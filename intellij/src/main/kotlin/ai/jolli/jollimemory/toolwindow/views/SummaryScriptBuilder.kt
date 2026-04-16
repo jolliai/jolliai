@@ -1,0 +1,1383 @@
+/**
+ * SummaryScriptBuilder
+ *
+ * Returns the JavaScript embedded in the JCEF webview for interactive behaviors:
+ * toggle expand/collapse, copy hash, copy markdown, push to Jolli, memory
+ * edit/delete, E2E test guide CRUD, plan actions, PR section interactions,
+ * and transcript modal.
+ *
+ * Kotlin port of the VS Code SummaryScriptBuilder.ts.
+ *
+ * Key differences from VS Code:
+ * - `acquireVsCodeApi().postMessage(...)` → `window.__jbQuery(JSON.stringify(...))`
+ * - `window.addEventListener('message', ...)` → `window.addEventListener('jollimemory', function(e) { var msg = e.detail; ... })`
+ * - The `vscode` variable is NOT available; uses `window.__jbQuery` instead.
+ */
+package ai.jolli.jollimemory.toolwindow.views
+
+object SummaryScriptBuilder {
+    /** Returns the JavaScript for interactive behaviors in the JCEF webview. */
+    fun buildScript(): String {
+        return """
+  // ── Bridge: post messages to IntelliJ via JCEF query handler ──
+  // Named jmSend (not postMessage) to avoid conflict with the built-in
+  // window.postMessage DOM API which JCEF may not allow overriding.
+  // Base64-encode the JSON payload to avoid UTF-8 corruption in JCEF's
+  // JS→Java IPC bridge (which mangles multi-byte characters like Chinese,
+  // emojis, ·, −, bullets into Latin-1).
+  function jmSend(msg) {
+    if (window.__jbQuery) {
+      var json = JSON.stringify(msg);
+      var bytes = new TextEncoder().encode(json);
+      var binary = '';
+      for (var i = 0; i < bytes.length; i++) { binary += String.fromCharCode(bytes[i]); }
+      window.__jbQuery(btoa(binary));
+    }
+  }
+
+  // Toggle expand/collapse for individual memory sections (skip clicks on action buttons)
+  document.querySelectorAll('.toggle-header').forEach(function(header) {
+    header.addEventListener('click', function(e) {
+      if (e.target.closest('.topic-actions')) { return; }
+      header.parentElement.classList.toggle('collapsed');
+    });
+  });
+
+  // Toggle expand/collapse for timeline date groups
+  document.querySelectorAll('.timeline-header').forEach(function(header) {
+    header.addEventListener('click', function() {
+      header.parentElement.classList.toggle('collapsed');
+    });
+  });
+
+  // Hash copy button: copy full commit hash to clipboard inline
+  document.querySelectorAll('.hash-copy').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var hash = btn.dataset.hash || '';
+      navigator.clipboard.writeText(hash).then(function() {
+        btn.classList.add('copied');
+        var original = btn.textContent;
+        btn.textContent = '\u2713';
+        setTimeout(function() {
+          btn.textContent = original;
+          btn.classList.remove('copied');
+        }, 1500);
+      });
+    });
+  });
+
+  // Copy Markdown button with brief visual feedback
+  var copyBtn = document.getElementById('copyMdBtn');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', function() {
+      jmSend({ command: 'copyMarkdown' });
+      var original = copyBtn.textContent;
+      copyBtn.textContent = 'Copied \u2713';
+      setTimeout(function() { copyBtn.textContent = original; }, 1500);
+    });
+  }
+
+  // Push to Jolli button
+  var pushBtn = document.getElementById('pushJolliBtn');
+  if (pushBtn) {
+    pushBtn.addEventListener('click', function() {
+      jmSend({ command: 'pushToJolli' });
+    });
+  }
+
+${buildPrSectionScript()}
+
+  // Listen for messages from the IDE (push + topic edit status updates)
+  window.addEventListener('jollimemory', function(e) {
+    var msg = e.detail;
+
+    // ── Push to Jolli status ──
+    if (pushBtn) {
+      if (msg.command === 'pushStarted') {
+        pushBtn.textContent = 'Pushing...';
+        pushBtn.disabled = true;
+      } else if (msg.command === 'pushSuccess') {
+        pushBtn.textContent = 'Pushed \u2713';
+        pushBtn.disabled = false;
+        setTimeout(function() { pushBtn.textContent = 'Update on Jolli'; }, 2000);
+        // Dynamically add/update the Jolli Memory row in the properties table
+        if (msg.url) {
+          var props = document.querySelector('.properties');
+          var existingRow = document.getElementById('jolliRow');
+          if (existingRow) existingRow.remove();
+          if (props) {
+            var label = document.createElement('div');
+            label.className = 'prop-label';
+            label.textContent = 'Jolli Memory';
+            var value = document.createElement('div');
+            value.className = 'prop-value';
+            var link = document.createElement('a');
+            link.className = 'jolli-link';
+            link.href = msg.url;
+            link.title = msg.commitMessage || 'View on Jolli';
+            link.textContent = msg.url;
+            value.appendChild(link);
+            // Add plan URLs as sub-block if any
+            if (msg.planUrls && msg.planUrls.length > 0) {
+              var plansBlock = document.createElement('div');
+              plansBlock.className = 'jolli-plans-block';
+              var plansLabel = document.createElement('span');
+              plansLabel.className = 'jolli-plans-label';
+              plansLabel.textContent = 'Plans';
+              plansBlock.appendChild(plansLabel);
+              msg.planUrls.forEach(function(p) {
+                var item = document.createElement('div');
+                item.className = 'jolli-plan-item';
+                var a = document.createElement('a');
+                a.className = 'jolli-link';
+                a.href = p.url;
+                a.title = p.title || p.slug;
+                a.textContent = p.url;
+                item.appendChild(a);
+                plansBlock.appendChild(item);
+              });
+              value.appendChild(plansBlock);
+            }
+            var row = document.createElement('div');
+            row.className = 'prop-row';
+            row.id = 'jolliRow';
+            row.appendChild(label);
+            row.appendChild(value);
+            props.appendChild(row);
+          }
+        }
+      } else if (msg.command === 'pushFailed') {
+        pushBtn.textContent = 'Push Failed';
+        pushBtn.disabled = false;
+        setTimeout(function() { pushBtn.textContent = 'Push to Jolli'; }, 2000);
+      }
+    }
+
+${buildPrMessageScript()}
+
+    // ── Memory edit status ──
+    if (msg.command === 'topicUpdated' && typeof msg.topicIndex === 'number' && msg.html) {
+      var oldToggle = document.getElementById('topic-' + msg.topicIndex);
+      if (oldToggle) {
+        // Clean up ESC handler if still in edit mode
+        if (oldToggle._escHandler) {
+          document.removeEventListener('keydown', oldToggle._escHandler);
+        }
+        // Check if old toggle was expanded
+        var wasOpen = oldToggle.classList.contains('open');
+        // Replace with server-rendered HTML
+        var wrapper = document.createElement('div');
+        wrapper.innerHTML = msg.html;
+        var newToggle = wrapper.firstElementChild;
+        if (newToggle) {
+          oldToggle.replaceWith(newToggle);
+          // Preserve open/collapsed state
+          if (wasOpen) { newToggle.classList.add('open'); }
+          // Re-attach edit/delete button handlers on the new element
+          attachTopicHandlers(newToggle);
+        }
+      }
+    } else if (msg.command === 'topicUpdateError') {
+      // Re-enable save/cancel buttons so the user can retry
+      var editingToggle = document.querySelector('.toggle.editing');
+      if (editingToggle) {
+        var saveBtn = editingToggle.querySelector('.edit-save-btn');
+        var cancelBtn = editingToggle.querySelector('.edit-cancel-btn');
+        if (saveBtn) { saveBtn.textContent = 'Save'; saveBtn.disabled = false; }
+        if (cancelBtn) { cancelBtn.disabled = false; }
+      }
+    }
+
+    // ── Topic deleted — remove the element from the DOM ──
+    if (msg.command === 'topicDeleted' && typeof msg.topicIndex === 'number') {
+      var deletedToggle = document.getElementById('topic-' + msg.topicIndex);
+      if (deletedToggle) {
+        deletedToggle.remove();
+      }
+    }
+  });
+
+  // Toggle All: expand / collapse all memories and timeline groups
+  var allCollapsed = false;
+  var toggleAllBtn = document.getElementById('toggleAllBtn');
+  if (toggleAllBtn) {
+    toggleAllBtn.addEventListener('click', function() {
+      var items = document.querySelectorAll('.toggle, .timeline-group');
+      allCollapsed = !allCollapsed;
+      items.forEach(function(t) {
+        if (allCollapsed) {
+          t.classList.add('collapsed');
+        } else {
+          t.classList.remove('collapsed');
+        }
+      });
+      toggleAllBtn.textContent = allCollapsed ? 'Expand All' : 'Collapse All';
+    });
+  }
+
+  // ── Attach collapsible callout toggle handlers inside a root element ──
+  function attachCollapsibleHandlers(root) {
+    root.querySelectorAll('.callout.collapsible .callout-label').forEach(function(label) {
+      label.addEventListener('click', function() {
+        label.closest('.callout').classList.toggle('callout-collapsed');
+      });
+    });
+  }
+
+  // ── Attach edit/delete handlers to buttons inside a root element ──
+  function attachTopicHandlers(root) {
+    attachCollapsibleHandlers(root);
+    root.querySelectorAll('.topic-delete-btn').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        var idx = parseInt(btn.dataset.topicIndex, 10);
+        var toggle = document.getElementById('topic-' + idx);
+        var titleEl = toggle ? toggle.querySelector('.toggle-title') : null;
+        var title = titleEl ? titleEl.textContent : '';
+        jmSend({ command: 'deleteTopic', topicIndex: idx, title: title });
+      });
+    });
+    root.querySelectorAll('.topic-edit-btn').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        var idx = parseInt(btn.dataset.topicIndex, 10);
+        var toggle = document.getElementById('topic-' + idx);
+        if (toggle && !toggle.classList.contains('editing')) {
+          enterEditMode(toggle, idx);
+        }
+      });
+    });
+  }
+  attachTopicHandlers(document);
+
+  // ── Edit memory handler ──
+  var EDIT_FIELDS = [
+    { key: 'trigger',       label: '\u26A1 Why this change' },
+    { key: 'decisions',     label: '\uD83D\uDCA1 Decisions behind the code' },
+    { key: 'response',      label: '\u2705 What was implemented' },
+    { key: 'todo',          label: '\uD83D\uDCCB Future enhancements' },
+    { key: 'filesAffected', label: '\uD83D\uDCC1 Files' }
+  ];
+
+  function autoResize(ta) {
+    ta.style.height = 'auto';
+    ta.style.height = ta.scrollHeight + 'px';
+  }
+
+  function enterEditMode(toggle, topicIndex) {
+    var data = JSON.parse(toggle.dataset.topic || '{}');
+    toggle.classList.add('editing');
+    toggle.classList.remove('collapsed');
+
+    // Replace title span with input in the header (in-place)
+    var header = toggle.querySelector('.toggle-header');
+    var titleSpan = header.querySelector('.toggle-title');
+    toggle._originalTitleHtml = titleSpan.outerHTML;
+    var titleInput = document.createElement('input');
+    titleInput.className = 'edit-title-input';
+    titleInput.dataset.editField = 'title';
+    titleInput.value = data.title;
+    titleInput.style.pointerEvents = 'auto';
+    titleInput.addEventListener('click', function(e) { e.stopPropagation(); });
+    titleSpan.replaceWith(titleInput);
+
+    // Hide cat pill during edit
+    var catPill = header.querySelector('.cat-pill');
+    if (catPill) { catPill.style.display = 'none'; }
+
+    var content = toggle.querySelector('.toggle-content');
+    // Save original HTML for cancel
+    toggle._originalHtml = content.innerHTML;
+
+    // Build edit form (no title input here — it's in the header)
+    var html = '';
+
+    for (var i = 0; i < EDIT_FIELDS.length; i++) {
+      var f = EDIT_FIELDS[i];
+      var val = data[f.key] || '';
+      var cls = f.key === 'filesAffected' ? 'files-affected-edit' : f.key;
+      html += '<div class="callout ' + cls + '">' +
+        '<div class="callout-body">' +
+        '<div class="callout-label">' + f.label + '</div>' +
+        '<textarea class="edit-textarea" data-edit-field="' + f.key + '"' +
+        (f.key === 'filesAffected' ? ' placeholder="One file per line"' : '') +
+        '>' +
+        val.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') +
+        '</textarea></div></div>';
+    }
+
+    html += '<div class="edit-actions">' +
+      '<button class="edit-cancel-btn">Cancel</button>' +
+      '<button class="edit-save-btn">Save</button></div>';
+
+    content.innerHTML = html;
+
+    // Auto-resize all textareas
+    content.querySelectorAll('.edit-textarea').forEach(function(ta) {
+      autoResize(ta);
+      ta.addEventListener('input', function() { autoResize(ta); });
+    });
+
+    // Cancel button
+    content.querySelector('.edit-cancel-btn').addEventListener('click', function() {
+      exitEditMode(toggle);
+    });
+
+    // Save button — collect fields from both header (title) and content (other fields)
+    var saveBtn = content.querySelector('.edit-save-btn');
+    saveBtn.addEventListener('click', function() {
+      var updates = {};
+      toggle.querySelectorAll('[data-edit-field]').forEach(function(el) {
+        var field = el.dataset.editField;
+        var value = el.value;
+        if (field === 'filesAffected') {
+          // Split by newlines, filter empty
+          var files = value.split('\n').map(function(f) { return f.trim(); }).filter(function(f) { return f.length > 0; });
+          updates[field] = files;
+        } else {
+          updates[field] = value;
+        }
+      });
+      // Validate required fields
+      if (!updates.title || !updates.title.trim()) {
+        var titleInput = toggle.querySelector('[data-edit-field="title"]');
+        if (titleInput) { titleInput.focus(); titleInput.style.borderColor = 'var(--vscode-inputValidation-errorBorder, #f44)'; }
+        return;
+      }
+      // Disable buttons and show saving state
+      saveBtn.textContent = 'Saving...';
+      saveBtn.disabled = true;
+      content.querySelector('.edit-cancel-btn').disabled = true;
+      jmSend({ command: 'editTopic', topicIndex: topicIndex, updates: updates });
+    });
+
+    // ESC key exits edit mode
+    toggle._escHandler = function(e) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        exitEditMode(toggle);
+      }
+    };
+    document.addEventListener('keydown', toggle._escHandler);
+  }
+
+  function exitEditMode(toggle) {
+    // Remove ESC handler
+    if (toggle._escHandler) {
+      document.removeEventListener('keydown', toggle._escHandler);
+      delete toggle._escHandler;
+    }
+    toggle.classList.remove('editing');
+    // Restore title span in header
+    var titleInput = toggle.querySelector('.edit-title-input');
+    if (titleInput && toggle._originalTitleHtml) {
+      var temp = document.createElement('div');
+      temp.innerHTML = toggle._originalTitleHtml;
+      titleInput.replaceWith(temp.firstChild);
+      delete toggle._originalTitleHtml;
+    }
+    // Restore cat pill visibility
+    var catPill = toggle.querySelector('.cat-pill');
+    if (catPill) { catPill.style.display = ''; }
+    // Restore content and reattach collapsible callout handlers
+    var content = toggle.querySelector('.toggle-content');
+    if (toggle._originalHtml) {
+      content.innerHTML = toggle._originalHtml;
+      delete toggle._originalHtml;
+      attachCollapsibleHandlers(toggle);
+    }
+  }
+
+  // ── E2E Test Guide ──
+  // E2E scenario toggle is handled by the generic .toggle-header handler above.
+
+  // Generate / Regenerate button
+  var genE2eBtn = document.getElementById('generateE2eBtn');
+  var regenE2eBtn = document.getElementById('regenE2eBtn');
+  function handleGenerateE2e(btn) {
+    if (!btn) return;
+    btn.addEventListener('click', function() {
+      jmSend({ command: 'generateE2eTest' });
+    });
+  }
+  handleGenerateE2e(genE2eBtn);
+  handleGenerateE2e(regenE2eBtn);
+
+  // Delete E2E button
+  function attachDeleteE2eHandler(btn) {
+    if (!btn) return;
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      jmSend({ command: 'deleteE2eTest' });
+    });
+  }
+  attachDeleteE2eHandler(document.getElementById('deleteE2eBtn'));
+
+  // Edit E2E button — switch to Markdown textarea editing
+  function attachEditE2eHandler(btn) {
+    if (!btn) return;
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var section = document.getElementById('e2eTestSection');
+      if (!section || section.classList.contains('e2e-editing')) return;
+      section.classList.add('e2e-editing');
+
+      // Collect existing scenarios from DOM into Markdown text
+      var scenarios = section.querySelectorAll('.e2e-scenario');
+      var md = '';
+      scenarios.forEach(function(sc, i) {
+        var title = sc.querySelector('.toggle-title');
+        var precond = sc.querySelector('.callout.preconditions .callout-text');
+        var stepsOl = sc.querySelector('.callout.steps ol');
+        var expectedUl = sc.querySelector('.callout.expected ul');
+        if (i > 0) md += '\n';
+        md += '### ' + (title ? title.textContent : 'Scenario') + '\n';
+        if (precond && precond.textContent.trim()) {
+          md += '**Preconditions:** ' + precond.textContent.trim() + '\n';
+        }
+        md += '**Steps:**\n';
+        if (stepsOl) {
+          var items = stepsOl.querySelectorAll('li');
+          items.forEach(function(li, j) {
+            md += (j + 1) + '. ' + li.textContent + '\n';
+          });
+        }
+        md += '**Expected:**\n';
+        if (expectedUl) {
+          var items = expectedUl.querySelectorAll('li');
+          items.forEach(function(li) {
+            md += '- ' + li.textContent + '\n';
+          });
+        }
+      });
+
+      // Save original content for cancel
+      section._originalE2eHtml = section.innerHTML;
+
+      // Replace section content with textarea + buttons (keep header)
+      var header = section.querySelector('.section-header');
+      section.innerHTML = '';
+      if (header) section.appendChild(header);
+
+      var ta = document.createElement('textarea');
+      ta.className = 'e2e-edit-area';
+      ta.value = md;
+      section.appendChild(ta);
+
+      var actions = document.createElement('div');
+      actions.className = 'e2e-edit-actions';
+      var cancelBtn = document.createElement('button');
+      cancelBtn.className = 'action-btn';
+      cancelBtn.textContent = 'Cancel';
+      var saveBtn = document.createElement('button');
+      saveBtn.className = 'action-btn primary';
+      saveBtn.textContent = 'Save';
+      actions.appendChild(cancelBtn);
+      actions.appendChild(saveBtn);
+      section.appendChild(actions);
+
+      // Auto-resize textarea
+      ta.style.height = ta.scrollHeight + 'px';
+      ta.addEventListener('input', function() {
+        ta.style.height = 'auto';
+        ta.style.height = ta.scrollHeight + 'px';
+      });
+      ta.focus();
+
+      // Cancel
+      cancelBtn.addEventListener('click', function() {
+        section.innerHTML = section._originalE2eHtml;
+        section.classList.remove('e2e-editing');
+        delete section._originalE2eHtml;
+        // Re-attach E2E handlers
+        reattachE2eHandlers();
+      });
+
+      // Save — parse Markdown back into scenarios
+      saveBtn.addEventListener('click', function() {
+        var text = ta.value;
+        var parsed = parseE2eMarkdown(text);
+        if (parsed.length === 0) {
+          ta.style.borderColor = 'var(--vscode-inputValidation-errorBorder, #f44)';
+          return;
+        }
+        saveBtn.textContent = 'Saving...';
+        saveBtn.disabled = true;
+        cancelBtn.disabled = true;
+        jmSend({ command: 'editE2eTest', scenarios: parsed });
+      });
+
+      // ESC to cancel
+      section._e2eEscHandler = function(ev) {
+        if (ev.key === 'Escape') {
+          ev.preventDefault();
+          cancelBtn.click();
+        }
+      };
+      document.addEventListener('keydown', section._e2eEscHandler);
+    });
+  }
+  attachEditE2eHandler(document.getElementById('editE2eBtn'));
+
+  /** Parses Markdown text back into E2eTestScenario[] for the save handler. */
+  function parseE2eMarkdown(text) {
+    var scenarios = [];
+    var blocks = text.split(/^###\s+/m).filter(function(b) { return b.trim().length > 0; });
+    for (var i = 0; i < blocks.length; i++) {
+      var block = blocks[i];
+      var lines = block.split('\n');
+      var title = lines[0].trim();
+      var preconditions = '';
+      var steps = [];
+      var expected = [];
+      var mode = '';
+      for (var j = 1; j < lines.length; j++) {
+        var line = lines[j];
+        if (/^\*\*Preconditions:\*\*/.test(line)) {
+          preconditions = line.replace(/^\*\*Preconditions:\*\*\s*/, '').trim();
+          mode = '';
+          continue;
+        }
+        if (/^\*\*Steps:\*\*/.test(line)) { mode = 'steps'; continue; }
+        if (/^\*\*Expected:\*\*/.test(line)) { mode = 'expected'; continue; }
+        var trimmed = line.trim();
+        if (!trimmed) continue;
+        if (mode === 'steps') {
+          steps.push(trimmed.replace(/^\d+\.\s*/, ''));
+        } else if (mode === 'expected') {
+          expected.push(trimmed.replace(/^[-*]\s+/, ''));
+        }
+      }
+      if (title && steps.length > 0) {
+        var sc = { title: title, steps: steps, expectedResults: expected };
+        if (preconditions) sc.preconditions = preconditions;
+        scenarios.push(sc);
+      }
+    }
+    return scenarios;
+  }
+
+  // Handle E2E status messages from the IDE
+  window.addEventListener('jollimemory', function(e) {
+    var msg = e.detail;
+    if (msg.command === 'e2eTestGenerating') {
+      var btn = document.getElementById('generateE2eBtn') || document.getElementById('regenE2eBtn');
+      if (btn) {
+        btn.textContent = 'Generating...';
+        btn.disabled = true;
+      }
+    } else if (msg.command === 'e2eTestUpdated' && msg.html) {
+      var section = document.getElementById('e2eTestSection');
+      if (section) {
+        // Clean up ESC handler if in edit mode
+        if (section._e2eEscHandler) {
+          document.removeEventListener('keydown', section._e2eEscHandler);
+          delete section._e2eEscHandler;
+        }
+        section.classList.remove('e2e-editing');
+        // Replace entire section with server-rendered HTML (includes the outer section div + hr)
+        var wrapper = document.createElement('div');
+        wrapper.innerHTML = msg.html;
+        // The HTML contains the section div and an hr — extract the section
+        var newSection = wrapper.querySelector('#e2eTestSection');
+        if (newSection) {
+          // Also get the separator hr following the section
+          var hr = section.nextElementSibling;
+          section.replaceWith(newSection);
+          // Replace the old hr with the new one from rendered HTML
+          var newHr = wrapper.querySelector('hr.separator');
+          if (newHr && hr && hr.tagName === 'HR') {
+            hr.replaceWith(newHr);
+          } else if (newHr && !hr) {
+            newSection.insertAdjacentElement('afterend', newHr);
+          }
+          reattachE2eHandlers();
+        }
+      }
+    } else if (msg.command === 'e2eTestError') {
+      var btn = document.getElementById('generateE2eBtn') || document.getElementById('regenE2eBtn');
+      if (btn) {
+        btn.textContent = btn.id === 'generateE2eBtn' ? 'Generate' : '\uD83D\uDD04';
+        btn.disabled = false;
+      }
+      // If in edit mode, re-enable buttons
+      var section = document.getElementById('e2eTestSection');
+      if (section && section.classList.contains('e2e-editing')) {
+        var saveBtn = section.querySelector('.action-btn.primary');
+        var cancelBtn = section.querySelector('.action-btn:not(.primary)');
+        if (saveBtn) { saveBtn.textContent = 'Save'; saveBtn.disabled = false; }
+        if (cancelBtn) { cancelBtn.disabled = false; }
+      }
+    }
+
+  /** Re-attaches E2E button event handlers after DOM replacement. */
+  function reattachE2eHandlers() {
+    var section = document.getElementById('e2eTestSection');
+    if (!section) return;
+    // Re-attach toggle collapse (new DOM elements lack the global handler)
+    section.querySelectorAll('.toggle-header').forEach(function(header) {
+      header.addEventListener('click', function(e) {
+        if (e.target.closest('.topic-actions')) { return; }
+        header.parentElement.classList.toggle('collapsed');
+      });
+    });
+    // Re-attach generate/regen
+    handleGenerateE2e(document.getElementById('generateE2eBtn'));
+    handleGenerateE2e(document.getElementById('regenE2eBtn'));
+    // Re-attach edit and delete buttons
+    attachEditE2eHandler(document.getElementById('editE2eBtn'));
+    attachDeleteE2eHandler(document.getElementById('deleteE2eBtn'));
+  }
+
+  // ── Plan inline edit messages ──
+  if (msg.command === 'planContentLoaded' && msg.slug && msg.content !== undefined) {
+    var planEl = document.getElementById('plan-' + msg.slug);
+    if (planEl) {
+      var editArea = planEl.querySelector('.plan-edit-area');
+      var textarea = planEl.querySelector('.plan-edit-textarea');
+      if (editArea && textarea) {
+        textarea.value = msg.content;
+        planEl.classList.add('editing');
+        textarea.focus();
+      }
+    }
+  }
+
+  if (msg.command === 'planSaved' && msg.slug) {
+    var planEl2 = document.getElementById('plan-' + msg.slug);
+    if (planEl2) {
+      planEl2.classList.remove('editing');
+    }
+  }
+
+  // ── Plan translation status ──
+  if (msg.command === 'planTranslating' && msg.slug) {
+    var translateBtn = document.querySelector('.plan-translate-btn[data-plan-slug="' + msg.slug + '"]');
+    if (translateBtn) {
+      translateBtn.disabled = true;
+      translateBtn.classList.add('translating');
+      translateBtn.setAttribute('title', 'Translating...');
+    }
+  }
+  if (msg.command === 'planTranslateError' && msg.slug) {
+    var translateBtn2 = document.querySelector('.plan-translate-btn[data-plan-slug="' + msg.slug + '"]');
+    if (translateBtn2) {
+      translateBtn2.disabled = false;
+      translateBtn2.classList.remove('translating');
+      translateBtn2.setAttribute('title', 'Translate to English');
+    }
+  }
+
+  });
+
+  // ── Plan actions: event delegation for data-action attributes ──
+  // Replaces inline onclick handlers for CSP compliance.
+  document.addEventListener('click', function(e) {
+    var target = e.target.closest('[data-action]');
+    if (!target) return;
+    var action = target.getAttribute('data-action');
+    var slug = target.getAttribute('data-plan-slug');
+    var title = target.getAttribute('data-plan-title') || '';
+
+    switch (action) {
+      case 'translatePlan':
+        jmSend({ command: 'translatePlan', slug: slug });
+        break;
+      case 'previewPlan':
+        e.preventDefault();
+        jmSend({ command: 'previewPlan', slug: slug, title: title });
+        break;
+      case 'loadPlanContent':
+        jmSend({ command: 'loadPlanContent', slug: slug });
+        break;
+      case 'removePlan':
+        jmSend({ command: 'removePlan', slug: slug, title: title });
+        break;
+      case 'savePlanEdit': {
+        var planItem = document.getElementById('plan-' + slug);
+        if (!planItem) break;
+        var textarea = planItem.querySelector('.plan-edit-textarea');
+        if (!textarea) break;
+        jmSend({ command: 'savePlan', slug: slug, content: textarea.value });
+        break;
+      }
+      case 'cancelPlanEdit': {
+        var planEl = document.getElementById('plan-' + slug);
+        if (!planEl) break;
+        planEl.classList.remove('editing');
+        break;
+      }
+      case 'associatePlan':
+        jmSend({ command: 'associatePlan' });
+        break;
+    }
+  });
+
+  // ── Transcript Stats (async load for section description) ──
+
+  var conversationsStats = document.getElementById('conversationsStats');
+  if (conversationsStats) {
+    jmSend({ command: 'loadTranscriptStats' });
+  }
+
+  // ── Transcript Modal ──
+
+  var transcriptModal = document.getElementById('transcriptModal');
+  var modalTabs = document.getElementById('modalTabs');
+  var modalBody = document.getElementById('modalBody');
+  var modalLoading = document.getElementById('modalLoading');
+  var modalSubtitle = document.getElementById('modalSubtitle');
+  var modalSaveBtn = document.getElementById('modalSaveBtn');
+  var modalCancelBtn = document.getElementById('modalCancelBtn');
+  var modalCloseBtn = document.getElementById('modalCloseBtn');
+  var deleteTranscriptsBtn = document.getElementById('deleteTranscriptsBtn');
+  var openTranscriptsBtn = document.getElementById('openTranscriptsBtn');
+
+  // State
+  var originalTranscripts = []; // full data from IDE, preserved for metadata
+  var rawContentMap = {}; // entryKey -> raw text (avoids data-attribute escaping issues)
+  var baseSubtitle = ''; // "147 entries, 4 sessions" — always visible
+  var modifiedCount = 0;
+  var deletedCount = 0;
+  var activeTextarea = null; // only one entry editable at a time
+
+  function openModal() {
+    if (!transcriptModal) return;
+    transcriptModal.classList.add('visible');
+    if (modalLoading) modalLoading.style.display = 'block';
+    modifiedCount = 0;
+    deletedCount = 0;
+    updateChangeCounter();
+    jmSend({ command: 'loadAllTranscripts' });
+  }
+
+  function closeModal() {
+    if (!transcriptModal) return;
+    transcriptModal.classList.remove('visible');
+    if (modalBody) modalBody.innerHTML = '<div class="modal-loading" id="modalLoading">Loading transcripts...</div>';
+    if (modalTabs) modalTabs.innerHTML = '';
+    activeTextarea = null;
+    modifiedCount = 0;
+    deletedCount = 0;
+  }
+
+  function updateChangeCounter() {
+    if (modalSubtitle) {
+      var parts = [];
+      if (modifiedCount > 0) parts.push(modifiedCount + ' modified');
+      if (deletedCount > 0) parts.push(deletedCount + ' deleted');
+      var changeText = parts.length > 0 ? ' \u00B7 ' + parts.join(', ') : '';
+      modalSubtitle.textContent = baseSubtitle + changeText;
+    }
+    if (modalSaveBtn) {
+      var total = modifiedCount + deletedCount;
+      modalSaveBtn.disabled = total === 0;
+      modalSaveBtn.textContent = total > 0 ? 'Save All (' + total + ')' : 'Save All';
+    }
+  }
+
+  function renderTranscriptEntries(entries) {
+    if (!modalBody) return;
+    originalTranscripts = entries;
+
+    // Group by source:sessionId
+    var groups = {};
+    var groupOrder = [];
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i];
+      var key = (e.source || 'claude') + ':' + e.sessionId;
+      if (!groups[key]) {
+        groups[key] = { source: e.source || 'claude', sessionId: e.sessionId, entries: [] };
+        groupOrder.push(key);
+      }
+      groups[key].entries.push(e);
+    }
+
+    // Sort entries within each group by timestamp
+    for (var k = 0; k < groupOrder.length; k++) {
+      groups[groupOrder[k]].entries.sort(function(a, b) {
+        return (a.timestamp || '').localeCompare(b.timestamp || '');
+      });
+    }
+
+    // Sort session groups by each group's earliest entry timestamp
+    groupOrder.sort(function(a, b) {
+      var aFirst = groups[a].entries[0] ? (groups[a].entries[0].timestamp || '') : '';
+      var bFirst = groups[b].entries[0] ? (groups[b].entries[0].timestamp || '') : '';
+      return aFirst.localeCompare(bFirst);
+    });
+
+    // Build tab bar (with delete button on each tab)
+    var tabsHtml = '';
+    for (var t = 0; t < groupOrder.length; t++) {
+      var tabGroup = groups[groupOrder[t]];
+      var tabSourceLabel = tabGroup.source === 'codex' ? 'Codex' : 'Claude';
+      var tabEntryCount = tabGroup.entries.length;
+      var activeClass = t === 0 ? ' active' : '';
+      tabsHtml += '<button class="modal-tab' + activeClass + '" data-tab-key="' + groupOrder[t] + '">';
+      tabsHtml += tabSourceLabel + ' (' + tabEntryCount + ')';
+      tabsHtml += '<span class="session-delete-btn" data-group-key="' + groupOrder[t] + '" title="Delete entire session">&#x1F5D1;</span>';
+      tabsHtml += '</button>';
+    }
+    if (modalTabs) {
+      modalTabs.innerHTML = tabsHtml;
+      // Hide tab bar if only one session
+      modalTabs.style.display = groupOrder.length > 1 ? 'flex' : 'none';
+    }
+
+    // Build tab panels and populate rawContentMap
+    rawContentMap = {};
+    var html = '';
+    for (var g = 0; g < groupOrder.length; g++) {
+      var group = groups[groupOrder[g]];
+      var panelActiveClass = g === 0 ? ' active' : '';
+      html += '<div class="tab-panel' + panelActiveClass + '" data-panel-key="' + groupOrder[g] + '">';
+      html += '<div class="transcript-session" data-group-key="' + groupOrder[g] + '">';
+
+      for (var j = 0; j < group.entries.length; j++) {
+        var entry = group.entries[j];
+        var entryKey = esc(entry.commitHash) + ':' + esc(entry.sessionId) + ':' + entry.originalIndex;
+        rawContentMap[entryKey] = entry.content;
+        var roleIcon = entry.role === 'human' ? '&#x1F464;' : '&#x1F916;';
+        var roleLabel = entry.role === 'human' ? 'user' : 'bot';
+        var timeStr = entry.timestamp ? formatTime(entry.timestamp) : '';
+        html += '<div class="transcript-entry" data-commit="' + esc(entry.commitHash) + '" data-session="' + esc(entry.sessionId) + '" data-source="' + esc(entry.source || 'claude') + '" data-index="' + entry.originalIndex + '" data-timestamp="' + esc(entry.timestamp || '') + '" data-role="' + esc(entry.role) + '">';
+        html += '<div class="entry-header">';
+        html += '<span class="entry-role">' + roleIcon + ' ' + roleLabel + '</span>';
+        html += '<span class="entry-time">' + esc(timeStr) + '</span>';
+        html += '<button class="entry-delete-btn" title="Delete entry">&#x1F5D1;</button>';
+        html += '</div>';
+        html += '<div class="entry-content">' + renderMarkdown(entry.content) + '</div>';
+        html += '</div>';
+      }
+      html += '</div>';
+      html += '</div>';
+    }
+
+    modalBody.innerHTML = html;
+
+    // Attach tab switching
+    if (modalTabs) {
+      var tabs = modalTabs.querySelectorAll('.modal-tab');
+      for (var ti = 0; ti < tabs.length; ti++) {
+        tabs[ti].addEventListener('click', function() {
+          var key = this.getAttribute('data-tab-key');
+          // Deactivate all tabs and panels
+          var allTabs = modalTabs.querySelectorAll('.modal-tab');
+          for (var a = 0; a < allTabs.length; a++) allTabs[a].classList.remove('active');
+          var allPanels = modalBody.querySelectorAll('.tab-panel');
+          for (var p = 0; p < allPanels.length; p++) allPanels[p].classList.remove('active');
+          // Activate clicked tab and matching panel
+          this.classList.add('active');
+          var panel = modalBody.querySelector('.tab-panel[data-panel-key="' + key + '"]');
+          if (panel) panel.classList.add('active');
+        });
+      }
+    }
+
+    // Attach click-to-edit on entries (across ALL panels so state is preserved)
+    var allEntries = modalBody.querySelectorAll('.transcript-entry:not(.deleted)');
+    for (var idx = 0; idx < allEntries.length; idx++) {
+      attachEntryClickHandler(allEntries[idx]);
+    }
+
+    // Attach delete handlers
+    var entryDelBtns = modalBody.querySelectorAll('.entry-delete-btn');
+    for (var d = 0; d < entryDelBtns.length; d++) {
+      attachEntryDeleteHandler(entryDelBtns[d]);
+    }
+
+    // Session delete buttons are in the tab bar, not in the body
+    var sessionDelBtns = modalTabs ? modalTabs.querySelectorAll('.session-delete-btn') : [];
+    for (var s = 0; s < sessionDelBtns.length; s++) {
+      attachSessionDeleteHandler(sessionDelBtns[s]);
+    }
+  }
+
+  function attachEntryClickHandler(entryEl) {
+    var contentEl = entryEl.querySelector('.entry-content');
+    if (!contentEl) return;
+    contentEl.addEventListener('click', function() {
+      if (entryEl.classList.contains('deleted')) return;
+      if (entryEl.classList.contains('editing')) return;
+
+      // Blur any active textarea first
+      if (activeTextarea) activeTextarea.blur();
+
+      var entryKey = entryEl.getAttribute('data-commit') + ':' + entryEl.getAttribute('data-session') + ':' + entryEl.getAttribute('data-index');
+      var originalText = rawContentMap[entryKey] || contentEl.textContent;
+      var textarea = document.createElement('textarea');
+      textarea.className = 'entry-edit-textarea';
+      textarea.value = originalText;
+      textarea.rows = Math.max(3, originalText.split('\n').length + 1);
+
+      contentEl.style.display = 'none';
+      entryEl.insertBefore(textarea, contentEl.nextSibling);
+      entryEl.classList.add('editing');
+      textarea.focus();
+      activeTextarea = textarea;
+
+      // Auto-resize
+      textarea.addEventListener('input', function() {
+        this.style.height = 'auto';
+        this.style.height = this.scrollHeight + 'px';
+      });
+      textarea.style.height = textarea.scrollHeight + 'px';
+
+      textarea.addEventListener('blur', function() {
+        var newText = textarea.value;
+        rawContentMap[entryKey] = newText;
+        contentEl.innerHTML = renderMarkdown(newText);
+        contentEl.style.display = '';
+        textarea.remove();
+        entryEl.classList.remove('editing');
+        activeTextarea = null;
+
+        if (newText !== originalText) {
+          if (!entryEl.classList.contains('modified')) {
+            entryEl.classList.add('modified');
+            modifiedCount++;
+            updateChangeCounter();
+          }
+        }
+      });
+    });
+  }
+
+  /** Sync tab strikethrough state based on whether all entries in the session are deleted. */
+  function syncTabState(sessionEl) {
+    if (!sessionEl || !modalTabs) return;
+    var groupKey = sessionEl.getAttribute('data-group-key');
+    var tabEl = modalTabs.querySelector('.modal-tab[data-tab-key="' + groupKey + '"]');
+    if (!tabEl) return;
+    var total = sessionEl.querySelectorAll('.transcript-entry').length;
+    var deletedInSession = sessionEl.querySelectorAll('.transcript-entry.deleted').length;
+    var allDeleted = total > 0 && deletedInSession === total;
+    var deleteBtn = tabEl.querySelector('.session-delete-btn');
+    if (allDeleted) {
+      tabEl.classList.add('session-deleted');
+      if (deleteBtn) { deleteBtn.innerHTML = '&#x21A9;'; deleteBtn.title = 'Restore entire session'; }
+    } else {
+      tabEl.classList.remove('session-deleted');
+      if (deleteBtn) { deleteBtn.innerHTML = '&#x1F5D1;'; deleteBtn.title = 'Delete entire session'; }
+    }
+  }
+
+  function attachEntryDeleteHandler(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var entryEl = btn.closest('.transcript-entry');
+      if (!entryEl) return;
+      if (entryEl.classList.contains('deleted')) {
+        entryEl.classList.remove('deleted');
+        btn.innerHTML = '&#x1F5D1;';
+        btn.title = 'Delete entry';
+        deletedCount--;
+      } else {
+        entryEl.classList.add('deleted');
+        btn.innerHTML = '&#x21A9;';
+        btn.title = 'Restore entry';
+        deletedCount++;
+      }
+      // Sync tab state based on session entries
+      var sessionEl = entryEl.closest('.transcript-session');
+      syncTabState(sessionEl);
+      updateChangeCounter();
+    });
+  }
+
+  function attachSessionDeleteHandler(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var groupKey = btn.getAttribute('data-group-key');
+      var tabEl = btn.closest('.modal-tab');
+      var sessionEl = modalBody ? modalBody.querySelector('.transcript-session[data-group-key="' + groupKey + '"]') : null;
+      if (!sessionEl) return;
+
+      var isDeleted = tabEl && tabEl.classList.contains('session-deleted');
+      if (isDeleted) {
+        // Restore all entries in session
+        if (tabEl) tabEl.classList.remove('session-deleted');
+        btn.innerHTML = '&#x1F5D1;';
+        btn.title = 'Delete entire session';
+        var deletedEntries = sessionEl.querySelectorAll('.transcript-entry.deleted');
+        for (var i = 0; i < deletedEntries.length; i++) {
+          deletedEntries[i].classList.remove('deleted');
+          var entryBtn = deletedEntries[i].querySelector('.entry-delete-btn');
+          if (entryBtn) { entryBtn.innerHTML = '&#x1F5D1;'; entryBtn.title = 'Delete entry'; }
+          deletedCount--;
+        }
+      } else {
+        // Delete all entries in session
+        if (tabEl) tabEl.classList.add('session-deleted');
+        btn.innerHTML = '&#x21A9;';
+        btn.title = 'Restore entire session';
+        var activeEntries = sessionEl.querySelectorAll('.transcript-entry:not(.deleted)');
+        for (var j = 0; j < activeEntries.length; j++) {
+          activeEntries[j].classList.add('deleted');
+          var entryBtn2 = activeEntries[j].querySelector('.entry-delete-btn');
+          if (entryBtn2) { entryBtn2.innerHTML = '&#x21A9;'; entryBtn2.title = 'Restore entry'; }
+          deletedCount++;
+        }
+      }
+      updateChangeCounter();
+    });
+  }
+
+  function collectSaveData() {
+    if (!modalBody) return [];
+    var entries = modalBody.querySelectorAll('.transcript-entry:not(.deleted)');
+    var result = [];
+    for (var i = 0; i < entries.length; i++) {
+      var el = entries[i];
+      var contentEl = el.querySelector('.entry-content');
+      result.push({
+        commitHash: el.getAttribute('data-commit'),
+        sessionId: el.getAttribute('data-session'),
+        source: el.getAttribute('data-source'),
+        originalIndex: parseInt(el.getAttribute('data-index'), 10),
+        role: el.getAttribute('data-role') === 'human' ? 'human' : 'assistant',
+        content: rawContentMap[el.getAttribute('data-commit') + ':' + el.getAttribute('data-session') + ':' + el.getAttribute('data-index')] || (contentEl ? contentEl.textContent : ''),
+        timestamp: el.getAttribute('data-timestamp') || ''
+      });
+    }
+    return result;
+  }
+
+  function formatTime(isoStr) {
+    if (!isoStr) return '';
+    try {
+      var d = new Date(isoStr);
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch(e) { return ''; }
+  }
+
+  function esc(str) {
+    if (!str) return '';
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  /** Lightweight markdown renderer: code blocks, inline code, bold, italic, links, lists, headers. */
+  function renderMarkdown(raw) {
+    if (!raw) return '';
+    var text = esc(raw);
+
+    // Fenced code blocks
+    text = text.replace(/``` [a-zA-Z]*\n([\s\S]*?)``` /g, function(_, code) {
+      return '<pre class="md-code-block"><code>' + code.replace(/\n$/, '') + '</code></pre>';
+    });
+
+    // Split into lines for block-level processing
+    var lines = text.split('\n');
+    var out = [];
+    var inList = false;
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+
+      // Skip lines inside code blocks (already handled)
+      if (line.indexOf('<pre class="md-code-block">') !== -1) {
+        if (inList) { out.push('</ul>'); inList = false; }
+        // Collect until </pre>
+        var block = line;
+        while (block.indexOf('</pre>') === -1 && i + 1 < lines.length) {
+          i++;
+          block += '\n' + lines[i];
+        }
+        out.push(block);
+        continue;
+      }
+
+      // Headers: # to ####
+      var headerMatch = line.match(/^(#{1,4})\s+(.+)$/);
+      if (headerMatch) {
+        if (inList) { out.push('</ul>'); inList = false; }
+        var level = headerMatch[1].length + 1; // Offset +1 to avoid overly large headers in modal
+        out.push('<h' + level + ' class="md-heading">' + applyInline(headerMatch[2]) + '</h' + level + '>');
+        continue;
+      }
+
+      // Unordered list items: - item or * item
+      var listMatch = line.match(/^[\-\*]\s+(.+)$/);
+      if (listMatch) {
+        if (!inList) { out.push('<ul class="md-list">'); inList = true; }
+        out.push('<li>' + applyInline(listMatch[1]) + '</li>');
+        continue;
+      }
+
+      // Non-list line closes open list
+      if (inList) { out.push('</ul>'); inList = false; }
+
+      // Empty line — small vertical gap
+      if (line.trim() === '') {
+        out.push('<div class="md-blank"></div>');
+        continue;
+      }
+
+      // Regular paragraph line
+      out.push('<div>' + applyInline(line) + '</div>');
+    }
+    if (inList) out.push('</ul>');
+    return out.join('');
+  }
+
+  /** Apply inline markdown: bold, italic, inline code, links. */
+  function applyInline(text) {
+    // Inline code
+    text = text.replace(/`([^`]+)`/g, '<code class="md-inline-code">$1</code>');
+    // Bold: **text** or __text__
+    text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
+    // Italic: *text* or _text_ (not inside bold)
+    text = text.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<em>$1</em>');
+    text = text.replace(/(?<!_)_([^_]+)_(?!_)/g, '<em>$1</em>');
+    // Links: [text](url) — only allow http/https URLs
+    text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" class="md-link">$1</a>');
+    return text;
+  }
+
+  // Wire up buttons
+  if (openTranscriptsBtn) openTranscriptsBtn.addEventListener('click', openModal);
+  if (modalCloseBtn) modalCloseBtn.addEventListener('click', function() { closeModal(); });
+  if (modalCancelBtn) modalCancelBtn.addEventListener('click', function() { closeModal(); });
+  if (transcriptModal) {
+    transcriptModal.addEventListener('click', function(e) {
+      if (e.target === transcriptModal) closeModal();
+    });
+  }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && transcriptModal && transcriptModal.classList.contains('visible')) {
+      closeModal();
+    }
+  });
+  if (modalSaveBtn) {
+    modalSaveBtn.addEventListener('click', function() {
+      var data = collectSaveData();
+      jmSend({ command: 'saveAllTranscripts', entries: data });
+      modalSaveBtn.disabled = true;
+      modalSaveBtn.textContent = 'Saving...';
+    });
+  }
+  if (deleteTranscriptsBtn) {
+    deleteTranscriptsBtn.addEventListener('click', function() {
+      // Mark all entries as deleted across all sessions (same as clicking each tab's delete)
+      if (!modalTabs || !modalBody) return;
+      var allTabs = modalTabs.querySelectorAll('.modal-tab:not(.session-deleted)');
+      for (var t = 0; t < allTabs.length; t++) {
+        var tabDeleteBtn = allTabs[t].querySelector('.session-delete-btn');
+        if (tabDeleteBtn) tabDeleteBtn.click();
+      }
+    });
+  }
+
+  // Handle transcript messages from IDE
+  window.addEventListener('jollimemory', function(e) {
+    var msg = e.detail;
+    if (msg.command === 'allTranscriptsLoaded') {
+      if (modalLoading) modalLoading.style.display = 'none';
+      renderTranscriptEntries(msg.entries || []);
+      var totalEntries = (msg.entries || []).length;
+      var sessions = {};
+      for (var i = 0; i < (msg.entries || []).length; i++) {
+        sessions[(msg.entries[i].source || 'claude') + ':' + msg.entries[i].sessionId] = true;
+      }
+      var sessionCount = Object.keys(sessions).length;
+      baseSubtitle = totalEntries + ' entries, ' + sessionCount + ' session' + (sessionCount !== 1 ? 's' : '');
+      if (modalSubtitle) modalSubtitle.textContent = baseSubtitle;
+    }
+    if (msg.command === 'transcriptsSaved') {
+      closeModal();
+    }
+    if (msg.command === 'transcriptsDeleted') {
+      // Modal already closed by deleteTranscriptsBtn handler
+    }
+    if (msg.command === 'transcriptsLoading') {
+      if (modalLoading) modalLoading.style.display = 'block';
+    }
+    if (msg.command === 'transcriptStatsLoaded') {
+      if (conversationsStats) {
+        var parts = [];
+        if (msg.claudeSessions > 0) parts.push('<strong>' + msg.claudeSessions + '</strong> Claude');
+        if (msg.codexSessions > 0) parts.push('<strong>' + msg.codexSessions + '</strong> Codex');
+        var totalSessions = (msg.claudeSessions || 0) + (msg.codexSessions || 0);
+        conversationsStats.innerHTML = '<strong>' + msg.totalEntries + '</strong> entries across <strong>' + totalSessions + '</strong> session' + (totalSessions !== 1 ? 's' : '') + ' (' + parts.join(', ') + ')';
+      }
+    }
+  });
+
+"""
+    }
+
+    // ── PR Section Script ──
+
+    /** Returns the JS for the PR section (auto-trigger + event handlers). */
+    private fun buildPrSectionScript(): String {
+        return """
+  // ── PR Section ──
+  var prStatusText = document.getElementById('prStatusText');
+  var prLinkRow = document.getElementById('prLinkRow');
+  var prActions = document.getElementById('prActions');
+  var prForm = document.getElementById('prForm');
+  var prTitleInput = document.getElementById('prTitleInput');
+  var prBodyInput = document.getElementById('prBodyInput');
+  var prFormCancel = document.getElementById('prFormCancel');
+  var prFormSubmit = document.getElementById('prFormSubmit');
+
+  var prCurrentState = 'loading';
+
+  /** Toggle visibility via the pr-hidden CSS class (CSP blocks inline style attributes). */
+  function prShow(el) { if (el) el.classList.remove('pr-hidden'); }
+  function prHide(el) { if (el) el.classList.add('pr-hidden'); }
+
+  // Auto-check PR status on load
+  jmSend({ command: 'checkPrStatus' });
+
+  // ── PR form event handlers ──
+  if (prFormCancel) {
+    prFormCancel.addEventListener('click', function() {
+      prHide(prForm);
+      prShow(prActions);
+      // Restore Edit PR button state
+      var editBtn = document.getElementById('editPrBtn');
+      if (editBtn) { editBtn.textContent = 'Edit PR'; editBtn.disabled = false; }
+      // Restore correct visibility based on current state
+      if (prCurrentState === 'ready') {
+        prHide(prStatusText);
+        prShow(prLinkRow);
+      } else {
+        prShow(prStatusText);
+        prHide(prLinkRow);
+      }
+    });
+  }
+  if (prFormSubmit) {
+    prFormSubmit.addEventListener('click', function() {
+      var title = prTitleInput.value.trim();
+      var body = prBodyInput.value;
+      if (!title) { prTitleInput.focus(); return; }
+      var mode = prForm.dataset.mode || 'create';
+      if (mode === 'update') {
+        jmSend({ command: 'updatePr', title: title, body: body });
+      } else {
+        jmSend({ command: 'createPr', title: title, body: body });
+      }
+    });
+  }"""
+    }
+
+    /** Returns the message-listener JS for PR status updates (inserted inside the main message listener). */
+    private fun buildPrMessageScript(): String {
+        return """
+    // ── PR Section status ──
+    if (msg.command === 'prStatus') {
+      var s = msg.status;
+      prCurrentState = s;
+      prHide(prForm);
+
+      if (s === 'multipleCommits') {
+        prStatusText.textContent = 'Branch has ' + msg.count + ' commits. Please squash into a single commit before creating or updating a PR.';
+        prShow(prStatusText);
+        prHide(prLinkRow);
+        prHide(prActions);
+      } else if (s === 'unavailable') {
+        prStatusText.textContent = 'GitHub CLI (gh) is not installed or not authenticated.';
+        prShow(prStatusText);
+        prHide(prLinkRow);
+        prHide(prActions);
+      } else if (s === 'noPr') {
+        prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '.';
+        prShow(prStatusText);
+        prHide(prLinkRow);
+        prActions.textContent = '';
+        var btn = document.createElement('button');
+        btn.className = 'action-btn';
+        btn.id = 'createPrBtn';
+        btn.textContent = 'Create PR';
+        prActions.appendChild(btn);
+        prShow(prActions);
+        // Bind Create PR button
+        btn.addEventListener('click', function() {
+          prHide(prStatusText);
+          prHide(prLinkRow);
+          prHide(prActions);
+          prShow(prForm);
+          prForm.dataset.mode = 'create';
+          prFormSubmit.textContent = 'Submit PR';
+          // Pre-fill form — values set via data attributes on prForm
+          prTitleInput.value = prForm.dataset.title || '';
+          prBodyInput.value = prForm.dataset.body || '';
+          prTitleInput.focus();
+        });
+      } else if (s === 'ready') {
+        var pr = msg.pr;
+        prHide(prStatusText);
+        // Build PR link via DOM
+        prLinkRow.textContent = '';
+        var a = document.createElement('a');
+        a.href = pr.url;
+        a.title = 'Open PR in browser';
+        a.textContent = '#' + pr.number + ' ' + pr.title;
+        prLinkRow.appendChild(a);
+        prShow(prLinkRow);
+        // Build Edit PR button via DOM
+        prActions.textContent = '';
+        var editBtn = document.createElement('button');
+        editBtn.className = 'action-btn';
+        editBtn.id = 'editPrBtn';
+        editBtn.textContent = 'Edit PR';
+        prActions.appendChild(editBtn);
+        prShow(prActions);
+        // Bind Edit PR button — asks IDE to prepare the form
+        editBtn.addEventListener('click', function() {
+          editBtn.textContent = 'Loading...';
+          editBtn.disabled = true;
+          jmSend({ command: 'prepareUpdatePr' });
+        });
+      }
+    }
+
+    // ── PR show update form ──
+    if (msg.command === 'prShowUpdateForm') {
+      prHide(prStatusText);
+      prHide(prLinkRow);
+      prHide(prActions);
+      prShow(prForm);
+      prForm.dataset.mode = 'update';
+      prFormSubmit.textContent = 'Update PR';
+      prFormSubmit.disabled = false;
+      prFormCancel.disabled = false;
+      prTitleInput.value = msg.title || '';
+      prBodyInput.value = msg.body || '';
+      prTitleInput.focus();
+    }
+
+    // ── PR form submit status (shared by create + update) ──
+    if (msg.command === 'prCreating' && prFormSubmit) {
+      prFormSubmit.textContent = 'Creating...';
+      prFormSubmit.disabled = true;
+      prFormCancel.disabled = true;
+    }
+    if (msg.command === 'prCreateError' && prFormSubmit) {
+      prFormSubmit.textContent = 'Submit PR';
+      prFormSubmit.disabled = false;
+      prFormCancel.disabled = false;
+    }
+    if (msg.command === 'prUpdating' && prFormSubmit) {
+      prFormSubmit.textContent = 'Updating...';
+      prFormSubmit.disabled = true;
+      prFormCancel.disabled = true;
+    }
+    if (msg.command === 'prUpdateError') {
+      // Reset Edit PR button if form is not yet shown (prepareUpdatePr failed)
+      var editBtn = document.getElementById('editPrBtn');
+      if (editBtn) { editBtn.textContent = 'Edit PR'; editBtn.disabled = false; }
+      // Reset form submit button if form is shown (updatePr failed)
+      if (prFormSubmit) {
+        prFormSubmit.textContent = 'Update PR';
+        prFormSubmit.disabled = false;
+        prFormCancel.disabled = false;
+      }
+    }"""
+    }
+}
