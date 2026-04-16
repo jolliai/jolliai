@@ -132,7 +132,7 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
 
     // ── Write API ───────────────────────────────────────────────────────────
 
-    fun storeSummary(summary: CommitSummary, force: Boolean = false, transcript: StoredTranscript? = null) {
+    fun storeSummary(summary: CommitSummary, force: Boolean = false, transcript: StoredTranscript? = null, planProgress: List<PlanProgressArtifact>? = null) {
         val existingIndex = loadIndex()
         val entryMap = (existingIndex?.entries ?: emptyList()).associateBy { it.commitHash }.toMutableMap()
 
@@ -156,6 +156,11 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
         )
         if (transcript != null && transcript.sessions.isNotEmpty()) {
             files.add(FileWrite("transcripts/${summary.commitHash}.json", gson.toJson(transcript)))
+        }
+        if (!planProgress.isNullOrEmpty()) {
+            for (artifact in planProgress) {
+                files.add(FileWrite("plan-progress/${artifact.planSlug}.json", gson.toJson(artifact)))
+            }
         }
 
         writeFilesToBranch(files, "Add summary for ${summary.commitHash.take(8)}: ${summary.commitMessage.take(50)}")

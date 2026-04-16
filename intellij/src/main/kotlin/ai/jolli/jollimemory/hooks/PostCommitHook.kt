@@ -2,6 +2,8 @@ package ai.jolli.jollimemory.hooks
 
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.core.*
+import ai.jolli.jollimemory.services.PlanService
+import java.io.File
 import java.time.Instant
 
 /**
@@ -211,6 +213,53 @@ object PostCommitHook {
                 model = config.model,
             ))
 
+            // 8b. Detect uncommitted plans, archive, and evaluate progress
+            val planRefs = mutableListOf<PlanReference>()
+            val planProgressArtifacts = mutableListOf<PlanProgressArtifact>()
+
+            val uncommittedSlugs = detectUncommittedPlanSlugs(cwd)
+            if (uncommittedSlugs.isNotEmpty()) {
+                log.info("Detected %d uncommitted plan(s): %s", uncommittedSlugs.size, uncommittedSlugs.joinToString(", "))
+                val plansDir = File(System.getProperty("user.home"), ".claude/plans")
+                val topics: List<TopicSummary> = summaryResult.topics ?: emptyList()
+                val commitDate = Instant.parse(commitInfo.date).toString()
+
+                for (slug in uncommittedSlugs) {
+                    // Read plan markdown before archiving (retain for eval)
+                    val planFile = File(plansDir, "$slug.md")
+                    val planMarkdown = if (planFile.exists()) planFile.readText(Charsets.UTF_8) else null
+
+                    // Archive: renames slug to slug-hash in registry, stores plan on orphan branch
+                    val ref = PlanService.archivePlanForCommit(slug, commitInfo.hash, store, cwd)
+                    if (ref != null) {
+                        planRefs.add(ref)
+
+                        // Evaluate progress via Haiku LLM call
+                        if (planMarkdown != null) {
+                            val result = try {
+                                PlanProgressEvaluator.evaluatePlanProgress(
+                                    planMarkdown, diff, topics, conversation, apiKey,
+                                )
+                            } catch (e: Exception) {
+                                log.warn("Plan progress eval failed for %s: %s", slug, e.message)
+                                null
+                            }
+
+                            if (result != null) {
+                                planProgressArtifacts.add(result.copy(
+                                    commitHash = commitInfo.hash,
+                                    commitMessage = commitInfo.message,
+                                    commitDate = commitDate,
+                                    planSlug = ref.slug,
+                                    originalSlug = slug,
+                                ))
+                            }
+                        }
+                    }
+                }
+                log.info("Plan progress: evaluated %d/%d plan(s)", planProgressArtifacts.size, planRefs.size)
+            }
+
             // 9. Build and store CommitSummary
             val branch = git.getCurrentBranch() ?: "unknown"
             val commitType = detectCommitType()
@@ -230,6 +279,7 @@ object PostCommitHook {
                 stats = summaryResult.stats,
                 topics = summaryResult.topics,
                 ticketId = summaryResult.ticketId,
+                plans = planRefs.takeIf { it.isNotEmpty() },
             )
 
             // Store transcript data alongside summary
@@ -238,7 +288,7 @@ object PostCommitHook {
             }
             val storedTranscript = StoredTranscript(storedSessions)
 
-            store.storeSummary(summary, force = force, transcript = storedTranscript)
+            store.storeSummary(summary, force = force, transcript = storedTranscript, planProgress = planProgressArtifacts.takeIf { it.isNotEmpty() })
             log.info("=== PostCommitHook worker finished ===")
 
         } finally {
@@ -276,6 +326,15 @@ object PostCommitHook {
             reflogAction.startsWith("commit") -> CommitType.commit
             else -> CommitType.commit
         }
+    }
+
+    /** Returns slugs of plans in plans.json that are not yet committed and not ignored. */
+    private fun detectUncommittedPlanSlugs(cwd: String): Set<String> {
+        val registry = SessionTracker.loadPlansRegistry(cwd)
+        return registry.plans.entries
+            .filter { (_, entry) -> entry.commitHash == null && entry.ignored != true }
+            .map { (slug, _) -> slug }
+            .toSet()
     }
 
     private fun parseDiffStats(statOutput: String): DiffStats {

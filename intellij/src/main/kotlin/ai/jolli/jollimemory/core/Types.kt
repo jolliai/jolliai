@@ -223,6 +223,32 @@ data class NoteReference(
     val jolliNoteDocId: Int? = null,
 )
 
+// ── Plan Progress types ────────────────────────────────────────────────────
+
+/** Status of a single step in a plan */
+enum class PlanStepStatus { completed, in_progress, not_started }
+
+/** A single step within a plan progress evaluation */
+data class PlanStep(
+    val id: String,
+    val description: String,
+    val status: PlanStepStatus,
+    val note: String? = null,
+)
+
+/** Result of evaluating plan progress against a commit */
+data class PlanProgressArtifact(
+    val version: Int = 1,
+    val commitHash: String,
+    val commitMessage: String,
+    val commitDate: String,
+    val planSlug: String,
+    val originalSlug: String,
+    val summary: String,
+    val steps: List<PlanStep>,
+    val llm: LlmCallMetadata,
+)
+
 /** Lightweight index entry for the summary index file */
 data class SummaryIndexEntry(
     val commitHash: String,
