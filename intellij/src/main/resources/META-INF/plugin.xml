@@ -1,0 +1,156 @@
+<idea-plugin>
+    <id>ai.jolli.jollimemory</id>
+    <name>JolliMemory</name>
+    <vendor url="https://jolli.ai">Jolli</vendor>
+
+    <description><![CDATA[
+        AI-powered commit summaries and smart git operations.<br/>
+        Automatically captures your AI coding conversations (Claude Code, Gemini CLI, Codex)
+        and generates structured summaries for each commit — so you always remember <em>why</em>.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>Git4Idea</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Project-level service: manages hook installation and core library integration -->
+        <projectService
+            serviceImplementation="ai.jolli.jollimemory.services.JolliMemoryService"/>
+
+        <!-- Tool window: sidebar with collapsible STATUS, MEMORIES, PLANS & NOTES, CHANGES, COMMITS panels -->
+        <toolWindow
+            id="JOLLI MEMORY"
+            anchor="right"
+            secondary="true"
+            icon="/icons/jollimemory.svg"
+            factoryClass="ai.jolli.jollimemory.toolwindow.JolliMemoryToolWindowFactory"/>
+
+        <!-- Post-startup activity to auto-detect and install hooks -->
+        <postStartupActivity
+            implementation="ai.jolli.jollimemory.services.JolliMemoryStartupActivity"/>
+
+        <!-- Editor tab provider for embedded commit memory webview (like VS Code) -->
+        <fileEditorProvider
+            implementation="ai.jolli.jollimemory.toolwindow.SummaryEditorProvider"/>
+
+        <!-- Notification group for balloon notifications (e.g., no-Git warning) -->
+        <notificationGroup
+            id="JolliMemory"
+            displayType="BALLOON"/>
+
+        <!-- Settings page -->
+        <projectConfigurable
+            instance="ai.jolli.jollimemory.settings.JolliMemoryConfigurable"
+            id="ai.jolli.jollimemory.settings"
+            displayName="Jolli Memory"
+            parentId="tools"/>
+    </extensions>
+
+    <actions>
+        <!-- STATUS panel actions -->
+        <group id="JolliMemory.StatusActions" text="JolliMemory Status">
+            <action id="JolliMemory.RefreshStatus"
+                    class="ai.jolli.jollimemory.actions.RefreshStatusAction"
+                    text="Refresh Status"
+                    description="Refresh Jolli Memory status"
+                    icon="AllIcons.Actions.Refresh"/>
+        </group>
+
+        <!-- Plans & Notes panel actions -->
+        <group id="JolliMemory.PlansActions" text="JolliMemory Plans &amp; Notes">
+            <action id="JolliMemory.AddPlan"
+                    class="ai.jolli.jollimemory.actions.AddPlanAction"
+                    text="Add Plan"
+                    description="Add a plan from ~/.claude/plans/"
+                    icon="AllIcons.General.Add"/>
+            <action id="JolliMemory.AddNote"
+                    class="ai.jolli.jollimemory.actions.AddNoteAction"
+                    text="Add Note"
+                    description="Add a markdown file or text snippet note"/>
+            <action id="JolliMemory.RefreshPlans"
+                    class="ai.jolli.jollimemory.actions.RefreshPlansAction"
+                    text="Refresh"
+                    description="Refresh plans and notes list"
+                    icon="AllIcons.Actions.Refresh"/>
+        </group>
+
+        <!-- Changes panel actions -->
+        <group id="JolliMemory.ChangesActions" text="JolliMemory Changes">
+            <action id="JolliMemory.SelectAllFiles"
+                    class="ai.jolli.jollimemory.actions.SelectAllFilesAction"
+                    text="Select/Deselect All Files"
+                    description="Toggle selection of all changed files"
+                    icon="AllIcons.Actions.Selectall"/>
+            <action id="JolliMemory.CommitAI"
+                    class="ai.jolli.jollimemory.actions.CommitAIAction"
+                    text="AI Commit"
+                    description="Generate AI commit message and commit selected files"
+                    icon="/icons/sparkle.svg"/>
+            <action id="JolliMemory.RefreshChanges"
+                    class="ai.jolli.jollimemory.actions.RefreshChangesAction"
+                    text="Refresh Changes"
+                    description="Refresh changed files"
+                    icon="AllIcons.Actions.Refresh"/>
+        </group>
+
+        <!-- Commits panel actions -->
+        <group id="JolliMemory.CommitsActions" text="JolliMemory Commits">
+            <action id="JolliMemory.SelectAllCommits"
+                    class="ai.jolli.jollimemory.actions.SelectAllCommitsAction"
+                    text="Select/Deselect All Commits"
+                    description="Toggle selection of all commits"
+                    icon="AllIcons.Actions.Selectall"/>
+            <action id="JolliMemory.Squash"
+                    class="ai.jolli.jollimemory.actions.SquashAction"
+                    text="Squash Selected"
+                    description="Squash selected commits"
+                    icon="/icons/git-merge.svg"/>
+            <action id="JolliMemory.RefreshCommits"
+                    class="ai.jolli.jollimemory.actions.RefreshCommitsAction"
+                    text="Refresh Commits"
+                    description="Refresh commit history"
+                    icon="AllIcons.Actions.Refresh"/>
+        </group>
+
+        <!-- Memories panel actions (includes Enable/Disable/Settings moved from Status) -->
+        <group id="JolliMemory.MemoriesActions" text="JolliMemory Memories">
+            <action id="JolliMemory.Enable"
+                    class="ai.jolli.jollimemory.actions.EnableAction"
+                    text="Enable Jolli Memory"
+                    description="Install Jolli Memory hooks"
+                    icon="AllIcons.Actions.Execute"/>
+            <action id="JolliMemory.Disable"
+                    class="ai.jolli.jollimemory.actions.DisableAction"
+                    text="Disable Jolli Memory"
+                    description="Remove Jolli Memory hooks"
+                    icon="AllIcons.Actions.Suspend"/>
+            <action id="JolliMemory.StatusSettings"
+                    class="ai.jolli.jollimemory.actions.StatusSettingsAction"
+                    text="Settings"
+                    description="Jolli Memory settings"
+                    icon="AllIcons.General.GearPlain"/>
+            <action id="JolliMemory.SearchMemories"
+                    class="ai.jolli.jollimemory.actions.SearchMemoriesAction"
+                    text="Search Memories"
+                    description="Search memories by commit message or branch name"
+                    icon="AllIcons.Actions.Search"/>
+            <action id="JolliMemory.ClearMemoryFilter"
+                    class="ai.jolli.jollimemory.actions.ClearMemoryFilterAction"
+                    text="Clear Filter"
+                    description="Clear the active memory search filter"
+                    icon="AllIcons.Actions.Close"/>
+            <action id="JolliMemory.RefreshMemories"
+                    class="ai.jolli.jollimemory.actions.RefreshMemoriesAction"
+                    text="Refresh Memories"
+                    description="Refresh the memories list"
+                    icon="AllIcons.Actions.Refresh"/>
+        </group>
+
+        <!-- Standalone action (not in a panel toolbar) -->
+        <action id="JolliMemory.ViewSummary"
+                class="ai.jolli.jollimemory.actions.ViewSummaryAction"
+                text="View Commit Memory"
+                description="View the AI-generated summary for this commit"
+                icon="/icons/eye.svg"/>
+    </actions>
+</idea-plugin>
