@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.actions
 
+import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
@@ -17,7 +18,15 @@ class PushAction : AnAction() {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
         val service = project.getService(JolliMemoryService::class.java)
+        val cwd = service.mainRepoRoot ?: project.basePath ?: return
         val git = service.getGitOps() ?: return
+
+        if (SessionTracker.isWorkerBusy(cwd)) {
+            Messages.showWarningDialog(project,
+                "AI summary is being generated. Please wait a moment.",
+                "Jolli Memory")
+            return
+        }
 
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Jolli Memory: Pushing...", false) {
             override fun run(indicator: ProgressIndicator) {
@@ -49,7 +58,10 @@ class PushAction : AnAction() {
     }
 
     override fun update(e: AnActionEvent) {
-        val status = e.project?.getService(JolliMemoryService::class.java)?.getStatus()
-        e.presentation.isEnabled = status != null && status.enabled
+        val service = e.project?.getService(JolliMemoryService::class.java)
+        val status = service?.getStatus()
+        val cwd = service?.mainRepoRoot ?: e.project?.basePath
+        val workerBusy = cwd != null && SessionTracker.isWorkerBusy(cwd)
+        e.presentation.isEnabled = status != null && status.enabled && !workerBusy
     }
 }

@@ -278,7 +278,10 @@ class CommitAIAction : AnAction() {
     }
 
     override fun update(e: AnActionEvent) {
-        val status = e.project?.getService(JolliMemoryService::class.java)?.getStatus()
-        e.presentation.isEnabled = status != null && status.enabled
+        val service = e.project?.getService(JolliMemoryService::class.java)
+        val status = service?.getStatus()
+        val cwd = service?.mainRepoRoot ?: e.project?.basePath
+        val workerBusy = cwd != null && SessionTracker.isWorkerBusy(cwd)
+        e.presentation.isEnabled = status != null && status.enabled && !workerBusy
     }
 }

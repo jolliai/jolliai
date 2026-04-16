@@ -188,18 +188,16 @@ class GitOps(private val projectDir: String) {
         return output.lines().filter { it.isNotBlank() }
     }
 
-    /** Stages one or more files. */
+    /** Stages one or more files in a single git command. */
     fun stageFiles(paths: List<String>) {
-        for (path in paths) {
-            exec("add", path)
-        }
+        if (paths.isEmpty()) return
+        exec(*( listOf("add", "--") + paths ).toTypedArray())
     }
 
-    /** Unstages one or more tracked files. */
+    /** Unstages one or more tracked files in a single git command. */
     fun unstageFiles(paths: List<String>) {
-        for (path in paths) {
-            exec("restore", "--staged", path)
-        }
+        if (paths.isEmpty()) return
+        exec(*( listOf("restore", "--staged", "--") + paths ).toTypedArray())
     }
 
     /**
