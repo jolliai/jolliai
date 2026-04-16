@@ -48,6 +48,14 @@ class SquashAction : AnAction() {
         val service = project.getService(JolliMemoryService::class.java)
         val git = service.getGitOps() ?: return
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
+
+        if (SessionTracker.isWorkerBusy(cwd)) {
+            Messages.showWarningDialog(project,
+                "AI summary is being generated. Please wait a moment.",
+                "Jolli Memory")
+            return
+        }
+
         val config = SessionTracker.loadConfig(cwd)
 
         // Get selected commits from CommitsPanel if available, otherwise use all branch commits
@@ -230,8 +238,11 @@ class SquashAction : AnAction() {
     }
 
     override fun update(e: AnActionEvent) {
-        val status = e.project?.getService(JolliMemoryService::class.java)?.getStatus()
-        e.presentation.isEnabled = status != null && status.enabled
+        val service = e.project?.getService(JolliMemoryService::class.java)
+        val status = service?.getStatus()
+        val cwd = service?.mainRepoRoot ?: e.project?.basePath
+        val workerBusy = cwd != null && SessionTracker.isWorkerBusy(cwd)
+        e.presentation.isEnabled = status != null && status.enabled && !workerBusy
     }
 }
 
