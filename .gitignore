@@ -1,4 +1,5 @@
 .jolli/
 .claude/settings.json
+.claude/settings.local.json
 .claude/skills/
 .gemini/
