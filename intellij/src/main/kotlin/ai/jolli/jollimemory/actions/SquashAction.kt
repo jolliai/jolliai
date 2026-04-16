@@ -130,6 +130,18 @@ class SquashAction : AnAction() {
                         ApplicationManager.getApplication().executeOnPooledThread {
                             indicator.text = "Squashing commits..."
 
+                            // Snapshot index and HEAD for safe restore on failure
+                            val originalIndexTree = git.writeTree()
+                            val originalHead = git.getHeadHash()
+                            if (originalIndexTree == null || originalHead == null) {
+                                ApplicationManager.getApplication().invokeLater {
+                                    Messages.showErrorDialog(project,
+                                        "Could not snapshot the current git state. Squash aborted to avoid data loss.",
+                                        "Jolli Memory")
+                                }
+                                return@executeOnPooledThread
+                            }
+
                             // Order oldest-first (matching VS Code SquashCommand behavior).
                             // getBranchCommits() and getSelectedCommits() return newest-first.
                             val orderedCommits = commits.reversed()
@@ -160,24 +172,27 @@ class SquashAction : AnAction() {
                             SessionTracker.savePluginSource(cwd)
                             SessionTracker.saveSquashPending(hashes, forkPoint, cwd)
 
-                            // Step 3: Soft reset to fork point (stages all changes)
-                            val resetResult = git.exec("reset", "--soft", forkPoint)
-                            log.info("git reset --soft %s → %s", forkPoint.take(8),
-                                if (resetResult != null) "ok" else "FAILED")
+                            try {
+                                // Step 3: Soft reset to fork point (stages all changes)
+                                val resetResult = git.exec("reset", "--soft", forkPoint)
+                                if (resetResult == null) throw RuntimeException("git reset --soft failed")
+                                log.info("git reset --soft %s → ok", forkPoint.take(8))
 
-                            // Step 4: Create the squash commit
-                            val commitResult = git.exec("commit", "-m", edited)
-                            if (commitResult == null) {
-                                log.error("git commit failed after reset --soft")
+                                // Step 4: Create the squash commit
+                                val commitResult = git.exec("commit", "-m", edited)
+                                if (commitResult == null) throw RuntimeException("git commit failed after reset")
+                                log.info("Squash commit created successfully")
+                            } catch (ex: Exception) {
+                                log.error("Squash failed, restoring state: %s", ex.message)
+                                git.exec("reset", "--soft", originalHead)
+                                git.readTree(originalIndexTree)
                                 ApplicationManager.getApplication().invokeLater {
                                     Messages.showErrorDialog(project,
-                                        "Squash failed: git commit returned an error after reset. " +
-                                            "Your changes are staged — you can commit manually.",
+                                        "Squash failed: ${ex.message}\n\nYour staging area and HEAD have been restored.",
                                         "Jolli Memory")
                                 }
                                 return@executeOnPooledThread
                             }
-                            log.info("Squash commit created successfully")
 
                             // Step 5: Optional force push (matching VS Code "Squash & Push")
                             if (shouldPush) {
