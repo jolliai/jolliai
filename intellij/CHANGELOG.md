@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.97.8
+
+- **Fix scheduled-for-removal API** — replace `PluginId.findId()` with `PluginId.getId()` to resolve Plugin Verifier warnings
+- **Add Plugin Verifier to CI** — verify binary compatibility against IntelliJ 2024.3, 2025.1, and 2026.1 on every build
+
+## 0.97.7
+
+- **Bump version** — version bump for standalone repository migration
+
+## 0.97.6
+
+- **Marketplace readiness** — add plugin icons (`pluginIcon.svg` with dark variant), configure Gradle plugin signing and publishing, add Apache 2.0 LICENSE
+
 ## 0.97.5
 
 - **Install Gemini CLI hooks** — the Enable button now writes the AfterAgent hook to `.gemini/settings.json`, matching the VS Code extension

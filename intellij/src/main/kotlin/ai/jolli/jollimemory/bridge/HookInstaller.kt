@@ -442,12 +442,10 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             // Use IntelliJ Plugin API to find our plugin's installation path.
             // This will throw NoClassDefFoundError when running from the hooks JAR
             // (outside IntelliJ), which is caught below.
-            val pluginId = com.intellij.openapi.extensions.PluginId.findId("ai.jolli.jollimemory")
+            val pluginId = com.intellij.openapi.extensions.PluginId.getId("ai.jolli.jollimemory")
             searchLog.appendLine("pluginId=$pluginId")
 
-            val plugin = if (pluginId != null) {
-                com.intellij.ide.plugins.PluginManagerCore.getPlugin(pluginId)
-            } else null
+            val plugin = com.intellij.ide.plugins.PluginManagerCore.getPlugin(pluginId)
             searchLog.appendLine("plugin=${plugin?.name} version=${plugin?.version}")
 
             val pluginPath = plugin?.pluginPath

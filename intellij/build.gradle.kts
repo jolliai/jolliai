@@ -1,3 +1,5 @@
+import org.jetbrains.intellij.platform.gradle.IntelliJPlatformType
+
 plugins {
     id("java")
     id("org.jetbrains.kotlin.jvm") version "2.1.20"
@@ -7,7 +9,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.97.7"
+version = "0.97.8"
 
 repositories {
     mavenCentral()
@@ -24,8 +26,14 @@ dependencies {
         intellijIdeaCommunity("2024.3")
         bundledPlugin("com.intellij.java")
         bundledPlugin("Git4Idea")
+        pluginVerifier()
         instrumentationTools()
     }
+    // Plugin Verifier notes (JOLLI-1285):
+    // kotlin-stdlib Boxing class uses deprecated JDK wrapper constructors (6) — upstream Kotlin issue.
+    // Gson 2.12.1 uses deprecated Locale/URL constructors, JsonElement.getAsCharacter(),
+    // and Class.newInstance() (7) — latest version, no upstream fix available.
+    // All 13 deprecated-API warnings are dependency-internal, not in our source code.
     implementation("com.google.code.gson:gson:2.12.1")
     compileOnly("org.jetbrains.kotlin:kotlin-stdlib")
     hooksRuntime("org.jetbrains.kotlin:kotlin-stdlib:2.1.20")
@@ -126,6 +134,26 @@ intellijPlatform {
             </p>
         """.trimIndent()
         changeNotes = """
+            <h3>0.97.8</h3>
+            <ul>
+                <li><b>Fix scheduled-for-removal API</b> &mdash; replace <code>PluginId.findId()</code>
+                    with <code>PluginId.getId()</code> to resolve Plugin Verifier warnings</li>
+                <li><b>Add Plugin Verifier to CI</b> &mdash; verify binary compatibility against
+                    IntelliJ 2024.3, 2025.1, and 2026.1 on every build</li>
+            </ul>
+
+            <h3>0.97.7</h3>
+            <ul>
+                <li><b>Bump version</b> &mdash; version bump for standalone repository migration</li>
+            </ul>
+
+            <h3>0.97.6</h3>
+            <ul>
+                <li><b>Marketplace readiness</b> &mdash; add plugin icons (<code>pluginIcon.svg</code>
+                    with dark variant), configure Gradle plugin signing and publishing,
+                    add Apache 2.0 LICENSE</li>
+            </ul>
+
             <h3>0.97.5</h3>
             <ul>
                 <li><b>Install Gemini CLI hooks</b> &mdash; the Enable button now writes the AfterAgent hook
@@ -211,6 +239,13 @@ intellijPlatform {
         ideaVersion {
             sinceBuild = "243"
             untilBuild = "262.*"
+        }
+    }
+
+    pluginVerification {
+        ides {
+            ide(IntelliJPlatformType.IntellijIdeaCommunity, "2024.3")
+            ide(IntelliJPlatformType.IntellijIdeaCommunity, "2025.1.3")
         }
     }
 
