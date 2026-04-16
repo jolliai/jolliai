@@ -18,6 +18,8 @@ import com.intellij.util.ui.JBUI
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryChangeListener
 import java.awt.BorderLayout
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.awt.Color
 import java.awt.Component
 import java.awt.Cursor
@@ -77,8 +79,9 @@ class CommitsPanel(
     )
     private val checkedHashes = mutableSetOf<String>()
     private var commits: List<CommitSummaryBrief> = emptyList()
-    /** Cache of files per commit hash — avoids re-running git for expanded commits. */
-    private val fileCache = mutableMapOf<String, List<CommitFileInfo>>()
+    /** Cache of files per commit hash — avoids re-running git for expanded commits.
+     *  Stores a CompletableFuture so that concurrent expands share the same in-flight request. */
+    private val fileCache = ConcurrentHashMap<String, CompletableFuture<List<CommitFileInfo>>>()
     /** Per-commit UI state for expand/collapse and checkbox management. */
     private val commitRowStates = mutableMapOf<String, CommitRowState>()
     /** True when the branch is fully merged into main (read-only history view). */
@@ -381,7 +384,7 @@ class CommitsPanel(
         listPanel.repaint()
     }
 
-    /** Lazily loads commit files on first expansion. */
+    /** Lazily loads commit files on first expansion, deduplicating in-flight git queries. */
     private fun loadCommitFiles(hash: String) {
         val state = commitRowStates[hash] ?: return
 
@@ -394,24 +397,36 @@ class CommitsPanel(
         })
         state.fileContainer.revalidate()
 
-        ApplicationManager.getApplication().executeOnPooledThread {
-            val files = fileCache.getOrPut(hash) { service.listCommitFiles(hash) }
+        // If a future already exists for this hash, reuse it (dedup in-flight requests).
+        // computeIfAbsent is atomic on ConcurrentHashMap, so only one thread creates the future.
+        val future = fileCache.computeIfAbsent(hash) {
+            CompletableFuture.supplyAsync(
+                { service.listCommitFiles(hash) },
+                { cmd -> ApplicationManager.getApplication().executeOnPooledThread(cmd) },
+            )
+        }
+
+        future.whenComplete { files, error ->
+            if (error != null) {
+                fileCache.remove(hash)
+            }
             SwingUtilities.invokeLater {
                 val currentState = commitRowStates[hash] ?: return@invokeLater
                 currentState.fileContainer.removeAll()
 
-                if (files.isEmpty()) {
-                    currentState.fileContainer.add(JLabel("(no files)").apply {
+                val result = files ?: emptyList()
+                if (result.isEmpty()) {
+                    currentState.fileContainer.add(JLabel(if (error != null) "(failed to load)" else "(no files)").apply {
                         foreground = Color.GRAY
                         border = JBUI.Borders.empty(2, 28)
                         alignmentX = Component.LEFT_ALIGNMENT
                     })
                 } else {
-                    for (file in files) {
+                    for (file in result) {
                         currentState.fileContainer.add(createFileRow(hash, file))
                     }
                 }
-                currentState.filesLoaded = true
+                currentState.filesLoaded = error == null
                 currentState.fileContainer.revalidate()
                 currentState.fileContainer.repaint()
             }
