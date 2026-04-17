@@ -142,7 +142,7 @@ All settings can be configured from **Settings > Tools > Jolli Memory** or via t
 
 | Field | Type | Default | Description |
 | -- | -- | -- | -- |
-| `apiKey` | string | `$ANTHROPIC_API_KEY` | Your Anthropic API key for AI summarization (generate one at [platform.anthropic.com](https://platform.claude.com/)) |
+| `apiKey` | string | `$ANTHROPIC_API_KEY` | Your Anthropic API key for AI summarization (generate one at [platform.claude.com](https://platform.claude.com/)) |
 | `model` | string | `claude-haiku-4-5-20251001` | Model used for summarization |
 | `jolliApiKey` | string | — | Jolli Space API key for pushing summaries to your team knowledge base |
 

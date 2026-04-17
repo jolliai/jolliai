@@ -1,0 +1,61 @@
+name: 🐛 Bug Report
+description: Report a bug in Jolli Memory
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please provide the details below to help us reproduce and fix it.
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin Version
+      description: Found under Settings → Plugins → Jolli Memory
+      placeholder: e.g. 0.97.8
+    validations:
+      required: true
+
+  - type: input
+    id: ide-version
+    attributes:
+      label: IDE Version
+      description: Help → About (e.g. IntelliJ IDEA 2025.1)
+      placeholder: e.g. IntelliJ IDEA 2025.1 (Ultimate)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - macOS
+        - Linux
+        - Windows
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Go to ...
+        2. Click on ...
+        3. See error
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Check `~/.jolli/logs/` for plugin logs
+      render: shell

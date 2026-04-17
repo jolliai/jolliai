@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & Discussions
+    url: https://github.com/jolliai/jollimemory/discussions
+    about: Ask questions or share ideas
+  - name: 🔐 Security Vulnerabilities
+    url: https://github.com/jolliai/jollimemory/security/advisories/new
+    about: Report security issues privately (do not file public issues)
