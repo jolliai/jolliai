@@ -8,8 +8,8 @@
 # Ensure JDK 21 is available
 export JAVA_HOME=/opt/homebrew/opt/openjdk@21  # macOS with Homebrew
 
-# Build the plugin
-cd tools/jollimemory-intellij
+# From repo root, enter the plugin directory and build
+cd intellij
 ./gradlew build
 ```
 
