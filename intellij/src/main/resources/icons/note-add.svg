@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Note/document body with folded corner -->
+  <path fill="#6E7681" d="M3 2h7l3 3v5.586L9.586 14H3V2zm1 1v10h5v-3.5h3.5V5.5h-2v-2.5H4zm7 1.707V5.5h.793L11 4.707z"/>
+  <!-- Plus sign -->
+  <path fill="#6E7681" d="M7 5h1v2h2v1H8v2H7V8H5V7h2V5z"/>
+</svg>
