@@ -1,3 +1,36 @@
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Gradle
+.gradle/
+build/
+
+# Kotlin / Java artifacts
+*.class
+*.jar
+*.war
+*.ear
+
+# Re-include Gradle wrapper jar
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
+*~
+
+# Environment
+.env
+.env.*
+
+# Jolli / Claude
 .jolli/
 .claude/
 .gemini/

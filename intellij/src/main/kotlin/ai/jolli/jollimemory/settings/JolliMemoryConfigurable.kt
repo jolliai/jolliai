@@ -41,7 +41,17 @@ class JolliMemoryConfigurable(private val project: Project) : Configurable {
         // Load current values
         loadFromConfig()
 
+        val privacyNotice = JBLabel(
+            "<html>By providing an API key, you consent to sending code diffs and AI session " +
+            "transcripts to third-party AI providers (e.g., Anthropic). " +
+            "<a href=\"https://github.com/Jolli-sample-repos/privacy/blob/main/privacy.md\">Privacy Policy</a></html>"
+        ).apply {
+            setCopyable(true)
+        }
+
         return FormBuilder.createFormBuilder()
+            .addComponent(privacyNotice)
+            .addSeparator()
             .addLabeledComponent(JBLabel("Anthropic API Key:"), apiKeyField!!, 1, false)
             .addTooltip("Required for AI commit summaries. Get yours at console.anthropic.com")
             .addLabeledComponent(JBLabel("Model:"), modelField!!, 1, false)

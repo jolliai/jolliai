@@ -1,4 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40" fill="none">
-  <rect x="4" y="12" width="24" height="20" rx="3" stroke="#AFB8C1" stroke-width="2" fill="#AFB8C1" fill-opacity="0.08" opacity="0.5"/>
-  <rect x="12" y="6" width="24" height="20" rx="3" stroke="#AFB8C1" stroke-width="2.5" fill="#AFB8C1" fill-opacity="0.08"/>
+<svg width="40" height="40" viewBox="0 0 61 56" xmlns="http://www.w3.org/2000/svg">
+
+  <!-- Edges -->
+  <g stroke="#8F88D8" stroke-width="2.4" stroke-linecap="round" fill="none" opacity="0.9">
+    <!-- outer connections -->
+    <line x1="29.25" y1="6.88" x2="5.50" y2="25.67"/>
+    <line x1="29.25" y1="6.88" x2="50.05" y2="18.21"/>
+    <line x1="5.5" y1="25.67" x2="11.65" y2="49.42"/>
+    <line x1="11.65" y1="49.42" x2="53.70" y2="40.68"/>
+    <line x1="53.70" y1="40.68" x2="50.05" y2="18.21"/>
+
+    <!-- center connections -->
+    <line x1="29.05" y1="30.48" x2="29.25" y2="6.88"/>
+    <line x1="29.05" y1="30.48" x2="5.50" y2="25.67"/>
+    <line x1="29.05" y1="30.48" x2="50.05" y2="18.21"/>
+    <line x1="29.05" y1="30.48" x2="11.65" y2="49.42"/>
+    <line x1="29.05" y1="30.48" x2="53.70" y2="40.68"/>
+  </g>
+
+  <!-- nodes -->
+  <circle cx="29.25" cy="6.88" r="6.98" fill="#4C8CFF"/>
+  <circle cx="50.05" cy="18.21" r="5.53" fill="#20D4E8"/>
+  <circle cx="5.5" cy="25.67" r="5.17" fill="#6FB3FF"/>
+  <circle cx="53.70" cy="40.68" r="6.96" fill="#7B7BFF"/>
+  <circle cx="11.65" cy="49.42" r="6.02" fill="#C3A6FF"/>
+  <circle cx="29.05" cy="30.48" r="7.82" fill="#9B5CFF"/>
+
 </svg>

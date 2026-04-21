@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.97.8"
+version = "0.97.9"
 
 repositories {
     mavenCentral()
@@ -132,6 +132,13 @@ intellijPlatform {
             </p>
         """.trimIndent()
         changeNotes = """
+            <h3>0.97.9</h3>
+            <ul>
+                <li><b>Privacy consent notice</b> &mdash; display a privacy notice with link to
+                    privacy policy at the top of the Settings page, satisfying JetBrains Marketplace
+                    guideline 2.2 for explicit user consent before data processing</li>
+            </ul>
+
             <h3>0.97.8</h3>
             <ul>
                 <li><b>Fix scheduled-for-removal API</b> &mdash; replace <code>PluginId.findId()</code>
