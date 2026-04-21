@@ -1,5 +1,10 @@
 .jolli/
-.claude/settings.json
-.claude/settings.local.json
-.claude/skills/
+.claude/
 .gemini/
+.codex/
+.opencode/
+.DS_Store
+**/dist/
+**/coverage/
+**/node_modules/
+**/*.vsix
