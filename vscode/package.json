@@ -1,0 +1,564 @@
+{
+	"name": "jollimemory-vscode",
+	"displayName": "Jolli Memory",
+	"description": "VS Code sidebar for Jolli Memory — AI-powered commit summaries and smart git operations",
+	"version": "0.98.0",
+	"publisher": "jolli",
+	"license": "Apache-2.0",
+	"icon": "assets/icon.png",
+	"homepage": "https://github.com/jolliai/jollimemory/tree/main/vscode#readme",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/jolliai/jollimemory"
+	},
+	"bugs": {
+		"url": "https://github.com/jolliai/jollimemory/issues"
+	},
+	"keywords": [
+		"ai",
+		"documentation",
+		"git",
+		"commit",
+		"memory",
+		"claude",
+		"codex",
+		"gemini",
+		"pr",
+		"summary"
+	],
+	"engines": {
+		"vscode": "^1.80.0"
+	},
+	"categories": [
+		"AI",
+		"SCM Providers",
+		"Other"
+	],
+	"activationEvents": [
+		"workspaceContains:.git",
+		"onUri"
+	],
+	"main": "./dist/Extension.js",
+	"contributes": {
+		"submenus": [
+			{
+				"id": "jollimemory.addMenu",
+				"label": "Add Plan or Note",
+				"icon": "$(add)"
+			}
+		],
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "jollimemory",
+					"title": "Jolli Memory",
+					"icon": "assets/icon.svg"
+				}
+			]
+		},
+		"views": {
+			"jollimemory": [
+				{
+					"id": "jollimemory.statusView",
+					"name": "STATUS",
+					"type": "tree",
+					"visibility": "collapsed"
+				},
+				{
+					"id": "jollimemory.memoriesView",
+					"name": "Memories",
+					"type": "tree",
+					"size": 3
+				},
+				{
+					"id": "jollimemory.plansView",
+					"name": "Plans & Notes",
+					"type": "tree",
+					"size": 5
+				},
+				{
+					"id": "jollimemory.filesView",
+					"name": "Changes",
+					"type": "tree"
+				},
+				{
+					"id": "jollimemory.historyView",
+					"name": "Commits",
+					"type": "tree"
+				}
+			]
+		},
+		"viewsWelcome": [
+			{
+				"view": "jollimemory.statusView",
+				"contents": "Jolli Memory is disabled.",
+				"when": "jollimemory.enabled == false"
+			},
+			{
+				"view": "jollimemory.memoriesView",
+				"contents": "Every commit deserves a Memory. Every memory deserves a Recall.\n\nJolli Memory automatically captures your AI coding sessions and generates structured summaries for each commit — so the reasoning behind every decision is never lost.\n\nUse /jolli-recall to load full branch context into your AI agent and pick up right where you left off.\n\n[Enable Jolli Memory](command:jollimemory.enableJolliMemory)",
+				"when": "jollimemory.enabled == false"
+			},
+			{
+				"view": "jollimemory.memoriesView",
+				"contents": "No memories yet.\n\nStart coding with Claude Code — memories will appear here after your first commit.",
+				"when": "jollimemory.enabled && jollimemory.memories.empty"
+			},
+			{
+				"view": "jollimemory.plansView",
+				"contents": "Jolli Memory is disabled.",
+				"when": "jollimemory.enabled == false"
+			},
+			{
+				"view": "jollimemory.plansView",
+				"contents": "No plans or notes yet.\n\nClick $(add) to add a plan or note.",
+				"when": "jollimemory.enabled && jollimemory.plans.empty"
+			},
+			{
+				"view": "jollimemory.filesView",
+				"contents": "Jolli Memory is disabled.",
+				"when": "jollimemory.enabled == false"
+			},
+			{
+				"view": "jollimemory.historyView",
+				"contents": "Jolli Memory is disabled.",
+				"when": "jollimemory.enabled == false"
+			},
+			{
+				"view": "jollimemory.historyView",
+				"contents": "Start coding — your commit memories will appear here.\n\nEvery commit on this branch will be automatically summarized.",
+				"when": "jollimemory.enabled && jollimemory.history.empty"
+			}
+		],
+		"commands": [
+			{
+				"command": "jollimemory.refreshStatus",
+				"title": "Refresh Status",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.refreshMemories",
+				"title": "Refresh Memories",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.exportMemories",
+				"title": "Export Memories to Markdown",
+				"icon": "$(export)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.searchMemories",
+				"title": "Search Memories",
+				"icon": "$(search)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.clearMemoryFilter",
+				"title": "Clear Filter",
+				"icon": "$(close)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.loadMoreMemories",
+				"title": "Load More Memories",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.copyRecallPrompt",
+				"title": "Copy Recall Prompt",
+				"icon": "$(copy)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openInClaudeCode",
+				"title": "Open in Claude Code",
+				"icon": "$(comment-discussion)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.enableJolliMemory",
+				"title": "Enable Jolli Memory",
+				"icon": "$(circle-filled)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.disableJolliMemory",
+				"title": "Disable Jolli Memory",
+				"icon": "$(circle-slash)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.selectAllFiles",
+				"title": "Select/Deselect All Files",
+				"icon": "$(check-all)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.commitAI",
+				"title": "AI Commit",
+				"icon": "$(sparkle)",
+				"category": "Jolli Memory",
+				"enablement": "!jollimemory.workerBusy"
+			},
+			{
+				"command": "jollimemory.openSettings",
+				"title": "Settings",
+				"icon": "$(gear)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openFileChange",
+				"title": "Open Change",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openCommitFileChange",
+				"title": "Open Commit File Diff",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.refreshFiles",
+				"title": "Refresh Files",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.discardFileChanges",
+				"title": "Discard Changes",
+				"icon": "$(discard)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.discardSelectedChanges",
+				"title": "Discard Selected Changes",
+				"icon": "$(discard)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.selectAllCommits",
+				"title": "Select/Deselect All Commits",
+				"icon": "$(check-all)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.squash",
+				"title": "Squash Selected",
+				"icon": "$(git-merge)",
+				"category": "Jolli Memory",
+				"enablement": "!jollimemory.workerBusy"
+			},
+			{
+				"command": "jollimemory.pushBranch",
+				"title": "Push",
+				"icon": "$(cloud-upload)",
+				"category": "Jolli Memory",
+				"enablement": "!jollimemory.workerBusy"
+			},
+			{
+				"command": "jollimemory.refreshHistory",
+				"title": "Refresh History",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.viewSummary",
+				"title": "View Commit Memory",
+				"icon": "$(eye)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.viewMemorySummary",
+				"title": "View Memory",
+				"icon": "$(eye)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.copyCommitHash",
+				"title": "Copy Commit Hash",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.pushToJolli",
+				"title": "Push to Jolli",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.refreshPlans",
+				"title": "Refresh Plans",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.editPlan",
+				"title": "Edit Plan",
+				"icon": "$(file-text)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.removePlan",
+				"title": "Remove Plan from List",
+				"icon": "$(trash)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.addPlan",
+				"title": "Add Plan",
+				"icon": "$(file-text)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.addMarkdownNote",
+				"title": "Add Markdown File",
+				"icon": "$(note)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.addTextSnippet",
+				"title": "Add Text Snippet",
+				"icon": "$(comment)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.editNote",
+				"title": "Edit Note",
+				"icon": "$(edit)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.removeNote",
+				"title": "Remove Note",
+				"icon": "$(trash)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.signIn",
+				"title": "Sign In to Jolli",
+				"icon": "$(sign-in)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.signOut",
+				"title": "Sign Out of Jolli",
+				"icon": "$(sign-out)",
+				"category": "Jolli Memory"
+			}
+		],
+		"menus": {
+			"view/title": [
+				{
+					"command": "jollimemory.signIn",
+					"when": "view == jollimemory.statusView && jollimemory.enabled && !jollimemory.signedIn",
+					"group": "navigation@1"
+				},
+				{
+					"command": "jollimemory.signOut",
+					"when": "view == jollimemory.statusView && jollimemory.enabled && jollimemory.signedIn",
+					"group": "navigation@1"
+				},
+				{
+					"command": "jollimemory.refreshStatus",
+					"when": "view == jollimemory.statusView",
+					"group": "navigation@2"
+				},
+				{
+					"command": "jollimemory.searchMemories",
+					"when": "view == jollimemory.memoriesView && jollimemory.enabled",
+					"group": "navigation@1"
+				},
+				{
+					"command": "jollimemory.clearMemoryFilter",
+					"when": "view == jollimemory.memoriesView && jollimemory.memories.hasFilter",
+					"group": "navigation@2"
+				},
+				{
+					"command": "jollimemory.refreshMemories",
+					"when": "view == jollimemory.memoriesView",
+					"group": "navigation@3"
+				},
+				{
+					"command": "jollimemory.exportMemories",
+					"when": "view == jollimemory.memoriesView && jollimemory.enabled",
+					"group": "navigation@4"
+				},
+				{
+					"command": "jollimemory.openSettings",
+					"when": "view == jollimemory.memoriesView",
+					"group": "navigation@5"
+				},
+				{
+					"command": "jollimemory.enableJolliMemory",
+					"when": "view == jollimemory.memoriesView && jollimemory.enabled == false",
+					"group": "navigation@6"
+				},
+				{
+					"command": "jollimemory.disableJolliMemory",
+					"when": "view == jollimemory.memoriesView && jollimemory.enabled",
+					"group": "navigation@6"
+				},
+				{
+					"submenu": "jollimemory.addMenu",
+					"when": "view == jollimemory.plansView && jollimemory.enabled",
+					"group": "navigation@0"
+				},
+				{
+					"command": "jollimemory.refreshPlans",
+					"when": "view == jollimemory.plansView",
+					"group": "navigation@2"
+				},
+				{
+					"command": "jollimemory.selectAllFiles",
+					"when": "view == jollimemory.filesView",
+					"group": "navigation@1"
+				},
+				{
+					"command": "jollimemory.commitAI",
+					"when": "view == jollimemory.filesView",
+					"group": "navigation@2"
+				},
+				{
+					"command": "jollimemory.refreshFiles",
+					"when": "view == jollimemory.filesView",
+					"group": "navigation@3"
+				},
+				{
+					"command": "jollimemory.discardSelectedChanges",
+					"when": "view == jollimemory.filesView",
+					"group": "navigation@4"
+				},
+				{
+					"command": "jollimemory.selectAllCommits",
+					"when": "view == jollimemory.historyView && !jollimemory.history.singleCommitMode && !jollimemory.history.mergedMode",
+					"group": "navigation@1"
+				},
+				{
+					"command": "jollimemory.squash",
+					"when": "view == jollimemory.historyView && !jollimemory.history.singleCommitMode && !jollimemory.history.mergedMode",
+					"group": "navigation@2"
+				},
+				{
+					"command": "jollimemory.pushBranch",
+					"when": "view == jollimemory.historyView && jollimemory.history.singleCommitMode && !jollimemory.history.mergedMode",
+					"group": "navigation@2"
+				},
+				{
+					"command": "jollimemory.refreshHistory",
+					"when": "view == jollimemory.historyView",
+					"group": "navigation@3"
+				}
+			],
+			"jollimemory.addMenu": [
+				{
+					"command": "jollimemory.addPlan",
+					"group": "1_add@1"
+				},
+				{
+					"command": "jollimemory.addMarkdownNote",
+					"group": "1_add@2"
+				},
+				{
+					"command": "jollimemory.addTextSnippet",
+					"group": "1_add@3"
+				}
+			],
+			"view/item/context": [
+				{
+					"command": "jollimemory.copyRecallPrompt",
+					"when": "view == jollimemory.memoriesView && viewItem == memory",
+					"group": "inline@1"
+				},
+				{
+					"command": "jollimemory.copyRecallPrompt",
+					"when": "view == jollimemory.memoriesView && viewItem == memory",
+					"group": "1_recall@1"
+				},
+				{
+					"command": "jollimemory.openInClaudeCode",
+					"when": "view == jollimemory.memoriesView && viewItem == memory",
+					"group": "1_recall@2"
+				},
+				{
+					"command": "jollimemory.viewMemorySummary",
+					"when": "view == jollimemory.memoriesView && viewItem == memory",
+					"group": "2_view@1"
+				},
+				{
+					"command": "jollimemory.discardFileChanges",
+					"when": "view == jollimemory.filesView && viewItem == file",
+					"group": "inline@1"
+				},
+				{
+					"command": "jollimemory.discardFileChanges",
+					"when": "view == jollimemory.filesView && viewItem == file",
+					"group": "1_discard@1"
+				},
+				{
+					"command": "jollimemory.editPlan",
+					"when": "view == jollimemory.plansView && viewItem == plan",
+					"group": "1_plan@1"
+				},
+				{
+					"command": "jollimemory.removePlan",
+					"when": "view == jollimemory.plansView && viewItem == plan",
+					"group": "inline@2"
+				},
+				{
+					"command": "jollimemory.editNote",
+					"when": "view == jollimemory.plansView && viewItem == note",
+					"group": "1_note@1"
+				},
+				{
+					"command": "jollimemory.removeNote",
+					"when": "view == jollimemory.plansView && viewItem == note",
+					"group": "inline@2"
+				},
+				{
+					"command": "jollimemory.viewSummary",
+					"when": "view == jollimemory.historyView && viewItem == commitWithMemory",
+					"group": "inline@1"
+				},
+				{
+					"command": "jollimemory.viewSummary",
+					"when": "view == jollimemory.historyView && viewItem == commitWithMemory",
+					"group": "1_view@1"
+				},
+				{
+					"command": "jollimemory.copyCommitHash",
+					"when": "view == jollimemory.historyView && viewItem =~ /^commit/",
+					"group": "1_view@2"
+				}
+			]
+		}
+	},
+	"scripts": {
+		"all": "npm run clean && npm run build && npm run lint && npm run test",
+		"clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
+		"typecheck": "tsc --noEmit",
+		"lint": "npx biome check --error-on-warnings src/",
+		"lint:fix": "npx biome check --write src/",
+		"test": "node ./scripts/run-vitest.mjs --coverage",
+		"build": "node esbuild.config.mjs",
+		"build:watch": "node esbuild.config.mjs --watch",
+		"package": "npx @vscode/vsce package --no-dependencies --allow-missing-repository",
+		"install:vsix": "node -e \"const v=require('./package.json').version;const {execSync}=require('child_process');const fs=require('fs');const path=require('path');const isWin=process.platform==='win32';let code;if(isWin){code=path.join(process.env.LOCALAPPDATA||'','Programs','Microsoft VS Code','bin','code.cmd')}else{const candidates=['/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code','/usr/bin/code','/snap/bin/code'];code=candidates.find(p=>fs.existsSync(p))||'code'}execSync((isWin?'\\\"'+code+'\\\"':'\\\"'+code+'\\\"')+' --install-extension jollimemory-vscode-'+v+'.vsix --force',{stdio:'inherit'});\"",
+		"deploy": "npm version patch --no-git-tag-version && npm run build && npm run package && npm run install:vsix"
+	},
+	"dependencies": {
+		"minimatch": "^10.2.4",
+		"open": "^11.0.0"
+	},
+	"overrides": {
+		"brace-expansion": "^5.0.5"
+	},
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"@types/vscode": "^1.80.0",
+		"@vitest/coverage-v8": "^4.1.2",
+		"@vscode/vsce": "^3.0.0",
+		"esbuild": "^0.27.4",
+		"typescript": "^5.7.2",
+		"vitest": "^4.1.2"
+	}
+}

@@ -1,0 +1,58 @@
+{
+	"name": "@jolli/cli",
+	"version": "0.98.0",
+	"description": "AI development process auto-documentation tool - generates structured commit summaries from Claude Code / Codex / Gemini sessions",
+	"main": "./dist/Cli.js",
+	"type": "module",
+	"bin": {
+		"jolli": "dist/Cli.js"
+	},
+	"files": ["dist/", "README.md"],
+	"scripts": {
+		"all": "npm run clean && npm run build && npm run lint && npm run test",
+		"build": "vite build",
+		"postbuild": "node -e \"require('fs').chmodSync('dist/Cli.js', 0o755)\"",
+		"clean": "rimraf dist/",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check --error-on-warnings",
+		"lint:fix": "biome check --write",
+		"cli": "tsx src/Cli.ts",
+		"cli:build": "npm run build && node dist/Cli.js",
+		"test": "vitest run --coverage",
+		"test:watch": "vitest",
+		"postinstall": "node -e \"require('fs').existsSync('dist/PostInstall.js') && require('child_process').spawnSync(process.execPath,['dist/PostInstall.js'],{stdio:'inherit'})\""
+	},
+	"keywords": ["ai", "documentation", "git-hooks", "claude-code", "codex", "gemini", "commit-summary", "dev-memory"],
+	"author": "Jolli",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/jolliai/jollimemory",
+		"directory": "cli"
+	},
+	"homepage": "https://github.com/jolliai/jollimemory/tree/main/cli#readme",
+	"bugs": {
+		"url": "https://github.com/jolliai/jollimemory/issues"
+	},
+	"dependencies": {
+		"@anthropic-ai/sdk": "^0.39.0",
+		"commander": "^13.1.0",
+		"open": "^11.0.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.2.6",
+		"@types/node": "^20.0.0",
+		"@vitest/coverage-v8": "^4.1.1",
+		"rimraf": "^6.0.1",
+		"tsx": "^4.7.0",
+		"typescript": "^5.7.2",
+		"vite": "^6.0.0",
+		"vitest": "^4.1.1"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"engines": {
+		"node": ">=18.0.0"
+	}
+}

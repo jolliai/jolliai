@@ -1,0 +1,94 @@
+# JolliMemory CLI npm Release Workflow
+#
+# Authentication: npm Trusted Publishing (OIDC). No NPM_TOKEN required.
+#   - Configure the trusted publisher on npmjs.com for @jolli/cli:
+#       org/user = jolliai, repo = jollimemory,
+#       workflow filename = publish-cli.yaml,
+#       environment = Production
+#   - The `Production` GitHub Environment provides a manual approval gate.
+#
+# Release flow:
+#   1. Bump version in cli/package.json (and lock file) alongside code changes, merge to main
+#   2. On release branch: git fetch origin main && git rebase origin/main (keep in sync with main)
+#   3. Trigger this workflow manually from release (Actions -> Run workflow)
+#      -> Validates branch, builds, publishes to npm with provenance, tags release-cli-v<version>
+
+name: Publish CLI to NPM
+
+on:
+    workflow_dispatch:
+
+jobs:
+    release-cli:
+        permissions:
+            contents: write   # tag + push the release tag
+            id-token: write   # request OIDC token for npm trusted publishing
+        runs-on: ubuntu-24.04
+        environment: Production
+        concurrency:
+            group: release-cli
+            cancel-in-progress: false
+
+        steps:
+            -   uses: actions/checkout@v5
+                with:
+                    fetch-depth: 0
+
+            -   name: Ensure workflow runs from release branch
+                run: |
+                    if [ "${GITHUB_REF_NAME}" != "release" ]; then
+                        echo "::error::Run this workflow from the release branch (current: ${GITHUB_REF_NAME})."
+                        exit 1
+                    fi
+
+            -   name: Ensure release branch contains latest main
+                run: |
+                    git fetch origin main
+                    if ! git merge-base --is-ancestor origin/main HEAD; then
+                        echo "::error::release is behind main. Rebase/merge main into release before releasing."
+                        exit 1
+                    fi
+
+            -   name: Ensure release branch is fully in sync with main
+                run: |
+                    EXTRA_FILES="$(git diff --name-only origin/main...HEAD || true)"
+
+                    if [ -n "${EXTRA_FILES}" ]; then
+                        echo "::error::release has commits beyond main. Rebase onto main first so the branches are identical."
+                        echo "Files diverging from main:"
+                        echo "${EXTRA_FILES}"
+                        exit 1
+                    fi
+
+            -   uses: actions/setup-node@v5
+                with:
+                    node-version-file: .nvmrc
+                    registry-url: https://registry.npmjs.org/
+                    scope: "@jolli"
+
+            -   name: Install workspace dependencies
+                run: npm ci
+
+            -   name: Build, lint, and test (CLI + VS Code)
+                run: npm run all
+
+            -   name: Read version from package.json
+                id: version
+                working-directory: cli
+                run: |
+                    VERSION="$(node -p "require('./package.json').version")"
+                    echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+            -   name: Publish to npm
+                # Authentication via npm Trusted Publishing (OIDC). No NPM_TOKEN.
+                # `--provenance` is passed explicitly so the job fails loudly if OIDC
+                # is misconfigured, rather than silently publishing without provenance.
+                working-directory: cli
+                run: npm publish --provenance
+
+            -   name: Tag release
+                env:
+                    VERSION: ${{ steps.version.outputs.version }}
+                run: |
+                    git tag "release-cli-v${VERSION}"
+                    git push origin "release-cli-v${VERSION}"

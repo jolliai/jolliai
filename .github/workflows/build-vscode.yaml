@@ -1,0 +1,42 @@
+# PR / push check for the CLI and VS Code extension workspaces.
+#
+# Covers both `cli/` and `vscode/` because they share a root package.json
+# (npm workspaces) — touching one can break the other's install or build.
+
+name: Build & Test (CLI + VS Code)
+
+on:
+    push:
+        branches: [main]
+        paths:
+            - "cli/**"
+            - "vscode/**"
+            - "package.json"
+            - "package-lock.json"
+            - ".nvmrc"
+            - ".github/workflows/build-vscode.yaml"
+    pull_request:
+        branches: [main]
+        paths:
+            - "cli/**"
+            - "vscode/**"
+            - "package.json"
+            - "package-lock.json"
+            - ".nvmrc"
+            - ".github/workflows/build-vscode.yaml"
+
+jobs:
+    build:
+        runs-on: ubuntu-24.04
+        steps:
+            -   uses: actions/checkout@v5
+
+            -   uses: actions/setup-node@v5
+                with:
+                    node-version-file: .nvmrc
+
+            -   name: Install workspace dependencies
+                run: npm ci
+
+            -   name: Build, lint, and test (CLI + VS Code)
+                run: npm run all

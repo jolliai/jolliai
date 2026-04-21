@@ -1,0 +1,40 @@
+{
+	"name": "jollimemory",
+	"version": "0.98.0",
+	"description": "AI development process auto-documentation tool - monorepo for CLI, VS Code extension and IntelliJ plugin",
+	"private": true,
+	"workspaces": [
+		"cli",
+		"vscode"
+	],
+	"scripts": {
+		"build": "npm run build -w @jolli/cli && npm run build -w vscode",
+		"build:cli": "npm run build -w @jolli/cli",
+		"build:vscode": "npm run build -w vscode",
+		"typecheck": "npm run typecheck -w @jolli/cli && npm run typecheck -w vscode",
+		"typecheck:cli": "npm run typecheck -w @jolli/cli",
+		"typecheck:vscode": "npm run typecheck -w vscode",
+		"lint": "npm run lint -w @jolli/cli && npm run lint -w vscode",
+		"lint:cli": "npm run lint -w @jolli/cli",
+		"lint:vscode": "npm run lint -w vscode",
+		"lint:fix": "npm run lint:fix -w @jolli/cli && npm run lint:fix -w vscode",
+		"test": "npm run test -w @jolli/cli && npm run test -w vscode",
+		"test:cli": "npm run test -w @jolli/cli",
+		"test:vscode": "npm run test -w vscode",
+		"clean": "npm run clean -w @jolli/cli && npm run clean -w vscode",
+		"all": "npm run clean && npm run build && npm run lint && npm run test",
+		"cli": "npm run cli -w @jolli/cli",
+		"cli:build": "npm run cli:build -w @jolli/cli"
+	},
+	"keywords": ["ai", "documentation", "git-hooks", "claude-code", "codex", "gemini", "commit-summary", "dev-memory"],
+	"author": "Jolli",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/jolliai/jollimemory"
+	},
+	"homepage": "https://github.com/jolliai/jollimemory",
+	"bugs": {
+		"url": "https://github.com/jolliai/jolli/issues"
+	}
+}
