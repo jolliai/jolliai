@@ -36,6 +36,7 @@ const {
 	escHtml,
 	formatDate,
 	formatFullDate,
+	getDisplayDate,
 	groupTopicsByDate,
 	padIndex,
 	renderCalloutText,
@@ -50,6 +51,10 @@ const {
 	escHtml: vi.fn((s: string) => s),
 	formatDate: vi.fn(() => "Jan 1, 2026"),
 	formatFullDate: vi.fn(() => "January 1, 2026 at 12:00 PM"),
+	getDisplayDate: vi.fn(
+		(e: { generatedAt?: string; commitDate: string }) =>
+			e.generatedAt || e.commitDate,
+	),
 	groupTopicsByDate: vi.fn(() => new Map()),
 	padIndex: vi.fn((i: number) => String(i + 1).padStart(2, "0")),
 	renderCalloutText: vi.fn((s: string) => s),
@@ -86,6 +91,7 @@ vi.mock("./SummaryUtils.js", () => ({
 	escHtml,
 	formatDate,
 	formatFullDate,
+	getDisplayDate,
 	groupTopicsByDate,
 	padIndex,
 	renderCalloutText,

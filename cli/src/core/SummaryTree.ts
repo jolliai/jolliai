@@ -7,9 +7,15 @@
  */
 import type { CommitSummary, DiffStats, TopicSummary } from "../Types.js";
 
-/** A topic decorated with the commitDate of the node it came from */
+/** A topic decorated with the date of the node it came from */
 export interface TopicWithDate extends TopicSummary {
 	readonly commitDate?: string;
+	/**
+	 * Summary (re)generation time of the source node (set on commit / amend /
+	 * squash / rebase). Preferred over commitDate by display code via
+	 * getDisplayDate.
+	 */
+	readonly generatedAt?: string;
 	/** Original index in the tree traversal order (from collectAllTopics), used by edit/delete operations */
 	readonly treeIndex?: number;
 }
@@ -25,7 +31,11 @@ function reverseCopy<T>(items: ReadonlyArray<T> | undefined): T[] {
 export function collectAllTopics(node: CommitSummary): ReadonlyArray<TopicWithDate> {
 	// Children are stored newest-first; reverse to process oldest-first
 	const childTopics = reverseCopy(node.children).flatMap(collectAllTopics);
-	const own: ReadonlyArray<TopicWithDate> = (node.topics ?? []).map((t) => ({ ...t, commitDate: node.commitDate }));
+	const own: ReadonlyArray<TopicWithDate> = (node.topics ?? []).map((t) => ({
+		...t,
+		commitDate: node.commitDate,
+		generatedAt: node.generatedAt,
+	}));
 	return [...childTopics, ...own];
 }
 
@@ -185,12 +195,15 @@ export function isLeafNode(node: CommitSummary): boolean {
 
 /**
  * Computes the work duration in days across the entire tree.
- * Collects all commitDates from nodes with data, returns the day span.
+ * Collects activity dates (generatedAt, falling back to commitDate) from nodes
+ * with data, returns the day span.
  */
 export function computeDurationDays(node: CommitSummary): number {
 	const sources = collectSourceNodes(node);
 	if (sources.length <= 1) return 1;
-	const dateStrings = new Set(sources.map((s) => new Date(s.commitDate).toISOString().substring(0, 10)));
+	const dateStrings = new Set(
+		sources.map((s) => new Date(s.generatedAt || s.commitDate).toISOString().substring(0, 10)),
+	);
 	return dateStrings.size;
 }
 
@@ -203,7 +216,7 @@ export function formatDurationLabel(node: CommitSummary): string {
 	const dayStr = days === 1 ? "1 day" : `${days} days`;
 	const sources = collectSourceNodes(node);
 	if (sources.length <= 1) return dayStr;
-	const timestamps = sources.map((s) => new Date(s.commitDate).getTime());
+	const timestamps = sources.map((s) => new Date(s.generatedAt || s.commitDate).getTime());
 	const earliest = new Date(Math.min(...timestamps));
 	const latest = new Date(Math.max(...timestamps));
 	const fmt = (d: Date): string => d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });

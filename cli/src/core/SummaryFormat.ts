@@ -27,6 +27,23 @@ export interface TopicWithDate extends CoreTopicWithDate {
 
 // ─── Date formatting ──────────────────────────────────────────────────────────
 
+/**
+ * Returns the canonical "activity date" for a summary / index entry.
+ *
+ * Prefers `generatedAt` (set at each git-related summary (re)generation — commit,
+ * amend, squash, rebase) over `commitDate` (git author-date, unchanged by amend).
+ * This matches the user-visible activity timeline: when they actually did
+ * something for this memory, not when the commit was first authored.
+ *
+ * Falls back to `commitDate` when `generatedAt` is missing or empty
+ * (uses `||`, not `??`) — e.g. for loose plan-reference or catalog objects
+ * that historically only carried `commitDate`, or for corrupt data where
+ * `generatedAt` is persisted as an empty string.
+ */
+export function getDisplayDate(entry: { generatedAt?: string; commitDate: string }): string {
+	return entry.generatedAt || entry.commitDate;
+}
+
 /** Returns a short date string, e.g. "Apr 5, 2026". */
 export function formatDate(iso: string): string {
 	try {
@@ -121,7 +138,7 @@ function extractTicketFallback(commitMessage: string, branch: string): string | 
 /** Builds panel title: date · ticket · hash · author */
 export function buildPanelTitle(summary: CommitSummary): string {
 	const ticket = summary.ticketId ?? extractTicketFallback(summary.commitMessage, summary.branch);
-	const date = summary.commitDate.substring(0, 10);
+	const date = getDisplayDate(summary).substring(0, 10);
 	const author = summary.commitAuthor;
 	const hash = summary.commitHash.substring(0, 7);
 	return [date, ticket, hash, author].filter(Boolean).join(" · ");
@@ -173,11 +190,14 @@ export function collectSortedTopics(summary: CommitSummary): {
 	const showRecordDates = sourceNodes.length > 1 && computeDurationDays(summary) > 1;
 	const collected = collectAllTopics(summary);
 	const topics = sortTopics(
-		collected.map((t, i) => ({
-			...t,
-			treeIndex: i,
-			...(showRecordDates && t.commitDate ? { recordDate: t.commitDate } : {}),
-		})),
+		collected.map((t, i) => {
+			const date = t.generatedAt || t.commitDate;
+			return {
+				...t,
+				treeIndex: i,
+				...(showRecordDates && date ? { recordDate: date } : {}),
+			};
+		}),
 	);
 	return { topics, sourceNodes, showRecordDates };
 }

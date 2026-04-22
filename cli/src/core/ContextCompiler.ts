@@ -9,6 +9,7 @@
 
 import { createLogger } from "../Logger.js";
 import type { CommitSummary, SummaryIndexEntry } from "../Types.js";
+import { getDisplayDate } from "./SummaryFormat.js";
 import { getIndex, getSummary, readNoteFromBranch, readPlanFromBranch } from "./SummaryStore.js";
 import { aggregateStats, collectAllTopics } from "./SummaryTree.js";
 
@@ -121,13 +122,15 @@ export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
 
 	const branches: BranchCatalogEntry[] = [];
 	for (const [branch, entries] of branchMap) {
-		const sorted = entries.sort((a, b) => new Date(a.commitDate).getTime() - new Date(b.commitDate).getTime());
+		const sorted = entries.sort(
+			(a, b) => new Date(getDisplayDate(a)).getTime() - new Date(getDisplayDate(b)).getTime(),
+		);
 		branches.push({
 			branch,
 			commitCount: entries.length,
 			period: {
-				start: sorted[0].commitDate,
-				end: sorted[sorted.length - 1].commitDate,
+				start: getDisplayDate(sorted[0]),
+				end: getDisplayDate(sorted[sorted.length - 1]),
 			},
 			commitMessages: sorted.map((e) => e.commitMessage),
 		});
@@ -146,12 +149,17 @@ interface PlanCandidate {
 	readonly title: string;
 	readonly commitHash: string;
 	readonly commitDate: string;
+	readonly generatedAt: string;
 }
 
 /**
  * Deduplicates plan references by base slug.
  * Archived plans have slug format "base-slug-<shortHash>". We extract the base
  * by cross-validating the trailing hash against the actual commit's shortHash.
+ *
+ * When the same plan appears in multiple commits, keep the one with the latest
+ * activity (see {@link getDisplayDate}) — that's the user's most recent
+ * edit/amend of the plan reference.
  */
 function deduplicatePlans(candidates: ReadonlyArray<PlanCandidate>): ReadonlyArray<PlanCandidate> {
 	const baseSlugMap = new Map<string, PlanCandidate>();
@@ -159,7 +167,7 @@ function deduplicatePlans(candidates: ReadonlyArray<PlanCandidate>): ReadonlyArr
 	for (const plan of candidates) {
 		const baseSlug = extractBaseSlug(plan.slug, plan.commitHash);
 		const existing = baseSlugMap.get(baseSlug);
-		if (!existing || new Date(plan.commitDate).getTime() > new Date(existing.commitDate).getTime()) {
+		if (!existing || new Date(getDisplayDate(plan)).getTime() > new Date(getDisplayDate(existing)).getTime()) {
 			baseSlugMap.set(baseSlug, plan);
 		}
 	}
@@ -205,8 +213,11 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
 		(e) => e.branch === branch && (e.parentCommitHash === null || e.parentCommitHash === undefined),
 	);
 
-	// Step 2: Sort by commit date (oldest first for narrative)
-	rootEntries = [...rootEntries].sort((a, b) => new Date(a.commitDate).getTime() - new Date(b.commitDate).getTime());
+	// Step 2: Sort by activity date (oldest first for narrative).
+	// Uses getDisplayDate so amended old commits surface as recent activity.
+	rootEntries = [...rootEntries].sort(
+		(a, b) => new Date(getDisplayDate(a)).getTime() - new Date(getDisplayDate(b)).getTime(),
+	);
 
 	// Step 3: Apply depth limit
 	if (depth !== undefined && depth > 0 && rootEntries.length > depth) {
@@ -258,6 +269,7 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
 						title: planRef.title,
 						commitHash: summary.commitHash,
 						commitDate: summary.commitDate,
+						generatedAt: summary.generatedAt,
 					});
 				}
 			}
@@ -311,8 +323,8 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
 	}
 
 	const period = {
-		start: summaries[0].commitDate,
-		end: summaries[summaries.length - 1].commitDate,
+		start: getDisplayDate(summaries[0]),
+		end: getDisplayDate(summaries[summaries.length - 1]),
 	};
 
 	// Step 8: Compute token stats
@@ -475,7 +487,7 @@ function renderSummarySection(summary: CommitSummary, index?: number): string {
 	const prefix = index !== undefined ? `${index}. ` : "";
 
 	lines.push(
-		`### ${prefix}${summary.commitHash.substring(0, 8)} — ${summary.commitMessage} (${formatDate(summary.commitDate)})`,
+		`### ${prefix}${summary.commitHash.substring(0, 8)} — ${summary.commitMessage} (${formatDate(getDisplayDate(summary))})`,
 	);
 	lines.push(`**Changes:** ${stats.filesChanged} files, +${stats.insertions} -${stats.deletions}`);
 	lines.push("");

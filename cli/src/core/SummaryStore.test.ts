@@ -790,6 +790,7 @@ describe("SummaryStore", () => {
 			const summary1: CommitSummary = {
 				...createMockSummary(oldHash1, "First feature"),
 				commitDate: "2026-02-18T10:00:00Z",
+				generatedAt: "2026-02-18T10:00:05Z",
 				topics: [
 					{ title: "Dark mode", trigger: "User request", response: "Added toggle", decisions: "CSS vars" },
 				],
@@ -797,6 +798,7 @@ describe("SummaryStore", () => {
 			const summary2: CommitSummary = {
 				...createMockSummary(oldHash2, "Second feature"),
 				commitDate: "2026-02-19T10:00:00Z",
+				generatedAt: "2026-02-19T10:00:05Z",
 				topics: [
 					{ title: "Auth fix", trigger: "Bug report", response: "Fixed JWT", decisions: "Use httpOnly" },
 					{ title: "Logging", trigger: "Debug need", response: "Added pino", decisions: "JSON format" },
@@ -893,12 +895,14 @@ describe("SummaryStore", () => {
 			const s1: CommitSummary = {
 				...createMockSummary("old1", "First"),
 				commitDate: "2026-02-18T10:00:00Z",
+				generatedAt: "2026-02-18T10:00:05Z",
 				jolliDocId: 101,
 				jolliDocUrl: "https://team.jolli.app/articles?doc=101",
 			};
 			const s2: CommitSummary = {
 				...createMockSummary("old2", "Second"),
 				commitDate: "2026-02-19T10:00:00Z",
+				generatedAt: "2026-02-19T10:00:05Z",
 				jolliDocId: 102,
 				jolliDocUrl: "https://team.jolli.app/articles?doc=102",
 			};
@@ -907,7 +911,7 @@ describe("SummaryStore", () => {
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
-			// Winner is s2 (newer commitDate)
+			// Winner is s2 (newer activity date via getDisplayDate)
 			expect(merged.jolliDocId).toBe(102);
 			expect(merged.jolliDocUrl).toBe("https://team.jolli.app/articles?doc=102");
 			// Loser goes to orphanedDocIds
@@ -924,6 +928,7 @@ describe("SummaryStore", () => {
 			const s1: CommitSummary = {
 				...createMockSummary("old1", "Prior squash"),
 				commitDate: "2026-02-18T10:00:00Z",
+				generatedAt: "2026-02-18T10:00:05Z",
 				jolliDocId: 101,
 				jolliDocUrl: "https://team.jolli.app/articles?doc=101",
 				orphanedDocIds: [99],
@@ -931,6 +936,7 @@ describe("SummaryStore", () => {
 			const s2: CommitSummary = {
 				...createMockSummary("old2", "Second"),
 				commitDate: "2026-02-19T10:00:00Z",
+				generatedAt: "2026-02-19T10:00:05Z",
 				jolliDocId: 102,
 				jolliDocUrl: "https://team.jolli.app/articles?doc=102",
 			};
@@ -939,10 +945,41 @@ describe("SummaryStore", () => {
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
-			// Winner is s2 (newer), loser is s1's 101, plus inherited 99
+			// Winner is s2 (newer activity), loser is s1's 101, plus inherited 99
 			expect(merged.jolliDocId).toBe(102);
 			expect(merged.orphanedDocIds).toEqual([101, 99]);
 			expect(result.orphanedDocIds).toEqual([101, 99]);
+		});
+
+		it("should pick the amend-updated child over a sibling with newer commitDate (getDisplayDate wins)", async () => {
+			// s1: older git author-date, but user amended its summary *just now* → generatedAt is newest.
+			// s2: author-date is newer (e.g. cherry-picked or fresh commit), but no amend happened.
+			// Expected winner is s1 because getDisplayDate prefers generatedAt, which reflects "most
+			// recently touched by the user" — the opposite of what commitDate-based sorting would pick.
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			const s1: CommitSummary = {
+				...createMockSummary("old1", "Amended just now"),
+				commitDate: "2026-02-10T10:00:00Z",
+				generatedAt: "2026-02-20T15:00:00Z",
+				jolliDocId: 101,
+				jolliDocUrl: "https://team.jolli.app/articles?doc=101",
+			};
+			const s2: CommitSummary = {
+				...createMockSummary("old2", "Fresh sibling"),
+				commitDate: "2026-02-19T10:00:00Z",
+				generatedAt: "2026-02-19T10:00:05Z",
+				jolliDocId: 102,
+				jolliDocUrl: "https://team.jolli.app/articles?doc=102",
+			};
+
+			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.jolliDocId).toBe(101);
+			expect(merged.jolliDocUrl).toBe("https://team.jolli.app/articles?doc=101");
+			expect(merged.orphanedDocIds).toEqual([102]);
+			expect(result.orphanedDocIds).toEqual([102]);
 		});
 
 		it("should hoist the newest nested child jolli metadata from deep descendants", async () => {
@@ -969,6 +1006,47 @@ describe("SummaryStore", () => {
 			const merged = JSON.parse(files[0].content) as CommitSummary;
 			expect(merged.jolliDocId).toBe(201);
 			expect(merged.jolliDocUrl).toBe("https://jolli.app/articles/201");
+		});
+
+		it("should use the descendant's own generatedAt (not the parent's) when comparing a nested winner against a direct sibling", async () => {
+			// old1 is stale overall, but its grandchild was amended today — its generatedAt (2026-04-20)
+			// is the newest activity in the whole tree. old2 is a direct sibling with its own docId and
+			// an author-date that falls between old1's stale date and the grandchild's fresh generatedAt.
+			//
+			// With the bug, the recursive winner bubbles up with old1's (stale) dates attached, so old2
+			// wins and the just-amended grandchild doc 301 gets orphaned. Correct behavior: grandchild
+			// (301) wins, old2's 302 is orphaned.
+			const old1: CommitSummary = {
+				...createMockSummary("old1", "Old 1 (stale parent)"),
+				commitDate: "2026-01-01T00:00:00Z",
+				generatedAt: "2026-01-01T00:00:00Z",
+				children: [
+					{
+						...createMockSummary("grandchild-amended", "Grandchild just amended"),
+						commitDate: "2026-01-01T00:00:00Z",
+						generatedAt: "2026-04-20T12:00:00Z",
+						jolliDocId: 301,
+						jolliDocUrl: "https://jolli.app/articles/301",
+					},
+				],
+			};
+			const old2: CommitSummary = {
+				...createMockSummary("old2", "Old 2 (direct sibling)"),
+				commitDate: "2026-03-01T00:00:00Z",
+				generatedAt: "2026-03-01T00:00:00Z",
+				jolliDocId: 302,
+				jolliDocUrl: "https://jolli.app/articles/302",
+			};
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+
+			const result = await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.jolliDocId).toBe(301);
+			expect(merged.jolliDocUrl).toBe("https://jolli.app/articles/301");
+			expect(merged.orphanedDocIds).toEqual([302]);
+			expect(result.orphanedDocIds).toEqual([302]);
 		});
 
 		it("should hoist and dedupe plans from nested descendants by newest updatedAt", async () => {
@@ -1543,6 +1621,42 @@ describe("SummaryStore", () => {
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const persistedIndex = JSON.parse(files[0].content) as SummaryIndex;
 			expect(persistedIndex.commitAliases).toEqual({ unknown1: "newer-root" });
+		});
+
+		it("should prefer the entry with newer generatedAt when tree hash depth ties, even if its commitDate is older", async () => {
+			// Two root entries, same tree hash, same depth. commitDate favors entry-a, but
+			// entry-b was regenerated most recently (amend/rebase case). The tie-break must
+			// use getDisplayDate (generatedAt || commitDate), not raw commitDate — otherwise
+			// we alias to the stale summary and the just-regenerated one becomes unreachable.
+			const index = v3Index([
+				{
+					commitHash: "entry-a",
+					parentCommitHash: null,
+					commitMessage: "Newer author-date, stale regen",
+					commitDate: "2026-02-19T10:00:00Z",
+					branch: "main",
+					generatedAt: "2026-02-18T10:00:00Z",
+					treeHash: "tree-1",
+				},
+				{
+					commitHash: "entry-b",
+					parentCommitHash: null,
+					commitMessage: "Older author-date, just regenerated",
+					commitDate: "2026-02-18T10:00:00Z",
+					branch: "main",
+					generatedAt: "2026-02-20T10:00:00Z",
+					treeHash: "tree-1",
+				},
+			]);
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
+
+			const result = await scanTreeHashAliases(["unknown1"]);
+
+			expect(result).toBe(true);
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const persistedIndex = JSON.parse(files[0].content) as SummaryIndex;
+			expect(persistedIndex.commitAliases).toEqual({ unknown1: "entry-b" });
 		});
 
 		it("should break depth calculation cycles when matching tree hashes", async () => {

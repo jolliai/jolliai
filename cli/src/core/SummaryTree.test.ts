@@ -218,8 +218,8 @@ describe("SummaryTree", () => {
 			const multiDay: CommitSummary = {
 				...D,
 				children: [
-					{ ...B, commitDate: "2026-03-03T10:00:00.000Z" },
-					{ ...A, commitDate: "2026-03-01T10:00:00.000Z" },
+					{ ...B, commitDate: "2026-03-03T10:00:00.000Z", generatedAt: "2026-03-03T10:00:10.000Z" },
+					{ ...A, commitDate: "2026-03-01T10:00:00.000Z", generatedAt: "2026-03-01T10:00:10.000Z" },
 				],
 			};
 			expect(computeDurationDays(multiDay)).toBe(2);
@@ -241,8 +241,8 @@ describe("SummaryTree", () => {
 			const multiDay: CommitSummary = {
 				...D,
 				children: [
-					{ ...B, commitDate: "2026-03-05T10:00:00.000Z" },
-					{ ...A, commitDate: "2026-03-01T10:00:00.000Z" },
+					{ ...B, commitDate: "2026-03-05T10:00:00.000Z", generatedAt: "2026-03-05T10:00:10.000Z" },
+					{ ...A, commitDate: "2026-03-01T10:00:00.000Z", generatedAt: "2026-03-01T10:00:10.000Z" },
 				],
 			};
 			const label = formatDurationLabel(multiDay);

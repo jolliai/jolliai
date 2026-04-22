@@ -40,6 +40,7 @@ import {
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
 import { acquireLock, releaseLock } from "./SessionTracker.js";
+import { getDisplayDate } from "./SummaryFormat.js";
 import { countTopics } from "./SummaryTree.js";
 
 const log = createLogger("SummaryStore");
@@ -310,24 +311,39 @@ function stripJolliMetadata(node: CommitSummary): CommitSummary {
 
 /** Hoist result for Jolli memory article metadata from children. */
 interface JolliMetaHoistResult {
-	/** The most recent child's Jolli metadata (to hoist to merged root), or null if no children were pushed. */
-	readonly winner: { readonly jolliDocId: number; readonly jolliDocUrl: string } | null;
+	/**
+	 * The most recent descendant's Jolli metadata (to hoist to merged root), or null if no
+	 * candidates were found. Carries the winner's own commitDate/generatedAt so that when a
+	 * caller re-enters the winner into a higher-level competition, the dates that drove the
+	 * inner victory (e.g. a just-amended grandchild) are the dates compared at the outer level.
+	 */
+	readonly winner: {
+		readonly jolliDocId: number;
+		readonly jolliDocUrl: string;
+		readonly commitDate: string;
+		readonly generatedAt: string;
+	} | null;
 	/** Memory article docIds from children that were NOT selected as winner (orphaned articles to delete). */
 	readonly orphanedDocIds: number[];
 }
 
 /** Recursively collects jolliDocId/jolliDocUrl from children, picks newest as winner. */
 function collectChildJolliMeta(nodes: ReadonlyArray<CommitSummary>): JolliMetaHoistResult {
-	const candidates: Array<{ jolliDocId: number; jolliDocUrl: string; commitDate: string }> = [];
+	const candidates: Array<{ jolliDocId: number; jolliDocUrl: string; commitDate: string; generatedAt: string }> = [];
 	for (const node of nodes) {
 		const url = node.jolliDocUrl;
 		if (node.jolliDocId && url) {
-			candidates.push({ jolliDocId: node.jolliDocId, jolliDocUrl: url, commitDate: node.commitDate });
+			candidates.push({
+				jolliDocId: node.jolliDocId,
+				jolliDocUrl: url,
+				commitDate: node.commitDate,
+				generatedAt: node.generatedAt,
+			});
 		}
 		if (node.children) {
 			const childResult = collectChildJolliMeta(node.children);
 			if (childResult.winner) {
-				candidates.push({ ...childResult.winner, commitDate: node.commitDate });
+				candidates.push({ ...childResult.winner });
 			}
 			// Child orphans are always orphaned (they lost in a deeper merge)
 			// but we don't collect them here — they were already handled by the deeper merge
@@ -335,9 +351,10 @@ function collectChildJolliMeta(nodes: ReadonlyArray<CommitSummary>): JolliMetaHo
 	}
 	if (candidates.length === 0) return { winner: null, orphanedDocIds: [] };
 
-	// Sort by commitDate descending, pick newest as winner
-	candidates.sort((a, b) => new Date(b.commitDate).getTime() - new Date(a.commitDate).getTime());
-	const winner = { jolliDocId: candidates[0].jolliDocId, jolliDocUrl: candidates[0].jolliDocUrl };
+	// Sort by activity date (getDisplayDate) descending so amend/rebase-updated children
+	// win over siblings with newer author-dates.
+	candidates.sort((a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime());
+	const winner = candidates[0];
 	const orphanedDocIds = candidates.slice(1).map((c) => c.jolliDocId);
 	return { winner, orphanedDocIds };
 }
@@ -366,9 +383,9 @@ export async function mergeManyToOne(
 ): Promise<{ orphanedDocIds: number[] }> {
 	log.info("Merging %d summaries into %s", oldSummaries.length, newCommitInfo.hash.substring(0, 8));
 
-	// Sort children by commitDate descending (newest first), matching git log order
+	// Sort children by activity date descending (newest first) via getDisplayDate.
 	const children = [...oldSummaries].sort(
-		(a, b) => new Date(b.commitDate).getTime() - new Date(a.commitDate).getTime(),
+		(a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime(),
 	);
 
 	// Hoist functional-level metadata from children into the merged root:
@@ -674,7 +691,14 @@ export async function listSummaries(count = 10, cwd?: string): Promise<ReadonlyA
 
 	// Only top-level roots (null = v3 root; undefined = v1 legacy entry treated as root)
 	const rootEntries = index.entries.filter(isRootEntry);
-	const recentEntries = rootEntries.slice(-count).reverse();
+
+	// Sort explicitly by getDisplayDate descending (newest activity first).
+	// Previously relied on Map insertion order via slice(-count).reverse(), which
+	// is fragile — amend/squash/rebase may re-shuffle entries.
+	const sortedEntries = [...rootEntries].sort(
+		(a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime(),
+	);
+	const recentEntries = sortedEntries.slice(0, count);
 
 	// Load full summaries for each root entry
 	const summaries: CommitSummary[] = [];
@@ -1002,7 +1026,10 @@ async function readSummaryFile(commitHash: string, cwd?: string): Promise<Commit
  * Finds the shallowest index entry with the given tree hash.
  *
  * "Shallowest" = fewest ancestors via parentCommitHash chain (depth 0 = root).
- * When depth is equal, the most recent commitDate wins.
+ * When depth is equal, the most recent activity date (generatedAt || commitDate)
+ * wins — this matches the system-wide ordering semantics used by list/display
+ * paths, so amend/rebase-regenerated entries take precedence over stale siblings
+ * that merely have a newer author-date.
  *
  * This tie-break ensures we alias to the container node (e.g. a squash root)
  * rather than a buried grandchild, since the container encompasses its children.
@@ -1030,10 +1057,10 @@ function findShallowstByTreeHash(
 		return { entry, depth };
 	});
 
-	// Sort: shallowest first, then most recent date
+	// Sort: shallowest first, then most recent activity date (generatedAt || commitDate)
 	withDepth.sort((a, b) => {
 		if (a.depth !== b.depth) return a.depth - b.depth;
-		return new Date(b.entry.commitDate).getTime() - new Date(a.entry.commitDate).getTime();
+		return new Date(getDisplayDate(b.entry)).getTime() - new Date(getDisplayDate(a.entry)).getTime();
 	});
 
 	return withDepth[0].entry;

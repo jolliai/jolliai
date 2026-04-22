@@ -257,6 +257,7 @@ describe("compileTaskContext", () => {
 		const summaryWithPlan1 = makeSummary({
 			commitHash: "aaa11111",
 			commitDate: "2026-03-28T10:00:00.000Z",
+			generatedAt: "2026-03-28T10:01:00.000Z",
 			plans: [
 				{
 					slug: "oauth-strategy-aaa11111",
@@ -270,6 +271,7 @@ describe("compileTaskContext", () => {
 		const summaryWithPlan2 = makeSummary({
 			commitHash: "bbb22222",
 			commitDate: "2026-03-29T10:00:00.000Z",
+			generatedAt: "2026-03-29T10:01:00.000Z",
 			plans: [
 				{
 					slug: "oauth-strategy-bbb22222",
@@ -753,6 +755,7 @@ describe("compileTaskContext — additional coverage", () => {
 		const summary1 = makeSummary({
 			commitHash: "aaa1111100000000",
 			commitDate: "2026-03-28T10:00:00.000Z",
+			generatedAt: "2026-03-28T10:01:00.000Z",
 			plans: [
 				{
 					slug: "oauth-plan-aaa1111",
@@ -766,6 +769,7 @@ describe("compileTaskContext — additional coverage", () => {
 		const summary2 = makeSummary({
 			commitHash: "bbb2222200000000",
 			commitDate: "2026-03-29T10:00:00.000Z",
+			generatedAt: "2026-03-29T10:01:00.000Z",
 			plans: [
 				{
 					slug: "oauth-plan-bbb22222",
@@ -811,6 +815,7 @@ describe("compileTaskContext — additional coverage", () => {
 		const summary1 = makeSummary({
 			commitHash: "bbb2222200000000",
 			commitDate: "2026-03-29T10:00:00.000Z",
+			generatedAt: "2026-03-29T10:01:00.000Z",
 			plans: [
 				{
 					slug: "my-plan-bbb22222",
@@ -824,6 +829,7 @@ describe("compileTaskContext — additional coverage", () => {
 		const summary2 = makeSummary({
 			commitHash: "aaa1111100000000",
 			commitDate: "2026-03-28T10:00:00.000Z",
+			generatedAt: "2026-03-28T10:01:00.000Z",
 			plans: [
 				{
 					slug: "my-plan-aaa11111",

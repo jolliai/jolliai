@@ -32,6 +32,7 @@ import {
 } from "../../cli/src/core/Summarizer.js";
 import type { ExportResult } from "../../cli/src/core/SummaryExporter.js";
 import { exportSummaries } from "../../cli/src/core/SummaryExporter.js";
+import { getDisplayDate } from "../../cli/src/core/SummaryFormat.js";
 import { buildMarkdown } from "../../cli/src/core/SummaryMarkdownBuilder.js";
 import {
 	getIndexEntryMap,
@@ -1209,7 +1210,10 @@ export class JolliMemoryBridge {
 					seen.add(e.commitHash);
 					return true;
 				})
-				.sort((a, b) => Date.parse(b.commitDate) - Date.parse(a.commitDate));
+				.sort(
+					(a, b) =>
+						Date.parse(getDisplayDate(b)) - Date.parse(getDisplayDate(a)),
+				);
 		}
 
 		let entries = this.cachedRootEntries;

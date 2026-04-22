@@ -11,6 +11,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { type Command, Option } from "commander";
+import { getDisplayDate } from "../core/SummaryFormat.js";
 import { buildMarkdown } from "../core/SummaryMarkdownBuilder.js";
 import { getIndex, getSummary } from "../core/SummaryStore.js";
 import { aggregateStats, aggregateTurns, collectAllTopics, formatDurationLabel } from "../core/SummaryTree.js";
@@ -50,7 +51,7 @@ function truncate(str: string, maxLen: number): string {
 function getRootEntries(entries: ReadonlyArray<SummaryIndexEntry>): Array<SummaryIndexEntry> {
 	return entries
 		.filter((e) => e.parentCommitHash == null)
-		.sort((a, b) => new Date(b.commitDate).getTime() - new Date(a.commitDate).getTime());
+		.sort((a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime());
 }
 
 /**
@@ -69,7 +70,7 @@ function printCompactList(entries: ReadonlyArray<SummaryIndexEntry>, total: numb
 	for (const [i, entry] of entries.entries()) {
 		const idx = String(i + 1).padStart(2);
 		const hash = entry.commitHash.substring(0, 8);
-		const date = formatShortDate(entry.commitDate).padEnd(10);
+		const date = formatShortDate(getDisplayDate(entry)).padEnd(10);
 		const topics = String(entry.topicCount ?? 0).padStart(3);
 		const changes = formatChanges(entry).padEnd(15);
 		const badge = formatTypeBadge(entry);
@@ -94,7 +95,7 @@ function buildMarkdownTable(entries: ReadonlyArray<SummaryIndexEntry>): string {
 		"|---|---|---|---|---|---|",
 		...entries.map(
 			(e, i) =>
-				`| ${i + 1} | ${e.commitHash.substring(0, 8)} | ${formatShortDate(e.commitDate)} | ${e.topicCount ?? 0} | ${formatChanges(e)} | ${escapeCell(e.commitMessage)} |`,
+				`| ${i + 1} | ${e.commitHash.substring(0, 8)} | ${formatShortDate(getDisplayDate(e))} | ${e.topicCount ?? 0} | ${formatChanges(e)} | ${escapeCell(e.commitMessage)} |`,
 		),
 	];
 	return rows.join("\n");
@@ -118,16 +119,14 @@ function formatCommitType(commitType?: string, commitSource?: string): string | 
 
 /** Prints a formatted full summary to the console. */
 function printSummary(summary: CommitSummary): void {
-	console.log(
-		"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
-	);
+	console.log(`  ${"─".repeat(38)}`);
 	console.log(`  Commit:  ${summary.commitHash.substring(0, 8)} \u2014 ${summary.commitMessage}`);
 	console.log(`  Branch:  ${summary.branch}`);
 
 	const typeInfo = formatCommitType(summary.commitType, summary.commitSource);
 	if (typeInfo) console.log(`  Commit Type: ${typeInfo}`);
 
-	console.log(`  Date:    ${summary.commitDate}`);
+	console.log(`  Date:    ${getDisplayDate(summary)}`);
 	console.log(`  Duration: ${formatDurationLabel(summary)}`);
 
 	const stats = aggregateStats(summary);

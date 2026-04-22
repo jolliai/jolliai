@@ -19,6 +19,7 @@ export {
 	collectSortedTopics,
 	formatDate,
 	formatFullDate,
+	getDisplayDate,
 	groupTopicsByDate,
 	padIndex,
 	sortTopics,

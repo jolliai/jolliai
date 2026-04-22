@@ -15,6 +15,7 @@ import {
 	collectSortedTopics,
 	formatDate,
 	formatFullDate,
+	getDisplayDate,
 	groupTopicsByDate,
 	padIndex,
 	type TopicWithDate,
@@ -88,7 +89,7 @@ function pushPropertiesSection(
 	const totalTurns = aggregateTurns(summary);
 
 	const filesLabel = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, +${aggStats.insertions} insertions, \u2212${aggStats.deletions} deletions`;
-	const dateLabel = formatFullDate(summary.commitDate);
+	const dateLabel = formatFullDate(getDisplayDate(summary));
 
 	lines.push(
 		`# ${summary.commitMessage}`,
@@ -183,7 +184,7 @@ function pushSourceCommitsSection(
 			? ` · ${node.conversationTurns} turns`
 			: "";
 		lines.push(
-			`- \`${node.commitHash.substring(0, 8)}\` ${node.commitMessage}  _(+${ins} \u2212${del}${turnsMd} · ${formatDate(node.commitDate)})_`,
+			`- \`${node.commitHash.substring(0, 8)}\` ${node.commitMessage}  _(+${ins} \u2212${del}${turnsMd} · ${formatDate(getDisplayDate(node))})_`,
 		);
 	}
 	lines.push("", "---");
