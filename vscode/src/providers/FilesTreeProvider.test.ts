@@ -113,8 +113,60 @@ vi.mock("vscode", () => ({
 	},
 }));
 
+import { FilesStore } from "../stores/FilesStore.js";
 import { ExcludeFilterManager } from "../util/ExcludeFilterManager.js";
 import { FileItem, FilesTreeProvider } from "./FilesTreeProvider.js";
+
+/**
+ * Test helper: constructs a real FilesStore + FilesTreeProvider and returns
+ * a facade with the pre-refactor shim surface (refresh / getFiles / etc.).
+ * The provider itself no longer carries those methods — the facade forwards
+ * to the store so legacy test assertions can keep working.
+ */
+function createProvider(
+	bridge: unknown,
+	workspaceRoot: string,
+	filter: ExcludeFilterManager,
+) {
+	const store = new FilesStore(bridge as never, workspaceRoot, filter);
+	const provider = new FilesTreeProvider(store);
+	const emitter = (
+		provider as unknown as {
+			_onDidChangeTreeData: { fire: ReturnType<typeof vi.fn> };
+		}
+	)._onDidChangeTreeData;
+	return {
+		__store: store,
+		_onDidChangeTreeData: emitter,
+		getTreeItem: provider.getTreeItem.bind(provider),
+		getChildren: provider.getChildren.bind(provider),
+		onDidChangeTreeData: provider.onDidChangeTreeData,
+		dispose: () => {
+			provider.dispose();
+			store.dispose();
+		},
+		// Shim surface (provider no longer has these — they now live on the store)
+		refresh: (reorder?: boolean) => store.refresh(reorder),
+		setMigrating: (m: boolean) => store.setMigrating(m),
+		setEnabled: (e: boolean) => store.setEnabled(e),
+		getFiles: () => store.getSnapshot().files,
+		getSelectedFiles: () => store.getSnapshot().selectedFiles,
+		getVisibleFileCount: () => store.getSnapshot().visibleCount,
+		getExcludedCount: () => store.getSnapshot().excludedCount,
+		deselectPaths: (paths: ReadonlyArray<string>) => store.deselectPaths(paths),
+		toggleSelectAll: () => store.toggleSelectAll(),
+		onCheckboxToggle: (item: FileItem, checked: boolean) =>
+			store.applyCheckboxBatch([[item.fileStatus.relativePath, checked]]),
+		onCheckboxToggleBatch: (
+			items: ReadonlyArray<readonly [FileItem, boolean]>,
+		) =>
+			store.applyCheckboxBatch(
+				items.map(
+					([item, checked]) => [item.fileStatus.relativePath, checked] as const,
+				),
+			),
+	};
+}
 
 function makeFile(
 	relativePath: string,
@@ -183,7 +235,7 @@ describe("FilesTreeProvider", () => {
 			makeFile("ignore.log", true),
 		];
 		const bridge = makeBridge(files);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(["*.log"]),
@@ -237,7 +289,7 @@ describe("FilesTreeProvider", () => {
 						}),
 				),
 		};
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -258,7 +310,7 @@ describe("FilesTreeProvider", () => {
 	});
 
 	it("hides children when disabled or migrating", async () => {
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			makeBridge([makeFile("a.ts", true)]) as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -274,7 +326,7 @@ describe("FilesTreeProvider", () => {
 	});
 
 	it("does not fire tree changes when enabled or migrating state is unchanged", () => {
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			makeBridge([makeFile("a.ts", true)]) as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -293,7 +345,7 @@ describe("FilesTreeProvider", () => {
 
 	it("updates selection in memory from checkbox toggles", async () => {
 		const bridge = makeBridge([makeFile("a.ts", false)]);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -317,7 +369,7 @@ describe("FilesTreeProvider", () => {
 		const files = [makeFile("a.ts", true), makeFile("b.ts", false)];
 		const bridge = makeBridge(files);
 		// Empty exclude filter — hasPatterns() returns false
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -330,7 +382,7 @@ describe("FilesTreeProvider", () => {
 
 	it("deselects a file in memory when checkbox is unchecked", async () => {
 		const bridge = makeBridge([makeFile("a.ts", true)]);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -345,7 +397,7 @@ describe("FilesTreeProvider", () => {
 
 	it("selects a file in memory when checkbox is checked", async () => {
 		const bridge = makeBridge([makeFile("a.ts", false)]);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -365,7 +417,7 @@ describe("FilesTreeProvider", () => {
 			makeFile("skip.log", false),
 		];
 		const bridge = makeBridge(files);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(["*.log"]),
@@ -385,7 +437,7 @@ describe("FilesTreeProvider", () => {
 	it("keeps already-selected visible files selected when selecting the remaining files", async () => {
 		const files = [makeFile("a.ts", true), makeFile("b.ts", false)];
 		const bridge = makeBridge(files);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -405,7 +457,7 @@ describe("FilesTreeProvider", () => {
 	it("leaves selection empty when toggleSelectAll runs with no visible files", async () => {
 		const files = [makeFile("skip.log", false)];
 		const bridge = makeBridge(files);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(["*.log"]),
@@ -424,7 +476,7 @@ describe("FilesTreeProvider", () => {
 		// relativePath is not in fileOrder (should not happen normally, but the guard exists).
 		const files = [makeFile("a.ts", true), makeFile("b.ts", false)];
 		const bridge = makeBridge(files);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -432,8 +484,9 @@ describe("FilesTreeProvider", () => {
 		await provider.refresh(true); // builds fileOrder: a.ts → 0, b.ts → 1
 
 		// Manually clear the fileOrder for "b.ts" to trigger the ?? 0 fallback
+		// (fileOrder now lives on the store)
 		const fileOrder = (
-			provider as unknown as { fileOrder: Map<string, number> }
+			provider.__store as unknown as { fileOrder: Map<string, number> }
 		).fileOrder;
 		fileOrder.delete("b.ts");
 
@@ -455,7 +508,7 @@ describe("FilesTreeProvider", () => {
 			makeFile("a.ts", false),
 			makeFile("b.ts", false),
 		]);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -473,12 +526,15 @@ describe("FilesTreeProvider", () => {
 
 	it("debounces workspace watcher refreshes and ignores .git paths", () => {
 		vi.useFakeTimers();
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			makeBridge([makeFile("a.ts", true)]) as never,
 			"/repo",
 			makeExcludeFilter(),
 		);
-		const refreshSpy = vi.spyOn(provider, "refresh").mockResolvedValue();
+		// Watchers now live on the Store — spy on its refresh path.
+		const refreshSpy = vi
+			.spyOn(provider.__store, "refresh")
+			.mockResolvedValue();
 
 		watchers[1].fireChange({ fsPath: "/repo/src/a.ts" });
 		watchers[1].fireCreate({ fsPath: "/repo/src/b.ts" });
@@ -493,13 +549,13 @@ describe("FilesTreeProvider", () => {
 
 	it("swallows errors from debounced refreshes", async () => {
 		vi.useFakeTimers();
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			makeBridge([makeFile("a.ts", true)]) as never,
 			"/repo",
 			makeExcludeFilter(),
 		);
 		const refreshSpy = vi
-			.spyOn(provider, "refresh")
+			.spyOn(provider.__store, "refresh")
 			.mockRejectedValue(new Error("refresh failed"));
 
 		watchers[0].fireChange({ fsPath: "/repo/.git/index" });
@@ -511,12 +567,14 @@ describe("FilesTreeProvider", () => {
 
 	it("debounces git index watcher refreshes and disposes resources", () => {
 		vi.useFakeTimers();
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			makeBridge([makeFile("a.ts", true)]) as never,
 			"/repo",
 			makeExcludeFilter(),
 		);
-		const refreshSpy = vi.spyOn(provider, "refresh").mockResolvedValue();
+		const refreshSpy = vi
+			.spyOn(provider.__store, "refresh")
+			.mockResolvedValue();
 
 		watchers[0].fireChange({ fsPath: "/repo/.git/index" });
 		watchers[0].fireCreate({ fsPath: "/repo/.git/index" });
@@ -526,13 +584,14 @@ describe("FilesTreeProvider", () => {
 		expect(refreshSpy).toHaveBeenCalledTimes(1);
 
 		provider.dispose();
+		provider.__store.dispose();
 		expect(watchers[0].dispose).toHaveBeenCalled();
 		expect(watchers[1].dispose).toHaveBeenCalled();
 		vi.useRealTimers();
 	});
 
 	it("getTreeItem returns the element directly", async () => {
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			makeBridge([makeFile("a.ts", true)]) as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -545,7 +604,7 @@ describe("FilesTreeProvider", () => {
 
 	it("dispose clears the debounce timer", () => {
 		vi.useFakeTimers();
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			makeBridge([makeFile("a.ts", true)]) as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -563,28 +622,17 @@ describe("FilesTreeProvider", () => {
 		expect(refreshSpy).not.toHaveBeenCalled();
 	});
 
-	it("fireChange emits without re-fetching files", () => {
-		const provider = new FilesTreeProvider(
-			makeBridge([makeFile("a.ts", true)]) as never,
-			"/repo",
-			makeExcludeFilter(),
-		);
-		const emitter = (
-			provider as unknown as {
-				_onDidChangeTreeData: { fire: ReturnType<typeof vi.fn> };
-			}
-		)._onDidChangeTreeData;
-
-		provider.fireChange();
-		expect(emitter.fire).toHaveBeenCalled();
-	});
+	// fireChange() was a provider shim for callers that wanted to nudge
+	// VSCode to re-render without re-fetching.  It is no longer part of the
+	// provider surface; equivalent effect is achieved by the store's
+	// onChange broadcast after any mutation.
 
 	it("prunes stale selected paths and deselects explicit paths on refresh", async () => {
 		const bridge = makeBridge([
 			makeFile("a.ts", false),
 			makeFile("b.ts", false),
 		]);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -622,7 +670,7 @@ describe("FilesTreeProvider", () => {
 			makeFile("a.ts", false),
 			makeFile("b.ts", false),
 		]);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
@@ -647,15 +695,18 @@ describe("FilesTreeProvider", () => {
 	it("uses the stable sort fallback when fileOrder entries are present but undefined", async () => {
 		const files = [makeFile("a.ts", false), makeFile("b.ts", false)];
 		const bridge = makeBridge(files);
-		const provider = new FilesTreeProvider(
+		const provider = createProvider(
 			bridge as never,
 			"/repo",
 			makeExcludeFilter(),
 		);
 		await provider.refresh(true);
 
+		// fileOrder lives on the store now
 		const fileOrder = (
-			provider as unknown as { fileOrder: Map<string, number | undefined> }
+			provider.__store as unknown as {
+				fileOrder: Map<string, number | undefined>;
+			}
 		).fileOrder;
 		fileOrder.set("a.ts", undefined);
 		fileOrder.set("b.ts", undefined);

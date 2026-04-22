@@ -12,9 +12,9 @@
 
 import * as vscode from "vscode";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
-import type { FilesTreeProvider } from "../providers/FilesTreeProvider.js";
-import type { HistoryTreeProvider } from "../providers/HistoryTreeProvider.js";
-import type { StatusTreeProvider } from "../providers/StatusTreeProvider.js";
+import type { CommitsStore } from "../stores/CommitsStore.js";
+import type { FilesStore } from "../stores/FilesStore.js";
+import type { StatusStore } from "../stores/StatusStore.js";
 import type { BranchCommit } from "../Types.js";
 import { isWorkerBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
@@ -25,9 +25,9 @@ const FORCE_PUSH_CONFIRM_LABEL = "Force Push (--force-with-lease)";
 export class PushCommand {
 	constructor(
 		private readonly bridge: JolliMemoryBridge,
-		private readonly historyProvider: HistoryTreeProvider,
-		private readonly filesProvider: FilesTreeProvider,
-		private readonly statusProvider: StatusTreeProvider,
+		private readonly commitsStore: CommitsStore,
+		private readonly filesStore: FilesStore,
+		private readonly statusStore: StatusStore,
 		private readonly statusBar: StatusBarManager,
 		private readonly workspaceRoot: string,
 	) {}
@@ -41,7 +41,7 @@ export class PushCommand {
 			return;
 		}
 
-		const commits = this.historyProvider.getAllCommits();
+		const commits = this.commitsStore.getSnapshot().commits;
 		if (commits.length !== 1) {
 			log.warn(
 				"push",
@@ -141,9 +141,9 @@ export class PushCommand {
 
 	private async refreshAll(): Promise<void> {
 		await Promise.all([
-			this.historyProvider.refresh(),
-			this.filesProvider.refresh(),
-			this.statusProvider.refresh(),
+			this.commitsStore.refresh(),
+			this.filesStore.refresh(),
+			this.statusStore.refresh(),
 		]);
 
 		const status = await this.bridge.getStatus();

@@ -74,7 +74,35 @@ vi.mock("vscode", () => ({
 	},
 }));
 
+import { PlansStore } from "../stores/PlansStore.js";
 import { NoteItem, PlanItem, PlansTreeProvider } from "./PlansTreeProvider.js";
+
+/**
+ * Test facade: real PlansStore + PlansTreeProvider with the legacy shim
+ * surface (refresh / setEnabled) forwarded to the store.
+ */
+function makePlansProvider(bridge: unknown) {
+	const store = new PlansStore(bridge as never);
+	const provider = new PlansTreeProvider(store);
+	const emitter = (
+		provider as unknown as {
+			_onDidChangeTreeData: {
+				fire: ReturnType<typeof vi.fn>;
+				dispose: () => void;
+			};
+		}
+	)._onDidChangeTreeData;
+	return {
+		__store: store,
+		_onDidChangeTreeData: emitter,
+		getTreeItem: provider.getTreeItem.bind(provider),
+		getChildren: provider.getChildren.bind(provider),
+		onDidChangeTreeData: provider.onDidChangeTreeData,
+		dispose: () => provider.dispose(),
+		refresh: () => store.refresh(),
+		setEnabled: (enabled: boolean) => store.setEnabled(enabled),
+	};
+}
 
 function makePlan(overrides: Partial<PlanInfo> = {}): PlanInfo {
 	return {
@@ -197,7 +225,7 @@ describe("PlansTreeProvider", () => {
 			listPlans: vi.fn(async () => plans),
 			listNotes: vi.fn(async () => []),
 		};
-		const provider = new PlansTreeProvider(bridge as never);
+		const provider = makePlansProvider(bridge as never);
 
 		await provider.refresh();
 
@@ -220,7 +248,7 @@ describe("PlansTreeProvider", () => {
 			listPlans: vi.fn(async () => [makePlan()]),
 			listNotes: vi.fn(async () => []),
 		};
-		const provider = new PlansTreeProvider(bridge as never);
+		const provider = makePlansProvider(bridge as never);
 
 		provider.setEnabled(false);
 		await provider.refresh();
@@ -234,7 +262,7 @@ describe("PlansTreeProvider", () => {
 			listPlans: vi.fn(async () => []),
 			listNotes: vi.fn(async () => []),
 		};
-		const provider = new PlansTreeProvider(bridge as never);
+		const provider = makePlansProvider(bridge as never);
 
 		await provider.refresh();
 
@@ -260,7 +288,7 @@ describe("PlansTreeProvider", () => {
 			listPlans: vi.fn(async () => plans),
 			listNotes: vi.fn(async () => notes),
 		};
-		const provider = new PlansTreeProvider(bridge as never);
+		const provider = makePlansProvider(bridge as never);
 
 		await provider.refresh();
 
@@ -276,7 +304,7 @@ describe("PlansTreeProvider", () => {
 			listPlans: vi.fn(async () => [makePlan()]),
 			listNotes: vi.fn(async () => [makeNote()]),
 		};
-		const provider = new PlansTreeProvider(bridge as never);
+		const provider = makePlansProvider(bridge as never);
 		provider.setEnabled(false);
 
 		expect(provider.getChildren()).toEqual([]);
@@ -287,7 +315,7 @@ describe("PlansTreeProvider", () => {
 			listPlans: vi.fn(async () => []),
 			listNotes: vi.fn(async () => []),
 		};
-		const provider = new PlansTreeProvider(bridge as never);
+		const provider = makePlansProvider(bridge as never);
 		const emitter = (
 			provider as unknown as {
 				_onDidChangeTreeData: { fire: ReturnType<typeof vi.fn> };
@@ -310,7 +338,7 @@ describe("PlansTreeProvider", () => {
 	});
 
 	it("disposes its event emitter", () => {
-		const provider = new PlansTreeProvider({ listPlans: vi.fn() } as never);
+		const provider = makePlansProvider({ listPlans: vi.fn() } as never);
 		const emitter = (
 			provider as unknown as {
 				_onDidChangeTreeData: { dispose: ReturnType<typeof vi.fn> };

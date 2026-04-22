@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CommitsStore } from "../stores/CommitsStore.js";
 import type {
 	BranchCommit,
 	BranchCommitsResult,
@@ -8,9 +9,51 @@ import {
 	COMMIT_FILE_SCHEME,
 	CommitFileDecorationProvider,
 	CommitFileItem,
+	type CommitItem,
 	didCommitSequenceChange,
 	HistoryTreeProvider,
 } from "./HistoryTreeProvider.js";
+
+/**
+ * Test facade: constructs a real CommitsStore + HistoryTreeProvider and
+ * returns an object with the pre-refactor shim surface.  The provider itself
+ * no longer carries refresh/setEnabled/etc. — the facade forwards to the
+ * store so legacy test assertions keep working without rewrites.
+ */
+function makeHistoryProvider(bridge: unknown) {
+	const store = new CommitsStore(bridge as never);
+	const provider = new HistoryTreeProvider(store);
+	const emitter = (
+		provider as unknown as {
+			_onDidChangeTreeData: {
+				fire: ReturnType<typeof vi.fn>;
+				dispose: () => void;
+			};
+		}
+	)._onDidChangeTreeData;
+	return {
+		__store: store,
+		store,
+		_onDidChangeTreeData: emitter,
+		getTreeItem: provider.getTreeItem.bind(provider),
+		getChildren: provider.getChildren.bind(provider),
+		onDidChangeTreeData: provider.onDidChangeTreeData,
+		dispose: () => provider.dispose(),
+		get isMerged() {
+			return store.getSnapshot().isMerged;
+		},
+		setMainBranch: (branch: string) => store.setMainBranch(branch),
+		setMigrating: (m: boolean) => store.setMigrating(m),
+		setEnabled: (e: boolean) => store.setEnabled(e),
+		refresh: () => store.refresh(),
+		getSelectedCommits: () => store.getSnapshot().selectedCommits,
+		getAllCommits: () => store.getSnapshot().commits,
+		getSelectionDebugInfo: () => store.getSelectionDebugInfo(),
+		onCheckboxToggle: (item: CommitItem, checked: boolean) =>
+			store.onCheckboxToggle(item.commit.hash, checked),
+		toggleSelectAll: () => store.toggleSelectAll(),
+	};
+}
 
 // ─── Mock vscode module ──────────────────────────────────────────────────────
 
@@ -121,7 +164,7 @@ function makeBridge(
 	return {
 		listBranchCommits: vi.fn(resultFn),
 		listCommitFiles: vi.fn(commitFilesFn ?? (async () => [])),
-	} as unknown as ConstructorParameters<typeof HistoryTreeProvider>[0];
+	};
 }
 
 beforeEach(() => {
@@ -165,13 +208,13 @@ describe("HistoryTreeProvider.refresh() selection clearing", () => {
 		const newHead = makeCommit("dddd4444");
 		let commits = [commitA, commitB, commitC];
 		const bridge = makeBridge(() => makeResult(commits));
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		// Initial load
 		await provider.refresh();
 		// Simulate user checking commits A and B
 		const children = await provider.getChildren();
-		provider.onCheckboxToggle(children[1], true); // checks A (idx 0) and B (idx 1)
+		provider.onCheckboxToggle(children[1] as CommitItem, true); // checks A (idx 0) and B (idx 1)
 		expect(provider.getSelectedCommits()).toHaveLength(2);
 
 		// Simulate amend: HEAD changes from A to newHead
@@ -186,11 +229,11 @@ describe("HistoryTreeProvider.refresh() selection clearing", () => {
 		const squashed = makeCommit("eeee5555");
 		let commits = [commitA, commitB, commitC];
 		const bridge = makeBridge(() => makeResult(commits));
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const children = await provider.getChildren();
-		provider.onCheckboxToggle(children[1], true);
+		provider.onCheckboxToggle(children[1] as CommitItem, true);
 		expect(provider.getSelectedCommits()).toHaveLength(2);
 
 		// Simulate squash: 3 commits become 2
@@ -203,11 +246,11 @@ describe("HistoryTreeProvider.refresh() selection clearing", () => {
 	it("preserves selection when commit list is unchanged", async () => {
 		const commits = [commitA, commitB, commitC];
 		const bridge = makeBridge(() => makeResult(commits));
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const children = await provider.getChildren();
-		provider.onCheckboxToggle(children[1], true);
+		provider.onCheckboxToggle(children[1] as CommitItem, true);
 		expect(provider.getSelectedCommits()).toHaveLength(2);
 
 		// Refresh with same commits — selection should survive
@@ -219,7 +262,7 @@ describe("HistoryTreeProvider.refresh() selection clearing", () => {
 	it("no side effects when commit list changes but nothing is selected", async () => {
 		let commits = [commitA, commitB];
 		const bridge = makeBridge(() => makeResult(commits));
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		expect(provider.getSelectedCommits()).toHaveLength(0);
@@ -235,11 +278,11 @@ describe("HistoryTreeProvider.refresh() selection clearing", () => {
 		const newCommit = makeCommit("gggg7777");
 		let commits = [commitA, commitB];
 		const bridge = makeBridge(() => makeResult(commits));
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const children = await provider.getChildren();
-		provider.onCheckboxToggle(children[0], true);
+		provider.onCheckboxToggle(children[0] as CommitItem, true);
 		expect(provider.getSelectedCommits()).toHaveLength(1);
 
 		// New commit pushed at HEAD
@@ -252,7 +295,7 @@ describe("HistoryTreeProvider.refresh() selection clearing", () => {
 
 describe("HistoryTreeProvider tree behavior", () => {
 	it("hides children when disabled or migrating", async () => {
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([makeCommit("aaaa1111")])),
 		);
 
@@ -265,7 +308,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 	});
 
 	it("does not fire tree change when setEnabled is called with the same value", () => {
-		const provider = new HistoryTreeProvider(makeBridge(() => makeResult([])));
+		const provider = makeHistoryProvider(makeBridge(() => makeResult([])));
 		const emitter = (
 			provider as unknown as {
 				_onDidChangeTreeData: { fire: ReturnType<typeof vi.fn> };
@@ -288,7 +331,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 	});
 
 	it("hides checkboxes and shows a commit icon in single-commit mode", async () => {
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([makeCommit("aaaa1111")])),
 		);
 
@@ -300,7 +343,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 	});
 
 	it("hides checkboxes in merged mode", async () => {
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() =>
 				makeResult([makeCommit("aaaa1111"), makeCommit("bbbb2222")], true),
 			),
@@ -319,9 +362,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 			makeCommit("bbbb2222"),
 			makeCommit("cccc3333"),
 		];
-		const provider = new HistoryTreeProvider(
-			makeBridge(() => makeResult(commits)),
-		);
+		const provider = makeHistoryProvider(makeBridge(() => makeResult(commits)));
 
 		await provider.refresh();
 		provider.toggleSelectAll();
@@ -341,9 +382,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 			makeCommit("bbbb2222"),
 			makeCommit("cccc3333"),
 		];
-		const provider = new HistoryTreeProvider(
-			makeBridge(() => makeResult(commits)),
-		);
+		const provider = makeHistoryProvider(makeBridge(() => makeResult(commits)));
 
 		await provider.refresh();
 
@@ -361,26 +400,24 @@ describe("HistoryTreeProvider tree behavior", () => {
 			makeCommit("bbbb2222"),
 			makeCommit("cccc3333"),
 		];
-		const provider = new HistoryTreeProvider(
-			makeBridge(() => makeResult(commits)),
-		);
+		const provider = makeHistoryProvider(makeBridge(() => makeResult(commits)));
 
 		await provider.refresh();
 		// Check all three commits (checking the last one auto-checks 0..2)
 		const children1 = await provider.getChildren();
-		provider.onCheckboxToggle(children1[2], true);
+		provider.onCheckboxToggle(children1[2] as CommitItem, true);
 		expect(provider.getSelectedCommits()).toHaveLength(3);
 
 		// Uncheck commit at index 1 — should uncheck indices 1 and 2
 		const children2 = await provider.getChildren();
-		provider.onCheckboxToggle(children2[1], false);
+		provider.onCheckboxToggle(children2[1] as CommitItem, false);
 		expect(provider.getSelectedCommits().map((c) => c.hash)).toEqual([
 			"aaaa1111",
 		]);
 	});
 
 	it("ignores checkbox toggles for commits that are not in the current list", async () => {
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([makeCommit("aaaa1111")])),
 		);
 
@@ -395,16 +432,18 @@ describe("HistoryTreeProvider tree behavior", () => {
 
 	it("reports selection debug info with stale hashes shortened", async () => {
 		const commits = [makeCommit("aaaaaaaa"), makeCommit("bbbbbbbb")];
-		const provider = new HistoryTreeProvider(
-			makeBridge(() => makeResult(commits)),
-		);
+		const provider = makeHistoryProvider(makeBridge(() => makeResult(commits)));
 
 		await provider.refresh();
 		const debugChildren = await provider.getChildren();
-		provider.onCheckboxToggle(debugChildren[1], true);
-		(provider as unknown as { checkedHashes: Set<string> }).checkedHashes.add(
-			"stalehash0000",
-		);
+		provider.onCheckboxToggle(debugChildren[1] as CommitItem, true);
+		// Inject a stale selection directly into the underlying store to simulate
+		// a commit that used to be selected but has disappeared from the list.
+		(
+			provider as unknown as {
+				store: { checkedHashes: Set<string> };
+			}
+		).store.checkedHashes.add("stalehash0000");
 
 		expect(provider.getSelectionDebugInfo()).toEqual({
 			checkedHashes: ["aaaaaaaa", "bbbbbbbb", "stalehas"],
@@ -428,7 +467,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 			filesChanged: 1,
 			hasSummary: true,
 		};
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([commit])),
 		);
 
@@ -455,7 +494,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 			filesChanged: 2,
 			hasSummary: false,
 		};
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([commit])),
 		);
 
@@ -471,7 +510,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 	});
 
 	it("updates VS Code context keys during refresh", async () => {
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([makeCommit("aaaaaaaa")], true)),
 		);
 
@@ -498,20 +537,22 @@ describe("HistoryTreeProvider tree behavior", () => {
 		vi.mocked(vscode.commands.executeCommand).mockRejectedValueOnce(
 			new Error("boom"),
 		);
-		const provider = new HistoryTreeProvider(makeBridge(() => makeResult([])));
+		const provider = makeHistoryProvider(makeBridge(() => makeResult([])));
 
 		await expect(provider.refresh()).resolves.toBeUndefined();
 	});
 
 	it("setMainBranch updates the internal main branch property", () => {
-		const provider = new HistoryTreeProvider(makeBridge(() => makeResult([])));
+		const provider = makeHistoryProvider(makeBridge(() => makeResult([])));
 
 		// setMainBranch should not throw and should set the internal property
 		provider.setMainBranch("develop");
 
-		// Access the private field to verify it was set
-		const mainBranch = (provider as unknown as { mainBranch: string })
-			.mainBranch;
+		// The branch now lives on the underlying store — access it via the
+		// provider's private `store` field.
+		const mainBranch = (
+			provider as unknown as { store: { mainBranch: string } }
+		).store.mainBranch;
 		expect(mainBranch).toBe("develop");
 	});
 
@@ -520,12 +561,12 @@ describe("HistoryTreeProvider tree behavior", () => {
 			...makeCommit("aaaaaaaa", "deployed feature"),
 			isPushed: true,
 		};
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([commit])),
 		);
 
 		await provider.refresh();
-		const [item] = await provider.getChildren();
+		const [item] = (await provider.getChildren()) as Array<CommitItem>;
 		const tooltip = item.tooltip as { value: string };
 
 		// The tooltip contains the commit message and the label includes the cloud icon
@@ -543,7 +584,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 			filesChanged: 2,
 			hasSummary: false,
 		};
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([commit])),
 		);
 
@@ -556,7 +597,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 	});
 
 	it("returns tree items unchanged and disposes its event emitter", async () => {
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([makeCommit("aaaaaaaa")])),
 		);
 
@@ -575,7 +616,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 	});
 
 	it("CommitItem has stable id set to commit hash", async () => {
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() => makeResult([makeCommit("aaaa1111")])),
 		);
 
@@ -586,7 +627,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 	});
 
 	it("commits have Collapsed collapsible state", async () => {
-		const provider = new HistoryTreeProvider(
+		const provider = makeHistoryProvider(
 			makeBridge(() =>
 				makeResult([makeCommit("aaaa1111"), makeCommit("bbbb2222")]),
 			),
@@ -615,7 +656,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 			() => makeResult([makeCommit("aaaa1111")]),
 			async () => mockFiles,
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem] = await provider.getChildren();
@@ -631,7 +672,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 			() => makeResult([makeCommit("aaaa1111")]),
 			async () => mockFiles,
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem] = await provider.getChildren();
@@ -646,7 +687,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 			() => makeResult([makeCommit("aaaa1111")]),
 			async () => mockFiles,
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem] = await provider.getChildren();
@@ -663,7 +704,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 			() => makeResult(commits),
 			async () => mockFiles,
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem1] = await provider.getChildren();
@@ -684,7 +725,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 			() => makeResult(commits),
 			async () => mockFiles,
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem1] = await provider.getChildren();
@@ -703,7 +744,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 			() => makeResult([makeCommit("aaaa1111")]),
 			async () => [{ relativePath: "src/Foo.ts", statusCode: "M" }],
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem] = await provider.getChildren();
@@ -727,7 +768,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 			() => makeResult([makeCommit("aaaa1111")]),
 			async () => mockFiles,
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem] = await provider.getChildren();
@@ -750,7 +791,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 				{ relativePath: "src/New.ts", statusCode: "R", oldPath: "src/Old.ts" },
 			],
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem] = await provider.getChildren();
@@ -767,7 +808,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 			() => makeResult([makeCommit("aaaa1111")]),
 			() => Promise.reject(new Error("git subprocess failed")),
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem] = await provider.getChildren();
@@ -791,7 +832,7 @@ describe("HistoryTreeProvider commit file expansion", () => {
 				]);
 			},
 		);
-		const provider = new HistoryTreeProvider(bridge);
+		const provider = makeHistoryProvider(bridge);
 
 		await provider.refresh();
 		const [commitItem] = await provider.getChildren();

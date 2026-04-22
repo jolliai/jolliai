@@ -1035,10 +1035,10 @@ describe("SummaryMarkdownBuilder", () => {
 
 	describe("buildClaudeCodeContext", () => {
 		it("returns recall prompt containing skill name and branch", () => {
-			const summary = makeSummary({ branch: "feature/JOLLI-123" });
+			const summary = makeSummary({ branch: "feature/PROJ-123" });
 			const result = buildClaudeCodeContext(summary);
 			expect(result).toContain("jolli-recall");
-			expect(result).toContain("feature/JOLLI-123");
+			expect(result).toContain("feature/PROJ-123");
 		});
 
 		it("includes invoke instruction with branch arg", () => {

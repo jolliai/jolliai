@@ -467,9 +467,9 @@ describe("SummaryUtils", () => {
 
 	describe("buildPanelTitle", () => {
 		it("builds title with date, ticketId, hash, and author", () => {
-			const summary = makeSummary({ ticketId: "JOLLI-100" });
+			const summary = makeSummary({ ticketId: "PROJ-100" });
 			const result = buildPanelTitle(summary);
-			expect(result).toBe("2026-03-15 · JOLLI-100 · abc1234 · Alice");
+			expect(result).toBe("2026-03-15 · PROJ-100 · abc1234 · Alice");
 		});
 
 		it("extracts ticket from commit message as fallback", () => {
@@ -513,10 +513,10 @@ describe("SummaryUtils", () => {
 
 	describe("buildPushTitle", () => {
 		it("appends commitMessage to panel title", () => {
-			const summary = makeSummary({ ticketId: "JOLLI-100" });
+			const summary = makeSummary({ ticketId: "PROJ-100" });
 			const result = buildPushTitle(summary);
 			expect(result).toBe(
-				"2026-03-15 · JOLLI-100 · abc1234 · Alice · Fix some bug",
+				"2026-03-15 · PROJ-100 · abc1234 · Alice · Fix some bug",
 			);
 		});
 	});
@@ -525,9 +525,9 @@ describe("SummaryUtils", () => {
 
 	describe("buildPlanPushTitle", () => {
 		it("appends planTitle to panel title", () => {
-			const summary = makeSummary({ ticketId: "JOLLI-100" });
+			const summary = makeSummary({ ticketId: "PROJ-100" });
 			const result = buildPlanPushTitle(summary, "My Plan");
-			expect(result).toBe("2026-03-15 · JOLLI-100 · abc1234 · Alice · My Plan");
+			expect(result).toBe("2026-03-15 · PROJ-100 · abc1234 · Alice · My Plan");
 		});
 	});
 
@@ -535,10 +535,10 @@ describe("SummaryUtils", () => {
 
 	describe("buildNotePushTitle", () => {
 		it("appends noteTitle to panel title", () => {
-			const summary = makeSummary({ ticketId: "JOLLI-200" });
+			const summary = makeSummary({ ticketId: "PROJ-200" });
 			const result = buildNotePushTitle(summary, "Release Notes");
 			expect(result).toBe(
-				"2026-03-15 · JOLLI-200 · abc1234 · Alice · Release Notes",
+				"2026-03-15 · PROJ-200 · abc1234 · Alice · Release Notes",
 			);
 		});
 	});

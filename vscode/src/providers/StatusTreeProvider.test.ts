@@ -66,7 +66,34 @@ vi.mock("../services/JolliPushService.js", () => ({
 	parseJolliApiKey,
 }));
 
+import { StatusStore } from "../stores/StatusStore.js";
 import { StatusTreeProvider } from "./StatusTreeProvider.js";
+
+/**
+ * Test facade: real StatusStore + StatusTreeProvider with the legacy shim
+ * surface (refresh / setWorkerBusy / setMigrating / etc.) forwarded to the
+ * store.  The provider itself no longer carries these methods.
+ */
+function makeStatusProvider(bridge: unknown, authService?: unknown) {
+	const store = new StatusStore(bridge as never, authService as never);
+	const provider = new StatusTreeProvider(store);
+	return {
+		__store: store,
+		getTreeItem: provider.getTreeItem.bind(provider),
+		getChildren: provider.getChildren.bind(provider),
+		onDidChangeTreeData: provider.onDidChangeTreeData,
+		dispose: () => provider.dispose(),
+		refresh: () => store.refresh(),
+		setMigrating: (m: boolean) => store.setMigrating(m),
+		setWorkerBusy: (busy: boolean) => store.setWorkerBusy(busy),
+		setExtensionOutdated: (outdated: boolean) =>
+			store.setExtensionOutdated(outdated),
+		setStatus: (status: Parameters<typeof store.setStatus>[0]) =>
+			store.setStatus(status),
+		/** @deprecated no-op, kept for back-compat with legacy test. */
+		setHistoryProvider: () => {},
+	};
+}
 
 function makeStatus(overrides: Record<string, unknown> = {}) {
 	return {
@@ -95,7 +122,7 @@ describe("StatusTreeProvider", () => {
 	});
 
 	it("renders loading, migrating, and disabled states", () => {
-		const provider = new StatusTreeProvider({
+		const provider = makeStatusProvider({
 			cwd: "/repo",
 			getStatus: vi.fn(),
 		} as never);
@@ -119,13 +146,13 @@ describe("StatusTreeProvider", () => {
 	});
 
 	it("setHistoryProvider is a no-op (deprecated)", () => {
-		const provider = new StatusTreeProvider({
+		const provider = makeStatusProvider({
 			cwd: "/repo",
 			getStatus: vi.fn(),
 		} as never);
 
 		// Should not throw — the method is a deprecated no-op kept for compatibility
-		expect(() => provider.setHistoryProvider({} as never)).not.toThrow();
+		expect(() => provider.setHistoryProvider()).not.toThrow();
 	});
 
 	it("refreshes full status, loads config, and adds optional warning rows", async () => {
@@ -139,7 +166,7 @@ describe("StatusTreeProvider", () => {
 			t: "acme",
 		});
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		expect(bridge.getStatus).toHaveBeenCalled();
@@ -179,7 +206,7 @@ describe("StatusTreeProvider", () => {
 			jolliApiKey: undefined,
 		});
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 
 		await provider.refresh();
 		provider.setWorkerBusy(true);
@@ -204,7 +231,7 @@ describe("StatusTreeProvider", () => {
 	});
 
 	it("getTreeItem returns the element directly", () => {
-		const provider = new StatusTreeProvider({
+		const provider = makeStatusProvider({
 			cwd: "/repo",
 			getStatus: vi.fn(),
 		} as never);
@@ -226,7 +253,7 @@ describe("StatusTreeProvider", () => {
 		};
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -250,7 +277,7 @@ describe("StatusTreeProvider", () => {
 		};
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -276,7 +303,7 @@ describe("StatusTreeProvider", () => {
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key", jolliApiKey: "jk" });
 		parseJolliApiKey.mockReturnValue(null);
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -297,7 +324,7 @@ describe("StatusTreeProvider", () => {
 		// Return meta without u field — no Jolli Site row
 		parseJolliApiKey.mockReturnValue({ t: "acme" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -309,7 +336,7 @@ describe("StatusTreeProvider", () => {
 			cwd: "/repo",
 			getStatus: vi.fn(async () => makeStatus({ enabled: false })),
 		};
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 
 		await provider.refresh();
 
@@ -330,7 +357,7 @@ describe("StatusTreeProvider", () => {
 		};
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -351,7 +378,7 @@ describe("StatusTreeProvider", () => {
 		};
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -368,7 +395,7 @@ describe("StatusTreeProvider", () => {
 		};
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -387,7 +414,7 @@ describe("StatusTreeProvider", () => {
 		};
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -400,7 +427,7 @@ describe("StatusTreeProvider", () => {
 		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		// setExtensionOutdated fires a tree change
@@ -425,7 +452,7 @@ describe("StatusTreeProvider", () => {
 			t: "acme",
 		});
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -451,7 +478,7 @@ describe("StatusTreeProvider", () => {
 			authToken: "some-auth-token",
 		});
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -475,7 +502,7 @@ describe("StatusTreeProvider", () => {
 		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();
@@ -494,7 +521,7 @@ describe("StatusTreeProvider", () => {
 		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key", authToken: "token" });
 
-		const provider = new StatusTreeProvider(
+		const provider = makeStatusProvider(
 			bridge as never,
 			mockAuthService as never,
 		);
@@ -513,7 +540,7 @@ describe("StatusTreeProvider", () => {
 			getStatus: vi.fn(async () => makeStatus({ enabled: false })),
 		};
 
-		const provider = new StatusTreeProvider(
+		const provider = makeStatusProvider(
 			bridge as never,
 			mockAuthService as never,
 		);
@@ -535,7 +562,7 @@ describe("StatusTreeProvider", () => {
 		};
 		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
 
-		const provider = new StatusTreeProvider(bridge as never);
+		const provider = makeStatusProvider(bridge as never);
 		await provider.refresh();
 
 		const items = provider.getChildren();

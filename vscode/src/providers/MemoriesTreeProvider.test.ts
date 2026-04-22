@@ -96,7 +96,41 @@ vi.mock("../util/Logger.js", () => ({
 
 // ─── Import under test ─────────────────────────────────────────────────────
 
+import { MemoriesStore } from "../stores/MemoriesStore.js";
 import { MemoriesTreeProvider, MemoryItem } from "./MemoriesTreeProvider.js";
+
+/**
+ * Test facade: real MemoriesStore + MemoriesTreeProvider with the legacy
+ * shim surface (refresh / setFilter / loadMore / etc.) forwarded to the
+ * store.  The provider itself no longer carries these methods.
+ */
+function makeMemoriesProvider(bridge: unknown) {
+	const store = new MemoriesStore(bridge as never);
+	const provider = new MemoriesTreeProvider(store);
+	const emitter = (
+		provider as unknown as {
+			_onDidChangeTreeData: {
+				fire: ReturnType<typeof vi.fn>;
+				dispose: () => void;
+			};
+		}
+	)._onDidChangeTreeData;
+	return {
+		__store: store,
+		_onDidChangeTreeData: emitter,
+		getTreeItem: provider.getTreeItem.bind(provider),
+		getChildren: provider.getChildren.bind(provider),
+		onDidChangeTreeData: provider.onDidChangeTreeData,
+		dispose: () => provider.dispose(),
+		refresh: () => store.refresh(),
+		ensureFirstLoad: () => store.ensureFirstLoad(),
+		hasFirstLoaded: () => store.hasFirstLoaded(),
+		loadMore: () => store.loadMore(),
+		setFilter: (text: string) => store.setFilter(text),
+		getFilter: () => store.getFilter(),
+		setEnabled: (enabled: boolean) => store.setEnabled(enabled),
+	};
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -314,7 +348,7 @@ describe("MemoriesTreeProvider", () => {
 				makeEntry({ commitHash: "bbbb", commitMessage: "Second" }),
 			];
 			const bridge = makeBridge(entries);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 
 			await provider.refresh();
 
@@ -328,7 +362,7 @@ describe("MemoriesTreeProvider", () => {
 			const bridge = {
 				listSummaryEntries: vi.fn().mockRejectedValue(new Error("git failed")),
 			};
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 
 			await provider.refresh();
 
@@ -339,7 +373,7 @@ describe("MemoriesTreeProvider", () => {
 			const bridge = {
 				listSummaryEntries: vi.fn().mockRejectedValue("string error"),
 			};
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 
 			await provider.refresh();
 
@@ -351,7 +385,7 @@ describe("MemoriesTreeProvider", () => {
 				makeEntry({ commitHash: "aaaa", commitMessage: "auth fix" }),
 			];
 			const bridge = makeBridge(entries, 1);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 
 			await provider.setFilter("auth");
 			bridge.listSummaryEntries.mockClear();
@@ -368,7 +402,7 @@ describe("MemoriesTreeProvider", () => {
 	describe("getChildren", () => {
 		it("returns [] when disabled", async () => {
 			const bridge = makeBridge([makeEntry()]);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			await provider.refresh();
 
 			provider.setEnabled(false);
@@ -378,7 +412,7 @@ describe("MemoriesTreeProvider", () => {
 
 		it("returns [] when not yet loaded", () => {
 			const bridge = makeBridge([makeEntry()]);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 
 			// No refresh called — loaded is still false
 			expect(provider.getChildren()).toEqual([]);
@@ -386,7 +420,7 @@ describe("MemoriesTreeProvider", () => {
 
 		it("returns [] when entries are empty", async () => {
 			const bridge = makeBridge([]);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			await provider.refresh();
 
 			expect(provider.getChildren()).toEqual([]);
@@ -394,7 +428,7 @@ describe("MemoriesTreeProvider", () => {
 
 		it("returns [] for child elements (flat list)", async () => {
 			const bridge = makeBridge([makeEntry()]);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			await provider.refresh();
 
 			const children = provider.getChildren();
@@ -404,7 +438,7 @@ describe("MemoriesTreeProvider", () => {
 		it("appends LoadMoreItem when more entries exist and no filter", async () => {
 			const entries = [makeEntry()];
 			const bridge = makeBridge(entries, 20); // totalCount > loadedCount
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			await provider.refresh();
 
 			const children = provider.getChildren();
@@ -416,7 +450,7 @@ describe("MemoriesTreeProvider", () => {
 		it("omits LoadMoreItem when all entries are loaded", async () => {
 			const entries = [makeEntry()];
 			const bridge = makeBridge(entries, 1); // totalCount === entries.length
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			await provider.refresh();
 
 			const children = provider.getChildren();
@@ -427,7 +461,7 @@ describe("MemoriesTreeProvider", () => {
 		it("omits LoadMoreItem when filter is active", async () => {
 			const entries = [makeEntry()];
 			const bridge = makeBridge(entries, 20);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			await provider.refresh();
 			await provider.setFilter("auth");
 
@@ -455,7 +489,7 @@ describe("MemoriesTreeProvider", () => {
 				}),
 			];
 			const bridge = makeBridge(entries);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 
 			await provider.setFilter("auth");
 
@@ -472,7 +506,7 @@ describe("MemoriesTreeProvider", () => {
 				makeEntry({ commitHash: "bbbb", branch: "main" }),
 			];
 			const bridge = makeBridge(entries);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 
 			await provider.setFilter("feature");
 
@@ -483,7 +517,7 @@ describe("MemoriesTreeProvider", () => {
 
 		it("clearing filter restores paged view", async () => {
 			const bridge = makeBridge([makeEntry()], 1);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			await provider.setFilter("auth");
 			bridge.listSummaryEntries.mockClear();
 
@@ -493,21 +527,18 @@ describe("MemoriesTreeProvider", () => {
 			expect(bridge.listSummaryEntries).toHaveBeenCalledWith(10, 0, undefined);
 		});
 
-		it("updates view description with filter result count", async () => {
+		it("setFilter updates snapshot filter state", async () => {
 			const bridge = makeBridge([makeEntry()], 1);
-			const provider = new MemoriesTreeProvider(bridge as never);
-			const mockView = { description: undefined as string | undefined };
-			provider.setView(mockView as never);
+			const provider = makeMemoriesProvider(bridge as never);
 
 			await provider.setFilter("auth");
 
-			expect(mockView.description).toContain('"auth"');
-			expect(mockView.description).toContain("result");
+			expect(provider.getFilter()).toBe("auth");
 		});
 
 		it("returns current filter via getFilter()", async () => {
 			const bridge = makeBridge([makeEntry()], 1);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 
 			await provider.setFilter("biome");
 
@@ -520,7 +551,7 @@ describe("MemoriesTreeProvider", () => {
 	describe("loadMore", () => {
 		it("increments loadedCount by PAGE_SIZE and re-fetches", async () => {
 			const bridge = makeBridge([makeEntry()], 30);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			await provider.refresh();
 			bridge.listSummaryEntries.mockClear();
 
@@ -536,7 +567,7 @@ describe("MemoriesTreeProvider", () => {
 	describe("setEnabled", () => {
 		it("is idempotent — no-op when value unchanged", () => {
 			const bridge = makeBridge([makeEntry()]);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			const emitter = (
 				provider as unknown as {
 					_onDidChangeTreeData: { fire: ReturnType<typeof vi.fn> };
@@ -550,7 +581,7 @@ describe("MemoriesTreeProvider", () => {
 
 		it("fires tree change event on transition", () => {
 			const bridge = makeBridge([makeEntry()]);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			const emitter = (
 				provider as unknown as {
 					_onDidChangeTreeData: { fire: ReturnType<typeof vi.fn> };
@@ -568,7 +599,7 @@ describe("MemoriesTreeProvider", () => {
 	describe("getTreeItem", () => {
 		it("returns the element itself", async () => {
 			const bridge = makeBridge([makeEntry()]);
-			const provider = new MemoriesTreeProvider(bridge as never);
+			const provider = makeMemoriesProvider(bridge as never);
 			await provider.refresh();
 
 			const children = provider.getChildren();
@@ -576,56 +607,6 @@ describe("MemoriesTreeProvider", () => {
 		});
 	});
 
-	// ── view description ──
-
-	describe("syncViewDescription", () => {
-		it("shows total count when no filter", async () => {
-			const bridge = makeBridge([makeEntry()], 5);
-			const provider = new MemoriesTreeProvider(bridge as never);
-			const mockView = { description: undefined as string | undefined };
-			provider.setView(mockView as never);
-
-			await provider.refresh();
-
-			expect(mockView.description).toBe("5 memories");
-		});
-
-		it("uses plural 'results' when filter returns multiple matches", async () => {
-			const entries = [
-				makeEntry({ commitHash: "aaa1", commitMessage: "Fix auth login" }),
-				makeEntry({ commitHash: "bbb2", commitMessage: "Fix auth session" }),
-			];
-			const bridge = makeBridge(entries, 2);
-			const provider = new MemoriesTreeProvider(bridge as never);
-			const mockView = { description: undefined as string | undefined };
-			provider.setView(mockView as never);
-
-			await provider.setFilter("auth");
-
-			expect(mockView.description).toContain("2 results");
-		});
-
-		it("uses singular 'result' when filter returns exactly 1 match", async () => {
-			const bridge = makeBridge([makeEntry()], 1);
-			const provider = new MemoriesTreeProvider(bridge as never);
-			const mockView = { description: undefined as string | undefined };
-			provider.setView(mockView as never);
-
-			await provider.setFilter("auth");
-
-			expect(mockView.description).toContain("1 result");
-			expect(mockView.description).not.toContain("1 results");
-		});
-
-		it("shows undefined when no entries", async () => {
-			const bridge = makeBridge([], 0);
-			const provider = new MemoriesTreeProvider(bridge as never);
-			const mockView = { description: undefined as string | undefined };
-			provider.setView(mockView as never);
-
-			await provider.refresh();
-
-			expect(mockView.description).toBeUndefined();
-		});
-	});
+	// view.description is now computed by MemoriesDataService.buildDescription
+	// and owned by Extension.ts — see MemoriesDataService.test.ts for coverage.
 });

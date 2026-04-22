@@ -7,7 +7,7 @@
 
 import { execSync } from "node:child_process";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import * as vscode from "vscode";
 import { acquireLock, releaseLock } from "../../cli/src/core/SessionTracker.js";
 import {
@@ -32,9 +32,7 @@ import { getNotesDir } from "./core/NoteService.js";
 import {
 	addPlanToRegistry,
 	getPlansDir,
-	isPlanFromCurrentProject,
 	listAvailablePlans,
-	registerNewPlan,
 } from "./core/PlanService.js";
 import { JolliMemoryBridge } from "./JolliMemoryBridge.js";
 import type { FileItem } from "./providers/FilesTreeProvider.js";
@@ -53,6 +51,12 @@ import type { NoteItem, PlanItem } from "./providers/PlansTreeProvider.js";
 import { PlansTreeProvider } from "./providers/PlansTreeProvider.js";
 import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
 import { AuthService } from "./services/AuthService.js";
+import { MemoriesDataService } from "./services/data/MemoriesDataService.js";
+import { CommitsStore } from "./stores/CommitsStore.js";
+import { FilesStore } from "./stores/FilesStore.js";
+import { MemoriesStore } from "./stores/MemoriesStore.js";
+import { PlansStore } from "./stores/PlansStore.js";
+import { StatusStore } from "./stores/StatusStore.js";
 import { ExcludeFilterManager } from "./util/ExcludeFilterManager.js";
 import { formatShortRelativeDate } from "./util/FormatUtils.js";
 import { isWorkerBusy } from "./util/LockUtils.js";
@@ -82,19 +86,6 @@ function toGitUri(fileUri: vscode.Uri, ref: string): vscode.Uri {
 // Plan readonly preview uses TextDocumentContentProvider (registered in activate)
 
 // ─── FileSystemWatcher helpers ────────────────────────────────────────────────
-
-/**
- * Creates a debounced wrapper around a callback. Multiple invocations within
- * `ms` milliseconds collapse into a single trailing call. Multiple callers
- * that share the returned function share the same timer.
- */
-function debounced(callback: () => void, ms: number): () => void {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	return () => {
-		clearTimeout(timer);
-		timer = setTimeout(callback, ms);
-	};
-}
 
 /**
  * Creates a FileSystemWatcher and subscribes `callback` to both create and
@@ -281,7 +272,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	/** Opens a file dialog to import a markdown file as a note. */
 	async function addMarkdownNote(
 		br: JolliMemoryBridge,
-		provider: PlansTreeProvider,
+		store: PlansStore,
 	): Promise<void> {
 		const fileUri = await vscode.window.showOpenDialog({
 			canSelectMany: false,
@@ -298,7 +289,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			fileUri[0].fsPath,
 			"markdown",
 		);
-		await provider.refresh();
+		await store.refresh();
 		if (noteInfo.filePath) {
 			const doc = await vscode.workspace.openTextDocument(noteInfo.filePath);
 			await vscode.window.showTextDocument(doc);
@@ -313,18 +304,35 @@ export function activate(context: vscode.ExtensionContext): void {
 	const statusBar = new StatusBarManager();
 	context.subscriptions.push({ dispose: () => statusBar.dispose() });
 
-	// ── Tree providers ───────────────────────────────────────────────────────
-	const statusProvider = new StatusTreeProvider(bridge, authService);
-	const memoriesProvider = new MemoriesTreeProvider(bridge);
-	const plansProvider = new PlansTreeProvider(bridge);
-	const filesProvider = new FilesTreeProvider(
-		bridge,
+	// ── Stores (host-side state controllers) ────────────────────────────────
+	// Stores own mutable state, watchers, and bridge calls. Providers /
+	// commands / (future) WebView adapters are thin subscribers.
+	const statusStore = new StatusStore(bridge, authService);
+	const memoriesStore = new MemoriesStore(bridge);
+	const plansStore = new PlansStore(bridge, {
 		workspaceRoot,
-		excludeFilter,
+		plansDir: getPlansDir(),
+		notesDir: getNotesDir(workspaceRoot),
+	});
+	const filesStore = new FilesStore(bridge, workspaceRoot, excludeFilter);
+	const commitsStore = new CommitsStore(bridge);
+	context.subscriptions.push(
+		statusStore,
+		memoriesStore,
+		plansStore,
+		filesStore,
+		commitsStore,
 	);
-	const historyProvider = new HistoryTreeProvider(bridge);
-	statusProvider.setHistoryProvider(historyProvider);
 
+	// ── Tree providers (thin subscribers over stores) ────────────────────────
+	const statusProvider = new StatusTreeProvider(statusStore);
+	const memoriesProvider = new MemoriesTreeProvider(memoriesStore);
+	const plansProvider = new PlansTreeProvider(plansStore);
+	const filesProvider = new FilesTreeProvider(filesStore);
+	const historyProvider = new HistoryTreeProvider(commitsStore);
+
+	context.subscriptions.push(statusProvider);
+	context.subscriptions.push(memoriesProvider);
 	context.subscriptions.push(plansProvider);
 	context.subscriptions.push(filesProvider);
 	context.subscriptions.push(historyProvider);
@@ -374,7 +382,27 @@ export function activate(context: vscode.ExtensionContext): void {
 		filesView,
 		historyView,
 	);
-	memoriesProvider.setView(memoriesView);
+
+	// ── View-level UI subscriptions (store.onChange → title/description) ─────
+	// Provider does NOT hold view references; all view-level UI updates live
+	// here at the assembly layer so Provider stays purely a TreeDataProvider.
+	context.subscriptions.push({
+		dispose: commitsStore.onChange((snap) => {
+			historyView.title = snap.isMerged
+				? "COMMITS (merged — read-only history)"
+				: "COMMITS";
+		}),
+	});
+	context.subscriptions.push({
+		dispose: memoriesStore.onChange((snap) => {
+			memoriesView.description = MemoriesDataService.buildDescription({
+				filter: snap.filter,
+				entriesCount: snap.entriesCount,
+				totalCount: snap.totalCount,
+			});
+		}),
+	});
+
 	void vscode.commands.executeCommand(
 		"setContext",
 		"jollimemory.history.singleCommitMode",
@@ -399,15 +427,15 @@ export function activate(context: vscode.ExtensionContext): void {
 	void (async () => {
 		await migrateV1IfNeeded(
 			workspaceRoot,
-			statusProvider,
-			historyProvider,
-			filesProvider,
+			statusStore,
+			commitsStore,
+			filesStore,
 		);
 		await migrateIndexIfNeeded(
 			workspaceRoot,
-			statusProvider,
-			historyProvider,
-			filesProvider,
+			statusStore,
+			commitsStore,
+			filesStore,
 		);
 	})();
 
@@ -423,96 +451,17 @@ export function activate(context: vscode.ExtensionContext): void {
 		workspaceRoot,
 		".jolli/jollimemory/sessions.json",
 		() => {
-			statusProvider.refresh().catch(handleError("sessionsWatcher"));
-			plansProvider.refresh().catch(handleError("sessionsWatcher.plans"));
+			statusStore.refresh().catch(handleError("sessionsWatcher"));
+			plansStore.refresh().catch(handleError("sessionsWatcher.plans"));
 		},
 	);
 	context.subscriptions.push(sessionsWatcher);
 
-	// ── Plans directory watcher ──────────────────────────────────────────────
-	// Watch ~/.claude/plans/*.md for changes to auto-refresh the PLANS panel.
-	const plansDir = getPlansDir();
-	const debouncedPlansRefresh = debounced(
-		() => plansProvider.refresh().catch(handleError("plansDirWatcher")),
-		500,
-	);
-	const plansDirWatcher = watchFile(
-		vscode.Uri.file(plansDir),
-		"*.md",
-		debouncedPlansRefresh,
-		{ delete: true },
-	);
-	context.subscriptions.push(plansDirWatcher);
-
-	// Event-driven registration: when a NEW .md file appears in ~/.claude/plans/,
-	// register it into plans.json immediately so the panel shows it without
-	// waiting for a turn boundary or StopHook transcript scan.
-	//
-	// Historical files: VSCode's FileSystemWatcher only fires onDidCreate for
-	// files created AFTER subscription, so pre-existing plans from prior
-	// sessions are naturally excluded — no startup directory scan needed.
-	//
-	// Cross-project isolation: `~/.claude/plans/` is GLOBAL, so the OS delivers
-	// every create event to every VS Code instance subscribed to it. To avoid
-	// registering a foreign project's plan into this project, we gate
-	// registerNewPlan behind isPlanFromCurrentProject(), which confirms the
-	// absolute path appears in THIS project's transcripts. If no transcript
-	// match is found (foreign write, or transcript not yet flushed), StopHook
-	// will handle the case at turn end with its own transcript-based
-	// attribution.
-	//
-	// Events are chained through `registerQueue` to serialize the
-	// load-modify-save sequences of back-to-back registrations (Claude may
-	// emit multiple file creations in one turn). Without this, two concurrent
-	// registerNewPlan calls could each read the registry before either writes,
-	// and the later save would overwrite the earlier slug.
-	let registerQueue: Promise<void> = Promise.resolve();
-	context.subscriptions.push(
-		plansDirWatcher.onDidCreate((uri) => {
-			const filename = basename(uri.fsPath);
-			if (!filename.endsWith(".md")) {
-				return;
-			}
-			const slug = filename.slice(0, -3);
-			registerQueue = registerQueue
-				.then(async () => {
-					if (!(await isPlanFromCurrentProject(uri.fsPath, workspaceRoot))) {
-						return;
-					}
-					await registerNewPlan(slug, workspaceRoot);
-				})
-				.catch((err) => handleError("plansDirWatcher.register")(err as Error));
-		}),
-	);
-
-	// plans.json watcher — catches StopHook writes, registerNewPlan writes from
-	// the onDidCreate handler above, and any other out-of-band registry update.
-	// Safe from infinite refresh: registerNewPlan is idempotent (no-op when the
-	// slug already exists), and detectPlans only writes for orphan cleanup
-	// (also one-shot). The 500ms debounce absorbs any transient fan-out.
-	const plansJsonWatcher = watchFile(
-		workspaceRoot,
-		".jolli/jollimemory/plans.json",
-		debouncedPlansRefresh,
-	);
-	context.subscriptions.push(plansJsonWatcher);
-
-	// ── Notes directory watcher ─────────────────────────────────────────────
-	// Watch .jolli/jollimemory/notes/*.md for snippet file changes. The
-	// debounced callback is also invoked from the onDidSaveTextDocument handler
-	// below for external markdown notes — both sources share the same timer.
-	const notesDir = getNotesDir(workspaceRoot);
-	const debouncedNotesRefresh = debounced(
-		() => plansProvider.refresh().catch(handleError("notesDirWatcher")),
-		500,
-	);
-	const notesDirWatcher = watchFile(
-		vscode.Uri.file(notesDir),
-		"*.md",
-		debouncedNotesRefresh,
-		{ delete: true },
-	);
-	context.subscriptions.push(notesDirWatcher);
+	// Plans / Notes / plans.json watchers and new-plan registration are now
+	// owned by PlansStore (see `src/stores/PlansStore.ts`).  The Store is
+	// disposed via context.subscriptions above, which tears down all three
+	// watchers in one shot.
+	const notesDir = plansStore.getNotesDir();
 
 	// ── External markdown note watcher ──────────────────────────────────────
 	// Markdown notes now reference the user's original file (outside the notes
@@ -534,7 +483,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					(n) => n.format === "markdown" && n.filePath === doc.fileName,
 				);
 				if (isNoteSource) {
-					debouncedNotesRefresh();
+					plansStore.refreshFromExternalNoteSave();
 				}
 			} catch {
 				/* ignore — listNotes failure is non-critical here */
@@ -559,10 +508,10 @@ export function activate(context: vscode.ExtensionContext): void {
 			vscode.Uri.file(dirname(headPath)),
 			"HEAD",
 			() => {
-				statusProvider.refresh().catch(handleError("headWatcher.status"));
-				plansProvider.refresh().catch(handleError("headWatcher.plans"));
-				filesProvider.refresh().catch(handleError("headWatcher.files"));
-				historyProvider.refresh().catch(handleError("headWatcher.history"));
+				statusStore.refresh().catch(handleError("headWatcher.status"));
+				plansStore.refresh().catch(handleError("headWatcher.plans"));
+				filesStore.refresh().catch(handleError("headWatcher.files"));
+				commitsStore.refresh().catch(handleError("headWatcher.history"));
 			},
 		);
 		context.subscriptions.push(headWatcher);
@@ -589,10 +538,14 @@ export function activate(context: vscode.ExtensionContext): void {
 			ORPHAN_BRANCH,
 			() => {
 				bridge.invalidateEntriesCache();
-				historyProvider.refresh().catch(handleError("orphanRefWatcher"));
-				memoriesProvider
-					.refresh()
-					.catch(handleError("orphanRefWatcher.memories"));
+				commitsStore.refresh().catch(handleError("orphanRefWatcher"));
+				// Lazy-load gate: if the user never opened Memories, do NOT silently
+				// wake it up in the background (would trigger listSummaryEntries).
+				if (memoriesStore.hasFirstLoaded()) {
+					memoriesStore
+						.refresh()
+						.catch(handleError("orphanRefWatcher.memories"));
+				}
 			},
 		);
 		context.subscriptions.push(orphanRefWatcher);
@@ -611,7 +564,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		new vscode.RelativePattern(workspaceRoot, ".jolli/jollimemory/lock"),
 	);
 	const setWorkerBusy = (busy: boolean) => {
-		statusProvider.setWorkerBusy(busy);
+		statusStore.setWorkerBusy(busy);
 		void vscode.commands.executeCommand(
 			"setContext",
 			"jollimemory.workerBusy",
@@ -628,57 +581,65 @@ export function activate(context: vscode.ExtensionContext): void {
 		// the COMMITS panel here as a reliable fallback so the View Memory icon
 		// appears as soon as the worker finishes.
 		bridge.invalidateEntriesCache();
-		historyProvider.refresh().catch(handleError("lockWatcher.onDidDelete"));
-		memoriesProvider
-			.refresh()
-			.catch(handleError("lockWatcher.onDidDelete.memories"));
+		commitsStore.refresh().catch(handleError("lockWatcher.onDidDelete"));
+		if (memoriesStore.hasFirstLoaded()) {
+			memoriesStore
+				.refresh()
+				.catch(handleError("lockWatcher.onDidDelete.memories"));
+		}
 		// Refresh PLANS panel so commit hash prefix appears after Worker associates plans.
-		plansProvider.refresh().catch(handleError("lockWatcher.onDidDelete.plans"));
+		plansStore.refresh().catch(handleError("lockWatcher.onDidDelete.plans"));
 	});
 	context.subscriptions.push(lockWatcher);
 	// Check initial state — lock file might already exist on activation
 	void isWorkerBusy(workspaceRoot).then(setWorkerBusy);
 
-	// COMMITS panel: update title when merged state changes.
-	historyProvider.onDidChangeTreeData(() => {
-		historyView.title = historyProvider.isMerged
-			? "COMMITS (merged — read-only history)"
-			: "COMMITS";
-	});
+	// COMMITS title updates are handled by the commitsStore.onChange subscription
+	// registered near the createTreeView calls above — no provider hook needed.
 
-	// CHANGES panel: badge (number on activity bar icon) + tooltip.
-	// historyView intentionally has no badge — the activity bar icon number
-	// reflects only the changed-file count, not commits.
-	function updateFilesBadge(): void {
-		const visible = filesProvider.getVisibleFileCount();
-		const selected = filesProvider.getSelectedFiles().length;
+	// CHANGES panel: badge (number on activity bar icon) + tooltip + view
+	// description (which shows "N files hidden" when the exclude filter is active).
+	// Both update on every filesStore.onChange so saving new exclude patterns
+	// immediately refreshes the header count.  historyView intentionally has
+	// no badge — the activity bar icon number reflects only the changed-file
+	// count, not commits.
+	function updateFilesViewUI(): void {
+		const snap = filesStore.getSnapshot();
+		const visible = snap.visibleCount;
+		const selected = snap.selectedFiles.length;
 		const tooltip = `${visible} changed file${visible !== 1 ? "s" : ""}, ${selected} selected`;
 		filesView.badge = visible > 0 ? { value: visible, tooltip } : undefined;
+		filesView.description =
+			snap.excludedCount > 0
+				? `${snap.excludedCount} file${snap.excludedCount === 1 ? "" : "s"} hidden`
+				: undefined;
 	}
-	filesProvider.onDidChangeTreeData(updateFilesBadge);
+	context.subscriptions.push({
+		dispose: filesStore.onChange(updateFilesViewUI),
+	});
 
 	// ── Commands ─────────────────────────────────────────────────────────────
 	const commitCommand = new CommitCommand(
 		bridge,
-		filesProvider,
-		historyProvider,
-		statusProvider,
+		filesStore,
+		commitsStore,
+		statusStore,
 		statusBar,
 		workspaceRoot,
 	);
 	const squashCommand = new SquashCommand(
 		bridge,
-		historyProvider,
-		filesProvider,
-		statusProvider,
+		commitsStore,
+		filesStore,
+		statusStore,
 		statusBar,
 		workspaceRoot,
 	);
 	const pushCommand = new PushCommand(
 		bridge,
-		historyProvider,
-		filesProvider,
-		statusProvider,
+		commitsStore,
+		filesStore,
+		statusStore,
 		statusBar,
 		workspaceRoot,
 	);
@@ -687,13 +648,13 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(
 		// Status panel
 		vscode.commands.registerCommand("jollimemory.refreshStatus", () => {
-			statusProvider.refresh().catch(handleError("refreshStatus"));
+			statusStore.refresh().catch(handleError("refreshStatus"));
 			refreshStatusBar(
 				bridge,
-				memoriesProvider,
-				plansProvider,
-				filesProvider,
-				historyProvider,
+				memoriesStore,
+				plansStore,
+				filesStore,
+				commitsStore,
 				statusBar,
 			);
 		}),
@@ -712,23 +673,38 @@ export function activate(context: vscode.ExtensionContext): void {
 					vscode.window.showErrorMessage(`Jolli Memory: ${result.message}`);
 				} else {
 					log.info("cmd", "enable succeeded — refreshing all panels");
-					// Refresh all panels so the latest file and commit data is shown
-					// immediately after enabling — don't rely on stale pre-enable data.
-					// Reorder the file list since this is a fresh enable.
-					await Promise.all([
-						statusProvider.refresh(),
-						memoriesProvider.refresh(),
-						filesProvider.refresh(true),
-						historyProvider.refresh(),
-					]);
+					// ORDER MATTERS:
+					//   1. refreshStatusBar flips every store's enabled flag
+					//      to true based on bridge.getStatus().  Without this,
+					//      PlansStore.refresh() would early-return because its
+					//      enabled flag is still false from the prior disable.
+					//   2. Then Promise.all pulls fresh data into all stores.
+					// Serializing these two phases trades a small amount of
+					// latency for correctness.
 					await refreshStatusBar(
 						bridge,
-						memoriesProvider,
-						plansProvider,
-						filesProvider,
-						historyProvider,
+						memoriesStore,
+						plansStore,
+						filesStore,
+						commitsStore,
 						statusBar,
 					);
+					// Memories is normally lazy-loaded: the initialLoad path and
+					// cross-panel watchers gate on `memoriesStore.hasFirstLoaded()`
+					// so passive triggers don't fetch listSummaryEntries before
+					// the user has opened the panel. Enable is NOT a passive
+					// trigger — it's an explicit user gesture that activates the
+					// feature as a whole, so we refresh memories eagerly alongside
+					// the other panels for consistent UX (otherwise description
+					// counts lag and the panel would show a loading state on
+					// first open).
+					await Promise.all([
+						statusStore.refresh(),
+						memoriesStore.refresh(),
+						plansStore.refresh(),
+						filesStore.refresh(true),
+						commitsStore.refresh(),
+					]);
 				}
 			},
 		),
@@ -743,13 +719,13 @@ export function activate(context: vscode.ExtensionContext): void {
 					vscode.window.showErrorMessage(`Jolli Memory: ${result.message}`);
 				} else {
 					log.info("cmd", "disable succeeded");
-					await statusProvider.refresh();
+					await statusStore.refresh();
 					await refreshStatusBar(
 						bridge,
-						memoriesProvider,
-						plansProvider,
-						filesProvider,
-						historyProvider,
+						memoriesStore,
+						plansStore,
+						filesStore,
+						commitsStore,
 						statusBar,
 					);
 				}
@@ -762,19 +738,19 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		// Files panel
 		vscode.commands.registerCommand("jollimemory.refreshFiles", () => {
-			filesProvider.refresh(true).catch(handleError("refreshFiles"));
+			filesStore.refresh(true).catch(handleError("refreshFiles"));
 			refreshStatusBar(
 				bridge,
-				memoriesProvider,
-				plansProvider,
-				filesProvider,
-				historyProvider,
+				memoriesStore,
+				plansStore,
+				filesStore,
+				commitsStore,
 				statusBar,
 			);
 		}),
 
 		vscode.commands.registerCommand("jollimemory.selectAllFiles", () => {
-			filesProvider.toggleSelectAll();
+			filesStore.toggleSelectAll();
 		}),
 
 		vscode.commands.registerCommand("jollimemory.commitAI", () => {
@@ -887,14 +863,14 @@ export function activate(context: vscode.ExtensionContext): void {
 				}
 				try {
 					await bridge.discardFiles([item.fileStatus]);
-					filesProvider.deselectPaths([relativePath]);
-					await filesProvider.refresh(true);
+					filesStore.deselectPaths([relativePath]);
+					await filesStore.refresh(true);
 					refreshStatusBar(
 						bridge,
-						memoriesProvider,
-						plansProvider,
-						filesProvider,
-						historyProvider,
+						memoriesStore,
+						plansStore,
+						filesStore,
+						commitsStore,
 						statusBar,
 					);
 				} catch (err: unknown) {
@@ -907,7 +883,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						`Jolli Memory: Failed to discard "${relativePath}": ${message}`,
 					);
 					// Refresh anyway — partial success possible (e.g. staged restore succeeded, disk delete failed)
-					await filesProvider.refresh(true);
+					await filesStore.refresh(true);
 				}
 			},
 		),
@@ -915,7 +891,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand(
 			"jollimemory.discardSelectedChanges",
 			async () => {
-				const selectedFiles = filesProvider.getSelectedFiles();
+				const selectedFiles = filesStore.getSnapshot().selectedFiles;
 				if (selectedFiles.length === 0) {
 					vscode.window.showInformationMessage(
 						"Jolli Memory: No files selected to discard.",
@@ -951,13 +927,13 @@ export function activate(context: vscode.ExtensionContext): void {
 				}
 				try {
 					await bridge.discardFiles(selectedFiles);
-					await filesProvider.refresh(true);
+					await filesStore.refresh(true);
 					refreshStatusBar(
 						bridge,
-						memoriesProvider,
-						plansProvider,
-						filesProvider,
-						historyProvider,
+						memoriesStore,
+						plansStore,
+						filesStore,
+						commitsStore,
 						statusBar,
 					);
 				} catch (err: unknown) {
@@ -967,14 +943,14 @@ export function activate(context: vscode.ExtensionContext): void {
 						`Jolli Memory: Failed to discard selected changes: ${message}`,
 					);
 					// Refresh anyway — some files may have been discarded before the error
-					await filesProvider.refresh(true);
+					await filesStore.refresh(true);
 				}
 			},
 		),
 
 		// Plans panel
 		vscode.commands.registerCommand("jollimemory.refreshPlans", () => {
-			plansProvider.refresh().catch(handleError("refreshPlans"));
+			plansStore.refresh().catch(handleError("refreshPlans"));
 		}),
 
 		vscode.commands.registerCommand(
@@ -1015,7 +991,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			async (item: PlanItem) => {
 				log.info("cmd", `removePlan invoked: ${item.plan.slug}`);
 				await bridge.removePlan(item.plan.slug);
-				await plansProvider.refresh();
+				await plansStore.refresh();
 			},
 		),
 
@@ -1045,17 +1021,17 @@ export function activate(context: vscode.ExtensionContext): void {
 				return;
 			}
 			await addPlanToRegistry(selected.slug, workspaceRoot);
-			await plansProvider.refresh();
+			await plansStore.refresh();
 			log.info("cmd", `addPlan: added ${selected.slug}`);
 		}),
 
 		vscode.commands.registerCommand("jollimemory.addMarkdownNote", async () => {
-			await addMarkdownNote(bridge, plansProvider);
+			await addMarkdownNote(bridge, plansStore);
 		}),
 
 		vscode.commands.registerCommand("jollimemory.addTextSnippet", () => {
 			NoteEditorWebviewPanel.show(context.extensionUri, bridge, () =>
-				plansProvider.refresh(),
+				plansStore.refresh(),
 			);
 		}),
 
@@ -1096,17 +1072,17 @@ export function activate(context: vscode.ExtensionContext): void {
 			async (item: NoteItem) => {
 				log.info("cmd", `removeNote invoked: ${item.note.id}`);
 				await bridge.removeNote(item.note.id);
-				await plansProvider.refresh();
+				await plansStore.refresh();
 			},
 		),
 
 		// History panel
 		vscode.commands.registerCommand("jollimemory.refreshHistory", () => {
-			historyProvider.refresh().catch(handleError("refreshHistory"));
+			commitsStore.refresh().catch(handleError("refreshHistory"));
 		}),
 
 		vscode.commands.registerCommand("jollimemory.selectAllCommits", () => {
-			historyProvider.toggleSelectAll();
+			commitsStore.toggleSelectAll();
 		}),
 
 		vscode.commands.registerCommand("jollimemory.squash", () => {
@@ -1195,26 +1171,26 @@ export function activate(context: vscode.ExtensionContext): void {
 		}),
 
 		vscode.commands.registerCommand("jollimemory.refreshMemories", () => {
-			memoriesProvider.refresh().catch(handleError("refreshMemories"));
+			memoriesStore.refresh().catch(handleError("refreshMemories"));
 		}),
 
 		vscode.commands.registerCommand("jollimemory.searchMemories", async () => {
 			const input = await vscode.window.showInputBox({
 				prompt: "Filter memories by commit message or branch name",
-				placeHolder: "e.g. biome, auth, JOLLI-280...",
-				value: memoriesProvider.getFilter(),
+				placeHolder: "e.g. biome, auth, PROJ-280...",
+				value: memoriesStore.getFilter(),
 			});
 			if (input !== undefined) {
-				await memoriesProvider.setFilter(input);
+				await memoriesStore.setFilter(input);
 			}
 		}),
 
 		vscode.commands.registerCommand("jollimemory.clearMemoryFilter", () => {
-			memoriesProvider.setFilter("").catch(handleError("clearMemoryFilter"));
+			memoriesStore.setFilter("").catch(handleError("clearMemoryFilter"));
 		}),
 
 		vscode.commands.registerCommand("jollimemory.loadMoreMemories", () => {
-			memoriesProvider.loadMore().catch(handleError("loadMoreMemories"));
+			memoriesStore.loadMore().catch(handleError("loadMoreMemories"));
 		}),
 
 		// Copy recall prompt to clipboard — accepts MemoryItem or plain hash string.
@@ -1257,12 +1233,26 @@ export function activate(context: vscode.ExtensionContext): void {
 		// Settings — accessible via the gear icon in the STATUS panel title bar.
 		vscode.commands.registerCommand("jollimemory.openSettings", () => {
 			log.info("cmd", "openSettings invoked");
-			SettingsWebviewPanel.show(context.extensionUri, workspaceRoot, () => {
-				// Refresh status panel and exclude filter after settings are saved
-				statusProvider.refresh().catch(handleError("openSettings.refresh"));
-				excludeFilter.load().catch(handleError("openSettings.excludeFilter"));
-				filesProvider.refresh().catch(handleError("openSettings.filesRefresh"));
-			});
+			SettingsWebviewPanel.show(
+				context.extensionUri,
+				workspaceRoot,
+				async () => {
+					// Strict ordering fixes a pre-existing race: previously the exclude
+					// filter was loaded in parallel with filesStore.refresh(), so
+					// getChildren could run against the stale pattern set until load
+					// completed.  Now: (1) load patterns, (2) recompute visible set
+					// without re-querying git, (3) refresh the status panel.  We call
+					// applyExcludeFilterChange() rather than refresh() to avoid an
+					// unnecessary bridge.listFiles() roundtrip.
+					try {
+						await excludeFilter.load();
+						filesStore.applyExcludeFilterChange();
+						await statusStore.refresh();
+					} catch (err) {
+						handleError("openSettings.save")(err as Error);
+					}
+				},
+			);
 		}),
 
 		// Auth — sign in / sign out via browser-based OAuth flow.
@@ -1274,7 +1264,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand("jollimemory.signOut", async () => {
 			log.info("cmd", "signOut invoked");
 			await authService.signOut();
-			statusProvider.refresh().catch(handleError("signOut.refresh"));
+			statusStore.refresh().catch(handleError("signOut.refresh"));
 		}),
 	);
 
@@ -1298,7 +1288,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					vscode.window.showInformationMessage(
 						"Signed in to Jolli successfully.",
 					);
-					statusProvider.refresh().catch(handleError("uriHandler.refresh"));
+					statusStore.refresh().catch(handleError("uriHandler.refresh"));
 				} else {
 					vscode.window.showErrorMessage(
 						`Jolli sign-in failed: ${result.error}`,
@@ -1309,8 +1299,9 @@ export function activate(context: vscode.ExtensionContext): void {
 	);
 
 	// Handle file checkbox toggle from the tree view (pure in-memory — no git ops).
-	// Badge is updated directly here instead of via _onDidChangeTreeData.fire(),
-	// which would cause a full tree rebuild, panel flicker, and focus-border jump.
+	// The store broadcasts with changeReason="userCheckbox" so the TreeView
+	// provider skips fire (avoiding flicker + focus-border jump).  The badge
+	// subscription above runs on every store change and picks up the new state.
 	// refreshStatusBar is intentionally omitted — checkbox toggles do not change
 	// the enabled/disabled state, so re-querying status would only cause needless
 	// tree rebuilds in sibling panels.
@@ -1318,12 +1309,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		const items = e.items.map(
 			([item, state]) =>
 				[
-					item as FileItem,
+					(item as FileItem).fileStatus.relativePath,
 					state === vscode.TreeItemCheckboxState.Checked,
 				] as const,
 		);
-		filesProvider.onCheckboxToggleBatch(items);
-		updateFilesBadge();
+		filesStore.applyCheckboxBatch(items);
 	});
 
 	// Handle commit checkbox toggle from the tree view.
@@ -1332,8 +1322,8 @@ export function activate(context: vscode.ExtensionContext): void {
 	historyView.onDidChangeCheckboxState((e) => {
 		for (const [item, state] of e.items) {
 			if ("commit" in item && item.commit) {
-				historyProvider.onCheckboxToggle(
-					item as CommitItem,
+				commitsStore.onCheckboxToggle(
+					(item as CommitItem).commit.hash,
 					state === vscode.TreeItemCheckboxState.Checked,
 				);
 			}
@@ -1343,11 +1333,14 @@ export function activate(context: vscode.ExtensionContext): void {
 	// ── Memories panel: lazy-load on first visibility ─────────────────────────
 	// Defer orphan-branch index read until the panel is actually visible.
 	// This keeps the activation critical path fast (~0ms overhead).
-	let memoriesLazyLoaded = false;
+	// `ensureFirstLoad()` is idempotent so multiple visibility events are safe,
+	// and cross-panel watchers (orphanRef / lock) gate on `hasFirstLoaded()` so
+	// they do not wake the panel behind the user's back.
 	memoriesView.onDidChangeVisibility((e) => {
-		if (e.visible && !memoriesLazyLoaded) {
-			memoriesLazyLoaded = true;
-			memoriesProvider.refresh().catch(handleError("memoriesView.lazyLoad"));
+		if (e.visible) {
+			memoriesStore
+				.ensureFirstLoad()
+				.catch(handleError("memoriesView.lazyLoad"));
 		}
 	});
 
@@ -1355,12 +1348,11 @@ export function activate(context: vscode.ExtensionContext): void {
 	initialLoad(
 		bridge,
 		excludeFilter,
-		statusProvider,
-		plansProvider,
-		filesProvider,
-		filesView,
-		historyProvider,
-		memoriesProvider,
+		statusStore,
+		plansStore,
+		filesStore,
+		commitsStore,
+		memoriesStore,
 		statusBar,
 	);
 
@@ -1376,19 +1368,19 @@ export function activate(context: vscode.ExtensionContext): void {
 
 			// Warn if a newer version (e.g. global CLI) manages hooks
 			if (mismatch) {
-				statusProvider.setExtensionOutdated(true);
+				statusStore.setExtensionOutdated(true);
 				vscode.window.showWarningMessage(
 					"Jolli Memory: A newer version is available. Please update the extension.",
 				);
 			}
 			// Re-render the status panel to reflect any path refresh that just happened.
-			await statusProvider.refresh();
+			await statusStore.refresh();
 			await refreshStatusBar(
 				bridge,
-				memoriesProvider,
-				plansProvider,
-				filesProvider,
-				historyProvider,
+				memoriesStore,
+				plansStore,
+				filesStore,
+				commitsStore,
 				statusBar,
 			);
 
@@ -1407,13 +1399,13 @@ export function activate(context: vscode.ExtensionContext): void {
 					"Project enabled but worktree hooks missing — auto-installing",
 				);
 				await bridge.autoInstallForWorktree();
-				await statusProvider.refresh();
+				await statusStore.refresh();
 				await refreshStatusBar(
 					bridge,
-					memoriesProvider,
-					plansProvider,
-					filesProvider,
-					historyProvider,
+					memoriesStore,
+					plansStore,
+					filesStore,
+					commitsStore,
 					statusBar,
 				);
 			}
@@ -1440,59 +1432,43 @@ export function deactivate(): void {
 function initialLoad(
 	bridge: JolliMemoryBridge,
 	excludeFilter: ExcludeFilterManager,
-	statusProvider: StatusTreeProvider,
-	plansProvider: PlansTreeProvider,
-	filesProvider: FilesTreeProvider,
-	filesView: vscode.TreeView<FileItem>,
-	historyProvider: HistoryTreeProvider,
-	memoriesProvider: MemoriesTreeProvider,
+	statusStore: StatusStore,
+	plansStore: PlansStore,
+	filesStore: FilesStore,
+	commitsStore: CommitsStore,
+	memoriesStore: MemoriesStore,
 	statusBar: StatusBarManager,
 ): void {
 	log.info("initialLoad", "Loading all panels");
 	// Load the exclude filter FIRST so the initial file list is already filtered.
-	// If loaded in parallel with filesProvider.refresh(), the tree briefly shows
+	// If loaded in parallel with filesStore.refresh(), the tree briefly shows
 	// all files (including excluded ones) before the filter kicks in.
 	excludeFilter
 		.load()
 		.then(() =>
 			Promise.all([
-				statusProvider.refresh(),
-				plansProvider.refresh(),
-				filesProvider.refresh(),
-				historyProvider.refresh(),
+				statusStore.refresh(),
+				plansStore.refresh(),
+				filesStore.refresh(),
+				commitsStore.refresh(),
 			]),
 		)
 		.then(async () => {
 			log.info("initialLoad", "All panels loaded — updating status bar");
-			// Set initial context key and description from persisted filter state
-			syncExcludeFilterUI(filesProvider, filesView);
+			// filesView.description is now driven by filesStore.onChange
+			// (updateFilesViewUI in activate), so no one-shot sync here.
 			await refreshStatusBar(
 				bridge,
-				memoriesProvider,
-				plansProvider,
-				filesProvider,
-				historyProvider,
+				memoriesStore,
+				plansStore,
+				filesStore,
+				commitsStore,
 				statusBar,
 			);
 		})
 		.catch((err: unknown) => {
 			log.error("initialLoad", "Failed to load panels", err);
 		});
-}
-
-/**
- * Syncs the exclude filter UI state: updates the tree view description
- * to show how many files are currently hidden by the exclude filter.
- */
-function syncExcludeFilterUI(
-	filesProvider: FilesTreeProvider,
-	filesView: vscode.TreeView<FileItem>,
-): void {
-	const excludedCount = filesProvider.getExcludedCount();
-	filesView.description =
-		excludedCount > 0
-			? `${excludedCount} file${excludedCount === 1 ? "" : "s"} hidden`
-			: undefined;
 }
 
 /**
@@ -1505,10 +1481,10 @@ function syncExcludeFilterUI(
  */
 async function refreshStatusBar(
 	bridge: JolliMemoryBridge,
-	memoriesProvider: MemoriesTreeProvider,
-	plansProvider: PlansTreeProvider,
-	filesProvider: FilesTreeProvider,
-	historyProvider: HistoryTreeProvider,
+	memoriesStore: MemoriesStore,
+	plansStore: PlansStore,
+	filesStore: FilesStore,
+	commitsStore: CommitsStore,
 	statusBar: StatusBarManager,
 ): Promise<void> {
 	const status = await bridge.getStatus();
@@ -1517,10 +1493,10 @@ async function refreshStatusBar(
 
 	// Propagate the enabled flag to providers so their panels show the
 	// viewsWelcome placeholder (empty list) when JolliMemory is disabled.
-	memoriesProvider.setEnabled(status.enabled);
-	plansProvider.setEnabled(status.enabled);
-	filesProvider.setEnabled(status.enabled);
-	historyProvider.setEnabled(status.enabled);
+	memoriesStore.setEnabled(status.enabled);
+	plansStore.setEnabled(status.enabled);
+	filesStore.setEnabled(status.enabled);
+	commitsStore.setEnabled(status.enabled);
 
 	// Update the context key so package.json `when` clauses show the correct icon.
 	await vscode.commands.executeCommand(
@@ -1553,13 +1529,13 @@ function handleError(commandName: string): (err: unknown) => void {
  */
 async function migrateIndexIfNeeded(
 	cwd: string,
-	statusProvider: StatusTreeProvider,
-	historyProvider: HistoryTreeProvider,
-	filesProvider: FilesTreeProvider,
+	statusStore: StatusStore,
+	commitsStore: CommitsStore,
+	filesStore: FilesStore,
 ): Promise<void> {
 	try {
 		// Early-return so that no-op cases (most activations) skip the expensive
-		// historyProvider.refresh() and migration-state toggling below.
+		// commitsStore.refresh() and migration-state toggling below.
 		const needsMigration = await indexNeedsMigration(cwd);
 		if (!needsMigration) {
 			return;
@@ -1570,9 +1546,9 @@ async function migrateIndexIfNeeded(
 	}
 
 	// Show migration state in all panels
-	statusProvider.setMigrating(true);
-	historyProvider.setMigrating(true);
-	filesProvider.setMigrating(true);
+	statusStore.setMigrating(true);
+	commitsStore.setMigrating(true);
+	filesStore.setMigrating(true);
 
 	try {
 		log.info("migrate", "Index v1 detected — migrating to v3 flat format");
@@ -1600,12 +1576,12 @@ async function migrateIndexIfNeeded(
 		log.error("migrate", "Index v1 → v3 migration failed", err);
 	} finally {
 		// Clear migration state regardless of success/failure
-		statusProvider.setMigrating(false);
-		historyProvider.setMigrating(false);
-		filesProvider.setMigrating(false);
+		statusStore.setMigrating(false);
+		commitsStore.setMigrating(false);
+		filesStore.setMigrating(false);
 
 		// Refresh providers so history reflects the migrated data
-		await Promise.all([statusProvider.refresh(), historyProvider.refresh()]);
+		await Promise.all([statusStore.refresh(), commitsStore.refresh()]);
 	}
 }
 
@@ -1616,13 +1592,13 @@ async function migrateIndexIfNeeded(
  */
 async function migrateV1IfNeeded(
 	cwd: string,
-	statusProvider: StatusTreeProvider,
-	historyProvider: HistoryTreeProvider,
-	filesProvider: FilesTreeProvider,
+	statusStore: StatusStore,
+	commitsStore: CommitsStore,
+	filesStore: FilesStore,
 ): Promise<void> {
 	try {
 		// Early-return so that no-op cases (most activations) skip the expensive
-		// historyProvider.refresh() and migration-state toggling below.
+		// commitsStore.refresh() and migration-state toggling below.
 		const v1Exists = await hasV1Branch(cwd);
 		if (!v1Exists) {
 			return;
@@ -1643,9 +1619,9 @@ async function migrateV1IfNeeded(
 	}
 
 	// Show migration state in all panels
-	statusProvider.setMigrating(true);
-	historyProvider.setMigrating(true);
-	filesProvider.setMigrating(true);
+	statusStore.setMigrating(true);
+	commitsStore.setMigrating(true);
+	filesStore.setMigrating(true);
 
 	try {
 		log.info(
@@ -1668,11 +1644,11 @@ async function migrateV1IfNeeded(
 		log.error("migrate", "V1 → V3 migration failed", err);
 	} finally {
 		// Clear migration state regardless of success/failure.
-		statusProvider.setMigrating(false);
-		historyProvider.setMigrating(false);
-		filesProvider.setMigrating(false);
+		statusStore.setMigrating(false);
+		commitsStore.setMigrating(false);
+		filesStore.setMigrating(false);
 
 		// Refresh providers so counts reflect the migrated data.
-		await Promise.all([statusProvider.refresh(), historyProvider.refresh()]);
+		await Promise.all([statusStore.refresh(), commitsStore.refresh()]);
 	}
 }
