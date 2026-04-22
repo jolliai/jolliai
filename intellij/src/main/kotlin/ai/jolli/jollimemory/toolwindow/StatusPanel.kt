@@ -7,6 +7,7 @@ import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.services.JolliApiClient
+import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
@@ -180,7 +181,7 @@ class StatusPanel(
             tooltip = "$branchSummaryCount on current branch, ${status.summaryCount} total across all branches",
         ))
 
-        // 5. Jolli Site (from API key) — show site URL when configured, warning when not
+        // 5. Jolli Site (from API key) — show site URL when configured
         if (!config.jolliApiKey.isNullOrBlank()) {
             val meta = JolliApiClient.parseJolliApiKey(config.jolliApiKey!!)
             val siteUrl = meta?.u
@@ -192,14 +193,6 @@ class StatusPanel(
                     tooltip = "Resolved from Jolli API Key (tenant: ${meta.t})",
                 ))
             }
-        } else {
-            listModel.addElement(StatusRow(
-                icon = Icon.WARN,
-                label = "Jolli API Key",
-                description = "not configured — double-click to set",
-                tooltip = "Required for pushing memories to Jolli Space (embeds site URL)",
-                onClick = { openSettingsDialog() },
-            ))
         }
 
         // 6. Claude Integration — matches VS Code pushIntegrationItem() descriptions

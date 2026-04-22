@@ -43,6 +43,7 @@ object Summarizer {
         val conversationTurns: Int? = null,
         val apiKey: String? = null,
         val model: String? = null,
+        val jolliApiKey: String? = null,
     )
 
     /** Builds the full summarization prompt. */
@@ -114,39 +115,52 @@ major
 17. NEVER use ===TOPIC=== or ---FIELDNAME--- inside your content."""
     }
 
-    /** Generates a summary by calling the Anthropic API. */
+    /** Generates a summary by calling the LLM (direct Anthropic or Jolli proxy). */
     fun generateSummary(params: SummarizeParams): SummaryResult {
-        val model = resolveModelId(params.model)
-        val apiKey = params.apiKey ?: System.getenv("ANTHROPIC_API_KEY")
-            ?: throw RuntimeException("Anthropic API key not found")
-
         log.info("Generating summary for commit %s", params.commitInfo.hash.take(8))
-        val prompt = buildSummarizationPrompt(params.conversation, params.diff, params.commitInfo)
-        val client = AnthropicClient(apiKey)
-        val startTime = System.currentTimeMillis()
 
-        val response = client.createMessage(
-            model = model,
-            maxTokens = DEFAULT_MAX_TOKENS,
-            temperature = 0.0,
-            messages = listOf(AnthropicClient.Message("user", prompt)),
+        // Select template variant based on diff size (matches CLI logic)
+        val totalLines = params.diffStats.insertions + params.diffStats.deletions
+        val workSize = when {
+            totalLines <= 100 -> "small"
+            totalLines <= 500 -> "medium"
+            else -> "large"
+        }
+
+        val prompt = buildSummarizationPrompt(params.conversation, params.diff, params.commitInfo)
+        val proxyParams = mapOf(
+            "commitHash" to params.commitInfo.hash,
+            "commitMessage" to params.commitInfo.message,
+            "commitAuthor" to params.commitInfo.author,
+            "commitDate" to params.commitInfo.date,
+            "conversation" to params.conversation,
+            "diff" to params.diff,
         )
 
-        val elapsed = System.currentTimeMillis() - startTime
-        log.info("API response in %dms (in=%d, out=%d)", elapsed, response.usage.inputTokens, response.usage.outputTokens)
+        val result = LlmClient.callLlm(
+            action = "summarize:$workSize",
+            params = proxyParams,
+            apiKey = params.apiKey,
+            jolliApiKey = params.jolliApiKey,
+            model = resolveModelId(params.model),
+            maxTokens = DEFAULT_MAX_TOKENS,
+            prompt = prompt,
+        )
 
-        val responseText = response.content.firstOrNull { it.type == "text" }?.text?.trim()
+        log.info("API response in %dms (in=%d, out=%d)", result.apiLatencyMs, result.inputTokens, result.outputTokens)
+
+        val responseText = result.text
             ?: throw RuntimeException("No text content in API response")
 
         val parsed = parseSummaryResponse(responseText)
         log.info("Summary parsed: %d topic(s)", parsed.topics.size)
 
         val llm = LlmCallMetadata(
-            model = response.model,
-            inputTokens = response.usage.inputTokens,
-            outputTokens = response.usage.outputTokens,
-            apiLatencyMs = elapsed,
-            stopReason = response.stopReason,
+            model = result.model ?: resolveModelId(params.model),
+            inputTokens = result.inputTokens,
+            outputTokens = result.outputTokens,
+            apiLatencyMs = result.apiLatencyMs,
+            stopReason = result.stopReason,
         )
 
         return SummaryResult(
@@ -275,21 +289,25 @@ Rules:
     }
 
     fun generateCommitMessage(params: CommitMessageParams): String {
-        val model = resolveModelId(params.model)
-        val apiKey = params.apiKey ?: System.getenv("ANTHROPIC_API_KEY")
-            ?: throw RuntimeException("Anthropic API key not found")
-
         val prompt = buildCommitMessagePrompt(params)
-        val client = AnthropicClient(apiKey)
-
-        val response = client.createMessage(
-            model = model,
-            maxTokens = 256,
-            temperature = 0.0,
-            messages = listOf(AnthropicClient.Message("user", prompt)),
+        val fileList = params.stagedFiles.joinToString(", ").ifEmpty { "(none)" }
+        val proxyParams = mapOf(
+            "stagedDiff" to params.stagedDiff.ifEmpty { "(empty diff -- no staged changes)" },
+            "branch" to params.branch,
+            "fileList" to fileList,
         )
 
-        val text = response.content.firstOrNull { it.type == "text" }?.text?.trim()
+        val result = LlmClient.callLlm(
+            action = "commit-message",
+            params = proxyParams,
+            apiKey = params.apiKey,
+            jolliApiKey = params.jolliApiKey,
+            model = resolveModelId(params.model),
+            maxTokens = 256,
+            prompt = prompt,
+        )
+
+        val text = result.text
             ?: throw RuntimeException("No text content in API response")
 
         return text.trim('"', '\'')
@@ -304,6 +322,7 @@ Rules:
         val diff: String,
         val apiKey: String? = null,
         val model: String? = null,
+        val jolliApiKey: String? = null,
     )
 
     private val SCENARIO_DELIMITER_RE = Regex("^\\s*===SCENARIO===\\s*$", RegexOption.MULTILINE)
@@ -430,23 +449,33 @@ What the reviewer needs to have ready before testing (e.g. "Have a Space with 3+
         return scenarios
     }
 
-    /** Generates E2E test scenarios by calling the Anthropic API. */
+    /** Generates E2E test scenarios by calling the LLM (direct Anthropic or Jolli proxy). */
     fun generateE2eTest(params: E2eTestParams): List<E2eTestScenario> {
-        val model = resolveModelId(params.model)
-        val apiKey = params.apiKey ?: throw RuntimeException("API key required")
-
         log.info("Generating E2E test guide for: %s", params.commitMessage.take(60))
         val prompt = buildE2eTestPrompt(params.topics, params.commitMessage, params.diff)
-        val client = AnthropicClient(apiKey)
+        val maxScenarios = if (params.topics.size <= 3) 5 else 10
+        val topicsSummary = params.topics.mapIndexed { i, t ->
+            "### Topic ${i + 1}: ${t.title}\n- **Trigger:** ${t.trigger}\n- **Response:** ${t.response}"
+        }.joinToString("\n\n")
 
-        val response = client.createMessage(
-            model = model,
-            maxTokens = DEFAULT_MAX_TOKENS,
-            temperature = 0.0,
-            messages = listOf(AnthropicClient.Message("user", prompt)),
+        val proxyParams = mapOf(
+            "commitMessage" to params.commitMessage,
+            "topicsSummary" to topicsSummary,
+            "diff" to params.diff,
+            "maxScenarios" to maxScenarios.toString(),
         )
 
-        val text = response.content.firstOrNull { it.type == "text" }?.text?.trim()
+        val result = LlmClient.callLlm(
+            action = "e2e-test",
+            params = proxyParams,
+            apiKey = params.apiKey,
+            jolliApiKey = params.jolliApiKey,
+            model = resolveModelId(params.model),
+            maxTokens = DEFAULT_MAX_TOKENS,
+            prompt = prompt,
+        )
+
+        val text = result.text
             ?: throw RuntimeException("No text in response")
 
         log.info("E2E raw response length: %d chars, first 500: %s", text.length, text.take(500))
@@ -473,23 +502,22 @@ Rules:
 $content"""
     }
 
-    /** Translates a Markdown document to English using the Anthropic API. */
-    fun translateToEnglish(content: String, apiKey: String?, model: String?): String {
-        val resolvedModel = resolveModelId(model)
-        val resolvedKey = apiKey ?: throw RuntimeException("API key required")
-
+    /** Translates a Markdown document to English using the LLM (direct Anthropic or Jolli proxy). */
+    fun translateToEnglish(content: String, apiKey: String?, model: String?, jolliApiKey: String? = null): String {
         log.info("Translating plan to English (%d chars)", content.length)
         val prompt = buildTranslationPrompt(content)
-        val client = AnthropicClient(resolvedKey)
 
-        val response = client.createMessage(
-            model = resolvedModel,
+        val result = LlmClient.callLlm(
+            action = "translate",
+            params = mapOf("content" to content),
+            apiKey = apiKey,
+            jolliApiKey = jolliApiKey,
+            model = resolveModelId(model),
             maxTokens = DEFAULT_MAX_TOKENS,
-            temperature = 0.0,
-            messages = listOf(AnthropicClient.Message("user", prompt)),
+            prompt = prompt,
         )
 
-        return response.content.firstOrNull { it.type == "text" }?.text?.trim()
+        return result.text
             ?: throw RuntimeException("No text in translation response")
     }
 
@@ -502,11 +530,8 @@ $content"""
         isFullSquash: Boolean,
         apiKey: String?,
         model: String?,
+        jolliApiKey: String? = null,
     ): String {
-        val resolvedModel = resolveModelId(model)
-        val key = apiKey ?: System.getenv("ANTHROPIC_API_KEY")
-            ?: throw RuntimeException("Anthropic API key not found")
-
         val commitsBlock = commits.mapIndexed { i, (msg, topics) ->
             val topicLines = if (topics.isNotEmpty()) {
                 topics.joinToString("\n") { "   - ${it.title}\n     Why: ${it.trigger}" }
@@ -547,9 +572,23 @@ Rules:
    - No ticket: no prefix.
 6. Do NOT include multi-line bodies -- just the single subject line."""
 
-        val client = AnthropicClient(key)
-        val response = client.createMessage(resolvedModel, 256, 0.0, listOf(AnthropicClient.Message("user", prompt)))
-        return response.content.firstOrNull { it.type == "text" }?.text?.trim()?.trim('"', '\'')
+        val proxyParams = mapOf(
+            "ticketLine" to ticketLine,
+            "commitsBlock" to commitsBlock,
+            "scopeLine" to scopeLine,
+        )
+
+        val result = LlmClient.callLlm(
+            action = "squash-message",
+            params = proxyParams,
+            apiKey = apiKey,
+            jolliApiKey = jolliApiKey,
+            model = resolveModelId(model),
+            maxTokens = 256,
+            prompt = prompt,
+        )
+
+        return result.text?.trim('"', '\'')
             ?: throw RuntimeException("No text in response")
     }
 }

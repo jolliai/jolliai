@@ -160,7 +160,10 @@ class SettingsDialog(
             .map { it.trim() }
             .filter { it.isNotEmpty() }
 
-        val config = JolliMemoryConfig(
+        // Always save to global config directory, preserving fields not managed by this dialog
+        val configDir = SessionTracker.getGlobalConfigDir()
+        val existing = SessionTracker.loadConfigFromDir(configDir)
+        val config = existing.copy(
             apiKey = resolvedApiKey.ifBlank { null },
             model = (modelCombo.selectedItem as String).let { if (it == "sonnet") null else it },
             maxTokens = maxTokens,
@@ -170,9 +173,6 @@ class SettingsDialog(
             geminiEnabled = geminiEnabledCheckbox.isSelected,
             excludePatterns = if (excludePatterns.isNotEmpty()) excludePatterns else null,
         )
-
-        // Always save to global config directory
-        val configDir = SessionTracker.getGlobalConfigDir()
         SessionTracker.saveConfigToDir(config, configDir)
 
         super.doOKAction()

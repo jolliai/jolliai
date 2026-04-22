@@ -195,10 +195,10 @@ object PostCommitHook {
             // 7. Build conversation context
             val conversation = TranscriptReader.buildMultiSessionContext(sessionTranscripts)
 
-            // 8. Generate summary via Anthropic API
+            // 8. Generate summary via LLM (direct Anthropic or Jolli proxy)
             val apiKey = config.apiKey ?: System.getenv("ANTHROPIC_API_KEY")
-            if (apiKey == null) {
-                log.warn("No API key configured — skipping summarization")
+            if (apiKey == null && config.jolliApiKey.isNullOrBlank()) {
+                log.warn("No LLM credentials configured — skipping summarization")
                 return
             }
 
@@ -211,6 +211,7 @@ object PostCommitHook {
                 conversationTurns = totalTurns,
                 apiKey = apiKey,
                 model = config.model,
+                jolliApiKey = config.jolliApiKey,
             ))
 
             // 8b. Detect uncommitted plans, archive, and evaluate progress
@@ -238,7 +239,7 @@ object PostCommitHook {
                         if (planMarkdown != null) {
                             val evalResult = try {
                                 PlanProgressEvaluator.evaluatePlanProgress(
-                                    planMarkdown, diff, topics, conversation, apiKey, config.model,
+                                    planMarkdown, diff, topics, conversation, apiKey, config.model, config.jolliApiKey,
                                 )
                             } catch (e: Exception) {
                                 log.warn("Plan progress eval failed for %s: %s", slug, e.message)

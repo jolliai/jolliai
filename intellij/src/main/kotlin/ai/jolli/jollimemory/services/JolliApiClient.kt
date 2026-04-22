@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.services
 
+import ai.jolli.jollimemory.auth.JolliConfigStore
 import ai.jolli.jollimemory.core.JmLogger
 import com.google.gson.Gson
 import java.net.URI
@@ -183,6 +184,82 @@ object JolliApiClient {
 
         if (statusCode != 200 && statusCode != 204) {
             throw RuntimeException("Delete failed with status $statusCode")
+        }
+    }
+
+    /**
+     * Resolves the effective bearer token for Jolli API calls.
+     * Priority: explicit Jolli API key > OAuth auth token from ~/.jolli/jollimemory/config.json.
+     */
+    fun resolveToken(jolliApiKey: String?): String? {
+        if (!jolliApiKey.isNullOrBlank()) return jolliApiKey
+        return JolliConfigStore.loadAuthToken()
+    }
+
+    // ── LLM Proxy ─────────────────────────────────────────────────────────
+
+    /** Response from the LLM proxy endpoint. */
+    data class LlmProxyResult(
+        val text: String?,
+        val inputTokens: Int,
+        val outputTokens: Int,
+    )
+
+    /** Payload sent to the LLM proxy endpoint. */
+    private data class LlmProxyPayload(
+        val action: String,
+        val params: Map<String, String>,
+    )
+
+    /**
+     * Calls the Jolli LLM proxy endpoint.
+     * The backend owns the prompt template — we just send the action key and params.
+     */
+    fun callLlmProxy(apiKey: String, action: String, params: Map<String, String>): LlmProxyResult {
+        val keyMeta = parseJolliApiKey(apiKey)
+        val resolvedBaseUrl = keyMeta?.u
+            ?: throw RuntimeException(
+                "Jolli site URL could not be determined from API key. " +
+                    "Please regenerate your Jolli API Key."
+            )
+
+        val parsed = parseBaseUrl(resolvedBaseUrl)
+        val targetUri = URI.create("${parsed.origin}/api/push/llm/complete")
+
+        val body = gson.toJson(LlmProxyPayload(action, params))
+        val requestBuilder = HttpRequest.newBuilder()
+            .uri(targetUri)
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer $apiKey")
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .timeout(Duration.ofSeconds(120))
+
+        if (parsed.tenantSlug != null) {
+            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        }
+        if (keyMeta.o != null) {
+            requestBuilder.header("x-org-slug", keyMeta.o)
+        }
+
+        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+        val raw = response.body() ?: ""
+        val statusCode = response.statusCode()
+
+        if (statusCode !in 200..299) {
+            log.warn("LLM proxy error %d: %s", statusCode, raw.take(500))
+            throw RuntimeException("LLM proxy error (HTTP $statusCode): ${raw.take(200)}")
+        }
+
+        return try {
+            @Suppress("UNCHECKED_CAST")
+            val json = gson.fromJson(raw, Map::class.java) as Map<String, Any?>
+            LlmProxyResult(
+                text = json["text"] as? String,
+                inputTokens = (json["inputTokens"] as? Double)?.toInt() ?: 0,
+                outputTokens = (json["outputTokens"] as? Double)?.toInt() ?: 0,
+            )
+        } catch (_: Exception) {
+            throw RuntimeException("Invalid JSON from LLM proxy (HTTP $statusCode): ${raw.take(200)}")
         }
     }
 

@@ -251,14 +251,15 @@ class SummaryPanel(
         val config = SessionTracker.loadConfig(cwd)
         if (config.jolliApiKey.isNullOrBlank()) {
             ApplicationManager.getApplication().invokeLater {
-                Messages.showWarningDialog(project, "Please configure your Jolli API Key first (STATUS panel).", "Missing API Key")
+                Messages.showWarningDialog(project, "Please sign in or configure a Jolli API Key in Settings > Tools > Jolli Memory.", "Missing API Key")
             }
             return
         }
 
         val keyMeta = JolliApiClient.parseJolliApiKey(config.jolliApiKey!!)
         val resolvedBaseUrl = keyMeta?.u
-        if (resolvedBaseUrl == null) {
+            ?: ai.jolli.jollimemory.auth.JolliUrlConfig.getJolliUrl()
+        if (resolvedBaseUrl.isBlank()) {
             ApplicationManager.getApplication().invokeLater {
                 Messages.showWarningDialog(project, "Jolli site URL could not be determined. Please regenerate your Jolli API Key.", "Invalid API Key")
             }
@@ -411,7 +412,7 @@ class SummaryPanel(
                 val scenarios = Summarizer.generateE2eTest(Summarizer.E2eTestParams(
                     topics = topics.map { it.topic.topic },
                     commitMessage = summary.commitMessage, diff = diff,
-                    apiKey = config.apiKey, model = config.model,
+                    apiKey = config.apiKey, model = config.model, jolliApiKey = config.jolliApiKey,
                 ))
 
                 val updatedSummary = summary.copy(e2eTestGuide = scenarios)
@@ -511,7 +512,7 @@ class SummaryPanel(
                 }
                 ApplicationManager.getApplication().invokeLater { postToWebview("planTranslating", mapOf("slug" to slug)) }
                 val config = SessionTracker.loadConfig(cwd)
-                val translated = Summarizer.translateToEnglish(content, config.apiKey, config.model)
+                val translated = Summarizer.translateToEnglish(content, config.apiKey, config.model, config.jolliApiKey)
                 store.writePlanToBranch(slug, translated, "Translate plan $slug to English")
                 syncPlanTitle(slug, translated)
                 planTranslateSet.remove(slug)

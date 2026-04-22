@@ -284,6 +284,7 @@ data class JolliMemoryConfig(
     val maxTokens: Int? = null,
     val excludePatterns: List<String>? = null,
     val jolliApiKey: String? = null,
+    val authToken: String? = null,
     val claudeEnabled: Boolean? = null,
     val codexEnabled: Boolean? = null,
     val geminiEnabled: Boolean? = null,
@@ -324,6 +325,7 @@ data class CommitMessageParams(
     val stagedFiles: List<String>,
     val apiKey: String? = null,
     val model: String? = null,
+    val jolliApiKey: String? = null,
 )
 
 /** Result of enable/disable operations */
