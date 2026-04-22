@@ -14,6 +14,7 @@ import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { CommitSummary } from "../Types.js";
 import { buildFileName } from "./SummaryExporter.js";
+import { getDisplayDate } from "./SummaryFormat.js";
 import { listSummaries } from "./SummaryStore.js";
 
 // ─── Public types ────────────────────────────────────────────────────────────
@@ -97,7 +98,7 @@ function collectOnDiskHashes(folder: string): Set<string> {
 
 /** Builds a single markdown table row for the index. */
 function buildIndexRow(summary: CommitSummary, fileName: string): string {
-	const date = summary.commitDate.substring(0, 10);
+	const date = getDisplayDate(summary).substring(0, 10);
 	const hashPrefix = summary.commitHash.substring(0, 8);
 	const safeMessage = summary.commitMessage.replace(/\|/g, "\\|");
 	return `| ${date} | \`${hashPrefix}\` | [${safeMessage}](./${fileName}) |`;
@@ -120,8 +121,10 @@ async function rebuildIndex(folder: string, cwd?: string): Promise<string> {
 	// Filter to summaries with a matching file on disk
 	const present = allSummaries.filter((s) => onDiskHashes.has(s.commitHash.substring(0, 8)));
 
-	// Sort by commitDate descending (newest first)
-	const sorted = [...present].sort((a, b) => new Date(b.commitDate).getTime() - new Date(a.commitDate).getTime());
+	// Sort by activity date descending (newest first) — see getDisplayDate.
+	const sorted = [...present].sort(
+		(a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime(),
+	);
 
 	// Build the index markdown
 	const rows = sorted.map((s) => buildIndexRow(s, buildFileName(s)));

@@ -219,6 +219,7 @@ describe("LocalPusher", () => {
 				commitHash: "1111222233334444555566667777888899990000",
 				commitMessage: "Prior commit",
 				commitDate: "2026-04-14T10:00:00Z",
+				generatedAt: "2026-04-14T10:05:00Z",
 			});
 			const existingFileName = "11112222-prior-commit.md";
 			writeFileSync(join(folder, existingFileName), "# Prior", "utf-8");
@@ -262,11 +263,13 @@ describe("LocalPusher", () => {
 				commitHash: "aaaa0000bbbb1111cccc2222dddd3333eeee4444",
 				commitMessage: "Older",
 				commitDate: "2026-04-10T08:00:00Z",
+				generatedAt: "2026-04-10T08:05:00Z",
 			});
 			writeFileSync(join(folder, "aaaa0000-older.md"), "# Older", "utf-8");
 
 			const newer = makeSummary({
 				commitDate: "2026-04-15T12:00:00Z",
+				generatedAt: "2026-04-15T12:05:00Z",
 			});
 
 			mocks.listSummaries.mockResolvedValue([newer, older]);

@@ -27,6 +27,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readFileFromBranch } from "../core/GitOps.js";
+import { getDisplayDate } from "../core/SummaryFormat.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
@@ -106,14 +107,16 @@ async function generateBriefing(projectDir: string): Promise<string | null> {
 		return null;
 	}
 
-	// Sort by date (newest first to find "last worked on")
-	const sorted = [...rootEntries].sort((a, b) => new Date(b.commitDate).getTime() - new Date(a.commitDate).getTime());
+	// Sort by activity date (newest first, to find "last worked on") — see getDisplayDate.
+	const sorted = [...rootEntries].sort(
+		(a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime(),
+	);
 
 	const lastEntry = sorted[0];
 	const oldestEntry = sorted[sorted.length - 1];
 
 	// Skip if only 1 commit made today
-	if (sorted.length === 1 && isToday(lastEntry.commitDate)) {
+	if (sorted.length === 1 && isToday(getDisplayDate(lastEntry))) {
 		return null;
 	}
 
@@ -248,9 +251,9 @@ function buildBriefingText(
 	diffStats: DiffStats | null,
 ): string {
 	const commitCount = entries.length;
-	const periodStart = formatDate(oldestEntry.commitDate);
-	const periodEnd = formatDate(lastEntry.commitDate);
-	const daysSinceLastCommit = daysBetween(lastEntry.commitDate, new Date().toISOString());
+	const periodStart = formatDate(getDisplayDate(oldestEntry));
+	const periodEnd = formatDate(getDisplayDate(lastEntry));
+	const daysSinceLastCommit = daysBetween(getDisplayDate(lastEntry), new Date().toISOString());
 
 	const lines: string[] = [];
 

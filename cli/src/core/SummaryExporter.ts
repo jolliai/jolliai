@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { CommitSummary } from "../Types.js";
+import { getDisplayDate } from "./SummaryFormat.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 import { getSummary, listSummaries } from "./SummaryStore.js";
 
@@ -98,7 +99,7 @@ function getExistingHashes(outputDir: string): Set<string> {
 
 /** Builds a single markdown table row for the index. */
 function buildIndexRow(summary: CommitSummary, hashPrefix: string, fileName: string): string {
-	const date = summary.commitDate.substring(0, 10);
+	const date = getDisplayDate(summary).substring(0, 10);
 	const safeMessage = summary.commitMessage.replace(/\|/g, "\\|");
 	return `| ${date} | \`${hashPrefix}\` | [${safeMessage}](./${fileName}) |`;
 }

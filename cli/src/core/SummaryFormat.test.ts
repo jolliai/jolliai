@@ -240,8 +240,16 @@ describe("collectSortedTopics", () => {
 			generatedAt: "2026-03-05T10:01:00.000Z",
 			topics: [],
 			children: [
-				leaf({ commitDate: "2026-03-01T10:00:00.000Z", commitHash: "aaa" }),
-				leaf({ commitDate: "2026-03-05T09:00:00.000Z", commitHash: "bbb" }),
+				leaf({
+					commitDate: "2026-03-01T10:00:00.000Z",
+					generatedAt: "2026-03-01T10:00:10.000Z",
+					commitHash: "aaa",
+				}),
+				leaf({
+					commitDate: "2026-03-05T09:00:00.000Z",
+					generatedAt: "2026-03-05T09:00:10.000Z",
+					commitHash: "bbb",
+				}),
 			],
 		});
 		const { showRecordDates } = collectSortedTopics(summary);

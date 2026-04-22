@@ -1798,7 +1798,8 @@ describe("SessionStartHook", () => {
 					commitMessage: "Undated commit",
 					commitDate: "",
 					branch: "feature/test-branch",
-					generatedAt: new Date().toISOString(),
+					// Both dates empty → getDisplayDate falls back to "" → formatDate renders "unknown"
+					generatedAt: "",
 				},
 			]),
 		);

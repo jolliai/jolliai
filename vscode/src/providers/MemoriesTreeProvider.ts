@@ -19,6 +19,7 @@
  */
 
 import * as vscode from "vscode";
+import { getDisplayDate } from "../../../cli/src/core/SummaryFormat.js";
 import type { SummaryIndexEntry } from "../../../cli/src/Types.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import {
@@ -42,7 +43,7 @@ const EMPTY_CONTEXT = "jollimemory.memories.empty";
 
 /** Builds the description: "1d ago" */
 function buildDescription(entry: SummaryIndexEntry): string {
-	return formatShortRelativeDate(entry.commitDate);
+	return formatShortRelativeDate(getDisplayDate(entry));
 }
 
 /**
@@ -62,7 +63,7 @@ function buildTooltip(entry: SummaryIndexEntry): vscode.MarkdownString {
 	md.isTrusted = true;
 
 	// Row 1: commit message (bold) + clock + relative date
-	const relativeDate = formatRelativeDate(entry.commitDate);
+	const relativeDate = formatRelativeDate(getDisplayDate(entry));
 	md.appendMarkdown(
 		`**${escMd(entry.commitMessage)}** \u00a0$(clock) ${escMd(relativeDate)}\n\n`,
 	);

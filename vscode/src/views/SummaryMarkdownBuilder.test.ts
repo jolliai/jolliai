@@ -15,6 +15,10 @@ const mocks = vi.hoisted(() => ({
 	collectSortedTopics: vi.fn(),
 	formatDate: vi.fn(),
 	formatFullDate: vi.fn(),
+	getDisplayDate: vi.fn(
+		(e: { generatedAt?: string; commitDate: string }) =>
+			e.generatedAt || e.commitDate,
+	),
 	groupTopicsByDate: vi.fn(),
 	padIndex: vi.fn(),
 }));
@@ -30,6 +34,7 @@ vi.mock("../../../cli/src/core/SummaryFormat.js", () => ({
 	collectSortedTopics: mocks.collectSortedTopics,
 	formatDate: mocks.formatDate,
 	formatFullDate: mocks.formatFullDate,
+	getDisplayDate: mocks.getDisplayDate,
 	groupTopicsByDate: mocks.groupTopicsByDate,
 	padIndex: mocks.padIndex,
 }));

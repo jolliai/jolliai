@@ -28,6 +28,7 @@ import {
 	escHtml,
 	formatDate,
 	formatFullDate,
+	getDisplayDate,
 	groupTopicsByDate,
 	padIndex,
 	renderCalloutText,
@@ -262,8 +263,8 @@ function buildHeader(
   <div class="prop-row">
     <div class="prop-label">Date</div>
     <div class="prop-value">
-      <span class="date-relative">${timeAgo(summary.commitDate)}</span>
-      <span class="date-full">(${formatFullDate(summary.commitDate)})</span>
+      <span class="date-relative">${timeAgo(getDisplayDate(summary))}</span>
+      <span class="date-full">(${formatFullDate(getDisplayDate(summary))})</span>
     </div>
   </div>
   ${buildDurationRow(summary)}
@@ -557,7 +558,7 @@ function renderCommitRow(node: CommitSummary): string {
 	return `<div class="commit-row">
   <span class="hash">${escHtml(node.commitHash.substring(0, 8))}</span>
   <span class="commit-msg">${escHtml(node.commitMessage)}</span>
-  <span class="commit-meta"><span class="stat-add">+${ins}</span> <span class="stat-del">\u2212${del}</span>${turnsSuffix} &middot; ${formatDate(node.commitDate)}</span>
+  <span class="commit-meta"><span class="stat-add">+${ins}</span> <span class="stat-del">\u2212${del}</span>${turnsSuffix} &middot; ${formatDate(getDisplayDate(node))}</span>
 </div>`;
 }
 
