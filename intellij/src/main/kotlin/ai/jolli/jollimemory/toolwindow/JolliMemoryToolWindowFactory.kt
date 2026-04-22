@@ -2,8 +2,9 @@ package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.actions.TogglePanelAction
- import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliApiClient
+import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.project.DumbAware
@@ -209,8 +210,90 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         }
         toolWindow.setAdditionalGearActions(gearActions)
 
-        val content = ContentFactory.getInstance().createContent(accordionPanel, "", false).apply {
+        // Sign-in banner — shown at top of tool window when not signed in
+        val signInBanner = JPanel(BorderLayout()).apply {
+            border = JBUI.Borders.empty(10, 12)
+        }
+
+        // Signed-in status line — shown when signed in
+        val signedInBar = JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 4)).apply {
+            add(JBLabel(JolliMemoryIcons.Check))
+            add(JBLabel("Signed in"))
+            add(javax.swing.JButton("Sign Out").apply {
+                putClientProperty("JButton.buttonType", "default")
+                addActionListener {
+                    JolliAuthService.signOut()
+                }
+            })
+        }
+
+        val syncSignInBanner: () -> Unit = {
+            val signedIn = JolliAuthService.isSignedIn()
+            signInBanner.isVisible = !signedIn
+            signedInBar.isVisible = signedIn
+        }
+
+        // Build banner contents (needs syncSignInBanner reference for the button callback)
+        val signInButton = javax.swing.JButton("Sign In").apply {
+            putClientProperty("JButton.buttonType", "default")
+            addActionListener {
+                isEnabled = false
+                text = "Signing in..."
+                JolliAuthService.login(
+                    onSuccess = { _ ->
+                        SwingUtilities.invokeLater {
+                            isEnabled = true
+                            text = "Sign In"
+                            syncSignInBanner()
+                        }
+                    },
+                    onError = { msg ->
+                        SwingUtilities.invokeLater {
+                            isEnabled = true
+                            text = "Sign In"
+                            com.intellij.notification.Notifications.Bus.notify(
+                                com.intellij.notification.Notification(
+                                    "JolliMemory",
+                                    "Sign In Failed",
+                                    msg,
+                                    com.intellij.notification.NotificationType.ERROR,
+                                )
+                            )
+                        }
+                    },
+                )
+            }
+        }
+        signInBanner.add(javax.swing.Box.createVerticalBox().apply {
+            add(JBLabel("<html><b>Sign up or Sign In to Jolli</b></html>"))
+            add(javax.swing.Box.createVerticalStrut(4))
+            add(JBLabel("<html><span style='color:gray'>Enable cloud sync, team collaboration, and LLM proxy</span></html>"))
+            add(javax.swing.Box.createVerticalStrut(8))
+            add(signInButton.apply {
+                alignmentX = java.awt.Component.LEFT_ALIGNMENT
+                maximumSize = java.awt.Dimension(Int.MAX_VALUE, preferredSize.height)
+            })
+            add(javax.swing.Box.createVerticalStrut(6))
+            add(JBLabel("<html><span style='color:gray; font-size:0.85em'>Or configure API keys in Settings &gt; Tools &gt; Jolli Memory</span></html>"))
+        }, BorderLayout.CENTER)
+
+        syncSignInBanner()
+        service.addStatusListener { SwingUtilities.invokeLater { syncSignInBanner() } }
+        val authListenerDisposable = JolliAuthService.addAuthListener { SwingUtilities.invokeLater { syncSignInBanner() } }
+
+        // Outer panel: banner at top, accordion fills the rest
+        val outerPanel = JPanel(BorderLayout()).apply {
+            val bannerWrapper = JPanel(BorderLayout()).apply {
+                add(signInBanner, BorderLayout.NORTH)
+                add(signedInBar, BorderLayout.SOUTH)
+            }
+            add(bannerWrapper, BorderLayout.NORTH)
+            add(accordionPanel, BorderLayout.CENTER)
+        }
+
+        val content = ContentFactory.getInstance().createContent(outerPanel, "", false).apply {
             setDisposer(Disposer.newDisposable("JolliMemoryToolWindowContent").also { parentDisposable ->
+                Disposer.register(parentDisposable, authListenerDisposable)
                 Disposer.register(parentDisposable, statusPanel)
                 Disposer.register(parentDisposable, plansPanel)
                 Disposer.register(parentDisposable, changesPanel)

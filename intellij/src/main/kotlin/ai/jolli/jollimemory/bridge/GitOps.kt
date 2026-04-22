@@ -22,16 +22,50 @@ class GitOps(private val projectDir: String) {
      */
     private val shellPath: String by lazy {
         try {
-            val shell = System.getenv("SHELL") ?: "/bin/zsh"
-            val proc = ProcessBuilder(shell, "-l", "-c", "echo \$PATH")
+            if (System.getProperty("os.name").lowercase().contains("win")) {
+                resolveWindowsPath()
+            } else {
+                val shell = System.getenv("SHELL") ?: "/bin/zsh"
+                val proc = ProcessBuilder(shell, "-l", "-c", "echo \$PATH")
+                    .redirectErrorStream(true)
+                    .start()
+                val output = proc.inputStream.bufferedReader().use { it.readText().trim() }
+                proc.waitFor(5, TimeUnit.SECONDS)
+                if (output.isNotBlank()) output else System.getenv("PATH") ?: ""
+            }
+        } catch (_: Exception) {
+            System.getenv("PATH") ?: ""
+        }
+    }
+
+    /**
+     * On Windows, the system PATH usually has Git's cmd/ dir but not usr/bin/
+     * where tools like sed and awk live. Find the Git install root and append
+     * usr/bin so git hooks that need those tools work correctly.
+     */
+    private fun resolveWindowsPath(): String {
+        val basePath = System.getenv("PATH") ?: ""
+        try {
+            val proc = ProcessBuilder("where", "git")
                 .redirectErrorStream(true)
                 .start()
             val output = proc.inputStream.bufferedReader().use { it.readText().trim() }
             proc.waitFor(5, TimeUnit.SECONDS)
-            if (output.isNotBlank()) output else System.getenv("PATH") ?: ""
-        } catch (_: Exception) {
-            System.getenv("PATH") ?: ""
-        }
+
+            // Find Git install root from the first git.exe path
+            // e.g. "C:\Program Files\Git\cmd\git.exe" -> "C:\Program Files\Git"
+            val gitExePath = output.lines().firstOrNull { it.endsWith("git.exe") }
+            if (gitExePath != null) {
+                val gitRoot = File(gitExePath).parentFile?.parentFile
+                if (gitRoot != null) {
+                    val usrBin = File(gitRoot, "usr${File.separator}bin")
+                    if (usrBin.isDirectory) {
+                        return "$basePath${File.pathSeparator}${usrBin.absolutePath}"
+                    }
+                }
+            }
+        } catch (_: Exception) { }
+        return basePath
     }
 
     /**

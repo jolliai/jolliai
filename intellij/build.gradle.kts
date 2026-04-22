@@ -375,6 +375,17 @@ tasks {
         }
     }
 
+    // Workaround: IntelliJ Platform Gradle Plugin 2.5.0 fails to parse the Java
+    // version from the downloaded IDE runtime, producing "JavaLanguageVersion must
+    // be a positive integer, not ''". Explicitly set the JVM launcher for affected tasks.
+    withType<JavaExec> {
+        javaLauncher.set(
+            project.the<JavaToolchainService>().launcherFor {
+                languageVersion.set(JavaLanguageVersion.of(21))
+            }
+        )
+    }
+
     test {
         useJUnitPlatform()
     }

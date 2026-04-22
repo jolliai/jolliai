@@ -59,9 +59,9 @@ class CommitAIAction : AnAction() {
         }
 
         val config = SessionTracker.loadConfig(cwd)
-        if (config.apiKey.isNullOrBlank()) {
+        if (config.apiKey.isNullOrBlank() && config.jolliApiKey.isNullOrBlank() && System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) {
             Messages.showErrorDialog(project,
-                "Anthropic API key not configured.\nSet it in the STATUS panel or Settings > Tools > Jolli Memory.",
+                "No LLM credentials available.\nSign in to Jolli or configure an Anthropic API key in Settings > Tools > Jolli Memory.",
                 "Jolli Memory")
             return
         }
@@ -116,13 +116,14 @@ class CommitAIAction : AnAction() {
                     val branch = git.getCurrentBranch() ?: "unknown"
 
                     // Step 5: Generate AI message
-                    indicator.text = "Calling Anthropic API..."
+                    indicator.text = "Generating AI commit message..."
                     val message = Summarizer.generateCommitMessage(CommitMessageParams(
                         stagedDiff = diff,
                         branch = branch,
                         stagedFiles = selectedPaths,
                         apiKey = config.apiKey,
                         model = config.model,
+                        jolliApiKey = config.jolliApiKey,
                     ))
 
                     // Step 6: Show dialog on EDT

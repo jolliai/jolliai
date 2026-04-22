@@ -93,8 +93,9 @@ Return a single JSON object (no markdown fences, no explanation):
         diff: String,
         topics: List<TopicSummary>,
         conversation: String,
-        apiKey: String,
+        apiKey: String?,
         model: String? = null,
+        jolliApiKey: String? = null,
     ): PlanProgressEvalResult? {
         val topicsText = renderTopics(topics)
 
@@ -104,24 +105,29 @@ Return a single JSON object (no markdown fences, no explanation):
             .replace("{{topics}}", topicsText)
             .replace("{{conversation}}", conversation)
 
-        val resolvedModel = Summarizer.resolveModelId(model ?: "haiku")
-        val client = AnthropicClient(apiKey)
+        val proxyParams = mapOf(
+            "planContent" to planMarkdown,
+            "diff" to diff,
+            "topics" to topicsText,
+            "conversation" to conversation,
+        )
 
-        val startTime = System.currentTimeMillis()
-        val response = try {
-            client.createMessage(
-                model = resolvedModel,
+        val result = try {
+            LlmClient.callLlm(
+                action = "plan-progress",
+                params = proxyParams,
+                apiKey = apiKey,
+                jolliApiKey = jolliApiKey,
+                model = Summarizer.resolveModelId(model ?: "haiku"),
                 maxTokens = MAX_TOKENS,
-                temperature = 0.0,
-                messages = listOf(AnthropicClient.Message("user", prompt)),
+                prompt = prompt,
             )
         } catch (e: Exception) {
             log.warn("Plan progress LLM call failed: %s", e.message)
             return null
         }
-        val elapsed = System.currentTimeMillis() - startTime
 
-        val responseText = response.content.firstOrNull { it.type == "text" }?.text?.trim()
+        val responseText = result.text
         if (responseText.isNullOrEmpty()) {
             log.warn("Plan progress LLM returned empty text")
             return null
@@ -169,11 +175,11 @@ Return a single JSON object (no markdown fences, no explanation):
         }
 
         val llm = LlmCallMetadata(
-            model = response.model,
-            inputTokens = response.usage.inputTokens,
-            outputTokens = response.usage.outputTokens,
-            apiLatencyMs = elapsed,
-            stopReason = response.stopReason,
+            model = result.model ?: Summarizer.resolveModelId(model ?: "haiku"),
+            inputTokens = result.inputTokens,
+            outputTokens = result.outputTokens,
+            apiLatencyMs = result.apiLatencyMs,
+            stopReason = result.stopReason,
         )
 
         return PlanProgressEvalResult(

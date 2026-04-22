@@ -37,6 +37,8 @@ Thumbs.db
 .codex/
 .opencode/
 .DS_Store
+.idea/
+*.iml
 **/dist/
 **/coverage/
 **/node_modules/

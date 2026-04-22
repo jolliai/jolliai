@@ -173,6 +173,7 @@ object SessionTracker {
             maxTokens = update.maxTokens ?: existing.maxTokens,
             excludePatterns = update.excludePatterns ?: existing.excludePatterns,
             jolliApiKey = update.jolliApiKey ?: existing.jolliApiKey,
+            authToken = update.authToken ?: existing.authToken,
             claudeEnabled = update.claudeEnabled ?: existing.claudeEnabled,
             codexEnabled = update.codexEnabled ?: existing.codexEnabled,
             geminiEnabled = update.geminiEnabled ?: existing.geminiEnabled,
