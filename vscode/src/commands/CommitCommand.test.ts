@@ -843,11 +843,18 @@ describe("CommitCommand", () => {
 		await command.execute();
 
 		expect(deps.bridge.commit).toHaveBeenCalledWith("feat: generated");
-		// stageFiles is called multiple times: once for index prep, once for re-stage before commit,
-		// and once for re-staging remaining previously-staged files
+		// stageFiles is called three times: (1) index prep, (2) re-stage
+		// before commit, (3) re-stage previously-staged remainder.
+		//
+		// Contract (JOLLI-1326 P1): the first two — the user-selection path —
+		// must opt in to missing-file tolerance with { allowMissing: true }.
+		// The third — the restore path — must NOT pass opts; it relies on
+		// `git add`'s loud failure to trigger the re-stage warning.
 		const stageFilesCalls = deps.bridge.stageFiles.mock.calls;
-		const lastCall = stageFilesCalls[stageFilesCalls.length - 1];
-		expect(lastCall).toEqual([["extra.ts"]]);
+		expect(stageFilesCalls).toHaveLength(3);
+		expect(stageFilesCalls[0]).toEqual([["a.ts"], { allowMissing: true }]);
+		expect(stageFilesCalls[1]).toEqual([["a.ts"], { allowMissing: true }]);
+		expect(stageFilesCalls[2]).toEqual([["extra.ts"]]);
 	});
 
 	it("warns when re-staging previously-staged files fails after commit", async () => {
