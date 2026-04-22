@@ -118,7 +118,7 @@ export class CommitCommand {
 			return;
 		}
 		try {
-			await this.bridge.stageFiles(selectedPaths);
+			await this.bridge.stageFiles(selectedPaths, { allowMissing: true });
 			if (unselectedTrackedPaths.length > 0) {
 				await this.bridge.unstageFiles(unselectedTrackedPaths);
 			}
@@ -172,7 +172,7 @@ export class CommitCommand {
 		// Step 5: Re-stage selected files to capture any edits made during message
 		// generation or QuickPick review, then execute the selected action.
 		try {
-			await this.bridge.stageFiles(selectedPaths);
+			await this.bridge.stageFiles(selectedPaths, { allowMissing: true });
 			log.info(
 				"commit",
 				`Re-staged ${selectedPaths.length} file(s) before commit`,

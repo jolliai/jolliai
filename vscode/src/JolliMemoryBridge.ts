@@ -11,7 +11,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { lstat, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -466,12 +466,68 @@ export class JolliMemoryBridge {
 		return files;
 	}
 
-	/** Stages multiple files in a single git add invocation to avoid index.lock contention. */
-	async stageFiles(relativePaths: Array<string>): Promise<void> {
+	/**
+	 * Stages multiple files.
+	 *
+	 * Default mode (no `allowMissing`): plain `git add --`. If any path
+	 * is unreachable (missing from worktree AND not in the index), git
+	 * fails with "pathspec did not match any files" and the rejection
+	 * surfaces to the caller — this is what the restore-previously-
+	 * staged flow (`CommitCommand.ts:200` / `SquashCommand.ts:205`)
+	 * relies on to warn the user that a prior staging state could not
+	 * be reinstated.
+	 *
+	 * `allowMissing: true` (AI-commit selection path): partition paths
+	 * by on-disk existence. Present paths go through `git add`; absent
+	 * paths go through `git rm --cached --ignore-unmatch`. This covers
+	 * the deletion flavours that `git add` refuses (gitignored +
+	 * deleted, sparse-excluded, skip-worktree, staged-add-then-deleted,
+	 * post-`git rm --cached` deletions, and the status-vs-commit race).
+	 * See JOLLI-1326 for the full rationale.
+	 *
+	 * The existence check is `lstatSync(..., { throwIfNoEntry: false })`
+	 * rather than `existsSync` — the latter dereferences symlinks and
+	 * would misclassify a dangling symlink as absent, even though git
+	 * stages dangling symlinks normally (it uses `lstat` internally).
+	 *
+	 * Invocations are sequential to preserve index.lock safety; errors
+	 * propagate unchanged so the caller's `restoreIndex()` path can
+	 * recover.
+	 */
+	async stageFiles(
+		relativePaths: Array<string>,
+		opts: { allowMissing?: boolean } = {},
+	): Promise<void> {
 		if (relativePaths.length === 0) {
 			return;
 		}
-		await execGit(["add", "--", ...relativePaths], this.cwd);
+
+		if (!opts.allowMissing) {
+			await execGit(["add", "--", ...relativePaths], this.cwd);
+			return;
+		}
+
+		const existing: Array<string> = [];
+		const missing: Array<string> = [];
+		for (const p of relativePaths) {
+			if (
+				lstatSync(join(this.cwd, p), { throwIfNoEntry: false }) !== undefined
+			) {
+				existing.push(p);
+			} else {
+				missing.push(p);
+			}
+		}
+
+		if (existing.length > 0) {
+			await execGit(["add", "--", ...existing], this.cwd);
+		}
+		if (missing.length > 0) {
+			await execGit(
+				["rm", "--cached", "--ignore-unmatch", "--", ...missing],
+				this.cwd,
+			);
+		}
 	}
 
 	/** Unstages multiple files in a single git restore invocation to avoid index.lock contention. */
@@ -1271,13 +1327,19 @@ export class JolliMemoryBridge {
 
 	// ── Private helpers ───────────────────────────────────────────────────
 
-	/** Returns file paths currently staged in the git index (git diff --cached --name-only). */
+	/**
+	 * Returns file paths currently staged in the git index.
+	 *
+	 * Uses `-z` (NUL-separated) so paths are output verbatim — no quoting of
+	 * unicode or control chars. Matches `listFiles()` so paths produced here
+	 * flow cleanly through `stageFiles()`'s `existsSync`-based partition.
+	 */
 	async getStagedFilePaths(): Promise<Array<string>> {
 		const output = await tryExecGit(
-			["diff", "--cached", "--name-only"],
+			["diff", "--cached", "-z", "--name-only"],
 			this.cwd,
 		);
-		return output.split("\n").filter(Boolean);
+		return output.split("\0").filter(Boolean);
 	}
 
 	/**
