@@ -465,12 +465,45 @@ export class JolliMemoryBridge {
 		return files;
 	}
 
-	/** Stages multiple files in a single git add invocation to avoid index.lock contention. */
+	/**
+	 * Stages multiple files, partitioning by on-disk existence so that
+	 * deleted paths don't trip `git add`'s pathspec check.
+	 *
+	 * Files that exist on disk are staged via `git add`. Files that are
+	 * missing from the worktree are staged via `git rm --cached
+	 * --ignore-unmatch` — this covers deletions that `git add` would
+	 * refuse (gitignored + deleted, sparse-excluded, skip-worktree,
+	 * staged-add-then-deleted, post-`git rm --cached` deletions, and the
+	 * status-vs-commit race). See JOLLI-1326 for the full rationale.
+	 *
+	 * Invocations are sequential to preserve index.lock safety; errors
+	 * propagate unchanged so the caller's `restoreIndex()` path can
+	 * recover.
+	 */
 	async stageFiles(relativePaths: Array<string>): Promise<void> {
 		if (relativePaths.length === 0) {
 			return;
 		}
-		await execGit(["add", "--", ...relativePaths], this.cwd);
+
+		const existing: Array<string> = [];
+		const missing: Array<string> = [];
+		for (const p of relativePaths) {
+			if (existsSync(join(this.cwd, p))) {
+				existing.push(p);
+			} else {
+				missing.push(p);
+			}
+		}
+
+		if (existing.length > 0) {
+			await execGit(["add", "--", ...existing], this.cwd);
+		}
+		if (missing.length > 0) {
+			await execGit(
+				["rm", "--cached", "--ignore-unmatch", "--", ...missing],
+				this.cwd,
+			);
+		}
 	}
 
 	/** Unstages multiple files in a single git restore invocation to avoid index.lock contention. */
@@ -1267,13 +1300,19 @@ export class JolliMemoryBridge {
 
 	// ── Private helpers ───────────────────────────────────────────────────
 
-	/** Returns file paths currently staged in the git index (git diff --cached --name-only). */
+	/**
+	 * Returns file paths currently staged in the git index.
+	 *
+	 * Uses `-z` (NUL-separated) so paths are output verbatim — no quoting of
+	 * unicode or control chars. Matches `listFiles()` so paths produced here
+	 * flow cleanly through `stageFiles()`'s `existsSync`-based partition.
+	 */
 	async getStagedFilePaths(): Promise<Array<string>> {
 		const output = await tryExecGit(
-			["diff", "--cached", "--name-only"],
+			["diff", "--cached", "-z", "--name-only"],
 			this.cwd,
 		);
-		return output.split("\n").filter(Boolean);
+		return output.split("\0").filter(Boolean);
 	}
 
 	/**

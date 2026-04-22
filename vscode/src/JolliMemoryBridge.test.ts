@@ -921,7 +921,8 @@ describe("JolliMemoryBridge", () => {
 	// ── stageFile / stageFiles ───────────────────────────────────────────
 
 	describe("stageFiles() — single file", () => {
-		it("runs git add for the given path", async () => {
+		it("runs git add when the path exists on disk", async () => {
+			existsSync.mockReturnValue(true);
 			mockExecFileSuccess("");
 			const bridge = makeBridge();
 
@@ -937,7 +938,8 @@ describe("JolliMemoryBridge", () => {
 	});
 
 	describe("stageFiles()", () => {
-		it("runs git add with multiple paths", async () => {
+		it("runs git add with multiple paths when all exist", async () => {
+			existsSync.mockReturnValue(true);
 			mockExecFileSuccess("");
 			const bridge = makeBridge();
 
@@ -949,6 +951,114 @@ describe("JolliMemoryBridge", () => {
 				{ cwd: TEST_CWD, encoding: "utf8" },
 				expect.any(Function),
 			);
+			expect(execFileMock).toHaveBeenCalledTimes(1);
+		});
+
+		it("runs git rm --cached --ignore-unmatch when all paths are missing", async () => {
+			existsSync.mockReturnValue(false);
+			mockExecFileSuccess("");
+			const bridge = makeBridge();
+
+			await bridge.stageFiles(["a.ts", "b.ts"]);
+
+			expect(execFileMock).toHaveBeenCalledWith(
+				"git",
+				["rm", "--cached", "--ignore-unmatch", "--", "a.ts", "b.ts"],
+				{ cwd: TEST_CWD, encoding: "utf8" },
+				expect.any(Function),
+			);
+			expect(execFileMock).toHaveBeenCalledTimes(1);
+		});
+
+		it("partitions mixed paths and runs git add before git rm --cached", async () => {
+			existsSync.mockImplementation(
+				(p: string) => p === join(TEST_CWD, "a.ts"),
+			);
+			mockExecFileSuccess(""); // for git add
+			mockExecFileSuccess(""); // for git rm --cached
+			const bridge = makeBridge();
+
+			await bridge.stageFiles(["a.ts", "b.ts"]);
+
+			expect(execFileMock).toHaveBeenNthCalledWith(
+				1,
+				"git",
+				["add", "--", "a.ts"],
+				{ cwd: TEST_CWD, encoding: "utf8" },
+				expect.any(Function),
+			);
+			expect(execFileMock).toHaveBeenNthCalledWith(
+				2,
+				"git",
+				["rm", "--cached", "--ignore-unmatch", "--", "b.ts"],
+				{ cwd: TEST_CWD, encoding: "utf8" },
+				expect.any(Function),
+			);
+		});
+
+		it("routes the reported JOLLI-1326 scenario (gitignored + deleted) to git rm --cached", async () => {
+			// Selection contains a path that `git add` would reject because it
+			// is gitignored and deleted from the worktree — simulated here by
+			// returning false from existsSync for that path. The partition logic
+			// must route it to `git rm --cached`, not `git add`.
+			existsSync.mockImplementation(
+				(p: string) => p !== join(TEST_CWD, "ignored-and-gone.ts"),
+			);
+			mockExecFileSuccess(""); // git add for the healthy path
+			mockExecFileSuccess(""); // git rm --cached for the problem path
+			const bridge = makeBridge();
+
+			await expect(
+				bridge.stageFiles(["healthy.ts", "ignored-and-gone.ts"]),
+			).resolves.toBeUndefined();
+
+			expect(execFileMock).toHaveBeenNthCalledWith(
+				1,
+				"git",
+				["add", "--", "healthy.ts"],
+				{ cwd: TEST_CWD, encoding: "utf8" },
+				expect.any(Function),
+			);
+			expect(execFileMock).toHaveBeenNthCalledWith(
+				2,
+				"git",
+				["rm", "--cached", "--ignore-unmatch", "--", "ignored-and-gone.ts"],
+				{ cwd: TEST_CWD, encoding: "utf8" },
+				expect.any(Function),
+			);
+		});
+
+		it("calls existsSync with join(cwd, path), not a bare relative path", async () => {
+			existsSync.mockReturnValue(true);
+			mockExecFileSuccess("");
+			const bridge = makeBridge();
+
+			await bridge.stageFiles(["src/main.ts"]);
+
+			expect(existsSync).toHaveBeenCalledWith(join(TEST_CWD, "src/main.ts"));
+		});
+
+		it("propagates git add rejection and does not invoke git rm --cached", async () => {
+			existsSync.mockReturnValue(true);
+			mockExecFileError("add failed");
+			const bridge = makeBridge();
+
+			await expect(bridge.stageFiles(["a.ts"])).rejects.toThrow("add failed");
+			expect(execFileMock).toHaveBeenCalledTimes(1);
+		});
+
+		it("propagates git rm --cached rejection even though git add already succeeded", async () => {
+			existsSync.mockImplementation(
+				(p: string) => p === join(TEST_CWD, "a.ts"),
+			);
+			mockExecFileSuccess(""); // git add succeeds
+			mockExecFileError("rm failed"); // git rm --cached rejects
+			const bridge = makeBridge();
+
+			await expect(bridge.stageFiles(["a.ts", "b.ts"])).rejects.toThrow(
+				"rm failed",
+			);
+			expect(execFileMock).toHaveBeenCalledTimes(2);
 		});
 
 		it("does nothing when paths array is empty", async () => {
@@ -957,6 +1067,7 @@ describe("JolliMemoryBridge", () => {
 			await bridge.stageFiles([]);
 
 			expect(execFileMock).not.toHaveBeenCalled();
+			expect(existsSync).not.toHaveBeenCalled();
 		});
 	});
 
@@ -1328,8 +1439,8 @@ describe("JolliMemoryBridge", () => {
 			mockExecFileSuccess("diff --cached output\n");
 			// 2) getCurrentBranch (tryExecGit for rev-parse --abbrev-ref HEAD)
 			mockExecFileSuccess("feature/test\n");
-			// 3) getStagedFilePaths (tryExecGit for diff --cached --name-only)
-			mockExecFileSuccess("src/a.ts\nsrc/b.ts\n");
+			// 3) getStagedFilePaths (tryExecGit for diff --cached -z --name-only)
+			mockExecFileSuccess("src/a.ts\0src/b.ts\0");
 			generateCommitMessage.mockResolvedValue("feat: add feature");
 
 			const bridge = makeBridge();
@@ -1859,13 +1970,42 @@ describe("JolliMemoryBridge", () => {
 	});
 
 	describe("getStagedFilePaths()", () => {
-		it("splits lines and filters blanks", async () => {
-			mockExecFileSuccess("src/a.ts\n\nsrc/b.ts\n");
+		it("splits NUL-separated output and filters the trailing empty entry", async () => {
+			// Real git -z output has a trailing NUL after every record, so the
+			// mock includes it.
+			mockExecFileSuccess("src/a.ts\0src/b.ts\0");
 			const bridge = makeBridge();
 
 			const paths = await bridge.getStagedFilePaths();
 
 			expect(paths).toEqual(["src/a.ts", "src/b.ts"]);
+			expect(execFileMock).toHaveBeenCalledWith(
+				"git",
+				["diff", "--cached", "-z", "--name-only"],
+				{ cwd: TEST_CWD, encoding: "utf8" },
+				expect.any(Function),
+			);
+		});
+
+		it("returns unicode paths verbatim (no octal quoting)", async () => {
+			// Regression lock for the JOLLI-1326 bundled fix: without `-z`, git
+			// would emit `"fo\303\266.ts"` for this filename, which later breaks
+			// the re-stage round-trip.
+			mockExecFileSuccess("foö.ts\0");
+			const bridge = makeBridge();
+
+			const paths = await bridge.getStagedFilePaths();
+
+			expect(paths).toEqual(["foö.ts"]);
+		});
+
+		it("returns an empty array when no files are staged", async () => {
+			mockExecFileSuccess("");
+			const bridge = makeBridge();
+
+			const paths = await bridge.getStagedFilePaths();
+
+			expect(paths).toEqual([]);
 		});
 	});
 
