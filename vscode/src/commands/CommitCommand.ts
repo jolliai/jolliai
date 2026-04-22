@@ -22,9 +22,9 @@
 
 import * as vscode from "vscode";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
-import type { FilesTreeProvider } from "../providers/FilesTreeProvider.js";
-import type { HistoryTreeProvider } from "../providers/HistoryTreeProvider.js";
-import type { StatusTreeProvider } from "../providers/StatusTreeProvider.js";
+import type { CommitsStore } from "../stores/CommitsStore.js";
+import type { FilesStore } from "../stores/FilesStore.js";
+import type { StatusStore } from "../stores/StatusStore.js";
 import { isWorkerBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import type { StatusBarManager } from "../util/StatusBarManager.js";
@@ -58,9 +58,9 @@ const AMEND_NO_EDIT_TITLE =
 export class CommitCommand {
 	constructor(
 		private readonly bridge: JolliMemoryBridge,
-		private readonly filesProvider: FilesTreeProvider,
-		private readonly historyProvider: HistoryTreeProvider,
-		private readonly statusProvider: StatusTreeProvider,
+		private readonly filesStore: FilesStore,
+		private readonly commitsStore: CommitsStore,
+		private readonly statusStore: StatusStore,
 		private readonly statusBar: StatusBarManager,
 		private readonly workspaceRoot: string,
 	) {}
@@ -79,7 +79,7 @@ export class CommitCommand {
 		}
 
 		// Step 1: Verify at least one file is selected
-		const selectedFiles = this.filesProvider.getSelectedFiles();
+		const selectedFiles = this.filesStore.getSnapshot().selectedFiles;
 		log.info("commit", `Selected files: ${selectedFiles.length}`);
 		if (selectedFiles.length === 0) {
 			log.warn("commit", "No files selected — aborting");
@@ -96,7 +96,7 @@ export class CommitCommand {
 		// Untracked files (statusCode "?") are excluded from the unstage list —
 		// git restore --staged on files never in the index would error out.
 		const selectedPaths = selectedFiles.map((f) => f.relativePath);
-		const allFiles = this.filesProvider.getFiles();
+		const allFiles = this.filesStore.getSnapshot().files;
 		const unselectedTrackedPaths = allFiles
 			.filter((f) => !f.isSelected && f.statusCode !== "?")
 			.map((f) => f.relativePath);
@@ -318,7 +318,7 @@ export class CommitCommand {
 					: undefined,
 				wasPushed,
 				keepMessage: item === ITEM_AMEND_NO_EDIT,
-				historySelection: this.historyProvider.getSelectionDebugInfo(),
+				historySelection: this.commitsStore.getSelectionDebugInfo(),
 			});
 
 			if (item === ITEM_AMEND_NO_EDIT) {
@@ -335,7 +335,7 @@ export class CommitCommand {
 				headAfterAmend: headAfterAmend
 					? headAfterAmend.substring(0, 8)
 					: undefined,
-				historySelection: this.historyProvider.getSelectionDebugInfo(),
+				historySelection: this.commitsStore.getSelectionDebugInfo(),
 			});
 
 			if (wasPushed) {
@@ -350,12 +350,12 @@ export class CommitCommand {
 
 	private async refreshAll(): Promise<void> {
 		log.debug("commit", "refreshAll() start", {
-			historySelection: this.historyProvider.getSelectionDebugInfo(),
+			historySelection: this.commitsStore.getSelectionDebugInfo(),
 		});
 		await Promise.all([
-			this.filesProvider.refresh(),
-			this.historyProvider.refresh(),
-			this.statusProvider.refresh(),
+			this.filesStore.refresh(),
+			this.commitsStore.refresh(),
+			this.statusStore.refresh(),
 		]);
 
 		// Update status bar with fresh data
@@ -365,7 +365,7 @@ export class CommitCommand {
 			headHash: (
 				(await this.bridge.getHEADHash().catch(() => "")) || undefined
 			)?.substring(0, 8),
-			historySelection: this.historyProvider.getSelectionDebugInfo(),
+			historySelection: this.commitsStore.getSelectionDebugInfo(),
 		});
 	}
 }

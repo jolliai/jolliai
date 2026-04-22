@@ -118,23 +118,38 @@ function makeDeps(selected = [makeCommit("cccc3333"), makeCommit("bbbb2222")]) {
 		unstageFiles: vi.fn().mockResolvedValue(undefined),
 		stageFiles: vi.fn().mockResolvedValue(undefined),
 	};
-	const historyProvider = {
+	const commitsStore = {
+		// Legacy shim: older SquashCommand code called `getSelectedCommits()` directly;
+		// the new code reads `getSnapshot().selectedCommits`.  Both are kept so
+		// existing `commitsStore.getSelectedCommits.mockReturnValue(...)` assertions
+		// continue working via the shared helper below.
 		getSelectedCommits: vi.fn(() => selected),
+		getSnapshot: vi.fn(() => ({
+			selectedCommits: commitsStore.getSelectedCommits(),
+			commits: selected,
+			selectedHashes: new Set(selected.map((c) => c.hash)),
+			isMerged: false,
+			singleCommitMode: selected.length === 1,
+			isEmpty: selected.length === 0,
+			isEnabled: true,
+			isMigrating: false,
+			changeReason: "refresh",
+		})),
 		getSelectionDebugInfo: vi.fn(() => ({
 			checkedHashes: selected.map((commit) => commit.hash),
 		})),
 		refresh: vi.fn().mockResolvedValue(undefined),
 	};
-	const filesProvider = {
+	const filesStore = {
 		refresh: vi.fn().mockResolvedValue(undefined),
 	};
-	const statusProvider = {
+	const statusStore = {
 		refresh: vi.fn().mockResolvedValue(undefined),
 	};
 	const statusBar = {
 		update: vi.fn(),
 	};
-	return { bridge, historyProvider, filesProvider, statusProvider, statusBar };
+	return { bridge, commitsStore, filesStore, statusStore, statusBar };
 }
 
 describe("SquashCommand", () => {
@@ -157,9 +172,9 @@ describe("SquashCommand", () => {
 		const deps = makeDeps();
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -175,9 +190,9 @@ describe("SquashCommand", () => {
 		const deps = makeDeps([makeCommit("cccc3333")]);
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -195,9 +210,9 @@ describe("SquashCommand", () => {
 		]);
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -215,9 +230,9 @@ describe("SquashCommand", () => {
 		);
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -232,9 +247,9 @@ describe("SquashCommand", () => {
 		const deps = makeDeps();
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -278,9 +293,9 @@ describe("SquashCommand", () => {
 		deps.bridge.squashCommits.mockRejectedValue(new Error("reset failed"));
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -301,9 +316,9 @@ describe("SquashCommand", () => {
 		const deps = makeDeps();
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -332,9 +347,9 @@ describe("SquashCommand", () => {
 		const deps = makeDeps();
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -356,9 +371,9 @@ describe("SquashCommand", () => {
 		const deps = makeDeps();
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -379,9 +394,9 @@ describe("SquashCommand", () => {
 		deps.bridge.generateSquashMessageWithLLM.mockRejectedValue("raw string");
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -398,9 +413,9 @@ describe("SquashCommand", () => {
 		deps.bridge.squashCommits.mockRejectedValue(42);
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -424,9 +439,9 @@ describe("SquashCommand", () => {
 		]);
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -441,9 +456,9 @@ describe("SquashCommand", () => {
 			["aaaa1111", "bbbb2222", "cccc3333"],
 			"feat: squash",
 		);
-		expect(deps.historyProvider.refresh).toHaveBeenCalled();
-		expect(deps.filesProvider.refresh).toHaveBeenCalled();
-		expect(deps.statusProvider.refresh).toHaveBeenCalled();
+		expect(deps.commitsStore.refresh).toHaveBeenCalled();
+		expect(deps.filesStore.refresh).toHaveBeenCalled();
+		expect(deps.statusStore.refresh).toHaveBeenCalled();
 		expect(deps.statusBar.update).toHaveBeenCalledWith(true);
 	});
 
@@ -454,9 +469,9 @@ describe("SquashCommand", () => {
 		]);
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -479,9 +494,9 @@ describe("SquashCommand", () => {
 		const deps = makeDeps([makeCommit("cccc3333"), makeCommit("bbbb2222")]);
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -518,9 +533,9 @@ describe("SquashCommand", () => {
 		const deps = makeDeps([makeCommit("cccc3333"), makeCommit("bbbb2222")]);
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -570,9 +585,9 @@ describe("SquashCommand", () => {
 
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -609,9 +624,9 @@ describe("SquashCommand", () => {
 
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -633,9 +648,9 @@ describe("SquashCommand", () => {
 
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -660,9 +675,9 @@ describe("SquashCommand", () => {
 
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -690,9 +705,9 @@ describe("SquashCommand", () => {
 
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -720,9 +735,9 @@ describe("SquashCommand", () => {
 
 		const command = new SquashCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);

@@ -1495,7 +1495,7 @@ describe("JolliMemoryBridge", () => {
 			// git log for hash1
 			mockExecFileSuccess("fix: first\n");
 			getSummary.mockResolvedValueOnce({
-				ticketId: "JOLLI-100",
+				ticketId: "PROJ-100",
 				topics: [{ title: "Topic A", trigger: "code change" }],
 			});
 			// git log for hash2
@@ -1504,7 +1504,7 @@ describe("JolliMemoryBridge", () => {
 			// rev-list --count (total branch commits)
 			mockExecFileSuccess("2\n");
 			generateSquashMessage.mockResolvedValue(
-				"Fixes JOLLI-100: first and second",
+				"Fixes PROJ-100: first and second",
 			);
 
 			const bridge = makeBridge();
@@ -1513,10 +1513,10 @@ describe("JolliMemoryBridge", () => {
 				"hash2",
 			]);
 
-			expect(result).toBe("Fixes JOLLI-100: first and second");
+			expect(result).toBe("Fixes PROJ-100: first and second");
 			expect(generateSquashMessage).toHaveBeenCalledWith(
 				expect.objectContaining({
-					ticketId: "JOLLI-100",
+					ticketId: "PROJ-100",
 					isFullSquash: true,
 					config: { apiKey: "test-key", model: "claude-3" },
 				}),
@@ -2687,7 +2687,7 @@ describe("JolliMemoryBridge", () => {
 				"aaa",
 				"2025-01-01T00:00:00Z",
 				"msg1",
-				"feature/JOLLI-123",
+				"feature/PROJ-123",
 			);
 			const e2 = makeEntry("bbb", "2025-01-02T00:00:00Z", "msg2", "main");
 			getIndexEntryMap.mockResolvedValue(
@@ -2698,7 +2698,7 @@ describe("JolliMemoryBridge", () => {
 			);
 
 			const bridge = makeBridge();
-			const result = await bridge.listSummaryEntries(10, 0, "jolli");
+			const result = await bridge.listSummaryEntries(10, 0, "proj");
 
 			expect(result.entries).toHaveLength(1);
 			expect(result.entries[0].commitHash).toBe("aaa");

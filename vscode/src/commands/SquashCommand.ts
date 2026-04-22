@@ -16,9 +16,9 @@
 
 import * as vscode from "vscode";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
-import type { FilesTreeProvider } from "../providers/FilesTreeProvider.js";
-import type { HistoryTreeProvider } from "../providers/HistoryTreeProvider.js";
-import type { StatusTreeProvider } from "../providers/StatusTreeProvider.js";
+import type { CommitsStore } from "../stores/CommitsStore.js";
+import type { FilesStore } from "../stores/FilesStore.js";
+import type { StatusStore } from "../stores/StatusStore.js";
 import type { BranchCommit } from "../Types.js";
 import { isWorkerBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
@@ -43,9 +43,9 @@ const ITEM_SQUASH_PUSH: vscode.QuickPickItem = {
 export class SquashCommand {
 	constructor(
 		private readonly bridge: JolliMemoryBridge,
-		private readonly historyProvider: HistoryTreeProvider,
-		private readonly filesProvider: FilesTreeProvider,
-		private readonly statusProvider: StatusTreeProvider,
+		private readonly commitsStore: CommitsStore,
+		private readonly filesStore: FilesStore,
+		private readonly statusStore: StatusStore,
 		private readonly statusBar: StatusBarManager,
 		private readonly workspaceRoot: string,
 	) {}
@@ -64,9 +64,9 @@ export class SquashCommand {
 		}
 
 		// Step 1: Verify selection
-		const selected = this.historyProvider.getSelectedCommits();
+		const selected = this.commitsStore.getSnapshot().selectedCommits;
 		log.info("squash", `Selected commits: ${selected.length}`, {
-			historySelection: this.historyProvider.getSelectionDebugInfo(),
+			historySelection: this.commitsStore.getSelectionDebugInfo(),
 			selectedHashes: selected.map((c) => c.hash.substring(0, 8)),
 		});
 		if (selected.length < 2) {
@@ -305,9 +305,9 @@ export class SquashCommand {
 
 	private async refreshAll(): Promise<void> {
 		await Promise.all([
-			this.historyProvider.refresh(),
-			this.filesProvider.refresh(),
-			this.statusProvider.refresh(),
+			this.commitsStore.refresh(),
+			this.filesStore.refresh(),
+			this.statusStore.refresh(),
 		]);
 
 		// Update status bar

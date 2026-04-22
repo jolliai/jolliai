@@ -123,37 +123,52 @@ function makeDeps() {
 		getHEADMessage: vi.fn(async () => "Part of PROJ-123: existing"),
 		getStatus: vi.fn(async () => ({ enabled: true })),
 	};
-	const filesProvider = {
+	const defaultFiles = [
+		{
+			relativePath: "a.ts",
+			isSelected: true,
+			statusCode: "M",
+			indexStatus: "M",
+			worktreeStatus: " ",
+		},
+		{
+			relativePath: "b.ts",
+			isSelected: false,
+			statusCode: "M",
+			indexStatus: "M",
+			worktreeStatus: " ",
+		},
+	];
+	const filesStore = {
+		// Real FilesStore exposes files / selectedFiles via getSnapshot().
+		// The test helpers `getSelectedFiles` / `getFiles` are legacy shims kept
+		// so older test assertions still work via `filesStore.getSelectedFiles.mockReturnValue(...)`.
 		getSelectedFiles: vi.fn(() => [{ relativePath: "a.ts" }]),
-		getFiles: vi.fn(() => [
-			{
-				relativePath: "a.ts",
-				isSelected: true,
-				statusCode: "M",
-				indexStatus: "M",
-				worktreeStatus: " ",
-			},
-			{
-				relativePath: "b.ts",
-				isSelected: false,
-				statusCode: "M",
-				indexStatus: "M",
-				worktreeStatus: " ",
-			},
-		]),
+		getFiles: vi.fn(() => defaultFiles),
+		getSnapshot: vi.fn(() => ({
+			selectedFiles: filesStore.getSelectedFiles(),
+			files: filesStore.getFiles(),
+			visibleFiles: [],
+			excludedCount: 0,
+			visibleCount: 2,
+			isEmpty: false,
+			isEnabled: true,
+			isMigrating: false,
+			changeReason: "refresh",
+		})),
 		refresh: vi.fn().mockResolvedValue(undefined),
 	};
-	const historyProvider = {
+	const commitsStore = {
 		refresh: vi.fn().mockResolvedValue(undefined),
 		getSelectionDebugInfo: vi.fn(() => ({ checkedHashes: [] })),
 	};
-	const statusProvider = {
+	const statusStore = {
 		refresh: vi.fn().mockResolvedValue(undefined),
 	};
 	const statusBar = {
 		update: vi.fn(),
 	};
-	return { bridge, filesProvider, historyProvider, statusProvider, statusBar };
+	return { bridge, filesStore, commitsStore, statusStore, statusBar };
 }
 
 describe("CommitCommand", () => {
@@ -176,9 +191,9 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -193,12 +208,12 @@ describe("CommitCommand", () => {
 
 	it("warns when nothing is selected", async () => {
 		const deps = makeDeps();
-		deps.filesProvider.getSelectedFiles.mockReturnValue([]);
+		deps.filesStore.getSelectedFiles.mockReturnValue([]);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -215,9 +230,9 @@ describe("CommitCommand", () => {
 		deps.bridge.generateCommitMessage.mockRejectedValue(new Error("api down"));
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -233,9 +248,9 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -263,9 +278,9 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -295,9 +310,9 @@ describe("CommitCommand", () => {
 		deps.bridge.isHeadPushed.mockResolvedValue(true);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -339,9 +354,9 @@ describe("CommitCommand", () => {
 		deps.bridge.commit.mockRejectedValue(new Error("git index locked"));
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -362,9 +377,9 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -393,9 +408,9 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -417,9 +432,9 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -446,9 +461,9 @@ describe("CommitCommand", () => {
 		deps.bridge.generateCommitMessage.mockRejectedValue("plain string error");
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -465,9 +480,9 @@ describe("CommitCommand", () => {
 		deps.bridge.commit.mockRejectedValue(42);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -488,9 +503,9 @@ describe("CommitCommand", () => {
 		deps.bridge.isHeadPushed.mockResolvedValue(false);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -529,9 +544,9 @@ describe("CommitCommand", () => {
 		deps.bridge.isHeadPushed.mockResolvedValue(false);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -571,9 +586,9 @@ describe("CommitCommand", () => {
 		deps.bridge.isHeadPushed.mockResolvedValue(true);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -612,9 +627,9 @@ describe("CommitCommand", () => {
 		deps.bridge.amendCommitNoEdit = vi.fn().mockResolvedValue(undefined);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -646,9 +661,9 @@ describe("CommitCommand", () => {
 		deps.bridge.getHEADHash.mockRejectedValue(new Error("fail"));
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -685,9 +700,9 @@ describe("CommitCommand", () => {
 		deps.bridge.getHEADHash.mockRejectedValue(new Error("hash fail"));
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -707,9 +722,9 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -721,9 +736,9 @@ describe("CommitCommand", () => {
 		await command.execute();
 
 		expect(deps.bridge.commit).toHaveBeenCalledWith("feat: generated");
-		expect(deps.filesProvider.refresh).toHaveBeenCalled();
-		expect(deps.historyProvider.refresh).toHaveBeenCalled();
-		expect(deps.statusProvider.refresh).toHaveBeenCalled();
+		expect(deps.filesStore.refresh).toHaveBeenCalled();
+		expect(deps.commitsStore.refresh).toHaveBeenCalled();
+		expect(deps.statusStore.refresh).toHaveBeenCalled();
 		expect(deps.statusBar.update).toHaveBeenCalledWith(true);
 		expect(showInformationMessage).toHaveBeenCalledWith(
 			"Jolli Memory: Successfully committed. post-commit hook is generating a summary in the background.",
@@ -739,9 +754,9 @@ describe("CommitCommand", () => {
 		);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -763,9 +778,9 @@ describe("CommitCommand", () => {
 		);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -789,9 +804,9 @@ describe("CommitCommand", () => {
 		);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -806,9 +821,9 @@ describe("CommitCommand", () => {
 		deps.bridge.stageFiles.mockRejectedValue(new Error("cannot stage"));
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -829,9 +844,9 @@ describe("CommitCommand", () => {
 		deps.bridge.getStagedFilePaths.mockResolvedValue(["a.ts", "extra.ts"]);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -865,9 +880,9 @@ describe("CommitCommand", () => {
 		});
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -895,9 +910,9 @@ describe("CommitCommand", () => {
 		deps.bridge.generateCommitMessage.mockRejectedValue(new Error("api down"));
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -913,9 +928,9 @@ describe("CommitCommand", () => {
 		const deps = makeDeps();
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -952,9 +967,9 @@ describe("CommitCommand", () => {
 		deps.bridge.saveIndexTree.mockRejectedValue("plain string index error");
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -969,7 +984,7 @@ describe("CommitCommand", () => {
 	it("skips unstageFiles when all files are selected", async () => {
 		const deps = makeDeps();
 		// All files are selected — no unselected tracked paths
-		deps.filesProvider.getFiles.mockReturnValue([
+		deps.filesStore.getFiles.mockReturnValue([
 			{
 				relativePath: "a.ts",
 				isSelected: true,
@@ -980,9 +995,9 @@ describe("CommitCommand", () => {
 		]);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -1002,9 +1017,9 @@ describe("CommitCommand", () => {
 		deps.bridge.stageFiles.mockRejectedValue(42);
 		const command = new CommitCommand(
 			deps.bridge as never,
-			deps.filesProvider as never,
-			deps.historyProvider as never,
-			deps.statusProvider as never,
+			deps.filesStore as never,
+			deps.commitsStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);

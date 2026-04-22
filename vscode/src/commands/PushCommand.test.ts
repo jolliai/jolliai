@@ -51,20 +51,32 @@ function makeDeps(commits = [makeCommit()]) {
 		forcePush: vi.fn().mockResolvedValue(undefined),
 		getStatus: vi.fn(async () => ({ enabled: true })),
 	};
-	const historyProvider = {
+	const commitsStore = {
+		// Legacy shim + snapshot view so tests keep working with either API.
 		getAllCommits: vi.fn(() => commits),
+		getSnapshot: vi.fn(() => ({
+			commits: commitsStore.getAllCommits(),
+			selectedCommits: [],
+			selectedHashes: new Set<string>(),
+			isMerged: false,
+			singleCommitMode: commitsStore.getAllCommits().length === 1,
+			isEmpty: commitsStore.getAllCommits().length === 0,
+			isEnabled: true,
+			isMigrating: false,
+			changeReason: "refresh",
+		})),
 		refresh: vi.fn().mockResolvedValue(undefined),
 	};
-	const filesProvider = {
+	const filesStore = {
 		refresh: vi.fn().mockResolvedValue(undefined),
 	};
-	const statusProvider = {
+	const statusStore = {
 		refresh: vi.fn().mockResolvedValue(undefined),
 	};
 	const statusBar = {
 		update: vi.fn(),
 	};
-	return { bridge, historyProvider, filesProvider, statusProvider, statusBar };
+	return { bridge, commitsStore, filesStore, statusStore, statusBar };
 }
 
 describe("PushCommand", () => {
@@ -84,9 +96,9 @@ describe("PushCommand", () => {
 		const deps = makeDeps();
 		const command = new PushCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -103,9 +115,9 @@ describe("PushCommand", () => {
 		const deps = makeDeps([makeCommit(), makeCommit({ hash: "bbbb" })]);
 		const command = new PushCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -121,9 +133,9 @@ describe("PushCommand", () => {
 		const deps = makeDeps();
 		const command = new PushCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -131,9 +143,9 @@ describe("PushCommand", () => {
 		await command.execute();
 
 		expect(deps.bridge.pushCurrentBranch).toHaveBeenCalled();
-		expect(deps.historyProvider.refresh).toHaveBeenCalled();
-		expect(deps.filesProvider.refresh).toHaveBeenCalled();
-		expect(deps.statusProvider.refresh).toHaveBeenCalled();
+		expect(deps.commitsStore.refresh).toHaveBeenCalled();
+		expect(deps.filesStore.refresh).toHaveBeenCalled();
+		expect(deps.statusStore.refresh).toHaveBeenCalled();
 		expect(deps.statusBar.update).toHaveBeenCalledWith(true);
 		expect(showInformationMessage).toHaveBeenCalledWith(
 			"Jolli Memory: Successfully pushed the current branch.",
@@ -144,9 +156,9 @@ describe("PushCommand", () => {
 		const deps = makeDeps([makeCommit({ isPushed: true })]);
 		const command = new PushCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -172,9 +184,9 @@ describe("PushCommand", () => {
 		showWarningMessage.mockResolvedValueOnce(undefined); // user cancels
 		const command = new PushCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -191,9 +203,9 @@ describe("PushCommand", () => {
 		deps.bridge.pushCurrentBranch.mockRejectedValueOnce("string error");
 		const command = new PushCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -214,9 +226,9 @@ describe("PushCommand", () => {
 		showWarningMessage.mockResolvedValueOnce("Force Push (--force-with-lease)");
 		const command = new PushCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
@@ -234,9 +246,9 @@ describe("PushCommand", () => {
 		showWarningMessage.mockResolvedValueOnce("Force Push (--force-with-lease)");
 		const command = new PushCommand(
 			deps.bridge as never,
-			deps.historyProvider as never,
-			deps.filesProvider as never,
-			deps.statusProvider as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
 			deps.statusBar as never,
 			"/repo",
 		);
