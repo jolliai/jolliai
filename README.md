@@ -14,7 +14,7 @@ Monorepo hosting three deliverables that share the same product model and storag
 
 | Surface | Directory | What it's for |
 | -- | -- | -- |
-| **CLI** — `@jolli/cli` | [`cli/`](cli/) | Standalone command-line tool. Installs the git hooks, generates summaries on commit, and offers `view` / `export` / `recall` / `configure` / `doctor` commands. Works independent of any IDE. |
+| **CLI** — `@jolli.ai/cli` | [`cli/`](cli/) | Standalone command-line tool. Installs the git hooks, generates summaries on commit, and offers `view` / `export` / `recall` / `configure` / `doctor` commands. Works independent of any IDE. |
 | **VS Code extension** — Jolli Memory | [`vscode/`](vscode/) | Sidebar UI with panels for Status, Memories, Plans & Notes, Changes, Commits. Bundles the CLI internally; works whether or not the CLI is also installed globally. |
 | **IntelliJ plugin** — Jolli Memory | [`intellij/`](intellij/) | JetBrains IDEs integration (IDEA, PyCharm, WebStorm, GoLand, …) — pure-Kotlin implementation. |
 
@@ -49,7 +49,7 @@ Monorepo hosting three deliverables that share the same product model and storag
 
 ```
 jollimemory/
-├── cli/          Node.js CLI (@jolli/cli, npm workspace)
+├── cli/          Node.js CLI (@jolli.ai/cli, npm workspace)
 ├── vscode/       VS Code extension (npm workspace)
 ├── intellij/     IntelliJ plugin (Kotlin + Gradle)
 ├── package.json  Root workspace config (coordinates cli + vscode)

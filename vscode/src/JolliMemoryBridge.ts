@@ -253,7 +253,7 @@ export class JolliMemoryBridge {
 		// register a fresh entry. Doesn't touch other sources.
 		//
 		// Path-based comparison (not version-based): two sequential extension
-		// releases can bundle the same @jolli/cli core version, so comparing
+		// releases can bundle the same @jolli.ai/cli core version, so comparing
 		// `ownEntry.version` against `__PKG_VERSION__` would miss the upgrade.
 		// The dist path always embeds the extension version (e.g. the VSCode
 		// marketplace writes to `jolli.jollimemory-vscode-<ext-ver>/dist`), so

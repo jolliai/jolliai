@@ -26,9 +26,9 @@ const log = createLogger("DistPathWriter");
  *   <version>
  *   /absolute/path/to/dist
  *
- * The version is the `@jolli/cli` core version (`__PKG_VERSION__`), not the
+ * The version is the `@jolli.ai/cli` core version (`__PKG_VERSION__`), not the
  * IDE extension's own release version. CLI, VS Code, Cursor, etc. all bundle
- * the same `@jolli/cli` core, so versions are directly comparable.
+ * the same `@jolli.ai/cli` core, so versions are directly comparable.
  *
  * @param sourceTag - Source identifier ("cli", "vscode", "cursor", ...).
  *   Becomes the filename inside `dist-paths/`.

@@ -40,7 +40,7 @@ Everything is stored in a git orphan branch (`jollimemory/summaries/v3`), comple
 **Requirements** — **Node.js 22.5 or later**. OpenCode session discovery uses Node's built-in `node:sqlite`, which first ships in Node 22.5; the `engines` field refuses installation on older runtimes. If you use Node 18 or 20, please upgrade before installing.
 
 ```bash
-npm install -g @jolli/cli
+npm install -g @jolli.ai/cli
 ```
 
 After installation:

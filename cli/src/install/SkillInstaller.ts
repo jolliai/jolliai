@@ -100,7 +100,7 @@ Run this Bash command to load Jolli context data:
 \`\`\`
 
 If the file \`~/.jolli/jollimemory/run-cli\` does not exist, tell the user:
-"Jolli not installed. Please install via \`npm install -g @jolli/cli && jolli enable\` or install the Jolli VS Code extension."
+"Jolli not installed. Please install via \`npm install -g @jolli.ai/cli && jolli enable\` or install the Jolli VS Code extension."
 Do not attempt further processing.
 
 ## Step 2: Process the Result

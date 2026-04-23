@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * PostInstall — npm postinstall hook for `@jolli/cli`.
+ * PostInstall — npm postinstall hook for `@jolli.ai/cli`.
  *
- * Runs automatically after `npm install -g @jolli/cli` or `npm update -g @jolli/cli`.
+ * Runs automatically after `npm install -g @jolli.ai/cli` or `npm update -g @jolli.ai/cli`.
  * Updates two things if the user has already opted in (has run `jolli enable`):
  *   1. `dist-paths/cli` — refreshed to point at THIS install's dist/
  *   2. Dispatch scripts (`resolve-dist-path`, `run-hook`, `run-cli`) — refreshed
@@ -48,7 +48,7 @@ async function main(): Promise<void> {
 
 	// Skip project-local installs (`npm install --save-dev`). Only `npm install -g`
 	// should update the global per-source registry. A local install lives under
-	// <project>/node_modules/@jolli/cli/dist.
+	// <project>/node_modules/@jolli.ai/cli/dist.
 	const callerDistDir = dirname(fileURLToPath(import.meta.url));
 	const cwdNodeModules = join(process.cwd(), "node_modules");
 	/* v8 ignore start -- only true during npm postinstall inside node_modules; tests always run from source tree */

@@ -1,5 +1,5 @@
 {
-	"name": "@jolli/cli",
+	"name": "@jolli.ai/cli",
 	"version": "0.98.0",
 	"description": "AI development process auto-documentation tool - generates structured commit summaries from Claude Code / Codex / Gemini sessions",
 	"main": "./dist/Cli.js",
