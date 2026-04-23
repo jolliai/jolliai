@@ -52,7 +52,7 @@ export function checkVersionMismatch(): void {
 		if (compareSemver(highestVersion, VERSION) <= 0) return;
 
 		process.stderr.write(
-			"\nWarning:\n" + "  A newer version of jolli is available. Please upgrade: npm update -g @jolli/cli\n\n",
+			"\nWarning:\n" + "  A newer version of jolli is available. Please upgrade: npm update -g @jolli.ai/cli\n\n",
 		);
 	} catch {
 		// Never block CLI execution

@@ -26,7 +26,7 @@ npm run all
 
 ## Local CLI Testing
 
-The recommended way to test locally is a global symlink install — this mirrors the real end-user experience (`npm install -g @jolli/cli`) with the same command name, path resolution, and shebang behavior.
+The recommended way to test locally is a global symlink install — this mirrors the real end-user experience (`npm install -g @jolli.ai/cli`) with the same command name, path resolution, and shebang behavior.
 
 ```bash
 # One-time setup: create a global symlink to your local build

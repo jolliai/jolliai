@@ -2422,7 +2422,7 @@ describe("CLI", () => {
 				.mock.calls.map((c) => String(c[0]))
 				.join("");
 			expect(output).toContain("A newer version of jolli is available");
-			expect(output).toContain("npm update -g @jolli/cli");
+			expect(output).toContain("npm update -g @jolli.ai/cli");
 		});
 
 		it("should not warn when versions match", async () => {

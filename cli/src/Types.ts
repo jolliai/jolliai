@@ -562,7 +562,7 @@ export interface StatusInfo {
 export interface DistPathInfo {
 	/** Source tag (e.g. "cli", "vscode", "cursor"). Filename of the dist-paths/ entry. */
 	readonly source: string;
-	/** Core version (`@jolli/cli` semver) embedded in the file. */
+	/** Core version (`@jolli.ai/cli` semver) embedded in the file. */
 	readonly version: string;
 	/** Absolute path to the dist directory this source points to. */
 	readonly distDir: string;

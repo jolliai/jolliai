@@ -536,7 +536,7 @@ describe("JolliMemoryBridge", () => {
 			// versioned dir still exists on disk (VSCode cleans it up lazily), so
 			// `available` is still true, but `distDir` is for the outdated install.
 			// Version-only comparison would miss this because both releases can bundle
-			// the same @jolli/cli core version.
+			// the same @jolli.ai/cli core version.
 			vi.stubGlobal("__PKG_VERSION__", "0.97.4");
 			existsSync.mockImplementation(
 				(p: string) => !String(p).includes("settings.local.json"),
