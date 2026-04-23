@@ -11,9 +11,46 @@ import { parseJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { getStatus } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
+import type { StatusInfo } from "../Types.js";
 import { resolveProjectDir, VERSION } from "./CliUtils.js";
 
 const log = createLogger("StatusCommand");
+
+/** Inputs to describeIntegrationStatus — one row in the CLI integration block. */
+interface IntegrationStatusInputs {
+	readonly enabled: boolean;
+	/** undefined = this integration has no hook concept (Codex, OpenCode). */
+	readonly hookInstalled: boolean | undefined;
+	readonly sessionCount: number | undefined;
+	/** OpenCode-only: DB existed but scan failed (corrupt/locked/schema/etc). */
+	readonly scanError?: StatusInfo["openCodeScanError"];
+}
+
+/**
+ * Formats the descriptor for one integration row in `jolli status` output.
+ *
+ * Mirrors the VSCode STATUS panel's four-state model (see StatusTreeProvider's
+ * pushIntegrationItem) plus a dedicated "unavailable" state for OpenCode's
+ * scan-error channel. Wording is kept aligned with VSCode so users see the
+ * same language in both surfaces.
+ */
+function describeIntegrationStatus(x: IntegrationStatusInputs): string {
+	if (x.scanError) {
+		return `unavailable — ${x.scanError.kind}`;
+	}
+	if (!x.enabled) {
+		return "detected but disabled";
+	}
+	const count = x.sessionCount ?? 0;
+	const suffix = count > 0 ? ` (${count} session${count !== 1 ? "s" : ""})` : "";
+	if (x.hookInstalled === false) {
+		return "hook not installed";
+	}
+	if (x.hookInstalled === true) {
+		return `hook installed${suffix}`;
+	}
+	return `detected & enabled${suffix}`;
+}
 
 /** Registers the `status` command on the given Commander program. */
 export function registerStatusCommand(program: Command): void {
@@ -65,6 +102,58 @@ export function registerStatusCommand(program: Command): void {
 				`  Anthropic Key:    ${config?.apiKey || process.env.ANTHROPIC_API_KEY ? "Configured" : "Not configured"}`,
 			);
 			console.log(`  Sessions:         ${status.activeSessions}`);
+
+			// Per-integration breakdown. Only print rows for detected integrations;
+			// undetected ones stay hidden to keep the output terse (same rule as
+			// the VSCode STATUS panel). Claude's enabled flag lives in config, not
+			// StatusInfo, so read it from the already-loaded `config`.
+			const counts = status.sessionsBySource ?? {};
+			const integrationRows: ReadonlyArray<
+				readonly [label: string, detected: boolean | undefined, inputs: IntegrationStatusInputs]
+			> = [
+				[
+					"Claude:",
+					status.claudeDetected,
+					{
+						enabled: config?.claudeEnabled !== false,
+						hookInstalled: status.claudeHookInstalled,
+						sessionCount: counts.claude,
+					},
+				],
+				[
+					"Codex:",
+					status.codexDetected,
+					{
+						enabled: status.codexEnabled !== false,
+						hookInstalled: undefined,
+						sessionCount: counts.codex,
+					},
+				],
+				[
+					"Gemini:",
+					status.geminiDetected,
+					{
+						enabled: status.geminiEnabled !== false,
+						hookInstalled: status.geminiHookInstalled,
+						sessionCount: counts.gemini,
+					},
+				],
+				[
+					"OpenCode:",
+					status.openCodeDetected,
+					{
+						enabled: status.openCodeEnabled !== false,
+						hookInstalled: undefined,
+						sessionCount: counts.opencode,
+						scanError: status.openCodeScanError,
+					},
+				],
+			];
+			for (const [label, detected, inputs] of integrationRows) {
+				if (!detected) continue;
+				console.log(`  ${label.padEnd(18)}${describeIntegrationStatus(inputs)}`);
+			}
+
 			console.log(`  Stored memories:  ${status.summaryCount}`);
 			if (jolliSite) {
 				console.log(`  Jolli Site:       ${jolliSite.replace(/^https?:\/\//, "")}`);

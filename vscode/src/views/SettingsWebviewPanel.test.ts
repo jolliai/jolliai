@@ -54,6 +54,7 @@ const { mockGetGlobalConfigDir, mockLoadConfigFromDir, mockSaveConfigScoped } =
 			claudeEnabled: true,
 			codexEnabled: false,
 			geminiEnabled: true,
+			openCodeEnabled: true,
 			excludePatterns: ["node_modules"],
 		}),
 		mockSaveConfigScoped: vi.fn().mockResolvedValue(undefined),
@@ -162,6 +163,7 @@ describe("SettingsWebviewPanel", () => {
 			claudeEnabled: true,
 			codexEnabled: false,
 			geminiEnabled: true,
+			openCodeEnabled: true,
 			excludePatterns: ["node_modules"],
 		});
 		mockGetGlobalConfigDir.mockReturnValue("/global/.jollimemory");
@@ -390,6 +392,7 @@ describe("SettingsWebviewPanel", () => {
 				claudeEnabled: true,
 				codexEnabled: false,
 				geminiEnabled: true,
+				openCodeEnabled: false,
 				excludePatterns: ["dist", "node_modules"],
 			});
 
@@ -412,6 +415,7 @@ describe("SettingsWebviewPanel", () => {
 						claudeEnabled: true,
 						codexEnabled: false,
 						geminiEnabled: true,
+						openCodeEnabled: false,
 						excludePatterns: "dist, node_modules",
 					}),
 				}),
@@ -427,6 +431,7 @@ describe("SettingsWebviewPanel", () => {
 				claudeEnabled: undefined,
 				codexEnabled: undefined,
 				geminiEnabled: undefined,
+				openCodeEnabled: undefined,
 				excludePatterns: undefined,
 			});
 
@@ -444,6 +449,7 @@ describe("SettingsWebviewPanel", () => {
 						claudeEnabled: true,
 						codexEnabled: true,
 						geminiEnabled: true,
+						openCodeEnabled: true,
 						excludePatterns: "",
 					}),
 				}),
@@ -486,6 +492,7 @@ describe("SettingsWebviewPanel", () => {
 				claudeEnabled: true,
 				codexEnabled: true,
 				geminiEnabled: true,
+				openCodeEnabled: true,
 				excludePatterns: [],
 				...configOverrides,
 			};
@@ -857,6 +864,7 @@ describe("SettingsWebviewPanel", () => {
 					claudeEnabled: false,
 					codexEnabled: false,
 					geminiEnabled: false,
+					openCodeEnabled: false,
 					excludePatterns: "",
 				},
 			});
@@ -867,6 +875,7 @@ describe("SettingsWebviewPanel", () => {
 					claudeEnabled: false,
 					codexEnabled: false,
 					geminiEnabled: false,
+					openCodeEnabled: false,
 				}),
 				expect.any(String),
 			);
@@ -887,6 +896,7 @@ describe("SettingsWebviewPanel", () => {
 					claudeEnabled: true,
 					codexEnabled: true,
 					geminiEnabled: true,
+					openCodeEnabled: true,
 					excludePatterns: "",
 				},
 			});
@@ -897,7 +907,48 @@ describe("SettingsWebviewPanel", () => {
 					claudeEnabled: true,
 					codexEnabled: true,
 					geminiEnabled: true,
+					openCodeEnabled: true,
 				}),
+				expect.any(String),
+			);
+		});
+
+		it("loads and saves OpenCode integration state", async () => {
+			const dispatch = await setupWithLoadedConfig({ openCodeEnabled: false });
+
+			// Re-trigger load — setupWithLoadedConfig clears postMessage after initial load
+			dispatch({ command: "loadSettings", scope: "project" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ openCodeEnabled: false }),
+				}),
+			);
+
+			postMessage.mockClear();
+			dispatch({
+				command: "applySettings",
+				scope: "project",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					openCodeEnabled: false,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ openCodeEnabled: false }),
 				expect.any(String),
 			);
 		});

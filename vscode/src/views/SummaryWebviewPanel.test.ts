@@ -1037,6 +1037,103 @@ describe("SummaryWebviewPanel", () => {
 				expect(mockPushToJolli).not.toHaveBeenCalled();
 			});
 
+			it("warns and skips snippet notes missing content (schema-drift guard)", async () => {
+				// Legacy/corrupt entry: snippet without `content` must not silently drop —
+				// it should log.warn and skip the push, while other valid notes still go through.
+				mockLoadConfig.mockResolvedValue({
+					apiKey: "test",
+					jolliApiKey: "jk_valid",
+				});
+				mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+				mockPushToJolli.mockResolvedValue({ docId: 42 });
+				warn.mockClear();
+
+				const dispatch = await setupPanel({
+					notes: [
+						{
+							id: "broken-snip",
+							title: "Legacy Broken Snippet",
+							format: "snippet" as const,
+							// content intentionally missing — legacy data
+							addedAt: "",
+							updatedAt: "",
+						},
+						{
+							id: "ok-snip",
+							title: "Healthy Snippet",
+							format: "snippet" as const,
+							content: "valid body",
+							addedAt: "",
+							updatedAt: "",
+						},
+					],
+				});
+
+				dispatch({ command: "push" });
+				await flushPromises();
+
+				expect(warn).toHaveBeenCalledWith(
+					"SummaryPanel",
+					expect.stringContaining("broken-snip"),
+				);
+				// mockPushToJolli is called for: summary + ok-snip (the broken one is skipped).
+				// Exactly assert it was invoked with the healthy note content.
+				const noteCall = mockPushToJolli.mock.calls.find(
+					(c) => c[2]?.content === "valid body",
+				);
+				expect(noteCall).toBeDefined();
+				const brokenCall = mockPushToJolli.mock.calls.find(
+					(c) => c[2]?.content === "",
+				);
+				expect(brokenCall).toBeUndefined();
+			});
+
+			it("pushes notes with an existing jolliNoteDocId using docId, new notes without", async () => {
+				// Exercises both branches of `...(note.jolliNoteDocId && { docId })` — previously
+				// guarded by a v8-ignore; now tested directly so coverage reflects real behavior.
+				mockLoadConfig.mockResolvedValue({
+					apiKey: "test",
+					jolliApiKey: "jk_valid",
+				});
+				mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+				mockPushToJolli.mockResolvedValue({ docId: 42 });
+
+				const dispatch = await setupPanel({
+					notes: [
+						{
+							id: "new-note",
+							title: "New",
+							format: "snippet" as const,
+							content: "new content",
+							addedAt: "",
+							updatedAt: "",
+							// no jolliNoteDocId → falsy branch of `&&`
+						},
+						{
+							id: "existing-note",
+							title: "Existing",
+							format: "snippet" as const,
+							content: "existing content",
+							addedAt: "",
+							updatedAt: "",
+							jolliNoteDocId: 77, // truthy branch of `&&`
+						},
+					],
+				});
+
+				dispatch({ command: "push" });
+				await flushPromises();
+
+				const newNoteCall = mockPushToJolli.mock.calls.find(
+					(c) => c[2]?.content === "new content",
+				);
+				const existingNoteCall = mockPushToJolli.mock.calls.find(
+					(c) => c[2]?.content === "existing content",
+				);
+				expect(newNoteCall?.[2]).not.toHaveProperty("docId");
+				expect(existingNoteCall?.[2]).toMatchObject({ docId: 77 });
+			});
+
 			it("shows warning when base URL cannot be parsed from API key", async () => {
 				mockLoadConfig.mockResolvedValue({
 					apiKey: "test",
@@ -2022,8 +2119,7 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
 						totalEntries: 3,
-						claudeSessions: 1, // s1 deduplicated
-						codexSessions: 1, // cx1 counted separately (line 789)
+						sessionCounts: expect.objectContaining({ claude: 1, codex: 1 }),
 					}),
 				);
 			});
@@ -2060,8 +2156,7 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
 						totalEntries: 2,
-						claudeSessions: 1,
-						codexSessions: 0,
+						sessionCounts: expect.objectContaining({ claude: 1 }),
 					}),
 				);
 			});
@@ -2131,8 +2226,7 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
 						totalEntries: 1,
-						claudeSessions: 1, // gemini sessions count as "claude" in the stats (non-codex)
-						codexSessions: 0,
+						sessionCounts: expect.objectContaining({ gemini: 1 }),
 					}),
 				);
 			});
@@ -2178,8 +2272,7 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
 						totalEntries: 1,
-						claudeSessions: 1,
-						codexSessions: 0,
+						sessionCounts: expect.objectContaining({ claude: 1 }),
 					}),
 				);
 			});
@@ -2213,8 +2306,7 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
 						totalEntries: 1,
-						claudeSessions: 1,
-						codexSessions: 0,
+						sessionCounts: expect.objectContaining({ claude: 1 }),
 					}),
 				);
 			});
@@ -2223,6 +2315,36 @@ describe("SummaryWebviewPanel", () => {
 		// ── translatePlan ────────────────────────────────────────────────────
 
 		describe("translatePlan", () => {
+			it("skips the final update when currentSummary is null (race)", async () => {
+				// Covers `if (this.currentSummary)` falsy branch in handleTranslatePlan.
+				mockReadPlanFromBranch.mockResolvedValue("# 中文\n\n内容");
+				mockTranslateToEnglish.mockResolvedValue("# Translated\n\nContent");
+				mockLoadPlansRegistry.mockResolvedValue({ plans: {} });
+				const dispatch = await setupPanel({
+					plans: [
+						{
+							slug: "race-plan",
+							title: "中文",
+							editCount: 0,
+							addedAt: "",
+							updatedAt: "",
+						},
+					],
+				});
+				// Simulate a dispose race: currentSummary cleared mid-operation.
+				const panel = firstCommitPanel<{ currentSummary: unknown }>();
+				panel.currentSummary = undefined;
+
+				dispatch({ command: "translatePlan", slug: "race-plan" });
+				await flushPromises();
+
+				// Translation still propagated — post-event message still posts.
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "planTranslated",
+					slug: "race-plan",
+				});
+			});
+
 			it("translates plan content and saves", async () => {
 				mockReadPlanFromBranch.mockResolvedValue("# 中文标题\n\n内容");
 				mockTranslateToEnglish.mockResolvedValue(
@@ -3281,8 +3403,7 @@ describe("SummaryWebviewPanel", () => {
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",
-						claudeSessions: 1,
-						codexSessions: 0,
+						sessionCounts: expect.objectContaining({ claude: 1 }),
 					}),
 				);
 			});
@@ -4102,6 +4223,35 @@ describe("SummaryWebviewPanel", () => {
 		// ── saveNote (edit) ──────────────────────────────────────────────────
 
 		describe("saveNote (edit)", () => {
+			it("skips summary sync when currentSummary has no notes (race)", async () => {
+				// Covers `if (this.currentSummary?.notes)` falsy branch in handleSaveNote.
+				// A panel opened for a summary without a notes array simulates the race.
+				const dispatch = await setupPanel({});
+				// Null out .notes on the live panel to force the falsy branch.
+				const panel = firstCommitPanel<{
+					currentSummary: { notes?: unknown } | undefined;
+				}>();
+				if (panel.currentSummary) {
+					delete panel.currentSummary.notes;
+				}
+
+				dispatch({
+					command: "saveNote",
+					id: "any",
+					content: "# New",
+					format: "markdown",
+				});
+				await flushPromises();
+
+				// Writes still go through, but no storeSummary call happened.
+				expect(mockStoreNotes).toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "noteSaved",
+					id: "any",
+				});
+			});
+
 			it("saves note content to orphan branch and updates summary", async () => {
 				const dispatch = await setupPanel({
 					notes: [
@@ -4693,6 +4843,341 @@ describe("SummaryWebviewPanel", () => {
 			});
 		});
 
+		// ── downloadMarkdown ─────────────────────────────────────────────────────
+
+		describe("downloadMarkdown", () => {
+			/** Creates a panel, clears currentSummary, and returns the dispatch function. */
+			async function setupPanelWithoutSummary(): Promise<
+				(msg: Record<string, unknown>) => void
+			> {
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				const dispatch = captureMessageHandler();
+				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
+				panelInstance.currentSummary = null;
+				vi.clearAllMocks();
+				return dispatch;
+			}
+
+			it("returns early when currentSummary is null", async () => {
+				const dispatch = await setupPanelWithoutSummary();
+
+				dispatch({ command: "downloadMarkdown" });
+				await flushPromises();
+
+				expect(showSaveDialog).not.toHaveBeenCalled();
+				expect(fsWriteFile).not.toHaveBeenCalled();
+			});
+
+			it("returns early when showSaveDialog returns undefined (user cancels)", async () => {
+				showSaveDialog.mockResolvedValue(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "downloadMarkdown" });
+				await flushPromises();
+
+				expect(showSaveDialog).toHaveBeenCalled();
+				expect(fsWriteFile).not.toHaveBeenCalled();
+				expect(showInformationMessage).not.toHaveBeenCalled();
+			});
+
+			it("writes markdown to file and shows info message", async () => {
+				const mockUri = { fsPath: "/workspace/Panel-Title.md" };
+				showSaveDialog.mockResolvedValue(mockUri);
+				mockBuildMarkdown.mockReturnValue("# Markdown Output");
+				fsWriteFile.mockResolvedValue(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "downloadMarkdown" });
+				await flushPromises();
+
+				expect(showSaveDialog).toHaveBeenCalledWith(
+					expect.objectContaining({
+						filters: { Markdown: ["md"] },
+						title: "Save Summary as Markdown",
+					}),
+				);
+				expect(fsWriteFile).toHaveBeenCalledWith(mockUri, expect.any(Buffer));
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					`Saved to ${mockUri.fsPath}`,
+				);
+			});
+		});
+
+		// ── saveSnippet: empty content ────────────────────────────────────────────
+
+		describe("saveSnippet: empty content", () => {
+			it("shows error when snippet content is empty/whitespace-only", async () => {
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "saveSnippet", title: "T", content: "   " });
+				await flushPromises();
+
+				expect(mockSaveNote).not.toHaveBeenCalled();
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Save snippet failed"),
+				);
+			});
+		});
+
+		// ── saveNote: multiple notes (n.id !== id branch) ────────────────────────
+
+		describe("saveNote: multiple notes", () => {
+			it("preserves other notes unchanged when editing one of multiple notes", async () => {
+				const dispatch = await setupPanel({
+					notes: [
+						{
+							id: "edit-1",
+							title: "First Note",
+							format: "markdown" as const,
+							addedAt: "2025-01-01",
+							updatedAt: "2025-01-01",
+						},
+						{
+							id: "other-note",
+							title: "Other Note",
+							format: "markdown" as const,
+							addedAt: "2025-01-01",
+							updatedAt: "2025-01-01",
+						},
+					],
+				});
+
+				dispatch({
+					command: "saveNote",
+					id: "edit-1",
+					content: "# Updated Title\n\nBody",
+					format: "markdown",
+				});
+				await flushPromises();
+
+				// The second note (id !== "edit-1") is returned unchanged via the else branch
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({
+						notes: expect.arrayContaining([
+							expect.objectContaining({
+								id: "other-note",
+								title: "Other Note",
+							}),
+							expect.objectContaining({ id: "edit-1", title: "Updated Title" }),
+						]),
+					}),
+					workspaceRoot,
+					true,
+				);
+			});
+
+			it("does not update title when note content has no # heading", async () => {
+				const dispatch = await setupPanel({
+					notes: [
+						{
+							id: "edit-1",
+							title: "Original Title",
+							format: "markdown" as const,
+							addedAt: "2025-01-01",
+							updatedAt: "2025-01-01",
+						},
+					],
+				});
+
+				dispatch({
+					command: "saveNote",
+					id: "edit-1",
+					content: "No heading here",
+					format: "markdown",
+				});
+				await flushPromises();
+
+				// newTitle is falsy, so title should remain unchanged
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({
+						notes: expect.arrayContaining([
+							expect.objectContaining({
+								id: "edit-1",
+								title: "Original Title",
+							}),
+						]),
+					}),
+					workspaceRoot,
+					true,
+				);
+			});
+		});
+
+		// ── translateNote: multiple notes (n.id !== id branch) ───────────────────
+
+		describe("translateNote: multiple notes", () => {
+			it("preserves other notes unchanged when translating one of multiple notes", async () => {
+				mockReadNoteFromBranch.mockResolvedValue("# 中文笔记\n\n内容");
+				mockTranslateToEnglish.mockResolvedValue(
+					"# Translated Note\n\nEnglish content",
+				);
+				const dispatch = await setupPanel({
+					notes: [
+						{
+							id: "cn-note",
+							title: "中文笔记",
+							format: "markdown" as const,
+							addedAt: "2025-01-01",
+							updatedAt: "2025-01-01",
+						},
+						{
+							id: "other-note",
+							title: "Other Note",
+							format: "markdown" as const,
+							addedAt: "2025-01-01",
+							updatedAt: "2025-01-01",
+						},
+					],
+				});
+
+				dispatch({ command: "translateNote", id: "cn-note" });
+				await flushPromises();
+
+				// The second note (id !== "cn-note") is returned unchanged via the n.id !== id branch
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({
+						notes: expect.arrayContaining([
+							expect.objectContaining({
+								id: "other-note",
+								title: "Other Note",
+							}),
+							expect.objectContaining({
+								id: "cn-note",
+								title: "Translated Note",
+							}),
+						]),
+					}),
+					workspaceRoot,
+					true,
+				);
+			});
+
+			it("does not update title when translated content has no # heading", async () => {
+				mockReadNoteFromBranch.mockResolvedValue("# 中文笔记\n\n内容");
+				// Translation result has no # heading, so newTitle should be falsy
+				mockTranslateToEnglish.mockResolvedValue(
+					"Translated content without heading",
+				);
+				const dispatch = await setupPanel({
+					notes: [
+						{
+							id: "cn-note",
+							title: "中文笔记",
+							format: "markdown" as const,
+							addedAt: "2025-01-01",
+							updatedAt: "2025-01-01",
+						},
+					],
+				});
+
+				dispatch({ command: "translateNote", id: "cn-note" });
+				await flushPromises();
+
+				// newTitle is falsy — title remains unchanged, no title update applied
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({
+						notes: expect.arrayContaining([
+							expect.objectContaining({ id: "cn-note", title: "中文笔记" }),
+						]),
+					}),
+					workspaceRoot,
+					true,
+				);
+			});
+		});
+
+		// ── openCodeEnabled: false ────────────────────────────────────────────────
+
+		describe("loadTranscriptStats: openCodeEnabled false", () => {
+			it("excludes opencode sessions when openCodeEnabled is false", async () => {
+				mockLoadConfig.mockResolvedValue({
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					openCodeEnabled: false,
+				});
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const transcriptMap = new Map([
+					[
+						"abc123",
+						{
+							sessions: [
+								{
+									sessionId: "s1",
+									source: "claude" as const,
+									entries: [{ role: "human" as const, content: "A" }],
+								},
+								{
+									sessionId: "oc1",
+									source: "opencode" as const,
+									entries: [
+										{ role: "human" as const, content: "B" },
+										{ role: "assistant" as const, content: "C" },
+									],
+								},
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
+
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadTranscriptStats" });
+				await flushPromises();
+
+				// opencode session (oc1) should be excluded; only claude session counted
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						command: "transcriptStatsLoaded",
+						totalEntries: 1,
+						sessionCounts: expect.objectContaining({ claude: 1 }),
+					}),
+				);
+			});
+		});
+
+		// ── loadNoteContent: snippet without inline content ───────────────────────
+
+		describe("loadNoteContent: snippet without inline content", () => {
+			it("reads from orphan branch when snippet has no inline content", async () => {
+				mockReadNoteFromBranch.mockResolvedValue("snippet body from branch");
+				const dispatch = await setupPanel({
+					notes: [
+						{
+							id: "snip-empty",
+							title: "Empty Snippet",
+							format: "snippet" as const,
+							// content is intentionally absent to exercise the else branch (line 948)
+							addedAt: "",
+							updatedAt: "",
+						},
+					],
+				});
+
+				dispatch({
+					command: "loadNoteContent",
+					id: "snip-empty",
+					format: "snippet",
+				});
+				await flushPromises();
+
+				// Since content is undefined, it falls through to the else branch and reads from branch
+				expect(mockReadNoteFromBranch).toHaveBeenCalledWith(
+					"snip-empty",
+					workspaceRoot,
+				);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "noteContentLoaded",
+					id: "snip-empty",
+					content: "snippet body from branch",
+				});
+			});
+		});
+
 		describe("pushToJolli with notes (exercises applyNoteUrls)", () => {
 			it("merges published note URLs into summary notes", async () => {
 				mockLoadConfig.mockResolvedValue({
@@ -4849,6 +5334,48 @@ describe("SummaryWebviewPanel", () => {
 				const noteB = storedSummary.notes.find((n) => n.id === "note-b");
 				expect(noteB?.jolliNoteDocUrl).toBeUndefined();
 			});
+		});
+	});
+
+	// ── Internal helpers (summariesEqual / setsEqual) ────────────────────────
+	describe("internal helpers", () => {
+		it("summariesEqual returns false when a is undefined", async () => {
+			const { __test__ } = await import("./SummaryWebviewPanel.js");
+			const b = { commitHash: "h" } as never;
+			expect(__test__.summariesEqual(undefined, b)).toBe(false);
+		});
+
+		it("summariesEqual returns true for deep-equal summaries", async () => {
+			const { __test__ } = await import("./SummaryWebviewPanel.js");
+			const a = { commitHash: "h", commitMessage: "m" } as never;
+			const b = { commitHash: "h", commitMessage: "m" } as never;
+			expect(__test__.summariesEqual(a, b)).toBe(true);
+		});
+
+		it("summariesEqual returns false for different summaries", async () => {
+			const { __test__ } = await import("./SummaryWebviewPanel.js");
+			const a = { commitHash: "h", commitMessage: "m1" } as never;
+			const b = { commitHash: "h", commitMessage: "m2" } as never;
+			expect(__test__.summariesEqual(a, b)).toBe(false);
+		});
+
+		it("setsEqual returns true for identical sets", async () => {
+			const { __test__ } = await import("./SummaryWebviewPanel.js");
+			expect(__test__.setsEqual(new Set(["a", "b"]), new Set(["a", "b"]))).toBe(
+				true,
+			);
+		});
+
+		it("setsEqual returns false when sizes differ", async () => {
+			const { __test__ } = await import("./SummaryWebviewPanel.js");
+			expect(__test__.setsEqual(new Set(["a"]), new Set(["a", "b"]))).toBe(
+				false,
+			);
+		});
+
+		it("setsEqual returns false when same-size sets have different members", async () => {
+			const { __test__ } = await import("./SummaryWebviewPanel.js");
+			expect(__test__.setsEqual(new Set(["a"]), new Set(["b"]))).toBe(false);
 		});
 	});
 });

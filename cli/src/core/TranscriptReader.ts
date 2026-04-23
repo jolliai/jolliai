@@ -21,7 +21,7 @@
 
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../Logger.js";
-import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
+import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult, TranscriptSource } from "../Types.js";
 import type { TranscriptParser } from "./TranscriptParser.js";
 
 const log = createLogger("TranscriptReader");
@@ -281,6 +281,12 @@ export function buildConversationContext(
 export interface SessionTranscript {
 	readonly sessionId: string;
 	readonly transcriptPath: string;
+	/**
+	 * Source integration this transcript came from. Carried on the transcript
+	 * itself (not looked up by `sessionId`) so downstream persistence does not
+	 * collapse two sources that coincidentally share an `sessionId`.
+	 */
+	readonly source?: TranscriptSource;
 	readonly entries: ReadonlyArray<TranscriptEntry>;
 }
 

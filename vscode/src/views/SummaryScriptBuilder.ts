@@ -911,6 +911,13 @@ ${buildPrMessageScript()}
     }
   }
 
+  function getSourceLabel(source) {
+    if (source === 'codex') return 'Codex';
+    if (source === 'gemini') return 'Gemini';
+    if (source === 'opencode') return 'OpenCode';
+    return 'Claude';
+  }
+
   function renderTranscriptEntries(entries) {
     if (!modalBody) return;
     originalTranscripts = entries;
@@ -946,7 +953,7 @@ ${buildPrMessageScript()}
     var tabsHtml = '';
     for (var t = 0; t < groupOrder.length; t++) {
       var tabGroup = groups[groupOrder[t]];
-      var tabSourceLabel = tabGroup.source === 'codex' ? 'Codex' : 'Claude';
+      var tabSourceLabel = getSourceLabel(tabGroup.source);
       var tabEntryCount = tabGroup.entries.length;
       var activeClass = t === 0 ? ' active' : '';
       tabsHtml += '<button class="modal-tab' + activeClass + '" data-tab-key="' + groupOrder[t] + '">';
@@ -1331,10 +1338,20 @@ ${buildPrMessageScript()}
     }
     if (msg.command === 'transcriptStatsLoaded') {
       if (conversationsStats) {
+        var sessionCounts = msg.sessionCounts || {};
         var parts = [];
-        if (msg.claudeSessions > 0) parts.push('<strong>' + msg.claudeSessions + '</strong> Claude');
-        if (msg.codexSessions > 0) parts.push('<strong>' + msg.codexSessions + '</strong> Codex');
-        var totalSessions = (msg.claudeSessions || 0) + (msg.codexSessions || 0);
+        var sourceOrder = ['claude', 'codex', 'gemini', 'opencode'];
+        for (var i = 0; i < sourceOrder.length; i++) {
+          var source = sourceOrder[i];
+          var count = sessionCounts[source] || 0;
+          if (count > 0) parts.push('<strong>' + count + '</strong> ' + getSourceLabel(source));
+        }
+        var totalSessions = 0;
+        for (var key in sessionCounts) {
+          if (Object.prototype.hasOwnProperty.call(sessionCounts, key)) {
+            totalSessions += sessionCounts[key] || 0;
+          }
+        }
         conversationsStats.innerHTML = '<strong>' + msg.totalEntries + '</strong> entries across <strong>' + totalSessions + '</strong> session' + (totalSessions !== 1 ? 's' : '') + ' (' + parts.join(', ') + ')';
       }
     }

@@ -195,6 +195,19 @@ describe("CliUtils", () => {
 		});
 	});
 
+	describe("formatShortDate", () => {
+		it("formats a valid ISO date as 'Mon DD'", async () => {
+			const { formatShortDate } = await import("./CliUtils.js");
+			expect(formatShortDate("2026-04-15T10:00:00.000Z")).toMatch(/Apr 1[45]/);
+		});
+
+		it("falls back to substring(0, 10) for invalid dates", async () => {
+			const { formatShortDate } = await import("./CliUtils.js");
+			// "xx-not-a-date-longer" is Invalid Date; NaN path returns first 10 chars.
+			expect(formatShortDate("xx-not-a-date-longer")).toBe("xx-not-a-d");
+		});
+	});
+
 	describe("SAFE_ARGUMENT_PATTERN", () => {
 		it("should match valid branch names", async () => {
 			const { SAFE_ARGUMENT_PATTERN } = await import("./CliUtils.js");

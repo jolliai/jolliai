@@ -165,6 +165,15 @@ vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	readGeminiTranscript: vi.fn(),
 }));
 
+vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
+	discoverOpenCodeSessions: vi.fn().mockResolvedValue([]),
+	isOpenCodeInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/OpenCodeTranscriptReader.js", () => ({
+	readOpenCodeTranscript: vi.fn(),
+}));
+
 vi.mock("../core/TranscriptParser.js", () => ({
 	getParserForSource: vi.fn(),
 }));

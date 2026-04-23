@@ -30,6 +30,10 @@ vi.mock("node:os", async (importOriginal) => {
 
 vi.stubGlobal("__PKG_VERSION__", "1.0.0");
 
+// Suppress console output
+vi.spyOn(console, "log").mockImplementation(() => {});
+vi.spyOn(console, "warn").mockImplementation(() => {});
+
 describe("DistPathResolver", () => {
 	let tempDir: string;
 

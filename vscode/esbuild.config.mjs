@@ -29,6 +29,9 @@ const base = {
 	bundle: true,
 	platform: "node",
 	format: "cjs",
+	// Target the Node bundled with the oldest supported VS Code (Electron 25 / Node 18).
+	// node:sqlite (Node 22.5+) is lazy-imported and gated by hasNodeSqliteSupport(), so
+	// this bundle loads fine on older hosts — OpenCode scanning just stays disabled.
 	target: "node18",
 	sourcemap: true,
 	minify: true,

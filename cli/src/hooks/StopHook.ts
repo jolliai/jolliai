@@ -127,9 +127,6 @@ export async function handleStopHook(): Promise<void> {
 
 // ─── Plan Discovery ─────────────────────────────────────────────────────────
 
-/** Plans directory where Claude Code stores plan files */
-const PLANS_DIR = join(homedir(), ".claude", "plans");
-
 /** Cursor key prefix to distinguish plan scan cursors from summarization cursors */
 const PLAN_CURSOR_PREFIX = "plan:";
 
@@ -190,7 +187,7 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 	let changed = false;
 
 	for (const [slug, editCount] of slugs) {
-		const planFile = join(PLANS_DIR, `${slug}.md`);
+		const planFile = join(homedir(), ".claude", "plans", `${slug}.md`);
 		if (!existsSync(planFile)) {
 			continue;
 		}

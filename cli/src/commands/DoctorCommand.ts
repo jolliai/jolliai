@@ -199,8 +199,9 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 	if (fix && fixesToApply.length > 0) {
 		console.log("\n  Applying fixes...");
 		for (const check of fixesToApply) {
-			/* v8 ignore next -- defensive: fixesToApply already filtered by check.fixer existence */
+			/* v8 ignore start -- defensive: fixesToApply already filtered by check.fixer existence */
 			if (!check.fixer) continue;
+			/* v8 ignore stop */
 			try {
 				const result = await check.fixer();
 				console.log(`  ✓ ${check.name}: ${result}`);

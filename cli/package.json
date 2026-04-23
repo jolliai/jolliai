@@ -7,7 +7,10 @@
 	"bin": {
 		"jolli": "dist/Cli.js"
 	},
-	"files": ["dist/", "README.md"],
+	"files": [
+		"dist/",
+		"README.md"
+	],
 	"scripts": {
 		"all": "npm run clean && npm run build && npm run lint && npm run test",
 		"build": "vite build",
@@ -22,7 +25,17 @@
 		"test:watch": "vitest",
 		"postinstall": "node -e \"require('fs').existsSync('dist/PostInstall.js') && require('child_process').spawnSync(process.execPath,['dist/PostInstall.js'],{stdio:'inherit'})\""
 	},
-	"keywords": ["ai", "documentation", "git-hooks", "claude-code", "codex", "gemini", "commit-summary", "dev-memory"],
+	"keywords": [
+		"ai",
+		"documentation",
+		"git-hooks",
+		"claude-code",
+		"codex",
+		"gemini",
+		"opencode",
+		"commit-summary",
+		"dev-memory"
+	],
 	"author": "Jolli",
 	"license": "Apache-2.0",
 	"repository": {
@@ -41,7 +54,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.2.6",
-		"@types/node": "^20.0.0",
+		"@types/node": "^22.5.0",
 		"@vitest/coverage-v8": "^4.1.1",
 		"rimraf": "^6.0.1",
 		"tsx": "^4.7.0",
@@ -53,6 +66,6 @@
 		"access": "public"
 	},
 	"engines": {
-		"node": ">=18.0.0"
+		"node": ">=22.5.0"
 	}
 }

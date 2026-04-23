@@ -22,6 +22,11 @@ import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDis
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
 import {
+	isOpenCodeInstalled,
+	type OpenCodeScanError,
+	scanOpenCodeSessions,
+} from "../core/OpenCodeSessionDiscoverer.js";
+import {
 	ensureJolliMemoryDir,
 	filterSessionsByEnabledIntegrations,
 	getGlobalConfigDir,
@@ -33,7 +38,7 @@ import {
 } from "../core/SessionTracker.js";
 import { getSummaryCount } from "../core/SummaryStore.js";
 import { createLogger, getJolliMemoryDir, ORPHAN_BRANCH } from "../Logger.js";
-import type { InstallResult, JolliMemoryConfig, SessionInfo, StatusInfo } from "../Types.js";
+import type { InstallResult, JolliMemoryConfig, SessionInfo, StatusInfo, TranscriptSource } from "../Types.js";
 import {
 	installClaudeHook,
 	installSessionStartHook,
@@ -238,6 +243,15 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			if (config.geminiEnabled === undefined) {
 				await saveConfig({ geminiEnabled: true });
 				log.info("Gemini CLI detected — enabled Gemini session tracking");
+			}
+		}
+
+		// Auto-detect OpenCode and enable session discovery
+		const openCodeDetected = config.openCodeEnabled !== false && (await isOpenCodeInstalled());
+		if (openCodeDetected) {
+			if (config.openCodeEnabled === undefined) {
+				await saveConfig({ openCodeEnabled: true });
+				log.info("OpenCode detected — enabled OpenCode session discovery");
 			}
 		}
 
@@ -455,6 +469,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 	const claudeDetected = await isClaudeInstalled();
 	const codexDetected = await isCodexInstalled();
 	const geminiDetected = await isGeminiInstalled();
+	const openCodeDetected = await isOpenCodeInstalled();
 
 	// Check if we can enumerate worktrees; falls back gracefully if not a git repo
 	let enabledWorktrees: number | undefined;
@@ -482,6 +497,25 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		if (codexSessions.length > 0) {
 			allEnabledSessions = [...enabledSessions, ...codexSessions];
 		}
+	}
+
+	// Discover OpenCode sessions on-demand (not stored in sessions.json).
+	// Use scanOpenCodeSessions so we can surface real scan failures (corrupt DB,
+	// schema drift, permission denied) rather than silently showing "0 sessions".
+	let openCodeScanError: OpenCodeScanError | undefined;
+	if (config.openCodeEnabled !== false && openCodeDetected) {
+		const scan = await scanOpenCodeSessions(projectDir);
+		if (scan.sessions.length > 0) {
+			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
+		}
+		openCodeScanError = scan.error;
+	}
+
+	// Compute per-source session counts for integration status rows
+	const sessionsBySource: Partial<Record<TranscriptSource, number>> = {};
+	for (const s of allEnabledSessions) {
+		const src = s.source ?? "claude";
+		sessionsBySource[src] = (sessionsBySource[src] ?? 0) + 1;
 	}
 
 	const filteredMostRecent =
@@ -546,16 +580,20 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		codexEnabled: config.codexEnabled,
 		geminiDetected,
 		geminiEnabled: config.geminiEnabled,
+		openCodeDetected,
+		openCodeEnabled: config.openCodeEnabled,
 		globalConfigDir,
 		worktreeStatePath,
 		enabledWorktrees,
 		hookSource: activeSource?.source,
 		hookVersion: activeSource?.version,
 		allSources,
+		sessionsBySource,
+		openCodeScanError,
 	};
 
 	log.info(
-		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s",
+		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s",
 		status.enabled,
 		status.claudeHookInstalled,
 		status.gitHookInstalled,
@@ -568,6 +606,8 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		status.geminiDetected,
 		status.geminiEnabled,
 		status.enabledWorktrees,
+		status.openCodeDetected,
+		status.openCodeEnabled,
 	);
 
 	return status;

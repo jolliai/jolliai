@@ -315,12 +315,18 @@ describe("StatusTreeProvider", () => {
 	});
 
 	it("shows Jolli Site only when parseJolliApiKey returns a URL with siteUrl", async () => {
-		// Covers the siteUrl truthy branch on line 210-211
+		// Covers both `if (meta?.u)` branches: signed in with jolliApiKey, but the
+		// parsed metadata lacks `u`, so the Jolli Site row is NOT appended.
 		const bridge = {
 			cwd: "/repo",
 			getStatus: vi.fn(async () => makeStatus()),
 		};
-		loadConfigFromDir.mockResolvedValue({ apiKey: "key", jolliApiKey: "jk" });
+		// authToken makes the "signed in" branch active so execution reaches line 247.
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "key",
+			authToken: "tok",
+			jolliApiKey: "jk",
+		});
 		// Return meta without u field — no Jolli Site row
 		parseJolliApiKey.mockReturnValue({ t: "acme" });
 
@@ -436,6 +442,99 @@ describe("StatusTreeProvider", () => {
 		const updateItem = items.find((item) => item.label === "Update Available");
 		expect(updateItem).toBeDefined();
 		expect(updateItem?.description).toBe("a newer version is available");
+	});
+
+	// ── Session count suffixes ────────────────────────────────────────────
+
+	it("appends plural session counts to integration descriptions", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({ sessionsBySource: { claude: 3, codex: 2 } }),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const claude = items.find((item) => item.label === "Claude Integration");
+		expect(claude?.description).toBe("hook installed (3 sessions)");
+		const codex = items.find((item) => item.label === "Codex Integration");
+		expect(codex?.description).toBe("detected & enabled (2 sessions)");
+	});
+
+	it("appends singular session count to integration description", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({ sessionsBySource: { claude: 1 } }),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const claude = items.find((item) => item.label === "Claude Integration");
+		expect(claude?.description).toBe("hook installed (1 session)");
+	});
+
+	// ── OpenCode scan error (Finding P1-b) ────────────────────────────────
+
+	it("renders an 'unavailable' OpenCode row when openCodeScanError is present", async () => {
+		// Regression: a corrupt/locked OpenCode DB used to render as
+		// "detected & enabled (0 sessions)" — visually identical to a healthy
+		// integration with no activity. Now the scan error replaces the normal row.
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					openCodeDetected: true,
+					openCodeEnabled: true,
+					openCodeScanError: {
+						kind: "corrupt",
+						message: "SQLITE_CORRUPT: disk image malformed",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const openCode = items.find(
+			(item) => item.label === "OpenCode Integration",
+		);
+		expect(openCode?.description).toBe("unavailable — corrupt");
+		expect(String(openCode?.tooltip)).toContain("SQLITE_CORRUPT");
+	});
+
+	it("falls back to the normal detected/enabled OpenCode row when no scan error", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					openCodeDetected: true,
+					openCodeEnabled: true,
+					sessionsBySource: { opencode: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const openCode = items.find(
+			(item) => item.label === "OpenCode Integration",
+		);
+		expect(openCode?.description).toBe("detected & enabled (2 sessions)");
 	});
 
 	// ── Auth-aware status rows ────────────────────────────────────────────

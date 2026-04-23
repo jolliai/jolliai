@@ -874,7 +874,9 @@ export function activate(context: vscode.ExtensionContext): void {
 						statusBar,
 					);
 				} catch (err: unknown) {
+					/* v8 ignore start -- defensive: VSCode API and provider helpers reject with Error; retained for unexpected non-Error throws */
 					const message = err instanceof Error ? err.message : String(err);
+					/* v8 ignore stop */
 					log.error(
 						"cmd",
 						`discardFileChanges failed for ${relativePath}: ${message}`,

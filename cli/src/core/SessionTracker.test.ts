@@ -919,6 +919,21 @@ describe("SessionTracker", () => {
 			});
 			expect(result).toHaveLength(0);
 		});
+
+		it("should exclude OpenCode sessions when openCodeEnabled is false", () => {
+			const openCodeSession = {
+				sessionId: "o1",
+				transcriptPath: "/o1",
+				updatedAt: "2025-01-01T00:00:00Z",
+				source: "opencode" as const,
+			};
+
+			const result = filterSessionsByEnabledIntegrations([claudeSession, openCodeSession], {
+				openCodeEnabled: false,
+			});
+
+			expect(result).toEqual([claudeSession]);
+		});
 	});
 
 	// ── git operation queue ────────────────────────────────────────────────
@@ -1004,6 +1019,15 @@ describe("SessionTracker", () => {
 			await expect(deleteQueueEntry("/non/existent/path.json")).resolves.toBeUndefined();
 		});
 
+		it("should swallow filesystem errors when deleting a queue entry", async () => {
+			const fsPromises = await import("node:fs/promises");
+			const rmSpy = vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(new Error("permission denied"));
+
+			await expect(deleteQueueEntry("/tmp/locked.json")).resolves.toBeUndefined();
+
+			rmSpy.mockRestore();
+		});
+
 		it("should return false when enqueue fails due to filesystem error", async () => {
 			// Use an invalid path that will fail on mkdir
 			const result = await enqueueGitOperation(makeOp("fail1"), "/\0/invalid-path");
@@ -1037,6 +1061,20 @@ describe("SessionTracker", () => {
 		it("should return config from global dir without throwing", async () => {
 			const config = await loadConfig();
 			expect(config).toBeDefined();
+		});
+
+		it("saveConfig should persist config to the global directory shorthand", async () => {
+			const originalHome = process.env.HOME;
+			process.env.HOME = tempDir;
+
+			try {
+				await saveConfig({ apiKey: "global-key" });
+				const config = await loadConfig();
+				expect(config.apiKey).toBe("global-key");
+			} finally {
+				if (originalHome === undefined) delete process.env.HOME;
+				else process.env.HOME = originalHome;
+			}
 		});
 	});
 
@@ -1284,22 +1322,6 @@ describe("SessionTracker", () => {
 			await mkdir(dir, { recursive: true });
 			await writeFile(join(dir, "squash-pending.json"), "not json");
 			expect(await checkStaleSquashPending(tempDir)).toBe(true);
-		});
-	});
-
-	// ── saveConfig (global wrapper) ──────────────────────────────────────
-
-	describe("saveConfig", () => {
-		it("delegates to saveConfigScoped with the global config directory", async () => {
-			// saveConfig writes to the global ~/.jolli/jollimemory/config.json.
-			// Verify it does not throw and round-trips through loadConfig.
-			const before = await loadConfig();
-			await saveConfig({ model: "test-model-for-coverage" });
-			const after = await loadConfig();
-			expect(after.model).toBe("test-model-for-coverage");
-
-			// Restore original value
-			await saveConfig({ model: before.model });
 		});
 	});
 });

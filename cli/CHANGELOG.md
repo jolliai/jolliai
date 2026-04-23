@@ -1,9 +1,11 @@
 # Changelog
 
-<!-- Last synced commit: ff796b6a5 | 2026-04-13 -->
+<!-- Last synced commit: ea9ad050b | 2026-04-23 -->
 
 ## 0.98.0
 
+- **Breaking: requires Node 22.5+** — the CLI now requires Node 22.5 or newer (previously Node 18+). OpenCode session discovery relies on Node's built-in `node:sqlite`, which first ships in Node 22.5. Node 18 and 20 users should upgrade before running `npm install -g @jolli/cli`; the `engines` field will refuse installation on older runtimes.
+- **OpenCode integration** — sessions from [OpenCode](https://opencode.ai) are now discovered automatically at commit time. Jolli Memory reads the global OpenCode SQLite database at `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode/opencode.db`) and picks up any session whose `directory` matches the current project. No hook installation needed — same pattern as Codex. Toggle with `jolli configure --set openCodeEnabled=true|false`.
 - **`jolli auth` commands**: Added `jolli auth signup`, `jolli auth login`, `jolli auth logout`, `jolli auth status` for browser-based OAuth authentication.
 - **Updated `jolli enable` flow**: Now offers Sign up / Sign in as the primary option alongside manual API key entry.
 

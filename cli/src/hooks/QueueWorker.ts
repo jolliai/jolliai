@@ -24,6 +24,8 @@ import { fileURLToPath } from "node:url";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
+import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
+import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import {
 	acquireLock,
@@ -67,6 +69,7 @@ import type {
 	PlanReference,
 	StoredTranscript,
 	TopicSummary,
+	TranscriptReadResult,
 	TranscriptSource,
 } from "../Types.js";
 
@@ -140,12 +143,18 @@ export function launchWorker(cwd: string): void {
 	const dir = dirname(fileURLToPath(import.meta.url));
 	const scriptPath = join(dir, "QueueWorker.js");
 
-	const child = spawn(process.execPath, [scriptPath, "--worker", "--cwd", cwd], {
-		detached: true,
-		stdio: "ignore",
-		cwd,
-		windowsHide: true,
-	});
+	const child = spawn(
+		process.execPath,
+		// --disable-warning silences node:sqlite's ExperimentalWarning during OpenCode
+		// scans; it also suppresses any other experimental warnings in this subprocess.
+		["--disable-warning=ExperimentalWarning", scriptPath, "--worker", "--cwd", cwd],
+		{
+			detached: true,
+			stdio: "ignore",
+			cwd,
+			windowsHide: true,
+		},
+	);
 	child.unref();
 
 	log.info("Background worker spawned (PID: %d)", child.pid ?? -1);
@@ -184,6 +193,9 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			if (entries.length === 0) break;
 
 			for (const { op, filePath } of entries) {
+				// Hard cap: if a single dequeue batch returns more than MAX_ENTRIES_PER_RUN,
+				// stop inside the inner loop so the outer while condition can re-check and
+				// exit cleanly. The subsequent chain-spawn (line below) picks up leftovers.
 				if (processedCount >= MAX_ENTRIES_PER_RUN) break;
 				try {
 					await processQueueEntry(op, cwd, force);
@@ -588,11 +600,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	}
 
 	// Step 3+4: Load sessions and read transcripts with time cutoff for queue-driven attribution
-	const { allSessions, sessionTranscripts, totalEntries, humanEntries } = await loadSessionTranscripts(
-		cwd,
-		config,
-		op.createdAt,
-	);
+	const { sessionTranscripts, totalEntries, humanEntries } = await loadSessionTranscripts(cwd, config, op.createdAt);
 
 	// Step 5: Get git diff and stats (moved before guard to enable diff-only summaries)
 	stepStart = now();
@@ -694,13 +702,19 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	// Step 8b: Evaluate plan progress for each linked plan (Haiku calls parallelized)
 	const planProgressArtifacts: PlanProgressArtifact[] = [];
 	if (planRefs.length > 0) {
+		/* v8 ignore start -- defensive: SummaryResult.topics is always set by generateSummary, but retain the nullish guard in case the type relaxes */
 		const topics: ReadonlyArray<TopicSummary> = summaryResult.topics ?? [];
+		/* v8 ignore stop */
 		const commitDate = new Date(commitInfo.date).toISOString();
 
 		const evalPromises = planRefs.map(async (planRef) => {
 			const planMarkdown = planAssociation.markdownBySlug.get(planRef.slug);
+			/* v8 ignore start -- defensive: associatePlansWithCommit populates markdownBySlug for every ref it returns, but retain the guard for invariant violations */
 			if (planMarkdown === undefined) return null;
+			/* v8 ignore stop */
+			/* v8 ignore start -- defensive: originalSlugBySlug is populated alongside markdownBySlug in associatePlansWithCommit */
 			const originalSlug = planAssociation.originalSlugBySlug.get(planRef.slug) ?? planRef.slug;
+			/* v8 ignore stop */
 			const result = await evaluatePlanProgress(planMarkdown, diff, topics, conversation, config);
 			if (!result) return null;
 			return {
@@ -745,7 +759,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	);
 
 	// Step 8c: Build StoredTranscript from session transcripts for persistence
-	const storedTranscript = buildStoredTranscript(sessionTranscripts, allSessions);
+	const storedTranscript = buildStoredTranscript(sessionTranscripts);
 
 	// Step 8d: Store summary (+ transcript + plan progress) in orphan branch
 	// Pass `force` so manual re-summarize can overwrite a previously failed entry.
@@ -968,12 +982,11 @@ async function handleAmendPipeline(
 
 	// Load sessions and read transcripts with time cutoff
 	const amendConfig = await loadConfig();
-	const {
-		allSessions: amendSessions,
-		sessionTranscripts,
-		totalEntries,
-		humanEntries,
-	} = await loadSessionTranscripts(cwd, amendConfig, beforeTimestamp);
+	const { sessionTranscripts, totalEntries, humanEntries } = await loadSessionTranscripts(
+		cwd,
+		amendConfig,
+		beforeTimestamp,
+	);
 
 	// Get git diff and stats
 	let stepStart = now();
@@ -1101,7 +1114,7 @@ async function handleAmendPipeline(
 	};
 
 	// Build StoredTranscript for the amend's own conversation (Scenario 2: fresh cursors)
-	const amendStoredTranscript = buildStoredTranscript(sessionTranscripts, amendSessions);
+	const amendStoredTranscript = buildStoredTranscript(sessionTranscripts);
 
 	stepStart = now();
 	await storeSummary(amendedSummary, cwd, false, { transcript: amendStoredTranscript });
@@ -1151,8 +1164,18 @@ async function loadSessionTranscripts(
 	if (config.codexEnabled !== false && (await isCodexInstalled())) {
 		const codexSessions = await discoverCodexSessions(cwd);
 		if (codexSessions.length > 0) {
-			allSessions = [...trackedSessions, ...codexSessions];
+			allSessions = [...allSessions, ...codexSessions];
 			log.info("Discovered %d Codex session(s)", codexSessions.length);
+		}
+	}
+
+	// Discover OpenCode sessions (on-demand SQLite scan)
+	// OpenCode uses a global DB at ~/.local/share/opencode/opencode.db, scoped by project directory
+	if (config.openCodeEnabled !== false && (await isOpenCodeInstalled())) {
+		const openCodeSessions = await discoverOpenCodeSessions(cwd);
+		if (openCodeSessions.length > 0) {
+			allSessions = [...allSessions, ...openCodeSessions];
+			log.info("Discovered %d OpenCode session(s)", openCodeSessions.length);
 		}
 	}
 
@@ -1192,17 +1215,22 @@ async function readAllTranscripts(
 		const startLine = cursor?.lineNumber ?? 0;
 		const source = session.source ?? "claude";
 
-		// Gemini uses a dedicated JSON reader (not JSONL line-based parsing)
-		const result =
-			source === "gemini"
-				? await readGeminiTranscript(session.transcriptPath, cursor, beforeTimestamp)
-				: await readTranscript(session.transcriptPath, cursor, getParserForSource(source), beforeTimestamp);
+		// Gemini and OpenCode use dedicated readers (not JSONL line-based parsing)
+		let result: TranscriptReadResult;
+		if (source === "gemini") {
+			result = await readGeminiTranscript(session.transcriptPath, cursor, beforeTimestamp);
+		} else if (source === "opencode") {
+			result = await readOpenCodeTranscript(session.transcriptPath, cursor, beforeTimestamp);
+		} else {
+			result = await readTranscript(session.transcriptPath, cursor, getParserForSource(source), beforeTimestamp);
+		}
 		const endLine = result.newCursor.lineNumber;
 
 		if (result.entries.length > 0) {
 			sessionTranscripts.push({
 				sessionId: session.sessionId,
 				transcriptPath: session.transcriptPath,
+				source: session.source,
 				entries: result.entries,
 			});
 			totalEntries += result.entries.length;
@@ -1225,34 +1253,36 @@ async function readAllTranscripts(
 }
 
 /**
- * Converts pipeline session transcripts into the StoredTranscript format for orphan branch persistence.
- * Maps each SessionTranscript to a StoredSession, enriching with `source` and `transcriptPath`
- * from the original session metadata.
+ * Converts pipeline session transcripts into the StoredTranscript format for
+ * orphan-branch persistence.
+ *
+ * Source / transcriptPath are threaded directly off each `SessionTranscript`
+ * rather than looked up in a `Map<sessionId, ...>` against `allSessions` —
+ * the earlier Map-based approach would collapse two sessions from different
+ * integrations that happened to share an `sessionId`, silently rewriting
+ * the later session's metadata onto the earlier one on serialize.
  */
-function buildStoredTranscript(
-	sessionTranscripts: ReadonlyArray<SessionTranscript>,
-	allSessions: ReadonlyArray<{ sessionId: string; transcriptPath: string; source?: TranscriptSource }>,
-): StoredTranscript {
-	const sessionMap = new Map(allSessions.map((s) => [s.sessionId, s]));
+function buildStoredTranscript(sessionTranscripts: ReadonlyArray<SessionTranscript>): StoredTranscript {
 	return {
-		sessions: sessionTranscripts.map((st) => {
-			const meta = sessionMap.get(st.sessionId);
-			return {
-				sessionId: st.sessionId,
-				source: meta?.source,
-				transcriptPath: meta?.transcriptPath ?? st.transcriptPath,
-				entries: [...st.entries],
-			};
-		}),
+		sessions: sessionTranscripts.map((st) => ({
+			sessionId: st.sessionId,
+			source: st.source,
+			transcriptPath: st.transcriptPath,
+			entries: [...st.entries],
+		})),
 	};
 }
 
 /** Exposed for unit tests. */
 export const __test__ = {
 	detectPlanSlugsFromRegistry,
+	detectUncommittedNoteIds,
+	hoistMetadataFromOldSummary,
 	associatePlansWithCommit,
 	executePipeline,
 	handleAmendPipeline,
+	handleSquashFromQueue,
+	loadSessionTranscripts,
 	buildStoredTranscript,
 };
 

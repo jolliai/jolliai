@@ -171,6 +171,24 @@ describe("GitOps", () => {
 			const result = await execGit(["status"]);
 			expect(result.exitCode).toBe(1);
 		});
+
+		it("should fall back to the error message when stdout and stderr are missing", async () => {
+			const error = new Error("message only") as Error & {
+				code?: number | string;
+				stdout?: string;
+				stderr?: string;
+			};
+			delete error.code;
+			delete error.stdout;
+			delete error.stderr;
+			mockExecFileAsync.mockRejectedValueOnce(error);
+
+			const result = await execGit(["status"]);
+
+			expect(result.stdout).toBe("");
+			expect(result.stderr).toBe("message only");
+			expect(result.exitCode).toBe(1);
+		});
 	});
 
 	describe("getHeadCommitInfo", () => {
@@ -1056,6 +1074,45 @@ describe("GitOps", () => {
 			const hooksDir = await resolveGitHooksDir(projectDir);
 			// For a non-worktree gitlink, hooks are inside the resolved gitdir
 			expect(hooksDir).toBe(join(bareGitDir, "hooks"));
+		});
+
+		it("should throw when a gitlink file is malformed", async () => {
+			const projectDir = join(tempDir, "project");
+			await mkdir(projectDir, { recursive: true });
+			await writeFile(join(projectDir, ".git"), "not-a-gitdir-pointer\n", "utf-8");
+
+			await expect(resolveGitHooksDir(projectDir)).rejects.toThrow("Unexpected .git file content");
+		});
+	});
+
+	describe("spawn-backed git helpers", () => {
+		it("should reject when spawn emits an error event", async () => {
+			mockFailure(128, "not a valid ref");
+			mockSpawn.mockImplementationOnce(() => {
+				const proc = Object.assign(new EventEmitter(), {
+					stdin: { write: vi.fn(), end: vi.fn() },
+					stdout: new EventEmitter(),
+					stderr: new EventEmitter(),
+				});
+				queueMicrotask(() => {
+					proc.emit("error", new Error("spawn failed"));
+				});
+				return proc;
+			});
+
+			await expect(ensureOrphanBranch("broken-branch")).rejects.toThrow("spawn failed");
+		});
+
+		it("should throw when existing subtree metadata is malformed", async () => {
+			mockSuccess("abc\n");
+			mockSuccess("parent\n");
+			mockSuccess("root_tree\n");
+			mockSpawnSuccess("new_blob\n");
+			mockSuccess("not-a-tree-line\n");
+
+			await expect(writeFileToBranch("branch", "summaries/abc.json", "{}", "Add")).rejects.toThrow(
+				"Unexpected ls-tree output",
+			);
 		});
 	});
 });

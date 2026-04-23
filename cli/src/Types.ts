@@ -5,7 +5,7 @@
  */
 
 /** Which AI coding agent produced the transcript */
-export type TranscriptSource = "claude" | "codex" | "gemini";
+export type TranscriptSource = "claude" | "codex" | "gemini" | "opencode";
 
 /** Metadata about an AI coding session, saved by the Stop hook (Claude) or discovered on-demand (Codex) */
 export interface SessionInfo {
@@ -442,6 +442,8 @@ export interface JolliMemoryConfig {
 	readonly geminiEnabled?: boolean;
 	/** Enable Claude Code session tracking via Stop hook (default: true) */
 	readonly claudeEnabled?: boolean;
+	/** Enable OpenCode session discovery at post-commit time (default: auto-detect) */
+	readonly openCodeEnabled?: boolean;
 	/** Global minimum log level written to debug.log (default: "info") */
 	readonly logLevel?: LogLevel;
 	/** Per-module log level overrides (e.g. { "GitOps": "debug" }) */
@@ -510,6 +512,10 @@ export interface StatusInfo {
 	readonly geminiDetected?: boolean;
 	/** Whether Gemini CLI session tracking is enabled in config (undefined = auto-detect) */
 	readonly geminiEnabled?: boolean;
+	/** Whether the global OpenCode database (~/.local/share/opencode/opencode.db) was detected */
+	readonly openCodeDetected?: boolean;
+	/** Whether OpenCode session discovery is enabled in config (undefined = auto-detect) */
+	readonly openCodeEnabled?: boolean;
 	/** Directory path for global config (~/.jolli/jollimemory) */
 	readonly globalConfigDir?: string;
 	/** Path to the worktree state directory */
@@ -535,6 +541,18 @@ export interface StatusInfo {
 	 * multi-source picture.
 	 */
 	readonly allSources?: ReadonlyArray<DistPathInfo>;
+	/** Per-source session count breakdown, keyed by TranscriptSource */
+	readonly sessionsBySource?: Partial<Record<TranscriptSource, number>>;
+	/**
+	 * OpenCode DB scan failed with a real (non-ENOENT) error — e.g. the DB is
+	 * corrupt, locked, or the schema has drifted. When present, UI should show
+	 * a warning adjacent to the OpenCode integration row rather than rendering
+	 * "0 sessions" (which is indistinguishable from "no OpenCode activity").
+	 */
+	readonly openCodeScanError?: {
+		readonly kind: "corrupt" | "locked" | "permission" | "schema" | "unknown";
+		readonly message: string;
+	};
 }
 
 /**

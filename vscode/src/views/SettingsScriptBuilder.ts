@@ -23,6 +23,7 @@ export function buildSettingsScript(): string {
   const claudeEnabledInput = document.getElementById('claudeEnabled');
   const codexEnabledInput = document.getElementById('codexEnabled');
   const geminiEnabledInput = document.getElementById('geminiEnabled');
+  const openCodeEnabledInput = document.getElementById('openCodeEnabled');
   const localFolderInput = document.getElementById('localFolder');
   const browseLocalFolderBtn = document.getElementById('browseLocalFolderBtn');
   const pushActionJolliRadio = document.getElementById('pushActionJolli');
@@ -76,7 +77,7 @@ export function buildSettingsScript(): string {
     }) && valid;
     // At least one integration must be enabled
     var intError = document.getElementById('integrations-error');
-    if (!claudeEnabledInput.checked && !codexEnabledInput.checked && !geminiEnabledInput.checked) {
+    if (!claudeEnabledInput.checked && !codexEnabledInput.checked && !geminiEnabledInput.checked && !openCodeEnabledInput.checked) {
       intError.textContent = 'At least one integration must be enabled';
       valid = false;
     } else {
@@ -110,6 +111,7 @@ export function buildSettingsScript(): string {
       claudeEnabled: claudeEnabledInput.checked,
       codexEnabled: codexEnabledInput.checked,
       geminiEnabled: geminiEnabledInput.checked,
+      openCodeEnabled: openCodeEnabledInput.checked,
       localFolder: localFolderInput.value,
       pushAction: pushActionBothRadio.checked ? 'both' : 'jolli',
       excludePatterns: excludePatternsInput.value,
@@ -127,6 +129,7 @@ export function buildSettingsScript(): string {
       claudeEnabledInput.checked !== initialState.claudeEnabled ||
       codexEnabledInput.checked !== initialState.codexEnabled ||
       geminiEnabledInput.checked !== initialState.geminiEnabled ||
+      openCodeEnabledInput.checked !== initialState.openCodeEnabled ||
       localFolderInput.value !== initialState.localFolder ||
       currentPushAction !== initialState.pushAction ||
       excludePatternsInput.value !== initialState.excludePatterns
@@ -143,7 +146,7 @@ export function buildSettingsScript(): string {
     input.addEventListener('input', function() { validateAll(); checkDirty(); });
   });
   modelSelect.addEventListener('change', function() { checkDirty(); });
-  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput].forEach(function(input) {
+  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput].forEach(function(input) {
     input.addEventListener('change', function() { validateAll(); checkDirty(); });
   });
   [pushActionJolliRadio, pushActionBothRadio].forEach(function(input) {
@@ -164,6 +167,7 @@ export function buildSettingsScript(): string {
         claudeEnabled: claudeEnabledInput.checked,
         codexEnabled: codexEnabledInput.checked,
         geminiEnabled: geminiEnabledInput.checked,
+        openCodeEnabled: openCodeEnabledInput.checked,
         localFolder: localFolderInput.value.trim(),
         pushAction: pushActionBothRadio.checked ? 'both' : 'jolli',
         excludePatterns: excludePatternsInput.value,
@@ -185,6 +189,7 @@ export function buildSettingsScript(): string {
         claudeEnabledInput.checked = msg.settings.claudeEnabled;
         codexEnabledInput.checked = msg.settings.codexEnabled;
         geminiEnabledInput.checked = msg.settings.geminiEnabled;
+        openCodeEnabledInput.checked = msg.settings.openCodeEnabled;
         localFolderInput.value = msg.settings.localFolder || '';
         if (msg.settings.pushAction === 'both') {
           pushActionBothRadio.checked = true;

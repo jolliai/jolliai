@@ -224,6 +224,18 @@ describe("SummaryTree", () => {
 			};
 			expect(computeDurationDays(multiDay)).toBe(2);
 		});
+
+		it("falls back to commitDate when a source has no generatedAt (covers `||` right branch)", () => {
+			// One child with empty generatedAt forces the fallback path inside the Set map.
+			const mixed: CommitSummary = {
+				...D,
+				children: [
+					{ ...B, commitDate: "2026-03-03T10:00:00.000Z", generatedAt: "" },
+					{ ...A, commitDate: "2026-03-01T10:00:00.000Z", generatedAt: "2026-03-01T10:00:10.000Z" },
+				],
+			};
+			expect(computeDurationDays(mixed)).toBe(2);
+		});
 	});
 
 	describe("formatDurationLabel", () => {
@@ -248,6 +260,19 @@ describe("SummaryTree", () => {
 			const label = formatDurationLabel(multiDay);
 			expect(label).toMatch(/^2 days \(/);
 			expect(label).toContain("Mar");
+		});
+
+		it("falls back to commitDate for timestamp computation when generatedAt is empty", () => {
+			// Covers the `s.generatedAt || s.commitDate` right branch in formatDurationLabel.
+			const mixed: CommitSummary = {
+				...D,
+				children: [
+					{ ...B, commitDate: "2026-03-05T10:00:00.000Z", generatedAt: "" },
+					{ ...A, commitDate: "2026-03-01T10:00:00.000Z", generatedAt: "2026-03-01T10:00:10.000Z" },
+				],
+			};
+			const label = formatDurationLabel(mixed);
+			expect(label).toMatch(/^2 days \(/);
 		});
 	});
 

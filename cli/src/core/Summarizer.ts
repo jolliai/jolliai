@@ -381,8 +381,9 @@ function extractPreTopicTicketId(text: string): string | undefined {
 	const match = preamble.match(/^---(?:TICKETID|ticketId)---\s*\n(.+)/m);
 	if (match) {
 		const id = match[1].trim();
-		/* v8 ignore next -- regex uses .+, so a matched ticket line is never empty after trimming */
+		/* v8 ignore start -- regex uses .+, so a matched ticket line is never empty after trimming */
 		return id.length > 0 ? id : undefined;
+		/* v8 ignore stop */
 	}
 	return undefined;
 }

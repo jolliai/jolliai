@@ -637,6 +637,40 @@ describe("JolliMemoryBridge", () => {
 				source: "vscode-extension",
 			});
 		});
+
+		it("detects legacy hooks via PostCommitHook keyword (not just StopHook)", async () => {
+			existsSync.mockImplementation((p: string) =>
+				String(p).includes("settings.local.json"),
+			);
+			readFileSync.mockReturnValue(
+				'{"hooks":{"PostCommit":[{"command":"node /old/PostCommitHook.js"}]}}',
+			);
+			installerGetStatus.mockResolvedValue({});
+			const bridge = makeBridge();
+
+			await bridge.refreshHookPathsIfStale("/ext/v2.0.0");
+
+			expect(installerInstall).toHaveBeenCalledWith(TEST_CWD, {
+				source: "vscode-extension",
+			});
+		});
+
+		it("triggers re-install during legacy migration when scope is not present", async () => {
+			existsSync.mockImplementation((p: string) =>
+				String(p).includes("settings.local.json"),
+			);
+			readFileSync.mockReturnValue(
+				'{"hooks":{"Stop":[{"command":"node /old/path/StopHook.js"}]}}',
+			);
+			installerGetStatus.mockResolvedValue({});
+			const bridge = makeBridge();
+
+			await bridge.refreshHookPathsIfStale("/ext/v2.0.0");
+
+			expect(installerInstall).toHaveBeenCalledWith(TEST_CWD, {
+				source: "vscode-extension",
+			});
+		});
 	});
 
 	// ── getStatus ────────────────────────────────────────────────────────
@@ -1451,6 +1485,26 @@ describe("JolliMemoryBridge", () => {
 			await expect(
 				bridge.discardFiles([makeFileStatus("locked.ts", "?", "?")]),
 			).rejects.toThrow("EPERM");
+		});
+
+		it("handles rename without originalPath (unstages only new path, skips restore)", async () => {
+			mockExecFileSuccess(""); // git restore --staged -- new.ts (single path)
+			lstat.mockResolvedValue({ isDirectory: () => false });
+			unlink.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			await bridge.discardFiles([makeFileStatus("new.ts", "R", " ")]);
+
+			// Only the new path should be unstaged (no second path)
+			expect(execFileMock).toHaveBeenCalledWith(
+				"git",
+				["restore", "--staged", "--", "new.ts"],
+				{ cwd: TEST_CWD, encoding: "utf8" },
+				expect.any(Function),
+			);
+			// No separate restore for old path
+			expect(execFileMock).toHaveBeenCalledTimes(1);
+			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
 		});
 
 		it("batches mixed status types into grouped git calls", async () => {

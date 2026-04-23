@@ -57,7 +57,7 @@ function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
 		commitMessage: "Fix login timeout",
 		commitAuthor: "Alice",
 		commitDate: "2026-03-30T10:00:00Z",
-		branch: "feature/jolli-100-login",
+		branch: "feature/proj-100-login",
 		generatedAt: "2026-03-30T10:05:00Z",
 		...overrides,
 	};
@@ -146,7 +146,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				expect(md).toContain("# Fix login timeout");
 				expect(md).toContain("- **Commit:** `abc1234567890def`");
-				expect(md).toContain("- **Branch:** `feature/jolli-100-login`");
+				expect(md).toContain("- **Branch:** `feature/proj-100-login`");
 				expect(md).toContain("- **Author:** Alice");
 				expect(md).toContain("- **Date:** March 30, 2026 at 10:00 AM");
 				expect(md).toContain("- **Duration:** 1 day (1 commit)");

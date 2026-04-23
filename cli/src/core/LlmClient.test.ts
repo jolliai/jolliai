@@ -186,6 +186,20 @@ describe("LlmClient", () => {
 			vi.unstubAllGlobals();
 		});
 
+		it("throws when proxy mode loses jolliApiKey before the inner proxy call", async () => {
+			let reads = 0;
+			const options = {
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				get jolliApiKey() {
+					reads += 1;
+					return reads === 1 ? "sk-jol-test.secret" : undefined;
+				},
+			} as unknown as Parameters<typeof callLlm>[0];
+
+			await expect(callLlm(options)).rejects.toThrow("Proxy mode requires jolliApiKey");
+		});
+
 		it("posts to the backend when jolliApiKey is provided", async () => {
 			const result = await callLlm({
 				action: "commit-message",
@@ -264,6 +278,22 @@ describe("LlmClient", () => {
 			const fetchCall = fetchSpy.mock.calls[0] as [string, RequestInit];
 			const body = JSON.parse(fetchCall[1].body as string) as Record<string, unknown>;
 			expect(body.version).toBe(2);
+		});
+
+		it("defaults missing proxy token counts to zero", async () => {
+			fetchSpy.mockResolvedValueOnce({
+				ok: true,
+				json: vi.fn().mockResolvedValue({ text: "proxy result" }),
+			});
+
+			const result = await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				jolliApiKey: "sk-jol-test.secret",
+			});
+
+			expect(result.inputTokens).toBe(0);
+			expect(result.outputTokens).toBe(0);
 		});
 
 		it("omits tenant and org headers when metadata is absent", async () => {

@@ -35,9 +35,6 @@ const CONFIG_FILE = "config.json";
 const LOCK_FILE = "lock";
 const PLANS_FILE = "plans.json";
 
-/** Global Jolli Memory config directory at ~/.jolli/jollimemory */
-const GLOBAL_JOLLIMEMORY_DIR = join(homedir(), ".jolli", "jollimemory");
-
 /** Sessions older than 48 hours are considered stale and pruned automatically */
 const SESSION_STALE_MS = 48 * 60 * 60 * 1000;
 
@@ -166,6 +163,9 @@ export function filterSessionsByEnabledIntegrations(
 	if (config.geminiEnabled === false) {
 		filtered = filtered.filter((s) => s.source !== "gemini");
 	}
+	if (config.openCodeEnabled === false) {
+		filtered = filtered.filter((s) => s.source !== "opencode");
+	}
 	return filtered;
 }
 
@@ -204,7 +204,7 @@ export async function loadCursorForTranscript(transcriptPath: string, cwd?: stri
  * Returns the global Jolli Memory config directory (~/.jolli/jollimemory).
  */
 export function getGlobalConfigDir(): string {
-	return GLOBAL_JOLLIMEMORY_DIR;
+	return join(homedir(), ".jolli", "jollimemory");
 }
 
 /**
@@ -248,7 +248,7 @@ export async function saveConfigScoped(update: Partial<JolliMemoryConfig>, targe
  * Returns empty config when no file exists.
  */
 export async function loadConfig(): Promise<JolliMemoryConfig> {
-	return loadConfigFromDir(GLOBAL_JOLLIMEMORY_DIR);
+	return loadConfigFromDir(getGlobalConfigDir());
 }
 
 /**
@@ -259,7 +259,7 @@ export async function loadConfig(): Promise<JolliMemoryConfig> {
  * @param update - Partial config fields to save
  */
 export async function saveConfig(update: Partial<JolliMemoryConfig>): Promise<void> {
-	return saveConfigScoped(update, GLOBAL_JOLLIMEMORY_DIR);
+	return saveConfigScoped(update, getGlobalConfigDir());
 }
 
 /**
@@ -858,10 +858,11 @@ export async function associateNoteWithCommit(noteId: string, commitHash: string
 		log.debug("associateNoteWithCommit: id %s not in registry, skipping", noteId);
 		return;
 	}
+	const notes = registry.notes as NonNullable<PlansRegistry["notes"]>;
 	const updated: PlansRegistry = {
 		...registry,
 		notes: {
-			...(registry.notes ?? {}),
+			...notes,
 			[noteId]: { ...entry, commitHash, updatedAt: new Date().toISOString() },
 		},
 	};

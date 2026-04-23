@@ -311,6 +311,55 @@ describe("compileTaskContext", () => {
 		expect(ctx.plans).toHaveLength(1);
 		expect(ctx.plans[0].title).toBe("OAuth Strategy v2");
 	});
+
+	it("should deduplicate notes that appear in multiple summaries", async () => {
+		const sharedNoteRef = {
+			id: "note-abc-1234abcd",
+			title: "Shared Note",
+			format: "snippet" as const,
+			content: "Note content here",
+			addedAt: "2026-03-28T10:00:00.000Z",
+			updatedAt: "2026-03-28T10:00:00.000Z",
+		};
+		const summaryWithNote1 = makeSummary({
+			commitHash: "aaa11111",
+			commitDate: "2026-03-28T10:00:00.000Z",
+			notes: [sharedNoteRef],
+		});
+		const summaryWithNote2 = makeSummary({
+			commitHash: "bbb22222",
+			commitDate: "2026-03-29T10:00:00.000Z",
+			notes: [sharedNoteRef],
+		});
+
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "aaa11111",
+					parentCommitHash: null,
+					commitMessage: "c1",
+					commitDate: "2026-03-28T10:00:00.000Z",
+					branch: "feature/test",
+					generatedAt: "2026-03-28T10:01:00.000Z",
+				},
+				{
+					commitHash: "bbb22222",
+					parentCommitHash: null,
+					commitMessage: "c2",
+					commitDate: "2026-03-29T10:00:00.000Z",
+					branch: "feature/test",
+					generatedAt: "2026-03-29T10:01:00.000Z",
+				},
+			]),
+		);
+		mockGetSummary.mockResolvedValueOnce(summaryWithNote1).mockResolvedValueOnce(summaryWithNote2);
+
+		const ctx = await compileTaskContext({ branch: "feature/test", includeNotes: true }, "/test");
+		// The same note ID appears in both summaries, so it should be deduplicated to 1
+		expect(ctx.notes).toHaveLength(1);
+		expect(ctx.notes[0].id).toBe("note-abc-1234abcd");
+		expect(ctx.notes[0].content).toBe("Note content here");
+	});
 });
 
 // ─── renderContextMarkdown ───────────────────────────────────────────────────

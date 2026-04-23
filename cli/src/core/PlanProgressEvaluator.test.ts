@@ -137,6 +137,29 @@ describe("evaluatePlanProgress", () => {
 				stopReason: "end_turn",
 			});
 		});
+
+		it("falls back to resolveModelId with default 'haiku' when both llm and config models are missing", async () => {
+			// llmResult.model undefined + config.model undefined
+			// covers: llmResult.model ?? X (right side) AND config.model ?? "haiku" (right side)
+			// AND llmResult.stopReason ?? null (right side)
+			mockCallLlm.mockResolvedValueOnce(llmResult(validResponse(), { model: undefined, stopReason: undefined }));
+
+			const result = await evaluatePlanProgress(planMarkdown, diff, [], conversation, config);
+
+			expect(result?.llm.model).toMatch(/haiku/);
+			expect(result?.llm.stopReason).toBeNull();
+		});
+
+		it("falls back to resolveModelId with explicit config.model when llm model missing", async () => {
+			// llmResult.model undefined + config.model = "sonnet"
+			// covers: llmResult.model ?? X (right side) AND config.model ?? "haiku" (left side)
+			mockCallLlm.mockResolvedValueOnce(llmResult(validResponse(), { model: undefined }));
+
+			const configWithModel: JolliMemoryConfig = { apiKey: "sk-ant-test", model: "sonnet" };
+			const result = await evaluatePlanProgress(planMarkdown, diff, [], conversation, configWithModel);
+
+			expect(result?.llm.model).toMatch(/sonnet/);
+		});
 	});
 
 	describe("code-fence stripping", () => {

@@ -320,6 +320,83 @@ describe("SummaryStore", () => {
 			expect(result?.commitMessage).toBe("Child commit");
 		});
 
+		it("should find a grandchild node via recursive tree search", async () => {
+			const grandchild = createMockSummary("grandchild1", "Grandchild commit");
+			const child: CommitSummary = {
+				...createMockSummary("child111", "Child commit"),
+				children: [grandchild],
+			};
+			const parent: CommitSummary = {
+				...createMockSummary("parent222", "Parent commit"),
+				children: [child],
+			};
+			const index = v3Index([
+				rootEntry("parent222"),
+				{
+					commitHash: "child111",
+					parentCommitHash: "parent222",
+					commitMessage: "Child commit",
+					commitDate: "2026-02-19T10:00:00Z",
+					branch: "main",
+					generatedAt: "2026-02-19T10:00:05Z",
+				},
+				{
+					commitHash: "grandchild1",
+					parentCommitHash: "child111",
+					commitMessage: "Grandchild commit",
+					commitDate: "2026-02-19T11:00:00Z",
+					branch: "main",
+					generatedAt: "2026-02-19T11:00:05Z",
+				},
+			]);
+
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(JSON.stringify(index))
+				.mockResolvedValueOnce(JSON.stringify(parent));
+
+			const result = await getSummary("grandchild1");
+			expect(result?.commitHash).toBe("grandchild1");
+			expect(result?.commitMessage).toBe("Grandchild commit");
+		});
+
+		it("should find a child node in the second branch of a multi-child tree", async () => {
+			const childA = createMockSummary("childA000", "Child A (no match)");
+			const childB = createMockSummary("childB000", "Child B (target)");
+			const parent: CommitSummary = {
+				...createMockSummary("parent222", "Parent commit"),
+				children: [childA, childB],
+			};
+			const index = v3Index([
+				rootEntry("parent222"),
+				{
+					commitHash: "childA000",
+					parentCommitHash: "parent222",
+					commitMessage: "Child A",
+					commitDate: "2026-02-19T10:00:00Z",
+					branch: "main",
+					generatedAt: "2026-02-19T10:00:05Z",
+				},
+				{
+					commitHash: "childB000",
+					parentCommitHash: "parent222",
+					commitMessage: "Child B",
+					commitDate: "2026-02-19T11:00:00Z",
+					branch: "main",
+					generatedAt: "2026-02-19T11:00:05Z",
+				},
+			]);
+
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(JSON.stringify(index))
+				.mockResolvedValueOnce(JSON.stringify(parent));
+
+			// Looking up childB means findNodeInTree tries childA first (returns null),
+			// then finds childB on the second iteration
+			const result = await getSummary("childB000");
+			expect(result?.commitHash).toBe("childB000");
+			expect(result?.commitMessage).toBe("Child B (target)");
+		});
+
 		it("should return summary via commitAliases when direct lookup fails", async () => {
 			const summary = createMockSummary("knownhash00");
 			const index = v3Index([rootEntry("knownhash00")], { unknownhash0: "knownhash00" });
@@ -456,6 +533,33 @@ describe("SummaryStore", () => {
 	});
 
 	describe("listSummaries", () => {
+		it("should skip entries whose summary files are missing (getSummary returns null)", async () => {
+			const index = v3Index([
+				rootEntry("hash1", "First", "2026-02-18T10:00:00Z"),
+				rootEntry("hash2", "Second (missing file)", "2026-02-19T10:00:00Z"),
+				rootEntry("hash3", "Third", "2026-02-20T10:00:00Z"),
+			]);
+
+			vi.mocked(readFileFromBranch)
+				// listSummaries → loadIndex
+				.mockResolvedValueOnce(JSON.stringify(index))
+				// getSummary("hash3") → loadIndex + readSummaryFile (newest first)
+				.mockResolvedValueOnce(JSON.stringify(index))
+				.mockResolvedValueOnce(JSON.stringify(createMockSummary("hash3", "Third")))
+				// getSummary("hash2") → loadIndex + readSummaryFile returns null (missing)
+				.mockResolvedValueOnce(JSON.stringify(index))
+				.mockResolvedValueOnce(null)
+				// getSummary("hash1") → loadIndex + readSummaryFile
+				.mockResolvedValueOnce(JSON.stringify(index))
+				.mockResolvedValueOnce(JSON.stringify(createMockSummary("hash1", "First")));
+
+			const summaries = await listSummaries(10);
+			// hash2 is skipped because its summary file is missing
+			expect(summaries).toHaveLength(2);
+			expect(summaries[0].commitHash).toBe("hash3");
+			expect(summaries[1].commitHash).toBe("hash1");
+		});
+
 		it("should return summaries in reverse chronological order (root-only)", async () => {
 			const index = v3Index([
 				rootEntry("hash1", "First", "2026-02-18T10:00:00Z"),
@@ -1329,6 +1433,62 @@ describe("SummaryStore", () => {
 			const merged = JSON.parse(files[0].content) as CommitSummary;
 			expect(merged.orphanedDocIds).toBeUndefined();
 		});
+
+		it("should keep the existing note when a duplicate appears with an older updatedAt", async () => {
+			// Covers both `!existing` false branches AND `note.updatedAt > existing.updatedAt`
+			// false branch in collectChildNotes (lines 281, 289). Three axes:
+			// (a) two top-level nodes with the same note id → line 281's existing+older path
+			// (b) nested child with older duplicate of top-level id → line 289's existing+older path
+			const old1: CommitSummary = {
+				...createMockSummary("old1", "Old 1"),
+				notes: [
+					{
+						id: "dupe",
+						title: "Newer",
+						format: "snippet",
+						content: "new",
+						addedAt: "2026-02-18T00:00:00Z",
+						updatedAt: "2026-02-25T00:00:00Z",
+					},
+				],
+				children: [
+					{
+						...createMockSummary("nested", "Nested"),
+						notes: [
+							{
+								id: "dupe",
+								title: "Nested Older",
+								format: "snippet",
+								content: "nested",
+								addedAt: "2026-02-18T00:00:00Z",
+								updatedAt: "2026-02-22T00:00:00Z",
+							},
+						],
+					},
+				],
+			};
+			const old2: CommitSummary = {
+				...createMockSummary("old2", "Old 2"),
+				notes: [
+					{
+						id: "dupe",
+						title: "Older",
+						format: "snippet",
+						content: "old",
+						addedAt: "2026-02-18T00:00:00Z",
+						updatedAt: "2026-02-20T00:00:00Z",
+					},
+				],
+			};
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.notes).toHaveLength(1);
+			expect(merged.notes?.[0].title).toBe("Newer");
+		});
 	});
 
 	describe("removeFromIndex", () => {
@@ -1591,6 +1751,16 @@ describe("SummaryStore", () => {
 			const index = v3Index([{ ...rootEntry("root1", "Root"), treeHash: "tree-1" }]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce(null);
+
+			await expect(scanTreeHashAliases(["unknown1"])).resolves.toBe(false);
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("should skip a hash when getTreeHash returns a tree hash that matches no entry", async () => {
+			const index = v3Index([{ ...rootEntry("root1", "Root"), treeHash: "tree-1" }]);
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
+			// getTreeHash returns a valid tree hash, but it matches no entry in the index
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-no-match");
 
 			await expect(scanTreeHashAliases(["unknown1"])).resolves.toBe(false);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
