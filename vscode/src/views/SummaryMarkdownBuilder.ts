@@ -1,8 +1,14 @@
 /**
  * SummaryMarkdownBuilder
  *
- * Re-exports the markdown builder from the core jollimemory package.
- * The implementation lives in cli/src/core/SummaryMarkdownBuilder.ts.
+ * Builds the full clipboard-export Markdown from a `CommitSummary`. Output
+ * is portable markdown (no GitHub-flavored HTML) so it renders correctly
+ * in the clipboard, Jolli doc pages, and any CommonMark renderer.
+ *
+ * GitHub PR description output (with <details>/<summary>/<blockquote>
+ * folding) lives in `SummaryPrMarkdownBuilder.ts` via `buildPrMarkdown`.
+ * That file imports `pushPlansAndNotesSection` and `pushFooter` from here,
+ * which is why those helpers are exported.
  */
 
 import {
@@ -13,7 +19,6 @@ import {
 import type { CommitSummary, E2eTestScenario } from "../../../cli/src/Types.js";
 import {
 	collectSortedTopics,
-	escHtml,
 	formatDate,
 	formatFullDate,
 	getDisplayDate,
@@ -50,34 +55,6 @@ export function buildMarkdown(summary: CommitSummary): string {
 	return lines.join("\n");
 }
 
-/**
- * Builds a simplified Markdown string optimized for GitHub PR descriptions.
- *
- * Only includes information not already visible on the PR page:
- * - Jolli Memory URL (if pushed)
- * - Associated Plans with URLs
- * - E2E Test Guide
- * - Summaries: Why (trigger) -> Decisions -> What (response)
- * - Footer
- */
-export function buildPrMarkdown(summary: CommitSummary): string {
-	const { topics: allTopics, showRecordDates } = collectSortedTopics(summary);
-	const lines: Array<string> = [];
-
-	// Jolli Memory URL
-	const memoryDocUrl = summary.jolliDocUrl;
-	if (memoryDocUrl) {
-		lines.push("", `## Jolli Memory`, "", `${memoryDocUrl}`);
-	}
-
-	pushPlansAndNotesSection(lines, summary);
-	pushE2eTestSection(lines, summary.e2eTestGuide, true);
-	pushPrTopicsSection(lines, allTopics, showRecordDates);
-	pushFooter(lines);
-
-	return lines.join("\n");
-}
-
 // ── Shared section helpers ──────────────────────────────────────────────────
 
 /** Appends the commit properties header (H1, metadata list, separator). */
@@ -89,7 +66,7 @@ function pushPropertiesSection(
 	const totalFiles = aggStats.filesChanged;
 	const totalTurns = aggregateTurns(summary);
 
-	const filesLabel = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, +${aggStats.insertions} insertions, \u2212${aggStats.deletions} deletions`;
+	const filesLabel = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, +${aggStats.insertions} insertions, −${aggStats.deletions} deletions`;
 	const dateLabel = formatFullDate(getDisplayDate(summary));
 
 	lines.push(
@@ -117,8 +94,13 @@ function pushPropertiesSection(
 	lines.push("", "---");
 }
 
-/** Appends a combined Plans & Notes section — title + URL for each item. */
-function pushPlansAndNotesSection(
+/**
+ * Appends a combined Plans & Notes section — title + URL for each item.
+ *
+ * Exported because `SummaryPrMarkdownBuilder.buildPrMarkdown` also calls it —
+ * plans/notes rendering is identical between clipboard and PR output.
+ */
+export function pushPlansAndNotesSection(
 	lines: Array<string>,
 	summary: CommitSummary,
 ): void {
@@ -143,18 +125,15 @@ function pushPlansAndNotesSection(
 }
 
 /**
- * Appends the E2E test guide section.
+ * Appends the E2E test guide section for clipboard export. Emits plain
+ * markdown H3 headings per scenario.
  *
- * Shared between clipboard and PR markdown. When `foldScenarios` is true
- * (PR path), each scenario is wrapped in a GitHub <details>/<summary> block
- * and user-provided fields are sanitized against <details>/<summary> tag
- * injection. Default behavior (foldScenarios=false) emits plain markdown
- * headings unchanged for clipboard export.
+ * The PR variant lives in `SummaryPrMarkdownBuilder.pushPrE2eTestSection`
+ * and wraps each scenario in a `<details>` block with sanitization.
  */
 function pushE2eTestSection(
 	lines: Array<string>,
 	e2eTestGuide: ReadonlyArray<E2eTestScenario> | undefined,
-	foldScenarios = false,
 ): void {
 	if (!e2eTestGuide || e2eTestGuide.length === 0) {
 		return;
@@ -162,37 +141,17 @@ function pushE2eTestSection(
 	lines.push("", `## E2E Test (${e2eTestGuide.length})`);
 	for (let i = 0; i < e2eTestGuide.length; i++) {
 		const s = e2eTestGuide[i];
-		if (foldScenarios) {
-			const summaryContent = `<strong>${i + 1}. ${escHtml(s.title)}</strong>`;
-			const bodyOnly: Array<string> = [];
-			if (s.preconditions) {
-				bodyOnly.push(
-					"",
-					`**Preconditions:** ${escapeGithubWrapperTags(s.preconditions)}`,
-				);
-			}
-			bodyOnly.push("", "**Steps:**");
-			for (let j = 0; j < s.steps.length; j++) {
-				bodyOnly.push(`${j + 1}. ${escapeGithubWrapperTags(s.steps[j])}`);
-			}
-			bodyOnly.push("", "**Expected Results:**");
-			for (const r of s.expectedResults) {
-				bodyOnly.push(`- ${escapeGithubWrapperTags(r)}`);
-			}
-			lines.push(...wrapInGithubDetails(summaryContent, bodyOnly));
-		} else {
-			lines.push("", `### ${i + 1}. ${s.title}`);
-			if (s.preconditions) {
-				lines.push("", `**Preconditions:** ${s.preconditions}`);
-			}
-			lines.push("", "**Steps:**");
-			for (let j = 0; j < s.steps.length; j++) {
-				lines.push(`${j + 1}. ${s.steps[j]}`);
-			}
-			lines.push("", "**Expected Results:**");
-			for (const r of s.expectedResults) {
-				lines.push(`- ${r}`);
-			}
+		lines.push("", `### ${i + 1}. ${s.title}`);
+		if (s.preconditions) {
+			lines.push("", `**Preconditions:** ${s.preconditions}`);
+		}
+		lines.push("", "**Steps:**");
+		for (let j = 0; j < s.steps.length; j++) {
+			lines.push(`${j + 1}. ${s.steps[j]}`);
+		}
+		lines.push("", "**Expected Results:**");
+		for (const r of s.expectedResults) {
+			lines.push(`- ${r}`);
 		}
 	}
 	lines.push("", "---");
@@ -214,7 +173,7 @@ function pushSourceCommitsSection(
 			? ` · ${node.conversationTurns} turns`
 			: "";
 		lines.push(
-			`- \`${node.commitHash.substring(0, 8)}\` ${node.commitMessage}  _(+${ins} \u2212${del}${turnsMd} · ${formatDate(getDisplayDate(node))})_`,
+			`- \`${node.commitHash.substring(0, 8)}\` ${node.commitMessage}  _(+${ins} −${del}${turnsMd} · ${formatDate(getDisplayDate(node))})_`,
 		);
 	}
 	lines.push("", "---");
@@ -248,7 +207,7 @@ function pushTopicsSection(
 	}
 	lines.push(
 		"",
-		`## ${allTopics.length === 1 ? "Summary" : "Summaries"} (${allTopics.length})`,
+		`## ${allTopics.length === 1 ? "Topic" : "Topics"} (${allTopics.length})`,
 	);
 	if (showRecordDates) {
 		let globalIdx = 0;
@@ -272,199 +231,13 @@ function pushTopicsSection(
 	}
 }
 
-// ── GitHub PR path (uses GitHub-flavored HTML, not portable) ─────────────
-// Helpers below emit <details>/<summary> HTML that only GitHub renders.
-// Do NOT reuse from clipboard export (buildMarkdown) or Jolli doc paths —
-// other markdown renderers will show raw tags or break rendering.
-
 /**
- * Wraps a block of lines with <details>/<summary> for GitHub PR folding.
+ * Appends the standard "Generated by Jolli Memory" footer.
  *
- * `summaryContent` is emitted inline inside `<summary>...</summary>` (no
- * blank lines around it) — markdown headings inside summary are avoided to
- * prevent GitHub's heading CSS (24px top + 16px bottom margin) from bloating
- * every collapsed row. Callers typically pass `<strong>NN · Title</strong>`
- * for a tight bold label.
- *
- * A `<br>` is inserted after `</summary>` so that when the block is expanded,
- * the inline summary label and the first body paragraph don't collide
- * visually — `<p>` has `margin-top: 0` under GitHub's CSS, which otherwise
- * makes the expanded content feel glued to the label.
- *
- * Body is wrapped in `<blockquote>...</blockquote>` so the expanded content
- * gets GitHub's blockquote styling (left border + indent + slightly dimmed
- * text). This gives each expanded topic a clear visual container that
- * distinguishes it from the summary label. GFM parses markdown inside the
- * blockquote when blank lines flank the HTML tags (type-6 HTML block rule).
- *
- * `bodyLines` is expected to begin with "" so that the blank line between
- * `<blockquote>` and the first body block is preserved (needed by GFM to
- * switch from HTML mode to markdown parsing inside the blockquote).
+ * Exported because `SummaryPrMarkdownBuilder.buildPrMarkdown` also calls it —
+ * footer content is identical between clipboard and PR output.
  */
-function wrapInGithubDetails(
-	summaryContent: string,
-	bodyLines: Array<string>,
-): Array<string> {
-	return [
-		"<details>",
-		`<summary>${summaryContent}</summary>`,
-		"<br>",
-		"<blockquote>",
-		...bodyLines,
-		"",
-		"</blockquote>",
-		"</details>",
-	];
-}
-
-/**
- * Escapes the block-level HTML tags used by `wrapInGithubDetails` so that
- * Claude-generated body content cannot prematurely close our outer wrappers.
- *
- * Two wrapper boundaries need protection:
- * - `<details>` / `</details>` — the outer collapsible block
- * - `<blockquote>` / `</blockquote>` — the inner visual container for body
- *
- * Both opening (including attribute variants like `<details open>`) and
- * closing tags are escaped to `&lt;...&gt;`. Other HTML tags (`<summary>`,
- * `<code>`, `<br>`, `<img>`, etc.) and markdown formatting are preserved.
- *
- * NOTE: Only applied to generated content inside buildPrMarkdown. User-edited
- * textarea content is NOT re-sanitized on submit (by design).
- */
-function escapeGithubWrapperTags(text: string): string {
-	return text
-		.replace(/<details\b[^>]*>/gi, (m) => `&lt;${m.slice(1, -1)}&gt;`)
-		.replace(/<\/details\s*>/gi, "&lt;/details&gt;")
-		.replace(/<blockquote\b[^>]*>/gi, (m) => `&lt;${m.slice(1, -1)}&gt;`)
-		.replace(/<\/blockquote\s*>/gi, "&lt;/blockquote&gt;");
-}
-
-/** Appends simplified topic body for PR: trigger, decisions, response (no todo/files). */
-function pushPrTopicBody(out: Array<string>, t: TopicWithDate): void {
-	out.push(
-		"",
-		`**⚡ Why This Change**`,
-		"",
-		escapeGithubWrapperTags(t.trigger),
-	);
-	out.push(
-		"",
-		`**💡 Decisions Behind the Code**`,
-		"",
-		escapeGithubWrapperTags(t.decisions),
-	);
-	out.push(
-		"",
-		`**✅ What Was Implemented**`,
-		"",
-		escapeGithubWrapperTags(t.response),
-	);
-}
-
-/**
- * Appends the PR summaries section with GitHub body-size truncation.
- * Uses simplified topic body (no todo/files) and stops adding topics
- * once the PR body would exceed the GitHub character limit.
- */
-function pushPrTopicsSection(
-	lines: Array<string>,
-	allTopics: Array<TopicWithDate>,
-	showRecordDates: boolean,
-): void {
-	if (allTopics.length === 0) {
-		return;
-	}
-
-	// GitHub PR body limit is 65536 chars. Reserve space for footer + markers (~200 chars).
-	const PR_BODY_LIMIT = 65000;
-
-	lines.push(
-		"",
-		`## ${allTopics.length === 1 ? "Summary" : "Summaries"} (${allTopics.length})`,
-	);
-	let includedCount = 0;
-	const currentLength = () => lines.join("\n").length;
-
-	if (showRecordDates) {
-		includedCount = pushPrTopicsGroupedByDate(
-			lines,
-			allTopics,
-			currentLength,
-			PR_BODY_LIMIT,
-		);
-	} else {
-		for (let i = 0; i < allTopics.length; i++) {
-			const summaryContent = `<strong>${padIndex(i)} · ${escHtml(allTopics[i].title)}</strong>`;
-			const bodyOnly: Array<string> = [];
-			pushPrTopicBody(bodyOnly, allTopics[i]);
-			const topicLines = wrapInGithubDetails(summaryContent, bodyOnly);
-			if (currentLength() + topicLines.join("\n").length > PR_BODY_LIMIT) {
-				break;
-			}
-			lines.push(...topicLines);
-			includedCount++;
-		}
-	}
-
-	const omitted = allTopics.length - includedCount;
-	if (omitted > 0) {
-		lines.push(
-			"",
-			`> ⚠️ ${omitted} more summar${omitted !== 1 ? "ies" : "y"} omitted due to GitHub PR body size limit.`,
-		);
-	}
-}
-
-/**
- * Appends date-grouped PR topics with truncation. Returns the number of
- * included topics.
- *
- * Group header `### <date>` is written **atomically** with the first topic
- * of its group — if the first topic doesn't fit, the group header is also
- * skipped, avoiding an orphan date header with no content.
- */
-function pushPrTopicsGroupedByDate(
-	lines: Array<string>,
-	allTopics: Array<TopicWithDate>,
-	currentLength: () => number,
-	limit: number,
-): number {
-	let globalIdx = 0;
-	let includedCount = 0;
-	let truncated = false;
-
-	for (const [, groupTopics] of groupTopicsByDate(allTopics)) {
-		if (truncated) {
-			break;
-		}
-		const groupDate = formatDate(groupTopics[0].recordDate ?? "");
-		let groupHeaderPushed = false;
-		for (const t of groupTopics) {
-			const summaryContent = `<strong>${padIndex(globalIdx)} · ${escHtml(t.title)}</strong>`;
-			const bodyOnly: Array<string> = [];
-			pushPrTopicBody(bodyOnly, t);
-			const topicLines = wrapInGithubDetails(summaryContent, bodyOnly);
-			const pending = groupHeaderPushed
-				? topicLines
-				: ["", `### ${groupDate}`, ...topicLines];
-			if (currentLength() + pending.join("\n").length > limit) {
-				truncated = true;
-				break;
-			}
-			lines.push(...pending);
-			groupHeaderPushed = true;
-			includedCount++;
-			globalIdx++;
-		}
-	}
-	return includedCount;
-}
-
-// ── end GitHub PR path ───────────────────────────────────────────────────
-
-/** Appends the standard "Generated by Jolli Memory" footer. */
-function pushFooter(lines: Array<string>): void {
+export function pushFooter(lines: Array<string>): void {
 	const generatedAt = formatFullDate(new Date().toISOString());
 	lines.push("", "---", "", `*Generated by Jolli Memory · ${generatedAt}*`);
 }

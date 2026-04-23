@@ -301,6 +301,9 @@ const { mockBuildMarkdown, mockBuildPrMarkdown } = vi.hoisted(() => ({
 
 vi.mock("./SummaryMarkdownBuilder.js", () => ({
 	buildMarkdown: mockBuildMarkdown,
+}));
+
+vi.mock("./SummaryPrMarkdownBuilder.js", () => ({
 	buildPrMarkdown: mockBuildPrMarkdown,
 }));
 
