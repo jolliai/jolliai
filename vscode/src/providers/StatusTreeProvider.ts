@@ -219,6 +219,8 @@ function buildFullStatusItems(
 		items.push(accountItem);
 	}
 
+	// Integration status rows (Claude, Codex, Gemini, OpenCode)
+	const counts = s.sessionsBySource ?? {};
 	pushIntegrationItem(
 		items,
 		s.claudeDetected,
@@ -228,6 +230,7 @@ function buildFullStatusItems(
 		"Claude Code hooks installed (Stop, SessionStart) — session tracking is enabled",
 		"Claude Code detected but session tracking is disabled in config",
 		"Claude Code detected but hooks are not installed",
+		counts.claude,
 	);
 	pushIntegrationItem(
 		items,
@@ -238,6 +241,7 @@ function buildFullStatusItems(
 		"Codex CLI sessions directory found — session discovery is enabled",
 		"Codex CLI detected but session discovery is disabled in config",
 		undefined,
+		counts.codex,
 	);
 	pushIntegrationItem(
 		items,
@@ -248,7 +252,34 @@ function buildFullStatusItems(
 		"Gemini CLI AfterAgent hook installed — session tracking is enabled",
 		"Gemini CLI detected but session tracking is disabled in config",
 		"Gemini CLI detected but AfterAgent hook is not installed",
+		counts.gemini,
 	);
+	// OpenCode has a scan-time error channel that the other integrations don't:
+	// the DB can exist but be corrupt / locked / schema-drifted. Surface that as
+	// a dedicated warning row BEFORE the regular "detected & enabled" row so
+	// the failure state doesn't silently look like "0 sessions".
+	if (s.openCodeScanError) {
+		items.push(
+			new StatusItem(
+				"OpenCode Integration",
+				`unavailable — ${s.openCodeScanError.kind}`,
+				ICON_WARN,
+				`OpenCode database scan failed (${s.openCodeScanError.kind}): ${s.openCodeScanError.message}`,
+			),
+		);
+	} else {
+		pushIntegrationItem(
+			items,
+			s.openCodeDetected,
+			s.openCodeEnabled !== false,
+			undefined,
+			"OpenCode Integration",
+			"OpenCode sessions database found — session discovery is enabled",
+			"OpenCode detected but session discovery is disabled in config",
+			undefined,
+			counts.opencode,
+		);
+	}
 
 	if (extensionOutdated) {
 		items.push(
@@ -273,10 +304,23 @@ function pushIntegrationItem(
 	enabledTooltip: string,
 	disabledTooltip: string,
 	hookMissingTooltip: string | undefined,
+	sessionCount?: number,
 ): void {
 	if (!detected) {
 		return;
 	}
+
+	// Build session count suffix for enabled states
+	const countSuffix =
+		sessionCount && sessionCount > 0
+			? ` (${sessionCount} session${sessionCount !== 1 ? "s" : ""})`
+			: "";
+	const tooltipSuffix =
+		sessionCount && sessionCount > 0
+			? ` (${sessionCount} active session${sessionCount !== 1 ? "s" : ""})`
+			: "";
+
+	// Four states: disabled in config, enabled without a hook, enabled but hook missing, fully enabled with hook
 	if (!enabled) {
 		items.push(
 			new StatusItem(
@@ -288,7 +332,12 @@ function pushIntegrationItem(
 		);
 	} else if (hookInstalled === undefined && hookMissingTooltip === undefined) {
 		items.push(
-			new StatusItem(label, "detected & enabled", ICON_OK, enabledTooltip),
+			new StatusItem(
+				label,
+				`detected & enabled${countSuffix}`,
+				ICON_OK,
+				`${enabledTooltip}${tooltipSuffix}`,
+			),
 		);
 	} else if (hookInstalled === false && hookMissingTooltip) {
 		items.push(
@@ -301,7 +350,12 @@ function pushIntegrationItem(
 		);
 	} else {
 		items.push(
-			new StatusItem(label, "hook installed", ICON_OK, enabledTooltip),
+			new StatusItem(
+				label,
+				`hook installed${countSuffix}`,
+				ICON_OK,
+				`${enabledTooltip}${tooltipSuffix}`,
+			),
 		);
 	}
 }

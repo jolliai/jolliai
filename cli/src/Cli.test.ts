@@ -1,10 +1,14 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockExecFileSync, mockExistsSync, mockReadFileSync, mockCreateInterface } = vi.hoisted(() => ({
 	mockExecFileSync: vi.fn(),
 	mockExistsSync: vi.fn(),
 	mockReadFileSync: vi.fn(),
 	mockCreateInterface: vi.fn(),
+}));
+
+const { mockQuestion } = vi.hoisted(() => ({
+	mockQuestion: vi.fn((_q: string, cb: (a: string) => void) => cb("")),
 }));
 
 vi.mock("node:child_process", () => ({
@@ -88,6 +92,7 @@ vi.mock("./install/Installer.js", () => ({
 		mostRecentSession: null,
 		summaryCount: 0,
 		orphanBranch: "jollimemory/summaries/v3",
+		sessionsBySource: {},
 	}),
 }));
 
@@ -170,6 +175,7 @@ vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
 import { main } from "./Cli.js";
 import { compileTaskContext, listBranchCatalog, renderContextMarkdown } from "./core/ContextCompiler.js";
+import { loadConfigFromDir } from "./core/SessionTracker.js";
 import { exportSummaries } from "./core/SummaryExporter.js";
 import { hasMigrationMeta, migrateV1toV3 } from "./core/SummaryMigration.js";
 import { getIndex, getSummary, indexNeedsMigration, listSummaries, migrateIndexToV3 } from "./core/SummaryStore.js";
@@ -182,6 +188,10 @@ describe("CLI", () => {
 		mockExecFileSync.mockReturnValue("/mock/project\n");
 		// Default: dist-path does not exist (checkVersionMismatch is a no-op)
 		mockExistsSync.mockReturnValue(false);
+		mockCreateInterface.mockReturnValue({
+			question: mockQuestion,
+			close: vi.fn(),
+		});
 	});
 
 	describe("help output", () => {
@@ -281,6 +291,7 @@ describe("CLI", () => {
 				mostRecentSession: { sessionId: "sess-123", transcriptPath: "/path", updatedAt: "now" },
 				summaryCount: 5,
 				orphanBranch: "jollimemory/summaries/v3",
+				sessionsBySource: {},
 			});
 			await main(["status"]);
 			expect(getStatus).toHaveBeenCalled();
@@ -296,6 +307,7 @@ describe("CLI", () => {
 				mostRecentSession: { sessionId: "sess-123", transcriptPath: "/path", updatedAt: "now" },
 				summaryCount: 5,
 				orphanBranch: "jollimemory/summaries/v3",
+				sessionsBySource: {},
 			};
 			vi.mocked(getStatus).mockResolvedValueOnce(status);
 
@@ -313,6 +325,7 @@ describe("CLI", () => {
 				mostRecentSession: null,
 				summaryCount: 5,
 				orphanBranch: "jollimemory/summaries/v3",
+				sessionsBySource: {},
 				codexDetected: true,
 				geminiDetected: true,
 			});
@@ -340,6 +353,7 @@ describe("CLI", () => {
 				mostRecentSession: null,
 				summaryCount: 0,
 				orphanBranch: "jollimemory/summaries/v3",
+				sessionsBySource: {},
 			});
 
 			await main(["status"]);
@@ -357,6 +371,7 @@ describe("CLI", () => {
 				mostRecentSession: null,
 				summaryCount: 5,
 				orphanBranch: "jollimemory/summaries/v3",
+				sessionsBySource: {},
 				hookSource: "cli",
 				hookVersion: "1.0.0",
 			});
@@ -364,6 +379,137 @@ describe("CLI", () => {
 			await main(["status"]);
 			const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
 			expect(calls.some((s) => s.includes("Hook runtime:") && s.includes("cli@1.0.0"))).toBe(true);
+		});
+
+		describe("integration rows", () => {
+			it("renders rows for all four integrations when detected, with session counts", async () => {
+				vi.mocked(getStatus).mockResolvedValueOnce({
+					enabled: true,
+					claudeHookInstalled: true,
+					gitHookInstalled: true,
+					geminiHookInstalled: true,
+					activeSessions: 10,
+					mostRecentSession: null,
+					summaryCount: 0,
+					orphanBranch: "jollimemory/summaries/v3",
+					claudeDetected: true,
+					codexDetected: true,
+					geminiDetected: true,
+					openCodeDetected: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					openCodeEnabled: true,
+					sessionsBySource: { claude: 3, codex: 2, gemini: 4, opencode: 1 },
+				});
+				vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ claudeEnabled: true });
+
+				await main(["status"]);
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => s.includes("Claude:") && s.includes("hook installed (3 sessions)"))).toBe(
+					true,
+				);
+				expect(calls.some((s) => s.includes("Codex:") && s.includes("detected & enabled (2 sessions)"))).toBe(
+					true,
+				);
+				expect(calls.some((s) => s.includes("Gemini:") && s.includes("hook installed (4 sessions)"))).toBe(
+					true,
+				);
+				expect(calls.some((s) => s.includes("OpenCode:") && s.includes("detected & enabled (1 session)"))).toBe(
+					true,
+				);
+			});
+
+			it("renders 'detected but disabled' when an integration is turned off in config", async () => {
+				vi.mocked(getStatus).mockResolvedValueOnce({
+					enabled: true,
+					claudeHookInstalled: false,
+					gitHookInstalled: true,
+					geminiHookInstalled: false,
+					activeSessions: 0,
+					mostRecentSession: null,
+					summaryCount: 0,
+					orphanBranch: "jollimemory/summaries/v3",
+					claudeDetected: true,
+					codexDetected: true,
+					openCodeDetected: true,
+					codexEnabled: false,
+					openCodeEnabled: false,
+					sessionsBySource: {},
+				});
+				vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ claudeEnabled: false });
+
+				await main(["status"]);
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => s.includes("Claude:") && s.includes("detected but disabled"))).toBe(true);
+				expect(calls.some((s) => s.includes("Codex:") && s.includes("detected but disabled"))).toBe(true);
+				expect(calls.some((s) => s.includes("OpenCode:") && s.includes("detected but disabled"))).toBe(true);
+			});
+
+			it("renders 'hook not installed' for Gemini when detected+enabled but the AfterAgent hook is missing", async () => {
+				vi.mocked(getStatus).mockResolvedValueOnce({
+					enabled: true,
+					claudeHookInstalled: false,
+					gitHookInstalled: true,
+					geminiHookInstalled: false,
+					activeSessions: 0,
+					mostRecentSession: null,
+					summaryCount: 0,
+					orphanBranch: "jollimemory/summaries/v3",
+					geminiDetected: true,
+					geminiEnabled: true,
+					sessionsBySource: {},
+				});
+
+				await main(["status"]);
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => s.includes("Gemini:") && s.includes("hook not installed"))).toBe(true);
+			});
+
+			it("renders 'unavailable — <kind>' for OpenCode when openCodeScanError is present", async () => {
+				vi.mocked(getStatus).mockResolvedValueOnce({
+					enabled: true,
+					claudeHookInstalled: false,
+					gitHookInstalled: true,
+					geminiHookInstalled: false,
+					activeSessions: 0,
+					mostRecentSession: null,
+					summaryCount: 0,
+					orphanBranch: "jollimemory/summaries/v3",
+					openCodeDetected: true,
+					openCodeEnabled: true,
+					openCodeScanError: { kind: "corrupt", message: "database disk image is malformed" },
+					sessionsBySource: {},
+				});
+
+				await main(["status"]);
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => s.includes("OpenCode:") && s.includes("unavailable — corrupt"))).toBe(true);
+			});
+
+			it("does not print a row for an integration that was not detected", async () => {
+				vi.mocked(getStatus).mockResolvedValueOnce({
+					enabled: true,
+					claudeHookInstalled: false,
+					gitHookInstalled: true,
+					geminiHookInstalled: false,
+					activeSessions: 0,
+					mostRecentSession: null,
+					summaryCount: 0,
+					orphanBranch: "jollimemory/summaries/v3",
+					claudeDetected: false,
+					codexDetected: false,
+					geminiDetected: false,
+					openCodeDetected: false,
+					sessionsBySource: {},
+				});
+
+				await main(["status"]);
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => /^\s+Claude:/.test(s))).toBe(false);
+				expect(calls.some((s) => /^\s+Codex:/.test(s))).toBe(false);
+				expect(calls.some((s) => /^\s+Gemini:/.test(s))).toBe(false);
+				expect(calls.some((s) => /^\s+OpenCode:/.test(s))).toBe(false);
+			});
 		});
 	});
 
@@ -1232,6 +1378,55 @@ describe("CLI", () => {
 			await fs.unlink(outputPath);
 		});
 
+		it("should render entries without topicCount as 0 in markdown table", async () => {
+			// Regression: entries produced by older writers may omit topicCount.
+			// Covers the `e.topicCount ?? 0` fallback branch in buildMarkdownTable.
+			vi.mocked(getIndex).mockResolvedValueOnce({
+				version: 3,
+				entries: [
+					{
+						commitHash: "nocount1",
+						parentCommitHash: null,
+						commitMessage: "No topic count",
+						commitDate: "2026-04-15T10:00:00Z",
+						branch: "main",
+						generatedAt: "2026-04-15T10:00:05Z",
+						// topicCount intentionally omitted
+					},
+				],
+			});
+			const os = await import("node:os");
+			const outputPath = `${os.tmpdir()}/jolli-view-nocount.md`;
+			await main(["view", "--output", outputPath, "--format", "md"]);
+			const fs = await import("node:fs/promises");
+			const content = await fs.readFile(outputPath, "utf-8");
+			// Missing topicCount should render as "0"
+			expect(content).toMatch(/\| nocount1 \|.*\| 0 \|/);
+			await fs.unlink(outputPath);
+		});
+
+		it("should default --output format to markdown when --format is absent", async () => {
+			// Covers `options.format ?? "md"` fallback branch in the --commit + --output path.
+			vi.mocked(getSummary).mockResolvedValueOnce({
+				version: 3,
+				commitHash: "abc123def456",
+				commitMessage: "Default format",
+				commitAuthor: "John",
+				commitDate: "2026-04-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-04-15T10:00:05Z",
+				topics: [],
+			});
+			const os = await import("node:os");
+			const outputPath = `${os.tmpdir()}/jolli-view-default-fmt.md`;
+			await main(["view", "--commit", "abc123def456", "--output", outputPath]);
+			const fs = await import("node:fs/promises");
+			const content = await fs.readFile(outputPath, "utf-8");
+			// Markdown (not JSON): must have the H1 commit message heading.
+			expect(content).toContain("# Default format");
+			await fs.unlink(outputPath);
+		});
+
 		it("should escape pipe chars and newlines in commit messages for GFM table safety", async () => {
 			// Regression: commit subjects containing '|' (allowed by git) used to break table alignment.
 			vi.mocked(getIndex).mockResolvedValueOnce({
@@ -1476,9 +1671,11 @@ describe("CLI", () => {
 				stats: {
 					topicCount: 0,
 					planCount: 0,
+					noteCount: 0,
 					decisionCount: 0,
 					topicTokens: 0,
 					planTokens: 0,
+					noteTokens: 0,
 					decisionTokens: 0,
 					transcriptTokens: 0,
 					totalTokens: 0,
@@ -1521,9 +1718,11 @@ describe("CLI", () => {
 				stats: {
 					topicCount: 1,
 					planCount: 0,
+					noteCount: 0,
 					decisionCount: 0,
 					topicTokens: 50,
 					planTokens: 0,
+					noteTokens: 0,
 					decisionTokens: 0,
 					transcriptTokens: 0,
 					totalTokens: 50,
@@ -1568,9 +1767,11 @@ describe("CLI", () => {
 				stats: {
 					topicCount: 0,
 					planCount: 0,
+					noteCount: 0,
 					decisionCount: 0,
 					topicTokens: 0,
 					planTokens: 0,
+					noteTokens: 0,
 					decisionTokens: 0,
 					transcriptTokens: 0,
 					totalTokens: 0,
@@ -1708,9 +1909,11 @@ describe("CLI", () => {
 				stats: {
 					topicCount: 0,
 					planCount: 0,
+					noteCount: 0,
 					decisionCount: 0,
 					topicTokens: 0,
 					planTokens: 0,
+					noteTokens: 0,
 					decisionTokens: 0,
 					transcriptTokens: 0,
 					totalTokens: 0,
@@ -1752,9 +1955,11 @@ describe("CLI", () => {
 				stats: {
 					topicCount: 0,
 					planCount: 0,
+					noteCount: 0,
 					decisionCount: 0,
 					topicTokens: 0,
 					planTokens: 0,
+					noteTokens: 0,
 					decisionTokens: 0,
 					transcriptTokens: 0,
 					totalTokens: 0,
@@ -1802,9 +2007,11 @@ describe("CLI", () => {
 				stats: {
 					topicCount: 0,
 					planCount: 0,
+					noteCount: 0,
 					decisionCount: 0,
 					topicTokens: 0,
 					planTokens: 0,
+					noteTokens: 0,
 					decisionTokens: 0,
 					transcriptTokens: 0,
 					totalTokens: 0,
@@ -2150,6 +2357,24 @@ describe("CLI", () => {
 
 			await freshMain(["status"]);
 			expect(getStatus).toHaveBeenCalledWith(process.cwd());
+		});
+
+		it("should resolve recall projectDir from git root when --cwd is omitted", async () => {
+			await main(["recall", "--catalog"]);
+
+			expect(listBranchCatalog).toHaveBeenCalledWith("/mock/project");
+		});
+
+		it("should parse process.argv when args are omitted", async () => {
+			const originalArgv = process.argv;
+			process.argv = ["node", "jollimemory", "status"];
+
+			try {
+				await main();
+				expect(getStatus).toHaveBeenCalled();
+			} finally {
+				process.argv = originalArgv;
+			}
 		});
 	});
 
@@ -2686,6 +2911,22 @@ describe("CLI", () => {
 			expect(output).toContain("***");
 		});
 
+		it("should render array config values as comma-joined strings", async () => {
+			const { loadConfig } = await import("./core/SessionTracker.js");
+			// Use the cast through unknown so TS accepts an ad-hoc array-typed config entry.
+			vi.mocked(loadConfig).mockResolvedValueOnce({
+				excludePatterns: ["*.log", "dist/"],
+			} as unknown as Awaited<ReturnType<typeof loadConfig>>);
+
+			await main(["configure"]);
+
+			const output = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.join("\n");
+			expect(output).toContain("*.log, dist/");
+		});
+
 		it("should set a config value with --set key=value", async () => {
 			const { saveConfig } = await import("./core/SessionTracker.js");
 
@@ -2716,6 +2957,45 @@ describe("CLI", () => {
 			await main(["configure", "--set", "geminiEnabled=yes"]);
 
 			expect(saveConfig).toHaveBeenCalledWith(expect.objectContaining({ geminiEnabled: true }));
+		});
+
+		it("should accept openCodeEnabled=true/false", async () => {
+			const { saveConfig } = await import("./core/SessionTracker.js");
+
+			await main(["configure", "--set", "openCodeEnabled=false"]);
+			expect(saveConfig).toHaveBeenCalledWith(expect.objectContaining({ openCodeEnabled: false }));
+
+			vi.mocked(saveConfig).mockClear();
+			await main(["configure", "--set", "openCodeEnabled=true"]);
+			expect(saveConfig).toHaveBeenCalledWith(expect.objectContaining({ openCodeEnabled: true }));
+		});
+
+		it("should reject openCodeEnabled with a non-boolean value", async () => {
+			const { saveConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(saveConfig).mockClear();
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			try {
+				await main(["configure", "--set", "openCodeEnabled=maybe"]);
+				expect(saveConfig).not.toHaveBeenCalled();
+				expect(process.exitCode).toBe(1);
+				const errorOutput = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+				expect(errorOutput).toContain("openCodeEnabled");
+				expect(errorOutput).toContain("true/false");
+			} finally {
+				errorSpy.mockRestore();
+			}
+		});
+
+		it("--list-keys includes openCodeEnabled", async () => {
+			await main(["configure", "--list-keys"]);
+			const output = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.join("\n");
+			expect(output).toContain("openCodeEnabled");
+			// Description should mention the Node version requirement — this is
+			// the only config key that's runtime-gated and users deserve the hint.
+			expect(output).toContain("Node 22.5+");
 		});
 
 		it("should reject invalid --set format", async () => {
@@ -3693,6 +3973,20 @@ describe("CLI", () => {
 			expect(browserLogin).toHaveBeenCalledWith(expect.stringContaining("/login"));
 		});
 
+		it("should report Jolli API Key saved when login yields jolliApiKey", async () => {
+			const { browserLogin } = await import("./auth/Login.js");
+			const { loadConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(browserLogin).mockResolvedValueOnce(undefined);
+			// After a successful login, loadConfig sees the freshly-persisted jolliApiKey.
+			vi.mocked(loadConfig).mockResolvedValueOnce({ jolliApiKey: "jk_test" });
+
+			vi.mocked(console.log).mockClear();
+			await main(["auth", "login"]);
+
+			const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+			expect(calls.some((s) => s.includes("Jolli API Key:") && s.includes("saved"))).toBe(true);
+		});
+
 		it("should handle login failure gracefully", async () => {
 			const { browserLogin } = await import("./auth/Login.js");
 			vi.mocked(browserLogin).mockRejectedValueOnce(new Error("Connection refused"));
@@ -4228,6 +4522,180 @@ describe("CLI", () => {
 				vi.mocked(getGlobalConfigDir).mockReturnValue("/mock/global/config");
 				await fs.rm(tmpGlobalDir, { recursive: true, force: true });
 			}
+		});
+	});
+
+	describe("interactive enable flow", () => {
+		const origIsTTY = process.stdin.isTTY;
+
+		beforeEach(() => {
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		});
+
+		afterEach(() => {
+			Object.defineProperty(process.stdin, "isTTY", { value: origIsTTY, configurable: true });
+		});
+
+		it("should skip prompts for already-configured API keys", async () => {
+			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ jolliApiKey: "existing", apiKey: "existing" });
+
+			await main(["enable", "--cwd", "/tmp/test-project"]);
+
+			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("configured"));
+			expect(mockQuestion).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("enable command — additional branches", () => {
+		it("should print non-interactive config guide with --yes flag", async () => {
+			await main(["enable", "--yes", "--cwd", "/tmp/test-project"]);
+
+			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Configure API keys"));
+		});
+
+		it("should print gemini settings path when present", async () => {
+			vi.mocked(install).mockResolvedValueOnce({
+				success: true,
+				message: "OK",
+				warnings: [],
+				geminiSettingsPath: "/home/user/.gemini/settings.json",
+			});
+
+			await main(["enable", "--cwd", "/tmp/test-project"]);
+
+			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Gemini CLI hook"));
+		});
+
+		it("should print warnings on enable failure", async () => {
+			vi.mocked(install).mockResolvedValueOnce({
+				success: false,
+				message: "Cannot install",
+				warnings: ["Git hook conflict"],
+			});
+
+			await main(["enable", "--cwd", "/tmp/test-project"]);
+
+			expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("Git hook conflict"));
+			expect(process.exitCode).toBe(1);
+		});
+	});
+
+	describe("status command — additional branches", () => {
+		it("should omit version suffix when hookVersion is 'unknown'", async () => {
+			vi.mocked(getStatus).mockResolvedValueOnce({
+				enabled: true,
+				claudeHookInstalled: true,
+				gitHookInstalled: true,
+				geminiHookInstalled: false,
+				activeSessions: 0,
+				mostRecentSession: null,
+				summaryCount: 0,
+				orphanBranch: "jollimemory/summaries/v3",
+				sessionsBySource: {},
+				hookSource: "cli",
+				hookVersion: "unknown",
+			});
+
+			await main(["status"]);
+
+			const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+			expect(calls.some((s) => s.includes("Hook runtime:") && s.includes("cli") && !s.includes("@unknown"))).toBe(
+				true,
+			);
+		});
+
+		it("should show hook runtime without version when hookVersion is absent", async () => {
+			vi.mocked(getStatus).mockResolvedValueOnce({
+				enabled: true,
+				claudeHookInstalled: true,
+				gitHookInstalled: true,
+				geminiHookInstalled: false,
+				activeSessions: 0,
+				mostRecentSession: null,
+				summaryCount: 0,
+				orphanBranch: "jollimemory/summaries/v3",
+				sessionsBySource: {},
+				hookSource: "vscode-extension",
+			});
+
+			await main(["status"]);
+
+			const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+			expect(calls.some((s) => s.includes("Hook runtime:") && s.includes("vscode-extension"))).toBe(true);
+		});
+	});
+
+	describe("recall command — JSON format branches", () => {
+		it("should output JSON catalog with query when no exact match and format is json", async () => {
+			vi.mocked(listBranchCatalog).mockResolvedValueOnce({
+				type: "catalog",
+				branches: [
+					{
+						branch: "feature/other",
+						commitCount: 1,
+						period: { start: "2026-04-01", end: "2026-04-01" },
+						commitMessages: ["x"],
+					},
+				],
+			});
+
+			await main(["recall", "feature/nonexistent", "--format", "json", "--cwd", "/tmp/test"]);
+
+			const output = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.join("\n");
+			const parsed = JSON.parse(output);
+			expect(parsed.query).toBe("feature/nonexistent");
+			expect(parsed.branches).toHaveLength(1);
+		});
+
+		it("should output JSON error when catalog is empty and no branch detected", async () => {
+			mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+				const a = args as string[];
+				if (a.includes("--show-current")) throw new Error("detached HEAD");
+				if (a.includes("--show-toplevel")) return "/tmp/test\n";
+				return "";
+			});
+			vi.mocked(listBranchCatalog).mockResolvedValueOnce({ type: "catalog", branches: [] });
+
+			await main(["recall", "--format", "json", "--cwd", "/tmp/test"]);
+
+			const output = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.join("\n");
+			const parsed = JSON.parse(output);
+			expect(parsed.type).toBe("error");
+		});
+
+		it("should output JSON catalog when no branch detected and catalog is non-empty", async () => {
+			mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+				const a = args as string[];
+				if (a.includes("--show-current")) throw new Error("detached");
+				if (a.includes("--show-toplevel")) return "/tmp/test\n";
+				return "";
+			});
+			vi.mocked(listBranchCatalog).mockResolvedValueOnce({
+				type: "catalog",
+				branches: [
+					{
+						branch: "feature/old",
+						commitCount: 1,
+						period: { start: "2026-03-28", end: "2026-03-28" },
+						commitMessages: ["x"],
+					},
+				],
+			});
+
+			await main(["recall", "--format", "json", "--cwd", "/tmp/test"]);
+
+			const output = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.join("\n");
+			const parsed = JSON.parse(output);
+			expect(parsed.branches).toHaveLength(1);
 		});
 	});
 });

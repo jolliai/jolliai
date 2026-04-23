@@ -31,14 +31,11 @@ import type { PlanReference } from "../../../cli/src/Types.js";
 import type { PlanEntry, PlanInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
 
-/** Directory where Claude Code stores plan files */
-const PLANS_DIR = join(homedir(), ".claude", "plans");
-
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /** Returns the global plans directory path (~/.claude/plans/) */
 export function getPlansDir(): string {
-	return PLANS_DIR;
+	return join(homedir(), ".claude", "plans");
 }
 
 /**
@@ -109,7 +106,7 @@ function toPlanInfo(entry: PlanEntry): PlanInfo | null {
 
 	// Skip archive guards (source file unchanged)
 	if (entry.contentHashAtCommit) {
-		const planFile = join(PLANS_DIR, `${entry.slug}.md`);
+		const planFile = join(getPlansDir(), `${entry.slug}.md`);
 		if (
 			!existsSync(planFile) ||
 			hashFileContent(planFile) === entry.contentHashAtCommit
@@ -186,7 +183,7 @@ export async function addPlanToRegistry(
 	slug: string,
 	cwd: string,
 ): Promise<void> {
-	const planFile = join(PLANS_DIR, `${slug}.md`);
+	const planFile = join(getPlansDir(), `${slug}.md`);
 	if (!existsSync(planFile)) {
 		return;
 	}
@@ -291,11 +288,11 @@ export async function isPlanFromCurrentProject(
 export function listAvailablePlans(
 	excludeSlugs: ReadonlySet<string>,
 ): ReadonlyArray<{ slug: string; title: string; mtimeMs: number }> {
-	if (!existsSync(PLANS_DIR)) {
+	if (!existsSync(getPlansDir())) {
 		return [];
 	}
 
-	const files = readdirSync(PLANS_DIR).filter((f) => f.endsWith(".md"));
+	const files = readdirSync(getPlansDir()).filter((f) => f.endsWith(".md"));
 	const available: Array<{ slug: string; title: string; mtimeMs: number }> = [];
 
 	for (const file of files) {
@@ -303,7 +300,7 @@ export function listAvailablePlans(
 		if (excludeSlugs.has(slug)) {
 			continue;
 		}
-		const filePath = join(PLANS_DIR, file);
+		const filePath = join(getPlansDir(), file);
 		try {
 			const mtime = statSync(filePath).mtimeMs;
 			available.push({ slug, title: extractTitle(filePath), mtimeMs: mtime });
@@ -335,7 +332,7 @@ export async function archivePlanForCommit(
 	// If slug is not in the registry (e.g., picked from ~/.claude/plans/ directory but
 	// never auto-discovered from transcript), create a fresh entry first.
 	if (!entry) {
-		const planFile = join(PLANS_DIR, `${slug}.md`);
+		const planFile = join(getPlansDir(), `${slug}.md`);
 		if (!existsSync(planFile)) {
 			return null;
 		}
@@ -390,7 +387,7 @@ export async function archivePlanForCommit(
 	);
 
 	// Store plan file in orphan branch under new slug
-	const planFile = join(PLANS_DIR, `${slug}.md`);
+	const planFile = join(getPlansDir(), `${slug}.md`);
 	if (existsSync(planFile)) {
 		const content = fsReadFileSync(planFile, "utf-8");
 		await storePlans(

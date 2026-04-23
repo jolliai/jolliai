@@ -43,6 +43,28 @@ vi.mock("../core/GeminiSessionDetector.js", () => ({
 	isGeminiInstalled: vi.fn().mockResolvedValue(false),
 }));
 
+// Mock OpenCodeSessionDiscoverer for status/install checks
+vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
+	isOpenCodeInstalled: vi.fn().mockResolvedValue(false),
+	discoverOpenCodeSessions: vi.fn().mockResolvedValue([]),
+	scanOpenCodeSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+}));
+
+// Partially mock DistPathResolver so resolveDistPath doesn't depend on global npm state.
+// By default, resolveDistPath returns the caller's own dist dir with "cli" source.
+vi.mock("./DistPathResolver.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("./DistPathResolver.js")>();
+	return {
+		...original,
+		resolveDistPath: vi.fn().mockImplementation(async (_cwd, callerDistDir, callerSource) => ({
+			distDir: callerDistDir,
+			version: typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev",
+			source: callerSource ?? "cli",
+			candidates: [],
+		})),
+	};
+});
+
 // Override getGlobalConfigDir and loadConfig so tests don't read the
 // developer's real ~/.jolli/jollimemory/config.json. loadConfig uses an
 // internal constant, so we must override the function itself.
@@ -104,6 +126,16 @@ describe("Installer", () => {
 		originalCwd = process.cwd();
 		// Create .git/hooks directory to simulate a git repo
 		await mkdir(join(tempDir, ".git", "hooks"), { recursive: true });
+		// Reset integration detector mocks to defaults so state doesn't leak between tests
+		const { isCodexInstalled, discoverCodexSessions } = await import("../core/CodexSessionDiscoverer.js");
+		vi.mocked(isCodexInstalled).mockResolvedValue(false);
+		vi.mocked(discoverCodexSessions).mockResolvedValue([]);
+		const { isOpenCodeInstalled, discoverOpenCodeSessions, scanOpenCodeSessions } = await import(
+			"../core/OpenCodeSessionDiscoverer.js"
+		);
+		vi.mocked(isOpenCodeInstalled).mockResolvedValue(false);
+		vi.mocked(discoverOpenCodeSessions).mockResolvedValue([]);
+		vi.mocked(scanOpenCodeSessions).mockResolvedValue({ sessions: [] });
 	});
 
 	afterEach(async () => {
@@ -133,6 +165,66 @@ describe("Installer", () => {
 			expect(matcherGroup.hooks[0].command).toContain("run-hook");
 			expect(matcherGroup.hooks[0].command).toContain("stop");
 			expect(matcherGroup.hooks[0].async).toBe(true);
+		});
+
+		it("should auto-enable Codex discovery when Codex is detected and not configured", async () => {
+			const { isCodexInstalled } = await import("../core/CodexSessionDiscoverer.js");
+			vi.mocked(isCodexInstalled).mockResolvedValueOnce(true);
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.codexEnabled).toBe(true);
+		});
+
+		it("should keep codexEnabled unchanged when Codex is detected but already configured", async () => {
+			const { isCodexInstalled } = await import("../core/CodexSessionDiscoverer.js");
+			vi.mocked(isCodexInstalled).mockResolvedValueOnce(true);
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ codexEnabled: false }), "utf-8");
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.codexEnabled).toBe(false);
+		});
+
+		it("should auto-enable OpenCode discovery when OpenCode is detected and not configured", async () => {
+			const { isOpenCodeInstalled } = await import("../core/OpenCodeSessionDiscoverer.js");
+			vi.mocked(isOpenCodeInstalled).mockResolvedValueOnce(true);
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.openCodeEnabled).toBe(true);
+		});
+
+		it("should keep openCodeEnabled unchanged when OpenCode is detected but already configured", async () => {
+			const { isOpenCodeInstalled } = await import("../core/OpenCodeSessionDiscoverer.js");
+			vi.mocked(isOpenCodeInstalled).mockResolvedValueOnce(true);
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ openCodeEnabled: false }), "utf-8");
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.openCodeEnabled).toBe(false);
+		});
+
+		it("should not rewrite openCodeEnabled when OpenCode is detected and already true", async () => {
+			// Covers the `config.openCodeEnabled === undefined` false branch: detection succeeds
+			// (reaches the inner if) but the existing value is explicitly `true`, so no rewrite.
+			const { isOpenCodeInstalled } = await import("../core/OpenCodeSessionDiscoverer.js");
+			vi.mocked(isOpenCodeInstalled).mockResolvedValueOnce(true);
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ openCodeEnabled: true }), "utf-8");
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.openCodeEnabled).toBe(true);
 		});
 
 		it("should use process.cwd() when install is called without cwd", async () => {
@@ -1139,6 +1231,102 @@ describe("Installer", () => {
 			expect(status.activeSessions).toBe(0);
 			expect(status.mostRecentSession).toBeNull();
 		});
+
+		it("should include OpenCode sessions in activeSessions when openCodeEnabled", async () => {
+			const { isOpenCodeInstalled, scanOpenCodeSessions } = await import("../core/OpenCodeSessionDiscoverer.js");
+			vi.mocked(isOpenCodeInstalled).mockResolvedValue(true);
+			vi.mocked(scanOpenCodeSessions).mockResolvedValue({
+				sessions: [
+					{
+						sessionId: "oc1",
+						transcriptPath: "/oc1",
+						updatedAt: new Date().toISOString(),
+						source: "opencode",
+					},
+				],
+			});
+
+			const status = await getStatus(tempDir);
+			expect(status.activeSessions).toBe(1);
+			expect(status.mostRecentSession?.source).toBe("opencode");
+		});
+
+		it("should exclude OpenCode sessions when openCodeEnabled is false", async () => {
+			const { isOpenCodeInstalled, scanOpenCodeSessions } = await import("../core/OpenCodeSessionDiscoverer.js");
+			const { saveConfig } = await import("../core/SessionTracker.js");
+			vi.mocked(isOpenCodeInstalled).mockResolvedValue(true);
+			vi.mocked(scanOpenCodeSessions).mockResolvedValue({
+				sessions: [
+					{
+						sessionId: "oc1",
+						transcriptPath: "/oc1",
+						updatedAt: new Date().toISOString(),
+						source: "opencode",
+					},
+				],
+			});
+
+			const projectConfigDir = join(tempDir, ".jolli", "jollimemory");
+			await saveConfig({ openCodeEnabled: false }, undefined, projectConfigDir);
+			const status = await getStatus(tempDir);
+			expect(status.activeSessions).toBe(0);
+			expect(status.mostRecentSession).toBeNull();
+		});
+
+		it("should populate sessionsBySource with per-source counts", async () => {
+			const { isCodexInstalled, discoverCodexSessions } = await import("../core/CodexSessionDiscoverer.js");
+			const { isOpenCodeInstalled, scanOpenCodeSessions } = await import("../core/OpenCodeSessionDiscoverer.js");
+			const { saveSession } = await import("../core/SessionTracker.js");
+
+			// Set up Claude session via sessions.json
+			await saveSession(
+				{
+					sessionId: "claude1",
+					transcriptPath: "/claude1",
+					updatedAt: new Date().toISOString(),
+					source: "claude",
+				},
+				tempDir,
+			);
+
+			// Set up Codex discovery
+			vi.mocked(isCodexInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCodexSessions).mockResolvedValue([
+				{
+					sessionId: "codex1",
+					transcriptPath: "/codex1",
+					updatedAt: new Date().toISOString(),
+					source: "codex",
+				},
+				{
+					sessionId: "codex2",
+					transcriptPath: "/codex2",
+					updatedAt: new Date().toISOString(),
+					source: "codex",
+				},
+			]);
+
+			// Set up OpenCode discovery
+			vi.mocked(isOpenCodeInstalled).mockResolvedValue(true);
+			vi.mocked(scanOpenCodeSessions).mockResolvedValue({
+				sessions: [
+					{
+						sessionId: "oc1",
+						transcriptPath: "/oc1",
+						updatedAt: new Date().toISOString(),
+						source: "opencode",
+					},
+				],
+			});
+
+			const status = await getStatus(tempDir);
+			expect(status.activeSessions).toBe(4);
+			expect(status.sessionsBySource).toEqual({
+				claude: 1,
+				codex: 2,
+				opencode: 1,
+			});
+		});
 	});
 
 	describe("Gemini auto-detection during install", () => {
@@ -1547,6 +1735,13 @@ describe("Installer", () => {
 	});
 
 	describe("migrateWorktreeConfig — backfill-only migration", () => {
+		it("should skip migration when the worktree config directory is already the global config directory", async () => {
+			mockGlobalConfigDir.mockReturnValue(join(tempDir, ".jolli", "jollimemory"));
+
+			const result = await install(tempDir);
+			expect(result.success).toBe(true);
+		});
+
 		it("should migrate only apiKey when jolliApiKey is undefined", async () => {
 			// Set up a second worktree with ONLY apiKey (no jolliApiKey)
 			const worktree2 = join(tempDir, "wt2");
@@ -1667,6 +1862,26 @@ describe("Installer", () => {
 			// Backfilled field should be removed from worktree
 			expect(wtConfig.jolliApiKey).toBeUndefined();
 		});
+
+		it("should leave worktree config untouched when nothing needs backfilling", async () => {
+			await mkdir(emptyGlobalDir, { recursive: true });
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ apiKey: "global-key" }), "utf-8");
+
+			const worktree2 = join(tempDir, "wt2");
+			await mkdir(join(worktree2, ".git", "hooks"), { recursive: true });
+			const wt2JolliDir = join(worktree2, ".jolli", "jollimemory");
+			await mkdir(wt2JolliDir, { recursive: true });
+			await writeFile(join(wt2JolliDir, "config.json"), JSON.stringify({ apiKey: "worktree-key" }), "utf-8");
+
+			const { listWorktrees } = await import("../core/GitOps.js");
+			vi.mocked(listWorktrees).mockResolvedValueOnce([tempDir, worktree2]);
+
+			const result = await install(tempDir);
+			expect(result.success).toBe(true);
+
+			const wtConfig = JSON.parse(await readFile(join(wt2JolliDir, "config.json"), "utf-8"));
+			expect(wtConfig.apiKey).toBe("worktree-key");
+		});
 	});
 
 	describe("migrateWorktreeConfig — no backfill when all fields already in global", () => {
@@ -1723,12 +1938,59 @@ describe("Installer", () => {
 	});
 
 	describe("getStatus — active sessions reduce branch", () => {
-		it("should compute mostRecentSession via reduce when multiple enabled sessions exist", async () => {
-			// Write multiple Claude sessions with different timestamps
+		it("should not append OpenCode sessions when discovery finds none", async () => {
+			const { isOpenCodeInstalled, scanOpenCodeSessions } = await import("../core/OpenCodeSessionDiscoverer.js");
+			vi.mocked(isOpenCodeInstalled).mockResolvedValueOnce(true);
+			vi.mocked(scanOpenCodeSessions).mockResolvedValueOnce({ sessions: [] });
+
+			const status = await getStatus(tempDir);
+			expect(status.activeSessions).toBe(0);
+		});
+
+		it("surfaces OpenCode scan errors so the UI can warn instead of silently showing 0 sessions", async () => {
+			const { isOpenCodeInstalled, scanOpenCodeSessions } = await import("../core/OpenCodeSessionDiscoverer.js");
+			vi.mocked(isOpenCodeInstalled).mockResolvedValueOnce(true);
+			vi.mocked(scanOpenCodeSessions).mockResolvedValueOnce({
+				sessions: [],
+				error: { kind: "corrupt", message: "SQLITE_CORRUPT: disk image is malformed" },
+			});
+
+			const status = await getStatus(tempDir);
+
+			expect(status.activeSessions).toBe(0);
+			expect(status.openCodeScanError).toEqual({
+				kind: "corrupt",
+				message: "SQLITE_CORRUPT: disk image is malformed",
+			});
+		});
+
+		it("should count legacy sessions without a source as Claude sessions", async () => {
 			const sessionsDir = join(tempDir, ".jolli", "jollimemory");
 			await mkdir(sessionsDir, { recursive: true });
-			const olderDate = "2025-01-01T00:00:00.000Z";
-			const newerDate = "2025-06-01T00:00:00.000Z";
+			await writeFile(
+				join(sessionsDir, "sessions.json"),
+				JSON.stringify({
+					sessions: {
+						legacy: {
+							sessionId: "legacy",
+							transcriptPath: "/legacy",
+							updatedAt: new Date().toISOString(),
+						},
+					},
+				}),
+				"utf-8",
+			);
+
+			const status = await getStatus(tempDir);
+			expect(status.sessionsBySource.claude).toBe(1);
+		});
+
+		it("should compute mostRecentSession via reduce when multiple enabled sessions exist", async () => {
+			// Write multiple Claude sessions with different timestamps (must be within 48h to avoid pruning)
+			const sessionsDir = join(tempDir, ".jolli", "jollimemory");
+			await mkdir(sessionsDir, { recursive: true });
+			const olderDate = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+			const newerDate = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString();
 			await writeFile(
 				join(sessionsDir, "sessions.json"),
 				JSON.stringify({
@@ -2027,6 +2289,20 @@ describe("Installer", () => {
 			} finally {
 				await chmod(settingsPath, 0o755);
 			}
+		});
+	});
+
+	describe("installResolveScript — failure path", () => {
+		it("should return failure when resolve-dist-path script cannot be written", async () => {
+			// Set homedir to an invalid path so mkdir fails inside installResolveScript
+			mockHomedir.mockReturnValue("/dev/null/impossible-path");
+
+			const result = await install(tempDir);
+			expect(result.success).toBe(false);
+			expect(result.message).toContain("resolve-dist-path");
+
+			// Restore for other tests
+			mockHomedir.mockReturnValue(fakeHomeDir);
 		});
 	});
 

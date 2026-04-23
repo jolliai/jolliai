@@ -231,11 +231,13 @@ describe("buildMarkdown", () => {
 		const child1 = leaf({
 			commitHash: "aaa",
 			commitDate: "2026-03-01T10:00:00.000Z",
-			topics: [{ title: "Day 1 topic", trigger: "t", response: "r", decisions: "d" }],
+			generatedAt: "2026-03-01T10:01:00.000Z",
+			topics: [{ title: "Day 1 topic", trigger: "t", response: "r", decisions: "d", category: "feature" }],
 		});
 		const child2 = leaf({
 			commitHash: "bbb",
 			commitDate: "2026-03-05T10:00:00.000Z",
+			generatedAt: "2026-03-05T10:01:00.000Z",
 			topics: [{ title: "Day 5 topic", trigger: "t", response: "r", decisions: "d" }],
 		});
 		const squash = leaf({
@@ -245,6 +247,11 @@ describe("buildMarkdown", () => {
 			children: [child2, child1],
 		});
 		const md = buildMarkdown(squash);
+		// showRecordDates=true path: date headers must appear
+		expect(md).toMatch(/### Mar 5, 2026/);
+		expect(md).toMatch(/### Mar 1, 2026/);
+		// Category label on first grouped topic (covers `t.category ? ...` branch)
+		expect(md).toContain("`feature`");
 		expect(md).toContain("Day 1 topic");
 		expect(md).toContain("Day 5 topic");
 	});
@@ -364,11 +371,13 @@ describe("buildPrMarkdown", () => {
 		const child1 = leaf({
 			commitHash: "aaa11111111",
 			commitDate: "2026-03-01T10:00:00.000Z",
+			generatedAt: "2026-03-01T10:01:00.000Z",
 			topics: [{ title: "Day 1 PR topic", trigger: "t1", response: "r1", decisions: "d1" }],
 		});
 		const child2 = leaf({
 			commitHash: "bbb22222222",
 			commitDate: "2026-03-05T10:00:00.000Z",
+			generatedAt: "2026-03-05T10:01:00.000Z",
 			topics: [{ title: "Day 5 PR topic", trigger: "t5", response: "r5", decisions: "d5" }],
 		});
 		const squash = leaf({
@@ -378,6 +387,8 @@ describe("buildPrMarkdown", () => {
 			children: [child2, child1],
 		});
 		const md = buildPrMarkdown(squash);
+		expect(md).toMatch(/### Mar 5, 2026/);
+		expect(md).toMatch(/### Mar 1, 2026/);
 		expect(md).toContain("Day 1 PR topic");
 		expect(md).toContain("Day 5 PR topic");
 		// Should NOT contain full topic body fields (todo/files)
@@ -386,7 +397,8 @@ describe("buildPrMarkdown", () => {
 	});
 
 	it("truncates date-grouped topics when exceeding PR body limit", () => {
-		// Build two children on different days, each with many large topics
+		// Build two children on different days, each with many large topics.
+		// generatedAt must differ per child so showRecordDates=true.
 		const bigTopics = Array.from({ length: 100 }, (_, i) => ({
 			title: `Big Topic ${i}`,
 			trigger: "X".repeat(400),
@@ -396,11 +408,13 @@ describe("buildPrMarkdown", () => {
 		const child1 = leaf({
 			commitHash: "ccc33333333",
 			commitDate: "2026-04-01T10:00:00.000Z",
+			generatedAt: "2026-04-01T10:01:00.000Z",
 			topics: bigTopics.slice(0, 50),
 		});
 		const child2 = leaf({
 			commitHash: "ddd44444444",
 			commitDate: "2026-04-10T10:00:00.000Z",
+			generatedAt: "2026-04-10T10:01:00.000Z",
 			topics: bigTopics.slice(50),
 		});
 		const squash = leaf({

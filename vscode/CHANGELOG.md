@@ -1,9 +1,10 @@
 # Changelog
 
-<!-- Last synced commit: ff796b6a5 | 2026-04-13 -->
+<!-- Last synced commit: ea9ad050b | 2026-04-23 -->
 
 ## 0.98.0
 
+- **OpenCode integration** — the sidebar STATUS panel now tracks [OpenCode](https://opencode.ai) sessions alongside Claude, Codex, and Gemini. Sessions are discovered automatically at commit time by reading OpenCode's global SQLite database; no hook installation required. Requires a host VS Code whose bundled Node is 22.5 or newer (VS Code ~1.99+); on older hosts OpenCode is quietly skipped while every other feature continues to work.
 - **Sign in with Jolli** — one-click browser-based OAuth sign-in / sign-out from the sidebar STATUS panel, bringing the unified Jolli account flow (shared with the new `jolli auth` CLI commands) into the extension — no more copy-pasting API keys to get started
 - **Push to local folder** — new Local Memories section in Settings saves memory Markdown files to a folder you pick; choose "Push to Jolli only" or "Push to Jolli & Local" as the default Push action
 - **Live Plans panel** — plans refresh automatically as they're added, updated, or completed — no reload needed

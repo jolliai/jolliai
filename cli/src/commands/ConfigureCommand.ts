@@ -29,6 +29,7 @@ const VALID_CONFIG_KEYS = [
 	"codexEnabled",
 	"geminiEnabled",
 	"claudeEnabled",
+	"openCodeEnabled",
 	"logLevel",
 	"excludePatterns",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig>;
@@ -62,7 +63,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		return n;
 	}
 	// Boolean fields
-	if (key === "codexEnabled" || key === "geminiEnabled" || key === "claudeEnabled") {
+	if (key === "codexEnabled" || key === "geminiEnabled" || key === "claudeEnabled" || key === "openCodeEnabled") {
 		const lower = raw.toLowerCase();
 		if (lower === "true" || lower === "1" || lower === "yes") return true;
 		if (lower === "false" || lower === "0" || lower === "no") return false;
@@ -96,6 +97,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{ key: "codexEnabled", type: "boolean", description: "Enable Codex CLI session discovery (true/false)" },
 	{ key: "geminiEnabled", type: "boolean", description: "Enable Gemini CLI session tracking (true/false)" },
 	{ key: "claudeEnabled", type: "boolean", description: "Enable Claude Code session tracking (true/false)" },
+	{
+		key: "openCodeEnabled",
+		type: "boolean",
+		description: "Enable OpenCode session discovery (true/false; requires Node 22.5+ at runtime)",
+	},
 	{ key: "logLevel", type: "enum", description: "Log level: debug | info | warn | error" },
 	{ key: "excludePatterns", type: "string[]", description: "Glob patterns for file exclusion (comma-separated)" },
 ];

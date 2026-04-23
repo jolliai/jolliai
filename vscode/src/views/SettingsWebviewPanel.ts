@@ -40,6 +40,7 @@ interface SettingsPayload {
 	readonly claudeEnabled: boolean;
 	readonly codexEnabled: boolean;
 	readonly geminiEnabled: boolean;
+	readonly openCodeEnabled: boolean;
 	readonly localFolder: string;
 	readonly pushAction: "jolli" | "both";
 	readonly excludePatterns: string;
@@ -220,6 +221,7 @@ export class SettingsWebviewPanel {
 			claudeEnabled: config.claudeEnabled !== false,
 			codexEnabled: config.codexEnabled !== false,
 			geminiEnabled: config.geminiEnabled !== false,
+			openCodeEnabled: config.openCodeEnabled !== false,
 			localFolder: config.localFolder ?? "",
 			pushAction: config.pushAction === "both" ? "both" : "jolli",
 			excludePatterns: config.excludePatterns
@@ -264,6 +266,7 @@ export class SettingsWebviewPanel {
 			claudeEnabled: settings.claudeEnabled,
 			codexEnabled: settings.codexEnabled,
 			geminiEnabled: settings.geminiEnabled,
+			openCodeEnabled: settings.openCodeEnabled,
 			localFolder:
 				settings.localFolder && settings.localFolder.length > 0
 					? settings.localFolder

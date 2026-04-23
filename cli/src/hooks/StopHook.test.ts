@@ -125,6 +125,33 @@ function mockTranscriptWithLines(lines: string[]): void {
 	vi.mocked(createReadStream).mockReturnValueOnce({} as ReadStream);
 }
 
+/**
+ * Helper to mock createReadStream + createInterface where the readline emits an error.
+ * Exercises the `rl.on("error", ...)` handler in scanTranscriptForPlans.
+ */
+function mockTranscriptWithError(): void {
+	const handlers: Record<string, Array<(...args: unknown[]) => void>> = {};
+
+	const mockRl = {
+		on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+			if (!handlers[event]) {
+				handlers[event] = [];
+			}
+			handlers[event].push(handler);
+			// Fire "error" event after all handlers are registered
+			if (event === "error") {
+				Promise.resolve().then(() => {
+					for (const h of handlers.error ?? []) h(new Error("read error"));
+				});
+			}
+			return mockRl;
+		}),
+	};
+
+	vi.mocked(createInterface).mockReturnValueOnce(mockRl as unknown as ReadlineInterface);
+	vi.mocked(createReadStream).mockReturnValueOnce({} as ReadStream);
+}
+
 /** Returns a valid hook input JSON string */
 function hookJson(transcriptPath = "/path/to/session.jsonl", cwd = "/my/project"): string {
 	return JSON.stringify({ session_id: "test-session-123", transcript_path: transcriptPath, cwd });
@@ -936,5 +963,17 @@ describe("StopHook — plan discovery", () => {
 		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
 		expect(saved?.plans["current-plan"]?.commitHash).toBeNull();
 		expect(saved?.plans["other-plan"]).toBeUndefined();
+	});
+
+	it("should resolve gracefully when readline emits an error during transcript scan", async () => {
+		vi.mocked(existsSync).mockReturnValue(true);
+		mockTranscriptWithError();
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		// The error handler resolves the promise (does not reject).
+		// Cursor should still be updated (totalLines = 0 since no lines were read).
+		expect(savePlansRegistry).not.toHaveBeenCalled();
 	});
 });

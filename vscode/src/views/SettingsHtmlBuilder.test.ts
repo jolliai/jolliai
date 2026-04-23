@@ -56,6 +56,7 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('id="claudeEnabled"');
 		expect(html).toContain('id="codexEnabled"');
 		expect(html).toContain('id="geminiEnabled"');
+		expect(html).toContain('id="openCodeEnabled"');
 	});
 
 	it("contains Files group with exclude patterns", () => {

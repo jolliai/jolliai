@@ -113,7 +113,9 @@ async function probeGh(
 		});
 		return { ok: true, stdout };
 	} catch (e) {
+		/* v8 ignore start -- defensive: execFile always rejects with Error; retain the coercion for unexpected non-Error throws */
 		const err = e instanceof Error ? e : new Error(String(e));
+		/* v8 ignore stop */
 		const code = (err as NodeJS.ErrnoException).code;
 		if (code === "ENOENT") {
 			return { ok: false, kind: "notFound", err };

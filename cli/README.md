@@ -21,6 +21,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
 | **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
 | **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem |
+| **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.5+) |
 
 ### Git Hooks — generating summaries on commit
 
@@ -32,7 +33,11 @@ When you run `git commit`, three standard git hooks handle the rest:
 
 Everything is stored in a git orphan branch (`jollimemory/summaries/v3`), completely separate from your code history.
 
+**Worktree-aware:** hooks and summaries work across `git worktree` checkouts — each worktree tracks its own current branch and its memories stay consistent.
+
 ## Installation
+
+**Requirements** — **Node.js 22.5 or later**. OpenCode session discovery uses Node's built-in `node:sqlite`, which first ships in Node 22.5; the `engines` field refuses installation on older runtimes. If you use Node 18 or 20, please upgrade before installing.
 
 ```bash
 npm install -g @jolli/cli
@@ -196,7 +201,7 @@ jolli configure --set excludePatterns=docs/**,*.log,node_modules
 jolli configure --remove jolliApiKey
 ```
 
-Supported keys: `apiKey`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `codexEnabled`, `geminiEnabled`, `claudeEnabled`, `logLevel`, `excludePatterns`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
+Supported keys: `apiKey`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `codexEnabled`, `geminiEnabled`, `claudeEnabled`, `openCodeEnabled`, `logLevel`, `excludePatterns`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
 
 ### `jolli doctor`
 
@@ -260,6 +265,7 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 | `claudeEnabled` | boolean | auto-detect | Enable Claude Code session tracking |
 | `codexEnabled` | boolean | auto-detect | Enable Codex CLI session discovery |
 | `geminiEnabled` | boolean | auto-detect | Enable Gemini CLI session tracking |
+| `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (requires Node 22.5+) |
 | `excludePatterns` | string[] | — | Glob patterns for file exclusion (set via `jolli configure --set excludePatterns=glob1,glob2`) |
 
 **Authentication setup** — three options:
@@ -332,4 +338,37 @@ Jolli Memory is designed to **never interfere** with your development workflow:
 - A unified operation queue ensures no summaries are lost during rapid commit/amend/rebase sequences
 
 If something looks off, run `jolli doctor` to check for faults (stuck locks, missing hooks, invalid config) and `jolli clean --dry-run` to preview redundant data that can be safely removed.
+
+## Privacy
+
+### At summary generation time (after each commit)
+
+To produce a summary, Jolli Memory reads your active AI session transcripts and the git diff locally, then sends them together to a summarization backend:
+
+- If an **Anthropic `apiKey`** is configured — transcripts + diff are sent **directly to Anthropic**.
+- If only a **`jolliApiKey`** is configured (you signed in with `jolli auth login`) — transcripts + diff are sent to the **Jolli LLM proxy**, which forwards them to Anthropic on your behalf. The proxy **does not persist the transcripts or diff, and does not write them to any Jolli-side log** — payloads are held in memory only for the duration of the request and discarded once Anthropic responds.
+
+The generated summary is then written to the git orphan branch locally, and the raw transcripts are preserved alongside it for later review.
+
+### Uploads to Jolli Space
+
+The CLI itself does not push summaries to Jolli Space — that action lives in the VS Code and IntelliJ extensions (**Push to Jolli** button). When triggered there, only the **generated summary** and its **associated plans and notes** are uploaded. **Raw transcripts are never sent to Jolli Space.**
+
+### Session metadata
+
+Session IDs, transcript file paths, and timestamps are stored locally in `~/.jolli/jollimemory/`. Never uploaded anywhere.
+
+### What stays 100% local
+
+Every file under `~/.jolli/jollimemory/` and every entry on the `jollimemory/summaries/v3` orphan branch — including raw transcripts — stays on your disk unless one of the specific actions above is triggered.
+
+## Support
+
+- **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jollimemory/issues)
+- **Jolli Space onboarding / enterprise** — support@jolli.ai
+- **VS Code extension reference** — see the [VS Code README](https://github.com/jolliai/jollimemory/tree/main/vscode)
+
+## License
+
+[Apache License 2.0](https://github.com/jolliai/jollimemory/blob/main/LICENSE)
 

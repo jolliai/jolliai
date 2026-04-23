@@ -59,8 +59,8 @@ const {
 } = vi.hoisted(() => ({
 	indexNeedsMigration: vi.fn(),
 	migrateIndexToV3: vi.fn(),
-	readPlanFromBranch: vi.fn(),
 	readNoteFromBranch: vi.fn(),
+	readPlanFromBranch: vi.fn(),
 }));
 
 const {
@@ -472,8 +472,8 @@ vi.mock("../../cli/src/core/SummaryMigration.js", () => ({
 vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 	indexNeedsMigration,
 	migrateIndexToV3,
-	readPlanFromBranch,
 	readNoteFromBranch,
+	readPlanFromBranch,
 }));
 
 vi.mock("../../cli/src/Logger.js", () => ({
@@ -828,6 +828,48 @@ describe("Extension", () => {
 			expect(showWarningMessage).not.toHaveBeenCalled();
 			expect(registerCommand).toHaveBeenCalled();
 			expect(MockJolliMemoryBridge).toHaveBeenCalledWith("/test/workspace");
+		});
+	});
+
+	describe("activate — resolveGitPath failure (git-less workspace)", () => {
+		it("warns but keeps activating when rev-parse --git-path fails", () => {
+			// Throw for all resolveGitPath queries → both HEAD and orphan-ref watchers
+			// skip creation, hitting the `else` branches that log auto-refresh-disabled warnings.
+			execSync.mockImplementation(() => {
+				throw new Error("not a git repo");
+			});
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			const warnCalls = warn.mock.calls.map((c) => c.join(" "));
+			expect(
+				warnCalls.some((s) => s.includes("Could not resolve git HEAD path")),
+			).toBe(true);
+			expect(
+				warnCalls.some((s) => s.includes("Could not resolve orphan ref path")),
+			).toBe(true);
+			// Activation still registers commands
+			expect(registerCommand).toHaveBeenCalled();
+		});
+
+		it("resolves non-absolute git-paths against cwd", () => {
+			// Returns a relative path → covers the `isAbsolute(out) ? out : resolve(cwd, out)` right branch.
+			execSync.mockImplementation((cmd: string) => {
+				if (cmd.includes("rev-parse --git-path HEAD")) {
+					return Buffer.from(".git/HEAD\n");
+				}
+				if (cmd.includes("rev-parse --git-path refs/heads/")) {
+					return Buffer.from(".git/refs/heads/__jolli_orphan_branch__\n");
+				}
+				throw new Error(`Unmocked exec: ${cmd}`);
+			});
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			// Activation should succeed even with relative git paths
+			expect(registerCommand).toHaveBeenCalled();
 		});
 	});
 
@@ -1446,6 +1488,81 @@ describe("Extension", () => {
 				await handler();
 
 				expect(MockNoteEditorWebviewPanel.show).toHaveBeenCalled();
+			});
+
+			it("invokes the refresh callback passed to NoteEditorWebviewPanel.show", async () => {
+				// Capture the onSaved callback and invoke it so the lambda body (which
+				// calls plansStore.refresh()) is actually executed — otherwise that
+				// arrow function reports as never called in coverage.
+				let savedCb: (() => unknown) | undefined;
+				MockNoteEditorWebviewPanel.show.mockImplementation(
+					(_uri: unknown, _bridge: unknown, cb: () => unknown) => {
+						savedCb = cb;
+					},
+				);
+
+				const handler = getRegisteredCommand("jollimemory.addTextSnippet");
+				await handler();
+
+				expect(savedCb).toBeDefined();
+				mockPlansStore.refresh.mockClear();
+				savedCb?.();
+				expect(mockPlansStore.refresh).toHaveBeenCalled();
+			});
+		});
+
+		describe("previewNote", () => {
+			it("opens markdown preview when note content is found", async () => {
+				readNoteFromBranch.mockResolvedValue("# My Note\nContent here");
+				const handler = getRegisteredCommand("jollimemory.previewNote");
+
+				await handler("note-1", "My Note");
+
+				expect(readNoteFromBranch).toHaveBeenCalledWith(
+					"note-1",
+					"/test/workspace",
+				);
+				expect(openTextDocument).toHaveBeenCalled();
+				expect(executeCommand).toHaveBeenCalledWith(
+					"markdown.showPreview",
+					expect.anything(),
+				);
+			});
+
+			it("shows error when note content is null", async () => {
+				readNoteFromBranch.mockResolvedValue(null);
+				const handler = getRegisteredCommand("jollimemory.previewNote");
+
+				await handler("note-1", "My Note");
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Could not read note"),
+				);
+				expect(openTextDocument).not.toHaveBeenCalled();
+			});
+
+			it("provides cached content for note preview virtual documents", async () => {
+				readNoteFromBranch.mockResolvedValue("# Note content");
+				const handler = getRegisteredCommand("jollimemory.previewNote");
+				await handler("note-1", "My Note");
+
+				// Note content provider is the second registered provider (index 1)
+				const provider = registerTextDocumentContentProvider.mock
+					.calls[1]?.[1] as
+					| {
+							provideTextDocumentContent: (uri: { query: string }) => string;
+					  }
+					| undefined;
+				expect(provider).toBeDefined();
+				expect(
+					provider?.provideTextDocumentContent({ query: "id=note-1" }),
+				).toBe("# Note content");
+				expect(
+					provider?.provideTextDocumentContent({ query: "id=missing" }),
+				).toBe("# Note not found");
+				expect(provider?.provideTextDocumentContent({ query: "" })).toBe(
+					"# Note not found",
+				);
 			});
 		});
 
@@ -2683,6 +2800,19 @@ describe("Extension", () => {
 			vi.useRealTimers();
 		});
 
+		it("skips markdown files inside the notes dir (handled by file watcher)", async () => {
+			const saveCallback = onDidSaveTextDocument.mock.calls[0]?.[0] as
+				| ((doc: { fileName: string }) => Promise<void>)
+				| undefined;
+			mockBridge.listNotes.mockClear();
+
+			await saveCallback?.({
+				fileName: "/test/workspace/.jolli/jollimemory/notes/my-note.md",
+			});
+
+			expect(mockBridge.listNotes).not.toHaveBeenCalled();
+		});
+
 		it("skips non-markdown file saves without calling listNotes", async () => {
 			const saveCallback = onDidSaveTextDocument.mock.calls[0]?.[0] as
 				| ((doc: { fileName: string }) => Promise<void>)
@@ -3518,6 +3648,88 @@ describe("Extension", () => {
 			);
 			expect(mockFilesStore.refresh).toHaveBeenCalledWith(true);
 		});
+
+		it("shows overflow indicator when more than 10 files are selected", async () => {
+			const selectedFiles = Array.from({ length: 12 }, (_, i) => ({
+				absolutePath: `/repo/file${i}.ts`,
+				relativePath: `file${i}.ts`,
+				statusCode: "M" as const,
+				indexStatus: " " as const,
+				worktreeStatus: "M" as const,
+				isSelected: true,
+			}));
+			mockFilesStore.getSnapshot.mockReturnValue({
+				selectedFiles,
+				files: selectedFiles,
+				visibleFiles: selectedFiles,
+				excludedCount: 0,
+				visibleCount: selectedFiles.length,
+				isEmpty: false,
+				isEnabled: true,
+				isMigrating: false,
+				changeReason: "refresh",
+			});
+			showWarningMessage.mockResolvedValue("Discard All");
+			const ctx = makeContext();
+			activate(ctx);
+			const handler = getRegisteredCommand(
+				"jollimemory.discardSelectedChanges",
+			);
+
+			await handler();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("12 selected files"),
+				expect.objectContaining({
+					modal: true,
+					detail: expect.stringContaining("...and 2 more"),
+				}),
+				"Discard All",
+			);
+		});
+
+		it("uses singular form for single selected file and single deleted file", async () => {
+			const selectedFiles = [
+				{
+					absolutePath: "/repo/new.ts",
+					relativePath: "new.ts",
+					statusCode: "?" as const,
+					indexStatus: "?" as const,
+					worktreeStatus: "?" as const,
+					isSelected: true,
+				},
+			];
+			mockFilesStore.getSnapshot.mockReturnValue({
+				selectedFiles,
+				files: selectedFiles,
+				visibleFiles: selectedFiles,
+				excludedCount: 0,
+				visibleCount: selectedFiles.length,
+				isEmpty: false,
+				isEnabled: true,
+				isMigrating: false,
+				changeReason: "refresh",
+			});
+			showWarningMessage.mockResolvedValue("Discard All");
+			const ctx = makeContext();
+			activate(ctx);
+			const handler = getRegisteredCommand(
+				"jollimemory.discardSelectedChanges",
+			);
+
+			await handler();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				// singular "file" (not "files")
+				expect.stringContaining("1 selected file?"),
+				expect.objectContaining({
+					modal: true,
+					// singular "file" in delete warning
+					detail: expect.stringContaining("1 file will be permanently deleted"),
+				}),
+				"Discard All",
+			);
+		});
 	});
 
 	// ── hook path refresh error ──────────────────────────────────────
@@ -3537,6 +3749,61 @@ describe("Extension", () => {
 			await vi.waitFor(() => {
 				expect(mockBridge.autoInstallForWorktree).toHaveBeenCalled();
 			});
+		});
+
+		it("skips auto-install when worktree hooks are already installed", async () => {
+			mockBridge.getStatus.mockResolvedValue({
+				enabled: true,
+				gitHookInstalled: true,
+				worktreeHooksInstalled: true,
+				enabledWorktrees: 2,
+			});
+			mockBridge.autoInstallForWorktree.mockClear();
+
+			const ctx = makeContext();
+			activate(ctx);
+
+			// Wait for the async refresh chain to complete
+			await vi.waitFor(() => {
+				expect(mockStatusStore.refresh).toHaveBeenCalled();
+			});
+			expect(mockBridge.autoInstallForWorktree).not.toHaveBeenCalled();
+		});
+
+		it("skips auto-install when enabledWorktrees is 0", async () => {
+			mockBridge.getStatus.mockResolvedValue({
+				enabled: true,
+				gitHookInstalled: true,
+				worktreeHooksInstalled: false,
+				enabledWorktrees: 0,
+			});
+			mockBridge.autoInstallForWorktree.mockClear();
+
+			const ctx = makeContext();
+			activate(ctx);
+
+			await vi.waitFor(() => {
+				expect(mockStatusStore.refresh).toHaveBeenCalled();
+			});
+			expect(mockBridge.autoInstallForWorktree).not.toHaveBeenCalled();
+		});
+
+		it("skips auto-install when enabledWorktrees is undefined", async () => {
+			mockBridge.getStatus.mockResolvedValue({
+				enabled: true,
+				gitHookInstalled: true,
+				worktreeHooksInstalled: false,
+				enabledWorktrees: undefined,
+			});
+			mockBridge.autoInstallForWorktree.mockClear();
+
+			const ctx = makeContext();
+			activate(ctx);
+
+			await vi.waitFor(() => {
+				expect(mockStatusStore.refresh).toHaveBeenCalled();
+			});
+			expect(mockBridge.autoInstallForWorktree).not.toHaveBeenCalled();
 		});
 
 		it("logs error when refreshHookPathsIfStale rejects", async () => {

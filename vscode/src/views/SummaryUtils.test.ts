@@ -46,7 +46,7 @@ function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
 		commitMessage: "Fix some bug",
 		commitAuthor: "Alice",
 		commitDate: "2026-03-15T10:30:00.000Z",
-		branch: "feature/jolli-100-my-feature",
+		branch: "feature/proj-100-my-feature",
 		generatedAt: "2026-03-15T10:31:00.000Z",
 		...overrides,
 	};

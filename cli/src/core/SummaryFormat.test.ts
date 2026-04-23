@@ -260,6 +260,41 @@ describe("collectSortedTopics", () => {
 		const { topics } = collectSortedTopics(leaf({ topics: undefined }));
 		expect(topics).toHaveLength(0);
 	});
+
+	it("falls back to commitDate when generatedAt is missing on child node (covers `||` right-side)", () => {
+		// child1 has generatedAt undefined — its topic date must come from commitDate.
+		// Parent is a container without own topics, children span multiple days
+		// (2026-03-01 vs 2026-03-05) so showRecordDates=true; that triggers the
+		// recordDate assignment whose `t.generatedAt || t.commitDate` right branch runs.
+		const summary = leaf({
+			commitDate: "2026-03-05T10:00:00.000Z",
+			generatedAt: "2026-03-05T10:01:00.000Z",
+			topics: [],
+			children: [
+				{
+					version: 3 as const,
+					commitHash: "noGenAt",
+					commitMessage: "legacy",
+					commitAuthor: "a",
+					branch: "b",
+					commitDate: "2026-03-01T10:00:00.000Z",
+					// generatedAt intentionally omitted
+					generatedAt: "",
+					topics: [{ title: "Legacy", trigger: "t", response: "r", decisions: "d" }],
+				},
+				leaf({
+					commitHash: "bbb",
+					commitDate: "2026-03-05T09:00:00.000Z",
+					generatedAt: "2026-03-05T09:00:10.000Z",
+				}),
+			],
+		});
+		const { topics, showRecordDates } = collectSortedTopics(summary);
+		expect(showRecordDates).toBe(true);
+		// The legacy topic's recordDate should equal its commitDate (since generatedAt is empty).
+		const legacy = topics.find((t) => t.title === "Legacy");
+		expect(legacy?.recordDate).toBe("2026-03-01T10:00:00.000Z");
+	});
 });
 
 // ─── collectAllPlans ────────────────────────────────────────────────────────

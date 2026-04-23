@@ -367,6 +367,136 @@ describe("PrCommentService", () => {
 			});
 		});
 
+		it("recovers when gh --version fails once (transient) then succeeds on retry", async () => {
+			// Covers checkGhInstalled retry → r2.ok success path.
+			let versionCalls = 0;
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "feature/br\n" };
+				if (cmd === "gh" && args[0] === "--version") {
+					versionCalls++;
+					if (versionCalls === 1) {
+						const err = new Error("EACCES") as NodeJS.ErrnoException;
+						err.code = "EACCES";
+						throw err;
+					}
+					return { stdout: "gh version 2.40.0\n" };
+				}
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr") throw new Error("no PR");
+				return { stdout: "" };
+			});
+
+			vi.useFakeTimers();
+			try {
+				const p = handleCheckPrStatus(CWD, postMessage);
+				await vi.runAllTimersAsync();
+				await p;
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(versionCalls).toBe(2);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prStatus",
+				status: "noPr",
+				branch: "feature/br",
+				crossBranch: false,
+			});
+		});
+
+		it("posts notInstalled when gh --version fails transiently then fails with ENOENT on retry", async () => {
+			// Covers checkGhInstalled retry → r2.kind === "notFound" branch.
+			let versionCalls = 0;
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
+				if (cmd === "gh" && args[0] === "--version") {
+					versionCalls++;
+					const err = new Error(
+						versionCalls === 1 ? "EACCES" : "ENOENT",
+					) as NodeJS.ErrnoException;
+					err.code = versionCalls === 1 ? "EACCES" : "ENOENT";
+					throw err;
+				}
+				return { stdout: "" };
+			});
+
+			vi.useFakeTimers();
+			try {
+				const p = handleCheckPrStatus(CWD, postMessage);
+				await vi.runAllTimersAsync();
+				await p;
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prStatus",
+				status: "notInstalled",
+			});
+		});
+
+		it("posts unavailable when gh auth fails transiently twice (error status propagates)", async () => {
+			// Covers checkGhAuthenticated retry with non-nonZero failure:
+			// r2.kind !== "nonZero" → returns "error" → handleCheckPrStatus reaches the
+			// `if (auth === "error")` branch → posts "unavailable".
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
+				if (cmd === "gh" && args[0] === "--version")
+					return { stdout: "gh 2.40\n" };
+				if (cmd === "gh" && args[0] === "auth") {
+					const err = new Error("spawn EACCES") as NodeJS.ErrnoException;
+					err.code = "EACCES";
+					throw err;
+				}
+				return { stdout: "" };
+			});
+
+			vi.useFakeTimers();
+			try {
+				const p = handleCheckPrStatus(CWD, postMessage);
+				await vi.runAllTimersAsync();
+				await p;
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prStatus",
+				status: "unavailable",
+			});
+		});
+
+		it("falls back to current branch when cross-branch detection yields no summary branch", async () => {
+			// Covers handleCheckPrStatus `summaryBranch ?? currentBranch` right branch:
+			// summaryCommitHash is set, merge-base --is-ancestor fails (cross-branch=true),
+			// but summaryBranch is undefined → fall back to currentBranch.
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "fallback-branch\n" };
+				// merge-base --is-ancestor fails → isCrossBranch=true
+				if (cmd === "git" && args[0] === "merge-base") {
+					throw new Error("not an ancestor");
+				}
+				if (cmd === "gh" && args[0] === "--version") return { stdout: "gh\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr") throw new Error("no pr");
+				return { stdout: "" };
+			});
+
+			// summaryBranch=undefined, summaryCommitHash="deadbeef"
+			await handleCheckPrStatus(CWD, postMessage, undefined, "deadbeef");
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prStatus",
+				status: "noPr",
+				branch: "fallback-branch",
+				crossBranch: true,
+			});
+		});
+
 		it("posts unavailable when gh --version fails with a transient error twice", async () => {
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "rev-list") {
@@ -997,6 +1127,47 @@ describe("PrCommentService", () => {
 			});
 		});
 
+		it("falls back to current branch when summary.branch is undefined (cross-branch)", async () => {
+			// Covers handlePrepareUpdatePr `summary.branch ?? currentBranch` right branch.
+			// merge-base --is-ancestor fails so isCrossBranch=true; summary has no branch,
+			// so the fallback reaches currentBranch.
+			const summaryNoBranch = {
+				commitHash: "deadbeef",
+				// no `branch` field — exercise the `??` fallback
+			} as never;
+
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "merge-base") {
+					throw new Error("not an ancestor");
+				}
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "fallback-branch\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					return {
+						stdout: JSON.stringify({
+							number: 1,
+							url: "u",
+							title: "t",
+							body: "",
+						}),
+					};
+				}
+				return { stdout: "" };
+			});
+
+			await handlePrepareUpdatePr(
+				summaryNoBranch,
+				CWD,
+				postMessage,
+				buildMarkdownFn,
+			);
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ command: "prShowUpdateForm" }),
+			);
+		});
+
 		it("replaces existing markers in PR body", async () => {
 			const existingBody = `Before\n${MARKER_START}\nold content\n${MARKER_END}\nAfter`;
 			setupExecFile((cmd, args) => {
@@ -1331,6 +1502,83 @@ describe("PrCommentService", () => {
 				"Updated PR #7",
 				"Open PR",
 			);
+		});
+
+		it("resolves target branch via summary branch when summaryCommitHash is unreachable", async () => {
+			// Covers handleUpdatePr's `summaryCommitHash ? ... : false` truthy branch,
+			// the `isCrossBranch ? ... : currentBranch` truthy branch, and the
+			// `summaryBranch ?? currentBranch` left branch (summaryBranch given).
+			const pr = { number: 9, url: "u", title: "Same", body: "" };
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "merge-base") {
+					throw new Error("not an ancestor");
+				}
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "current-branch\n" };
+				}
+				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
+				if (cmd === "gh" && args[0] === "--version") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					return { stdout: JSON.stringify(pr) };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
+					return { stdout: "" };
+				}
+				return { stdout: "" };
+			});
+			showInformationMessage.mockResolvedValue(undefined);
+
+			await handleUpdatePr(
+				"Same",
+				"new body",
+				CWD,
+				postMessage,
+				"summary-branch",
+				"deadbeef",
+			);
+
+			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdating" });
+			// Verify the PR lookup used the summary branch (passed via the 2nd rev-parse)
+			const viewCall = mockExecFileAsync.mock.calls.find(
+				(c) => c[0] === "gh" && c[1][0] === "pr" && c[1][1] === "view",
+			);
+			expect(viewCall?.[1]).toContain("summary-branch");
+		});
+
+		it("falls back to current branch when summaryCommitHash is unreachable but summaryBranch is undefined", async () => {
+			// Covers the `summaryBranch ?? currentBranch` right branch in handleUpdatePr.
+			const pr = { number: 9, url: "u", title: "Same", body: "" };
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "merge-base") {
+					throw new Error("not an ancestor");
+				}
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "current-branch\n" };
+				}
+				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
+				if (cmd === "gh" && args[0] === "--version") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					return { stdout: JSON.stringify(pr) };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
+					return { stdout: "" };
+				}
+				return { stdout: "" };
+			});
+			showInformationMessage.mockResolvedValue(undefined);
+
+			await handleUpdatePr(
+				"Same",
+				"new body",
+				CWD,
+				postMessage,
+				undefined,
+				"deadbeef",
+			);
+
+			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdating" });
 		});
 
 		it("opens external URL when user clicks 'Open PR' after update", async () => {

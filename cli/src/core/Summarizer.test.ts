@@ -239,6 +239,16 @@ Using \`===TOPIC===\` as the topic separator avoids JSON encoding issues.`);
 			expect(result.topics[0].trigger).toContain("Extra content");
 		});
 
+		it("ignores unknown fields that appear before any known field", () => {
+			const result = parseSummaryResponse(
+				"===TOPIC===\n---UNKNOWNFIELD---\nIgnored\n---TITLE---\nTest\n---TRIGGER---\nBug found\n---RESPONSE---\nFixed it\n---DECISIONS---\nDecided this way",
+			);
+
+			expect(result.topics).toHaveLength(1);
+			expect(result.topics[0].title).toBe("Test");
+			expect(result.topics[0].trigger).not.toContain("Ignored");
+		});
+
 		it("handles topics missing optional fields (no TODO, CATEGORY, IMPORTANCE)", () => {
 			const result = parseSummaryResponse(
 				delimited({ title: "Minimal", trigger: "t", response: "r", decisions: "Minimal decisions" }),
@@ -343,6 +353,20 @@ Using \`===TOPIC===\` as the topic separator avoids JSON encoding issues.`);
 				}),
 			);
 			expect(result.topics[0].filesAffected).toEqual(["src/A.ts", "src/B.ts"]);
+		});
+
+		it("omits filesAffected when the field only contains empty items", () => {
+			const result = parseSummaryResponse(
+				delimited({
+					title: "A",
+					trigger: "t",
+					response: "r",
+					decisions: "d",
+					filesAffected: ",  ,\n   ",
+				}),
+			);
+
+			expect(result.topics[0].filesAffected).toBeUndefined();
 		});
 	});
 
@@ -837,6 +861,32 @@ This is unknown content
 			expect(result[0].title).toBe("Unknown field test");
 			// The unknown CUSTOM field's content should be appended to STEPS (the last known field)
 			expect(result[0].steps[0]).toContain("Do something");
+		});
+
+		it("ignores unknown fields that appear before any known E2E field", () => {
+			const result = parseE2eTestResponse(`===SCENARIO===
+---CUSTOM---
+Ignored
+---TITLE---
+Known title
+---STEPS---
+1. Open app
+---EXPECTED---
+- Works`);
+
+			expect(result).toHaveLength(1);
+			expect(result[0].title).toBe("Known title");
+			expect(result[0].steps[0]).not.toContain("Ignored");
+		});
+
+		it("skips scenarios with a missing title", () => {
+			const result = parseE2eTestResponse(`===SCENARIO===
+---STEPS---
+1. Open app
+---EXPECTED---
+- Works`);
+
+			expect(result).toEqual([]);
 		});
 
 		it("should handle scenario with steps but no EXPECTED field", () => {

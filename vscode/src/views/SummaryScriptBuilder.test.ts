@@ -94,4 +94,12 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toContain("noteTranslateError");
 		expect(script).toContain("note-translate-btn");
 	});
+
+	it("maps transcript sources to provider labels", () => {
+		expect(script).toContain("function getSourceLabel");
+		expect(script).toContain("source === 'opencode'");
+		expect(script).toContain("return 'OpenCode'");
+		expect(script).toContain("source === 'gemini'");
+		expect(script).toContain("return 'Gemini'");
+	});
 });

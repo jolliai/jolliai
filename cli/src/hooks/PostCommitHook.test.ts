@@ -82,6 +82,19 @@ vi.mock("../core/CodexSessionDiscoverer.js", () => ({
 	isCodexInstalled: vi.fn().mockResolvedValue(true),
 }));
 
+vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
+	discoverOpenCodeSessions: vi.fn().mockResolvedValue([]),
+	isOpenCodeInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/OpenCodeTranscriptReader.js", () => ({
+	readOpenCodeTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	readGeminiTranscript: vi.fn().mockResolvedValue({
 		entries: [],
@@ -111,6 +124,8 @@ import {
 	getProjectRootDir,
 	readFileFromBranch,
 } from "../core/GitOps.js";
+import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
+import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
 	acquireLock,
 	associateNoteWithCommit,
@@ -1363,6 +1378,54 @@ describe("queue-driven Worker", () => {
 			]);
 			// generateSummary should reflect total entries from both sessions
 			expect(generateSummary).toHaveBeenCalledWith(expect.objectContaining({ transcriptEntries: 2 }));
+		});
+	});
+
+	// ─── OpenCode session discovery in loadSessionTranscripts ─────────────────
+
+	describe("loadSessionTranscripts with OpenCode", () => {
+		it("includes discovered OpenCode sessions and uses the dedicated reader", async () => {
+			setupFullPipeline();
+			// Return a Claude session (from loadAllSessions) and an OpenCode session (from discovery)
+			vi.mocked(loadAllSessions).mockResolvedValue([
+				{ sessionId: "claude-1", transcriptPath: "/claude/session.jsonl", updatedAt: "2026-02-19" },
+			]);
+			vi.mocked(isOpenCodeInstalled).mockResolvedValue(true);
+			vi.mocked(discoverOpenCodeSessions).mockResolvedValue([
+				{
+					sessionId: "oc-1",
+					transcriptPath: "/home/user/.local/share/opencode/opencode.db#oc-1",
+					updatedAt: "2026-02-19",
+					source: "opencode",
+				},
+			]);
+			vi.mocked(readTranscript).mockResolvedValueOnce({
+				entries: [{ role: "human", content: "Claude entry" }],
+				newCursor: { transcriptPath: "/claude/session.jsonl", lineNumber: 5, updatedAt: "2026-02-19" },
+				totalLinesRead: 5,
+			});
+			vi.mocked(readOpenCodeTranscript).mockResolvedValueOnce({
+				entries: [{ role: "human", content: "OpenCode entry" }],
+				newCursor: {
+					transcriptPath: "/home/user/.local/share/opencode/opencode.db#oc-1",
+					lineNumber: 3,
+					updatedAt: "2026-02-19",
+				},
+				totalLinesRead: 3,
+			});
+			vi.mocked(buildMultiSessionContext).mockReturnValue("merged context");
+
+			await runWorker("/test/project");
+
+			// readOpenCodeTranscript should be called for the opencode session
+			expect(readOpenCodeTranscript).toHaveBeenCalledTimes(1);
+			// readTranscript should be called for the Claude session
+			expect(readTranscript).toHaveBeenCalledTimes(1);
+			// buildMultiSessionContext should receive both sessions
+			expect(buildMultiSessionContext).toHaveBeenCalledWith([
+				expect.objectContaining({ sessionId: "claude-1" }),
+				expect.objectContaining({ sessionId: "oc-1" }),
+			]);
 		});
 	});
 

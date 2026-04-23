@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:child_process", () => ({
 	execSync: vi.fn(),
@@ -41,6 +41,7 @@ import { loadSquashPending, saveSquashPending } from "../core/SessionTracker.js"
 import {
 	detectCommitOperation,
 	detectResetSquash,
+	isRebaseInProgress,
 	readLastReflogSubject,
 	resolveGitDir,
 } from "./GitOperationDetector.js";
@@ -51,6 +52,84 @@ describe("GitOperationDetector", () => {
 		// Default: statSync throws so resolveGitDir falls back to dotGit path
 		vi.mocked(existsSync).mockReturnValue(false);
 		delete process.env.GIT_REFLOG_ACTION;
+	});
+
+	describe("resolveGitDir", () => {
+		it("should return the default .git path when statSync throws (regular repo)", () => {
+			vi.mocked(statSync).mockImplementation(() => {
+				throw new Error("ENOENT");
+			});
+
+			const result = resolveGitDir("/test/repo");
+
+			expect(result).toBe("/test/repo/.git");
+		});
+
+		it("should return the default .git path when .git is a directory", () => {
+			vi.mocked(statSync).mockReturnValue({ isFile: () => false } as ReturnType<typeof statSync>);
+
+			const result = resolveGitDir("/test/repo");
+
+			expect(result).toBe("/test/repo/.git");
+		});
+
+		it("should resolve an absolute gitdir path from a worktree .git file", () => {
+			vi.mocked(statSync).mockReturnValue({ isFile: () => true } as ReturnType<typeof statSync>);
+			vi.mocked(readFileSync).mockReturnValue("gitdir: /main-repo/.git/worktrees/feature-branch\n");
+
+			const result = resolveGitDir("/test/worktree");
+
+			expect(result).toBe("/main-repo/.git/worktrees/feature-branch");
+		});
+
+		it("should resolve a relative gitdir path from a worktree .git file", () => {
+			vi.mocked(statSync).mockReturnValue({ isFile: () => true } as ReturnType<typeof statSync>);
+			vi.mocked(readFileSync).mockReturnValue("gitdir: ../.git/worktrees/feature-branch\n");
+
+			const result = resolveGitDir("/test/worktree");
+
+			// join() resolves the relative path: /test/worktree + ../.git/worktrees/feature-branch
+			expect(result).toBe("/test/.git/worktrees/feature-branch");
+		});
+
+		it("should return the default .git path when .git file has no gitdir line", () => {
+			vi.mocked(statSync).mockReturnValue({ isFile: () => true } as ReturnType<typeof statSync>);
+			vi.mocked(readFileSync).mockReturnValue("some other content\n");
+
+			const result = resolveGitDir("/test/repo");
+
+			expect(result).toBe("/test/repo/.git");
+		});
+	});
+
+	describe("isRebaseInProgress", () => {
+		it("should return true when rebase-merge directory exists", () => {
+			// statSync throws so resolveGitDir returns default .git path
+			vi.mocked(statSync).mockImplementation(() => {
+				throw new Error("ENOENT");
+			});
+			vi.mocked(existsSync).mockImplementation((p) => String(p).endsWith("rebase-merge"));
+
+			expect(isRebaseInProgress("/test/repo")).toBe(true);
+		});
+
+		it("should return true when rebase-apply directory exists", () => {
+			vi.mocked(statSync).mockImplementation(() => {
+				throw new Error("ENOENT");
+			});
+			vi.mocked(existsSync).mockImplementation((p) => String(p).endsWith("rebase-apply"));
+
+			expect(isRebaseInProgress("/test/repo")).toBe(true);
+		});
+
+		it("should return false when neither rebase directory exists", () => {
+			vi.mocked(statSync).mockImplementation(() => {
+				throw new Error("ENOENT");
+			});
+			vi.mocked(existsSync).mockReturnValue(false);
+
+			expect(isRebaseInProgress("/test/repo")).toBe(false);
+		});
 	});
 
 	describe("readLastReflogSubject", () => {
@@ -74,6 +153,136 @@ describe("GitOperationDetector", () => {
 			const result = readLastReflogSubject("/test/repo");
 
 			expect(result).toBeNull();
+		});
+	});
+
+	describe("detectCommitOperation", () => {
+		const CWD = "/test/repo";
+		let savedReflogAction: string | undefined;
+
+		beforeEach(() => {
+			savedReflogAction = process.env.GIT_REFLOG_ACTION;
+			delete process.env.GIT_REFLOG_ACTION;
+			vi.mocked(existsSync).mockReturnValue(false);
+		});
+
+		afterEach(() => {
+			if (savedReflogAction !== undefined) {
+				process.env.GIT_REFLOG_ACTION = savedReflogAction;
+			} else {
+				delete process.env.GIT_REFLOG_ACTION;
+			}
+		});
+
+		it("should detect rebase when GIT_REFLOG_ACTION contains 'rebase'", () => {
+			process.env.GIT_REFLOG_ACTION = "rebase (pick)";
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({ type: "rebase" });
+		});
+
+		it("should detect rebase via filesystem when rebase-merge directory exists", () => {
+			// No GIT_REFLOG_ACTION, but rebase-merge directory exists
+			vi.mocked(existsSync).mockImplementation((p) => {
+				return String(p).endsWith("rebase-merge");
+			});
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({ type: "rebase" });
+		});
+
+		it("should detect rebase via filesystem when rebase-apply directory exists", () => {
+			vi.mocked(existsSync).mockImplementation((p) => {
+				return String(p).endsWith("rebase-apply");
+			});
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({ type: "rebase" });
+		});
+
+		it("should detect squash when squash-pending.json exists", () => {
+			vi.mocked(existsSync).mockImplementation((p) => {
+				return String(p).endsWith("squash-pending.json");
+			});
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({
+				type: "squash",
+				squashPendingPath: expect.stringContaining("squash-pending.json"),
+			});
+		});
+
+		it("should detect amend via reflog subject", () => {
+			vi.mocked(execSync).mockReturnValueOnce("commit (amend): Fix typo\n");
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({ type: "amend" });
+		});
+
+		it("should detect cherry-pick when GIT_REFLOG_ACTION is 'cherry-pick'", () => {
+			process.env.GIT_REFLOG_ACTION = "cherry-pick";
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({ type: "cherry-pick" });
+		});
+
+		it("should detect revert when GIT_REFLOG_ACTION is 'revert'", () => {
+			process.env.GIT_REFLOG_ACTION = "revert";
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({ type: "revert" });
+		});
+
+		it("should fall back to 'commit' when no special signals are present", () => {
+			vi.mocked(execSync).mockReturnValueOnce("commit: Add new feature\n");
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({ type: "commit" });
+		});
+
+		it("should fall back to 'commit' when reflog cannot be read", () => {
+			vi.mocked(execSync).mockImplementationOnce(() => {
+				throw new Error("fatal: reflog is empty");
+			});
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({ type: "commit" });
+		});
+
+		it("should prioritize rebase over squash-pending.json", () => {
+			process.env.GIT_REFLOG_ACTION = "rebase (pick)";
+			// Even if squash-pending.json exists, rebase should win
+			vi.mocked(existsSync).mockImplementation((p) => {
+				return String(p).endsWith("squash-pending.json");
+			});
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({ type: "rebase" });
+		});
+
+		it("should prioritize squash over amend", () => {
+			// squash-pending.json exists AND reflog says amend — squash should win
+			vi.mocked(existsSync).mockImplementation((p) => {
+				return String(p).endsWith("squash-pending.json");
+			});
+			vi.mocked(execSync).mockReturnValueOnce("commit (amend): Fix typo\n");
+
+			const result = detectCommitOperation(CWD);
+
+			expect(result).toEqual({
+				type: "squash",
+				squashPendingPath: expect.stringContaining("squash-pending.json"),
+			});
 		});
 	});
 

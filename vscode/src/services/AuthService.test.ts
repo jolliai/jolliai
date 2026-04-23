@@ -216,6 +216,34 @@ describe("AuthService", () => {
 				expect(result.error).toContain("disk full");
 			}
 		});
+
+		it("should stringify non-Error throw from saveAuthCredentials", async () => {
+			// Covers the `err instanceof Error ? err.message : String(err)` right branch.
+			saveAuthCredentials.mockRejectedValueOnce("bare string rejection");
+			const uri = makeUri("/auth-callback", "token=test-token");
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("bare string rejection");
+			}
+		});
+
+		it("should continue returning success when setContext throws", async () => {
+			// Covers the log.warn branch in the setContext catch (line 106).
+			// executeCommand succeeds for saveAuthCredentials's lifecycle but throws
+			// specifically for the setContext call.
+			executeCommand.mockImplementationOnce(() => {
+				throw new Error("setContext unavailable");
+			});
+			const uri = makeUri("/auth-callback", "token=test-token");
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			// Save succeeded → overall result is success even though setContext threw.
+			expect(result.success).toBe(true);
+		});
 	});
 
 	// ── signOut ─────────────────────────────────────────────────────────
@@ -302,6 +330,18 @@ describe("AuthService", () => {
 
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				expect.stringContaining("no browser"),
+			);
+		});
+
+		it("should stringify a non-Error throw from openExternal", async () => {
+			// Covers the `err instanceof Error ? err.message : String(err)` right branch
+			// in openSignInPage (line 145).
+			openExternal.mockRejectedValueOnce("bare string from browser layer");
+
+			await service.openSignInPage();
+
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("bare string from browser layer"),
 			);
 		});
 	});
