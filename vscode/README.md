@@ -105,7 +105,7 @@ Click **👁** on any commit to open a full memory panel. It shows:
 * **Plans & Notes**: associated plans and notes with edit, remove, and add actions (plans, Markdown files, or inline text snippets)
 * **E2E Test Guide**: AI-generated test scenarios with preconditions, steps, and expected results. Click "Generate" to create them on demand.
 * **Source Commits** (for squash/amend): all contributing commits with diff stats and conversation counts
-* **Summaries**: each topic structured as:
+* **Topics**: each topic structured as:
   * ⚡ **Why This Change**: the trigger from the AI conversation
   * 💡 **Decisions Behind the Code**: key technical trade-offs and choices
   * ✅ **What Was Implemented**: what was actually built
@@ -229,7 +229,7 @@ Once your branch is merged into main, the panel switches to a **merged (read-onl
 
 At the bottom of every memory panel, Jolli Memory can create or update a GitHub Pull Request:
 
-* **Create PR**: pre-fills the PR description with a streamlined summary: Jolli Memory URL → Plans → E2E Test Guide → Summaries (Why → Decisions → What). Only includes information not already visible on the GitHub PR page.
+* **Create PR**: pre-fills the PR description with a structured summary: Jolli Memory URL → Plans → E2E Test Guide → Topics (Why → Decisions → What → Future Enhancements → Files). All topic bodies are folded by default so the PR stays scannable.
 * **Update PR**: refreshes the summary section in place (using `<!-- jollimemory-summary -->` markers) without affecting any text you've added manually.
 
 Requires the `gh` CLI to be installed and authenticated.

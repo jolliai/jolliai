@@ -20,7 +20,7 @@ import type {
 } from "../../../cli/src/Types.js";
 import { buildPrSectionHtml } from "../services/PrCommentService.js";
 import { buildCss } from "./SummaryCssBuilder.js";
-import { buildPrMarkdown } from "./SummaryMarkdownBuilder.js";
+import { buildPrMarkdown } from "./SummaryPrMarkdownBuilder.js";
 import { buildScript } from "./SummaryScriptBuilder.js";
 import {
 	collectSortedTopics,
@@ -76,14 +76,14 @@ export function buildHtml(
 
 	let topicsHtml: string;
 	if (allTopics.length === 0) {
-		topicsHtml = '<p class="empty">No summaries available for this commit.</p>';
+		topicsHtml = '<p class="empty">No topics available for this commit.</p>';
 	} else if (showRecordDates) {
 		topicsHtml = renderTimeline(groupTopicsByDate(allTopics));
 	} else {
 		topicsHtml = allTopics.map((t, i) => renderTopic(t, i)).join("\n");
 	}
 
-	const topicsLabel = `${allTopics.length} summar${allTopics.length !== 1 ? "ies" : "y"} extracted from this commit`;
+	const topicsLabel = `${allTopics.length} topic${allTopics.length !== 1 ? "s" : ""} extracted from this commit`;
 
 	const csp = nonce
 		? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src data:;" />`
@@ -110,8 +110,8 @@ ${buildE2eTestSection(summary)}
 ${buildSourceCommits(sourceNodes)}
 <div class="section">
   <div class="section-header">
-    <div class="section-title" title="${topicsLabel}">&#x1F4DD; ${allTopics.length === 1 ? "Summary" : "Summaries"} <span class="section-count">${allTopics.length}</span></div>
-    <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all summaries">Collapse All</button>
+    <div class="section-title" title="${topicsLabel}">&#x1F4DD; ${allTopics.length === 1 ? "Topic" : "Topics"} <span class="section-count">${allTopics.length}</span></div>
+    <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all topics">Collapse All</button>
   </div>
   ${topicsHtml}
 </div>

@@ -77,7 +77,7 @@ vi.mock("./SummaryCssBuilder.js", () => ({
 	buildCss,
 }));
 
-vi.mock("./SummaryMarkdownBuilder.js", () => ({
+vi.mock("./SummaryPrMarkdownBuilder.js", () => ({
 	buildPrMarkdown,
 }));
 
@@ -246,14 +246,14 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).not.toContain("nonce=");
 		});
 
-		it('shows "No summaries available" message when topics are empty', () => {
+		it('shows "No topics available" message when topics are empty', () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],
 				sourceNodes: [],
 				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("No summaries available for this commit.");
+			expect(html).toContain("No topics available for this commit.");
 		});
 
 		it("renders topics without timeline for a single topic", () => {
@@ -289,26 +289,26 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("timeline-header");
 		});
 
-		it('shows correct section header count — "1 summary" for singular', () => {
+		it('shows correct section header count — "1 topic" for singular', () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [makeTopic()],
 				sourceNodes: [makeSummary()],
 				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("Summary");
-			expect(html).toContain("1 summary extracted from this commit");
+			expect(html).toContain("Topic");
+			expect(html).toContain("1 topic extracted from this commit");
 		});
 
-		it('shows correct section header count — "3 summaries" for plural', () => {
+		it('shows correct section header count — "3 topics" for plural', () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [makeTopic(), makeTopic(), makeTopic()],
 				sourceNodes: [makeSummary()],
 				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("Summaries");
-			expect(html).toContain("3 summaries extracted from this commit");
+			expect(html).toContain("Topics");
+			expect(html).toContain("3 topics extracted from this commit");
 		});
 
 		it("header includes commit hash, branch, author, date", () => {

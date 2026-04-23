@@ -81,7 +81,8 @@ import {
 	buildHtml,
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
-import { buildMarkdown, buildPrMarkdown } from "./SummaryMarkdownBuilder.js";
+import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
+import { buildPrMarkdown } from "./SummaryPrMarkdownBuilder.js";
 import {
 	buildNotePushTitle,
 	buildPanelTitle,
