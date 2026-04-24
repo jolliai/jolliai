@@ -41,6 +41,61 @@ export function buildSettingsScript(): string {
   let hasErrors = false;
 
   // ── Validation ──
+  var ALLOWED_JOLLI_HOSTS = ['jolli.ai', 'jolli.dev', 'jolli-local.me'];
+
+  function decodeBase64url(seg) {
+    try {
+      var b64 = seg.replace(/-/g, '+').replace(/_/g, '/');
+      var pad = b64.length % 4;
+      if (pad === 2) b64 += '==';
+      else if (pad === 3) b64 += '=';
+      else if (pad === 1) return null;
+      return atob(b64);
+    } catch (e) { return null; }
+  }
+
+  function checkJolliOriginAllowed(origin) {
+    try {
+      var u = new URL(origin);
+      var host = u.hostname.toLowerCase();
+      if (u.protocol !== 'https:' || !host) return false;
+      for (var i = 0; i < ALLOWED_JOLLI_HOSTS.length; i++) {
+        var h = ALLOWED_JOLLI_HOSTS[i];
+        if (host === h || host.slice(-(h.length + 1)) === '.' + h) return true;
+      }
+      return false;
+    } catch (e) { return false; }
+  }
+
+  // Inline port of cli/src/core/JolliApiUtils.ts validateJolliApiKey — this
+  // runs in the webview's browser context so it can't just import the Node
+  // module. Keep in lockstep with the CLI version (and the Kotlin port in
+  // intellij/.../JolliApiClient.kt). Runs on every keystroke for inline red
+  // feedback; the server-side check in handleApplySettings is authoritative.
+  function validateJolliApiKeyRule(v) {
+    if (v.length === 0 || v === maskedJolliApiKey) return '';
+    if (!v.startsWith('sk-jol-')) return 'Key cannot be decoded. Paste the key exactly as issued by Jolli.';
+    var rest = v.slice('sk-jol-'.length);
+    if (rest.indexOf('.') < 0) {
+      return 'Key cannot be decoded. Paste the key exactly as issued by Jolli.';
+    }
+    var segments = rest.split('.');
+    for (var i = 0; i < segments.length; i++) {
+      var json = decodeBase64url(segments[i]);
+      if (json === null) continue;
+      try {
+        var meta = JSON.parse(json);
+        if (typeof meta.t === 'string' && typeof meta.u === 'string') {
+          if (!checkJolliOriginAllowed(meta.u)) {
+            return 'Origin ' + meta.u + ' is not on the Jolli allowlist (only *.jolli.ai, *.jolli.dev, *.jolli-local.me).';
+          }
+          return '';
+        }
+      } catch (e) { /* try next segment */ }
+    }
+    return 'Key cannot be decoded. Paste the key exactly as issued by Jolli.';
+  }
+
   function validateField(input, errorId, rule) {
     var errorEl = document.getElementById(errorId);
     var value = input.value.trim();
@@ -64,13 +119,7 @@ export function buildSettingsScript(): string {
       }
       return '';
     }) && valid;
-    valid = validateField(jolliApiKeyInput, 'jolliApiKey-error', function(v) {
-      if (v.length > 0 && v !== maskedJolliApiKey) {
-        if (!v.startsWith('sk-jol-')) return 'Must start with sk-jol-';
-        if (v.length < 20) return 'Key looks incomplete';
-      }
-      return '';
-    }) && valid;
+    valid = validateField(jolliApiKeyInput, 'jolliApiKey-error', validateJolliApiKeyRule) && valid;
     valid = validateField(maxTokensInput, 'maxTokens-error', function(v) {
       if (v.length > 0 && (isNaN(Number(v)) || Number(v) < 1 || !Number.isInteger(Number(v)))) return 'Must be a positive integer';
       return '';
@@ -138,24 +187,44 @@ export function buildSettingsScript(): string {
   }
 
   function updateApplyBtn() {
+    // Gate on both "nothing to save" and "has client-side errors". The click
+    // handler also re-runs validateAll() and surfaces a saveFeedback message
+    // if a validation error slips through (e.g. programmatic value change),
+    // so the user gets explicit feedback rather than a swallowed click.
     applyBtn.disabled = !isDirty || hasErrors;
+  }
+
+  function clearSaveFeedback() {
+    saveFeedback.classList.remove('visible');
+    saveFeedback.classList.remove('error');
   }
 
   // ── Event listeners for all inputs ──
   [apiKeyInput, jolliApiKeyInput, maxTokensInput, excludePatternsInput].forEach(function(input) {
-    input.addEventListener('input', function() { validateAll(); checkDirty(); });
+    input.addEventListener('input', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
-  modelSelect.addEventListener('change', function() { checkDirty(); });
+  modelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
   [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput].forEach(function(input) {
-    input.addEventListener('change', function() { validateAll(); checkDirty(); });
+    input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
   [pushActionJolliRadio, pushActionBothRadio].forEach(function(input) {
-    input.addEventListener('change', function() { checkDirty(); });
+    input.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
   });
 
   // ── Apply Changes ──
   applyBtn.addEventListener('click', function() {
     if (applyBtn.disabled) return;
+    // Final client-side pass so inline errors stay in sync even if a field was
+    // changed programmatically or before any input event had a chance to fire.
+    // Server-side validation runs regardless, but this gives the user the
+    // inline red-text field marker immediately.
+    validateAll();
+    if (hasErrors) {
+      saveFeedback.textContent = 'Please fix the highlighted fields before saving';
+      saveFeedback.classList.add('error');
+      saveFeedback.classList.add('visible');
+      return;
+    }
     var maxVal = maxTokensInput.value.trim();
     vscode.postMessage({
       command: 'applySettings',
@@ -213,16 +282,17 @@ export function buildSettingsScript(): string {
         break;
       case 'settingsSaved':
         saveFeedback.textContent = 'Settings saved';
+        saveFeedback.classList.remove('error');
         saveFeedback.classList.add('visible');
         setTimeout(function() { saveFeedback.classList.remove('visible'); }, 2000);
         captureInitialState();
         break;
       case 'settingsError':
+        // Persistent red banner — stays until the user edits a field (handled
+        // by the input listeners above, which clear it via clearSaveFeedback).
         saveFeedback.textContent = msg.message;
+        saveFeedback.classList.add('error');
         saveFeedback.classList.add('visible');
-        setTimeout(function() {
-          saveFeedback.classList.remove('visible');
-        }, 3000);
         break;
     }
   });

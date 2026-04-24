@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { Command } from "commander";
 import { getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
+import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
@@ -80,6 +81,13 @@ async function handleManualApiKey(configDir: string): Promise<void> {
 
 	const key = await promptText("  Jolli API Key (press Enter to skip): ");
 	if (key) {
+		try {
+			validateJolliApiKey(key);
+		} catch (err) {
+			console.error(`\n  Error: ${(err as Error).message}\n`);
+			process.exitCode = 1;
+			return;
+		}
 		await saveConfigScoped({ jolliApiKey: key } as Partial<JolliMemoryConfig>, configDir);
 		console.log("  Jolli API Key:     saved ✓");
 		console.log(`\n  Configuration saved to ${join(configDir, "config.json")}`);

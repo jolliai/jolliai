@@ -15,6 +15,18 @@
 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+// JolliPushService reads the key's embedded tenant/org metadata to route
+// requests — it does NOT enforce the origin allowlist. Allowlist validation
+// belongs to save-time paths (SettingsWebviewPanel.handleApplySettings,
+// AuthService.handleAuthCallback via CLI saveAuthCredentials). Those callers
+// import `validateJolliApiKey` directly from cli/src/core/JolliApiUtils.js.
+import {
+	type JolliApiKeyMeta,
+	parseBaseUrl,
+	parseJolliApiKey,
+} from "../../../cli/src/core/JolliApiUtils.js";
+
+export { parseJolliApiKey, type JolliApiKeyMeta };
 
 /** Thrown when the server rejects the request due to outdated plugin version (HTTP 426). */
 export class PluginOutdatedError extends Error {
@@ -44,84 +56,6 @@ export interface JolliPushResult {
 	readonly docId: number;
 	readonly jrn: string;
 	readonly created: boolean;
-}
-
-/**
- * Parsed base URL with optional tenant slug extracted from the path.
- *
- * Path-based: "https://jolli-local.me/test1/" → origin "https://jolli-local.me", tenantSlug "test1"
- * Subdomain:  "https://test1.jolli.ai"       → origin "https://test1.jolli.ai", tenantSlug undefined
- */
-interface ParsedBaseUrl {
-	/** The origin without any path prefix (e.g. "https://jolli-local.me") */
-	readonly origin: string;
-	/** Tenant slug extracted from the first path segment, if present */
-	readonly tenantSlug: string | undefined;
-}
-
-/**
- * Extracts the origin and optional tenant slug from a Jolli base URL.
- * If the URL has a non-empty path (e.g. "/test1/"), the first segment is the tenant slug.
- */
-function parseBaseUrl(baseUrl: string): ParsedBaseUrl {
-	const url = new URL(baseUrl);
-	// Strip leading/trailing slashes and extract first segment
-	const pathSegments = url.pathname
-		.replace(/^\/+|\/+$/g, "")
-		.split("/")
-		.filter(Boolean);
-	return {
-		origin: url.origin,
-		tenantSlug: pathSegments.length > 0 ? pathSegments[0] : undefined,
-	};
-}
-
-/**
- * Metadata embedded in a new-format Jolli API key.
- * - `t`: tenant slug (used as x-tenant-slug header for path-based tenants)
- * - `u`: full base URL (e.g., "https://ibm.jolli.ai" or "https://jolli.ai/ibm")
- * - `o`: org slug (used as x-org-slug header for multi-org routing; absent in old keys)
- */
-export interface JolliApiKeyMeta {
-	readonly t: string;
-	readonly u: string;
-	readonly o?: string;
-}
-
-/**
- * Parses the tenant metadata embedded in a new-format Jolli API key.
- *
- * New format: sk-jol-{base64url(JSON meta)}.{base64url(32 random bytes)}
- * Old format: sk-jol-{32 hex chars} — returns null
- *
- * @param key - Jolli API key string
- * @returns Parsed metadata, or null if the key uses the old format or cannot be decoded
- */
-export function parseJolliApiKey(key: string): JolliApiKeyMeta | null {
-	if (!key.startsWith("sk-jol-")) {
-		return null;
-	}
-	const rest = key.slice("sk-jol-".length);
-	const dotIndex = rest.indexOf(".");
-	if (dotIndex === -1) {
-		return null;
-	}
-	try {
-		const metaJson = Buffer.from(rest.slice(0, dotIndex), "base64url").toString(
-			"utf-8",
-		);
-		const meta = JSON.parse(metaJson) as Record<string, unknown>;
-		if (typeof meta.t === "string" && typeof meta.u === "string") {
-			return {
-				t: meta.t,
-				u: meta.u,
-				...(typeof meta.o === "string" ? { o: meta.o } : {}),
-			};
-		}
-		return null;
-	} catch {
-		return null;
-	}
 }
 
 /**

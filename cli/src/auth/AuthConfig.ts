@@ -5,13 +5,21 @@
  * Tokens are stored in ~/.jolli/jollimemory/config.json alongside other config fields.
  */
 
+import { assertJolliOriginAllowed, validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { loadConfig, saveConfig } from "../core/SessionTracker.js";
 
 const DEFAULT_JOLLI_URL = "https://app.jolli.ai";
 
-/** Returns the Jolli server URL. Checks JOLLI_URL env var, then falls back to default. Strips trailing slashes. */
+/**
+ * Returns the Jolli server URL. Checks JOLLI_URL env var, then falls back to default.
+ * Strips trailing slashes and enforces the Jolli origin allowlist — a
+ * socially-engineered `JOLLI_URL=https://evil.com` would otherwise send the
+ * user's OAuth credentials to the attacker before any API key is involved.
+ */
 export function getJolliUrl(): string {
-	return (process.env.JOLLI_URL?.trim() || DEFAULT_JOLLI_URL).replace(/\/+$/, "");
+	const url = (process.env.JOLLI_URL?.trim() || DEFAULT_JOLLI_URL).replace(/\/+$/, "");
+	assertJolliOriginAllowed(url);
+	return url;
 }
 
 /** Saves the OAuth auth token to global config. */
@@ -31,6 +39,7 @@ export async function saveAuthCredentials(credentials: {
 }): Promise<void> {
 	const update: { authToken: string; jolliApiKey?: string } = { authToken: credentials.token };
 	if (credentials.jolliApiKey) {
+		validateJolliApiKey(credentials.jolliApiKey);
 		update.jolliApiKey = credentials.jolliApiKey;
 	}
 	await saveConfig(update);

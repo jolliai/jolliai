@@ -388,7 +388,8 @@ describe("SettingsWebviewPanel", () => {
 				apiKey: "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234",
 				model: "claude-3-5",
 				maxTokens: 4096,
-				jolliApiKey: "jolli-key-12345678901234",
+				jolliApiKey:
+					"sk-jol-eyJ0IjoidGVuYW50IiwidSI6Imh0dHBzOi8vdGVuYW50LmpvbGxpLmFpIn0.secret",
 				claudeEnabled: true,
 				codexEnabled: false,
 				geminiEnabled: true,
@@ -488,7 +489,8 @@ describe("SettingsWebviewPanel", () => {
 				apiKey: "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234",
 				model: "sonnet",
 				maxTokens: null,
-				jolliApiKey: "jolli-key-12345678901234",
+				jolliApiKey:
+					"sk-jol-eyJ0IjoidGVuYW50IiwidSI6Imh0dHBzOi8vdGVuYW50LmpvbGxpLmFpIn0.secret",
 				claudeEnabled: true,
 				codexEnabled: true,
 				geminiEnabled: true,
@@ -566,7 +568,8 @@ describe("SettingsWebviewPanel", () => {
 		});
 
 		it("preserves original jolli API key when masked value is unchanged", async () => {
-			const jolliKey = "jolli-key-12345678901234";
+			const jolliKey =
+				"sk-jol-eyJ0IjoidGVuYW50IiwidSI6Imh0dHBzOi8vdGVuYW50LmpvbGxpLmFpIn0.secret";
 			const dispatch = await setupWithLoadedConfig({ jolliApiKey: jolliKey });
 
 			const maskedJolliKey = `${jolliKey.substring(0, 12)}****${jolliKey.substring(jolliKey.length - 4)}`;
@@ -595,11 +598,13 @@ describe("SettingsWebviewPanel", () => {
 		});
 
 		it("uses new jolli API key when user changes it from the masked value", async () => {
-			const jolliKey = "jolli-key-12345678901234";
+			const jolliKey =
+				"sk-jol-eyJ0IjoidGVuYW50IiwidSI6Imh0dHBzOi8vdGVuYW50LmpvbGxpLmFpIn0.secret";
 			const dispatch = await setupWithLoadedConfig({ jolliApiKey: jolliKey });
 
 			const maskedJolliKey = `${jolliKey.substring(0, 12)}****${jolliKey.substring(jolliKey.length - 4)}`;
-			const newJolliKey = "jolli-key-new-9876543210";
+			const newJolliKey =
+				"sk-jol-eyJ0IjoidGVuYW50MiIsInUiOiJodHRwczovL3RlbmFudDIuam9sbGkuYWkifQ.secret";
 
 			dispatch({
 				command: "applySettings",
@@ -762,6 +767,130 @@ describe("SettingsWebviewPanel", () => {
 			expect(postMessage).toHaveBeenCalledWith({ command: "settingsSaved" });
 			expect(onSaved).toHaveBeenCalled();
 			expect(info).toHaveBeenCalledWith("SettingsPanel", "Settings saved");
+		});
+
+		it("rejects a Jolli API key that cannot be decoded (wrong prefix), without saving", async () => {
+			const dispatch = await setupWithLoadedConfig();
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "sf-jol-garbage",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).not.toHaveBeenCalled();
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsError",
+					message: expect.stringMatching(/cannot be decoded/),
+				}),
+			);
+		});
+
+		it("rejects a Jolli API key with no embedded meta (legacy-only shape), without saving", async () => {
+			const dispatch = await setupWithLoadedConfig();
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "sk-jol-legacyhex32chars",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).not.toHaveBeenCalled();
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsError",
+					message: expect.stringMatching(/cannot be decoded/),
+				}),
+			);
+		});
+
+		it("rejects a Jolli API key whose embedded origin is off the allowlist, without saving", async () => {
+			const dispatch = await setupWithLoadedConfig();
+			// Build a key whose decoded meta.u points off the allowlist
+			const badMeta = { t: "x", u: "https://evil.com" };
+			const encoded = Buffer.from(JSON.stringify(badMeta)).toString(
+				"base64url",
+			);
+			const badKey = `sk-jol-${encoded}.secret`;
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: badKey,
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).not.toHaveBeenCalled();
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsError",
+					message: expect.stringMatching(/evil\.com/),
+				}),
+			);
+		});
+
+		it("accepts a Jolli API key whose embedded origin is on the allowlist", async () => {
+			const dispatch = await setupWithLoadedConfig();
+			const goodMeta = { t: "tenant1", u: "https://tenant1.jolli.ai" };
+			const encoded = Buffer.from(JSON.stringify(goodMeta)).toString(
+				"base64url",
+			);
+			const goodKey = `sk-jol-${encoded}.secret`;
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: goodKey,
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ jolliApiKey: goodKey }),
+				expect.any(String),
+			);
 		});
 
 		it("posts settingsError when save fails", async () => {
@@ -1282,7 +1411,8 @@ describe("SettingsWebviewPanel", () => {
 				apiKey: "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234",
 				model: "sonnet",
 				maxTokens: null,
-				jolliApiKey: "jolli-key-12345678901234",
+				jolliApiKey:
+					"sk-jol-eyJ0IjoidGVuYW50IiwidSI6Imh0dHBzOi8vdGVuYW50LmpvbGxpLmFpIn0.secret",
 				claudeEnabled: true,
 				codexEnabled: true,
 				geminiEnabled: true,

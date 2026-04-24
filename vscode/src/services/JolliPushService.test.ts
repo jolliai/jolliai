@@ -198,6 +198,9 @@ describe("parseJolliApiKey", () => {
 	});
 });
 
+// assertJolliOriginAllowed is owned by cli/src/core/JolliApiUtils.ts and
+// covered by cli/src/core/JolliApiUtils.test.ts — no duplicate here.
+
 describe("pushToJolli", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
@@ -391,11 +394,7 @@ describe("pushToJolli", () => {
 			},
 		);
 
-		await pushToJolli(
-			"https://jolli-local.me/test1/",
-			OLD_KEY,
-			DEFAULT_PAYLOAD,
-		);
+		await pushToJolli("https://jolli.ai/test1/", OLD_KEY, DEFAULT_PAYLOAD);
 
 		const callArgs = mockHttpsRequest.mock.calls[0] as [
 			unknown,
@@ -725,7 +724,7 @@ describe("deleteFromJolli", () => {
 			},
 		);
 
-		await deleteFromJolli("https://jolli-local.me/test1/", OLD_KEY, 42);
+		await deleteFromJolli("https://jolli.ai/test1/", OLD_KEY, 42);
 
 		const callArgs = mockHttpsRequest.mock.calls[0] as [
 			{ headers: Record<string, string> },
@@ -759,48 +758,6 @@ describe("deleteFromJolli", () => {
 			{ headers: Record<string, string> },
 		];
 		expect(callArgs[0].headers["x-org-slug"]).toBe("org1");
-	});
-
-	it("uses http.request for HTTP URL", async () => {
-		const mockReq = createMockRequest();
-		const mockRes: MockIncomingMessage = {
-			statusCode: 204,
-			on: vi.fn(),
-			resume: vi.fn(),
-		};
-
-		mockHttpRequest.mockImplementation(
-			(_opts: unknown, cb: (res: MockIncomingMessage) => void) => {
-				cb(mockRes);
-				return mockReq;
-			},
-		);
-
-		await deleteFromJolli("http://localhost:7034", OLD_KEY, 42);
-		expect(mockHttpRequest).toHaveBeenCalledOnce();
-		expect(mockHttpsRequest).not.toHaveBeenCalled();
-	});
-
-	it("defaults port to 80 for HTTP URL without explicit port", async () => {
-		const mockReq = createMockRequest();
-		const mockRes: MockIncomingMessage = {
-			statusCode: 204,
-			on: vi.fn(),
-			resume: vi.fn(),
-		};
-
-		mockHttpRequest.mockImplementation(
-			(_opts: unknown, cb: (res: MockIncomingMessage) => void) => {
-				cb(mockRes);
-				return mockReq;
-			},
-		);
-
-		await deleteFromJolli("http://localhost", OLD_KEY, 42);
-		expect(mockHttpRequest).toHaveBeenCalledOnce();
-
-		const callArgs = mockHttpRequest.mock.calls[0] as [{ port: number }];
-		expect(callArgs[0].port).toBe(80);
 	});
 
 	it("constructs the correct delete path with docId", async () => {

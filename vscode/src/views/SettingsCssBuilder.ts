@@ -242,7 +242,12 @@ export function buildSettingsCss(): string {
     margin-right: 12px;
     opacity: 0;
     transition: opacity 0.3s;
+    max-width: 480px;
   }
   .save-feedback.visible { opacity: 1; }
+  .save-feedback.error {
+    color: var(--vscode-errorForeground);
+    font-weight: 600;
+  }
   `;
 }

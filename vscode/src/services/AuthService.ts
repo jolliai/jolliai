@@ -131,7 +131,20 @@ export class AuthService {
 		// Mirrors the CLI's browserLogin() behaviour in Login.ts.
 		const { jolliApiKey } = await loadConfig();
 		const generateKeyParam = jolliApiKey ? "" : "&generate_api_key=true";
-		const loginUrl = `${getJolliUrl()}/login?cli_callback=${encodeURIComponent(callbackUri)}${generateKeyParam}&client=vscode`;
+		// `getJolliUrl()` throws if `JOLLI_URL` env var points off the
+		// allowlist — catch it here so an attacker-pointed env var surfaces as
+		// a friendly error dialog instead of an unhandled command exception.
+		let loginUrl: string;
+		try {
+			loginUrl = `${getJolliUrl()}/login?cli_callback=${encodeURIComponent(callbackUri)}${generateKeyParam}&client=vscode`;
+		} catch (err: unknown) {
+			const message = err instanceof Error ? err.message : String(err);
+			log.error("AuthService", "getJolliUrl rejected: %s", message);
+			vscode.window.showErrorMessage(
+				`Cannot sign in: ${message} Unset JOLLI_URL (or set it to a trusted Jolli host) and retry.`,
+			);
+			return;
+		}
 		log.info("AuthService", "Opening browser for sign-in");
 		try {
 			const opened = await vscode.env.openExternal(vscode.Uri.parse(loginUrl));
