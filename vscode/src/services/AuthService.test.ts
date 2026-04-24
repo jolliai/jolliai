@@ -14,38 +14,57 @@ const { loadConfig } = vi.hoisted(() => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
 }));
 
-const { executeCommand, openExternal, showErrorMessage, Uri, uriParse } =
-	vi.hoisted(() => {
-		const executeCommand = vi.fn().mockResolvedValue(undefined);
-		const showErrorMessage = vi.fn();
-		const openExternal = vi.fn().mockResolvedValue(true);
+const {
+	executeCommand,
+	openExternal,
+	showErrorMessage,
+	Uri,
+	uriParse,
+	appNameState,
+} = vi.hoisted(() => {
+	const executeCommand = vi.fn().mockResolvedValue(undefined);
+	const showErrorMessage = vi.fn();
+	const openExternal = vi.fn().mockResolvedValue(true);
+	// Mutable holder so individual tests can swap the host IDE (e.g. set to
+	// `"Cursor"` to simulate running inside Cursor) and verify AuthService's
+	// scheme resolution adapts. The `vi.mock` factory below reads it via a
+	// getter so runtime mutation is honored — the factory itself only
+	// executes once.
+	const appNameState = { current: "Visual Studio Code" };
 
-		// Minimal Uri shape — AuthService only reads path/query, so full URI semantics
-		// aren't required. Enough to stand in for vscode.Uri in tests.
-		interface FakeUri {
-			readonly scheme: string;
-			readonly authority: string;
-			readonly path: string;
-			readonly query: string;
-			readonly fragment: string;
-		}
+	// Minimal Uri shape — AuthService only reads path/query, so full URI semantics
+	// aren't required. Enough to stand in for vscode.Uri in tests.
+	interface FakeUri {
+		readonly scheme: string;
+		readonly authority: string;
+		readonly path: string;
+		readonly query: string;
+		readonly fragment: string;
+	}
 
-		// `parse` is a vi.fn so tests can assert on the exact string that was parsed
-		// (this is the login URL AuthService hands to openExternal).
-		const uriParse = vi.fn((value: string): FakeUri => {
-			const url = new URL(value);
-			return {
-				scheme: url.protocol.replace(":", ""),
-				authority: url.hostname,
-				path: url.pathname,
-				query: url.search.replace("?", ""),
-				fragment: url.hash.replace("#", ""),
-			};
-		});
-		const Uri = { parse: uriParse };
-
-		return { executeCommand, openExternal, showErrorMessage, Uri, uriParse };
+	// `parse` is a vi.fn so tests can assert on the exact string that was parsed
+	// (this is the login URL AuthService hands to openExternal).
+	const uriParse = vi.fn((value: string): FakeUri => {
+		const url = new URL(value);
+		return {
+			scheme: url.protocol.replace(":", ""),
+			authority: url.hostname,
+			path: url.pathname,
+			query: url.search.replace("?", ""),
+			fragment: url.hash.replace("#", ""),
+		};
 	});
+	const Uri = { parse: uriParse };
+
+	return {
+		executeCommand,
+		openExternal,
+		showErrorMessage,
+		Uri,
+		uriParse,
+		appNameState,
+	};
+});
 
 const {
 	info,
@@ -59,7 +78,15 @@ const {
 
 vi.mock("vscode", () => ({
 	commands: { executeCommand },
-	env: { openExternal },
+	env: {
+		openExternal,
+		// Getter so tests can mutate `appNameState.current` at runtime
+		// (the factory itself only executes once). `appName` is the signal
+		// AuthService uses to derive the OS-registered URI scheme.
+		get appName() {
+			return appNameState.current;
+		},
+	},
 	window: { showErrorMessage },
 	Uri,
 }));
@@ -103,6 +130,8 @@ describe("AuthService", () => {
 		vi.clearAllMocks();
 		// Default: no jolliApiKey configured — sign-in should request key generation.
 		loadConfig.mockResolvedValue({});
+		// Reset host-IDE appName to VSCode Stable; per-test overrides simulate forks.
+		appNameState.current = "Visual Studio Code";
 		service = new AuthService();
 	});
 
@@ -343,6 +372,58 @@ describe("AuthService", () => {
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				expect.stringContaining("bare string from browser layer"),
 			);
+		});
+
+		// Each VSCode fork rebrands `vscode.env.appName` (product.json nameLong)
+		// while often leaving `vscode.env.uriScheme` at the upstream default
+		// "vscode". AuthService therefore derives the callback scheme from
+		// appName — these mappings must stay in sync with Jolli's cli_callback
+		// allowlist. If a new fork shows up, add a row here AND to
+		// resolveUriScheme() in AuthService.ts AND to the server-side allowlist.
+		describe.each([
+			["Visual Studio Code", "vscode"],
+			["Visual Studio Code - Insiders", "vscode-insiders"],
+			["VSCodium", "vscodium"],
+			["Cursor", "cursor"],
+			["Windsurf", "windsurf"],
+			["Kiro", "kiro"],
+			["Antigravity", "antigravity"],
+		])("with host appName=%s", (appName, expectedScheme) => {
+			it(`constructs the callback URI with the ${expectedScheme} scheme`, async () => {
+				appNameState.current = appName;
+
+				await service.openSignInPage();
+
+				expect(uriParse).toHaveBeenCalledTimes(1);
+				const parsed = uriParse.mock.calls[0]?.[0] ?? "";
+
+				// Decoding the full cli_callback value guards against false
+				// positives from `client=vscode` (which also contains "vscode"
+				// but is unrelated to the callback scheme).
+				const match = parsed.match(/cli_callback=([^&]+)/);
+				expect(match).not.toBeNull();
+				const decoded = decodeURIComponent(match?.[1] ?? "");
+				expect(decoded).toBe(
+					`${expectedScheme}://jolli.jollimemory-vscode/auth-callback`,
+				);
+			});
+		});
+
+		it("should fall back to vscode:// for an unrecognized host appName", async () => {
+			// Safety net for forks resolveUriScheme() doesn't know about yet:
+			// we route to "vscode" so at least the VSCode-family install on the
+			// machine catches the callback (better than a scheme that nothing
+			// on the OS is registered to handle). The user can then add the new
+			// fork to the mapping.
+			appNameState.current = "Some Brand New Fork";
+
+			await service.openSignInPage();
+
+			expect(uriParse).toHaveBeenCalledTimes(1);
+			const parsed = uriParse.mock.calls[0]?.[0] ?? "";
+			const match = parsed.match(/cli_callback=([^&]+)/);
+			const decoded = decodeURIComponent(match?.[1] ?? "");
+			expect(decoded).toBe("vscode://jolli.jollimemory-vscode/auth-callback");
 		});
 	});
 
