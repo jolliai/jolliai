@@ -757,6 +757,12 @@ describe("queue-driven Worker", () => {
 		expect(getCommitInfo).toHaveBeenCalledWith("abc123", "/test/project");
 		expect(generateSummary).toHaveBeenCalled();
 		expect(deleteQueueEntry).toHaveBeenCalledWith(DEFAULT_COMMIT_OP.filePath);
+		// Leaf commits persist diffStats on the CommitSummary equal to the actual
+		// `git diff {hash}^..{hash}` result (mocked to {2, 10, 5} in setupFullPipeline).
+		// For leaves this value equals `stats`, but diffStats is the canonical
+		// field the display layer reads via resolveDiffStats.
+		const summaryArg = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
+		expect(summaryArg.diffStats).toEqual({ filesChanged: 2, insertions: 10, deletions: 5 });
 	});
 
 	it("exits gracefully when queue is empty", async () => {
@@ -1199,6 +1205,31 @@ describe("queue-driven Worker", () => {
 				false,
 				expect.anything(),
 			);
+			// The amend root carries diffStats so the display layer can read the
+			// real integer `git diff {newHash}^..{newHash}` instead of aggregating
+			// delta + children.stats (today's over-counting behavior).
+			const summaryArg = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
+			expect(summaryArg.diffStats).toBeDefined();
+		});
+
+		it("amend diffStats is the full commit diff (Scenario 1 second getDiffStats call)", async () => {
+			setupAmendPipeline({ hasOldSummary: true });
+			// Override getDiffStats to distinguish the two production calls:
+			// 1st call = delta (fromRef=oldHash, toRef=newHash) — used by the LLM
+			// 2nd call = full commit diff (newHash^..newHash) — persisted as diffStats
+			vi.mocked(getDiffStats)
+				.mockResolvedValueOnce({ filesChanged: 1, insertions: 3, deletions: 1 }) // delta
+				.mockResolvedValueOnce({ filesChanged: 5, insertions: 120, deletions: 40 }); // full
+
+			await runWorker("/test/project");
+
+			const summaryArg = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
+			// `diffStats` is the full commit diff for display — sourced from the
+			// 2nd getDiffStats call inserted by this refactor.
+			expect(summaryArg.diffStats).toEqual({ filesChanged: 5, insertions: 120, deletions: 40 });
+			// `stats` is whatever the LLM's SummaryResult carried (mock provides a
+			// fixed 2/10/5 via createMockResult). It is NOT the diffStats.
+			expect(summaryArg.stats).not.toEqual(summaryArg.diffStats);
 		});
 
 		it("creates fresh leaf node when no old summary exists", async () => {
@@ -1215,6 +1246,13 @@ describe("queue-driven Worker", () => {
 
 		it("skips LLM but migrates index for message-only amend (no diff, no transcript)", async () => {
 			setupAmendPipeline({ hasOldSummary: true, hasTranscript: false, hasDiff: false });
+			// Second getDiffStats call (for `{newHash}^..{newHash}` integral) returns
+			// a non-zero number — the full commit has a diff even though the message-only
+			// amend DELTA is empty. This is the key correctness invariant the plan
+			// calls out for the message-only branch.
+			vi.mocked(getDiffStats)
+				.mockResolvedValueOnce({ filesChanged: 0, insertions: 0, deletions: 0 }) // delta = empty
+				.mockResolvedValueOnce({ filesChanged: 3, insertions: 70, deletions: 15 }); // integral
 
 			await runWorker("/test/project");
 
@@ -1229,6 +1267,14 @@ describe("queue-driven Worker", () => {
 				}),
 				"/test/project",
 			);
+			// The message-only amend ALSO writes diffStats (the full commit diff) on
+			// the migrated summary, so display code doesn't fall back to recursive
+			// aggregation of children. This was previously missed — see plan.
+			const summaryArg = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
+			expect(summaryArg.diffStats).toEqual({ filesChanged: 3, insertions: 70, deletions: 15 });
+			// `stats` field stays undefined on the migrated summary (this path never
+			// ran an LLM and had no local `stats` value to assign).
+			expect(summaryArg.stats).toBeUndefined();
 		});
 	});
 

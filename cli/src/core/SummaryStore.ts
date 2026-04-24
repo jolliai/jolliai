@@ -168,6 +168,14 @@ export async function migrateOneToOne(
 	// - orphanedDocIds: memory article IDs pending cleanup on next push
 	const strippedOld = stripFunctionalMetadata(oldSummary);
 	const docUrl = oldSummary.jolliDocUrl;
+
+	// Compute the real `git diff {newHash}^..{newHash}` for the persisted `diffStats`
+	// field. Rebase-pick preserves the diff of the commit, but the new hash has a
+	// different parent so we recompute to be safe.
+	const migratedDiffStats: DiffStats = await getDiffStats(`${newCommitInfo.hash}^`, newCommitInfo.hash, cwd).catch(
+		(): DiffStats => ({ filesChanged: 0, insertions: 0, deletions: 0 }),
+	);
+
 	const newSummary: CommitSummary = {
 		version: 3,
 		commitHash: newCommitInfo.hash,
@@ -183,6 +191,7 @@ export async function migrateOneToOne(
 		...(oldSummary.plans && { plans: oldSummary.plans }),
 		...(oldSummary.notes && { notes: oldSummary.notes }),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
+		diffStats: migratedDiffStats,
 		children: [strippedOld],
 	};
 
@@ -403,6 +412,14 @@ export async function mergeManyToOne(
 	const allOrphanedDocIds = [...jolliMeta.orphanedDocIds, ...inheritedOrphanIds];
 	const strippedChildren = children.map(stripFunctionalMetadata);
 
+	// Compute the real `git diff {squashHash}^..{squashHash}` for the persisted
+	// `diffStats` field. This is what the display layer reads — eliminates the need
+	// for the recursive children aggregation that previously over-counted files
+	// modified by multiple source commits.
+	const mergedDiffStats: DiffStats = await getDiffStats(`${newCommitInfo.hash}^`, newCommitInfo.hash, cwd).catch(
+		(): DiffStats => ({ filesChanged: 0, insertions: 0, deletions: 0 }),
+	);
+
 	const mergedSummary: CommitSummary = {
 		version: 3,
 		commitHash: newCommitInfo.hash,
@@ -418,6 +435,7 @@ export async function mergeManyToOne(
 		...(hoistedNotes.length > 0 && { notes: hoistedNotes }),
 		...(jolliMeta.winner && { jolliDocId: jolliMeta.winner.jolliDocId, jolliDocUrl: jolliMeta.winner.jolliDocUrl }),
 		...(allOrphanedDocIds.length > 0 && { orphanedDocIds: allOrphanedDocIds }),
+		diffStats: mergedDiffStats,
 		children: strippedChildren,
 	};
 
@@ -938,17 +956,26 @@ async function flattenSummaryTree(
 	const isRoot = parentCommitHash === null;
 
 	// For root entries, compute display-level metadata (topicCount + diffStats).
-	// diffStats are reused from the existing entry when available (commit hash unchanged
-	// means diff unchanged — e.g. WebView topic edits via storeSummary(force=true)).
+	// Source of truth for diffStats, in preference order:
+	//   1. node.diffStats — persisted by the construction pipeline (executePipeline /
+	//      handleAmendPipeline / mergeManyToOne / migrateOneToOne) from a fresh
+	//      `git diff`. Reusing it here avoids a redundant git call AND guarantees
+	//      that summaries/{hash}.json and index.json carry the same value by construction.
+	//   2. existing entry — commit hash unchanged means diff unchanged (e.g. WebView
+	//      topic edit via storeSummary(force=true) on a legacy v3 summary that has
+	//      no diffStats on the node).
+	//   3. fresh `git diff` — legacy v3 path where neither the node nor the index
+	//      entry carries diffStats yet. Returns zeros on first-commit (no parent).
 	let rootFields: { readonly topicCount: number; readonly diffStats: DiffStats } | undefined;
 	if (isRoot) {
+		const nodeDiffStats = node.diffStats;
 		const existingDiffStats = existingEntryMap?.get(node.commitHash)?.diffStats;
 		let diffStats: DiffStats;
-		if (existingDiffStats) {
+		if (nodeDiffStats) {
+			diffStats = nodeDiffStats;
+		} else if (existingDiffStats) {
 			diffStats = existingDiffStats;
 		} else {
-			// getDiffStats returns zeroes when git diff fails (e.g. first commit with no parent),
-			// because execGit internally catches all errors and returns empty stdout.
 			diffStats = await getDiffStats(`${node.commitHash}^`, node.commitHash, cwd);
 		}
 		rootFields = { topicCount: countTopics(node), diffStats };

@@ -7,9 +7,9 @@
  */
 
 import {
-	aggregateStats,
 	aggregateTurns,
 	formatDurationLabel,
+	resolveDiffStats,
 } from "../../../cli/src/core/SummaryTree.js";
 import type {
 	CommitSummary,
@@ -69,7 +69,7 @@ export function buildHtml(
 		sourceNodes,
 		showRecordDates,
 	} = collectSortedTopics(summary);
-	const stats = aggregateStats(summary);
+	const stats = resolveDiffStats(summary);
 	const totalInsertions = stats.insertions;
 	const totalDeletions = stats.deletions;
 	const totalFiles = stats.filesChanged;
@@ -553,12 +553,11 @@ function renderCommitRow(node: CommitSummary): string {
 	const turnsSuffix = turns
 		? ` &middot; <span class="stat-turns">${turns} turn${turns !== 1 ? "s" : ""}</span>`
 		: "";
-	const ins = node.stats?.insertions ?? 0;
-	const del = node.stats?.deletions ?? 0;
+	const nodeStats = resolveDiffStats(node);
 	return `<div class="commit-row">
   <span class="hash">${escHtml(node.commitHash.substring(0, 8))}</span>
   <span class="commit-msg">${escHtml(node.commitMessage)}</span>
-  <span class="commit-meta"><span class="stat-add">+${ins}</span> <span class="stat-del">\u2212${del}</span>${turnsSuffix} &middot; ${formatDate(getDisplayDate(node))}</span>
+  <span class="commit-meta"><span class="stat-add">+${nodeStats.insertions}</span> <span class="stat-del">\u2212${nodeStats.deletions}</span>${turnsSuffix} &middot; ${formatDate(getDisplayDate(node))}</span>
 </div>`;
 }
 

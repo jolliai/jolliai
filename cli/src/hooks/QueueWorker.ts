@@ -735,7 +735,8 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		log.info("Plan progress: evaluated %d/%d plan(s)", planProgressArtifacts.length, planRefs.length);
 	}
 
-	// Build the CommitSummary leaf node with top-level fields from the API result
+	// Build the CommitSummary leaf node with top-level fields from the API result.
+	// For a leaf, diffStats === stats (both are `git diff {hash}^..{hash}`).
 	const summary: CommitSummary = {
 		version: 3,
 		commitHash: commitInfo.hash,
@@ -747,6 +748,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		commitType,
 		commitSource,
 		...summaryResult,
+		diffStats,
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
 		...(noteRefs.length > 0 ? { notes: noteRefs } : {}),
 	};
@@ -1018,6 +1020,17 @@ async function handleAmendPipeline(
 		formatElapsed(stepStart),
 	);
 
+	// Compute the amend commit's FULL diff (git diff {newHash}^..{newHash}) for the
+	// persisted `diffStats` field. In Scenario 1 (diffOverride = oldHash..newHash) the
+	// `diffStats` local above is the DELTA, not the full commit diff. In Scenario 2
+	// (default HEAD~1..HEAD, equals newHash^..newHash at amend time) the two are equal
+	// and we skip the extra git call.
+	const amendFullDiffStats: DiffStats = diffOverride
+		? await getDiffStats(`${commitInfo.hash}^`, commitInfo.hash, cwd).catch(
+				(): DiffStats => ({ filesChanged: 0, insertions: 0, deletions: 0 }),
+			)
+		: diffStats;
+
 	// Guard: skip LLM generation if no transcript entries AND no file changes.
 	// However, we MUST still migrate the index even when skipping — a message-only amend
 	// changes the commit hash and the old hash must be replaced in the index.
@@ -1041,6 +1054,7 @@ async function handleAmendPipeline(
 				...(metadata?.commitType && { commitType: metadata.commitType }),
 				...(metadata?.commitSource && { commitSource: metadata.commitSource }),
 				...hoistMetadataFromOldSummary(oldSummary),
+				diffStats: amendFullDiffStats,
 				children: [strippedOld],
 			};
 			await storeSummary(migratedSummary, cwd);
@@ -1109,6 +1123,10 @@ async function handleAmendPipeline(
 		...(metadata?.commitType && { commitType: metadata.commitType }),
 		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
 		...summaryResult,
+		// `summaryResult.stats` is what the LLM processed — in Scenario 1 that's
+		// the amend delta, not the full commit diff. `diffStats` is a separate
+		// field that always records the full commit diff for display purposes.
+		diffStats: amendFullDiffStats,
 		...hoistMetadataFromOldSummary(oldSummary),
 		...(strippedOld && { children: [strippedOld] }),
 	};

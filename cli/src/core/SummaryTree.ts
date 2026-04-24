@@ -42,6 +42,11 @@ export function collectAllTopics(node: CommitSummary): ReadonlyArray<TopicWithDa
 /**
  * Recursively aggregates diff statistics across the entire tree.
  * Pure function — does not mutate the original node.
+ *
+ * NOTE: Display code must NOT call this directly. Use resolveDiffStats() instead,
+ * which prefers the persisted `diffStats` field and only falls back here for v3
+ * legacy data. This function is retained as the fallback implementation and for
+ * internal use (e.g. SessionStartHook's branch-level aggregation).
  */
 export function aggregateStats(node: CommitSummary): DiffStats {
 	const s = node.stats;
@@ -55,6 +60,33 @@ export function aggregateStats(node: CommitSummary): DiffStats {
 		deletions += cs.deletions;
 	}
 	return { filesChanged, insertions, deletions };
+}
+
+/**
+ * Single source of truth for display code's diff stats.
+ *
+ * Decision tree:
+ *   1. node.diffStats present                → return it (new data, authoritative).
+ *   2. node is a LEAF (no children)          → return node.stats ?? zeros.
+ *      Leaves always have a well-defined `stats` = this commit's own diff.
+ *   3. node is a CONTAINER (has children)    → return aggregateStats(node).
+ *      Rationale: on legacy container roots, `stats` may be:
+ *        - absent (squash / rebase-pick roots)  → must aggregate
+ *        - a delta diff (amend root, Scenario 1) → mixing delta with
+ *          children.stats (the pre-amend full diff) is exactly what today's
+ *          aggregateStats() does. Preserving aggregate keeps the display
+ *          pixel-identical to today for legacy amend data.
+ *
+ * Display code MUST use this helper. Never call aggregateStats() directly, and
+ * never read node.stats as a display field.
+ */
+export function resolveDiffStats(node: CommitSummary): DiffStats {
+	if (node.diffStats) return node.diffStats;
+	const hasChildren = (node.children?.length ?? 0) > 0;
+	if (!hasChildren) {
+		return node.stats ?? { filesChanged: 0, insertions: 0, deletions: 0 };
+	}
+	return aggregateStats(node);
 }
 
 /** Recursively sums conversationTurns across the entire tree. */

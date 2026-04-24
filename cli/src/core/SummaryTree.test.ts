@@ -10,6 +10,7 @@ import {
 	deleteTopicInTree,
 	formatDurationLabel,
 	isLeafNode,
+	resolveDiffStats,
 	updateTopicInTree,
 } from "./SummaryTree.js";
 
@@ -356,6 +357,79 @@ describe("SummaryTree", () => {
 			expect(result).not.toBeNull();
 			expect(result?.consumed).toBe(3);
 			expect(result?.result).toBe(D);
+		});
+	});
+
+	describe("resolveDiffStats", () => {
+		it("returns diffStats when present (new-data path) — ignores stats and children", () => {
+			const node: CommitSummary = {
+				...A,
+				diffStats: { filesChanged: 99, insertions: 999, deletions: 9 },
+				stats: { filesChanged: 1, insertions: 1, deletions: 1 },
+				children: [B],
+			};
+			expect(resolveDiffStats(node)).toEqual({ filesChanged: 99, insertions: 999, deletions: 9 });
+		});
+
+		it("returns node.stats for a leaf (no children, no diffStats)", () => {
+			// A is a leaf with stats but no diffStats
+			expect(resolveDiffStats(A)).toEqual({ filesChanged: 3, insertions: 120, deletions: 5 });
+		});
+
+		it("returns zeros for a leaf with neither diffStats nor stats", () => {
+			const empty: CommitSummary = { ...A, stats: undefined };
+			expect(resolveDiffStats(empty)).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
+		});
+
+		it("treats undefined children and [] children both as leaf", () => {
+			const withEmptyChildren: CommitSummary = { ...A, children: [] };
+			expect(resolveDiffStats(withEmptyChildren)).toEqual({ filesChanged: 3, insertions: 120, deletions: 5 });
+		});
+
+		it("aggregates across tree for a container (legacy squash root: no diffStats, no stats, has children)", () => {
+			// D is a pure container with children [B, C] where C in turn has child A.
+			// Matches today's aggregateStats behavior exactly.
+			const viaHelper = resolveDiffStats(D);
+			const viaAggregate = aggregateStats(D);
+			expect(viaHelper).toEqual(viaAggregate);
+			// Sanity: the sum matches aggregateStats's own test expectation
+			expect(viaHelper).toEqual({ filesChanged: 6, insertions: 203, deletions: 10 });
+		});
+
+		it("aggregates for a legacy amend root (stats is delta, has children)", () => {
+			// Legacy amend: stats = delta (small), children carry pre-amend full stats.
+			// Today's display is aggregateStats(amend) = delta + children.stats. Must
+			// stay identical under resolveDiffStats for backward compatibility.
+			const legacyAmend: CommitSummary = {
+				...C, // C already has stats (delta-ish) + children [A]
+			};
+			expect(resolveDiffStats(legacyAmend)).toEqual(aggregateStats(legacyAmend));
+			expect(resolveDiffStats(legacyAmend)).toEqual({ filesChanged: 4, insertions: 123, deletions: 8 });
+		});
+
+		it("aggregates for a legacy nested container (no diffStats anywhere, no root stats, has children)", () => {
+			// Pure nested container: mimics an old squash/rebase-pick root viewed via getSummary.
+			const nested: CommitSummary = {
+				...D,
+				stats: undefined,
+				diffStats: undefined,
+				children: [B, C], // reuse same sub-tree
+			};
+			expect(resolveDiffStats(nested)).toEqual(aggregateStats(nested));
+		});
+
+		it("returns diffStats even when children are present (new container root)", () => {
+			const newSquashRoot: CommitSummary = {
+				...D,
+				diffStats: { filesChanged: 2, insertions: 40, deletions: 20 },
+				// No stats (container), children still present
+				children: [B, C],
+			};
+			expect(resolveDiffStats(newSquashRoot)).toEqual({
+				filesChanged: 2,
+				insertions: 40,
+				deletions: 20,
+			});
 		});
 	});
 });

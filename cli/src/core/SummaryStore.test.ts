@@ -706,6 +706,8 @@ describe("SummaryStore", () => {
 			expect(newSummaryContent.commitType).toBe("rebase");
 			expect(newSummaryContent.topics).toBeUndefined();
 			expect(newSummaryContent.stats).toBeUndefined();
+			// diffStats is populated from git diff (persisted for display layer — no recursive aggregation needed)
+			expect(newSummaryContent.diffStats).toEqual({ filesChanged: 1, insertions: 5, deletions: 2 });
 			// Old summary preserved as the sole child — old hash is never lost
 			expect(newSummaryContent.children).toHaveLength(1);
 			expect(newSummaryContent.children?.[0].commitHash).toBe(oldHash);
@@ -883,6 +885,18 @@ describe("SummaryStore", () => {
 			expect(hashes).toContain(newHash);
 			expect(hashes).toContain("oldhash");
 		});
+
+		it("falls back to zero diffStats when git diff fails on the new rebase-pick root", async () => {
+			vi.mocked(getDiffStats).mockRejectedValueOnce(new Error("git diff failed"));
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+
+			const newHash = "newhash0000000000000002";
+			await migrateOneToOne(createMockSummary("oldhash"), createMockCommitInfo(newHash));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const migrated = JSON.parse(files[0].content) as CommitSummary;
+			expect(migrated.diffStats).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
+		});
 	});
 
 	describe("mergeManyToOne", () => {
@@ -932,10 +946,15 @@ describe("SummaryStore", () => {
 			expect(mergedContent.children?.[1].commitHash).toBe(oldHash1);
 			expect(mergedContent.children?.[1].topics).toHaveLength(1);
 
-			// Pure container: no own topics/stats/llm
+			// Pure container: no own topics/stats/llm (stats = the node's own LLM-processed
+			// diff; a pure squash root has none since no LLM runs on it).
 			expect(mergedContent.topics).toBeUndefined();
 			expect(mergedContent.stats).toBeUndefined();
 			expect(mergedContent.llm).toBeUndefined();
+			// diffStats IS populated — it's the real `git diff {squashHash}^..{squashHash}`
+			// computed at merge time, so the display layer never needs to recursively
+			// aggregate children (which over-counts files edited by multiple sources).
+			expect(mergedContent.diffStats).toEqual({ filesChanged: 1, insertions: 5, deletions: 2 });
 
 			// Index: all three hashes present; old hashes are now children of new hash
 			const newIndexContent = JSON.parse(files[1].content) as SummaryIndex;
@@ -1488,6 +1507,57 @@ describe("SummaryStore", () => {
 			const merged = JSON.parse(files[0].content) as CommitSummary;
 			expect(merged.notes).toHaveLength(1);
 			expect(merged.notes?.[0].title).toBe("Newer");
+		});
+
+		it("stores diffStats from git --shortstat even when child .stats would over-count", async () => {
+			// Scenario: 3 source commits all edit the SAME file. Recursive aggregation
+			// (today's aggregateStats) would report filesChanged=3 because each child
+			// has its own stats{filesChanged:1}. The real git diff of the squash commit,
+			// however, is filesChanged=1 (one distinct file on disk). Our persisted
+			// diffStats reflects the real number — not the inflated aggregate.
+
+			// Override default getDiffStats for this test: real squash diff = 1 file.
+			vi.mocked(getDiffStats).mockResolvedValueOnce({
+				filesChanged: 1,
+				insertions: 42,
+				deletions: 5,
+			});
+
+			const makeSourceWithStats = (hash: string, insertions: number): CommitSummary => ({
+				...createMockSummary(hash),
+				stats: { filesChanged: 1, insertions, deletions: 1 },
+			});
+
+			const old1 = makeSourceWithStats("abc1", 10);
+			const old2 = makeSourceWithStats("abc2", 20);
+			const old3 = makeSourceWithStats("abc3", 15);
+
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			await mergeManyToOne([old1, old2, old3], createMockCommitInfo("squash1"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+
+			// Real diff wins: 1 file changed, NOT 3 (which children.stats summed would give)
+			expect(merged.diffStats).toEqual({ filesChanged: 1, insertions: 42, deletions: 5 });
+			// Sanity: children retain their original per-commit stats unchanged
+			expect(merged.children?.[0].stats?.filesChanged).toBe(1);
+			expect(merged.children?.[1].stats?.filesChanged).toBe(1);
+			expect(merged.children?.[2].stats?.filesChanged).toBe(1);
+		});
+
+		it("falls back to zero diffStats when git diff fails (e.g. first commit)", async () => {
+			vi.mocked(getDiffStats).mockRejectedValueOnce(new Error("git diff failed"));
+
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			await mergeManyToOne(
+				[createMockSummary("old1"), createMockSummary("old2")],
+				createMockCommitInfo("newhash"),
+			);
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.diffStats).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
 		});
 	});
 
@@ -2152,6 +2222,35 @@ describe("SummaryStore", () => {
 			expect(indexContent.entries[0].diffStats).toEqual({ filesChanged: 10, insertions: 100, deletions: 50 });
 			// getDiffStats should NOT be called — reused from existing entry
 			expect(getDiffStats).not.toHaveBeenCalled();
+		});
+
+		it("should prefer node.diffStats over index and skip git call (new-data path)", async () => {
+			// CommitSummary carries its own persisted diffStats (written by the pipeline).
+			// flattenSummaryTree must prefer it — this guarantees summary.json and
+			// index.json carry the same value by construction AND avoids a redundant
+			// git call. Priority: node.diffStats > existing entry > fresh git diff.
+			const summary: CommitSummary = {
+				...createMockSummary("newdata"),
+				diffStats: { filesChanged: 7, insertions: 77, deletions: 17 },
+			};
+			// Existing index has stale diffStats — should be ignored
+			const staleEntry: SummaryIndexEntry = {
+				...rootEntry("newdata", "Stale"),
+				diffStats: { filesChanged: 99, insertions: 999, deletions: 999 },
+			};
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([staleEntry])));
+
+			await storeSummary(summary, undefined, true);
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const indexContent = JSON.parse(files[1].content) as SummaryIndex;
+			// Index entry reflects node.diffStats, not the stale value nor a fresh git diff
+			expect(indexContent.entries[0].diffStats).toEqual({ filesChanged: 7, insertions: 77, deletions: 17 });
+			// No redundant git call when the node already carries the answer
+			expect(getDiffStats).not.toHaveBeenCalled();
+			// summary.json on disk reflects the same value — single source of truth
+			const summaryContent = JSON.parse(files[0].content) as CommitSummary;
+			expect(summaryContent.diffStats).toEqual({ filesChanged: 7, insertions: 77, deletions: 17 });
 		});
 	});
 

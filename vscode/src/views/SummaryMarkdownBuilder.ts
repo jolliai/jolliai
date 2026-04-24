@@ -12,9 +12,9 @@
  */
 
 import {
-	aggregateStats,
 	aggregateTurns,
 	formatDurationLabel,
+	resolveDiffStats,
 } from "../../../cli/src/core/SummaryTree.js";
 import type { CommitSummary, E2eTestScenario } from "../../../cli/src/Types.js";
 import {
@@ -62,11 +62,11 @@ function pushPropertiesSection(
 	lines: Array<string>,
 	summary: CommitSummary,
 ): void {
-	const aggStats = aggregateStats(summary);
-	const totalFiles = aggStats.filesChanged;
+	const displayStats = resolveDiffStats(summary);
+	const totalFiles = displayStats.filesChanged;
 	const totalTurns = aggregateTurns(summary);
 
-	const filesLabel = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, +${aggStats.insertions} insertions, −${aggStats.deletions} deletions`;
+	const filesLabel = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, +${displayStats.insertions} insertions, −${displayStats.deletions} deletions`;
 	const dateLabel = formatFullDate(getDisplayDate(summary));
 
 	lines.push(
@@ -167,13 +167,12 @@ function pushSourceCommitsSection(
 	}
 	lines.push("", `## Source Commits (${sourceNodes.length})`);
 	for (const node of sourceNodes) {
-		const ins = node.stats?.insertions ?? 0;
-		const del = node.stats?.deletions ?? 0;
+		const nodeStats = resolveDiffStats(node);
 		const turnsMd = node.conversationTurns
 			? ` · ${node.conversationTurns} turns`
 			: "";
 		lines.push(
-			`- \`${node.commitHash.substring(0, 8)}\` ${node.commitMessage}  _(+${ins} −${del}${turnsMd} · ${formatDate(getDisplayDate(node))})_`,
+			`- \`${node.commitHash.substring(0, 8)}\` ${node.commitMessage}  _(+${nodeStats.insertions} −${nodeStats.deletions}${turnsMd} · ${formatDate(getDisplayDate(node))})_`,
 		);
 	}
 	lines.push("", "---");

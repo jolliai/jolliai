@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
 	aggregateStats: vi.fn(),
 	aggregateTurns: vi.fn(),
 	formatDurationLabel: vi.fn(),
+	resolveDiffStats: vi.fn(),
 	collectSortedTopics: vi.fn(),
 	formatDate: vi.fn(),
 	formatFullDate: vi.fn(),
@@ -29,6 +30,7 @@ vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
 	aggregateStats: mocks.aggregateStats,
 	aggregateTurns: mocks.aggregateTurns,
 	formatDurationLabel: mocks.formatDurationLabel,
+	resolveDiffStats: mocks.resolveDiffStats,
 }));
 
 // Mock the core SummaryFormat module (used by the core SummaryMarkdownBuilder)
@@ -58,6 +60,8 @@ function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
 		commitDate: "2026-03-30T10:00:00Z",
 		branch: "feature/proj-100-login",
 		generatedAt: "2026-03-30T10:05:00Z",
+		// Default stats so resolveDiffStats mock reads a sensible value on the header call.
+		stats: { filesChanged: 3, insertions: 50, deletions: 10 },
 		...overrides,
 	};
 }
@@ -96,6 +100,11 @@ function setupDefaults(
 		filesChanged: 3,
 		insertions: 50,
 		deletions: 10,
+	});
+	mocks.resolveDiffStats.mockImplementation((node: CommitSummary) => {
+		if (node.diffStats) return node.diffStats;
+		if (node.stats) return node.stats;
+		return { filesChanged: 0, insertions: 0, deletions: 0 };
 	});
 	mocks.aggregateTurns.mockReturnValue(5);
 	mocks.formatDurationLabel.mockReturnValue("1 day (1 commit)");
