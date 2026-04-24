@@ -27,10 +27,12 @@ const { tmpdirMock } = vi.hoisted(() => ({
 }));
 
 const {
+	debug,
 	info,
 	warn,
 	error: logError,
 } = vi.hoisted(() => ({
+	debug: vi.fn(),
 	info: vi.fn(),
 	warn: vi.fn(),
 	error: vi.fn(),
@@ -88,7 +90,7 @@ vi.mock("node:os", () => ({
 }));
 
 vi.mock("../util/Logger.js", () => ({
-	log: { info, warn, error: logError },
+	log: { debug, info, warn, error: logError },
 }));
 
 // ─── Import under test ──────────────────────────────────────────────────────
@@ -252,6 +254,9 @@ describe("PrCommentService", () => {
 	describe("handleCheckPrStatus", () => {
 		it("posts multipleCommits status when branch has more than 1 commit", async () => {
 			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "symbolic-ref") {
+					return { stdout: "origin/main\n" };
+				}
 				if (cmd === "git" && args[0] === "rev-list") {
 					return { stdout: "3\n" };
 				}
@@ -739,7 +744,7 @@ describe("PrCommentService", () => {
 			);
 		});
 
-		it("treats getCommitCount failure as 0 commits and continues", async () => {
+		it("treats unresolved upstream baseline as 0 commits and continues (no origin/HEAD)", async () => {
 			const prData = {
 				number: 7,
 				url: "https://pr/7",
@@ -747,11 +752,15 @@ describe("PrCommentService", () => {
 				body: "",
 			};
 			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "symbolic-ref") {
+					// Healthy repo without a pinned origin/HEAD — e.g. no origin remote,
+					// or fresh clone before first fetch. symbolic-ref exits non-zero.
+					throw new Error(
+						"fatal: ref refs/remotes/origin/HEAD is not a symbolic ref",
+					);
+				}
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/test\n" };
-				}
-				if (cmd === "git" && args[0] === "rev-list") {
-					throw new Error("origin/main not found");
 				}
 				if (cmd === "gh" && args[0] === "--version") {
 					return { stdout: "gh version 2.40.0\n" };
@@ -767,7 +776,7 @@ describe("PrCommentService", () => {
 
 			await handleCheckPrStatus(CWD, postMessage);
 
-			// getCommitCount caught → 0, so no "multipleCommits", continues to PR check
+			// baseline unresolved → 0 commits, no multipleCommits gate, flow continues.
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ command: "prStatus", status: "ready" }),
 			);
@@ -840,6 +849,9 @@ describe("PrCommentService", () => {
 
 		it("keeps commit count check when branch matches current branch", async () => {
 			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "symbolic-ref") {
+					return { stdout: "origin/main\n" };
+				}
 				if (cmd === "git" && args[0] === "rev-list") {
 					return { stdout: "3\n" };
 				}
@@ -939,6 +951,235 @@ describe("PrCommentService", () => {
 				branch: "feature/new-name",
 				crossBranch: false,
 			});
+		});
+
+		// ── debug.log observability (non-goal: UI folding stays the same) ─────
+
+		/**
+		 * Builds an execFile router stub where `gh pr view` (or a custom gh call)
+		 * can be programmed. All the prereq probes (`git rev-list`, `git rev-parse`,
+		 * `gh --version`, `gh auth status`) return success so the flow reaches
+		 * `findPrForBranch`. `ghPrHandler` controls what `gh pr ...` does.
+		 */
+		function setupHappyProbesWithPrHandler(
+			ghPrHandler: () => { stdout: string },
+		): void {
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "symbolic-ref")
+					return { stdout: "origin/main\n" };
+				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "feature/br\n" };
+				if (cmd === "gh" && args[0] === "--version")
+					return { stdout: "gh 2.40\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr") return ghPrHandler();
+				return { stdout: "" };
+			});
+		}
+
+		/** Builds an Error with `code` and `stderr` attached, mimicking child_process execFile rejection shape. */
+		function ghError(opts: {
+			message: string;
+			code?: string | number;
+			stderr?: string;
+		}): Error {
+			const err = new Error(opts.message) as Error & {
+				code?: string | number;
+				stderr?: string;
+			};
+			if (opts.code !== undefined) err.code = opts.code;
+			if (opts.stderr !== undefined) err.stderr = opts.stderr;
+			return err;
+		}
+
+		it("does not emit warn/debug on the happy path (baseline)", async () => {
+			setupHappyProbesWithPrHandler(() => ({
+				stdout: JSON.stringify({
+					number: 7,
+					url: "https://pr/7",
+					title: "t",
+					body: "b",
+				}),
+			}));
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(warn).not.toHaveBeenCalled();
+			expect(debug).not.toHaveBeenCalled();
+		});
+
+		it("logs at debug when gh pr view stderr indicates 'no pull requests found'", async () => {
+			setupHappyProbesWithPrHandler(() => {
+				throw ghError({
+					message: "gh: exit 1",
+					code: 1,
+					stderr: "no pull requests found for branch feature/br\n",
+				});
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(debug).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.stringContaining("No PR for branch feature/br"),
+			);
+			expect(warn).not.toHaveBeenCalled();
+			// UI folding unchanged — see plan non-goal
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
+			);
+		});
+
+		it("logs at warn when gh pr view fails with a non-expected stderr (e.g. auth/ratelimit)", async () => {
+			setupHappyProbesWithPrHandler(() => {
+				throw ghError({
+					message: "gh: exit 1",
+					code: 1,
+					stderr: "authentication required: please run gh auth login\n",
+				});
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(warn).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.stringMatching(
+					/gh pr view failed for branch feature\/br.*code=1.*stderr:.*authentication required/s,
+				),
+			);
+			expect(debug).not.toHaveBeenCalled();
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
+			);
+		});
+
+		it("logs at warn with code=ENOENT when gh binary is missing for the pr view call", async () => {
+			// Note: pre-check `gh --version` succeeds in this stub; we only fail
+			// the `gh pr view` call, to exercise tryExecGh's ENOENT branch
+			// specifically (rather than checkGhInstalled's).
+			setupHappyProbesWithPrHandler(() => {
+				throw ghError({ message: "spawn gh ENOENT", code: "ENOENT" });
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(warn).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.stringContaining("code=ENOENT"),
+			);
+		});
+
+		it("logs at warn with Raw length when gh pr view returns unparseable JSON", async () => {
+			setupHappyProbesWithPrHandler(() => ({
+				stdout: "not-json-{{{",
+			}));
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(warn).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.stringMatching(/unparseable JSON.*Raw length: \d+/s),
+			);
+			// UI folding unchanged
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
+			);
+		});
+
+		it("stays silent when upstream baseline cannot be resolved — healthy repos without origin/HEAD must not spam logs", async () => {
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "symbolic-ref") {
+					// No origin/HEAD pinned — common in repos with no `origin`, fresh
+					// clones, or detached setups. Previously this caused a warn on
+					// every PR panel open for any repo using master/trunk; now it
+					// should be completely silent.
+					throw new Error(
+						"fatal: ref refs/remotes/origin/HEAD is not a symbolic ref",
+					);
+				}
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "feature/br\n" };
+				if (cmd === "gh" && args[0] === "--version")
+					return { stdout: "gh 2.40\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr") throw new Error("no pr");
+				return { stdout: "" };
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			// Silent: no commit-count log at all when baseline is unresolved.
+			// (The unrelated `gh pr` stub still trips a warn from findPrForBranch,
+			// so assert narrowly: nothing about rev-list.)
+			expect(warn).not.toHaveBeenCalledWith(
+				expect.any(String),
+				expect.stringContaining("rev-list"),
+			);
+			expect(debug).not.toHaveBeenCalledWith(
+				expect.any(String),
+				expect.stringContaining("rev-list"),
+			);
+			// Flow continues — commit count treated as 0 means no multipleCommits gate.
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ status: "multipleCommits" }),
+			);
+		});
+
+		it("resolves the actual upstream default branch (origin/master etc.), not hardcoded origin/main", async () => {
+			// Verifies the root-cause fix: squash gate works in master-based repos.
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "symbolic-ref") {
+					return { stdout: "origin/master\n" };
+				}
+				if (cmd === "git" && args[0] === "rev-list") {
+					// Executed only if the command uses origin/master..HEAD — otherwise
+					// the production bug (hardcoded origin/main) would reach this stub
+					// with different args and we would never see count=5 in postMessage.
+					expect(args).toEqual(["rev-list", "--count", "origin/master..HEAD"]);
+					return { stdout: "5\n" };
+				}
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "feature/br\n" };
+				return { stdout: "" };
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prStatus",
+				status: "multipleCommits",
+				count: 5,
+			});
+		});
+
+		it("warns when rev-list fails after the upstream baseline was resolved — that is a real repo problem, not a config mismatch", async () => {
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "symbolic-ref") {
+					return { stdout: "origin/master\n" };
+				}
+				if (cmd === "git" && args[0] === "rev-list") {
+					// Baseline resolved but rev-list still broke — e.g. permission,
+					// corruption. Worth a warn so debug.log has a trail.
+					throw new Error("fatal: bad object origin/master");
+				}
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "feature/br\n" };
+				if (cmd === "gh" && args[0] === "--version")
+					return { stdout: "gh 2.40\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr") throw new Error("no pr");
+				return { stdout: "" };
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(warn).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.stringMatching(
+					/git rev-list --count origin\/master\.\.HEAD failed.*bad object/s,
+				),
+			);
 		});
 	});
 
