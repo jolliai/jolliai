@@ -15,6 +15,24 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 	};
 });
 
+// Redirect homedir() so the global-config tests don't pollute the developer's
+// real ~/.jolli/jollimemory/config.json. Default passes through to the real
+// homedir(); individual tests opt into redirection via mockHomedir.mockReturnValue().
+// Cross-platform: works on Windows too, where process.env.HOME is ignored by homedir().
+const { mockHomedir, realHomedir } = vi.hoisted(() => ({
+	mockHomedir: vi.fn<typeof import("node:os").homedir>(),
+	realHomedir: { current: null as typeof import("node:os").homedir | null },
+}));
+vi.mock("node:os", async (importOriginal) => {
+	const original = await importOriginal<typeof import("node:os")>();
+	realHomedir.current = original.homedir;
+	mockHomedir.mockImplementation(original.homedir);
+	return {
+		...original,
+		homedir: mockHomedir,
+	};
+});
+
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1058,23 +1076,23 @@ describe("SessionTracker", () => {
 	// ── loadConfig (global shorthand) ────────────────────────────────────
 
 	describe("loadConfig", () => {
+		beforeEach(() => {
+			mockHomedir.mockReturnValue(tempDir);
+		});
+
+		afterEach(() => {
+			if (realHomedir.current) mockHomedir.mockImplementation(realHomedir.current);
+		});
+
 		it("should return config from global dir without throwing", async () => {
 			const config = await loadConfig();
 			expect(config).toBeDefined();
 		});
 
 		it("saveConfig should persist config to the global directory shorthand", async () => {
-			const originalHome = process.env.HOME;
-			process.env.HOME = tempDir;
-
-			try {
-				await saveConfig({ apiKey: "global-key" });
-				const config = await loadConfig();
-				expect(config.apiKey).toBe("global-key");
-			} finally {
-				if (originalHome === undefined) delete process.env.HOME;
-				else process.env.HOME = originalHome;
-			}
+			await saveConfig({ apiKey: "global-key" });
+			const config = await loadConfig();
+			expect(config.apiKey).toBe("global-key");
 		});
 	});
 
