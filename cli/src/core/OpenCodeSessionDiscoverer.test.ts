@@ -144,12 +144,12 @@ describe("OpenCodeSessionDiscoverer", () => {
 		it("returns the default XDG path under home directory", () => {
 			delete process.env.XDG_DATA_HOME;
 			mockHomedir.mockReturnValue("/home/user");
-			expect(getOpenCodeDbPath()).toBe("/home/user/.local/share/opencode/opencode.db");
+			expect(getOpenCodeDbPath()).toBe(join("/home/user", ".local/share/opencode/opencode.db"));
 		});
 
 		it("respects XDG_DATA_HOME when set", () => {
 			process.env.XDG_DATA_HOME = "/custom/data";
-			expect(getOpenCodeDbPath()).toBe("/custom/data/opencode/opencode.db");
+			expect(getOpenCodeDbPath()).toBe(join("/custom/data", "opencode/opencode.db"));
 		});
 	});
 

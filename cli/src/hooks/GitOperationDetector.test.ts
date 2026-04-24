@@ -36,6 +36,7 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { getCommitRange, getHeadHash, getLastReflogAction, isAncestor, readOrigHead } from "../core/GitOps.js";
 import { loadSquashPending, saveSquashPending } from "../core/SessionTracker.js";
 import {
@@ -62,7 +63,8 @@ describe("GitOperationDetector", () => {
 
 			const result = resolveGitDir("/test/repo");
 
-			expect(result).toBe("/test/repo/.git");
+			// path.join uses native separators — keep the assertion platform-agnostic
+			expect(result).toBe(join("/test/repo", ".git"));
 		});
 
 		it("should return the default .git path when .git is a directory", () => {
@@ -70,7 +72,7 @@ describe("GitOperationDetector", () => {
 
 			const result = resolveGitDir("/test/repo");
 
-			expect(result).toBe("/test/repo/.git");
+			expect(result).toBe(join("/test/repo", ".git"));
 		});
 
 		it("should resolve an absolute gitdir path from a worktree .git file", () => {
@@ -89,7 +91,7 @@ describe("GitOperationDetector", () => {
 			const result = resolveGitDir("/test/worktree");
 
 			// join() resolves the relative path: /test/worktree + ../.git/worktrees/feature-branch
-			expect(result).toBe("/test/.git/worktrees/feature-branch");
+			expect(result).toBe(join("/test/worktree", "../.git/worktrees/feature-branch"));
 		});
 
 		it("should return the default .git path when .git file has no gitdir line", () => {
@@ -98,7 +100,7 @@ describe("GitOperationDetector", () => {
 
 			const result = resolveGitDir("/test/repo");
 
-			expect(result).toBe("/test/repo/.git");
+			expect(result).toBe(join("/test/repo", ".git"));
 		});
 	});
 

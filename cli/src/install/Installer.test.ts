@@ -2294,8 +2294,13 @@ describe("Installer", () => {
 
 	describe("installResolveScript — failure path", () => {
 		it("should return failure when resolve-dist-path script cannot be written", async () => {
-			// Set homedir to an invalid path so mkdir fails inside installResolveScript
-			mockHomedir.mockReturnValue("/dev/null/impossible-path");
+			// Cross-platform: drop a regular file and point homedir at a path whose
+			// parent segment is that file. mkdir (even recursive) fails with ENOTDIR
+			// when any parent in the chain is not a directory. Using `/dev/null/...`
+			// only fails on POSIX — Windows happily creates it as a normal subtree.
+			const blockingFile = join(tempDir, "blocker-file");
+			await writeFile(blockingFile, "not a directory");
+			mockHomedir.mockReturnValue(join(blockingFile, "home-under-file"));
 
 			const result = await install(tempDir);
 			expect(result.success).toBe(false);

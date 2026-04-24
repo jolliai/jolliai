@@ -71,15 +71,31 @@ async function execGh(args: Array<string>, cwd: string): Promise<string> {
 	return stdout;
 }
 
-/** Runs a gh command, returning stdout or `undefined` on failure. */
+/** Result of a non-throwing gh invocation. */
+type GhCmdResult =
+	| { ok: true; stdout: string }
+	| { ok: false; code?: string | number; err: Error; stderr?: string };
+
+/**
+ * Runs a gh command. Returns a discriminated result — never throws, never
+ * returns undefined. Callers decide how to log based on the failure shape
+ * (e.g. stderr containing "no pull requests found" is expected and should
+ * be debug; anything else is warn).
+ */
 async function tryExecGh(
 	args: Array<string>,
 	cwd: string,
-): Promise<string | undefined> {
+): Promise<GhCmdResult> {
 	try {
-		return await execGh(args, cwd);
-	} catch {
-		return;
+		const stdout = await execGh(args, cwd);
+		return { ok: true, stdout };
+	} catch (e) {
+		const err = e instanceof Error ? e : new Error(String(e));
+		const code = (err as NodeJS.ErrnoException).code;
+		// execFile failure: child_process attaches stderr to the error (when
+		// within maxBuffer). Missing otherwise — callers must handle undefined.
+		const stderr = (err as { stderr?: string }).stderr;
+		return { ok: false, code, err, stderr };
 	}
 }
 
@@ -198,15 +214,56 @@ async function execGit(args: Array<string>, cwd: string): Promise<string> {
 	return stdout;
 }
 
-/** Returns the number of commits on the current branch relative to origin/main. */
-async function getCommitCount(cwd: string): Promise<number> {
+/**
+ * Resolves the upstream default branch (what `origin/HEAD` points to), e.g.
+ * `"origin/main"`, `"origin/master"`, `"origin/trunk"`. Returns `undefined`
+ * when the ref is not set — common and healthy in repos without an `origin`
+ * remote, in fresh clones before the first fetch, in detached states, or when
+ * `origin/HEAD` was never pinned. Undefined is an expected outcome, not an
+ * error: callers should treat it as "no baseline in this repo".
+ */
+async function resolveUpstreamBaseline(
+	cwd: string,
+): Promise<string | undefined> {
 	try {
 		const raw = await execGit(
-			["rev-list", "--count", "origin/main..HEAD"],
+			["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+			cwd,
+		);
+		const trimmed = raw.trim();
+		return trimmed.length > 0 ? trimmed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Returns the number of commits on the current branch that are ahead of the
+ * upstream default branch. Used only to gate the "multiple commits — please
+ * squash" UI, so 0 means "don't gate" — a safe fallback whenever the baseline
+ * cannot be determined or the count cannot be computed.
+ */
+async function getCommitCount(cwd: string): Promise<number> {
+	const baseline = await resolveUpstreamBaseline(cwd);
+	if (!baseline) {
+		// No upstream baseline in this repo — squash gate does not apply.
+		// Silent: this is the normal state for many healthy setups (no
+		// `origin`, fresh clone, detached HEAD), not a condition to warn about.
+		return 0;
+	}
+	try {
+		const raw = await execGit(
+			["rev-list", "--count", `${baseline}..HEAD`],
 			cwd,
 		);
 		return Number.parseInt(raw.trim(), 10) || 0;
-	} catch {
+	} catch (err) {
+		// Baseline resolved but rev-list failed — unusual (e.g. corrupted
+		// repo, permissions). Worth a warn so debug.log has a trail.
+		log.warn(
+			TAG,
+			`git rev-list --count ${baseline}..HEAD failed: ${(err as Error).message}`,
+		);
 		return 0;
 	}
 }
@@ -283,14 +340,36 @@ async function findPrForBranch(
 	branch: string,
 ): Promise<PrInfo | undefined> {
 	const args = ["pr", "view", "--json", "number,url,title,body", "--", branch];
-	const raw = await tryExecGh(args, cwd);
-	if (!raw) {
+	const result = await tryExecGh(args, cwd);
+
+	if (!result.ok) {
+		const stderr = result.stderr ?? "";
+		// "no pull requests found" is the expected miss path — keep it at
+		// debug to avoid noise on every WebView open. Anything else (auth,
+		// rate limit, network, repo config, non-zero exits) is a real
+		// failure and deserves warn so it shows at default log level.
+		const isExpectedNoPr = /no pull requests? found/i.test(stderr);
+		if (isExpectedNoPr) {
+			log.debug(TAG, `No PR for branch ${branch}`);
+		} else {
+			log.warn(
+				TAG,
+				`gh pr view failed for branch ${branch} (code=${result.code}): ${result.err.message}${
+					stderr ? ` | stderr: ${stderr.trim()}` : ""
+				}`,
+			);
+		}
 		return;
 	}
+
 	try {
-		const parsed = JSON.parse(raw) as PrInfo;
+		const parsed = JSON.parse(result.stdout) as PrInfo;
 		return parsed.number ? parsed : undefined;
-	} catch {
+	} catch (err) {
+		log.warn(
+			TAG,
+			`gh pr view returned unparseable JSON for branch ${branch}: ${(err as Error).message}. Raw length: ${result.stdout.length}`,
+		);
 		return;
 	}
 }
