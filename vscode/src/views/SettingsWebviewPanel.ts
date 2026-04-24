@@ -16,6 +16,7 @@ import {
 	getProjectRootDir,
 	listWorktrees,
 } from "../../../cli/src/core/GitOps.js";
+import { validateJolliApiKey } from "../../../cli/src/core/JolliApiUtils.js";
 import {
 	getGlobalConfigDir,
 	loadConfigFromDir,
@@ -235,6 +236,22 @@ export class SettingsWebviewPanel {
 			maskedApiKey,
 			maskedJolliApiKey,
 		});
+
+		// Surface invalid-but-saved Jolli API keys as soon as Settings opens.
+		// The webview only sees the masked form, so without this the user can't
+		// tell a malformed key is sitting in config until they try to save.
+		if (this.fullJolliApiKey.length > 0) {
+			try {
+				validateJolliApiKey(this.fullJolliApiKey);
+			} catch (err) {
+				const message =
+					err instanceof Error ? err.message : "Invalid Jolli API Key on file";
+				log.warn("SettingsPanel", `Saved Jolli API key is invalid: ${message}`);
+				this.postError(
+					`${message} (the key currently on disk is invalid — paste a new one and click Apply)`,
+				);
+			}
+		}
 	}
 
 	/** Saves settings, resolving masked API keys back to full values. */
@@ -250,6 +267,21 @@ export class SettingsWebviewPanel {
 			settings.jolliApiKey === sentMaskedJolliApiKey
 				? this.fullJolliApiKey
 				: settings.jolliApiKey;
+
+		// Reject unrecognized key shapes and keys whose embedded `.u` points off
+		// the allowlist before we touch disk or sync hooks. Surface the specific
+		// error inline so the user knows which field is wrong.
+		if (resolvedJolliApiKey.length > 0) {
+			try {
+				validateJolliApiKey(resolvedJolliApiKey);
+			} catch (err) {
+				const message =
+					err instanceof Error ? err.message : "Invalid Jolli API Key";
+				log.error("SettingsPanel", `Save rejected: ${message}`);
+				this.postError(message);
+				return;
+			}
+		}
 
 		// Parse exclude patterns from comma-separated string
 		const excludePatterns = settings.excludePatterns

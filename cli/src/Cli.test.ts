@@ -45,9 +45,13 @@ vi.mock("./core/SessionTracker.js", () => ({
 	deleteSquashPending: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock("./core/JolliApiUtils.js", () => ({
-	parseJolliApiKey: vi.fn().mockReturnValue(null),
-}));
+vi.mock("./core/JolliApiUtils.js", async () => {
+	const actual = await vi.importActual<typeof import("./core/JolliApiUtils.js")>("./core/JolliApiUtils.js");
+	return {
+		...actual,
+		parseJolliApiKey: vi.fn().mockReturnValue(null),
+	};
+});
 
 vi.mock("./install/DistPathResolver.js", () => ({
 	compareSemver: (a: string, b: string) => {
@@ -2512,8 +2516,11 @@ describe("CLI", () => {
 
 		it("should save API keys and print confirmation when keys are entered interactively", async () => {
 			const { saveConfigScoped } = await import("./core/SessionTracker.js");
+			// Construct an on-allowlist key so the new validateJolliApiKey gate passes.
+			const goodMeta = { t: "tenant1", u: "https://tenant1.jolli.ai" };
+			const goodJolliKey = `sk-jol-${Buffer.from(JSON.stringify(goodMeta)).toString("base64url")}.secret`;
 			// Choose "2" (manual Jolli API key), enter key, then enter Anthropic key
-			mockUserInput("2", "jk_test_key_123", "sk-ant-test-key");
+			mockUserInput("2", goodJolliKey, "sk-ant-test-key");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 
@@ -2647,8 +2654,11 @@ describe("CLI", () => {
 
 		it("should show empty line when keys are saved after manual entry", async () => {
 			const { loadConfigFromDir } = await import("./core/SessionTracker.js");
+			// Construct an on-allowlist key so the new validateJolliApiKey gate passes.
+			const goodMeta = { t: "tenant1", u: "https://tenant1.jolli.ai" };
+			const goodJolliKey = `sk-jol-${Buffer.from(JSON.stringify(goodMeta)).toString("base64url")}.secret`;
 			// Choose "2" (manual), enter Jolli key, enter Anthropic key
-			mockUserInput("2", "jk_test", "sk-ant-test");
+			mockUserInput("2", goodJolliKey, "sk-ant-test");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 			// Mock the 3 calls to loadConfigFromDir:
@@ -2657,8 +2667,8 @@ describe("CLI", () => {
 			// 3. final state check in promptAnthropicKey (has both keys)
 			vi.mocked(loadConfigFromDir)
 				.mockResolvedValueOnce({})
-				.mockResolvedValueOnce({ jolliApiKey: "jk_test" })
-				.mockResolvedValueOnce({ jolliApiKey: "jk_test", apiKey: "sk-ant-test" });
+				.mockResolvedValueOnce({ jolliApiKey: goodJolliKey })
+				.mockResolvedValueOnce({ jolliApiKey: goodJolliKey, apiKey: "sk-ant-test" });
 
 			try {
 				await main(["enable"]);
@@ -3107,6 +3117,75 @@ describe("CLI", () => {
 			expect(saveConfig).toHaveBeenCalledWith(
 				expect.objectContaining({ excludePatterns: ["*.log", "dist/**", "node_modules"] }),
 			);
+		});
+
+		it("should reject a jolliApiKey whose embedded origin is off the allowlist", async () => {
+			const { saveConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(saveConfig).mockClear();
+
+			// Build a real key whose embedded meta decodes to an off-allowlist origin —
+			// mocking parseJolliApiKey wouldn't work here because validateJolliApiKey
+			// calls into the same module (vi.mock doesn't intercept intra-module refs).
+			const evilMeta = { t: "x", u: "https://evil.com" };
+			const encoded = Buffer.from(JSON.stringify(evilMeta)).toString("base64url");
+			const evilKey = `sk-jol-${encoded}.secretbytes`;
+
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			try {
+				await main(["configure", "--set", `jolliApiKey=${evilKey}`]);
+				expect(saveConfig).not.toHaveBeenCalled();
+				expect(process.exitCode).toBe(1);
+				const errorOutput = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+				expect(errorOutput).toContain("evil.com");
+			} finally {
+				errorSpy.mockRestore();
+			}
+		});
+
+		it("should accept a jolliApiKey whose embedded origin is on the allowlist", async () => {
+			const { saveConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(saveConfig).mockClear();
+
+			const goodMeta = { t: "tenant1", u: "https://tenant1.jolli.ai" };
+			const encoded = Buffer.from(JSON.stringify(goodMeta)).toString("base64url");
+			const goodKey = `sk-jol-${encoded}.secretbytes`;
+
+			await main(["configure", "--set", `jolliApiKey=${goodKey}`]);
+
+			expect(saveConfig).toHaveBeenCalledWith(expect.objectContaining({ jolliApiKey: goodKey }));
+		});
+
+		it("should reject a jolliApiKey that cannot be decoded (legacy no-meta shape)", async () => {
+			const { saveConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(saveConfig).mockClear();
+			// Default parseJolliApiKey mock returns null.
+
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			try {
+				await main(["configure", "--set", "jolliApiKey=sk-jol-legacyhex32chars"]);
+				expect(saveConfig).not.toHaveBeenCalled();
+				expect(process.exitCode).toBe(1);
+				const errorOutput = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+				expect(errorOutput).toContain("cannot be decoded");
+			} finally {
+				errorSpy.mockRestore();
+			}
+		});
+
+		it("should reject a jolliApiKey that does not start with sk-jol-", async () => {
+			const { saveConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(saveConfig).mockClear();
+
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			try {
+				await main(["configure", "--set", "jolliApiKey=sf-jol-garbage"]);
+				expect(saveConfig).not.toHaveBeenCalled();
+				expect(process.exitCode).toBe(1);
+				const errorOutput = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+				expect(errorOutput).toContain("cannot be decoded");
+			} finally {
+				errorSpy.mockRestore();
+			}
 		});
 
 		it("should list all config keys with --list-keys", async () => {

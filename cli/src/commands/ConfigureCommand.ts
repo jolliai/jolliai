@@ -7,6 +7,7 @@
 
 import { join } from "node:path";
 import type { Command } from "commander";
+import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfig, saveConfig } from "../core/SessionTracker.js";
 import { createLogger } from "../Logger.js";
 import type { JolliMemoryConfig, LogLevel } from "../Types.js";
@@ -163,6 +164,17 @@ export function registerConfigureCommand(program: Command): void {
 						console.error(`\n  Error: ${(err as Error).message}\n`);
 						process.exitCode = 1;
 						return;
+					}
+					// Reject unrecognized shapes and keys whose embedded `.u` points off
+					// the allowlist before we touch disk. Matches saveAuthCredentials.
+					if (key === "jolliApiKey" && typeof update[key] === "string") {
+						try {
+							validateJolliApiKey(update[key] as string);
+						} catch (err) {
+							console.error(`\n  Error: ${(err as Error).message}\n`);
+							process.exitCode = 1;
+							return;
+						}
 					}
 				}
 
