@@ -2,17 +2,29 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Hoisted mocks ──────────────────────────────────────────────────────────
 
-const { aggregateStats, aggregateTurns, formatDurationLabel } = vi.hoisted(
-	() => ({
-		aggregateStats: vi.fn(() => ({
-			insertions: 10,
-			deletions: 5,
-			filesChanged: 3,
-		})),
-		aggregateTurns: vi.fn(() => 0),
-		formatDurationLabel: vi.fn(() => "2 hours"),
+const {
+	aggregateStats,
+	aggregateTurns,
+	formatDurationLabel,
+	resolveDiffStats,
+} = vi.hoisted(() => ({
+	aggregateStats: vi.fn(() => ({
+		insertions: 10,
+		deletions: 5,
+		filesChanged: 3,
+	})),
+	aggregateTurns: vi.fn(() => 0),
+	formatDurationLabel: vi.fn(() => "2 hours"),
+	// resolveDiffStats: new canonical display-stats helper.
+	// Default impl mirrors the real helper's fallback: node.diffStats →
+	// node.stats → zeros. Source-commit rows with stats-less leaves render
+	// as +0 −0, matching the old production behavior.
+	resolveDiffStats: vi.fn((node: { diffStats?: unknown; stats?: unknown }) => {
+		if (node.diffStats) return node.diffStats;
+		if (node.stats) return node.stats;
+		return { insertions: 0, deletions: 0, filesChanged: 0 };
 	}),
-);
+}));
 
 const { buildPrSectionHtml } = vi.hoisted(() => ({
 	buildPrSectionHtml: vi.fn(() => ""),
@@ -67,6 +79,7 @@ vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
 	aggregateStats,
 	aggregateTurns,
 	formatDurationLabel,
+	resolveDiffStats,
 }));
 
 vi.mock("../services/PrCommentService.js", () => ({
@@ -182,6 +195,14 @@ describe("SummaryHtmlBuilder", () => {
 			deletions: 5,
 			filesChanged: 3,
 		});
+		// Re-install the per-node default impl (clearAllMocks above cleared it).
+		resolveDiffStats.mockImplementation(
+			(node: { diffStats?: unknown; stats?: unknown }) => {
+				if (node.diffStats) return node.diffStats as object;
+				if (node.stats) return node.stats as object;
+				return { insertions: 0, deletions: 0, filesChanged: 0 };
+			},
+		);
 		aggregateTurns.mockReturnValue(0);
 		formatDurationLabel.mockReturnValue("2 hours");
 		buildPrSectionHtml.mockReturnValue("");
@@ -723,7 +744,7 @@ describe("SummaryHtmlBuilder", () => {
 		});
 
 		it("header shows correct singular/plural for file changes", () => {
-			aggregateStats.mockReturnValue({
+			resolveDiffStats.mockReturnValue({
 				insertions: 1,
 				deletions: 1,
 				filesChanged: 1,
@@ -735,7 +756,7 @@ describe("SummaryHtmlBuilder", () => {
 		});
 
 		it("header shows correct plural for multiple file changes", () => {
-			aggregateStats.mockReturnValue({
+			resolveDiffStats.mockReturnValue({
 				insertions: 10,
 				deletions: 5,
 				filesChanged: 3,

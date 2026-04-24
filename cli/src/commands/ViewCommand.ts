@@ -14,7 +14,7 @@ import { type Command, Option } from "commander";
 import { getDisplayDate } from "../core/SummaryFormat.js";
 import { buildMarkdown } from "../core/SummaryMarkdownBuilder.js";
 import { getIndex, getSummary } from "../core/SummaryStore.js";
-import { aggregateStats, aggregateTurns, collectAllTopics, formatDurationLabel } from "../core/SummaryTree.js";
+import { aggregateTurns, collectAllTopics, formatDurationLabel, resolveDiffStats } from "../core/SummaryTree.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { CommitSummary, SummaryIndexEntry, TopicSummary } from "../Types.js";
 import { formatShortDate, parsePositiveInt, resolveProjectDir } from "./CliUtils.js";
@@ -129,7 +129,7 @@ function printSummary(summary: CommitSummary): void {
 	console.log(`  Date:    ${getDisplayDate(summary)}`);
 	console.log(`  Duration: ${formatDurationLabel(summary)}`);
 
-	const stats = aggregateStats(summary);
+	const stats = resolveDiffStats(summary);
 	const statsStr = `${stats.filesChanged} files, +${stats.insertions} -${stats.deletions}`;
 	console.log(`  Changes: ${statsStr}`);
 

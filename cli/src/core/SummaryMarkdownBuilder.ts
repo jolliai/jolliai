@@ -16,7 +16,7 @@ import {
 	padIndex,
 	type TopicWithDate,
 } from "./SummaryFormat.js";
-import { aggregateStats, aggregateTurns, formatDurationLabel } from "./SummaryTree.js";
+import { aggregateTurns, formatDurationLabel, resolveDiffStats } from "./SummaryTree.js";
 
 /**
  * Builds a Markdown string from a CommitSummary for clipboard export.
@@ -74,11 +74,11 @@ export function buildPrMarkdown(summary: CommitSummary): string {
 
 /** Appends the commit properties header (H1, metadata list, separator). */
 function pushPropertiesSection(lines: Array<string>, summary: CommitSummary): void {
-	const aggStats = aggregateStats(summary);
-	const totalFiles = aggStats.filesChanged;
+	const displayStats = resolveDiffStats(summary);
+	const totalFiles = displayStats.filesChanged;
 	const totalTurns = aggregateTurns(summary);
 
-	const filesLabel = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, +${aggStats.insertions} insertions, \u2212${aggStats.deletions} deletions`;
+	const filesLabel = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, +${displayStats.insertions} insertions, \u2212${displayStats.deletions} deletions`;
 	const dateLabel = formatFullDate(getDisplayDate(summary));
 
 	lines.push(
@@ -157,11 +157,10 @@ function pushSourceCommitsSection(lines: Array<string>, sourceNodes: ReadonlyArr
 	}
 	lines.push("", `## Source Commits (${sourceNodes.length})`);
 	for (const node of sourceNodes) {
-		const ins = node.stats?.insertions ?? 0;
-		const del = node.stats?.deletions ?? 0;
+		const nodeStats = resolveDiffStats(node);
 		const turnsMd = node.conversationTurns ? ` · ${node.conversationTurns} turns` : "";
 		lines.push(
-			`- \`${node.commitHash.substring(0, 8)}\` ${node.commitMessage}  _(+${ins} \u2212${del}${turnsMd} · ${formatDate(getDisplayDate(node))})_`,
+			`- \`${node.commitHash.substring(0, 8)}\` ${node.commitMessage}  _(+${nodeStats.insertions} \u2212${nodeStats.deletions}${turnsMd} · ${formatDate(getDisplayDate(node))})_`,
 		);
 	}
 	lines.push("", "---");

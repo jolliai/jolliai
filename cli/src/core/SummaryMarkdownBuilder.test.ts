@@ -227,6 +227,89 @@ describe("buildMarkdown", () => {
 		expect(md).not.toContain("1 files");
 	});
 
+	it("reads from diffStats (new data) rather than aggregating children — fixes squash over-count", () => {
+		// Squash root with diffStats set (new data). Children have their own stats,
+		// which if aggregated would yield filesChanged=4 (2+2). The real git diff
+		// says filesChanged=1. The display must show 1.
+		const squashRoot: CommitSummary = {
+			...leaf(),
+			stats: undefined,
+			diffStats: { filesChanged: 1, insertions: 42, deletions: 5 },
+			topics: undefined,
+			children: [
+				leaf({
+					commitHash: "child1",
+					stats: { filesChanged: 2, insertions: 20, deletions: 2 },
+					topics: [{ title: "c1", trigger: "t", response: "r", decisions: "d" }],
+				}),
+				leaf({
+					commitHash: "child2",
+					stats: { filesChanged: 2, insertions: 22, deletions: 3 },
+					topics: [{ title: "c2", trigger: "t", response: "r", decisions: "d" }],
+				}),
+			],
+		};
+		const md = buildMarkdown(squashRoot);
+		expect(md).toContain("1 file changed, +42 insertions");
+		expect(md).not.toContain("4 files");
+	});
+
+	it("falls back to aggregate for legacy squash root (no diffStats, no stats, has children)", () => {
+		// Mimics a v3 squash root on disk today: no diffStats anywhere, no stats on
+		// the container. resolveDiffStats must walk children — same as today's
+		// aggregateStats — so the rendered number is pixel-identical to today.
+		const legacySquashRoot: CommitSummary = {
+			...leaf(),
+			stats: undefined,
+			diffStats: undefined,
+			topics: undefined,
+			children: [
+				leaf({
+					commitHash: "child1",
+					stats: { filesChanged: 2, insertions: 20, deletions: 2 },
+					topics: [{ title: "c1", trigger: "t", response: "r", decisions: "d" }],
+				}),
+				leaf({
+					commitHash: "child2",
+					stats: { filesChanged: 2, insertions: 22, deletions: 3 },
+					topics: [{ title: "c2", trigger: "t", response: "r", decisions: "d" }],
+				}),
+			],
+		};
+		const md = buildMarkdown(legacySquashRoot);
+		// Aggregate: 2 + 2 = 4 files, 20 + 22 = 42 insertions, 2 + 3 = 5 deletions
+		expect(md).toContain("4 files changed, +42 insertions, −5 deletions");
+	});
+
+	it("Source Commits section uses each child's real diff via resolveDiffStats", () => {
+		const squashRoot: CommitSummary = {
+			...leaf(),
+			stats: undefined,
+			diffStats: { filesChanged: 2, insertions: 30, deletions: 4 },
+			topics: undefined,
+			children: [
+				leaf({
+					commitHash: "childAAA",
+					commitMessage: "first",
+					commitDate: "2026-03-02T10:00:00.000Z",
+					stats: { filesChanged: 1, insertions: 7, deletions: 1 },
+					topics: [{ title: "c1", trigger: "t", response: "r", decisions: "d" }],
+				}),
+				leaf({
+					commitHash: "childBBB",
+					commitMessage: "second",
+					commitDate: "2026-03-03T10:00:00.000Z",
+					stats: { filesChanged: 1, insertions: 23, deletions: 3 },
+					topics: [{ title: "c2", trigger: "t", response: "r", decisions: "d" }],
+				}),
+			],
+		};
+		const md = buildMarkdown(squashRoot);
+		// Each child row renders its own real diff, not aggregated
+		expect(md).toContain("+7 ");
+		expect(md).toContain("+23 ");
+	});
+
 	it("renders date-grouped topics for multi-day squash", () => {
 		const child1 = leaf({
 			commitHash: "aaa",

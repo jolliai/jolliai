@@ -11,7 +11,7 @@ import { createLogger } from "../Logger.js";
 import type { CommitSummary, SummaryIndexEntry } from "../Types.js";
 import { getDisplayDate } from "./SummaryFormat.js";
 import { getIndex, getSummary, readNoteFromBranch, readPlanFromBranch } from "./SummaryStore.js";
-import { aggregateStats, collectAllTopics } from "./SummaryTree.js";
+import { collectAllTopics, resolveDiffStats } from "./SummaryTree.js";
 
 const log = createLogger("ContextCompiler");
 
@@ -311,12 +311,17 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
 		}
 	}
 
-	// Step 7: Aggregate stats
+	// Step 7: Aggregate stats.
+	// Horizontal (cross-commit) sum: each summary contributes its own real diff; sum
+	// gives the total work for the branch. Uses resolveDiffStats() so each commit's
+	// contribution is the persisted real `git diff` (new data) or the best available
+	// fallback (legacy). This is different from vertical (tree) recursion, which is
+	// what we eliminated — the outer sum here is the correct semantics.
 	let totalFilesChanged = 0;
 	let totalInsertions = 0;
 	let totalDeletions = 0;
 	for (const summary of summaries) {
-		const stats = aggregateStats(summary);
+		const stats = resolveDiffStats(summary);
 		totalFilesChanged += stats.filesChanged;
 		totalInsertions += stats.insertions;
 		totalDeletions += stats.deletions;
@@ -483,7 +488,7 @@ export function renderContextMarkdown(ctx: CompiledContext, tokenBudget?: number
 
 function renderSummarySection(summary: CommitSummary, index?: number): string {
 	const lines: string[] = [];
-	const stats = aggregateStats(summary);
+	const stats = resolveDiffStats(summary);
 	const prefix = index !== undefined ? `${index}. ` : "";
 
 	lines.push(

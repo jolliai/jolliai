@@ -14,6 +14,10 @@ const mocks = vi.hoisted(() => ({
 	aggregateStats: vi.fn(),
 	aggregateTurns: vi.fn(),
 	formatDurationLabel: vi.fn(),
+	// resolveDiffStats: new helper that prefers node.diffStats (new data) and
+	// falls back to aggregateStats (legacy path). Tests that previously set up
+	// aggregateStats return values keep working without change.
+	resolveDiffStats: vi.fn(),
 	collectSortedTopics: vi.fn(),
 	formatDate: vi.fn(),
 	formatFullDate: vi.fn(),
@@ -29,6 +33,7 @@ vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
 	aggregateStats: mocks.aggregateStats,
 	aggregateTurns: mocks.aggregateTurns,
 	formatDurationLabel: mocks.formatDurationLabel,
+	resolveDiffStats: mocks.resolveDiffStats,
 }));
 
 // Mock the core SummaryFormat module (used by the core SummaryMarkdownBuilder)
@@ -60,6 +65,9 @@ function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
 		commitDate: "2026-03-30T10:00:00Z",
 		branch: "feature/proj-100-login",
 		generatedAt: "2026-03-30T10:05:00Z",
+		// Default stats match commonSetup's aggregateStats return value, so the
+		// resolveDiffStats mock can read node.stats directly for the header case.
+		stats: { filesChanged: 3, insertions: 50, deletions: 10 },
 		...overrides,
 	};
 }
@@ -98,6 +106,15 @@ function setupDefaults(
 		filesChanged: 3,
 		insertions: 50,
 		deletions: 10,
+	});
+	// resolveDiffStats is the new canonical display-stats helper. Mirrors the
+	// real implementation's fallback: node.diffStats → node.stats → zeros.
+	// Leaves without stats render as +0 −0, matching the old production code
+	// path (which read `node.stats?.insertions ?? 0` directly).
+	mocks.resolveDiffStats.mockImplementation((node: CommitSummary) => {
+		if (node.diffStats) return node.diffStats;
+		if (node.stats) return node.stats;
+		return { filesChanged: 0, insertions: 0, deletions: 0 };
 	});
 	mocks.aggregateTurns.mockReturnValue(5);
 	mocks.formatDurationLabel.mockReturnValue("1 day (1 commit)");
@@ -160,6 +177,11 @@ describe("SummaryMarkdownBuilder", () => {
 				const summary = makeSummary();
 				setupDefaults(summary);
 				mocks.aggregateStats.mockReturnValue({
+					filesChanged: 1,
+					insertions: 5,
+					deletions: 0,
+				});
+				mocks.resolveDiffStats.mockReturnValue({
 					filesChanged: 1,
 					insertions: 5,
 					deletions: 0,
@@ -514,9 +536,12 @@ describe("SummaryMarkdownBuilder", () => {
 
 			it("handles source node without stats", () => {
 				const summary = makeSummary();
+				// Explicitly clear the default stats so the child is truly stats-less \u2014
+				// mirrors legacy data where a leaf's stats field was never written.
 				const child = makeSummary({
 					commitHash: "ccc3333300000000",
 					commitMessage: "No stats",
+					stats: undefined,
 				});
 				setupDefaults(summary, [makeTopic()], [child, child]);
 

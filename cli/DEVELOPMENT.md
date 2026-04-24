@@ -132,10 +132,35 @@ jolli status
 | [GeminiSessionDetector.ts](src/core/GeminiSessionDetector.ts) | Detects Gemini CLI installation |
 | [Summarizer.ts](src/core/Summarizer.ts) | Anthropic API calls for structured summary generation. Also exports `generateSquashMessage()` for the VSCode extension's squash flow |
 | [SummaryStore.ts](src/core/SummaryStore.ts) | Reads/writes summaries to the orphan branch (v3 tree format), merge/migrate operations |
-| [SummaryTree.ts](src/core/SummaryTree.ts) | Tree traversal utilities (aggregate stats/turns, collect source nodes) |
+| [SummaryTree.ts](src/core/SummaryTree.ts) | Tree traversal utilities (aggregate stats/turns, collect source nodes, `resolveDiffStats` display helper) |
 | [SummaryMigration.ts](src/core/SummaryMigration.ts) | v1→v3 migration logic for legacy orphan branch data |
 | [GitOperationDetector.ts](src/hooks/GitOperationDetector.ts) | Detects git operation type (commit, amend, squash, rebase, cherry-pick, revert) |
 | [Installer.ts](src/install/Installer.ts) | Installs/removes hooks in Claude Code, Gemini, and git |
+
+## Display-Layer Conventions
+
+### Reading diff stats — always use `resolveDiffStats`
+
+Any code that shows file/line diff numbers to a human (UI, Markdown, console, PR body, webview, AI briefing text) **MUST** read through `resolveDiffStats(node)` from [SummaryTree.ts](src/core/SummaryTree.ts).
+
+Do **NOT**:
+- Call `aggregateStats(node)` directly in display code — it recursively sums children, which over-counts files edited by multiple source commits in a squash.
+- Read `node.stats?.insertions` / `.deletions` / `.filesChanged` directly as display data — `stats` has different semantics per node type (delta for amend, absent for squash containers). It is kept as a legacy / old-plugin compat field, not for display.
+
+Do:
+- Call `resolveDiffStats(node)` — priority: persisted `node.diffStats` (new data) → `node.stats` on a leaf (legacy leaf) → recursive `aggregateStats` (legacy container fallback). The leaf/container branching prevents double-counting grandchildren on amend-over-squash trees.
+
+### Writing diff stats — `diffStats` is the persisted truth
+
+Every code path that constructs a `CommitSummary` writes `diffStats` from a fresh `git diff {hash}^..{hash}`:
+- [QueueWorker.executePipeline](src/hooks/QueueWorker.ts) — leaf commits
+- [QueueWorker.handleAmendPipeline](src/hooks/QueueWorker.ts) — amend (both the LLM branch and the message-only branch)
+- [SummaryStore.mergeManyToOne](src/core/SummaryStore.ts) — squash / merge-squash
+- [SummaryStore.migrateOneToOne](src/core/SummaryStore.ts) — rebase-pick
+
+`flattenSummaryTree()` prefers `node.diffStats` when writing the index entry, so `summaries/{hash}.json` and `index.json` are guaranteed consistent by construction and there is no redundant git call.
+
+`stats` stays untouched on new writes (keeps old plugin versions functional when they read new data).
 
 ## Unified Git Operation Queue
 

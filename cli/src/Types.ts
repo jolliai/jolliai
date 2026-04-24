@@ -202,8 +202,39 @@ export interface CommitSummary {
 	readonly conversationTurns?: number;
 	/** LLM call metadata; absent for squash/merge containers (no API call made) */
 	readonly llm?: LlmCallMetadata;
-	/** Diff statistics for this node's own changes */
+	/**
+	 * Legacy field: "this node's own LLM-processed diff".
+	 *
+	 * Semantics vary by node type — this is WHY display code cannot read it directly:
+	 *   - Leaf commits            → git diff {hash}^..{hash} (correct)
+	 *   - amend roots             → may be delta (oldHash..newHash) when diffOverride used,
+	 *                               or the full amended diff (HEAD~1..HEAD) otherwise
+	 *   - squash / rebase-pick roots → absent (containers have no own stats)
+	 *
+	 * Kept for:
+	 *   (a) backward compat with older plugin versions that only know this field
+	 *   (b) historical amend delta info (not user-facing but retained for completeness)
+	 *   (c) v3 fallback when `diffStats` is absent on legacy data
+	 *
+	 * New code should prefer `diffStats`. Display code MUST use resolveDiffStats(node)
+	 * — never read this field directly as display data.
+	 */
 	readonly stats?: DiffStats;
+	/**
+	 * Real `git diff {commitHash}^..{commitHash} --shortstat` result.
+	 *
+	 * Semantics: "this commit's actual diff against its parent". Identical meaning for
+	 * every node type (leaf / amend root / squash root / rebase-pick root / nested
+	 * container). Written at construction time by:
+	 *   - executePipeline         (leaf)
+	 *   - handleAmendPipeline     (both the LLM branch and the message-only branch)
+	 *   - mergeManyToOne          (squash / merge-squash root)
+	 *   - migrateOneToOne         (rebase-pick root)
+	 *
+	 * Display code reads via resolveDiffStats(), which falls back to `stats` /
+	 * aggregateStats() for v3 legacy data that predates this field.
+	 */
+	readonly diffStats?: DiffStats;
 	/** AI-generated topics for this node's own changes */
 	readonly topics?: ReadonlyArray<TopicSummary>;
 	/**
