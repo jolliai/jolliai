@@ -124,7 +124,13 @@ export class AuthService {
 
 	/** Opens the browser to the Jolli login page with a VSCode callback URI. */
 	async openSignInPage(): Promise<void> {
-		const callbackUri = `vscode://${EXTENSION_ID}${AUTH_CALLBACK_PATH}`;
+		// Derive the callback scheme from the host IDE. `vscode.env.uriScheme`
+		// is unreliable here — most forks inherit upstream's "vscode" default
+		// for that API even though they register their own scheme at the OS
+		// level. `appName` is consistently rebranded (forks surface it in window
+		// titles and About dialogs), so it's the stable signal — see
+		// resolveUriScheme() at the bottom of this file.
+		const callbackUri = `${resolveUriScheme()}://${EXTENSION_ID}${AUTH_CALLBACK_PATH}`;
 		// Only ask the server to issue a fresh Jolli API key when the user has
 		// none configured — otherwise sign-in would overwrite a manually
 		// configured key (and a subsequent sign-out would then delete it).
@@ -163,6 +169,32 @@ export class AuthService {
 			this.isSignedIn(config),
 		);
 	}
+}
+
+/**
+ * Resolves the OS-registered URI scheme for the host IDE.
+ *
+ * `vscode.env.uriScheme` returns "vscode" in most forks (Cursor, Windsurf,
+ * Kiro, Antigravity, …) because forks inherit upstream VSCode's default for
+ * that API without overriding it. The OS-level scheme registration, however,
+ * is usually correct — so we detect the host via `appName` (which forks
+ * consistently rebrand) and return the scheme the OS has registered.
+ *
+ * Unknown forks fall through to "vscode". If such a fork did register its
+ * own scheme, sign-in will fail over to VSCode Stable; add a new branch here
+ * and a corresponding entry to Jolli's cli_callback allowlist to fix it.
+ */
+function resolveUriScheme(): string {
+	const appName = vscode.env.appName.toLowerCase();
+	if (appName.includes("cursor")) return "cursor";
+	if (appName.includes("windsurf")) return "windsurf";
+	if (appName.includes("vscodium")) return "vscodium";
+	if (appName.includes("kiro")) return "kiro";
+	if (appName.includes("antigravity")) return "antigravity";
+	// Check "insiders" last: it coexists with "visual studio code" in the
+	// VSCode Insiders appName, and we want the more specific match to win.
+	if (appName.includes("insiders")) return "vscode-insiders";
+	return "vscode";
 }
 
 /** Maps server-returned error codes to user-friendly messages. Mirrors Login.ts. */

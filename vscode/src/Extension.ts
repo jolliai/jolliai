@@ -1272,7 +1272,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	// ── URI handler ──────────────────────────────────────────────────────────
 	// Receives the OAuth callback after browser-based login/signup.
-	// URI format: vscode://jolli.jollimemory-vscode/auth-callback?token=...&jolli_api_key=...
+	// URI format: <host-scheme>://jolli.jollimemory-vscode/auth-callback?token=...&jolli_api_key=...
+	// <host-scheme> is derived from vscode.env.appName (NOT uriScheme — forks
+	// tend to leave that at the upstream "vscode" default even though they
+	// register their own scheme at the OS level). See resolveUriScheme() in
+	// AuthService.ts for the mapping. This handler runs regardless of which
+	// scheme the OS dispatched — registerUriHandler covers every scheme.
 	context.subscriptions.push(
 		vscode.window.registerUriHandler({
 			async handleUri(uri: vscode.Uri) {
