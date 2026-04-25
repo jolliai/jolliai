@@ -15,8 +15,8 @@ This is an npm workspaces monorepo containing the CLI (`cli/`) and the VS Code e
 
 ```bash
 # Clone your fork
-git clone https://github.com/<your-username>/jollimemory.git
-cd jollimemory
+git clone https://github.com/<your-username>/jolliai.git
+cd jolliai
 
 # Install dependencies for all workspaces
 npm ci

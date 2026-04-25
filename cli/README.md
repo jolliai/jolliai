@@ -364,11 +364,11 @@ Every file under `~/.jolli/jollimemory/` and every entry on the `jollimemory/sum
 
 ## Support
 
-- **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jollimemory/issues)
+- **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jolliai/issues)
 - **Jolli Space onboarding / enterprise** — support@jolli.ai
-- **VS Code extension reference** — see the [VS Code README](https://github.com/jolliai/jollimemory/tree/main/vscode)
+- **VS Code extension reference** — see the [VS Code README](https://github.com/jolliai/jolliai/tree/main/vscode)
 
 ## License
 
-[Apache License 2.0](https://github.com/jolliai/jollimemory/blob/main/LICENSE)
+[Apache License 2.0](https://github.com/jolliai/jolliai/blob/main/LICENSE)
 
