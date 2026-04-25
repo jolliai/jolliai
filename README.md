@@ -85,7 +85,7 @@ Contributions welcome. Please read:
 
 ## Support
 
-- **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jollimemory/issues)
+- **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jolliai/issues)
 - **Jolli Space onboarding / enterprise** — support@jolli.ai
 
 ## License

@@ -297,7 +297,7 @@ Each memory uses a **v3 tree structure**: a single commit can cover multiple ind
 
 **Topic fields**: `trigger` (what prompted the work), `response` (what was built), `decisions` (design rationale — may include Markdown tables), `todo` (optional follow-up), `category` (one of `feature`, `bugfix`, `refactor`, `tech-debt`, `performance`, `security`, `test`, `docs`, `ux`, `devops`), `importance` (`major` or `minor`).
 
-For CLI export usage (`jolli export`) and programmatic consumption, see the [`@jolli.ai/cli` README](https://github.com/jolliai/jollimemory/tree/main/cli#summary-format).
+For CLI export usage (`jolli export`) and programmatic consumption, see the [`@jolli.ai/cli` README](https://github.com/jolliai/jolliai/tree/main/cli#summary-format).
 
 ## Privacy
 
@@ -324,10 +324,10 @@ Every file under `~/.jolli/jollimemory/`, every entry on the `jollimemory/summar
 
 ## Support
 
-* **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jollimemory/issues)
+* **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jolliai/issues)
 * **Jolli Space onboarding / enterprise** — support@jolli.ai
-* **CLI reference & troubleshooting** — see the [`@jolli.ai/cli` README](https://github.com/jolliai/jollimemory/tree/main/cli)
+* **CLI reference & troubleshooting** — see the [`@jolli.ai/cli` README](https://github.com/jolliai/jolliai/tree/main/cli)
 
 ## License
 
-[Apache License 2.0](https://github.com/jolliai/jollimemory/blob/main/LICENSE)
+[Apache License 2.0](https://github.com/jolliai/jolliai/blob/main/LICENSE)

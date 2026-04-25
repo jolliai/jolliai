@@ -40,12 +40,12 @@
 	"license": "Apache-2.0",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/jolliai/jollimemory",
+		"url": "https://github.com/jolliai/jolliai",
 		"directory": "cli"
 	},
-	"homepage": "https://github.com/jolliai/jollimemory/tree/main/cli#readme",
+	"homepage": "https://github.com/jolliai/jolliai/tree/main/cli#readme",
 	"bugs": {
-		"url": "https://github.com/jolliai/jollimemory/issues"
+		"url": "https://github.com/jolliai/jolliai/issues"
 	},
 	"dependencies": {
 		"@anthropic-ai/sdk": "^0.39.0",

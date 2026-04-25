@@ -31,10 +31,10 @@
 	"license": "Apache-2.0",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/jolliai/jollimemory"
+		"url": "https://github.com/jolliai/jolliai"
 	},
-	"homepage": "https://github.com/jolliai/jollimemory",
+	"homepage": "https://github.com/jolliai/jolliai",
 	"bugs": {
-		"url": "https://github.com/jolliai/jollimemory/issues"
+		"url": "https://github.com/jolliai/jolliai/issues"
 	}
 }
