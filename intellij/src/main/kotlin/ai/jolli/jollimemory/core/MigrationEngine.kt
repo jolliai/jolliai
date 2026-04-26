@@ -94,8 +94,17 @@ class MigrationEngine(
             ))
         }
 
+        // Migrate all summaries (including non-root ones missed by the entry loop)
+        migrateAllSummaries()
+
+        // Migrate all transcripts (including non-root ones missed by the entry loop)
+        migrateAllTranscripts()
+
         // Migrate plans
         migratePlans()
+
+        // Migrate notes
+        migrateNotes()
 
         // Migrate plan-progress
         migratePlanProgress()
@@ -201,6 +210,56 @@ class MigrationEngine(
         }
         if (progressFiles.isNotEmpty()) {
             log.info("Migrated %d plan-progress file(s)", progressFiles.size)
+        }
+    }
+
+    private fun migrateNotes() {
+        val noteFiles = orphanStorage.listFiles("notes/")
+        for (path in noteFiles) {
+            val content = orphanStorage.readFile(path) ?: continue
+            folderStorage.writeFiles(
+                listOf(FileWrite(path, content)),
+                "Migration: note $path",
+            )
+        }
+        if (noteFiles.isNotEmpty()) {
+            log.info("Migrated %d note file(s)", noteFiles.size)
+        }
+    }
+
+    private fun migrateAllSummaries() {
+        val summaryFiles = orphanStorage.listFiles("summaries/")
+        var migrated = 0
+        for (path in summaryFiles) {
+            val existing = folderStorage.readFile(path)
+            if (existing != null) continue
+            val content = orphanStorage.readFile(path) ?: continue
+            folderStorage.writeFiles(
+                listOf(FileWrite(path, content)),
+                "Migration: summary $path",
+            )
+            migrated++
+        }
+        if (migrated > 0) {
+            log.info("Migrated %d additional summary file(s)", migrated)
+        }
+    }
+
+    private fun migrateAllTranscripts() {
+        val transcriptFiles = orphanStorage.listFiles("transcripts/")
+        var migrated = 0
+        for (path in transcriptFiles) {
+            val existing = folderStorage.readFile(path)
+            if (existing != null) continue
+            val content = orphanStorage.readFile(path) ?: continue
+            folderStorage.writeFiles(
+                listOf(FileWrite(path, content)),
+                "Migration: transcript $path",
+            )
+            migrated++
+        }
+        if (migrated > 0) {
+            log.info("Migrated %d additional transcript file(s)", migrated)
         }
     }
 

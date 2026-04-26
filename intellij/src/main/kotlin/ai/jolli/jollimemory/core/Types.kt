@@ -321,6 +321,7 @@ data class FileWrite(
     val path: String,
     val content: String,
     val delete: Boolean = false,
+    val branch: String? = null,
 )
 
 /** Parameters for generating a commit message */

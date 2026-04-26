@@ -66,6 +66,16 @@ class FolderStorage(
                     if (file.path.startsWith("summaries/") && file.path.endsWith(".json")) {
                         generateMarkdown(file.content)
                     }
+
+                    // Generate visible markdown for plan files
+                    if (file.path.startsWith("plans/") && file.path.endsWith(".md")) {
+                        generatePlanMarkdown(file.path, file.content, file.branch)
+                    }
+
+                    // Generate visible markdown for note files
+                    if (file.path.startsWith("notes/") && file.path.endsWith(".md")) {
+                        generateNoteMarkdown(file.path, file.content, file.branch)
+                    }
                 }
             }
             log.info("Wrote %d files, deleted %d (%s)", written, deleted, message)
@@ -161,6 +171,101 @@ class FolderStorage(
         }
         lines.add("---")
         return lines.joinToString("\n")
+    }
+
+    /**
+     * Generates a visible markdown copy for a plan file.
+     *
+     * Output: {branchFolder}/plan--{slug}.md with YAML frontmatter.
+     */
+    private fun generatePlanMarkdown(path: String, content: String, branch: String?) {
+        val slug = path.removePrefix("plans/").removeSuffix(".md")
+        val resolvedBranch = branch ?: resolveBranchFromSlug(slug) ?: return
+        val branchFolder = metadataManager.resolveFolderForBranch(resolvedBranch)
+        val fileName = "plan--$slug.md"
+        val relativePath = "$branchFolder/$fileName"
+
+        val frontmatter = buildPlanNoteFrontmatter(type = "plan", slug = slug)
+        val markdown = "$frontmatter\n$content"
+
+        val targetPath = rootPath.resolve(relativePath)
+        atomicWrite(targetPath, markdown)
+
+        val fingerprint = sha256(markdown)
+        metadataManager.updateManifest(ManifestEntry(
+            path = relativePath,
+            fileId = "plan-$slug",
+            type = "plan",
+            fingerprint = fingerprint,
+            source = ManifestSource(branch = resolvedBranch),
+            title = extractTitleFromMarkdown(content),
+        ))
+
+        log.info("Plan markdown generated: %s", relativePath)
+    }
+
+    /**
+     * Generates a visible markdown copy for a note file.
+     *
+     * Output: {branchFolder}/note--{slug}.md with YAML frontmatter.
+     */
+    private fun generateNoteMarkdown(path: String, content: String, branch: String?) {
+        val slug = path.removePrefix("notes/").removeSuffix(".md")
+        val resolvedBranch = branch ?: resolveBranchFromSlug(slug) ?: return
+        val branchFolder = metadataManager.resolveFolderForBranch(resolvedBranch)
+        val fileName = "note--$slug.md"
+        val relativePath = "$branchFolder/$fileName"
+
+        val frontmatter = buildPlanNoteFrontmatter(type = "note", slug = slug)
+        val markdown = "$frontmatter\n$content"
+
+        val targetPath = rootPath.resolve(relativePath)
+        atomicWrite(targetPath, markdown)
+
+        val fingerprint = sha256(markdown)
+        metadataManager.updateManifest(ManifestEntry(
+            path = relativePath,
+            fileId = "note-$slug",
+            type = "note",
+            fingerprint = fingerprint,
+            source = ManifestSource(branch = resolvedBranch),
+            title = extractTitleFromMarkdown(content),
+        ))
+
+        log.info("Note markdown generated: %s", relativePath)
+    }
+
+    /** Builds YAML frontmatter for plan/note markdown files. */
+    private fun buildPlanNoteFrontmatter(type: String, slug: String): String {
+        return listOf("---", "type: $type", "slug: $slug", "---").joinToString("\n")
+    }
+
+    /** Extracts the first `# ` heading from markdown, or returns "Untitled". */
+    private fun extractTitleFromMarkdown(content: String): String {
+        val match = Regex("^#\\s+(.+)", RegexOption.MULTILINE).find(content)
+        return match?.groupValues?.get(1)?.trim() ?: "Untitled"
+    }
+
+    /**
+     * Resolves a branch name from a slug by extracting the trailing hash8 segment
+     * and looking it up in index.json entries.
+     *
+     * Plan slugs follow the pattern `{name}-{hash8}` where hash8 is the first 8
+     * characters of a commit hash. This method extracts that hash8 and scans index
+     * entries to find which branch the commit belongs to.
+     *
+     * @return the branch name, or null if no match is found
+     */
+    fun resolveBranchFromSlug(slug: String): String? {
+        // Extract the last segment after the final dash — it may be a hash8
+        val lastDash = slug.lastIndexOf('-')
+        if (lastDash < 0) return null
+        val hash8 = slug.substring(lastDash + 1)
+        if (hash8.length != 8 || !hash8.all { it in '0'..'9' || it in 'a'..'f' }) return null
+
+        val index = metadataManager.readIndex() ?: return null
+        val entry = index.entries.find { it.commitHash.startsWith(hash8) }
+        return entry?.branch
     }
 
     // ── Hidden file operations ─────────────────────────────────────────────

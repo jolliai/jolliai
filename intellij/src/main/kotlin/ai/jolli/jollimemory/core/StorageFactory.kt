@@ -25,7 +25,7 @@ object StorageFactory {
      * @param config The user's JolliMemoryConfig (contains storageMode, knowledgeBasePath)
      */
     fun create(git: GitOps, projectPath: String, config: JolliMemoryConfig = SessionTracker.loadConfig()): StorageProvider {
-        val mode = config.storageMode ?: "orphan"
+        val mode = config.storageMode ?: "dual-write"
         log.info("StorageFactory.create: storageMode=%s, projectPath=%s", mode, projectPath)
 
         return when (mode) {
