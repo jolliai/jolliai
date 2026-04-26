@@ -1,28 +1,25 @@
-<svg width="40" height="40" viewBox="0 0 61 56" xmlns="http://www.w3.org/2000/svg">
-
-  <!-- Edges -->
-  <g stroke="#8F88D8" stroke-width="2.4" stroke-linecap="round" fill="none" opacity="0.9">
+<svg width="40" height="40" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+  <g stroke="#8F88D8" stroke-width="1.6" stroke-linecap="round" fill="none" opacity="0.9">
     <!-- outer connections -->
-    <line x1="29.25" y1="6.88" x2="5.50" y2="25.67"/>
-    <line x1="29.25" y1="6.88" x2="50.05" y2="18.21"/>
-    <line x1="5.5" y1="25.67" x2="11.65" y2="49.42"/>
-    <line x1="11.65" y1="49.42" x2="53.70" y2="40.68"/>
-    <line x1="53.70" y1="40.68" x2="50.05" y2="18.21"/>
+    <line x1="19.2" y1="4.9" x2="3.6" y2="18.3"/>
+    <line x1="19.2" y1="4.9" x2="32.8" y2="13.0"/>
+    <line x1="3.6" y1="18.3" x2="7.6" y2="35.3"/>
+    <line x1="7.6" y1="35.3" x2="35.2" y2="29.0"/>
+    <line x1="35.2" y1="29.0" x2="32.8" y2="13.0"/>
 
     <!-- center connections -->
-    <line x1="29.05" y1="30.48" x2="29.25" y2="6.88"/>
-    <line x1="29.05" y1="30.48" x2="5.50" y2="25.67"/>
-    <line x1="29.05" y1="30.48" x2="50.05" y2="18.21"/>
-    <line x1="29.05" y1="30.48" x2="11.65" y2="49.42"/>
-    <line x1="29.05" y1="30.48" x2="53.70" y2="40.68"/>
+    <line x1="19.1" y1="21.8" x2="19.2" y2="4.9"/>
+    <line x1="19.1" y1="21.8" x2="3.6" y2="18.3"/>
+    <line x1="19.1" y1="21.8" x2="32.8" y2="13.0"/>
+    <line x1="19.1" y1="21.8" x2="7.6" y2="35.3"/>
+    <line x1="19.1" y1="21.8" x2="35.2" y2="29.0"/>
   </g>
 
   <!-- nodes -->
-  <circle cx="29.25" cy="6.88" r="6.98" fill="#4C8CFF"/>
-  <circle cx="50.05" cy="18.21" r="5.53" fill="#20D4E8"/>
-  <circle cx="5.5" cy="25.67" r="5.17" fill="#6FB3FF"/>
-  <circle cx="53.70" cy="40.68" r="6.96" fill="#7B7BFF"/>
-  <circle cx="11.65" cy="49.42" r="6.02" fill="#C3A6FF"/>
-  <circle cx="29.05" cy="30.48" r="7.82" fill="#9B5CFF"/>
-
+  <circle cx="19.2" cy="4.9" r="4.6" fill="#4C8CFF"/>
+  <circle cx="32.8" cy="13.0" r="3.6" fill="#20D4E8"/>
+  <circle cx="3.6" cy="18.3" r="3.4" fill="#6FB3FF"/>
+  <circle cx="35.2" cy="29.0" r="4.6" fill="#7B7BFF"/>
+  <circle cx="7.6" cy="35.3" r="3.9" fill="#C3A6FF"/>
+  <circle cx="19.1" cy="21.8" r="5.1" fill="#9B5CFF"/>
 </svg>
