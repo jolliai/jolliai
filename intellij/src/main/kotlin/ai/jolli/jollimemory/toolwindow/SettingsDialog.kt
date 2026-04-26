@@ -1,11 +1,20 @@
 package ai.jolli.jollimemory.toolwindow
 
+import ai.jolli.jollimemory.core.FolderStorage
 import ai.jolli.jollimemory.core.JolliMemoryConfig
+import ai.jolli.jollimemory.core.KBPathResolver
+import ai.jolli.jollimemory.core.MetadataManager
+import ai.jolli.jollimemory.core.MigrationEngine
+import ai.jolli.jollimemory.core.OrphanBranchStorage
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.services.JolliMemoryService
+import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
+import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.ui.TextFieldWithBrowseButton
 import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.components.JBCheckBox
@@ -18,6 +27,7 @@ import java.awt.Dimension
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.DefaultComboBoxModel
+import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JSeparator
@@ -31,12 +41,13 @@ import javax.swing.JSeparator
  *      excluded patterns
  *   3. AI Configuration — model + max tokens (hidden when provider == "jolli")
  *   4. Enabled Platforms — Claude / Codex / Gemini toggles
+ *   5. Knowledge Base — folder path, sort order, migrate button
  *
  * Reads/writes the global config (`config-intellij.json` after namespacing).
  */
 class SettingsDialog(
     private val project: Project,
-    @Suppress("unused") private val service: JolliMemoryService,
+    private val service: JolliMemoryService,
 ) : DialogWrapper(project) {
 
     // ── Sign-in bar ────────────────────────────────────────────────────────
@@ -57,6 +68,18 @@ class SettingsDialog(
     private val claudeEnabledCheckbox = JBCheckBox("Claude Code — Session tracking via Stop hook", true)
     private val codexEnabledCheckbox = JBCheckBox("Codex CLI — Session discovery via filesystem scan", true)
     private val geminiEnabledCheckbox = JBCheckBox("Gemini CLI — Session tracking via AfterAgent hook", true)
+
+    // ── Knowledge Base ────────────────────────────────────────────────────
+    private val kbPathField = TextFieldWithBrowseButton().apply {
+        addBrowseFolderListener(
+            "Knowledge Base Folder", "Select the root folder for your local Knowledge Base",
+            project, FileChooserDescriptorFactory.createSingleFolderDescriptor(),
+        )
+    }
+    private val kbSortCombo = ComboBox(DefaultComboBoxModel(arrayOf("date", "name"))).apply {
+        maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+    }
+    private var defaultKBPath: String = ""
 
     init {
         title = "Jolli Memory Settings"
@@ -118,6 +141,20 @@ class SettingsDialog(
             .addComponent(geminiEnabledCheckbox, 4)
             .panel))
 
+        panel.add(Box.createVerticalStrut(12))
+        panel.add(createSeparator())
+        panel.add(Box.createVerticalStrut(12))
+
+        // ── Knowledge Base Section ─────────────────────────────────────────
+        panel.add(createSectionHeader("Knowledge Base"))
+        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+            .addLabeledComponent(JBLabel("Folder Path:"), kbPathField, 1, false)
+            .addTooltip("Parent folder for all KB data. Each repo gets its own subfolder. Default: ~/Documents/jolli/")
+            .addLabeledComponent(JBLabel("Sort Order:"), kbSortCombo, 1, false)
+            .addTooltip("How files are sorted in the Knowledge Base explorer")
+            .addComponent(createMigrateButton(), 12)
+            .panel))
+
         // Hide AI Configuration whenever provider isn't Anthropic.
         providerSelector.addStateChangeListener {
             aiConfigSection.isVisible = providerSelector.getProvider() == "anthropic"
@@ -162,6 +199,9 @@ class SettingsDialog(
             .map { it.trim() }
             .filter { it.isNotEmpty() }
 
+        val kbPath = kbPathField.text.trim()
+        val kbSort = kbSortCombo.selectedItem as String
+
         val configDir = SessionTracker.getGlobalConfigDir()
         val existing = SessionTracker.loadConfigFromDir(configDir)
         val config = existing.copy(
@@ -173,8 +213,30 @@ class SettingsDialog(
             geminiEnabled = geminiEnabledCheckbox.isSelected,
             excludePatterns = if (excludePatterns.isNotEmpty()) excludePatterns else null,
             aiProvider = provider,
+            knowledgeBasePath = kbPath.ifBlank { null },
+            knowledgeBaseSort = kbSort,
         )
         SessionTracker.saveConfigToDir(config, configDir)
+
+        // Initialize KB folder + auto-migrate data from orphan branch
+        val projectPath = service.mainRepoRoot ?: project.basePath
+        if (projectPath != null) {
+            val repoName = KBPathResolver.extractRepoName(projectPath)
+            val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
+            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+            KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
+
+            // Auto-migrate if orphan branch has data
+            val gitOps = GitOps(projectPath)
+            val orphan = OrphanBranchStorage(gitOps)
+            if (orphan.exists()) {
+                val mm = MetadataManager(kbRoot.resolve(".jolli"))
+                val folder = FolderStorage(kbRoot, mm)
+                folder.ensure()
+                val engine = MigrationEngine(orphan, folder, mm)
+                engine.runMigration()
+            }
+        }
 
         super.doOKAction()
     }
@@ -199,6 +261,19 @@ class SettingsDialog(
 
         // Apply current visibility for AI Configuration section.
         aiConfigSection.isVisible = providerSelector.getProvider() == "anthropic"
+
+        // KB fields — compute default path for placeholder
+        val projectPath = service.mainRepoRoot ?: project.basePath ?: ""
+        if (projectPath.isNotBlank()) {
+            val repoName = KBPathResolver.extractRepoName(projectPath)
+            val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
+            defaultKBPath = KBPathResolver.resolve(repoName, remoteUrl).toString()
+        }
+        kbPathField.text = config.knowledgeBasePath ?: ""
+        (kbPathField.textField as? JBTextField)?.emptyText?.setText(
+            if (defaultKBPath.isNotBlank()) defaultKBPath else "~/Documents/jolli/"
+        )
+        kbSortCombo.selectedItem = config.knowledgeBaseSort ?: "date"
     }
 
     /** Creates a bold section header label. */
@@ -216,6 +291,60 @@ class SettingsDialog(
             add(formPanel, BorderLayout.CENTER)
             alignmentX = JComponent.LEFT_ALIGNMENT
             maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }
+    }
+
+    /** Creates the "Migrate to Knowledge Base" button. */
+    private fun createMigrateButton(): JComponent {
+        return JButton("Migrate to Knowledge Base").apply {
+            toolTipText = "Migrate existing memories from git storage to the Knowledge Base folder"
+            addActionListener {
+                isEnabled = false
+                text = "Migrating..."
+                try {
+                    val projectPath = service.mainRepoRoot ?: project.basePath ?: ""
+                    if (projectPath.isBlank()) {
+                        Messages.showWarningDialog(project, "No project path available.", "Migration")
+                        return@addActionListener
+                    }
+
+                    val gitOps = GitOps(projectPath)
+                    val orphan = OrphanBranchStorage(gitOps)
+                    if (!orphan.exists()) {
+                        Messages.showInfoMessage(project, "No git storage found — nothing to migrate.", "Migration")
+                        return@addActionListener
+                    }
+
+                    val config = SessionTracker.loadConfig()
+                    val repoName = KBPathResolver.extractRepoName(projectPath)
+                    val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
+                    val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+                    val mm = MetadataManager(kbRoot.resolve(".jolli"))
+                    val folder = FolderStorage(kbRoot, mm)
+                    folder.ensure()
+
+                    val engine = MigrationEngine(orphan, folder, mm)
+                    val result = engine.runMigration()
+
+                    if (result.status == "completed") {
+                        Messages.showInfoMessage(project,
+                            "Migration completed: ${result.migratedEntries} memories migrated to\n$kbRoot",
+                            "Migration")
+                    } else {
+                        Messages.showErrorDialog(project,
+                            "Migration finished with status: ${result.status}\n" +
+                                "${result.migratedEntries}/${result.totalEntries} entries processed.",
+                            "Migration")
+                    }
+                } catch (e: Exception) {
+                    Messages.showErrorDialog(project,
+                        "Migration failed: ${e.message}",
+                        "Migration")
+                } finally {
+                    isEnabled = true
+                    text = "Migrate to Knowledge Base"
+                }
+            }
         }
     }
 

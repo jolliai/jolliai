@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.hooks
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.core.CommitInfo
 import ai.jolli.jollimemory.core.JmLogger
+import ai.jolli.jollimemory.core.StorageFactory
 import ai.jolli.jollimemory.core.SummaryStore
 
 /**
@@ -28,7 +29,8 @@ object PostRewriteHook {
         if (input.isBlank()) return
 
         val git = GitOps(cwd)
-        val store = SummaryStore(cwd, git)
+        val storage = StorageFactory.create(git, cwd)
+        val store = SummaryStore(cwd, git, storage)
 
         // Parse hash mappings: "oldHash newHash" per line
         val mappings = input.lines()

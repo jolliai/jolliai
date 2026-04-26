@@ -6,7 +6,10 @@ import ai.jolli.jollimemory.bridge.HookInstaller
 import ai.jolli.jollimemory.bridge.SummaryReader
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.JmLogger
+import ai.jolli.jollimemory.core.KBPathResolver
+import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StatusInfo
+import ai.jolli.jollimemory.core.StorageFactory
 import ai.jolli.jollimemory.toolwindow.PanelRegistry
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
@@ -36,7 +39,12 @@ class JolliMemoryService(private val project: Project) : Disposable {
     private var git: GitOps? = null
     private var installer: HookInstaller? = null
     private var reader: SummaryReader? = null
+    @Volatile
     private var cachedStatus: StatusInfo? = null
+    /** Timestamp until which refreshStatus() should not downgrade enabled→disabled.
+     *  Set after install() to prevent GIT_REPO_CHANGE from flapping the status. */
+    @Volatile
+    private var installProtectionUntil: Long = 0L
     /** The resolved main repo root (handles worktrees). */
     var mainRepoRoot: String? = null
         private set
@@ -142,6 +150,33 @@ class JolliMemoryService(private val project: Project) : Disposable {
             sb.appendLine("Skill file checked/updated")
         } catch (e: Exception) {
             sb.appendLine("Skill update failed: ${e.message}")
+        }
+
+        // Auto-initialize KB folder with repo identity + auto-migrate
+        try {
+            val repoName = KBPathResolver.extractRepoName(resolvedRoot)
+            val remoteUrl = KBPathResolver.getRemoteUrl(resolvedRoot)
+            val config = SessionTracker.loadConfig()
+            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+            KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
+            sb.appendLine("KB folder initialized: $kbRoot")
+
+            // Auto-migrate: if orphan branch has data but migration not completed yet
+            val orphan = ai.jolli.jollimemory.core.OrphanBranchStorage(gitOps)
+            if (orphan.exists()) {
+                val mm = ai.jolli.jollimemory.core.MetadataManager(kbRoot.resolve(".jolli"))
+                val migrationState = mm.readMigrationState()
+                if (migrationState == null || migrationState.status != "completed") {
+                    val folder = ai.jolli.jollimemory.core.FolderStorage(kbRoot, mm)
+                    val engine = ai.jolli.jollimemory.core.MigrationEngine(orphan, folder, mm)
+                    val result = engine.runMigration()
+                    sb.appendLine("Auto-migration: ${result.status} (${result.migratedEntries}/${result.totalEntries})")
+                } else {
+                    sb.appendLine("Migration already completed")
+                }
+            }
+        } catch (e: Exception) {
+            sb.appendLine("KB folder init/migration failed: ${e.message}")
         }
 
         isInitialized = true
@@ -269,6 +304,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
 
     fun getStatus(): StatusInfo? = cachedStatus
 
+    @Synchronized
     fun refreshStatus(): StatusInfo? {
         lastError = null
 
@@ -291,7 +327,17 @@ class JolliMemoryService(private val project: Project) : Disposable {
         }
 
         return try {
-            cachedStatus = r.getStatus(i)
+            val newStatus = r.getStatus(i)
+            // During install protection period, don't downgrade from enabled to disabled.
+            // GIT_REPO_CHANGE events fire when .git/hooks/ is modified and can momentarily
+            // read stale hook state, causing status to flap enabled→disabled→enabled.
+            val wasEnabled = cachedStatus?.enabled == true
+            val isProtected = System.currentTimeMillis() < installProtectionUntil
+            if (isProtected && wasEnabled && !newStatus.enabled) {
+                log.info("refreshStatus: suppressed enabled→disabled flap (install protection active)")
+                return cachedStatus
+            }
+            cachedStatus = newStatus
             notifyListeners()
             cachedStatus
         } catch (e: Exception) {
@@ -314,6 +360,9 @@ class JolliMemoryService(private val project: Project) : Disposable {
     fun install(): Boolean {
         val result = installer?.install()
         if (result != null && result.success) {
+            // Protect against GIT_REPO_CHANGE flapping: for 3 seconds after install,
+            // refreshStatus() will not downgrade enabled:true → enabled:false.
+            installProtectionUntil = System.currentTimeMillis() + 3000
             refreshStatus()
             return true
         }
@@ -324,6 +373,8 @@ class JolliMemoryService(private val project: Project) : Disposable {
     fun uninstall(): Boolean {
         val result = installer?.uninstall()
         if (result != null && result.success) {
+            // Clear protection so disable takes effect immediately
+            installProtectionUntil = 0L
             refreshStatus()
             return true
         }
@@ -344,7 +395,8 @@ class JolliMemoryService(private val project: Project) : Disposable {
      */
     fun listMemoryEntries(count: Int, filter: String? = null): Pair<List<ai.jolli.jollimemory.core.SummaryIndexEntry>, Int> {
         val g = git ?: return emptyList<ai.jolli.jollimemory.core.SummaryIndexEntry>() to 0
-        val store = ai.jolli.jollimemory.core.SummaryStore(mainRepoRoot ?: "", g)
+        val projectPath = mainRepoRoot ?: ""
+            val store = ai.jolli.jollimemory.core.SummaryStore(projectPath, g, StorageFactory.create(g, projectPath))
         val index = store.loadIndex() ?: return emptyList<ai.jolli.jollimemory.core.SummaryIndexEntry>() to 0
 
         // Filter to root entries only (no child/incremental summaries)
@@ -371,7 +423,8 @@ class JolliMemoryService(private val project: Project) : Disposable {
         if (direct != null) return direct
 
         val g = git ?: return null
-        val store = ai.jolli.jollimemory.core.SummaryStore(mainRepoRoot ?: "", g)
+        val projectPath = mainRepoRoot ?: ""
+            val store = ai.jolli.jollimemory.core.SummaryStore(projectPath, g, StorageFactory.create(g, projectPath))
         val resolvedHash = store.resolveAlias(commitHash)
         if (resolvedHash != commitHash) {
             // Find the root summary for the alias target
@@ -414,12 +467,14 @@ class JolliMemoryService(private val project: Project) : Disposable {
             mergeBase = null
         }
 
-        // If merge-base equals HEAD, we're on main or branch is fully merged
-        // Use origin/main..HEAD to show unpushed commits (matches VS Code behavior)
+        // If merge-base equals HEAD, we're on main or branch is fully merged.
+        // When on main with a remote, show unpushed commits (origin/main..HEAD).
+        // When on main with no remote or on a fresh branch with no own commits,
+        // return empty — matches VS Code behavior where Commits panel clears on new branch.
         val range = when {
             mergeBase == null -> null // No common ancestor
             mergeBase == headHash && baseRef.startsWith("origin/") -> "$baseRef..HEAD"
-            mergeBase == headHash -> null // On main with no remote — fall back to recent
+            mergeBase == headHash -> return emptyList() // On main or fresh branch — no branch-specific commits
             else -> "$mergeBase..HEAD"
         }
 
@@ -438,7 +493,8 @@ class JolliMemoryService(private val project: Project) : Disposable {
         val commitHashes = parsedEntries.map { it[0] }
 
         // Batch check which commits have summaries (including tree-hash aliases)
-        val store = ai.jolli.jollimemory.core.SummaryStore(mainRepoRoot ?: "", g)
+        val projectPath = mainRepoRoot ?: ""
+            val store = ai.jolli.jollimemory.core.SummaryStore(projectPath, g, StorageFactory.create(g, projectPath))
         var summaryHashSet = store.filterCommitsWithSummary(commitHashes)
 
         // Scan unmatched commits for tree-hash aliases (cross-branch matching)

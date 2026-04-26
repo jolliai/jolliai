@@ -19,7 +19,7 @@
 
         <!-- Tool window: sidebar with collapsible STATUS, MEMORIES, PLANS & NOTES, CHANGES, COMMITS panels -->
         <toolWindow
-            id="JOLLI MEMORY"
+            id="JOLLI"
             anchor="right"
             secondary="true"
             icon="/icons/jollimemory.svg"

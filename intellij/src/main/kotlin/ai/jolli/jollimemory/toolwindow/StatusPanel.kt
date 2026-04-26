@@ -5,6 +5,7 @@ import ai.jolli.jollimemory.core.CodexSessionDiscoverer
 import ai.jolli.jollimemory.core.GeminiSupport
 import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.StorageFactory
 import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliAuthService
@@ -282,7 +283,7 @@ class StatusPanel(
     private fun countBranchSummaries(): Int {
         val gitOps = service.getGitOps() ?: return 0
         val cwd = service.mainRepoRoot ?: return 0
-        val store = SummaryStore(cwd, gitOps)
+        val store = SummaryStore(cwd, gitOps, StorageFactory.create(gitOps, cwd))
 
         // Get commit hashes on this branch (not in main)
         val logOutput = gitOps.getBranchCommits() ?: return 0
@@ -325,6 +326,11 @@ class StatusPanel(
             }
 
             service.install()
+
+            // Delay slightly to ensure file writes are visible, then refresh status
+            // and force all panels to re-read state. This runs on the pooled thread
+            // BEFORE switching to EDT, so the status is fully updated.
+            service.refreshStatus()
 
             SwingUtilities.invokeLater {
                 toggleButton.isEnabled = true
