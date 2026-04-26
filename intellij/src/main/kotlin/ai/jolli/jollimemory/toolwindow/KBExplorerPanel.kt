@@ -8,8 +8,10 @@ import ai.jolli.jollimemory.services.JolliMemoryService
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.intellij.icons.AllIcons
+import com.intellij.ide.actions.RevealFileAction
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileEditor.FileEditorManager
@@ -17,11 +19,19 @@ import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.util.text.StringUtil
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.openapi.vfs.newvfs.BulkFileListener
+import com.intellij.openapi.vfs.newvfs.events.VFileCreateEvent
+import com.intellij.openapi.vfs.newvfs.events.VFileDeleteEvent
+import com.intellij.openapi.vfs.newvfs.events.VFileEvent
+import com.intellij.openapi.vfs.newvfs.events.VFileMoveEvent
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.treeStructure.Tree
+import com.intellij.util.messages.MessageBusConnection
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.awt.Color
@@ -64,8 +74,8 @@ class KBExplorerPanel(
     private var metadataManager: MetadataManager? = null
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
 
-    private val refreshTimer: javax.swing.Timer
     private val statusListener: () -> Unit
+    private val busConnection: MessageBusConnection
 
     data class KBNodeData(
         val path: Path,
@@ -82,12 +92,21 @@ class KBExplorerPanel(
         statusListener = { ApplicationManager.getApplication().executeOnPooledThread { refresh() } }
         service.addStatusListener(statusListener)
 
-        refreshTimer = javax.swing.Timer(3000) {
-            ApplicationManager.getApplication().executeOnPooledThread { refresh() }
-        }.apply {
-            isRepeats = true
-            start()
-        }
+        // Watch KB root for file create/delete/move events instead of polling
+        busConnection = ApplicationManager.getApplication().messageBus.connect()
+        busConnection.subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
+            override fun after(events: List<VFileEvent>) {
+                val root = kbRoot ?: return
+                val rootStr = root.toString()
+                val hasRelevantChange = events.any { e ->
+                    (e is VFileCreateEvent || e is VFileDeleteEvent || e is VFileMoveEvent) &&
+                        (e.path ?: "").startsWith(rootStr)
+                }
+                if (hasRelevantChange) {
+                    ApplicationManager.getApplication().executeOnPooledThread { refresh() }
+                }
+            }
+        })
     }
 
     fun load() {
@@ -209,12 +228,19 @@ class KBExplorerPanel(
                 tree = t
                 treeModel = model
             } else {
-                // Preserve selection across refresh
-                val selectedPath = tree!!.selectionPath
+                // Preserve selection across refresh by matching the selected node's file path
+                val selectedNode = tree!!.lastSelectedPathComponent as? DefaultMutableTreeNode
+                val selectedData = selectedNode?.userObject as? KBNodeData
+                val selectedFilePath = selectedData?.path
+
                 treeModel = model
                 tree!!.model = model
-                if (selectedPath != null) {
-                    tree!!.selectionPath = selectedPath
+
+                if (selectedFilePath != null) {
+                    findNodeByPath(rootNode, selectedFilePath)?.let { matchedNode ->
+                        val tp = TreePath(model.getPathToRoot(matchedNode))
+                        tree!!.selectionPath = tp
+                    }
                 }
             }
 
@@ -263,7 +289,9 @@ class KBExplorerPanel(
                         }
                     }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            LOG.warn("Failed to list children of $dir", e)
+        }
     }
 
     // ── Drag and drop (unified via DragSource + DropTarget) ────────────────
@@ -323,6 +351,16 @@ class KBExplorerPanel(
                             val dest = targetDir.resolve(internalSource.fileName)
                             if (internalSource == dest) { dtde.dropComplete(false); return }
 
+                            if (Files.exists(dest)) {
+                                val confirm = Messages.showYesNoDialog(
+                                    project,
+                                    "\"${dest.fileName}\" already exists in the destination. Overwrite?",
+                                    "Confirm Overwrite",
+                                    Messages.getWarningIcon(),
+                                )
+                                if (confirm != Messages.YES) { dtde.dropComplete(false); return }
+                            }
+
                             Files.move(internalSource, dest, StandardCopyOption.REPLACE_EXISTING)
                             val oldRel = root.relativize(internalSource).toString()
                             val newRel = root.relativize(dest).toString()
@@ -344,6 +382,17 @@ class KBExplorerPanel(
                             for (file in files) {
                                 val source = file.toPath()
                                 val dest = targetDir.resolve(source.fileName)
+
+                                if (Files.exists(dest)) {
+                                    val confirm = Messages.showYesNoDialog(
+                                        project,
+                                        "\"${dest.fileName}\" already exists in the destination. Overwrite?",
+                                        "Confirm Overwrite",
+                                        Messages.getWarningIcon(),
+                                    )
+                                    if (confirm != Messages.YES) continue
+                                }
+
                                 if (source.startsWith(root)) {
                                     Files.move(source, dest, StandardCopyOption.REPLACE_EXISTING)
                                     val oldRel = root.relativize(source).toString()
@@ -360,7 +409,8 @@ class KBExplorerPanel(
                         }
 
                         dtde.dropComplete(false)
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        LOG.warn("Drag-and-drop failed", e)
                         dtde.dropComplete(false)
                     }
                 }
@@ -407,13 +457,10 @@ class KBExplorerPanel(
         }
 
         popup.addSeparator()
-        popup.add(JMenuItem("Reveal in Finder").apply {
+        popup.add(JMenuItem(RevealFileAction.getActionName()).apply {
             addActionListener {
                 val target = data?.path ?: root
-                try {
-                    // Use 'open -R' to reveal and select the file/folder in Finder
-                    Runtime.getRuntime().exec(arrayOf("open", "-R", target.toString()))
-                } catch (_: Exception) {}
+                RevealFileAction.openFile(target.toFile())
             }
         })
 
@@ -579,7 +626,8 @@ class KBExplorerPanel(
                 } else {
                     SwingUtilities.invokeLater { openFile(data.path) }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                LOG.warn("Failed to open commit summary for ${data.path}", e)
                 SwingUtilities.invokeLater { openFile(data.path) }
             }
         }
@@ -594,7 +642,8 @@ class KBExplorerPanel(
     private fun showMessage(text: String) {
         SwingUtilities.invokeLater {
             removeAll()
-            add(JLabel("<html><center>$text</center></html>", SwingConstants.CENTER).apply {
+            val escaped = StringUtil.escapeXmlEntities(text)
+            add(JLabel("<html><center>$escaped</center></html>", SwingConstants.CENTER).apply {
                 border = JBUI.Borders.empty(20)
             }, BorderLayout.CENTER)
             revalidate()
@@ -602,13 +651,28 @@ class KBExplorerPanel(
         }
     }
 
+    private fun findNodeByPath(node: DefaultMutableTreeNode, targetPath: Path): DefaultMutableTreeNode? {
+        val data = node.userObject as? KBNodeData
+        if (data?.path == targetPath) return node
+        for (i in 0 until node.childCount) {
+            val child = node.getChildAt(i) as? DefaultMutableTreeNode ?: continue
+            val found = findNodeByPath(child, targetPath)
+            if (found != null) return found
+        }
+        return null
+    }
+
     private fun isHiddenOrInternal(name: String): Boolean {
         return name.startsWith(".") || name == "summaries" || name == "transcripts" || name == "plan-progress"
     }
 
     override fun dispose() {
-        refreshTimer.stop()
+        busConnection.disconnect()
         service.removeStatusListener(statusListener)
+    }
+
+    companion object {
+        private val LOG = Logger.getInstance(KBExplorerPanel::class.java)
     }
 
     // ── Tree cell renderer ─────────────────────────────────────────────────
