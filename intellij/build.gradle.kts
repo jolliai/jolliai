@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.97.9.71"
+version = "0.98.0"
 
 repositories {
     mavenCentral()
@@ -132,6 +132,28 @@ intellijPlatform {
             </p>
         """.trimIndent()
         changeNotes = """
+            <h3>0.98.0</h3>
+            <ul>
+                <li><b>Knowledge Base explorer</b> &mdash; browse your local Knowledge Base folder
+                    as a tree view in the JOLLI tool window, with C/P/N badges and readable titles.
+                    Double-click commit files to open the formatted summary viewer</li>
+                <li><b>Folder-based storage</b> &mdash; new dual-write mode stores summaries as
+                    human-readable Markdown files alongside hidden JSON data in a local folder
+                    (<code>~/Documents/jolli/{project}/</code>)</li>
+                <li><b>Auto-migration</b> &mdash; existing orphan branch data is automatically
+                    migrated to the Knowledge Base folder on plugin startup. Manual migration
+                    available via Settings</li>
+                <li><b>File operations</b> &mdash; right-click context menu for New Folder,
+                    New File, Import, Rename, Move, Delete. Drag and drop support for
+                    files and folders with metadata sync</li>
+                <li><b>Create &amp; Update PR</b> &mdash; automatically detects existing PRs
+                    and updates them instead of failing</li>
+                <li><b>Fix CommitsPanel after Enable</b> &mdash; resolve race condition where
+                    CommitsPanel showed &ldquo;disabled&rdquo; on empty branches after Enable</li>
+                <li><b>Fix panel refresh on branch switch</b> &mdash; add VCS listener and
+                    periodic polling for reliable branch detection</li>
+            </ul>
+
             <h3>0.97.9</h3>
             <ul>
                 <li><b>Privacy consent notice</b> &mdash; display a privacy notice with link to
