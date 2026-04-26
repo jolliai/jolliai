@@ -622,7 +622,15 @@ class SummaryPanel(
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 PrService.pushBranch(cwd)
-                val prUrl = PrService.createPr(title, body, cwd)
+                // Check if PR already exists for this branch — update instead of create
+                val existingPr = PrService.findPrForBranch(cwd)
+                val prUrl: String
+                if (existingPr != null) {
+                    PrService.updatePr(existingPr.number, title, body, cwd)
+                    prUrl = existingPr.url
+                } else {
+                    prUrl = PrService.createPr(title, body, cwd)
+                }
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("prCreated", mapOf("url" to prUrl))
                     handleCheckPrStatus()
