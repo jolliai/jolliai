@@ -114,6 +114,12 @@ class CommitsPanel(
             GitRepositoryChangeListener { scheduleDebouncedGitRefresh() },
         )
 
+        // Also subscribe to VCS config changes (catches terminal branch operations)
+        messageBusConnection.subscribe(
+            com.intellij.openapi.vcs.ProjectLevelVcsManager.VCS_CONFIGURATION_CHANGED,
+            com.intellij.openapi.vcs.VcsListener { scheduleDebouncedGitRefresh() },
+        )
+
         ApplicationManager.getApplication().executeOnPooledThread { refreshFromGit() }
     }
 
@@ -128,6 +134,34 @@ class CommitsPanel(
     fun refresh() {
         refreshVersion++
         ApplicationManager.getApplication().executeOnPooledThread { refreshFromGit() }
+    }
+
+    /**
+     * Force refresh that bypasses the refreshVersion stale-discard mechanism.
+     * Used after Enable/Disable to guarantee the UI updates regardless of
+     * concurrent refresh races.
+     */
+    fun forceRefresh() {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val status = service.getStatus()
+            if (status == null) {
+                SwingUtilities.invokeLater { showInitializing() }
+                return@executeOnPooledThread
+            }
+            if (!status.enabled) {
+                SwingUtilities.invokeLater { showDisabled() }
+                return@executeOnPooledThread
+            }
+            try {
+                val newCommits = service.getBranchCommits()
+                isMerged = newCommits.isNotEmpty() && service.isBranchMerged()
+                commits = newCommits
+                SwingUtilities.invokeLater { updateCommitList() }
+            } catch (_: Exception) {
+                commits = emptyList()
+                SwingUtilities.invokeLater { updateCommitList() }
+            }
+        }
     }
 
     /** Range-based checkbox toggle matching VS Code behavior. */
@@ -182,6 +216,11 @@ class CommitsPanel(
         val myVersion = refreshVersion
 
         val status = service.getStatus()
+        // DEBUG: write to desktop file for easy access
+        try {
+            val debugFile = java.io.File(System.getProperty("user.home"), "Desktop/commits-debug.log")
+            debugFile.appendText("${java.time.Instant.now()} refreshFromGit: enabled=${status?.enabled}, myVer=$myVersion, curVer=$refreshVersion, thr=${Thread.currentThread().name}\n")
+        } catch (_: Exception) {}
         if (status == null) {
             SwingUtilities.invokeLater { if (refreshVersion == myVersion) showInitializing() }
             return
@@ -238,6 +277,8 @@ class CommitsPanel(
         commitRowStates.clear()
 
         if (commits.isEmpty()) {
+            emptyLabel.text = "<html><center>Start coding — your commit memories will appear here.<br/>" +
+                "Every commit on this branch will be automatically summarized.</center></html>"
             add(emptyLabel, BorderLayout.CENTER)
         } else {
             for (commit in commits) {

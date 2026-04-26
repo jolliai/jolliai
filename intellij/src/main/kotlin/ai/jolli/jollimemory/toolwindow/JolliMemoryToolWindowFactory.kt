@@ -8,6 +8,7 @@ import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
@@ -15,6 +16,8 @@ import com.intellij.openapi.vcs.ProjectLevelVcsManager
 import com.intellij.openapi.vcs.VcsListener
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
+import git4idea.repo.GitRepository
+import git4idea.repo.GitRepositoryChangeListener
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.content.ContentFactory
 import com.intellij.util.ui.JBUI
@@ -257,8 +260,20 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 
         syncView()
 
-        val content = ContentFactory.getInstance().createContent(rootPanel, "", false).apply {
-            setDisposer(Disposer.newDisposable("JolliMemoryToolWindowContent").also { parentDisposable ->
+        // Content 1: Knowledge Base — KB folder browser
+        val kbPanel = KBExplorerPanel(project, service)
+        val memoriesContent = ContentFactory.getInstance().createContent(kbPanel, "\uD83D\uDCDA Knowledge Base", false).apply {
+            isCloseable = false
+            setDisposer(Disposer.newDisposable("JolliMemoryMemoriesContent").also { parentDisposable ->
+                Disposer.register(parentDisposable, kbPanel)
+            })
+        }
+
+        // Content 2: Branch — current branch name with emoji
+        val currentBranch = service.getGitOps()?.getCurrentBranch() ?: "Branch"
+        val branchContent = ContentFactory.getInstance().createContent(rootPanel, "\uD83C\uDF3F $currentBranch", false).apply {
+            isCloseable = false
+            setDisposer(Disposer.newDisposable("JolliMemoryBranchContent").also { parentDisposable ->
                 Disposer.register(parentDisposable, onboardingPanel)
                 Disposer.register(parentDisposable, factoryAuthDisposable)
                 Disposer.register(parentDisposable, statusPanel)
@@ -268,12 +283,47 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                 Disposer.register(parentDisposable, memoriesPanel)
             })
         }
-        toolWindow.contentManager.addContent(content)
+
+        // Auto-update branch tab title on branch switch — multiple detection paths
+        var lastBranch = currentBranch
+        val updateBranchTitle: () -> Unit = {
+            val newBranch = service.getGitOps()?.getCurrentBranch() ?: "Branch"
+            if (newBranch != lastBranch) {
+                lastBranch = newBranch
+                SwingUtilities.invokeLater { branchContent.displayName = "\uD83C\uDF3F $newBranch" }
+            }
+        }
+
+        // Path 1: IntelliJ git repository change event
+        val branchUpdateConnection = project.messageBus.connect()
+        branchUpdateConnection.subscribe(
+            GitRepository.GIT_REPO_CHANGE,
+            GitRepositoryChangeListener { updateBranchTitle() },
+        )
+
+        // Path 2: VCS configuration change (catches terminal branch operations)
+        branchUpdateConnection.subscribe(
+            ProjectLevelVcsManager.VCS_CONFIGURATION_CHANGED,
+            VcsListener { updateBranchTitle() },
+        )
+
+        // Path 3: Periodic poll every 2 seconds (catches all edge cases)
+        javax.swing.Timer(2000) { updateBranchTitle() }.apply {
+            isRepeats = true
+            start()
+        }
+
+        // Path 4: Service status change
+        service.addStatusListener { updateBranchTitle() }
+
+        toolWindow.contentManager.addContent(branchContent)
+        toolWindow.contentManager.addContent(memoriesContent)
+
+        // Load KB tree on background thread
+        ApplicationManager.getApplication().executeOnPooledThread { kbPanel.load() }
     }
 
     override fun shouldBeAvailable(project: Project): Boolean {
-        // Always available — the tool window shows a "no Git" message when
-        // .git is absent, and the full panel UI when Git is present.
         return project.basePath != null
     }
 

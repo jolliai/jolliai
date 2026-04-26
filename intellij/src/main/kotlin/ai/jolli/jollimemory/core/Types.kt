@@ -292,6 +292,9 @@ data class JolliMemoryConfig(
     val aiProvider: String? = null,
     val logLevel: String? = null,
     val logLevelOverrides: Map<String, String>? = null,
+    val knowledgeBasePath: String? = null,
+    val knowledgeBaseSort: String? = null,  // "date" | "name"
+    val storageMode: String? = null,        // "orphan" | "dual-write" | "folder"
 )
 
 /** Registry of all active sessions */
