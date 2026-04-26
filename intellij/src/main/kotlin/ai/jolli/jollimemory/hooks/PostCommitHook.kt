@@ -88,7 +88,8 @@ object PostCommitHook {
         log.info("=== PostCommitHook worker started ===")
 
         val git = GitOps(cwd)
-        val store = SummaryStore(cwd, git)
+        val storage = StorageFactory.create(git, cwd)
+        val store = SummaryStore(cwd, git, storage)
         val config = SessionTracker.loadConfig(cwd)
 
         // Load log level from config

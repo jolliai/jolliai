@@ -163,8 +163,10 @@ class SquashAction : AnAction() {
                             // Step 1: Find the parent of the oldest commit (fork point).
                             // This is the correct reset target — NOT merge-base with main,
                             // which would reset ALL branch commits, not just the selected ones.
-                            val forkPoint = git.exec("rev-parse", "$oldestHash^")?.trim()
-                            if (forkPoint.isNullOrBlank()) {
+                            // For root commits (no parent), use --root orphan reset.
+                            val isRootCommit = git.exec("rev-parse", "--verify", "$oldestHash^") == null
+                            val forkPoint = if (isRootCommit) null else git.exec("rev-parse", "$oldestHash^")?.trim()
+                            if (!isRootCommit && forkPoint.isNullOrBlank()) {
                                 log.error("Failed to resolve parent of oldest commit: %s", oldestHash)
                                 ApplicationManager.getApplication().invokeLater {
                                     Messages.showErrorDialog(project,
@@ -173,18 +175,30 @@ class SquashAction : AnAction() {
                                 }
                                 return@executeOnPooledThread
                             }
-                            log.info("Fork point resolved: %s", forkPoint.take(8))
+                            log.info("Fork point resolved: %s", if (isRootCommit) "(root)" else forkPoint!!.take(8))
 
                             // Step 2: Write plugin-source marker and squash-pending.json
                             // so the post-commit hook can merge summaries automatically.
                             SessionTracker.savePluginSource(cwd)
-                            SessionTracker.saveSquashPending(hashes, forkPoint, cwd)
+                            SessionTracker.saveSquashPending(hashes, forkPoint ?: oldestHash, cwd)
 
                             try {
                                 // Step 3: Soft reset to fork point (stages all changes)
-                                val resetResult = git.exec("reset", "--soft", forkPoint)
-                                if (resetResult == null) throw RuntimeException("git reset --soft failed")
-                                log.info("git reset --soft %s → ok", forkPoint.take(8))
+                                val resetResult = if (isRootCommit) {
+                                    // Root commit has no parent — update-ref to delete HEAD,
+                                    // then re-stage everything so git commit creates a new root.
+                                    git.exec("update-ref", "-d", "HEAD")
+                                } else {
+                                    git.exec("reset", "--soft", forkPoint!!)
+                                }
+                                if (resetResult == null && !isRootCommit) throw RuntimeException("git reset --soft failed")
+                                if (isRootCommit) {
+                                    // After deleting HEAD, files are still in the index but there's no commit.
+                                    // git commit will create a new root commit with the current index.
+                                    log.info("Deleted HEAD for root squash → orphan state")
+                                } else {
+                                    log.info("git reset --soft %s → ok", forkPoint!!.take(8))
+                                }
 
                                 // Step 4: Create the squash commit
                                 val commitResult = git.exec("commit", "-m", edited)

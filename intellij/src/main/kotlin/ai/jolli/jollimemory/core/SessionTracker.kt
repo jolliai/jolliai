@@ -200,6 +200,9 @@ object SessionTracker {
             aiProvider = update.aiProvider ?: existing.aiProvider,
             logLevel = update.logLevel ?: existing.logLevel,
             logLevelOverrides = update.logLevelOverrides ?: existing.logLevelOverrides,
+            knowledgeBasePath = update.knowledgeBasePath ?: existing.knowledgeBasePath,
+            knowledgeBaseSort = update.knowledgeBaseSort ?: existing.knowledgeBaseSort,
+            storageMode = update.storageMode ?: existing.storageMode,
         )
         atomicWrite(File(dir, CONFIG_FILE), gson.toJson(merged))
         log.info("Config saved")

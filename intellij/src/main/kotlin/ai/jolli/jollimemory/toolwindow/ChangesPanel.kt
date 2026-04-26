@@ -103,6 +103,10 @@ class ChangesPanel(
             GitRepository.GIT_REPO_CHANGE,
             GitRepositoryChangeListener { scheduleGitChangeRefresh() },
         )
+        projectBusConnection.subscribe(
+            com.intellij.openapi.vcs.ProjectLevelVcsManager.VCS_CONFIGURATION_CHANGED,
+            com.intellij.openapi.vcs.VcsListener { scheduleGitChangeRefresh() },
+        )
 
         // Initial load
         ApplicationManager.getApplication().executeOnPooledThread { refreshFromGit() }
