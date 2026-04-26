@@ -44,7 +44,7 @@ dependencies {
 intellijPlatform {
     pluginConfiguration {
         id = "ai.jolli.jollimemory"
-        name = "JolliMemory"
+        name = "Jolli Memory"
         version = project.version.toString()
         description = """
             <p>
