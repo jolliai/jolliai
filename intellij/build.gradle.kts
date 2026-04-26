@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.98.0"
+version = "0.98.1"
 
 repositories {
     mavenCentral()
@@ -132,6 +132,26 @@ intellijPlatform {
             </p>
         """.trimIndent()
         changeNotes = """
+            <h3>0.98.1</h3>
+            <ul>
+                <li><b>Full migration</b> &mdash; migration now includes all child summaries,
+                    notes, and transcripts from the orphan branch, not just root entries</li>
+                <li><b>Visible plan &amp; note copies</b> &mdash; plans and notes now generate
+                    human-readable Markdown files in branch directories with YAML frontmatter</li>
+                <li><b>Default dual-write mode</b> &mdash; all users automatically get folder
+                    storage after upgrade without manual configuration</li>
+                <li><b>Performance</b> &mdash; replaced 3-second polling timer with VirtualFileManager
+                    listener for KB tree updates</li>
+                <li><b>Cross-platform Reveal</b> &mdash; Reveal in Finder/Explorer now works on
+                    macOS, Windows, and Linux</li>
+                <li><b>DnD safety</b> &mdash; drag-and-drop file moves now prompt for confirmation
+                    before overwriting existing files</li>
+                <li><b>Error handling</b> &mdash; silent exception swallowing replaced with proper
+                    logging; HTML-escaped error messages in UI</li>
+                <li><b>Selection restore</b> &mdash; KB tree selection is correctly preserved
+                    after refresh</li>
+            </ul>
+
             <h3>0.98.0</h3>
             <ul>
                 <li><b>Knowledge Base explorer</b> &mdash; browse your local Knowledge Base folder

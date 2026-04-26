@@ -72,8 +72,10 @@ class SettingsDialog(
     // ── Knowledge Base ────────────────────────────────────────────────────
     private val kbPathField = TextFieldWithBrowseButton().apply {
         addBrowseFolderListener(
-            "Knowledge Base Folder", "Select the root folder for your local Knowledge Base",
-            project, FileChooserDescriptorFactory.createSingleFolderDescriptor(),
+            project,
+            FileChooserDescriptorFactory.createSingleFolderDescriptor()
+                .withTitle("Knowledge Base Folder")
+                .withDescription("Select the root folder for your local Knowledge Base"),
         )
     }
     private val kbSortCombo = ComboBox(DefaultComboBoxModel(arrayOf("date", "name"))).apply {
