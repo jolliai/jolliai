@@ -99,7 +99,7 @@ export function validateJolliApiKey(key: string): void {
 	assertJolliOriginAllowed(meta.u);
 }
 
-const ALLOWED_JOLLI_HOSTS = ["jolli.ai", "jolli.dev", "jolli-local.me"];
+const ALLOWED_JOLLI_HOSTS = ["jolli.ai", "jolli.dev", "jolli.cloud", "jolli-local.me"];
 
 /**
  * Rejects origins that are not on the Jolli allowlist. Called from the
@@ -128,6 +128,6 @@ export function assertJolliOriginAllowed(origin: string): void {
 		return;
 	}
 	throw new Error(
-		`Rejected Jolli origin "${url.origin}". Only https://*.jolli.ai, https://*.jolli.dev, and https://*.jolli-local.me are permitted.`,
+		`Rejected Jolli origin "${url.origin}". Only https://*.jolli.ai, https://*.jolli.dev, https://*.jolli.cloud, and https://*.jolli-local.me are permitted.`,
 	);
 }

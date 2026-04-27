@@ -41,6 +41,13 @@ describe("SettingsScriptBuilder", () => {
 		expect(script).toContain("sk-jol-");
 	});
 
+	it("includes all Jolli hosts in the allowlist", () => {
+		expect(script).toContain("'jolli.ai'");
+		expect(script).toContain("'jolli.dev'");
+		expect(script).toContain("'jolli.cloud'");
+		expect(script).toContain("'jolli-local.me'");
+	});
+
 	it("contains dirty tracking logic", () => {
 		expect(script).toContain("isDirty");
 	});

@@ -108,6 +108,14 @@ describe("JolliApiUtils", () => {
 			expect(() => assertJolliOriginAllowed("https://tenant.jolli.dev")).not.toThrow();
 		});
 
+		it("accepts https://admin.jolli.cloud", () => {
+			expect(() => assertJolliOriginAllowed("https://admin.jolli.cloud")).not.toThrow();
+		});
+
+		it("accepts apex https://jolli.cloud", () => {
+			expect(() => assertJolliOriginAllowed("https://jolli.cloud")).not.toThrow();
+		});
+
 		it("accepts https://jolli-local.me for local development", () => {
 			expect(() => assertJolliOriginAllowed("https://jolli-local.me")).not.toThrow();
 		});
