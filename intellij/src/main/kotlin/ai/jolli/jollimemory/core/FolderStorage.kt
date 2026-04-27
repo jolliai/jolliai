@@ -240,10 +240,12 @@ class FolderStorage(
         return listOf("---", "type: $type", "slug: $slug", "---").joinToString("\n")
     }
 
-    /** Extracts the first `# ` heading from markdown, or returns "Untitled". */
+    /** Extracts the first `# ` heading, or falls back to first non-empty line of content. */
     private fun extractTitleFromMarkdown(content: String): String {
-        val match = Regex("^#\\s+(.+)", RegexOption.MULTILINE).find(content)
-        return match?.groupValues?.get(1)?.trim() ?: "Untitled"
+        val heading = Regex("^#\\s+(.+)", RegexOption.MULTILINE).find(content)
+        if (heading != null) return heading.groupValues[1].trim()
+        val firstLine = content.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }
+        return firstLine?.take(80) ?: "Untitled"
     }
 
     /**
