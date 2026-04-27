@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.KBDataCache
 import ai.jolli.jollimemory.core.KBPathResolver
 import ai.jolli.jollimemory.core.KBRepoDiscoverer
 import ai.jolli.jollimemory.core.MetadataManager
@@ -47,13 +48,18 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import javax.swing.BoxLayout
 import javax.swing.JLabel
 import javax.swing.JMenuItem
 import javax.swing.JPanel
 import javax.swing.JPopupMenu
+import javax.swing.JToggleButton
 import javax.swing.JTree
 import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
+import java.awt.CardLayout
+import java.awt.Dimension
+import java.awt.FlowLayout
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeModel
 import javax.swing.tree.TreePath
@@ -71,11 +77,20 @@ class KBExplorerPanel(
     private val service: JolliMemoryService,
 ) : JPanel(BorderLayout()), Disposable {
 
+    private enum class ViewMode { TREE, TIMELINE, AZ }
+
     private var tree: Tree? = null
     private var treeModel: DefaultTreeModel? = null
     private var kbRoot: Path? = null
     private var metadataManager: MetadataManager? = null
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
+
+    private var currentView = ViewMode.TREE
+    private val contentPanel = JPanel(CardLayout())
+    private val treePanel = JPanel(BorderLayout())
+    private val timelinePanel = JPanel(BorderLayout())
+    private val azPanel = JPanel(BorderLayout())
+    private var cachedRepos: List<KBRepoDiscoverer.DiscoveredRepo> = emptyList()
 
     private val statusListener: () -> Unit
     private val busConnection: MessageBusConnection
@@ -92,6 +107,36 @@ class KBExplorerPanel(
 
     init {
         border = JBUI.Borders.empty()
+
+        // Toolbar with view toggle buttons
+        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 2, 0)).apply {
+            border = JBUI.Borders.empty(2)
+        }
+        val btnTree = JToggleButton("Tree", true).apply { toolTipText = "Tree view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "first") }
+        val btnTimeline = JToggleButton("Timeline").apply { toolTipText = "Timeline view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "middle") }
+        val btnAZ = JToggleButton("A-Z").apply { toolTipText = "Alphabetical view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "last") }
+        val viewButtons = listOf(btnTree, btnTimeline, btnAZ)
+        fun selectView(mode: ViewMode) {
+            currentView = mode
+            viewButtons.forEach { it.isSelected = false }
+            when (mode) { ViewMode.TREE -> btnTree; ViewMode.TIMELINE -> btnTimeline; ViewMode.AZ -> btnAZ }.isSelected = true
+            (contentPanel.layout as CardLayout).show(contentPanel, mode.name)
+            ApplicationManager.getApplication().executeOnPooledThread { rebuildCurrentView() }
+        }
+        btnTree.addActionListener { selectView(ViewMode.TREE) }
+        btnTimeline.addActionListener { selectView(ViewMode.TIMELINE) }
+        btnAZ.addActionListener { selectView(ViewMode.AZ) }
+        toolbar.add(btnTree)
+        toolbar.add(btnTimeline)
+        toolbar.add(btnAZ)
+
+        contentPanel.add(treePanel, ViewMode.TREE.name)
+        contentPanel.add(timelinePanel, ViewMode.TIMELINE.name)
+        contentPanel.add(azPanel, ViewMode.AZ.name)
+
+        add(toolbar, BorderLayout.NORTH)
+        add(contentPanel, BorderLayout.CENTER)
+
         showMessage("Loading...")
 
         statusListener = { ApplicationManager.getApplication().executeOnPooledThread { refresh() } }
@@ -138,9 +183,27 @@ class KBExplorerPanel(
         try {
             resolveKBRoot()
             reconcile()
-            buildTree()
+            reloadCache()
+            rebuildCurrentView()
         } catch (e: Exception) {
             showMessage("Refresh error: ${e.message}")
+        }
+    }
+
+    private fun reloadCache() {
+        val config = SessionTracker.loadConfig()
+        val projectPath = service.mainRepoRoot ?: project.basePath
+        val currentRepoName = projectPath?.let { KBPathResolver.extractRepoName(it) }
+        val currentRemoteUrl = projectPath?.let { KBPathResolver.getRemoteUrl(it) }
+        cachedRepos = KBRepoDiscoverer.discover(currentRepoName, currentRemoteUrl, config.knowledgeBasePath)
+        KBDataCache.reload(cachedRepos)
+    }
+
+    private fun rebuildCurrentView() {
+        when (currentView) {
+            ViewMode.TREE -> buildTree()
+            ViewMode.TIMELINE -> buildTimeline()
+            ViewMode.AZ -> buildAZ()
         }
     }
 
@@ -164,14 +227,9 @@ class KBExplorerPanel(
     // ── Tree building ──────────────────────────────────────────────────────
 
     private fun buildTree() {
-        val config = SessionTracker.loadConfig()
-        val projectPath = service.mainRepoRoot ?: project.basePath
-        val currentRepoName = projectPath?.let { KBPathResolver.extractRepoName(it) }
-        val currentRemoteUrl = projectPath?.let { KBPathResolver.getRemoteUrl(it) }
-
-        val repos = KBRepoDiscoverer.discover(currentRepoName, currentRemoteUrl, config.knowledgeBasePath)
+        val repos = cachedRepos
         if (repos.isEmpty()) {
-            showMessage("No memories yet — commit with an AI coding tool to get started")
+            showMessageIn(treePanel, "No memories yet — commit with an AI coding tool to get started")
             return
         }
 
@@ -271,8 +329,8 @@ class KBExplorerPanel(
                 }
             }
 
-            removeAll()
-            add(JBScrollPane(tree!!), BorderLayout.CENTER)
+            treePanel.removeAll()
+            treePanel.add(JBScrollPane(tree!!), BorderLayout.CENTER)
             // Expand current repo and its branch folders; collapse other repos
             for (i in 0 until rootNode.childCount) {
                 val repoNode = rootNode.getChildAt(i) as? DefaultMutableTreeNode ?: continue
@@ -287,8 +345,8 @@ class KBExplorerPanel(
                     tree!!.collapsePath(repoPath)
                 }
             }
-            revalidate()
-            repaint()
+            treePanel.revalidate()
+            treePanel.repaint()
         }
     }
 
@@ -677,6 +735,108 @@ class KBExplorerPanel(
         ApplicationManager.getApplication().executeOnPooledThread { refresh() }
     }
 
+    // ── Timeline view ──────────────────────────────────────────────────────
+
+    private fun buildTimeline() {
+        val groups = KBDataCache.byTimeline()
+        if (groups.isEmpty()) {
+            showMessageIn(timelinePanel, "No memories yet")
+            return
+        }
+
+        val rootNode = DefaultMutableTreeNode("Timeline")
+        for ((dateLabel, entries) in groups) {
+            val dateNode = DefaultMutableTreeNode(dateLabel)
+            for (entry in entries) {
+                val display = entry.title ?: entry.path
+                val desc = "${entry.repo} / ${entry.branch ?: "unknown"}"
+                dateNode.add(DefaultMutableTreeNode(KBNodeData(
+                    entry.fullPath, entry.path, displayName = display,
+                    isDirectory = false, badge = "C",
+                )))
+            }
+            rootNode.add(dateNode)
+        }
+
+        SwingUtilities.invokeLater {
+            val t = Tree(DefaultTreeModel(rootNode)).apply {
+                isRootVisible = false
+                showsRootHandles = true
+                cellRenderer = TimelineCellRenderer()
+            }
+            t.addMouseListener(object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) {
+                    if (e.clickCount == 2) {
+                        val node = t.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return
+                        val data = node.userObject as? KBNodeData ?: return
+                        if (!data.isDirectory) openCommitSummary(data)
+                    }
+                }
+            })
+            // Expand all date groups
+            for (i in 0 until rootNode.childCount) {
+                t.expandPath(TreePath(arrayOf(rootNode, rootNode.getChildAt(i))))
+            }
+            timelinePanel.removeAll()
+            timelinePanel.add(JBScrollPane(t), BorderLayout.CENTER)
+            timelinePanel.revalidate()
+            timelinePanel.repaint()
+        }
+    }
+
+    // ── A-Z view ──────────────────────────────────────────────────────────
+
+    private fun buildAZ() {
+        val entries = KBDataCache.byAlpha()
+        if (entries.isEmpty()) {
+            showMessageIn(azPanel, "No memories yet")
+            return
+        }
+
+        val rootNode = DefaultMutableTreeNode("A-Z")
+        for (entry in entries) {
+            val label = "${entry.repo} :: ${entry.branch ?: "?"} :: ${entry.title ?: entry.path}"
+            rootNode.add(DefaultMutableTreeNode(KBNodeData(
+                entry.fullPath, label, isDirectory = false, badge = "C",
+            )))
+        }
+
+        SwingUtilities.invokeLater {
+            val t = Tree(DefaultTreeModel(rootNode)).apply {
+                isRootVisible = false
+                showsRootHandles = false
+                cellRenderer = AZCellRenderer()
+            }
+            t.addMouseListener(object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) {
+                    if (e.clickCount == 2) {
+                        val node = t.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return
+                        val data = node.userObject as? KBNodeData ?: return
+                        if (!data.isDirectory) openCommitSummary(data)
+                    }
+                }
+            })
+            azPanel.removeAll()
+            azPanel.add(JBScrollPane(t), BorderLayout.CENTER)
+            azPanel.revalidate()
+            azPanel.repaint()
+        }
+    }
+
+    // ── View helpers ──────────────────────────────────────────────────────
+
+    private fun showMessageIn(panel: JPanel, text: String) {
+        SwingUtilities.invokeLater {
+            panel.removeAll()
+            val escaped = StringUtil.escapeXmlEntities(text)
+            panel.add(JLabel("<html><center>$escaped</center></html>", SwingConstants.CENTER).apply {
+                border = JBUI.Borders.empty(20)
+            }, BorderLayout.CENTER)
+            panel.revalidate()
+            panel.repaint()
+        }
+    }
+
     private fun showMessage(text: String) {
         SwingUtilities.invokeLater {
             removeAll()
@@ -738,6 +898,46 @@ class KBExplorerPanel(
                     "P" -> append("  P", SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, Color(0x21, 0x96, 0xF3)))
                     "N" -> append("  N", SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, Color(0x4C, 0xAF, 0x50)))
                 }
+            }
+        }
+    }
+
+    private class TimelineCellRenderer : ColoredTreeCellRenderer() {
+        override fun customizeCellRenderer(
+            tree: JTree, value: Any?, selected: Boolean,
+            expanded: Boolean, leaf: Boolean, row: Int, hasFocus: Boolean,
+        ) {
+            val node = value as? DefaultMutableTreeNode ?: return
+            val data = node.userObject
+            if (data is String) {
+                // Date group header
+                icon = AllIcons.Actions.GroupByPrefix
+                append(data, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
+            } else if (data is KBNodeData) {
+                icon = AllIcons.Vcs.CommitNode
+                append(data.displayName ?: data.name)
+            }
+        }
+    }
+
+    private class AZCellRenderer : ColoredTreeCellRenderer() {
+        override fun customizeCellRenderer(
+            tree: JTree, value: Any?, selected: Boolean,
+            expanded: Boolean, leaf: Boolean, row: Int, hasFocus: Boolean,
+        ) {
+            val node = value as? DefaultMutableTreeNode ?: return
+            val data = node.userObject as? KBNodeData ?: return
+            icon = AllIcons.Vcs.CommitNode
+            // name is already "repo :: branch :: title"
+            val parts = data.name.split(" :: ", limit = 3)
+            if (parts.size == 3) {
+                append(parts[0], SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                append(" :: ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                append(parts[1], SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                append(" :: ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                append(parts[2])
+            } else {
+                append(data.name)
             }
         }
     }
