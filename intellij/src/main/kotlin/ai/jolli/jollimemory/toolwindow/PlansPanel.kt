@@ -259,6 +259,8 @@ class PlansPanel(
         val plansDir = File(System.getProperty("user.home"), ".claude/plans")
         return plans.values.filter { entry ->
             if (entry.ignored == true) return@filter false
+            // Skip entries from other branches
+            if (currentBranch != null && entry.branch != null && entry.branch != currentBranch) return@filter false
             // Skip committed snapshot copies (slug-<shortHash> entries created by archivePlanForCommit).
             // These exist only for orphan branch storage / Summary WebView, not for the sidebar panel.
             if (entry.commitHash != null && entry.contentHashAtCommit == null) return@filter false
@@ -272,11 +274,6 @@ class PlansPanel(
                         .joinToString("") { "%02x".format(it) }
                 } catch (_: Exception) { null }
                 if (hash == entry.contentHashAtCommit) return@filter false
-            }
-            // Skip committed plans not on current branch
-            if (entry.commitHash != null && currentBranch != null) {
-                val onBranch = gitOps?.exec("merge-base", "--is-ancestor", entry.commitHash, "HEAD")
-                if (onBranch == null) return@filter false
             }
             // Skip uncommitted plans whose source file was deleted
             if (entry.commitHash == null && !File(entry.sourcePath).exists()) return@filter false
@@ -292,6 +289,8 @@ class PlansPanel(
     ): List<NoteEntry> {
         return notes.values.filter { entry ->
             if (entry.ignored == true) return@filter false
+            // Skip entries from other branches
+            if (currentBranch != null && entry.branch != null && entry.branch != currentBranch) return@filter false
             // Skip committed snapshot copies (created by archiveNoteForCommit).
             // These exist only for orphan branch storage / Summary WebView, not for the sidebar panel.
             if (entry.commitHash != null && entry.contentHashAtCommit == null) return@filter false
@@ -305,11 +304,6 @@ class PlansPanel(
                         .joinToString("") { "%02x".format(it) }
                 } catch (_: Exception) { null }
                 if (hash == entry.contentHashAtCommit) return@filter false
-            }
-            // Skip committed notes not on current branch
-            if (entry.commitHash != null && currentBranch != null) {
-                val onBranch = gitOps?.exec("merge-base", "--is-ancestor", entry.commitHash, "HEAD")
-                if (onBranch == null) return@filter false
             }
             // Skip uncommitted notes whose source file was deleted
             if (entry.commitHash == null && entry.sourcePath != null && !File(entry.sourcePath).exists()) {

@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.KBPathResolver
+import ai.jolli.jollimemory.core.KBRepoDiscoverer
 import ai.jolli.jollimemory.core.MetadataManager
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliMemoryService
@@ -84,6 +85,8 @@ class KBExplorerPanel(
         val name: String,
         val displayName: String? = null,
         val isDirectory: Boolean,
+        val isRepoRoot: Boolean = false,
+        val isCurrentRepo: Boolean = false,
         val badge: String? = null,
     )
 
@@ -94,15 +97,14 @@ class KBExplorerPanel(
         statusListener = { ApplicationManager.getApplication().executeOnPooledThread { refresh() } }
         service.addStatusListener(statusListener)
 
-        // Watch KB root for file create/delete/move events instead of polling
+        // Watch KB parent directory for file changes across all repos
         busConnection = ApplicationManager.getApplication().messageBus.connect()
         busConnection.subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
             override fun after(events: List<VFileEvent>) {
-                val root = kbRoot ?: return
-                val rootStr = root.toString()
+                val parentStr = KBPathResolver.KB_PARENT.toString()
                 val hasRelevantChange = events.any { e ->
                     (e is VFileCreateEvent || e is VFileDeleteEvent || e is VFileMoveEvent) &&
-                        (e.path ?: "").startsWith(rootStr)
+                        (e.path ?: "").startsWith(parentStr)
                 }
                 if (hasRelevantChange) {
                     ApplicationManager.getApplication().executeOnPooledThread { refresh() }
@@ -115,11 +117,9 @@ class KBExplorerPanel(
         project.messageBus.connect(this as Disposable).subscribe(
             GitRepository.GIT_REPO_CHANGE,
             GitRepositoryChangeListener {
-                ApplicationManager.getApplication().executeOnPooledThread {
-                    // Force VFS to detect external file changes before rebuilding the tree
-                    VirtualFileManager.getInstance().syncRefresh()
-                    refresh()
-                }
+                // asyncRefresh triggers a VFS scan on the write thread, then calls our
+                // VFS_CHANGES listener which refreshes the tree on a pooled thread.
+                VirtualFileManager.getInstance().asyncRefresh { refresh() }
             },
         )
     }
@@ -164,50 +164,62 @@ class KBExplorerPanel(
     // ── Tree building ──────────────────────────────────────────────────────
 
     private fun buildTree() {
-        val root = kbRoot ?: throw IllegalStateException("KB root not resolved")
-        if (!Files.isDirectory(root)) {
-            showMessage("KB folder not found: $root")
-            return
-        }
+        val config = SessionTracker.loadConfig()
+        val projectPath = service.mainRepoRoot ?: project.basePath
+        val currentRepoName = projectPath?.let { KBPathResolver.extractRepoName(it) }
+        val currentRemoteUrl = projectPath?.let { KBPathResolver.getRemoteUrl(it) }
 
-        val badgeMap = mutableMapOf<String, String>()
-        val titleMap = mutableMapOf<String, String>()
-        metadataManager?.readManifest()?.files?.forEach { entry ->
-            badgeMap[entry.path] = when (entry.type) {
-                "commit" -> "C"; "plan" -> "P"; "note" -> "N"; else -> ""
-            }
-            if (entry.title != null) titleMap[entry.path] = entry.title
+        val repos = KBRepoDiscoverer.discover(currentRepoName, currentRemoteUrl, config.knowledgeBasePath)
+        if (repos.isEmpty()) {
+            showMessage("No memories yet — commit with an AI coding tool to get started")
+            return
         }
 
         val rootNode = DefaultMutableTreeNode("KB")
-        val dirs = Files.list(root).use { s ->
-            s.filter { it.isDirectory() }
-                .filter { !isHiddenOrInternal(it.name) }
-                .sorted(compareBy { it.name })
-                .toList()
-        }
 
-        for (dir in dirs) {
-            val branchNode = DefaultMutableTreeNode(KBNodeData(dir, dir.name, isDirectory = true))
-            addChildren(branchNode, dir, root, badgeMap, titleMap)
-            rootNode.add(branchNode)  // Show all folders including empty ones
-        }
-
-        Files.list(root).use { s ->
-            s.filter { it.isRegularFile() }
-                .filter { !it.name.startsWith(".") && it.name != "index.json" }
-                .sorted(compareBy { it.name })
-                .forEach { file ->
-                    val relPath = root.relativize(file).toString()
-                    rootNode.add(DefaultMutableTreeNode(
-                        KBNodeData(file, file.name, displayName = titleMap[relPath], isDirectory = false, badge = badgeMap[relPath])
-                    ))
+        for (repo in repos) {
+            val repoMM = MetadataManager(repo.kbRoot.resolve(".jolli"))
+            val badgeMap = mutableMapOf<String, String>()
+            val titleMap = mutableMapOf<String, String>()
+            repoMM.readManifest().files.forEach { entry ->
+                badgeMap[entry.path] = when (entry.type) {
+                    "commit" -> "C"; "plan" -> "P"; "note" -> "N"; else -> ""
                 }
-        }
+                if (entry.title != null) titleMap[entry.path] = entry.title
+            }
 
-        if (rootNode.childCount == 0) {
-            showMessage("No memories yet — commit with an AI coding tool to get started")
-            return
+            val repoNode = DefaultMutableTreeNode(KBNodeData(
+                repo.kbRoot, repo.repoName, isDirectory = true,
+                isRepoRoot = true, isCurrentRepo = repo.isCurrentRepo,
+            ))
+
+            // Add branch folders
+            val dirs = Files.list(repo.kbRoot).use { s ->
+                s.filter { it.isDirectory() }
+                    .filter { !isHiddenOrInternal(it.name) }
+                    .sorted(compareBy { it.name })
+                    .toList()
+            }
+            for (dir in dirs) {
+                val branchNode = DefaultMutableTreeNode(KBNodeData(dir, dir.name, isDirectory = true))
+                addChildren(branchNode, dir, repo.kbRoot, badgeMap, titleMap)
+                repoNode.add(branchNode)
+            }
+
+            // Add root-level files
+            Files.list(repo.kbRoot).use { s ->
+                s.filter { it.isRegularFile() }
+                    .filter { !it.name.startsWith(".") && it.name != "index.json" }
+                    .sorted(compareBy { it.name })
+                    .forEach { file ->
+                        val relPath = repo.kbRoot.relativize(file).toString()
+                        repoNode.add(DefaultMutableTreeNode(
+                            KBNodeData(file, file.name, displayName = titleMap[relPath], isDirectory = false, badge = badgeMap[relPath])
+                        ))
+                    }
+            }
+
+            rootNode.add(repoNode)
         }
 
         SwingUtilities.invokeLater {
@@ -261,8 +273,19 @@ class KBExplorerPanel(
 
             removeAll()
             add(JBScrollPane(tree!!), BorderLayout.CENTER)
+            // Expand current repo and its branch folders; collapse other repos
             for (i in 0 until rootNode.childCount) {
-                tree!!.expandPath(TreePath(arrayOf(rootNode, rootNode.getChildAt(i))))
+                val repoNode = rootNode.getChildAt(i) as? DefaultMutableTreeNode ?: continue
+                val repoData = repoNode.userObject as? KBNodeData
+                val repoPath = TreePath(arrayOf(rootNode, repoNode))
+                if (repoData?.isCurrentRepo == true) {
+                    tree!!.expandPath(repoPath)
+                    for (j in 0 until repoNode.childCount) {
+                        tree!!.expandPath(TreePath(arrayOf(rootNode, repoNode, repoNode.getChildAt(j))))
+                    }
+                } else {
+                    tree!!.collapsePath(repoPath)
+                }
             }
             revalidate()
             repaint()
@@ -699,7 +722,12 @@ class KBExplorerPanel(
         ) {
             val node = value as? DefaultMutableTreeNode ?: return
             val data = node.userObject as? KBNodeData ?: return
-            if (data.isDirectory) {
+            if (data.isRepoRoot) {
+                icon = AllIcons.Nodes.Module
+                val attrs = if (data.isCurrentRepo) SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES
+                    else SimpleTextAttributes.REGULAR_ATTRIBUTES
+                append(data.name, attrs)
+            } else if (data.isDirectory) {
                 icon = AllIcons.Nodes.Folder
                 append(data.name)
             } else {
