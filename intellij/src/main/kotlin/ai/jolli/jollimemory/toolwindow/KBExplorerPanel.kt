@@ -27,6 +27,8 @@ import com.intellij.openapi.vfs.newvfs.events.VFileCreateEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileDeleteEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileMoveEvent
+import git4idea.repo.GitRepository
+import git4idea.repo.GitRepositoryChangeListener
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.JBScrollPane
@@ -107,6 +109,19 @@ class KBExplorerPanel(
                 }
             }
         })
+
+        // Also refresh after git operations (commits, amends) — hooks write to KB folder
+        // via an external process, so VFS_CHANGES may not fire until a VFS refresh occurs.
+        project.messageBus.connect(this as Disposable).subscribe(
+            GitRepository.GIT_REPO_CHANGE,
+            GitRepositoryChangeListener {
+                ApplicationManager.getApplication().executeOnPooledThread {
+                    // Force VFS to detect external file changes before rebuilding the tree
+                    VirtualFileManager.getInstance().syncRefresh()
+                    refresh()
+                }
+            },
+        )
     }
 
     fun load() {
