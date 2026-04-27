@@ -24,7 +24,7 @@ object KBPathResolver {
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
 
     /** Default parent directory for all KB folders. */
-    private val KB_PARENT: Path = Path.of(System.getProperty("user.home"), "Documents", "jolli")
+    val KB_PARENT: Path = Path.of(System.getProperty("user.home"), "Documents", "jolli")
 
     /**
      * Resolves the KB root path for a repository.
