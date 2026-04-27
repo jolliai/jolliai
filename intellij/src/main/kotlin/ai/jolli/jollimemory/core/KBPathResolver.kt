@@ -104,11 +104,12 @@ object KBPathResolver {
         if (config.remoteUrl != null && remoteUrl != null) {
             return normalizeRemoteUrl(config.remoteUrl) == normalizeRemoteUrl(remoteUrl)
         }
-        // If neither has a remote, match by repo name (or folder name for legacy configs without repoName)
-        if (config.remoteUrl == null && remoteUrl == null) {
+        // Legacy config without remoteUrl — match by repoName to avoid
+        // false collisions that create unnecessary -2 suffixed folders
+        if (config.remoteUrl == null) {
             return config.repoName == null || config.repoName == repoName
         }
-        // One has remote, other doesn't — assume different repos
+        // Config has remote but current project doesn't — assume different repos
         return false
     }
 
