@@ -1,27 +1,36 @@
 # JolliMemory CLI npm Release Workflow
 #
 # Authentication: npm Trusted Publishing (OIDC). No NPM_TOKEN required.
-#   - Configure the trusted publisher on npmjs.com for @jolli/cli:
-#       org/user = jolliai, repo = jollimemory,
+#   - Configure the trusted publisher on npmjs.com for @jolli.ai/cli:
+#       org/user = jolliai, repo = jolliai,
 #       workflow filename = publish-cli.yaml,
 #       environment = Production
 #   - The `Production` GitHub Environment provides a manual approval gate.
 #
-# Release flow:
-#   1. Bump version in cli/package.json (and lock file) alongside code changes, merge to main
-#   2. On release branch: git fetch origin main && git rebase origin/main (keep in sync with main)
-#   3. Trigger this workflow manually from release (Actions -> Run workflow)
-#      -> Validates branch, builds, publishes to npm with provenance, tags release-cli-v<version>
+# Triggering: workflow_dispatch only. Pushing a release-cli-v* tag does NOT
+# auto-publish — a human must explicitly start the run from the Actions UI
+# and pass the existing tag name as input. The full release procedure
+# (branch model, version-bump rules, hotfix flow) is in /RELEASE.md.
 
 name: Publish CLI to NPM
 
 on:
     workflow_dispatch:
+        inputs:
+            tag:
+                description: 'Existing signed tag to publish, e.g. release-cli-v1.6.1'
+                required: true
+                type: string
+            dry_run:
+                description: 'If true, run all checks + build + test but skip the actual npm publish'
+                required: false
+                default: false
+                type: boolean
 
 jobs:
     release-cli:
         permissions:
-            contents: write   # tag + push the release tag
+            contents: read    # checkout the tag; CI no longer pushes tags
             id-token: write   # request OIDC token for npm trusted publishing
         runs-on: ubuntu-24.04
         environment: Production
@@ -30,33 +39,130 @@ jobs:
             cancel-in-progress: false
 
         steps:
+            -   name: Resolve and validate tag input
+                id: meta
+                env:
+                    # Pulled into env (not interpolated into shell) to avoid
+                    # any command-injection vector via the tag input. See
+                    # https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+                    TAG_INPUT: ${{ inputs.tag }}
+                run: |
+                    # Strictly validate format. Anything other than
+                    # release-cli-v<semver> is rejected here so all downstream
+                    # steps can rely on this being a literal semver tag string.
+                    if ! printf '%s' "${TAG_INPUT}" | grep -Eq '^release-cli-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+                        echo "::error::tag must match release-cli-v<semver> (got '${TAG_INPUT}')"
+                        exit 1
+                    fi
+                    VERSION="${TAG_INPUT#release-cli-v}"
+                    echo "tag=${TAG_INPUT}" >> "$GITHUB_OUTPUT"
+                    echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
             -   uses: actions/checkout@v5
                 with:
+                    ref: refs/tags/${{ steps.meta.outputs.tag }}
                     fetch-depth: 0
 
-            -   name: Ensure workflow runs from release branch
+            -   name: Fetch tag object and assert it is an annotated, signed tag
+                env:
+                    TAG: ${{ steps.meta.outputs.tag }}
                 run: |
-                    if [ "${GITHUB_REF_NAME}" != "release" ]; then
-                        echo "::error::Run this workflow from the release branch (current: ${GITHUB_REF_NAME})."
+                    set -euo pipefail
+                    # Fetch the tag *ref* explicitly. Relying on the checkout
+                    # action's ref resolution alone is insufficient: that
+                    # resolution accepts a same-named branch or a lightweight
+                    # tag pointing at any signed commit, which would bypass the
+                    # "release tags must be signed" gate.
+                    git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+
+                    # Annotated (and signed) tags resolve to a "tag" object in
+                    # git's object database. Lightweight tags or branches resolve
+                    # to a "commit" object. Sigstore signatures live on the tag
+                    # object itself, so anything that isn't an annotated tag is
+                    # rejected here, before signature verification runs.
+                    TYPE="$(git cat-file -t "refs/tags/${TAG}")"
+                    if [ "${TYPE}" != "tag" ]; then
+                        echo "::error::refs/tags/${TAG} is not an annotated tag (object type: ${TYPE})"
+                        echo "::error::Release tags must be created with 'git tag -s', which produces an annotated tag object signed via sigstore"
                         exit 1
                     fi
 
-            -   name: Ensure release branch contains latest main
+            -   name: Install gitsign
+                env:
+                    # Pin gitsign to a specific release. Update periodically and
+                    # check https://github.com/sigstore/gitsign/releases for the
+                    # current stable. Consider also adding a SHA256 checksum
+                    # verification step once a release-tracking process is in place.
+                    GITSIGN_VERSION: '0.14.0'
                 run: |
-                    git fetch origin main
-                    if ! git merge-base --is-ancestor origin/main HEAD; then
-                        echo "::error::release is behind main. Rebase/merge main into release before releasing."
+                    set -euo pipefail
+                    workdir="$(mktemp -d)"
+                    cd "${workdir}"
+                    curl -fsSL -o gitsign \
+                        "https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/gitsign_${GITSIGN_VERSION}_linux_amd64"
+                    chmod +x gitsign
+                    sudo mv gitsign /usr/local/bin/gitsign
+                    gitsign version
+
+            -   name: Verify tag signature via sigstore
+                env:
+                    TAG: ${{ steps.meta.outputs.tag }}
+                    # Allowlist of OIDC identities permitted to sign release tags.
+                    # The signer's verified email at the time of OAuth must match.
+                    # Update this regex when maintainers join or leave —
+                    # see RELEASE.md and the team setup checklist.
+                    IDENTITY_REGEX: '^.+@jolli\.ai$'
+                    OIDC_ISSUER: 'https://github.com/login/oauth'
+                run: |
+                    # Verify the tag *object* (refs/tags/...) — not the bare
+                    # tag name, which gitsign's revision parser could resolve to
+                    # a same-named branch or a commit pointed at by a lightweight
+                    # tag. The previous step asserted this is an annotated tag.
+                    if ! gitsign verify "refs/tags/${TAG}" \
+                        --certificate-identity-regexp="${IDENTITY_REGEX}" \
+                        --certificate-oidc-issuer="${OIDC_ISSUER}"; then
+                        echo "::error::tag ${TAG} is not signed via sigstore by a trusted identity"
+                        echo "::error::Tags must be signed with gitsign by a maintainer matching: ${IDENTITY_REGEX}"
+                        echo "::error::See RELEASE.md prerequisites for gitsign setup"
                         exit 1
                     fi
 
-            -   name: Ensure release branch is fully in sync with main
+            -   name: Verify tag is reachable from a release/*.x branch
+                env:
+                    TAG: ${{ steps.meta.outputs.tag }}
                 run: |
-                    EXTRA_FILES="$(git diff --name-only origin/main...HEAD || true)"
+                    set -euo pipefail
+                    git fetch origin '+refs/heads/release/*:refs/remotes/origin/release/*'
+                    # Resolve via refs/tags/... to avoid a same-named branch
+                    # being preferred by git's revision parser.
+                    SHA="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+                    BRANCHES="$(git for-each-ref \
+                        --contains "${SHA}" \
+                        --format '%(refname:short)' \
+                        refs/remotes/origin/release/)"
+                    if [ -z "${BRANCHES}" ]; then
+                        echo "::error::tag ${TAG} is not reachable from any release/*.x branch"
+                        echo "::error::All releases must be tagged on a release/<minor>.x branch — see RELEASE.md"
+                        exit 1
+                    fi
+                    echo "Tag reachable from: ${BRANCHES}"
 
-                    if [ -n "${EXTRA_FILES}" ]; then
-                        echo "::error::release has commits beyond main. Rebase onto main first so the branches are identical."
-                        echo "Files diverging from main:"
-                        echo "${EXTRA_FILES}"
+            -   name: Verify cli/package.json version matches tag
+                env:
+                    EXPECTED: ${{ steps.meta.outputs.version }}
+                run: |
+                    ACTUAL="$(node -p "require('./cli/package.json').version")"
+                    if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+                        echo "::error::cli/package.json is ${ACTUAL}, tag expects ${EXPECTED}"
+                        exit 1
+                    fi
+
+            -   name: Verify version not already on npm
+                env:
+                    VERSION: ${{ steps.meta.outputs.version }}
+                run: |
+                    if npm view "@jolli.ai/cli@${VERSION}" version >/dev/null 2>&1; then
+                        echo "::error::@jolli.ai/cli@${VERSION} already published to npm — versions are immutable"
                         exit 1
                     fi
 
@@ -64,7 +170,7 @@ jobs:
                 with:
                     node-version-file: .nvmrc
                     registry-url: https://registry.npmjs.org/
-                    scope: "@jolli"
+                    scope: "@jolli.ai"
 
             -   name: Install workspace dependencies
                 run: npm ci
@@ -72,23 +178,19 @@ jobs:
             -   name: Build, lint, and test (CLI + VS Code)
                 run: npm run all
 
-            -   name: Read version from package.json
-                id: version
-                working-directory: cli
-                run: |
-                    VERSION="$(node -p "require('./package.json').version")"
-                    echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
             -   name: Publish to npm
                 # Authentication via npm Trusted Publishing (OIDC). No NPM_TOKEN.
                 # `--provenance` is passed explicitly so the job fails loudly if OIDC
                 # is misconfigured, rather than silently publishing without provenance.
+                if: inputs.dry_run != true
                 working-directory: cli
                 run: npm publish --provenance
 
-            -   name: Tag release
+            -   name: Dry-run summary
+                if: inputs.dry_run == true
                 env:
-                    VERSION: ${{ steps.version.outputs.version }}
+                    VERSION: ${{ steps.meta.outputs.version }}
                 run: |
-                    git tag "release-cli-v${VERSION}"
-                    git push origin "release-cli-v${VERSION}"
+                    echo "::notice::DRY RUN — real run would publish @jolli.ai/cli@${VERSION} to npm"
+                    echo "All verification + build + test steps completed successfully."
+                    echo "To perform the real release, re-run this workflow with the same tag and dry_run=false."

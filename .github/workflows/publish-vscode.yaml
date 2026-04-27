@@ -1,21 +1,37 @@
 # JolliMemory VS Code Extension Release Workflow
 #
-# Release flow:
-#   1. Bump version in vscode/package.json (and lock file) alongside code changes, merge to main
-#   2. On release branch: git fetch origin main && git rebase origin/main (keep in sync with main)
-#   3. Trigger this workflow manually from release (Actions → Run workflow)
-#      → Validates branch, builds, publishes to VS Code Marketplace + Open VSX, tags release-vscode-v<version>
-#   - The `Production` GitHub Environment provides a manual approval gate.
+# Authentication:
+#   - VS Code Marketplace: long-lived PAT in JOLLIMEMORY_VSCE_PAT secret
+#   - Open VSX: long-lived PAT in JOLLIMEMORY_OVSX_PAT secret
+#   Both marketplaces do not currently support OIDC trusted publishing, so
+#   long-lived PATs remain necessary. Track upstream support and migrate when
+#   either platform offers OIDC. The `Production` environment gate limits
+#   secret exposure to approved release runs.
+#
+# Triggering: workflow_dispatch only. Pushing a release-vscode-v* tag does NOT
+# auto-publish — a human must explicitly start the run from the Actions UI
+# and pass the existing tag name as input. Full release procedure
+# (branch model, version-bump rules, hotfix flow) is in /RELEASE.md.
 
-name: Publish VS Code Extension to Marketplace
+name: Publish VS Code Extension to Marketplaces
 
 on:
     workflow_dispatch:
+        inputs:
+            tag:
+                description: 'Existing signed tag to publish, e.g. release-vscode-v1.6.1'
+                required: true
+                type: string
+            dry_run:
+                description: 'If true, run all checks + build + test + package but skip the actual marketplace publishes'
+                required: false
+                default: false
+                type: boolean
 
 jobs:
-    release-jollimemory:
+    release-vscode:
         permissions:
-            contents: write
+            contents: read    # checkout the tag; CI no longer pushes tags
         runs-on: ubuntu-24.04
         environment: Production
         concurrency:
@@ -23,34 +39,115 @@ jobs:
             cancel-in-progress: false
 
         steps:
+            -   name: Resolve and validate tag input
+                id: meta
+                env:
+                    # Pulled into env (not interpolated into shell) to avoid
+                    # any command-injection vector via the tag input.
+                    TAG_INPUT: ${{ inputs.tag }}
+                run: |
+                    if ! printf '%s' "${TAG_INPUT}" | grep -Eq '^release-vscode-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+                        echo "::error::tag must match release-vscode-v<semver> (got '${TAG_INPUT}')"
+                        exit 1
+                    fi
+                    VERSION="${TAG_INPUT#release-vscode-v}"
+                    echo "tag=${TAG_INPUT}" >> "$GITHUB_OUTPUT"
+                    echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
             -   uses: actions/checkout@v5
                 with:
+                    ref: refs/tags/${{ steps.meta.outputs.tag }}
                     fetch-depth: 0
 
-            -   name: Ensure workflow runs from release branch
+            -   name: Fetch tag object and assert it is an annotated, signed tag
+                env:
+                    TAG: ${{ steps.meta.outputs.tag }}
                 run: |
-                    if [ "${GITHUB_REF_NAME}" != "release" ]; then
-                        echo "::error::Run this workflow from the release branch (current: ${GITHUB_REF_NAME})."
+                    set -euo pipefail
+                    # Fetch the tag *ref* explicitly. Relying on the checkout
+                    # action's ref resolution alone is insufficient: that
+                    # resolution accepts a same-named branch or a lightweight
+                    # tag pointing at any signed commit, which would bypass the
+                    # "release tags must be signed" gate.
+                    git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+
+                    # Annotated (and signed) tags resolve to a "tag" object in
+                    # git's object database. Lightweight tags or branches resolve
+                    # to a "commit" object. Sigstore signatures live on the tag
+                    # object itself, so anything that isn't an annotated tag is
+                    # rejected here, before signature verification runs.
+                    TYPE="$(git cat-file -t "refs/tags/${TAG}")"
+                    if [ "${TYPE}" != "tag" ]; then
+                        echo "::error::refs/tags/${TAG} is not an annotated tag (object type: ${TYPE})"
+                        echo "::error::Release tags must be created with 'git tag -s', which produces an annotated tag object signed via sigstore"
                         exit 1
                     fi
 
-            -   name: Ensure release branch contains latest main
+            -   name: Install gitsign
+                env:
+                    # Pin gitsign to a specific release. Update periodically and
+                    # check https://github.com/sigstore/gitsign/releases for the
+                    # current stable. Keep this version in sync with publish-cli.yaml.
+                    GITSIGN_VERSION: '0.14.0'
                 run: |
-                    git fetch origin main
-                    if ! git merge-base --is-ancestor origin/main HEAD; then
-                        echo "::error::release is behind main. Rebase/merge main into release before releasing."
+                    set -euo pipefail
+                    workdir="$(mktemp -d)"
+                    cd "${workdir}"
+                    curl -fsSL -o gitsign \
+                        "https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/gitsign_${GITSIGN_VERSION}_linux_amd64"
+                    chmod +x gitsign
+                    sudo mv gitsign /usr/local/bin/gitsign
+                    gitsign version
+
+            -   name: Verify tag signature via sigstore
+                env:
+                    TAG: ${{ steps.meta.outputs.tag }}
+                    # Allowlist of OIDC identities permitted to sign release tags.
+                    # Keep in sync with publish-cli.yaml — both products share
+                    # the same maintainer set per the release model.
+                    IDENTITY_REGEX: '^.+@jolli\.ai$'
+                    OIDC_ISSUER: 'https://github.com/login/oauth'
+                run: |
+                    # Verify the tag *object* (refs/tags/...) — not the bare
+                    # tag name, which gitsign's revision parser could resolve to
+                    # a same-named branch or a commit pointed at by a lightweight
+                    # tag. The previous step asserted this is an annotated tag.
+                    if ! gitsign verify "refs/tags/${TAG}" \
+                        --certificate-identity-regexp="${IDENTITY_REGEX}" \
+                        --certificate-oidc-issuer="${OIDC_ISSUER}"; then
+                        echo "::error::tag ${TAG} is not signed via sigstore by a trusted identity"
+                        echo "::error::Tags must be signed with gitsign by a maintainer matching: ${IDENTITY_REGEX}"
+                        echo "::error::See RELEASE.md prerequisites for gitsign setup"
                         exit 1
                     fi
 
-            -   name: Ensure release branch is fully in sync with main
+            -   name: Verify tag is reachable from a release/*.x branch
+                env:
+                    TAG: ${{ steps.meta.outputs.tag }}
                 run: |
-                    # After a correct rebase, release should be identical to main.
-                    EXTRA_FILES="$(git diff --name-only origin/main...HEAD || true)"
+                    set -euo pipefail
+                    git fetch origin '+refs/heads/release/*:refs/remotes/origin/release/*'
+                    # Resolve via refs/tags/... to avoid a same-named branch
+                    # being preferred by git's revision parser.
+                    SHA="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+                    BRANCHES="$(git for-each-ref \
+                        --contains "${SHA}" \
+                        --format '%(refname:short)' \
+                        refs/remotes/origin/release/)"
+                    if [ -z "${BRANCHES}" ]; then
+                        echo "::error::tag ${TAG} is not reachable from any release/*.x branch"
+                        echo "::error::All releases must be tagged on a release/<minor>.x branch — see RELEASE.md"
+                        exit 1
+                    fi
+                    echo "Tag reachable from: ${BRANCHES}"
 
-                    if [ -n "${EXTRA_FILES}" ]; then
-                        echo "::error::release has commits beyond main. Rebase onto main first so the branches are identical."
-                        echo "Files diverging from main:"
-                        echo "${EXTRA_FILES}"
+            -   name: Verify vscode/package.json version matches tag
+                env:
+                    EXPECTED: ${{ steps.meta.outputs.version }}
+                run: |
+                    ACTUAL="$(node -p "require('./vscode/package.json').version")"
+                    if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+                        echo "::error::vscode/package.json is ${ACTUAL}, tag expects ${EXPECTED}"
                         exit 1
                     fi
 
@@ -64,32 +161,124 @@ jobs:
             -   name: Build, lint, and test (CLI + VS Code)
                 run: npm run all
 
-            -   name: Read version from package.json
-                id: version
-                working-directory: vscode
-                run: |
-                    VERSION="$(node -p "require('./package.json').version")"
-                    echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
             -   name: Package extension
                 working-directory: vscode
                 run: npm run package
 
+            -   name: Check if version already on VS Code Marketplace
+                id: vsce_check
+                env:
+                    VERSION: ${{ steps.meta.outputs.version }}
+                run: |
+                    # Don't `set -e` — we inspect vsce show's exit code below.
+                    set -uo pipefail
+                    # Marketplace versions are immutable. If this version is
+                    # already published we skip the publish step (don't fail)
+                    # so a partially-failed run can resume cleanly. But if the
+                    # lookup itself fails (network, 5xx, malformed JSON, etc.),
+                    # we fail CLOSED — silently treating an undetermined state
+                    # as "not published" would let a transient outage produce a
+                    # double-publish attempt or other broken state.
+                    OUTPUT="$(npx -y @vscode/vsce show jolli.jollimemory-vscode --json 2>&1)"
+                    EXIT=$?
+                    if [ ${EXIT} -eq 0 ]; then
+                        # Successful response — parse and check for VERSION.
+                        if printf '%s' "${OUTPUT}" | node -e 'const j=JSON.parse(require("fs").readFileSync(0,"utf8")||"{}");const v=process.env.VERSION;process.exit((j.versions||[]).some(x=>x.version===v)?0:1)'; then
+                            echo "Version ${VERSION} already on VS Code Marketplace; skipping publish"
+                            echo "skip=true" >> "$GITHUB_OUTPUT"
+                        else
+                            echo "Version ${VERSION} not yet on VS Code Marketplace; will publish"
+                            echo "skip=false" >> "$GITHUB_OUTPUT"
+                        fi
+                    elif printf '%s' "${OUTPUT}" | grep -qiE "(extension not found|extension does not exist|no extensions found)"; then
+                        # Recognised "extension namespace exists but no extension yet"
+                        # — this is the first publish for a new extension.
+                        echo "Extension not yet on VS Code Marketplace; will publish (first release)"
+                        echo "skip=false" >> "$GITHUB_OUTPUT"
+                    else
+                        echo "::error::vsce show failed unexpectedly (exit ${EXIT}); cannot determine publish status — failing closed."
+                        echo "${OUTPUT}" >&2
+                        exit 1
+                    fi
+
             -   name: Publish to VS Code Marketplace
+                if: steps.vsce_check.outputs.skip != 'true' && inputs.dry_run != true
                 working-directory: vscode
                 env:
                     VSCE_PAT: ${{ secrets.JOLLIMEMORY_VSCE_PAT }}
-                run: npx vsce publish --packagePath "jollimemory-vscode-${{ steps.version.outputs.version }}.vsix" --no-dependencies --allow-missing-repository
+                    VERSION: ${{ steps.meta.outputs.version }}
+                run: |
+                    npx -y @vscode/vsce publish \
+                        --packagePath "jollimemory-vscode-${VERSION}.vsix" \
+                        --no-dependencies \
+                        --allow-missing-repository
 
-            -   name: Publish to Open VSX (Cursor marketplace)
+            -   name: Dry-run summary for VS Code Marketplace
+                if: inputs.dry_run == true
+                env:
+                    VERSION: ${{ steps.meta.outputs.version }}
+                    SKIP: ${{ steps.vsce_check.outputs.skip }}
+                run: |
+                    if [ "${SKIP}" = "true" ]; then
+                        echo "::notice::DRY RUN — version ${VERSION} already on VS Code Marketplace; real run would skip"
+                    else
+                        echo "::notice::DRY RUN — real run would publish version ${VERSION} to VS Code Marketplace"
+                    fi
+
+            -   name: Check if version already on Open VSX
+                id: ovsx_check
+                env:
+                    VERSION: ${{ steps.meta.outputs.version }}
+                run: |
+                    # Don't `set -e` — we inspect curl's exit code below.
+                    set -uo pipefail
+                    # 200 = already published (skip publish step).
+                    # 404 = not yet published (run publish step).
+                    # Anything else (5xx, 429, network error) fails CLOSED —
+                    # we won't publish over a transient outage that may be
+                    # masking a prior successful publish, nor silently retry
+                    # past rate limits.
+                    HTTP_STATUS="$(curl -sSL -o /dev/null -w '%{http_code}' \
+                        "https://open-vsx.org/api/jolli/jollimemory-vscode/${VERSION}")"
+                    CURL_EXIT=$?
+                    if [ ${CURL_EXIT} -ne 0 ]; then
+                        echo "::error::curl to Open VSX failed (exit ${CURL_EXIT}) — failing closed"
+                        exit 1
+                    fi
+                    case "${HTTP_STATUS}" in
+                        200)
+                            echo "Version ${VERSION} already on Open VSX; skipping publish"
+                            echo "skip=true" >> "$GITHUB_OUTPUT"
+                            ;;
+                        404)
+                            echo "Version ${VERSION} not yet on Open VSX (HTTP 404); will publish"
+                            echo "skip=false" >> "$GITHUB_OUTPUT"
+                            ;;
+                        *)
+                            echo "::error::Open VSX returned unexpected HTTP ${HTTP_STATUS} for version ${VERSION}"
+                            echo "::error::Cannot safely determine publish status — failing closed"
+                            exit 1
+                            ;;
+                    esac
+
+            -   name: Publish to Open VSX
+                if: steps.ovsx_check.outputs.skip != 'true' && inputs.dry_run != true
                 working-directory: vscode
                 env:
                     OVSX_PAT: ${{ secrets.JOLLIMEMORY_OVSX_PAT }}
-                run: npx ovsx publish "jollimemory-vscode-${{ steps.version.outputs.version }}.vsix" -p "${OVSX_PAT}"
-
-            -   name: Tag release
-                env:
-                    VERSION: ${{ steps.version.outputs.version }}
+                    VERSION: ${{ steps.meta.outputs.version }}
                 run: |
-                    git tag "release-vscode-v${VERSION}"
-                    git push origin "release-vscode-v${VERSION}"
+                    npx -y ovsx publish "jollimemory-vscode-${VERSION}.vsix" -p "${OVSX_PAT}"
+
+            -   name: Dry-run summary for Open VSX
+                if: inputs.dry_run == true
+                env:
+                    VERSION: ${{ steps.meta.outputs.version }}
+                    SKIP: ${{ steps.ovsx_check.outputs.skip }}
+                run: |
+                    if [ "${SKIP}" = "true" ]; then
+                        echo "::notice::DRY RUN — version ${VERSION} already on Open VSX; real run would skip"
+                    else
+                        echo "::notice::DRY RUN — real run would publish version ${VERSION} to Open VSX"
+                    fi
+                    echo "Dry run complete. To perform the real release, re-run this workflow with the same tag and dry_run=false."
