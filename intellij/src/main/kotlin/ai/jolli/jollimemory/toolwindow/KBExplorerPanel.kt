@@ -5,7 +5,12 @@ import ai.jolli.jollimemory.core.KBDataCache
 import ai.jolli.jollimemory.core.KBPathResolver
 import ai.jolli.jollimemory.core.KBRepoDiscoverer
 import ai.jolli.jollimemory.core.MetadataManager
+import ai.jolli.jollimemory.core.MigrationEngine
+import ai.jolli.jollimemory.core.MigrationState
+import ai.jolli.jollimemory.core.FolderStorage
+import ai.jolli.jollimemory.core.OrphanBranchStorage
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
@@ -49,6 +54,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import javax.swing.BoxLayout
+import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JMenuItem
 import javax.swing.JPanel
@@ -57,6 +63,8 @@ import javax.swing.JToggleButton
 import javax.swing.JTree
 import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
 import java.awt.CardLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
@@ -91,6 +99,7 @@ class KBExplorerPanel(
     private val timelinePanel = JPanel(BorderLayout())
     private val azPanel = JPanel(BorderLayout())
     private var cachedRepos: List<KBRepoDiscoverer.DiscoveredRepo> = emptyList()
+    private var searchQuery: String = ""
 
     private val statusListener: () -> Unit
     private val busConnection: MessageBusConnection
@@ -129,6 +138,31 @@ class KBExplorerPanel(
         toolbar.add(btnTree)
         toolbar.add(btnTimeline)
         toolbar.add(btnAZ)
+        toolbar.add(javax.swing.Box.createHorizontalStrut(8))
+
+        // Search field
+        val searchField = com.intellij.ui.SearchTextField(false).apply {
+            toolTipText = "Search across all repos"
+            textEditor.columns = 12
+        }
+        searchField.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent?) = onSearchChanged(searchField.text)
+            override fun removeUpdate(e: DocumentEvent?) = onSearchChanged(searchField.text)
+            override fun changedUpdate(e: DocumentEvent?) = onSearchChanged(searchField.text)
+        })
+        toolbar.add(searchField)
+        toolbar.add(javax.swing.Box.createHorizontalStrut(4))
+
+        // Reset button
+        val btnReset = JButton(AllIcons.Actions.Refresh).apply {
+            toolTipText = "Reset — re-migrate from orphan branch"
+            isBorderPainted = false
+            isContentAreaFilled = false
+            addActionListener {
+                ApplicationManager.getApplication().executeOnPooledThread { resetMigration() }
+            }
+        }
+        toolbar.add(btnReset)
 
         contentPanel.add(treePanel, ViewMode.TREE.name)
         contentPanel.add(timelinePanel, ViewMode.TIMELINE.name)
@@ -735,6 +769,39 @@ class KBExplorerPanel(
         ApplicationManager.getApplication().executeOnPooledThread { refresh() }
     }
 
+    // ── Search ─────────────────────────────────────────────────────────────
+
+    private fun onSearchChanged(query: String) {
+        searchQuery = query.trim().lowercase()
+        ApplicationManager.getApplication().executeOnPooledThread { rebuildCurrentView() }
+    }
+
+    private fun matchesSearch(vararg fields: String?): Boolean {
+        if (searchQuery.isEmpty()) return true
+        return fields.any { it?.lowercase()?.contains(searchQuery) == true }
+    }
+
+    // ── Reset migration ───────────────────────────────────────────────────
+
+    private fun resetMigration() {
+        try {
+            val root = kbRoot ?: return
+            val mm = MetadataManager(root.resolve(".jolli"))
+            mm.saveMigrationState(MigrationState(status = "pending"))
+
+            val projectPath = service.mainRepoRoot ?: project.basePath ?: return
+            val orphan = OrphanBranchStorage(GitOps(projectPath))
+            val folder = FolderStorage(root, mm)
+            val engine = MigrationEngine(orphan, folder, mm)
+            val result = engine.runMigration()
+
+            LOG.info("Reset migration: ${result.status} (${result.migratedEntries}/${result.totalEntries})")
+            refresh()
+        } catch (e: Exception) {
+            LOG.warn("Reset migration failed", e)
+        }
+    }
+
     // ── Timeline view ──────────────────────────────────────────────────────
 
     private fun buildTimeline() {
@@ -746,16 +813,22 @@ class KBExplorerPanel(
 
         val rootNode = DefaultMutableTreeNode("Timeline")
         for ((dateLabel, entries) in groups) {
+            val filtered = entries.filter { matchesSearch(it.repo, it.branch, it.title, it.path) }
+            if (filtered.isEmpty()) continue
             val dateNode = DefaultMutableTreeNode(dateLabel)
-            for (entry in entries) {
+            for (entry in filtered) {
                 val display = entry.title ?: entry.path
-                val desc = "${entry.repo} / ${entry.branch ?: "unknown"}"
                 dateNode.add(DefaultMutableTreeNode(KBNodeData(
                     entry.fullPath, entry.path, displayName = display,
                     isDirectory = false, badge = "C",
                 )))
             }
             rootNode.add(dateNode)
+        }
+
+        if (rootNode.childCount == 0) {
+            showMessageIn(timelinePanel, "No results for \"$searchQuery\"")
+            return
         }
 
         SwingUtilities.invokeLater {
@@ -788,8 +861,9 @@ class KBExplorerPanel(
 
     private fun buildAZ() {
         val entries = KBDataCache.byAlpha()
+            .filter { matchesSearch(it.repo, it.branch, it.title, it.path) }
         if (entries.isEmpty()) {
-            showMessageIn(azPanel, "No memories yet")
+            showMessageIn(azPanel, if (searchQuery.isEmpty()) "No memories yet" else "No results for \"$searchQuery\"")
             return
         }
 
@@ -838,15 +912,9 @@ class KBExplorerPanel(
     }
 
     private fun showMessage(text: String) {
-        SwingUtilities.invokeLater {
-            removeAll()
-            val escaped = StringUtil.escapeXmlEntities(text)
-            add(JLabel("<html><center>$escaped</center></html>", SwingConstants.CENTER).apply {
-                border = JBUI.Borders.empty(20)
-            }, BorderLayout.CENTER)
-            revalidate()
-            repaint()
-        }
+        showMessageIn(treePanel, text)
+        showMessageIn(timelinePanel, text)
+        showMessageIn(azPanel, text)
     }
 
     private fun findNodeByPath(node: DefaultMutableTreeNode, targetPath: Path): DefaultMutableTreeNode? {
