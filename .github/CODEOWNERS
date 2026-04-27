@@ -1,0 +1,37 @@
+# GitHub CODEOWNERS for jolliai/jolliai
+#
+# Combined with the `Require review from Code Owners` branch rule on `main`,
+# this file makes the listed teams' approval mandatory for any PR that
+# touches the matched paths.
+#
+# IMPORTANT: GitHub CODEOWNERS uses LAST-matching-pattern-wins (not
+# most-specific). Order matters — specific overrides must come AFTER
+# broader rules.
+#
+# Team handles below (`@jolliai/<team>`) point to GitHub Teams. Their
+# membership is configured in GitHub org settings, not in this file.
+
+# Default owners — every PR needs at least one maintainer review.
+* @jolliai/maintainers
+
+# All CI / release workflows (build + publish). Changes here directly
+# affect what code reaches end users — build correctness, publish targets,
+# signing/verification logic. Covers any workflow added later, not just the
+# publish-* ones currently in the repo.
+.github/workflows/  @jolliai/release-team
+
+# Release procedure document (the human counterpart of the workflows).
+RELEASE.md  @jolliai/release-team
+
+# Security-sensitive: API key parsing and origin allowlist.
+# CLAUDE.md notes "Keep the three implementations in lockstep" —
+# any change here implies coordinated changes across CLI / VS Code (via
+# bundled CLI helpers) / IntelliJ. Security team review enforces that.
+cli/src/core/JolliApiUtils.ts                                @jolliai/security
+intellij/src/main/kotlin/ai/jolli/jollimemory/services/      @jolliai/security
+
+# CODEOWNERS itself: modifying *who reviews what* is a governance change,
+# distinct from any code change, so it requires admin-level approval.
+# Keep this rule LAST so it overrides the `.github/workflows/` rule above
+# (last-matching-pattern-wins).
+.github/CODEOWNERS  @jolliai/admins
