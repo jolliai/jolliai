@@ -41,7 +41,7 @@ export function buildSettingsScript(): string {
   let hasErrors = false;
 
   // ── Validation ──
-  var ALLOWED_JOLLI_HOSTS = ['jolli.ai', 'jolli.dev', 'jolli-local.me'];
+  var ALLOWED_JOLLI_HOSTS = ['jolli.ai', 'jolli.dev', 'jolli.cloud', 'jolli-local.me'];
 
   function decodeBase64url(seg) {
     try {
@@ -87,7 +87,7 @@ export function buildSettingsScript(): string {
         var meta = JSON.parse(json);
         if (typeof meta.t === 'string' && typeof meta.u === 'string') {
           if (!checkJolliOriginAllowed(meta.u)) {
-            return 'Origin ' + meta.u + ' is not on the Jolli allowlist (only *.jolli.ai, *.jolli.dev, *.jolli-local.me).';
+            return 'Origin ' + meta.u + ' is not on the Jolli allowlist (only *.jolli.ai, *.jolli.dev, *.jolli.cloud, *.jolli-local.me).';
           }
           return '';
         }
