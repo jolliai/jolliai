@@ -1575,11 +1575,20 @@ describe("CLI", () => {
 	});
 
 	describe("export-prompt command", () => {
-		it("prints all templates when no action is provided", async () => {
+		it("prints a usage hint instead of dumping all templates when no flags are provided", async () => {
 			await main(["export-prompt"]);
 
-			expect(process.stdout.write).toHaveBeenCalledWith(expect.stringContaining("=== summarize:small ==="));
-			expect(process.stdout.write).toHaveBeenCalledWith(expect.stringContaining("=== translate ==="));
+			// Default output is guidance text — dumping all templates to stdout
+			// produces thousands of lines that overwhelm scrollback. Direct users
+			// to either --action <key> for one or --output <dir> for all.
+			const calls = (console.log as unknown as { mock: { calls: ReadonlyArray<ReadonlyArray<string>> } }).mock
+				.calls;
+			const combined = calls.map((c) => c.join(" ")).join("\n");
+			expect(combined).toContain("--action");
+			expect(combined).toContain("--output");
+			expect(combined).toContain("Available actions:");
+			// And explicitly NOT a template body
+			expect(process.stdout.write).not.toHaveBeenCalledWith(expect.stringContaining("=== summarize"));
 		});
 
 		it("prints a single template when --action is provided", async () => {
@@ -1595,6 +1604,128 @@ describe("CLI", () => {
 
 			expect(console.error).toHaveBeenCalledWith(expect.stringContaining('unknown action "unknown-action"'));
 			expect(process.exitCode).toBe(1);
+		});
+
+		describe("--output", () => {
+			let tmpDir: string;
+			beforeEach(async () => {
+				const { mkdtemp } = await import("node:fs/promises");
+				const { tmpdir } = await import("node:os");
+				const { join } = await import("node:path");
+				tmpDir = await mkdtemp(join(tmpdir(), "jolli-export-prompt-"));
+			});
+			afterEach(async () => {
+				const { rm } = await import("node:fs/promises");
+				await rm(tmpDir, { recursive: true, force: true });
+			});
+
+			it("writes manifest.json + per-prompt .md files to the output directory", async () => {
+				const { readFile, readdir } = await import("node:fs/promises");
+				const { join } = await import("node:path");
+
+				await main(["export-prompt", "--output", tmpDir]);
+
+				const files = await readdir(tmpDir);
+				expect(files).toContain("manifest.json");
+				// Per-prompt .md files (one per action)
+				expect(files).toContain("summarize.md");
+				expect(files).toContain("commit-message.md");
+				expect(files).toContain("translate.md");
+
+				const manifestRaw = await readFile(join(tmpDir, "manifest.json"), "utf-8");
+				const manifest = JSON.parse(manifestRaw) as {
+					exportedAt: string;
+					cliVersion: string;
+					prompts: ReadonlyArray<{
+						action: string;
+						version: number;
+						template: string;
+						placeholders: ReadonlyArray<string>;
+					}>;
+				};
+
+				// Schema sanity
+				expect(manifest.exportedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+				expect(manifest.cliVersion).toBeTruthy();
+				// cliVersion must NOT leak the VSCode plugin's package.json version
+				// when this CLI binary is shipped inside the VSCode bundle. The
+				// build-time define `__CLI_PKG_VERSION__` is the canonical source —
+				// validate that the value at minimum looks like a semver string and
+				// is not the placeholder "unknown" the catch-all returns when both
+				// the define and the package.json read fail.
+				expect(manifest.cliVersion).not.toBe("unknown");
+				expect(manifest.cliVersion).toMatch(/^\d+\.\d+\.\d+/);
+				expect(manifest.prompts.length).toBeGreaterThanOrEqual(6);
+
+				// Each entry has the required fields and non-empty template
+				for (const p of manifest.prompts) {
+					expect(p.action).toBeTruthy();
+					expect(p.version).toBeGreaterThan(0);
+					expect(p.template.length).toBeGreaterThan(0);
+					expect(Array.isArray(p.placeholders)).toBe(true);
+				}
+
+				// Placeholder extraction must cover spaced form too (matches fillTemplate).
+				// Topic-count guidance is now embedded in the prompt text itself, so the
+				// summarize template should NOT have a topicGuidance placeholder anymore —
+				// only the standard input set: commit fields, conversation, diff.
+				const summarize = manifest.prompts.find((p) => p.action === "summarize");
+				expect(summarize?.placeholders).toContain("commitHash");
+				expect(summarize?.placeholders).toContain("diff");
+				expect(summarize?.placeholders).toContain("conversation");
+				expect(summarize?.placeholders).not.toContain("topicGuidance");
+			});
+
+			it("emits per-prompt .md with frontmatter (action, version, placeholders)", async () => {
+				const { readFile } = await import("node:fs/promises");
+				const { join } = await import("node:path");
+
+				await main(["export-prompt", "--output", tmpDir]);
+
+				const md = await readFile(join(tmpDir, "translate.md"), "utf-8");
+				expect(md).toMatch(/^---\naction: "translate"\n/);
+				expect(md).toMatch(/version: \d+\n/);
+				expect(md).toContain("placeholders:");
+				expect(md).toContain("Translate the following Markdown");
+			});
+
+			it("filters to a single prompt when --action and --output both provided", async () => {
+				const { readFile, readdir } = await import("node:fs/promises");
+				const { join } = await import("node:path");
+
+				await main(["export-prompt", "--action", "translate", "--output", tmpDir]);
+
+				const files = await readdir(tmpDir);
+				expect(files).toContain("manifest.json");
+				expect(files).toContain("translate.md");
+				// Other prompts should NOT have files written
+				expect(files).not.toContain("summarize.md");
+				expect(files).not.toContain("commit-message.md");
+
+				const manifest = JSON.parse(await readFile(join(tmpDir, "manifest.json"), "utf-8")) as {
+					prompts: ReadonlyArray<{ action: string }>;
+				};
+				expect(manifest.prompts).toHaveLength(1);
+				expect(manifest.prompts[0].action).toBe("translate");
+			});
+
+			it("errors when --action is unknown even with --output", async () => {
+				await main(["export-prompt", "--action", "no-such-action", "--output", tmpDir]);
+
+				expect(console.error).toHaveBeenCalledWith(expect.stringContaining('unknown action "no-such-action"'));
+				expect(process.exitCode).toBe(1);
+			});
+
+			it("creates the output directory if it does not exist", async () => {
+				const { stat } = await import("node:fs/promises");
+				const { join } = await import("node:path");
+				const nestedDir = join(tmpDir, "nested", "deep");
+
+				await main(["export-prompt", "--output", nestedDir]);
+
+				const s = await stat(nestedDir);
+				expect(s.isDirectory()).toBe(true);
+			});
 		});
 	});
 
@@ -3530,7 +3661,11 @@ describe("CLI", () => {
 			expect(output).toContain("Nothing to clean");
 		});
 
-		it("should detect orphan summary and transcript files", async () => {
+		it("no longer scans or reports orphan summary/transcript files", async () => {
+			// Under unified Hoist (schema v4) the per-child summary file is the
+			// ONLY copy of original topics/recap (the embedded child gets stripped).
+			// Transcripts have always been by-hash files. clean must not delete
+			// either; the section is removed from the output entirely.
 			const hash = "abc1234567890abcdef";
 			const output = (
 				await runClean(["clean", "--dry-run"], {
@@ -3540,11 +3675,9 @@ describe("CLI", () => {
 				})
 			).join("\n");
 
-			expect(output).toContain("Orphan summaries:");
-			expect(output).toContain("1 files");
-			expect(output).toContain("Orphan transcripts:");
-			expect(output).toContain("[dry-run]");
-			expect(output).toContain("Would remove 2 items");
+			expect(output).not.toContain("Orphan summaries:");
+			expect(output).not.toContain("Orphan transcripts:");
+			expect(output).toContain("Nothing to clean");
 		});
 
 		it("should detect stale sessions/queue/squash-pending", async () => {
@@ -3562,23 +3695,20 @@ describe("CLI", () => {
 			expect(output).toContain("Would remove 6 items");
 		});
 
-		it("should filter orphan files by child hashes only", async () => {
+		it("does not surface orphan summaries in the output", async () => {
 			const childHash = "abc1111111111111111";
 			const rootHash = "def2222222222222222";
 			const output = (
 				await runClean(["clean", "--dry-run"], {
 					childHashes: [childHash],
-					orphanSummaries: [
-						`summaries/${childHash}.json`,
-						`summaries/${rootHash}.json`, // not a child — should NOT count
-					],
+					orphanSummaries: [`summaries/${childHash}.json`, `summaries/${rootHash}.json`],
 				})
 			).join("\n");
 
-			expect(output).toContain("Orphan summaries:     1 files");
+			expect(output).not.toContain("Orphan summaries:");
 		});
 
-		it("should perform deletions when confirmed with --yes", async () => {
+		it("performs only the stale-data deletions when confirmed with --yes (no orphan files touched)", async () => {
 			const { writeMultipleFilesToBranch } = await import("./core/GitOps.js");
 			const { pruneStaleSessions, pruneStaleQueueEntries, deleteSquashPending } = await import(
 				"./core/SessionTracker.js"
@@ -3590,6 +3720,7 @@ describe("CLI", () => {
 			const hash = "abc1234567890abcdef";
 			const output = (
 				await runClean(["clean", "--yes"], {
+					// Even when callers stage orphan files, clean must not delete them.
 					childHashes: [hash],
 					orphanSummaries: [`summaries/${hash}.json`],
 					staleSessions: 2,
@@ -3598,7 +3729,9 @@ describe("CLI", () => {
 				})
 			).join("\n");
 
-			expect(writeMultipleFilesToBranch).toHaveBeenCalled();
+			// The orphan-file deletion path (writeMultipleFilesToBranch with deletes)
+			// is removed entirely. Stale data path is unchanged.
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 			expect(pruneStaleSessions).toHaveBeenCalled();
 			expect(pruneStaleQueueEntries).toHaveBeenCalled();
 			expect(deleteSquashPending).toHaveBeenCalled();
@@ -4406,45 +4539,13 @@ describe("CLI", () => {
 
 	// ── Clean: parentCommitHash branch ──────────────────────────────────
 	describe("clean — index entries with parentCommitHash", () => {
-		it("should detect orphan files when index entries have parentCommitHash set", async () => {
-			const { getIndex } = await import("./core/SummaryStore.js");
-			const { listFilesInBranch } = await import("./core/GitOps.js");
+		it("does not scan or report orphan summary files even when child entries exist", async () => {
 			const { countStaleSessions, countStaleQueueEntries, checkStaleSquashPending } = await import(
 				"./core/SessionTracker.js"
 			);
-
-			vi.mocked(getIndex).mockReset();
-			vi.mocked(listFilesInBranch).mockReset();
 			vi.mocked(countStaleSessions).mockReset();
 			vi.mocked(countStaleQueueEntries).mockReset();
 			vi.mocked(checkStaleSquashPending).mockReset();
-
-			const childHash = "abc1234567890abcdef";
-			const rootHash = "root123456789abcdef";
-			// Index with entries where parentCommitHash is explicitly set
-			vi.mocked(getIndex).mockResolvedValue({
-				version: 3,
-				entries: [
-					{
-						commitHash: rootHash,
-						branch: "main",
-						commitMessage: "root commit",
-						commitDate: "2026-04-01T00:00:00.000Z",
-						// No parentCommitHash — this is a root entry
-					},
-					{
-						commitHash: childHash,
-						parentCommitHash: rootHash,
-						branch: "main",
-						commitMessage: "child commit",
-						commitDate: "2026-04-01T00:00:00.000Z",
-					},
-				],
-			});
-
-			vi.mocked(listFilesInBranch)
-				.mockResolvedValueOnce([`summaries/${childHash}.json`, `summaries/${rootHash}.json`])
-				.mockResolvedValueOnce([]);
 			vi.mocked(countStaleSessions).mockResolvedValue(0);
 			vi.mocked(countStaleQueueEntries).mockResolvedValue(0);
 			vi.mocked(checkStaleSquashPending).mockResolvedValue(false);
@@ -4456,9 +4557,10 @@ describe("CLI", () => {
 				.mocked(console.log)
 				.mock.calls.map((c) => String(c[0]))
 				.join("\n");
-			// Only the child hash should be detected as orphan (it has parentCommitHash)
-			expect(output).toContain("Orphan summaries:     1 files");
-			expect(output).toContain("[dry-run]");
+			// Output should never mention orphan summary/transcript files; clean
+			// no longer touches them after the unified Hoist refactor.
+			expect(output).not.toContain("Orphan summaries:");
+			expect(output).not.toContain("Orphan transcripts:");
 		});
 	});
 
@@ -4528,8 +4630,9 @@ describe("CLI", () => {
 				.mocked(console.log)
 				.mock.calls.map((c) => String(c[0]))
 				.join("\n");
-			// No orphan files because no entries have parentCommitHash
-			expect(output).toContain("Orphan summaries:     0 files");
+			// clean no longer scans for orphan summaries/transcripts; the section
+			// is removed from the output regardless of index shape.
+			expect(output).not.toContain("Orphan summaries:");
 			expect(output).toContain("Nothing to clean");
 		});
 	});

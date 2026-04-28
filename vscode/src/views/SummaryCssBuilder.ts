@@ -435,6 +435,31 @@ export function buildCss(): string {
     justify-content: flex-end;
   }
 
+  /* ── Quick recap edit mode (mirrors e2e-edit-area) ── */
+  .recap-section .topic-actions { visibility: hidden; }
+  .recap-section:hover .topic-actions { visibility: visible; }
+  .recap-section.recap-editing .topic-actions { display: none; }
+  .recap-edit-area {
+    width: 100%;
+    min-height: 120px;
+    font-family: var(--vscode-font-family);
+    font-size: 0.95em;
+    line-height: 1.55;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, #444);
+    border-radius: 4px;
+    padding: 10px;
+    resize: vertical;
+    box-sizing: border-box;
+  }
+  .recap-edit-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    justify-content: flex-end;
+  }
+
   /* ── Properties table (Notion-style key-value rows) ── */
   .properties {
     display: grid;
@@ -873,86 +898,6 @@ export function buildCss(): string {
   .files-affected-item::before {
     content: "\\2022\\00a0";
     color: var(--text-tertiary);
-  }
-
-  /* ── Timeline (date-grouped memories for multi-day squash) ── */
-  .timeline {
-    position: relative;
-  }
-  .timeline::before {
-    content: '';
-    position: absolute;
-    left: -15px;
-    top: 12px;
-    bottom: 12px;
-    width: 2px;
-    background: var(--border-light);
-    border-radius: 1px;
-  }
-  .timeline-group {
-    position: relative;
-    margin-bottom: 4px;
-    /* Group aligns with the MEMORIES label above, so the hover background
-       starts at the same left edge. The dot/line use negative left values
-       to float into the page's left padding area. */
-  }
-  .timeline-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 10px;
-    cursor: pointer;
-    user-select: none;
-    font-size: 0.9em;
-    border-radius: 4px;
-    transition: background 0.1s ease;
-  }
-  .timeline-header:hover { background: var(--surface-hover); }
-  .timeline-dot {
-    position: absolute;
-    /* Dot floats in the page left-padding area. Center at -14px from section,
-       matching the line center (left: -15px + 1px half-width = -14px). */
-    left: -19px;
-    top: 12px;
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: var(--text-tertiary);
-    border: 2px solid var(--vscode-editor-background, #1e1e1e);
-    z-index: 1;
-  }
-  .timeline-arrow {
-    font-size: 0.7em;
-    color: var(--text-secondary);
-    transition: transform 0.2s ease;
-    flex-shrink: 0;
-    display: inline-block;
-    width: 12px;
-    text-align: center;
-  }
-  .timeline-group.collapsed .timeline-arrow { transform: rotate(-90deg); }
-  .timeline-date {
-    font-weight: 600;
-    color: var(--vscode-foreground);
-  }
-  .timeline-count {
-    color: var(--text-tertiary);
-    font-weight: 400;
-    font-size: 0.85em;
-  }
-  .timeline-content {
-    overflow: hidden;
-    max-height: 4000px;
-    opacity: 1;
-    transition: max-height 0.3s ease, opacity 0.2s ease, padding 0.3s ease;
-    /* Left padding aligns memory cards with the date text above. */
-    padding: 2px 0 8px 20px;
-  }
-  .timeline-group.collapsed .timeline-content {
-    max-height: 0;
-    opacity: 0;
-    padding-top: 0;
-    padding-bottom: 0;
   }
 
   /* ── Jolli article link ── */

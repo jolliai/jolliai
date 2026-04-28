@@ -7,6 +7,7 @@ const pkg = JSON.parse(readFileSync(resolve(__dirname, "package.json"), "utf-8")
 export default defineConfig({
 	define: {
 		__PKG_VERSION__: JSON.stringify(pkg.version),
+		__CLI_PKG_VERSION__: JSON.stringify(pkg.version),
 	},
 	build: {
 		lib: {

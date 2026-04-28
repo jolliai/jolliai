@@ -7,6 +7,20 @@
  */
 import type { CommitSummary, DiffStats, TopicSummary } from "../Types.js";
 
+/**
+ * Discriminator: returns true when the summary node was written by the unified
+ * Hoist pipeline (schema v4 onward). v4 roots have authoritative `topics` and
+ * `recap` on the root itself; v3 (legacy) roots may have data scattered across
+ * children (legacy squash) or split between root and children (legacy amend),
+ * and require recursive collection via collectAllTopics() to recover them.
+ *
+ * Used by resolveEffectiveTopics, expandSourcesForConsolidation, and
+ * collectDisplayTopics to choose between root-authoritative and recursive paths.
+ */
+export function isUnifiedHoistFormat(s: Pick<CommitSummary, "version">): boolean {
+	return s.version >= 4;
+}
+
 /** A topic decorated with the date of the node it came from */
 export interface TopicWithDate extends TopicSummary {
 	readonly commitDate?: string;
@@ -104,17 +118,77 @@ export function countTopics(node: CommitSummary): number {
 }
 
 /**
- * Collects all nodes that have their own data (topics.length > 0), in reverse
- * chronological order (newest first). Used for the "Source Commits" display section.
+ * Returns the LEAF descendant nodes of root (NOT root itself, NOT intermediate
+ * containers). Used for the "Source Commits" drill-down section and for
+ * computeDurationDays date aggregation.
  *
- * Note: This includes amend nodes that have both own topics AND children — they are
- * not skipped just because they have children.
+ * After the unified Hoist rollout, children are stripped of own topics/recap,
+ * so the old "has own topics" discriminator stops working. The new rule is
+ * purely structural: leaf descendants are the original commits whose work is
+ * embedded in this root. Intermediate squash/amend containers are skipped
+ * because they're internal structure, not user-meaningful sources.
+ *
+ * Examples:
+ * - Normal commit (no children) → []
+ * - Squash of leaves [A1, A2, A3] → [A1, A2, A3]
+ * - Rebase Pick (A → A', A leaf) → [A]
+ * - Amend (A → A', A leaf) → [A] (root excluded)
+ * - Amend over Squash (A' wraps S wraps [A1,A2,A3]) → [A1,A2,A3] (S skipped)
+ * - Rebase Pick over Squash → [A1,A2,A3] (S skipped)
+ *
+ * Children are stored newest-first; the leaf-only walk preserves that order.
  */
 export function collectSourceNodes(node: CommitSummary): ReadonlyArray<CommitSummary> {
-	// Children are stored newest-first; keep that order for newest-first output
-	const childNodes = (node.children ?? []).flatMap(collectSourceNodes);
-	const hasOwnData = (node.topics?.length ?? 0) > 0;
-	return hasOwnData ? [node, ...childNodes] : childNodes;
+	const out: CommitSummary[] = [];
+	const walk = (n: CommitSummary) => {
+		if (!n.children?.length) {
+			out.push(n);
+		} else {
+			for (const child of n.children) walk(child);
+		}
+	};
+	for (const child of node.children ?? []) walk(child);
+	return out;
+}
+
+/**
+ * Returns the topics to display for a summary. Schema v4 (unified Hoist)
+ * summaries have authoritative root.topics (which may legitimately be []
+ * for recap-only commits); recursion is the legacy fallback for v3 data.
+ *
+ * Discriminator is `version` (via isUnifiedHoistFormat), not topics.length.
+ * This avoids two failure modes:
+ *   - legacy amend root has root.topics (delta) AND children topics (pre-amend);
+ *     topics.length > 0 would mistreat it as v4 and lose the children data.
+ *   - v4 recap-only commit has topics === []; topics.length > 0 would mistreat
+ *     it as legacy and recurse into stripped children, losing the recap.
+ */
+export function collectDisplayTopics(node: CommitSummary): ReadonlyArray<TopicWithDate> {
+	if (isUnifiedHoistFormat(node)) {
+		return (node.topics ?? []).map((t) => ({
+			...t,
+			commitDate: node.commitDate,
+			generatedAt: node.generatedAt,
+		}));
+	}
+	return collectAllTopics(node);
+}
+
+/**
+ * Recursively collects every node's commitHash in tree order (root first,
+ * then children). Used by display code to look up `transcripts/{hash}.json`
+ * files for all commits whose work is embedded in this summary tree.
+ *
+ * Companion to readTranscript(hash) in SummaryStore — together they implement
+ * the "transcripts are by-hash, not Hoisted" model: physical files stay at
+ * `transcripts/{originalHash}.json`, display walks the tree to discover hashes.
+ */
+export function collectAllTranscriptHashes(node: CommitSummary): ReadonlyArray<string> {
+	const hashes: string[] = [node.commitHash];
+	for (const child of node.children ?? []) {
+		hashes.push(...collectAllTranscriptHashes(child));
+	}
+	return hashes;
 }
 
 /**

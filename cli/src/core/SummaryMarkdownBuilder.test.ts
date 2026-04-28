@@ -310,7 +310,10 @@ describe("buildMarkdown", () => {
 		expect(md).toContain("+23 ");
 	});
 
-	it("renders date-grouped topics for multi-day squash", () => {
+	it("renders v3 squash topics as a single flat list (no date grouping)", () => {
+		// Timeline grouping was removed: all topics under v4 root share the
+		// root's date anyway, and v3 legacy data falls back to flat rendering
+		// via the same path. This test pins the flat-list contract.
 		const child1 = leaf({
 			commitHash: "aaa",
 			commitDate: "2026-03-01T10:00:00.000Z",
@@ -330,10 +333,9 @@ describe("buildMarkdown", () => {
 			children: [child2, child1],
 		});
 		const md = buildMarkdown(squash);
-		// showRecordDates=true path: date headers must appear
-		expect(md).toMatch(/### Mar 5, 2026/);
-		expect(md).toMatch(/### Mar 1, 2026/);
-		// Category label on first grouped topic (covers `t.category ? ...` branch)
+		// No `### Mar X, 2026` date headers under the flat model.
+		expect(md).not.toMatch(/### Mar \d+, 2026/);
+		// Category label is still rendered on each topic when present.
 		expect(md).toContain("`feature`");
 		expect(md).toContain("Day 1 topic");
 		expect(md).toContain("Day 5 topic");
@@ -450,7 +452,7 @@ describe("buildPrMarkdown", () => {
 		expect(md).not.toContain("## Summaries");
 	});
 
-	it("renders date-grouped topics for multi-day squash", () => {
+	it("renders v3 squash topics as a flat list in PR markdown (no date grouping)", () => {
 		const child1 = leaf({
 			commitHash: "aaa11111111",
 			commitDate: "2026-03-01T10:00:00.000Z",
@@ -470,8 +472,7 @@ describe("buildPrMarkdown", () => {
 			children: [child2, child1],
 		});
 		const md = buildPrMarkdown(squash);
-		expect(md).toMatch(/### Mar 5, 2026/);
-		expect(md).toMatch(/### Mar 1, 2026/);
+		expect(md).not.toMatch(/### Mar \d+, 2026/);
 		expect(md).toContain("Day 1 PR topic");
 		expect(md).toContain("Day 5 PR topic");
 		// Should NOT contain full topic body fields (todo/files)

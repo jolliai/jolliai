@@ -1,17 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
-	mockCollectAllTopics,
+	mockCollectDisplayTopics,
 	mockCollectSourceNodes,
 	mockComputeDurationDays,
 } = vi.hoisted(() => ({
-	mockCollectAllTopics: vi.fn(),
+	mockCollectDisplayTopics: vi.fn(),
 	mockCollectSourceNodes: vi.fn(),
 	mockComputeDurationDays: vi.fn(),
 }));
 
 vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
-	collectAllTopics: mockCollectAllTopics,
+	collectDisplayTopics: mockCollectDisplayTopics,
 	collectSourceNodes: mockCollectSourceNodes,
 	computeDurationDays: mockComputeDurationDays,
 }));
@@ -29,7 +29,6 @@ import {
 	escHtml,
 	formatDate,
 	formatFullDate,
-	groupTopicsByDate,
 	padIndex,
 	renderCalloutText,
 	sortTopics,
@@ -258,52 +257,52 @@ describe("SummaryUtils", () => {
 	// ── sortTopics ───────────────────────────────────────────────────────────
 
 	describe("sortTopics", () => {
-		it("sorts by date descending (newest first)", () => {
+		it("sorts by source date descending (newest first)", () => {
 			const topics: Array<TopicWithDate> = [
-				makeTopic({ recordDate: "2026-03-10T08:00:00Z" }),
-				makeTopic({ recordDate: "2026-03-15T08:00:00Z" }),
-				makeTopic({ recordDate: "2026-03-12T08:00:00Z" }),
+				makeTopic({ commitDate: "2026-03-10T08:00:00Z" }),
+				makeTopic({ commitDate: "2026-03-15T08:00:00Z" }),
+				makeTopic({ commitDate: "2026-03-12T08:00:00Z" }),
 			];
 			const sorted = sortTopics(topics);
-			expect(sorted[0].recordDate).toContain("2026-03-15");
-			expect(sorted[1].recordDate).toContain("2026-03-12");
-			expect(sorted[2].recordDate).toContain("2026-03-10");
+			expect(sorted[0].commitDate).toContain("2026-03-15");
+			expect(sorted[1].commitDate).toContain("2026-03-12");
+			expect(sorted[2].commitDate).toContain("2026-03-10");
 		});
 
 		it("sorts major before minor on the same day", () => {
 			const topics: Array<TopicWithDate> = [
-				makeTopic({ recordDate: "2026-03-15T10:00:00Z", importance: "minor" }),
-				makeTopic({ recordDate: "2026-03-15T08:00:00Z", importance: "major" }),
+				makeTopic({ commitDate: "2026-03-15T10:00:00Z", importance: "minor" }),
+				makeTopic({ commitDate: "2026-03-15T08:00:00Z", importance: "major" }),
 			];
 			const sorted = sortTopics(topics);
 			expect(sorted[0].importance).toBe("major");
 			expect(sorted[1].importance).toBe("minor");
 		});
 
-		it("treats missing recordDate as empty string (sorts last)", () => {
+		it("treats topics without any date as sort-last", () => {
 			const topics: Array<TopicWithDate> = [
-				makeTopic({ recordDate: undefined }),
-				makeTopic({ recordDate: "2026-03-15T10:00:00Z" }),
+				makeTopic({ commitDate: undefined }),
+				makeTopic({ commitDate: "2026-03-15T10:00:00Z" }),
 			];
 			const sorted = sortTopics(topics);
-			expect(sorted[0].recordDate).toContain("2026-03-15");
-			expect(sorted[1].recordDate).toBeUndefined();
+			expect(sorted[0].commitDate).toContain("2026-03-15");
+			expect(sorted[1].commitDate).toBeUndefined();
 		});
 
 		it("sorts major before minor on the same day when minor comes first in input", () => {
 			const topics: Array<TopicWithDate> = [
 				makeTopic({
-					recordDate: "2026-03-15T14:00:00Z",
+					commitDate: "2026-03-15T14:00:00Z",
 					importance: "minor",
 					title: "Minor task",
 				}),
 				makeTopic({
-					recordDate: "2026-03-15T10:00:00Z",
+					commitDate: "2026-03-15T10:00:00Z",
 					importance: "major",
 					title: "Major task",
 				}),
 				makeTopic({
-					recordDate: "2026-03-15T08:00:00Z",
+					commitDate: "2026-03-15T08:00:00Z",
 					importance: "minor",
 					title: "Another minor",
 				}),
@@ -316,9 +315,9 @@ describe("SummaryUtils", () => {
 
 		it("treats undefined importance as major (sorts before minor)", () => {
 			const topics: Array<TopicWithDate> = [
-				makeTopic({ recordDate: "2026-03-15T10:00:00Z", importance: "minor" }),
+				makeTopic({ commitDate: "2026-03-15T10:00:00Z", importance: "minor" }),
 				makeTopic({
-					recordDate: "2026-03-15T08:00:00Z",
+					commitDate: "2026-03-15T08:00:00Z",
 					importance: undefined,
 				}),
 			];
@@ -329,8 +328,8 @@ describe("SummaryUtils", () => {
 
 		it("does not mutate the original array", () => {
 			const topics: Array<TopicWithDate> = [
-				makeTopic({ recordDate: "2026-03-10T08:00:00Z" }),
-				makeTopic({ recordDate: "2026-03-15T08:00:00Z" }),
+				makeTopic({ commitDate: "2026-03-10T08:00:00Z" }),
+				makeTopic({ commitDate: "2026-03-15T08:00:00Z" }),
 			];
 			const originalFirst = topics[0];
 			sortTopics(topics);
@@ -339,46 +338,6 @@ describe("SummaryUtils", () => {
 
 		it("returns empty array for empty input", () => {
 			expect(sortTopics([])).toEqual([]);
-		});
-	});
-
-	// ── groupTopicsByDate ────────────────────────────────────────────────────
-
-	describe("groupTopicsByDate", () => {
-		it("groups topics by YYYY-MM-DD from recordDate", () => {
-			const topics: Array<TopicWithDate> = [
-				makeTopic({ recordDate: "2026-03-15T08:00:00Z", title: "A" }),
-				makeTopic({ recordDate: "2026-03-15T18:00:00Z", title: "B" }),
-				makeTopic({ recordDate: "2026-03-16T08:00:00Z", title: "C" }),
-			];
-			const groups = groupTopicsByDate(topics);
-			expect(groups.size).toBe(2);
-			expect(groups.get("2026-03-15")?.length).toBe(2);
-			expect(groups.get("2026-03-16")?.length).toBe(1);
-		});
-
-		it("uses 'unknown' key for topics without recordDate", () => {
-			const topics: Array<TopicWithDate> = [
-				makeTopic({ recordDate: undefined, title: "NoDate" }),
-			];
-			const groups = groupTopicsByDate(topics);
-			expect(groups.has("unknown")).toBe(true);
-			expect(groups.get("unknown")?.length).toBe(1);
-		});
-
-		it("preserves order within each group", () => {
-			const topics: Array<TopicWithDate> = [
-				makeTopic({ recordDate: "2026-03-15T08:00:00Z", title: "First" }),
-				makeTopic({ recordDate: "2026-03-15T18:00:00Z", title: "Second" }),
-			];
-			const groups = groupTopicsByDate(topics);
-			const group = groups.get("2026-03-15") as Array<TopicWithDate>;
-			expect(group[0].title).toBe("First");
-			expect(group[1].title).toBe("Second");
-		});
-
-		it("returns empty map for empty input", () => {
-			expect(groupTopicsByDate([]).size).toBe(0);
 		});
 	});
 
@@ -547,12 +506,12 @@ describe("SummaryUtils", () => {
 
 	describe("collectSortedTopics", () => {
 		beforeEach(() => {
-			mockCollectAllTopics.mockReset();
+			mockCollectDisplayTopics.mockReset();
 			mockCollectSourceNodes.mockReset();
 			mockComputeDurationDays.mockReset();
 		});
 
-		it("returns sorted topics with recordDate when multi-day squash", () => {
+		it("returns flat sorted topics from collectDisplayTopics output", () => {
 			const summary = makeSummary();
 			const rawTopics = [
 				makeTopic({
@@ -567,75 +526,41 @@ describe("SummaryUtils", () => {
 				}),
 			];
 			mockCollectSourceNodes.mockReturnValue([makeSummary(), makeSummary()]);
-			mockComputeDurationDays.mockReturnValue(5);
-			mockCollectAllTopics.mockReturnValue(rawTopics);
+			mockCollectDisplayTopics.mockReturnValue(rawTopics);
 
 			const result = collectSortedTopics(summary);
 
-			expect(result.showRecordDates).toBe(true);
 			expect(result.sourceNodes.length).toBe(2);
 			// Sorted: newest first
 			expect(result.topics[0].title).toBe("B");
 			expect(result.topics[1].title).toBe("A");
-			// recordDate is set
-			expect(result.topics[0].recordDate).toBe("2026-03-15T08:00:00Z");
-			expect(result.topics[1].recordDate).toBe("2026-03-10T08:00:00Z");
 		});
 
-		it("omits recordDate when single source node", () => {
+		it("returns the source nodes array for the Source Commits section", () => {
 			const summary = makeSummary();
-			const rawTopics = [
-				makeTopic({ title: "A", commitDate: "2026-03-15T08:00:00Z" }),
-			];
 			mockCollectSourceNodes.mockReturnValue([makeSummary()]);
-			mockComputeDurationDays.mockReturnValue(0);
-			mockCollectAllTopics.mockReturnValue(rawTopics);
+			mockCollectDisplayTopics.mockReturnValue([
+				makeTopic({ title: "A", commitDate: "2026-03-15T08:00:00Z" }),
+			]);
 
 			const result = collectSortedTopics(summary);
 
-			expect(result.showRecordDates).toBe(false);
-			expect(result.topics[0].recordDate).toBeUndefined();
+			expect(result.sourceNodes).toHaveLength(1);
 		});
 
-		it("omits recordDate when duration is 1 day even with multiple sources", () => {
-			const summary = makeSummary();
-			const rawTopics = [makeTopic({ commitDate: "2026-03-15T08:00:00Z" })];
-			mockCollectSourceNodes.mockReturnValue([makeSummary(), makeSummary()]);
-			mockComputeDurationDays.mockReturnValue(1);
-			mockCollectAllTopics.mockReturnValue(rawTopics);
-
-			const result = collectSortedTopics(summary);
-
-			expect(result.showRecordDates).toBe(false);
-		});
-
-		it("handles topics without commitDate (no recordDate assigned)", () => {
-			const summary = makeSummary();
-			const rawTopics = [makeTopic({ commitDate: undefined })];
-			mockCollectSourceNodes.mockReturnValue([makeSummary(), makeSummary()]);
-			mockComputeDurationDays.mockReturnValue(5);
-			mockCollectAllTopics.mockReturnValue(rawTopics);
-
-			const result = collectSortedTopics(summary);
-
-			expect(result.showRecordDates).toBe(true);
-			// No commitDate => no recordDate even though showRecordDates is true
-			expect(result.topics[0].recordDate).toBeUndefined();
-		});
-
-		it("assigns treeIndex based on original array index", () => {
+		it("assigns treeIndex based on original array index from collectDisplayTopics", () => {
 			const summary = makeSummary();
 			const rawTopics = [
 				makeTopic({ title: "First", commitDate: "2026-03-10T08:00:00Z" }),
 				makeTopic({ title: "Second", commitDate: "2026-03-15T08:00:00Z" }),
 			];
 			mockCollectSourceNodes.mockReturnValue([makeSummary()]);
-			mockComputeDurationDays.mockReturnValue(0);
-			mockCollectAllTopics.mockReturnValue(rawTopics);
+			mockCollectDisplayTopics.mockReturnValue(rawTopics);
 
 			const result = collectSortedTopics(summary);
 
-			// treeIndex should reflect the original positions from collectAllTopics
+			// treeIndex reflects the original collectDisplayTopics order, independent
+			// of the post-sort display order.
 			const first = result.topics.find((t) => t.title === "First");
 			const second = result.topics.find((t) => t.title === "Second");
 			expect(first?.treeIndex).toBe(0);

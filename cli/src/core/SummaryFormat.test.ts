@@ -9,7 +9,6 @@ import {
 	collectSortedTopics,
 	formatDate,
 	formatFullDate,
-	groupTopicsByDate,
 	padIndex,
 	sortTopics,
 	type TopicWithDate,
@@ -73,10 +72,29 @@ describe("formatFullDate", () => {
 // ─── sortTopics ─────────────────────────────────────────────────────────────
 
 describe("sortTopics", () => {
-	it("sorts by recordDate descending (newest first)", () => {
+	it("sorts by source date descending (newest first)", () => {
 		const topics = [
-			makeTopic({ title: "Old", recordDate: "2026-01-01T00:00:00Z" }),
-			makeTopic({ title: "New", recordDate: "2026-03-15T00:00:00Z" }),
+			makeTopic({ title: "Old", commitDate: "2026-01-01T00:00:00Z" }),
+			makeTopic({ title: "New", commitDate: "2026-03-15T00:00:00Z" }),
+		];
+		const sorted = sortTopics(topics);
+		expect(sorted[0].title).toBe("New");
+		expect(sorted[1].title).toBe("Old");
+	});
+
+	it("prefers generatedAt over commitDate for the date key", () => {
+		// generatedAt is the "(re)summary generation time" — always wins when present.
+		const topics = [
+			makeTopic({
+				title: "Old",
+				commitDate: "2026-03-15T00:00:00Z",
+				generatedAt: "2026-01-01T00:00:00Z",
+			}),
+			makeTopic({
+				title: "New",
+				commitDate: "2026-01-01T00:00:00Z",
+				generatedAt: "2026-03-15T00:00:00Z",
+			}),
 		];
 		const sorted = sortTopics(topics);
 		expect(sorted[0].title).toBe("New");
@@ -85,8 +103,8 @@ describe("sortTopics", () => {
 
 	it("sorts major before minor within same day", () => {
 		const topics = [
-			makeTopic({ title: "Minor", importance: "minor", recordDate: "2026-03-01T10:00:00Z" }),
-			makeTopic({ title: "Major", importance: "major", recordDate: "2026-03-01T12:00:00Z" }),
+			makeTopic({ title: "Minor", importance: "minor", commitDate: "2026-03-01T10:00:00Z" }),
+			makeTopic({ title: "Major", importance: "major", commitDate: "2026-03-01T12:00:00Z" }),
 		];
 		const sorted = sortTopics(topics);
 		expect(sorted[0].title).toBe("Major");
@@ -95,18 +113,18 @@ describe("sortTopics", () => {
 
 	it("sorts by importance when topics share the same day", () => {
 		const topics = [
-			makeTopic({ title: "Minor", importance: "minor", recordDate: "2026-03-01T08:00:00Z" }),
-			makeTopic({ title: "Major", recordDate: "2026-03-01T12:00:00Z" }),
+			makeTopic({ title: "Minor", importance: "minor", commitDate: "2026-03-01T08:00:00Z" }),
+			makeTopic({ title: "Major", commitDate: "2026-03-01T12:00:00Z" }),
 		];
 		const sorted = sortTopics(topics);
 		expect(sorted[0].title).toBe("Major");
 		expect(sorted[1].title).toBe("Minor");
 	});
 
-	it("handles topics without recordDate", () => {
+	it("handles topics without any date (lands at the bottom)", () => {
 		const topics = [
 			makeTopic({ title: "No date" }),
-			makeTopic({ title: "Has date", recordDate: "2026-01-01T00:00:00Z" }),
+			makeTopic({ title: "Has date", commitDate: "2026-01-01T00:00:00Z" }),
 		];
 		const sorted = sortTopics(topics);
 		expect(sorted[0].title).toBe("Has date");
@@ -115,34 +133,38 @@ describe("sortTopics", () => {
 
 	it("does not mutate the original array", () => {
 		const topics = [
-			makeTopic({ title: "B", recordDate: "2026-01-01T00:00:00Z" }),
-			makeTopic({ title: "A", recordDate: "2026-03-01T00:00:00Z" }),
+			makeTopic({ title: "B", commitDate: "2026-01-01T00:00:00Z" }),
+			makeTopic({ title: "A", commitDate: "2026-03-01T00:00:00Z" }),
 		];
 		const original = [...topics];
 		sortTopics(topics);
 		expect(topics).toEqual(original);
 	});
-});
 
-// ─── groupTopicsByDate ──────────────────────────────────────────────────────
-
-describe("groupTopicsByDate", () => {
-	it("groups topics by YYYY-MM-DD", () => {
+	it("exercises both dayA>dayB and dayA<dayB branches via 3-element sort", () => {
+		// With 3+ elements, V8's TimSort invokes the compare callback in both
+		// directions (compare(a,b) AND compare(b,a) for adjacent pairs), so
+		// both `-1` and `1` ternary outcomes get hit in a single test call.
 		const topics = [
-			makeTopic({ title: "A", recordDate: "2026-03-01T10:00:00Z" }),
-			makeTopic({ title: "B", recordDate: "2026-03-01T14:00:00Z" }),
-			makeTopic({ title: "C", recordDate: "2026-03-02T09:00:00Z" }),
+			makeTopic({ title: "Mid", commitDate: "2026-02-01T00:00:00Z" }),
+			makeTopic({ title: "Old", commitDate: "2026-01-01T00:00:00Z" }),
+			makeTopic({ title: "New", commitDate: "2026-03-15T00:00:00Z" }),
 		];
-		const groups = groupTopicsByDate(topics);
-		expect(groups.size).toBe(2);
-		expect(groups.get("2026-03-01")).toHaveLength(2);
-		expect(groups.get("2026-03-02")).toHaveLength(1);
+		const sorted = sortTopics(topics);
+		expect(sorted.map((t) => t.title)).toEqual(["New", "Mid", "Old"]);
 	});
 
-	it("uses 'unknown' key for topics without recordDate", () => {
-		const topics = [makeTopic({ title: "No date" })];
-		const groups = groupTopicsByDate(topics);
-		expect(groups.get("unknown")).toHaveLength(1);
+	it("treats topics with no date as same-day (sort by importance only)", () => {
+		// Both topics have no generatedAt/commitDate — both fall to the "" → ""
+		// dayKey, so the sort collapses to importance ordering. This pins the
+		// `commitDate || ""` final-fallback branch.
+		const topics = [
+			makeTopic({ title: "Minor", importance: "minor" }),
+			makeTopic({ title: "Major", importance: "major" }),
+		];
+		const sorted = sortTopics(topics);
+		expect(sorted[0].importance).toBe("major");
+		expect(sorted[1].importance).toBe("minor");
 	});
 });
 
@@ -229,31 +251,18 @@ describe("collectSortedTopics", () => {
 				{ title: "B", trigger: "t", response: "r", decisions: "d" },
 			],
 		});
-		const { topics, showRecordDates } = collectSortedTopics(summary);
+		const { topics } = collectSortedTopics(summary);
 		expect(topics).toHaveLength(2);
-		expect(showRecordDates).toBe(false);
 	});
 
-	it("returns showRecordDates=true for multi-day squash", () => {
+	it("returns sourceNodes for the Source Commits section", () => {
+		// v3 squash root with 2 children — sourceNodes lists both leaf descendants.
 		const summary = leaf({
-			commitDate: "2026-03-05T10:00:00.000Z",
-			generatedAt: "2026-03-05T10:01:00.000Z",
 			topics: [],
-			children: [
-				leaf({
-					commitDate: "2026-03-01T10:00:00.000Z",
-					generatedAt: "2026-03-01T10:00:10.000Z",
-					commitHash: "aaa",
-				}),
-				leaf({
-					commitDate: "2026-03-05T09:00:00.000Z",
-					generatedAt: "2026-03-05T09:00:10.000Z",
-					commitHash: "bbb",
-				}),
-			],
+			children: [leaf({ commitHash: "aaa" }), leaf({ commitHash: "bbb" })],
 		});
-		const { showRecordDates } = collectSortedTopics(summary);
-		expect(showRecordDates).toBe(true);
+		const { sourceNodes } = collectSortedTopics(summary);
+		expect(sourceNodes).toHaveLength(2);
 	});
 
 	it("returns empty topics for a summary with no topics", () => {
@@ -261,39 +270,20 @@ describe("collectSortedTopics", () => {
 		expect(topics).toHaveLength(0);
 	});
 
-	it("falls back to commitDate when generatedAt is missing on child node (covers `||` right-side)", () => {
-		// child1 has generatedAt undefined — its topic date must come from commitDate.
-		// Parent is a container without own topics, children span multiple days
-		// (2026-03-01 vs 2026-03-05) so showRecordDates=true; that triggers the
-		// recordDate assignment whose `t.generatedAt || t.commitDate` right branch runs.
+	it("assigns a stable treeIndex to each topic for edit/delete operations", () => {
 		const summary = leaf({
-			commitDate: "2026-03-05T10:00:00.000Z",
-			generatedAt: "2026-03-05T10:01:00.000Z",
-			topics: [],
-			children: [
-				{
-					version: 3 as const,
-					commitHash: "noGenAt",
-					commitMessage: "legacy",
-					commitAuthor: "a",
-					branch: "b",
-					commitDate: "2026-03-01T10:00:00.000Z",
-					// generatedAt intentionally omitted
-					generatedAt: "",
-					topics: [{ title: "Legacy", trigger: "t", response: "r", decisions: "d" }],
-				},
-				leaf({
-					commitHash: "bbb",
-					commitDate: "2026-03-05T09:00:00.000Z",
-					generatedAt: "2026-03-05T09:00:10.000Z",
-				}),
+			topics: [
+				{ title: "A", trigger: "t", response: "r", decisions: "d" },
+				{ title: "B", trigger: "t", response: "r", decisions: "d" },
+				{ title: "C", trigger: "t", response: "r", decisions: "d" },
 			],
 		});
-		const { topics, showRecordDates } = collectSortedTopics(summary);
-		expect(showRecordDates).toBe(true);
-		// The legacy topic's recordDate should equal its commitDate (since generatedAt is empty).
-		const legacy = topics.find((t) => t.title === "Legacy");
-		expect(legacy?.recordDate).toBe("2026-03-01T10:00:00.000Z");
+		const { topics } = collectSortedTopics(summary);
+		// treeIndex matches the original collectDisplayTopics order, independent
+		// of post-sort display order.
+		expect(topics.every((t) => typeof t.treeIndex === "number")).toBe(true);
+		const indices = topics.map((t) => t.treeIndex).sort();
+		expect(indices).toEqual([0, 1, 2]);
 	});
 });
 

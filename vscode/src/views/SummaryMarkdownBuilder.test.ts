@@ -25,7 +25,6 @@ const mocks = vi.hoisted(() => ({
 		(e: { generatedAt?: string; commitDate: string }) =>
 			e.generatedAt || e.commitDate,
 	),
-	groupTopicsByDate: vi.fn(),
 	padIndex: vi.fn(),
 }));
 
@@ -42,7 +41,6 @@ vi.mock("../../../cli/src/core/SummaryFormat.js", () => ({
 	formatDate: mocks.formatDate,
 	formatFullDate: mocks.formatFullDate,
 	getDisplayDate: mocks.getDisplayDate,
-	groupTopicsByDate: mocks.groupTopicsByDate,
 	padIndex: mocks.padIndex,
 }));
 
@@ -95,12 +93,10 @@ function setupDefaults(
 	summary: CommitSummary,
 	topics: Array<TopicWithDate> = [makeTopic()],
 	sourceNodes: ReadonlyArray<CommitSummary> = [summary],
-	showRecordDates = false,
 ): void {
 	mocks.collectSortedTopics.mockReturnValue({
 		topics,
 		sourceNodes,
-		showRecordDates,
 	});
 	mocks.aggregateStats.mockReturnValue({
 		filesChanged: 3,
@@ -123,19 +119,6 @@ function setupDefaults(
 	mocks.padIndex.mockImplementation((i: number) =>
 		String(i + 1).padStart(2, "0"),
 	);
-	mocks.groupTopicsByDate.mockImplementation((ts: Array<TopicWithDate>) => {
-		const map = new Map<string, Array<TopicWithDate>>();
-		for (const t of ts) {
-			const key = t.recordDate ?? "unknown";
-			const list = map.get(key);
-			if (list) {
-				list.push(t);
-			} else {
-				map.set(key, [t]);
-			}
-		}
-		return map;
-	});
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
@@ -577,48 +560,31 @@ describe("SummaryMarkdownBuilder", () => {
 				expect(md).toContain("## Topic (1)");
 			});
 
-			it("renders topics with date grouping when showRecordDates is true", () => {
+			it("renders multiple topics as a flat list (no date grouping)", () => {
+				// Timeline grouping was removed: topics now render as a flat list
+				// regardless of source-commit count or date span. Date headers
+				// (### Mar 30, 2026) must NOT appear; topics use ### at H3 directly.
 				const summary = makeSummary();
 				const topics = [
 					makeTopic({
 						title: "Topic X",
-						recordDate: "2026-03-30T10:00:00Z",
+						commitDate: "2026-03-30T10:00:00Z",
 						category: "bugfix",
 					}),
 					makeTopic({
 						title: "Topic Y",
-						recordDate: "2026-03-29T10:00:00Z",
+						commitDate: "2026-03-29T10:00:00Z",
 						category: undefined,
 					}),
 				];
-				setupDefaults(summary, topics, [summary], true);
+				setupDefaults(summary, topics, [summary]);
 
 				const md = buildMarkdown(summary);
 
 				expect(md).toContain("## Topics (2)");
-				// Date group headers
-				expect(md).toContain("### Mar 30, 2026");
-				// Topics use #### under date groups
-				expect(md).toContain("#### 01 · Topic X `bugfix`");
-				expect(md).toContain("#### 02 · Topic Y");
-			});
-
-			it("uses empty-string fallback for formatDate when recordDate is undefined in date-grouped mode", () => {
-				const summary = makeSummary();
-				const topics = [
-					makeTopic({
-						title: "Topic Z",
-						recordDate: undefined,
-						category: undefined,
-					}),
-				];
-				setupDefaults(summary, topics, [summary], true);
-
-				const md = buildMarkdown(summary);
-
-				// formatDate is called with "" (the ?? "" fallback) for topics without recordDate
-				expect(mocks.formatDate).toHaveBeenCalledWith("");
-				expect(md).toContain("## Topic (1)");
+				expect(md).not.toMatch(/^### Mar \d+, 2026/m);
+				expect(md).toContain("### 01 · Topic X `bugfix`");
+				expect(md).toContain("### 02 · Topic Y");
 			});
 
 			it("omits topics section when no topics exist", () => {

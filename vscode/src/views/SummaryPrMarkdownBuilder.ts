@@ -8,20 +8,21 @@
  * export or Jolli document paths.
  *
  * Clipboard / Jolli-doc output lives in `SummaryMarkdownBuilder.ts` via
- * `buildMarkdown`. The two builders share two helpers
- * (`pushPlansAndNotesSection`, `pushFooter`) imported from that file.
+ * `buildMarkdown`. The two builders share three helpers
+ * (`pushPlansAndNotesSection`, `pushRecapSection`, `pushFooter`) imported
+ * from that file so recap, plans, and footer rendering stays identical
+ * between clipboard and PR output.
  */
 
 import type { CommitSummary, E2eTestScenario } from "../../../cli/src/Types.js";
 import {
 	pushFooter,
 	pushPlansAndNotesSection,
+	pushRecapSection,
 } from "./SummaryMarkdownBuilder.js";
 import {
 	collectSortedTopics,
 	escHtml,
-	formatDate,
-	groupTopicsByDate,
 	padIndex,
 	type TopicWithDate,
 } from "./SummaryUtils.js";
@@ -38,7 +39,7 @@ import {
  * - Footer
  */
 export function buildPrMarkdown(summary: CommitSummary): string {
-	const { topics: allTopics, showRecordDates } = collectSortedTopics(summary);
+	const { topics: allTopics } = collectSortedTopics(summary);
 	const lines: Array<string> = [];
 
 	// Jolli Memory URL
@@ -48,8 +49,9 @@ export function buildPrMarkdown(summary: CommitSummary): string {
 	}
 
 	pushPlansAndNotesSection(lines, summary);
+	pushRecapSection(lines, summary);
 	pushPrE2eTestSection(lines, summary.e2eTestGuide);
-	pushPrTopicsSection(lines, allTopics, showRecordDates);
+	pushPrTopicsSection(lines, allTopics);
 	pushFooter(lines);
 
 	return lines.join("\n");
@@ -210,7 +212,6 @@ function pushPrTopicBody(out: Array<string>, t: TopicWithDate): void {
 function pushPrTopicsSection(
 	lines: Array<string>,
 	allTopics: Array<TopicWithDate>,
-	showRecordDates: boolean,
 ): void {
 	if (allTopics.length === 0) {
 		return;
@@ -226,25 +227,16 @@ function pushPrTopicsSection(
 	let includedCount = 0;
 	const currentLength = () => lines.join("\n").length;
 
-	if (showRecordDates) {
-		includedCount = pushPrTopicsGroupedByDate(
-			lines,
-			allTopics,
-			currentLength,
-			PR_BODY_LIMIT,
-		);
-	} else {
-		for (let i = 0; i < allTopics.length; i++) {
-			const summaryContent = `<strong>${padIndex(i)} · ${escHtml(allTopics[i].title)}</strong>`;
-			const bodyOnly: Array<string> = [];
-			pushPrTopicBody(bodyOnly, allTopics[i]);
-			const topicLines = wrapInGithubDetails(summaryContent, bodyOnly);
-			if (currentLength() + topicLines.join("\n").length > PR_BODY_LIMIT) {
-				break;
-			}
-			lines.push(...topicLines);
-			includedCount++;
+	for (let i = 0; i < allTopics.length; i++) {
+		const summaryContent = `<strong>${padIndex(i)} · ${escHtml(allTopics[i].title)}</strong>`;
+		const bodyOnly: Array<string> = [];
+		pushPrTopicBody(bodyOnly, allTopics[i]);
+		const topicLines = wrapInGithubDetails(summaryContent, bodyOnly);
+		if (currentLength() + topicLines.join("\n").length > PR_BODY_LIMIT) {
+			break;
 		}
+		lines.push(...topicLines);
+		includedCount++;
 	}
 
 	const omitted = allTopics.length - includedCount;
@@ -254,49 +246,4 @@ function pushPrTopicsSection(
 			`> ⚠️ ${omitted} more topic${omitted !== 1 ? "s" : ""} omitted due to GitHub PR body size limit.`,
 		);
 	}
-}
-
-/**
- * Appends date-grouped PR topics with truncation. Returns the number of
- * included topics.
- *
- * Group header `### <date>` is written **atomically** with the first topic
- * of its group — if the first topic doesn't fit, the group header is also
- * skipped, avoiding an orphan date header with no content.
- */
-function pushPrTopicsGroupedByDate(
-	lines: Array<string>,
-	allTopics: Array<TopicWithDate>,
-	currentLength: () => number,
-	limit: number,
-): number {
-	let globalIdx = 0;
-	let includedCount = 0;
-	let truncated = false;
-
-	for (const [, groupTopics] of groupTopicsByDate(allTopics)) {
-		if (truncated) {
-			break;
-		}
-		const groupDate = formatDate(groupTopics[0].recordDate ?? "");
-		let groupHeaderPushed = false;
-		for (const t of groupTopics) {
-			const summaryContent = `<strong>${padIndex(globalIdx)} · ${escHtml(t.title)}</strong>`;
-			const bodyOnly: Array<string> = [];
-			pushPrTopicBody(bodyOnly, t);
-			const topicLines = wrapInGithubDetails(summaryContent, bodyOnly);
-			const pending = groupHeaderPushed
-				? topicLines
-				: ["", `### ${groupDate}`, ...topicLines];
-			if (currentLength() + pending.join("\n").length > limit) {
-				truncated = true;
-				break;
-			}
-			lines.push(...pending);
-			groupHeaderPushed = true;
-			includedCount++;
-			globalIdx++;
-		}
-	}
-	return includedCount;
 }

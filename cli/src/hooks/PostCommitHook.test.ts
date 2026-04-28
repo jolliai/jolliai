@@ -50,9 +50,19 @@ vi.mock("../core/TranscriptReader.js", () => ({
 	buildMultiSessionContext: vi.fn(),
 }));
 
-vi.mock("../core/Summarizer.js", () => ({
-	generateSummary: vi.fn(),
-}));
+vi.mock("../core/Summarizer.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/Summarizer.js")>();
+	return {
+		generateSummary: vi.fn(),
+		// runSquashPipeline / handleAmendPipeline call these. Mock the LLM-touching
+		// path; mechanicalConsolidate runs as the fallback. extractTicketIdFromMessage
+		// and formatSourceCommitsForSquash are pure helpers -- use real impl.
+		generateSquashConsolidation: vi.fn().mockResolvedValue(null),
+		mechanicalConsolidate: actual.mechanicalConsolidate,
+		extractTicketIdFromMessage: actual.extractTicketIdFromMessage,
+		formatSourceCommitsForSquash: actual.formatSourceCommitsForSquash,
+	};
+});
 
 vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/SummaryStore.js")>();
@@ -63,8 +73,10 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		migrateOneToOne: vi.fn(),
 		storePlans: vi.fn(),
 		storeNotes: vi.fn(),
-		// Keep real implementation for pure functions used in production code
+		// Keep real implementations for pure tree-transform helpers.
 		stripFunctionalMetadata: actual.stripFunctionalMetadata,
+		resolveEffectiveTopics: actual.resolveEffectiveTopics,
+		expandSourcesForConsolidation: actual.expandSourcesForConsolidation,
 	};
 });
 
@@ -994,6 +1006,7 @@ describe("queue-driven Worker", () => {
 				expect.objectContaining({ commitHash: "oldHash" }),
 				expect.objectContaining({ hash: "newHash" }),
 				"/test/project",
+				expect.objectContaining({ commitType: "rebase" }),
 			);
 			expect(generateSummary).not.toHaveBeenCalled();
 		});
@@ -1015,6 +1028,39 @@ describe("queue-driven Worker", () => {
 
 			expect(migrateOneToOne).not.toHaveBeenCalled();
 			expect(getCommitInfo).not.toHaveBeenCalled();
+		});
+
+		it("forwards commitSource from the queue entry into migrateOneToOne", async () => {
+			// The queue entry's commitSource (e.g. "plugin") must reach the
+			// migrated summary; squash and amend already do this — rebase-pick
+			// must too.
+			const rebasePickOp = {
+				op: {
+					type: "rebase-pick" as const,
+					commitHash: "newHash",
+					sourceHashes: ["oldHash"],
+					commitSource: "plugin" as const,
+					createdAt: "2026-02-19T00:00:00.000Z",
+				},
+				filePath: "/test/project/.jolli/jollimemory/git-op-queue/1234567890-newHash.json",
+			};
+			vi.mocked(dequeueAllGitOperations).mockResolvedValueOnce([rebasePickOp]).mockResolvedValue([]);
+			vi.mocked(getSummary).mockResolvedValue(createMockSummary("oldHash"));
+			vi.mocked(getCommitInfo).mockResolvedValue({
+				hash: "newHash",
+				message: "Rebased commit",
+				author: "John",
+				date: "2026-02-19",
+			});
+
+			await runWorker("/test/project");
+
+			expect(migrateOneToOne).toHaveBeenCalledWith(
+				expect.objectContaining({ commitHash: "oldHash" }),
+				expect.objectContaining({ hash: "newHash" }),
+				"/test/project",
+				expect.objectContaining({ commitType: "rebase", commitSource: "plugin" }),
+			);
 		});
 	});
 
@@ -1053,6 +1099,8 @@ describe("queue-driven Worker", () => {
 				expect.objectContaining({ hash: "newHash" }),
 				"/test/project",
 				expect.objectContaining({ commitType: "squash" }),
+				// runSquashPipeline passes a 5th `consolidated` arg to mergeManyToOne.
+				expect.objectContaining({ topics: expect.any(Array) }),
 			);
 			expect(generateSummary).not.toHaveBeenCalled();
 		});
@@ -1082,7 +1130,8 @@ describe("queue-driven Worker", () => {
 
 			await runWorker("/test/project");
 
-			// Should merge with only the 2 available summaries
+			// Should merge with only the 2 available summaries; the 5th arg is the
+			// consolidated topics/recap built by runSquashPipeline.
 			expect(mergeManyToOne).toHaveBeenCalledWith(
 				expect.arrayContaining([
 					expect.objectContaining({ commitHash: "hash1" }),
@@ -1091,6 +1140,7 @@ describe("queue-driven Worker", () => {
 				expect.objectContaining({ hash: "newHash" }),
 				"/test/project",
 				expect.anything(),
+				expect.objectContaining({ topics: expect.any(Array) }),
 			);
 			// Verify exactly 2 summaries were passed (not 3)
 			const summariesArg = vi.mocked(mergeManyToOne).mock.calls[0][0];
@@ -1620,6 +1670,128 @@ describe("queue-driven Worker", () => {
 		});
 	});
 
+	// ─── reassociateMetadata coverage (plans + notes on amend, all 3 paths) ──
+
+	describe("reassociateMetadata in amend", () => {
+		const AMEND_OP = {
+			op: {
+				type: "amend" as const,
+				commitHash: "newHash",
+				sourceHashes: ["oldHash"],
+				commitSource: "cli" as const,
+				createdAt: "2026-02-19T00:00:00.000Z",
+			},
+			filePath: "/test/project/.jolli/jollimemory/git-op-queue/1234567890-newHash.json",
+		};
+
+		function oldSummaryWithMetadata(): CommitSummary {
+			return {
+				...createMockSummary("oldHash"),
+				plans: [
+					{
+						slug: "plan-old",
+						title: "Old plan",
+						editCount: 1,
+						addedAt: "2026-02-19T00:00:00Z",
+						updatedAt: "2026-02-19T00:00:00Z",
+					},
+				],
+				notes: [
+					{
+						id: "note-old",
+						title: "Old note",
+						format: "markdown" as const,
+						addedAt: "2026-02-19T00:00:00Z",
+						updatedAt: "2026-02-19T00:00:00Z",
+					},
+				],
+			};
+		}
+
+		function setupAmend(): void {
+			vi.mocked(dequeueAllGitOperations).mockReset().mockResolvedValueOnce([AMEND_OP]).mockResolvedValue([]);
+			vi.mocked(getCommitInfo).mockResolvedValue({
+				hash: "newHash",
+				message: "Amended commit",
+				author: "John",
+				date: "2026-02-19",
+			});
+			vi.mocked(loadConfig).mockResolvedValue({});
+			vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+			vi.mocked(getCurrentBranch).mockResolvedValue("feature-branch");
+		}
+
+		it("re-associates plans and notes on short-circuit A (trivial delta, 0 LLM)", async () => {
+			setupAmend();
+			vi.mocked(getSummary).mockResolvedValue(oldSummaryWithMetadata());
+			// No sessions + tiny diff -> isTrivialAmendDelta=true -> short-circuit A
+			vi.mocked(loadAllSessions).mockResolvedValue([]);
+			vi.mocked(getDiffContent).mockResolvedValue("");
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 0, insertions: 0, deletions: 0 });
+
+			await runWorker("/test/project");
+
+			// Short-circuit A must NOT call generateSummary (0 LLM)
+			expect(generateSummary).not.toHaveBeenCalled();
+			expect(storeSummary).toHaveBeenCalled();
+			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
+			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
+		});
+
+		it("re-associates plans and notes on short-circuit B (1 LLM, empty delta)", async () => {
+			setupAmend();
+			vi.mocked(getSummary).mockResolvedValue(oldSummaryWithMetadata());
+			// Sessions with entries -> not trivial. Delta returns no topics + no recap -> short-circuit B.
+			vi.mocked(loadAllSessions).mockResolvedValue([
+				{ sessionId: "sess-1", transcriptPath: "/path/to/transcript.jsonl", updatedAt: "2026-02-19" },
+			]);
+			vi.mocked(readTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "Amend" }],
+				newCursor: { transcriptPath: "/path/to/transcript.jsonl", lineNumber: 10, updatedAt: "2026-02-19" },
+				totalLinesRead: 10,
+			});
+			vi.mocked(buildMultiSessionContext).mockReturnValue("[Human]: Amend");
+			vi.mocked(getDiffContent).mockResolvedValue("diff content");
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 2 });
+			vi.mocked(generateSummary).mockResolvedValue({
+				...createMockResult(),
+				topics: [],
+				recap: undefined,
+			});
+
+			await runWorker("/test/project");
+
+			expect(generateSummary).toHaveBeenCalledTimes(1);
+			expect(storeSummary).toHaveBeenCalled();
+			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
+			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
+		});
+
+		it("re-associates plans and notes on full path (2 LLM, non-empty delta)", async () => {
+			setupAmend();
+			vi.mocked(getSummary).mockResolvedValue(oldSummaryWithMetadata());
+			vi.mocked(loadAllSessions).mockResolvedValue([
+				{ sessionId: "sess-1", transcriptPath: "/path/to/transcript.jsonl", updatedAt: "2026-02-19" },
+			]);
+			vi.mocked(readTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "Amend" }],
+				newCursor: { transcriptPath: "/path/to/transcript.jsonl", lineNumber: 10, updatedAt: "2026-02-19" },
+				totalLinesRead: 10,
+			});
+			vi.mocked(buildMultiSessionContext).mockReturnValue("[Human]: Amend");
+			vi.mocked(getDiffContent).mockResolvedValue("diff content");
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 2 });
+			// Delta returns substantive topics -> full path (consolidate runs)
+			vi.mocked(generateSummary).mockResolvedValue(createMockResult());
+
+			await runWorker("/test/project");
+
+			expect(storeSummary).toHaveBeenCalled();
+			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
+			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
+		});
+	});
+
 	// ─── runWorker edge cases ────────────────────────────────────────────────
 
 	describe("runWorker edge cases", () => {
@@ -1723,7 +1895,7 @@ describe("queue-driven Worker", () => {
 
 			await runWorker("/test/project");
 
-			// Should merge available summaries (2 of 3)
+			// Should merge available summaries (2 of 3); 5th arg is consolidated topics/recap.
 			expect(mergeManyToOne).toHaveBeenCalledWith(
 				expect.arrayContaining([
 					expect.objectContaining({ commitHash: "hash1" }),
@@ -1732,6 +1904,7 @@ describe("queue-driven Worker", () => {
 				expect.anything(),
 				"/test/project",
 				expect.anything(),
+				expect.objectContaining({ topics: expect.any(Array) }),
 			);
 		});
 	});

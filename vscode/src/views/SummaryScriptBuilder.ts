@@ -26,13 +26,6 @@ export function buildScript(): string {
     });
   });
 
-  // Toggle expand/collapse for timeline date groups
-  document.querySelectorAll('.timeline-header').forEach(function(header) {
-    header.addEventListener('click', function() {
-      header.parentElement.classList.toggle('collapsed');
-    });
-  });
-
   // Hash copy button: copy full commit hash to clipboard inline
   document.querySelectorAll('.hash-copy').forEach(function(btn) {
     btn.addEventListener('click', function() {
@@ -162,14 +155,46 @@ ${buildPrMessageScript()}
         if (cancelBtn) { cancelBtn.disabled = false; }
       }
     }
+
+    // ── Recap edit status ──
+    if (msg.command === 'recapUpdated' && msg.html) {
+      // Server re-renders the whole recap section so we get the canonical HTML
+      // (handles the empty-recap → section-removed case automatically too).
+      var oldRecap = document.getElementById('recapSection');
+      if (oldRecap) {
+        var oldSep = oldRecap.nextElementSibling;
+        if (msg.html.trim().length === 0) {
+          // Empty recap after edit — remove section + trailing separator.
+          if (oldSep && oldSep.tagName === 'HR') oldSep.remove();
+          oldRecap.remove();
+        } else {
+          var recapWrap = document.createElement('div');
+          recapWrap.innerHTML = msg.html;
+          // The buildRecapSection result contains <div class="section">…</div><hr/>.
+          // Replace the old section + its trailing <hr> with the new pair.
+          var nodes = Array.prototype.slice.call(recapWrap.childNodes).filter(function(n) { return n.nodeType === 1; });
+          if (oldSep && oldSep.tagName === 'HR') oldSep.remove();
+          oldRecap.replaceWith.apply(oldRecap, nodes);
+          attachEditRecapHandler();
+        }
+      }
+    } else if (msg.command === 'recapUpdateError') {
+      var editingRecap = document.querySelector('.recap-section.recap-editing');
+      if (editingRecap) {
+        var rSave = editingRecap.querySelector('.recap-edit-actions .primary');
+        var rCancel = editingRecap.querySelector('.recap-edit-actions .action-btn');
+        if (rSave) { rSave.textContent = 'Save'; rSave.disabled = false; }
+        if (rCancel) { rCancel.disabled = false; }
+      }
+    }
   });
 
-  // Toggle All: expand / collapse all memories and timeline groups
+  // Toggle All: expand / collapse all memories
   var allCollapsed = false;
   var toggleAllBtn = document.getElementById('toggleAllBtn');
   if (toggleAllBtn) {
     toggleAllBtn.addEventListener('click', function() {
-      var items = document.querySelectorAll('.toggle, .timeline-group');
+      var items = document.querySelectorAll('.toggle');
       allCollapsed = !allCollapsed;
       items.forEach(function(t) {
         if (allCollapsed) {
@@ -486,6 +511,89 @@ ${buildPrMessageScript()}
     });
   }
   attachEditE2eHandler(document.getElementById('editE2eBtn'));
+
+  // ── Recap edit handler ─────────────────────────────────────────────────
+  function attachEditRecapHandler() {
+    var btn = document.getElementById('editRecapBtn');
+    if (!btn) return;
+    btn.addEventListener('click', function() {
+      var section = document.getElementById('recapSection');
+      if (!section || section.classList.contains('recap-editing')) return;
+      enterRecapEditMode(section);
+    });
+  }
+
+  function enterRecapEditMode(section) {
+    section.classList.add('recap-editing');
+    var body = section.querySelector('.recap-body');
+    var raw = section.dataset.raw || (body ? body.textContent : '') || '';
+
+    // Stash original HTML so Cancel can restore it verbatim (cheap revert).
+    section._originalRecapBody = body ? body.outerHTML : '';
+
+    var ta = document.createElement('textarea');
+    ta.className = 'recap-edit-area';
+    ta.value = raw;
+    if (body) { body.replaceWith(ta); } else { section.appendChild(ta); }
+
+    var actions = document.createElement('div');
+    actions.className = 'recap-edit-actions';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'action-btn';
+    cancelBtn.textContent = 'Cancel';
+    var saveBtn = document.createElement('button');
+    saveBtn.className = 'action-btn primary';
+    saveBtn.textContent = 'Save';
+    actions.appendChild(cancelBtn);
+    actions.appendChild(saveBtn);
+    ta.insertAdjacentElement('afterend', actions);
+
+    // Auto-resize and focus.
+    ta.style.height = ta.scrollHeight + 'px';
+    ta.addEventListener('input', function() {
+      ta.style.height = 'auto';
+      ta.style.height = ta.scrollHeight + 'px';
+    });
+    ta.focus();
+
+    function exitRecapEditMode() {
+      if (section._recapEscHandler) {
+        document.removeEventListener('keydown', section._recapEscHandler);
+        delete section._recapEscHandler;
+      }
+      section.classList.remove('recap-editing');
+      var ed = section.querySelector('.recap-edit-area');
+      if (ed && section._originalRecapBody) {
+        // Recreate the original .recap-body element from the stashed HTML.
+        var temp = document.createElement('div');
+        temp.innerHTML = section._originalRecapBody;
+        ed.replaceWith(temp.firstChild);
+      }
+      var act = section.querySelector('.recap-edit-actions');
+      if (act) act.remove();
+      delete section._originalRecapBody;
+    }
+
+    cancelBtn.addEventListener('click', exitRecapEditMode);
+
+    saveBtn.addEventListener('click', function() {
+      var newRecap = ta.value.trim();
+      saveBtn.textContent = 'Saving...';
+      saveBtn.disabled = true;
+      cancelBtn.disabled = true;
+      vscode.postMessage({ command: 'editRecap', recap: newRecap });
+    });
+
+    // ESC cancels
+    section._recapEscHandler = function(ev) {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        cancelBtn.click();
+      }
+    };
+    document.addEventListener('keydown', section._recapEscHandler);
+  }
+  attachEditRecapHandler();
 
   /** Parses Markdown text back into E2eTestScenario[] for the save handler. */
   function parseE2eMarkdown(text) {

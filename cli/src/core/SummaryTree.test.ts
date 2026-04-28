@@ -4,12 +4,15 @@ import {
 	aggregateStats,
 	aggregateTurns,
 	collectAllTopics,
+	collectAllTranscriptHashes,
+	collectDisplayTopics,
 	collectSourceNodes,
 	computeDurationDays,
 	countTopics,
 	deleteTopicInTree,
 	formatDurationLabel,
 	isLeafNode,
+	isUnifiedHoistFormat,
 	resolveDiffStats,
 	updateTopicInTree,
 } from "./SummaryTree.js";
@@ -171,24 +174,93 @@ describe("SummaryTree", () => {
 		});
 	});
 
-	describe("collectSourceNodes", () => {
-		it("returns the leaf itself", () => {
-			const nodes = collectSourceNodes(A);
-			expect(nodes).toHaveLength(1);
-			expect(nodes[0].commitHash).toBe("aaa");
+	describe("collectSourceNodes (leaf-only, root excluded)", () => {
+		it("returns empty for a leaf node (root itself is not a source of itself)", () => {
+			expect(collectSourceNodes(A)).toEqual([]);
 		});
 
-		it("includes amend node and its child (newest first)", () => {
+		it("returns the leaf child of an amend root (root excluded)", () => {
 			const nodes = collectSourceNodes(C);
-			expect(nodes).toHaveLength(2);
-			expect(nodes[0].commitHash).toBe("ccc"); // C (newer, own data)
-			expect(nodes[1].commitHash).toBe("aaa"); // A (older, from child)
+			expect(nodes.map((n) => n.commitHash)).toEqual(["aaa"]);
 		});
 
-		it("skips pure container, collects all data nodes (newest first)", () => {
+		it("returns leaf descendants of a squash root, skipping intermediate amend container", () => {
+			// D.children = [B, C]; B is a leaf so it's included; C is an intermediate
+			// container (has children), so we recurse into C and pick up A as a leaf.
 			const nodes = collectSourceNodes(D);
-			expect(nodes).toHaveLength(3);
-			expect(nodes.map((n) => n.commitHash)).toEqual(["bbb", "ccc", "aaa"]);
+			expect(nodes.map((n) => n.commitHash)).toEqual(["bbb", "aaa"]);
+		});
+	});
+
+	describe("isUnifiedHoistFormat", () => {
+		it("returns false for v3 (legacy) summaries", () => {
+			expect(isUnifiedHoistFormat({ version: 3 })).toBe(false);
+		});
+
+		it("returns true for v4 (unified Hoist) summaries", () => {
+			expect(isUnifiedHoistFormat({ version: 4 })).toBe(true);
+		});
+
+		it("treats future versions as unified Hoist (forward-compatible)", () => {
+			expect(isUnifiedHoistFormat({ version: 5 })).toBe(true);
+			expect(isUnifiedHoistFormat({ version: 99 })).toBe(true);
+		});
+
+		it("returns false when version is below 4 (defensive)", () => {
+			expect(isUnifiedHoistFormat({ version: 0 })).toBe(false);
+			expect(isUnifiedHoistFormat({ version: 1 })).toBe(false);
+		});
+	});
+
+	describe("collectDisplayTopics", () => {
+		const v4Root = {
+			...A,
+			version: 4,
+			topics: [
+				{ title: "Topic X", trigger: "tx", response: "rx", decisions: "dx" },
+				{ title: "Topic Y", trigger: "ty", response: "ry", decisions: "dy" },
+			],
+			children: [
+				// Stripped child (no topics) -- v4 strip removes them
+				{ ...A, version: 3, topics: [] as ReadonlyArray<never>, commitHash: "child-aaa" },
+			],
+		};
+
+		it("returns root.topics for v4 (root authoritative, ignore children)", () => {
+			const topics = collectDisplayTopics(v4Root);
+			expect(topics.map((t) => t.title)).toEqual(["Topic X", "Topic Y"]);
+		});
+
+		it("returns empty array for v4 recap-only commit (topics=[] is legitimate)", () => {
+			const recapOnly = { ...v4Root, topics: [], recap: "Just a recap" };
+			expect(collectDisplayTopics(recapOnly)).toEqual([]);
+		});
+
+		it("falls back to recursive collectAllTopics for v3 (legacy)", () => {
+			// D is v3 with no own topics, children carry the topics
+			const topics = collectDisplayTopics(D);
+			expect(topics).toHaveLength(3);
+			expect(topics.map((t) => t.title)).toEqual(["Implement login", "Fix indentation", "Implement logout"]);
+		});
+
+		it("decorates v4 topics with commitDate / generatedAt from root", () => {
+			const topics = collectDisplayTopics(v4Root);
+			expect(topics[0].commitDate).toBe(v4Root.commitDate);
+			expect(topics[0].generatedAt).toBe(v4Root.generatedAt);
+		});
+	});
+
+	describe("collectAllTranscriptHashes", () => {
+		it("returns just the root hash for a leaf", () => {
+			expect(collectAllTranscriptHashes(A)).toEqual(["aaa"]);
+		});
+
+		it("walks children depth-first, root first", () => {
+			expect(collectAllTranscriptHashes(C)).toEqual(["ccc", "aaa"]);
+		});
+
+		it("descends into nested squash trees", () => {
+			expect(collectAllTranscriptHashes(D)).toEqual(["ddd", "bbb", "ccc", "aaa"]);
 		});
 	});
 

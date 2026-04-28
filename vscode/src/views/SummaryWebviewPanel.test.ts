@@ -280,17 +280,22 @@ vi.mock("../util/Logger.js", () => ({
 	log: { info, warn, error: logError },
 }));
 
-const { mockBuildHtml, mockBuildE2eTestSection, mockRenderTopic } = vi.hoisted(
-	() => ({
-		mockBuildHtml: vi.fn().mockReturnValue("<html>mock</html>"),
-		mockBuildE2eTestSection: vi.fn().mockReturnValue("<div>e2e</div>"),
-		mockRenderTopic: vi.fn().mockReturnValue("<div>topic</div>"),
-	}),
-);
+const {
+	mockBuildHtml,
+	mockBuildE2eTestSection,
+	mockBuildRecapSection,
+	mockRenderTopic,
+} = vi.hoisted(() => ({
+	mockBuildHtml: vi.fn().mockReturnValue("<html>mock</html>"),
+	mockBuildE2eTestSection: vi.fn().mockReturnValue("<div>e2e</div>"),
+	mockBuildRecapSection: vi.fn().mockReturnValue("<div>recap</div>"),
+	mockRenderTopic: vi.fn().mockReturnValue("<div>topic</div>"),
+}));
 
 vi.mock("./SummaryHtmlBuilder.js", () => ({
 	buildHtml: mockBuildHtml,
 	buildE2eTestSection: mockBuildE2eTestSection,
+	buildRecapSection: mockBuildRecapSection,
 	renderTopic: mockRenderTopic,
 }));
 
@@ -1447,6 +1452,64 @@ describe("SummaryWebviewPanel", () => {
 				);
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({ command: "topicUpdateError" }),
+				);
+			});
+		});
+
+		// ── editRecap ────────────────────────────────────────────────────────
+
+		describe("editRecap", () => {
+			it("stores the new recap and posts recapUpdated with re-rendered HTML", async () => {
+				mockBuildRecapSection.mockReturnValue(
+					'<div id="recapSection">new</div>',
+				);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "editRecap", recap: "  A new recap.  " });
+				await flushPromises();
+
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ recap: "A new recap." }),
+					workspaceRoot,
+					true,
+				);
+				expect(mockBuildRecapSection).toHaveBeenCalledWith("A new recap.");
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "recapUpdated",
+					html: '<div id="recapSection">new</div>',
+				});
+			});
+
+			it("clears the recap when input is empty (recap=undefined on summary)", async () => {
+				mockBuildRecapSection.mockReturnValue("");
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "editRecap", recap: "   " });
+				await flushPromises();
+
+				const stored = mockStoreSummary.mock.calls[0][0] as {
+					recap?: string;
+				};
+				expect(stored.recap).toBeUndefined();
+				expect(mockBuildRecapSection).toHaveBeenCalledWith(undefined);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "recapUpdated",
+					html: "",
+				});
+			});
+
+			it("posts recapUpdateError when storeSummary throws", async () => {
+				mockStoreSummary.mockRejectedValueOnce(new Error("disk full"));
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "editRecap", recap: "anything" });
+				await flushPromises();
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Recap save failed"),
+				);
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "recapUpdateError" }),
 				);
 			});
 		});

@@ -2,8 +2,8 @@
  * SummaryHtmlBuilder
  *
  * Assembles the complete HTML document for the Commit Memory webview.
- * Combines CSS, header, topic cards, timeline, E2E test guide, source
- * commits, footer, and interactive script into a single HTML string.
+ * Combines CSS, header, recap, PR section, topic cards, E2E test guide,
+ * source commits, footer, and interactive script into a single HTML string.
  */
 
 import {
@@ -29,7 +29,6 @@ import {
 	formatDate,
 	formatFullDate,
 	getDisplayDate,
-	groupTopicsByDate,
 	padIndex,
 	renderCalloutText,
 	type TopicWithDate,
@@ -64,24 +63,16 @@ export function buildHtml(
 		nonce,
 		pushAction = "jolli",
 	} = opts;
-	const {
-		topics: allTopics,
-		sourceNodes,
-		showRecordDates,
-	} = collectSortedTopics(summary);
+	const { topics: allTopics, sourceNodes } = collectSortedTopics(summary);
 	const stats = resolveDiffStats(summary);
 	const totalInsertions = stats.insertions;
 	const totalDeletions = stats.deletions;
 	const totalFiles = stats.filesChanged;
 
-	let topicsHtml: string;
-	if (allTopics.length === 0) {
-		topicsHtml = '<p class="empty">No topics available for this commit.</p>';
-	} else if (showRecordDates) {
-		topicsHtml = renderTimeline(groupTopicsByDate(allTopics));
-	} else {
-		topicsHtml = allTopics.map((t, i) => renderTopic(t, i)).join("\n");
-	}
+	const topicsHtml =
+		allTopics.length === 0
+			? '<p class="empty">No topics available for this commit.</p>'
+			: allTopics.map((t, i) => renderTopic(t, i)).join("\n");
 
 	const topicsLabel = `${allTopics.length} topic${allTopics.length !== 1 ? "s" : ""} extracted from this commit`;
 
@@ -104,6 +95,7 @@ ${csp}
 ${buildAllConversationsSection(transcriptHashSet)}
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions, pushAction)}
 <hr class="separator" />
+${buildRecapSection(summary.recap)}
 ${buildPrSectionHtml(summary.commitMessage, buildPrMarkdown(summary))}
 ${buildPlansAndNotesSection(summary.plans, summary.notes, planTranslateSet, noteTranslateSet)}
 ${buildE2eTestSection(summary)}
@@ -275,6 +267,37 @@ function buildHeader(
   ${buildConversationsRow(totalTurns)}
   ${buildJolliRow(summary.jolliDocUrl, summary.commitMessage, summary.plans, summary.notes)}
 </div>`;
+}
+
+// ─── Quick recap section ────────────────────────────────────────────────────
+
+/**
+ * Builds the Quick recap section. Returns an empty string when no recap is
+ * present so the surrounding template doesn't render an empty wrapper.
+ *
+ * Reuses the same `.section` / `.section-header` shell as the topics block so
+ * the visual rhythm of the page is unchanged. The recap body is wrapped in
+ * `.recap-body` for callout-style styling defined in SummaryCssBuilder.
+ *
+ * Includes an inline edit button (consistent with E2E section's pencil-icon
+ * pattern). Click toggles `.recap-editing` state which the SummaryScriptBuilder
+ * handles by replacing the body with a textarea + Save/Cancel buttons. The
+ * raw recap text is stashed in `data-raw` so the editor restores the unescaped
+ * source rather than the HTML-escaped display version.
+ */
+export function buildRecapSection(recap: string | undefined): string {
+	const trimmed = recap?.trim();
+	if (!trimmed) return "";
+	return `<div class="section recap-section" id="recapSection" data-raw="${escAttr(trimmed)}">
+  <div class="section-header">
+    <div class="section-title">&#x1F4D6; Quick recap</div>
+    <span class="topic-actions">
+      <button class="topic-action-btn" id="editRecapBtn" title="Edit recap">✎</button>
+    </span>
+  </div>
+  <div class="recap-body">${escHtml(trimmed)}</div>
+</div>
+<hr class="separator" />`;
 }
 
 // ─── Plans & Notes Section ───────────────────────────────────────────────────
@@ -627,32 +650,6 @@ export function renderTopic(t: TopicWithDate, displayIndex: number): string {
     </div>
   </div>
 </div>`;
-}
-
-/** Renders memories grouped by date as a timeline. Global numbering is continuous across groups. */
-function renderTimeline(groups: Map<string, Array<TopicWithDate>>): string {
-	let displayIndex = 0;
-	const groupsHtml: Array<string> = [];
-	for (const [dayKey, topics] of groups) {
-		const dateStr = formatDate(topics[0].recordDate ?? dayKey);
-		const count = topics.length;
-		const topicsHtml = topics
-			.map((t) => renderTopic(t, displayIndex++))
-			.join("\n");
-		groupsHtml.push(`
-<div class="timeline-group" id="day-${dayKey}">
-  <div class="timeline-header">
-    <span class="timeline-dot"></span>
-    <span class="timeline-arrow">\u25BC</span>
-    <span class="timeline-date">${escHtml(dateStr)}</span>
-    <span class="timeline-count">${count} memor${count !== 1 ? "ies" : "y"}</span>
-  </div>
-  <div class="timeline-content">
-    ${topicsHtml}
-  </div>
-</div>`);
-	}
-	return `<div class="timeline">${groupsHtml.join("\n")}</div>`;
 }
 
 // ─── Footer ───────────────────────────────────────────────────────────────────

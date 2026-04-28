@@ -37,6 +37,7 @@ import {
 import { acquireLock, releaseLock } from "./SessionTracker.js";
 import {
 	deleteTranscript,
+	expandSourcesForConsolidation,
 	getIndex,
 	getIndexEntryMap,
 	getSummary,
@@ -282,257 +283,86 @@ describe("SummaryStore", () => {
 		});
 	});
 
-	describe("getSummary", () => {
-		it("should return summary via index lookup when it exists as root", async () => {
+	describe("getSummary (direct-read)", () => {
+		// readFileFromBranch is mocked per test. Lookup contract:
+		//   1. Try readSummaryFile(hash) -- 1 read; if it returns non-null, return.
+		//   2. Otherwise loadIndex (1 read), check commitAliases, optional tree-hash
+		//      scan, then a final readSummaryFile(matchedHash) when an alias hits.
+		//
+		// Direct file read returns the original summary for any hash that ever
+		// owned a `summaries/{hash}.json` file -- which is every hash that entered
+		// the system, since mergeManyToOne / migrateOneToOne never delete old files.
+
+		it("returns the original summary directly via readSummaryFile (root hash)", async () => {
 			const summary = createMockSummary();
-			// loadIndex → returns index with entry; readSummaryFile → returns summary
-			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(JSON.stringify(v3Index([rootEntry("abc123def456")])))
-				.mockResolvedValueOnce(JSON.stringify(summary));
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(summary));
 
 			const result = await getSummary("abc123def456");
 			expect(result).not.toBeNull();
 			expect(result?.commitHash).toBe("abc123def456");
 			expect(result?.topics?.[0].title).toBe("Fix login");
+			// Only one read -- direct path hit, no index lookup needed.
+			expect(vi.mocked(readFileFromBranch)).toHaveBeenCalledTimes(1);
 		});
 
-		it("should return child node when targeting a child hash", async () => {
-			const child = createMockSummary("child111", "Child commit");
-			const parent: CommitSummary = { ...createMockSummary("parent222", "Parent commit"), children: [child] };
-			const index = v3Index([
-				rootEntry("parent222"),
-				{
-					commitHash: "child111",
-					parentCommitHash: "parent222",
-					commitMessage: "Child commit",
-					commitDate: "2026-02-19T10:00:00Z",
-					branch: "main",
-					generatedAt: "2026-02-19T10:00:05Z",
-				},
-			]);
-
-			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(parent));
+		it("returns the original child summary when the child still has its independent file", async () => {
+			// In v3+v4 storage, mergeManyToOne and migrateOneToOne preserve the old
+			// `summaries/{childHash}.json` files. Direct read returns the child's
+			// pre-Hoist data with its full topics (rather than the stripped child
+			// embedded in the squash root, which would have empty topics under v4).
+			const childOriginal = createMockSummary("child111", "Child commit");
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(childOriginal));
 
 			const result = await getSummary("child111");
 			expect(result?.commitHash).toBe("child111");
-			expect(result?.commitMessage).toBe("Child commit");
+			expect(result?.topics?.[0].title).toBe("Fix login");
 		});
 
-		it("should find a grandchild node via recursive tree search", async () => {
-			const grandchild = createMockSummary("grandchild1", "Grandchild commit");
-			const child: CommitSummary = {
-				...createMockSummary("child111", "Child commit"),
-				children: [grandchild],
-			};
-			const parent: CommitSummary = {
-				...createMockSummary("parent222", "Parent commit"),
-				children: [child],
-			};
-			const index = v3Index([
-				rootEntry("parent222"),
-				{
-					commitHash: "child111",
-					parentCommitHash: "parent222",
-					commitMessage: "Child commit",
-					commitDate: "2026-02-19T10:00:00Z",
-					branch: "main",
-					generatedAt: "2026-02-19T10:00:05Z",
-				},
-				{
-					commitHash: "grandchild1",
-					parentCommitHash: "child111",
-					commitMessage: "Grandchild commit",
-					commitDate: "2026-02-19T11:00:00Z",
-					branch: "main",
-					generatedAt: "2026-02-19T11:00:05Z",
-				},
-			]);
-
-			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(parent));
-
-			const result = await getSummary("grandchild1");
-			expect(result?.commitHash).toBe("grandchild1");
-			expect(result?.commitMessage).toBe("Grandchild commit");
-		});
-
-		it("should find a child node in the second branch of a multi-child tree", async () => {
-			const childA = createMockSummary("childA000", "Child A (no match)");
-			const childB = createMockSummary("childB000", "Child B (target)");
-			const parent: CommitSummary = {
-				...createMockSummary("parent222", "Parent commit"),
-				children: [childA, childB],
-			};
-			const index = v3Index([
-				rootEntry("parent222"),
-				{
-					commitHash: "childA000",
-					parentCommitHash: "parent222",
-					commitMessage: "Child A",
-					commitDate: "2026-02-19T10:00:00Z",
-					branch: "main",
-					generatedAt: "2026-02-19T10:00:05Z",
-				},
-				{
-					commitHash: "childB000",
-					parentCommitHash: "parent222",
-					commitMessage: "Child B",
-					commitDate: "2026-02-19T11:00:00Z",
-					branch: "main",
-					generatedAt: "2026-02-19T11:00:05Z",
-				},
-			]);
-
-			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(parent));
-
-			// Looking up childB means findNodeInTree tries childA first (returns null),
-			// then finds childB on the second iteration
-			const result = await getSummary("childB000");
-			expect(result?.commitHash).toBe("childB000");
-			expect(result?.commitMessage).toBe("Child B (target)");
-		});
-
-		it("should return summary via commitAliases when direct lookup fails", async () => {
+		it("falls back to commitAliases when direct read misses", async () => {
 			const summary = createMockSummary("knownhash00");
 			const index = v3Index([rootEntry("knownhash00")], { unknownhash0: "knownhash00" });
 
 			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(summary));
+				.mockResolvedValueOnce(null) // direct readSummaryFile("unknownhash0") miss
+				.mockResolvedValueOnce(JSON.stringify(index)) // loadIndex
+				.mockResolvedValueOnce(JSON.stringify(summary)); // readSummaryFile(aliasHash)
 
 			const result = await getSummary("unknownhash0");
 			expect(result?.commitHash).toBe("knownhash00");
 		});
 
-		it("should return null when index points to a child not present in the root tree (stale index)", async () => {
-			// Index says "child111" is a child of "parent222", but the root JSON
-			// does NOT contain "child111" — index is stale / migration incomplete.
-			const parent = createMockSummary("parent222", "Parent commit"); // no children
-			const index = v3Index([
-				rootEntry("parent222"),
-				{
-					commitHash: "child111",
-					parentCommitHash: "parent222",
-					commitMessage: "Child commit",
-					commitDate: "2026-02-19T10:00:00Z",
-					branch: "main",
-					generatedAt: "2026-02-19T10:00:05Z",
-				},
-			]);
-
+		it("returns null when the file read fails AND there is no index", async () => {
 			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(parent));
-
-			const result = await getSummary("child111");
-			// Must return null — not silently return the root summary
-			expect(result).toBeNull();
-		});
-
-		it("should return null when a child entry points to a missing root in the index", async () => {
-			const index = v3Index([
-				{
-					commitHash: "child111",
-					parentCommitHash: "missing-root",
-					commitMessage: "Child commit",
-					commitDate: "2026-02-19T10:00:00Z",
-					branch: "main",
-					generatedAt: "2026-02-19T10:00:05Z",
-				},
-			]);
-
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
-
-			const result = await getSummary("child111");
-
-			expect(result).toBeNull();
-		});
-
-		it("should stop traversing corrupt parent cycles when resolving a root hash", async () => {
-			const index = v3Index([
-				{
-					commitHash: "child111",
-					parentCommitHash: "parent222",
-					commitMessage: "Child commit",
-					commitDate: "2026-02-19T10:00:00Z",
-					branch: "main",
-					generatedAt: "2026-02-19T10:00:05Z",
-				},
-				{
-					commitHash: "parent222",
-					parentCommitHash: "child111",
-					commitMessage: "Parent commit",
-					commitDate: "2026-02-19T10:05:00Z",
-					branch: "main",
-					generatedAt: "2026-02-19T10:05:05Z",
-				},
-			]);
-
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index)).mockResolvedValueOnce(null);
-
-			const result = await getSummary("child111");
-
-			expect(result).toBeNull();
-		});
-
-		it("should return null when summary doesn't exist", async () => {
-			// loadIndex → null (no index); readSummaryFile → null
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+				.mockResolvedValueOnce(null) // direct miss
+				.mockResolvedValueOnce(null); // loadIndex returns null
 			const result = await getSummary("nonexistent");
 			expect(result).toBeNull();
 		});
 
-		it("should use legacy file fallback when no index exists", async () => {
-			const summary = createMockSummary("oldhash");
-			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(null) // loadIndex → no index
-				.mockResolvedValueOnce(JSON.stringify(summary)); // readSummaryFile fallback
-
-			const result = await getSummary("oldhash");
-			expect(result?.commitHash).toBe("oldhash");
-		});
-
-		it("should return null for malformed JSON in summary file", async () => {
-			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(null) // loadIndex → no index
-				.mockResolvedValueOnce("not json"); // readSummaryFile → parse fails
+		it("returns null when the file content is malformed JSON", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce("not json");
 			const result = await getSummary("bad-json");
 			expect(result).toBeNull();
 		});
 
-		it("should resolve a summary via tree-hash fallback when direct lookup and aliases miss", async () => {
-			const summary = createMockSummary("knownhash00");
-			const index = v3Index([{ ...rootEntry("knownhash00"), treeHash: "tree-1" }]);
-
+		it("returns null when nothing matches: direct miss, no aliases, no tree-hash hit", async () => {
+			const index = v3Index([rootEntry("knownhash00")]);
 			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(summary));
-			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
-
-			const result = await getSummary("unknownhash0");
-			expect(result?.commitHash).toBe("knownhash00");
-		});
-
-		it("should fall through to legacy file fallback when tree-hash fallback finds no match", async () => {
-			const summary = createMockSummary("unknownhash0");
-			const index = v3Index([{ ...rootEntry("knownhash00"), treeHash: "tree-1" }]);
-
-			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(summary));
-			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-miss");
-
-			const result = await getSummary("unknownhash0");
-			expect(result?.commitHash).toBe("unknownhash0");
+				.mockResolvedValueOnce(null) // direct miss
+				.mockResolvedValueOnce(JSON.stringify(index)); // loadIndex (no aliases match)
+			// getTreeHash mock left unconfigured -> resolves to undefined, no match
+			const result = await getSummary("absolutely-unknown");
+			expect(result).toBeNull();
 		});
 	});
 
 	describe("listSummaries", () => {
+		// Read order per entry:
+		//   listSummaries() -> loadIndex (1 read)
+		//   then for each root entry, getSummary -> readSummaryFile (1 read; direct hit)
+		//   or readSummaryFile (null) + loadIndex + maybe alias resolution (3+ reads)
+		// We exercise the happy path with one direct read per entry.
+
 		it("should skip entries whose summary files are missing (getSummary returns null)", async () => {
 			const index = v3Index([
 				rootEntry("hash1", "First", "2026-02-18T10:00:00Z"),
@@ -541,20 +371,17 @@ describe("SummaryStore", () => {
 			]);
 
 			vi.mocked(readFileFromBranch)
-				// listSummaries → loadIndex
+				// listSummaries -> loadIndex
 				.mockResolvedValueOnce(JSON.stringify(index))
-				// getSummary("hash3") → loadIndex + readSummaryFile (newest first)
-				.mockResolvedValueOnce(JSON.stringify(index))
+				// getSummary("hash3") direct read (newest first)
 				.mockResolvedValueOnce(JSON.stringify(createMockSummary("hash3", "Third")))
-				// getSummary("hash2") → loadIndex + readSummaryFile returns null (missing)
-				.mockResolvedValueOnce(JSON.stringify(index))
+				// getSummary("hash2") direct miss -> loadIndex (no aliases match) -> null
 				.mockResolvedValueOnce(null)
-				// getSummary("hash1") → loadIndex + readSummaryFile
 				.mockResolvedValueOnce(JSON.stringify(index))
+				// getSummary("hash1") direct read
 				.mockResolvedValueOnce(JSON.stringify(createMockSummary("hash1", "First")));
 
 			const summaries = await listSummaries(10);
-			// hash2 is skipped because its summary file is missing
 			expect(summaries).toHaveLength(2);
 			expect(summaries[0].commitHash).toBe("hash3");
 			expect(summaries[1].commitHash).toBe("hash1");
@@ -567,14 +394,9 @@ describe("SummaryStore", () => {
 			]);
 
 			vi.mocked(readFileFromBranch)
-				// listSummaries → loadIndex
-				.mockResolvedValueOnce(JSON.stringify(index))
-				// getSummary("hash2") → loadIndex + readSummaryFile
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(createMockSummary("hash2", "Second")))
-				// getSummary("hash1") → loadIndex + readSummaryFile
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(createMockSummary("hash1", "First")));
+				.mockResolvedValueOnce(JSON.stringify(index)) // listSummaries -> loadIndex
+				.mockResolvedValueOnce(JSON.stringify(createMockSummary("hash2", "Second"))) // direct read newest first
+				.mockResolvedValueOnce(JSON.stringify(createMockSummary("hash1", "First"))); // direct read
 
 			const summaries = await listSummaries(10);
 			expect(summaries.length).toBe(2);
@@ -600,7 +422,6 @@ describe("SummaryStore", () => {
 
 			vi.mocked(readFileFromBranch)
 				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(index))
 				.mockResolvedValueOnce(JSON.stringify(createMockSummary("root000", "Root")));
 
 			const summaries = await listSummaries(10);
@@ -621,17 +442,13 @@ describe("SummaryStore", () => {
 			]);
 
 			vi.mocked(readFileFromBranch)
-				// listSummaries → loadIndex
-				.mockResolvedValueOnce(JSON.stringify(index))
-				// getSummary("exists") → loadIndex + readSummaryFile
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(JSON.stringify(createMockSummary("exists", "Good")))
-				// getSummary("missing") → loadIndex + readSummaryFile (file missing)
-				.mockResolvedValueOnce(JSON.stringify(index))
-				.mockResolvedValueOnce(null);
+				.mockResolvedValueOnce(JSON.stringify(index)) // listSummaries -> loadIndex
+				.mockResolvedValueOnce(JSON.stringify(createMockSummary("exists", "Good"))) // direct read
+				// getSummary("missing"): direct miss -> loadIndex -> null
+				.mockResolvedValueOnce(null)
+				.mockResolvedValueOnce(JSON.stringify(index));
 
 			const summaries = await listSummaries(10);
-			// Only the valid summary should be returned
 			expect(summaries).toHaveLength(1);
 			expect(summaries[0].commitHash).toBe("exists");
 		});
@@ -702,17 +519,17 @@ describe("SummaryStore", () => {
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
 			expect(newSummaryContent.commitHash).toBe(newHash);
 			expect(newSummaryContent.commitMessage).toBe("New message");
-			// Container node: commitType = "rebase", no AI-generated fields at top level
+			// v4 root: commitType = "rebase"; topics + recap are now Copy-Hoisted from old.
+			expect(newSummaryContent.version).toBe(4);
 			expect(newSummaryContent.commitType).toBe("rebase");
-			expect(newSummaryContent.topics).toBeUndefined();
+			expect(newSummaryContent.topics).toEqual(oldSummary.topics);
 			expect(newSummaryContent.stats).toBeUndefined();
-			// diffStats is populated from git diff (persisted for display layer — no recursive aggregation needed)
 			expect(newSummaryContent.diffStats).toEqual({ filesChanged: 1, insertions: 5, deletions: 2 });
-			// Old summary preserved as the sole child — old hash is never lost
+			// Old summary preserved as the sole child, with all 8 Hoist fields stripped.
 			expect(newSummaryContent.children).toHaveLength(1);
 			expect(newSummaryContent.children?.[0].commitHash).toBe(oldHash);
-			expect(newSummaryContent.children?.[0].topics).toHaveLength(1);
-			expect(newSummaryContent.children?.[0].topics?.[0].title).toBe("Fix login");
+			// Topics are now stripped from the embedded child under the unified Hoist contract.
+			expect(newSummaryContent.children?.[0].topics).toBeUndefined();
 
 			const newIndexContent = JSON.parse(files[1].content) as SummaryIndex;
 			const hashes = newIndexContent.entries.map((e) => e.commitHash);
@@ -937,18 +754,21 @@ describe("SummaryStore", () => {
 			const mergedContent = JSON.parse(files[0].content) as CommitSummary;
 			expect(mergedContent.commitHash).toBe(newHash);
 			expect(mergedContent.commitMessage).toBe("Squashed commit");
-			expect(mergedContent.version).toBe(3);
+			// Root is v4 with consolidated topics/recap on root.
+			expect(mergedContent.version).toBe(4);
 
-			// Children: sorted by commitDate desc → summary2 (Feb 19) first, then summary1 (Feb 18)
+			// Children: sorted by commitDate desc -> summary2 (Feb 19) first, then summary1 (Feb 18).
+			// Topics are now stripped from children under the unified Hoist contract.
 			expect(mergedContent.children).toHaveLength(2);
 			expect(mergedContent.children?.[0].commitHash).toBe(oldHash2);
-			expect(mergedContent.children?.[0].topics).toHaveLength(2);
+			expect(mergedContent.children?.[0].topics).toBeUndefined();
 			expect(mergedContent.children?.[1].commitHash).toBe(oldHash1);
-			expect(mergedContent.children?.[1].topics).toHaveLength(1);
+			expect(mergedContent.children?.[1].topics).toBeUndefined();
 
-			// Pure container: no own topics/stats/llm (stats = the node's own LLM-processed
-			// diff; a pure squash root has none since no LLM runs on it).
-			expect(mergedContent.topics).toBeUndefined();
+			// Without a passed `consolidated` arg, mergeManyToOne defaults to an empty
+			// topics array on the root (no LLM ran). Real callers (runSquashPipeline /
+			// handleAmendPipeline) always pass a populated `consolidated`.
+			expect(mergedContent.topics).toEqual([]);
 			expect(mergedContent.stats).toBeUndefined();
 			expect(mergedContent.llm).toBeUndefined();
 			// diffStats IS populated — it's the real `git diff {squashHash}^..{squashHash}`
@@ -997,7 +817,7 @@ describe("SummaryStore", () => {
 			expect(hashes).toContain("old2");
 		});
 
-		it("should not include top-level llm/stats/topics in merged summary (pure container)", async () => {
+		it("defaults topics to [] when no `consolidated` argument is passed (legacy callers)", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
 			await mergeManyToOne(
@@ -1009,8 +829,36 @@ describe("SummaryStore", () => {
 			const mergedContent = JSON.parse(files[0].content) as CommitSummary;
 			expect(mergedContent.llm).toBeUndefined();
 			expect(mergedContent.stats).toBeUndefined();
-			expect(mergedContent.topics).toBeUndefined();
+			// Empty topics array (rather than undefined) keeps the v4 invariant: every
+			// root carries a topics field. Real callers always pass `consolidated`.
+			expect(mergedContent.topics).toEqual([]);
+			expect(mergedContent.recap).toBeUndefined();
 			expect(mergedContent.children).toHaveLength(2);
+		});
+
+		it("writes consolidated topics + recap onto the merged root when `consolidated` is provided", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+
+			await mergeManyToOne(
+				[createMockSummary("old1"), createMockSummary("old2")],
+				createMockCommitInfo("newhash"),
+				undefined,
+				undefined,
+				{
+					topics: [{ title: "Consolidated topic", trigger: "t", response: "r", decisions: "d" }],
+					recap: "Consolidated paragraph.",
+					ticketId: "PROJ-1",
+				},
+			);
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const mergedContent = JSON.parse(files[0].content) as CommitSummary;
+			expect(mergedContent.topics).toHaveLength(1);
+			expect(mergedContent.topics?.[0].title).toBe("Consolidated topic");
+			expect(mergedContent.recap).toBe("Consolidated paragraph.");
+			expect(mergedContent.ticketId).toBe("PROJ-1");
+			// Children still get stripped via stripFunctionalMetadata.
+			expect(mergedContent.children?.[0].topics).toBeUndefined();
 		});
 
 		it("should write orphanedDocIds to root when merging summaries with different jolliDocIds", async () => {
@@ -2099,7 +1947,7 @@ describe("SummaryStore", () => {
 	});
 
 	describe("stripFunctionalMetadata", () => {
-		it("should strip notes from a summary node", () => {
+		it("should strip notes (and topics, recap) from a summary node, preserving identity fields", () => {
 			const summary: CommitSummary = {
 				...createMockSummary("abc123", "With notes"),
 				notes: [
@@ -2112,12 +1960,15 @@ describe("SummaryStore", () => {
 						updatedAt: "2026-02-18T00:00:00Z",
 					},
 				],
+				recap: "Should be stripped too",
 			};
 
 			const stripped = stripFunctionalMetadata(summary);
 			expect(stripped.notes).toBeUndefined();
 			expect(stripped.commitHash).toBe("abc123");
-			expect(stripped.topics).toHaveLength(1);
+			// topics + recap are part of the Hoist family and get stripped.
+			expect(stripped.topics).toBeUndefined();
+			expect(stripped.recap).toBeUndefined();
 		});
 
 		it("should strip notes from nested children", () => {
@@ -2313,6 +2164,70 @@ describe("SummaryStore", () => {
 			await storeNotes([], "Empty commit");
 
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("expandSourcesForConsolidation", () => {
+		const leaf = (hash: string, topics: string[]): CommitSummary => ({
+			version: 3,
+			commitHash: hash,
+			commitMessage: `Commit ${hash}`,
+			commitAuthor: "Dev",
+			commitDate: "2026-01-01T00:00:00Z",
+			branch: "main",
+			generatedAt: "2026-01-01T00:00:05Z",
+			transcriptEntries: 0,
+			stats: { filesChanged: 0, insertions: 0, deletions: 0 },
+			topics: topics.map((t) => ({ title: t, detail: t, decisions: undefined })),
+		});
+
+		it("preserves grandchild topics in v3 squash-of-squash scenario", () => {
+			// Inner squash: grandchild1 + grandchild2 were squashed into innerSquash
+			const gc1 = leaf("gc1", ["gc1-topic"]);
+			const gc2 = leaf("gc2", ["gc2-topic"]);
+			const innerSquash: CommitSummary = {
+				...leaf("inner", []),
+				children: [gc2, gc1], // newest-first
+			};
+			// Outer squash combines innerSquash + another commit
+			const sibling = leaf("sib", ["sib-topic"]);
+			const outerSquash: CommitSummary = {
+				...leaf("outer", []),
+				children: [sibling, innerSquash], // newest-first
+			};
+
+			const sources = expandSourcesForConsolidation(outerSquash);
+
+			// Should have two sources (one per direct child)
+			expect(sources).toHaveLength(2);
+
+			const innerSource = sources.find((s) => s.commitHash === "inner");
+			const sibSource = sources.find((s) => s.commitHash === "sib");
+
+			expect(sibSource?.topics.map((t) => t.title)).toEqual(["sib-topic"]);
+			// Without the fix this would be [] — innerSquash.topics was empty
+			expect(innerSource?.topics.map((t) => t.title)).toEqual(["gc1-topic", "gc2-topic"]);
+		});
+
+		it("returns a single source for v4 unified-hoist format", () => {
+			const v4Summary: CommitSummary = {
+				version: 4,
+				commitHash: "v4abc",
+				commitMessage: "Squash",
+				commitAuthor: "Dev",
+				commitDate: "2026-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-01T00:00:05Z",
+				transcriptEntries: 0,
+				stats: { filesChanged: 0, insertions: 0, deletions: 0 },
+				topics: [{ title: "v4-topic", detail: "d", decisions: undefined }],
+			};
+
+			const sources = expandSourcesForConsolidation(v4Summary);
+
+			expect(sources).toHaveLength(1);
+			expect(sources[0]?.commitHash).toBe("v4abc");
+			expect(sources[0]?.topics.map((t) => t.title)).toEqual(["v4-topic"]);
 		});
 	});
 });

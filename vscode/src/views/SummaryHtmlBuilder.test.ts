@@ -49,7 +49,6 @@ const {
 	formatDate,
 	formatFullDate,
 	getDisplayDate,
-	groupTopicsByDate,
 	padIndex,
 	renderCalloutText,
 	timeAgo,
@@ -57,7 +56,6 @@ const {
 	collectSortedTopics: vi.fn(() => ({
 		topics: [],
 		sourceNodes: [],
-		showRecordDates: false,
 	})),
 	escAttr: vi.fn((s: string) => s),
 	escHtml: vi.fn((s: string) => s),
@@ -67,7 +65,6 @@ const {
 		(e: { generatedAt?: string; commitDate: string }) =>
 			e.generatedAt || e.commitDate,
 	),
-	groupTopicsByDate: vi.fn(() => new Map()),
 	padIndex: vi.fn((i: number) => String(i + 1).padStart(2, "0")),
 	renderCalloutText: vi.fn((s: string) => s),
 	timeAgo: vi.fn(() => "3 hours ago"),
@@ -105,7 +102,6 @@ vi.mock("./SummaryUtils.js", () => ({
 	formatDate,
 	formatFullDate,
 	getDisplayDate,
-	groupTopicsByDate,
 	padIndex,
 	renderCalloutText,
 	timeAgo,
@@ -122,6 +118,7 @@ import type {
 import {
 	buildE2eTestSection,
 	buildHtml,
+	buildRecapSection,
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
 import type { TopicWithDate } from "./SummaryUtils.js";
@@ -212,7 +209,6 @@ describe("SummaryHtmlBuilder", () => {
 		collectSortedTopics.mockReturnValue({
 			topics: [],
 			sourceNodes: [],
-			showRecordDates: false,
 		});
 		escAttr.mockImplementation((s: string) => s);
 		escHtml.mockImplementation((s: string) => s);
@@ -221,7 +217,6 @@ describe("SummaryHtmlBuilder", () => {
 		padIndex.mockImplementation((i: number) => String(i + 1).padStart(2, "0"));
 		renderCalloutText.mockImplementation((s: string) => s);
 		timeAgo.mockReturnValue("3 hours ago");
-		groupTopicsByDate.mockReturnValue(new Map());
 	});
 
 	// ─── buildHtml ────────────────────────────────────────────────────────────
@@ -271,7 +266,6 @@ describe("SummaryHtmlBuilder", () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],
 				sourceNodes: [],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("No topics available for this commit.");
@@ -282,7 +276,6 @@ describe("SummaryHtmlBuilder", () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [topic],
 				sourceNodes: [makeSummary()],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			expect(html).not.toContain("timeline");
@@ -290,31 +283,26 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("toggle");
 		});
 
-		it("renders timeline when showRecordDates is true with multiple topics", () => {
+		it("renders multiple topics as a flat list (no timeline grouping)", () => {
 			const topics = [
-				makeTopic({ title: "Topic 1", recordDate: "2026-01-15T10:00:00Z" }),
-				makeTopic({ title: "Topic 2", recordDate: "2026-01-14T10:00:00Z" }),
+				makeTopic({ title: "Topic 1", commitDate: "2026-01-15T10:00:00Z" }),
+				makeTopic({ title: "Topic 2", commitDate: "2026-01-14T10:00:00Z" }),
 			];
-			const grouped = new Map<string, Array<TopicWithDate>>();
-			grouped.set("2026-01-15", [topics[0]]);
-			grouped.set("2026-01-14", [topics[1]]);
-			groupTopicsByDate.mockReturnValue(grouped);
 			collectSortedTopics.mockReturnValue({
 				topics,
 				sourceNodes: [makeSummary(), makeSummary()],
-				showRecordDates: true,
 			});
 			const html = buildHtml(makeSummary());
-			expect(html).toContain("timeline");
-			expect(html).toContain("timeline-group");
-			expect(html).toContain("timeline-header");
+			// Flat-list mode: no timeline-group / timeline-header markup.
+			expect(html).not.toContain("timeline-group");
+			expect(html).not.toContain("timeline-header");
+			expect(html).toContain("toggle");
 		});
 
 		it('shows correct section header count — "1 topic" for singular', () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [makeTopic()],
 				sourceNodes: [makeSummary()],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("Topic");
@@ -325,7 +313,6 @@ describe("SummaryHtmlBuilder", () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [makeTopic(), makeTopic(), makeTopic()],
 				sourceNodes: [makeSummary()],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("Topics");
@@ -638,7 +625,6 @@ describe("SummaryHtmlBuilder", () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],
 				sourceNodes: [makeSummary()],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			expect(html).not.toContain("Source Commits");
@@ -659,7 +645,6 @@ describe("SummaryHtmlBuilder", () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],
 				sourceNodes: [source1, source2],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("Source Commits");
@@ -678,7 +663,6 @@ describe("SummaryHtmlBuilder", () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],
 				sourceNodes: [source, makeSummary()],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("7 turns");
@@ -693,7 +677,6 @@ describe("SummaryHtmlBuilder", () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],
 				sourceNodes: [source, makeSummary()],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			expect(html).toContain("1 turn");
@@ -709,7 +692,6 @@ describe("SummaryHtmlBuilder", () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],
 				sourceNodes: [source, makeSummary()],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			expect(html).not.toContain("stat-turns");
@@ -807,26 +789,6 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("hash-copy");
 		});
 
-		it("timeline renders correct group count labels", () => {
-			const topics = [
-				makeTopic({ title: "T1", recordDate: "2026-01-15T10:00:00Z" }),
-				makeTopic({ title: "T2", recordDate: "2026-01-15T11:00:00Z" }),
-				makeTopic({ title: "T3", recordDate: "2026-01-14T10:00:00Z" }),
-			];
-			const grouped = new Map<string, Array<TopicWithDate>>();
-			grouped.set("2026-01-15", [topics[0], topics[1]]);
-			grouped.set("2026-01-14", [topics[2]]);
-			groupTopicsByDate.mockReturnValue(grouped);
-			collectSortedTopics.mockReturnValue({
-				topics,
-				sourceNodes: [makeSummary(), makeSummary()],
-				showRecordDates: true,
-			});
-			const html = buildHtml(makeSummary());
-			expect(html).toContain("2 memories");
-			expect(html).toContain("1 memory");
-		});
-
 		it("source commit row handles missing stats gracefully", () => {
 			const source = makeSummary({
 				commitHash: "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
@@ -835,11 +797,59 @@ describe("SummaryHtmlBuilder", () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],
 				sourceNodes: [source, makeSummary()],
-				showRecordDates: false,
 			});
 			const html = buildHtml(makeSummary());
 			// With undefined stats, insertions/deletions default to 0
 			expect(html).toContain("+0");
+		});
+	});
+
+	// ─── buildRecapSection ───────────────────────────────────────────────────
+
+	describe("buildRecapSection", () => {
+		it("returns empty string when recap is undefined", () => {
+			expect(buildRecapSection(undefined)).toBe("");
+		});
+
+		it("returns empty string when recap is whitespace-only", () => {
+			expect(buildRecapSection("   \n  \t  ")).toBe("");
+		});
+
+		it("renders the section with edit button and trailing separator", () => {
+			const html = buildRecapSection("This commit added a recap field.");
+			expect(html).toContain('id="recapSection"');
+			expect(html).toContain("Quick recap");
+			expect(html).toContain('id="editRecapBtn"');
+			expect(html).toContain('class="recap-body"');
+			expect(html).toContain("This commit added a recap field.");
+			expect(html.trimEnd().endsWith('<hr class="separator" />')).toBe(true);
+		});
+
+		it("stashes the raw recap text in data-raw for editor restore", () => {
+			const html = buildRecapSection("Recap with <html> & special chars");
+			// data-raw uses escAttr (mocked to identity here), the body uses escHtml.
+			// The point of the assertion is that data-raw exists and carries the value.
+			expect(html).toContain('data-raw="Recap with <html> & special chars"');
+		});
+	});
+
+	// ─── buildHtml recap ordering ────────────────────────────────────────────
+
+	describe("buildHtml recap ordering", () => {
+		it("renders Quick recap above the Pull Request section", () => {
+			buildPrSectionHtml.mockReturnValue('<div class="pr-marker">PR</div>');
+			const html = buildHtml(makeSummary({ recap: "A short recap." }));
+			const recapIdx = html.indexOf("recapSection");
+			const prIdx = html.indexOf("pr-marker");
+			expect(recapIdx).toBeGreaterThan(0);
+			expect(prIdx).toBeGreaterThan(0);
+			expect(recapIdx).toBeLessThan(prIdx);
+		});
+
+		it("omits the recap section entirely when summary has no recap", () => {
+			const html = buildHtml(makeSummary({ recap: undefined }));
+			expect(html).not.toContain("recapSection");
+			expect(html).not.toContain("editRecapBtn");
 		});
 	});
 
@@ -1112,23 +1122,6 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("topic-edit-btn");
 			expect(html).toContain("topic-delete-btn");
 			expect(html).toContain('data-topic-index="3"');
-		});
-
-		it("timeline uses dayKey fallback when first topic has no recordDate", () => {
-			const topicNoDate = makeTopic({ title: "NoDate", recordDate: undefined });
-			const grouped = new Map<string, Array<TopicWithDate>>();
-			grouped.set("2026-01-15", [topicNoDate]);
-			groupTopicsByDate.mockReturnValue(grouped);
-			collectSortedTopics.mockReturnValue({
-				topics: [topicNoDate],
-				sourceNodes: [makeSummary(), makeSummary()],
-				showRecordDates: true,
-			});
-
-			buildHtml(makeSummary());
-
-			// formatDate should be called with the dayKey "2026-01-15" (the fallback)
-			expect(formatDate).toHaveBeenCalledWith("2026-01-15");
 		});
 
 		it("maps all category types to correct CSS classes", () => {
