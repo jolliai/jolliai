@@ -5,10 +5,10 @@
  * This script is spawned as a detached background process by PostCommitHook or PostRewriteHook.
  * It acquires a lock, drains the git operation queue, and processes each entry:
  *
- * - commit/cherry-pick/revert/amend: runs the LLM summarization pipeline
- * - squash: merges existing summaries (no LLM)
- * - rebase-pick: migrates summary 1:1 (no LLM)
- * - rebase-squash: merges summaries N:1 (no LLM)
+ * - commit / cherry-pick / revert / amend: runs the per-commit summarize LLM pipeline
+ * - squash: runs the LLM-driven `generateSquashConsolidation` pipeline (mechanical merge as fallback)
+ * - rebase-pick: migrates summary 1:1 (no LLM — pure metadata + ref re-association)
+ * - rebase-squash: same LLM consolidation pipeline as squash (mechanical merge as fallback)
  *
  * Transcript attribution uses each queue entry's `createdAt` timestamp as a time cutoff,
  * ensuring each commit gets only the transcript entries from its own time window.
@@ -42,10 +42,20 @@ import {
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
-import { generateSummary } from "../core/Summarizer.js";
 import {
+	extractTicketIdFromMessage,
+	generateSquashConsolidation,
+	generateSummary,
+	mechanicalConsolidate,
+	type SquashConsolidationSource,
+} from "../core/Summarizer.js";
+import {
+	type ConsolidatedTopics,
+	expandSourcesForConsolidation,
 	getSummary,
 	mergeManyToOne,
+	migrateOneToOne,
+	resolveEffectiveTopics,
 	storeNotes,
 	storePlans,
 	storeSummary,
@@ -737,8 +747,12 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 
 	// Build the CommitSummary leaf node with top-level fields from the API result.
 	// For a leaf, diffStats === stats (both are `git diff {hash}^..{hash}`).
+	// Schema v4: unified Hoist -- topics + recap are part of the Hoist family
+	// so root is always authoritative. Leaves are the source-of-truth for v4
+	// children; later squash/amend operations strip the Hoist fields off this
+	// node when it becomes a child of a v4 root.
 	const summary: CommitSummary = {
-		version: 3,
+		version: 4,
 		commitHash: commitInfo.hash,
 		commitMessage: commitInfo.message,
 		commitAuthor: commitInfo.author,
@@ -754,8 +768,10 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	};
 
 	log.info(
-		"Summary built for %s: plans field = %s, notes field = %s",
+		"Summary built for %s: recap=%s, topics=%d, plans=%s, notes=%s",
 		commitInfo.hash.substring(0, 8),
+		summary.recap ? "yes" : "no",
+		summary.topics?.length ?? 0,
 		summary.plans ? `${summary.plans.length} ref(s): [${summary.plans.map((p) => p.slug).join(", ")}]` : "absent",
 		summary.notes ? `${summary.notes.length} ref(s): [${summary.notes.map((n) => n.id).join(", ")}]` : "absent",
 	);
@@ -798,16 +814,95 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 }
 
 /**
- * Handles a git merge --squash scenario by merging existing summaries from the
- * squashed source commits. Returns true if summaries were successfully merged,
- * false if no source summaries were found (caller falls through to LLM pipeline).
+ * Shared squash consolidation pipeline. Used by BOTH:
+ *   - handleSquashFromQueue (op.type = "squash"): VSCode plugin Squash button
+ *     (writes squash-pending.json + git reset --soft + git commit), or `git
+ *     merge --squash` (writes SQUASH_MSG).
+ *   - handleRebaseSquashFromQueue (op.type = "rebase-squash"): `git rebase -i`
+ *     with squash/fixup in the todo list.
+ *
+ * Steps:
+ *   1. Build SquashConsolidationSource[] via expandSourcesForConsolidation.
+ *      This preserves commit-level grouping for nested squash roots (rule 4
+ *      supersede evidence relies on per-commit chronology).
+ *   2. Extract the outer ticketId from the squash commit message (highest
+ *      priority hint per ticketId resolution chain in generateSquashConsolidation).
+ *   3. Call generateSquashConsolidation -- returns null on no-content / repeated
+ *      LLM failure, in which case mechanicalConsolidate concatenates source
+ *      content as a graceful fallback (Hoist invariant always completes).
+ *   4. mergeManyToOne writes the v4 root with consolidated topics+recap and
+ *     stripped children.
+ *
+ * Renamed from `handleSquashMerge` because "merge" misleadingly suggested a
+ * git merge --squash specific path (it actually serves both routes), and
+ * because the function now drives an LLM pipeline rather than just merging.
  */
-async function handleSquashMerge(
+async function runSquashPipeline(
+	oldSummaries: ReadonlyArray<CommitSummary>,
 	commitInfo: CommitInfo,
+	cwd: string,
+	metadata: { readonly commitType: CommitType; readonly commitSource: CommitSource },
+): Promise<void> {
+	// Expand each source via expandSourcesForConsolidation: preserves per-commit
+	// grouping for nested squash roots (so the LLM can apply rule 4 evidence).
+	const sources: ReadonlyArray<SquashConsolidationSource> = oldSummaries.flatMap(expandSourcesForConsolidation);
+
+	// Outer ticketId: the squash commit message often carries the explicit ticket
+	// ("PROJ-123: ..."), which beats per-source ticketIds. extractTicketIdFromMessage
+	// returns undefined when none is present, leaving the inner resolution chain
+	// (earliest source -> LLM-extracted) to fill in.
+	const outerTicketId = extractTicketIdFromMessage(commitInfo.message);
+
+	let consolidated: ConsolidatedTopics & { status: "llm" | "mechanical" };
+
+	try {
+		const config = await loadConfig();
+		const result = await generateSquashConsolidation({
+			squashCommitMessage: commitInfo.message,
+			...(outerTicketId !== undefined && { ticketId: outerTicketId }),
+			sources,
+			config,
+		});
+		if (result) {
+			consolidated = { ...result, status: "llm" };
+		} else {
+			// No content / repeated LLM failure: mechanical fallback preserves source
+			// content so the Hoist root is never hollow.
+			consolidated = { ...mechanicalConsolidate(sources, outerTicketId), status: "mechanical" };
+		}
+	} catch (err) {
+		log.warn("Squash consolidation LLM failed, using mechanical merge: %s", (err as Error).message);
+		consolidated = { ...mechanicalConsolidate(sources, outerTicketId), status: "mechanical" };
+	}
+
+	log.info(
+		"Squash consolidation for %s: sources=%d, topics %d → %d, recap=%s, status=%s",
+		commitInfo.hash.substring(0, 8),
+		sources.length,
+		sources.reduce((n, s) => n + s.topics.length, 0),
+		consolidated.topics.length,
+		consolidated.recap ? "yes" : "no",
+		consolidated.status,
+	);
+
+	// mergeManyToOne writes the v4 root with these consolidated topics + recap +
+	// stripped children. Hoist invariant always completes (consolidated is never
+	// undefined here, even on LLM failure thanks to mechanicalConsolidate).
+	await mergeManyToOne(oldSummaries, commitInfo, cwd, metadata, consolidated);
+
+	// Re-associate plans and notes with the new squash commit hash.
+	await reassociateMetadata(oldSummaries, commitInfo.hash, cwd);
+}
+
+/**
+ * Loads source summaries by hash, logging warnings for missing entries.
+ * Shared by both squash queue handlers (commit-squash and rebase-squash).
+ */
+async function loadSourceSummaries(
 	sourceHashes: ReadonlyArray<string>,
 	cwd: string,
-	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
-): Promise<boolean> {
+	context: string,
+): Promise<CommitSummary[]> {
 	const oldSummaries: CommitSummary[] = [];
 	const missingHashes: string[] = [];
 	for (const hash of sourceHashes) {
@@ -818,39 +913,28 @@ async function handleSquashMerge(
 			missingHashes.push(hash);
 		}
 	}
-
-	if (oldSummaries.length === 0) {
-		return false;
-	}
-
 	if (missingHashes.length > 0) {
 		log.warn(
-			"Squash merge: %d of %d source summaries missing — [%s]",
+			"%s: %d of %d source summaries missing -- merging available ones. Missing: [%s]",
+			context,
 			missingHashes.length,
 			sourceHashes.length,
 			missingHashes.map((h) => h.substring(0, 8)).join(", "),
 		);
 	}
-
-	// orphanedDocIds are now persisted in the merged summary itself.
-	// Orphan cleanup happens in the VSCode plugin's handlePushToJolli() when user pushes.
-	await mergeManyToOne(oldSummaries, commitInfo, cwd, metadata);
-
-	// Re-associate plans and notes with the new squash commit hash
-	await reassociateMetadata(oldSummaries, commitInfo.hash, cwd);
-
-	log.info("Squash merge complete: merged %d of %d summaries", oldSummaries.length, sourceHashes.length);
-	return true;
+	return oldSummaries;
 }
 
 // ── Queue-driven handler functions ──────────────────────────────────────────
 
 /**
- * Handles a squash queue entry: merges existing summaries from source commits.
- * No LLM call needed — just combines already-generated summaries.
+ * Handles a squash queue entry (op.type = "squash"): VSCode plugin Squash
+ * button or `git merge --squash`. Both routes write a marker file
+ * (squash-pending.json or SQUASH_MSG) that prepare-msg-hook -> queue translates
+ * into this op.type.
  *
- * TODO: When squash adds LLM-based summary generation, use `loadSessionTranscripts()`
- * with `op.createdAt` as beforeTimestamp for correct transcript attribution.
+ * Delegates to runSquashPipeline so behaviour is identical to rebase-squash --
+ * both routes go through the same LLM consolidation + mechanical fallback.
  */
 async function handleSquashFromQueue(op: GitOperation, cwd: string): Promise<void> {
 	if (!op.sourceHashes || op.sourceHashes.length === 0) {
@@ -858,17 +942,19 @@ async function handleSquashFromQueue(op: GitOperation, cwd: string): Promise<voi
 		return;
 	}
 
+	const oldSummaries = await loadSourceSummaries(op.sourceHashes, cwd, "Squash");
+	if (oldSummaries.length === 0) {
+		log.warn("Squash: no source summaries found for %s -- skipping", op.commitHash.substring(0, 8));
+		return;
+	}
+
 	const commitInfo = await getCommitInfo(op.commitHash, cwd);
 	/* v8 ignore start -- commitSource is always set by the enqueue path; fallback is defensive */
-	const merged = await handleSquashMerge(commitInfo, op.sourceHashes, cwd, {
+	await runSquashPipeline(oldSummaries, commitInfo, cwd, {
 		commitType: "squash",
 		commitSource: op.commitSource ?? "cli",
 	});
 	/* v8 ignore stop */
-
-	if (!merged) {
-		log.warn("Squash merge found no source summaries for %s", op.commitHash.substring(0, 8));
-	}
 }
 
 /**
@@ -889,8 +975,13 @@ async function handleRebasePickFromQueue(op: GitOperation, cwd: string): Promise
 	}
 
 	const newCommitInfo = await getCommitInfo(op.commitHash, cwd);
-	const { migrateOneToOne } = await import("../core/SummaryStore.js");
-	await migrateOneToOne(oldSummary, newCommitInfo, cwd);
+	// Carry commitSource forward so the migrated summary records whether the
+	// original action came from the VSCode plugin or the CLI. squash and amend
+	// already do this; rebase-pick was the odd one out.
+	await migrateOneToOne(oldSummary, newCommitInfo, cwd, {
+		commitType: "rebase",
+		...(op.commitSource && { commitSource: op.commitSource }),
+	});
 
 	// Re-associate plans and notes with the new hash
 	await reassociateMetadata([oldSummary], op.commitHash, cwd);
@@ -899,8 +990,12 @@ async function handleRebasePickFromQueue(op: GitOperation, cwd: string): Promise
 }
 
 /**
- * Handles a rebase squash (N:1 merge) queue entry.
- * No LLM call needed — just merges source summaries into the new hash.
+ * Handles a rebase squash (N:1 merge) queue entry, triggered by `git rebase -i`
+ * with squash/fixup in the todo list.
+ *
+ * Delegates to runSquashPipeline (same path as handleSquashFromQueue) so both
+ * routes share the LLM consolidation + mechanical fallback. The user-visible
+ * result is identical regardless of which path triggered the squash.
  */
 async function handleRebaseSquashFromQueue(op: GitOperation, cwd: string): Promise<void> {
 	if (!op.sourceHashes || op.sourceHashes.length === 0) {
@@ -908,62 +1003,125 @@ async function handleRebaseSquashFromQueue(op: GitOperation, cwd: string): Promi
 		return;
 	}
 
-	const oldSummaries: CommitSummary[] = [];
-	const missingHashes: string[] = [];
-	for (const hash of op.sourceHashes) {
-		const summary = await getSummary(hash, cwd);
-		if (summary) {
-			oldSummaries.push(summary);
-		} else {
-			missingHashes.push(hash);
-		}
-	}
-
+	const oldSummaries = await loadSourceSummaries(op.sourceHashes, cwd, "Rebase-squash");
 	if (oldSummaries.length === 0) {
 		log.warn("Rebase-squash: no source summaries found for %s — skipping", op.commitHash.substring(0, 8));
 		return;
 	}
 
-	if (missingHashes.length > 0) {
-		log.warn(
-			"Rebase-squash: %d of %d source summaries missing for %s — merging available ones. " +
-				"Missing hashes: [%s]. These summaries were never generated (not a race condition — " +
-				"queue ordering guarantees all prior entries are processed before this one).",
-			missingHashes.length,
-			op.sourceHashes.length,
-			op.commitHash.substring(0, 8),
-			missingHashes.map((h) => h.substring(0, 8)).join(", "),
-		);
-	}
-
 	const newCommitInfo = await getCommitInfo(op.commitHash, cwd);
-	await mergeManyToOne(oldSummaries, newCommitInfo, cwd, {
+	await runSquashPipeline(oldSummaries, newCommitInfo, cwd, {
 		commitType: "squash",
 		commitSource: (op.commitSource ?? "cli") as CommitSource,
 	});
-
-	// Re-associate plans and notes with the new hash
-	await reassociateMetadata(oldSummaries, op.commitHash, cwd);
-
-	log.info("Rebase-squash: merged %d summaries → %s", oldSummaries.length, op.commitHash.substring(0, 8));
 }
 
 /**
- * Handles amend-pending scenarios. Runs the full LLM pipeline for the amended commit
- * and merges the resulting record with the old summary's records, then removes the old
- * summary from the index.
+ * Threshold for the trivial-amend short-circuit A (line count of the delta diff).
+ * 10 is intentionally conservative -- prefer running the LLM (false negative)
+ * over silently skipping a substantive change (false positive).
+ */
+const TRIVIAL_AMEND_DELTA_LINES = 10;
+
+/**
+ * Detects "no real conversation, mechanical-only delta" amends so we can skip
+ * the LLM entirely. Examples that should match:
+ *   - `git commit --amend --no-edit`
+ *   - bumping a version number
+ *   - re-signing with GPG
+ *   - applying formatter output
+ *
+ * Conservative by design: any captured conversation, OR any delta beyond the
+ * line threshold (regardless of whitespace), forces the full pipeline. False
+ * positives here would silently drop new amend information.
+ */
+function isTrivialAmendDelta(deltaStats: DiffStats, transcriptEntries: number): boolean {
+	if (transcriptEntries > 0) return false;
+	const totalLines = deltaStats.insertions + deltaStats.deletions;
+	return totalLines <= TRIVIAL_AMEND_DELTA_LINES;
+}
+
+/**
+ * Hoisted-fields bundle for buildHoistedAmendRoot. The v4 amend root carries
+ * topics + recap + ticketId either Copy-Hoisted from the old summary (short
+ * circuit A/B) or LLM-consolidated from [old, delta] (full path).
+ *
+ * `llm` is only set when the topics/recap actually came from this call (i.e.
+ * the consolidate step ran). Short-circuit A/B leave it undefined so the
+ * field's "produced this node's data" semantics stay accurate.
+ */
+interface AmendHoistedFields {
+	readonly topics: ReadonlyArray<TopicSummary>;
+	readonly recap?: string;
+	readonly ticketId?: string;
+	readonly llm?: import("../Types.js").LlmCallMetadata;
+}
+
+/**
+ * Builds the v4 amend root with all 8 Hoist fields populated and the old
+ * summary attached as a stripped child. Used by all three amend paths
+ * (short-circuit A, short-circuit B, full path); the only differences are
+ * which `hoisted` values the caller passes in and whether they pass a
+ * transcript artifact to storeSummary.
+ *
+ * `oldSummary` is undefined when there's no recorded prior summary (rare:
+ * the user amended a commit that was never summarised). In that case the
+ * new root is effectively a fresh leaf -- still v4, no children, no Hoist
+ * source -- and `hoisted` is whatever the caller derived from delta alone.
+ */
+function buildHoistedAmendRoot(
+	oldSummary: CommitSummary | undefined,
+	newInfo: CommitInfo,
+	hoisted: AmendHoistedFields,
+	metadata: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
+	fullDiffStats: DiffStats,
+	stats?: { readonly transcriptEntries?: number; readonly conversationTurns?: number },
+): CommitSummary {
+	const branch = oldSummary?.branch ?? "";
+	const strippedOld = oldSummary ? stripFunctionalMetadata(oldSummary) : undefined;
+	const carriedFromOld = oldSummary ? hoistMetadataFromOldSummary(oldSummary) : {};
+	return {
+		version: 4,
+		commitHash: newInfo.hash,
+		commitMessage: newInfo.message,
+		commitAuthor: newInfo.author,
+		commitDate: new Date(newInfo.date).toISOString(),
+		branch,
+		generatedAt: new Date().toISOString(),
+		...(metadata.commitType && { commitType: metadata.commitType }),
+		...(metadata.commitSource && { commitSource: metadata.commitSource }),
+		...(hoisted.ticketId && { ticketId: hoisted.ticketId }),
+		...(hoisted.llm && { llm: hoisted.llm }),
+		...(stats?.transcriptEntries !== undefined && { transcriptEntries: stats.transcriptEntries }),
+		...(stats?.conversationTurns !== undefined && { conversationTurns: stats.conversationTurns }),
+		...carriedFromOld,
+		topics: hoisted.topics,
+		...(hoisted.recap && { recap: hoisted.recap }),
+		diffStats: fullDiffStats,
+		...(strippedOld && { children: [strippedOld] }),
+	};
+}
+
+/**
+ * Handles amend queue entries via three-tier dispatch:
+ *
+ *   - **Short-circuit A** (0 LLM): trivial delta (empty transcript + small or
+ *     mechanical diff) -> Copy-Hoist topics/recap from old, no transcript artifact.
+ *   - **Short-circuit B** (1 LLM): summarize(delta) returned no topics + no
+ *     recap -> Copy-Hoist topics/recap from old, BUT write the transcript
+ *     artifact (the LLM read the conversation -- those bytes are valuable for
+ *     audit even though the topics/recap weren't substantive).
+ *   - **Full path** (2 LLM): summarize(delta) + consolidate([old, delta]) ->
+ *     LLM-produced topics/recap (or mechanicalConsolidate fallback), with
+ *     transcript artifact.
+ *
+ * All three paths converge on buildHoistedAmendRoot + storeSummary, so the
+ * Hoist invariant always completes regardless of which dispatch tier ran.
  *
  * Called by both scenarios:
  *   - Scenario 2: lock was free; commitInfo is the amended commit (HEAD)
- *   - Scenario 1: lock was held; commitInfo is the new commit (derived from HEAD after Worker finishes)
- *
- * @param commitInfo - The amended (new) commit
- * @param oldHash - The pre-amend commit hash (key for the old summary)
- * @param cwd - Working directory
- * @param pipelineStart - Pipeline start time for elapsed logging
- * @param diffOverride - Optional diff refs override; when provided, uses these refs instead of
- *   HEAD~1..HEAD. Used by Scenario 1 to compute the amend delta (oldHash..newHash) rather
- *   than the full commit diff.
+ *   - Scenario 1: lock was held; commitInfo is the new commit (derived from
+ *     HEAD after Worker finishes)
  */
 async function handleAmendPipeline(
 	commitInfo: CommitInfo,
@@ -974,7 +1132,7 @@ async function handleAmendPipeline(
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
 	beforeTimestamp?: string,
 ): Promise<void> {
-	// Load old summary (may not exist if the original commit had no LLM summary)
+	// Load old summary (may not exist if the original commit had no LLM summary).
 	const oldSummary = await getSummary(oldHash, cwd);
 	if (oldSummary) {
 		log.info("Loaded old summary for %s", oldHash.substring(0, 8));
@@ -982,7 +1140,7 @@ async function handleAmendPipeline(
 		log.info("No old summary found for %s — will create fresh summary for amended commit", oldHash.substring(0, 8));
 	}
 
-	// Load sessions and read transcripts with time cutoff
+	// Load sessions and read transcripts with time cutoff.
 	const amendConfig = await loadConfig();
 	const { sessionTranscripts, totalEntries, humanEntries } = await loadSessionTranscripts(
 		cwd,
@@ -990,112 +1148,95 @@ async function handleAmendPipeline(
 		beforeTimestamp,
 	);
 
-	// Get git diff and stats
+	// Get git diff and stats. diffOverride (Scenario 1) provides oldHash->newHash
+	// (the actual amend delta); default HEAD~1..HEAD is the full amended diff.
 	let stepStart = now();
-	const branch = await getCurrentBranch(cwd);
-	let diff: string;
-	let diffStats: DiffStats;
-
-	// Use diffOverride refs when provided (Scenario 1: amend delta oldHash->newHash),
-	// otherwise fall back to HEAD~1..HEAD (Scenario 2: full amended commit diff).
+	let deltaDiff: string;
+	let deltaDiffStats: DiffStats;
 	const fromRef = diffOverride?.fromRef ?? "HEAD~1";
 	const toRef = diffOverride?.toRef ?? "HEAD";
-
 	try {
-		diff = await getDiffContent(fromRef, toRef, cwd);
-		diffStats = await getDiffStats(fromRef, toRef, cwd);
+		deltaDiff = await getDiffContent(fromRef, toRef, cwd);
+		deltaDiffStats = await getDiffStats(fromRef, toRef, cwd);
 	} catch {
 		log.warn("Could not diff %s..%s, using empty diff", fromRef, toRef);
-		diff = "(Could not compute diff)";
-		diffStats = { filesChanged: 0, insertions: 0, deletions: 0 };
+		deltaDiff = "(Could not compute diff)";
+		deltaDiffStats = { filesChanged: 0, insertions: 0, deletions: 0 };
 	}
-
 	log.info(
-		"Git diff (%s..%s): %d files changed, +%d -%d (%s)",
+		"Amend delta diff (%s..%s): %d files changed, +%d -%d (%s)",
 		fromRef.substring(0, 8),
 		toRef.substring(0, 8),
-		diffStats.filesChanged,
-		diffStats.insertions,
-		diffStats.deletions,
+		deltaDiffStats.filesChanged,
+		deltaDiffStats.insertions,
+		deltaDiffStats.deletions,
 		formatElapsed(stepStart),
 	);
 
-	// Compute the amend commit's FULL diff (git diff {newHash}^..{newHash}) for the
-	// persisted `diffStats` field. In Scenario 1 (diffOverride = oldHash..newHash) the
-	// `diffStats` local above is the DELTA, not the full commit diff. In Scenario 2
-	// (default HEAD~1..HEAD, equals newHash^..newHash at amend time) the two are equal
-	// and we skip the extra git call.
+	// Compute the amend commit's FULL diff (git diff {newHash}^..{newHash}) for
+	// persisted `diffStats`. In Scenario 1 (diffOverride = oldHash..newHash) the
+	// delta diff is NOT the full commit diff. In Scenario 2 (default HEAD~1..HEAD)
+	// they're equal so we skip the extra git call.
 	const amendFullDiffStats: DiffStats = diffOverride
 		? await getDiffStats(`${commitInfo.hash}^`, commitInfo.hash, cwd).catch(
 				(): DiffStats => ({ filesChanged: 0, insertions: 0, deletions: 0 }),
 			)
-		: diffStats;
+		: deltaDiffStats;
 
-	// Guard: skip LLM generation if no transcript entries AND no file changes.
-	// However, we MUST still migrate the index even when skipping — a message-only amend
-	// changes the commit hash and the old hash must be replaced in the index.
-	if (totalEntries === 0 && diffStats.filesChanged === 0) {
-		log.info("No new transcript entries and no file changes. Skipping amend LLM generation.");
-		/* v8 ignore start -- amend with no content changes and existing summary: tested via PostCommitHook integration */
-		if (oldSummary) {
-			// Wrap the old summary as a child rather than replacing its hash, preserving the
-			// principle that no recorded commit hash is ever lost from the summary tree.
-			// Hoist all functional metadata (jolliDocId/Url, plans, e2eTestGuide, orphanedDocIds)
-			// to the new root — docId-based update makes this safe across hash changes.
-			const strippedOld = stripFunctionalMetadata(oldSummary);
-			const migratedSummary: CommitSummary = {
-				version: 3,
-				commitHash: commitInfo.hash,
-				commitMessage: commitInfo.message,
-				commitAuthor: commitInfo.author,
-				commitDate: new Date(commitInfo.date).toISOString(),
-				branch: oldSummary.branch,
-				generatedAt: new Date().toISOString(),
-				...(metadata?.commitType && { commitType: metadata.commitType }),
-				...(metadata?.commitSource && { commitSource: metadata.commitSource }),
-				...hoistMetadataFromOldSummary(oldSummary),
-				diffStats: amendFullDiffStats,
-				children: [strippedOld],
-			};
-			await storeSummary(migratedSummary, cwd);
-			// Note: do NOT call removeFromIndex(oldHash) here. In v3, storeSummary's
-			// flattenSummaryTree upsert already reclassifies the old entry as a child
-			// of the new hash by setting its parentCommitHash. Calling removeFromIndex
-			// afterward would break the parentCommitHash chain for getSummary().
-			log.info(
-				"Amend index migration (no new content): %s → %s",
-				oldHash.substring(0, 8),
-				commitInfo.hash.substring(0, 8),
-			);
-		}
-		/* v8 ignore stop */
+	// ── Short-circuit A: trivial delta (0 LLM) ────────────────────────────────
+	if (oldSummary && isTrivialAmendDelta(deltaDiffStats, totalEntries)) {
+		log.info("Amend short-circuit A: trivial delta -- 0 LLM, Copy-Hoist topics/recap from old");
+		const root = buildHoistedAmendRoot(
+			oldSummary,
+			commitInfo,
+			{
+				topics: resolveEffectiveTopics(oldSummary),
+				...(oldSummary.recap !== undefined && { recap: oldSummary.recap }),
+				...(oldSummary.ticketId !== undefined && { ticketId: oldSummary.ticketId }),
+			},
+			metadata ?? {},
+			amendFullDiffStats,
+		);
+		await storeSummary(root, cwd);
+		await reassociateMetadata([oldSummary], commitInfo.hash, cwd);
+		log.info(
+			"Amend short-circuit A complete: %s -> %s (%s)",
+			oldHash.substring(0, 8),
+			commitInfo.hash.substring(0, 8),
+			formatElapsed(pipelineStart),
+		);
 		return;
 	}
 
-	// Build multi-session conversation context and call LLM
-	const conversation = buildMultiSessionContext(sessionTranscripts);
+	// No old summary AND trivial delta -- nothing useful to record.
+	/* v8 ignore start -- defensive: covered indirectly when both inputs are absent */
+	if (!oldSummary && isTrivialAmendDelta(deltaDiffStats, totalEntries)) {
+		log.info("Amend with no old summary AND trivial delta -- skipping");
+		return;
+	}
+	/* v8 ignore stop */
 
+	// ── Step 1 LLM: summarize the delta ───────────────────────────────────────
+	const conversation = buildMultiSessionContext(sessionTranscripts);
 	stepStart = now();
 	const summaryParams = {
 		conversation,
-		diff,
+		diff: deltaDiff,
 		commitInfo,
-		diffStats,
+		diffStats: deltaDiffStats,
 		transcriptEntries: totalEntries,
 		conversationTurns: humanEntries,
 		config: amendConfig,
 	};
 
-	let summaryResult: Awaited<ReturnType<typeof generateSummary>>;
-
+	let delta: Awaited<ReturnType<typeof generateSummary>>;
 	try {
-		summaryResult = await generateSummary(summaryParams);
+		delta = await generateSummary(summaryParams);
 	} catch (error: unknown) {
 		log.warn("First API attempt failed: %s. Retrying in %dms...", (error as Error).message, RETRY_DELAY_MS);
 		await delay(RETRY_DELAY_MS);
-
 		try {
-			summaryResult = await generateSummary(summaryParams);
+			delta = await generateSummary(summaryParams);
 		} catch (retryError: unknown) {
 			log.error("API call failed after retry: %s", (retryError as Error).message);
 			log.error(
@@ -1106,14 +1247,109 @@ async function handleAmendPipeline(
 			return;
 		}
 	}
-	log.info("API summary generated for amended commit (%s)", formatElapsed(stepStart));
+	log.info("Amend step 1 (delta summary) generated (%s)", formatElapsed(stepStart));
 
-	// Build the amended summary: new delta fields at top level, old summary as child.
-	// Hoist functional metadata from old summary to new root (docId-based update is hash-stable).
-	// If no old summary exists, treat this as a fresh leaf node.
-	const strippedOld = oldSummary ? stripFunctionalMetadata(oldSummary) : undefined;
-	const amendedSummary: CommitSummary = {
-		version: 3,
+	// Persist the conversation regardless of which path we take from here.
+	const amendStoredTranscript = buildStoredTranscript(sessionTranscripts);
+	const transcriptArtifact = amendStoredTranscript.sessions.length > 0 ? amendStoredTranscript : undefined;
+
+	// ── Short-circuit B: 1 LLM, delta produced no substantive content ─────────
+	if (oldSummary && (delta.topics?.length ?? 0) === 0 && !delta.recap) {
+		log.info("Amend short-circuit B: 1 LLM, delta empty -- Copy-Hoist topics/recap from old, write transcript");
+		const root = buildHoistedAmendRoot(
+			oldSummary,
+			commitInfo,
+			{
+				topics: resolveEffectiveTopics(oldSummary),
+				...(oldSummary.recap !== undefined && { recap: oldSummary.recap }),
+				...(oldSummary.ticketId !== undefined && { ticketId: oldSummary.ticketId }),
+				// llm: undefined -- topics/recap came from old, not from delta
+			},
+			metadata ?? {},
+			amendFullDiffStats,
+			{ transcriptEntries: totalEntries, conversationTurns: humanEntries },
+		);
+		await storeSummary(root, cwd, false, transcriptArtifact ? { transcript: transcriptArtifact } : undefined);
+		await reassociateMetadata([oldSummary], commitInfo.hash, cwd);
+		log.info(
+			"Amend short-circuit B complete: %s -> %s (%s)",
+			oldHash.substring(0, 8),
+			commitInfo.hash.substring(0, 8),
+			formatElapsed(pipelineStart),
+		);
+		return;
+	}
+
+	// ── Full path: oldSummary exists with non-empty delta -> step 2 consolidate ──
+	if (oldSummary) {
+		const deltaSource: SquashConsolidationSource = {
+			commitHash: commitInfo.hash,
+			commitDate: new Date(commitInfo.date).toISOString(),
+			// commitMessage gets rendered as the "Message:" line in sourceCommitsBlock.
+			// Use a label that signals "this is the amend delta in context" rather
+			// than the bare squash commit message.
+			commitMessage: `(amend delta of ${oldSummary.commitMessage})`,
+			...(delta.ticketId !== undefined && { ticketId: delta.ticketId }),
+			topics: delta.topics,
+			...(delta.recap !== undefined && { recap: delta.recap }),
+		};
+		const sources: ReadonlyArray<SquashConsolidationSource> = [
+			...expandSourcesForConsolidation(oldSummary),
+			deltaSource,
+		];
+		const outerTicketId = oldSummary.ticketId ?? delta.ticketId;
+
+		stepStart = now();
+		let consolidated: ConsolidatedTopics | null;
+		try {
+			consolidated = await generateSquashConsolidation({
+				squashCommitMessage: commitInfo.message,
+				...(outerTicketId !== undefined && { ticketId: outerTicketId }),
+				sources,
+				config: amendConfig,
+			});
+		} catch (err) {
+			log.warn(
+				"Amend step 2 (consolidate) LLM failed: %s -- falling back to mechanical merge",
+				(err as Error).message,
+			);
+			consolidated = null;
+		}
+		const finalConsolidated: ConsolidatedTopics = consolidated ?? mechanicalConsolidate(sources, outerTicketId);
+		log.info(
+			"Amend step 2 (consolidate) %s (%s)",
+			consolidated ? "succeeded" : "fell back to mechanical",
+			formatElapsed(stepStart),
+		);
+
+		const root = buildHoistedAmendRoot(
+			oldSummary,
+			commitInfo,
+			{
+				topics: finalConsolidated.topics,
+				...(finalConsolidated.recap !== undefined && { recap: finalConsolidated.recap }),
+				...(finalConsolidated.ticketId !== undefined && { ticketId: finalConsolidated.ticketId }),
+				// Only include llm metadata when consolidation actually called the LLM.
+				...(consolidated?.llm && { llm: consolidated.llm }),
+			},
+			metadata ?? {},
+			amendFullDiffStats,
+			{ transcriptEntries: totalEntries, conversationTurns: humanEntries },
+		);
+		await storeSummary(root, cwd, false, transcriptArtifact ? { transcript: transcriptArtifact } : undefined);
+		await reassociateMetadata([oldSummary], commitInfo.hash, cwd);
+		log.info("=== Amend full path completed in %s ===", formatElapsed(pipelineStart));
+		log.info("=== Summary content (%d topics) ===", finalConsolidated.topics.length);
+		for (const topic of finalConsolidated.topics) {
+			log.info("Topic: %s", topic.title);
+		}
+		return;
+	}
+
+	// ── No old summary AND non-trivial delta -> store delta as a fresh leaf ────
+	const branch = await getCurrentBranch(cwd);
+	const freshLeaf: CommitSummary = {
+		version: 4,
 		commitHash: commitInfo.hash,
 		commitMessage: commitInfo.message,
 		commitAuthor: commitInfo.author,
@@ -1122,36 +1358,15 @@ async function handleAmendPipeline(
 		generatedAt: new Date().toISOString(),
 		...(metadata?.commitType && { commitType: metadata.commitType }),
 		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
-		...summaryResult,
-		// `summaryResult.stats` is what the LLM processed — in Scenario 1 that's
-		// the amend delta, not the full commit diff. `diffStats` is a separate
-		// field that always records the full commit diff for display purposes.
+		...delta,
 		diffStats: amendFullDiffStats,
-		...hoistMetadataFromOldSummary(oldSummary),
-		...(strippedOld && { children: [strippedOld] }),
 	};
-
-	// Build StoredTranscript for the amend's own conversation (Scenario 2: fresh cursors)
-	const amendStoredTranscript = buildStoredTranscript(sessionTranscripts);
-
-	stepStart = now();
-	await storeSummary(amendedSummary, cwd, false, { transcript: amendStoredTranscript });
-	log.info("Amend summary stored for commit %s (%s)", commitInfo.hash.substring(0, 8), formatElapsed(stepStart));
-	// Note: do NOT call removeFromIndex(oldHash) here. In v3, storeSummary's
-	// flattenSummaryTree upsert already reclassifies the old entry as a child
-	// of the new amended hash. Removing it would break the parentCommitHash chain.
-
-	log.info("=== Amend pipeline completed in %s ===", formatElapsed(pipelineStart));
-	log.info("=== Summary content (%d topics) ===", summaryResult.topics.length);
-	for (const topic of summaryResult.topics) {
-		log.info("Topic: %s", topic.title);
-		log.info("  Trigger:   %s", topic.trigger);
-		log.info("  Response:  %s", topic.response);
-		log.info("  Decisions: %s", topic.decisions);
-		if (topic.todo) {
-			log.info("  Todo:      %s", topic.todo);
-		}
-	}
+	await storeSummary(freshLeaf, cwd, false, transcriptArtifact ? { transcript: transcriptArtifact } : undefined);
+	log.info(
+		"Amend with no old summary -> stored as fresh leaf for %s (%s)",
+		commitInfo.hash.substring(0, 8),
+		formatElapsed(pipelineStart),
+	);
 }
 
 /**

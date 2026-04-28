@@ -1,29 +1,22 @@
 /**
  * SummaryFormat — Shared formatting utilities for summary display.
  *
- * Contains date formatting, topic sorting/grouping, title builders, and the
+ * Contains date formatting, topic sorting, title builders, and the
  * collectSortedTopics helper used by both the CLI markdown exporter and the
  * VS Code webview. This file has zero VS Code dependencies.
  */
 
 import type { CommitSummary, PlanReference } from "../Types.js";
-import {
-	type TopicWithDate as CoreTopicWithDate,
-	collectAllTopics,
-	collectSourceNodes,
-	computeDurationDays,
-} from "./SummaryTree.js";
+import { collectDisplayTopics, collectSourceNodes, type TopicWithDate } from "./SummaryTree.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /**
- * A topic annotated with its parent record's date (for multi-record display).
- * Extends the core TopicWithDate (which has commitDate) with an additional
- * recordDate field used in timeline display.
+ * Topic annotated with its source node's date. Re-exported from SummaryTree so
+ * VSCode webview / IntelliJ-equivalent consumers can import it from this
+ * formatting module without reaching into the tree-utility layer.
  */
-export interface TopicWithDate extends CoreTopicWithDate {
-	readonly recordDate?: string;
-}
+export type { TopicWithDate };
 
 // ─── Date formatting ──────────────────────────────────────────────────────────
 
@@ -81,13 +74,24 @@ function dayOnly(iso: string): string {
 	return iso.substring(0, 10);
 }
 
-// ─── Topic sorting / grouping ─────────────────────────────────────────────────
+// ─── Topic sorting ────────────────────────────────────────────────────────────
 
-/** Sorts topics by record date at day granularity (newest first), then by importance (major before minor). */
+/**
+ * Sorts topics by source date at day granularity (newest first), then by
+ * importance (major before minor).
+ *
+ * Source date is `generatedAt || commitDate`. Under v4 unified Hoist all topics
+ * on a squash/amend root share the root's date, so day-key falls equal and the
+ * sort collapses to importance order — which is what we want for the flat
+ * presentation model. v3 legacy data with cross-day topics still gets a
+ * meaningful day ordering.
+ */
 export function sortTopics(topics: Array<TopicWithDate>): Array<TopicWithDate> {
 	return [...topics].sort((a, b) => {
-		const dayA = a.recordDate ? dayOnly(a.recordDate) : "";
-		const dayB = b.recordDate ? dayOnly(b.recordDate) : "";
+		// dayOnly("") returns "" — no need for a separate ternary guard around
+		// the empty-date case. `||` falls through generatedAt → commitDate → "".
+		const dayA = dayOnly(a.generatedAt || a.commitDate || "");
+		const dayB = dayOnly(b.generatedAt || b.commitDate || "");
 		if (dayA !== dayB) {
 			return dayA > dayB ? -1 : 1;
 		}
@@ -97,21 +101,6 @@ export function sortTopics(topics: Array<TopicWithDate>): Array<TopicWithDate> {
 		return impA - impB;
 		/* v8 ignore stop */
 	});
-}
-
-/** Groups topics by date (YYYY-MM-DD). Preserves the sort order within each group. */
-export function groupTopicsByDate(topics: Array<TopicWithDate>): Map<string, Array<TopicWithDate>> {
-	const groups = new Map<string, Array<TopicWithDate>>();
-	for (const t of topics) {
-		const key = t.recordDate ? dayOnly(t.recordDate) : "unknown";
-		const list = groups.get(key);
-		if (list) {
-			list.push(t);
-		} else {
-			groups.set(key, [t]);
-		}
-	}
-	return groups;
 }
 
 /** Pads a number to 2 digits (e.g. 1 → "01", 12 → "12"). */
@@ -176,30 +165,26 @@ export function buildNotePushTitle(summary: CommitSummary, noteTitle: string): s
 // ─── Topic collection ─────────────────────────────────────────────────────────
 
 /**
- * Collects all topics from a summary tree, enriches multi-day squash topics
- * with a `recordDate`, and returns them sorted (newest first, major before minor).
+ * Collects all topics from a summary tree and returns them sorted (newest
+ * first, major before minor) with a stable `treeIndex` per topic for edit /
+ * delete operations.
  *
- * Also returns `showRecordDates` so callers know whether to render timeline groups.
+ * Returns `sourceNodes` for callers that render the "Source Commits" section.
+ *
+ * **Flat presentation model**: under v4 unified Hoist all topics on a squash
+ * or amend root share the root's date, so the previous "timeline grouping by
+ * day" feature degenerated into a single useless group. The grouping path was
+ * removed; topics now render as one flat list. Per-source date attribution
+ * still surfaces via the Source Commits section.
  */
 export function collectSortedTopics(summary: CommitSummary): {
 	topics: Array<TopicWithDate>;
 	sourceNodes: ReadonlyArray<CommitSummary>;
-	showRecordDates: boolean;
 } {
 	const sourceNodes = collectSourceNodes(summary);
-	const showRecordDates = sourceNodes.length > 1 && computeDurationDays(summary) > 1;
-	const collected = collectAllTopics(summary);
-	const topics = sortTopics(
-		collected.map((t, i) => {
-			const date = t.generatedAt || t.commitDate;
-			return {
-				...t,
-				treeIndex: i,
-				...(showRecordDates && date ? { recordDate: date } : {}),
-			};
-		}),
-	);
-	return { topics, sourceNodes, showRecordDates };
+	const collected = collectDisplayTopics(summary);
+	const topics = sortTopics(collected.map((t, i) => ({ ...t, treeIndex: i })));
+	return { topics, sourceNodes };
 }
 
 /**

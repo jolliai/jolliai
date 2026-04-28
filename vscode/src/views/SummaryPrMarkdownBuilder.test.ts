@@ -22,7 +22,6 @@ const mocks = vi.hoisted(() => ({
 		(e: { generatedAt?: string; commitDate: string }) =>
 			e.generatedAt || e.commitDate,
 	),
-	groupTopicsByDate: vi.fn(),
 	padIndex: vi.fn(),
 }));
 
@@ -39,7 +38,6 @@ vi.mock("../../../cli/src/core/SummaryFormat.js", () => ({
 	formatDate: mocks.formatDate,
 	formatFullDate: mocks.formatFullDate,
 	getDisplayDate: mocks.getDisplayDate,
-	groupTopicsByDate: mocks.groupTopicsByDate,
 	padIndex: mocks.padIndex,
 }));
 
@@ -89,12 +87,10 @@ function setupDefaults(
 	summary: CommitSummary,
 	topics: Array<TopicWithDate> = [makeTopic()],
 	sourceNodes: ReadonlyArray<CommitSummary> = [summary],
-	showRecordDates = false,
 ): void {
 	mocks.collectSortedTopics.mockReturnValue({
 		topics,
 		sourceNodes,
-		showRecordDates,
 	});
 	mocks.aggregateStats.mockReturnValue({
 		filesChanged: 3,
@@ -113,19 +109,6 @@ function setupDefaults(
 	mocks.padIndex.mockImplementation((i: number) =>
 		String(i + 1).padStart(2, "0"),
 	);
-	mocks.groupTopicsByDate.mockImplementation((ts: Array<TopicWithDate>) => {
-		const map = new Map<string, Array<TopicWithDate>>();
-		for (const t of ts) {
-			const key = t.recordDate ?? "unknown";
-			const list = map.get(key);
-			if (list) {
-				list.push(t);
-			} else {
-				map.set(key, [t]);
-			}
-		}
-		return map;
-	});
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
@@ -399,71 +382,23 @@ describe("SummaryPrMarkdownBuilder", () => {
 			});
 		});
 
-		describe("PR date-grouped topics with recordDate fallback", () => {
-			it("uses empty-string fallback for formatDate when recordDate is undefined in PR date-grouped mode", () => {
+		describe("flat topics rendering (no date grouping)", () => {
+			it("renders multiple topics as a flat list in PR mode", () => {
+				// Timeline grouping was removed: topics render flat regardless of
+				// source-commit count or date span.
 				const topics = [
-					makeTopic({ title: "PR No Date", recordDate: undefined }),
+					makeTopic({ title: "A", commitDate: "2026-03-30T10:00:00Z" }),
+					makeTopic({ title: "B", commitDate: "2026-03-29T10:00:00Z" }),
 				];
 				const summary = makeSummary();
-				setupDefaults(summary, topics, [summary], true);
-
-				const md = buildPrMarkdown(summary);
-
-				expect(mocks.formatDate).toHaveBeenCalledWith("");
-				expect(md).toContain("## Topic (1)");
-			});
-		});
-
-		describe("date-grouped PR truncation", () => {
-			it("renders date-grouped topics in PR mode when showRecordDates is true", () => {
-				const topics = [
-					makeTopic({ title: "A", recordDate: "2026-03-30T10:00:00Z" }),
-					makeTopic({ title: "B", recordDate: "2026-03-29T10:00:00Z" }),
-				];
-				const summary = makeSummary();
-				setupDefaults(summary, topics, [summary], true);
+				setupDefaults(summary, topics, [summary]);
 
 				const md = buildPrMarkdown(summary);
 
 				expect(md).toContain("## Topics (2)");
-				expect(md).toContain("### Mar 30, 2026");
+				expect(md).not.toMatch(/^### Mar \d+, 2026/m);
 				expect(md).toContain("<strong>01 · A</strong>");
 				expect(md).toContain("<strong>02 · B</strong>");
-			});
-
-			it("truncates date-grouped PR topics when exceeding limit", () => {
-				const longText = "w".repeat(25000);
-				const topics = [
-					makeTopic({
-						title: "Big1",
-						recordDate: "2026-03-30T10:00:00Z",
-						trigger: longText,
-						decisions: longText,
-						response: longText,
-					}),
-					makeTopic({
-						title: "Big2",
-						recordDate: "2026-03-29T10:00:00Z",
-						trigger: longText,
-						decisions: "small",
-						response: "small",
-					}),
-					makeTopic({
-						title: "Big3",
-						recordDate: "2026-03-28T10:00:00Z",
-						trigger: "small",
-						decisions: "small",
-						response: "small",
-					}),
-				];
-				const summary = makeSummary();
-				setupDefaults(summary, topics, [summary], true);
-
-				const md = buildPrMarkdown(summary);
-
-				if (md.includes("omitted")) {
-					expect(md).toMatch(/⚠️ \d+ more topic(s?) omitted/);
-				}
 			});
 		});
 
@@ -668,56 +603,6 @@ describe("SummaryPrMarkdownBuilder", () => {
 				expect(md).not.toContain("&lt;summary&gt;");
 				expect(md).not.toContain("&lt;br&gt;");
 				expect(md).not.toContain("&lt;img");
-			});
-
-			it("writes group header only once for multiple topics in same date group", () => {
-				const sharedDate = "2026-03-30T10:00:00Z";
-				const topics = [
-					makeTopic({ title: "First", recordDate: sharedDate }),
-					makeTopic({ title: "Second", recordDate: sharedDate }),
-				];
-				const summary = makeSummary();
-				setupDefaults(summary, topics, [summary], true);
-
-				const md = buildPrMarkdown(summary);
-
-				expect((md.match(/### Mar 30, 2026/g) ?? []).length).toBe(1);
-				expect(md).toContain("<strong>01 · First</strong>");
-				expect(md).toContain("<strong>02 · Second</strong>");
-				expect((md.match(/<details>/g) ?? []).length).toBe(2);
-			});
-
-			it("skips orphan group header when its first topic does not fit", () => {
-				const longText = "g".repeat(25000);
-				const topics = [
-					makeTopic({
-						title: "SmallGroup1",
-						recordDate: "2026-03-30T10:00:00Z",
-						trigger: "ok",
-						decisions: "ok",
-						response: "ok",
-					}),
-					makeTopic({
-						title: "HugeGroup2First",
-						recordDate: "2026-03-29T10:00:00Z",
-						trigger: longText,
-						decisions: longText,
-						response: longText,
-					}),
-				];
-				mocks.formatDate.mockImplementation((d: string) =>
-					d.startsWith("2026-03-30") ? "Mar 30, 2026" : "Mar 29, 2026",
-				);
-				const summary = makeSummary();
-				setupDefaults(summary, topics, [summary], true);
-
-				const md = buildPrMarkdown(summary);
-
-				expect(md).toContain("### Mar 30, 2026");
-				expect(md).toContain("SmallGroup1");
-				expect(md).not.toContain("### Mar 29, 2026");
-				expect(md).not.toContain("HugeGroup2First");
-				expect(md).toMatch(/⚠️ \d+ more topic(s?) omitted/);
 			});
 
 			it("preserves topic atomicity: oversized topic writes neither <details> nor </details>", () => {

@@ -148,9 +148,18 @@ vi.mock("../core/TranscriptReader.js", () => ({
 	readTranscript: mockReadTranscript,
 }));
 
-vi.mock("../core/Summarizer.js", () => ({
-	generateSummary: mockGenerateSummary,
-}));
+vi.mock("../core/Summarizer.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/Summarizer.js")>();
+	return {
+		generateSummary: mockGenerateSummary,
+		// Mock LLM-touching squash consolidation; default null forces the
+		// caller into the (real) mechanicalConsolidate fallback.
+		generateSquashConsolidation: vi.fn().mockResolvedValue(null),
+		mechanicalConsolidate: actual.mechanicalConsolidate,
+		extractTicketIdFromMessage: actual.extractTicketIdFromMessage,
+		formatSourceCommitsForSquash: actual.formatSourceCommitsForSquash,
+	};
+});
 
 vi.mock("../core/CodexSessionDiscoverer.js", () => ({
 	discoverCodexSessions: mockDiscoverCodexSessions,
@@ -728,7 +737,9 @@ describe("PostCommitHook helpers", () => {
 			});
 			mockLoadAllSessions.mockResolvedValue([]);
 			mockLoadConfig.mockResolvedValue({});
-			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 1, deletions: 0 });
+			// Short-circuit A fires when transcript is empty AND diff is small.
+			// To exercise the LLM path here we need a non-trivial delta (>10 lines).
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 50, deletions: 0 });
 			mockGetDiffContent.mockResolvedValue("diff");
 
 			await __test__.handleAmendPipeline(
@@ -738,7 +749,14 @@ describe("PostCommitHook helpers", () => {
 				0,
 			);
 
-			expect(mockStoreSummary).toHaveBeenCalledWith(
+			// With non-trivial delta, the pipeline runs step 1 (summarize) and writes the
+			// new root via storeSummary. transcript artifact is undefined (no sessions),
+			// so the 4th arg is omitted -- match on the prefix the test cares about.
+			const calls = vi.mocked(mockStoreSummary).mock.calls;
+			expect(calls.length).toBeGreaterThanOrEqual(1);
+			const [root, cwdArg] = calls[0];
+			expect(cwdArg).toBe("/repo");
+			expect(root).toEqual(
 				expect.objectContaining({
 					jolliDocId: 52,
 					jolliDocUrl: "https://jolli.app/articles/52",
@@ -746,9 +764,6 @@ describe("PostCommitHook helpers", () => {
 					plans: [expect.objectContaining({ slug: "plan-2" })],
 					e2eTestGuide: [expect.objectContaining({ title: "Scenario 2" })],
 				}),
-				"/repo",
-				false,
-				expect.anything(),
 			);
 		});
 	});

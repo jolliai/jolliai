@@ -40,15 +40,26 @@ vi.mock("../core/TranscriptReader.js", () => ({
 	buildMultiSessionContext: vi.fn().mockReturnValue(""),
 }));
 
-vi.mock("../core/Summarizer.js", () => ({
-	generateSummary: vi.fn().mockResolvedValue({
-		transcriptEntries: 0,
-		conversationTurns: 0,
-		llm: { model: "test", inputTokens: 0, outputTokens: 0, apiLatencyMs: 0, stopReason: "end_turn" },
-		stats: { filesChanged: 1, insertions: 5, deletions: 2 },
-		topics: [{ title: "Test topic", trigger: "test", response: "done", decisions: "none" }],
-	}),
-}));
+vi.mock("../core/Summarizer.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/Summarizer.js")>();
+	return {
+		generateSummary: vi.fn().mockResolvedValue({
+			transcriptEntries: 0,
+			conversationTurns: 0,
+			llm: { model: "test", inputTokens: 0, outputTokens: 0, apiLatencyMs: 0, stopReason: "end_turn" },
+			stats: { filesChanged: 1, insertions: 5, deletions: 2 },
+			topics: [{ title: "Test topic", trigger: "test", response: "done", decisions: "none" }],
+		}),
+		// Mock the LLM-touching path; default behaviour returns null so the
+		// caller falls through to the (real) mechanicalConsolidate.
+		generateSquashConsolidation: vi.fn().mockResolvedValue(null),
+		// Real implementations for the pure helpers -- runSquashPipeline /
+		// handleAmendPipeline rely on their actual behaviour.
+		mechanicalConsolidate: actual.mechanicalConsolidate,
+		extractTicketIdFromMessage: actual.extractTicketIdFromMessage,
+		formatSourceCommitsForSquash: actual.formatSourceCommitsForSquash,
+	};
+});
 
 vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/SummaryStore.js")>();
@@ -59,7 +70,13 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		migrateOneToOne: vi.fn(),
 		storePlans: vi.fn(),
 		storeNotes: vi.fn(),
+		// Real implementations -- runSquashPipeline / handleAmendPipeline call
+		// these to expand source commits and copy-hoist topics. The mocks above
+		// cover the storage write side; these helpers are pure tree transforms
+		// so we want their actual behaviour in tests.
 		stripFunctionalMetadata: actual.stripFunctionalMetadata,
+		resolveEffectiveTopics: actual.resolveEffectiveTopics,
+		expandSourcesForConsolidation: actual.expandSourcesForConsolidation,
 	};
 });
 
@@ -559,11 +576,14 @@ describe("QueueWorker", () => {
 				"/test/cwd",
 			);
 
+			// runSquashPipeline calls mergeManyToOne with a 5th `consolidated`
+			// argument (LLM result or mechanicalConsolidate fallback).
 			expect(mergeManyToOne).toHaveBeenCalledWith(
 				expect.any(Array),
 				expect.objectContaining({ hash: "newhash123" }),
 				"/test/cwd",
 				expect.objectContaining({ commitSource: "cli", commitType: "squash" }),
+				expect.objectContaining({ topics: expect.any(Array) }),
 			);
 		});
 	});

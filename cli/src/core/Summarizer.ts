@@ -72,6 +72,8 @@ export interface SummaryResult {
 	readonly topics: ReadonlyArray<TopicSummary>;
 	/** Ticket/issue identifier extracted by LLM from commit message, branch, or conversation */
 	readonly ticketId?: string;
+	/** Quick recap paragraph extracted by LLM (Consolidate-Hoist field; see CommitSummary.recap) */
+	readonly recap?: string;
 }
 
 /** Parameters for generating a summary */
@@ -113,20 +115,24 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 
 	const { config } = params;
 
-	// Classify work size to select the appropriate template variant
-	const totalLines = diffStats.insertions + diffStats.deletions;
-	const workSize = totalLines <= 100 ? "small" : totalLines <= 500 ? "medium" : "large";
-
+	// The `summarize` prompt is self-contained: topic-count guidance is embedded
+	// as a three-bucket rule (rule 6) in the prompt itself, so the LLM gauges
+	// scope from the diff directly. We previously bucketed in the CLI by total
+	// changed lines, but that leaked an implementation detail across the
+	// caller/backend boundary and risked silent failure if a caller forgot the
+	// associated `topicGuidance` placeholder param. Self-contained prompt =
+	// one less contract to misconfigure.
+	const sharedParams = {
+		commitHash: commitInfo.hash,
+		commitMessage: commitInfo.message,
+		commitAuthor: commitInfo.author,
+		commitDate: commitInfo.date,
+		conversation,
+		diff,
+	};
 	const llmResult = await callLlm({
-		action: `summarize:${workSize}`,
-		params: {
-			commitHash: commitInfo.hash,
-			commitMessage: commitInfo.message,
-			commitAuthor: commitInfo.author,
-			commitDate: commitInfo.date,
-			conversation,
-			diff,
-		},
+		action: "summarize",
+		params: sharedParams,
 		maxTokens: DEFAULT_MAX_TOKENS,
 		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
@@ -134,20 +140,80 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 	});
 
 	// Parse raw LLM text (both direct and proxy modes return raw text)
-	const responseText = llmResult.text ?? "";
+	let responseText = llmResult.text ?? "";
 	log.debug("=== LLM raw response START ===");
 	log.debug("%s", responseText);
 	log.debug("=== LLM raw response END ===");
 
-	const parsed = parseSummaryResponse(responseText);
+	let parsed = parseSummaryResponse(responseText);
 	log.info("Summary parsed: %d topic(s), response length: %d chars", parsed.topics.length, responseText.length);
 
-	// Log full LLM response only on true parse failure (not intentional rule-16 empty).
-	// Uses error level to guarantee file persistence regardless of configured log level.
-	if (parsed.topics.length === 0 && !parsed.intentionallyEmpty) {
-		log.error("=== LLM raw response (no topics parsed) START ===");
+	// Format-failure retry: when the first response is non-empty AND its first
+	// non-blank line is not a recognized top-level marker, the model emitted
+	// markdown / prose instead of the delimited format (typically when the
+	// transcript itself is markdown-heavy). Retry once with the strict template,
+	// which prepends the failed response and a correction header. Single-shot
+	// retry only -- if the second call also fails format compliance, accept the
+	// first-response result rather than spend further LLM cost.
+	//
+	// Empty responses and legitimate recap-only / ticket-only responses ARE
+	// format-compliant by isFormatCompliant() and skip the retry path entirely.
+	let llmMeta: LlmCallMetadata = {
+		model: llmResult.model ?? resolveModelId(config.model),
+		inputTokens: llmResult.inputTokens,
+		outputTokens: llmResult.outputTokens,
+		apiLatencyMs: llmResult.apiLatencyMs,
+		stopReason: llmResult.stopReason ?? null,
+	};
+	if (!isFormatCompliant(responseText)) {
+		log.error("=== LLM raw response (format-incompliant) START ===");
 		log.error("%s", responseText);
-		log.error("=== LLM raw response (no topics parsed) END ===");
+		log.error("=== LLM raw response (format-incompliant) END ===");
+		log.warn(
+			"First response was format-incompliant (length=%d, first line did not match any top-level marker) -- retrying with strict format reminder",
+			responseText.length,
+		);
+		try {
+			const retryResult = await callLlm({
+				action: "summarize-strict",
+				params: {
+					...sharedParams,
+					previousResponse: truncateForRetry(responseText),
+				},
+				maxTokens: DEFAULT_MAX_TOKENS,
+				apiKey: config.apiKey,
+				model: resolveModelId(config.model),
+				jolliApiKey: config.jolliApiKey,
+			});
+			const retryText = retryResult.text ?? "";
+			log.debug("=== LLM strict-retry response START ===");
+			log.debug("%s", retryText);
+			log.debug("=== LLM strict-retry response END ===");
+			if (isFormatCompliant(retryText)) {
+				const retryParsed = parseSummaryResponse(retryText);
+				log.info(
+					"Strict-retry produced format-compliant response (%d topic(s), %d chars) -- using retry result",
+					retryParsed.topics.length,
+					retryText.length,
+				);
+				parsed = retryParsed;
+				responseText = retryText;
+				llmMeta = {
+					model: retryResult.model ?? resolveModelId(config.model),
+					inputTokens: llmMeta.inputTokens + retryResult.inputTokens,
+					outputTokens: llmMeta.outputTokens + retryResult.outputTokens,
+					apiLatencyMs: llmMeta.apiLatencyMs + retryResult.apiLatencyMs,
+					stopReason: retryResult.stopReason ?? null,
+				};
+			} else {
+				log.warn("Strict-retry response was also format-incompliant -- accepting first-response result");
+			}
+		} catch (err) {
+			log.warn(
+				"Strict-retry call failed: %s -- accepting first-response result",
+				err instanceof Error ? err.message : String(err),
+			);
+		}
 	}
 	for (const [i, topic] of parsed.topics.entries()) {
 		log.info("  Topic %d: %s", i + 1, topic.title.substring(0, 80));
@@ -155,23 +221,32 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 	if (parsed.ticketId) {
 		log.info("Ticket ID: %s", parsed.ticketId);
 	}
-
-	const llm: LlmCallMetadata = {
-		model: llmResult.model ?? resolveModelId(config.model),
-		inputTokens: llmResult.inputTokens,
-		outputTokens: llmResult.outputTokens,
-		apiLatencyMs: llmResult.apiLatencyMs,
-		stopReason: llmResult.stopReason ?? null,
-	};
+	if (parsed.recap) {
+		log.info("Recap (%d chars): %s", parsed.recap.length, parsed.recap.substring(0, 120));
+	}
 
 	return {
 		transcriptEntries,
 		...(params.conversationTurns !== undefined && { conversationTurns: params.conversationTurns }),
-		llm,
+		llm: llmMeta,
 		stats: diffStats,
 		topics: parsed.topics,
 		...(parsed.ticketId && { ticketId: parsed.ticketId }),
+		...(parsed.recap && { recap: parsed.recap }),
 	};
+}
+
+/**
+ * Truncates a failed response before embedding it into the strict-retry prompt.
+ * Bounded so the retry's input tokens stay reasonable; the model only needs to
+ * see the head + tail of the malformed output to recognize the format mistake.
+ */
+function truncateForRetry(text: string): string {
+	const MAX = 4000;
+	if (text.length <= MAX) return text;
+	const head = text.slice(0, MAX - 200);
+	const tail = text.slice(-200);
+	return `${head}\n\n[... truncated ${text.length - MAX} chars ...]\n\n${tail}`;
 }
 
 /**
@@ -184,25 +259,23 @@ const EMPTY_DECISIONS_RE = /^(no\s+(design\s+)?decisions?\s+recorded|n\/?a|none\
 export function parseSummaryResponse(responseText: string): {
 	topics: ReadonlyArray<TopicSummary>;
 	ticketId?: string;
-	intentionallyEmpty?: boolean;
+	recap?: string;
 } {
-	const { topics: raw, ticketId, intentionallyEmpty } = parseTopicsResponse(responseText);
+	const { topics: raw, ticketId, recap } = parseTopicsResponse(responseText);
 	// Drop topics whose decisions field is empty or a placeholder --
 	// a topic with no meaningful decisions adds noise, not value.
 	const topics = raw.filter((t) => t.decisions.trim().length > 0 && !EMPTY_DECISIONS_RE.test(t.decisions.trim()));
 	if (topics.length < raw.length) {
 		log.info("Filtered %d topic(s) with empty/placeholder decisions", raw.length - topics.length);
 	}
-	return { topics, ticketId, intentionallyEmpty };
+	return {
+		topics,
+		...(ticketId && { ticketId }),
+		...(recap && { recap }),
+	};
 }
 
 // --- Delimited text format constants ------------------------------------------
-
-/**
- * Regex that matches the explicit "no topics" signal on its own line.
- * The LLM emits this when rule 16 causes all topics to be omitted.
- */
-const NO_TOPICS_RE = /^\s*===NO_TOPICS===\s*$/m;
 
 /**
  * Regex that matches the topic delimiter ONLY when it appears on its own line
@@ -222,6 +295,84 @@ const KNOWN_FIELDS = new Set([
 	"CATEGORY",
 	"IMPORTANCE",
 ]);
+
+/**
+ * Top-level markers that may legitimately appear as the first non-blank line
+ * of an LLM response. Single source of truth for the format-compliance check
+ * used by the strict-retry trigger in generateSummary / generateSquashConsolidation.
+ *
+ * **When extending the delimited format with a NEW top-level field, this is
+ * one of FIVE coordinated touch points:**
+ *   1. Add the marker to this Set.
+ *   2. Update SUMMARIZE / SQUASH_CONSOLIDATE prompt rules + example block in
+ *      [PromptTemplates.ts](./PromptTemplates.ts) so the LLM knows about it.
+ *   3. Update parseTopLevelFields() and TOP_LEVEL_FIELD_NAMES (plus the regex
+ *      alternation in TOP_LEVEL_SCAN_RE) to extract the new field's value
+ *      from anywhere in the LLM response.
+ *   4. Add the field to SummaryResult / CommitSummary types in
+ *      [Types.ts](../Types.ts) and the Hoist strip helpers in SummaryStore.ts.
+ *   5. Update display builders -- SummaryMarkdownBuilder, the VSCode HTML
+ *      builder, and the PR markdown builder -- to render the new field.
+ *
+ * Topic-internal field markers (---TITLE---, ---DECISIONS---, etc. -- see
+ * KNOWN_FIELDS above) are NOT in this Set: they appear only INSIDE a
+ * ===TOPIC=== block, never as the first line of a response.
+ */
+export const TOP_LEVEL_MARKERS: ReadonlySet<string> = new Set([
+	"===SUMMARY===",
+	"===TOPIC===",
+	"---TICKETID---",
+	"---RECAP---",
+]);
+
+/**
+ * Sentinel that marks the start of a structured summary response. Required as
+ * the first line of every SUMMARIZE / SQUASH_CONSOLIDATE response (new format,
+ * v3+); also used as the assistant-turn prefill so the model physically cannot
+ * drift into markdown / prose at the start of its response.
+ *
+ * Legacy responses (no sentinel — old prompt seeded in proxy backends) are still
+ * accepted: parseTopLevelFields treats the leading sentinel as optional.
+ */
+export const SUMMARY_SENTINEL = "===SUMMARY===";
+
+// NOTE: Assistant-turn prefill (passing `===SUMMARY===` as a pre-filled
+// assistant message so the model physically cannot drift to markdown) was
+// prototyped on top of this sentinel but had to be removed: claude-sonnet-4-6
+// returned 400 "This model does not support assistant message prefill" in
+// production (commit 9ef56ce4, 2026-04-28). The sentinel itself remains
+// useful — the prompt instructs the LLM to start with it, and the parser
+// peels it via stripSummarySentinel when present. If a future model variant
+// re-enables prefill, see git history for the LlmCallOptions.assistantPrefill
+// + callDirect messages-array wiring; until then the format-compliance
+// guarantee comes from prompt hardening + strict-retry alone.
+
+/**
+ * Returns true when the LLM response either (a) is empty after trim
+ * (legitimate "trivial commit" output per SUMMARIZE rule 16), or (b) has its
+ * first non-blank line equal to / starting with one of the top-level markers.
+ *
+ * Used as the strict-retry trigger: format-incompliant responses (markdown
+ * headers, prose introductions, tables) yield false here and trigger a single
+ * retry against the strict template. Compliant responses -- including
+ * empty-but-legitimate ones -- are accepted as-is.
+ *
+ * **Why startsWith for ===SUMMARY===:** with assistant-turn prefill the
+ * response always starts with `===SUMMARY===` followed by the model's
+ * continuation. Claude usually emits a `\n` immediately after, but if it
+ * occasionally elides the newline (e.g. continues with `---RECAP---` directly
+ * on the same line) the first line becomes `===SUMMARY===---RECAP---`. The
+ * parser handles both via stripSummarySentinel, so isFormatCompliant accepts
+ * any first line that starts with the sentinel rather than demanding exact
+ * equality.
+ */
+export function isFormatCompliant(text: string): boolean {
+	const trimmed = text.trim();
+	if (trimmed.length === 0) return true;
+	const firstLine = trimmed.split(/\r?\n/, 1)[0]?.trim() ?? "";
+	if (firstLine.startsWith(SUMMARY_SENTINEL)) return true;
+	return TOP_LEVEL_MARKERS.has(firstLine);
+}
 
 /**
  * Parses an AI response in delimited plain-text format into TopicSummary objects.
@@ -316,18 +467,25 @@ function parseDelimitedTopics(text: string): ReadonlyArray<TopicSummary> | null 
 // --- Unified response parser -------------------------------------------------
 
 /**
- * Internal helper: parses response text into a TopicSummary array.
+ * Internal helper: parses response text into a TopicSummary array plus any
+ * pre-topic fields (ticketId, recap).
  *
  * Routing strategy:
  *   1. If the text contains ===TOPIC===, parse as delimited plain text.
- *   2. If only ---TICKETID--- is present (no topics), return empty topics.
- *   3. Last-resort fallback: store raw text as a single error topic.
+ *   2. Otherwise return empty topics (no sentinel needed — the presence/absence
+ *      of ===TOPIC=== markers is the only signal the parser needs).
+ *
+ * Top-level fields (TICKETID, RECAP, plus any future fields) are always
+ * extracted via parseTopLevelFields, which scans the entire response (not
+ * just the preamble) so a trailing ---RECAP--- after the last topic is still
+ * recovered. Topic body is parsed from the sanitized text returned by that
+ * helper, with marker+content excised so it cannot leak into the last topic's
+ * field-fallthrough path.
  */
 interface ParsedResponse {
 	readonly topics: ReadonlyArray<TopicSummary>;
 	readonly ticketId?: string;
-	/** True when the LLM explicitly signalled no topics via ===NO_TOPICS=== (rule 16). */
-	readonly intentionallyEmpty?: boolean;
+	readonly recap?: string;
 }
 
 function parseTopicsResponse(responseText: string): ParsedResponse {
@@ -338,54 +496,142 @@ function parseTopicsResponse(responseText: string): ParsedResponse {
 		text = fenced[1].trim();
 	}
 
-	// Extract pre-topic ticketId (appears before the first ===TOPIC===)
-	const ticketId = extractPreTopicTicketId(text);
+	// Extract top-level fields (ticketId, recap) from anywhere outside
+	// ===TOPIC=== blocks, returning a sanitized text with marker+content
+	// excised. This is robust to the LLM placing ---RECAP--- at the end of the
+	// response (after the last topic) instead of in the preamble: a real LLM
+	// failure mode observed in production where the recap was silently dropped
+	// AND the trailing marker polluted the last topic's IMPORTANCE field.
+	const { sanitizedText, ticketId, recap } = parseTopLevelFields(text);
 
 	// -- Route 1: delimited plain-text format --
 	// Use line-anchored regex to avoid false positives when the LLM mentions
 	// the delimiter inline (e.g. inside backticks or prose about the format).
-	const hasDelimitedFormat = TOPIC_DELIMITER_RE.test(text);
+	const hasDelimitedFormat = TOPIC_DELIMITER_RE.test(sanitizedText);
 	if (hasDelimitedFormat) {
-		const topics = parseDelimitedTopics(text);
+		const topics = parseDelimitedTopics(sanitizedText);
 		if (topics && topics.length > 0) {
 			log.info("Parsed %d topic(s) from delimited text format", topics.length);
-			return { topics, ticketId };
+			return {
+				topics,
+				...(ticketId && { ticketId }),
+				...(recap && { recap }),
+			};
 		}
 		log.warn("Delimited format detected but parsing yielded 0 topics");
 	}
 
-	// -- Route 2: explicit "no topics" signal --
-	// LLM emits ===NO_TOPICS=== when rule 16 causes all topics to be omitted.
-	// This is an intentional empty response, not a parse failure.
-	if (NO_TOPICS_RE.test(text)) {
-		log.info("LLM signalled no topics (rule 16 applied)");
-		return { topics: [], ticketId, intentionallyEmpty: true };
-	}
-
-	// -- Fallback: no structured topics found --
-	// Return empty topics -- the raw LLM response is already in debug.log
-	// (logged by the caller before parsing). No need to store garbage data
-	// in the summary tree.
-	log.warn("No structured topics found in LLM response -- returning empty summary");
-	return { topics: [], ticketId };
+	// -- Fallback: no ===TOPIC=== markers found --
+	// This is the expected outcome when rule 16 omits all topics. Return
+	// empty topics (with any extracted ticketId / recap). If the response was
+	// malformed, the caller's error-level log will capture it.
+	log.info("No ===TOPIC=== sections in LLM response -- returning empty topics");
+	return {
+		topics: [],
+		...(ticketId && { ticketId }),
+		...(recap && { recap }),
+	};
 }
 
 /**
- * Extracts the ---TICKETID--- field from the text before the first ===TOPIC===.
- * Also accepts lowercase ---ticketId--- for backward compatibility.
- * Returns undefined if not found.
+ * Top-level field marker names (paired set with TOP_LEVEL_MARKERS, but for the
+ * `---FIELDNAME---` form rather than the full marker line). Per rule 18 the LLM
+ * is forbidden from emitting these markers inside topic content, which makes
+ * "any ---TICKETID--- / ---RECAP--- line outside a ===TOPIC=== block is a real
+ * top-level field" a safe parsing invariant.
  */
-function extractPreTopicTicketId(text: string): string | undefined {
-	const topicIdx = text.search(TOPIC_DELIMITER_RE);
-	const preamble = topicIdx >= 0 ? text.substring(0, topicIdx) : text;
-	const match = preamble.match(/^---(?:TICKETID|ticketId)---\s*\n(.+)/m);
-	if (match) {
-		const id = match[1].trim();
-		/* v8 ignore start -- regex uses .+, so a matched ticket line is never empty after trimming */
-		return id.length > 0 ? id : undefined;
+const TOP_LEVEL_FIELD_NAMES: ReadonlySet<string> = new Set(["TICKETID", "RECAP"]);
+
+/**
+ * Combined regex for one-pass scan: matches either a ===TOPIC=== anchor or a
+ * top-level field marker (---TICKETID--- / ---RECAP---) on its own line. Case-
+ * insensitive for back-compat with older summaries that used `---ticketId---`.
+ */
+const TOP_LEVEL_SCAN_RE = /^[ \t]*(?:(===TOPIC===)|---(TICKETID|RECAP)---)[ \t]*$/gim;
+
+/**
+ * Strips the leading `===SUMMARY===` sentinel line if present. The sentinel
+ * marks the start of a structured response (new format, v3+); legacy responses
+ * without it still parse correctly because we only strip when the very first
+ * non-blank line matches.
+ */
+function stripSummarySentinel(text: string): string {
+	return text.replace(/^\s*===SUMMARY===[ \t]*\r?\n?/i, "");
+}
+
+/**
+ * Extracts top-level fields (TICKETID, RECAP) from anywhere in the LLM response
+ * outside ===TOPIC=== blocks, and returns a sanitized text with those marker+
+ * content regions excised so downstream topic parsing does not absorb them.
+ *
+ * **Why scan the whole text, not just the preamble:** the prompt asks the LLM
+ * to put ---RECAP--- before the first ===TOPIC===, but the strict-retry path
+ * reliably produces the recap AT THE END (after the last topic) in some cases
+ * — observed in production on commit 922f603e. The preamble-only parser
+ * silently dropped the recap AND the trailing marker polluted the last topic's
+ * IMPORTANCE field via the unknown-field-fallthrough in parseDelimitedTopics.
+ *
+ * **Excision strategy:** for every ---TICKETID--- / ---RECAP--- match, the
+ * field's content runs from end-of-marker to the next match (===TOPIC=== or
+ * another top-level marker) or EOF. We strip the entire marker+content span
+ * from the sanitized output so parseDelimitedTopics sees a clean topic body.
+ *
+ * **First-occurrence wins:** if the LLM emits the same field twice (e.g. once
+ * in preamble and again at the end), the first occurrence wins. This matches
+ * the prompt's expectation that the preamble copy is canonical when present.
+ */
+export function parseTopLevelFields(text: string): {
+	sanitizedText: string;
+	ticketId?: string;
+	recap?: string;
+} {
+	// Peel the leading ===SUMMARY=== sentinel (new format) before scanning so
+	// the rest of the parser sees a clean preamble. Legacy responses without
+	// the sentinel are unaffected — stripSummarySentinel is a no-op when the
+	// first line is something else.
+	const peeled = stripSummarySentinel(text);
+	const matches = [...peeled.matchAll(TOP_LEVEL_SCAN_RE)];
+
+	const fields: { ticketId?: string; recap?: string } = {};
+	let cursor = 0;
+	let sanitized = "";
+
+	for (let i = 0; i < matches.length; i++) {
+		const m = matches[i];
+		// m[1] = "===TOPIC===" (when topic anchor matched), m[2] = "TICKETID"|"RECAP" (when field marker matched)
+		const fieldName = m[2]?.toUpperCase();
+		/* v8 ignore start -- matchAll always provides .index for /g regex matches */
+		const startOfMarker = m.index ?? 0;
 		/* v8 ignore stop */
+		const endOfMarker = startOfMarker + m[0].length;
+		const nextMatchStart = i + 1 < matches.length ? (matches[i + 1].index ?? peeled.length) : peeled.length;
+
+		if (!fieldName) {
+			// ===TOPIC=== — leave it (and its body) intact for parseDelimitedTopics
+			sanitized += peeled.substring(cursor, endOfMarker);
+			cursor = endOfMarker;
+			continue;
+		}
+
+		// Top-level field marker: capture content (first occurrence wins) and
+		// excise marker+content from the sanitized stream.
+		const content = peeled.substring(endOfMarker, nextMatchStart).trim();
+		if (content.length > 0 && TOP_LEVEL_FIELD_NAMES.has(fieldName)) {
+			if (fieldName === "TICKETID" && fields.ticketId === undefined) {
+				fields.ticketId = content;
+			} else if (fieldName === "RECAP" && fields.recap === undefined) {
+				fields.recap = content;
+			}
+		}
+
+		// Append text up to (not including) the marker; skip over marker+content.
+		sanitized += peeled.substring(cursor, startOfMarker);
+		cursor = nextMatchStart;
 	}
-	return undefined;
+
+	sanitized += peeled.substring(cursor);
+
+	return { sanitizedText: sanitized, ...fields };
 }
 
 /**
@@ -627,8 +873,23 @@ export async function generateE2eTest(params: E2eTestParams): Promise<ReadonlyAr
 	log.info("Generating E2E test guide for: %s", params.commitMessage.substring(0, 60));
 
 	const { config } = params;
-	const maxScenarios = params.topics.length <= 3 ? 5 : 10;
-	const topicsSummary = params.topics
+	// Filter to major topics before building topicsSummary. Minor topics
+	// (formatting, config tweaks, version bumps, doc-only changes) are not
+	// worth a manual E2E walkthrough; the prompt's rule 12 caps total scenarios
+	// aggressively, so spending one of those slots on a minor topic crowds out
+	// the user-facing changes that actually need verification.
+	//
+	// Topics without an `importance` field default to inclusion -- legacy
+	// summaries from before the field existed get a scenario, matching the
+	// previous behaviour (the LLM still applies rule 7 to skip non-verifiable
+	// internal-only changes).
+	const majorTopics = params.topics.filter((t) => t.importance !== "minor");
+	if (majorTopics.length === 0) {
+		log.info("E2E test guide: no major topics to test -- returning 0 scenarios");
+		return [];
+	}
+
+	const topicsSummary = majorTopics
 		.map((t, i) => `### Topic ${i + 1}: ${t.title}\n- **Trigger:** ${t.trigger}\n- **Response:** ${t.response}`)
 		.join("\n\n");
 	const llmResult = await callLlm({
@@ -637,7 +898,6 @@ export async function generateE2eTest(params: E2eTestParams): Promise<ReadonlyAr
 			commitMessage: params.commitMessage,
 			topicsSummary,
 			diff: params.diff,
-			maxScenarios: String(maxScenarios),
 		},
 		maxTokens: DEFAULT_MAX_TOKENS,
 		apiKey: config.apiKey,
@@ -646,7 +906,7 @@ export async function generateE2eTest(params: E2eTestParams): Promise<ReadonlyAr
 	});
 
 	const scenarios = parseE2eTestResponse(llmResult.text ?? "");
-	log.info("E2E test guide parsed: %d scenario(s)", scenarios.length);
+	log.info("E2E test guide parsed: %d scenario(s) from %d major topic(s)", scenarios.length, majorTopics.length);
 	return scenarios;
 }
 
@@ -767,4 +1027,307 @@ function validateTopicSummary(item: unknown, index: number): TopicSummary {
 		...(category !== undefined && { category }),
 		...(importance !== undefined && { importance }),
 	};
+}
+
+// --- Squash consolidation ----------------------------------------------------
+
+/**
+ * Pattern matching a project ticket prefix in a commit message or branch name.
+ * Recognises forms like "PROJ-123", "FEAT-456", "JOLLI-789".
+ */
+const TICKET_PATTERN = /[A-Z][A-Z0-9]+-\d+/;
+
+/**
+ * Extracts the canonical (uppercase) ticket identifier from a commit message,
+ * branch name, or any text that may contain a "PROJ-123" style reference.
+ * Returns undefined when no recognisable ticket appears in the input.
+ *
+ * Used by:
+ *   - runSquashPipeline to derive the outer ticketId hint from the squash
+ *     commit message (highest-priority hint, beats per-source ticketIds).
+ *   - SummaryFormat.buildPanelTitle as the legacy fallback for older summaries
+ *     written before the structured ticketId field existed.
+ */
+export function extractTicketIdFromMessage(text: string): string | undefined {
+	const match = text.match(TICKET_PATTERN);
+	return match ? match[0].toUpperCase() : undefined;
+}
+
+/**
+ * One squashed source commit fed into squash-consolidate.
+ *
+ * `ticketId` is per-source -- the ticket recorded for that individual commit
+ * (extracted at its own summarize time). Callers MAY pass any source order;
+ * generateSquashConsolidation sorts internally before rendering the prompt.
+ */
+export interface SquashConsolidationSource {
+	readonly commitHash: string;
+	readonly commitDate: string;
+	readonly commitMessage: string;
+	readonly ticketId?: string;
+	readonly recap?: string;
+	readonly topics: ReadonlyArray<TopicSummary>;
+}
+
+/** Parameters for generateSquashConsolidation. */
+export interface SquashConsolidationParams {
+	readonly squashCommitMessage: string;
+	/**
+	 * Explicit ticket extracted from the squash commit message itself (highest
+	 * priority hint to the LLM and to the post-call ticketId resolution).
+	 * When unset, generateSquashConsolidation falls back to the first source's
+	 * ticketId (after oldest-first sort), then to the LLM-extracted value.
+	 */
+	readonly ticketId?: string;
+	readonly sources: ReadonlyArray<SquashConsolidationSource>;
+	readonly config: LlmConfig;
+}
+
+/** Output from generateSquashConsolidation when the LLM call succeeds. */
+export interface SquashConsolidationResult {
+	readonly topics: ReadonlyArray<TopicSummary>;
+	readonly recap?: string;
+	readonly ticketId?: string;
+	readonly llm: LlmCallMetadata;
+}
+
+/**
+ * Sorts sources by commitDate ascending (oldest first). Internal contract of
+ * generateSquashConsolidation and mechanicalConsolidate -- callers MAY pass
+ * any order, the prompt always renders oldest-first per "Source Commits
+ * (oldest first -- authoritative chronological order)" rule.
+ */
+function sortSourcesOldestFirst(
+	sources: ReadonlyArray<SquashConsolidationSource>,
+): ReadonlyArray<SquashConsolidationSource> {
+	return [...sources].sort((a, b) => new Date(a.commitDate).getTime() - new Date(b.commitDate).getTime());
+}
+
+/**
+ * Renders a {{sourceCommitsBlock}} for the squash-consolidate prompt. Each
+ * source becomes a "=== Commit i of N ===" block with its hash, date, message,
+ * optional recap, and per-topic summary. Missing fields drop entire lines (no
+ * placeholder strings) -- the prompt itself forbids "None" / "N/A" output.
+ *
+ * Exported so the Worker can compute prompt previews if needed; primary caller
+ * is generateSquashConsolidation.
+ */
+export function formatSourceCommitsForSquash(sources: ReadonlyArray<SquashConsolidationSource>): string {
+	const ordered = sortSourcesOldestFirst(sources);
+	const total = ordered.length;
+	return ordered
+		.map((src, i) => {
+			const lines: string[] = [`=== Commit ${i + 1} of ${total} ===`];
+			lines.push(`Hash: ${src.commitHash.substring(0, 8)}`);
+			lines.push(`Date: ${src.commitDate.substring(0, 10)}`);
+			lines.push(`Message: ${src.commitMessage}`);
+			if (src.ticketId) lines.push(`Ticket: ${src.ticketId}`);
+			if (src.recap) lines.push(`Recap: ${src.recap}`);
+
+			if (src.topics.length === 0) {
+				lines.push("(no topics recorded for this commit)");
+			} else {
+				src.topics.forEach((t, ti) => {
+					lines.push("");
+					lines.push(`Topic ${ti + 1}`);
+					lines.push(` Title: ${t.title}`);
+					lines.push(` Trigger: ${t.trigger}`);
+					lines.push(` Response: ${t.response}`);
+					lines.push(` Decisions: ${t.decisions}`);
+					if (t.todo) lines.push(` Todo: ${t.todo}`);
+					if (t.category) lines.push(` Category: ${t.category}`);
+					if (t.importance) lines.push(` Importance: ${t.importance}`);
+					if (t.filesAffected && t.filesAffected.length > 0) {
+						lines.push(` Files: ${t.filesAffected.join(", ")}`);
+					}
+				});
+			}
+			return lines.join("\n");
+		})
+		.join("\n\n");
+}
+
+/**
+ * Mechanical fallback when the LLM is unavailable (network failure, parse
+ * failure after retry). Concatenates source topics in oldest-first order and
+ * joins recaps with paragraph breaks. The result is "complete but unconsolidated"
+ * -- duplicates and supersede candidates remain, but no data is lost.
+ *
+ * The Hoist invariant still holds: caller writes this back to the root and
+ * strips children, so display still works through a single root-authoritative
+ * path.
+ */
+export function mechanicalConsolidate(
+	sources: ReadonlyArray<SquashConsolidationSource>,
+	outerTicketId?: string,
+): {
+	topics: ReadonlyArray<TopicSummary>;
+	recap?: string;
+	ticketId?: string;
+} {
+	const sorted = sortSourcesOldestFirst(sources);
+	const topics = sorted.flatMap((s) => s.topics);
+	const recaps = sorted.map((s) => s.recap).filter((r): r is string => !!r);
+	const recap = recaps.length > 0 ? recaps.join("\n\n") : undefined;
+	const ticketId = outerTicketId ?? sorted.find((s) => s.ticketId)?.ticketId;
+	return {
+		topics,
+		...(recap !== undefined && { recap }),
+		...(ticketId !== undefined && { ticketId }),
+	};
+}
+
+/**
+ * Single LLM call that consolidates topics + recap across multiple squashed
+ * source commits. Caller MAY pass sources in any order; the function sorts
+ * internally and emits an oldest-first {{sourceCommitsBlock}} into the prompt.
+ *
+ * Returns null when:
+ *   - There are no sources at all.
+ *   - All sources have empty topics AND empty recap (nothing to consolidate).
+ *   - Both LLM call attempts (1 retry) fail.
+ *
+ * On null, the caller (runSquashPipeline / handleAmendPipeline) falls back to
+ * mechanicalConsolidate so the Hoist invariant always completes.
+ *
+ * ticketId resolution priority on success: params.ticketId (squash message)
+ *   > earliest source's ticketId > LLM-extracted ticketId from response.
+ */
+export async function generateSquashConsolidation(
+	params: SquashConsolidationParams,
+): Promise<SquashConsolidationResult | null> {
+	const { sources, squashCommitMessage, ticketId: outerTicketId, config } = params;
+
+	if (sources.length === 0) {
+		log.info("generateSquashConsolidation: no sources -- returning null");
+		return null;
+	}
+
+	const allEmpty = sources.every((s) => s.topics.length === 0 && !s.recap);
+	if (allEmpty) {
+		log.info("generateSquashConsolidation: all sources have no topics or recap -- returning null");
+		return null;
+	}
+
+	const sourceCommitsBlock = formatSourceCommitsForSquash(sources);
+	// Sort once and reuse for ticketLine + post-call resolution: both should
+	// fall back to the OLDEST source's ticketId, not "first encountered" in
+	// caller order (which varies between callers and is non-deterministic).
+	const sortedSources = sortSourcesOldestFirst(sources);
+	const ticketLine = outerTicketId ?? sortedSources.find((s) => s.ticketId)?.ticketId ?? "No ticket associated";
+
+	const baseParams = { squashMessage: squashCommitMessage, ticketLine, sourceCommitsBlock };
+
+	// Single network call (action = "squash-consolidate" or "squash-consolidate-strict").
+	// Returns the raw response text + parsed object so the orchestrator can decide
+	// between accepting / strict-retrying / falling through to mechanical.
+	const callOnce = async (
+		action: "squash-consolidate" | "squash-consolidate-strict",
+		extraParams: Record<string, string> = {},
+	): Promise<{
+		responseText: string;
+		parsed: ReturnType<typeof parseSummaryResponse>;
+		llm: LlmCallMetadata;
+	}> => {
+		const llmResult = await callLlm({
+			action,
+			params: { ...baseParams, ...extraParams },
+			maxTokens: DEFAULT_MAX_TOKENS,
+			apiKey: config.apiKey,
+			model: resolveModelId(config.model),
+			jolliApiKey: config.jolliApiKey,
+		});
+		const responseText = llmResult.text ?? "";
+		log.debug("=== %s raw response START ===", action);
+		log.debug("%s", responseText);
+		log.debug("=== %s raw response END ===", action);
+		const parsed = parseSummaryResponse(responseText);
+		const llm: LlmCallMetadata = {
+			model: llmResult.model ?? resolveModelId(config.model),
+			inputTokens: llmResult.inputTokens,
+			outputTokens: llmResult.outputTokens,
+			apiLatencyMs: llmResult.apiLatencyMs,
+			stopReason: llmResult.stopReason ?? null,
+		};
+		return { responseText, parsed, llm };
+	};
+
+	const buildResult = (
+		parsed: ReturnType<typeof parseSummaryResponse>,
+		llm: LlmCallMetadata,
+	): SquashConsolidationResult => {
+		const resolvedTicketId = outerTicketId ?? sortedSources.find((s) => s.ticketId)?.ticketId ?? parsed.ticketId;
+		return {
+			topics: parsed.topics,
+			...(parsed.recap !== undefined && { recap: parsed.recap }),
+			...(resolvedTicketId !== undefined && { ticketId: resolvedTicketId }),
+			llm,
+		};
+	};
+
+	// First attempt: standard squash-consolidate template. Network errors retry
+	// once with the same template (transient failure recovery). Format failures
+	// (substantive response but parser found nothing) retry with the strict
+	// template instead, which embeds the failed response and a correction header.
+	let first: { responseText: string; parsed: ReturnType<typeof parseSummaryResponse>; llm: LlmCallMetadata };
+	try {
+		first = await callOnce("squash-consolidate");
+	} catch (err) {
+		log.warn("generateSquashConsolidation first attempt failed: %s -- retrying once", (err as Error).message);
+		try {
+			first = await callOnce("squash-consolidate");
+		} catch (err2) {
+			log.error("generateSquashConsolidation retry failed: %s", (err2 as Error).message);
+			return null;
+		}
+	}
+
+	if (first.parsed.topics.length > 0 || first.parsed.recap) {
+		return buildResult(first.parsed, first.llm);
+	}
+
+	// First call extracted no usable content (no topics, no recap). Two cases:
+	//   (a) Response is format-incompliant (markdown / prose) -- strict retry
+	//       might recover the consolidation work.
+	//   (b) Response is format-compliant but empty / placeholder-only -- the
+	//       LLM tried and produced nothing meaningful. Retrying same input is
+	//       unlikely to help; fall through to mechanicalConsolidate.
+	if (!isFormatCompliant(first.responseText)) {
+		log.error("=== squash-consolidate raw response (format-incompliant) START ===");
+		log.error("%s", first.responseText);
+		log.error("=== squash-consolidate raw response (format-incompliant) END ===");
+		log.warn(
+			"squash-consolidate first response was format-incompliant (length=%d) -- retrying with strict format reminder",
+			first.responseText.length,
+		);
+		try {
+			const strict = await callOnce("squash-consolidate-strict", {
+				previousResponse: truncateForRetry(first.responseText),
+			});
+			if (isFormatCompliant(strict.responseText) && (strict.parsed.topics.length > 0 || strict.parsed.recap)) {
+				log.info("Strict-retry produced format-compliant squash-consolidation output -- using retry result");
+				const mergedLlm: LlmCallMetadata = {
+					model: strict.llm.model,
+					inputTokens: first.llm.inputTokens + strict.llm.inputTokens,
+					outputTokens: first.llm.outputTokens + strict.llm.outputTokens,
+					apiLatencyMs: first.llm.apiLatencyMs + strict.llm.apiLatencyMs,
+					stopReason: strict.llm.stopReason,
+				};
+				return buildResult(strict.parsed, mergedLlm);
+			}
+			log.warn(
+				"squash-consolidate-strict also produced no usable output -- falling through to mechanical fallback",
+			);
+		} catch (err) {
+			log.warn(
+				"squash-consolidate-strict call failed: %s -- falling through to mechanical fallback",
+				err instanceof Error ? err.message : String(err),
+			);
+		}
+	} else {
+		log.warn(
+			"generateSquashConsolidation: LLM produced format-compliant but empty consolidation -- falling through to mechanical fallback",
+		);
+	}
+	return null;
 }

@@ -79,6 +79,7 @@ import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
 import {
 	buildE2eTestSection,
 	buildHtml,
+	buildRecapSection,
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
@@ -135,7 +136,8 @@ type WebviewMessage =
 			command: "saveAllTranscripts";
 			entries: ReadonlyArray<TranscriptEntryUpdate>;
 	  }
-	| { command: "deleteAllTranscripts" };
+	| { command: "deleteAllTranscripts" }
+	| { command: "editRecap"; recap: string };
 
 /** Entry data sent back from the webview on Save All. */
 interface TranscriptEntryUpdate {
@@ -271,6 +273,15 @@ export class SummaryWebviewPanel {
 					"Edit failed",
 					{
 						command: "topicUpdateError",
+					},
+				);
+				break;
+			case "editRecap":
+				this.catchAndShow(
+					this.handleEditRecap(message.recap ?? ""),
+					"Recap save failed",
+					{
+						command: "recapUpdateError",
 					},
 				);
 				break;
@@ -1161,6 +1172,32 @@ export class SummaryWebviewPanel {
 			command: "topicUpdated",
 			topicIndex,
 			html,
+		});
+	}
+
+	/**
+	 * Handles user editing the Quick recap. Empty input clears the field
+	 * (undefined on the persisted summary, no recap section in the rendered
+	 * webview); non-empty input replaces the trimmed recap.
+	 */
+	private async handleEditRecap(recap: string): Promise<void> {
+		const summary = this.currentSummary;
+		if (!summary) {
+			return;
+		}
+		const trimmed = recap.trim();
+		const updated: CommitSummary = trimmed
+			? { ...summary, recap: trimmed }
+			: { ...summary, recap: undefined };
+		await storeSummary(updated, this.workspaceRoot, true);
+		this.currentSummary = updated;
+		// Server-render the section so the webview gets the canonical HTML
+		// (including the trailing <hr/> separator). Empty result removes the
+		// section entirely; the webview-side handler treats empty html as
+		// "delete recap section".
+		this.panel.webview.postMessage({
+			command: "recapUpdated",
+			html: buildRecapSection(updated.recap),
 		});
 	}
 

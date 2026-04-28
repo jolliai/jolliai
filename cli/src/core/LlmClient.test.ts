@@ -229,7 +229,7 @@ describe("LlmClient", () => {
 			parseJolliApiKey.mockReturnValueOnce({ t: "test1", u: "https://jolli-local.me/test1", o: "eng" });
 
 			await callLlm({
-				action: "summarize:small",
+				action: "summarize",
 				params: {
 					commitHash: "abc123",
 					commitMessage: "test",
@@ -237,6 +237,7 @@ describe("LlmClient", () => {
 					commitDate: "2026-04-01",
 					conversation: "talk",
 					diff: "diff",
+					topicGuidance: "6. Return 1-3 topics.\n7. Single purpose preferred.",
 				},
 				jolliApiKey: "sk-jol-test.secret",
 			});
@@ -267,17 +268,49 @@ describe("LlmClient", () => {
 			).rejects.toThrow("status 429");
 		});
 
-		it("includes version in request body when specified", async () => {
+		it("includes explicit caller-supplied version (overrides TEMPLATES default)", async () => {
+			// Pass an unambiguous version (99) to verify the override path,
+			// not the auto-injected version which happens to be 2 today.
 			await callLlm({
 				action: "commit-message",
 				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
 				jolliApiKey: "sk-jol-test.secret",
-				version: 2,
+				version: 99,
 			});
 
 			const fetchCall = fetchSpy.mock.calls[0] as [string, RequestInit];
 			const body = JSON.parse(fetchCall[1].body as string) as Record<string, unknown>;
+			expect(body.version).toBe(99);
+		});
+
+		it("auto-injects version from TEMPLATES when caller does not specify one", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				jolliApiKey: "sk-jol-test.secret",
+			});
+
+			const fetchCall = fetchSpy.mock.calls[0] as [string, RequestInit];
+			const body = JSON.parse(fetchCall[1].body as string) as Record<string, unknown>;
+			// commit-message is registered in TEMPLATES at version 2.
+			// If anyone bumps it, update this assertion intentionally.
 			expect(body.version).toBe(2);
+		});
+
+		it("omits version when action is unknown to TEMPLATES (graceful degrade)", async () => {
+			// Direct mode would throw on an unknown action because it needs the
+			// template; proxy mode delegates template resolution to the backend,
+			// so an unknown-to-CLI action is allowed and the request goes through
+			// without a version (backend resolves max-revision as fallback).
+			await callLlm({
+				action: "future-action-not-in-cli-templates",
+				params: {},
+				jolliApiKey: "sk-jol-test.secret",
+			});
+
+			const fetchCall = fetchSpy.mock.calls[0] as [string, RequestInit];
+			const body = JSON.parse(fetchCall[1].body as string) as Record<string, unknown>;
+			expect(body).not.toHaveProperty("version");
 		});
 
 		it("defaults missing proxy token counts to zero", async () => {

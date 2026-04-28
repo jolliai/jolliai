@@ -76,7 +76,7 @@ export function resolveLlmCredentialSource(
 
 /** Options for making an LLM call */
 export interface LlmCallOptions extends LlmCredentials {
-	/** Template key (e.g. "summarize:small", "commit-message") */
+	/** Template key (e.g. "summarize", "commit-message") */
 	readonly action: string;
 	/** Params to fill {{placeholder}} tokens in the template */
 	readonly params: Record<string, string>;
@@ -129,15 +129,15 @@ export async function callLlm(options: LlmCallOptions): Promise<LlmCallResult> {
 
 /** Direct mode: call Anthropic SDK locally */
 async function callDirect(options: LlmCallOptions, apiKey: string): Promise<LlmCallResult> {
-	const template = TEMPLATES.get(options.action);
-	if (!template) {
+	const entry = TEMPLATES.get(options.action);
+	if (!entry) {
 		throw new Error(`Unknown LLM action: "${options.action}". Available: ${[...TEMPLATES.keys()].join(", ")}`);
 	}
-	const missing = findUnfilledPlaceholders(template, options.params);
+	const missing = findUnfilledPlaceholders(entry.template, options.params);
 	if (missing.length > 0) {
 		log.warn("Direct LLM call has unfilled placeholders for action=%s: %s", options.action, missing.join(", "));
 	}
-	const prompt = fillTemplate(template, options.params);
+	const prompt = fillTemplate(entry.template, options.params);
 
 	const model = resolveModelId(options.model);
 	const maxTokens = options.maxTokens ?? 8192;
@@ -197,10 +197,21 @@ async function callProxy(options: LlmCallOptions, baseUrl: string): Promise<LlmC
 	// Tenant is resolved via X-Jolli-Tenant header, not path — the path is always the same.
 	const url = `${parsed.origin}${LLM_PROXY_PATH}`;
 
+	// Resolve the version to send to the proxy:
+	// 1. Caller-supplied `options.version` wins (used for pinning to a specific
+	//    revision in tests / debug scenarios).
+	// 2. Otherwise auto-inject the version from the TEMPLATES entry. This is the
+	//    normal path — every action has a known version baked into the CLI build.
+	// 3. If neither is present (action unknown to TEMPLATES — should be unreachable
+	//    given direct mode validates the same map), omit `version` so the backend
+	//    falls back to its max-revision lookup.
+	const templateEntry = TEMPLATES.get(options.action);
+	const versionToSend = options.version ?? templateEntry?.version;
+
 	const body = JSON.stringify({
 		action: options.action,
 		params: options.params as Record<string, unknown>,
-		...(options.version !== undefined ? { version: options.version } : {}),
+		...(versionToSend !== undefined ? { version: versionToSend } : {}),
 	});
 
 	log.info("Proxy LLM call: action=%s url=%s", options.action, url);

@@ -31,6 +31,7 @@ import type {
 	StoredTranscript,
 	SummaryIndex,
 	SummaryIndexEntry,
+	TopicSummary,
 } from "../Types.js";
 import {
 	getDiffStats,
@@ -40,8 +41,9 @@ import {
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
 import { acquireLock, releaseLock } from "./SessionTracker.js";
+import type { SquashConsolidationSource } from "./Summarizer.js";
 import { getDisplayDate } from "./SummaryFormat.js";
-import { countTopics } from "./SummaryTree.js";
+import { collectAllTopics, countTopics, isUnifiedHoistFormat } from "./SummaryTree.js";
 
 const log = createLogger("SummaryStore");
 
@@ -143,17 +145,24 @@ export async function storeSummary(
 }
 
 /**
- * Migrates a summary 1:1 (for rebase pick): creates a container node with commitType "rebase"
- * that wraps the original summary as a child. This preserves the old commit hash in the tree,
- * upholding the principle that no recorded summary hash is ever lost.
+ * Migrates a summary 1:1 (rebase pick path only). Wraps the original summary
+ * as a stripped child of a new v4 root carrying Hoisted metadata.
  *
- * In v3, the old entry's `parentCommitHash` is updated to point to the new hash
- * (becomes a child) rather than being deleted from the index.
+ * **Scope**: rebase pick ONLY. Amend short-circuits write transcript artifacts,
+ * which don't fit this signature; they go through `buildHoistedAmendRoot` +
+ * `storeSummary` instead.
+ *
+ * The optional `metadata` parameter carries `commitType` / `commitSource`
+ * forward so the migrated summary records who triggered the rebase
+ * (VSCode plugin vs CLI). `handleRebasePickFromQueue` passes
+ * `commitType: "rebase"` plus the queue entry's `commitSource`, matching
+ * how `runSquashPipeline` propagates these fields on squash / amend.
  */
 export async function migrateOneToOne(
 	oldSummary: CommitSummary,
 	newCommitInfo: CommitInfo,
 	cwd?: string,
+	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
 ): Promise<void> {
 	log.info(
 		"Migrating summary 1:1: %s → %s",
@@ -162,10 +171,8 @@ export async function migrateOneToOne(
 	);
 
 	// Wrap the old summary as a child rather than replacing its hash.
-	// Hoist functional-level metadata to the new root so they're accessible at the top level:
-	// - plans, notes, e2eTestGuide: feature-level metadata
-	// - jolliDocId, jolliDocUrl: stable server IDs for direct article update (docId-based)
-	// - orphanedDocIds: memory article IDs pending cleanup on next push
+	// stripFunctionalMetadata strips all 8 Hoist fields (Copy-Hoist 6 + the
+	// new Consolidate-Hoist topics/recap) so the root is solely authoritative.
 	const strippedOld = stripFunctionalMetadata(oldSummary);
 	const docUrl = oldSummary.jolliDocUrl;
 
@@ -176,21 +183,29 @@ export async function migrateOneToOne(
 		(): DiffStats => ({ filesChanged: 0, insertions: 0, deletions: 0 }),
 	);
 
+	// Legacy-aware Copy-Hoist of topics: v4 returns root.topics; v3 (legacy
+	// squash / legacy amend) flattens via collectAllTopics so no data drops.
+	const hoistedTopics = resolveEffectiveTopics(oldSummary);
+
 	const newSummary: CommitSummary = {
-		version: 3,
+		version: 4,
 		commitHash: newCommitInfo.hash,
 		commitMessage: newCommitInfo.message,
 		commitAuthor: newCommitInfo.author,
 		commitDate: newCommitInfo.date,
 		branch: oldSummary.branch,
 		generatedAt: new Date().toISOString(),
-		commitType: "rebase",
+		commitType: metadata?.commitType ?? "rebase",
+		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
+		...(oldSummary.ticketId && { ticketId: oldSummary.ticketId }),
 		...(oldSummary.jolliDocId && { jolliDocId: oldSummary.jolliDocId }),
 		...(docUrl && { jolliDocUrl: docUrl }),
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
 		...(oldSummary.plans && { plans: oldSummary.plans }),
 		...(oldSummary.notes && { notes: oldSummary.notes }),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
+		topics: hoistedTopics,
+		...(oldSummary.recap && { recap: oldSummary.recap }),
 		diffStats: migratedDiffStats,
 		children: [strippedOld],
 	};
@@ -368,27 +383,149 @@ function collectChildJolliMeta(nodes: ReadonlyArray<CommitSummary>): JolliMetaHo
 	return { winner, orphanedDocIds };
 }
 
-/** Strips plans, notes, e2eTestGuide, and all Jolli metadata from a summary node. */
+/** Returns a deep copy of the summary tree with topics stripped from all nodes. */
+function stripTopics(node: CommitSummary): CommitSummary {
+	const { topics: _, ...rest } = node;
+	if (!rest.children) return rest as CommitSummary;
+	return { ...rest, children: rest.children.map(stripTopics) } as CommitSummary;
+}
+
+/** Returns a deep copy of the summary tree with recap stripped from all nodes. */
+function stripRecap(node: CommitSummary): CommitSummary {
+	const { recap: _, ...rest } = node;
+	if (!rest.children) return rest as CommitSummary;
+	return { ...rest, children: rest.children.map(stripRecap) } as CommitSummary;
+}
+
+// --- Legacy-aware Hoist input helpers ----------------------------------------
+
+/**
+ * Returns the topics array to use as Copy-Hoist source when migrating
+ * `oldSummary` to a new hash (rebase pick, amend short-circuits).
+ *
+ * - v4 root (unified Hoist format): root is authoritative -- return its
+ *   topics directly (may legitimately be []).
+ * - v3 root (legacy data): topics may be on root, on children, or split
+ *   across both (e.g. legacy amend root carries delta topics on root and
+ *   pre-amend topics on its child). Use collectAllTopics to gather everything,
+ *   then strip the runtime decorations (commitDate / generatedAt) added by it.
+ *
+ * Discriminator is `version` via isUnifiedHoistFormat -- not topics.length.
+ * "topics.length > 0" was the original draft and was rejected because it
+ * mishandles legacy amend (would mistreat as v4 and lose pre-amend) and
+ * v4 recap-only commits (would mistreat as legacy and recurse into stripped
+ * children, losing the recap).
+ */
+export function resolveEffectiveTopics(oldSummary: CommitSummary): ReadonlyArray<TopicSummary> {
+	if (isUnifiedHoistFormat(oldSummary)) return oldSummary.topics ?? [];
+	return collectAllTopics(oldSummary).map(({ commitDate: _cd, generatedAt: _ga, treeIndex: _ti, ...topic }) => topic);
+}
+
+/**
+ * Returns SquashConsolidationSource[] suitable for feeding into
+ * generateSquashConsolidation. Unlike resolveEffectiveTopics this preserves
+ * commit-level grouping for the LLM (so it can apply rule 4's supersede
+ * evidence standard); flat aggregation would lose the chronological signal.
+ *
+ * - v4 root: returns a single source built from root itself (root is
+ *   authoritative; topics may be [] for recap-only commits).
+ * - v3 squash root: returns one source per original child commit.
+ * - v3 amend root: same as squash root, BUT the root itself ALSO contributed
+ *   own topics (delta topics). Append it as its own latest source so the
+ *   delta data isn't lost. This is the v3 amend form of issue #1 in the plan.
+ *
+ * Caller does NOT need to sort the result -- generateSquashConsolidation /
+ * mechanicalConsolidate sort sources oldest-first internally.
+ */
+export function expandSourcesForConsolidation(oldSummary: CommitSummary): ReadonlyArray<SquashConsolidationSource> {
+	if (isUnifiedHoistFormat(oldSummary)) {
+		return [
+			{
+				commitHash: oldSummary.commitHash,
+				commitMessage: oldSummary.commitMessage,
+				commitDate: oldSummary.commitDate,
+				...(oldSummary.ticketId && { ticketId: oldSummary.ticketId }),
+				topics: oldSummary.topics ?? [],
+				...(oldSummary.recap && { recap: oldSummary.recap }),
+			},
+		];
+	}
+
+	const childSources: SquashConsolidationSource[] = (oldSummary.children ?? []).map((child) => ({
+		commitHash: child.commitHash,
+		commitMessage: child.commitMessage,
+		commitDate: child.commitDate,
+		...(child.ticketId && { ticketId: child.ticketId }),
+		topics: resolveEffectiveTopics(child),
+		...(child.recap && { recap: child.recap }),
+	}));
+
+	// Legacy amend root carries delta topics/recap on root itself; append it
+	// as its own source so the delta isn't lost. (This branch matters for v3
+	// data; v4 amend roots would have been caught by the early-return above.)
+	const rootHasOwnData = (oldSummary.topics?.length ?? 0) > 0 || !!oldSummary.recap;
+	if (rootHasOwnData) {
+		childSources.push({
+			commitHash: oldSummary.commitHash,
+			commitMessage: oldSummary.commitMessage,
+			commitDate: oldSummary.commitDate,
+			...(oldSummary.ticketId && { ticketId: oldSummary.ticketId }),
+			topics: oldSummary.topics ?? [],
+			...(oldSummary.recap && { recap: oldSummary.recap }),
+		});
+	}
+
+	return childSources;
+}
+
+/**
+ * Strips all 8 Hoist-managed fields from a summary node and its descendants.
+ *
+ * Hoist family (8 fields):
+ *   - Copy-Hoist (6): jolliDocId, jolliDocUrl, orphanedDocIds, plans, notes, e2eTestGuide
+ *   - Consolidate-Hoist (2): topics, recap
+ *
+ * `version` is intentionally NOT stripped -- it's an identity field, like
+ * commitHash. A v4 root may legitimately contain a v3 stripped child (legacy
+ * data on first migration); helpers always look at the root's own version.
+ */
 export function stripFunctionalMetadata(node: CommitSummary): CommitSummary {
-	return stripJolliMetadata(stripNotes(stripPlans(stripE2eTestGuide(node))));
+	return stripJolliMetadata(stripNotes(stripPlans(stripE2eTestGuide(stripTopics(stripRecap(node))))));
+}
+
+/**
+ * Result of squash consolidation passed into mergeManyToOne. Pure data shape;
+ * source is either generateSquashConsolidation (LLM path) or
+ * mechanicalConsolidate (fallback). The Hoist invariant requires the root to
+ * always carry a topics array (possibly empty) and an optional recap, so
+ * mergeManyToOne always receives this object -- there is no "container mode"
+ * branch where the root has no topics.
+ */
+export interface ConsolidatedTopics {
+	readonly topics: ReadonlyArray<TopicSummary>;
+	readonly recap?: string;
+	readonly ticketId?: string;
+	readonly llm?: import("../Types.js").LlmCallMetadata;
 }
 
 /**
  * Merges multiple summaries into one (for rebase squash/fixup and git merge --squash).
  * Places all source summaries as `children` sorted by commitDate descending (newest first).
- * No LLM call is made — this is a pure container node.
  *
- * In v3, the old top-level entries' `parentCommitHash` is updated to point to the new
- * merged hash. Child nodes of old summaries keep their existing parentCommitHash intact.
+ * `consolidated` carries the LLM-consolidated (or mechanically-consolidated)
+ * topics + recap + ticketId. The Hoist invariant: the root ALWAYS carries
+ * topics (possibly empty), and children are stripped via stripFunctionalMetadata.
  *
- * E2E test guides from children are hoisted to the merged root and stripped from the
- * children so the root owns all E2E data directly (no runtime collection needed).
+ * E2E test guides, plans, notes, jolliDoc metadata are still hoisted from
+ * children via the existing collect* helpers; that part of the contract is
+ * unchanged. The new piece is topics/recap going in via `consolidated`.
  */
 export async function mergeManyToOne(
 	oldSummaries: ReadonlyArray<CommitSummary>,
 	newCommitInfo: CommitInfo,
 	cwd?: string,
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
+	consolidated?: ConsolidatedTopics,
 ): Promise<{ orphanedDocIds: number[] }> {
 	log.info("Merging %d summaries into %s", oldSummaries.length, newCommitInfo.hash.substring(0, 8));
 
@@ -403,7 +540,7 @@ export async function mergeManyToOne(
 	// - Notes: user-created notes (snippets, markdown) associated with commits
 	// - Jolli memory article metadata (docId/URL): stable server ID for direct update
 	// - orphanedDocIds: accumulated memory article IDs pending cleanup on next push
-	// Topics stay with their original child commits (commit-level granularity).
+	// - topics/recap: from `consolidated` (LLM or mechanical); see ConsolidatedTopics.
 	const hoistedE2e = collectChildE2eScenarios(children);
 	const hoistedPlans = collectChildPlans(children);
 	const hoistedNotes = collectChildNotes(children);
@@ -420,8 +557,17 @@ export async function mergeManyToOne(
 		(): DiffStats => ({ filesChanged: 0, insertions: 0, deletions: 0 }),
 	);
 
+	// Default to empty topics + no recap when caller doesn't pass `consolidated`.
+	// Production callers (runSquashPipeline) always pass a value built from
+	// generateSquashConsolidation (LLM path) or mechanicalConsolidate (fallback),
+	// so the root always carries authoritative consolidated topics + recap.
+	const consolidatedTopics = consolidated?.topics ?? [];
+	const consolidatedRecap = consolidated?.recap;
+	const consolidatedTicketId = consolidated?.ticketId;
+	const consolidatedLlm = consolidated?.llm;
+
 	const mergedSummary: CommitSummary = {
-		version: 3,
+		version: 4,
 		commitHash: newCommitInfo.hash,
 		commitMessage: newCommitInfo.message,
 		commitAuthor: newCommitInfo.author,
@@ -430,11 +576,15 @@ export async function mergeManyToOne(
 		generatedAt: new Date().toISOString(),
 		...(metadata?.commitType && { commitType: metadata.commitType }),
 		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
+		...(consolidatedTicketId && { ticketId: consolidatedTicketId }),
+		...(consolidatedLlm && { llm: consolidatedLlm }),
 		...(hoistedE2e.length > 0 && { e2eTestGuide: hoistedE2e }),
 		...(hoistedPlans.length > 0 && { plans: hoistedPlans }),
 		...(hoistedNotes.length > 0 && { notes: hoistedNotes }),
 		...(jolliMeta.winner && { jolliDocId: jolliMeta.winner.jolliDocId, jolliDocUrl: jolliMeta.winner.jolliDocUrl }),
 		...(allOrphanedDocIds.length > 0 && { orphanedDocIds: allOrphanedDocIds }),
+		topics: consolidatedTopics,
+		...(consolidatedRecap && { recap: consolidatedRecap }),
 		diffStats: mergedDiffStats,
 		children: strippedChildren,
 	};
@@ -620,78 +770,53 @@ export async function getTranscriptHashes(cwd?: string): Promise<Set<string>> {
 /**
  * Retrieves a summary for a specific commit hash.
  *
- * Lookup order (v3 flat index):
- * 1. Direct entry lookup by commitHash
- * 2. commitAliases[commitHash] → cached alias hash → entry lookup
- * 3. Tree hash fallback: git cat-file → scan entries by treeHash → write alias → persist
- * 4. Legacy fallback: direct file read (v1 orphan branch, no index)
+ * Lookup order:
+ * 1. **Direct file read** (`summaries/{commitHash}.json`). Works for any hash
+ *    that was ever a root at write time. This is the primary path -- it
+ *    bypasses the index entirely and returns the commit's ORIGINAL summary
+ *    rather than the (potentially stripped) version embedded in a squash root.
+ *    Storage invariant: `mergeManyToOne` / `migrateOneToOne` never delete the
+ *    old `summaries/{oldHash}.json` files, so every hash that entered the
+ *    system keeps its own file.
+ * 2. **Alias / treeHash fallback**: when direct read misses, check the index
+ *    for cross-branch aliases (cached + on-the-fly tree-hash matching). Used
+ *    when the caller passes a hash that isn't a recorded root, e.g. a commit
+ *    on a different branch that shares a tree hash with a recorded one.
  *
- * Once the target entry is found, follows the `parentCommitHash` chain to locate
- * the root summary file, then traverses the tree to return the specific node.
+ * Direct file read intentionally bypasses the embedded child view: under the
+ * unified Hoist strip, embedded children no longer carry topics/recap, so
+ * returning them would silently degrade results.
  *
  * Returns null if no summary exists for that commit.
  */
 export async function getSummary(commitHash: string, cwd?: string): Promise<CommitSummary | null> {
+	// Step 1: Direct file read -- works for any hash that was ever indexed.
+	const direct = await readSummaryFile(commitHash, cwd);
+	if (direct) return direct;
+
+	// Step 2: Cross-branch fallback via aliases / tree hash.
 	const index = await loadIndex(cwd);
+	if (!index) return null;
 
-	if (index) {
-		const entryMap = new Map(index.entries.map((e) => [e.commitHash, e]));
-
-		// Step 1: Direct lookup
-		let targetEntry = entryMap.get(commitHash);
-
-		// Step 2: Check cached aliases
-		if (!targetEntry && index.commitAliases?.[commitHash]) {
-			const aliasHash = index.commitAliases[commitHash];
-			targetEntry = entryMap.get(aliasHash);
-		}
-
-		// Step 3: Tree hash fallback (slow path — only for v3 index with treeHash fields).
-		// This is a read-only path: alias caching is intentionally deferred to
-		// scanTreeHashAliases() so getSummary() never writes to the orphan branch.
-		if (!targetEntry && index.version === 3) {
-			const treeHash = await getTreeHash(commitHash, cwd);
-			/* v8 ignore start -- tree hash fallback: requires real git repo with matching tree hashes across commit rewrites */
-			if (treeHash) {
-				const matchEntry = findShallowstByTreeHash(treeHash, index.entries, entryMap);
-				if (matchEntry) {
-					targetEntry = matchEntry;
-				}
-				/* v8 ignore stop */
-			}
-		}
-
-		if (targetEntry) {
-			// Follow parentCommitHash chain to find the root
-			const rootHash = findRootHash(targetEntry.commitHash, entryMap);
-			if (!rootHash) return null;
-
-			// Load the root summary file
-			const rootSummary = await readSummaryFile(rootHash, cwd);
-			if (!rootSummary) return null;
-
-			// If the target is the root, return directly
-			if (rootHash === targetEntry.commitHash) return rootSummary;
-
-			// Otherwise find the specific child node in the tree.
-			// Return null rather than silently falling back to the root: a missing child
-			// means the index is stale or migration is incomplete, and returning the wrong
-			// summary would mask that as a successful lookup.
-			const node = findNodeInTree(rootSummary, targetEntry.commitHash);
-			if (!node) {
-				log.warn(
-					"getSummary: index entry %s points to root %s but node not found in tree — stale index?",
-					targetEntry.commitHash.substring(0, 8),
-					rootHash.substring(0, 8),
-				);
-				return null;
-			}
-			return node;
-		}
+	const aliasHash = index.commitAliases?.[commitHash];
+	if (aliasHash) {
+		return readSummaryFile(aliasHash, cwd);
 	}
 
-	// Step 4: Legacy fallback — direct file read (v1 orphan branch)
-	return readSummaryFile(commitHash, cwd);
+	if (index.version === 3) {
+		const treeHash = await getTreeHash(commitHash, cwd);
+		/* v8 ignore start -- tree hash fallback: requires real git repo */
+		if (treeHash) {
+			const entryMap = new Map(index.entries.map((e) => [e.commitHash, e]));
+			const matchEntry = findShallowstByTreeHash(treeHash, index.entries, entryMap);
+			if (matchEntry) {
+				return readSummaryFile(matchEntry.commitHash, cwd);
+			}
+		}
+		/* v8 ignore stop */
+	}
+
+	return null;
 }
 
 /**
@@ -999,38 +1124,6 @@ async function flattenSummaryTree(
 		entries.push(...childEntries);
 	}
 	return entries;
-}
-
-/**
- * Follows the `parentCommitHash` chain from the given commit hash upward
- * to find the root entry (the one with `parentCommitHash == null`).
- *
- * Includes cycle detection to prevent infinite loops on corrupt index data.
- * Returns null if the entry is not found in the map.
- */
-function findRootHash(commitHash: string, entryMap: Map<string, SummaryIndexEntry>): string | null {
-	const visited = new Set<string>();
-	let current = entryMap.get(commitHash);
-	while (current && current.parentCommitHash != null) {
-		if (visited.has(current.commitHash)) break; // cycle guard
-		visited.add(current.commitHash);
-		current = entryMap.get(current.parentCommitHash);
-	}
-	return current?.commitHash ?? null;
-}
-
-/**
- * Recursively searches a CommitSummary tree for the node with `targetHash`.
- * Returns the matching node, or null if not found.
- */
-function findNodeInTree(root: CommitSummary, targetHash: string): CommitSummary | null {
-	if (root.commitHash === targetHash) return root;
-	for (const child of root.children ?? []) {
-		const found = findNodeInTree(child, targetHash);
-		/* v8 ignore next -- recursive traversal: found branch is exercised but v8 undercounts in recursion */
-		if (found) return found;
-	}
-	return null;
 }
 
 /**

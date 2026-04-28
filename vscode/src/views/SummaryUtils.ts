@@ -20,7 +20,6 @@ export {
 	formatDate,
 	formatFullDate,
 	getDisplayDate,
-	groupTopicsByDate,
 	padIndex,
 	sortTopics,
 	type TopicWithDate,

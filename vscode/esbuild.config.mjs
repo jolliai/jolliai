@@ -24,6 +24,13 @@ const isWatch = process.argv.includes("--watch");
 // dist-path resolution, NOT the VSCode extension version.
 const jmPkg = JSON.parse(readFileSync("./package.json", "utf-8"));
 
+// Read the @jolli.ai/cli package version separately. Inlined into the bundled
+// `Cli.js` as `__CLI_PKG_VERSION__` so consumers that want "the CLI's npm
+// package version" (e.g. `jolli export-prompt --output` manifest) get the
+// right number when this Cli.js is shipped inside the VSCode plugin (where
+// vscode-version and cli-version may diverge).
+const cliPkg = JSON.parse(readFileSync(resolve("..", "cli", "package.json"), "utf-8"));
+
 // ── Shared base options ────────────────────────────────────────────────────
 const base = {
 	bundle: true,
@@ -54,6 +61,7 @@ const extensionOptions = {
 	define: {
 		"import.meta.url": "__jmImportMetaUrl",
 		__PKG_VERSION__: JSON.stringify(jmPkg.version),
+		__CLI_PKG_VERSION__: JSON.stringify(cliPkg.version),
 	},
 };
 
@@ -89,6 +97,7 @@ const cliOptions = {
 	define: {
 		"import.meta.url": "__jmImportMetaUrl",
 		__PKG_VERSION__: JSON.stringify(jmPkg.version),
+		__CLI_PKG_VERSION__: JSON.stringify(cliPkg.version),
 	},
 };
 
