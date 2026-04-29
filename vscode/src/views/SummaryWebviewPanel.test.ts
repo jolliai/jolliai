@@ -274,6 +274,7 @@ vi.mock("../services/PrCommentService.js", () => ({
 	handleCreatePr: mockHandleCreatePr,
 	handlePrepareUpdatePr: mockHandlePrepareUpdatePr,
 	handleUpdatePr: mockHandleUpdatePr,
+	wrapWithMarkers: (s: string) => `[MARKERS]${s}[/MARKERS]`,
 }));
 
 vi.mock("../util/Logger.js", () => ({
@@ -285,11 +286,13 @@ const {
 	mockBuildE2eTestSection,
 	mockBuildRecapSection,
 	mockRenderTopic,
+	mockRenderE2eScenario,
 } = vi.hoisted(() => ({
 	mockBuildHtml: vi.fn().mockReturnValue("<html>mock</html>"),
 	mockBuildE2eTestSection: vi.fn().mockReturnValue("<div>e2e</div>"),
 	mockBuildRecapSection: vi.fn().mockReturnValue("<div>recap</div>"),
 	mockRenderTopic: vi.fn().mockReturnValue("<div>topic</div>"),
+	mockRenderE2eScenario: vi.fn().mockReturnValue("<div>scenario</div>"),
 }));
 
 vi.mock("./SummaryHtmlBuilder.js", () => ({
@@ -297,6 +300,7 @@ vi.mock("./SummaryHtmlBuilder.js", () => ({
 	buildE2eTestSection: mockBuildE2eTestSection,
 	buildRecapSection: mockBuildRecapSection,
 	renderTopic: mockRenderTopic,
+	renderE2eScenario: mockRenderE2eScenario,
 }));
 
 const { mockBuildMarkdown, mockBuildPrMarkdown } = vi.hoisted(() => ({
@@ -1670,6 +1674,245 @@ describe("SummaryWebviewPanel", () => {
 			});
 		});
 
+		// ── editE2eScenario ──────────────────────────────────────────────────
+
+		describe("editE2eScenario", () => {
+			it("merges updates into the scenario at index, persists, and posts e2eScenarioUpdated", async () => {
+				const original = {
+					title: "Old",
+					preconditions: "before",
+					steps: ["s1"],
+					expectedResults: ["r1"],
+				};
+				mockRenderE2eScenario.mockReturnValue("<div>row 0</div>");
+				const dispatch = await setupPanel({ e2eTestGuide: [original] });
+
+				dispatch({
+					command: "editE2eScenario",
+					index: 0,
+					updates: { title: "New", steps: ["a", "b"] },
+				});
+				await flushPromises();
+
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({
+						e2eTestGuide: [
+							{
+								title: "New",
+								preconditions: "before",
+								steps: ["a", "b"],
+								expectedResults: ["r1"],
+							},
+						],
+					}),
+					workspaceRoot,
+					true,
+				);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "e2eScenarioUpdated",
+					scenarioIndex: 0,
+					html: "<div>row 0</div>",
+				});
+			});
+
+			it("clears preconditions when updates omits or empties the field", async () => {
+				const original = {
+					title: "T",
+					preconditions: "old",
+					steps: ["s"],
+					expectedResults: ["r"],
+				};
+				const dispatch = await setupPanel({ e2eTestGuide: [original] });
+
+				// Empty string → backend should drop the field.
+				dispatch({
+					command: "editE2eScenario",
+					index: 0,
+					updates: { title: "T", preconditions: "" },
+				});
+				await flushPromises();
+
+				const stored = mockStoreSummary.mock.calls[0][0] as {
+					e2eTestGuide: ReadonlyArray<{ preconditions?: string }>;
+				};
+				expect(stored.e2eTestGuide[0].preconditions).toBeUndefined();
+			});
+
+			it("preserves original preconditions when updates does not mention the field", async () => {
+				const original = {
+					title: "T",
+					preconditions: "keep me",
+					steps: ["s"],
+					expectedResults: ["r"],
+				};
+				const dispatch = await setupPanel({ e2eTestGuide: [original] });
+
+				dispatch({
+					command: "editE2eScenario",
+					index: 0,
+					updates: { title: "renamed" },
+				});
+				await flushPromises();
+
+				const stored = mockStoreSummary.mock.calls[0][0] as {
+					e2eTestGuide: ReadonlyArray<{ preconditions?: string }>;
+				};
+				expect(stored.e2eTestGuide[0].preconditions).toBe("keep me");
+			});
+
+			it("returns early when summary is not loaded", async () => {
+				const dispatch = await setupPanel();
+				// no e2eTestGuide on default summary
+
+				dispatch({
+					command: "editE2eScenario",
+					index: 0,
+					updates: { title: "x" },
+				});
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+
+			it("returns early when index is out of range", async () => {
+				const dispatch = await setupPanel({
+					e2eTestGuide: [
+						{ title: "only", steps: ["s"], expectedResults: ["r"] },
+					],
+				});
+
+				dispatch({
+					command: "editE2eScenario",
+					index: 5,
+					updates: { title: "x" },
+				});
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+
+			it("only mutates the targeted scenario in a multi-scenario guide", async () => {
+				const a = { title: "A", steps: ["a"], expectedResults: ["ra"] };
+				const b = { title: "B", steps: ["b"], expectedResults: ["rb"] };
+				const c = { title: "C", steps: ["c"], expectedResults: ["rc"] };
+				const dispatch = await setupPanel({ e2eTestGuide: [a, b, c] });
+
+				dispatch({
+					command: "editE2eScenario",
+					index: 1,
+					updates: { title: "B-edited" },
+				});
+				await flushPromises();
+
+				const stored = mockStoreSummary.mock.calls[0][0] as {
+					e2eTestGuide: ReadonlyArray<{ title: string }>;
+				};
+				expect(stored.e2eTestGuide.map((s) => s.title)).toEqual([
+					"A",
+					"B-edited",
+					"C",
+				]);
+			});
+
+			it("treats explicit preconditions: undefined the same as empty string (clears)", async () => {
+				const original = {
+					title: "T",
+					preconditions: "old",
+					steps: ["s"],
+					expectedResults: ["r"],
+				};
+				const dispatch = await setupPanel({ e2eTestGuide: [original] });
+
+				dispatch({
+					command: "editE2eScenario",
+					index: 0,
+					updates: { title: "T", preconditions: undefined },
+				});
+				await flushPromises();
+
+				const stored = mockStoreSummary.mock.calls[0][0] as {
+					e2eTestGuide: ReadonlyArray<{ preconditions?: string }>;
+				};
+				expect(stored.e2eTestGuide[0].preconditions).toBeUndefined();
+			});
+		});
+
+		// ── deleteE2eScenario ────────────────────────────────────────────────
+
+		describe("deleteE2eScenario", () => {
+			it("removes the scenario at index after confirmation, posts e2eTestUpdated", async () => {
+				showWarningMessage.mockResolvedValue("Delete");
+				const a = { title: "A", steps: ["s"], expectedResults: ["r"] };
+				const b = { title: "B", steps: ["s"], expectedResults: ["r"] };
+				const dispatch = await setupPanel({ e2eTestGuide: [a, b] });
+
+				dispatch({ command: "deleteE2eScenario", index: 0, title: "A" });
+				await flushPromises();
+
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ e2eTestGuide: [b] }),
+					workspaceRoot,
+					true,
+				);
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "e2eTestUpdated" }),
+				);
+			});
+
+			it("sets e2eTestGuide to undefined when removing the last scenario", async () => {
+				showWarningMessage.mockResolvedValue("Delete");
+				const dispatch = await setupPanel({
+					e2eTestGuide: [
+						{ title: "only", steps: ["s"], expectedResults: ["r"] },
+					],
+				});
+
+				dispatch({ command: "deleteE2eScenario", index: 0 });
+				await flushPromises();
+
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ e2eTestGuide: undefined }),
+					workspaceRoot,
+					true,
+				);
+			});
+
+			it("does nothing when user cancels", async () => {
+				showWarningMessage.mockResolvedValue(undefined);
+				const dispatch = await setupPanel({
+					e2eTestGuide: [{ title: "T", steps: ["s"], expectedResults: ["r"] }],
+				});
+
+				dispatch({ command: "deleteE2eScenario", index: 0 });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+
+			it("returns early when summary is not loaded", async () => {
+				const dispatch = await setupPanel();
+				// default summary has no e2eTestGuide
+
+				dispatch({ command: "deleteE2eScenario", index: 0 });
+				await flushPromises();
+
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+
+			it("returns early when index is out of range", async () => {
+				const dispatch = await setupPanel({
+					e2eTestGuide: [{ title: "T", steps: ["s"], expectedResults: ["r"] }],
+				});
+
+				dispatch({ command: "deleteE2eScenario", index: 99 });
+				await flushPromises();
+
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+		});
+
 		// ── loadPlanContent ──────────────────────────────────────────────────
 
 		describe("loadPlanContent", () => {
@@ -2060,6 +2303,43 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				expect(postMessage).toHaveBeenCalledWith({ command: "prCreating" });
+			});
+		});
+
+		describe("prepareCreatePr", () => {
+			it("posts prShowCreateForm with wrapped body and commit message title", async () => {
+				mockBuildPrMarkdown.mockReturnValue("# fresh body");
+				const dispatch = await setupPanel({ commitMessage: "feat: add thing" });
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				expect(mockBuildPrMarkdown).toHaveBeenCalledWith(
+					expect.objectContaining({ commitHash: "abc123" }),
+				);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prShowCreateForm",
+					body: "[MARKERS]# fresh body[/MARKERS]",
+					title: "feat: add thing",
+				});
+			});
+
+			it("does nothing when no summary is loaded", async () => {
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+				);
+				const dispatch = captureMessageHandler();
+				firstCommitPanel<{ currentSummary: null }>().currentSummary = null;
+				vi.clearAllMocks();
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "prShowCreateForm" }),
+				);
 			});
 		});
 

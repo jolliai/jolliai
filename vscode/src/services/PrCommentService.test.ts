@@ -162,26 +162,8 @@ describe("PrCommentService", () => {
 	// ─── buildPrSectionHtml ─────────────────────────────────────────────────
 
 	describe("buildPrSectionHtml", () => {
-		it("returns HTML with escaped title and body in data attributes", () => {
-			const html = buildPrSectionHtml('Fix "bug" & <tag>', "## Summary\nDone");
-			expect(html).toContain(
-				'data-title="Fix &quot;bug&quot; &amp; &lt;tag&gt;"',
-			);
-			// Markers are HTML-escaped inside the data attribute
-			const escapedMarkerStart = MARKER_START.replace(/</g, "&lt;").replace(
-				/>/g,
-				"&gt;",
-			);
-			const escapedMarkerEnd = MARKER_END.replace(/</g, "&lt;").replace(
-				/>/g,
-				"&gt;",
-			);
-			expect(html).toContain(`data-body="${escapedMarkerStart}`);
-			expect(html).toContain(escapedMarkerEnd);
-		});
-
 		it("includes the PR section structure with status text and form", () => {
-			const html = buildPrSectionHtml("Title", "Body");
+			const html = buildPrSectionHtml();
 			expect(html).toContain('id="prSection"');
 			expect(html).toContain('id="prStatusText"');
 			expect(html).toContain('id="prForm"');
@@ -189,6 +171,8 @@ describe("PrCommentService", () => {
 			expect(html).toContain('id="prBodyInput"');
 			expect(html).toContain('id="prFormSubmit"');
 			expect(html).toContain("Pull Request");
+			expect(html).not.toContain("data-title");
+			expect(html).not.toContain("data-body");
 		});
 	});
 

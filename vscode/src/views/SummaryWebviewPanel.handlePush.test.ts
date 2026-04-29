@@ -280,18 +280,23 @@ vi.mock("../util/Logger.js", () => ({
 	log: { info, warn, error: logError },
 }));
 
-const { mockBuildHtml, mockBuildE2eTestSection, mockRenderTopic } = vi.hoisted(
-	() => ({
-		mockBuildHtml: vi.fn().mockReturnValue("<html>mock</html>"),
-		mockBuildE2eTestSection: vi.fn().mockReturnValue("<div>e2e</div>"),
-		mockRenderTopic: vi.fn().mockReturnValue("<div>topic</div>"),
-	}),
-);
+const {
+	mockBuildHtml,
+	mockBuildE2eTestSection,
+	mockRenderTopic,
+	mockRenderE2eScenario,
+} = vi.hoisted(() => ({
+	mockBuildHtml: vi.fn().mockReturnValue("<html>mock</html>"),
+	mockBuildE2eTestSection: vi.fn().mockReturnValue("<div>e2e</div>"),
+	mockRenderTopic: vi.fn().mockReturnValue("<div>topic</div>"),
+	mockRenderE2eScenario: vi.fn().mockReturnValue("<div>scenario</div>"),
+}));
 
 vi.mock("./SummaryHtmlBuilder.js", () => ({
 	buildHtml: mockBuildHtml,
 	buildE2eTestSection: mockBuildE2eTestSection,
 	renderTopic: mockRenderTopic,
+	renderE2eScenario: mockRenderE2eScenario,
 }));
 
 const { mockBuildMarkdown, mockBuildPrMarkdown } = vi.hoisted(() => ({

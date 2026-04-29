@@ -20,7 +20,6 @@ import type {
 } from "../../../cli/src/Types.js";
 import { buildPrSectionHtml } from "../services/PrCommentService.js";
 import { buildCss } from "./SummaryCssBuilder.js";
-import { buildPrMarkdown } from "./SummaryPrMarkdownBuilder.js";
 import { buildScript } from "./SummaryScriptBuilder.js";
 import {
 	collectSortedTopics,
@@ -96,7 +95,7 @@ ${buildAllConversationsSection(transcriptHashSet)}
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions, pushAction)}
 <hr class="separator" />
 ${buildRecapSection(summary.recap)}
-${buildPrSectionHtml(summary.commitMessage, buildPrMarkdown(summary))}
+${buildPrSectionHtml()}
 ${buildPlansAndNotesSection(summary.plans, summary.notes, planTranslateSet, noteTranslateSet)}
 ${buildE2eTestSection(summary)}
 ${buildSourceCommits(sourceNodes)}
@@ -435,8 +434,8 @@ export function buildE2eTestSection(summary: CommitSummary): string {
   <div class="section-header">
     <div class="section-title">\uD83E\uDDEA E2E Test <span class="section-count">${scenarios.length}</span></div>
     <span class="topic-actions">
-      <button class="topic-action-btn" id="editE2eBtn" title="Edit">\u270E</button>
-      <button class="topic-action-btn" id="regenE2eBtn" title="Regenerate">\uD83D\uDD04</button>
+      <button class="toggle-all-btn" id="toggleAllE2eBtn" title="Expand / Collapse all scenarios">Collapse All</button>
+      <button class="topic-action-btn" id="regenE2eBtn" title="Regenerate">&#x21BB;</button>
       <button class="topic-action-btn" id="deleteE2eBtn" title="Delete">\uD83D\uDDD1</button>
     </span>
   </div>
@@ -445,8 +444,13 @@ export function buildE2eTestSection(summary: CommitSummary): string {
 <hr class="separator" />`;
 }
 
-/** Renders a single E2E test scenario as a collapsible toggle. */
-function renderE2eScenario(s: E2eTestScenario, index: number): string {
+/**
+ * Renders a single E2E test scenario as a collapsible toggle.
+ *
+ * Exported so the webview-panel handler can re-render just one scenario
+ * row after a per-scenario edit (mirrors the topic pattern of `renderTopic`).
+ */
+export function renderE2eScenario(s: E2eTestScenario, index: number): string {
 	const preconditionsHtml = s.preconditions
 		? `<div class="callout preconditions">
       <div class="callout-body">
@@ -464,12 +468,25 @@ function renderE2eScenario(s: E2eTestScenario, index: number): string {
 		.map((r) => `<li>${escHtml(r)}</li>`)
 		.join("\n        ");
 
+	// Embed raw scenario data for inline edit mode (mirrors topic pattern).
+	// Arrays joined by newlines so edit textareas can use one-item-per-line.
+	const scenarioData = JSON.stringify({
+		title: s.title,
+		preconditions: s.preconditions ?? "",
+		steps: s.steps.join("\n"),
+		expectedResults: s.expectedResults.join("\n"),
+	});
+
 	return `
-<div class="toggle e2e-scenario" id="e2e-scenario-${index}">
+<div class="toggle e2e-scenario" id="e2e-scenario-${index}" data-scenario='${escAttr(scenarioData)}'>
   <div class="toggle-header">
     <span class="arrow">\u25BC</span>
     <span class="toggle-num">${padIndex(index)}</span>
     <span class="toggle-title">${escHtml(s.title)}</span>
+    <span class="topic-actions">
+      <button class="topic-action-btn e2e-edit-btn" data-scenario-index="${index}" title="Edit scenario">\u270E</button>
+      <button class="topic-action-btn e2e-delete-btn" data-scenario-index="${index}" title="Delete scenario">\uD83D\uDDD1</button>
+    </span>
   </div>
   <div class="toggle-content">
     ${preconditionsHtml}
@@ -479,7 +496,7 @@ function renderE2eScenario(s: E2eTestScenario, index: number): string {
         <div class="callout-text"><ol>${stepsHtml}</ol></div>
       </div>
     </div>
-    <div class="callout expected">
+    <div class="callout expectedResults">
       <div class="callout-body">
         <div class="callout-label">\u2705 Expected Results</div>
         <div class="callout-text"><ul>${expectedHtml}</ul></div>

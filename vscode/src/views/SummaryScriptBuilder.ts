@@ -189,12 +189,14 @@ ${buildPrMessageScript()}
     }
   });
 
-  // Toggle All: expand / collapse all memories
+  // Toggle All: expand / collapse all topic toggles and timeline groups.
+  // Scoped to topics — explicitly excludes .e2e-scenario so the E2E section
+  // has its own independent #toggleAllE2eBtn.
   var allCollapsed = false;
   var toggleAllBtn = document.getElementById('toggleAllBtn');
   if (toggleAllBtn) {
     toggleAllBtn.addEventListener('click', function() {
-      var items = document.querySelectorAll('.toggle');
+      var items = document.querySelectorAll('.toggle:not(.e2e-scenario), .timeline-group');
       allCollapsed = !allCollapsed;
       items.forEach(function(t) {
         if (allCollapsed) {
@@ -382,135 +384,79 @@ ${buildPrMessageScript()}
   }
 
   // ── E2E Test Guide ────────────────────────────────────────────────────
+  // Mirrors the Topics pattern: each scenario is a .toggle.e2e-scenario
+  // with its own edit/delete buttons; the section header has a Collapse-All
+  // button. Inline edit replaces title (in header) and content fields with
+  // textareas; Save posts editE2eScenario, Cancel restores cached HTML.
   // E2E scenario toggle is handled by the generic .toggle-header handler above.
 
-  // Generate / Regenerate button
-  var genE2eBtn = document.getElementById('generateE2eBtn');
-  var regenE2eBtn = document.getElementById('regenE2eBtn');
-  function handleGenerateE2e(btn) {
-    if (!btn) return;
-    btn.addEventListener('click', function() {
+  var E2E_EDIT_FIELDS = [
+    { key: 'preconditions',   label: '📋 Preconditions', placeholder: '' },
+    { key: 'steps',           label: '👣 Steps',          placeholder: 'One step per line' },
+    { key: 'expectedResults', label: '✅ Expected Results',     placeholder: 'One result per line' }
+  ];
+
+  function attachE2eHandlers(root) {
+    if (!root) return;
+
+    // Generate / Regenerate (placeholder + section header buttons share command).
+    var genBtn = root.querySelector('#generateE2eBtn');
+    if (genBtn) genBtn.addEventListener('click', function() {
       vscode.postMessage({ command: 'generateE2eTest' });
     });
-  }
-  handleGenerateE2e(genE2eBtn);
-  handleGenerateE2e(regenE2eBtn);
+    var regenBtn = root.querySelector('#regenE2eBtn');
+    if (regenBtn) regenBtn.addEventListener('click', function() {
+      vscode.postMessage({ command: 'generateE2eTest' });
+    });
 
-  // Delete E2E button
-  function attachDeleteE2eHandler(btn) {
-    if (!btn) return;
-    btn.addEventListener('click', function(e) {
+    // Section-level Delete (deletes the whole guide).
+    var sectionDelBtn = root.querySelector('#deleteE2eBtn');
+    if (sectionDelBtn) sectionDelBtn.addEventListener('click', function(e) {
       e.stopPropagation();
       vscode.postMessage({ command: 'deleteE2eTest' });
     });
-  }
-  attachDeleteE2eHandler(document.getElementById('deleteE2eBtn'));
 
-  // Edit E2E button — switch to Markdown textarea editing
-  function attachEditE2eHandler(btn) {
-    if (!btn) return;
-    btn.addEventListener('click', function(e) {
-      e.stopPropagation();
+    // Collapse-All for E2E (scoped to the e2e section only).
+    var toggleAllBtn = root.querySelector('#toggleAllE2eBtn');
+    if (toggleAllBtn) toggleAllBtn.addEventListener('click', function() {
       var section = document.getElementById('e2eTestSection');
-      if (!section || section.classList.contains('e2e-editing')) return;
-      section.classList.add('e2e-editing');
+      if (!section) return;
+      var scenarios = section.querySelectorAll('.toggle.e2e-scenario');
+      var allCollapsed = scenarios.length > 0 && Array.prototype.every.call(scenarios, function(s) {
+        return s.classList.contains('collapsed');
+      });
+      var collapseNext = !allCollapsed;
+      scenarios.forEach(function(s) {
+        if (collapseNext) { s.classList.add('collapsed'); }
+        else { s.classList.remove('collapsed'); }
+      });
+      toggleAllBtn.textContent = collapseNext ? 'Expand All' : 'Collapse All';
+    });
 
-      // Collect existing scenarios from DOM into Markdown text
-      var scenarios = section.querySelectorAll('.e2e-scenario');
-      var md = '';
-      scenarios.forEach(function(sc, i) {
-        var title = sc.querySelector('.toggle-title');
-        var precond = sc.querySelector('.callout.preconditions .callout-text');
-        var stepsOl = sc.querySelector('.callout.steps ol');
-        var expectedUl = sc.querySelector('.callout.expected ul');
-        if (i > 0) md += '\\n';
-        md += '### ' + (title ? title.textContent : 'Scenario') + '\\n';
-        if (precond && precond.textContent.trim()) {
-          md += '**Preconditions:** ' + precond.textContent.trim() + '\\n';
-        }
-        md += '**Steps:**\\n';
-        if (stepsOl) {
-          var items = stepsOl.querySelectorAll('li');
-          items.forEach(function(li, j) {
-            md += (j + 1) + '. ' + li.textContent + '\\n';
-          });
-        }
-        md += '**Expected:**\\n';
-        if (expectedUl) {
-          var items = expectedUl.querySelectorAll('li');
-          items.forEach(function(li) {
-            md += '- ' + li.textContent + '\\n';
-          });
+    // Per-scenario Delete.
+    root.querySelectorAll('.e2e-delete-btn').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        var idx = parseInt(btn.dataset.scenarioIndex, 10);
+        var scenarioEl = document.getElementById('e2e-scenario-' + idx);
+        var titleEl = scenarioEl ? scenarioEl.querySelector('.toggle-title') : null;
+        var title = titleEl ? titleEl.textContent : '';
+        vscode.postMessage({ command: 'deleteE2eScenario', index: idx, title: title });
+      });
+    });
+
+    // Per-scenario Edit.
+    root.querySelectorAll('.e2e-edit-btn').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        var idx = parseInt(btn.dataset.scenarioIndex, 10);
+        var toggle = document.getElementById('e2e-scenario-' + idx);
+        if (toggle && !toggle.classList.contains('editing')) {
+          enterE2eEditMode(toggle, idx);
         }
       });
-
-      // Save original content for cancel
-      section._originalE2eHtml = section.innerHTML;
-
-      // Replace section content with textarea + buttons (keep header)
-      var header = section.querySelector('.section-header');
-      section.innerHTML = '';
-      if (header) section.appendChild(header);
-
-      var ta = document.createElement('textarea');
-      ta.className = 'e2e-edit-area';
-      ta.value = md;
-      section.appendChild(ta);
-
-      var actions = document.createElement('div');
-      actions.className = 'e2e-edit-actions';
-      var cancelBtn = document.createElement('button');
-      cancelBtn.className = 'action-btn';
-      cancelBtn.textContent = 'Cancel';
-      var saveBtn = document.createElement('button');
-      saveBtn.className = 'action-btn primary';
-      saveBtn.textContent = 'Save';
-      actions.appendChild(cancelBtn);
-      actions.appendChild(saveBtn);
-      section.appendChild(actions);
-
-      // Auto-resize textarea
-      ta.style.height = ta.scrollHeight + 'px';
-      ta.addEventListener('input', function() {
-        ta.style.height = 'auto';
-        ta.style.height = ta.scrollHeight + 'px';
-      });
-      ta.focus();
-
-      // Cancel
-      cancelBtn.addEventListener('click', function() {
-        section.innerHTML = section._originalE2eHtml;
-        section.classList.remove('e2e-editing');
-        delete section._originalE2eHtml;
-        // Re-attach E2E handlers
-        reattachE2eHandlers();
-      });
-
-      // Save — parse Markdown back into scenarios
-      saveBtn.addEventListener('click', function() {
-        var text = ta.value;
-        var parsed = parseE2eMarkdown(text);
-        if (parsed.length === 0) {
-          ta.style.borderColor = 'var(--vscode-inputValidation-errorBorder, #f44)';
-          return;
-        }
-        saveBtn.textContent = 'Saving...';
-        saveBtn.disabled = true;
-        cancelBtn.disabled = true;
-        vscode.postMessage({ command: 'editE2eTest', scenarios: parsed });
-      });
-
-      // ESC to cancel
-      section._e2eEscHandler = function(ev) {
-        if (ev.key === 'Escape') {
-          ev.preventDefault();
-          cancelBtn.click();
-        }
-      };
-      document.addEventListener('keydown', section._e2eEscHandler);
     });
   }
-  attachEditE2eHandler(document.getElementById('editE2eBtn'));
 
   // ── Recap edit handler ─────────────────────────────────────────────────
   function attachEditRecapHandler() {
@@ -595,43 +541,125 @@ ${buildPrMessageScript()}
   }
   attachEditRecapHandler();
 
-  /** Parses Markdown text back into E2eTestScenario[] for the save handler. */
-  function parseE2eMarkdown(text) {
-    var scenarios = [];
-    var blocks = text.split(/^###\\s+/m).filter(function(b) { return b.trim().length > 0; });
-    for (var i = 0; i < blocks.length; i++) {
-      var block = blocks[i];
-      var lines = block.split('\\n');
-      var title = lines[0].trim();
-      var preconditions = '';
-      var steps = [];
-      var expected = [];
-      var mode = '';
-      for (var j = 1; j < lines.length; j++) {
-        var line = lines[j];
-        if (/^\\*\\*Preconditions:\\*\\*/.test(line)) {
-          preconditions = line.replace(/^\\*\\*Preconditions:\\*\\*\\s*/, '').trim();
-          mode = '';
-          continue;
-        }
-        if (/^\\*\\*Steps:\\*\\*/.test(line)) { mode = 'steps'; continue; }
-        if (/^\\*\\*Expected:\\*\\*/.test(line)) { mode = 'expected'; continue; }
-        var trimmed = line.trim();
-        if (!trimmed) continue;
-        if (mode === 'steps') {
-          steps.push(trimmed.replace(/^\\d+\\.\\s*/, ''));
-        } else if (mode === 'expected') {
-          expected.push(trimmed.replace(/^[-*]\\s+/, ''));
-        }
-      }
-      if (title && steps.length > 0) {
-        var sc = { title: title, steps: steps, expectedResults: expected };
-        if (preconditions) sc.preconditions = preconditions;
-        scenarios.push(sc);
-      }
+  function enterE2eEditMode(toggle, scenarioIndex) {
+    var data = JSON.parse(toggle.dataset.scenario || '{}');
+    toggle.classList.add('editing');
+    toggle.classList.remove('collapsed');
+
+    // Replace title span with input in the header (mirrors topic pattern).
+    var header = toggle.querySelector('.toggle-header');
+    var titleSpan = header.querySelector('.toggle-title');
+    toggle._originalTitleHtml = titleSpan.outerHTML;
+    var titleInput = document.createElement('input');
+    titleInput.className = 'edit-title-input';
+    titleInput.dataset.editField = 'title';
+    titleInput.value = data.title || '';
+    titleInput.style.pointerEvents = 'auto';
+    titleInput.addEventListener('click', function(e) { e.stopPropagation(); });
+    titleSpan.replaceWith(titleInput);
+
+    var content = toggle.querySelector('.toggle-content');
+    toggle._originalHtml = content.innerHTML;
+
+    var html = '';
+    for (var i = 0; i < E2E_EDIT_FIELDS.length; i++) {
+      var f = E2E_EDIT_FIELDS[i];
+      var val = data[f.key] || '';
+      html += '<div class="callout ' + f.key + '">' +
+        '<div class="callout-body">' +
+        '<div class="callout-label">' + f.label + '</div>' +
+        '<textarea class="edit-textarea" data-edit-field="' + f.key + '"' +
+        (f.placeholder ? ' placeholder="' + f.placeholder + '"' : '') +
+        '>' +
+        val.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') +
+        '</textarea></div></div>';
     }
-    return scenarios;
+
+    html += '<div class="edit-actions">' +
+      '<button class="edit-cancel-btn">Cancel</button>' +
+      '<button class="edit-save-btn">Save</button></div>';
+
+    content.innerHTML = html;
+
+    content.querySelectorAll('.edit-textarea').forEach(function(ta) {
+      autoResize(ta);
+      ta.addEventListener('input', function() { autoResize(ta); });
+    });
+
+    content.querySelector('.edit-cancel-btn').addEventListener('click', function() {
+      exitE2eEditMode(toggle);
+    });
+
+    var saveBtn = content.querySelector('.edit-save-btn');
+    saveBtn.addEventListener('click', function() {
+      var updates = {};
+      var titleEl = toggle.querySelector('[data-edit-field="title"]');
+      updates.title = titleEl ? titleEl.value : '';
+      content.querySelectorAll('[data-edit-field]').forEach(function(el) {
+        var field = el.dataset.editField;
+        var value = el.value;
+        if (field === 'steps' || field === 'expectedResults') {
+          updates[field] = value.split('\\n').map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+        } else if (field === 'preconditions') {
+          updates[field] = value.trim(); // empty string signals clear to backend
+        }
+      });
+      // Validation: title required.
+      if (!updates.title || !updates.title.trim()) {
+        var ti = toggle.querySelector('[data-edit-field="title"]');
+        if (ti) {
+          ti.focus();
+          ti.style.borderColor = 'var(--vscode-inputValidation-errorBorder, #f44)';
+        }
+        return;
+      }
+      // Validation: at least one step required.
+      if (!updates.steps || updates.steps.length === 0) {
+        var stepsEl = content.querySelector('[data-edit-field="steps"]');
+        if (stepsEl) {
+          stepsEl.focus();
+          stepsEl.style.borderColor = 'var(--vscode-inputValidation-errorBorder, #f44)';
+        }
+        return;
+      }
+      saveBtn.textContent = 'Saving...';
+      saveBtn.disabled = true;
+      content.querySelector('.edit-cancel-btn').disabled = true;
+      vscode.postMessage({ command: 'editE2eScenario', index: scenarioIndex, updates: updates });
+    });
+
+    toggle._escHandler = function(e) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        exitE2eEditMode(toggle);
+      }
+    };
+    document.addEventListener('keydown', toggle._escHandler);
   }
+
+  function exitE2eEditMode(toggle) {
+    if (toggle._escHandler) {
+      document.removeEventListener('keydown', toggle._escHandler);
+      delete toggle._escHandler;
+    }
+    toggle.classList.remove('editing');
+    var titleInput = toggle.querySelector('.edit-title-input');
+    if (titleInput && toggle._originalTitleHtml) {
+      var temp = document.createElement('div');
+      temp.innerHTML = toggle._originalTitleHtml;
+      titleInput.replaceWith(temp.firstChild);
+      delete toggle._originalTitleHtml;
+    }
+    var content = toggle.querySelector('.toggle-content');
+    if (toggle._originalHtml) {
+      content.innerHTML = toggle._originalHtml;
+      delete toggle._originalHtml;
+      attachCollapsibleHandlers(toggle);
+    }
+  }
+
+  attachE2eHandlers(document);
 
   // Handle E2E status messages from the extension
   window.addEventListener('message', function(event) {
@@ -639,71 +667,79 @@ ${buildPrMessageScript()}
     if (msg.command === 'e2eTestGenerating') {
       var btn = document.getElementById('generateE2eBtn') || document.getElementById('regenE2eBtn');
       if (btn) {
-        btn.textContent = 'Generating...';
+        if (btn.id === 'regenE2eBtn') {
+          btn.classList.add('generating');
+          btn.title = 'Generating...';
+        } else {
+          btn.textContent = 'Generating...';
+        }
         btn.disabled = true;
       }
     } else if (msg.command === 'e2eTestUpdated' && msg.html) {
+      // Whole-section replacement (used by Generate, section-level Delete,
+      // and per-scenario Delete since indices shift after removal).
       var section = document.getElementById('e2eTestSection');
       if (section) {
-        // Clean up ESC handler if in edit mode
-        if (section._e2eEscHandler) {
-          document.removeEventListener('keydown', section._e2eEscHandler);
-          delete section._e2eEscHandler;
-        }
-        section.classList.remove('e2e-editing');
-        // Replace entire section with server-rendered HTML (includes the outer section div + hr)
+        // Clean up any ESC handlers from scenarios currently in edit mode
+        // before the DOM nodes are discarded.
+        section.querySelectorAll('.e2e-scenario.editing').forEach(function(t) {
+          if (t._escHandler) {
+            document.removeEventListener('keydown', t._escHandler);
+          }
+        });
         var wrapper = document.createElement('div');
         wrapper.innerHTML = msg.html;
-        // The HTML contains the section div and an hr — extract the section
         var newSection = wrapper.querySelector('#e2eTestSection');
         if (newSection) {
-          // Also get the separator hr following the section
           var hr = section.nextElementSibling;
           section.replaceWith(newSection);
-          // Replace the old hr with the new one from rendered HTML
           var newHr = wrapper.querySelector('hr.separator');
           if (newHr && hr && hr.tagName === 'HR') {
             hr.replaceWith(newHr);
           } else if (newHr && !hr) {
             newSection.insertAdjacentElement('afterend', newHr);
           }
-          reattachE2eHandlers();
+          attachE2eHandlers(newSection);
         }
+      }
+    } else if (msg.command === 'e2eScenarioUpdated' && typeof msg.scenarioIndex === 'number' && msg.html) {
+      // Surgical per-scenario replacement preserves collapsed state of other scenarios.
+      var oldToggle = document.getElementById('e2e-scenario-' + msg.scenarioIndex);
+      if (oldToggle) {
+        if (oldToggle._escHandler) {
+          document.removeEventListener('keydown', oldToggle._escHandler);
+        }
+        var wasCollapsed = oldToggle.classList.contains('collapsed');
+        var wrapper = document.createElement('div');
+        wrapper.innerHTML = msg.html;
+        var newToggle = wrapper.firstElementChild;
+        if (newToggle) {
+          oldToggle.replaceWith(newToggle);
+          if (wasCollapsed) { newToggle.classList.add('collapsed'); }
+          attachE2eHandlers(newToggle);
+        }
+      }
+    } else if (msg.command === 'e2eScenarioUpdateError') {
+      // Re-enable save/cancel so the user can retry.
+      var editing = document.querySelector('.e2e-scenario.editing');
+      if (editing) {
+        var saveBtn = editing.querySelector('.edit-save-btn');
+        var cancelBtn = editing.querySelector('.edit-cancel-btn');
+        if (saveBtn) { saveBtn.textContent = 'Save'; saveBtn.disabled = false; }
+        if (cancelBtn) { cancelBtn.disabled = false; }
       }
     } else if (msg.command === 'e2eTestError') {
       var btn = document.getElementById('generateE2eBtn') || document.getElementById('regenE2eBtn');
       if (btn) {
-        btn.textContent = btn.id === 'generateE2eBtn' ? 'Generate' : '\\uD83D\\uDD04';
+        if (btn.id === 'regenE2eBtn') {
+          btn.classList.remove('generating');
+          btn.title = 'Regenerate';
+        } else {
+          btn.textContent = 'Generate';
+        }
         btn.disabled = false;
       }
-      // If in edit mode, re-enable buttons
-      var section = document.getElementById('e2eTestSection');
-      if (section && section.classList.contains('e2e-editing')) {
-        var saveBtn = section.querySelector('.action-btn.primary');
-        var cancelBtn = section.querySelector('.action-btn:not(.primary)');
-        if (saveBtn) { saveBtn.textContent = 'Save'; saveBtn.disabled = false; }
-        if (cancelBtn) { cancelBtn.disabled = false; }
-      }
     }
-
-  /** Re-attaches E2E button event handlers after DOM replacement. */
-  function reattachE2eHandlers() {
-    var section = document.getElementById('e2eTestSection');
-    if (!section) return;
-    // Re-attach toggle collapse (new DOM elements lack the global handler)
-    section.querySelectorAll('.toggle-header').forEach(function(header) {
-      header.addEventListener('click', function(e) {
-        if (e.target.closest('.topic-actions')) { return; }
-        header.parentElement.classList.toggle('collapsed');
-      });
-    });
-    // Re-attach generate/regen
-    handleGenerateE2e(document.getElementById('generateE2eBtn'));
-    handleGenerateE2e(document.getElementById('regenE2eBtn'));
-    // Re-attach edit and delete buttons
-    attachEditE2eHandler(document.getElementById('editE2eBtn'));
-    attachDeleteE2eHandler(document.getElementById('deleteE2eBtn'));
-  }
 
   // ── Plan inline edit messages ──
   if (msg.command === 'planContentLoaded' && msg.slug && msg.content !== undefined) {
