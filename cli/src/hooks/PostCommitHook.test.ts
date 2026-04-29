@@ -6,6 +6,16 @@ vi.mock("node:child_process", () => ({
 	execSync: vi.fn(),
 }));
 
+vi.mock("../core/StorageFactory.js", () => ({
+	createStorage: vi.fn().mockResolvedValue({
+		readFile: vi.fn().mockResolvedValue(null),
+		writeFiles: vi.fn().mockResolvedValue(undefined),
+		listFiles: vi.fn().mockResolvedValue([]),
+		exists: vi.fn().mockResolvedValue(true),
+		ensure: vi.fn().mockResolvedValue(undefined),
+	}),
+}));
+
 // Mock all dependencies
 vi.mock("../core/GitOps.js", () => ({
 	getCommitInfo: vi.fn(),
@@ -73,6 +83,8 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		migrateOneToOne: vi.fn(),
 		storePlans: vi.fn(),
 		storeNotes: vi.fn(),
+		setActiveStorage: vi.fn(),
+		resolveStorage: vi.fn(),
 		// Keep real implementations for pure tree-transform helpers.
 		stripFunctionalMetadata: actual.stripFunctionalMetadata,
 		resolveEffectiveTopics: actual.resolveEffectiveTopics,

@@ -42,6 +42,7 @@ import {
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
+import { createStorage } from "../core/StorageFactory.js";
 import {
 	extractTicketIdFromMessage,
 	generateSquashConsolidation,
@@ -56,6 +57,7 @@ import {
 	mergeManyToOne,
 	migrateOneToOne,
 	resolveEffectiveTopics,
+	setActiveStorage,
 	storeNotes,
 	storePlans,
 	storeSummary,
@@ -185,6 +187,11 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 	setLogDir(cwd);
 
 	log.info("=== Queue worker started ===");
+
+	// Create storage provider based on config (orphan/dual-write/folder)
+	// Sets module-level override in SummaryStore so all write operations use this provider.
+	const storage = await createStorage(cwd, cwd);
+	setActiveStorage(storage);
 
 	// Acquire lock to prevent concurrent runs
 	const lockAcquired = await acquireLock(cwd);
@@ -337,6 +344,7 @@ async function associatePlansWithCommit(
 	slugs: Set<string>,
 	commitHash: string,
 	cwd: string,
+	branch?: string,
 ): Promise<PlanAssociationResult> {
 	log.info("Plan association: detected %d slug(s) from transcripts: [%s]", slugs.size, [...slugs].join(", "));
 	const emptyResult: PlanAssociationResult = {
@@ -452,7 +460,7 @@ async function associatePlansWithCommit(
 
 	// Store plan files in orphan branch
 	if (planFiles.length > 0) {
-		await storePlans(planFiles, `Archive ${planFiles.length} plan(s) for commit ${shortHash}`, cwd);
+		await storePlans(planFiles, `Archive ${planFiles.length} plan(s) for commit ${shortHash}`, cwd, branch);
 		log.info("Associated %d plan(s) with commit %s", planFiles.length, shortHash);
 	}
 
@@ -483,7 +491,12 @@ async function detectUncommittedNoteIds(cwd: string): Promise<Set<string>> {
  * adds NoteReference entries to the summary, and backs up note files
  * to the orphan branch.
  */
-async function associateNotesWithCommit(ids: Set<string>, commitHash: string, cwd: string): Promise<NoteReference[]> {
+async function associateNotesWithCommit(
+	ids: Set<string>,
+	commitHash: string,
+	cwd: string,
+	branch?: string,
+): Promise<NoteReference[]> {
 	log.info("Note association: detected %d note(s): [%s]", ids.size, [...ids].join(", "));
 	if (ids.size === 0) return [];
 
@@ -560,7 +573,7 @@ async function associateNotesWithCommit(ids: Set<string>, commitHash: string, cw
 
 	// Store note files in orphan branch
 	if (noteFiles.length > 0) {
-		await storeNotes(noteFiles, `Archive ${noteFiles.length} note(s) for commit ${shortHash}`, cwd);
+		await storeNotes(noteFiles, `Archive ${noteFiles.length} note(s) for commit ${shortHash}`, cwd, branch);
 		log.info("Associated %d note(s) with commit %s", noteFiles.length, shortHash);
 	}
 
@@ -702,12 +715,12 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 
 	// Step 8a: Read uncommitted plan slugs from plans.json registry
 	const planSlugs = await detectPlanSlugsFromRegistry(cwd);
-	const planAssociation = await associatePlansWithCommit(planSlugs, commitInfo.hash, cwd);
+	const planAssociation = await associatePlansWithCommit(planSlugs, commitInfo.hash, cwd, branch);
 	const planRefs = planAssociation.refs;
 
 	// Step 8a2: Read uncommitted note IDs from plans.json registry
 	const noteIds = await detectUncommittedNoteIds(cwd);
-	const noteRefs = await associateNotesWithCommit(noteIds, commitInfo.hash, cwd);
+	const noteRefs = await associateNotesWithCommit(noteIds, commitInfo.hash, cwd, branch);
 
 	// Step 8b: Evaluate plan progress for each linked plan (Haiku calls parallelized)
 	const planProgressArtifacts: PlanProgressArtifact[] = [];

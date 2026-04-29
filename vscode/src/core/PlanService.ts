@@ -11,6 +11,7 @@
  * - Filtering: Branch-aware visibility, archive guards, ignored entries
  */
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -72,7 +73,8 @@ export async function detectPlans(cwd: string): Promise<Array<PlanInfo>> {
 		await savePlansRegistry({ ...registry, plans: registryPlans }, cwd);
 	}
 
-	const plans = buildPlanInfoList(registryPlans);
+	const branch = getCurrentBranch(cwd);
+	const plans = buildPlanInfoList(registryPlans, branch);
 	log.info(
 		"plans",
 		`detectPlans found ${plans.length} plans (${Object.keys(registryPlans).length} in registry)`,
@@ -83,10 +85,11 @@ export async function detectPlans(cwd: string): Promise<Array<PlanInfo>> {
 /** Converts registry entries into a sorted PlanInfo array, filtering out invisible entries. */
 function buildPlanInfoList(
 	registryPlans: Record<string, PlanEntry>,
+	currentBranch?: string,
 ): Array<PlanInfo> {
 	const plans: Array<PlanInfo> = [];
 	for (const entry of Object.values(registryPlans)) {
-		const info = toPlanInfo(entry);
+		const info = toPlanInfo(entry, currentBranch);
 		if (info) {
 			plans.push(info);
 		}
@@ -99,8 +102,13 @@ function buildPlanInfoList(
 }
 
 /** Converts a single PlanEntry to PlanInfo, returning null if the entry should be hidden. */
-function toPlanInfo(entry: PlanEntry): PlanInfo | null {
+function toPlanInfo(entry: PlanEntry, currentBranch?: string): PlanInfo | null {
 	if (entry.ignored) {
+		return null;
+	}
+
+	// Skip entries from other branches
+	if (currentBranch && entry.branch && entry.branch !== currentBranch) {
 		return null;
 	}
 
@@ -474,8 +482,6 @@ function hashFileContent(filePath: string): string {
 
 export function getCurrentBranch(cwd: string): string {
 	try {
-		const { execFileSync } =
-			require("node:child_process") as typeof import("node:child_process");
 		return execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
 			cwd,
 			encoding: "utf-8",

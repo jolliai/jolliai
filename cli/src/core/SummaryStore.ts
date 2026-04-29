@@ -16,7 +16,7 @@
  *   - Cached aliases (`commitAliases`) so repeated lookups skip git calls
  */
 
-import { createLogger, ORPHAN_BRANCH } from "../Logger.js";
+import { createLogger } from "../Logger.js";
 import type {
 	CommitInfo,
 	CommitSource,
@@ -33,17 +33,23 @@ import type {
 	SummaryIndexEntry,
 	TopicSummary,
 } from "../Types.js";
-import {
-	getDiffStats,
-	getTreeHash,
-	listFilesInBranch,
-	readFileFromBranch,
-	writeMultipleFilesToBranch,
-} from "./GitOps.js";
+import { getDiffStats, getTreeHash } from "./GitOps.js";
+import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { acquireLock, releaseLock } from "./SessionTracker.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
+import type { StorageProvider } from "./StorageProvider.js";
 import { getDisplayDate } from "./SummaryFormat.js";
 import { collectAllTopics, countTopics, isUnifiedHoistFormat } from "./SummaryTree.js";
+
+let activeStorageOverride: StorageProvider | undefined;
+
+export function setActiveStorage(storage: StorageProvider | undefined): void {
+	activeStorageOverride = storage;
+}
+
+export function resolveStorage(storage?: StorageProvider, cwd?: string): StorageProvider {
+	return storage ?? activeStorageOverride ?? new OrphanBranchStorage(cwd);
+}
 
 const log = createLogger("SummaryStore");
 
@@ -134,11 +140,10 @@ export async function storeSummary(
 		}
 	}
 
-	await writeMultipleFilesToBranch(
-		ORPHAN_BRANCH,
+	const store = resolveStorage(undefined, cwd);
+	await store.writeFiles(
 		files,
 		`${verb} summary for ${summary.commitHash.substring(0, 8)}: ${summary.commitMessage.substring(0, 50)}`,
-		cwd,
 	);
 
 	log.info("Summary stored successfully for commit %s", summary.commitHash.substring(0, 8));
@@ -237,11 +242,10 @@ export async function migrateOneToOne(
 		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
 	];
 
-	await writeMultipleFilesToBranch(
-		ORPHAN_BRANCH,
+	const store = resolveStorage(undefined, cwd);
+	await store.writeFiles(
 		files,
 		`Migrate summary ${oldSummary.commitHash.substring(0, 8)} → ${newCommitInfo.hash.substring(0, 8)}`,
-		cwd,
 	);
 	log.info("Summary migrated: %s → %s", oldSummary.commitHash.substring(0, 8), newCommitInfo.hash.substring(0, 8));
 }
@@ -617,12 +621,8 @@ export async function mergeManyToOne(
 		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
 	];
 
-	await writeMultipleFilesToBranch(
-		ORPHAN_BRANCH,
-		files,
-		`Merge summaries [${oldHashesStr}] → ${newCommitInfo.hash.substring(0, 8)}`,
-		cwd,
-	);
+	const store = resolveStorage(undefined, cwd);
+	await store.writeFiles(files, `Merge summaries [${oldHashesStr}] → ${newCommitInfo.hash.substring(0, 8)}`);
 	log.info(
 		"Summaries merged: [%s] → %s (%d children, %d orphaned docs)",
 		oldHashesStr,
@@ -661,7 +661,8 @@ export async function removeFromIndex(commitHash: string, cwd?: string): Promise
 	};
 	const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
 
-	await writeMultipleFilesToBranch(ORPHAN_BRANCH, files, `Remove index entry for ${commitHash.substring(0, 8)}`, cwd);
+	const store = resolveStorage(undefined, cwd);
+	await store.writeFiles(files, `Remove index entry for ${commitHash.substring(0, 8)}`);
 	log.info("Removed %s from index", commitHash.substring(0, 8));
 }
 
@@ -672,7 +673,8 @@ export async function removeFromIndex(commitHash: string, cwd?: string): Promise
  * Returns null if no transcript file exists for the given commit hash.
  */
 export async function readTranscript(commitHash: string, cwd?: string): Promise<StoredTranscript | null> {
-	const raw = await readFileFromBranch(ORPHAN_BRANCH, `transcripts/${commitHash}.json`, cwd);
+	const store = resolveStorage(undefined, cwd);
+	const raw = await store.readFile(`transcripts/${commitHash}.json`);
 	if (!raw) return null;
 	try {
 		return JSON.parse(raw) as StoredTranscript;
@@ -737,7 +739,8 @@ export async function saveTranscriptsBatch(
 		.filter(Boolean)
 		.join(", ");
 
-	await writeMultipleFilesToBranch(ORPHAN_BRANCH, files, `Update transcripts: ${summary}`, cwd);
+	const store = resolveStorage(undefined, cwd);
+	await store.writeFiles(files, `Update transcripts: ${summary}`);
 	log.info("Transcript batch: %s", summary);
 }
 
@@ -750,10 +753,11 @@ export async function deleteTranscript(commitHash: string, cwd?: string): Promis
 
 /**
  * Returns the set of commit hashes that have transcript files in the orphan branch.
- * Uses `listFilesInBranch()` to scan the `transcripts/` prefix.
+ * Scans the `transcripts/` prefix via the active storage provider.
  */
 export async function getTranscriptHashes(cwd?: string): Promise<Set<string>> {
-	const files = await listFilesInBranch(ORPHAN_BRANCH, "transcripts/", cwd);
+	const store = resolveStorage(undefined, cwd);
+	const files = await store.listFiles("transcripts/");
 	const hashes = new Set<string>();
 	for (const filePath of files) {
 		// filePath = "transcripts/abc123.json" → extract "abc123"
@@ -968,12 +972,8 @@ export async function scanTreeHashAliases(commitHashes: string[], cwd?: string):
 		const mergedAliases = { ...existingAliases, ...newAliases };
 		const newIndex: SummaryIndex = { ...index, commitAliases: mergedAliases };
 		const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
-		await writeMultipleFilesToBranch(
-			ORPHAN_BRANCH,
-			files,
-			`Add ${Object.keys(newAliases).length} tree hash alias(es)`,
-			cwd,
-		);
+		const store = resolveStorage(undefined, cwd);
+		await store.writeFiles(files, `Add ${Object.keys(newAliases).length} tree hash alias(es)`);
 	} finally {
 		await releaseLock(cwd);
 	}
@@ -1056,7 +1056,8 @@ export async function migrateIndexToV3(cwd?: string): Promise<{ migrated: number
 	};
 
 	const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
-	await writeMultipleFilesToBranch(ORPHAN_BRANCH, files, `Migrate index v1 → v3 (${migrated} entries)`, cwd);
+	const store = resolveStorage(undefined, cwd);
+	await store.writeFiles(files, `Migrate index v1 → v3 (${migrated} entries)`);
 
 	log.info("Index migrated to v3: %d migrated, %d skipped", migrated, skipped);
 	return { migrated, skipped };
@@ -1131,7 +1132,8 @@ async function flattenSummaryTree(
  * Only works for root nodes (files exist at `summaries/{rootHash}.json`).
  */
 async function readSummaryFile(commitHash: string, cwd?: string): Promise<CommitSummary | null> {
-	const content = await readFileFromBranch(ORPHAN_BRANCH, `summaries/${commitHash}.json`, cwd);
+	const store = resolveStorage(undefined, cwd);
+	const content = await store.readFile(`summaries/${commitHash}.json`);
 	if (!content) return null;
 
 	try {
@@ -1198,7 +1200,8 @@ export async function getIndex(cwd?: string): Promise<SummaryIndex | null> {
  * Loads the index file from the orphan branch.
  */
 async function loadIndex(cwd?: string): Promise<SummaryIndex | null> {
-	const content = await readFileFromBranch(ORPHAN_BRANCH, INDEX_FILE, cwd);
+	const store = resolveStorage(undefined, cwd);
+	const content = await store.readFile(INDEX_FILE);
 	if (!content) {
 		return null;
 	}
@@ -1221,16 +1224,19 @@ export async function storePlans(
 	planFiles: ReadonlyArray<{ slug: string; content: string }>,
 	commitMessage: string,
 	cwd?: string,
+	branch?: string,
 ): Promise<void> {
 	if (planFiles.length === 0) return;
 
 	const files: FileWrite[] = planFiles.map((p) => ({
 		path: `plans/${p.slug}.md`,
 		content: p.content,
+		branch,
 	}));
 
-	await writeMultipleFilesToBranch(ORPHAN_BRANCH, files, commitMessage, cwd);
-	log.info("Stored %d plan file(s) in orphan branch", planFiles.length);
+	const store = resolveStorage(undefined, cwd);
+	await store.writeFiles(files, commitMessage);
+	log.info("Stored %d plan file(s)", planFiles.length);
 }
 
 /**
@@ -1239,7 +1245,8 @@ export async function storePlans(
  */
 export async function readPlanFromBranch(slug: string, cwd?: string): Promise<string | null> {
 	try {
-		return await readFileFromBranch(ORPHAN_BRANCH, `plans/${slug}.md`, cwd);
+		const store = resolveStorage(undefined, cwd);
+		return await store.readFile(`plans/${slug}.md`);
 	} catch {
 		return null;
 	}
@@ -1251,7 +1258,8 @@ export async function readPlanFromBranch(slug: string, cwd?: string): Promise<st
  */
 export async function readPlanProgress(slug: string, cwd?: string): Promise<PlanProgressArtifact | null> {
 	try {
-		const json = await readFileFromBranch(ORPHAN_BRANCH, `plan-progress/${slug}.json`, cwd);
+		const store = resolveStorage(undefined, cwd);
+		const json = await store.readFile(`plan-progress/${slug}.json`);
 		if (!json) return null;
 		return JSON.parse(json) as PlanProgressArtifact;
 	} catch {
@@ -1269,16 +1277,19 @@ export async function storeNotes(
 	noteFiles: ReadonlyArray<{ id: string; content: string }>,
 	commitMessage: string,
 	cwd?: string,
+	branch?: string,
 ): Promise<void> {
 	if (noteFiles.length === 0) return;
 
 	const files: FileWrite[] = noteFiles.map((n) => ({
 		path: `notes/${n.id}.md`,
 		content: n.content,
+		branch,
 	}));
 
-	await writeMultipleFilesToBranch(ORPHAN_BRANCH, files, commitMessage, cwd);
-	log.info("Stored %d note file(s) in orphan branch", noteFiles.length);
+	const store = resolveStorage(undefined, cwd);
+	await store.writeFiles(files, commitMessage);
+	log.info("Stored %d note file(s)", noteFiles.length);
 }
 
 /**
@@ -1287,7 +1298,8 @@ export async function storeNotes(
  */
 export async function readNoteFromBranch(id: string, cwd?: string): Promise<string | null> {
 	try {
-		return await readFileFromBranch(ORPHAN_BRANCH, `notes/${id}.md`, cwd);
+		const store = resolveStorage(undefined, cwd);
+		return await store.readFile(`notes/${id}.md`);
 	} catch {
 		return null;
 	}

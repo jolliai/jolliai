@@ -626,6 +626,8 @@ export interface FileWrite {
 	readonly content: string;
 	/** When true, removes this file from the branch instead of writing it */
 	readonly delete?: boolean;
+	/** Git branch this file belongs to. Used by FolderStorage to place visible copies in the correct branch directory. */
+	readonly branch?: string;
 }
 
 /** Log levels for the Logger module */
