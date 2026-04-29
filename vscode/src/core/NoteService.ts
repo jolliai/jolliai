@@ -43,9 +43,10 @@ export async function detectNotes(cwd: string): Promise<Array<NoteInfo>> {
 	const registry = await loadPlansRegistry(cwd);
 	const notes = registry.notes ?? {};
 
+	const branch = getCurrentBranch(cwd);
 	const result: Array<NoteInfo> = [];
 	for (const entry of Object.values(notes)) {
-		const info = toNoteInfo(entry);
+		const info = toNoteInfo(entry, branch);
 		if (info) {
 			result.push(info);
 		}
@@ -314,8 +315,13 @@ export function generateNoteSlug(title: string): string {
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
 /** Converts a NoteEntry to NoteInfo, returning null if the entry should be hidden. */
-function toNoteInfo(entry: NoteEntry): NoteInfo | null {
+function toNoteInfo(entry: NoteEntry, currentBranch?: string): NoteInfo | null {
 	if (entry.ignored) {
+		return null;
+	}
+
+	// Skip entries from other branches
+	if (currentBranch && entry.branch && entry.branch !== currentBranch) {
 		return null;
 	}
 

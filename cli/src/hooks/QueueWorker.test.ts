@@ -61,6 +61,16 @@ vi.mock("../core/Summarizer.js", async (importOriginal) => {
 	};
 });
 
+vi.mock("../core/StorageFactory.js", () => ({
+	createStorage: vi.fn().mockResolvedValue({
+		readFile: vi.fn().mockResolvedValue(null),
+		writeFiles: vi.fn().mockResolvedValue(undefined),
+		listFiles: vi.fn().mockResolvedValue([]),
+		exists: vi.fn().mockResolvedValue(true),
+		ensure: vi.fn().mockResolvedValue(undefined),
+	}),
+}));
+
 vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/SummaryStore.js")>();
 	return {
@@ -70,6 +80,7 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		migrateOneToOne: vi.fn(),
 		storePlans: vi.fn(),
 		storeNotes: vi.fn(),
+		setActiveStorage: vi.fn(),
 		// Real implementations -- runSquashPipeline / handleAmendPipeline call
 		// these to expand source commits and copy-hoist topics. The mocks above
 		// cover the storage write side; these helpers are pure tree transforms

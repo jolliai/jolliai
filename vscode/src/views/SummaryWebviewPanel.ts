@@ -162,7 +162,7 @@ interface TranscriptEntryUpdate {
 }
 
 /** Source of the panel — determines which static slot it occupies. */
-export type SummaryPanelSource = "memory" | "commit";
+export type SummaryPanelSource = "memory" | "commit" | "kb";
 
 export class SummaryWebviewPanel {
 	/**
@@ -220,7 +220,7 @@ export class SummaryWebviewPanel {
 		this.panel = vscode.window.createWebviewPanel(
 			viewType,
 			"Commit Memory",
-			vscode.ViewColumn.Beside,
+			source === "kb" ? vscode.ViewColumn.One : vscode.ViewColumn.Beside,
 			{
 				enableScripts: true,
 				localResourceRoots: [extensionUri],
@@ -578,7 +578,7 @@ export class SummaryWebviewPanel {
 		const config = await loadGlobalConfig();
 		const pushAction = config.pushAction ?? "jolli";
 
-		if (source === "commit") {
+		if (source === "commit" || source === "kb") {
 			const existing = SummaryWebviewPanel.commitPanels.get(summary.commitHash);
 			if (existing) {
 				// Snapshot prior state, then re-run refresh pipeline unconditionally.
@@ -611,7 +611,8 @@ export class SummaryWebviewPanel {
 				// Passing ViewColumn.Beside can trigger a column-move (VSCode
 				// recomputes "beside" against the active editor at call time),
 				// which destroys and recreates the iframe and leaves it blank.
-				existing.panel.reveal(undefined, true);
+				// KB source: switch focus to the tab. Commit source: keep focus on sidebar.
+				existing.panel.reveal(undefined, source !== "kb");
 				return;
 			}
 		}

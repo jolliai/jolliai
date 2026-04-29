@@ -7,6 +7,8 @@ vi.mock("./GitOps.js", () => ({
 	listFilesInBranch: vi.fn(),
 	getTreeHash: vi.fn(),
 	getDiffStats: vi.fn(),
+	ensureOrphanBranch: vi.fn(),
+	orphanBranchExists: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("./SessionTracker.js", () => ({

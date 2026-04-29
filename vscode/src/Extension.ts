@@ -6,10 +6,15 @@
  */
 
 import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import * as vscode from "vscode";
-import { acquireLock, releaseLock } from "../../cli/src/core/SessionTracker.js";
+import {
+	acquireLock,
+	loadConfig,
+	releaseLock,
+} from "../../cli/src/core/SessionTracker.js";
 import {
 	cleanupV1IfExpired,
 	hasMigrationMeta,
@@ -43,6 +48,10 @@ import {
 	type CommitItem,
 	HistoryTreeProvider,
 } from "./providers/HistoryTreeProvider.js";
+import {
+	type KBFileItem,
+	KnowledgeBaseTreeProvider,
+} from "./providers/KnowledgeBaseTreeProvider.js";
 import {
 	MemoriesTreeProvider,
 	type MemoryItem,
@@ -146,7 +155,138 @@ function resolveGitPath(
 export function activate(context: vscode.ExtensionContext): void {
 	const workspaceRoot = getWorkspaceRoot();
 	if (!workspaceRoot) {
-		log.warn("activate", "No workspace root found — skipping activation");
+		// Register ALL declared commands as no-ops so buttons don't throw "command not found"
+		const noFolder = () =>
+			vscode.window.showInformationMessage(
+				"Please open a folder to use Jolli Memory.",
+			);
+		const allCommands = [
+			"jollimemory.enableJolliMemory",
+			"jollimemory.disableJolliMemory",
+			"jollimemory.refreshStatus",
+			"jollimemory.refreshMemories",
+			"jollimemory.refreshKnowledgeBase",
+			"jollimemory.migrateToKnowledgeBase",
+			"jollimemory.openKBCommitSummary",
+			"jollimemory.openSettings",
+			"jollimemory.refreshFiles",
+			"jollimemory.refreshHistory",
+			"jollimemory.refreshPlans",
+			"jollimemory.commitAI",
+			"jollimemory.squash",
+			"jollimemory.pushBranch",
+			"jollimemory.pushToJolli",
+			"jollimemory.exportMemories",
+			"jollimemory.selectAllFiles",
+			"jollimemory.selectAllCommits",
+			"jollimemory.searchMemories",
+			"jollimemory.clearMemoryFilter",
+			"jollimemory.loadMoreMemories",
+			"jollimemory.viewMemorySummary",
+			"jollimemory.viewSummary",
+			"jollimemory.copyCommitHash",
+			"jollimemory.copyRecallPrompt",
+			"jollimemory.openFileChange",
+			"jollimemory.openCommitFileChange",
+			"jollimemory.discardFileChanges",
+			"jollimemory.discardSelectedChanges",
+			"jollimemory.focusSidebar",
+			"jollimemory.addPlan",
+			"jollimemory.editPlan",
+			"jollimemory.removePlan",
+			"jollimemory.addMarkdownNote",
+			"jollimemory.addTextSnippet",
+			"jollimemory.editNote",
+			"jollimemory.removeNote",
+			"jollimemory.openInClaudeCode",
+			"jollimemory.focusKnowledgeBase",
+			"jollimemory.signIn",
+			"jollimemory.signOut",
+		];
+		for (const cmd of allCommands) {
+			context.subscriptions.push(
+				vscode.commands.registerCommand(cmd, noFolder),
+			);
+		}
+		return;
+	}
+
+	// Check if git is initialized — if not, offer to init
+	if (!existsSync(join(workspaceRoot, ".git"))) {
+		const noGit = () =>
+			vscode.window
+				.showWarningMessage(
+					"This folder is not a git repository. Jolli Memory requires git.",
+					"Initialize Git",
+				)
+				.then((choice) => {
+					if (choice === "Initialize Git") {
+						try {
+							execSync("git init", { cwd: workspaceRoot });
+							vscode.window
+								.showInformationMessage(
+									"Git initialized. Please reload the window to activate Jolli Memory.",
+									"Reload",
+								)
+								.then((r) => {
+									if (r === "Reload")
+										vscode.commands.executeCommand(
+											"workbench.action.reloadWindow",
+										);
+								});
+						} catch (err) {
+							vscode.window.showErrorMessage(
+								`Failed to initialize git: ${(err as Error).message}`,
+							);
+						}
+					}
+				});
+		const allCommands = [
+			"jollimemory.enableJolliMemory",
+			"jollimemory.disableJolliMemory",
+			"jollimemory.refreshStatus",
+			"jollimemory.refreshMemories",
+			"jollimemory.refreshKnowledgeBase",
+			"jollimemory.migrateToKnowledgeBase",
+			"jollimemory.openKBCommitSummary",
+			"jollimemory.openSettings",
+			"jollimemory.refreshFiles",
+			"jollimemory.refreshHistory",
+			"jollimemory.refreshPlans",
+			"jollimemory.commitAI",
+			"jollimemory.squash",
+			"jollimemory.pushBranch",
+			"jollimemory.pushToJolli",
+			"jollimemory.exportMemories",
+			"jollimemory.selectAllFiles",
+			"jollimemory.selectAllCommits",
+			"jollimemory.searchMemories",
+			"jollimemory.clearMemoryFilter",
+			"jollimemory.loadMoreMemories",
+			"jollimemory.viewMemorySummary",
+			"jollimemory.viewSummary",
+			"jollimemory.copyCommitHash",
+			"jollimemory.copyRecallPrompt",
+			"jollimemory.openFileChange",
+			"jollimemory.openCommitFileChange",
+			"jollimemory.discardFileChanges",
+			"jollimemory.discardSelectedChanges",
+			"jollimemory.focusSidebar",
+			"jollimemory.addPlan",
+			"jollimemory.editPlan",
+			"jollimemory.removePlan",
+			"jollimemory.addMarkdownNote",
+			"jollimemory.addTextSnippet",
+			"jollimemory.editNote",
+			"jollimemory.removeNote",
+			"jollimemory.openInClaudeCode",
+			"jollimemory.focusKnowledgeBase",
+			"jollimemory.signIn",
+			"jollimemory.signOut",
+		];
+		for (const cmd of allCommands) {
+			context.subscriptions.push(vscode.commands.registerCommand(cmd, noGit));
+		}
 		return;
 	}
 
@@ -342,8 +482,23 @@ export function activate(context: vscode.ExtensionContext): void {
 		),
 	);
 
+	// ── Knowledge Base tree provider ────────────────────────────────────────
+	const kbProvider = new KnowledgeBaseTreeProvider();
+	context.subscriptions.push(kbProvider);
+	let kbFocused = false;
+
+	// KB initialization is serialized in initializeKB() below to avoid
+	// race conditions from concurrent orphan branch and config access.
+
 	// Register tree views FIRST so providers are available before context keys
 	// trigger `when` clause re-evaluation (which may cause VSCode to query tree data).
+
+	const kbView = vscode.window.createTreeView("jollimemory.knowledgeBaseView", {
+		treeDataProvider: kbProvider,
+		showCollapseAll: true,
+	});
+	context.subscriptions.push(kbView);
+
 	const statusView = vscode.window.createTreeView("jollimemory.statusView", {
 		treeDataProvider: statusProvider,
 		showCollapseAll: false,
@@ -420,11 +575,38 @@ export function activate(context: vscode.ExtensionContext): void {
 		true,
 	);
 
-	// Run migrations sequentially: orphan branch migration must complete before
-	// flat index migration to prevent concurrent writes to the same orphan branch.
-	// TODO(v1.0): Remove all migration code (migrateV1IfNeeded, migrateIndexIfNeeded,
-	// cleanupV1IfExpired) once JolliMemory v1.0 ships — all users will be on v3 by then.
-	void (async () => {
+	// ── Serialized KB initialization ────────────────────────────────────────
+	// All three KB-related startup tasks (KB tree root, legacy migrations, KB
+	// folder init + auto-migration) are serialized into one async function to
+	// prevent race conditions from concurrent orphan branch and config access.
+	async function initializeKB(): Promise<void> {
+		// Dynamic imports are used throughout initializeKB because these cli/
+		// modules depend on Node-only APIs (fs, child_process). Static imports
+		// would cause esbuild to bundle them into the VS Code extension,
+		// breaking the build in webview/browser contexts.
+
+		// 1. Initialize KB root path for the tree provider
+		try {
+			const { extractRepoName, getRemoteUrl, resolveKBPath } = await import(
+				"../../cli/src/core/KBPathResolver.js"
+			);
+			const repoName = extractRepoName(workspaceRoot);
+			const remoteUrl = getRemoteUrl(workspaceRoot);
+			const cfg = await loadConfig();
+			const customKBPath = (cfg as Record<string, unknown>).knowledgeBasePath as
+				| string
+				| undefined;
+			const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
+			kbProvider.setKBRoot(kbRoot);
+		} catch (err) {
+			log.error("activate", "KB tree init failed", err);
+		}
+
+		// 2. Run legacy migrations sequentially: orphan branch migration must
+		// complete before flat index migration to prevent concurrent writes.
+		// TODO(v1.0): Remove all migration code (migrateV1IfNeeded,
+		// migrateIndexIfNeeded, cleanupV1IfExpired) once JolliMemory v1.0
+		// ships — all users will be on v3 by then.
 		await migrateV1IfNeeded(
 			workspaceRoot,
 			statusStore,
@@ -437,11 +619,64 @@ export function activate(context: vscode.ExtensionContext): void {
 			commitsStore,
 			filesStore,
 		);
-	})();
 
-	// V1 branch delayed cleanup: after migration, the v1 branch is retained for
-	// 48 hours as a safety net. Check if the retention period has expired and delete.
-	void cleanupV1IfExpired(workspaceRoot);
+		// V1 branch delayed cleanup: after migration, the v1 branch is retained
+		// for 48 hours as a safety net. Check if the retention period has expired.
+		await cleanupV1IfExpired(workspaceRoot);
+
+		// 3. KB folder auto-initialization + migration
+		// Creates the KB folder (~/Documents/jolli/{repoName}/) and auto-migrates
+		// orphan branch data if migration hasn't been completed yet.
+		try {
+			const {
+				extractRepoName,
+				getRemoteUrl,
+				initializeKBFolder,
+				resolveKBPath,
+			} = await import("../../cli/src/core/KBPathResolver.js");
+			const { MetadataManager } = await import(
+				"../../cli/src/core/MetadataManager.js"
+			);
+			const { OrphanBranchStorage } = await import(
+				"../../cli/src/core/OrphanBranchStorage.js"
+			);
+			const { FolderStorage } = await import(
+				"../../cli/src/core/FolderStorage.js"
+			);
+			const { MigrationEngine } = await import(
+				"../../cli/src/core/MigrationEngine.js"
+			);
+
+			const repoName = extractRepoName(workspaceRoot);
+			const remoteUrl = getRemoteUrl(workspaceRoot);
+			const config = await loadConfig();
+			const customKBPath = (config as Record<string, unknown>)
+				.knowledgeBasePath as string | undefined;
+			const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
+			initializeKBFolder(kbRoot, repoName, remoteUrl);
+
+			// Auto-migrate if orphan branch has data but migration not completed
+			const orphan = new OrphanBranchStorage(workspaceRoot);
+			if (await orphan.exists()) {
+				const mm = new MetadataManager(join(kbRoot, ".jolli"));
+				const migrationState = mm.readMigrationState();
+				if (!migrationState || migrationState.status !== "completed") {
+					const folder = new FolderStorage(kbRoot, mm);
+					await folder.ensure();
+					const engine = new MigrationEngine(orphan, folder, mm);
+					const result = await engine.runMigration();
+					log.info(
+						"activate",
+						`KB auto-migration: ${result.status} (${result.migratedEntries}/${result.totalEntries})`,
+					);
+				}
+			}
+		} catch (err) {
+			log.error("activate", "KB folder init/migration failed", err);
+		}
+	}
+
+	void initializeKB();
 
 	// ── sessions.json watcher ─────────────────────────────────────────────────
 	// When sessions.json is created or updated (e.g. a new Claude Code session
@@ -646,6 +881,146 @@ export function activate(context: vscode.ExtensionContext): void {
 	const exportMemoriesCommand = new ExportMemoriesCommand(bridge);
 
 	context.subscriptions.push(
+		// Knowledge Base panel
+		vscode.commands.registerCommand("jollimemory.refreshKnowledgeBase", () => {
+			kbProvider.refresh();
+		}),
+		vscode.commands.registerCommand(
+			"jollimemory.focusKnowledgeBase",
+			async () => {
+				// Minimize all other Jolli Memory sections by toggling off visible ones
+				const otherViews = [
+					"jollimemory.statusView",
+					"jollimemory.memoriesView",
+					"jollimemory.plansView",
+					"jollimemory.filesView",
+					"jollimemory.historyView",
+				];
+				if (kbFocused) {
+					// Restore: show all panels again
+					for (const viewId of otherViews) {
+						await vscode.commands.executeCommand(`${viewId}.toggleVisibility`);
+					}
+					kbFocused = false;
+				} else {
+					// Focus: hide all other panels
+					for (const viewId of otherViews) {
+						await vscode.commands.executeCommand(`${viewId}.toggleVisibility`);
+					}
+					await vscode.commands.executeCommand(
+						"jollimemory.knowledgeBaseView.focus",
+					);
+					kbFocused = true;
+				}
+			},
+		),
+		vscode.commands.registerCommand(
+			"jollimemory.migrateToKnowledgeBase",
+			async () => {
+				try {
+					const {
+						extractRepoName,
+						getRemoteUrl,
+						initializeKBFolder,
+						resolveKBPath,
+					} = await import("../../cli/src/core/KBPathResolver.js");
+					const { MetadataManager } = await import(
+						"../../cli/src/core/MetadataManager.js"
+					);
+					const { OrphanBranchStorage } = await import(
+						"../../cli/src/core/OrphanBranchStorage.js"
+					);
+					const { FolderStorage } = await import(
+						"../../cli/src/core/FolderStorage.js"
+					);
+					const { MigrationEngine } = await import(
+						"../../cli/src/core/MigrationEngine.js"
+					);
+
+					const repoName = extractRepoName(workspaceRoot);
+					const remoteUrl = getRemoteUrl(workspaceRoot);
+					const cfg = await loadConfig();
+					const customKBPath = (cfg as Record<string, unknown>)
+						.knowledgeBasePath as string | undefined;
+					const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
+					initializeKBFolder(kbRoot, repoName, remoteUrl);
+
+					const orphan = new OrphanBranchStorage(workspaceRoot);
+					if (!(await orphan.exists())) {
+						vscode.window.showInformationMessage(
+							"No git storage found — nothing to migrate.",
+						);
+						return;
+					}
+
+					const mm = new MetadataManager(join(kbRoot, ".jolli"));
+					const folder = new FolderStorage(kbRoot, mm);
+					await folder.ensure();
+					const engine = new MigrationEngine(orphan, folder, mm);
+
+					await vscode.window.withProgress(
+						{
+							location: vscode.ProgressLocation.Notification,
+							title: "Migrating to Knowledge Base...",
+						},
+						async (progress) => {
+							const result = await engine.runMigration((migrated, total) => {
+								progress.report({
+									message: `${migrated}/${total}`,
+									increment: (1 / total) * 100,
+								});
+							});
+							if (result.status === "completed") {
+								vscode.window.showInformationMessage(
+									`Migration completed: ${result.migratedEntries} memories migrated to ${kbRoot}`,
+								);
+							} else {
+								vscode.window.showWarningMessage(
+									`Migration ${result.status}: ${result.migratedEntries}/${result.totalEntries} entries`,
+								);
+							}
+							kbProvider.setKBRoot(kbRoot);
+						},
+					);
+				} catch (err) {
+					vscode.window.showErrorMessage(
+						`Migration failed: ${(err as Error).message}`,
+					);
+				}
+			},
+		),
+		vscode.commands.registerCommand(
+			"jollimemory.openKBCommitSummary",
+			async (item: KBFileItem) => {
+				if (!item.manifestEntry) return;
+				const kbRoot = kbProvider.kbRoot;
+				if (!kbRoot) return;
+				const summaryPath = join(
+					kbRoot,
+					".jolli",
+					"summaries",
+					`${item.manifestEntry.fileId}.json`,
+				);
+				try {
+					const { readFileSync } = await import("node:fs");
+					const json = readFileSync(summaryPath, "utf-8");
+					const summary = JSON.parse(json);
+					// "kb" source: opens in ViewColumn.One (not Beside), focuses tab,
+					// reuses existing tab for same commit (keyed by commitHash).
+					await SummaryWebviewPanel.show(
+						summary,
+						context.extensionUri,
+						workspaceRoot,
+						"kb",
+					);
+				} catch {
+					await vscode.commands.executeCommand(
+						"vscode.open",
+						vscode.Uri.file(item.fsPath),
+					);
+				}
+			},
+		),
 		// Status panel
 		vscode.commands.registerCommand("jollimemory.refreshStatus", () => {
 			statusStore.refresh().catch(handleError("refreshStatus"));

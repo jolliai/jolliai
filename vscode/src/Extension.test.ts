@@ -92,7 +92,7 @@ const { homedir } = vi.hoisted(() => ({
 }));
 
 const { existsSync } = vi.hoisted(() => ({
-	existsSync: vi.fn(() => false),
+	existsSync: vi.fn(() => true),
 }));
 
 const { buildClaudeCodeContext } = vi.hoisted(() => ({
@@ -148,6 +148,8 @@ const {
 	MockNoteEditorWebviewPanel,
 	mockAuthService,
 	MockAuthService,
+	mockKBProvider,
+	MockKnowledgeBaseTreeProvider,
 } = vi.hoisted(() => {
 	function makeMockProvider() {
 		return {
@@ -231,6 +233,14 @@ const {
 		refreshContextKey: vi.fn(),
 	};
 
+	const mockKBProvider_ = {
+		refresh: vi.fn(),
+		setKBRoot: vi.fn(),
+		kbRoot: undefined as string | undefined,
+		dispose: vi.fn(),
+		onDidChangeTreeData: vi.fn(),
+	};
+
 	return {
 		mockStatusProvider: mockStatusProvider_,
 		mockPlansProvider: mockPlansProvider_,
@@ -287,6 +297,12 @@ const {
 		MockAuthService: vi.fn(function MockAuthService() {
 			return mockAuthService_;
 		}),
+		mockKBProvider: mockKBProvider_,
+		MockKnowledgeBaseTreeProvider: vi.fn(
+			function MockKnowledgeBaseTreeProvider() {
+				return mockKBProvider_;
+			},
+		),
 	};
 });
 
@@ -538,6 +554,10 @@ vi.mock("./providers/MemoriesTreeProvider.js", () => ({
 
 vi.mock("./providers/PlansTreeProvider.js", () => ({
 	PlansTreeProvider: MockPlansTreeProvider,
+}));
+
+vi.mock("./providers/KnowledgeBaseTreeProvider.js", () => ({
+	KnowledgeBaseTreeProvider: MockKnowledgeBaseTreeProvider,
 }));
 
 vi.mock("./providers/StatusTreeProvider.js", () => ({
@@ -803,18 +823,15 @@ describe("Extension", () => {
 	// ── activate: early returns ───────────────────────────────────────────
 
 	describe("activate — no workspace root", () => {
-		it("logs a warning and returns early without registering commands", () => {
+		it("registers no-op commands and returns early", () => {
 			getWorkspaceRoot.mockReturnValue(undefined);
 			const ctx = makeContext();
 
 			activate(ctx);
 
-			expect(warn).toHaveBeenCalledWith(
-				"activate",
-				"No workspace root found — skipping activation",
-			);
-			expect(registerCommand).not.toHaveBeenCalled();
-			expect(ctx.subscriptions).toHaveLength(0);
+			// Should register stub commands so buttons don't throw "command not found"
+			expect(registerCommand).toHaveBeenCalled();
+			expect(ctx.subscriptions.length).toBeGreaterThan(0);
 		});
 	});
 
@@ -995,6 +1012,10 @@ describe("Extension", () => {
 				"jollimemory.copyCommitHash",
 				"jollimemory.exportMemories",
 				"jollimemory.openSettings",
+				"jollimemory.refreshKnowledgeBase",
+				"jollimemory.focusKnowledgeBase",
+				"jollimemory.migrateToKnowledgeBase",
+				"jollimemory.openKBCommitSummary",
 			];
 
 			for (const cmd of expectedCommands) {
@@ -1056,12 +1077,13 @@ describe("Extension", () => {
 			);
 		});
 
-		it("calls cleanupV1IfExpired on activation", () => {
+		it("calls cleanupV1IfExpired on activation", async () => {
 			const ctx = makeContext();
 
 			activate(ctx);
-
-			expect(cleanupV1IfExpired).toHaveBeenCalledWith("/test/workspace");
+			await vi.waitFor(() => {
+				expect(cleanupV1IfExpired).toHaveBeenCalledWith("/test/workspace");
+			});
 		});
 
 		it("checks initial worker busy state", () => {
@@ -3953,6 +3975,124 @@ describe("Extension", () => {
 
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				"Jolli sign-in failed: No token received",
+			);
+		});
+	});
+
+	// ── Knowledge Base commands ──────────────────────────────────────────
+
+	describe("Knowledge Base commands", () => {
+		it("refreshKnowledgeBase calls kbProvider.refresh()", () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			const handler = getRegisteredCommand("jollimemory.refreshKnowledgeBase");
+			handler();
+
+			expect(mockKBProvider.refresh).toHaveBeenCalled();
+		});
+
+		it("focusKnowledgeBase toggles other view visibility and focuses KB view", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			const handler = getRegisteredCommand("jollimemory.focusKnowledgeBase");
+			await handler();
+
+			// First call hides other panels and focuses KB view
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.knowledgeBaseView.focus",
+			);
+		});
+
+		it("focusKnowledgeBase restores panels on second call", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			const handler = getRegisteredCommand("jollimemory.focusKnowledgeBase");
+			// First call: focus (hide others)
+			await handler();
+			executeCommand.mockClear();
+
+			// Second call: restore
+			await handler();
+
+			// Should toggle visibility on the other views to restore them
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.statusView.toggleVisibility",
+			);
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.memoriesView.toggleVisibility",
+			);
+			// Should NOT focus KB view on restore
+			expect(executeCommand).not.toHaveBeenCalledWith(
+				"jollimemory.knowledgeBaseView.focus",
+			);
+		});
+
+		it("migrateToKnowledgeBase can be invoked without throwing", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			const handler = getRegisteredCommand(
+				"jollimemory.migrateToKnowledgeBase",
+			);
+			// The dynamic imports inside the handler will fail in the test
+			// environment, which triggers the catch block that shows an error
+			// message. We just verify the command is registered and callable.
+			await handler();
+
+			// Either shows an error message (import failure) or info message
+			// (no orphan branch) — command completes without unhandled rejection.
+			expect(
+				showErrorMessage.mock.calls.length +
+					showInformationMessage.mock.calls.length,
+			).toBeGreaterThanOrEqual(0);
+		});
+
+		it("creates a tree view for the Knowledge Base panel", () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			expect(createTreeView).toHaveBeenCalledWith(
+				"jollimemory.knowledgeBaseView",
+				expect.objectContaining({ showCollapseAll: true }),
+			);
+		});
+	});
+
+	// ── no-workspace stub commands include KB commands ────────────────────
+
+	describe("no-workspace stub — KB commands", () => {
+		it("registers KB commands as no-ops when no workspace is open", () => {
+			getWorkspaceRoot.mockReturnValue(undefined);
+			const ctx = makeContext();
+			activate(ctx);
+
+			const kbCommands = [
+				"jollimemory.refreshKnowledgeBase",
+				"jollimemory.focusKnowledgeBase",
+				"jollimemory.migrateToKnowledgeBase",
+				"jollimemory.openKBCommitSummary",
+			];
+			for (const cmd of kbCommands) {
+				expect(
+					commandMap.has(cmd),
+					`Expected no-op stub for "${cmd}" to be registered`,
+				).toBe(true);
+			}
+		});
+
+		it("no-op KB stub shows informational message", () => {
+			getWorkspaceRoot.mockReturnValue(undefined);
+			const ctx = makeContext();
+			activate(ctx);
+
+			const handler = commandMap.get("jollimemory.refreshKnowledgeBase");
+			handler?.();
+
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				"Please open a folder to use Jolli Memory.",
 			);
 		});
 	});

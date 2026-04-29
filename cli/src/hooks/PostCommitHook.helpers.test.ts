@@ -102,6 +102,16 @@ vi.mock("node:readline", () => ({
 	createInterface: mockCreateInterface,
 }));
 
+vi.mock("../core/StorageFactory.js", () => ({
+	createStorage: vi.fn().mockResolvedValue({
+		readFile: vi.fn().mockResolvedValue(null),
+		writeFiles: vi.fn().mockResolvedValue(undefined),
+		listFiles: vi.fn().mockResolvedValue([]),
+		exists: vi.fn().mockResolvedValue(true),
+		ensure: vi.fn().mockResolvedValue(undefined),
+	}),
+}));
+
 vi.mock("../core/GitOps.js", () => ({
 	getHeadCommitInfo: mockGetHeadCommitInfo,
 	getCommitInfo: mockGetHeadCommitInfo,
@@ -140,6 +150,7 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		mergeManyToOne: vi.fn(),
 		storePlans: mockStorePlans,
 		storeSummary: mockStoreSummary,
+		setActiveStorage: vi.fn(),
 	};
 });
 
@@ -377,6 +388,7 @@ describe("PostCommitHook helpers", () => {
 				[{ slug: "alpha-deadbeef", content: "# Alpha plan\n\nDo the work" }],
 				"Archive 1 plan(s) for commit deadbeef",
 				"/repo",
+				undefined,
 			);
 		});
 
