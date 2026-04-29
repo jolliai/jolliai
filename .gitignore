@@ -38,6 +38,7 @@ Thumbs.db
 .opencode/
 .DS_Store
 **/dist/
+cli/src/site/_generatedTemplates.ts
 **/coverage/
 **/node_modules/
 **/*.vsix

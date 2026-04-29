@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>API Reference</title>
+	<style>
+		html, body { margin: 0; padding: 0; height: 100%; }
+		.darklight, .darklight-reference { display: none !important; }
+		.scalar-app footer { display: none !important; }
+	</style>
+</head>
+<body>
+	<script>
+		(function() {
+			var urlParams = new URLSearchParams(window.location.search);
+			var isDark = urlParams.get("theme") === "dark";
+			var config = isDark
+				? {"theme":"kepler","layout":"modern","hideModels":false,"hideDarkModeToggle":true}
+				: {"theme":"default","layout":"modern","hideModels":false,"hideDarkModeToggle":true};
+			document.write(
+				'<script id="api-reference" data-url="/api-docs-petstore.json"' +
+				' data-configuration=\'' + JSON.stringify(config) + "\'>" +
+				"<\/script>"
+			);
+		})();
+	</script>
+	<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+</body>
+</html>

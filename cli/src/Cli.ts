@@ -29,6 +29,7 @@ import { registerDisableCommand, registerEnableCommand } from "./commands/Enable
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
+import { registerSiteCommands } from "./commands/SiteCommand.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
 import { setSilentConsole } from "./Logger.js";
@@ -66,6 +67,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerMigrateCommand(program);
 	registerExportPromptCommand(program);
 	registerExportCommand(program);
+	registerSiteCommands(program);
 	registerAuthCommands(program);
 
 	checkVersionMismatch();
