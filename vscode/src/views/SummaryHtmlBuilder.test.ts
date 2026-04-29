@@ -34,10 +34,6 @@ const { buildCss } = vi.hoisted(() => ({
 	buildCss: vi.fn(() => "/* css */"),
 }));
 
-const { buildPrMarkdown } = vi.hoisted(() => ({
-	buildPrMarkdown: vi.fn(() => "pr markdown"),
-}));
-
 const { buildScript } = vi.hoisted(() => ({
 	buildScript: vi.fn(() => "// script"),
 }));
@@ -85,10 +81,6 @@ vi.mock("../services/PrCommentService.js", () => ({
 
 vi.mock("./SummaryCssBuilder.js", () => ({
 	buildCss,
-}));
-
-vi.mock("./SummaryPrMarkdownBuilder.js", () => ({
-	buildPrMarkdown,
 }));
 
 vi.mock("./SummaryScriptBuilder.js", () => ({
@@ -204,7 +196,6 @@ describe("SummaryHtmlBuilder", () => {
 		formatDurationLabel.mockReturnValue("2 hours");
 		buildPrSectionHtml.mockReturnValue("");
 		buildCss.mockReturnValue("/* css */");
-		buildPrMarkdown.mockReturnValue("pr markdown");
 		buildScript.mockReturnValue("// script");
 		collectSortedTopics.mockReturnValue({
 			topics: [],
@@ -613,12 +604,17 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("Generate");
 		});
 
-		it("E2E test section with scenarios shows edit/regen/delete buttons", () => {
+		it("E2E test section with scenarios shows section toolbar (collapse-all + regen + delete)", () => {
 			const scenarios = [makeScenario()];
 			const html = buildHtml(makeSummary({ e2eTestGuide: scenarios }));
-			expect(html).toContain("editE2eBtn");
+			// Section toolbar: collapse-all + regen + delete (no bulk-edit anymore).
+			expect(html).toContain("toggleAllE2eBtn");
 			expect(html).toContain("regenE2eBtn");
 			expect(html).toContain("deleteE2eBtn");
+			expect(html).not.toContain("editE2eBtn");
+			// Per-scenario actions live on the scenario row.
+			expect(html).toContain("e2e-edit-btn");
+			expect(html).toContain("e2e-delete-btn");
 		});
 
 		it("source commits section not shown for single source", () => {
@@ -774,12 +770,9 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("pushJolliBtn");
 		});
 
-		it("calls buildPrSectionHtml with commit message and PR markdown", () => {
+		it("calls buildPrSectionHtml with no arguments", () => {
 			buildHtml(makeSummary({ commitMessage: "test msg" }));
-			expect(buildPrSectionHtml).toHaveBeenCalledWith(
-				"test msg",
-				"pr markdown",
-			);
+			expect(buildPrSectionHtml).toHaveBeenCalledWith();
 		});
 
 		it("includes hash copy button with full hash in data attribute", () => {
@@ -899,13 +892,50 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain(`<span class="section-count">2</span>`);
 		});
 
-		it("shows edit/regen/delete buttons when scenarios exist", () => {
+		it("shows section toolbar (collapse-all + regen + delete) when scenarios exist", () => {
 			const html = buildE2eTestSection(
 				makeSummary({ e2eTestGuide: [makeScenario()] }),
 			);
-			expect(html).toContain("editE2eBtn");
+			expect(html).toContain("toggleAllE2eBtn");
 			expect(html).toContain("regenE2eBtn");
 			expect(html).toContain("deleteE2eBtn");
+			expect(html).not.toContain("editE2eBtn");
+		});
+
+		it("renders per-scenario edit/delete buttons with scenario index", () => {
+			const html = buildE2eTestSection(
+				makeSummary({
+					e2eTestGuide: [
+						makeScenario({ title: "A" }),
+						makeScenario({ title: "B" }),
+					],
+				}),
+			);
+			// Each scenario gets its own edit/delete with data-scenario-index.
+			expect(html).toContain('e2e-edit-btn" data-scenario-index="0"');
+			expect(html).toContain('e2e-delete-btn" data-scenario-index="0"');
+			expect(html).toContain('e2e-edit-btn" data-scenario-index="1"');
+			expect(html).toContain('e2e-delete-btn" data-scenario-index="1"');
+		});
+
+		it("embeds scenario data on the toggle as data-scenario JSON", () => {
+			const html = buildE2eTestSection(
+				makeSummary({
+					e2eTestGuide: [
+						makeScenario({
+							title: "Edit me",
+							preconditions: "ready",
+							steps: ["one", "two"],
+							expectedResults: ["pass"],
+						}),
+					],
+				}),
+			);
+			// data-scenario carries title + preconditions + newline-joined arrays
+			// so the inline edit form can populate textareas without an extra round-trip.
+			expect(html).toContain("data-scenario=");
+			expect(html).toContain("Edit me");
+			expect(html).toContain("ready");
 		});
 
 		it("renders preconditions block when preconditions are set", () => {

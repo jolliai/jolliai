@@ -73,6 +73,7 @@ import {
 	handleCreatePr,
 	handlePrepareUpdatePr,
 	handleUpdatePr,
+	wrapWithMarkers,
 } from "../services/PrCommentService.js";
 import { log } from "../util/Logger.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
@@ -80,6 +81,7 @@ import {
 	buildE2eTestSection,
 	buildHtml,
 	buildRecapSection,
+	renderE2eScenario,
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
@@ -112,6 +114,12 @@ type WebviewMessage =
 	| { command: "generateE2eTest" }
 	| { command: "editE2eTest"; scenarios: Array<E2eTestScenario> }
 	| { command: "deleteE2eTest" }
+	| {
+			command: "editE2eScenario";
+			index: number;
+			updates: Partial<E2eTestScenario>;
+	  }
+	| { command: "deleteE2eScenario"; index: number; title?: string }
 	| { command: "editPlan"; slug: string; committed?: boolean }
 	| { command: "loadPlanContent"; slug: string }
 	| { command: "savePlan"; slug: string; content: string }
@@ -126,6 +134,7 @@ type WebviewMessage =
 	| { command: "translateNote"; id: string }
 	| { command: "removeNote"; id: string; title: string }
 	| { command: "checkPrStatus" }
+	| { command: "prepareCreatePr" }
 	| { command: "createPr"; title: string; body: string }
 	| { command: "prepareUpdatePr" }
 	| { command: "updatePr"; title: string; body: string }
@@ -315,6 +324,21 @@ export class SummaryWebviewPanel {
 			case "deleteE2eTest":
 				this.catchAndShow(this.handleDeleteE2eTest(), "Delete failed");
 				break;
+			case "editE2eScenario":
+				this.catchAndShow(
+					this.handleEditE2eScenario(message.index, message.updates),
+					"E2E scenario save failed",
+					{
+						command: "e2eScenarioUpdateError",
+					},
+				);
+				break;
+			case "deleteE2eScenario":
+				this.catchAndShow(
+					this.handleDeleteE2eScenario(message.index, message.title),
+					"Delete scenario failed",
+				);
+				break;
 			case "editPlan":
 				void vscode.commands.executeCommand(
 					"jollimemory.editPlan",
@@ -430,6 +454,17 @@ export class SummaryWebviewPanel {
 					),
 					"Create PR failed",
 				);
+				break;
+			case "prepareCreatePr":
+				if (this.currentSummary) {
+					const body = wrapWithMarkers(buildPrMarkdown(this.currentSummary));
+					const title = this.currentSummary.commitMessage;
+					void this.panel.webview.postMessage({
+						command: "prShowCreateForm",
+						body,
+						title,
+					});
+				}
 				break;
 			case "prepareUpdatePr":
 				if (this.currentSummary) {
@@ -1281,7 +1316,14 @@ export class SummaryWebviewPanel {
 		this.panel.webview.postMessage({ command: "e2eTestUpdated", html });
 	}
 
-	/** Saves edited E2E test scenarios from the webview. */
+	/**
+	 * Saves edited E2E test scenarios from the webview (bulk replace).
+	 *
+	 * @deprecated Replaced by per-scenario `handleEditE2eScenario` /
+	 * `handleDeleteE2eScenario`. Kept as a defensive fallback in case any
+	 * external caller still posts `editE2eTest`; current webview UI no
+	 * longer triggers this command.
+	 */
 	private async handleEditE2eTest(
 		scenarios: Array<E2eTestScenario>,
 	): Promise<void> {
@@ -1293,6 +1335,111 @@ export class SummaryWebviewPanel {
 		const updatedSummary: CommitSummary = {
 			...summary,
 			e2eTestGuide: scenarios,
+		};
+		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		this.currentSummary = updatedSummary;
+
+		const html = buildE2eTestSection(updatedSummary);
+		this.panel.webview.postMessage({ command: "e2eTestUpdated", html });
+	}
+
+	/**
+	 * Updates a single E2E scenario at the given index. Sends back a
+	 * rendered scenario row via `e2eScenarioUpdated` so the webview can
+	 * replace just that row, preserving collapsed state on other scenarios.
+	 */
+	private async handleEditE2eScenario(
+		index: number,
+		updates: Partial<E2eTestScenario>,
+	): Promise<void> {
+		const summary = this.currentSummary;
+		if (!summary || !summary.e2eTestGuide) {
+			return;
+		}
+		if (index < 0 || index >= summary.e2eTestGuide.length) {
+			log.warn(
+				"SummaryWebviewPanel",
+				"editE2eScenario: index out of range",
+				index,
+			);
+			return;
+		}
+
+		const oldScenario = summary.e2eTestGuide[index];
+		const merged: E2eTestScenario = {
+			...oldScenario,
+			...updates,
+			// Preserve required-array shape: caller may omit unchanged arrays.
+			steps: updates.steps ?? oldScenario.steps,
+			expectedResults: updates.expectedResults ?? oldScenario.expectedResults,
+		};
+		// Honor caller's intent to clear preconditions: empty/undefined value
+		// in updates means drop the field. Omitting the key keeps the old
+		// value (already handled by the spread above).
+		if (
+			"preconditions" in updates &&
+			(updates.preconditions === undefined || updates.preconditions === "")
+		) {
+			delete (merged as { preconditions?: string }).preconditions;
+		}
+
+		const newScenarios = summary.e2eTestGuide.map((s, i) =>
+			i === index ? merged : s,
+		);
+		const updatedSummary: CommitSummary = {
+			...summary,
+			e2eTestGuide: newScenarios,
+		};
+		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		this.currentSummary = updatedSummary;
+
+		const html = renderE2eScenario(merged, index);
+		this.panel.webview.postMessage({
+			command: "e2eScenarioUpdated",
+			scenarioIndex: index,
+			html,
+		});
+	}
+
+	/**
+	 * Deletes a single E2E scenario at the given index. Since indices shift
+	 * after removal, sends back a full re-rendered section via
+	 * `e2eTestUpdated` (the existing whole-section replacement path).
+	 *
+	 * If the deletion empties the guide, `e2eTestGuide` is set to undefined
+	 * so the webview falls back to the "no scenarios" placeholder.
+	 */
+	private async handleDeleteE2eScenario(
+		index: number,
+		title?: string,
+	): Promise<void> {
+		const summary = this.currentSummary;
+		if (!summary || !summary.e2eTestGuide) {
+			return;
+		}
+		if (index < 0 || index >= summary.e2eTestGuide.length) {
+			log.warn(
+				"SummaryWebviewPanel",
+				"deleteE2eScenario: index out of range",
+				index,
+			);
+			return;
+		}
+
+		const scenarioTitle = title ?? summary.e2eTestGuide[index].title;
+		const choice = await vscode.window.showWarningMessage(
+			`Delete scenario "${scenarioTitle}"?`,
+			{ modal: true, detail: "This cannot be undone." },
+			"Delete",
+		);
+		if (choice !== "Delete") {
+			return;
+		}
+
+		const remaining = summary.e2eTestGuide.filter((_, i) => i !== index);
+		const updatedSummary: CommitSummary = {
+			...summary,
+			e2eTestGuide: remaining.length > 0 ? remaining : undefined,
 		};
 		await storeSummary(updatedSummary, this.workspaceRoot, true);
 		this.currentSummary = updatedSummary;

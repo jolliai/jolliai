@@ -247,14 +247,20 @@ export function buildCss(): string {
     padding-left: 2px;
   }
   .plan-remove-btn:hover { color: var(--vscode-errorForeground, #f44); }
-  .plan-translate-btn.translating {
+  .plan-translate-btn.translating,
+  .note-translate-btn.translating {
     opacity: 0.5;
     cursor: wait;
-    animation: pulse 1.2s ease-in-out infinite;
+    animation: spin 1s linear infinite;
   }
-  @keyframes pulse {
-    0%, 100% { opacity: 0.5; }
-    50% { opacity: 0.2; }
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+  .topic-action-btn.generating {
+    opacity: 0.5;
+    cursor: wait;
+    animation: spin 1s linear infinite;
   }
   .plan-title-link {
     color: var(--vscode-foreground);
@@ -403,8 +409,8 @@ export function buildCss(): string {
   .e2e-scenario .callout.preconditions .callout-label { color: var(--callout-trigger-label); }
   .e2e-scenario .callout.steps { background: var(--callout-response-bg); }
   .e2e-scenario .callout.steps .callout-label { color: var(--callout-response-label); }
-  .e2e-scenario .callout.expected { background: var(--callout-decisions-bg); }
-  .e2e-scenario .callout.expected .callout-label { color: var(--callout-decisions-label); }
+  .e2e-scenario .callout.expectedResults { background: var(--callout-decisions-bg); }
+  .e2e-scenario .callout.expectedResults .callout-label { color: var(--callout-decisions-label); }
   .e2e-scenario .callout ol {
     margin: 0; padding-left: 1.4em;
   }
@@ -413,26 +419,6 @@ export function buildCss(): string {
   }
   .e2e-scenario .callout li {
     margin-bottom: 4px; line-height: 1.45;
-  }
-  .e2e-edit-area {
-    width: 100%;
-    min-height: 200px;
-    font-family: var(--vscode-editor-font-family, monospace);
-    font-size: 0.9em;
-    line-height: 1.5;
-    background: var(--vscode-input-background);
-    color: var(--vscode-input-foreground);
-    border: 1px solid var(--vscode-input-border, #444);
-    border-radius: 4px;
-    padding: 10px;
-    resize: vertical;
-    box-sizing: border-box;
-  }
-  .e2e-edit-actions {
-    display: flex;
-    gap: 8px;
-    margin-top: 8px;
-    justify-content: flex-end;
   }
 
   /* ── Quick recap edit mode (mirrors e2e-edit-area) ── */

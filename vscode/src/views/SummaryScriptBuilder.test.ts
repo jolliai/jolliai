@@ -17,6 +17,14 @@ describe("SummaryScriptBuilder", () => {
 		expect(script.length).toBeGreaterThan(0);
 	});
 
+	it("produces parseable JavaScript (catches syntax errors at build time)", () => {
+		// Try to parse the script via Function constructor — throws on syntax errors.
+		// This catches issues like backticks inside template literals, unbalanced
+		// braces, or stray template-literal delimiters that would otherwise only
+		// surface at webview runtime.
+		expect(() => new Function(script)).not.toThrow();
+	});
+
 	it("contains vscode API initialization", () => {
 		expect(script).toContain("acquireVsCodeApi");
 	});
@@ -74,7 +82,18 @@ describe("SummaryScriptBuilder", () => {
 
 	it("contains E2E test handlers", () => {
 		expect(script).toContain("e2eTestSection");
-		expect(script).toContain("e2e-editing");
+		// New section-level toolbar handler (Collapse-All for E2E).
+		expect(script).toContain("toggleAllE2eBtn");
+		// Per-scenario inline edit/delete handlers.
+		expect(script).toContain("e2e-edit-btn");
+		expect(script).toContain("e2e-delete-btn");
+		expect(script).toContain("enterE2eEditMode");
+		expect(script).toContain("editE2eScenario");
+		expect(script).toContain("deleteE2eScenario");
+		// Surgical per-scenario replacement message.
+		expect(script).toContain("e2eScenarioUpdated");
+		// Bulk-markdown-edit removed; no e2e-editing class anymore.
+		expect(script).not.toContain("e2e-editing");
 	});
 
 	it("contains message event listener", () => {

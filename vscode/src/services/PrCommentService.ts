@@ -28,15 +28,6 @@ const TAG = "PrSection";
 
 // ─── HTML helper ─────────────────────────────────────────────────────────────
 
-/** Escapes a string for use inside an HTML attribute value. */
-function escAttr(s: string): string {
-	return s
-		.replace(/&/g, "&amp;")
-		.replace(/"/g, "&quot;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;");
-}
-
 // ─── Marker constants ────────────────────────────────────────────────────────
 
 const MARKER_START = "<!-- jollimemory-summary-start -->";
@@ -47,7 +38,7 @@ const MARKER_PATTERN =
 // ─── Marker helpers ──────────────────────────────────────────────────────────
 
 /** Wraps markdown content with start/end markers. */
-function wrapWithMarkers(markdown: string): string {
+export function wrapWithMarkers(markdown: string): string {
 	return `${MARKER_START}\n${markdown}\n${MARKER_END}`;
 }
 
@@ -722,13 +713,7 @@ export async function handleUpdatePr(
 const PR_ICON = `<svg class="pr-icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M7.177 3.073L9.573.677A.25.25 0 0110 .854v4.792a.25.25 0 01-.427.177L7.177 3.427a.25.25 0 010-.354zM3.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122v5.256a2.251 2.251 0 11-1.5 0V5.372A2.25 2.25 0 011.5 3.25zM11 2.5h-1V4h1a1 1 0 011 1v5.628a2.251 2.251 0 101.5 0V5A2.5 2.5 0 0011 2.5zm1 10.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0zM3.75 12a.75.75 0 100 1.5.75.75 0 000-1.5z"/></svg>`;
 
 /** Returns the initial HTML for the PR section (loading state). */
-export function buildPrSectionHtml(
-	commitMessage: string,
-	summaryMarkdown: string,
-): string {
-	// Encode pre-fill values as data attributes for the Create PR form
-	const escapedTitle = escAttr(commitMessage);
-	const escapedBody = escAttr(wrapWithMarkers(summaryMarkdown));
+export function buildPrSectionHtml(): string {
 	return `
 <div class="section" id="prSection">
   <div class="section-header">
@@ -737,7 +722,7 @@ export function buildPrSectionHtml(
   <p class="pr-status-text" id="prStatusText">Checking PR status...</p>
   <div class="pr-link-row pr-hidden" id="prLinkRow"></div>
   <div class="pr-actions pr-hidden" id="prActions"></div>
-  <div class="pr-form pr-hidden" id="prForm" data-title="${escapedTitle}" data-body="${escapedBody}">
+  <div class="pr-form pr-hidden" id="prForm">
     <label class="pr-form-label">Title</label>
     <input type="text" class="pr-form-input" id="prTitleInput" />
     <label class="pr-form-label">Body</label>
@@ -948,18 +933,12 @@ export function buildPrMessageScript(): string {
           btn.textContent = 'Create PR';
           prActions.appendChild(btn);
           prShow(prActions);
-          // Bind Create PR button
+          // Bind Create PR button — request fresh body from backend so that
+          // content generated after the webview opened (e.g. E2E test) is included.
           btn.addEventListener('click', function() {
-            prHide(prStatusText);
-            prHide(prLinkRow);
-            prHide(prActions);
-            prShow(prForm);
-            prForm.dataset.mode = 'create';
-            prFormSubmit.textContent = 'Submit PR';
-            // Pre-fill form — values set via data attributes on prForm
-            prTitleInput.value = prForm.dataset.title || '';
-            prBodyInput.value = prForm.dataset.body || '';
-            prTitleInput.focus();
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+            vscode.postMessage({ command: 'prepareCreatePr' });
           });
         }
       } else if (s === 'ready') {
@@ -988,6 +967,23 @@ export function buildPrMessageScript(): string {
           vscode.postMessage({ command: 'prepareUpdatePr' });
         });
       }
+    }
+
+    // ── PR show create form ──
+    if (msg.command === 'prShowCreateForm') {
+      prHide(prStatusText);
+      prHide(prLinkRow);
+      var createBtn = document.getElementById('createPrBtn');
+      if (createBtn) { createBtn.textContent = 'Create PR'; createBtn.disabled = false; }
+      prHide(prActions);
+      prShow(prForm);
+      prForm.dataset.mode = 'create';
+      prFormSubmit.textContent = 'Submit PR';
+      prFormSubmit.disabled = false;
+      prFormCancel.disabled = false;
+      prTitleInput.value = msg.title || '';
+      prBodyInput.value = msg.body || '';
+      prTitleInput.focus();
     }
 
     // ── PR show update form ──
