@@ -12,11 +12,12 @@ When you work with AI agents like Claude Code, Codex, or Gemini CLI, the reasoni
 
 After each commit, Jolli Memory reads your selected AI session transcripts and the code diff, calls the LLM to produce a structured summary, and stores it alongside the commit silently in the background. The IntelliJ plugin surfaces everything in a tool window so you can manage plans, stage files, write AI-assisted commit messages, review summaries, and share them, without leaving your IDE.
 
-### The tool window has four panels
+### The tool window has five panels
 
 | Panel | What it shows |
 | -- | -- |
-| **STATUS** | Whether Jolli Memory is enabled, active AI agent sessions (Claude, Codex, Gemini), and how many memories are stored. Toggle on/off with the Enable / Disable buttons. |
+| **STATUS** | Whether Jolli Memory is enabled, active AI agent sessions (Claude, Codex, Gemini), and how many memories are stored. Toggle on/off with the Enable / Disable buttons; sign in or out of your Jolli account from the same panel toolbar. |
+| **MEMORIES** | Every stored memory across all branches, with search and pagination. Use the search action to filter by keyword, or click **Load More** at the bottom to fetch older entries. |
 | **PLANS & NOTES** | Plans auto-detected from Claude Code sessions, plus your own notes (text snippets or imported Markdown files). Edit, remove, or associate items with commits. Use the **+ Add** button to add a plan, a Markdown file, or a quick text snippet. |
 | **CHANGES** | All changed files with checkboxes to stage or unstage. |
 | **COMMITS** | Every commit on the current branch not yet in main. Click to open the full AI summary. |
@@ -33,7 +34,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 
 | Agent | How sessions are tracked |
 | -- | -- |
-| **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
+| **Claude Code** | A lightweight `StopHook` fires after each AI response |
 | **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
 | **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem |
 
@@ -90,7 +91,15 @@ Click **Push to Jolli** to publish the summary to your team's Jolli Space knowle
 
 Plans and notes (both Markdown files and text snippets) are each uploaded as separate articles first, so their URLs appear in the summary. The summary itself is published last.
 
-Requires a Jolli API Key configured in Settings. Sign up at [jolli.ai](https://jolli.ai) to get one.
+Requires a Jolli account (use **Sign In to Jolli** below) or a manually configured Jolli API Key in Settings.
+
+### Sign In to Jolli
+
+Open **Settings > Tools > Jolli Memory** (or click the Sign In button in the tool window banner) and click **Sign In**. The plugin opens your default browser at the Jolli sign-in page and listens for the OAuth callback locally. After you sign in, the plugin receives an `authToken` and a `jolliApiKey` (`sk-jol-…`) and stores them in `~/.jolli/jollimemory/config.json` — the same file the CLI uses, so signing in once works for both surfaces.
+
+The `jolliApiKey` covers two flows: it lets the LLM proxy handle summary generation (so you don't need to manage an Anthropic key directly), and it authorises pushing summaries to your Jolli Space. You can still set a manual Anthropic API key in Settings if you prefer your own account; that key takes precedence.
+
+Click **Sign Out** in the same place to clear the stored credentials.
 
 ### Plans & Notes
 
@@ -126,11 +135,9 @@ Requires the `gh` CLI to be installed and authenticated.
 
 ### Session Context Recall
 
-Jolli Memory feeds prior development context back into your AI agent so it can pick up where you (or a teammate) left off.
+Jolli Memory feeds prior development context back into your AI agent so it can pick up where you (or a teammate) left off. Run `/jolli-recall` inside Claude Code (or any agent that supports it) to load the complete branch history: summaries, plans, decisions, and file-change statistics (up to ~30 000 tokens). The agent then reports what the branch is implementing, key technical decisions, what was last worked on, and the main files involved — so you can continue without re-reading the code.
 
-**Automatic briefing** — every time a new Claude Code session starts, a `SessionStartHook` injects a lightweight briefing (~300 tokens) into the conversation: branch name, commit count, date range, and last commit message. If it has been more than 3 days since the last commit, it suggests running the full recall command. This runs in under 200 ms and never blocks session startup.
-
-**Full recall** — run `/jolli-recall` inside Claude Code (or any agent that supports it) to load the complete branch history: summaries, plans, decisions, and file-change statistics (up to ~30 000 tokens). The agent then reports what the branch is implementing, key technical decisions, what was last worked on, and the main files involved — so you can continue without re-reading the code.
+The `/jolli-recall` slash command is installed automatically into `.claude/skills/jolli-recall/SKILL.md` when you enable Jolli Memory.
 
 If the current branch has no memories, the command shows a catalog of branches that do, letting you pick one to recall. You can also pass a branch name or keyword as an argument (e.g. `/jolli-recall auth-refactor`).
 
@@ -138,13 +145,14 @@ If the current branch has no memories, the command shows a catalog of branches t
 
 ## Configuration
 
-All settings can be configured from **Settings > Tools > Jolli Memory** or via the gear icon in the STATUS panel. They are stored in `.jolli/jollimemory/config.json` (add `.jolli/` to your `.gitignore`):
+All settings can be configured from **Settings > Tools > Jolli Memory** or via the gear icon in the STATUS panel. They are stored globally in `~/.jolli/jollimemory/config.json` and shared with the `@jolli.ai/cli` and the VS Code extension:
 
 | Field | Type | Default | Description |
 | -- | -- | -- | -- |
 | `apiKey` | string | `$ANTHROPIC_API_KEY` | Your Anthropic API key for AI summarization (generate one at [platform.claude.com](https://platform.claude.com/)) |
-| `model` | string | `claude-haiku-4-5-20251001` | Model used for summarization |
-| `jolliApiKey` | string | — | Jolli Space API key for pushing summaries to your team knowledge base |
+| `model` | string | `claude-sonnet-4-6` | Model used for summarization. Accepts an alias (`sonnet`, `haiku`) or a full model ID. |
+| `jolliApiKey` | string | — | Jolli Space API key for pushing summaries to your team knowledge base. Auto-managed when you use **Sign In to Jolli**. |
+| `authToken` | string | — | OAuth auth token set automatically by **Sign In to Jolli** — not edited manually. |
 
 ---
 

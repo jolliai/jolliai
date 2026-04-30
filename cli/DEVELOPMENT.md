@@ -55,16 +55,19 @@ jolli status
 ## Architecture Overview
 
 ```
-                    AI Agent Session (Claude / Codex / Gemini)
+                    AI Agent Session (Claude / Codex / Gemini / OpenCode)
                            │
                     ┌──────┴──────┐
-                    │  Stop Event  │  (or AfterAgent for Gemini)
-                    └──────┬──────┘
+                    │  Stop Event  │  (Claude only — Gemini uses AfterAgent;
+                    └──────┬──────┘   Codex / OpenCode have no hook)
                            │ stdin JSON
                     ┌──────┴──────┐
                     │  StopHook   │  Saves session info to
-                    │  (Node.js)  │  .jolli/jollimemory/sessions.json
+                    │  (Node.js)  │  ~/.jolli/jollimemory/sessions.json
                     └─────────────┘
+                  (Codex sessions are discovered by scanning ~/.codex/sessions/
+                   at post-commit time; OpenCode by reading
+                   ~/.local/share/opencode/opencode.db via node:sqlite)
 
                     ... developer codes ...
 
@@ -130,6 +133,8 @@ jolli status
 | [GeminiTranscriptReader.ts](src/core/GeminiTranscriptReader.ts) | Dedicated JSON reader for Gemini transcript format |
 | [CodexSessionDiscoverer.ts](src/core/CodexSessionDiscoverer.ts) | Discovers Codex CLI sessions by scanning the filesystem |
 | [GeminiSessionDetector.ts](src/core/GeminiSessionDetector.ts) | Detects Gemini CLI installation |
+| [OpenCodeSessionDiscoverer.ts](src/core/OpenCodeSessionDiscoverer.ts) | Discovers OpenCode sessions by reading `~/.local/share/opencode/opencode.db` (Node 22.5+ `node:sqlite`, lazy-imported and feature-gated). Surfaces a typed `OpenCodeScanError` when the DB is present but unreadable (corrupt / locked / schema mismatch) so the UI can render a dedicated "unavailable" row. |
+| [OpenCodeTranscriptReader.ts](src/core/OpenCodeTranscriptReader.ts) | Reads OpenCode message rows out of `opencode.db` and converts them into the shared `TranscriptEntry` shape used by the rest of the pipeline |
 | [Summarizer.ts](src/core/Summarizer.ts) | Anthropic API calls for structured summary generation. Also exports `generateSquashMessage()` for the VSCode extension's squash flow |
 | [SummaryStore.ts](src/core/SummaryStore.ts) | Reads/writes summaries to the orphan branch (v3 tree format), merge/migrate operations |
 | [SummaryTree.ts](src/core/SummaryTree.ts) | Tree traversal utilities (aggregate stats/turns, collect source nodes, `resolveDiffStats` display helper) |

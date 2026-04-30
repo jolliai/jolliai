@@ -48,7 +48,7 @@ Monorepo hosting three deliverables that share the same product model and storag
 ## Repository layout
 
 ```
-jollimemory/
+jolliai/
 ├── cli/          Node.js CLI (@jolli.ai/cli, npm workspace)
 ├── vscode/       VS Code extension (npm workspace)
 ├── intellij/     IntelliJ plugin (Kotlin + Gradle)
