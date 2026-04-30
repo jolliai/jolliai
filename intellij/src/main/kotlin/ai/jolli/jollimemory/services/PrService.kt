@@ -34,24 +34,70 @@ object PrService {
 
     // ── CLI helpers ─────────────────────────────────────────────────────────
 
+    private val isWindows = System.getProperty("os.name").lowercase().contains("win")
+
     /**
-     * Detects the user's login shell. IntelliJ's JVM process has a minimal
-     * PATH that doesn't include Homebrew or other user-installed directories.
-     * Running commands through a login shell (`-lc`) sources the user's shell
-     * profile (~/.zshrc, ~/.bash_profile, etc.) which sets up the full PATH —
-     * matching the behavior of VS Code's Node.js `execFile` which inherits
-     * the login shell environment.
+     * Resolves the user's full PATH. IntelliJ's JVM process has a minimal PATH
+     * that may not include Homebrew (macOS/Linux) or user-scoped installs (Windows).
+     *
+     * On Unix, runs a one-time login shell to capture the full PATH from the
+     * user's shell profile (~/.zshrc, ~/.bash_profile, etc.).
+     *
+     * On Windows, starts from the system PATH and appends Git's usr/bin so
+     * utilities like sed/awk are available to git hooks.
+     *
+     * Follows the same pattern as GitOps.shellPath.
      */
-    private val loginShell: String by lazy {
-        val shell = System.getenv("SHELL")
-        if (!shell.isNullOrBlank() && File(shell).canExecute()) shell else "/bin/zsh"
+    private val resolvedPath: String by lazy {
+        try {
+            if (isWindows) {
+                resolveWindowsPath()
+            } else {
+                val shell = System.getenv("SHELL")
+                    ?.takeIf { it.isNotBlank() && File(it).canExecute() }
+                    ?: "/bin/zsh"
+                val proc = ProcessBuilder(shell, "-l", "-c", "echo \$PATH")
+                    .redirectErrorStream(true)
+                    .start()
+                val output = proc.inputStream.bufferedReader().use { it.readText().trim() }
+                proc.waitFor(5, TimeUnit.SECONDS)
+                if (output.isNotBlank()) output else System.getenv("PATH") ?: ""
+            }
+        } catch (_: Exception) {
+            System.getenv("PATH") ?: ""
+        }
+    }
+
+    /** On Windows, appends Git's usr/bin to the system PATH (for sed, awk, etc.). */
+    private fun resolveWindowsPath(): String {
+        val basePath = System.getenv("PATH") ?: ""
+        try {
+            val proc = ProcessBuilder("where", "git")
+                .redirectErrorStream(true)
+                .start()
+            val output = proc.inputStream.bufferedReader().use { it.readText().trim() }
+            proc.waitFor(5, TimeUnit.SECONDS)
+
+            val gitExePath = output.lines().firstOrNull { it.endsWith("git.exe") }
+            if (gitExePath != null) {
+                val gitRoot = File(gitExePath).parentFile?.parentFile
+                if (gitRoot != null) {
+                    val usrBin = File(gitRoot, "usr${File.separator}bin")
+                    if (usrBin.isDirectory) {
+                        return "$basePath${File.pathSeparator}${usrBin.absolutePath}"
+                    }
+                }
+            }
+        } catch (_: Exception) { }
+        return basePath
     }
 
     /**
-     * Runs a CLI command through the user's login shell and returns stdout,
-     * or null on failure. Using a login shell (`-lc`) ensures the full PATH
-     * from the user's shell profile is available, so tools like `gh` and `git`
-     * installed via Homebrew are found.
+     * Runs a CLI command directly via ProcessBuilder and returns stdout,
+     * or null on failure. Uses [resolvedPath] so that tools like `gh` and
+     * `git` installed via Homebrew (macOS/Linux) or user-scoped installers
+     * (Windows) are found. No shell wrapper or quoting needed — each argument
+     * is passed directly to the OS process.
      */
     private fun execCommand(
         command: String,
@@ -60,40 +106,39 @@ object PrService {
         timeoutSeconds: Long = 30,
     ): String? {
         return try {
-            // Build a single shell command string with proper quoting
-            val shellCmd = (listOf(command) + args).joinToString(" ") { shellQuote(it) }
-
-            val process = ProcessBuilder(loginShell, "-lc", shellCmd)
+            val pb = ProcessBuilder(listOf(command) + args)
                 .directory(File(cwd))
                 .redirectErrorStream(false)
-                .start()
+            pb.environment()["PATH"] = resolvedPath
 
-            // Read stdout concurrently to avoid pipe buffer deadlock
+            val process = pb.start()
+
+            // Read stdout and stderr concurrently to avoid pipe buffer deadlock
             val stdoutFuture = java.util.concurrent.CompletableFuture.supplyAsync {
                 process.inputStream.bufferedReader().use { it.readText().trim() }
+            }
+            val stderrFuture = java.util.concurrent.CompletableFuture.supplyAsync {
+                process.errorStream.bufferedReader().use { it.readText().trim() }
             }
 
             val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
             if (!completed) {
                 process.destroyForcibly()
+                log.warn("execCommand: timed out after %ds: %s %s", timeoutSeconds, command, args.joinToString(" "))
                 return null
             }
 
-            if (process.exitValue() != 0) return null
+            val exitCode = process.exitValue()
+            if (exitCode != 0) {
+                val stderr = stderrFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)
+                log.warn("execCommand: exit=%d cmd='%s %s' stderr='%s'", exitCode, command, args.joinToString(" "), stderr)
+                return null
+            }
             stdoutFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)
         } catch (e: Exception) {
-            log.debug("Command failed: $command ${args.joinToString(" ")}: ${e.message}")
+            log.warn("execCommand: exception for '%s %s': %s", command, args.joinToString(" "), e.message ?: e.toString())
             null
         }
-    }
-
-    /** Shell-quotes a single argument (wraps in single quotes, escaping internal single quotes). */
-    private fun shellQuote(arg: String): String {
-        if (arg.isEmpty()) return "''"
-        // If the arg contains no special characters, return as-is
-        if (arg.matches(Regex("[a-zA-Z0-9_./:@=-]+"))) return arg
-        // Wrap in single quotes, escaping any embedded single quotes
-        return "'" + arg.replace("'", "'\\''") + "'"
     }
 
     /** Runs a gh command and returns stdout, or null on failure. */

@@ -5,7 +5,6 @@ import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
-import java.lang.reflect.Method
 
 class PrServiceTest {
 
@@ -49,46 +48,6 @@ class PrServiceTest {
             val result = PrService.replaceSummaryInBody("", "Summary")
             result shouldContain "<!-- jollimemory-summary-start -->"
             result shouldContain "Summary"
-        }
-    }
-
-    // ── shellQuote (private, via reflection) ────────────────────────────
-
-    @Nested
-    inner class ShellQuote {
-        private fun shellQuote(arg: String): String {
-            val method: Method = PrService::class.java.getDeclaredMethod("shellQuote", String::class.java)
-            method.isAccessible = true
-            return method.invoke(PrService, arg) as String
-        }
-
-        @Test
-        fun `returns empty quotes for empty string`() {
-            shellQuote("") shouldBe "''"
-        }
-
-        @Test
-        fun `returns safe string unchanged`() {
-            shellQuote("hello") shouldBe "hello"
-            shellQuote("path/to/file.txt") shouldBe "path/to/file.txt"
-            shellQuote("user@host") shouldBe "user@host"
-        }
-
-        @Test
-        fun `wraps strings with spaces in quotes`() {
-            shellQuote("hello world") shouldContain "'"
-        }
-
-        @Test
-        fun `escapes embedded single quotes`() {
-            val result = shellQuote("it's a test")
-            result shouldContain "\\'"
-        }
-
-        @Test
-        fun `wraps strings with special characters`() {
-            shellQuote("echo \$HOME") shouldContain "'"
-            shellQuote("a && b") shouldContain "'"
         }
     }
 
