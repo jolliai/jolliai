@@ -394,7 +394,7 @@ ${buildTranscriptModal()}"""
      * - Create/Edit form (when user clicks the action buttons)
      */
     private fun buildPrSection(summary: CommitSummary): String {
-        val prMarkdown = SummaryMarkdownBuilder.buildPrMarkdown(summary)
+        val prMarkdown = SummaryPrMarkdownBuilder.buildPrMarkdown(summary)
         val escapedTitle = escAttr(summary.commitMessage)
         val escapedBody = escAttr(ai.jolli.jollimemory.services.PrService.wrapWithMarkers(prMarkdown))
 

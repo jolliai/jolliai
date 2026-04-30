@@ -17,6 +17,7 @@ import ai.jolli.jollimemory.services.PlanService
 import ai.jolli.jollimemory.services.PrService
 import ai.jolli.jollimemory.toolwindow.views.SummaryHtmlBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryMarkdownBuilder
+import ai.jolli.jollimemory.toolwindow.views.SummaryPrMarkdownBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils
 import com.google.gson.Gson
 import com.google.gson.JsonArray
@@ -642,7 +643,7 @@ class SummaryPanel(
                     ApplicationManager.getApplication().invokeLater { postToWebview("prUpdateError", mapOf("message" to "No PR found")) }
                     return@executeOnPooledThread
                 }
-                val newMarkdown = SummaryMarkdownBuilder.buildPrMarkdown(currentSummary)
+                val newMarkdown = SummaryPrMarkdownBuilder.buildPrMarkdown(currentSummary)
                 val newBody = PrService.replaceSummaryInBody(pr.body, newMarkdown)
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("prShowUpdateForm", mapOf("title" to pr.title, "body" to newBody))
