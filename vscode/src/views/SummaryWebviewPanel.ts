@@ -26,6 +26,7 @@ import {
 } from "../../../cli/src/core/SessionTracker.js";
 import {
 	generateE2eTest,
+	generateRecap,
 	translateToEnglish,
 } from "../../../cli/src/core/Summarizer.js";
 import {
@@ -146,7 +147,8 @@ type WebviewMessage =
 			entries: ReadonlyArray<TranscriptEntryUpdate>;
 	  }
 	| { command: "deleteAllTranscripts" }
-	| { command: "editRecap"; recap: string };
+	| { command: "editRecap"; recap: string }
+	| { command: "generateRecap" };
 
 /** Entry data sent back from the webview on Save All. */
 interface TranscriptEntryUpdate {
@@ -289,6 +291,15 @@ export class SummaryWebviewPanel {
 				this.catchAndShow(
 					this.handleEditRecap(message.recap ?? ""),
 					"Recap save failed",
+					{
+						command: "recapUpdateError",
+					},
+				);
+				break;
+			case "generateRecap":
+				this.catchAndShow(
+					this.handleGenerateRecap(),
+					"Recap generation failed",
 					{
 						command: "recapUpdateError",
 					},
@@ -1236,6 +1247,57 @@ export class SummaryWebviewPanel {
 		});
 	}
 
+	/**
+	 * Generates (or regenerates) the Quick Recap paragraph via a standalone
+	 * LLM call against the existing topics. The diff is intentionally NOT
+	 * included -- the recap is a narrative over already-extracted topics, not a
+	 * fresh code analysis, and skipping the diff keeps token cost low for an
+	 * action users may invoke repeatedly until the wording feels right.
+	 *
+	 * If the commit has no major topics, generateRecap returns an empty string
+	 * and the section re-renders into its placeholder (state-1) form. The
+	 * webview's recapUpdated handler treats the new HTML as canonical, so the
+	 * Generate button reappears automatically without extra signalling.
+	 */
+	private async handleGenerateRecap(): Promise<void> {
+		const summary = this.currentSummary;
+		if (!summary) {
+			return;
+		}
+
+		this.panel.webview.postMessage({ command: "recapGenerating" });
+
+		const { topics } = collectSortedTopics(summary);
+		const config = await loadGlobalConfig();
+		const recap = await generateRecap({
+			topics,
+			commitMessage: summary.commitMessage,
+			config,
+		});
+
+		const trimmed = recap.trim();
+		// Empty result means generateRecap short-circuited because the commit has
+		// no `importance: major` topics. Surface a toast and exit without
+		// touching storage so an existing recap (legacy summaries, or summaries
+		// where the user just demoted every topic) is never silently destroyed.
+		if (!trimmed) {
+			vscode.window.showInformationMessage(
+				"No major topics in this commit, so there's nothing to recap.",
+			);
+			this.panel.webview.postMessage({ command: "recapUpdateError" });
+			return;
+		}
+
+		const updated: CommitSummary = { ...summary, recap: trimmed };
+		await storeSummary(updated, this.workspaceRoot, true);
+		this.currentSummary = updated;
+
+		this.panel.webview.postMessage({
+			command: "recapUpdated",
+			html: buildRecapSection(updated.recap),
+		});
+	}
+
 	/** Handles deleting a memory at the given global index (with confirmation). */
 	private async handleDeleteTopic(
 		topicIndex: number,
@@ -1303,6 +1365,18 @@ export class SummaryWebviewPanel {
 			diff,
 			config,
 		});
+
+		// Empty result means generateE2eTest short-circuited because the commit
+		// has no testable major topics (no topics at all, or every topic is
+		// `importance: minor`). Surface a toast and exit without touching
+		// storage so a previously generated guide is never silently overwritten.
+		if (scenarios.length === 0) {
+			vscode.window.showInformationMessage(
+				"No major topics in this commit, so there's nothing to test.",
+			);
+			this.panel.webview.postMessage({ command: "e2eTestError" });
+			return;
+		}
 
 		const updatedSummary: CommitSummary = {
 			...summary,

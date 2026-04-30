@@ -34,6 +34,24 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toContain("classList.toggle");
 	});
 
+	it("toggle-header binding is idempotent and reused by E2E re-render path", () => {
+		// E2E section is replaced wholesale on e2eTestUpdated / e2eScenarioUpdated;
+		// new headers must get the click handler too. Guarded by a `_toggleAttached`
+		// marker so both the page-level pass and attachE2eHandlers can call the
+		// shared helper without double-binding.
+		expect(script).toContain("function attachToggleHeader");
+		expect(script).toContain("_toggleAttached");
+		// The shared helper is invoked by attachE2eHandlers on its root parameter.
+		// We assert the call exists inside the function body by locating it after
+		// the function definition.
+		const e2eHandlerStart = script.indexOf("function attachE2eHandlers");
+		expect(e2eHandlerStart).toBeGreaterThan(0);
+		const e2eHandlerSection = script.slice(e2eHandlerStart);
+		expect(e2eHandlerSection).toContain(
+			"querySelectorAll('.toggle-header').forEach(attachToggleHeader)",
+		);
+	});
+
 	it("contains hash copy functionality", () => {
 		expect(script).toContain(".hash-copy");
 		expect(script).toContain("navigator.clipboard.writeText");

@@ -397,8 +397,9 @@ export function buildCss(): string {
     display: none;
   }
 
-  /* ── E2E Test Guide ── */
-  .e2e-placeholder {
+  /* ── Empty-state placeholder text (E2E Test Guide, Quick recap, Plans & Notes) ── */
+  .e2e-placeholder,
+  .recap-placeholder {
     color: var(--vscode-descriptionForeground);
     font-size: 0.92em;
     line-height: 1.5;

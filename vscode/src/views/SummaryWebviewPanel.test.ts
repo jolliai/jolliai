@@ -111,15 +111,18 @@ vi.mock("../util/WorkspaceUtils.js", () => ({
 	loadGlobalConfig: mockLoadConfig,
 }));
 
-const { mockGenerateE2eTest, mockTranslateToEnglish } = vi.hoisted(() => ({
-	mockGenerateE2eTest: vi.fn().mockResolvedValue([]),
-	mockTranslateToEnglish: vi
-		.fn()
-		.mockResolvedValue("# Translated Plan\n\nEnglish content"),
-}));
+const { mockGenerateE2eTest, mockGenerateRecap, mockTranslateToEnglish } =
+	vi.hoisted(() => ({
+		mockGenerateE2eTest: vi.fn().mockResolvedValue([]),
+		mockGenerateRecap: vi.fn().mockResolvedValue(""),
+		mockTranslateToEnglish: vi
+			.fn()
+			.mockResolvedValue("# Translated Plan\n\nEnglish content"),
+	}));
 
 vi.mock("../../../cli/src/core/Summarizer.js", () => ({
 	generateE2eTest: mockGenerateE2eTest,
+	generateRecap: mockGenerateRecap,
 	translateToEnglish: mockTranslateToEnglish,
 }));
 
@@ -1460,6 +1463,67 @@ describe("SummaryWebviewPanel", () => {
 			});
 		});
 
+		// ── generateRecap ────────────────────────────────────────────────────
+
+		describe("generateRecap", () => {
+			it("stores the new recap and posts recapUpdated when generation succeeds", async () => {
+				mockGenerateRecap.mockResolvedValueOnce("  Generated recap.  ");
+				mockBuildRecapSection.mockReturnValue('<div id="recapSection">x</div>');
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "generateRecap" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "recapGenerating",
+				});
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ recap: "Generated recap." }),
+					workspaceRoot,
+					true,
+				);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "recapUpdated",
+					html: '<div id="recapSection">x</div>',
+				});
+			});
+
+			it("preserves existing recap and shows toast when generation returns empty", async () => {
+				// Empty result happens when the commit has no major topics. The
+				// handler must not destroy a previously stored recap.
+				mockGenerateRecap.mockResolvedValueOnce("");
+				const dispatch = await setupPanel({ recap: "Existing recap." });
+
+				dispatch({ command: "generateRecap" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("nothing to recap"),
+				);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "recapUpdateError",
+				});
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "recapUpdated" }),
+				);
+			});
+
+			it("treats whitespace-only generation as empty (no store, toast surfaced)", async () => {
+				mockGenerateRecap.mockResolvedValueOnce("   \n\t  ");
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "generateRecap" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "recapUpdateError",
+				});
+			});
+		});
+
 		// ── editRecap ────────────────────────────────────────────────────────
 
 		describe("editRecap", () => {
@@ -1615,6 +1679,32 @@ describe("SummaryWebviewPanel", () => {
 				// Should still call generateE2eTest with empty diff
 				expect(mockGenerateE2eTest).toHaveBeenCalledWith(
 					expect.objectContaining({ diff: "" }),
+				);
+			});
+
+			it("preserves existing guide and shows toast when generation returns no scenarios", async () => {
+				// Empty array happens when the commit has no major (testable) topics.
+				// The handler must not overwrite an existing guide with [].
+				const existingGuide = [
+					{
+						title: "Existing scenario",
+						steps: ["Step 1"],
+						expectedResults: ["Result 1"],
+					},
+				];
+				mockGenerateE2eTest.mockResolvedValueOnce([]);
+				const dispatch = await setupPanel({ e2eTestGuide: existingGuide });
+
+				dispatch({ command: "generateE2eTest" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("nothing to test"),
+				);
+				expect(postMessage).toHaveBeenCalledWith({ command: "e2eTestError" });
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "e2eTestUpdated" }),
 				);
 			});
 		});

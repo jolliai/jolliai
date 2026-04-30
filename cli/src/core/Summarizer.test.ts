@@ -16,12 +16,14 @@ import {
 	formatSourceCommitsForSquash,
 	generateCommitMessage,
 	generateE2eTest,
+	generateRecap,
 	generateSquashConsolidation,
 	generateSquashMessage,
 	generateSummary,
 	isFormatCompliant,
 	mechanicalConsolidate,
 	parseE2eTestResponse,
+	parseRecapResponse,
 	parseSummaryResponse,
 	parseTopLevelFields,
 	resolveModelId,
@@ -1440,6 +1442,151 @@ Test reordering
 			});
 
 			expect(result).toEqual([]);
+		});
+	});
+
+	describe("parseRecapResponse", () => {
+		it("strips the leading ---RECAP--- marker and returns the body trimmed", () => {
+			const text = `---RECAP---\nThe developer added drag-handle reordering.\n\nA second paragraph follows.\n`;
+			expect(parseRecapResponse(text)).toBe(
+				"The developer added drag-handle reordering.\n\nA second paragraph follows.",
+			);
+		});
+
+		it("returns empty string for empty input", () => {
+			expect(parseRecapResponse("")).toBe("");
+			expect(parseRecapResponse("   \n\t  ")).toBe("");
+		});
+
+		it("falls back to whole text when the marker is missing", () => {
+			// Defensive against LLMs that occasionally drop the leading marker.
+			expect(parseRecapResponse("The developer added X.")).toBe("The developer added X.");
+		});
+
+		it("strips an echoed closing ---RECAP--- marker if the model wraps the body", () => {
+			const text = `---RECAP---\nA recap paragraph.\n---RECAP---\n`;
+			expect(parseRecapResponse(text)).toBe("A recap paragraph.");
+		});
+
+		it("handles surrounding whitespace before the marker", () => {
+			const text = `\n\n   \n---RECAP---\nText after whitespace.\n`;
+			expect(parseRecapResponse(text)).toBe("Text after whitespace.");
+		});
+	});
+
+	describe("generateRecap", () => {
+		it("returns the parsed recap and skips the diff in the LLM payload", async () => {
+			mockCallLlm.mockResolvedValueOnce(
+				summaryLlmResult("---RECAP---\nThe developer reorganised the article sidebar."),
+			);
+
+			const recap = await generateRecap({
+				topics: mockTopics,
+				commitMessage: "Refactor sidebar",
+				config: mockConfig,
+			});
+
+			expect(recap).toBe("The developer reorganised the article sidebar.");
+			expect(mockCallLlm).toHaveBeenCalledWith(
+				expect.objectContaining({
+					action: "recap",
+					params: expect.objectContaining({
+						commitMessage: "Refactor sidebar",
+						topicsSummary: expect.stringContaining("Add drag-to-reorder for articles"),
+					}),
+				}),
+			);
+			const calls = mockCallLlm.mock.calls as unknown as ReadonlyArray<[{ params: Record<string, unknown> }]>;
+			// Recap re-generation deliberately does NOT pass the diff (token-saving;
+			// recap is a narrative over already-extracted topics, not fresh code analysis).
+			expect(calls[0][0].params).not.toHaveProperty("diff");
+		});
+
+		it("formats topicsSummary using narrative fields only (no response field leakage)", async () => {
+			mockCallLlm.mockResolvedValueOnce(summaryLlmResult("---RECAP---\nx"));
+
+			await generateRecap({
+				topics: mockTopics,
+				commitMessage: "msg",
+				config: mockConfig,
+			});
+
+			const calls = mockCallLlm.mock.calls as unknown as ReadonlyArray<[{ params: Record<string, string> }]>;
+			const summary = calls[0][0].params.topicsSummary;
+			// Title, Trigger, Decisions are present (narrative).
+			expect(summary).toContain("Add drag-to-reorder for articles");
+			expect(summary).toContain("**Trigger:** Users wanted to reorder articles");
+			expect(summary).toContain("**Decisions:** Used a simple swap algorithm");
+			// Response is implementation-detail and must not appear.
+			expect(summary).not.toContain("Implemented drag-and-drop reordering via the chat agent");
+		});
+
+		it("filters out minor topics before sending to the LLM", async () => {
+			mockCallLlm.mockResolvedValueOnce(summaryLlmResult("---RECAP---\ny"));
+
+			await generateRecap({
+				topics: [
+					{
+						title: "Major change",
+						trigger: "t",
+						response: "r",
+						decisions: "d",
+						importance: "major",
+					},
+					{
+						title: "Tiny tweak",
+						trigger: "t",
+						response: "r",
+						decisions: "d",
+						importance: "minor",
+					},
+				],
+				commitMessage: "Mixed",
+				config: mockConfig,
+			});
+
+			const calls = mockCallLlm.mock.calls as unknown as ReadonlyArray<[{ params: Record<string, string> }]>;
+			const summary = calls[0][0].params.topicsSummary;
+			expect(summary).toContain("Major change");
+			expect(summary).not.toContain("Tiny tweak");
+		});
+
+		it("returns empty string and skips the LLM call when every topic is minor", async () => {
+			const result = await generateRecap({
+				topics: [
+					{ title: "x", trigger: "t", response: "r", decisions: "d", importance: "minor" },
+					{ title: "y", trigger: "t", response: "r", decisions: "d", importance: "minor" },
+				],
+				commitMessage: "Trivia only",
+				config: mockConfig,
+			});
+
+			expect(result).toBe("");
+			expect(mockCallLlm).not.toHaveBeenCalled();
+		});
+
+		it("returns empty string when the LLM produces no text", async () => {
+			mockCallLlm.mockResolvedValueOnce(summaryLlmResult("", { text: null as unknown as string }));
+
+			const result = await generateRecap({
+				topics: mockTopics,
+				commitMessage: "msg",
+				config: mockConfig,
+			});
+
+			expect(result).toBe("");
+		});
+
+		it("uses the configured model alias", async () => {
+			mockCallLlm.mockResolvedValueOnce(summaryLlmResult("---RECAP---\ntext"));
+
+			await generateRecap({
+				topics: mockTopics,
+				commitMessage: "msg",
+				config: { model: "haiku" },
+			});
+
+			expect(mockCallLlm).toHaveBeenCalledWith(expect.objectContaining({ model: "claude-haiku-4-5-20251001" }));
 		});
 	});
 

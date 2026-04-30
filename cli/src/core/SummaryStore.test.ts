@@ -2229,5 +2229,124 @@ describe("SummaryStore", () => {
 			expect(sources[0]?.commitHash).toBe("v4abc");
 			expect(sources[0]?.topics.map((t) => t.title)).toEqual(["v4-topic"]);
 		});
+
+		it("carries ticketId and recap from v4 unified-hoist root onto the source", () => {
+			const v4Summary: CommitSummary = {
+				version: 4,
+				commitHash: "v4withMeta",
+				commitMessage: "Squash with meta",
+				commitAuthor: "Dev",
+				commitDate: "2026-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-01T00:00:05Z",
+				transcriptEntries: 0,
+				stats: { filesChanged: 0, insertions: 0, deletions: 0 },
+				ticketId: "PROJ-123",
+				recap: "The developer added drag-handle reordering.",
+				topics: [{ title: "x", detail: "d", decisions: undefined }],
+			};
+
+			const sources = expandSourcesForConsolidation(v4Summary);
+
+			expect(sources).toHaveLength(1);
+			expect(sources[0]?.ticketId).toBe("PROJ-123");
+			expect(sources[0]?.recap).toBe("The developer added drag-handle reordering.");
+		});
+
+		it("carries ticketId and recap from v3 children onto each source", () => {
+			const child1: CommitSummary = {
+				...leaf("c1", ["t1"]),
+				ticketId: "FEAT-1",
+				recap: "Recap for child 1.",
+			};
+			const child2: CommitSummary = {
+				...leaf("c2", ["t2"]),
+				// Intentionally no ticketId / recap to exercise the falsy branch
+				// of the conditional spreads on lines 458 / 460.
+			};
+			const root: CommitSummary = {
+				...leaf("root", []),
+				children: [child1, child2],
+			};
+
+			const sources = expandSourcesForConsolidation(root);
+
+			expect(sources).toHaveLength(2);
+			expect(sources.find((s) => s.commitHash === "c1")?.ticketId).toBe("FEAT-1");
+			expect(sources.find((s) => s.commitHash === "c1")?.recap).toBe("Recap for child 1.");
+			expect(sources.find((s) => s.commitHash === "c2")?.ticketId).toBeUndefined();
+			expect(sources.find((s) => s.commitHash === "c2")?.recap).toBeUndefined();
+		});
+
+		it("appends a legacy v3 amend root carrying its own topics + recap + ticketId as an extra source", () => {
+			// v3 amend pattern: the root commit has children (from prior commits) AND
+			// its own delta topics/recap/ticketId left behind by the amend operation.
+			// Without this branch, the root delta would be silently dropped during squash.
+			const child: CommitSummary = leaf("child", ["child-topic"]);
+			const amendRoot: CommitSummary = {
+				...leaf("amend-root", ["root-delta-topic"]),
+				ticketId: "AMEND-9",
+				recap: "Recap left on the amend root.",
+				children: [child],
+			};
+
+			const sources = expandSourcesForConsolidation(amendRoot);
+
+			expect(sources).toHaveLength(2);
+			const rootSource = sources.find((s) => s.commitHash === "amend-root");
+			expect(rootSource).toBeDefined();
+			expect(rootSource?.ticketId).toBe("AMEND-9");
+			expect(rootSource?.recap).toBe("Recap left on the amend root.");
+			expect(rootSource?.topics.map((t) => t.title)).toEqual(["root-delta-topic"]);
+		});
+
+		it("appends a legacy v3 amend root with only recap (no ticketId, no own topics) so the recap survives", () => {
+			// Edge case: rootHasOwnData triggers when topics OR recap is present.
+			// Without recap on the amend root and no own topics, the branch should
+			// NOT trigger and the source list should match children only.
+			const child: CommitSummary = leaf("child", ["child-topic"]);
+			const recapOnlyRoot: CommitSummary = {
+				...leaf("recap-only-root", []),
+				recap: "Only a recap here.",
+				children: [child],
+			};
+
+			const sources = expandSourcesForConsolidation(recapOnlyRoot);
+
+			expect(sources).toHaveLength(2);
+			const rootSource = sources.find((s) => s.commitHash === "recap-only-root");
+			expect(rootSource?.recap).toBe("Only a recap here.");
+			expect(rootSource?.ticketId).toBeUndefined();
+		});
+
+		it("handles a legacy v3 amend root where topics is undefined (not [])", () => {
+			// rootHasOwnData uses optional chaining `oldSummary.topics?.length`
+			// which yields undefined when topics is not set; the `?? 0` fallback
+			// then gates on recap. The legacy carry-over also relies on
+			// `topics: oldSummary.topics ?? []` to materialise the empty array.
+			// This test exercises both nullish-coalesce branches.
+			const child: CommitSummary = leaf("child", ["child-topic"]);
+			const noTopicsRoot: CommitSummary = {
+				version: 3,
+				commitHash: "no-topics-root",
+				commitMessage: "Amend with only recap",
+				commitAuthor: "Dev",
+				commitDate: "2026-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-01T00:00:05Z",
+				transcriptEntries: 0,
+				stats: { filesChanged: 0, insertions: 0, deletions: 0 },
+				// Intentionally omit `topics` -- exercises optional-chain undefined
+				recap: "Recap on a topic-less root.",
+				children: [child],
+			};
+
+			const sources = expandSourcesForConsolidation(noTopicsRoot);
+
+			expect(sources).toHaveLength(2);
+			const rootSource = sources.find((s) => s.commitHash === "no-topics-root");
+			expect(rootSource?.topics).toEqual([]);
+			expect(rootSource?.recap).toBe("Recap on a topic-less root.");
+		});
 	});
 });

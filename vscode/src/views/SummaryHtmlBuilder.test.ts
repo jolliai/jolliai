@@ -800,21 +800,34 @@ describe("SummaryHtmlBuilder", () => {
 	// ─── buildRecapSection ───────────────────────────────────────────────────
 
 	describe("buildRecapSection", () => {
-		it("returns empty string when recap is undefined", () => {
-			expect(buildRecapSection(undefined)).toBe("");
+		it("renders State 1 (placeholder + Generate button) when recap is undefined", () => {
+			const html = buildRecapSection(undefined);
+			expect(html).toContain('id="recapSection"');
+			expect(html).toContain('id="generateRecapBtn"');
+			expect(html).toContain("Quick recap");
+			expect(html).toContain("recap-placeholder");
+			// State 1 has no Edit / Regenerate / data-raw / recap-body
+			expect(html).not.toContain('id="editRecapBtn"');
+			expect(html).not.toContain('id="regenerateRecapBtn"');
+			expect(html).not.toContain("data-raw=");
+			expect(html).not.toContain("recap-body");
 		});
 
-		it("returns empty string when recap is whitespace-only", () => {
-			expect(buildRecapSection("   \n  \t  ")).toBe("");
+		it("renders State 1 when recap is whitespace-only (treated as empty)", () => {
+			const html = buildRecapSection("   \n  \t  ");
+			expect(html).toContain('id="generateRecapBtn"');
+			expect(html).not.toContain('id="editRecapBtn"');
 		});
 
-		it("renders the section with edit button and trailing separator", () => {
+		it("renders State 2 (recap body with Edit + Regenerate buttons) when recap is present", () => {
 			const html = buildRecapSection("This commit added a recap field.");
 			expect(html).toContain('id="recapSection"');
 			expect(html).toContain("Quick recap");
 			expect(html).toContain('id="editRecapBtn"');
+			expect(html).toContain('id="regenerateRecapBtn"');
 			expect(html).toContain('class="recap-body"');
 			expect(html).toContain("This commit added a recap field.");
+			expect(html).not.toContain('id="generateRecapBtn"');
 			expect(html.trimEnd().endsWith('<hr class="separator" />')).toBe(true);
 		});
 
@@ -823,6 +836,19 @@ describe("SummaryHtmlBuilder", () => {
 			// data-raw uses escAttr (mocked to identity here), the body uses escHtml.
 			// The point of the assertion is that data-raw exists and carries the value.
 			expect(html).toContain('data-raw="Recap with <html> & special chars"');
+		});
+
+		it("splits multi-paragraph recaps on blank lines into separate <p> elements", () => {
+			const html = buildRecapSection("First paragraph.\n\nSecond paragraph.");
+			// Two <p> tags inside the body, each holding one paragraph
+			expect(html).toContain("<p>First paragraph.</p>");
+			expect(html).toContain("<p>Second paragraph.</p>");
+		});
+
+		it("collapses 3+ consecutive newlines to a single paragraph break", () => {
+			const html = buildRecapSection("A.\n\n\n\nB.");
+			expect(html).toContain("<p>A.</p>");
+			expect(html).toContain("<p>B.</p>");
 		});
 	});
 
@@ -839,10 +865,14 @@ describe("SummaryHtmlBuilder", () => {
 			expect(recapIdx).toBeLessThan(prIdx);
 		});
 
-		it("omits the recap section entirely when summary has no recap", () => {
+		it("renders the State 1 placeholder when summary has no recap (so Generate button is reachable)", () => {
 			const html = buildHtml(makeSummary({ recap: undefined }));
-			expect(html).not.toContain("recapSection");
-			expect(html).not.toContain("editRecapBtn");
+			// recapSection is always present now; what differs between states is
+			// which buttons appear and whether recap-body / data-raw exist.
+			expect(html).toContain('id="recapSection"');
+			expect(html).toContain('id="generateRecapBtn"');
+			expect(html).not.toContain('id="editRecapBtn"');
+			expect(html).not.toContain('id="regenerateRecapBtn"');
 		});
 	});
 
