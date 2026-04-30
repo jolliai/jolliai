@@ -388,5 +388,10 @@ tasks {
 
     test {
         useJUnitPlatform()
+        javaLauncher.set(
+            project.the<JavaToolchainService>().launcherFor {
+                languageVersion.set(JavaLanguageVersion.of(21))
+            }
+        )
     }
 }

@@ -42,34 +42,6 @@ object SummaryMarkdownBuilder {
         return lines.joinToString("\n")
     }
 
-    /**
-     * Builds a simplified Markdown string optimized for GitHub PR descriptions.
-     *
-     * Only includes information not already visible on the PR page:
-     * - Jolli Memory URL (if pushed)
-     * - Associated Plans with URLs
-     * - E2E Test Guide
-     * - Summaries: Why (trigger) -> Decisions -> What (response)
-     * - Footer
-     */
-    fun buildPrMarkdown(summary: CommitSummary): String {
-        val (allTopics, _, showRecordDates) = collectSortedTopics(summary)
-        val lines = mutableListOf<String>()
-
-        // Jolli Memory URL
-        val memoryDocUrl = summary.jolliDocUrl
-        if (memoryDocUrl != null) {
-            lines.addAll(listOf("", "## Jolli Memory", "", memoryDocUrl))
-        }
-
-        pushPlansSection(lines, summary, includeEditInfo = false)
-        pushE2eTestSection(lines, summary.e2eTestGuide)
-        pushPrTopicsSection(lines, allTopics, showRecordDates)
-        pushFooter(lines)
-
-        return lines.joinToString("\n")
-    }
-
     // ── Shared section helpers ──────────────────────────────────────────────
 
     /** Appends the commit properties header (H1, metadata list, separator). */
@@ -136,6 +108,30 @@ object SummaryMarkdownBuilder {
         }
     }
 
+    /**
+     * Appends the combined plans & notes section for PR markdown.
+     * Plans with jolliPlanDocUrl are rendered as links; notes with jolliNoteDocUrl likewise.
+     */
+    internal fun pushPlansAndNotesSection(lines: MutableList<String>, summary: CommitSummary) {
+        val plans = summary.plans ?: emptyList()
+        val notes = summary.notes ?: emptyList()
+        val totalCount = plans.size + notes.size
+        if (totalCount == 0) return
+
+        val countLabel = if (totalCount > 1) " ($totalCount)" else ""
+        lines.addAll(listOf("", "## Plans & Notes$countLabel", ""))
+
+        for (plan in plans) {
+            val planUrl = plan.jolliPlanDocUrl
+            lines.add(if (planUrl != null) "- [${plan.title}]($planUrl)" else "- ${plan.title}")
+        }
+
+        for (note in notes) {
+            val noteUrl = note.jolliNoteDocUrl
+            lines.add(if (noteUrl != null) "- [${note.title}]($noteUrl)" else "- ${note.title}")
+        }
+    }
+
     /** Appends the E2E test guide section (shared between clipboard and PR markdown). */
     private fun pushE2eTestSection(lines: MutableList<String>, e2eTestGuide: List<E2eTestScenario>?) {
         if (e2eTestGuide.isNullOrEmpty()) return
@@ -196,14 +192,6 @@ object SummaryMarkdownBuilder {
         }
     }
 
-    /** Appends simplified topic body for PR: trigger, decisions, response (no todo/files). */
-    private fun pushPrTopicBody(out: MutableList<String>, t: ViewTopicWithDate) {
-        val topic = t.topic.topic
-        out.addAll(listOf("", "**\u26A1 Why This Change**", "", topic.trigger))
-        out.addAll(listOf("", "**\uD83D\uDCA1 Decisions Behind the Code**", "", topic.decisions))
-        out.addAll(listOf("", "**\u2705 What Was Implemented**", "", topic.response))
-    }
-
     /** Appends the memories/summaries section for clipboard export. */
     private fun pushTopicsSection(
         lines: MutableList<String>,
@@ -237,82 +225,8 @@ object SummaryMarkdownBuilder {
         }
     }
 
-    /**
-     * Appends the PR summaries section with GitHub body-size truncation.
-     * Uses simplified topic body (no todo/files) and stops adding topics
-     * once the PR body would exceed the GitHub character limit.
-     */
-    private fun pushPrTopicsSection(
-        lines: MutableList<String>,
-        allTopics: List<ViewTopicWithDate>,
-        showRecordDates: Boolean,
-    ) {
-        if (allTopics.isEmpty()) return
-
-        // GitHub PR body limit is 65536 chars. Reserve space for footer + markers (~200 chars).
-        val prBodyLimit = 65_000
-
-        val heading = if (allTopics.size == 1) "Summary" else "Summaries"
-        lines.addAll(listOf("", "## $heading (${allTopics.size})"))
-
-        val currentLength = { lines.joinToString("\n").length }
-        val includedCount: Int
-
-        if (showRecordDates) {
-            includedCount = pushPrTopicsGroupedByDate(lines, allTopics, currentLength, prBodyLimit)
-        } else {
-            var count = 0
-            for ((i, t) in allTopics.withIndex()) {
-                val topicLines = mutableListOf<String>()
-                topicLines.addAll(listOf("", "### ${padIndex(i)} \u00b7 ${t.topic.topic.title}"))
-                pushPrTopicBody(topicLines, t)
-                if (currentLength() + topicLines.joinToString("\n").length > prBodyLimit) break
-                lines.addAll(topicLines)
-                count++
-            }
-            includedCount = count
-        }
-
-        val omitted = allTopics.size - includedCount
-        if (omitted > 0) {
-            val noun = if (omitted != 1) "ies" else "y"
-            lines.addAll(listOf("", "> \u26A0\uFE0F $omitted more summar$noun omitted due to GitHub PR body size limit."))
-        }
-    }
-
-    /** Appends date-grouped PR topics with truncation. Returns the number of included topics. */
-    private fun pushPrTopicsGroupedByDate(
-        lines: MutableList<String>,
-        allTopics: List<ViewTopicWithDate>,
-        currentLength: () -> Int,
-        limit: Int,
-    ): Int {
-        var globalIdx = 0
-        var includedCount = 0
-        var truncated = false
-
-        for ((_, groupTopics) in groupTopicsByDate(allTopics)) {
-            if (truncated) break
-            val groupDate = formatDate(groupTopics[0].recordDate ?: "")
-            lines.addAll(listOf("", "### $groupDate"))
-            for (t in groupTopics) {
-                val topicLines = mutableListOf<String>()
-                topicLines.addAll(listOf("", "#### ${padIndex(globalIdx)} \u00b7 ${t.topic.topic.title}"))
-                pushPrTopicBody(topicLines, t)
-                if (currentLength() + topicLines.joinToString("\n").length > limit) {
-                    truncated = true
-                    break
-                }
-                lines.addAll(topicLines)
-                includedCount++
-                globalIdx++
-            }
-        }
-        return includedCount
-    }
-
     /** Appends the standard "Generated by JolliMemory" footer. */
-    private fun pushFooter(lines: MutableList<String>) {
+    internal fun pushFooter(lines: MutableList<String>) {
         val generatedAt = formatFullDate(java.time.Instant.now().toString())
         lines.addAll(listOf("", "---", "", "*Generated by JolliMemory \u00b7 $generatedAt*"))
     }
