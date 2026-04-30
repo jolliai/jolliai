@@ -4,7 +4,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort.
 
-When you work with AI agents like Claude Code, Codex, or Gemini CLI, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents like Claude Code, Codex, Gemini CLI or OpenCode, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 ## How It Works
 
@@ -110,7 +110,7 @@ The login flow opens your default browser for OAuth authentication. After comple
 
 ### `jolli status`
 
-Shows the current installation status, including CLI version, hook state, authentication state, active sessions, supported integrations (Claude, Codex, Gemini), and summary count.
+Shows the current installation status, including CLI version, hook state, authentication state, active sessions, supported integrations (Claude, Codex, Gemini, OpenCode), and summary count.
 
 ```bash
 jolli status

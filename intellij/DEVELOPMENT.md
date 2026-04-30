@@ -88,7 +88,7 @@ Summaries are stored in a git orphan branch (`jollimemory/summaries/v3`) using a
 ```
 src/main/kotlin/ai/jolli/jollimemory/
 ├── JolliMemoryIcons.kt              # Icon resource loader
-├── actions/                         # IntelliJ AnAction classes (16 actions)
+├── actions/                         # IntelliJ AnAction classes (19 actions)
 │   ├── EnableAction.kt              # Install hooks and Claude Code stop hook
 │   ├── DisableAction.kt             # Uninstall hooks
 │   ├── CommitAIAction.kt            # AI-powered commit message generation + commit
@@ -99,27 +99,35 @@ src/main/kotlin/ai/jolli/jollimemory/
 │   ├── AddNoteAction.kt             # Add a Markdown file or text snippet note
 │   ├── SelectAllFilesAction.kt      # Toggle selection of all changed files
 │   ├── SelectAllCommitsAction.kt    # Toggle selection of all commits
+│   ├── SearchMemoriesAction.kt      # Open the Memories panel keyword filter
+│   ├── ClearMemoryFilterAction.kt   # Clear the active Memories filter
 │   ├── StatusSettingsAction.kt      # Open settings dialog
 │   ├── TogglePanelAction.kt         # Toggle panel visibility
-│   └── Refresh*Action.kt            # Refresh individual panels (4 actions)
-├── bridge/                          # Native Kotlin bridge to git and summaries
+│   └── Refresh*Action.kt            # Refresh individual panels (Status, Memories, Plans, Changes, Commits — 5 actions)
+├── auth/                            # Auth credential storage (shared with CLI/VSCode at ~/.jolli/jollimemory/config.json)
+│   ├── JolliConfigStore.kt          # Read/write authToken and space metadata
+│   └── JolliUrlConfig.kt            # Resolves the Jolli site URL from saved metadata
+├── bridge/                          # Native Kotlin bridge to git, hooks, and summaries
 │   ├── GitOps.kt                    # Git command execution via ProcessBuilder
 │   ├── HookInstaller.kt             # Hook script installation/removal (pure file I/O)
+│   ├── SkillInstaller.kt            # Installs the /jolli-recall slash command into Claude Code's skills directory
 │   └── SummaryReader.kt             # Read summaries from orphan branch
 ├── core/                            # Pure Kotlin core (no IntelliJ dependencies)
 │   ├── AnthropicClient.kt           # HTTP client for Anthropic API (Java 21 HttpClient)
+│   ├── LlmClient.kt                 # Abstraction over the LLM provider — picks Anthropic direct vs Jolli proxy by config
 │   ├── Summarizer.kt                # LLM prompt construction and response parsing
 │   ├── SummaryStore.kt              # Orphan branch read/write (git plumbing)
 │   ├── SummaryTree.kt               # Tree-structured summary index
+│   ├── PlanProgressEvaluator.kt     # Derives "active vs done" plan progress from transcript signals
 │   ├── TranscriptReader.kt          # JSONL transcript parser with cursor resumption
 │   ├── TranscriptParsers.kt         # Agent-specific transcript format parsers
-│   ├── SessionTracker.kt            # Active session registry (sessions.json)
+│   ├── SessionTracker.kt            # Active session registry (sessions.json) + global config dir resolution
 │   ├── CodexSessionDiscoverer.kt    # Auto-discover Codex sessions from filesystem
 │   ├── GeminiSupport.kt             # Gemini CLI session integration
-│   ├── Types.kt                     # Data classes, enums, and type definitions
+│   ├── Types.kt                     # Data classes, enums, and type definitions (incl. JolliMemoryConfig with authToken)
 │   └── JmLogger.kt                  # File-based logger for hooks (no IDE dependency)
 ├── hooks/                           # Standalone hook entry points (bundled in hooks JAR)
-│   ├── HookRunner.kt                # Main-Class entry point for jollimemory-hooks.jar
+│   ├── HookRunner.kt                # Main-Class entry point for jollimemory-hooks.jar; dispatches by first arg
 │   ├── PostCommitHook.kt            # Post-commit: spawn background summarization
 │   ├── PostRewriteHook.kt           # Post-rewrite: migrate summaries after rebase/amend
 │   ├── PrepareMsgHook.kt            # Prepare-commit-msg: detect squash/amend
@@ -129,18 +137,20 @@ src/main/kotlin/ai/jolli/jollimemory/
 ├── services/                        # IntelliJ project-level services
 │   ├── JolliMemoryService.kt        # Central service: install/uninstall, status, branch ops
 │   ├── JolliMemoryStartupActivity.kt# Auto-detect and install hooks on project open
-│   ├── JolliApiClient.kt            # HTTP client for Jolli Space API
+│   ├── JolliAuthService.kt          # OAuth flow: opens browser, runs a local callback listener, stores credentials
+│   ├── JolliApiClient.kt            # HTTP client for Jolli Space API (Push to Jolli)
 │   ├── PlanService.kt               # Plan detection and registry management
 │   └── PrService.kt                 # GitHub PR creation/update via gh CLI
 ├── settings/
-│   └── JolliMemoryConfigurable.kt   # Settings page (Settings > Tools > Jolli Memory)
+│   └── JolliMemoryConfigurable.kt   # Settings page (Settings > Tools > Jolli Memory) — Sign In/Out + API keys + model
 └── toolwindow/                      # UI components (Swing / JCEF)
-    ├── JolliMemoryToolWindowFactory.kt # Tool window entry point
+    ├── JolliMemoryToolWindowFactory.kt # Tool window entry point + Sign In banner
     ├── AccordionLayout.kt           # Collapsed panels shrink to header-only
     ├── CollapsiblePanel.kt          # Header with title, arrow, inline toolbar
     ├── ResizeDivider.kt             # Drag-to-resize between panels
     ├── PanelRegistry.kt             # Panel visibility state management
-    ├── StatusPanel.kt               # STATUS panel (hook status, sessions, summaries)
+    ├── StatusPanel.kt               # STATUS panel (hook status, sessions, summary count)
+    ├── MemoriesPanel.kt             # MEMORIES panel (search + paginated list of stored summaries)
     ├── PlansPanel.kt                # PLANS & NOTES panel
     ├── ChangesPanel.kt              # CHANGES panel (file selection with checkboxes)
     ├── CommitsPanel.kt              # COMMITS panel (branch history with metadata)
@@ -149,7 +159,6 @@ src/main/kotlin/ai/jolli/jollimemory/
     ├── SummaryFileEditor.kt         # File editor wrapper for summary content
     ├── SummaryPanel.kt              # Summary rendering panel
     ├── SummaryVirtualFile.kt        # Virtual file for summary content
-    ├── ScopeDialog.kt               # Scope selection dialog
     ├── SettingsDialog.kt            # Inline settings dialog
     └── views/                       # HTML/CSS/JS builders for summary rendering
 ```
@@ -171,7 +180,7 @@ Unlike the VS Code extension (which bundles a Node.js CLI), the IntelliJ plugin 
 
 Git hooks must run outside the IDE (commits happen from the terminal too). The `hookJar` Gradle task (ShadowJar) produces `jollimemory-hooks.jar` — a self-contained JAR with:
 
-- All hook entry points (`PostCommitHook`, `PostRewriteHook`, `PrepareMsgHook`, `StopHook`)
+- All hook entry points (`PostCommitHook`, `PostRewriteHook`, `PrepareMsgHook`, `StopHook`, `GeminiAfterAgentHook`)
 - Core classes (`Summarizer`, `SummaryStore`, `TranscriptReader`, etc.)
 - Gson for JSON parsing
 - Kotlin stdlib (bundled via separate `hooksRuntime` configuration)
@@ -220,7 +229,7 @@ Test files are in `src/test/kotlin/ai/jolli/jollimemory/` mirroring the main sou
 The plugin version is set in `build.gradle.kts`:
 
 ```kotlin
-version = "0.97.4"
+version = "0.97.9"
 ```
 
 Compatibility range is also defined there:

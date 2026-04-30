@@ -254,7 +254,7 @@ Most settings can be configured directly from the **Status** panel in the sideba
 | Field | Type | Default | Description |
 | -- | -- | -- | -- |
 | `apiKey` | string | `$ANTHROPIC_API_KEY` | Your Anthropic API key for AI summarization (generate one at [platform.anthropic.com](https://platform.claude.com/)) |
-| `model` | string | `claude-haiku-4-5-20251001` | Model used for summarization. Accepts an alias (`sonnet`, `haiku`) or a full model ID. |
+| `model` | string | `claude-sonnet-4-6` | Model used for summarization. Accepts an alias (`sonnet`, `haiku`) or a full model ID. |
 | `maxTokens` | integer | model default | Max output tokens per summarization call |
 | `jolliApiKey` | string | — | Jolli Space API key for pushing summaries to your team knowledge base |
 | `authToken` | string | — | OAuth token set automatically by **Sign In to Jolli** — not edited manually |
