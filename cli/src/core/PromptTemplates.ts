@@ -46,6 +46,112 @@ export function findUnfilledPlaceholders(
 	return [...missing];
 }
 
+// -- Shared recap content rules ----------------------------------------------
+
+/**
+ * The five language/style rules that govern recap writing across all three
+ * recap-producing templates: SUMMARIZE rule 19 (per-commit), SQUASH_CONSOLIDATE
+ * rule 1 (squash consolidation), and RECAP (standalone regenerate). Extracted
+ * because all three previously carried near-byte-identical copies and any
+ * tightening (e.g. adding the causal-connectives signal) had to be applied in
+ * three places, with high drift risk over time.
+ *
+ * Formatted with leading 2-space indentation so it splices directly into the
+ * bulleted recap-rules section of each template. The subject example is
+ * deliberately generic ("This commit (or batch of commits)...") so the same
+ * text works for both single-commit and squash recaps.
+ */
+const RECAP_LANGUAGE_RULES = `  - Subject and tense: third person, past tense, with a concrete subject. Use "The developer added...", "This commit (or batch of commits) introduced...", "The login page now ...", or "Users can now ...". FORBIDDEN subjects: "the tool", "the LLM", "the system", "the model", "the AI" -- never anthropomorphize the generator. Never "I" or "we".
+  - Describe WHAT changed and what users can now do differently. Do NOT explain WHY technical choices were made -- that belongs in the decisions field. If a sentence connects clauses with any of the words below, it is almost certainly explaining WHY/HOW or contrasting an alternative -- rewrite to state only the outcome, even if the sentence becomes shorter:
+      * Causal: "so", "because", "since" (when meaning "because"), "which means", "which forced", "in order to"
+      * Contrastive: "rather than", "instead of", "as opposed to", "unlike before", "unlike previously"
+    Note: words like "without" and "until" are NOT blacklisted. They are fine when they describe a neutral spatial / contextual fact ("without leaving the page", "until the result satisfies the user"). They become a problem only when they implicitly criticise an old path ("...there was no way to fix it without re-running the entire flow from scratch") -- which is already covered by the broader rule "do not describe before-vs-after in the recap".
+  - No code identifiers: no file paths, no function/class/variable names, no CLI flags, no inline code. Also forbidden: any internal field name or section label from this prompt or the data model (e.g. "decisions field", "topic count", "importance label", "recap block", "word ceiling", "trailing mention"). Also forbidden: references to how the generator works internally ("before labeling", "after parsing", "the tool decides", "marked as major"). The test: a colleague who uses the product but has never seen this codebase or this prompt should understand every sentence.
+  - User-facing names ARE allowed and encouraged: product names, page names ("the login page"), feature names ("article reordering"), and widely-recognized UI element names ("the sidebar", "the Settings panel").
+  - Meta-commits (changes to internal rules, prompts, configuration, or generation behavior the user does not directly interact with): describe the user-VISIBLE consequence -- what the user will see in future output or product behavior -- NOT the internal rule that changed. Translate mechanism statements like "the recap is now generated after the topic list" into user-facing outcomes like "future commit summaries will read more clearly: each recap covers fewer topics in greater depth". If you cannot identify a visible consequence for the user, this change may not warrant a recap at all.
+  - Paragraph balance: when the recap has multiple paragraphs, each paragraph MUST contain at least 2 sentences. Single-sentence paragraphs alongside longer ones produce a fragmented finish -- expand the short one with concrete detail, or merge it into an adjacent paragraph. (A whole-recap-of-one-sentence is still fine for trivial single-change commits.)
+  - Self-check (mandatory): before finalizing your output, mentally scan each sentence of your draft recap for the forbidden connectives listed above. For every match, rewrite that sentence to state only the visible outcome and drop the comparison/causation clause entirely. The lost information either belongs in the decisions field or should not be in the recap at all. If you have not done this scan, your output is not ready.`;
+
+/**
+ * Anti-patterns block: BAD/GOOD recap examples with brief annotations.
+ * Shared across all three templates and placed at the end of each template's
+ * recap-rules section. Indented to match the surrounding bulleted structure.
+ */
+const RECAP_ANTI_PATTERNS = `  Recap anti-patterns (do NOT write like this):
+  - BAD: "The way the tool selects topics was overhauled, so it can look back at what was already marked as major rather than guessing ahead."
+    Why bad: subject "the tool" anthropomorphizes the generator; "so" + "rather than" are causal connectives explaining WHY/HOW; "marked as major" is implementation-level vocabulary.
+  - BAD: "The recap block was moved after the topics, which means the LLM no longer needs to anticipate the importance label."
+    Why bad: "the LLM" forbidden subject; "the recap block" / "importance label" are internal field names; "which means" explains mechanism.
+  - GOOD: "Future commit summaries will be easier to read: each recap now focuses on the two or three most impactful changes and explains them in real depth. Single-line summaries of every topic are gone. Routine cleanup work no longer appears in the recap at all."
+    Why good: subject is the user-visible artefact ("future commit summaries"); describes WHAT the user will see; no internal vocabulary; no forbidden causal/contrastive connectives.`;
+
+// -- Shared output-format building blocks -------------------------------------
+
+/**
+ * The format-spec preamble shared verbatim by SUMMARIZE and SQUASH_CONSOLIDATE:
+ * the "Output format requirements" header, the "MUST be a delimited..." line,
+ * and the fenced shape diagram. Extracted because this block is the format
+ * contract most likely to be tightened (e.g. adding a new top-level marker)
+ * across both prompts at once, with high drift risk if duplicated.
+ */
+const OUTPUT_FORMAT_SHAPE = `**Output format requirements (READ FIRST -- the rest of this prompt depends on these being followed):**
+
+Your response MUST be a delimited plain-text document with the following shape:
+
+\`\`\`
+===SUMMARY===
+[optional ---TICKETID--- block]
+[zero or more ===TOPIC=== blocks]
+[optional ---RECAP--- block, AFTER all topics]
+\`\`\``;
+
+/**
+ * Output-Example TOPIC block skeleton with caller-supplied RESPONSE and
+ * DECISIONS bodies. The other six fields (TITLE / TRIGGER / TODO /
+ * FILESAFFECTED / CATEGORY / IMPORTANCE) are byte-identical between
+ * SUMMARIZE and SQUASH_CONSOLIDATE; only RESPONSE and DECISIONS diverge in
+ * cap (3 vs 5 bullets) and source-of-insight wording, so they're injected.
+ */
+function buildTopicExample(responseBody: string, decisionsBody: string): string {
+	return `===TOPIC===
+---TITLE---
+8-15 word concrete and searchable label for this topic
+---TRIGGER---
+1-2 sentences: the problem, bug, or need that prompted this work. Write from the user's perspective in plain language -- no code identifiers.
+---RESPONSE---
+${responseBody}
+---DECISIONS---
+${decisionsBody}
+---TODO---
+Tech debt, deferred work, or follow-up items. Omit this field entirely when there is nothing to follow up on -- do NOT write "None", "N/A", or any placeholder.
+---FILESAFFECTED---
+src/Auth.ts, src/Middleware.ts
+---CATEGORY---
+feature
+---IMPORTANCE---
+major`;
+}
+
+/**
+ * The two opening bullets of the recap content rules: topic-count selection
+ * and per-topic length / total-word target. Used by SUMMARIZE rule 19,
+ * SQUASH_CONSOLIDATE rule 1, and the standalone RECAP template. The standalone
+ * RECAP runs without a topic-list output, so it omits the "major" qualifier
+ * and the "topics list preserves them" reassurance (there is no topics list
+ * to preserve anything).
+ */
+function buildRecapHighImpactRule(opts: {
+	topicRange: string;
+	majorQualifier: boolean;
+	preserveNote: boolean;
+	wordTarget: string;
+}): string {
+	const major = opts.majorQualifier ? " major" : "";
+	const preserve = opts.preserveNote ? " -- the topics list preserves them" : "";
+	return `  - Pick the ${opts.topicRange} highest-impact${major} topics to cover; skip the rest${preserve}. Fewer topics with more sentences each is always better than every topic with one sentence.
+  - For each chosen topic, write 2-4 sentences. Target ${opts.wordTarget} words total. No hard upper limit -- let the substance drive length.`;
+}
+
 // -- Summarize template -------------------------------------------------------
 
 /**
@@ -53,7 +159,7 @@ export function findUnfilledPlaceholders(
  * a three-bucket rule (rule 6) inside the prompt itself, letting the LLM gauge
  * the diff scope and choose the appropriate range. We previously had three
  * separate templates (summarize:small/medium/large) plus a `{{topicGuidance}}`
- * placeholder filled by the CLI's diff-size bucketing — both designs were
+ * placeholder filled by the CLI's diff-size bucketing -- both designs were
  * abandoned because they leaked CLI implementation details into the prompt
  * contract and risked silent failure if any caller forgot to fill the field.
  */
@@ -78,23 +184,16 @@ Date: {{commitDate}}
 
 ## Instructions
 
-**Output format requirements (READ FIRST -- the rest of this prompt depends on these being followed):**
-
-Your response MUST be a delimited plain-text document with the following shape:
-
-\`\`\`
-===SUMMARY===
-[optional ---TICKETID--- block]
-[optional ---RECAP--- block]
-[zero or more ===TOPIC=== blocks]
-\`\`\`
+${OUTPUT_FORMAT_SHAPE}
 
 The very first non-blank line of your response MUST be \`===SUMMARY===\`. This is a fixed sentinel that marks the start of your output. Do NOT preface it with anything: no markdown headers (\`#\`, \`##\`, \`###\`, \`####\`), no markdown tables, no code fences (\`\`\`), no prose ("Here is the summary...", "## Summary"). If your response does not start with \`===SUMMARY===\` it will be rejected.
 
-After \`===SUMMARY===\` you MAY emit, in order:
-  - \`---TICKETID---\` if a ticket was referenced (rule 17)
-  - \`---RECAP---\` with a single-paragraph "Quick recap" of the commit's main work (rule 19)
-  - Zero or more \`===TOPIC===\` blocks (one per distinct user goal -- see rule 6 for count)
+After \`===SUMMARY===\` you MUST emit blocks in this strict order:
+  1. \`---TICKETID---\` first (if a ticket was referenced -- rule 17)
+  2. Zero or more \`===TOPIC===\` blocks (one per distinct user goal -- see rule 6 for count)
+  3. \`---RECAP---\` LAST (after the final \`===TOPIC===\` block -- rule 19)
+
+The recap MUST be the final block. This ordering is intentional: by the time you write the recap, every topic's \`---IMPORTANCE---\` label has already been emitted to your own output, so you can apply rule 19's "major-only" constraint by literal lookback at what you just wrote rather than by speculation.
 
 If there is nothing substantive to emit per rule 16 (trivial commit, no ticket, no substantive decisions), output \`===SUMMARY===\` alone on its own line and stop. Do NOT write prose explanations or placeholder sentinels.
 
@@ -110,33 +209,20 @@ Each topic starts with \`===TOPIC===\` on its own line, and each field starts wi
 ---TICKETID---
 PROJ-123
 
----RECAP---
-The developer added drag-handle reordering to the article sidebar with full backend persistence: articles can now be visually reordered and the new order survives a page refresh. The drag handle's styling matches the sidebar's existing icon set with grab/grabbing cursor feedback, and unit tests cover the underlying sort helper.
-
-===TOPIC===
----TITLE---
-8-15 word concrete and searchable label for this topic
----TRIGGER---
-1-2 sentences: the problem, bug, or need that prompted this work. Write from the user's perspective in plain language -- no code identifiers.
----RESPONSE---
-What was implemented or fixed -- this is a detail field, so technical precision is welcome. Name files, functions, and systems changed. ALWAYS use a bulleted list (- item) when there are 2+ distinct points. Use 2-4 sentences per point -- enough to specify what changed, not pad. A single sentence is fine for trivial single-point changes. Maximum 3 points. If the commit has more than 3 substantive changes, pick the 3 with highest impact (architectural changes, user-visible behavior changes, changes to load-bearing systems) -- do NOT merge unrelated changes into one point just to fit more in. Lower-impact changes you don't pick simply don't appear; that's the intended trade-off.
----DECISIONS---
-Why THIS approach was chosen over alternatives. ALWAYS use a bulleted list (- **Bold label**: explanation) when there are 2+ decisions -- each bullet is one decision with its rationale. Prioritize insights from the conversation: alternatives considered, constraints, trade-offs. Explain in plain language using impact dimensions (speed, safety, complexity, UX, maintainability) -- no code identifiers. Write so a teammate unfamiliar with this codebase area can follow. Use 2-4 sentences per bullet -- enough to explain the trade-off, not pad. Maximum 3 bullets. If the commit has more than 3 substantive decisions, pick the 3 with highest impact (architectural choices, user-visible behavior changes, decisions that constrain future work) -- do NOT merge unrelated decisions into one bullet just to fit more in. Lower-impact decisions you don't pick simply don't appear; that's the intended trade-off.
----TODO---
-Tech debt, deferred work, or follow-up items. Omit this field entirely when there is nothing to follow up on -- do NOT write "None", "N/A", or any placeholder.
----FILESAFFECTED---
-src/Auth.ts, src/Middleware.ts
----CATEGORY---
-feature
----IMPORTANCE---
-major
+${buildTopicExample(
+	"What was implemented or fixed -- this is a detail field, so technical precision is welcome. Name files, functions, and systems changed. ALWAYS use a bulleted list (- item) when there are 2+ distinct points. Use 2-4 sentences per point -- enough to specify what changed, not pad. A single sentence is fine for trivial single-point changes. Maximum 3 points. If the commit has more than 3 substantive changes, pick the 3 with highest impact (architectural changes, user-visible behavior changes, changes to load-bearing systems) -- do NOT merge unrelated changes into one point just to fit more in. Lower-impact changes you don't pick simply don't appear; that's the intended trade-off.",
+	"Why THIS approach was chosen over alternatives. ALWAYS use a bulleted list (- **Bold label**: explanation) when there are 2+ decisions -- each bullet is one decision with its rationale. When there is exactly one decision, write it as plain prose -- no bullet, no bold label. One decision is fine; one bullet is a formatting error. Prioritize insights from the conversation: alternatives considered, constraints, trade-offs. Explain in plain language using impact dimensions (speed, safety, complexity, UX, maintainability) -- no code identifiers. Write so a teammate unfamiliar with this codebase area can follow. Use 2-4 sentences per bullet -- enough to explain the trade-off, not pad. Maximum 3 bullets. If the commit has more than 3 substantive decisions, pick the 3 with highest impact (architectural choices, user-visible behavior changes, decisions that constrain future work) -- do NOT merge unrelated decisions into one bullet just to fit more in. Lower-impact decisions you don't pick simply don't appear; that's the intended trade-off.",
+)}
 
 ===TOPIC===
 [Repeat the ===TOPIC=== block above for each additional topic the commit warrants per rule 6's count guidance. The example shows ONE block for brevity -- do not let that anchor your output to a single topic when the diff covers multiple goals.]
 
+---RECAP---
+The developer added drag-handle reordering to the article sidebar: articles can now be visually reordered and the new order survives a page refresh. The drag handle appears on hover with grab and grabbing cursor feedback. Ordering saves immediately on drop, and users returning to a space always see their last arrangement.
+
 ## Rules
-1. The summary has two audiences. The **narrative fields** (title, trigger, decisions) are read by everyone -- write them for a developer who was NOT present in the session. Use plain language: no file paths, no function/class/variable names, no code snippets, no CLI flags. The **detail fields** (response, todo, filesAffected) are collapsed by default and read on-demand -- they MAY use technical identifiers (file names, function names, specific APIs) to describe implementation precisely.
-2. decisions is the most valuable field -- it captures reasoning that cannot be reconstructed from the diff alone. ALWAYS use a bulleted list (- **Label**: rationale) when there are 2+ decisions. Express each in terms of IMPACT and TRADE-OFFS, not code architecture. Use 2-4 sentences per bullet to actually explain the trade-off (depth over breadth). A single prose sentence is acceptable only when there is exactly one decision. Maximum 3 bullets. If there are more than 3 substantive decisions, pick the 3 with highest impact -- do NOT merge unrelated decisions into one bullet just to fit more in. Lower-impact decisions you don't pick simply don't appear; that's the intended trade-off.
+1. The summary has two audiences. The **narrative fields** (title, trigger, decisions) are read by everyone -- write them for a colleague who uses the product but was NOT present in the session and has never read this codebase. Use plain language: no file paths, no function/class/variable names, no code snippets, no CLI flags, and no implementation-level terms that only make sense if you have seen the code (e.g. internal algorithm names, internal protocol names, framework-specific concepts). The test: a product manager or designer should understand every sentence in these fields without needing an explanation. The **detail fields** (response, todo, filesAffected) are collapsed by default and read on-demand -- they MAY use technical identifiers (file names, function names, specific APIs) to describe implementation precisely.
+2. decisions is the most valuable field -- it captures reasoning that cannot be reconstructed from the diff alone. ALWAYS use a bulleted list (- **Label**: rationale) when there are 2+ decisions. When there is exactly one decision, write it as plain prose -- no bullet, no bold label. One decision is fine; one bullet is a formatting error. Express each in terms of IMPACT and TRADE-OFFS, not code architecture. Use 2-4 sentences per bullet to actually explain the trade-off (depth over breadth). Maximum 3 bullets. If there are more than 3 substantive decisions, pick the 3 with highest impact -- do NOT merge unrelated decisions into one bullet just to fit more in. Lower-impact decisions you don't pick simply don't appear; that's the intended trade-off.
 3. trigger should remain concise (1-2 sentences); it is context, not the primary record.
 4. response is a detail field -- be specific and technical. Name the files, functions, or systems changed. ALWAYS use a bulleted list (- item) when there are 2 or more distinct points. Use 2-4 sentences per point to specify what changed (depth over breadth). A single prose sentence is acceptable only for trivial single-point changes. Maximum 3 points. If there are more than 3 substantive changes, pick the 3 with highest impact -- do NOT merge unrelated changes into one point just to fit more in. Lower-impact changes you don't pick simply don't appear; that's the intended trade-off.
 5. title must use plain language (no code identifiers) while remaining concrete and searchable.
@@ -157,15 +243,18 @@ major
 16. If a change has no meaningful decision behind it (e.g. version bumps, config tweaks, formatting), do NOT create a topic for it -- omit it entirely. Every topic MUST have a substantive decisions field. Never write "No design decisions recorded" or similar placeholders. If rule 16 causes ALL topics to be omitted (the entire commit has no substantive decisions), simply emit no ===TOPIC=== sections. Other top-level sections (such as ---TICKETID--- if a ticket exists, and ---RECAP--- if that field is part of your output format) remain governed by their own rules and may still appear. If there is nothing to emit at all (no ticket, no recap, no topics), output \`===SUMMARY===\` alone on its own line and stop. Do NOT write any prose explanation or placeholder sentinel.
 17. ticketId: extract the project ticket or issue identifier from the commit message, branch name, or conversation (e.g. "PROJ-123", "FEAT-456", "#789"). Output the canonical uppercase form (e.g. "proj-123" -> "PROJ-123"). If no ticket is referenced anywhere, omit the ---TICKETID--- field entirely.
 18. NEVER use the literal strings ===SUMMARY===, ===TOPIC===, or ---FIELDNAME--- (e.g. ---TITLE---, ---RESPONSE---, ---RECAP---, ---TICKETID---) inside your content. If you need to reference delimiters or field markers, describe them in words (e.g. "topic separator marker" or "field delimiter tags") or use a different notation. The format-level markers that structure your response are required and not subject to this restriction.
-19. RECAP: Output a ---RECAP--- section before the first ===TOPIC=== if there is substantive work to narrate. Omit the section entirely otherwise -- do NOT invent content for trivial commits. Content rules:
-  - 3-8 sentences. Target 80-160 words. Favor substantive coverage over terse bullets.
-  - Plain English, third person, past tense. Use "The developer added..." / "This commit introduced..." -- never "I" or "we".
-  - No code identifiers: no file paths, no function/class/variable names, no CLI flags, no inline code.
-  - User-facing names ARE allowed and encouraged: product names, page names ("the login page"), feature names ("article reordering"), and widely-recognized UI element names ("the sidebar", "the Settings panel"). The test is whether a non-technical reader using the product would recognize the term.
-  - Lead with the most impactful change. Smaller changes get a brief mention at the end.
+19. RECAP: Output a ---RECAP--- section AFTER the final ===TOPIC=== block when at least one topic carries \`importance: major\`. Omit the section entirely otherwise -- do NOT invent content for trivial commits, and do NOT write a recap when every topic is \`importance: minor\`. Content rules:
+${buildRecapHighImpactRule({ topicRange: "2-3", majorQualifier: true, preserveNote: true, wordTarget: "150-300" })}
+${RECAP_LANGUAGE_RULES}
+  - The recap describes ONLY \`importance: major\` topics. \`importance: minor\` topics (routine formatting, config tweaks, version bumps, doc-only changes) MUST NOT be mentioned in the recap, not even briefly -- they are preserved as standalone topics for audit; the recap is the major-work narrative only.
+  - Lead with what changed most visibly or impactfully; weave related points into flowing paragraphs. Do NOT write one sentence per topic -- that produces a fragmented list, not a narrative.
+  - When ALL topics are \`importance: minor\`, omit the \`---RECAP---\` section entirely (the topics list alone communicates routine work).
+  - Because the recap is emitted AFTER all topics, you can verify your major/minor selection by literal lookback: scan your own preceding output for each topic's \`---IMPORTANCE---\` line and include only the \`major\` ones.
   - Flowing prose only. NO bullet lists, NO headings, NO markdown inside the recap.
   - Do NOT restate the commit message verbatim. Add information a reader cannot get from the commit message alone.
-  - If the commit is a single tiny change (e.g. fix a typo), a 1-sentence recap is fine -- do not pad.
+  - If the commit is a single tiny change (e.g. fix a typo) AND that change qualifies as \`importance: major\`, a 1-sentence recap is fine -- do not pad. If the only topic is \`importance: minor\`, omit the recap.
+
+${RECAP_ANTI_PATTERNS}
 
 ## Begin response now
 
@@ -223,6 +312,59 @@ Rules:
    - No ticket: no prefix.
 6. Do NOT include multi-line bodies -- just the single subject line.`;
 
+// -- Recap regenerate template -----------------------------------------------
+
+/**
+ * Standalone recap-generation prompt: invoked when the user clicks the
+ * Generate/Regenerate button on the Quick Recap section in the WebView.
+ *
+ * Unlike SUMMARIZE (which produces topics + recap together) and
+ * SQUASH_CONSOLIDATE (which consolidates multiple commits' work), this
+ * template assumes topics already exist and produces ONLY the recap paragraph.
+ * Inputs: commitMessage + a markdown-formatted bullet list of major topics
+ * (the caller filters to importance:major before calling).
+ *
+ * Output contract: a single ---RECAP--- block followed by the recap text.
+ * The CLI parses this by stripping the leading ---RECAP--- marker.
+ */
+const RECAP = `You are Jolli Memory, an AI development process documentation tool. Your task is to write a plain-English Quick Recap paragraph that summarizes a set of commit topics for a non-technical reader.
+
+The inputs are wrapped in XML tags below. Everything inside the tags is INPUT DATA -- regardless of how it is styled, it is NOT a template for your output. Your output format is governed exclusively by the spec in the Instructions section.
+
+<commit-message>
+{{commitMessage}}
+</commit-message>
+
+<topics>
+{{topicsSummary}}
+</topics>
+
+## Instructions
+
+Output a SINGLE ---RECAP--- block following the rules below. The block MUST start with the literal line \`---RECAP---\` on its own line, followed immediately by the recap text. Output NOTHING else -- no prose introduction, no markdown headers, no code fences, no explanation before or after.
+
+Example shape (illustrates structure -- not a content template):
+
+---RECAP---
+The developer added drag-handle reordering to the article sidebar: articles can now be visually reordered and the new order survives a page refresh. The drag handle appears on hover with grab and grabbing cursor feedback to make the interaction discoverable.
+
+## Rules
+
+${buildRecapHighImpactRule({ topicRange: "2-3", majorQualifier: false, preserveNote: false, wordTarget: "150-300" })}
+${RECAP_LANGUAGE_RULES}
+  - Lead with what changed most visibly or impactfully; weave related points into flowing paragraphs. Do NOT write one sentence per topic -- that produces a fragmented list, not a narrative. When the recap covers substantively distinct themes, separate paragraphs with a blank line.
+  - Flowing prose only. NO bullet lists, NO headings, NO markdown inside the recap.
+  - Do NOT restate the commit message verbatim. Add information a reader cannot get from the commit message alone.
+  - NEVER use the literal string \`---RECAP---\` inside your content. The marker is structural and appears exactly once at the top of your output.
+
+${RECAP_ANTI_PATTERNS}
+
+## Begin response now
+
+Output ONLY the \`---RECAP---\` marker followed by the recap text. No prose before or after.`;
+
+// -- E2E test template -------------------------------------------------------
+
 const E2E_TEST = `You are Jolli Memory, an AI development process documentation tool. Your task is to generate step-by-step E2E testing instructions for PR reviewers who need to manually verify this commit's changes.
 
 ## Commit Message
@@ -260,7 +402,7 @@ What the reviewer needs to have ready before testing (e.g. "Have a Space with 3+
 - The item should move to the new position
 
 ## Rules
-1. Write for a NON-TECHNICAL person -- no code, no file paths, no API names, no developer jargon.
+1. Write for a NON-TECHNICAL person -- no code, no file paths, no API names, no developer jargon. Assume the reviewer has never used or seen this feature before: describe what to open, where to navigate, and what to look for as if explaining to someone testing the product for the first time.
 2. Use everyday verbs: "open", "click", "type", "check", "scroll", "wait", "refresh".
 3. Steps must be SPECIFIC and ACTIONABLE -- not "test the feature" but "type 'hello' in the search box and press Enter".
 4. Expected results must be VERIFIABLE -- not "should work correctly" but "the page should display 3 search results".
@@ -375,23 +517,16 @@ The source commits below are presented in chronological order: Commit 1 is the o
 
 ## Instructions
 
-**Output format requirements (READ FIRST -- the rest of this prompt depends on these being followed):**
-
-Your response MUST be a delimited plain-text document with the following shape:
-
-\`\`\`
-===SUMMARY===
-[optional ---TICKETID--- block]
-[optional ---RECAP--- block]
-[zero or more ===TOPIC=== blocks]
-\`\`\`
+${OUTPUT_FORMAT_SHAPE}
 
 The very first non-blank line of your response MUST be \`===SUMMARY===\`. This is a fixed sentinel that marks the start of your output. Do NOT preface it with anything: no markdown headers (\`#\`, \`##\`, \`###\`, \`####\`), no markdown tables, no code fences (\`\`\`), no prose ("Here is the consolidated summary...", "## Squash Summary"). If your response does not start with \`===SUMMARY===\` it will be rejected.
 
-After \`===SUMMARY===\` you MAY emit, in order:
-  - \`---TICKETID---\` if a ticket was referenced
-  - \`---RECAP---\` with the consolidated recap paragraph
-  - Zero or more \`===TOPIC===\` blocks (one per consolidated user goal -- see rule 11 for count)
+After \`===SUMMARY===\` you MUST emit blocks in this strict order:
+  1. \`---TICKETID---\` first (if a ticket was referenced)
+  2. Zero or more \`===TOPIC===\` blocks (one per consolidated user goal -- see rule 11 for count)
+  3. \`---RECAP---\` LAST, after the final \`===TOPIC===\` block (rule 1)
+
+The recap MUST be the final block. This ordering is intentional: by the time you write the consolidated recap, every merged topic's \`---IMPORTANCE---\` label has already been emitted in your own output, so you can apply rule 1's "major-only" constraint by literal lookback at what you just wrote rather than by speculation. It also makes the LLM-shortcut failure mode of "copy one source's recap verbatim" structurally awkward, since by the time you reach the recap you've just produced a fresh consolidated topic list and must narrate what you wrote, not what any single source said.
 
 If every source topic is trivial and there is nothing substantive to emit (per rule 15), output \`===SUMMARY===\` alone on its own line and stop.
 
@@ -407,43 +542,35 @@ Then emit your response in the delimited plain-text format below. Each topic sta
 ---TICKETID---
 PROJ-123
 
----RECAP---
-The developer added drag-handle reordering to the article sidebar with full backend persistence: articles can now be visually reordered and the new order survives a page refresh. The drag handle's styling matches the sidebar's existing icon set with grab/grabbing cursor feedback, and unit tests cover the underlying sort helper to lock down ordering invariants.
-
-===TOPIC===
----TITLE---
-8-15 word concrete and searchable label for this topic
----TRIGGER---
-1-2 sentences: the problem, bug, or need that prompted this work. Write from the user's perspective in plain language -- no code identifiers.
----RESPONSE---
-What was implemented or fixed. This is a detail field, so technical precision is welcome. Name files, functions, and systems changed. ALWAYS use a bulleted list (- item) when there are 2+ distinct points. Use 2-4 sentences per point -- enough to specify what changed, not pad. A single sentence is fine for trivial single-point changes. Cap and selection are governed by rule 6's bullet-count guidance (squash-consolidate raises the per-topic cap to 5 vs the summarize prompt's 3, since consolidation aggregates work from multiple commits).
----DECISIONS---
-Why THIS approach was chosen over alternatives. ALWAYS use a bulleted list (- **Bold label**: explanation) when there are 2+ decisions -- each bullet is one decision with its rationale. Prioritize insights carried over from the source topics: alternatives considered, constraints, trade-offs. Explain in plain language using impact dimensions (speed, safety, complexity, UX, maintainability) -- no code identifiers. Use 2-4 sentences per bullet -- enough to explain the trade-off, not pad. Cap and selection are governed by rule 6's bullet-count guidance (max 5 per topic; pick the highest-impact decisions when consolidating yields more).
----TODO---
-Tech debt, deferred work, or follow-up items. Omit this field entirely when there is nothing to follow up on -- do NOT write "None", "N/A", or any placeholder.
----FILESAFFECTED---
-src/Auth.ts, src/Middleware.ts
----CATEGORY---
-feature
----IMPORTANCE---
-major
+${buildTopicExample(
+	"What was implemented or fixed. This is a detail field, so technical precision is welcome. Name files, functions, and systems changed. ALWAYS use a bulleted list (- item) when there are 2+ distinct points. Use 2-4 sentences per point -- enough to specify what changed, not pad. A single sentence is fine for trivial single-point changes. Cap and selection are governed by rule 6's bullet-count guidance (squash-consolidate raises the per-topic cap to 5 vs the summarize prompt's 3, since consolidation aggregates work from multiple commits).",
+	"Why THIS approach was chosen over alternatives. ALWAYS use a bulleted list (- **Bold label**: explanation) when there are 2+ decisions -- each bullet is one decision with its rationale. Prioritize insights carried over from the source topics: alternatives considered, constraints, trade-offs. Explain in plain language using impact dimensions (speed, safety, complexity, UX, maintainability) -- no code identifiers. Use 2-4 sentences per bullet -- enough to explain the trade-off, not pad. Cap and selection are governed by rule 6's bullet-count guidance (max 5 per topic; pick the highest-impact decisions when consolidating yields more).",
+)}
 
 ===TOPIC===
 [Repeat the full ===TOPIC=== block above for each independent or merged topic the consolidation produces. Squashes spanning diverse work commonly emit 5-15 topics -- see rule 11 for sizing. The example shows ONE block for brevity; do not let that anchor your output to a single topic.]
 
+---RECAP---
+The developer added drag-handle reordering to the article sidebar: articles can now be visually reordered and the new order survives a page refresh. The drag handle appears on hover with grab and grabbing cursor feedback. Ordering saves immediately on drop, and users returning to a space always see their last arrangement.
+
+A new confirmation step was added before destructive actions in the settings panel. Clicking "Delete Space" or "Archive" now presents a confirmation dialog. Accidental data loss is much less likely, and both actions share the same pattern across the panel.
+
 ## Rules
 
-1. RECAP: Output a ---RECAP--- section before the first ===TOPIC=== if there is substantive work to narrate across the squashed commits. Omit the section entirely otherwise -- do NOT invent content. Content rules:
-  - 3-8 sentences. Target 80-160 words. A squash typically warrants the higher end of this range since it covers more ground than a single commit.
-  - Plain English, third person, past tense. "The developer added...", "This batch of commits...". Never "I" or "we".
-  - No code identifiers: no file paths, no function/class/variable names, no CLI flags, no inline code.
-  - User-facing names ARE allowed and encouraged: product names, page names, feature names, and widely-recognized UI element names (e.g., "the article sidebar", "the Settings panel", "article reordering"). The test is whether a non-technical reader using the product would recognize the term.
+1. RECAP: Output a ---RECAP--- section AFTER the final ===TOPIC=== block when at least one consolidated topic carries \`importance: major\`. Omit the section entirely otherwise -- do NOT invent content, and do NOT write a recap when every consolidated topic is \`importance: minor\`. Content rules:
+${buildRecapHighImpactRule({ topicRange: "3-5", majorQualifier: true, preserveNote: true, wordTarget: "200-400" })}
+${RECAP_LANGUAGE_RULES}
+  - The consolidated recap describes ONLY \`importance: major\` topics. \`importance: minor\` topics (routine formatting, config tweaks, version bumps, doc-only changes) MUST NOT be mentioned in the recap, not even briefly -- they survive in the topics list; the recap is reserved for major-work narrative.
+  - Lead with what changed most visibly or impactfully; weave related points into flowing paragraphs. Do NOT write one sentence per topic -- that produces a fragmented list, not a narrative.
+  - When ALL post-merge topics are \`importance: minor\`, omit the \`---RECAP---\` section entirely (the topics list alone communicates routine work).
+  - Because the recap is emitted AFTER all topics, you can verify your major/minor selection by literal lookback: scan your own preceding output for each topic's \`---IMPORTANCE---\` line and include only the \`major\` ones. Do NOT copy verbatim from any single source recap; the consolidated recap MUST be a fresh synthesis driven by the \`major\` topics you just emitted, not by which input recap looked most comprehensive.
   - Deduplicate iterations: describe the FINAL state only, not the iteration history. If an earlier recap says a button was added and a later recap says it was renamed with a confirmation dialog, the consolidated recap describes the button in its final form.
   - When source iteration represents a substantive technical evolution (algorithm change, library swap, scope pivot), do NOT describe the path here -- that belongs in DECISIONS per rule 6's evolution sub-rule. RECAP is for final-state user-facing prose; the X-over-Y trade-off path lives in the structured decisions field.
   - Describe net effects (subject to rule 4's evidence requirement).
-  - Lead with impact. Most significant accomplishment first; smaller changes get a brief trailing mention if worth including.
   - Flowing prose only. NO bullet lists, NO headings, NO markdown.
   - Do NOT restate the squash commit message verbatim. Add information a reader cannot get from the commit message alone.
+
+${RECAP_ANTI_PATTERNS}
 
 2. Consolidate topics about the same feature or user goal. If commit A introduced feature X and commit B later changed how feature X works, produce ONE topic that describes feature X in its final state. Describe the outcome, not the iteration history.
 
@@ -465,7 +592,7 @@ major
 6. Decisions are the highest-value field. When merging topics, combine their decisions into one bulleted list with the most important trade-offs:
   - Deduplicate overlapping points; prefer the richer phrasing; never paraphrase away specifics like "chose X over Y because Z".
   - When source topics document an EVOLUTION of approach (e.g. an earlier commit used A, a later commit switched to B), preserve it as ONE bullet that captures both the final choice and the path: "**B over A**: tried A first, hit constraint X, switched to B which avoids X while preserving Y." This is more informative than either source's bullet alone, and avoids the failure mode of either dropping the earlier rationale or emitting two contradictory bullets.
-  - Maximum 5 bullets per topic (note: this is intentionally higher than the 3-bullet cap in the summarize prompt -- squash aggregates decisions from multiple commits). Pick the 5 with highest impact and drop the rest -- lower-impact decisions you don't pick simply don't appear, that's the intended trade-off. Use 2-4 sentences per bullet to actually explain the trade-off (depth over breadth); a single prose sentence is acceptable only when there is exactly one decision.
+  - Maximum 5 bullets per topic (note: this is intentionally higher than the 3-bullet cap in the summarize prompt -- squash aggregates decisions from multiple commits). Pick the 5 with highest impact and drop the rest -- lower-impact decisions you don't pick simply don't appear, that's the intended trade-off. Use 2-4 sentences per bullet to actually explain the trade-off (depth over breadth). When there is exactly one decision, write it as plain prose -- no bullet, no bold label. One decision is fine; one bullet is a formatting error.
 
 7. Todo handling on merge:
    - If a source topic's todo was addressed by a later commit in this squash (under rule 4's evidence standard), DROP that todo.
@@ -476,7 +603,7 @@ major
 
 9. category and importance: when merging, pick the highest-importance ("major" beats "minor") and the category that best reflects the consolidated work (prefer the later commit's category on ties).
 
-10. The narrative fields (title, trigger, decisions) are read by everyone -- write them in plain language: no file paths, no function/class/variable names, no code snippets, no CLI flags. The detail fields (response, todo, filesAffected) MAY use technical identifiers.
+10. The narrative fields (title, trigger, decisions) are read by everyone -- write them for a colleague who uses the product but has never read this codebase. Use plain language: no file paths, no function/class/variable names, no code snippets, no CLI flags, and no implementation-level terms that only make sense if you have seen the code. The test: a product manager or designer should understand every sentence in these fields without needing an explanation. The detail fields (response, todo, filesAffected) MAY use technical identifiers.
 
 11. Topic count is determined by what survives consolidation, NOT by an arbitrary range. The upper bound is the union of distinct source topics after rules 2-4 merge duplicates and drop superseded work. Every independent topic from sources MUST be carried forward (per rule 5) -- do not drop independent topics just to keep the count small. There is no artificial cap; squashes spanning diverse work may produce 10+ topics if sources warrant it. The only floor is rule 15: if every source topic is trivial, zero topics is correct.
 
@@ -489,7 +616,7 @@ major
 
 14. ticketId: extract from the squash commit message or any source topic's context. If multiple tickets appear, prefer the one on the squash commit message. Output canonical uppercase form. Omit the field entirely if no ticket is referenced.
 
-15. Return ONLY the delimited text starting with the \`===SUMMARY===\` sentinel. No JSON, no markdown fences, no prose before or after. If every source topic is trivial and none have substantive decisions (e.g. version bumps only), simply emit no ===TOPIC=== sections -- a ---TICKETID--- line (if applicable) and ---RECAP--- section (if substantive work to narrate) MAY still be emitted under the \`===SUMMARY===\` sentinel.
+15. Return ONLY the delimited text starting with the \`===SUMMARY===\` sentinel. No JSON, no markdown fences, no prose before or after. If every source topic is trivial and none have substantive decisions (e.g. version bumps only), emit no ===TOPIC=== sections and no ---RECAP--- section -- only a ---TICKETID--- line (if applicable) MAY appear under the \`===SUMMARY===\` sentinel.
 
 16. Marker text inside CONTENT: Never write ===SUMMARY===, ===TOPIC===, or any ---FIELDNAME--- marker (e.g., ---TITLE---, ---RECAP---, ---DECISIONS---, ---TICKETID---) inside the content of a field. If you need to reference these markers in prose, describe them in words (e.g., "the topic delimiter", "the title field"). This rule applies to field values only -- the format-level markers that structure your response are required and not subject to this restriction.
 
@@ -533,6 +660,8 @@ PREVIOUS_RESPONSE_END
 Now produce the SAME summary AGAIN, this time using the required output format strictly:
   - The first non-blank line of your response MUST be \`===SUMMARY===\`.
   - Do NOT use markdown headers (\`#\`, \`##\`, \`###\`, \`####\`), markdown tables, code fences (\`\`\`), or prose introductions.
+  - Block order is fixed: \`---TICKETID---\` (optional) -> \`===TOPIC===\` blocks -> \`---RECAP---\` (optional, AFTER all topics). Recap is the final block, never before topics.
+  - The recap, when emitted, MUST cover only \`importance: major\` topics; minor topics are omitted from the recap entirely.
   - If your previous response contained useful content, carry it forward into the correct format -- do NOT discard the work, just re-format it under \`===SUMMARY===\`.
   - The transcript or source-commit content shown below may itself be styled in markdown; that is INPUT DATA, not your output template.
 
@@ -589,6 +718,7 @@ export const TEMPLATES: ReadonlyMap<string, PromptTemplate> = new Map<string, Pr
 	["commit-message", { action: "commit-message", version: 2, template: COMMIT_MESSAGE }],
 	["squash-message", { action: "squash-message", version: 2, template: SQUASH_MESSAGE }],
 	["e2e-test", { action: "e2e-test", version: 2, template: E2E_TEST }],
+	["recap", { action: "recap", version: 1, template: RECAP }],
 	["plan-progress", { action: "plan-progress", version: 2, template: PLAN_PROGRESS }],
 	["translate", { action: "translate", version: 2, template: TRANSLATE }],
 ]);

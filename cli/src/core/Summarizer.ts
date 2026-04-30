@@ -910,6 +910,88 @@ export async function generateE2eTest(params: E2eTestParams): Promise<ReadonlyAr
 	return scenarios;
 }
 
+// --- Recap regeneration ------------------------------------------------------
+
+/** Parameters for the standalone recap regeneration call. */
+export interface RecapParams {
+	readonly topics: ReadonlyArray<TopicSummary>;
+	readonly commitMessage: string;
+	/** LLM credentials and model selection loaded by the caller. */
+	readonly config: LlmConfig;
+}
+
+/**
+ * Extracts the recap text from a `RECAP` template response.
+ *
+ * The expected output starts with a `---RECAP---` marker on its own line
+ * followed by the recap paragraph(s). This function:
+ *   1. Finds the marker and returns everything after it (trimmed).
+ *   2. Falls back to the whole response if the marker is missing -- some LLMs
+ *      occasionally drop the leading delimiter when the rest of the prompt
+ *      has been internalised. Treating that as the recap text is safer than
+ *      returning empty (the caller can still display whatever was generated).
+ *   3. Strips a trailing `---RECAP---` if the model echoes it at the bottom
+ *      (defensive against the model wrapping the content in a closing tag).
+ */
+export function parseRecapResponse(text: string): string {
+	const trimmed = text.trim();
+	if (!trimmed) return "";
+
+	const markerRe = /^\s*---RECAP---\s*$/m;
+	const match = markerRe.exec(trimmed);
+	const body = match ? trimmed.slice(match.index + match[0].length) : trimmed;
+
+	// Drop any echoed closing marker so we don't render it as content.
+	return body.replace(/^\s*---RECAP---\s*$/m, "").trim();
+}
+
+/**
+ * Generates a single Quick Recap paragraph for an existing commit summary.
+ *
+ * Topics are filtered to `importance: major` (legacy topics without the field
+ * are included) before being formatted as the prompt's `topicsSummary` input.
+ * Returns an empty string when no major topics exist -- the caller decides
+ * whether to keep or clear an existing recap in that case.
+ *
+ * Unlike `generateE2eTest`, this call does NOT take the diff: the recap is a
+ * narrative over already-extracted topics, not a fresh analysis of code.
+ * Keeping the diff out of the input also keeps token cost low for an action
+ * users may invoke repeatedly until the wording feels right.
+ */
+export async function generateRecap(params: RecapParams): Promise<string> {
+	log.info("Regenerating recap for: %s", params.commitMessage.substring(0, 60));
+
+	const { config } = params;
+	const majorTopics = params.topics.filter((t) => t.importance !== "minor");
+	if (majorTopics.length === 0) {
+		log.info("Recap regenerate: no major topics -- returning empty recap");
+		return "";
+	}
+
+	// The narrative fields (title, trigger, decisions) are what the recap is
+	// built from; response is a detail field and would push the LLM toward
+	// implementation-level prose, which the recap rules explicitly forbid.
+	const topicsSummary = majorTopics
+		.map((t, i) => `### Topic ${i + 1}: ${t.title}\n- **Trigger:** ${t.trigger}\n- **Decisions:** ${t.decisions}`)
+		.join("\n\n");
+
+	const llmResult = await callLlm({
+		action: "recap",
+		params: {
+			commitMessage: params.commitMessage,
+			topicsSummary,
+		},
+		maxTokens: DEFAULT_MAX_TOKENS,
+		apiKey: config.apiKey,
+		model: resolveModelId(config.model),
+		jolliApiKey: config.jolliApiKey,
+	});
+
+	const recap = parseRecapResponse(llmResult.text ?? "");
+	log.info("Recap regenerate: produced %d chars from %d major topic(s)", recap.length, majorTopics.length);
+	return recap;
+}
+
 // --- Translation --------------------------------------------------------------
 
 /** Parameters for the translateToEnglish function. */

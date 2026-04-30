@@ -18,13 +18,17 @@ export function buildScript(): string {
 	return `
   const vscode = acquireVsCodeApi();
 
-  // Toggle expand/collapse for individual memory sections (skip clicks on action buttons)
-  document.querySelectorAll('.toggle-header').forEach(function(header) {
+  // Toggle expand/collapse for individual memory sections (skip clicks on action buttons).
+  // Idempotent so attachE2eHandlers can safely revisit headers after section replacement.
+  function attachToggleHeader(header) {
+    if (header._toggleAttached) { return; }
+    header._toggleAttached = true;
     header.addEventListener('click', function(e) {
       if (e.target.closest('.topic-actions')) { return; }
       header.parentElement.classList.toggle('collapsed');
     });
-  });
+  }
+  document.querySelectorAll('.toggle-header').forEach(attachToggleHeader);
 
   // Hash copy button: copy full commit hash to clipboard inline
   document.querySelectorAll('.hash-copy').forEach(function(btn) {
@@ -156,7 +160,7 @@ ${buildPrMessageScript()}
       }
     }
 
-    // ── Recap edit status ──
+    // ── Recap edit / generate status ──
     if (msg.command === 'recapUpdated' && msg.html) {
       // Server re-renders the whole recap section so we get the canonical HTML
       // (handles the empty-recap → section-removed case automatically too).
@@ -175,16 +179,36 @@ ${buildPrMessageScript()}
           var nodes = Array.prototype.slice.call(recapWrap.childNodes).filter(function(n) { return n.nodeType === 1; });
           if (oldSep && oldSep.tagName === 'HR') oldSep.remove();
           oldRecap.replaceWith.apply(oldRecap, nodes);
+          // Reattach BOTH handlers: edit (state-2 only) and generate/regen
+          // (state-1 has only Generate button, state-2 has only Regenerate).
+          // Both attach functions internally null-check the buttons so calling
+          // them in either state is safe.
           attachEditRecapHandler();
+          attachGenerateRecapHandler();
         }
       }
     } else if (msg.command === 'recapUpdateError') {
+      // Edit-mode failure — restore Save/Cancel button state.
       var editingRecap = document.querySelector('.recap-section.recap-editing');
       if (editingRecap) {
         var rSave = editingRecap.querySelector('.recap-edit-actions .primary');
         var rCancel = editingRecap.querySelector('.recap-edit-actions .action-btn');
         if (rSave) { rSave.textContent = 'Save'; rSave.disabled = false; }
         if (rCancel) { rCancel.disabled = false; }
+      }
+      // Generate-mode failure — restore button labels and clear the
+      // .generating spinning state on the regen icon. The section is
+      // never simultaneously editing and generating, so this is independent.
+      var genBtn2 = document.getElementById('generateRecapBtn');
+      var regenBtn2 = document.getElementById('regenerateRecapBtn');
+      if (genBtn2) {
+        genBtn2.textContent = '\\u2728 Generate';
+        genBtn2.disabled = false;
+      }
+      if (regenBtn2) {
+        regenBtn2.classList.remove('generating');
+        regenBtn2.title = 'Regenerate';
+        regenBtn2.disabled = false;
       }
     }
   });
@@ -399,6 +423,10 @@ ${buildPrMessageScript()}
   function attachE2eHandlers(root) {
     if (!root) return;
 
+    // Re-bind toggle-header click on freshly-rendered scenarios — the page-level
+    // attach pass runs once on script load and misses elements inserted later.
+    root.querySelectorAll('.toggle-header').forEach(attachToggleHeader);
+
     // Generate / Regenerate (placeholder + section header buttons share command).
     var genBtn = root.querySelector('#generateE2eBtn');
     if (genBtn) genBtn.addEventListener('click', function() {
@@ -540,6 +568,48 @@ ${buildPrMessageScript()}
     document.addEventListener('keydown', section._recapEscHandler);
   }
   attachEditRecapHandler();
+
+  // ── Recap generate / regenerate handler ────────────────────────────────
+  // Both buttons post the same 'generateRecap' command; the extension
+  // decides whether this is a first-time generate or a regenerate based on
+  // whether summary.recap is already set. Loading state is reflected on
+  // whichever button is in the DOM.
+  function attachGenerateRecapHandler() {
+    var ids = ['generateRecapBtn', 'regenerateRecapBtn'];
+    ids.forEach(function(id) {
+      var btn = document.getElementById(id);
+      if (!btn) return;
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        vscode.postMessage({ command: 'generateRecap' });
+      });
+    });
+  }
+  attachGenerateRecapHandler();
+
+  // Recap status messages — generation flow only. The 'recapUpdated' /
+  // 'recapUpdateError' messages are handled in the top-level message
+  // listener above and reused here; we only add the generating-loading
+  // state here so the button reflects in-flight work.
+  // Mirrors the E2E regenerate UX: regen icon button gets the .generating
+  // class (spinning animation + opacity dim + wait cursor); the larger
+  // Generate text button just changes its label to "Generating...".
+  window.addEventListener('message', function(event) {
+    var msg = event.data;
+    if (msg.command === 'recapGenerating') {
+      var genBtn = document.getElementById('generateRecapBtn');
+      var regenBtn = document.getElementById('regenerateRecapBtn');
+      if (genBtn) {
+        genBtn.textContent = 'Generating...';
+        genBtn.disabled = true;
+      }
+      if (regenBtn) {
+        regenBtn.classList.add('generating');
+        regenBtn.title = 'Generating...';
+        regenBtn.disabled = true;
+      }
+    }
+  });
 
   function enterE2eEditMode(toggle, scenarioIndex) {
     var data = JSON.parse(toggle.dataset.scenario || '{}');
@@ -735,7 +805,7 @@ ${buildPrMessageScript()}
           btn.classList.remove('generating');
           btn.title = 'Regenerate';
         } else {
-          btn.textContent = 'Generate';
+          btn.textContent = '\\u2728 Generate';
         }
         btn.disabled = false;
       }

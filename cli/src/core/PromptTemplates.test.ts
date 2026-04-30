@@ -33,6 +33,7 @@ describe("PromptTemplates", () => {
 			"commit-message",
 			"squash-message",
 			"e2e-test",
+			"recap",
 			"plan-progress",
 			"translate",
 		]);
@@ -75,6 +76,42 @@ describe("PromptTemplates", () => {
 		expect(summarize).toContain("</diff>");
 	});
 
+	it("SUMMARIZE prompt places RECAP block AFTER topic blocks in the output spec and example", () => {
+		// Phase 3: recap was moved from "before first topic" to "after final topic"
+		// so the LLM can apply the major-only rule by literal lookback at the
+		// IMPORTANCE labels it just emitted, rather than by speculation.
+		const summarize = TEMPLATES.get("summarize")?.template ?? "";
+		expect(summarize).toContain("[optional ---RECAP--- block, AFTER all topics]");
+		expect(summarize).toContain("`---RECAP---` LAST");
+		// In the rendered example, the ---RECAP--- block must appear AFTER the
+		// final ===TOPIC=== example block. Clip to just the example section
+		// (between "### Output Example" and the start of "## Rules") so rule
+		// text doesn't pollute the substring search.
+		const exampleStart = summarize.indexOf("### Output Example");
+		const rulesStart = summarize.indexOf("## Rules", exampleStart);
+		expect(exampleStart).toBeGreaterThan(0);
+		expect(rulesStart).toBeGreaterThan(exampleStart);
+		const exampleSection = summarize.slice(exampleStart, rulesStart);
+		const lastTopicIdx = exampleSection.lastIndexOf("===TOPIC===");
+		const recapIdx = exampleSection.indexOf("---RECAP---");
+		expect(lastTopicIdx).toBeGreaterThan(0);
+		expect(recapIdx).toBeGreaterThan(lastTopicIdx);
+	});
+
+	it("SUMMARIZE rule 19 narrows the recap to importance:major topics only", () => {
+		const summarize = TEMPLATES.get("summarize")?.template ?? "";
+		// New wording — recap is the major-work narrative; minor topics are
+		// excluded entirely (not even a trailing sentence).
+		expect(summarize).toContain("describes ONLY `importance: major` topics");
+		expect(summarize).toContain("MUST NOT be mentioned in the recap");
+		// All-minor commit -> omit recap entirely
+		expect(summarize).toContain("When ALL topics are `importance: minor`, omit");
+		// The old "smaller changes get a brief mention at the end" line MUST be
+		// gone — leaving it in alongside the new rule would send a contradictory
+		// soft signal that LLM might trust over the new hard signal.
+		expect(summarize).not.toContain("Smaller changes get a brief mention at the end");
+	});
+
 	it("SUMMARIZE prompt ends with a Begin-response sentinel", () => {
 		const summarize = TEMPLATES.get("summarize")?.template ?? "";
 		expect(summarize).toContain("## Begin response now");
@@ -92,6 +129,32 @@ describe("PromptTemplates", () => {
 		const identifyIdx = squash.indexOf("First, identify the distinct user goals");
 		expect(preambleIdx).toBeGreaterThan(0);
 		expect(identifyIdx).toBeGreaterThan(preambleIdx);
+	});
+
+	it("SQUASH_CONSOLIDATE prompt places RECAP block AFTER topic blocks", () => {
+		const squash = TEMPLATES.get("squash-consolidate")?.template ?? "";
+		expect(squash).toContain("[optional ---RECAP--- block, AFTER all topics]");
+		expect(squash).toContain("`---RECAP---` LAST");
+		const exampleStart = squash.indexOf("### Output Example");
+		const rulesStart = squash.indexOf("## Rules", exampleStart);
+		expect(exampleStart).toBeGreaterThan(0);
+		expect(rulesStart).toBeGreaterThan(exampleStart);
+		const exampleSection = squash.slice(exampleStart, rulesStart);
+		const lastTopicIdx = exampleSection.lastIndexOf("===TOPIC===");
+		const recapIdx = exampleSection.indexOf("---RECAP---");
+		expect(lastTopicIdx).toBeGreaterThan(0);
+		expect(recapIdx).toBeGreaterThan(lastTopicIdx);
+	});
+
+	it("SQUASH_CONSOLIDATE rule 1 narrows the recap to importance:major topics + forbids verbatim source-recap copy", () => {
+		const squash = TEMPLATES.get("squash-consolidate")?.template ?? "";
+		expect(squash).toContain("describes ONLY `importance: major` topics");
+		expect(squash).toContain("MUST NOT be mentioned in the recap");
+		expect(squash).toContain("When ALL post-merge topics are `importance: minor`");
+		// Defense against the byte-identical-recap-copy failure mode observed
+		// on commit 1bb408e (LLM copied src1's 1544-char recap verbatim).
+		expect(squash).toContain("Do NOT copy verbatim from any single source recap");
+		expect(squash).not.toContain("smaller changes get a brief trailing mention");
 	});
 
 	it("SQUASH_CONSOLIDATE prompt ends with a Begin-response sentinel", () => {
@@ -232,6 +295,56 @@ describe("PromptTemplates", () => {
 		const squash = TEMPLATES.get("squash-consolidate")?.template ?? "";
 		expect(squash).toContain("17. Trigger field on merged topics");
 		expect(squash).toContain("18. Topic ordering");
+	});
+
+	describe("RECAP standalone template", () => {
+		it("is registered at version 1", () => {
+			expect(TEMPLATES.get("recap")?.version).toBe(1);
+			expect(TEMPLATES.get("recap")?.action).toBe("recap");
+		});
+
+		it("declares exactly the expected placeholders", () => {
+			const recap = TEMPLATES.get("recap")?.template ?? "";
+			const placeholders = new Set<string>();
+			for (const match of recap.matchAll(/\{\{\s*(\w+)\s*\}\}/g)) {
+				placeholders.add(match[1]);
+			}
+			expect(placeholders).toEqual(new Set(["commitMessage", "topicsSummary"]));
+		});
+
+		it("wraps inputs in XML tags so transcript content cannot mimic the output spec", () => {
+			const recap = TEMPLATES.get("recap")?.template ?? "";
+			expect(recap).toContain("<commit-message>");
+			expect(recap).toContain("</commit-message>");
+			expect(recap).toContain("<topics>");
+			expect(recap).toContain("</topics>");
+		});
+
+		it("instructs the LLM to emit a leading ---RECAP--- marker and forbids prose preface", () => {
+			const recap = TEMPLATES.get("recap")?.template ?? "";
+			expect(recap).toContain("---RECAP---");
+			expect(recap).toContain("Output ONLY the `---RECAP---` marker");
+		});
+
+		it("carries the major-only / 2-3 topics / 150-300 words rule", () => {
+			const recap = TEMPLATES.get("recap")?.template ?? "";
+			expect(recap).toContain("2-3 highest-impact topics");
+			expect(recap).toContain("150-300 words");
+		});
+
+		it("forbids WHY in recap (decisions field owns rationale)", () => {
+			const recap = TEMPLATES.get("recap")?.template ?? "";
+			expect(recap).toContain("Do NOT explain WHY");
+		});
+
+		it("renders cleanly with the standard input set (no leftover placeholders)", () => {
+			const recap = TEMPLATES.get("recap")?.template ?? "";
+			const filled = fillTemplate(recap, {
+				commitMessage: "Add drag handle",
+				topicsSummary: "### Topic 1: Reorder\n- **Trigger:** ...\n- **Decisions:** ...",
+			});
+			expect(filled).not.toContain("{{");
+		});
 	});
 
 	it("each entry exposes action / version / template fields", () => {

@@ -271,30 +271,54 @@ function buildHeader(
 // ─── Quick recap section ────────────────────────────────────────────────────
 
 /**
- * Builds the Quick recap section. Returns an empty string when no recap is
- * present so the surrounding template doesn't render an empty wrapper.
+ * Builds the Quick recap section.
  *
- * Reuses the same `.section` / `.section-header` shell as the topics block so
- * the visual rhythm of the page is unchanged. The recap body is wrapped in
- * `.recap-body` for callout-style styling defined in SummaryCssBuilder.
+ * Two states:
+ *   1. No recap: render a placeholder + Generate button so the user can
+ *      trigger a one-shot recap LLM call without re-running the full summarize.
+ *   2. With recap: render the recap body (split on blank lines into paragraphs)
+ *      plus Edit and Regenerate buttons.
  *
- * Includes an inline edit button (consistent with E2E section's pencil-icon
- * pattern). Click toggles `.recap-editing` state which the SummaryScriptBuilder
- * handles by replacing the body with a textarea + Save/Cancel buttons. The
- * raw recap text is stashed in `data-raw` so the editor restores the unescaped
- * source rather than the HTML-escaped display version.
+ * The raw recap text is stashed in `data-raw` so the inline editor restores
+ * the unescaped source rather than the HTML-escaped display version.
+ *
+ * Paragraph splitting on `\n\n` is defensive: the LLM may emit one or several
+ * paragraphs depending on how many topics it weaves in, and HTML collapses
+ * whitespace by default so a textual blank line would otherwise disappear.
  */
 export function buildRecapSection(recap: string | undefined): string {
 	const trimmed = recap?.trim();
-	if (!trimmed) return "";
+
+	if (!trimmed) {
+		// State 1: no recap yet. Always show the Generate button. If the commit
+		// has no `importance: major` topics, the handler short-circuits and
+		// surfaces a toast instead of producing an empty recap; storage stays
+		// untouched in that case so existing recaps are never destroyed.
+		return `
+<div class="section recap-section" id="recapSection">
+  <div class="section-header">
+    <div class="section-title">&#x1F4D6; Quick recap</div>
+  </div>
+  <p class="recap-placeholder">Generate a recap that highlights the major work in this commit.</p>
+  <button class="action-btn" id="generateRecapBtn">&#x2728; Generate</button>
+</div>
+<hr class="separator" />`;
+	}
+
+	// State 2: recap exists. Render body + Edit/Regenerate buttons.
+	const bodyHtml = trimmed
+		.split(/\n\n+/)
+		.map((p) => `<p>${escHtml(p.trim())}</p>`)
+		.join("");
 	return `<div class="section recap-section" id="recapSection" data-raw="${escAttr(trimmed)}">
   <div class="section-header">
     <div class="section-title">&#x1F4D6; Quick recap</div>
     <span class="topic-actions">
       <button class="topic-action-btn" id="editRecapBtn" title="Edit recap">✎</button>
+      <button class="topic-action-btn" id="regenerateRecapBtn" title="Regenerate">&#x21BB;</button>
     </span>
   </div>
-  <div class="recap-body">${escHtml(trimmed)}</div>
+  <div class="recap-body">${bodyHtml}</div>
 </div>
 <hr class="separator" />`;
 }
