@@ -1,19 +1,15 @@
-name: Build & Test
+# Required by branch ruleset (context: build-intellij). See
+# build-vscode.yaml for the step-level skip rationale.
+name: CI - IntelliJ
 
 on:
   push:
-    branches: [main]
-    paths:
-      - "intellij/**"
-      - ".github/workflows/build-intellij.yaml"
+    branches: [main, "release/**"]
   pull_request:
-    branches: [main]
-    paths:
-      - "intellij/**"
-      - ".github/workflows/build-intellij.yaml"
+    branches: [main, "release/**"]
 
 jobs:
-  build:
+  build-intellij:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -21,26 +17,41 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up JDK 21
+      - id: changes
+        uses: ./.github/actions/detect-relevant-paths
+        with:
+          globs: |
+            intellij/*
+            .github/workflows/build-intellij.yaml
+
+      - if: steps.changes.outputs.relevant == 'true'
+        name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
 
-      - name: Setup Gradle
+      - if: steps.changes.outputs.relevant == 'true'
+        name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build plugin
+      - if: steps.changes.outputs.relevant == 'true'
+        name: Build plugin
         run: ./gradlew buildPlugin
 
-      - name: Run tests
+      - if: steps.changes.outputs.relevant == 'true'
+        name: Run tests
         run: ./gradlew test
 
-      - name: Run Plugin Verifier
+      - if: steps.changes.outputs.relevant == 'true'
+        name: Run Plugin Verifier
         run: ./gradlew verifyPlugin
 
-      - name: Upload plugin artifact
+      - if: steps.changes.outputs.relevant == 'true'
+        name: Upload plugin artifact
         uses: actions/upload-artifact@v4
         with:
           name: jollimemory-intellij

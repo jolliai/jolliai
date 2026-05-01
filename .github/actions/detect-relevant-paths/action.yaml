@@ -1,0 +1,67 @@
+# Internal composite action used by required-check workflows.
+#
+# Computes whether the current event's diff touches any of the given path
+# globs. Lets a required check always run + report SUCCESS, with real
+# build steps gated on the `relevant` output — required + path-filter
+# would otherwise deadlock PRs that don't touch matching paths.
+
+name: Detect relevant paths
+description: Set relevant=true if any changed file matches any of the given globs.
+
+inputs:
+    globs:
+        description: |
+            Newline-separated list of case-style glob patterns. A changed
+            file matches if any pattern matches.
+        required: true
+
+outputs:
+    relevant:
+        description: '"true" if any changed file matched any glob, otherwise "false".'
+        value: ${{ steps.changes.outputs.relevant }}
+
+runs:
+    using: composite
+    steps:
+        -   id: changes
+            shell: bash
+            env:
+                EVENT: ${{ github.event_name }}
+                PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                PUSH_BEFORE_SHA: ${{ github.event.before }}
+                PUSH_AFTER_SHA: ${{ github.event.after }}
+                GLOBS: ${{ inputs.globs }}
+            run: |
+                set -euo pipefail
+                cd "$GITHUB_WORKSPACE"
+
+                if [ "$EVENT" = "pull_request" ]; then
+                    base="$PR_BASE_SHA"
+                    head="$PR_HEAD_SHA"
+                else
+                    base="$PUSH_BEFORE_SHA"
+                    head="$PUSH_AFTER_SHA"
+                fi
+
+                # First push of a new branch / shallow fetch / unknown base: be conservative
+                if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$base" 2>/dev/null; then
+                    echo "relevant=true" >> "$GITHUB_OUTPUT"
+                    exit 0
+                fi
+
+                mapfile -t globs <<< "$GLOBS"
+
+                relevant=false
+                while IFS= read -r f; do
+                    [ -z "$f" ] && continue
+                    for glob in "${globs[@]}"; do
+                        [ -z "$glob" ] && continue
+                        # $glob unquoted on purpose — case patterns need word splitting
+                        case "$f" in
+                            $glob) relevant=true; break 2 ;;
+                        esac
+                    done
+                done <<< "$(git diff --name-only "$base" "$head")"
+
+                echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
