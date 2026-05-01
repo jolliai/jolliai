@@ -1,0 +1,28 @@
+---
+title: Deployment
+---
+
+# Deployment
+
+## Vercel (recommended)
+
+1. Push your site to a GitHub repository
+2. Import the repo on [vercel.com/new](https://vercel.com/new)
+3. Vercel auto-detects Next.js — no configuration needed
+4. Every push triggers a new deployment
+
+## Netlify
+
+```bash
+jolli build
+```
+
+Deploy the `out/` directory as a static site.
+
+## Any static host
+
+Run `jolli build` and upload the `out/` directory to any hosting provider that serves static files (GitHub Pages, Cloudflare Pages, AWS S3 + CloudFront, etc.).
+
+## Search
+
+Full-text search is powered by [Pagefind](https://pagefind.app/) and is generated automatically during `jolli build`. No external service required.

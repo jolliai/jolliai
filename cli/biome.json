@@ -1,7 +1,7 @@
 {
 	"$schema": "https://biomejs.dev/schemas/2.2.6/schema.json",
 	"files": {
-		"includes": ["src/**"]
+		"includes": ["src/**", "!src/site/_generatedTemplates.ts"]
 	},
 	"assist": {
 		"enabled": true,

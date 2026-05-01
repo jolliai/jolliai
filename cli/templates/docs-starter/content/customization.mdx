@@ -1,0 +1,61 @@
+---
+title: Customization
+---
+
+# Customization
+
+## Navigation
+
+Edit `content/_meta.ts` to control the sidebar and top navbar:
+
+```ts filename="content/_meta.ts"
+export default {
+  // Sidebar items — order matters
+  "getting-started": "Getting Started",
+  customization: "Customization",
+
+  // Separator with label
+  "---": {
+    type: "separator",
+    title: "Advanced",
+  },
+
+  // Top navbar dropdown menu
+  "__api-reference": {
+    title: "API Reference",
+    type: "menu",
+    items: {
+      petstore: { title: "Petstore API", href: "/api-docs/petstore" },
+    },
+  },
+
+  // Top navbar external link
+  "nav-github": {
+    title: "GitHub",
+    type: "page",
+    href: "https://github.com/your-org",
+  },
+}
+```
+
+## Themes
+
+This site uses the **Nextra docs theme**. Key layout options in `app/layout.tsx`:
+
+| Prop | Description |
+|------|-------------|
+| `logo` | Navbar logo (text, image, or component) |
+| `sidebar.defaultMenuCollapseLevel` | How many levels are expanded by default |
+| `toc.title` | Title above the table of contents |
+| `editLink` | Link to edit the page on GitHub |
+| `feedback` | Feedback widget configuration |
+| `darkMode` | Enable dark mode toggle |
+
+## Favicon
+
+Replace `public/favicon.svg` with your own SVG icon. It is referenced in `app/layout.tsx`.
+
+## Learn more
+
+- [Nextra Docs Theme](https://nextra.site/docs/docs-theme/start)
+- [Nextra Built-in Components](https://nextra.site/docs/guide/built-ins)

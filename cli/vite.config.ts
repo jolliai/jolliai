@@ -37,7 +37,7 @@ export default defineConfig({
 		coverage: {
 			provider: "v8",
 			reporter: ["text", "json-summary"],
-			exclude: ["src/Types.ts", "vite.config.ts"],
+			exclude: ["src/Types.ts", "src/site/_generatedTemplates.ts", "vite.config.ts"],
 			thresholds: {
 				statements: 97,
 				branches: 96,

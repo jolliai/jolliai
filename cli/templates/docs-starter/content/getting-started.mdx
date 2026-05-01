@@ -1,0 +1,73 @@
+---
+title: Getting Started
+---
+
+# Getting Started
+
+This guide walks you through setting up **{{PROJECT_NAME}}** and making your first changes.
+
+## Prerequisites
+
+- [Node.js](https://nodejs.org/) 18 or later
+- A package manager (npm, yarn, or pnpm)
+
+## Project structure
+
+After scaffolding, your site looks like this:
+
+```
+my-docs/
+├── app/                  # Next.js App Router
+│   ├── layout.tsx        # Root layout with navbar + footer
+│   └── [...mdxPath]/     # Catch-all route for content pages
+├── content/              # Your documentation (edit these!)
+│   ├── _meta.ts          # Navigation config
+│   ├── index.mdx         # Welcome page
+│   ├── getting-started.mdx
+│   ├── customization.mdx
+│   └── deployment.mdx
+├── public/               # Static assets (favicon, OpenAPI specs)
+└── package.json
+```
+
+## Adding a new page
+
+1. Create a `.mdx` file in `content/`:
+
+```mdx filename="content/my-new-page.mdx"
+---
+title: My New Page
+---
+
+# My New Page
+
+Write your content here using **Markdown** and JSX.
+```
+
+2. Add it to `content/_meta.ts` to control its position in the sidebar:
+
+```ts filename="content/_meta.ts"
+export default {
+  "getting-started": "Getting Started",
+  "my-new-page": "My New Page",   // ← add here
+  customization: "Customization",
+}
+```
+
+3. The page appears automatically at `/my-new-page`.
+
+## Development
+
+```bash
+jolli dev
+```
+
+Opens [http://localhost:3000](http://localhost:3000) with hot reload.
+
+## Build for production
+
+```bash
+jolli build
+```
+
+This produces a static site with full-text search powered by [Pagefind](https://pagefind.app/).

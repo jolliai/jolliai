@@ -83,6 +83,37 @@ Contributions welcome. Please read:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — workflow, code style, PR expectations
 - [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — community guidelines
 
+## Site generation
+
+The CLI includes a built-in site generator powered by [Nextra](https://nextra.site). Create documentation or blog sites from the command line:
+
+```bash
+# Install the CLI
+npm install -g @jolli.ai/cli
+
+# Scaffold a docs site (starter kit is the default)
+jolli new my-docs
+
+# Scaffold a minimal docs site
+jolli new my-docs --template minimal
+
+# Start the dev server
+cd my-docs
+jolli dev
+
+# Build for production
+jolli build
+```
+
+**Templates:**
+
+| Template | Description |
+|----------|-------------|
+| `starter` (default) | Jolli Starter Kit — getting started guide, customization docs, deployment guide, Petstore OpenAPI spec with Scalar API reference, Jolli favicon, best-practice navigation |
+| `minimal` | Bare-bones Nextra docs site |
+
+Template files live in `cli/templates/` as real, editable files. To customize a template, edit the files directly and rebuild the CLI.
+
 ## Support
 
 - **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jolliai/issues)
