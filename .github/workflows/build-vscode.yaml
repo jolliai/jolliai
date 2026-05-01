@@ -3,40 +3,49 @@
 # Covers both `cli/` and `vscode/` because they share a root package.json
 # (npm workspaces) — touching one can break the other's install or build.
 
-name: Build & Test (CLI + VS Code)
+# Required by branch ruleset (contexts: build-vscode). The status check
+# context that ruleset matches is the job id, not the workflow name.
+#
+# The job always runs and reports a status — required + path-filter
+# would deadlock PRs that don't touch matching paths. Step-level `if:`
+# (not job-level) lets us skip real work while keeping the status SUCCESS
+# instead of `skipped`, which ruleset doesn't accept as passing.
+name: CI - CLI + VS Code
 
 on:
     push:
-        branches: [main]
-        paths:
-            - "cli/**"
-            - "vscode/**"
-            - "package.json"
-            - "package-lock.json"
-            - ".nvmrc"
-            - ".github/workflows/build-vscode.yaml"
+        branches: [main, "release/**"]
     pull_request:
-        branches: [main]
-        paths:
-            - "cli/**"
-            - "vscode/**"
-            - "package.json"
-            - "package-lock.json"
-            - ".nvmrc"
-            - ".github/workflows/build-vscode.yaml"
+        branches: [main, "release/**"]
 
 jobs:
-    build:
+    build-vscode:
         runs-on: ubuntu-24.04
         steps:
             -   uses: actions/checkout@v5
+                with:
+                    fetch-depth: 0
 
-            -   uses: actions/setup-node@v5
+            -   id: changes
+                uses: ./.github/actions/detect-relevant-paths
+                with:
+                    globs: |
+                        cli/*
+                        vscode/*
+                        package.json
+                        package-lock.json
+                        .nvmrc
+                        .github/workflows/build-vscode.yaml
+
+            -   if: steps.changes.outputs.relevant == 'true'
+                uses: actions/setup-node@v5
                 with:
                     node-version-file: .nvmrc
 
-            -   name: Install workspace dependencies
+            -   if: steps.changes.outputs.relevant == 'true'
+                name: Install workspace dependencies
                 run: npm ci
 
-            -   name: Build, lint, and test (CLI + VS Code)
+            -   if: steps.changes.outputs.relevant == 'true'
+                name: Build, lint, and test (CLI + VS Code)
                 run: npm run all
