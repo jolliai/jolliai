@@ -273,12 +273,14 @@ export class MigrationEngine {
 
 	/** Resolves branch from a file path containing a commit hash suffix (e.g. plans/name-{hash8}.md) */
 	private resolveBranchFromPath(filePath: string): string | undefined {
+		/* v8 ignore start -- defensive: split() always returns ≥1 element, so the ?? "" fallbacks are unreachable for any string input */
 		const basename =
 			filePath
 				.split("/")
 				.pop()
 				?.replace(/\.\w+$/, "") ?? "";
 		const hash8 = basename.split("-").pop() ?? "";
+		/* v8 ignore stop */
 		if (hash8.length >= 7 && this.index) {
 			const entry = this.index.entries.find((e) => e.commitHash.startsWith(hash8));
 			if (entry?.branch) return entry.branch;

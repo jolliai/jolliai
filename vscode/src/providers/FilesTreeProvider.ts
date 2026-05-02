@@ -5,9 +5,13 @@
  *
  * Provider responsibilities (only):
  *  1. subscribe to `store.onChange` → `setContext("jollimemory.files.empty", ...)`
- *  2. fire `onDidChangeTreeData` EXCEPT when the change reason is `"userCheckbox"`
- *     (VSCode has already painted the checkbox; re-firing would cause a full
- *     tree rebuild, flicker, and focus-border jump).
+ *  2. fire `onDidChangeTreeData` on every reason. The sidebar webview consumes
+ *     this event to push a fresh `branch:changesData` snapshot — including the
+ *     `userCheckbox` reason, because the webview's toolbar disabled-state is
+ *     derived from `branchData.changes[i].isSelected` and only refreshes when
+ *     that snapshot is re-pushed. The legacy "skip on userCheckbox" guard
+ *     existed to avoid native-TreeView flicker, but the native views were
+ *     removed in commit e2aaf561.
  *  3. render a `FileItem` per snapshot entry in `getChildren`.
  *
  * The provider holds NO mutable state; all reads go through `store.getSnapshot()`.
@@ -18,6 +22,8 @@ import { basename } from "node:path";
 import * as vscode from "vscode";
 import type { FilesStore } from "../stores/FilesStore.js";
 import type { FileStatus } from "../Types.js";
+import type { SerializedTreeItem } from "../views/SidebarMessages.js";
+import { treeItemToSerialized } from "../views/SidebarSerialize.js";
 
 // ─── FileItem tree node ───────────────────────────────────────────────────────
 
@@ -67,11 +73,7 @@ export class FilesTreeProvider
 				"jollimemory.files.empty",
 				snap.isEmpty,
 			);
-			// userCheckbox: VSCode has already drawn the checkbox state — skipping
-			// fire avoids a full-tree rebuild flicker and focus-border jump.
-			if (snap.changeReason !== "userCheckbox") {
-				this._onDidChangeTreeData.fire(undefined);
-			}
+			this._onDidChangeTreeData.fire(undefined);
 		});
 	}
 
@@ -85,6 +87,21 @@ export class FilesTreeProvider
 			return [];
 		}
 		return snap.visibleFiles.map((f) => new FileItem(f));
+	}
+
+	serialize(): ReadonlyArray<SerializedTreeItem> {
+		return this.getChildren().map((it) => {
+			const idHint =
+				typeof it.resourceUri?.fsPath === "string"
+					? it.resourceUri.fsPath
+					: undefined;
+			const base = treeItemToSerialized(it, idHint);
+			return {
+				...base,
+				gitStatus: it.fileStatus.statusCode,
+				isSelected: it.fileStatus.isSelected,
+			};
+		});
 	}
 
 	dispose(): void {

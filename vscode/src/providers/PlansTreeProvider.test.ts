@@ -94,9 +94,13 @@ function makePlansProvider(bridge: unknown) {
 	)._onDidChangeTreeData;
 	return {
 		__store: store,
+		__provider: provider,
 		_onDidChangeTreeData: emitter,
 		getTreeItem: provider.getTreeItem.bind(provider),
 		getChildren: provider.getChildren.bind(provider),
+		serialize: (
+			provider as unknown as { serialize: () => unknown }
+		).serialize?.bind(provider),
 		onDidChangeTreeData: provider.onDidChangeTreeData,
 		dispose: () => provider.dispose(),
 		refresh: () => store.refresh(),
@@ -347,5 +351,69 @@ describe("PlansTreeProvider", () => {
 
 		provider.dispose();
 		expect(emitter.dispose).toHaveBeenCalled();
+	});
+
+	it("serialize() returns SerializedTreeItem[] mapped from getChildren", async () => {
+		const plans = [
+			makePlan({ slug: "plan-alpha", title: "Alpha Plan" }),
+			makePlan({
+				slug: "plan-beta",
+				title: "Beta Plan",
+				commitHash: "abcdef1234567890",
+			}),
+		];
+		const notes = [makeNote({ id: "note-alpha", title: "Alpha Note" })];
+		const bridge = {
+			listPlans: vi.fn(async () => plans),
+			listNotes: vi.fn(async () => notes),
+		};
+		const provider = makePlansProvider(bridge as never);
+
+		await provider.refresh();
+
+		const out = provider.serialize?.();
+
+		expect(Array.isArray(out)).toBe(true);
+		expect(out?.length).toBeGreaterThan(0);
+		expect(out?.[0]).toMatchObject({
+			id: expect.any(String),
+			label: expect.any(String),
+		});
+		// Check that icon colors are preserved for committed items
+		const committedItem = out?.find((item) => item.label.includes("abcdef12"));
+		if (committedItem) {
+			expect(committedItem.iconKey).toBe("lock");
+			expect(committedItem.iconColor).toBe("charts.green");
+		}
+	});
+
+	describe("serialize", () => {
+		it("uses plan.slug as id for plan items", async () => {
+			const plans = [makePlan({ slug: "feature-x", title: "Feature X" })];
+			const bridge = {
+				listPlans: vi.fn(async () => plans),
+				listNotes: vi.fn(async () => []),
+			};
+			const provider = makePlansProvider(bridge as never);
+
+			await provider.refresh();
+
+			const items = provider.serialize?.();
+			expect(items?.[0]?.id).toBe("feature-x");
+		});
+
+		it("uses note.id as id for note items", async () => {
+			const notes = [makeNote({ id: "note-abc", title: "Note A" })];
+			const bridge = {
+				listPlans: vi.fn(async () => []),
+				listNotes: vi.fn(async () => notes),
+			};
+			const provider = makePlansProvider(bridge as never);
+
+			await provider.refresh();
+
+			const items = provider.serialize?.();
+			expect(items?.[0]?.id).toBe("note-abc");
+		});
 	});
 });

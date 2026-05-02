@@ -28,7 +28,11 @@ export async function createStorage(projectPath: string, cwd?: string): Promise<
 		config = {};
 	}
 	const mode = (config.storageMode as string | undefined) ?? "dual-write";
-	const customKBPath = config.knowledgeBasePath as string | undefined;
+	// `localFolder` is the user-configured KB parent directory (set via the
+	// VS Code Settings panel's "Local Folder" input). `resolveKBPath` appends
+	// the repo name as a subfolder, so `localFolder=~/MyKB` puts this repo at
+	// `~/MyKB/<repoName>/`.
+	const customKBPath = config.localFolder as string | undefined;
 
 	log.info("StorageFactory.create: storageMode=%s, projectPath=%s", mode, projectPath);
 

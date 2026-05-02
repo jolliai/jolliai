@@ -10,9 +10,13 @@
  * Pure string template — no logic dependencies on other view modules.
  */
 
+import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
+
 /** Returns the JavaScript for the Settings webview interactions. */
 export function buildSettingsScript(): string {
 	return `
+  ${buildContextMenuGuardScript()}
+
   const vscode = acquireVsCodeApi();
 
   // ── DOM references ──
@@ -26,9 +30,8 @@ export function buildSettingsScript(): string {
   const openCodeEnabledInput = document.getElementById('openCodeEnabled');
   const localFolderInput = document.getElementById('localFolder');
   const browseLocalFolderBtn = document.getElementById('browseLocalFolderBtn');
-  const pushActionJolliRadio = document.getElementById('pushActionJolli');
-  const pushActionBothRadio = document.getElementById('pushActionBoth');
-  const pushActionBothHint = document.getElementById('pushActionBothHint');
+  const rebuildKbBtn = document.getElementById('rebuildKbBtn');
+  const rebuildKbStatus = document.getElementById('rebuildKbStatus');
   const excludePatternsInput = document.getElementById('excludePatterns');
   const applyBtn = document.getElementById('applyBtn');
   const saveFeedback = document.getElementById('saveFeedback');
@@ -136,18 +139,16 @@ export function buildSettingsScript(): string {
     updateApplyBtn();
   }
 
-  // ── Local Memories helpers ──
-  function updatePushActionBothState() {
-    var hasFolder = localFolderInput.value.trim().length > 0;
-    pushActionBothRadio.disabled = !hasFolder;
-    pushActionBothHint.textContent = hasFolder ? '' : '— set a local folder first';
-    if (!hasFolder && pushActionBothRadio.checked) {
-      pushActionJolliRadio.checked = true;
-    }
-  }
-
+  // ── Local Memory Bank helpers ──
   browseLocalFolderBtn.addEventListener('click', function() {
     vscode.postMessage({ command: 'browseLocalFolder' });
+  });
+
+  rebuildKbBtn.addEventListener('click', function() {
+    if (rebuildKbBtn.disabled) return;
+    rebuildKbBtn.disabled = true;
+    rebuildKbStatus.textContent = 'Rebuilding…';
+    vscode.postMessage({ command: 'rebuildKnowledgeBase' });
   });
 
   // ── Dirty tracking ──
@@ -162,14 +163,12 @@ export function buildSettingsScript(): string {
       geminiEnabled: geminiEnabledInput.checked,
       openCodeEnabled: openCodeEnabledInput.checked,
       localFolder: localFolderInput.value,
-      pushAction: pushActionBothRadio.checked ? 'both' : 'jolli',
       excludePatterns: excludePatternsInput.value,
     };
     checkDirty();
   }
 
   function checkDirty() {
-    var currentPushAction = pushActionBothRadio.checked ? 'both' : 'jolli';
     isDirty = (
       apiKeyInput.value !== initialState.apiKey ||
       modelSelect.value !== initialState.model ||
@@ -180,7 +179,6 @@ export function buildSettingsScript(): string {
       geminiEnabledInput.checked !== initialState.geminiEnabled ||
       openCodeEnabledInput.checked !== initialState.openCodeEnabled ||
       localFolderInput.value !== initialState.localFolder ||
-      currentPushAction !== initialState.pushAction ||
       excludePatternsInput.value !== initialState.excludePatterns
     );
     updateApplyBtn();
@@ -206,9 +204,6 @@ export function buildSettingsScript(): string {
   modelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
   [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput].forEach(function(input) {
     input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
-  });
-  [pushActionJolliRadio, pushActionBothRadio].forEach(function(input) {
-    input.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
   });
 
   // ── Apply Changes ──
@@ -238,7 +233,6 @@ export function buildSettingsScript(): string {
         geminiEnabled: geminiEnabledInput.checked,
         openCodeEnabled: openCodeEnabledInput.checked,
         localFolder: localFolderInput.value.trim(),
-        pushAction: pushActionBothRadio.checked ? 'both' : 'jolli',
         excludePatterns: excludePatternsInput.value,
       },
       maskedApiKey: maskedApiKey,
@@ -260,12 +254,6 @@ export function buildSettingsScript(): string {
         geminiEnabledInput.checked = msg.settings.geminiEnabled;
         openCodeEnabledInput.checked = msg.settings.openCodeEnabled;
         localFolderInput.value = msg.settings.localFolder || '';
-        if (msg.settings.pushAction === 'both') {
-          pushActionBothRadio.checked = true;
-        } else {
-          pushActionJolliRadio.checked = true;
-        }
-        updatePushActionBothState();
         excludePatternsInput.value = msg.settings.excludePatterns;
         maskedApiKey = msg.maskedApiKey;
         maskedJolliApiKey = msg.maskedJolliApiKey;
@@ -277,8 +265,13 @@ export function buildSettingsScript(): string {
         break;
       case 'setLocalFolder':
         localFolderInput.value = msg.path || '';
-        updatePushActionBothState();
         checkDirty();
+        break;
+      case 'rebuildKnowledgeBaseDone':
+        rebuildKbBtn.disabled = false;
+        rebuildKbStatus.textContent = msg.success
+          ? 'Rebuild complete: ' + (msg.message || '')
+          : 'Rebuild failed: ' + (msg.message || 'unknown error');
         break;
       case 'settingsSaved':
         saveFeedback.textContent = 'Settings saved';

@@ -12,10 +12,13 @@ import {
 	buildPrMessageScript,
 	buildPrSectionScript,
 } from "../services/PrCommentService.js";
+import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
 
 /** Returns the JavaScript for toggle interactions and the Copy Markdown button. */
 export function buildScript(): string {
 	return `
+  ${buildContextMenuGuardScript()}
+
   const vscode = acquireVsCodeApi();
 
   // Toggle expand/collapse for individual memory sections (skip clicks on action buttons).
@@ -1022,7 +1025,7 @@ ${buildPrMessageScript()}
   function showSnippetForm() {
     var form = document.getElementById('snippetForm');
     if (form) {
-      form.removeAttribute('hidden');
+      form.classList.remove('hidden');
       form.classList.add('open');
       var titleInput = document.getElementById('snippetTitle');
       if (titleInput) titleInput.focus();
@@ -1034,7 +1037,7 @@ ${buildPrMessageScript()}
     var form = document.getElementById('snippetForm');
     if (form) {
       form.classList.remove('open');
-      form.setAttribute('hidden', '');
+      form.classList.add('hidden');
     }
     var sTitle = document.getElementById('snippetTitle');
     var sContent = document.getElementById('snippetContent');

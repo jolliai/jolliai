@@ -237,6 +237,10 @@ export class MetadataManager {
 		return result || "default";
 	}
 
+	// Content fingerprint for FolderStorage cache invalidation — never used for
+	// password or credential hashing. CodeQL js/insufficient-password-hash may
+	// flag indirect taint from API tokens via summary URLs; the hashed input is
+	// always user-authored markdown or on-disk file bytes.
 	static sha256(content: string): string {
 		return createHash("sha256").update(content, "utf-8").digest("hex");
 	}

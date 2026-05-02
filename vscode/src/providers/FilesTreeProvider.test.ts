@@ -111,6 +111,15 @@ vi.mock("vscode", () => ({
 	window: {
 		showErrorMessage,
 	},
+	// FilesTreeProvider's snap subscriber calls
+	// `vscode.commands.executeCommand("setContext", ...)` to mirror the empty
+	// state into a context key. Without a stub here the call throws inside
+	// BaseStore.emit and downstream subscribers (including the
+	// _onDidChangeTreeData fire) never run, which would break any assertion
+	// that observes the fire.
+	commands: {
+		executeCommand: vi.fn(),
+	},
 }));
 
 import { FilesStore } from "../stores/FilesStore.js";
@@ -341,6 +350,32 @@ describe("FilesTreeProvider", () => {
 		provider.setMigrating(false);
 
 		expect(emitter.fire).not.toHaveBeenCalled();
+	});
+
+	it("fires onDidChangeTreeData on userCheckbox so the sidebar webview re-pushes changesData", async () => {
+		// Regression: when the legacy native TreeView still existed, the provider
+		// suppressed fire() on userCheckbox to avoid re-render flicker. The native
+		// view is gone (commit e2aaf561) and the sidebar webview now derives its
+		// toolbar disabled-state from the snapshot it last received — so the fire
+		// MUST happen on userCheckbox or the Commit / Discard buttons stay
+		// disabled forever after the user ticks the row.
+		const bridge = makeBridge([makeFile("a.ts", false)]);
+		const provider = createProvider(
+			bridge as never,
+			"/repo",
+			makeExcludeFilter(),
+		);
+		await provider.refresh();
+		const emitter = (
+			provider as unknown as {
+				_onDidChangeTreeData: { fire: ReturnType<typeof vi.fn> };
+			}
+		)._onDidChangeTreeData;
+		emitter.fire.mockClear();
+
+		provider.onCheckboxToggle(provider.getChildren()[0], true);
+
+		expect(emitter.fire).toHaveBeenCalledTimes(1);
 	});
 
 	it("updates selection in memory from checkbox toggles", async () => {
@@ -600,6 +635,73 @@ describe("FilesTreeProvider", () => {
 		const [item] = provider.getChildren();
 
 		expect(provider.getTreeItem(item)).toBe(item);
+	});
+});
+
+describe("FilesTreeProvider.serialize", () => {
+	it("returns SerializedTreeItem[] mapped from getChildren", async () => {
+		const bridge = makeBridge([
+			makeFile("src/App.ts", true),
+			makeFile("src/index.ts", false),
+		]);
+		const store = new FilesStore(bridge as never, "/repo", makeExcludeFilter());
+		const provider = new FilesTreeProvider(store);
+		await store.refresh();
+
+		const serialized = provider.serialize();
+
+		expect(Array.isArray(serialized)).toBe(true);
+		expect(serialized.length).toBeGreaterThan(0);
+		expect(serialized[0]).toMatchObject({
+			id: expect.any(String),
+			label: expect.any(String),
+		});
+
+		provider.dispose();
+		store.dispose();
+	});
+
+	it("uses fsPath as id when resourceUri is present", async () => {
+		const bridge = makeBridge([makeFile("src/App.ts", true)]);
+		const store = new FilesStore(bridge as never, "/repo", makeExcludeFilter());
+		const provider = new FilesTreeProvider(store);
+		await store.refresh();
+
+		const serialized = provider.serialize();
+
+		const item = serialized[0];
+		// id should look path-like (contain repo path)
+		expect(item.id).toBe("/repo/src/App.ts");
+
+		provider.dispose();
+		store.dispose();
+	});
+
+	it("serialize emits gitStatus and isSelected on file rows", async () => {
+		const bridge = makeBridge([
+			{
+				absolutePath: "/repo/src/foo.ts",
+				relativePath: "src/foo.ts",
+				statusCode: "M",
+				indexStatus: "M",
+				worktreeStatus: " ",
+				isSelected: true,
+			},
+		]);
+		const store = new FilesStore(bridge as never, "/repo", makeExcludeFilter());
+		const provider = new FilesTreeProvider(store);
+		await store.refresh();
+
+		const items = provider.serialize();
+
+		expect(items[0]).toMatchObject({
+			label: "foo.ts",
+			gitStatus: "M",
+			isSelected: true,
+		});
+
+		provider.dispose();
+		store.dispose();
 	});
 
 	it("dispose clears the debounce timer", () => {

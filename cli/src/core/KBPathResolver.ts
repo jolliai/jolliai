@@ -12,7 +12,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { KBConfig } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
@@ -22,20 +22,28 @@ const log = createLogger("KBPathResolver");
 const KB_PARENT = join(homedir(), "Documents", "jolli");
 
 /**
+ * Validates a user-configured KB parent path (`localFolder`) and returns the
+ * effective parent dir. Falls back to the default `~/Documents/jolli/` when
+ * the input is missing or unsafe. Centralized so `resolveKBPath` and the
+ * legacy migration helper agree on the parent dir.
+ */
+function resolveParentDir(customPath?: string): string {
+	if (!customPath) return KB_PARENT;
+	if (!isAbsolute(customPath) || customPath.includes("..")) {
+		log.warn(
+			"Invalid customPath '%s': must be absolute and not contain '..'. Falling back to default.",
+			customPath,
+		);
+		return KB_PARENT;
+	}
+	return customPath;
+}
+
+/**
  * Resolves the KB root path for a repository.
  */
 export function resolveKBPath(repoName: string, remoteUrl: string | null, customPath?: string): string {
-	let parent = KB_PARENT;
-	if (customPath) {
-		if (!isAbsolute(customPath) || customPath.includes("..")) {
-			log.warn(
-				"Invalid customPath '%s': must be absolute and not contain '..'. Falling back to default.",
-				customPath,
-			);
-		} else {
-			parent = customPath;
-		}
-	}
+	const parent = resolveParentDir(customPath);
 	const basePath = join(parent, repoName);
 
 	if (!existsSync(basePath)) return basePath;
@@ -46,6 +54,22 @@ export function resolveKBPath(repoName: string, remoteUrl: string | null, custom
 	}
 
 	return findAvailablePath(parent, repoName, remoteUrl);
+}
+
+/**
+ * Returns the next unused `-N`-suffixed KB path, even when the base path
+ * belongs to the same repo. Used by Rebuild Knowledge Base, which deliberately
+ * avoids reusing the current KB folder.
+ */
+export function findFreshKBPath(repoName: string, customPath?: string): string {
+	const parent = resolveParentDir(customPath);
+	const basePath = join(parent, repoName);
+	if (!existsSync(basePath)) return basePath;
+	for (let suffix = 2; suffix <= 99; suffix++) {
+		const candidate = join(parent, `${repoName}-${suffix}`);
+		if (!existsSync(candidate)) return candidate;
+	}
+	return join(parent, `${repoName}-${Date.now()}`);
 }
 
 /**
@@ -60,23 +84,62 @@ export function initializeKBFolder(kbRoot: string, repoName: string, remoteUrl: 
 	log.info("KB folder initialized: %s (remote=%s)", kbRoot, remoteUrl ?? "none");
 }
 
-/** Extracts the repository name from a project path. */
+/**
+ * Extracts the repository name for KB-folder identification.
+ *
+ * Three-layer fallback so a git worktree resolves to its main repo's name
+ * (avoiding the bug where `<localFolder>/<worktree-dirname>/` and
+ * `<localFolder>/<mainrepo-dirname>/` end up holding parallel KBs):
+ *
+ *   1. `git config --get remote.origin.url` basename — the GitHub canonical
+ *      name. Survives renames, applies identically to main repo and any
+ *      worktree of it.
+ *   2. `git rev-parse --git-common-dir` parent basename — when there's no
+ *      remote (local-only repo), follows the worktree pointer back to the
+ *      main repo's `.git` and uses the main repo dir name.
+ *   3. `basename(projectPath)` — last resort for non-git directories.
+ *
+ * Layer 3 is the only path that can produce a worktree dirname, and only
+ * when the directory isn't a git repo at all (in which case there's no
+ * better identity).
+ */
 export function extractRepoName(projectPath: string): string {
+	const url = tryGitCommand(projectPath, ["config", "--get", "remote.origin.url"]);
+	if (url) {
+		const m = url.match(/\/([^/]+?)(?:\.git)?$/);
+		if (m?.[1]) return m[1];
+	}
+
+	const commonDir = tryGitCommand(projectPath, ["rev-parse", "--git-common-dir"]);
+	if (commonDir) {
+		const abs = isAbsolute(commonDir) ? commonDir : join(projectPath, commonDir);
+		const mainRepoDir = dirname(abs);
+		if (mainRepoDir && mainRepoDir !== "/" && mainRepoDir !== ".") {
+			const name = basename(mainRepoDir);
+			if (name) return name;
+		}
+	}
+
 	return basename(projectPath) || "unknown";
+}
+
+function tryGitCommand(cwd: string, args: string[]): string | null {
+	try {
+		const out = execFileSync("git", args, {
+			cwd,
+			encoding: "utf-8",
+			timeout: 5000,
+			windowsHide: true,
+		}).trim();
+		return out || null;
+	} catch {
+		return null;
+	}
 }
 
 /** Gets the remote origin URL for a repository, or null if not configured. */
 export function getRemoteUrl(projectPath: string): string | null {
-	try {
-		const output = execFileSync("git", ["remote", "get-url", "origin"], {
-			cwd: projectPath,
-			encoding: "utf-8",
-			timeout: 5000,
-		}).trim();
-		return output || null;
-	} catch {
-		return null;
-	}
+	return tryGitCommand(projectPath, ["remote", "get-url", "origin"]);
 }
 
 // ── Internal ───────────────────────────────────────────────────────────

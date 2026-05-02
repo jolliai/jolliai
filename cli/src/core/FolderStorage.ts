@@ -150,6 +150,70 @@ export class FolderStorage implements StorageProvider {
 		});
 
 		log.info("Markdown generated: %s", relativePath);
+
+		// After amend/squash, the new root's tree wraps the prior root(s) as
+		// children. Their visible MD copies were written by earlier writeFiles()
+		// calls; only the latest root surfaces in Memories now, so the prior
+		// copies are dead weight that pollute the KB folder and any push to
+		// a remote KB. Delete them — but skip any whose on-disk fingerprint no
+		// longer matches the manifest, since that means a human edited the file.
+		if (summary.children && summary.children.length > 0) {
+			this.cleanupSupersededDescendants(summary.children, relativePath);
+		}
+	}
+
+	private cleanupSupersededDescendants(children: ReadonlyArray<CommitSummary>, newRootRelPath: string): void {
+		const hashes: string[] = [];
+		FolderStorage.collectDescendantHashes(children, hashes);
+
+		for (const hash of hashes) {
+			const entry = this.metadataManager.findById(hash);
+			if (!entry || entry.type !== "commit") continue;
+			// Defensive: never delete what we just wrote (would only happen in
+			// a hash-prefix collision, but the cost of guarding is one compare).
+			if (entry.path === newRootRelPath) continue;
+
+			const absPath = join(this.rootPath, entry.path);
+			if (!existsSync(absPath)) {
+				// Already gone (prior cleanup pass, or user removed manually);
+				// just drop the manifest entry so we stop tracking a ghost.
+				this.metadataManager.removeFromManifest(hash);
+				continue;
+			}
+
+			let onDiskFingerprint: string;
+			try {
+				onDiskFingerprint = MetadataManager.sha256(readFileSync(absPath, "utf-8"));
+			} catch (err) {
+				log.warn("Cannot read %s for fingerprint check: %s — keeping file", entry.path, String(err));
+				continue;
+			}
+
+			if (onDiskFingerprint !== entry.fingerprint) {
+				log.warn(
+					"Skipping cleanup of %s — file modified since manifest record (likely hand-edited)",
+					entry.path,
+				);
+				continue;
+			}
+
+			try {
+				unlinkSync(absPath);
+				this.metadataManager.removeFromManifest(hash);
+				log.info("Cleaned up superseded MD: %s", entry.path);
+			} catch (err) {
+				log.warn("Failed to delete superseded MD %s: %s", entry.path, String(err));
+			}
+		}
+	}
+
+	private static collectDescendantHashes(nodes: ReadonlyArray<CommitSummary>, out: string[]): void {
+		for (const node of nodes) {
+			out.push(node.commitHash);
+			if (node.children && node.children.length > 0) {
+				FolderStorage.collectDescendantHashes(node.children, out);
+			}
+		}
 	}
 
 	private buildYamlFrontmatter(summary: CommitSummary): string {

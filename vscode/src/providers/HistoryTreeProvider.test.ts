@@ -52,6 +52,8 @@ function makeHistoryProvider(bridge: unknown) {
 		onCheckboxToggle: (item: CommitItem, checked: boolean) =>
 			store.onCheckboxToggle(item.commit.hash, checked),
 		toggleSelectAll: () => store.toggleSelectAll(),
+		serialize: () => provider.serialize(),
+		getMode: () => provider.getMode(),
 	};
 }
 
@@ -890,5 +892,194 @@ describe("CommitFileDecorationProvider", () => {
 				makeUri("file", "/src/File.ts", "s=M") as never,
 			),
 		).toBeUndefined();
+	});
+});
+
+// ─── HistoryTreeProvider.serialize ──────────────────────────────────────────
+
+describe("HistoryTreeProvider.serialize", () => {
+	it("returns SerializedTreeItem[] for top-level commits", async () => {
+		const commits = [
+			makeCommit("aaaa1111", "first commit"),
+			makeCommit("bbbb2222", "second commit"),
+		];
+		const bridge = makeBridge(() => makeResult(commits));
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		const out = await provider.serialize();
+
+		expect(Array.isArray(out)).toBe(true);
+		expect(out.length).toBe(2);
+		expect(out[0]).toMatchObject({
+			id: "aaaa1111",
+			label: expect.any(String),
+		});
+		expect(out[1]).toMatchObject({
+			id: "bbbb2222",
+			label: expect.any(String),
+		});
+	});
+
+	it("walks nested children for expandable commit rows", async () => {
+		const commits = [makeCommit("aaaa1111", "commit with files")];
+		const mockFiles: Array<CommitFileInfo> = [
+			{ relativePath: "src/Foo.ts", statusCode: "M" },
+			{ relativePath: "src/Bar.ts", statusCode: "A" },
+		];
+		const bridge = makeBridge(
+			() => makeResult(commits),
+			async () => mockFiles,
+		);
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		const out = await provider.serialize();
+
+		expect(out).toHaveLength(1);
+		const commitWithChildren = out[0];
+		expect(commitWithChildren.id).toBe("aaaa1111");
+		expect(commitWithChildren.collapsibleState).toBe("collapsed");
+		expect(commitWithChildren.children).toBeDefined();
+		expect(commitWithChildren.children).toHaveLength(2);
+		if (commitWithChildren.children) {
+			expect(commitWithChildren.children[0]).toMatchObject({
+				id: "aaaa1111:src/Foo.ts",
+				label: "Foo.ts",
+				collapsibleState: "none",
+			});
+			expect(commitWithChildren.children[1]).toMatchObject({
+				id: "aaaa1111:src/Bar.ts",
+				label: "Bar.ts",
+				collapsibleState: "none",
+			});
+		}
+	});
+
+	it("returns empty array when disabled or migrating", async () => {
+		const commits = [makeCommit("aaaa1111")];
+		const bridge = makeBridge(() => makeResult(commits));
+		const provider = makeHistoryProvider(bridge);
+
+		provider.setEnabled(false);
+		let out = await provider.serialize();
+		expect(out).toEqual([]);
+
+		provider.setEnabled(true);
+		provider.setMigrating(true);
+		out = await provider.serialize();
+		expect(out).toEqual([]);
+	});
+
+	it("serialize emits hasMemory=true for commits with summary", async () => {
+		const commits = [makeCommit("h1", "x")];
+		commits[0].hasSummary = true;
+		const bridge = makeBridge(() => makeResult(commits));
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		expect((items[0] as { hasMemory?: boolean }).hasMemory).toBe(true);
+	});
+
+	it("serialize emits hasMemory=false for commits without summary", async () => {
+		const commits = [makeCommit("h1", "x")];
+		commits[0].hasSummary = false;
+		const bridge = makeBridge(() => makeResult(commits));
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		expect((items[0] as { hasMemory?: boolean }).hasMemory).toBe(false);
+	});
+
+	it("serialize emits structured hover data for commit rows", async () => {
+		// Distinct, non-default values so we can verify all hover fields flow
+		// through buildHover instead of falling back to BranchCommit defaults.
+		const commits: Array<BranchCommit> = [
+			{
+				hash: "abcd1234efgh5678",
+				shortHash: "abcd1234",
+				message: "feat: add hover card",
+				author: "Test",
+				authorEmail: "test@test.com",
+				date: "2026-04-29T00:00:00Z",
+				shortDate: "04-29",
+				topicCount: 0,
+				insertions: 12,
+				deletions: 3,
+				filesChanged: 2,
+				isPushed: false,
+				hasSummary: true,
+				commitType: "amend",
+			},
+		];
+		const bridge = makeBridge(() => makeResult(commits));
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		const items = await provider.serialize();
+
+		expect(items).toHaveLength(1);
+		const hover = (items[0] as { hover?: Record<string, unknown> }).hover;
+		expect(hover).toBeDefined();
+		expect(hover).toMatchObject({
+			message: "feat: add hover card",
+			shortHash: "abcd1234",
+			commitType: "amend",
+			statsLine: "2 files changed, 12 insertions(+), 3 deletions(-)",
+		});
+		expect(typeof hover?.relativeDate).toBe("string");
+		// Branch is intentionally omitted on commit rows — see buildHover docs.
+		expect(hover?.branch).toBeUndefined();
+	});
+});
+
+// ─── HistoryTreeProvider.getMode ────────────────────────────────────────────
+
+describe("getMode", () => {
+	it("returns 'empty' when commits list is empty", async () => {
+		const bridge = makeBridge(() => makeResult([]));
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		expect((provider as unknown as { getMode: () => string }).getMode()).toBe(
+			"empty",
+		);
+	});
+
+	it("returns 'merged' when merged and non-empty", async () => {
+		const bridge = makeBridge(() => makeResult([makeCommit("abc")], true));
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		expect((provider as unknown as { getMode: () => string }).getMode()).toBe(
+			"merged",
+		);
+	});
+
+	it("returns 'single' when singleCommitMode is true and not merged", async () => {
+		const bridge = makeBridge(() => makeResult([makeCommit("abc")]));
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		expect((provider as unknown as { getMode: () => string }).getMode()).toBe(
+			"single",
+		);
+	});
+
+	it("returns 'multi' when multiple commits and not merged", async () => {
+		const commits = [makeCommit("aaaa1111"), makeCommit("bbbb2222")];
+		const bridge = makeBridge(() => makeResult(commits));
+		const provider = makeHistoryProvider(bridge);
+
+		await provider.refresh();
+		expect((provider as unknown as { getMode: () => string }).getMode()).toBe(
+			"multi",
+		);
 	});
 });

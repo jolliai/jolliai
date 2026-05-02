@@ -155,6 +155,61 @@ describe("LlmClient", () => {
 			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: raw string failure");
 		});
 
+		it("flattens a transport-layer error cause chain into the diagnostic log", async () => {
+			// Mimic the undici "fetch failed → cause" wrapping that motivated the helper.
+			const inner = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:443"), {
+				code: "ECONNREFUSED",
+				errno: -61,
+				syscall: "connect",
+				address: "127.0.0.1",
+				port: 443,
+				hostname: "api.anthropic.com",
+			});
+			const middle = Object.assign(new Error(""), { name: "AggregateError", cause: inner });
+			const outer = Object.assign(new TypeError("fetch failed"), { cause: middle });
+			mockCreate.mockRejectedValueOnce(outer);
+
+			await expect(
+				callLlm({
+					action: "translate",
+					params: { content: "test" },
+					apiKey: "sk-ant-test",
+				}),
+			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: fetch failed");
+		});
+
+		it("treats a primitive-cause SDK error as having an empty diagnostic chain", async () => {
+			// Exercises formatCause's "non-Error cause" branch (String(cause) at line 43).
+			const err = Object.assign(new Error("boom"), { cause: "raw string cause" });
+			mockCreate.mockRejectedValueOnce(err);
+
+			await expect(
+				callLlm({
+					action: "translate",
+					params: { content: "test" },
+					apiKey: "sk-ant-test",
+				}),
+			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: boom");
+		});
+
+		it("logs '(empty)' when the cause is an Error with no fields populated", async () => {
+			// Exercises the `fields.join(' ') || '(empty)'` fallback in formatCause.
+			// An Error whose `name` is "Error" (default) and whose message is "" produces
+			// no fields — the helper must still return a non-empty string.
+			const cause = new Error("");
+			cause.name = "Error";
+			const err = Object.assign(new Error("outer"), { cause });
+			mockCreate.mockRejectedValueOnce(err);
+
+			await expect(
+				callLlm({
+					action: "translate",
+					params: { content: "test" },
+					apiKey: "sk-ant-test",
+				}),
+			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: outer");
+		});
+
 		it("throws when API returns no text content", async () => {
 			mockCreate.mockResolvedValueOnce({
 				content: [{ type: "image", source: {} }],
@@ -327,6 +382,36 @@ describe("LlmClient", () => {
 
 			expect(result.inputTokens).toBe(0);
 			expect(result.outputTokens).toBe(0);
+		});
+
+		it("rethrows the original transport error when fetch itself fails", async () => {
+			const inner = Object.assign(new Error("getaddrinfo ENOTFOUND jolli.app"), {
+				code: "ENOTFOUND",
+				syscall: "getaddrinfo",
+				hostname: "jolli.app",
+			});
+			const transport = Object.assign(new TypeError("fetch failed"), { cause: inner });
+			fetchSpy.mockRejectedValueOnce(transport);
+
+			await expect(
+				callLlm({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					jolliApiKey: "sk-jol-test.secret",
+				}),
+			).rejects.toBe(transport);
+		});
+
+		it("rethrows when fetch rejects with a non-Error value", async () => {
+			fetchSpy.mockRejectedValueOnce("kaboom");
+
+			await expect(
+				callLlm({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					jolliApiKey: "sk-jol-test.secret",
+				}),
+			).rejects.toBe("kaboom");
 		});
 
 		it("omits tenant and org headers when metadata is absent", async () => {
