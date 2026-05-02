@@ -2,7 +2,7 @@
 	"name": "jollimemory-vscode",
 	"displayName": "Jolli Memory",
 	"description": "VS Code sidebar for Jolli Memory — AI-powered commit summaries and smart git operations",
-	"version": "0.98.3",
+	"version": "0.98.15",
 	"publisher": "jolli",
 	"license": "Apache-2.0",
 	"icon": "assets/icon.png",
@@ -37,9 +37,7 @@
 	"activationEvents": [
 		"workspaceContains:.git",
 		"onUri",
-		"onView:jollimemory.knowledgeBaseView",
-		"onView:jollimemory.statusView",
-		"onView:jollimemory.memoriesView"
+		"onView:jollimemory.mainView"
 	],
 	"main": "./dist/Extension.js",
 	"contributes": {
@@ -62,108 +60,16 @@
 		"views": {
 			"jollimemory": [
 				{
-					"id": "jollimemory.statusView",
-					"name": "STATUS",
-					"type": "tree",
-					"visibility": "collapsed"
-				},
-				{
-					"id": "jollimemory.knowledgeBaseView",
-					"name": "Knowledge Base",
-					"type": "tree",
-					"visibility": "collapsed"
-				},
-				{
-					"id": "jollimemory.memoriesView",
-					"name": "Memories",
-					"type": "tree",
-					"size": 3
-				},
-				{
-					"id": "jollimemory.plansView",
-					"name": "Plans & Notes",
-					"type": "tree",
-					"size": 5
-				},
-				{
-					"id": "jollimemory.filesView",
-					"name": "Changes",
-					"type": "tree"
-				},
-				{
-					"id": "jollimemory.historyView",
-					"name": "Commits",
-					"type": "tree"
+					"id": "jollimemory.mainView",
+					"name": "Jolli Memory",
+					"type": "webview"
 				}
 			]
 		},
-		"viewsWelcome": [
-			{
-				"view": "jollimemory.knowledgeBaseView",
-				"contents": "Open a project folder to browse your Knowledge Base.",
-				"when": "workspaceFolderCount == 0"
-			},
-			{
-				"view": "jollimemory.knowledgeBaseView",
-				"contents": "Knowledge Base folder not initialized yet.\n\nCommit with an AI coding tool to generate your first memory.",
-				"when": "workspaceFolderCount > 0 && jollimemory.kb.empty"
-			},
-			{
-				"view": "jollimemory.statusView",
-				"contents": "Jolli Memory is disabled.",
-				"when": "jollimemory.enabled == false"
-			},
-			{
-				"view": "jollimemory.memoriesView",
-				"contents": "Every commit deserves a Memory. Every memory deserves a Recall.\n\nJolli Memory automatically captures your AI coding sessions and generates structured summaries for each commit — so the reasoning behind every decision is never lost.\n\nUse /jolli-recall to load full branch context into your AI agent and pick up right where you left off.\n\n[Enable Jolli Memory](command:jollimemory.enableJolliMemory)",
-				"when": "jollimemory.enabled == false"
-			},
-			{
-				"view": "jollimemory.memoriesView",
-				"contents": "No memories yet.\n\nStart coding with Claude Code — memories will appear here after your first commit.",
-				"when": "jollimemory.enabled && jollimemory.memories.empty"
-			},
-			{
-				"view": "jollimemory.plansView",
-				"contents": "Jolli Memory is disabled.",
-				"when": "jollimemory.enabled == false"
-			},
-			{
-				"view": "jollimemory.plansView",
-				"contents": "No plans or notes yet.\n\nClick $(add) to add a plan or note.",
-				"when": "jollimemory.enabled && jollimemory.plans.empty"
-			},
-			{
-				"view": "jollimemory.filesView",
-				"contents": "Jolli Memory is disabled.",
-				"when": "jollimemory.enabled == false"
-			},
-			{
-				"view": "jollimemory.historyView",
-				"contents": "Jolli Memory is disabled.",
-				"when": "jollimemory.enabled == false"
-			},
-			{
-				"view": "jollimemory.historyView",
-				"contents": "Start coding — your commit memories will appear here.\n\nEvery commit on this branch will be automatically summarized.",
-				"when": "jollimemory.enabled && jollimemory.history.empty"
-			}
-		],
 		"commands": [
 			{
-				"command": "jollimemory.refreshKnowledgeBase",
-				"title": "Refresh Knowledge Base",
-				"icon": "$(refresh)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.openKBCommitSummary",
-				"title": "View Commit Memory",
-				"category": "Jolli Memory"
-			},
-			{
 				"command": "jollimemory.migrateToKnowledgeBase",
-				"title": "Migrate to Knowledge Base",
+				"title": "Migrate to Memory Bank",
 				"icon": "$(database)",
 				"category": "Jolli Memory"
 			},
@@ -177,12 +83,6 @@
 				"command": "jollimemory.refreshMemories",
 				"title": "Refresh Memories",
 				"icon": "$(refresh)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.exportMemories",
-				"title": "Export Memories to Markdown",
-				"icon": "$(export)",
 				"category": "Jolli Memory"
 			},
 			{
@@ -370,12 +270,6 @@
 				"category": "Jolli Memory"
 			},
 			{
-				"command": "jollimemory.focusKnowledgeBase",
-				"title": "Focus Knowledge Base",
-				"icon": "$(screen-full)",
-				"category": "Jolli Memory"
-			},
-			{
 				"command": "jollimemory.signIn",
 				"title": "Sign In to Jolli",
 				"icon": "$(sign-in)",
@@ -386,126 +280,15 @@
 				"title": "Sign Out of Jolli",
 				"icon": "$(sign-out)",
 				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openMemoryFile",
+				"title": "Open Memory File",
+				"category": "Jolli Memory"
 			}
 		],
 		"menus": {
-			"view/title": [
-				{
-					"command": "jollimemory.focusKnowledgeBase",
-					"when": "view == jollimemory.knowledgeBaseView && jollimemory.enabled",
-					"group": "navigation@0"
-				},
-				{
-					"command": "jollimemory.migrateToKnowledgeBase",
-					"when": "view == jollimemory.knowledgeBaseView && jollimemory.enabled",
-					"group": "navigation@1"
-				},
-				{
-					"command": "jollimemory.refreshKnowledgeBase",
-					"when": "view == jollimemory.knowledgeBaseView && jollimemory.enabled",
-					"group": "navigation@2"
-				},
-				{
-					"command": "jollimemory.signIn",
-					"when": "view == jollimemory.statusView && jollimemory.enabled && !jollimemory.signedIn",
-					"group": "navigation@1"
-				},
-				{
-					"command": "jollimemory.signOut",
-					"when": "view == jollimemory.statusView && jollimemory.enabled && jollimemory.signedIn",
-					"group": "navigation@1"
-				},
-				{
-					"command": "jollimemory.refreshStatus",
-					"when": "view == jollimemory.statusView",
-					"group": "navigation@2"
-				},
-				{
-					"command": "jollimemory.searchMemories",
-					"when": "view == jollimemory.memoriesView && jollimemory.enabled",
-					"group": "navigation@1"
-				},
-				{
-					"command": "jollimemory.clearMemoryFilter",
-					"when": "view == jollimemory.memoriesView && jollimemory.memories.hasFilter",
-					"group": "navigation@2"
-				},
-				{
-					"command": "jollimemory.refreshMemories",
-					"when": "view == jollimemory.memoriesView",
-					"group": "navigation@3"
-				},
-				{
-					"command": "jollimemory.exportMemories",
-					"when": "view == jollimemory.memoriesView && jollimemory.enabled",
-					"group": "navigation@4"
-				},
-				{
-					"command": "jollimemory.openSettings",
-					"when": "view == jollimemory.memoriesView",
-					"group": "navigation@5"
-				},
-				{
-					"command": "jollimemory.enableJolliMemory",
-					"when": "view == jollimemory.memoriesView && jollimemory.enabled == false",
-					"group": "navigation@6"
-				},
-				{
-					"command": "jollimemory.disableJolliMemory",
-					"when": "view == jollimemory.memoriesView && jollimemory.enabled",
-					"group": "navigation@6"
-				},
-				{
-					"submenu": "jollimemory.addMenu",
-					"when": "view == jollimemory.plansView && jollimemory.enabled",
-					"group": "navigation@0"
-				},
-				{
-					"command": "jollimemory.refreshPlans",
-					"when": "view == jollimemory.plansView",
-					"group": "navigation@2"
-				},
-				{
-					"command": "jollimemory.selectAllFiles",
-					"when": "view == jollimemory.filesView",
-					"group": "navigation@1"
-				},
-				{
-					"command": "jollimemory.commitAI",
-					"when": "view == jollimemory.filesView",
-					"group": "navigation@2"
-				},
-				{
-					"command": "jollimemory.refreshFiles",
-					"when": "view == jollimemory.filesView",
-					"group": "navigation@3"
-				},
-				{
-					"command": "jollimemory.discardSelectedChanges",
-					"when": "view == jollimemory.filesView",
-					"group": "navigation@4"
-				},
-				{
-					"command": "jollimemory.selectAllCommits",
-					"when": "view == jollimemory.historyView && !jollimemory.history.singleCommitMode && !jollimemory.history.mergedMode",
-					"group": "navigation@1"
-				},
-				{
-					"command": "jollimemory.squash",
-					"when": "view == jollimemory.historyView && !jollimemory.history.singleCommitMode && !jollimemory.history.mergedMode",
-					"group": "navigation@2"
-				},
-				{
-					"command": "jollimemory.pushBranch",
-					"when": "view == jollimemory.historyView && jollimemory.history.singleCommitMode && !jollimemory.history.mergedMode",
-					"group": "navigation@2"
-				},
-				{
-					"command": "jollimemory.refreshHistory",
-					"when": "view == jollimemory.historyView",
-					"group": "navigation@3"
-				}
-			],
+			"view/title": [],
 			"jollimemory.addMenu": [
 				{
 					"command": "jollimemory.addPlan",
@@ -596,15 +379,17 @@
 		"lint": "npx biome check --error-on-warnings src/",
 		"lint:fix": "npx biome check --write src/",
 		"test": "node ./scripts/run-vitest.mjs --coverage",
-		"build": "node esbuild.config.mjs",
+		"build": "node ./scripts/copy-codicons.mjs && node esbuild.config.mjs",
 		"build:watch": "node esbuild.config.mjs --watch",
-		"package": "npx @vscode/vsce package --no-dependencies --allow-missing-repository",
+		"package": "npm run build && npx @vscode/vsce package --no-dependencies --allow-missing-repository",
 		"install:vsix": "node -e \"const v=require('./package.json').version;const {execSync}=require('child_process');const fs=require('fs');const path=require('path');const isWin=process.platform==='win32';let code;if(isWin){code=path.join(process.env.LOCALAPPDATA||'','Programs','Microsoft VS Code','bin','code.cmd')}else{const candidates=['/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code','/usr/bin/code','/snap/bin/code'];code=candidates.find(p=>fs.existsSync(p))||'code'}execSync((isWin?'\\\"'+code+'\\\"':'\\\"'+code+'\\\"')+' --install-extension jollimemory-vscode-'+v+'.vsix --force',{stdio:'inherit'});\"",
-		"deploy": "npm version patch --no-git-tag-version && npm run build && npm run package && npm run install:vsix"
+		"deploy": "npm version patch --no-git-tag-version && npm run build && npm run package && npm run install:vsix",
+		"copy:codicons": "node ./scripts/copy-codicons.mjs"
 	},
 	"dependencies": {
 		"minimatch": "^10.2.4",
-		"open": "^11.0.0"
+		"open": "^11.0.0",
+		"@vscode/codicons": "^0.0.45"
 	},
 	"overrides": {
 		"brace-expansion": "^5.0.5"

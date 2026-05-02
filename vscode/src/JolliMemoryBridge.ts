@@ -26,12 +26,12 @@ import {
 	savePluginSource,
 	saveSquashPending,
 } from "../../cli/src/core/SessionTracker.js";
+import { createStorage } from "../../cli/src/core/StorageFactory.js";
+import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
 import {
 	generateCommitMessage,
 	generateSquashMessage,
 } from "../../cli/src/core/Summarizer.js";
-import type { ExportResult } from "../../cli/src/core/SummaryExporter.js";
-import { exportSummaries } from "../../cli/src/core/SummaryExporter.js";
 import { getDisplayDate } from "../../cli/src/core/SummaryFormat.js";
 import { buildMarkdown } from "../../cli/src/core/SummaryMarkdownBuilder.js";
 import {
@@ -170,11 +170,48 @@ export class JolliMemoryBridge {
 	/** Absolute path to the workspace root (git repo) */
 	readonly cwd: string;
 
+	/**
+	 * Storage backend the bridge passes explicitly into every SummaryStore call,
+	 * so reads honour the user's storageMode (orphan / dual-write / folder)
+	 * without relying on the module-level `setActiveStorage` global. The
+	 * QueueWorker still uses that global because it lives in a separate process;
+	 * the extension process owns this instance instead.
+	 *
+	 * Lazy: created on first `getStorage()` call rather than in the constructor,
+	 * so bridge methods that don't touch SummaryStore (git ops, install, etc.)
+	 * don't pay for config reads / FolderStorage init they'll never use.
+	 * `reloadStorage()` clears the cache so the next `getStorage()` rebuilds
+	 * from the latest config (used after a settings-save changes storageMode
+	 * or localFolder).
+	 */
+	private storagePromise: Promise<StorageProvider> | null = null;
+
 	constructor(
 		/** Absolute path to the workspace root (git repo) */
 		cwd: string,
 	) {
 		this.cwd = cwd;
+	}
+
+	/**
+	 * Returns the current StorageProvider, awaiting the initial creation or any
+	 * in-flight reload. Internal helper used by every SummaryStore wrapper below.
+	 */
+	private getStorage(): Promise<StorageProvider> {
+		if (!this.storagePromise) {
+			this.storagePromise = createStorage(this.cwd, this.cwd);
+		}
+		return this.storagePromise;
+	}
+
+	/**
+	 * Drops the cached storage backend so the next `getStorage()` rebuilds
+	 * from the latest config. Called by the settings-save callback after the
+	 * user changes `storageMode` or `localFolder` so subsequent reads hit the
+	 * right backend without requiring a window reload.
+	 */
+	reloadStorage(): void {
+		this.storagePromise = null;
 	}
 
 	// ── Enable / Disable ──────────────────────────────────────────────────
@@ -355,7 +392,16 @@ export class JolliMemoryBridge {
 	 * This matches VS Code's built-in Source Control implementation.
 	 */
 	async listFiles(): Promise<Array<FileStatus>> {
-		const raw = await tryExecGit(["status", "-z", "--porcelain=v1"], this.cwd);
+		// `-uall` forces git to expand untracked directories into individual file
+		// entries instead of collapsing them into a single `?? dir/` row. Without
+		// it, a freshly created folder full of untracked files surfaces as one
+		// directory row in CHANGES — visually misleading and not actionable
+		// (the open / discard handlers expect file paths). Matches VS Code's
+		// built-in Source Control extension which uses the same flag.
+		const raw = await tryExecGit(
+			["status", "-z", "--porcelain=v1", "-uall"],
+			this.cwd,
+		);
 		if (!raw) {
 			return [];
 		}
@@ -388,6 +434,15 @@ export class JolliMemoryBridge {
 
 			const hasIndexEntry = stagedCode !== " " && stagedCode !== "?";
 			const statusCode = hasIndexEntry ? stagedCode : unstagedCode;
+
+			// Belt-and-suspenders: even with -uall, skip any directory-shaped
+			// entry (path ending with "/"). Some git configurations
+			// (`status.showUntrackedFiles=normal` overriding our flag, certain
+			// submodule states) can still emit one. The CHANGES list is files-only.
+			if (resolvedPath.endsWith("/")) {
+				i++;
+				continue;
+			}
 
 			files.push({
 				absolutePath: join(this.cwd, resolvedPath),
@@ -812,7 +867,8 @@ export class JolliMemoryBridge {
 			.filter((parts) => parts.length >= 5);
 
 		const commitHashes = parsedEntries.map((parts) => parts[0]);
-		const indexEntryMap = await getIndexEntryMap(this.cwd);
+		const storage = await this.getStorage();
+		const indexEntryMap = await getIndexEntryMap(this.cwd, storage);
 
 		const commits: Array<BranchCommit> = [];
 
@@ -852,14 +908,16 @@ export class JolliMemoryBridge {
 		// Fire-and-forget — when new aliases are found, callers should refresh the panel.
 		const unmatchedHashes = commitHashes.filter((h) => !indexEntryMap.has(h));
 		if (unmatchedHashes.length > 0) {
-			void scanTreeHashAliases(unmatchedHashes, this.cwd).then((anyFound) => {
-				if (anyFound) {
-					log.info(
-						"commits",
-						"Tree hash aliases found — panel refresh recommended",
-					);
-				}
-			});
+			void scanTreeHashAliases(unmatchedHashes, this.cwd, storage).then(
+				(anyFound) => {
+					if (anyFound) {
+						log.info(
+							"commits",
+							"Tree hash aliases found — panel refresh recommended",
+						);
+					}
+				},
+			);
 		}
 
 		const cachedCount = commits.filter(
@@ -1068,11 +1126,12 @@ export class JolliMemoryBridge {
 		}> = [];
 		let ticketId: string | undefined;
 
+		const storage = await this.getStorage();
 		for (const hash of hashes) {
 			const msg = (
 				await tryExecGit(["log", "-1", "--pretty=format:%s", hash], this.cwd)
 			).trim();
-			const summary = await getSummary(hash, this.cwd);
+			const summary = await getSummary(hash, this.cwd, storage);
 			const topics =
 				summary?.topics?.map((t) => ({ title: t.title, trigger: t.trigger })) ??
 				[];
@@ -1215,24 +1274,16 @@ export class JolliMemoryBridge {
 
 	/** Lists the most recent summaries from the JolliMemory orphan branch. */
 	async listSummaries(count: number): Promise<Array<CommitSummary>> {
-		const entries = await listSummaries(count, this.cwd);
+		const storage = await this.getStorage();
+		const entries = await listSummaries(count, this.cwd, storage);
 		const summaries: Array<CommitSummary> = [];
 		for (const entry of entries) {
-			const summary = await getSummary(entry.commitHash, this.cwd);
+			const summary = await getSummary(entry.commitHash, this.cwd, storage);
 			if (summary) {
 				summaries.push(summary);
 			}
 		}
 		return summaries;
-	}
-
-	/**
-	 * Exports all memories for the current workspace as markdown files under
-	 * ~/Documents/jollimemory/<project>/. Skips any files already on disk.
-	 * Returns counts and the output directory path.
-	 */
-	exportMemories(): Promise<ExportResult> {
-		return exportSummaries({ cwd: this.cwd });
 	}
 
 	/** Cached sorted root entries from the orphan branch index. */
@@ -1259,7 +1310,8 @@ export class JolliMemoryBridge {
 		totalCount: number;
 	}> {
 		if (!this.cachedRootEntries) {
-			const map = await getIndexEntryMap(this.cwd);
+			const storage = await this.getStorage();
+			const map = await getIndexEntryMap(this.cwd, storage);
 			// Deduplicate: aliases map different keys to the same entry object.
 			const seen = new Set<string>();
 			this.cachedRootEntries = [...map.values()]
@@ -1297,8 +1349,9 @@ export class JolliMemoryBridge {
 	}
 
 	/** Returns the full summary for a single commit hash, or null if not found. */
-	getSummary(hash: string): Promise<CommitSummary | null> {
-		return getSummary(hash, this.cwd);
+	async getSummary(hash: string): Promise<CommitSummary | null> {
+		const storage = await this.getStorage();
+		return getSummary(hash, this.cwd, storage);
 	}
 
 	// ── Git utility methods ───────────────────────────────────────────────
@@ -1471,13 +1524,14 @@ export class JolliMemoryBridge {
 		);
 
 		const satellites: Array<SatelliteFile> = [];
+		const storage = await this.getStorage();
 
 		// Plans: read from disk if available, otherwise fall back to orphan branch
 		// (committed/archived plans have filePath="" and only exist on the orphan branch)
 		for (const plan of matchedPlans) {
 			const content = plan.filePath
 				? readFileSync(plan.filePath, "utf-8")
-				: await readPlanFromBranch(plan.slug, this.cwd);
+				: await readPlanFromBranch(plan.slug, this.cwd, storage);
 			/* v8 ignore start -- both readFileSync (on-disk plan) and readPlanFromBranch (orphan-branch plan) return non-empty strings for any plan that was linked to this commit; empty content indicates corruption and is defensively skipped */
 			if (!content) {
 				continue;
@@ -1503,7 +1557,7 @@ export class JolliMemoryBridge {
 				content =
 					noteRef?.format === "snippet" && noteRef.content
 						? noteRef.content
-						: await readNoteFromBranch(note.id, this.cwd);
+						: await readNoteFromBranch(note.id, this.cwd, storage);
 			}
 			if (!content) {
 				continue;

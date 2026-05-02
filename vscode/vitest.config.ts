@@ -18,7 +18,14 @@ export default {
 			provider: "custom",
 			customProviderModule: resolvePackageModule("@vitest/coverage-v8/dist/index.js"),
 			reporter: ["text", "json-summary", "html"],
-			exclude: ["vite.config.ts", "vitest.config.ts", "esbuild.config.mjs", "scripts/**", "dist/**", "assets/**", "src/Types.ts"],
+			exclude: [
+				"vite.config.ts",
+				"vitest.config.ts",
+				"esbuild.config.mjs",
+				"scripts/**",
+				"dist/**",
+				"assets/**",
+			],
 			thresholds: {
 				statements: 97,
 				branches: 97,

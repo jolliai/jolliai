@@ -20,6 +20,11 @@ import * as vscode from "vscode";
 import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { BranchCommit, CommitFileInfo } from "../Types.js";
 import { escMd, formatRelativeDate } from "../util/FormatUtils.js";
+import type {
+	MemoryHover,
+	SerializedTreeItem,
+} from "../views/SidebarMessages.js";
+import { treeItemToSerialized } from "../views/SidebarSerialize.js";
 
 // ─── Commit-file decoration ─────────────────────────────────────────────────
 
@@ -190,6 +195,79 @@ export class HistoryTreeProvider
 		);
 	}
 
+	getMode(): "multi" | "single" | "merged" | "empty" {
+		const snap = this.store.getSnapshot();
+		if (snap.isEmpty) return "empty";
+		if (snap.isMerged) return "merged";
+		if (snap.singleCommitMode) return "single";
+		return "multi";
+	}
+
+	private async serializeNode(
+		item: CommitItem | CommitFileItem,
+	): Promise<SerializedTreeItem> {
+		// CommitItem has a stable id (commit hash) set directly; use it as idHint.
+		// CommitFileItem already has id set to "commitHash:relativePath", so use that directly.
+		const idHint = item instanceof CommitItem ? item.commit.hash : item.id;
+		const base = treeItemToSerialized(item, idHint);
+		let enriched: SerializedTreeItem;
+		if (item instanceof CommitItem) {
+			// isSelected mirrors the native TreeItem.checkboxState that VSCode
+			// would render automatically in a TreeView. After the migration to
+			// a webview, the JS render code reads this flat boolean instead —
+			// FilesTreeProvider already does the same for its file rows.
+			// In single-commit / merged modes checkboxState is left undefined
+			// (see getChildren above), so isSelected falls to false and the
+			// webview gates checkbox rendering on commitsMode === 'multi'.
+			enriched = {
+				...base,
+				hasMemory: !!item.commit.hasSummary,
+				hover: buildHover(item.commit),
+				isSelected: item.checkboxState === vscode.TreeItemCheckboxState.Checked,
+			};
+		} else {
+			// CommitFileItem: surface the four fields needed to dispatch
+			// jollimemory.openCommitFileChange from the webview. command.arguments
+			// gets dropped during serialization (circular reference), so the
+			// webview reconstructs the payload from this side-channel.
+			enriched = {
+				...base,
+				commitFile: {
+					commitHash: item.commitHash,
+					relativePath: item.relativePath,
+					statusCode: item.statusCode,
+					oldPath: item.oldPath,
+				},
+				gitStatus: item.statusCode,
+			};
+		}
+		// `collapsibleState` truthy already excludes `None` (= 0) and
+		// `undefined`, so an explicit `!== None` check would be redundant
+		// and trips TS2367 once enriched gains a precise SerializedTreeItem
+		// annotation.
+		if (item.collapsibleState) {
+			// Local try/catch: each commit's file fetch fans out to a separate
+			// `git diff-tree` shell call. A single failure (e.g. orphan ref,
+			// transient git lock) should not nuke the whole top-level list, so
+			// we degrade to a base node without children rather than rejecting.
+			try {
+				const kidsRaw = await this.getChildren(item);
+				const kids = await Promise.all(
+					kidsRaw.map((k) => this.serializeNode(k)),
+				);
+				return Object.assign({}, enriched, { children: kids });
+			} catch {
+				return enriched;
+			}
+		}
+		return enriched;
+	}
+
+	async serialize(): Promise<ReadonlyArray<SerializedTreeItem>> {
+		const tops = await this.getChildren();
+		return Promise.all(tops.map((it) => this.serializeNode(it)));
+	}
+
 	private async syncContextKeys(
 		singleCommitMode: boolean,
 		mergedMode: boolean,
@@ -231,6 +309,40 @@ function buildDescription(c: BranchCommit): string {
 	return c.shortDate;
 }
 
+function buildStatsLine(c: BranchCommit): string {
+	const stats: Array<string> = [
+		`${c.filesChanged} file${c.filesChanged !== 1 ? "s" : ""} changed`,
+	];
+	if (c.insertions > 0) {
+		stats.push(`${c.insertions} insertion${c.insertions !== 1 ? "s" : ""}(+)`);
+	}
+	if (c.deletions > 0) {
+		stats.push(`${c.deletions} deletion${c.deletions !== 1 ? "s" : ""}(-)`);
+	}
+	return stats.join(", ");
+}
+
+/**
+ * Structured hover-card payload for a single commit row. The webview renders
+ * this through the same `.hover-card` popover that drives Memories rows
+ * (see SidebarScriptBuilder.renderHoverCard) — keeping both surfaces visually
+ * 1:1 with the legacy MarkdownString tooltip.
+ *
+ * `branch` is intentionally omitted: the entire Commits panel is one branch's
+ * history, so repeating the branch name on every row's hover is noise. The
+ * Memories view is the only consumer that fills it (rows can come from any
+ * branch), and the renderer skips the branch line when absent.
+ */
+function buildHover(c: BranchCommit): MemoryHover {
+	return {
+		message: c.message,
+		relativeDate: formatRelativeDate(c.date),
+		commitType: c.commitType,
+		shortHash: c.shortHash,
+		statsLine: buildStatsLine(c),
+	};
+}
+
 function buildTooltip(c: BranchCommit): vscode.MarkdownString {
 	const md = new vscode.MarkdownString("", true);
 	md.isTrusted = true;
@@ -247,16 +359,7 @@ function buildTooltip(c: BranchCommit): vscode.MarkdownString {
 	md.appendMarkdown(`${escMd(c.message)}\n\n`);
 	md.appendMarkdown("---\n\n");
 
-	const stats: Array<string> = [
-		`${c.filesChanged} file${c.filesChanged !== 1 ? "s" : ""} changed`,
-	];
-	if (c.insertions > 0) {
-		stats.push(`${c.insertions} insertion${c.insertions !== 1 ? "s" : ""}(+)`);
-	}
-	if (c.deletions > 0) {
-		stats.push(`${c.deletions} deletion${c.deletions !== 1 ? "s" : ""}(-)`);
-	}
-	md.appendMarkdown(`${stats.join(", ")}\n\n`);
+	md.appendMarkdown(`${buildStatsLine(c)}\n\n`);
 
 	md.appendMarkdown("---\n\n");
 

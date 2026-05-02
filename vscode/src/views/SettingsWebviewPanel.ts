@@ -43,7 +43,6 @@ interface SettingsPayload {
 	readonly geminiEnabled: boolean;
 	readonly openCodeEnabled: boolean;
 	readonly localFolder: string;
-	readonly pushAction: "jolli" | "both";
 	readonly excludePatterns: string;
 }
 
@@ -57,6 +56,7 @@ interface HookSyncFailure {
 type SettingsMessage =
 	| { command: "loadSettings" }
 	| { command: "browseLocalFolder" }
+	| { command: "rebuildKnowledgeBase" }
 	| {
 			command: "applySettings";
 			settings: SettingsPayload;
@@ -179,7 +179,34 @@ export class SettingsWebviewPanel {
 					this.postError("Failed to save settings");
 				});
 				break;
+			case "rebuildKnowledgeBase":
+				this.handleRebuildKnowledgeBase().catch((err: unknown) => {
+					log.error("SettingsPanel", `Rebuild failed: ${err}`);
+					this.panel.webview.postMessage({
+						command: "rebuildKnowledgeBaseDone",
+						success: false,
+						message: err instanceof Error ? err.message : String(err),
+					});
+				});
+				break;
 		}
+	}
+
+	/**
+	 * Forwards the Settings → Migrate to Memory Bank button click to the
+	 * `jollimemory.rebuildKnowledgeBase` command. The command returns a result
+	 * object (or throws) which we relay back to the webview so the button can
+	 * reset its loading state.
+	 */
+	private async handleRebuildKnowledgeBase(): Promise<void> {
+		const result = (await vscode.commands.executeCommand(
+			"jollimemory.rebuildKnowledgeBase",
+		)) as { ok: boolean; message: string } | undefined;
+		this.panel.webview.postMessage({
+			command: "rebuildKnowledgeBaseDone",
+			success: result?.ok ?? false,
+			message: result?.message ?? "",
+		});
 	}
 
 	/** Opens a folder picker and posts the selected path back to the webview. */
@@ -224,7 +251,6 @@ export class SettingsWebviewPanel {
 			geminiEnabled: config.geminiEnabled !== false,
 			openCodeEnabled: config.openCodeEnabled !== false,
 			localFolder: config.localFolder ?? "",
-			pushAction: config.pushAction === "both" ? "both" : "jolli",
 			excludePatterns: config.excludePatterns
 				? config.excludePatterns.join(", ")
 				: "",
@@ -303,7 +329,6 @@ export class SettingsWebviewPanel {
 				settings.localFolder && settings.localFolder.length > 0
 					? settings.localFolder
 					: undefined,
-			pushAction: settings.pushAction === "both" ? "both" : undefined,
 			excludePatterns: excludePatterns.length > 0 ? excludePatterns : undefined,
 		};
 

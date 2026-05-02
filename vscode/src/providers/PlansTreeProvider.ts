@@ -14,6 +14,8 @@ import {
 	formatRelativeDate,
 	formatShortRelativeDate,
 } from "../util/FormatUtils.js";
+import type { SerializedTreeItem } from "../views/SidebarMessages.js";
+import { treeItemToSerialized } from "../views/SidebarSerialize.js";
 
 // ─── Tree item types ────────────────────────────────────────────────────────
 
@@ -94,6 +96,13 @@ export class PlansTreeProvider
 				? (new PlanItem(entry.plan) as TreeItem)
 				: (new NoteItem(entry.note) as TreeItem),
 		);
+	}
+
+	serialize(): ReadonlyArray<SerializedTreeItem> {
+		return this.getChildren().map((it) => {
+			const idHint = it instanceof PlanItem ? it.plan.slug : it.note.id;
+			return treeItemToSerialized(it, idHint);
+		});
 	}
 
 	dispose(): void {

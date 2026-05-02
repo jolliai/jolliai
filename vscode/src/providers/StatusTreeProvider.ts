@@ -12,6 +12,8 @@ import * as vscode from "vscode";
 import type { JolliMemoryConfig, StatusInfo } from "../../../cli/src/Types.js";
 import { parseJolliApiKey } from "../services/JolliPushService.js";
 import type { StatusStore } from "../stores/StatusStore.js";
+import type { SerializedTreeItem } from "../views/SidebarMessages.js";
+import { treeItemToSerialized } from "../views/SidebarSerialize.js";
 
 // ─── StatusItem tree node ─────────────────────────────────────────────────────
 
@@ -87,6 +89,11 @@ export class StatusTreeProvider
 			items.push(new StatusItem("AI summary in progress…", "", ICON_LOADING));
 		}
 		return items;
+	}
+
+	serialize(): ReadonlyArray<SerializedTreeItem> {
+		const items = this.getChildren();
+		return items.map((it) => treeItemToSerialized(it));
 	}
 
 	dispose(): void {

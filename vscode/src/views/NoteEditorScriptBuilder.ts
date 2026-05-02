@@ -5,9 +5,13 @@
  * Handles form interaction, validation, and message passing to the extension host.
  */
 
+import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
+
 /** Returns the client-side JS for the Note Editor webview. */
 export function buildNoteEditorScript(): string {
 	return `
+  ${buildContextMenuGuardScript()}
+
   (function () {
     const vscode = acquireVsCodeApi();
 

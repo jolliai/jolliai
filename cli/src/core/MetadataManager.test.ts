@@ -122,6 +122,18 @@ describe("MetadataManager", () => {
 			expect(manager.updatePath("abc", "new/path.md")).toBe(true);
 			expect(manager.findById("abc")?.path).toBe("new/path.md");
 		});
+
+		it("updatePath returns false for unknown fileId", () => {
+			expect(manager.updatePath("does-not-exist", "irrelevant.md")).toBe(false);
+		});
+
+		it("updatePath only mutates the entry whose fileId matches", () => {
+			manager.updateManifest(makeEntry({ path: "main/a.md", fileId: "a" }));
+			manager.updateManifest(makeEntry({ path: "main/b.md", fileId: "b" }));
+			expect(manager.updatePath("a", "main/a-renamed.md")).toBe(true);
+			expect(manager.findById("a")?.path).toBe("main/a-renamed.md");
+			expect(manager.findById("b")?.path).toBe("main/b.md");
+		});
 	});
 
 	describe("branch mapping", () => {
@@ -159,6 +171,36 @@ describe("MetadataManager", () => {
 			expect(removed).toBe(1);
 			expect(manager.readManifest().files).toHaveLength(1);
 			expect(manager.findById("b")).toBeDefined();
+		});
+
+		it("renameBranchFolder leaves unrelated manifest entries untouched and returns 0 when nothing matches", () => {
+			manager.resolveFolderForBranch("feature/old");
+			manager.updateManifest(makeEntry({ path: "main/a.md", fileId: "a" }));
+
+			const count = manager.renameBranchFolder("feature-old", "feature-new");
+			expect(count).toBe(0);
+			expect(manager.findById("a")?.path).toBe("main/a.md");
+			expect(manager.listBranchMappings().find((m) => m.branch === "feature/old")?.folder).toBe("feature-new");
+		});
+
+		it("renameBranchFolder leaves other branch mappings untouched", () => {
+			manager.resolveFolderForBranch("feature/old");
+			manager.resolveFolderForBranch("feature/keep");
+
+			manager.renameBranchFolder("feature-old", "feature-new");
+			const mappings = manager.listBranchMappings();
+			expect(mappings.find((m) => m.branch === "feature/keep")?.folder).toBe("feature-keep");
+			expect(mappings.find((m) => m.branch === "feature/old")?.folder).toBe("feature-new");
+		});
+
+		it("removeBranchFolder returns 0 when no manifest files match", () => {
+			manager.resolveFolderForBranch("feature/empty");
+			manager.updateManifest(makeEntry({ path: "main/a.md", fileId: "a" }));
+
+			const removed = manager.removeBranchFolder("feature-empty");
+			expect(removed).toBe(0);
+			expect(manager.readManifest().files).toHaveLength(1);
+			expect(manager.listBranchMappings().some((m) => m.folder === "feature-empty")).toBe(false);
 		});
 	});
 
@@ -263,6 +305,29 @@ describe("MetadataManager", () => {
 
 			expect(manager.reconcile(kbRoot)).toBe(0);
 		});
+
+		it("returns 0 immediately for empty manifest", () => {
+			const kbRoot = join(jolliDir, "..");
+			expect(manager.reconcile(kbRoot)).toBe(0);
+		});
+
+		it("walkDir skips dot-prefixed dirs and non-md files while scanning fingerprints", () => {
+			const kbRoot = join(jolliDir, "..");
+			mkdirSync(join(kbRoot, "main"), { recursive: true });
+			mkdirSync(join(kbRoot, ".hidden"), { recursive: true });
+
+			writeFileSync(join(kbRoot, "main/notes.txt"), "ignored non-md");
+			writeFileSync(join(kbRoot, ".hidden/secret.md"), "should not be indexed");
+
+			const movedContent = "# Moved";
+			const fp = MetadataManager.sha256(movedContent);
+			writeFileSync(join(kbRoot, "main/moved.md"), movedContent);
+			manager.updateManifest(makeEntry({ path: "main/old.md", fileId: "abc", fingerprint: fp }));
+
+			const fixed = manager.reconcile(kbRoot);
+			expect(fixed).toBe(1);
+			expect(manager.findById("abc")?.path).toBe("main/moved.md");
+		});
 	});
 
 	describe("resilience", () => {
@@ -276,6 +341,10 @@ describe("MetadataManager", () => {
 			mkdirSync(jolliDir, { recursive: true });
 			writeFileSync(join(jolliDir, "config.json"), "{bad json");
 			expect(manager.readConfig().sortOrder).toBe("date");
+		});
+
+		it("readBranches falls back to empty mappings when branches.json is missing", () => {
+			expect(manager.readBranches()).toEqual({ version: 1, mappings: [] });
 		});
 	});
 });

@@ -1400,11 +1400,13 @@ describe("SettingsWebviewPanel", () => {
 		});
 	});
 
-	// ── applySettings with localFolder + pushAction ─────────────────────────
+	// ── applySettings with localFolder ──────────────────────────────────────
+	// pushAction was removed in 2026-04 along with the "Default Push Action"
+	// fieldset; these tests track the surviving localFolder behavior.
 
-	describe("applySettings with localFolder and pushAction", () => {
+	describe("applySettings with localFolder", () => {
 		/** Loads settings to populate cached keys, then returns dispatch fn. */
-		async function setupForLocalMemories(
+		async function setupForLocalKnowledgeBase(
 			configOverrides?: Record<string, unknown>,
 		) {
 			const config = {
@@ -1417,7 +1419,6 @@ describe("SettingsWebviewPanel", () => {
 				codexEnabled: true,
 				geminiEnabled: true,
 				localFolder: undefined,
-				pushAction: undefined,
 				excludePatterns: [],
 				...configOverrides,
 			};
@@ -1439,8 +1440,8 @@ describe("SettingsWebviewPanel", () => {
 			return dispatch;
 		}
 
-		it("persists localFolder and pushAction when both are provided", async () => {
-			const dispatch = await setupForLocalMemories();
+		it("persists localFolder when provided", async () => {
+			const dispatch = await setupForLocalKnowledgeBase();
 
 			dispatch({
 				command: "applySettings",
@@ -1454,8 +1455,7 @@ describe("SettingsWebviewPanel", () => {
 					claudeEnabled: true,
 					codexEnabled: true,
 					geminiEnabled: true,
-					localFolder: "/home/user/memories",
-					pushAction: "both",
+					localFolder: "/home/user/kb",
 					excludePatterns: "",
 				},
 			});
@@ -1463,15 +1463,14 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
 				expect.objectContaining({
-					localFolder: "/home/user/memories",
-					pushAction: "both",
+					localFolder: "/home/user/kb",
 				}),
 				expect.any(String),
 			);
 		});
 
 		it("persists undefined localFolder when field is empty", async () => {
-			const dispatch = await setupForLocalMemories();
+			const dispatch = await setupForLocalKnowledgeBase();
 
 			dispatch({
 				command: "applySettings",
@@ -1486,7 +1485,6 @@ describe("SettingsWebviewPanel", () => {
 					codexEnabled: true,
 					geminiEnabled: true,
 					localFolder: "",
-					pushAction: "jolli",
 					excludePatterns: "",
 				},
 			});
@@ -1495,14 +1493,13 @@ describe("SettingsWebviewPanel", () => {
 			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
 				expect.objectContaining({
 					localFolder: undefined,
-					pushAction: undefined,
 				}),
 				expect.any(String),
 			);
 		});
 
-		it("persists undefined pushAction when pushAction is 'jolli' (default)", async () => {
-			const dispatch = await setupForLocalMemories();
+		it("does not include pushAction in the saved config (field removed)", async () => {
+			const dispatch = await setupForLocalKnowledgeBase();
 
 			dispatch({
 				command: "applySettings",
@@ -1517,26 +1514,23 @@ describe("SettingsWebviewPanel", () => {
 					codexEnabled: true,
 					geminiEnabled: true,
 					localFolder: "/some/path",
-					pushAction: "jolli",
 					excludePatterns: "",
 				},
 			});
 			await flushPromises();
 
-			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
-				expect.objectContaining({
-					localFolder: "/some/path",
-					pushAction: undefined,
-				}),
-				expect.any(String),
-			);
+			const savedArg = mockSaveConfigScoped.mock.calls.at(-1)?.[0] as
+				| Record<string, unknown>
+				| undefined;
+			expect(savedArg).toBeDefined();
+			expect(savedArg).not.toHaveProperty("pushAction");
 		});
 	});
 
-	// ── handleLoadSettings with localFolder + pushAction ────────────────────
+	// ── handleLoadSettings with localFolder ─────────────────────────────────
 
-	describe("handleLoadSettings with localFolder and pushAction", () => {
-		it("sends localFolder and pushAction in settingsLoaded payload", async () => {
+	describe("handleLoadSettings with localFolder", () => {
+		it("sends localFolder in settingsLoaded payload", async () => {
 			mockLoadConfigFromDir.mockResolvedValue({
 				apiKey: undefined,
 				model: "sonnet",
@@ -1546,7 +1540,6 @@ describe("SettingsWebviewPanel", () => {
 				codexEnabled: true,
 				geminiEnabled: true,
 				localFolder: "/saved/folder",
-				pushAction: "both",
 				excludePatterns: [],
 			});
 
@@ -1560,13 +1553,12 @@ describe("SettingsWebviewPanel", () => {
 					command: "settingsLoaded",
 					settings: expect.objectContaining({
 						localFolder: "/saved/folder",
-						pushAction: "both",
 					}),
 				}),
 			);
 		});
 
-		it("defaults localFolder to empty string and pushAction to 'jolli' when not set", async () => {
+		it("defaults localFolder to empty string when not set", async () => {
 			mockLoadConfigFromDir.mockResolvedValue({
 				apiKey: undefined,
 				model: "sonnet",
@@ -1576,7 +1568,6 @@ describe("SettingsWebviewPanel", () => {
 				codexEnabled: true,
 				geminiEnabled: true,
 				localFolder: undefined,
-				pushAction: undefined,
 				excludePatterns: [],
 			});
 
@@ -1590,10 +1581,37 @@ describe("SettingsWebviewPanel", () => {
 					command: "settingsLoaded",
 					settings: expect.objectContaining({
 						localFolder: "",
-						pushAction: "jolli",
 					}),
 				}),
 			);
+		});
+
+		it("does not include pushAction in the loaded payload (field removed)", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			const settingsLoadedCall = postMessage.mock.calls.find(
+				(c: unknown[]) =>
+					(c[0] as { command?: string }).command === "settingsLoaded",
+			);
+			expect(settingsLoadedCall).toBeDefined();
+			const settings = (
+				settingsLoadedCall?.[0] as { settings: Record<string, unknown> }
+			).settings;
+			expect(settings).not.toHaveProperty("pushAction");
 		});
 	});
 

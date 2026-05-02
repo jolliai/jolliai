@@ -87,14 +87,14 @@ export function buildSettingsHtml(nonce: string): string {
       <div class="error-message" id="integrations-error"></div>
     </div>
 
-    <!-- Local Memories -->
+    <!-- Local Memory Bank -->
     <div class="settings-group">
-      <h2>Local Memories</h2>
+      <h2>Local Memory Bank</h2>
 
       <div class="settings-row">
         <label class="settings-label" for="localFolder">
           Local Folder
-          <span class="hint">Where to save local memory files</span>
+          <span class="hint">Root directory of the Memory Bank on disk</span>
         </label>
         <div class="browse-row">
           <input type="text" id="localFolder" readonly placeholder="No folder selected" spellcheck="false" />
@@ -102,21 +102,11 @@ export function buildSettingsHtml(nonce: string): string {
         </div>
       </div>
 
-      <fieldset class="settings-row column" id="pushActionFieldset">
-        <legend class="settings-label">
-          Default Push Action
-          <span class="hint">Where memories are pushed when you click Push</span>
-        </legend>
-        <label class="radio-label">
-          <input type="radio" name="pushAction" id="pushActionJolli" value="jolli" checked />
-          Push to Jolli only
-        </label>
-        <label class="radio-label">
-          <input type="radio" name="pushAction" id="pushActionBoth" value="both" />
-          Push to Jolli &amp; Local
-          <span class="hint radio-hint" id="pushActionBothHint"></span>
-        </label>
-      </fieldset>
+      <div class="settings-row column rebuild-row">
+        <button type="button" class="browse-btn rebuild-btn" id="rebuildKbBtn">Migrate to Memory Bank</button>
+        <div class="hint rebuild-hint">Re-migrate this repo from the orphan branch into a fresh Memory Bank folder. The existing folder is preserved (a new <code>-2</code>-suffixed folder is created and the repo registry is repointed).</div>
+        <div class="hint" id="rebuildKbStatus"></div>
+      </div>
     </div>
 
     <!-- Files -->

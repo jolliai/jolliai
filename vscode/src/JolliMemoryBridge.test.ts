@@ -17,10 +17,6 @@ const { generateCommitMessage, generateSquashMessage } = vi.hoisted(() => ({
 	generateSquashMessage: vi.fn(),
 }));
 
-const { exportSummaries } = vi.hoisted(() => ({
-	exportSummaries: vi.fn(),
-}));
-
 const {
 	getIndexEntryMap,
 	getSummary,
@@ -146,10 +142,6 @@ vi.mock("./util/WorkspaceUtils.js", () => ({
 vi.mock("../../cli/src/core/Summarizer.js", () => ({
 	generateCommitMessage,
 	generateSquashMessage,
-}));
-
-vi.mock("../../cli/src/core/SummaryExporter.js", () => ({
-	exportSummaries,
 }));
 
 vi.mock("../../cli/src/core/SummaryStore.js", () => ({
@@ -770,6 +762,33 @@ describe("JolliMemoryBridge", () => {
 			expect(files[0].relativePath).toBe("copy.ts");
 			expect(files[0].originalPath).toBe("original.ts");
 			expect(files[0].indexStatus).toBe("C");
+		});
+
+		it("requests -uall so untracked dirs are expanded into files (no directory rows in CHANGES)", async () => {
+			// Default `git status` collapses an untracked-only directory into one
+			// `?? docs/` line. The sidebar renders that as a "file" with a `?`
+			// status — the bug reported when a fresh `docs/` tree appeared in the
+			// CHANGES list as a single directory row. -uall forces git to expand
+			// directories into individual untracked file rows.
+			mockExecFileSuccess("");
+			const bridge = makeBridge();
+			await bridge.listFiles();
+			const args = execFileMock.mock.calls[0]?.[1] as ReadonlyArray<string>;
+			expect(args).toContain("-uall");
+		});
+
+		it("drops directory-shaped entries (trailing slash) defensively", async () => {
+			// Belt-and-suspenders against a future git mode (or user
+			// status.showUntrackedFiles config) that emits a directory entry
+			// despite -uall. The CHANGES list is files-only by design, so any
+			// path ending with "/" must not be rendered as a row.
+			mockExecFileSuccess("?? docs/\0M  src/main.ts\0?? .hidden/\0");
+			const bridge = makeBridge();
+
+			const files = await bridge.listFiles();
+
+			expect(files).toHaveLength(1);
+			expect(files[0].relativePath).toBe("src/main.ts");
 		});
 
 		it("handles paths with spaces verbatim (no quoting in -z mode)", async () => {
@@ -1985,7 +2004,11 @@ describe("JolliMemoryBridge", () => {
 			const bridge = makeBridge();
 			const summaries = await bridge.listSummaries(10);
 
-			expect(listSummaries).toHaveBeenCalledWith(10, TEST_CWD);
+			expect(listSummaries).toHaveBeenCalledWith(
+				10,
+				TEST_CWD,
+				expect.anything(),
+			);
 			// Only non-null summaries are returned
 			expect(summaries).toHaveLength(1);
 			expect(summaries[0].commitHash).toBe("aaa");
@@ -1999,7 +2022,11 @@ describe("JolliMemoryBridge", () => {
 
 			const result = await bridge.getSummary("abc");
 
-			expect(getSummary).toHaveBeenCalledWith("abc", TEST_CWD);
+			expect(getSummary).toHaveBeenCalledWith(
+				"abc",
+				TEST_CWD,
+				expect.anything(),
+			);
 			expect(result).toEqual({ commitHash: "abc", topics: [] });
 		});
 
@@ -2545,6 +2572,7 @@ describe("JolliMemoryBridge", () => {
 				expect(scanTreeHashAliases).toHaveBeenCalledWith(
 					["commitHash1"],
 					TEST_CWD,
+					expect.anything(),
 				);
 				expect(info).toHaveBeenCalledWith(
 					"commits",
@@ -2856,7 +2884,10 @@ describe("JolliMemoryBridge", () => {
 			const bridge = makeBridge();
 			const result = await bridge.listSummaryEntries(10);
 
-			expect(getIndexEntryMap).toHaveBeenCalledWith(TEST_CWD);
+			expect(getIndexEntryMap).toHaveBeenCalledWith(
+				TEST_CWD,
+				expect.anything(),
+			);
 			expect(result.entries.map((e) => e.commitHash)).toEqual([
 				"bbb",
 				"ccc",
@@ -3010,29 +3041,6 @@ describe("JolliMemoryBridge", () => {
 			bridge.invalidateEntriesCache();
 			await bridge.listSummaryEntries(10);
 			expect(getIndexEntryMap).toHaveBeenCalledTimes(2);
-		});
-	});
-
-	describe("exportMemories", () => {
-		beforeEach(() => {
-			exportSummaries.mockReset();
-		});
-
-		it("forwards the workspace cwd to exportSummaries and returns its result", async () => {
-			const expected = {
-				outputDir: "/home/user/Documents/jollimemory/repo",
-				filesWritten: 3,
-				filesSkipped: 1,
-				totalSummaries: 4,
-				indexPath: "/home/user/Documents/jollimemory/repo/index.md",
-			};
-			exportSummaries.mockResolvedValue(expected);
-			const bridge = new JolliMemoryBridge("/workspace/repo");
-
-			const result = await bridge.exportMemories();
-
-			expect(exportSummaries).toHaveBeenCalledWith({ cwd: "/workspace/repo" });
-			expect(result).toBe(expected);
 		});
 	});
 
@@ -3402,6 +3410,7 @@ describe("JolliMemoryBridge", () => {
 			expect(readPlanFromBranch).toHaveBeenCalledWith(
 				"archived-plan",
 				TEST_CWD,
+				expect.anything(),
 			);
 			expect(readFileSync).not.toHaveBeenCalled();
 			const callArgs = corePushSummaryToLocal.mock.calls[0][0];

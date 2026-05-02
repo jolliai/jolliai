@@ -409,7 +409,7 @@ function buildPlansAndNotesSection(
       <div class="add-dropdown-item" data-action="addTextSnippet">Add Text Snippet</div>
     </div>
   </div>
-  <div class="snippet-form" id="snippetForm" hidden>
+  <div class="snippet-form hidden" id="snippetForm">
     <div class="snippet-field">
       <label for="snippetTitle">Title</label>
       <input type="text" id="snippetTitle" placeholder="My Note" autocomplete="off" spellcheck="false" />

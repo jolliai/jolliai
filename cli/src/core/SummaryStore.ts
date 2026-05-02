@@ -36,8 +36,8 @@ import type {
 import { getDiffStats, getTreeHash } from "./GitOps.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { acquireLock, releaseLock } from "./SessionTracker.js";
-import type { SquashConsolidationSource } from "./Summarizer.js";
 import type { StorageProvider } from "./StorageProvider.js";
+import type { SquashConsolidationSource } from "./Summarizer.js";
 import { getDisplayDate } from "./SummaryFormat.js";
 import { collectAllTopics, countTopics, isUnifiedHoistFormat } from "./SummaryTree.js";
 
@@ -793,18 +793,22 @@ export async function getTranscriptHashes(cwd?: string): Promise<Set<string>> {
  *
  * Returns null if no summary exists for that commit.
  */
-export async function getSummary(commitHash: string, cwd?: string): Promise<CommitSummary | null> {
+export async function getSummary(
+	commitHash: string,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<CommitSummary | null> {
 	// Step 1: Direct file read -- works for any hash that was ever indexed.
-	const direct = await readSummaryFile(commitHash, cwd);
+	const direct = await readSummaryFile(commitHash, cwd, storage);
 	if (direct) return direct;
 
 	// Step 2: Cross-branch fallback via aliases / tree hash.
-	const index = await loadIndex(cwd);
+	const index = await loadIndex(cwd, storage);
 	if (!index) return null;
 
 	const aliasHash = index.commitAliases?.[commitHash];
 	if (aliasHash) {
-		return readSummaryFile(aliasHash, cwd);
+		return readSummaryFile(aliasHash, cwd, storage);
 	}
 
 	if (index.version === 3) {
@@ -814,7 +818,7 @@ export async function getSummary(commitHash: string, cwd?: string): Promise<Comm
 			const entryMap = new Map(index.entries.map((e) => [e.commitHash, e]));
 			const matchEntry = findShallowstByTreeHash(treeHash, index.entries, entryMap);
 			if (matchEntry) {
-				return readSummaryFile(matchEntry.commitHash, cwd);
+				return readSummaryFile(matchEntry.commitHash, cwd, storage);
 			}
 		}
 		/* v8 ignore stop */
@@ -830,8 +834,12 @@ export async function getSummary(commitHash: string, cwd?: string): Promise<Comm
  * @param count - Maximum number of summaries to return (default: 10)
  * @param cwd - Optional working directory
  */
-export async function listSummaries(count = 10, cwd?: string): Promise<ReadonlyArray<CommitSummary>> {
-	const index = await loadIndex(cwd);
+export async function listSummaries(
+	count = 10,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<ReadonlyArray<CommitSummary>> {
+	const index = await loadIndex(cwd, storage);
 	if (!index || index.entries.length === 0) {
 		return [];
 	}
@@ -850,7 +858,7 @@ export async function listSummaries(count = 10, cwd?: string): Promise<ReadonlyA
 	// Load full summaries for each root entry
 	const summaries: CommitSummary[] = [];
 	for (const entry of recentEntries) {
-		const summary = await getSummary(entry.commitHash, cwd);
+		const summary = await getSummary(entry.commitHash, cwd, storage);
 		if (summary) {
 			summaries.push(summary);
 		}
@@ -891,8 +899,11 @@ export async function listSummaryHashes(cwd?: string): Promise<ReadonlySet<strin
  * @param cwd - Optional working directory
  * @returns A Map keyed by commit hash (including aliases), or an empty Map if no index exists
  */
-export async function getIndexEntryMap(cwd?: string): Promise<ReadonlyMap<string, SummaryIndexEntry>> {
-	const index = await loadIndex(cwd);
+export async function getIndexEntryMap(
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<ReadonlyMap<string, SummaryIndexEntry>> {
+	const index = await loadIndex(cwd, storage);
 	if (!index) return new Map();
 
 	const map = new Map<string, SummaryIndexEntry>(index.entries.map((e) => [e.commitHash, e]));
@@ -927,8 +938,12 @@ export async function getIndexEntryMap(cwd?: string): Promise<ReadonlyMap<string
  *
  * @returns `true` if any new aliases were written, `false` otherwise
  */
-export async function scanTreeHashAliases(commitHashes: string[], cwd?: string): Promise<boolean> {
-	const index = await loadIndex(cwd);
+export async function scanTreeHashAliases(
+	commitHashes: string[],
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<boolean> {
+	const index = await loadIndex(cwd, storage);
 	if (!index || index.version !== 3) return false;
 
 	const existingAliases = { ...(index.commitAliases ?? {}) };
@@ -972,7 +987,7 @@ export async function scanTreeHashAliases(commitHashes: string[], cwd?: string):
 		const mergedAliases = { ...existingAliases, ...newAliases };
 		const newIndex: SummaryIndex = { ...index, commitAliases: mergedAliases };
 		const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		await store.writeFiles(files, `Add ${Object.keys(newAliases).length} tree hash alias(es)`);
 	} finally {
 		await releaseLock(cwd);
@@ -1131,8 +1146,12 @@ async function flattenSummaryTree(
  * Reads a summary JSON file directly from the orphan branch.
  * Only works for root nodes (files exist at `summaries/{rootHash}.json`).
  */
-async function readSummaryFile(commitHash: string, cwd?: string): Promise<CommitSummary | null> {
-	const store = resolveStorage(undefined, cwd);
+async function readSummaryFile(
+	commitHash: string,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<CommitSummary | null> {
+	const store = resolveStorage(storage, cwd);
 	const content = await store.readFile(`summaries/${commitHash}.json`);
 	if (!content) return null;
 
@@ -1199,8 +1218,8 @@ export async function getIndex(cwd?: string): Promise<SummaryIndex | null> {
 /**
  * Loads the index file from the orphan branch.
  */
-async function loadIndex(cwd?: string): Promise<SummaryIndex | null> {
-	const store = resolveStorage(undefined, cwd);
+async function loadIndex(cwd?: string, storage?: StorageProvider): Promise<SummaryIndex | null> {
+	const store = resolveStorage(storage, cwd);
 	const content = await store.readFile(INDEX_FILE);
 	if (!content) {
 		return null;
@@ -1243,9 +1262,13 @@ export async function storePlans(
  * Reads a plan file from the orphan branch.
  * Returns the markdown content, or null if the file doesn't exist.
  */
-export async function readPlanFromBranch(slug: string, cwd?: string): Promise<string | null> {
+export async function readPlanFromBranch(
+	slug: string,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<string | null> {
 	try {
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		return await store.readFile(`plans/${slug}.md`);
 	} catch {
 		return null;
@@ -1296,9 +1319,9 @@ export async function storeNotes(
  * Reads a note file from the orphan branch.
  * Returns the markdown content, or null if the file doesn't exist.
  */
-export async function readNoteFromBranch(id: string, cwd?: string): Promise<string | null> {
+export async function readNoteFromBranch(id: string, cwd?: string, storage?: StorageProvider): Promise<string | null> {
 	try {
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		return await store.readFile(`notes/${id}.md`);
 	} catch {
 		return null;

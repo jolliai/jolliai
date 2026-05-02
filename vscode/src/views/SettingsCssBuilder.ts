@@ -58,6 +58,25 @@ export function buildSettingsCss(): string {
   .settings-row.column {
     flex-direction: column;
     align-items: stretch;
+    gap: 6px;
+    min-width: 0;
+  }
+  .rebuild-btn {
+    align-self: flex-start;
+  }
+  .rebuild-hint {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    white-space: normal;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    line-height: 1.45;
+  }
+  .rebuild-hint code {
+    white-space: normal;
+    word-break: break-all;
   }
   .input-col {
     flex: 1;

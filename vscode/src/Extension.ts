@@ -5,11 +5,16 @@
  * Called by VSCode when the extension activates (workspaceContains:.git).
  */
 
-import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import * as vscode from "vscode";
+import {
+	extractRepoName,
+	getRemoteUrl,
+	resolveKBPath,
+} from "../../cli/src/core/KBPathResolver.js";
 import {
 	acquireLock,
 	loadConfig,
@@ -29,8 +34,8 @@ import {
 	readPlanFromBranch,
 } from "../../cli/src/core/SummaryStore.js";
 import { ORPHAN_BRANCH } from "../../cli/src/Logger.js";
+import type { StatusInfo } from "../../cli/src/Types.js";
 import { CommitCommand } from "./commands/CommitCommand.js";
-import { ExportMemoriesCommand } from "./commands/ExportMemoriesCommand.js";
 import { PushCommand } from "./commands/PushCommand.js";
 import { SquashCommand } from "./commands/SquashCommand.js";
 import { getNotesDir } from "./core/NoteService.js";
@@ -49,10 +54,6 @@ import {
 	HistoryTreeProvider,
 } from "./providers/HistoryTreeProvider.js";
 import {
-	type KBFileItem,
-	KnowledgeBaseTreeProvider,
-} from "./providers/KnowledgeBaseTreeProvider.js";
-import {
 	MemoriesTreeProvider,
 	type MemoryItem,
 } from "./providers/MemoriesTreeProvider.js";
@@ -60,7 +61,7 @@ import type { NoteItem, PlanItem } from "./providers/PlansTreeProvider.js";
 import { PlansTreeProvider } from "./providers/PlansTreeProvider.js";
 import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
 import { AuthService } from "./services/AuthService.js";
-import { MemoriesDataService } from "./services/data/MemoriesDataService.js";
+import { KbFoldersService } from "./services/KbFoldersService.js";
 import { CommitsStore } from "./stores/CommitsStore.js";
 import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
@@ -74,6 +75,7 @@ import { StatusBarManager } from "./util/StatusBarManager.js";
 import { getWorkspaceRoot } from "./util/WorkspaceUtils.js";
 import { NoteEditorWebviewPanel } from "./views/NoteEditorWebviewPanel.js";
 import { SettingsWebviewPanel } from "./views/SettingsWebviewPanel.js";
+import { SidebarWebviewProvider } from "./views/SidebarWebviewProvider.js";
 import { buildClaudeCodeContext } from "./views/SummaryMarkdownBuilder.js";
 import { SummaryWebviewPanel } from "./views/SummaryWebviewPanel.js";
 
@@ -150,69 +152,163 @@ function resolveGitPath(
 		return;
 	}
 }
+
+/**
+ * Parses the YAML-ish frontmatter that FolderStorage writes onto each on-disk
+ * markdown copy of a commit summary (see FolderStorage.buildYamlFrontmatter).
+ * Returns the embedded commit hash when the file represents a summary
+ * (`type: commit`); returns null for plan/note copies, files without
+ * frontmatter, and anything that fails to parse — the caller falls back to a
+ * plain markdown preview in those cases.
+ */
+function parseSummaryFrontmatter(
+	absPath: string,
+): { commitHash: string } | null {
+	let raw: string;
+	try {
+		raw = readFileSync(absPath, "utf-8");
+	} catch {
+		return null;
+	}
+	if (!raw.startsWith("---\n")) return null;
+	const closing = raw.indexOf("\n---", 4);
+	if (closing === -1) return null;
+	const block = raw.slice(4, closing);
+	let type: string | undefined;
+	let commitHash: string | undefined;
+	for (const line of block.split("\n")) {
+		const idx = line.indexOf(":");
+		if (idx === -1) continue;
+		const key = line.slice(0, idx).trim();
+		const val = line.slice(idx + 1).trim();
+		if (key === "type") type = val;
+		else if (key === "commitHash") commitHash = val;
+	}
+	if (type !== "commit" || !commitHash) return null;
+	return { commitHash };
+}
+
 // ─── activate ─────────────────────────────────────────────────────────────────
+
+/**
+ * Names of every command declared in package.json. The two degraded paths
+ * (no workspace, no git) need to register a no-op for each one so command-
+ * palette invocations don't fail with "command not found"; lifting the list
+ * to a constant keeps the two branches in lockstep.
+ */
+const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
+	"jollimemory.enableJolliMemory",
+	"jollimemory.disableJolliMemory",
+	"jollimemory.refreshStatus",
+	"jollimemory.refreshMemories",
+	"jollimemory.migrateToKnowledgeBase",
+	"jollimemory.openSettings",
+	"jollimemory.refreshFiles",
+	"jollimemory.refreshHistory",
+	"jollimemory.refreshPlans",
+	"jollimemory.commitAI",
+	"jollimemory.squash",
+	"jollimemory.pushBranch",
+	"jollimemory.pushToJolli",
+	"jollimemory.selectAllFiles",
+	"jollimemory.selectAllCommits",
+	"jollimemory.searchMemories",
+	"jollimemory.clearMemoryFilter",
+	"jollimemory.loadMoreMemories",
+	"jollimemory.viewMemorySummary",
+	"jollimemory.viewSummary",
+	"jollimemory.copyCommitHash",
+	"jollimemory.copyRecallPrompt",
+	"jollimemory.openFileChange",
+	"jollimemory.openCommitFileChange",
+	"jollimemory.discardFileChanges",
+	"jollimemory.discardSelectedChanges",
+	"jollimemory.focusSidebar",
+	"jollimemory.addPlan",
+	"jollimemory.editPlan",
+	"jollimemory.removePlan",
+	"jollimemory.addMarkdownNote",
+	"jollimemory.addTextSnippet",
+	"jollimemory.editNote",
+	"jollimemory.removeNote",
+	"jollimemory.openMemoryFile",
+	"jollimemory.openInClaudeCode",
+	"jollimemory.signIn",
+	"jollimemory.signOut",
+];
+
+/**
+ * Registers a SidebarWebviewProvider in degraded mode (no data providers, no
+ * branch watcher) so the activity-bar icon renders the reason-specific CTA
+ * banner — Open Folder for "no-workspace", Initialize Git for "no-git" —
+ * instead of VSCode's "no view registered" placeholder.
+ */
+function registerDegradedSidebar(
+	context: vscode.ExtensionContext,
+	reason: "no-workspace" | "no-git",
+): void {
+	const provider = new SidebarWebviewProvider({
+		executeCommand: (cmd, ...args) =>
+			vscode.commands.executeCommand(cmd, ...args),
+		getInitialState: () => ({
+			enabled: false,
+			authenticated: false,
+			activeTab: "status",
+			kbMode: "folders",
+			branchName: "",
+			detached: false,
+			degradedReason: reason,
+		}),
+		extensionUri: context.extensionUri,
+	});
+	context.subscriptions.push(
+		provider,
+		vscode.window.registerWebviewViewProvider(
+			SidebarWebviewProvider.viewId,
+			provider,
+		),
+	);
+}
 
 export function activate(context: vscode.ExtensionContext): void {
 	const workspaceRoot = getWorkspaceRoot();
 	if (!workspaceRoot) {
-		// Register ALL declared commands as no-ops so buttons don't throw "command not found"
 		const noFolder = () =>
 			vscode.window.showInformationMessage(
 				"Please open a folder to use Jolli Memory.",
 			);
-		const allCommands = [
-			"jollimemory.enableJolliMemory",
-			"jollimemory.disableJolliMemory",
-			"jollimemory.refreshStatus",
-			"jollimemory.refreshMemories",
-			"jollimemory.refreshKnowledgeBase",
-			"jollimemory.migrateToKnowledgeBase",
-			"jollimemory.openKBCommitSummary",
-			"jollimemory.openSettings",
-			"jollimemory.refreshFiles",
-			"jollimemory.refreshHistory",
-			"jollimemory.refreshPlans",
-			"jollimemory.commitAI",
-			"jollimemory.squash",
-			"jollimemory.pushBranch",
-			"jollimemory.pushToJolli",
-			"jollimemory.exportMemories",
-			"jollimemory.selectAllFiles",
-			"jollimemory.selectAllCommits",
-			"jollimemory.searchMemories",
-			"jollimemory.clearMemoryFilter",
-			"jollimemory.loadMoreMemories",
-			"jollimemory.viewMemorySummary",
-			"jollimemory.viewSummary",
-			"jollimemory.copyCommitHash",
-			"jollimemory.copyRecallPrompt",
-			"jollimemory.openFileChange",
-			"jollimemory.openCommitFileChange",
-			"jollimemory.discardFileChanges",
-			"jollimemory.discardSelectedChanges",
-			"jollimemory.focusSidebar",
-			"jollimemory.addPlan",
-			"jollimemory.editPlan",
-			"jollimemory.removePlan",
-			"jollimemory.addMarkdownNote",
-			"jollimemory.addTextSnippet",
-			"jollimemory.editNote",
-			"jollimemory.removeNote",
-			"jollimemory.openInClaudeCode",
-			"jollimemory.focusKnowledgeBase",
-			"jollimemory.signIn",
-			"jollimemory.signOut",
-		];
-		for (const cmd of allCommands) {
+		for (const cmd of ALL_DECLARED_COMMANDS) {
 			context.subscriptions.push(
 				vscode.commands.registerCommand(cmd, noFolder),
 			);
 		}
+		// The webview "Open Folder" button dispatches the built-in
+		// vscode.openFolder, which is always registered, so no extra command is
+		// needed for the no-workspace CTA.
+		registerDegradedSidebar(context, "no-workspace");
 		return;
 	}
 
 	// Check if git is initialized — if not, offer to init
 	if (!existsSync(join(workspaceRoot, ".git"))) {
+		const initGit = () => {
+			try {
+				execFileSync("git", ["init"], { cwd: workspaceRoot });
+				return vscode.window
+					.showInformationMessage(
+						"Git initialized. Please reload the window to activate Jolli Memory.",
+						"Reload",
+					)
+					.then((r) => {
+						if (r === "Reload")
+							vscode.commands.executeCommand("workbench.action.reloadWindow");
+					});
+			} catch (err) {
+				vscode.window.showErrorMessage(
+					`Failed to initialize git: ${(err as Error).message}`,
+				);
+			}
+		};
 		const noGit = () =>
 			vscode.window
 				.showWarningMessage(
@@ -220,73 +316,18 @@ export function activate(context: vscode.ExtensionContext): void {
 					"Initialize Git",
 				)
 				.then((choice) => {
-					if (choice === "Initialize Git") {
-						try {
-							execSync("git init", { cwd: workspaceRoot });
-							vscode.window
-								.showInformationMessage(
-									"Git initialized. Please reload the window to activate Jolli Memory.",
-									"Reload",
-								)
-								.then((r) => {
-									if (r === "Reload")
-										vscode.commands.executeCommand(
-											"workbench.action.reloadWindow",
-										);
-								});
-						} catch (err) {
-							vscode.window.showErrorMessage(
-								`Failed to initialize git: ${(err as Error).message}`,
-							);
-						}
-					}
+					if (choice === "Initialize Git") void initGit();
 				});
-		const allCommands = [
-			"jollimemory.enableJolliMemory",
-			"jollimemory.disableJolliMemory",
-			"jollimemory.refreshStatus",
-			"jollimemory.refreshMemories",
-			"jollimemory.refreshKnowledgeBase",
-			"jollimemory.migrateToKnowledgeBase",
-			"jollimemory.openKBCommitSummary",
-			"jollimemory.openSettings",
-			"jollimemory.refreshFiles",
-			"jollimemory.refreshHistory",
-			"jollimemory.refreshPlans",
-			"jollimemory.commitAI",
-			"jollimemory.squash",
-			"jollimemory.pushBranch",
-			"jollimemory.pushToJolli",
-			"jollimemory.exportMemories",
-			"jollimemory.selectAllFiles",
-			"jollimemory.selectAllCommits",
-			"jollimemory.searchMemories",
-			"jollimemory.clearMemoryFilter",
-			"jollimemory.loadMoreMemories",
-			"jollimemory.viewMemorySummary",
-			"jollimemory.viewSummary",
-			"jollimemory.copyCommitHash",
-			"jollimemory.copyRecallPrompt",
-			"jollimemory.openFileChange",
-			"jollimemory.openCommitFileChange",
-			"jollimemory.discardFileChanges",
-			"jollimemory.discardSelectedChanges",
-			"jollimemory.focusSidebar",
-			"jollimemory.addPlan",
-			"jollimemory.editPlan",
-			"jollimemory.removePlan",
-			"jollimemory.addMarkdownNote",
-			"jollimemory.addTextSnippet",
-			"jollimemory.editNote",
-			"jollimemory.removeNote",
-			"jollimemory.openInClaudeCode",
-			"jollimemory.focusKnowledgeBase",
-			"jollimemory.signIn",
-			"jollimemory.signOut",
-		];
-		for (const cmd of allCommands) {
+		for (const cmd of ALL_DECLARED_COMMANDS) {
 			context.subscriptions.push(vscode.commands.registerCommand(cmd, noGit));
 		}
+		// Sidebar "Initialize Git" button dispatches this command directly —
+		// skip the warning prompt the command-palette path shows because the
+		// click itself is the explicit confirmation.
+		context.subscriptions.push(
+			vscode.commands.registerCommand("jollimemory.initGit", initGit),
+		);
+		registerDegradedSidebar(context, "no-git");
 		return;
 	}
 
@@ -482,81 +523,161 @@ export function activate(context: vscode.ExtensionContext): void {
 		),
 	);
 
-	// ── Knowledge Base tree provider ────────────────────────────────────────
-	const kbProvider = new KnowledgeBaseTreeProvider();
-	context.subscriptions.push(kbProvider);
-	let kbFocused = false;
+	// Tree views were removed in favor of the 3-tab sidebar webview below.
+	// The five `*TreeProvider` instances above are kept as data sources only:
+	// the sidebar reads them through `serialize()` / `onDidChangeTreeData`.
 
-	// KB initialization is serialized in initializeKB() below to avoid
-	// race conditions from concurrent orphan branch and config access.
+	// ── Sidebar webview (3-tab) ──────────────────────────────────────────────
+	// Provides directory listing for the Folders tab in the sidebar webview.
+	// kbRoot resolution mirrors HEAD's KBPathResolver flow so the sidebar reads
+	// from the same on-disk location that auto-migration / FolderStorage write
+	// to (~/Documents/jolli/<repoName>/), not the legacy hardcoded path used in
+	// the original 828991c4 commit.
+	/* v8 ignore start -- cherry-picked sidebar wiring; covered indirectly via SidebarWebviewProvider tests; follow-up adds activate-level tests. */
+	const sidebarRepoName = extractRepoName(workspaceRoot);
+	const sidebarRemoteUrl = getRemoteUrl(workspaceRoot);
+	// Initial resolution skips customKBPath because loadConfig() is async.
+	// The async branch below re-resolves once config is loaded, and the
+	// settings-save callback re-resolves whenever the user picks a new folder.
+	let sidebarKbRoot = resolveKBPath(sidebarRepoName, sidebarRemoteUrl);
+	const kbFoldersService = new KbFoldersService(() => sidebarKbRoot);
 
-	// Register tree views FIRST so providers are available before context keys
-	// trigger `when` clause re-evaluation (which may cause VSCode to query tree data).
+	// Re-resolves sidebarKbRoot from the latest config and (if the path has
+	// changed) tells the sidebar webview to drop its cached folder tree so the
+	// next listing starts from the new root. Returns true when the root moved.
+	async function refreshSidebarKbRoot(): Promise<boolean> {
+		try {
+			const cfg = await loadConfig();
+			const customKBPath = (cfg as Record<string, unknown>).localFolder as
+				| string
+				| undefined;
+			const next = resolveKBPath(
+				sidebarRepoName,
+				sidebarRemoteUrl,
+				customKBPath,
+			);
+			if (next !== sidebarKbRoot) {
+				sidebarKbRoot = next;
+				return true;
+			}
+		} catch (err) {
+			log.warn("activate", "refreshSidebarKbRoot failed", err);
+		}
+		return false;
+	}
 
-	const kbView = vscode.window.createTreeView("jollimemory.knowledgeBaseView", {
-		treeDataProvider: kbProvider,
-		showCollapseAll: true,
+	// Display name for the repo-root header in the sidebar's KB tree (mirrors
+	// IntelliJ's KBExplorerPanel repo node). Identical to `sidebarRepoName`
+	// because cli's `extractRepoName` is the single source of truth for both
+	// the on-disk path and the UI label — opening a worktree shows e.g.
+	// "jolliai" (origin URL basename) instead of the worktree directory name.
+	const kbRepoFolder = sidebarRepoName;
+
+	let currentBranchName = "";
+	let currentBranchDetached = false;
+	const branchChangeEmitter = new vscode.EventEmitter<void>();
+
+	void bridge.getCurrentBranch().then((branch) => {
+		currentBranchName = branch;
+		currentBranchDetached = branch === "HEAD";
+		branchChangeEmitter.fire();
 	});
-	context.subscriptions.push(kbView);
 
-	const statusView = vscode.window.createTreeView("jollimemory.statusView", {
-		treeDataProvider: statusProvider,
-		showCollapseAll: false,
-	});
+	let currentEnabled = true;
+	let currentAuthenticated = false;
 
-	const memoriesView = vscode.window.createTreeView(
-		"jollimemory.memoriesView",
-		{
-			treeDataProvider: memoriesProvider,
-			showCollapseAll: false,
+	const sidebarProvider = new SidebarWebviewProvider({
+		executeCommand: (cmd, ...args) =>
+			vscode.commands.executeCommand(cmd, ...args),
+		getInitialState: () => ({
+			enabled: currentEnabled,
+			authenticated: currentAuthenticated,
+			activeTab: "branch",
+			kbMode: "folders",
+			branchName: currentBranchName,
+			detached: currentBranchDetached,
+			kbRepoFolder,
+		}),
+		extensionUri: context.extensionUri,
+		statusProvider: {
+			serialize: () => statusProvider.serialize(),
+			onDidChangeTreeData:
+				statusProvider.onDidChangeTreeData.bind(statusProvider),
 		},
-	);
-
-	const plansView = vscode.window.createTreeView("jollimemory.plansView", {
-		treeDataProvider: plansProvider,
-		showCollapseAll: false,
+		memoriesProvider: {
+			serialize: () => memoriesProvider.serialize(),
+			onDidChangeTreeData:
+				memoriesProvider.onDidChangeTreeData.bind(memoriesProvider),
+		},
+		plansProvider: {
+			serialize: () => plansProvider.serialize(),
+			onDidChangeTreeData:
+				plansProvider.onDidChangeTreeData.bind(plansProvider),
+		},
+		filesProvider: {
+			serialize: () => filesProvider.serialize(),
+			onDidChangeTreeData:
+				filesProvider.onDidChangeTreeData.bind(filesProvider),
+		},
+		historyProvider: {
+			serialize: async () => historyProvider.serialize(),
+			onDidChangeTreeData:
+				historyProvider.onDidChangeTreeData.bind(historyProvider),
+			getMode: historyProvider.getMode.bind(historyProvider),
+		},
+		kbFolders: kbFoldersService,
+		resolveKbAbs: (relPath) => join(sidebarKbRoot, relPath),
+		// MemoriesStore was previously loaded via memoriesView.onDidChangeVisibility;
+		// the webview replacement has no equivalent built-in event, so we plumb it
+		// through SidebarWebviewProvider's `case "ready"` instead.
+		onSidebarFirstVisible: () => {
+			void memoriesStore.ensureFirstLoad();
+		},
+		branchWatcher: {
+			current: () => ({
+				name: currentBranchName,
+				detached: currentBranchDetached,
+			}),
+			onChange: (cb) => {
+				const disposable = branchChangeEmitter.event(() => {
+					cb(currentBranchName, currentBranchDetached);
+				});
+				return { dispose: () => disposable.dispose() };
+			},
+		},
+		applyFileCheckbox: (filePath, selected) =>
+			filesStore.applyCheckboxBatch([[filePath, selected]]),
+		applyCommitCheckbox: (hash, selected) =>
+			commitsStore.onCheckboxToggle(hash, selected),
 	});
-
-	const filesView = vscode.window.createTreeView("jollimemory.filesView", {
-		treeDataProvider: filesProvider,
-		showCollapseAll: false,
-		canSelectMany: false,
-		// checkboxes require vscode 1.80+
-	});
-
-	const historyView = vscode.window.createTreeView("jollimemory.historyView", {
-		treeDataProvider: historyProvider,
-		showCollapseAll: true,
-		canSelectMany: false,
-	});
-
 	context.subscriptions.push(
-		statusView,
-		memoriesView,
-		plansView,
-		filesView,
-		historyView,
+		sidebarProvider,
+		vscode.window.registerWebviewViewProvider(
+			SidebarWebviewProvider.viewId,
+			sidebarProvider,
+		),
+		branchChangeEmitter,
 	);
 
-	// ── View-level UI subscriptions (store.onChange → title/description) ─────
-	// Provider does NOT hold view references; all view-level UI updates live
-	// here at the assembly layer so Provider stays purely a TreeDataProvider.
-	context.subscriptions.push({
-		dispose: commitsStore.onChange((snap) => {
-			historyView.title = snap.isMerged
-				? "COMMITS (merged — read-only history)"
-				: "COMMITS";
-		}),
+	void bridge.getStatus().then((s) => {
+		currentEnabled = s.enabled;
+		sidebarProvider.notifyEnabledChanged(s.enabled);
 	});
-	context.subscriptions.push({
-		dispose: memoriesStore.onChange((snap) => {
-			memoriesView.description = MemoriesDataService.buildDescription({
-				filter: snap.filter,
-				entriesCount: snap.entriesCount,
-				totalCount: snap.totalCount,
-			});
-		}),
+	void loadConfig().then((cfg) => {
+		currentAuthenticated = !!cfg?.authToken;
+		sidebarProvider.notifyAuthChanged(currentAuthenticated);
 	});
+	// Pick up customKBPath from config now that loadConfig() can run async.
+	// Without this the sidebar would keep showing the default KB folder until
+	// the user reopens VS Code, even after they've configured "Local Folder".
+	void refreshSidebarKbRoot().then((moved) => {
+		if (moved) sidebarProvider.refreshKnowledgeBaseFolders();
+	});
+	/* v8 ignore stop */
+
+	// View-level UI subscriptions (historyView.title / memoriesView.description)
+	// were dropped along with the tree views — the sidebar webview renders these
+	// labels itself via its serialized snapshots.
 
 	void vscode.commands.executeCommand(
 		"setContext",
@@ -585,22 +706,8 @@ export function activate(context: vscode.ExtensionContext): void {
 		// would cause esbuild to bundle them into the VS Code extension,
 		// breaking the build in webview/browser contexts.
 
-		// 1. Initialize KB root path for the tree provider
-		try {
-			const { extractRepoName, getRemoteUrl, resolveKBPath } = await import(
-				"../../cli/src/core/KBPathResolver.js"
-			);
-			const repoName = extractRepoName(workspaceRoot);
-			const remoteUrl = getRemoteUrl(workspaceRoot);
-			const cfg = await loadConfig();
-			const customKBPath = (cfg as Record<string, unknown>).knowledgeBasePath as
-				| string
-				| undefined;
-			const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
-			kbProvider.setKBRoot(kbRoot);
-		} catch (err) {
-			log.error("activate", "KB tree init failed", err);
-		}
+		// (KB tree-provider init removed — the sidebar webview computes its own
+		// kbRoot synchronously via resolveKBPath() at activation time.)
 
 		// 2. Run legacy migrations sequentially: orphan branch migration must
 		// complete before flat index migration to prevent concurrent writes.
@@ -650,12 +757,18 @@ export function activate(context: vscode.ExtensionContext): void {
 			const repoName = extractRepoName(workspaceRoot);
 			const remoteUrl = getRemoteUrl(workspaceRoot);
 			const config = await loadConfig();
-			const customKBPath = (config as Record<string, unknown>)
-				.knowledgeBasePath as string | undefined;
+			const customKBPath = (config as Record<string, unknown>).localFolder as
+				| string
+				| undefined;
 			const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
 			initializeKBFolder(kbRoot, repoName, remoteUrl);
 
-			// Auto-migrate if orphan branch has data but migration not completed
+			// Auto-migrate if orphan branch has data but migration not completed.
+			// This covers two real-world entry points: (1) fresh install of the
+			// folder-mode extension on a repo previously using orphan storage, and
+			// (2) the user manually wiped the KB folder (which also nukes
+			// migration.json, making readMigrationState() return null and forcing
+			// a re-migration).
 			const orphan = new OrphanBranchStorage(workspaceRoot);
 			if (await orphan.exists()) {
 				const mm = new MetadataManager(join(kbRoot, ".jolli"));
@@ -669,6 +782,14 @@ export function activate(context: vscode.ExtensionContext): void {
 						"activate",
 						`KB auto-migration: ${result.status} (${result.migratedEntries}/${result.totalEntries})`,
 					);
+					// initializeKB is fire-and-forget (`void initializeKB()` below),
+					// so the sidebar webview can resolve and request kb:expandFolder
+					// before migration writes its first MD. Without an explicit
+					// signal, the sidebar's first listing is empty and stays empty
+					// until the user clicks Refresh — a UX bug that surfaces every
+					// post-wipe reload. Push a reset so the client re-fetches once
+					// migration's writes are on disk.
+					sidebarProvider.refreshKnowledgeBaseFolders();
 				}
 			}
 		} catch (err) {
@@ -832,26 +953,8 @@ export function activate(context: vscode.ExtensionContext): void {
 	// COMMITS title updates are handled by the commitsStore.onChange subscription
 	// registered near the createTreeView calls above — no provider hook needed.
 
-	// CHANGES panel: badge (number on activity bar icon) + tooltip + view
-	// description (which shows "N files hidden" when the exclude filter is active).
-	// Both update on every filesStore.onChange so saving new exclude patterns
-	// immediately refreshes the header count.  historyView intentionally has
-	// no badge — the activity bar icon number reflects only the changed-file
-	// count, not commits.
-	function updateFilesViewUI(): void {
-		const snap = filesStore.getSnapshot();
-		const visible = snap.visibleCount;
-		const selected = snap.selectedFiles.length;
-		const tooltip = `${visible} changed file${visible !== 1 ? "s" : ""}, ${selected} selected`;
-		filesView.badge = visible > 0 ? { value: visible, tooltip } : undefined;
-		filesView.description =
-			snap.excludedCount > 0
-				? `${snap.excludedCount} file${snap.excludedCount === 1 ? "" : "s"} hidden`
-				: undefined;
-	}
-	context.subscriptions.push({
-		dispose: filesStore.onChange(updateFilesViewUI),
-	});
+	// (filesView.badge / .description hooks removed — the sidebar's Files tab
+	// renders its own header text from the serialized snapshot.)
 
 	// ── Commands ─────────────────────────────────────────────────────────────
 	const commitCommand = new CommitCommand(
@@ -878,42 +981,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		statusBar,
 		workspaceRoot,
 	);
-	const exportMemoriesCommand = new ExportMemoriesCommand(bridge);
-
 	context.subscriptions.push(
-		// Knowledge Base panel
-		vscode.commands.registerCommand("jollimemory.refreshKnowledgeBase", () => {
-			kbProvider.refresh();
-		}),
-		vscode.commands.registerCommand(
-			"jollimemory.focusKnowledgeBase",
-			async () => {
-				// Minimize all other Jolli Memory sections by toggling off visible ones
-				const otherViews = [
-					"jollimemory.statusView",
-					"jollimemory.memoriesView",
-					"jollimemory.plansView",
-					"jollimemory.filesView",
-					"jollimemory.historyView",
-				];
-				if (kbFocused) {
-					// Restore: show all panels again
-					for (const viewId of otherViews) {
-						await vscode.commands.executeCommand(`${viewId}.toggleVisibility`);
-					}
-					kbFocused = false;
-				} else {
-					// Focus: hide all other panels
-					for (const viewId of otherViews) {
-						await vscode.commands.executeCommand(`${viewId}.toggleVisibility`);
-					}
-					await vscode.commands.executeCommand(
-						"jollimemory.knowledgeBaseView.focus",
-					);
-					kbFocused = true;
-				}
-			},
-		),
+		// Standalone orphan→folder migration. Triggered from settings or external
+		// plugins; not tied to a tree view. Surfaces the same MigrationEngine
+		// flow the activate() path runs automatically when the orphan branch has
+		// data but migration hasn't been completed.
 		vscode.commands.registerCommand(
 			"jollimemory.migrateToKnowledgeBase",
 			async () => {
@@ -940,8 +1012,9 @@ export function activate(context: vscode.ExtensionContext): void {
 					const repoName = extractRepoName(workspaceRoot);
 					const remoteUrl = getRemoteUrl(workspaceRoot);
 					const cfg = await loadConfig();
-					const customKBPath = (cfg as Record<string, unknown>)
-						.knowledgeBasePath as string | undefined;
+					const customKBPath = (cfg as Record<string, unknown>).localFolder as
+						| string
+						| undefined;
 					const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
 					initializeKBFolder(kbRoot, repoName, remoteUrl);
 
@@ -961,7 +1034,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					await vscode.window.withProgress(
 						{
 							location: vscode.ProgressLocation.Notification,
-							title: "Migrating to Knowledge Base...",
+							title: "Migrating to Memory Bank...",
 						},
 						async (progress) => {
 							const result = await engine.runMigration((migrated, total) => {
@@ -979,7 +1052,6 @@ export function activate(context: vscode.ExtensionContext): void {
 									`Migration ${result.status}: ${result.migratedEntries}/${result.totalEntries} entries`,
 								);
 							}
-							kbProvider.setKBRoot(kbRoot);
 						},
 					);
 				} catch (err) {
@@ -989,35 +1061,99 @@ export function activate(context: vscode.ExtensionContext): void {
 				}
 			},
 		),
+		// Settings → Migrate to Memory Bank. Re-runs the orphan→folder migration
+		// into a fresh `-N`-suffixed folder, leaves the old folder's content on
+		// disk, and "repoints" by archiving the old folder's repo identity so
+		// the next resolveKBPath() picks the new one. Returns a structured
+		// result instead of showing UI directly — SettingsWebviewPanel relays it
+		// back into the webview's button state.
 		vscode.commands.registerCommand(
-			"jollimemory.openKBCommitSummary",
-			async (item: KBFileItem) => {
-				if (!item.manifestEntry) return;
-				const kbRoot = kbProvider.kbRoot;
-				if (!kbRoot) return;
-				const summaryPath = join(
-					kbRoot,
-					".jolli",
-					"summaries",
-					`${item.manifestEntry.fileId}.json`,
-				);
+			"jollimemory.rebuildKnowledgeBase",
+			async (): Promise<{ ok: boolean; message: string }> => {
 				try {
-					const { readFileSync } = await import("node:fs");
-					const json = readFileSync(summaryPath, "utf-8");
-					const summary = JSON.parse(json);
-					// "kb" source: opens in ViewColumn.One (not Beside), focuses tab,
-					// reuses existing tab for same commit (keyed by commitHash).
-					await SummaryWebviewPanel.show(
-						summary,
-						context.extensionUri,
-						workspaceRoot,
-						"kb",
+					const {
+						extractRepoName,
+						getRemoteUrl,
+						initializeKBFolder,
+						resolveKBPath,
+						findFreshKBPath,
+					} = await import("../../cli/src/core/KBPathResolver.js");
+					const { MetadataManager } = await import(
+						"../../cli/src/core/MetadataManager.js"
 					);
-				} catch {
-					await vscode.commands.executeCommand(
-						"vscode.open",
-						vscode.Uri.file(item.fsPath),
+					const { OrphanBranchStorage } = await import(
+						"../../cli/src/core/OrphanBranchStorage.js"
 					);
+					const { FolderStorage } = await import(
+						"../../cli/src/core/FolderStorage.js"
+					);
+					const { MigrationEngine } = await import(
+						"../../cli/src/core/MigrationEngine.js"
+					);
+
+					const repoName = extractRepoName(workspaceRoot);
+					const remoteUrl = getRemoteUrl(workspaceRoot);
+					const cfg = await loadConfig();
+					const customKBPath = (cfg as Record<string, unknown>).localFolder as
+						| string
+						| undefined;
+
+					const orphan = new OrphanBranchStorage(workspaceRoot);
+					if (!(await orphan.exists())) {
+						return {
+							ok: false,
+							message: "No git storage found — nothing to rebuild.",
+						};
+					}
+
+					const oldKbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
+					const newKbRoot = findFreshKBPath(repoName, customKBPath);
+					initializeKBFolder(newKbRoot, repoName, remoteUrl);
+
+					const newMm = new MetadataManager(join(newKbRoot, ".jolli"));
+					const folder = new FolderStorage(newKbRoot, newMm);
+					await folder.ensure();
+					const engine = new MigrationEngine(orphan, folder, newMm);
+					const result = await engine.runMigration();
+
+					// "Repoint": rewrite the old folder's identity so resolveKBPath()
+					// no longer reuses it. Content files are untouched.
+					if (oldKbRoot !== newKbRoot) {
+						try {
+							const oldMm = new MetadataManager(join(oldKbRoot, ".jolli"));
+							const oldCfg = oldMm.readConfig();
+							oldMm.saveConfig({
+								...oldCfg,
+								remoteUrl: undefined,
+								repoName: `${repoName}-archived-${Date.now()}`,
+							});
+						} catch (err) {
+							log.warn(
+								"rebuildKnowledgeBase",
+								`failed to archive old KB identity at ${oldKbRoot}`,
+								err,
+							);
+						}
+					}
+
+					const moved = await refreshSidebarKbRoot();
+					if (moved) sidebarProvider.refreshKnowledgeBaseFolders(kbRepoFolder);
+
+					if (result.status === "completed") {
+						return {
+							ok: true,
+							message: `${result.migratedEntries} memories migrated to ${newKbRoot}`,
+						};
+					}
+					return {
+						ok: false,
+						message: `Rebuild ${result.status}: ${result.migratedEntries}/${result.totalEntries} entries (${newKbRoot})`,
+					};
+				} catch (err) {
+					return {
+						ok: false,
+						message: (err as Error).message,
+					};
 				}
 			},
 		),
@@ -1056,7 +1192,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					//   2. Then Promise.all pulls fresh data into all stores.
 					// Serializing these two phases trades a small amount of
 					// latency for correctness.
-					await refreshStatusBar(
+					const status = await refreshStatusBar(
 						bridge,
 						memoriesStore,
 						plansStore,
@@ -1064,6 +1200,8 @@ export function activate(context: vscode.ExtensionContext): void {
 						commitsStore,
 						statusBar,
 					);
+					currentEnabled = status.enabled;
+					sidebarProvider.notifyEnabledChanged(status.enabled);
 					// Memories is normally lazy-loaded: the initialLoad path and
 					// cross-panel watchers gate on `memoriesStore.hasFirstLoaded()`
 					// so passive triggers don't fetch listSummaryEntries before
@@ -1095,7 +1233,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				} else {
 					log.info("cmd", "disable succeeded");
 					await statusStore.refresh();
-					await refreshStatusBar(
+					const status = await refreshStatusBar(
 						bridge,
 						memoriesStore,
 						plansStore,
@@ -1103,12 +1241,14 @@ export function activate(context: vscode.ExtensionContext): void {
 						commitsStore,
 						statusBar,
 					);
+					currentEnabled = status.enabled;
+					sidebarProvider.notifyEnabledChanged(status.enabled);
 				}
 			},
 		),
 
 		vscode.commands.registerCommand("jollimemory.focusSidebar", () => {
-			vscode.commands.executeCommand("jollimemory.memoriesView.focus");
+			vscode.commands.executeCommand("jollimemory.mainView.focus");
 		}),
 
 		// Files panel
@@ -1365,9 +1505,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		vscode.commands.registerCommand(
 			"jollimemory.removePlan",
-			async (item: PlanItem) => {
-				log.info("cmd", `removePlan invoked: ${item.plan.slug}`);
-				await bridge.removePlan(item.plan.slug);
+			async (itemOrSlug: PlanItem | string) => {
+				const slug =
+					typeof itemOrSlug === "string" ? itemOrSlug : itemOrSlug.plan.slug;
+				log.info("cmd", `removePlan invoked: ${slug}`);
+				await bridge.removePlan(slug);
 				await plansStore.refresh();
 			},
 		),
@@ -1444,11 +1586,76 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
+		// ── Sidebar row-click preview commands ──────────────────────────────────
+		// These differ from `editPlan` / `editNote` (used by the row's ✎ inline
+		// button) which open the source file in an editor. They also differ
+		// from `previewNote` (used by Summary panel) which only reads from the
+		// orphan branch — a "snapshot at commit time" semantic. Sidebar wants
+		// "current state" instead: prefer the local file (latest draft); fall
+		// back to the orphan branch when only a committed copy exists.
+		vscode.commands.registerCommand(
+			"jollimemory.openPlanForPreview",
+			async (slug: string) => {
+				log.info("cmd", `openPlanForPreview: ${slug}`);
+				// Look up plan info to know whether a committed snapshot exists.
+				// PlansStore already holds the latest snapshot; no need to ask
+				// the bridge.
+				const snap = plansStore.getSnapshot();
+				const plan = snap.merged.find(
+					(e) => e.kind === "plan" && e.plan.slug === slug,
+				);
+				const planTitle = plan && plan.kind === "plan" ? plan.plan.title : slug;
+				const localPath = join(homedir(), ".claude", "plans", `${slug}.md`);
+				if (existsSync(localPath)) {
+					await vscode.commands.executeCommand(
+						"markdown.showPreview",
+						vscode.Uri.file(localPath),
+					);
+					return;
+				}
+				// No local file → fall back to the orphan-branch snapshot.
+				await showPlanPreview(slug, planTitle);
+			},
+		),
+
+		vscode.commands.registerCommand(
+			"jollimemory.openNoteForPreview",
+			async (noteId: string) => {
+				log.info("cmd", `openNoteForPreview: ${noteId}`);
+				const notes = await bridge.listNotes();
+				const note = notes.find((n) => n.id === noteId);
+				if (!note) {
+					return;
+				}
+				if (note.filePath && existsSync(note.filePath)) {
+					// Markdown notes preview natively; snippets (plain text in a
+					// .md or other extension) render as plain text inside the
+					// markdown preview, which is acceptable for read-only viewing.
+					await vscode.commands.executeCommand(
+						"markdown.showPreview",
+						vscode.Uri.file(note.filePath),
+					);
+					return;
+				}
+				if (note.commitHash) {
+					// Local file gone but a committed snapshot exists — read the
+					// orphan-branch copy. Reuses the Summary-side preview helper.
+					await showNotePreview(noteId, note.title);
+					return;
+				}
+				vscode.window.showInformationMessage(
+					`Note "${note.title}" has no readable content.`,
+				);
+			},
+		),
+
 		vscode.commands.registerCommand(
 			"jollimemory.removeNote",
-			async (item: NoteItem) => {
-				log.info("cmd", `removeNote invoked: ${item.note.id}`);
-				await bridge.removeNote(item.note.id);
+			async (itemOrId: NoteItem | string) => {
+				const noteId =
+					typeof itemOrId === "string" ? itemOrId : itemOrId.note.id;
+				log.info("cmd", `removeNote invoked: ${noteId}`);
+				await bridge.removeNote(noteId);
 				await plansStore.refresh();
 			},
 		),
@@ -1521,6 +1728,48 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
+		// Opens an arbitrary kbRoot-relative file in the editor, dispatched from the
+		// sidebar's KB folder tree. Markdown files whose frontmatter identifies a
+		// commit summary (`type: commit` + `commitHash:`) open in the rich KB
+		// SummaryWebviewPanel — same UI as the Memories tab gets — so users keep
+		// access to push, copy-as-recall-prompt, and the structured commit view.
+		// Plain markdown (plans, notes, user-dropped files) falls back to the
+		// built-in Markdown preview; non-`.md` files delegate to `vscode.open`.
+		// Non-string / empty paths are ignored so the sidebar can post bad
+		// payloads safely.
+		vscode.commands.registerCommand(
+			"jollimemory.openMemoryFile",
+			async (absPath: string) => {
+				if (typeof absPath !== "string" || absPath.length === 0) return;
+				const uri = vscode.Uri.file(absPath);
+				if (!absPath.toLowerCase().endsWith(".md")) {
+					await vscode.commands.executeCommand("vscode.open", uri);
+					return;
+				}
+				const meta = parseSummaryFrontmatter(absPath);
+				if (meta) {
+					const summary = await bridge.getSummary(meta.commitHash);
+					if (summary) {
+						await SummaryWebviewPanel.show(
+							summary,
+							context.extensionUri,
+							workspaceRoot,
+							"kb",
+						);
+						return;
+					}
+					// Frontmatter looked like a summary but the bridge couldn't
+					// load it — fall through to markdown preview rather than
+					// silently failing.
+					log.warn(
+						"cmd",
+						`openMemoryFile: frontmatter for ${absPath} references commit ${meta.commitHash} but no summary found; falling back to markdown preview`,
+					);
+				}
+				await vscode.commands.executeCommand("markdown.showPreview", uri);
+			},
+		),
+
 		// Accepts either a CommitItem or a plain hash string (from tooltip command link).
 		vscode.commands.registerCommand(
 			"jollimemory.copyCommitHash",
@@ -1540,27 +1789,17 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		// ── Memories panel commands ──────────────────────────────────────────
 
-		vscode.commands.registerCommand("jollimemory.exportMemories", () => {
-			log.info("cmd", "exportMemories invoked");
-			// ExportMemoriesCommand.execute() handles its own errors (logs + user-facing toast)
-			// and never rejects, so no .catch is needed.
-			exportMemoriesCommand.execute();
-		}),
-
 		vscode.commands.registerCommand("jollimemory.refreshMemories", () => {
 			memoriesStore.refresh().catch(handleError("refreshMemories"));
 		}),
 
-		vscode.commands.registerCommand("jollimemory.searchMemories", async () => {
-			const input = await vscode.window.showInputBox({
-				prompt: "Filter memories by commit message or branch name",
-				placeHolder: "e.g. biome, auth, PROJ-280...",
-				value: memoriesStore.getFilter(),
-			});
-			if (input !== undefined) {
-				await memoriesStore.setFilter(input);
-			}
-		}),
+		vscode.commands.registerCommand(
+			"jollimemory.searchMemories",
+			async (query?: unknown) => {
+				const filter = typeof query === "string" ? query : "";
+				await memoriesStore.setFilter(filter);
+			},
+		),
 
 		vscode.commands.registerCommand("jollimemory.clearMemoryFilter", () => {
 			memoriesStore.setFilter("").catch(handleError("clearMemoryFilter"));
@@ -1624,7 +1863,17 @@ export function activate(context: vscode.ExtensionContext): void {
 					try {
 						await excludeFilter.load();
 						filesStore.applyExcludeFilterChange();
+						// storageMode / localFolder may have changed — recreate the
+						// bridge's storage backend so subsequent reads (sidebar
+						// memories, summary panels) hit the new mode/path without
+						// requiring a window reload.
+						bridge.reloadStorage();
 						await statusStore.refresh();
+						// Re-resolve the sidebar's KB root in case the user changed
+						// "Local Folder". When it moves, drop the cached folder tree
+						// so the next listing reads from the new path.
+						const moved = await refreshSidebarKbRoot();
+						if (moved) sidebarProvider.refreshKnowledgeBaseFolders();
 					} catch (err) {
 						handleError("openSettings.save")(err as Error);
 					}
@@ -1640,7 +1889,22 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		vscode.commands.registerCommand("jollimemory.signOut", async () => {
 			log.info("cmd", "signOut invoked");
+			const choice = await vscode.window.showWarningMessage(
+				"Sign out of Jolli?",
+				{
+					modal: true,
+					detail:
+						"This clears your local Jolli credentials and API key. You'll need to sign in again through your browser to push memories.",
+				},
+				"Sign Out",
+			);
+			if (choice !== "Sign Out") {
+				log.info("cmd", "signOut cancelled by user");
+				return;
+			}
 			await authService.signOut();
+			currentAuthenticated = false;
+			sidebarProvider.notifyAuthChanged(false);
 			statusStore.refresh().catch(handleError("signOut.refresh"));
 		}),
 	);
@@ -1667,6 +1931,8 @@ export function activate(context: vscode.ExtensionContext): void {
 				);
 				const result = await authService.handleAuthCallback(uri);
 				if (result.success) {
+					currentAuthenticated = true;
+					sidebarProvider.notifyAuthChanged(true);
 					vscode.window.showInformationMessage(
 						"Signed in to Jolli successfully.",
 					);
@@ -1680,51 +1946,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		}),
 	);
 
-	// Handle file checkbox toggle from the tree view (pure in-memory — no git ops).
-	// The store broadcasts with changeReason="userCheckbox" so the TreeView
-	// provider skips fire (avoiding flicker + focus-border jump).  The badge
-	// subscription above runs on every store change and picks up the new state.
-	// refreshStatusBar is intentionally omitted — checkbox toggles do not change
-	// the enabled/disabled state, so re-querying status would only cause needless
-	// tree rebuilds in sibling panels.
-	filesView.onDidChangeCheckboxState((e) => {
-		const items = e.items.map(
-			([item, state]) =>
-				[
-					(item as FileItem).fileStatus.relativePath,
-					state === vscode.TreeItemCheckboxState.Checked,
-				] as const,
-		);
-		filesStore.applyCheckboxBatch(items);
-	});
-
-	// Handle commit checkbox toggle from the tree view.
-	// Guard: only process CommitItem nodes (which have a `commit` property).
-	// CommitFileItem nodes have no checkboxes but could theoretically arrive here.
-	historyView.onDidChangeCheckboxState((e) => {
-		for (const [item, state] of e.items) {
-			if ("commit" in item && item.commit) {
-				commitsStore.onCheckboxToggle(
-					(item as CommitItem).commit.hash,
-					state === vscode.TreeItemCheckboxState.Checked,
-				);
-			}
-		}
-	});
-
-	// ── Memories panel: lazy-load on first visibility ─────────────────────────
-	// Defer orphan-branch index read until the panel is actually visible.
-	// This keeps the activation critical path fast (~0ms overhead).
-	// `ensureFirstLoad()` is idempotent so multiple visibility events are safe,
-	// and cross-panel watchers (orphanRef / lock) gate on `hasFirstLoaded()` so
-	// they do not wake the panel behind the user's back.
-	memoriesView.onDidChangeVisibility((e) => {
-		if (e.visible) {
-			memoriesStore
-				.ensureFirstLoad()
-				.catch(handleError("memoriesView.lazyLoad"));
-		}
-	});
+	// Tree-view checkbox / visibility handlers were dropped along with the tree
+	// views. Equivalent hooks now live in the sidebar wiring above:
+	// - File checkbox: `applyFileCheckbox` callback on the SidebarWebviewProvider
+	// - Commit checkbox: handled via the sidebar's per-row commit messages
+	// - Memories lazy-load: `onSidebarFirstVisible` triggers ensureFirstLoad()
 
 	// ── Initial data load ────────────────────────────────────────────────────
 	initialLoad(
@@ -1868,7 +2094,7 @@ async function refreshStatusBar(
 	filesStore: FilesStore,
 	commitsStore: CommitsStore,
 	statusBar: StatusBarManager,
-): Promise<void> {
+): Promise<StatusInfo> {
 	const status = await bridge.getStatus();
 
 	statusBar.update(status.enabled);
@@ -1886,6 +2112,8 @@ async function refreshStatusBar(
 		"jollimemory.enabled",
 		status.enabled,
 	);
+
+	return status;
 }
 
 /**

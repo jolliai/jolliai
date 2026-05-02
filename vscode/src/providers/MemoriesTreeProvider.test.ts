@@ -129,6 +129,8 @@ function makeMemoriesProvider(bridge: unknown) {
 		setFilter: (text: string) => store.setFilter(text),
 		getFilter: () => store.getFilter(),
 		setEnabled: (enabled: boolean) => store.setEnabled(enabled),
+		serialize: () =>
+			(provider as unknown as { serialize: () => unknown }).serialize(),
 	};
 }
 
@@ -159,6 +161,7 @@ function makeBridge(
 	totalCount?: number,
 ) {
 	return {
+		cwd: "/home/user/test-project",
 		listSummaryEntries: vi.fn(
 			(count: number, _offset?: number, filter?: string) => {
 				let result = entries;
@@ -609,4 +612,297 @@ describe("MemoriesTreeProvider", () => {
 
 	// view.description is now computed by MemoriesDataService.buildDescription
 	// and owned by Extension.ts — see MemoriesDataService.test.ts for coverage.
+});
+
+// ── MemoriesTreeProvider.serialize ──────────────────────────────────────────
+
+describe("MemoriesTreeProvider.serialize", () => {
+	it("returns MemoryItem[] with id, title, hash, branch, project, timestamp", async () => {
+		const entries = [
+			makeEntry({
+				commitHash: "aaaa",
+				commitMessage: "First commit",
+				commitDate: "2026-04-08T12:00:00.000Z",
+				branch: "main",
+			}),
+			makeEntry({
+				commitHash: "bbbb",
+				commitMessage: "Second commit",
+				commitDate: "2026-04-09T12:00:00.000Z",
+				branch: "feature/test",
+			}),
+		];
+		const bridge = makeBridge(entries);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => {
+					items: Array<{
+						id: string;
+						title: string;
+						commitHash: string;
+						branch: string;
+						project: string;
+						timestamp: number;
+					}>;
+					hasMore: boolean;
+				};
+			}
+		).serialize();
+
+		expect(result.items).toHaveLength(2);
+		expect(result.items[0]).toMatchObject({
+			id: expect.any(String),
+			title: expect.any(String),
+			commitHash: expect.any(String),
+			branch: expect.any(String),
+			project: expect.any(String),
+			timestamp: expect.any(Number),
+		});
+		expect(result.hasMore).toBe(false);
+	});
+
+	it("returns hasMore=true when totalCount exceeds entries.length", async () => {
+		const entries = [makeEntry()];
+		const bridge = makeBridge(entries, 20); // totalCount > entries.length
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => { items: unknown[]; hasMore: boolean };
+			}
+		).serialize();
+
+		expect(result.hasMore).toBe(true);
+	});
+
+	it("sorts items time-desc (newest first)", async () => {
+		const entries = [
+			makeEntry({
+				commitHash: "aaaa",
+				commitMessage: "Old commit",
+				commitDate: "2026-04-08T12:00:00.000Z",
+			}),
+			makeEntry({
+				commitHash: "bbbb",
+				commitMessage: "Newer commit",
+				commitDate: "2026-04-09T12:00:00.000Z",
+			}),
+		];
+		const bridge = makeBridge(entries);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => {
+					items: Array<{ timestamp: number }>;
+					hasMore: boolean;
+				};
+			}
+		).serialize();
+
+		expect(result.items).toHaveLength(2);
+		expect(result.items[0].timestamp).toBeGreaterThan(
+			result.items[1].timestamp,
+		);
+	});
+
+	it("includes correct id prefix in serialized items", async () => {
+		const entries = [makeEntry({ commitHash: "abc123" })];
+		const bridge = makeBridge(entries);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => { items: Array<{ id: string }> };
+			}
+		).serialize();
+
+		expect(result.items[0].id).toMatch(/^memory-/);
+		expect(result.items[0].id).toContain("abc123");
+	});
+
+	it("converts commitDate to timestamp in milliseconds", async () => {
+		const dateStr = "2026-04-08T12:00:00.000Z";
+		const expectedMs = Date.parse(dateStr);
+		const entries = [
+			makeEntry({
+				commitHash: "aaaa",
+				commitDate: dateStr,
+			}),
+		];
+		const bridge = makeBridge(entries);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => { items: Array<{ timestamp: number }> };
+			}
+		).serialize();
+
+		expect(result.items[0].timestamp).toBe(expectedMs);
+	});
+
+	it("returns empty items array when no entries loaded", async () => {
+		const bridge = makeBridge([]);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => { items: unknown[]; hasMore: boolean };
+			}
+		).serialize();
+
+		expect(result.items).toHaveLength(0);
+		expect(result.hasMore).toBe(false);
+	});
+
+	it("dispose() runs unsubscribe and disposes the change emitter exactly once", () => {
+		const bridge = makeBridge([]);
+		const provider = makeMemoriesProvider(bridge as never);
+		// dispose() must invoke the store-onChange unsubscribe and the internal
+		// _onDidChangeTreeData emitter — leaking either would keep the provider
+		// live after the extension deactivates.
+		expect(() => provider.dispose()).not.toThrow();
+		expect(provider._onDidChangeTreeData.dispose).toHaveBeenCalledTimes(1);
+	});
+
+	// The hover / plain-text tooltip helpers in serialize cover a large set of
+	// stat-line shape branches (singular/plural, missing diffStats, zero
+	// counts, missing commitType, missing topicCount). They're only reachable
+	// via serialize() — getChildren() returns TreeItems whose tooltip uses the
+	// rich MarkdownString variant, not these.
+
+	it("serialize() emits structured hover with full stats line for an entry that has every field", async () => {
+		const entries = [
+			makeEntry({
+				commitHash: "abcdef1234567890",
+				topicCount: 2,
+				diffStats: { filesChanged: 3, insertions: 4, deletions: 5 },
+				commitType: "amend" as never,
+			}),
+		];
+		const bridge = makeBridge(entries);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => {
+					items: Array<{
+						tooltip: string;
+						hover: {
+							statsLine?: string;
+							commitType?: string;
+							shortHash: string;
+						};
+					}>;
+				};
+			}
+		).serialize();
+
+		// Hover side: full, comma-joined stats line and the commitType bubble.
+		expect(result.items[0].hover.statsLine).toBe(
+			"2 topics, 3 files changed, 4 insertions(+), 5 deletions(-)",
+		);
+		expect(result.items[0].hover.commitType).toBe("amend");
+		expect(result.items[0].hover.shortHash).toBe("abcdef12");
+		// Plain-text variant still includes commitType as its own line.
+		expect(result.items[0].tooltip).toContain("amend");
+		expect(result.items[0].tooltip).toContain("commit: abcdef12");
+		expect(result.items[0].tooltip).toContain("+4");
+		expect(result.items[0].tooltip).toContain("-5");
+	});
+
+	it("serialize() drops the stats line entirely when topicCount is zero and diffStats is absent", async () => {
+		const entries = [
+			makeEntry({
+				topicCount: undefined,
+				diffStats: undefined,
+				commitType: undefined,
+			}),
+		];
+		const bridge = makeBridge(entries);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => {
+					items: Array<{
+						tooltip: string;
+						hover: { statsLine?: string; commitType?: string };
+					}>;
+				};
+			}
+		).serialize();
+
+		// Hover: statsLine is undefined when stats is empty.
+		expect(result.items[0].hover.statsLine).toBeUndefined();
+		// And commitType is undefined when the entry doesn't have one.
+		expect(result.items[0].hover.commitType).toBeUndefined();
+		// Plain-text tooltip's stats fragment is just the bare commit hash.
+		expect(result.items[0].tooltip).toMatch(/commit: [0-9a-f]{8}$/m);
+	});
+
+	it("serialize() uses singular forms for topicCount=1, filesChanged=1, insertions=1, deletions=1", async () => {
+		const entries = [
+			makeEntry({
+				topicCount: 1,
+				diffStats: { filesChanged: 1, insertions: 1, deletions: 1 },
+			}),
+		];
+		const bridge = makeBridge(entries);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => {
+					items: Array<{ tooltip: string; hover: { statsLine?: string } }>;
+				};
+			}
+		).serialize();
+
+		// Both representations should agree on the singular forms.
+		expect(result.items[0].hover.statsLine).toBe(
+			"1 topic, 1 file changed, 1 insertion(+), 1 deletion(-)",
+		);
+		expect(result.items[0].tooltip).toContain("1 topic,");
+		expect(result.items[0].tooltip).toContain("1 file changed");
+		expect(result.items[0].tooltip).toContain("+1");
+		expect(result.items[0].tooltip).toContain("-1");
+	});
+
+	it("serialize() omits the zero-count parts of the stats line", async () => {
+		const entries = [
+			makeEntry({
+				topicCount: 0,
+				diffStats: { filesChanged: 4, insertions: 0, deletions: 0 },
+			}),
+		];
+		const bridge = makeBridge(entries);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => {
+					items: Array<{ tooltip: string; hover: { statsLine?: string } }>;
+				};
+			}
+		).serialize();
+
+		// Stats line carries only the file-change count.
+		expect(result.items[0].hover.statsLine).toBe("4 files changed");
+		expect(result.items[0].tooltip).not.toContain("insertion");
+		expect(result.items[0].tooltip).not.toContain("deletion");
+	});
 });

@@ -81,6 +81,7 @@ function makeStatusProvider(bridge: unknown, authService?: unknown) {
 		__store: store,
 		getTreeItem: provider.getTreeItem.bind(provider),
 		getChildren: provider.getChildren.bind(provider),
+		serialize: provider.serialize.bind(provider),
 		onDidChangeTreeData: provider.onDidChangeTreeData,
 		dispose: () => provider.dispose(),
 		refresh: () => store.refresh(),
@@ -674,5 +675,64 @@ describe("StatusTreeProvider", () => {
 		expect(
 			items.find((item) => item.label === "Gemini Integration"),
 		).toBeUndefined();
+	});
+
+	describe("StatusTreeProvider.serialize", () => {
+		it("returns [] when status is disabled", () => {
+			const provider = makeStatusProvider({
+				cwd: "/repo",
+				getStatus: vi.fn(),
+			} as never);
+			provider.setStatus(makeStatus({ enabled: false }) as never);
+			expect(provider.serialize()).toEqual([]);
+		});
+
+		it("returns a single 'Migrating memories...' entry when migrating", () => {
+			const provider = makeStatusProvider({
+				cwd: "/repo",
+				getStatus: vi.fn(),
+			} as never);
+			provider.setMigrating(true);
+			const out = provider.serialize();
+			expect(out).toHaveLength(1);
+			expect(out[0].label).toBe("Migrating memories...");
+			expect(out[0].iconKey).toBe("loading~spin");
+		});
+
+		it("serializes a Hooks entry with description and tooltip", async () => {
+			const bridge = {
+				cwd: "/repo",
+				getStatus: vi.fn(async () =>
+					makeStatus({ gitHookInstalled: true, claudeHookInstalled: true }),
+				),
+			};
+			loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+			const provider = makeStatusProvider(bridge as never);
+			await provider.refresh();
+
+			const out = provider.serialize();
+			const hooks = out.find((e) => e.label === "Hooks");
+			expect(hooks).toBeDefined();
+			expect(hooks?.iconKey).toBe("check");
+			expect(hooks?.iconColor).toBe("charts.green");
+			expect(hooks?.description).toContain("Git");
+			expect(hooks?.tooltip).toContain("Git hooks");
+		});
+
+		it("includes a click command on the API key warning row", async () => {
+			const bridge = {
+				cwd: "/repo",
+				getStatus: vi.fn(async () => makeStatus()),
+			};
+			loadConfigFromDir.mockResolvedValue({ apiKey: undefined });
+
+			const provider = makeStatusProvider(bridge as never);
+			await provider.refresh();
+
+			const out = provider.serialize();
+			const apiKey = out.find((e) => e.label === "Anthropic API Key");
+			expect(apiKey?.command?.command).toBe("jollimemory.openSettings");
+		});
 	});
 });

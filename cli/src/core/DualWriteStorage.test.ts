@@ -147,4 +147,144 @@ describe("DualWriteStorage", () => {
 		const dual = new DualWriteStorage(primary, shadow);
 		expect(await dual.listFiles("dir/")).toHaveLength(2);
 	});
+
+	it("exists reflects the primary backend", async () => {
+		const primary = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn().mockResolvedValue(false),
+			ensure: vi.fn(),
+		} as unknown as StorageProvider;
+		const shadow = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn().mockResolvedValue(true),
+			ensure: vi.fn(),
+		} as unknown as StorageProvider;
+
+		const dual = new DualWriteStorage(primary, shadow);
+		expect(await dual.exists()).toBe(false);
+		expect(primary.exists).toHaveBeenCalled();
+		expect(shadow.exists).not.toHaveBeenCalled();
+	});
+
+	it("ensure runs both backends when shadow succeeds", async () => {
+		const primaryEnsure = vi.fn();
+		const shadowEnsure = vi.fn();
+		const primary = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn(),
+			ensure: primaryEnsure,
+		} as unknown as StorageProvider;
+		const shadow = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn(),
+			ensure: shadowEnsure,
+		} as unknown as StorageProvider;
+
+		const dual = new DualWriteStorage(primary, shadow);
+		await dual.ensure();
+		expect(primaryEnsure).toHaveBeenCalled();
+		expect(shadowEnsure).toHaveBeenCalled();
+	});
+
+	it("ensure swallows shadow failures", async () => {
+		const primary = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn(),
+			ensure: vi.fn().mockResolvedValue(undefined),
+		} as unknown as StorageProvider;
+		const shadow = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn(),
+			ensure: vi.fn().mockRejectedValue(new Error("shadow ensure broken")),
+		} as unknown as StorageProvider;
+
+		const dual = new DualWriteStorage(primary, shadow);
+		await expect(dual.ensure()).resolves.toBeUndefined();
+	});
+
+	it("ensure swallows shadow failure raised as a non-Error value", async () => {
+		const primary = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn(),
+			ensure: vi.fn().mockResolvedValue(undefined),
+		} as unknown as StorageProvider;
+		const shadow = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn(),
+			ensure: vi.fn().mockRejectedValue("ensure boom"),
+		} as unknown as StorageProvider;
+
+		const dual = new DualWriteStorage(primary, shadow);
+		await expect(dual.ensure()).resolves.toBeUndefined();
+	});
+
+	it("marks shadow dirty and skips clearDirty when shadow write fails", async () => {
+		const primary = new InMemoryStorage();
+		const markDirty = vi.fn();
+		const clearDirty = vi.fn();
+		const shadow = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn().mockRejectedValue(new Error("disk full")),
+			listFiles: vi.fn(),
+			exists: vi.fn().mockResolvedValue(true),
+			ensure: vi.fn(),
+			markDirty,
+			clearDirty,
+		} as unknown as StorageProvider;
+
+		const dual = new DualWriteStorage(primary, shadow);
+		await dual.writeFiles([{ path: "ok.txt", content: "data" }], "write");
+		expect(markDirty).toHaveBeenCalledWith("write");
+		expect(clearDirty).not.toHaveBeenCalled();
+	});
+
+	it("clears dirty marker after a successful shadow write", async () => {
+		const primary = new InMemoryStorage();
+		const markDirty = vi.fn();
+		const clearDirty = vi.fn();
+		const shadow = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn().mockResolvedValue(undefined),
+			listFiles: vi.fn(),
+			exists: vi.fn().mockResolvedValue(true),
+			ensure: vi.fn(),
+			markDirty,
+			clearDirty,
+		} as unknown as StorageProvider;
+
+		const dual = new DualWriteStorage(primary, shadow);
+		await dual.writeFiles([{ path: "ok.txt", content: "data" }], "write");
+		expect(clearDirty).toHaveBeenCalled();
+		expect(markDirty).not.toHaveBeenCalled();
+	});
+
+	it("logs a non-Error shadow write failure via String(err)", async () => {
+		const primary = new InMemoryStorage();
+		const shadow = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn().mockRejectedValue("string failure"),
+			listFiles: vi.fn(),
+			exists: vi.fn().mockResolvedValue(true),
+			ensure: vi.fn(),
+		} as unknown as StorageProvider;
+
+		const dual = new DualWriteStorage(primary, shadow);
+		await expect(dual.writeFiles([{ path: "ok.txt", content: "data" }], "write")).resolves.toBeUndefined();
+	});
 });

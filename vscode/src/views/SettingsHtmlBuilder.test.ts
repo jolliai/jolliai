@@ -76,25 +76,24 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('id="integrations-error"');
 	});
 
-	it("contains Local Memories section with localFolder input and Browse button", () => {
-		expect(html).toContain("Local Memories");
+	it("contains Local Memory Bank section with localFolder input and Browse button", () => {
+		expect(html).toContain("Local Memory Bank");
 		expect(html).toContain('id="localFolder"');
 		expect(html).toContain("readonly");
 		expect(html).toContain('id="browseLocalFolderBtn"');
 		expect(html).toContain("Browse");
 	});
 
-	it("contains push action radio buttons", () => {
-		expect(html).toContain('id="pushActionJolli"');
-		expect(html).toContain('id="pushActionBoth"');
-		expect(html).toContain('value="jolli"');
-		expect(html).toContain('value="both"');
-		expect(html).toContain("Push to Jolli only");
-		expect(html).toContain("Push to Jolli &amp; Local");
+	it("contains Migrate to Memory Bank button", () => {
+		expect(html).toContain('id="rebuildKbBtn"');
+		expect(html).toContain("Migrate to Memory Bank");
+		expect(html).toContain('id="rebuildKbStatus"');
 	});
 
-	it("contains Default Push Action legend", () => {
-		expect(html).toContain("Default Push Action");
-		expect(html).toContain('id="pushActionBothHint"');
+	it("no longer contains the Default Push Action UI (removed)", () => {
+		expect(html).not.toContain("Default Push Action");
+		expect(html).not.toContain('id="pushActionJolli"');
+		expect(html).not.toContain('id="pushActionBoth"');
+		expect(html).not.toContain("Push to Jolli only");
 	});
 });

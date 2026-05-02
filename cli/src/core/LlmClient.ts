@@ -29,6 +29,31 @@ function getOrCreateClient(apiKey: string): Anthropic {
 const log = createLogger("LlmClient");
 
 /**
+ * Flattens an Error's `cause` chain into a single line for logging.
+ *
+ * Node's undici fetch wraps transport-layer failures in a TypeError("fetch failed")
+ * and stashes the actual reason (DNS, TLS, ECONNREFUSED, ETIMEDOUT, ECONNRESET, ...)
+ * in `error.cause`, sometimes nested two levels deep. Logging only `error.message`
+ * leaves operators with "fetch failed" and no way to diagnose. This helper extracts
+ * Node syscall fields (code/errno/syscall/hostname/address/port) plus name/message,
+ * and recurses when the cause itself has a cause.
+ */
+function formatCause(cause: unknown): string {
+	if (cause == null) return "(none)";
+	if (!(cause instanceof Error)) return String(cause);
+	const fields: string[] = [];
+	if (cause.name && cause.name !== "Error") fields.push(`name=${cause.name}`);
+	if (cause.message) fields.push(`message=${cause.message}`);
+	for (const key of ["code", "errno", "syscall", "hostname", "address", "port"] as const) {
+		const value = (cause as unknown as Record<string, unknown>)[key];
+		if (value !== undefined) fields.push(`${key}=${String(value)}`);
+	}
+	const inner = (cause as { cause?: unknown }).cause;
+	if (inner !== undefined) fields.push(`cause=[${formatCause(inner)}]`);
+	return fields.join(" ") || "(empty)";
+}
+
+/**
  * Backend route path for LLM proxy requests.
  * Must stay in sync with the route mounted in backend/src/router/LlmProxyRouter.ts.
  */
@@ -156,9 +181,19 @@ async function callDirect(options: LlmCallOptions, apiKey: string): Promise<LlmC
 	} catch (err) {
 		// Surface the effective baseURL so users can tell whether a 3rd-party relay
 		// (e.g. an ANTHROPIC_BASE_URL override) returned the error versus Anthropic itself.
+		// Also surface error.cause: undici wraps transport-layer reasons (DNS, TLS,
+		// ECONNREFUSED, ECONNRESET, ETIMEDOUT) inside `cause`, so logging only the
+		// outer message leaves "fetch failed" with no diagnostic information.
 		const baseUrl = client.baseURL;
 		const message = err instanceof Error ? err.message : String(err);
-		log.error("Direct LLM call failed: action=%s baseUrl=%s error=%s", options.action, baseUrl, message);
+		const cause = err instanceof Error ? formatCause((err as { cause?: unknown }).cause) : "(non-error)";
+		log.error(
+			"Direct LLM call failed: action=%s baseUrl=%s error=%s cause=%s",
+			options.action,
+			baseUrl,
+			message,
+			cause,
+		);
 		throw new Error(`LLM direct request to ${baseUrl} failed: ${message}`);
 	}
 
@@ -218,16 +253,27 @@ async function callProxy(options: LlmCallOptions, baseUrl: string): Promise<LlmC
 
 	const startTime = Date.now();
 
-	const response = await fetch(url, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${jolliApiKey}`,
-			...(tenantSlug ? { "x-tenant-slug": tenantSlug } : {}),
-			...(orgSlug ? { "x-org-slug": orgSlug } : {}),
-		},
-		body,
-	});
+	let response: Response;
+	try {
+		response = await fetch(url, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${jolliApiKey}`,
+				...(tenantSlug ? { "x-tenant-slug": tenantSlug } : {}),
+				...(orgSlug ? { "x-org-slug": orgSlug } : {}),
+			},
+			body,
+		});
+	} catch (err) {
+		// Transport-layer failure (DNS, TLS handshake, connect, reset, timeout).
+		// undici wraps the real reason in `cause` — without surfacing it the log
+		// is just "fetch failed" and the operator has no way to diagnose.
+		const message = err instanceof Error ? err.message : String(err);
+		const cause = err instanceof Error ? formatCause((err as { cause?: unknown }).cause) : "(non-error)";
+		log.error("Proxy LLM fetch failed: action=%s url=%s error=%s cause=%s", options.action, url, message, cause);
+		throw err;
+	}
 	const elapsed = Date.now() - startTime;
 
 	if (!response.ok) {

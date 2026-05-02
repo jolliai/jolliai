@@ -43,3 +43,7 @@ Thumbs.db
 **/coverage/
 **/node_modules/
 **/*.vsix
+.superpowers/
+
+# Generated codicon assets (copied from node_modules at build time)
+vscode/assets/codicons/

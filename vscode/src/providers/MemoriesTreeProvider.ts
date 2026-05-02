@@ -22,6 +22,7 @@ import {
 	formatRelativeDate,
 	formatShortRelativeDate,
 } from "../util/FormatUtils.js";
+import type { MemoryItem as MemoryItemMessage } from "../views/SidebarMessages.js";
 
 const EMPTY_CONTEXT = "jollimemory.memories.empty";
 const HAS_FILTER_CONTEXT = "jollimemory.memories.hasFilter";
@@ -30,6 +31,68 @@ const HAS_FILTER_CONTEXT = "jollimemory.memories.hasFilter";
 
 function buildDescription(entry: SummaryIndexEntry): string {
 	return formatShortRelativeDate(getDisplayDate(entry));
+}
+
+// Plain-text variant of the rich MarkdownString tooltip — used by the webview
+// (HTML `title=` attributes don't render markdown, so codicon syntax `$(...)`
+// would surface as literal noise). Keep the same field order so the hover info
+// matches what the native tree view shows.
+// Structured-fields variant used by the webview's custom hover popup. The
+// popup renders codicons and command links itself, so we only need to ship
+// the display-ready strings here.
+function buildHoverFields(
+	entry: SummaryIndexEntry,
+): MemoryItemMessage["hover"] {
+	const stats: Array<string> = [];
+	const topicCount = entry.topicCount ?? 0;
+	if (topicCount > 0) {
+		stats.push(`${topicCount} topic${topicCount !== 1 ? "s" : ""}`);
+	}
+	if (entry.diffStats) {
+		const { insertions, deletions, filesChanged } = entry.diffStats;
+		stats.push(`${filesChanged} file${filesChanged !== 1 ? "s" : ""} changed`);
+		if (insertions > 0) {
+			stats.push(`${insertions} insertion${insertions !== 1 ? "s" : ""}(+)`);
+		}
+		if (deletions > 0) {
+			stats.push(`${deletions} deletion${deletions !== 1 ? "s" : ""}(-)`);
+		}
+	}
+	return {
+		message: entry.commitMessage,
+		relativeDate: formatRelativeDate(getDisplayDate(entry)),
+		commitType: entry.commitType,
+		branch: entry.branch,
+		statsLine: stats.length > 0 ? stats.join(", ") : undefined,
+		shortHash: entry.commitHash.substring(0, 8),
+	};
+}
+
+function buildPlainTextTooltip(entry: SummaryIndexEntry): string {
+	const lines: Array<string> = [];
+	lines.push(entry.commitMessage);
+	lines.push(formatRelativeDate(getDisplayDate(entry)));
+	if (entry.commitType) lines.push(entry.commitType);
+	lines.push(`branch: ${entry.branch}`);
+
+	const shortHash = entry.commitHash.substring(0, 8);
+	const stats: Array<string> = [`commit: ${shortHash}`];
+	const topicCount = entry.topicCount ?? 0;
+	if (topicCount > 0) {
+		stats.push(`${topicCount} topic${topicCount !== 1 ? "s" : ""}`);
+	}
+	if (entry.diffStats) {
+		const { insertions, deletions, filesChanged } = entry.diffStats;
+		stats.push(`${filesChanged} file${filesChanged !== 1 ? "s" : ""} changed`);
+		if (insertions > 0) {
+			stats.push(`+${insertions}`);
+		}
+		if (deletions > 0) {
+			stats.push(`-${deletions}`);
+		}
+	}
+	lines.push(stats.join(", "));
+	return lines.join("\n");
 }
 
 function buildTooltip(entry: SummaryIndexEntry): vscode.MarkdownString {
@@ -164,6 +227,30 @@ export class MemoriesTreeProvider
 			items.push(new LoadMoreItem());
 		}
 		return items;
+	}
+
+	serialize(): {
+		items: ReadonlyArray<MemoryItemMessage>;
+		hasMore: boolean;
+	} {
+		const snap = this.store.getSnapshot();
+		const items: MemoryItemMessage[] = snap.entries.map((e) => ({
+			id: `memory-${e.commitHash}`,
+			title: e.commitMessage,
+			commitHash: e.commitHash,
+			branch: e.branch,
+			// Project name is the basename of the git repo root (stored in bridge.cwd)
+			// We access it via the store's bridge property (which is private, so we use type assertion)
+			project:
+				(this.store as unknown as { bridge: { cwd: string } }).bridge.cwd
+					.split(/[/\\]/)
+					.pop() ?? "",
+			timestamp: Date.parse(e.commitDate),
+			tooltip: buildPlainTextTooltip(e),
+			hover: buildHoverFields(e),
+		}));
+		items.sort((a, b) => b.timestamp - a.timestamp);
+		return { items, hasMore: snap.totalCount > snap.entries.length };
 	}
 
 	dispose(): void {

@@ -99,7 +99,7 @@ const { buildClaudeCodeContext } = vi.hoisted(() => ({
 	buildClaudeCodeContext: vi.fn(() => "mock recall context"),
 }));
 
-const { execSync } = vi.hoisted(() => ({
+const { execSync, execFileSync } = vi.hoisted(() => ({
 	// Mock git rev-parse --git-path calls used by resolveGitPath() in Extension.ts.
 	// Returns realistic paths so HEAD and orphan-ref watchers are created in tests,
 	// preserving the createFileSystemWatcher mock call order.
@@ -113,6 +113,11 @@ const { execSync } = vi.hoisted(() => ({
 			);
 		}
 		throw new Error(`Unmocked exec: ${cmd}`);
+	}),
+	// Used by the no-git Initialize Git path. Default impl throws so unmocked
+	// calls fail loudly; the no-git tests override .mockImplementation per case.
+	execFileSync: vi.fn((bin: string, args: ReadonlyArray<string>) => {
+		throw new Error(`Unmocked execFile: ${bin} ${args.join(" ")}`);
 	}),
 }));
 
@@ -141,15 +146,11 @@ const {
 	MockPushCommand,
 	mockSquashCommand,
 	MockSquashCommand,
-	mockExportMemoriesCommand,
-	MockExportMemoriesCommand,
 	MockSummaryWebviewPanel,
 	MockSettingsWebviewPanel,
 	MockNoteEditorWebviewPanel,
 	mockAuthService,
 	MockAuthService,
-	mockKBProvider,
-	MockKnowledgeBaseTreeProvider,
 } = vi.hoisted(() => {
 	function makeMockProvider() {
 		return {
@@ -176,7 +177,11 @@ const {
 	const mockStatusProvider_ = makeMockProvider();
 	const mockPlansProvider_ = makeMockProvider();
 	const mockFilesProvider_ = makeMockProvider();
-	const mockHistoryProvider_ = makeMockProvider();
+	const mockHistoryProvider_ = {
+		...makeMockProvider(),
+		serialize: vi.fn().mockResolvedValue([]),
+		getMode: vi.fn(() => "empty" as const),
+	};
 	const mockMemoriesProvider_ = {
 		...makeMockProvider(),
 		setView: vi.fn(),
@@ -217,28 +222,19 @@ const {
 			.fn()
 			.mockResolvedValue({ entries: [], totalCount: 0 }),
 		invalidateEntriesCache: vi.fn(),
+		getCurrentBranch: vi.fn().mockResolvedValue("main"),
+		reloadStorage: vi.fn(),
 	};
 
 	const mockCommitCommand_ = { execute: vi.fn().mockResolvedValue(undefined) };
 	const mockPushCommand_ = { execute: vi.fn().mockResolvedValue(undefined) };
 	const mockSquashCommand_ = { execute: vi.fn().mockResolvedValue(undefined) };
-	const mockExportMemoriesCommand_ = {
-		execute: vi.fn().mockResolvedValue(undefined),
-	};
 	const mockAuthService_ = {
 		handleAuthCallback: vi.fn().mockResolvedValue({ success: true }),
 		signOut: vi.fn().mockResolvedValue(undefined),
 		openSignInPage: vi.fn(),
 		isSignedIn: vi.fn(() => false),
 		refreshContextKey: vi.fn(),
-	};
-
-	const mockKBProvider_ = {
-		refresh: vi.fn(),
-		setKBRoot: vi.fn(),
-		kbRoot: undefined as string | undefined,
-		dispose: vi.fn(),
-		onDidChangeTreeData: vi.fn(),
 	};
 
 	return {
@@ -286,10 +282,6 @@ const {
 		MockSquashCommand: vi.fn(function MockSquashCommand() {
 			return mockSquashCommand_;
 		}),
-		mockExportMemoriesCommand: mockExportMemoriesCommand_,
-		MockExportMemoriesCommand: vi.fn(function MockExportMemoriesCommand() {
-			return mockExportMemoriesCommand_;
-		}),
 		MockSummaryWebviewPanel: { show: vi.fn().mockResolvedValue(undefined) },
 		MockSettingsWebviewPanel: { show: vi.fn() },
 		MockNoteEditorWebviewPanel: { show: vi.fn() },
@@ -297,18 +289,18 @@ const {
 		MockAuthService: vi.fn(function MockAuthService() {
 			return mockAuthService_;
 		}),
-		mockKBProvider: mockKBProvider_,
-		MockKnowledgeBaseTreeProvider: vi.fn(
-			function MockKnowledgeBaseTreeProvider() {
-				return mockKBProvider_;
-			},
-		),
 	};
 });
 
 // ─── Command map — captures registerCommand callbacks ───────────────────────
 
 const commandMap = new Map<string, (...args: Array<unknown>) => unknown>();
+
+// ─── SidebarWebviewProvider deps capture ──────────────────────────────────────
+
+let sidebarDepsCaptured: unknown;
+
+// ─── VSCode API mocks ─────────────────────────────────────────────────────────
 
 const {
 	showWarningMessage,
@@ -319,6 +311,7 @@ const {
 	showTextDocument,
 	showOpenDialog,
 	createTreeView,
+	registerWebviewViewProvider,
 	createFileSystemWatcher,
 	executeCommand,
 	registerCommand,
@@ -379,6 +372,7 @@ const {
 				dispose: vi.fn(),
 			}),
 		),
+		registerWebviewViewProvider: vi.fn(() => ({ dispose: vi.fn() })),
 		registerTextDocumentContentProvider: vi.fn(() => ({ dispose: vi.fn() })),
 		openTextDocument: vi.fn().mockResolvedValue({ uri: "mock-doc" }),
 		onDidSaveTextDocument: vi.fn(() => ({ dispose: vi.fn() })),
@@ -392,6 +386,13 @@ const {
 
 vi.mock("node:child_process", () => ({
 	execSync,
+	execFileSync,
+	// execFile is reached transitively through OrphanBranchStorage in the
+	// rebuildKnowledgeBase command path. Tests don't exercise that path, so a
+	// throwing stub is enough — it just needs to exist as an export.
+	execFile: () => {
+		throw new Error("execFile not mocked in Extension.test.ts");
+	},
 }));
 
 vi.mock("vscode", () => ({
@@ -440,13 +441,26 @@ vi.mock("vscode", () => ({
 		showTextDocument,
 		showOpenDialog,
 		createTreeView,
+		registerWebviewViewProvider,
 		createOutputChannel: vi.fn(() => ({
 			appendLine: vi.fn(),
 			dispose: vi.fn(),
 		})),
 		registerFileDecorationProvider: vi.fn(() => ({ dispose: vi.fn() })),
 		registerUriHandler: vi.fn(() => ({ dispose: vi.fn() })),
+		// Pass-through Progress mock — runs the user's callback so commands that
+		// wrap work in `vscode.window.withProgress(...)` (e.g. migrateToKnowledgeBase)
+		// actually execute that work in tests instead of silently no-oping.
+		withProgress: vi.fn(
+			async (
+				_options: unknown,
+				task: (p: { report: (x: unknown) => void }) => Promise<unknown>,
+			) => {
+				return task({ report: vi.fn() });
+			},
+		),
 	},
+	ProgressLocation: { Notification: 15 },
 	workspace: {
 		registerTextDocumentContentProvider,
 		createFileSystemWatcher,
@@ -492,6 +506,70 @@ vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 	readPlanFromBranch,
 }));
 
+// Mock the KB folder-mode dependencies so auto-migration paths in `activate`
+// and the migrateToKnowledgeBase / rebuildKnowledgeBase commands run with
+// predictable, side-effect-free stand-ins. Each test that exercises those
+// paths overrides the relevant helper via `vi.mocked(...).mockReturnValueOnce`.
+vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
+	extractRepoName: vi.fn(() => "test-repo"),
+	getRemoteUrl: vi.fn(() => null),
+	resolveKBPath: vi.fn(() => "/test/kb"),
+	findFreshKBPath: vi.fn(() => "/test/kb-2"),
+	initializeKBFolder: vi.fn(),
+}));
+
+const {
+	mockMetadataManagerInstance,
+	mockOrphanInstance,
+	mockFolderStorageInstance,
+	mockMigrationEngineInstance,
+} = vi.hoisted(() => {
+	const meta = {
+		readMigrationState: vi.fn(() => null),
+		readConfig: vi.fn(() => ({})),
+		saveConfig: vi.fn(),
+	};
+	const orphan = { exists: vi.fn(async () => false) };
+	const folder = { ensure: vi.fn(async () => undefined) };
+	const engine = {
+		runMigration: vi.fn(async () => ({
+			status: "completed" as const,
+			migratedEntries: 0,
+			totalEntries: 0,
+		})),
+	};
+	return {
+		mockMetadataManagerInstance: meta,
+		mockOrphanInstance: orphan,
+		mockFolderStorageInstance: folder,
+		mockMigrationEngineInstance: engine,
+	};
+});
+
+vi.mock("../../cli/src/core/MetadataManager.js", () => ({
+	MetadataManager: vi.fn(function MockMetadataManager() {
+		return mockMetadataManagerInstance;
+	}),
+}));
+
+vi.mock("../../cli/src/core/OrphanBranchStorage.js", () => ({
+	OrphanBranchStorage: vi.fn(function MockOrphanBranchStorage() {
+		return mockOrphanInstance;
+	}),
+}));
+
+vi.mock("../../cli/src/core/FolderStorage.js", () => ({
+	FolderStorage: vi.fn(function MockFolderStorage() {
+		return mockFolderStorageInstance;
+	}),
+}));
+
+vi.mock("../../cli/src/core/MigrationEngine.js", () => ({
+	MigrationEngine: vi.fn(function MockMigrationEngine() {
+		return mockMigrationEngineInstance;
+	}),
+}));
+
 vi.mock("../../cli/src/Logger.js", () => ({
 	ORPHAN_BRANCH: "jollimemory",
 	createLogger: vi.fn(() => ({
@@ -513,10 +591,6 @@ vi.mock("./commands/PushCommand.js", () => ({
 
 vi.mock("./commands/SquashCommand.js", () => ({
 	SquashCommand: MockSquashCommand,
-}));
-
-vi.mock("./commands/ExportMemoriesCommand.js", () => ({
-	ExportMemoriesCommand: MockExportMemoriesCommand,
 }));
 
 vi.mock("./core/PlanService.js", () => ({
@@ -554,10 +628,6 @@ vi.mock("./providers/MemoriesTreeProvider.js", () => ({
 
 vi.mock("./providers/PlansTreeProvider.js", () => ({
 	PlansTreeProvider: MockPlansTreeProvider,
-}));
-
-vi.mock("./providers/KnowledgeBaseTreeProvider.js", () => ({
-	KnowledgeBaseTreeProvider: MockKnowledgeBaseTreeProvider,
 }));
 
 vi.mock("./providers/StatusTreeProvider.js", () => ({
@@ -678,6 +748,20 @@ vi.mock("./util/WorkspaceUtils.js", () => ({
 	resolveCLIPath,
 }));
 
+vi.mock("./views/SidebarWebviewProvider.js", () => ({
+	SidebarWebviewProvider: class {
+		static viewId = "jollimemory.mainView";
+		constructor(deps: unknown) {
+			sidebarDepsCaptured = deps;
+		}
+		resolveWebviewView() {}
+		dispose() {}
+		refreshKnowledgeBaseFolders() {}
+		notifyEnabledChanged() {}
+		notifyAuthChanged() {}
+	},
+}));
+
 vi.mock("./views/SummaryWebviewPanel.js", () => ({
 	SummaryWebviewPanel: MockSummaryWebviewPanel,
 }));
@@ -774,6 +858,7 @@ describe("Extension", () => {
 		commandMap.clear();
 		checkboxCallbacks.clear();
 		visibilityCallbacks.clear();
+		sidebarDepsCaptured = undefined;
 
 		// Populate the local commandMap from the hoisted closure
 		registerCommand.mockImplementation(
@@ -947,31 +1032,27 @@ describe("Extension", () => {
 			expect(MockPushCommand).toHaveBeenCalled();
 		});
 
-		it("creates tree views for all panels", () => {
+		it("registers a webview view provider for the main sidebar view", () => {
 			const ctx = makeContext();
 
 			activate(ctx);
 
-			expect(createTreeView).toHaveBeenCalledWith(
-				"jollimemory.statusView",
+			expect(registerWebviewViewProvider).toHaveBeenCalledWith(
+				"jollimemory.mainView",
 				expect.any(Object),
 			);
-			expect(createTreeView).toHaveBeenCalledWith(
-				"jollimemory.memoriesView",
-				expect.any(Object),
-			);
-			expect(createTreeView).toHaveBeenCalledWith(
-				"jollimemory.plansView",
-				expect.any(Object),
-			);
-			expect(createTreeView).toHaveBeenCalledWith(
-				"jollimemory.filesView",
-				expect.any(Object),
-			);
-			expect(createTreeView).toHaveBeenCalledWith(
-				"jollimemory.historyView",
-				expect.any(Object),
-			);
+		});
+
+		it("wires applyFileCheckbox to filesStore.applyCheckboxBatch", () => {
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			expect(sidebarDepsCaptured.applyFileCheckbox).toBeDefined();
+			sidebarDepsCaptured.applyFileCheckbox("src/foo.ts", true);
+			expect(mockFilesStore.applyCheckboxBatch).toHaveBeenCalledWith([
+				["src/foo.ts", true],
+			]);
 		});
 
 		it("registers all expected commands", () => {
@@ -1010,12 +1091,8 @@ describe("Extension", () => {
 				"jollimemory.viewSummary",
 				"jollimemory.viewMemorySummary",
 				"jollimemory.copyCommitHash",
-				"jollimemory.exportMemories",
 				"jollimemory.openSettings",
-				"jollimemory.refreshKnowledgeBase",
-				"jollimemory.focusKnowledgeBase",
 				"jollimemory.migrateToKnowledgeBase",
-				"jollimemory.openKBCommitSummary",
 			];
 
 			for (const cmd of expectedCommands) {
@@ -1328,7 +1405,7 @@ describe("Extension", () => {
 				handler();
 
 				expect(executeCommand).toHaveBeenCalledWith(
-					"jollimemory.memoriesView.focus",
+					"jollimemory.mainView.focus",
 				);
 			});
 		});
@@ -1594,6 +1671,14 @@ describe("Extension", () => {
 				await handler({ plan: { slug: "my-plan" } });
 
 				expect(mockBridge.removePlan).toHaveBeenCalledWith("my-plan");
+				expect(mockPlansStore.refresh).toHaveBeenCalled();
+			});
+
+			it("accepts string slug as fallback", async () => {
+				const handler = getRegisteredCommand("jollimemory.removePlan");
+				await handler("my-plan-slug");
+
+				expect(mockBridge.removePlan).toHaveBeenCalledWith("my-plan-slug");
 				expect(mockPlansStore.refresh).toHaveBeenCalled();
 			});
 		});
@@ -1929,41 +2014,49 @@ describe("Extension", () => {
 				expect(mockBridge.removeNote).toHaveBeenCalledWith("note-to-remove");
 				expect(mockPlansStore.refresh).toHaveBeenCalled();
 			});
+
+			it("accepts string noteId as fallback", async () => {
+				const handler = getRegisteredCommand("jollimemory.removeNote");
+				await handler("note-id-123");
+
+				expect(mockBridge.removeNote).toHaveBeenCalledWith("note-id-123");
+				expect(mockPlansStore.refresh).toHaveBeenCalled();
+			});
 		});
 
 		// ── searchMemories command ──────────────────────────────────────────
 
 		describe("searchMemories", () => {
-			it("calls memoriesProvider.setFilter when user provides input text", async () => {
-				showInputBox.mockResolvedValue("biome");
-
+			it("applies filter directly when called with a string query", async () => {
 				const handler = getRegisteredCommand("jollimemory.searchMemories");
-				await handler();
+				await handler("biome");
 
-				expect(showInputBox).toHaveBeenCalledWith(
-					expect.objectContaining({
-						prompt: "Filter memories by commit message or branch name",
-					}),
-				);
 				expect(mockMemoriesStore.setFilter).toHaveBeenCalledWith("biome");
+				expect(showInputBox).not.toHaveBeenCalled();
 			});
 
-			it("calls memoriesProvider.setFilter with empty string when user clears input", async () => {
-				showInputBox.mockResolvedValue("");
-
+			it("clears the filter when called with no argument", async () => {
 				const handler = getRegisteredCommand("jollimemory.searchMemories");
 				await handler();
 
 				expect(mockMemoriesStore.setFilter).toHaveBeenCalledWith("");
+				expect(showInputBox).not.toHaveBeenCalled();
 			});
 
-			it("does NOT call setFilter when user cancels (undefined)", async () => {
-				showInputBox.mockResolvedValue(undefined);
-
+			it("clears the filter when called with an empty string", async () => {
 				const handler = getRegisteredCommand("jollimemory.searchMemories");
-				await handler();
+				await handler("");
 
-				expect(mockMemoriesStore.setFilter).not.toHaveBeenCalled();
+				expect(mockMemoriesStore.setFilter).toHaveBeenCalledWith("");
+				expect(showInputBox).not.toHaveBeenCalled();
+			});
+
+			it("treats non-string args as no-arg", async () => {
+				const handler = getRegisteredCommand("jollimemory.searchMemories");
+				await handler(42);
+
+				expect(mockMemoriesStore.setFilter).toHaveBeenCalledWith("");
+				expect(showInputBox).not.toHaveBeenCalled();
 			});
 		});
 
@@ -1975,17 +2068,6 @@ describe("Extension", () => {
 				handler();
 
 				expect(mockMemoriesStore.setFilter).toHaveBeenCalledWith("");
-			});
-		});
-
-		// ── exportMemories command ──────────────────────────────────────────
-
-		describe("exportMemories", () => {
-			it("calls exportMemoriesCommand.execute", () => {
-				const handler = getRegisteredCommand("jollimemory.exportMemories");
-				handler();
-
-				expect(mockExportMemoriesCommand.execute).toHaveBeenCalled();
 			});
 		});
 
@@ -2151,6 +2233,47 @@ describe("Extension", () => {
 				).toBe("# Note not found");
 				expect(provider?.provideTextDocumentContent({ query: "" })).toBe(
 					"# Note not found",
+				);
+			});
+		});
+
+		// ── openMemoryFile command ──────────────────────────────────────────
+		describe("openMemoryFile", () => {
+			it("opens .md files in the rendered markdown preview", async () => {
+				const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+				await handler("/abs/path/to/memo.md");
+
+				expect(executeCommand).toHaveBeenCalledWith(
+					"markdown.showPreview",
+					expect.anything(),
+				);
+			});
+
+			it("falls through to vscode.open for non-markdown files", async () => {
+				const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+				await handler("/abs/path/to/data.json");
+
+				expect(executeCommand).toHaveBeenCalledWith(
+					"vscode.open",
+					expect.anything(),
+				);
+				expect(executeCommand).not.toHaveBeenCalledWith(
+					"markdown.showPreview",
+					expect.anything(),
+				);
+			});
+
+			it("ignores empty / non-string paths without throwing", async () => {
+				const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+				await handler("");
+				await handler(undefined as unknown as string);
+				expect(executeCommand).not.toHaveBeenCalledWith(
+					"markdown.showPreview",
+					expect.anything(),
+				);
+				expect(executeCommand).not.toHaveBeenCalledWith(
+					"vscode.open",
+					expect.anything(),
 				);
 			});
 		});
@@ -2377,147 +2500,10 @@ describe("Extension", () => {
 		});
 	});
 
-	// ── onDidChangeCheckboxState handlers ─────────────────────────────
-
-	describe("filesView.onDidChangeCheckboxState", () => {
-		let ctx: vscode.ExtensionContext;
-
-		beforeEach(() => {
-			ctx = makeContext();
-			activate(ctx);
-		});
-
-		it("forwards checkbox toggles to filesStore.applyCheckboxBatch with path+bool pairs", async () => {
-			const cb = checkboxCallbacks.get("jollimemory.filesView");
-			expect(cb).toBeDefined();
-
-			const mockFileItem = { fileStatus: { relativePath: "src/index.ts" } };
-			// TreeItemCheckboxState.Checked = 1
-			await cb?.({ items: [[mockFileItem, 1]] });
-
-			// Extension.ts maps [FileItem, CheckboxState] → [relativePath, boolean]
-			// before calling the store, matching the store's applyCheckboxBatch API.
-			expect(mockFilesStore.applyCheckboxBatch).toHaveBeenCalledWith([
-				["src/index.ts", true],
-			]);
-		});
-
-		it("passes `false` for unchecked items", async () => {
-			const cb = checkboxCallbacks.get("jollimemory.filesView");
-			expect(cb).toBeDefined();
-
-			const mockFileItem = { fileStatus: { relativePath: "src/index.ts" } };
-			// TreeItemCheckboxState.Unchecked = 0
-			await cb?.({ items: [[mockFileItem, 0]] });
-
-			expect(mockFilesStore.applyCheckboxBatch).toHaveBeenCalledWith([
-				["src/index.ts", false],
-			]);
-		});
-	});
-
-	describe("historyView.onDidChangeCheckboxState", () => {
-		let ctx: vscode.ExtensionContext;
-
-		beforeEach(() => {
-			ctx = makeContext();
-			activate(ctx);
-		});
-
-		it("forwards checkbox toggles to commitsStore.onCheckboxToggle with hash+bool", () => {
-			const cb = checkboxCallbacks.get("jollimemory.historyView");
-			expect(cb).toBeDefined();
-
-			const mockCommitItem = { commit: { hash: "abc123", shortHash: "abc" } };
-			// TreeItemCheckboxState.Checked = 1
-			cb?.({ items: [[mockCommitItem, 1]] });
-
-			// Extension.ts unwraps commit.hash before calling the store.
-			expect(mockCommitsStore.onCheckboxToggle).toHaveBeenCalledWith(
-				"abc123",
-				true,
-			);
-		});
-
-		it("passes `false` for unchecked commit items", () => {
-			const cb = checkboxCallbacks.get("jollimemory.historyView");
-			expect(cb).toBeDefined();
-
-			const mockCommitItem = { commit: { hash: "abc123", shortHash: "abc" } };
-			// TreeItemCheckboxState.Unchecked = 0
-			cb?.({ items: [[mockCommitItem, 0]] });
-
-			expect(mockCommitsStore.onCheckboxToggle).toHaveBeenCalledWith(
-				"abc123",
-				false,
-			);
-		});
-
-		it("ignores non-commit items (e.g. CommitFileItem) in checkbox handler", () => {
-			const cb = checkboxCallbacks.get("jollimemory.historyView");
-			expect(cb).toBeDefined();
-
-			// CommitFileItem-shaped object: has commitHash but no commit property
-			const mockFileItem = {
-				commitHash: "abc123",
-				relativePath: "src/Foo.ts",
-				statusCode: "M",
-			};
-			cb?.({ items: [[mockFileItem, 1]] });
-
-			expect(mockCommitsStore.onCheckboxToggle).not.toHaveBeenCalled();
-		});
-	});
-
-	// ── memoriesView.onDidChangeVisibility ───────────────────────────
-
-	describe("memoriesView.onDidChangeVisibility", () => {
-		let ctx: vscode.ExtensionContext;
-
-		beforeEach(() => {
-			ctx = makeContext();
-			activate(ctx);
-		});
-
-		it("triggers ensureFirstLoad on first visibility when memoriesLazyLoaded is false", () => {
-			const cb = visibilityCallbacks.get("jollimemory.memoriesView");
-			expect(cb).toBeDefined();
-
-			// Clear calls from activation
-			mockMemoriesStore.ensureFirstLoad.mockClear();
-
-			// First call with visible: true should trigger ensureFirstLoad
-			cb?.({ visible: true });
-
-			expect(mockMemoriesStore.ensureFirstLoad).toHaveBeenCalledTimes(1);
-		});
-
-		it("is safe to call ensureFirstLoad multiple times (idempotent)", () => {
-			const cb = visibilityCallbacks.get("jollimemory.memoriesView");
-			expect(cb).toBeDefined();
-
-			// First call sets the flag on the store
-			cb?.({ visible: true });
-			// Second visibility event also calls — the store implementation is idempotent
-			cb?.({ visible: true });
-
-			// Store's ensureFirstLoad is idempotent internally; the provider shim
-			// simply forwards every call.
-			expect(mockMemoriesStore.ensureFirstLoad).toHaveBeenCalled();
-		});
-
-		it("does not trigger ensureFirstLoad when panel becomes hidden", () => {
-			const cb = visibilityCallbacks.get("jollimemory.memoriesView");
-			expect(cb).toBeDefined();
-
-			mockMemoriesStore.ensureFirstLoad.mockClear();
-
-			// visible: false should not trigger ensureFirstLoad
-			cb?.({ visible: false });
-
-			expect(mockMemoriesStore.ensureFirstLoad).not.toHaveBeenCalled();
-		});
-	});
+	// NOTE: filesView.onDidChangeCheckboxState, historyView.onDidChangeCheckboxState,
+	// and memoriesView.onDidChangeVisibility tests were removed in Task 8.
+	// The 5 tree views were replaced by a single SidebarWebviewProvider (jollimemory.mainView).
+	// These callbacks will be re-wired via webview messages in later phases.
 
 	describe("watcher callbacks", () => {
 		let ctx: vscode.ExtensionContext;
@@ -3895,14 +3881,31 @@ describe("Extension", () => {
 	});
 
 	describe("signOut command", () => {
-		it("calls authService.signOut and refreshes status", async () => {
+		it("prompts for confirmation and signs out when user confirms", async () => {
+			showWarningMessage.mockResolvedValueOnce("Sign Out");
 			activate(makeContext());
 
 			const handler = getRegisteredCommand("jollimemory.signOut");
 			await handler();
 
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				"Sign out of Jolli?",
+				expect.objectContaining({ modal: true }),
+				"Sign Out",
+			);
 			expect(mockAuthService.signOut).toHaveBeenCalled();
 			expect(mockStatusStore.refresh).toHaveBeenCalled();
+		});
+
+		it("does nothing when user cancels the confirmation", async () => {
+			showWarningMessage.mockResolvedValueOnce(undefined);
+			activate(makeContext());
+
+			const handler = getRegisteredCommand("jollimemory.signOut");
+			await handler();
+
+			expect(showWarningMessage).toHaveBeenCalled();
+			expect(mockAuthService.signOut).not.toHaveBeenCalled();
 		});
 	});
 
@@ -3979,57 +3982,13 @@ describe("Extension", () => {
 		});
 	});
 
-	// ── Knowledge Base commands ──────────────────────────────────────────
+	// ── Memory Bank commands ─────────────────────────────────────────────
+	// The tree-view-coupled commands (refreshKnowledgeBase, focusKnowledgeBase,
+	// openKBCommitSummary) were removed when the 6 tree views were replaced by
+	// the sidebar webview. Only `migrateToKnowledgeBase` survives as a
+	// standalone migration trigger.
 
-	describe("Knowledge Base commands", () => {
-		it("refreshKnowledgeBase calls kbProvider.refresh()", () => {
-			const ctx = makeContext();
-			activate(ctx);
-
-			const handler = getRegisteredCommand("jollimemory.refreshKnowledgeBase");
-			handler();
-
-			expect(mockKBProvider.refresh).toHaveBeenCalled();
-		});
-
-		it("focusKnowledgeBase toggles other view visibility and focuses KB view", async () => {
-			const ctx = makeContext();
-			activate(ctx);
-
-			const handler = getRegisteredCommand("jollimemory.focusKnowledgeBase");
-			await handler();
-
-			// First call hides other panels and focuses KB view
-			expect(executeCommand).toHaveBeenCalledWith(
-				"jollimemory.knowledgeBaseView.focus",
-			);
-		});
-
-		it("focusKnowledgeBase restores panels on second call", async () => {
-			const ctx = makeContext();
-			activate(ctx);
-
-			const handler = getRegisteredCommand("jollimemory.focusKnowledgeBase");
-			// First call: focus (hide others)
-			await handler();
-			executeCommand.mockClear();
-
-			// Second call: restore
-			await handler();
-
-			// Should toggle visibility on the other views to restore them
-			expect(executeCommand).toHaveBeenCalledWith(
-				"jollimemory.statusView.toggleVisibility",
-			);
-			expect(executeCommand).toHaveBeenCalledWith(
-				"jollimemory.memoriesView.toggleVisibility",
-			);
-			// Should NOT focus KB view on restore
-			expect(executeCommand).not.toHaveBeenCalledWith(
-				"jollimemory.knowledgeBaseView.focus",
-			);
-		});
-
+	describe("Memory Bank commands", () => {
 		it("migrateToKnowledgeBase can be invoked without throwing", async () => {
 			const ctx = makeContext();
 			activate(ctx);
@@ -4049,52 +4008,6 @@ describe("Extension", () => {
 					showInformationMessage.mock.calls.length,
 			).toBeGreaterThanOrEqual(0);
 		});
-
-		it("creates a tree view for the Knowledge Base panel", () => {
-			const ctx = makeContext();
-			activate(ctx);
-
-			expect(createTreeView).toHaveBeenCalledWith(
-				"jollimemory.knowledgeBaseView",
-				expect.objectContaining({ showCollapseAll: true }),
-			);
-		});
-	});
-
-	// ── no-workspace stub commands include KB commands ────────────────────
-
-	describe("no-workspace stub — KB commands", () => {
-		it("registers KB commands as no-ops when no workspace is open", () => {
-			getWorkspaceRoot.mockReturnValue(undefined);
-			const ctx = makeContext();
-			activate(ctx);
-
-			const kbCommands = [
-				"jollimemory.refreshKnowledgeBase",
-				"jollimemory.focusKnowledgeBase",
-				"jollimemory.migrateToKnowledgeBase",
-				"jollimemory.openKBCommitSummary",
-			];
-			for (const cmd of kbCommands) {
-				expect(
-					commandMap.has(cmd),
-					`Expected no-op stub for "${cmd}" to be registered`,
-				).toBe(true);
-			}
-		});
-
-		it("no-op KB stub shows informational message", () => {
-			getWorkspaceRoot.mockReturnValue(undefined);
-			const ctx = makeContext();
-			activate(ctx);
-
-			const handler = commandMap.get("jollimemory.refreshKnowledgeBase");
-			handler?.();
-
-			expect(showInformationMessage).toHaveBeenCalledWith(
-				"Please open a folder to use Jolli Memory.",
-			);
-		});
 	});
 
 	// ── deactivate ──────────────────────────────────────────────────────
@@ -4112,6 +4025,466 @@ describe("Extension", () => {
 				"Jolli Memory extension deactivating",
 			);
 			expect(logDispose).toHaveBeenCalled();
+		});
+	});
+
+	// ── Coverage backfill: noFolder fallback dialog ───────────────────────
+	describe("activate — no workspace root: noFolder commands prompt user", () => {
+		// Reset existsSync impl between tests (other test groups override it).
+		beforeEach(() => {
+			existsSync.mockReset();
+			existsSync.mockImplementation(() => true);
+		});
+
+		it("invoking a registered no-op command shows the 'open a folder' info message", () => {
+			getWorkspaceRoot.mockReturnValue(undefined);
+			const ctx = makeContext();
+			activate(ctx);
+
+			const handler = commandMap.get("jollimemory.commitAI");
+			expect(handler).toBeDefined();
+			handler?.();
+
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				"Please open a folder to use Jolli Memory.",
+			);
+		});
+	});
+
+	// ── Coverage backfill: workspace lacks a `.git` directory ──────────────
+	describe("activate — no .git in workspace: noGit + Initialize Git prompt", () => {
+		afterEach(() => {
+			// Restore default so subsequent describe blocks see existsSync returning true.
+			existsSync.mockReset();
+			existsSync.mockImplementation(() => true);
+		});
+
+		// `existsSync` is also called for many other files inside activate (plan
+		// previews etc). Override only for the `.git` lookup so the rest of the
+		// activate path behaves as the default mock implementations expect.
+		function stubGitMissing(): void {
+			existsSync.mockImplementation((p: unknown) => {
+				const s = String(p);
+				if (
+					s.endsWith("/.git") ||
+					s.endsWith("\\.git") ||
+					s === "/test/workspace/.git"
+				) {
+					return false;
+				}
+				return true;
+			});
+		}
+
+		it("registers a noGit no-op for every command and shows the prompt when invoked", async () => {
+			stubGitMissing();
+			showWarningMessage.mockResolvedValueOnce(undefined); // user dismisses
+			const ctx = makeContext();
+			activate(ctx);
+
+			expect(commandMap.size).toBeGreaterThan(0);
+			const handler = commandMap.get("jollimemory.commitAI");
+			expect(handler).toBeDefined();
+			await handler?.();
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("not a git repository"),
+				"Initialize Git",
+			);
+		});
+
+		it("when user picks 'Initialize Git' and init succeeds, prompts to reload", async () => {
+			stubGitMissing();
+			showWarningMessage.mockResolvedValueOnce("Initialize Git");
+			showInformationMessage.mockResolvedValueOnce("Reload");
+			execFileSync.mockImplementation(
+				(bin: string, args: ReadonlyArray<string>) => {
+					if (bin === "git" && args[0] === "init") return Buffer.from("");
+					throw new Error(`Unmocked execFile: ${bin} ${args.join(" ")}`);
+				},
+			);
+			const ctx = makeContext();
+			activate(ctx);
+
+			await commandMap.get("jollimemory.commitAI")?.();
+			// promise chain inside noGit needs a few microtask flushes
+			await new Promise((r) => setTimeout(r, 0));
+			await new Promise((r) => setTimeout(r, 0));
+
+			expect(execFileSync).toHaveBeenCalledWith(
+				"git",
+				["init"],
+				expect.objectContaining({ cwd: "/test/workspace" }),
+			);
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Git initialized"),
+				"Reload",
+			);
+			expect(executeCommand).toHaveBeenCalledWith(
+				"workbench.action.reloadWindow",
+			);
+		});
+
+		it("when user picks 'Initialize Git' but init fails, surfaces an error message", async () => {
+			stubGitMissing();
+			showWarningMessage.mockResolvedValueOnce("Initialize Git");
+			execFileSync.mockImplementation(
+				(bin: string, args: ReadonlyArray<string>) => {
+					if (bin === "git" && args[0] === "init") {
+						throw new Error("permission denied");
+					}
+					throw new Error(`Unmocked execFile: ${bin} ${args.join(" ")}`);
+				},
+			);
+			const ctx = makeContext();
+			activate(ctx);
+
+			await commandMap.get("jollimemory.commitAI")?.();
+			await new Promise((r) => setTimeout(r, 0));
+			await new Promise((r) => setTimeout(r, 0));
+
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Failed to initialize git"),
+			);
+		});
+
+		it("when user dismisses the reload prompt, does not call reloadWindow", async () => {
+			stubGitMissing();
+			showWarningMessage.mockResolvedValueOnce("Initialize Git");
+			showInformationMessage.mockResolvedValueOnce(undefined);
+			execFileSync.mockImplementation(
+				(bin: string, args: ReadonlyArray<string>) => {
+					if (bin === "git" && args[0] === "init") return Buffer.from("");
+					throw new Error(`Unmocked execFile: ${bin} ${args.join(" ")}`);
+				},
+			);
+			const ctx = makeContext();
+			activate(ctx);
+
+			await commandMap.get("jollimemory.commitAI")?.();
+			await new Promise((r) => setTimeout(r, 0));
+			await new Promise((r) => setTimeout(r, 0));
+
+			const cmds = executeCommand.mock.calls.map((c) => c[0]);
+			expect(cmds).not.toContain("workbench.action.reloadWindow");
+		});
+	});
+
+	// ── Coverage backfill: row-click preview commands ──────────────────────
+	describe("openPlanForPreview / openNoteForPreview", () => {
+		beforeEach(() => {
+			existsSync.mockReset();
+			existsSync.mockImplementation(() => true);
+		});
+
+		it("opens the local plan file via markdown.showPreview when it exists", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			mockPlansStore.getSnapshot.mockReturnValueOnce({
+				merged: [
+					{
+						kind: "plan",
+						plan: { slug: "my-plan", title: "My Plan" },
+					},
+				],
+				changeReason: "init",
+			} as never);
+			existsSync.mockImplementationOnce(() => true);
+
+			const handler = getRegisteredCommand("jollimemory.openPlanForPreview");
+			await handler("my-plan");
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"markdown.showPreview",
+				expect.objectContaining({ fsPath: expect.stringContaining("my-plan") }),
+			);
+		});
+
+		// Exercises the fallback to the orphan-branch snapshot when the local plan
+		// file isn't on disk. Plans without a matching snapshot fall through to
+		// `slug` as the preview title.
+		it("falls back to the orphan-branch snapshot when the local plan file is gone", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			mockPlansStore.getSnapshot.mockReturnValueOnce({
+				merged: [],
+				changeReason: "init",
+			} as never);
+			existsSync.mockImplementationOnce(() => false);
+			readPlanFromBranch.mockResolvedValueOnce("# Plan body");
+
+			const handler = getRegisteredCommand("jollimemory.openPlanForPreview");
+			await handler("orphan-only");
+
+			expect(readPlanFromBranch).toHaveBeenCalledWith(
+				"orphan-only",
+				"/test/workspace",
+			);
+		});
+
+		it("shows an error when the orphan snapshot read also fails", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			mockPlansStore.getSnapshot.mockReturnValueOnce({
+				merged: [],
+				changeReason: "init",
+			} as never);
+			existsSync.mockImplementationOnce(() => false);
+			readPlanFromBranch.mockResolvedValueOnce(null);
+
+			const handler = getRegisteredCommand("jollimemory.openPlanForPreview");
+			await handler("missing-everywhere");
+
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Could not read plan"),
+			);
+		});
+
+		it("opens the local note file via markdown.showPreview when it exists", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			mockBridge.listNotes.mockResolvedValueOnce([
+				{ id: "n-1", title: "N", filePath: "/abs/n.md", commitHash: null },
+			] as never);
+			existsSync.mockImplementationOnce(() => true);
+
+			const handler = getRegisteredCommand("jollimemory.openNoteForPreview");
+			await handler("n-1");
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"markdown.showPreview",
+				expect.objectContaining({ fsPath: "/abs/n.md" }),
+			);
+		});
+
+		it("falls back to the orphan-branch snapshot when only commitHash is available", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			mockBridge.listNotes.mockResolvedValueOnce([
+				{
+					id: "n-1",
+					title: "Committed Note",
+					filePath: undefined,
+					commitHash: "abc",
+				},
+			] as never);
+			readNoteFromBranch.mockResolvedValueOnce("# Note body");
+
+			const handler = getRegisteredCommand("jollimemory.openNoteForPreview");
+			await handler("n-1");
+
+			expect(readNoteFromBranch).toHaveBeenCalledWith("n-1", "/test/workspace");
+		});
+
+		it("shows an info message when neither local file nor commitHash is available", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			mockBridge.listNotes.mockResolvedValueOnce([
+				{ id: "n-1", title: "Empty", filePath: undefined, commitHash: null },
+			] as never);
+
+			const handler = getRegisteredCommand("jollimemory.openNoteForPreview");
+			await handler("n-1");
+
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining("has no readable content"),
+			);
+		});
+
+		it("returns silently when the note id does not exist in listNotes", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			mockBridge.listNotes.mockResolvedValueOnce([] as never);
+			showInformationMessage.mockClear();
+			showErrorMessage.mockClear();
+
+			const handler = getRegisteredCommand("jollimemory.openNoteForPreview");
+			await expect(handler("does-not-exist")).resolves.toBeUndefined();
+			expect(showInformationMessage).not.toHaveBeenCalledWith(
+				expect.stringContaining("has no readable content"),
+			);
+		});
+	});
+
+	// ── Coverage backfill: migrateToKnowledgeBase success / partial paths ──
+	describe("migrateToKnowledgeBase command (success/partial paths)", () => {
+		beforeEach(() => {
+			existsSync.mockReset();
+			existsSync.mockImplementation(() => true);
+			mockOrphanInstance.exists.mockReset();
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMigrationEngineInstance.runMigration.mockReset();
+			mockMigrationEngineInstance.runMigration.mockResolvedValue({
+				status: "completed",
+				migratedEntries: 7,
+				totalEntries: 7,
+			});
+		});
+
+		it("shows an info message when migration completes", async () => {
+			activate(makeContext());
+			const handler = getRegisteredCommand(
+				"jollimemory.migrateToKnowledgeBase",
+			);
+			await handler();
+
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Migration completed"),
+			);
+		});
+
+		it("shows a warning when migration is partial", async () => {
+			mockMigrationEngineInstance.runMigration.mockResolvedValueOnce({
+				status: "partial",
+				migratedEntries: 3,
+				totalEntries: 7,
+			});
+			activate(makeContext());
+			const handler = getRegisteredCommand(
+				"jollimemory.migrateToKnowledgeBase",
+			);
+			await handler();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Migration partial"),
+			);
+		});
+
+		it("shows an info message when there is no orphan storage to migrate", async () => {
+			mockOrphanInstance.exists.mockResolvedValueOnce(false);
+			activate(makeContext());
+			const handler = getRegisteredCommand(
+				"jollimemory.migrateToKnowledgeBase",
+			);
+			await handler();
+
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining("No git storage found"),
+			);
+		});
+
+		it("surfaces a failure as an error toast", async () => {
+			mockMigrationEngineInstance.runMigration.mockRejectedValueOnce(
+				new Error("disk full"),
+			);
+			activate(makeContext());
+			const handler = getRegisteredCommand(
+				"jollimemory.migrateToKnowledgeBase",
+			);
+			await handler();
+
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Migration failed"),
+			);
+		});
+	});
+
+	// ── Coverage backfill: rebuildKnowledgeBase command ────────────────────
+	describe("rebuildKnowledgeBase command (success/partial/error paths)", () => {
+		beforeEach(() => {
+			existsSync.mockReset();
+			existsSync.mockImplementation(() => true);
+			mockOrphanInstance.exists.mockReset();
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMigrationEngineInstance.runMigration.mockReset();
+			mockMigrationEngineInstance.runMigration.mockResolvedValue({
+				status: "completed",
+				migratedEntries: 5,
+				totalEntries: 5,
+			});
+			mockMetadataManagerInstance.readConfig.mockReset();
+			mockMetadataManagerInstance.readConfig.mockReturnValue({});
+			mockMetadataManagerInstance.saveConfig.mockClear();
+		});
+
+		it("returns ok when rebuild migration completes", async () => {
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
+			const result = (await handler()) as { ok: boolean; message: string };
+			expect(result.ok).toBe(true);
+			expect(result.message).toContain("memories migrated");
+			// "Repoint": old KB identity is rewritten so resolveKBPath stops reusing it.
+			expect(mockMetadataManagerInstance.saveConfig).toHaveBeenCalled();
+		});
+
+		it("returns not-ok with No git storage found when orphan branch is missing", async () => {
+			mockOrphanInstance.exists.mockResolvedValueOnce(false);
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
+			const result = (await handler()) as { ok: boolean; message: string };
+			expect(result.ok).toBe(false);
+			expect(result.message).toContain("No git storage");
+		});
+
+		it("returns not-ok when rebuild migration is only partial", async () => {
+			mockMigrationEngineInstance.runMigration.mockResolvedValueOnce({
+				status: "partial",
+				migratedEntries: 1,
+				totalEntries: 3,
+			});
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
+			const result = (await handler()) as { ok: boolean; message: string };
+			expect(result.ok).toBe(false);
+			expect(result.message).toContain("Rebuild partial");
+		});
+
+		it("warns but still completes when archiving the old KB identity throws", async () => {
+			mockMetadataManagerInstance.readConfig.mockImplementationOnce(() => {
+				throw new Error("read failed");
+			});
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
+			const result = (await handler()) as { ok: boolean; message: string };
+			expect(result.ok).toBe(true);
+		});
+
+		it("returns not-ok when the migration itself throws", async () => {
+			mockMigrationEngineInstance.runMigration.mockRejectedValueOnce(
+				new Error("fs error"),
+			);
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
+			const result = (await handler()) as { ok: boolean; message: string };
+			expect(result.ok).toBe(false);
+			expect(result.message).toBe("fs error");
+		});
+	});
+
+	// ── Coverage backfill: misc trivial command paths ──────────────────────
+	describe("trivial command paths", () => {
+		beforeEach(() => {
+			existsSync.mockReset();
+			existsSync.mockImplementation(() => true);
+		});
+
+		it("openSettings save callback surfaces errors via handleError when excludeFilter.load throws", async () => {
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.openSettings");
+			handler();
+
+			// SettingsWebviewPanel.show was invoked with a save callback as 3rd arg.
+			const showCalls = MockSettingsWebviewPanel.show.mock.calls as [
+				unknown,
+				unknown,
+				() => Promise<void>,
+			][];
+			expect(showCalls.length).toBeGreaterThan(0);
+			const saveCb = showCalls[showCalls.length - 1][2];
+
+			mockExcludeFilter.load.mockRejectedValueOnce(new Error("disk full"));
+			await saveCb();
+
+			// handleError logs via the shared `log.error`; the test just verifies
+			// the callback didn't throw and an error was logged.
+			expect(error).toHaveBeenCalled();
 		});
 	});
 });
