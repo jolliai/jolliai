@@ -10,6 +10,10 @@ const { saveAuthCredentials, clearAuthCredentials, getJolliUrl } = vi.hoisted(
 	}),
 );
 
+const { exchangeCliCode } = vi.hoisted(() => ({
+	exchangeCliCode: vi.fn(),
+}));
+
 const { loadConfig } = vi.hoisted(() => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
 }));
@@ -97,6 +101,10 @@ vi.mock("../../../cli/src/auth/AuthConfig.js", () => ({
 	getJolliUrl,
 }));
 
+vi.mock("../../../cli/src/auth/CliExchange.js", () => ({
+	exchangeCliCode,
+}));
+
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadConfig,
 }));
@@ -132,21 +140,29 @@ describe("AuthService", () => {
 		loadConfig.mockResolvedValue({});
 		// Reset host-IDE appName to VSCode Stable; per-test overrides simulate forks.
 		appNameState.current = "Visual Studio Code";
+		// Default: code-exchange succeeds and returns a token only. Tests that
+		// need an API key or different failure modes override per-call.
+		exchangeCliCode.mockResolvedValue({ token: "test-token" });
 		service = new AuthService();
 	});
 
 	// ── handleAuthCallback ──────────────────────────────────────────────
 
 	describe("handleAuthCallback", () => {
-		it("should save token and API key atomically on successful callback", async () => {
-			const uri = makeUri(
-				"/auth-callback",
-				"token=test-token&jolli_api_key=sk-jol-test",
-			);
+		it("should exchange the code and save token + API key atomically on success", async () => {
+			exchangeCliCode.mockResolvedValueOnce({
+				token: "test-token",
+				jolliApiKey: "sk-jol-test",
+			});
+			const uri = makeUri("/auth-callback", "code=abc123");
 
 			const result = await service.handleAuthCallback(uri as never);
 
 			expect(result).toEqual({ success: true });
+			expect(exchangeCliCode).toHaveBeenCalledWith(
+				"https://app.jolli.ai",
+				"abc123",
+			);
 			expect(saveAuthCredentials).toHaveBeenCalledWith({
 				token: "test-token",
 				jolliApiKey: "sk-jol-test",
@@ -159,16 +175,26 @@ describe("AuthService", () => {
 			);
 		});
 
-		it("should save only token when API key is absent", async () => {
-			const uri = makeUri("/auth-callback", "token=test-token");
+		it("should save only the token when the exchange omits an API key", async () => {
+			exchangeCliCode.mockResolvedValueOnce({ token: "test-token" });
+			const uri = makeUri("/auth-callback", "code=abc123");
 
 			const result = await service.handleAuthCallback(uri as never);
 
 			expect(result).toEqual({ success: true });
-			expect(saveAuthCredentials).toHaveBeenCalledWith({
-				token: "test-token",
-				jolliApiKey: undefined,
-			});
+			expect(saveAuthCredentials).toHaveBeenCalledWith({ token: "test-token" });
+		});
+
+		it("should pass the configured JOLLI_URL through to the exchange", async () => {
+			getJolliUrl.mockReturnValueOnce("https://custom.jolli.ai");
+			const uri = makeUri("/auth-callback", "code=abc123");
+
+			await service.handleAuthCallback(uri as never);
+
+			expect(exchangeCliCode).toHaveBeenCalledWith(
+				"https://custom.jolli.ai",
+				"abc123",
+			);
 		});
 
 		it("should return error for server-reported error codes", async () => {
@@ -182,7 +208,22 @@ describe("AuthService", () => {
 					"OAuth authentication failed. Please try again.",
 				);
 			}
+			expect(exchangeCliCode).not.toHaveBeenCalled();
 			expect(saveAuthCredentials).not.toHaveBeenCalled();
+		});
+
+		it("should return a friendly message when the user cancels on the consent page", async () => {
+			const uri = makeUri("/auth-callback", "error=user_denied");
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toBe(
+					"Sign-in was cancelled. You can try again from the side panel.",
+				);
+			}
+			expect(exchangeCliCode).not.toHaveBeenCalled();
 		});
 
 		it("should return user-friendly message for known error codes", async () => {
@@ -209,20 +250,125 @@ describe("AuthService", () => {
 			}
 		});
 
-		it("should return error when token is missing", async () => {
+		it("should return error when both code and token are missing", async () => {
+			// `jolli_api_key` alone is meaningless — we have no token to pair it
+			// with, regardless of which server flow the callback came from.
 			const uri = makeUri("/auth-callback", "jolli_api_key=sk-jol-test");
 
 			const result = await service.handleAuthCallback(uri as never);
 
 			expect(result.success).toBe(false);
 			if (!result.success) {
-				expect(result.error).toBe("No authentication token received");
+				expect(result.error).toBe("No authorization code or token received");
 			}
+			expect(exchangeCliCode).not.toHaveBeenCalled();
 			expect(saveAuthCredentials).not.toHaveBeenCalled();
 		});
 
+		// ── Legacy token-in-URL fallback ──────────────────────────────────
+		// Compatibility window for users on the latest extension whose Jolli
+		// server hasn't shipped JOLLI-1270 yet. Once all server tenants emit
+		// `?code=` callbacks, this whole describe block (and the matching
+		// branch in handleAuthCallback) can be deleted.
+
+		it("should accept legacy token-in-URL callback with jolli_api_key", async () => {
+			const uri = makeUri(
+				"/auth-callback",
+				"token=legacy-token&jolli_api_key=sk-jol-legacy",
+			);
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result).toEqual({ success: true });
+			// No exchange call — old-server callback delivers the token directly.
+			expect(exchangeCliCode).not.toHaveBeenCalled();
+			expect(saveAuthCredentials).toHaveBeenCalledWith({
+				token: "legacy-token",
+				jolliApiKey: "sk-jol-legacy",
+			});
+			expect(executeCommand).toHaveBeenCalledWith(
+				"setContext",
+				"jollimemory.signedIn",
+				true,
+			);
+		});
+
+		it("should accept legacy token-only callback (no jolli_api_key param)", async () => {
+			const uri = makeUri("/auth-callback", "token=legacy-token");
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result).toEqual({ success: true });
+			expect(saveAuthCredentials).toHaveBeenCalledWith({
+				token: "legacy-token",
+			});
+		});
+
+		it("should log a warning when falling back to legacy token-in-URL", async () => {
+			// The warn log is our signal for tracking residual old-server traffic
+			// after the server rollout — needed to know when it's safe to drop
+			// the fallback branch.
+			const uri = makeUri("/auth-callback", "token=legacy-token");
+
+			await service.handleAuthCallback(uri as never);
+
+			expect(warn).toHaveBeenCalledWith(
+				"AuthService",
+				expect.stringContaining("legacy token-in-URL"),
+			);
+		});
+
+		it("should prefer code over token when both are present", async () => {
+			// A misconfigured server could in theory emit both — code takes
+			// priority because it leaks the actual credential through fewer
+			// surfaces (no browser history, no referer, no URI handler chain).
+			exchangeCliCode.mockResolvedValueOnce({
+				token: "exchanged-token",
+				jolliApiKey: "sk-jol-exchanged",
+			});
+			const uri = makeUri(
+				"/auth-callback",
+				"code=abc123&token=ignored-legacy-token&jolli_api_key=sk-jol-ignored",
+			);
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result).toEqual({ success: true });
+			expect(exchangeCliCode).toHaveBeenCalledWith(
+				"https://app.jolli.ai",
+				"abc123",
+			);
+			expect(saveAuthCredentials).toHaveBeenCalledWith({
+				token: "exchanged-token",
+				jolliApiKey: "sk-jol-exchanged",
+			});
+		});
+
+		it("should propagate save failure from the legacy token path", async () => {
+			// `saveAuthCredentials` calls `validateJolliApiKey` internally — a
+			// malformed `jolli_api_key` from a legacy server reaches us here as
+			// a thrown Error and must surface the same way as the code-flow
+			// save failures (so the user sees "Failed to save credentials: …"
+			// instead of a silent success).
+			saveAuthCredentials.mockRejectedValueOnce(
+				new Error("invalid jolli api key"),
+			);
+			const uri = makeUri(
+				"/auth-callback",
+				"token=legacy-token&jolli_api_key=garbage",
+			);
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("Failed to save credentials");
+				expect(result.error).toContain("invalid jolli api key");
+			}
+		});
+
 		it("should ignore unknown URI paths", async () => {
-			const uri = makeUri("/some-other-path", "token=test-token");
+			const uri = makeUri("/some-other-path", "code=abc123");
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -230,12 +376,42 @@ describe("AuthService", () => {
 			if (!result.success) {
 				expect(result.error).toBe("Unknown callback path");
 			}
+			expect(exchangeCliCode).not.toHaveBeenCalled();
 			expect(saveAuthCredentials).not.toHaveBeenCalled();
+		});
+
+		it("should surface the exchange failure message and skip saving", async () => {
+			exchangeCliCode.mockRejectedValueOnce(
+				new Error(
+					"Sign-in code expired or already used. Please try signing in again.",
+				),
+			);
+			const uri = makeUri("/auth-callback", "code=abc123");
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("expired or already used");
+			}
+			expect(saveAuthCredentials).not.toHaveBeenCalled();
+		});
+
+		it("should stringify non-Error throws from the exchange", async () => {
+			exchangeCliCode.mockRejectedValueOnce("bare exchange rejection");
+			const uri = makeUri("/auth-callback", "code=abc123");
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("bare exchange rejection");
+			}
 		});
 
 		it("should return error when save fails", async () => {
 			saveAuthCredentials.mockRejectedValueOnce(new Error("disk full"));
-			const uri = makeUri("/auth-callback", "token=test-token");
+			const uri = makeUri("/auth-callback", "code=abc123");
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -249,7 +425,7 @@ describe("AuthService", () => {
 		it("should stringify non-Error throw from saveAuthCredentials", async () => {
 			// Covers the `err instanceof Error ? err.message : String(err)` right branch.
 			saveAuthCredentials.mockRejectedValueOnce("bare string rejection");
-			const uri = makeUri("/auth-callback", "token=test-token");
+			const uri = makeUri("/auth-callback", "code=abc123");
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -260,13 +436,13 @@ describe("AuthService", () => {
 		});
 
 		it("should continue returning success when setContext throws", async () => {
-			// Covers the log.warn branch in the setContext catch (line 106).
+			// Covers the log.warn branch in the setContext catch.
 			// executeCommand succeeds for saveAuthCredentials's lifecycle but throws
 			// specifically for the setContext call.
 			executeCommand.mockImplementationOnce(() => {
 				throw new Error("setContext unavailable");
 			});
-			const uri = makeUri("/auth-callback", "token=test-token");
+			const uri = makeUri("/auth-callback", "code=abc123");
 
 			const result = await service.handleAuthCallback(uri as never);
 

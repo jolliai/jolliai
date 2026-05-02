@@ -60,8 +60,7 @@ export async function promptSetup(): Promise<void> {
 /** Opens the browser for OAuth login/signup and saves credentials on callback. */
 async function handleBrowserLogin(): Promise<void> {
 	try {
-		const baseUrl = getJolliUrl();
-		await browserLogin(`${baseUrl}/login`);
+		await browserLogin(getJolliUrl());
 		console.log("\n  Authenticated successfully ✓");
 		const configDir = getGlobalConfigDir();
 		const config = await loadConfigFromDir(configDir);

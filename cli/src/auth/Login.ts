@@ -2,8 +2,9 @@
  * Browser OAuth Login Flow
  *
  * Opens the user's browser to the Jolli login/signup page and starts a local
- * HTTP server to receive the OAuth callback. On success, persists the auth
- * token (and optionally an API key) to the global config.
+ * HTTP server to receive the OAuth callback. On success, redeems the
+ * single-use exchange code (JOLLI-1270) and persists the auth token (and
+ * optionally an API key) to the global config.
  */
 
 import { createServer, type Server, type ServerResponse } from "node:http";
@@ -11,19 +12,25 @@ import { URL } from "node:url";
 import open from "open";
 import { loadConfig } from "../core/SessionTracker.js";
 import { saveAuthCredentials } from "./AuthConfig.js";
+import { exchangeCliCode } from "./CliExchange.js";
 
 /**
- * Opens the browser to `baseUrl` with a CLI callback URL, waits for the OAuth
- * redirect, and saves the resulting credentials.
+ * Opens the browser to `${jolliUrl}/login` with a CLI callback URL, waits for
+ * the OAuth redirect, redeems the exchange code, and saves the resulting
+ * credentials.
  *
  * Uses port 0 so the OS assigns a free port — avoids EADDRINUSE conflicts.
  *
- * @param baseUrl - Full login page URL (e.g. `https://app.jolli.ai/login`)
+ * @param jolliUrl Origin of the Jolli server (e.g. `https://app.jolli.ai`).
+ *   The same origin is used to build the login page URL and to redeem the
+ *   exchange code, so the two halves of the flow can never disagree on which
+ *   tenant is being signed into.
  */
-export function browserLogin(baseUrl: string): Promise<void> {
+export function browserLogin(jolliUrl: string): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const server = createLoginServer({
 			port: 0,
+			jolliUrl,
 			async onListen() {
 				try {
 					const addr = server.address();
@@ -35,7 +42,7 @@ export function browserLogin(baseUrl: string): Promise<void> {
 
 					// If no jolliApiKey yet, ask the server to generate one during login
 					const config = await loadConfig();
-					let loginUrl = `${baseUrl}?cli_callback=${encodeURIComponent(callbackUrl)}`;
+					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}`;
 					if (!config.jolliApiKey) {
 						loginUrl += "&generate_api_key=true&client=cli";
 					}
@@ -59,6 +66,8 @@ export function browserLogin(baseUrl: string): Promise<void> {
 
 interface LoginServerOptions {
 	readonly port: number;
+	/** Jolli origin used to redeem the exchange code (server-to-server POST). */
+	readonly jolliUrl: string;
 	onListen(): void;
 	onSuccess(): void;
 	onError(error: Error): void;
@@ -66,9 +75,25 @@ interface LoginServerOptions {
 
 /**
  * Creates the local HTTP callback server. Exported for testing.
+ *
+ * Accepts two callback shapes, in priority order:
+ *
+ *   1. JOLLI-1270 code-exchange (preferred — issued by upgraded servers):
+ *        /callback?code=<32-byte-hex>
+ *      Redeemed via {@link exchangeCliCode}; the token never appears in the
+ *      browser address bar, history, or referer logs — it arrives only as the
+ *      JSON response of the server-to-server exchange POST.
+ *
+ *   2. Legacy token-in-URL (fallback — issued by pre-1270 servers):
+ *        /callback?token=<jwt>&jolli_api_key=<sk-jol-…>
+ *      Server delivers credentials directly in query params. Less secure
+ *      (token visible to browser history/referer), but required so users on
+ *      the latest CLI can still sign in to a server that hasn't shipped the
+ *      code-exchange endpoint yet. Remove once all server tenants issue
+ *      `?code=` callbacks.
  */
 export function createLoginServer(options: LoginServerOptions): Server {
-	const { port, onListen, onSuccess, onError } = options;
+	const { port, jolliUrl, onListen, onSuccess, onError } = options;
 
 	const server = createServer(async (req, res) => {
 		const url = new URL((req as { url: string }).url, `http://127.0.0.1:${port}`);
@@ -78,12 +103,7 @@ export function createLoginServer(options: LoginServerOptions): Server {
 			return;
 		}
 
-		const token = url.searchParams.get("token");
-		const jolliApiKey = url.searchParams.get("jolli_api_key");
 		const error = url.searchParams.get("error");
-
-		// Space param is intentionally ignored — JolliMemory doesn't use space slug
-
 		if (error) {
 			const errorMessage = getErrorMessage(error);
 			sendHtml(res, 400, "Login Failed", errorMessage);
@@ -92,22 +112,47 @@ export function createLoginServer(options: LoginServerOptions): Server {
 			return;
 		}
 
-		if (!token) {
-			sendHtml(res, 400, "Login Failed", "No token received");
-			closeServer(server);
-			onError(new Error("No token received"));
-			return;
-		}
+		// New and legacy shapes are mutually exclusive in practice (a given
+		// server emits one or the other), so this just selects the right path
+		// automatically — no version probe needed.
+		const code = url.searchParams.get("code");
+		const legacyToken = url.searchParams.get("token");
 
 		try {
-			await saveAuthCredentials({ token, jolliApiKey: jolliApiKey ?? undefined });
+			let credentials: { token: string; jolliApiKey?: string };
+			if (code) {
+				const exchanged = await exchangeCliCode(jolliUrl, code);
+				credentials = {
+					token: exchanged.token,
+					...(exchanged.jolliApiKey ? { jolliApiKey: exchanged.jolliApiKey } : {}),
+				};
+			} else if (legacyToken) {
+				// Legacy fallback. Logged at warn level so we can track residual
+				// usage and decide when it's safe to drop this branch.
+				console.warn(
+					"Using legacy token-in-URL callback — server has not been upgraded to JOLLI-1270 code-exchange",
+				);
+				const legacyApiKey = url.searchParams.get("jolli_api_key");
+				credentials = {
+					token: legacyToken,
+					...(legacyApiKey ? { jolliApiKey: legacyApiKey } : {}),
+				};
+			} else {
+				const message = "No authorization code or token received";
+				sendHtml(res, 400, "Login Failed", message);
+				closeServer(server);
+				onError(new Error(message));
+				return;
+			}
+			await saveAuthCredentials(credentials);
 			sendHtml(res, 200, "Login Successful!", "Your account has been connected to Jolli.");
 			closeServer(server);
 			onSuccess();
 		} catch (err) {
-			sendHtml(res, 500, "Error", `Failed to save token: ${err}`);
+			const message = err instanceof Error ? err.message : String(err);
+			sendHtml(res, 500, "Login Failed", message);
 			closeServer(server);
-			onError(err instanceof Error ? err : new Error(String(err)));
+			onError(err instanceof Error ? err : new Error(message));
 		}
 	});
 
@@ -200,6 +245,8 @@ function getErrorMessage(errorCode: string): string {
 		no_verified_emails: "No verified email addresses found on your account.",
 		server_error: "An unexpected server error occurred. Please try again later.",
 		failed_to_get_token: "We couldn't retrieve your credentials. Please try signing in again.",
+		user_denied: "Sign-in was cancelled. You can try again with `jolli auth login`.",
+		invalid_callback: "The sign-in callback was rejected by the server. Please try again.",
 	};
 
 	return errorMessages[errorCode] || `Authentication error: ${errorCode}`;

@@ -4182,7 +4182,10 @@ describe("CLI", () => {
 
 			await main(["auth", "login"]);
 
-			expect(browserLogin).toHaveBeenCalledWith(expect.stringContaining("/login"));
+			// browserLogin receives the Jolli origin (not the full /login URL) —
+			// it appends `/login` and the cli_callback params internally.
+			expect(browserLogin).toHaveBeenCalledTimes(1);
+			expect(browserLogin).toHaveBeenCalledWith(expect.stringMatching(/^https:\/\/[^/]+$/));
 		});
 
 		it("should report Jolli API Key saved when login yields jolliApiKey", async () => {

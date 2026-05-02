@@ -3938,9 +3938,9 @@ describe("Extension", () => {
 
 			const mockUri = {
 				path: "/auth-callback",
-				query: "token=test&jolli_api_key=sk-jol-test",
+				query: "code=abc123",
 				toString: () =>
-					"vscode://jolli.jollimemory-vscode/auth-callback?token=test",
+					"vscode://jolli.jollimemory-vscode/auth-callback?code=abc123",
 			};
 			await handler.handleUri(mockUri);
 
@@ -3954,7 +3954,7 @@ describe("Extension", () => {
 		it("shows error message on failed auth callback", async () => {
 			mockAuthService.handleAuthCallback.mockResolvedValueOnce({
 				success: false,
-				error: "No token received",
+				error: "No authorization code received",
 			});
 
 			const ctx = makeContext();
@@ -3977,7 +3977,7 @@ describe("Extension", () => {
 			await handler.handleUri(mockUri);
 
 			expect(showErrorMessage).toHaveBeenCalledWith(
-				"Jolli sign-in failed: No token received",
+				"Jolli sign-in failed: No authorization code received",
 			);
 		});
 	});
