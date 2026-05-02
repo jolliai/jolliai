@@ -60,6 +60,14 @@ function formatCause(cause: unknown): string {
 const LLM_PROXY_PATH = "/api/push/llm/complete";
 
 /**
+ * End-to-end timeout for proxy LLM calls (covers connect + headers + body).
+ * The backend invokes Anthropic non-streaming inside this request, so 120s is
+ * generous for a full LLM round-trip while bounding how long a stuck request
+ * can hold the QueueWorker file lock.
+ */
+const PROXY_FETCH_TIMEOUT_MS = 120_000;
+
+/**
  * LLM provider credentials and model selection.
  *
  * Two modes:
@@ -264,6 +272,7 @@ async function callProxy(options: LlmCallOptions, baseUrl: string): Promise<LlmC
 				...(orgSlug ? { "x-org-slug": orgSlug } : {}),
 			},
 			body,
+			signal: AbortSignal.timeout(PROXY_FETCH_TIMEOUT_MS),
 		});
 	} catch (err) {
 		// Transport-layer failure (DNS, TLS handshake, connect, reset, timeout).
