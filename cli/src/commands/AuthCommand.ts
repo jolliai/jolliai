@@ -15,8 +15,7 @@ export function registerAuthCommands(program: Command): void {
 		.description("Log in to Jolli via browser")
 		.action(async () => {
 			try {
-				const baseUrl = getJolliUrl();
-				await browserLogin(`${baseUrl}/login`);
+				await browserLogin(getJolliUrl());
 				const config = await loadConfig();
 				console.log("\n  Signed in successfully!");
 				console.log("  Auth token:        saved ✓");

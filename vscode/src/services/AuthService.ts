@@ -17,6 +17,7 @@ import {
 	getJolliUrl,
 	saveAuthCredentials,
 } from "../../../cli/src/auth/AuthConfig.js";
+import { exchangeCliCode } from "../../../cli/src/auth/CliExchange.js";
 import { loadConfig } from "../../../cli/src/core/SessionTracker.js";
 import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
 import { log } from "../util/Logger.js";
@@ -52,9 +53,23 @@ export class AuthService {
 	/**
 	 * Handles the OAuth callback URI from the browser redirect.
 	 *
-	 * Expected URI format (matching CLI convention from Login.ts):
-	 *   vscode://jolli.jollimemory-vscode/auth-callback?token=xxx&jolli_api_key=sk-jol-xxx
-	 *   vscode://jolli.jollimemory-vscode/auth-callback?error=oauth_failed
+	 * Two callback shapes are accepted, in priority order:
+	 *
+	 *   1. JOLLI-1270 code-exchange (preferred — issued by upgraded servers):
+	 *        vscode://jolli.jollimemory-vscode/auth-callback?code=<32-byte-hex>
+	 *      The `code` is single-use and TTL-bound; we POST it to
+	 *      `/api/auth/cli-exchange` to redeem the actual token + API key over a
+	 *      channel the browser never sees.
+	 *
+	 *   2. Legacy token-in-URL (fallback — issued by pre-1270 servers):
+	 *        vscode://jolli.jollimemory-vscode/auth-callback?token=<jwt>&jolli_api_key=<sk-jol-…>
+	 *      Server delivers credentials directly in query params. Less secure
+	 *      (token visible to URI handler chain), but required so users on the
+	 *      latest extension can still sign in to a server that hasn't shipped
+	 *      the code-exchange endpoint yet. Remove once all server tenants
+	 *      issue `?code=` callbacks.
+	 *
+	 *   3. Error: ?error=<code>
 	 */
 	async handleAuthCallback(uri: vscode.Uri): Promise<AuthCallbackResult> {
 		if (uri.path !== AUTH_CALLBACK_PATH) {
@@ -70,21 +85,51 @@ export class AuthService {
 			return { success: false, error: message };
 		}
 
+		// Prefer the code-exchange flow when the server offers it. The two
+		// shapes are mutually exclusive in practice (a given server emits one
+		// or the other), so this just selects the right path automatically.
+		const code = params.get("code");
 		const token = params.get("token");
-		if (!token) {
-			log.error("AuthService", "Auth callback missing token");
-			return { success: false, error: "No authentication token received" };
-		}
 
-		const jolliApiKey = params.get("jolli_api_key");
+		let credentials: { token: string; jolliApiKey?: string };
+		if (code) {
+			try {
+				const exchanged = await exchangeCliCode(getJolliUrl(), code);
+				credentials = {
+					token: exchanged.token,
+					...(exchanged.jolliApiKey
+						? { jolliApiKey: exchanged.jolliApiKey }
+						: {}),
+				};
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err);
+				log.error("AuthService", "Failed to exchange code: %s", message);
+				return { success: false, error: message };
+			}
+		} else if (token) {
+			// Legacy fallback. Logged at warn level so we can track residual
+			// usage and decide when it's safe to drop this branch.
+			log.warn(
+				"AuthService",
+				"Using legacy token-in-URL callback — server has not been upgraded to JOLLI-1270 code-exchange",
+			);
+			const legacyApiKey = params.get("jolli_api_key");
+			credentials = {
+				token,
+				...(legacyApiKey ? { jolliApiKey: legacyApiKey } : {}),
+			};
+		} else {
+			log.error("AuthService", "Auth callback missing code and token");
+			return {
+				success: false,
+				error: "No authorization code or token received",
+			};
+		}
 
 		try {
 			// Single atomic write — avoids leaving the config in a half-written state
 			// (token saved, API key dropped) if the second write were to fail.
-			await saveAuthCredentials({
-				token,
-				jolliApiKey: jolliApiKey ?? undefined,
-			});
+			await saveAuthCredentials(credentials);
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			log.error("AuthService", "Failed to save credentials: %s", message);
@@ -223,6 +268,10 @@ function getErrorMessage(errorCode: string): string {
 			"An unexpected server error occurred. Please try again later.",
 		failed_to_get_token:
 			"We couldn't retrieve your credentials. Please try signing in again.",
+		user_denied:
+			"Sign-in was cancelled. You can try again from the side panel.",
+		invalid_callback:
+			"The sign-in callback was rejected by the server. Please try again.",
 	};
 	return errorMessages[errorCode] ?? `Authentication error: ${errorCode}`;
 }
