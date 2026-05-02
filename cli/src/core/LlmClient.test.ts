@@ -278,6 +278,17 @@ describe("LlmClient", () => {
 			expect(result.outputTokens).toBe(5);
 		});
 
+		it("attaches an AbortSignal to bound proxy fetch wall time", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff --git a/src/foo.ts" },
+				jolliApiKey: "sk-jol-test.secret",
+			});
+
+			const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+			expect(init.signal).toBeInstanceOf(AbortSignal);
+		});
+
 		it("sends x-tenant-slug header from URL path", async () => {
 			const { parseBaseUrl, parseJolliApiKey } = vi.mocked(await import("./JolliApiUtils.js"));
 			parseBaseUrl.mockReturnValueOnce({ origin: "https://jolli-local.me", tenantSlug: "test1" });
