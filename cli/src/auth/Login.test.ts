@@ -25,6 +25,10 @@ vi.mock("open", () => ({
 import { browserLogin, createLoginServer } from "./Login.js";
 
 const TEST_JOLLI_URL = "https://app.jolli.ai";
+// Mimics the format of randomBytes(32).toString("hex") — 64 hex chars.
+// Tests pass this as expectedState and append &state=${TEST_STATE} to the
+// callback URL to simulate a server that correctly echoes the nonce.
+const TEST_STATE = "abcdef0123456789".repeat(4);
 
 describe("Login", () => {
 	let server: Server | null = null;
@@ -51,13 +55,14 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
 						reject(new Error("No address"));
 						return;
 					}
-					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-abc`);
+					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-abc&state=${TEST_STATE}`);
 				},
 				onSuccess: resolve,
 				onError: reject,
@@ -75,13 +80,14 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
 						reject(new Error("No address"));
 						return;
 					}
-					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-1`);
+					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-1&state=${TEST_STATE}`);
 				},
 				onSuccess: resolve,
 				onError: reject,
@@ -99,13 +105,14 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
 						reject(new Error("No address"));
 						return;
 					}
-					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-bare`);
+					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-bare&state=${TEST_STATE}`);
 				},
 				onSuccess: resolve,
 				onError: reject,
@@ -120,6 +127,7 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
@@ -142,6 +150,7 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
@@ -164,6 +173,7 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
@@ -185,6 +195,7 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
@@ -224,6 +235,7 @@ describe("Login", () => {
 				server = createLoginServer({
 					port: 0,
 					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
 					onListen() {
 						const addr = server?.address();
 						if (!addr || typeof addr === "string") {
@@ -250,6 +262,7 @@ describe("Login", () => {
 				server = createLoginServer({
 					port: 0,
 					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
 					onListen() {
 						const addr = server?.address();
 						if (!addr || typeof addr === "string") {
@@ -271,6 +284,7 @@ describe("Login", () => {
 				server = createLoginServer({
 					port: 0,
 					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
 					onListen() {
 						const addr = server?.address();
 						if (!addr || typeof addr === "string") {
@@ -297,6 +311,7 @@ describe("Login", () => {
 				server = createLoginServer({
 					port: 0,
 					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
 					onListen() {
 						const addr = server?.address();
 						if (!addr || typeof addr === "string") {
@@ -304,7 +319,7 @@ describe("Login", () => {
 							return;
 						}
 						fetch(
-							`http://127.0.0.1:${addr.port}/callback?code=abc&token=ignored&jolli_api_key=sk-jol-ignored`,
+							`http://127.0.0.1:${addr.port}/callback?code=abc&state=${TEST_STATE}&token=ignored&jolli_api_key=sk-jol-ignored`,
 						);
 					},
 					onSuccess: resolve,
@@ -326,6 +341,7 @@ describe("Login", () => {
 				server = createLoginServer({
 					port: 0,
 					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
 					onListen() {
 						const addr = server?.address();
 						if (!addr || typeof addr === "string") {
@@ -343,12 +359,164 @@ describe("Login", () => {
 		});
 	});
 
+	// ── CSRF state validation (RFC 6749 §10.12) ──────────────────────────
+	// Only enforced on the `?code=` path. The legacy `?token=` describe
+	// block above intentionally exercises callbacks WITHOUT state to confirm
+	// the bypass — without that bypass, users on pre-1270 servers would be
+	// locked out of sign-in.
+
+	describe("state (CSRF) validation", () => {
+		it("rejects a code callback that omits the state param", async () => {
+			const error = await new Promise<Error>((resolve, reject) => {
+				server = createLoginServer({
+					port: 0,
+					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
+					onListen() {
+						const addr = server?.address();
+						if (!addr || typeof addr === "string") {
+							reject(new Error("No address"));
+							return;
+						}
+						// Code present, state absent — exactly the shape of the
+						// CSRF attack the nonce defends against.
+						fetch(`http://127.0.0.1:${addr.port}/callback?code=attacker-code`);
+					},
+					onSuccess: () => reject(new Error("Should not succeed")),
+					onError: resolve,
+				});
+			});
+
+			expect(error.message).toContain("state mismatch");
+			expect(mockExchangeCliCode).not.toHaveBeenCalled();
+			expect(mockSaveAuthCredentials).not.toHaveBeenCalled();
+		});
+
+		it("rejects a code callback whose state does not match the expected nonce", async () => {
+			const error = await new Promise<Error>((resolve, reject) => {
+				server = createLoginServer({
+					port: 0,
+					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
+					onListen() {
+						const addr = server?.address();
+						if (!addr || typeof addr === "string") {
+							reject(new Error("No address"));
+							return;
+						}
+						fetch(`http://127.0.0.1:${addr.port}/callback?code=attacker-code&state=wrong-state`);
+					},
+					onSuccess: () => reject(new Error("Should not succeed")),
+					onError: resolve,
+				});
+			});
+
+			expect(error.message).toContain("state mismatch");
+			expect(mockExchangeCliCode).not.toHaveBeenCalled();
+		});
+
+		it("rejects a code callback whose state matches in length but not content", async () => {
+			// timingSafeEqual requires equal-length inputs — a length-matched
+			// mismatch exercises the actual constant-time compare path.
+			const wrongSameLength = "0".repeat(TEST_STATE.length);
+			expect(wrongSameLength.length).toBe(TEST_STATE.length);
+
+			const error = await new Promise<Error>((resolve, reject) => {
+				server = createLoginServer({
+					port: 0,
+					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
+					onListen() {
+						const addr = server?.address();
+						if (!addr || typeof addr === "string") {
+							reject(new Error("No address"));
+							return;
+						}
+						fetch(`http://127.0.0.1:${addr.port}/callback?code=c&state=${wrongSameLength}`);
+					},
+					onSuccess: () => reject(new Error("Should not succeed")),
+					onError: resolve,
+				});
+			});
+
+			expect(error.message).toContain("state mismatch");
+		});
+
+		it("rejects a code callback whose state has matching JS length but non-ASCII bytes", async () => {
+			// Without a byte-aware length check, a state whose JS char length
+			// equals the expected nonce length but contains a non-ASCII char
+			// (extra UTF-8 continuation bytes) slips past `a.length !== b.length`
+			// and crashes `timingSafeEqual` with RangeError. That throw, raised
+			// outside the inner try/catch, leaves browserLogin's Promise hanging
+			// — a usable DoS against an in-flight sign-in. This test pins the
+			// clean rejection path so the regression can't sneak back.
+			const sneakyState = `${"0".repeat(TEST_STATE.length - 1)}é`;
+			expect(sneakyState.length).toBe(TEST_STATE.length);
+			expect(Buffer.byteLength(sneakyState, "utf8")).not.toBe(Buffer.byteLength(TEST_STATE, "utf8"));
+
+			const error = await new Promise<Error>((resolve, reject) => {
+				server = createLoginServer({
+					port: 0,
+					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
+					onListen() {
+						const addr = server?.address();
+						if (!addr || typeof addr === "string") {
+							reject(new Error("No address"));
+							return;
+						}
+						fetch(`http://127.0.0.1:${addr.port}/callback?code=c&state=${encodeURIComponent(sneakyState)}`);
+					},
+					onSuccess: () => reject(new Error("Should not succeed")),
+					onError: resolve,
+				});
+			});
+
+			expect(error.message).toContain("state mismatch");
+			expect(mockExchangeCliCode).not.toHaveBeenCalled();
+		});
+
+		it("does NOT enforce state on the legacy token-in-URL fallback", async () => {
+			// Legacy compatibility window — pre-1270 servers don't echo state.
+			// Validating here would lock those users out of sign-in. The
+			// dedicated legacy describe block above asserts the happy path;
+			// this test just pins the design decision in one obvious place.
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				await new Promise<void>((resolve, reject) => {
+					server = createLoginServer({
+						port: 0,
+						jolliUrl: TEST_JOLLI_URL,
+						expectedState: TEST_STATE,
+						onListen() {
+							const addr = server?.address();
+							if (!addr || typeof addr === "string") {
+								reject(new Error("No address"));
+								return;
+							}
+							// No state on the URL — would be rejected on the
+							// code path, but the legacy token path tolerates it.
+							fetch(`http://127.0.0.1:${addr.port}/callback?token=legacy-tk-no-state`);
+						},
+						onSuccess: resolve,
+						onError: reject,
+					});
+				});
+
+				expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "legacy-tk-no-state" });
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+	});
+
 	it("returns 404 for non-callback paths", async () => {
 		let responseStatus = 0;
 
 		server = createLoginServer({
 			port: 0,
 			jolliUrl: TEST_JOLLI_URL,
+			expectedState: TEST_STATE,
 			onListen() {
 				const addr = server?.address();
 				if (!addr || typeof addr === "string") return;
@@ -374,13 +542,14 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
 						reject(new Error("No address"));
 						return;
 					}
-					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-expired`);
+					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-expired&state=${TEST_STATE}`);
 				},
 				onSuccess: () => reject(new Error("Should not succeed")),
 				onError: resolve,
@@ -398,13 +567,14 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
 						reject(new Error("No address"));
 						return;
 					}
-					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-1`);
+					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-1&state=${TEST_STATE}`);
 				},
 				onSuccess: () => reject(new Error("Should not succeed")),
 				onError: resolve,
@@ -421,13 +591,14 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
 						reject(new Error("No address"));
 						return;
 					}
-					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-1`);
+					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-1&state=${TEST_STATE}`);
 				},
 				onSuccess: () => reject(new Error("Should not succeed")),
 				onError: resolve,
@@ -444,13 +615,14 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen() {
 					const addr = server?.address();
 					if (!addr || typeof addr === "string") {
 						reject(new Error("No address"));
 						return;
 					}
-					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-1`);
+					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-1&state=${TEST_STATE}`);
 				},
 				onSuccess: () => reject(new Error("Should not succeed")),
 				onError: resolve,
@@ -478,6 +650,7 @@ describe("Login", () => {
 				server = createLoginServer({
 					port: 0,
 					jolliUrl: TEST_JOLLI_URL,
+					expectedState: TEST_STATE,
 					onListen() {
 						const addr = server?.address();
 						if (!addr || typeof addr === "string") {
@@ -505,6 +678,7 @@ describe("Login", () => {
 			const s = createLoginServer({
 				port: 0,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen: () => resolve(s),
 				onSuccess: vi.fn(),
 				onError: vi.fn(),
@@ -517,6 +691,7 @@ describe("Login", () => {
 			server = createLoginServer({
 				port: blockerPort,
 				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
 				onListen: () => reject(new Error("Should not listen")),
 				onSuccess: () => reject(new Error("Should not succeed")),
 				onError: resolve,
@@ -529,16 +704,19 @@ describe("Login", () => {
 
 	describe("browserLogin", () => {
 		/**
-		 * Simulates a browser: extracts cli_callback from the opened URL and
-		 * sends a callback with the supplied code. The exchange step itself is
-		 * stubbed via `mockExchangeCliCode`, so the test only asserts the URL
+		 * Simulates a browser: extracts cli_callback + state from the opened
+		 * URL and sends a callback that echoes state unchanged — mirrors what
+		 * an upgraded server does on the redirect. The exchange step is stubbed
+		 * via `mockExchangeCliCode`, so the test only asserts the URL
 		 * round-trip.
 		 */
 		function simulateBrowserCallback(code: string) {
 			return (url: string) => {
-				const callbackUrl = new URL(url).searchParams.get("cli_callback");
+				const parsed = new URL(url);
+				const callbackUrl = parsed.searchParams.get("cli_callback");
+				const state = parsed.searchParams.get("state");
 				if (callbackUrl) {
-					fetch(`${callbackUrl}?code=${code}`);
+					fetch(`${callbackUrl}?code=${code}&state=${state ?? ""}`);
 				}
 				return { unref: vi.fn() };
 			};
@@ -557,6 +735,21 @@ describe("Login", () => {
 			expect(openedUrl).toContain("client=cli");
 			expect(mockExchangeCliCode).toHaveBeenCalledWith(TEST_JOLLI_URL, "browser-code");
 			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "browser-token" });
+		});
+
+		it("includes a 256-bit hex state nonce on the login URL (RFC 6749 §10.12)", async () => {
+			mockLoadConfig.mockResolvedValue({});
+			mockExchangeCliCode.mockResolvedValue({ token: "browser-token-3" });
+			mockOpen.mockImplementation(simulateBrowserCallback("browser-code-3"));
+
+			await browserLogin(TEST_JOLLI_URL);
+
+			const openedUrl = mockOpen.mock.calls[0][0] as string;
+			const state = new URL(openedUrl).searchParams.get("state");
+			// 32 bytes → 64 hex chars. Asserting the format guards both the
+			// existence of the param and that we're not regressing to a weaker
+			// nonce (e.g. Math.random()).
+			expect(state).toMatch(/^[0-9a-f]{64}$/);
 		});
 
 		it("omits generate_api_key when a jolliApiKey is already configured", async () => {
