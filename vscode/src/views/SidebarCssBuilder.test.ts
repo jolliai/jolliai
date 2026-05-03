@@ -162,6 +162,18 @@ describe("kb-search-box (always-visible toolbar search input)", () => {
 		// always-visible toolbar input.
 		expect(css).not.toContain(".search-row");
 	});
+
+	it("declares .toolbar-worker-status to push the indicator left and shrink gracefully", () => {
+		const css = buildSidebarCss();
+		expect(css).toContain(".toolbar-worker-status");
+		// flex:1 1 auto packs the refresh button to the right edge (same trick
+		// as .kb-search-box). min-width:0 lets the label ellipsis-truncate
+		// rather than overflow.
+		expect(css).toMatch(/\.toolbar-worker-status\s*{[\s\S]*?flex:\s*1 1 auto/);
+		expect(css).toMatch(/\.toolbar-worker-status\s*{[\s\S]*?min-width:\s*0/);
+		expect(css).toContain(".toolbar-worker-status-text");
+		expect(css).toContain("text-overflow: ellipsis");
+	});
 });
 
 describe("checkbox + row-leading", () => {

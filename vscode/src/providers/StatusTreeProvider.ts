@@ -96,6 +96,10 @@ export class StatusTreeProvider
 		return items.map((it) => treeItemToSerialized(it));
 	}
 
+	getWorkerBusy(): boolean {
+		return this.store.getSnapshot().workerBusy;
+	}
+
 	dispose(): void {
 		this.unsubscribe();
 		this._onDidChangeTreeData.dispose();

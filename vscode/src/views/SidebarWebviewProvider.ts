@@ -33,6 +33,13 @@ export interface SidebarWebviewDeps {
 	statusProvider?: {
 		serialize(): ReadonlyArray<SerializedTreeItem>;
 		onDidChangeTreeData: (cb: () => void) => { dispose: () => void };
+		/**
+		 * Returns the current workerBusy flag from StatusStore. Pushed to the
+		 * webview as a dedicated `worker:busy` message so the Branch tab toolbar
+		 * can show an "AI summary in progress…" indicator without depending on
+		 * the unstable `status:data` entries list.
+		 */
+		getWorkerBusy(): boolean;
 	};
 	kbFolders?: { listChildren(relPath: string): Promise<FolderNode> };
 	/** Returns absolute path under kbRoot for a relative path. */
@@ -332,6 +339,13 @@ export class SidebarWebviewProvider
 		this.postMessage({
 			type: "status:data",
 			entries: this.deps.statusProvider.serialize(),
+		});
+		// Worker-busy travels on its own channel so the Branch tab toolbar can
+		// react without re-parsing status entries. Pushed alongside status:data
+		// because both originate from the same StatusStore change event.
+		this.postMessage({
+			type: "worker:busy",
+			busy: this.deps.statusProvider.getWorkerBusy(),
 		});
 	}
 

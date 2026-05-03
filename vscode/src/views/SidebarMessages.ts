@@ -283,4 +283,5 @@ export type SidebarInboundMsg =
 			readonly entries: ReadonlyArray<SerializedTreeItem>;
 	  }
 	| { readonly type: "enabled:changed"; readonly enabled: boolean }
-	| { readonly type: "auth:changed"; readonly authenticated: boolean };
+	| { readonly type: "auth:changed"; readonly authenticated: boolean }
+	| { readonly type: "worker:busy"; readonly busy: boolean };
