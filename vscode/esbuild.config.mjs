@@ -40,7 +40,7 @@ const base = {
 	// node:sqlite (Node 22.5+) is lazy-imported and gated by hasNodeSqliteSupport(), so
 	// this bundle loads fine on older hosts — OpenCode scanning just stays disabled.
 	target: "node18",
-	sourcemap: true,
+	sourcemap: false,
 	minify: true,
 	logLevel: "info",
 };

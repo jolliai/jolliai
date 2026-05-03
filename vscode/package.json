@@ -379,7 +379,7 @@
 		"lint": "npx biome check --error-on-warnings src/",
 		"lint:fix": "npx biome check --write src/",
 		"test": "node ./scripts/run-vitest.mjs --coverage",
-		"build": "node ./scripts/copy-codicons.mjs && node esbuild.config.mjs",
+		"build": "npm run clean && node ./scripts/copy-codicons.mjs && node esbuild.config.mjs",
 		"build:watch": "node esbuild.config.mjs --watch",
 		"package": "npm run build && npx @vscode/vsce package --no-dependencies --allow-missing-repository",
 		"install:vsix": "node -e \"const v=require('./package.json').version;const {execSync}=require('child_process');const fs=require('fs');const path=require('path');const isWin=process.platform==='win32';let code;if(isWin){code=path.join(process.env.LOCALAPPDATA||'','Programs','Microsoft VS Code','bin','code.cmd')}else{const candidates=['/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code','/usr/bin/code','/snap/bin/code'];code=candidates.find(p=>fs.existsSync(p))||'code'}execSync((isWin?'\\\"'+code+'\\\"':'\\\"'+code+'\\\"')+' --install-extension jollimemory-vscode-'+v+'.vsix --force',{stdio:'inherit'});\"",
