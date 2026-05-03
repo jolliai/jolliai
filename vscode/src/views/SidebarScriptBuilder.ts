@@ -81,8 +81,16 @@ export function buildSidebarScript(): string {
     // commit collapsed; we mirror that default but persist user toggles
     // across reloads via vscode.setState.
     commitsExpanded: {},
-    scrollTops: {}
+    scrollTops: {},
+    // Live flag pushed by the host whenever the post-commit Worker is holding
+    // the lock. Drives the "AI summary in progress…" indicator on the Branch
+    // toolbar. Not persisted — start from false on every load and let the next
+    // worker:busy or status push correct it.
+    workerBusy: false
   }, vscode.getState() || {});
+  // workerBusy is intentionally reset on load (above), even if persisted state
+  // had it set — the lock is process-bound and cannot survive a reload.
+  state.workerBusy = false;
   function persist() { vscode.setState(state); }
 
   // Display name for the repo-root header rendered above the KB tree (origin
@@ -101,6 +109,7 @@ export function buildSidebarScript(): string {
   const ctxMenu = document.getElementById('context-menu');
   const tabButtonKb = document.getElementById('tab-button-kb');
   const tabBranchBtn = document.getElementById('tab-button-branch');
+  const statusIconBtn = document.getElementById('status-icon-btn');
   const tabContents = {
     kb: document.getElementById('tab-content-kb'),
     branch: document.getElementById('tab-content-branch'),
@@ -147,6 +156,10 @@ export function buildSidebarScript(): string {
 
   function attachTextTip(el, text) {
     if (!el || !text) return el;
+    // dataset.tip lets callers update the tooltip text without re-attaching the
+    // listeners (used by status-icon-btn to follow OK/Warning/Error). Read at
+    // show time, not at attach time, so closure text is just the fallback.
+    el.dataset.tip = text;
     let lastX = 0;
     let lastY = 0;
     el.addEventListener('mousemove', function(e) {
@@ -158,7 +171,7 @@ export function buildSidebarScript(): string {
       lastY = e.clientY;
       if (textTipTimer) clearTimeout(textTipTimer);
       textTipTimer = setTimeout(function() {
-        showTextTip(text, lastX, lastY);
+        showTextTip(el.dataset.tip || text, lastX, lastY);
       }, TEXT_TIP_SHOW_DELAY_MS);
     });
     el.addEventListener('mouseleave', function() {
@@ -166,6 +179,11 @@ export function buildSidebarScript(): string {
     });
     return el;
   }
+
+  // Status icon lives in the static HTML skeleton (not the toolbar), so attach
+  // its tooltip once here. renderStatus updates dataset.tip in lockstep with
+  // the indicator color so the hover text always matches the dot.
+  if (statusIconBtn) attachTextTip(statusIconBtn, 'Jolli Memory: All good');
 
   // ---- Tab switching ----
   function switchTab(tab) {
@@ -187,8 +205,17 @@ export function buildSidebarScript(): string {
     // already-cached data appears instead of the initial "Loading..." placeholder.
     if (tab === 'branch') renderBranch();
     else if (tab === 'kb') {
-      if (state.kbMode === 'folders') renderFolders();
-      else renderMemories();
+      if (state.kbMode === 'folders') {
+        renderFolders();
+        // Folders are lazy: host only pushes kb:foldersData in response to a
+        // kb:expandFolder request. The init handler fires that request only when
+        // initial activeTab is already 'kb'; if the user lands on Branch/Status
+        // first and switches to Memory Bank later, the root cache stays empty
+        // and renderFolders() is stuck on "Loading...". Re-request on cache miss.
+        if (!folderCache['']) vscode.postMessage({ type: 'kb:expandFolder', path: '' });
+      } else {
+        renderMemories();
+      }
     }
     vscode.postMessage({ type: 'tab:switched', tab: tab });
   }
@@ -273,12 +300,33 @@ export function buildSidebarScript(): string {
         state.authenticated
           ? iconButton('sign-out', 'Sign Out', 'sign-out')
           : iconButton('sign-in', 'Sign In', 'sign-in'),
-        iconButton('disable-jolli', 'Disable Jolli Memory', 'debug-disconnect'),
+        iconButton('disable-jolli', 'Disable Jolli Memory', 'stop-circle'),
         iconButton('refresh', 'Refresh', 'refresh'),
       ];
       mountIn(tabToolbar, items);
     } else {
-      mountIn(tabToolbar, iconButton('refresh', 'Refresh', 'refresh'));
+      // Branch tab: optional left-side worker-busy indicator + refresh.
+      // The indicator container is always mounted so the right-edge refresh
+      // button stays in a stable position; its inner content is only filled
+      // when state.workerBusy is true.
+      const items = [];
+      const busyEl = el('div', {
+        className: 'toolbar-worker-status' + (state.workerBusy ? '' : ' hidden'),
+        id: 'toolbar-worker-status'
+      });
+      if (state.workerBusy) {
+        busyEl.appendChild(el('i', {
+          className: 'codicon codicon-loading codicon-modifier-spin',
+          'aria-hidden': 'true'
+        }));
+        busyEl.appendChild(el('span', {
+          className: 'toolbar-worker-status-text',
+          text: 'AI summary in progress…'
+        }));
+      }
+      items.push(busyEl);
+      items.push(iconButton('refresh', 'Refresh', 'refresh'));
+      mountIn(tabToolbar, items);
     }
   }
 
@@ -377,6 +425,15 @@ export function buildSidebarScript(): string {
         // toolbar; re-render so the swap takes effect immediately.
         if (state.activeTab === 'status') renderToolbar();
         break;
+      case 'worker:busy': {
+        const next = !!msg.busy;
+        if (state.workerBusy === next) break;
+        state.workerBusy = next;
+        // Only the Branch tab toolbar shows this indicator; other tabs ignore
+        // the flag, so re-render is scoped to avoid wiping their toolbars.
+        if (state.activeTab === 'branch') renderToolbar();
+        break;
+      }
       case 'branch:branchName':
         renderBranchTabName(msg.name, msg.detached);
         break;
@@ -569,19 +626,30 @@ export function buildSidebarScript(): string {
       }
     }
 
-    // Update the status indicator color in the tab bar based on overall health.
+    // Update the status indicator color (and matching tooltip text) based on
+    // overall health. The dot and the tip travel together so a red dot never
+    // says "All good" — they read the same entries array in one pass.
     const indicator = document.querySelector('#status-icon-btn .codicon');
     if (indicator) {
       // Worst icon color wins: red > yellow > green (default).
       let cls = 'status-icon-ok';
+      let tip = 'Jolli Memory: All good';
       const list = entries || [];
       for (let i = 0; i < list.length; i++) {
         const c = list[i].iconColor;
         const k = list[i].iconKey;
-        if (c === 'charts.red' || k === 'x' || k === 'error') { cls = 'status-icon-error'; break; }
-        if (c === 'charts.yellow' || k === 'warning' || k === 'alert') cls = 'status-icon-warn';
+        if (c === 'charts.red' || k === 'x' || k === 'error') {
+          cls = 'status-icon-error';
+          tip = 'Jolli Memory: Errors';
+          break;
+        }
+        if (c === 'charts.yellow' || k === 'warning' || k === 'alert') {
+          cls = 'status-icon-warn';
+          tip = 'Jolli Memory: Warnings';
+        }
       }
       indicator.className = 'codicon codicon-circle-filled ' + cls;
+      if (statusIconBtn) statusIconBtn.dataset.tip = tip;
     }
   }
 
@@ -825,6 +893,12 @@ export function buildSidebarScript(): string {
         'data-id': m.id,
         'data-hash': m.commitHash,
       }, [
+        // Leading M icon mirrors the Tree view (codicon-markdown tinted via
+        // kb-icon-memory) so a Memories-list row reads as the same artifact
+        // type as the Tree-mode memory file.
+        el('span', { className: 'memory-row-icon kb-icon-memory' }, [
+          el('i', { className: 'codicon codicon-markdown' }),
+        ]),
         el('div', { className: 'memory-row-main' }, [
           el('div', { className: 'title', text: m.title }),
           el('div', { className: 'meta' }, [
@@ -836,21 +910,34 @@ export function buildSidebarScript(): string {
           ]),
         ]),
         el('span', { className: 'inline-actions' }, [
-          el('button', {
-            type: 'button',
-            className: 'iconbtn',
-            'data-inline': 'copy-recall',
-            'data-hash': m.commitHash,
-            title: 'Copy Recall Prompt',
-            'aria-label': 'Copy Recall Prompt',
-          }, [el('i', { className: 'codicon codicon-copy' })]),
+          // Native title= is unreliable across webview focus transitions
+          // (see iconButton helper at the top of this file); attachTextTip
+          // drives the visible tooltip via the same plain-text tip popover
+          // used by toolbar buttons + status-icon-btn.
+          attachTextTip(
+            el('button', {
+              type: 'button',
+              className: 'iconbtn',
+              'data-inline': 'copy-recall',
+              'data-hash': m.commitHash,
+              'aria-label': 'Copy Recall Prompt',
+            }, [el('i', { className: 'codicon codicon-copy' })]),
+            'Copy Recall Prompt',
+          ),
         ]),
       ]);
       nodes.push(row);
     }
     if (memoriesState.hasMore) {
+      // Leading chevron-down occupies the same 16px icon column as the M
+      // glyph on real memory rows so the load-more row's text starts at the
+      // same x-coordinate (column-alignment, not pixel-padding tweaking).
+      // No kb-icon-memory tint — load-more is an action, not a memory.
       nodes.push(el('div', { className: 'memory-row', 'data-action': 'load-more' }, [
-        el('div', { className: 'title', text: 'Load more...' })
+        el('span', { className: 'memory-row-icon' }, [
+          el('i', { className: 'codicon codicon-chevron-down' }),
+        ]),
+        el('div', { className: 'title', text: 'Load more...' }),
       ]));
     }
     mountIn(container, nodes);
@@ -1063,6 +1150,14 @@ export function buildSidebarScript(): string {
   tabContents.kb.addEventListener('mouseover', function(e) {
     const row = e.target.closest('.memory-row[data-hash]');
     if (!row) return;
+    // Inline action buttons (e.g. Copy Recall) own their own attachTextTip
+    // tooltip; dismiss the row hover card so the two don't stack. mouseout
+    // can't do this alone — its row.contains(to) guard intentionally keeps
+    // the card open during intra-row child transitions.
+    if (e.target.closest('.inline-actions')) {
+      dismissHoverCard();
+      return;
+    }
     scheduleShowHoverCard(row.getAttribute('data-hash'), e.clientX, e.clientY);
   });
   tabContents.kb.addEventListener('mouseout', function(e) {
@@ -1482,9 +1577,11 @@ export function buildSidebarScript(): string {
         })
       : el('span', { className: 'twirl' });
     // Multi-commit mode renders a checkbox for squash-selection; single /
-    // merged / empty modes leave the slot empty (host omits checkboxState in
-    // those modes — see HistoryTreeProvider.getChildren). The slot is kept
-    // even when empty so commit rows align horizontally with commit-file rows.
+    // merged modes show a git-commit codicon in the slot instead, matching
+    // the legacy native TreeView (HistoryTreeProvider set iconPath to
+    // ThemeIcon("git-commit") whenever the checkbox was hidden). The slot
+    // width is kept constant so commit rows align horizontally with
+    // commit-file rows regardless of mode.
     const isMulti = branchData.commitsMode === 'multi';
     let leading;
     if (isMulti) {
@@ -1497,12 +1594,27 @@ export function buildSidebarScript(): string {
       cb.checked = !!item.isSelected;
       leading = el('span', { className: 'row-leading' }, [cb]);
     } else {
-      leading = el('span', { className: 'row-leading' });
+      leading = el('span', { className: 'row-leading' }, [
+        el('i', { className: 'codicon codicon-git-commit' }),
+      ]);
     }
+    // hasMem rows get the M (markdown) glyph tinted via kb-icon-memory —
+    // matches the Tree view's memory file rows and the Memories-list rows
+    // so all three surfaces share one visual vocabulary for "this row maps
+    // to a memory summary". Memory-less commits show codicon-code (< >) at
+    // default foreground weight, signalling "code-only commit, not yet
+    // promoted to a memory" while keeping the icon column aligned.
+    const memIcon = hasMem
+      ? el('span', { className: 'icon kb-icon-memory' }, [
+          el('i', { className: 'codicon codicon-markdown' }),
+        ])
+      : el('span', { className: 'icon' }, [
+          el('i', { className: 'codicon codicon-code' }),
+        ]);
     const kids = [
       twirl,
       leading,
-      el('span', { className: 'icon', text: hasMem ? '◉' : '●' }),
+      memIcon,
       el('span', { className: 'label', text: item.label }),
     ];
     if (item.description) {
@@ -1511,7 +1623,14 @@ export function buildSidebarScript(): string {
     if (hasMem) {
       kids.push(
         el('span', { className: 'inline-actions' }, [
-          el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'viewSummary', 'data-id': item.id, title: 'View Memory', text: '👁' }),
+          el('button', {
+            type: 'button',
+            className: 'iconbtn',
+            'data-inline': 'viewSummary',
+            'data-id': item.id,
+            title: 'View Memory',
+            'aria-label': 'View Memory',
+          }, [el('i', { className: 'codicon codicon-eye' })]),
         ]),
       );
     } else {

@@ -137,9 +137,60 @@ describe("SidebarScriptBuilder", () => {
 		expect(js.slice(handlerStart, handlerEnd)).toContain("renderToolbar()");
 	});
 
+	it("renders an AI summary indicator on the Branch tab toolbar when workerBusy", () => {
+		const js = buildSidebarScript();
+		// The indicator container + spinning loading codicon + label live in
+		// renderToolbar's branch (else) branch.
+		expect(js).toContain("toolbar-worker-status");
+		expect(js).toContain("codicon-loading codicon-modifier-spin");
+		expect(js).toContain("AI summary in progress…");
+	});
+
+	it("handles worker:busy by re-rendering toolbar only when on Branch tab", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("'worker:busy'");
+		// Idempotent: skip re-render when the flag did not change.
+		expect(js).toContain("if (state.workerBusy === next) break;");
+		// Scoped re-render: only Branch tab needs to repaint. Take the whole
+		// case body (up to the next `case `) since the early-return `break;` for
+		// the no-change branch sits before the activeTab guard.
+		const handlerStart = js.indexOf("'worker:busy'");
+		const handlerEnd = js.indexOf("case ", handlerStart + 1);
+		expect(handlerStart).toBeGreaterThan(-1);
+		expect(js.slice(handlerStart, handlerEnd)).toContain(
+			"state.activeTab === 'branch'",
+		);
+	});
+
 	it("posts kb:expandFolder when an unexpanded folder is clicked", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("kb:expandFolder");
+	});
+
+	it("attaches a dynamic tooltip to the Status indicator that follows OK/Warning/Error", () => {
+		const js = buildSidebarScript();
+		// One-time attach at script init (the icon lives in the static skeleton).
+		expect(js).toContain(
+			"if (statusIconBtn) attachTextTip(statusIconBtn, 'Jolli Memory: All good')",
+		);
+		// renderStatus picks the tip in the same loop that picks the indicator
+		// class, so the dot color and the tooltip can never disagree.
+		expect(js).toContain("tip = 'Jolli Memory: Errors'");
+		expect(js).toContain("tip = 'Jolli Memory: Warnings'");
+		expect(js).toContain("statusIconBtn.dataset.tip = tip");
+		// attachTextTip prefers dataset.tip on show so dynamic updates don't
+		// require re-attaching listeners.
+		expect(js).toContain("showTextTip(el.dataset.tip || text");
+	});
+
+	it("re-requests root listing when switching into KB folders mode with empty cache", () => {
+		const js = buildSidebarScript();
+		// Without this, init-time fetch is the only kb:expandFolder trigger and
+		// folders mode shows "Loading..." forever for users who first land on
+		// Branch/Status and only later click Memory Bank.
+		expect(js).toContain(
+			"if (!folderCache['']) vscode.postMessage({ type: 'kb:expandFolder', path: '' })",
+		);
 	});
 
 	it("renders M/P/N letter glyphs for memory/plan/note file nodes", () => {
@@ -499,6 +550,19 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toMatch(/renderPlanRow/);
 			expect(js).toMatch(/renderChangeRow/);
 			expect(js).toMatch(/renderCommitRow/);
+		});
+
+		it("fills the leading slot with a git-commit codicon when no checkbox is shown", () => {
+			const js = buildSidebarScript();
+			// Visual parity with the legacy native TreeView: HistoryTreeProvider
+			// used to set iconPath = ThemeIcon("git-commit") in single-commit /
+			// merged modes; the webview must do the same so the column doesn't
+			// look empty when checkboxes are hidden.
+			const renderCommitRow = js.slice(
+				js.indexOf("function renderCommitRow"),
+				js.indexOf("function renderCommitFileRow"),
+			);
+			expect(renderCommitRow).toContain("'codicon codicon-git-commit'");
 		});
 	});
 

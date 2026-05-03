@@ -160,6 +160,7 @@ describe("SidebarWebviewProvider", () => {
 					storedHandler = cb;
 					return { dispose: () => {} };
 				},
+				getWorkerBusy: () => false,
 			},
 		});
 		provider.resolveWebviewView(view as unknown as never);
@@ -169,6 +170,47 @@ describe("SidebarWebviewProvider", () => {
 		expect(
 			sent.some((m) => m.type === "status:data" && m.entries === statusItems),
 		).toBe(true);
+	});
+
+	it("posts worker:busy alongside status:data so the Branch toolbar can react", () => {
+		const view = makeMockView();
+		let busyValue = false;
+		let storedHandler: (() => void) | undefined;
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			statusProvider: {
+				serialize: () => [],
+				onDidChangeTreeData: (cb: () => void) => {
+					storedHandler = cb;
+					return { dispose: () => {} };
+				},
+				getWorkerBusy: () => busyValue,
+			},
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		// Initial pushStatus on ready: busy=false.
+		const initial = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		expect(
+			initial.some((m) => m.type === "worker:busy" && m.busy === false),
+		).toBe(true);
+		// Flip the flag and re-fire onDidChangeTreeData; expect a follow-up push
+		// with busy=true.
+		busyValue = true;
+		storedHandler?.();
+		const after = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		expect(after.some((m) => m.type === "worker:busy" && m.busy === true)).toBe(
+			true,
+		);
 	});
 
 	it("posts an empty-tree kb:foldersData when listChildren rejects (so webview leaves Loading)", async () => {
@@ -1295,6 +1337,7 @@ describe("SidebarWebviewProvider", () => {
 			statusProvider: {
 				serialize: () => [],
 				onDidChangeTreeData: () => ({ dispose: statusDispose }),
+				getWorkerBusy: () => false,
 			},
 			memoriesProvider: {
 				serialize: () => ({ items: [], hasMore: false }),

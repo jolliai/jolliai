@@ -147,6 +147,24 @@ export function buildSidebarCss(): string {
     outline: 1px solid var(--vscode-focusBorder, #007acc);
     outline-offset: -1px;
   }
+  /* Worker-busy indicator on the Branch tab toolbar. flex:1 1 auto pushes the
+     refresh button to the right edge — same packing trick as .kb-search-box.
+     min-width:0 lets the label truncate gracefully on narrow sidebars. */
+  .toolbar-worker-status {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 12px;
+    padding-left: 2px;
+  }
+  .toolbar-worker-status-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .iconbtn {
     width: 24px;
     height: 22px;
@@ -365,6 +383,9 @@ export function buildSidebarCss(): string {
     gap: 8px;
   }
   .memory-row:hover { background: var(--vscode-list-hoverBackground); }
+  .memory-row-icon { width: 16px; flex-shrink: 0; text-align: center; }
+  .memory-row-icon .codicon { font-size: 14px; line-height: 1; }
+  .memory-row-icon.kb-icon-memory .codicon { color: var(--vscode-charts-blue, #2f7adc); }
   .memory-row-main { flex: 1; min-width: 0; }
   .memory-row .title {
     color: var(--vscode-foreground);

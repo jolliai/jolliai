@@ -45,9 +45,9 @@ export function buildSidebarHtml(
   <div class="sidebar-root" id="sidebar-root">
     <div class="tab-bar" id="tab-bar" role="tablist">
       <button class="tab active" type="button" data-tab="branch" role="tab" id="tab-button-branch"><i class="codicon codicon-git-branch tab-icon-leading" aria-hidden="true"></i><span class="tab-label">(loading)</span></button>
-      <button class="tab" type="button" data-tab="kb" role="tab" id="tab-button-kb"><i class="codicon codicon-book tab-icon-leading" aria-hidden="true"></i><span class="tab-label">Memory Bank</span></button>
+      <button class="tab" type="button" data-tab="kb" role="tab" id="tab-button-kb"><i class="codicon codicon-book tab-icon-leading" aria-hidden="true"></i><span class="tab-label">MEMORY BANK</span></button>
       <div class="tab-bar-right">
-        <button class="tab tab-icon" type="button" data-tab="status" id="status-icon-btn" title="Status">
+        <button class="tab tab-icon" type="button" data-tab="status" id="status-icon-btn">
           <i class="codicon codicon-circle-filled"></i>
         </button>
       </div>

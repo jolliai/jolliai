@@ -603,6 +603,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			serialize: () => statusProvider.serialize(),
 			onDidChangeTreeData:
 				statusProvider.onDidChangeTreeData.bind(statusProvider),
+			getWorkerBusy: () => statusProvider.getWorkerBusy(),
 		},
 		memoriesProvider: {
 			serialize: () => memoriesProvider.serialize(),

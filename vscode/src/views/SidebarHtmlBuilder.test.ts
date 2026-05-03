@@ -51,6 +51,10 @@ describe("SidebarHtmlBuilder", () => {
 		expect(html).not.toContain('data-action="open-settings"');
 		// Status icon still carries data-tab="status" for switchTab compatibility
 		expect(html).toContain('data-tab="status"');
+		// Native title="Status" was removed in favor of attachTextTip (which
+		// renders a dynamic OK/Warnings/Errors tooltip from JS). Keeping both
+		// would cause the native title to flash before the project tip shows.
+		expect(html).not.toContain('id="status-icon-btn" title=');
 	});
 
 	it("includes 3 tab content panels with stable ids", () => {
