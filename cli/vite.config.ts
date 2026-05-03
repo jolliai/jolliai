@@ -30,7 +30,8 @@ export default defineConfig({
 			},
 		},
 		outDir: "dist",
-		sourcemap: true,
+		sourcemap: false,
+		minify: "esbuild",
 		ssr: true,
 	},
 	test: {
