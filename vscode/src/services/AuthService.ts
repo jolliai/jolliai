@@ -11,6 +11,7 @@
  * Display info (site URL, tenant) is derived from the API key metadata.
  */
 
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as vscode from "vscode";
 import {
 	clearAuthCredentials,
@@ -51,6 +52,17 @@ export type AuthCallbackResult =
  */
 export class AuthService {
 	/**
+	 * CSRF state nonce for the in-flight login attempt (RFC 6749 §10.12).
+	 * Set in {@link openSignInPage} before opening the browser; consumed and
+	 * cleared on the next {@link handleAuthCallback} so a captured state can't
+	 * be replayed against a future login. `null` between attempts.
+	 *
+	 * Lives in memory only — extension reload during a sign-in invalidates
+	 * the in-flight attempt by design (the user retries).
+	 */
+	private pendingState: string | null = null;
+
+	/**
 	 * Handles the OAuth callback URI from the browser redirect.
 	 *
 	 * Two callback shapes are accepted, in priority order:
@@ -90,6 +102,35 @@ export class AuthService {
 		// or the other), so this just selects the right path automatically.
 		const code = params.get("code");
 		const token = params.get("token");
+
+		// CSRF check (RFC 6749 §10.12). Only enforced on the code-exchange
+		// path; the legacy token-in-URL fallback predates state support and
+		// pre-1270 servers don't echo state. Tightening it here would lock
+		// those users out of sign-in. The legacy gap closes when the fallback
+		// is removed.
+		//
+		// One-shot: clearing pendingState before validation prevents an
+		// attacker who rapidly fires two callbacks (one with the right
+		// state, one without) from getting two attempts at the same nonce.
+		const expectedState = this.pendingState;
+		this.pendingState = null;
+		if (code) {
+			const receivedState = params.get("state");
+			if (
+				!expectedState ||
+				!receivedState ||
+				!constantTimeStringEqual(receivedState, expectedState)
+			) {
+				log.error(
+					"AuthService",
+					"Auth callback state mismatch — rejecting (possible CSRF attempt)",
+				);
+				return {
+					success: false,
+					error: "Invalid sign-in callback (state mismatch). Please try again.",
+				};
+			}
+		}
 
 		let credentials: { token: string; jolliApiKey?: string };
 		if (code) {
@@ -182,12 +223,15 @@ export class AuthService {
 		// Mirrors the CLI's browserLogin() behaviour in Login.ts.
 		const { jolliApiKey } = await loadConfig();
 		const generateKeyParam = jolliApiKey ? "" : "&generate_api_key=true";
+		// 256-bit CSRF nonce per RFC 6749 §10.12. Sent on the login URL and
+		// validated on the matching handleAuthCallback().
+		const state = randomBytes(32).toString("hex");
 		// `getJolliUrl()` throws if `JOLLI_URL` env var points off the
 		// allowlist — catch it here so an attacker-pointed env var surfaces as
 		// a friendly error dialog instead of an unhandled command exception.
 		let loginUrl: string;
 		try {
-			loginUrl = `${getJolliUrl()}/login?cli_callback=${encodeURIComponent(callbackUri)}${generateKeyParam}&client=vscode`;
+			loginUrl = `${getJolliUrl()}/login?cli_callback=${encodeURIComponent(callbackUri)}&state=${state}${generateKeyParam}&client=vscode`;
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			log.error("AuthService", "getJolliUrl rejected: %s", message);
@@ -196,16 +240,22 @@ export class AuthService {
 			);
 			return;
 		}
+		// Commit pendingState only after the URL builds — otherwise a thrown
+		// getJolliUrl() would leave behind a state that pairs with no
+		// outgoing nonce.
+		this.pendingState = state;
 		log.info("AuthService", "Opening browser for sign-in");
 		try {
 			const opened = await vscode.env.openExternal(vscode.Uri.parse(loginUrl));
 			if (!opened) {
+				this.pendingState = null;
 				log.warn("AuthService", "openExternal returned false for login URL");
 				vscode.window.showErrorMessage(
 					"Couldn't launch the browser for sign-in. Please try again.",
 				);
 			}
 		} catch (err: unknown) {
+			this.pendingState = null;
 			const message = err instanceof Error ? err.message : String(err);
 			log.error("AuthService", "openExternal failed: %s", message);
 			vscode.window.showErrorMessage(
@@ -253,6 +303,23 @@ function resolveUriScheme(): string {
 	// VSCode Insiders appName, and we want the more specific match to win.
 	if (appName.includes("insiders")) return "vscode-insiders";
 	return "vscode";
+}
+
+/**
+ * Constant-time string equality. Mirrors Login.ts. The 256-bit nonce makes
+ * timing leaks infeasible in practice, but `timingSafeEqual` costs nothing
+ * extra and keeps the comparison correct-by-construction.
+ *
+ * Length is compared on the encoded byte buffers, not the JS strings:
+ * `String.prototype.length` counts UTF-16 code units while `Buffer.from`
+ * defaults to UTF-8, so an attacker-supplied non-ASCII state of matching
+ * char-length would otherwise crash `timingSafeEqual` with RangeError.
+ */
+function constantTimeStringEqual(a: string, b: string): boolean {
+	const ba = Buffer.from(a);
+	const bb = Buffer.from(b);
+	if (ba.length !== bb.length) return false;
+	return timingSafeEqual(ba, bb);
 }
 
 /** Maps server-returned error codes to user-friendly messages. Mirrors Login.ts. */

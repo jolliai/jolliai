@@ -123,6 +123,19 @@ function makeUri(path: string, query: string): { path: string; query: string } {
 	return { path, query };
 }
 
+/**
+ * Drives openSignInPage() to seed `pendingState`, then returns the nonce that
+ * appeared on the resulting login URL — exactly what an upgraded server would
+ * echo back as `state=…`. Tests use this so they exercise the full nonce
+ * lifecycle (generate → URL → callback) without poking private state.
+ */
+async function primeStateViaSignIn(service: AuthService): Promise<string> {
+	const callsBefore = uriParse.mock.calls.length;
+	await service.openSignInPage();
+	const parsed = uriParse.mock.calls[callsBefore]?.[0] ?? "";
+	return new URL(parsed).searchParams.get("state") ?? "";
+}
+
 function makeConfig(
 	overrides: Partial<JolliMemoryConfig> = {},
 ): JolliMemoryConfig {
@@ -154,7 +167,8 @@ describe("AuthService", () => {
 				token: "test-token",
 				jolliApiKey: "sk-jol-test",
 			});
-			const uri = makeUri("/auth-callback", "code=abc123");
+			const state = await primeStateViaSignIn(service);
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -177,7 +191,8 @@ describe("AuthService", () => {
 
 		it("should save only the token when the exchange omits an API key", async () => {
 			exchangeCliCode.mockResolvedValueOnce({ token: "test-token" });
-			const uri = makeUri("/auth-callback", "code=abc123");
+			const state = await primeStateViaSignIn(service);
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -186,8 +201,9 @@ describe("AuthService", () => {
 		});
 
 		it("should pass the configured JOLLI_URL through to the exchange", async () => {
+			const state = await primeStateViaSignIn(service);
 			getJolliUrl.mockReturnValueOnce("https://custom.jolli.ai");
-			const uri = makeUri("/auth-callback", "code=abc123");
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
 
 			await service.handleAuthCallback(uri as never);
 
@@ -326,9 +342,10 @@ describe("AuthService", () => {
 				token: "exchanged-token",
 				jolliApiKey: "sk-jol-exchanged",
 			});
+			const state = await primeStateViaSignIn(service);
 			const uri = makeUri(
 				"/auth-callback",
-				"code=abc123&token=ignored-legacy-token&jolli_api_key=sk-jol-ignored",
+				`code=abc123&state=${state}&token=ignored-legacy-token&jolli_api_key=sk-jol-ignored`,
 			);
 
 			const result = await service.handleAuthCallback(uri as never);
@@ -367,6 +384,142 @@ describe("AuthService", () => {
 			}
 		});
 
+		// ── CSRF state validation (RFC 6749 §10.12) ──────────────────────
+		// Only enforced on the `?code=` path. Legacy `?token=` callbacks
+		// from pre-1270 servers don't echo state and can't be tightened
+		// without locking those users out of sign-in — see the legacy
+		// describe block above for the bypass tests.
+
+		describe("state validation", () => {
+			it("rejects a code callback that omits the state param", async () => {
+				await primeStateViaSignIn(service);
+				const uri = makeUri("/auth-callback", "code=attacker-code");
+
+				const result = await service.handleAuthCallback(uri as never);
+
+				expect(result.success).toBe(false);
+				if (!result.success) {
+					expect(result.error).toContain("state mismatch");
+				}
+				expect(exchangeCliCode).not.toHaveBeenCalled();
+				expect(saveAuthCredentials).not.toHaveBeenCalled();
+			});
+
+			it("rejects a code callback whose state does not match the pending nonce", async () => {
+				await primeStateViaSignIn(service);
+				const uri = makeUri(
+					"/auth-callback",
+					"code=attacker-code&state=wrong-state",
+				);
+
+				const result = await service.handleAuthCallback(uri as never);
+
+				expect(result.success).toBe(false);
+				if (!result.success) {
+					expect(result.error).toContain("state mismatch");
+				}
+				expect(exchangeCliCode).not.toHaveBeenCalled();
+			});
+
+			it("rejects a code callback whose state matches in length but not content", async () => {
+				// timingSafeEqual requires equal-length inputs — a length-matched
+				// mismatch exercises the actual constant-time compare path.
+				const real = await primeStateViaSignIn(service);
+				const wrongSameLength = "0".repeat(real.length);
+				expect(wrongSameLength).not.toBe(real);
+				const uri = makeUri(
+					"/auth-callback",
+					`code=c&state=${wrongSameLength}`,
+				);
+
+				const result = await service.handleAuthCallback(uri as never);
+
+				expect(result.success).toBe(false);
+				if (!result.success) {
+					expect(result.error).toContain("state mismatch");
+				}
+			});
+
+			it("rejects a code callback whose state has matching JS length but non-ASCII bytes", async () => {
+				// Without a byte-aware length check, a state whose JS char
+				// length equals the expected nonce length but contains a
+				// non-ASCII char (extra UTF-8 continuation bytes) slips past
+				// `a.length !== b.length` and crashes `timingSafeEqual` with
+				// RangeError — breaking the documented AuthCallbackResult
+				// contract by rejecting the Promise instead of resolving to
+				// `{ success: false, error: "...state mismatch..." }`.
+				const real = await primeStateViaSignIn(service);
+				const sneakyState = `${"0".repeat(real.length - 1)}é`;
+				expect(sneakyState.length).toBe(real.length);
+				expect(Buffer.byteLength(sneakyState, "utf8")).not.toBe(
+					Buffer.byteLength(real, "utf8"),
+				);
+				const uri = makeUri(
+					"/auth-callback",
+					`code=c&state=${encodeURIComponent(sneakyState)}`,
+				);
+
+				const result = await service.handleAuthCallback(uri as never);
+
+				expect(result.success).toBe(false);
+				if (!result.success) {
+					expect(result.error).toContain("state mismatch");
+				}
+				expect(exchangeCliCode).not.toHaveBeenCalled();
+			});
+
+			it("rejects a code callback when no sign-in was initiated (no pending state)", async () => {
+				// An attacker firing a callback URI directly — without the user
+				// ever having clicked Sign In — has no nonce to forge against.
+				const uri = makeUri(
+					"/auth-callback",
+					"code=attacker-code&state=any-value",
+				);
+
+				const result = await service.handleAuthCallback(uri as never);
+
+				expect(result.success).toBe(false);
+				if (!result.success) {
+					expect(result.error).toContain("state mismatch");
+				}
+			});
+
+			it("consumes the pending state on one callback (replay protection)", async () => {
+				// First callback uses the nonce; a second callback with the same
+				// state must fail because pendingState was cleared.
+				const state = await primeStateViaSignIn(service);
+				exchangeCliCode.mockResolvedValueOnce({ token: "first-token" });
+
+				const firstResult = await service.handleAuthCallback(
+					makeUri("/auth-callback", `code=first&state=${state}`) as never,
+				);
+				expect(firstResult.success).toBe(true);
+
+				const secondResult = await service.handleAuthCallback(
+					makeUri("/auth-callback", `code=second&state=${state}`) as never,
+				);
+				expect(secondResult.success).toBe(false);
+				if (!secondResult.success) {
+					expect(secondResult.error).toContain("state mismatch");
+				}
+			});
+
+			it("does NOT enforce state on the legacy token-in-URL fallback", async () => {
+				// Pre-1270 servers don't echo state; demanding it would lock
+				// those users out of sign-in. The legacy hole closes when the
+				// fallback is removed.
+				await primeStateViaSignIn(service);
+				const uri = makeUri("/auth-callback", "token=legacy-tk");
+
+				const result = await service.handleAuthCallback(uri as never);
+
+				expect(result).toEqual({ success: true });
+				expect(saveAuthCredentials).toHaveBeenCalledWith({
+					token: "legacy-tk",
+				});
+			});
+		});
+
 		it("should ignore unknown URI paths", async () => {
 			const uri = makeUri("/some-other-path", "code=abc123");
 
@@ -386,7 +539,8 @@ describe("AuthService", () => {
 					"Sign-in code expired or already used. Please try signing in again.",
 				),
 			);
-			const uri = makeUri("/auth-callback", "code=abc123");
+			const state = await primeStateViaSignIn(service);
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -399,7 +553,8 @@ describe("AuthService", () => {
 
 		it("should stringify non-Error throws from the exchange", async () => {
 			exchangeCliCode.mockRejectedValueOnce("bare exchange rejection");
-			const uri = makeUri("/auth-callback", "code=abc123");
+			const state = await primeStateViaSignIn(service);
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -411,7 +566,8 @@ describe("AuthService", () => {
 
 		it("should return error when save fails", async () => {
 			saveAuthCredentials.mockRejectedValueOnce(new Error("disk full"));
-			const uri = makeUri("/auth-callback", "code=abc123");
+			const state = await primeStateViaSignIn(service);
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -425,7 +581,8 @@ describe("AuthService", () => {
 		it("should stringify non-Error throw from saveAuthCredentials", async () => {
 			// Covers the `err instanceof Error ? err.message : String(err)` right branch.
 			saveAuthCredentials.mockRejectedValueOnce("bare string rejection");
-			const uri = makeUri("/auth-callback", "code=abc123");
+			const state = await primeStateViaSignIn(service);
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -442,7 +599,8 @@ describe("AuthService", () => {
 			executeCommand.mockImplementationOnce(() => {
 				throw new Error("setContext unavailable");
 			});
-			const uri = makeUri("/auth-callback", "code=abc123");
+			const state = await primeStateViaSignIn(service);
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
 
 			const result = await service.handleAuthCallback(uri as never);
 
@@ -491,6 +649,88 @@ describe("AuthService", () => {
 			);
 			expect(parsed).toContain("generate_api_key=true");
 			expect(parsed).toContain("client=vscode");
+		});
+
+		it("should include a 256-bit hex state nonce on the login URL (RFC 6749 §10.12)", async () => {
+			await service.openSignInPage();
+
+			const parsed = uriParse.mock.calls[0]?.[0] ?? "";
+			const state = new URL(parsed).searchParams.get("state");
+			// 32 bytes → 64 hex chars. Asserting the format guards both the
+			// existence of the param and that we're not regressing to a weaker
+			// nonce (e.g. Math.random()).
+			expect(state).toMatch(/^[0-9a-f]{64}$/);
+		});
+
+		it("should generate a fresh nonce on each sign-in attempt", async () => {
+			await service.openSignInPage();
+			await service.openSignInPage();
+
+			const first = new URL(uriParse.mock.calls[0]?.[0] ?? "").searchParams.get(
+				"state",
+			);
+			const second = new URL(
+				uriParse.mock.calls[1]?.[0] ?? "",
+			).searchParams.get("state");
+			expect(first).toBeTruthy();
+			expect(second).toBeTruthy();
+			expect(first).not.toBe(second);
+		});
+
+		it("should clear pendingState when openExternal returns false (covers leak-on-launch-failure path)", async () => {
+			// Sets pendingState, then openExternal fails → state must be
+			// cleared so it doesn't validate a future code callback.
+			openExternal.mockResolvedValueOnce(false);
+			await service.openSignInPage();
+
+			// A subsequent code callback would fail with "state mismatch" even
+			// if it carries the nonce from the failed attempt's URL — because
+			// pendingState is null again.
+			const failedUrl = uriParse.mock.calls[0]?.[0] ?? "";
+			const failedState = new URL(failedUrl).searchParams.get("state") ?? "";
+			const result = await service.handleAuthCallback(
+				makeUri("/auth-callback", `code=stale&state=${failedState}`) as never,
+			);
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("state mismatch");
+			}
+		});
+
+		it("should clear pendingState when openExternal throws (covers leak-on-throw path)", async () => {
+			openExternal.mockRejectedValueOnce(new Error("no browser"));
+			await service.openSignInPage();
+
+			const failedUrl = uriParse.mock.calls[0]?.[0] ?? "";
+			const failedState = new URL(failedUrl).searchParams.get("state") ?? "";
+			const result = await service.handleAuthCallback(
+				makeUri("/auth-callback", `code=stale&state=${failedState}`) as never,
+			);
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("state mismatch");
+			}
+		});
+
+		it("should not commit pendingState when getJolliUrl throws (no URL was opened)", async () => {
+			// If URL construction fails, no nonce reached the user's browser —
+			// keeping pendingState null prevents a later callback from
+			// matching against a state that was never sent out.
+			getJolliUrl.mockImplementationOnce(() => {
+				throw new Error("JOLLI_URL points off the allowlist");
+			});
+
+			await service.openSignInPage();
+
+			// Fire a code callback with any state — without a pending state,
+			// validation must reject.
+			const result = await service.handleAuthCallback(
+				makeUri("/auth-callback", "code=c&state=anything") as never,
+			);
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("state mismatch");
+			}
 		});
 
 		it("should use custom JOLLI_URL when configured", async () => {

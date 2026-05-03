@@ -7,6 +7,7 @@
  * optionally an API key) to the global config.
  */
 
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import open from "open";
@@ -28,9 +29,14 @@ import { exchangeCliCode } from "./CliExchange.js";
  */
 export function browserLogin(jolliUrl: string): Promise<void> {
 	return new Promise((resolve, reject) => {
+		// 256-bit CSRF nonce per RFC 6749 §10.12. Sent on the login URL and
+		// echoed back unchanged on the `?code=` callback; mismatch means the
+		// callback didn't originate from the login flow we just opened.
+		const expectedState = randomBytes(32).toString("hex");
 		const server = createLoginServer({
 			port: 0,
 			jolliUrl,
+			expectedState,
 			async onListen() {
 				try {
 					const addr = server.address();
@@ -42,7 +48,7 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 
 					// If no jolliApiKey yet, ask the server to generate one during login
 					const config = await loadConfig();
-					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}`;
+					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}`;
 					if (!config.jolliApiKey) {
 						loginUrl += "&generate_api_key=true&client=cli";
 					}
@@ -68,6 +74,13 @@ interface LoginServerOptions {
 	readonly port: number;
 	/** Jolli origin used to redeem the exchange code (server-to-server POST). */
 	readonly jolliUrl: string;
+	/**
+	 * CSRF nonce (RFC 6749 §10.12) the server is expected to echo on the
+	 * `?code=` callback. Required on the production code-exchange path; the
+	 * legacy `?token=` fallback bypasses this check because pre-1270 servers
+	 * don't echo state and we'd otherwise lock those users out of sign-in.
+	 */
+	readonly expectedState: string;
 	onListen(): void;
 	onSuccess(): void;
 	onError(error: Error): void;
@@ -93,7 +106,7 @@ interface LoginServerOptions {
  *      `?code=` callbacks.
  */
 export function createLoginServer(options: LoginServerOptions): Server {
-	const { port, jolliUrl, onListen, onSuccess, onError } = options;
+	const { port, jolliUrl, expectedState, onListen, onSuccess, onError } = options;
 
 	const server = createServer(async (req, res) => {
 		const url = new URL((req as { url: string }).url, `http://127.0.0.1:${port}`);
@@ -117,6 +130,22 @@ export function createLoginServer(options: LoginServerOptions): Server {
 		// automatically — no version probe needed.
 		const code = url.searchParams.get("code");
 		const legacyToken = url.searchParams.get("token");
+
+		// CSRF check (RFC 6749 §10.12): only enforced on the code-exchange
+		// path. The legacy token-in-URL branch predates state support; pre-1270
+		// servers don't echo state, and demanding it here would lock those
+		// users out of sign-in. The legacy gap closes when the fallback is
+		// removed.
+		if (code) {
+			const receivedState = url.searchParams.get("state");
+			if (!receivedState || !constantTimeStringEqual(receivedState, expectedState)) {
+				const message = "Invalid sign-in callback (state mismatch). Please try again.";
+				sendHtml(res, 400, "Login Failed", message);
+				closeServer(server);
+				onError(new Error(message));
+				return;
+			}
+		}
 
 		try {
 			let credentials: { token: string; jolliApiKey?: string };
@@ -169,6 +198,23 @@ export function createLoginServer(options: LoginServerOptions): Server {
 function closeServer(server: Server): void {
 	server.closeAllConnections();
 	server.close();
+}
+
+/**
+ * Constant-time string equality. The 256-bit nonce makes timing leaks
+ * infeasible in practice, but `timingSafeEqual` costs nothing extra and keeps
+ * the comparison correct-by-construction.
+ *
+ * Length is compared on the encoded byte buffers, not the JS strings:
+ * `String.prototype.length` counts UTF-16 code units while `Buffer.from`
+ * defaults to UTF-8, so an attacker-supplied non-ASCII state of matching
+ * char-length would otherwise crash `timingSafeEqual` with RangeError.
+ */
+function constantTimeStringEqual(a: string, b: string): boolean {
+	const ba = Buffer.from(a);
+	const bb = Buffer.from(b);
+	if (ba.length !== bb.length) return false;
+	return timingSafeEqual(ba, bb);
 }
 
 /** Escapes HTML special characters to prevent XSS in rendered callback pages. */
