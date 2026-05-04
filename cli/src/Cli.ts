@@ -13,6 +13,11 @@
  *   recall        — Recall development context for a branch (alias: context)
  *   export        — Export summaries as markdown to ~/Documents/jollimemory/
  *   auth          — Authentication commands (login, logout, status)
+ *   new           — Scaffold a new documentation project (Content_Folder)
+ *   convert       — Convert a documentation folder to Nextra-compatible structure
+ *   dev           — Start a dev server with hot reload
+ *   build         — Build a static site with search indexing
+ *   start         — Build a static site with search indexing, then serve
  *
  * Internal commands (hidden from --help):
  *   migrate       — Migrate orphan branch + index to v3 format
@@ -24,11 +29,14 @@ import { registerAuthCommands } from "./commands/AuthCommand.js";
 import { registerCleanCommand } from "./commands/CleanCommand.js";
 import { checkVersionMismatch, VERSION } from "./commands/CliUtils.js";
 import { registerConfigureCommand } from "./commands/ConfigureCommand.js";
+import { registerConvertCommand } from "./commands/ConvertCommand.js";
 import { registerDoctorCommand } from "./commands/DoctorCommand.js";
 import { registerDisableCommand, registerEnableCommand } from "./commands/EnableCommand.js";
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
+import { registerNewCommand } from "./commands/NewCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
+import { registerBuildCommand, registerDevCommand, registerStartCommand } from "./commands/StartCommand.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
 import { setSilentConsole } from "./Logger.js";
@@ -67,6 +75,11 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerExportPromptCommand(program);
 	registerExportCommand(program);
 	registerAuthCommands(program);
+	registerNewCommand(program);
+	registerConvertCommand(program);
+	registerDevCommand(program);
+	registerBuildCommand(program);
+	registerStartCommand(program);
 
 	checkVersionMismatch();
 
