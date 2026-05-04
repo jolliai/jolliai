@@ -595,8 +595,7 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 				nonEmptyString,
 				nonEmptyString,
 				fc.array(navItem, { minLength: 0, maxLength: 5 }),
-				(title, description, nav) => {
-					const config = { title, description, nav };
+				(_title, _description, _nav) => {
 					try {
 						JSON.parse(generatePackageJson());
 						return true;
@@ -627,8 +626,7 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 				nonEmptyString,
 				nonEmptyString,
 				fc.array(navItem, { minLength: 0, maxLength: 5 }),
-				(title, description, nav) => {
-					const config = { title, description, nav };
+				(_title, _description, _nav) => {
 					const pkg = JSON.parse(generatePackageJson());
 					return requiredDeps.every((dep) => dep in pkg.dependencies);
 				},
