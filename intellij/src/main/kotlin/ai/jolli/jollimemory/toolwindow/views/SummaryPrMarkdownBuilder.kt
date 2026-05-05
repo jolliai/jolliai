@@ -44,11 +44,19 @@ object SummaryPrMarkdownBuilder {
         }
 
         SummaryMarkdownBuilder.pushPlansAndNotesSection(lines, summary)
+        pushPrRecapSection(lines, summary)
         pushPrE2eTestSection(lines, summary.e2eTestGuide)
         pushPrTopicsSection(lines, allTopics)
         SummaryMarkdownBuilder.pushFooter(lines)
 
         return lines.joinToString("\n")
+    }
+
+    /** Appends the Quick Recap section for PR markdown if present. */
+    private fun pushPrRecapSection(lines: MutableList<String>, summary: CommitSummary) {
+        val recap = summary.recap?.trim()
+        if (recap.isNullOrEmpty()) return
+        lines.addAll(listOf("", "## Quick recap", "", recap, "", "---"))
     }
 
     // ── GitHub folding helpers ──────────────────────────────────────────────

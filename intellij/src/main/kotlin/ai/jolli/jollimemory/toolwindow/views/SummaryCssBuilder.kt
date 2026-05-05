@@ -206,12 +206,49 @@ $rootVars
     display: none;
   }
 
-  /* ── E2E Test Guide ── */
-  .e2e-placeholder {
+  /* ── Empty-state placeholder text (E2E Test Guide, Quick recap) ── */
+  .e2e-placeholder,
+  .recap-placeholder {
     color: var(--description-fg);
     font-size: 0.92em;
     line-height: 1.5;
     margin: 4px 0 12px;
+  }
+
+  /* ── Quick Recap ── */
+  .recap-body p {
+    margin: 0 0 8px;
+    line-height: 1.6;
+  }
+  .recap-body p:last-child {
+    margin-bottom: 0;
+  }
+  .recap-edit-area {
+    width: 100%;
+    min-height: 120px;
+    font-family: $MONO_FONT_FAMILY;
+    font-size: 0.92em;
+    padding: 8px 10px;
+    border: 1px solid var(--input-border);
+    border-radius: 4px;
+    background: var(--input-bg);
+    color: var(--fg);
+    resize: vertical;
+    box-sizing: border-box;
+    line-height: 1.5;
+  }
+  .recap-edit-area:focus {
+    outline: none;
+    border-color: var(--focus-border);
+  }
+  .recap-edit-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .recap-section.recap-editing .recap-body,
+  .recap-section.recap-editing .topic-actions {
+    display: none;
   }
   .e2e-scenario .callout.preconditions { background: var(--callout-trigger-bg); }
   .e2e-scenario .callout.preconditions .callout-label { color: var(--callout-trigger-label); }
