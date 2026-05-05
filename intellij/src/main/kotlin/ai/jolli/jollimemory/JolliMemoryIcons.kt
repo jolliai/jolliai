@@ -74,4 +74,10 @@ object JolliMemoryIcons {
 
     /** Red circle — status indicator for errors/failed state. */
     val CircleRed: Icon = IconLoader.getIcon("/icons/circle-red.svg", JolliMemoryIcons::class.java)
+
+    /** Jolli Memory logo — used for tool window icon and onboarding. */
+    val JolliLogo: Icon = IconLoader.getIcon("/icons/jollimemory.svg", JolliMemoryIcons::class.java)
+
+    /** Red cloud — cloud sync disabled (not signed in to Jolli). */
+    val CloudRed: Icon = IconLoader.getIcon("/icons/cloud-red.svg", JolliMemoryIcons::class.java)
 }

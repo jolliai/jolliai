@@ -114,7 +114,7 @@ class SquashAction : AnAction() {
                     }
                     try {
                         log.info("Generating squash message via AI…")
-                        message = Summarizer.generateSquashMessage(commitData, ticketId, isFullSquash, config.apiKey, config.model, config.jolliApiKey)
+                        message = Summarizer.generateSquashMessage(commitData, ticketId, isFullSquash, config.apiKey, config.model, config.jolliApiKey, config.aiProvider)
                         log.info("Squash message generated: %s", message)
                     } catch (ex: Exception) {
                         log.error("Failed to generate squash message: %s", ex.message)

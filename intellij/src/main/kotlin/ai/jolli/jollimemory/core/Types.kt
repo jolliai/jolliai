@@ -277,7 +277,7 @@ data class SummaryIndex(
     val commitAliases: Map<String, String>? = null,
 )
 
-/** Configuration stored in .jolli/jollimemory/config.json */
+/** Configuration stored in .jolli/jollimemory/config-intellij.json */
 data class JolliMemoryConfig(
     val apiKey: String? = null,
     val model: String? = null,
@@ -288,6 +288,8 @@ data class JolliMemoryConfig(
     val claudeEnabled: Boolean? = null,
     val codexEnabled: Boolean? = null,
     val geminiEnabled: Boolean? = null,
+    /** AI summarization provider: "jolli" (proxy) or "anthropic" (direct). null defers to legacy "Anthropic wins" routing. */
+    val aiProvider: String? = null,
     val logLevel: String? = null,
     val logLevelOverrides: Map<String, String>? = null,
 )
@@ -326,6 +328,7 @@ data class CommitMessageParams(
     val apiKey: String? = null,
     val model: String? = null,
     val jolliApiKey: String? = null,
+    val aiProvider: String? = null,
 )
 
 /** Result of enable/disable operations */

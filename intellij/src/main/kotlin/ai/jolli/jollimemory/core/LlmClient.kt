@@ -26,13 +26,25 @@ object LlmClient {
 
     /**
      * Determines which credential source to use.
-     * Returns null if no credentials are available.
+     *
+     * When [aiProvider] is set, it controls preference order; the other source is the fallback
+     * when the preferred one has no credentials. When null, defers to the historical
+     * "Anthropic wins" order. Returns null if no credentials are available.
      */
-    fun resolveCredentialSource(apiKey: String?, jolliApiKey: String?): CredentialSource? {
-        if (!apiKey.isNullOrBlank()) return CredentialSource.ANTHROPIC_CONFIG
-        if (!System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return CredentialSource.ANTHROPIC_ENV
-        if (!jolliApiKey.isNullOrBlank()) return CredentialSource.JOLLI_PROXY
-        return null
+    fun resolveCredentialSource(
+        apiKey: String?,
+        jolliApiKey: String?,
+        aiProvider: String? = null,
+    ): CredentialSource? {
+        val anthropicConfig = if (!apiKey.isNullOrBlank()) CredentialSource.ANTHROPIC_CONFIG else null
+        val anthropicEnv = if (!System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) CredentialSource.ANTHROPIC_ENV else null
+        val jolliProxy = if (!jolliApiKey.isNullOrBlank()) CredentialSource.JOLLI_PROXY else null
+
+        return when (aiProvider) {
+            "jolli" -> jolliProxy ?: anthropicConfig ?: anthropicEnv
+            "anthropic" -> anthropicConfig ?: anthropicEnv ?: jolliProxy
+            else -> anthropicConfig ?: anthropicEnv ?: jolliProxy
+        }
     }
 
     /**
@@ -54,8 +66,9 @@ object LlmClient {
         model: String?,
         maxTokens: Int?,
         prompt: String?,
+        aiProvider: String? = null,
     ): LlmCallResult {
-        val source = resolveCredentialSource(apiKey, jolliApiKey)
+        val source = resolveCredentialSource(apiKey, jolliApiKey, aiProvider)
             ?: throw RuntimeException("No LLM credentials available. Sign in to Jolli or configure an Anthropic API key.")
 
         log.info("LLM call: action=%s, source=%s", action, source)

@@ -124,6 +124,7 @@ class CommitAIAction : AnAction() {
                         apiKey = config.apiKey,
                         model = config.model,
                         jolliApiKey = config.jolliApiKey,
+                        aiProvider = config.aiProvider,
                     ))
 
                     // Step 6: Show dialog on EDT

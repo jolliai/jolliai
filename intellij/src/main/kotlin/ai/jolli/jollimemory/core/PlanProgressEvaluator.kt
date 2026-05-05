@@ -96,6 +96,7 @@ Return a single JSON object (no markdown fences, no explanation):
         apiKey: String?,
         model: String? = null,
         jolliApiKey: String? = null,
+        aiProvider: String? = null,
     ): PlanProgressEvalResult? {
         val topicsText = renderTopics(topics)
 
@@ -121,6 +122,7 @@ Return a single JSON object (no markdown fences, no explanation):
                 model = Summarizer.resolveModelId(model ?: "haiku"),
                 maxTokens = MAX_TOKENS,
                 prompt = prompt,
+                aiProvider = aiProvider,
             )
         } catch (e: Exception) {
             log.warn("Plan progress LLM call failed: %s", e.message)

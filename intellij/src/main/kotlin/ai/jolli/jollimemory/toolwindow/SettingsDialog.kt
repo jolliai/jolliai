@@ -4,11 +4,12 @@ import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.ValidationInfo
+import com.intellij.openapi.util.Disposer
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
-import com.intellij.ui.components.JBPasswordField
 import com.intellij.ui.components.JBTextField
 import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
@@ -20,50 +21,51 @@ import javax.swing.DefaultComboBoxModel
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JSeparator
-import com.intellij.openapi.ui.ComboBox
 
 /**
- * Full settings dialog matching the VS Code Jolli Memory Settings webview.
+ * Full settings dialog opened from the gear icon on the MEMORIES panel toolbar.
  *
- * Sections:
- *   1. AI Configuration — Anthropic API Key, Model, Max Tokens
- *   2. Integrations — Jolli API Key, Claude/Codex/Gemini toggles
- *   3. Files — Exclude Patterns
+ * Sections (top to bottom):
+ *   1. Sign-in bar (mirrors the tool window banner; settings hint dropped)
+ *   2. General — AI provider selector (own component, see [AiProviderSelector]) +
+ *      excluded patterns
+ *   3. AI Configuration — model + max tokens (hidden when provider == "jolli")
+ *   4. Enabled Platforms — Claude / Codex / Gemini toggles
  *
- * Reads config from the global config directory and writes back on OK.
+ * Reads/writes the global config (`config-intellij.json` after namespacing).
  */
 class SettingsDialog(
     private val project: Project,
-    private val service: JolliMemoryService,
+    @Suppress("unused") private val service: JolliMemoryService,
 ) : DialogWrapper(project) {
 
+    // ── Sign-in bar ────────────────────────────────────────────────────────
+    private val signInBar = SignInBar()
+
+    // ── General ────────────────────────────────────────────────────────────
+    private val providerSelector = AiProviderSelector()
+    private val excludePatternsField = JBTextField()
+
     // ── AI Configuration ───────────────────────────────────────────────────
-    private val apiKeyField = JBPasswordField()
     private val modelCombo = ComboBox(DefaultComboBoxModel(arrayOf("haiku", "sonnet", "opus"))).apply {
         maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
     }
     private val maxTokensField = JBTextField()
+    private lateinit var aiConfigSection: JComponent
 
-    // ── Integrations ───────────────────────────────────────────────────────
-    private val jolliApiKeyField = JBPasswordField()
+    // ── Enabled Platforms ──────────────────────────────────────────────────
     private val claudeEnabledCheckbox = JBCheckBox("Claude Code — Session tracking via Stop hook", true)
     private val codexEnabledCheckbox = JBCheckBox("Codex CLI — Session discovery via filesystem scan", true)
     private val geminiEnabledCheckbox = JBCheckBox("Gemini CLI — Session tracking via AfterAgent hook", true)
-
-    // ── Files ──────────────────────────────────────────────────────────────
-    private val excludePatternsField = JBTextField()
-
-    /** Full (unmasked) API keys loaded from config — used to detect unchanged masked values. */
-    private var fullApiKey: String = ""
-    private var fullJolliApiKey: String = ""
-    private var maskedApiKey: String = ""
-    private var maskedJolliApiKey: String = ""
 
     init {
         title = "Jolli Memory Settings"
         setOKButtonText("Apply Changes")
         init()
         loadSettings()
+        // Tie sub-components' lifecycles to the dialog so their auth listeners are removed on close.
+        Disposer.register(disposable, signInBar)
+        Disposer.register(disposable, providerSelector)
     }
 
     override fun createCenterPanel(): JComponent {
@@ -72,60 +74,64 @@ class SettingsDialog(
             border = JBUI.Borders.empty(8, 12)
         }
 
-        // ── AI Configuration Section ───────────────────────────────────────
-        panel.add(createSectionHeader("AI Configuration"))
+        // ── Sign-in bar ────────────────────────────────────────────────────
+        signInBar.alignmentX = JComponent.LEFT_ALIGNMENT
+        panel.add(signInBar)
+        panel.add(Box.createVerticalStrut(8))
+        panel.add(createSeparator())
+        panel.add(Box.createVerticalStrut(12))
+
+        // ── General Section ────────────────────────────────────────────────
+        panel.add(createSectionHeader("General"))
+        panel.add(createStretchedFormPanel(providerSelector))
         panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
-            .addLabeledComponent(JBLabel("Anthropic API Key:"), apiKeyField, 1, false)
-            .addTooltip("sk-ant-... — get yours at console.anthropic.com")
-            .addLabeledComponent(JBLabel("Model:"), modelCombo, 1, false)
-            .addTooltip("Haiku = fastest, Sonnet = balanced (default), Opus = most capable")
-            .addLabeledComponent(JBLabel("Max Tokens:"), maxTokensField, 1, false)
-            .addTooltip("Default: 8192")
+            .addLabeledComponent(JBLabel("Excluded patterns:"), excludePatternsField, 1, false)
+            .addTooltip("Select files for jolli memory to ignore (comma-separated globs, e.g. **/*.vsix, docs/*.md)")
             .panel))
+
         panel.add(Box.createVerticalStrut(12))
         panel.add(createSeparator())
         panel.add(Box.createVerticalStrut(12))
 
-        // ── Integrations Section ───────────────────────────────────────────
-        panel.add(createSectionHeader("Integrations"))
+        // ── AI Configuration Section ───────────────────────────────────────
+        aiConfigSection = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            add(createSectionHeader("AI Configuration"))
+            add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+                .addLabeledComponent(JBLabel("Model:"), modelCombo, 1, false)
+                .addTooltip("Haiku = fastest, Sonnet = balanced (default), Opus = most capable")
+                .addLabeledComponent(JBLabel("Max Tokens:"), maxTokensField, 1, false)
+                .addTooltip("Default: 8192")
+                .panel))
+            add(Box.createVerticalStrut(12))
+            add(createSeparator())
+            add(Box.createVerticalStrut(12))
+        }
+        panel.add(aiConfigSection)
+
+        // ── Enabled Platforms Section ──────────────────────────────────────
+        panel.add(createSectionHeader("Enabled Platforms"))
         panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
-            .addLabeledComponent(JBLabel("Jolli API Key:"), jolliApiKeyField, 1, false)
-            .addTooltip("sk-jol-... — for pushing memories to Jolli Space")
-            .addComponent(claudeEnabledCheckbox, 8)
+            .addComponent(claudeEnabledCheckbox, 4)
             .addComponent(codexEnabledCheckbox, 4)
             .addComponent(geminiEnabledCheckbox, 4)
             .panel))
-        panel.add(Box.createVerticalStrut(12))
-        panel.add(createSeparator())
-        panel.add(Box.createVerticalStrut(12))
 
-        // ── Files Section ──────────────────────────────────────────────────
-        panel.add(createSectionHeader("Files"))
-        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
-            .addLabeledComponent(JBLabel("Exclude Patterns:"), excludePatternsField, 1, false)
-            .addTooltip("Comma-separated globs, e.g. **/*.vsix, docs/*.md")
-            .panel))
+        // Hide AI Configuration whenever provider isn't Anthropic.
+        providerSelector.addStateChangeListener {
+            aiConfigSection.isVisible = providerSelector.getProvider() == "anthropic"
+            pack()
+        }
 
         return JPanel(BorderLayout()).apply {
             add(panel, BorderLayout.NORTH)
-            preferredSize = Dimension(520, preferredSize.height)
+            preferredSize = Dimension(560, preferredSize.height)
         }
     }
 
     override fun doValidate(): ValidationInfo? {
-        val apiKeyText = String(apiKeyField.password)
-        if (apiKeyText.isNotBlank() && apiKeyText != maskedApiKey &&
-            !apiKeyText.startsWith("sk-ant-")
-        ) {
-            return ValidationInfo("Anthropic API Key should start with sk-ant-", apiKeyField)
-        }
-
-        val jolliKeyText = String(jolliApiKeyField.password)
-        if (jolliKeyText.isNotBlank() && jolliKeyText != maskedJolliApiKey &&
-            !jolliKeyText.startsWith("sk-jol-")
-        ) {
-            return ValidationInfo("Jolli API Key should start with sk-jol-", jolliApiKeyField)
-        }
+        providerSelector.validateInput()?.let { return it }
 
         val maxTokensText = maxTokensField.text.trim()
         if (maxTokensText.isNotBlank()) {
@@ -138,19 +144,15 @@ class SettingsDialog(
         if (!claudeEnabledCheckbox.isSelected && !codexEnabledCheckbox.isSelected &&
             !geminiEnabledCheckbox.isSelected
         ) {
-            return ValidationInfo("At least one integration must be enabled", claudeEnabledCheckbox)
+            return ValidationInfo("At least one platform must be enabled", claudeEnabledCheckbox)
         }
 
         return null
     }
 
     override fun doOKAction() {
-        // Resolve API keys: if value matches the masked string, keep the original
-        val apiKeyText = String(apiKeyField.password)
-        val resolvedApiKey = if (apiKeyText == maskedApiKey) fullApiKey else apiKeyText
-
-        val jolliKeyText = String(jolliApiKeyField.password)
-        val resolvedJolliApiKey = if (jolliKeyText == maskedJolliApiKey) fullJolliApiKey else jolliKeyText
+        val provider = providerSelector.getProvider()
+        val resolvedApiKey = providerSelector.getEffectiveAnthropicKey()
 
         val maxTokensText = maxTokensField.text.trim()
         val maxTokens = if (maxTokensText.isNotBlank()) maxTokensText.toIntOrNull() else null
@@ -160,18 +162,17 @@ class SettingsDialog(
             .map { it.trim() }
             .filter { it.isNotEmpty() }
 
-        // Always save to global config directory, preserving fields not managed by this dialog
         val configDir = SessionTracker.getGlobalConfigDir()
         val existing = SessionTracker.loadConfigFromDir(configDir)
         val config = existing.copy(
             apiKey = resolvedApiKey.ifBlank { null },
             model = (modelCombo.selectedItem as String).let { if (it == "sonnet") null else it },
             maxTokens = maxTokens,
-            jolliApiKey = resolvedJolliApiKey.ifBlank { null },
             claudeEnabled = claudeEnabledCheckbox.isSelected,
             codexEnabled = codexEnabledCheckbox.isSelected,
             geminiEnabled = geminiEnabledCheckbox.isSelected,
             excludePatterns = if (excludePatterns.isNotEmpty()) excludePatterns else null,
+            aiProvider = provider,
         )
         SessionTracker.saveConfigToDir(config, configDir)
 
@@ -185,23 +186,19 @@ class SettingsDialog(
         populateFields(config)
     }
 
-    /** Fills all form fields from a config object, masking API keys. */
+    /** Fills all form fields from a config object. */
     private fun populateFields(config: JolliMemoryConfig) {
-        fullApiKey = config.apiKey ?: ""
-        fullJolliApiKey = config.jolliApiKey ?: ""
-        maskedApiKey = maskApiKey(fullApiKey)
-        maskedJolliApiKey = maskApiKey(fullJolliApiKey)
-
-        apiKeyField.text = maskedApiKey
+        providerSelector.loadFromConfig(config)
         modelCombo.selectedItem = config.model ?: "sonnet"
         maxTokensField.text = if (config.maxTokens != null) config.maxTokens.toString() else ""
+        excludePatternsField.text = config.excludePatterns?.joinToString(", ") ?: ""
 
-        jolliApiKeyField.text = maskedJolliApiKey
         claudeEnabledCheckbox.isSelected = config.claudeEnabled != false
         codexEnabledCheckbox.isSelected = config.codexEnabled != false
         geminiEnabledCheckbox.isSelected = config.geminiEnabled != false
 
-        excludePatternsField.text = config.excludePatterns?.joinToString(", ") ?: ""
+        // Apply current visibility for AI Configuration section.
+        aiConfigSection.isVisible = providerSelector.getProvider() == "anthropic"
     }
 
     /** Creates a bold section header label. */
@@ -227,21 +224,6 @@ class SettingsDialog(
         return JSeparator().apply {
             alignmentX = JComponent.LEFT_ALIGNMENT
             maximumSize = Dimension(Int.MAX_VALUE, 1)
-        }
-    }
-
-    companion object {
-        /**
-         * Masks an API key for display.
-         * Keys with a recognized prefix (sk-ant-, sk-jol-) are always masked.
-         * Other keys are masked when longer than 16 chars: first 12 + **** + last 4.
-         */
-        fun maskApiKey(key: String): String {
-            if (key.isEmpty()) return ""
-            val hasKnownPrefix = key.startsWith("sk-ant-") || key.startsWith("sk-jol-")
-            if (!hasKnownPrefix && key.length <= 16) return key
-            val prefixLen = minOf(12, key.length - 4)
-            return "${key.substring(0, prefixLen)}****${key.substring(key.length - 4)}"
         }
     }
 }

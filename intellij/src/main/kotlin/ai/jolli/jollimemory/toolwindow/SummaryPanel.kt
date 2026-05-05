@@ -412,6 +412,7 @@ class SummaryPanel(
                     topics = topics.map { it.topic.topic },
                     commitMessage = summary.commitMessage, diff = diff,
                     apiKey = config.apiKey, model = config.model, jolliApiKey = config.jolliApiKey,
+                    aiProvider = config.aiProvider,
                 ))
 
                 val updatedSummary = summary.copy(e2eTestGuide = scenarios)
@@ -511,7 +512,7 @@ class SummaryPanel(
                 }
                 ApplicationManager.getApplication().invokeLater { postToWebview("planTranslating", mapOf("slug" to slug)) }
                 val config = SessionTracker.loadConfig(cwd)
-                val translated = Summarizer.translateToEnglish(content, config.apiKey, config.model, config.jolliApiKey)
+                val translated = Summarizer.translateToEnglish(content, config.apiKey, config.model, config.jolliApiKey, config.aiProvider)
                 store.writePlanToBranch(slug, translated, "Translate plan $slug to English")
                 syncPlanTitle(slug, translated)
                 planTranslateSet.remove(slug)

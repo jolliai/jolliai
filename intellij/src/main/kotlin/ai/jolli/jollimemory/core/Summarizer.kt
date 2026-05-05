@@ -44,6 +44,7 @@ object Summarizer {
         val apiKey: String? = null,
         val model: String? = null,
         val jolliApiKey: String? = null,
+        val aiProvider: String? = null,
     )
 
     /** Builds the full summarization prompt. */
@@ -145,6 +146,7 @@ major
             model = resolveModelId(params.model),
             maxTokens = DEFAULT_MAX_TOKENS,
             prompt = prompt,
+            aiProvider = params.aiProvider,
         )
 
         log.info("API response in %dms (in=%d, out=%d)", result.apiLatencyMs, result.inputTokens, result.outputTokens)
@@ -305,6 +307,7 @@ Rules:
             model = resolveModelId(params.model),
             maxTokens = 256,
             prompt = prompt,
+            aiProvider = params.aiProvider,
         )
 
         val text = result.text
@@ -323,6 +326,7 @@ Rules:
         val apiKey: String? = null,
         val model: String? = null,
         val jolliApiKey: String? = null,
+        val aiProvider: String? = null,
     )
 
     private val SCENARIO_DELIMITER_RE = Regex("^\\s*===SCENARIO===\\s*$", RegexOption.MULTILINE)
@@ -473,6 +477,7 @@ What the reviewer needs to have ready before testing (e.g. "Have a Space with 3+
             model = resolveModelId(params.model),
             maxTokens = DEFAULT_MAX_TOKENS,
             prompt = prompt,
+            aiProvider = params.aiProvider,
         )
 
         val text = result.text
@@ -503,7 +508,13 @@ $content"""
     }
 
     /** Translates a Markdown document to English using the LLM (direct Anthropic or Jolli proxy). */
-    fun translateToEnglish(content: String, apiKey: String?, model: String?, jolliApiKey: String? = null): String {
+    fun translateToEnglish(
+        content: String,
+        apiKey: String?,
+        model: String?,
+        jolliApiKey: String? = null,
+        aiProvider: String? = null,
+    ): String {
         log.info("Translating plan to English (%d chars)", content.length)
         val prompt = buildTranslationPrompt(content)
 
@@ -515,6 +526,7 @@ $content"""
             model = resolveModelId(model),
             maxTokens = DEFAULT_MAX_TOKENS,
             prompt = prompt,
+            aiProvider = aiProvider,
         )
 
         return result.text
@@ -531,6 +543,7 @@ $content"""
         apiKey: String?,
         model: String?,
         jolliApiKey: String? = null,
+        aiProvider: String? = null,
     ): String {
         val commitsBlock = commits.mapIndexed { i, (msg, topics) ->
             val topicLines = if (topics.isNotEmpty()) {
@@ -586,6 +599,7 @@ Rules:
             model = resolveModelId(model),
             maxTokens = 256,
             prompt = prompt,
+            aiProvider = aiProvider,
         )
 
         return result.text?.trim('"', '\'')

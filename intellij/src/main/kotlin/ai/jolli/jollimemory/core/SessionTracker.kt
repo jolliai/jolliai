@@ -25,7 +25,8 @@ object SessionTracker {
 
     private const val SESSIONS_FILE = "sessions.json"
     private const val CURSORS_FILE = "cursors.json"
-    private const val CONFIG_FILE = "config.json"
+    private const val CONFIG_FILE = "config-intellij.json"
+    private const val LEGACY_CONFIG_FILE = "config.json"
     private const val LOCK_FILE = "lock"
     private const val PLANS_FILE = "plans.json"
     private const val SQUASH_PENDING_FILE = "squash-pending.json"
@@ -154,10 +155,29 @@ object SessionTracker {
         return loadConfigFromDir(getGlobalConfigDir())
     }
 
-    /** Reads config.json from a specific directory. Returns empty config on error. */
+    /**
+     * Reads config-intellij.json from a specific directory. Returns empty config on error.
+     *
+     * One-time migration: if config-intellij.json is absent but the legacy shared
+     * config.json exists, copy the legacy file forward so existing IntelliJ users
+     * keep their settings on first run after the namespacing change.
+     */
     fun loadConfigFromDir(dir: String): JolliMemoryConfig {
+        val target = File(dir, CONFIG_FILE)
+        if (!target.exists()) {
+            val legacy = File(dir, LEGACY_CONFIG_FILE)
+            if (legacy.exists()) {
+                try {
+                    File(dir).mkdirs()
+                    legacy.copyTo(target, overwrite = false)
+                    log.info("Migrated legacy config.json to config-intellij.json")
+                } catch (_: Exception) {
+                    // Migration is best-effort; fall through to empty config below.
+                }
+            }
+        }
         return try {
-            gson.fromJson(File(dir, CONFIG_FILE).readText(Charsets.UTF_8), JolliMemoryConfig::class.java)
+            gson.fromJson(target.readText(Charsets.UTF_8), JolliMemoryConfig::class.java)
         } catch (_: Exception) {
             JolliMemoryConfig()
         }
@@ -177,6 +197,7 @@ object SessionTracker {
             claudeEnabled = update.claudeEnabled ?: existing.claudeEnabled,
             codexEnabled = update.codexEnabled ?: existing.codexEnabled,
             geminiEnabled = update.geminiEnabled ?: existing.geminiEnabled,
+            aiProvider = update.aiProvider ?: existing.aiProvider,
             logLevel = update.logLevel ?: existing.logLevel,
             logLevelOverrides = update.logLevelOverrides ?: existing.logLevelOverrides,
         )
