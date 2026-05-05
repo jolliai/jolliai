@@ -34,6 +34,7 @@ object SummaryMarkdownBuilder {
 
         pushPropertiesSection(lines, summary)
         pushPlansSection(lines, summary, includeEditInfo = true)
+        pushRecapSection(lines, summary)
         pushE2eTestSection(lines, summary.e2eTestGuide)
         pushSourceCommitsSection(lines, sourceNodes)
         pushTopicsSection(lines, allTopics, showRecordDates, ::pushTopicBody)
@@ -130,6 +131,13 @@ object SummaryMarkdownBuilder {
             val noteUrl = note.jolliNoteDocUrl
             lines.add(if (noteUrl != null) "- [${note.title}]($noteUrl)" else "- ${note.title}")
         }
+    }
+
+    /** Appends the Quick Recap section if present. */
+    private fun pushRecapSection(lines: MutableList<String>, summary: CommitSummary) {
+        val recap = summary.recap?.trim()
+        if (recap.isNullOrEmpty()) return
+        lines.addAll(listOf("", "## Quick recap", "", recap, "", "---"))
     }
 
     /** Appends the E2E test guide section (shared between clipboard and PR markdown). */

@@ -231,6 +231,8 @@ class SummaryPanel(
                 "loadAllTranscripts" -> handleLoadAllTranscripts()
                 "saveAllTranscripts" -> handleSaveAllTranscripts(json.getAsJsonArray("entries"))
                 "deleteAllTranscripts" -> handleDeleteAllTranscripts()
+                "generateRecap" -> handleGenerateRecap()
+                "editRecap" -> handleEditRecap(json.get("recap").asString)
                 else -> LOG.debug("Unknown webview command: $command")
             }
         } catch (e: Exception) {
@@ -459,6 +461,60 @@ class SummaryPanel(
                 currentSummary = updatedSummary
                 val html = SummaryHtmlBuilder.buildE2eTestSection(updatedSummary)
                 ApplicationManager.getApplication().invokeLater { postToWebview("e2eTestUpdated", mapOf("html" to html)) }
+            }
+        }
+    }
+
+    private fun handleGenerateRecap() {
+        postToWebview("recapGenerating")
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                val summary = currentSummary
+                val config = SessionTracker.loadConfig(cwd)
+                val (topics) = SummaryUtils.collectSortedTopics(summary)
+
+                val recap = Summarizer.generateRecap(Summarizer.RecapParams(
+                    topics = topics.map { it.topic.topic },
+                    commitMessage = summary.commitMessage,
+                    apiKey = config.apiKey, model = config.model, jolliApiKey = config.jolliApiKey,
+                ))
+
+                val trimmed = recap.trim()
+                if (trimmed.isEmpty()) {
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("recapUpdateError")
+                        Messages.showInfoMessage(project, "No major topics in this commit, so there's nothing to recap.", "Recap")
+                    }
+                    return@executeOnPooledThread
+                }
+
+                val updatedSummary = summary.copy(recap = trimmed)
+                store.storeSummary(updatedSummary, force = true)
+                currentSummary = updatedSummary
+                val html = SummaryHtmlBuilder.buildRecapSection(updatedSummary)
+                ApplicationManager.getApplication().invokeLater { postToWebview("recapUpdated", mapOf("html" to html)) }
+            } catch (e: Exception) {
+                ApplicationManager.getApplication().invokeLater {
+                    postToWebview("recapUpdateError", mapOf("message" to (e.message ?: "Generation failed")))
+                    Messages.showErrorDialog(project, "Recap generation failed: ${e.message}", "Error")
+                }
+            }
+        }
+    }
+
+    private fun handleEditRecap(recap: String) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                val updatedSummary = currentSummary.copy(recap = recap.ifEmpty { null })
+                store.storeSummary(updatedSummary, force = true)
+                currentSummary = updatedSummary
+                val html = SummaryHtmlBuilder.buildRecapSection(updatedSummary)
+                ApplicationManager.getApplication().invokeLater { postToWebview("recapUpdated", mapOf("html" to html)) }
+            } catch (e: Exception) {
+                ApplicationManager.getApplication().invokeLater {
+                    postToWebview("recapUpdateError", mapOf("message" to (e.message ?: "Save failed")))
+                    Messages.showErrorDialog(project, "Recap save failed: ${e.message}", "Error")
+                }
             }
         }
     }

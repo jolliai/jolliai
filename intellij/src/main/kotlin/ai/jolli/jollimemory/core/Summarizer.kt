@@ -1,7 +1,7 @@
 package ai.jolli.jollimemory.core
 
 /**
- * Summarizer — Kotlin port of Summarizer.ts
+ * Summarizer — Handles LLM-based commit summarization and recap generation (hoist test).
  *
  * Calls the Anthropic API to generate structured multi-topic commit summaries.
  * Also generates commit messages and squash messages.
@@ -31,6 +31,7 @@ object Summarizer {
         val stats: DiffStats,
         val topics: List<TopicSummary>,
         val ticketId: String? = null,
+        val recap: String? = null,
     )
 
     /** Parameters for generating a summary */
@@ -68,11 +69,31 @@ $diff
 
 ## Instructions
 
+**Output format requirements (READ FIRST -- the rest of this prompt depends on these being followed):**
+
+Your response MUST be a delimited plain-text document with the following shape:
+
+```
+===SUMMARY===
+[optional ---TICKETID--- block]
+[zero or more ===TOPIC=== blocks]
+[optional ---RECAP--- block, AFTER all topics]
+```
+
+The very first non-blank line of your response MUST be `===SUMMARY===`. Do NOT preface it with anything.
+
+After `===SUMMARY===` you MUST emit blocks in this strict order:
+  1. `---TICKETID---` first (if a ticket was referenced -- rule 16)
+  2. Zero or more `===TOPIC===` blocks (one per distinct user goal -- see rule 6)
+  3. `---RECAP---` LAST (after the final `===TOPIC===` block -- rule 19)
+
+The recap MUST be the final block. By the time you write the recap, every topic's `---IMPORTANCE---` label has already been emitted, so you can apply rule 19's "major-only" constraint by literal lookback.
+
 Identify the distinct problems or tasks worked on during this session. Each independent user goal should be its own topic. Order topics by conversation timeline (most recent first, like git log). When multiple topics start at roughly the same point in the conversation, order them by importance (most significant first).
 
 Return your response using the following delimited plain-text format. Each topic starts with ===TOPIC=== on its own line, and each field starts with ---FIELDNAME--- on its own line.
 
-Before the first topic, output the ticket identifier if one exists:
+===SUMMARY===
 
 ---TICKETID---
 PROJ-597
@@ -81,13 +102,13 @@ PROJ-597
 ---TITLE---
 8-15 word concrete and searchable label for this topic
 ---TRIGGER---
-1-2 sentences: the problem, bug, or need that prompted this work.
+1-2 sentences: the problem, bug, or need that prompted this work. Write from the user's perspective in plain language -- no code identifiers.
 ---RESPONSE---
-What was implemented or fixed.
+What was implemented or fixed -- this is a detail field, so technical precision is welcome. Name files, functions, and systems changed. ALWAYS use a bulleted list (- item) when there are 2+ distinct points. Maximum 3 points.
 ---DECISIONS---
-Why THIS approach was chosen over alternatives.
+Why THIS approach was chosen over alternatives. ALWAYS use a bulleted list (- **Bold label**: explanation) when there are 2+ decisions. When there is exactly one decision, write it as plain prose -- no bullet, no bold label.
 ---TODO---
-Tech debt, deferred work, or follow-up items.
+Tech debt, deferred work, or follow-up items. Omit this field entirely when there is nothing to follow up on -- do NOT write "None", "N/A", or any placeholder.
 ---FILESAFFECTED---
 src/Auth.ts, src/Middleware.ts
 ---CATEGORY---
@@ -95,24 +116,43 @@ feature
 ---IMPORTANCE---
 major
 
+===TOPIC===
+[Repeat the ===TOPIC=== block above for each additional topic the commit warrants per rule 6.]
+
+---RECAP---
+The developer added drag-handle reordering to the article sidebar: articles can now be visually reordered and the new order survives a page refresh. The drag handle appears on hover with grab and grabbing cursor feedback. Ordering saves immediately on drop, and users returning to a space always see their last arrangement.
+
 ## Rules
-1. The summary has two audiences. Narrative fields use plain language. Detail fields may use technical identifiers.
-2. decisions is the most valuable field — it captures reasoning that cannot be reconstructed from the diff alone.
+1. The summary has two audiences. The **narrative fields** (title, trigger, decisions) are read by everyone -- write them for a colleague who uses the product but was NOT present in the session and has never read this codebase. Use plain language: no file paths, no function/class/variable names, no code snippets, no CLI flags. The **detail fields** (response, todo, filesAffected) MAY use technical identifiers.
+2. decisions is the most valuable field -- it captures reasoning that cannot be reconstructed from the diff alone. ALWAYS use a bulleted list (- **Label**: rationale) when there are 2+ decisions. When there is exactly one decision, write it as plain prose -- no bullet, no bold label. Maximum 3 bullets.
 3. trigger should remain concise (1-2 sentences).
-4. response is a detail field — be specific and technical.
+4. response is a detail field -- be specific and technical. ALWAYS use a bulleted list when there are 2+ distinct points. Maximum 3 points.
 5. title must use plain language while remaining concrete and searchable.
 6. Create one topic per independent user goal.
 7. If the conversation is empty, infer topics from the diff and commit message.
-8. todo: only include when deferred work was EXPLICITLY discussed.
+8. todo: only include when deferred work was EXPLICITLY discussed. Omit the field entirely otherwise.
 9. The conversation transcript is the PRIMARY source.
 10. Extract high-value elements for trigger and decisions.
-11. Return ONLY the delimited text.
+11. Return ONLY the delimited text starting with `===SUMMARY===`.
 12. filesAffected: list the 2-6 most important files changed.
 13. category: pick one from: feature, bugfix, refactor, tech-debt, performance, security, test, docs, ux, devops.
 14. importance: "major" for features/bugs/architectural decisions. "minor" for cleanup/config.
-15. If a change has no meaningful decision, do NOT create a topic. If ALL are omitted, output: ===NO_TOPICS===
-16. ticketId: extract from commit message, branch, or conversation.
-17. NEVER use ===TOPIC=== or ---FIELDNAME--- inside your content."""
+15. If a change has no meaningful decision, do NOT create a topic. If ALL are omitted, output no ===TOPIC=== sections.
+16. ticketId: extract from commit message, branch, or conversation. Output canonical uppercase form. Omit ---TICKETID--- entirely if no ticket is referenced.
+17. NEVER use ===SUMMARY===, ===TOPIC===, or ---FIELDNAME--- inside your content.
+18. If there is nothing substantive to emit (trivial commit, no ticket, no decisions), output `===SUMMARY===` alone on its own line and stop.
+19. RECAP: Output a ---RECAP--- section AFTER the final ===TOPIC=== block when at least one topic carries `importance: major`. Omit the section entirely otherwise. Content rules:
+  - Pick the 2-3 highest-impact major topics to cover; skip the rest -- the topics list preserves them. Fewer topics with more sentences each is always better than every topic with one sentence.
+  - For each chosen topic, write 2-4 sentences. Target 150-300 words total. No hard upper limit -- let the substance drive length.
+  - Subject and tense: third person, past tense, with a concrete subject. Use "The developer added...", "This commit introduced...", "Users can now ...". FORBIDDEN subjects: "the tool", "the LLM", "the system", "the model", "the AI". Never "I" or "we".
+  - Describe WHAT changed and what users can now do differently. Do NOT explain WHY technical choices were made.
+  - No code identifiers: no file paths, no function/class/variable names, no CLI flags, no inline code.
+  - User-facing names ARE allowed and encouraged: product names, page names, feature names, and widely-recognized UI element names.
+  - The recap describes ONLY `importance: major` topics. `importance: minor` topics MUST NOT be mentioned.
+  - Lead with what changed most visibly or impactfully; weave related points into flowing paragraphs.
+  - Flowing prose only. NO bullet lists, NO headings, NO markdown inside the recap.
+  - Do NOT restate the commit message verbatim.
+  - When ALL topics are `importance: minor`, omit the `---RECAP---` section entirely."""
     }
 
     /** Generates a summary by calling the LLM (direct Anthropic or Jolli proxy). */
@@ -152,8 +192,10 @@ major
         val responseText = result.text
             ?: throw RuntimeException("No text content in API response")
 
+        log.debug("Raw LLM response (first 2000 chars): %s", responseText.take(2000))
+
         val parsed = parseSummaryResponse(responseText)
-        log.info("Summary parsed: %d topic(s)", parsed.topics.size)
+        log.info("Summary parsed: %d topic(s), recap=%s", parsed.topics.size, if (parsed.recap != null) "${parsed.recap!!.length} chars" else "null")
 
         val llm = LlmCallMetadata(
             model = result.model ?: resolveModelId(params.model),
@@ -170,6 +212,7 @@ major
             stats = params.diffStats,
             topics = parsed.topics,
             ticketId = parsed.ticketId,
+            recap = parsed.recap,
         )
     }
 
@@ -183,6 +226,7 @@ major
     data class ParsedResponse(
         val topics: List<TopicSummary>,
         val ticketId: String? = null,
+        val recap: String? = null,
         val intentionallyEmpty: Boolean = false,
     )
 
@@ -192,6 +236,7 @@ major
         if (fenced != null) text = fenced.groupValues[1].trim()
 
         val ticketId = extractPreTopicTicketId(text)
+        val recap = extractRecap(text)
 
         if (TOPIC_DELIMITER_RE.containsMatchIn(text)) {
             val topics = parseDelimitedTopics(text)
@@ -199,15 +244,30 @@ major
                 val filtered = topics.filter {
                     it.decisions.trim().isNotEmpty() && !EMPTY_DECISIONS_RE.matches(it.decisions.trim())
                 }
-                return ParsedResponse(filtered, ticketId)
+                return ParsedResponse(filtered, ticketId, recap = recap)
             }
         }
 
         if (NO_TOPICS_RE.containsMatchIn(text)) {
-            return ParsedResponse(emptyList(), ticketId, intentionallyEmpty = true)
+            return ParsedResponse(emptyList(), ticketId, recap = recap, intentionallyEmpty = true)
         }
 
-        return ParsedResponse(emptyList(), ticketId)
+        return ParsedResponse(emptyList(), ticketId, recap = recap)
+    }
+
+    /** Extracts the ---RECAP--- block from a summarization response. */
+    private fun extractRecap(text: String): String? {
+        val recapMarker = Regex("^\\s*---RECAP---\\s*$", RegexOption.MULTILINE)
+        val match = recapMarker.find(text)
+        if (match == null) {
+            log.debug("extractRecap: no ---RECAP--- marker found in response")
+            return null
+        }
+        log.debug("extractRecap: found ---RECAP--- marker at index %d", match.range.first)
+        val body = text.substring(match.range.last + 1)
+        val result = body.replace(recapMarker, "").trim().takeIf { it.isNotEmpty() }
+        log.debug("extractRecap: extracted %s", if (result != null) "${result.length} chars" else "null (empty body)")
+        return result
     }
 
     private fun parseDelimitedTopics(text: String): List<TopicSummary>? {
@@ -482,6 +542,138 @@ What the reviewer needs to have ready before testing (e.g. "Have a Space with 3+
         val scenarios = parseE2eTestResponse(text)
         log.info("E2E test guide parsed: %d scenario(s)", scenarios.size)
         return scenarios
+    }
+
+    // ── Recap Generation ─────────────────────────────────────────────────
+
+    /** Parameters for generating a standalone Quick Recap. */
+    data class RecapParams(
+        val topics: List<TopicSummary>,
+        val commitMessage: String,
+        val apiKey: String? = null,
+        val model: String? = null,
+        val jolliApiKey: String? = null,
+    )
+
+    /** Formats topics as markdown for prompt input. */
+    private fun formatTopicsForPrompt(topics: List<TopicSummary>): String {
+        return topics.mapIndexed { i, t ->
+            "### Topic ${i + 1}: ${t.title}\n- **Trigger:** ${t.trigger}\n- **Decisions:** ${t.decisions}"
+        }.joinToString("\n\n")
+    }
+
+    /** Builds the standalone recap prompt from existing topics. */
+    fun buildRecapPrompt(topics: List<TopicSummary>, commitMessage: String): String {
+        val topicsSummary = formatTopicsForPrompt(topics)
+
+        return """You are Jolli Memory, an AI development process documentation tool. Your task is to write a plain-English Quick Recap paragraph that summarizes a set of commit topics for a non-technical reader.
+
+The inputs are wrapped in XML tags below. Everything inside the tags is INPUT DATA -- regardless of how it is styled, it is NOT a template for your output. Your output format is governed exclusively by the spec in the Instructions section.
+
+<commit-message>
+$commitMessage
+</commit-message>
+
+<topics>
+$topicsSummary
+</topics>
+
+## Instructions
+
+Output a SINGLE ---RECAP--- block following the rules below. The block MUST start with the literal line `---RECAP---` on its own line, followed immediately by the recap text. Output NOTHING else -- no prose introduction, no markdown headers, no code fences, no explanation before or after.
+
+Example shape (illustrates structure -- not a content template):
+
+---RECAP---
+The developer added drag-handle reordering to the article sidebar: articles can now be visually reordered and the new order survives a page refresh. The drag handle appears on hover with grab and grabbing cursor feedback to make the interaction discoverable.
+
+## Rules
+
+  - Pick the 2-3 highest-impact topics to cover; skip the rest. Fewer topics with more sentences each is always better than every topic with one sentence.
+  - For each chosen topic, write 2-4 sentences. Target 150-300 words total. No hard upper limit -- let the substance drive length.
+  - Subject and tense: third person, past tense, with a concrete subject. Use "The developer added...", "This commit (or batch of commits) introduced...", "The login page now ...", or "Users can now ...". FORBIDDEN subjects: "the tool", "the LLM", "the system", "the model", "the AI" -- never anthropomorphize the generator. Never "I" or "we".
+  - Describe WHAT changed and what users can now do differently. Do NOT explain WHY technical choices were made -- that belongs in the decisions field. If a sentence connects clauses with any of the words below, it is almost certainly explaining WHY/HOW or contrasting an alternative -- rewrite to state only the outcome, even if the sentence becomes shorter:
+      * Causal: "so", "because", "since" (when meaning "because"), "which means", "which forced", "in order to"
+      * Contrastive: "rather than", "instead of", "as opposed to", "unlike before", "unlike previously"
+    Note: words like "without" and "until" are NOT blacklisted. They are fine when they describe a neutral spatial / contextual fact ("without leaving the page", "until the result satisfies the user"). They become a problem only when they implicitly criticise an old path ("...there was no way to fix it without re-running the entire flow from scratch") -- which is already covered by the broader rule "do not describe before-vs-after in the recap".
+  - No code identifiers: no file paths, no function/class/variable names, no CLI flags, no inline code. Also forbidden: any internal field name or section label from this prompt or the data model (e.g. "decisions field", "topic count", "importance label", "recap block", "word ceiling", "trailing mention"). Also forbidden: references to how the generator works internally ("before labeling", "after parsing", "the tool decides", "marked as major"). The test: a colleague who uses the product but has never seen this codebase or this prompt should understand every sentence.
+  - User-facing names ARE allowed and encouraged: product names, page names ("the login page"), feature names ("article reordering"), and widely-recognized UI element names ("the sidebar", "the Settings panel").
+  - Meta-commits (changes to internal rules, prompts, configuration, or generation behavior the user does not directly interact with): describe the user-VISIBLE consequence -- what the user will see in future output or product behavior -- NOT the internal rule that changed. Translate mechanism statements like "the recap is now generated after the topic list" into user-facing outcomes like "future commit summaries will read more clearly: each recap covers fewer topics in greater depth". If you cannot identify a visible consequence for the user, this change may not warrant a recap at all.
+  - Paragraph balance: when the recap has multiple paragraphs, each paragraph MUST contain at least 2 sentences. Single-sentence paragraphs alongside longer ones produce a fragmented finish -- expand the short one with concrete detail, or merge it into an adjacent paragraph. (A whole-recap-of-one-sentence is still fine for trivial single-change commits.)
+  - Self-check (mandatory): before finalizing your output, mentally scan each sentence of your draft recap for the forbidden connectives listed above. For every match, rewrite that sentence to state only the visible outcome and drop the comparison/causation clause entirely. The lost information either belongs in the decisions field or should not be in the recap at all. If you have not done this scan, your output is not ready.
+  - Lead with what changed most visibly or impactfully; weave related points into flowing paragraphs. Do NOT write one sentence per topic -- that produces a fragmented list, not a narrative. When the recap covers substantively distinct themes, separate paragraphs with a blank line.
+  - Flowing prose only. NO bullet lists, NO headings, NO markdown inside the recap.
+  - Do NOT restate the commit message verbatim. Add information a reader cannot get from the commit message alone.
+  - NEVER use the literal string `---RECAP---` inside your content. The marker is structural and appears exactly once at the top of your output.
+
+  Recap anti-patterns (do NOT write like this):
+  - BAD: "The way the tool selects topics was overhauled, so it can look back at what was already marked as major rather than guessing ahead."
+    Why bad: subject "the tool" anthropomorphizes the generator; "so" + "rather than" are causal connectives explaining WHY/HOW; "marked as major" is implementation-level vocabulary.
+  - BAD: "The recap block was moved after the topics, which means the LLM no longer needs to anticipate the importance label."
+    Why bad: "the LLM" forbidden subject; "the recap block" / "importance label" are internal field names; "which means" explains mechanism.
+  - GOOD: "Future commit summaries will be easier to read: each recap now focuses on the two or three most impactful changes and explains them in real depth. Single-line summaries of every topic are gone. Routine cleanup work no longer appears in the recap at all."
+    Why good: subject is the user-visible artefact ("future commit summaries"); describes WHAT the user will see; no internal vocabulary; no forbidden causal/contrastive connectives.
+
+## Begin response now
+
+Output ONLY the `---RECAP---` marker followed by the recap text. No prose before or after."""
+    }
+
+    /**
+     * Extracts the recap text from a RECAP template response.
+     *
+     * Finds the `---RECAP---` marker and returns everything after it (trimmed).
+     * Falls back to the whole response if the marker is missing. Strips a
+     * trailing `---RECAP---` if the model echoes it at the bottom.
+     */
+    fun parseRecapResponse(text: String): String {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return ""
+
+        val markerRe = Regex("^\\s*---RECAP---\\s*$", RegexOption.MULTILINE)
+        val match = markerRe.find(trimmed)
+        val body = if (match != null) trimmed.substring(match.range.last + 1) else trimmed
+
+        // Drop any echoed closing marker
+        return body.replace(markerRe, "").trim()
+    }
+
+    /**
+     * Generates a Quick Recap paragraph for an existing commit summary.
+     *
+     * Topics are filtered to importance: major (legacy topics without the field
+     * are included) before being formatted as prompt input. Returns an empty
+     * string when no major topics exist.
+     */
+    fun generateRecap(params: RecapParams): String {
+        log.info("Regenerating recap for: %s", params.commitMessage.take(60))
+
+        val majorTopics = params.topics.filter { it.importance != TopicImportance.minor }
+        if (majorTopics.isEmpty()) {
+            log.info("Recap regenerate: no major topics -- returning empty recap")
+            return ""
+        }
+
+        val prompt = buildRecapPrompt(majorTopics, params.commitMessage)
+
+        val proxyParams = mapOf(
+            "commitMessage" to params.commitMessage,
+            "topicsSummary" to formatTopicsForPrompt(majorTopics),
+        )
+
+        val result = LlmClient.callLlm(
+            action = "recap",
+            params = proxyParams,
+            apiKey = params.apiKey,
+            jolliApiKey = params.jolliApiKey,
+            model = resolveModelId(params.model),
+            maxTokens = DEFAULT_MAX_TOKENS,
+            prompt = prompt,
+        )
+
+        val recap = parseRecapResponse(result.text ?: "")
+        log.info("Recap regenerate: produced %d chars from %d major topic(s)", recap.length, majorTopics.size)
+        return recap
     }
 
     // ── Translation ────────────────────────────────────────────────────────

@@ -141,6 +141,7 @@ data class CommitSummary(
     val jolliDocId: Int? = null,
     val orphanedDocIds: List<Int>? = null,
     val treeHash: String? = null,
+    val recap: String? = null,
     val e2eTestGuide: List<E2eTestScenario>? = null,
     val plans: List<PlanReference>? = null,
     val notes: List<NoteReference>? = null,

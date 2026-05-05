@@ -78,6 +78,7 @@ ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
 <hr class="separator" />
 ${buildPrSection(summary)}
 ${buildPlansSection(summary.plans, planTranslateSet)}
+${buildRecapSection(summary)}
 ${buildE2eTestSection(summary)}
 ${buildSourceCommits(sourceNodes)}
 <div class="section">
@@ -129,6 +130,41 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
     </span>
   </div>
   $scenariosHtml
+</div>
+<hr class="separator" />"""
+    }
+
+    // ── Quick Recap Section (public for in-place update) ───────────────────
+
+    /** Renders the Quick Recap section HTML (for in-place update). */
+    fun buildRecapSection(summary: CommitSummary): String {
+        val trimmed = summary.recap?.trim()
+
+        if (trimmed.isNullOrEmpty()) {
+            return """
+<div class="section recap-section" id="recapSection">
+  <div class="section-header">
+    <div class="section-title">&#x1F4D6; Quick recap</div>
+  </div>
+  <p class="recap-placeholder">Generate a recap that highlights the major work in this commit.</p>
+  <button class="action-btn" id="generateRecapBtn">&#x2728; Generate</button>
+</div>
+<hr class="separator" />"""
+        }
+
+        val bodyHtml = trimmed.split(Regex("\n\n+"))
+            .joinToString("") { "<p>${escHtml(it.trim())}</p>" }
+
+        return """
+<div class="section recap-section" id="recapSection" data-raw="${escAttr(trimmed)}">
+  <div class="section-header">
+    <div class="section-title">&#x1F4D6; Quick recap</div>
+    <span class="topic-actions">
+      <button class="topic-action-btn" id="editRecapBtn" title="Edit recap">&#x270E;</button>
+      <button class="topic-action-btn" id="regenerateRecapBtn" title="Regenerate">&#x21BB;</button>
+    </span>
+  </div>
+  <div class="recap-body">$bodyHtml</div>
 </div>
 <hr class="separator" />"""
     }

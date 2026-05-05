@@ -214,6 +214,8 @@ object PostCommitHook {
                 jolliApiKey = config.jolliApiKey,
             ))
 
+            log.debug("Summary result recap: %s", if (summaryResult.recap != null) "${summaryResult.recap!!.length} chars" else "null")
+
             // 8b. Detect uncommitted plans, archive, and evaluate progress
             val planRefs = mutableListOf<PlanReference>()
             val planProgressArtifacts = mutableListOf<PlanProgressArtifact>()
@@ -283,6 +285,7 @@ object PostCommitHook {
                 stats = summaryResult.stats,
                 topics = summaryResult.topics,
                 ticketId = summaryResult.ticketId,
+                recap = summaryResult.recap,
                 plans = planRefs.takeIf { it.isNotEmpty() },
             )
 
