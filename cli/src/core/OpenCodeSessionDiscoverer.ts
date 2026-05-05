@@ -16,10 +16,19 @@
  */
 
 import { stat } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
+import {
+	classifyScanError as classifySqliteError,
+	hasNodeSqliteSupport,
+	NODE_SQLITE_MIN_VERSION,
+	type SqliteDbHandle,
+	type SqliteScanError,
+	type SqliteScanErrorKind,
+	withSqliteDb,
+} from "./SqliteHelpers.js";
 
 const log = createLogger("OpenCodeDiscoverer");
 
@@ -34,40 +43,16 @@ function getXdgDataHome(): string {
 	return process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
 }
 
-/**
- * Database handle shape passed to `withOpenCodeDb` callbacks.
- *
- * Structurally typed against node:sqlite's DatabaseSync rather than importing
- * the type directly, so the module is not loaded until the helper runs — this
- * keeps the ExperimentalWarning out of every PostCommitHook invocation that
- * only transitively imports this file.
- */
-export interface OpenCodeDbHandle {
-	prepare(sql: string): {
-		all(params?: Record<string, unknown> | unknown, ...rest: unknown[]): unknown[];
-		get(params?: Record<string, unknown> | unknown, ...rest: unknown[]): unknown;
-		run(params?: Record<string, unknown> | unknown, ...rest: unknown[]): unknown;
-	};
-	close(): void;
-}
-
-/**
- * Opens the OpenCode SQLite database read-only, runs a callback, then closes it.
- *
- * Uses Node's built-in `node:sqlite` (statically-linked SQLite; full WAL support).
- * The module is imported dynamically so the ExperimentalWarning only appears
- * when this helper is actually invoked — not when PostCommitHook merely
- * transitively imports this file.
- */
-export async function withOpenCodeDb<T>(dbPath: string, fn: (db: OpenCodeDbHandle) => T): Promise<T> {
-	const { DatabaseSync } = await import("node:sqlite");
-	const db = new DatabaseSync(dbPath, { readOnly: true });
-	try {
-		return fn(db as unknown as OpenCodeDbHandle);
-	} finally {
-		db.close();
-	}
-}
+/** @deprecated use SqliteDbHandle from SqliteHelpers.js */
+export type OpenCodeDbHandle = SqliteDbHandle;
+/** @deprecated use withSqliteDb from SqliteHelpers.js */
+export const withOpenCodeDb = withSqliteDb;
+export { NODE_SQLITE_MIN_VERSION, hasNodeSqliteSupport };
+/** @deprecated use SqliteScanErrorKind */
+export type OpenCodeScanErrorKind = SqliteScanErrorKind;
+/** @deprecated use SqliteScanError */
+export type OpenCodeScanError = SqliteScanError;
+export const classifyScanError = classifySqliteError;
 
 /**
  * Returns the path to the global OpenCode database file.
@@ -75,32 +60,6 @@ export async function withOpenCodeDb<T>(dbPath: string, fn: (db: OpenCodeDbHandl
  */
 export function getOpenCodeDbPath(): string {
 	return join(getXdgDataHome(), "opencode", "opencode.db");
-}
-
-/**
- * Minimum Node version that ships `node:sqlite`. OpenCode support requires this
- * built-in module; older runtimes cannot load it even if the DB file is present.
- *
- * Exported for unit tests; callers should use `isOpenCodeInstalled()`.
- */
-export const NODE_SQLITE_MIN_VERSION = { major: 22, minor: 5 } as const;
-
-/**
- * Returns true when the current runtime can load `node:sqlite`. Compares the
- * major.minor of `process.versions.node` against NODE_SQLITE_MIN_VERSION
- * rather than doing a live probe, which would emit the ExperimentalWarning on
- * matching runtimes and defeat the lazy-import pattern used by `withOpenCodeDb`.
- */
-export function hasNodeSqliteSupport(nodeVersion: string = process.versions.node): boolean {
-	const match = /^(\d+)\.(\d+)/.exec(nodeVersion);
-	/* v8 ignore start -- process.versions.node is always well-formed semver in supported runtimes; guard is purely defensive */
-	if (!match) return false;
-	/* v8 ignore stop */
-	const major = Number.parseInt(match[1], 10);
-	const minor = Number.parseInt(match[2], 10);
-	if (major > NODE_SQLITE_MIN_VERSION.major) return true;
-	if (major < NODE_SQLITE_MIN_VERSION.major) return false;
-	return minor >= NODE_SQLITE_MIN_VERSION.minor;
 }
 
 /**
@@ -131,29 +90,6 @@ export async function isOpenCodeInstalled(): Promise<boolean> {
 	}
 }
 
-/**
- * Classifies a real OpenCode scan failure into a user-facing severity. Only
- * *genuine* failures are represented here — ENOENT is excluded because an
- * OpenCode DB that's absent between `isOpenCodeInstalled()` and our read
- * is indistinguishable from "not installed" and should stay silent.
- *
- * - `corrupt` — SQLite reports SQLITE_CORRUPT / SQLITE_NOTADB. The file exists
- *   but is unreadable. Users should know.
- * - `locked` — another process holds an exclusive lock (SQLITE_BUSY). Transient,
- *   but worth surfacing if it persists.
- * - `permission` — EACCES / EPERM / SQLITE_CANTOPEN opening the DB. Users
- *   should know.
- * - `schema` — the expected table or column is missing. Likely OpenCode version
- *   drift; users should know so we can support the new schema.
- * - `unknown` — anything else. Surface as a generic "OpenCode scan failed" warning.
- */
-export type OpenCodeScanErrorKind = "corrupt" | "locked" | "permission" | "schema" | "unknown";
-
-export interface OpenCodeScanError {
-	readonly kind: OpenCodeScanErrorKind;
-	readonly message: string;
-}
-
 export interface OpenCodeScanResult {
 	readonly sessions: ReadonlyArray<SessionInfo>;
 	/**
@@ -161,33 +97,6 @@ export interface OpenCodeScanResult {
 	 * should surface this to the UI rather than silently reporting "0 sessions".
 	 */
 	readonly error?: OpenCodeScanError;
-}
-
-/**
- * Returns null if the error is ENOENT (treat as "not installed" — silent).
- * Exported for unit testing; callers should use `scanOpenCodeSessions`.
- */
-export function classifyScanError(error: unknown): OpenCodeScanError | null {
-	const err = error as (Error & { code?: string }) | undefined;
-	const message = err?.message ?? String(error);
-	const code = err?.code;
-	if (code === "ENOENT") return null;
-	if (code === "EACCES" || code === "EPERM") return { kind: "permission", message };
-	// node:sqlite surfaces low-level SQLite error codes in the message
-	// (e.g. "SQLITE_CORRUPT: database disk image is malformed").
-	if (/SQLITE_CORRUPT|SQLITE_NOTADB|file is not a database/i.test(message)) {
-		return { kind: "corrupt", message };
-	}
-	if (/SQLITE_BUSY|SQLITE_LOCKED|database is locked/i.test(message)) {
-		return { kind: "locked", message };
-	}
-	if (/no such table|no such column/i.test(message)) {
-		return { kind: "schema", message };
-	}
-	if (/SQLITE_CANTOPEN|unable to open/i.test(message)) {
-		return { kind: "permission", message };
-	}
-	return { kind: "unknown", message };
 }
 
 /**
@@ -227,7 +136,7 @@ export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCode
 	}
 
 	try {
-		const sessions = await withOpenCodeDb(dbPath, (db) => {
+		const sessions = await withSqliteDb(dbPath, (db) => {
 			// OpenCode stores timestamps as unix milliseconds (INTEGER).
 			// Include both top-level and continuation (compacted) sessions for this project.
 			// Auto-compact creates child sessions (parent_id != NULL) that carry on the conversation,
@@ -238,7 +147,8 @@ export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCode
 			// (e.g. VS Code URIs lowercase the drive letter). Compare case-insensitively
 			// on those platforms. Linux filesystems are case-sensitive, so exact match
 			// is correct there.
-			const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+			const os = platform();
+			const caseInsensitive = os === "win32" || os === "darwin";
 			const directoryMatch = caseInsensitive
 				? "LOWER(directory) = LOWER(:projectDir)"
 				: "directory = :projectDir";

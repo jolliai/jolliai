@@ -118,6 +118,22 @@ vi.mock("../core/OpenCodeTranscriptReader.js", () => ({
 	}),
 }));
 
+vi.mock("../core/CursorSessionDiscoverer.js", () => ({
+	discoverCursorSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/CursorDetector.js", () => ({
+	isCursorInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/CursorTranscriptReader.js", () => ({
+	readCursorTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	readGeminiTranscript: vi.fn().mockResolvedValue({
 		entries: [],
@@ -146,6 +162,9 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { isCursorInstalled } from "../core/CursorDetector.js";
+import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
+import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
@@ -207,6 +226,7 @@ describe("QueueWorker", () => {
 		vi.mocked(savePlansRegistry).mockResolvedValue(undefined);
 		vi.mocked(isCodexInstalled).mockResolvedValue(false);
 		vi.mocked(isOpenCodeInstalled).mockResolvedValue(false);
+		vi.mocked(isCursorInstalled).mockResolvedValue(false);
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 		vi.mocked(generateSummary).mockResolvedValue({
 			transcriptEntries: 0,
@@ -331,6 +351,93 @@ describe("QueueWorker", () => {
 
 			// Worker should complete without throwing (error caught internally)
 			expect(releaseLock).toHaveBeenCalled();
+		});
+	});
+
+	describe("Cursor integration", () => {
+		it("should include discovered Cursor sessions in the pipeline when enabled", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cursor.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCursorSessions).mockResolvedValue([
+				{
+					sessionId: "cur-1",
+					transcriptPath: "/tmp/cursor.vscdb#cur-1",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cursor",
+				},
+			]);
+			vi.mocked(readCursorTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "Cursor context", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: {
+					transcriptPath: "/tmp/cursor.vscdb#cur-1",
+					lineNumber: 1,
+					updatedAt: "2026-04-01T12:00:00.000Z",
+				},
+				totalLinesRead: 1,
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(discoverCursorSessions).toHaveBeenCalledWith("/test/cwd");
+			expect(readCursorTranscript).toHaveBeenCalledWith(
+				"/tmp/cursor.vscdb#cur-1",
+				null,
+				"2026-04-01T12:00:00.000Z",
+			);
+			expect(saveCursor).toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/tmp/cursor.vscdb#cur-1", lineNumber: 1 }),
+				"/test/cwd",
+			);
+		});
+
+		it("skips discovery when cursorEnabled is explicitly false", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cursor-disabled.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({ cursorEnabled: false } as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+
+			await runWorker("/test/cwd");
+
+			// cursorEnabled=false short-circuits before isCursorInstalled is consulted
+			expect(isCursorInstalled).not.toHaveBeenCalled();
+			expect(discoverCursorSessions).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("Cursor integration — empty sessions", () => {
+		it("logs no Discovered count when isCursorInstalled=true but discovery returns empty", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cursor-empty.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCursorSessions).mockResolvedValue([]);
+
+			await runWorker("/test/cwd");
+
+			expect(discoverCursorSessions).toHaveBeenCalledWith("/test/cwd");
+			expect(storeSummary).toHaveBeenCalled();
 		});
 	});
 

@@ -31,6 +31,7 @@ const VALID_CONFIG_KEYS = [
 	"geminiEnabled",
 	"claudeEnabled",
 	"openCodeEnabled",
+	"cursorEnabled",
 	"logLevel",
 	"excludePatterns",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig>;
@@ -64,7 +65,13 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		return n;
 	}
 	// Boolean fields
-	if (key === "codexEnabled" || key === "geminiEnabled" || key === "claudeEnabled" || key === "openCodeEnabled") {
+	if (
+		key === "codexEnabled" ||
+		key === "geminiEnabled" ||
+		key === "claudeEnabled" ||
+		key === "openCodeEnabled" ||
+		key === "cursorEnabled"
+	) {
 		const lower = raw.toLowerCase();
 		if (lower === "true" || lower === "1" || lower === "yes") return true;
 		if (lower === "false" || lower === "0" || lower === "no") return false;
@@ -102,6 +109,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "openCodeEnabled",
 		type: "boolean",
 		description: "Enable OpenCode session discovery (true/false; requires Node 22.5+ at runtime)",
+	},
+	{
+		key: "cursorEnabled",
+		type: "boolean",
+		description: "Enable Cursor Composer session discovery (true/false; requires Node 22.5+ at runtime)",
 	},
 	{ key: "logLevel", type: "enum", description: "Log level: debug | info | warn | error" },
 	{ key: "excludePatterns", type: "string[]", description: "Glob patterns for file exclusion (comma-separated)" },

@@ -2044,6 +2044,9 @@ export class SummaryWebviewPanel {
 		if (config.openCodeEnabled !== false) {
 			sources.add("opencode");
 		}
+		if (config.cursorEnabled !== false) {
+			sources.add("cursor");
+		}
 		return sources;
 	}
 

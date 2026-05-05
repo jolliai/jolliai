@@ -18,7 +18,7 @@
 
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
-import { withOpenCodeDb } from "./OpenCodeSessionDiscoverer.js";
+import { withSqliteDb } from "./SqliteHelpers.js";
 import { mergeConsecutiveEntries } from "./TranscriptReader.js";
 
 const log = createLogger("OpenCodeTranscriptReader");
@@ -51,7 +51,7 @@ export async function readOpenCodeTranscript(
 	const cutoffTime = beforeTimestamp ? new Date(beforeTimestamp).getTime() : undefined;
 
 	try {
-		const { rawEntries, totalMessages, lastConsumedIndex } = await withOpenCodeDb(dbPath, (db) => {
+		const { rawEntries, totalMessages, lastConsumedIndex } = await withSqliteDb(dbPath, (db) => {
 			// Query messages with their parts via JOIN
 			const rows = db
 				.prepare(

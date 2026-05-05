@@ -138,5 +138,7 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toContain("return 'OpenCode'");
 		expect(script).toContain("source === 'gemini'");
 		expect(script).toContain("return 'Gemini'");
+		expect(script).toContain("source === 'cursor'");
+		expect(script).toContain("return 'Cursor'");
 	});
 });
