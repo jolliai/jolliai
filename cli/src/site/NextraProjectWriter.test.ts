@@ -226,6 +226,178 @@ describe("NextraProjectWriter.generateLayout", () => {
 		expect(result).toContain("Test");
 		expect(result).toContain("Desc");
 	});
+
+	// ── header / footer (post-1392 schema) ────────────────────────────────────
+
+	it("renders header.items direct links the same way as legacy nav", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			header: { items: [{ label: "Guides", url: "/guides" }] },
+		});
+		expect(result).toContain('<a href={"/guides"}');
+		expect(result).toContain('{"Guides"}');
+	});
+
+	it("prefers header.items over the legacy nav shorthand when both are set", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [{ label: "FromNav", href: "/nav" }],
+			header: { items: [{ label: "FromHeader", url: "/header" }] },
+		});
+		expect(result).toContain("FromHeader");
+		expect(result).not.toContain("FromNav");
+	});
+
+	it("renders a <details> dropdown when a header item has sub-items", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			header: {
+				items: [
+					{
+						label: "Resources",
+						items: [
+							{ label: "Blog", url: "/blog" },
+							{ label: "Changelog", url: "/changelog" },
+						],
+					},
+				],
+			},
+		});
+		expect(result).toContain("<details");
+		expect(result).toContain("<summary");
+		expect(result).toContain('{"Resources"}');
+		expect(result).toContain('{"Blog"}');
+		expect(result).toContain('{"Changelog"}');
+		expect(result).toContain('<a href={"/blog"}');
+	});
+
+	it("emits a bare <Footer /> when no footer config is provided (back-compat)", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout(SAMPLE_CONFIG);
+		expect(result).toContain("footer={<Footer />}");
+	});
+
+	it("emits a bare <Footer /> when footer is set but has no rendering content", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: { columns: [], socialLinks: {} },
+		});
+		expect(result).toContain("footer={<Footer />}");
+	});
+
+	it("renders footer copyright text", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: { copyright: "2026 Acme Inc." },
+		});
+		expect(result).toContain("<Footer>");
+		expect(result).toContain('{"2026 Acme Inc."}');
+	});
+
+	it("renders footer columns with titles and links", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: {
+				columns: [
+					{
+						title: "Product",
+						links: [
+							{ label: "Pricing", url: "/pricing" },
+							{ label: "Docs", url: "/docs" },
+						],
+					},
+				],
+			},
+		});
+		expect(result).toContain('{"Product"}');
+		expect(result).toContain('{"Pricing"}');
+		expect(result).toContain('<a href={"/pricing"}');
+		expect(result).toContain('<a href={"/docs"}');
+	});
+
+	it("renders footer social links in canonical platform order, skipping unset ones", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: { socialLinks: { youtube: "https://yt.example", github: "https://gh.example" } },
+		});
+		// github appears before youtube in SOCIAL_PLATFORMS; verify ordering survived.
+		const ghIdx = result.indexOf("gh.example");
+		const ytIdx = result.indexOf("yt.example");
+		expect(ghIdx).toBeGreaterThan(-1);
+		expect(ytIdx).toBeGreaterThan(-1);
+		expect(ghIdx).toBeLessThan(ytIdx);
+		expect(result).toContain('aria-label={"github"}');
+		expect(result).toContain('aria-label={"youtube"}');
+		expect(result).not.toContain('aria-label={"twitter"}');
+	});
+
+	it("sanitizes javascript: URLs in header items to '#'", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			header: { items: [{ label: "Bad", url: "javascript:alert(1)" }] },
+		});
+		expect(result).not.toContain("javascript:alert");
+		expect(result).toContain('<a href={"#"}');
+	});
+
+	it("sanitizes javascript: URLs in dropdown sub-items to '#'", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			header: {
+				items: [
+					{
+						label: "Menu",
+						items: [{ label: "Bad", url: "JAVASCRIPT:alert(1)" }],
+					},
+				],
+			},
+		});
+		expect(result).not.toMatch(/javascript:alert/i);
+		expect(result).toContain('<a href={"#"}');
+	});
+
+	it("sanitizes javascript: URLs in footer column links and social links", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: {
+				columns: [{ title: "X", links: [{ label: "Bad", url: "javascript:alert(1)" }] }],
+				socialLinks: { github: "data:text/html,evil" },
+			},
+		});
+		expect(result).not.toContain("javascript:alert");
+		expect(result).not.toContain("data:text/html");
+		// Both unsafe URLs should have been replaced with "#".
+		expect(result.match(/<a href={"#"}/g)?.length).toBeGreaterThanOrEqual(2);
+	});
 });
 
 // ─── generateMdxComponents unit tests ────────────────────────────────────────
@@ -569,8 +741,18 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 		);
 	});
 
-	it("generateLayout always contains all nav item hrefs", async () => {
+	it("generateLayout always contains the sanitized form of every nav item href", async () => {
 		const { generateLayout } = await import("./NextraProjectWriter.js");
+
+		// sanitizeUrl trims whitespace and replaces non-safe schemes with "#".
+		// The output embeds each href via JSON.stringify(sanitizeUrl(href)).
+		function expectedHref(href: string): string {
+			const trimmed = href.trim();
+			if (trimmed === "" || /^(?:https?:|mailto:|tel:|[#?/]|\.\.?\/)/i.test(trimmed)) {
+				return JSON.stringify(trimmed);
+			}
+			return JSON.stringify("#");
+		}
 
 		fc.assert(
 			fc.property(
@@ -580,7 +762,7 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 				(title, description, nav) => {
 					const config = { title, description, nav };
 					const result = generateLayout(config);
-					return nav.every(({ href }) => result.includes(href));
+					return nav.every(({ href }) => result.includes(expectedHref(href)));
 				},
 			),
 			{ numRuns: 100 },

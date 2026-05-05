@@ -15,6 +15,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { FooterConfig, HeaderConfig, HeaderItem, NavLink } from "./Types.js";
 
 // ─── NextraProjectConfig ──────────────────────────────────────────────────────
 
@@ -25,7 +26,9 @@ import { join } from "node:path";
 export interface NextraProjectConfig {
 	title: string;
 	description: string;
-	nav: Array<{ label: string; href: string }>;
+	nav: NavLink[];
+	header?: HeaderConfig;
+	footer?: FooterConfig;
 }
 
 // ─── initNextraProject ────────────────────────────────────────────────────────
@@ -133,31 +136,149 @@ export default withNextra({${exportLines}
 `;
 }
 
+// ─── generateLayout helpers ──────────────────────────────────────────────────
+
+/** Social platforms supported in the footer, in display order. */
+const SOCIAL_PLATFORMS = ["github", "twitter", "discord", "linkedin", "youtube"] as const;
+
+/**
+ * Allow http(s), mailto, tel, fragments, query strings, and absolute or
+ * relative paths. Anything else (e.g. `javascript:`, `data:`, `vbscript:`)
+ * is replaced with `"#"` so a malicious site.json can't inject a script URL.
+ */
+function sanitizeUrl(url: string): string {
+	const trimmed = url.trim();
+	if (trimmed === "" || /^(?:https?:|mailto:|tel:|[#?/]|\.\.?\/)/i.test(trimmed)) {
+		return trimmed;
+	}
+	return "#";
+}
+
+/**
+ * Resolves the navbar's logical item list. `header.items` wins when set;
+ * otherwise the legacy flat `nav` is coerced into dropdown-less items so
+ * pre-`header` site.json files keep rendering unchanged.
+ */
+function resolveHeaderItems(config: NextraProjectConfig): HeaderItem[] {
+	if (config.header?.items && config.header.items.length > 0) {
+		return config.header.items;
+	}
+	return config.nav.map((n) => ({ label: n.label, url: n.href }));
+}
+
+/** Renders a single header item — either an `<a>` or a `<details>` dropdown. */
+function renderNavbarChild(item: HeaderItem): string {
+	const jsLabel = JSON.stringify(item.label);
+	if (item.items && item.items.length > 0) {
+		const subLinks = item.items
+			.map((sub) => {
+				const jsSubLabel = JSON.stringify(sub.label);
+				const jsSubHref = JSON.stringify(sanitizeUrl(sub.url));
+				return `              <a href={${jsSubHref}} style={{ display: 'block', padding: '0.25rem 0.75rem', whiteSpace: 'nowrap' }}>{${jsSubLabel}}</a>`;
+			})
+			.join("\n");
+		return [
+			`          <details style={{ marginLeft: '1rem', display: 'inline-block', position: 'relative' }}>`,
+			`            <summary style={{ cursor: 'pointer', listStyle: 'none' }}>{${jsLabel}}</summary>`,
+			`            <div style={{ position: 'absolute', top: '100%', left: 0, marginTop: '0.25rem', background: 'var(--nextra-bg, #fff)', border: '1px solid var(--nextra-border, #e5e7eb)', borderRadius: 4, padding: '0.25rem 0', minWidth: 160, zIndex: 10 }}>`,
+			subLinks,
+			`            </div>`,
+			`          </details>`,
+		].join("\n");
+	}
+	const jsHref = JSON.stringify(sanitizeUrl(item.url ?? "#"));
+	return `          <a href={${jsHref}} style={{ marginLeft: '1rem' }}>{${jsLabel}}</a>`;
+}
+
+/** Builds the inner JSX of `<Footer>`, or `""` when there's nothing to render. */
+function buildFooterBody(footer: FooterConfig | undefined): string {
+	if (!footer) return "";
+
+	const hasColumns = footer.columns && footer.columns.length > 0;
+	const hasCopyright = typeof footer.copyright === "string" && footer.copyright.length > 0;
+	const socials = footer.socialLinks;
+	const socialEntries = socials
+		? SOCIAL_PLATFORMS.filter((p) => typeof socials[p] === "string" && socials[p] !== "")
+		: [];
+	const hasSocial = socialEntries.length > 0;
+
+	if (!hasColumns && !hasCopyright && !hasSocial) return "";
+
+	const blocks: string[] = [];
+
+	if (hasColumns) {
+		const columnsJsx = (footer.columns ?? [])
+			.map((col) => {
+				const jsTitle = JSON.stringify(col.title);
+				const links = col.links
+					.map((link) => {
+						const jsLabel = JSON.stringify(link.label);
+						const jsHref = JSON.stringify(sanitizeUrl(link.url));
+						return `                <li><a href={${jsHref}}>{${jsLabel}}</a></li>`;
+					})
+					.join("\n");
+				return [
+					`            <div style={{ minWidth: 140 }}>`,
+					`              <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.875rem', fontWeight: 600 }}>{${jsTitle}}</h4>`,
+					`              <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>`,
+					links,
+					`              </ul>`,
+					`            </div>`,
+				].join("\n");
+			})
+			.join("\n");
+		blocks.push(
+			`          <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap', marginBottom: '1rem' }}>\n${columnsJsx}\n          </div>`,
+		);
+	}
+
+	if (hasCopyright || hasSocial) {
+		const bottom: string[] = [];
+		if (hasCopyright) {
+			const jsCopyright = JSON.stringify(footer.copyright);
+			bottom.push(`            <span>{${jsCopyright}}</span>`);
+		}
+		if (hasSocial && socials) {
+			const social = socialEntries
+				.map((p) => {
+					const jsHref = JSON.stringify(sanitizeUrl(socials[p] ?? ""));
+					const jsLabel = JSON.stringify(p);
+					return `              <a href={${jsHref}} aria-label={${jsLabel}}>{${jsLabel}}</a>`;
+				})
+				.join("\n");
+			bottom.push(`            <div style={{ display: 'flex', gap: '0.75rem' }}>\n${social}\n            </div>`);
+		}
+		blocks.push(
+			`          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>\n${bottom.join("\n")}\n          </div>`,
+		);
+	}
+
+	return [`        <div style={{ width: '100%' }}>`, ...blocks, `        </div>`].join("\n");
+}
+
 // ─── generateLayout ──────────────────────────────────────────────────────────
 
 /**
  * Returns the contents of `app/layout.tsx` — the root layout for the Nextra v4
  * docs theme.
  *
- * Maps `title`, `description`, and `nav` from `site.json` into the Nextra
- * Layout, Navbar, and Footer components.
+ * Maps `title`, `description`, `nav` / `header`, and `footer` from `site.json`
+ * into the Nextra Layout, Navbar, and Footer components. `nav` is the legacy
+ * flat shorthand; `header.items` (which supports per-item dropdowns) wins
+ * when set.
  */
 export function generateLayout(config: NextraProjectConfig): string {
-	const { title, description, nav } = config;
+	const { title, description } = config;
 
 	const jsTitle = JSON.stringify(title);
 	const jsDescription = JSON.stringify(description);
 
-	// Build navbar children from nav items (Navbar uses `children` for extra content).
-	const navLinks = nav
-		.map(({ label, href }) => {
-			const jsLabel = JSON.stringify(label);
-			const jsHref = JSON.stringify(href);
-			return `          <a href={${jsHref}} style={{ marginLeft: '1rem' }}>{${jsLabel}}</a>`;
-		})
-		.join("\n");
+	const headerItems = resolveHeaderItems(config);
+	const navLinks = headerItems.map(renderNavbarChild).join("\n");
+	const navbarChildren = headerItems.length > 0 ? `\n${navLinks}\n        ` : "";
 
-	const navbarChildren = nav.length > 0 ? `\n${navLinks}\n        ` : "";
+	const footerBody = buildFooterBody(config.footer);
+	const footerJsx = footerBody === "" ? `<Footer />` : `<Footer>\n${footerBody}\n      </Footer>`;
 
 	return `import { Footer, Layout, Navbar } from 'nextra-theme-docs'
 import { Head } from 'nextra/components'
@@ -179,7 +300,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             <Navbar logo={<b>{${jsTitle}}</b>}>${navbarChildren}</Navbar>
           }
           pageMap={await getPageMap()}
-          footer={<Footer />}
+          footer={${footerJsx}}
         >
           {children}
         </Layout>
