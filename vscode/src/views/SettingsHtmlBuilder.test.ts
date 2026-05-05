@@ -60,6 +60,11 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('id="cursorEnabled"');
 	});
 
+	it("includes a Copilot toggle row", () => {
+		expect(html).toContain('id="copilotEnabled"');
+		expect(html).toContain("Copilot");
+	});
+
 	it("contains Files group with exclude patterns", () => {
 		expect(html).toContain("Files");
 		expect(html).toContain('id="excludePatterns"');

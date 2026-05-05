@@ -1003,6 +1003,23 @@ describe("SessionTracker", () => {
 			expect(filterSessionsByEnabledIntegrations(sessions, {})).toEqual(sessions);
 			expect(filterSessionsByEnabledIntegrations(sessions, { cursorEnabled: true })).toEqual(sessions);
 		});
+
+		it("filters out copilot sessions when copilotEnabled is false", () => {
+			const sessions = [
+				{ sessionId: "a", transcriptPath: "/a", updatedAt: "2026-05-05T00:00:00Z", source: "claude" as const },
+				{ sessionId: "b", transcriptPath: "/b", updatedAt: "2026-05-05T00:00:00Z", source: "copilot" as const },
+			];
+			const result = filterSessionsByEnabledIntegrations(sessions, { copilotEnabled: false });
+			expect(result.map((s) => s.sessionId)).toEqual(["a"]);
+		});
+
+		it("keeps copilot sessions when copilotEnabled is unset or true", () => {
+			const sessions = [
+				{ sessionId: "b", transcriptPath: "/b", updatedAt: "2026-05-05T00:00:00Z", source: "copilot" as const },
+			];
+			expect(filterSessionsByEnabledIntegrations(sessions, {})).toHaveLength(1);
+			expect(filterSessionsByEnabledIntegrations(sessions, { copilotEnabled: true })).toHaveLength(1);
+		});
 	});
 
 	// ── git operation queue ────────────────────────────────────────────────

@@ -29,6 +29,7 @@ export function buildSettingsScript(): string {
   const geminiEnabledInput = document.getElementById('geminiEnabled');
   const openCodeEnabledInput = document.getElementById('openCodeEnabled');
   const cursorEnabledInput = document.getElementById('cursorEnabled');
+  const copilotEnabledInput = document.getElementById('copilotEnabled');
   const localFolderInput = document.getElementById('localFolder');
   const browseLocalFolderBtn = document.getElementById('browseLocalFolderBtn');
   const rebuildKbBtn = document.getElementById('rebuildKbBtn');
@@ -130,7 +131,7 @@ export function buildSettingsScript(): string {
     }) && valid;
     // At least one integration must be enabled
     var intError = document.getElementById('integrations-error');
-    if (!claudeEnabledInput.checked && !codexEnabledInput.checked && !geminiEnabledInput.checked && !openCodeEnabledInput.checked && !cursorEnabledInput.checked) {
+    if (!claudeEnabledInput.checked && !codexEnabledInput.checked && !geminiEnabledInput.checked && !openCodeEnabledInput.checked && !cursorEnabledInput.checked && !copilotEnabledInput.checked) {
       intError.textContent = 'At least one integration must be enabled';
       valid = false;
     } else {
@@ -164,6 +165,7 @@ export function buildSettingsScript(): string {
       geminiEnabled: geminiEnabledInput.checked,
       openCodeEnabled: openCodeEnabledInput.checked,
       cursorEnabled: cursorEnabledInput.checked,
+      copilotEnabled: copilotEnabledInput.checked,
       localFolder: localFolderInput.value,
       excludePatterns: excludePatternsInput.value,
     };
@@ -181,6 +183,7 @@ export function buildSettingsScript(): string {
       geminiEnabledInput.checked !== initialState.geminiEnabled ||
       openCodeEnabledInput.checked !== initialState.openCodeEnabled ||
       cursorEnabledInput.checked !== initialState.cursorEnabled ||
+      copilotEnabledInput.checked !== initialState.copilotEnabled ||
       localFolderInput.value !== initialState.localFolder ||
       excludePatternsInput.value !== initialState.excludePatterns
     );
@@ -205,7 +208,7 @@ export function buildSettingsScript(): string {
     input.addEventListener('input', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
   modelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
-  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput].forEach(function(input) {
+  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput].forEach(function(input) {
     input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
 
@@ -236,6 +239,7 @@ export function buildSettingsScript(): string {
         geminiEnabled: geminiEnabledInput.checked,
         openCodeEnabled: openCodeEnabledInput.checked,
         cursorEnabled: cursorEnabledInput.checked,
+        copilotEnabled: copilotEnabledInput.checked,
         localFolder: localFolderInput.value.trim(),
         excludePatterns: excludePatternsInput.value,
       },
@@ -258,6 +262,7 @@ export function buildSettingsScript(): string {
         geminiEnabledInput.checked = msg.settings.geminiEnabled;
         openCodeEnabledInput.checked = msg.settings.openCodeEnabled;
         cursorEnabledInput.checked = msg.settings.cursorEnabled;
+        copilotEnabledInput.checked = msg.settings.copilotEnabled;
         localFolderInput.value = msg.settings.localFolder || '';
         excludePatternsInput.value = msg.settings.excludePatterns;
         maskedApiKey = msg.maskedApiKey;

@@ -22,7 +22,7 @@ interface IntegrationStatusInputs {
 	/** undefined = this integration has no hook concept (Codex, OpenCode). */
 	readonly hookInstalled: boolean | undefined;
 	readonly sessionCount: number | undefined;
-	/** OpenCode-only: DB existed but scan failed (corrupt/locked/schema/etc). */
+	/** DB existed but scan failed (corrupt/locked/schema/etc). Used by OpenCode and Copilot integrations. */
 	readonly scanError?: StatusInfo["openCodeScanError"];
 }
 
@@ -156,6 +156,16 @@ export function registerStatusCommand(program: Command): void {
 						hookInstalled: undefined,
 						sessionCount: counts.cursor,
 						scanError: status.cursorScanError,
+					},
+				],
+				[
+					"Copilot:",
+					status.copilotDetected,
+					{
+						enabled: status.copilotEnabled !== false,
+						hookInstalled: undefined,
+						sessionCount: counts.copilot,
+						scanError: status.copilotScanError,
 					},
 				],
 			];

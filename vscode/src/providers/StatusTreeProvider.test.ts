@@ -586,6 +586,52 @@ describe("StatusTreeProvider", () => {
 		expect(cursor?.description).toBe("detected & enabled (3 sessions)");
 	});
 
+	// ── Copilot scan error ────────────────────────────────────────────────
+
+	it("shows Copilot Integration row when detected and enabled", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: true,
+					copilotEnabled: true,
+					sessionsBySource: { copilot: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const item = items.find((i) => i.label === "Copilot Integration");
+		expect(item).toBeDefined();
+		expect(item?.description).toContain("2");
+	});
+
+	it("shows Copilot Integration as unavailable when scan errors", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: true,
+					copilotEnabled: true,
+					copilotScanError: { kind: "locked", message: "database is locked" },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const item = items.find((i) => i.label === "Copilot Integration");
+		expect(item?.description).toContain("locked");
+		expect(String(item?.tooltip)).toContain("Copilot database scan failed");
+	});
+
 	// ── Auth-aware status rows ────────────────────────────────────────────
 
 	it("shows Jolli Account connected when authToken is present", async () => {

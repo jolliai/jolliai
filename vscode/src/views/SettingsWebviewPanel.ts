@@ -43,6 +43,7 @@ interface SettingsPayload {
 	readonly geminiEnabled: boolean;
 	readonly openCodeEnabled: boolean;
 	readonly cursorEnabled: boolean;
+	readonly copilotEnabled: boolean;
 	readonly localFolder: string;
 	readonly excludePatterns: string;
 }
@@ -252,6 +253,7 @@ export class SettingsWebviewPanel {
 			geminiEnabled: config.geminiEnabled !== false,
 			openCodeEnabled: config.openCodeEnabled !== false,
 			cursorEnabled: config.cursorEnabled !== false,
+			copilotEnabled: config.copilotEnabled !== false,
 			localFolder: config.localFolder ?? "",
 			excludePatterns: config.excludePatterns
 				? config.excludePatterns.join(", ")
@@ -328,6 +330,7 @@ export class SettingsWebviewPanel {
 			geminiEnabled: settings.geminiEnabled,
 			openCodeEnabled: settings.openCodeEnabled,
 			cursorEnabled: settings.cursorEnabled,
+			copilotEnabled: settings.copilotEnabled,
 			localFolder:
 				settings.localFolder && settings.localFolder.length > 0
 					? settings.localFolder

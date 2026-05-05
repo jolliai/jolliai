@@ -315,6 +315,30 @@ function buildFullStatusItems(
 		);
 	}
 
+	// Copilot CLI also has a scan-time error channel (DB can be locked/corrupt).
+	if (s.copilotScanError) {
+		items.push(
+			new StatusItem(
+				"Copilot Integration",
+				`unavailable — ${s.copilotScanError.kind}`,
+				ICON_WARN,
+				`Copilot database scan failed (${s.copilotScanError.kind}): ${s.copilotScanError.message}`,
+			),
+		);
+	} else {
+		pushIntegrationItem(
+			items,
+			s.copilotDetected,
+			s.copilotEnabled !== false,
+			undefined,
+			"Copilot Integration",
+			"Copilot CLI database found — session discovery is enabled",
+			"Copilot CLI detected but session discovery is disabled in config",
+			undefined,
+			counts.copilot,
+		);
+	}
+
 	if (extensionOutdated) {
 		items.push(
 			new StatusItem(

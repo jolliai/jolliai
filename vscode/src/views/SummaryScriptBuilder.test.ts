@@ -141,4 +141,15 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toContain("source === 'cursor'");
 		expect(script).toContain("return 'Cursor'");
 	});
+
+	it("maps 'copilot' source to 'Copilot' label", () => {
+		expect(script).toContain("source === 'copilot'");
+		expect(script).toContain("return 'Copilot'");
+	});
+
+	it("appends 'cursor' and 'copilot' to sourceOrder", () => {
+		expect(script).toContain(
+			"'claude', 'codex', 'gemini', 'opencode', 'cursor', 'copilot'",
+		);
+	});
 });

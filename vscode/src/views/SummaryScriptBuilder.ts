@@ -1133,6 +1133,7 @@ ${buildPrMessageScript()}
     if (source === 'gemini') return 'Gemini';
     if (source === 'opencode') return 'OpenCode';
     if (source === 'cursor') return 'Cursor';
+    if (source === 'copilot') return 'Copilot';
     return 'Claude';
   }
 
@@ -1558,7 +1559,7 @@ ${buildPrMessageScript()}
       if (conversationsStats) {
         var sessionCounts = msg.sessionCounts || {};
         var parts = [];
-        var sourceOrder = ['claude', 'codex', 'gemini', 'opencode', 'cursor'];
+        var sourceOrder = ['claude', 'codex', 'gemini', 'opencode', 'cursor', 'copilot'];
         for (var i = 0; i < sourceOrder.length; i++) {
           var source = sourceOrder[i];
           var count = sessionCounts[source] || 0;

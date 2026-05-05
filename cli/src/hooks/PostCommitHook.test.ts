@@ -143,6 +143,23 @@ vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	}),
 }));
 
+vi.mock("../core/CopilotDetector.js", () => ({
+	isCopilotInstalled: vi.fn().mockResolvedValue(false),
+	getCopilotDbPath: vi.fn().mockReturnValue("/mock/.copilot/session-store.db"),
+}));
+
+vi.mock("../core/CopilotSessionDiscoverer.js", () => ({
+	discoverCopilotSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/CopilotTranscriptReader.js", () => ({
+	readCopilotTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/TranscriptParser.js", () => ({
 	getParserForSource: vi.fn().mockReturnValue({ parseLine: vi.fn() }),
 }));

@@ -1127,6 +1127,74 @@ describe("SettingsWebviewPanel", () => {
 			);
 		});
 
+		it("loads copilotEnabled from config (default true)", async () => {
+			// When config has copilotEnabled: false, it should be sent as false
+			const dispatch = await setupWithLoadedConfig({ copilotEnabled: false });
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ copilotEnabled: false }),
+				}),
+			);
+
+			// When config has no copilotEnabled, it should default to true
+			postMessage.mockClear();
+			SettingsWebviewPanel.dispose();
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				// copilotEnabled intentionally absent
+				excludePatterns: [],
+			});
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch2 = captureMessageHandler();
+			dispatch2({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ copilotEnabled: true }),
+				}),
+			);
+		});
+
+		it("persists copilotEnabled when the user submits", async () => {
+			const dispatch = await setupWithLoadedConfig({ copilotEnabled: true });
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					openCodeEnabled: true,
+					copilotEnabled: false,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ copilotEnabled: false }),
+				expect.any(String),
+			);
+		});
+
 		it("removes Claude and Gemini hooks when disabled", async () => {
 			const dispatch = await setupWithLoadedConfig();
 

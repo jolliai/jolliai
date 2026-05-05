@@ -63,4 +63,22 @@ describe("SettingsScriptBuilder", () => {
 		expect(script).toContain("openCodeEnabled");
 		expect(script).toContain("cursorEnabled");
 	});
+
+	it("references the copilotEnabled DOM input", () => {
+		expect(script).toContain("getElementById('copilotEnabled')");
+	});
+
+	it("includes copilotEnabled in validation guard", () => {
+		expect(script).toMatch(/!copilotEnabledInput\.checked/);
+	});
+
+	it("ships copilotEnabled in save payload", () => {
+		expect(script).toContain("copilotEnabled: copilotEnabledInput.checked");
+	});
+
+	it("loads copilotEnabled from host message", () => {
+		expect(script).toContain(
+			"copilotEnabledInput.checked = msg.settings.copilotEnabled",
+		);
+	});
 });

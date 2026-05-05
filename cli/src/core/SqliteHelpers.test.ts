@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { classifyScanError, hasNodeSqliteSupport, NODE_SQLITE_MIN_VERSION } from "./SqliteHelpers.js";
+import { classifyScanError, hasNodeSqliteSupport, NODE_SQLITE_MIN_VERSION, withSqliteDb } from "./SqliteHelpers.js";
 
 describe("hasNodeSqliteSupport", () => {
 	const { major, minor } = NODE_SQLITE_MIN_VERSION;
@@ -81,5 +81,45 @@ describe("classifyScanError", () => {
 		const classified = classifyScanError("raw string rejection");
 		expect(classified?.kind).toBe("unknown");
 		expect(classified?.message).toBe("raw string rejection");
+	});
+});
+
+describe("withSqliteDb", () => {
+	it("opens a real DB read-only, runs the callback, then closes", async () => {
+		const { tmpdir } = await import("node:os");
+		const { mkdtemp } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const { DatabaseSync } = await import("node:sqlite");
+		const dir = await mkdtemp(join(tmpdir(), "sqlite-helpers-"));
+		const dbPath = join(dir, "x.db");
+
+		// Seed: one CREATE then one INSERT, each through prepare().run() so this test
+		// works on every node:sqlite version (DatabaseSync.prepare accepts only single
+		// statements).
+		const seed = new DatabaseSync(dbPath);
+		seed.prepare("CREATE TABLE t (k TEXT)").run();
+		seed.prepare("INSERT INTO t (k) VALUES ('hi')").run();
+		seed.close();
+
+		const value = await withSqliteDb(dbPath, (db) => {
+			return (db.prepare("SELECT k FROM t").get() as { k: string }).k;
+		});
+		expect(value).toBe("hi");
+	});
+
+	it("propagates errors from the callback", async () => {
+		const { tmpdir } = await import("node:os");
+		const { mkdtemp } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const { DatabaseSync } = await import("node:sqlite");
+		const dir = await mkdtemp(join(tmpdir(), "sqlite-helpers-"));
+		const dbPath = join(dir, "x.db");
+		new DatabaseSync(dbPath).close();
+
+		await expect(
+			withSqliteDb(dbPath, () => {
+				throw new Error("boom");
+			}),
+		).rejects.toThrow("boom");
 	});
 });

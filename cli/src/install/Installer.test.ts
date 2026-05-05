@@ -60,6 +60,18 @@ vi.mock("../core/CursorSessionDiscoverer.js", () => ({
 	scanCursorSessions: vi.fn().mockResolvedValue({ sessions: [] }),
 }));
 
+// Mock CopilotDetector for status/install checks
+vi.mock("../core/CopilotDetector.js", () => ({
+	isCopilotInstalled: vi.fn().mockResolvedValue(false),
+	getCopilotDbPath: vi.fn().mockReturnValue("/fake/.copilot/session-store.db"),
+}));
+
+// Mock CopilotSessionDiscoverer for status/install checks
+vi.mock("../core/CopilotSessionDiscoverer.js", () => ({
+	scanCopilotSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+	discoverCopilotSessions: vi.fn().mockResolvedValue([]),
+}));
+
 // Partially mock DistPathResolver so resolveDistPath doesn't depend on global npm state.
 // By default, resolveDistPath returns the caller's own dist dir with "cli" source.
 vi.mock("./DistPathResolver.js", async (importOriginal) => {
@@ -150,6 +162,10 @@ describe("Installer", () => {
 		vi.mocked(isCursorInstalled).mockResolvedValue(false);
 		const { scanCursorSessions } = await import("../core/CursorSessionDiscoverer.js");
 		vi.mocked(scanCursorSessions).mockResolvedValue({ sessions: [] });
+		const { isCopilotInstalled } = await import("../core/CopilotDetector.js");
+		const { scanCopilotSessions } = await import("../core/CopilotSessionDiscoverer.js");
+		vi.mocked(isCopilotInstalled).mockResolvedValue(false);
+		vi.mocked(scanCopilotSessions).mockResolvedValue({ sessions: [] });
 	});
 
 	afterEach(async () => {
@@ -276,6 +292,41 @@ describe("Installer", () => {
 			expect(result.success).toBe(true);
 			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
 			expect(globalConfig.cursorEnabled).toBe(true);
+		});
+
+		it("auto-enables Copilot when DB is detected and config is undefined", async () => {
+			const { isCopilotInstalled } = await import("../core/CopilotDetector.js");
+			vi.mocked(isCopilotInstalled).mockResolvedValueOnce(true);
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.copilotEnabled).toBe(true);
+		});
+
+		it("does not overwrite copilotEnabled when explicitly set", async () => {
+			const { isCopilotInstalled } = await import("../core/CopilotDetector.js");
+			vi.mocked(isCopilotInstalled).mockResolvedValueOnce(true);
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ copilotEnabled: false }), "utf-8");
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.copilotEnabled).toBe(false);
+		});
+
+		it("should not rewrite copilotEnabled when Copilot CLI is detected and already true", async () => {
+			const { isCopilotInstalled } = await import("../core/CopilotDetector.js");
+			vi.mocked(isCopilotInstalled).mockResolvedValueOnce(true);
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ copilotEnabled: true }), "utf-8");
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.copilotEnabled).toBe(true);
 		});
 
 		it("should use process.cwd() when install is called without cwd", async () => {
@@ -2060,6 +2111,54 @@ describe("Installer", () => {
 				kind: "corrupt",
 				message: "SQLITE_CORRUPT: disk image is malformed",
 			});
+		});
+
+		it("includes copilotDetected/copilotEnabled in status when DB present", async () => {
+			const { isCopilotInstalled } = await import("../core/CopilotDetector.js");
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			vi.mocked(isCopilotInstalled).mockResolvedValue(true);
+			await saveConfigScoped({ copilotEnabled: true }, emptyGlobalDir);
+			const status = await getStatus(tempDir);
+			expect(status.copilotDetected).toBe(true);
+			expect(status.copilotEnabled).toBe(true);
+		});
+
+		it("surfaces copilotScanError on scan failure", async () => {
+			const { isCopilotInstalled } = await import("../core/CopilotDetector.js");
+			const { scanCopilotSessions } = await import("../core/CopilotSessionDiscoverer.js");
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			vi.mocked(isCopilotInstalled).mockResolvedValue(true);
+			vi.mocked(scanCopilotSessions).mockResolvedValue({
+				sessions: [],
+				error: { kind: "locked", message: "database is locked" },
+			});
+			await saveConfigScoped({ copilotEnabled: true }, emptyGlobalDir);
+			const status = await getStatus(tempDir);
+			expect(status.copilotScanError).toEqual({ kind: "locked", message: "database is locked" });
+		});
+
+		it("merges discovered Copilot sessions into the active session count", async () => {
+			const { isCopilotInstalled } = await import("../core/CopilotDetector.js");
+			const { scanCopilotSessions } = await import("../core/CopilotSessionDiscoverer.js");
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			vi.mocked(isCopilotInstalled).mockResolvedValue(true);
+			vi.mocked(scanCopilotSessions).mockResolvedValue({
+				sessions: [
+					{
+						sessionId: "cp-active",
+						transcriptPath: "/fake/.copilot/session-store.db#cp-active",
+						updatedAt: new Date().toISOString(),
+						source: "copilot",
+					},
+				],
+			});
+			await saveConfigScoped({ copilotEnabled: true }, emptyGlobalDir);
+
+			const status = await getStatus(tempDir);
+
+			expect(status.activeSessions).toBeGreaterThanOrEqual(1);
+			expect(status.sessionsBySource?.copilot).toBe(1);
+			expect(status.copilotScanError).toBeUndefined();
 		});
 
 		it("should count legacy sessions without a source as Claude sessions", async () => {

@@ -22,6 +22,9 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { isCopilotInstalled } from "../core/CopilotDetector.js";
+import { discoverCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
+import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
 import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
@@ -1437,6 +1440,15 @@ async function loadSessionTranscripts(
 		}
 	}
 
+	// Discover Copilot CLI sessions (on-demand SQLite scan).
+	if (config.copilotEnabled !== false && (await isCopilotInstalled())) {
+		const copilotSessions = await discoverCopilotSessions(cwd);
+		if (copilotSessions.length > 0) {
+			allSessions = [...allSessions, ...copilotSessions];
+			log.info("Discovered %d Copilot session(s)", copilotSessions.length);
+		}
+	}
+
 	if (allSessions.length === 0) {
 		log.info("No active sessions found — will infer topics from diff if available");
 	}
@@ -1473,14 +1485,35 @@ async function readAllTranscripts(
 		const startLine = cursor?.lineNumber ?? 0;
 		const source = session.source ?? "claude";
 
-		// Gemini, OpenCode, and Cursor use dedicated readers (not JSONL line-based parsing)
+		// Gemini, OpenCode, Cursor, and Copilot use dedicated readers (not JSONL line-based parsing).
+		// SQLite-backed readers (opencode/cursor/copilot) share the same failure modes —
+		// transient lock, corruption, schema drift, DB disappearing between scan and read.
+		// Wrap each in try/catch + `continue` so one bad session never abandons the rest of
+		// the batch. JSONL readers (gemini/claude) handle their per-line failures internally.
 		let result: TranscriptReadResult;
 		if (source === "gemini") {
 			result = await readGeminiTranscript(session.transcriptPath, cursor, beforeTimestamp);
 		} else if (source === "opencode") {
-			result = await readOpenCodeTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			try {
+				result = await readOpenCodeTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping OpenCode session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
 		} else if (source === "cursor") {
-			result = await readCursorTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			try {
+				result = await readCursorTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Cursor session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
+		} else if (source === "copilot") {
+			try {
+				result = await readCopilotTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Copilot session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
 		} else {
 			result = await readTranscript(session.transcriptPath, cursor, getParserForSource(source), beforeTimestamp);
 		}
