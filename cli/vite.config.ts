@@ -24,7 +24,7 @@ export default defineConfig({
 			formats: ["es"],
 		},
 		rollupOptions: {
-			external: ["@anthropic-ai/sdk", "@mdx-js/mdx", "commander", "open", /^node:.*/],
+			external: ["@anthropic-ai/sdk", "@mdx-js/mdx", "chokidar", "commander", "open", /^node:.*/],
 			output: {
 				chunkFileNames: "[name].js",
 			},

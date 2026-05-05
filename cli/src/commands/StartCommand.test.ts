@@ -84,6 +84,11 @@ vi.mock("../site/PagefindRunner.js", () => ({
 	runPagefind: mockRunPagefind,
 }));
 
+const mockStartSourceWatcher = vi.hoisted(() => vi.fn());
+vi.mock("../site/SourceWatcher.js", () => ({
+	startSourceWatcher: mockStartSourceWatcher,
+}));
+
 // ─── Default mock values ──────────────────────────────────────────────────────
 
 const DEFAULT_SITE_JSON_RESULT = {
@@ -129,6 +134,7 @@ function setupSuccessfulRun(
 	mockRunNpmDev.mockResolvedValue({ success: true, output: "" });
 	mockRunPagefind.mockResolvedValue({ success: true, output: "Indexed 5 pages", pagesIndexed: 5 });
 	mockRunServe.mockResolvedValue({ success: true, output: "" });
+	mockStartSourceWatcher.mockReturnValue({ close: vi.fn().mockResolvedValue(undefined) });
 }
 
 // ─── Shared pipeline tests (apply to both start and dev) ─────────────────────
@@ -496,6 +502,84 @@ describe("jolli dev", () => {
 		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
 
 		expect(process.exitCode).toBe(0);
+	});
+
+	// ── Source-folder hot reload ──────────────────────────────────────────────
+
+	it("starts a source-folder watcher rooted at the resolved sourceRoot", async () => {
+		setupSuccessfulRun();
+		const program = await makeProgram();
+		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
+
+		expect(mockStartSourceWatcher).toHaveBeenCalledOnce();
+		const [watchedPath] = mockStartSourceWatcher.mock.calls[0] as [string, { onChange: () => Promise<void> }];
+		expect(watchedPath).toBe(resolve("/my-docs"));
+	});
+
+	it("closes the watcher when the dev server exits cleanly", async () => {
+		setupSuccessfulRun();
+		const closeMock = vi.fn().mockResolvedValue(undefined);
+		mockStartSourceWatcher.mockReturnValue({ close: closeMock });
+		const program = await makeProgram();
+		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
+
+		expect(closeMock).toHaveBeenCalledOnce();
+	});
+
+	it("closes the watcher even when the dev server errors out", async () => {
+		setupSuccessfulRun();
+		mockRunNpmDev.mockResolvedValue({ success: false, output: "Dev error" });
+		const closeMock = vi.fn().mockResolvedValue(undefined);
+		mockStartSourceWatcher.mockReturnValue({ close: closeMock });
+		const program = await makeProgram();
+		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
+
+		expect(process.exitCode).toBe(1);
+		expect(closeMock).toHaveBeenCalledOnce();
+	});
+
+	it("re-runs mirror + nav + openapi when the watcher fires onChange", async () => {
+		setupSuccessfulRun({ openapiFiles: ["api/spec.yaml"] });
+		const program = await makeProgram();
+		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
+
+		// Initial pass already called the mirroring + render path once.
+		const initialMirrorCount = mockMirrorContent.mock.calls.length;
+		const initialRenderCount = mockRenderOpenApiFiles.mock.calls.length;
+
+		// Trigger the captured onChange to simulate a file edit.
+		const [, options] = mockStartSourceWatcher.mock.calls[0] as [string, { onChange: () => Promise<void> }];
+		await options.onChange();
+
+		expect(mockMirrorContent.mock.calls.length).toBe(initialMirrorCount + 1);
+		expect(mockGenerateMetaFiles).toHaveBeenCalledTimes(2);
+		expect(mockRenderOpenApiFiles.mock.calls.length).toBe(initialRenderCount + 1);
+	});
+
+	it("logs a synced-file count on each onChange", async () => {
+		setupSuccessfulRun({ markdownFiles: ["a.md", "b.md"], openapiFiles: ["api.yaml"] });
+		const program = await makeProgram();
+		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
+
+		const [, options] = mockStartSourceWatcher.mock.calls[0] as [string, { onChange: () => Promise<void> }];
+		await options.onChange();
+
+		const output = consoleSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+		expect(output).toMatch(/↻ Synced \d+ files/);
+	});
+
+	it("watcher onChange swallows a site.json read error and does NOT crash", async () => {
+		setupSuccessfulRun();
+		const program = await makeProgram();
+		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
+
+		// Make the next site.json read fail; the dev process must keep running.
+		mockReadSiteJson.mockRejectedValueOnce(new Error("transient parse error"));
+		const [, options] = mockStartSourceWatcher.mock.calls[0] as [string, { onChange: () => Promise<void> }];
+		await expect(options.onChange()).resolves.toBeUndefined();
+
+		const errorOutput = consoleErrorSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+		expect(errorOutput).toContain("transient parse error");
 	});
 });
 

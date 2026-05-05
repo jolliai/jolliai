@@ -15,6 +15,7 @@ import { needsInstall, runNpmInstall, runServe } from "../site/NpmRunner.js";
 import { runPagefind } from "../site/PagefindRunner.js";
 import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
+import { startSourceWatcher } from "../site/SourceWatcher.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -32,6 +33,59 @@ function verbose(msg: string, isVerbose: boolean): void {
 interface CmdOpts {
 	migrate?: boolean;
 	verbose?: boolean;
+}
+
+// ─── syncContent ─────────────────────────────────────────────────────────────
+
+/**
+ * Reads `site.json`, mirrors the source folder into `contentDir`, fixes the
+ * sidebar's index key if a file was renamed, regenerates navigation, and
+ * re-renders OpenAPI specs. Used by both the initial `prepareContent` and
+ * the dev-mode source watcher (which calls it on every settled change so
+ * `next dev`'s HMR sees the latest output).
+ *
+ * Side effects this function does NOT do — they're scaffolding-only and
+ * belong to `prepareContent`: `initProject`, clearing the public dir,
+ * resolving favicon, npm install.
+ */
+async function syncContent(
+	sourceRoot: string,
+	contentDir: string,
+	publicDir: string,
+	renderer: SiteRenderer,
+	opts: CmdOpts,
+): Promise<{ success: false } | { success: true; mirrorResult: Awaited<ReturnType<typeof mirrorContent>> }> {
+	let siteJsonResult: Awaited<ReturnType<typeof readSiteJson>>;
+	try {
+		siteJsonResult = await readSiteJson(sourceRoot, { migrate: opts.migrate });
+	} catch (err) {
+		console.error(`  Error: ${err instanceof Error ? err.message : String(err)}`);
+		return { success: false };
+	}
+
+	const mirrorResult = await mirrorContent(
+		sourceRoot,
+		contentDir,
+		siteJsonResult.config.pathMappings,
+		publicDir,
+		renderer.getContentRules(),
+	);
+
+	// Fix sidebar index key if a file was renamed during mirror.
+	const sidebar = siteJsonResult.config.sidebar;
+	if (mirrorResult.renamedToIndex && sidebar?.["/"]?.[mirrorResult.renamedToIndex]) {
+		const label = sidebar["/"][mirrorResult.renamedToIndex];
+		delete sidebar["/"][mirrorResult.renamedToIndex];
+		sidebar["/"] = { index: label, ...sidebar["/"] };
+	}
+
+	await renderer.generateNavigation(contentDir, sidebar);
+
+	if (mirrorResult.openapiFiles.length > 0) {
+		await renderer.renderOpenApiFiles(sourceRoot, contentDir, mirrorResult.openapiFiles, publicDir);
+	}
+
+	return { success: true, mirrorResult };
 }
 
 // ─── prepareContent ──────────────────────────────────────────────────────────
@@ -90,15 +144,14 @@ async function prepareContent(
 	// Resolve favicon
 	await resolveFavicon(siteJsonResult.config.favicon, sourceRoot, publicDir);
 
-	// Mirror content
+	// Mirror + nav + render OpenAPI specs (shared with the dev watcher).
 	verbose("Mirroring content…", v);
-	const mirrorResult = await mirrorContent(
-		sourceRoot,
-		contentDir,
-		siteJsonResult.config.pathMappings,
-		publicDir,
-		renderer.getContentRules(),
-	);
+	const sync = await syncContent(sourceRoot, contentDir, publicDir, renderer, opts);
+	if (!sync.success) {
+		process.exitCode = 1;
+		return { success: false };
+	}
+	const { mirrorResult } = sync;
 
 	const total = mirrorResult.markdownFiles.length + mirrorResult.imageFiles.length + mirrorResult.openapiFiles.length;
 	const downgraded = mirrorResult.downgradedCount;
@@ -109,24 +162,7 @@ async function prepareContent(
 		console.warn("  ⚠ No markdown or OpenAPI files found. Producing an empty site.");
 	}
 
-	// Fix sidebar index key if file was renamed
-	const sidebar = siteJsonResult.config.sidebar;
-	if (mirrorResult.renamedToIndex && sidebar?.["/"]?.[mirrorResult.renamedToIndex]) {
-		const label = sidebar["/"][mirrorResult.renamedToIndex];
-		delete sidebar["/"][mirrorResult.renamedToIndex];
-		sidebar["/"] = { index: label, ...sidebar["/"] };
-	}
-
-	// Generate navigation
-	verbose("Generating navigation…", v);
-	await renderer.generateNavigation(contentDir, sidebar);
 	console.log("  ✓ Generated navigation");
-
-	// Render OpenAPI specs
-	if (mirrorResult.openapiFiles.length > 0) {
-		verbose("Rendering OpenAPI specs…", v);
-		await renderer.renderOpenApiFiles(sourceRoot, contentDir, mirrorResult.openapiFiles, publicDir);
-	}
 
 	// Install dependencies
 	if (needsInstall(buildDir)) {
@@ -248,11 +284,34 @@ export function registerDevCommand(program: Command): void {
 			const result = await prepareContent(sourceRoot, buildDir, contentDir, publicDir, false, opts);
 			if (!result.success) return;
 
+			// Watch the source folder so edits trigger an incremental re-mirror
+			// + re-render of OpenAPI specs while the dev server is running.
+			// Next.js's HMR picks up the writes to <buildDir>/content/.
+			console.log("  Watching source folder for changes…");
+			const watcher = startSourceWatcher(sourceRoot, {
+				onChange: async () => {
+					const sync = await syncContent(sourceRoot, contentDir, publicDir, result.renderer, opts);
+					if (sync.success) {
+						const total =
+							sync.mirrorResult.markdownFiles.length +
+							sync.mirrorResult.imageFiles.length +
+							sync.mirrorResult.openapiFiles.length;
+						const ignored = sync.mirrorResult.ignoredFiles.length;
+						const suffix = ignored > 0 ? ` (${ignored} ignored)` : "";
+						console.log(`  ↻ Synced ${total} files${suffix}`);
+					}
+				},
+			});
+
 			console.log("");
-			const devResult = await result.renderer.runDev(buildDir, opts.verbose === true);
-			if (!devResult.success) {
-				if (devResult.output) console.error(devResult.output);
-				process.exitCode = 1;
+			try {
+				const devResult = await result.renderer.runDev(buildDir, opts.verbose === true);
+				if (!devResult.success) {
+					if (devResult.output) console.error(devResult.output);
+					process.exitCode = 1;
+				}
+			} finally {
+				await watcher.close();
 			}
 		});
 }
