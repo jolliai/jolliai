@@ -2098,6 +2098,9 @@ export class SummaryWebviewPanel {
 		if (config.cursorEnabled !== false) {
 			sources.add("cursor");
 		}
+		if (config.copilotEnabled !== false) {
+			sources.add("copilot");
+		}
 		return sources;
 	}
 

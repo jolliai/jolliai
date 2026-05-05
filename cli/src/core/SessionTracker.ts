@@ -169,6 +169,9 @@ export function filterSessionsByEnabledIntegrations(
 	if (config.cursorEnabled === false) {
 		filtered = filtered.filter((s) => s.source !== "cursor");
 	}
+	if (config.copilotEnabled === false) {
+		filtered = filtered.filter((s) => s.source !== "copilot");
+	}
 	return filtered;
 }
 

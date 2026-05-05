@@ -32,6 +32,7 @@ const VALID_CONFIG_KEYS = [
 	"claudeEnabled",
 	"openCodeEnabled",
 	"cursorEnabled",
+	"copilotEnabled",
 	"logLevel",
 	"excludePatterns",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig>;
@@ -70,7 +71,8 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "geminiEnabled" ||
 		key === "claudeEnabled" ||
 		key === "openCodeEnabled" ||
-		key === "cursorEnabled"
+		key === "cursorEnabled" ||
+		key === "copilotEnabled"
 	) {
 		const lower = raw.toLowerCase();
 		if (lower === "true" || lower === "1" || lower === "yes") return true;
@@ -114,6 +116,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "cursorEnabled",
 		type: "boolean",
 		description: "Enable Cursor Composer session discovery (true/false; requires Node 22.5+ at runtime)",
+	},
+	{
+		key: "copilotEnabled",
+		type: "boolean",
+		description: "Enable Copilot CLI session discovery (true/false; requires Node 22.5+ at runtime)",
 	},
 	{ key: "logLevel", type: "enum", description: "Log level: debug | info | warn | error" },
 	{ key: "excludePatterns", type: "string[]", description: "Glob patterns for file exclusion (comma-separated)" },

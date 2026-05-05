@@ -19,6 +19,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isClaudeInstalled } from "../core/ClaudeDetector.js";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { isCopilotInstalled } from "../core/CopilotDetector.js";
+import { scanCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
 import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
@@ -267,6 +269,15 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			}
 		}
 
+		// Auto-detect Copilot CLI and enable session discovery
+		const copilotDetected = config.copilotEnabled !== false && (await isCopilotInstalled());
+		if (copilotDetected) {
+			if (config.copilotEnabled === undefined) {
+				await saveConfig({ copilotEnabled: true });
+				log.info("Copilot CLI detected — enabled Copilot session discovery");
+			}
+		}
+
 		// Migrate any existing worktree-level API keys to the global config dir.
 		// The worktrees list always includes the main repo root as its first entry.
 		for (const wt of worktrees) {
@@ -483,6 +494,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 	const geminiDetected = await isGeminiInstalled();
 	const openCodeDetected = await isOpenCodeInstalled();
 	const cursorDetected = await isCursorInstalled();
+	const copilotDetected = await isCopilotInstalled();
 
 	// Check if we can enumerate worktrees; falls back gracefully if not a git repo
 	let enabledWorktrees: number | undefined;
@@ -524,6 +536,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		openCodeScanError = scan.error;
 	}
 
+	// Discover Cursor Composer sessions on-demand (not stored in sessions.json).
 	let cursorScanError: SqliteScanError | undefined;
 	if (config.cursorEnabled !== false && cursorDetected) {
 		const scan = await scanCursorSessions(projectDir);
@@ -531,6 +544,16 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
 		}
 		cursorScanError = scan.error;
+	}
+
+	// Discover Copilot CLI sessions on-demand (not stored in sessions.json).
+	let copilotScanError: SqliteScanError | undefined;
+	if (config.copilotEnabled !== false && copilotDetected) {
+		const scan = await scanCopilotSessions(projectDir);
+		if (scan.sessions.length > 0) {
+			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
+		}
+		copilotScanError = scan.error;
 	}
 
 	// Compute per-source session counts for integration status rows
@@ -607,6 +630,9 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		cursorDetected,
 		cursorEnabled: config.cursorEnabled,
 		cursorScanError,
+		copilotDetected,
+		copilotEnabled: config.copilotEnabled,
+		copilotScanError,
 		globalConfigDir,
 		worktreeStatePath,
 		enabledWorktrees,
@@ -618,7 +644,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 	};
 
 	log.info(
-		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s, cursor=%s/%s",
+		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s, cursor=%s/%s, copilot=%s/%s",
 		status.enabled,
 		status.claudeHookInstalled,
 		status.gitHookInstalled,
@@ -635,6 +661,8 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		status.openCodeEnabled,
 		status.cursorDetected,
 		status.cursorEnabled,
+		status.copilotDetected,
+		status.copilotEnabled,
 	);
 
 	return status;

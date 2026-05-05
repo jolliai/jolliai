@@ -217,14 +217,27 @@ describe("AssetResolver", () => {
 		});
 	});
 
-	// ── resolveExternalImage — additional branch coverage ────────────────────
-
 	describe("resolveExternalImage branches", () => {
+		it("falls back to the parent sourceRoot when no project markers exist", async () => {
+			const { resolveExternalImage } = await import("./AssetResolver.js");
+			const docsDir = join(tempDir, "docs");
+			await mkdir(docsDir, { recursive: true });
+			const rootStatic = join(tempDir, "static");
+			await mkdir(rootStatic, { recursive: true });
+			await writeFile(join(rootStatic, "logo.png"), "fake", "utf-8");
+
+			const result = resolveExternalImage("logo.png", docsDir, docsDir);
+
+			expect(result.isPlaceholder).toBe(false);
+			expect(result.publicPath).toContain("logo.png");
+		});
+
 		it("tries direct resolve from originalMdDir", async () => {
 			const { resolveExternalImage } = await import("./AssetResolver.js");
 			const projectDir = join(tempDir, "project");
 			const docsDir = join(projectDir, "docs");
 			const imgDir = join(docsDir, "images");
+			await mkdir(docsDir, { recursive: true });
 			await mkdir(imgDir, { recursive: true });
 			await writeFile(join(projectDir, "package.json"), "{}", "utf-8");
 			await writeFile(join(imgDir, "diagram.png"), "fake", "utf-8");

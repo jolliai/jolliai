@@ -21,14 +21,35 @@ import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
 import {
-	classifyScanError as classifySqliteError,
-	hasNodeSqliteSupport,
-	NODE_SQLITE_MIN_VERSION,
+	classifyScanError as classifySqliteScanError,
+	hasNodeSqliteSupport as hasNodeSqliteSupportFromHelpers,
+	NODE_SQLITE_MIN_VERSION as NODE_SQLITE_MIN_VERSION_FROM_HELPERS,
 	type SqliteDbHandle,
 	type SqliteScanError,
 	type SqliteScanErrorKind,
 	withSqliteDb,
 } from "./SqliteHelpers.js";
+
+/** @deprecated Use SqliteDbHandle from ./SqliteHelpers.js */
+export type OpenCodeDbHandle = SqliteDbHandle;
+
+/** @deprecated Use withSqliteDb from ./SqliteHelpers.js */
+export const withOpenCodeDb = withSqliteDb;
+
+/** @deprecated Use SqliteScanErrorKind from ./SqliteHelpers.js */
+export type OpenCodeScanErrorKind = SqliteScanErrorKind;
+
+/** @deprecated Use SqliteScanError from ./SqliteHelpers.js */
+export type OpenCodeScanError = SqliteScanError;
+
+/** @deprecated Use classifyScanError from ./SqliteHelpers.js */
+export const classifyScanError = classifySqliteScanError;
+
+/** @deprecated Use hasNodeSqliteSupport from ./SqliteHelpers.js */
+export const hasNodeSqliteSupport = hasNodeSqliteSupportFromHelpers;
+
+/** @deprecated Use NODE_SQLITE_MIN_VERSION from ./SqliteHelpers.js */
+export const NODE_SQLITE_MIN_VERSION = NODE_SQLITE_MIN_VERSION_FROM_HELPERS;
 
 const log = createLogger("OpenCodeDiscoverer");
 
@@ -42,17 +63,6 @@ const SESSION_STALE_MS = 48 * 60 * 60 * 1000;
 function getXdgDataHome(): string {
 	return process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
 }
-
-/** @deprecated use SqliteDbHandle from SqliteHelpers.js */
-export type OpenCodeDbHandle = SqliteDbHandle;
-/** @deprecated use withSqliteDb from SqliteHelpers.js */
-export const withOpenCodeDb = withSqliteDb;
-export { NODE_SQLITE_MIN_VERSION, hasNodeSqliteSupport };
-/** @deprecated use SqliteScanErrorKind */
-export type OpenCodeScanErrorKind = SqliteScanErrorKind;
-/** @deprecated use SqliteScanError */
-export type OpenCodeScanError = SqliteScanError;
-export const classifyScanError = classifySqliteError;
 
 /**
  * Returns the path to the global OpenCode database file.
@@ -70,14 +80,14 @@ export function getOpenCodeDbPath(): string {
  * anyway. Keeps the same no-arg shape as `isCodexInstalled`.
  */
 export async function isOpenCodeInstalled(): Promise<boolean> {
-	if (!hasNodeSqliteSupport()) {
+	if (!hasNodeSqliteSupportFromHelpers()) {
 		// Expected "not applicable", not a failure — log at info so operators
 		// can correlate "OpenCode absent from status" with the runtime version.
 		log.info(
 			"OpenCode support disabled: this runtime is Node %s, requires %d.%d+ for built-in SQLite",
 			process.versions.node,
-			NODE_SQLITE_MIN_VERSION.major,
-			NODE_SQLITE_MIN_VERSION.minor,
+			NODE_SQLITE_MIN_VERSION_FROM_HELPERS.major,
+			NODE_SQLITE_MIN_VERSION_FROM_HELPERS.minor,
 		);
 		return false;
 	}

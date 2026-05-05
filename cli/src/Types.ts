@@ -4,8 +4,10 @@
  * Central type definitions for all modules in the Jolli Memory tool.
  */
 
+import type { SqliteScanError } from "./core/SqliteHelpers.js";
+
 /** Which AI coding agent produced the transcript */
-export type TranscriptSource = "claude" | "codex" | "gemini" | "opencode" | "cursor";
+export type TranscriptSource = "claude" | "codex" | "gemini" | "opencode" | "cursor" | "copilot";
 
 /** Metadata about an AI coding session, saved by the Stop hook (Claude) or discovered on-demand (Codex) */
 export interface SessionInfo {
@@ -488,6 +490,8 @@ export interface JolliMemoryConfig {
 	readonly openCodeEnabled?: boolean;
 	/** Enable Cursor Composer session discovery at post-commit time (default: auto-detect) */
 	readonly cursorEnabled?: boolean;
+	/** Enable GitHub Copilot CLI session discovery at post-commit time (default: auto-detect) */
+	readonly copilotEnabled?: boolean;
 	/** Global minimum log level written to debug.log (default: "info") */
 	readonly logLevel?: LogLevel;
 	/** Per-module log level overrides (e.g. { "GitOps": "debug" }) */
@@ -569,10 +573,11 @@ export interface StatusInfo {
 	 * schema drift, or permission denied. UI surfaces this adjacent to the Cursor
 	 * row instead of silently rendering "0 sessions".
 	 */
-	readonly cursorScanError?: {
-		readonly kind: "corrupt" | "locked" | "permission" | "schema" | "unknown";
-		readonly message: string;
-	};
+	readonly cursorScanError?: SqliteScanError;
+	/** Whether Copilot CLI's session DB (~/.copilot/session-store.db) was detected */
+	readonly copilotDetected?: boolean;
+	/** Whether Copilot CLI session discovery is enabled in config (undefined = auto-detect) */
+	readonly copilotEnabled?: boolean;
 	/** Directory path for global config (~/.jolli/jollimemory) */
 	readonly globalConfigDir?: string;
 	/** Path to the worktree state directory */
@@ -606,10 +611,9 @@ export interface StatusInfo {
 	 * a warning adjacent to the OpenCode integration row rather than rendering
 	 * "0 sessions" (which is indistinguishable from "no OpenCode activity").
 	 */
-	readonly openCodeScanError?: {
-		readonly kind: "corrupt" | "locked" | "permission" | "schema" | "unknown";
-		readonly message: string;
-	};
+	readonly openCodeScanError?: SqliteScanError;
+	/** Copilot DB scan failed with a real (non-ENOENT) error. Same UI semantics as openCodeScanError. */
+	readonly copilotScanError?: SqliteScanError;
 }
 
 /**

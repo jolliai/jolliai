@@ -1,9 +1,9 @@
 /**
  * SQLite Helpers
  *
- * Shared SQLite utilities for SQLite-based agents (OpenCode, Cursor).
- * Extracted from OpenCodeSessionDiscoverer to avoid agents depending on
- * a file named for a different agent.
+ * Shared SQLite utilities for SQLite-based agents (OpenCode, Cursor, Copilot).
+ * Extracted out of the per-agent discoverers so agents don't depend on a file
+ * named for a different agent.
  */
 
 /**

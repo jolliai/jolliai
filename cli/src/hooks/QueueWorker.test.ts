@@ -134,6 +134,22 @@ vi.mock("../core/CursorTranscriptReader.js", () => ({
 	}),
 }));
 
+vi.mock("../core/CopilotDetector.js", () => ({
+	isCopilotInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/CopilotSessionDiscoverer.js", () => ({
+	discoverCopilotSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/CopilotTranscriptReader.js", () => ({
+	readCopilotTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	readGeminiTranscript: vi.fn().mockResolvedValue({
 		entries: [],
@@ -162,6 +178,9 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { isCopilotInstalled } from "../core/CopilotDetector.js";
+import { discoverCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
+import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
 import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
@@ -227,6 +246,7 @@ describe("QueueWorker", () => {
 		vi.mocked(isCodexInstalled).mockResolvedValue(false);
 		vi.mocked(isOpenCodeInstalled).mockResolvedValue(false);
 		vi.mocked(isCursorInstalled).mockResolvedValue(false);
+		vi.mocked(isCopilotInstalled).mockResolvedValue(false);
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 		vi.mocked(generateSummary).mockResolvedValue({
 			transcriptEntries: 0,
@@ -667,6 +687,132 @@ describe("QueueWorker", () => {
 			expect(discoverOpenCodeSessions).toHaveBeenCalledWith("/test/cwd");
 			// Pipeline completes normally
 			expect(storeSummary).toHaveBeenCalled();
+		});
+	});
+
+	describe("Copilot integration", () => {
+		it("should include discovered Copilot sessions in the pipeline when enabled", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/copilot.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isCopilotInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCopilotSessions).mockResolvedValue([
+				{
+					sessionId: "cp-1",
+					transcriptPath: "/db.sqlite#cp-1",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "copilot",
+				},
+			]);
+			vi.mocked(readCopilotTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "Copilot context", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: {
+					transcriptPath: "/db.sqlite#cp-1",
+					lineNumber: 1,
+					updatedAt: "2026-04-01T12:00:00.000Z",
+				},
+				totalLinesRead: 1,
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(discoverCopilotSessions).toHaveBeenCalledWith("/test/cwd");
+			expect(readCopilotTranscript).toHaveBeenCalledWith("/db.sqlite#cp-1", null, "2026-04-01T12:00:00.000Z");
+			expect(saveCursor).toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/db.sqlite#cp-1", lineNumber: 1 }),
+				"/test/cwd",
+			);
+		});
+	});
+
+	describe("Copilot integration — disabled", () => {
+		it("should not call isCopilotInstalled or discoverCopilotSessions when copilotEnabled is false", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/copilot-disabled.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({
+				copilotEnabled: false,
+			} as Awaited<ReturnType<typeof loadConfig>>);
+
+			await runWorker("/test/cwd");
+
+			expect(isCopilotInstalled).not.toHaveBeenCalled();
+			expect(discoverCopilotSessions).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("Copilot integration — empty sessions", () => {
+		it("logs no Discovered count when isCopilotInstalled=true but discovery returns empty", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/copilot-empty.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(isCopilotInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCopilotSessions).mockResolvedValue([]);
+
+			await runWorker("/test/cwd");
+
+			expect(discoverCopilotSessions).toHaveBeenCalledWith("/test/cwd");
+			// Pipeline completes normally
+			expect(storeSummary).toHaveBeenCalled();
+		});
+	});
+
+	describe("Copilot integration — read failure", () => {
+		it("skips a Copilot session whose transcript read throws and continues with the rest of the pipeline", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/copilot-throws.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isCopilotInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCopilotSessions).mockResolvedValue([
+				{
+					sessionId: "cp-broken",
+					transcriptPath: "/db.sqlite#cp-broken",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "copilot",
+				},
+			]);
+			vi.mocked(readCopilotTranscript).mockRejectedValue(new Error("Cannot read Copilot session: cp-broken"));
+
+			await runWorker("/test/cwd");
+
+			expect(readCopilotTranscript).toHaveBeenCalledWith(
+				"/db.sqlite#cp-broken",
+				null,
+				"2026-04-01T12:00:00.000Z",
+			);
+			// Pipeline still completes — the broken session was skipped, not fatal
+			expect(storeSummary).toHaveBeenCalled();
+			// No cursor saved for the failed session
+			expect(saveCursor).not.toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/db.sqlite#cp-broken" }),
+				"/test/cwd",
+			);
 		});
 	});
 

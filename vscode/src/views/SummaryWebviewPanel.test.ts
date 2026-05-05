@@ -5705,6 +5705,97 @@ describe("SummaryWebviewPanel", () => {
 			});
 		});
 
+		// ── copilotEnabled ────────────────────────────────────────────────────────
+
+		describe("loadTranscriptStats: copilotEnabled", () => {
+			it("includes copilot sessions when copilotEnabled !== false", async () => {
+				mockLoadConfig.mockResolvedValue({
+					claudeEnabled: true,
+					copilotEnabled: true,
+				});
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const transcriptMap = new Map([
+					[
+						"abc123",
+						{
+							sessions: [
+								{
+									sessionId: "cp1",
+									source: "copilot" as const,
+									entries: [
+										{ role: "human" as const, content: "X" },
+										{ role: "assistant" as const, content: "Y" },
+									],
+								},
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
+
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadTranscriptStats" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						command: "transcriptStatsLoaded",
+						sessionCounts: expect.objectContaining({ copilot: 1 }),
+					}),
+				);
+			});
+
+			it("excludes copilot sessions when copilotEnabled === false", async () => {
+				mockLoadConfig.mockResolvedValue({
+					claudeEnabled: true,
+					copilotEnabled: false,
+				});
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const transcriptMap = new Map([
+					[
+						"abc123",
+						{
+							sessions: [
+								{
+									sessionId: "s1",
+									source: "claude" as const,
+									entries: [{ role: "human" as const, content: "A" }],
+								},
+								{
+									sessionId: "cp1",
+									source: "copilot" as const,
+									entries: [
+										{ role: "human" as const, content: "B" },
+										{ role: "assistant" as const, content: "C" },
+									],
+								},
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
+
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadTranscriptStats" });
+				await flushPromises();
+
+				// copilot session (cp1) should be excluded; only claude session counted
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						command: "transcriptStatsLoaded",
+						totalEntries: 1,
+						sessionCounts: expect.objectContaining({ claude: 1 }),
+					}),
+				);
+			});
+		});
+
 		// ── loadNoteContent: snippet without inline content ───────────────────────
 
 		describe("loadNoteContent: snippet without inline content", () => {
