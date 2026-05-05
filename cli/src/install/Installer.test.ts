@@ -50,6 +50,16 @@ vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
 	scanOpenCodeSessions: vi.fn().mockResolvedValue({ sessions: [] }),
 }));
 
+// Mock CursorDetector for status/install checks
+vi.mock("../core/CursorDetector.js", () => ({
+	isCursorInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+// Mock CursorSessionDiscoverer for status/install checks
+vi.mock("../core/CursorSessionDiscoverer.js", () => ({
+	scanCursorSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+}));
+
 // Partially mock DistPathResolver so resolveDistPath doesn't depend on global npm state.
 // By default, resolveDistPath returns the caller's own dist dir with "cli" source.
 vi.mock("./DistPathResolver.js", async (importOriginal) => {
@@ -136,6 +146,10 @@ describe("Installer", () => {
 		vi.mocked(isOpenCodeInstalled).mockResolvedValue(false);
 		vi.mocked(discoverOpenCodeSessions).mockResolvedValue([]);
 		vi.mocked(scanOpenCodeSessions).mockResolvedValue({ sessions: [] });
+		const { isCursorInstalled } = await import("../core/CursorDetector.js");
+		vi.mocked(isCursorInstalled).mockResolvedValue(false);
+		const { scanCursorSessions } = await import("../core/CursorSessionDiscoverer.js");
+		vi.mocked(scanCursorSessions).mockResolvedValue({ sessions: [] });
 	});
 
 	afterEach(async () => {
@@ -225,6 +239,43 @@ describe("Installer", () => {
 			expect(result.success).toBe(true);
 			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
 			expect(globalConfig.openCodeEnabled).toBe(true);
+		});
+
+		it("should auto-enable Cursor discovery when Cursor is detected and not configured", async () => {
+			const { isCursorInstalled } = await import("../core/CursorDetector.js");
+			vi.mocked(isCursorInstalled).mockResolvedValueOnce(true);
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.cursorEnabled).toBe(true);
+		});
+
+		it("should keep cursorEnabled unchanged when Cursor is detected but already configured", async () => {
+			const { isCursorInstalled } = await import("../core/CursorDetector.js");
+			vi.mocked(isCursorInstalled).mockResolvedValueOnce(true);
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ cursorEnabled: false }), "utf-8");
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.cursorEnabled).toBe(false);
+		});
+
+		it("should not rewrite cursorEnabled when Cursor is detected and already true", async () => {
+			// Covers the `config.cursorEnabled === undefined` false branch: detection succeeds
+			// (reaches the inner if) but the existing value is explicitly `true`, so no rewrite.
+			const { isCursorInstalled } = await import("../core/CursorDetector.js");
+			vi.mocked(isCursorInstalled).mockResolvedValueOnce(true);
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ cursorEnabled: true }), "utf-8");
+
+			const result = await install(tempDir);
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.cursorEnabled).toBe(true);
 		});
 
 		it("should use process.cwd() when install is called without cwd", async () => {
@@ -1959,6 +2010,54 @@ describe("Installer", () => {
 
 			expect(status.activeSessions).toBe(0);
 			expect(status.openCodeScanError).toEqual({
+				kind: "corrupt",
+				message: "SQLITE_CORRUPT: disk image is malformed",
+			});
+		});
+
+		it("should not append Cursor sessions when discovery finds none", async () => {
+			const { isCursorInstalled } = await import("../core/CursorDetector.js");
+			const { scanCursorSessions } = await import("../core/CursorSessionDiscoverer.js");
+			vi.mocked(isCursorInstalled).mockResolvedValueOnce(true);
+			vi.mocked(scanCursorSessions).mockResolvedValueOnce({ sessions: [] });
+
+			const status = await getStatus(tempDir);
+			expect(status.activeSessions).toBe(0);
+		});
+
+		it("should include Cursor sessions in activeSessions when cursorEnabled", async () => {
+			const { isCursorInstalled } = await import("../core/CursorDetector.js");
+			const { scanCursorSessions } = await import("../core/CursorSessionDiscoverer.js");
+			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+			vi.mocked(scanCursorSessions).mockResolvedValue({
+				sessions: [
+					{
+						sessionId: "cursor1",
+						transcriptPath: "/cursor1",
+						updatedAt: new Date().toISOString(),
+						source: "cursor",
+					},
+				],
+			});
+
+			const status = await getStatus(tempDir);
+			expect(status.activeSessions).toBe(1);
+			expect(status.mostRecentSession?.source).toBe("cursor");
+		});
+
+		it("surfaces Cursor scan errors so the UI can warn instead of silently showing 0 sessions", async () => {
+			const { isCursorInstalled } = await import("../core/CursorDetector.js");
+			const { scanCursorSessions } = await import("../core/CursorSessionDiscoverer.js");
+			vi.mocked(isCursorInstalled).mockResolvedValueOnce(true);
+			vi.mocked(scanCursorSessions).mockResolvedValueOnce({
+				sessions: [],
+				error: { kind: "corrupt", message: "SQLITE_CORRUPT: disk image is malformed" },
+			});
+
+			const status = await getStatus(tempDir);
+
+			expect(status.activeSessions).toBe(0);
+			expect(status.cursorScanError).toEqual({
 				kind: "corrupt",
 				message: "SQLITE_CORRUPT: disk image is malformed",
 			});

@@ -994,6 +994,7 @@ describe("SettingsWebviewPanel", () => {
 					codexEnabled: false,
 					geminiEnabled: false,
 					openCodeEnabled: false,
+					cursorEnabled: false,
 					excludePatterns: "",
 				},
 			});
@@ -1005,6 +1006,7 @@ describe("SettingsWebviewPanel", () => {
 					codexEnabled: false,
 					geminiEnabled: false,
 					openCodeEnabled: false,
+					cursorEnabled: false,
 				}),
 				expect.any(String),
 			);
@@ -1026,6 +1028,7 @@ describe("SettingsWebviewPanel", () => {
 					codexEnabled: true,
 					geminiEnabled: true,
 					openCodeEnabled: true,
+					cursorEnabled: true,
 					excludePatterns: "",
 				},
 			});
@@ -1037,6 +1040,7 @@ describe("SettingsWebviewPanel", () => {
 					codexEnabled: true,
 					geminiEnabled: true,
 					openCodeEnabled: true,
+					cursorEnabled: true,
 				}),
 				expect.any(String),
 			);
@@ -1071,6 +1075,7 @@ describe("SettingsWebviewPanel", () => {
 					codexEnabled: true,
 					geminiEnabled: true,
 					openCodeEnabled: false,
+					cursorEnabled: true,
 					excludePatterns: "",
 				},
 			});
@@ -1078,6 +1083,46 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
 				expect.objectContaining({ openCodeEnabled: false }),
+				expect.any(String),
+			);
+		});
+
+		it("loads and saves Cursor integration state", async () => {
+			const dispatch = await setupWithLoadedConfig({ cursorEnabled: false });
+
+			dispatch({ command: "loadSettings", scope: "project" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ cursorEnabled: false }),
+				}),
+			);
+
+			postMessage.mockClear();
+			dispatch({
+				command: "applySettings",
+				scope: "project",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					openCodeEnabled: true,
+					cursorEnabled: false,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ cursorEnabled: false }),
 				expect.any(String),
 			);
 		});

@@ -230,7 +230,7 @@ function buildFullStatusItems(
 		items.push(accountItem);
 	}
 
-	// Integration status rows (Claude, Codex, Gemini, OpenCode)
+	// Integration status rows (Claude, Codex, Gemini, OpenCode, Cursor)
 	const counts = s.sessionsBySource ?? {};
 	pushIntegrationItem(
 		items,
@@ -289,6 +289,29 @@ function buildFullStatusItems(
 			"OpenCode detected but session discovery is disabled in config",
 			undefined,
 			counts.opencode,
+		);
+	}
+	// Cursor: Composer sessions via global SQLite (no agent hook — scan errors surface like OpenCode).
+	if (s.cursorScanError) {
+		items.push(
+			new StatusItem(
+				"Cursor Integration",
+				`unavailable — ${s.cursorScanError.kind}`,
+				ICON_WARN,
+				`Cursor database scan failed (${s.cursorScanError.kind}): ${s.cursorScanError.message}`,
+			),
+		);
+	} else {
+		pushIntegrationItem(
+			items,
+			s.cursorDetected,
+			s.cursorEnabled !== false,
+			undefined,
+			"Cursor Integration",
+			"Cursor Composer store found — session discovery is enabled",
+			"Cursor detected but session discovery is disabled in config",
+			undefined,
+			counts.cursor,
 		);
 	}
 

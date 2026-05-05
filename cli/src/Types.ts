@@ -5,7 +5,7 @@
  */
 
 /** Which AI coding agent produced the transcript */
-export type TranscriptSource = "claude" | "codex" | "gemini" | "opencode";
+export type TranscriptSource = "claude" | "codex" | "gemini" | "opencode" | "cursor";
 
 /** Metadata about an AI coding session, saved by the Stop hook (Claude) or discovered on-demand (Codex) */
 export interface SessionInfo {
@@ -486,6 +486,8 @@ export interface JolliMemoryConfig {
 	readonly claudeEnabled?: boolean;
 	/** Enable OpenCode session discovery at post-commit time (default: auto-detect) */
 	readonly openCodeEnabled?: boolean;
+	/** Enable Cursor Composer session discovery at post-commit time (default: auto-detect) */
+	readonly cursorEnabled?: boolean;
 	/** Global minimum log level written to debug.log (default: "info") */
 	readonly logLevel?: LogLevel;
 	/** Per-module log level overrides (e.g. { "GitOps": "debug" }) */
@@ -558,6 +560,19 @@ export interface StatusInfo {
 	readonly openCodeDetected?: boolean;
 	/** Whether OpenCode session discovery is enabled in config (undefined = auto-detect) */
 	readonly openCodeEnabled?: boolean;
+	/** Whether Cursor data dir was detected (Cursor.app + state.vscdb + node:sqlite) */
+	readonly cursorDetected?: boolean;
+	/** Whether Cursor session discovery is enabled in config (undefined = auto-detect) */
+	readonly cursorEnabled?: boolean;
+	/**
+	 * Cursor DB scan failed with a real (non-ENOENT) error — corrupt, locked,
+	 * schema drift, or permission denied. UI surfaces this adjacent to the Cursor
+	 * row instead of silently rendering "0 sessions".
+	 */
+	readonly cursorScanError?: {
+		readonly kind: "corrupt" | "locked" | "permission" | "schema" | "unknown";
+		readonly message: string;
+	};
 	/** Directory path for global config (~/.jolli/jollimemory) */
 	readonly globalConfigDir?: string;
 	/** Path to the worktree state directory */

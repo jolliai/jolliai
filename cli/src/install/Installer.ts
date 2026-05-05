@@ -19,6 +19,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isClaudeInstalled } from "../core/ClaudeDetector.js";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { isCursorInstalled } from "../core/CursorDetector.js";
+import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
 import {
@@ -36,6 +38,7 @@ import {
 	saveConfig,
 	saveConfigScoped,
 } from "../core/SessionTracker.js";
+import type { SqliteScanError } from "../core/SqliteHelpers.js";
 import { getSummaryCount } from "../core/SummaryStore.js";
 import { createLogger, getJolliMemoryDir, ORPHAN_BRANCH } from "../Logger.js";
 import type { InstallResult, JolliMemoryConfig, SessionInfo, StatusInfo, TranscriptSource } from "../Types.js";
@@ -255,6 +258,15 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			}
 		}
 
+		// Auto-detect Cursor and enable Composer session discovery
+		const cursorDetected = config.cursorEnabled !== false && (await isCursorInstalled());
+		if (cursorDetected) {
+			if (config.cursorEnabled === undefined) {
+				await saveConfig({ cursorEnabled: true });
+				log.info("Cursor detected — enabled Cursor Composer session discovery");
+			}
+		}
+
 		// Migrate any existing worktree-level API keys to the global config dir.
 		// The worktrees list always includes the main repo root as its first entry.
 		for (const wt of worktrees) {
@@ -470,6 +482,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 	const codexDetected = await isCodexInstalled();
 	const geminiDetected = await isGeminiInstalled();
 	const openCodeDetected = await isOpenCodeInstalled();
+	const cursorDetected = await isCursorInstalled();
 
 	// Check if we can enumerate worktrees; falls back gracefully if not a git repo
 	let enabledWorktrees: number | undefined;
@@ -509,6 +522,15 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
 		}
 		openCodeScanError = scan.error;
+	}
+
+	let cursorScanError: SqliteScanError | undefined;
+	if (config.cursorEnabled !== false && cursorDetected) {
+		const scan = await scanCursorSessions(projectDir);
+		if (scan.sessions.length > 0) {
+			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
+		}
+		cursorScanError = scan.error;
 	}
 
 	// Compute per-source session counts for integration status rows
@@ -582,6 +604,9 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		geminiEnabled: config.geminiEnabled,
 		openCodeDetected,
 		openCodeEnabled: config.openCodeEnabled,
+		cursorDetected,
+		cursorEnabled: config.cursorEnabled,
+		cursorScanError,
 		globalConfigDir,
 		worktreeStatePath,
 		enabledWorktrees,
@@ -593,7 +618,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 	};
 
 	log.info(
-		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s",
+		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s, cursor=%s/%s",
 		status.enabled,
 		status.claudeHookInstalled,
 		status.gitHookInstalled,
@@ -608,6 +633,8 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		status.enabledWorktrees,
 		status.openCodeDetected,
 		status.openCodeEnabled,
+		status.cursorDetected,
+		status.cursorEnabled,
 	);
 
 	return status;

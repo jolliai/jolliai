@@ -61,5 +61,6 @@ describe("SettingsScriptBuilder", () => {
 		expect(script).toContain("integrations-error");
 		expect(script).toContain("At least one integration must be enabled");
 		expect(script).toContain("openCodeEnabled");
+		expect(script).toContain("cursorEnabled");
 	});
 });

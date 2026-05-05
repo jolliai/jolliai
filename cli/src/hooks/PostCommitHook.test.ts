@@ -119,6 +119,22 @@ vi.mock("../core/OpenCodeTranscriptReader.js", () => ({
 	}),
 }));
 
+vi.mock("../core/CursorDetector.js", () => ({
+	isCursorInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/CursorSessionDiscoverer.js", () => ({
+	discoverCursorSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/CursorTranscriptReader.js", () => ({
+	readCursorTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	readGeminiTranscript: vi.fn().mockResolvedValue({
 		entries: [],

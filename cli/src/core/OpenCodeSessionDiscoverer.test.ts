@@ -10,21 +10,19 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 // Mock homedir so tests don't depend on real home directory
-const { mockHomedir } = vi.hoisted(() => ({
+const { mockHomedir, mockPlatform } = vi.hoisted(() => ({
 	mockHomedir: vi.fn().mockReturnValue(""),
+	mockPlatform: vi.fn().mockReturnValue("darwin"),
 }));
 vi.mock("node:os", async (importOriginal) => {
 	const original = await importOriginal<typeof import("node:os")>();
-	return { ...original, homedir: mockHomedir };
+	return { ...original, homedir: mockHomedir, platform: mockPlatform };
 });
 
 import {
-	classifyScanError,
 	discoverOpenCodeSessions,
 	getOpenCodeDbPath,
-	hasNodeSqliteSupport,
 	isOpenCodeInstalled,
-	NODE_SQLITE_MIN_VERSION,
 	scanOpenCodeSessions,
 } from "./OpenCodeSessionDiscoverer.js";
 
@@ -193,37 +191,6 @@ describe("OpenCodeSessionDiscoverer", () => {
 		});
 	});
 
-	describe("hasNodeSqliteSupport", () => {
-		const { major, minor } = NODE_SQLITE_MIN_VERSION;
-
-		it("returns true on exactly the minimum version", () => {
-			expect(hasNodeSqliteSupport(`${major}.${minor}.0`)).toBe(true);
-		});
-
-		it("returns true on a later major", () => {
-			expect(hasNodeSqliteSupport(`${major + 1}.0.0`)).toBe(true);
-		});
-
-		it("returns true on a later minor within the same major", () => {
-			expect(hasNodeSqliteSupport(`${major}.${minor + 1}.0`)).toBe(true);
-		});
-
-		it("returns false on an earlier minor within the same major", () => {
-			// minor=0 covers the "earlier minor" branch even when NODE_SQLITE_MIN_VERSION.minor is 0
-			// (the comparison is `>=`, so 22.0.0 < 22.5.0 returns false).
-			expect(hasNodeSqliteSupport(`${major}.0.0`)).toBe(false);
-		});
-
-		it("returns false on an earlier major", () => {
-			expect(hasNodeSqliteSupport(`${major - 1}.99.0`)).toBe(false);
-		});
-
-		it("treats prerelease tags correctly (major.minor extracted from prefix)", () => {
-			expect(hasNodeSqliteSupport("22.5.0-nightly20260101")).toBe(true);
-			expect(hasNodeSqliteSupport("20.15.0-nightly20260101")).toBe(false);
-		});
-	});
-
 	describe("discoverOpenCodeSessions", () => {
 		it("discovers recent top-level sessions for the given project", async () => {
 			const now = Date.now();
@@ -323,30 +290,47 @@ describe("OpenCodeSessionDiscoverer", () => {
 			expect(sessions[0].updatedAt).toBe(new Date(now).toISOString());
 		});
 
-		it("matches directory case-insensitively on Windows and macOS (drive-letter / path-casing drift)", async () => {
-			// Reproduces the real Windows bug observed in debug.log:
-			//   worker pipeline spawned with cwd "E:\\jollimemory-3" → stored by OpenCode
-			//   extension status reported projectDir "e:\\jollimemory-3" → exact-match missed
-			// Both describe the same directory on a case-insensitive filesystem, so the
-			// SQL must match regardless of drive-letter casing on Windows / macOS.
-			// Linux filesystems are case-sensitive, so exact-match is the correct behaviour
-			// there and this test asserts the lookup returns empty.
+		it.each(["darwin", "win32"] as const)(
+			"matches directory case-insensitively on %s (drive-letter / path-casing drift)",
+			async (osName) => {
+				// Reproduces the real Windows bug observed in debug.log:
+				//   worker pipeline spawned with cwd "E:\\jollimemory-3" → stored by OpenCode
+				//   extension status reported projectDir "e:\\jollimemory-3" → exact-match missed
+				// Both describe the same directory on a case-insensitive filesystem, so the
+				// SQL must match regardless of drive-letter casing on Windows / macOS.
+				// Linux's case-sensitive behaviour is asserted by the next test.
+				mockPlatform.mockReturnValue(osName);
+				const now = Date.now();
+				const dbDir = join(fakeHome, ".local", "share", "opencode");
+				const storedDir = "E:\\jollimemory-3";
+				const queryDir = "e:\\jollimemory-3";
+				await createOpenCodeDb(dbDir, [
+					{ id: "drive-letter", directory: storedDir, time_created: now - 1000, time_updated: now },
+				]);
+
+				const sessions = await discoverOpenCodeSessions(queryDir);
+
+				expect(sessions.map((s) => s.sessionId)).toEqual(["drive-letter"]);
+			},
+		);
+
+		it("matches directory exactly (case-sensitive) on linux", async () => {
+			// Linux filesystems are case-sensitive, so a casing mismatch must NOT
+			// resolve to the same session. This exercises the `directory = :projectDir`
+			// branch of the case-insensitive ternary that darwin/win32 hosts skip.
+			mockPlatform.mockReturnValue("linux");
 			const now = Date.now();
 			const dbDir = join(fakeHome, ".local", "share", "opencode");
-			const storedDir = "E:\\jollimemory-3";
-			const queryDir = "e:\\jollimemory-3";
+			const storedDir = "/home/flyer/Project";
 			await createOpenCodeDb(dbDir, [
-				{ id: "drive-letter", directory: storedDir, time_created: now - 1000, time_updated: now },
+				{ id: "exact-1", directory: storedDir, time_created: now - 1000, time_updated: now },
 			]);
 
-			const sessions = await discoverOpenCodeSessions(queryDir);
-
-			const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
-			if (caseInsensitive) {
-				expect(sessions.map((s) => s.sessionId)).toEqual(["drive-letter"]);
-			} else {
-				expect(sessions).toHaveLength(0);
-			}
+			// Lowercased query MUST NOT match the original-cased stored directory.
+			expect(await discoverOpenCodeSessions("/home/flyer/project")).toHaveLength(0);
+			// Same-cased query DOES match — confirms the linux branch was reached.
+			const sessions = await discoverOpenCodeSessions("/home/flyer/Project");
+			expect(sessions.map((s) => s.sessionId)).toEqual(["exact-1"]);
 		});
 
 		it("skips sessions whose time_updated is not a finite number (schema drift)", async () => {
@@ -413,57 +397,6 @@ describe("OpenCodeSessionDiscoverer", () => {
 			// The compat wrapper must not throw, even though the scan hit a real error.
 			const sessions = await discoverOpenCodeSessions(projectDir);
 			expect(sessions).toEqual([]);
-		});
-	});
-
-	describe("classifyScanError", () => {
-		function err(message: string, code?: string): Error & { code?: string } {
-			const e = new Error(message) as Error & { code?: string };
-			if (code !== undefined) e.code = code;
-			return e;
-		}
-
-		it("returns null for ENOENT (silent 'not installed')", () => {
-			expect(classifyScanError(err("…", "ENOENT"))).toBeNull();
-		});
-
-		it("classifies EACCES and EPERM as permission", () => {
-			expect(classifyScanError(err("denied", "EACCES"))?.kind).toBe("permission");
-			expect(classifyScanError(err("denied", "EPERM"))?.kind).toBe("permission");
-		});
-
-		it("classifies SQLITE_CANTOPEN / 'unable to open' as permission", () => {
-			expect(classifyScanError(err("SQLITE_CANTOPEN: file failed to open"))?.kind).toBe("permission");
-			expect(classifyScanError(err("unable to open database file"))?.kind).toBe("permission");
-		});
-
-		it("classifies SQLITE_CORRUPT and similar as corrupt", () => {
-			expect(classifyScanError(err("SQLITE_CORRUPT: database disk image is malformed"))?.kind).toBe("corrupt");
-			expect(classifyScanError(err("file is not a database"))?.kind).toBe("corrupt");
-			expect(classifyScanError(err("SQLITE_NOTADB"))?.kind).toBe("corrupt");
-		});
-
-		it("classifies SQLITE_BUSY / SQLITE_LOCKED as locked", () => {
-			expect(classifyScanError(err("SQLITE_BUSY: database is locked"))?.kind).toBe("locked");
-			expect(classifyScanError(err("database is locked"))?.kind).toBe("locked");
-			expect(classifyScanError(err("SQLITE_LOCKED"))?.kind).toBe("locked");
-		});
-
-		it("classifies 'no such table'/'no such column' as schema drift", () => {
-			expect(classifyScanError(err("no such table: session"))?.kind).toBe("schema");
-			expect(classifyScanError(err("no such column: time_updated"))?.kind).toBe("schema");
-		});
-
-		it("falls back to 'unknown' for unrecognized errors", () => {
-			const classified = classifyScanError(err("totally unexpected disk failure"));
-			expect(classified?.kind).toBe("unknown");
-			expect(classified?.message).toBe("totally unexpected disk failure");
-		});
-
-		it("handles non-Error throws by stringifying", () => {
-			const classified = classifyScanError("raw string rejection");
-			expect(classified?.kind).toBe("unknown");
-			expect(classified?.message).toBe("raw string rejection");
 		});
 	});
 });
