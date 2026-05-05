@@ -212,6 +212,7 @@ object PostCommitHook {
                 apiKey = apiKey,
                 model = config.model,
                 jolliApiKey = config.jolliApiKey,
+                aiProvider = config.aiProvider,
             ))
 
             // 8b. Detect uncommitted plans, archive, and evaluate progress
@@ -239,7 +240,7 @@ object PostCommitHook {
                         if (planMarkdown != null) {
                             val evalResult = try {
                                 PlanProgressEvaluator.evaluatePlanProgress(
-                                    planMarkdown, diff, topics, conversation, apiKey, config.model, config.jolliApiKey,
+                                    planMarkdown, diff, topics, conversation, apiKey, config.model, config.jolliApiKey, config.aiProvider,
                                 )
                             } catch (e: Exception) {
                                 log.warn("Plan progress eval failed for %s: %s", slug, e.message)
