@@ -386,7 +386,7 @@ describe("CLI", () => {
 		});
 
 		describe("integration rows", () => {
-			it("renders rows for all four integrations when detected, with session counts", async () => {
+			it("renders rows for all five integrations when detected, with session counts", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
 					enabled: true,
 					claudeHookInstalled: true,
@@ -400,10 +400,12 @@ describe("CLI", () => {
 					codexDetected: true,
 					geminiDetected: true,
 					openCodeDetected: true,
+					cursorDetected: true,
 					codexEnabled: true,
 					geminiEnabled: true,
 					openCodeEnabled: true,
-					sessionsBySource: { claude: 3, codex: 2, gemini: 4, opencode: 1 },
+					cursorEnabled: true,
+					sessionsBySource: { claude: 3, codex: 2, gemini: 4, opencode: 1, cursor: 5 },
 				});
 				vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ claudeEnabled: true });
 
@@ -421,6 +423,9 @@ describe("CLI", () => {
 				expect(calls.some((s) => s.includes("OpenCode:") && s.includes("detected & enabled (1 session)"))).toBe(
 					true,
 				);
+				expect(calls.some((s) => s.includes("Cursor:") && s.includes("detected & enabled (5 sessions)"))).toBe(
+					true,
+				);
 			});
 
 			it("renders 'detected but disabled' when an integration is turned off in config", async () => {
@@ -436,8 +441,10 @@ describe("CLI", () => {
 					claudeDetected: true,
 					codexDetected: true,
 					openCodeDetected: true,
+					cursorDetected: true,
 					codexEnabled: false,
 					openCodeEnabled: false,
+					cursorEnabled: false,
 					sessionsBySource: {},
 				});
 				vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ claudeEnabled: false });
@@ -447,6 +454,7 @@ describe("CLI", () => {
 				expect(calls.some((s) => s.includes("Claude:") && s.includes("detected but disabled"))).toBe(true);
 				expect(calls.some((s) => s.includes("Codex:") && s.includes("detected but disabled"))).toBe(true);
 				expect(calls.some((s) => s.includes("OpenCode:") && s.includes("detected but disabled"))).toBe(true);
+				expect(calls.some((s) => s.includes("Cursor:") && s.includes("detected but disabled"))).toBe(true);
 			});
 
 			it("renders 'hook not installed' for Gemini when detected+enabled but the AfterAgent hook is missing", async () => {
@@ -490,6 +498,27 @@ describe("CLI", () => {
 				expect(calls.some((s) => s.includes("OpenCode:") && s.includes("unavailable — corrupt"))).toBe(true);
 			});
 
+			it("renders 'unavailable — <kind>' for Cursor when cursorScanError is present", async () => {
+				vi.mocked(getStatus).mockResolvedValueOnce({
+					enabled: true,
+					claudeHookInstalled: false,
+					gitHookInstalled: true,
+					geminiHookInstalled: false,
+					activeSessions: 0,
+					mostRecentSession: null,
+					summaryCount: 0,
+					orphanBranch: "jollimemory/summaries/v3",
+					cursorDetected: true,
+					cursorEnabled: true,
+					cursorScanError: { kind: "locked", message: "database is locked" },
+					sessionsBySource: {},
+				});
+
+				await main(["status"]);
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => s.includes("Cursor:") && s.includes("unavailable — locked"))).toBe(true);
+			});
+
 			it("does not print a row for an integration that was not detected", async () => {
 				vi.mocked(getStatus).mockResolvedValueOnce({
 					enabled: true,
@@ -504,6 +533,7 @@ describe("CLI", () => {
 					codexDetected: false,
 					geminiDetected: false,
 					openCodeDetected: false,
+					cursorDetected: false,
 					sessionsBySource: {},
 				});
 
@@ -513,6 +543,7 @@ describe("CLI", () => {
 				expect(calls.some((s) => /^\s+Codex:/.test(s))).toBe(false);
 				expect(calls.some((s) => /^\s+Gemini:/.test(s))).toBe(false);
 				expect(calls.some((s) => /^\s+OpenCode:/.test(s))).toBe(false);
+				expect(calls.some((s) => /^\s+Cursor:/.test(s))).toBe(false);
 			});
 		});
 	});
@@ -3136,6 +3167,44 @@ describe("CLI", () => {
 			expect(output).toContain("openCodeEnabled");
 			// Description should mention the Node version requirement — this is
 			// the only config key that's runtime-gated and users deserve the hint.
+			expect(output).toContain("Node 22.5+");
+		});
+
+		it("should accept cursorEnabled=true/false", async () => {
+			const { saveConfig } = await import("./core/SessionTracker.js");
+
+			await main(["configure", "--set", "cursorEnabled=false"]);
+			expect(saveConfig).toHaveBeenCalledWith(expect.objectContaining({ cursorEnabled: false }));
+
+			vi.mocked(saveConfig).mockClear();
+			await main(["configure", "--set", "cursorEnabled=true"]);
+			expect(saveConfig).toHaveBeenCalledWith(expect.objectContaining({ cursorEnabled: true }));
+		});
+
+		it("should reject cursorEnabled with a non-boolean value", async () => {
+			const { saveConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(saveConfig).mockClear();
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			try {
+				await main(["configure", "--set", "cursorEnabled=maybe"]);
+				expect(saveConfig).not.toHaveBeenCalled();
+				expect(process.exitCode).toBe(1);
+				const errorOutput = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+				expect(errorOutput).toContain("cursorEnabled");
+				expect(errorOutput).toContain("true/false");
+			} finally {
+				errorSpy.mockRestore();
+			}
+		});
+
+		it("--list-keys includes cursorEnabled", async () => {
+			await main(["configure", "--list-keys"]);
+			const output = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.join("\n");
+			expect(output).toContain("cursorEnabled");
+			// Description should mention the Node version requirement.
 			expect(output).toContain("Node 22.5+");
 		});
 

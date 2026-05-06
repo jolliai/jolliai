@@ -194,6 +194,18 @@ vi.mock("../core/OpenCodeTranscriptReader.js", () => ({
 	readOpenCodeTranscript: vi.fn(),
 }));
 
+vi.mock("../core/CursorDetector.js", () => ({
+	isCursorInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/CursorSessionDiscoverer.js", () => ({
+	discoverCursorSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/CursorTranscriptReader.js", () => ({
+	readCursorTranscript: vi.fn(),
+}));
+
 vi.mock("../core/TranscriptParser.js", () => ({
 	getParserForSource: vi.fn(),
 }));

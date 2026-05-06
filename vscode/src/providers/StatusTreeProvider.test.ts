@@ -538,6 +538,54 @@ describe("StatusTreeProvider", () => {
 		expect(openCode?.description).toBe("detected & enabled (2 sessions)");
 	});
 
+	// ── Cursor scan error / healthy row ───────────────────────────────────
+
+	it("renders an 'unavailable' Cursor row when cursorScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorDetected: true,
+					cursorEnabled: true,
+					cursorScanError: {
+						kind: "locked",
+						message: "database is locked",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursor = items.find((item) => item.label === "Cursor Integration");
+		expect(cursor?.description).toBe("unavailable — locked");
+		expect(String(cursor?.tooltip)).toContain("database is locked");
+	});
+
+	it("falls back to the normal detected/enabled Cursor row when no scan error", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorDetected: true,
+					cursorEnabled: true,
+					sessionsBySource: { cursor: 3 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursor = items.find((item) => item.label === "Cursor Integration");
+		expect(cursor?.description).toBe("detected & enabled (3 sessions)");
+	});
+
 	// ── Auth-aware status rows ────────────────────────────────────────────
 
 	it("shows Jolli Account connected when authToken is present", async () => {

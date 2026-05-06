@@ -22,6 +22,9 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { isCursorInstalled } from "../core/CursorDetector.js";
+import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
+import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
@@ -1425,6 +1428,15 @@ async function loadSessionTranscripts(
 		}
 	}
 
+	// Discover Cursor Composer sessions (on-demand SQLite scan from globalStorage)
+	if (config.cursorEnabled !== false && (await isCursorInstalled())) {
+		const cursorSessions = await discoverCursorSessions(cwd);
+		if (cursorSessions.length > 0) {
+			allSessions = [...allSessions, ...cursorSessions];
+			log.info("Discovered %d Cursor session(s)", cursorSessions.length);
+		}
+	}
+
 	if (allSessions.length === 0) {
 		log.info("No active sessions found — will infer topics from diff if available");
 	}
@@ -1461,12 +1473,14 @@ async function readAllTranscripts(
 		const startLine = cursor?.lineNumber ?? 0;
 		const source = session.source ?? "claude";
 
-		// Gemini and OpenCode use dedicated readers (not JSONL line-based parsing)
+		// Gemini, OpenCode, and Cursor use dedicated readers (not JSONL line-based parsing)
 		let result: TranscriptReadResult;
 		if (source === "gemini") {
 			result = await readGeminiTranscript(session.transcriptPath, cursor, beforeTimestamp);
 		} else if (source === "opencode") {
 			result = await readOpenCodeTranscript(session.transcriptPath, cursor, beforeTimestamp);
+		} else if (source === "cursor") {
+			result = await readCursorTranscript(session.transcriptPath, cursor, beforeTimestamp);
 		} else {
 			result = await readTranscript(session.transcriptPath, cursor, getParserForSource(source), beforeTimestamp);
 		}

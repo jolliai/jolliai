@@ -148,6 +148,16 @@ export function registerStatusCommand(program: Command): void {
 						scanError: status.openCodeScanError,
 					},
 				],
+				[
+					"Cursor:",
+					status.cursorDetected,
+					{
+						enabled: status.cursorEnabled !== false,
+						hookInstalled: undefined,
+						sessionCount: counts.cursor,
+						scanError: status.cursorScanError,
+					},
+				],
 			];
 			for (const [label, detected, inputs] of integrationRows) {
 				if (!detected) continue;

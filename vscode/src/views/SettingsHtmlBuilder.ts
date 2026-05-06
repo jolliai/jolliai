@@ -84,6 +84,7 @@ export function buildSettingsHtml(nonce: string): string {
       ${buildToggleRow("codexEnabled", "Codex CLI", "Session discovery via filesystem scan")}
       ${buildToggleRow("geminiEnabled", "Gemini CLI", "Session tracking via AfterAgent hook")}
       ${buildToggleRow("openCodeEnabled", "OpenCode", "Session discovery via ~/.local/share/opencode/opencode.db")}
+      ${buildToggleRow("cursorEnabled", "Cursor", "Session discovery via Cursor's local SQLite store")}
       <div class="error-message" id="integrations-error"></div>
     </div>
 

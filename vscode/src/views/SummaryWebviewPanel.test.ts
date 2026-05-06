@@ -2560,6 +2560,40 @@ describe("SummaryWebviewPanel", () => {
 				);
 			});
 
+			it("counts cursor sessions in transcript stats when cursor integration is enabled", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const transcriptMap = new Map([
+					[
+						"abc123",
+						{
+							sessions: [
+								{
+									sessionId: "cur1",
+									source: "cursor" as const,
+									entries: [{ role: "human" as const, content: "hi" }],
+								},
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
+
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadTranscriptStats" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						command: "transcriptStatsLoaded",
+						totalEntries: 1,
+						sessionCounts: expect.objectContaining({ cursor: 1 }),
+					}),
+				);
+			});
+
 			it("loads transcript metadata and sends stats to webview", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
 				const transcriptMap = new Map([
@@ -5566,6 +5600,59 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				// opencode session (oc1) should be excluded; only claude session counted
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						command: "transcriptStatsLoaded",
+						totalEntries: 1,
+						sessionCounts: expect.objectContaining({ claude: 1 }),
+					}),
+				);
+			});
+		});
+
+		// ── cursorEnabled: false ────────────────────────────────────────────────
+
+		describe("loadTranscriptStats: cursorEnabled false", () => {
+			it("excludes cursor sessions when cursorEnabled is false", async () => {
+				mockLoadConfig.mockResolvedValue({
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					openCodeEnabled: true,
+					cursorEnabled: false,
+				});
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const transcriptMap = new Map([
+					[
+						"abc123",
+						{
+							sessions: [
+								{
+									sessionId: "s1",
+									source: "claude" as const,
+									entries: [{ role: "human" as const, content: "A" }],
+								},
+								{
+									sessionId: "cur1",
+									source: "cursor" as const,
+									entries: [
+										{ role: "human" as const, content: "B" },
+										{ role: "assistant" as const, content: "C" },
+									],
+								},
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
+
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadTranscriptStats" });
+				await flushPromises();
+
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({
 						command: "transcriptStatsLoaded",

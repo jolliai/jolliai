@@ -166,6 +166,9 @@ export function filterSessionsByEnabledIntegrations(
 	if (config.openCodeEnabled === false) {
 		filtered = filtered.filter((s) => s.source !== "opencode");
 	}
+	if (config.cursorEnabled === false) {
+		filtered = filtered.filter((s) => s.source !== "cursor");
+	}
 	return filtered;
 }
 
