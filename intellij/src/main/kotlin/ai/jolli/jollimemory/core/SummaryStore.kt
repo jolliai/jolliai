@@ -174,18 +174,19 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
             commitDate = newCommitInfo.date, branch = oldSummary.branch,
             generatedAt = Instant.now().toString(), commitType = CommitType.rebase,
             jolliDocId = oldSummary.jolliDocId, jolliDocUrl = oldSummary.jolliDocUrl,
-            plans = oldSummary.plans, e2eTestGuide = oldSummary.e2eTestGuide,
-            children = listOf(oldSummary.copy(jolliDocId = null, jolliDocUrl = null, plans = null, e2eTestGuide = null)),
+            plans = oldSummary.plans, e2eTestGuide = oldSummary.e2eTestGuide, recap = oldSummary.recap,
+            children = listOf(oldSummary.copy(jolliDocId = null, jolliDocUrl = null, plans = null, e2eTestGuide = null, recap = null)),
         )
         storeSummary(newSummary, force = true)
     }
 
     fun mergeManyToOne(oldSummaries: List<CommitSummary>, newCommitInfo: CommitInfo) {
         val children = oldSummaries.sortedByDescending { it.commitDate }
-            .map { it.copy(jolliDocId = null, jolliDocUrl = null, plans = null, e2eTestGuide = null) }
+            .map { it.copy(jolliDocId = null, jolliDocUrl = null, plans = null, e2eTestGuide = null, recap = null) }
         val allPlans = oldSummaries.flatMap { it.plans ?: emptyList() }
             .groupBy { it.slug }.mapNotNull { (_, p) -> p.maxByOrNull { it.updatedAt } }
         val allE2e = oldSummaries.flatMap { it.e2eTestGuide ?: emptyList() }
+        val mergedRecap = oldSummaries.firstNotNullOfOrNull { it.recap }
 
         val newSummary = CommitSummary(
             version = 3, commitHash = newCommitInfo.hash,
@@ -193,6 +194,7 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
             commitDate = newCommitInfo.date, branch = oldSummaries.firstOrNull()?.branch ?: "unknown",
             generatedAt = Instant.now().toString(), commitType = CommitType.squash,
             plans = allPlans.takeIf { it.isNotEmpty() }, e2eTestGuide = allE2e.takeIf { it.isNotEmpty() },
+            recap = mergedRecap,
             children = children,
         )
         storeSummary(newSummary, force = true)
