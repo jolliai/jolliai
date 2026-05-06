@@ -1,0 +1,164 @@
+openapi: "3.1.0"
+info:
+  title: Pet Store
+  version: "1.0.0"
+  description: A sample Pet Store API for demonstrating OpenAPI rendering.
+servers:
+  - url: https://petstore.example.com/v1
+    description: Production
+tags:
+  - name: Pets
+    description: Operations for managing pets
+  - name: Store
+    description: Store inventory and orders
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      summary: List all pets
+      description: Returns all pets in the store, with optional filtering by status.
+      tags:
+        - Pets
+      parameters:
+        - name: status
+          in: query
+          description: Filter by pet status
+          schema:
+            type: string
+            enum: [available, pending, sold]
+        - name: limit
+          in: query
+          description: Maximum number of results to return
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: A list of pets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Pet"
+    post:
+      operationId: createPet
+      summary: Add a new pet
+      description: Adds a new pet to the store inventory.
+      tags:
+        - Pets
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewPet"
+            example:
+              name: "Rex"
+              species: "dog"
+              age: 3
+      responses:
+        "201":
+          description: Pet created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+  /pets/{petId}:
+    get:
+      operationId: getPet
+      summary: Get a pet by ID
+      tags:
+        - Pets
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          description: The ID of the pet to retrieve
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A single pet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+        "404":
+          description: Pet not found
+    delete:
+      operationId: deletePet
+      summary: Delete a pet
+      tags:
+        - Pets
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Pet deleted
+        "404":
+          description: Pet not found
+  /store/inventory:
+    get:
+      operationId: getInventory
+      summary: Get store inventory
+      description: Returns the count of pets grouped by status.
+      tags:
+        - Store
+      responses:
+        "200":
+          description: Inventory counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available:
+                    type: integer
+                  pending:
+                    type: integer
+                  sold:
+                    type: integer
+              example:
+                available: 12
+                pending: 3
+                sold: 45
+components:
+  schemas:
+    Pet:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        species:
+          type: string
+        age:
+          type: integer
+        status:
+          type: string
+          enum: [available, pending, sold]
+    NewPet:
+      type: object
+      required:
+        - name
+        - species
+      properties:
+        name:
+          type: string
+        species:
+          type: string
+        age:
+          type: integer
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+security:
+  - apiKey: []

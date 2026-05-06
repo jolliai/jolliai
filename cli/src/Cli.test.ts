@@ -3573,7 +3573,7 @@ describe("CLI", () => {
 		it("should auto-reinstall missing hooks when --fix is passed", async () => {
 			const { install } = await import("./install/Installer.js");
 			vi.mocked(install).mockClear();
-			vi.mocked(install).mockResolvedValueOnce({ success: true, message: "ok" });
+			vi.mocked(install).mockResolvedValueOnce({ success: true, message: "ok", warnings: [] });
 
 			await runDoctor(["doctor", "--fix"], { gitHookInstalled: false });
 
@@ -3602,7 +3602,7 @@ describe("CLI", () => {
 			// Simulate install failing — fixer contract is "throw on failure",
 			// so we make install resolve with success=false which the fixer
 			// converts to a thrown error.
-			vi.mocked(install).mockResolvedValueOnce({ success: false, message: "disk full" });
+			vi.mocked(install).mockResolvedValueOnce({ success: false, message: "disk full", warnings: [] });
 			process.exitCode = 0;
 
 			const output = (await runDoctor(["doctor", "--fix"], { gitHookInstalled: false })).join("\n");
@@ -3705,6 +3705,7 @@ describe("CLI", () => {
 						branch: "main",
 						commitMessage: "test",
 						commitDate: "2026-04-01T00:00:00.000Z",
+						generatedAt: "2026-04-01T00:00:00.000Z",
 					})),
 				});
 			} else {
@@ -4675,17 +4676,19 @@ describe("CLI", () => {
 				entries: [
 					{
 						commitHash: "aaa1111111111111111",
+						parentCommitHash: null,
 						branch: "main",
 						commitMessage: "standalone commit",
 						commitDate: "2026-04-01T00:00:00.000Z",
-						// No parentCommitHash — this is a root entry
+						generatedAt: "2026-04-01T00:00:00.000Z",
 					},
 					{
 						commitHash: "bbb2222222222222222",
+						parentCommitHash: null,
 						branch: "main",
 						commitMessage: "another standalone",
 						commitDate: "2026-04-02T00:00:00.000Z",
-						// No parentCommitHash
+						generatedAt: "2026-04-02T00:00:00.000Z",
 					},
 				],
 			});

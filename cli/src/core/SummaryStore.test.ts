@@ -158,7 +158,6 @@ describe("SummaryStore", () => {
 						{
 							sessionId: "claude/session-1",
 							source: "claude",
-							startedAt: "2026-02-19T09:55:00Z",
 							entries: [],
 						},
 					],
@@ -608,9 +607,9 @@ describe("SummaryStore", () => {
 				],
 				e2eTestGuide: [
 					{
-						name: "checkout flow",
+						title: "checkout flow",
 						steps: ["open cart", "submit order"],
-						expectedResult: "order succeeds",
+						expectedResults: ["order succeeds"],
 					},
 				],
 			};
@@ -632,9 +631,9 @@ describe("SummaryStore", () => {
 			]);
 			expect(newSummaryContent.e2eTestGuide).toEqual([
 				{
-					name: "checkout flow",
+					title: "checkout flow",
 					steps: ["open cart", "submit order"],
-					expectedResult: "order succeeds",
+					expectedResults: ["order succeeds"],
 				},
 			]);
 			expect(newSummaryContent.children?.[0].plans).toBeUndefined();
@@ -2180,7 +2179,7 @@ describe("SummaryStore", () => {
 			generatedAt: "2026-01-01T00:00:05Z",
 			transcriptEntries: 0,
 			stats: { filesChanged: 0, insertions: 0, deletions: 0 },
-			topics: topics.map((t) => ({ title: t, detail: t, decisions: undefined })),
+			topics: topics.map((t) => ({ title: t, trigger: t, response: t, decisions: "" })),
 		});
 
 		it("preserves grandchild topics in v3 squash-of-squash scenario", () => {
@@ -2222,7 +2221,7 @@ describe("SummaryStore", () => {
 				generatedAt: "2026-01-01T00:00:05Z",
 				transcriptEntries: 0,
 				stats: { filesChanged: 0, insertions: 0, deletions: 0 },
-				topics: [{ title: "v4-topic", detail: "d", decisions: undefined }],
+				topics: [{ title: "v4-topic", trigger: "t", response: "r", decisions: "" }],
 			};
 
 			const sources = expandSourcesForConsolidation(v4Summary);
@@ -2245,7 +2244,7 @@ describe("SummaryStore", () => {
 				stats: { filesChanged: 0, insertions: 0, deletions: 0 },
 				ticketId: "PROJ-123",
 				recap: "The developer added drag-handle reordering.",
-				topics: [{ title: "x", detail: "d", decisions: undefined }],
+				topics: [{ title: "x", trigger: "t", response: "r", decisions: "" }],
 			};
 
 			const sources = expandSourcesForConsolidation(v4Summary);

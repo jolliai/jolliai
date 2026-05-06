@@ -98,6 +98,59 @@ describe("NextraRenderer", () => {
 		}
 	});
 
+	it("api.css uses theme.primaryHue when set, regardless of pack", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-hue-"));
+		try {
+			const config = {
+				title: "T",
+				description: "D",
+				nav: [],
+				theme: { pack: "forge" as const, primaryHue: 145 },
+			};
+			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
+			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
+			expect(css).toContain("hsl(145 84% 50%)");
+		} finally {
+			await rm(buildDir, { recursive: true, force: true });
+		}
+	});
+
+	it("api.css falls back to Forge's manifest hue (228) when pack is forge but primaryHue is unset", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-forge-"));
+		try {
+			const config = { title: "T", description: "D", nav: [], theme: { pack: "forge" as const } };
+			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
+			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
+			expect(css).toContain("hsl(228 84% 50%)");
+		} finally {
+			await rm(buildDir, { recursive: true, force: true });
+		}
+	});
+
+	it("api.css falls back to Atlas's manifest hue (200) when pack is atlas but primaryHue is unset", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-atlas-"));
+		try {
+			const config = { title: "T", description: "D", nav: [], theme: { pack: "atlas" as const } };
+			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
+			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
+			expect(css).toContain("hsl(200 84% 50%)");
+		} finally {
+			await rm(buildDir, { recursive: true, force: true });
+		}
+	});
+
+	it("api.css uses generateApiCss's internal default (220) when no theme is set", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-default-"));
+		try {
+			const config = { title: "T", description: "D", nav: [] };
+			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
+			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
+			expect(css).toContain("hsl(220 84% 50%)");
+		} finally {
+			await rm(buildDir, { recursive: true, force: true });
+		}
+	});
+
 	it("getCacheDirs returns .next directory", () => {
 		expect(new NextraRenderer().getCacheDirs("/build")).toEqual(["/build/.next"]);
 	});

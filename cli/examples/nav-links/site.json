@@ -1,0 +1,9 @@
+{
+  "title": "Nav Links Example",
+  "description": "Demonstrates the legacy nav shorthand for flat navbar links",
+  "nav": [
+    { "label": "Home", "href": "/" },
+    { "label": "Guides", "href": "/guides" },
+    { "label": "GitHub", "href": "https://github.com/example/project" }
+  ]
+}

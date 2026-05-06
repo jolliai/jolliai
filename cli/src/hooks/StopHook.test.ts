@@ -313,7 +313,9 @@ describe("StopHook — plan discovery", () => {
 		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
 		// Default: files don't exist
 		vi.mocked(existsSync).mockReturnValue(false);
-		vi.mocked(readFileSync).mockReturnValue("# Plan Title\n\nContent" as unknown as Buffer);
+		vi.mocked(readFileSync).mockReturnValue(
+			"# Plan Title\n\nContent" as unknown as ReturnType<typeof readFileSync>,
+		);
 	});
 
 	afterEach(() => {
@@ -423,7 +425,7 @@ describe("StopHook — plan discovery", () => {
 
 	it("should fall back to the file name when the plan has no markdown heading", async () => {
 		vi.mocked(existsSync).mockReturnValueOnce(true).mockReturnValueOnce(true);
-		vi.mocked(readFileSync).mockReturnValueOnce("plain text only" as unknown as Buffer);
+		vi.mocked(readFileSync).mockReturnValueOnce("plain text only" as unknown as ReturnType<typeof readFileSync>);
 
 		mockTranscriptWithLines(['{"type":"tool_result","slug":"untitled-plan","content":"..."}']);
 

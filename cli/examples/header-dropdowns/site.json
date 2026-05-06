@@ -1,0 +1,27 @@
+{
+  "title": "Header Dropdowns Example",
+  "description": "Demonstrates header.items with dropdown menus",
+  "nav": [],
+  "header": {
+    "items": [
+      { "label": "Docs", "url": "/docs" },
+      { "label": "API Reference", "url": "/api" },
+      {
+        "label": "Resources",
+        "items": [
+          { "label": "Blog", "url": "https://blog.example.com" },
+          { "label": "Changelog", "url": "/changelog" },
+          { "label": "Status Page", "url": "https://status.example.com" }
+        ]
+      },
+      {
+        "label": "Community",
+        "items": [
+          { "label": "Discord", "url": "https://discord.gg/example" },
+          { "label": "GitHub Discussions", "url": "https://github.com/example/discussions" }
+        ]
+      },
+      { "label": "Pricing", "url": "https://example.com/pricing" }
+    ]
+  }
+}

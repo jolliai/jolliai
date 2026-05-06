@@ -1,0 +1,22 @@
+{
+  "title": "Pet Store API",
+  "description": "Demonstrates OpenAPI spec rendering with Forge theme",
+  "nav": [],
+  "theme": {
+    "pack": "forge",
+    "primaryHue": 265,
+    "fontFamily": "inter"
+  },
+  "header": {
+    "items": [
+      { "label": "Docs", "url": "/" },
+      { "label": "API Reference", "url": "/api-petstore" }
+    ]
+  },
+  "footer": {
+    "copyright": "2026 Pet Store Demo",
+    "socialLinks": {
+      "github": "https://github.com/example/petstore"
+    }
+  }
+}

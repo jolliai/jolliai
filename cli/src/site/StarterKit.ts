@@ -26,6 +26,9 @@ const SITE_JSON = JSON.stringify(
 			{ label: "API Reference", href: "/api/openapi" },
 			{ label: "Guides", href: "/guides/introduction" },
 		],
+		// Forge — clean developer-docs visual style. Drop or change to
+		// `"default"` to render with vanilla `nextra-theme-docs` instead.
+		theme: { pack: "forge" },
 	},
 	null,
 	2,
@@ -81,7 +84,9 @@ All content lives in this folder. You can:
 
 ## Configuring the site
 
-Edit \`site.json\` to change the site title, description, and top navigation bar.
+Edit \`site.json\` to change the site title, description, top navigation bar,
+and visual theme. Available theme packs: \`"forge"\` (clean developer docs,
+default) or \`"default"\` (vanilla \`nextra-theme-docs\`).
 
 \`\`\`json
 {
@@ -89,7 +94,8 @@ Edit \`site.json\` to change the site title, description, and top navigation bar
   "description": "Documentation site powered by Jolli",
   "nav": [
     { "label": "Home", "href": "/" }
-  ]
+  ],
+  "theme": { "pack": "forge", "primaryHue": 228 }
 }
 \`\`\`
 `;

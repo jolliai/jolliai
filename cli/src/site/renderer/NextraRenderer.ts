@@ -29,6 +29,35 @@ const PROVIDED_COMPONENTS = new Set(["Fragment", "Callout", "Cards", "Card", "Fi
 
 const PAGE_COUNT_PATTERN = /Generating static pages.*?(\d+)\/(\d+)/s;
 
+/**
+ * Pack manifest defaults — kept in sync with `themes/<pack>/Manifest.ts`.
+ * Hardcoded here because importing the manifests from inside `renderer/`
+ * would invert the dependency direction (renderer should not depend on
+ * pack-specific modules; ApiCss is pack-agnostic).
+ */
+const FORGE_DEFAULT_HUE = 228;
+const ATLAS_DEFAULT_HUE = 200;
+
+/**
+ * Resolves the accent hue passed to `generateApiCss`. `theme.primaryHue`
+ * wins when set; otherwise we fall back to a pack-aware default so the
+ * API surface visually matches the pack the customer picked. Returning
+ * `undefined` lets `generateApiCss` apply its own internal default (220).
+ */
+function resolveApiAccentHue(config: SiteJson): number | undefined {
+	if (typeof config.theme?.primaryHue === "number") {
+		return config.theme.primaryHue;
+	}
+	switch (config.theme?.pack) {
+		case "forge":
+			return FORGE_DEFAULT_HUE;
+		case "atlas":
+			return ATLAS_DEFAULT_HUE;
+		default:
+			return undefined;
+	}
+}
+
 // ─── NextraRenderer ─────────────────────────────────────────────────────────
 
 export class NextraRenderer implements SiteRenderer {
@@ -46,7 +75,15 @@ export class NextraRenderer implements SiteRenderer {
 		// before any MDX shim does. Writing them once here also avoids
 		// rewriting nine files on every render-loop call. The API stylesheet
 		// is also scaffold — `app/layout.tsx` imports it unconditionally.
-		await this.writeFiles(buildDir, [...generateApiComponents(), generateApiCss()]);
+		//
+		// `accentHue` flows from `theme.primaryHue` so the API method/status
+		// pills match the rest of the pack. When the user picks Forge but
+		// doesn't override the hue, fall back to Forge's manifest default
+		// (228) so the API surface inherits the pack's identity instead of
+		// the unrelated `generateApiCss` fallback (220).
+		const accentHue = resolveApiAccentHue(config);
+		await this.writeFiles(buildDir, [...generateApiComponents(), generateApiCss({ accentHue })]);
+
 		return result;
 	}
 

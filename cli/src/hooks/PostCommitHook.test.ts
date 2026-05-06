@@ -1440,10 +1440,10 @@ describe("queue-driven Worker", () => {
 
 			// Mock fs to allow reading the note file
 			vi.mocked(existsSync).mockImplementation((path) => path === noteSourcePath);
-			vi.mocked(readFileSync).mockImplementation((path) => {
-				if (path === noteSourcePath) return "# Test note content" as unknown as Buffer;
-				return "" as unknown as Buffer;
-			});
+			vi.mocked(readFileSync).mockImplementation(((path: unknown) => {
+				if (path === noteSourcePath) return "# Test note content";
+				return "";
+			}) as typeof readFileSync);
 
 			await runWorker("/test/project");
 
@@ -1995,7 +1995,7 @@ describe("queue-driven Worker", () => {
 			});
 			vi.mocked(getSummary).mockResolvedValue({
 				...createMockSummary("oldHash"),
-				e2eTestGuide: { scenarios: [{ title: "Test scenario", steps: ["step 1"], assertions: ["assert 1"] }] },
+				e2eTestGuide: [{ title: "Test scenario", steps: ["step 1"], expectedResults: ["assert 1"] }],
 			});
 			vi.mocked(loadConfig).mockResolvedValue({});
 			vi.mocked(loadAllSessions).mockResolvedValue([]);
@@ -2011,7 +2011,7 @@ describe("queue-driven Worker", () => {
 
 			expect(storeSummary).toHaveBeenCalledWith(
 				expect.objectContaining({
-					e2eTestGuide: expect.objectContaining({ scenarios: expect.any(Array) }),
+					e2eTestGuide: expect.any(Array),
 				}),
 				"/test/project",
 			);
@@ -2057,7 +2057,7 @@ describe("queue-driven Worker", () => {
 			//   2. detectUncommittedNoteIds → registry WITH ghost note (id added to set)
 			//   3. associateNotesWithCommit → registry WITHOUT that note (id missing → skip)
 			const registryWithNote = {
-				version: 1,
+				version: 1 as const,
 				plans: {},
 				notes: {
 					"ghost-note": {
@@ -2072,7 +2072,7 @@ describe("queue-driven Worker", () => {
 					},
 				},
 			};
-			const emptyRegistry = { version: 1, plans: {}, notes: {} };
+			const emptyRegistry = { version: 1 as const, plans: {}, notes: {} };
 
 			vi.mocked(loadPlansRegistry)
 				.mockResolvedValueOnce(emptyRegistry) // detectPlanSlugsFromRegistry
@@ -2107,10 +2107,10 @@ describe("queue-driven Worker", () => {
 				},
 			});
 			vi.mocked(existsSync).mockImplementation((path) => path === snippetPath);
-			vi.mocked(readFileSync).mockImplementation((path) => {
-				if (path === snippetPath) return "const x = 42;" as unknown as Buffer;
-				return "" as unknown as Buffer;
-			});
+			vi.mocked(readFileSync).mockImplementation(((path: unknown) => {
+				if (path === snippetPath) return "const x = 42;";
+				return "";
+			}) as typeof readFileSync);
 
 			await runWorker("/test/project");
 
