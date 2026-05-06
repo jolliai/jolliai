@@ -55,6 +55,7 @@ export async function initNextraProject(
 	await writeFile(join(buildDir, "package.json"), generatePackageJson(), "utf-8");
 	await writeFile(join(buildDir, "next.config.mjs"), generateNextConfig(options.staticExport), "utf-8");
 	await writeFile(join(buildDir, "app", "layout.tsx"), generateLayout(config), "utf-8");
+	await writeFile(join(buildDir, "app", "not-found.tsx"), generateNotFound(), "utf-8");
 	await writeFile(join(buildDir, "app", "[[...mdxPath]]", "page.tsx"), generateCatchAllPage(), "utf-8");
 	await writeFile(join(buildDir, "mdx-components.tsx"), generateMdxComponents(), "utf-8");
 	await writeFile(join(buildDir, "tsconfig.json"), generateTsConfig(), "utf-8");
@@ -69,8 +70,12 @@ export async function initNextraProject(
  * hidden build directory.
  *
  * Includes all dependencies required by a Nextra v4 docs site:
- *   next, nextra, nextra-theme-docs, react, react-dom, swagger-ui-react,
- *   and pagefind.
+ *   next, nextra, nextra-theme-docs, react, react-dom, and pagefind.
+ *
+ * The previous `swagger-ui-react` dependency is gone — the new OpenAPI
+ * pipeline (Phase 4 of feature/openapi-rich-renderer) renders per-endpoint
+ * MDX pages with a custom component tree, so the user's site no longer
+ * pulls a Swagger UI bundle (~600 KB shaved off the runtime).
  */
 /** Runtime dependencies for a Nextra v4 docs site. Shared with EngineManager. */
 export const NEXTRA_DEPENDENCIES: Record<string, string> = {
@@ -79,7 +84,6 @@ export const NEXTRA_DEPENDENCIES: Record<string, string> = {
 	"nextra-theme-docs": "4.2.17",
 	react: "^19.0.0",
 	"react-dom": "^19.0.0",
-	"swagger-ui-react": "^5.0.0",
 	pagefind: "^1.0.0",
 };
 
@@ -163,6 +167,7 @@ export function generateLayout(config: NextraProjectConfig): string {
 import { Head } from 'nextra/components'
 import { getPageMap } from 'nextra/page-map'
 import 'nextra-theme-docs/style.css'
+import '../styles/api.css'
 
 export const metadata = {
   title: ${jsTitle},
@@ -187,6 +192,20 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     </html>
   )
 }
+`;
+}
+
+// ─── generateNotFound ───────────────────────────────────────────────────────
+
+/**
+ * Returns the contents of `app/not-found.tsx` — required by Next.js 15 during
+ * static export to resolve the `/_not-found` route.
+ *
+ * Re-exports the themed 404 page from `nextra-theme-docs`, matching the
+ * pattern used in Nextra v4's own example projects.
+ */
+export function generateNotFound(): string {
+	return `export { NotFoundPage as default } from 'nextra-theme-docs'
 `;
 }
 
@@ -251,6 +270,11 @@ export default async function Page(props: { params: Promise<{ mdxPath?: string[]
 
 /**
  * Returns a minimal `tsconfig.json` for the generated Nextra v4 project.
+ *
+ * The `@/*` path alias maps to the build root so the generated MDX shims
+ * can import `@/components/api/Endpoint` without depending on how deep
+ * each shim sits under `content/`. Next.js resolves the same alias at
+ * bundle time via the same tsconfig.
  */
 export function generateTsConfig(): string {
 	const tsconfig = {
@@ -265,6 +289,8 @@ export function generateTsConfig(): string {
 			strict: true,
 			skipLibCheck: true,
 			esModuleInterop: true,
+			baseUrl: ".",
+			paths: { "@/*": ["./*"] },
 		},
 		include: ["**/*.ts", "**/*.tsx", "mdx-components.tsx"],
 		exclude: ["node_modules"],

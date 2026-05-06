@@ -10,7 +10,7 @@ import { existsSync } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { copyExternalAsset, resolveExternalImage } from "./AssetResolver.js";
-import { isValidOpenApiContent } from "./OpenApiRenderer.js";
+import { tryParseOpenApi } from "./openapi/SpecLoader.js";
 import type { ContentRules } from "./renderer/SiteRenderer.js";
 import type { FileType, MirrorResult, PathMappings } from "./Types.js";
 
@@ -169,7 +169,7 @@ export function classifyFile(filePath: string, content?: string): FileType {
 
 	// 4.4 — OpenAPI (JSON or YAML with openapi + info fields)
 	if (ext === ".json" || ext === ".yaml" || ext === ".yml") {
-		if (content !== undefined && isValidOpenApiContent(content, ext)) {
+		if (content !== undefined && tryParseOpenApi(content, ext) !== null) {
 			return "openapi";
 		}
 		return "ignored";
@@ -412,6 +412,7 @@ export async function mirrorContent(
 	const result: MirrorResult = {
 		markdownFiles: [],
 		openapiFiles: [],
+		openapiDocs: {},
 		imageFiles: [],
 		ignoredFiles: [],
 		downgradedCount: 0,
@@ -601,19 +602,30 @@ async function processFile(
 	const relPath = applyPathMapping(originalRelPath, pathMappings);
 	const ext = extname(fullPath).toLowerCase();
 
-	// For potential OpenAPI files, read content for classification
-	let content: string | undefined;
+	// For potential OpenAPI files, parse once and cache the AST so the
+	// rich-renderer pipeline can consume the parsed document without
+	// re-reading or re-parsing the source. Files that fail the OpenAPI
+	// structural check fall through to "ignored" — we never copy raw
+	// JSON/YAML into the content directory.
 	if (ext === ".json" || ext === ".yaml" || ext === ".yml") {
+		let content: string;
 		try {
 			content = await readFile(fullPath, "utf-8");
 		} catch {
-			// If we can't read the file, treat as ignored
 			result.ignoredFiles.push(relPath);
 			return;
 		}
+		const doc = tryParseOpenApi(content, ext);
+		if (doc !== null) {
+			result.openapiFiles.push(relPath);
+			result.openapiDocs[relPath] = doc;
+		} else {
+			result.ignoredFiles.push(relPath);
+		}
+		return;
 	}
 
-	const fileType = classifyFile(fullPath, content);
+	const fileType = classifyFile(fullPath);
 
 	switch (fileType) {
 		case "markdown": {
@@ -673,9 +685,8 @@ async function processFile(
 			break;
 		}
 		case "openapi": {
-			result.openapiFiles.push(relPath);
-			// OpenAPI files are not copied directly — they are rendered as .mdx pages
-			// by OpenApiRenderer. We just record them here.
+			// Unreachable from processFile — OpenAPI files are handled in the
+			// early-return branch above so we can cache the parsed AST.
 			break;
 		}
 		case "ignored": {

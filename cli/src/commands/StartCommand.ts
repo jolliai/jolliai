@@ -12,8 +12,11 @@ import type { Command } from "commander";
 import { resolveFavicon } from "../site/AssetResolver.js";
 import { clearDir, mirrorContent } from "../site/ContentMirror.js";
 import { needsInstall, runNpmInstall, runServe } from "../site/NpmRunner.js";
+import { buildPipeline } from "../site/openapi/OpenApiPipeline.js";
+import { deriveSpecName } from "../site/openapi/SpecName.js";
 import { runPagefind } from "../site/PagefindRunner.js";
 import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
+import type { OpenApiSpecInput } from "../site/renderer/SiteRenderer.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -32,6 +35,35 @@ function verbose(msg: string, isVerbose: boolean): void {
 interface CmdOpts {
 	migrate?: boolean;
 	verbose?: boolean;
+}
+
+/**
+ * Builds the per-spec inputs the renderer's `renderOpenApiSpecs` expects.
+ * Reuses the documents `ContentMirror` already cached, runs them through
+ * `buildPipeline` once each, and tags each entry with a URL slug derived
+ * from the source-file basename. Throws on a `specName` collision —
+ * silently dropping a spec would result in missing pages.
+ */
+function buildOpenApiSpecInputs(mirrorResult: Awaited<ReturnType<typeof mirrorContent>>): OpenApiSpecInput[] {
+	const inputs: OpenApiSpecInput[] = [];
+	const claimed = new Map<string, string>();
+	for (const sourceRelPath of mirrorResult.openapiFiles) {
+		const doc = mirrorResult.openapiDocs[sourceRelPath];
+		if (!doc) {
+			continue;
+		}
+		const specName = deriveSpecName(sourceRelPath);
+		const existing = claimed.get(specName);
+		if (existing) {
+			throw new Error(
+				`OpenAPI spec name collision: "${existing}" and "${sourceRelPath}" both resolve to ` +
+					`spec slug "${specName}". Rename one of the source files so each spec gets a unique URL.`,
+			);
+		}
+		claimed.set(specName, sourceRelPath);
+		inputs.push({ specName, sourceRelPath, pipeline: buildPipeline(doc) });
+	}
+	return inputs;
 }
 
 // ─── prepareContent ──────────────────────────────────────────────────────────
@@ -125,7 +157,8 @@ async function prepareContent(
 	// Render OpenAPI specs
 	if (mirrorResult.openapiFiles.length > 0) {
 		verbose("Rendering OpenAPI specs…", v);
-		await renderer.renderOpenApiFiles(sourceRoot, contentDir, mirrorResult.openapiFiles, publicDir);
+		const specInputs = buildOpenApiSpecInputs(mirrorResult);
+		await renderer.renderOpenApiSpecs(contentDir, publicDir, specInputs);
 	}
 
 	// Install dependencies
