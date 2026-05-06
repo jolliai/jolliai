@@ -266,6 +266,22 @@ describe("ContentMirror.mirrorContent", () => {
 		expect(existsSync(join(contentDir, "api.yaml"))).toBe(false);
 	});
 
+	it("caches the parsed OpenAPI document in openapiDocs keyed by relative path", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "api.yaml"), OPENAPI_YAML, "utf-8");
+		await writeFile(join(sourceRoot, "api.json"), OPENAPI_JSON, "utf-8");
+
+		const result = await mirrorContent(sourceRoot, contentDir);
+
+		expect(result.openapiDocs["api.yaml"]?.openapi).toBe("3.1.0");
+		expect(result.openapiDocs["api.json"]?.openapi).toBe("3.1.0");
+		expect(result.openapiDocs["api.yaml"]?.info.title).toBe("Test");
+		// Ignored files must not appear in the cache.
+		await writeFile(join(sourceRoot, "notes.txt"), "x", "utf-8");
+		const result2 = await mirrorContent(sourceRoot, contentDir);
+		expect(result2.openapiDocs["notes.txt"]).toBeUndefined();
+	});
+
 	// ── Ignored files ────────────────────────────────────────────────────────
 
 	it("records ignored files in ignoredFiles", async () => {
