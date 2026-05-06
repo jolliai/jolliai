@@ -333,7 +333,7 @@ async function detectPlanSlugsFromRegistry(cwd: string): Promise<Set<string>> {
 }
 
 /** Result from associatePlansWithCommit: plan references + raw markdown for progress evaluation */
-interface PlanAssociationResult {
+export interface PlanAssociationResult {
 	readonly refs: ReadonlyArray<PlanReference>;
 	/** Map of archived slug (newSlug) to raw plan markdown content */
 	readonly markdownBySlug: ReadonlyMap<string, string>;

@@ -670,7 +670,7 @@ describe("SessionTracker", () => {
 				},
 			};
 
-			await savePlansRegistry(registry, tempDir);
+			await savePlansRegistry(registry as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 			await expect(loadPlansRegistry(tempDir)).resolves.toEqual(registry);
 		});
 
@@ -692,7 +692,7 @@ describe("SessionTracker", () => {
 			};
 			mockRename.mockRejectedValueOnce(Object.assign(new Error("busy"), { code: "EPERM" }));
 
-			await savePlansRegistry(registry, tempDir);
+			await savePlansRegistry(registry as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 			await expect(loadPlansRegistry(tempDir)).resolves.toEqual(registry);
 		});
 
@@ -724,7 +724,7 @@ describe("SessionTracker", () => {
 					},
 				},
 			};
-			await savePlansRegistry(before, tempDir);
+			await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
 			await associatePlanWithCommit("feature-auth", "abcdef1234567890", tempDir);
 
@@ -749,7 +749,7 @@ describe("SessionTracker", () => {
 					},
 				},
 			};
-			await savePlansRegistry(before, tempDir);
+			await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
 			await associatePlanWithCommit("missing-plan", "abcdef1234567890", tempDir);
 
@@ -772,7 +772,7 @@ describe("SessionTracker", () => {
 					},
 				},
 			};
-			await savePlansRegistry(registry, tempDir);
+			await savePlansRegistry(registry as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
 			await expect(loadPlanEntry("feature-auth", tempDir)).resolves.toEqual(registry.plans["feature-auth"]);
 			await expect(loadPlanEntry("missing-plan", tempDir)).resolves.toBeNull();
@@ -796,7 +796,7 @@ describe("SessionTracker", () => {
 					},
 				},
 			};
-			await savePlansRegistry(before, tempDir);
+			await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
 			await associateNoteWithCommit("note-1-abc", "abcdef1234567890", tempDir);
 
@@ -811,7 +811,7 @@ describe("SessionTracker", () => {
 				version: 1 as const,
 				plans: {},
 			};
-			await savePlansRegistry(before, tempDir);
+			await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
 			// Note doesn't exist, so nothing changes, but the code path
 			// exercises the `registry.notes ?? {}` branch.
@@ -837,7 +837,7 @@ describe("SessionTracker", () => {
 					},
 				},
 			};
-			await savePlansRegistry(before, tempDir);
+			await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
 			await associateNoteWithCommit("missing-note", "abcdef1234567890", tempDir);
 

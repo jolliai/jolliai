@@ -638,6 +638,13 @@ describe("FolderStorage", () => {
 				children: [JSON.parse(oldJson)],
 			});
 
+			// Windows chmod doesn't enforce the same EACCES behaviour as POSIX, so
+			// the unlink-fails branch can't be exercised on win32. Skipping there
+			// keeps `npm run all` green on the maintainer's primary platform.
+			if (process.platform === "win32") {
+				return;
+			}
+
 			const fs = await import("node:fs");
 			const mainDir = join(rootPath, "main");
 			fs.chmodSync(mainDir, 0o500); // r-x — unlink within fails with EACCES

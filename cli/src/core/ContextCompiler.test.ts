@@ -7,15 +7,23 @@ import { compileTaskContext, estimateTokens, listBranchCatalog, renderContextMar
 vi.mock("./SummaryStore.js", () => ({
 	getIndex: vi.fn(),
 	getSummary: vi.fn(),
+	getCatalogWithLazyBuild: vi.fn(async () => ({ version: 1, entries: [] })),
 	readPlanFromBranch: vi.fn(),
 	readNoteFromBranch: vi.fn(),
 	readTranscript: vi.fn(),
 }));
 
-import { getIndex, getSummary, readNoteFromBranch, readPlanFromBranch } from "./SummaryStore.js";
+import {
+	getCatalogWithLazyBuild,
+	getIndex,
+	getSummary,
+	readNoteFromBranch,
+	readPlanFromBranch,
+} from "./SummaryStore.js";
 
 const mockGetIndex = vi.mocked(getIndex);
 const mockGetSummary = vi.mocked(getSummary);
+const mockGetCatalog = vi.mocked(getCatalogWithLazyBuild);
 const mockReadPlan = vi.mocked(readPlanFromBranch);
 const mockReadNote = vi.mocked(readNoteFromBranch);
 
@@ -82,6 +90,8 @@ describe("estimateTokens", () => {
 describe("listBranchCatalog", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		// Default: empty catalog so existing tests aren't influenced by topicTitles enrichment.
+		mockGetCatalog.mockResolvedValue({ version: 1, entries: [] });
 	});
 
 	it("should return empty catalog when no index", async () => {
@@ -157,6 +167,78 @@ describe("listBranchCatalog", () => {
 		expect(catalog.branches).toHaveLength(1);
 		expect(catalog.branches[0].commitCount).toBe(1);
 		expect(catalog.branches[0].commitMessages).toEqual(["Root commit"]);
+	});
+
+	it("aggregates and dedupes topicTitles from catalog.json", async () => {
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "h1",
+					parentCommitHash: null,
+					commitMessage: "msg",
+					commitDate: "2026-04-01T10:00:00.000Z",
+					branch: "feature/auth",
+					generatedAt: "2026-04-01T10:01:00.000Z",
+				},
+				{
+					commitHash: "h2",
+					parentCommitHash: null,
+					commitMessage: "msg2",
+					commitDate: "2026-04-02T10:00:00.000Z",
+					branch: "feature/auth",
+					generatedAt: "2026-04-02T10:01:00.000Z",
+				},
+			]),
+		);
+		mockGetCatalog.mockResolvedValue({
+			version: 1,
+			entries: [
+				{ commitHash: "h1", topics: [{ title: "JWT decision" }, { title: "shared" }] },
+				{ commitHash: "h2", topics: [{ title: "Middleware" }, { title: "shared" }] },
+			],
+		});
+		const catalog = await listBranchCatalog("/test");
+		expect(catalog.branches).toHaveLength(1);
+		expect(catalog.branches[0].topicTitles).toEqual(["JWT decision", "shared", "Middleware"]);
+	});
+
+	it("filters out empty topic titles when enriching", async () => {
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "h1",
+					parentCommitHash: null,
+					commitMessage: "msg",
+					commitDate: "2026-04-01T10:00:00.000Z",
+					branch: "x",
+					generatedAt: "2026-04-01T10:01:00.000Z",
+				},
+			]),
+		);
+		mockGetCatalog.mockResolvedValue({
+			version: 1,
+			entries: [{ commitHash: "h1", topics: [{ title: "" }, { title: "real" }] }],
+		});
+		const catalog = await listBranchCatalog("/test");
+		expect(catalog.branches[0].topicTitles).toEqual(["real"]);
+	});
+
+	it("omits topicTitles entirely when no catalog entry contributes any", async () => {
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "h1",
+					parentCommitHash: null,
+					commitMessage: "msg",
+					commitDate: "2026-04-01T10:00:00.000Z",
+					branch: "x",
+					generatedAt: "2026-04-01T10:01:00.000Z",
+				},
+			]),
+		);
+		mockGetCatalog.mockResolvedValue({ version: 1, entries: [] });
+		const catalog = await listBranchCatalog("/test");
+		expect(catalog.branches[0].topicTitles).toBeUndefined();
 	});
 });
 

@@ -131,11 +131,17 @@ export function postCommitEntry(cwd: string): void {
 // tests importing __test__ from PostCommitHook.js continue to work.
 import { __test__ as workerTestHelpers } from "./QueueWorker.js";
 
-export const __test__ = {
+const _testHelpers = {
 	resolveGitDir,
 	isRebaseInProgress,
 	...workerTestHelpers,
 };
+
+// Cast through unknown to defuse a "cannot be named" diagnostic — the merged
+// helpers reference private QueueWorker types (PlanAssociationResult etc.)
+// that don't have stable exported names. The cast preserves call-site typing
+// because consumers go through `typeof workerTestHelpers` re-exports below.
+export const __test__ = _testHelpers as typeof _testHelpers;
 
 // --- Script entry point (only when run directly, not when imported) ---
 /* v8 ignore start */

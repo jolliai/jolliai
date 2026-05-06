@@ -18,6 +18,9 @@
 
 import { createLogger } from "../Logger.js";
 import type {
+	CatalogEntry,
+	CatalogTopic,
+	CommitCatalog,
 	CommitInfo,
 	CommitSource,
 	CommitSummary,
@@ -39,7 +42,7 @@ import { acquireLock, releaseLock } from "./SessionTracker.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
 import { getDisplayDate } from "./SummaryFormat.js";
-import { collectAllTopics, countTopics, isUnifiedHoistFormat } from "./SummaryTree.js";
+import { collectAllTopics, collectDisplayTopics, countTopics, isUnifiedHoistFormat } from "./SummaryTree.js";
 
 let activeStorageOverride: StorageProvider | undefined;
 
@@ -54,6 +57,7 @@ export function resolveStorage(storage?: StorageProvider, cwd?: string): Storage
 const log = createLogger("SummaryStore");
 
 const INDEX_FILE = "index.json";
+const CATALOG_FILE = "catalog.json";
 
 /**
  * Returns true if the entry is a root-level summary (not a child of a
@@ -92,6 +96,7 @@ export async function storeSummary(
 	},
 ): Promise<void> {
 	const existingIndex = await loadIndex(cwd);
+	const existingCatalog = await loadCatalog(cwd);
 	const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
 	const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
 
@@ -120,6 +125,7 @@ export async function storeSummary(
 	const files: FileWrite[] = [
 		{ path: `summaries/${summary.commitHash}.json`, content: JSON.stringify(summary, null, "\t") },
 		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
+		buildCatalogFileWrite(existingCatalog, entryMap, summary),
 	];
 
 	// Append transcript file if provided
@@ -216,6 +222,7 @@ export async function migrateOneToOne(
 	};
 
 	const existingIndex = await loadIndex(cwd);
+	const existingCatalog = await loadCatalog(cwd);
 	const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
 	const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
 
@@ -240,6 +247,7 @@ export async function migrateOneToOne(
 	const files: FileWrite[] = [
 		{ path: `summaries/${newSummary.commitHash}.json`, content: JSON.stringify(newSummary, null, "\t") },
 		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
+		buildCatalogFileWrite(existingCatalog, entryMap, newSummary),
 	];
 
 	const store = resolveStorage(undefined, cwd);
@@ -594,6 +602,7 @@ export async function mergeManyToOne(
 	};
 
 	const existingIndex = await loadIndex(cwd);
+	const existingCatalog = await loadCatalog(cwd);
 	const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
 	const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
 
@@ -619,6 +628,7 @@ export async function mergeManyToOne(
 	const files: FileWrite[] = [
 		{ path: `summaries/${mergedSummary.commitHash}.json`, content: JSON.stringify(mergedSummary, null, "\t") },
 		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
+		buildCatalogFileWrite(existingCatalog, entryMap, mergedSummary),
 	];
 
 	const store = resolveStorage(undefined, cwd);
@@ -644,26 +654,46 @@ export async function mergeManyToOne(
  * Use only for admin cleanup of truly orphaned root entries.
  */
 export async function removeFromIndex(commitHash: string, cwd?: string): Promise<void> {
-	const existingIndex = await loadIndex(cwd);
-	if (!existingIndex) {
+	// Acquire the shared lock before touching index/catalog: this function
+	// performs a multi-file write that races with QueueWorker / scanTreeHashAliases
+	// / storeSummary if unsynchronized. Loading the data inside the lock window
+	// guarantees we operate on the most recent on-disk state.
+	const locked = await acquireLock(cwd);
+	if (!locked) {
+		log.warn("removeFromIndex: could not acquire lock — skipping removal of %s", commitHash.substring(0, 8));
 		return;
 	}
+	try {
+		const existingIndex = await loadIndex(cwd);
+		if (!existingIndex) {
+			return;
+		}
 
-	const filtered = existingIndex.entries.filter((e) => e.commitHash !== commitHash);
-	if (filtered.length === existingIndex.entries.length) {
-		return;
+		const filtered = existingIndex.entries.filter((e) => e.commitHash !== commitHash);
+		if (filtered.length === existingIndex.entries.length) {
+			return;
+		}
+
+		const newIndex: SummaryIndex = {
+			version: existingIndex.version,
+			entries: filtered,
+			commitAliases: existingIndex.commitAliases,
+		};
+		const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
+
+		// Keep catalog aligned: drop the entry for this hash if catalog tracks it.
+		const existingCatalog = await loadCatalog(cwd);
+		const catalogWrite = buildCatalogRemoveFileWrite(existingCatalog, commitHash);
+		if (catalogWrite) {
+			files.push(catalogWrite);
+		}
+
+		const store = resolveStorage(undefined, cwd);
+		await store.writeFiles(files, `Remove index entry for ${commitHash.substring(0, 8)}`);
+		log.info("Removed %s from index", commitHash.substring(0, 8));
+	} finally {
+		await releaseLock(cwd);
 	}
-
-	const newIndex: SummaryIndex = {
-		version: existingIndex.version,
-		entries: filtered,
-		commitAliases: existingIndex.commitAliases,
-	};
-	const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
-
-	const store = resolveStorage(undefined, cwd);
-	await store.writeFiles(files, `Remove index entry for ${commitHash.substring(0, 8)}`);
-	log.info("Removed %s from index", commitHash.substring(0, 8));
 }
 
 // ─── Transcript API ──────────────────────────────────────────────────────────
@@ -1042,6 +1072,10 @@ export async function migrateIndexToV3(cwd?: string): Promise<{ migrated: number
 	let skipped = 0;
 
 	const newEntryMap = new Map<string, SummaryIndexEntry>();
+	// Opportunistically (re)build catalog.json during v1→v3 migration since we're
+	// loading every root summary anyway. Avoids a separate bootstrap pass on first
+	// /jolli-search after migration.
+	const catalogEntries: CatalogEntry[] = [];
 
 	for (const entry of existingIndex.entries) {
 		// In v1, all entries are top-level (no parentCommitHash field)
@@ -1058,6 +1092,7 @@ export async function migrateIndexToV3(cwd?: string): Promise<{ migrated: number
 			for (const flatEntry of flatEntries) {
 				newEntryMap.set(flatEntry.commitHash, flatEntry);
 			}
+			catalogEntries.push(toCatalogEntry(summaryContent));
 			migrated++;
 		} catch (err) {
 			log.warn("Failed to flatten summary for %s: %s", entry.commitHash.substring(0, 8), (err as Error).message);
@@ -1070,7 +1105,12 @@ export async function migrateIndexToV3(cwd?: string): Promise<{ migrated: number
 		entries: [...newEntryMap.values()],
 	};
 
-	const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
+	const newCatalog: CommitCatalog = { version: 1, entries: catalogEntries };
+
+	const files: FileWrite[] = [
+		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
+		{ path: CATALOG_FILE, content: JSON.stringify(newCatalog, null, "\t") },
+	];
 	const store = resolveStorage(undefined, cwd);
 	await store.writeFiles(files, `Migrate index v1 → v3 (${migrated} entries)`);
 
@@ -1209,10 +1249,14 @@ function findShallowstByTreeHash(
 
 /**
  * Loads the index file from the orphan branch.
- * Public wrapper for use by ContextCompiler and other consumers.
+ * Public wrapper for use by ContextCompiler / LocalSearchProvider / other consumers.
+ *
+ * Accepts an optional `storage` override so callers can keep index and catalog
+ * reads coherent on the same backend (e.g. {@link LocalSearchProvider} passes
+ * `this.storage` to both `getIndex` and `getCatalogWithLazyBuild`).
  */
-export async function getIndex(cwd?: string): Promise<SummaryIndex | null> {
-	return loadIndex(cwd);
+export async function getIndex(cwd?: string, storage?: StorageProvider): Promise<SummaryIndex | null> {
+	return loadIndex(cwd, storage);
 }
 
 /**
@@ -1231,6 +1275,224 @@ async function loadIndex(cwd?: string, storage?: StorageProvider): Promise<Summa
 		log.error("Failed to parse index.json: %s", (error as Error).message);
 		return null;
 	}
+}
+
+// ─── Catalog (warm-path, search/recall enrichment) ───────────────────────────
+
+/**
+ * Builds a catalog entry from a CommitSummary.
+ *
+ * **CRITICAL**: must use `collectDisplayTopics(summary)` rather than reading
+ * `summary.topics` directly. v3 legacy data and IntelliJ squash output may
+ * carry topics inside `children` rather than on the root, so direct field
+ * access would yield empty topics for those summaries.
+ *
+ * `decisions` is preserved at full length — no length cap. catalog.json is
+ * cold path, only loaded by /jolli-search and recall catalog enrichment.
+ */
+export function toCatalogEntry(summary: CommitSummary): CatalogEntry {
+	const topics: CatalogTopic[] = collectDisplayTopics(summary).map((t) => ({
+		title: t.title,
+		...(t.decisions !== undefined && { decisions: t.decisions }),
+		...(t.category !== undefined && { category: t.category }),
+		...(t.importance !== undefined && { importance: t.importance }),
+		...(t.filesAffected && t.filesAffected.length > 0 && { filesAffected: t.filesAffected }),
+	}));
+	return {
+		commitHash: summary.commitHash,
+		...(summary.recap !== undefined && { recap: summary.recap }),
+		...(summary.ticketId !== undefined && { ticketId: summary.ticketId }),
+		...(topics.length > 0 && { topics }),
+	};
+}
+
+/**
+ * Loads the catalog file from the orphan branch.
+ * Returns null if `catalog.json` does not exist (e.g. legacy install before
+ * the warm-path catalog was introduced); callers should fall back to lazy
+ * build / bootstrap (see `getCatalogWithLazyBuild`).
+ */
+export async function loadCatalog(cwd?: string, storage?: StorageProvider): Promise<CommitCatalog | null> {
+	const store = resolveStorage(storage, cwd);
+	const content = await store.readFile(CATALOG_FILE);
+	if (!content) {
+		return null;
+	}
+
+	try {
+		return JSON.parse(content) as CommitCatalog;
+	} catch (error: unknown) {
+		log.error("Failed to parse catalog.json: %s", (error as Error).message);
+		return null;
+	}
+}
+
+/**
+ * Public wrapper around {@link loadCatalog} for callers outside this module.
+ *
+ * Note: prefer {@link getCatalogWithLazyBuild} when you need a guaranteed
+ * up-to-date catalog (lazy build + reconcile). Use this raw wrapper only when
+ * you specifically need the on-disk file as-is (e.g. tests, audit, debug).
+ */
+export async function getCatalog(cwd?: string, storage?: StorageProvider): Promise<CommitCatalog | null> {
+	return loadCatalog(cwd, storage);
+}
+
+/**
+ * Returns a {@link CommitCatalog} guaranteed to contain entries for every
+ * current root commit in `index.json`, performing reconcile + lazy build:
+ *
+ * 1. **Reconcile**: drop any catalog entry whose hash is no longer a root in
+ *    index (e.g. an external writer such as IntelliJ amended a commit, turning
+ *    the old root into a child).
+ * 2. **Bootstrap / lazy build**: for every root in index that the catalog does
+ *    not list, load `summaries/<hash>.json` and append a fresh entry built via
+ *    {@link toCatalogEntry}.
+ *
+ * **Concurrency**: writes to catalog.json are guarded by the same shared lock
+ * used by `QueueWorker` and `scanTreeHashAliases`. Without the lock,
+ * `writeMultipleFilesToBranch`'s unconditional `update-ref` could race with a
+ * concurrent worker write and roll the orphan branch ref back to a stale
+ * parent — silently destroying the worker's commit.
+ *
+ * Lock-contention behavior: when the lock cannot be acquired, the function
+ * returns the freshly reconciled catalog **in memory** without writing it
+ * back. The caller's read still sees the correct view; the next read will
+ * retry the write. This is safe because the reconcile is purely derived from
+ * `index.json` + per-hash summary files — no information is lost by skipping
+ * the write.
+ *
+ * Idempotent and safe to call from multiple processes; concurrent successful
+ * writes converge to the same content.
+ */
+export async function getCatalogWithLazyBuild(cwd?: string, storage?: StorageProvider): Promise<CommitCatalog> {
+	const store = resolveStorage(storage, cwd);
+
+	// Pre-flight read OUTSIDE the lock to detect the no-op case cheaply.
+	const preflightCatalog = (await loadCatalog(cwd, store)) ?? { version: 1, entries: [] };
+	const preflightIndex = await loadIndex(cwd, store);
+
+	if (!preflightIndex || preflightIndex.entries.length === 0) {
+		return preflightCatalog;
+	}
+
+	const preflightRoots = new Set(preflightIndex.entries.filter(isRootEntry).map((e) => e.commitHash));
+	const preflightHaveHashes = new Set(preflightCatalog.entries.map((e) => e.commitHash));
+	const preflightCleanedCount = preflightCatalog.entries.filter((e) => preflightRoots.has(e.commitHash)).length;
+	const preflightMissing: string[] = [];
+	for (const hash of preflightRoots) {
+		if (!preflightHaveHashes.has(hash)) preflightMissing.push(hash);
+	}
+
+	// Fast path: catalog already in sync with index; no write needed.
+	if (preflightCleanedCount === preflightCatalog.entries.length && preflightMissing.length === 0) {
+		return preflightCatalog;
+	}
+
+	// We have work to do. Acquire the shared lock so concurrent worker writes
+	// can't race with our update; if the lock is contended, fall back to the
+	// preflight in-memory result (a stale-but-coherent view is better than
+	// stomping a fresher write).
+	const locked = await acquireLock(cwd);
+	if (!locked) {
+		log.debug("getCatalogWithLazyBuild: lock contention — returning in-memory catalog without writeback");
+		// Build the in-memory updated view so caller still sees current roots.
+		const cleaned = preflightCatalog.entries.filter((e) => preflightRoots.has(e.commitHash));
+		const newEntries: CatalogEntry[] = [];
+		for (const hash of preflightMissing) {
+			const summary = await readSummaryFile(hash, cwd, store);
+			if (summary) newEntries.push(toCatalogEntry(summary));
+		}
+		return { version: 1, entries: [...cleaned, ...newEntries] };
+	}
+
+	try {
+		// Re-read inside the lock — the previously-blocking writer may have
+		// just finished, making our preflight view obsolete.
+		const catalog = (await loadCatalog(cwd, store)) ?? { version: 1, entries: [] };
+		const index = await loadIndex(cwd, store);
+		if (!index || index.entries.length === 0) {
+			return catalog;
+		}
+
+		const currentRoots = new Set(index.entries.filter(isRootEntry).map((e) => e.commitHash));
+		const cleaned = catalog.entries.filter((e) => currentRoots.has(e.commitHash));
+		const haveHashes = new Set(cleaned.map((e) => e.commitHash));
+		const missing: string[] = [];
+		for (const hash of currentRoots) {
+			if (!haveHashes.has(hash)) missing.push(hash);
+		}
+
+		// Re-check fast path under the lock — another writer may have already
+		// reconciled while we waited.
+		if (cleaned.length === catalog.entries.length && missing.length === 0) {
+			return catalog;
+		}
+
+		const newEntries: CatalogEntry[] = [];
+		for (const hash of missing) {
+			const summary = await readSummaryFile(hash, cwd, store);
+			if (summary) {
+				newEntries.push(toCatalogEntry(summary));
+			} else {
+				log.warn("Catalog lazy build: summary file missing for root %s", hash.substring(0, 8));
+			}
+		}
+
+		const updated: CommitCatalog = { version: 1, entries: [...cleaned, ...newEntries] };
+		const removed = catalog.entries.length - cleaned.length;
+		const message = `catalog: reconcile (+${newEntries.length}, -${removed})`;
+		await store.writeFiles([{ path: CATALOG_FILE, content: JSON.stringify(updated, null, "\t") }], message);
+		return updated;
+	} finally {
+		await releaseLock(cwd);
+	}
+}
+
+/**
+ * Builds a `FileWrite` describing the new catalog.json contents to be committed
+ * atomically alongside summary + index updates.
+ *
+ * Reconcile-on-write invariant: the resulting catalog contains exactly:
+ *   - existing entries whose hash is still a root in `entryMap`
+ *     (entries for hashes that became amend/squash children are dropped)
+ *   - the new root's entry (replaces any prior entry for the same hash)
+ *
+ * When `existingCatalog` is null (fresh install or catalog was deleted), the
+ * write produces a catalog with only the new root's entry. The read-path
+ * `getCatalogWithLazyBuild` reconciliation later fills in any historical
+ * roots that pre-date this write.
+ */
+function buildCatalogFileWrite(
+	existingCatalog: CommitCatalog | null,
+	entryMap: ReadonlyMap<string, SummaryIndexEntry>,
+	newRoot: CommitSummary,
+): FileWrite {
+	const currentRootHashes = new Set([...entryMap.values()].filter(isRootEntry).map((e) => e.commitHash));
+	const priorEntries = existingCatalog?.entries ?? [];
+	const filtered = priorEntries.filter(
+		(e) => currentRootHashes.has(e.commitHash) && e.commitHash !== newRoot.commitHash,
+	);
+	const updated: CommitCatalog = {
+		version: 1,
+		entries: [...filtered, toCatalogEntry(newRoot)],
+	};
+	return { path: CATALOG_FILE, content: JSON.stringify(updated, null, "\t") };
+}
+
+/**
+ * Builds a `FileWrite` for catalog.json that drops the entry for `removedHash`.
+ * Used by `removeFromIndex` so admin cleanup keeps catalog and index aligned.
+ *
+ * Returns null when no catalog file exists or no entry references the hash —
+ * caller can then skip writing catalog.json.
+ */
+function buildCatalogRemoveFileWrite(existingCatalog: CommitCatalog | null, removedHash: string): FileWrite | null {
+	if (!existingCatalog) return null;
+	const filtered = existingCatalog.entries.filter((e) => e.commitHash !== removedHash);
+	if (filtered.length === existingCatalog.entries.length) return null;
+	const updated: CommitCatalog = { version: 1, entries: filtered };
+	return { path: CATALOG_FILE, content: JSON.stringify(updated, null, "\t") };
 }
 
 // ─── Plan file storage ────────────────────────────────────────────────────────

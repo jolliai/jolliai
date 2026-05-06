@@ -10,7 +10,13 @@
 import { createLogger } from "../Logger.js";
 import type { CommitSummary, SummaryIndexEntry } from "../Types.js";
 import { getDisplayDate } from "./SummaryFormat.js";
-import { getIndex, getSummary, readNoteFromBranch, readPlanFromBranch } from "./SummaryStore.js";
+import {
+	getCatalogWithLazyBuild,
+	getIndex,
+	getSummary,
+	readNoteFromBranch,
+	readPlanFromBranch,
+} from "./SummaryStore.js";
 import { collectAllTopics, resolveDiffStats } from "./SummaryTree.js";
 
 const log = createLogger("ContextCompiler");
@@ -66,6 +72,16 @@ export interface BranchCatalogEntry {
 	readonly commitCount: number;
 	readonly period: { readonly start: string; readonly end: string };
 	readonly commitMessages: ReadonlyArray<string>;
+	/**
+	 * Aggregated topic titles for all root commits on this branch, deduplicated
+	 * and ordered as encountered (oldest commit first within the branch).
+	 *
+	 * Sourced from `catalog.json` via {@link getCatalogWithLazyBuild}. Provides
+	 * higher-signal inputs than `commitMessages` (which often degrade to "wip" /
+	 * "address review") for the LLM that performs semantic branch matching in
+	 * recall's catalog mode. Absent when no catalog data exists for the branch.
+	 */
+	readonly topicTitles?: ReadonlyArray<string>;
 }
 
 export interface BranchCatalog {
@@ -76,31 +92,27 @@ export interface BranchCatalog {
 
 // ─── Token estimation ────────────────────────────────────────────────────────
 
-const CJK_RANGE =
-	/[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u{20000}-\u{2a6df}\u{2a700}-\u{2b73f}\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/u;
+// Re-exported from TokenEstimator so existing callers / tests keep working
+// while new modules (e.g. LocalSearchProvider) can depend on the smaller
+// utility module directly without pulling in ContextCompiler's surface.
+export { estimateTokens } from "./TokenEstimator.js";
 
-/**
- * Estimates token count for mixed CJK/ASCII text.
- * CJK characters ~1.5 tokens each, ASCII ~0.25 tokens/char.
- */
-export function estimateTokens(text: string): number {
-	let cjkChars = 0;
-	let asciiChars = 0;
-	for (const ch of text) {
-		if (CJK_RANGE.test(ch)) {
-			cjkChars++;
-		} else {
-			asciiChars++;
-		}
-	}
-	return Math.ceil(cjkChars * 1.5 + asciiChars * 0.25);
-}
+import { estimateTokens } from "./TokenEstimator.js";
 
 // ─── Branch catalog ──────────────────────────────────────────────────────────
 
 /**
- * Lists all branches with Jolli Memory records, aggregated from index.json.
- * Only reads the index file — no summary files loaded. Fast.
+ * Lists all branches with Jolli Memory records, aggregated from index.json
+ * (and optionally enriched with topic titles from catalog.json).
+ *
+ * Reads index.json for branch / period / commitMessages, then enriches each
+ * `BranchCatalogEntry` with `topicTitles` aggregated from `catalog.json`.
+ * The catalog read goes through {@link getCatalogWithLazyBuild} so missing
+ * entries (e.g. data written by IntelliJ which does not maintain catalog.json)
+ * are reconciled on the fly.
+ *
+ * Slightly slower than the bare index read but still bounded — catalog.json
+ * is sized for /jolli-search and easily fits in memory.
  */
 export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
 	const index = await getIndex(cwd);
@@ -120,11 +132,37 @@ export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
 		}
 	}
 
+	// Build hash → topic titles map from catalog.json so we can enrich each
+	// branch entry without N additional file reads.
+	const catalog = await getCatalogWithLazyBuild(cwd);
+	const titlesByHash = new Map<string, string[]>();
+	for (const cat of catalog.entries) {
+		const titles = (cat.topics ?? []).map((t) => t.title).filter((t) => t.length > 0);
+		if (titles.length > 0) {
+			titlesByHash.set(cat.commitHash, titles);
+		}
+	}
+
 	const branches: BranchCatalogEntry[] = [];
 	for (const [branch, entries] of branchMap) {
 		const sorted = entries.sort(
 			(a, b) => new Date(getDisplayDate(a)).getTime() - new Date(getDisplayDate(b)).getTime(),
 		);
+
+		// Aggregate topic titles for this branch in commit order, deduplicated.
+		const seen = new Set<string>();
+		const topicTitles: string[] = [];
+		for (const e of sorted) {
+			const titles = titlesByHash.get(e.commitHash);
+			if (!titles) continue;
+			for (const title of titles) {
+				if (!seen.has(title)) {
+					seen.add(title);
+					topicTitles.push(title);
+				}
+			}
+		}
+
 		branches.push({
 			branch,
 			commitCount: entries.length,
@@ -133,6 +171,7 @@ export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
 				end: getDisplayDate(sorted[sorted.length - 1]),
 			},
 			commitMessages: sorted.map((e) => e.commitMessage),
+			...(topicTitles.length > 0 && { topicTitles }),
 		});
 	}
 
