@@ -1,0 +1,22 @@
+{
+  "title": "Sidebar Overrides Example",
+  "description": "Demonstrates custom sidebar labels, ordering, separators, and external links",
+  "nav": [],
+  "sidebar": {
+    "/": {
+      "index": "Home",
+      "getting-started": "Getting Started",
+      "---": { "type": "separator" },
+      "guides": "Guides",
+      "reference": "Reference",
+      "---2": { "type": "separator" },
+      "github": { "title": "GitHub", "href": "https://github.com/example/project" },
+      "support": { "title": "Get Help", "href": "https://example.com/support" }
+    },
+    "/guides": {
+      "quickstart": "Quick Start",
+      "configuration": "Configuration",
+      "deployment": "Deployment"
+    }
+  }
+}

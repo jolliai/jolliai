@@ -1,0 +1,75 @@
+{
+  "title": "Engineering Handbook",
+  "description": "Internal engineering handbook and style guide — Atlas theme",
+  "nav": [],
+  "theme": {
+    "pack": "atlas",
+    "primaryHue": 220,
+    "defaultTheme": "dark",
+    "fontFamily": "source-serif",
+    "logoUrl": "https://placehold.co/140x32/3b82f6/white?text=Handbook"
+  },
+  "header": {
+    "items": [
+      { "label": "Principles", "url": "/principles" },
+      { "label": "Standards", "url": "/standards" },
+      {
+        "label": "Guides",
+        "items": [
+          { "label": "Code Review", "url": "/guides/code-review" },
+          { "label": "Testing Strategy", "url": "/guides/testing" },
+          { "label": "Deployment", "url": "/guides/deployment" },
+          { "label": "Incident Response", "url": "/guides/incident-response" }
+        ]
+      },
+      {
+        "label": "Tools",
+        "items": [
+          { "label": "CI/CD Dashboard", "url": "https://ci.internal.example.com" },
+          { "label": "Monitoring", "url": "https://grafana.internal.example.com" }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "copyright": "Internal use only. Do not distribute.",
+    "columns": [
+      {
+        "title": "Quick Links",
+        "links": [
+          { "label": "Onboarding", "url": "/onboarding" },
+          { "label": "Architecture", "url": "/architecture" },
+          { "label": "Runbooks", "url": "/runbooks" }
+        ]
+      },
+      {
+        "title": "Team Resources",
+        "links": [
+          { "label": "Engineering Blog", "url": "https://eng-blog.internal.example.com" },
+          { "label": "RFC Archive", "url": "https://rfcs.internal.example.com" },
+          { "label": "Design System", "url": "https://design.internal.example.com" }
+        ]
+      }
+    ],
+    "socialLinks": {
+      "github": "https://github.com/example-corp"
+    }
+  },
+  "sidebar": {
+    "/": {
+      "index": "Welcome",
+      "principles": "Principles",
+      "standards": "Standards",
+      "guides": "Guides",
+      "onboarding": "Onboarding",
+      "architecture": "Architecture",
+      "runbooks": "Runbooks"
+    },
+    "/guides": {
+      "code-review": "Code Review",
+      "testing": "Testing Strategy",
+      "deployment": "Deployment",
+      "incident-response": "Incident Response"
+    }
+  }
+}

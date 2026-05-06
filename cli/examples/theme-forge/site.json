@@ -1,0 +1,62 @@
+{
+  "title": "DevKit",
+  "description": "DevKit developer documentation — Forge theme",
+  "nav": [],
+  "theme": {
+    "pack": "forge",
+    "primaryHue": 160,
+    "defaultTheme": "light",
+    "fontFamily": "space-grotesk",
+    "logoUrl": "https://placehold.co/120x32/22c55e/white?text=DevKit",
+    "logoUrlDark": "https://placehold.co/120x32/111827/22c55e?text=DevKit",
+    "favicon": "https://placehold.co/32x32/22c55e/white?text=D"
+  },
+  "header": {
+    "items": [
+      { "label": "Guides", "url": "/guides" },
+      { "label": "API Reference", "url": "/api" },
+      {
+        "label": "SDKs",
+        "items": [
+          { "label": "Node.js", "url": "https://github.com/devkit/node-sdk" },
+          { "label": "Python", "url": "https://github.com/devkit/python-sdk" },
+          { "label": "Go", "url": "https://github.com/devkit/go-sdk" }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "copyright": "2026 DevKit Labs. All rights reserved.",
+    "columns": [
+      {
+        "title": "Product",
+        "links": [
+          { "label": "Features", "url": "https://devkit.dev/features" },
+          { "label": "Pricing", "url": "https://devkit.dev/pricing" },
+          { "label": "Changelog", "url": "/changelog" }
+        ]
+      },
+      {
+        "title": "Resources",
+        "links": [
+          { "label": "Documentation", "url": "/" },
+          { "label": "API Reference", "url": "/api" },
+          { "label": "Blog", "url": "https://blog.devkit.dev" }
+        ]
+      }
+    ],
+    "socialLinks": {
+      "github": "https://github.com/devkit",
+      "twitter": "https://twitter.com/devkit",
+      "discord": "https://discord.gg/devkit"
+    }
+  },
+  "sidebar": {
+    "/": {
+      "index": "Overview",
+      "guides": "Guides",
+      "api": "API Reference",
+      "changelog": "Changelog"
+    }
+  }
+}

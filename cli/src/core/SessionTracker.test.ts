@@ -660,8 +660,12 @@ describe("SessionTracker", () => {
 					"feature-auth": {
 						slug: "feature-auth",
 						title: "Auth plan",
-						path: "plans/feature-auth.md",
+						sourcePath: "plans/feature-auth.md",
+						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
+						branch: "main",
+						commitHash: null,
+						editCount: 0,
 					},
 				},
 			};
@@ -677,8 +681,12 @@ describe("SessionTracker", () => {
 					"feature-auth": {
 						slug: "feature-auth",
 						title: "Auth plan",
-						path: "plans/feature-auth.md",
+						sourcePath: "plans/feature-auth.md",
+						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
+						branch: "main",
+						commitHash: null,
+						editCount: 0,
 					},
 				},
 			};
@@ -707,8 +715,12 @@ describe("SessionTracker", () => {
 					"feature-auth": {
 						slug: "feature-auth",
 						title: "Auth plan",
-						path: "plans/feature-auth.md",
+						sourcePath: "plans/feature-auth.md",
+						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
+						branch: "main",
+						commitHash: null,
+						editCount: 0,
 					},
 				},
 			};
@@ -728,8 +740,12 @@ describe("SessionTracker", () => {
 					"feature-auth": {
 						slug: "feature-auth",
 						title: "Auth plan",
-						path: "plans/feature-auth.md",
+						sourcePath: "plans/feature-auth.md",
+						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
+						branch: "main",
+						commitHash: null,
+						editCount: 0,
 					},
 				},
 			};
@@ -747,8 +763,11 @@ describe("SessionTracker", () => {
 					"feature-auth": {
 						slug: "feature-auth",
 						title: "Auth plan",
-						path: "plans/feature-auth.md",
+						sourcePath: "plans/feature-auth.md",
+						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
+						branch: "main",
+						editCount: 0,
 						commitHash: "abcdef1234567890",
 					},
 				},

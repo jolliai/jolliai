@@ -50,6 +50,7 @@
 	"dependencies": {
 		"@anthropic-ai/sdk": "^0.39.0",
 		"@mdx-js/mdx": "^3.1.1",
+		"chokidar": "^4.0.0",
 		"commander": "^13.1.0",
 		"open": "^11.0.0",
 		"yaml": "^2.6.1"

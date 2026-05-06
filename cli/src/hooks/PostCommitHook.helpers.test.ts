@@ -782,16 +782,13 @@ describe("PostCommitHook helpers", () => {
 
 	describe("buildStoredTranscript", () => {
 		it("falls back to the session transcript path when the session metadata is missing", () => {
-			const stored = __test__.buildStoredTranscript(
-				[
-					{
-						sessionId: "sess-1",
-						transcriptPath: "/tmp/from-transcript.jsonl",
-						entries: [{ role: "human", content: "hi" }],
-					},
-				],
-				[],
-			);
+			const stored = __test__.buildStoredTranscript([
+				{
+					sessionId: "sess-1",
+					transcriptPath: "/tmp/from-transcript.jsonl",
+					entries: [{ role: "human", content: "hi" }],
+				},
+			]);
 
 			expect(stored.sessions[0].transcriptPath).toBe("/tmp/from-transcript.jsonl");
 		});

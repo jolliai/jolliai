@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { LlmCallResult } from "./LlmClient.js";
+import type { LlmCallOptions, LlmCallResult } from "./LlmClient.js";
 
-const mockCallLlm = vi.fn<() => Promise<LlmCallResult>>();
+const mockCallLlm = vi.fn<(options: LlmCallOptions) => Promise<LlmCallResult>>();
 vi.mock("./LlmClient.js", () => ({
-	callLlm: (...args: unknown[]) => mockCallLlm(...args),
+	callLlm: (options: LlmCallOptions) => mockCallLlm(options),
 }));
 
 vi.spyOn(console, "log").mockImplementation(() => {});
@@ -1437,7 +1437,7 @@ Test reordering
 			const result = await generateE2eTest({
 				commitMessage: "Fix bug",
 				topics: [{ title: "Fix", trigger: "Bug", response: "Fixed", decisions: "D" }],
-				diffSummary: "+1 -1",
+				diff: "+1 -1",
 				config: mockConfig,
 			});
 

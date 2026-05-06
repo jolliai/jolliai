@@ -57,25 +57,31 @@ describe("StorageFactory", () => {
 		const storage = await createStorage("/project/path");
 
 		expect(DualWriteStorage).toHaveBeenCalledOnce();
-		expect((storage as Record<string, unknown>).type).toBe("dual-write");
+		expect((storage as unknown as Record<string, unknown>).type).toBe("dual-write");
 	});
 
 	it('returns OrphanBranchStorage when storageMode is "orphan"', async () => {
-		mockLoadConfig.mockResolvedValue({ storageMode: "orphan" });
+		// `storageMode` is read off the config via a cast in StorageFactory.ts;
+		// the type doesn't declare the field but the implementation tolerates it.
+		mockLoadConfig.mockResolvedValue({ storageMode: "orphan" } as unknown as Awaited<
+			ReturnType<typeof loadConfig>
+		>);
 
 		const storage = await createStorage("/project/path");
 
 		expect(OrphanBranchStorage).toHaveBeenCalledOnce();
-		expect((storage as Record<string, unknown>).type).toBe("orphan");
+		expect((storage as unknown as Record<string, unknown>).type).toBe("orphan");
 	});
 
 	it('returns FolderStorage when storageMode is "folder"', async () => {
-		mockLoadConfig.mockResolvedValue({ storageMode: "folder" });
+		mockLoadConfig.mockResolvedValue({ storageMode: "folder" } as unknown as Awaited<
+			ReturnType<typeof loadConfig>
+		>);
 
 		const storage = await createStorage("/project/path");
 
 		expect(FolderStorage).toHaveBeenCalledOnce();
-		expect((storage as Record<string, unknown>).type).toBe("folder");
+		expect((storage as unknown as Record<string, unknown>).type).toBe("folder");
 	});
 
 	it("falls back to DualWriteStorage with warning when loadConfig fails", async () => {
@@ -85,7 +91,7 @@ describe("StorageFactory", () => {
 		const storage = await createStorage("/project/path");
 
 		expect(DualWriteStorage).toHaveBeenCalledOnce();
-		expect((storage as Record<string, unknown>).type).toBe("dual-write");
+		expect((storage as unknown as Record<string, unknown>).type).toBe("dual-write");
 		// Verify that a warning was logged (our Logger writes to console.warn)
 		expect(warnSpy).toHaveBeenCalled();
 	});

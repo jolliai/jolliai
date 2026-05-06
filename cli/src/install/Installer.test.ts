@@ -1253,7 +1253,7 @@ describe("Installer", () => {
 
 		it("should exclude OpenCode sessions when openCodeEnabled is false", async () => {
 			const { isOpenCodeInstalled, scanOpenCodeSessions } = await import("../core/OpenCodeSessionDiscoverer.js");
-			const { saveConfig } = await import("../core/SessionTracker.js");
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
 			vi.mocked(isOpenCodeInstalled).mockResolvedValue(true);
 			vi.mocked(scanOpenCodeSessions).mockResolvedValue({
 				sessions: [
@@ -1266,8 +1266,7 @@ describe("Installer", () => {
 				],
 			});
 
-			const projectConfigDir = join(tempDir, ".jolli", "jollimemory");
-			await saveConfig({ openCodeEnabled: false }, undefined, projectConfigDir);
+			await saveConfigScoped({ openCodeEnabled: false }, emptyGlobalDir);
 			const status = await getStatus(tempDir);
 			expect(status.activeSessions).toBe(0);
 			expect(status.mostRecentSession).toBeNull();
@@ -1982,7 +1981,7 @@ describe("Installer", () => {
 			);
 
 			const status = await getStatus(tempDir);
-			expect(status.sessionsBySource.claude).toBe(1);
+			expect(status.sessionsBySource?.claude).toBe(1);
 		});
 
 		it("should compute mostRecentSession via reduce when multiple enabled sessions exist", async () => {

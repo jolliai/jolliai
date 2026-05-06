@@ -1,0 +1,43 @@
+{
+  "title": "Footer Config Example",
+  "description": "Demonstrates footer with copyright, columns, and social links",
+  "nav": [
+    { "label": "Docs", "href": "/docs" }
+  ],
+  "footer": {
+    "copyright": "2026 Example Corp. All rights reserved.",
+    "columns": [
+      {
+        "title": "Product",
+        "links": [
+          { "label": "Features", "url": "/features" },
+          { "label": "Pricing", "url": "/pricing" },
+          { "label": "Changelog", "url": "/changelog" }
+        ]
+      },
+      {
+        "title": "Developers",
+        "links": [
+          { "label": "Documentation", "url": "/docs" },
+          { "label": "API Reference", "url": "/api" },
+          { "label": "SDKs", "url": "/sdks" }
+        ]
+      },
+      {
+        "title": "Company",
+        "links": [
+          { "label": "About", "url": "/about" },
+          { "label": "Blog", "url": "https://blog.example.com" },
+          { "label": "Careers", "url": "https://example.com/careers" }
+        ]
+      }
+    ],
+    "socialLinks": {
+      "github": "https://github.com/example",
+      "twitter": "https://twitter.com/example",
+      "discord": "https://discord.gg/example",
+      "linkedin": "https://linkedin.com/company/example",
+      "youtube": "https://youtube.com/@example"
+    }
+  }
+}

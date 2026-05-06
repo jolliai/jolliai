@@ -119,6 +119,17 @@ describe("StarterKit.scaffoldProject", () => {
 		}
 	});
 
+	it("site.json defaults theme.pack to forge so new sites get the polished look out of the box", async () => {
+		const { scaffoldProject } = await import("./StarterKit.js");
+		const targetDir = join(tempBase, "my-docs");
+
+		await scaffoldProject(targetDir);
+
+		const raw = await readFile(join(targetDir, "site.json"), "utf-8");
+		const parsed = JSON.parse(raw) as { theme?: { pack?: unknown } };
+		expect(parsed.theme?.pack).toBe("forge");
+	});
+
 	// ── Markdown files (Requirement 1.4) ───────────────────────────────────
 
 	it("writes index.md at the root", async () => {

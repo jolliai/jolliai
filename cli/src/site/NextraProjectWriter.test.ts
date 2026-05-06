@@ -227,6 +227,225 @@ describe("NextraProjectWriter.generateLayout", () => {
 		expect(result).toContain("'nextra-theme-docs/style.css'");
 		expect(result).toContain("'../styles/api.css'");
 	});
+
+	// ── theme.pack dispatcher (Phase 1) ──────────────────────────────────────
+
+	it("uses the default layout when theme.pack is unset", async () => {
+		const { generateLayout, generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		expect(generateLayout(SAMPLE_CONFIG)).toBe(generateDefaultLayout(SAMPLE_CONFIG));
+	});
+
+	it("uses the default layout when theme.pack is explicitly 'default'", async () => {
+		const { generateLayout, generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const config = { ...SAMPLE_CONFIG, theme: { pack: "default" as const } };
+		expect(generateLayout(config)).toBe(generateDefaultLayout(SAMPLE_CONFIG));
+	});
+
+	it("forge pack returns the Forge layout (forge-sidebar-logo + forge.css import)", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const config = { ...SAMPLE_CONFIG, theme: { pack: "forge" as const } };
+		const result = generateLayout(config);
+		expect(result).toContain("forge-sidebar-logo");
+		expect(result).toContain("./themes/forge.css");
+	});
+
+	it("atlas pack returns the Atlas layout (atlas-navbar-logo + atlas.css import)", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const config = { ...SAMPLE_CONFIG, theme: { pack: "atlas" as const } };
+		const result = generateLayout(config);
+		expect(result).toContain("atlas-navbar-logo");
+		expect(result).toContain("./themes/atlas.css");
+	});
+
+	it("default layout passes through theme branding fields without crashing (no-op for now)", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const config = {
+			...SAMPLE_CONFIG,
+			theme: {
+				logoUrl: "/logo.svg",
+				logoUrlDark: "/logo-dark.svg",
+				favicon: "/favicon.ico",
+				primaryHue: 200,
+				defaultTheme: "dark" as const,
+				fontFamily: "inter" as const,
+			},
+		};
+		const result = generateLayout(config);
+		expect(result).toContain("My API Docs");
+		expect(result).toContain("nextra-theme-docs");
+	});
+
+	// ── header / footer (post-1392 schema) ────────────────────────────────────
+
+	it("renders header.items direct links the same way as legacy nav", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			header: { items: [{ label: "Guides", url: "/guides" }] },
+		});
+		expect(result).toContain('<a href={"/guides"}');
+		expect(result).toContain('{"Guides"}');
+	});
+
+	it("prefers header.items over the legacy nav shorthand when both are set", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [{ label: "FromNav", href: "/nav" }],
+			header: { items: [{ label: "FromHeader", url: "/header" }] },
+		});
+		expect(result).toContain("FromHeader");
+		expect(result).not.toContain("FromNav");
+	});
+
+	it("renders a <details> dropdown when a header item has sub-items", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			header: {
+				items: [
+					{
+						label: "Resources",
+						items: [
+							{ label: "Blog", url: "/blog" },
+							{ label: "Changelog", url: "/changelog" },
+						],
+					},
+				],
+			},
+		});
+		expect(result).toContain("<details");
+		expect(result).toContain("<summary");
+		expect(result).toContain('{"Resources"}');
+		expect(result).toContain('{"Blog"}');
+		expect(result).toContain('{"Changelog"}');
+		expect(result).toContain('<a href={"/blog"}');
+	});
+
+	it("emits a bare <Footer /> when no footer config is provided (back-compat)", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout(SAMPLE_CONFIG);
+		expect(result).toContain("footer={<Footer />}");
+	});
+
+	it("emits a bare <Footer /> when footer is set but has no rendering content", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: { columns: [], socialLinks: {} },
+		});
+		expect(result).toContain("footer={<Footer />}");
+	});
+
+	it("renders footer copyright text", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: { copyright: "2026 Acme Inc." },
+		});
+		expect(result).toContain("<Footer>");
+		expect(result).toContain('{"2026 Acme Inc."}');
+	});
+
+	it("renders footer columns with titles and links", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: {
+				columns: [
+					{
+						title: "Product",
+						links: [
+							{ label: "Pricing", url: "/pricing" },
+							{ label: "Docs", url: "/docs" },
+						],
+					},
+				],
+			},
+		});
+		expect(result).toContain('{"Product"}');
+		expect(result).toContain('{"Pricing"}');
+		expect(result).toContain('<a href={"/pricing"}');
+		expect(result).toContain('<a href={"/docs"}');
+	});
+
+	it("renders footer social links in canonical platform order, skipping unset ones", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: { socialLinks: { youtube: "https://yt.example", github: "https://gh.example" } },
+		});
+		// github appears before youtube in SOCIAL_PLATFORMS; verify ordering survived.
+		const ghIdx = result.indexOf("gh.example");
+		const ytIdx = result.indexOf("yt.example");
+		expect(ghIdx).toBeGreaterThan(-1);
+		expect(ytIdx).toBeGreaterThan(-1);
+		expect(ghIdx).toBeLessThan(ytIdx);
+		expect(result).toContain('aria-label={"github"}');
+		expect(result).toContain('aria-label={"youtube"}');
+		expect(result).not.toContain('aria-label={"twitter"}');
+	});
+
+	it("sanitizes javascript: URLs in header items to '#'", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			header: { items: [{ label: "Bad", url: "javascript:alert(1)" }] },
+		});
+		expect(result).not.toContain("javascript:alert");
+		expect(result).toContain('<a href={"#"}');
+	});
+
+	it("sanitizes javascript: URLs in dropdown sub-items to '#'", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			header: {
+				items: [
+					{
+						label: "Menu",
+						items: [{ label: "Bad", url: "JAVASCRIPT:alert(1)" }],
+					},
+				],
+			},
+		});
+		expect(result).not.toMatch(/javascript:alert/i);
+		expect(result).toContain('<a href={"#"}');
+	});
+
+	it("sanitizes javascript: URLs in footer column links and social links", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: {
+				columns: [{ title: "X", links: [{ label: "Bad", url: "javascript:alert(1)" }] }],
+				socialLinks: { github: "data:text/html,evil" },
+			},
+		});
+		expect(result).not.toContain("javascript:alert");
+		expect(result).not.toContain("data:text/html");
+		// Both unsafe URLs should have been replaced with "#".
+		expect(result.match(/<a href={"#"}/g)?.length).toBeGreaterThanOrEqual(2);
+	});
 });
 
 // ─── generateMdxComponents unit tests ────────────────────────────────────────
@@ -497,6 +716,102 @@ describe("NextraProjectWriter.initNextraProject", () => {
 		expect(content).toContain("nextra");
 		expect(content).toContain("export default");
 	});
+
+	// ── Forge pack: writes app/themes/forge.css ──────────────────────────────
+
+	it("writes app/themes/forge.css when theme.pack is 'forge'", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+		const config = { ...SAMPLE_CONFIG, theme: { pack: "forge" as const } };
+
+		await initNextraProject(buildDir, config);
+
+		expect(existsSync(join(buildDir, "app", "themes", "forge.css"))).toBe(true);
+	});
+
+	it("does NOT write app/themes/forge.css for the default pack", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+
+		await initNextraProject(buildDir, SAMPLE_CONFIG);
+
+		expect(existsSync(join(buildDir, "app", "themes", "forge.css"))).toBe(false);
+	});
+
+	it("forge.css reflects theme.primaryHue in the generated overrides", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+		const config = { ...SAMPLE_CONFIG, theme: { pack: "forge" as const, primaryHue: 145 } };
+
+		await initNextraProject(buildDir, config);
+
+		const css = await readFile(join(buildDir, "app", "themes", "forge.css"), "utf-8");
+		expect(css).toContain("--nextra-primary-hue:        145");
+		expect(css).toContain("hsl(145");
+	});
+
+	it("forge.css reflects theme.fontFamily in the generated overrides", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+		const config = {
+			...SAMPLE_CONFIG,
+			theme: { pack: "forge" as const, fontFamily: "ibm-plex" as const },
+		};
+
+		await initNextraProject(buildDir, config);
+
+		const css = await readFile(join(buildDir, "app", "themes", "forge.css"), "utf-8");
+		expect(css).toContain("--forge-font-family:");
+		expect(css).toContain("IBM Plex Sans");
+	});
+
+	// ── Atlas pack: writes app/themes/atlas.css ──────────────────────────────
+
+	it("writes app/themes/atlas.css when theme.pack is 'atlas'", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+		const config = { ...SAMPLE_CONFIG, theme: { pack: "atlas" as const } };
+
+		await initNextraProject(buildDir, config);
+
+		expect(existsSync(join(buildDir, "app", "themes", "atlas.css"))).toBe(true);
+	});
+
+	it("does NOT write app/themes/atlas.css for the forge pack", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+		const config = { ...SAMPLE_CONFIG, theme: { pack: "forge" as const } };
+
+		await initNextraProject(buildDir, config);
+
+		expect(existsSync(join(buildDir, "app", "themes", "atlas.css"))).toBe(false);
+	});
+
+	it("atlas.css uses Atlas's manifest hue (200) when primaryHue is unset", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+		const config = { ...SAMPLE_CONFIG, theme: { pack: "atlas" as const } };
+
+		await initNextraProject(buildDir, config);
+
+		const css = await readFile(join(buildDir, "app", "themes", "atlas.css"), "utf-8");
+		expect(css).toContain("--nextra-primary-hue:        200");
+	});
+
+	it("atlas.css reflects theme.fontFamily in the generated overrides", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+		const config = {
+			...SAMPLE_CONFIG,
+			theme: { pack: "atlas" as const, fontFamily: "source-sans" as const },
+		};
+
+		await initNextraProject(buildDir, config);
+
+		const css = await readFile(join(buildDir, "app", "themes", "atlas.css"), "utf-8");
+		expect(css).toContain("--atlas-font-family:");
+		expect(css).toContain("Source Sans 3");
+	});
 });
 
 // ─── Property-based tests ─────────────────────────────────────────────────────
@@ -576,8 +891,18 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 		);
 	});
 
-	it("generateLayout always contains all nav item hrefs", async () => {
+	it("generateLayout always contains the sanitized form of every nav item href", async () => {
 		const { generateLayout } = await import("./NextraProjectWriter.js");
+
+		// sanitizeUrl trims whitespace and replaces non-safe schemes with "#".
+		// The output embeds each href via JSON.stringify(sanitizeUrl(href)).
+		function expectedHref(href: string): string {
+			const trimmed = href.trim();
+			if (trimmed === "" || /^(?:https?:|mailto:|tel:|[#?/]|\.\.?\/)/i.test(trimmed)) {
+				return JSON.stringify(trimmed);
+			}
+			return JSON.stringify("#");
+		}
 
 		fc.assert(
 			fc.property(
@@ -587,7 +912,7 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 				(title, description, nav) => {
 					const config = { title, description, nav };
 					const result = generateLayout(config);
-					return nav.every(({ href }) => result.includes(href));
+					return nav.every(({ href }) => result.includes(expectedHref(href)));
 				},
 			),
 			{ numRuns: 100 },

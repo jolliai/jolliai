@@ -1,0 +1,19 @@
+{
+  "title": "Path Mappings Example",
+  "description": "Demonstrates remapping source folders to different content paths",
+  "nav": [
+    { "label": "Guides", "href": "/guides" },
+    { "label": "API", "href": "/reference/api" }
+  ],
+  "pathMappings": {
+    "sql-docs": "reference/sql",
+    "api-docs": "reference/api"
+  },
+  "sidebar": {
+    "/": {
+      "index": "Home",
+      "guides": "Guides",
+      "reference": "Reference"
+    }
+  }
+}
