@@ -33,6 +33,7 @@ Thumbs.db
 # Jolli / Claude
 .jolli/
 .claude/
+.kiro/
 .gemini/
 .codex/
 .opencode/

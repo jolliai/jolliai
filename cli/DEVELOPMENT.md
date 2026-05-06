@@ -349,6 +349,131 @@ All errors are logged to `.jolli/jollimemory/debug.log`. The tool is designed to
 | `git-op-queue/*.json` | Pending git operation queue entries |
 | `squash-pending.json` | Temporary cross-hook file for squash detection |
 
+## Site Generation: OpenAPI Reference Pipeline
+
+`jolli new` / `build` / `start` / `dev` generate a Nextra v4 docs site
+from a `Content_Folder` of markdown + OpenAPI specs. The OpenAPI
+surface is split into a **framework-agnostic IR layer** and a
+**renderer-specific emitter**, so a future Fumadocs / Docusaurus
+emitter is a self-contained sibling rather than a fork of the whole
+pipeline.
+
+### Two-layer architecture
+
+```
+Content_Folder/                              ContentMirror
+  api/petstore.yaml         ─►  parses once via tryParseOpenApi
+                                stashes parsed AST in
+                                MirrorResult.openapiDocs[relPath]
+                                                   │
+                                                   ▼
+                            StartCommand.buildOpenApiSpecInputs:
+                              • derive specName from basename
+                                (collision → throws)
+                              • buildPipeline(doc) per spec
+                                                   │
+                                                   ▼
+                          OpenApiPipelineResult per spec
+                          { spec: ParsedSpec,
+                            dossiers: [{ operation, codeSamples }] }
+                                                   │
+                          ┌────────────────────────┴────────────┐
+                          │ Framework-agnostic IR (openapi/)    │
+                          │   SpecLoader, SpecParser, RefResolver,│
+                          │   CodeSampleGenerator, SchemaExample,│
+                          │   OpenApiPipeline, Slug, ReservedWords,│
+                          │   Escape, SpecName, Types            │
+                          └────────────────────────┬────────────┘
+                                                   │
+                                                   ▼
+                          renderer.renderOpenApiSpecs(...)
+                                                   │
+                          ┌────────────────────────┴────────────┐
+                          │ Renderer emitter (renderer/nextra/) │
+                          │   Components, EndpointPageEmitter,  │
+                          │   EndpointDataEmitter,              │
+                          │   OverviewPageEmitter,              │
+                          │   SidebarMetaEmitter, ApiCss, Paths │
+                          └────────────────────────┬────────────┘
+                                                   │
+                                                   ▼
+                          <buildDir>/
+                            content/api-{spec}/
+                              index.mdx                  ← overview page
+                              _refs.ts                   ← shared schema map
+                              _meta.ts                   ← top-level sidebar
+                              _data/{opId}.json          ← per-op JSON sidecar
+                              {tag}/_meta.ts             ← per-tag sidebar
+                              {tag}/{opId}.mdx           ← per-endpoint shim
+                            components/api/*.tsx         ← 9 React components
+                                                           (written by initProject)
+                            styles/api.css               ← method/status/grid CSS
+                                                           (written by initProject)
+```
+
+### Where each module lives, and what NOT to put there
+
+`cli/src/site/openapi/` — agnostic IR. **Must not** import from any
+renderer-specific path. Output is data structures, never strings of
+MDX or framework-specific filenames.
+
+| Module | Purpose |
+|---|---|
+| [SpecLoader.ts](src/site/openapi/SpecLoader.ts) | `tryParseOpenApi(content, ext)` — real `yaml`/`JSON.parse` returning the validated AST or `null`. Powers content-based discovery in `ContentMirror` |
+| [SpecParser.ts](src/site/openapi/SpecParser.ts) | `parseFullSpec(doc)` — walks `paths × HTTP_METHODS` in declaration order, follows `$ref` (RFC 6901 ~1/~0 escapes), throws on `(tag, operationId)` collisions, merges path-level + operation-level params |
+| [SchemaExample.ts](src/site/openapi/SchemaExample.ts) | `exampleFromSchema(schema)` — depth-limited synthesis. Documented gaps: `$ref` / `oneOf` / `anyOf` / `allOf` / `enum` / `default` / `nullable` not honoured |
+| [CodeSampleGenerator.ts](src/site/openapi/CodeSampleGenerator.ts) | `generateCodeSamples(op, server, schemes)` — five hand-rolled samples (cURL, JS, TS, Python, Go). `toPythonLiteral` and `goStringLiteral` avoid the regex-based replacement regression that corrupted strings containing literal `true`/`false`/`null` or backticks |
+| [Slug.ts](src/site/openapi/Slug.ts) + [ReservedWords.ts](src/site/openapi/ReservedWords.ts) | `slugify(text)` with reserved-word fallback (`export` → `export-doc`) so MDX → JS module compilation never breaks |
+| [Escape.ts](src/site/openapi/Escape.ts) | `escapeMdxText`, `escapeInlineCode`, `escapeYaml`, `escapeJsString`, `escapeHtml` — used by every emitter |
+| [SpecName.ts](src/site/openapi/SpecName.ts) | `deriveSpecName(relPath)` — basename + slugify, used as the URL slug in `/api-{specName}/...` |
+| [OpenApiPipeline.ts](src/site/openapi/OpenApiPipeline.ts) | `buildPipeline(doc)` — single entry point that runs `parseFullSpec` and attaches per-operation code samples. Emitters consume this verbatim |
+| [Types.ts](src/site/openapi/Types.ts) | `OpenApiDocument`, `ParsedSpec`, `OpenApiOperation`, `OpenApiPipelineResult`, `EndpointDossier`, `OpenApiCodeSamples` |
+
+`cli/src/site/renderer/nextra/` — Nextra emitter. Consumes
+`OpenApiPipelineResult`, returns `TemplateFile[]` with project-root-
+relative paths. **Must not** assume any particular spec count or
+inline its own spec parsing.
+
+| Module | Purpose |
+|---|---|
+| [Components.ts](src/site/renderer/nextra/Components.ts) | The 9 React components (`Endpoint`, `TryIt`, `SchemaBlock`, `ResponseBlock`, `ParamTable`, `AuthRequirements`, `EndpointMeta`, `CodeSwitcher`, `describeType`) as string templates. Written once by `initProject` |
+| [ApiCss.ts](src/site/renderer/nextra/ApiCss.ts) | `generateApiCss({ accentHue })` — single stylesheet at `styles/api.css`, hooks into Nextra's `--nextra-*` tokens for surfaces / dark mode |
+| [Paths.ts](src/site/renderer/nextra/Paths.ts) | `apiSpecFolderSlug`, `tagSlug`, `endpointPagePath`, `endpointRoutePath`, `endpointDataPath`, `endpointDataImportSpecifier` — Nextra path conventions |
+| [OverviewPageEmitter.ts](src/site/renderer/nextra/OverviewPageEmitter.ts) | `emitOverviewPage(specName, parsed)` — `content/api-{spec}/index.mdx` with per-tag tables |
+| [SidebarMetaEmitter.ts](src/site/renderer/nextra/SidebarMetaEmitter.ts) | `emitSidebarMetas(specName, parsed)` — top-level + per-tag `_meta.ts` |
+| [EndpointDataEmitter.ts](src/site/renderer/nextra/EndpointDataEmitter.ts) | `emitEndpointData(specName, op, parsed)` — JSON sidecar at `_data/{opId}.json`. Pre-resolves auth schemes / parameters / responses so `<Endpoint>` doesn't look anything up at render time |
+| [EndpointPageEmitter.ts](src/site/renderer/nextra/EndpointPageEmitter.ts) | `emitEndpointPage(specName, op, samples)` — per-endpoint MDX shim plus the spec-wide `_refs.ts`. The shim delegates rendering to `<Endpoint>` and ships request/response samples as MDX-fenced code blocks so Nextra's Shiki pipeline highlights them |
+| [index.ts](src/site/renderer/nextra/index.ts) | `emitNextraOpenApiFiles(specs)` orchestrator. Components are NOT included here — they're scaffold |
+
+### Why the IR / emitter split (and what it costs)
+
+The agnostic IR is ~70% of the OpenAPI code (parsing, refs, samples,
+schema-example synthesis). Without the split, a future Fumadocs port
+would copy the whole thing. With the split, only a new emitter
+(~600 LoC) is needed and the parser stays one source of truth.
+
+The cost: `OpenApiSpecInput` (`renderer/SiteRenderer.ts`) is the
+contract that bridges them. Both layers have to keep it in sync —
+type changes in the IR ripple through every emitter signature.
+
+### Adding a new docs framework
+
+1. Create `cli/src/site/renderer/<framework>/` mirroring `nextra/`.
+2. Implement `SiteRenderer` (`name`, `initProject`, `getCacheDirs`,
+   `generateNavigation`, `renderOpenApiSpecs`, `getContentRules`,
+   `runBuild`, `runDev`, `createOutputFilter`, `extractPageCount`).
+3. Wire the new renderer into `resolveRenderer` in
+   `cli/src/site/renderer/index.ts` and document the `renderer:` key
+   value in `site.json`.
+4. The agnostic IR layer stays untouched.
+
+### `swagger-ui-react` is gone
+
+The pre-Phase-3 implementation embedded `swagger-ui-react` in a 4-line
+MDX shim. That dependency is no longer in `NEXTRA_DEPENDENCIES` — the
+new pipeline pre-renders everything as MDX. If you see references to
+it in old commits or stale notes, they're outdated.
+
 ## Tech Stack
 
 - **Runtime**: Node.js with TypeScript (ESM)

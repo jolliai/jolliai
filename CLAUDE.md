@@ -75,6 +75,16 @@ Summaries live on the git orphan branch `jollimemory/summaries/v3` in the user's
 
 Hook installation uses dist-path indirection: hooks call `node "$($HOME/.jolli/jollimemory/resolve-dist-path)/PostCommitHook.js"`, where `resolve-dist-path` reads the `~/.jolli/jollimemory/dist-path` file. CLI vs extension write the same version-tagged dist-path (e.g. `source=cli@1.0.0\n/abs/path/to/dist`), so whichever surface was enabled most recently wins, and version comparisons work across surfaces.
 
+### Site generation: OpenAPI rich pipeline
+
+The `jolli new` / `build` / `start` / `dev` commands generate a Nextra v4 docs site from a `Content_Folder`. The OpenAPI surface is split in two so a future Fumadocs / Docusaurus emitter doesn't have to reimplement parsing:
+
+1. **Framework-agnostic IR** at `cli/src/site/openapi/` — `SpecLoader` / `SpecParser` / `RefResolver` / `CodeSampleGenerator` / `SchemaExample` / `Slug` / `Escape` / `OpenApiPipeline`. Output is data structures only. `parseFullSpec` walks `paths × HTTP_METHODS` in declaration order, follows `$ref` with RFC 6901 `~1`/`~0` escapes, and **throws** on `(tag, operationId)` collisions (silently dropping an endpoint would be worse).
+
+2. **Renderer-specific emitter** at `cli/src/site/renderer/nextra/` — consumes the IR and returns `TemplateFile[]`. Per spec: an overview MDX, a `_refs.ts` schema map, per-endpoint MDX shims, per-operation JSON sidecars, and `_meta.ts` sidebar files. Plus 9 React components (`Endpoint`, `TryIt`, `SchemaBlock`, `CodeSwitcher`, …) and a single `styles/api.css`, both written once at `initProject` time and imported via the `@/*` tsconfig alias declared in the generated `tsconfig.json`.
+
+The bridge is `SiteRenderer.renderOpenApiSpecs(contentDir, publicDir, specs)` in `cli/src/site/renderer/SiteRenderer.ts`. `StartCommand` builds the `OpenApiSpecInput[]` from `MirrorResult.openapiDocs` (the parsed-once-cached AST from `ContentMirror`) via `buildPipeline`. The legacy `swagger-ui-react` MDX shim is gone — that dependency is no longer in `NEXTRA_DEPENDENCIES`. See [`cli/DEVELOPMENT.md`](cli/DEVELOPMENT.md) for module-by-module detail and the full file-flow diagram.
+
 ### Auth & origin allowlist
 
 `jolliApiKey` (`sk-jol-…`) is a plain or JWT-shaped token whose payload encodes the tenant URL in a base64url-decoded segment. Three places consume it: CLI (`cli/src/core/JolliApiUtils.ts`, canonical `parseJolliApiKey` + `assertJolliOriginAllowed`), VS Code extension (which imports the canonical CLI helpers via the bundled path), and the IntelliJ plugin (Kotlin port). The allowlist is `jolli.ai`, `jolli.dev`, `jolli.cloud`, `jolli-local.me`, HTTPS-only, with a suffix-boundary check (`host === h || host.endsWith("." + h)`). Validation is **save-time** (OAuth callback, `configure --set`, settings UI, `JOLLI_URL` env at read time) — request paths trust the saved value. Keep the three implementations in lockstep.
