@@ -17,8 +17,7 @@ export interface NavLink {
 
 /**
  * A simple labelled URL — used as a footer-column link, a header-dropdown
- * sub-item, etc. Matches the SaaS `ExternalLink` shape (minus the editor-only
- * `id` field, which the CLI doesn't need).
+ * sub-item, etc.
  */
 export interface ExternalLink {
 	label: string;
@@ -27,7 +26,7 @@ export interface ExternalLink {
 
 /**
  * Header navbar item — direct link (`url`) OR dropdown (`items`),
- * mutually exclusive. Matches the SaaS `HeaderNavItem` shape.
+ * mutually exclusive.
  */
 export interface HeaderItem {
 	label: string;
@@ -60,6 +59,11 @@ export interface FooterConfig {
 	copyright?: string;
 	columns?: FooterColumn[];
 	socialLinks?: SocialLinks;
+	/**
+	 * Deprecated nested-shape alias for `socialLinks`. Coerced to `socialLinks`
+	 * at site.json load time; `socialLinks` wins when both are set.
+	 */
+	social?: SocialLinks;
 }
 
 /**
@@ -92,31 +96,38 @@ export type PathMappings = Record<string, string>;
 
 /**
  * Visual theme pack — picks the layout/CSS shell.
- *   - `default` — vanilla `nextra-theme-docs` (current behaviour, shipped before
- *     theme packs existed). The fallback when `theme.pack` is unset.
  *   - `forge` — clean developer-docs pack: light default, sidebar-first layout,
- *     Inter typography, hairline borders. Mirrors the SaaS Forge pack post-1392.
+ *     Inter typography, hairline borders. **The fallback when `theme.pack`
+ *     is unset.**
  *   - `atlas` — editorial pack: dark default, top-nav, serif headlines,
- *     airy spacing, masthead footer. Mirrors the SaaS Atlas pack.
+ *     airy spacing, masthead footer.
+ *   - `default` — vanilla `nextra-theme-docs` (the pre-pack visual, shipped
+ *     before theme packs existed). Kept as an explicit opt-in for sites that
+ *     prefer the unstyled Nextra look; never picked implicitly.
  */
 export type ThemePack = "default" | "forge" | "atlas";
 
 /** Initial colour scheme for visitors. */
 export type DefaultThemeMode = "light" | "dark" | "system";
 
-/**
- * Font families a pack can resolve via Google Fonts. Names match the SaaS
- * `FontFamily` enum so a single site.json works in both surfaces.
- */
+/** Font families a pack can resolve via Google Fonts. */
 export type FontFamily = "inter" | "space-grotesk" | "ibm-plex" | "source-sans" | "source-serif";
 
 /**
- * Visual theme block in site.json. Mirrors the customer-facing surface of
- * the SaaS `SiteBranding` (post-1392), minus tenant-only fields (`siteName` —
- * the CLI uses `title` at the top level instead, `customCss`, `legacyBranding`).
+ * How the navbar logo composes its image and text parts:
+ *   - `"text"`  — render only the logo text (defaults to `title`, or `logoText` if set)
+ *   - `"image"` — render only the logo image (`logoUrl`); falls back to text if `logoUrl` is unset
+ *   - `"both"`  — render image followed by text
  *
- * All fields are optional; each pack's manifest supplies defaults (e.g. Forge
- * defaults to `primaryHue: 228`, `defaultTheme: "light"`, `fontFamily: "inter"`).
+ * When `logoDisplay` is unset, the layout infers `"both"` if `logoUrl` is set
+ * and `"text"` otherwise — preserving pre-`logoDisplay` behaviour.
+ */
+export type LogoDisplay = "text" | "image" | "both";
+
+/**
+ * Visual theme block in site.json. All fields are optional; each pack's
+ * manifest supplies defaults (e.g. Forge defaults to `primaryHue: 228`,
+ * `defaultTheme: "light"`, `fontFamily: "inter"`).
  */
 export interface ThemeConfig {
 	pack?: ThemePack;
@@ -124,6 +135,17 @@ export interface ThemeConfig {
 	logoUrl?: string;
 	/** Optional dark-mode logo variant. The pack swaps when `.dark` is active. */
 	logoUrlDark?: string;
+	/**
+	 * Custom logo text. When unset, the site `title` is used. Useful when the
+	 * page title ("Acme Documentation") differs from the brand wordmark ("ACME").
+	 */
+	logoText?: string;
+	/**
+	 * Whether the navbar logo shows the image, the text, or both. See
+	 * `LogoDisplay` for the resolution rules. The auto-default preserves
+	 * pre-`logoDisplay` behaviour, so existing sites need no change.
+	 */
+	logoDisplay?: LogoDisplay;
 	/**
 	 * Favicon URL. When the legacy top-level `favicon` field is also set, the
 	 * top-level value wins (deprecated alias kept for back-compat).
@@ -137,6 +159,35 @@ export interface ThemeConfig {
 	fontFamily?: FontFamily;
 }
 
+/**
+ * Logo subfields under `branding.logo`. The canonical shape is the flat
+ * `theme.logoUrl` / `theme.logoText` etc. — `BrandingConfig` is read as a
+ * deprecated alias and coerced into `theme` at site.json load time.
+ */
+export interface BrandingLogoConfig {
+	text?: string;
+	image?: string;
+	imageDark?: string;
+	display?: LogoDisplay;
+	/** Schema-compatibility passthrough — currently ignored by the CLI renderer. */
+	alt?: string;
+}
+
+/**
+ * Visual branding block — the deprecated nested-shape alias for `theme`.
+ * Mapping happens at load time in `SiteJsonReader.coerceBrandingToTheme`.
+ * When both `branding` and `theme` are present, `theme.*` wins (so callers
+ * can override a single field without rewriting the whole block).
+ */
+export interface BrandingConfig {
+	themePack?: ThemePack;
+	logo?: BrandingLogoConfig;
+	favicon?: string;
+	colors?: { primaryHue?: number };
+	fontFamily?: FontFamily;
+	defaultTheme?: DefaultThemeMode;
+}
+
 /** The parsed contents of site.json */
 export interface SiteJson {
 	title: string;
@@ -147,15 +198,9 @@ export interface SiteJson {
 	 * items at render time so existing CLI sites keep working unchanged.
 	 */
 	nav: NavLink[];
-	/**
-	 * Header navbar — supports per-item dropdowns. Mirrors the SaaS
-	 * `HeaderLinksConfig` shape so a single `site.json` works in both systems.
-	 */
+	/** Header navbar — supports per-item dropdowns. */
 	header?: HeaderConfig;
-	/**
-	 * Site footer — copyright, columns of links, and social-icon URLs.
-	 * Mirrors the SaaS `FooterConfig` shape.
-	 */
+	/** Site footer — copyright, columns of links, and social-icon URLs. */
 	footer?: FooterConfig;
 	sidebar?: SidebarOverrides;
 	pathMappings?: PathMappings;
@@ -167,6 +212,12 @@ export interface SiteJson {
 	renderer?: string;
 	/** Visual styling — see `ThemeConfig`. */
 	theme?: ThemeConfig;
+	/**
+	 * Deprecated nested-shape alias for `theme`. Coerced to `theme.*` at
+	 * site.json load time; `theme.*` wins when both are set. New site.json
+	 * files should use `theme` directly.
+	 */
+	branding?: BrandingConfig;
 	[key: string]: unknown; // unknown fields are silently ignored
 }
 

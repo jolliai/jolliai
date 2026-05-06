@@ -2,11 +2,6 @@
  * Forge theme pack manifest — declares the pack's identity and the defaults
  * applied when a customer-overridable field on `theme` (in `site.json`) is
  * absent.
- *
- * Mirrors `FORGE_MANIFEST` from the SaaS Forge pack. Customer fields the CLI doesn't surface yet (e.g.
- * `requiredPackages` for SaaS deploy validation) are omitted — the CLI runs
- * `npm install` against the same `nextra-theme-docs` deps the default pack
- * already declares in `package.json`.
  */
 
 import type { DefaultThemeMode, FontFamily } from "../../Types.js";

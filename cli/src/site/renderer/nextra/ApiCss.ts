@@ -4,13 +4,12 @@
  *
  * Surfaces, typography, and dark-mode colours hook into Nextra's existing
  * `--nextra-*` tokens so the API pages match the rest of the docs site
- * without any per-customer theming. The accent hue is the only knob and
- * defaults to a Nextra-ish blue (220) — Phase 6 hardcodes this; theme
- * customisation is a future enhancement.
+ * without per-customer theming. The accent hue is the only knob and
+ * defaults to a Nextra-ish blue (220).
  *
- * Ported verbatim (modulo this header) from themes/ApiCss.ts.
- * That source layered the output onto Forge / Atlas / Classic theme-pack
- * stylesheets; we emit it standalone since jolliai has no theme packs.
+ * Emitted as a standalone `styles/api.css` file and imported alongside
+ * any pack stylesheet (`themes/forge.css` / `themes/atlas.css`) by the
+ * generated `app/layout.tsx`.
  */
 
 import type { TemplateFile } from "./Types.js";

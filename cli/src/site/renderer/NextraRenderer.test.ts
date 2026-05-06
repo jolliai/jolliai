@@ -139,10 +139,22 @@ describe("NextraRenderer", () => {
 		}
 	});
 
-	it("api.css uses generateApiCss's internal default (220) when no theme is set", async () => {
-		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-default-"));
+	it("api.css falls back to Forge's manifest hue (228) when no theme block is set (Forge is the implicit default)", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-implicit-forge-"));
 		try {
 			const config = { title: "T", description: "D", nav: [] };
+			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
+			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
+			expect(css).toContain("hsl(228 84% 50%)");
+		} finally {
+			await rm(buildDir, { recursive: true, force: true });
+		}
+	});
+
+	it("api.css uses generateApiCss's internal default (220) when theme.pack is explicitly 'default'", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-explicit-default-"));
+		try {
+			const config = { title: "T", description: "D", nav: [], theme: { pack: "default" as const } };
 			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
 			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
 			expect(css).toContain("hsl(220 84% 50%)");
@@ -155,11 +167,12 @@ describe("NextraRenderer", () => {
 		expect(new NextraRenderer().getCacheDirs("/build")).toEqual([join("/build", ".next")]);
 	});
 
-	it("generateNavigation delegates to generateMetaFiles", async () => {
+	it("generateNavigation delegates to generateMetaFiles, passing the rootInjection payload through", async () => {
 		const { generateMetaFiles } = await import("../MetaGenerator.js");
 		const sidebar = { "/": { intro: "Intro" } };
-		await new NextraRenderer().generateNavigation("/content", sidebar);
-		expect(generateMetaFiles).toHaveBeenCalledWith("/content", sidebar);
+		const rootInjection = { apiSpecs: [{ specName: "petstore", title: "Petstore" }] };
+		await new NextraRenderer().generateNavigation("/content", sidebar, rootInjection);
+		expect(generateMetaFiles).toHaveBeenCalledWith("/content", sidebar, rootInjection);
 	});
 
 	it("getContentRules returns safe import prefixes including nextra and react", () => {

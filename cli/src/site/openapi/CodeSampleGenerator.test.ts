@@ -1,11 +1,10 @@
 /**
  * Tests for CodeSampleGenerator.
  *
- * Ported from nextra-generator. Same coverage: Python literal
- * encoding, Go string-literal escaping, end-to-end sample emission with
- * tricky content (strings containing `true`/`false`/`null`, payloads with
- * backticks). New helper-targeted tests added for query-string + auth
- * scheme branches that the original suite covered indirectly.
+ * Coverage: Python literal encoding, Go string-literal escaping, end-to-end
+ * sample emission with tricky content (strings containing `true`/`false`/
+ * `null`, payloads with backticks), plus helper-targeted tests for the
+ * query-string and auth-scheme branches.
  */
 
 import { describe, expect, it } from "vitest";

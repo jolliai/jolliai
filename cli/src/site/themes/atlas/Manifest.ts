@@ -4,8 +4,6 @@
  * Designed to feel materially different from Forge so users have a real
  * reason to pick. Top-nav layout (vs Forge's sidebar-dominant), serif
  * headlines, dark-default mode, airy spacing, masthead-style footer.
- *
- * Mirrors `ATLAS_MANIFEST` from the SaaS Atlas pack.
  */
 
 import type { DefaultThemeMode, FontFamily } from "../../Types.js";

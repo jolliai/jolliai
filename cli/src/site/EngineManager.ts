@@ -14,7 +14,7 @@ import { existsSync, lstatSync, readFileSync, unlinkSync } from "node:fs";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { NEXTRA_DEPENDENCIES, NEXTRA_DEV_DEPENDENCIES } from "./NextraProjectWriter.js";
+import { NEXTRA_DEPENDENCIES, NEXTRA_DEV_DEPENDENCIES, NEXTRA_OVERRIDES } from "./NextraProjectWriter.js";
 import type { NpmRunResult } from "./Types.js";
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
@@ -36,11 +36,16 @@ interface EngineMetadata {
 // ─── computeDepsHash ────────────────────────────────────────────────────────
 
 /**
- * Computes a SHA-256 hash of the dependency version specs.
- * Changes when dependency versions are updated in NextraProjectWriter.
+ * Computes a SHA-256 hash of the dependency version specs (including
+ * `overrides`). Changes when any version is updated in NextraProjectWriter,
+ * which triggers an engine reinstall on the next CLI invocation.
  */
 export function computeDepsHash(): string {
-	const combined = JSON.stringify({ ...NEXTRA_DEPENDENCIES, ...NEXTRA_DEV_DEPENDENCIES });
+	const combined = JSON.stringify({
+		...NEXTRA_DEPENDENCIES,
+		...NEXTRA_DEV_DEPENDENCIES,
+		overrides: NEXTRA_OVERRIDES,
+	});
 	return createHash("sha256").update(combined).digest("hex").slice(0, 16);
 }
 
@@ -98,13 +103,17 @@ export async function ensureEngine(): Promise<NpmRunResult> {
 	try {
 		await mkdir(engineDir, { recursive: true });
 
-		// Write engine package.json
+		// Write engine package.json. Mirrors the per-site package.json shape
+		// (including `overrides`) so the engine resolves the same transitive
+		// graph the customer sees — see `NEXTRA_OVERRIDES` JSDoc for why we
+		// constrain `zod` here.
 		const pkg = {
 			name: "jolli-site-engine",
 			version: "0.0.1",
 			private: true,
 			dependencies: { ...NEXTRA_DEPENDENCIES },
 			devDependencies: { ...NEXTRA_DEV_DEPENDENCIES },
+			overrides: { ...NEXTRA_OVERRIDES },
 		};
 		await writeFile(join(engineDir, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`, "utf-8");
 

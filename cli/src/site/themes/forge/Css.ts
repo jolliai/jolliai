@@ -9,9 +9,8 @@
  * the end of the file so customer accent + sidebar/header bg overrides take
  * precedence via the cascade.
  *
- * Vendored from the SaaS Forge pack. The auth banner block has been stripped (CLI sites don't
- * have JWT auth) and the API-reference companion stylesheet (`buildApiCss`)
- * is intentionally not appended yet — it lands in a follow-up commit so the
+ * The API-reference companion stylesheet is written separately as
+ * `styles/api.css` and imported alongside this file from the layout, so
  * OpenAPI page styling can be reviewed in isolation.
  */
 
@@ -1297,9 +1296,9 @@ ${fontDecl}  --nextra-primary-hue:        ${hue};
 
 /**
  * Build the complete Forge stylesheet (base + customer overrides). The
- * API-reference companion stylesheet that the SaaS appends here is left out
- * for now; OpenAPI pages render with the default Nextra styling until the
- * follow-up commit ports `ApiCss` over.
+ * API-reference companion stylesheet is emitted separately as
+ * `styles/api.css` and imported alongside `themes/forge.css` from the
+ * layout, so the two stylesheets stay independently reviewable.
  */
 export function buildForgeCss(input: ForgeOverrideInput): string {
 	return FORGE_BASE_CSS + buildForgeOverrides(input);

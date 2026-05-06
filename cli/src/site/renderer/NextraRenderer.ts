@@ -10,12 +10,14 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { generateMetaFiles } from "../MetaGenerator.js";
+import { generateMetaFiles, type RootInjectionInput } from "../MetaGenerator.js";
 import { initNextraProject } from "../NextraProjectWriter.js";
 import { runNpmBuild, runNpmDev, type ServerResult } from "../NpmRunner.js";
 import type { OutputFilter } from "../OutputFilter.js";
 import { createOutputFilter as createFilter } from "../OutputFilter.js";
 import type { NpmRunResult, SidebarOverrides, SiteJson } from "../Types.js";
+import { ATLAS_MANIFEST } from "../themes/atlas/Manifest.js";
+import { FORGE_MANIFEST } from "../themes/forge/Manifest.js";
 import { generateApiCss } from "./nextra/ApiCss.js";
 import { emitNextraOpenApiFiles, generateApiComponents } from "./nextra/index.js";
 import type { TemplateFile } from "./nextra/Types.js";
@@ -30,31 +32,25 @@ const PROVIDED_COMPONENTS = new Set(["Fragment", "Callout", "Cards", "Card", "Fi
 const PAGE_COUNT_PATTERN = /Generating static pages.*?(\d+)\/(\d+)/s;
 
 /**
- * Pack manifest defaults — kept in sync with `themes/<pack>/Manifest.ts`.
- * Hardcoded here because importing the manifests from inside `renderer/`
- * would invert the dependency direction (renderer should not depend on
- * pack-specific modules; ApiCss is pack-agnostic).
- */
-const FORGE_DEFAULT_HUE = 228;
-const ATLAS_DEFAULT_HUE = 200;
-
-/**
  * Resolves the accent hue passed to `generateApiCss`. `theme.primaryHue`
- * wins when set; otherwise we fall back to a pack-aware default so the
- * API surface visually matches the pack the customer picked. Returning
- * `undefined` lets `generateApiCss` apply its own internal default (220).
+ * wins when set; otherwise we fall back to the pack manifest's default so
+ * the API surface visually matches the pack the customer picked. Unset
+ * `theme.pack` is treated as Forge (matches the layout dispatcher in
+ * `NextraProjectWriter.generateLayout`); explicit `theme.pack: "default"`
+ * falls through to `generateApiCss`'s internal default (220).
  */
 function resolveApiAccentHue(config: SiteJson): number | undefined {
 	if (typeof config.theme?.primaryHue === "number") {
 		return config.theme.primaryHue;
 	}
-	switch (config.theme?.pack) {
-		case "forge":
-			return FORGE_DEFAULT_HUE;
+	const pack = config.theme?.pack ?? "forge";
+	switch (pack) {
 		case "atlas":
-			return ATLAS_DEFAULT_HUE;
-		default:
+			return ATLAS_MANIFEST.defaults.primaryHue;
+		case "default":
 			return undefined;
+		default:
+			return FORGE_MANIFEST.defaults.primaryHue;
 	}
 }
 
@@ -91,8 +87,12 @@ export class NextraRenderer implements SiteRenderer {
 		return [join(buildDir, ".next")];
 	}
 
-	async generateNavigation(contentDir: string, sidebar?: SidebarOverrides): Promise<void> {
-		await generateMetaFiles(contentDir, sidebar);
+	async generateNavigation(
+		contentDir: string,
+		sidebar?: SidebarOverrides,
+		rootInjection?: RootInjectionInput,
+	): Promise<void> {
+		await generateMetaFiles(contentDir, sidebar, rootInjection);
 	}
 
 	/**
