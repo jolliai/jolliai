@@ -4,6 +4,8 @@
  * Shared type definitions for the `jolli new` and `jolli start` site modules.
  */
 
+import type { OpenApiDocument } from "./openapi/Types.js";
+
 /** File classification used by ContentMirror to categorize source files */
 export type FileType = "markdown" | "openapi" | "image" | "ignored";
 
@@ -66,6 +68,12 @@ export interface MirrorResult {
 	markdownFiles: string[];
 	/** Relative paths of mirrored OpenAPI files */
 	openapiFiles: string[];
+	/**
+	 * Parsed OpenAPI documents keyed by the same relative path that appears in
+	 * `openapiFiles`. Cached during mirroring so the rich-renderer pipeline
+	 * does not need to re-read or re-parse the source files.
+	 */
+	openapiDocs: Record<string, OpenApiDocument>;
 	/** Relative paths of mirrored image files */
 	imageFiles: string[];
 	/** Relative paths of files that were skipped */

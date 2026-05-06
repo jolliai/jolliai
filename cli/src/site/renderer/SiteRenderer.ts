@@ -10,6 +10,7 @@
 
 import type { ServerResult } from "../NpmRunner.js";
 import type { OutputFilter } from "../OutputFilter.js";
+import type { OpenApiPipelineResult } from "../openapi/Types.js";
 import type { NpmRunResult, SidebarOverrides, SiteJson } from "../Types.js";
 
 // ─── ContentRules ───────────────────────────────────────────────────────────
@@ -23,6 +24,29 @@ export interface ContentRules {
 	safeImportPrefixes: string[];
 	/** Component names provided by the framework that don't need imports */
 	providedComponents: Set<string>;
+}
+
+// ─── OpenApiSpecInput ───────────────────────────────────────────────────────
+
+/**
+ * One OpenAPI spec ready for emission. Built once by StartCommand from the
+ * raw documents `ContentMirror` cached, so renderers receive a parsed,
+ * walked, sample-augmented IR and never re-parse the source file.
+ */
+export interface OpenApiSpecInput {
+	/**
+	 * URL slug used in `/api-{specName}/...` routes and in folder names
+	 * under `content/`. Derived from the source file's basename via
+	 * `deriveSpecName`.
+	 */
+	specName: string;
+	/**
+	 * Source-folder relative path (e.g. `api/petstore.yaml`). Useful for
+	 * diagnostics; emitters do not need to read the source file again.
+	 */
+	sourceRelPath: string;
+	/** Pre-built parser + per-operation code samples. */
+	pipeline: OpenApiPipelineResult;
 }
 
 // ─── SiteRenderer ───────────────────────────────────────────────────────────
@@ -50,14 +74,17 @@ export interface SiteRenderer {
 	generateNavigation(contentDir: string, sidebar?: SidebarOverrides): Promise<void>;
 
 	/**
-	 * Render OpenAPI spec files into framework-appropriate pages.
+	 * Render OpenAPI specs into framework-appropriate pages. Each input
+	 * carries a pre-built pipeline (parsed spec + per-operation code
+	 * samples), so this method only emits — it never parses, walks, or
+	 * generates samples itself.
+	 *
+	 * @param contentDir - Absolute path to the framework's content/ root.
+	 * @param publicDir  - Absolute path to the framework's public/ root.
+	 * @param specs      - One entry per OpenAPI source file detected in
+	 *                     the user's docs folder.
 	 */
-	renderOpenApiFiles(
-		sourceRoot: string,
-		contentDir: string,
-		openapiFiles: string[],
-		publicDir?: string,
-	): Promise<void>;
+	renderOpenApiSpecs(contentDir: string, publicDir: string, specs: OpenApiSpecInput[]): Promise<void>;
 
 	/**
 	 * Content rules for ContentMirror's import/component compatibility checks.

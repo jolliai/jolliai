@@ -25,7 +25,7 @@ const {
 	mockInitNextraProject,
 	mockMirrorContent,
 	mockGenerateMetaFiles,
-	mockRenderOpenApiFiles,
+	mockRenderOpenApiSpecs,
 	mockNeedsInstall,
 	mockRunNpmInstall,
 	mockRunNpmBuild,
@@ -38,7 +38,7 @@ const {
 	mockInitNextraProject: vi.fn(),
 	mockMirrorContent: vi.fn(),
 	mockGenerateMetaFiles: vi.fn(),
-	mockRenderOpenApiFiles: vi.fn(),
+	mockRenderOpenApiSpecs: vi.fn(),
 	mockNeedsInstall: vi.fn(),
 	mockRunNpmInstall: vi.fn(),
 	mockRunNpmBuild: vi.fn(),
@@ -68,8 +68,46 @@ vi.mock("../site/MetaGenerator.js", () => ({
 	generateMetaFiles: mockGenerateMetaFiles,
 }));
 
-vi.mock("../site/OpenApiRenderer.js", () => ({
-	renderOpenApiFiles: mockRenderOpenApiFiles,
+// Mock the NextraRenderer class so renderOpenApiSpecs can be observed
+// without exercising the real file-writing path. The other methods
+// (initProject / generateNavigation / runBuild / runDev) already delegate
+// to modules mocked elsewhere in this file.
+vi.mock("../site/renderer/NextraRenderer.js", () => ({
+	NextraRenderer: class {
+		readonly name = "nextra";
+		async initProject(...args: unknown[]) {
+			const { initNextraProject } = await import("../site/NextraProjectWriter.js");
+			return initNextraProject(...(args as Parameters<typeof initNextraProject>));
+		}
+		getCacheDirs() {
+			return [];
+		}
+		async generateNavigation(...args: unknown[]) {
+			const { generateMetaFiles } = await import("../site/MetaGenerator.js");
+			return generateMetaFiles(...(args as Parameters<typeof generateMetaFiles>));
+		}
+		renderOpenApiSpecs = mockRenderOpenApiSpecs;
+		getContentRules() {
+			return { safeImportPrefixes: [], providedComponents: new Set<string>() };
+		}
+		async runBuild(...args: unknown[]) {
+			const { runNpmBuild } = await import("../site/NpmRunner.js");
+			return runNpmBuild(...(args as Parameters<typeof runNpmBuild>));
+		}
+		async runDev(...args: unknown[]) {
+			const { runNpmDev } = await import("../site/NpmRunner.js");
+			return runNpmDev(...(args as Parameters<typeof runNpmDev>));
+		}
+		createOutputFilter() {
+			return { write: vi.fn(), getUrl: vi.fn() };
+		}
+		extractPageCount(buildOutput: string) {
+			// Inline the same regex the real NextraRenderer uses so tests that
+			// assert on "Built N pages" output still see the parsed count.
+			const match = buildOutput.match(/Generating static pages.*?(\d+)\/(\d+)/s);
+			return match ? Number.parseInt(match[2], 10) : undefined;
+		}
+	},
 }));
 
 vi.mock("../site/NpmRunner.js", () => ({
@@ -94,6 +132,7 @@ const DEFAULT_SITE_JSON_RESULT = {
 const DEFAULT_MIRROR_RESULT = {
 	markdownFiles: ["index.md"],
 	openapiFiles: [],
+	openapiDocs: {} as Record<string, unknown>,
 	imageFiles: [],
 	ignoredFiles: [],
 };
@@ -110,19 +149,34 @@ async function makeProgram(): Promise<Command> {
 	return program;
 }
 
+/** Minimal valid OpenApiDocument for tests that exercise the rendering path. */
+const SAMPLE_OPENAPI_DOC = {
+	openapi: "3.1.0",
+	info: { title: "Sample API", version: "1.0.0" },
+	paths: { "/x": { get: { operationId: "getX" } } },
+};
+
 function setupSuccessfulRun(
-	overrides: { needsInstall?: boolean; markdownFiles?: string[]; openapiFiles?: string[] } = {},
+	overrides: {
+		needsInstall?: boolean;
+		markdownFiles?: string[];
+		openapiFiles?: string[];
+		openapiDocs?: Record<string, unknown>;
+	} = {},
 ): void {
 	mockExistsSync.mockReturnValue(true);
 	mockReadSiteJson.mockResolvedValue(DEFAULT_SITE_JSON_RESULT);
 	mockInitNextraProject.mockResolvedValue({ isNew: false });
+	const openapiFiles = overrides.openapiFiles ?? DEFAULT_MIRROR_RESULT.openapiFiles;
+	const openapiDocs = overrides.openapiDocs ?? Object.fromEntries(openapiFiles.map((p) => [p, SAMPLE_OPENAPI_DOC]));
 	mockMirrorContent.mockResolvedValue({
 		...DEFAULT_MIRROR_RESULT,
 		markdownFiles: overrides.markdownFiles ?? DEFAULT_MIRROR_RESULT.markdownFiles,
-		openapiFiles: overrides.openapiFiles ?? DEFAULT_MIRROR_RESULT.openapiFiles,
+		openapiFiles,
+		openapiDocs,
 	});
 	mockGenerateMetaFiles.mockResolvedValue(undefined);
-	mockRenderOpenApiFiles.mockResolvedValue(undefined);
+	mockRenderOpenApiSpecs.mockResolvedValue(undefined);
 	mockNeedsInstall.mockReturnValue(overrides.needsInstall ?? false);
 	mockRunNpmInstall.mockResolvedValue({ success: true, output: "" });
 	mockRunNpmBuild.mockResolvedValue({ success: true, output: "" });
@@ -521,20 +575,23 @@ describe("StartCommand additional branches", () => {
 		consoleErrorSpy.mockRestore();
 	});
 
-	it("renders OpenAPI files when openapiFiles is non-empty", async () => {
+	it("renders OpenAPI specs when openapiFiles is non-empty", async () => {
 		setupSuccessfulRun({ openapiFiles: ["api/spec.yaml"] });
 		const program = await makeProgram();
 		await program.parseAsync(["build", "/my-docs"], { from: "user" });
 
-		expect(mockRenderOpenApiFiles).toHaveBeenCalledOnce();
+		expect(mockRenderOpenApiSpecs).toHaveBeenCalledOnce();
+		const [, , specs] = mockRenderOpenApiSpecs.mock.calls[0] as [string, string, Array<{ specName: string }>];
+		expect(specs).toHaveLength(1);
+		expect(specs[0].specName).toBe("spec");
 	});
 
-	it("does not render OpenAPI files when openapiFiles is empty", async () => {
+	it("does not render OpenAPI specs when openapiFiles is empty", async () => {
 		setupSuccessfulRun({ openapiFiles: [] });
 		const program = await makeProgram();
 		await program.parseAsync(["build", "/my-docs"], { from: "user" });
 
-		expect(mockRenderOpenApiFiles).not.toHaveBeenCalled();
+		expect(mockRenderOpenApiSpecs).not.toHaveBeenCalled();
 	});
 
 	it("includes downgraded count in mirrored message", async () => {

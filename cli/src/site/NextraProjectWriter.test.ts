@@ -79,12 +79,6 @@ describe("NextraProjectWriter.generatePackageJson", () => {
 		expect(pkg.dependencies).toHaveProperty("react-dom");
 	});
 
-	it("includes 'swagger-ui-react' dependency", async () => {
-		const { generatePackageJson } = await import("./NextraProjectWriter.js");
-		const pkg = JSON.parse(generatePackageJson());
-		expect(pkg.dependencies).toHaveProperty("swagger-ui-react");
-	});
-
 	it("includes 'pagefind' dependency", async () => {
 		const { generatePackageJson } = await import("./NextraProjectWriter.js");
 		const pkg = JSON.parse(generatePackageJson());
@@ -226,6 +220,13 @@ describe("NextraProjectWriter.generateLayout", () => {
 		expect(result).toContain("Test");
 		expect(result).toContain("Desc");
 	});
+
+	it("imports the API stylesheet alongside Nextra's theme stylesheet", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout(SAMPLE_CONFIG);
+		expect(result).toContain("'nextra-theme-docs/style.css'");
+		expect(result).toContain("'../styles/api.css'");
+	});
 });
 
 // ─── generateMdxComponents unit tests ────────────────────────────────────────
@@ -298,6 +299,13 @@ describe("NextraProjectWriter.generateTsConfig", () => {
 		const { generateTsConfig } = await import("./NextraProjectWriter.js");
 		const tsconfig = JSON.parse(generateTsConfig());
 		expect(tsconfig.compilerOptions.jsx).toBe("preserve");
+	});
+
+	it("declares the @/* path alias mapping to the build root", async () => {
+		const { generateTsConfig } = await import("./NextraProjectWriter.js");
+		const tsconfig = JSON.parse(generateTsConfig());
+		expect(tsconfig.compilerOptions.baseUrl).toBe(".");
+		expect(tsconfig.compilerOptions.paths).toEqual({ "@/*": ["./*"] });
 	});
 });
 
@@ -476,7 +484,6 @@ describe("NextraProjectWriter.initNextraProject", () => {
 		expect(pkg.dependencies).toHaveProperty("nextra-theme-docs");
 		expect(pkg.dependencies).toHaveProperty("react");
 		expect(pkg.dependencies).toHaveProperty("react-dom");
-		expect(pkg.dependencies).toHaveProperty("swagger-ui-react");
 		expect(pkg.dependencies).toHaveProperty("pagefind");
 	});
 
@@ -611,15 +618,7 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 	it("generatePackageJson always includes all required dependencies", async () => {
 		const { generatePackageJson } = await import("./NextraProjectWriter.js");
 
-		const requiredDeps = [
-			"next",
-			"nextra",
-			"nextra-theme-docs",
-			"react",
-			"react-dom",
-			"swagger-ui-react",
-			"pagefind",
-		];
+		const requiredDeps = ["next", "nextra", "nextra-theme-docs", "react", "react-dom", "pagefind"];
 
 		fc.assert(
 			fc.property(
