@@ -26,6 +26,18 @@ export {
 } from "../../../cli/src/core/SummaryFormat.js";
 
 import { formatDate as coreFormatDate } from "../../../cli/src/core/SummaryFormat.js";
+import { sanitizeBranchSlug } from "../util/GitRemoteUtils.js";
+
+// ─── Push contract: relativePath construction (server plan §8) ───────────────
+
+/**
+ * Returns the `relativePath` for any push: `<branchSlug>`. Summary, plan, and
+ * note docs all share this flat per-branch path; the server distinguishes them
+ * via the body's `docType` field and writes it to `sourceMetadata.docType`.
+ */
+export function buildBranchRelativePath(branch: string | undefined): string {
+	return sanitizeBranchSlug(branch);
+}
 
 // ─── HTML escaping ────────────────────────────────────────────────────────────
 

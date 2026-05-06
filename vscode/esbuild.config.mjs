@@ -62,6 +62,11 @@ const extensionOptions = {
 		"import.meta.url": "__jmImportMetaUrl",
 		__PKG_VERSION__: JSON.stringify(jmPkg.version),
 		__CLI_PKG_VERSION__: JSON.stringify(cliPkg.version),
+		// `x-jolli-client` kind. The Extension bundle never directly emits this
+		// header (it builds its own from ClientInfo.ts), but anything it
+		// inlines from cli/src must self-identify as the surface it ships
+		// under. The version half is already injected as __PKG_VERSION__.
+		__JOLLI_CLIENT_KIND__: JSON.stringify("vscode-plugin"),
 	},
 };
 
@@ -98,6 +103,13 @@ const cliOptions = {
 		"import.meta.url": "__jmImportMetaUrl",
 		__PKG_VERSION__: JSON.stringify(jmPkg.version),
 		__CLI_PKG_VERSION__: JSON.stringify(cliPkg.version),
+		// `x-jolli-client` kind for hook scripts and the bundled CLI: this CLI
+		// code is shipped *as part of* the VSCode plugin, so it must
+		// self-identify as `vscode-plugin/<vscode-version>` on the wire — not
+		// `cli/<vscode-version>` (kind would be wrong) and not
+		// `cli/<cli-package-version>` (server would gate it as native CLI).
+		// The version half pairs with __PKG_VERSION__ above (= jmPkg.version).
+		__JOLLI_CLIENT_KIND__: JSON.stringify("vscode-plugin"),
 	},
 };
 

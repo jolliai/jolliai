@@ -13,3 +13,21 @@ declare const __PKG_VERSION__: string;
  * the right number even after CLI / VSCode versions diverge.
  */
 declare const __CLI_PKG_VERSION__: string;
+
+/**
+ * Surface kind sent in the `x-jolli-client` header alongside the surface's
+ * version: wire format is `<__JOLLI_CLIENT_KIND__>/<__PKG_VERSION__>`. The
+ * kind mirrors `ClientInfo` in vscode/intellij — `"cli"`, `"vscode-plugin"`,
+ * or `"intellij-plugin"` — and lets the server route min-version gating to
+ * the right surface. Without this, vscode-bundled hooks would self-identify
+ * as `cli` and trip the wrong gate (a vscode-only user would be told to
+ * upgrade a CLI they never installed, or worse, slip past the upgrade prompt
+ * entirely because the version number reflects the surface, not the bundled
+ * CLI code).
+ *
+ * The version half of the wire identity is already covered by `__PKG_VERSION__`
+ * (which each bundler defines as the surface's own version), so we don't
+ * also inject a separate `__JOLLI_CLIENT_VERSION__` — that would be a
+ * structural duplicate.
+ */
+declare const __JOLLI_CLIENT_KIND__: "cli" | "vscode-plugin" | "intellij-plugin";

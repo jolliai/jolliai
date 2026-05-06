@@ -146,20 +146,17 @@ function sanitizeTitle(title: string): string {
 
 /** Builds the memory document title for pushing to Jolli Space. */
 export function buildPushTitle(summary: CommitSummary): string {
-	const base = buildPanelTitle(summary);
-	return sanitizeTitle(`${base} · ${summary.commitMessage}`);
+	return sanitizeTitle(summary.commitMessage);
 }
 
 /** Builds the plan document title for pushing to Jolli Space. */
-export function buildPlanPushTitle(summary: CommitSummary, planTitle: string): string {
-	const base = buildPanelTitle(summary);
-	return sanitizeTitle(`${base} · ${planTitle}`);
+export function buildPlanPushTitle(_summary: CommitSummary, planTitle: string): string {
+	return sanitizeTitle(planTitle);
 }
 
 /** Builds the note document title for pushing to Jolli Space. */
-export function buildNotePushTitle(summary: CommitSummary, noteTitle: string): string {
-	const base = buildPanelTitle(summary);
-	return sanitizeTitle(`${base} · ${noteTitle}`);
+export function buildNotePushTitle(_summary: CommitSummary, noteTitle: string): string {
+	return sanitizeTitle(noteTitle);
 }
 
 // ─── Topic collection ─────────────────────────────────────────────────────────

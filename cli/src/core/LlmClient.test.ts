@@ -270,12 +270,82 @@ describe("LlmClient", () => {
 						"Content-Type": "application/json",
 						Authorization: "Bearer sk-jol-test.secret",
 						"x-org-slug": "eng",
+						"x-jolli-client": expect.stringMatching(/^cli\//),
 					}),
 				}),
 			);
 			expect(result.text).toBe("proxy result");
 			expect(result.inputTokens).toBe(30);
 			expect(result.outputTokens).toBe(5);
+		});
+
+		// Pins the build-time identity in the `x-jolli-client` header. Kind
+		// comes from `__JOLLI_CLIENT_KIND__`, version from `__PKG_VERSION__` —
+		// both are baked in at bundle time by either vite (CLI build) or
+		// esbuild (VSCode build). The two cases below exercise both paths via
+		// `vi.resetModules()` + `vi.stubGlobal(...)` so a future builder change
+		// can't silently regress to e.g. `cli/<vscode-version>`.
+		describe("x-jolli-client identity is bundler-driven", () => {
+			it("reports the cli kind and cli version under a CLI build", async () => {
+				vi.resetModules();
+				vi.stubGlobal("__JOLLI_CLIENT_KIND__", "cli");
+				vi.stubGlobal("__PKG_VERSION__", "0.98.0");
+				vi.stubGlobal("fetch", fetchSpy);
+				const { callLlm: callLlmFresh } = await import("./LlmClient.js");
+
+				await callLlmFresh({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					jolliApiKey: "sk-jol-test.secret",
+				});
+
+				expect(fetchSpy).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.objectContaining({
+						headers: expect.objectContaining({
+							"x-jolli-client": "cli/0.98.0",
+						}),
+					}),
+				);
+			});
+
+			it("reports vscode-plugin and the VSCode version under a VSCode-bundled build, even when the inlined CLI code is older", async () => {
+				vi.resetModules();
+				// Reproduce the VSCode esbuild path: kind is the surface
+				// (`vscode-plugin`), and __PKG_VERSION__ is the VSCode
+				// extension version (NOT the cli/package.json version of the
+				// bundled CLI code, which is what __CLI_PKG_VERSION__ holds).
+				vi.stubGlobal("__JOLLI_CLIENT_KIND__", "vscode-plugin");
+				vi.stubGlobal("__PKG_VERSION__", "0.98.17");
+				// Also set __CLI_PKG_VERSION__ to the older CLI code version
+				// — the test would catch a regression that read this token
+				// instead: any "0.98.0" in the header would mean we're
+				// advertising the inlined CLI code version under a VSCode
+				// surface, which is also wrong.
+				vi.stubGlobal("__CLI_PKG_VERSION__", "0.98.0");
+				vi.stubGlobal("fetch", fetchSpy);
+				const { callLlm: callLlmFresh } = await import("./LlmClient.js");
+
+				await callLlmFresh({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					jolliApiKey: "sk-jol-test.secret",
+				});
+
+				expect(fetchSpy).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.objectContaining({
+						headers: expect.objectContaining({
+							"x-jolli-client": "vscode-plugin/0.98.17",
+						}),
+					}),
+				);
+			});
+
+			// Note: the cli/dev fallback (when neither global is defined, e.g.
+			// `tsx`-driven dev runs) is implicitly exercised by every other
+			// test in this file, which all hit the default `^cli\/` matcher
+			// without stubbing these globals.
 		});
 
 		it("attaches an AbortSignal to bound proxy fetch wall time", async () => {

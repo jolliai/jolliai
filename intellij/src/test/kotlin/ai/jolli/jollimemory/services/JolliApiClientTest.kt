@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.services
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldMatch
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -166,7 +167,6 @@ class JolliApiClientTest {
         payload.branch shouldBe null
         payload.subFolder shouldBe null
         payload.docId shouldBe null
-        payload.pluginVersion shouldBe null
     }
 
     @Test
@@ -189,5 +189,18 @@ class JolliApiClientTest {
         meta.t shouldBe "t"
         meta.u shouldBe "u"
         meta.o shouldBe "o"
+    }
+
+    // ── pluginVersion (classpath resource baked by processResources) ────
+
+    @Nested
+    inner class PluginVersion {
+        @Test
+        fun `pluginVersion is populated from build-time resource`() {
+            // Asserts the processResources expand step ran and produced a real
+            // semver — not the 0.0.0 fallback that signals a packaging bug.
+            JolliApiClient.pluginVersion shouldMatch Regex("""^\d+\.\d+\.\d+$""")
+            JolliApiClient.pluginVersion shouldNotBe "0.0.0"
+        }
     }
 }

@@ -11,22 +11,33 @@
  * Handles two URL patterns for multi-tenant support:
  * - Path-based (dev): "https://jolli-local.me/test1/" → calls /api/push/... with X-Tenant-Slug header
  * - Subdomain-based (prod): "https://test1.jolli.ai" → subdomain resolved by backend
+ *
+ * Implements the JOLLI-1335 push contract:
+ * - Sends `x-jolli-client: <kind>/<version>` header (e.g. `vscode-plugin/1.2.3`)
+ *   so the server can identify the caller, gate on version, and route through
+ *   the per-repo binding flow without parsing the body. (Here `<kind>` is the
+ *   *client* kind — distinct from the body's `docType` field below.)
+ * - Sends `repoUrl` (canonical, normalized — see GitRemoteUtils) and
+ *   `relativePath` (flat — `<branchSlug>` for all kinds) in the body so the
+ *   server can place the doc under `repoFolder → branchSlug`.
+ * - Sends `docType: "summary" | "plan" | "note"` in the body. With the flat
+ *   path layout this is the sole disambiguator the server uses to set
+ *   `sourceMetadata.docType` and route TreeItem icons on the frontend.
+ * - Maps `412 binding_required` → `BindingRequiredError` and
+ *   `409 binding_already_exists` → `BindingAlreadyExistsError` so the call
+ *   site can run the chooser flow.
  */
 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-// JolliPushService reads the key's embedded tenant/org metadata to route
-// requests — it does NOT enforce the origin allowlist. Allowlist validation
-// belongs to save-time paths (SettingsWebviewPanel.handleApplySettings,
-// AuthService.handleAuthCallback via CLI saveAuthCredentials). Those callers
-// import `validateJolliApiKey` directly from cli/src/core/JolliApiUtils.js.
 import {
 	type JolliApiKeyMeta,
 	parseBaseUrl,
 	parseJolliApiKey,
 } from "../../../cli/src/core/JolliApiUtils.js";
+import { type ClientInfo, VSCODE_CLIENT_INFO } from "./ClientInfo.js";
 
-export { parseJolliApiKey, type JolliApiKeyMeta };
+export { parseJolliApiKey, type JolliApiKeyMeta, type ClientInfo };
 
 /** Thrown when the server rejects the request due to outdated plugin version (HTTP 426). */
 export class PluginOutdatedError extends Error {
@@ -36,18 +47,63 @@ export class PluginOutdatedError extends Error {
 	}
 }
 
+/**
+ * Thrown when the server returns 412 binding_required — the repo at `repoUrl`
+ * has no JM space binding yet. The call site should run the chooser flow
+ * (BindingChooserWebviewPanel), register a binding, and retry the push.
+ */
+export class BindingRequiredError extends Error {
+	readonly repoUrl: string;
+	constructor(repoUrl: string, message?: string) {
+		super(message ?? `binding_required for ${repoUrl}`);
+		this.name = "BindingRequiredError";
+		this.repoUrl = repoUrl;
+	}
+}
+
+/**
+ * Thrown when a `POST /api/jolli-memory/bindings` collides with an existing
+ * binding (server's `UNIQUE(org_id, repo_url)`). The body carries the winner's
+ * binding info — the chooser uses it to resolve gracefully.
+ */
+export class BindingAlreadyExistsError extends Error {
+	readonly winner: BindingExistsBody;
+	constructor(body: BindingExistsBody, message?: string) {
+		super(message ?? "binding_already_exists");
+		this.name = "BindingAlreadyExistsError";
+		this.winner = body;
+	}
+}
+
+/** Body shape returned alongside `409 binding_already_exists`. */
+export interface BindingExistsBody {
+	readonly error: "binding_already_exists";
+	readonly id?: number;
+	readonly jmSpaceId?: number;
+	readonly jmSpaceName?: string;
+	readonly repoName?: string;
+	readonly repoUrl?: string;
+}
+
 /** Payload sent to the Jolli push endpoint */
 export interface JolliPushPayload {
 	readonly title: string;
 	readonly content: string;
 	readonly commitHash: string;
+	/**
+	 * Document type — distinct from the *client* kind in `x-jolli-client`.
+	 * With the flat per-branch layout, this is the sole disambiguator the
+	 * server uses to set `sourceMetadata.docType` and to drive TreeItem icons.
+	 * Required: a missing value would silently mis-tag every push.
+	 */
+	readonly docType: "summary" | "plan" | "note";
 	readonly branch?: string;
-	/** Optional subfolder name under the push target folder (e.g. "Plans") */
-	readonly subFolder?: string;
 	/** Server-side document ID for direct update on subsequent pushes. */
 	readonly docId?: number;
-	/** Plugin version string (e.g. "0.87.1"). Sent for server-side version gate. */
-	readonly pluginVersion?: string;
+	/** Canonical, normalized remote URL — server's identity key for the repo. */
+	readonly repoUrl?: string;
+	/** Folder chain below the repo folder — flat `<branchSlug>` for all docTypes. No leading `/`. */
+	readonly relativePath?: string;
 }
 
 /** Response from a successful push */
@@ -56,6 +112,45 @@ export interface JolliPushResult {
 	readonly docId: number;
 	readonly jrn: string;
 	readonly created: boolean;
+}
+
+/** Body shape the server emits for non-2xx responses we explicitly handle. */
+interface ErrorBody {
+	error?: string;
+	message?: string;
+	repoUrl?: string;
+}
+
+/**
+ * Builds the standard request headers for any Jolli Memory API call:
+ * Authorization, Content-Type, Content-Length, the multi-tenant
+ * `x-tenant-slug` / `x-org-slug` headers when applicable, and the
+ * `x-jolli-client` header identifying this plugin (read once from
+ * `package.json` via `VSCODE_CLIENT_INFO`).
+ *
+ * Shared between push (this file) and the new endpoints in JolliMemoryApiService.
+ */
+export function buildJolliApiHeaders(params: {
+	apiKey: string;
+	keyMeta: JolliApiKeyMeta | null;
+	tenantSlug: string | undefined;
+	bodyByteLength?: number;
+}): Record<string, string | number> {
+	const headers: Record<string, string | number> = {
+		"Content-Type": "application/json",
+		Authorization: `Bearer ${params.apiKey}`,
+		"x-jolli-client": `${VSCODE_CLIENT_INFO.kind}/${VSCODE_CLIENT_INFO.version}`,
+	};
+	if (params.bodyByteLength !== undefined) {
+		headers["Content-Length"] = params.bodyByteLength;
+	}
+	if (params.tenantSlug) {
+		headers["x-tenant-slug"] = params.tenantSlug;
+	}
+	if (params.keyMeta?.o) {
+		headers["x-org-slug"] = params.keyMeta.o;
+	}
+	return headers;
 }
 
 /**
@@ -72,7 +167,6 @@ export function pushToJolli(
 	apiKey: string,
 	payload: JolliPushPayload,
 ): Promise<JolliPushResult> {
-	// Parse key metadata once — used for base URL fallback and org routing
 	const keyMeta = parseJolliApiKey(apiKey);
 	const resolvedBaseUrl = baseUrl ?? keyMeta?.u;
 	if (!resolvedBaseUrl) {
@@ -83,31 +177,17 @@ export function pushToJolli(
 		);
 	}
 	const parsed = parseBaseUrl(resolvedBaseUrl);
-	// Always call /api/push/jollimemory at the origin (without tenant path prefix)
 	const targetUrl = new URL("/api/push/jollimemory", parsed.origin);
 	const body = JSON.stringify(payload);
 	const isHttps = targetUrl.protocol === "https:";
 
-	// Build request headers
-	const headers: Record<string, string | number> = {
-		"Content-Type": "application/json",
-		"Content-Length": Buffer.byteLength(body),
-		Authorization: `Bearer ${apiKey}`,
-	};
+	const headers = buildJolliApiHeaders({
+		apiKey,
+		keyMeta,
+		tenantSlug: parsed.tenantSlug,
+		bodyByteLength: Buffer.byteLength(body),
+	});
 
-	// For path-based multi-tenancy (e.g. /test1/), send the tenant slug as a header
-	// so the backend TenantMiddleware can resolve the tenant without JWT or subdomain.
-	if (parsed.tenantSlug) {
-		headers["x-tenant-slug"] = parsed.tenantSlug;
-	}
-
-	// Send org slug so TenantMiddleware routes to the correct org schema.
-	// Old keys without `o` omit this header, causing a fallback to the default org.
-	if (keyMeta?.o) {
-		headers["x-org-slug"] = keyMeta.o;
-	}
-
-	// Use http or https depending on the URL scheme.
 	const requestFn = isHttps ? httpsRequest : httpRequest;
 
 	return new Promise<JolliPushResult>((resolve, reject) => {
@@ -123,10 +203,7 @@ export function pushToJolli(
 				res.on("end", () => {
 					const raw = Buffer.concat(chunks).toString("utf-8");
 					try {
-						const json = JSON.parse(raw) as JolliPushResult & {
-							error?: string;
-							message?: string;
-						};
+						const json = JSON.parse(raw) as JolliPushResult & ErrorBody;
 						const status = res.statusCode ?? 0;
 						if (status >= 200 && status < 300) {
 							resolve(json);
@@ -135,6 +212,23 @@ export function pushToJolli(
 								new PluginOutdatedError(
 									json.message ??
 										"Plugin version is outdated. Please update to the latest version.",
+								),
+							);
+						} else if (status === 412 && json.error === "binding_required") {
+							reject(
+								new BindingRequiredError(
+									json.repoUrl ?? payload.repoUrl ?? "",
+									json.message,
+								),
+							);
+						} else if (
+							status === 409 &&
+							json.error === "binding_already_exists"
+						) {
+							reject(
+								new BindingAlreadyExistsError(
+									json as unknown as BindingExistsBody,
+									json.message,
 								),
 							);
 						} else {
@@ -178,15 +272,11 @@ export function deleteFromJolli(
 	const targetUrl = new URL(`/api/push/jollimemory/${docId}`, parsed.origin);
 	const isHttps = targetUrl.protocol === "https:";
 
-	const headers: Record<string, string> = {
-		Authorization: `Bearer ${apiKey}`,
-	};
-	if (parsed.tenantSlug) {
-		headers["x-tenant-slug"] = parsed.tenantSlug;
-	}
-	if (keyMeta?.o) {
-		headers["x-org-slug"] = keyMeta.o;
-	}
+	const headers = buildJolliApiHeaders({
+		apiKey,
+		keyMeta,
+		tenantSlug: parsed.tenantSlug,
+	});
 
 	const requestFn = isHttps ? httpsRequest : httpRequest;
 	const options: Record<string, unknown> = {
@@ -199,7 +289,6 @@ export function deleteFromJolli(
 
 	return new Promise((resolve, reject) => {
 		const req = requestFn(options, (res) => {
-			// Consume response body
 			res.resume();
 			if (res.statusCode === 204 || res.statusCode === 200) {
 				resolve();

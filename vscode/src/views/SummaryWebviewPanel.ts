@@ -50,7 +50,6 @@ import type {
 	PlanReference,
 	StoredTranscript,
 } from "../../../cli/src/Types.js";
-import { version as pluginVersion } from "../../package.json";
 import {
 	archiveNoteForCommit,
 	ignoreNote,
@@ -64,6 +63,7 @@ import {
 	unassociatePlanFromCommit,
 } from "../core/PlanService.js";
 import {
+	BindingRequiredError,
 	deleteFromJolli,
 	PluginOutdatedError,
 	parseJolliApiKey,
@@ -76,8 +76,13 @@ import {
 	handleUpdatePr,
 	wrapWithMarkers,
 } from "../services/PrCommentService.js";
+import {
+	deriveRepoNameFromUrl,
+	getCanonicalRepoUrl,
+} from "../util/GitRemoteUtils.js";
 import { log } from "../util/Logger.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
+import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import {
 	buildE2eTestSection,
 	buildHtml,
@@ -88,6 +93,7 @@ import {
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 import { buildPrMarkdown } from "./SummaryPrMarkdownBuilder.js";
 import {
+	buildBranchRelativePath,
 	buildNotePushTitle,
 	buildPanelTitle,
 	buildPlanPushTitle,
@@ -180,6 +186,7 @@ export class SummaryWebviewPanel {
 	private static commitPanels: Map<string, SummaryWebviewPanel> = new Map();
 
 	private readonly panel: vscode.WebviewPanel;
+	private readonly extensionUri: vscode.Uri;
 	private readonly workspaceRoot: string;
 	private readonly source: SummaryPanelSource;
 	/** Commit hash the panel is scoped to — used as the key in `commitPanels`. */
@@ -209,6 +216,7 @@ export class SummaryWebviewPanel {
 		source: SummaryPanelSource,
 		commitHash: string,
 	) {
+		this.extensionUri = extensionUri;
 		this.workspaceRoot = workspaceRoot;
 		this.source = source;
 		this.commitHash = commitHash;
@@ -821,10 +829,17 @@ export class SummaryWebviewPanel {
 	/**
 	 * Runs the Jolli Cloud push (plans, notes, summary, orphan cleanup).
 	 * Returns the outcome so the caller can post the result message.
+	 *
+	 * On `412 binding_required` the plugin opens BindingChooserWebviewPanel for
+	 * the user to pick or create a JM space, registers the binding server-side,
+	 * and retries the push exactly once. The `retried` flag prevents infinite
+	 * recursion if a second 412 fires after binding registration (which would
+	 * indicate a server bug).
 	 */
 	private async runJolliPush(
 		summary: CommitSummary,
 		jolliApiKey: string | undefined,
+		retried = false,
 	): Promise<{ url: string; docId: number }> {
 		if (!jolliApiKey) {
 			vscode.window.showWarningMessage(
@@ -846,6 +861,7 @@ export class SummaryWebviewPanel {
 		this.panel.webview.postMessage({ command: "pushStarted" });
 
 		const baseUrl = resolvedBaseUrl.replace(/\/+$/, "");
+		const repoUrl = await getCanonicalRepoUrl(this.workspaceRoot);
 
 		try {
 			// Step 1: Upload associated plans and notes
@@ -854,12 +870,14 @@ export class SummaryWebviewPanel {
 				resolvedBaseUrl,
 				baseUrl,
 				jolliApiKey,
+				repoUrl,
 			);
 			const noteUrls = await this.pushNotes(
 				summary,
 				resolvedBaseUrl,
 				baseUrl,
 				jolliApiKey,
+				repoUrl,
 			);
 
 			// Step 2: Update plan/note URLs in summary before building markdown
@@ -880,9 +898,11 @@ export class SummaryWebviewPanel {
 				title,
 				content: markdown,
 				commitHash: summary.commitHash,
+				docType: "summary",
 				branch: summary.branch,
 				...(summary.jolliDocId && { docId: summary.jolliDocId }),
-				pluginVersion,
+				repoUrl,
+				relativePath: buildBranchRelativePath(summary.branch),
 			});
 
 			// Build the full article URL using docId query param (matches frontend routing)
@@ -930,6 +950,33 @@ export class SummaryWebviewPanel {
 
 			return { url: fullUrl, docId: result.docId };
 		} catch (err: unknown) {
+			if (err instanceof BindingRequiredError && !retried) {
+				const outcome = await BindingChooserWebviewPanel.openAndAwait({
+					extensionUri: this.extensionUri,
+					baseUrl,
+					apiKey: jolliApiKey,
+					repoUrl,
+					suggestedRepoName: deriveRepoNameFromUrl(repoUrl),
+				});
+				if (outcome.kind === "selected") {
+					return this.runJolliPush(summary, jolliApiKey, true);
+				}
+				if (outcome.kind === "anotherOpen") {
+					// Another summary panel for the same repo already opened the
+					// chooser; that panel is the one driving the binding decision.
+					// Tell this caller to wait there and re-push afterwards — using
+					// "Push cancelled" here would be misleading (the user never
+					// cancelled anything in this panel).
+					vscode.window.showInformationMessage(
+						"A Memory space chooser is already open for this repo. Finish there, then click the Jolli push button again.",
+					);
+				} else {
+					vscode.window.showErrorMessage(
+						"Push cancelled — no Memory space chosen for this repo. Click the Jolli push button again when you're ready.",
+					);
+				}
+				throw err;
+			}
 			if (err instanceof PluginOutdatedError) {
 				vscode.window.showErrorMessage(
 					"Push failed — your Jolli Memory plugin is outdated. Please update to the latest version.",
@@ -1073,6 +1120,7 @@ export class SummaryWebviewPanel {
 		resolvedBaseUrl: string,
 		baseUrl: string,
 		apiKey: string,
+		repoUrl: string,
 	): Promise<
 		Array<{ slug: string; title: string; url: string; docId: number }>
 	> {
@@ -1107,10 +1155,11 @@ export class SummaryWebviewPanel {
 				title: buildPlanPushTitle(summary, plan.title),
 				content: planContent,
 				commitHash: summary.commitHash,
+				docType: "plan",
 				branch: summary.branch,
-				subFolder: "Plans & Notes",
 				...(plan.jolliPlanDocId && { docId: plan.jolliPlanDocId }),
-				pluginVersion,
+				repoUrl,
+				relativePath: buildBranchRelativePath(summary.branch),
 			});
 			const planUrl = `${baseUrl}/articles?doc=${planResult.docId}`;
 			log.info(
@@ -1133,6 +1182,7 @@ export class SummaryWebviewPanel {
 		resolvedBaseUrl: string,
 		baseUrl: string,
 		apiKey: string,
+		repoUrl: string,
 	): Promise<Array<{ id: string; title: string; url: string; docId: number }>> {
 		const allNotes = summary.notes ?? [];
 		log.info(
@@ -1175,10 +1225,11 @@ export class SummaryWebviewPanel {
 				title: buildNotePushTitle(summary, note.title),
 				content: noteContent,
 				commitHash: summary.commitHash,
+				docType: "note",
 				branch: summary.branch,
-				subFolder: "Plans & Notes",
 				...(note.jolliNoteDocId && { docId: note.jolliNoteDocId }),
-				pluginVersion,
+				repoUrl,
+				relativePath: buildBranchRelativePath(summary.branch),
 			});
 			const noteUrl = `${baseUrl}/articles?doc=${noteResult.docId}`;
 			results.push({
