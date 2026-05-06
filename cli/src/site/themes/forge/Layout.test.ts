@@ -16,7 +16,6 @@ import { FORGE_MANIFEST } from "./Manifest.js";
 const BASE_INPUT = {
 	title: "Acme Docs",
 	description: "API reference + guides",
-	nav: [],
 	primaryHue: FORGE_MANIFEST.defaults.primaryHue,
 	defaultTheme: FORGE_MANIFEST.defaults.defaultTheme,
 	fontFamily: FORGE_MANIFEST.defaults.fontFamily,
@@ -29,7 +28,6 @@ describe("resolveForgeLayoutInput", () => {
 		const result = resolveForgeLayoutInput({
 			title: "T",
 			description: "D",
-			nav: [],
 			theme: undefined,
 			legacyFavicon: undefined,
 		});
@@ -42,7 +40,6 @@ describe("resolveForgeLayoutInput", () => {
 		const result = resolveForgeLayoutInput({
 			title: "T",
 			description: "D",
-			nav: [],
 			theme: { primaryHue: 200, defaultTheme: "dark", fontFamily: "source-serif" },
 			legacyFavicon: undefined,
 		});
@@ -55,7 +52,6 @@ describe("resolveForgeLayoutInput", () => {
 		const result = resolveForgeLayoutInput({
 			title: "T",
 			description: "D",
-			nav: [],
 			theme: { favicon: "/theme.ico" },
 			legacyFavicon: "/legacy.ico",
 		});
@@ -66,7 +62,6 @@ describe("resolveForgeLayoutInput", () => {
 		const result = resolveForgeLayoutInput({
 			title: "T",
 			description: "D",
-			nav: [],
 			theme: { favicon: "/theme.ico" },
 			legacyFavicon: undefined,
 		});
@@ -84,7 +79,6 @@ describe("resolveForgeLayoutInput", () => {
 		const result = resolveForgeLayoutInput({
 			title: "T",
 			description: "D",
-			nav: [],
 			header,
 			footer,
 			theme: undefined,
@@ -92,6 +86,18 @@ describe("resolveForgeLayoutInput", () => {
 		});
 		expect(result.header).toBe(header);
 		expect(result.footer).toBe(footer);
+	});
+
+	it("propagates theme.logoText and theme.logoDisplay to the resolved input", () => {
+		const result = resolveForgeLayoutInput({
+			title: "T",
+			description: "D",
+			theme: { logoText: "ACME", logoDisplay: "image", logoUrl: "/logo.svg" },
+			legacyFavicon: undefined,
+		});
+		expect(result.logoText).toBe("ACME");
+		expect(result.logoDisplay).toBe("image");
+		expect(result.logoUrl).toBe("/logo.svg");
 	});
 });
 
@@ -175,28 +181,64 @@ describe("generateForgeLayoutTsx", () => {
 		expect(result).toContain('<img src={"/dark.svg"}');
 	});
 
-	it("renders nav items as <a> children of <Navbar> alongside <ThemeSwitch />", () => {
-		const result = generateForgeLayoutTsx({
-			...BASE_INPUT,
-			nav: [
-				{ label: "Guides", href: "/guides" },
-				{ label: "GitHub", href: "https://github.com/acme" },
-			],
-		});
-		expect(result).toContain('href={"/guides"}');
-		expect(result).toContain('{"Guides"}');
-		expect(result).toContain('href={"https://github.com/acme"}');
-		expect(result).toContain('{"GitHub"}');
-		expect(result).toContain("<ThemeSwitch />");
+	it("uses logoText for the logo span when set, instead of title", () => {
+		const result = generateForgeLayoutTsx({ ...BASE_INPUT, logoText: "ACME" });
+		expect(result).toContain('<span>{"ACME"}</span>');
+		expect(result).not.toContain('<span>{"Acme Docs"}</span>');
 	});
 
-	it("sanitizes javascript: URLs in nav hrefs to '#'", () => {
+	it("logoDisplay='text' suppresses the image even when logoUrl is set", () => {
 		const result = generateForgeLayoutTsx({
 			...BASE_INPUT,
-			nav: [{ label: "Bad", href: "javascript:alert(1)" }],
+			logoUrl: "/logo.svg",
+			logoDisplay: "text",
 		});
-		expect(result).not.toMatch(/javascript:alert/i);
-		expect(result).toContain('<a href={"#"}');
+		expect(result).not.toContain("<img ");
+		expect(result).toContain('<span>{"Acme Docs"}</span>');
+	});
+
+	it("logoDisplay='image' suppresses the text span when logoUrl is set", () => {
+		const result = generateForgeLayoutTsx({
+			...BASE_INPUT,
+			logoUrl: "/logo.svg",
+			logoDisplay: "image",
+		});
+		expect(result).toContain("<img ");
+		// The forge-navbar-logo wrapper still wraps the image, but no inner <span> with the title text.
+		expect(result).not.toContain('<span>{"Acme Docs"}</span>');
+	});
+
+	it("logoDisplay='image' falls back to text when logoUrl is unset (avoids empty navbar logo)", () => {
+		const result = generateForgeLayoutTsx({ ...BASE_INPUT, logoDisplay: "image" });
+		expect(result).not.toContain("<img ");
+		expect(result).toContain('<span>{"Acme Docs"}</span>');
+	});
+
+	it("logoDisplay='both' renders image + text together", () => {
+		const result = generateForgeLayoutTsx({
+			...BASE_INPUT,
+			logoUrl: "/logo.svg",
+			logoText: "ACME",
+			logoDisplay: "both",
+		});
+		expect(result).toContain('<img src={"/logo.svg"}');
+		expect(result).toContain('<span>{"ACME"}</span>');
+	});
+
+	it("renders <Navbar> with only <ThemeSwitch /> as children — nav items go through _meta.js", () => {
+		const result = generateForgeLayoutTsx(BASE_INPUT);
+		// New architecture: nav items are NOT spliced into the layout JSX.
+		// MetaGenerator writes them to root _meta.js where Nextra renders
+		// them natively (chevron / hover / mobile drawer). The layout input
+		// no longer carries `nav` at all — enforced at the type level.
+		expect(result).toContain("<Navbar logo={<SiteLogo />}><ThemeSwitch /></Navbar>");
+	});
+
+	it("uses <ScopedNextraLayout> instead of vanilla <Layout>", () => {
+		const result = generateForgeLayoutTsx(BASE_INPUT);
+		expect(result).toContain("import ScopedNextraLayout from '../components/ScopedNextraLayout'");
+		expect(result).toContain("<ScopedNextraLayout");
+		expect(result).toContain("</ScopedNextraLayout>");
 	});
 
 	it("sanitizes javascript: URLs in favicon to '#'", () => {
@@ -220,79 +262,7 @@ describe("generateForgeLayoutTsx", () => {
 		expect(result).toContain('alt={"Acme \\"Tools\\""}');
 	});
 
-	// ── header.items support ─────────────────────────────────────────────────
-
-	it("prefers header.items over legacy nav when both are set", () => {
-		const result = generateForgeLayoutTsx({
-			...BASE_INPUT,
-			nav: [{ label: "FromNav", href: "/nav" }],
-			header: { items: [{ label: "FromHeader", url: "/header" }] },
-		});
-		expect(result).toContain("FromHeader");
-		expect(result).not.toContain("FromNav");
-	});
-
-	it("renders a <details> dropdown when a header item has sub-items", () => {
-		const result = generateForgeLayoutTsx({
-			...BASE_INPUT,
-			header: {
-				items: [
-					{
-						label: "Resources",
-						items: [
-							{ label: "Blog", url: "/blog" },
-							{ label: "Changelog", url: "/changelog" },
-						],
-					},
-				],
-			},
-		});
-		expect(result).toContain("<details");
-		expect(result).toContain("<summary");
-		expect(result).toContain('{"Resources"}');
-		expect(result).toContain('{"Blog"}');
-		expect(result).toContain('href={"/blog"}');
-	});
-
-	it("renders a direct link for header items without sub-items", () => {
-		const result = generateForgeLayoutTsx({
-			...BASE_INPUT,
-			header: { items: [{ label: "Docs", url: "/docs" }] },
-		});
-		expect(result).toContain('href={"/docs"}');
-		expect(result).toContain('{"Docs"}');
-		expect(result).not.toContain("<details");
-	});
-
-	it("falls back to '#' for header items with no url and no sub-items", () => {
-		const result = generateForgeLayoutTsx({
-			...BASE_INPUT,
-			header: { items: [{ label: "Empty" }] },
-		});
-		expect(result).toContain('href={"#"}');
-	});
-
-	it("sanitizes javascript: URLs in header dropdown sub-items", () => {
-		const result = generateForgeLayoutTsx({
-			...BASE_INPUT,
-			header: {
-				items: [{ label: "Menu", items: [{ label: "Bad", url: "javascript:alert(1)" }] }],
-			},
-		});
-		expect(result).not.toMatch(/javascript:alert/i);
-		expect(result).toContain('href={"#"}');
-	});
-
-	it("falls back to legacy nav when header.items is empty", () => {
-		const result = generateForgeLayoutTsx({
-			...BASE_INPUT,
-			nav: [{ label: "NavLink", href: "/nav" }],
-			header: { items: [] },
-		});
-		expect(result).toContain("NavLink");
-	});
-
-	// ── footer support ───────────────────────────────────────────────────────
+	// ── footer (semantic classes — pack CSS targets these) ───────────────────
 
 	it("renders default copyright footer when no footer config is set", () => {
 		const result = generateForgeLayoutTsx(BASE_INPUT);
@@ -300,53 +270,44 @@ describe("generateForgeLayoutTsx", () => {
 		expect(result).toContain("new Date().getFullYear()");
 	});
 
-	it("renders footer copyright text", () => {
+	it("emits forge-footer wrapper class when footer config is set", () => {
 		const result = generateForgeLayoutTsx({
 			...BASE_INPUT,
 			footer: { copyright: "2026 Acme Inc." },
 		});
-		expect(result).toContain("<Footer>");
-		expect(result).toContain('{"2026 Acme Inc."}');
+		expect(result).toContain('className="forge-footer"');
+		expect(result).toContain('className="forge-footer-bottom"');
+		expect(result).toContain('className="forge-footer-copyright"');
+		expect(result).toContain('className="forge-footer-powered"');
+		expect(result).toContain("2026 Acme Inc.");
 	});
 
-	it("renders footer columns with titles and links", () => {
+	it("emits forge-footer-columns and forge-footer-col classes for columns", () => {
 		const result = generateForgeLayoutTsx({
 			...BASE_INPUT,
 			footer: {
 				columns: [
 					{
 						title: "Product",
-						links: [
-							{ label: "Pricing", url: "/pricing" },
-							{ label: "Docs", url: "/docs" },
-						],
+						links: [{ label: "Pricing", url: "/pricing" }],
 					},
 				],
 			},
 		});
-		expect(result).toContain('{"Product"}');
-		expect(result).toContain('{"Pricing"}');
-		expect(result).toContain('href={"/pricing"}');
+		expect(result).toContain('className="forge-footer-columns"');
+		expect(result).toContain('className="forge-footer-col"');
+		expect(result).toContain("Product");
+		expect(result).toContain('href="/pricing"');
 	});
 
-	it("renders footer social links in canonical platform order", () => {
+	it("emits forge-footer-social wrapper for social-icon links", () => {
 		const result = generateForgeLayoutTsx({
 			...BASE_INPUT,
-			footer: { socialLinks: { youtube: "https://yt.example", github: "https://gh.example" } },
+			footer: { socialLinks: { github: "https://gh.example" } },
 		});
-		const ghIdx = result.indexOf("gh.example");
-		const ytIdx = result.indexOf("yt.example");
-		expect(ghIdx).toBeGreaterThan(-1);
-		expect(ytIdx).toBeGreaterThan(-1);
-		expect(ghIdx).toBeLessThan(ytIdx);
-	});
-
-	it("renders default copyright footer when footer has no content", () => {
-		const result = generateForgeLayoutTsx({
-			...BASE_INPUT,
-			footer: { columns: [], socialLinks: {} },
-		});
-		expect(result).toContain("new Date().getFullYear()");
+		expect(result).toContain('className="forge-footer-social"');
+		expect(result).toContain('className="forge-footer-social-github"');
+		expect(result).toContain("https://gh.example");
 	});
 
 	it("sanitizes javascript: URLs in footer links and social links", () => {
@@ -354,10 +315,10 @@ describe("generateForgeLayoutTsx", () => {
 			...BASE_INPUT,
 			footer: {
 				columns: [{ title: "X", links: [{ label: "Bad", url: "javascript:alert(1)" }] }],
-				socialLinks: { github: "data:text/html,evil" },
+				socialLinks: { github: "javascript:evil" },
 			},
 		});
 		expect(result).not.toContain("javascript:alert");
-		expect(result).not.toContain("data:text/html");
+		expect(result).not.toContain("javascript:evil");
 	});
 });

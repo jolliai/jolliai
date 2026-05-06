@@ -5,9 +5,11 @@
  * cream when toggled to light), wider content column, airy spacing, masthead-
  * style footer. Accent color used as ambient glow rather than solid fill.
  *
- * Vendored from the SaaS Atlas pack. The auth banner block has been stripped (CLI sites have no
- * JWT auth) and the API-reference companion stylesheet is consumed via
- * `styles/api.css` from the rich-renderer pipeline rather than appended here.
+ * The auth-banner ruleset is carried even though CLI sites don't currently
+ * render the element — it costs nothing and stays in step with any future
+ * shared-DOM scenario that does emit it. The API-reference companion
+ * stylesheet is written separately as `styles/api.css` and imported
+ * alongside this file from the layout.
  */
 
 const ATLAS_BASE_CSS = `/*
@@ -537,21 +539,37 @@ article hr {
 
 article strong { color: var(--atlas-text-strong) !important; font-weight: 600 !important; }
 
-/* Code — full-bleed, soft surface, no gutter */
+/* Inline code — soft surface pill. Tighter horizontal padding (0.3em) plus a
+   small margin-inline keeps the pill from visually swallowing adjacent letters
+   on tight lines: without the margin, the rounded background can paint right
+   up against neighbouring glyphs and read as if a character is missing.
+   box-decoration-break: clone ensures the pill renders correctly when an
+   inline code span wraps across two lines (each line gets its own padded box
+   instead of one rectangle that spans both). */
 article code:not(pre code) {
   font-size: 0.8125em !important;
   font-weight: 500 !important;
   color: var(--atlas-text-strong) !important;
   background: var(--atlas-border-soft) !important;
   border-radius: 4px !important;
-  padding: 0.15em 0.4em !important;
+  padding: 0.15em 0.3em !important;
+  margin: 0 0.15em !important;
+  -webkit-box-decoration-break: clone !important;
+  box-decoration-break: clone !important;
 }
 
 /* Atlas code blocks — printed-listing style. No card border, no rounded
    corners; instead the block extends past the article column by ~1rem each
    side and is bookended by hairline rules above and below, so code reads
-   like a typeset listing in a print magazine rather than an inset card. */
-.nextra-code {
+   like a typeset listing in a print magazine rather than an inset card.
+
+   The :has(pre) qualifier is critical: Nextra v4 also applies the
+   .nextra-code class to inline code in some contexts, and without the
+   qualifier the negative-margin / position-relative full-bleed treatment
+   leaks onto inline code, visually overlapping adjacent text. (Forge sidesteps
+   this entirely by putting all its full-bleed styling on .nextra-code pre
+   instead of the wrapper — same outcome, different shape.) */
+.nextra-code:has(pre) {
   position: relative !important;
   margin: 2rem -1rem !important;
 }
@@ -966,6 +984,32 @@ footer .atlas-footer-copy {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   AUTH BANNER — yellow alert pattern, slightly warmer in Atlas. CLI sites
+   don't currently render the .jolli-auth-banner element (no JWT auth), but
+   the rule is carried so any future shared-DOM scenario that does emit it
+   keeps the same look without duplicating CSS.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.jolli-auth-banner {
+  width: 100%;
+  background-color: #fef3c7;
+  border-bottom: 1px solid #fcd34d;
+  padding: 8px 16px;
+  font-size: 13px;
+  color: #78350f;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.dark .jolli-auth-banner {
+  background-color: rgba(120, 53, 15, 0.18);
+  border-bottom-color: rgba(202, 138, 4, 0.3);
+  color: #fde68a;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    SEARCH RESULTS DROPDOWN — Nextra portals the dropdown to body level. By
    default it inherits the search input's width (clipping long result titles)
    and stacks below the sidebar (whose left half then paints over the
@@ -1055,9 +1099,9 @@ ${fontDecl}  --nextra-primary-hue:        ${hue};
 
 /**
  * Build the complete Atlas stylesheet (base + customer overrides). The
- * API-reference companion stylesheet that the SaaS appends here is left out
- * — the CLI's rich-renderer writes `styles/api.css` separately and the
- * layout imports it alongside `themes/atlas.css`.
+ * API-reference companion stylesheet is emitted separately as
+ * `styles/api.css` and imported alongside `themes/atlas.css` from the
+ * layout, so the two stylesheets stay independently reviewable.
  */
 export function buildAtlasCss(input: AtlasOverrideInput): string {
 	return ATLAS_BASE_CSS + buildAtlasOverrides(input);

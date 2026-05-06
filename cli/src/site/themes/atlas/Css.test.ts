@@ -54,8 +54,12 @@ describe("buildAtlasCss", () => {
 		expect(overrideMarkerIdx).toBeGreaterThan(baseMarkerIdx);
 	});
 
-	it("does NOT include the auth banner block (CLI-strip)", () => {
+	it("includes the .jolli-auth-banner ruleset (carried even though CLI sites don't render it)", () => {
+		// CLI-generated sites have no auth and never emit the .jolli-auth-banner
+		// element. The CSS rule is still carried so any future shared-DOM
+		// scenario that does emit it keeps the same look without duplicating
+		// CSS — keeping the rule is cheaper than dropping it.
 		const result = buildAtlasCss({ accentHue: 200 });
-		expect(result).not.toContain(".jolli-auth-banner");
+		expect(result).toContain(".jolli-auth-banner");
 	});
 });

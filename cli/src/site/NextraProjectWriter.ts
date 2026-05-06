@@ -15,13 +15,16 @@
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { FooterConfig, HeaderConfig, HeaderItem, NavLink, ThemeConfig, ThemePack } from "./Types.js";
+import { sanitizeUrl } from "./Sanitize.js";
+import { SCOPE_PAGE_MAP_RUNTIME_SOURCE } from "./ScopePageMap.js";
+import type { FooterConfig, HeaderConfig, LogoDisplay, ThemeConfig, ThemePack } from "./Types.js";
 import {
 	buildAtlasCss,
 	buildAtlasFontFamilyCssValue,
 	generateAtlasLayoutTsx,
 	resolveAtlasLayoutInput,
 } from "./themes/atlas/index.js";
+import { SOCIAL_PLATFORMS } from "./themes/Footer.js";
 import {
 	buildForgeCss,
 	buildForgeFontFamilyCssValue,
@@ -38,7 +41,6 @@ import {
 export interface NextraProjectConfig {
 	title: string;
 	description: string;
-	nav: NavLink[];
 	header?: HeaderConfig;
 	footer?: FooterConfig;
 	/**
@@ -76,28 +78,31 @@ export async function initNextraProject(
 	// Always regenerate config files so they reflect the latest site.json values.
 	await writeFile(join(buildDir, "package.json"), generatePackageJson(), "utf-8");
 	await writeFile(join(buildDir, "next.config.mjs"), generateNextConfig(options.staticExport), "utf-8");
-	await writeFile(join(buildDir, "app", "layout.tsx"), generateLayout(config), "utf-8");
+	await writeLayoutTsx(buildDir, config);
 	await writeFile(join(buildDir, "app", "not-found.tsx"), generateNotFound(), "utf-8");
 	await writeFile(join(buildDir, "app", "[[...mdxPath]]", "page.tsx"), generateCatchAllPage(), "utf-8");
 	await writeFile(join(buildDir, "mdx-components.tsx"), generateMdxComponents(), "utf-8");
 	await writeFile(join(buildDir, "tsconfig.json"), generateTsConfig(), "utf-8");
+	await writeScopedNextraLayoutComponent(buildDir);
 
-	// Pack-specific stylesheet — only written when the user opts into a
-	// non-default pack. Each pack's layout imports its own CSS file, so the
-	// file has to land before `next dev` reads the layout module.
-	if (config.theme?.pack === "forge") {
+	// Pack-specific stylesheet. Forge is the implicit default: a site.json
+	// with no `theme.pack` renders Forge. The vanilla `nextra-theme-docs`
+	// look is still reachable via `theme.pack: "default"`, which writes no
+	// pack CSS.
+	const pack = config.theme?.pack ?? "forge";
+	if (pack === "forge") {
 		await mkdir(join(buildDir, "app", "themes"), { recursive: true });
-		const primaryHue = config.theme.primaryHue ?? 228;
-		const fontFamily = config.theme.fontFamily ?? "inter";
+		const primaryHue = config.theme?.primaryHue ?? 228;
+		const fontFamily = config.theme?.fontFamily ?? "inter";
 		const css = buildForgeCss({
 			accentHue: primaryHue,
 			fontFamily: buildForgeFontFamilyCssValue(fontFamily),
 		});
 		await writeFile(join(buildDir, "app", "themes", "forge.css"), css, "utf-8");
-	} else if (config.theme?.pack === "atlas") {
+	} else if (pack === "atlas") {
 		await mkdir(join(buildDir, "app", "themes"), { recursive: true });
-		const primaryHue = config.theme.primaryHue ?? 200;
-		const fontFamily = config.theme.fontFamily ?? "source-serif";
+		const primaryHue = config.theme?.primaryHue ?? 200;
+		const fontFamily = config.theme?.fontFamily ?? "source-serif";
 		const css = buildAtlasCss({
 			accentHue: primaryHue,
 			fontFamily: buildAtlasFontFamilyCssValue(fontFamily),
@@ -108,25 +113,122 @@ export async function initNextraProject(
 	return { isNew };
 }
 
+// ─── writeScopedNextraLayoutComponent ────────────────────────────────────────
+
+/**
+ * Emits `<buildDir>/components/ScopedNextraLayout.tsx` — the runtime client
+ * wrapper around Nextra's `<Layout>` that filters the pageMap by URL so the
+ * sidebar scopes cleanly to either docs or the active OpenAPI spec.
+ *
+ * Without this wrapper, Nextra's `normalizePages` collapses sidebar items
+ * from every top-level page-tab into a single merged `docsDirectories` list.
+ * That works fine when every root entry is a folder-bound page-tab, but our
+ * generator mixes top-level docs items (string entries) with `api-{spec}`
+ * page-tabs. The result is a sidebar that bleeds docs items onto API pages
+ * and vice versa.
+ *
+ * `display: 'hidden'` doesn't fix this either: Nextra short-circuits sidebar
+ * scoping for the active hidden tab. So we filter on the client by matching
+ * `usePathname()` against `/api-{slug}/…`.
+ *
+ * `SCOPE_PAGE_MAP_RUNTIME_SOURCE` (in `ScopePageMap.ts`) bundles the pure
+ * filter function + helpers into one ready-to-inline string. The same
+ * helpers are unit-tested in `ScopePageMap.test.ts` so behaviour changes
+ * propagate to both the tests and the emitted client.
+ */
+export async function writeScopedNextraLayoutComponent(buildDir: string): Promise<void> {
+	await mkdir(join(buildDir, "components"), { recursive: true });
+	// `// @ts-nocheck` disables type-checking for the whole file because the
+	// embedded helpers (above the React component) are pasted from a plain JS
+	// string (`SCOPE_PAGE_MAP_RUNTIME_SOURCE` in `ScopePageMap.ts`) that carries
+	// no TypeScript annotations. In a strict-mode customer Next.js build that
+	// produces noImplicitAny errors on every helper. The React component below
+	// is small and well-typed in its source-of-truth file (`ScopePageMap.ts` +
+	// the TSX template here), so the loss in IDE checking on the emitted file
+	// is acceptable.
+	// Helpers must appear BEFORE the React component, not after. Next.js's
+	// "use client" / RSC compiler is unreliable about preserving hoisted
+	// function declarations placed after the default export — they get
+	// tree-shaken from the client bundle and the component throws
+	// "scopePageMap is not defined" at render time.
+	const content = `// @ts-nocheck
+"use client";
+
+import { Layout } from "nextra-theme-docs";
+import { useEffect, useMemo, type ComponentProps, type ReactNode } from "react";
+import { usePathname } from "next/navigation";
+
+// Pure pageMap-filtering logic — pasted verbatim from
+// SCOPE_PAGE_MAP_RUNTIME_SOURCE in ScopePageMap.ts (a hand-maintained string
+// literal, not Function.prototype.toString()ed, so Vite's identifier mangling
+// in the CLI build can't break the customer's runtime). Behaviour parity with
+// the typed function is asserted in ScopePageMap.test.ts.
+${SCOPE_PAGE_MAP_RUNTIME_SOURCE}
+
+type LayoutProps = ComponentProps<typeof Layout>;
+type PageMap = LayoutProps["pageMap"];
+
+interface Props extends Omit<LayoutProps, "pageMap" | "children"> {
+  pageMap: PageMap;
+  children: ReactNode;
+}
+
+export default function ScopedNextraLayout({ pageMap, children, ...layoutProps }: Props) {
+  const pathname = usePathname() ?? "/";
+
+  const { scopedPageMap, isMultiSpec } = useMemo(
+    () => scopePageMap(pageMap as never, pathname),
+    [pageMap, pathname],
+  );
+
+  useEffect(() => {
+    document.documentElement.dataset.jolliMultiSpec = isMultiSpec ? "true" : "false";
+  }, [isMultiSpec]);
+
+  return (
+    <Layout pageMap={scopedPageMap as PageMap} {...layoutProps}>
+      {children}
+    </Layout>
+  );
+}
+`;
+	await writeFile(join(buildDir, "components", "ScopedNextraLayout.tsx"), content, "utf-8");
+}
+
+// ─── writeLayoutTsx (internal) ───────────────────────────────────────────────
+
+/**
+ * Writes `app/layout.tsx` from a `NextraProjectConfig`. Internal — every
+ * navbar / sidebar augmentation now flows through `MetaGenerator`'s root
+ * `_meta.js` injection, so the layout is written once during
+ * `initNextraProject` and never re-written per-render.
+ */
+async function writeLayoutTsx(buildDir: string, config: NextraProjectConfig): Promise<void> {
+	await mkdir(join(buildDir, "app"), { recursive: true });
+	await writeFile(join(buildDir, "app", "layout.tsx"), generateLayout(config), "utf-8");
+}
+
 // ─── generatePackageJson ──────────────────────────────────────────────────────
 
 /**
- * Returns the contents of the `package.json` that should be written into the
- * hidden build directory.
+ * Runtime dependencies for a Nextra v4 docs site. Shared with EngineManager.
  *
- * Includes all dependencies required by a Nextra v4 docs site:
- *   next, nextra, nextra-theme-docs, react, react-dom, and pagefind.
+ * Nextra ^4.6.1: 4.2.x had a Zod schema in `nextra-theme-docs/dist/layout.js`
+ * that rejected JSX element props that crossed our `<ScopedNextraLayout>`
+ * client-component boundary — `Validation error: Must be a valid React node
+ * at "footer"` — even though the elements *did* pass `isValidElement` when
+ * checked directly. 4.6.x relaxed the schema; the floor pin is here so
+ * fresh installs pick up a passing version.
  *
  * The previous `swagger-ui-react` dependency is gone — the new OpenAPI
- * pipeline (Phase 4 of feature/openapi-rich-renderer) renders per-endpoint
- * MDX pages with a custom component tree, so the user's site no longer
- * pulls a Swagger UI bundle (~600 KB shaved off the runtime).
+ * pipeline renders per-endpoint MDX pages with a custom component tree,
+ * so the user's site no longer pulls a Swagger UI bundle (~600 KB shaved
+ * off the runtime).
  */
-/** Runtime dependencies for a Nextra v4 docs site. Shared with EngineManager. */
 export const NEXTRA_DEPENDENCIES: Record<string, string> = {
 	next: "^15.0.0",
-	nextra: "4.2.17",
-	"nextra-theme-docs": "4.2.17",
+	nextra: "^4.6.1",
+	"nextra-theme-docs": "^4.6.1",
 	react: "^19.0.0",
 	"react-dom": "^19.0.0",
 	pagefind: "^1.0.0",
@@ -138,6 +240,37 @@ export const NEXTRA_DEV_DEPENDENCIES: Record<string, string> = {
 	typescript: "^5.0.0",
 };
 
+/**
+ * npm `overrides` constraints applied to every generated `package.json`.
+ * Shared with EngineManager so the shared engine and per-site dirs stay
+ * aligned on the same transitive dep graph.
+ *
+ * `zod ~4.3.0` — Zod 4.4 changed `z.custom()` strict-object semantics:
+ * `LayoutPropsSchema` in `nextra-theme-docs/dist/schemas.js` declares
+ * `children: reactNode` as required, while the `Layout` component
+ * destructures `children` out of its props before parsing the rest.
+ * Under Zod ≤4.3 the missing field falls through to `reactNode`'s
+ * `data == null` branch and validation passes. Under Zod ≥4.4 the
+ * strict-object check fires before the custom predicate runs and every
+ * Layout render throws `Invalid input: expected nonoptional, received
+ * undefined → at children`. The CLI emits a fresh `package.json` with no
+ * lockfile, so a clean install resolves whichever Zod the registry's
+ * caret-range happens to point at — pin it transitively here. Remove
+ * this override when Nextra ships a release that either (a) marks
+ * `children` optional in the schema or (b) doesn't destructure it before
+ * parsing.
+ */
+export const NEXTRA_OVERRIDES: Record<string, string> = {
+	zod: "~4.3.0",
+};
+
+/**
+ * Returns the contents of the `package.json` that should be written into the
+ * hidden build directory. Pulls in all runtime + dev dependencies required by
+ * a Nextra v4 docs site (see `NEXTRA_DEPENDENCIES` / `NEXTRA_DEV_DEPENDENCIES`)
+ * plus `NEXTRA_OVERRIDES` to constrain transitive deps that have known
+ * incompatibilities with the Nextra version we ship.
+ */
 export function generatePackageJson(): string {
 	const pkg = {
 		name: "jolli-site",
@@ -150,6 +283,7 @@ export function generatePackageJson(): string {
 		},
 		dependencies: { ...NEXTRA_DEPENDENCIES },
 		devDependencies: { ...NEXTRA_DEV_DEPENDENCIES },
+		overrides: { ...NEXTRA_OVERRIDES },
 	};
 
 	return JSON.stringify(pkg, null, 2);
@@ -163,6 +297,17 @@ export function generatePackageJson(): string {
  *
  * Nextra v4 no longer accepts `theme` or `themeConfig` options — those are
  * configured via `app/layout.tsx` and `mdx-components.tsx` instead.
+ *
+ * `infrastructureLogging.level = 'error'` silences webpack's pack-file cache
+ * snapshot warning (`Caching failed for pack: Error: Can't resolve 'nextra'
+ * in <build-dir>`). This is a long-standing Next.js + ESM-config quirk
+ * (vercel/next.js#27650, #35872, #47394, #57128) — webpack can't fully
+ * snapshot dependencies that flow through `next.config.mjs`'s top-level
+ * `import nextra from 'nextra'` because the config is loaded by Node
+ * directly rather than processed through webpack. The warning is non-fatal
+ * (the page renders, the cache just doesn't persist), but for the OSS dev
+ * experience we'd rather not show six lines of red text on every
+ * `jolli dev` startup. Real webpack errors still surface.
  */
 export function generateNextConfig(staticExport?: boolean): string {
 	const exportLines = staticExport ? `\n  output: 'export',\n  images: { unoptimized: true },` : "";
@@ -174,69 +319,24 @@ const withNextra = nextra({
 })
 
 export default withNextra({${exportLines}
+  reactStrictMode: true,
   webpack(config) {
-    config.resolve.preferRelative = true
+    // See JSDoc above for why this is here.
+    config.infrastructureLogging = { ...(config.infrastructureLogging ?? {}), level: 'error' }
     return config
-  }
+  },
 })
 `;
 }
 
 // ─── generateLayout helpers ──────────────────────────────────────────────────
 
-/** Social platforms supported in the footer, in display order. */
-const SOCIAL_PLATFORMS = ["github", "twitter", "discord", "linkedin", "youtube"] as const;
-
 /**
- * Allow http(s), mailto, tel, fragments, query strings, and absolute or
- * relative paths. Anything else (e.g. `javascript:`, `data:`, `vbscript:`)
- * is replaced with `"#"` so a malicious site.json can't inject a script URL.
+ * Builds the inner JSX of `<Footer>` for the default theme, or `""` when
+ * there's nothing to render. Uses inline styles because the default theme
+ * has no pack stylesheet to host class-based selectors. Forge / Atlas
+ * use semantic class names emitted by `themes/Footer.ts`.
  */
-function sanitizeUrl(url: string): string {
-	const trimmed = url.trim();
-	if (trimmed === "" || /^(?:https?:|mailto:|tel:|[#?/]|\.\.?\/)/i.test(trimmed)) {
-		return trimmed;
-	}
-	return "#";
-}
-
-/**
- * Resolves the navbar's logical item list. `header.items` wins when set;
- * otherwise the legacy flat `nav` is coerced into dropdown-less items so
- * pre-`header` site.json files keep rendering unchanged.
- */
-function resolveHeaderItems(config: NextraProjectConfig): HeaderItem[] {
-	if (config.header?.items && config.header.items.length > 0) {
-		return config.header.items;
-	}
-	return config.nav.map((n) => ({ label: n.label, url: n.href }));
-}
-
-/** Renders a single header item — either an `<a>` or a `<details>` dropdown. */
-function renderNavbarChild(item: HeaderItem): string {
-	const jsLabel = JSON.stringify(item.label);
-	if (item.items && item.items.length > 0) {
-		const subLinks = item.items
-			.map((sub) => {
-				const jsSubLabel = JSON.stringify(sub.label);
-				const jsSubHref = JSON.stringify(sanitizeUrl(sub.url));
-				return `              <a href={${jsSubHref}} style={{ display: 'block', padding: '0.25rem 0.75rem', whiteSpace: 'nowrap' }}>{${jsSubLabel}}</a>`;
-			})
-			.join("\n");
-		return [
-			`          <details style={{ marginLeft: '1rem', display: 'inline-block', position: 'relative' }}>`,
-			`            <summary style={{ cursor: 'pointer', listStyle: 'none' }}>{${jsLabel}}</summary>`,
-			`            <div style={{ position: 'absolute', top: '100%', left: 0, marginTop: '0.25rem', background: 'var(--nextra-bg, #fff)', border: '1px solid var(--nextra-border, #e5e7eb)', borderRadius: 4, padding: '0.25rem 0', minWidth: 160, zIndex: 10 }}>`,
-			subLinks,
-			`            </div>`,
-			`          </details>`,
-		].join("\n");
-	}
-	const jsHref = JSON.stringify(sanitizeUrl(item.url ?? "#"));
-	return `          <a href={${jsHref}} style={{ marginLeft: '1rem' }}>{${jsLabel}}</a>`;
-}
-
-/** Builds the inner JSX of `<Footer>`, or `""` when there's nothing to render. */
 function buildFooterBody(footer: FooterConfig | undefined): string {
 	if (!footer) return "";
 
@@ -307,30 +407,38 @@ function buildFooterBody(footer: FooterConfig | undefined): string {
 /**
  * Returns the contents of `app/layout.tsx`. Dispatches to a pack-specific
  * generator based on `config.theme?.pack`:
- *   - `default` (or unset) → vanilla `nextra-theme-docs` with header/footer
- *   - `forge` → Forge pack (clean dev docs)
+ *   - unset (or `forge`) → Forge pack (clean dev docs)
  *   - `atlas` → Atlas pack (editorial)
+ *   - `default` → vanilla `nextra-theme-docs` (back-compat opt-in for sites
+ *     that explicitly want the pre-pack visual)
  */
 export function generateLayout(config: NextraProjectConfig): string {
-	const pack: ThemePack = config.theme?.pack ?? "default";
+	const pack: ThemePack = config.theme?.pack ?? "forge";
 	switch (pack) {
-		case "forge":
-			return generateForgeLayout(config);
 		case "atlas":
 			return generateAtlasLayout(config);
-		default:
+		case "default":
 			return generateDefaultLayout(config);
+		default:
+			return generateForgeLayout(config);
 	}
 }
 
 // ─── generateDefaultLayout ───────────────────────────────────────────────────
 
 /**
- * Vanilla `nextra-theme-docs` layout with header dropdown and footer support.
- * Maps `title`, `description`, `nav` / `header`, and `footer` from `site.json`
- * into the Nextra Layout, Navbar, and Footer components. `nav` is the legacy
- * flat shorthand; `header.items` (which supports per-item dropdowns) wins
- * when set.
+ * Vanilla `nextra-theme-docs` layout with footer support. Page tabs come
+ * from the root `_meta.js` (Nextra renders them natively); the navbar
+ * itself only carries the logo. Sidebar scoping is handled by
+ * `<ScopedNextraLayout>` based on the URL — same architecture as Forge /
+ * Atlas, just without a pack stylesheet.
+ *
+ * Logo composition mirrors Forge / Atlas: `theme.logoText` overrides the text,
+ * `theme.logoDisplay` controls whether image / text / both render. When
+ * `theme.logoUrlDark` is set alongside `theme.logoUrl`, a small inline `<style>`
+ * block toggles the two images via the `.dark` root class — same trick the
+ * pack stylesheets use. Without a pack, the default layout has no per-pack
+ * stylesheet to host the rule, so it's inlined here.
  */
 export function generateDefaultLayout(config: NextraProjectConfig): string {
 	const { title, description } = config;
@@ -338,18 +446,39 @@ export function generateDefaultLayout(config: NextraProjectConfig): string {
 	const jsTitle = JSON.stringify(title);
 	const jsDescription = JSON.stringify(description);
 
-	const headerItems = resolveHeaderItems(config);
-	const navLinks = headerItems.map(renderNavbarChild).join("\n");
-	const navbarChildren = headerItems.length > 0 ? `\n${navLinks}\n        ` : "";
-
 	const footerBody = buildFooterBody(config.footer);
 	const footerJsx = footerBody === "" ? `<Footer />` : `<Footer>\n${footerBody}\n      </Footer>`;
 
-	return `import { Footer, Layout, Navbar } from 'nextra-theme-docs'
+	const logoMarkup = buildDefaultLogoMarkup(config);
+	// Inline `<style>` block toggles the two logo `<img>`s by `.dark` root class.
+	// The default theme has no pack stylesheet to host this rule, so it ships in
+	// the layout itself. Forge / Atlas put the equivalent rule in their pack CSS.
+	const logoDarkSwapStyle =
+		config.theme?.logoUrl && config.theme.logoUrlDark
+			? `<style>{\`.jolli-default-logo-light{display:inline-block}.jolli-default-logo-dark{display:none}.dark .jolli-default-logo-light{display:none}.dark .jolli-default-logo-dark{display:inline-block}\`}</style>`
+			: "";
+
+	// `nextThemes.defaultTheme` controls the initial colour scheme `next-themes`
+	// applies on first load (subsequent loads honour the user's stored choice).
+	// Without this prop the default layout silently fell back to whatever
+	// `next-themes` defaulted to, ignoring `theme.defaultTheme` from the
+	// customer's site.json — Forge / Atlas already pass it; defaulting to
+	// `"system"` here matches Nextra's documented behaviour.
+	const jsDefaultTheme = JSON.stringify(config.theme?.defaultTheme ?? "system");
+
+	// Favicon. Top-level `favicon` wins for back-compat (matches Forge/Atlas
+	// precedence); `theme.favicon` is the canonical placement going forward.
+	// The asset itself is mirrored into `public/` by ContentMirror, so a
+	// browser-absolute path like `/favicon.svg` resolves naturally.
+	const faviconHref = config.favicon ?? config.theme?.favicon;
+	const faviconLink = faviconHref ? `<link rel="icon" href={${JSON.stringify(sanitizeUrl(faviconHref))}} />` : "";
+
+	return `import { Footer, Navbar } from 'nextra-theme-docs'
 import { Head } from 'nextra/components'
 import { getPageMap } from 'nextra/page-map'
 import 'nextra-theme-docs/style.css'
 import '../styles/api.css'
+import ScopedNextraLayout from '../components/ScopedNextraLayout'
 
 export const metadata = {
   title: ${jsTitle},
@@ -359,17 +488,21 @@ export const metadata = {
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" dir="ltr" suppressHydrationWarning>
-      <Head />
+      <Head>
+        ${faviconLink}
+        ${logoDarkSwapStyle}
+      </Head>
       <body>
-        <Layout
+        <ScopedNextraLayout
           navbar={
-            <Navbar logo={<b>{${jsTitle}}</b>}>${navbarChildren}</Navbar>
+            <Navbar logo={<span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>${logoMarkup}</span>} />
           }
           pageMap={await getPageMap()}
           footer={${footerJsx}}
+          nextThemes={{ defaultTheme: ${jsDefaultTheme} }}
         >
           {children}
-        </Layout>
+        </ScopedNextraLayout>
       </body>
     </html>
   )
@@ -377,18 +510,71 @@ export default async function RootLayout({ children }: { children: React.ReactNo
 `;
 }
 
+// ─── Default-layout logo helpers ─────────────────────────────────────────────
+
+/**
+ * Resolves `LogoDisplay` for the default layout. Same auto-default rules as
+ * Forge / Atlas: `"both"` when `logoUrl` is set, `"text"` otherwise. Explicit
+ * `theme.logoDisplay` wins. `"image"` with no `logoUrl` falls back to `"text"`.
+ */
+function resolveDefaultLogoDisplay(theme: ThemeConfig | undefined): LogoDisplay {
+	const display = theme?.logoDisplay;
+	const hasImage = Boolean(theme?.logoUrl);
+	if (display === "image" && !hasImage) return "text";
+	if (display) return display;
+	return hasImage ? "both" : "text";
+}
+
+/**
+ * Builds the inline JSX for the default-layout navbar logo. Returns a string
+ * suitable for splicing inside a JSX expression — `<img>` tags use bracketed
+ * attributes (`src={...}`), and the text label is wrapped in `<b>` to match
+ * the previous default styling.
+ */
+function buildDefaultLogoMarkup(config: NextraProjectConfig): string {
+	const display = resolveDefaultLogoDisplay(config.theme);
+	const logoText = config.theme?.logoText ?? config.title;
+	const jsLogoText = JSON.stringify(logoText);
+	const textMarkup = `<b>{${jsLogoText}}</b>`;
+
+	const logoUrl = config.theme?.logoUrl;
+	const logoUrlDark = config.theme?.logoUrlDark;
+	const jsAlt = JSON.stringify(logoText);
+
+	let imageMarkup = "";
+	if (logoUrl) {
+		const jsLightSrc = JSON.stringify(sanitizeUrl(logoUrl));
+		if (logoUrlDark) {
+			const jsDarkSrc = JSON.stringify(sanitizeUrl(logoUrlDark));
+			imageMarkup =
+				`<img src={${jsLightSrc}} alt={${jsAlt}} className="jolli-default-logo-light" style={{ height: '1.5rem' }} />` +
+				`<img src={${jsDarkSrc}} alt={${jsAlt}} className="jolli-default-logo-dark" style={{ height: '1.5rem' }} />`;
+		} else {
+			imageMarkup = `<img src={${jsLightSrc}} alt={${jsAlt}} style={{ height: '1.5rem' }} />`;
+		}
+	}
+
+	switch (display) {
+		case "image":
+			return imageMarkup;
+		case "text":
+			return textMarkup;
+		default:
+			return `${imageMarkup}${textMarkup}`;
+	}
+}
+
 // ─── generateForgeLayout ─────────────────────────────────────────────────────
 
 /**
  * Forge pack layout — clean developer-docs visual style. The pack-specific
  * stylesheet is written to `app/themes/forge.css` by `initNextraProject`.
- * See `themes/forge/Layout.ts` for the template and the SaaS-port notes.
+ * See `themes/forge/Layout.ts` for the template.
  */
 export function generateForgeLayout(config: NextraProjectConfig): string {
 	const input = resolveForgeLayoutInput({
 		title: config.title,
 		description: config.description,
-		nav: config.nav,
 		header: config.header,
 		footer: config.footer,
 		theme: config.theme,
@@ -402,13 +588,12 @@ export function generateForgeLayout(config: NextraProjectConfig): string {
 /**
  * Atlas pack layout — editorial handbook visual style. The pack-specific
  * stylesheet is written to `app/themes/atlas.css` by `initNextraProject`.
- * See `themes/atlas/Layout.ts` for the template and the SaaS-port notes.
+ * See `themes/atlas/Layout.ts` for the template.
  */
 export function generateAtlasLayout(config: NextraProjectConfig): string {
 	const input = resolveAtlasLayoutInput({
 		title: config.title,
 		description: config.description,
-		nav: config.nav,
 		header: config.header,
 		footer: config.footer,
 		theme: config.theme,
@@ -462,6 +647,14 @@ export function useMDXComponents(components: Record<string, React.ComponentType>
  * its table of contents and metadata.
  */
 export function generateCatchAllPage(): string {
+	// Coerce `params.mdxPath` to `[]` before passing to `importPage`. The Next.js
+	// `[[...mdxPath]]` optional catch-all leaves `mdxPath` undefined for the root
+	// route ("/"), and webpack's dev-mode dynamic-import analyser then logs
+	// `Error: Cannot find module './undefined'` once per importPage call site
+	// while still resolving the page correctly at runtime. The noise is
+	// cosmetic but lands on every `jolli dev` startup — bad first-impression
+	// for the OSS dev experience. The empty-array form makes Nextra's
+	// `importPage` resolve the root explicitly and webpack drops the warning.
 	return `import { generateStaticParamsFor, importPage } from 'nextra/pages'
 import { useMDXComponents } from '../../mdx-components'
 
@@ -469,7 +662,7 @@ export const generateStaticParams = generateStaticParamsFor('mdxPath')
 
 export async function generateMetadata(props: { params: Promise<{ mdxPath?: string[] }> }) {
   const params = await props.params
-  const { metadata } = await importPage(params.mdxPath)
+  const { metadata } = await importPage(params.mdxPath ?? [])
   return metadata
 }
 
@@ -477,7 +670,7 @@ const Wrapper = useMDXComponents({}).wrapper
 
 export default async function Page(props: { params: Promise<{ mdxPath?: string[] }> }) {
   const params = await props.params
-  const result = await importPage(params.mdxPath)
+  const result = await importPage(params.mdxPath ?? [])
   const { default: MDXContent, toc, metadata } = result
   return (
     <Wrapper toc={toc} metadata={metadata}>

@@ -12,10 +12,18 @@ const YAML_SPECIAL_VALUES = new Set(["true", "false", "yes", "no", "on", "off", 
 // ─── escapeYaml ──────────────────────────────────────────────────────────────
 
 /**
- * Escapes special characters in YAML string values and quotes the value if
- * it would otherwise be parsed as a non-string type:
+ * Escapes a string so it can be dropped into YAML frontmatter as a scalar
+ * value. Quotes the value if it would otherwise be parsed as a non-string
+ * type or break the scalar boundary:
  *  - Strings starting with a digit (would be parsed as a number)
  *  - YAML special values (`true`, `false`, `null`, `yes`, `no`, `on`, `off`, `~`)
+ *  - Strings containing a newline / carriage return — without quoting these,
+ *    the second line is read as the next implicit key and the document fails
+ *    to parse (Vercel build crash on Nextra `remark-mdx-frontmatter`). The
+ *    newline is rewritten as the YAML `\n` escape, valid only inside a
+ *    double-quoted scalar.
+ *  - Strings containing a backslash — must be doubled inside double-quoted
+ *    scalars, otherwise YAML reads it as the start of an escape sequence.
  */
 export function escapeYaml(str: string): string {
 	const hasSpecialChars = /[:#[\]{}|>`\n\r]/.test(str) || str.includes('"') || str.includes("'");

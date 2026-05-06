@@ -1,8 +1,7 @@
 /**
  * Tests for SchemaExample — synthesises example payloads from OpenAPI schemas.
  *
- * Ported from nextra-generator with no behavioural changes.
- * These also document the function's intentional gaps (no $ref, no oneOf /
+ * Also documents the function's intentional gaps (no $ref, no oneOf /
  * anyOf / allOf, no enum / default / nullable handling) so we don't quietly
  * regress.
  */

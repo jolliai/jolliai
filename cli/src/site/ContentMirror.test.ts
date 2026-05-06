@@ -385,7 +385,10 @@ describe("ContentMirror.mirrorContent", () => {
 
 	it("copies .mdx files without incompatible imports normally", async () => {
 		const { mirrorContent } = await import("./ContentMirror.js");
-		const mdxContent = `import SwaggerUI from 'swagger-ui-react'\n\n# API\n`;
+		// Use a default-safe prefix (`nextra/components`) — the Nextra renderer
+		// pipeline allows these natively and ContentMirror's own DEFAULT_SAFE_IMPORT_PREFIXES
+		// includes the `nextra` family.
+		const mdxContent = `import { Callout } from 'nextra/components'\n\n# API\n`;
 		await writeFile(join(sourceRoot, "api.mdx"), mdxContent, "utf-8");
 
 		const result = await mirrorContent(sourceRoot, contentDir);
