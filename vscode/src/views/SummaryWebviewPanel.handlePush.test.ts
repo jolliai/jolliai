@@ -232,6 +232,7 @@ const {
 	mockPushToJolli,
 	mockDeleteFromJolli,
 	MockPluginOutdatedError,
+	MockBindingRequiredError,
 	mockParseJolliApiKey,
 } = vi.hoisted(() => {
 	class MockPluginOutdatedError extends Error {
@@ -240,10 +241,19 @@ const {
 			this.name = "PluginOutdatedError";
 		}
 	}
+	class MockBindingRequiredError extends Error {
+		readonly repoUrl: string;
+		constructor(repoUrl: string, msg = "binding_required") {
+			super(msg);
+			this.name = "BindingRequiredError";
+			this.repoUrl = repoUrl;
+		}
+	}
 	return {
 		mockPushToJolli: vi.fn().mockResolvedValue({ docId: 42 }),
 		mockDeleteFromJolli: vi.fn().mockResolvedValue(undefined),
 		MockPluginOutdatedError,
+		MockBindingRequiredError,
 		mockParseJolliApiKey: vi
 			.fn()
 			.mockReturnValue({ u: "https://example.jolli.app" }),
@@ -254,7 +264,40 @@ vi.mock("../services/JolliPushService.js", () => ({
 	pushToJolli: mockPushToJolli,
 	deleteFromJolli: mockDeleteFromJolli,
 	PluginOutdatedError: MockPluginOutdatedError,
+	BindingRequiredError: MockBindingRequiredError,
 	parseJolliApiKey: mockParseJolliApiKey,
+}));
+
+const { mockGetCanonicalRepoUrl, mockDeriveRepoNameFromUrl } = vi.hoisted(
+	() => ({
+		mockGetCanonicalRepoUrl: vi
+			.fn()
+			.mockResolvedValue("https://github.com/example/repo"),
+		mockDeriveRepoNameFromUrl: vi.fn().mockReturnValue("repo"),
+	}),
+);
+
+vi.mock("../util/GitRemoteUtils.js", () => ({
+	getCanonicalRepoUrl: mockGetCanonicalRepoUrl,
+	deriveRepoNameFromUrl: mockDeriveRepoNameFromUrl,
+}));
+
+// `mockBindingChooserOpen` returns a BindingChooserOutcome:
+//   { kind: "selected", result: BindingChooserResult }  // user picked a space
+//   { kind: "cancelled" }                                // user dismissed
+//   { kind: "anotherOpen" }                              // another chooser open for this repo
+const { mockBindingChooserOpen, mockBindingChooserDispose } = vi.hoisted(
+	() => ({
+		mockBindingChooserOpen: vi.fn().mockResolvedValue({ kind: "cancelled" }),
+		mockBindingChooserDispose: vi.fn(),
+	}),
+);
+
+vi.mock("./BindingChooserWebviewPanel.js", () => ({
+	BindingChooserWebviewPanel: {
+		openAndAwait: mockBindingChooserOpen,
+		dispose: mockBindingChooserDispose,
+	},
 }));
 
 const {
@@ -319,6 +362,7 @@ const {
 	mockBuildNotePushTitle,
 	mockCollectSortedTopics,
 	mockCollectAllPlans,
+	mockBuildBranchRelativePath,
 } = vi.hoisted(() => ({
 	mockBuildPanelTitle: vi.fn().mockReturnValue("Panel Title"),
 	mockBuildPushTitle: vi.fn().mockReturnValue("Push Title"),
@@ -328,6 +372,7 @@ const {
 		.fn()
 		.mockReturnValue({ topics: [], sourceNodes: [], showRecordDates: false }),
 	mockCollectAllPlans: vi.fn().mockReturnValue([]),
+	mockBuildBranchRelativePath: vi.fn().mockReturnValue("main"),
 }));
 
 vi.mock("./SummaryUtils.js", () => ({
@@ -337,6 +382,7 @@ vi.mock("./SummaryUtils.js", () => ({
 	buildNotePushTitle: mockBuildNotePushTitle,
 	collectSortedTopics: mockCollectSortedTopics,
 	collectAllPlans: mockCollectAllPlans,
+	buildBranchRelativePath: mockBuildBranchRelativePath,
 }));
 
 const { mockExecSync } = vi.hoisted(() => ({
@@ -813,6 +859,13 @@ describe("SummaryWebviewPanel handlePush", () => {
 					]),
 				}),
 			);
+
+			// Each pushToJolli call carries the right docType — server keys off it
+			// to set sourceMetadata.docType once the path is flat per branch.
+			const docTypes = mockPushToJolli.mock.calls
+				.map((c: Array<unknown>) => (c[2] as { docType?: string })?.docType)
+				.sort();
+			expect(docTypes).toEqual(["note", "plan", "summary"]);
 		});
 
 		it("skips plans and notes when readPlanFromBranch/readNoteFromBranch return null", async () => {
@@ -1046,6 +1099,161 @@ describe("SummaryWebviewPanel handlePush", () => {
 			await flushPromises();
 
 			expect(mockPushToJolli).toHaveBeenCalledTimes(2);
+		});
+	});
+
+	// ── Test 10: 412 binding_required → chooser → retry ─────────────────────
+
+	describe("412 binding_required opens chooser and retries the push", () => {
+		const baseConfig = {
+			apiKey: "test",
+			jolliApiKey: "jk_valid",
+			pushAction: "jolli" as const,
+		};
+
+		it("opens BindingChooser with derived params and retries on confirm", async () => {
+			mockLoadConfig.mockResolvedValue(baseConfig);
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			mockGetCanonicalRepoUrl.mockResolvedValue(
+				"https://github.com/example/repo",
+			);
+			mockDeriveRepoNameFromUrl.mockReturnValue("repo");
+			// First call: 412; second call (after chooser confirms): success
+			mockPushToJolli
+				.mockRejectedValueOnce(
+					new MockBindingRequiredError("https://github.com/example/repo"),
+				)
+				.mockResolvedValueOnce({ docId: 77 });
+			mockBindingChooserOpen.mockResolvedValue({
+				kind: "selected",
+				result: {
+					id: 1,
+					jmSpaceId: 5,
+					jmSpaceName: "team-space",
+					repoName: "repo",
+				},
+			});
+			const dispatch = await setupPanel();
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			expect(mockBindingChooserOpen).toHaveBeenCalledTimes(1);
+			expect(mockBindingChooserOpen).toHaveBeenCalledWith(
+				expect.objectContaining({
+					baseUrl: "https://my.jolli.app",
+					apiKey: "jk_valid",
+					repoUrl: "https://github.com/example/repo",
+					suggestedRepoName: "repo",
+				}),
+			);
+			expect(mockPushToJolli).toHaveBeenCalledTimes(2);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "pushToJolliResult",
+					success: true,
+				}),
+			);
+		});
+
+		it("does not retry and reports failure when the user cancels", async () => {
+			mockLoadConfig.mockResolvedValue(baseConfig);
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			mockGetCanonicalRepoUrl.mockResolvedValue(
+				"https://github.com/example/repo",
+			);
+			mockPushToJolli.mockRejectedValue(
+				new MockBindingRequiredError("https://github.com/example/repo"),
+			);
+			mockBindingChooserOpen.mockResolvedValue({ kind: "cancelled" });
+			const dispatch = await setupPanel();
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			expect(mockBindingChooserOpen).toHaveBeenCalledTimes(1);
+			expect(mockPushToJolli).toHaveBeenCalledTimes(1);
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining(
+					"Push cancelled — no Memory space chosen for this repo",
+				),
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "pushToJolliResult",
+					success: false,
+				}),
+			);
+		});
+
+		it("shows an informational hint (not 'Push cancelled') when another chooser is open for the same repo", async () => {
+			mockLoadConfig.mockResolvedValue(baseConfig);
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			mockGetCanonicalRepoUrl.mockResolvedValue(
+				"https://github.com/example/repo",
+			);
+			mockPushToJolli.mockRejectedValue(
+				new MockBindingRequiredError("https://github.com/example/repo"),
+			);
+			mockBindingChooserOpen.mockResolvedValue({ kind: "anotherOpen" });
+			const dispatch = await setupPanel();
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			expect(mockBindingChooserOpen).toHaveBeenCalledTimes(1);
+			// No retry — the *other* panel will retry once it gets a binding.
+			expect(mockPushToJolli).toHaveBeenCalledTimes(1);
+			// Informational hint, not the misleading "Push cancelled" error.
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining(
+					"A Memory space chooser is already open for this repo",
+				),
+			);
+			expect(showErrorMessage).not.toHaveBeenCalledWith(
+				expect.stringContaining("Push cancelled"),
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "pushToJolliResult",
+					success: false,
+				}),
+			);
+		});
+
+		it("does not loop: a second 412 after the retry surfaces as a normal error", async () => {
+			mockLoadConfig.mockResolvedValue(baseConfig);
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			mockGetCanonicalRepoUrl.mockResolvedValue(
+				"https://github.com/example/repo",
+			);
+			// Both push attempts return 412 — runJolliPush passes retried=true on the
+			// second call, so the chooser must NOT open a second time.
+			mockPushToJolli.mockRejectedValue(
+				new MockBindingRequiredError("https://github.com/example/repo"),
+			);
+			mockBindingChooserOpen.mockResolvedValue({
+				kind: "selected",
+				result: {
+					id: 1,
+					jmSpaceId: 5,
+					jmSpaceName: "team-space",
+					repoName: "repo",
+				},
+			});
+			const dispatch = await setupPanel();
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			expect(mockPushToJolli).toHaveBeenCalledTimes(2);
+			expect(mockBindingChooserOpen).toHaveBeenCalledTimes(1);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "pushToJolliResult",
+					success: false,
+				}),
+			);
 		});
 	});
 });

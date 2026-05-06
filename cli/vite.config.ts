@@ -8,6 +8,7 @@ export default defineConfig({
 	define: {
 		__PKG_VERSION__: JSON.stringify(pkg.version),
 		__CLI_PKG_VERSION__: JSON.stringify(pkg.version),
+		__JOLLI_CLIENT_KIND__: JSON.stringify("cli"),
 	},
 	build: {
 		lib: {

@@ -97,8 +97,11 @@ vi.mock("node:https", () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
+import { VSCODE_CLIENT_INFO } from "./ClientInfo.js";
 import type { JolliPushPayload } from "./JolliPushService.js";
 import {
+	BindingAlreadyExistsError,
+	BindingRequiredError,
 	deleteFromJolli,
 	PluginOutdatedError,
 	parseJolliApiKey,
@@ -126,6 +129,7 @@ const DEFAULT_PAYLOAD: JolliPushPayload = {
 	title: "Test Summary",
 	content: "# Test\nSome content",
 	commitHash: "abc123",
+	docType: "summary",
 	branch: "main",
 };
 
@@ -241,6 +245,51 @@ describe("pushToJolli", () => {
 		expect(mockHttpsRequest).toHaveBeenCalledOnce();
 		expect(mockReq.write).toHaveBeenCalledWith(JSON.stringify(DEFAULT_PAYLOAD));
 		expect(mockReq.end).toHaveBeenCalledOnce();
+		const callArgs = mockHttpsRequest.mock.calls[0] as [
+			unknown,
+			{ headers: Record<string, string> },
+		];
+		expect(callArgs[1].headers["x-jolli-client"]).toBe(
+			`${VSCODE_CLIENT_INFO.kind}/${VSCODE_CLIENT_INFO.version}`,
+		);
+	});
+
+	it("round-trips docType into the JSON request body for each kind", async () => {
+		const responseBody = JSON.stringify({
+			url: "u",
+			docId: 1,
+			jrn: "j",
+			created: true,
+		});
+		const writtenBodies: Array<string> = [];
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				cb(createMockResponse(200, responseBody));
+				const req = createMockRequest();
+				req.write.mockImplementation((body: string) => {
+					writtenBodies.push(body);
+					return true;
+				});
+				return req;
+			},
+		);
+
+		for (const docType of ["summary", "plan", "note"] as const) {
+			await pushToJolli("https://acme.jolli.ai", OLD_KEY, {
+				...DEFAULT_PAYLOAD,
+				docType,
+			});
+		}
+
+		expect(writtenBodies).toHaveLength(3);
+		const parsedDocTypes = writtenBodies.map(
+			(b) => (JSON.parse(b) as { docType: string }).docType,
+		);
+		expect(parsedDocTypes).toEqual(["summary", "plan", "note"]);
 	});
 
 	it("throws PluginOutdatedError on HTTP 426", async () => {
@@ -556,6 +605,151 @@ describe("pushToJolli", () => {
 		await pushToJolli("http://localhost:7034", OLD_KEY, DEFAULT_PAYLOAD);
 		expect(mockHttpRequest).toHaveBeenCalledOnce();
 		expect(mockHttpsRequest).not.toHaveBeenCalled();
+	});
+
+	it("throws BindingRequiredError on 412 with binding_required", async () => {
+		const responseBody = JSON.stringify({
+			error: "binding_required",
+			repoUrl: "https://github.com/jolliai/jolli",
+		});
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(412, responseBody);
+
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				cb(mockRes);
+				return mockReq;
+			},
+		);
+
+		const err = await pushToJolli(
+			"https://acme.jolli.ai",
+			OLD_KEY,
+			DEFAULT_PAYLOAD,
+		).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(BindingRequiredError);
+		expect((err as BindingRequiredError).repoUrl).toBe(
+			"https://github.com/jolliai/jolli",
+		);
+	});
+
+	it("falls back to payload.repoUrl when 412 body omits repoUrl", async () => {
+		const responseBody = JSON.stringify({ error: "binding_required" });
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(412, responseBody);
+
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				cb(mockRes);
+				return mockReq;
+			},
+		);
+
+		const payload: JolliPushPayload = {
+			...DEFAULT_PAYLOAD,
+			repoUrl: "https://github.com/jolliai/jolli",
+		};
+		const err = await pushToJolli(
+			"https://acme.jolli.ai",
+			OLD_KEY,
+			payload,
+		).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(BindingRequiredError);
+		expect((err as BindingRequiredError).repoUrl).toBe(
+			"https://github.com/jolliai/jolli",
+		);
+	});
+
+	it("does not treat unrelated 412 errors as BindingRequiredError", async () => {
+		const responseBody = JSON.stringify({ error: "precondition_failed" });
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(412, responseBody);
+
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				cb(mockRes);
+				return mockReq;
+			},
+		);
+
+		const err = await pushToJolli(
+			"https://acme.jolli.ai",
+			OLD_KEY,
+			DEFAULT_PAYLOAD,
+		).catch((e: unknown) => e);
+		expect(err).not.toBeInstanceOf(BindingRequiredError);
+		expect((err as Error).message).toBe("precondition_failed");
+	});
+
+	it("throws BindingAlreadyExistsError on 409 with binding_already_exists", async () => {
+		const responseBody = JSON.stringify({
+			error: "binding_already_exists",
+			id: 7,
+			jmSpaceId: 42,
+			jmSpaceName: "backend-team",
+			repoName: "jolli",
+		});
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(409, responseBody);
+
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				cb(mockRes);
+				return mockReq;
+			},
+		);
+
+		const err = await pushToJolli(
+			"https://acme.jolli.ai",
+			OLD_KEY,
+			DEFAULT_PAYLOAD,
+		).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(BindingAlreadyExistsError);
+		expect((err as BindingAlreadyExistsError).winner.jmSpaceId).toBe(42);
+		expect((err as BindingAlreadyExistsError).winner.jmSpaceName).toBe(
+			"backend-team",
+		);
+	});
+
+	it("does not treat unrelated 409 errors as BindingAlreadyExistsError", async () => {
+		const responseBody = JSON.stringify({ error: "conflict" });
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(409, responseBody);
+
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				cb(mockRes);
+				return mockReq;
+			},
+		);
+
+		const err = await pushToJolli(
+			"https://acme.jolli.ai",
+			OLD_KEY,
+			DEFAULT_PAYLOAD,
+		).catch((e: unknown) => e);
+		expect(err).not.toBeInstanceOf(BindingAlreadyExistsError);
+		expect((err as Error).message).toBe("conflict");
 	});
 
 	it("handles statusCode being undefined (defaults to 0)", async () => {

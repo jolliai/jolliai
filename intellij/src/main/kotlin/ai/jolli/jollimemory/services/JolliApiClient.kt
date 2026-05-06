@@ -20,6 +20,14 @@ import java.util.Base64
  * Handles two URL patterns for multi-tenant support:
  * - Path-based (dev): "http://localhost:3000/acme/" -> x-tenant-slug header
  * - Subdomain-based (prod): "https://test1.jolli.ai" -> subdomain resolved by backend
+ *
+ * Sends `x-jolli-client: intellij-plugin/<version>` on every request so the
+ * server can identify the caller and apply the IntelliJ-specific minimum
+ * version gate. The version is read once from the classpath resource
+ * `/jollimemory-plugin-version.txt`, which `processResources` populates at
+ * build time from `project.version` in build.gradle.kts. Keeping the lookup
+ * inside this client preserves its "pure HTTP, no IntelliJ Platform deps"
+ * shape — the same posture as the VS Code TypeScript port.
  */
 object JolliApiClient {
 
@@ -29,6 +37,40 @@ object JolliApiClient {
         .connectTimeout(Duration.ofSeconds(30))
         .build()
 
+    private const val VERSION_RESOURCE_PATH = "/jollimemory-plugin-version.txt"
+
+    /**
+     * Last-resort version sent if the classpath resource is missing. `0.0.0`
+     * is intentional: it will fail any server-side minimum-version gate and
+     * surface a build/packaging mistake loudly instead of silently shipping a
+     * misleading version string.
+     */
+    private const val FALLBACK_PLUGIN_VERSION = "0.0.0"
+
+    /**
+     * IntelliJ plugin version sent in the `x-jolli-client` header. Resolved
+     * once on first use from the classpath resource baked in by
+     * `processResources` (see build.gradle.kts).
+     */
+    internal val pluginVersion: String by lazy { loadPluginVersion() }
+
+    private fun loadPluginVersion(): String {
+        val raw = try {
+            javaClass.getResourceAsStream(VERSION_RESOURCE_PATH)
+                ?.bufferedReader(Charsets.UTF_8)
+                ?.use { it.readText() }
+        } catch (e: Exception) {
+            log.warn("Failed to read plugin version resource: ${e.message}")
+            null
+        }
+        val trimmed = raw?.trim().orEmpty()
+        if (trimmed.isEmpty()) {
+            log.warn("Plugin version resource missing or empty at $VERSION_RESOURCE_PATH; using fallback $FALLBACK_PLUGIN_VERSION")
+            return FALLBACK_PLUGIN_VERSION
+        }
+        return trimmed
+    }
+
     /** Payload sent to the Jolli push endpoint. */
     data class JolliPushPayload(
         val title: String,
@@ -37,7 +79,6 @@ object JolliApiClient {
         val branch: String? = null,
         val subFolder: String? = null,
         val docId: Int? = null,
-        val pluginVersion: String? = null,
     )
 
     /** Response from a successful push. */
@@ -118,7 +159,11 @@ object JolliApiClient {
      * @throws RuntimeException if the push fails (network error, non-2xx response, or missing base URL)
      * @throws PluginOutdatedError if the server returns HTTP 426
      */
-    fun pushToJolli(baseUrl: String?, apiKey: String, payload: JolliPushPayload): JolliPushResult {
+    fun pushToJolli(
+        baseUrl: String?,
+        apiKey: String,
+        payload: JolliPushPayload,
+    ): JolliPushResult {
         val keyMeta = parseJolliApiKey(apiKey)
         val resolvedBaseUrl = baseUrl ?: keyMeta?.u
             ?: throw RuntimeException(
@@ -134,6 +179,7 @@ object JolliApiClient {
             .uri(targetUri)
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer $apiKey")
+            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .timeout(Duration.ofSeconds(60))
 
@@ -169,6 +215,7 @@ object JolliApiClient {
         val requestBuilder = HttpRequest.newBuilder()
             .uri(targetUri)
             .header("Authorization", "Bearer $apiKey")
+            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
             .DELETE()
             .timeout(Duration.ofSeconds(30))
 
@@ -231,6 +278,7 @@ object JolliApiClient {
             .uri(targetUri)
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer $apiKey")
+            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .timeout(Duration.ofSeconds(120))
 

@@ -69,6 +69,25 @@ describe("PlansDataService.mergeByLastModified", () => {
 		expect(onlyNotes).toHaveLength(1);
 		expect(onlyNotes[0].kind).toBe("note");
 	});
+
+	it("sorts plan-vs-plan and note-vs-note pairs by lastModified", () => {
+		// Exercises the b.kind === "plan" / b.kind === "note" branches in the
+		// comparator's lastModified lookups, which are skipped when the input
+		// only ever pairs (plan, note) at the boundary.
+		const plans = [
+			makePlan("2026-01-01T00:00:00Z", "p-old"),
+			makePlan("2026-04-01T00:00:00Z", "p-new"),
+		];
+		const notes = [
+			makeNote("2026-02-01T00:00:00Z", "n-old"),
+			makeNote("2026-03-01T00:00:00Z", "n-new"),
+		];
+		const merged = PlansDataService.mergeByLastModified(plans, notes);
+		const order = merged.map((m) =>
+			m.kind === "plan" ? m.plan.slug : m.note.id,
+		);
+		expect(order).toEqual(["p-new", "n-new", "n-old", "p-old"]);
+	});
 });
 
 describe("PlansDataService.isEmpty", () => {

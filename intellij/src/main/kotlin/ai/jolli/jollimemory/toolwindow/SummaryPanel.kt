@@ -269,7 +269,6 @@ class SummaryPanel(
 
         postToWebview("pushStarted")
         val baseUrl = resolvedBaseUrl.trimEnd('/')
-        val pluginVersion = getPluginVersion()
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
@@ -286,7 +285,6 @@ class SummaryPanel(
                         branch = summary.branch,
                         subFolder = "Plans",
                         docId = plan.jolliPlanDocId,
-                        pluginVersion = pluginVersion,
                     ))
                     planUrls.add(PlanPushResult(plan.slug, plan.title, "$baseUrl/articles?doc=${planResult.docId}", planResult.docId))
                 }
@@ -306,7 +304,7 @@ class SummaryPanel(
 
                 val result = JolliApiClient.pushToJolli(resolvedBaseUrl, config.jolliApiKey!!, JolliApiClient.JolliPushPayload(
                     title = pushTitle, content = markdown, commitHash = summary.commitHash,
-                    branch = summary.branch, docId = summary.jolliDocId, pluginVersion = pluginVersion,
+                    branch = summary.branch, docId = summary.jolliDocId,
                 ))
 
                 val fullUrl = "$baseUrl/articles?doc=${result.docId}"
@@ -846,34 +844,11 @@ class SummaryPanel(
         return cleanedSummary
     }
 
-    /**
-     * Returns the plugin version sent to the Jolli push API.
-     *
-     * The server enforces a minimum version gate (MIN_PLUGIN_VERSION in PushRouter.ts)
-     * using three-part semver (e.g. "0.90.160"). The IntelliJ plugin's own build version
-     * (e.g. "0.4.3") uses a separate numbering scheme that would always be rejected.
-     * We therefore read the canonical version from the shared jollimemory core's
-     * package.json, which is the same version the VS Code extension sends.
-     */
-    private fun getPluginVersion(): String {
-        return try {
-            val packageJson = File(cwd, "tools/jollimemory-vscode/package.json")
-            if (packageJson.exists()) {
-                val json = gson.fromJson(packageJson.readText(), com.google.gson.JsonObject::class.java)
-                json.get("version")?.asString ?: FALLBACK_PLUGIN_VERSION
-            } else {
-                FALLBACK_PLUGIN_VERSION
-            }
-        } catch (_: Exception) { FALLBACK_PLUGIN_VERSION }
-    }
-
     private data class RebuildSession(val sessionId: String, val source: String, val transcriptPath: String?, val entries: MutableList<TranscriptEntry> = mutableListOf())
     private data class PlanPushResult(val slug: String, val title: String, val url: String, val docId: Int)
 
     companion object {
         private val LOG = Logger.getInstance(SummaryPanel::class.java)
-        /** Fallback version sent to the push API when package.json cannot be read. */
-        private const val FALLBACK_PLUGIN_VERSION = "0.90.160"
 
         fun collectTreeHashes(summary: CommitSummary): Set<String> {
             val hashes = mutableSetOf(summary.commitHash)

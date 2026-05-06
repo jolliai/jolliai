@@ -235,6 +235,7 @@ const {
 	mockPushToJolli,
 	mockDeleteFromJolli,
 	MockPluginOutdatedError,
+	MockBindingRequiredError,
 	mockParseJolliApiKey,
 } = vi.hoisted(() => {
 	class MockPluginOutdatedError extends Error {
@@ -243,10 +244,19 @@ const {
 			this.name = "PluginOutdatedError";
 		}
 	}
+	class MockBindingRequiredError extends Error {
+		readonly repoUrl: string;
+		constructor(repoUrl: string, msg = "binding_required") {
+			super(msg);
+			this.name = "BindingRequiredError";
+			this.repoUrl = repoUrl;
+		}
+	}
 	return {
 		mockPushToJolli: vi.fn().mockResolvedValue({ docId: 42 }),
 		mockDeleteFromJolli: vi.fn().mockResolvedValue(undefined),
 		MockPluginOutdatedError,
+		MockBindingRequiredError,
 		mockParseJolliApiKey: vi
 			.fn()
 			.mockReturnValue({ u: "https://example.jolli.app" }),
@@ -257,7 +267,36 @@ vi.mock("../services/JolliPushService.js", () => ({
 	pushToJolli: mockPushToJolli,
 	deleteFromJolli: mockDeleteFromJolli,
 	PluginOutdatedError: MockPluginOutdatedError,
+	BindingRequiredError: MockBindingRequiredError,
 	parseJolliApiKey: mockParseJolliApiKey,
+}));
+
+const { mockGetCanonicalRepoUrl, mockDeriveRepoNameFromUrl } = vi.hoisted(
+	() => ({
+		mockGetCanonicalRepoUrl: vi
+			.fn()
+			.mockResolvedValue("https://github.com/example/repo"),
+		mockDeriveRepoNameFromUrl: vi.fn().mockReturnValue("repo"),
+	}),
+);
+
+vi.mock("../util/GitRemoteUtils.js", () => ({
+	getCanonicalRepoUrl: mockGetCanonicalRepoUrl,
+	deriveRepoNameFromUrl: mockDeriveRepoNameFromUrl,
+}));
+
+const { mockBindingChooserOpen, mockBindingChooserDispose } = vi.hoisted(
+	() => ({
+		mockBindingChooserOpen: vi.fn().mockResolvedValue(undefined),
+		mockBindingChooserDispose: vi.fn(),
+	}),
+);
+
+vi.mock("./BindingChooserWebviewPanel.js", () => ({
+	BindingChooserWebviewPanel: {
+		openAndAwait: mockBindingChooserOpen,
+		dispose: mockBindingChooserDispose,
+	},
 }));
 
 const {
@@ -326,6 +365,7 @@ const {
 	mockBuildNotePushTitle,
 	mockCollectSortedTopics,
 	mockCollectAllPlans,
+	mockBuildBranchRelativePath,
 } = vi.hoisted(() => ({
 	mockBuildPanelTitle: vi.fn().mockReturnValue("Panel Title"),
 	mockBuildPushTitle: vi.fn().mockReturnValue("Push Title"),
@@ -335,6 +375,7 @@ const {
 		.fn()
 		.mockReturnValue({ topics: [], sourceNodes: [], showRecordDates: false }),
 	mockCollectAllPlans: vi.fn().mockReturnValue([]),
+	mockBuildBranchRelativePath: vi.fn().mockReturnValue("main"),
 }));
 
 vi.mock("./SummaryUtils.js", () => ({
@@ -344,6 +385,7 @@ vi.mock("./SummaryUtils.js", () => ({
 	buildNotePushTitle: mockBuildNotePushTitle,
 	collectSortedTopics: mockCollectSortedTopics,
 	collectAllPlans: mockCollectAllPlans,
+	buildBranchRelativePath: mockBuildBranchRelativePath,
 }));
 
 const { mockExecSync } = vi.hoisted(() => ({
@@ -3910,7 +3952,7 @@ describe("SummaryWebviewPanel", () => {
 				expect(mockPushToJolli).toHaveBeenCalledWith(
 					"https://my.jolli.app",
 					"jk_valid",
-					expect.objectContaining({ docId: 77, subFolder: "Plans & Notes" }),
+					expect.objectContaining({ docId: 77, relativePath: "main" }),
 				);
 			});
 		});
@@ -5283,7 +5325,7 @@ describe("SummaryWebviewPanel", () => {
 				expect(mockPushToJolli).toHaveBeenCalledTimes(3);
 				const noteCalls = mockPushToJolli.mock.calls.filter(
 					(c: Array<unknown>) =>
-						(c[2] as { subFolder?: string })?.subFolder === "Plans & Notes",
+						(c[2] as { docType?: string })?.docType === "note",
 				);
 				expect(noteCalls).toHaveLength(2);
 				expect((noteCalls[0][2] as { content: string }).content).toBe(

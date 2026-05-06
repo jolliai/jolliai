@@ -19,6 +19,7 @@ vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
 import type { CommitSummary, PlanReference } from "../../../cli/src/Types.js";
 import type { TopicWithDate } from "./SummaryUtils.js";
 import {
+	buildBranchRelativePath,
 	buildNotePushTitle,
 	buildPanelTitle,
 	buildPlanPushTitle,
@@ -471,34 +472,30 @@ describe("SummaryUtils", () => {
 	// ── buildPushTitle ───────────────────────────────────────────────────────
 
 	describe("buildPushTitle", () => {
-		it("appends commitMessage to panel title", () => {
+		it("returns just the commit message with no metadata prefix", () => {
 			const summary = makeSummary({ ticketId: "PROJ-100" });
 			const result = buildPushTitle(summary);
-			expect(result).toBe(
-				"2026-03-15 · PROJ-100 · abc1234 · Alice · Fix some bug",
-			);
+			expect(result).toBe("Fix some bug");
 		});
 	});
 
 	// ── buildPlanPushTitle ───────────────────────────────────────────────────
 
 	describe("buildPlanPushTitle", () => {
-		it("appends planTitle to panel title", () => {
+		it("returns just the plan title with no metadata prefix", () => {
 			const summary = makeSummary({ ticketId: "PROJ-100" });
 			const result = buildPlanPushTitle(summary, "My Plan");
-			expect(result).toBe("2026-03-15 · PROJ-100 · abc1234 · Alice · My Plan");
+			expect(result).toBe("My Plan");
 		});
 	});
 
 	// ── buildNotePushTitle ───────────────────────────────────────────────────
 
 	describe("buildNotePushTitle", () => {
-		it("appends noteTitle to panel title", () => {
+		it("returns just the note title with no metadata prefix", () => {
 			const summary = makeSummary({ ticketId: "PROJ-200" });
 			const result = buildNotePushTitle(summary, "Release Notes");
-			expect(result).toBe(
-				"2026-03-15 · PROJ-200 · abc1234 · Alice · Release Notes",
-			);
+			expect(result).toBe("Release Notes");
 		});
 	});
 
@@ -684,6 +681,27 @@ describe("SummaryUtils", () => {
 			const summary = makeSummary();
 			const plans = collectAllPlans(summary);
 			expect(plans).toHaveLength(0);
+		});
+	});
+
+	describe("buildBranchRelativePath", () => {
+		it("returns just the branch slug for any push (summary/plan/note)", () => {
+			expect(buildBranchRelativePath("main")).toBe("main");
+		});
+
+		it("preserves slashes in feature branches", () => {
+			expect(buildBranchRelativePath("feature/oauth")).toBe("feature/oauth");
+		});
+
+		it("sanitizes unsafe characters", () => {
+			expect(buildBranchRelativePath("feat: oauth + sso")).toBe(
+				"feat_oauth_sso",
+			);
+		});
+
+		it("uses _ as fallback for empty branch", () => {
+			expect(buildBranchRelativePath(undefined)).toBe("_");
+			expect(buildBranchRelativePath("")).toBe("_");
 		});
 	});
 });

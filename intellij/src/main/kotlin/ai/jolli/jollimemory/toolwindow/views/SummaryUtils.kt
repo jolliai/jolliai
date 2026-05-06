@@ -134,14 +134,12 @@ object SummaryUtils {
 
     /** Builds the memory document title for pushing to Jolli Space. */
     fun buildPushTitle(summary: CommitSummary): String {
-        val base = buildPanelTitle(summary)
-        return "$base · ${summary.commitMessage}"
+        return summary.commitMessage
     }
 
     /** Builds the plan document title for pushing to Jolli Space. */
-    fun buildPlanPushTitle(summary: CommitSummary, planTitle: String): String {
-        val base = buildPanelTitle(summary)
-        return "$base · $planTitle"
+    fun buildPlanPushTitle(@Suppress("UNUSED_PARAMETER") summary: CommitSummary, planTitle: String): String {
+        return planTitle
     }
 
     // ── Topic sorting / grouping ───────────────────────────────────────────

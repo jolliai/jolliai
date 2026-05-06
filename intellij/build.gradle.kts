@@ -386,6 +386,18 @@ tasks {
         )
     }
 
+    // Bake project.version into jollimemory-plugin-version.txt at build time so
+    // JolliApiClient can read it from the classpath without depending on the
+    // IntelliJ Platform API. The inputs.property line makes the task properly
+    // re-run when the version changes (otherwise Gradle would cache stale output).
+    processResources {
+        val pluginVersion = project.version.toString()
+        inputs.property("pluginVersion", pluginVersion)
+        filesMatching("jollimemory-plugin-version.txt") {
+            expand("version" to pluginVersion)
+        }
+    }
+
     test {
         useJUnitPlatform()
         javaLauncher.set(

@@ -214,30 +214,31 @@ describe("buildPanelTitle", () => {
 // ─── buildPushTitle ─────────────────────────────────────────────────────────
 
 describe("buildPushTitle", () => {
-	it("includes commit message and sanitizes forbidden characters", () => {
+	it("returns the commit message with forbidden characters sanitized", () => {
 		const title = buildPushTitle(leaf({ commitMessage: 'fix: remove "bad" chars <tag>' }));
 		expect(title).not.toContain('"');
 		expect(title).not.toContain("<");
 		expect(title).not.toContain(">");
 		expect(title).toContain("fix");
+		// No date/ticket/hash/author prefix.
+		expect(title).not.toContain("2026-03-01");
+		expect(title).not.toContain("abc1234");
 	});
 });
 
 // ─── buildPlanPushTitle / buildNotePushTitle ─────────────────────────────────
 
 describe("buildPlanPushTitle", () => {
-	it("appends plan title to panel title", () => {
+	it("returns the plan title without metadata prefix", () => {
 		const title = buildPlanPushTitle(leaf(), "My Plan");
-		expect(title).toContain("My Plan");
-		expect(title).toContain("2026-03-01");
+		expect(title).toBe("My Plan");
 	});
 });
 
 describe("buildNotePushTitle", () => {
-	it("appends note title to panel title", () => {
+	it("returns the note title without metadata prefix", () => {
 		const title = buildNotePushTitle(leaf(), "My Note");
-		expect(title).toContain("My Note");
-		expect(title).toContain("2026-03-01");
+		expect(title).toBe("My Note");
 	});
 });
 
