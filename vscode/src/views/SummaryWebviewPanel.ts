@@ -62,6 +62,7 @@ import {
 	listAvailablePlans,
 	unassociatePlanFromCommit,
 } from "../core/PlanService.js";
+import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import {
 	BindingRequiredError,
 	deleteFromJolli,
@@ -74,15 +75,18 @@ import {
 	handleCreatePr,
 	handlePrepareUpdatePr,
 	handleUpdatePr,
+	isCommitReachableFromHead,
 	wrapWithMarkers,
 } from "../services/PrCommentService.js";
 import {
 	deriveRepoNameFromUrl,
 	getCanonicalRepoUrl,
 } from "../util/GitRemoteUtils.js";
+import { isWorkerBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
+import { loadBranchSummaries } from "./BranchSummaryLoader.js";
 import {
 	buildE2eTestSection,
 	buildHtml,
@@ -91,6 +95,7 @@ import {
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
+import { buildAggregatedPrMarkdown } from "./SummaryPrAggregateMarkdownBuilder.js";
 import { buildPrMarkdown } from "./SummaryPrMarkdownBuilder.js";
 import {
 	buildBranchRelativePath,
@@ -170,6 +175,25 @@ interface TranscriptEntryUpdate {
 /** Source of the panel — determines which static slot it occupies. */
 export type SummaryPanelSource = "memory" | "commit" | "kb";
 
+// Single source of truth for Create/Update PR body assembly. Aggregates
+// when the branch has 2+ summaries; otherwise falls back to single-summary
+// `buildPrMarkdown` and (when missingCount > 0) appends a "K skipped"
+// footnote so partial-coverage branches don't render as misleading
+// single-commit PRs.
+function buildPrBodyMarkdown(
+	currentSummary: CommitSummary,
+	summaries: ReadonlyArray<CommitSummary>,
+	missingCount: number,
+	isCrossBranch: boolean,
+): string {
+	if (!isCrossBranch && summaries.length >= 2) {
+		return buildAggregatedPrMarkdown(summaries, missingCount);
+	}
+	const base = buildPrMarkdown(currentSummary);
+	if (missingCount <= 0) return base;
+	return `${base}\n\n> Note: ${missingCount} commit(s) without summary were skipped.`;
+}
+
 export class SummaryWebviewPanel {
 	/**
 	 * Single slot for panels opened from the Memories tree. Clicking another
@@ -210,16 +234,25 @@ export class SummaryWebviewPanel {
 	 */
 	private disposed = false;
 
+	private readonly bridge: JolliMemoryBridge;
+	// Snapshot of `CommitsStore.getMainBranch()` at panel creation. Revisit
+	// when `setMainBranch` is wired to a UI control (today there is no caller).
+	private readonly mainBranch: string;
+
 	private constructor(
 		extensionUri: vscode.Uri,
 		workspaceRoot: string,
 		source: SummaryPanelSource,
 		commitHash: string,
+		bridge: JolliMemoryBridge,
+		mainBranch: string,
 	) {
 		this.extensionUri = extensionUri;
 		this.workspaceRoot = workspaceRoot;
 		this.source = source;
 		this.commitHash = commitHash;
+		this.bridge = bridge;
+		this.mainBranch = mainBranch;
 		// Distinct viewType per source keeps the two panels independently identified by VSCode.
 		const viewType =
 			source === "memory"
@@ -476,24 +509,13 @@ export class SummaryWebviewPanel {
 				break;
 			case "prepareCreatePr":
 				if (this.currentSummary) {
-					const body = wrapWithMarkers(buildPrMarkdown(this.currentSummary));
-					const title = this.currentSummary.commitMessage;
-					void this.panel.webview.postMessage({
-						command: "prShowCreateForm",
-						body,
-						title,
-					});
+					this.catchAndShow(this.handlePrepareCreatePr(), "Prepare PR failed");
 				}
 				break;
 			case "prepareUpdatePr":
 				if (this.currentSummary) {
 					this.catchAndShow(
-						handlePrepareUpdatePr(
-							this.currentSummary,
-							this.workspaceRoot,
-							(msg) => this.panel.webview.postMessage(msg),
-							buildPrMarkdown,
-						),
+						this.handlePrepareUpdatePr(),
 						"Load PR data failed",
 					);
 				}
@@ -581,6 +603,8 @@ export class SummaryWebviewPanel {
 		summary: CommitSummary,
 		extensionUri: vscode.Uri,
 		workspaceRoot: string,
+		bridge: JolliMemoryBridge,
+		mainBranch: string,
 		source: SummaryPanelSource = "commit",
 	): Promise<void> {
 		const config = await loadGlobalConfig();
@@ -634,6 +658,8 @@ export class SummaryWebviewPanel {
 			workspaceRoot,
 			source,
 			summary.commitHash,
+			bridge,
+			mainBranch,
 		);
 		instance.pushAction = pushAction;
 		if (source === "memory") {
@@ -771,6 +797,106 @@ export class SummaryWebviewPanel {
 		const markdown = buildMarkdown(summary);
 		await vscode.workspace.fs.writeFile(uri, Buffer.from(markdown, "utf-8"));
 		vscode.window.showInformationMessage(`Saved to ${uri.fsPath}`);
+	}
+
+	private async handlePrepareCreatePr(): Promise<void> {
+		// biome-ignore lint/style/noNonNullAssertion: dispatch guard ensures currentSummary is set
+		const summary = this.currentSummary!;
+		const postMessage = (msg: Record<string, unknown>): void => {
+			this.panel.webview.postMessage(msg);
+		};
+
+		if (await this.handleWorkerBusyOrContinue(summary, postMessage)) {
+			return;
+		}
+
+		const { isCrossBranch, summaries, missingCount } =
+			await this.resolveBranchContext(summary);
+		const markdown = buildPrBodyMarkdown(
+			summary,
+			summaries,
+			missingCount,
+			isCrossBranch,
+		);
+		const useAggregate = !isCrossBranch && summaries.length >= 2;
+		const title = useAggregate
+			? summaries[summaries.length - 1].commitMessage
+			: summary.commitMessage;
+		postMessage({
+			command: "prShowCreateForm",
+			body: wrapWithMarkers(markdown),
+			title,
+		});
+	}
+
+	private async handlePrepareUpdatePr(): Promise<void> {
+		// biome-ignore lint/style/noNonNullAssertion: dispatch guard ensures currentSummary is set
+		const summary = this.currentSummary!;
+		const postMessage = (msg: Record<string, unknown>): void => {
+			this.panel.webview.postMessage(msg);
+		};
+
+		if (await this.handleWorkerBusyOrContinue(summary, postMessage)) {
+			return;
+		}
+
+		const { isCrossBranch, summaries, missingCount } =
+			await this.resolveBranchContext(summary);
+		const markdown = buildPrBodyMarkdown(
+			summary,
+			summaries,
+			missingCount,
+			isCrossBranch,
+		);
+
+		await handlePrepareUpdatePr(
+			summary.branch,
+			summary.commitHash,
+			markdown,
+			this.workspaceRoot,
+			postMessage,
+		);
+	}
+
+	// Returns true when worker is busy: shows the toast and re-runs the
+	// status check so the click-time "Loading..." button gets rebuilt.
+	private async handleWorkerBusyOrContinue(
+		summary: CommitSummary,
+		postMessage: (msg: Record<string, unknown>) => void,
+	): Promise<boolean> {
+		if (!(await isWorkerBusy(this.workspaceRoot))) {
+			return false;
+		}
+		vscode.window.showWarningMessage(
+			"Jolli Memory: AI summary is being generated. Please wait a moment.",
+		);
+		await handleCheckPrStatus(
+			this.workspaceRoot,
+			postMessage,
+			summary.branch,
+			summary.commitHash,
+		);
+		return true;
+	}
+
+	private async resolveBranchContext(summary: CommitSummary): Promise<{
+		isCrossBranch: boolean;
+		summaries: ReadonlyArray<CommitSummary>;
+		missingCount: number;
+	}> {
+		const isCrossBranch = !(await isCommitReachableFromHead(
+			this.workspaceRoot,
+			summary.commitHash,
+		));
+		if (isCrossBranch) {
+			return { isCrossBranch: true, summaries: [], missingCount: 0 };
+		}
+		const result = await loadBranchSummaries(this.bridge, this.mainBranch);
+		return {
+			isCrossBranch: false,
+			summaries: result.summaries,
+			missingCount: result.missingCount,
+		};
 	}
 
 	/**
@@ -1894,7 +2020,7 @@ export class SummaryWebviewPanel {
 				if (n.id !== id) {
 					return n;
 				}
-				const updates: Partial<NoteReference> = {};
+				const updates: { title?: string; content?: string } = {};
 				if (newTitle) {
 					updates.title = newTitle;
 				}
@@ -2044,7 +2170,7 @@ export class SummaryWebviewPanel {
 				if (n.id !== id) {
 					return n;
 				}
-				const updates: Partial<NoteReference> = {};
+				const updates: { title?: string; content?: string } = {};
 				if (newTitle) {
 					updates.title = newTitle;
 				}

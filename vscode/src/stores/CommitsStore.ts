@@ -80,6 +80,19 @@ export class CommitsStore extends BaseStore<
 		this.rebuildSnapshot("mainBranch");
 	}
 
+	/**
+	 * Returns the configured main branch name (default `"main"`).
+	 *
+	 * Public read access for callers that need the same baseline the store
+	 * uses for `bridge.listBranchCommits` — e.g. `SummaryWebviewPanel` when
+	 * loading branch summaries to assemble a multi-commit PR body. Kept as a
+	 * getter (rather than exposing the field) so a future `setMainBranch`
+	 * caller wiring config-driven values doesn't change the read API.
+	 */
+	getMainBranch(): string {
+		return this.mainBranch;
+	}
+
 	// ── Reads ─────────────────────────────────────────────────────────────────
 
 	/** File list for a commit (promise-cached to dedupe concurrent expands). */

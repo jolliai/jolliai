@@ -304,11 +304,14 @@ const {
 	mockHandleCreatePr,
 	mockHandlePrepareUpdatePr,
 	mockHandleUpdatePr,
+	mockIsCommitReachableFromHead,
 } = vi.hoisted(() => ({
 	mockHandleCheckPrStatus: vi.fn().mockResolvedValue(undefined),
 	mockHandleCreatePr: vi.fn().mockResolvedValue(undefined),
 	mockHandlePrepareUpdatePr: vi.fn().mockResolvedValue(undefined),
 	mockHandleUpdatePr: vi.fn().mockResolvedValue(undefined),
+	// Default: commit IS reachable from HEAD (i.e., NOT cross-branch).
+	mockIsCommitReachableFromHead: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("../services/PrCommentService.js", () => ({
@@ -316,7 +319,35 @@ vi.mock("../services/PrCommentService.js", () => ({
 	handleCreatePr: mockHandleCreatePr,
 	handlePrepareUpdatePr: mockHandlePrepareUpdatePr,
 	handleUpdatePr: mockHandleUpdatePr,
+	isCommitReachableFromHead: mockIsCommitReachableFromHead,
 	wrapWithMarkers: (s: string) => `[MARKERS]${s}[/MARKERS]`,
+}));
+
+const { mockIsWorkerBusy } = vi.hoisted(() => ({
+	mockIsWorkerBusy: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../util/LockUtils.js", () => ({
+	isWorkerBusy: mockIsWorkerBusy,
+}));
+
+const { mockLoadBranchSummaries } = vi.hoisted(() => ({
+	// Default: empty branch summaries → routes through single-summary path.
+	mockLoadBranchSummaries: vi
+		.fn()
+		.mockResolvedValue({ summaries: [], missingCount: 0, totalCount: 0 }),
+}));
+
+vi.mock("./BranchSummaryLoader.js", () => ({
+	loadBranchSummaries: mockLoadBranchSummaries,
+}));
+
+const { mockBuildAggregatedPrMarkdown } = vi.hoisted(() => ({
+	mockBuildAggregatedPrMarkdown: vi.fn().mockReturnValue("# Aggregated body"),
+}));
+
+vi.mock("./SummaryPrAggregateMarkdownBuilder.js", () => ({
+	buildAggregatedPrMarkdown: mockBuildAggregatedPrMarkdown,
 }));
 
 vi.mock("../util/Logger.js", () => ({
@@ -428,6 +459,13 @@ function makeSummary(overrides?: Partial<CommitSummary>): CommitSummary {
 
 const extensionUri = { fsPath: "/ext", toString: () => "/ext" } as never;
 const workspaceRoot = "/workspace";
+// Bridge stub used to satisfy the panel ctor signature; tests in this file
+// don't exercise branch-summary loading. Methods stay unused.
+const stubBridge = {
+	listBranchCommits: vi.fn(),
+	getSummary: vi.fn(),
+} as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
+const mainBranch = "main";
 
 /**
  * Captures the onDidReceiveMessage callback registered by the panel constructor,
@@ -486,7 +524,13 @@ describe("SummaryWebviewPanel", () => {
 	describe("show()", () => {
 		it("creates a new webview panel when none exists (commit slot by default)", async () => {
 			const summary = makeSummary();
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			expect(createWebviewPanel).toHaveBeenCalledWith(
 				"jollimemory.summary.commit",
@@ -505,6 +549,8 @@ describe("SummaryWebviewPanel", () => {
 				summary,
 				extensionUri,
 				workspaceRoot,
+				stubBridge,
+				mainBranch,
 				"memory",
 			);
 
@@ -527,6 +573,8 @@ describe("SummaryWebviewPanel", () => {
 				summary1,
 				extensionUri,
 				workspaceRoot,
+				stubBridge,
+				mainBranch,
 				"commit",
 			);
 			const commitPanelDispose =
@@ -536,6 +584,8 @@ describe("SummaryWebviewPanel", () => {
 				summary2,
 				extensionUri,
 				workspaceRoot,
+				stubBridge,
+				mainBranch,
 				"memory",
 			);
 
@@ -546,7 +596,13 @@ describe("SummaryWebviewPanel", () => {
 		it("sets panel title from buildPanelTitle", async () => {
 			mockBuildPanelTitle.mockReturnValue("Custom Title");
 			const summary = makeSummary();
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			const panel = createWebviewPanel.mock.results[0].value;
 			expect(panel.title).toBe("Custom Title");
@@ -555,7 +611,13 @@ describe("SummaryWebviewPanel", () => {
 		it("sets HTML content from buildHtml", async () => {
 			mockBuildHtml.mockReturnValue("<html>test content</html>");
 			const summary = makeSummary();
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			const panel = createWebviewPanel.mock.results[0].value;
 			expect(panel.webview.html).toBe("<html>test content</html>");
@@ -573,7 +635,13 @@ describe("SummaryWebviewPanel", () => {
 
 		it("dispose handler removes the commit panel from the per-hash map", async () => {
 			const summary = makeSummary();
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			expect(onDidDispose).toHaveBeenCalled();
 			const disposeCallback = onDidDispose.mock.calls[0][0] as () => void;
@@ -581,7 +649,13 @@ describe("SummaryWebviewPanel", () => {
 
 			// After dispose, a new call to show() for the same commit should
 			// create a new panel (instead of revealing the now-disposed one).
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 			expect(createWebviewPanel).toHaveBeenCalledTimes(2);
 		});
 
@@ -589,10 +663,22 @@ describe("SummaryWebviewPanel", () => {
 			const summary1 = makeSummary({ commitHash: "aaa" });
 			const summary2 = makeSummary({ commitHash: "bbb" });
 
-			await SummaryWebviewPanel.show(summary1, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary1,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 			const firstPanelDispose =
 				createWebviewPanel.mock.results[0].value.dispose;
-			await SummaryWebviewPanel.show(summary2, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary2,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			expect(createWebviewPanel).toHaveBeenCalledTimes(2);
 			expect(firstPanelDispose).not.toHaveBeenCalled();
@@ -601,9 +687,21 @@ describe("SummaryWebviewPanel", () => {
 		it("commit slot: reveals the existing panel when the same commit is shown again", async () => {
 			const summary = makeSummary({ commitHash: "aaa" });
 
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 			reveal.mockClear();
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			expect(createWebviewPanel).toHaveBeenCalledTimes(1);
 			// reveal() with undefined viewColumn keeps the panel in its current column
@@ -614,11 +712,23 @@ describe("SummaryWebviewPanel", () => {
 		it("commit slot: skips webview re-render when summary + config + orphan state all unchanged", async () => {
 			const summary = makeSummary({ commitHash: "aaa" });
 
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 			mockGetTranscriptHashes.mockClear();
 			mockBuildHtml.mockClear();
 
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			// Refreshes always run (they're cheap reads that cover orphan-branch
 			// state which can change without a summary JSON change). But when all
@@ -637,7 +747,13 @@ describe("SummaryWebviewPanel", () => {
 				model: "m",
 				pushAction: "jolli",
 			});
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 			mockBuildHtml.mockClear();
 
 			mockLoadConfig.mockResolvedValueOnce({
@@ -645,7 +761,13 @@ describe("SummaryWebviewPanel", () => {
 				model: "m",
 				pushAction: "both",
 			});
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			expect(mockBuildHtml).toHaveBeenCalledWith(
 				summary,
@@ -657,13 +779,25 @@ describe("SummaryWebviewPanel", () => {
 			const summary = makeSummary({ commitHash: "aaa" });
 
 			mockGetTranscriptHashes.mockResolvedValueOnce(new Set<string>());
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 			mockBuildHtml.mockClear();
 
 			// Background session added a transcript for this commit — summary JSON
 			// is identical, but the orphan-branch state changed.
 			mockGetTranscriptHashes.mockResolvedValueOnce(new Set(["aaa"]));
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			expect(mockBuildHtml).toHaveBeenCalledWith(
 				summary,
@@ -675,11 +809,23 @@ describe("SummaryWebviewPanel", () => {
 			const summary1 = makeSummary({ commitHash: "aaa", commitMessage: "v1" });
 			const summary2 = makeSummary({ commitHash: "aaa", commitMessage: "v2" });
 
-			await SummaryWebviewPanel.show(summary1, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary1,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 			mockGetTranscriptHashes.mockClear();
 			mockBuildHtml.mockClear();
 
-			await SummaryWebviewPanel.show(summary2, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary2,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			// Content differs → refresh + update runs on the existing panel.
 			expect(createWebviewPanel).toHaveBeenCalledTimes(1);
@@ -695,6 +841,8 @@ describe("SummaryWebviewPanel", () => {
 				summary1,
 				extensionUri,
 				workspaceRoot,
+				stubBridge,
+				mainBranch,
 				"memory",
 			);
 			const firstPanelDispose =
@@ -703,6 +851,8 @@ describe("SummaryWebviewPanel", () => {
 				summary2,
 				extensionUri,
 				workspaceRoot,
+				stubBridge,
+				mainBranch,
 				"memory",
 			);
 
@@ -719,8 +869,20 @@ describe("SummaryWebviewPanel", () => {
 				.mockReturnValueOnce("<html>first</html>")
 				.mockReturnValueOnce("<html>second</html>");
 
-			await SummaryWebviewPanel.show(summary1, extensionUri, workspaceRoot);
-			await SummaryWebviewPanel.show(summary2, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary1,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			await SummaryWebviewPanel.show(
+				summary2,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			const secondPanel = createWebviewPanel.mock.results[1].value;
 			expect(secondPanel.webview.html).toBe("<html>second</html>");
@@ -732,6 +894,8 @@ describe("SummaryWebviewPanel", () => {
 				summary,
 				extensionUri,
 				workspaceRoot,
+				stubBridge,
+				mainBranch,
 				"memory",
 			);
 
@@ -771,7 +935,13 @@ describe("SummaryWebviewPanel", () => {
 					}),
 				],
 			});
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			// buildHtml should receive all 3 hashes (root + child + grandchild) intersected with file hashes
 			expect(mockBuildHtml).toHaveBeenCalledWith(
@@ -789,7 +959,13 @@ describe("SummaryWebviewPanel", () => {
 		it("populates transcriptHashSet from orphan branch", async () => {
 			mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
 			const summary = makeSummary({ commitHash: "abc123" });
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			// buildHtml should receive the intersection of tree hashes and file hashes
 			expect(mockBuildHtml).toHaveBeenCalledWith(
@@ -823,7 +999,13 @@ describe("SummaryWebviewPanel", () => {
 					},
 				],
 			});
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			// plan-1 has CJK title, plan-2 does not and readPlanFromBranch returns null
 			expect(mockBuildHtml).toHaveBeenCalledWith(
@@ -851,7 +1033,13 @@ describe("SummaryWebviewPanel", () => {
 					},
 				],
 			});
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			expect(mockBuildHtml).toHaveBeenCalledWith(
 				summary,
@@ -884,7 +1072,13 @@ describe("SummaryWebviewPanel", () => {
 					},
 				],
 			});
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			// cn-note has CJK title, en-note does not
 			expect(mockBuildHtml).toHaveBeenCalledWith(
@@ -912,7 +1106,13 @@ describe("SummaryWebviewPanel", () => {
 					},
 				],
 			});
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			expect(mockBuildHtml).toHaveBeenCalledWith(
 				summary,
@@ -939,7 +1139,13 @@ describe("SummaryWebviewPanel", () => {
 					},
 				],
 			});
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			expect(mockBuildHtml).toHaveBeenCalledWith(
 				summary,
@@ -966,7 +1172,13 @@ describe("SummaryWebviewPanel", () => {
 					},
 				],
 			});
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 
 			// noteTranslateSet should be empty since read failed
 			expect(mockBuildHtml).toHaveBeenCalledWith(
@@ -990,7 +1202,13 @@ describe("SummaryWebviewPanel", () => {
 			overrides?: Partial<CommitSummary>,
 		): Promise<(msg: Record<string, unknown>) => void> {
 			const summary = makeSummary(overrides);
-			await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
 			return captureMessageHandler();
 		}
 
@@ -1416,7 +1634,13 @@ describe("SummaryWebviewPanel", () => {
 
 			it("returns early when currentSummary is null (handlePushToJolli guard)", async () => {
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 				// Clear the summary from the internal state to exercise lines 329-332
 				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
@@ -2439,7 +2663,10 @@ describe("SummaryWebviewPanel", () => {
 		});
 
 		describe("prepareCreatePr", () => {
-			it("posts prShowCreateForm with wrapped body and commit message title", async () => {
+			it("posts prShowCreateForm with wrapped body and commit message title (single-summary path)", async () => {
+				// Default branch state: 0 summaries → caller falls back to
+				// buildPrMarkdown(currentSummary). missingCount=0 means no footnote
+				// is appended, so the body is byte-identical to today.
 				mockBuildPrMarkdown.mockReturnValue("# fresh body");
 				const dispatch = await setupPanel({ commitMessage: "feat: add thing" });
 
@@ -2456,11 +2683,101 @@ describe("SummaryWebviewPanel", () => {
 				});
 			});
 
+			it("uses aggregated body and HEAD commit message title when branch has 2+ summaries", async () => {
+				const sA = makeSummary({
+					commitHash: "AAAA1234",
+					commitMessage: "first commit",
+				});
+				const sB = makeSummary({
+					commitHash: "BBBB5678",
+					commitMessage: "head commit",
+				});
+				mockLoadBranchSummaries.mockResolvedValueOnce({
+					summaries: [sA, sB],
+					missingCount: 0,
+					totalCount: 2,
+				});
+				mockBuildAggregatedPrMarkdown.mockReturnValueOnce("# aggregated");
+				const dispatch = await setupPanel({ commitMessage: "viewer commit" });
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				expect(mockBuildAggregatedPrMarkdown).toHaveBeenCalledWith([sA, sB], 0);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prShowCreateForm",
+					body: "[MARKERS]# aggregated[/MARKERS]",
+					title: "head commit",
+				});
+			});
+
+			it("appends missing-summary footnote when summaries.length <= 1 but missingCount > 0", async () => {
+				mockLoadBranchSummaries.mockResolvedValueOnce({
+					summaries: [],
+					missingCount: 3,
+					totalCount: 3,
+				});
+				mockBuildPrMarkdown.mockReturnValueOnce("# only body");
+				const dispatch = await setupPanel({ commitMessage: "lone msg" });
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => (c[0] as { command?: string }).command === "prShowCreateForm",
+				);
+				expect(call).toBeDefined();
+				const body = (call?.[0] as { body: string }).body;
+				expect(body).toContain("# only body");
+				expect(body).toContain(
+					"> Note: 3 commit(s) without summary were skipped.",
+				);
+			});
+
+			it("uses single-summary path on cross-branch (commit not reachable from HEAD)", async () => {
+				mockIsCommitReachableFromHead.mockResolvedValueOnce(false);
+				mockBuildPrMarkdown.mockReturnValueOnce("# cross body");
+				const dispatch = await setupPanel({ commitMessage: "cross msg" });
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				// Cross-branch must NOT call loadBranchSummaries.
+				expect(mockLoadBranchSummaries).not.toHaveBeenCalled();
+				expect(mockBuildAggregatedPrMarkdown).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prShowCreateForm",
+					body: "[MARKERS]# cross body[/MARKERS]",
+					title: "cross msg",
+				});
+			});
+
+			it("worker-busy: shows warning + re-runs handleCheckPrStatus to reset the button", async () => {
+				mockIsWorkerBusy.mockResolvedValueOnce(true);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("AI summary is being generated"),
+				);
+				// Status check is invoked so the webview rebuilds the section,
+				// which replaces the click-time "Loading..." button with a fresh one.
+				expect(mockHandleCheckPrStatus).toHaveBeenCalled();
+				// No prShowCreateForm should be posted.
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "prShowCreateForm" }),
+				);
+			});
+
 			it("does nothing when no summary is loaded", async () => {
 				await SummaryWebviewPanel.show(
 					makeSummary(),
 					extensionUri,
 					workspaceRoot,
+					stubBridge,
+					mainBranch,
 				);
 				const dispatch = captureMessageHandler();
 				firstCommitPanel<{ currentSummary: null }>().currentSummary = null;
@@ -2476,28 +2793,89 @@ describe("SummaryWebviewPanel", () => {
 		});
 
 		describe("prepareUpdatePr", () => {
-			it("delegates to handlePrepareUpdatePr with current summary", async () => {
+			it("delegates to handlePrepareUpdatePr with single-summary markdown when branch has <= 1 summary", async () => {
+				mockBuildPrMarkdown.mockReturnValueOnce("# update body");
 				const dispatch = await setupPanel();
 
 				dispatch({ command: "prepareUpdatePr" });
 				await flushPromises();
 
 				expect(mockHandlePrepareUpdatePr).toHaveBeenCalledWith(
-					expect.objectContaining({ commitHash: "abc123" }),
+					"feature/test",
+					"abc123",
+					"# update body",
 					workspaceRoot,
 					expect.any(Function),
-					mockBuildPrMarkdown,
 				);
 			});
 
+			it("delegates with aggregated markdown when branch has 2+ summaries", async () => {
+				const sA = makeSummary({ commitHash: "AAAA1234" });
+				const sB = makeSummary({ commitHash: "BBBB5678" });
+				mockLoadBranchSummaries.mockResolvedValueOnce({
+					summaries: [sA, sB],
+					missingCount: 0,
+					totalCount: 2,
+				});
+				mockBuildAggregatedPrMarkdown.mockReturnValueOnce(
+					"# aggregated update",
+				);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "prepareUpdatePr" });
+				await flushPromises();
+
+				expect(mockBuildAggregatedPrMarkdown).toHaveBeenCalledWith([sA, sB], 0);
+				expect(mockHandlePrepareUpdatePr).toHaveBeenCalledWith(
+					"feature/test",
+					"abc123",
+					"# aggregated update",
+					workspaceRoot,
+					expect.any(Function),
+				);
+			});
+
+			it("appends missing-summary footnote on the single-summary fallback when missingCount > 0", async () => {
+				mockLoadBranchSummaries.mockResolvedValueOnce({
+					summaries: [],
+					missingCount: 4,
+					totalCount: 4,
+				});
+				mockBuildPrMarkdown.mockReturnValueOnce("# update body");
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "prepareUpdatePr" });
+				await flushPromises();
+
+				const md = mockHandlePrepareUpdatePr.mock.calls[0][2];
+				expect(md).toContain("# update body");
+				expect(md).toContain(
+					"> Note: 4 commit(s) without summary were skipped.",
+				);
+			});
+
+			it("worker-busy: shows warning + re-runs handleCheckPrStatus to reset the button", async () => {
+				mockIsWorkerBusy.mockResolvedValueOnce(true);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "prepareUpdatePr" });
+				await flushPromises();
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("AI summary is being generated"),
+				);
+				expect(mockHandleCheckPrStatus).toHaveBeenCalled();
+				expect(mockHandlePrepareUpdatePr).not.toHaveBeenCalled();
+			});
+
 			it("forwards postMessage callback to the webview panel", async () => {
-				// Make handlePrepareUpdatePr invoke the callback to exercise the lambda on line 210
 				mockHandlePrepareUpdatePr.mockImplementationOnce(
 					(
-						_summary: unknown,
+						_branch: string,
+						_hash: string,
+						_md: string,
 						_cwd: string,
 						pm: (msg: Record<string, unknown>) => void,
-						_buildPr: unknown,
 					) => Promise.resolve(pm({ command: "prDataLoaded" })),
 				);
 				const dispatch = await setupPanel();
@@ -2587,7 +2965,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -2658,7 +3042,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -2727,7 +3117,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -2773,7 +3169,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -2808,7 +3210,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -2960,7 +3368,13 @@ describe("SummaryWebviewPanel", () => {
 				// Create a panel, then clear the internal currentSummary to exercise
 				// the `if (!summary) { return; }` guard on line 807-809.
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 				// Clear the summary from the internal state
 				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
@@ -3022,7 +3436,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadAllTranscripts" });
@@ -3072,7 +3492,13 @@ describe("SummaryWebviewPanel", () => {
 				]);
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadAllTranscripts" });
@@ -3122,7 +3548,13 @@ describe("SummaryWebviewPanel", () => {
 				]);
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadAllTranscripts" });
@@ -3165,7 +3597,13 @@ describe("SummaryWebviewPanel", () => {
 					]),
 				);
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({
@@ -3216,7 +3654,13 @@ describe("SummaryWebviewPanel", () => {
 					]),
 				);
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({
@@ -3286,7 +3730,13 @@ describe("SummaryWebviewPanel", () => {
 				const summary = makeSummary({
 					children: [makeSummary({ commitHash: "def456" })],
 				});
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				// Send entries only for abc123 — def456 has no entries so should be deleted
@@ -3320,7 +3770,13 @@ describe("SummaryWebviewPanel", () => {
 			it("deletes all transcript files for current summary", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "deleteAllTranscripts" });
@@ -3349,7 +3805,13 @@ describe("SummaryWebviewPanel", () => {
 			it("skips refresh when currentSummary is null during delete", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				// Clear the summary after showing the panel
 				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
 				panelInstance.currentSummary = null;
@@ -3409,7 +3871,13 @@ describe("SummaryWebviewPanel", () => {
 				(msg: Record<string, unknown>) => void
 			> {
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
 				panelInstance.currentSummary = null;
@@ -3537,7 +4005,13 @@ describe("SummaryWebviewPanel", () => {
 				// The dispatch-level guard `if (this.currentSummary)` prevents handlePush
 				// from being called at all when the summary is cleared.
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
 				panelInstance.currentSummary = null;
 				mockLoadConfig.mockClear();
@@ -3821,7 +4295,13 @@ describe("SummaryWebviewPanel", () => {
 			it("sets transcriptHashSet to empty on error", async () => {
 				mockGetTranscriptHashes.mockRejectedValue(new Error("git error"));
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 
 				// buildHtml should have been called with an empty set
 				expect(mockBuildHtml).toHaveBeenCalledWith(
@@ -3839,7 +4319,13 @@ describe("SummaryWebviewPanel", () => {
 			it("handles non-Error rejection via String()", async () => {
 				mockGetTranscriptHashes.mockRejectedValue("string git error");
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 
 				expect(warn).toHaveBeenCalledWith(
 					expect.stringContaining("Failed to load transcript hashes"),
@@ -3868,7 +4354,13 @@ describe("SummaryWebviewPanel", () => {
 						},
 					],
 				});
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 
 				// plan should NOT be in planTranslateSet because read failed
 				expect(mockBuildHtml).toHaveBeenCalledWith(
@@ -3906,7 +4398,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -4074,7 +4572,13 @@ describe("SummaryWebviewPanel", () => {
 				);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -4091,7 +4595,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockRejectedValue("string rejection");
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -4132,7 +4642,13 @@ describe("SummaryWebviewPanel", () => {
 					]),
 				);
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({
@@ -4243,7 +4759,13 @@ describe("SummaryWebviewPanel", () => {
 				]);
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadAllTranscripts" });
@@ -4284,7 +4806,13 @@ describe("SummaryWebviewPanel", () => {
 					]),
 				);
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({
@@ -4482,7 +5010,13 @@ describe("SummaryWebviewPanel", () => {
 
 			it("returns early when currentSummary is null", async () => {
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
 				panelInstance.currentSummary = null;
@@ -5363,7 +5897,13 @@ describe("SummaryWebviewPanel", () => {
 				(msg: Record<string, unknown>) => void
 			> {
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 				const panelInstance = firstCommitPanel<{ currentSummary: null }>();
 				panelInstance.currentSummary = null;
@@ -5635,7 +6175,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });

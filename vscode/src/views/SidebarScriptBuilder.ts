@@ -1384,12 +1384,16 @@ export function buildSidebarScript(): string {
         // button below that threshold; it auto-re-enables when the user picks
         // a 2nd commit because branch:commitsData triggers renderBranch which
         // rebuilds these section actions with a fresh selectedCount.
+        // Push Branch is also exposed in multi mode now that PushCommand
+        // supports any commit count >= 1 — squashing remains a user choice,
+        // not a precondition.
         const selectedCount = branchData.commits.filter(function(c) {
           return !!c.isSelected;
         }).length;
         return [
           iconButton('commits-select-all', 'Select/Deselect All Commits', 'check-all'),
           iconButton('commits-squash',     'Squash Selected',             'git-merge', { disabled: selectedCount < 2 }),
+          iconButton('commits-push-branch', 'Push Branch',                'cloud-upload'),
         ];
       }
       if (m === 'single') {

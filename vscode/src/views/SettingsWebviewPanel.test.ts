@@ -1326,8 +1326,7 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(logError).toHaveBeenCalledWith(
 				"SettingsPanel",
-				"Failed to sync Claude hook for %s: %s",
-				"/workspace",
+				"Failed to sync Claude hook for /workspace",
 				expect.any(Error),
 			);
 			expect(mockInstallGeminiHook).toHaveBeenCalledWith("/workspace");
@@ -1362,8 +1361,7 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(logError).toHaveBeenCalledWith(
 				"SettingsPanel",
-				"Failed to sync Claude hook for %s: %s",
-				"/workspace",
+				"Failed to sync Claude hook for /workspace",
 				expect.any(Error),
 			);
 			expect(mockInstallGeminiHook).toHaveBeenCalledWith("/workspace");
@@ -1397,8 +1395,7 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(logError).toHaveBeenCalledWith(
 				"SettingsPanel",
-				"Failed to sync Gemini hook for %s: %s",
-				"/workspace",
+				"Failed to sync Gemini hook for /workspace",
 				expect.any(Error),
 			);
 			expect(mockInstallClaudeHook).toHaveBeenCalledWith("/workspace");
@@ -1432,8 +1429,7 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(logError).toHaveBeenCalledWith(
 				"SettingsPanel",
-				"Failed to sync Gemini hook for %s: %s",
-				"/workspace",
+				"Failed to sync Gemini hook for /workspace",
 				expect.any(Error),
 			);
 			expect(mockInstallClaudeHook).toHaveBeenCalledWith("/workspace");

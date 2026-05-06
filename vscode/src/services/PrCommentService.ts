@@ -19,7 +19,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
-import type { CommitSummary } from "../../../cli/src/Types.js";
 import { log } from "../util/Logger.js";
 
 const execFileAsync = promisify(execFile);
@@ -205,60 +204,6 @@ async function execGit(args: Array<string>, cwd: string): Promise<string> {
 	return stdout;
 }
 
-/**
- * Resolves the upstream default branch (what `origin/HEAD` points to), e.g.
- * `"origin/main"`, `"origin/master"`, `"origin/trunk"`. Returns `undefined`
- * when the ref is not set — common and healthy in repos without an `origin`
- * remote, in fresh clones before the first fetch, in detached states, or when
- * `origin/HEAD` was never pinned. Undefined is an expected outcome, not an
- * error: callers should treat it as "no baseline in this repo".
- */
-async function resolveUpstreamBaseline(
-	cwd: string,
-): Promise<string | undefined> {
-	try {
-		const raw = await execGit(
-			["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-			cwd,
-		);
-		const trimmed = raw.trim();
-		return trimmed.length > 0 ? trimmed : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Returns the number of commits on the current branch that are ahead of the
- * upstream default branch. Used only to gate the "multiple commits — please
- * squash" UI, so 0 means "don't gate" — a safe fallback whenever the baseline
- * cannot be determined or the count cannot be computed.
- */
-async function getCommitCount(cwd: string): Promise<number> {
-	const baseline = await resolveUpstreamBaseline(cwd);
-	if (!baseline) {
-		// No upstream baseline in this repo — squash gate does not apply.
-		// Silent: this is the normal state for many healthy setups (no
-		// `origin`, fresh clone, detached HEAD), not a condition to warn about.
-		return 0;
-	}
-	try {
-		const raw = await execGit(
-			["rev-list", "--count", `${baseline}..HEAD`],
-			cwd,
-		);
-		return Number.parseInt(raw.trim(), 10) || 0;
-	} catch (err) {
-		// Baseline resolved but rev-list failed — unusual (e.g. corrupted
-		// repo, permissions). Worth a warn so debug.log has a trail.
-		log.warn(
-			TAG,
-			`git rev-list --count ${baseline}..HEAD failed: ${(err as Error).message}`,
-		);
-		return 0;
-	}
-}
-
 /** Returns the current branch name. */
 async function getCurrentBranch(cwd: string): Promise<string> {
 	const raw = await execGit(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
@@ -293,7 +238,7 @@ async function getCurrentBranch(cwd: string): Promise<string> {
  * HEAD, 1 when it is not, and other codes on internal errors — in all
  * failure modes we conservatively return false.
  */
-async function isCommitReachableFromHead(
+export async function isCommitReachableFromHead(
 	cwd: string,
 	commitHash: string,
 ): Promise<boolean> {
@@ -454,19 +399,6 @@ export async function handleCheckPrStatus(
 			? (summaryBranch ?? currentBranch)
 			: currentBranch;
 
-		// Commit-count check: only relevant for the current working branch.
-		if (!isCrossBranch) {
-			const commitCount = await getCommitCount(cwd);
-			if (commitCount > 1) {
-				postMessage({
-					command: "prStatus",
-					status: "multipleCommits",
-					count: commitCount,
-				});
-				return;
-			}
-		}
-
 		// Check gh availability — distinguish "not installed" (definitive) from
 		// transient spawn errors so the user gets an actionable message.
 		const availability = await checkGhInstalled(cwd);
@@ -588,29 +520,32 @@ export async function handleCreatePr(
 
 /**
  * Prepares the Update PR form by fetching the current PR data,
- * replacing the marker region with the latest summary, and sending
- * the pre-filled title + body to the webview.
+ * replacing the marker region with the caller-provided markdown, and
+ * sending the pre-filled title + body to the webview.
  *
- * The branch is read directly from `summary.branch` — no separate parameter
- * needed, avoiding drift between the summary object and a loose branch arg.
+ * The caller is responsible for assembling `markdown` (single-summary or
+ * branch-aggregated) and for cross-branch detection — so this function
+ * only handles the GitHub-side lookup + marker replacement, keeping its
+ * single-responsibility scope. See `SummaryWebviewPanel.handlePrepareUpdatePr`.
+ *
+ * `summaryBranch` / `summaryCommitHash` are passed through to mirror the
+ * branch-resolution logic in `handleCheckPrStatus` (cross-branch falls back
+ * to `summaryBranch`; normal case uses the current branch).
  */
 export async function handlePrepareUpdatePr(
-	summary: CommitSummary,
+	summaryBranch: string | undefined,
+	summaryCommitHash: string | undefined,
+	markdown: string,
 	cwd: string,
 	postMessage: PostMessageFn,
-	buildMarkdownFn: (s: CommitSummary) => string,
 ): Promise<void> {
 	try {
-		// Same lookup strategy as handleCheckPrStatus — see the Cross-branch
-		// section above. Normal case: use current branch so the pre-filled
-		// edit form targets the PR that was just created.
-		const isCrossBranch = !(await isCommitReachableFromHead(
-			cwd,
-			summary.commitHash,
-		));
+		const isCrossBranch = summaryCommitHash
+			? !(await isCommitReachableFromHead(cwd, summaryCommitHash))
+			: false;
 		const currentBranch = await getCurrentBranch(cwd);
 		const targetBranch = isCrossBranch
-			? (summary.branch ?? currentBranch)
+			? (summaryBranch ?? currentBranch)
 			: currentBranch;
 		const pr = await findPrForBranch(cwd, targetBranch);
 		if (!pr) {
@@ -620,7 +555,6 @@ export async function handlePrepareUpdatePr(
 			return;
 		}
 
-		const markdown = buildMarkdownFn(summary);
 		const newBody = replaceSummaryInBody(pr.body || "", markdown);
 
 		postMessage({
@@ -878,12 +812,7 @@ export function buildPrMessageScript(): string {
       prCurrentState = s;
       prHide(prForm);
 
-      if (s === 'multipleCommits') {
-        prStatusText.textContent = 'Branch has ' + msg.count + ' commits. Please squash into a single commit before creating or updating a PR.';
-        prShow(prStatusText);
-        prHide(prLinkRow);
-        prHide(prActions);
-      } else if (s === 'notInstalled') {
+      if (s === 'notInstalled') {
         prStatusText.textContent = 'GitHub CLI (gh) is not installed. Install it from https://cli.github.com/ and reload the window.';
         prShow(prStatusText);
         prHide(prLinkRow);

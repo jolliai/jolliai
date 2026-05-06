@@ -381,12 +381,7 @@ export class SettingsWebviewPanel {
 					await removeClaudeHook(wt);
 				}
 			} catch (err: unknown) {
-				log.error(
-					"SettingsPanel",
-					"Failed to sync Claude hook for %s: %s",
-					wt,
-					err,
-				);
+				log.error("SettingsPanel", `Failed to sync Claude hook for ${wt}`, err);
 				failures.push({ integration: "Claude", worktree: wt, cause: err });
 			}
 
@@ -397,12 +392,7 @@ export class SettingsWebviewPanel {
 					await removeGeminiHook(wt);
 				}
 			} catch (err: unknown) {
-				log.error(
-					"SettingsPanel",
-					"Failed to sync Gemini hook for %s: %s",
-					wt,
-					err,
-				);
+				log.error("SettingsPanel", `Failed to sync Gemini hook for ${wt}`, err);
 				failures.push({ integration: "Gemini", worktree: wt, cause: err });
 			}
 		}

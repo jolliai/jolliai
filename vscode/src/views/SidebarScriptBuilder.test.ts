@@ -654,6 +654,20 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toMatch(/iconButton\('commits-push-branch',/);
 		});
 
+		it("multi mode toolbar includes pushBranch alongside select-all and squash", () => {
+			// Multi-commit branches now support push directly (no squash precondition).
+			// Assert the multi branch in the rendered JS contains all three button ids.
+			const js = buildSidebarScript();
+			const multiMatch = js.match(
+				/if \(m === 'multi'\)[\s\S]*?return \[([\s\S]*?)\];/,
+			);
+			expect(multiMatch).not.toBeNull();
+			const multiArr = multiMatch?.[1] ?? "";
+			expect(multiArr).toMatch(/iconButton\('commits-select-all',/);
+			expect(multiArr).toMatch(/iconButton\('commits-squash',/);
+			expect(multiArr).toMatch(/iconButton\('commits-push-branch',/);
+		});
+
 		it("uses codicons matching package.json contributes (check-all / git-merge / cloud-upload)", () => {
 			const js = buildSidebarScript();
 			// `[,)]` accepts either a closing paren (no opts arg) or a comma

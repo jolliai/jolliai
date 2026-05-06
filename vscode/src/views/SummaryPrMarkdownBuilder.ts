@@ -12,6 +12,11 @@
  * (`pushPlansAndNotesSection`, `pushRecapSection`, `pushFooter`) imported
  * from that file so recap, plans, and footer rendering stays identical
  * between clipboard and PR output.
+ *
+ * The four file-local helpers `wrapInGithubDetails`, `escapeGithubWrapperTags`,
+ * `pushPrE2eTestSection`, and `pushPrTopicBody` are exported so the
+ * branch-aggregating builder (`SummaryPrAggregateMarkdownBuilder`) can reuse
+ * the same fold/escape/render conventions across multi-commit PR bodies.
  */
 
 import type { CommitSummary, E2eTestScenario } from "../../../cli/src/Types.js";
@@ -83,7 +88,7 @@ export function buildPrMarkdown(summary: CommitSummary): string {
  * `<blockquote>` and the first body block is preserved (needed by GFM to
  * switch from HTML mode to markdown parsing inside the blockquote).
  */
-function wrapInGithubDetails(
+export function wrapInGithubDetails(
 	summaryContent: string,
 	bodyLines: Array<string>,
 ): Array<string> {
@@ -114,7 +119,7 @@ function wrapInGithubDetails(
  * NOTE: Only applied to generated content inside buildPrMarkdown. User-edited
  * textarea content is NOT re-sanitized on submit (by design).
  */
-function escapeGithubWrapperTags(text: string): string {
+export function escapeGithubWrapperTags(text: string): string {
 	return text
 		.replace(/<details\b[^>]*>/gi, (m) => `&lt;${m.slice(1, -1)}&gt;`)
 		.replace(/<\/details\s*>/gi, "&lt;/details&gt;")
@@ -125,11 +130,30 @@ function escapeGithubWrapperTags(text: string): string {
 // ─── PR body section builders (file-local) ─────────────────────────────────
 
 /**
- * Appends the E2E test guide section for PR markdown. Each scenario is
- * wrapped in a `<details>` block with its title in `<summary>`, and all
- * user-provided fields are sanitized against wrapper-tag injection.
+ * Builds the inner body lines (preconditions / steps / expected results) of
+ * a PR e2e scenario. Shared between single-summary and branch-aggregated
+ * renderers — keep both call sites' output byte-identical.
  */
-function pushPrE2eTestSection(
+export function buildScenarioBodyLines(s: E2eTestScenario): Array<string> {
+	const out: Array<string> = [];
+	if (s.preconditions) {
+		out.push(
+			"",
+			`**Preconditions:** ${escapeGithubWrapperTags(s.preconditions)}`,
+		);
+	}
+	out.push("", "**Steps:**");
+	for (let j = 0; j < s.steps.length; j++) {
+		out.push(`${j + 1}. ${escapeGithubWrapperTags(s.steps[j])}`);
+	}
+	out.push("", "**Expected Results:**");
+	for (const r of s.expectedResults) {
+		out.push(`- ${escapeGithubWrapperTags(r)}`);
+	}
+	return out;
+}
+
+export function pushPrE2eTestSection(
 	lines: Array<string>,
 	e2eTestGuide: ReadonlyArray<E2eTestScenario> | undefined,
 ): void {
@@ -140,22 +164,9 @@ function pushPrE2eTestSection(
 	for (let i = 0; i < e2eTestGuide.length; i++) {
 		const s = e2eTestGuide[i];
 		const summaryContent = `<strong>${i + 1}. ${escHtml(s.title)}</strong>`;
-		const bodyOnly: Array<string> = [];
-		if (s.preconditions) {
-			bodyOnly.push(
-				"",
-				`**Preconditions:** ${escapeGithubWrapperTags(s.preconditions)}`,
-			);
-		}
-		bodyOnly.push("", "**Steps:**");
-		for (let j = 0; j < s.steps.length; j++) {
-			bodyOnly.push(`${j + 1}. ${escapeGithubWrapperTags(s.steps[j])}`);
-		}
-		bodyOnly.push("", "**Expected Results:**");
-		for (const r of s.expectedResults) {
-			bodyOnly.push(`- ${escapeGithubWrapperTags(r)}`);
-		}
-		lines.push(...wrapInGithubDetails(summaryContent, bodyOnly));
+		lines.push(
+			...wrapInGithubDetails(summaryContent, buildScenarioBodyLines(s)),
+		);
 	}
 	lines.push("", "---");
 }
@@ -169,7 +180,7 @@ function pushPrE2eTestSection(
  * injection. File paths are wrapped in backticks (code span) where HTML
  * is not parsed, so `filesAffected` entries need no escape.
  */
-function pushPrTopicBody(out: Array<string>, t: TopicWithDate): void {
+export function pushPrTopicBody(out: Array<string>, t: TopicWithDate): void {
 	out.push(
 		"",
 		`**⚡ Why This Change**`,
