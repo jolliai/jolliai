@@ -85,6 +85,20 @@ The `jolli new` / `build` / `start` / `dev` commands generate a Nextra v4 docs s
 
 The bridge is `SiteRenderer.renderOpenApiSpecs(contentDir, publicDir, specs)` in `cli/src/site/renderer/SiteRenderer.ts`. `StartCommand` builds the `OpenApiSpecInput[]` from `MirrorResult.openapiDocs` (the parsed-once-cached AST from `ContentMirror`) via `buildPipeline`. The legacy `swagger-ui-react` MDX shim is gone — that dependency is no longer in `NEXTRA_DEPENDENCIES`. See [`cli/DEVELOPMENT.md`](cli/DEVELOPMENT.md) for module-by-module detail and the full file-flow diagram.
 
+### Site generation: layout, navbar, and footer architecture
+
+The CLI's Nextra layouts are deliberately thin — `<Navbar logo={<SiteLogo />}><ThemeSwitch /></Navbar>` for Forge, `<Navbar logo={<SiteLogo />} />` for Atlas / default. **No `<a>` or `<details>` JSX is spliced into the navbar.** Page tabs (Documentation, API Reference, customer-supplied `header.items`) flow through:
+
+1. `MetaGenerator.generateMetaFiles(contentDir, sidebar, rootInjection)` writes the **root `content/_meta.js`** with auto-injected `__documentation` + `__api-reference` keys (single-spec direct link vs multi-spec dropdown shape) plus customer `header.items` materialised as slug-keyed page-tab entries. URLs flow through `Sanitize.sanitizeUrl` so `javascript:` / `data:` / `vbscript:` are clamped to `"#"`.
+2. Nextra's `<Navbar>` reads the page-map and renders the entries natively (chevron, hover, mobile drawer all come for free).
+3. Layouts wrap content in `<ScopedNextraLayout>` (emitted to `<buildDir>/components/ScopedNextraLayout.tsx` from a verbatim port of the SaaS `scopePageMap` filter) so the sidebar scopes cleanly when the user is inside `/api-{slug}/…`.
+
+Pack footers (Forge / Atlas) emit semantic class names targeted by the pack stylesheets — `themes/Footer.ts` builds the JSX with `.{prefix}-footer-columns`, `.{prefix}-footer-col`, `.{prefix}-footer-bottom`, `.{prefix}-footer-copyright`, `.{prefix}-footer-social`, `.{prefix}-footer-powered` so the pack CSS does the layout. The default theme has no pack stylesheet so it keeps the inline-style footer fallback.
+
+Schema aliasing happens at site.json read time — `SiteJsonReader.coerceBrandingToTheme` maps the SaaS-shape `branding.*` block into the canonical `theme.*` (and `footer.social` → `footer.socialLinks`). Downstream code only ever reads the canonical shape.
+
+URL/HTML escaping is consolidated in `cli/src/site/Sanitize.ts` — every layout, footer renderer, and `_meta.js` writer imports from there so a future tightening of the allow-list happens in one place.
+
 ### Auth & origin allowlist
 
 `jolliApiKey` (`sk-jol-…`) is a plain or JWT-shaped token whose payload encodes the tenant URL in a base64url-decoded segment. Three places consume it: CLI (`cli/src/core/JolliApiUtils.ts`, canonical `parseJolliApiKey` + `assertJolliOriginAllowed`), VS Code extension (which imports the canonical CLI helpers via the bundled path), and the IntelliJ plugin (Kotlin port). The allowlist is `jolli.ai`, `jolli.dev`, `jolli.cloud`, `jolli-local.me`, HTTPS-only, with a suffix-boundary check (`host === h || host.endsWith("." + h)`). Validation is **save-time** (OAuth callback, `configure --set`, settings UI, `JOLLI_URL` env at read time) — request paths trust the saved value. Keep the three implementations in lockstep.

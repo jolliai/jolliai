@@ -19,7 +19,6 @@ import { ATLAS_MANIFEST } from "./Manifest.js";
 const BASE_INPUT = {
 	title: "Acme Handbook",
 	description: "Editorial-style content site",
-	nav: [],
 	primaryHue: ATLAS_MANIFEST.defaults.primaryHue,
 	defaultTheme: ATLAS_MANIFEST.defaults.defaultTheme,
 	fontFamily: ATLAS_MANIFEST.defaults.fontFamily,
@@ -32,7 +31,6 @@ describe("resolveAtlasLayoutInput", () => {
 		const result = resolveAtlasLayoutInput({
 			title: "T",
 			description: "D",
-			nav: [],
 			theme: undefined,
 			legacyFavicon: undefined,
 		});
@@ -45,7 +43,6 @@ describe("resolveAtlasLayoutInput", () => {
 		const result = resolveAtlasLayoutInput({
 			title: "T",
 			description: "D",
-			nav: [],
 			theme: { primaryHue: 30, defaultTheme: "light", fontFamily: "ibm-plex" },
 			legacyFavicon: undefined,
 		});
@@ -58,7 +55,6 @@ describe("resolveAtlasLayoutInput", () => {
 		const result = resolveAtlasLayoutInput({
 			title: "T",
 			description: "D",
-			nav: [],
 			theme: { favicon: "/theme.ico" },
 			legacyFavicon: "/legacy.ico",
 		});
@@ -76,7 +72,6 @@ describe("resolveAtlasLayoutInput", () => {
 		const result = resolveAtlasLayoutInput({
 			title: "T",
 			description: "D",
-			nav: [],
 			header,
 			footer,
 			theme: undefined,
@@ -84,6 +79,18 @@ describe("resolveAtlasLayoutInput", () => {
 		});
 		expect(result.header).toBe(header);
 		expect(result.footer).toBe(footer);
+	});
+
+	it("propagates theme.logoText and theme.logoDisplay to the resolved input", () => {
+		const result = resolveAtlasLayoutInput({
+			title: "T",
+			description: "D",
+			theme: { logoText: "ACME", logoDisplay: "image", logoUrl: "/logo.svg" },
+			legacyFavicon: undefined,
+		});
+		expect(result.logoText).toBe("ACME");
+		expect(result.logoDisplay).toBe("image");
+		expect(result.logoUrl).toBe("/logo.svg");
 	});
 });
 
@@ -144,20 +151,56 @@ describe("generateAtlasLayoutTsx", () => {
 		expect(result).toContain('className="atlas-logo-dark"');
 	});
 
+	it("uses logoText for the logo span when set, instead of title", () => {
+		const result = generateAtlasLayoutTsx({ ...BASE_INPUT, logoText: "ACME" });
+		expect(result).toContain('<span>{"ACME"}</span>');
+		expect(result).not.toContain('<span>{"Acme Handbook"}</span>');
+	});
+
+	it("logoDisplay='text' suppresses the image even when logoUrl is set", () => {
+		const result = generateAtlasLayoutTsx({
+			...BASE_INPUT,
+			logoUrl: "/logo.svg",
+			logoDisplay: "text",
+		});
+		expect(result).not.toContain("<img ");
+		expect(result).toContain('<span>{"Acme Handbook"}</span>');
+	});
+
+	it("logoDisplay='image' suppresses the text span when logoUrl is set", () => {
+		const result = generateAtlasLayoutTsx({
+			...BASE_INPUT,
+			logoUrl: "/logo.svg",
+			logoDisplay: "image",
+		});
+		expect(result).toContain("<img ");
+		expect(result).not.toContain('<span>{"Acme Handbook"}</span>');
+	});
+
+	it("logoDisplay='image' falls back to text when logoUrl is unset", () => {
+		const result = generateAtlasLayoutTsx({ ...BASE_INPUT, logoDisplay: "image" });
+		expect(result).not.toContain("<img ");
+		expect(result).toContain('<span>{"Acme Handbook"}</span>');
+	});
+
+	it("logoDisplay='both' renders image + text together", () => {
+		const result = generateAtlasLayoutTsx({
+			...BASE_INPUT,
+			logoUrl: "/logo.svg",
+			logoText: "ACME",
+			logoDisplay: "both",
+		});
+		expect(result).toContain('<img src={"/logo.svg"}');
+		expect(result).toContain('<span>{"ACME"}</span>');
+	});
+
 	it("includes the favicon <link> when configured and omits it when not", () => {
 		expect(generateAtlasLayoutTsx(BASE_INPUT)).not.toContain('rel="icon"');
 		const withFavicon = generateAtlasLayoutTsx({ ...BASE_INPUT, favicon: "/favicon.ico" });
 		expect(withFavicon).toContain('<link rel="icon" href={"/favicon.ico"}');
 	});
 
-	it("sanitizes javascript: URLs in nav, favicon, and logoUrl to '#'", () => {
-		const navResult = generateAtlasLayoutTsx({
-			...BASE_INPUT,
-			nav: [{ label: "Bad", href: "javascript:alert(1)" }],
-		});
-		expect(navResult).not.toMatch(/javascript:alert/i);
-		expect(navResult).toContain('<a href={"#"}');
-
+	it("sanitizes javascript: URLs in favicon and logoUrl to '#'", () => {
 		const favResult = generateAtlasLayoutTsx({ ...BASE_INPUT, favicon: "javascript:alert(1)" });
 		expect(favResult).not.toMatch(/javascript:alert/i);
 
@@ -166,121 +209,58 @@ describe("generateAtlasLayoutTsx", () => {
 		expect(logoResult).toContain('<img src={"#"}');
 	});
 
-	it("renders nav items as <a> children of <Navbar> (Atlas keeps the legacy nav shorthand support)", () => {
-		const result = generateAtlasLayoutTsx({
-			...BASE_INPUT,
-			nav: [{ label: "Guides", href: "/guides" }],
-		});
-		expect(result).toContain('href={"/guides"}');
-		expect(result).toContain('{"Guides"}');
+	it("renders <Navbar> with no JSX children — nav items go through _meta.js", () => {
+		const result = generateAtlasLayoutTsx(BASE_INPUT);
+		// New architecture: Atlas's navbar has only the logo prop, no
+		// children. Page tabs come from the root _meta.js (Nextra renders
+		// them natively with chevron / hover / mobile drawer). The layout
+		// input no longer carries `nav` at all — enforced at the type level.
+		expect(result).toContain("<Navbar logo={<SiteLogo />} />");
 	});
 
-	// ── header.items support ─────────────────────────────────────────────────
-
-	it("prefers header.items over legacy nav when both are set", () => {
-		const result = generateAtlasLayoutTsx({
-			...BASE_INPUT,
-			nav: [{ label: "FromNav", href: "/nav" }],
-			header: { items: [{ label: "FromHeader", url: "/header" }] },
-		});
-		expect(result).toContain("FromHeader");
-		expect(result).not.toContain("FromNav");
+	it("uses <ScopedNextraLayout> instead of vanilla <Layout>", () => {
+		const result = generateAtlasLayoutTsx(BASE_INPUT);
+		expect(result).toContain("import ScopedNextraLayout from '../components/ScopedNextraLayout'");
+		expect(result).toContain("<ScopedNextraLayout");
+		expect(result).toContain("</ScopedNextraLayout>");
 	});
 
-	it("renders a <details> dropdown when a header item has sub-items", () => {
-		const result = generateAtlasLayoutTsx({
-			...BASE_INPUT,
-			header: {
-				items: [
-					{
-						label: "Resources",
-						items: [
-							{ label: "Blog", url: "/blog" },
-							{ label: "Changelog", url: "/changelog" },
-						],
-					},
-				],
-			},
-		});
-		expect(result).toContain("<details");
-		expect(result).toContain("<summary");
-		expect(result).toContain('{"Resources"}');
-		expect(result).toContain('{"Blog"}');
-		expect(result).toContain('href={"/blog"}');
-	});
-
-	it("renders a direct link for header items without sub-items", () => {
-		const result = generateAtlasLayoutTsx({
-			...BASE_INPUT,
-			header: { items: [{ label: "Docs", url: "/docs" }] },
-		});
-		expect(result).toContain('href={"/docs"}');
-		expect(result).not.toContain("<details");
-	});
-
-	it("falls back to '#' for header items with no url and no sub-items", () => {
-		const result = generateAtlasLayoutTsx({
-			...BASE_INPUT,
-			header: { items: [{ label: "Empty" }] },
-		});
-		expect(result).toContain('href={"#"}');
-	});
-
-	it("sanitizes javascript: URLs in header dropdown sub-items", () => {
-		const result = generateAtlasLayoutTsx({
-			...BASE_INPUT,
-			header: {
-				items: [{ label: "Menu", items: [{ label: "Bad", url: "javascript:alert(1)" }] }],
-			},
-		});
-		expect(result).not.toMatch(/javascript:alert/i);
-		expect(result).toContain('href={"#"}');
-	});
-
-	it("falls back to legacy nav when header.items is empty", () => {
-		const result = generateAtlasLayoutTsx({
-			...BASE_INPUT,
-			nav: [{ label: "NavLink", href: "/nav" }],
-			header: { items: [] },
-		});
-		expect(result).toContain("NavLink");
-	});
-
-	// ── footer support ───────────────────────────────────────────────────────
+	// ── footer (semantic classes — pack CSS targets these) ───────────────────
 
 	it("renders default copyright footer when no footer config is set", () => {
 		const result = generateAtlasLayoutTsx(BASE_INPUT);
 		expect(result).toContain("<Footer>");
-		expect(result).toContain("new Date().getFullYear()");
+		expect(result).toContain("atlas-footer-masthead");
 	});
 
-	it("renders footer copyright text", () => {
+	it("emits atlas-footer wrapper class when footer config is set", () => {
 		const result = generateAtlasLayoutTsx({
 			...BASE_INPUT,
 			footer: { copyright: "2026 Acme Inc." },
 		});
-		expect(result).toContain("<Footer>");
-		expect(result).toContain('{"2026 Acme Inc."}');
+		expect(result).toContain('className="atlas-footer"');
+		expect(result).toContain('className="atlas-footer-bottom"');
+		expect(result).toContain('className="atlas-footer-masthead"');
+		expect(result).toContain('className="atlas-footer-copy"');
+		expect(result).toContain("2026 Acme Inc.");
 	});
 
-	it("renders footer columns with titles and links", () => {
+	it("emits atlas-footer-columns and atlas-footer-col classes for columns", () => {
 		const result = generateAtlasLayoutTsx({
 			...BASE_INPUT,
 			footer: {
 				columns: [
 					{
 						title: "Product",
-						links: [
-							{ label: "Pricing", url: "/pricing" },
-							{ label: "Docs", url: "/docs" },
-						],
+						links: [{ label: "Pricing", url: "/pricing" }],
 					},
 				],
 			},
 		});
-		expect(result).toContain('{"Product"}');
-		expect(result).toContain('{"Pricing"}');
-		expect(result).toContain('href={"/pricing"}');
+		expect(result).toContain('className="atlas-footer-columns"');
+		expect(result).toContain('className="atlas-footer-col"');
+		expect(result).toContain("Product");
+		expect(result).toContain('href="/pricing"');
 	});
 
 	it("renders footer social links in canonical platform order", () => {

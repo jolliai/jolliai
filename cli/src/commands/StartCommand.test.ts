@@ -847,3 +847,98 @@ describe("StartCommand additional branches", () => {
 		expect(output).toContain("Indexed 0 pages");
 	});
 });
+
+// ─── buildRootInjectionInput unit tests ──────────────────────────────────────
+
+/**
+ * Direct unit tests for the exported `buildRootInjectionInput` helper. The
+ * legacy `nav` shorthand fallback is the back-compat lifeline for existing
+ * CLI sites — pinning it explicitly so a regression doesn't slip through
+ * the integration paths.
+ */
+describe("buildRootInjectionInput", () => {
+	type MirrorResult = Parameters<typeof import("./StartCommand.js").buildRootInjectionInput>[2];
+	type OpenApiDocs = MirrorResult["openapiDocs"];
+	const EMPTY_MIRROR: MirrorResult = {
+		markdownFiles: [],
+		openapiFiles: [],
+		openapiDocs: {},
+		imageFiles: [],
+		ignoredFiles: [],
+		downgradedCount: 0,
+	};
+
+	it("returns headerItems unchanged when populated, ignoring legacy nav", async () => {
+		const { buildRootInjectionInput } = await import("./StartCommand.js");
+		const result = buildRootInjectionInput(
+			[{ label: "Pricing", url: "/pricing" }],
+			[{ label: "Old", href: "/old" }],
+			EMPTY_MIRROR,
+		);
+		expect(result.headerItems).toEqual([{ label: "Pricing", url: "/pricing" }]);
+	});
+
+	it("coerces legacy nav into header items when headerItems is undefined", async () => {
+		const { buildRootInjectionInput } = await import("./StartCommand.js");
+		const result = buildRootInjectionInput(
+			undefined,
+			[
+				{ label: "Guides", href: "/guides" },
+				{ label: "GitHub", href: "https://github.com/x" },
+			],
+			EMPTY_MIRROR,
+		);
+		expect(result.headerItems).toEqual([
+			{ label: "Guides", url: "/guides" },
+			{ label: "GitHub", url: "https://github.com/x" },
+		]);
+	});
+
+	it("coerces legacy nav into header items when headerItems is an empty array", async () => {
+		const { buildRootInjectionInput } = await import("./StartCommand.js");
+		const result = buildRootInjectionInput([], [{ label: "Docs", href: "/docs" }], EMPTY_MIRROR);
+		expect(result.headerItems).toEqual([{ label: "Docs", url: "/docs" }]);
+	});
+
+	it("returns headerItems undefined when neither headerItems nor legacy nav is populated", async () => {
+		const { buildRootInjectionInput } = await import("./StartCommand.js");
+		const result = buildRootInjectionInput(undefined, [], EMPTY_MIRROR);
+		expect(result.headerItems).toBeUndefined();
+	});
+
+	it("returns headerItems undefined when both headerItems and legacy nav are empty arrays", async () => {
+		const { buildRootInjectionInput } = await import("./StartCommand.js");
+		const result = buildRootInjectionInput([], [], EMPTY_MIRROR);
+		expect(result.headerItems).toBeUndefined();
+	});
+
+	it("derives apiSpecs from openapiFiles + openapiDocs, picking up the title when present", async () => {
+		const { buildRootInjectionInput } = await import("./StartCommand.js");
+		const mirror: MirrorResult = {
+			...EMPTY_MIRROR,
+			openapiFiles: ["api/petstore.yaml"],
+			openapiDocs: {
+				"api/petstore.yaml": { info: { title: "Petstore" } },
+			} as unknown as OpenApiDocs,
+		};
+		const result = buildRootInjectionInput(undefined, [], mirror);
+		expect(result.apiSpecs).toEqual([{ specName: "petstore", title: "Petstore" }]);
+	});
+
+	it("falls back to undefined title when info.title is missing or non-string", async () => {
+		const { buildRootInjectionInput } = await import("./StartCommand.js");
+		const mirror: MirrorResult = {
+			...EMPTY_MIRROR,
+			openapiFiles: ["api/petstore.yaml", "api/users.yaml"],
+			openapiDocs: {
+				"api/petstore.yaml": { info: {} },
+				"api/users.yaml": { info: { title: 42 } },
+			} as unknown as OpenApiDocs,
+		};
+		const result = buildRootInjectionInput(undefined, [], mirror);
+		expect(result.apiSpecs).toEqual([
+			{ specName: "petstore", title: undefined },
+			{ specName: "users", title: undefined },
+		]);
+	});
+});

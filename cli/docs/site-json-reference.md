@@ -29,6 +29,18 @@ Run `jolli dev .` in the folder containing this file to start a dev server.
 | `pathMappings` | `Record<string, string>` | No | Remap source folders to different content paths. |
 | `favicon` | `string` | No | Favicon URL. Deprecated; use `theme.favicon` instead. |
 | `theme` | `ThemeConfig` | No | Visual theme pack and branding options. |
+| `branding` | `BrandingConfig` | No | Deprecated SaaS-shape alias for `theme`. Coerced at load time; `theme.*` wins on conflict. New site.json files should use `theme` directly. |
+
+### How navbar entries reach the browser
+
+`header.items` and `nav` are NOT spliced into the layout JSX as `<a>` / `<details>` tags. The CLI writes them into the **root `content/_meta.js`** so Nextra's `<Navbar>` renders them as native page tabs — the chevron on dropdowns, the hover styling, and the mobile-drawer integration come from Nextra and not from custom JSX.
+
+When OpenAPI specs are detected, two extra entries are auto-injected into the same `_meta.js`:
+
+- **`Documentation`** — links back to `/`. Always present whenever any specs are detected.
+- **`API Reference`** — for a single spec, a direct link to `/api-{slug}`. For two or more specs, a `type: "menu"` dropdown with one sub-entry per spec.
+
+A header item whose label matches `Documentation` / `API` / `API Reference` (case-insensitive) suppresses the matching auto-entry — customer overrides win.
 
 ---
 
@@ -177,7 +189,31 @@ Controls the visual appearance of the generated site.
 | `fontFamily` | `string` | Pack default | Body font. See font options below. |
 | `logoUrl` | `string` | None | Logo image URL (light mode). |
 | `logoUrlDark` | `string` | None | Logo image URL (dark mode). Falls back to `logoUrl`. |
+| `logoText` | `string` | Site `title` | Override for the text shown alongside (or instead of) the logo image. Useful when the wordmark differs from the page title. |
+| `logoDisplay` | `"text"` \| `"image"` \| `"both"` | Auto¹ | What the navbar logo renders. |
 | `favicon` | `string` | None | Favicon URL. |
+
+¹ When `logoDisplay` is unset, the layout infers `"both"` if `logoUrl` is set and `"text"` otherwise — preserving pre-`logoDisplay` behaviour. `"image"` with no `logoUrl` falls back to `"text"` to avoid an empty navbar logo.
+
+### Deprecated alias: `branding`
+
+The CLI also accepts a `branding` block that mirrors the SaaS / `https://jolli.app/schemas/site.v1.json` shape. Fields are coerced into `theme.*` at load time; `theme.*` wins on conflict.
+
+| `branding.*` | Coerces to |
+|---|---|
+| `branding.themePack` | `theme.pack` |
+| `branding.colors.primaryHue` | `theme.primaryHue` |
+| `branding.fontFamily` | `theme.fontFamily` |
+| `branding.defaultTheme` | `theme.defaultTheme` |
+| `branding.favicon` | `theme.favicon` |
+| `branding.logo.image` | `theme.logoUrl` |
+| `branding.logo.imageDark` | `theme.logoUrlDark` |
+| `branding.logo.text` | `theme.logoText` |
+| `branding.logo.display` | `theme.logoDisplay` |
+
+`footer.social` is also accepted as an alias for `footer.socialLinks` with the same precedence rule.
+
+New site.json files should use `theme` and `footer.socialLinks` directly. The aliases exist for back-compat with sites authored against the published SaaS schema.
 
 ### Theme packs
 
