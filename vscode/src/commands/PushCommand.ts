@@ -1,11 +1,14 @@
 /**
  * PushCommand
  *
- * Handles single-commit branch submission from the Branch Commits panel.
+ * Handles branch submission from the Branch Commits panel. Supports any
+ * commit count >= 1 — multi-commit branches push exactly the same way as
+ * single-commit ones (`git push origin HEAD`); the difference is purely the
+ * force-push warning copy.
  *
  * Flow:
- * 1. Validate the branch has exactly one commit in history view.
- * 2. If the commit is already pushed, ask for force-push confirmation first.
+ * 1. Reject empty branches (no commits ahead of base) with a warning.
+ * 2. If the HEAD commit is already on remote, ask for force-push confirmation.
  * 3. Otherwise try normal push; on non-fast-forward rejection, offer force push.
  * 4. Refresh panels and status bar after success.
  */
@@ -42,29 +45,33 @@ export class PushCommand {
 		}
 
 		const commits = this.commitsStore.getSnapshot().commits;
-		if (commits.length !== 1) {
-			log.warn(
+		if (commits.length === 0) {
+			log.info(
 				"push",
-				`pushBranch only supports single-commit mode, got ${commits.length}`,
+				"pushBranch invoked with empty branch — nothing to push",
 			);
 			vscode.window.showWarningMessage(
-				"Jolli Memory: Push mode is available only when this branch has exactly 1 commit.",
+				"Jolli Memory: No commits to push on the current branch.",
 			);
 			return;
 		}
 
-		const onlyCommit = commits[0];
+		// commits is newest-first (per JolliMemoryBridge.listBranchCommits), so
+		// commits[0] is HEAD. The "is HEAD on remote" check covers both single
+		// and multi commit branches uniformly: if HEAD is already pushed, any
+		// further push that lands a different HEAD is a history rewrite.
+		const headCommit = commits[0];
 		let resultLabel: "pushed" | "force-pushed" = "pushed";
 
 		try {
-			if (onlyCommit.isPushed) {
+			if (headCommit.isPushed) {
 				log.info(
 					"push",
-					"Single commit already pushed — asking for force-push confirmation",
+					`HEAD already pushed (${commits.length} commit(s) on branch) — asking for force-push confirmation`,
 				);
 				const confirmed = await this.showForcePushWarning(
-					onlyCommit,
-					"This commit is already on remote. Force push will rewrite remote branch history.",
+					commits,
+					"HEAD is already on remote. Force push will rewrite remote branch history.",
 				);
 				if (!confirmed) {
 					log.info("push", "Force-push confirmation cancelled");
@@ -84,7 +91,7 @@ export class PushCommand {
 						"Normal push rejected (non-fast-forward) — offering force push",
 					);
 					const confirmed = await this.showForcePushWarning(
-						onlyCommit,
+						commits,
 						"Remote branch has diverged. Force push will overwrite remote history.",
 					);
 					if (!confirmed) {
@@ -108,15 +115,25 @@ export class PushCommand {
 		await this.refreshAll();
 	}
 
+	/**
+	 * Shows a modal force-push confirmation dialog.
+	 *
+	 * Single-commit branches show "Commit: <hash> <msg>"; multi-commit branches
+	 * show "HEAD (N commits): <hash> <msg>" so the user can see at a glance how
+	 * many commits the force-push will replace on the remote.
+	 */
 	private async showForcePushWarning(
-		commit: BranchCommit,
+		commits: ReadonlyArray<BranchCommit>,
 		reason: string,
 	): Promise<boolean> {
+		const head = commits[0];
+		const headLabel =
+			commits.length === 1 ? "Commit" : `HEAD (${commits.length} commits)`;
 		const answer = await vscode.window.showWarningMessage(
 			[
 				"This operation may rewrite remote history.",
 				"",
-				`Commit: ${commit.shortHash} ${commit.message.substring(0, 80)}`,
+				`${headLabel}: ${head.shortHash} ${head.message.substring(0, 80)}`,
 				"",
 				reason,
 				"This may affect collaborators on the same branch.",

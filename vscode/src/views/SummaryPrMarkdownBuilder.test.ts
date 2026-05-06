@@ -74,7 +74,6 @@ function makeTopic(overrides: Partial<TopicWithDate> = {}): TopicWithDate {
 		todo: "Add metrics for retry counts.",
 		filesAffected: ["src/auth/Login.ts", "src/auth/Retry.ts"],
 		category: "bugfix",
-		recordDate: "2026-03-30T10:00:00Z",
 		importance: "major",
 		commitDate: "2026-03-30T10:00:00Z",
 		treeIndex: 0,

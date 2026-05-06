@@ -111,7 +111,9 @@ describe("PushCommand", () => {
 		expect(deps.bridge.pushCurrentBranch).not.toHaveBeenCalled();
 	});
 
-	it("warns when the branch is not in single-commit mode", async () => {
+	it("pushes successfully when branch has multiple commits (multi-commit support)", async () => {
+		// Multi-commit branches no longer trigger a warning — push proceeds the
+		// same way as for single-commit branches (`git push origin HEAD`).
 		const deps = makeDeps([makeCommit(), makeCommit({ hash: "bbbb" })]);
 		const command = new PushCommand(
 			deps.bridge as never,
@@ -124,9 +126,61 @@ describe("PushCommand", () => {
 
 		await command.execute();
 
-		expect(showWarningMessage).toHaveBeenCalledWith(
-			"Jolli Memory: Push mode is available only when this branch has exactly 1 commit.",
+		expect(deps.bridge.pushCurrentBranch).toHaveBeenCalled();
+		expect(showInformationMessage).toHaveBeenCalledWith(
+			"Jolli Memory: Successfully pushed the current branch.",
 		);
+		expect(showWarningMessage).not.toHaveBeenCalledWith(
+			expect.stringContaining("exactly 1 commit"),
+		);
+	});
+
+	it("warns and aborts when branch has zero commits ahead of base", async () => {
+		// Removed the !== 1 gate but kept an explicit empty-branch guard, since
+		// the command can be invoked from the command palette / keyboard binding
+		// in a state the sidebar UI hides.
+		const deps = makeDeps([]);
+		const command = new PushCommand(
+			deps.bridge as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
+			deps.statusBar as never,
+			"/repo",
+		);
+
+		await command.execute();
+
+		expect(showWarningMessage).toHaveBeenCalledWith(
+			"Jolli Memory: No commits to push on the current branch.",
+		);
+		expect(deps.bridge.pushCurrentBranch).not.toHaveBeenCalled();
+	});
+
+	it("force-push warning shows commit count when branch has > 1 commits", async () => {
+		const deps = makeDeps([
+			makeCommit({ hash: "aaaa", isPushed: true, message: "head msg" }),
+			makeCommit({ hash: "bbbb" }),
+			makeCommit({ hash: "cccc" }),
+		]);
+		showWarningMessage.mockResolvedValueOnce("Force Push (--force-with-lease)");
+		const command = new PushCommand(
+			deps.bridge as never,
+			deps.commitsStore as never,
+			deps.filesStore as never,
+			deps.statusStore as never,
+			deps.statusBar as never,
+			"/repo",
+		);
+
+		await command.execute();
+
+		expect(showWarningMessage).toHaveBeenCalledWith(
+			expect.stringContaining("HEAD (3 commits)"),
+			expect.objectContaining({ modal: true }),
+			"Force Push (--force-with-lease)",
+		);
+		expect(deps.bridge.forcePush).toHaveBeenCalled();
 	});
 
 	it("pushes normally and refreshes all providers", async () => {

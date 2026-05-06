@@ -125,8 +125,8 @@ export interface PlansRegistry {
 // Re-export core note types to avoid duplication
 export type { NoteEntry, NoteFormat } from "../../cli/src/Types.js";
 
-// Import for use in NoteInfo below
-import type { NoteFormat } from "../../cli/src/Types.js";
+// Import for use in PlansRegistry / NoteInfo above and below
+import type { NoteEntry, NoteFormat } from "../../cli/src/Types.js";
 
 /** Display-level note metadata for the VSCode tree view */
 export interface NoteInfo {

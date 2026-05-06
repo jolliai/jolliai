@@ -1699,6 +1699,8 @@ export function activate(context: vscode.ExtensionContext): void {
 					summary,
 					context.extensionUri,
 					workspaceRoot,
+					bridge,
+					commitsStore.getMainBranch(),
 					"commit",
 				);
 			},
@@ -1724,6 +1726,8 @@ export function activate(context: vscode.ExtensionContext): void {
 					summary,
 					context.extensionUri,
 					workspaceRoot,
+					bridge,
+					commitsStore.getMainBranch(),
 					"memory",
 				);
 			},
@@ -1755,6 +1759,8 @@ export function activate(context: vscode.ExtensionContext): void {
 							summary,
 							context.extensionUri,
 							workspaceRoot,
+							bridge,
+							commitsStore.getMainBranch(),
 							"kb",
 						);
 						return;

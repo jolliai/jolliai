@@ -49,10 +49,15 @@ const {
 	renderCalloutText,
 	timeAgo,
 } = vi.hoisted(() => ({
-	collectSortedTopics: vi.fn(() => ({
-		topics: [],
-		sourceNodes: [],
-	})),
+	collectSortedTopics: vi.fn(
+		(): {
+			topics: Array<unknown>;
+			sourceNodes: Array<unknown>;
+		} => ({
+			topics: [],
+			sourceNodes: [],
+		}),
+	),
 	escAttr: vi.fn((s: string) => s),
 	escHtml: vi.fn((s: string) => s),
 	formatDate: vi.fn(() => "Jan 1, 2026"),

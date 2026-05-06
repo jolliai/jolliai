@@ -673,6 +673,7 @@ const {
 			setExtensionOutdated: vi.fn(),
 			setStatus: vi.fn(),
 			setMainBranch: vi.fn(),
+			getMainBranch: vi.fn(() => "main"),
 			setFilter: vi.fn().mockResolvedValue(undefined),
 			getFilter: vi.fn(() => ""),
 			loadMore: vi.fn().mockResolvedValue(undefined),
@@ -1425,6 +1426,8 @@ describe("Extension", () => {
 					summary,
 					expect.anything(),
 					"/test/workspace",
+					mockBridge,
+					expect.any(String),
 					"commit",
 				);
 			});
@@ -1468,6 +1471,8 @@ describe("Extension", () => {
 					summary,
 					expect.anything(),
 					"/test/workspace",
+					mockBridge,
+					expect.any(String),
 					"memory",
 				);
 			});
@@ -1484,6 +1489,8 @@ describe("Extension", () => {
 					summary,
 					expect.anything(),
 					"/test/workspace",
+					mockBridge,
+					expect.any(String),
 					"memory",
 				);
 			});

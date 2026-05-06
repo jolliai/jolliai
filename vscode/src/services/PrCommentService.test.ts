@@ -151,11 +151,12 @@ const MARKER_END = "<!-- jollimemory-summary-end -->";
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe("PrCommentService", () => {
-	let postMessage: ReturnType<typeof vi.fn>;
+	let postMessage: ReturnType<typeof vi.fn> &
+		((msg: Record<string, unknown>) => void);
 
 	beforeEach(() => {
 		vi.clearAllMocks();
-		postMessage = vi.fn();
+		postMessage = vi.fn() as typeof postMessage;
 		setupTmpFile();
 	});
 
@@ -236,23 +237,46 @@ describe("PrCommentService", () => {
 	// ─── handleCheckPrStatus ────────────────────────────────────────────────
 
 	describe("handleCheckPrStatus", () => {
-		it("posts multipleCommits status when branch has more than 1 commit", async () => {
+		it("proceeds past the (now removed) commit-count gate regardless of multi-commit branches", async () => {
+			// Multi-commit branches no longer trigger a "multipleCommits" status —
+			// the gate was removed when multi-commit PRs became supported.
+			// This test asserts the gate is gone: with `gh` available + a PR found,
+			// status becomes 'ready' even though git history shows multiple commits.
 			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "symbolic-ref") {
-					return { stdout: "origin/main\n" };
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "feature/multi\n" };
 				}
-				if (cmd === "git" && args[0] === "rev-list") {
-					return { stdout: "3\n" };
+				if (cmd === "gh" && args[0] === "--version") {
+					return { stdout: "gh version 2.40.0\n" };
+				}
+				if (cmd === "gh" && args[0] === "auth") {
+					return { stdout: "Logged in\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr") {
+					const prData = {
+						number: 42,
+						url: "https://github.com/example/repo/pull/42",
+						title: "Multi-commit PR",
+						body: "",
+					};
+					return { stdout: JSON.stringify(prData) };
 				}
 				return { stdout: "" };
 			});
 
 			await handleCheckPrStatus(CWD, postMessage);
 
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ status: "multipleCommits" }),
+			);
 			expect(postMessage).toHaveBeenCalledWith({
 				command: "prStatus",
-				status: "multipleCommits",
-				count: 3,
+				status: "ready",
+				pr: {
+					number: 42,
+					url: "https://github.com/example/repo/pull/42",
+					title: "Multi-commit PR",
+				},
 			});
 		});
 
@@ -286,7 +310,14 @@ describe("PrCommentService", () => {
 					return { stdout: "gh version 2.40.0\n" };
 				}
 				if (cmd === "gh" && args[0] === "auth") {
-					const err = new Error("not logged in") as NodeJS.ErrnoException;
+					// execFile sets numeric exit codes on the error object; production
+					// `probeGh` uses `typeof code === "number"` to detect the
+					// non-zero-exit case (despite the Node.js TS typing claiming
+					// `code: string | undefined`). Cast through `unknown` so we can
+					// simulate the runtime shape the production code actually checks.
+					const err = new Error("not logged in") as unknown as {
+						code: number;
+					} & Error;
 					err.code = 1;
 					throw err;
 				}
@@ -323,9 +354,9 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					authCalls++;
 					if (authCalls === 1) {
-						const err = new Error(
-							"credential manager locked",
-						) as NodeJS.ErrnoException;
+						const err = new Error("credential manager locked") as unknown as {
+							code: number;
+						} & Error;
 						err.code = 1;
 						throw err;
 					}
@@ -676,28 +707,6 @@ describe("PrCommentService", () => {
 			expect(logError).toHaveBeenCalled();
 		});
 
-		it("treats non-numeric rev-list output as 0 commits (|| 0 fallback)", async () => {
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "rev-list") {
-					// Returns non-numeric output — parseInt returns NaN, || 0 kicks in
-					return { stdout: "not-a-number\n" };
-				}
-				if (cmd === "gh" && args[0] === "--version") {
-					throw new Error("no gh");
-				}
-				return { stdout: "" };
-			});
-
-			await handleCheckPrStatus(CWD, postMessage);
-
-			// NaN || 0 → 0 commits, which is <= 1, so continues to gh check
-			// gh is not available → unavailable
-			expect(postMessage).toHaveBeenCalledWith({
-				command: "prStatus",
-				status: "unavailable",
-			});
-		});
-
 		it("coerces non-Error to string in outer catch (line 217)", async () => {
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "rev-list") {
@@ -725,44 +734,6 @@ describe("PrCommentService", () => {
 			expect(logError).toHaveBeenCalledWith(
 				expect.any(String),
 				expect.stringContaining("string error from git"),
-			);
-		});
-
-		it("treats unresolved upstream baseline as 0 commits and continues (no origin/HEAD)", async () => {
-			const prData = {
-				number: 7,
-				url: "https://pr/7",
-				title: "My PR",
-				body: "",
-			};
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "symbolic-ref") {
-					// Healthy repo without a pinned origin/HEAD — e.g. no origin remote,
-					// or fresh clone before first fetch. symbolic-ref exits non-zero.
-					throw new Error(
-						"fatal: ref refs/remotes/origin/HEAD is not a symbolic ref",
-					);
-				}
-				if (cmd === "git" && args[0] === "rev-parse") {
-					return { stdout: "feature/test\n" };
-				}
-				if (cmd === "gh" && args[0] === "--version") {
-					return { stdout: "gh version 2.40.0\n" };
-				}
-				if (cmd === "gh" && args[0] === "auth") {
-					return { stdout: "ok\n" };
-				}
-				if (cmd === "gh" && args[0] === "pr") {
-					return { stdout: JSON.stringify(prData) };
-				}
-				return { stdout: "" };
-			});
-
-			await handleCheckPrStatus(CWD, postMessage);
-
-			// baseline unresolved → 0 commits, no multipleCommits gate, flow continues.
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({ command: "prStatus", status: "ready" }),
 			);
 		});
 
@@ -829,30 +800,6 @@ describe("PrCommentService", () => {
 			expect(postMessage).not.toHaveBeenCalledWith(
 				expect.objectContaining({ status: "multipleCommits" }),
 			);
-		});
-
-		it("keeps commit count check when branch matches current branch", async () => {
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "symbolic-ref") {
-					return { stdout: "origin/main\n" };
-				}
-				if (cmd === "git" && args[0] === "rev-list") {
-					return { stdout: "3\n" };
-				}
-				if (cmd === "git" && args[0] === "rev-parse") {
-					return { stdout: "feature/current\n" };
-				}
-				return { stdout: "" };
-			});
-
-			// Pass branch that matches current — should still show multipleCommits
-			await handleCheckPrStatus(CWD, postMessage, "feature/current");
-
-			expect(postMessage).toHaveBeenCalledWith({
-				command: "prStatus",
-				status: "multipleCommits",
-				count: 3,
-			});
 		});
 
 		it("uses provided branch in noPr status message with crossBranch flag", async () => {
@@ -1070,101 +1017,6 @@ describe("PrCommentService", () => {
 				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
 			);
 		});
-
-		it("stays silent when upstream baseline cannot be resolved — healthy repos without origin/HEAD must not spam logs", async () => {
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "symbolic-ref") {
-					// No origin/HEAD pinned — common in repos with no `origin`, fresh
-					// clones, or detached setups. Previously this caused a warn on
-					// every PR panel open for any repo using master/trunk; now it
-					// should be completely silent.
-					throw new Error(
-						"fatal: ref refs/remotes/origin/HEAD is not a symbolic ref",
-					);
-				}
-				if (cmd === "git" && args[0] === "rev-parse")
-					return { stdout: "feature/br\n" };
-				if (cmd === "gh" && args[0] === "--version")
-					return { stdout: "gh 2.40\n" };
-				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
-				if (cmd === "gh" && args[0] === "pr") throw new Error("no pr");
-				return { stdout: "" };
-			});
-
-			await handleCheckPrStatus(CWD, postMessage);
-
-			// Silent: no commit-count log at all when baseline is unresolved.
-			// (The unrelated `gh pr` stub still trips a warn from findPrForBranch,
-			// so assert narrowly: nothing about rev-list.)
-			expect(warn).not.toHaveBeenCalledWith(
-				expect.any(String),
-				expect.stringContaining("rev-list"),
-			);
-			expect(debug).not.toHaveBeenCalledWith(
-				expect.any(String),
-				expect.stringContaining("rev-list"),
-			);
-			// Flow continues — commit count treated as 0 means no multipleCommits gate.
-			expect(postMessage).not.toHaveBeenCalledWith(
-				expect.objectContaining({ status: "multipleCommits" }),
-			);
-		});
-
-		it("resolves the actual upstream default branch (origin/master etc.), not hardcoded origin/main", async () => {
-			// Verifies the root-cause fix: squash gate works in master-based repos.
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "symbolic-ref") {
-					return { stdout: "origin/master\n" };
-				}
-				if (cmd === "git" && args[0] === "rev-list") {
-					// Executed only if the command uses origin/master..HEAD — otherwise
-					// the production bug (hardcoded origin/main) would reach this stub
-					// with different args and we would never see count=5 in postMessage.
-					expect(args).toEqual(["rev-list", "--count", "origin/master..HEAD"]);
-					return { stdout: "5\n" };
-				}
-				if (cmd === "git" && args[0] === "rev-parse")
-					return { stdout: "feature/br\n" };
-				return { stdout: "" };
-			});
-
-			await handleCheckPrStatus(CWD, postMessage);
-
-			expect(postMessage).toHaveBeenCalledWith({
-				command: "prStatus",
-				status: "multipleCommits",
-				count: 5,
-			});
-		});
-
-		it("warns when rev-list fails after the upstream baseline was resolved — that is a real repo problem, not a config mismatch", async () => {
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "symbolic-ref") {
-					return { stdout: "origin/master\n" };
-				}
-				if (cmd === "git" && args[0] === "rev-list") {
-					// Baseline resolved but rev-list still broke — e.g. permission,
-					// corruption. Worth a warn so debug.log has a trail.
-					throw new Error("fatal: bad object origin/master");
-				}
-				if (cmd === "git" && args[0] === "rev-parse")
-					return { stdout: "feature/br\n" };
-				if (cmd === "gh" && args[0] === "--version")
-					return { stdout: "gh 2.40\n" };
-				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
-				if (cmd === "gh" && args[0] === "pr") throw new Error("no pr");
-				return { stdout: "" };
-			});
-
-			await handleCheckPrStatus(CWD, postMessage);
-
-			expect(warn).toHaveBeenCalledWith(
-				expect.any(String),
-				expect.stringMatching(
-					/git rev-list --count origin\/master\.\.HEAD failed.*bad object/s,
-				),
-			);
-		});
 	});
 
 	// ─── handleCreatePr ─────────────────────────────────────────────────────
@@ -1316,12 +1168,13 @@ describe("PrCommentService", () => {
 	// ─── handlePrepareUpdatePr ──────────────────────────────────────────────
 
 	describe("handlePrepareUpdatePr", () => {
-		const summary = {
-			message: "fix: bug",
-			files: [],
-			branch: "feature/test-branch",
-		} as never;
-		const buildMarkdownFn = vi.fn(() => "## Summary\nFixed a bug");
+		// New signature: caller pre-builds the markdown and passes the branch +
+		// commit hash separately. The function is now PR-lookup + marker-merge
+		// only — single-summary vs aggregated rendering happens upstream in
+		// SummaryWebviewPanel before the call.
+		const SUMMARY_BRANCH = "feature/test-branch";
+		const SUMMARY_HASH = "deadbeef";
+		const MARKDOWN = "## Summary\nFixed a bug";
 
 		it("posts prShowUpdateForm with merged body when PR exists", async () => {
 			const existingBody = "Old description";
@@ -1342,9 +1195,14 @@ describe("PrCommentService", () => {
 				return { stdout: "" };
 			});
 
-			await handlePrepareUpdatePr(summary, CWD, postMessage, buildMarkdownFn);
+			await handlePrepareUpdatePr(
+				SUMMARY_BRANCH,
+				SUMMARY_HASH,
+				MARKDOWN,
+				CWD,
+				postMessage,
+			);
 
-			expect(buildMarkdownFn).toHaveBeenCalledWith(summary);
 			expect(postMessage).toHaveBeenCalledWith({
 				command: "prShowUpdateForm",
 				title: "PR Title",
@@ -1352,15 +1210,10 @@ describe("PrCommentService", () => {
 			});
 		});
 
-		it("falls back to current branch when summary.branch is undefined (cross-branch)", async () => {
-			// Covers handlePrepareUpdatePr `summary.branch ?? currentBranch` right branch.
-			// merge-base --is-ancestor fails so isCrossBranch=true; summary has no branch,
-			// so the fallback reaches currentBranch.
-			const summaryNoBranch = {
-				commitHash: "deadbeef",
-				// no `branch` field — exercise the `??` fallback
-			} as never;
-
+		it("falls back to current branch when summaryBranch is undefined under cross-branch", async () => {
+			// Covers `summaryBranch ?? currentBranch` fallback. With a commit hash
+			// that fails merge-base --is-ancestor → isCrossBranch=true; with no
+			// summaryBranch passed, target falls through to currentBranch.
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "merge-base") {
 					throw new Error("not an ancestor");
@@ -1382,10 +1235,43 @@ describe("PrCommentService", () => {
 			});
 
 			await handlePrepareUpdatePr(
-				summaryNoBranch,
+				undefined,
+				SUMMARY_HASH,
+				MARKDOWN,
 				CWD,
 				postMessage,
-				buildMarkdownFn,
+			);
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ command: "prShowUpdateForm" }),
+			);
+		});
+
+		it("treats undefined commitHash as not cross-branch (uses current branch)", async () => {
+			// When summaryCommitHash is undefined the cross-branch probe is skipped.
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "feature/test-branch\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					return {
+						stdout: JSON.stringify({
+							number: 5,
+							url: "u",
+							title: "t",
+							body: "",
+						}),
+					};
+				}
+				return { stdout: "" };
+			});
+
+			await handlePrepareUpdatePr(
+				SUMMARY_BRANCH,
+				undefined,
+				MARKDOWN,
+				CWD,
+				postMessage,
 			);
 
 			expect(postMessage).toHaveBeenCalledWith(
@@ -1412,7 +1298,13 @@ describe("PrCommentService", () => {
 				return { stdout: "" };
 			});
 
-			await handlePrepareUpdatePr(summary, CWD, postMessage, buildMarkdownFn);
+			await handlePrepareUpdatePr(
+				SUMMARY_BRANCH,
+				SUMMARY_HASH,
+				MARKDOWN,
+				CWD,
+				postMessage,
+			);
 
 			const call = postMessage.mock.calls[0][0];
 			expect(call.body).toContain("Before\n");
@@ -1430,7 +1322,13 @@ describe("PrCommentService", () => {
 				throw new Error("no PR");
 			});
 
-			await handlePrepareUpdatePr(summary, CWD, postMessage, buildMarkdownFn);
+			await handlePrepareUpdatePr(
+				SUMMARY_BRANCH,
+				SUMMARY_HASH,
+				MARKDOWN,
+				CWD,
+				postMessage,
+			);
 
 			expect(showWarningMessage).toHaveBeenCalledWith(
 				"No pull request found for branch feature/test-branch.",
@@ -1438,33 +1336,24 @@ describe("PrCommentService", () => {
 			expect(postMessage).not.toHaveBeenCalled();
 		});
 
-		it("shows error on unexpected failure", async () => {
-			// Return a valid PR first, but make buildMarkdownFn throw
+		it("shows error and logs when an unexpected error is thrown", async () => {
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "rev-parse") {
-					return { stdout: "feature/test-branch\n" };
-				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return {
-						stdout: JSON.stringify({
-							number: 10,
-							url: "https://url",
-							title: "T",
-							body: "body",
-						}),
-					};
+					throw new Error("git rev-parse exploded");
 				}
 				return { stdout: "" };
 			});
 
-			const throwingBuildFn = vi.fn(() => {
-				throw new Error("markdown generation failed");
-			});
-
-			await handlePrepareUpdatePr(summary, CWD, postMessage, throwingBuildFn);
+			await handlePrepareUpdatePr(
+				SUMMARY_BRANCH,
+				SUMMARY_HASH,
+				MARKDOWN,
+				CWD,
+				postMessage,
+			);
 
 			expect(showErrorMessage).toHaveBeenCalledWith(
-				expect.stringContaining("markdown generation failed"),
+				expect.stringContaining("git rev-parse exploded"),
 			);
 			expect(logError).toHaveBeenCalled();
 		});
@@ -1472,26 +1361,18 @@ describe("PrCommentService", () => {
 		it("coerces non-Error thrown to string in error message", async () => {
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "rev-parse") {
-					return { stdout: "feature/test-branch\n" };
-				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return {
-						stdout: JSON.stringify({
-							number: 10,
-							url: "https://url",
-							title: "T",
-							body: "body",
-						}),
-					};
+					throw "plain string error";
 				}
 				return { stdout: "" };
 			});
 
-			const throwingBuildFn = vi.fn(() => {
-				throw "plain string error";
-			});
-
-			await handlePrepareUpdatePr(summary, CWD, postMessage, throwingBuildFn);
+			await handlePrepareUpdatePr(
+				SUMMARY_BRANCH,
+				SUMMARY_HASH,
+				MARKDOWN,
+				CWD,
+				postMessage,
+			);
 
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				expect.stringContaining("plain string error"),
@@ -1517,7 +1398,13 @@ describe("PrCommentService", () => {
 				return { stdout: "" };
 			});
 
-			await handlePrepareUpdatePr(summary, CWD, postMessage, buildMarkdownFn);
+			await handlePrepareUpdatePr(
+				SUMMARY_BRANCH,
+				SUMMARY_HASH,
+				MARKDOWN,
+				CWD,
+				postMessage,
+			);
 
 			const call = postMessage.mock.calls[0][0];
 			expect(call.body).toBe(

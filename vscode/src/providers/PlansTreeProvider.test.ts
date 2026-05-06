@@ -99,7 +99,14 @@ function makePlansProvider(bridge: unknown) {
 		getTreeItem: provider.getTreeItem.bind(provider),
 		getChildren: provider.getChildren.bind(provider),
 		serialize: (
-			provider as unknown as { serialize: () => unknown }
+			provider as unknown as {
+				serialize: () => ReadonlyArray<{
+					id?: string;
+					label?: string;
+					iconKey?: string;
+					iconColor?: string;
+				}>;
+			}
 		).serialize?.bind(provider),
 		onDidChangeTreeData: provider.onDidChangeTreeData,
 		dispose: () => provider.dispose(),
@@ -380,7 +387,9 @@ describe("PlansTreeProvider", () => {
 			label: expect.any(String),
 		});
 		// Check that icon colors are preserved for committed items
-		const committedItem = out?.find((item) => item.label.includes("abcdef12"));
+		const committedItem = out?.find((item) =>
+			(item.label ?? "").includes("abcdef12"),
+		);
 		if (committedItem) {
 			expect(committedItem.iconKey).toBe("lock");
 			expect(committedItem.iconColor).toBe("charts.green");

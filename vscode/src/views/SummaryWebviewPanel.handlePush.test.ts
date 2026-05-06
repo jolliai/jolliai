@@ -446,9 +446,22 @@ async function setupPanel(
 	overrides?: Partial<CommitSummary>,
 ): Promise<(msg: Record<string, unknown>) => void> {
 	const summary = makeSummary(overrides);
-	await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+	await SummaryWebviewPanel.show(
+		summary,
+		extensionUri,
+		workspaceRoot,
+		stubBridge,
+		"main",
+	);
 	return captureMessageHandler();
 }
+
+// Bridge stub used only to satisfy the panel ctor signature; handlePush tests
+// don't exercise branch-summary loading, so the stub's methods stay unused.
+const stubBridge = {
+	listBranchCommits: vi.fn(),
+	getSummary: vi.fn(),
+} as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 

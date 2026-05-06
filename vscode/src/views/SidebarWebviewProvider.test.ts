@@ -1222,10 +1222,7 @@ describe("SidebarWebviewProvider", () => {
 				detached: false,
 			}),
 			extensionUri: mockExtensionUri as unknown as never,
-			historyProvider: historyProvider as unknown as {
-				serialize(): Promise<ReadonlyArray<unknown>>;
-				onDidChangeTreeData: (cb: () => void) => { dispose: () => void };
-			},
+			historyProvider: historyProvider as never,
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({ type: "ready" });
