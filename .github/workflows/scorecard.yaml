@@ -1,0 +1,58 @@
+# OpenSSF Scorecard analysis.
+#
+# Runs the OpenSSF Scorecard checks weekly and on pushes to main, then
+# publishes results to:
+#   - the project's Code Scanning alerts page (SARIF upload)
+#   - the public Scorecard API (https://api.scorecard.dev/)
+# The README badge surfaces the score so adopters can see it without
+# having to visit the API directly.
+#
+# Required repository configuration:
+#   - "Code scanning" must be enabled under Settings › Code security
+#     for the SARIF upload step to succeed.
+
+name: OpenSSF Scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: '37 7 * * 2'  # Weekly, Tuesday 07:37 UTC (off-hours)
+  push:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload SARIF to Code Scanning
+      id-token: write          # publish results to the public Scorecard API
+      contents: read           # checkout
+      actions: read            # read workflow data for analysis
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard analysis
+        uses: ossf/scorecard-action@f2ea147fec3c2f0d459703eba7405b5e9bcd8c8f # v2.4.2
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload artifact (SARIF)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to Code Scanning
+        uses: github/codeql-action/upload-sarif@6825d5659bf007b85a0866e2d0f434aacf50de94 # v3.27.5
+        with:
+          sarif_file: results.sarif

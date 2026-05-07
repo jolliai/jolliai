@@ -312,7 +312,7 @@ Core content processing engine. Mirrors files from source to build directory.
 
 **MDX compatibility checking (two layers):**
 
-1. **Layer 1 — Regex (milliseconds):** Checks imports against safe prefix whitelist (`nextra`, `react`, `next/`, `swagger-ui-react`). Checks JSX components against imported names + Nextra built-ins (`Callout`, `Cards`, `Steps`, `Tabs`, etc.).
+1. **Layer 1 — Regex (milliseconds):** Checks imports against safe prefix allowlist (`nextra`, `react`, `next/`, `swagger-ui-react`). Checks JSX components against imported names + Nextra built-ins (`Callout`, `Cards`, `Steps`, `Tabs`, etc.).
 
 2. **Layer 2 — MDX compiler (seconds):** If regex passes, attempts `@mdx-js/mdx` compilation to catch syntax errors. Only runs on files that passed Layer 1.
 
@@ -645,7 +645,7 @@ pathMappings: {
 ### Two-Layer Validation
 
 **Layer 1 — Regex scan (milliseconds):**
-- Checks imports against whitelist: `nextra`, `react`, `next/*`, `swagger-ui-react`, relative paths
+- Checks imports against allowlist: `nextra`, `react`, `next/*`, `swagger-ui-react`, relative paths
 - Checks JSX components against imports + Nextra built-ins
 
 **Layer 2 — MDX compiler (seconds):**

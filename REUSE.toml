@@ -1,0 +1,43 @@
+# REUSE 3.x licensing manifest. See https://reuse.software/spec for spec.
+#
+# This file declares copyright and license for paths matching the globs
+# below, satisfying SPDX compliance without requiring per-file headers
+# across hundreds of source files. `reuse lint` honours both this manifest
+# and any inline `SPDX-FileCopyrightText` / `SPDX-License-Identifier`
+# headers, so individual files may still add explicit headers without
+# breaking these aggregate rules.
+#
+# Workflow:
+#   - To verify compliance locally, run `pipx run reuse lint`.
+#   - To add a new third-party vendored asset, add an `[[annotations]]`
+#     entry below with `precedence = "override"` and the upstream copyright.
+
+version = 1
+SPDX-PackageName = "Jolli Memory"
+SPDX-PackageSupplier = "Jolli AI <support@jolli.ai>"
+SPDX-PackageDownloadLocation = "https://github.com/jolliai/jolliai"
+
+# Default: every tracked file is © Jolli AI under Apache-2.0 unless an
+# overriding rule below says otherwise. `precedence = "aggregate"` means
+# any inline SPDX headers in individual files combine with this rule; they
+# do not need to repeat it.
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Jolli AI"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Gradle wrapper files are vendored from the Gradle Project. They ship under
+# Apache-2.0 but the copyright is upstream's, not ours. `precedence =
+# "override"` ensures this attribution stays intact even if the catch-all
+# above is later refined.
+[[annotations]]
+path = [
+  "intellij/gradle/wrapper/gradle-wrapper.jar",
+  "intellij/gradle/wrapper/gradle-wrapper.properties",
+  "intellij/gradlew",
+  "intellij/gradlew.bat",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "the Gradle Project"
+SPDX-License-Identifier = "Apache-2.0"
