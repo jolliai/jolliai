@@ -417,7 +417,7 @@ export async function mirrorContent(
 		downgradedCount: 0,
 	};
 
-	await walkDir(sourceRoot, sourceRoot, contentDir, result, pathMappings, contentRules);
+	await walkDir(sourceRoot, sourceRoot, contentDir, result, pathMappings, contentRules, publicDir);
 
 	// If no index.md exists at root, look for a file with `slug: /` frontmatter
 	// (common in Docusaurus projects) and rename it to index.md
@@ -555,6 +555,7 @@ async function walkDir(
 	result: MirrorResult,
 	pathMappings?: PathMappings,
 	contentRules?: ContentRules,
+	publicDir?: string,
 ): Promise<void> {
 	let entries: string[];
 	try {
@@ -580,9 +581,9 @@ async function walkDir(
 		}
 
 		if (entryStat.isDirectory()) {
-			await walkDir(fullPath, sourceRoot, contentDir, result, pathMappings, contentRules);
+			await walkDir(fullPath, sourceRoot, contentDir, result, pathMappings, contentRules, publicDir);
 		} else if (entryStat.isFile()) {
-			await processFile(fullPath, sourceRoot, contentDir, result, pathMappings, contentRules);
+			await processFile(fullPath, sourceRoot, contentDir, result, pathMappings, contentRules, publicDir);
 		}
 	}
 }
@@ -596,6 +597,7 @@ async function processFile(
 	result: MirrorResult,
 	pathMappings?: PathMappings,
 	contentRules?: ContentRules,
+	publicDir?: string,
 ): Promise<void> {
 	const originalRelPath = relative(sourceRoot, fullPath);
 	const relPath = applyPathMapping(originalRelPath, pathMappings);
@@ -681,6 +683,17 @@ async function processFile(
 			const destPath = join(contentDir, relPath);
 			await ensureDir(destPath);
 			await copyFile(fullPath, destPath);
+			// Also mirror into publicDir at the *original* relative path so any
+			// browser-absolute references (e.g. `/favicon.svg`,
+			// `/assets/logo.svg` from site.json or hand-written markdown) resolve
+			// against Next.js's public/ root. Original (non-pathMapped) path is
+			// used because absolute refs in site.json are written against the
+			// source folder layout, not the post-mapping layout.
+			if (publicDir) {
+				const publicDest = join(publicDir, originalRelPath);
+				await ensureDir(publicDest);
+				await copyFile(fullPath, publicDest);
+			}
 			break;
 		}
 		/* v8 ignore next 5 -- unreachable: OpenAPI files are handled in the early-return branch above. */

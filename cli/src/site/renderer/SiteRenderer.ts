@@ -8,6 +8,7 @@
  * framework-specific functions directly.
  */
 
+import type { RootInjectionInput } from "../MetaGenerator.js";
 import type { ServerResult } from "../NpmRunner.js";
 import type { OutputFilter } from "../OutputFilter.js";
 import type { OpenApiPipelineResult } from "../openapi/Types.js";
@@ -68,10 +69,17 @@ export interface SiteRenderer {
 	getCacheDirs(buildDir: string): string[];
 
 	/**
-	 * Generate navigation/sidebar files from the content directory
-	 * structure and sidebar overrides.
+	 * Generate navigation / sidebar files from the content-directory structure
+	 * and sidebar overrides. `rootInjection` carries detected OpenAPI specs
+	 * and `header.items` from `site.json` so the renderer can materialise
+	 * `Documentation` / `API Reference` page tabs and customer header tabs
+	 * as native Nextra navbar entries (chevron, hover, mobile drawer).
 	 */
-	generateNavigation(contentDir: string, sidebar?: SidebarOverrides): Promise<void>;
+	generateNavigation(
+		contentDir: string,
+		sidebar?: SidebarOverrides,
+		rootInjection?: RootInjectionInput,
+	): Promise<void>;
 
 	/**
 	 * Render OpenAPI specs into framework-appropriate pages. Each input

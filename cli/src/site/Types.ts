@@ -60,6 +60,11 @@ export interface FooterConfig {
 	copyright?: string;
 	columns?: FooterColumn[];
 	socialLinks?: SocialLinks;
+	/**
+	 * Deprecated SaaS-shape alias for `socialLinks`. Coerced to `socialLinks`
+	 * at site.json load time; `socialLinks` wins when both are set.
+	 */
+	social?: SocialLinks;
 }
 
 /**
@@ -111,6 +116,17 @@ export type DefaultThemeMode = "light" | "dark" | "system";
 export type FontFamily = "inter" | "space-grotesk" | "ibm-plex" | "source-sans" | "source-serif";
 
 /**
+ * How the navbar logo composes its image and text parts:
+ *   - `"text"`  — render only the logo text (defaults to `title`, or `logoText` if set)
+ *   - `"image"` — render only the logo image (`logoUrl`); falls back to text if `logoUrl` is unset
+ *   - `"both"`  — render image followed by text
+ *
+ * When `logoDisplay` is unset, the layout infers `"both"` if `logoUrl` is set
+ * and `"text"` otherwise — preserving pre-`logoDisplay` behaviour.
+ */
+export type LogoDisplay = "text" | "image" | "both";
+
+/**
  * Visual theme block in site.json. Mirrors the customer-facing surface of
  * the SaaS `SiteBranding` (post-1392), minus tenant-only fields (`siteName` —
  * the CLI uses `title` at the top level instead, `customCss`, `legacyBranding`).
@@ -125,6 +141,17 @@ export interface ThemeConfig {
 	/** Optional dark-mode logo variant. The pack swaps when `.dark` is active. */
 	logoUrlDark?: string;
 	/**
+	 * Custom logo text. When unset, the site `title` is used. Useful when the
+	 * page title ("Acme Documentation") differs from the brand wordmark ("ACME").
+	 */
+	logoText?: string;
+	/**
+	 * Whether the navbar logo shows the image, the text, or both. See
+	 * `LogoDisplay` for the resolution rules. The auto-default preserves
+	 * pre-`logoDisplay` behaviour, so existing sites need no change.
+	 */
+	logoDisplay?: LogoDisplay;
+	/**
 	 * Favicon URL. When the legacy top-level `favicon` field is also set, the
 	 * top-level value wins (deprecated alias kept for back-compat).
 	 */
@@ -135,6 +162,37 @@ export interface ThemeConfig {
 	defaultTheme?: DefaultThemeMode;
 	/** Body / heading font family. Pack default applies when unset. */
 	fontFamily?: FontFamily;
+}
+
+/**
+ * Logo subfields under `branding.logo`. Mirrors the SaaS schema (post-1392)
+ * so a single site.json works in both surfaces. The CLI's canonical shape is
+ * the flat `theme.logoUrl` / `theme.logoText` etc. — `BrandingConfig` is read
+ * as a deprecated alias and coerced into `theme` at site.json load time.
+ */
+export interface BrandingLogoConfig {
+	text?: string;
+	image?: string;
+	imageDark?: string;
+	display?: LogoDisplay;
+	/** Schema-compatibility passthrough — currently ignored by the CLI renderer. */
+	alt?: string;
+}
+
+/**
+ * Visual branding block — the SaaS / `https://jolli.app/schemas/site.v1.json`
+ * shape. Read as a deprecated alias for the canonical `theme` field; mapping
+ * happens at load time in `SiteJsonReader.coerceBrandingToTheme`. When both
+ * `branding` and `theme` are present, `theme.*` wins (so callers can override
+ * a single field without rewriting the whole block).
+ */
+export interface BrandingConfig {
+	themePack?: ThemePack;
+	logo?: BrandingLogoConfig;
+	favicon?: string;
+	colors?: { primaryHue?: number };
+	fontFamily?: FontFamily;
+	defaultTheme?: DefaultThemeMode;
 }
 
 /** The parsed contents of site.json */
@@ -167,6 +225,12 @@ export interface SiteJson {
 	renderer?: string;
 	/** Visual styling — see `ThemeConfig`. */
 	theme?: ThemeConfig;
+	/**
+	 * Deprecated SaaS-shape alias for `theme`. Coerced to `theme.*` at
+	 * site.json load time; `theme.*` wins when both are set. New site.json
+	 * files should use `theme` directly.
+	 */
+	branding?: BrandingConfig;
 	[key: string]: unknown; // unknown fields are silently ignored
 }
 

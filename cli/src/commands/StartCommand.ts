@@ -11,6 +11,7 @@ import { join, resolve } from "node:path";
 import type { Command } from "commander";
 import { resolveFavicon } from "../site/AssetResolver.js";
 import { clearDir, mirrorContent } from "../site/ContentMirror.js";
+import type { RootApiSpec, RootInjectionInput } from "../site/MetaGenerator.js";
 import { needsInstall, runNpmInstall, runServe } from "../site/NpmRunner.js";
 import { buildPipeline } from "../site/openapi/OpenApiPipeline.js";
 import { deriveSpecName } from "../site/openapi/SpecName.js";
@@ -19,6 +20,7 @@ import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
 import type { OpenApiSpecInput } from "../site/renderer/SiteRenderer.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
 import { startSourceWatcher } from "../site/SourceWatcher.js";
+import type { HeaderItem, NavLink } from "../site/Types.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -111,14 +113,53 @@ async function syncContent(
 		sidebar["/"] = { index: label, ...sidebar["/"] };
 	}
 
-	await renderer.generateNavigation(contentDir, sidebar);
-
 	if (mirrorResult.openapiFiles.length > 0) {
 		const specInputs = buildOpenApiSpecInputs(mirrorResult);
 		await renderer.renderOpenApiSpecs(contentDir, publicDir, specInputs);
 	}
 
+	// Build the root-_meta.js injection payload. The renderer turns these
+	// into native Nextra page tabs (chevron / hover / mobile drawer) by
+	// writing them to the root `content/_meta.js` — no JSX nav-children
+	// rendering in `<Navbar>`.
+	const rootInjection = buildRootInjectionInput(
+		siteJsonResult.config.header?.items,
+		siteJsonResult.config.nav,
+		mirrorResult,
+	);
+
+	await renderer.generateNavigation(contentDir, sidebar, rootInjection);
+
 	return { success: true, mirrorResult };
+}
+
+/**
+ * Builds the `RootInjectionInput` from header config + detected specs.
+ * Used by both initial render and the dev watcher.
+ *
+ * Falls back to coercing the legacy `nav` shorthand into dropdown-less
+ * header items when `header.items` is empty/missing — matches the documented
+ * `nav` semantics in `Types.ts` so existing CLI sites with only a flat
+ * `nav: [...]` block keep rendering navbar tabs after the move from JSX
+ * navbar children to Nextra-native page-tabs.
+ */
+export function buildRootInjectionInput(
+	headerItems: HeaderItem[] | undefined,
+	legacyNav: NavLink[] | undefined,
+	mirrorResult: Awaited<ReturnType<typeof mirrorContent>>,
+): RootInjectionInput {
+	const apiSpecs: RootApiSpec[] = mirrorResult.openapiFiles.map((relPath) => {
+		const doc = mirrorResult.openapiDocs[relPath];
+		const title = typeof doc?.info?.title === "string" ? doc.info.title : undefined;
+		return { specName: deriveSpecName(relPath), title };
+	});
+	const effectiveHeaderItems =
+		headerItems && headerItems.length > 0
+			? headerItems
+			: legacyNav && legacyNav.length > 0
+				? legacyNav.map((n) => ({ label: n.label, url: n.href }))
+				: undefined;
+	return { apiSpecs, headerItems: effectiveHeaderItems };
 }
 
 // ─── prepareContent ──────────────────────────────────────────────────────────

@@ -428,4 +428,143 @@ describe("SiteJsonReader.readSiteJson", () => {
 
 		expect(result.config.sidebar).toBeUndefined();
 	});
+
+	// ── branding → theme alias coercion ──────────────────────────────────────
+
+	it("coerces branding.themePack into theme.pack", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			branding: { themePack: "forge" },
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.theme?.pack).toBe("forge");
+	});
+
+	it("coerces branding.colors.primaryHue into theme.primaryHue", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			branding: { colors: { primaryHue: 217 } },
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.theme?.primaryHue).toBe(217);
+	});
+
+	it("coerces branding.logo.{text,image,imageDark,display} into theme.{logoText,logoUrl,logoUrlDark,logoDisplay}", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			branding: {
+				logo: {
+					text: "ACME",
+					image: "/logo.svg",
+					imageDark: "/logo-dark.svg",
+					display: "both",
+				},
+			},
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.theme?.logoText).toBe("ACME");
+		expect(result.config.theme?.logoUrl).toBe("/logo.svg");
+		expect(result.config.theme?.logoUrlDark).toBe("/logo-dark.svg");
+		expect(result.config.theme?.logoDisplay).toBe("both");
+	});
+
+	it("coerces branding.{favicon,fontFamily,defaultTheme} into theme.{favicon,fontFamily,defaultTheme}", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			branding: {
+				favicon: "/favicon.svg",
+				fontFamily: "ibm-plex",
+				defaultTheme: "system",
+			},
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.theme?.favicon).toBe("/favicon.svg");
+		expect(result.config.theme?.fontFamily).toBe("ibm-plex");
+		expect(result.config.theme?.defaultTheme).toBe("system");
+	});
+
+	it("theme.* wins over branding.* when both are set on the same field", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			branding: { themePack: "forge", defaultTheme: "system" },
+			theme: { pack: "atlas", defaultTheme: "dark" },
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.theme?.pack).toBe("atlas");
+		expect(result.config.theme?.defaultTheme).toBe("dark");
+	});
+
+	it("merges unrelated branding.* and theme.* fields without dropping either", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			branding: { themePack: "forge" },
+			theme: { primaryHue: 100 },
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.theme?.pack).toBe("forge");
+		expect(result.config.theme?.primaryHue).toBe(100);
+	});
+
+	it("leaves theme unset when no branding or theme block is present", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = { title: "T", description: "D", nav: [] };
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.theme).toBeUndefined();
+	});
+
+	// ── footer.social → footer.socialLinks alias ─────────────────────────────
+
+	it("coerces footer.social into footer.socialLinks", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: { social: { github: "https://github.com/acme" } },
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.footer?.socialLinks).toEqual({ github: "https://github.com/acme" });
+	});
+
+	it("footer.socialLinks wins over footer.social when both are set", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: {
+				social: { github: "https://github.com/old" },
+				socialLinks: { github: "https://github.com/new" },
+			},
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.footer?.socialLinks).toEqual({ github: "https://github.com/new" });
+	});
 });

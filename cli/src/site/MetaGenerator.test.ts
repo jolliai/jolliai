@@ -609,3 +609,314 @@ describe("MetaGenerator.generateMetaFiles with sidebar overrides", () => {
 		expect(metaContent).toContain("Home Page");
 	});
 });
+
+// ─── injectRootNavEntries (root-only auto-injection) ─────────────────────────
+
+describe("MetaGenerator.generateMetaFiles with rootInjection", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "jolli-meta-inject-test-"));
+		// Need at least one *visible* markdown file in the root for processDir
+		// to write the root _meta.js — the folder-walker skips writing the
+		// file when every entry is hidden (`index.md` alone counts as hidden).
+		await writeFile(join(tempDir, "index.md"), "# Home\n", "utf-8");
+		await writeFile(join(tempDir, "about.md"), "# About\n", "utf-8");
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	async function readRootMeta(): Promise<string> {
+		return readFile(join(tempDir, "_meta.js"), "utf-8");
+	}
+
+	// ── No specs / no header.items: no injection ─────────────────────────────
+
+	it("injects nothing when there are no specs and no header.items", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, { apiSpecs: [], headerItems: [] });
+		const meta = await readRootMeta();
+		expect(meta).not.toContain("__documentation");
+		expect(meta).not.toContain("__api-reference");
+	});
+
+	it("injects nothing when rootInjection is omitted entirely", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir);
+		const meta = await readRootMeta();
+		expect(meta).not.toContain("__documentation");
+	});
+
+	// ── Single spec auto-injection ───────────────────────────────────────────
+
+	it("single spec: injects __documentation + the per-spec entry as the visible API Reference link", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			apiSpecs: [{ specName: "petstore", title: "Petstore" }],
+		});
+		const meta = await readRootMeta();
+		expect(meta).toContain('"__documentation":');
+		expect(meta).toContain('"title":"Documentation"');
+		expect(meta).toContain('"href":"/"');
+		expect(meta).toContain('"api-petstore":');
+		expect(meta).toContain('"title":"API Reference"');
+		expect(meta).toContain('"href":"/api-petstore"');
+		// Single-spec form does NOT emit the dropdown key.
+		expect(meta).not.toContain("__api-reference");
+	});
+
+	// ── Multi-spec auto-injection ────────────────────────────────────────────
+
+	it("multi-spec: emits hidden per-spec entries plus a visible __api-reference dropdown", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			apiSpecs: [
+				{ specName: "petstore", title: "Petstore API" },
+				{ specName: "users", title: "Users API" },
+			],
+		});
+		const meta = await readRootMeta();
+		// Per-spec entries — hidden navbar tabs.
+		expect(meta).toContain('"api-petstore":');
+		expect(meta).toContain('"display":"hidden"');
+		expect(meta).toContain('"api-users":');
+		// Visible dropdown.
+		expect(meta).toContain('"__api-reference":');
+		expect(meta).toContain('"type":"menu"');
+		expect(meta).toContain('"href":"/api-petstore"');
+		expect(meta).toContain('"href":"/api-users"');
+	});
+
+	it("multi-spec falls back to the slug as title when the parsed info.title is missing", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			apiSpecs: [{ specName: "petstore" }, { specName: "users", title: "" }],
+		});
+		const meta = await readRootMeta();
+		expect(meta).toContain('"title":"petstore"');
+		expect(meta).toContain('"title":"users"');
+	});
+
+	// ── User overrides win ───────────────────────────────────────────────────
+
+	it("skips __documentation when the user declares a 'Documentation' header item", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			apiSpecs: [{ specName: "petstore" }],
+			headerItems: [{ label: "Documentation", url: "/docs" }],
+		});
+		const meta = await readRootMeta();
+		expect(meta).not.toContain("__documentation");
+		// User entry survives, slug-keyed.
+		expect(meta).toContain('"nav-documentation":');
+		expect(meta).toContain('"href":"/docs"');
+	});
+
+	it("skips __api-reference when the user declares an 'API Reference' header item", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			apiSpecs: [{ specName: "petstore" }, { specName: "users" }],
+			headerItems: [{ label: "API Reference", url: "/api" }],
+		});
+		const meta = await readRootMeta();
+		expect(meta).not.toContain('"__api-reference":');
+		// Per-spec hidden entries are still emitted (they're folder-bindings).
+		expect(meta).toContain('"api-petstore":');
+		// User entry survives.
+		expect(meta).toContain('"nav-api-reference":');
+	});
+
+	it("matches override labels case-insensitively", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			apiSpecs: [{ specName: "petstore" }],
+			headerItems: [{ label: "DOCUMENTATION", url: "/docs" }],
+		});
+		const meta = await readRootMeta();
+		expect(meta).not.toContain("__documentation");
+	});
+
+	it("recognises the short label 'API' as an API Reference override", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			apiSpecs: [{ specName: "petstore" }],
+			headerItems: [{ label: "API", url: "/api" }],
+		});
+		const meta = await readRootMeta();
+		// Single-spec API Reference auto-entry is suppressed; the api-petstore
+		// folder binding should not be emitted as a navbar link either.
+		expect(meta).not.toContain('"title":"API Reference"');
+	});
+
+	// ── header.items materialisation ─────────────────────────────────────────
+
+	it("materialises a flat header item as type:'page' with the configured href", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			headerItems: [{ label: "Pricing", url: "/pricing" }],
+		});
+		const meta = await readRootMeta();
+		expect(meta).toContain('"nav-pricing":');
+		expect(meta).toContain('"type":"page"');
+		expect(meta).toContain('"href":"/pricing"');
+	});
+
+	it("materialises a header item with sub-items as type:'menu' with sub-entries", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			headerItems: [
+				{
+					label: "Resources",
+					items: [
+						{ label: "Blog", url: "/blog" },
+						{ label: "Changelog", url: "/changelog" },
+					],
+				},
+			],
+		});
+		const meta = await readRootMeta();
+		expect(meta).toContain('"nav-resources":');
+		expect(meta).toContain('"type":"menu"');
+		expect(meta).toContain('"blog":{"title":"Blog","href":"/blog"}');
+		expect(meta).toContain('"changelog":{"title":"Changelog","href":"/changelog"}');
+	});
+
+	// ── Security: URL sanitisation ───────────────────────────────────────────
+
+	it("sanitises javascript: URLs in flat header.items[].url to '#'", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			headerItems: [{ label: "Bad", url: "javascript:alert(1)" }],
+		});
+		const meta = await readRootMeta();
+		expect(meta).not.toMatch(/javascript:alert/i);
+		expect(meta).toContain('"href":"#"');
+	});
+
+	it("sanitises javascript: URLs in dropdown sub-items to '#'", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			headerItems: [
+				{
+					label: "Menu",
+					items: [{ label: "Bad", url: "JAVASCRIPT:alert(1)" }],
+				},
+			],
+		});
+		const meta = await readRootMeta();
+		expect(meta).not.toMatch(/javascript:alert/i);
+		expect(meta).toContain('"href":"#"');
+	});
+
+	it("sanitises data: and vbscript: URLs to '#'", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			headerItems: [
+				{ label: "DataUrl", url: "data:text/html,<script>alert(1)</script>" },
+				{ label: "VbsUrl", url: "vbscript:msgbox(1)" },
+			],
+		});
+		const meta = await readRootMeta();
+		expect(meta).not.toContain("data:text/html");
+		expect(meta).not.toContain("vbscript:");
+		expect(meta).not.toContain("<script>");
+	});
+
+	it("preserves http(s), mailto, tel, fragment, and relative hrefs unchanged", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			headerItems: [
+				{ label: "Site", url: "https://example.com/path" },
+				{ label: "Email", url: "mailto:hi@example.com" },
+				{ label: "Phone", url: "tel:+15551234567" },
+				{ label: "Fragment", url: "#section" },
+				{ label: "Relative", url: "/path/to/page" },
+			],
+		});
+		const meta = await readRootMeta();
+		expect(meta).toContain("https://example.com/path");
+		expect(meta).toContain("mailto:hi@example.com");
+		expect(meta).toContain("tel:+15551234567");
+		expect(meta).toContain("#section");
+		expect(meta).toContain("/path/to/page");
+	});
+
+	// ── Key collision handling ───────────────────────────────────────────────
+
+	it("does not overwrite existing _meta keys when sidebar overrides already declare them", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		// Sidebar override pins __documentation to a custom value.
+		await generateMetaFiles(
+			tempDir,
+			{ "/": { __documentation: { title: "Custom Docs", href: "/docs" } } },
+			{ apiSpecs: [{ specName: "petstore" }] },
+		);
+		const meta = await readRootMeta();
+		expect(meta).toContain('"title":"Custom Docs"');
+		expect(meta).toContain('"href":"/docs"');
+		// And does not double-inject the same key.
+		const occurrences = meta.match(/"__documentation":/g) ?? [];
+		expect(occurrences.length).toBe(1);
+	});
+
+	it("disambiguates two header.items with identical labels by appending an index", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			headerItems: [
+				{ label: "Docs", url: "/a" },
+				{ label: "Docs", url: "/b" },
+			],
+		});
+		const meta = await readRootMeta();
+		// First gets `nav-docs`, second gets a suffixed key so both survive.
+		expect(meta).toContain('"nav-docs":');
+		expect(meta).toMatch(/"nav-docs-1":/);
+		expect(meta).toContain("/a");
+		expect(meta).toContain("/b");
+	});
+
+	it("disambiguates dropdown sub-items with identical labels so neither is silently overwritten", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			headerItems: [
+				{
+					label: "Resources",
+					items: [
+						{ label: "Blog", url: "/a" },
+						{ label: "Blog", url: "/b" },
+					],
+				},
+			],
+		});
+		const meta = await readRootMeta();
+		// Both sub-items survive — first as `blog`, second with an index suffix.
+		expect(meta).toContain('"blog":{"title":"Blog","href":"/a"}');
+		expect(meta).toMatch(/"blog-1":\{"title":"Blog","href":"\/b"\}/);
+	});
+
+	it("falls back to nav-{idx} for header items whose label slugs to empty", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			headerItems: [{ label: "!!!", url: "/symbol" }],
+		});
+		const meta = await readRootMeta();
+		expect(meta).toContain('"nav-0":');
+		expect(meta).toContain('"href":"/symbol"');
+	});
+
+	// ── Non-root scope is unaffected ─────────────────────────────────────────
+
+	it("does NOT inject auto-entries into nested folder _meta.js files", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await mkdir(join(tempDir, "guides"), { recursive: true });
+		await writeFile(join(tempDir, "guides", "intro.md"), "# Intro\n", "utf-8");
+
+		await generateMetaFiles(tempDir, undefined, { apiSpecs: [{ specName: "petstore" }] });
+
+		const nestedMeta = await readFile(join(tempDir, "guides", "_meta.js"), "utf-8");
+		expect(nestedMeta).not.toContain("__documentation");
+		expect(nestedMeta).not.toContain("api-petstore");
+	});
+});

@@ -155,11 +155,12 @@ describe("NextraRenderer", () => {
 		expect(new NextraRenderer().getCacheDirs("/build")).toEqual([join("/build", ".next")]);
 	});
 
-	it("generateNavigation delegates to generateMetaFiles", async () => {
+	it("generateNavigation delegates to generateMetaFiles, passing the rootInjection payload through", async () => {
 		const { generateMetaFiles } = await import("../MetaGenerator.js");
 		const sidebar = { "/": { intro: "Intro" } };
-		await new NextraRenderer().generateNavigation("/content", sidebar);
-		expect(generateMetaFiles).toHaveBeenCalledWith("/content", sidebar);
+		const rootInjection = { apiSpecs: [{ specName: "petstore", title: "Petstore" }] };
+		await new NextraRenderer().generateNavigation("/content", sidebar, rootInjection);
+		expect(generateMetaFiles).toHaveBeenCalledWith("/content", sidebar, rootInjection);
 	});
 
 	it("getContentRules returns safe import prefixes including nextra and react", () => {

@@ -178,18 +178,20 @@ describe("NextraProjectWriter.generateLayout", () => {
 		expect(generateLayout(SAMPLE_CONFIG)).toContain("Documentation for My API");
 	});
 
-	it("contains nav item labels", async () => {
+	it("uses <ScopedNextraLayout> instead of vanilla <Layout> (sidebar scoping)", async () => {
 		const { generateLayout } = await import("./NextraProjectWriter.js");
 		const result = generateLayout(SAMPLE_CONFIG);
-		expect(result).toContain("Home");
-		expect(result).toContain("GitHub");
+		expect(result).toContain("import ScopedNextraLayout from '../components/ScopedNextraLayout'");
+		expect(result).toContain("<ScopedNextraLayout");
 	});
 
-	it("contains nav item hrefs", async () => {
+	it("default layout's <Navbar> has no JSX children — nav comes from root _meta.js", async () => {
 		const { generateLayout } = await import("./NextraProjectWriter.js");
 		const result = generateLayout(SAMPLE_CONFIG);
-		expect(result).toContain("/");
-		expect(result).toContain("https://github.com/example");
+		// Nav items live in `content/_meta.js` (written by MetaGenerator).
+		// The layout's navbar only renders the logo prop.
+		expect(result).not.toContain('href={"/"}');
+		expect(result).not.toContain("https://github.com/example");
 	});
 
 	it("imports nextra-theme-docs Layout and Navbar", async () => {
@@ -257,74 +259,96 @@ describe("NextraProjectWriter.generateLayout", () => {
 		expect(result).toContain("./themes/atlas.css");
 	});
 
-	it("default layout passes through theme branding fields without crashing (no-op for now)", async () => {
-		const { generateLayout } = await import("./NextraProjectWriter.js");
-		const config = {
+	it("default layout renders the title in <b> when no logo image or text is configured", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout(SAMPLE_CONFIG);
+		expect(result).toContain('<b>{"My API Docs"}</b>');
+		expect(result).not.toContain("<img");
+	});
+
+	it("default layout uses theme.logoText for the navbar text when set", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({ ...SAMPLE_CONFIG, theme: { logoText: "ACME" } });
+		expect(result).toContain('<b>{"ACME"}</b>');
+		expect(result).not.toContain('<b>{"My API Docs"}</b>');
+	});
+
+	it("default layout renders an <img> from theme.logoUrl alongside the text by default", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({ ...SAMPLE_CONFIG, theme: { logoUrl: "/logo.svg" } });
+		expect(result).toContain('<img src={"/logo.svg"}');
+		expect(result).toContain('<b>{"My API Docs"}</b>');
+	});
+
+	it("default layout emits dark-swap classes and a <style> rule when both logoUrl and logoUrlDark are set", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({
+			...SAMPLE_CONFIG,
+			theme: { logoUrl: "/light.svg", logoUrlDark: "/dark.svg" },
+		});
+		expect(result).toContain('className="jolli-default-logo-light"');
+		expect(result).toContain('className="jolli-default-logo-dark"');
+		expect(result).toContain(".dark .jolli-default-logo-light");
+	});
+
+	it("default layout logoDisplay='text' suppresses the image even when logoUrl is set", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({
+			...SAMPLE_CONFIG,
+			theme: { logoUrl: "/logo.svg", logoDisplay: "text" },
+		});
+		expect(result).not.toContain("<img");
+		expect(result).toContain('<b>{"My API Docs"}</b>');
+	});
+
+	it("default layout logoDisplay='image' suppresses the text label when logoUrl is set", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({
+			...SAMPLE_CONFIG,
+			theme: { logoUrl: "/logo.svg", logoDisplay: "image" },
+		});
+		expect(result).toContain('<img src={"/logo.svg"}');
+		expect(result).not.toContain('<b>{"My API Docs"}</b>');
+	});
+
+	it("default layout logoDisplay='image' falls back to text when logoUrl is unset", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({ ...SAMPLE_CONFIG, theme: { logoDisplay: "image" } });
+		expect(result).not.toContain("<img");
+		expect(result).toContain('<b>{"My API Docs"}</b>');
+	});
+
+	it("default layout passes through favicon, primaryHue, etc. without crashing", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({
 			...SAMPLE_CONFIG,
 			theme: {
 				logoUrl: "/logo.svg",
 				logoUrlDark: "/logo-dark.svg",
 				favicon: "/favicon.ico",
 				primaryHue: 200,
-				defaultTheme: "dark" as const,
-				fontFamily: "inter" as const,
+				defaultTheme: "dark",
+				fontFamily: "inter",
 			},
-		};
-		const result = generateLayout(config);
+		});
 		expect(result).toContain("My API Docs");
 		expect(result).toContain("nextra-theme-docs");
 	});
 
-	// ── header / footer (post-1392 schema) ────────────────────────────────────
+	// ── footer (default theme: inline-style fallback, no pack CSS) ────────────
 
-	it("renders header.items direct links the same way as legacy nav", async () => {
+	it("default layout footer body still uses inline-style flex layout (no pack CSS to target classes)", async () => {
 		const { generateLayout } = await import("./NextraProjectWriter.js");
 		const result = generateLayout({
 			title: "T",
 			description: "D",
 			nav: [],
-			header: { items: [{ label: "Guides", url: "/guides" }] },
+			footer: { copyright: "2026 Acme Inc." },
 		});
-		expect(result).toContain('<a href={"/guides"}');
-		expect(result).toContain('{"Guides"}');
-	});
-
-	it("prefers header.items over the legacy nav shorthand when both are set", async () => {
-		const { generateLayout } = await import("./NextraProjectWriter.js");
-		const result = generateLayout({
-			title: "T",
-			description: "D",
-			nav: [{ label: "FromNav", href: "/nav" }],
-			header: { items: [{ label: "FromHeader", url: "/header" }] },
-		});
-		expect(result).toContain("FromHeader");
-		expect(result).not.toContain("FromNav");
-	});
-
-	it("renders a <details> dropdown when a header item has sub-items", async () => {
-		const { generateLayout } = await import("./NextraProjectWriter.js");
-		const result = generateLayout({
-			title: "T",
-			description: "D",
-			nav: [],
-			header: {
-				items: [
-					{
-						label: "Resources",
-						items: [
-							{ label: "Blog", url: "/blog" },
-							{ label: "Changelog", url: "/changelog" },
-						],
-					},
-				],
-			},
-		});
-		expect(result).toContain("<details");
-		expect(result).toContain("<summary");
-		expect(result).toContain('{"Resources"}');
-		expect(result).toContain('{"Blog"}');
-		expect(result).toContain('{"Changelog"}');
-		expect(result).toContain('<a href={"/blog"}');
+		// Default theme has no pack stylesheet, so it keeps the inline-style
+		// fallback. Forge / Atlas use semantic class names — see their tests.
+		expect(result).toContain("<Footer>");
+		expect(result).toContain('{"2026 Acme Inc."}');
 	});
 
 	it("emits a bare <Footer /> when no footer config is provided (back-compat)", async () => {
@@ -397,37 +421,6 @@ describe("NextraProjectWriter.generateLayout", () => {
 		expect(result).toContain('aria-label={"github"}');
 		expect(result).toContain('aria-label={"youtube"}');
 		expect(result).not.toContain('aria-label={"twitter"}');
-	});
-
-	it("sanitizes javascript: URLs in header items to '#'", async () => {
-		const { generateLayout } = await import("./NextraProjectWriter.js");
-		const result = generateLayout({
-			title: "T",
-			description: "D",
-			nav: [],
-			header: { items: [{ label: "Bad", url: "javascript:alert(1)" }] },
-		});
-		expect(result).not.toContain("javascript:alert");
-		expect(result).toContain('<a href={"#"}');
-	});
-
-	it("sanitizes javascript: URLs in dropdown sub-items to '#'", async () => {
-		const { generateLayout } = await import("./NextraProjectWriter.js");
-		const result = generateLayout({
-			title: "T",
-			description: "D",
-			nav: [],
-			header: {
-				items: [
-					{
-						label: "Menu",
-						items: [{ label: "Bad", url: "JAVASCRIPT:alert(1)" }],
-					},
-				],
-			},
-		});
-		expect(result).not.toMatch(/javascript:alert/i);
-		expect(result).toContain('<a href={"#"}');
 	});
 
 	it("sanitizes javascript: URLs in footer column links and social links", async () => {
@@ -673,21 +666,32 @@ describe("NextraProjectWriter.initNextraProject", () => {
 		expect(layoutContent).toContain("New description");
 	});
 
-	it("regenerates app/layout.tsx with updated nav on subsequent run", async () => {
+	it("regenerates app/layout.tsx with updated title on subsequent run (nav now flows through _meta.js)", async () => {
 		const { initNextraProject } = await import("./NextraProjectWriter.js");
 		const buildDir = join(tempDir, ".jolli-site");
 
 		await initNextraProject(buildDir, SAMPLE_CONFIG);
 
-		const updatedConfig = {
-			...SAMPLE_CONFIG,
-			nav: [{ label: "New Link", href: "/new" }],
-		};
+		const updatedConfig = { ...SAMPLE_CONFIG, title: "Updated Title", nav: [{ label: "New Link", href: "/new" }] };
 		await initNextraProject(buildDir, updatedConfig);
 
 		const layoutContent = await readFile(join(buildDir, "app", "layout.tsx"), "utf-8");
-		expect(layoutContent).toContain("New Link");
-		expect(layoutContent).toContain("/new");
+		expect(layoutContent).toContain("Updated Title");
+		// Nav items are written to root _meta.js by MetaGenerator, NOT into layout.tsx.
+		expect(layoutContent).not.toContain("/new");
+	});
+
+	it("initNextraProject writes components/ScopedNextraLayout.tsx with the runtime page-map filter", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+
+		await initNextraProject(buildDir, SAMPLE_CONFIG);
+
+		expect(existsSync(join(buildDir, "components", "ScopedNextraLayout.tsx"))).toBe(true);
+		const content = await readFile(join(buildDir, "components", "ScopedNextraLayout.tsx"), "utf-8");
+		expect(content).toContain('"use client"');
+		expect(content).toContain("scopePageMap");
+		expect(content).toContain("usePathname");
 	});
 
 	it("written package.json is valid JSON with required dependencies", async () => {
@@ -873,7 +877,7 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 		);
 	});
 
-	it("generateLayout always contains all nav item labels", async () => {
+	it("generateLayout never embeds nav item labels — they go through root _meta.js instead", async () => {
 		const { generateLayout } = await import("./NextraProjectWriter.js");
 
 		fc.assert(
@@ -884,25 +888,17 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 				(title, description, nav) => {
 					const config = { title, description, nav };
 					const result = generateLayout(config);
-					return nav.every(({ label }) => result.includes(label));
+					// Only `title` and the `<Navbar logo=…>` slot reach the layout —
+					// nav item labels and hrefs do not.
+					return nav.every(({ href }) => !result.includes(`href={${JSON.stringify(href)}}`));
 				},
 			),
 			{ numRuns: 100 },
 		);
 	});
 
-	it("generateLayout always contains the sanitized form of every nav item href", async () => {
+	it("generateLayout always uses <ScopedNextraLayout> and never embeds nav hrefs", async () => {
 		const { generateLayout } = await import("./NextraProjectWriter.js");
-
-		// sanitizeUrl trims whitespace and replaces non-safe schemes with "#".
-		// The output embeds each href via JSON.stringify(sanitizeUrl(href)).
-		function expectedHref(href: string): string {
-			const trimmed = href.trim();
-			if (trimmed === "" || /^(?:https?:|mailto:|tel:|[#?/]|\.\.?\/)/i.test(trimmed)) {
-				return JSON.stringify(trimmed);
-			}
-			return JSON.stringify("#");
-		}
 
 		fc.assert(
 			fc.property(
@@ -912,7 +908,7 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 				(title, description, nav) => {
 					const config = { title, description, nav };
 					const result = generateLayout(config);
-					return nav.every(({ href }) => result.includes(expectedHref(href)));
+					return result.includes("ScopedNextraLayout") && !result.includes("<a href=");
 				},
 			),
 			{ numRuns: 100 },

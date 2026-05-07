@@ -15,7 +15,36 @@
 
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join, relative, sep } from "node:path";
-import type { SidebarItemValue, SidebarOverrides } from "./Types.js";
+import { sanitizeUrl } from "./Sanitize.js";
+import type { HeaderItem, SidebarItemValue, SidebarOverrides } from "./Types.js";
+
+// ─── Root-injection types ────────────────────────────────────────────────────
+
+/**
+ * One detected OpenAPI spec used by `injectRootNavEntries` to decide
+ * single-spec vs multi-spec navbar shape.
+ */
+export interface RootApiSpec {
+	/** URL slug (matches `/api-{specName}` route + `content/api-{specName}/` folder). */
+	specName: string;
+	/** Display title from `info.title`. Falls back to the slug when unset. */
+	title?: string;
+}
+
+/**
+ * Optional inputs for root `_meta.js` augmentation. None of these affect
+ * non-root meta files.
+ */
+export interface RootInjectionInput {
+	/** Detected OpenAPI specs — drives the auto-injected `Documentation` + `API Reference` entries. */
+	apiSpecs?: RootApiSpec[];
+	/**
+	 * `site.json`'s `header.items`. Each entry is materialised as a root
+	 * `_meta.js` key so Nextra renders it as a native page-tab (with chevron
+	 * for `items`-bearing dropdowns) instead of custom JSX.
+	 */
+	headerItems?: HeaderItem[];
+}
 
 // ─── MetaEntry ────────────────────────────────────────────────────────────────
 
@@ -128,14 +157,29 @@ function buildOverriddenEntries(filenames: string[], override: Record<string, Si
  *
  * When `sidebarOverrides` is provided, directories with matching path keys
  * use the declared ordering/labels instead of alphabetical auto-generation.
+ *
+ * `rootInjection` only affects the root-level `_meta.js`. It auto-injects
+ * `__documentation` + `__api-reference` entries from detected OpenAPI specs
+ * and materialises `header.items` (from site.json) as native Nextra page
+ * tabs. Mirrors the SaaS `injectOpenApiNavEntries` so navbar styling, chevron,
+ * mobile drawer integration come from Nextra natively.
  */
-export async function generateMetaFiles(contentDir: string, sidebarOverrides?: SidebarOverrides): Promise<void> {
-	await processDir(contentDir, contentDir, sidebarOverrides);
+export async function generateMetaFiles(
+	contentDir: string,
+	sidebarOverrides?: SidebarOverrides,
+	rootInjection?: RootInjectionInput,
+): Promise<void> {
+	await processDir(contentDir, contentDir, sidebarOverrides, rootInjection);
 }
 
 // ─── processDir (internal recursive helper) ───────────────────────────────────
 
-async function processDir(dir: string, contentDir: string, sidebarOverrides?: SidebarOverrides): Promise<boolean> {
+async function processDir(
+	dir: string,
+	contentDir: string,
+	sidebarOverrides?: SidebarOverrides,
+	rootInjection?: RootInjectionInput,
+): Promise<boolean> {
 	let entries: string[];
 	try {
 		entries = await readdir(dir);
@@ -158,7 +202,7 @@ async function processDir(dir: string, contentDir: string, sidebarOverrides?: Si
 		}
 
 		if (entryStat.isDirectory()) {
-			const hasContent = await processDir(fullPath, contentDir, sidebarOverrides);
+			const hasContent = await processDir(fullPath, contentDir, sidebarOverrides, rootInjection);
 			if (hasContent) {
 				contentItems.push(entry);
 			}
@@ -179,7 +223,13 @@ async function processDir(dir: string, contentDir: string, sidebarOverrides?: Si
 	const pathKey = `/${relPath.split(sep).join("/")}`.replace(/\/$/, "") || "/";
 
 	const override = sidebarOverrides?.[pathKey];
-	const metaEntries = buildMetaEntries(contentItems, override);
+	let metaEntries = buildMetaEntries(contentItems, override);
+
+	// Root-only augmentation: auto-inject `Documentation` / `API Reference`
+	// page tabs and materialise `header.items` as Nextra-native tabs.
+	if (pathKey === "/" && rootInjection) {
+		metaEntries = injectRootNavEntries(metaEntries, rootInjection);
+	}
 
 	// Don't write _meta.js if all entries are hidden (e.g. folder with only index.md).
 	// Nextra fails to prerender folders with _meta.js that has no visible entries.
@@ -191,6 +241,173 @@ async function processDir(dir: string, contentDir: string, sidebarOverrides?: Si
 	}
 
 	return true;
+}
+
+// ─── injectRootNavEntries ────────────────────────────────────────────────────
+
+/**
+ * Reserved keys for the auto-injected root navbar entries. Exported so tests
+ * (and future inspector tooling) can assert against the same string the SaaS
+ * uses, keeping the two surfaces aligned.
+ */
+export const DOC_HOME_NAV_KEY = "__documentation";
+export const OPENAPI_NAV_KEY = "__api-reference";
+
+/** Customer-side labels that suppress auto-injection (case-insensitive). */
+const DOCUMENTATION_LABELS = new Set(["documentation"]);
+const API_REFERENCE_LABELS = new Set(["api reference", "api"]);
+
+/**
+ * Slugifies a header-item label into a stable `_meta.js` key. Uses a
+ * `nav-` prefix to namespace customer-supplied entries so they cannot
+ * collide with auto-injected `__documentation` / `__api-reference` /
+ * `api-{slug}` keys, even via crafted labels.
+ *
+ * Falls back to `nav-${idx}` when slugification yields an empty string —
+ * e.g. a label that was all punctuation.
+ */
+function navKeyFromLabel(label: string, idx: number): string {
+	const slug = label
+		.toLowerCase()
+		.replace(/[^\w\s-]/g, "")
+		.replace(/\s+/g, "-")
+		.replace(/-+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return slug ? `nav-${slug}` : `nav-${idx}`;
+}
+
+/**
+ * Returns a new entry list with auto-injected `Documentation` / `API Reference`
+ * tabs and materialised `header.items` entries. Mirrors the SaaS
+ * `injectOpenApiNavEntries`:
+ *
+ *   - `__documentation` page-tab linking to `/` whenever the customer has any
+ *     specs and hasn't already declared a header item labelled "Documentation".
+ *   - **Single spec, no override**: the spec's `api-{slug}` entry doubles as
+ *     the visible "API Reference" navbar tab — `{ title: "API Reference",
+ *     type: "page", href: "/api-{slug}" }`. The href makes it a link in docs
+ *     scope; `<ScopedNextraLayout>` strips the href when inside the spec's
+ *     folder so Nextra binds it for sidebar scoping.
+ *   - **Multi-spec (or single spec with a user "API Reference" override)**:
+ *     each spec is recorded as a hidden page-tab + a visible
+ *     `__api-reference` dropdown (`type: "menu"`) whose `items` map is one
+ *     sub-entry per spec.
+ *   - User-supplied `header.items` are appended after the auto entries with
+ *     `nav-{slug}` keys derived from the label so customer reordering is a
+ *     no-op on the generated keys. URLs flow through `sanitizeUrl` —
+ *     `javascript:` / `data:` URLs are clamped to `"#"`.
+ *     A header item with a clashing label (Documentation / API / API
+ *     Reference, case-insensitive) suppresses the matching auto injection —
+ *     customer overrides win.
+ *
+ * Order matters: Nextra renders root tabs in `_meta.js` declaration order,
+ * and we want `Documentation` first (primary anchor), `API Reference` next,
+ * then user-supplied tabs.
+ */
+function injectRootNavEntries(existing: MetaEntry[], input: RootInjectionInput): MetaEntry[] {
+	const apiSpecs = input.apiSpecs ?? [];
+	const headerItems = input.headerItems ?? [];
+
+	const userLabels = new Set<string>();
+	for (const item of headerItems) {
+		userLabels.add(item.label.trim().toLowerCase());
+	}
+	const skipDocumentation = [...DOCUMENTATION_LABELS].some((label) => userLabels.has(label));
+	const skipApiReference = [...API_REFERENCE_LABELS].some((label) => userLabels.has(label));
+
+	const injected: MetaEntry[] = [];
+
+	if (apiSpecs.length > 0 && !skipDocumentation) {
+		injected.push({
+			key: DOC_HOME_NAV_KEY,
+			value: { title: "Documentation", type: "page", href: "/" },
+		});
+	}
+
+	if (apiSpecs.length === 1 && !skipApiReference) {
+		// Single-spec form — the per-spec entry IS the visible navbar API
+		// Reference link. Carries an `href` so it acts as a navigation link
+		// in docs scope; `<ScopedNextraLayout>` strips the href when inside
+		// the spec's folder so Nextra binds it for sidebar scoping.
+		const spec = apiSpecs[0];
+		injected.push({
+			key: `api-${spec.specName}`,
+			value: { title: "API Reference", type: "page", href: `/api-${spec.specName}` },
+		});
+	} else if (apiSpecs.length > 1) {
+		// Multi-spec — per-spec entries are hidden by default, the visible
+		// dropdown at `OPENAPI_NAV_KEY` handles navigation. Each spec entry
+		// is kept so `<ScopedNextraLayout>` can un-hide the active one for
+		// sidebar binding.
+		for (const spec of apiSpecs) {
+			injected.push({
+				key: `api-${spec.specName}`,
+				value: { title: spec.title?.trim() || spec.specName, type: "page", display: "hidden" },
+			});
+		}
+		if (!skipApiReference) {
+			const items: Record<string, { title: string; href: string }> = {};
+			for (const spec of apiSpecs) {
+				items[spec.specName] = {
+					title: spec.title?.trim() || spec.specName,
+					href: `/api-${spec.specName}`,
+				};
+			}
+			injected.push({
+				key: OPENAPI_NAV_KEY,
+				value: { title: "API Reference", type: "menu", items },
+			});
+		}
+	}
+
+	// User-supplied header items — coerced into Nextra page-tab shape with
+	// sanitised URLs and slug-derived keys (stable across reordering).
+	const usedNavKeys = new Set<string>();
+	headerItems.forEach((item, idx) => {
+		let key = navKeyFromLabel(item.label, idx);
+		// Defuse two `header.items` entries with the same label collapsing onto
+		// one key (Nextra reads the last definition wins; we'd rather keep all
+		// entries by appending an index suffix on collision).
+		if (usedNavKeys.has(key)) {
+			key = `${key}-${idx}`;
+		}
+		usedNavKeys.add(key);
+
+		if (item.items && item.items.length > 0) {
+			const items: Record<string, { title: string; href: string }> = {};
+			const usedSubKeys = new Set<string>();
+			item.items.forEach((sub, subIdx) => {
+				// `navKeyFromLabel` always returns `nav-{slug}` or `nav-{idx}`, so
+				// after stripping the prefix we always have at least one character.
+				let subKey = navKeyFromLabel(sub.label, subIdx).replace(/^nav-/, "");
+				// Same dedup discipline as the outer header-items loop: two sub-items
+				// with the same label otherwise collapse to one entry (last wins).
+				if (usedSubKeys.has(subKey)) {
+					subKey = `${subKey}-${subIdx}`;
+				}
+				usedSubKeys.add(subKey);
+				items[subKey] = { title: sub.label, href: sanitizeUrl(sub.url) };
+			});
+			injected.push({ key, value: { title: item.label, type: "menu", items } });
+		} else {
+			const value: Record<string, unknown> = { title: item.label, type: "page" };
+			if (item.url) {
+				value.href = sanitizeUrl(item.url);
+			}
+			injected.push({ key, value });
+		}
+	});
+
+	if (injected.length === 0) {
+		return existing;
+	}
+
+	// De-duplicate against keys the existing entry list already declares
+	// (e.g. when the customer wrote a manual `_meta.js` override that
+	// already pins `__documentation`).
+	const existingKeys = new Set(existing.map((e) => e.key));
+	const filtered = injected.filter((e) => !existingKeys.has(e.key));
+	return [...filtered, ...existing];
 }
 
 // ─── writeMetaFile (internal helper) ─────────────────────────────────────────

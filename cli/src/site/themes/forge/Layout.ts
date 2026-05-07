@@ -26,15 +26,9 @@
  *                            for back-compat; `theme.favicon` is the fallback)
  */
 
-import type {
-	DefaultThemeMode,
-	ExternalLink,
-	FontFamily,
-	FooterConfig,
-	HeaderConfig,
-	HeaderItem,
-	NavLink,
-} from "../../Types.js";
+import { sanitizeUrl } from "../../Sanitize.js";
+import type { DefaultThemeMode, FontFamily, FooterConfig, HeaderConfig, LogoDisplay } from "../../Types.js";
+import { buildForgeFooterBody } from "../Footer.js";
 import { FORGE_MANIFEST } from "./Manifest.js";
 
 // ─── Font config ─────────────────────────────────────────────────────────────
@@ -77,7 +71,6 @@ const FONT_CONFIG: Record<FontFamily, FontEntry> = {
 export interface ForgeLayoutInput {
 	title: string;
 	description: string;
-	nav: NavLink[];
 	header?: HeaderConfig;
 	footer?: FooterConfig;
 	primaryHue: number;
@@ -85,23 +78,14 @@ export interface ForgeLayoutInput {
 	fontFamily: FontFamily;
 	logoUrl?: string;
 	logoUrlDark?: string;
+	/** Optional override for the text shown alongside (or instead of) the logo image. Falls back to `title`. */
+	logoText?: string;
+	/** Override for the logo composition mode. See `LogoDisplay` in `Types.ts` for the auto-default rules. */
+	logoDisplay?: LogoDisplay;
 	favicon?: string;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/**
- * Allow http(s), mailto, tel, fragments, query strings, and relative paths.
- * Anything else (`javascript:`, `data:`, `vbscript:`) is replaced with `"#"`
- * so a malicious site.json can't smuggle a script URL into the layout.
- */
-function sanitizeUrl(url: string): string {
-	const trimmed = url.trim();
-	if (trimmed === "" || /^(?:https?:|mailto:|tel:|[#?/]|\.\.?\/)/i.test(trimmed)) {
-		return trimmed;
-	}
-	return "#";
-}
 
 /**
  * Logo slot markup used in both the navbar logo + sidebar logo positions.
@@ -133,107 +117,44 @@ function buildLogoSlots(input: ForgeLayoutInput): { light: string; dark: string 
 }
 
 /**
- * Resolves the navbar's logical item list. `header.items` wins when set;
- * otherwise legacy `nav` is coerced into dropdown-less items.
+ * Resolves the effective `LogoDisplay` mode for an input. When the customer
+ * sets `logoDisplay` explicitly, that wins. Otherwise the legacy auto-default
+ * applies — `"both"` if `logoUrl` is set, `"text"` otherwise — so existing
+ * site.json files render unchanged.
+ *
+ * Special case: `display: "image"` with no `logoUrl` configured falls back to
+ * `"text"`. Rendering an empty navbar logo would be a worse UX than honouring
+ * the customer's intent partially.
  */
-function resolveHeaderItems(input: ForgeLayoutInput): HeaderItem[] {
-	if (input.header?.items && input.header.items.length > 0) {
-		return input.header.items;
-	}
-	return input.nav.map((n) => ({ label: n.label, url: n.href }));
+function resolveLogoDisplay(input: ForgeLayoutInput): LogoDisplay {
+	if (input.logoDisplay === "image" && !input.logoUrl) return "text";
+	if (input.logoDisplay) return input.logoDisplay;
+	return input.logoUrl ? "both" : "text";
 }
 
-/** Renders a single header item — either an `<a>` or a `<details>` dropdown. */
-function renderNavbarChild(item: HeaderItem): string {
-	const jsLabel = JSON.stringify(item.label);
-	if (item.items && item.items.length > 0) {
-		const subLinks = item.items
-			.map((sub: ExternalLink) => {
-				const jsSubLabel = JSON.stringify(sub.label);
-				const jsSubHref = JSON.stringify(sanitizeUrl(sub.url));
-				return `              <a href={${jsSubHref}} style={{ display: 'block', padding: '0.25rem 0.75rem', whiteSpace: 'nowrap' }}>{${jsSubLabel}}</a>`;
-			})
-			.join("\n");
-		return [
-			`          <details style={{ marginLeft: '1rem', display: 'inline-block', position: 'relative' }}>`,
-			`            <summary style={{ cursor: 'pointer', listStyle: 'none' }}>{${jsLabel}}</summary>`,
-			`            <div style={{ position: 'absolute', top: '100%', left: 0, marginTop: '0.25rem', background: 'var(--nextra-bg, #fff)', border: '1px solid var(--nextra-border, #e5e7eb)', borderRadius: 4, padding: '0.25rem 0', minWidth: 160, zIndex: 10 }}>`,
-			subLinks,
-			`            </div>`,
-			`          </details>`,
-		].join("\n");
+/**
+ * Builds the inner markup for the logo slot. `textTemplate` is a JSX snippet
+ * with the literal token `TEXT` where the logo text expression should be
+ * spliced — Forge / Atlas / default each use different element wrappers, so
+ * the caller passes the wrapper and this helper handles the composition.
+ */
+function composeLogoMarkup(
+	input: ForgeLayoutInput,
+	logoSlots: { light: string; dark: string },
+	textTemplate: string,
+): string {
+	const display = resolveLogoDisplay(input);
+	const logoText = input.logoText ?? input.title;
+	const textMarkup = textTemplate.replace("TEXT", JSON.stringify(logoText));
+	const imageMarkup = `${logoSlots.light}${logoSlots.dark}`;
+	switch (display) {
+		case "image":
+			return imageMarkup;
+		case "text":
+			return textMarkup;
+		default:
+			return `${imageMarkup}${textMarkup}`;
 	}
-	const jsHref = JSON.stringify(sanitizeUrl(item.url ?? "#"));
-	return `          <a href={${jsHref}} style={{ marginLeft: '1rem' }}>{${jsLabel}}</a>`;
-}
-
-/** Social platforms supported in the footer, in display order. */
-const SOCIAL_PLATFORMS = ["github", "twitter", "discord", "linkedin", "youtube"] as const;
-
-/** Builds the inner JSX of `<Footer>`, or `""` when there's nothing to render. */
-function buildFooterBody(footer: FooterConfig | undefined): string {
-	if (!footer) return "";
-
-	const hasColumns = footer.columns && footer.columns.length > 0;
-	const hasCopyright = typeof footer.copyright === "string" && footer.copyright.length > 0;
-	const socials = footer.socialLinks;
-	const socialEntries = socials
-		? SOCIAL_PLATFORMS.filter((p) => typeof socials[p] === "string" && socials[p] !== "")
-		: [];
-	const hasSocial = socialEntries.length > 0;
-
-	if (!hasColumns && !hasCopyright && !hasSocial) return "";
-
-	const blocks: string[] = [];
-
-	if (hasColumns) {
-		const columnsJsx = (footer.columns ?? [])
-			.map((col) => {
-				const jsTitle = JSON.stringify(col.title);
-				const links = col.links
-					.map((link: ExternalLink) => {
-						const jsLabel = JSON.stringify(link.label);
-						const jsHref = JSON.stringify(sanitizeUrl(link.url));
-						return `                <li><a href={${jsHref}}>{${jsLabel}}</a></li>`;
-					})
-					.join("\n");
-				return [
-					`            <div style={{ minWidth: 140 }}>`,
-					`              <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.875rem', fontWeight: 600 }}>{${jsTitle}}</h4>`,
-					`              <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>`,
-					links,
-					`              </ul>`,
-					`            </div>`,
-				].join("\n");
-			})
-			.join("\n");
-		blocks.push(
-			`          <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap', marginBottom: '1rem' }}>\n${columnsJsx}\n          </div>`,
-		);
-	}
-
-	if (hasCopyright || hasSocial) {
-		const bottom: string[] = [];
-		if (hasCopyright) {
-			const jsCopyright = JSON.stringify(footer.copyright);
-			bottom.push(`            <span>{${jsCopyright}}</span>`);
-		}
-		if (hasSocial && socials) {
-			const social = socialEntries
-				.map((p) => {
-					const jsHref = JSON.stringify(sanitizeUrl(socials[p] ?? ""));
-					const jsLabel = JSON.stringify(p);
-					return `              <a href={${jsHref}} aria-label={${jsLabel}}>{${jsLabel}}</a>`;
-				})
-				.join("\n");
-			bottom.push(`            <div style={{ display: 'flex', gap: '0.75rem' }}>\n${social}\n            </div>`);
-		}
-		blocks.push(
-			`          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>\n${bottom.join("\n")}\n          </div>`,
-		);
-	}
-
-	return [`        <div style={{ width: '100%' }}>`, ...blocks, `        </div>`].join("\n");
 }
 
 // ─── generateForgeLayoutTsx ──────────────────────────────────────────────────
@@ -241,7 +162,14 @@ function buildFooterBody(footer: FooterConfig | undefined): string {
 /**
  * Returns the full contents of `app/layout.tsx` for a Forge-themed site.
  * Caller is responsible for writing `app/themes/forge.css` (which this
+ * layout imports) and `components/ScopedNextraLayout.tsx` (which this
  * layout imports) — see `initNextraProject` in `NextraProjectWriter`.
+ *
+ * Mirrors the SaaS Forge layout post-1392: navbar children reduced to
+ * `<ThemeSwitch />` only — page tabs come from the root `_meta.js`
+ * (Nextra renders them natively with chevron / hover / mobile drawer
+ * styling). Sidebar scoping is handled by `<ScopedNextraLayout>` based
+ * on the URL.
  */
 export function generateForgeLayoutTsx(input: ForgeLayoutInput): string {
 	const jsTitle = JSON.stringify(input.title);
@@ -253,25 +181,18 @@ export function generateForgeLayoutTsx(input: ForgeLayoutInput): string {
 	const faviconLink = input.favicon ? `<link rel="icon" href={${JSON.stringify(sanitizeUrl(input.favicon))}} />` : "";
 
 	const logo = buildLogoSlots(input);
-	const logoMarkup = `${logo.light}${logo.dark}<span>{${jsTitle}}</span>`;
+	const logoMarkup = composeLogoMarkup(input, logo, "<span>{TEXT}</span>");
 
-	const headerItems = resolveHeaderItems(input);
-	const navLinks = headerItems.map(renderNavbarChild).join("\n");
-	const navbarChildren =
-		headerItems.length > 0 ? `\n${navLinks}\n          <ThemeSwitch />\n        ` : "<ThemeSwitch />";
+	const footerBody = buildForgeFooterBody(input.title, input.footer);
+	const footerJsx = `<Footer>${footerBody}</Footer>`;
 
-	const footerBody = buildFooterBody(input.footer);
-	const footerJsx =
-		footerBody === ""
-			? `<Footer>{new Date().getFullYear()} © {${jsTitle}}</Footer>`
-			: `<Footer>\n${footerBody}\n      </Footer>`;
-
-	return `import { Footer, Layout, Navbar, ThemeSwitch } from 'nextra-theme-docs'
+	return `import { Footer, Navbar, ThemeSwitch } from 'nextra-theme-docs'
 import { Head, Search } from 'nextra/components'
 import { getPageMap } from 'nextra/page-map'
 import 'nextra-theme-docs/style.css'
 import '../styles/api.css'
 import './themes/forge.css'
+import ScopedNextraLayout from '../components/ScopedNextraLayout'
 
 export const metadata = {
   title: ${jsTitle},
@@ -284,7 +205,7 @@ const SiteLogo = () => (
   </span>
 )
 
-const navbar = <Navbar logo={<SiteLogo />}>${navbarChildren}</Navbar>
+const navbar = <Navbar logo={<SiteLogo />}><ThemeSwitch /></Navbar>
 const footer = ${footerJsx}
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
@@ -305,7 +226,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
           <Search placeholder="Search…" />
         </div>
 
-        <Layout
+        <ScopedNextraLayout
           navbar={navbar}
           pageMap={await getPageMap()}
           footer={footer}
@@ -315,7 +236,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
           nextThemes={{ defaultTheme: ${jsDefaultTheme} }}
         >
           {children}
-        </Layout>
+        </ScopedNextraLayout>
       </body>
     </html>
   )
@@ -337,7 +258,6 @@ export default async function RootLayout({ children }: { children: React.ReactNo
 export function resolveForgeLayoutInput(args: {
 	title: string;
 	description: string;
-	nav: NavLink[];
 	header?: HeaderConfig;
 	footer?: FooterConfig;
 	theme:
@@ -347,6 +267,8 @@ export function resolveForgeLayoutInput(args: {
 				fontFamily?: FontFamily;
 				logoUrl?: string;
 				logoUrlDark?: string;
+				logoText?: string;
+				logoDisplay?: LogoDisplay;
 				favicon?: string;
 		  }
 		| undefined;
@@ -356,7 +278,6 @@ export function resolveForgeLayoutInput(args: {
 	return {
 		title: args.title,
 		description: args.description,
-		nav: args.nav,
 		header: args.header,
 		footer: args.footer,
 		primaryHue: t.primaryHue ?? FORGE_MANIFEST.defaults.primaryHue,
@@ -364,6 +285,8 @@ export function resolveForgeLayoutInput(args: {
 		fontFamily: t.fontFamily ?? FORGE_MANIFEST.defaults.fontFamily,
 		logoUrl: t.logoUrl,
 		logoUrlDark: t.logoUrlDark,
+		logoText: t.logoText,
+		logoDisplay: t.logoDisplay,
 		favicon: args.legacyFavicon ?? t.favicon,
 	};
 }
