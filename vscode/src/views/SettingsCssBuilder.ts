@@ -134,7 +134,16 @@ export function buildSettingsCss(): string {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 12px;
     padding: 6px 0;
+  }
+  /* In toggle rows the label is the only flexible element — let it grow
+     into available space and shrink below its 140px min-width so long
+     hints (e.g. the Copilot row) wrap instead of pushing the toggle off
+     the right edge. */
+  .toggle-row .settings-label {
+    flex: 1;
+    min-width: 0;
   }
   .toggle-switch {
     position: relative;

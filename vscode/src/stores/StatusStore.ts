@@ -73,13 +73,16 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 	}
 
 	async refresh(): Promise<void> {
+		// Config (authToken / apiKey) lives on disk independently of whether
+		// the git hook is installed; load it unconditionally so the Sidebar's
+		// `configured = signedIn || hasApiKey` gate keeps reflecting the
+		// user's credentials even when hooks are uninstalled. Otherwise
+		// disabling Jolli Memory would flip `configured` to false, swap the
+		// disabled-banner (which carries the Enable button) for the
+		// onboarding panel, and trap the user with no way to re-enable.
 		this.status = await this.bridge.getStatus();
-		if (this.status.enabled) {
-			this.config = await loadConfigFromDir(getGlobalConfigDir());
-			this.authService?.refreshContextKey(this.config);
-		} else {
-			this.config = null;
-		}
+		this.config = await loadConfigFromDir(getGlobalConfigDir());
+		this.authService?.refreshContextKey(this.config);
 		this.rebuildSnapshot("refresh");
 	}
 

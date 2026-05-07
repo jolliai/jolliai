@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { SidebarInboundMsg, SidebarOutboundMsg } from "./SidebarMessages";
+import type {
+	SidebarInboundMsg,
+	SidebarOutboundMsg,
+	SidebarState,
+} from "./SidebarMessages";
 import { SidebarWebviewProvider } from "./SidebarWebviewProvider";
 
 interface MockWebview {
@@ -45,6 +49,14 @@ vi.mock("vscode", () => ({
 		})),
 	},
 }));
+
+// Drains queued microtasks so the async ready handler (which awaits
+// deps.initialStateReady before posting init) gets a chance to run.
+// Two ticks: one for the await, one for the trailing then-block.
+async function flushReady(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+}
 
 function makeMockView(): MockWebviewView {
 	let messageHandler: ((msg: SidebarOutboundMsg) => void) | undefined;
@@ -97,10 +109,11 @@ describe("SidebarWebviewProvider", () => {
 		expect(view.webview.html).toContain('id="sidebar-root"');
 	});
 
-	it("posts `init` when client sends `ready`", () => {
+	it("posts `init` when client sends `ready`", async () => {
 		const view = makeMockView();
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
 		const sent = view.webview.postMessage.mock.calls.map(
 			(c) => c[0],
 		) as SidebarInboundMsg[];
@@ -172,7 +185,7 @@ describe("SidebarWebviewProvider", () => {
 		).toBe(true);
 	});
 
-	it("posts worker:busy alongside status:data so the Branch toolbar can react", () => {
+	it("posts worker:busy alongside status:data so the Branch toolbar can react", async () => {
 		const view = makeMockView();
 		let busyValue = false;
 		let storedHandler: (() => void) | undefined;
@@ -198,6 +211,7 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
 		// Initial pushStatus on ready: busy=false.
 		const initial = view.webview.postMessage.mock.calls.map((c) => c[0]);
 		expect(
@@ -223,6 +237,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",
@@ -258,6 +273,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",
@@ -324,7 +340,7 @@ describe("SidebarWebviewProvider", () => {
 		expect(exec).toHaveBeenCalledWith("vscode.open", expect.anything());
 	});
 
-	it("posts kb:memoriesData on ready and on memoriesProvider change", () => {
+	it("posts kb:memoriesData on ready and on memoriesProvider change", async () => {
 		const view = makeMockView();
 		let memHandler: (() => void) | undefined;
 		const memProvider = {
@@ -361,6 +377,7 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
 		memHandler?.();
 		const msgs = view.webview.postMessage.mock.calls.map((c) => c[0]);
 		expect(
@@ -442,6 +459,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",
@@ -466,7 +484,7 @@ describe("SidebarWebviewProvider", () => {
 		).toBe(true);
 	});
 
-	it("pushes initial branch name on ready", () => {
+	it("pushes initial branch name on ready", async () => {
 		const view = makeMockView();
 		const provider = new SidebarWebviewProvider({
 			executeCommand: vi.fn(),
@@ -486,6 +504,7 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
 		const msgs = view.webview.postMessage.mock.calls.map((c) => c[0]);
 		expect(
 			msgs.some(
@@ -494,7 +513,7 @@ describe("SidebarWebviewProvider", () => {
 		).toBe(true);
 	});
 
-	it("posts branch:plansData on ready and on plansProvider change", () => {
+	it("posts branch:plansData on ready and on plansProvider change", async () => {
 		const view = makeMockView();
 		let plansHandler: (() => void) | undefined;
 		const plansProvider = {
@@ -519,6 +538,7 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
 		plansHandler?.();
 		const msgs = view.webview.postMessage.mock.calls.map((c) => c[0]);
 		expect(
@@ -552,7 +572,7 @@ describe("SidebarWebviewProvider", () => {
 		);
 	});
 
-	it("posts branch:changesData on ready and on filesProvider change", () => {
+	it("posts branch:changesData on ready and on filesProvider change", async () => {
 		const view = makeMockView();
 		let filesHandler: (() => void) | undefined;
 		const filesProvider = {
@@ -579,6 +599,7 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
 		filesHandler?.();
 		const msgs = view.webview.postMessage.mock.calls.map((c) => c[0]);
 		expect(
@@ -979,6 +1000,109 @@ describe("SidebarWebviewProvider", () => {
 		).toBe(true);
 	});
 
+	it("notifyConfiguredChanged posts configured:changed with the new configured flag", () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: false,
+				activeTab: "status",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		provider.notifyConfiguredChanged(true);
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		expect(
+			sent.some(
+				(m) =>
+					typeof m === "object" &&
+					m !== null &&
+					(m as { type?: unknown }).type === "configured:changed" &&
+					(m as { configured?: unknown }).configured === true,
+			),
+		).toBe(true);
+	});
+
+	it("init message carries configured field from getInitialState", async () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		const initMsg = sent.find(
+			(m): m is { type: "init"; state: SidebarState } =>
+				typeof m === "object" &&
+				m !== null &&
+				(m as { type?: unknown }).type === "init",
+		);
+		expect(initMsg).toBeDefined();
+		expect(initMsg?.state.configured).toBe(false);
+	});
+
+	it("waits for initialStateReady before posting init (so reload doesn't flash onboarding)", async () => {
+		const view = makeMockView();
+		// Construct a deferred we can resolve manually so we can observe the
+		// "before-resolve" and "after-resolve" snapshots of postMessage.
+		let resolveReady: () => void = () => {};
+		const initialStateReady = new Promise<void>((r) => {
+			resolveReady = r;
+		});
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			initialStateReady,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await Promise.resolve();
+		// Before initialStateReady resolves, init must NOT have been posted.
+		// This is the gate that prevents the "first paint shows pessimistic
+		// configured=false → flicker to tab UI" bug on reload.
+		expect(
+			view.webview.postMessage.mock.calls.some((c) => {
+				const m = c[0] as { type?: unknown };
+				return m?.type === "init";
+			}),
+		).toBe(false);
+		resolveReady();
+		await flushReady();
+		expect(
+			view.webview.postMessage.mock.calls.some((c) => {
+				const m = c[0] as { type?: unknown };
+				return m?.type === "init";
+			}),
+		).toBe(true);
+	});
+
 	// postMessage runs before resolveWebviewView is called → no view handle → must
 	// be a silent no-op (the sidebar may receive notifyXxx() calls during startup
 	// before the view first becomes visible).
@@ -988,6 +1112,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",
@@ -998,12 +1123,13 @@ describe("SidebarWebviewProvider", () => {
 		// Just verify it doesn't throw — there's no view to assert against.
 		expect(() => provider.notifyEnabledChanged(false)).not.toThrow();
 		expect(() => provider.notifyAuthChanged(true)).not.toThrow();
+		expect(() => provider.notifyConfiguredChanged(false)).not.toThrow();
 	});
 
 	// onSidebarFirstVisible fires exactly once across multiple `ready` messages —
 	// re-resolves of the view (e.g. user toggles the sidebar) must not re-trigger
 	// the lazy load.
-	it("onSidebarFirstVisible fires only once even across re-readies", () => {
+	it("onSidebarFirstVisible fires only once even across re-readies", async () => {
 		const view = makeMockView();
 		const onSidebarFirstVisible = vi.fn();
 		const provider = new SidebarWebviewProvider({
@@ -1011,6 +1137,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",
@@ -1021,7 +1148,9 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
 		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
 		expect(onSidebarFirstVisible).toHaveBeenCalledTimes(1);
 	});
 
@@ -1036,6 +1165,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",
@@ -1246,6 +1376,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",
@@ -1275,6 +1406,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",
@@ -1378,6 +1510,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",
@@ -1397,6 +1530,7 @@ describe("SidebarWebviewProvider", () => {
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
+				configured: true,
 				activeTab: "kb",
 				kbMode: "folders",
 				branchName: "main",

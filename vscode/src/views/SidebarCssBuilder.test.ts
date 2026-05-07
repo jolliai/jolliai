@@ -189,3 +189,59 @@ describe("checkbox + row-leading", () => {
 		expect(css).toContain("var(--vscode-checkbox-background)");
 	});
 });
+
+describe("onboarding panel styles", () => {
+	it("declares the onboarding-panel and card classes", () => {
+		const css = buildSidebarCss();
+		expect(css).toMatch(/\.onboarding-panel\b/);
+		expect(css).toMatch(/\.ob-card\b/);
+		expect(css).toMatch(/\.ob-card--recommended\b/);
+	});
+
+	it("declares the RECOMMENDED badge", () => {
+		const css = buildSidebarCss();
+		expect(css).toMatch(/\.ob-badge\b/);
+	});
+
+	it("declares primary and secondary onboarding buttons", () => {
+		const css = buildSidebarCss();
+		expect(css).toMatch(/\.ob-btn--primary\b/);
+		expect(css).toMatch(/\.ob-btn--secondary\b/);
+	});
+
+	it("uses VSCode theme tokens (focusBorder, button-background)", () => {
+		const css = buildSidebarCss();
+		// The recommended outline + RECOMMENDED badge accent colour come from
+		// --vscode-focusBorder so they adapt to Light / Dark / High-Contrast
+		// themes without hard-coded hex values.
+		expect(css).toContain("var(--vscode-focusBorder)");
+		expect(css).toContain("var(--vscode-button-background)");
+	});
+
+	it("renders the OR divider with flex-1 lines on either side", () => {
+		const css = buildSidebarCss();
+		expect(css).toMatch(/\.ob-or\b/);
+		expect(css).toMatch(/\.ob-or::before/);
+		expect(css).toMatch(/\.ob-or::after/);
+	});
+
+	it("declares a .loading-panel rule for the first-paint placeholder", () => {
+		const css = buildSidebarCss();
+		// The loading panel sits between webview-load and the host's first
+		// `init` message. Without dedicated centering styles it would
+		// render as a top-left codicon — this rule is what makes it look
+		// like a proper "Loading…" placeholder during reload.
+		expect(css).toMatch(/\.loading-panel\b/);
+		expect(css).toContain("var(--vscode-descriptionForeground)");
+	});
+
+	it("shares the onboarding-panel container rule with .disabled-panel", () => {
+		const css = buildSidebarCss();
+		// .disabled-panel reuses the onboarding container (padding/scroll/
+		// height) by way of a multi-selector rule rather than redeclaring
+		// the same declarations. This keeps the two full-viewport panels in
+		// lockstep so tweaking onboarding spacing automatically applies to
+		// the disabled CTA without a parallel edit.
+		expect(css).toMatch(/\.onboarding-panel\s*,\s*\.disabled-panel\s*\{/);
+	});
+});

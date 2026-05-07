@@ -558,5 +558,137 @@ export function buildSidebarCss(): string {
     font-size: 11px;
     flex-shrink: 0;
   }
+
+  /* ── Loading panel ────────────────────────────────────────────────
+     First-paint placeholder shown until the host's 'init' message
+     arrives. Centered spinner + label using --vscode-descriptionForeground
+     so it adapts to all themes. The .codicon-modifier-spin class is
+     provided by codicon.css (already linked from the HTML head). */
+  .loading-panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 16px;
+    height: 100%;
+    box-sizing: border-box;
+    color: var(--vscode-descriptionForeground);
+  }
+  .loading-icon {
+    font-size: 20px;
+  }
+  .loading-text {
+    font-size: 12px;
+  }
+
+  /* ── Onboarding panel ─────────────────────────────────────────────
+     Shown when state.configured === false. Sibling of .tab-bar inside
+     .sidebar-root; toggled via the .hidden class by SidebarScriptBuilder.
+     Theme accents (border, badge, primary button) all come from
+     --vscode-focusBorder / --vscode-button-* so the panel adapts to
+     Light / Dark / High-Contrast without hard-coded hex values.
+
+     .disabled-panel is the user-disabled (state.enabled === false)
+     counterpart. It reuses the same container shell + .ob-* header /
+     button styles but renders a stripped-down body (header + Enable
+     button only — no option cards, no OR divider). Sharing the
+     container rule keeps padding/scroll behavior in lockstep. */
+  .onboarding-panel,
+  .disabled-panel {
+    padding: 16px;
+    overflow-y: auto;
+    height: 100%;
+    box-sizing: border-box;
+  }
+  .ob-header { margin-bottom: 12px; }
+  .ob-title-row { display: flex; align-items: center; gap: 8px; }
+  .ob-title-icon {
+    font-size: 18px;
+    color: var(--vscode-textLink-foreground);
+  }
+  .ob-title { font-size: 14px; font-weight: 600; margin: 0; }
+  .ob-subtitle {
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground);
+    margin: 6px 0 0 0;
+    line-height: 1.5;
+  }
+  .ob-divider {
+    border: none;
+    border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+    margin: 12px 0 14px 0;
+  }
+  .ob-card {
+    position: relative;
+    border: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+    border-radius: 6px;
+    padding: 12px;
+    background: var(--vscode-editor-background);
+  }
+  .ob-card--recommended {
+    border-color: var(--vscode-focusBorder);
+    border-width: 1.5px;
+    padding-top: 14px;
+  }
+  .ob-badge {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 3px 8px;
+    border-radius: 8px;
+    color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+    background: color-mix(in srgb, var(--vscode-focusBorder) 20%, transparent);
+  }
+  .ob-card-row { display: flex; gap: 10px; align-items: flex-start; }
+  .ob-card-icon {
+    font-size: 16px;
+    margin-top: 2px;
+    color: var(--vscode-foreground);
+  }
+  .ob-card-text { flex: 1; min-width: 0; }
+  .ob-card-title { font-size: 12px; font-weight: 600; margin: 0; }
+  .ob-card-desc {
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground);
+    margin: 4px 0 0 0;
+    line-height: 1.5;
+  }
+  .ob-btn {
+    display: block;
+    width: 100%;
+    padding: 8px 12px;
+    margin-top: 8px;
+    border-radius: 4px;
+    font-size: 13px;
+    cursor: pointer;
+    text-align: center;
+    border: 1px solid transparent;
+  }
+  .ob-btn--primary {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
+  .ob-btn--primary:hover { background: var(--vscode-button-hoverBackground); }
+  .ob-btn--secondary {
+    background: transparent;
+    color: var(--vscode-foreground);
+    border-color: var(--vscode-widget-border, var(--vscode-editorWidget-border));
+  }
+  .ob-btn--secondary:hover { background: var(--vscode-list-hoverBackground); }
+  .ob-or {
+    display: flex; align-items: center; gap: 10px;
+    margin: 14px 0;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+  }
+  .ob-or::before, .ob-or::after {
+    content: "";
+    flex: 1;
+    border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+  }
   `;
 }

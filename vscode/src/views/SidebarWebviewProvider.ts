@@ -78,6 +78,22 @@ export interface SidebarWebviewDeps {
 	applyFileCheckbox?: (filePath: string, selected: boolean) => void;
 	/** Toggle a single commit's selection state in CommitsStore. */
 	applyCommitCheckbox?: (hash: string, selected: boolean) => void;
+	/**
+	 * Resolves once the host has finished its first-pass initial load — in
+	 * particular once `statusStore.refresh()` has run so `getInitialState()`
+	 * returns the real `configured` / `enabled` flags rather than their
+	 * pessimistic activate-time defaults. The `ready` handler awaits this
+	 * before posting `init`, which prevents the webview from briefly
+	 * rendering the onboarding panel on reload (the bug this hooks into:
+	 * `currentConfigured = false` → init pushed pre-refresh →
+	 * applyConfigured(false) → onboarding flashes → configured:changed
+	 * arrives → tab UI restored).
+	 *
+	 * Must never reject — the host wraps it in a `.catch(() => undefined)`
+	 * so a failed initial load never traps the webview in the loading
+	 * placeholder.
+	 */
+	initialStateReady?: Promise<unknown>;
 }
 
 export class SidebarWebviewProvider
@@ -158,34 +174,55 @@ export class SidebarWebviewProvider
 		void this.view.webview.postMessage(msg);
 	}
 
+	/**
+	 * Awaits `deps.initialStateReady` (when provided) before posting `init`,
+	 * so the first state the webview sees already reflects the real
+	 * `configured` / `enabled` derived from `statusStore`. Without the
+	 * await, the webview would render against the host's pessimistic
+	 * activate-time defaults (configured=false) and visibly flash the
+	 * onboarding panel on reload.
+	 *
+	 * The promise is wrapped in `.catch` so a failed initial load still
+	 * lets `init` go out — better an unflashed onboarding panel than a
+	 * webview stuck on the loading placeholder forever.
+	 */
+	private async handleReady(): Promise<void> {
+		try {
+			await this.deps.initialStateReady;
+		} catch {
+			// fall through
+		}
+		this.postMessage({ type: "init", state: this.deps.getInitialState() });
+		// Trigger lazy-loaded data sources on first visibility. Idempotent —
+		// `firstVisibleFired` guards against re-firing on view re-resolves
+		// (e.g. user collapses + reopens the sidebar).
+		if (!this.firstVisibleFired) {
+			this.firstVisibleFired = true;
+			if (this.deps.onSidebarFirstVisible) {
+				void this.deps.onSidebarFirstVisible();
+			}
+		}
+		this.pushStatus();
+		this.pushMemories();
+		this.pushPlans();
+		this.pushChanges();
+		void this.pushCommits();
+		if (this.deps.branchWatcher) {
+			const cur = this.deps.branchWatcher.current();
+			this.postMessage({
+				type: "branch:branchName",
+				name: cur.name,
+				detached: cur.detached,
+			});
+		}
+	}
+
 	private handleOutbound(raw: unknown): void {
 		if (!isOutbound(raw)) return;
 		const msg: SidebarOutboundMsg = raw;
 		switch (msg.type) {
 			case "ready":
-				this.postMessage({ type: "init", state: this.deps.getInitialState() });
-				// Trigger lazy-loaded data sources on first visibility. Idempotent —
-				// `firstVisibleFired` guards against re-firing on view re-resolves
-				// (e.g. user collapses + reopens the sidebar).
-				if (!this.firstVisibleFired) {
-					this.firstVisibleFired = true;
-					if (this.deps.onSidebarFirstVisible) {
-						void this.deps.onSidebarFirstVisible();
-					}
-				}
-				this.pushStatus();
-				this.pushMemories();
-				this.pushPlans();
-				this.pushChanges();
-				void this.pushCommits();
-				if (this.deps.branchWatcher) {
-					const cur = this.deps.branchWatcher.current();
-					this.postMessage({
-						type: "branch:branchName",
-						name: cur.name,
-						detached: cur.detached,
-					});
-				}
+				void this.handleReady();
 				return;
 			case "command":
 				if (msg.args && msg.args.length > 0) {
@@ -332,6 +369,15 @@ export class SidebarWebviewProvider
 	/** Pushed after the OAuth callback completes (sign-in) and after signOut. */
 	notifyAuthChanged(authenticated: boolean): void {
 		this.postMessage({ type: "auth:changed", authenticated });
+	}
+
+	/**
+	 * Pushed whenever the user's `configured` state changes — i.e. whenever
+	 * either of the two underlying signals (`signedIn`, `hasApiKey`) flips.
+	 * Drives the onboarding-panel vs main-UI split in the webview.
+	 */
+	notifyConfiguredChanged(configured: boolean): void {
+		this.postMessage({ type: "configured:changed", configured });
 	}
 
 	private pushStatus(): void {

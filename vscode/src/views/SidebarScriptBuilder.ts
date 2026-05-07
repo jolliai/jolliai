@@ -76,6 +76,12 @@ export function buildSidebarScript(): string {
     activeTab: 'branch',
     kbMode: 'folders',
     authenticated: false,
+    // 'enabled' / 'configured' default to truthy so the HTML default state
+    // (onboarding panel hidden, tab UI visible) does not flicker before the
+    // host's init message arrives. The init handler reconciles both fields
+    // against the real values from the host.
+    enabled: true,
+    configured: true,
     sectionsCollapsed: {},
     // Per-commit expand toggle (hash → bool). Native TreeView starts each
     // commit collapsed; we mirror that default but persist user toggles
@@ -110,6 +116,22 @@ export function buildSidebarScript(): string {
   const tabButtonKb = document.getElementById('tab-button-kb');
   const tabBranchBtn = document.getElementById('tab-button-branch');
   const statusIconBtn = document.getElementById('status-icon-btn');
+  // Onboarding panel — full-viewport replacement for the tab UI when the
+  // user has not configured AI yet (no Jolli sign-in and no Anthropic key).
+  const onboardingPanel = document.getElementById('onboarding-panel');
+  const onboardingSigninBtn = document.getElementById('onboarding-signin-btn');
+  const onboardingApikeyBtn = document.getElementById('onboarding-apikey-btn');
+  // Disabled panel — full-viewport "Enable" CTA shown when the user is
+  // configured but has explicitly disabled the extension. Sibling of the
+  // onboarding panel; mutually exclusive with it.
+  const disabledPanel = document.getElementById('disabled-panel');
+  const disabledEnableBtn = document.getElementById('disabled-enable-btn');
+  // Loading panel — visible on first paint (no .hidden in HTML), then
+  // hidden as soon as the host's init message arrives. Bridges the gap
+  // between webview-load and the first real configured/enabled values
+  // so reload doesn't briefly show the onboarding panel as a side effect
+  // of host's currentConfigured starting at false.
+  const loadingPanel = document.getElementById('loading-panel');
   const tabContents = {
     kb: document.getElementById('tab-content-kb'),
     branch: document.getElementById('tab-content-branch'),
@@ -371,6 +393,26 @@ export function buildSidebarScript(): string {
     vscode.postMessage({ type: 'command', command: enableBtn.dataset.command || 'jollimemory.enableJolliMemory' });
   });
 
+  // Onboarding panel buttons. The Anthropic API key path is the recommended
+  // primary action and routes to the existing Settings webview (where the
+  // user already configures their API key); Sign In / Sign Up runs the
+  // OAuth-based jollimemory.signIn command.
+  onboardingApikeyBtn.addEventListener('click', function() {
+    vscode.postMessage({ type: 'command', command: 'jollimemory.openSettings' });
+  });
+  onboardingSigninBtn.addEventListener('click', function() {
+    vscode.postMessage({ type: 'command', command: 'jollimemory.signIn' });
+  });
+
+  // Disabled-panel Enable button — same command as the legacy in-Status
+  // disabled-banner Enable button (jollimemory.enableJolliMemory). Wired
+  // separately because the two buttons live in disjoint DOM regions and
+  // only one is visible at a time (disabled-panel for user-opt-out,
+  // disabled-banner for the degraded fallback).
+  disabledEnableBtn.addEventListener('click', function() {
+    vscode.postMessage({ type: 'command', command: 'jollimemory.enableJolliMemory' });
+  });
+
   // Close context menu on outside click.
   document.addEventListener('click', function(e) {
     if (!ctxMenu.contains(e.target)) ctxMenu.classList.add('hidden');
@@ -387,6 +429,12 @@ export function buildSidebarScript(): string {
     switch (msg.type) {
       case 'init':
         if (typeof msg.state.authenticated === 'boolean') state.authenticated = msg.state.authenticated;
+        // Tear down the first-paint loading placeholder once init lands —
+        // every following branch (degraded, configured, disabled, normal)
+        // unhides exactly the panel it owns, so this is the single hand-off
+        // point. Doing it before applyDegraded means degraded paths don't
+        // need to know about the loading panel.
+        loadingPanel.classList.add('hidden');
         if (msg.state.degradedReason) {
           // Degraded path: no workspace folder open, or workspace is not a git
           // repo. Skip the rest of init (data providers aren't wired in this
@@ -395,6 +443,11 @@ export function buildSidebarScript(): string {
           break;
         }
         applyEnabled(msg.state.enabled);
+        // Onboarding gate sits on top of enabled — when configured===false it
+        // hides the tab UI applyEnabled just configured. configured defaults to
+        // true on undefined (e.g. older host code, transient init message)
+        // so the regular UI keeps working without a strict-host upgrade.
+        applyConfigured(msg.state.configured !== false);
         if (msg.state.activeTab) switchTab(msg.state.activeTab);
         if (msg.state.kbMode) state.kbMode = msg.state.kbMode;
         if (typeof msg.state.kbRepoFolder === 'string') kbRepoFolder = msg.state.kbRepoFolder;
@@ -425,13 +478,27 @@ export function buildSidebarScript(): string {
         // toolbar; re-render so the swap takes effect immediately.
         if (state.activeTab === 'status') renderToolbar();
         break;
+      case 'configured:changed':
+        applyConfigured(!!msg.configured);
+        // After flipping configured back to true we're back on the regular
+        // UI surface; refresh the toolbar so the active-tab buttons reflect
+        // the current state (e.g. Sign In/Out icon, worker-busy label).
+        if (msg.configured) renderToolbar();
+        break;
       case 'worker:busy': {
         const next = !!msg.busy;
         if (state.workerBusy === next) break;
         state.workerBusy = next;
-        // Only the Branch tab toolbar shows this indicator; other tabs ignore
-        // the flag, so re-render is scoped to avoid wiping their toolbars.
-        if (state.activeTab === 'branch') renderToolbar();
+        // Only the Branch tab reacts to workerBusy: the toolbar shows the
+        // "AI summary in progress…" indicator (renderToolbar) and the
+        // Changes section's Commit-AI icon must flip its disabled state
+        // (renderSectionActions reads state.workerBusy → renderBranch
+        // re-mounts the section action span). Other tabs ignore the flag
+        // so we don't wipe their toolbars.
+        if (state.activeTab === 'branch') {
+          renderToolbar();
+          renderBranch();
+        }
         break;
       }
       case 'branch:branchName':
@@ -481,48 +548,97 @@ export function buildSidebarScript(): string {
   }
 
   function applyEnabled(enabled) {
-    disabledBanner.classList.toggle('hidden', !!enabled);
+    state.enabled = !!enabled;
+    // While the onboarding panel is showing, keep all main-UI elements hidden
+    // regardless of the enabled flag — the onboarding flow takes the entire
+    // viewport. applyConfigured(true) re-invokes applyEnabled on its own when
+    // the user finishes configuring, so this branch never traps the UI.
+    if (state.configured === false) {
+      disabledPanel.classList.add('hidden');
+      disabledBanner.classList.add('hidden');
+      statusEntries.classList.add('hidden');
+      return;
+    }
     statusEntries.classList.toggle('hidden', !enabled);
-    // Tab bar itself stays visible always; we hide just the labeled KB / Branch
-    // tab buttons so only the Status icon remains in the bar when disabled.
-    tabButtonKb.classList.toggle('hidden', !enabled);
-    tabBranchBtn.classList.toggle('hidden', !enabled);
+    // The legacy disabled-banner inside the Status panel is reserved for the
+    // degraded (no-workspace / no-git) fallback. The standard user-disabled
+    // path uses the new disabled-panel above, so keep the banner hidden here
+    // and let applyDegraded re-show it when needed.
+    disabledBanner.classList.add('hidden');
+    // Disabled-panel mirrors enabled: hidden when enabled, visible when not.
+    disabledPanel.classList.toggle('hidden', !!enabled);
+    // Tab bar — hidden entirely in the disabled state because the
+    // disabled-panel takes the full viewport (no Status tab to land on).
+    tabBar.classList.toggle('hidden', !enabled);
     tabToolbar.classList.toggle('hidden', !enabled);
     // Invalidate the status-entries cache: visibility flipped, so the next
     // status:data push must repaint regardless of whether the JSON changed.
     lastStatusEntriesJson = null;
 
-    // Sync the .active class on tab buttons. When disabled, the Status icon is
-    // the only visible tab and Status content is force-shown, so the icon
-    // should look active regardless of state.activeTab. state.activeTab is
-    // preserved untouched so re-enabling restores the user's previous tab.
-    const visualActive = enabled ? state.activeTab : 'status';
-    document.querySelectorAll('.tab').forEach(function(elBtn) {
-      elBtn.classList.toggle('active', elBtn.getAttribute('data-tab') === visualActive);
-    });
-
     if (enabled) {
+      // Restore tab-button labels (cleared by disabled-mode overrides if any)
+      // and sync .active class against the persisted active tab.
+      tabButtonKb.classList.remove('hidden');
+      tabBranchBtn.classList.remove('hidden');
+      document.querySelectorAll('.tab').forEach(function(elBtn) {
+        elBtn.classList.toggle('active', elBtn.getAttribute('data-tab') === state.activeTab);
+      });
       // Normal mode: only the active tab's content is visible.
       Object.keys(tabContents).forEach(function(t) {
         tabContents[t].classList.toggle('hidden', t !== state.activeTab);
       });
     } else {
-      // Disabled mode: hide KB and Branch panels, force Status panel visible
-      // so the disabled-banner inside it (intro + Enable button) is the only
-      // thing the user sees — no labeled tabs, no toolbar, no entries area.
+      // Disabled mode: the disabled-panel is the entire UI. Hide every
+      // tab-content so the panel sits cleanly in the viewport, and clear the
+      // .active class on tab buttons so re-enable starts from a clean slate.
       tabContents.kb.classList.add('hidden');
       tabContents.branch.classList.add('hidden');
-      tabContents.status.classList.remove('hidden');
+      tabContents.status.classList.add('hidden');
+      document.querySelectorAll('.tab').forEach(function(elBtn) {
+        elBtn.classList.remove('active');
+      });
     }
   }
 
-  // Degraded mode (no workspace / no git) reuses the disabled visuals — same
-  // hidden tabs/toolbar, same banner-only Status panel — but swaps the banner
-  // copy and primary-button command for the reason-specific CTA. The standard
-  // "Enable Jolli Memory" path doesn't apply because the underlying problem is
-  // outside our control (user must open a folder or init git first).
+  // Toggles between the onboarding flow and the regular tab UI based on
+  // whether the user has supplied any AI credentials (Jolli sign-in OR
+  // Anthropic key). When configured=false the onboarding panel takes the
+  // entire sidebar viewport and every other element is hidden. When
+  // configured=true we restore the regular UI by re-running applyEnabled
+  // against the last-known enabled flag (host always pushes enabled:changed
+  // before we'd flip configured back, but defending against ordering keeps
+  // this idempotent).
+  function applyConfigured(configured) {
+    state.configured = !!configured;
+    if (!configured) {
+      onboardingPanel.classList.remove('hidden');
+      disabledPanel.classList.add('hidden');
+      tabBar.classList.add('hidden');
+      tabToolbar.classList.add('hidden');
+      tabContents.kb.classList.add('hidden');
+      tabContents.branch.classList.add('hidden');
+      tabContents.status.classList.add('hidden');
+      disabledBanner.classList.add('hidden');
+      return;
+    }
+    onboardingPanel.classList.add('hidden');
+    // applyEnabled() now manages the .hidden flag on tabBar itself (it hides
+    // the bar in disabled mode because disabled-panel owns the viewport),
+    // so just delegate — no manual tabBar.classList.remove('hidden') needed.
+    applyEnabled(state.enabled);
+  }
+
+  // Degraded mode (no workspace / no git) keeps the legacy disabled-banner
+  // path: it has reason-specific copy and a non-Enable primary command
+  // (Open Folder / Initialize Git) that the new disabled-panel doesn't
+  // model. We start from applyEnabled(false) — which hides everything
+  // including the disabled-panel — then explicitly swap in the Status tab
+  // + banner so the reason-specific CTA is the only visible element.
   function applyDegraded(reason) {
     applyEnabled(false);
+    disabledPanel.classList.add('hidden');
+    tabContents.status.classList.remove('hidden');
+    disabledBanner.classList.remove('hidden');
     const intro = disabledBanner.querySelector('.disabled-intro');
     if (reason === 'no-workspace') {
       if (intro) intro.textContent = 'Open a folder to start capturing memories from your AI coding sessions.';
@@ -1367,13 +1483,17 @@ export function buildSidebarScript(): string {
       // similarly has no work to do with zero selection. Disable both below
       // that threshold. Re-enables itself on the next branch:changesData
       // push (which always follows a checkbox toggle on the host side).
+      // Commit-AI is also disabled while a background AI summary is in
+      // progress (state.workerBusy) — kicking off another LLM call while
+      // the queue worker is mid-flight risks racing the same provider /
+      // hitting rate limits. Discard is local-only so it stays available.
       const selectedCount = branchData.changes.filter(function(c) {
         return !!c.isSelected;
       }).length;
       const noneSelected = selectedCount === 0;
       return [
         iconButton('changes-select-all', 'Select/Deselect All Files', 'check-all'),
-        iconButton('changes-commit-ai',  'Commit (AI message)',       'sparkle',  { disabled: noneSelected }),
+        iconButton('changes-commit-ai',  'Commit (AI message)',       'sparkle',  { disabled: noneSelected || state.workerBusy }),
         iconButton('changes-discard',    'Discard Selected Changes',  'discard',  { disabled: noneSelected }),
       ];
     }

@@ -62,6 +62,10 @@ import { PlansTreeProvider } from "./providers/PlansTreeProvider.js";
 import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
 import { AuthService } from "./services/AuthService.js";
 import { KbFoldersService } from "./services/KbFoldersService.js";
+import {
+	readManualDisableFlag,
+	writeManualDisableFlag,
+} from "./services/ManualDisableFlag.js";
 import { CommitsStore } from "./stores/CommitsStore.js";
 import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
@@ -253,6 +257,11 @@ function registerDegradedSidebar(
 		getInitialState: () => ({
 			enabled: false,
 			authenticated: false,
+			// In degraded mode (no workspace / no git) we never show the
+			// onboarding panel — the degraded UI takes priority. Reporting
+			// `configured: true` keeps the webview from gating on the
+			// onboarding flow when there's nothing to onboard against yet.
+			configured: true,
 			activeTab: "status",
 			kbMode: "folders",
 			branchName: "",
@@ -577,14 +586,54 @@ export function activate(context: vscode.ExtensionContext): void {
 	let currentBranchDetached = false;
 	const branchChangeEmitter = new vscode.EventEmitter<void>();
 
-	void bridge.getCurrentBranch().then((branch) => {
-		currentBranchName = branch;
-		currentBranchDetached = branch === "HEAD";
-		branchChangeEmitter.fire();
-	});
+	// Re-read the current branch name from git and notify subscribers if it
+	// changed. Called once at activation and again from the HEAD watcher so
+	// branch switches (regular and detached) update the sidebar tab label.
+	// Without the HEAD-watcher re-call, currentBranchName would freeze at
+	// activation time and drift out of sync with what `git branch --show-current`
+	// reports — producing the "tab name doesn't match workspace branch" bug.
+	const refreshBranchName = async (): Promise<void> => {
+		try {
+			const branch = await bridge.getCurrentBranch();
+			const detached = branch === "HEAD";
+			if (branch === currentBranchName && detached === currentBranchDetached) {
+				return;
+			}
+			currentBranchName = branch;
+			currentBranchDetached = detached;
+			branchChangeEmitter.fire();
+		} catch (err) {
+			log.warn("refreshBranchName", "Failed to read current branch", {
+				error: (err as Error).message,
+			});
+		}
+	};
+
+	void refreshBranchName();
 
 	let currentEnabled = true;
 	let currentAuthenticated = false;
+	// Tracks whether the user has either signed in to Jolli or supplied an
+	// Anthropic API key. Drives the onboarding-panel vs main-UI split. Updated
+	// from statusStore.onChange so sign-in / sign-out / settings save / config
+	// reload all converge on a single source of truth.
+	let currentConfigured = false;
+
+	// Deferred barrier that the SidebarWebviewProvider awaits before posting
+	// the first `init` message. We resolve it once `initialLoad()` (which
+	// includes statusStore.refresh) has finished, so currentConfigured /
+	// currentAuthenticated / currentBranchName have all been corrected from
+	// their pessimistic activate-time defaults. Without this gate the
+	// webview would render against `configured = false` on reload and visibly
+	// flash the onboarding panel before the real value arrives. Wrapped on
+	// the consumer side with .catch so a failed initialLoad never traps the
+	// webview in the loading placeholder.
+	let resolveInitialStateReady: () => void = () => {
+		// no-op until the real resolver replaces it
+	};
+	const initialStateReady = new Promise<void>((resolve) => {
+		resolveInitialStateReady = resolve;
+	});
 
 	const sidebarProvider = new SidebarWebviewProvider({
 		executeCommand: (cmd, ...args) =>
@@ -592,6 +641,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		getInitialState: () => ({
 			enabled: currentEnabled,
 			authenticated: currentAuthenticated,
+			configured: currentConfigured,
 			activeTab: "branch",
 			kbMode: "folders",
 			branchName: currentBranchName,
@@ -650,6 +700,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			filesStore.applyCheckboxBatch([[filePath, selected]]),
 		applyCommitCheckbox: (hash, selected) =>
 			commitsStore.onCheckboxToggle(hash, selected),
+		initialStateReady,
 	});
 	context.subscriptions.push(
 		sidebarProvider,
@@ -660,13 +711,35 @@ export function activate(context: vscode.ExtensionContext): void {
 		branchChangeEmitter,
 	);
 
-	void bridge.getStatus().then((s) => {
-		currentEnabled = s.enabled;
-		sidebarProvider.notifyEnabledChanged(s.enabled);
-	});
 	void loadConfig().then((cfg) => {
 		currentAuthenticated = !!cfg?.authToken;
 		sidebarProvider.notifyAuthChanged(currentAuthenticated);
+	});
+
+	// Keep `currentEnabled` and `currentConfigured` in lockstep with StatusStore
+	// so the disabled banner and onboarding-panel vs main-UI split flip the
+	// moment any underlying signal changes (enable/disable, sign-in/sign-out,
+	// settings save, config reload). Routing both through the same store also
+	// puts them under `initialStateReady`'s barrier — `initialLoad()` awaits
+	// `statusStore.refresh()`, which fires this subscription, so the first
+	// `init` message the webview receives reflects real state instead of the
+	// optimistic activate-time defaults. Previously `currentEnabled` had its
+	// own fire-and-forget `bridge.getStatus()` outside the barrier, which
+	// could race the `init` and briefly flash the main UI before flipping to
+	// disabled. Only fire `notify…` when the boolean actually changes to keep
+	// webview round-trips minimal.
+	context.subscriptions.push({
+		dispose: statusStore.onChange((snap) => {
+			const nextConfigured = snap.derived.signedIn || snap.derived.hasApiKey;
+			if (nextConfigured !== currentConfigured) {
+				currentConfigured = nextConfigured;
+				sidebarProvider.notifyConfiguredChanged(nextConfigured);
+			}
+			if (snap.status && snap.status.enabled !== currentEnabled) {
+				currentEnabled = snap.status.enabled;
+				sidebarProvider.notifyEnabledChanged(snap.status.enabled);
+			}
+		}),
 	});
 	// Pick up customKBPath from config now that loadConfig() can run async.
 	// Without this the sidebar would keep showing the default KB folder until
@@ -865,6 +938,12 @@ export function activate(context: vscode.ExtensionContext): void {
 			vscode.Uri.file(dirname(headPath)),
 			"HEAD",
 			() => {
+				// Branch label is the only piece that doesn't read from a store —
+				// re-fetch and emit through branchChangeEmitter so the Branch tab
+				// label tracks the workspace's actual HEAD across branch switches
+				// (regular + detached). The other refreshes drive the per-tab data
+				// stores, which already key off "current branch" implicitly.
+				void refreshBranchName();
 				statusStore.refresh().catch(handleError("headWatcher.status"));
 				plansStore.refresh().catch(handleError("headWatcher.plans"));
 				filesStore.refresh().catch(handleError("headWatcher.files"));
@@ -1159,16 +1238,37 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 		// Status panel
-		vscode.commands.registerCommand("jollimemory.refreshStatus", () => {
+		// Beyond refreshing the status store + status bar, this also re-pulls
+		// `bridge.getStatus()` (via refreshStatusBar's return value) and
+		// `loadConfig()` to resync the sidebar shell's `currentEnabled` /
+		// `currentAuthenticated` — those are only otherwise updated by
+		// startup promises and the enable/disable/auth commands, so without
+		// this any out-of-band change to hooks or auth would leave the
+		// disabled panel / Sign In/Out chrome stale until reload.
+		vscode.commands.registerCommand("jollimemory.refreshStatus", async () => {
 			statusStore.refresh().catch(handleError("refreshStatus"));
-			refreshStatusBar(
-				bridge,
-				memoriesStore,
-				plansStore,
-				filesStore,
-				commitsStore,
-				statusBar,
-			);
+			try {
+				const status = await refreshStatusBar(
+					bridge,
+					memoriesStore,
+					plansStore,
+					filesStore,
+					commitsStore,
+					statusBar,
+				);
+				if (status.enabled !== currentEnabled) {
+					currentEnabled = status.enabled;
+					sidebarProvider.notifyEnabledChanged(status.enabled);
+				}
+				const cfg = await loadConfig();
+				const nextAuth = !!cfg?.authToken;
+				if (nextAuth !== currentAuthenticated) {
+					currentAuthenticated = nextAuth;
+					sidebarProvider.notifyAuthChanged(nextAuth);
+				}
+			} catch (err) {
+				handleError("refreshStatus")(err);
+			}
 		}),
 
 		// enableJolliMemory / disableJolliMemory: two commands with different icons,
@@ -1184,6 +1284,10 @@ export function activate(context: vscode.ExtensionContext): void {
 					log.error("cmd", "enable failed", { message: result.message });
 					vscode.window.showErrorMessage(`Jolli Memory: ${result.message}`);
 				} else {
+					// Clear the opt-out so subsequent IDE restarts auto-enable as
+					// usual. Done only on success — a failed install means the
+					// previous (manuallyDisabled) state is still the user's intent.
+					await writeManualDisableFlag(workspaceRoot, false);
 					log.info("cmd", "enable succeeded — refreshing all panels");
 					// ORDER MATTERS:
 					//   1. refreshStatusBar flips every store's enabled flag
@@ -1227,6 +1331,9 @@ export function activate(context: vscode.ExtensionContext): void {
 			"jollimemory.disableJolliMemory",
 			async () => {
 				log.info("cmd", "disableJolliMemory invoked");
+				// Record the opt-out *before* the async uninstall so the user's
+				// intent is durable even if Installer.uninstall() throws or fails.
+				await writeManualDisableFlag(workspaceRoot, true);
 				const result = await bridge.disable();
 				if (!result.success) {
 					log.error("cmd", "disable failed", { message: result.message });
@@ -1964,7 +2071,11 @@ export function activate(context: vscode.ExtensionContext): void {
 	// - Memories lazy-load: `onSidebarFirstVisible` triggers ensureFirstLoad()
 
 	// ── Initial data load ────────────────────────────────────────────────────
-	initialLoad(
+	// Resolve `initialStateReady` once initialLoad finishes (success OR error
+	// path) so the sidebar webview never gets stuck in its loading
+	// placeholder. initialLoad already swallows errors internally and
+	// returns void, so a single .finally is enough to release the barrier.
+	void initialLoad(
 		bridge,
 		excludeFilter,
 		statusStore,
@@ -1973,7 +2084,9 @@ export function activate(context: vscode.ExtensionContext): void {
 		commitsStore,
 		memoriesStore,
 		statusBar,
-	);
+	).finally(() => {
+		resolveInitialStateReady();
+	});
 
 	// ── Auto-refresh hook paths on version upgrade ────────────────────────────
 	// VSCode installs each extension version into a versioned directory
@@ -2028,6 +2141,37 @@ export function activate(context: vscode.ExtensionContext): void {
 					statusBar,
 				);
 			}
+
+			// Auto-enable on first run unless the user has explicitly opted out.
+			// The opt-out is a marker file at
+			// `<projectDir>/.jolli/jollimemory/disabled-by-user` (sibling of
+			// sessions.json / cursors.json), so a fresh project / fresh worktree
+			// has no marker → falsy → install.
+			const manuallyDisabled = await readManualDisableFlag(workspaceRoot);
+			if (!status.enabled && !manuallyDisabled) {
+				log.info(
+					"activate",
+					"Auto-enabling Jolli Memory (no opt-out recorded)",
+				);
+				const enableResult = await bridge.enable();
+				if (!enableResult.success) {
+					log.warn("activate", "Auto-enable failed", {
+						message: enableResult.message,
+					});
+				} else {
+					await statusStore.refresh();
+					const refreshed = await refreshStatusBar(
+						bridge,
+						memoriesStore,
+						plansStore,
+						filesStore,
+						commitsStore,
+						statusBar,
+					);
+					currentEnabled = refreshed.enabled;
+					sidebarProvider.notifyEnabledChanged(refreshed.enabled);
+				}
+			}
 		})
 		.catch((err: unknown) => {
 			log.error("activate", "Failed to refresh hook paths", err);
@@ -2057,12 +2201,12 @@ function initialLoad(
 	commitsStore: CommitsStore,
 	memoriesStore: MemoriesStore,
 	statusBar: StatusBarManager,
-): void {
+): Promise<void> {
 	log.info("initialLoad", "Loading all panels");
 	// Load the exclude filter FIRST so the initial file list is already filtered.
 	// If loaded in parallel with filesStore.refresh(), the tree briefly shows
 	// all files (including excluded ones) before the filter kicks in.
-	excludeFilter
+	return excludeFilter
 		.load()
 		.then(() =>
 			Promise.all([

@@ -117,15 +117,65 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("state.authenticated = !!msg.authenticated");
 	});
 
-	it("disabled mode forces Status panel visible and hides KB/Branch panels", () => {
+	it("hides the loading-panel as soon as init arrives so the placeholder doesn't outlive the host's first state push", () => {
 		const js = buildSidebarScript();
-		// Explicit visibility flips for the disabled branch of applyEnabled.
-		// We toggle the .hidden class (instead of the HTML hidden attribute)
-		// because UA-stylesheet display:none for [hidden] loses to author
-		// rules like display:flex on .tab-bar / .tab-toolbar.
+		// The loading-panel is unhidden in HTML (no .hidden) and must be
+		// hidden by the init handler before any apply* call decides which
+		// of the configured / disabled / tab-UI panels to surface. This
+		// avoids both panels being visible at once during the init frame.
+		expect(js).toContain("getElementById('loading-panel')");
+		const initStart = js.indexOf("'init'");
+		const initEnd = js.indexOf("case ", initStart + 1);
+		expect(initStart).toBeGreaterThan(-1);
+		expect(js.slice(initStart, initEnd)).toContain(
+			"loadingPanel.classList.add('hidden')",
+		);
+	});
+
+	it("disabled mode hides every tab-content and shows the disabled-panel only", () => {
+		const js = buildSidebarScript();
+		// applyEnabled(false) lets the new disabled-panel take the entire
+		// viewport: every tab-content is hidden, the tab bar is hidden, and
+		// only the disabled-panel sibling is visible. The legacy
+		// disabled-banner stays hidden — it's reserved for the degraded
+		// fallback (no-workspace / no-git) which applyDegraded sets up
+		// explicitly afterwards.
 		expect(js).toContain("tabContents.kb.classList.add('hidden')");
 		expect(js).toContain("tabContents.branch.classList.add('hidden')");
-		expect(js).toContain("tabContents.status.classList.remove('hidden')");
+		expect(js).toContain("tabContents.status.classList.add('hidden')");
+		// `.toggle('hidden', !!enabled)` covers both directions:
+		// hidden when enabled, visible when disabled.
+		expect(js).toMatch(
+			/disabledPanel\.classList\.toggle\(['"]hidden['"], !!enabled\)/,
+		);
+		expect(js).toMatch(/tabBar\.classList\.toggle\(['"]hidden['"], !enabled\)/);
+		expect(js).toContain("disabledBanner.classList.add('hidden')");
+	});
+
+	it("wires the disabled-panel Enable button to jollimemory.enableJolliMemory", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("getElementById('disabled-enable-btn')");
+		// The button is its own listener (separate from the legacy in-Status
+		// banner enable-btn) and dispatches the Enable command.
+		expect(js).toMatch(
+			/disabledEnableBtn\.addEventListener\(['"]click['"][\s\S]{0,200}jollimemory\.enableJolliMemory/,
+		);
+	});
+
+	it("applyDegraded keeps the legacy disabled-banner path (Status panel + banner re-shown after applyEnabled(false))", () => {
+		const js = buildSidebarScript();
+		// applyDegraded must explicitly un-hide the Status tab content and
+		// the disabled-banner because applyEnabled(false) hides both.
+		// Without these, the reason-specific CTA (Open Folder / Initialize
+		// Git) would be invisible and the user would be stuck on a blank
+		// disabled-panel with the wrong button.
+		const start = js.indexOf("function applyDegraded");
+		const end = js.indexOf("function ", start + 1);
+		expect(start).toBeGreaterThan(-1);
+		const body = js.slice(start, end);
+		expect(body).toContain("disabledPanel.classList.add('hidden')");
+		expect(body).toContain("tabContents.status.classList.remove('hidden')");
+		expect(body).toContain("disabledBanner.classList.remove('hidden')");
 	});
 
 	it("re-renders toolbar on enabled:changed (Disable button visibility depends on enabled)", () => {
@@ -146,7 +196,7 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("AI summary in progress…");
 	});
 
-	it("handles worker:busy by re-rendering toolbar only when on Branch tab", () => {
+	it("handles worker:busy by re-rendering toolbar AND branch on the Branch tab", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("'worker:busy'");
 		// Idempotent: skip re-render when the flag did not change.
@@ -157,9 +207,14 @@ describe("SidebarScriptBuilder", () => {
 		const handlerStart = js.indexOf("'worker:busy'");
 		const handlerEnd = js.indexOf("case ", handlerStart + 1);
 		expect(handlerStart).toBeGreaterThan(-1);
-		expect(js.slice(handlerStart, handlerEnd)).toContain(
-			"state.activeTab === 'branch'",
-		);
+		const body = js.slice(handlerStart, handlerEnd);
+		expect(body).toContain("state.activeTab === 'branch'");
+		// Toolbar repaint covers the "AI summary in progress…" indicator.
+		expect(body).toContain("renderToolbar()");
+		// Branch repaint covers the changes section's Commit-AI button —
+		// its disabled state depends on state.workerBusy, and renderToolbar
+		// alone wouldn't refresh it (section actions live in renderBranch).
+		expect(body).toContain("renderBranch()");
 	});
 
 	it("posts kb:expandFolder when an unexpanded folder is clicked", () => {
@@ -614,6 +669,22 @@ describe("SidebarScriptBuilder", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("'jollimemory.discardSelectedChanges'");
 		});
+
+		it("disables changes-commit-ai while a background AI summary is in progress", () => {
+			const js = buildSidebarScript();
+			// Even with selected changes, the Commit-AI button must stay
+			// disabled when state.workerBusy is true — kicking off another
+			// LLM call while the queue worker is mid-flight risks racing
+			// the same provider / hitting rate limits. Discard stays
+			// available because it's purely local (no LLM).
+			expect(js).toMatch(
+				/iconButton\('changes-commit-ai',[\s\S]*?disabled:\s*noneSelected\s*\|\|\s*state\.workerBusy/,
+			);
+			// Discard's disabled condition must NOT include workerBusy.
+			expect(js).toMatch(
+				/iconButton\('changes-discard',[\s\S]*?disabled:\s*noneSelected\s*\}/,
+			);
+		});
 	});
 
 	describe("section header click delegation", () => {
@@ -755,6 +826,55 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toMatch(
 				/ctxMenu\.addEventListener\('click',[\s\S]*?data-raw-msg[\s\S]*?data-cmd/,
 			);
+		});
+	});
+
+	describe("onboarding panel toggle", () => {
+		it("handles configured:changed messages", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("'configured:changed'");
+		});
+
+		it("references the onboarding panel id when toggling visibility", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("onboarding-panel");
+		});
+
+		it("wires onboarding signin button to dispatch jollimemory.signIn", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("onboarding-signin-btn");
+			expect(js).toContain("'jollimemory.signIn'");
+		});
+
+		it("wires onboarding apikey button to dispatch jollimemory.openSettings", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("onboarding-apikey-btn");
+			expect(js).toContain("'jollimemory.openSettings'");
+		});
+
+		it("reads configured from init state", () => {
+			const js = buildSidebarScript();
+			// The init handler must consult msg.state.configured to pick the
+			// onboarding-vs-main branch on first paint.
+			expect(js).toMatch(/msg\.state\.configured/);
+		});
+
+		it("applyConfigured(true) un-hides the tabBar via applyEnabled's toggle", () => {
+			const js = buildSidebarScript();
+			// applyConfigured(false) adds .hidden to #tab-bar to clear room
+			// for the onboarding panel. applyConfigured(true) delegates to
+			// applyEnabled(state.enabled), which now owns the tabBar
+			// .hidden flag (see "disabled mode hides every tab-content..."
+			// for the toggle assertion). The path back from onboarding is
+			// therefore covered by that single toggle in applyEnabled —
+			// when the host pushes enabled === true, tabBar reappears.
+			expect(js).toContain("function applyConfigured");
+			// The configured===true branch must end by delegating to applyEnabled
+			// so the tab bar / toolbar / contents resync against the host's
+			// enabled flag instead of being left stuck in onboarding-hidden state.
+			const start = js.indexOf("function applyConfigured");
+			const end = js.indexOf("function ", start + 1);
+			expect(js.slice(start, end)).toMatch(/applyEnabled\(state\.enabled\)/);
 		});
 	});
 });
