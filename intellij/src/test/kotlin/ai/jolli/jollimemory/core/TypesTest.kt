@@ -10,7 +10,7 @@ class TypesTest {
     inner class Enums {
         @Test
         fun `TranscriptSource has correct values`() {
-            TranscriptSource.entries.map { it.name } shouldBe listOf("claude", "codex", "gemini")
+            TranscriptSource.entries.map { it.name } shouldBe listOf("claude", "codex", "gemini", "opencode")
         }
 
         @Test
