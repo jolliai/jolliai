@@ -178,7 +178,7 @@ describe("DistPathResolver", () => {
 			expect(deriveSourceTag("/Users/x/.vscode-oss/extensions/jolli.foo/dist")).toBe("vscodium");
 		});
 
-		it("should auto-extract IDE name from non-whitelisted ~/.<name>/extensions/ paths", () => {
+		it("should auto-extract IDE name from non-allowlisted ~/.<name>/extensions/ paths", () => {
 			expect(deriveSourceTag("/Users/x/.newide/extensions/jolli.foo/dist")).toBe("newide");
 		});
 

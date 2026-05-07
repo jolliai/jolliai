@@ -1,5 +1,5 @@
 /**
- * Tests for the Atlas stylesheet builder. Sanity-checks the static
+ * Tests for the Atlas stylesheet builder. Confidence-checks the static
  * vendor + targeted assertions on the dynamic override generator.
  */
 

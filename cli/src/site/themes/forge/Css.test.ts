@@ -2,7 +2,7 @@
  * Tests for the Forge stylesheet builder.
  *
  * Forge CSS is mostly a vendored static block (~1300 lines) that we cover
- * with sanity checks rather than line-by-line — the value-add of these
+ * with confidence checks rather than line-by-line — the value-add of these
  * tests is the dynamic override generator: hue interpolation, optional
  * font-family declaration, and the cascade order (base + overrides).
  */

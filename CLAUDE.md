@@ -2,6 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Critical rules
+
+These rules affect whether a change can ship at all. They override any other guidance below.
+
+- **DCO sign-off on every commit** — `git commit -s`. CI rejects PRs without `Signed-off-by:`.
+- **No `Co-Authored-By: Claude …` trailer or `🤖 Generated with …` footer.** Commit messages and PR descriptions stay human-authored; only the DCO `Signed-off-by:` trailer belongs there.
+- **`npm run all` must pass before commit** (clean → build → lint → test). CI runs the same chain.
+- **Do not regress CLI test coverage.** New code under `cli/src/` is held to 97% statements / 96% branches / 97% functions / 97% lines (see [`cli/vite.config.ts`](cli/vite.config.ts)).
+- **Three implementations of the API key parser stay in lockstep.** `parseJolliApiKey` / `assertJolliOriginAllowed` live in [`cli/src/core/JolliApiUtils.ts`](cli/src/core/JolliApiUtils.ts), are bundled into the VS Code extension verbatim, and have a Kotlin port in `intellij/`. Updating one without the others is a known-bad pattern.
+- **Cross-package imports in `vscode/src/**` are intentional.** Paths like `../../../cli/src/core/JolliApiUtils.js` resolve at esbuild bundle time. Don't refactor them into a published-package import — VS Code currently bundles the CLI inline.
+- **Worktree-aware code only.** Hooks, summary storage, and lock files must work across `git worktree` checkouts. Don't assume a single working tree.
+- **Suspected vulnerabilities go through [`SECURITY.md`](SECURITY.md)**, not public issues or PRs.
+- **Workflow injection hygiene.** Inside `.github/workflows/*.yaml`, never interpolate `${{ github.event.* }}` directly into a `run:` block — pull through `env:` first. The publish workflows already follow this pattern.
+
 ## Repository layout
 
 Monorepo with three deliverables that share the same product model and storage (a git orphan branch `jollimemory/summaries/v3`):
