@@ -1,13 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommitCatalog, CommitSummary, SummaryIndex } from "../Types.js";
-import {
-	extractSnippet,
-	findFirstMatchOffset,
-	highlightTerms,
-	LocalSearchProvider,
-	parseSince,
-	tokenizeQuery,
-} from "./LocalSearchProvider.js";
+import { LocalSearchProvider, parseSince } from "./LocalSearchProvider.js";
 import { DEFAULT_CATALOG_LIMIT, DEFAULT_SEARCH_BUDGET } from "./Search.js";
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
@@ -121,159 +114,6 @@ describe("parseSince", () => {
 
 	it("returns null for invalid date strings", () => {
 		expect(parseSince("not-a-date")).toBeNull();
-	});
-});
-
-// ─── tokenizeQuery ───────────────────────────────────────────────────────────
-
-describe("tokenizeQuery", () => {
-	it("returns empty for empty / whitespace", () => {
-		expect(tokenizeQuery("")).toEqual([]);
-		expect(tokenizeQuery("   ")).toEqual([]);
-	});
-
-	it("splits on whitespace", () => {
-		expect(tokenizeQuery("foo bar baz")).toEqual(["foo", "bar", "baz"]);
-	});
-
-	it("normalizes to lowercase", () => {
-		expect(tokenizeQuery("FOO Bar")).toEqual(["foo", "bar"]);
-	});
-
-	it("preserves quoted phrases as a single token", () => {
-		expect(tokenizeQuery('"rate limiting" auth')).toEqual(["rate limiting", "auth"]);
-	});
-
-	it("strips stray quotes from unbalanced input (defensive)", () => {
-		// Unbalanced opening quote — the unquoted path captures `"foo`; we strip the quote.
-		expect(tokenizeQuery('"foo')).toEqual(["foo"]);
-		// Adjacent quotes around a single token.
-		expect(tokenizeQuery('foo"bar')).toEqual(["foobar"]);
-	});
-
-	it("drops empty captures (e.g. just whitespace inside quotes)", () => {
-		expect(tokenizeQuery('"   "')).toEqual([]);
-	});
-});
-
-// ─── findFirstMatchOffset ────────────────────────────────────────────────────
-
-describe("findFirstMatchOffset", () => {
-	it("returns -1 for empty tokens", () => {
-		expect(findFirstMatchOffset("hello world", [])).toBe(-1);
-	});
-
-	it("returns -1 for empty text", () => {
-		expect(findFirstMatchOffset("", ["foo"])).toBe(-1);
-	});
-
-	it("returns -1 when no token matches", () => {
-		expect(findFirstMatchOffset("hello world", ["xyz"])).toBe(-1);
-	});
-
-	it("returns the first match position", () => {
-		expect(findFirstMatchOffset("hello world", ["world"])).toBe(6);
-	});
-
-	it("returns the lowest offset across multiple tokens", () => {
-		expect(findFirstMatchOffset("hello world foo", ["foo", "world"])).toBe(6);
-	});
-
-	it("updates best when a later token finds an earlier match", () => {
-		// First token "world" matches at 6; second token "hello" matches at 0,
-		// so the loop must update best from 6 → 0.
-		expect(findFirstMatchOffset("hello world", ["world", "hello"])).toBe(0);
-	});
-
-	it("keeps best unchanged when a later token finds a later match", () => {
-		// "hello" matches at 0; "world" matches at 6 (not earlier), so the
-		// `idx < best` branch evaluates false and best stays 0.
-		expect(findFirstMatchOffset("hello world", ["hello", "world"])).toBe(0);
-	});
-
-	it("ignores empty tokens", () => {
-		expect(findFirstMatchOffset("hello world", ["", "world"])).toBe(6);
-	});
-
-	it("is case-insensitive", () => {
-		expect(findFirstMatchOffset("Hello World", ["world"])).toBe(6);
-	});
-});
-
-// ─── extractSnippet ──────────────────────────────────────────────────────────
-
-describe("extractSnippet", () => {
-	it("returns empty string for empty text", () => {
-		expect(extractSnippet("", ["foo"])).toBe("");
-	});
-
-	it("falls back to prefix when no match", () => {
-		const snippet = extractSnippet("a very long string with no matches".repeat(20), ["nope"]);
-		expect(snippet).toContain("a very long string");
-		expect(snippet.endsWith("...")).toBe(true);
-	});
-
-	it("returns full short text on no match without ellipsis", () => {
-		expect(extractSnippet("short", ["nope"])).toBe("short");
-	});
-
-	it("centers around match with ellipsis on both sides for long text", () => {
-		const long = `${"left ".repeat(40)}NEEDLE${" right".repeat(40)}`;
-		const snippet = extractSnippet(long, ["needle"]);
-		expect(snippet.startsWith("...")).toBe(true);
-		expect(snippet.endsWith("...")).toBe(true);
-		expect(snippet).toMatch(/\*\*NEEDLE\*\*/);
-	});
-
-	it("omits left ellipsis when match is at start", () => {
-		const text = "NEEDLE then plenty of trailing context to extend past the half-width threshold. ".repeat(3);
-		const snippet = extractSnippet(text, ["needle"]);
-		expect(snippet.startsWith("...")).toBe(false);
-		expect(snippet).toMatch(/^\*\*NEEDLE\*\*/);
-	});
-
-	it("omits right ellipsis when match is at end", () => {
-		const lots = "lorem ipsum dolor ".repeat(20);
-		const text = `${lots}NEEDLE`;
-		const snippet = extractSnippet(text, ["needle"]);
-		expect(snippet.endsWith("...")).toBe(false);
-		expect(snippet).toMatch(/\*\*NEEDLE\*\*$/);
-	});
-});
-
-// ─── highlightTerms ──────────────────────────────────────────────────────────
-
-describe("highlightTerms", () => {
-	it("returns text unchanged when tokens are empty", () => {
-		expect(highlightTerms("hello", [])).toBe("hello");
-	});
-
-	it("returns text unchanged when no token matches", () => {
-		expect(highlightTerms("hello", ["xyz"])).toBe("hello");
-	});
-
-	it("wraps single match in markdown bold", () => {
-		expect(highlightTerms("foo bar baz", ["bar"])).toBe("foo **bar** baz");
-	});
-
-	it("preserves original casing inside the bold wrapper", () => {
-		expect(highlightTerms("Foo BAR baz", ["bar"])).toBe("Foo **BAR** baz");
-	});
-
-	it("merges overlapping ranges so we never produce nested **", () => {
-		const out = highlightTerms("aaaa", ["aa"]);
-		// Overlapping matches (positions 0,1,2) merge into one.
-		expect(out).toBe("**aaaa**");
-	});
-
-	it("handles multiple tokens that share start position", () => {
-		const out = highlightTerms("authentication flow", ["auth", "authentication"]);
-		// Both tokens start at 0; ranges merge to length 14 ("authentication").
-		expect(out).toBe("**authentication** flow");
-	});
-
-	it("ignores empty tokens", () => {
-		expect(highlightTerms("foo", ["", "foo"])).toBe("**foo**");
 	});
 });
 
@@ -502,7 +342,7 @@ describe("LocalSearchProvider.loadHits", () => {
 		expect(result.failedHashes).toBeUndefined();
 	});
 
-	it("loads hits and includes failed hashes when summary is missing", async () => {
+	it("records hashes whose summary load failed in failedHashes", async () => {
 		mockGetSummary.mockImplementation(async (hash: string) => {
 			if (hash === "found") return makeSummary("found");
 			return null;
@@ -513,67 +353,128 @@ describe("LocalSearchProvider.loadHits", () => {
 		expect(result.failedHashes).toEqual(["missing"]);
 	});
 
-	it("includes filesAffected in matches when query touches a file path", async () => {
+	it("emits identity / provenance / narrative fields on each hit", async () => {
 		mockGetSummary.mockResolvedValueOnce(
-			makeSummary("zzz", {
-				ticketId: "TKT-1",
-				topics: [
-					{
-						title: "Auth",
-						trigger: "T",
-						response: "R",
-						decisions: "D",
-						filesAffected: ["src/middleware/auth.ts"],
-					},
-				],
+			makeSummary("abc1234", {
+				commitMessage: "feat: add OAuth flow",
+				commitAuthor: "alice",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/oauth",
+				commitType: "amend",
+				ticketId: "TKT-99",
+				recap: "Quick recap of the OAuth work",
 			}),
 		);
 		const provider = new LocalSearchProvider("/test");
-		const result = await provider.loadHits({ query: "middleware", hashes: ["zzz"] });
-		const fileMatch = result.results[0].matches.find((m) => m.field === "filesAffected");
-		expect(fileMatch).toBeDefined();
-		expect(fileMatch?.snippet).toMatch(/\*\*middleware\*\*/);
+		const result = await provider.loadHits({ query: "oauth", hashes: ["abc1234"] });
+		const hit = result.results[0];
+		expect(hit.hash).toBe("abc1234"); // 8-char short
+		expect(hit.fullHash).toBe("abc1234");
+		expect(hit.commitMessage).toBe("feat: add OAuth flow");
+		expect(hit.commitAuthor).toBe("alice");
+		expect(hit.commitDate).toBe("2026-04-01T10:00:00.000Z");
+		expect(hit.branch).toBe("feature/oauth");
+		expect(hit.commitType).toBe("amend");
+		expect(hit.ticketId).toBe("TKT-99");
+		expect(hit.recap).toBe("Quick recap of the OAuth work");
 	});
 
-	it("emits matches with bold highlighting", async () => {
-		mockGetSummary.mockResolvedValue(
-			makeSummary("xxx", {
+	it("emits diffStats when present on the source summary", async () => {
+		mockGetSummary.mockResolvedValueOnce(
+			makeSummary("withstats", {
+				diffStats: { files: 7, insertions: 123, deletions: 45 },
+			}),
+		);
+		const provider = new LocalSearchProvider("/test");
+		const result = await provider.loadHits({ query: "x", hashes: ["withstats"] });
+		expect(result.results[0].diffStats).toEqual({ files: 7, insertions: 123, deletions: 45 });
+	});
+
+	it("emits the full topics array — title / trigger / response / decisions / category / importance / filesAffected", async () => {
+		mockGetSummary.mockResolvedValueOnce(
+			makeSummary("topictest", {
 				topics: [
 					{
 						title: "Auth flow",
-						trigger: "user wanted auth",
-						response: "added auth middleware",
-						decisions: "JWT preferred over auth Session",
-						filesAffected: ["src/auth.ts"],
+						trigger: "Need login",
+						response: "Implemented OAuth via Authlib",
+						decisions:
+							"- **JWT over Session**: stateless, scales horizontally\n- **PKCE flow**: required for mobile",
+						category: "feature",
+						importance: "major",
+						filesAffected: ["src/auth.ts", "src/middleware.ts"],
 					},
 				],
-				recap: "Recap mentions auth",
 			}),
 		);
 		const provider = new LocalSearchProvider("/test");
-		const result = await provider.loadHits({ query: "auth", hashes: ["xxx"] });
-		expect(result.results[0].matches.length).toBeGreaterThan(0);
-		for (const m of result.results[0].matches) {
-			expect(m.snippet).toMatch(/\*\*auth\*\*/i);
-		}
+		const result = await provider.loadHits({ query: "anything", hashes: ["topictest"] });
+		const topic = result.results[0].topics[0];
+		expect(topic.title).toBe("Auth flow");
+		expect(topic.trigger).toBe("Need login");
+		expect(topic.response).toBe("Implemented OAuth via Authlib");
+		expect(topic.decisions).toContain("JWT over Session");
+		expect(topic.category).toBe("feature");
+		expect(topic.importance).toBe("major");
+		expect(topic.filesAffected).toEqual(["src/auth.ts", "src/middleware.ts"]);
 	});
 
-	it("dedups & does not throw when topic fields are absent", async () => {
-		mockGetSummary.mockResolvedValue(
-			makeSummary("yyy", {
+	it("propagates topic.todo when present", async () => {
+		mockGetSummary.mockResolvedValueOnce(
+			makeSummary("todotest", {
 				topics: [
 					{
-						title: "ttt",
-						trigger: "",
-						response: "",
-						decisions: "",
+						title: "T",
+						trigger: "T",
+						response: "R",
+						decisions: "D",
+						todo: "Add rate-limit middleware in a follow-up",
 					},
 				],
-				recap: undefined,
 			}),
 		);
 		const provider = new LocalSearchProvider("/test");
-		const result = await provider.loadHits({ query: "anything", hashes: ["yyy"] });
-		expect(result.results[0].matches.every((m) => typeof m.snippet === "string")).toBe(true);
+		const result = await provider.loadHits({ query: "x", hashes: ["todotest"] });
+		expect(result.results[0].topics[0].todo).toBe("Add rate-limit middleware in a follow-up");
+	});
+
+	it("omits optional topic fields when source data lacks them", async () => {
+		mockGetSummary.mockResolvedValueOnce(
+			makeSummary("minimal", {
+				topics: [
+					{
+						title: "Bare topic",
+						trigger: "T",
+						response: "R",
+						decisions: "D",
+						// no todo / filesAffected / category / importance
+					},
+				],
+			}),
+		);
+		const provider = new LocalSearchProvider("/test");
+		const result = await provider.loadHits({ query: "x", hashes: ["minimal"] });
+		const topic = result.results[0].topics[0];
+		// Optional fields should be absent from the JSON, not present as undefined
+		// (skill template's schema doc tells the LLM "optional" — rendering must
+		// not see literal `undefined`).
+		expect(Object.hasOwn(topic, "todo")).toBe(false);
+		expect(Object.hasOwn(topic, "filesAffected")).toBe(false);
+		expect(Object.hasOwn(topic, "category")).toBe(false);
+		expect(Object.hasOwn(topic, "importance")).toBe(false);
+	});
+
+	it("does NOT emit matches[] or commit-level filesAffected (removed in the rich-topics rewrite)", async () => {
+		// Earlier shape exposed pre-bolded `matches[]` snippets and an aggregated
+		// commit-level `filesAffected`. With full topics in the hit, both became
+		// redundant — `matches` because the LLM has full topic content, and
+		// commit-level `filesAffected` because per-topic `filesAffected` is
+		// strictly stronger (preserves the decision→file mapping).
+		mockGetSummary.mockResolvedValueOnce(makeSummary("noredundant"));
+		const provider = new LocalSearchProvider("/test");
+		const result = await provider.loadHits({ query: "anything", hashes: ["noredundant"] });
+		const hit = result.results[0] as Record<string, unknown>;
+		expect(hit.matches).toBeUndefined();
+		expect(hit.filesAffected).toBeUndefined();
 	});
 });

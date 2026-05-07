@@ -223,7 +223,7 @@ for the chat LLM that runs this skill.
 
 ## When to use
 
-- "Has anyone dealt with X before?" / "我们之前怎么处理 Y 的？"
+- "Has anyone dealt with X before?" / "How have we handled Y previously?"
 - Looking for a past decision: "why did we choose X over Y?"
 - Finding the commit related to a half-remembered ticket / file / topic.
 
@@ -234,11 +234,12 @@ for the chat LLM that runs this skill.
 
 ## Step 1: Parse \${ARGUMENTS} into query + flags
 
-The user can include flags inline, e.g. \`/jolli-search 认证 --since 2w\`. Before
+The user can include flags inline, e.g. \`/jolli-search auth --since 2w\`. Before
 invoking the CLI, split the argument string into two parts:
 
 1. **Query**: the user's keyword / sentence (everything that is NOT a CLI flag).
-   This may be Chinese, English, contain natural punctuation (\`?\`, \`#\`, \`(\`, etc.).
+   The query may be in any human language and contain natural punctuation
+   (\`?\`, \`#\`, \`(\`, etc.).
 2. **Flags**: any of \`--since <date>\`, \`--limit <n>\`, \`--budget <tokens>\`,
    \`--output <path>\`. Pass these through verbatim. Ignore any other token starting
    with \`--\`.
@@ -246,11 +247,11 @@ invoking the CLI, split the argument string into two parts:
 Quote ONLY the query when constructing bash; pass flags as separate unquoted
 tokens. Examples:
 
-| User input                              | Bash you should run                                                                       |
-|----------------------------------------|-------------------------------------------------------------------------------------------|
-| \`认证\`                                | \`"$HOME/.jolli/jollimemory/run-cli" search "认证" --format json\`                       |
-| \`认证 --since 2w\`                     | \`"$HOME/.jolli/jollimemory/run-cli" search "认证" --since 2w --format json\`           |
-| \`why did we choose X over Y? --since 1m\` | \`"$HOME/.jolli/jollimemory/run-cli" search "why did we choose X over Y?" --since 1m --format json\` |
+| User input                                  | Bash you should run                                                                                |
+|---------------------------------------------|----------------------------------------------------------------------------------------------------|
+| \`auth\`                                    | \`"$HOME/.jolli/jollimemory/run-cli" search "auth" --format json\`                                |
+| \`auth --since 2w\`                         | \`"$HOME/.jolli/jollimemory/run-cli" search "auth" --since 2w --format json\`                     |
+| \`why did we choose X over Y? --since 1m\`  | \`"$HOME/.jolli/jollimemory/run-cli" search "why did we choose X over Y?" --since 1m --format json\` |
 
 Always include \`--format json\`. Never put flags inside the query quotes.
 
@@ -287,30 +288,26 @@ if many entries look unrelated; that's expected.
 ## Step 3: Pick relevant commit hashes (semantic, not literal)
 
 **Read each entry's \`title\`, \`recap\`, \`decisions\`, and \`filesAffected\` and judge
-semantic relevance to the user's intent.** The query may be in CN or EN; entries
-may be in either or both. Cross-language and synonym matching is YOUR job here.
+semantic relevance to the user's intent.** The query and the entries may be in
+different human languages. Cross-language and synonym matching is YOUR job here.
 
-- Pick 5-15 commits whose meaning relates to the query.
+- Pick **5-10** commits whose meaning relates to the query. The Phase 2 payload
+  carries full topic content per hit (trigger / response / decisions / files);
+  picking more than 10 risks blowing the chat context budget for ambitious
+  queries.
 - Don't worry if no entry contains the literal query token — that's exactly what
-  semantic picking is for. (The plan calls these "semantic hits"; Step 5 has a
-  fallback for them.)
+  semantic picking is for.
 
 **If \`truncated\` is \`true\` and the entries you see don't include obvious matches**,
 silently retry Step 2 once with \`--budget 50000\` to see more of the corpus before
 asking the user to narrow \`--since\`. Only ask the user to narrow time if the
 larger budget still doesn't surface relevant commits.
 
-### Internal constraints (these matter)
+### Internal constraints
 
-- DO read the catalog JSON inline from the previous tool result. The JSON is
-  designed to fit your context window with the default budget.
-- DO NOT write the JSON to a temp file and re-read it. \`/tmp\` paths resolve
-  inconsistently across Windows / WSL / macOS shells, and there's no benefit.
-- DO NOT run shell scripts (Python, jq, awk, grep) to score entries by literal
-  keyword counts. That undoes Phase 1's whole reason for existing — semantic
-  picking is what makes this skill better than \`grep\` over a folder.
-- If you catch yourself thinking "let me save this and process it programmatically",
-  stop. Read the JSON entries with your eyes and pick by meaning.
+- **DO** read the JSON inline from the previous tool result.
+- **DO NOT** process programmatically — no temp files, no jq/python/grep
+  scoring scripts. Semantic picking by reading is the whole point.
 
 ## Step 4: Load full content for the picks
 
@@ -321,44 +318,81 @@ from Step 1, plus \`--hashes <h1,h2,h3>\`:
 "$HOME/.jolli/jollimemory/run-cli" search "<the query>" --hashes <h1,h2,h3> --format json
 \`\`\`
 
-The output is a JSON object with \`type: "search"\` and a \`results\` array. Each
-hit's \`matches\` array carries snippets with the user's query terms pre-bolded
-via markdown \`**...**\`.
+Output is a \`SearchResult\` with \`results: SearchHit[]\`. See Step 5 for the schema and how to render.
 
 ## Step 5: Render to the user
 
-Lead with one sentence stating coverage: "Found N relevant commits out of M in
-the catalog (other M-N were judged unrelated)." This sets expectations — the
-user otherwise wonders why the catalog had so many entries.
+The CLI gave you structured data — full distilled content per commit.
+**Output shape is entirely your call.** Pick whatever serves the user's
+query: prose, table, timeline, side-by-side, mixed. **The principles below
+are the only constraints.**
 
-Then show the 5-8 most relevant hits. For each hit:
+### A. The data you have (per hit)
 
-- Topic title (or commit message) — branch — date — ticket badge if present
-- **Body content**: the rendering depends on whether \`hit.matches\` is empty:
-  - **\`matches\` non-empty (literal hit)**: show the snippet from each match
-    (bolding via \`**...**\` is already applied — render it as markdown bold).
-  - **\`matches\` is empty (semantic hit)**: you picked this commit by meaning
-    in Step 3, not literal text — fall back to \`hit.recap\` (or the first topic
-    title if no recap). Annotate it as "(picked by relevance)" so the user knows
-    why there's no highlighted text.
-- \`git show <hash>\` for the full diff
-- \`/jolli-recall <branch>\` for the full branch context
+Each \`results[i]\` is a \`SearchHit\`:
 
-### Term translation for non-technical queries
+**Identity / provenance**:
+- \`hash\` — 8-char short SHA (plain text, no link)
+- \`fullHash\` — 40-char full SHA
+- \`commitMessage\` — raw subject (fallback for label; \`recap\` is usually better)
+- \`commitAuthor\` — for "who worked on X" queries
+- \`commitDate\` — ISO 8601
+- \`branch\`
+- \`commitType?\` — \`"commit"\` / \`"amend"\` / \`"squash"\` / \`"rebase-pick"\` / \`"cherry-pick"\` / \`"revert"\`; helps distinguish routine commits from consolidated ones
+- \`ticketId?\` — render as \`[TICKET-1234]\` badge
 
-If the user's query looks like a "what is" / "why" / "explain" question (e.g.
-"hoist 是什么", "explain how X works"), the snippet content will likely contain
-internal jargon (function names, schema versions, internal abbreviations). After
-showing the snippets, add a one-paragraph plain-language summary that translates
-the jargon into terms a product-aware non-engineer would understand. Skip this
-when the query is already a technical identifier (file path, ticket ID, function
-name) — there the user wants the raw content.
+**Change scale**:
+- \`diffStats?\` — \`{ files, insertions, deletions }\`
 
-### Empty / partial results
+**Narrative**:
+- \`recap?\` — 1-3 paragraphs of plain-English narrative. Highest-quality prose; primary source for "what is X" / "explain X".
 
-- If \`results\` is empty or all entries lack both matches and recap: tell the user
-  no usable content was found and suggest broader keywords or a wider \`--since\`.
-- If \`failedHashes\` is present and non-empty, mention which picks couldn't be
-  loaded so the user knows the search isn't complete.
+**Topics** — \`topics: SearchHitTopic[]\` (★ the meat):
+
+  - \`title\` — one-sentence label
+  - \`trigger\` — 1-2 sentences, what prompted the work
+  - \`response\` — implementation summary, may include code; longest field
+  - \`decisions\` ★ **THE STAR FIELD** — design choices + *why*, as markdown bullets. Primary source for "why did we choose X" / "what alternatives" / "rationale". Not in the diff; only here.
+  - \`todo?\` — residual work the LLM flagged (rare)
+  - \`filesAffected?\` — per-topic file list. Render as markdown links: \`[cli/src/Types.ts](cli/src/Types.ts)\`.
+  - \`category?\` — \`feature\` / \`bugfix\` / \`refactor\` / \`tech-debt\` / \`docs\` / \`test\` / \`devops\` / \`ux\`
+  - \`importance?\` — \`major\` / \`minor\`
+
+### B. Universal principles (apply regardless of shape)
+
+Non-negotiable. Encoded from past dogfood failures.
+
+1. **Lead with the answer**, not with search mechanics. Never open with "Found N relevant commits out of M". Coverage chatter belongs only in the empty/partial branches below.
+
+2. **Ground every concrete claim** to a hash and/or file. Use \`(abc1234)\` for hashes and \`[cli/src/Types.ts](cli/src/Types.ts)\` for files. Never wrap file paths in backticks alone — markdown-link form stays readable AND becomes clickable.
+
+3. **Synthesize, don't dump — but DO use short verbatim quotes.** Read everything; fold into coherent prose or bullets. **However**, when a single short sentence or phrase from \`recap\` or \`decisions\` captures the answer concisely, quote it verbatim in **bold** with attribution: e.g. *the design chose JWT because* **"stateless, scales horizontally"** *(decisions, abc1234)*. Bold in this skill means "verbatim from stored data" — it builds user confidence that answers come from real recorded decisions, not LLM paraphrase. Use sparingly (1-3 quotes per answer); never wall-of-fragments.
+
+4. **Skip near-duplicates** from amend / squash chains (same \`commitMessage\`, similar topics). One row per logical change.
+
+5. **Reply in the user's language.** Template is English; user-visible output matches the user.
+
+6. **Don't expose search machinery.** No "Phase 1" / "Phase 2" / "catalog" / "SearchHit JSON" mentions.
+
+7. **No \`[Open in IDE](vscode://...)\` links** — chat webview filters non-http(s) clicks (anthropics/claude-code#26952). Use \`jolli view --commit <hash>\` as the per-commit open action.
+
+### C. Output shape
+
+Your call. The only hard rule: every concrete claim must be groundable to a hash or file (principle 2). If the picks share an obvious unifying theme (same \`branch\` / \`ticketId\` / initiative), name it.
+
+### D. Empty / partial / failed-hash handling
+
+This is the **only** place where it is appropriate to mention search-machinery
+state (catalog size, truncation, hash load failures). Stay silent about it
+when results are healthy.
+
+- If \`results\` is empty: tell the user no usable content was found and suggest
+  broader keywords or a wider \`--since\`. Coverage chatter is appropriate here:
+  *"Scanned N candidates from the last <window>; none matched."*
+- If the catalog was truncated (\`truncated: true\` from Phase 1) **and** the
+  picks feel thin: *"Catalog hit the token budget; rerun with \`--budget 50000\`
+  to widen the search."*
+- If \`failedHashes\` is non-empty: mention which picks couldn't be loaded so the
+  user knows the search isn't complete.
 `;
 }

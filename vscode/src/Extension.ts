@@ -2024,17 +2024,26 @@ export function activate(context: vscode.ExtensionContext): void {
 	);
 
 	// ── URI handler ──────────────────────────────────────────────────────────
-	// Receives the OAuth callback after browser-based login/signup.
-	// URI format (JOLLI-1270 code-exchange flow):
-	//   <host-scheme>://jolli.jollimemory-vscode/auth-callback?code=<32-byte-hex>
-	//   <host-scheme>://jolli.jollimemory-vscode/auth-callback?error=user_denied
-	// AuthService redeems the code via POST /api/auth/cli-exchange — the token
-	// itself never appears in the callback URL.
+	// Two routes, dispatched on uri.path:
+	//
+	// 1. /auth-callback — OAuth code-exchange flow:
+	//      <host-scheme>://jolli.jollimemory-vscode/auth-callback?code=<32-byte-hex>
+	//      <host-scheme>://jolli.jollimemory-vscode/auth-callback?error=user_denied
+	//    AuthService redeems the code via POST /api/auth/cli-exchange — the
+	//    token itself never appears in the callback URL.
+	//
+	// 2. /summary/<fullHash> — open the SummaryWebviewPanel for a commit, fired
+	//    from clickable links emitted by the jolli-search skill template (the
+	//    chat renders them as `[Open in IDE](vscode://...)` style links). The
+	//    full 40-char SHA is required so the panel matches one specific
+	//    summary; we accept 7-40 hex chars to leave room for short-hash usage
+	//    but reject anything else as a defensive measure.
+	//
 	// <host-scheme> is derived from vscode.env.appName (NOT uriScheme — forks
 	// tend to leave that at the upstream "vscode" default even though they
 	// register their own scheme at the OS level). See resolveUriScheme() in
-	// AuthService.ts for the mapping. This handler runs regardless of which
-	// scheme the OS dispatched — registerUriHandler covers every scheme.
+	// AuthService.ts for the mapping. registerUriHandler runs regardless of
+	// which scheme the OS dispatched — it covers every scheme.
 	context.subscriptions.push(
 		vscode.window.registerUriHandler({
 			async handleUri(uri: vscode.Uri) {
@@ -2047,19 +2056,45 @@ export function activate(context: vscode.ExtensionContext): void {
 					"uriHandler",
 					`Received callback ${uri.scheme}://${uri.authority}${uri.path} (${paramCount} params)`,
 				);
-				const result = await authService.handleAuthCallback(uri);
-				if (result.success) {
-					currentAuthenticated = true;
-					sidebarProvider.notifyAuthChanged(true);
-					vscode.window.showInformationMessage(
-						"Signed in to Jolli successfully.",
-					);
-					statusStore.refresh().catch(handleError("uriHandler.refresh"));
-				} else {
-					vscode.window.showErrorMessage(
-						`Jolli sign-in failed: ${result.error}`,
-					);
+
+				if (uri.path === "/auth-callback") {
+					const result = await authService.handleAuthCallback(uri);
+					if (result.success) {
+						currentAuthenticated = true;
+						sidebarProvider.notifyAuthChanged(true);
+						vscode.window.showInformationMessage(
+							"Signed in to Jolli successfully.",
+						);
+						statusStore.refresh().catch(handleError("uriHandler.refresh"));
+					} else {
+						vscode.window.showErrorMessage(
+							`Jolli sign-in failed: ${result.error}`,
+						);
+					}
+					return;
 				}
+
+				const summaryMatch = uri.path.match(/^\/summary\/([0-9a-f]{7,40})$/);
+				if (summaryMatch) {
+					const hash = summaryMatch[1];
+					const shortHash = hash.substring(0, 7);
+					const summary = await bridge.getSummary(hash);
+					if (!summary) {
+						vscode.window.showInformationMessage(
+							`Jolli Memory: No summary found for commit ${shortHash}.`,
+						);
+						return;
+					}
+					await SummaryWebviewPanel.show(
+						summary,
+						context.extensionUri,
+						workspaceRoot,
+						"commit",
+					);
+					return;
+				}
+
+				log.info("uriHandler", `Ignoring unknown URI path: ${uri.path}`);
 			},
 		}),
 	);

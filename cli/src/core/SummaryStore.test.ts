@@ -129,9 +129,13 @@ describe("SummaryStore", () => {
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const callArgs = vi.mocked(writeMultipleFilesToBranch).mock.calls[0];
 			const files = callArgs[1] as ReadonlyArray<FileWrite>;
-			expect(files).toHaveLength(2);
+			// 3 base writes: summary + index + catalog. catalog.json is the warm
+			// path for jolli-search Phase 1; written on every storeSummary call
+			// alongside summary + index in the same atomic commit.
+			expect(files).toHaveLength(3);
 			expect(files[0].path).toBe("summaries/abc123def456.json");
 			expect(files[1].path).toBe("index.json");
+			expect(files[2].path).toBe("catalog.json");
 
 			const summaryContent = JSON.parse(files[0].content) as CommitSummary;
 			expect(summaryContent.commitHash).toBe("abc123def456");
@@ -165,8 +169,9 @@ describe("SummaryStore", () => {
 			});
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
-			expect(files).toHaveLength(3);
-			expect(files[2]).toMatchObject({ path: "transcripts/abc123def456.json" });
+			// 3 base (summary + index + catalog) + 1 transcript appended after.
+			expect(files).toHaveLength(4);
+			expect(files[3]).toMatchObject({ path: "transcripts/abc123def456.json" });
 		});
 
 		it("should append plan progress artifacts when provided", async () => {
@@ -199,11 +204,11 @@ describe("SummaryStore", () => {
 			await storeSummary(summary, undefined, false, { planProgress });
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
-			// 2 base files (summary + index) + 1 plan progress
-			expect(files).toHaveLength(3);
-			expect(files[2].path).toBe("plan-progress/my-plan-abc123de.json");
+			// 3 base files (summary + index + catalog) + 1 plan progress
+			expect(files).toHaveLength(4);
+			expect(files[3].path).toBe("plan-progress/my-plan-abc123de.json");
 
-			const content = JSON.parse(files[2].content) as PlanProgressArtifact;
+			const content = JSON.parse(files[3].content) as PlanProgressArtifact;
 			expect(content.planSlug).toBe("my-plan-abc123de");
 			expect(content.originalSlug).toBe("my-plan");
 			expect(content.summary).toBe("Implemented the feature.");
@@ -255,9 +260,10 @@ describe("SummaryStore", () => {
 			await storeSummary(summary, undefined, false, { planProgress });
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
-			expect(files).toHaveLength(4); // summary + index + 2 plan progress
-			expect(files[2].path).toBe("plan-progress/plan-a-abc123de.json");
-			expect(files[3].path).toBe("plan-progress/plan-b-abc123de.json");
+			// 3 base (summary + index + catalog) + 2 plan progress
+			expect(files).toHaveLength(5);
+			expect(files[3].path).toBe("plan-progress/plan-a-abc123de.json");
+			expect(files[4].path).toBe("plan-progress/plan-b-abc123de.json");
 		});
 
 		it("should flatten tree children into the index", async () => {
@@ -461,7 +467,8 @@ describe("SummaryStore", () => {
 			await storeSummary(createMockSummary());
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
-			expect(files).toHaveLength(2);
+			// summary + index + catalog (3 base writes per storeSummary call)
+			expect(files).toHaveLength(3);
 		});
 
 		it("should skip duplicate commit entirely", async () => {
@@ -515,7 +522,10 @@ describe("SummaryStore", () => {
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
-			expect(files).toHaveLength(2);
+			// migrateOneToOne writes summary + index + catalog (same 3-file shape as
+			// storeSummary).
+			expect(files).toHaveLength(3);
+			expect(files[2].path).toBe("catalog.json");
 
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
 			expect(newSummaryContent.commitHash).toBe(newHash);

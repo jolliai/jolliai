@@ -3,8 +3,8 @@
  *
  * Opens the user's browser to the Jolli login/signup page and starts a local
  * HTTP server to receive the OAuth callback. On success, redeems the
- * single-use exchange code (JOLLI-1270) and persists the auth token (and
- * optionally an API key) to the global config.
+ * single-use exchange code and persists the auth token (and optionally an API
+ * key) to the global config.
  */
 
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -77,7 +77,7 @@ interface LoginServerOptions {
 	/**
 	 * CSRF nonce (RFC 6749 §10.12) the server is expected to echo on the
 	 * `?code=` callback. Required on the production code-exchange path; the
-	 * legacy `?token=` fallback bypasses this check because pre-1270 servers
+	 * legacy `?token=` fallback bypasses this check because older servers
 	 * don't echo state and we'd otherwise lock those users out of sign-in.
 	 */
 	readonly expectedState: string;
@@ -91,13 +91,13 @@ interface LoginServerOptions {
  *
  * Accepts two callback shapes, in priority order:
  *
- *   1. JOLLI-1270 code-exchange (preferred — issued by upgraded servers):
+ *   1. Code-exchange (preferred — issued by upgraded servers):
  *        /callback?code=<32-byte-hex>
  *      Redeemed via {@link exchangeCliCode}; the token never appears in the
  *      browser address bar, history, or referer logs — it arrives only as the
  *      JSON response of the server-to-server exchange POST.
  *
- *   2. Legacy token-in-URL (fallback — issued by pre-1270 servers):
+ *   2. Legacy token-in-URL (fallback — issued by pre-code-exchange servers):
  *        /callback?token=<jwt>&jolli_api_key=<sk-jol-…>
  *      Server delivers credentials directly in query params. Less secure
  *      (token visible to browser history/referer), but required so users on
@@ -132,7 +132,7 @@ export function createLoginServer(options: LoginServerOptions): Server {
 		const legacyToken = url.searchParams.get("token");
 
 		// CSRF check (RFC 6749 §10.12): only enforced on the code-exchange
-		// path. The legacy token-in-URL branch predates state support; pre-1270
+		// path. The legacy token-in-URL branch predates state support; older
 		// servers don't echo state, and demanding it here would lock those
 		// users out of sign-in. The legacy gap closes when the fallback is
 		// removed.
@@ -159,7 +159,7 @@ export function createLoginServer(options: LoginServerOptions): Server {
 				// Legacy fallback. Logged at warn level so we can track residual
 				// usage and decide when it's safe to drop this branch.
 				console.warn(
-					"Using legacy token-in-URL callback — server has not been upgraded to JOLLI-1270 code-exchange",
+					"Using legacy token-in-URL callback — server has not been upgraded to the code-exchange flow",
 				);
 				const legacyApiKey = url.searchParams.get("jolli_api_key");
 				credentials = {

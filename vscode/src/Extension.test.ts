@@ -480,6 +480,7 @@ vi.mock("vscode", () => ({
 			writeText: vi.fn().mockResolvedValue(undefined),
 		},
 		openExternal,
+		appName: "Visual Studio Code",
 	},
 }));
 
@@ -834,7 +835,19 @@ function makeContext(): vscode.ExtensionContext {
 		storageUri: vscode.Uri.file("/mock/storage"),
 		globalStorageUri: vscode.Uri.file("/mock/global-storage"),
 		extensionMode: 1,
-		environmentVariableCollection: {} as never,
+		environmentVariableCollection: {
+			replace: vi.fn(),
+			append: vi.fn(),
+			prepend: vi.fn(),
+			get: vi.fn(),
+			forEach: vi.fn(),
+			delete: vi.fn(),
+			clear: vi.fn(),
+			[Symbol.iterator]: vi.fn(),
+			persistent: true,
+			description: "",
+			getScoped: vi.fn(),
+		} as unknown as vscode.GlobalEnvironmentVariableCollection,
 		storagePath: "/mock/storage",
 		globalStoragePath: "/mock/global-storage",
 		logUri: vscode.Uri.file("/mock/log"),
@@ -4114,6 +4127,106 @@ describe("Extension", () => {
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				"Jolli sign-in failed: No authorization code received",
 			);
+		});
+
+		describe("/summary/<hash> route", () => {
+			// Helper: install the handler and return it for a focused assertion.
+			function getHandler() {
+				const ctx = makeContext();
+				activate(ctx);
+				const registerUriHandler = (
+					vscode.window as unknown as {
+						registerUriHandler: ReturnType<typeof vi.fn>;
+					}
+				).registerUriHandler;
+				return registerUriHandler.mock.calls[0]?.[0] as {
+					handleUri: (uri: unknown) => Promise<void>;
+				};
+			}
+
+			it("opens SummaryWebviewPanel in commit slot when the summary exists", async () => {
+				const summary = { hash: "abc1234", content: "summary text" };
+				mockBridge.getSummary.mockResolvedValue(summary);
+
+				const handler = getHandler();
+				await handler.handleUri({
+					path: "/summary/0123456789abcdef0123456789abcdef01234567",
+					query: "",
+					toString: () =>
+						"vscode://jolli.jollimemory-vscode/summary/0123456789abcdef0123456789abcdef01234567",
+				});
+
+				expect(mockBridge.getSummary).toHaveBeenCalledWith(
+					"0123456789abcdef0123456789abcdef01234567",
+				);
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					summary,
+					expect.anything(),
+					"/test/workspace",
+					"commit",
+				);
+				// Summary route must NOT trigger the OAuth path.
+				expect(mockAuthService.handleAuthCallback).not.toHaveBeenCalled();
+			});
+
+			it("shows info message when no summary is found", async () => {
+				mockBridge.getSummary.mockResolvedValue(null);
+
+				const handler = getHandler();
+				await handler.handleUri({
+					path: "/summary/0123456789abcdef0123456789abcdef01234567",
+					query: "",
+					toString: () =>
+						"vscode://jolli.jollimemory-vscode/summary/0123456789abcdef0123456789abcdef01234567",
+				});
+
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					"Jolli Memory: No summary found for commit 0123456.",
+				);
+				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
+			});
+
+			it("accepts a 7-char short hash (defensive lower bound of the regex)", async () => {
+				const summary = { hash: "abc1234", content: "x" };
+				mockBridge.getSummary.mockResolvedValue(summary);
+
+				const handler = getHandler();
+				await handler.handleUri({
+					path: "/summary/abc1234",
+					query: "",
+					toString: () => "vscode://jolli.jollimemory-vscode/summary/abc1234",
+				});
+
+				expect(mockBridge.getSummary).toHaveBeenCalledWith("abc1234");
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalled();
+			});
+
+			it("ignores malformed hash (rejects non-hex / wrong length)", async () => {
+				const handler = getHandler();
+				await handler.handleUri({
+					path: "/summary/NOT-A-HASH",
+					query: "",
+					toString: () =>
+						"vscode://jolli.jollimemory-vscode/summary/NOT-A-HASH",
+				});
+
+				expect(mockBridge.getSummary).not.toHaveBeenCalled();
+				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
+				expect(mockAuthService.handleAuthCallback).not.toHaveBeenCalled();
+			});
+
+			it("ignores unknown URI paths", async () => {
+				const handler = getHandler();
+				await handler.handleUri({
+					path: "/something-else",
+					query: "",
+					toString: () => "vscode://jolli.jollimemory-vscode/something-else",
+				});
+
+				expect(mockBridge.getSummary).not.toHaveBeenCalled();
+				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
+				expect(mockAuthService.handleAuthCallback).not.toHaveBeenCalled();
+			});
 		});
 	});
 

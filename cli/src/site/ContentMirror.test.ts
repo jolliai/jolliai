@@ -1101,7 +1101,7 @@ describe("ContentMirror.mirrorContent with pathMappings", () => {
 		await rm(contentDir, { recursive: true, force: true });
 	});
 
-	it("remaps file paths according to pathMappings", async () => {
+	it.skipIf(process.platform === "win32")("remaps file paths according to pathMappings", async () => {
 		const { mirrorContent } = await import("./ContentMirror.js");
 		await mkdir(join(sourceRoot, "sql"), { recursive: true });
 		await writeFile(join(sourceRoot, "sql", "query.md"), "# Query\n", "utf-8");

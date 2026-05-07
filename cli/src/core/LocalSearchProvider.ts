@@ -2,20 +2,22 @@
  * LocalSearchProvider — Local (orphan-branch) implementation of the search
  * catalog/hit pipeline.
  *
- * Phase 1 (`buildCatalog`): joins index.json metadata with catalog.json content
- * and applies `--since` / `--limit` / `--budget` constraints to produce a
- * scannable list for the LLM in the skill template.
+ * Phase 1 (`buildCatalog`): joins `index.json` metadata with `catalog.json`
+ * content and applies `--since` / `--limit` / `--budget` constraints to
+ * produce a scannable list for the LLM in the skill template.
  *
- * Phase 2 (`loadHits`): for each hash the LLM picked, loads the full summary
- * via `getSummary` (which reads the per-hash file directly, bypassing index)
- * and extracts snippets around query terms with `**bold**` highlighting.
+ * Phase 2 (`loadHits`): for each hash the LLM picked, loads the full
+ * `summaries/<hash>.json` via `getSummary` and projects it down to a
+ * `SearchHit` — full distilled topics, recap, diff stats. The skill template
+ * Step 5 hands that JSON to the LLM with detailed schema documentation and
+ * lets it pick whatever output shape fits the user's query.
  *
  * No LLM calls happen in this module — the chat LLM that drives `/jolli-search`
- * does all semantic work. Everything here is pure string / index manipulation.
+ * does all semantic work. Everything here is pure data projection.
  */
 
 import { createLogger } from "../Logger.js";
-import type { CommitSummary, SummaryIndexEntry, TopicSummary } from "../Types.js";
+import type { CommitSummary, SummaryIndexEntry } from "../Types.js";
 import type {
 	BuildCatalogOptions,
 	LoadHitsOptions,
@@ -23,8 +25,7 @@ import type {
 	SearchCatalogEntry,
 	SearchCatalogTopic,
 	SearchHit,
-	SearchMatch,
-	SearchMatchField,
+	SearchHitTopic,
 	SearchResult,
 } from "./Search.js";
 import { DEFAULT_CATALOG_LIMIT, DEFAULT_SEARCH_BUDGET } from "./Search.js";
@@ -35,15 +36,6 @@ import { collectDisplayTopics } from "./SummaryTree.js";
 import { estimateTokens } from "./TokenEstimator.js";
 
 const log = createLogger("LocalSearchProvider");
-
-/** Number of characters of context on each side of a snippet's match position. */
-const SNIPPET_HALF_WIDTH = 100;
-
-/** Snippet falls back to this prefix length when no term hits. */
-const FALLBACK_SNIPPET_LENGTH = 200;
-
-/** Tokens-per-character estimate for incremental budget arithmetic. */
-const ASCII_TOKENS_PER_CHAR = 0.25;
 
 // ─── Public class ────────────────────────────────────────────────────────────
 
@@ -137,7 +129,6 @@ export class LocalSearchProvider implements SearchProvider {
 	}
 
 	async loadHits(options: LoadHitsOptions): Promise<SearchResult> {
-		const tokens = tokenizeQuery(options.query);
 		const hits: SearchHit[] = [];
 		const failed: string[] = [];
 		let totalTokens = 0;
@@ -149,7 +140,7 @@ export class LocalSearchProvider implements SearchProvider {
 				failed.push(hash);
 				continue;
 			}
-			const hit = buildHit(summary, tokens);
+			const hit = buildHit(summary);
 			hits.push(hit);
 			totalTokens += estimateTokens(JSON.stringify(hit));
 		}
@@ -245,180 +236,42 @@ function trimEntry(entry: SearchCatalogEntry): SearchCatalogEntry {
 	};
 }
 
-// ─── Snippet extraction ──────────────────────────────────────────────────────
-
 /**
- * Splits the query into normalized lowercase tokens; preserves quoted phrases
- * as single tokens (e.g. `"rate limiting"` → `rate limiting`).
+ * Projects a full `CommitSummary` down to a `SearchHit`. Walks the v3 tree via
+ * `collectDisplayTopics` so embedded children (legacy squash nests) are
+ * resolved before being copied into the hit's `topics[]`.
  *
- * Quoted phrases are trimmed and lower-cased; empty phrases are dropped. When
- * a token captured via the unquoted alternative still contains stray double
- * quotes (e.g. unbalanced quote in user input like `"foo`), they are stripped
- * so subsequent substring matching does not silently fail looking for a
- * literal `"`.
+ * Drops internal metadata (`generatedAt` / `commitSource` / `transcriptEntries`
+ * / `conversationTurns` / `llm` / `treeHash` / `jolliDocId/Url` /
+ * `orphanedDocIds`) and large payloads with no search value
+ * (`e2eTestGuide` / `plans` / `notes`). See SearchHit doc for the rationale.
  */
-export function tokenizeQuery(query: string): ReadonlyArray<string> {
-	const tokens: string[] = [];
-	const phrasePattern = /"([^"]+)"|(\S+)/g;
-	for (const m of query.matchAll(phrasePattern)) {
-		const raw = m[1] ?? m[2] ?? "";
-		const stripped = raw.replace(/"/g, "");
-		const norm = stripped.trim().toLowerCase();
-		if (norm.length > 0) tokens.push(norm);
-	}
-	return tokens;
-}
-
-/**
- * Returns the lowest 0-based offset where any token appears in `text`, or -1
- * when no token matches. Comparison is case-insensitive.
- */
-export function findFirstMatchOffset(text: string, tokens: ReadonlyArray<string>): number {
-	if (tokens.length === 0) return -1;
-	const lower = text.toLowerCase();
-	let best = -1;
-	for (const t of tokens) {
-		if (t.length === 0) continue;
-		const idx = lower.indexOf(t);
-		if (idx === -1) continue;
-		if (best === -1 || idx < best) best = idx;
-	}
-	return best;
-}
-
-/**
- * Extracts a ~200-character snippet around the first matched token. Bolds all
- * matches inside the window with markdown `**...**`. When no token matches,
- * returns a short prefix as a fallback (callers may use this to show "no
- * direct hit, here's how this field starts").
- */
-export function extractSnippet(text: string, tokens: ReadonlyArray<string>): string {
-	if (text.length === 0) return "";
-	const matchOffset = findFirstMatchOffset(text, tokens);
-	if (matchOffset === -1) {
-		const prefix = text.slice(0, FALLBACK_SNIPPET_LENGTH);
-		// ASCII "..." rather than Unicode "…" (U+2026) — the latter renders as
-		// `??` / mojibake on Windows terminals running non-UTF-8 codepages
-		// (CP936/GBK in CN locale), which is exactly where many users live.
-		return text.length > FALLBACK_SNIPPET_LENGTH ? `${prefix}...` : prefix;
-	}
-
-	const start = Math.max(0, matchOffset - SNIPPET_HALF_WIDTH);
-	const end = Math.min(text.length, matchOffset + SNIPPET_HALF_WIDTH);
-	const slice = text.slice(start, end);
-	const prefixEllipsis = start > 0 ? "..." : "";
-	const suffixEllipsis = end < text.length ? "..." : "";
-	const highlighted = highlightTerms(slice, tokens);
-	return `${prefixEllipsis}${highlighted}${suffixEllipsis}`;
-}
-
-/**
- * Surrounds each token occurrence in `text` with `**...**`. Case-insensitive
- * but preserves the original casing of the matched substring.
- */
-export function highlightTerms(text: string, tokens: ReadonlyArray<string>): string {
-	if (tokens.length === 0) return text;
-	// Collect all match ranges, sorted by start so we can splice in order.
-	type Range = { start: number; end: number };
-	const ranges: Range[] = [];
-	const lower = text.toLowerCase();
-	for (const token of tokens) {
-		if (token.length === 0) continue;
-		let from = 0;
-		while (from <= lower.length) {
-			const idx = lower.indexOf(token, from);
-			if (idx === -1) break;
-			ranges.push({ start: idx, end: idx + token.length });
-			from = idx + token.length;
-		}
-	}
-	if (ranges.length === 0) return text;
-
-	// Merge overlapping ranges so we never produce nested `**...**`.
-	ranges.sort((a, b) => a.start - b.start);
-	const merged: Range[] = [];
-	for (const r of ranges) {
-		const last = merged[merged.length - 1];
-		if (last && r.start <= last.end) {
-			last.end = Math.max(last.end, r.end);
-		} else {
-			merged.push({ ...r });
-		}
-	}
-
-	let out = "";
-	let cursor = 0;
-	for (const r of merged) {
-		out += text.slice(cursor, r.start);
-		out += `**${text.slice(r.start, r.end)}**`;
-		cursor = r.end;
-	}
-	out += text.slice(cursor);
-	return out;
-}
-
-function buildHit(summary: CommitSummary, tokens: ReadonlyArray<string>): SearchHit {
-	const matches: SearchMatch[] = [];
-
-	if (summary.recap) {
-		const offset = findFirstMatchOffset(summary.recap, tokens);
-		if (offset !== -1) {
-			matches.push({
-				field: "recap",
-				snippet: extractSnippet(summary.recap, tokens),
-			});
-		}
-	}
-
-	for (const topic of collectDisplayTopics(summary)) {
-		matches.push(...topicMatches(topic, tokens));
-	}
+function buildHit(summary: CommitSummary): SearchHit {
+	const topics = collectDisplayTopics(summary).map(
+		(t) =>
+			({
+				title: t.title,
+				trigger: t.trigger,
+				response: t.response,
+				decisions: t.decisions,
+				...(t.todo !== undefined && { todo: t.todo }),
+				...(t.filesAffected && t.filesAffected.length > 0 && { filesAffected: t.filesAffected }),
+				...(t.category !== undefined && { category: t.category }),
+				...(t.importance !== undefined && { importance: t.importance }),
+			}) satisfies SearchHitTopic,
+	);
 
 	return {
 		hash: summary.commitHash.substring(0, 8),
 		fullHash: summary.commitHash,
-		branch: summary.branch,
-		date: summary.commitDate,
 		commitMessage: summary.commitMessage,
+		commitAuthor: summary.commitAuthor,
+		commitDate: summary.commitDate,
+		branch: summary.branch,
+		...(summary.commitType !== undefined && { commitType: summary.commitType }),
 		...(summary.ticketId && { ticketId: summary.ticketId }),
+		...(summary.diffStats !== undefined && { diffStats: summary.diffStats }),
 		...(summary.recap && { recap: summary.recap }),
-		matches,
+		topics,
 	};
 }
-
-function topicMatches(topic: TopicSummary, tokens: ReadonlyArray<string>): SearchMatch[] {
-	const out: SearchMatch[] = [];
-
-	const fieldChecks: Array<{ field: SearchMatchField; value: string | undefined }> = [
-		{ field: "title", value: topic.title },
-		{ field: "decisions", value: topic.decisions },
-		{ field: "trigger", value: topic.trigger },
-		{ field: "response", value: topic.response },
-	];
-	for (const { field, value } of fieldChecks) {
-		if (!value) continue;
-		if (findFirstMatchOffset(value, tokens) === -1) continue;
-		out.push({
-			field,
-			topicTitle: topic.title,
-			snippet: extractSnippet(value, tokens),
-		});
-	}
-
-	if (topic.filesAffected && topic.filesAffected.length > 0) {
-		const joined = topic.filesAffected.join(" ");
-		if (findFirstMatchOffset(joined, tokens) !== -1) {
-			out.push({
-				field: "filesAffected",
-				topicTitle: topic.title,
-				snippet: highlightTerms(joined, tokens),
-			});
-		}
-	}
-
-	return out;
-}
-
-// Re-export estimateTokens-related constant for tests that need to compute
-// expected budgets without re-deriving the constant.
-export const _BUDGET_TOKENS_PER_CHAR = ASCII_TOKENS_PER_CHAR;

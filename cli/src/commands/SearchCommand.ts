@@ -8,7 +8,10 @@
  *            → outputs SearchCatalog (root-commit catalog for LLM scanning).
  *
  *   Phase 2: `jolli search <query> --hashes h1,h2,h3`
- *            → outputs SearchResult (full content + snippets for picked hashes).
+ *            → outputs SearchResult (full distilled content for picked hashes:
+ *              recap + topics with trigger/response/decisions/files/category/
+ *              importance + diffStats). Skill template Step 5 documents the
+ *              schema and lets the LLM pick the render shape.
  *
  * The CLI is a pure function: no LLM calls, deterministic JSON output for the
  * skill template to parse.
@@ -84,11 +87,14 @@ function renderResultText(result: SearchResult): string {
 	lines.push(`Search hits for "${result.query}" (${result.results.length} of ${result.hashes.length})`);
 	lines.push("");
 	for (const hit of result.results) {
-		lines.push(`  ${hit.hash}  ${hit.branch}  ${hit.date}`);
+		lines.push(`  ${hit.hash}  ${hit.branch}  ${hit.commitDate}`);
 		lines.push(`    ${hit.commitMessage.split("\n")[0]}`);
-		for (const m of hit.matches) {
-			const where = m.topicTitle ? `${m.topicTitle} / ${m.field}` : m.field;
-			lines.push(`    [${where}] ${m.snippet}`);
+		// Compact topic-title preview — one line per topic, no decisions/response
+		// dump (text format is for quick inspection, not deep reading; users who
+		// want full content go through `--format json` to a chat or `jolli view
+		// --commit <hash>`).
+		for (const t of hit.topics) {
+			lines.push(`    • ${t.title}`);
 		}
 	}
 	if (result.results.length === 0) {
