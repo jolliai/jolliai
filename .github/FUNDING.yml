@@ -1,0 +1,11 @@
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-configuration/displaying-a-sponsor-button-in-your-repository
+#
+# This file controls the "Sponsor" button shown on the GitHub repo page.
+# The `custom:` entry points adopters at the project's website, where the
+# current sponsorship and commercial-support options are documented.
+# When dedicated platform handles are set up (GitHub Sponsors, Open Collective,
+# etc.) add them above the `custom:` line and they will appear in the
+# sponsor menu in the order listed below.
+
+custom:
+  - https://jolli.ai

@@ -284,7 +284,7 @@ export function parseSummaryResponse(responseText: string): {
  */
 const TOPIC_DELIMITER_RE = /^\s*===TOPIC===\s*$/m;
 
-/** Recognised field names in the delimited format (whitelist for safe splitting, UPPERCASE) */
+/** Recognised field names in the delimited format (allowlist for safe splitting, UPPERCASE) */
 const KNOWN_FIELDS = new Set([
 	"TITLE",
 	"TRIGGER",
