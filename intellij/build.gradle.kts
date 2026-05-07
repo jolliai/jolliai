@@ -33,8 +33,10 @@ dependencies {
     // The standalone hooks JAR bundles its own copies via the hooksRuntime configuration.
     compileOnly("com.google.code.gson:gson:2.12.1")
     compileOnly("org.jetbrains.kotlin:kotlin-stdlib")
+    compileOnly("org.xerial:sqlite-jdbc:3.49.1.0")
     hooksRuntime("com.google.code.gson:gson:2.12.1")
     hooksRuntime("org.jetbrains.kotlin:kotlin-stdlib:2.1.20")
+    hooksRuntime("org.xerial:sqlite-jdbc:3.49.1.0")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("io.mockk:mockk:1.13.16")

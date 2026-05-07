@@ -93,6 +93,7 @@ class SettingsDialog(
     private val claudeEnabledCheckbox = JBCheckBox("Claude Code — Session tracking via Stop hook", true)
     private val codexEnabledCheckbox = JBCheckBox("Codex CLI — Session discovery via filesystem scan", true)
     private val geminiEnabledCheckbox = JBCheckBox("Gemini CLI — Session tracking via AfterAgent hook", true)
+    private val openCodeEnabledCheckbox = JBCheckBox("OpenCode — Session discovery via SQLite database scan", true)
     private val excludePatternsField = JBTextField()
     private val pauseCheckbox = JBCheckBox("Pause Jolli Memory (temporarily disable hooks without losing configuration)")
 
@@ -163,6 +164,7 @@ class SettingsDialog(
             .addComponent(claudeEnabledCheckbox, 4)
             .addComponent(codexEnabledCheckbox, 4)
             .addComponent(geminiEnabledCheckbox, 4)
+            .addComponent(openCodeEnabledCheckbox, 4)
             .panel))
 
         return wrapTabContent(panel)
@@ -572,7 +574,7 @@ class SettingsDialog(
         }
 
         if (!claudeEnabledCheckbox.isSelected && !codexEnabledCheckbox.isSelected &&
-            !geminiEnabledCheckbox.isSelected
+            !geminiEnabledCheckbox.isSelected && !openCodeEnabledCheckbox.isSelected
         ) {
             return ValidationInfo("At least one platform must be enabled", claudeEnabledCheckbox)
         }
@@ -632,6 +634,7 @@ class SettingsDialog(
             claudeEnabled = claudeEnabledCheckbox.isSelected,
             codexEnabled = codexEnabledCheckbox.isSelected,
             geminiEnabled = geminiEnabledCheckbox.isSelected,
+            openCodeEnabled = openCodeEnabledCheckbox.isSelected,
             excludePatterns = if (excludePatterns.isNotEmpty()) excludePatterns else null,
             aiProvider = provider,
             knowledgeBasePath = kbPath,
@@ -730,6 +733,7 @@ class SettingsDialog(
         claudeEnabledCheckbox.isSelected = config.claudeEnabled != false
         codexEnabledCheckbox.isSelected = config.codexEnabled != false
         geminiEnabledCheckbox.isSelected = config.geminiEnabled != false
+        openCodeEnabledCheckbox.isSelected = config.openCodeEnabled != false
         pauseCheckbox.isSelected = config.paused == true
 
         // Memory Bank
