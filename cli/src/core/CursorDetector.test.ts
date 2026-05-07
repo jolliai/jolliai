@@ -21,7 +21,7 @@ vi.mock("./SqliteHelpers.js", async () => ({
 	hasNodeSqliteSupport: mockSqliteSupport,
 }));
 
-import { getCursorGlobalDbPath, isCursorInstalled } from "./CursorDetector.js";
+import { getCursorGlobalDbPath, getCursorWorkspaceStorageDir, isCursorInstalled } from "./CursorDetector.js";
 
 describe("isCursorInstalled (darwin)", () => {
 	let tmpHome: string;
@@ -108,5 +108,30 @@ describe("getCursorGlobalDbPath", () => {
 		const result = getCursorGlobalDbPath();
 		const suffix = join("Cursor", "User", "globalStorage", "state.vscdb");
 		expect(result.endsWith(suffix)).toBe(true);
+	});
+});
+
+describe("getCursorWorkspaceStorageDir", () => {
+	beforeEach(() => {
+		mockHomedir.mockReturnValue("/home/user");
+	});
+
+	it("returns the darwin workspaceStorage path", () => {
+		mockPlatform.mockReturnValue("darwin");
+		expect(getCursorWorkspaceStorageDir()).toBe(
+			"/home/user/Library/Application Support/Cursor/User/workspaceStorage",
+		);
+	});
+
+	it("returns the linux workspaceStorage path", () => {
+		mockPlatform.mockReturnValue("linux");
+		expect(getCursorWorkspaceStorageDir()).toBe("/home/user/.config/Cursor/User/workspaceStorage");
+	});
+
+	it("honors an explicit home override (used by tests/installs not running as the real user)", () => {
+		mockPlatform.mockReturnValue("darwin");
+		expect(getCursorWorkspaceStorageDir("/tmp/sandbox")).toBe(
+			"/tmp/sandbox/Library/Application Support/Cursor/User/workspaceStorage",
+		);
 	});
 });

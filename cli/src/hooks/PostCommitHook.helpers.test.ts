@@ -202,6 +202,26 @@ vi.mock("../core/CursorSessionDiscoverer.js", () => ({
 	discoverCursorSessions: vi.fn().mockResolvedValue([]),
 }));
 
+vi.mock("../core/CopilotDetector.js", () => ({
+	isCopilotInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/CopilotSessionDiscoverer.js", () => ({
+	discoverCopilotSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/CopilotChatDetector.js", () => ({
+	isCopilotChatInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/CopilotChatSessionDiscoverer.js", () => ({
+	discoverCopilotChatSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/CopilotChatTranscriptReader.js", () => ({
+	readCopilotChatTranscript: vi.fn(),
+}));
+
 vi.mock("../core/CursorTranscriptReader.js", () => ({
 	readCursorTranscript: vi.fn(),
 }));

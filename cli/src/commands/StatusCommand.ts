@@ -160,11 +160,12 @@ export function registerStatusCommand(program: Command): void {
 				],
 				[
 					"Copilot:",
-					status.copilotDetected,
+					(status.copilotDetected ?? false) || (status.copilotChatDetected ?? false),
 					{
 						enabled: status.copilotEnabled !== false,
 						hookInstalled: undefined,
-						sessionCount: counts.copilot,
+						sessionCount: (counts.copilot ?? 0) + (counts["copilot-chat"] ?? 0),
+						// CLI scan error renders on the main row; Chat scan error renders as a sub-line below.
 						scanError: status.copilotScanError,
 					},
 				],
@@ -172,6 +173,17 @@ export function registerStatusCommand(program: Command): void {
 			for (const [label, detected, inputs] of integrationRows) {
 				if (!detected) continue;
 				console.log(`  ${label.padEnd(18)}${describeIntegrationStatus(inputs)}`);
+			}
+			const anyCopilotDetected = (status.copilotDetected ?? false) || (status.copilotChatDetected ?? false);
+			if (anyCopilotDetected) {
+				const cliMark = status.copilotDetected ? "✓" : "✗";
+				const chatMark = status.copilotChatDetected ? "✓" : "✗";
+				console.log(`  ${"".padEnd(18)}↳ CLI: ${cliMark}, Chat: ${chatMark}`);
+				if (status.copilotChatScanError) {
+					console.log(
+						`  ${"".padEnd(18)}↳ Chat scan failed (${status.copilotChatScanError.kind}): ${status.copilotChatScanError.message}`,
+					);
+				}
 			}
 
 			console.log(`  Stored memories:  ${status.summaryCount}`);

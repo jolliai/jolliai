@@ -2100,6 +2100,7 @@ export class SummaryWebviewPanel {
 		}
 		if (config.copilotEnabled !== false) {
 			sources.add("copilot");
+			sources.add("copilot-chat");
 		}
 		return sources;
 	}

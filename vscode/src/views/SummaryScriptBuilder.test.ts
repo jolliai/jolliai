@@ -152,4 +152,13 @@ describe("SummaryScriptBuilder", () => {
 			"'claude', 'codex', 'gemini', 'opencode', 'cursor', 'copilot'",
 		);
 	});
+
+	it("renders 'Copilot Chat' label for copilot-chat source", () => {
+		expect(script).toContain("source === 'copilot-chat'");
+		expect(script).toContain("return 'Copilot Chat'");
+	});
+
+	it("places copilot-chat after copilot in source ordering", () => {
+		expect(script).toMatch(/'copilot',\s*'copilot-chat'/);
+	});
 });

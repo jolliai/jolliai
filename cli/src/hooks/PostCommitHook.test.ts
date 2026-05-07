@@ -152,6 +152,24 @@ vi.mock("../core/CopilotSessionDiscoverer.js", () => ({
 	discoverCopilotSessions: vi.fn().mockResolvedValue([]),
 }));
 
+vi.mock("../core/CopilotChatDetector.js", () => ({
+	isCopilotChatInstalled: vi.fn().mockResolvedValue(false),
+	getCopilotChatStorageDir: vi.fn().mockReturnValue("/mock/Code/User/globalStorage/github.copilot-chat"),
+}));
+
+vi.mock("../core/CopilotChatSessionDiscoverer.js", () => ({
+	discoverCopilotChatSessions: vi.fn().mockResolvedValue([]),
+	scanCopilotChatSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+}));
+
+vi.mock("../core/CopilotChatTranscriptReader.js", () => ({
+	readCopilotChatTranscript: vi.fn().mockResolvedValue({
+		entries: [],
+		newCursor: { transcriptPath: "", lineNumber: 0, updatedAt: "" },
+		totalLinesRead: 0,
+	}),
+}));
+
 vi.mock("../core/CopilotTranscriptReader.js", () => ({
 	readCopilotTranscript: vi.fn().mockResolvedValue({
 		entries: [],
