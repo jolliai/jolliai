@@ -32,6 +32,21 @@ describe("SettingsCssBuilder", () => {
 		expect(css).toContain(".toggle-switch");
 	});
 
+	// Regression: long hints (e.g. Copilot's) used to push the toggle out
+	// of the right edge because `.settings-label` is `flex-shrink: 0` and
+	// nothing else in `.toggle-row` flex-grew, so the label was sized to
+	// max-content (the hint on one line). The fix lets the label flex into
+	// available space inside toggle rows so the hint wraps.
+	it("lets toggle-row labels flex so long hints wrap instead of pushing the toggle out", () => {
+		// `.toggle-row .settings-label { flex: 1; min-width: 0; ... }`
+		expect(css).toMatch(
+			/\.toggle-row\s+\.settings-label\s*\{[^}]*\bflex\s*:\s*1\b[^}]*\bmin-width\s*:\s*0\b/s,
+		);
+		// `.toggle-row` declares a gap so the now-flex-grown label keeps
+		// breathing room between itself and the toggle.
+		expect(css).toMatch(/\.toggle-row\s*\{[^}]*\bgap\s*:\s*\d/s);
+	});
+
 	it("contains validation error styles", () => {
 		expect(css).toContain(".error");
 		expect(css).toContain(".error-message");

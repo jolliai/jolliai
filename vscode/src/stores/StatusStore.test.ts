@@ -48,14 +48,22 @@ describe("StatusStore", () => {
 		expect(authService.refreshContextKey).toHaveBeenCalled();
 	});
 
-	it("refresh clears config when status.enabled is false", async () => {
+	it("refresh keeps config (and derived signedIn / hasApiKey) when status.enabled is false", async () => {
+		// Disabling Jolli Memory only uninstalls hooks — it does not sign the
+		// user out or wipe their Anthropic API key. The Sidebar's onboarding-
+		// vs-main-UI gate is `signedIn || hasApiKey` and must continue to
+		// reflect on-disk credentials, otherwise the disabled state replaces
+		// the toolbar's "Enable" affordance with the onboarding panel and the
+		// user can never re-enable from the sidebar.
 		const bridge = {
 			getStatus: vi.fn(async () => makeStatus({ enabled: false })),
 		};
-		loadConfigFromDir.mockResolvedValue({ apiKey: "k" });
+		loadConfigFromDir.mockResolvedValue({ apiKey: "k", authToken: "t" });
 		const store = new StatusStore(bridge as never);
 		await store.refresh();
-		expect(store.getSnapshot().config).toBeNull();
+		expect(store.getSnapshot().config).toEqual({ apiKey: "k", authToken: "t" });
+		expect(store.getSnapshot().derived.hasApiKey).toBe(true);
+		expect(store.getSnapshot().derived.signedIn).toBe(true);
 	});
 
 	it("setStatus updates status snapshot with setStatus reason", () => {

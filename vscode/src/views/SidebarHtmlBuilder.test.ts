@@ -113,4 +113,143 @@ describe("SidebarHtmlBuilder", () => {
 		expect(html).toContain('"kbMemoriesEmpty":"No memories yet."');
 		expect(html).toContain('type="application/json"');
 	});
+
+	describe("onboarding panel skeleton", () => {
+		it("includes the onboarding panel, hidden by default", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			expect(html).toContain('id="onboarding-panel"');
+			expect(html).toMatch(/<div class="onboarding-panel hidden"/);
+			expect(html).toContain("Get started with Jolli Memory");
+			expect(html).toContain("Sign in to Jolli");
+			expect(html).toContain("Use your Anthropic API key");
+			expect(html).toContain("RECOMMENDED");
+			expect(html).toContain('id="onboarding-signin-btn"');
+			expect(html).toContain('id="onboarding-apikey-btn"');
+		});
+
+		it("renders Anthropic API key as the recommended option above Sign in to Jolli", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			const apikeyIdx = html.indexOf("Use your Anthropic API key");
+			const signinIdx = html.indexOf("Sign in to Jolli");
+			expect(apikeyIdx).toBeGreaterThan(-1);
+			expect(signinIdx).toBeGreaterThan(-1);
+			expect(apikeyIdx).toBeLessThan(signinIdx);
+			// The RECOMMENDED badge must live in the same DOM region as the
+			// Anthropic card — i.e. between the panel header and the Sign in card.
+			const badgeIdx = html.indexOf("RECOMMENDED");
+			expect(badgeIdx).toBeGreaterThan(-1);
+			expect(badgeIdx).toBeLessThan(signinIdx);
+		});
+
+		it("uses primary button class on Configure API Key and secondary on Sign In", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			expect(html).toMatch(
+				/id="onboarding-apikey-btn"[^>]*class="ob-btn ob-btn--primary"/,
+			);
+			expect(html).toMatch(
+				/id="onboarding-signin-btn"[^>]*class="ob-btn ob-btn--secondary"/,
+			);
+		});
+	});
+
+	describe("loading panel skeleton", () => {
+		it("includes the loading panel visible by default with spinner + label", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			// Loading panel is the first-paint placeholder. It must NOT be
+			// hidden by default — the script tears it down once init lands.
+			expect(html).toContain('id="loading-panel"');
+			expect(html).toMatch(/<div class="loading-panel"/);
+			expect(html).not.toMatch(/<div class="loading-panel hidden"/);
+			expect(html).toContain("codicon-loading codicon-modifier-spin");
+			expect(html).toContain("Loading…");
+		});
+
+		it("hides tab-bar and all tab-content panels by default so they don't peek through during loading", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			// Without these defaults, reload would briefly show the tab bar
+			// before the script wires up applyConfigured/applyEnabled.
+			expect(html).toMatch(/<div class="tab-bar hidden"/);
+			expect(html).toMatch(
+				/<div class="tab-content hidden" id="tab-content-branch"/,
+			);
+			expect(html).toMatch(
+				/<div class="tab-content hidden" id="tab-content-kb"/,
+			);
+			expect(html).toMatch(
+				/<div class="tab-content hidden" id="tab-content-status"/,
+			);
+		});
+	});
+
+	describe("disabled panel skeleton", () => {
+		it("includes the disabled panel, hidden by default, with a header and Enable button", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			expect(html).toContain('id="disabled-panel"');
+			expect(html).toMatch(/<div class="disabled-panel hidden"/);
+			expect(html).toContain('id="disabled-enable-btn"');
+			expect(html).toMatch(
+				/id="disabled-enable-btn"[^>]*class="ob-btn ob-btn--primary"/,
+			);
+			expect(html).toMatch(
+				/<button[^>]*id="disabled-enable-btn"[^>]*>Enable Jolli Memory<\/button>/,
+			);
+		});
+
+		it("reuses the onboarding header copy (Get started + subtitle) and omits the option cards", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			// Slice from disabled-panel open to the next sibling (tab-bar);
+			// disabled-panel sits between onboarding-panel and tab-bar in the
+			// skeleton, so this window contains exactly the panel's body.
+			const start = html.indexOf('<div class="disabled-panel');
+			const end = html.indexOf('<div class="tab-bar', start);
+			expect(start).toBeGreaterThan(-1);
+			expect(end).toBeGreaterThan(start);
+			const panel = html.slice(start, end);
+			expect(panel).toContain("Get started with Jolli Memory");
+			expect(panel).toContain(
+				"Jolli Memory automatically captures your work context",
+			);
+			// Onboarding-only artefacts must NOT bleed into the disabled panel.
+			expect(panel).not.toContain("RECOMMENDED");
+			expect(panel).not.toContain("Use your Anthropic API key");
+			expect(panel).not.toContain("Sign in to Jolli");
+			expect(panel).not.toMatch(/class="ob-card/);
+			expect(panel).not.toMatch(/class="ob-or"/);
+		});
+	});
 });

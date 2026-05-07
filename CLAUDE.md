@@ -8,7 +8,7 @@ Monorepo with three deliverables that share the same product model and storage (
 
 - `cli/` — `@jolli.ai/cli` (npm workspace, Node 22.5+, ESM, Vite multi-entry lib build). Standalone command-line tool plus all git/agent hook scripts.
 - `vscode/` — `jollimemory-vscode` extension (npm workspace, esbuild → CJS). Bundles the CLI and hook scripts into its own `dist/` so it has **no dependency on a global CLI install**.
-- `intellij/` — separate Gradle/Kotlin project (JDK 21). Independent build, but installs the same git/agent hooks and writes to the same orphan branch + `~/.jolli/jollimemory/` state.
+- `intellij/` — separate Gradle/Kotlin project (JDK 21). Independent build, but installs the same git/agent hooks and writes to the same shared state: the orphan branch, the machine-global `~/.jolli/jollimemory/` (config + hook entry scripts), and the per-project `<projectDir>/.jolli/jollimemory/` (sessions, cursors, queue, …).
 
 Root `package.json` only coordinates the two npm workspaces; it does not touch `intellij/`. Use `.nvmrc` (currently `24.10.0`) for the Node version.
 
@@ -57,13 +57,18 @@ IntelliJ plugin: `cd intellij && ./gradlew build` (or `runIde` for a sandbox). S
 
 The product is built on a hook pipeline that runs in the user's project, not in this repo:
 
-1. **AI agent hooks** (Claude `StopHook` / `SessionStartHook`, Gemini `AfterAgent`) only record session metadata to `~/.jolli/jollimemory/sessions.json`. They do not read transcripts, do not call the LLM, and run with `async: true` so they never block the agent. Codex and OpenCode have no hook — they're discovered by scanning `~/.codex/sessions/` or reading `~/.local/share/opencode/opencode.db` (Node 22.5+ `node:sqlite`, lazy-imported and feature-gated; the VSCode bundle targets Node 18 and tolerates the missing module).
+1. **AI agent hooks** (Claude `StopHook` / `SessionStartHook`, Gemini `AfterAgent`) only record session metadata to `<projectDir>/.jolli/jollimemory/sessions.json`. They do not read transcripts, do not call the LLM, and run with `async: true` so they never block the agent. Codex and OpenCode have no hook — they're discovered by scanning `~/.codex/sessions/` or reading `~/.local/share/opencode/opencode.db` (Node 22.5+ `node:sqlite`, lazy-imported and feature-gated; the VSCode bundle targets Node 18 and tolerates the missing module).
 
 2. **Git hooks** drive a unified queue under `.jolli/jollimemory/git-op-queue/`. `post-commit` is synchronous (<5 ms) and only enqueues + spawns a detached `QueueWorker`; the worker holds a 5-min file lock, drains entries in timestamp order, runs the LLM where needed, and chain-spawns a successor if new entries appear after it finishes. Squash and rebase entries skip the LLM and just merge/migrate existing summaries. `prepare-commit-msg` writes `squash-pending.json` so the worker recognizes squash before deciding whether to call the LLM. See [`cli/DEVELOPMENT.md`](cli/DEVELOPMENT.md) for the queue rationale (each op gets its own file precisely because the previous single-slot pending files lost summaries during rapid amend/rebase sequences).
 
-### Storage: orphan branch + `~/.jolli/jollimemory/`
+### Storage: orphan branch + two `.jolli/jollimemory/` dirs
 
-Summaries live on the git orphan branch `jollimemory/summaries/v3` in the user's repo and are written via plumbing only — the branch is **never checked out**. Read with `git show <branch>:<path>`; write with `hash-object` + `mktree` + `commit-tree` + `update-ref`. Local non-summary state (sessions, cursors, config, locks, queue, dist-path indirection) lives under `~/.jolli/jollimemory/`.
+Summaries live on the git orphan branch `jollimemory/summaries/v3` in the user's repo and are written via plumbing only — the branch is **never checked out**. Read with `git show <branch>:<path>`; write with `hash-object` + `mktree` + `commit-tree` + `update-ref`.
+
+Local non-summary state is split across **two** `.jolli/jollimemory/` directories — don't conflate them:
+
+- `~/.jolli/jollimemory/` — **machine-global**: `config.json` (authToken / apiKey), `dist-paths/` (per-source dist-path indirection), `run-hook` / `run-cli` / `resolve-dist-path` hook entry scripts. Resolved by `getGlobalConfigDir()`.
+- `<projectDir>/.jolli/jollimemory/` — **per-project, gitignored**: `sessions.json`, `cursors.json`, `git-op-queue/`, `notes/`, `plans.json`, `briefing-cache.json`, `debug.log`, and the manual-disable marker (VS Code). Resolved by `getJolliMemoryDir(cwd)` in [`cli/src/Logger.ts`](cli/src/Logger.ts).
 
 ### VS Code extension bundles the CLI
 

@@ -26,6 +26,19 @@ export interface SidebarState {
 	 * after the OAuth callback completes (signIn) and after signOut clears creds.
 	 */
 	readonly authenticated: boolean;
+	/**
+	 * Whether the user has provided enough credentials to actually use AI
+	 * features — signed in to Jolli OR has supplied an Anthropic API key. Drives
+	 * the onboarding panel vs main tabs split: when `false`, the webview shows
+	 * the onboarding panel; when `true`, the normal sidebar UI renders. Pushed
+	 * via `configured:changed` whenever auth state or the Anthropic key changes.
+	 *
+	 * Optional because the consumer (`SidebarScriptBuilder`) treats `undefined`
+	 * as "not yet known" via `configured !== false` and the HTML default state
+	 * shows the main UI — same behavior the host produces by sending
+	 * `configured: true` once `currentConfigured` is hydrated.
+	 */
+	readonly configured?: boolean;
 	readonly activeTab: SidebarTab;
 	readonly kbMode: KbMode;
 	readonly branchName: string;
@@ -284,4 +297,5 @@ export type SidebarInboundMsg =
 	  }
 	| { readonly type: "enabled:changed"; readonly enabled: boolean }
 	| { readonly type: "auth:changed"; readonly authenticated: boolean }
+	| { readonly type: "configured:changed"; readonly configured: boolean }
 	| { readonly type: "worker:busy"; readonly busy: boolean };

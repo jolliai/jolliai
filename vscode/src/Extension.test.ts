@@ -783,6 +783,16 @@ vi.mock("./services/AuthService.js", () => ({
 	AuthService: MockAuthService,
 }));
 
+const { readManualDisableFlag, writeManualDisableFlag } = vi.hoisted(() => ({
+	readManualDisableFlag: vi.fn(async () => false),
+	writeManualDisableFlag: vi.fn(async () => undefined),
+}));
+
+vi.mock("./services/ManualDisableFlag.js", () => ({
+	readManualDisableFlag,
+	writeManualDisableFlag,
+}));
+
 vi.mock("node:os", () => ({
 	homedir,
 }));
@@ -1312,6 +1322,17 @@ describe("Extension", () => {
 					"Jolli Memory: git not found",
 				);
 			});
+
+			it("clears the manually-disabled marker on enable success", async () => {
+				writeManualDisableFlag.mockClear();
+				const handler = getRegisteredCommand("jollimemory.enableJolliMemory");
+				await handler();
+
+				expect(writeManualDisableFlag).toHaveBeenCalledWith(
+					"/test/workspace",
+					false,
+				);
+			});
 		});
 
 		describe("disableJolliMemory", () => {
@@ -1333,6 +1354,34 @@ describe("Extension", () => {
 
 				expect(showErrorMessage).toHaveBeenCalledWith(
 					"Jolli Memory: permission denied",
+				);
+			});
+
+			it("writes the manually-disabled marker before disabling", async () => {
+				writeManualDisableFlag.mockClear();
+				const handler = getRegisteredCommand("jollimemory.disableJolliMemory");
+				await handler();
+
+				expect(writeManualDisableFlag).toHaveBeenCalledWith(
+					"/test/workspace",
+					true,
+				);
+			});
+
+			it("writes the manually-disabled marker even when bridge.disable fails", async () => {
+				mockBridge.disable.mockResolvedValue({
+					success: false,
+					message: "permission denied",
+				});
+				writeManualDisableFlag.mockClear();
+				const handler = getRegisteredCommand("jollimemory.disableJolliMemory");
+				await handler();
+
+				// The opt-out is recorded *before* the async uninstall so it
+				// survives a failed Installer.uninstall().
+				expect(writeManualDisableFlag).toHaveBeenCalledWith(
+					"/test/workspace",
+					true,
 				);
 			});
 		});
@@ -2882,6 +2931,26 @@ describe("Extension", () => {
 			expect(() => onCreate?.()).not.toThrow();
 		});
 
+		it("HEAD watcher re-reads bridge.getCurrentBranch so branch label tracks branch switches", async () => {
+			// Activation called getCurrentBranch once at startup. After a HEAD
+			// change (branch switch / detached checkout), the watcher MUST call
+			// it again — otherwise currentBranchName freezes at the activation
+			// value and the Branch tab label drifts out of sync with the
+			// workspace's actual HEAD.
+			const callsBefore = mockBridge.getCurrentBranch.mock.calls.length;
+			const headWatcher = createFileSystemWatcher.mock.results[1]?.value;
+			const onChange = headWatcher?.onDidChange.mock.calls[0]?.[0] as
+				| (() => void)
+				| undefined;
+			expect(onChange).toBeDefined();
+			onChange?.();
+			// Allow the queued microtask (refreshBranchName is async) to flush.
+			await Promise.resolve();
+			expect(mockBridge.getCurrentBranch.mock.calls.length).toBeGreaterThan(
+				callsBefore,
+			);
+		});
+
 		it("wires orphan branch watcher to refresh callback", () => {
 			const orphanWatcher = createFileSystemWatcher.mock.results[2]?.value;
 			const onCreate = orphanWatcher?.onDidCreate.mock.calls[0]?.[0] as
@@ -3819,6 +3888,65 @@ describe("Extension", () => {
 				expect(mockStatusStore.refresh).toHaveBeenCalled();
 			});
 			expect(mockBridge.autoInstallForWorktree).not.toHaveBeenCalled();
+		});
+
+		// Auto-enable on activate: a fresh workspace with no opt-out should
+		// install hooks transparently. The opt-out is a marker file
+		// (`<projectDir>/.jolli/jollimemory/disabled-by-user`) that survives
+		// across IDE restarts AND project moves, since it's project-scoped
+		// rather than bound to VS Code's per-machine workspaceState.
+		describe("auto-enable on activate", () => {
+			it("calls bridge.enable when status.enabled=false and no opt-out recorded", async () => {
+				mockBridge.getStatus.mockResolvedValue({
+					enabled: false,
+					gitHookInstalled: false,
+					worktreeHooksInstalled: false,
+				});
+				mockBridge.enable.mockClear();
+				readManualDisableFlag.mockResolvedValue(false);
+
+				const ctx = makeContext();
+				activate(ctx);
+
+				await vi.waitFor(() => {
+					expect(mockBridge.enable).toHaveBeenCalled();
+				});
+			});
+
+			it("does NOT call bridge.enable when the manually-disabled marker is present", async () => {
+				mockBridge.getStatus.mockResolvedValue({
+					enabled: false,
+					gitHookInstalled: false,
+					worktreeHooksInstalled: false,
+				});
+				mockBridge.enable.mockClear();
+				readManualDisableFlag.mockResolvedValue(true);
+
+				const ctx = makeContext();
+				activate(ctx);
+
+				await vi.waitFor(() => {
+					expect(mockStatusStore.refresh).toHaveBeenCalled();
+				});
+				expect(mockBridge.enable).not.toHaveBeenCalled();
+			});
+
+			it("does NOT call bridge.enable when status.enabled is already true", async () => {
+				mockBridge.getStatus.mockResolvedValue({
+					enabled: true,
+					gitHookInstalled: true,
+					worktreeHooksInstalled: true,
+				});
+				mockBridge.enable.mockClear();
+
+				const ctx = makeContext();
+				activate(ctx);
+
+				await vi.waitFor(() => {
+					expect(mockStatusStore.refresh).toHaveBeenCalled();
+				});
+				expect(mockBridge.enable).not.toHaveBeenCalled();
+			});
 		});
 
 		it("logs error when refreshHookPathsIfStale rejects", async () => {

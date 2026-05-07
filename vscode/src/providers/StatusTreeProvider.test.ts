@@ -338,16 +338,21 @@ describe("StatusTreeProvider", () => {
 		expect(items.find((item) => item.label === "Jolli Site")).toBeUndefined();
 	});
 
-	it("skips config loading when disabled", async () => {
+	it("loads config even when disabled, but renders no rows", async () => {
+		// Auth state (authToken / apiKey) is independent of whether hooks are
+		// installed — keeping config loaded while disabled lets the Sidebar's
+		// onboarding gate stay accurate, even though this provider itself
+		// surfaces no rows in the disabled state.
 		const bridge = {
 			cwd: "/repo",
 			getStatus: vi.fn(async () => makeStatus({ enabled: false })),
 		};
+		loadConfigFromDir.mockResolvedValue({});
 		const provider = makeStatusProvider(bridge as never);
 
 		await provider.refresh();
 
-		expect(loadConfigFromDir).not.toHaveBeenCalled();
+		expect(loadConfigFromDir).toHaveBeenCalled();
 		expect(provider.getChildren()).toEqual([]);
 	});
 
@@ -813,12 +818,17 @@ describe("StatusTreeProvider", () => {
 		});
 	});
 
-	it("does not call authService.refreshContextKey when disabled", async () => {
+	it("calls authService.refreshContextKey when disabled with the on-disk config", async () => {
+		// `jollimemory.signedIn` context key reflects whether the user is
+		// signed in, not whether hooks are installed — so disable must not
+		// stop us from syncing it. Otherwise the context key drifts stale
+		// after a disable and any when-clauses gating on it lie to the user.
 		const mockAuthService = { refreshContextKey: vi.fn() };
 		const bridge = {
 			cwd: "/repo",
 			getStatus: vi.fn(async () => makeStatus({ enabled: false })),
 		};
+		loadConfigFromDir.mockResolvedValue({ authToken: "t" });
 
 		const provider = makeStatusProvider(
 			bridge as never,
@@ -826,7 +836,9 @@ describe("StatusTreeProvider", () => {
 		);
 		await provider.refresh();
 
-		expect(mockAuthService.refreshContextKey).not.toHaveBeenCalled();
+		expect(mockAuthService.refreshContextKey).toHaveBeenCalledWith({
+			authToken: "t",
+		});
 	});
 
 	it("skips integration row when claudeDetected is false", async () => {
