@@ -4,15 +4,18 @@
  * Two-phase design (mirrors recall's branch-catalog pattern):
  *   Phase 1: CLI emits a `SearchCatalog` (light, scannable) for an LLM to skim
  *            and pick relevant commit hashes from.
- *   Phase 2: CLI loads full content for the picked hashes and emits
- *            `SearchResult` with snippet highlighting.
+ *   Phase 2: CLI loads each picked summary from `summaries/<hash>.json` and
+ *            emits a `SearchResult` containing rich `SearchHit` entries — full
+ *            distilled topic content, recap, diff stats — so the LLM can
+ *            synthesize the final answer in whatever shape best fits the user's
+ *            query.
  *
  * The CLI never invokes an LLM itself — the chat LLM in the skill template is
  * the one that performs semantic matching between catalog entries and the
- * user's query.
+ * user's query, and the one that decides Phase 2's render shape.
  */
 
-import type { TopicCategory, TopicImportance } from "../Types.js";
+import type { CommitType, DiffStats, TopicCategory, TopicImportance } from "../Types.js";
 
 /** Default catalog size when `--since` is not provided. */
 export const DEFAULT_CATALOG_LIMIT = 500;
@@ -85,34 +88,77 @@ export interface SearchCatalog {
 
 // ─── Result (Phase 2) ─────────────────────────────────────────────────────────
 
-/** Which field a snippet's match came from. */
-export type SearchMatchField = "title" | "decisions" | "trigger" | "response" | "recap" | "filesAffected";
-
-/** Single field-level match within a SearchHit. */
-export interface SearchMatch {
-	readonly field: SearchMatchField;
-	/** Title of the topic the match originated from (absent for commit-level fields like `recap`). */
-	readonly topicTitle?: string;
-	/**
-	 * ~200-character excerpt around the matched term. The matched term is
-	 * pre-highlighted with markdown `**bold**` so the LLM can render directly.
-	 */
-	readonly snippet: string;
+/**
+ * A topic inside a Phase 2 hit. Carries the full distilled content needed for
+ * the LLM to synthesize "why" / "what" / "how" answers. Mirrors `TopicSummary`
+ * from `Types.ts` but excludes only fields that have no LLM value (none in
+ * this schema today; if `TopicSummary` grows, deliberately decide each new
+ * field's value to a search consumer).
+ *
+ * `decisions` is the highest-signal field — it captures architectural choices
+ * AND the reasoning behind them, which the diff alone never shows. Skill
+ * template Step 5 calls this out as the "★ star field".
+ */
+export interface SearchHitTopic {
+	readonly title: string;
+	/** 1-2 sentences describing what prompted the work. */
+	readonly trigger: string;
+	/** Implementation summary; may include code references. Verbose. */
+	readonly response: string;
+	/** ★ Design choices + the reasoning behind each. Multi-line markdown bullets. */
+	readonly decisions: string;
+	/** Residual work the LLM noticed during summarization (rare but valuable). */
+	readonly todo?: string;
+	/** Files this specific topic touched. Source of truth for file grounding. */
+	readonly filesAffected?: ReadonlyArray<string>;
+	readonly category?: TopicCategory;
+	readonly importance?: TopicImportance;
 }
 
 /**
- * One hit returned by Phase 2. Each entry corresponds to one of the hashes
- * passed in `--hashes`, paired with snippets relevant to the query.
+ * One hit returned by Phase 2.
+ *
+ * The shape is deliberately rich — the skill template Step 5 hands this JSON
+ * to the LLM with detailed schema documentation and tells it to pick whatever
+ * output shape fits the user's query (definition prose / comparison table /
+ * timeline / grouped list / etc.). Earlier iterations exposed only `matches[]`
+ * snippets and forced a rigid "table + bullets" template, which produced the
+ * same shape regardless of query intent.
+ *
+ * Notable absences:
+ *   - No `matches[]` / snippets: the LLM has the full topics so per-field
+ *     literal-match excerpts are redundant, and the old "snippet dump" failure
+ *     mode was driven by their presence.
+ *   - No commit-level aggregated `filesAffected`: derive it from
+ *     `topics.flatMap(t => t.filesAffected ?? [])` if needed. Per-topic
+ *     `filesAffected` is strictly stronger because it preserves the
+ *     decision-to-file mapping.
+ *   - No `children` / tree: `collectDisplayTopics` walks the tree before
+ *     building this hit, so `topics[]` already contains the resolved
+ *     leaf-level distillation.
+ *   - No internal metadata (`generatedAt`, `commitSource`, `transcriptEntries`,
+ *     `conversationTurns`, `llm`, `treeHash`, `jolliDocId/Url`,
+ *     `orphanedDocIds`, `e2eTestGuide`, `plans`, `notes`).
  */
 export interface SearchHit {
+	// Identity + provenance
 	readonly hash: string;
 	readonly fullHash: string;
-	readonly branch: string;
-	readonly date: string;
 	readonly commitMessage: string;
+	readonly commitAuthor: string;
+	readonly commitDate: string;
+	readonly branch: string;
+	readonly commitType?: CommitType;
 	readonly ticketId?: string;
+
+	// Change scale
+	readonly diffStats?: DiffStats;
+
+	// Narrative
 	readonly recap?: string;
-	readonly matches: ReadonlyArray<SearchMatch>;
+
+	// Structured body — the meaty field
+	readonly topics: ReadonlyArray<SearchHitTopic>;
 }
 
 /**

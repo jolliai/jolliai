@@ -22,12 +22,10 @@ import { exchangeCliCode } from "../../../cli/src/auth/CliExchange.js";
 import { loadConfig } from "../../../cli/src/core/SessionTracker.js";
 import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
 import { log } from "../util/Logger.js";
+import { EXTENSION_ID, resolveUriScheme } from "../util/UriSchemeResolver.js";
 
 /** VSCode URI callback path for OAuth redirects */
 const AUTH_CALLBACK_PATH = "/auth-callback";
-
-/** Extension ID used in the vscode:// callback URI */
-const EXTENSION_ID = "jolli.jollimemory-vscode";
 
 /**
  * Result of handling an auth callback URI. Discriminated on `success` so the
@@ -67,13 +65,13 @@ export class AuthService {
 	 *
 	 * Two callback shapes are accepted, in priority order:
 	 *
-	 *   1. JOLLI-1270 code-exchange (preferred — issued by upgraded servers):
+	 *   1. Code-exchange (preferred — issued by upgraded servers):
 	 *        vscode://jolli.jollimemory-vscode/auth-callback?code=<32-byte-hex>
 	 *      The `code` is single-use and TTL-bound; we POST it to
 	 *      `/api/auth/cli-exchange` to redeem the actual token + API key over a
 	 *      channel the browser never sees.
 	 *
-	 *   2. Legacy token-in-URL (fallback — issued by pre-1270 servers):
+	 *   2. Legacy token-in-URL (fallback — issued by pre-code-exchange servers):
 	 *        vscode://jolli.jollimemory-vscode/auth-callback?token=<jwt>&jolli_api_key=<sk-jol-…>
 	 *      Server delivers credentials directly in query params. Less secure
 	 *      (token visible to URI handler chain), but required so users on the
@@ -105,7 +103,7 @@ export class AuthService {
 
 		// CSRF check (RFC 6749 §10.12). Only enforced on the code-exchange
 		// path; the legacy token-in-URL fallback predates state support and
-		// pre-1270 servers don't echo state. Tightening it here would lock
+		// older servers don't echo state. Tightening it here would lock
 		// those users out of sign-in. The legacy gap closes when the fallback
 		// is removed.
 		//
@@ -152,7 +150,7 @@ export class AuthService {
 			// usage and decide when it's safe to drop this branch.
 			log.warn(
 				"AuthService",
-				"Using legacy token-in-URL callback — server has not been upgraded to JOLLI-1270 code-exchange",
+				"Using legacy token-in-URL callback — server has not been upgraded to the code-exchange flow",
 			);
 			const legacyApiKey = params.get("jolli_api_key");
 			credentials = {
@@ -277,32 +275,6 @@ export class AuthService {
 			this.isSignedIn(config),
 		);
 	}
-}
-
-/**
- * Resolves the OS-registered URI scheme for the host IDE.
- *
- * `vscode.env.uriScheme` returns "vscode" in most forks (Cursor, Windsurf,
- * Kiro, Antigravity, …) because forks inherit upstream VSCode's default for
- * that API without overriding it. The OS-level scheme registration, however,
- * is usually correct — so we detect the host via `appName` (which forks
- * consistently rebrand) and return the scheme the OS has registered.
- *
- * Unknown forks fall through to "vscode". If such a fork did register its
- * own scheme, sign-in will fail over to VSCode Stable; add a new branch here
- * and a corresponding entry to Jolli's cli_callback allowlist to fix it.
- */
-function resolveUriScheme(): string {
-	const appName = vscode.env.appName.toLowerCase();
-	if (appName.includes("cursor")) return "cursor";
-	if (appName.includes("windsurf")) return "windsurf";
-	if (appName.includes("vscodium")) return "vscodium";
-	if (appName.includes("kiro")) return "kiro";
-	if (appName.includes("antigravity")) return "antigravity";
-	// Check "insiders" last: it coexists with "visual studio code" in the
-	// VSCode Insiders appName, and we want the more specific match to win.
-	if (appName.includes("insiders")) return "vscode-insiders";
-	return "vscode";
 }
 
 /**

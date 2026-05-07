@@ -283,9 +283,9 @@ describe("AuthService", () => {
 
 		// ── Legacy token-in-URL fallback ──────────────────────────────────
 		// Compatibility window for users on the latest extension whose Jolli
-		// server hasn't shipped JOLLI-1270 yet. Once all server tenants emit
-		// `?code=` callbacks, this whole describe block (and the matching
-		// branch in handleAuthCallback) can be deleted.
+		// server hasn't shipped the code-exchange endpoint yet. Once all
+		// server tenants emit `?code=` callbacks, this whole describe block
+		// (and the matching branch in handleAuthCallback) can be deleted.
 
 		it("should accept legacy token-in-URL callback with jolli_api_key", async () => {
 			const uri = makeUri(
@@ -386,7 +386,7 @@ describe("AuthService", () => {
 
 		// ── CSRF state validation (RFC 6749 §10.12) ──────────────────────
 		// Only enforced on the `?code=` path. Legacy `?token=` callbacks
-		// from pre-1270 servers don't echo state and can't be tightened
+		// from older servers don't echo state and can't be tightened
 		// without locking those users out of sign-in — see the legacy
 		// describe block above for the bypass tests.
 
@@ -505,7 +505,7 @@ describe("AuthService", () => {
 			});
 
 			it("does NOT enforce state on the legacy token-in-URL fallback", async () => {
-				// Pre-1270 servers don't echo state; demanding it would lock
+				// Older servers don't echo state; demanding it would lock
 				// those users out of sign-in. The legacy hole closes when the
 				// fallback is removed.
 				await primeStateViaSignIn(service);

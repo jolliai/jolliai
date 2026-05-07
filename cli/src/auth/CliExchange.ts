@@ -1,5 +1,5 @@
 /**
- * CLI Code Exchange (JOLLI-1270)
+ * CLI Code Exchange
  *
  * Trades a single-use authorization code (received via the `cli_callback`
  * URL) for the actual auth token and any auto-generated Jolli API key.
