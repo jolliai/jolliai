@@ -9,10 +9,14 @@ import { browserLogin } from "../auth/Login.js";
 import { loadConfig } from "../core/SessionTracker.js";
 
 export function registerAuthCommands(program: Command): void {
-	const auth = program.command("auth").description("Authentication commands");
+	const auth = program
+		.command("auth")
+		.description("Sign in to Jolli to generate AI summaries without an Anthropic API key");
 
 	auth.command("login")
-		.description("Log in to Jolli via browser")
+		.description(
+			"Log in via browser and save a Jolli API Key — for users with claude.ai access but no Anthropic API key, this key is what powers AI summary generation",
+		)
 		.action(async () => {
 			try {
 				await browserLogin(getJolliUrl());
@@ -31,7 +35,7 @@ export function registerAuthCommands(program: Command): void {
 		});
 
 	auth.command("logout")
-		.description("Clear stored auth credentials")
+		.description("Clear the stored Jolli auth token and Jolli API Key (Anthropic API key, if any, is preserved)")
 		.action(async () => {
 			await clearAuthCredentials();
 			const config = await loadConfig();
@@ -47,7 +51,7 @@ export function registerAuthCommands(program: Command): void {
 		});
 
 	auth.command("status")
-		.description("Show current authentication state")
+		.description("Show whether you're signed in and whether a Jolli API Key is configured")
 		.action(async () => {
 			const token = await loadAuthToken();
 			const config = await loadConfig();

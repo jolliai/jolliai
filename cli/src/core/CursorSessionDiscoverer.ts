@@ -303,14 +303,18 @@ async function readCursorAnchorComposerIds(wsHash: string): Promise<ReadonlyArra
  *   when their casing differs.
  */
 function normalizePathForMatch(p: string): string {
+	// Normalize backslashes to forward slashes so Windows paths from
+	// fileURLToPath (which returns `\`-separated paths) compare correctly
+	// against caller-supplied forward-slash paths.
+	const fwd = p.replace(/\\/g, "/");
 	// Linear-time trailing-slash strip. Equivalent to /\/+$/ but expressed as a
 	// loop so CodeQL's js/polynomial-redos heuristic doesn't flag the regex
 	// when this function receives paths read from on-disk JSON.
-	let end = p.length;
-	while (end > 0 && p[end - 1] === "/") {
+	let end = fwd.length;
+	while (end > 0 && fwd[end - 1] === "/") {
 		end--;
 	}
-	const trimmed = p.slice(0, end);
+	const trimmed = fwd.slice(0, end);
 	const os = platform();
 	return os === "darwin" || os === "win32" ? trimmed.toLowerCase() : trimmed;
 }

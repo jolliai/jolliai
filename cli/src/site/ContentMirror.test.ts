@@ -231,7 +231,7 @@ describe("ContentMirror.mirrorContent", () => {
 
 		const result = await mirrorContent(sourceRoot, contentDir);
 
-		expect(result.markdownFiles).toContain(join("guides", "intro.md"));
+		expect(result.markdownFiles).toContain("guides/intro.md");
 	});
 
 	// ── Image files are copied (Requirement 3.4) ────────────────────────────
@@ -340,7 +340,7 @@ describe("ContentMirror.mirrorContent", () => {
 
 		expect(result.markdownFiles).toContain("index.md");
 		expect(result.imageFiles).toContain("logo.svg");
-		expect(result.openapiFiles).toContain(join("api", "spec.yaml"));
+		expect(result.openapiFiles).toContain("api/spec.yaml");
 		expect(result.ignoredFiles).toContain("notes.txt");
 	});
 
@@ -491,7 +491,7 @@ describe("ContentMirror.mirrorContent", () => {
 		expect(result.markdownFiles).toHaveLength(0);
 	});
 
-	it("skips entries where stat fails (e.g. broken symlinks)", async () => {
+	it.skipIf(process.platform === "win32")("skips entries where stat fails (e.g. broken symlinks)", async () => {
 		const { symlink } = await import("node:fs/promises");
 		const { mirrorContent } = await import("./ContentMirror.js");
 		// Create a broken symlink — readdir lists it, but stat fails
@@ -508,7 +508,7 @@ describe("ContentMirror.mirrorContent", () => {
 
 	// ── Error handling: unreadable file for OpenAPI classification ──────────
 
-	it("treats an unreadable .yaml file as ignored", async () => {
+	it.skipIf(process.platform === "win32")("treats an unreadable .yaml file as ignored", async () => {
 		const { chmod, writeFile: wf } = await import("node:fs/promises");
 		const { mirrorContent } = await import("./ContentMirror.js");
 		const yamlPath = join(sourceRoot, "spec.yaml");
@@ -753,7 +753,7 @@ describe("Property 2: Content mirroring preserves directory structure", () => {
 
 				const result = await mirrorContent(sourceRoot, contentDir);
 
-				const expectedRelPath = join(dirName, `${fileName}.md`);
+				const expectedRelPath = `${dirName}/${fileName}.md`;
 				return result.markdownFiles.includes(expectedRelPath) && existsSync(join(contentDir, expectedRelPath));
 			}),
 			{ numRuns: 50 },
@@ -826,6 +826,18 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 
 		expect(result).toContain('style="background-color: red; font-size: 14px"');
 		expect(result).not.toContain("{{");
+	});
+
+	it("drops malformed entries (no value) inside style blocks", async () => {
+		// "noColon" has no `:` so it has no value parts → the conversion drops it
+		// while keeping the well-formed `color: red` entry.
+		const { stripIncompatibleContent } = await import("./ContentMirror.js");
+		const input = "<div style={{noColon, color: red}}>x</div>";
+
+		const result = stripIncompatibleContent(input);
+
+		expect(result).toContain('style="color: red"');
+		expect(result).not.toContain("noColon");
 	});
 
 	it("removes Docusaurus admonition fences", async () => {
@@ -978,6 +990,55 @@ describe("ContentMirror.rewriteRelativeImagePaths", () => {
 
 		expect(result).toContain("../file.pdf"); // Unchanged
 	});
+
+	it("does not rewrite HTML img with non-image extension", async () => {
+		const { rewriteRelativeImagePaths } = await import("./ContentMirror.js");
+		const content = '<img src="./file.pdf" alt="x">';
+
+		const result = rewriteRelativeImagePaths(content, "docs/page.md", "guides/docs/page.md");
+
+		expect(result).toContain('src="./file.pdf"');
+	});
+
+	it("does not rewrite HTML img with absolute path", async () => {
+		const { rewriteRelativeImagePaths } = await import("./ContentMirror.js");
+		const content = '<img src="/img/logo.png" alt="x">';
+
+		const result = rewriteRelativeImagePaths(content, "docs/page.md", "guides/docs/page.md");
+
+		expect(result).toContain('src="/img/logo.png"');
+	});
+
+	it("does not rewrite HTML img with http URL", async () => {
+		const { rewriteRelativeImagePaths } = await import("./ContentMirror.js");
+		const content = '<img src="https://example.com/x.png" alt="x">';
+
+		const result = rewriteRelativeImagePaths(content, "docs/page.md", "guides/docs/page.md");
+
+		expect(result).toContain('src="https://example.com/x.png"');
+	});
+
+	it("computes relative paths sharing a common prefix", async () => {
+		// originalDir = "a", newDir = "a/b" → common prefix "a" exercises the
+		// `common++` branch of computeRelative.
+		const { rewriteRelativeImagePaths } = await import("./ContentMirror.js");
+		const content = "![logo](./img.png)\n";
+
+		const result = rewriteRelativeImagePaths(content, "a/old.md", "a/b/new.md");
+
+		expect(result).toContain("../img.png");
+	});
+
+	it("handles empty newDir when file moves to root", async () => {
+		// newRelPath has no slash → newDir = "" exercises the empty-from branch
+		// of computeRelative, which returns a "./..."-prefixed path.
+		const { rewriteRelativeImagePaths } = await import("./ContentMirror.js");
+		const content = "![logo](./img.png)\n";
+
+		const result = rewriteRelativeImagePaths(content, "docs/page.md", "page.md");
+
+		expect(result).toContain("docs/img.png");
+	});
 });
 
 // ─── applyPathMapping tests ──────────────────────────────────────────────────
@@ -1047,7 +1108,7 @@ describe("ContentMirror.mirrorContent with pathMappings", () => {
 
 		const result = await mirrorContent(sourceRoot, contentDir, { sql: "pipelines/sql" });
 
-		expect(result.markdownFiles).toContain(join("pipelines", "sql", "query.md"));
+		expect(result.markdownFiles).toContain("pipelines/sql/query.md");
 		expect(existsSync(join(contentDir, "pipelines", "sql", "query.md"))).toBe(true);
 	});
 
@@ -1156,6 +1217,146 @@ describe("ContentMirror.mirrorContent with publicDir", () => {
 		const output = await rf(join(contentDir, "page.md"), "utf-8");
 		expect(output).toContain("/images/");
 	});
+
+	it("ignores non-image references in markdown image syntax", async () => {
+		// `![doc](./file.pdf)` has the wrong extension → resolveImage returns null
+		// and the reference is left untouched.
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "page.md"), "![doc](./file.pdf)\n", "utf-8");
+
+		await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		const { readFile: rf } = await import("node:fs/promises");
+		const output = await rf(join(contentDir, "page.md"), "utf-8");
+		expect(output).toContain("./file.pdf");
+	});
+
+	it("ignores http(s) image URLs", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "page.md"), "![remote](https://example.com/x.png)\n", "utf-8");
+
+		await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		const { readFile: rf } = await import("node:fs/promises");
+		const output = await rf(join(contentDir, "page.md"), "utf-8");
+		expect(output).toContain("https://example.com/x.png");
+	});
+
+	it("preserves existing relative images without rewriting", async () => {
+		// Image exists on disk → existsSync(resolvedPath) is true → no rewrite.
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "logo.png"), "fake-png-data", "utf-8");
+		await writeFile(join(sourceRoot, "page.md"), "![logo](./logo.png)\n", "utf-8");
+
+		await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		const { readFile: rf } = await import("node:fs/promises");
+		const output = await rf(join(contentDir, "page.md"), "utf-8");
+		expect(output).toContain("./logo.png");
+		// Should NOT have been rewritten to /images/...
+		expect(output).not.toContain("/images/");
+	});
+
+	it("rewrites HTML <img> tags pointing to missing images", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "page.md"), '<img src="./missing.png" alt="x">\n', "utf-8");
+
+		await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		const { readFile: rf } = await import("node:fs/promises");
+		const output = await rf(join(contentDir, "page.md"), "utf-8");
+		expect(output).toContain('src="/images/');
+	});
+
+	it("ignores HTML <img> tags with non-image extensions", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "page.md"), '<img src="./doc.pdf" alt="x">\n', "utf-8");
+
+		await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		const { readFile: rf } = await import("node:fs/promises");
+		const output = await rf(join(contentDir, "page.md"), "utf-8");
+		expect(output).toContain('src="./doc.pdf"');
+	});
+
+	it("ignores HTML <img> tags with http URLs", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "page.md"), '<img src="https://example.com/x.png" alt="x">\n', "utf-8");
+
+		await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		const { readFile: rf } = await import("node:fs/promises");
+		const output = await rf(join(contentDir, "page.md"), "utf-8");
+		expect(output).toContain('src="https://example.com/x.png"');
+	});
+
+	it("does not modify content when no images need resolution", async () => {
+		// All references are valid → no in-place rewrite happens (modified === false).
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "page.md"), "# Plain\n\nNo images here.\n", "utf-8");
+
+		await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		const { readFile: rf } = await import("node:fs/promises");
+		const output = await rf(join(contentDir, "page.md"), "utf-8");
+		expect(output).toBe("# Plain\n\nNo images here.\n");
+	});
+});
+
+// ─── mirrorContent edge cases ────────────────────────────────────────────────
+
+describe("ContentMirror.mirrorContent edge cases", () => {
+	let contentDir: string;
+
+	beforeEach(async () => {
+		contentDir = await makeTempDir();
+	});
+
+	afterEach(async () => {
+		await rm(contentDir, { recursive: true, force: true });
+	});
+
+	it("returns an empty result when sourceRoot does not exist", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		const missing = join(contentDir, "does-not-exist");
+
+		const result = await mirrorContent(missing, contentDir);
+
+		expect(result.markdownFiles).toHaveLength(0);
+		expect(result.openapiFiles).toHaveLength(0);
+		expect(result.imageFiles).toHaveLength(0);
+		expect(result.ignoredFiles).toHaveLength(0);
+	});
+
+	it("classifies JSON without an OpenAPI structure as ignored", async () => {
+		const sourceRoot = await makeTempDir();
+		try {
+			await writeFile(join(sourceRoot, "data.json"), '{"foo":"bar"}', "utf-8");
+			const { mirrorContent } = await import("./ContentMirror.js");
+
+			const result = await mirrorContent(sourceRoot, contentDir);
+
+			expect(result.openapiFiles).toHaveLength(0);
+			expect(result.ignoredFiles).toContain("data.json");
+		} finally {
+			await rm(sourceRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("classifies YAML without an OpenAPI structure as ignored", async () => {
+		const sourceRoot = await makeTempDir();
+		try {
+			await writeFile(join(sourceRoot, "config.yaml"), "foo: bar\nbaz: qux\n", "utf-8");
+			const { mirrorContent } = await import("./ContentMirror.js");
+
+			const result = await mirrorContent(sourceRoot, contentDir);
+
+			expect(result.openapiFiles).toHaveLength(0);
+			expect(result.ignoredFiles).toContain("config.yaml");
+		} finally {
+			await rm(sourceRoot, { recursive: true, force: true });
+		}
+	});
 });
 
 // ─── hasIncompatibleImports with custom ContentRules ─────────────────────────
@@ -1200,6 +1401,22 @@ describe("ContentMirror.hasIncompatibleImports with ContentRules", () => {
 
 		expect(hasIncompatibleImports(content, undefined)).toBe(false);
 	});
+
+	it("treats components from named imports as compatible", async () => {
+		const { hasIncompatibleImports } = await import("./ContentMirror.js");
+		// `import { Foo, Bar } from 'react'` → Foo and Bar are imported components.
+		const content = "import { Foo, Bar } from 'react'\n\n<Foo />\n<Bar />\n";
+
+		expect(hasIncompatibleImports(content)).toBe(false);
+	});
+
+	it("treats components from aliased named imports as compatible", async () => {
+		const { hasIncompatibleImports } = await import("./ContentMirror.js");
+		// `import { Foo as Renamed } from 'react'` → Renamed is the local name.
+		const content = "import { Foo as Renamed } from 'react'\n\n<Renamed />\n";
+
+		expect(hasIncompatibleImports(content)).toBe(false);
+	});
 });
 
 // ─── mirrorContent with unreadable .mdx file ─────────────────────────────────
@@ -1218,7 +1435,7 @@ describe("ContentMirror.mirrorContent unreadable MDX", () => {
 		await rm(contentDir, { recursive: true, force: true });
 	});
 
-	it("treats broken .mdx symlink as ignored", async () => {
+	it.skipIf(process.platform === "win32")("treats broken .mdx symlink as ignored", async () => {
 		const { symlink: symlinkFn } = await import("node:fs/promises");
 		const { mirrorContent } = await import("./ContentMirror.js");
 		// Create a broken symlink that stat resolves but readFile fails

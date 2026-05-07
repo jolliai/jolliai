@@ -144,14 +144,17 @@ describe("EngineManager.ensureEngine", () => {
 	});
 
 	it("calls npm install in the engine directory", async () => {
-		const { ensureEngine, getEngineDir } = await import("./EngineManager.js");
+		const { ensureEngine } = await import("./EngineManager.js");
 
 		await ensureEngine();
 
-		expect(mockSpawnSync).toHaveBeenCalledWith(expect.any(String), ["install"], {
-			cwd: getEngineDir(),
-			stdio: "pipe",
-		});
+		const call = mockSpawnSync.mock.calls[0];
+		const invocation = `${call[0]} ${(call[1] ?? []).join(" ")}`;
+		expect(invocation).toContain("npm");
+		expect(invocation).toContain("install");
+		expect(call[2].cwd).toContain(".jolli");
+		expect(call[2].cwd).toContain("site-engine");
+		expect(call[2].stdio).toBe("pipe");
 	});
 
 	it("returns failure when npm install fails", async () => {

@@ -92,18 +92,21 @@ describe("getCursorGlobalDbPath", () => {
 	it("returns the darwin path", () => {
 		mockPlatform.mockReturnValue("darwin");
 		expect(getCursorGlobalDbPath()).toBe(
-			"/home/user/Library/Application Support/Cursor/User/globalStorage/state.vscdb",
+			join("/home/user", "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb"),
 		);
 	});
 
 	it("returns the linux path", () => {
 		mockPlatform.mockReturnValue("linux");
-		expect(getCursorGlobalDbPath()).toBe("/home/user/.config/Cursor/User/globalStorage/state.vscdb");
+		expect(getCursorGlobalDbPath()).toBe(
+			join("/home/user", ".config", "Cursor", "User", "globalStorage", "state.vscdb"),
+		);
 	});
 
 	it("returns a Cursor-rooted path on win32", () => {
 		mockPlatform.mockReturnValue("win32");
-		const path = getCursorGlobalDbPath();
-		expect(path.endsWith("Cursor/User/globalStorage/state.vscdb")).toBe(true);
+		const result = getCursorGlobalDbPath();
+		const suffix = join("Cursor", "User", "globalStorage", "state.vscdb");
+		expect(result.endsWith(suffix)).toBe(true);
 	});
 });

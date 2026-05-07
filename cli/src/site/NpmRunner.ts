@@ -13,9 +13,21 @@ import { engineNeedsInstall, ensureEngine, linkEngineModules } from "./EngineMan
 import { createOutputFilter } from "./OutputFilter.js";
 import type { NpmRunResult } from "./Types.js";
 
-/** On Windows, npm/npx must be invoked as npm.cmd/npx.cmd. */
-const NPM = process.platform === "win32" ? /* v8 ignore next */ "npm.cmd" : "npm";
-const NPX = process.platform === "win32" ? /* v8 ignore next */ "npx.cmd" : "npx";
+/**
+ * On Windows, npm/npx are batch scripts (.cmd) that require `shell: true`
+ * for spawn/spawnSync since Node 22.5+ (CVE-2024-27980 hardened child_process
+ * to reject .cmd/.bat files without a shell). To avoid the DEP0190 warning
+ * ("Passing args to a child process with shell option true"), we join the
+ * command and args into a single string when shell mode is active.
+ */
+const IS_WIN = process.platform === "win32";
+const SHELL_OPTS = IS_WIN ? /* v8 ignore next */ ({ shell: true } as const) : {};
+
+/** Merges cmd + args into the format expected by spawn/spawnSync. */
+function shellCmd(cmd: string, args: string[]): [string, string[]] {
+	/* v8 ignore next */
+	return IS_WIN ? [`${cmd} ${args.join(" ")}`, []] : [cmd, args];
+}
 
 export type { NpmRunResult };
 
@@ -45,9 +57,11 @@ export async function runNpmInstall(buildDir: string): Promise<NpmRunResult> {
  * Runs `npm run build` inside `buildDir`.
  */
 export async function runNpmBuild(buildDir: string): Promise<NpmRunResult> {
-	const result = spawnSync(NPM, ["run", "build"], {
+	const [cmd, args] = shellCmd("npm", ["run", "build"]);
+	const result = spawnSync(cmd, args, {
 		cwd: buildDir,
 		stdio: "pipe",
+		...SHELL_OPTS,
 	});
 
 	const stdout = result.stdout ? result.stdout.toString() : "";
@@ -74,27 +88,29 @@ export interface ServerResult extends NpmRunResult {
  * and the server URL are shown. In verbose mode, all output is streamed.
  */
 export function runNpmDev(buildDir: string, verbose = false): Promise<ServerResult> {
-	return runLongProcess(NPM, ["run", "dev"], buildDir, verbose);
+	return runLongProcess("npm", ["run", "dev"], buildDir, verbose);
 }
 
 /**
  * Serves the static `out/` directory inside `buildDir` using `npx serve`.
  */
 export function runServe(buildDir: string, verbose = false): Promise<ServerResult> {
-	return runLongProcess(NPX, ["serve", "out"], buildDir, verbose);
+	return runLongProcess("npx", ["serve", "out"], buildDir, verbose);
 }
 
 /**
  * Shared implementation for long-running server processes.
  * Pipes output through OutputFilter and extracts the server URL.
  */
-function runLongProcess(cmd: string, args: string[], cwd: string, verbose: boolean): Promise<ServerResult> {
+function runLongProcess(rawCmd: string, rawArgs: string[], cwd: string, verbose: boolean): Promise<ServerResult> {
 	return new Promise((resolve) => {
 		const filter = createOutputFilter(verbose);
+		const [cmd, args] = shellCmd(rawCmd, rawArgs);
 
 		const child = spawn(cmd, args, {
 			cwd,
 			stdio: "pipe",
+			...SHELL_OPTS,
 		});
 
 		child.stdout?.on("data", (data: Buffer) => {
