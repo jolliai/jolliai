@@ -1,12 +1,15 @@
 <idea-plugin>
     <id>ai.jolli.jollimemory</id>
-    <name>JolliMemory</name>
-    <vendor url="https://jolli.ai">Jolli</vendor>
+    <name>Jolli Memory</name>
+    <vendor url="https://jolli.ai" email="support@jolli.ai">Jolli</vendor>
 
     <description><![CDATA[
         AI-powered commit summaries and smart git operations.<br/>
         Automatically captures your AI coding conversations (Claude Code, Gemini CLI, Codex)
         and generates structured summaries for each commit — so you always remember <em>why</em>.
+        <br/><br/>
+        <a href="https://github.com/jolliai/jolliai">Source Code</a> |
+        <a href="https://jolli.ai/privacy">Privacy Policy</a>
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
@@ -19,7 +22,7 @@
 
         <!-- Tool window: sidebar with collapsible STATUS, MEMORIES, PLANS & NOTES, CHANGES, COMMITS panels -->
         <toolWindow
-            id="JOLLI MEMORY"
+            id="JOLLI"
             anchor="right"
             secondary="true"
             icon="/icons/jollimemory.svg"

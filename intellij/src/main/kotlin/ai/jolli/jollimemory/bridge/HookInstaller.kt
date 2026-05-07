@@ -166,7 +166,15 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
 
             // Install Claude Code hook
             installClaudeHook()
-            installLog.appendLine("Claude hook installed")
+            // DEBUG: verify file was written correctly
+            val verifyFile = File(mainRepoRoot, ".claude/settings.local.json")
+            val verifyContent = if (verifyFile.exists()) verifyFile.readText(Charsets.UTF_8) else "FILE NOT FOUND"
+            val hasHook = verifyContent.contains("jollimemory-hooks")
+            installLog.appendLine("Claude hook installed (verified: hasHook=$hasHook, size=${verifyContent.length})")
+            if (!hasHook) {
+                installLog.appendLine("WARNING: Claude hook NOT found in file after write!")
+                installLog.appendLine("File content: ${verifyContent.take(200)}")
+            }
 
             // Install Gemini CLI hook (if Gemini is detected)
             installGeminiHook()
@@ -181,6 +189,12 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             // Install Claude Code skill file (.claude/skills/jolli-recall/SKILL.md)
             SkillInstaller(mainRepoRoot).updateSkillIfNeeded()
             installLog.appendLine("Skill installed")
+
+            // Final verification: re-read Claude hook file
+            val finalVerify = File(mainRepoRoot, ".claude/settings.local.json")
+            val finalContent = if (finalVerify.exists()) finalVerify.readText(Charsets.UTF_8) else "FILE NOT FOUND"
+            installLog.appendLine("Final verify: hasHook=${finalContent.contains("jollimemory-hooks")}, size=${finalContent.length}")
+            installLog.appendLine("areAllHooksInstalled=${areAllHooksInstalled()}")
 
             // Write install log
             writeInstallLog(installLog.toString())

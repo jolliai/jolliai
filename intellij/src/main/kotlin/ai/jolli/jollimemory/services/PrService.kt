@@ -149,7 +149,7 @@ object PrService {
     /** Runs a gh command and returns stdout. Throws on failure. */
     private fun execGhOrThrow(args: List<String>, cwd: String): String {
         return execGh(args, cwd)
-            ?: throw RuntimeException("gh command failed: gh ${args.joinToString(" ")}")
+            ?: throw RuntimeException("gh command failed: gh ${args.joinToString(" ")}\n\nCheck: Is 'gh' installed? Is it authenticated (gh auth login)? Is the branch pushed to remote?")
     }
 
     /** Runs a git command and returns stdout, or null on failure. */

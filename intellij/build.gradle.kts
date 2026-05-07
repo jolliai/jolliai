@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.97.9"
+version = "0.98.3"
 
 repositories {
     mavenCentral()
@@ -44,7 +44,7 @@ dependencies {
 intellijPlatform {
     pluginConfiguration {
         id = "ai.jolli.jollimemory"
-        name = "JolliMemory"
+        name = "Jolli Memory"
         version = project.version.toString()
         description = """
             <p>
@@ -132,6 +132,48 @@ intellijPlatform {
             </p>
         """.trimIndent()
         changeNotes = """
+            <h3>0.98.1</h3>
+            <ul>
+                <li><b>Full migration</b> &mdash; migration now includes all child summaries,
+                    notes, and transcripts from the orphan branch, not just root entries</li>
+                <li><b>Visible plan &amp; note copies</b> &mdash; plans and notes now generate
+                    human-readable Markdown files in branch directories with YAML frontmatter</li>
+                <li><b>Default dual-write mode</b> &mdash; all users automatically get folder
+                    storage after upgrade without manual configuration</li>
+                <li><b>Performance</b> &mdash; replaced 3-second polling timer with VirtualFileManager
+                    listener for KB tree updates</li>
+                <li><b>Cross-platform Reveal</b> &mdash; Reveal in Finder/Explorer now works on
+                    macOS, Windows, and Linux</li>
+                <li><b>DnD safety</b> &mdash; drag-and-drop file moves now prompt for confirmation
+                    before overwriting existing files</li>
+                <li><b>Error handling</b> &mdash; silent exception swallowing replaced with proper
+                    logging; HTML-escaped error messages in UI</li>
+                <li><b>Selection restore</b> &mdash; KB tree selection is correctly preserved
+                    after refresh</li>
+            </ul>
+
+            <h3>0.98.0</h3>
+            <ul>
+                <li><b>Knowledge Base explorer</b> &mdash; browse your local Knowledge Base folder
+                    as a tree view in the JOLLI tool window, with C/P/N badges and readable titles.
+                    Double-click commit files to open the formatted summary viewer</li>
+                <li><b>Folder-based storage</b> &mdash; new dual-write mode stores summaries as
+                    human-readable Markdown files alongside hidden JSON data in a local folder
+                    (<code>~/Documents/jolli/{project}/</code>)</li>
+                <li><b>Auto-migration</b> &mdash; existing orphan branch data is automatically
+                    migrated to the Knowledge Base folder on plugin startup. Manual migration
+                    available via Settings</li>
+                <li><b>File operations</b> &mdash; right-click context menu for New Folder,
+                    New File, Import, Rename, Move, Delete. Drag and drop support for
+                    files and folders with metadata sync</li>
+                <li><b>Create &amp; Update PR</b> &mdash; automatically detects existing PRs
+                    and updates them instead of failing</li>
+                <li><b>Fix CommitsPanel after Enable</b> &mdash; resolve race condition where
+                    CommitsPanel showed &ldquo;disabled&rdquo; on empty branches after Enable</li>
+                <li><b>Fix panel refresh on branch switch</b> &mdash; add VCS listener and
+                    periodic polling for reliable branch detection</li>
+            </ul>
+
             <h3>0.97.9</h3>
             <ul>
                 <li><b>Privacy consent notice</b> &mdash; display a privacy notice with link to

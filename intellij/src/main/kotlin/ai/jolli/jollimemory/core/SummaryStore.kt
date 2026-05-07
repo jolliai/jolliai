@@ -8,11 +8,16 @@ import java.time.Instant
 /**
  * SummaryStore — Kotlin port of SummaryStore.ts
  *
- * Stores and retrieves commit summaries from the orphan branch
- * using git plumbing commands (hash-object, mktree, commit-tree, update-ref).
- * Never checks out the orphan branch.
+ * Stores and retrieves commit summaries via a StorageProvider.
+ * The default provider is OrphanBranchStorage (git plumbing on an orphan branch).
+ *
+ * GitOps is still needed for non-storage git operations (e.g. cat-file
+ * for tree hash extraction).
  */
-class SummaryStore(private val cwd: String, private val git: GitOps) {
+class SummaryStore(private val cwd: String, private val git: GitOps, private val storage: StorageProvider) {
+
+    /** Backward-compatible constructor: creates OrphanBranchStorage from GitOps. */
+    constructor(cwd: String, git: GitOps) : this(cwd, git, OrphanBranchStorage(git))
 
     private val log = JmLogger.create("SummaryStore")
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
@@ -25,7 +30,7 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
     // ── Read API ────────────────────────────────────────────────────────────
 
     fun loadIndex(): SummaryIndex? {
-        val json = git.readBranchFile(ORPHAN_BRANCH, INDEX_FILE) ?: return null
+        val json = storage.readFile(INDEX_FILE) ?: return null
         return try {
             gson.fromJson(json, SummaryIndex::class.java)
         } catch (e: Exception) {
@@ -35,7 +40,8 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
     }
 
     fun getSummary(commitHash: String): CommitSummary? {
-        val json = git.readBranchFile(ORPHAN_BRANCH, "summaries/$commitHash.json") ?: return null
+        val resolved = resolveAlias(commitHash)
+        val json = storage.readFile("summaries/$resolved.json") ?: return null
         return try {
             gson.fromJson(json, CommitSummary::class.java)
         } catch (e: Exception) {
@@ -53,12 +59,13 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
             .mapNotNull { getSummary(it.commitHash) }
     }
 
-    fun getSummaryCount(): Int = git.listBranchFiles(ORPHAN_BRANCH, "summaries/").size
+    fun getSummaryCount(): Int = storage.listFiles("summaries/").size
 
     fun findRootHash(commitHash: String): String? {
         val index = loadIndex() ?: return null
         val entryMap = index.entries.associateBy { it.commitHash }
-        var current = entryMap[commitHash] ?: return null
+        val resolved = index.commitAliases?.get(commitHash) ?: commitHash
+        var current = entryMap[resolved] ?: return null
         while (current.parentCommitHash != null) {
             current = entryMap[current.parentCommitHash] ?: return current.commitHash
         }
@@ -101,7 +108,7 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
 
         for (hash in unmatchedHashes) {
             if (hash in existingAliases) continue
-            // Get the tree hash for this commit
+            // Get the tree hash for this commit (reads from the actual git repo, not storage)
             val catFile = git.exec("cat-file", "-p", hash) ?: continue
             val match = Regex("^tree ([a-f0-9]+)").find(catFile) ?: continue
             val treeHash = match.groupValues[1]
@@ -115,10 +122,9 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
         }
 
         if (anyFound) {
-            // Update the index with new aliases
             val updated = index.copy(commitAliases = existingAliases)
             val files = listOf(FileWrite("index.json", gson.toJson(updated)))
-            writeFilesToBranch(files, "Update commit aliases")
+            storage.writeFiles(files, "Update commit aliases")
         }
 
         return anyFound
@@ -163,7 +169,7 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
             }
         }
 
-        writeFilesToBranch(files, "Add summary for ${summary.commitHash.take(8)}: ${summary.commitMessage.take(50)}")
+        storage.writeFiles(files, "Add summary for ${summary.commitHash.take(8)}: ${summary.commitMessage.take(50)}")
         log.info("Summary stored for commit %s", summary.commitHash.take(8))
     }
 
@@ -200,9 +206,9 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
 
     // ── Plan progress storage ─────────────────────────────────────────────
 
-    /** Reads a plan progress artifact from the orphan branch. */
+    /** Reads a plan progress artifact from storage. */
     fun readPlanProgress(slug: String): PlanProgressArtifact? {
-        val json = git.readBranchFile(ORPHAN_BRANCH, "plan-progress/$slug.json") ?: return null
+        val json = storage.readFile("plan-progress/$slug.json") ?: return null
         return try {
             gson.fromJson(json, PlanProgressArtifact::class.java)
         } catch (e: Exception) {
@@ -213,36 +219,36 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
 
     // ── Plan storage ─────────────────────────────────────────────────────
 
-    /** Writes plan files to the orphan branch in a single atomic commit. */
+    /** Writes plan files to storage in a single atomic commit. */
     fun storePlanFiles(files: List<FileWrite>, commitMessage: String) {
         if (files.isEmpty()) return
-        writeFilesToBranch(files, commitMessage)
+        storage.writeFiles(files, commitMessage)
         log.info("Stored %d plan file(s): %s", files.size, commitMessage)
     }
 
-    /** Reads a plan file from the orphan branch. */
+    /** Reads a plan file from storage. */
     fun readPlanFromBranch(slug: String): String? {
-        return git.readBranchFile(ORPHAN_BRANCH, "plans/$slug.md")
+        return storage.readFile("plans/$slug.md")
     }
 
-    /** Writes a plan file to the orphan branch. */
+    /** Writes a plan file to storage. */
     fun writePlanToBranch(slug: String, content: String, message: String) {
         val files = listOf(FileWrite("plans/$slug.md", content))
-        writeFilesToBranch(files, message)
+        storage.writeFiles(files, message)
     }
 
     // ── Transcript storage ──────────────────────────────────────────────
 
-    /** Lists commit hashes that have transcript files on the orphan branch. */
+    /** Lists commit hashes that have transcript files in storage. */
     fun getTranscriptHashes(): Set<String> {
-        return git.listBranchFiles(ORPHAN_BRANCH, "transcripts/")
+        return storage.listFiles("transcripts/")
             .map { it.removePrefix("transcripts/").removeSuffix(".json") }
             .toSet()
     }
 
     /** Reads a stored transcript for a commit hash. */
     fun readTranscript(commitHash: String): StoredTranscript? {
-        val json = git.readBranchFile(ORPHAN_BRANCH, "transcripts/$commitHash.json") ?: return null
+        val json = storage.readFile("transcripts/$commitHash.json") ?: return null
         return try {
             gson.fromJson(json, StoredTranscript::class.java)
         } catch (e: Exception) {
@@ -261,11 +267,11 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
             files.add(FileWrite("transcripts/$hash.json", "", delete = true))
         }
         if (files.isNotEmpty()) {
-            writeFilesToBranch(files, "Update transcripts")
+            storage.writeFiles(files, "Update transcripts")
         }
     }
 
-    // ── Git plumbing (matches Node.js GitOps.ts) ────────────────────────────
+    // ── Internal helpers ────────────────────────────────────────────────────
 
     private fun flattenSummaryTree(node: CommitSummary, parentHash: String?): List<SummaryIndexEntry> {
         val treeHash = git.exec("cat-file", "-p", node.commitHash)?.let { output ->
@@ -278,144 +284,5 @@ class SummaryStore(private val cwd: String, private val git: GitOps) {
             branch = node.branch, generatedAt = node.generatedAt,
         )
         return listOf(entry) + (node.children ?: emptyList()).flatMap { flattenSummaryTree(it, node.commitHash) }
-    }
-
-    /** Ensures the orphan branch exists using pure plumbing (no checkout). */
-    private fun ensureOrphanBranch() {
-        if (git.branchExists(ORPHAN_BRANCH)) return
-
-        log.info("Creating orphan branch '%s' using plumbing commands", ORPHAN_BRANCH)
-
-        // Step 1: Write initial index.json as a blob
-        val initialIndex = gson.toJson(SummaryIndex(version = 3, entries = emptyList()))
-        val blobHash = writeBlob(initialIndex) ?: throw RuntimeException("Failed to create blob")
-
-        // Step 2: Create a tree containing index.json
-        val treeInput = "100644 blob $blobHash\tindex.json\n"
-        val treeHash = git.execWithStdin("mktree", input = treeInput)
-            ?: throw RuntimeException("Failed to create tree")
-
-        // Step 3: Create orphan commit (no parents)
-        val commitHash = git.exec("commit-tree", treeHash, "-m", "Initialize JolliMemory summaries")
-            ?: throw RuntimeException("Failed to create commit")
-
-        // Step 4: Point the branch ref at the commit
-        git.exec("update-ref", "refs/heads/$ORPHAN_BRANCH", commitHash)
-            ?: throw RuntimeException("Failed to update ref")
-
-        log.info("Orphan branch '%s' created successfully", ORPHAN_BRANCH)
-    }
-
-    /** Writes content as a git blob, returns the hash. */
-    private fun writeBlob(content: String): String? {
-        return git.execWithStdin("hash-object", "-w", "--stdin", input = content)
-    }
-
-    /** Updates a tree by adding/replacing a file. Handles nested paths (e.g. "summaries/abc.json"). */
-    private fun updateTreeWithFile(currentTree: String, filePath: String, blobHash: String): String {
-        val parts = filePath.split("/")
-
-        if (parts.size == 1) {
-            return replaceInTree(currentTree, parts[0], "100644", "blob", blobHash)
-        }
-
-        // Nested: recurse into subdirectory
-        val dirName = parts[0]
-        val remainingPath = parts.drop(1).joinToString("/")
-
-        val lsResult = git.exec("ls-tree", currentTree, dirName)
-        val emptyTree = { git.execWithStdin("mktree", input = "")
-            ?: throw RuntimeException("Failed to create empty tree") }
-        val subTreeHash = if (!lsResult.isNullOrBlank()) {
-            val match = Regex("^(\\d+)\\s+tree\\s+([a-f0-9]+)\\t").find(lsResult)
-            match?.groupValues?.get(2) ?: emptyTree()
-        } else {
-            emptyTree()
-        }
-
-        val newSubTree = updateTreeWithFile(subTreeHash, remainingPath, blobHash)
-        return replaceInTree(currentTree, dirName, "040000", "tree", newSubTree)
-    }
-
-    /** Replaces or adds an entry in a tree object. */
-    private fun replaceInTree(treeHash: String, name: String, mode: String, type: String, objectHash: String): String {
-        val lsResult = git.exec("ls-tree", treeHash) ?: ""
-        val existingEntries = lsResult.lines()
-            .filter { it.isNotEmpty() }
-            .filter { line -> line.split("\t").getOrNull(1) != name }
-            .toMutableList()
-
-        existingEntries.add("$mode $type $objectHash\t$name")
-        existingEntries.sort()
-
-        val treeInput = existingEntries.joinToString("\n") + "\n"
-        return git.execWithStdin("mktree", input = treeInput)
-            ?: throw RuntimeException("Failed to create tree")
-    }
-
-    /** Removes a file from a tree object. Handles nested paths (e.g. "summaries/abc.json"). */
-    private fun removeFromTree(currentTree: String, filePath: String): String {
-        val parts = filePath.split("/")
-
-        if (parts.size == 1) {
-            // Remove the entry from this tree level
-            val lsResult = git.exec("ls-tree", currentTree) ?: ""
-            val remaining = lsResult.lines()
-                .filter { it.isNotEmpty() }
-                .filter { line -> line.split("\t").getOrNull(1) != parts[0] }
-            val treeInput = if (remaining.isEmpty()) "" else remaining.joinToString("\n") + "\n"
-            return git.execWithStdin("mktree", input = treeInput)
-                ?: throw RuntimeException("Failed to create tree")
-        }
-
-        // Nested: recurse into subdirectory
-        val dirName = parts[0]
-        val remainingPath = parts.drop(1).joinToString("/")
-
-        val lsResult = git.exec("ls-tree", currentTree, dirName)
-        if (lsResult.isNullOrBlank()) return currentTree // File doesn't exist, nothing to remove
-
-        val match = Regex("^(\\d+)\\s+tree\\s+([a-f0-9]+)\\t").find(lsResult)
-        val subTreeHash = match?.groupValues?.get(2) ?: return currentTree
-
-        val newSubTree = removeFromTree(subTreeHash, remainingPath)
-        return replaceInTree(currentTree, dirName, "040000", "tree", newSubTree)
-    }
-
-    /** Writes multiple files to the orphan branch in a single atomic commit. */
-    private fun writeFilesToBranch(files: List<FileWrite>, message: String) {
-        ensureOrphanBranch()
-
-        val parentCommit = git.exec("rev-parse", "refs/heads/$ORPHAN_BRANCH")
-            ?: throw RuntimeException("Failed to get branch tip")
-
-        val baseTree = git.exec("rev-parse", "$parentCommit^{tree}")
-            ?: throw RuntimeException("Failed to get tree")
-
-        // Accumulate tree updates (writes and deletes)
-        var currentTree = baseTree
-        var written = 0
-        var deleted = 0
-        for (file in files) {
-            if (file.delete) {
-                currentTree = removeFromTree(currentTree, file.path)
-                deleted++
-            } else {
-                val blobHash = writeBlob(file.content)
-                    ?: throw RuntimeException("Failed to write blob for ${file.path}")
-                currentTree = updateTreeWithFile(currentTree, file.path, blobHash)
-                written++
-            }
-        }
-
-        // Create commit
-        val newCommit = git.exec("commit-tree", currentTree, "-p", parentCommit, "-m", message)
-            ?: throw RuntimeException("Failed to create commit")
-
-        // Update ref
-        git.exec("update-ref", "refs/heads/$ORPHAN_BRANCH", newCommit)
-            ?: throw RuntimeException("Failed to update ref")
-
-        log.info("Updated branch '%s': %d written, %d deleted (commit: %s)", ORPHAN_BRANCH, written, deleted, newCommit.take(8))
     }
 }

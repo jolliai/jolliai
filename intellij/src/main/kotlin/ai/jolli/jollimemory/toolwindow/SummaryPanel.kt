@@ -4,6 +4,7 @@ import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.E2eTestScenario
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.StorageFactory
 import ai.jolli.jollimemory.core.StoredSession
 import ai.jolli.jollimemory.core.StoredTranscript
 import ai.jolli.jollimemory.core.Summarizer
@@ -78,7 +79,8 @@ class SummaryPanel(
         val service = project.getService(JolliMemoryService::class.java)
         cwd = service?.mainRepoRoot ?: project.basePath ?: ""
         val gitOps = service?.getGitOps()
-        store = if (gitOps != null) SummaryStore(cwd, gitOps) else SummaryStore(cwd, GitOps(cwd))
+        val git = gitOps ?: GitOps(cwd)
+        store = SummaryStore(cwd, git, StorageFactory.create(git, cwd))
         refreshTranscriptHashes()
         refreshPlanTranslateSet()
         add(createContent(), BorderLayout.CENTER)
@@ -620,7 +622,15 @@ class SummaryPanel(
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 PrService.pushBranch(cwd)
-                val prUrl = PrService.createPr(title, body, cwd)
+                // Check if PR already exists for this branch — update instead of create
+                val existingPr = PrService.findPrForBranch(cwd)
+                val prUrl: String
+                if (existingPr != null) {
+                    PrService.updatePr(existingPr.number, title, body, cwd)
+                    prUrl = existingPr.url
+                } else {
+                    prUrl = PrService.createPr(title, body, cwd)
+                }
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("prCreated", mapOf("url" to prUrl))
                     handleCheckPrStatus()
