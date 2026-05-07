@@ -3,13 +3,19 @@ package ai.jolli.jollimemory.services
 import ai.jolli.jollimemory.auth.JolliConfigStore
 import ai.jolli.jollimemory.auth.JolliUrlConfig
 import ai.jolli.jollimemory.core.JmLogger
-import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
+import com.google.gson.Gson
+import com.google.gson.JsonObject
 import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
 import com.sun.net.httpserver.HttpServer
 import java.net.InetSocketAddress
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.security.SecureRandom
+import java.time.Duration
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -117,30 +123,50 @@ object JolliAuthService {
                         sendHtml(exchange, html, 400)
                         onError(message)
                     } else {
-                        val token = params["token"]
-                        val space = params["space"]
-                        val jolliApiKey = params["jolli_api_key"]
+                        val code = params["code"]
+                        val legacyToken = params["token"]
 
-                        if (token.isNullOrBlank()) {
-                            val html = errorHtml("No token received from server.")
-                            sendHtml(exchange, html, 400)
-                            onError("No token received from server.")
-                        } else {
-                            val globalDir = SessionTracker.getGlobalConfigDir()
-                            val existing = SessionTracker.loadConfigFromDir(globalDir)
-                            SessionTracker.saveConfigToDir(existing.copy(
-                                authToken = token,
-                                jolliApiKey = if (!jolliApiKey.isNullOrBlank()) jolliApiKey else existing.jolliApiKey,
-                            ), globalDir)
-                            if (!space.isNullOrBlank()) {
-                                JolliConfigStore.saveSpace(space)
+                        val result: LoginResult = if (!code.isNullOrBlank()) {
+                            // JOLLI-1270 code-exchange (preferred)
+                            try {
+                                exchangeCode(jolliUrl, code)
+                            } catch (e: Exception) {
+                                val msg = e.message ?: "Code exchange failed"
+                                sendHtml(exchange, errorHtml(msg), 400)
+                                onError(msg)
+                                shutdown()
+                                return@createContext
                             }
-
-                            val html = successHtml()
-                            sendHtml(exchange, html, 200)
-                            notifyAuthListeners()
-                            onSuccess(LoginResult(token, space, jolliApiKey))
+                        } else if (!legacyToken.isNullOrBlank()) {
+                            // Legacy token-in-URL fallback for pre-1270 servers
+                            log.warn("Using legacy token-in-URL callback — server has not been upgraded to code-exchange (JOLLI-1270).")
+                            LoginResult(
+                                token = legacyToken,
+                                space = params["space"],
+                                jolliApiKey = params["jolli_api_key"],
+                            )
+                        } else {
+                            val msg = "No authorization code or token received from server."
+                            sendHtml(exchange, errorHtml(msg), 400)
+                            onError(msg)
+                            shutdown()
+                            return@createContext
                         }
+
+                        val globalDir = SessionTracker.getGlobalConfigDir()
+                        val existing = SessionTracker.loadConfigFromDir(globalDir)
+                        SessionTracker.saveConfigToDir(existing.copy(
+                            authToken = result.token,
+                            jolliApiKey = if (!result.jolliApiKey.isNullOrBlank()) result.jolliApiKey else existing.jolliApiKey,
+                        ), globalDir)
+                        if (!result.space.isNullOrBlank()) {
+                            JolliConfigStore.saveSpace(result.space)
+                        }
+
+                        val html = successHtml()
+                        sendHtml(exchange, html, 200)
+                        notifyAuthListeners()
+                        onSuccess(result)
                     }
                 } catch (e: Exception) {
                     log.warn("Callback error: ${e.message}")
@@ -198,11 +224,73 @@ object JolliAuthService {
         }
     }
 
+    /**
+     * Exchanges a single-use authorization code for credentials via POST to
+     * `/api/auth/cli-exchange`. Mirrors the CLI's `exchangeCliCode()`.
+     */
+    internal fun exchangeCode(jolliUrl: String, code: String): LoginResult {
+        val parsed = URI.create(jolliUrl)
+        val origin = "${parsed.scheme}://${parsed.authority}"
+        val tenantSlug = parsed.path.split('/').firstOrNull { it.isNotEmpty() }
+
+        val exchangeUrl = "$origin/api/auth/cli-exchange"
+        val requestBody = Gson().toJson(mapOf("code" to code))
+        val requestBuilder = HttpRequest.newBuilder()
+            .uri(URI.create(exchangeUrl))
+            .header("content-type", "application/json")
+            .timeout(Duration.ofSeconds(20))
+            .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+
+        if (tenantSlug != null) {
+            requestBuilder.header("x-tenant-slug", tenantSlug)
+        }
+
+        val response: HttpResponse<String>
+        try {
+            response = HttpClient.newHttpClient()
+                .send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+        } catch (e: Exception) {
+            throw RuntimeException("Couldn't reach Jolli to complete sign-in: ${e.message}")
+        }
+
+        if (response.statusCode() == 404) {
+            throw RuntimeException("Sign-in code expired or already used. Please try signing in again.")
+        }
+        if (response.statusCode() !in 200..299) {
+            throw RuntimeException("Sign-in failed (HTTP ${response.statusCode()}).")
+        }
+
+        val payload: JsonObject
+        try {
+            payload = Gson().fromJson(response.body(), JsonObject::class.java)
+        } catch (e: Exception) {
+            throw RuntimeException("Sign-in failed: server returned malformed response (${e.message}).")
+        }
+
+        val token = payload.get("token")?.takeIf { it.isJsonPrimitive }?.asString
+        if (token.isNullOrBlank()) {
+            throw RuntimeException("Sign-in failed: server response did not include a token.")
+        }
+
+        val jolliApiKey = payload.get("jolliApiKey")?.takeIf { it.isJsonPrimitive }?.asString
+        val space = payload.get("space")?.takeIf { it.isJsonPrimitive }?.asString
+
+        return LoginResult(token = token, space = space, jolliApiKey = jolliApiKey)
+    }
+
     internal fun getErrorMessage(code: String): String = when (code) {
         "access_denied" -> "Access was denied. Please try again."
         "invalid_request" -> "Invalid login request. Please try again."
         "server_error" -> "Server error during login. Please try again later."
         "temporarily_unavailable" -> "Service temporarily unavailable. Please try again later."
+        "oauth_failed" -> "OAuth authentication failed. Please try again."
+        "session_missing" -> "Session expired or missing. Please try again."
+        "invalid_provider" -> "Invalid authentication provider."
+        "auth_fetch_failed" -> "Failed to fetch user information from the authentication provider."
+        "no_verified_emails" -> "No verified email addresses found on your account."
+        "failed_to_get_token" -> "We couldn't retrieve your credentials. Please try signing in again."
+        "user_denied" -> "Sign-in was cancelled. You can try again from Settings."
+        "invalid_callback" -> "The sign-in callback was rejected by the server. Please try again."
         else -> "Login failed: $code"
     }
 
