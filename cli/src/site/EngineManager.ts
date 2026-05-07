@@ -108,12 +108,17 @@ export async function ensureEngine(): Promise<NpmRunResult> {
 		};
 		await writeFile(join(engineDir, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`, "utf-8");
 
-		// Run npm install
+		// Run npm install — on Windows, npm is a .cmd script that requires
+		// shell: true since Node 22.5+ (CVE-2024-27980). Pass the full command
+		// as a single string to avoid the DEP0190 warning about shell + args.
 		const { spawnSync } = await import("node:child_process");
-		const npm = process.platform === "win32" ? /* v8 ignore next */ "npm.cmd" : "npm";
-		const result = spawnSync(npm, ["install"], {
+		const isWin = process.platform === "win32";
+		const shellOpts = isWin ? /* v8 ignore next */ ({ shell: true } as const) : {};
+		const [cmd, args] = isWin ? /* v8 ignore next */ ["npm install", []] : ["npm", ["install"]];
+		const result = spawnSync(cmd, args, {
 			cwd: engineDir,
 			stdio: "pipe",
+			...shellOpts,
 		});
 
 		const stdout = result.stdout ? result.stdout.toString() : "";

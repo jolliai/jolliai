@@ -219,7 +219,7 @@ export class MetadataManager {
 				try {
 					const content = readFileSync(fullPath, "utf-8");
 					const fp = MetadataManager.sha256(content);
-					map.set(fp, relative(kbRoot, fullPath));
+					map.set(fp, relative(kbRoot, fullPath).replace(/\\/g, "/"));
 				} catch {
 					/* ignore */
 				}

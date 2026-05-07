@@ -12,7 +12,7 @@
  *   - Defaults source-root to process.cwd() when not provided
  */
 
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getBuildDir } from "./StartCommand.js";
@@ -224,7 +224,9 @@ describe.each([
 		const program = await makeProgram();
 		await program.parseAsync([cmd, "/nonexistent"], { from: "user" });
 
-		expect(consoleErrorSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n")).toContain("/nonexistent");
+		expect(consoleErrorSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n")).toContain(
+			resolve("/nonexistent"),
+		);
 		expect(process.exitCode).toBe(1);
 	});
 
@@ -314,7 +316,7 @@ describe.each([
 		await program.parseAsync([cmd, "/my-docs"], { from: "user" });
 
 		const [, calledContentDir] = mockMirrorContent.mock.calls[0] as [string, string];
-		expect(calledContentDir).toBe(`${getBuildDir(resolve("/my-docs"))}/content`);
+		expect(calledContentDir).toBe(join(getBuildDir(resolve("/my-docs")), "content"));
 	});
 });
 

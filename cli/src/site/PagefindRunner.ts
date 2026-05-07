@@ -12,8 +12,13 @@
 import { spawnSync } from "node:child_process";
 import type { PagefindResult } from "./Types.js";
 
-/** On Windows, npx must be invoked as npx.cmd. */
-const NPX = process.platform === "win32" ? /* v8 ignore next */ "npx.cmd" : "npx";
+/**
+ * On Windows, npx is a .cmd script that requires shell: true since
+ * Node 22.5+ (CVE-2024-27980). Command + args are joined into a single
+ * string to avoid the DEP0190 warning about shell + separate args.
+ */
+const IS_WIN = process.platform === "win32";
+const SHELL_OPTS = IS_WIN ? /* v8 ignore next */ ({ shell: true } as const) : {};
 
 export type { PagefindResult };
 
@@ -25,9 +30,12 @@ export type { PagefindResult };
  * on exit code 0, or `{ success: false, output }` on any non-zero exit code.
  */
 export function runPagefind(buildDir: string): PagefindResult {
-	const result = spawnSync(NPX, ["pagefind", "--site", "out", "--output-path", "out/_pagefind"], {
+	const rawArgs = ["pagefind", "--site", "out", "--output-path", "out/_pagefind"];
+	const [cmd, args] = IS_WIN ? /* v8 ignore next */ [`npx ${rawArgs.join(" ")}`, []] : ["npx", rawArgs];
+	const result = spawnSync(cmd, args, {
 		cwd: buildDir,
 		stdio: "pipe",
+		...SHELL_OPTS,
 	});
 
 	const stdout = result.stdout ? result.stdout.toString() : "";

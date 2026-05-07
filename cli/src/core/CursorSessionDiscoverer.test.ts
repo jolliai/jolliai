@@ -1,8 +1,26 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+/**
+ * Converts a POSIX-style absolute path to a file:// URI that is valid on the
+ * current host. On Windows, `fileURLToPath` rejects URIs without a drive
+ * letter, so we go through `pathToFileURL(resolve(...))` to get a proper URI.
+ */
+function toFileUri(posixPath: string): string {
+	return pathToFileURL(resolve(posixPath)).href;
+}
+
+/**
+ * Returns the native absolute path for a POSIX-style absolute path.
+ * On Windows `/Users/flyer/work` becomes e.g. `D:\Users\flyer\work`.
+ */
+function toNativePath(posixPath: string): string {
+	return resolve(posixPath);
+}
 
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -109,7 +127,7 @@ describe("discoverCursorSessions", () => {
 
 	it("returns [] when projectDir does not match any workspace", async () => {
 		await setupCursorHome(tmpHome, { globalComposers: [], workspaces: [] });
-		const sessions = await discoverCursorSessions("/Users/flyer/jolli/code/somewhere");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/jolli/code/somewhere"));
 		expect(sessions).toEqual([]);
 	});
 
@@ -119,13 +137,13 @@ describe("discoverCursorSessions", () => {
 			globalComposers: [{ composerId: "anchor-1", createdAtMs: ancientTs, lastUpdatedAtMs: ancientTs }],
 			workspaces: [
 				{
-					folder: "file:///Users/flyer/work/proj-a",
+					folder: toFileUri("/Users/flyer/work/proj-a"),
 					pointers: { lastFocusedComposerIds: ["anchor-1"] },
 				},
 			],
 		});
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toHaveLength(1);
 		expect(sessions[0]).toMatchObject({ sessionId: "anchor-1", source: "cursor" });
 		expect(sessions[0].transcriptPath).toContain("#anchor-1");
@@ -142,13 +160,13 @@ describe("discoverCursorSessions", () => {
 			],
 			workspaces: [
 				{
-					folder: "file:///Users/flyer/work/proj-a",
+					folder: toFileUri("/Users/flyer/work/proj-a"),
 					pointers: { lastFocusedComposerIds: ["anchor-1"] },
 				},
 			],
 		});
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		const ids = sessions.map((s) => s.sessionId).sort();
 		expect(ids).toEqual(["anchor-1", "fresh-2"]);
 	});
@@ -158,13 +176,13 @@ describe("discoverCursorSessions", () => {
 			globalComposers: [{ composerId: "c-1", createdAtMs: Date.now(), lastUpdatedAtMs: Date.now() }],
 			workspaces: [
 				{
-					folder: "file:///Users/Flyer/Code%20Folder/Proj",
+					folder: toFileUri("/Users/Flyer/Code Folder/Proj"),
 					pointers: { lastFocusedComposerIds: ["c-1"] },
 				},
 			],
 		});
 
-		const sessions = await discoverCursorSessions("/users/flyer/code folder/proj");
+		const sessions = await discoverCursorSessions(toNativePath("/users/flyer/code folder/proj"));
 		expect(sessions).toHaveLength(1);
 	});
 
@@ -174,13 +192,13 @@ describe("discoverCursorSessions", () => {
 			globalComposers: [{ composerId: "stale-1", createdAtMs: stale, lastUpdatedAtMs: stale }],
 			workspaces: [
 				{
-					folder: "file:///Users/flyer/work/proj-a",
+					folder: toFileUri("/Users/flyer/work/proj-a"),
 					pointers: null,
 				},
 			],
 		});
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toEqual([]);
 	});
 
@@ -191,7 +209,7 @@ describe("discoverCursorSessions", () => {
 		await mkdir(join(userDir, "workspaceStorage", "ws-00000000"), { recursive: true });
 		await writeFile(
 			join(userDir, "workspaceStorage", "ws-00000000", "workspace.json"),
-			JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
 		);
 
 		// Workspace DB with anchor pointing to good-1
@@ -216,7 +234,7 @@ describe("discoverCursorSessions", () => {
 			.run("composerData:bad-2", "this is not json");
 		globalDb.close();
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions.map((s) => s.sessionId)).toEqual(["good-1"]);
 	});
 
@@ -226,7 +244,7 @@ describe("discoverCursorSessions", () => {
 		await mkdir(join(userDir, "workspaceStorage", "ws-00000000"), { recursive: true });
 		await writeFile(
 			join(userDir, "workspaceStorage", "ws-00000000", "workspace.json"),
-			JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
 		);
 
 		const wsDbPath = join(userDir, "workspaceStorage", "ws-00000000", "state.vscdb");
@@ -247,7 +265,7 @@ describe("discoverCursorSessions", () => {
 			.run("composerData:c-2", JSON.stringify({ composerId: 12345, lastUpdatedAt: Date.now() }));
 		globalDb.close();
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toEqual([]);
 	});
 
@@ -257,7 +275,7 @@ describe("discoverCursorSessions", () => {
 		await mkdir(join(userDir, "workspaceStorage", "ws-00000000"), { recursive: true });
 		await writeFile(
 			join(userDir, "workspaceStorage", "ws-00000000", "workspace.json"),
-			JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
 		);
 
 		const wsDbPath = join(userDir, "workspaceStorage", "ws-00000000", "state.vscdb");
@@ -282,7 +300,7 @@ describe("discoverCursorSessions", () => {
 			.run("composerData:other-bad", JSON.stringify({ composerId: "other-bad", lastUpdatedAt: null }));
 		globalDb.close();
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toEqual([]);
 	});
 
@@ -302,7 +320,7 @@ describe("discoverCursorSessions", () => {
 		);
 		createCursorWorkspaceDb(join(wsDir, "state.vscdb"), { lastFocusedComposerIds: ["c-1"] });
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toEqual([]);
 	});
 
@@ -315,7 +333,10 @@ describe("discoverCursorSessions", () => {
 
 		const wsDir = join(userDir, "workspaceStorage", "ws-00000000");
 		await mkdir(wsDir, { recursive: true });
-		await writeFile(join(wsDir, "workspace.json"), JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }));
+		await writeFile(
+			join(wsDir, "workspace.json"),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
+		);
 
 		// Workspace DB has the composer.composerData key but with garbage JSON
 		const wsDb = new DatabaseSync(join(wsDir, "state.vscdb"));
@@ -328,7 +349,7 @@ describe("discoverCursorSessions", () => {
 
 		// No anchors should be extracted; the stale composer is outside the time window;
 		// overall result is empty without the read crashing.
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toEqual([]);
 	});
 
@@ -338,7 +359,7 @@ describe("discoverCursorSessions", () => {
 			globalComposers: [{ composerId: "selected-1", createdAtMs: ancientTs, lastUpdatedAtMs: ancientTs }],
 			workspaces: [
 				{
-					folder: "file:///Users/flyer/work/proj-a",
+					folder: toFileUri("/Users/flyer/work/proj-a"),
 					pointers: null, // creates the DB with tables but no composer.composerData row
 				},
 			],
@@ -360,7 +381,7 @@ describe("discoverCursorSessions", () => {
 		);
 		wsDb.close();
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toHaveLength(1);
 		expect(sessions[0].sessionId).toBe("selected-1");
 	});
@@ -390,11 +411,11 @@ describe("discoverCursorSessions", () => {
 		await mkdir(goodWsDir, { recursive: true });
 		await writeFile(
 			join(goodWsDir, "workspace.json"),
-			JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
 		);
 		createCursorWorkspaceDb(join(goodWsDir, "state.vscdb"), { lastFocusedComposerIds: ["c-1"] });
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toHaveLength(1);
 		expect(sessions[0].sessionId).toBe("c-1");
 	});
@@ -412,10 +433,13 @@ describe("discoverCursorSessions", () => {
 
 		const wsDir = join(userDir, "workspaceStorage", "ws-00000000");
 		await mkdir(wsDir, { recursive: true });
-		await writeFile(join(wsDir, "workspace.json"), JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }));
+		await writeFile(
+			join(wsDir, "workspace.json"),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
+		);
 		// Intentionally do NOT create wsDir/state.vscdb
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions.map((s) => s.sessionId)).toEqual(["fresh-1"]);
 	});
 
@@ -429,9 +453,12 @@ describe("discoverCursorSessions", () => {
 
 		const wsDir = join(userDir, "workspaceStorage", "ws-00000000");
 		await mkdir(wsDir, { recursive: true });
-		await writeFile(join(wsDir, "workspace.json"), JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }));
+		await writeFile(
+			join(wsDir, "workspace.json"),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
+		);
 
-		const result = await scanCursorSessions("/Users/flyer/work/proj-a");
+		const result = await scanCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(result).toEqual({ sessions: [] });
 	});
 
@@ -456,10 +483,10 @@ describe("discoverCursorSessions", () => {
 		// ws-2: good
 		const ws2 = join(userDir, "workspaceStorage", "ws-00000002");
 		await mkdir(ws2, { recursive: true });
-		await writeFile(join(ws2, "workspace.json"), JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }));
+		await writeFile(join(ws2, "workspace.json"), JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }));
 		createCursorWorkspaceDb(join(ws2, "state.vscdb"), { lastFocusedComposerIds: ["c-1"] });
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions.map((s) => s.sessionId)).toEqual(["c-1"]);
 	});
 
@@ -478,7 +505,7 @@ describe("discoverCursorSessions", () => {
 		// folder is a number, not a string
 		await writeFile(join(wsDir, "workspace.json"), JSON.stringify({ folder: 12345 }));
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toEqual([]);
 	});
 
@@ -495,16 +522,19 @@ describe("discoverCursorSessions", () => {
 		// Non-matching workspace
 		const ws0 = join(userDir, "workspaceStorage", "ws-00000000");
 		await mkdir(ws0, { recursive: true });
-		await writeFile(join(ws0, "workspace.json"), JSON.stringify({ folder: "file:///Users/flyer/work/other-proj" }));
+		await writeFile(
+			join(ws0, "workspace.json"),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/other-proj") }),
+		);
 		createCursorWorkspaceDb(join(ws0, "state.vscdb"), null);
 
 		// Matching workspace
 		const ws1 = join(userDir, "workspaceStorage", "ws-00000001");
 		await mkdir(ws1, { recursive: true });
-		await writeFile(join(ws1, "workspace.json"), JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }));
+		await writeFile(join(ws1, "workspace.json"), JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }));
 		createCursorWorkspaceDb(join(ws1, "state.vscdb"), { lastFocusedComposerIds: ["c-1"] });
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions.map((s) => s.sessionId)).toEqual(["c-1"]);
 	});
 
@@ -530,10 +560,13 @@ describe("discoverCursorSessions", () => {
 
 		const wsDir = join(userDir, "workspaceStorage", "ws-00000000");
 		await mkdir(wsDir, { recursive: true });
-		await writeFile(join(wsDir, "workspace.json"), JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }));
+		await writeFile(
+			join(wsDir, "workspace.json"),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
+		);
 		createCursorWorkspaceDb(join(wsDir, "state.vscdb"), null);
 
-		const sessions = await discoverCursorSessions("/Users/flyer/work/proj-a");
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions.map((s) => s.sessionId)).toEqual(["dup-1"]);
 	});
 
@@ -557,13 +590,13 @@ describe("discoverCursorSessions", () => {
 			await mkdir(wsDir, { recursive: true });
 			await writeFile(
 				join(wsDir, "workspace.json"),
-				JSON.stringify({ folder: "file:///Users/Flyer/Code%20Folder/Proj" }),
+				JSON.stringify({ folder: toFileUri("/Users/Flyer/Code Folder/Proj") }),
 			);
 			createCursorWorkspaceDb(join(wsDir, "state.vscdb"), { lastFocusedComposerIds: ["c-1"] });
 
 			// Lowercased target should match the original-cased stored path
 			// because the win32 normalize branch lowercases both sides.
-			const sessions = await discoverCursorSessions("/users/flyer/code folder/proj");
+			const sessions = await discoverCursorSessions(toNativePath("/users/flyer/code folder/proj"));
 			expect(sessions).toHaveLength(1);
 		} finally {
 			if (prevAppData === undefined) delete process.env.APPDATA;
@@ -582,16 +615,16 @@ describe("discoverCursorSessions", () => {
 		]);
 		const wsDir = join(userDir, "workspaceStorage", "ws-00000000");
 		await mkdir(wsDir, { recursive: true });
-		await writeFile(join(wsDir, "workspace.json"), JSON.stringify({ folder: "file:///home/flyer/Work/Proj" }));
+		await writeFile(join(wsDir, "workspace.json"), JSON.stringify({ folder: toFileUri("/home/flyer/Work/Proj") }));
 		createCursorWorkspaceDb(join(wsDir, "state.vscdb"), { lastFocusedComposerIds: ["c-1"] });
 
 		// Lowercased target must NOT match the original-cased stored path on linux.
-		const sessions = await discoverCursorSessions("/home/flyer/work/proj");
+		const sessions = await discoverCursorSessions(toNativePath("/home/flyer/work/proj"));
 		expect(sessions).toEqual([]);
 
 		// Same-case target DOES match — confirms the linux branch was reached
 		// rather than the lookup short-circuiting on a missing workspace dir.
-		const sessions2 = await discoverCursorSessions("/home/flyer/Work/Proj");
+		const sessions2 = await discoverCursorSessions(toNativePath("/home/flyer/Work/Proj"));
 		expect(sessions2).toHaveLength(1);
 	});
 
@@ -602,10 +635,13 @@ describe("discoverCursorSessions", () => {
 
 		const wsDir = join(userDir, "workspaceStorage", "ws-00000000");
 		await mkdir(wsDir, { recursive: true });
-		await writeFile(join(wsDir, "workspace.json"), JSON.stringify({ folder: "file:///Users/flyer/work/proj-a" }));
+		await writeFile(
+			join(wsDir, "workspace.json"),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
+		);
 		await writeFile(join(wsDir, "state.vscdb"), "garbage too");
 
-		const result = await scanCursorSessions("/Users/flyer/work/proj-a");
+		const result = await scanCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(result.sessions).toEqual([]);
 		expect(result.error).toBeDefined();
 		expect(["corrupt", "permission", "unknown"]).toContain(result.error?.kind);

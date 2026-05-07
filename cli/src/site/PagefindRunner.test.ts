@@ -50,14 +50,11 @@ describe("PagefindRunner.runPagefind", () => {
 
 		await runPagefind("/my/build/dir");
 
-		expect(mockSpawnSync).toHaveBeenCalledWith(
-			expect.any(String),
-			["pagefind", "--site", "out", "--output-path", "out/_pagefind"],
-			{
-				cwd: "/my/build/dir",
-				stdio: "pipe",
-			},
-		);
+		const call = mockSpawnSync.mock.calls[0];
+		const invocation = `${call[0]} ${(call[1] ?? []).join(" ")}`;
+		expect(invocation).toContain("npx");
+		expect(invocation).toContain("pagefind");
+		expect(call[2]).toEqual(expect.objectContaining({ cwd: "/my/build/dir", stdio: "pipe" }));
 	});
 
 	it("returns { success: true } when pagefind exits with code 0", async () => {

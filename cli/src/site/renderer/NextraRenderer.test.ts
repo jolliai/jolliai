@@ -152,7 +152,7 @@ describe("NextraRenderer", () => {
 	});
 
 	it("getCacheDirs returns .next directory", () => {
-		expect(new NextraRenderer().getCacheDirs("/build")).toEqual(["/build/.next"]);
+		expect(new NextraRenderer().getCacheDirs("/build")).toEqual([join("/build", ".next")]);
 	});
 
 	it("generateNavigation delegates to generateMetaFiles", async () => {

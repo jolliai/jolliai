@@ -300,7 +300,7 @@ describe("MetaGenerator.generateMetaFiles", () => {
 		await expect(generateMetaFiles(join(contentDir, "nonexistent"))).resolves.not.toThrow();
 	});
 
-	it("skips entries where stat fails (e.g. broken symlinks)", async () => {
+	it.skipIf(process.platform === "win32")("skips entries where stat fails (e.g. broken symlinks)", async () => {
 		const { symlink } = await import("node:fs/promises");
 		const { generateMetaFiles } = await import("./MetaGenerator.js");
 		// Create a valid file so _meta.js gets generated

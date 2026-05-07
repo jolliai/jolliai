@@ -12,6 +12,7 @@
  *   - errors are returned (not thrown) on non-zero exit codes
  */
 
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Mocks ────────────────────────────────────────────────────────────────────
@@ -105,7 +106,7 @@ describe("NpmRunner.needsInstall", () => {
 
 		needsInstall("/my/build/dir");
 
-		expect(mockExistsSync).toHaveBeenCalledWith("/my/build/dir/node_modules");
+		expect(mockExistsSync).toHaveBeenCalledWith(join("/my/build/dir", "node_modules"));
 	});
 });
 
@@ -246,10 +247,13 @@ describe("NpmRunner.runNpmBuild", () => {
 
 		await runNpmBuild("/my/build/dir");
 
-		expect(mockSpawnSync).toHaveBeenCalledWith(expect.any(String), ["run", "build"], {
-			cwd: "/my/build/dir",
-			stdio: "pipe",
-		});
+		const call = mockSpawnSync.mock.calls[0];
+		// On Windows: single command string "npm run build" with empty args.
+		// On POSIX: "npm" with ["run", "build"]. Join both forms before asserting.
+		const invocation = `${call[0]} ${(call[1] ?? []).join(" ")}`;
+		expect(invocation).toContain("npm");
+		expect(invocation).toContain("build");
+		expect(call[2]).toEqual(expect.objectContaining({ cwd: "/my/build/dir", stdio: "pipe" }));
 	});
 
 	it("handles null stdout and stderr gracefully", async () => {
@@ -360,9 +364,10 @@ describe("NpmRunner.runNpmDev", () => {
 		child.emit("close", 0);
 		await promise;
 
-		expect(mockSpawn).toHaveBeenCalledWith(expect.any(String), ["run", "dev"], {
-			cwd: "/my/build/dir",
-			stdio: "pipe",
-		});
+		const call = mockSpawn.mock.calls[0];
+		const invocation = `${call[0]} ${(call[1] ?? []).join(" ")}`;
+		expect(invocation).toContain("npm");
+		expect(invocation).toContain("dev");
+		expect(call[2]).toEqual(expect.objectContaining({ cwd: "/my/build/dir", stdio: "pipe" }));
 	});
 });

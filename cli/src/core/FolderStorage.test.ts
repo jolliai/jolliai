@@ -621,7 +621,7 @@ describe("FolderStorage", () => {
 		// strip write permission on the parent directory so unlink raises EACCES
 		// while the rest of the storage write path still succeeds (the new MD
 		// goes into a different branch directory).
-		it("warns and keeps the entry when unlinkSync fails", async () => {
+		it.skipIf(process.platform === "win32")("warns and keeps the entry when unlinkSync fails", async () => {
 			const oldJson = summaryJson("old1234567890abcd", "Old");
 			await storage.writeFiles([{ path: "summaries/old1234567890abcd.json", content: oldJson }], "old");
 

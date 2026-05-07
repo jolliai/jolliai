@@ -121,9 +121,8 @@ function computeRelative(from: string, to: string): string {
  * Uses forward slashes for matching regardless of platform.
  */
 export function applyPathMapping(relPath: string, pathMappings?: PathMappings): string {
-	if (!pathMappings) return relPath;
-
 	const normalized = relPath.replace(/\\/g, "/");
+	if (!pathMappings) return normalized;
 
 	for (const [source, target] of Object.entries(pathMappings)) {
 		if (normalized === source || normalized.startsWith(`${source}/`)) {
@@ -131,7 +130,7 @@ export function applyPathMapping(relPath: string, pathMappings?: PathMappings): 
 		}
 	}
 
-	return relPath;
+	return normalized;
 }
 
 // ─── classifyFile ─────────────────────────────────────────────────────────────
@@ -536,10 +535,10 @@ async function ensureIndexPage(contentDir: string, result: MirrorResult): Promis
 			if (/^slug:\s*\/\s*$/m.test(content)) {
 				await rename(join(contentDir, relPath), join(contentDir, "index.md"));
 				const oldKey = relPath.replace(/\.(md|mdx)$/, "");
-				// Replace the original entry with index.md
+				// Replace the original entry with index.md. relPath is always
+				// in markdownFiles because walkDir pushed it before this runs.
 				const idx = result.markdownFiles.indexOf(relPath);
-				if (idx !== -1) result.markdownFiles[idx] = "index.md";
-				else result.markdownFiles.push("index.md");
+				result.markdownFiles[idx] = "index.md";
 				return oldKey;
 			}
 		} catch {}
@@ -684,9 +683,10 @@ async function processFile(
 			await copyFile(fullPath, destPath);
 			break;
 		}
+		/* v8 ignore next 5 -- unreachable: OpenAPI files are handled in the early-return branch above. */
 		case "openapi": {
-			// Unreachable from processFile — OpenAPI files are handled in the
-			// early-return branch above so we can cache the parsed AST.
+			// classifyFile() called without content for non-JSON/YAML extensions
+			// returns "ignored", never "openapi", so this case can't be reached.
 			break;
 		}
 		case "ignored": {
@@ -700,8 +700,7 @@ async function processFile(
 
 /** Ensures the parent directory of `filePath` exists. */
 async function ensureDir(filePath: string): Promise<void> {
-	const dir = dirname(filePath);
-	if (dir) {
-		await mkdir(dir, { recursive: true });
-	}
+	// `dirname()` always returns a non-empty string ("." for bare filenames),
+	// so no empty-dir guard is needed.
+	await mkdir(dirname(filePath), { recursive: true });
 }
