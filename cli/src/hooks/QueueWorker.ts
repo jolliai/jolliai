@@ -22,6 +22,9 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
+import { discoverCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
+import { readCopilotChatTranscript } from "../core/CopilotChatTranscriptReader.js";
 import { isCopilotInstalled } from "../core/CopilotDetector.js";
 import { discoverCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
 import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
@@ -1449,6 +1452,16 @@ async function loadSessionTranscripts(
 		}
 	}
 
+	// Discover Copilot Chat sessions (on-demand JSONL scan in vscode workspaceStorage).
+	// Shares copilotEnabled with the CLI source (one user-facing toggle for "GitHub Copilot").
+	if (config.copilotEnabled !== false && (await isCopilotChatInstalled())) {
+		const chatSessions = await discoverCopilotChatSessions(cwd);
+		if (chatSessions.length > 0) {
+			allSessions = [...allSessions, ...chatSessions];
+			log.info("Discovered %d Copilot Chat session(s)", chatSessions.length);
+		}
+	}
+
 	if (allSessions.length === 0) {
 		log.info("No active sessions found — will infer topics from diff if available");
 	}
@@ -1512,6 +1525,13 @@ async function readAllTranscripts(
 				result = await readCopilotTranscript(session.transcriptPath, cursor, beforeTimestamp);
 			} catch (error: unknown) {
 				log.error("Skipping Copilot session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
+		} else if (source === "copilot-chat") {
+			try {
+				result = await readCopilotChatTranscript(session.transcriptPath, cursor ?? undefined, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Copilot Chat session %s: %s", session.sessionId, (error as Error).message);
 				continue;
 			}
 		} else {

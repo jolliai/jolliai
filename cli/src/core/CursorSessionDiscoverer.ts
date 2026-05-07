@@ -33,14 +33,13 @@
  *   and transcript-reading code works uniformly across SQLite-backed sources.
  */
 
-import { readdir, readFile, stat } from "node:fs/promises";
-import { platform } from "node:os";
+import { stat } from "node:fs/promises";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
-import { getCursorGlobalDbPath, getCursorWorkspaceStorageDir } from "./CursorDetector.js";
+import { getCursorGlobalDbPath } from "./CursorDetector.js";
 import { classifyScanError, type SqliteScanError, withSqliteDb } from "./SqliteHelpers.js";
+import { findVscodeWorkspaceHash, getVscodeWorkspaceStorageDir } from "./VscodeWorkspaceLocator.js";
 
 const log = createLogger("CursorDiscoverer");
 
@@ -189,57 +188,12 @@ export async function discoverCursorSessions(projectDir: string): Promise<Readon
 }
 
 /**
- * Scans the Cursor workspaceStorage directory for a workspace whose `folder`
- * URI resolves to projectDir. Returns the workspace hash (directory name) on
- * match, or null if no match is found.
- *
- * workspace.json contains a `folder` property that is a `file://` URI. We
- * decode it with fileURLToPath so percent-encoding and platform casing are
- * handled correctly.
+ * Thin wrapper over the shared VscodeWorkspaceLocator. Cursor reuses VS Code's
+ * workspaceStorage layout, so workspace lookup is delegated to the shared
+ * implementation with `flavor: "Cursor"`.
  */
 async function findCursorWorkspaceHash(projectDir: string): Promise<string | null> {
-	const wsStorageDir = getCursorWorkspaceStorageDir();
-
-	let entries: string[];
-	try {
-		entries = await readdir(wsStorageDir);
-	} catch {
-		log.debug("Cursor workspaceStorage not readable at %s", wsStorageDir);
-		return null;
-	}
-
-	const target = normalizePathForMatch(projectDir);
-
-	for (const entry of entries) {
-		const wsJsonPath = join(wsStorageDir, entry, "workspace.json");
-		let folderUri: string | undefined;
-		try {
-			const raw = await readFile(wsJsonPath, "utf8");
-			const parsed = JSON.parse(raw) as Record<string, unknown>;
-			folderUri = typeof parsed.folder === "string" ? parsed.folder : undefined;
-		} catch {
-			// Skip entries without a readable workspace.json
-			continue;
-		}
-
-		if (!folderUri || !folderUri.startsWith("file://")) {
-			continue;
-		}
-
-		let folderPath: string;
-		try {
-			folderPath = fileURLToPath(folderUri);
-		} catch {
-			log.warn("Cursor workspace %s has unparseable folder URI: %s", entry, folderUri);
-			continue;
-		}
-
-		if (normalizePathForMatch(folderPath) === target) {
-			return entry;
-		}
-	}
-
-	return null;
+	return findVscodeWorkspaceHash("Cursor", projectDir);
 }
 
 /**
@@ -250,7 +204,7 @@ async function findCursorWorkspaceHash(projectDir: string): Promise<string | nul
  * abort the whole scan; we still proceed with time-window-only results.
  */
 async function readCursorAnchorComposerIds(wsHash: string): Promise<ReadonlyArray<string>> {
-	const wsStorageDir = getCursorWorkspaceStorageDir();
+	const wsStorageDir = getVscodeWorkspaceStorageDir("Cursor");
 	const wsDbPath = join(wsStorageDir, wsHash, "state.vscdb");
 
 	try {
@@ -293,28 +247,4 @@ async function readCursorAnchorComposerIds(wsHash: string): Promise<ReadonlyArra
 		log.warn("Failed to read Cursor workspace anchor IDs from %s: %s", wsDbPath, (error as Error).message);
 		return [];
 	}
-}
-
-/**
- * Normalises a filesystem path for workspace matching.
- * - Strips trailing slashes.
- * - Lowercases on case-insensitive platforms (darwin, win32) so that Cursor's
- *   stored path and the projectDir passed by callers compare correctly even
- *   when their casing differs.
- */
-function normalizePathForMatch(p: string): string {
-	// Normalize backslashes to forward slashes so Windows paths from
-	// fileURLToPath (which returns `\`-separated paths) compare correctly
-	// against caller-supplied forward-slash paths.
-	const fwd = p.replace(/\\/g, "/");
-	// Linear-time trailing-slash strip. Equivalent to /\/+$/ but expressed as a
-	// loop so CodeQL's js/polynomial-redos heuristic doesn't flag the regex
-	// when this function receives paths read from on-disk JSON.
-	let end = fwd.length;
-	while (end > 0 && fwd[end - 1] === "/") {
-		end--;
-	}
-	const trimmed = fwd.slice(0, end);
-	const os = platform();
-	return os === "darwin" || os === "win32" ? trimmed.toLowerCase() : trimmed;
 }

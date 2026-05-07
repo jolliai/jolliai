@@ -170,7 +170,7 @@ export function filterSessionsByEnabledIntegrations(
 		filtered = filtered.filter((s) => s.source !== "cursor");
 	}
 	if (config.copilotEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== "copilot");
+		filtered = filtered.filter((s) => s.source !== "copilot" && s.source !== "copilot-chat");
 	}
 	return filtered;
 }

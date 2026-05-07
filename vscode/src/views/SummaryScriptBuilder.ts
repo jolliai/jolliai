@@ -1134,6 +1134,7 @@ ${buildPrMessageScript()}
     if (source === 'opencode') return 'OpenCode';
     if (source === 'cursor') return 'Cursor';
     if (source === 'copilot') return 'Copilot';
+    if (source === 'copilot-chat') return 'Copilot Chat';
     return 'Claude';
   }
 
@@ -1559,7 +1560,7 @@ ${buildPrMessageScript()}
       if (conversationsStats) {
         var sessionCounts = msg.sessionCounts || {};
         var parts = [];
-        var sourceOrder = ['claude', 'codex', 'gemini', 'opencode', 'cursor', 'copilot'];
+        var sourceOrder = ['claude', 'codex', 'gemini', 'opencode', 'cursor', 'copilot', 'copilot-chat'];
         for (var i = 0; i < sourceOrder.length; i++) {
           var source = sourceOrder[i];
           var count = sessionCounts[source] || 0;

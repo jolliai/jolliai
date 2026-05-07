@@ -72,6 +72,18 @@ vi.mock("../core/CopilotSessionDiscoverer.js", () => ({
 	discoverCopilotSessions: vi.fn().mockResolvedValue([]),
 }));
 
+// Mock CopilotChatDetector for status/install checks
+vi.mock("../core/CopilotChatDetector.js", () => ({
+	isCopilotChatInstalled: vi.fn().mockResolvedValue(false),
+	getCopilotChatStorageDir: vi.fn().mockReturnValue("/fake/Code/User/globalStorage/github.copilot-chat"),
+}));
+
+// Mock CopilotChatSessionDiscoverer for status/install checks
+vi.mock("../core/CopilotChatSessionDiscoverer.js", () => ({
+	scanCopilotChatSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+	discoverCopilotChatSessions: vi.fn().mockResolvedValue([]),
+}));
+
 // Partially mock DistPathResolver so resolveDistPath doesn't depend on global npm state.
 // By default, resolveDistPath returns the caller's own dist dir with "cli" source.
 vi.mock("./DistPathResolver.js", async (importOriginal) => {
@@ -166,6 +178,10 @@ describe("Installer", () => {
 		const { scanCopilotSessions } = await import("../core/CopilotSessionDiscoverer.js");
 		vi.mocked(isCopilotInstalled).mockResolvedValue(false);
 		vi.mocked(scanCopilotSessions).mockResolvedValue({ sessions: [] });
+		const { isCopilotChatInstalled } = await import("../core/CopilotChatDetector.js");
+		const { scanCopilotChatSessions } = await import("../core/CopilotChatSessionDiscoverer.js");
+		vi.mocked(isCopilotChatInstalled).mockResolvedValue(false);
+		vi.mocked(scanCopilotChatSessions).mockResolvedValue({ sessions: [] });
 	});
 
 	afterEach(async () => {
@@ -327,6 +343,34 @@ describe("Installer", () => {
 			expect(result.success).toBe(true);
 			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
 			expect(globalConfig.copilotEnabled).toBe(true);
+		});
+
+		it("auto-enables copilotEnabled when only Copilot Chat is detected", async () => {
+			const { install } = await import("./Installer.js");
+			const { isCopilotInstalled } = await import("../core/CopilotDetector.js");
+			const { isCopilotChatInstalled } = await import("../core/CopilotChatDetector.js");
+			const { loadConfigFromDir, getGlobalConfigDir } = await import("../core/SessionTracker.js");
+			vi.mocked(isCopilotInstalled).mockResolvedValueOnce(false);
+			vi.mocked(isCopilotChatInstalled).mockResolvedValueOnce(true);
+
+			await install(tempDir);
+
+			const globalConfig = await loadConfigFromDir(getGlobalConfigDir());
+			expect(globalConfig.copilotEnabled).toBe(true);
+		});
+
+		it("does not auto-enable when neither Copilot form is present", async () => {
+			const { install } = await import("./Installer.js");
+			const { isCopilotInstalled } = await import("../core/CopilotDetector.js");
+			const { isCopilotChatInstalled } = await import("../core/CopilotChatDetector.js");
+			const { loadConfigFromDir, getGlobalConfigDir } = await import("../core/SessionTracker.js");
+			vi.mocked(isCopilotInstalled).mockResolvedValueOnce(false);
+			vi.mocked(isCopilotChatInstalled).mockResolvedValueOnce(false);
+
+			await install(tempDir);
+
+			const globalConfig = await loadConfigFromDir(getGlobalConfigDir());
+			expect(globalConfig.copilotEnabled).toBeUndefined();
 		});
 
 		it("should use process.cwd() when install is called without cwd", async () => {
@@ -2135,6 +2179,38 @@ describe("Installer", () => {
 			await saveConfigScoped({ copilotEnabled: true }, emptyGlobalDir);
 			const status = await getStatus(tempDir);
 			expect(status.copilotScanError).toEqual({ kind: "locked", message: "database is locked" });
+		});
+
+		it("getStatus reports copilotChatDetected when chat dir is present", async () => {
+			const { getStatus } = await import("./Installer.js");
+			const { isCopilotChatInstalled } = await import("../core/CopilotChatDetector.js");
+			vi.mocked(isCopilotChatInstalled).mockResolvedValue(true);
+
+			const status = await getStatus(tempDir);
+
+			expect(status.copilotChatDetected).toBe(true);
+		});
+
+		it("getStatus surfaces copilot-chat sessions and uses copilotEnabled gating", async () => {
+			const { getStatus } = await import("./Installer.js");
+			const { isCopilotChatInstalled } = await import("../core/CopilotChatDetector.js");
+			const { scanCopilotChatSessions } = await import("../core/CopilotChatSessionDiscoverer.js");
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			vi.mocked(isCopilotChatInstalled).mockResolvedValue(true);
+			vi.mocked(scanCopilotChatSessions).mockResolvedValue({
+				sessions: [
+					{
+						sessionId: "chat-1",
+						transcriptPath: "/fake/Code/.../chat-1.jsonl",
+						updatedAt: "2026-05-06T00:00:00Z",
+						source: "copilot-chat",
+					},
+				],
+			});
+			await saveConfigScoped({ copilotEnabled: true }, emptyGlobalDir);
+
+			const status = await getStatus(tempDir);
+			expect(status.sessionsBySource?.["copilot-chat"]).toBe(1);
 		});
 
 		it("merges discovered Copilot sessions into the active session count", async () => {

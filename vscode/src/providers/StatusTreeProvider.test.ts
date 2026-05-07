@@ -629,7 +629,93 @@ describe("StatusTreeProvider", () => {
 		const items = provider.getChildren();
 		const item = items.find((i) => i.label === "Copilot Integration");
 		expect(item?.description).toContain("locked");
-		expect(String(item?.tooltip)).toContain("Copilot database scan failed");
+		expect(String(item?.tooltip)).toContain("Copilot CLI database scan failed");
+	});
+
+	it("Copilot row tooltip distinguishes CLI / Chat detection", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: true,
+					copilotChatDetected: false,
+					copilotEnabled: true,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const copilotItem = items.find(
+			(i) => typeof i.label === "string" && i.label.includes("Copilot"),
+		);
+		expect(String(copilotItem?.tooltip)).toContain("CLI: ✓");
+		expect(String(copilotItem?.tooltip)).toContain("Chat: ✗");
+	});
+
+	it("Copilot row detected = true when only Chat is detected", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: false,
+					copilotChatDetected: true,
+					copilotEnabled: true,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const copilotItem = items.find((i) => i.label === "Copilot Integration");
+		// Item is rendered with detected=true (e.g. shows "available" rather than "not detected")
+		expect(copilotItem).toBeDefined();
+		expect(String(copilotItem?.description)).not.toContain("not detected");
+	});
+
+	it("shows independent warn rows for each Copilot form scan error and still renders integration row", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: false,
+					copilotChatDetected: true,
+					copilotEnabled: true,
+					copilotScanError: { kind: "locked", message: "db is locked" },
+					copilotChatScanError: {
+						kind: "io",
+						message: "workspace dir unreadable",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cliWarn = items.find(
+			(i) =>
+				i.label === "Copilot Integration" &&
+				String(i.description).includes("locked"),
+		);
+		const chatWarn = items.find((i) => i.label === "Copilot Chat");
+		const integration = items.find(
+			(i) =>
+				i.label === "Copilot Integration" && String(i.tooltip).includes("CLI:"),
+		);
+		expect(cliWarn).toBeDefined();
+		expect(chatWarn).toBeDefined();
+		expect(String(chatWarn?.tooltip)).toContain("Copilot Chat scan failed");
+		expect(integration).toBeDefined();
+		expect(String(integration?.tooltip)).toContain("Chat: ✓");
 	});
 
 	// ── Auth-aware status rows ────────────────────────────────────────────
@@ -769,6 +855,40 @@ describe("StatusTreeProvider", () => {
 		expect(
 			items.find((item) => item.label === "Gemini Integration"),
 		).toBeUndefined();
+	});
+
+	it("getWorkerBusy reflects the underlying store's worker-busy flag", () => {
+		const provider = makeStatusProvider({
+			cwd: "/repo",
+			getStatus: vi.fn(),
+		} as never);
+
+		// Use the inner provider directly — the facade doesn't expose getWorkerBusy
+		// because legacy tests didn't need it; the production code path does.
+		const tree = new StatusTreeProvider(provider.__store);
+		expect(tree.getWorkerBusy()).toBe(false);
+		provider.__store.setWorkerBusy(true);
+		expect(tree.getWorkerBusy()).toBe(true);
+		tree.dispose();
+	});
+
+	it("dispose unsubscribes from the store and disposes the change emitter", () => {
+		const provider = makeStatusProvider({
+			cwd: "/repo",
+			getStatus: vi.fn(),
+		} as never);
+
+		// Spy on the store's onChange to confirm the unsubscribe returned by it
+		// is invoked exactly once when the provider disposes.
+		const unsubscribe = vi.fn();
+		const onChange = vi
+			.spyOn(provider.__store, "onChange")
+			.mockImplementation(() => unsubscribe);
+		const tree = new StatusTreeProvider(provider.__store);
+		expect(onChange).toHaveBeenCalledTimes(1);
+
+		tree.dispose();
+		expect(unsubscribe).toHaveBeenCalledTimes(1);
 	});
 
 	describe("StatusTreeProvider.serialize", () => {

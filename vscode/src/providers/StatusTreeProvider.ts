@@ -315,29 +315,44 @@ function buildFullStatusItems(
 		);
 	}
 
-	// Copilot CLI also has a scan-time error channel (DB can be locked/corrupt).
+	// Copilot integration: shared `copilotEnabled` toggle for terminal CLI and VS Code Chat.
+	// Each form has its own scan-error channel; each surfaces as a separate warn row.
 	if (s.copilotScanError) {
 		items.push(
 			new StatusItem(
 				"Copilot Integration",
 				`unavailable — ${s.copilotScanError.kind}`,
 				ICON_WARN,
-				`Copilot database scan failed (${s.copilotScanError.kind}): ${s.copilotScanError.message}`,
+				`Copilot CLI database scan failed (${s.copilotScanError.kind}): ${s.copilotScanError.message}`,
 			),
 		);
-	} else {
-		pushIntegrationItem(
-			items,
-			s.copilotDetected,
-			s.copilotEnabled !== false,
-			undefined,
-			"Copilot Integration",
-			"Copilot CLI database found — session discovery is enabled",
-			"Copilot CLI detected but session discovery is disabled in config",
-			undefined,
-			counts.copilot,
+	}
+	if (s.copilotChatScanError) {
+		items.push(
+			new StatusItem(
+				"Copilot Chat",
+				`unavailable — ${s.copilotChatScanError.kind}`,
+				ICON_WARN,
+				`Copilot Chat scan failed (${s.copilotChatScanError.kind}): ${s.copilotChatScanError.message}`,
+			),
 		);
 	}
+	const cliMark = s.copilotDetected ? "✓" : "✗";
+	const chatMark = s.copilotChatDetected ? "✓" : "✗";
+	const anyCopilotDetected =
+		(s.copilotDetected ?? false) || (s.copilotChatDetected ?? false);
+	const copilotSessions = (counts.copilot ?? 0) + (counts["copilot-chat"] ?? 0);
+	pushIntegrationItem(
+		items,
+		anyCopilotDetected,
+		s.copilotEnabled !== false,
+		undefined,
+		"Copilot Integration",
+		`GitHub Copilot detected (CLI: ${cliMark}, Chat: ${chatMark}) — session discovery is enabled`,
+		`GitHub Copilot detected (CLI: ${cliMark}, Chat: ${chatMark}) but session discovery is disabled in config`,
+		undefined,
+		copilotSessions,
+	);
 
 	if (extensionOutdated) {
 		items.push(

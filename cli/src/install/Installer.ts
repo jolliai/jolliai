@@ -19,6 +19,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isClaudeInstalled } from "../core/ClaudeDetector.js";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
+import { scanCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
+import type { CopilotChatScanError } from "../core/CopilotChatTranscriptReader.js";
 import { isCopilotInstalled } from "../core/CopilotDetector.js";
 import { scanCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
@@ -269,13 +272,18 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			}
 		}
 
-		// Auto-detect Copilot CLI and enable session discovery
+		// Auto-detect GitHub Copilot in either form (terminal CLI or vscode Chat) and
+		// enable the shared copilotEnabled flag. Both sources share one toggle —
+		// see docs/superpowers/specs/2026-05-06-copilot-chat-support-design.md.
 		const copilotDetected = config.copilotEnabled !== false && (await isCopilotInstalled());
-		if (copilotDetected) {
-			if (config.copilotEnabled === undefined) {
-				await saveConfig({ copilotEnabled: true });
-				log.info("Copilot CLI detected — enabled Copilot session discovery");
-			}
+		const copilotChatDetected = config.copilotEnabled !== false && (await isCopilotChatInstalled());
+		if ((copilotDetected || copilotChatDetected) && config.copilotEnabled === undefined) {
+			await saveConfig({ copilotEnabled: true });
+			log.info(
+				"GitHub Copilot detected (CLI=%s, Chat=%s) — enabled session discovery",
+				copilotDetected,
+				copilotChatDetected,
+			);
 		}
 
 		// Migrate any existing worktree-level API keys to the global config dir.
@@ -495,6 +503,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 	const openCodeDetected = await isOpenCodeInstalled();
 	const cursorDetected = await isCursorInstalled();
 	const copilotDetected = await isCopilotInstalled();
+	const copilotChatDetected = await isCopilotChatInstalled();
 
 	// Check if we can enumerate worktrees; falls back gracefully if not a git repo
 	let enabledWorktrees: number | undefined;
@@ -554,6 +563,16 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
 		}
 		copilotScanError = scan.error;
+	}
+
+	// Discover Copilot Chat sessions on-demand (not stored in sessions.json).
+	let copilotChatScanError: CopilotChatScanError | undefined;
+	if (config.copilotEnabled !== false && copilotChatDetected) {
+		const scan = await scanCopilotChatSessions(projectDir);
+		if (scan.sessions.length > 0) {
+			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
+		}
+		copilotChatScanError = scan.error;
 	}
 
 	// Compute per-source session counts for integration status rows
@@ -633,6 +652,8 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		copilotDetected,
 		copilotEnabled: config.copilotEnabled,
 		copilotScanError,
+		copilotChatDetected,
+		copilotChatScanError,
 		globalConfigDir,
 		worktreeStatePath,
 		enabledWorktrees,
@@ -644,7 +665,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 	};
 
 	log.info(
-		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s, cursor=%s/%s, copilot=%s/%s",
+		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s, cursor=%s/%s, copilot=%s/%s, copilotChat=%s",
 		status.enabled,
 		status.claudeHookInstalled,
 		status.gitHookInstalled,
@@ -663,6 +684,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		status.cursorEnabled,
 		status.copilotDetected,
 		status.copilotEnabled,
+		status.copilotChatDetected,
 	);
 
 	return status;

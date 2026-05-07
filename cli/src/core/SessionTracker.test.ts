@@ -1020,6 +1020,24 @@ describe("SessionTracker", () => {
 			expect(filterSessionsByEnabledIntegrations(sessions, {})).toHaveLength(1);
 			expect(filterSessionsByEnabledIntegrations(sessions, { copilotEnabled: true })).toHaveLength(1);
 		});
+
+		it("excludes copilot-chat sessions when copilotEnabled is false", () => {
+			const sessions: ReadonlyArray<SessionInfo> = [
+				{ sessionId: "a", transcriptPath: "/a", updatedAt: "2026-05-06T00:00:00Z", source: "copilot" },
+				{ sessionId: "b", transcriptPath: "/b", updatedAt: "2026-05-06T00:00:00Z", source: "copilot-chat" },
+				{ sessionId: "c", transcriptPath: "/c", updatedAt: "2026-05-06T00:00:00Z", source: "claude" },
+			];
+			const filtered = filterSessionsByEnabledIntegrations(sessions, { copilotEnabled: false });
+			expect(filtered.map((s) => s.sessionId)).toEqual(["c"]);
+		});
+
+		it("includes copilot-chat sessions when copilotEnabled is unset (auto-detect)", () => {
+			const sessions: ReadonlyArray<SessionInfo> = [
+				{ sessionId: "b", transcriptPath: "/b", updatedAt: "2026-05-06T00:00:00Z", source: "copilot-chat" },
+			];
+			const filtered = filterSessionsByEnabledIntegrations(sessions, {});
+			expect(filtered.map((s) => s.sessionId)).toEqual(["b"]);
+		});
 	});
 
 	// ── git operation queue ────────────────────────────────────────────────

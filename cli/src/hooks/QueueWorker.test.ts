@@ -150,6 +150,14 @@ vi.mock("../core/CopilotTranscriptReader.js", () => ({
 	}),
 }));
 
+vi.mock("../core/CopilotChatDetector.js", () => ({
+	isCopilotChatInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../core/CopilotChatSessionDiscoverer.js", () => ({
+	discoverCopilotChatSessions: vi.fn().mockResolvedValue([]),
+}));
+
 vi.mock("../core/GeminiTranscriptReader.js", () => ({
 	readGeminiTranscript: vi.fn().mockResolvedValue({
 		entries: [],
@@ -178,6 +186,8 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
+import { discoverCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
 import { isCopilotInstalled } from "../core/CopilotDetector.js";
 import { discoverCopilotSessions } from "../core/CopilotSessionDiscoverer.js";
 import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
@@ -247,6 +257,8 @@ describe("QueueWorker", () => {
 		vi.mocked(isOpenCodeInstalled).mockResolvedValue(false);
 		vi.mocked(isCursorInstalled).mockResolvedValue(false);
 		vi.mocked(isCopilotInstalled).mockResolvedValue(false);
+		vi.mocked(isCopilotChatInstalled).mockResolvedValue(false);
+		vi.mocked(discoverCopilotChatSessions).mockResolvedValue([]);
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 		vi.mocked(generateSummary).mockResolvedValue({
 			transcriptEntries: 0,
@@ -813,6 +825,55 @@ describe("QueueWorker", () => {
 				expect.objectContaining({ transcriptPath: "/db.sqlite#cp-broken" }),
 				"/test/cwd",
 			);
+		});
+	});
+
+	describe("Copilot Chat integration", () => {
+		it("includes Copilot Chat sessions when chat is detected and copilotEnabled is true", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/copilot-chat.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isCopilotChatInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCopilotChatSessions).mockResolvedValue([
+				{
+					sessionId: "chat-1",
+					transcriptPath: "/fake/chat-1.jsonl",
+					updatedAt: "2026-05-06T00:00:00.000Z",
+					source: "copilot-chat",
+				},
+			]);
+
+			await runWorker("/test/cwd");
+
+			expect(isCopilotChatInstalled).toHaveBeenCalled();
+			expect(discoverCopilotChatSessions).toHaveBeenCalledWith("/test/cwd");
+		});
+
+		it("does not call isCopilotChatInstalled or discoverCopilotChatSessions when copilotEnabled is false", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/copilot-chat-disabled.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({
+				copilotEnabled: false,
+			} as Awaited<ReturnType<typeof loadConfig>>);
+
+			await runWorker("/test/cwd");
+
+			expect(isCopilotChatInstalled).not.toHaveBeenCalled();
+			expect(discoverCopilotChatSessions).not.toHaveBeenCalled();
 		});
 	});
 

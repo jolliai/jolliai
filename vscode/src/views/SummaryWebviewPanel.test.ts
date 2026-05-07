@@ -5794,6 +5794,97 @@ describe("SummaryWebviewPanel", () => {
 					}),
 				);
 			});
+
+			it("includes copilot-chat in enabled sources when copilotEnabled is true", async () => {
+				mockLoadConfig.mockResolvedValue({
+					claudeEnabled: true,
+					copilotEnabled: true,
+				});
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const transcriptMap = new Map([
+					[
+						"abc123",
+						{
+							sessions: [
+								{
+									sessionId: "cc1",
+									source: "copilot-chat" as const,
+									entries: [
+										{ role: "human" as const, content: "X" },
+										{ role: "assistant" as const, content: "Y" },
+									],
+								},
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
+
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadTranscriptStats" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						command: "transcriptStatsLoaded",
+						sessionCounts: expect.objectContaining({ "copilot-chat": 1 }),
+					}),
+				);
+			});
+
+			it("excludes copilot-chat when copilotEnabled is false", async () => {
+				mockLoadConfig.mockResolvedValue({
+					claudeEnabled: true,
+					copilotEnabled: false,
+				});
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const transcriptMap = new Map([
+					[
+						"abc123",
+						{
+							sessions: [
+								{
+									sessionId: "s1",
+									source: "claude" as const,
+									entries: [{ role: "human" as const, content: "A" }],
+								},
+								{
+									sessionId: "cc1",
+									source: "copilot-chat" as const,
+									entries: [
+										{ role: "human" as const, content: "B" },
+										{ role: "assistant" as const, content: "C" },
+									],
+								},
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
+
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadTranscriptStats" });
+				await flushPromises();
+
+				// copilot-chat session (cc1) should be excluded; only claude session counted
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						command: "transcriptStatsLoaded",
+						totalEntries: 1,
+						sessionCounts: expect.objectContaining({ claude: 1 }),
+					}),
+				);
+				const lastCall = postMessage.mock.calls[
+					postMessage.mock.calls.length - 1
+				]?.[0] as { sessionCounts?: Record<string, number> } | undefined;
+				expect(lastCall?.sessionCounts).not.toHaveProperty("copilot-chat");
+			});
 		});
 
 		// ── loadNoteContent: snippet without inline content ───────────────────────

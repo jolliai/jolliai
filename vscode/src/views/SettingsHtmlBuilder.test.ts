@@ -65,6 +65,11 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain("Copilot");
 	});
 
+	it("Copilot toggle description mentions both CLI and Chat sources", () => {
+		expect(html).toContain("Copilot CLI");
+		expect(html).toContain("Copilot Chat");
+	});
+
 	it("contains Files group with exclude patterns", () => {
 		expect(html).toContain("Files");
 		expect(html).toContain('id="excludePatterns"');

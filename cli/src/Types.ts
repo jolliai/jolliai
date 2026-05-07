@@ -4,10 +4,11 @@
  * Central type definitions for all modules in the Jolli Memory tool.
  */
 
+import type { CopilotChatScanError } from "./core/CopilotChatTranscriptReader.js";
 import type { SqliteScanError } from "./core/SqliteHelpers.js";
 
 /** Which AI coding agent produced the transcript */
-export type TranscriptSource = "claude" | "codex" | "gemini" | "opencode" | "cursor" | "copilot";
+export type TranscriptSource = "claude" | "codex" | "gemini" | "opencode" | "cursor" | "copilot" | "copilot-chat";
 
 /** Metadata about an AI coding session, saved by the Stop hook (Claude) or discovered on-demand (Codex) */
 export interface SessionInfo {
@@ -614,6 +615,10 @@ export interface StatusInfo {
 	readonly openCodeScanError?: SqliteScanError;
 	/** Copilot DB scan failed with a real (non-ENOENT) error. Same UI semantics as openCodeScanError. */
 	readonly copilotScanError?: SqliteScanError;
+	/** Whether vscode's Copilot Chat globalStorage dir was detected */
+	readonly copilotChatDetected?: boolean;
+	/** Copilot Chat scan failed with a real (non-ENOENT) error: parse / fs / schema. */
+	readonly copilotChatScanError?: CopilotChatScanError;
 }
 
 /**

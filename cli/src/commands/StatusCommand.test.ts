@@ -127,4 +127,32 @@ describe("StatusCommand — Copilot integration row", () => {
 		expect(out).toContain("Copilot");
 		expect(out).toContain("detected but disabled");
 	});
+
+	it("Copilot row shows CLI/Chat breakdown when only chat is detected", async () => {
+		const out = await renderStatus({
+			...baseStatus,
+			copilotDetected: false,
+			copilotChatDetected: true,
+			copilotEnabled: true,
+			sessionsBySource: { "copilot-chat": 2 },
+		});
+		expect(out).toContain("CLI: ✗");
+		expect(out).toContain("Chat: ✓");
+		expect(out).toMatch(/2\s*sessions/);
+	});
+
+	it("emits a Chat scan-failed sub-line when copilotChatScanError is set", async () => {
+		// CLI scan error renders on the main row; Chat error is structurally
+		// different — it surfaces as an indented "↳ Chat scan failed" sub-line
+		// underneath the CLI/Chat breakdown so users can tell which form failed.
+		const out = await renderStatus({
+			...baseStatus,
+			copilotDetected: true,
+			copilotChatDetected: true,
+			copilotEnabled: true,
+			copilotChatScanError: { kind: "parse", message: "bad jsonl event at line 7" },
+		});
+		expect(out).toContain("Chat scan failed (parse)");
+		expect(out).toContain("bad jsonl event at line 7");
+	});
 });
