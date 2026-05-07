@@ -4,6 +4,7 @@ import ai.jolli.jollimemory.core.CodexSessionDiscoverer
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.GeminiSupport
 import ai.jolli.jollimemory.core.JmLogger
+import ai.jolli.jollimemory.core.OpenCodeSupport
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StatusInfo
 import com.google.gson.Gson
@@ -44,6 +45,8 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
             codexEnabled = config.codexEnabled,
             geminiDetected = GeminiSupport.isGeminiInstalled(),
             geminiEnabled = config.geminiEnabled,
+            openCodeDetected = OpenCodeSupport.isOpenCodeInstalled(),
+            openCodeEnabled = config.openCodeEnabled,
         )
     }
 

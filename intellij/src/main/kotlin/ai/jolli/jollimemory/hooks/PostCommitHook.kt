@@ -146,7 +146,14 @@ object PostCommitHook {
             }
 
             // 4. Load sessions and read transcripts
-            val sessions = SessionTracker.loadAllSessions(cwd)
+            val allSessions = SessionTracker.loadAllSessions(cwd).toMutableList()
+
+            // On-demand discovery: OpenCode (SQLite-backed, no hook)
+            if (config.openCodeEnabled != false && OpenCodeSupport.isOpenCodeInstalled()) {
+                allSessions.addAll(OpenCodeSupport.discoverSessions(cwd))
+            }
+
+            val sessions = allSessions
             if (sessions.isEmpty()) {
                 log.info("No active sessions — skipping summarization")
                 return
@@ -164,6 +171,9 @@ object PostCommitHook {
                     TranscriptSource.gemini -> {
                         val entries = GeminiSupport.readGeminiTranscript(session.transcriptPath)
                         TranscriptReadResult(entries, TranscriptCursor(session.transcriptPath, entries.size, Instant.now().toString()), entries.size)
+                    }
+                    TranscriptSource.opencode -> {
+                        OpenCodeSupport.readTranscript(session.transcriptPath, cursor)
                     }
                     else -> {
                         val parser = getParserForSource(source)

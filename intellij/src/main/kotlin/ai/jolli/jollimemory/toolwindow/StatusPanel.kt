@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.toolwindow
 import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.core.CodexSessionDiscoverer
 import ai.jolli.jollimemory.core.GeminiSupport
+import ai.jolli.jollimemory.core.OpenCodeSupport
 import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.SummaryStore
@@ -234,6 +235,20 @@ class StatusPanel(
                 enabledTooltip = "Gemini CLI AfterAgent hook installed — session tracking is enabled",
                 disabledTooltip = "Gemini CLI detected but session tracking is disabled in config",
                 hookMissingTooltip = "Gemini CLI detected but AfterAgent hook is not installed",
+            )
+        }
+
+        // 9. OpenCode Integration (no hooks needed — just detection)
+        val openCodeDetected = status.openCodeDetected ?: OpenCodeSupport.isOpenCodeInstalled()
+        if (openCodeDetected) {
+            val enabled = config.openCodeEnabled != false
+            addIntegrationRow(
+                enabled = enabled,
+                hookInstalled = null,
+                label = "OpenCode Integration",
+                enabledTooltip = "OpenCode database found — session discovery is enabled",
+                disabledTooltip = "OpenCode detected but session discovery is disabled in config",
+                hookMissingTooltip = null,
             )
         }
 
