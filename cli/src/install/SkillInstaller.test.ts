@@ -219,7 +219,7 @@ describe("updateSkillsIfNeeded", () => {
 	// (the LLM is told to translate replies into the user's language). Lock this
 	// in: any future template edit that slips CJK / Hiragana / Katakana / Hangul
 	// chars into either SKILL.md is a regression caught here.
-	const CJK_AND_OTHER_NON_LATIN = /[一-鿿㐀-䶿豈-﫿぀-ゟ゠-ヿ가-힯]/u;
+	const CJK_AND_OTHER_NON_LATIN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]/u;
 
 	it("recall template contains no CJK characters", async () => {
 		await updateSkillsIfNeeded(tempDir);
