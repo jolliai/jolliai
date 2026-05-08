@@ -5,6 +5,7 @@ import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPasswordField
@@ -110,7 +111,7 @@ class OnboardingPanel(
 
 		// Card
 		val card = createOptionCard(
-			icon = JolliMemoryIcons.Lock,
+			icon = JolliMemoryIcons.Key,
 			title = "Use your Anthropic API key",
 			description = "Connect your own Anthropic API key for AI summarization. Memories are stored locally only.",
 		)
@@ -167,10 +168,23 @@ class OnboardingPanel(
 			val updated = existing.copy(
 				apiKey = key,
 				aiProvider = "anthropic",
+				paused = null, // clear paused state
 			)
 			SessionTracker.saveConfigToDir(updated, configDir)
-			service.refreshStatus()
-			onApiKeySaved()
+
+			// Auto-enable: initialize + install hooks so user doesn't need a separate step
+			saveButton.isEnabled = false
+			saveButton.text = "Setting up..."
+			ApplicationManager.getApplication().executeOnPooledThread {
+				if (!service.isInitialized) service.initialize()
+				service.install()
+				service.refreshStatus()
+				SwingUtilities.invokeLater {
+					saveButton.isEnabled = true
+					saveButton.text = "Save"
+					onApiKeySaved()
+				}
+			}
 		}
 
 		section.add(configureButton)
@@ -226,16 +240,22 @@ class OnboardingPanel(
 		signInButton.isEnabled = false
 		signInButton.text = "Signing in..."
 		JolliAuthService.login(
-			onSuccess = { result ->
+			onSuccess = { _ ->
 				// Save aiProvider to config so isConfigured() picks it up
 				val configDir = SessionTracker.getGlobalConfigDir()
 				val existing = SessionTracker.loadConfigFromDir(configDir)
 				if (existing.aiProvider.isNullOrBlank() || existing.aiProvider == "anthropic") {
-					val updated = existing.copy(aiProvider = "jolli")
+					val updated = existing.copy(aiProvider = "jolli", paused = null)
 					SessionTracker.saveConfigToDir(updated, configDir)
 				}
-				service.refreshStatus()
-				// Button state reset handled by auth listener
+
+				// Auto-enable: initialize + install hooks
+				ApplicationManager.getApplication().executeOnPooledThread {
+					if (!service.isInitialized) service.initialize()
+					service.install()
+					service.refreshStatus()
+					// Button state reset handled by auth listener
+				}
 			},
 			onError = { msg ->
 				SwingUtilities.invokeLater {

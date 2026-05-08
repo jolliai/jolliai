@@ -8,7 +8,10 @@ import ai.jolli.jollimemory.core.MigrationEngine
 import ai.jolli.jollimemory.core.OrphanBranchStorage
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
@@ -19,10 +22,13 @@ import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.JBPasswordField
+import com.intellij.ui.components.JBTabbedPane
 import com.intellij.ui.components.JBTextField
 import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
+import java.awt.CardLayout
 import java.awt.Dimension
 import javax.swing.Box
 import javax.swing.BoxLayout
@@ -30,52 +36,52 @@ import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
-import javax.swing.JSeparator
+import javax.swing.SwingUtilities
 
 /**
- * Full settings dialog opened from the gear icon on the MEMORIES panel toolbar.
+ * Settings dialog with four tabs:
  *
- * Sections (top to bottom):
- *   1. Sign-in bar (mirrors the tool window banner; settings hint dropped)
- *   2. General — AI provider selector (own component, see [AiProviderSelector]) +
- *      excluded patterns
- *   3. AI Configuration — model + max tokens (hidden when provider == "jolli")
- *   4. Enabled Platforms — Claude / Codex / Gemini toggles
- *   5. Knowledge Base — folder path, sort order, migrate button
- *
- * Reads/writes the global config (`config-intellij.json` after namespacing).
+ *   1. AI Summary — provider selection (Anthropic direct vs Jolli proxy),
+ *      with contextual Anthropic settings or Jolli sign-in prompt
+ *   2. Sync to Jolli — cloud push settings, login-dependent
+ *   3. Memory Bank — local storage folder, sort order, migration
+ *   4. General — enabled platforms, exclude patterns, pause toggle
  */
 class SettingsDialog(
     private val project: Project,
     private val service: JolliMemoryService,
 ) : DialogWrapper(project) {
 
-    // ── Sign-in bar ────────────────────────────────────────────────────────
-    private val signInBar = SignInBar()
-
-    // ── General ────────────────────────────────────────────────────────────
-    private val providerSelector = AiProviderSelector()
-    private val excludePatternsField = JBTextField()
-
-    // ── AI Configuration ───────────────────────────────────────────────────
-    private val modelCombo = ComboBox(DefaultComboBoxModel(arrayOf("haiku", "sonnet", "opus"))).apply {
+    // ── Tab 1: AI Summary ──────────────────────────────────────────────────
+    private val providerCombo = ComboBox(DefaultComboBoxModel(arrayOf("Anthropic", "Jolli"))).apply {
         maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
     }
+    private val anthropicKeyField = JBPasswordField()
+    private val modelCombo = ComboBox(DefaultComboBoxModel(arrayOf(
+        "haiku — fastest, cheapest",
+        "sonnet — balanced (default)",
+        "opus — most detailed",
+    ))).apply {
+        maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        setMinimumAndPreferredWidth(250)
+    }
     private val maxTokensField = JBTextField()
-    private lateinit var aiConfigSection: JComponent
+    private val anthropicCardLayout = CardLayout()
+    private val anthropicCardPanel = JPanel(anthropicCardLayout)
+    private lateinit var signInForSummaryButton: JButton
 
-    // ── Enabled Platforms ──────────────────────────────────────────────────
-    private val claudeEnabledCheckbox = JBCheckBox("Claude Code — Session tracking via Stop hook", true)
-    private val codexEnabledCheckbox = JBCheckBox("Codex CLI — Session discovery via filesystem scan", true)
-    private val geminiEnabledCheckbox = JBCheckBox("Gemini CLI — Session tracking via AfterAgent hook", true)
+    // ── Tab 2: Sync to Jolli ───────────────────────────────────────────────
+    private val syncCardLayout = CardLayout()
+    private val syncCardPanel = JPanel(syncCardLayout)
+    private lateinit var signInForSyncButton: JButton
 
-    // ── Knowledge Base ────────────────────────────────────────────────────
+    // ── Tab 3: Memory Bank ─────────────────────────────────────────────────
     private val kbPathField = TextFieldWithBrowseButton().apply {
         addBrowseFolderListener(
             project,
             FileChooserDescriptorFactory.createSingleFolderDescriptor()
-                .withTitle("Knowledge Base Folder")
-                .withDescription("Select the root folder for your local Knowledge Base"),
+                .withTitle("Memory Bank Folder")
+                .withDescription("Select the root folder for your local Memory Bank"),
         )
     }
     private val kbSortCombo = ComboBox(DefaultComboBoxModel(arrayOf("date", "name"))).apply {
@@ -83,94 +89,478 @@ class SettingsDialog(
     }
     private var defaultKBPath: String = ""
 
+    // ── Tab 4: General ─────────────────────────────────────────────────────
+    private val claudeEnabledCheckbox = JBCheckBox("Claude Code — Session tracking via Stop hook", true)
+    private val codexEnabledCheckbox = JBCheckBox("Codex CLI — Session discovery via filesystem scan", true)
+    private val geminiEnabledCheckbox = JBCheckBox("Gemini CLI — Session tracking via AfterAgent hook", true)
+    private val excludePatternsField = JBTextField()
+    private val pauseCheckbox = JBCheckBox("Pause Jolli Memory (temporarily disable hooks without losing configuration)")
+
+    // ── State ──────────────────────────────────────────────────────────────
+    private var savedAnthropicKey: String = ""
+    private var maskedAnthropicKey: String = ""
+    private var jolliApiKeyFieldRef: JBTextField? = null
+    private var jolliSiteLabelRef: JBLabel? = null
+    private var advancedLinkRef: JBLabel? = null
+    private var advancedPanelRef: JPanel? = null
+    private var anthropicWarningRef: JBLabel? = null
+    private var syncApiKeyFieldRef: JBTextField? = null
+    private val authListenerDisposable: Disposable
+
     init {
         title = "Jolli Memory Settings"
         setOKButtonText("Apply Changes")
         init()
         loadSettings()
-        // Tie sub-components' lifecycles to the dialog so their auth listeners are removed on close.
-        Disposer.register(disposable, signInBar)
-        Disposer.register(disposable, providerSelector)
+
+        authListenerDisposable = JolliAuthService.addAuthListener {
+            SwingUtilities.invokeLater {
+                refreshJolliFields()
+                syncProviderCard()
+                syncSyncCard()
+            }
+        }
+        Disposer.register(disposable, Disposable { Disposer.dispose(authListenerDisposable) })
     }
 
     override fun createCenterPanel(): JComponent {
+        val tabbedPane = JBTabbedPane()
+        tabbedPane.addTab("AI Agents", buildAgentsTab())
+        tabbedPane.addTab("AI Summary", buildAiSummaryTab())
+        tabbedPane.addTab("Sync to Jolli", buildSyncTab())
+        tabbedPane.addTab("Memory Bank", buildMemoryBankTab())
+        tabbedPane.addTab("Others", buildGeneralTab())
+
+        // Restore last selected tab and track changes
+        tabbedPane.selectedIndex = lastSelectedTab.coerceIn(0, tabbedPane.tabCount - 1)
+        tabbedPane.addChangeListener { lastSelectedTab = tabbedPane.selectedIndex }
+
+        // Initial card states
+        syncProviderCard()
+        syncSyncCard()
+
+        return JPanel(BorderLayout()).apply {
+            add(tabbedPane, BorderLayout.CENTER)
+            preferredSize = Dimension(480, 360)
+        }
+    }
+
+    // ── Tab builders ───────────────────────────────────────────────────────
+
+    private fun buildAgentsTab(): JComponent {
         val panel = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            border = JBUI.Borders.empty(8, 12)
+            border = JBUI.Borders.empty(12)
         }
 
-        // ── Sign-in bar ────────────────────────────────────────────────────
-        signInBar.alignmentX = JComponent.LEFT_ALIGNMENT
-        panel.add(signInBar)
-        panel.add(Box.createVerticalStrut(8))
-        panel.add(createSeparator())
-        panel.add(Box.createVerticalStrut(12))
-
-        // ── General Section ────────────────────────────────────────────────
-        panel.add(createSectionHeader("General"))
-        panel.add(createStretchedFormPanel(providerSelector))
-        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
-            .addLabeledComponent(JBLabel("Excluded patterns:"), excludePatternsField, 1, false)
-            .addTooltip("Select files for jolli memory to ignore (comma-separated globs, e.g. **/*.vsix, docs/*.md)")
-            .panel))
-
-        panel.add(Box.createVerticalStrut(12))
-        panel.add(createSeparator())
-        panel.add(Box.createVerticalStrut(12))
-
-        // ── AI Configuration Section ───────────────────────────────────────
-        aiConfigSection = JPanel().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        panel.add(JBLabel("<html><span style='color:gray'>Choose which AI agents to track.</span></html>").apply {
             alignmentX = JComponent.LEFT_ALIGNMENT
-            add(createSectionHeader("AI Configuration"))
-            add(createStretchedFormPanel(FormBuilder.createFormBuilder()
-                .addLabeledComponent(JBLabel("Model:"), modelCombo, 1, false)
-                .addTooltip("Haiku = fastest, Sonnet = balanced (default), Opus = most capable")
-                .addLabeledComponent(JBLabel("Max Tokens:"), maxTokensField, 1, false)
-                .addTooltip("Default: 8192")
-                .panel))
-            add(Box.createVerticalStrut(12))
-            add(createSeparator())
-            add(Box.createVerticalStrut(12))
-        }
-        panel.add(aiConfigSection)
+            border = JBUI.Borders.emptyBottom(8)
+        })
 
-        // ── Enabled Platforms Section ──────────────────────────────────────
-        panel.add(createSectionHeader("Enabled Platforms"))
         panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
             .addComponent(claudeEnabledCheckbox, 4)
             .addComponent(codexEnabledCheckbox, 4)
             .addComponent(geminiEnabledCheckbox, 4)
             .panel))
 
-        panel.add(Box.createVerticalStrut(12))
-        panel.add(createSeparator())
-        panel.add(Box.createVerticalStrut(12))
+        return wrapTabContent(panel)
+    }
 
-        // ── Knowledge Base Section ─────────────────────────────────────────
-        panel.add(createSectionHeader("Knowledge Base"))
+    private fun buildAiSummaryTab(): JComponent {
+        val panel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            border = JBUI.Borders.empty(12)
+        }
+
+        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+            .addLabeledComponent(JBLabel("Provider:"), providerCombo, 1, false)
+            .addTooltip("Choose how AI summaries are generated for each commit")
+            .panel))
+
+        // Anthropic card: warning + key + model + max tokens
+        val anthropicWarning = JBLabel(
+            "<html><span style='color:#D29922'>\u26A0</span> API key is empty. AI summaries won't work without it.</html>"
+        ).apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyBottom(6)
+            isVisible = false
+        }
+        this.anthropicWarningRef = anthropicWarning
+        val anthropicContent = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            add(Box.createVerticalStrut(8))
+            add(anthropicWarning)
+            add(JBLabel("<html><span style='color:gray'>Calls go directly to Anthropic.</span></html>").apply {
+                alignmentX = JComponent.LEFT_ALIGNMENT
+                border = JBUI.Borders.emptyBottom(6)
+            })
+            add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+                .addLabeledComponent(JBLabel("API Key:"), anthropicKeyField, 1, false)
+                .addTooltip("Your Anthropic API key (sk-ant-...). Get one at console.anthropic.com")
+                .addLabeledComponent(JBLabel("Model:"), modelCombo, 1, false)
+                .addLabeledComponent(JBLabel("Max Output Tokens:"), maxTokensField, 1, false)
+                .addTooltip("Max length of the generated summary. Default: 8192")
+                .panel))
+        }
+
+        // Jolli signed-in card
+        signInForSummaryButton = JButton("Sign In to Jolli").apply {
+            putClientProperty("JButton.buttonType", "default")
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+            addActionListener { handleSignIn(this) }
+        }
+        val jolliSiteLabel = JBLabel().apply { alignmentX = JComponent.LEFT_ALIGNMENT }
+        val jolliApiKeyField = JBTextField().apply {
+            isEditable = true
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }
+        val advancedPanel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            isVisible = false
+            add(Box.createVerticalStrut(6))
+            add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+                .addLabeledComponent(JBLabel("Jolli API Key:"), jolliApiKeyField, 1, false)
+                .addTooltip("sk-jol-... — auto-filled on sign-in, or paste a new one")
+                .panel))
+        }
+        val advancedLink = JBLabel("<html><a href='#'>Advanced</a></html>").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+            addMouseListener(object : java.awt.event.MouseAdapter() {
+                override fun mouseClicked(e: java.awt.event.MouseEvent) {
+                    advancedPanel.isVisible = !advancedPanel.isVisible
+                    text = if (advancedPanel.isVisible) "<html><a href='#'>Hide Advanced</a></html>"
+                        else "<html><a href='#'>Advanced</a></html>"
+                    advancedPanel.revalidate()
+                    advancedPanel.repaint()
+                }
+            })
+        }
+
+        // Save references for populateFields(), doOKAction, and syncProviderCard
+        this.jolliApiKeyFieldRef = jolliApiKeyField
+        this.jolliSiteLabelRef = jolliSiteLabel
+        this.advancedLinkRef = advancedLink
+        this.advancedPanelRef = advancedPanel
+
+        val jolliSignedInContent = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            add(Box.createVerticalStrut(8))
+            add(jolliSiteLabel)
+        }
+        val reSignInButton = JButton("Sign Out & Re-login").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            addActionListener {
+                JolliAuthService.signOut()
+                // After sign-out, the auth listener will flip to the sign-in card
+            }
+        }
+        val jolliNoKeyContent = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            add(Box.createVerticalStrut(8))
+            add(JBLabel("<html><span style='color:#D29922'>\u26A0</span> Signed in but Jolli API Key is missing.<br/>" +
+                "Enter your key below, or sign out and sign in again.</html>").apply {
+                alignmentX = JComponent.LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(6))
+            add(reSignInButton)
+        }
+        val jolliSignedOutContent = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            add(Box.createVerticalStrut(8))
+            add(JBLabel("<html><span style='color:gray'>Sign in to use Jolli for AI summarization</span></html>").apply {
+                alignmentX = JComponent.LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(6))
+            add(signInForSummaryButton)
+        }
+
+        // Update Anthropic warning as user types
+        anthropicKeyField.document.addDocumentListener(object : javax.swing.event.DocumentListener {
+            private fun update() {
+                val hasKey = String(anthropicKeyField.password).isNotBlank() ||
+                    !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
+                anthropicWarningRef?.isVisible = !hasKey
+            }
+            override fun insertUpdate(e: javax.swing.event.DocumentEvent) = update()
+            override fun removeUpdate(e: javax.swing.event.DocumentEvent) = update()
+            override fun changedUpdate(e: javax.swing.event.DocumentEvent) = update()
+        })
+
+        anthropicCardPanel.add(anthropicContent, CARD_ANTHROPIC)
+        anthropicCardPanel.add(jolliSignedInContent, CARD_JOLLI_OK)
+        anthropicCardPanel.add(jolliNoKeyContent, CARD_JOLLI_NOKEY)
+        anthropicCardPanel.add(jolliSignedOutContent, CARD_JOLLI_SIGNIN)
+        anthropicCardPanel.alignmentX = JComponent.LEFT_ALIGNMENT
+        panel.add(anthropicCardPanel)
+
+        // Advanced panel — always below the card, visible for both OK and NoKey states
+        panel.add(advancedLink)
+        panel.add(advancedPanel)
+
+        providerCombo.addItemListener { syncProviderCard() }
+
+        return wrapTabContent(panel)
+    }
+
+    private fun buildSyncTab(): JComponent {
+        val panel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            border = JBUI.Borders.empty(12)
+        }
+
+        signInForSyncButton = JButton("Sign In to Jolli").apply {
+            putClientProperty("JButton.buttonType", "default")
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+            addActionListener { handleSignIn(this) }
+        }
+
+        val syncSignedOut = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            add(JBLabel("<html><span style='color:gray'>Sign in to push memories to Jolli cloud.</span></html>").apply {
+                alignmentX = JComponent.LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(6))
+            add(signInForSyncButton)
+        }
+        val syncSignedIn = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            add(JBLabel("<html><span style='color:#3FB950'>\u2713</span> Signed in — ready to push memories</html>").apply {
+                alignmentX = JComponent.LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(6))
+            add(JButton("Sign Out").apply {
+                alignmentX = JComponent.LEFT_ALIGNMENT
+                addActionListener { JolliAuthService.signOut() }
+            })
+        }
+
+        // Sync no-key: re-login button + advanced API key field
+        val syncReLoginButton = JButton("Sign Out & Re-login").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            addActionListener {
+                JolliAuthService.signOut()
+            }
+        }
+        val syncApiKeyField = JBTextField().apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }
+        this.syncApiKeyFieldRef = syncApiKeyField
+
+        val syncAdvancedPanel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            isVisible = false
+            add(Box.createVerticalStrut(6))
+            add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+                .addLabeledComponent(JBLabel("Jolli API Key:"), syncApiKeyField, 1, false)
+                .addTooltip("sk-jol-... — paste your Jolli API key here")
+                .panel))
+        }
+        val syncAdvancedLink = JBLabel("<html><a href='#'>Advanced</a></html>").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+            addMouseListener(object : java.awt.event.MouseAdapter() {
+                override fun mouseClicked(e: java.awt.event.MouseEvent) {
+                    syncAdvancedPanel.isVisible = !syncAdvancedPanel.isVisible
+                    text = if (syncAdvancedPanel.isVisible) "<html><a href='#'>Hide Advanced</a></html>"
+                        else "<html><a href='#'>Advanced</a></html>"
+                    syncAdvancedPanel.revalidate()
+                    syncAdvancedPanel.repaint()
+                }
+            })
+        }
+
+        val syncNoKey = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            add(JBLabel("<html><span style='color:#D29922'>\u26A0</span> Signed in but Jolli API Key is missing.<br/>" +
+                "Re-login to get the key automatically, or enter it manually.</html>").apply {
+                alignmentX = JComponent.LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(6))
+            add(syncReLoginButton)
+            add(Box.createVerticalStrut(4))
+            add(syncAdvancedLink)
+            add(syncAdvancedPanel)
+        }
+
+        syncCardPanel.add(syncSignedOut, CARD_SYNC_SIGNEDOUT)
+        syncCardPanel.add(syncNoKey, CARD_SYNC_NOKEY)
+        syncCardPanel.add(syncSignedIn, CARD_SYNC_SIGNEDIN)
+        syncCardPanel.alignmentX = JComponent.LEFT_ALIGNMENT
+        panel.add(syncCardPanel)
+
+        return wrapTabContent(panel)
+    }
+
+    private fun buildMemoryBankTab(): JComponent {
+        val panel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            border = JBUI.Borders.empty(12)
+        }
+
         panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
             .addLabeledComponent(JBLabel("Folder Path:"), kbPathField, 1, false)
-            .addTooltip("Parent folder for all KB data. Each repo gets its own subfolder. Default: ~/Documents/jolli/")
+            .addTooltip("Root folder for all memory data. Each repo gets its own subfolder. Default: ~/Documents/jolli/")
             .addLabeledComponent(JBLabel("Sort Order:"), kbSortCombo, 1, false)
-            .addTooltip("How files are sorted in the Knowledge Base explorer")
+            .addTooltip("How files are sorted in the Memory Bank explorer")
             .addComponent(createMigrateButton(), 12)
             .panel))
 
-        // Hide AI Configuration whenever provider isn't Anthropic.
-        providerSelector.addStateChangeListener {
-            aiConfigSection.isVisible = providerSelector.getProvider() == "anthropic"
-            pack()
+        return wrapTabContent(panel)
+    }
+
+    private fun buildGeneralTab(): JComponent {
+        val panel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            border = JBUI.Borders.empty(12)
         }
 
+        panel.add(JBLabel("<html><b>Exclude Patterns</b></html>").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyBottom(2)
+        })
+        panel.add(JBLabel("<html><span style='color:gray'>Hide files from the Changes panel and AI commits.</span></html>").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyBottom(4)
+        })
+        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+            .addLabeledComponent(JBLabel("Patterns:"), excludePatternsField, 1, false)
+            .addTooltip("Comma-separated globs, e.g. **/*.vsix, dist/**, node_modules/*")
+            .panel))
+
+        panel.add(Box.createVerticalStrut(12))
+        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
+            .addComponent(pauseCheckbox, 4)
+            .addTooltip("Uninstalls hooks while preserving all settings. Unpause to re-enable.")
+            .panel))
+
+        return wrapTabContent(panel)
+    }
+
+    /** Wraps tab content so it aligns to the top instead of centering vertically. */
+    private fun wrapTabContent(content: JPanel): JComponent {
         return JPanel(BorderLayout()).apply {
-            add(panel, BorderLayout.NORTH)
-            preferredSize = Dimension(560, preferredSize.height)
+            add(content, BorderLayout.NORTH)
         }
     }
 
+    // ── Card sync logic ────────────────────────────────────────────────────
+
+    /** Reloads Jolli API key and site label from config (e.g. after sign-in/sign-out). */
+    private fun refreshJolliFields() {
+        val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+        val jolliKey = config.jolliApiKey ?: ""
+        jolliApiKeyFieldRef?.text = jolliKey
+        syncApiKeyFieldRef?.text = jolliKey
+        val meta = if (jolliKey.isNotBlank()) ai.jolli.jollimemory.services.JolliApiClient.parseJolliApiKey(jolliKey) else null
+        val siteDisplay = meta?.u?.removePrefix("https://")?.removePrefix("http://") ?: ""
+        jolliSiteLabelRef?.text = if (siteDisplay.isNotBlank()) {
+            "<html><span style='color:#3FB950'>\u2713</span> Signed in to <b>$siteDisplay</b> — using Jolli to generate summaries</html>"
+        } else {
+            "<html><span style='color:#3FB950'>\u2713</span> Using Jolli to generate summaries</html>"
+        }
+    }
+
+    /** Checks if a Jolli API key exists in config (the actual credential for API calls). */
+    private fun hasJolliApiKey(): Boolean {
+        val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+        return !config.jolliApiKey.isNullOrBlank()
+    }
+
+    private fun syncProviderCard() {
+        val provider = providerCombo.selectedItem as String
+        if (provider == "Anthropic") {
+            anthropicCardLayout.show(anthropicCardPanel, CARD_ANTHROPIC)
+            val hasKey = getEffectiveAnthropicKey().isNotBlank() ||
+                !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
+            anthropicWarningRef?.isVisible = !hasKey
+            advancedLinkRef?.isVisible = false
+            advancedPanelRef?.isVisible = false
+        } else if (hasJolliApiKey()) {
+            anthropicCardLayout.show(anthropicCardPanel, CARD_JOLLI_OK)
+            advancedLinkRef?.isVisible = true
+        } else if (JolliAuthService.isSignedIn()) {
+            anthropicCardLayout.show(anthropicCardPanel, CARD_JOLLI_NOKEY)
+            // Auto-show Advanced so user can enter the missing key
+            advancedLinkRef?.isVisible = false
+            advancedPanelRef?.isVisible = true
+        } else {
+            anthropicCardLayout.show(anthropicCardPanel, CARD_JOLLI_SIGNIN)
+            advancedLinkRef?.isVisible = false
+            advancedPanelRef?.isVisible = false
+        }
+        anthropicCardPanel.revalidate()
+        anthropicCardPanel.repaint()
+    }
+
+    private fun syncSyncCard() {
+        val signedIn = JolliAuthService.isSignedIn()
+        val hasKey = hasJolliApiKey()
+        if (signedIn && hasKey) {
+            syncCardLayout.show(syncCardPanel, CARD_SYNC_SIGNEDIN)
+        } else if (signedIn && !hasKey) {
+            syncCardLayout.show(syncCardPanel, CARD_SYNC_NOKEY)
+        } else {
+            syncCardLayout.show(syncCardPanel, CARD_SYNC_SIGNEDOUT)
+        }
+        syncCardPanel.revalidate()
+        syncCardPanel.repaint()
+    }
+
+    private fun handleSignIn(button: JButton) {
+        button.isEnabled = false
+        button.text = "Signing in..."
+        JolliAuthService.login(
+            onSuccess = { _ ->
+                SwingUtilities.invokeLater {
+                    button.isEnabled = true
+                    button.text = "Sign In to Jolli"
+                    syncProviderCard()
+                    syncSyncCard()
+                }
+            },
+            onError = { msg ->
+                SwingUtilities.invokeLater {
+                    button.isEnabled = true
+                    button.text = "Sign In to Jolli"
+                    com.intellij.notification.Notifications.Bus.notify(
+                        com.intellij.notification.Notification(
+                            "JolliMemory", "Sign In Failed", msg,
+                            com.intellij.notification.NotificationType.ERROR,
+                        )
+                    )
+                }
+            },
+        )
+    }
+
+    // ── Validation & save ──────────────────────────────────────────────────
+
     override fun doValidate(): ValidationInfo? {
-        providerSelector.validateInput()?.let { return it }
+        val provider = providerCombo.selectedItem as String
+        if (provider == "Anthropic") {
+            val typed = String(anthropicKeyField.password)
+            // Only validate format if the user typed something new (not blank, not the masked display)
+            if (typed.isNotBlank() && typed != maskedAnthropicKey && !typed.startsWith("sk-ant-")) {
+                return ValidationInfo("Anthropic API Key should start with sk-ant-", anthropicKeyField)
+            }
+        } else if (provider == "Jolli" && !JolliAuthService.isSignedIn()) {
+            return ValidationInfo("Sign in to Jolli first to use it as AI provider", providerCombo)
+        }
 
         val maxTokensText = maxTokensField.text.trim()
         if (maxTokensText.isNotBlank()) {
@@ -190,8 +580,10 @@ class SettingsDialog(
     }
 
     override fun doOKAction() {
-        val provider = providerSelector.getProvider()
-        val resolvedApiKey = providerSelector.getEffectiveAnthropicKey()
+        val provider = if ((providerCombo.selectedItem as String) == "Anthropic") "anthropic" else "jolli"
+        // Always preserve the Anthropic key even when Jolli is selected,
+        // so switching back to Anthropic doesn't lose the saved key.
+        val resolvedApiKey = getEffectiveAnthropicKey()
 
         val maxTokensText = maxTokensField.text.trim()
         val maxTokens = if (maxTokensText.isNotBlank()) maxTokensText.toIntOrNull() else null
@@ -201,26 +593,61 @@ class SettingsDialog(
             .map { it.trim() }
             .filter { it.isNotEmpty() }
 
-        val kbPath = kbPathField.text.trim()
+        // Save the default path explicitly if user hasn't set a custom one
+        val kbPath = kbPathField.text.trim().ifBlank { KBPathResolver.KB_PARENT.toString() }
         val kbSort = kbSortCombo.selectedItem as String
 
         val configDir = SessionTracker.getGlobalConfigDir()
+        // Both AI Summary and Sync tabs can set the Jolli API key — use whichever has a value
+        val aiSummaryKey = jolliApiKeyFieldRef?.text?.trim() ?: ""
+        val syncKey = syncApiKeyFieldRef?.text?.trim() ?: ""
+        val jolliApiKeyText = syncKey.ifBlank { aiSummaryKey }
+
+        // If the Advanced field was shown and user cleared it, treat as sign-out
+        val preExisting = SessionTracker.loadConfigFromDir(configDir)
+        val jolliKeyCleared = jolliApiKeyFieldRef != null &&
+            jolliApiKeyText.isBlank() && !preExisting.jolliApiKey.isNullOrBlank()
+        if (jolliKeyCleared) {
+            JolliAuthService.signOut()
+        }
+
+        // Re-load after potential sign-out so authToken change is reflected
         val existing = SessionTracker.loadConfigFromDir(configDir)
         val config = existing.copy(
             apiKey = resolvedApiKey.ifBlank { null },
-            model = (modelCombo.selectedItem as String).let { if (it == "sonnet") null else it },
+            jolliApiKey = if (jolliKeyCleared) null else jolliApiKeyText.ifBlank { existing.jolliApiKey },
+            model = (modelCombo.selectedItem as String).substringBefore(" ").let { if (it == "sonnet") null else it },
             maxTokens = maxTokens,
             claudeEnabled = claudeEnabledCheckbox.isSelected,
             codexEnabled = codexEnabledCheckbox.isSelected,
             geminiEnabled = geminiEnabledCheckbox.isSelected,
             excludePatterns = if (excludePatterns.isNotEmpty()) excludePatterns else null,
             aiProvider = provider,
-            knowledgeBasePath = kbPath.ifBlank { null },
+            knowledgeBasePath = kbPath,
             knowledgeBaseSort = kbSort,
+            paused = if (pauseCheckbox.isSelected) true else null,
         )
         SessionTracker.saveConfigToDir(config, configDir)
 
-        // Initialize KB folder + auto-migrate data from orphan branch
+        // Check if any LLM credential is available (matches LlmClient fallback chain)
+        val hasCredentials = !config.apiKey.isNullOrBlank() ||
+            !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
+            !config.jolliApiKey.isNullOrBlank()
+
+        // Handle pause toggle or credential removal, then always refresh status
+        val wasPaused = existing.paused == true
+        val nowPaused = pauseCheckbox.isSelected
+        ApplicationManager.getApplication().executeOnPooledThread {
+            if (!hasCredentials || (nowPaused && !wasPaused)) {
+                service.uninstall()
+            } else if (!nowPaused && wasPaused) {
+                if (!service.isInitialized) service.initialize()
+                service.install()
+            }
+            service.refreshStatus()
+        }
+
+        // Initialize Memory Bank folder + auto-migrate data from orphan branch
         val projectPath = service.mainRepoRoot ?: project.basePath
         if (projectPath != null) {
             val repoName = KBPathResolver.extractRepoName(projectPath)
@@ -228,7 +655,6 @@ class SettingsDialog(
             val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
             KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
 
-            // Auto-migrate if orphan branch has data
             val gitOps = GitOps(projectPath)
             val orphan = OrphanBranchStorage(gitOps)
             if (orphan.exists()) {
@@ -243,51 +669,73 @@ class SettingsDialog(
         super.doOKAction()
     }
 
-    /** Loads settings from the global config directory and populates the form. */
+    private fun getEffectiveAnthropicKey(): String {
+        val typed = String(anthropicKeyField.password)
+        return if (typed == maskedAnthropicKey) savedAnthropicKey else typed
+    }
+
     private fun loadSettings() {
         val configDir = SessionTracker.getGlobalConfigDir()
         val config = SessionTracker.loadConfigFromDir(configDir)
         populateFields(config)
     }
 
-    /** Fills all form fields from a config object. */
     private fun populateFields(config: JolliMemoryConfig) {
-        providerSelector.loadFromConfig(config)
-        modelCombo.selectedItem = config.model ?: "sonnet"
-        maxTokensField.text = if (config.maxTokens != null) config.maxTokens.toString() else ""
-        excludePatternsField.text = config.excludePatterns?.joinToString(", ") ?: ""
+        // AI Summary
+        savedAnthropicKey = config.apiKey ?: ""
+        maskedAnthropicKey = AiProviderSelector.maskApiKey(savedAnthropicKey)
+        anthropicKeyField.text = maskedAnthropicKey
 
+        val provider = when (config.aiProvider?.lowercase()) {
+            "jolli" -> "Jolli"
+            "anthropic" -> "Anthropic"
+            else -> if (JolliAuthService.isSignedIn()) "Jolli" else "Anthropic"
+        }
+        providerCombo.selectedItem = provider
+
+        val modelAlias = config.model ?: "sonnet"
+        for (i in 0 until modelCombo.itemCount) {
+            if ((modelCombo.getItemAt(i) as String).startsWith(modelAlias)) {
+                modelCombo.selectedIndex = i
+                break
+            }
+        }
+        maxTokensField.text = if (config.maxTokens != null) config.maxTokens.toString() else ""
+
+        // Jolli API Key + site label (both AI Summary and Sync tabs share the same config value)
+        val jolliKey = config.jolliApiKey ?: ""
+        jolliApiKeyFieldRef?.text = jolliKey
+        syncApiKeyFieldRef?.text = jolliKey
+        val meta = if (jolliKey.isNotBlank()) ai.jolli.jollimemory.services.JolliApiClient.parseJolliApiKey(jolliKey) else null
+        val siteDisplay = meta?.u?.removePrefix("https://")?.removePrefix("http://") ?: ""
+        jolliSiteLabelRef?.text = if (siteDisplay.isNotBlank()) {
+            "<html><span style='color:#3FB950'>\u2713</span> Signed in to <b>$siteDisplay</b> — using Jolli to generate summaries</html>"
+        } else {
+            "<html><span style='color:#3FB950'>\u2713</span> Using Jolli to generate summaries</html>"
+        }
+
+        // General
+        excludePatternsField.text = config.excludePatterns?.joinToString(", ") ?: ""
         claudeEnabledCheckbox.isSelected = config.claudeEnabled != false
         codexEnabledCheckbox.isSelected = config.codexEnabled != false
         geminiEnabledCheckbox.isSelected = config.geminiEnabled != false
+        pauseCheckbox.isSelected = config.paused == true
 
-        // Apply current visibility for AI Configuration section.
-        aiConfigSection.isVisible = providerSelector.getProvider() == "anthropic"
-
-        // KB fields — compute default path for placeholder
+        // Memory Bank
         val projectPath = service.mainRepoRoot ?: project.basePath ?: ""
         if (projectPath.isNotBlank()) {
             val repoName = KBPathResolver.extractRepoName(projectPath)
             val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
             defaultKBPath = KBPathResolver.resolve(repoName, remoteUrl).toString()
         }
-        kbPathField.text = config.knowledgeBasePath ?: ""
-        (kbPathField.textField as? JBTextField)?.emptyText?.setText(
-            if (defaultKBPath.isNotBlank()) defaultKBPath else "~/Documents/jolli/"
-        )
+        kbPathField.text = config.knowledgeBasePath ?: KBPathResolver.KB_PARENT.toString()
         kbSortCombo.selectedItem = config.knowledgeBaseSort ?: "date"
+
+        // Sync card states after all fields are populated
+        syncProviderCard()
+        syncSyncCard()
     }
 
-    /** Creates a bold section header label. */
-    private fun createSectionHeader(text: String): JComponent {
-        return JBLabel(text).apply {
-            font = font.deriveFont(java.awt.Font.BOLD, font.size + 1f)
-            border = JBUI.Borders.emptyBottom(4)
-            alignmentX = JComponent.LEFT_ALIGNMENT
-        }
-    }
-
-    /** Wraps a form panel so it stretches to fill the full dialog width. */
     private fun createStretchedFormPanel(formPanel: JPanel): JComponent {
         return JPanel(BorderLayout()).apply {
             add(formPanel, BorderLayout.CENTER)
@@ -296,10 +744,9 @@ class SettingsDialog(
         }
     }
 
-    /** Creates the "Migrate to Knowledge Base" button. */
     private fun createMigrateButton(): JComponent {
-        return JButton("Migrate to Knowledge Base").apply {
-            toolTipText = "Migrate existing memories from git storage to the Knowledge Base folder"
+        return JButton("Migrate to Memory Bank").apply {
+            toolTipText = "Migrate existing memories from git storage to the Memory Bank folder"
             addActionListener {
                 isEnabled = false
                 text = "Migrating..."
@@ -344,17 +791,22 @@ class SettingsDialog(
                         "Migration")
                 } finally {
                     isEnabled = true
-                    text = "Migrate to Knowledge Base"
+                    text = "Migrate to Memory Bank"
                 }
             }
         }
     }
 
-    /** Creates a horizontal separator line. */
-    private fun createSeparator(): JComponent {
-        return JSeparator().apply {
-            alignmentX = JComponent.LEFT_ALIGNMENT
-            maximumSize = Dimension(Int.MAX_VALUE, 1)
-        }
+    companion object {
+        /** Remembers last selected tab across dialog open/close within the same IDE session. */
+        private var lastSelectedTab = 0
+
+        private const val CARD_ANTHROPIC = "card.anthropic"
+        private const val CARD_JOLLI_OK = "card.jolli.ok"
+        private const val CARD_JOLLI_NOKEY = "card.jolli.nokey"
+        private const val CARD_JOLLI_SIGNIN = "card.jolli.signin"
+        private const val CARD_SYNC_SIGNEDOUT = "card.sync.out"
+        private const val CARD_SYNC_NOKEY = "card.sync.nokey"
+        private const val CARD_SYNC_SIGNEDIN = "card.sync.in"
     }
 }

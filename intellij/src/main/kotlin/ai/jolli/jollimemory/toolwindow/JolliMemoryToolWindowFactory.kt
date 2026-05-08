@@ -215,8 +215,11 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         }
         toolWindow.setAdditionalGearActions(gearActions)
 
-        // Cloud sync icon in the title bar — shows auth state, click for sign-in/out popup.
-        toolWindow.setTitleActions(listOf(CloudSyncAction()))
+        // Title bar actions — always visible regardless of which panels are open.
+        toolWindow.setTitleActions(listOf(
+            ai.jolli.jollimemory.actions.StatusSettingsAction(),
+            CloudSyncAction(),
+        ))
 
         val mainPanel = JPanel(BorderLayout()).apply {
             add(accordionPanel, BorderLayout.CENTER)
@@ -228,7 +231,12 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 
         fun isConfigured(): Boolean {
             val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-            return JolliAuthService.isSignedIn() || !config.apiKey.isNullOrBlank()
+            if (config.paused == true) return true
+            // Check if any LLM credential is actually available (matches LlmClient fallback chain)
+            if (!config.apiKey.isNullOrBlank()) return true
+            if (!System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return true
+            if (!config.jolliApiKey.isNullOrBlank()) return true
+            return false
         }
 
         fun syncView() {
@@ -255,14 +263,30 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 
         // Auth listener on the factory: handles sign-in → main, sign-out → onboarding
         val factoryAuthDisposable = JolliAuthService.addAuthListener {
+            if (!JolliAuthService.isSignedIn()) {
+                // Sign-out: check if any LLM credential remains
+                val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+                val hasCredentials = !config.apiKey.isNullOrBlank() ||
+                    !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
+                    !config.jolliApiKey.isNullOrBlank()
+                if (!hasCredentials) {
+                    ApplicationManager.getApplication().executeOnPooledThread {
+                        service.uninstall()
+                        service.refreshStatus()
+                    }
+                }
+            }
             SwingUtilities.invokeLater { syncView() }
         }
 
         syncView()
 
-        // Content 1: Knowledge Base — KB folder browser
+        // Also sync view on status changes (e.g. settings dialog clears API key → uninstall → status changes)
+        service.addStatusListener { SwingUtilities.invokeLater { syncView() } }
+
+        // Content 1: Memory Bank — KB folder browser
         val kbPanel = KBExplorerPanel(project, service)
-        val memoriesContent = ContentFactory.getInstance().createContent(kbPanel, "\uD83D\uDCDA Knowledge Base", false).apply {
+        val memoriesContent = ContentFactory.getInstance().createContent(kbPanel, "\uD83D\uDCDA Memory Bank", false).apply {
             isCloseable = false
             setDisposer(Disposer.newDisposable("JolliMemoryMemoriesContent").also { parentDisposable ->
                 Disposer.register(parentDisposable, kbPanel)
@@ -385,12 +409,31 @@ private class StatusIndicatorLabel(
 
     /**
      * Checks whether the current status has any warnings:
+     * - No LLM credentials configured (selected provider can't work)
      * - Service has a lastError
      * - Git hooks not fully installed
      * - Claude hooks not installed when Claude is detected
      * - Gemini hooks not installed when Gemini is detected
      */
     private fun hasWarnings(status: ai.jolli.jollimemory.core.StatusInfo): Boolean {
+        // Check if the selected provider's credential is missing
+        val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+        when (config.aiProvider) {
+            "anthropic" -> {
+                if (config.apiKey.isNullOrBlank() && System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return true
+            }
+            "jolli" -> {
+                if (config.jolliApiKey.isNullOrBlank()) return true
+            }
+            else -> {
+                // No provider set — warn if nothing at all
+                val hasAny = !config.apiKey.isNullOrBlank() ||
+                    !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
+                    !config.jolliApiKey.isNullOrBlank()
+                if (!hasAny) return true
+            }
+        }
+
         if (service.lastError != null) return true
         if (!status.gitHookInstalled) return true
         if (status.claudeDetected == true && !status.claudeHookInstalled) return true
@@ -440,6 +483,20 @@ private class StatusIndicatorLabel(
             }
             sb.append("</div></html>")
             return sb.toString()
+        }
+
+        // Credential warning for selected provider
+        val credConfig = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+        val providerMissing = when (credConfig.aiProvider) {
+            "anthropic" -> credConfig.apiKey.isNullOrBlank() && System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
+            "jolli" -> credConfig.jolliApiKey.isNullOrBlank()
+            else -> credConfig.apiKey.isNullOrBlank() &&
+                System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() &&
+                credConfig.jolliApiKey.isNullOrBlank()
+        }
+        if (providerMissing) {
+            val providerName = if (credConfig.aiProvider == "jolli") "Jolli" else "Anthropic"
+            sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>$providerName API key missing</b> — open Settings to add one</p>")
         }
 
         // Hooks

@@ -45,6 +45,9 @@ object JolliMemoryIcons {
     /** Refresh — uses IntelliJ platform icon for crisp rendering. */
     val Refresh: Icon = AllIcons.Actions.Refresh
 
+    /** Key (yellow) — used for Anthropic API key option in onboarding. */
+    val Key: Icon = IconLoader.getIcon("/icons/key.svg", JolliMemoryIcons::class.java)
+
     /** Lock (green) — matches VSCode codicon "lock" for committed plans. */
     val Lock: Icon = IconLoader.getIcon("/icons/lock.svg", JolliMemoryIcons::class.java)
 

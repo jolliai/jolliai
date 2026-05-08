@@ -111,7 +111,7 @@ class MemoriesPanel(
             return
         }
         if (!status.enabled) {
-            SwingUtilities.invokeLater { showDisabled() }
+            SwingUtilities.invokeLater { showInitializing() }
             return
         }
 
@@ -135,62 +135,6 @@ class MemoriesPanel(
         emptyLabel.text = "<html><center>Initializing Jolli Memory...</center></html>"
         add(emptyLabel, BorderLayout.CENTER)
         revalidate(); repaint()
-    }
-
-    private fun showDisabled() {
-        removeAll()
-        val wrapper = javax.swing.Box.createVerticalBox().apply {
-            add(JBLabel(
-                "<html>" +
-                    "Every commit deserves a Memory.<br/><br/>" +
-                    "Jolli Memory automatically captures your AI conversations " +
-                    "and generates structured summaries for each commit — so you " +
-                    "always remember why.<br/><br/>" +
-                    "Summaries are stored locally alongside your project. The original " +
-                    "AI conversation is never stored — only the distilled summary." +
-                    "</html>",
-            ).apply { alignmentX = Component.LEFT_ALIGNMENT })
-            add(javax.swing.Box.createVerticalStrut(12))
-            add(javax.swing.JButton("Enable Jolli Memory").apply {
-                putClientProperty("JButton.buttonType", "default")
-                alignmentX = Component.LEFT_ALIGNMENT
-                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
-                addActionListener { onEnableToggle(this) }
-            })
-        }
-        add(wrapper, BorderLayout.NORTH)
-        revalidate(); repaint()
-    }
-
-    /** Handles enable/disable toggle from the inline button. */
-    private fun onEnableToggle(button: javax.swing.JButton) {
-        val status = service.getStatus()
-
-        if (status?.enabled == true) {
-            button.isEnabled = false
-            button.text = "Disabling..."
-            ApplicationManager.getApplication().executeOnPooledThread {
-                service.uninstall()
-                SwingUtilities.invokeLater {
-                    button.isEnabled = true
-                    refresh()
-                }
-            }
-            return
-        }
-
-        button.isEnabled = false
-        button.text = "Enabling..."
-        ApplicationManager.getApplication().executeOnPooledThread {
-            if (status == null) {
-                service.initialize()
-            }
-            service.install()
-            SwingUtilities.invokeLater {
-                button.isEnabled = true
-                refresh()
-            }
-        }
     }
 
     private fun updateList() {

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.99.0
+
+- **Simplified setup flow** — removed separate Enable/Disable step; hooks auto-install on credential save and auto-remove on credential clear
+- **Onboarding screen** — detects existing API keys (config or `ANTHROPIC_API_KEY` env var) and skips onboarding automatically
+- **Tabbed Settings dialog** — reorganized into five tabs: General, AI Agents, AI Summary, Sync to Jolli, and Memory Bank. Remembers last selected tab
+- **AI Summary tab** — provider dropdown (Anthropic / Jolli) with contextual UI and credential warnings
+- **Provider credential warnings** — status indicator turns yellow when selected provider's API key is missing
+- **Sync to Jolli tab** — shows sign-in/sign-out state with messaging when Jolli API key is missing
+- **Memory Bank** — renamed from Knowledge Base throughout the UI
+- **Pause toggle** — temporarily disable hooks without losing configuration (General tab)
+- **Auto-disable on sign-out** — signing out or clearing credentials auto-uninstalls hooks and returns to onboarding
+- **Refined icons** — new key icon for Anthropic, cleaner cloud sync and git-merge icons
+- **Settings always accessible** — gear icon in tool window title bar, visible regardless of panel state
+
+## 0.98.1
+
+- **Full migration** — migration now includes all child summaries, notes, and transcripts from the orphan branch
+- **Visible plan & note copies** — plans and notes generate human-readable Markdown files with YAML frontmatter
+- **Default dual-write mode** — all users automatically get folder storage after upgrade
+- **Performance** — replaced 3-second polling timer with VirtualFileManager listener for KB tree updates
+- **Cross-platform Reveal** — Reveal in Finder/Explorer now works on macOS, Windows, and Linux
+- **DnD safety** — drag-and-drop file moves prompt for confirmation before overwriting
+- **Error handling** — silent exception swallowing replaced with proper logging
+- **Selection restore** — KB tree selection preserved after refresh
+
+## 0.98.0
+
+- **Knowledge Base explorer** — browse local Knowledge Base folder as tree view with C/P/N badges
+- **Folder-based storage** — dual-write mode stores summaries as Markdown alongside JSON
+- **Auto-migration** — orphan branch data auto-migrated on startup
+- **File operations** — context menu for New Folder, File, Import, Rename, Move, Delete with DnD support
+- **Create & Update PR** — detects existing PRs and updates instead of failing
+
 ## 0.97.8
 
 - **Fix scheduled-for-removal API** — replace `PluginId.findId()` with `PluginId.getId()` to resolve Plugin Verifier warnings
