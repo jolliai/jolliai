@@ -225,6 +225,57 @@ describe("SidebarHtmlBuilder", () => {
 			);
 		});
 
+		it("includes the apikey-panel, hidden by default, with input + Save (initially disabled) + Back + inline error", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			expect(html).toContain('id="apikey-panel"');
+			expect(html).toMatch(/<div class="apikey-panel hidden"/);
+			// Password input keeps the typed key off-screen and disables
+			// browser autofill (Anthropic keys aren't a username/password
+			// pair so autofill suggestions would be wrong noise).
+			expect(html).toMatch(
+				/<input type="password"[^>]*id="apikey-input"[^>]*autocomplete="off"/,
+			);
+			// Save starts disabled — empty input is not a valid key. The
+			// script flips it on input. Without the disabled attribute the
+			// user could click Save with an empty field and we'd round-trip
+			// to the host just to surface "API key cannot be empty."
+			expect(html).toMatch(
+				/<button[^>]*id="apikey-save-btn"[^>]*\sdisabled[^>]*>Save<\/button>/,
+			);
+			expect(html).toMatch(
+				/<button[^>]*id="apikey-back-btn"[^>]*>Back<\/button>/,
+			);
+			// Inline error span is hidden until populated by an
+			// apikey:saveError message from the host.
+			expect(html).toMatch(/<p class="apikey-error hidden"/);
+			expect(html).toContain('id="apikey-error"');
+		});
+
+		it("places the apikey-panel between onboarding-panel and disabled-panel so configured===false views are siblings", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			// The three configured===false views must be DOM siblings in this
+			// order so the script's exclusive toggle (only one of the three
+			// visible at a time) maps cleanly to top-down scan order. Out of
+			// order they'd still render correctly, but we'd lose the
+			// "first-of-three is the default" intuition.
+			const ob = html.indexOf('<div class="onboarding-panel');
+			const ak = html.indexOf('<div class="apikey-panel');
+			const di = html.indexOf('<div class="disabled-panel');
+			expect(ob).toBeGreaterThan(-1);
+			expect(ak).toBeGreaterThan(ob);
+			expect(di).toBeGreaterThan(ak);
+		});
+
 		it("reuses the onboarding header copy (Get started + subtitle) and omits the option cards", () => {
 			const html = buildSidebarHtml(
 				"test-nonce",

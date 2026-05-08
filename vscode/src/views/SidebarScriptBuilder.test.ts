@@ -117,17 +117,31 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("state.authenticated = !!msg.authenticated");
 	});
 
-	it("hides the loading-panel as soon as init arrives so the placeholder doesn't outlive the host's first state push", () => {
+	it("hides the loading-panel on the first host message (any type), not only on init", () => {
 		const js = buildSidebarScript();
-		// The loading-panel is unhidden in HTML (no .hidden) and must be
-		// hidden by the init handler before any apply* call decides which
-		// of the configured / disabled / tab-UI panels to surface. This
-		// avoids both panels being visible at once during the init frame.
+		// The loading-panel is unhidden in HTML (no .hidden) and must be hidden
+		// before any apply* call decides which of the configured / disabled /
+		// tab-UI panels to surface. The hand-off used to live inside the init
+		// case, but statusStore.refresh during initialLoad posts
+		// configured:changed / enabled:changed BEFORE init — those handlers
+		// call applyEnabled/applyConfigured which surface the disabled-panel
+		// or onboarding-panel while loading is still up. Hiding at the top of
+		// handleMessage (before the switch) covers every state-bearing path.
 		expect(js).toContain("getElementById('loading-panel')");
-		const initStart = js.indexOf("'init'");
+		const fnStart = js.indexOf("function handleMessage");
+		const switchStart = js.indexOf("switch", fnStart);
+		expect(fnStart).toBeGreaterThan(-1);
+		expect(switchStart).toBeGreaterThan(fnStart);
+		expect(js.slice(fnStart, switchStart)).toContain(
+			"loadingPanel.classList.add('hidden')",
+		);
+		// And the redundant hide inside the init case is gone — keeping it
+		// duplicated invites future drift where someone updates one site but
+		// not the other.
+		const initStart = js.indexOf("case 'init'");
 		const initEnd = js.indexOf("case ", initStart + 1);
 		expect(initStart).toBeGreaterThan(-1);
-		expect(js.slice(initStart, initEnd)).toContain(
+		expect(js.slice(initStart, initEnd)).not.toContain(
 			"loadingPanel.classList.add('hidden')",
 		);
 	});
@@ -835,6 +849,52 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("'configured:changed'");
 		});
 
+		it("configured:changed false→true (onboarding completed) switches to the Status tab", () => {
+			const js = buildSidebarScript();
+			// Both onboarding completion paths — sign-in OAuth callback and
+			// inline API key save — flip configured from false to true via
+			// statusStore.refresh, so the same handler must land the user on
+			// the Status tab (where they see auth state, settings entry, and
+			// the worker indicator) instead of the default Branch tab.
+			const start = js.indexOf("case 'configured:changed'");
+			expect(start).toBeGreaterThan(-1);
+			const end = js.indexOf("case '", start + 1);
+			const body = js.slice(start, end);
+			// Capture the prior value BEFORE applyConfigured mutates it; the
+			// edge detection collapses to !wasConfigured && msg.configured.
+			// Reading state.configured AFTER applyConfigured would always
+			// reflect the new value and the edge detection would collapse to
+			// always-false (true→true) or always-true (false→false), neither
+			// of which fires switchTab('status') correctly.
+			expect(body).toMatch(
+				/const\s+wasConfigured\s*=\s*state\.configured[\s\S]{0,200}applyConfigured\(/,
+			);
+			expect(body).toMatch(
+				/!wasConfigured[\s\S]{0,40}switchTab\(['"]status['"]\)/,
+			);
+		});
+
+		it("configured:changed true→true (already configured) does NOT auto-switch the user's tab", () => {
+			const js = buildSidebarScript();
+			// Re-broadcasts of configured=true happen routinely (host
+			// statusStore.refresh during background polls, init race). We
+			// must not yank the user out of whatever tab they're on — the
+			// auto-switch is gated on the false→true edge, not the value.
+			const start = js.indexOf("case 'configured:changed'");
+			const end = js.indexOf("case '", start + 1);
+			const body = js.slice(start, end);
+			// The switchTab('status') call MUST be guarded by !wasConfigured.
+			// A bare switchTab('status') inside the msg.configured branch
+			// would steal the tab on every same-value push.
+			const switchIdx = body.indexOf("switchTab('status')");
+			expect(switchIdx).toBeGreaterThan(-1);
+			// Walk backwards to the nearest `if` and assert it gates on the edge.
+			const guardSlice = body.slice(0, switchIdx);
+			const lastIfIdx = guardSlice.lastIndexOf("if");
+			expect(lastIfIdx).toBeGreaterThan(-1);
+			expect(guardSlice.slice(lastIfIdx)).toContain("!wasConfigured");
+		});
+
 		it("references the onboarding panel id when toggling visibility", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("onboarding-panel");
@@ -846,10 +906,142 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("'jollimemory.signIn'");
 		});
 
-		it("wires onboarding apikey button to dispatch jollimemory.openSettings", () => {
+		it("wires onboarding apikey button to swap into the inline apikey-panel (NOT openSettings)", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("onboarding-apikey-btn");
-			expect(js).toContain("'jollimemory.openSettings'");
+			// Configure API Key now stays in-panel: it switches to the
+			// apikey-panel sibling instead of opening the full Settings
+			// webview, so the user sees a single API key field instead of
+			// the dozen unrelated Settings options.
+			const start = js.indexOf("onboardingApikeyBtn.addEventListener");
+			const end = js.indexOf("});", start);
+			expect(start).toBeGreaterThan(-1);
+			const handler = js.slice(start, end);
+			expect(handler).toContain("showApikeyPanel");
+			// The handler MUST NOT post the openSettings command — that's
+			// the legacy gear-icon path and would re-open the regression.
+			expect(handler).not.toContain("jollimemory.openSettings");
+		});
+
+		it("apikey-panel: showApikeyPanel hides onboarding cards and shows the input view (and resets transient state)", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("function showApikeyPanel");
+			const start = js.indexOf("function showApikeyPanel");
+			const end = js.indexOf("function ", start + 1);
+			const body = js.slice(start, end);
+			// Mutually exclusive view swap.
+			expect(body).toContain("onboardingPanel.classList.add('hidden')");
+			expect(body).toContain("apikeyPanel.classList.remove('hidden')");
+			// Reset transient state on every (re-)entry: clear any stale
+			// error / value / saving label that might have been left over
+			// from a prior attempt the user backed out of.
+			expect(body).toContain("apikeyError.classList.add('hidden')");
+			expect(body).toContain("apikeyError.textContent = ''");
+			expect(body).toContain("apikeyInput.value = ''");
+			expect(body).toContain("apikeySaveBtn.disabled = true");
+			expect(body).toMatch(/apikeySaveBtn\.textContent\s*=\s*['"]Save['"]/);
+		});
+
+		it("apikey-panel: Save button disabled while input is empty, enabled on non-empty trim", () => {
+			const js = buildSidebarScript();
+			// The button starts disabled (HTML attribute) and the input
+			// listener flips it based on `value.trim().length === 0`. Trim
+			// matters because pasting "  sk-ant-...  " with stray whitespace
+			// would otherwise look valid client-side and then fail server-side.
+			expect(js).toMatch(
+				/apikeyInput\.addEventListener\(['"]input['"][\s\S]{0,400}apikeySaveBtn\.disabled\s*=\s*apikeyInput\.value\.trim\(\)\.length\s*===\s*0/,
+			);
+		});
+
+		it("apikey-panel: Enter key in the input submits when Save is enabled", () => {
+			const js = buildSidebarScript();
+			// Keyboard accelerator parity with the click path. preventDefault
+			// stops the form-submit-style page reload that would otherwise
+			// blow away the webview state.
+			expect(js).toMatch(
+				/apikeyInput\.addEventListener\(['"]keydown['"][\s\S]{0,400}e\.key\s*===\s*['"]Enter['"][\s\S]{0,200}submitApikey\(\)/,
+			);
+		});
+
+		it("apikey-panel: submitApikey dispatches jollimemory.saveAnthropicApiKey with the trimmed key and shows Saving…", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("function submitApikey");
+			const start = js.indexOf("function submitApikey");
+			const end = js.indexOf("\n  }", start);
+			const body = js.slice(start, end);
+			// Trim is enforced once more on the host-bound side so a race
+			// where the disabled flag got bypassed (focus-lost + click
+			// timing) still doesn't ship whitespace to disk.
+			expect(body).toMatch(/apikeyInput\.value\.trim\(\)/);
+			expect(body).toMatch(/apikeySaveBtn\.textContent\s*=\s*['"]Saving/);
+			expect(body).toContain("'jollimemory.saveAnthropicApiKey'");
+			// The arg is forwarded as args:[key] so executeCommand's variadic
+			// invocation in SidebarWebviewProvider.handleOutbound spreads it
+			// into the registered handler's first positional parameter.
+			expect(body).toMatch(/args:\s*\[\s*key\s*\]/);
+		});
+
+		it("apikey-panel: Back button restores the onboarding cards view", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("function showOnboardingPanel");
+			expect(js).toMatch(
+				/apikeyBackBtn\.addEventListener\(['"]click['"]\s*,\s*showOnboardingPanel\)/,
+			);
+		});
+
+		it("apikey-panel: apikey:saveError re-enables Save and surfaces the message inline (only when panel is still active)", () => {
+			const js = buildSidebarScript();
+			// Anchor on the case label to avoid landing on the comment that
+			// also mentions the message type inside submitApikey.
+			expect(js).toContain("case 'apikey:saveError'");
+			const start = js.indexOf("case 'apikey:saveError'");
+			const end = js.indexOf("break", start);
+			const body = js.slice(start, end);
+			// Guard: if the panel was already retired by applyConfigured
+			// (success raced past us), don't re-show the input — the user
+			// is already on the main UI and a stale error would be confusing.
+			expect(body).toContain("apikeyPanel.classList.contains('hidden')");
+			// Re-enable Save (re-deriving from input.trim()) and restore the
+			// label so the user can edit and retry.
+			expect(body).toMatch(/apikeySaveBtn\.disabled\s*=/);
+			expect(body).toMatch(/apikeySaveBtn\.textContent\s*=\s*['"]Save['"]/);
+			expect(body).toContain("apikeyError.classList.remove('hidden')");
+			// Fall-back string when the host posts an empty/non-string message.
+			expect(body).toContain("Failed to save the API key.");
+		});
+
+		it("applyConfigured(true) hides the apikey-panel along with the onboarding-panel", () => {
+			const js = buildSidebarScript();
+			// The apikey-panel is a sub-view of the configured===false flow,
+			// so the same configured:changed(true) hand-off that retires the
+			// onboarding cards must retire the input view too. Otherwise a
+			// successful save would flip configured but leave the input
+			// stranded on top of the tab UI.
+			const start = js.indexOf("function applyConfigured");
+			const trueBranch = js.indexOf(
+				"onboardingPanel.classList.add('hidden')",
+				start,
+			);
+			expect(trueBranch).toBeGreaterThan(-1);
+			const window = js.slice(trueBranch, trueBranch + 400);
+			expect(window).toContain("apikeyPanel.classList.add('hidden')");
+		});
+
+		it("applyConfigured(false) resets to the cards view (not the apikey-panel)", () => {
+			const js = buildSidebarScript();
+			// The apikey-panel is not a stable state — it's a transient
+			// sub-view the user opted into. If configured flips back to
+			// false (e.g. user signed out), reset to the cards so they can
+			// pick API key OR Sign In again, not whichever sub-view they
+			// happened to be on last.
+			const start = js.indexOf("function applyConfigured");
+			const falseBranch = js.indexOf(
+				"onboardingPanel.classList.remove('hidden')",
+				start,
+			);
+			expect(falseBranch).toBeGreaterThan(-1);
+			const window = js.slice(falseBranch, falseBranch + 400);
+			expect(window).toContain("apikeyPanel.classList.add('hidden')");
 		});
 
 		it("reads configured from init state", () => {

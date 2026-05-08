@@ -235,13 +235,38 @@ describe("onboarding panel styles", () => {
 		expect(css).toContain("var(--vscode-descriptionForeground)");
 	});
 
-	it("shares the onboarding-panel container rule with .disabled-panel", () => {
+	it("shares the onboarding-panel container rule with .disabled-panel and .apikey-panel", () => {
 		const css = buildSidebarCss();
-		// .disabled-panel reuses the onboarding container (padding/scroll/
-		// height) by way of a multi-selector rule rather than redeclaring
-		// the same declarations. This keeps the two full-viewport panels in
-		// lockstep so tweaking onboarding spacing automatically applies to
-		// the disabled CTA without a parallel edit.
-		expect(css).toMatch(/\.onboarding-panel\s*,\s*\.disabled-panel\s*\{/);
+		// All three full-viewport configured===false views (onboarding cards,
+		// apikey input, and disabled CTA) reuse the same container rule
+		// (padding/scroll/height) by way of a multi-selector rule rather
+		// than redeclaring the same declarations. This keeps tweaks to
+		// onboarding spacing in lockstep across every sibling panel.
+		expect(css).toMatch(
+			/\.onboarding-panel\s*,\s*\.disabled-panel\s*,\s*\.apikey-panel\s*\{/,
+		);
+	});
+
+	it("declares apikey-panel-specific styles for input + inline error", () => {
+		const css = buildSidebarCss();
+		// The inline API key entry has three custom pieces beyond the shared
+		// container: the label (.apikey-label), the password input
+		// (.apikey-input), and the inline error span (.apikey-error). The
+		// input is themed via --vscode-input-* so it matches Settings + the
+		// rest of the host UI.
+		expect(css).toMatch(/\.apikey-label\b/);
+		expect(css).toMatch(/\.apikey-input\b/);
+		expect(css).toMatch(/\.apikey-error\b/);
+		expect(css).toContain("var(--vscode-input-background)");
+		expect(css).toContain("var(--vscode-errorForeground)");
+	});
+
+	it("disables the .ob-btn:disabled state so the Save button has visible affordance when empty", () => {
+		const css = buildSidebarCss();
+		// The apikey-panel Save button starts disabled and toggles based on
+		// input value. Without the :disabled rule it'd look identical to the
+		// active state, which would make the apikey form look broken on
+		// first paint.
+		expect(css).toMatch(/\.ob-btn:disabled\s*\{/);
 	});
 });

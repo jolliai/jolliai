@@ -298,4 +298,15 @@ export type SidebarInboundMsg =
 	| { readonly type: "enabled:changed"; readonly enabled: boolean }
 	| { readonly type: "auth:changed"; readonly authenticated: boolean }
 	| { readonly type: "configured:changed"; readonly configured: boolean }
-	| { readonly type: "worker:busy"; readonly busy: boolean };
+	| { readonly type: "worker:busy"; readonly busy: boolean }
+	| {
+			/**
+			 * Posted only on the failure path of the inline onboarding API key
+			 * save (jollimemory.saveAnthropicApiKey). The success path is
+			 * implicit: a successful save flips `configured` true via
+			 * statusStore, which triggers the existing `configured:changed`
+			 * channel and retires the apikey-panel through `applyConfigured(true)`.
+			 */
+			readonly type: "apikey:saveError";
+			readonly message: string;
+	  };

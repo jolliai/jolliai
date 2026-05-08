@@ -24,18 +24,29 @@ const {
 	dispose: vi.fn(),
 }));
 
+const { mockNotifyApiKeySaveError } = vi.hoisted(() => ({
+	mockNotifyApiKeySaveError: vi.fn(),
+}));
+
 const { isWorkerBusy } = vi.hoisted(() => ({
 	isWorkerBusy: vi.fn(),
 }));
 
-const { loadConfig, getGlobalConfigDir, saveConfig, acquireLock, releaseLock } =
-	vi.hoisted(() => ({
-		loadConfig: vi.fn(),
-		getGlobalConfigDir: vi.fn(() => "/home/user/.jolli/jollimemory"),
-		saveConfig: vi.fn(),
-		acquireLock: vi.fn(),
-		releaseLock: vi.fn(),
-	}));
+const {
+	loadConfig,
+	getGlobalConfigDir,
+	saveConfig,
+	saveConfigScoped,
+	acquireLock,
+	releaseLock,
+} = vi.hoisted(() => ({
+	loadConfig: vi.fn(),
+	getGlobalConfigDir: vi.fn(() => "/home/user/.jolli/jollimemory"),
+	saveConfig: vi.fn(),
+	saveConfigScoped: vi.fn(),
+	acquireLock: vi.fn(),
+	releaseLock: vi.fn(),
+}));
 
 const {
 	cleanupV1IfExpired,
@@ -488,6 +499,7 @@ vi.mock("../../cli/src/core/SessionTracker.js", () => ({
 	loadConfig,
 	getGlobalConfigDir,
 	saveConfig,
+	saveConfigScoped,
 	acquireLock,
 	releaseLock,
 }));
@@ -761,6 +773,11 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		refreshKnowledgeBaseFolders() {}
 		notifyEnabledChanged() {}
 		notifyAuthChanged() {}
+		notifyConfiguredChanged() {}
+		// Tracked via a shared vi.fn so saveAnthropicApiKey-error tests can
+		// assert the failure-path message routing without needing access to
+		// the constructed instance.
+		notifyApiKeySaveError = mockNotifyApiKeySaveError;
 	},
 }));
 
@@ -4054,6 +4071,97 @@ describe("Extension", () => {
 
 			expect(showWarningMessage).toHaveBeenCalled();
 			expect(mockAuthService.signOut).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("saveAnthropicApiKey command", () => {
+		// Sidebar onboarding inline-input save path. The success branch is
+		// implicit: saveConfigScoped + statusStore.refresh make `configured`
+		// flip true, which triggers the existing configured:changed channel.
+		// We don't post an explicit success ack — only failures post
+		// apikey:saveError so the panel can re-enable Save and show inline.
+
+		it("registers the saveAnthropicApiKey command", () => {
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.saveAnthropicApiKey");
+			expect(handler).toBeDefined();
+		});
+
+		it("saves only the apiKey field and refreshes statusStore on success", async () => {
+			activate(makeContext());
+			saveConfigScoped.mockResolvedValueOnce(undefined);
+			mockStatusStore.refresh.mockClear();
+
+			const handler = getRegisteredCommand("jollimemory.saveAnthropicApiKey");
+			await handler("sk-ant-test-key");
+
+			// The update is scoped to apiKey only — no hooks/integrations/etc.
+			// get rewritten. This is the contract that lets us bypass the
+			// full Settings webview without losing user-set fields elsewhere.
+			expect(saveConfigScoped).toHaveBeenCalledWith(
+				{ apiKey: "sk-ant-test-key" },
+				"/home/user/.jolli/jollimemory",
+			);
+			// statusStore.refresh re-derives `configured` from
+			// signedIn || hasApiKey, so it must run after save to flip the
+			// onboarding panel away. Without this the panel stays open.
+			expect(mockStatusStore.refresh).toHaveBeenCalled();
+			// Success path is implicit — no explicit error post.
+			expect(mockNotifyApiKeySaveError).not.toHaveBeenCalled();
+		});
+
+		it("trims surrounding whitespace before saving (paste-with-newline tolerance)", async () => {
+			activate(makeContext());
+			saveConfigScoped.mockResolvedValueOnce(undefined);
+
+			const handler = getRegisteredCommand("jollimemory.saveAnthropicApiKey");
+			await handler("  sk-ant-pasted  \n");
+
+			expect(saveConfigScoped).toHaveBeenCalledWith(
+				{ apiKey: "sk-ant-pasted" },
+				expect.any(String),
+			);
+		});
+
+		it("rejects empty input without touching disk and surfaces inline error", async () => {
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.saveAnthropicApiKey");
+			await handler("   ");
+
+			// No write attempt — we don't want an empty-string apiKey on disk
+			// even transiently, since downstream code may treat empty-string
+			// differently from undefined.
+			expect(saveConfigScoped).not.toHaveBeenCalled();
+			expect(mockNotifyApiKeySaveError).toHaveBeenCalledWith(
+				"API key cannot be empty.",
+			);
+		});
+
+		it("rejects non-string input (defensive against malformed webview message) without saving", async () => {
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.saveAnthropicApiKey");
+			await handler(42 as unknown);
+
+			expect(saveConfigScoped).not.toHaveBeenCalled();
+			expect(mockNotifyApiKeySaveError).toHaveBeenCalled();
+		});
+
+		it("posts apikey:saveError with the error message when saveConfigScoped throws", async () => {
+			activate(makeContext());
+			saveConfigScoped.mockRejectedValueOnce(new Error("EROFS: read-only fs"));
+
+			const handler = getRegisteredCommand("jollimemory.saveAnthropicApiKey");
+			await handler("sk-ant-real-key");
+
+			// We don't assert on mockStatusStore.refresh here because the
+			// activation path (initialLoad / hook-path refresh) calls it
+			// asynchronously and races with this test. The contract that
+			// matters — and that the user actually observes — is that the
+			// failure surfaces through notifyApiKeySaveError so the panel
+			// can re-enable Save and show the inline error.
+			expect(mockNotifyApiKeySaveError).toHaveBeenCalledWith(
+				"EROFS: read-only fs",
+			);
 		});
 	});
 

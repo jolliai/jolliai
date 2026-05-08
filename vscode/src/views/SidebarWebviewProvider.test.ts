@@ -1000,6 +1000,36 @@ describe("SidebarWebviewProvider", () => {
 		).toBe(true);
 	});
 
+	it("notifyApiKeySaveError posts apikey:saveError with the supplied message", () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: false,
+				activeTab: "status",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		provider.notifyApiKeySaveError("disk full");
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		expect(
+			sent.some(
+				(m) =>
+					typeof m === "object" &&
+					m !== null &&
+					(m as { type?: unknown }).type === "apikey:saveError" &&
+					(m as { message?: unknown }).message === "disk full",
+			),
+		).toBe(true);
+	});
+
 	it("notifyConfiguredChanged posts configured:changed with the new configured flag", () => {
 		const view = makeMockView();
 		const provider = new SidebarWebviewProvider({
@@ -1124,6 +1154,7 @@ describe("SidebarWebviewProvider", () => {
 		expect(() => provider.notifyEnabledChanged(false)).not.toThrow();
 		expect(() => provider.notifyAuthChanged(true)).not.toThrow();
 		expect(() => provider.notifyConfiguredChanged(false)).not.toThrow();
+		expect(() => provider.notifyApiKeySaveError("anything")).not.toThrow();
 	});
 
 	// onSidebarFirstVisible fires exactly once across multiple `ready` messages —
