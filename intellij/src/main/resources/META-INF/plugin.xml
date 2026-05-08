@@ -115,23 +115,8 @@
                     icon="AllIcons.Actions.Refresh"/>
         </group>
 
-        <!-- Memories panel actions (includes Enable/Disable/Settings moved from Status) -->
+        <!-- Memories panel actions -->
         <group id="JolliMemory.MemoriesActions" text="JolliMemory Memories">
-            <action id="JolliMemory.Enable"
-                    class="ai.jolli.jollimemory.actions.EnableAction"
-                    text="Enable Jolli Memory"
-                    description="Install Jolli Memory hooks"
-                    icon="AllIcons.Actions.Execute"/>
-            <action id="JolliMemory.Disable"
-                    class="ai.jolli.jollimemory.actions.DisableAction"
-                    text="Disable Jolli Memory"
-                    description="Remove Jolli Memory hooks"
-                    icon="AllIcons.Actions.Suspend"/>
-            <action id="JolliMemory.StatusSettings"
-                    class="ai.jolli.jollimemory.actions.StatusSettingsAction"
-                    text="Settings"
-                    description="Jolli Memory settings"
-                    icon="AllIcons.General.GearPlain"/>
             <action id="JolliMemory.SearchMemories"
                     class="ai.jolli.jollimemory.actions.SearchMemoriesAction"
                     text="Search Memories"

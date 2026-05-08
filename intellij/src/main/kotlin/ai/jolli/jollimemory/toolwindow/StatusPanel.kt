@@ -11,7 +11,6 @@ import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.Disposable
-import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
@@ -27,7 +26,6 @@ import java.awt.event.MouseEvent
 import java.awt.image.BufferedImage
 import javax.swing.Box
 import javax.swing.DefaultListModel
-import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JPanel
@@ -60,24 +58,10 @@ class StatusPanel(
         cellRenderer = StatusRowRenderer()
         selectionMode = ListSelectionModel.SINGLE_SELECTION
     }
-    private val toggleButton = JButton("Enable Jolli Memory").apply {
-        putClientProperty("JButton.buttonType", "default")
-    }
-    private val disabledLabel = JBLabel(
-        "<html>" +
-            "Every commit deserves a Memory.<br/><br/>" +
-            "Jolli Memory automatically captures your AI conversations " +
-            "and generates structured summaries for each commit — so you " +
-            "always remember why.<br/><br/>" +
-            "Summaries are stored locally alongside your project. The original " +
-            "AI conversation is never stored — only the distilled summary." +
-            "</html>",
-    )
     private val statusListener: () -> Unit = { SwingUtilities.invokeLater { refreshUI() } }
 
     init {
         border = JBUI.Borders.empty(8)
-        toggleButton.addActionListener { onToggle() }
 
         // Double-click on clickable rows triggers the action (dialog input)
         statusList.addMouseListener(object : MouseAdapter() {
@@ -107,40 +91,20 @@ class StatusPanel(
         refreshUI()
     }
 
-    /** Opens the full settings dialog. */
-    private fun openSettingsDialog() {
-        val dialog = SettingsDialog(project, service)
-        if (dialog.showAndGet()) {
-            refreshUI()
-        }
-    }
-
     private fun refreshUI() {
         removeAll()
 
         val status = service.getStatus()
 
-        if (status == null || !status.enabled) {
-            val wrapper = Box.createVerticalBox().apply {
-                add(disabledLabel.apply {
-                    alignmentX = Component.LEFT_ALIGNMENT
-                })
-                add(Box.createVerticalStrut(12))
-                add(toggleButton.apply {
-                    text = "Enable Jolli Memory"
-                    isEnabled = true
-                    alignmentX = Component.LEFT_ALIGNMENT
-                    maximumSize = java.awt.Dimension(Int.MAX_VALUE, preferredSize.height)
-                })
-            }
-            add(wrapper, BorderLayout.NORTH)
-            // Register as default button so the LAF renders it as blue/primary
-            SwingUtilities.invokeLater { toggleButton.rootPane?.defaultButton = toggleButton }
+        if (status == null) {
+            add(JBLabel("Initializing...").apply {
+                border = JBUI.Borders.empty(4, 8)
+            }, BorderLayout.NORTH)
             revalidate(); repaint()
             return
         }
 
-        // Enabled state — build status rows
+        // Build status rows
         // Use main repo root for config (worktrees share config with main repo)
         val cwd = service.mainRepoRoot ?: project.basePath ?: ""
         val config = loadLayeredConfig(cwd)
@@ -296,47 +260,6 @@ class StatusPanel(
 
         // Check against index + aliases (same as VS Code's indexEntryMap.has(hash))
         return store.filterCommitsWithSummary(hashes).size
-    }
-
-    private fun onToggle() {
-        val status = service.getStatus()
-
-        // Disabling — no scope dialog needed
-        if (status?.enabled == true) {
-            toggleButton.isEnabled = false
-            toggleButton.text = "Disabling..."
-            ApplicationManager.getApplication().executeOnPooledThread {
-                service.uninstall()
-                SwingUtilities.invokeLater {
-                    toggleButton.isEnabled = true
-                    refreshUI()
-                }
-            }
-            return
-        }
-
-        // Enabling
-        toggleButton.isEnabled = false
-        toggleButton.text = "Enabling..."
-
-        ApplicationManager.getApplication().executeOnPooledThread {
-            // Initialize service if not yet done
-            if (status == null) {
-                service.initialize()
-            }
-
-            service.install()
-
-            // Delay slightly to ensure file writes are visible, then refresh status
-            // and force all panels to re-read state. This runs on the pooled thread
-            // BEFORE switching to EDT, so the status is fully updated.
-            service.refreshStatus()
-
-            SwingUtilities.invokeLater {
-                toggleButton.isEnabled = true
-                refreshUI()
-            }
-        }
     }
 
     override fun dispose() {

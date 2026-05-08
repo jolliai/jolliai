@@ -77,7 +77,7 @@ import kotlin.io.path.isRegularFile
 import kotlin.io.path.name
 
 /**
- * KBExplorerPanel — Knowledge Base folder browser with context menu, drag-and-drop,
+ * KBExplorerPanel — Memory Bank folder browser with context menu, drag-and-drop,
  * selection highlighting, and metadata sync.
  */
 class KBExplorerPanel(
@@ -681,7 +681,7 @@ class KBExplorerPanel(
 
         val destDir = Path.of(chosen[0].path)
         if (!destDir.startsWith(root)) {
-            Messages.showWarningDialog(project, "Destination must be inside the Knowledge Base folder.", "Move")
+            Messages.showWarningDialog(project, "Destination must be inside the Memory Bank folder.", "Move")
             return
         }
 

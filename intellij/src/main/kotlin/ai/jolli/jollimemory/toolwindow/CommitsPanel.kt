@@ -138,8 +138,7 @@ class CommitsPanel(
 
     /**
      * Force refresh that bypasses the refreshVersion stale-discard mechanism.
-     * Used after Enable/Disable to guarantee the UI updates regardless of
-     * concurrent refresh races.
+     * Guarantees the UI updates regardless of concurrent refresh races.
      */
     fun forceRefresh() {
         ApplicationManager.getApplication().executeOnPooledThread {
@@ -149,7 +148,7 @@ class CommitsPanel(
                 return@executeOnPooledThread
             }
             if (!status.enabled) {
-                SwingUtilities.invokeLater { showDisabled() }
+                SwingUtilities.invokeLater { showInitializing() }
                 return@executeOnPooledThread
             }
             try {
@@ -226,7 +225,7 @@ class CommitsPanel(
             return
         }
         if (!status.enabled) {
-            SwingUtilities.invokeLater { if (refreshVersion == myVersion) showDisabled() }
+            SwingUtilities.invokeLater { if (refreshVersion == myVersion) showInitializing() }
             return
         }
 
@@ -259,14 +258,7 @@ class CommitsPanel(
 
     private fun showInitializing() {
         removeAll()
-        emptyLabel.text = "<html><center>Initializing JolliMemory...</center></html>"
-        add(emptyLabel, BorderLayout.CENTER)
-        revalidate(); repaint()
-    }
-
-    private fun showDisabled() {
-        removeAll()
-        emptyLabel.text = "Jolli Memory is disabled."
+        emptyLabel.text = "<html><center>Initializing Jolli Memory...</center></html>"
         add(emptyLabel, BorderLayout.CENTER)
         revalidate(); repaint()
     }

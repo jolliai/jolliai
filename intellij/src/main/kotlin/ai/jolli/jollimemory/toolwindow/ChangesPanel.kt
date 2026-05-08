@@ -147,7 +147,7 @@ class ChangesPanel(
             return
         }
         if (!status.enabled) {
-            SwingUtilities.invokeLater { if (refreshVersion == myVersion) showDisabled() }
+            SwingUtilities.invokeLater { if (refreshVersion == myVersion) showInitializing() }
             return
         }
 
@@ -161,14 +161,7 @@ class ChangesPanel(
 
     private fun showInitializing() {
         removeAll()
-        emptyLabel.text = "<html><center>Initializing JolliMemory...</center></html>"
-        add(emptyLabel, BorderLayout.CENTER)
-        revalidate(); repaint()
-    }
-
-    private fun showDisabled() {
-        removeAll()
-        emptyLabel.text = "Jolli Memory is disabled."
+        emptyLabel.text = "<html><center>Initializing Jolli Memory...</center></html>"
         add(emptyLabel, BorderLayout.CENTER)
         revalidate(); repaint()
     }

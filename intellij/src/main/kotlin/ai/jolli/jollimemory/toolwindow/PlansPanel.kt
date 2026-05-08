@@ -226,7 +226,7 @@ class PlansPanel(
             return
         }
         if (!status.enabled) {
-            SwingUtilities.invokeLater { showDisabled() }
+            SwingUtilities.invokeLater { showInitializing() }
             return
         }
 
@@ -320,12 +320,6 @@ class PlansPanel(
         revalidate(); repaint()
     }
 
-    private fun showDisabled() {
-        removeAll()
-        emptyLabel.text = "Jolli Memory is disabled."
-        add(emptyLabel, BorderLayout.CENTER)
-        revalidate(); repaint()
-    }
 
     private fun updateList(items: List<ListItem>) {
         removeAll()

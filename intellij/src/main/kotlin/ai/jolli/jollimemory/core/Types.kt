@@ -295,6 +295,8 @@ data class JolliMemoryConfig(
     val knowledgeBasePath: String? = null,
     val knowledgeBaseSort: String? = null,  // "date" | "name"
     val storageMode: String? = null,        // "orphan" | "dual-write" | "folder"
+    /** When true, hooks are uninstalled and the plugin is paused without losing config. */
+    val paused: Boolean? = null,
 )
 
 /** Registry of all active sessions */

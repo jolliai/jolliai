@@ -2,7 +2,7 @@
 
 > *Every commit deserves a Memory. Every memory deserves a Recall.*
 
-**Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort.
+**Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. It also includes **Jolli Site** — generate polished documentation sites from Markdown and OpenAPI specs with a single command.
 
 When you work with AI agents like Claude Code, Codex, Gemini CLI or OpenCode, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
@@ -239,6 +239,93 @@ jolli clean --yes
 ```
 
 **Safety**: in a non-TTY environment (CI, pipes, redirected stdin), `clean` refuses to delete without `--yes` and exits with code 1. This prevents scripts from silently wiping data.
+
+## Jolli Site — documentation from your content folder
+
+The CLI also includes a site generation surface that turns a plain folder of Markdown files and OpenAPI specs into a polished Nextra v4 documentation site.
+
+### `jolli new [folder-name]`
+
+Scaffolds a new Content_Folder with starter files: `site.json` (configuration), sample Markdown pages, and an example OpenAPI spec.
+
+```bash
+jolli new my-docs
+cd my-docs
+jolli dev          # live preview at localhost:3000
+```
+
+### `jolli dev [source-root]`
+
+Starts a development server with hot reload. Edits to Markdown, MDX, or OpenAPI files in the source folder are mirrored and rendered instantly via Next.js HMR.
+
+```bash
+jolli dev                  # current directory
+jolli dev ./my-docs        # specific folder
+jolli dev --migrate        # re-detect framework config
+jolli dev --verbose        # detailed build output
+```
+
+### `jolli build [source-root]`
+
+Builds a static site with full-text search indexing (Pagefind). No server is started.
+
+```bash
+jolli build
+```
+
+### `jolli start [source-root]`
+
+Builds the static site + search index, then serves it locally.
+
+```bash
+jolli start
+```
+
+### `jolli convert [source]`
+
+Converts an existing Docusaurus documentation folder to Nextra-compatible structure. Creates a timestamped backup when converting in-place.
+
+```bash
+jolli convert                      # convert current directory
+jolli convert ./old-docs           # convert specific folder
+jolli convert --output ./new-docs  # output to a different folder
+```
+
+What it does: detects sidebar config, reorganizes directory structure, downgrades incompatible `.mdx` to `.md`, rewrites image paths, writes a clean `site.json`, and removes framework-specific files.
+
+### How it works
+
+1. **Content_Folder** — your Markdown files, images, and OpenAPI specs live in a plain folder. `site.json` at the root configures title, navigation, theme, and footer.
+2. **Mirror + Render** — the CLI mirrors content into a hidden build directory (`~/.jolli/sites/<hash>/`), renders OpenAPI specs into interactive API docs, generates sidebar navigation from the folder structure, and runs Next.js under the hood.
+3. **Theme Packs** — choose from `forge` (clean developer-docs, default), `default` (vanilla Nextra), or `atlas` (editorial, dark serif). Set in `site.json` under `theme.pack`.
+
+### `site.json` reference
+
+```json
+{
+  "title": "My Docs",
+  "description": "Project documentation",
+  "nav": [
+    { "title": "Home", "href": "/" },
+    { "title": "API", "href": "/api/openapi" }
+  ],
+  "theme": { "pack": "forge" }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | Site title (required) |
+| `description` | string | Site description (required) |
+| `nav` | array | Top navbar links (required) |
+| `header` | object | Advanced dropdown navbar |
+| `footer` | object | Copyright, columns, social icons |
+| `sidebar` | object | Folder → navigation label overrides |
+| `pathMappings` | object | Source → target folder remapping |
+| `theme` | object | Pack, colors, fonts, logo |
+| `favicon` | string | Path to favicon file |
+
+---
 
 ## Session Context Recall
 

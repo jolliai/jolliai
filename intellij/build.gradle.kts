@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.98.3"
+version = "0.99.0"
 
 repositories {
     mavenCentral()
@@ -132,6 +132,35 @@ intellijPlatform {
             </p>
         """.trimIndent()
         changeNotes = """
+            <h3>0.99.0</h3>
+            <ul>
+                <li><b>Simplified setup flow</b> &mdash; removed the separate Enable/Disable step;
+                    hooks are now auto-installed when you save credentials and auto-removed when
+                    credentials are cleared. No more &ldquo;configured but not enabled&rdquo; limbo state</li>
+                <li><b>Onboarding screen</b> &mdash; first-run wizard detects existing API keys
+                    (config or <code>ANTHROPIC_API_KEY</code> env var) and skips onboarding automatically</li>
+                <li><b>Tabbed Settings dialog</b> &mdash; reorganized into five tabs: General,
+                    AI Agents, AI Summary, Sync to Jolli, and Memory Bank. Remembers last
+                    selected tab within the IDE session</li>
+                <li><b>AI Summary tab</b> &mdash; provider dropdown (Anthropic / Jolli) with
+                    contextual UI: Anthropic shows key + model + max tokens; Jolli shows site
+                    name and Advanced panel to view/edit Jolli API Key</li>
+                <li><b>Provider credential warnings</b> &mdash; status indicator turns yellow when
+                    the selected provider&rsquo;s API key is missing; hover popup shows which key is needed</li>
+                <li><b>Sync to Jolli tab</b> &mdash; shows sign-in/sign-out state with clear
+                    messaging when Jolli API key is missing</li>
+                <li><b>Memory Bank</b> &mdash; renamed from Knowledge Base; tab title and all
+                    UI references updated</li>
+                <li><b>Pause toggle</b> &mdash; temporarily disable hooks without losing configuration,
+                    available in the General tab</li>
+                <li><b>Auto-disable on sign-out</b> &mdash; signing out or clearing all credentials
+                    automatically uninstalls hooks and returns to the onboarding screen</li>
+                <li><b>Refined icons</b> &mdash; new key icon for Anthropic option, cleaner cloud
+                    sync and git-merge icons</li>
+                <li><b>Settings always accessible</b> &mdash; gear icon now in the tool window
+                    title bar, visible regardless of which panels are open</li>
+            </ul>
+
             <h3>0.98.1</h3>
             <ul>
                 <li><b>Full migration</b> &mdash; migration now includes all child summaries,

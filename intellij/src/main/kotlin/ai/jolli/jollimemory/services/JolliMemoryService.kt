@@ -179,6 +179,19 @@ class JolliMemoryService(private val project: Project) : Disposable {
             sb.appendLine("KB folder init/migration failed: ${e.message}")
         }
 
+        // Auto-install hooks if configured and not paused (eliminates the separate "Enable" step)
+        val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+        val hasCredentials = !config.apiKey.isNullOrBlank() ||
+            !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
+            !config.jolliApiKey.isNullOrBlank()
+        val isPaused = config.paused == true
+        if (hasCredentials && !isPaused && cachedStatus?.enabled != true) {
+            sb.appendLine("Auto-installing hooks (configured + not paused + not yet enabled)")
+            install()
+            refreshStatus()
+            sb.appendLine("status after auto-install=${cachedStatus}")
+        }
+
         isInitialized = true
         initLog = sb.toString()
         log.info("Initialize complete:\n$initLog")
