@@ -38,6 +38,7 @@ import {
 } from "./GitOps.js";
 import { acquireLock, releaseLock } from "./SessionTracker.js";
 import {
+	AmbiguousHashError,
 	deleteTranscript,
 	expandSourcesForConsolidation,
 	getIndex,
@@ -291,12 +292,10 @@ describe("SummaryStore", () => {
 	describe("getSummary (direct-read)", () => {
 		// readFileFromBranch is mocked per test. Lookup contract:
 		//   1. Try readSummaryFile(hash) -- 1 read; if it returns non-null, return.
-		//   2. Otherwise loadIndex (1 read), check commitAliases, optional tree-hash
-		//      scan, then a final readSummaryFile(matchedHash) when an alias hits.
-		//
-		// Direct file read returns the original summary for any hash that ever
-		// owned a `summaries/{hash}.json` file -- which is every hash that entered
-		// the system, since mergeManyToOne / migrateOneToOne never delete old files.
+		//   2. Otherwise loadIndex (1 read), then branch by input length:
+		//      - 40-char SHA → check commitAliases, then tree-hash fallback.
+		//      - shorter prefix → index prefix scan (own describe block below),
+		//        then tree-hash fallback.
 
 		it("returns the original summary directly via readSummaryFile (root hash)", async () => {
 			const summary = createMockSummary();
@@ -323,17 +322,21 @@ describe("SummaryStore", () => {
 			expect(result?.topics?.[0].title).toBe("Fix login");
 		});
 
-		it("falls back to commitAliases when direct read misses", async () => {
-			const summary = createMockSummary("knownhash00");
-			const index = v3Index([rootEntry("knownhash00")], { unknownhash0: "knownhash00" });
+		it("falls back to commitAliases when direct read misses (40-char old SHA → new SHA)", async () => {
+			// Alias keys are 40-char in production — use 40-char fixtures so the
+			// length-branched lookup takes the alias-map path rather than prefix scan.
+			const oldHash = "1111111111111111111111111111111111111111";
+			const newHash = "2222222222222222222222222222222222222222";
+			const summary = createMockSummary(newHash);
+			const index = v3Index([rootEntry(newHash)], { [oldHash]: newHash });
 
 			vi.mocked(readFileFromBranch)
-				.mockResolvedValueOnce(null) // direct readSummaryFile("unknownhash0") miss
+				.mockResolvedValueOnce(null) // direct readSummaryFile(oldHash) miss
 				.mockResolvedValueOnce(JSON.stringify(index)) // loadIndex
 				.mockResolvedValueOnce(JSON.stringify(summary)); // readSummaryFile(aliasHash)
 
-			const result = await getSummary("unknownhash0");
-			expect(result?.commitHash).toBe("knownhash00");
+			const result = await getSummary(oldHash);
+			expect(result?.commitHash).toBe(newHash);
 		});
 
 		it("returns null when the file read fails AND there is no index", async () => {
@@ -355,9 +358,209 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch)
 				.mockResolvedValueOnce(null) // direct miss
 				.mockResolvedValueOnce(JSON.stringify(index)); // loadIndex (no aliases match)
-			// getTreeHash mock left unconfigured -> resolves to undefined, no match
+			// getTreeHash mock left unconfigured -> resolves to null, no match.
+			// Use 18-char input so the prefix-scan branch runs and produces 0
+			// matches (knownhash00 doesn't start with absolutely-unknown).
 			const result = await getSummary("absolutely-unknown");
 			expect(result).toBeNull();
+		});
+	});
+
+	describe("getSummary (abbreviated-hash prefix scan)", () => {
+		// Inputs shorter than 40 characters take the index-prefix-scan branch
+		// after Step 1 misses. Resolution is purely in-memory via index.entries.
+
+		const ENTRY_ONE = "abcdef1234567890abcdef1234567890abcdef12"; // 40 chars
+		const ENTRY_TWO = "abcdef9876543210abcdef9876543210abcdef98"; // 40 chars, shares "abcdef" prefix
+		const ENTRY_THREE = "fedcba0000000000000000000000000000000000";
+
+		it("resolves an abbreviated hash to the unique matching entry without touching git or alias map", async () => {
+			const summary = createMockSummary(ENTRY_ONE);
+			const index = v3Index([rootEntry(ENTRY_ONE), rootEntry(ENTRY_THREE)]);
+
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1 readSummaryFile("abcdef12") miss
+				.mockResolvedValueOnce(JSON.stringify(index)) // loadIndex
+				.mockResolvedValueOnce(JSON.stringify(summary)); // readSummaryFile(matched.commitHash)
+
+			// "abcdef12" matches only ENTRY_ONE (ENTRY_THREE starts with "fedcba")
+			const result = await getSummary("abcdef12");
+			expect(result?.commitHash).toBe(ENTRY_ONE);
+			// The behavioral assertion: prefix scan resolves without invoking
+			// the git tree-hash subprocess. Read counts are intentionally NOT
+			// asserted — they're an implementation detail (caching / batching
+			// could change them) and the no-git-call check is the contract.
+			expect(vi.mocked(getTreeHash)).not.toHaveBeenCalled();
+		});
+
+		it("throws AmbiguousHashError when an abbreviated hash matches multiple entries", async () => {
+			const index = v3Index([rootEntry(ENTRY_ONE), rootEntry(ENTRY_TWO), rootEntry(ENTRY_THREE)]);
+
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1 miss
+				.mockResolvedValueOnce(JSON.stringify(index)); // loadIndex
+
+			// "abcdef" matches both ENTRY_ONE and ENTRY_TWO
+			let caught: unknown;
+			try {
+				await getSummary("abcdef");
+			} catch (error: unknown) {
+				caught = error;
+			}
+			expect(caught).toBeInstanceOf(AmbiguousHashError);
+			expect((caught as AmbiguousHashError).prefix).toBe("abcdef");
+			// Order of matches is incidental (could change to e.g. sort by date
+			// for deterministic display) — only the SET of colliding hashes is
+			// part of the contract.
+			expect([...(caught as AmbiguousHashError).matches].sort()).toEqual([ENTRY_ONE, ENTRY_TWO].sort());
+			expect((caught as AmbiguousHashError).matches).toHaveLength(2);
+			expect((caught as AmbiguousHashError).message).toContain("abbreviation `abcdef` is ambiguous");
+		});
+
+		it("falls through to tree-hash fallback when an abbreviated hash has no prefix match in the index", async () => {
+			// The hash isn't in the index by name, but git might still resolve it.
+			// We can't exercise the tree-hash hit branch here (it's marked
+			// `v8 ignore`), but we verify that we ATTEMPT the cross-tree fallback
+			// — getTreeHash should be called.
+			const index = v3Index([rootEntry(ENTRY_ONE)]);
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1 miss
+				.mockResolvedValueOnce(JSON.stringify(index)); // loadIndex
+			vi.mocked(getTreeHash).mockResolvedValueOnce(null); // no tree resolved → null result
+
+			// "deadbeef" has 0 prefix matches (ENTRY_ONE starts with "abcdef…")
+			const result = await getSummary("deadbeef");
+			expect(result).toBeNull();
+			expect(vi.mocked(getTreeHash)).toHaveBeenCalledWith("deadbeef", undefined);
+		});
+
+		it("treats very short prefixes the same as longer ones — multiple matches still throw", async () => {
+			// Validates that we don't need a hard minimum-length check at the
+			// resolver level: an extremely short input simply hits more entries
+			// and surfaces the same AmbiguousHashError, which carries the user-
+			// actionable signal.
+			const index = v3Index([rootEntry(ENTRY_ONE), rootEntry(ENTRY_TWO)]);
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1 miss
+				.mockResolvedValueOnce(JSON.stringify(index)); // loadIndex
+
+			await expect(getSummary("a")).rejects.toThrow(AmbiguousHashError);
+		});
+
+		it("lowercases the user input before resolving (UPPERCASE prefix still hits)", async () => {
+			// Index `commitHash` values are stored lowercase. Without normalizing
+			// at the resolver boundary, `--commit ABCDEF12` would scan against
+			// lowercase entries and miss every step except the v3 tree-hash
+			// fallback. We lowercase up front so all callers (CLI, sidebar, URI
+			// handler) see consistent behavior.
+			const summary = createMockSummary(ENTRY_ONE);
+			const index = v3Index([rootEntry(ENTRY_ONE)]);
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1 miss (lowercase already)
+				.mockResolvedValueOnce(JSON.stringify(index))
+				.mockResolvedValueOnce(JSON.stringify(summary));
+
+			const result = await getSummary("ABCDEF12"); // uppercase prefix
+			expect(result?.commitHash).toBe(ENTRY_ONE);
+		});
+
+		it("returns null on an empty index (no entries to scan)", async () => {
+			// Sanity edge case: prefix scan over zero entries returns 0 matches
+			// and falls through to Step 4 cleanly.
+			const index = v3Index([]);
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1 miss
+				.mockResolvedValueOnce(JSON.stringify(index)); // loadIndex (empty)
+			vi.mocked(getTreeHash).mockResolvedValueOnce(null);
+
+			const result = await getSummary("abcdef12");
+			expect(result).toBeNull();
+		});
+
+		it("works against a v1 index — prefix scan matches entries regardless of index version", async () => {
+			// v1 indexes have entries with `parentCommitHash: undefined` (vs v3's
+			// explicit null). The prefix-scan loop iterates `index.entries`
+			// without referencing parentCommitHash, so it should resolve cleanly
+			// — and Step 4 (cross-tree) is gated to v3 only, so v1 input that
+			// misses prefix scan ends up null with no git call.
+			const summary = createMockSummary(ENTRY_ONE);
+			const v1Entry: SummaryIndexEntry = {
+				commitHash: ENTRY_ONE,
+				parentCommitHash: undefined, // v1 marker
+				commitMessage: "v1 commit",
+				commitDate: "2026-02-19T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-02-19T10:00:05Z",
+			};
+			const v1Index: SummaryIndex = { version: 1, entries: [v1Entry] };
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1 miss
+				.mockResolvedValueOnce(JSON.stringify(v1Index)) // loadIndex
+				.mockResolvedValueOnce(JSON.stringify(summary)); // readSummaryFile(matched)
+
+			const result = await getSummary("abcdef12");
+			expect(result?.commitHash).toBe(ENTRY_ONE);
+			// Step 4 was gated to v3 — v1 with 0 prefix matches must NOT call git.
+			expect(vi.mocked(getTreeHash)).not.toHaveBeenCalled();
+		});
+
+		it("v1 index with a non-matching prefix returns null and skips Step 4", async () => {
+			// Verifies the Step-4-gated-to-v3 behavior on the miss path.
+			const v1Entry: SummaryIndexEntry = {
+				commitHash: ENTRY_ONE,
+				parentCommitHash: undefined,
+				commitMessage: "v1",
+				commitDate: "2026-02-19T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-02-19T10:00:05Z",
+			};
+			const v1Index: SummaryIndex = { version: 1, entries: [v1Entry] };
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null).mockResolvedValueOnce(JSON.stringify(v1Index));
+
+			const result = await getSummary("deadbeef"); // no prefix match
+			expect(result).toBeNull();
+			expect(vi.mocked(getTreeHash)).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("getSummary (full-SHA Step 4 fallthrough)", () => {
+		// Locks in the four-step contract for full SHA inputs that miss
+		// Steps 1+2 — i.e. direct file read fails AND alias map has no entry.
+		// Without this we only test Step 4 fallthrough on the abbreviated branch.
+
+		it("returns null when 40-char input misses direct file, alias map, AND tree-hash", async () => {
+			const fullHash = "ffffffffffffffffffffffffffffffffffffffff";
+			const otherEntry = "0000000000000000000000000000000000000001";
+			const index = v3Index([rootEntry(otherEntry)]); // no alias for fullHash, no matching tree
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1 miss
+				.mockResolvedValueOnce(JSON.stringify(index)); // loadIndex
+			// getTreeHash mock: we let it resolve to null to confirm Step 4 was
+			// invoked but produced no match.
+			vi.mocked(getTreeHash).mockResolvedValueOnce(null);
+
+			const result = await getSummary(fullHash);
+			expect(result).toBeNull();
+			expect(vi.mocked(getTreeHash)).toHaveBeenCalledWith(fullHash, undefined);
+		});
+
+		it("hits commitAliases via lowercase normalization when the input is UPPERCASE 40-char", async () => {
+			// Catches the case the reviewer flagged: alias map keys are
+			// lowercase in production, so an UPPERCASE 40-char input must
+			// lowercase before lookup or the alias path silently misses.
+			const oldHashLower = "abcdef1234567890abcdef1234567890abcdef12";
+			const oldHashUpper = oldHashLower.toUpperCase();
+			const newHash = "1111111111111111111111111111111111111111";
+			const summary = createMockSummary(newHash);
+			const index = v3Index([rootEntry(newHash)], { [oldHashLower]: newHash });
+
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1: readSummaryFile(lowercase) miss
+				.mockResolvedValueOnce(JSON.stringify(index)) // loadIndex
+				.mockResolvedValueOnce(JSON.stringify(summary)); // readSummaryFile(aliasHash)
+
+			const result = await getSummary(oldHashUpper);
+			expect(result?.commitHash).toBe(newHash);
 		});
 	});
 

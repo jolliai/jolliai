@@ -32,7 +32,7 @@ import { DEFAULT_CATALOG_LIMIT, DEFAULT_SEARCH_BUDGET } from "./Search.js";
 import type { SearchProvider, SearchSource } from "./SearchProvider.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { getDisplayDate } from "./SummaryFormat.js";
-import { getCatalogWithLazyBuild, getIndex, getSummary } from "./SummaryStore.js";
+import { AmbiguousHashError, getCatalogWithLazyBuild, getIndex, getSummary } from "./SummaryStore.js";
 import { collectDisplayTopics } from "./SummaryTree.js";
 import { estimateTokens } from "./TokenEstimator.js";
 
@@ -166,7 +166,21 @@ export class LocalSearchProvider implements SearchProvider {
 		let totalTokens = 0;
 
 		for (const hash of options.hashes) {
-			const summary = await getSummary(hash, this.cwd, this.storage);
+			let summary: CommitSummary | null;
+			try {
+				summary = await getSummary(hash, this.cwd, this.storage);
+			} catch (error: unknown) {
+				// Abbreviated hash collided with multiple index entries. We log it
+				// and record the ambiguous input in `failedHashes` so the LLM
+				// caller sees a partial result rather than a 500-style abort —
+				// other unambiguous hashes in the same batch are still loaded.
+				if (error instanceof AmbiguousHashError) {
+					log.debug("loadHits: %s is ambiguous (%d matches) — skipping", hash, error.matches.length);
+					failed.push(hash);
+					continue;
+				}
+				throw error;
+			}
 			if (!summary) {
 				log.debug("loadHits: no summary for %s — recording as failed", hash.substring(0, 8));
 				failed.push(hash);

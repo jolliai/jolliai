@@ -13,6 +13,11 @@ const { mockExecFileSync } = vi.hoisted(() => ({
 
 vi.mock("node:child_process", () => ({
 	execFileSync: mockExecFileSync,
+	// `printAmbiguousHash`'s tests import the real AmbiguousHashError from
+	// SummaryStore.ts → which transitively imports GitOps.ts → which calls
+	// `promisify(execFile)` at module load. Stub it to a no-op so the
+	// import doesn't blow up; we don't actually invoke any git here.
+	execFile: () => undefined,
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({
@@ -219,6 +224,64 @@ describe("CliUtils", () => {
 			const { SAFE_ARGUMENT_PATTERN } = await import("./CliUtils.js");
 			expect(SAFE_ARGUMENT_PATTERN.test("branch;rm -rf /")).toBe(false);
 			expect(SAFE_ARGUMENT_PATTERN.test("$(whoami)")).toBe(false);
+		});
+	});
+
+	describe("printAmbiguousHash", () => {
+		// 40-char SHA fixtures matching production: AmbiguousHashError.matches
+		// always carries `index.entries[].commitHash` values which are 40 chars.
+		const SHA_A = "abc1234567890abc1234567890abc1234567890ab";
+		const SHA_B = "abc9876543210abc9876543210abc9876543210ab";
+		const SHA_C = "abc1111111111111111111111111111111111111ab";
+
+		it("prints the prefix, count, and full match list when matches fit the display cap", async () => {
+			const { printAmbiguousHash } = await import("./CliUtils.js");
+			const { AmbiguousHashError } = await import("../core/SummaryStore.js");
+			const matches = [SHA_A.slice(0, 40), SHA_B.slice(0, 40), SHA_C.slice(0, 40)];
+			const out: string[] = [];
+			const origLog = console.log;
+			console.log = (msg: string) => out.push(msg);
+			try {
+				printAmbiguousHash(new AmbiguousHashError("abc", matches));
+			} finally {
+				console.log = origLog;
+			}
+			const joined = out.join("\n");
+			expect(joined).toContain("abbreviation `abc` is ambiguous");
+			expect(joined).toContain("Matched 3 commits");
+			for (const hash of matches) expect(joined).toContain(hash);
+			// No "and N more" line when under the cap.
+			expect(joined).not.toContain("more");
+		});
+
+		it("truncates long match lists and adds an 'and N more' tail", async () => {
+			// A 1-2 char abbreviation in a large repo can collide with hundreds
+			// of entries — printing them all floods the terminal. We cap the
+			// visible list at 10 and summarize the rest. Use realistic 40-char
+			// SHAs so the formatter sees production-shaped input.
+			const { printAmbiguousHash } = await import("./CliUtils.js");
+			const { AmbiguousHashError } = await import("../core/SummaryStore.js");
+			const matches = Array.from({ length: 25 }, (_, i) => {
+				const stem = `${String(i).padStart(2, "0")}`;
+				return (stem + "0".repeat(40)).slice(0, 40); // 40-char hex
+			});
+			const out: string[] = [];
+			const origLog = console.log;
+			console.log = (msg: string) => out.push(msg);
+			try {
+				printAmbiguousHash(new AmbiguousHashError("00", matches));
+			} finally {
+				console.log = origLog;
+			}
+			const joined = out.join("\n");
+			expect(joined).toContain("Matched 25 commits");
+			// First 10 are listed.
+			for (let i = 0; i < 10; i++) {
+				expect(joined).toContain(matches[i]);
+			}
+			// The 11th and beyond are NOT inlined.
+			expect(joined).not.toContain(matches[10]);
+			expect(joined).toContain("and 15 more");
 		});
 	});
 });

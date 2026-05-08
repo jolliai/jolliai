@@ -5,13 +5,19 @@ import { DEFAULT_CATALOG_LIMIT, DEFAULT_SEARCH_BUDGET } from "./Search.js";
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
-vi.mock("./SummaryStore.js", () => ({
-	getCatalogWithLazyBuild: vi.fn(),
-	getIndex: vi.fn(),
-	getSummary: vi.fn(),
-}));
+vi.mock("./SummaryStore.js", async () => {
+	const actual = await vi.importActual<typeof import("./SummaryStore.js")>("./SummaryStore.js");
+	return {
+		// Real AmbiguousHashError so loadHits's `instanceof` check matches the
+		// errors thrown by mocked getSummary.
+		AmbiguousHashError: actual.AmbiguousHashError,
+		getCatalogWithLazyBuild: vi.fn(),
+		getIndex: vi.fn(),
+		getSummary: vi.fn(),
+	};
+});
 
-import { getCatalogWithLazyBuild, getIndex, getSummary } from "./SummaryStore.js";
+import { AmbiguousHashError, getCatalogWithLazyBuild, getIndex, getSummary } from "./SummaryStore.js";
 
 const mockGetIndex = vi.mocked(getIndex);
 const mockGetCatalog = vi.mocked(getCatalogWithLazyBuild);
@@ -484,6 +490,38 @@ describe("LocalSearchProvider.loadHits", () => {
 		const result = await provider.loadHits({ query: "auth", hashes: ["found", "missing"] });
 		expect(result.results).toHaveLength(1);
 		expect(result.failedHashes).toEqual(["missing"]);
+	});
+
+	it("records ambiguous abbreviated hashes in failedHashes without aborting the batch", async () => {
+		// loadHits used to bubble any throw out, which would 500-style abort the
+		// whole search request the moment one abbreviated hash was ambiguous.
+		// We catch AmbiguousHashError, mark just that hash as failed, and keep
+		// loading the rest so the LLM caller still gets a partial result it can
+		// reason about (and try a longer prefix on next iteration).
+		mockGetSummary.mockImplementation(async (hash: string) => {
+			if (hash === "good1234") return makeSummary("good1234");
+			if (hash === "ambig") {
+				throw new AmbiguousHashError("ambig", [
+					"ambig1111111111111111111111111111111111",
+					"ambig2222222222222222222222222222222222",
+				]);
+			}
+			return null;
+		});
+		const provider = new LocalSearchProvider("/test");
+		const result = await provider.loadHits({ query: "x", hashes: ["good1234", "ambig"] });
+		expect(result.results).toHaveLength(1);
+		expect(result.results[0].hash).toBe("good1234");
+		expect(result.failedHashes).toEqual(["ambig"]);
+	});
+
+	it("propagates non-Ambiguous errors from getSummary (don't silently swallow)", async () => {
+		// Defensive: only AmbiguousHashError is caught. Anything else (storage
+		// failure, OOM, etc.) should bubble up so it isn't masked as "failed
+		// hash".
+		mockGetSummary.mockRejectedValueOnce(new Error("storage offline"));
+		const provider = new LocalSearchProvider("/test");
+		await expect(provider.loadHits({ query: "x", hashes: ["whatever"] })).rejects.toThrow("storage offline");
 	});
 
 	it("emits identity / provenance / narrative fields on each hit", async () => {

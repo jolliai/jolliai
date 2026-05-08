@@ -10,6 +10,7 @@
 import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
+import type { AmbiguousHashError } from "../core/SummaryStore.js";
 import { compareSemver, traverseDistPaths } from "../install/DistPathResolver.js";
 
 /** Package version — injected by Vite at build time, falls back to "dev" when running via tsx. */
@@ -138,6 +139,33 @@ export function formatShortDate(iso: string): string {
 /** Returns true when stdin is an interactive terminal (not piped/CI). */
 export function isInteractive(): boolean {
 	return process.stdin.isTTY === true;
+}
+
+/** Cap on how many colliding hashes we list when an abbreviation is ambiguous. */
+const AMBIGUOUS_DISPLAY_LIMIT = 10;
+
+/**
+ * Prints a git-style "abbreviation is ambiguous" message for {@link AmbiguousHashError}.
+ *
+ * Shared by `view` / `export` / any future command whose `--commit <ref>` calls
+ * `getSummary` with potentially abbreviated input. Caller is responsible for
+ * setting `process.exitCode` so a single helper covers both quiet (subcommand)
+ * and noisy (top-level) callers without surprising them.
+ *
+ * Trims `matches` to {@link AMBIGUOUS_DISPLAY_LIMIT} so a 1-2 character prefix
+ * against a multi-thousand-commit repo doesn't flood the terminal.
+ */
+export function printAmbiguousHash(error: AmbiguousHashError): void {
+	console.log(`\n  abbreviation \`${error.prefix}\` is ambiguous; please use a longer prefix.`);
+	console.log(`  Matched ${error.matches.length} commits:`);
+	const head = error.matches.slice(0, AMBIGUOUS_DISPLAY_LIMIT);
+	for (const hash of head) {
+		console.log(`    ${hash}`);
+	}
+	if (error.matches.length > AMBIGUOUS_DISPLAY_LIMIT) {
+		console.log(`    … and ${error.matches.length - AMBIGUOUS_DISPLAY_LIMIT} more`);
+	}
+	console.log("");
 }
 
 /**
