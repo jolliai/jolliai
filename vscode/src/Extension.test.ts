@@ -4163,6 +4163,8 @@ describe("Extension", () => {
 					summary,
 					expect.anything(),
 					"/test/workspace",
+					expect.anything(), // bridge
+					"main", // mainBranch from mocked CommitsStore.getMainBranch()
 					"commit",
 				);
 				// Summary route must NOT trigger the OAuth path.
@@ -4186,10 +4188,11 @@ describe("Extension", () => {
 				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
 			});
 
-			it("accepts a 7-char short hash (defensive lower bound of the regex)", async () => {
-				const summary = { hash: "abc1234", content: "x" };
-				mockBridge.getSummary.mockResolvedValue(summary);
-
+			it("rejects abbreviated hashes (must be a full 40-char SHA)", async () => {
+				// `bridge.getSummary` falls through to alias / tree-hash resolution
+				// for non-direct hits, which silently resolves the wrong commit when
+				// two distinct commits share the same tree (cherry-pick, identical
+				// re-commit). Same hardening as `search --hashes`.
 				const handler = getHandler();
 				await handler.handleUri({
 					path: "/summary/abc1234",
@@ -4197,8 +4200,8 @@ describe("Extension", () => {
 					toString: () => "vscode://jolli.jollimemory-vscode/summary/abc1234",
 				});
 
-				expect(mockBridge.getSummary).toHaveBeenCalledWith("abc1234");
-				expect(MockSummaryWebviewPanel.show).toHaveBeenCalled();
+				expect(mockBridge.getSummary).not.toHaveBeenCalled();
+				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
 			});
 
 			it("ignores malformed hash (rejects non-hex / wrong length)", async () => {

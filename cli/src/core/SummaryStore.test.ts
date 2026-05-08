@@ -156,8 +156,6 @@ describe("SummaryStore", () => {
 			const summary = createMockSummary();
 			await storeSummary(summary, undefined, false, {
 				transcript: {
-					version: 1,
-					commitHash: summary.commitHash,
 					sessions: [
 						{
 							sessionId: "claude/session-1",
@@ -1117,9 +1115,9 @@ describe("SummaryStore", () => {
 						...createMockSummary("old1"),
 						e2eTestGuide: [
 							{
-								name: "checkout flow",
+								title: "checkout flow",
 								steps: ["open cart", "submit order"],
-								expectedResult: "order succeeds",
+								expectedResults: ["order succeeds"],
 							},
 						],
 					},
@@ -1136,9 +1134,9 @@ describe("SummaryStore", () => {
 			expect(merged.commitSource).toBe("plugin");
 			expect(merged.e2eTestGuide).toEqual([
 				{
-					name: "checkout flow",
+					title: "checkout flow",
 					steps: ["open cart", "submit order"],
-					expectedResult: "order succeeds",
+					expectedResults: ["order succeeds"],
 				},
 			]);
 		});

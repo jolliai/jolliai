@@ -208,6 +208,81 @@ describe("LocalSearchProvider.buildCatalog", () => {
 		expect(result.entries.map((e) => e.fullHash)).toEqual(["recent"]);
 	});
 
+	it("uses getDisplayDate (generatedAt || commitDate) for --since and sort, not raw commitDate", async () => {
+		// Regression: amend / rebase / cherry-pick preserve the original git
+		// author date but bump generatedAt. If the filter or sort used raw
+		// commitDate, a memory just amended yesterday on top of a 90-day-old
+		// commit would silently fall out of `--since 7d` and be ranked behind
+		// genuinely older entries. Every other recency-sensitive path in jolli
+		// (SessionStartHook, ViewCommand, listSummaries) uses getDisplayDate.
+		const recent = new Date().toISOString();
+		const old = new Date(Date.now() - 90 * 86_400_000).toISOString();
+		mockGetIndex.mockResolvedValue({
+			version: 3,
+			entries: [
+				// Just-amended entry: old commitDate (author date preserved by amend),
+				// fresh generatedAt (re-summarized at amend time).
+				{
+					commitHash: "amended",
+					parentCommitHash: null,
+					branch: "x",
+					commitMessage: "amended yesterday",
+					commitDate: old,
+					generatedAt: recent,
+				},
+				// Untouched entry: both fields old.
+				{
+					commitHash: "untouched",
+					parentCommitHash: null,
+					branch: "x",
+					commitMessage: "old, never touched",
+					commitDate: old,
+					generatedAt: old,
+				},
+			],
+		});
+		mockGetCatalog.mockResolvedValue({ version: 1, entries: [] });
+		const provider = new LocalSearchProvider("/test");
+		const result = await provider.buildCatalog({ query: "q", since: "7d" });
+		// `amended` survives the 7d window via generatedAt; `untouched` does not.
+		expect(result.entries.map((e) => e.fullHash)).toEqual(["amended"]);
+	});
+
+	it("sorts newest-first by getDisplayDate so just-amended entries float above newer-author-date entries", async () => {
+		const t0 = new Date("2026-01-01T00:00:00.000Z").toISOString();
+		const t1 = new Date("2026-02-01T00:00:00.000Z").toISOString();
+		const t2 = new Date("2026-03-01T00:00:00.000Z").toISOString();
+		mockGetIndex.mockResolvedValue({
+			version: 3,
+			entries: [
+				// Newer author date, but never re-summarized after initial commit.
+				{
+					commitHash: "newer-author",
+					parentCommitHash: null,
+					branch: "x",
+					commitMessage: "newer author date",
+					commitDate: t1,
+					generatedAt: t1,
+				},
+				// Older author date, but recently amended (bumps generatedAt to t2).
+				{
+					commitHash: "amended-recently",
+					parentCommitHash: null,
+					branch: "x",
+					commitMessage: "amended recently",
+					commitDate: t0,
+					generatedAt: t2,
+				},
+			],
+		});
+		mockGetCatalog.mockResolvedValue({ version: 1, entries: [] });
+		const provider = new LocalSearchProvider("/test");
+		const result = await provider.buildCatalog({ query: "q" });
+		// `amended-recently` has the newer activity and must sort first, even
+		// though `newer-author` has the newer commitDate.
+		expect(result.entries.map((e) => e.fullHash)).toEqual(["amended-recently", "newer-author"]);
+	});
+
 	it("respects --limit", async () => {
 		mockGetIndex.mockResolvedValue(makeIndex(["a", "b", "c", "d"]));
 		mockGetCatalog.mockResolvedValue({ version: 1, entries: [] });
@@ -440,12 +515,12 @@ describe("LocalSearchProvider.loadHits", () => {
 	it("emits diffStats when present on the source summary", async () => {
 		mockGetSummary.mockResolvedValueOnce(
 			makeSummary("withstats", {
-				diffStats: { files: 7, insertions: 123, deletions: 45 },
+				diffStats: { filesChanged: 7, insertions: 123, deletions: 45 },
 			}),
 		);
 		const provider = new LocalSearchProvider("/test");
 		const result = await provider.loadHits({ query: "x", hashes: ["withstats"] });
-		expect(result.results[0].diffStats).toEqual({ files: 7, insertions: 123, deletions: 45 });
+		expect(result.results[0].diffStats).toEqual({ filesChanged: 7, insertions: 123, deletions: 45 });
 	});
 
 	it("emits the full topics array — title / trigger / response / decisions / category / importance / filesAffected", async () => {
@@ -516,10 +591,10 @@ describe("LocalSearchProvider.loadHits", () => {
 		// Optional fields should be absent from the JSON, not present as undefined
 		// (skill template's schema doc tells the LLM "optional" — rendering must
 		// not see literal `undefined`).
-		expect(Object.hasOwn(topic, "todo")).toBe(false);
-		expect(Object.hasOwn(topic, "filesAffected")).toBe(false);
-		expect(Object.hasOwn(topic, "category")).toBe(false);
-		expect(Object.hasOwn(topic, "importance")).toBe(false);
+		expect("todo" in topic).toBe(false);
+		expect("filesAffected" in topic).toBe(false);
+		expect("category" in topic).toBe(false);
+		expect("importance" in topic).toBe(false);
 	});
 
 	it("does NOT emit matches[] or commit-level filesAffected (removed in the rich-topics rewrite)", async () => {
@@ -531,8 +606,8 @@ describe("LocalSearchProvider.loadHits", () => {
 		mockGetSummary.mockResolvedValueOnce(makeSummary("noredundant"));
 		const provider = new LocalSearchProvider("/test");
 		const result = await provider.loadHits({ query: "anything", hashes: ["noredundant"] });
-		const hit = result.results[0] as Record<string, unknown>;
-		expect(hit.matches).toBeUndefined();
-		expect(hit.filesAffected).toBeUndefined();
+		const hit = result.results[0];
+		expect(hit).not.toHaveProperty("matches");
+		expect(hit).not.toHaveProperty("filesAffected");
 	});
 });
