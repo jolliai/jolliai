@@ -13,6 +13,12 @@
  *     key). In that mode the tab bar and tab content are hidden; the onboarding
  *     panel takes the entire viewport. The Anthropic API key path is positioned
  *     as the recommended primary option above the secondary Sign in to Jolli card.
+ *   - An API key entry panel sibling, hidden by default. Shown when the user
+ *     clicks "Configure API Key" from the onboarding panel — replaces the
+ *     onboarding cards with a focused input + Save/Back so users can save the
+ *     key without opening the full Settings page (which surfaces a dozen
+ *     unrelated fields). Successful save flips `configured` to true via
+ *     statusStore, which hides this panel through `applyConfigured(true)`.
  *   - A disabled panel sibling, hidden by default. Shown when the user is
  *     configured but has explicitly disabled the extension (`state.enabled ===
  *     false`). It reuses the onboarding header copy + the `.ob-*` styles, but
@@ -89,11 +95,25 @@ export function buildSidebarHtml(
           <i class="codicon codicon-cloud ob-card-icon" aria-hidden="true"></i>
           <div class="ob-card-text">
             <h3 class="ob-card-title">Sign in to Jolli</h3>
-            <p class="ob-card-desc">Use Jolli's cloud to sync memories across machines and get AI summarization out of the box. Free to get started.</p>
+            <p class="ob-card-desc">Use your Jolli account for AI summarization. Memories are stored locally, with the option to push to Jolli cloud.</p>
           </div>
         </div>
       </section>
       <button type="button" id="onboarding-signin-btn" class="ob-btn ob-btn--secondary">Sign In / Sign Up</button>
+    </div>
+    <div class="apikey-panel hidden" id="apikey-panel" role="region" aria-label="Configure Anthropic API key">
+      <header class="ob-header">
+        <div class="ob-title-row">
+          <i class="codicon codicon-key ob-title-icon" aria-hidden="true"></i>
+          <h2 class="ob-title">Configure your Anthropic API key</h2>
+        </div>
+        <p class="ob-subtitle">Paste your Anthropic API key. The key is stored locally only.</p>
+      </header>
+      <label class="apikey-label" for="apikey-input">API key</label>
+      <input type="password" id="apikey-input" class="apikey-input" autocomplete="off" spellcheck="false" placeholder="sk-ant-..." />
+      <p class="apikey-error hidden" id="apikey-error" role="alert"></p>
+      <button type="button" id="apikey-save-btn" class="ob-btn ob-btn--primary" disabled>Save</button>
+      <button type="button" id="apikey-back-btn" class="ob-btn ob-btn--secondary">Back</button>
     </div>
     <div class="disabled-panel hidden" id="disabled-panel" role="region" aria-label="Enable Jolli Memory">
       <header class="ob-header">

@@ -380,6 +380,17 @@ export class SidebarWebviewProvider
 		this.postMessage({ type: "configured:changed", configured });
 	}
 
+	/**
+	 * Pushed only on the failure path of the inline onboarding API key save.
+	 * Successful saves flip `configured` and ride the regular
+	 * `configured:changed` channel — no explicit success ack here. The
+	 * failure path needs an explicit message because nothing in
+	 * statusStore changes to trigger the existing reactive plumbing.
+	 */
+	notifyApiKeySaveError(message: string): void {
+		this.postMessage({ type: "apikey:saveError", message });
+	}
+
 	private pushStatus(): void {
 		if (!this.deps.statusProvider) return;
 		this.postMessage({

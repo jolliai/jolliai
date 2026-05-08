@@ -595,7 +595,8 @@ export function buildSidebarCss(): string {
      button only — no option cards, no OR divider). Sharing the
      container rule keeps padding/scroll behavior in lockstep. */
   .onboarding-panel,
-  .disabled-panel {
+  .disabled-panel,
+  .apikey-panel {
     padding: 16px;
     overflow-y: auto;
     height: 100%;
@@ -679,6 +680,45 @@ export function buildSidebarCss(): string {
     border-color: var(--vscode-widget-border, var(--vscode-editorWidget-border));
   }
   .ob-btn--secondary:hover { background: var(--vscode-list-hoverBackground); }
+  .ob-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .ob-btn:disabled:hover { background: var(--vscode-button-background); }
+  /* ── API key entry panel ──────────────────────────────────────────
+     Reuses .ob-header / .ob-btn from the onboarding panel. The label +
+     input pair sits between the header and the Save/Back buttons. The
+     inline error span is hidden via .hidden by default and surfaces
+     only after the host posts an apikey:saveError back. */
+  .apikey-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    margin: 12px 0 6px 0;
+    color: var(--vscode-foreground);
+  }
+  .apikey-input {
+    display: block;
+    width: 100%;
+    padding: 6px 8px;
+    box-sizing: border-box;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, var(--vscode-widget-border, transparent));
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: var(--vscode-editor-font-family, monospace);
+  }
+  .apikey-input:focus {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+  }
+  .apikey-error {
+    margin: 8px 0 0 0;
+    font-size: 12px;
+    color: var(--vscode-errorForeground);
+    line-height: 1.4;
+  }
   .ob-or {
     display: flex; align-items: center; gap: 10px;
     margin: 14px 0;

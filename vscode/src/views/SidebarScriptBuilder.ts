@@ -126,6 +126,16 @@ export function buildSidebarScript(): string {
   // onboarding panel; mutually exclusive with it.
   const disabledPanel = document.getElementById('disabled-panel');
   const disabledEnableBtn = document.getElementById('disabled-enable-btn');
+  // API key entry panel — replaces the onboarding cards when the user
+  // clicks "Configure API Key". Also a sibling of onboarding-panel: only
+  // one of {onboarding, apikey, disabled} is visible at any time when
+  // configured===false. Successful save flips configured to true via
+  // statusStore, after which applyConfigured(true) hides this panel.
+  const apikeyPanel = document.getElementById('apikey-panel');
+  const apikeyInput = document.getElementById('apikey-input');
+  const apikeyError = document.getElementById('apikey-error');
+  const apikeySaveBtn = document.getElementById('apikey-save-btn');
+  const apikeyBackBtn = document.getElementById('apikey-back-btn');
   // Loading panel — visible on first paint (no .hidden in HTML), then
   // hidden as soon as the host's init message arrives. Bridges the gap
   // between webview-load and the first real configured/enabled values
@@ -393,16 +403,70 @@ export function buildSidebarScript(): string {
     vscode.postMessage({ type: 'command', command: enableBtn.dataset.command || 'jollimemory.enableJolliMemory' });
   });
 
-  // Onboarding panel buttons. The Anthropic API key path is the recommended
-  // primary action and routes to the existing Settings webview (where the
-  // user already configures their API key); Sign In / Sign Up runs the
-  // OAuth-based jollimemory.signIn command.
+  // Onboarding panel buttons. Configure API Key swaps the cards view for the
+  // inline apikey-panel (single input + Save) so the user doesn't have to
+  // open the full Settings webview just to set one value. Sign In / Sign Up
+  // runs the OAuth-based jollimemory.signIn command.
   onboardingApikeyBtn.addEventListener('click', function() {
-    vscode.postMessage({ type: 'command', command: 'jollimemory.openSettings' });
+    showApikeyPanel();
   });
   onboardingSigninBtn.addEventListener('click', function() {
     vscode.postMessage({ type: 'command', command: 'jollimemory.signIn' });
   });
+
+  // ---- API key entry panel ----
+  // showApikeyPanel / showOnboardingPanel toggle exclusively between the two
+  // configured===false views. Only one of {onboarding-panel, apikey-panel}
+  // is visible at a time. Both are hidden simultaneously by applyConfigured(true)
+  // when the user finishes configuring (typed key saved or signed in).
+  function showApikeyPanel() {
+    onboardingPanel.classList.add('hidden');
+    apikeyPanel.classList.remove('hidden');
+    apikeyError.classList.add('hidden');
+    apikeyError.textContent = '';
+    apikeyInput.value = '';
+    apikeySaveBtn.disabled = true;
+    apikeySaveBtn.textContent = 'Save';
+    setTimeout(function() { apikeyInput.focus(); }, 0);
+  }
+  function showOnboardingPanel() {
+    apikeyPanel.classList.add('hidden');
+    onboardingPanel.classList.remove('hidden');
+  }
+  apikeyBackBtn.addEventListener('click', showOnboardingPanel);
+  apikeyInput.addEventListener('input', function() {
+    apikeySaveBtn.disabled = apikeyInput.value.trim().length === 0;
+    // Typing dismisses any prior error so the user isn't staring at a stale
+    // message while editing.
+    if (!apikeyError.classList.contains('hidden')) {
+      apikeyError.classList.add('hidden');
+      apikeyError.textContent = '';
+    }
+  });
+  apikeyInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !apikeySaveBtn.disabled) {
+      e.preventDefault();
+      submitApikey();
+    }
+  });
+  apikeySaveBtn.addEventListener('click', submitApikey);
+  function submitApikey() {
+    const key = apikeyInput.value.trim();
+    if (key.length === 0) return;
+    apikeySaveBtn.disabled = true;
+    apikeySaveBtn.textContent = 'Saving…';
+    apikeyError.classList.add('hidden');
+    apikeyError.textContent = '';
+    // Successful save flips configured via statusStore.onChange → the panel
+    // is hidden by applyConfigured(true). Failure comes back as an
+    // 'apikey:saveError' message handled below; we re-enable the Save button
+    // and surface the error inline.
+    vscode.postMessage({
+      type: 'command',
+      command: 'jollimemory.saveAnthropicApiKey',
+      args: [key],
+    });
+  }
 
   // Disabled-panel Enable button — same command as the legacy in-Status
   // disabled-banner Enable button (jollimemory.enableJolliMemory). Wired
@@ -426,15 +490,18 @@ export function buildSidebarScript(): string {
   });
 
   function handleMessage(msg) {
+    // Tear down the first-paint loading placeholder on the FIRST host message,
+    // not just on init. Used to gate this on init exclusively, but the hosts
+    // statusStore.refresh during initialLoad fires onChange synchronously and
+    // posts configured:changed / enabled:changed BEFORE the gated init —
+    // those handlers call applyConfigured/applyEnabled which un-hide the
+    // onboarding-panel or disabled-panel while loading-panel is still up,
+    // leaving both stacked in the flex column. Hiding here covers every
+    // state-bearing entry path uniformly. Idempotent on already-hidden.
+    loadingPanel.classList.add('hidden');
     switch (msg.type) {
       case 'init':
         if (typeof msg.state.authenticated === 'boolean') state.authenticated = msg.state.authenticated;
-        // Tear down the first-paint loading placeholder once init lands —
-        // every following branch (degraded, configured, disabled, normal)
-        // unhides exactly the panel it owns, so this is the single hand-off
-        // point. Doing it before applyDegraded means degraded paths don't
-        // need to know about the loading panel.
-        loadingPanel.classList.add('hidden');
         if (msg.state.degradedReason) {
           // Degraded path: no workspace folder open, or workspace is not a git
           // repo. Skip the rest of init (data providers aren't wired in this
@@ -478,12 +545,40 @@ export function buildSidebarScript(): string {
         // toolbar; re-render so the swap takes effect immediately.
         if (state.activeTab === 'status') renderToolbar();
         break;
-      case 'configured:changed':
+      case 'configured:changed': {
+        // Capture the prior value BEFORE applyConfigured mutates state.configured —
+        // we use the false→true edge to detect "user just finished onboarding"
+        // (either sign-in OAuth callback or API key save). Same-value pushes
+        // (host re-broadcasts during background refresh, init race) leave
+        // wasConfigured===true so the auto-switch below is skipped.
+        const wasConfigured = state.configured;
         applyConfigured(!!msg.configured);
         // After flipping configured back to true we're back on the regular
         // UI surface; refresh the toolbar so the active-tab buttons reflect
         // the current state (e.g. Sign In/Out icon, worker-busy label).
-        if (msg.configured) renderToolbar();
+        if (msg.configured) {
+          // Land the user on the Status tab the first time they finish
+          // onboarding so they see the live state of what they just
+          // configured (auth status, settings entry, worker indicator)
+          // instead of the default Branch tab. Both sign-in and API key
+          // paths converge on this same configured=false→true transition.
+          if (!wasConfigured) switchTab('status');
+          renderToolbar();
+        }
+        break;
+      }
+      case 'apikey:saveError':
+        // Only re-enable Save + show the error if the apikey-panel is still
+        // the active surface. If the panel has been retired (success path
+        // raced past us), stay quiet — applyConfigured already hid us.
+        if (!apikeyPanel.classList.contains('hidden')) {
+          apikeySaveBtn.disabled = apikeyInput.value.trim().length === 0;
+          apikeySaveBtn.textContent = 'Save';
+          apikeyError.textContent = typeof msg.message === 'string' && msg.message.length > 0
+            ? msg.message
+            : 'Failed to save the API key.';
+          apikeyError.classList.remove('hidden');
+        }
         break;
       case 'worker:busy': {
         const next = !!msg.busy;
@@ -611,7 +706,11 @@ export function buildSidebarScript(): string {
   function applyConfigured(configured) {
     state.configured = !!configured;
     if (!configured) {
+      // Land on the cards view when configured flips back to false (e.g.
+      // user signed out). The apikey-panel is a sub-view of onboarding,
+      // not a stable state on its own, so we always reset back to cards.
       onboardingPanel.classList.remove('hidden');
+      apikeyPanel.classList.add('hidden');
       disabledPanel.classList.add('hidden');
       tabBar.classList.add('hidden');
       tabToolbar.classList.add('hidden');
@@ -622,6 +721,10 @@ export function buildSidebarScript(): string {
       return;
     }
     onboardingPanel.classList.add('hidden');
+    // Hide apikey-panel here too — when the user successfully saves a key,
+    // statusStore re-derives configured=true and we land here. This is the
+    // single hand-off that retires the apikey input view.
+    apikeyPanel.classList.add('hidden');
     // applyEnabled() now manages the .hidden flag on tabBar itself (it hides
     // the bar in disabled mode because disabled-panel owns the viewport),
     // so just delegate — no manual tabBar.classList.remove('hidden') needed.

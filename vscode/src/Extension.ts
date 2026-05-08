@@ -17,8 +17,10 @@ import {
 } from "../../cli/src/core/KBPathResolver.js";
 import {
 	acquireLock,
+	getGlobalConfigDir,
 	loadConfig,
 	releaseLock,
+	saveConfigScoped,
 } from "../../cli/src/core/SessionTracker.js";
 import {
 	cleanupV1IfExpired,
@@ -239,6 +241,7 @@ const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
 	"jollimemory.openInClaudeCode",
 	"jollimemory.signIn",
 	"jollimemory.signOut",
+	"jollimemory.saveAnthropicApiKey",
 ];
 
 /**
@@ -1994,6 +1997,36 @@ export function activate(context: vscode.ExtensionContext): void {
 				},
 			);
 		}),
+
+		// Inline onboarding API key save — wired from the sidebar's apikey-panel
+		// (the user clicks "Configure API Key" → types a key → Save). Touches
+		// only the apiKey field so we don't silently overwrite hooks /
+		// integrations / exclude patterns the user may have configured by other
+		// means. Successful save flips configured=true via statusStore.refresh,
+		// which retires the apikey-panel through the existing
+		// configured:changed plumbing — no explicit success ack needed here.
+		// On failure we surface the message inline through
+		// notifyApiKeySaveError so the user sees it without leaving the panel.
+		vscode.commands.registerCommand(
+			"jollimemory.saveAnthropicApiKey",
+			async (rawKey: unknown) => {
+				log.info("cmd", "saveAnthropicApiKey invoked");
+				const key = typeof rawKey === "string" ? rawKey.trim() : "";
+				if (key.length === 0) {
+					sidebarProvider.notifyApiKeySaveError("API key cannot be empty.");
+					return;
+				}
+				try {
+					await saveConfigScoped({ apiKey: key }, getGlobalConfigDir());
+					await statusStore.refresh();
+				} catch (err) {
+					const message =
+						err instanceof Error ? err.message : "Failed to save the API key.";
+					log.error("cmd", `saveAnthropicApiKey failed: ${message}`);
+					sidebarProvider.notifyApiKeySaveError(message);
+				}
+			},
+		),
 
 		// Auth — sign in / sign out via browser-based OAuth flow.
 		vscode.commands.registerCommand("jollimemory.signIn", async () => {
