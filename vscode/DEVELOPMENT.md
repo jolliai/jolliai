@@ -5,15 +5,14 @@
 ## First-time Setup
 
 ```bash
-# 1. Build the jollimemory core (the extension bundles it at build time via esbuild)
-cd cli
-npm install && npm run build
-
-# 2. Install extension dev dependencies
-cd ../vscode
+# 1. Install workspace dependencies (npm workspaces — run once at the repo root, covers cli + vscode)
 npm install
 
+# 2. Build the jollimemory core (the extension bundles it at build time via esbuild)
+npm run build:cli
+
 # 3. Deploy (bumps patch version, builds, packages, and installs into your VS Code)
+cd vscode
 npm run deploy
 ```
 
@@ -42,8 +41,8 @@ Ctrl+Shift+P → Developer: Reload Window
 The extension bundles `cli/src/**` at build time. If you change files under `cli/src/`, rebuild the core first:
 
 ```bash
-cd cli && npm run build
-cd ../vscode && npm run deploy
+npm run build:cli            # from the repo root
+cd vscode && npm run deploy
 ```
 
 ---
@@ -62,8 +61,11 @@ These hooks track which AI sessions are active. They only record session metadat
 | **Gemini CLI** | `GeminiAfterAgentHook` | Same stdin format as Claude's StopHook; additionally outputs `{}` to stdout (Gemini hook spec). |
 | **Codex CLI** | _(no hook)_ | Sessions discovered by scanning `~/.codex/sessions/` at post-commit time. |
 | **OpenCode** | _(no hook)_ | Sessions discovered by reading `~/.local/share/opencode/opencode.db` (SQLite) at post-commit time. Requires Node 22.5+ for `node:sqlite`; the discoverer is lazy-imported and feature-gated, so older hosts (e.g. VS Code's bundled Electron Node) silently skip OpenCode without breaking anything else. |
+| **Cursor IDE** (Composer) | _(no hook)_ | Sessions discovered by `CursorDetector` + `CursorSessionDiscoverer` scanning Cursor's workspace storage at post-commit time. |
+| **GitHub Copilot CLI** | _(no hook)_ | Sessions discovered by `CopilotDetector` + `CopilotSessionDiscoverer` scanning the Copilot CLI session log. |
+| **VS Code Copilot Chat** | _(no hook)_ | Sessions discovered by `CopilotChatDetector` + `CopilotChatSessionDiscoverer` reading the Copilot Chat conversation cache. |
 
-Per-integration enable/disable lives in the global config (`claudeEnabled`, `geminiEnabled`, `codexEnabled`, `openCodeEnabled`) and is toggled from the **Settings** webview. Discoverable-but-disabled integrations show up in the Status panel as "detected but disabled". OpenCode additionally surfaces a separate **scan-error** row when the DB is present but unreadable (corrupt, locked, schema-incompatible) — this avoids the past failure mode where a corrupt DB rendered as a healthy-looking integration.
+Per-integration enable/disable lives in the global config (`claudeEnabled`, `geminiEnabled`, `codexEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`) and is toggled from the **Settings** webview. The single `copilotEnabled` switch covers both Copilot CLI and Copilot Chat — splitting them was rejected because users almost always want them together. Discoverable-but-disabled integrations show up in the Status panel as "detected but disabled". OpenCode and the Copilot family additionally surface a separate **scan-error** row when their backing store is present but unreadable (corrupt, locked, schema-incompatible) — this avoids the past failure mode where a corrupt DB rendered as a healthy-looking integration.
 
 ### Git Hooks — Summary Generation Pipeline
 
@@ -105,7 +107,8 @@ src/
 │   └── CommitsStore.ts           # Branch commits + range selection
 │
 ├── services/                     # Stateless services
-│   ├── AuthService.ts            # OAuth callback URI handling, sign-in / sign-out, jollimemory.signedIn context key
+│   ├── AuthService.ts            # OAuth callback URI handling (code-exchange flow + CSRF state validation per RFC 6749), sign-in / sign-out, jollimemory.signedIn context key
+│   ├── ManualDisableFlag.ts      # Durable per-repo opt-out for auto-enable (set when user clicks Disable; respected on every activation)
 │   ├── JolliPushService.ts       # HTTP client for pushing summaries to a Jolli Space
 │   ├── PrCommentService.ts       # GitHub PR creation/update via gh CLI; PR section markers
 │   └── data/                     # Pure derivations consumed by providers (no VSCode imports, no state)
@@ -120,15 +123,24 @@ src/
 │   ├── MemoriesTreeProvider.ts
 │   ├── PlansTreeProvider.ts      # Plans + Notes (one panel)
 │   ├── FilesTreeProvider.ts
-│   └── HistoryTreeProvider.ts    # Commits + per-commit file children + checkbox range logic
+│   ├── HistoryTreeProvider.ts    # Commits + per-commit file children + checkbox range logic
+│   └── KnowledgeBaseTreeProvider.ts  # Branch-aware Memory Bank folder tree (the class name keeps the legacy "KnowledgeBase" identifier)
 │
 ├── views/                        # Webview panels (HTML + CSS + JS, served via webview API)
+│   ├── SidebarWebviewProvider.ts         # Top-level sidebar webview that renders the onboarding flow, status, Memory Bank folders, and acts as the host for the in-sidebar panels
+│   ├── SidebarHtmlBuilder.ts             # HTML assembly for the sidebar (onboarding panel, sections, Memory Bank tree)
+│   ├── SidebarCssBuilder.ts              # Sidebar stylesheet (CSP-compatible — no inline style)
+│   ├── SidebarScriptBuilder.ts           # Embedded JS — onboarding interactions, message bus, lazy data fetches
+│   ├── SidebarMessages.ts                # Typed message contracts between extension host and sidebar webview
+│   │
 │   ├── SummaryWebviewPanel.ts            # Per-commit summary panel (orchestrator)
 │   ├── SummaryHtmlBuilder.ts             # Assembles HTML from modular blocks
 │   ├── SummaryCssBuilder.ts              # Notion-like stylesheet
 │   ├── SummaryScriptBuilder.ts           # Embedded JS for toggles, edit/delete, PR interactions
-│   ├── SummaryMarkdownBuilder.ts         # Markdown export for clipboard / Jolli push
-│   ├── SummaryPrMarkdownBuilder.ts       # PR-section variant of the Markdown export
+│   ├── SummaryMarkdownBuilder.ts         # Single-commit Markdown export for clipboard / Jolli push
+│   ├── SummaryPrMarkdownBuilder.ts       # PR-section variant of the Markdown export (collapsible <details> per topic)
+│   ├── SummaryPrAggregateMarkdownBuilder.ts  # Multi-commit branch-summary variant — rolls up every commit on the branch into a single PR description
+│   ├── BranchSummaryLoader.ts            # Walks the branch and loads every commit's stored summary for the aggregate PR builder
 │   ├── SummaryUtils.ts                   # Shared helpers (HTML escaping, date formatting, topic sorting)
 │   │
 │   ├── SettingsWebviewPanel.ts           # Singleton settings form (API keys, integrations, exclude patterns, push action)
@@ -249,6 +261,19 @@ Both panels are singletons (one instance at a time, focused if reopened) and use
 **Memories panel — lazy load + filter** — The Memories tree only fetches its first page on first visibility (`onDidChangeVisibility` in `Extension.ts`). Subsequent loads come from the in-store cache. When a filter is active, the bridge returns the matched set in one call and the "Load More" affordance is suppressed; without a filter it paginates. All this logic is split between `MemoriesStore` (cache + cursor) and `MemoriesDataService` (pure derivations like the description string and `canLoadMore`).
 
 **Bulk export** — `ExportMemoriesCommand` exports every memory in the workspace to `~/Documents/jollimemory/<project>/` via the core `SummaryExporter`. The result toast offers an **Open folder** action when anything was written or skipped.
+
+**Onboarding panel + auto-enable + durable opt-out** — `SidebarWebviewProvider` renders an onboarding flow on first activation (sign-in or inline Anthropic API key, then enable hooks). After the first repo is enabled, every newly opened workspace runs `installAll` automatically in the background. `ManualDisableFlag` records the user's explicit **Disable** decision into a per-repo file under `.jolli/jollimemory/`; on every activation the flag is checked first, so auto-enable never overrides a manual opt-out. Tests cover the four state combinations (never enabled, auto-enabled, manually enabled, manually disabled) so the durable flag does not get re-armed by unrelated config changes.
+
+**Aggregate PR descriptions for multi-commit branches** — `BranchSummaryLoader` walks every commit between the branch's fork point and HEAD and loads each commit's stored summary; `SummaryPrAggregateMarkdownBuilder` then composes a single PR description with one collapsible `<details>` block per topic across all commits, preceded by Plans and the E2E Test Guide. The single-commit code path is unchanged (`SummaryPrMarkdownBuilder`); `PrCommentService` picks the right builder based on commit count.
+
+**Memory Bank folder mode** — When the user opts in (Settings → Local Memory Bank → Migrate to Memory Bank), the extension drives the CLI's `StorageProvider` abstraction via `setActiveStorage()`. The sidebar webview shows a branch-aware folder view rendered by `KnowledgeBaseTreeProvider` (the class name still uses the legacy "KnowledgeBase" identifier; the user-facing label is "Memory Bank").
+
+Two commands implement the lifecycle:
+
+- `jollimemory.migrateToKnowledgeBase` — first migration. Picks a target folder, copies every existing memory into it as Markdown via `MigrationEngine`, and switches the active storage to `DualWriteStorage`.
+- `jollimemory.rebuildKnowledgeBase` — re-migration. Triggered by clicking **Migrate to Memory Bank** in Settings after a previous migration. Creates a new `-N`-suffixed folder, runs the migration into it, and archives the previous folder's repo identity so the next `resolveKBPath()` picks the new one.
+
+Both commands keep the orphan branch as the system of record; the folder is always derivable from it.
 
 ---
 

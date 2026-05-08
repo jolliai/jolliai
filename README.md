@@ -7,7 +7,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort.
 
-When you work with AI agents like Claude Code, Codex, Gemini CLI, or OpenCode, the reasoning behind every decision lives in the conversation — *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents like Claude Code, Codex, Gemini CLI, OpenCode, Cursor IDE, GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation — *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 ---
 
@@ -41,9 +41,10 @@ Monorepo hosting three deliverables that share the same product model and storag
 ## Product highlights
 
 - **Automatic** — git hooks run summary generation in a detached background process; your commit returns instantly (the summary appears 10–20 seconds later).
-- **Multi-agent** — works with Claude Code, Codex CLI, Gemini CLI, and OpenCode. Sessions are picked up automatically via agent hooks or filesystem/DB scanning.
-- **Local-first** — summaries and raw transcripts stay on your machine in a git orphan branch. Opt-in **Push to Jolli** shares summaries (not transcripts) with your team.
+- **Multi-agent** — works with Claude Code, Codex CLI, Gemini CLI, OpenCode, Cursor IDE, GitHub Copilot CLI, and VS Code Copilot Chat. Sessions are picked up automatically via agent hooks or filesystem/DB scanning.
+- **Local-first** — summaries and raw transcripts stay on your machine in a git orphan branch, and a **Memory Bank** folder additionally holds a plain-Markdown copy of every memory (dual-written automatically — the orphan branch is the source of truth). Opt-in **Push to Jolli** shares summaries (not transcripts) with your team.
 - **Structured format** — v3 tree with topics, triggers, decisions, and todos; correctly handles amend / squash / cherry-pick / rebase.
+- **Documentation site generator** — the CLI also ships a Nextra-based site generator (`jolli new` / `build` / `start` / `dev`) with theme packs, header / footer config, and an OpenAPI rich-rendering pipeline (per-endpoint MDX, no `swagger-ui-react` runtime).
 - **Privacy-respecting** — see the *Privacy* section in each surface's README for the exact data flow. The Jolli LLM proxy does not persist transcripts or diffs, and does not log them.
 
 ---

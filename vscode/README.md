@@ -27,10 +27,12 @@ Or search for **Jolli Memory** in the Extensions sidebar (`⌘⇧X` / `Ctrl+Shif
 
 ### First run
 
+On a fresh install, the sidebar opens to an **onboarding panel** that walks you through the three steps below. Once one repo is enabled, every newly opened workspace auto-enables in the background — clicking **Disable** is recorded as a durable opt-out and respected on every subsequent activation.
+
 1. Click the Jolli icon in the activity bar to open the sidebar.
-2. In the **Status** panel, either click **Sign In to Jolli** (OAuth) or open the **Settings** gear icon and paste an Anthropic API key.
-3. Click `(⊘)` in the Status panel to install git hooks in the current repository.
-4. Restart any active AI agent session (Claude Code / Codex / Gemini / OpenCode) so hooks take effect.
+2. In the onboarding panel, either click **Sign In to Jolli** (OAuth) or paste an Anthropic API key directly into the inline entry panel. (You can also open the **Settings** gear later.)
+3. Click **Enable Jolli Memory** to install git hooks in the current repository.
+4. Restart any active AI agent session (Claude Code / Codex / Gemini / OpenCode / Cursor / Copilot) so hooks take effect.
 5. Make a commit as usual — the summary appears in the **Commits** panel within ~10-20 seconds.
 
 ---
@@ -43,7 +45,7 @@ After each commit, Jolli Memory reads your selected AI session transcripts and t
 
 | Panel | What it shows |
 | -- | -- |
-| **Status** | Whether Jolli Memory is enabled, active AI agent sessions (Claude, Codex, Gemini, OpenCode), and how many memories are stored. Toggle Jolli Memory on/off with the `(●)` / `(⊘)` buttons; sign in or out of your Jolli account via the **Sign In to Jolli** / **Sign Out of Jolli** actions in the same panel toolbar. |
+| **Status** | Whether Jolli Memory is enabled, active AI agent sessions (Claude, Codex, Gemini, OpenCode, Cursor, Copilot CLI, Copilot Chat), and how many memories are stored. Toggle Jolli Memory on/off with the `(●)` / `(⊘)` buttons; sign in or out of your Jolli account via the **Sign In to Jolli** / **Sign Out of Jolli** actions in the same panel toolbar. A small busy indicator appears while a queue worker is running. |
 | **Memories** | Every stored memory across all branches, with instant search and filter. Click `(🔍)` in the panel title bar to filter by keyword, or click the **Load More** item at the bottom of the list to fetch older entries. |
 | **Plans & Notes** | Plans auto-detected from Claude Code sessions, plus your own notes (text snippets or imported Markdown files). Edit, remove, or associate items with commits. Use the **+ Add** dropdown to add a plan, a Markdown file, or a quick text snippet. |
 | **Changes** | All changed files with checkboxes to stage or unstage. Supports an exclude filter for hiding irrelevant files. |
@@ -65,6 +67,9 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
 | **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database (requires a host VS Code with Node 22.5+) |
+| **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by scanning Cursor workspace storage |
+| **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning the Copilot CLI session log |
+| **VS Code Copilot Chat** | No hook needed — sessions are discovered automatically by reading the Copilot Chat conversation cache |
 
 ### Git Hooks — generating summaries on commit
 
@@ -198,7 +203,7 @@ Click **Sign Out of Jolli** from the same toolbar to clear the stored credential
 Click the gear icon `(⚙)` in the Memories panel toolbar (or any **Open Settings** action) to open a dedicated Settings webview with grouped sections:
 
 * **Authentication** — Anthropic `apiKey`, `model`, `maxTokens`, `jolliApiKey`
-* **Integrations** — toggles for Claude / Codex / Gemini / OpenCode session tracking
+* **Integrations** — toggles for Claude / Codex / Gemini / OpenCode / Cursor / Copilot session tracking. (Copilot CLI and VS Code Copilot Chat share a single switch.)
 * **Local Memories** — `localFolder` + default `pushAction` (see above)
 * **Files** — `excludePatterns` for the Changes panel
 
@@ -231,8 +236,17 @@ At the bottom of every memory panel, Jolli Memory can create or update a GitHub 
 
 * **Create PR**: pre-fills the PR description with a structured summary: Jolli Memory URL → Plans → E2E Test Guide → Topics (Why → Decisions → What → Future Enhancements → Files). All topic bodies are folded by default so the PR stays scannable.
 * **Update PR**: refreshes the summary section in place (using `<!-- jollimemory-summary -->` markers) without affecting any text you've added manually.
+* **Multi-commit PRs**: when the branch has more than one commit, the PR description aggregates every commit's memory into a single roll-up — Plans, E2E Test Guide, then a Topics section that combines all commits with each topic folded by default.
 
 Requires the `gh` CLI to be installed and authenticated.
+
+### Memory Bank
+
+Every repo automatically gets a plain-Markdown copy of every memory on disk, alongside the canonical storage on the `jollimemory/summaries/v3` orphan branch. The Memory Bank folder is created the first time the extension activates on a repo, and any pre-existing memories on the orphan branch are migrated into it without any action on your part.
+
+From then on, every new memory is **dual-written**: the orphan branch remains the source of truth, and the Memory Bank folder holds a `.md` copy you can open, search, and version like any other file.
+
+To change where the folder lives, open **Settings → Local Memory Bank**, click **Browse…** to pick a location, then click **Migrate to Memory Bank**. A fresh `-N`-suffixed folder is created at the new location and the previous folder is left in place on disk; nothing is deleted.
 
 
 ## Session Context Recall
@@ -263,6 +277,8 @@ Most settings can be configured directly from the **Status** panel in the sideba
 | `codexEnabled` | boolean | auto-detect | Enable Codex CLI session discovery |
 | `geminiEnabled` | boolean | auto-detect | Enable Gemini CLI session tracking |
 | `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (requires a host VS Code with Node 22.5+) |
+| `cursorEnabled` | boolean | auto-detect | Enable Cursor IDE (Composer) session discovery |
+| `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |
 | `localFolder` | string | — | Absolute path where **Push to Jolli & Local** writes Markdown copies of pushed summaries |
 | `pushAction` | enum | `jolli` | Default Push action: `jolli` (Jolli Space only) or `both` (Jolli Space + local folder) |
 | `excludePatterns` | string[] | — | Glob patterns for hiding files from the Changes panel |
