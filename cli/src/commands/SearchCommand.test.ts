@@ -39,31 +39,52 @@ describe("parseHashList", () => {
 	});
 
 	it("parses single hex hash", () => {
-		expect(parseHashList("abcd1234")).toEqual(["abcd1234"]);
+		expect(parseHashList("abcd1234abcd1234abcd1234abcd1234abcd1234")).toEqual([
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
+		]);
 	});
 
 	it("parses comma-separated hashes", () => {
-		expect(parseHashList("abcd1234,deadbeef")).toEqual(["abcd1234", "deadbeef"]);
+		expect(
+			parseHashList("abcd1234abcd1234abcd1234abcd1234abcd1234,deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+		).toEqual(["abcd1234abcd1234abcd1234abcd1234abcd1234", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]);
 	});
 
 	it("rejects too-short hashes", () => {
 		expect(parseHashList("abc")).toBeNull();
 	});
 
+	it("rejects 8-char abbreviations (must be the full 40-char SHA)", () => {
+		// Regression: earlier the pattern was 4-64 chars and abbreviations relied
+		// on `getSummary`'s git rev-parse + tree-hash fallback. That fallback
+		// silently resolves to the wrong commit when two distinct commits share
+		// a tree (cherry-pick, rebase). The CLI now rejects abbreviations at the
+		// boundary so the contract is enforced — `hit.fullHash`, not `hit.hash`.
+		expect(parseHashList("abcd1234")).toBeNull();
+		expect(parseHashList("abcd1234,deadbeef")).toBeNull();
+		// 39 chars: one shy of full SHA, still rejected.
+		expect(parseHashList("abcd1234abcd1234abcd1234abcd1234abcd123")).toBeNull();
+	});
+
 	it("rejects trailing comma", () => {
-		expect(parseHashList("abcd1234,")).toBeNull();
+		expect(parseHashList("abcd1234abcd1234abcd1234abcd1234abcd1234,")).toBeNull();
 	});
 
 	it("rejects whitespace inside hashes", () => {
-		expect(parseHashList("abcd 1234")).toBeNull();
+		// Even a 40-char value gets rejected if there's whitespace inside.
+		expect(parseHashList("abcd1234 abcd1234abcd1234abcd1234abcd123")).toBeNull();
 	});
 
 	it("rejects non-hex characters", () => {
-		expect(parseHashList("xyz12345")).toBeNull();
+		// 40-char string with a non-hex letter ("z") — would have passed the old
+		// hex-only check based on length but for the wrong reason; explicit here.
+		expect(parseHashList("zzz12345abcd1234abcd1234abcd1234abcd1234")).toBeNull();
 	});
 
 	it("normalizes mixed case to lowercase", () => {
-		expect(parseHashList("AbCd1234")).toEqual(["abcd1234"]);
+		expect(parseHashList("AbCd1234abcd1234abcd1234abcd1234abcd1234")).toEqual([
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
+		]);
 	});
 });
 
@@ -145,16 +166,47 @@ describe("registerSearchCommand", () => {
 		expect(stdout).toContain('"type":"error"');
 	});
 
+	it("rejects --hashes with abbreviated SHAs and tells the caller to use fullHash", async () => {
+		// Earlier the CLI accepted 4-64 char hashes and `getSummary`'s tree-hash
+		// fallback resolved them. That fallback can silently match the wrong
+		// commit when two commits share a tree (cherry-pick, rebase). Now the
+		// CLI rejects anything other than 40-char SHAs at the boundary.
+		const { stdout } = await runCommand([
+			"auth",
+			"--hashes",
+			"abcd1234,deadbeef",
+			"--cwd",
+			"/tmp/jolli-search-test-empty",
+		]);
+		expect(stdout).toContain('"type":"error"');
+		expect(stdout).toContain("fullHash");
+		expect(stdout).toContain("40-character");
+	});
+
 	it("requires query when --hashes is provided", async () => {
-		const { stdout } = await runCommand(["--hashes", "abcd1234", "--cwd", "/tmp/jolli-search-test-empty"]);
+		const { stdout } = await runCommand([
+			"--hashes",
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
+			"--cwd",
+			"/tmp/jolli-search-test-empty",
+		]);
 		expect(stdout).toContain('"type":"error"');
 		expect(stdout).toContain("query is required");
+	});
+
+	it("rejects invalid --since instead of silently disabling the filter", async () => {
+		// Regression: earlier `--since=lastweek` parsed to null (treated as no
+		// filter), broadening results instead of erroring. Now buildCatalog
+		// throws, the action's outer try/catch emits a JSON error.
+		const { stdout } = await runCommand(["auth", "--since", "lastweek", "--cwd", "/tmp/jolli-search-test-empty"]);
+		expect(stdout).toContain('"type":"error"');
+		expect(stdout).toContain("Invalid --since");
 	});
 
 	it("Phase 2 path: returns search result for picked hash", async () => {
 		mockGetSummary.mockResolvedValueOnce({
 			version: 4,
-			commitHash: "abcd1234",
+			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
 			commitMessage: "msg",
 			commitAuthor: "dev",
 			commitDate: "2026-04-01T00:00:00.000Z",
@@ -170,9 +222,15 @@ describe("registerSearchCommand", () => {
 				},
 			],
 		});
-		const { stdout } = await runCommand(["auth", "--hashes", "abcd1234", "--cwd", "/tmp/jolli-search-test-found"]);
+		const { stdout } = await runCommand([
+			"auth",
+			"--hashes",
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
+			"--cwd",
+			"/tmp/jolli-search-test-found",
+		]);
 		expect(stdout).toContain('"type": "search"');
-		expect(stdout).toContain("abcd1234");
+		expect(stdout).toContain("abcd1234abcd1234abcd1234abcd1234abcd1234");
 	});
 
 	it("--output writes file and prints confirmation", async () => {
@@ -191,7 +249,7 @@ describe("registerSearchCommand", () => {
 	it("Phase 2 text format renders the populated-results path", async () => {
 		mockGetSummary.mockResolvedValueOnce({
 			version: 4,
-			commitHash: "abcd1234",
+			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
 			commitMessage: "feat: add auth",
 			commitAuthor: "dev",
 			commitDate: "2026-04-01T00:00:00.000Z",
@@ -210,14 +268,16 @@ describe("registerSearchCommand", () => {
 		const { stdout } = await runCommand([
 			"auth",
 			"--hashes",
-			"abcd1234",
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
 			"--format",
 			"text",
 			"--cwd",
 			"/tmp/jolli-search-test-found",
 		]);
 		expect(stdout).toContain("Search hits");
-		expect(stdout).toContain("abcd1234");
+		// Text renderer prints `hit.hash` (8-char display abbreviation), not the
+		// 40-char fullHash — see renderResultText in SearchCommand.ts.
+		expect(stdout).toContain("abcd1234 ");
 		expect(stdout).toContain("feature/auth");
 	});
 
@@ -226,7 +286,7 @@ describe("registerSearchCommand", () => {
 		const { stdout } = await runCommand([
 			"auth",
 			"--hashes",
-			"abcd1234",
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
 			"--format",
 			"text",
 			"--cwd",
@@ -253,7 +313,13 @@ describe("registerSearchCommand", () => {
 		mockGetSummary.mockImplementationOnce(async () => {
 			throw new Error("simulated storage failure");
 		});
-		const { stdout } = await runCommand(["auth", "--hashes", "abcd1234", "--cwd", "/tmp/jolli-search-test-found"]);
+		const { stdout } = await runCommand([
+			"auth",
+			"--hashes",
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
+			"--cwd",
+			"/tmp/jolli-search-test-found",
+		]);
 		expect(stdout).toContain('"type":"error"');
 		expect(stdout).toContain("simulated storage failure");
 	});
@@ -261,7 +327,7 @@ describe("registerSearchCommand", () => {
 	it("--output also works for Phase 2", async () => {
 		mockGetSummary.mockResolvedValueOnce({
 			version: 4,
-			commitHash: "abcd1234",
+			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
 			commitMessage: "msg",
 			commitAuthor: "dev",
 			commitDate: "2026-04-01T00:00:00.000Z",
@@ -272,7 +338,7 @@ describe("registerSearchCommand", () => {
 		await runCommand([
 			"auth",
 			"--hashes",
-			"abcd1234",
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
 			"--output",
 			"sub/dir/result.json",
 			"--cwd",
@@ -380,7 +446,7 @@ describe("registerSearchCommand", () => {
 			version: 3,
 			entries: [
 				{
-					commitHash: "deadbeef00",
+					commitHash: "deadbeef00deadbeef00deadbeef00deadbeef00",
 					parentCommitHash: null,
 					branch: "feature/x",
 					commitMessage: "msg",
@@ -393,7 +459,7 @@ describe("registerSearchCommand", () => {
 			version: 1,
 			entries: [
 				{
-					commitHash: "deadbeef00",
+					commitHash: "deadbeef00deadbeef00deadbeef00deadbeef00",
 					recap: "Recap line",
 					ticketId: "PROJ-9",
 					topics: [{ title: "Major Topic", category: "feature", importance: "major" }],
@@ -412,7 +478,13 @@ describe("registerSearchCommand", () => {
 		mockGetSummary.mockImplementationOnce(async () => {
 			throw "string error not an Error instance";
 		});
-		const { stdout } = await runCommand(["auth", "--hashes", "abcd1234", "--cwd", "/tmp/jolli-search-test-found"]);
+		const { stdout } = await runCommand([
+			"auth",
+			"--hashes",
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
+			"--cwd",
+			"/tmp/jolli-search-test-found",
+		]);
 		expect(stdout).toContain('"type":"error"');
 		expect(stdout).toContain("string error");
 	});

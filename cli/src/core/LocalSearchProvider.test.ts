@@ -65,55 +65,65 @@ function makeSummary(hash: string, overrides: Partial<CommitSummary> = {}): Comm
 // ─── parseSince ──────────────────────────────────────────────────────────────
 
 describe("parseSince", () => {
-	it("returns null for undefined", () => {
-		expect(parseSince(undefined)).toBeNull();
+	it("returns kind:'unset' for undefined", () => {
+		expect(parseSince(undefined)).toEqual({ kind: "unset" });
 	});
 
-	it("returns null for empty / whitespace-only strings", () => {
-		expect(parseSince("")).toBeNull();
-		expect(parseSince("   ")).toBeNull();
+	it("returns kind:'unset' for empty / whitespace-only strings", () => {
+		expect(parseSince("")).toEqual({ kind: "unset" });
+		expect(parseSince("   ")).toEqual({ kind: "unset" });
 	});
 
-	it("parses days (case-insensitive)", () => {
+	it("parses days (case-insensitive) into kind:'ok'", () => {
 		const beforeNow = Date.now();
-		const ts = parseSince("7d");
+		const result = parseSince("7d");
+		expect(result.kind).toBe("ok");
+		if (result.kind !== "ok") return;
 		const expected = beforeNow - 7 * 86_400_000;
 		// Allow 1s slack for clock drift between Date.now() calls.
-		expect(Math.abs((ts ?? 0) - expected)).toBeLessThan(1000);
+		expect(Math.abs(result.ts - expected)).toBeLessThan(1000);
 
 		const upper = parseSince("7D");
-		expect(upper).not.toBeNull();
+		expect(upper.kind).toBe("ok");
 	});
 
 	it("parses weeks / months / years", () => {
-		const w = parseSince("2w");
-		expect(w).not.toBeNull();
-		const m = parseSince("1m");
-		expect(m).not.toBeNull();
-		const y = parseSince("1y");
-		expect(y).not.toBeNull();
+		expect(parseSince("2w").kind).toBe("ok");
+		expect(parseSince("1m").kind).toBe("ok");
+		expect(parseSince("1y").kind).toBe("ok");
 	});
 
 	it("zero days resolves to ~now", () => {
-		const ts = parseSince("0d");
-		expect(Math.abs((ts ?? 0) - Date.now())).toBeLessThan(1000);
+		const result = parseSince("0d");
+		expect(result.kind).toBe("ok");
+		if (result.kind !== "ok") return;
+		expect(Math.abs(result.ts - Date.now())).toBeLessThan(1000);
 	});
 
-	it("rejects decimal numbers", () => {
-		// "1.5d" — the regex matches integer-only so this falls through to Date parsing
-		const ts = parseSince("1.5d");
-		// Date.parse("1.5d") is NaN
-		expect(ts).toBeNull();
+	it("returns kind:'invalid' for decimals like '1.5d'", () => {
+		// Earlier this collapsed to null (== unset); now decimals are an explicit
+		// invalid signal so the CLI can emit a hard error instead of silently
+		// disabling the filter.
+		const result = parseSince("1.5d");
+		expect(result.kind).toBe("invalid");
+		if (result.kind !== "invalid") return;
+		expect(result.value).toBe("1.5d");
 	});
 
-	it("parses ISO date strings", () => {
-		const ts = parseSince("2026-01-01");
-		expect(ts).not.toBeNull();
-		expect(ts).toBe(new Date("2026-01-01").getTime());
+	it("parses ISO date strings into kind:'ok'", () => {
+		const result = parseSince("2026-01-01");
+		expect(result.kind).toBe("ok");
+		if (result.kind !== "ok") return;
+		expect(result.ts).toBe(new Date("2026-01-01").getTime());
 	});
 
-	it("returns null for invalid date strings", () => {
-		expect(parseSince("not-a-date")).toBeNull();
+	it("returns kind:'invalid' for unparseable strings (was silent null before)", () => {
+		// This is the regression-prevention test for the typo failure mode:
+		// `--since=lastweek` used to disable filtering entirely (null = no filter)
+		// instead of erroring. Now it surfaces explicitly so the CLI can reject it.
+		expect(parseSince("not-a-date")).toEqual({ kind: "invalid", value: "not-a-date" });
+		expect(parseSince("lastweek")).toEqual({ kind: "invalid", value: "lastweek" });
+		expect(parseSince("7days")).toEqual({ kind: "invalid", value: "7days" });
 	});
 });
 
@@ -222,6 +232,54 @@ describe("LocalSearchProvider.buildCatalog", () => {
 		const provider = new LocalSearchProvider("/test");
 		const tight = await provider.buildCatalog({ query: "q", budget: 50 });
 		expect(tight.entries.length === 0 || tight.entries[0].topics?.[0].decisions === undefined).toBe(true);
+	});
+
+	it("skips an oversized entry but keeps later candidates (continue, not break)", async () => {
+		// Regression: earlier the budget loop did `break` when one entry couldn't
+		// fit even after trim. Because candidates are newest-first, a single
+		// verbose recent commit would silently exclude EVERY older smaller one.
+		// Now we `continue` past the oversized entry and keep accumulating.
+		const huge = "X".repeat(20_000);
+		mockGetIndex.mockResolvedValue(makeIndex(["recent-huge", "older-small"], "2026-04-01T10:00:00.000Z"));
+		mockGetCatalog.mockResolvedValue(
+			makeCatalog([
+				// Recent entry: even after trim (drop decisions) still ~20K chars of
+				// recap, exceeds the budget. With `break` this would tank the loop.
+				{ commitHash: "recent-huge", recap: huge, topics: [{ title: "t", decisions: "d" }] },
+				// Older entry: tiny, would fit easily if reached.
+				{ commitHash: "older-small", topics: [{ title: "small", decisions: "x" }] },
+			]),
+		);
+		const provider = new LocalSearchProvider("/test");
+		const result = await provider.buildCatalog({ query: "q", budget: 1000 });
+		// The huge one is skipped; the small one made it in.
+		const hashes = result.entries.map((e) => e.fullHash);
+		expect(hashes).toContain("older-small");
+		expect(hashes).not.toContain("recent-huge");
+		expect(result.truncated).toBe(true);
+	});
+
+	it("throws on invalid --since instead of silently disabling the filter", async () => {
+		// Regression: earlier `--since=lastweek` returned more results than the
+		// user expected (because invalid → null → no filter). Now it errors out
+		// at the boundary so the CLI can surface the typo to the user.
+		mockGetIndex.mockResolvedValue(makeIndex(["aaa"]));
+		mockGetCatalog.mockResolvedValue({ version: 1, entries: [] });
+		const provider = new LocalSearchProvider("/test");
+		await expect(provider.buildCatalog({ query: "q", since: "lastweek" })).rejects.toThrow(/Invalid --since/);
+		await expect(provider.buildCatalog({ query: "q", since: "7days" })).rejects.toThrow(/Invalid --since/);
+		await expect(provider.buildCatalog({ query: "q", since: "2026-13-99" })).rejects.toThrow(/Invalid --since/);
+	});
+
+	it("filterEcho omits since when invalid would have been passed (defense in depth)", async () => {
+		// `buildCatalog` throws on invalid since, so this echo-vs-actual mismatch
+		// is impossible at runtime. But verify that when since IS unset, filterEcho
+		// also leaves it out (regression check on the conditional spread).
+		mockGetIndex.mockResolvedValue(makeIndex(["aaa"]));
+		mockGetCatalog.mockResolvedValue({ version: 1, entries: [] });
+		const provider = new LocalSearchProvider("/test");
+		const result = await provider.buildCatalog({ query: "q" });
+		expect(result.filter.since).toBeUndefined();
 	});
 
 	it("treats missing index entries as empty without crashing", async () => {
