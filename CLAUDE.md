@@ -14,7 +14,7 @@ These rules affect whether a change can ship at all. They override any other gui
 - **Cross-package imports in `vscode/src/**` are intentional.** Paths like `../../../cli/src/core/JolliApiUtils.js` resolve at esbuild bundle time. Don't refactor them into a published-package import — VS Code currently bundles the CLI inline.
 - **Worktree-aware code only.** Hooks, summary storage, and lock files must work across `git worktree` checkouts. Don't assume a single working tree.
 - **Suspected vulnerabilities go through [`SECURITY.md`](SECURITY.md)**, not public issues or PRs.
-- **Workflow injection hygiene.** Inside `.github/workflows/*.yaml`, never interpolate `${{ github.event.* }}` directly into a `run:` block — pull through `env:` first. The publish workflows already follow this pattern.
+- **Workflow injection hygiene.** Inside `.github/workflows/*.yaml`, any `${{ … }}` expression derived from a user-controlled context — `github.event.*`, `inputs.*`, `github.head_ref`, the commit author/message fields, etc. — must be funnelled through `env:` before reaching a `run:` block or the `with:` of an untrusted action. Direct interpolation is the injection pattern. The existing publish workflows already follow this for both `inputs.tag` and `github.event.release.tag_name`.
 
 ## Repository layout
 
@@ -111,9 +111,8 @@ The bridge is `SiteRenderer.renderOpenApiSpecs(contentDir, publicDir, specs)` in
 ## Project conventions worth knowing
 
 - **Biome** is the formatter and linter (config: [`cli/biome.json`](cli/biome.json)). Tabs, 4-wide, 120 column limit. Rules of note: `noExplicitAny: error`, `noUnusedImports/Variables: error`, `useImportType: warn`. CI runs `biome check --error-on-warnings` — warnings fail.
-- **Test coverage** in `cli/` is enforced at 97% statements / 96% branches / 97% functions / 97% lines (see [`cli/vite.config.ts`](cli/vite.config.ts)). New code under `cli/src/` should not regress coverage.
-- **DCO sign-off is required** on every commit (`git commit -s`). PRs without a `Signed-off-by:` line will be rejected. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
-- **Worktree-aware**: hooks and summaries work across `git worktree` checkouts. Don't write code that assumes a single working tree.
+
+(The DCO sign-off, `npm run all` gate, CLI coverage floor, and worktree-aware requirement are stated as critical rules at the top of this file; they are not repeated here to keep this file as a single source of truth.)
 
 ## Release flow
 

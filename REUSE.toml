@@ -39,5 +39,5 @@ path = [
   "intellij/gradlew.bat",
 ]
 precedence = "override"
-SPDX-FileCopyrightText = "the Gradle Project"
+SPDX-FileCopyrightText = "Gradle, Inc."
 SPDX-License-Identifier = "Apache-2.0"

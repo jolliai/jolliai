@@ -1,0 +1,30 @@
+# Dependabot configuration.
+#
+# Scope is intentionally limited to the GitHub Actions ecosystem for now.
+# All workflows under `.github/workflows/` SHA-pin their external Actions,
+# which is what Scorecard's `Pinned-Dependencies` rewards — but a SHA pin
+# without an update channel drifts. This file gives the pins a maintenance
+# loop: each upstream release lands as a PR, with the version-comment
+# (e.g. `# v3.27.5`) updated alongside the SHA.
+#
+# npm and Gradle ecosystems are deliberately omitted at this stage; their
+# update cadence is handled manually as part of the release flow.
+
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      # Match the repo's release-team-owned workflow file convention.
+      prefix: "chore(actions)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"

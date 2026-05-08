@@ -32,6 +32,7 @@ jobs:
   analysis:
     name: Scorecard analysis
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       security-events: write   # upload SARIF to Code Scanning
       id-token: write          # publish results to the public Scorecard API
@@ -59,6 +60,6 @@ jobs:
           retention-days: 5
 
       - name: Upload to Code Scanning
-        uses: github/codeql-action/upload-sarif@6825d5659bf007b85a0866e2d0f434aacf50de94 # v3.27.5
+        uses: github/codeql-action/upload-sarif@7fd177fa680c9881b53cdab4d346d32574c9f7f4 # v3.35.4
         with:
           sarif_file: results.sarif

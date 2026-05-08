@@ -24,10 +24,12 @@ permissions:
 jobs:
     build-vscode:
         runs-on: ubuntu-24.04
+        timeout-minutes: 20
         steps:
             -   uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
                 with:
                     fetch-depth: 0
+                    persist-credentials: false
 
             -   id: changes
                 uses: ./.github/actions/detect-relevant-paths

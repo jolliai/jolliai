@@ -30,6 +30,14 @@ RELEASE.md  @jolliai/release-team
 cli/src/core/JolliApiUtils.ts                                @jolliai/security
 intellij/src/main/kotlin/ai/jolli/jollimemory/services/      @jolliai/security
 
+# Security policy: changes to disclosure process, supported versions, and
+# SLAs are security-team territory rather than general maintainer work.
+SECURITY.md  @jolliai/security
+
+# Governance document: changes to roles, decision-making, or the path to
+# becoming a maintainer require admin approval per the document itself.
+GOVERNANCE.md  @jolliai/admins
+
 # CODEOWNERS itself: modifying *who reviews what* is a governance change,
 # distinct from any code change, so it requires admin-level approval.
 # Keep this rule LAST so it overrides the `.github/workflows/` rule above

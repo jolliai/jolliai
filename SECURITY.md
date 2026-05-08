@@ -22,20 +22,21 @@ Please include:
 - Whether the issue requires authentication, user interaction, or specific configuration.
 
 We aim to acknowledge reports within 5 business days. After triage we will share an indicative
-timeline for a fix and keep you updated through the advisory.
+timeline for a fix and keep you updated through the advisory. Our target is to ship a fix or
+documented mitigation within 90 days of triage; complex issues may extend this by mutual
+agreement with the reporter, recorded in the advisory.
 
 ## Supported versions
 
-Security fixes are released for the latest published minor of each artifact:
+Security fixes ship on the **latest published minor** of each channel below. Older minors are
+not patched — upgrade to the latest minor on the same channel before reporting issues against
+prior versions.
 
-| Artifact | Channel |
-| --- | --- |
-| `@jolli.ai/cli` | npm |
-| Jolli Memory (VS Code extension) | VS Code Marketplace, Open VSX |
-| Jolli Memory (IntelliJ plugin) | JetBrains Marketplace |
-
-If you are running an older version, the first step toward a fix is to upgrade to the latest
-minor on the same channel.
+| Artifact | Channel | Supported version |
+| --- | --- | --- |
+| `@jolli.ai/cli` | npm | latest published minor |
+| Jolli Memory (VS Code extension) | VS Code Marketplace, Open VSX | latest published minor |
+| Jolli Memory (IntelliJ plugin) | JetBrains Marketplace | latest published minor |
 
 ## Disclosure
 
