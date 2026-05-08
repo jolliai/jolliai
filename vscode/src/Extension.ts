@@ -2074,7 +2074,12 @@ export function activate(context: vscode.ExtensionContext): void {
 					return;
 				}
 
-				const summaryMatch = uri.path.match(/^\/summary\/([0-9a-f]{7,40})$/);
+				// Full 40-char SHA required — `bridge.getSummary` falls through to
+				// alias / tree-hash resolution for abbreviated input, which silently
+				// resolves the wrong commit when two distinct commits share the same
+				// tree (cherry-pick, identical re-commit, rebase). Same hardening as
+				// `search --hashes` in cli/src/commands/SearchCommand.ts.
+				const summaryMatch = uri.path.match(/^\/summary\/([0-9a-f]{40})$/);
 				if (summaryMatch) {
 					const hash = summaryMatch[1];
 					const shortHash = hash.substring(0, 7);
@@ -2089,6 +2094,8 @@ export function activate(context: vscode.ExtensionContext): void {
 						summary,
 						context.extensionUri,
 						workspaceRoot,
+						bridge,
+						commitsStore.getMainBranch(),
 						"commit",
 					);
 					return;

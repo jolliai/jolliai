@@ -31,6 +31,7 @@ import type {
 import { DEFAULT_CATALOG_LIMIT, DEFAULT_SEARCH_BUDGET } from "./Search.js";
 import type { SearchProvider, SearchSource } from "./SearchProvider.js";
 import type { StorageProvider } from "./StorageProvider.js";
+import { getDisplayDate } from "./SummaryFormat.js";
 import { getCatalogWithLazyBuild, getIndex, getSummary } from "./SummaryStore.js";
 import { collectDisplayTopics } from "./SummaryTree.js";
 import { estimateTokens } from "./TokenEstimator.js";
@@ -89,12 +90,20 @@ export class LocalSearchProvider implements SearchProvider {
 
 		// Filter to root entries within the --since window; sort newest-first so
 		// truncation prefers recent commits when budget runs out.
+		//
+		// Use `getDisplayDate` (generatedAt || commitDate), not raw `commitDate`.
+		// commitDate is the git author-date and is preserved by amend / rebase /
+		// cherry-pick — using it would silently drop just-rewritten memories from
+		// short --since windows, and push them below the limit/budget cutoff in
+		// the unfiltered case. Every other recency-sensitive path in the codebase
+		// (SessionStartHook, ViewCommand, listSummaries, getMatchedRoots) uses
+		// getDisplayDate for the same reason.
 		const sinceTimestamp = sinceParsed.kind === "ok" ? sinceParsed.ts : null;
 		const indexEntries = index?.entries ?? [];
 		const candidates = indexEntries
 			.filter(isRootEntry)
-			.filter((e) => sinceTimestamp === null || new Date(e.commitDate).getTime() >= sinceTimestamp)
-			.sort((a, b) => new Date(b.commitDate).getTime() - new Date(a.commitDate).getTime());
+			.filter((e) => sinceTimestamp === null || new Date(getDisplayDate(e)).getTime() >= sinceTimestamp)
+			.sort((a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime());
 
 		const totalCandidates = candidates.length;
 		const limited = candidates.slice(0, limit);
