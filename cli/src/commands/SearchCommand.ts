@@ -26,19 +26,19 @@ import { setLogDir } from "../Logger.js";
 import { isSafeQuery, parsePositiveInt, resolveProjectDir } from "./CliUtils.js";
 
 /**
- * Pattern matching a comma-separated list of **40-char full SHA hashes**.
+ * Pattern matching a comma-separated list of **8- to 40-char hex SHAs**.
  *
- * Full hashes only — no abbreviations. Earlier this allowed 4-64 hex chars
- * relying on `getSummary`'s tree-hash fallback to resolve abbreviations, but
- * that fallback is unsafe for the search caller: when two distinct commits
- * share the same git tree (cherry-pick, rebase that produces an identical
- * tree, etc.), the abbrev resolves to the wrong index entry silently. The
- * skill template's catalog output exposes both `hash` (8-char display) and
- * `fullHash` (40-char), and Step 4 of the template now explicitly tells the
- * LLM to pass `fullHash` here. Locking the pattern to exactly 40 characters
- * enforces that contract at the boundary.
+ * Accepts abbreviated SHAs (≥ 8 chars, jolli's catalog `hash` field length) up
+ * to full 40-char SHAs. The lower bound mirrors what the catalog emits, so the
+ * LLM can echo back either `hit.hash` or `hit.fullHash` and have it resolve.
+ *
+ * Earlier this was locked to exactly 40 because `getSummary`'s tree-hash
+ * fallback could silently mis-resolve cherry-pick / rebase twins that share a
+ * tree. Once `getSummary` resolves abbreviated input via in-memory index
+ * prefix scan (with explicit `AmbiguousHashError` on collisions), the boundary
+ * can safely accept abbreviations again.
  */
-const HASH_LIST_PATTERN = /^[0-9a-f]{40}(,[0-9a-f]{40})*$/i;
+const HASH_LIST_PATTERN = /^[0-9a-f]{8,40}(,[0-9a-f]{8,40})*$/i;
 
 interface SearchOptions {
 	since?: string;
@@ -174,13 +174,13 @@ export function registerSearchCommand(program: Command): void {
 					return;
 				}
 
-				// --hashes implies Phase 2; require full 40-char SHAs and a query.
+				// --hashes implies Phase 2; require 8-40 char hex SHAs and a query.
 				if (options.hashes !== undefined) {
 					const parsed = parseHashList(options.hashes);
 					if (!parsed || parsed.length === 0) {
 						emitError(
 							options,
-							"Invalid --hashes value. Expected comma-separated 40-character full hex SHAs (use `hit.fullHash` from the Phase 1 catalog, not `hit.hash`).",
+							"Invalid --hashes value. Expected comma-separated hex SHAs of 8 to 40 characters (use `hit.hash` or `hit.fullHash` from the Phase 1 catalog).",
 						);
 						return;
 					}

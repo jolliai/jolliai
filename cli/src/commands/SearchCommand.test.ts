@@ -2,11 +2,17 @@ import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseHashList, registerSearchCommand } from "./SearchCommand.js";
 
-vi.mock("../core/SummaryStore.js", () => ({
-	getCatalogWithLazyBuild: vi.fn(async () => ({ version: 1, entries: [] })),
-	getIndex: vi.fn(async () => null),
-	getSummary: vi.fn(async () => null),
-}));
+vi.mock("../core/SummaryStore.js", async () => {
+	const actual = await vi.importActual<typeof import("../core/SummaryStore.js")>("../core/SummaryStore.js");
+	return {
+		// Re-export the real AmbiguousHashError so `instanceof` checks in
+		// LocalSearchProvider see the same class the tests would throw.
+		AmbiguousHashError: actual.AmbiguousHashError,
+		getCatalogWithLazyBuild: vi.fn(async () => ({ version: 1, entries: [] })),
+		getIndex: vi.fn(async () => null),
+		getSummary: vi.fn(async () => null),
+	};
+});
 
 import { getCatalogWithLazyBuild, getIndex } from "../core/SummaryStore.js";
 
@@ -50,20 +56,30 @@ describe("parseHashList", () => {
 		).toEqual(["abcd1234abcd1234abcd1234abcd1234abcd1234", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]);
 	});
 
-	it("rejects too-short hashes", () => {
+	it("rejects hashes shorter than 8 characters", () => {
+		// Below 8 we don't try to resolve — the catalog never emits anything
+		// shorter, and very short inputs would just produce ambiguous matches.
 		expect(parseHashList("abc")).toBeNull();
+		expect(parseHashList("1234567")).toBeNull();
 	});
 
-	it("rejects 8-char abbreviations (must be the full 40-char SHA)", () => {
-		// Regression: earlier the pattern was 4-64 chars and abbreviations relied
-		// on `getSummary`'s git rev-parse + tree-hash fallback. That fallback
-		// silently resolves to the wrong commit when two distinct commits share
-		// a tree (cherry-pick, rebase). The CLI now rejects abbreviations at the
-		// boundary so the contract is enforced — `hit.fullHash`, not `hit.hash`.
-		expect(parseHashList("abcd1234")).toBeNull();
-		expect(parseHashList("abcd1234,deadbeef")).toBeNull();
-		// 39 chars: one shy of full SHA, still rejected.
-		expect(parseHashList("abcd1234abcd1234abcd1234abcd1234abcd123")).toBeNull();
+	it("accepts 8-char abbreviations (matches the catalog's `hash` field length)", () => {
+		// Once getSummary resolves abbrevs via in-memory index prefix scan
+		// (returning AmbiguousHashError for collisions instead of silently
+		// picking one), the CLI boundary can safely accept either `hit.hash`
+		// (8-char) or `hit.fullHash` (40-char) from the catalog output.
+		expect(parseHashList("abcd1234")).toEqual(["abcd1234"]);
+		expect(parseHashList("abcd1234,deadbeef")).toEqual(["abcd1234", "deadbeef"]);
+		// Mixed lengths in the same call: one 8-char abbrev, one full 40-char SHA.
+		expect(parseHashList("abcd1234,abcd1234abcd1234abcd1234abcd1234abcd1234")).toEqual([
+			"abcd1234",
+			"abcd1234abcd1234abcd1234abcd1234abcd1234",
+		]);
+	});
+
+	it("rejects hashes longer than 40 characters", () => {
+		// 41 hex chars: longer than any real SHA-1 — likely garbage / typo.
+		expect(parseHashList("abcd1234abcd1234abcd1234abcd1234abcd12345")).toBeNull();
 	});
 
 	it("rejects trailing comma", () => {
@@ -76,9 +92,9 @@ describe("parseHashList", () => {
 	});
 
 	it("rejects non-hex characters", () => {
-		// 40-char string with a non-hex letter ("z") — would have passed the old
-		// hex-only check based on length but for the wrong reason; explicit here.
+		// "z" is not a valid hex digit.
 		expect(parseHashList("zzz12345abcd1234abcd1234abcd1234abcd1234")).toBeNull();
+		expect(parseHashList("abcd123g")).toBeNull(); // 8 chars, "g" is not hex
 	});
 
 	it("normalizes mixed case to lowercase", () => {
@@ -166,21 +182,20 @@ describe("registerSearchCommand", () => {
 		expect(stdout).toContain('"type":"error"');
 	});
 
-	it("rejects --hashes with abbreviated SHAs and tells the caller to use fullHash", async () => {
-		// Earlier the CLI accepted 4-64 char hashes and `getSummary`'s tree-hash
-		// fallback resolved them. That fallback can silently match the wrong
-		// commit when two commits share a tree (cherry-pick, rebase). Now the
-		// CLI rejects anything other than 40-char SHAs at the boundary.
+	it("rejects --hashes that don't fit the 8-40 hex pattern (too short / non-hex)", async () => {
+		// Abbreviated SHAs ≥ 8 are now ACCEPTED — `getSummary` resolves them via
+		// in-memory index prefix scan with explicit AmbiguousHashError on collisions,
+		// so the boundary no longer has to enforce "full SHA only". Inputs that
+		// don't look like a hex SHA at all (too short, non-hex chars) still error.
 		const { stdout } = await runCommand([
 			"auth",
 			"--hashes",
-			"abcd1234,deadbeef",
+			"abc,defg", // both segments < 8 chars
 			"--cwd",
 			"/tmp/jolli-search-test-empty",
 		]);
 		expect(stdout).toContain('"type":"error"');
-		expect(stdout).toContain("fullHash");
-		expect(stdout).toContain("40-character");
+		expect(stdout).toContain("8 to 40 characters");
 	});
 
 	it("requires query when --hashes is provided", async () => {

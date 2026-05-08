@@ -13,11 +13,11 @@ import { pathToFileURL } from "node:url";
 import { type Command, Option } from "commander";
 import { getDisplayDate } from "../core/SummaryFormat.js";
 import { buildMarkdown } from "../core/SummaryMarkdownBuilder.js";
-import { getIndex, getSummary } from "../core/SummaryStore.js";
+import { AmbiguousHashError, getIndex, getSummary } from "../core/SummaryStore.js";
 import { aggregateTurns, collectAllTopics, formatDurationLabel, resolveDiffStats } from "../core/SummaryTree.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { CommitSummary, SummaryIndexEntry, TopicSummary } from "../Types.js";
-import { formatShortDate, parsePositiveInt, resolveProjectDir } from "./CliUtils.js";
+import { formatShortDate, parsePositiveInt, printAmbiguousHash, resolveProjectDir } from "./CliUtils.js";
 
 const log = createLogger("view");
 
@@ -255,8 +255,21 @@ export function registerViewCommand(program: Command): void {
 			log.info("Running 'view' command");
 
 			if (options.commit) {
-				// View specific commit (by index or SHA)
-				const summary = await resolveCommit(options.commit, options.cwd);
+				// View specific commit (by index or SHA). The lookup may throw
+				// AmbiguousHashError when an abbreviated SHA matches multiple
+				// commits — show a git-style "use a longer prefix" message and
+				// list the colliding hashes so the user can disambiguate.
+				let summary: CommitSummary | null;
+				try {
+					summary = await resolveCommit(options.commit, options.cwd);
+				} catch (error: unknown) {
+					if (error instanceof AmbiguousHashError) {
+						printAmbiguousHash(error);
+						process.exitCode = 1;
+						return;
+					}
+					throw error;
+				}
 				if (!summary) {
 					if (!/^\d+$/.test(options.commit)) {
 						console.log(`\n  No summary found for commit ${options.commit}\n`);

@@ -1348,7 +1348,16 @@ export class JolliMemoryBridge {
 		this.cachedRootEntries = null;
 	}
 
-	/** Returns the full summary for a single commit hash, or null if not found. */
+	/**
+	 * Returns the full summary for a single commit hash, or null if not found.
+	 *
+	 * **May throw `AmbiguousHashError`** if `hash` is an abbreviated SHA that
+	 * matches multiple index entries. All current callers pass full 40-char
+	 * SHAs (sidebar items, URI-handler regex `[0-9a-f]{40}`), so the throw is
+	 * structurally unreachable today — but if a future caller wires user-
+	 * typed abbreviations through here (e.g. a "go to commit" quick-pick),
+	 * wrap this in try/catch and surface a "use a longer prefix" hint.
+	 */
 	async getSummary(hash: string): Promise<CommitSummary | null> {
 		const storage = await this.getStorage();
 		return getSummary(hash, this.cwd, storage);

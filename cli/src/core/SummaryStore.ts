@@ -802,24 +802,77 @@ export async function getTranscriptHashes(cwd?: string): Promise<Set<string>> {
 // ─── Public read API ──────────────────────────────────────────────────────────
 
 /**
+ * Length of a full SHA-1 git commit hash. Anything shorter is treated as an
+ * abbreviated prefix and resolved via index scan rather than direct file /
+ * alias lookup, since both of those keys are 40-char in production.
+ */
+const FULL_HASH_LENGTH = 40;
+
+/**
+ * Thrown by {@link getSummary} when an abbreviated hash matches multiple
+ * entries in the index. Surfacing this (rather than silently picking one)
+ * lets user-facing callers prompt for a longer prefix; internal callers that
+ * always supply 40-char SHAs (e.g. iterating index entries) never trigger it.
+ */
+export class AmbiguousHashError extends Error {
+	readonly prefix: string;
+	readonly matches: ReadonlyArray<string>;
+	constructor(prefix: string, matches: ReadonlyArray<string>) {
+		super(
+			`abbreviation \`${prefix}\` is ambiguous; please use a longer prefix (matched ${matches.length} commits)`,
+		);
+		this.name = "AmbiguousHashError";
+		this.prefix = prefix;
+		this.matches = matches;
+	}
+}
+
+/**
+ * Returns all index entries whose commitHash starts with the given prefix.
+ *
+ * Used by {@link getSummary} to resolve abbreviated hashes (jolli's catalog
+ * emits 8-char prefixes) without invoking git — purely in-memory, so it is
+ * unaffected by working-tree state (rebase / squash dropping the commit
+ * doesn't lose the index record) and by tree-hash collisions (cherry-pick
+ * twins that share a tree but live as distinct entries).
+ */
+function findEntriesByPrefix(
+	prefix: string,
+	entries: ReadonlyArray<SummaryIndexEntry>,
+): ReadonlyArray<SummaryIndexEntry> {
+	return entries.filter((e) => e.commitHash.startsWith(prefix));
+}
+
+/**
  * Retrieves a summary for a specific commit hash.
  *
- * Lookup order:
- * 1. **Direct file read** (`summaries/{commitHash}.json`). Works for any hash
- *    that was ever a root at write time. This is the primary path -- it
- *    bypasses the index entirely and returns the commit's ORIGINAL summary
- *    rather than the (potentially stripped) version embedded in a squash root.
- *    Storage invariant: `mergeManyToOne` / `migrateOneToOne` never delete the
- *    old `summaries/{oldHash}.json` files, so every hash that entered the
- *    system keeps its own file.
- * 2. **Alias / treeHash fallback**: when direct read misses, check the index
- *    for cross-branch aliases (cached + on-the-fly tree-hash matching). Used
- *    when the caller passes a hash that isn't a recorded root, e.g. a commit
- *    on a different branch that shares a tree hash with a recorded one.
+ * Lookup steps:
+ *   1. Direct file read — `summaries/{hash}.json`. Hits for any hash that ever
+ *      owned a summary file (production: 40-char SHAs only); a deterministic
+ *      cheap miss otherwise. Returns the commit's ORIGINAL summary even after
+ *      a squash/rebase has folded it into a container, since `mergeManyToOne` /
+ *      `migrateOneToOne` keep the old files. (Bypassing the embedded child view
+ *      is intentional: under the unified Hoist strip, embedded children no
+ *      longer carry topics/recap.)
  *
- * Direct file read intentionally bypasses the embedded child view: under the
- * unified Hoist strip, embedded children no longer carry topics/recap, so
- * returning them would silently degrade results.
+ *   then, branched by input length:
+ *
+ *   if hash.length === 40 (full SHA):
+ *     2. Alias map lookup — `index.commitAliases[hash]` for amend/rebase
+ *        chains where an old SHA was rewritten to a new one. Keys are
+ *        always 40-char in production.
+ *
+ *   if hash.length < 40 (abbreviated, e.g. catalog's 8-char output):
+ *     3. Index prefix scan — entries whose `commitHash` starts with the input.
+ *        - 1 match → return that summary
+ *        - ≥ 2 matches → throw {@link AmbiguousHashError}
+ *        - 0 matches → fall through to Step 4
+ *
+ *   finally, if nothing above hit:
+ *     4. Cross-tree fallback — `git rev-parse hash^{tree}` then match by
+ *        tree hash to an indexed entry. Catches cherry-pick / rebase copies
+ *        that share a tree with an indexed commit but aren't themselves in
+ *        the index. This is the only step that requires a live git repo.
  *
  * Returns null if no summary exists for that commit.
  */
@@ -828,21 +881,59 @@ export async function getSummary(
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<CommitSummary | null> {
-	// Step 1: Direct file read -- works for any hash that was ever indexed.
-	const direct = await readSummaryFile(commitHash, cwd, storage);
+	// Normalize to lowercase up front. Index entries / file names / alias
+	// keys are all written lowercase, so without this a user typing
+	// `--commit ABC123…` would miss every step except Step 4's git-mediated
+	// fallback (which `git rev-parse` would mask by normalizing). Doing it
+	// here protects every caller (CLI, sidebar, URI handler) uniformly.
+	const hash = commitHash.toLowerCase();
+
+	// Step 1: Direct file read. Tried for all inputs; storage is the only
+	// O(1) lookup that can hit on a full SHA, and a deterministic miss for
+	// shorter inputs in production.
+	const direct = await readSummaryFile(hash, cwd, storage);
 	if (direct) return direct;
 
-	// Step 2: Cross-branch fallback via aliases / tree hash.
 	const index = await loadIndex(cwd, storage);
 	if (!index) return null;
 
-	const aliasHash = index.commitAliases?.[commitHash];
-	if (aliasHash) {
-		return readSummaryFile(aliasHash, cwd, storage);
+	const isFullHash = hash.length === FULL_HASH_LENGTH;
+
+	if (isFullHash) {
+		// Step 2: Alias lookup — `commitAliases` is keyed by 40-char OLD SHA.
+		// Note: this branch only runs for full SHAs. Abbreviated input that
+		// would only resolve via an alias entry (e.g. an old SHA that's been
+		// GC'd from the working repo) won't hit here — pass the full 40-char
+		// SHA to reach aliased rewrites reliably. The realistic blast radius
+		// is small: `scanTreeHashAliases` only writes aliases for hashes git
+		// has already resolved at scan time, so they're already 40-char in
+		// practice, and abbreviated input is overwhelmingly catalog output
+		// (which targets live, indexed entries — not aliased rewrites).
+		const aliasHash = index.commitAliases?.[hash];
+		if (aliasHash) {
+			return readSummaryFile(aliasHash, cwd, storage);
+		}
+	} else {
+		// Step 3: Index prefix scan for abbreviated input. Deterministic, in
+		// memory, and immune to tree-hash collisions — we match on the index's
+		// own `commitHash` field, not on tree hashes.
+		const matches = findEntriesByPrefix(hash, index.entries);
+		if (matches.length === 1) {
+			return readSummaryFile(matches[0].commitHash, cwd, storage);
+		}
+		if (matches.length >= 2) {
+			throw new AmbiguousHashError(
+				hash,
+				matches.map((m) => m.commitHash),
+			);
+		}
+		// matches.length === 0 → fall through to Step 4.
 	}
 
+	// Step 4: Cross-tree fallback. Requires a live git repo to resolve the
+	// hash to a tree, then we look for any indexed entry sharing that tree.
 	if (index.version === 3) {
-		const treeHash = await getTreeHash(commitHash, cwd);
+		const treeHash = await getTreeHash(hash, cwd);
 		/* v8 ignore start -- tree hash fallback: requires real git repo */
 		if (treeHash) {
 			const entryMap = new Map(index.entries.map((e) => [e.commitHash, e]));

@@ -14,8 +14,9 @@ import { fileURLToPath } from "node:url";
 import type { Command } from "commander";
 import { TEMPLATES } from "../core/PromptTemplates.js";
 import { exportSummaries } from "../core/SummaryExporter.js";
+import { AmbiguousHashError } from "../core/SummaryStore.js";
 import { createLogger, setLogDir } from "../Logger.js";
-import { resolveProjectDir } from "./CliUtils.js";
+import { printAmbiguousHash, resolveProjectDir } from "./CliUtils.js";
 
 const log = createLogger("ExportCommand");
 
@@ -241,11 +242,24 @@ export function registerExportCommand(program: Command): void {
 			setLogDir(options.cwd);
 			log.info("Running 'export' command");
 
-			const result = await exportSummaries({
-				commit: options.commit,
-				project: options.project,
-				cwd: options.cwd,
-			});
+			let result: Awaited<ReturnType<typeof exportSummaries>>;
+			try {
+				result = await exportSummaries({
+					commit: options.commit,
+					project: options.project,
+					cwd: options.cwd,
+				});
+			} catch (error: unknown) {
+				// Abbreviated --commit value matched multiple index entries.
+				// Mirror ViewCommand's "use a longer prefix" hint so the user
+				// knows how to disambiguate; everything else propagates.
+				if (error instanceof AmbiguousHashError) {
+					printAmbiguousHash(error);
+					process.exitCode = 1;
+					return;
+				}
+				throw error;
+			}
 
 			if (result.totalSummaries === 0) {
 				console.log("\n  No summaries found to export.\n");
