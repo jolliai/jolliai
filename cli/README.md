@@ -22,6 +22,9 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
 | **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.5+) |
+| **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by scanning the Cursor workspace storage |
+| **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning Copilot CLI's session log |
+| **VS Code Copilot Chat** | No hook needed — sessions are discovered automatically by reading the Copilot Chat conversation cache |
 
 ### Git Hooks — generating summaries on commit
 
@@ -180,6 +183,49 @@ jolli recall --format json
 jolli recall --budget 30000 --format json
 ```
 
+### `jolli search`
+
+Searches stored memories on the local catalog with a two-phase pipeline (catalog scan → topic match). Returns full topic bodies — not match snippets — and prints a stable `/summary/<hash>` URI per hit so an AI agent can deep-link back to the right memory. Also powers the [`/jolli-search` skill](#session-context-recall) for in-agent search.
+
+```bash
+# Search memories on the current branch
+jolli search "rate limiter"
+
+# Limit to recent commits and a specific branch
+jolli search "auth refactor" --since 2026-04-01 --branch feature/auth
+
+# Cap the result count, JSON output for skills/agents
+jolli search "windows path" --limit 5 --format json
+```
+
+`--since` accepts an ISO date or RFC 3339 timestamp; bad values are rejected with exit 1 (no silent empty result). SHAs in `/summary/<hash>` URIs are always full 40-character SHAs.
+
+### Site generation: `jolli new` / `build` / `start` / `dev`
+
+Generates a Nextra v4 documentation site from a `Content_Folder` of Markdown plus optional OpenAPI specs. Designed for product / API documentation alongside (or instead of) your AI commit memories.
+
+```bash
+# Scaffold a new site (creates Content_Folder/ + site.json)
+jolli new my-docs
+
+# Build the static site to <out>/dist
+jolli build
+
+# Serve the built site
+jolli start
+
+# Hot-reload dev server (watches Content_Folder/ and re-syncs on change)
+jolli dev
+```
+
+Highlights:
+
+- **Theme packs**: `Forge` (clean dev docs, sidebar-first, Inter) and `Atlas` (editorial, dark default, serif). Customize `accentHue`, `fontFamily`, logos, and default theme mode in `site.json`.
+- **Header / footer config**: `header.items` supports per-item dropdowns; `footer` supports copyright, link columns, and social icons.
+- **OpenAPI rich pipeline**: each endpoint is compiled into a per-endpoint MDX page with auto-generated cURL / JS / TS / Python / Go code samples — no `swagger-ui-react` runtime.
+
+See [`docs/site-json-reference.md`](docs/site-json-reference.md) and [`examples/`](examples/) for runnable configurations.
+
 ### `jolli configure`
 
 Manages settings stored in `~/.jolli/jollimemory/config.json`. API keys are masked in the display output.
@@ -201,7 +247,7 @@ jolli configure --set excludePatterns=docs/**,*.log,node_modules
 jolli configure --remove jolliApiKey
 ```
 
-Supported keys: `apiKey`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `codexEnabled`, `geminiEnabled`, `claudeEnabled`, `openCodeEnabled`, `logLevel`, `excludePatterns`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
+Supported keys: `apiKey`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `logLevel`, `excludePatterns`. `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
 
 ### `jolli doctor`
 
@@ -337,6 +383,8 @@ Jolli Memory feeds prior development context back into your AI agent so it can p
 
 If the current branch has no memories, the command shows a catalog of branches that do, letting you pick one to recall. You can also pass a branch name or keyword as an argument (e.g. `/jolli-recall auth-refactor`).
 
+**Targeted search** — run `/jolli-search <keyword>` (or `jolli search <keyword>` from the terminal) to search across every branch's memories. It returns full topic bodies along with `/summary/<hash>` URIs that the IntelliJ plugin and VS Code extension treat as deep links into the matching memory.
+
 ## Configuration
 
 Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommended way to manage them is via `jolli configure` — see [the command reference above](#jolli-configure) — which validates keys and types and masks secrets on display.
@@ -353,6 +401,8 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 | `codexEnabled` | boolean | auto-detect | Enable Codex CLI session discovery |
 | `geminiEnabled` | boolean | auto-detect | Enable Gemini CLI session tracking |
 | `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (requires Node 22.5+) |
+| `cursorEnabled` | boolean | auto-detect | Enable Cursor IDE (Composer) session discovery |
+| `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |
 | `excludePatterns` | string[] | — | Glob patterns for file exclusion (set via `jolli configure --set excludePatterns=glob1,glob2`) |
 
 **Authentication setup** — three options:

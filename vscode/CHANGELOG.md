@@ -1,6 +1,19 @@
 # Changelog
 
-<!-- Last synced commit: ea9ad050b | 2026-04-23 -->
+<!-- Last synced commit: fd3e1e2e | 2026-05-08 -->
+
+## 0.99.0
+
+- **Onboarding panel + auto-enable** — fresh installs now show a sidebar onboarding flow that walks you through sign-in (or pasting an Anthropic API key inline) and enabling git hooks. After the first repo is enabled, newly opened workspaces auto-enable in the background. Click **Disable** any time and that decision sticks across reloads — auto-enable never overrides an explicit choice.
+- **Three new AI agents supported** — Cursor IDE (Composer), GitHub Copilot CLI, and VS Code Copilot Chat. All are discovered automatically and shown alongside Claude / Codex / Gemini / OpenCode in the Status panel; toggles live in **Settings → Integrations** (Copilot CLI and Copilot Chat share a single switch).
+- **Multi-commit pull requests** — when a branch has more than one commit, **Create & Update PR** now produces a single rolled-up description across every commit (Plans → E2E Test Guide → Topics, each topic folded by default). Single-commit PRs are unchanged.
+- **Memory Bank** — every repo now gets a plain-Markdown copy of every memory on disk. The first time the extension activates on a repo with existing memories, it migrates them automatically; from then on, every new memory is written to **both** the git orphan branch (still the source of truth) and the Memory Bank folder. Change the folder location any time from **Settings → Local Memory Bank**.
+- **Open memory by hash** — clicking a `/summary/<hash>` link in agent output (for example from the new CLI `jolli search`) now opens the matching memory's Summary Webview directly.
+- **Hardened sign-in** — uses an authorization-code exchange with CSRF protection (RFC 6749) so credentials never appear in browser URLs.
+- **Better recap and PR descriptions** — prompts, regeneration, and squash-merge of memories are all tighter; PR sections fold each topic in `<details>` blocks so long branches stay scannable.
+- **E2E test guide editing** — edit or delete individual scenarios instead of all-or-nothing regeneration.
+- **Smaller VSIX** — sourcemaps removed from production builds; install size meaningfully smaller.
+- Bug fixes
 
 ## 0.98.0
 

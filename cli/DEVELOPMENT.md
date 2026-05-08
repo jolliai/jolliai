@@ -55,19 +55,25 @@ jolli status
 ## Architecture Overview
 
 ```
-                    AI Agent Session (Claude / Codex / Gemini / OpenCode)
+                    AI Agent Session
+              (Claude / Codex / Gemini / OpenCode /
+               Cursor / Copilot CLI / Copilot Chat)
                            │
                     ┌──────┴──────┐
                     │  Stop Event  │  (Claude only — Gemini uses AfterAgent;
-                    └──────┬──────┘   Codex / OpenCode have no hook)
+                    └──────┬──────┘   every other source has no hook)
                            │ stdin JSON
                     ┌──────┴──────┐
                     │  StopHook   │  Saves session info to
                     │  (Node.js)  │  ~/.jolli/jollimemory/sessions.json
                     └─────────────┘
                   (Codex sessions are discovered by scanning ~/.codex/sessions/
-                   at post-commit time; OpenCode by reading
-                   ~/.local/share/opencode/opencode.db via node:sqlite)
+                   at post-commit time. OpenCode reads
+                   ~/.local/share/opencode/opencode.db via node:sqlite.
+                   Cursor / Copilot CLI / Copilot Chat are each discovered by
+                   their own per-source detector + session discoverer at
+                   post-commit time, with the same lazy-import + feature-gate
+                   pattern as OpenCode.)
 
                     ... developer codes ...
 
@@ -135,8 +141,18 @@ jolli status
 | [GeminiSessionDetector.ts](src/core/GeminiSessionDetector.ts) | Detects Gemini CLI installation |
 | [OpenCodeSessionDiscoverer.ts](src/core/OpenCodeSessionDiscoverer.ts) | Discovers OpenCode sessions by reading `~/.local/share/opencode/opencode.db` (Node 22.5+ `node:sqlite`, lazy-imported and feature-gated). Surfaces a typed `OpenCodeScanError` when the DB is present but unreadable (corrupt / locked / schema mismatch) so the UI can render a dedicated "unavailable" row. |
 | [OpenCodeTranscriptReader.ts](src/core/OpenCodeTranscriptReader.ts) | Reads OpenCode message rows out of `opencode.db` and converts them into the shared `TranscriptEntry` shape used by the rest of the pipeline |
+| [CursorDetector.ts](src/core/CursorDetector.ts) / [CursorSessionDiscoverer.ts](src/core/CursorSessionDiscoverer.ts) / [CursorTranscriptReader.ts](src/core/CursorTranscriptReader.ts) | Cursor IDE (Composer) integration. Detector → "is Cursor installed", discoverer scans the workspace storage, reader normalises to `TranscriptEntry`. Same lazy-import + feature-gate pattern as OpenCode. |
+| [CopilotDetector.ts](src/core/CopilotDetector.ts) / [CopilotSessionDiscoverer.ts](src/core/CopilotSessionDiscoverer.ts) / [CopilotTranscriptReader.ts](src/core/CopilotTranscriptReader.ts) | GitHub Copilot CLI integration (same triplet pattern). |
+| [CopilotChatDetector.ts](src/core/CopilotChatDetector.ts) / [CopilotChatSessionDiscoverer.ts](src/core/CopilotChatSessionDiscoverer.ts) / [CopilotChatTranscriptReader.ts](src/core/CopilotChatTranscriptReader.ts) | VS Code Copilot Chat integration. Sessions live in the Copilot Chat conversation cache. Both Copilot CLI and Copilot Chat respect the single shared `copilotEnabled` config flag. |
 | [Summarizer.ts](src/core/Summarizer.ts) | Anthropic API calls for structured summary generation. Also exports `generateSquashMessage()` for the VSCode extension's squash flow |
-| [SummaryStore.ts](src/core/SummaryStore.ts) | Reads/writes summaries to the orphan branch (v3 tree format), merge/migrate operations |
+| [SummaryStore.ts](src/core/SummaryStore.ts) | Reads/writes summaries via the active `StorageProvider`. Default backend is the orphan branch; folder-mode and dual-write backends are pluggable (see Storage Layer below). Handles v3 tree merge / migrate operations. |
+| [StorageProvider.ts](src/core/StorageProvider.ts) / [StorageFactory.ts](src/core/StorageFactory.ts) | Storage abstraction: any backend implementing `StorageProvider` can be plugged in via `setActiveStorage()`. Factory selects the active backend (`OrphanBranchStorage`, `FolderStorage`, or `DualWriteStorage`) based on user config. |
+| [OrphanBranchStorage.ts](src/core/OrphanBranchStorage.ts) | Existing orphan-branch backend (default). Reads via `git show`, writes via `hash-object` + `mktree` + `commit-tree` + `update-ref`. |
+| [FolderStorage.ts](src/core/FolderStorage.ts) | Folder-mode backend: visible Markdown files under a chosen Memory Bank directory. |
+| [DualWriteStorage.ts](src/core/DualWriteStorage.ts) | Writes through to both orphan branch and folder storage so the orphan branch remains the system of record. |
+| [KBPathResolver.ts](src/core/KBPathResolver.ts) / [KBTypes.ts](src/core/KBTypes.ts) | Memory Bank path resolution (per-branch directories, kb root, dual-write metadata files). The `KB` prefix is the legacy identifier — the user-facing name is "Memory Bank". |
+| [MetadataManager.ts](src/core/MetadataManager.ts) | Reads / writes the kb metadata file (storage mode, paths, last-sync info). |
+| [MigrationEngine.ts](src/core/MigrationEngine.ts) | Drives migrations between storage modes (orphan → folder, folder → orphan, partial recovery). |
 | [SummaryTree.ts](src/core/SummaryTree.ts) | Tree traversal utilities (aggregate stats/turns, collect source nodes, `resolveDiffStats` display helper) |
 | [SummaryMigration.ts](src/core/SummaryMigration.ts) | v1→v3 migration logic for legacy orphan branch data |
 | [GitOperationDetector.ts](src/hooks/GitOperationDetector.ts) | Detects git operation type (commit, amend, squash, rebase, cherry-pick, revert) |

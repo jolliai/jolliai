@@ -1,6 +1,6 @@
 {
 	"name": "jollimemory",
-	"version": "0.98.0",
+	"version": "0.99.0",
 	"description": "AI development process auto-documentation tool - monorepo for CLI, VS Code extension and IntelliJ plugin",
 	"private": true,
 	"workspaces": [

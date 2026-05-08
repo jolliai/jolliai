@@ -71,18 +71,28 @@ IntelliJ plugin: `cd intellij && ./gradlew build` (or `runIde` for a sandbox). S
 
 The product is built on a hook pipeline that runs in the user's project, not in this repo:
 
-1. **AI agent hooks** (Claude `StopHook` / `SessionStartHook`, Gemini `AfterAgent`) only record session metadata to `<projectDir>/.jolli/jollimemory/sessions.json`. They do not read transcripts, do not call the LLM, and run with `async: true` so they never block the agent. Codex and OpenCode have no hook — they're discovered by scanning `~/.codex/sessions/` or reading `~/.local/share/opencode/opencode.db` (Node 22.5+ `node:sqlite`, lazy-imported and feature-gated; the VSCode bundle targets Node 18 and tolerates the missing module).
+1. **AI agent hooks** (Claude `StopHook` / `SessionStartHook`, Gemini `AfterAgent`) only record session metadata to `<projectDir>/.jolli/jollimemory/sessions.json`. They do not read transcripts, do not call the LLM, and run with `async: true` so they never block the agent. Codex, OpenCode, Cursor (Composer), GitHub Copilot CLI, and VS Code Copilot Chat have **no hook** — each has a per-source detector + session discoverer + transcript reader triplet under `cli/src/core/` that runs at post-commit time. The OpenCode reader uses Node 22.5+ `node:sqlite` and is lazy-imported + feature-gated so the VSCode bundle (which targets Node 18) tolerates the missing module; the Cursor and Copilot triplets follow the same lazy-import pattern. Copilot CLI and Copilot Chat share a single `copilotEnabled` config flag — splitting them was rejected because users want them together.
 
 2. **Git hooks** drive a unified queue under `.jolli/jollimemory/git-op-queue/`. `post-commit` is synchronous (<5 ms) and only enqueues + spawns a detached `QueueWorker`; the worker holds a 5-min file lock, drains entries in timestamp order, runs the LLM where needed, and chain-spawns a successor if new entries appear after it finishes. Squash and rebase entries skip the LLM and just merge/migrate existing summaries. `prepare-commit-msg` writes `squash-pending.json` so the worker recognizes squash before deciding whether to call the LLM. See [`cli/DEVELOPMENT.md`](cli/DEVELOPMENT.md) for the queue rationale (each op gets its own file precisely because the previous single-slot pending files lost summaries during rapid amend/rebase sequences).
 
-### Storage: orphan branch + two `.jolli/jollimemory/` dirs
+### Storage: orphan branch + pluggable `StorageProvider` + two `.jolli/jollimemory/` dirs
 
 Summaries live on the git orphan branch `jollimemory/summaries/v3` in the user's repo and are written via plumbing only — the branch is **never checked out**. Read with `git show <branch>:<path>`; write with `hash-object` + `mktree` + `commit-tree` + `update-ref`.
+
+The orphan branch I/O is wrapped behind a `StorageProvider` interface (`cli/src/core/StorageProvider.ts`). Three backends ship today, picked by `StorageFactory` and swapped in at runtime via `setActiveStorage()` in `SummaryStore.ts`:
+
+- `OrphanBranchStorage` — orphan-branch-only, the legacy mode (the only mode in 0.98.0 and earlier).
+- `FolderStorage` — folder-only.
+- `DualWriteStorage` — **the default in 0.99.0** (`storageMode` defaults to `"dual-write"` in `StorageFactory.createStorage`). Writes go to both the orphan branch (system of record) and a Memory Bank folder under `<kbRoot>/.jolli/jollimemory/<dir>/` per-branch; reads come from the orphan branch. The `kbRoot` variable name and the `KB`-prefixed module names (`KBPathResolver`, `KBTypes`) are legacy identifiers from when the feature was internally called "Knowledge Base"; the user-facing label is "Memory Bank".
+
+The VS Code extension's `activate()` (and the IntelliJ plugin's equivalent) checks `MetadataManager.readMigrationState()` on every start: if the orphan branch has data but migration has not completed (fresh install, or the user wiped the folder), `MigrationEngine.runMigration()` runs automatically. There is no opt-in — Memory Bank is on by default. The Settings → Local Memory Bank entry point lets the user re-target the folder; it re-runs migration into a fresh `-N`-suffixed folder and archives the previous folder's repo identity (content files are untouched).
+
+Display and write paths in `SummaryStore.ts` / `LocalSearchProvider.ts` go through the active provider, so adding a fourth backend (e.g. SQLite, S3) is a single new class plus a factory wiring change. Existing code that hard-coded git plumbing is gone — don't reintroduce it.
 
 Local non-summary state is split across **two** `.jolli/jollimemory/` directories — don't conflate them:
 
 - `~/.jolli/jollimemory/` — **machine-global**: `config.json` (authToken / apiKey), `dist-paths/` (per-source dist-path indirection), `run-hook` / `run-cli` / `resolve-dist-path` hook entry scripts. Resolved by `getGlobalConfigDir()`.
-- `<projectDir>/.jolli/jollimemory/` — **per-project, gitignored**: `sessions.json`, `cursors.json`, `git-op-queue/`, `notes/`, `plans.json`, `briefing-cache.json`, `debug.log`, and the manual-disable marker (VS Code). Resolved by `getJolliMemoryDir(cwd)` in [`cli/src/Logger.ts`](cli/src/Logger.ts).
+- `<projectDir>/.jolli/jollimemory/` — **per-project, gitignored**: `sessions.json`, `cursors.json`, `git-op-queue/`, `notes/`, `plans.json`, `briefing-cache.json`, `debug.log`, and the manual-disable marker (VS Code, written by `ManualDisableFlag` — durable per-repo opt-out from auto-enable; once set, never auto-cleared by anything other than an explicit re-enable). Resolved by `getJolliMemoryDir(cwd)` in [`cli/src/Logger.ts`](cli/src/Logger.ts).
 
 ### VS Code extension bundles the CLI
 
@@ -111,6 +121,7 @@ The bridge is `SiteRenderer.renderOpenApiSpecs(contentDir, publicDir, specs)` in
 ## Project conventions worth knowing
 
 - **Biome** is the formatter and linter (config: [`cli/biome.json`](cli/biome.json)). Tabs, 4-wide, 120 column limit. Rules of note: `noExplicitAny: error`, `noUnusedImports/Variables: error`, `useImportType: warn`. CI runs `biome check --error-on-warnings` — warnings fail.
+- **Never include AI/Claude co-author information in commit messages.** No `Co-Authored-By: Claude …` trailers, no "🤖 Generated with …" footers — for either commits or PR descriptions. The repo is going open-source and history should read as human-authored work; only `Signed-off-by:` is required.
 
 (The DCO sign-off, `npm run all` gate, CLI coverage floor, and worktree-aware requirement are stated as critical rules at the top of this file; they are not repeated here to keep this file as a single source of truth.)
 
