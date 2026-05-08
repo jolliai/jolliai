@@ -32,7 +32,7 @@ const log = createLogger("DistPathResolver");
 
 /**
  * Known IDE markers — provides stability for popular IDEs by mapping their
- * extension install path to a canonical source tag. The whitelist exists so
+ * extension install path to a canonical source tag. The allowlist exists so
  * that path variants (e.g. some IDEs ship multiple extension dirs) collapse to
  * one consistent tag.
  *
@@ -53,13 +53,13 @@ const KNOWN_IDE_MARKERS: ReadonlyArray<readonly [pattern: string, tag: string]> 
  * Derives a stable source tag from an extension installation path.
  *
  * Strategy:
- *   1. Match against known IDE whitelist (stable, handles aliases)
+ *   1. Match against known IDE allowlist (stable, handles aliases)
  *   2. Extract from `~/.<ide-name>/extensions/` pattern (auto-supports new IDEs)
  *   3. Hash fallback for non-standard paths (e.g. system-wide installs)
  *
  * Examples:
- *   ~/.vscode/extensions/jolli.../dist      -> "vscode"      (whitelist)
- *   ~/.cursor/extensions/jolli.../dist      -> "cursor"      (whitelist)
+ *   ~/.vscode/extensions/jolli.../dist      -> "vscode"      (allowlist)
+ *   ~/.cursor/extensions/jolli.../dist      -> "cursor"      (allowlist)
  *   ~/.newide/extensions/jolli.../dist      -> "newide"      (auto-extract)
  *   /opt/custom/path/dist                   -> "a1b2c3d4"    (hash fallback)
  */

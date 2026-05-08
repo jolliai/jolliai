@@ -159,7 +159,7 @@ Use a dry run when:
 
 - It's the first publish from a freshly-cut `release/<minor>.x` and you want to validate the whole chain (gitsign signing, OIDC, CI build/test) before committing.
 - You've upgraded `GITSIGN_VERSION` or changed `IDENTITY_REGEX` and want to confirm the new config works.
-- You've rotated a marketplace PAT and want to sanity-check it without burning a version number.
+- You've rotated a marketplace PAT and want to spot-check it without burning a version number.
 
 How to run:
 
