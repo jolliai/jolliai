@@ -816,14 +816,56 @@ const FULL_HASH_LENGTH = 40;
  */
 export class AmbiguousHashError extends Error {
 	readonly prefix: string;
+	/**
+	 * Full 40-char SHAs of every entry that matched the abbreviated prefix.
+	 * Carries the full list (not just a count) so user-facing callers can
+	 * render the colliding hashes for disambiguation — `jolli view` /
+	 * `jolli export` print them via {@link printAmbiguousHash} so the user
+	 * can copy-paste a longer prefix.
+	 */
 	readonly matches: ReadonlyArray<string>;
 	constructor(prefix: string, matches: ReadonlyArray<string>) {
+		// Invariant guards — these should be unreachable from production
+		// callers (`getSummary` only constructs this when ≥2 prefix matches
+		// were found, and the prefix it passed was a non-empty user input).
+		// Defensive throw makes the bug surface at the construction site
+		// rather than as confusing downstream behavior.
+		if (matches.length < 2) {
+			throw new Error(
+				`AmbiguousHashError requires ≥2 matches (got ${matches.length}); use null/undefined for "not found"`,
+			);
+		}
+		if (prefix.length === 0 || prefix.length >= FULL_HASH_LENGTH) {
+			throw new Error(
+				`AmbiguousHashError prefix must be 1..${FULL_HASH_LENGTH - 1} chars (got length ${prefix.length})`,
+			);
+		}
 		super(
 			`abbreviation \`${prefix}\` is ambiguous; please use a longer prefix (matched ${matches.length} commits)`,
 		);
 		this.name = "AmbiguousHashError";
 		this.prefix = prefix;
 		this.matches = matches;
+	}
+
+	/**
+	 * Duck-typed type guard that survives cross-bundle scenarios.
+	 *
+	 * `instanceof` only works when both sides reference the same class
+	 * identity. esbuild inlines `cli/src/**` into the VS Code extension
+	 * bundle today, so identity is preserved — but if a future caller
+	 * crosses an IPC boundary (worker, child process, serialized error
+	 * payload), the prototype chain breaks while name + fields survive.
+	 * Catch sites should prefer this over `instanceof` for forward-
+	 * compatibility.
+	 */
+	static is(error: unknown): error is AmbiguousHashError {
+		return (
+			error instanceof Error &&
+			error.name === "AmbiguousHashError" &&
+			typeof (error as { prefix?: unknown }).prefix === "string" &&
+			Array.isArray((error as { matches?: unknown }).matches)
+		);
 	}
 }
 
@@ -881,6 +923,13 @@ export async function getSummary(
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<CommitSummary | null> {
+	// Empty input is meaningless — return null rather than letting it fall
+	// to the prefix scan, where `"".startsWith()` would match every entry
+	// and surface as `AmbiguousHashError("", [all-of-index])`. Callers like
+	// `JolliMemoryBridge.getSummary` don't pre-validate length, so the
+	// guard belongs here.
+	if (commitHash.length === 0) return null;
+
 	// Normalize to lowercase up front. Index entries / file names / alias
 	// keys are all written lowercase, so without this a user typing
 	// `--commit ABC123…` would miss every step except Step 4's git-mediated
@@ -1357,6 +1406,14 @@ async function loadIndex(cwd?: string, storage?: StorageProvider): Promise<Summa
 	const store = resolveStorage(storage, cwd);
 	const content = await store.readFile(INDEX_FILE);
 	if (!content) {
+		// Surface as warn: in a healthy installation the index always exists
+		// once any summary has been generated. A null read here means either
+		// (a) fresh repo / no summaries yet, or (b) git failed to read from
+		// the orphan branch — `store.readFile` swallows the underlying git
+		// error and returns null, so production needs the warn to notice (b).
+		// Callers (`getSummary`, `listSummaries`, …) treat this as "nothing
+		// to return" rather than throwing, so the warn is the only signal.
+		log.warn("loadIndex: index.json unreadable from orphan branch (fresh repo or git read failed)");
 		return null;
 	}
 

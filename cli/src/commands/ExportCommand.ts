@@ -253,7 +253,7 @@ export function registerExportCommand(program: Command): void {
 				// Abbreviated --commit value matched multiple index entries.
 				// Mirror ViewCommand's "use a longer prefix" hint so the user
 				// knows how to disambiguate; everything else propagates.
-				if (error instanceof AmbiguousHashError) {
+				if (AmbiguousHashError.is(error)) {
 					printAmbiguousHash(error);
 					process.exitCode = 1;
 					return;

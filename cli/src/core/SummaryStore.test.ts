@@ -562,6 +562,41 @@ describe("SummaryStore", () => {
 			const result = await getSummary(oldHashUpper);
 			expect(result?.commitHash).toBe(newHash);
 		});
+
+		it("returns null on empty-string input without scanning the index", async () => {
+			// Without the empty-string guard, "" would fall through to prefix
+			// scan where `e.commitHash.startsWith("")` matches every entry,
+			// and `getSummary` would throw `AmbiguousHashError("", [all])`.
+			// Guard at the top short-circuits cleanly to null with no I/O.
+			const result = await getSummary("");
+			expect(result).toBeNull();
+			expect(vi.mocked(readFileFromBranch)).not.toHaveBeenCalled();
+		});
+
+		it("does NOT resolve an abbreviated hash that only matches a key in commitAliases", async () => {
+			// Contract: the alias map is consulted only on the FULL-SHA branch.
+			// An abbreviated input that happens to be a prefix of an alias key
+			// (but not of any entry's commitHash) must NOT resolve via the
+			// alias path — that path is for amend / rebase rewrites where the
+			// caller knows the exact 40-char old SHA. Resolving short prefixes
+			// against alias keys would be a surprising back-door.
+			const onlyAliasEntry = "ffffffffffffffffffffffffffffffffffffffff";
+			const aliasOldHash = "abcdef1234567890abcdef1234567890abcdef12"; // 40-char alias key
+			const index = v3Index(
+				// Entry's commitHash starts with "ff…", so the prefix scan
+				// will MISS for an "abcd…" prefix even though the alias map
+				// has "abcd…" as a key.
+				[rootEntry(onlyAliasEntry)],
+				{ [aliasOldHash]: onlyAliasEntry },
+			);
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(null) // Step 1: readSummaryFile("abcdef12") miss
+				.mockResolvedValueOnce(JSON.stringify(index)); // loadIndex
+			vi.mocked(getTreeHash).mockResolvedValueOnce(null); // Step 4 also misses
+
+			const result = await getSummary("abcdef12");
+			expect(result).toBeNull();
+		});
 	});
 
 	describe("listSummaries", () => {

@@ -263,7 +263,7 @@ export function registerViewCommand(program: Command): void {
 				try {
 					summary = await resolveCommit(options.commit, options.cwd);
 				} catch (error: unknown) {
-					if (error instanceof AmbiguousHashError) {
+					if (AmbiguousHashError.is(error)) {
 						printAmbiguousHash(error);
 						process.exitCode = 1;
 						return;

@@ -170,12 +170,21 @@ export class LocalSearchProvider implements SearchProvider {
 			try {
 				summary = await getSummary(hash, this.cwd, this.storage);
 			} catch (error: unknown) {
-				// Abbreviated hash collided with multiple index entries. We log it
-				// and record the ambiguous input in `failedHashes` so the LLM
-				// caller sees a partial result rather than a 500-style abort —
-				// other unambiguous hashes in the same batch are still loaded.
-				if (error instanceof AmbiguousHashError) {
-					log.debug("loadHits: %s is ambiguous (%d matches) — skipping", hash, error.matches.length);
+				// Abbreviated hash collided with multiple index entries. We log
+				// it and record the ambiguous input in `failedHashes` so the
+				// LLM caller sees a partial result rather than a 500-style
+				// abort — other unambiguous hashes in the same batch are still
+				// loaded. `failedHashes` currently flattens "ambiguous" and
+				// "missing" into one signal; bumping to warn so production
+				// observers can tell which hashes need a longer prefix even
+				// without a schema upgrade. (Splitting the schema into
+				// `{hash, reason, matches?}` is tracked as a follow-up.)
+				if (AmbiguousHashError.is(error)) {
+					log.warn(
+						"loadHits: hash %s is ambiguous (%d matches) — recording as failed",
+						hash,
+						error.matches.length,
+					);
 					failed.push(hash);
 					continue;
 				}

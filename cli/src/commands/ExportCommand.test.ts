@@ -66,12 +66,15 @@ describe("registerExportCommand — ambiguous --commit handling", () => {
 		];
 		mockExport.mockRejectedValueOnce(new AmbiguousHashError("abcdef", collidingHashes));
 
-		const { stdout } = await runCommand(["--commit", "abcdef", "--cwd", "/tmp/jolli-export-test"]);
+		const { stdout, stderr } = await runCommand(["--commit", "abcdef", "--cwd", "/tmp/jolli-export-test"]);
 
-		expect(stdout).toContain("abbreviation `abcdef` is ambiguous");
-		expect(stdout).toContain("please use a longer prefix");
+		// Hint goes to stderr (matches `jolli view`'s convention so piped
+		// stdout consumers stay clean); stdout doesn't get the prose.
+		expect(stderr).toContain("abbreviation `abcdef` is ambiguous");
+		expect(stderr).toContain("please use a longer prefix");
+		expect(stdout).not.toContain("abbreviation");
 		for (const hash of collidingHashes) {
-			expect(stdout).toContain(hash);
+			expect(stderr).toContain(hash);
 		}
 		expect(process.exitCode).toBe(1);
 	});

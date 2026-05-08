@@ -141,7 +141,6 @@ export function isInteractive(): boolean {
 	return process.stdin.isTTY === true;
 }
 
-/** Cap on how many colliding hashes we list when an abbreviation is ambiguous. */
 const AMBIGUOUS_DISPLAY_LIMIT = 10;
 
 /**
@@ -152,20 +151,23 @@ const AMBIGUOUS_DISPLAY_LIMIT = 10;
  * setting `process.exitCode` so a single helper covers both quiet (subcommand)
  * and noisy (top-level) callers without surprising them.
  *
- * Trims `matches` to {@link AMBIGUOUS_DISPLAY_LIMIT} so a 1-2 character prefix
- * against a multi-thousand-commit repo doesn't flood the terminal.
+ * Writes to **stderr** so downstream `tee` / pipe consumers don't see the hint
+ * mixed into stdout (the project's `SearchCommand.emitError` follows the same
+ * convention for text-mode error output). Trims `matches` to
+ * {@link AMBIGUOUS_DISPLAY_LIMIT} so a 1-2 character prefix against a multi-
+ * thousand-commit repo doesn't flood the terminal.
  */
 export function printAmbiguousHash(error: AmbiguousHashError): void {
-	console.log(`\n  abbreviation \`${error.prefix}\` is ambiguous; please use a longer prefix.`);
-	console.log(`  Matched ${error.matches.length} commits:`);
+	console.error(`\n  abbreviation \`${error.prefix}\` is ambiguous; please use a longer prefix.`);
+	console.error(`  Matched ${error.matches.length} commits:`);
 	const head = error.matches.slice(0, AMBIGUOUS_DISPLAY_LIMIT);
 	for (const hash of head) {
-		console.log(`    ${hash}`);
+		console.error(`    ${hash}`);
 	}
 	if (error.matches.length > AMBIGUOUS_DISPLAY_LIMIT) {
-		console.log(`    … and ${error.matches.length - AMBIGUOUS_DISPLAY_LIMIT} more`);
+		console.error(`    … and ${error.matches.length - AMBIGUOUS_DISPLAY_LIMIT} more`);
 	}
-	console.log("");
+	console.error("");
 }
 
 /**

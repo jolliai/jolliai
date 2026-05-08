@@ -230,27 +230,52 @@ describe("CliUtils", () => {
 	describe("printAmbiguousHash", () => {
 		// 40-char SHA fixtures matching production: AmbiguousHashError.matches
 		// always carries `index.entries[].commitHash` values which are 40 chars.
-		const SHA_A = "abc1234567890abc1234567890abc1234567890ab";
-		const SHA_B = "abc9876543210abc9876543210abc9876543210ab";
-		const SHA_C = "abc1111111111111111111111111111111111111ab";
+		const SHA_A = "abc1234567890abc1234567890abc1234567890ab".slice(0, 40);
+		const SHA_B = "abc9876543210abc9876543210abc9876543210ab".slice(0, 40);
+		const SHA_C = "abc1111111111111111111111111111111111111ab".slice(0, 40);
+
+		/** Captures console.error output of `fn` and returns the joined text. */
+		async function captureStderr(fn: () => void): Promise<string> {
+			const out: string[] = [];
+			const origErr = console.error;
+			console.error = (msg: string) => out.push(msg);
+			try {
+				fn();
+			} finally {
+				console.error = origErr;
+			}
+			return out.join("\n");
+		}
 
 		it("prints the prefix, count, and full match list when matches fit the display cap", async () => {
 			const { printAmbiguousHash } = await import("./CliUtils.js");
 			const { AmbiguousHashError } = await import("../core/SummaryStore.js");
-			const matches = [SHA_A.slice(0, 40), SHA_B.slice(0, 40), SHA_C.slice(0, 40)];
-			const out: string[] = [];
-			const origLog = console.log;
-			console.log = (msg: string) => out.push(msg);
-			try {
+			const matches = [SHA_A, SHA_B, SHA_C];
+			const joined = await captureStderr(() => {
 				printAmbiguousHash(new AmbiguousHashError("abc", matches));
-			} finally {
-				console.log = origLog;
-			}
-			const joined = out.join("\n");
+			});
 			expect(joined).toContain("abbreviation `abc` is ambiguous");
 			expect(joined).toContain("Matched 3 commits");
 			for (const hash of matches) expect(joined).toContain(hash);
 			// No "and N more" line when under the cap.
+			expect(joined).not.toContain("more");
+		});
+
+		it("includes every match (no '… and N more' tail) at exactly the display cap of 10", async () => {
+			// Boundary regression: catches `>` vs `>=` bugs in the truncation
+			// branch. With cap=10 and matches.length=10, the 10th element must
+			// still be inlined and the "and N more" line must NOT appear.
+			const { printAmbiguousHash } = await import("./CliUtils.js");
+			const { AmbiguousHashError } = await import("../core/SummaryStore.js");
+			const matches = Array.from({ length: 10 }, (_, i) => {
+				const stem = `${String(i).padStart(2, "0")}`;
+				return (stem + "f".repeat(40)).slice(0, 40);
+			});
+			const joined = await captureStderr(() => {
+				printAmbiguousHash(new AmbiguousHashError("00", matches));
+			});
+			expect(joined).toContain("Matched 10 commits");
+			for (const hash of matches) expect(joined).toContain(hash);
 			expect(joined).not.toContain("more");
 		});
 
@@ -265,15 +290,9 @@ describe("CliUtils", () => {
 				const stem = `${String(i).padStart(2, "0")}`;
 				return (stem + "0".repeat(40)).slice(0, 40); // 40-char hex
 			});
-			const out: string[] = [];
-			const origLog = console.log;
-			console.log = (msg: string) => out.push(msg);
-			try {
+			const joined = await captureStderr(() => {
 				printAmbiguousHash(new AmbiguousHashError("00", matches));
-			} finally {
-				console.log = origLog;
-			}
-			const joined = out.join("\n");
+			});
 			expect(joined).toContain("Matched 25 commits");
 			// First 10 are listed.
 			for (let i = 0; i < 10; i++) {
@@ -282,6 +301,72 @@ describe("CliUtils", () => {
 			// The 11th and beyond are NOT inlined.
 			expect(joined).not.toContain(matches[10]);
 			expect(joined).toContain("and 15 more");
+		});
+
+		it("does not write to stdout (clean for piped consumers)", async () => {
+			// Caller convention: hint goes to stderr so `jolli view --commit
+			// abc | tee file` keeps stdout clean. Without this guard a lazy
+			// console.log slip would silently regress the pipe contract.
+			const { printAmbiguousHash } = await import("./CliUtils.js");
+			const { AmbiguousHashError } = await import("../core/SummaryStore.js");
+			const stdoutLines: string[] = [];
+			const origLog = console.log;
+			console.log = (msg: string) => stdoutLines.push(msg);
+			try {
+				printAmbiguousHash(new AmbiguousHashError("abc", [SHA_A, SHA_B]));
+			} finally {
+				console.log = origLog;
+			}
+			expect(stdoutLines).toEqual([]);
+		});
+	});
+
+	describe("AmbiguousHashError construction invariants", () => {
+		it("rejects matches.length < 2 (use null/undefined for 'not found' instead)", async () => {
+			const { AmbiguousHashError } = await import("../core/SummaryStore.js");
+			expect(() => new AmbiguousHashError("abc", [])).toThrow(/requires ≥2 matches/);
+			expect(() => new AmbiguousHashError("abc", ["only-one"])).toThrow(/requires ≥2 matches/);
+		});
+
+		it("rejects an empty prefix (would otherwise match every entry on prefix scan)", async () => {
+			const { AmbiguousHashError } = await import("../core/SummaryStore.js");
+			expect(() => new AmbiguousHashError("", ["a", "b"])).toThrow(/prefix must be 1\.\.39 chars/);
+		});
+
+		it("rejects a 40-char prefix (full SHA wouldn't be ambiguous in the index)", async () => {
+			const { AmbiguousHashError } = await import("../core/SummaryStore.js");
+			const fortyChar = "a".repeat(40);
+			expect(() => new AmbiguousHashError(fortyChar, ["x", "y"])).toThrow(/prefix must be 1\.\.39 chars/);
+		});
+	});
+
+	describe("AmbiguousHashError.is (duck-typed guard)", () => {
+		it("matches both real instances and shape-equivalent objects across bundles", async () => {
+			const { AmbiguousHashError } = await import("../core/SummaryStore.js");
+			// Real instance — covers the common in-process case.
+			const real = new AmbiguousHashError("ab", ["aaaa", "bbbb"]);
+			expect(AmbiguousHashError.is(real)).toBe(true);
+
+			// Cross-bundle simulation: an Error with the same name + fields but
+			// a different prototype chain (what an IPC-deserialized error
+			// payload would look like). instanceof would FAIL here; is() must
+			// SUCCEED to keep callers forward-compatible.
+			const crossBundle = Object.assign(new Error("..."), {
+				name: "AmbiguousHashError",
+				prefix: "ab",
+				matches: ["aaaa", "bbbb"],
+			});
+			expect(AmbiguousHashError.is(crossBundle)).toBe(true);
+
+			// Negative cases: not Error / wrong name / missing fields.
+			expect(AmbiguousHashError.is(null)).toBe(false);
+			expect(AmbiguousHashError.is(new Error("plain"))).toBe(false);
+			expect(AmbiguousHashError.is({ name: "AmbiguousHashError", prefix: "ab", matches: [] })).toBe(false); // not Error
+			expect(
+				AmbiguousHashError.is(
+					Object.assign(new Error("..."), { name: "AmbiguousHashError", prefix: "ab" }), // missing matches
+				),
+			).toBe(false);
 		});
 	});
 });
