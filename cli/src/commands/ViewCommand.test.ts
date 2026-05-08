@@ -65,13 +65,16 @@ describe("registerViewCommand", () => {
 		];
 		mockGetSummary.mockRejectedValueOnce(new AmbiguousHashError("abcdef", collidingHashes));
 
-		const { stdout } = await runCommand(["--commit", "abcdef", "--cwd", "/tmp/jolli-view-test"]);
+		const { stdout, stderr } = await runCommand(["--commit", "abcdef", "--cwd", "/tmp/jolli-view-test"]);
 
-		expect(stdout).toContain("abbreviation `abcdef` is ambiguous");
-		expect(stdout).toContain("please use a longer prefix");
+		// Hint goes to stderr (so it doesn't pollute piped stdout consumers
+		// like `jolli view --commit abc | tee file`); stdout stays clean.
+		expect(stderr).toContain("abbreviation `abcdef` is ambiguous");
+		expect(stderr).toContain("please use a longer prefix");
+		expect(stdout).not.toContain("abbreviation");
 		// Both colliding hashes are shown so the user can pick.
 		for (const hash of collidingHashes) {
-			expect(stdout).toContain(hash);
+			expect(stderr).toContain(hash);
 		}
 		expect(process.exitCode).toBe(1);
 	});

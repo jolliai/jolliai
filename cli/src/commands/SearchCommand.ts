@@ -50,16 +50,29 @@ interface SearchOptions {
 	cwd?: string;
 }
 
-/** Splits a `--hashes` value into a list of trimmed, lowercased hashes. */
+/**
+ * Splits a `--hashes` value into a list of trimmed, lowercased hashes.
+ *
+ * Deduplicates while preserving first-seen order so a copy-pasted list with
+ * accidental duplicates (e.g. `abc1234,abc1234`) doesn't double-load the
+ * same summary downstream. The order matters because `LocalSearchProvider.
+ * loadHits` returns `results` in input order — the caller may rely on that
+ * ordering for rendering.
+ */
 export function parseHashList(value: string | undefined): ReadonlyArray<string> | null {
 	if (!value) return null;
 	const trimmed = value.trim();
 	if (trimmed.length === 0) return null;
 	if (!HASH_LIST_PATTERN.test(trimmed)) return null;
-	return trimmed
-		.split(",")
-		.map((h) => h.trim().toLowerCase())
-		.filter((h) => h.length > 0);
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const raw of trimmed.split(",")) {
+		const h = raw.trim().toLowerCase();
+		if (h.length === 0 || seen.has(h)) continue;
+		seen.add(h);
+		out.push(h);
+	}
+	return out;
 }
 
 /**

@@ -248,6 +248,60 @@ describe("registerSearchCommand", () => {
 		expect(stdout).toContain("abcd1234abcd1234abcd1234abcd1234abcd1234");
 	});
 
+	it("Phase 2 path: 8-char abbreviated hash flows end-to-end through getSummary's prefix scan", async () => {
+		// Integration coverage for the loosened HASH_LIST_PATTERN: parseHashList
+		// accepts the 8-char abbrev, the CLI passes it to LocalSearchProvider,
+		// which passes it to getSummary, which (in production) resolves it via
+		// the new in-memory prefix scan. Mock returns a summary keyed at the
+		// FULL 40-char SHA — buildHit then renders `hit.hash` as the first 8.
+		const fullHash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+		mockGetSummary.mockResolvedValueOnce({
+			version: 4,
+			commitHash: fullHash,
+			commitMessage: "feat: thing",
+			commitAuthor: "dev",
+			commitDate: "2026-04-01T00:00:00.000Z",
+			branch: "feature/thing",
+			generatedAt: "2026-04-01T00:00:00.000Z",
+			recap: "Did the thing",
+			topics: [{ title: "T", trigger: "tr", response: "rs", decisions: "d" }],
+		});
+		const { stdout } = await runCommand([
+			"thing",
+			"--hashes",
+			"deadbeef", // 8-char abbreviation
+			"--cwd",
+			"/tmp/jolli-search-test-abbrev",
+		]);
+		expect(stdout).toContain('"type": "search"');
+		// LocalSearchProvider was called with the abbreviated form (CLI doesn't
+		// expand to full SHA — that's getSummary's job in real use).
+		expect(mockGetSummary).toHaveBeenCalledTimes(1);
+		expect(mockGetSummary.mock.calls[0][0]).toBe("deadbeef");
+		// The result contains the full 40-char SHA (returned by getSummary)
+		// and the 8-char display hash matches the abbreviation.
+		expect(stdout).toContain(fullHash);
+	});
+
+	it("Phase 2 path: dedupes duplicate --hashes input", async () => {
+		// Regression: a copy-pasted list with accidental duplicates shouldn't
+		// double-load the same summary. parseHashList collapses duplicates
+		// into a single entry, so getSummary is only invoked once per unique
+		// hash.
+		mockGetSummary.mockResolvedValue({
+			version: 4,
+			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
+			commitMessage: "m",
+			commitAuthor: "d",
+			commitDate: "2026-04-01T00:00:00.000Z",
+			branch: "b",
+			generatedAt: "2026-04-01T00:00:00.000Z",
+			topics: [],
+		});
+		await runCommand(["q", "--hashes", "abcd1234,abcd1234,abcd1234", "--cwd", "/tmp/jolli-search-test-dedupe"]);
+		expect(mockGetSummary).toHaveBeenCalledTimes(1);
+	});
+
 	it("--output writes file and prints confirmation", async () => {
 		const { stdout } = await runCommand([
 			"auth",
