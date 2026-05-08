@@ -17,8 +17,48 @@ import { compareSemver, traverseDistPaths } from "../install/DistPathResolver.js
 export const VERSION = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
 /* v8 ignore stop */
 
-/** Valid characters for branch/keyword arguments (security: prevent shell injection). */
-export const SAFE_ARGUMENT_PATTERN = /^[\p{L}\p{N}\s\-_./]+$/u;
+/**
+ * Valid characters for branch/keyword arguments (security: prevent shell injection).
+ *
+ * Used by recall (which expects a branch name or short keyword identifier — not
+ * a free-form sentence). Search uses the looser {@link isSafeQuery} instead, so
+ * natural-language queries with `?`, `(`, `:`, etc. are accepted.
+ *
+ * Whitespace is intentionally restricted to ASCII space + tab (not the broader
+ * `\s` which includes newlines, vertical tabs, form feeds, etc.). The skill
+ * templates wrap user input in double quotes, but a literal newline would still
+ * split a quoted bash string into two commands on some shells. Blocking newlines
+ * at the validation layer is defense-in-depth.
+ */
+export const SAFE_ARGUMENT_PATTERN = /^[\p{L}\p{N} \t\-_./]+$/u;
+
+/**
+ * Characters that would escape a double-quoted bash argument or otherwise let
+ * the user inject another command. Everything else is allowed for search
+ * queries — including `?`, `#`, `(`, `)`, `:`, `,`, `'`, `!`, etc. that natural
+ * language sentences rely on.
+ *
+ * Blocked set (matched as two passes by isSafeQuery):
+ *   - `\\` — backslash (escape sequences / closes the quoted string)
+ *   - `` ` `` — backtick (legacy command substitution)
+ *   - `$`  — variable / `$()` expansion inside double quotes
+ *   - `"`  — closes the wrapping double quote
+ *   - any Unicode control character (`\p{Cc}` — newline, tab, form feed,
+ *     NUL, DEL, etc.); a literal newline inside `"..."` can split a quoted
+ *     string into multiple commands on some shells.
+ */
+const QUERY_DENY_LITERALS = /[\\`$"]/;
+const QUERY_DENY_CONTROL = /\p{Cc}/u;
+
+/**
+ * Returns true when `query` is safe to interpolate inside a double-quoted
+ * bash argument (e.g. `"${query}"`). Designed for free-form search queries
+ * where natural punctuation must be preserved. Two-pass check: shell-meta
+ * literals first, then any Unicode control character.
+ */
+export function isSafeQuery(query: string): boolean {
+	return !QUERY_DENY_LITERALS.test(query) && !QUERY_DENY_CONTROL.test(query);
+}
 
 /**
  * Prints a warning to stderr if any registered source's dist-paths/<source>

@@ -294,7 +294,10 @@ describe("MetadataManager", () => {
 
 			const fixed = manager.reconcile(kbRoot);
 			expect(fixed).toBe(1);
-			expect(manager.findById("abc")?.path).toBe("other/test.md");
+			// Normalize path separators — reconcile uses platform-native separators
+			// (backslash on Windows, slash on POSIX). The stored value is the
+			// platform-correct one; tests run on both.
+			expect(manager.findById("abc")?.path.replace(/\\/g, "/")).toBe("other/test.md");
 		});
 
 		it("no changes when files are in place", () => {
@@ -326,7 +329,8 @@ describe("MetadataManager", () => {
 
 			const fixed = manager.reconcile(kbRoot);
 			expect(fixed).toBe(1);
-			expect(manager.findById("abc")?.path).toBe("main/moved.md");
+			// Normalize path separators — same rationale as the move-by-fingerprint test above.
+			expect(manager.findById("abc")?.path.replace(/\\/g, "/")).toBe("main/moved.md");
 		});
 	});
 

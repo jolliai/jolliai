@@ -215,9 +215,9 @@ describe("Login", () => {
 
 	// ── Legacy token-in-URL fallback ──────────────────────────────────────
 	// Compatibility window for users on the latest CLI whose Jolli server
-	// hasn't shipped JOLLI-1270 yet. Once all server tenants emit `?code=`
-	// callbacks, this whole describe block (and the matching branch in
-	// createLoginServer) can be deleted.
+	// hasn't shipped the code-exchange endpoint yet. Once all server tenants
+	// emit `?code=` callbacks, this whole describe block (and the matching
+	// branch in createLoginServer) can be deleted.
 
 	describe("legacy token-in-URL fallback", () => {
 		// Silence the warn we emit on every legacy callback — it's exercised
@@ -362,7 +362,7 @@ describe("Login", () => {
 	// ── CSRF state validation (RFC 6749 §10.12) ──────────────────────────
 	// Only enforced on the `?code=` path. The legacy `?token=` describe
 	// block above intentionally exercises callbacks WITHOUT state to confirm
-	// the bypass — without that bypass, users on pre-1270 servers would be
+	// the bypass — without that bypass, users on older servers would be
 	// locked out of sign-in.
 
 	describe("state (CSRF) validation", () => {
@@ -477,7 +477,7 @@ describe("Login", () => {
 		});
 
 		it("does NOT enforce state on the legacy token-in-URL fallback", async () => {
-			// Legacy compatibility window — pre-1270 servers don't echo state.
+			// Legacy compatibility window — older servers don't echo state.
 			// Validating here would lock those users out of sign-in. The
 			// dedicated legacy describe block above asserts the happy path;
 			// this test just pins the design decision in one obvious place.

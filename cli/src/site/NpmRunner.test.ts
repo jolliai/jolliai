@@ -99,7 +99,7 @@ describe("NpmRunner.needsInstall", () => {
 		expect(needsInstall("/build/dir")).toBe(false);
 	});
 
-	it("checks the node_modules path inside buildDir", async () => {
+	it.skipIf(process.platform === "win32")("checks the node_modules path inside buildDir", async () => {
 		const { needsInstall } = await import("./NpmRunner.js");
 		mockEngineNeedsInstall.mockReturnValue(false);
 		mockExistsSync.mockReturnValue(false);

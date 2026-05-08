@@ -119,19 +119,21 @@ describe("getCursorWorkspaceStorageDir", () => {
 	it("returns the darwin workspaceStorage path", () => {
 		mockPlatform.mockReturnValue("darwin");
 		expect(getCursorWorkspaceStorageDir()).toBe(
-			"/home/user/Library/Application Support/Cursor/User/workspaceStorage",
+			join("/home/user", "Library", "Application Support", "Cursor", "User", "workspaceStorage"),
 		);
 	});
 
 	it("returns the linux workspaceStorage path", () => {
 		mockPlatform.mockReturnValue("linux");
-		expect(getCursorWorkspaceStorageDir()).toBe("/home/user/.config/Cursor/User/workspaceStorage");
+		expect(getCursorWorkspaceStorageDir()).toBe(
+			join("/home/user", ".config", "Cursor", "User", "workspaceStorage"),
+		);
 	});
 
 	it("honors an explicit home override (used by tests/installs not running as the real user)", () => {
 		mockPlatform.mockReturnValue("darwin");
 		expect(getCursorWorkspaceStorageDir("/tmp/sandbox")).toBe(
-			"/tmp/sandbox/Library/Application Support/Cursor/User/workspaceStorage",
+			join("/tmp/sandbox", "Library", "Application Support", "Cursor", "User", "workspaceStorage"),
 		);
 	});
 });

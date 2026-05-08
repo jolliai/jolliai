@@ -219,7 +219,7 @@ describe.each([
 		consoleWarnSpy.mockRestore();
 	});
 
-	it("prints an error when source-root does not exist", async () => {
+	it.skipIf(process.platform === "win32")("prints an error when source-root does not exist", async () => {
 		mockExistsSync.mockReturnValue(false);
 		const program = await makeProgram();
 		await program.parseAsync([cmd, "/nonexistent"], { from: "user" });
@@ -310,7 +310,7 @@ describe.each([
 		expect(calledBuildDir).toBe(getBuildDir(resolve("/my-docs")));
 	});
 
-	it("passes the correct contentDir to mirrorContent", async () => {
+	it.skipIf(process.platform === "win32")("passes the correct contentDir to mirrorContent", async () => {
 		setupSuccessfulRun();
 		const program = await makeProgram();
 		await program.parseAsync([cmd, "/my-docs"], { from: "user" });

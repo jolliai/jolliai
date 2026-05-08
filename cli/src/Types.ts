@@ -465,6 +465,68 @@ export interface SummaryIndex {
 	readonly commitAliases?: Readonly<Record<string, string>>;
 }
 
+// ─── Catalog types (search/recall warm path) ─────────────────────────────────
+
+/**
+ * Single topic entry within a CatalogEntry — a denormalized projection of
+ * `summary.topics[i]` (collected via `collectDisplayTopics` to handle v3/v4
+ * differences) optimized for catalog scanning.
+ *
+ * Decisions are stored in full (no length cap) — catalog.json is cold path
+ * and only loaded when /jolli-search or recall-catalog operations run.
+ */
+export interface CatalogTopic {
+	readonly title: string;
+	readonly decisions?: string;
+	readonly category?: TopicCategory;
+	readonly importance?: TopicImportance;
+	readonly filesAffected?: ReadonlyArray<string>;
+}
+
+/**
+ * Catalog entry — one per **root** commit (matches index entries with
+ * `parentCommitHash === null`). Carries the high-signal denormalized fields
+ * search needs to give an LLM enough context to pick relevant commits without
+ * loading individual summary files.
+ *
+ * Foreign-key relationship to `SummaryIndexEntry.commitHash` — branch / date
+ * metadata stays in index.json (hot path), rich content lives here (warm path).
+ */
+export interface CatalogEntry {
+	readonly commitHash: string;
+	readonly recap?: string;
+	/**
+	 * Ticket/issue identifier from the source summary.
+	 * Note: `SummaryIndexEntry` does NOT carry `ticketId`; catalog.json is the
+	 * authoritative source for this field.
+	 */
+	readonly ticketId?: string;
+	readonly topics?: ReadonlyArray<CatalogTopic>;
+}
+
+/**
+ * `catalog.json` file contents — sibling to `index.json` on the orphan branch.
+ *
+ * Lifecycle:
+ * - **Write**: maintained alongside `index.json` by the same write path that
+ *   stores summaries (storeSummary / migrateOneToOne / mergeManyToOne).
+ * - **Lazy build**: when CLI reads catalog and finds it missing entries that
+ *   exist as roots in index (e.g. IntelliJ wrote a commit but does not know
+ *   about catalog.json), the missing entries are reconstructed from
+ *   `summaries/<hash>.json` files and written back under the shared lock.
+ * - **Bootstrap**: when catalog.json is absent entirely (legacy install or
+ *   first-run on existing data), the same lazy-build path scans all root
+ *   summaries and creates the file.
+ *
+ * Reconcile invariant: lazy build also REMOVES catalog entries whose hashes
+ * are no longer roots in index (e.g. amend turned an old root into a child).
+ * This prevents stale entries from leaking into search results.
+ */
+export interface CommitCatalog {
+	readonly version: 1;
+	readonly entries: ReadonlyArray<CatalogEntry>;
+}
+
 /**
  * Subset of {@link JolliMemoryConfig} containing only the fields needed for LLM calls.
  * Callers load the full config and pass this subset to Summarizer functions,
