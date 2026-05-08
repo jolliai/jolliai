@@ -312,11 +312,16 @@ larger budget still doesn't surface relevant commits.
 ## Step 4: Load full content for the picks
 
 Construct the Phase 2 bash with the same query quoting + flag separation rule
-from Step 1, plus \`--hashes <h1,h2,h3>\`:
+from Step 1, plus \`--hashes <fullHash1,fullHash2,fullHash3>\`:
 
 \`\`\`
-"$HOME/.jolli/jollimemory/run-cli" search "<the query>" --hashes <h1,h2,h3> --format json
+"$HOME/.jolli/jollimemory/run-cli" search "<the query>" --hashes <fullHash1>,<fullHash2>,<fullHash3> --format json
 \`\`\`
+
+**Use \`hit.fullHash\` (40-char SHA), NOT \`hit.hash\` (8-char display)**. The
+CLI rejects abbreviated hashes — the 8-char display \`hash\` is for showing in
+your output to the user, but Phase 2 lookup needs the unambiguous full SHA
+(otherwise cherry-pick / rebase chains can resolve to the wrong commit silently).
 
 Output is a \`SearchResult\` with \`results: SearchHit[]\`. See Step 5 for the schema and how to render.
 

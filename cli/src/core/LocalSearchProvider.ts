@@ -60,11 +60,26 @@ export class LocalSearchProvider implements SearchProvider {
 		const limit = options.limit ?? DEFAULT_CATALOG_LIMIT;
 		const budget = options.budget ?? DEFAULT_SEARCH_BUDGET;
 
+		// Parse `--since` BEFORE any I/O — invalid values throw immediately so
+		// the user gets a hard error instead of silently disabled filtering.
+		// Earlier this path collapsed "unset" and "invalid" into the same null
+		// (treated as no-filter), turning typos like `--since=lastweek` into
+		// "wider results than expected with no warning".
+		const sinceParsed = parseSince(options.since);
+		if (sinceParsed.kind === "invalid") {
+			throw new Error(
+				`Invalid --since value "${sinceParsed.value}". Expected ISO date (e.g. 2026-01-01) or relative shorthand (7d / 2w / 1m / 3y).`,
+			);
+		}
+
 		const index = await getIndex(this.cwd, this.storage);
 		const catalog = await getCatalogWithLazyBuild(this.cwd, this.storage);
 
+		// `filterEcho` only echoes the user's `--since` when it parsed successfully;
+		// the "invalid" path threw above, so reaching here means it was either
+		// unset or valid.
 		const filterEcho = {
-			...(options.since !== undefined && { since: options.since }),
+			...(sinceParsed.kind === "ok" && options.since !== undefined && { since: options.since }),
 			limit,
 		} satisfies SearchCatalog["filter"];
 
@@ -74,7 +89,7 @@ export class LocalSearchProvider implements SearchProvider {
 
 		// Filter to root entries within the --since window; sort newest-first so
 		// truncation prefers recent commits when budget runs out.
-		const sinceTimestamp = parseSince(options.since);
+		const sinceTimestamp = sinceParsed.kind === "ok" ? sinceParsed.ts : null;
 		const indexEntries = index?.entries ?? [];
 		const candidates = indexEntries
 			.filter(isRootEntry)
@@ -85,6 +100,12 @@ export class LocalSearchProvider implements SearchProvider {
 		const limited = candidates.slice(0, limit);
 
 		// Build entries; track running token estimate and trim when over budget.
+		// `candidates` is sorted newest-first, so truncation prefers recent commits
+		// when budget runs out. When a single entry can't fit even after trim, we
+		// `continue` past it (skipping just that one) rather than `break` the
+		// whole loop — otherwise one verbose recent commit (long recap + many
+		// topics + many filesAffected) would silently exclude every older
+		// candidate, regardless of how small they would have been individually.
 		const entries: SearchCatalogEntry[] = [];
 		let runningTokens = 0;
 		let truncated = totalCandidates > limit;
@@ -93,14 +114,16 @@ export class LocalSearchProvider implements SearchProvider {
 			let entry = buildEntry(idx, cat);
 			let entryTokens = estimateTokens(JSON.stringify(entry));
 
-			// If adding this entry would blow the budget, try to trim it instead
-			// of stopping outright — many entries fit fine sans `decisions`.
+			// If adding this entry would blow the budget, try to trim it first —
+			// many entries fit fine sans `decisions`.
 			if (runningTokens + entryTokens > budget) {
 				entry = trimEntry(entry);
 				entryTokens = estimateTokens(JSON.stringify(entry));
 				if (runningTokens + entryTokens > budget) {
+					// This single entry is too big even trimmed. Skip it but keep
+					// trying smaller candidates that come later in the list.
 					truncated = true;
-					break;
+					continue;
 				}
 			}
 
@@ -163,14 +186,32 @@ function isRootEntry(e: SummaryIndexEntry): boolean {
 }
 
 /**
- * Parses `--since` accepting either ISO date strings (e.g. `2026-01-01`) or
- * relative shorthand (`7d`, `2w`, `1m`, `3y`). Returns the millisecond
- * timestamp (epoch) of the resulting cutoff, or `null` when no filter applies.
+ * Result of parsing a `--since` value.
+ *
+ * Three outcomes, deliberately distinguished:
+ *   - `{ kind: "unset" }`     — caller passed nothing (no filter, expected)
+ *   - `{ kind: "ok", ts }`    — successfully parsed timestamp
+ *   - `{ kind: "invalid", value }` — caller passed something that didn't parse
+ *
+ * The earlier signature (`number | null`) collapsed "unset" and "invalid" into
+ * the same `null`, so a typo like `--since=lastweek` silently disabled the
+ * filter (returning more results, not fewer) — the opposite of what the user
+ * intended, with no error feedback. The CLI now checks for `kind === "invalid"`
+ * and emits a hard error instead.
  */
-export function parseSince(since: string | undefined): number | null {
-	if (!since) return null;
+export type SinceParseResult =
+	| { readonly kind: "unset" }
+	| { readonly kind: "ok"; readonly ts: number }
+	| { readonly kind: "invalid"; readonly value: string };
+
+/**
+ * Parses `--since` accepting either ISO date strings (e.g. `2026-01-01`) or
+ * relative shorthand (`7d`, `2w`, `1m`, `3y`).
+ */
+export function parseSince(since: string | undefined): SinceParseResult {
+	if (since === undefined) return { kind: "unset" };
 	const trimmed = since.trim();
-	if (trimmed.length === 0) return null;
+	if (trimmed.length === 0) return { kind: "unset" };
 
 	const relative = trimmed.match(/^(\d+)([dwmy])$/i);
 	if (relative) {
@@ -180,18 +221,19 @@ export function parseSince(since: string | undefined): number | null {
 		const dayMs = 86_400_000;
 		switch (unit) {
 			case "d":
-				return now - n * dayMs;
+				return { kind: "ok", ts: now - n * dayMs };
 			case "w":
-				return now - n * 7 * dayMs;
+				return { kind: "ok", ts: now - n * 7 * dayMs };
 			case "m":
-				return now - n * 30 * dayMs;
+				return { kind: "ok", ts: now - n * 30 * dayMs };
 			case "y":
-				return now - n * 365 * dayMs;
+				return { kind: "ok", ts: now - n * 365 * dayMs };
 		}
 	}
 
 	const ms = new Date(trimmed).getTime();
-	return Number.isFinite(ms) ? ms : null;
+	if (Number.isFinite(ms)) return { kind: "ok", ts: ms };
+	return { kind: "invalid", value: trimmed };
 }
 
 function buildEntry(
