@@ -87,7 +87,9 @@ class OnboardingPanel(
 		add(JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply {
 			alignmentX = LEFT_ALIGNMENT
 			add(JBLabel(JolliMemoryIcons.JolliLogo))
-			add(JBLabel("<html><b style='font-size:14pt'>Get started with Jolli Memory</b></html>"))
+			add(JBLabel("Get started with Jolli Memory").apply {
+				font = JBUI.Fonts.label(14f).asBold()
+			})
 		})
 		add(Box.createVerticalStrut(4))
 		add(JBLabel(
@@ -114,6 +116,9 @@ class OnboardingPanel(
 			icon = JolliMemoryIcons.Key,
 			title = "Use your Anthropic API key",
 			description = "Connect your own Anthropic API key for AI summarization. Memories are stored locally only.",
+			helpTooltip = "Don't have one?",
+			helpLinkText = "Create one at console.anthropic.com",
+			helpLinkUrl = "https://console.anthropic.com/",
 		)
 		section.add(card)
 		section.add(Box.createVerticalStrut(8))
@@ -267,7 +272,7 @@ class OnboardingPanel(
 		)
 	}
 
-	private fun createOptionCard(icon: javax.swing.Icon, title: String, description: String): JPanel = object : JPanel() {
+	private fun createOptionCard(icon: javax.swing.Icon, title: String, description: String, helpTooltip: String? = null, helpLinkText: String? = null, helpLinkUrl: String? = null): JPanel = object : JPanel() {
 		init { isOpaque = false }
 		override fun paintComponent(g: java.awt.Graphics) {
 			val g2 = g.create() as java.awt.Graphics2D
@@ -291,7 +296,20 @@ class OnboardingPanel(
 		add(JPanel().apply {
 			layout = BoxLayout(this, BoxLayout.Y_AXIS)
 			isOpaque = false
-			add(JBLabel("<html><b>$title</b></html>").apply { alignmentX = Component.LEFT_ALIGNMENT })
+			add(JPanel(FlowLayout(FlowLayout.LEFT, 4, 0)).apply {
+				isOpaque = false
+				alignmentX = Component.LEFT_ALIGNMENT
+				add(JBLabel("<html><b>$title</b></html>"))
+				if (helpTooltip != null) {
+					if (helpLinkText != null && helpLinkUrl != null) {
+						add(com.intellij.ui.ContextHelpLabel.createWithLink(null, helpTooltip, helpLinkText) {
+							com.intellij.ide.BrowserUtil.browse(helpLinkUrl)
+						})
+					} else {
+						add(com.intellij.ui.ContextHelpLabel.create(helpTooltip))
+					}
+				}
+			})
 			add(Box.createVerticalStrut(2))
 			add(JBLabel("<html><span style='color:gray'>$description</span></html>").apply {
 				alignmentX = Component.LEFT_ALIGNMENT
