@@ -14,14 +14,16 @@ permissions:
 jobs:
   build-intellij:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: intellij
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - id: changes
         uses: ./.github/actions/detect-relevant-paths
@@ -32,14 +34,20 @@ jobs:
 
       - if: steps.changes.outputs.relevant == 'true'
         name: Set up JDK 21
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: temurin
           java-version: 21
 
+      # `validate-wrappers: true` (default since v3) re-checksums
+      # `intellij/gradle/wrapper/gradle-wrapper.jar` against Gradle's published
+      # known-good list before any `./gradlew` invocation, closing the in-tree
+      # binary supply-chain vector flagged by REUSE.toml's wrapper override.
       - if: steps.changes.outputs.relevant == 'true'
         name: Setup Gradle
-        uses: gradle/actions/setup-gradle@42ebad84b0585498c0413b0967cf4e80ec0e1d19 # v4.4.1
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+        with:
+          validate-wrappers: true
 
       - if: steps.changes.outputs.relevant == 'true'
         name: Build plugin

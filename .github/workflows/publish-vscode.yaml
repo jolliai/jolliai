@@ -36,6 +36,7 @@ jobs:
         permissions:
             contents: read    # checkout the tag; CI no longer pushes tags
         runs-on: ubuntu-24.04
+        timeout-minutes: 30
         environment: Production
         concurrency:
             group: release-vscode
@@ -61,6 +62,11 @@ jobs:
                 with:
                     ref: refs/tags/${{ steps.meta.outputs.tag }}
                     fetch-depth: 0
+                    # No push back to origin; drop the cached token from
+                    # `.git/config` so subsequent steps (incl. `npm ci` and any
+                    # postinstall scripts) cannot reach an authenticated
+                    # `GITHUB_TOKEN` via `git config --get http.extraheader`.
+                    persist-credentials: false
 
             -   name: Fetch tag object and assert it is an annotated, signed tag
                 env:
