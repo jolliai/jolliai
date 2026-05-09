@@ -228,18 +228,27 @@ comparison, mixed. The principles below are the only constraints.
 2. **Ground every concrete claim** to a hash and/or file. Use \`(abc12345)\`
    for hashes and \`[middleware/auth.ts](middleware/auth.ts)\` for files.
 
-3. **Synthesize, don't dump — but DO use short verbatim quotes.** Read
-   everything; fold into coherent prose or bullets. **However**, when a
-   single short sentence or phrase from \`decisions\` / \`recap\` /
-   \`plans[].content\` / \`notes[].content\` captures the answer concisely,
-   quote it verbatim in **bold** with attribution. Examples:
+3. **Synthesize, don't dump — but DO use verbatim quotes from stored
+   data.** Read everything; fold into coherent prose or bullets.
+   Whenever a phrase from \`decisions\` / \`recap\` / \`plans[].content\` /
+   \`notes[].content\` captures the answer more compactly than your
+   paraphrase, quote it verbatim in **bold** with attribution.
 
-   - *the design chose JWT because* **"stateless, scales horizontally"**
-     *(decisions, abc12345)*
-   - *per the auth-redesign plan,* **"all session tokens must be opaque"**
-     *(plan: auth-redesign)*
+   Quote **complete clauses (typically 10-30 words)** — not 2-3 word
+   fragments that depend on your surrounding paraphrase to mean
+   anything. The reader should be able to skim the bold quote alone
+   and understand its claim. Format, embedded in narrative:
 
-   Use sparingly (1-3 quotes per answer); never wall-of-fragments.
+   *The design chose JWT because* **"the stateless model lets us scale
+   horizontally without a shared session store across regions"**
+   *(decisions, abc12345)*; *per the auth-redesign plan,* **"all session
+   tokens must be opaque, with no client-readable claims, so rotation
+   never breaks the API"** *(plan: auth-redesign)*.
+
+   **Bold = verbatim from stored data.** Never use bold for general
+   emphasis. Quotes belong inside running prose or bullets that carry
+   their own narrative — never as bare bullets stripped of context.
+   Stringing bare quotes is the wall-of-fragments failure mode.
 
 4. **Reply in the user's language.** Template is English; user-visible
    output matches the user.
@@ -247,7 +256,7 @@ comparison, mixed. The principles below are the only constraints.
 5. **Don't expose machinery.** No "RecallPayload" / "commits array" /
    "JSON field" / "SearchHit" mentions.
 
-6. **Brief by default — keep the answer to ~400 words at most.**
+6. **Brief by default — keep the answer to ~500 words at most.**
    Long-form output is opt-in; render it only when the user explicitly
    asks for a "deep dive" or asks for detail on a specific theme.
 
@@ -479,7 +488,11 @@ Each \`results[i]\` is a \`SearchHit\`:
 
 2. **Ground every concrete claim** to a hash and/or file. Use \`(abc1234)\` for hashes and \`[cli/src/Types.ts](cli/src/Types.ts)\` for files.
 
-3. **Synthesize, don't dump — but DO use short verbatim quotes.** Read everything; fold into coherent prose or bullets. **However**, when a single short sentence or phrase from \`recap\` or \`decisions\` captures the answer concisely, quote it verbatim in **bold** with attribution: e.g. *the design chose JWT because* **"stateless, scales horizontally"** *(decisions, abc1234)*. Use sparingly (1-3 quotes per answer); never wall-of-fragments.
+3. **Synthesize, don't dump — but DO use verbatim quotes from stored data.** Read everything; fold into coherent prose or bullets. Whenever a phrase from \`recap\` or \`decisions\` captures the answer more compactly than your paraphrase, quote it verbatim in **bold** with attribution.
+
+   Quote **complete clauses (typically 10-30 words)** — not 2-3 word fragments that depend on your surrounding paraphrase to mean anything. The reader should be able to skim the bold quote alone and understand its claim. Format, embedded in narrative: *the design chose JWT because* **"the stateless model lets us scale horizontally without a shared session store across regions"** *(decisions, abc1234)*.
+
+   **Bold = verbatim from stored data.** Never use bold for general emphasis. Quotes belong inside running prose or bullets that carry their own narrative — never as bare bullets stripped of context. Stringing bare quotes is the wall-of-fragments failure mode.
 
 4. **Reply in the user's language.** Template is English; user-visible output matches the user.
 
