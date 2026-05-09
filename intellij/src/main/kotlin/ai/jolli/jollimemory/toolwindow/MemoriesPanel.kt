@@ -8,6 +8,9 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
+import git4idea.repo.GitRepository
+import git4idea.repo.GitRepositoryChangeListener
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.util.ui.JBUI
@@ -69,6 +72,10 @@ class MemoriesPanel(
         SwingConstants.CENTER,
     )
 
+    /** Scope for listing memories: "branch", "repo", or "all". */
+    var scope: String = "branch"
+        private set
+
     private var entries: List<SummaryIndexEntry> = emptyList()
     private var totalCount = 0
     private var loadedCount = PAGE_SIZE
@@ -76,10 +83,19 @@ class MemoriesPanel(
     private var loaded = false
     private val statusListener: () -> Unit = { SwingUtilities.invokeLater { refresh() } }
 
+    private val messageBusConnection = project.messageBus.connect()
+
     init {
         border = JBUI.Borders.empty(8)
 
         service.addStatusListener(statusListener)
+
+        // Refresh on branch switch so scope filter picks up the new branch
+        messageBusConnection.subscribe(
+            GitRepository.GIT_REPO_CHANGE,
+            GitRepositoryChangeListener { SwingUtilities.invokeLater { refresh() } },
+        )
+
         ApplicationManager.getApplication().executeOnPooledThread { refreshFromIndex() }
     }
 
@@ -90,6 +106,13 @@ class MemoriesPanel(
     /** Loads the next page of entries. */
     fun loadMore() {
         loadedCount += PAGE_SIZE
+        refresh()
+    }
+
+    /** Sets the scope and refreshes. */
+    fun setScope(newScope: String) {
+        scope = newScope
+        loadedCount = PAGE_SIZE
         refresh()
     }
 
@@ -119,6 +142,7 @@ class MemoriesPanel(
             val result = service.listMemoryEntries(
                 count = if (filter.isNotEmpty()) MAX_SEARCH_ENTRIES else loadedCount,
                 filter = filter.ifEmpty { null },
+                scope = scope,
             )
             entries = result.first
             totalCount = result.second
@@ -329,6 +353,7 @@ class MemoriesPanel(
 
     override fun dispose() {
         service.removeStatusListener(statusListener)
+        messageBusConnection.disconnect()
     }
 
     // ─── Utility functions ──────────────────────────────────────────────────────

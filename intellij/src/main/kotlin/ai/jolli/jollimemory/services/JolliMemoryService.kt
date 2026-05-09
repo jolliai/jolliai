@@ -406,7 +406,15 @@ class JolliMemoryService(private val project: Project) : Disposable {
      * @param filter Optional search text (filters by commitMessage or branch)
      * @return Pair of (matched entries, total count before pagination)
      */
-    fun listMemoryEntries(count: Int, filter: String? = null): Pair<List<ai.jolli.jollimemory.core.SummaryIndexEntry>, Int> {
+    /**
+     * Lists memory entries for the Memories panel.
+     *
+     * @param count Max number of entries to return
+     * @param filter Optional search text (filters by commitMessage or branch)
+     * @param scope "branch" = current branch only, "repo" = all branches, "all" = all repos in memory bank
+     * @return Pair of (matched entries, total count before pagination)
+     */
+    fun listMemoryEntries(count: Int, filter: String? = null, scope: String = "branch"): Pair<List<ai.jolli.jollimemory.core.SummaryIndexEntry>, Int> {
         val g = git ?: return emptyList<ai.jolli.jollimemory.core.SummaryIndexEntry>() to 0
         val projectPath = mainRepoRoot ?: ""
             val store = ai.jolli.jollimemory.core.SummaryStore(projectPath, g, StorageFactory.create(g, projectPath))
@@ -416,6 +424,16 @@ class JolliMemoryService(private val project: Project) : Disposable {
         var entries = index.entries
             .filter { it.parentCommitHash == null }
             .sortedByDescending { it.commitDate }
+
+        // Apply scope filter
+        if (scope == "branch") {
+            val currentBranch = g.getCurrentBranch()?.trim()
+            if (!currentBranch.isNullOrBlank()) {
+                entries = entries.filter { it.branch == currentBranch }
+            }
+        }
+        // scope == "repo" → no branch filter (all branches in this repo)
+        // scope == "all" → same as repo for now (memory bank browsing is in KB panel)
 
         // Apply search filter
         if (!filter.isNullOrBlank()) {
