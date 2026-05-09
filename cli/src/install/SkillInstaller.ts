@@ -217,8 +217,11 @@ Save interpretation for Part B.
 #### Part B — Free-form synthesis
 
 Pick whatever shape best serves the user's prompt: prose narrative,
-chronological timeline, decision-focused bullet list, side-by-side
-comparison, mixed. The principles below are the only constraints.
+chronological timeline, decision-focused bullet list, per-theme
+\`###\` sections, side-by-side comparison, mixed. When multiple
+distinct themes emerge across the commits, prefer \`###\` per theme —
+inline-bold paragraph prefixes blend into a wall under markdown
+rendering. The principles below are the only constraints.
 
 #### Universal principles (apply regardless of shape)
 
@@ -256,9 +259,14 @@ comparison, mixed. The principles below are the only constraints.
 5. **Don't expose machinery.** No "RecallPayload" / "commits array" /
    "JSON field" / "SearchHit" mentions.
 
-6. **Brief by default — keep the answer to ~500 words at most.**
-   Long-form output is opt-in; render it only when the user explicitly
-   asks for a "deep dive" or asks for detail on a specific theme.
+6. **Brief by default — synthesize, don't dump every commit.** Skip
+   routine commits and merge overlapping themes; aim for ~500 words
+   on a typical branch, but favor section structure over compression.
+   Never collapse \`###\` themes into inline-bold paragraph prefixes
+   just to hit a word count — that produces a wall and defeats the
+   structure's purpose. Branches with many distinct themes may
+   legitimately run longer; a "deep dive" on a specific theme is
+   opt-in.
 
 #### Plan / note stubs on commits
 
