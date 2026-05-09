@@ -105,6 +105,7 @@ class SettingsDialog(
     private var advancedPanelRef: JPanel? = null
     private var anthropicWarningRef: JBLabel? = null
     private var syncApiKeyFieldRef: JBTextField? = null
+    private var syncAdvancedPanelRef: JPanel? = null
     private val authListenerDisposable: Disposable
 
     init {
@@ -359,7 +360,7 @@ class SettingsDialog(
         }
         this.syncApiKeyFieldRef = syncApiKeyField
 
-        val syncAdvancedPanel = JPanel().apply {
+        val syncAdvancedPanel = JPanel().also { this.syncAdvancedPanelRef = it }.apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             alignmentX = JComponent.LEFT_ALIGNMENT
             isVisible = false
@@ -598,22 +599,25 @@ class SettingsDialog(
         val kbSort = kbSortCombo.selectedItem as String
 
         val configDir = SessionTracker.getGlobalConfigDir()
-        // Both AI Summary and Sync tabs can set the Jolli API key.
-        // If either field was shown, use its value. Prefer non-blank.
-        val aiSummaryKey = jolliApiKeyFieldRef?.text?.trim() ?: ""
-        val syncKey = syncApiKeyFieldRef?.text?.trim() ?: ""
-        // If either field is visible and non-blank, use it; otherwise take whatever is there
-        val jolliApiKeyText = when {
-            syncKey.isNotBlank() -> syncKey
-            aiSummaryKey.isNotBlank() -> aiSummaryKey
-            else -> "" // both blank — key was cleared
-        }
+        // Only read Jolli API key from fields whose Advanced panel is visible (user interacted).
+        // If Advanced is hidden, the field still has the value from populateFields — ignore it.
+        val aiSummaryKeyVisible = advancedPanelRef?.isVisible == true
+        val syncKeyVisible = syncAdvancedPanelRef?.isVisible == true
+        val aiSummaryKey = if (aiSummaryKeyVisible) jolliApiKeyFieldRef?.text?.trim() ?: "" else ""
+        val syncKey = if (syncKeyVisible) syncApiKeyFieldRef?.text?.trim() ?: "" else ""
 
-        // Detect if jolli key was actively cleared (was present before, now blank)
         val preExisting = SessionTracker.loadConfigFromDir(configDir)
-        val eitherFieldShown = jolliApiKeyFieldRef != null || syncApiKeyFieldRef != null
-        val jolliKeyCleared = eitherFieldShown &&
-            jolliApiKeyText.isBlank() && !preExisting.jolliApiKey.isNullOrBlank()
+        val jolliApiKeyText: String
+        val jolliKeyCleared: Boolean
+        if (aiSummaryKeyVisible || syncKeyVisible) {
+            // User opened Advanced — use the visible field's value
+            jolliApiKeyText = syncKey.ifBlank { aiSummaryKey }
+            jolliKeyCleared = jolliApiKeyText.isBlank() && !preExisting.jolliApiKey.isNullOrBlank()
+        } else {
+            // Advanced never opened — keep existing config value
+            jolliApiKeyText = preExisting.jolliApiKey ?: ""
+            jolliKeyCleared = false
+        }
         if (jolliKeyCleared) {
             JolliAuthService.signOut()
         }
@@ -622,7 +626,7 @@ class SettingsDialog(
         val existing = SessionTracker.loadConfigFromDir(configDir)
         val config = existing.copy(
             apiKey = resolvedApiKey.ifBlank { null },
-            jolliApiKey = if (jolliKeyCleared) null else jolliApiKeyText.ifBlank { existing.jolliApiKey },
+            jolliApiKey = if (jolliKeyCleared) null else jolliApiKeyText.ifBlank { null },
             model = (modelCombo.selectedItem as String).substringBefore(" ").let { if (it == "sonnet") null else it },
             maxTokens = maxTokens,
             claudeEnabled = claudeEnabledCheckbox.isSelected,
