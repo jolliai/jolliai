@@ -84,6 +84,25 @@ export async function migrateV1toV3(cwd?: string): Promise<{ migrated: number; s
 		return { migrated: 0, skipped: 0 };
 	}
 
+	// Hold orphan-write.lock for the ENTIRE read-build-write cycle.
+	//
+	// Earlier the lock only wrapped the final writeMultipleFilesToBranch call,
+	// which left a window where the post-commit Worker could land a fresh v3
+	// summary in `index.json` after we read v1 / built `filesToWrite` but
+	// before we acquired the lock. Migration's index.json — built solely from
+	// `rebuildIndexFromV1` — would then clobber the worker's entry on write
+	// (the summary file would survive but become unreachable from the index).
+	//
+	// Holding the lock through the whole body means the worker's storeSummary
+	// (which acquires the same lock around its own LMW) waits until migration
+	// completes; its write then layers on top of the migration's index. The
+	// only cost is a worker `storeSummary` whose 30 s timeout is exhausted by
+	// a very large migration — that is one summary lost, but the queue is
+	// drained correctly afterwards.
+	return withMigrationOrphanWriteLock(cwd, "migrateV1toV3", () => migrateV1toV3Locked(cwd));
+}
+
+async function migrateV1toV3Locked(cwd?: string): Promise<{ migrated: number; skipped: number }> {
 	// Read all summary files from v1
 	const v1Files = await listFilesInBranch(ORPHAN_BRANCH_V1, "summaries/", cwd);
 	log.info("Found %d summary files in v1 branch", v1Files.length);
@@ -129,18 +148,12 @@ export async function migrateV1toV3(cwd?: string): Promise<{ migrated: number; s
 	}
 
 	if (filesToWrite.length > 0) {
-		// Write under orphan-write.lock so we don't race the post-commit Worker
-		// (which also writes the orphan branch). This goes via raw GitOps rather
-		// than the StorageProvider abstraction, so the lock has to live here
-		// rather than being inherited from a StorageProvider wrapper.
-		await withMigrationOrphanWriteLock(cwd, "migrateV1toV3", async () => {
-			await writeMultipleFilesToBranch(
-				ORPHAN_BRANCH,
-				filesToWrite,
-				`Migrate ${migrated} summaries from v1 to v3 tree format`,
-				cwd,
-			);
-		});
+		await writeMultipleFilesToBranch(
+			ORPHAN_BRANCH,
+			filesToWrite,
+			`Migrate ${migrated} summaries from v1 to v3 tree format`,
+			cwd,
+		);
 		log.info("Migration complete: %d migrated, %d skipped", migrated, skipped);
 	} else {
 		log.info("No summaries to migrate");
