@@ -1,7 +1,8 @@
+import { execFileSync } from "node:child_process";
 import { mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Re-export node:fs/promises through a mock so individual tests can `vi.spyOn`
 // specific members (ESM exports are not configurable by default).
@@ -10,11 +11,19 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 	return { ...original };
 });
 
+// Same trick for node:child_process — needed by the fallback-path test, which
+// forces `git rev-parse` to fail to exercise the per-worktree fallback.
+vi.mock("node:child_process", async (importOriginal) => {
+	const original = await importOriginal<typeof import("node:child_process")>();
+	return { ...original };
+});
+
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import {
+	__resetSharedLockDirCache,
 	acquireOrphanWriteLock,
 	acquireWorkerLock,
 	DEFAULT_ORPHAN_WRITE_POLL_MS,
@@ -28,15 +37,51 @@ import {
 	WORKER_LOCK_FILE,
 } from "./Locks.js";
 
+/**
+ * Worker lock dir = per-worktree (`<cwd>/.jolli/jollimemory/`).
+ * Same path regardless of git presence.
+ */
+function workerLockPath(tempDir: string): string {
+	return join(tempDir, ".jolli", "jollimemory", WORKER_LOCK_FILE);
+}
+
+/**
+ * Orphan-write lock dir = `<git-common-dir>/jollimemory/` when the cwd is
+ * inside a git repo. The default test setup does `git init` in the tempdir,
+ * so the common dir is `<tempDir>/.git`.
+ */
+function orphanWriteLockPath(tempDir: string): string {
+	return join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE);
+}
+
 describe("Locks", () => {
 	let tempDir: string;
 
-	beforeEach(async () => {
+	// `git init` per test would spawn ~30 subprocesses across this file, which
+	// has been observed to push the v8-coverage worker pool over its memory
+	// budget on Windows CI. Init once per file and clean lock files between
+	// tests instead — each test still observes a fresh lock state, just inside
+	// the same git repo.
+	beforeAll(async () => {
 		tempDir = await mkdtemp(join(tmpdir(), "jollimemory-locks-"));
+		execFileSync("git", ["init", "--quiet"], { cwd: tempDir, stdio: "ignore" });
+	});
+
+	afterAll(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	beforeEach(async () => {
+		__resetSharedLockDirCache();
+		// Clean any lock file that an earlier test left behind so each test
+		// starts with both locks definitively unheld. `force: true` covers the
+		// usual "file does not exist" case.
+		await rm(join(tempDir, ".jolli", "jollimemory", WORKER_LOCK_FILE), { force: true });
+		await rm(join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE), { force: true });
 	});
 
 	afterEach(async () => {
-		await rm(tempDir, { recursive: true, force: true });
+		__resetSharedLockDirCache();
 		vi.restoreAllMocks();
 	});
 
@@ -56,9 +101,8 @@ describe("Locks", () => {
 
 		it("reclaims a stale lock (older than LOCK_TIMEOUT_MS) and acquires", async () => {
 			expect(await acquireWorkerLock(tempDir)).toBe(true);
-			const lockPath = join(tempDir, ".jolli", "jollimemory", WORKER_LOCK_FILE);
 			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
-			await utimes(lockPath, past, past);
+			await utimes(workerLockPath(tempDir), past, past);
 			expect(await acquireWorkerLock(tempDir)).toBe(true);
 			await releaseWorkerLock(tempDir);
 		});
@@ -71,6 +115,8 @@ describe("Locks", () => {
 		});
 
 		it("releaseWorkerLock swallows filesystem errors", async () => {
+			// Take the lock first so the PID check passes and we get to rm().
+			await acquireWorkerLock(tempDir);
 			const fsPromises = await import("node:fs/promises");
 			const rmSpy = vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(new Error("EACCES"));
 			await expect(releaseWorkerLock(tempDir)).resolves.toBeUndefined();
@@ -113,9 +159,8 @@ describe("Locks", () => {
 
 		it("isWorkerLockStale returns true when lock is older than LOCK_TIMEOUT_MS", async () => {
 			await acquireWorkerLock(tempDir);
-			const lockPath = join(tempDir, ".jolli", "jollimemory", WORKER_LOCK_FILE);
 			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
-			await utimes(lockPath, past, past);
+			await utimes(workerLockPath(tempDir), past, past);
 			expect(await isWorkerLockStale(tempDir)).toBe(true);
 			await releaseWorkerLock(tempDir);
 		});
@@ -124,10 +169,8 @@ describe("Locks", () => {
 	describe("refreshWorkerLockMtime", () => {
 		it("bumps the lock's mtime so a long-lived worker is not reaped", async () => {
 			await acquireWorkerLock(tempDir);
-			const lockPath = join(tempDir, ".jolli", "jollimemory", WORKER_LOCK_FILE);
-
 			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
-			await utimes(lockPath, past, past);
+			await utimes(workerLockPath(tempDir), past, past);
 			expect(await isWorkerLockStale(tempDir)).toBe(true);
 
 			await refreshWorkerLockMtime(tempDir);
@@ -139,6 +182,26 @@ describe("Locks", () => {
 
 		it("silently no-ops when the lock file is missing", async () => {
 			await expect(refreshWorkerLockMtime(tempDir)).resolves.toBeUndefined();
+		});
+
+		// PID-ownership guard: if a stale-reclaim race put a different process's
+		// PID into our worker.lock, refreshing the mtime would let the other
+		// process's stale-reclaim window get extended on our behalf.
+		it("does not bump mtime when the lock is owned by a different PID", async () => {
+			// Simulate a different owner: write a foreign PID into worker.lock and
+			// backdate it so the test can detect any unwanted mtime bump.
+			const lockPath = workerLockPath(tempDir);
+			const fsPromises = await import("node:fs/promises");
+			await fsPromises.mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
+			await writeFile(lockPath, "999999", "utf-8");
+			const backdated = new Date(Date.now() - 2 * LOCK_TIMEOUT_MS);
+			await utimes(lockPath, backdated, backdated);
+
+			await refreshWorkerLockMtime(tempDir);
+
+			// mtime should NOT have been advanced — the lock isn't ours.
+			const after = await stat(lockPath);
+			expect(Math.abs(after.mtimeMs - backdated.getTime())).toBeLessThan(1000);
 		});
 	});
 
@@ -194,14 +257,14 @@ describe("Locks", () => {
 
 		it("reclaims a stale orphan-write lock", async () => {
 			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
-			const lockPath = join(tempDir, ".jolli", "jollimemory", ORPHAN_WRITE_LOCK_FILE);
 			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
-			await utimes(lockPath, past, past);
+			await utimes(orphanWriteLockPath(tempDir), past, past);
 			expect(await acquireOrphanWriteLock(tempDir, { timeoutMs: 100 })).toBe(true);
 			await releaseOrphanWriteLock(tempDir);
 		});
 
 		it("releaseOrphanWriteLock swallows filesystem errors", async () => {
+			await acquireOrphanWriteLock(tempDir);
 			const fsPromises = await import("node:fs/promises");
 			const rmSpy = vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(new Error("EACCES"));
 			await expect(releaseOrphanWriteLock(tempDir)).resolves.toBeUndefined();
@@ -214,9 +277,8 @@ describe("Locks", () => {
 			expect(await acquireWorkerLock(tempDir)).toBe(true);
 			expect(await acquireOrphanWriteLock(tempDir, { timeoutMs: 100 })).toBe(true);
 
-			const dir = join(tempDir, ".jolli", "jollimemory");
-			expect((await stat(join(dir, WORKER_LOCK_FILE))).isFile()).toBe(true);
-			expect((await stat(join(dir, ORPHAN_WRITE_LOCK_FILE))).isFile()).toBe(true);
+			expect((await stat(workerLockPath(tempDir))).isFile()).toBe(true);
+			expect((await stat(orphanWriteLockPath(tempDir))).isFile()).toBe(true);
 
 			await releaseOrphanWriteLock(tempDir);
 			await releaseWorkerLock(tempDir);
@@ -231,10 +293,9 @@ describe("Locks", () => {
 
 		it("isWorkerLockHeld ignores a stale worker.lock + fresh orphan-write.lock", async () => {
 			// Plant a stale worker.lock the way a crashed worker would leave it.
-			const dir = join(tempDir, ".jolli", "jollimemory");
 			const fsPromises = await import("node:fs/promises");
-			await fsPromises.mkdir(dir, { recursive: true });
-			const stalePath = join(dir, WORKER_LOCK_FILE);
+			await fsPromises.mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
+			const stalePath = workerLockPath(tempDir);
 			await writeFile(stalePath, "12345", "utf-8");
 			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
 			await utimes(stalePath, past, past);
@@ -242,6 +303,121 @@ describe("Locks", () => {
 			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
 			expect(await isWorkerLockHeld(tempDir)).toBe(false);
 			await releaseOrphanWriteLock(tempDir);
+		});
+	});
+
+	// ── PID ownership on release ────────────────────────────────────────────
+	//
+	// Stale-reclaim race the PID check guards against:
+	//   1. Process A acquires lock (mtime t0)
+	//   2. A blocks long enough that age ≥ LOCK_TIMEOUT_MS
+	//   3. Process B's tryAcquireOnce removes A's lock and writes its own PID
+	//   4. A wakes up and runs its `finally { releaseLock }` block
+	//   5. Without the PID check: A would `rm` B's lock → C arrives → no lock
+	//      visible → C acquires → B and C now both write concurrently.
+	// The check makes step 5 a no-op.
+	describe("PID ownership on release", () => {
+		it("worker.lock release skips rm when the file's PID is not ours", async () => {
+			const lockPath = workerLockPath(tempDir);
+			const fsPromises = await import("node:fs/promises");
+			await fsPromises.mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
+			// Plant a foreign PID into the worker lock — emulates the post-reclaim state.
+			const foreignPid = String(process.pid + 1);
+			await writeFile(lockPath, foreignPid, "utf-8");
+
+			await releaseWorkerLock(tempDir);
+
+			// File must still be there (not removed by us).
+			const after = await stat(lockPath);
+			expect(after.isFile()).toBe(true);
+		});
+
+		it("worker.lock release removes the file when the PID matches us", async () => {
+			await acquireWorkerLock(tempDir);
+			await releaseWorkerLock(tempDir);
+			await expect(stat(workerLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("worker.lock release is a no-op when the file is missing (idempotent)", async () => {
+			await expect(releaseWorkerLock(tempDir)).resolves.toBeUndefined();
+		});
+
+		it("orphan-write.lock release skips rm when the file's PID is not ours", async () => {
+			const fsPromises = await import("node:fs/promises");
+			await fsPromises.mkdir(join(tempDir, ".git", "jollimemory"), { recursive: true });
+			const lockPath = orphanWriteLockPath(tempDir);
+			const foreignPid = String(process.pid + 1);
+			await writeFile(lockPath, foreignPid, "utf-8");
+
+			await releaseOrphanWriteLock(tempDir);
+
+			const after = await stat(lockPath);
+			expect(after.isFile()).toBe(true);
+		});
+
+		it("orphan-write.lock release removes the file when the PID matches us", async () => {
+			await acquireOrphanWriteLock(tempDir);
+			await releaseOrphanWriteLock(tempDir);
+			await expect(stat(orphanWriteLockPath(tempDir))).rejects.toThrow();
+		});
+	});
+
+	// ── git-common-dir resolution ──────────────────────────────────────────
+	//
+	// orphan-write.lock must live at `<git-common-dir>/jollimemory/` so all
+	// worktrees of the same repository serialize on the same lock file. The
+	// default beforeEach has `git init`'d the tempdir, so the common dir is
+	// <tempDir>/.git/. Both the file's actual location and a (non-init'd)
+	// fallback path are exercised here.
+	describe("orphan-write.lock path resolution", () => {
+		it("places the lock at <git-common-dir>/jollimemory/ when cwd is inside a git repo", async () => {
+			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
+			const expected = join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE);
+			expect((await stat(expected)).isFile()).toBe(true);
+			await releaseOrphanWriteLock(tempDir);
+		});
+
+		it("falls back to <cwd>/.jolli/jollimemory/ when git rev-parse fails", async () => {
+			// Force the resolver into the catch path by making `execFile` throw.
+			// Tests run with `mkdtemp` so the cache hasn't seen tempDir yet — but
+			// reset to be safe in case a previous it-block populated it.
+			__resetSharedLockDirCache();
+			const childProcess = await import("node:child_process");
+			const execSpy = vi.spyOn(childProcess, "execFile").mockImplementation(
+				// @ts-expect-error -- vi.spyOn signature for overloaded execFile is awkward; the runtime call shape matches what the resolver invokes
+				(_file: string, _args: ReadonlyArray<string>, _opts: unknown, cb: (err: Error) => void) => {
+					cb(new Error("simulated: git not found"));
+					return {} as unknown;
+				},
+			);
+
+			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
+			const fallback = join(tempDir, ".jolli", "jollimemory", ORPHAN_WRITE_LOCK_FILE);
+			expect((await stat(fallback)).isFile()).toBe(true);
+			await releaseOrphanWriteLock(tempDir);
+
+			execSpy.mockRestore();
+			__resetSharedLockDirCache();
+		});
+
+		it("caches the resolved path so repeated polls don't spawn git on every iteration", async () => {
+			__resetSharedLockDirCache();
+			const childProcess = await import("node:child_process");
+			const execSpy = vi.spyOn(childProcess, "execFile");
+
+			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
+			await releaseOrphanWriteLock(tempDir);
+			const callsAfterFirstAcquire = execSpy.mock.calls.length;
+
+			// Multiple subsequent acquire/release cycles must hit the cache (zero
+			// additional `git rev-parse` invocations).
+			for (let i = 0; i < 5; i++) {
+				await acquireOrphanWriteLock(tempDir);
+				await releaseOrphanWriteLock(tempDir);
+			}
+			expect(execSpy.mock.calls.length).toBe(callsAfterFirstAcquire);
+
+			execSpy.mockRestore();
 		});
 	});
 });
