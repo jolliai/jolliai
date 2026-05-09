@@ -141,57 +141,163 @@ jolli-skill-version: ${SKILL_VERSION}
 
 > Every commit deserves a Memory. Every memory deserves a Recall.
 
-## Step 1: Load Context
+Load the structured development context for a branch — commits with their
+distilled topics (trigger / response / decisions / files), plus any plans
+and notes that the work referenced. Synthesize a grounded answer to the
+user's prompt about that branch.
 
-Run this Bash command to load Jolli context data:
+## Step 1: Parse the argument
+
+The user's input is either a branch name (exact or fragment) or empty (use
+the current git branch). Quote it when constructing bash to prevent shell
+injection.
+
+## Step 2: Run the CLI
 
 \`\`\`
-"$HOME/.jolli/jollimemory/run-cli" recall "\${ARGUMENTS}" --budget 30000 --format json
+"$HOME/.jolli/jollimemory/run-cli" recall "\${ARGUMENTS}" --format json
 \`\`\`
 
-If the file \`~/.jolli/jollimemory/run-cli\` does not exist, tell the user:
+If \`~/.jolli/jollimemory/run-cli\` does not exist, tell the user:
 "Jolli not installed. Please install via \`npm install -g @jolli.ai/cli && jolli enable\` or install the Jolli VS Code extension."
 Do not attempt further processing.
 
-## Step 2: Process the Result
+## Step 3: Handle the response
 
-The command output is JSON with a "type" field. Handle each case:
+The output is JSON with a \`type\` field. Three cases:
 
-### type: "recall" — Full context loaded successfully
-Generate the loading report:
+### type: "recall" — full payload returned
 
-**Part 1: Loading Confirmation & Statistics**
-- Time span, commit count, file change statistics
-- Total context size (tokens) and percentage of context window used
-- Breakdown by content type: N topics (~X tokens), N plans (~Y tokens), N decisions (~Z tokens)
+You have a \`RecallPayload\` with these fields:
 
-**Part 2: Understanding Summary**
-In your own words, summarize what you understood:
-- What this branch is implementing (one sentence)
-- Key technical decisions and why they were made
-- What was last worked on
-- Main files involved
+- \`branch\`, \`period: { start, end }\`, \`commitCount\`, \`totalFilesChanged\`,
+  \`totalInsertions\`, \`totalDeletions\` — branch-level facts.
+- \`commits[]\` — per-commit projection. Each carries:
+  - identity (always present): \`hash\` (8-char display), \`fullHash\`, \`branch\`,
+    \`commitDate\`, \`commitAuthor\`, \`commitMessage\`; optional \`commitType?\`,
+    \`ticketId?\`.
+  - \`diffStats?\` — \`{ filesChanged, insertions, deletions }\`.
+  - \`recap?\` — 1-3 paragraphs of plain-English narrative.
+  - \`topics[]\` — each with **always present**: \`title\`, **\`decisions\` (★)**;
+    **may be absent**: \`trigger?\`, \`response?\`, \`todo?\`, \`filesAffected?\`,
+    \`category?\`, \`importance?\`. \`trigger\` and \`response\` may be dropped by
+    budget trimming; \`decisions\` is never dropped from a kept commit (if the
+    budget can't fit it, the whole commit is omitted from \`commits[]\`).
+  - \`plans?\` — \`{ slug, title }[]\` refs only; \`slug\` is the **normalized
+    base slug** that always resolves to an entry in payload-level \`plans\`.
+  - \`notes?\` — \`{ id, title }[]\` refs only; \`id\` always resolves to an
+    entry in payload-level \`notes\`. (Notes use \`id\`, not \`slug\` — they
+    have no archive-suffix mechanism.)
+- \`plans[]\` — branch-deduplicated plan bodies: \`{ slug, title, content? }\`.
+  \`content\` may be absent under tight budget — when absent, the entry is
+  still a valid grounding anchor but you can't quote from it.
+- \`notes[]\` — same shape and trimming rule as plans.
+- \`stats\`, \`estimatedTokens\`, \`truncated?\`.
 
-This section is critical for building user trust — the user needs to see that
-you accurately understand the prior work.
+Render in two parts (in order):
 
-**Part 3: Next Steps**
-Ask: "What would you like to work on next?"
+#### Part A — Forced fact opener (no paraphrase, no interpretation)
 
-### type: "catalog" — Branch lookup needed
-The CLI returned a catalog because no exact branch match was found.
-If a "query" field is present, use semantic matching against the catalog's
-branch names, commit messages, and topicTitles (LLM-distilled per-commit titles):
-- Match across languages: e.g. CJK keywords should match English branch names/messages
-- Match by time: e.g. "last week" or date-related queries should match by date range
-- Match topicTitles when present — they carry far more signal than commit messages
-- One match: load it with Bash: \`"$HOME/.jolli/jollimemory/run-cli" recall "<branch>" --budget 30000 --format json\`, then output the full report above
-- Multiple matches: show candidates, ask user to choose
-- No matches: show full catalog, ask user to clarify
+Render the loaded confirmation as a heading + bullet block (not a prose
+line). **Facts only — do not interpret what the branch is "about" here.**
+The mandated shape:
 
-If no "query" field (user ran without arguments and current branch has no records):
-- Show the branch catalog in a friendly format
-- Ask which branch they want to recall
+\`\`\`markdown
+### Loaded \`feature/auth\`
+
+- **Period:** 2026-04-10 → 2026-04-15 (5 days)
+- **Commits:** 8 (+312 −89, 24 files)
+- **Captured:** 12 topics, 5 key decisions, 2 plans, 3 notes
+\`\`\`
+
+The heading + bullet shape is required — a single prose line blends into
+the synthesis below and the user loses the visual anchor for verification.
+Save interpretation for Part B.
+
+#### Part B — Free-form synthesis
+
+Pick whatever shape best serves the user's prompt: prose narrative,
+chronological timeline, decision-focused bullet list, side-by-side
+comparison, mixed. The principles below are the only constraints.
+
+#### Universal principles (apply regardless of shape)
+
+1. **Lead with the answer.** No "Let me analyze..." or "Found N commits..."
+   preamble.
+
+2. **Ground every concrete claim** to a hash and/or file. Use \`(abc12345)\`
+   for hashes and \`[middleware/auth.ts](middleware/auth.ts)\` for files.
+
+3. **Synthesize, don't dump — but DO use short verbatim quotes.** Read
+   everything; fold into coherent prose or bullets. **However**, when a
+   single short sentence or phrase from \`decisions\` / \`recap\` /
+   \`plans[].content\` / \`notes[].content\` captures the answer concisely,
+   quote it verbatim in **bold** with attribution. Examples:
+
+   - *the design chose JWT because* **"stateless, scales horizontally"**
+     *(decisions, abc12345)*
+   - *per the auth-redesign plan,* **"all session tokens must be opaque"**
+     *(plan: auth-redesign)*
+
+   Use sparingly (1-3 quotes per answer); never wall-of-fragments.
+
+4. **Reply in the user's language.** Template is English; user-visible
+   output matches the user.
+
+5. **Don't expose machinery.** No "RecallPayload" / "commits array" /
+   "JSON field" / "SearchHit" mentions.
+
+6. **Brief by default — keep the answer to ~400 words at most.**
+   Long-form output is opt-in; render it only when the user explicitly
+   asks for a "deep dive" or asks for detail on a specific theme.
+
+#### Plan / note stubs on commits
+
+When a commit carries \`plans?\` / \`notes?\` stubs, use the stub title as a
+grounding anchor for narrative ("the auth-redesign plan guides this work").
+
+**To quote from a plan or note body**, look up the matching entry in the
+top-level \`plans\` / \`notes\` array by its \`slug\` (plans) or \`id\` (notes):
+
+- If the entry has \`content\`: quote verbatim with \`(plan: <slug>)\` /
+  \`(note: <id>)\` attribution if relevant to the user's prompt.
+- If \`content\` is absent (budget trimming dropped the body): use **only**
+  the title as a citation anchor — never fabricate a quote from a body
+  you cannot see.
+
+#### Empty / partial handling
+
+- Empty \`commits\`: tell the user no records were found; suggest running
+  \`jolli enable\` if they expected records.
+- \`truncated: true\`: budget enforcement dropped fields or commits. Mention
+  it with a one-liner if the user asks for deeper detail; otherwise stay
+  silent.
+
+### type: "catalog" — branch lookup needed
+
+Returned when no exact branch match was found. Has a \`branches[]\` array
+with \`branch\`, \`commitCount\`, \`period\`, \`commitMessages\`, \`topicTitles?\`.
+If a \`query\` field is present, semantic-match the user's input against
+\`branch\`, \`commitMessages\`, and \`topicTitles\` (the highest-signal source);
+support cross-language matching and time-relative queries.
+
+- One match: re-run \`"$HOME/.jolli/jollimemory/run-cli" recall "<branch>" --format json\`
+  and continue from Step 3.
+- Multiple matches: list candidates, ask user to choose.
+- No matches: show the catalog, ask user to clarify.
+
+### type: "error" — CLI returned a hard error
+
+Has a \`message\` string. Common cases:
+
+- Branch matched but its summaries failed to load.
+- No records in the repo at all.
+- Invalid argument or internal failure.
+
+Surface the message verbatim to the user (translated into their language if
+non-English). For "no records in this repo" specifically, suggest running
+\`jolli enable\` if they expected records. Do NOT retry or fabricate a recall
+payload from nothing.
 `;
 }
 
@@ -347,7 +453,7 @@ Each \`results[i]\` is a \`SearchHit\`:
 - \`ticketId?\` — render as \`[TICKET-1234]\` badge
 
 **Change scale**:
-- \`diffStats?\` — \`{ files, insertions, deletions }\`
+- \`diffStats?\` — \`{ filesChanged, insertions, deletions }\`
 
 **Narrative**:
 - \`recap?\` — 1-3 paragraphs of plain-English narrative. Highest-quality prose; primary source for "what is X" / "explain X".
@@ -355,31 +461,29 @@ Each \`results[i]\` is a \`SearchHit\`:
 **Topics** — \`topics: SearchHitTopic[]\` (★ the meat):
 
   - \`title\` — one-sentence label
-  - \`trigger\` — 1-2 sentences, what prompted the work
-  - \`response\` — implementation summary, may include code; longest field
+  - \`trigger?\` — 1-2 sentences, what prompted the work
+  - \`response?\` — implementation summary, may include code; longest field
   - \`decisions\` ★ **THE STAR FIELD** — design choices + *why*, as markdown bullets. Primary source for "why did we choose X" / "what alternatives" / "rationale". Not in the diff; only here.
   - \`todo?\` — residual work the LLM flagged (rare)
   - \`filesAffected?\` — per-topic file list. Render as markdown links: \`[cli/src/Types.ts](cli/src/Types.ts)\`.
   - \`category?\` — \`feature\` / \`bugfix\` / \`refactor\` / \`tech-debt\` / \`docs\` / \`test\` / \`devops\` / \`ux\`
   - \`importance?\` — \`major\` / \`minor\`
 
+**Plan / note stubs**:
+- \`plans?\` — \`{ slug, title }[]\` — plan refs this commit declared. Search ships only stubs (no plan body); use the title as a grounding anchor in your narrative ("the decision is consistent with the auth-redesign plan referenced by this commit"). **Do NOT promise the user they can navigate to the plan body from search** — search Phase 2 carries no plan content.
+- \`notes?\` — \`{ id, title }[]\` — same shape and rule as plans.
+
 ### B. Universal principles (apply regardless of shape)
 
-Non-negotiable. Encoded from past dogfood failures.
+1. **Lead with the answer.** No "Let me analyze..." or "Found N commits..." preamble.
 
-1. **Lead with the answer**, not with search mechanics. Never open with "Found N relevant commits out of M". Coverage chatter belongs only in the empty/partial branches below.
+2. **Ground every concrete claim** to a hash and/or file. Use \`(abc1234)\` for hashes and \`[cli/src/Types.ts](cli/src/Types.ts)\` for files.
 
-2. **Ground every concrete claim** to a hash and/or file. Use \`(abc1234)\` for hashes and \`[cli/src/Types.ts](cli/src/Types.ts)\` for files. Never wrap file paths in backticks alone — markdown-link form stays readable AND becomes clickable.
+3. **Synthesize, don't dump — but DO use short verbatim quotes.** Read everything; fold into coherent prose or bullets. **However**, when a single short sentence or phrase from \`recap\` or \`decisions\` captures the answer concisely, quote it verbatim in **bold** with attribution: e.g. *the design chose JWT because* **"stateless, scales horizontally"** *(decisions, abc1234)*. Use sparingly (1-3 quotes per answer); never wall-of-fragments.
 
-3. **Synthesize, don't dump — but DO use short verbatim quotes.** Read everything; fold into coherent prose or bullets. **However**, when a single short sentence or phrase from \`recap\` or \`decisions\` captures the answer concisely, quote it verbatim in **bold** with attribution: e.g. *the design chose JWT because* **"stateless, scales horizontally"** *(decisions, abc1234)*. Bold in this skill means "verbatim from stored data" — it builds user confidence that answers come from real recorded decisions, not LLM paraphrase. Use sparingly (1-3 quotes per answer); never wall-of-fragments.
+4. **Reply in the user's language.** Template is English; user-visible output matches the user.
 
-4. **Skip near-duplicates** from amend / squash chains (same \`commitMessage\`, similar topics). One row per logical change.
-
-5. **Reply in the user's language.** Template is English; user-visible output matches the user.
-
-6. **Don't expose search machinery.** No "Phase 1" / "Phase 2" / "catalog" / "SearchHit JSON" mentions.
-
-7. **No \`[Open in IDE](vscode://...)\` links** — chat webview filters non-http(s) clicks (anthropics/claude-code#26952). Use \`jolli view --commit <hash>\` as the per-commit open action.
+5. **Don't expose machinery.** No "Phase 1" / "Phase 2" / "catalog" / "SearchCatalog" / "SearchHit" / "JSON field" mentions.
 
 ### C. Output shape
 

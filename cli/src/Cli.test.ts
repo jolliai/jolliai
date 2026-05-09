@@ -167,7 +167,32 @@ vi.mock("./core/ContextCompiler.js", () => ({
 	}),
 	listBranchCatalog: vi.fn().mockResolvedValue({ type: "catalog", branches: [] }),
 	renderContextMarkdown: vi.fn().mockReturnValue("# Task Context: feature/test\n"),
-	DEFAULT_TOKEN_BUDGET: 30000,
+	buildRecallPayload: vi.fn().mockReturnValue({
+		type: "recall",
+		branch: "feature/test",
+		period: { start: "2026-03-28T10:00:00.000Z", end: "2026-03-28T10:00:00.000Z" },
+		commitCount: 0,
+		totalFilesChanged: 0,
+		totalInsertions: 0,
+		totalDeletions: 0,
+		commits: [],
+		plans: [],
+		notes: [],
+		stats: {
+			topicCount: 0,
+			planCount: 0,
+			noteCount: 0,
+			decisionCount: 0,
+			topicTokens: 0,
+			planTokens: 0,
+			noteTokens: 0,
+			decisionTokens: 0,
+			transcriptTokens: 0,
+			totalTokens: 0,
+		},
+		estimatedTokens: 0,
+	}),
+	DEFAULT_TOKEN_BUDGET: 50000,
 }));
 
 // Suppress console output

@@ -28,6 +28,77 @@ describe("updateSkillsIfNeeded", () => {
 		expect(search).toContain("name: jolli-search");
 	});
 
+	// Plan/note stubs on commits must use the right key names — `slug` for
+	// plans (because plan slugs carry archive-suffix semantics), `id` for
+	// notes (no archive mechanism). Earlier templates conflated both as
+	// "(slug + title)", which would point the LLM at a non-existent field
+	// when looking up a note.
+	it("recall template documents plan stubs (slug+title) and note stubs (id+title) distinctly", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
+		expect(recall).toMatch(/`plans\?` — `\{ slug, title \}\[\]`/);
+		expect(recall).toMatch(/`notes\?` — `\{ id, title \}\[\]`/);
+		// Neither shape is described as the other.
+		expect(recall).not.toMatch(/`notes\?`[^.]*slug \+ title/);
+	});
+
+	// The stub-quoting paragraph used to unconditionally claim "content is
+	// already in your context" — but budget trimming can drop content while
+	// keeping the slug/title anchor. Without a conditional rule the LLM
+	// would fabricate quotes from a body it never received.
+	it("recall template conditionally guides quoting based on whether content is present", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
+		// Affirmative branch — content present → quote verbatim with attribution.
+		expect(recall).toMatch(/If the entry has `content`/);
+		// Negative branch — content absent → title-only anchor, no fabricated quotes.
+		expect(recall).toMatch(/If `content` is absent/);
+		expect(recall).toMatch(/never fabricate a quote/);
+	});
+
+	// Fact opener used to render as a single prose line that visually merged
+	// with the synthesis below. The skill template now mandates a heading +
+	// bullet block so the user has a clear, scannable verification anchor.
+	it("recall template Part A renders as `### Loaded` heading + bullet block (not a single prose line)", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
+		// The mandated example heading anchored on a real branch name.
+		expect(recall).toMatch(/### Loaded `feature\/auth`/);
+		// The bullet items the LLM should fill in.
+		expect(recall).toMatch(/\*\*Period:\*\*/);
+		expect(recall).toMatch(/\*\*Commits:\*\*/);
+		expect(recall).toMatch(/\*\*Captured:\*\*/);
+		// And the explicit ban on collapsing back to a single prose line.
+		expect(recall).toMatch(/heading \+ bullet shape is required/);
+		// The empty line between heading and bullets keeps markdown rendering correct.
+		expect(recall).toMatch(/### Loaded `feature\/auth`\n\n- \*\*Period:/);
+	});
+
+	// recall outputs were running long (multi-screen) because the LLM had no
+	// length anchor — search bounds itself naturally via Step-3 picking,
+	// recall has no equivalent. Principle 6 gives a concrete word ceiling +
+	// explicit deep-dive escape hatch. **Length only — no form constraint.**
+	// LLM still picks the output shape (per Part B's "shape is your call").
+	it("recall template caps default answer length at ~400 words (principle #6)", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
+		// Concrete word ceiling — actionable for LLM in a way "one screen" wasn't.
+		// 400 was picked over 200 after dogfood: a substantive 5-commit branch
+		// naturally produces ~700-800 words; 200 is too aggressive and forces
+		// loss of detail, 400 is roughly one screen of plain prose.
+		expect(recall).toMatch(/Brief by default/);
+		expect(recall).toMatch(/~400 words at most/);
+		// Escape hatch. Use \s+ to tolerate the line wrap inside the principle.
+		expect(recall).toMatch(/Long-form\s+output is opt-in/);
+		expect(recall).toMatch(/deep dive/);
+		// Negative: principle 6 must NOT impose form constraints. Earlier drafts
+		// said "group by theme" / "3-5 decisions max" / "no subsection headings"
+		// — those conflict with Part B's "shape is your call". Length only.
+		expect(recall).not.toMatch(/Group commits by theme/);
+		expect(recall).not.toMatch(/3-5 key decisions max/);
+		expect(recall).not.toMatch(/No subsection headings/);
+	});
+
 	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal $\{ARGUMENTS} is the bash placeholder being asserted on
 	it("recall template quotes ${ARGUMENTS} (shell-injection defense)", async () => {
 		await updateSkillsIfNeeded(tempDir);
@@ -122,8 +193,10 @@ describe("updateSkillsIfNeeded", () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
 		expect(search).toMatch(/`title` —/);
-		expect(search).toMatch(/`trigger` —/);
-		expect(search).toMatch(/`response` —/);
+		// `trigger` and `response` are now optional in SearchHitTopic — the schema
+		// doc reflects that with `?` so the LLM doesn't expect them on every hit.
+		expect(search).toMatch(/`trigger\?` —/);
+		expect(search).toMatch(/`response\?` —/);
 		expect(search).toMatch(/`decisions` ★/);
 		expect(search).toMatch(/`todo\?` —/);
 		expect(search).toMatch(/`filesAffected\?` —/);
@@ -131,27 +204,48 @@ describe("updateSkillsIfNeeded", () => {
 		expect(search).toMatch(/`importance\?` —/);
 	});
 
+	// `diffStats` schema: actual interface is { filesChanged, insertions,
+	// deletions } — older template wrongly wrote `files`. This test pins the
+	// fix so a future revert can't go unnoticed.
+	it("search template uses correct diffStats field name (filesChanged, not files)", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		expect(search).toMatch(/`diffStats\?` — `\{ filesChanged, insertions, deletions \}`/);
+		expect(search).not.toMatch(/`diffStats\?` — `\{ files,/);
+	});
+
+	// Plan / note stubs: SearchHit now carries plan/note refs (slug/id + title)
+	// so the LLM can use them as grounding anchors. Search ships only stubs
+	// (no plan body) — the template must say so explicitly to avoid promising
+	// the user navigation that doesn't exist.
+	it("search template documents plan/note stubs and forbids navigation promises", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		expect(search).toMatch(/`plans\?` — `\{ slug, title \}\[\]`/);
+		expect(search).toMatch(/`notes\?` — `\{ id, title \}\[\]`/);
+		expect(search).toMatch(/Do NOT promise the user they can navigate to the plan body/);
+		// Don't suggest /jolli-recall as a "see the plan body" path either —
+		// recall also doesn't show plan content directly to the user.
+		expect(search).not.toMatch(/see plan content via \/jolli-recall/);
+	});
+
 	// ── Universal principles ──
 	// The principles encode lessons from past dogfood failures and are the only
 	// hard constraints (the output shape itself is up to the LLM). These tests
 	// pin each principle so a careless edit can't silently drop one.
 
-	it("search template lists Lead-with-the-answer principle and forbids Found-N-out-of-M opener", async () => {
+	it("search template lists Lead-with-the-answer principle and forbids preamble openers", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
 		expect(search).toMatch(/Lead with the answer/);
-		// Negative rationale must be present so future contributors don't add the
-		// "Found N out of M" opener back as helpful coverage info.
-		expect(search).toMatch(/Found N relevant commits out of M/);
+		// The compressed principle 1 directly forbids the two stock LLM openers.
+		expect(search).toMatch(/No "Let me analyze\.\.\." or "Found N commits\.\.\." preamble/);
 	});
 
-	it("search template requires file paths as markdown links and forbids backtick-only", async () => {
+	it("search template requires file paths as markdown links", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
 		expect(search).toMatch(/\[cli\/src\/Types\.ts\]\(cli\/src\/Types\.ts\)/);
-		// Negative-rationale prose is split across two lines after the markdown
-		// example, so use \s+ for whitespace tolerance.
-		expect(search).toMatch(/Never wrap\s+file paths in backticks alone/);
 	});
 
 	it("search template forbids snippet dumps but ENCOURAGES short bold verbatim quotes from recap/decisions", async () => {
@@ -160,30 +254,42 @@ describe("updateSkillsIfNeeded", () => {
 		// Synthesize-don't-dump is still in (no wall-of-fragments).
 		expect(search).toMatch(/Synthesize, don't dump/);
 		expect(search).toMatch(/wall-of-fragments/);
-		// New: bold verbatim quotes are explicitly encouraged. This is the principle
-		// that makes "the answer came from real stored data" visually obvious to the
-		// user — bolding signals "this came from `recap` or `decisions` verbatim".
+		// Bold verbatim quotes are explicitly encouraged.
 		expect(search).toMatch(/short verbatim quotes/);
-		// The bold convention is reserved for verbatim — not generic emphasis.
-		expect(search).toMatch(/Bold in this skill means "verbatim from stored data"/);
 		// And a worked example anchoring the format the LLM should emit.
 		expect(search).toMatch(/\*\*"stateless, scales horizontally"\*\*/);
 	});
 
-	it("search template forbids exposing search machinery (Phase 1 / Phase 2 / catalog)", async () => {
+	it("search template forbids exposing machinery (Phase 1 / Phase 2 / catalog / SearchHit)", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		expect(search).toMatch(/Don't expose search machinery/);
+		expect(search).toMatch(/Don't expose machinery/);
+		// Specific machinery names are listed so the LLM has concrete forbids.
+		expect(search).toMatch(/"Phase 1"/);
+		expect(search).toMatch(/"Phase 2"/);
+		expect(search).toMatch(/"catalog"/);
+		expect(search).toMatch(/"SearchHit"/);
 	});
 
-	it("search template forbids Open-in-IDE / vscode:// links and points at jolli view as fallback", async () => {
+	// Principle 7 ("No vscode:// links") and principle 4 ("Skip near-duplicates")
+	// were removed in the principles-simplification refactor. Pin both deletions
+	// so a casual revert can't reintroduce noise the template doesn't need.
+	it("search template does NOT carry the legacy vscode:// principle", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// Earlier iterations rendered [Open in IDE](vscode://...) — chat webview
-		// silently strips the click. Don't resurrect.
-		expect(search).toMatch(/No `\[Open in IDE\]\(vscode:\/\/\.\.\.\)`/);
-		// The replacement open action — works in any chat surface via Bash tool.
-		expect(search).toMatch(/jolli view --commit <hash>/);
+		// CLI is the only "open commit" path now — but it's still mentioned by Step
+		// 4 as the disambiguation tool. The principle that called it out as a
+		// vscode:// alternative is gone.
+		expect(search).not.toMatch(/Open in IDE/);
+		expect(search).not.toMatch(/vscode:\/\//);
+	});
+
+	it("search template does NOT carry the legacy near-duplicate principle (root-only filter handles it)", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		// Skip-near-duplicates was redundant with the catalog-side root-only filter
+		// and burned attention budget; removed. Don't reintroduce.
+		expect(search).not.toMatch(/Skip near-duplicates/);
 	});
 
 	// ── Free-shape rendering (the central design point) ──

@@ -6,7 +6,7 @@
  * VS Code webview. This file has zero VS Code dependencies.
  */
 
-import type { CommitSummary, PlanReference } from "../Types.js";
+import type { CommitSummary, NoteReference, PlanReference } from "../Types.js";
 import { collectDisplayTopics, collectSourceNodes, type TopicWithDate } from "./SummaryTree.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -210,4 +210,96 @@ export function collectAllPlans(summary: CommitSummary): ReadonlyArray<PlanRefer
 
 	walk(summary);
 	return [...planMap.values()];
+}
+
+/**
+ * Recursively collects all note references from a summary tree.
+ * Deduplicates by id, keeping the most recently updated version.
+ */
+export function collectAllNotes(summary: CommitSummary): ReadonlyArray<NoteReference> {
+	const noteMap = new Map<string, NoteReference>();
+
+	function walk(node: CommitSummary): void {
+		if (node.notes) {
+			for (const note of node.notes) {
+				const existing = noteMap.get(note.id);
+				if (!existing || note.updatedAt > existing.updatedAt) {
+					noteMap.set(note.id, note);
+				}
+			}
+		}
+		if (node.children) {
+			for (const child of node.children) {
+				walk(child);
+			}
+		}
+	}
+
+	walk(summary);
+	return [...noteMap.values()];
+}
+
+/**
+ * Like {@link collectAllPlans} but also reports the host commit hash for each
+ * plan reference — the commit (root or nested child) where the reference was
+ * declared. Required for base-slug normalization, which strips a trailing
+ * `-<hostHash>` suffix introduced when a plan was archived at that commit.
+ *
+ * Same dedup contract as {@link collectAllPlans} (latest `updatedAt` wins per
+ * slug), with the winner's `hostCommitHash` reported alongside.
+ */
+export function collectAllPlansWithHosts(
+	summary: CommitSummary,
+): ReadonlyArray<{ readonly planRef: PlanReference; readonly hostCommitHash: string }> {
+	const map = new Map<string, { planRef: PlanReference; hostCommitHash: string }>();
+
+	function walk(node: CommitSummary): void {
+		if (node.plans) {
+			for (const plan of node.plans) {
+				const existing = map.get(plan.slug);
+				if (!existing || plan.updatedAt > existing.planRef.updatedAt) {
+					map.set(plan.slug, { planRef: plan, hostCommitHash: node.commitHash });
+				}
+			}
+		}
+		if (node.children) {
+			for (const child of node.children) {
+				walk(child);
+			}
+		}
+	}
+
+	walk(summary);
+	return [...map.values()];
+}
+
+/**
+ * Like {@link collectAllNotes} but also reports the host commit hash for each
+ * note reference. Notes have no archive-suffix mechanism today, but the API
+ * is symmetric to {@link collectAllPlansWithHosts} so future archive-style
+ * normalization (or per-host attribution) can plug in without churn.
+ */
+export function collectAllNotesWithHosts(
+	summary: CommitSummary,
+): ReadonlyArray<{ readonly noteRef: NoteReference; readonly hostCommitHash: string }> {
+	const map = new Map<string, { noteRef: NoteReference; hostCommitHash: string }>();
+
+	function walk(node: CommitSummary): void {
+		if (node.notes) {
+			for (const note of node.notes) {
+				const existing = map.get(note.id);
+				if (!existing || note.updatedAt > existing.noteRef.updatedAt) {
+					map.set(note.id, { noteRef: note, hostCommitHash: node.commitHash });
+				}
+			}
+		}
+		if (node.children) {
+			for (const child of node.children) {
+				walk(child);
+			}
+		}
+	}
+
+	walk(summary);
+	return [...map.values()];
 }

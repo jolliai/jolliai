@@ -9,7 +9,10 @@
 
 import { createLogger } from "../Logger.js";
 import type { CommitSummary, SummaryIndexEntry } from "../Types.js";
-import { getDisplayDate } from "./SummaryFormat.js";
+import { extractBaseSlug } from "./PlanSlug.js";
+import type { SearchHit } from "./Search.js";
+import { collectAllNotesWithHosts, collectAllPlansWithHosts, getDisplayDate } from "./SummaryFormat.js";
+import { buildHit } from "./SummaryProjection.js";
 import {
 	getCatalogWithLazyBuild,
 	getIndex,
@@ -60,11 +63,54 @@ export interface CompiledContext {
 	readonly stats: ContextStats;
 }
 
-/** JSON output for SKILL.md (stats + rendered markdown, no raw data duplication) */
-export interface ContextOutput {
+/**
+ * Branch-scoped plan / note body shipped at the top of {@link RecallPayload}.
+ *
+ * `slug` (plan) / `id` (note) is the **canonical key** also used by every
+ * matching {@link SearchHit.plans}/`notes` stub on `commits[]`, so a stub-to-body
+ * lookup never fails for a kept commit.
+ *
+ * `content` may be omitted when budget enforcement strips bodies in the order
+ * documented at {@link buildRecallPayload}. The slug+title pair still serves
+ * as a citation anchor when content is absent.
+ */
+export interface RecallPayloadPlan {
+	readonly slug: string;
+	readonly title: string;
+	readonly content?: string;
+}
+export interface RecallPayloadNote {
+	readonly id: string;
+	readonly title: string;
+	readonly content?: string;
+}
+
+/**
+ * Structured output of `jolli recall --format json`.
+ *
+ * Replaces the prior `ContextOutput` (which shipped a single pre-rendered
+ * markdown blob). The shift to structured fields is the same data discipline
+ * that jolli-search already validated: the skill-template LLM produces a
+ * grounded, citation-anchored answer instead of paraphrasing a markdown blob.
+ */
+export interface RecallPayload {
 	readonly type: "recall";
+	readonly branch: string;
+	readonly period: { readonly start: string; readonly end: string };
+	readonly commitCount: number;
+	readonly totalFilesChanged: number;
+	readonly totalInsertions: number;
+	readonly totalDeletions: number;
+	/** Per-commit projection — same shape jolli-search ships from Phase 2. */
+	readonly commits: ReadonlyArray<SearchHit>;
+	/** Branch-scoped, deduplicated plan bodies. Slug is the canonical base slug. */
+	readonly plans: ReadonlyArray<RecallPayloadPlan>;
+	/** Branch-scoped, deduplicated note bodies. Id is the canonical key. */
+	readonly notes: ReadonlyArray<RecallPayloadNote>;
 	readonly stats: ContextStats;
-	readonly renderedMarkdown: string;
+	readonly estimatedTokens: number;
+	/** Set when budget enforcement removed at least one field (or commit). */
+	readonly truncated?: boolean;
 }
 
 export interface BranchCatalogEntry {
@@ -181,60 +227,77 @@ export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
 	return { type: "catalog", branches };
 }
 
-// ─── Plan deduplication ──────────────────────────────────────────────────────
+// ─── Plan / note collection ──────────────────────────────────────────────────
 
+/**
+ * Per-summary plan candidate enriched with the host commit's hash. The host
+ * hash is the commit (root or nested child) where the reference lives — used
+ * by {@link extractBaseSlug} to peel any `-<shortHash>` archive suffix.
+ */
 interface PlanCandidate {
-	readonly slug: string;
+	readonly originalSlug: string;
+	readonly baseSlug: string;
 	readonly title: string;
-	readonly commitHash: string;
+	readonly hostCommitHash: string;
+	/** Activity date carried by the summary that owned this candidate. */
 	readonly commitDate: string;
 	readonly generatedAt: string;
 }
 
 /**
- * Deduplicates plan references by base slug.
- * Archived plans have slug format "base-slug-<shortHash>". We extract the base
- * by cross-validating the trailing hash against the actual commit's shortHash.
+ * Collects plan references across the whole tree (root + nested children) of
+ * each summary, computing the canonical **base slug** for each via
+ * {@link extractBaseSlug}. Recursion mirrors what {@link buildHit} does for
+ * SearchHit stubs, so a plan referenced from a v3-legacy nested child surfaces
+ * in both the SearchHit stub list AND the top-level payload — a stub never
+ * dangles.
+ */
+function collectPlanCandidates(summaries: ReadonlyArray<CommitSummary>): ReadonlyArray<PlanCandidate> {
+	const out: PlanCandidate[] = [];
+	for (const summary of summaries) {
+		for (const { planRef, hostCommitHash } of collectAllPlansWithHosts(summary)) {
+			out.push({
+				originalSlug: planRef.slug,
+				baseSlug: extractBaseSlug(planRef.slug, hostCommitHash),
+				title: planRef.title,
+				hostCommitHash,
+				commitDate: summary.commitDate,
+				generatedAt: summary.generatedAt,
+			});
+		}
+	}
+	return out;
+}
+
+/**
+ * Deduplicates plan candidates by canonical **base slug**, keeping the one
+ * with the latest activity per group.
  *
- * When the same plan appears in multiple commits, keep the one with the latest
- * activity (see {@link getDisplayDate}) — that's the user's most recent
- * edit/amend of the plan reference.
+ * After this step, `payload.plans[].slug` (canonical) matches every
+ * `commits[].plans[].slug` stub on a 1:1 basis — the lookup never fails.
  */
 function deduplicatePlans(candidates: ReadonlyArray<PlanCandidate>): ReadonlyArray<PlanCandidate> {
 	const baseSlugMap = new Map<string, PlanCandidate>();
 
 	for (const plan of candidates) {
-		const baseSlug = extractBaseSlug(plan.slug, plan.commitHash);
-		const existing = baseSlugMap.get(baseSlug);
+		const existing = baseSlugMap.get(plan.baseSlug);
 		if (!existing || new Date(getDisplayDate(plan)).getTime() > new Date(getDisplayDate(existing)).getTime()) {
-			baseSlugMap.set(baseSlug, plan);
+			baseSlugMap.set(plan.baseSlug, plan);
 		}
 	}
 
 	return [...baseSlugMap.values()];
 }
 
-/**
- * Extracts the base slug from an archived slug by cross-validating the trailing
- * hash against the commit's actual short hash.
- */
-function extractBaseSlug(slug: string, commitHash: string): string {
-	const shortHash = commitHash.substring(0, 8);
-	if (slug.endsWith(`-${shortHash}`)) {
-		return slug.slice(0, -(shortHash.length + 1));
-	}
-	// Try 7-char hash too
-	const shortHash7 = commitHash.substring(0, 7);
-	if (slug.endsWith(`-${shortHash7}`)) {
-		return slug.slice(0, -(shortHash7.length + 1));
-	}
-	// No match — slug is the base
-	return slug;
-}
-
 // ─── Core compilation ────────────────────────────────────────────────────────
 
-export const DEFAULT_TOKEN_BUDGET = 30000;
+/**
+ * Default token budget for recall output (`jolli recall --format json` and
+ * `--full` markdown). 50K leaves ~75% of a 200K-context model free for the
+ * surrounding conversation; 1M-context models almost never trip the budget
+ * enforcement path. Users can override with `--budget <tokens>`.
+ */
+export const DEFAULT_TOKEN_BUDGET = 50000;
 
 /**
  * Compiles task context for a branch from Jolli Memory's orphan branch data.
@@ -296,54 +359,50 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
 		}
 	}
 
-	// Step 6: Load and deduplicate plans
+	// Step 6: Load and deduplicate plans.
+	//
+	// Walk each summary tree (root + nested children) so v3-legacy / IntelliJ-
+	// squash data with plans stashed in children doesn't get silently dropped —
+	// matches the recursion in `buildHit`'s plan-stub projection so every stub
+	// resolves to a top-level plan entry. Slug is normalized to its canonical
+	// **base slug** (archive suffix peeled) so pre-archive and post-archive
+	// commits referencing the same plan collapse to one entry.
 	const plans: { slug: string; title: string; content: string }[] = [];
 	if (includePlans) {
-		const planCandidates: PlanCandidate[] = [];
-		for (const summary of summaries) {
-			if (summary.plans) {
-				for (const planRef of summary.plans) {
-					planCandidates.push({
-						slug: planRef.slug,
-						title: planRef.title,
-						commitHash: summary.commitHash,
-						commitDate: summary.commitDate,
-						generatedAt: summary.generatedAt,
-					});
-				}
-			}
-		}
-
+		const planCandidates = collectPlanCandidates(summaries);
 		const deduplicated = deduplicatePlans(planCandidates);
 		for (const plan of deduplicated) {
-			const content = await readPlanFromBranch(plan.slug, cwd);
+			// Read by the **original** slug (the path on disk at archive time);
+			// expose the **base slug** so SearchHit stubs match without knowing
+			// which archived suffix happens to be on disk.
+			const content = await readPlanFromBranch(plan.originalSlug, cwd);
 			if (content) {
-				plans.push({ slug: plan.slug, title: plan.title, content });
+				plans.push({ slug: plan.baseSlug, title: plan.title, content });
 			} else {
-				log.warn("Plan %s referenced but not found in orphan branch", plan.slug);
+				log.warn("Plan %s referenced but not found in orphan branch", plan.originalSlug);
 			}
 		}
 	}
 
-	// Step 6b: Load and deduplicate notes
+	// Step 6b: Load and deduplicate notes.
+	// Same recursion rationale as plans (cover v3-legacy nested-child notes).
+	// Notes have no archive-suffix mechanism, so id is the natural canonical key.
 	const notes: { id: string; title: string; content: string }[] = [];
 	if (includeNotes) {
 		const seenIds = new Set<string>();
 		for (const summary of summaries) {
-			if (summary.notes) {
-				for (const noteRef of summary.notes) {
-					if (seenIds.has(noteRef.id)) continue;
-					seenIds.add(noteRef.id);
-					// Snippets carry their content inline; markdown notes read from orphan branch
-					if (noteRef.format === "snippet" && noteRef.content) {
-						notes.push({ id: noteRef.id, title: noteRef.title, content: noteRef.content });
+			for (const { noteRef } of collectAllNotesWithHosts(summary)) {
+				if (seenIds.has(noteRef.id)) continue;
+				seenIds.add(noteRef.id);
+				// Snippets carry their content inline; markdown notes read from orphan branch
+				if (noteRef.format === "snippet" && noteRef.content) {
+					notes.push({ id: noteRef.id, title: noteRef.title, content: noteRef.content });
+				} else {
+					const content = await readNoteFromBranch(noteRef.id, cwd);
+					if (content) {
+						notes.push({ id: noteRef.id, title: noteRef.title, content });
 					} else {
-						const content = await readNoteFromBranch(noteRef.id, cwd);
-						if (content) {
-							notes.push({ id: noteRef.id, title: noteRef.title, content });
-						} else {
-							log.warn("Note %s referenced but not found in orphan branch", noteRef.id);
-						}
+						log.warn("Note %s referenced but not found in orphan branch", noteRef.id);
 					}
 				}
 			}
@@ -404,6 +463,165 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
 }
 
 // ─── Markdown rendering ──────────────────────────────────────────────────────
+
+// ─── Structured payload (jolli recall --format json) ────────────────────────
+
+/**
+ * Projects a {@link CompiledContext} into the structured {@link RecallPayload}
+ * shape consumed by the `/jolli-recall` skill template, applying budget
+ * enforcement at the **field** level.
+ *
+ * Trim order (oldest commit first within each step):
+ *   1. drop `topic.response` (longest field, lowest signal)
+ *   2. drop `topic.trigger`
+ *   3. drop `plans[].content` (keep slug + title as a citation anchor)
+ *   4. drop `notes[].content`
+ *   5. drop the entire oldest commit from `commits[]` (with its decisions)
+ *
+ * Type contract: every {@link SearchHit} that survives in `commits[]` carries
+ * `decisions` on every topic and full identity fields. When the budget is so
+ * tight that decisions can't fit, the commit is removed wholesale rather than
+ * shipped without decisions — the skill template can rely on "all kept hits
+ * are complete".
+ */
+export function buildRecallPayload(ctx: CompiledContext, tokenBudget?: number): RecallPayload {
+	const budget = tokenBudget ?? DEFAULT_TOKEN_BUDGET;
+
+	let plans: RecallPayloadPlan[] = ctx.plans.map((p) => ({ slug: p.slug, title: p.title, content: p.content }));
+	let notes: RecallPayloadNote[] = ctx.notes.map((n) => ({ id: n.id, title: n.title, content: n.content }));
+
+	// Resolved-key sets — a stub on a commit is considered "live" only if its
+	// slug/id has a matching entry at the payload top level. This guards the
+	// `always resolves` contract documented in the recall skill template:
+	// stubs whose body wasn't loaded (orphan-branch read failed) or wasn't
+	// requested (`--no-plans` / `--no-notes`) get filtered out of the
+	// per-commit hit instead of dangling.
+	const resolvedPlanSlugs = new Set(plans.map((p) => p.slug));
+	const resolvedNoteIds = new Set(notes.map((n) => n.id));
+
+	// Per the chronological invariant in compileTaskContext (Step 2), summaries
+	// are sorted oldest first. We project commits from this order so commits[0]
+	// is the oldest — matching the trim direction below.
+	let commits: SearchHit[] = ctx.summaries.map((s) => filterStubs(buildHit(s), resolvedPlanSlugs, resolvedNoteIds));
+	let truncated = false;
+
+	// Build a stable envelope that surrounds commits/plans/notes so the budget
+	// measure reflects the actual JSON output size, not just the variable parts.
+	// estimatedTokens / truncated are not included (chicken-and-egg with measure
+	// itself); their ~15-token cost is negligible against any realistic budget.
+	const envelope = {
+		type: "recall" as const,
+		branch: ctx.branch,
+		period: ctx.period,
+		commitCount: ctx.commitCount,
+		totalFilesChanged: ctx.totalFilesChanged,
+		totalInsertions: ctx.totalInsertions,
+		totalDeletions: ctx.totalDeletions,
+		stats: ctx.stats,
+	};
+
+	const measure = (): number => estimateTokens(JSON.stringify({ ...envelope, commits, plans, notes }));
+
+	// Step 1: drop topic.response from oldest commits
+	for (let i = 0; i < commits.length && measure() > budget; i++) {
+		const hit = commits[i];
+		const trimmed = hit.topics.map((t) => {
+			if (t.response === undefined) return t;
+			truncated = true;
+			const { response: _r, ...rest } = t;
+			return rest;
+		});
+		commits[i] = { ...hit, topics: trimmed };
+	}
+
+	// Step 2: drop topic.trigger from oldest commits
+	for (let i = 0; i < commits.length && measure() > budget; i++) {
+		const hit = commits[i];
+		const trimmed = hit.topics.map((t) => {
+			if (t.trigger === undefined) return t;
+			truncated = true;
+			const { trigger: _t, ...rest } = t;
+			return rest;
+		});
+		commits[i] = { ...hit, topics: trimmed };
+	}
+
+	// Step 3: drop plans[].content (slug + title remain as citation anchors)
+	if (measure() > budget && plans.some((p) => p.content !== undefined)) {
+		plans = plans.map((p) => {
+			if (p.content === undefined) return p;
+			truncated = true;
+			return { slug: p.slug, title: p.title };
+		});
+	}
+
+	// Step 4: drop notes[].content
+	if (measure() > budget && notes.some((n) => n.content !== undefined)) {
+		notes = notes.map((n) => {
+			if (n.content === undefined) return n;
+			truncated = true;
+			return { id: n.id, title: n.title };
+		});
+	}
+
+	// Step 5: drop the oldest commit wholesale (with its decisions) until we fit.
+	// Always keep at least one commit — otherwise `commits=[]` would
+	// ambiguously mean "no records found" OR "budget evicted everything",
+	// forcing the skill template to teach the LLM a 3-way state machine
+	// for a case only pathological budgets (< envelope size) ever trigger.
+	// Keeping ≥1 commit makes empty-commits unambiguously mean "no records",
+	// at the cost of a minor overage when `--budget` is set absurdly low.
+	while (measure() > budget && commits.length > 1) {
+		commits = commits.slice(1);
+		truncated = true;
+	}
+
+	const estimatedTokens = measure();
+
+	return {
+		type: "recall",
+		branch: ctx.branch,
+		period: ctx.period,
+		commitCount: ctx.commitCount,
+		totalFilesChanged: ctx.totalFilesChanged,
+		totalInsertions: ctx.totalInsertions,
+		totalDeletions: ctx.totalDeletions,
+		commits,
+		plans,
+		notes,
+		stats: ctx.stats,
+		estimatedTokens,
+		...(truncated && { truncated: true }),
+	};
+}
+
+/**
+ * Strips plan/note stubs whose canonical key has no matching entry at the
+ * payload top level. Without this guard the "always resolve" contract breaks
+ * in two paths: (1) `readPlanFromBranch` / `readNoteFromBranch` returned null
+ * (orphan-branch read miss); (2) the caller passed `--no-plans` / `--no-notes`,
+ * leaving the top-level array empty while `summary.plans` / `summary.notes`
+ * still feed buildHit's stub projection.
+ */
+function filterStubs(hit: SearchHit, resolvedPlanSlugs: Set<string>, resolvedNoteIds: Set<string>): SearchHit {
+	const liveStubPlans = hit.plans?.filter((p) => resolvedPlanSlugs.has(p.slug));
+	const liveStubNotes = hit.notes?.filter((n) => resolvedNoteIds.has(n.id));
+
+	const next: { -readonly [K in keyof SearchHit]: SearchHit[K] } = { ...hit };
+	if (liveStubPlans && liveStubPlans.length > 0) {
+		next.plans = liveStubPlans;
+	} else {
+		delete next.plans;
+	}
+	if (liveStubNotes && liveStubNotes.length > 0) {
+		next.notes = liveStubNotes;
+	} else {
+		delete next.notes;
+	}
+	return next;
+}
+
+// ─── Markdown rendering (used by --full / --output / default short summary) ─
 
 /**
  * Renders a compiled context into Markdown, applying token budget truncation.

@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { CommitSummary, PlanReference } from "../Types.js";
+import type { CommitSummary, NoteReference, PlanReference } from "../Types.js";
 import {
 	buildNotePushTitle,
 	buildPanelTitle,
 	buildPlanPushTitle,
 	buildPushTitle,
+	collectAllNotes,
+	collectAllNotesWithHosts,
 	collectAllPlans,
+	collectAllPlansWithHosts,
 	collectSortedTopics,
 	formatDate,
 	formatFullDate,
@@ -382,5 +385,171 @@ describe("collectAllPlans", () => {
 		});
 		const plans = collectAllPlans(summary);
 		expect(plans).toHaveLength(2);
+	});
+});
+
+// ─── collectAllNotes ────────────────────────────────────────────────────────
+
+function noteRef(overrides: Partial<NoteReference> = {}): NoteReference {
+	return {
+		id: "note-1",
+		title: "Note 1",
+		format: "markdown",
+		addedAt: "2026-01-01T00:00:00Z",
+		updatedAt: "2026-01-01T00:00:00Z",
+		...overrides,
+	};
+}
+
+describe("collectAllNotes", () => {
+	it("collects notes from a leaf node", () => {
+		const notes = collectAllNotes(leaf({ notes: [noteRef()] }));
+		expect(notes).toHaveLength(1);
+		expect(notes[0].id).toBe("note-1");
+	});
+
+	it("deduplicates by id, keeping the most recently updated", () => {
+		const older = noteRef({ id: "note-x", title: "v1", updatedAt: "2026-01-10" });
+		const newer = noteRef({ id: "note-x", title: "v2", updatedAt: "2026-01-20" });
+		const summary = leaf({
+			notes: [older],
+			children: [leaf({ notes: [newer], commitHash: "child1" })],
+		});
+		const notes = collectAllNotes(summary);
+		expect(notes).toHaveLength(1);
+		expect(notes[0].title).toBe("v2");
+	});
+
+	it("keeps newer note when an older duplicate is encountered later in the walk", () => {
+		const newer = noteRef({ id: "note-x", title: "v2", updatedAt: "2026-01-20" });
+		const older = noteRef({ id: "note-x", title: "v1", updatedAt: "2026-01-10" });
+		const summary = leaf({
+			notes: [newer],
+			children: [leaf({ notes: [older], commitHash: "child1" })],
+		});
+		const notes = collectAllNotes(summary);
+		expect(notes).toHaveLength(1);
+		expect(notes[0].title).toBe("v2");
+	});
+
+	it("returns empty array when no notes exist", () => {
+		expect(collectAllNotes(leaf())).toHaveLength(0);
+	});
+
+	it("collects notes from nested children", () => {
+		const summary = leaf({
+			children: [
+				leaf({
+					commitHash: "child1",
+					notes: [noteRef({ id: "n1" })],
+					children: [leaf({ commitHash: "grandchild", notes: [noteRef({ id: "n2" })] })],
+				}),
+			],
+		});
+		const notes = collectAllNotes(summary);
+		expect(notes).toHaveLength(2);
+	});
+});
+
+// ─── collectAllPlansWithHosts ───────────────────────────────────────────────
+
+describe("collectAllPlansWithHosts", () => {
+	it("reports the host commit hash for each plan", () => {
+		const plan: PlanReference = {
+			slug: "p1",
+			title: "P1",
+			editCount: 1,
+			addedAt: "2026-01-01",
+			updatedAt: "2026-01-01",
+		};
+		const summary = leaf({ commitHash: "root123", plans: [plan] });
+		const result = collectAllPlansWithHosts(summary);
+		expect(result).toHaveLength(1);
+		expect(result[0].planRef.slug).toBe("p1");
+		expect(result[0].hostCommitHash).toBe("root123");
+	});
+
+	it("reports the child commit hash when the plan lives in a child", () => {
+		const plan: PlanReference = {
+			slug: "p1",
+			title: "P1",
+			editCount: 1,
+			addedAt: "2026-01-01",
+			updatedAt: "2026-01-01",
+		};
+		const summary = leaf({ commitHash: "root123", children: [leaf({ commitHash: "child456", plans: [plan] })] });
+		const result = collectAllPlansWithHosts(summary);
+		expect(result).toHaveLength(1);
+		expect(result[0].hostCommitHash).toBe("child456");
+	});
+
+	it("dedupes by slug and keeps the winner's host hash", () => {
+		const older: PlanReference = {
+			slug: "p1",
+			title: "v1",
+			editCount: 1,
+			addedAt: "2026-01-01",
+			updatedAt: "2026-01-10",
+		};
+		const newer: PlanReference = {
+			slug: "p1",
+			title: "v2",
+			editCount: 2,
+			addedAt: "2026-01-01",
+			updatedAt: "2026-01-20",
+		};
+		const summary = leaf({
+			commitHash: "root",
+			plans: [older],
+			children: [leaf({ commitHash: "child", plans: [newer] })],
+		});
+		const result = collectAllPlansWithHosts(summary);
+		expect(result).toHaveLength(1);
+		expect(result[0].planRef.title).toBe("v2");
+		expect(result[0].hostCommitHash).toBe("child");
+	});
+
+	it("returns empty array when no plans exist", () => {
+		expect(collectAllPlansWithHosts(leaf())).toHaveLength(0);
+	});
+});
+
+// ─── collectAllNotesWithHosts ───────────────────────────────────────────────
+
+describe("collectAllNotesWithHosts", () => {
+	it("reports the host commit hash for each note", () => {
+		const summary = leaf({ commitHash: "root123", notes: [noteRef()] });
+		const result = collectAllNotesWithHosts(summary);
+		expect(result).toHaveLength(1);
+		expect(result[0].noteRef.id).toBe("note-1");
+		expect(result[0].hostCommitHash).toBe("root123");
+	});
+
+	it("reports the child commit hash when the note lives in a child", () => {
+		const summary = leaf({
+			commitHash: "root",
+			children: [leaf({ commitHash: "child", notes: [noteRef({ id: "n1" })] })],
+		});
+		const result = collectAllNotesWithHosts(summary);
+		expect(result).toHaveLength(1);
+		expect(result[0].hostCommitHash).toBe("child");
+	});
+
+	it("dedupes by id and keeps the winner's host hash", () => {
+		const older = noteRef({ id: "n1", title: "v1", updatedAt: "2026-01-10" });
+		const newer = noteRef({ id: "n1", title: "v2", updatedAt: "2026-01-20" });
+		const summary = leaf({
+			commitHash: "root",
+			notes: [older],
+			children: [leaf({ commitHash: "child", notes: [newer] })],
+		});
+		const result = collectAllNotesWithHosts(summary);
+		expect(result).toHaveLength(1);
+		expect(result[0].noteRef.title).toBe("v2");
+		expect(result[0].hostCommitHash).toBe("child");
+	});
+
+	it("returns empty array when no notes exist", () => {
+		expect(collectAllNotesWithHosts(leaf())).toHaveLength(0);
 	});
 });
