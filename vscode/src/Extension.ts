@@ -16,10 +16,8 @@ import {
 	resolveKbParent,
 } from "../../cli/src/core/KBPathResolver.js";
 import {
-	acquireLock,
 	getGlobalConfigDir,
 	loadConfig,
-	releaseLock,
 	saveConfigScoped,
 } from "../../cli/src/core/SessionTracker.js";
 import {
@@ -2391,8 +2389,9 @@ function handleError(commandName: string): (err: unknown) => void {
  * (every tree node has its own entry with `parentCommitHash`). Runs once after the
  * v1 orphan branch migration and on subsequent activations until the index is at v3.
  *
- * Uses the shared worker lock (`acquireLock`) so it never runs concurrently with the
- * post-commit hook Worker writing to the orphan branch.
+ * `migrateIndexToV3` acquires `orphan-write.lock` internally so it never races
+ * with the post-commit hook Worker or any background scan writing to the orphan
+ * branch.
  *
  * Sets all providers to "migrating" state and refreshes them afterward.
  */
@@ -2422,25 +2421,11 @@ async function migrateIndexIfNeeded(
 	try {
 		log.info("migrate", "Index v1 detected — migrating to v3 flat format");
 
-		// Acquire the shared worker lock to prevent concurrent orphan branch writes
-		const lockAcquired = await acquireLock(cwd);
-		if (!lockAcquired) {
-			log.warn(
-				"migrate",
-				"Could not acquire worker lock for index migration — deferring",
-			);
-			return;
-		}
-
-		try {
-			const { migrated, skipped } = await migrateIndexToV3(cwd);
-			log.info(
-				"migrate",
-				`Index migration complete: ${migrated} entries migrated, ${skipped} skipped`,
-			);
-		} finally {
-			await releaseLock(cwd);
-		}
+		const { migrated, skipped } = await migrateIndexToV3(cwd);
+		log.info(
+			"migrate",
+			`Index migration complete: ${migrated} entries migrated, ${skipped} skipped`,
+		);
 	} catch (err: unknown) {
 		log.error("migrate", "Index v1 → v3 migration failed", err);
 	} finally {

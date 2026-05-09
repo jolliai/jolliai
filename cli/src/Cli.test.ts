@@ -33,8 +33,6 @@ vi.mock("./core/SessionTracker.js", () => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
 	saveConfig: vi.fn().mockResolvedValue(undefined),
 	// Used by doctor / clean commands
-	isLockStale: vi.fn().mockResolvedValue(false),
-	releaseLock: vi.fn().mockResolvedValue(undefined),
 	loadAllSessions: vi.fn().mockResolvedValue([]),
 	countActiveQueueEntries: vi.fn().mockResolvedValue(0),
 	countStaleSessions: vi.fn().mockResolvedValue(0),
@@ -43,6 +41,11 @@ vi.mock("./core/SessionTracker.js", () => ({
 	pruneStaleQueueEntries: vi.fn().mockResolvedValue(0),
 	checkStaleSquashPending: vi.fn().mockResolvedValue(null),
 	deleteSquashPending: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("./core/Locks.js", () => ({
+	isWorkerLockStale: vi.fn().mockResolvedValue(false),
+	releaseWorkerLock: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("./core/JolliApiUtils.js", async () => {
@@ -3444,15 +3447,14 @@ describe("CLI", () => {
 			} = {},
 		): Promise<string[]> {
 			const { getStatus } = await import("./install/Installer.js");
-			const { isLockStale, countActiveQueueEntries, loadConfig, loadAllSessions } = await import(
-				"./core/SessionTracker.js"
-			);
+			const { countActiveQueueEntries, loadConfig, loadAllSessions } = await import("./core/SessionTracker.js");
+			const { isWorkerLockStale } = await import("./core/Locks.js");
 			const { orphanBranchExists } = await import("./core/GitOps.js");
 			const { traverseDistPaths } = await import("./install/DistPathResolver.js");
 
 			// Reset (prevent bleed-over from prior tests' mockResolvedValueOnce)
 			vi.mocked(getStatus).mockReset();
-			vi.mocked(isLockStale).mockReset();
+			vi.mocked(isWorkerLockStale).mockReset();
 			vi.mocked(countActiveQueueEntries).mockReset();
 			vi.mocked(loadConfig).mockReset();
 			vi.mocked(loadAllSessions).mockReset();
@@ -3469,7 +3471,7 @@ describe("CLI", () => {
 				summaryCount: 0,
 				orphanBranch: "jollimemory/summaries/v3",
 			});
-			vi.mocked(isLockStale).mockResolvedValue(overrides.lockStale ?? false);
+			vi.mocked(isWorkerLockStale).mockResolvedValue(overrides.lockStale ?? false);
 			vi.mocked(countActiveQueueEntries).mockResolvedValue(overrides.activeQueue ?? 0);
 			vi.mocked(loadConfig).mockResolvedValue(overrides.apiKey ? { apiKey: overrides.apiKey } : {});
 			vi.mocked(loadAllSessions).mockResolvedValue([]);
@@ -3489,7 +3491,7 @@ describe("CLI", () => {
 
 			expect(output).toContain("Jolli Memory Doctor");
 			expect(output).toContain("✓ Git hooks");
-			expect(output).toContain("✓ Lock file");
+			expect(output).toContain("✓ Worker lock");
 			expect(output).toContain("✓ Config");
 			expect(output).toContain("✓ dist-paths/cli");
 			expect(output).not.toContain("Run with --fix");
@@ -3503,7 +3505,7 @@ describe("CLI", () => {
 
 		it("should flag stuck lock file as fail", async () => {
 			const output = (await runDoctor(["doctor"], { lockStale: true })).join("\n");
-			expect(output).toContain("✗ Lock file");
+			expect(output).toContain("✗ Worker lock");
 			expect(output).toContain("stuck");
 		});
 
@@ -3585,12 +3587,12 @@ describe("CLI", () => {
 		});
 
 		it("should auto-fix stale lock when --fix is passed", async () => {
-			const { releaseLock } = await import("./core/SessionTracker.js");
-			vi.mocked(releaseLock).mockClear();
+			const { releaseWorkerLock } = await import("./core/Locks.js");
+			vi.mocked(releaseWorkerLock).mockClear();
 
 			const output = (await runDoctor(["doctor", "--fix"], { lockStale: true })).join("\n");
 
-			expect(releaseLock).toHaveBeenCalled();
+			expect(releaseWorkerLock).toHaveBeenCalled();
 			expect(output).toContain("Applying fixes");
 			expect(output).toContain("released");
 		});
@@ -3655,8 +3657,8 @@ describe("CLI", () => {
 
 		it("should set exitCode=1 when --fix repairs some but unfixable failures remain (Gap B)", async () => {
 			// Lock fixer succeeds; dist-path has no fixer and stays broken.
-			const { releaseLock } = await import("./core/SessionTracker.js");
-			vi.mocked(releaseLock).mockClear();
+			const { releaseWorkerLock } = await import("./core/Locks.js");
+			vi.mocked(releaseWorkerLock).mockClear();
 			process.exitCode = 0;
 
 			const output = (
@@ -3667,7 +3669,7 @@ describe("CLI", () => {
 				})
 			).join("\n");
 
-			expect(releaseLock).toHaveBeenCalled();
+			expect(releaseWorkerLock).toHaveBeenCalled();
 			expect(output).toContain("✗ dist-paths");
 			expect(process.exitCode).toBe(1);
 			process.exitCode = 0;
@@ -3677,9 +3679,9 @@ describe("CLI", () => {
 			// --fix passed, but the only failure is dist-path which has no fixer,
 			// so fixesToApply is empty. Must still exit 1 — the ✗ is still there.
 			const { install } = await import("./install/Installer.js");
-			const { releaseLock } = await import("./core/SessionTracker.js");
+			const { releaseWorkerLock } = await import("./core/Locks.js");
 			vi.mocked(install).mockClear();
-			vi.mocked(releaseLock).mockClear();
+			vi.mocked(releaseWorkerLock).mockClear();
 			process.exitCode = 0;
 
 			const output = (await runDoctor(["doctor", "--fix"], { distPaths: [], apiKey: "sk-ant-test" })).join("\n");
@@ -3688,7 +3690,7 @@ describe("CLI", () => {
 			expect(output).not.toContain("Applying fixes");
 			expect(output).toContain("✗ dist-paths");
 			expect(install).not.toHaveBeenCalled();
-			expect(releaseLock).not.toHaveBeenCalled();
+			expect(releaseWorkerLock).not.toHaveBeenCalled();
 			expect(process.exitCode).toBe(1);
 			process.exitCode = 0;
 		});
@@ -4800,14 +4802,13 @@ describe("CLI", () => {
 			vi.mocked(getGlobalConfigDir).mockReturnValue(tmpGlobalDir);
 
 			const { getStatus } = await import("./install/Installer.js");
-			const { isLockStale, countActiveQueueEntries, loadConfig, loadAllSessions } = await import(
-				"./core/SessionTracker.js"
-			);
+			const { countActiveQueueEntries, loadConfig, loadAllSessions } = await import("./core/SessionTracker.js");
+			const { isWorkerLockStale } = await import("./core/Locks.js");
 			const { orphanBranchExists } = await import("./core/GitOps.js");
 			const { traverseDistPaths } = await import("./install/DistPathResolver.js");
 
 			vi.mocked(getStatus).mockReset();
-			vi.mocked(isLockStale).mockReset();
+			vi.mocked(isWorkerLockStale).mockReset();
 			vi.mocked(countActiveQueueEntries).mockReset();
 			vi.mocked(loadConfig).mockReset();
 			vi.mocked(loadAllSessions).mockReset();
@@ -4824,7 +4825,7 @@ describe("CLI", () => {
 				summaryCount: 0,
 				orphanBranch: "jollimemory/summaries/v3",
 			});
-			vi.mocked(isLockStale).mockResolvedValue(false);
+			vi.mocked(isWorkerLockStale).mockResolvedValue(false);
 			vi.mocked(countActiveQueueEntries).mockResolvedValue(0);
 			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-ant-test" });
 			vi.mocked(loadAllSessions).mockResolvedValue([]);

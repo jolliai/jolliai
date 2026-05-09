@@ -36,8 +36,6 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		loadCursorForTranscript: vi.fn(),
 		saveCursor: vi.fn(),
 		loadConfig: vi.fn(),
-		acquireLock: vi.fn(),
-		releaseLock: vi.fn(),
 		loadSquashPending: vi.fn(),
 		deleteSquashPending: vi.fn(),
 		loadPluginSource: vi.fn(),
@@ -47,13 +45,19 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		associatePlanWithCommit: vi.fn(),
 		associateNoteWithCommit: vi.fn(),
 		filterSessionsByEnabledIntegrations: actual.filterSessionsByEnabledIntegrations,
-		// Queue functions (new)
+		// Queue functions
 		dequeueAllGitOperations: vi.fn(),
 		deleteQueueEntry: vi.fn(),
 		enqueueGitOperation: vi.fn(),
-		isLockHeld: vi.fn(),
 	};
 });
+
+vi.mock("../core/Locks.js", () => ({
+	acquireWorkerLock: vi.fn(),
+	releaseWorkerLock: vi.fn(),
+	refreshWorkerLockMtime: vi.fn(),
+	isWorkerLockHeld: vi.fn(),
+}));
 
 vi.mock("../core/TranscriptReader.js", () => ({
 	readTranscript: vi.fn(),
@@ -199,10 +203,10 @@ import {
 	getProjectRootDir,
 	readFileFromBranch,
 } from "../core/GitOps.js";
+import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
-	acquireLock,
 	associateNoteWithCommit,
 	associatePlanWithCommit,
 	deleteQueueEntry,
@@ -212,7 +216,6 @@ import {
 	loadCursorForTranscript,
 	loadPlansRegistry,
 	loadSquashPending,
-	releaseLock,
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
@@ -318,8 +321,8 @@ describe("PostCommitHook", () => {
 		vi.useFakeTimers();
 
 		// Default: lock can be acquired
-		vi.mocked(acquireLock).mockResolvedValue(true);
-		vi.mocked(releaseLock).mockResolvedValue();
+		vi.mocked(acquireWorkerLock).mockResolvedValue(true);
+		vi.mocked(releaseWorkerLock).mockResolvedValue();
 		// Default: empty config (prevents undefined access after loadConfig)
 		vi.mocked(loadConfig).mockResolvedValue({});
 		// Default: no Codex sessions (prevent undefined.length crash)
@@ -339,7 +342,7 @@ describe("PostCommitHook", () => {
 
 		await runWorker("/test/project");
 
-		expect(acquireLock).toHaveBeenCalled();
+		expect(acquireWorkerLock).toHaveBeenCalled();
 		expect(getCommitInfo).toHaveBeenCalledWith("abc123", "/test/project");
 		expect(loadAllSessions).toHaveBeenCalled();
 		expect(readTranscript).toHaveBeenCalled();
@@ -347,7 +350,7 @@ describe("PostCommitHook", () => {
 		expect(generateSummary).toHaveBeenCalled();
 		expect(storeSummary).toHaveBeenCalled();
 		expect(saveCursor).toHaveBeenCalled();
-		expect(releaseLock).toHaveBeenCalled();
+		expect(releaseWorkerLock).toHaveBeenCalled();
 	});
 
 	it("should mark summaries as plugin-sourced when queue entry has commitSource:plugin", async () => {
@@ -436,7 +439,7 @@ describe("PostCommitHook", () => {
 		await runWorker("/test/project");
 
 		expect(generateSummary).not.toHaveBeenCalled();
-		expect(releaseLock).toHaveBeenCalled();
+		expect(releaseWorkerLock).toHaveBeenCalled();
 	});
 
 	it("should generate summary when no sessions but diff is non-empty (Part A fix)", async () => {
@@ -526,12 +529,12 @@ describe("PostCommitHook", () => {
 	});
 
 	it("should skip when lock cannot be acquired", async () => {
-		vi.mocked(acquireLock).mockResolvedValue(false);
+		vi.mocked(acquireWorkerLock).mockResolvedValue(false);
 
 		await runWorker("/test/project");
 
 		expect(getCommitInfo).not.toHaveBeenCalled();
-		expect(releaseLock).not.toHaveBeenCalled();
+		expect(releaseWorkerLock).not.toHaveBeenCalled();
 	});
 
 	it("should release lock even on pipeline error", async () => {
@@ -539,7 +542,7 @@ describe("PostCommitHook", () => {
 
 		await runWorker("/test/project");
 
-		expect(releaseLock).toHaveBeenCalled();
+		expect(releaseWorkerLock).toHaveBeenCalled();
 	});
 
 	// Note: rebase skip and amend-polling tests removed — these behaviors are now
@@ -818,8 +821,8 @@ describe("queue-driven Worker", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		vi.useFakeTimers();
-		vi.mocked(acquireLock).mockResolvedValue(true);
-		vi.mocked(releaseLock).mockResolvedValue();
+		vi.mocked(acquireWorkerLock).mockResolvedValue(true);
+		vi.mocked(releaseWorkerLock).mockResolvedValue();
 	});
 
 	it("processes a commit queue entry through the full LLM pipeline", async () => {
@@ -850,7 +853,7 @@ describe("queue-driven Worker", () => {
 	});
 
 	it("exits without processing when lock cannot be acquired", async () => {
-		vi.mocked(acquireLock).mockResolvedValue(false);
+		vi.mocked(acquireWorkerLock).mockResolvedValue(false);
 		vi.mocked(dequeueAllGitOperations).mockResolvedValue([DEFAULT_COMMIT_OP]);
 
 		await runWorker("/test/project");

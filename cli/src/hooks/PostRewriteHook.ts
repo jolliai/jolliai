@@ -25,7 +25,8 @@ import { existsSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { enqueueGitOperation, isLockHeld } from "../core/SessionTracker.js";
+import { isWorkerLockHeld } from "../core/Locks.js";
+import { enqueueGitOperation } from "../core/SessionTracker.js";
 import { createLogger, getJolliMemoryDir, setLogDir } from "../Logger.js";
 import type { CommitSource, GitOperation } from "../Types.js";
 import { launchWorker } from "./QueueWorker.js";
@@ -66,12 +67,15 @@ export async function handlePostRewriteHook(command: string, cwd: string): Promi
 		log.info("Unknown command '%s', skipping", command);
 	}
 
-	// Spawn Worker if lock is free (entries are queued, need someone to process them)
-	const lockHeld = await isLockHeld(cwd);
-	if (!lockHeld) {
+	// Spawn Worker only if no Worker is already running. We deliberately check
+	// `worker.lock` (not the older shared lock) so a brief background writer
+	// holding `orphan-write.lock` does not falsely block the spawn — that race
+	// was the cause of orphaned queue entries during rebase + VS Code panel scan.
+	const workerRunning = await isWorkerLockHeld(cwd);
+	if (!workerRunning) {
 		launchWorker(cwd);
 	} else {
-		log.info("Worker lock is held — queued entries will be consumed by the running Worker");
+		log.info("Worker is already running — queued entries will be drained by it");
 	}
 
 	log.info("=== Post-rewrite hook finished ===");

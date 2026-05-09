@@ -32,21 +32,13 @@ const { isWorkerBusy } = vi.hoisted(() => ({
 	isWorkerBusy: vi.fn(),
 }));
 
-const {
-	loadConfig,
-	getGlobalConfigDir,
-	saveConfig,
-	saveConfigScoped,
-	acquireLock,
-	releaseLock,
-} = vi.hoisted(() => ({
-	loadConfig: vi.fn(),
-	getGlobalConfigDir: vi.fn(() => "/home/user/.jolli/jollimemory"),
-	saveConfig: vi.fn(),
-	saveConfigScoped: vi.fn(),
-	acquireLock: vi.fn(),
-	releaseLock: vi.fn(),
-}));
+const { loadConfig, getGlobalConfigDir, saveConfig, saveConfigScoped } =
+	vi.hoisted(() => ({
+		loadConfig: vi.fn(),
+		getGlobalConfigDir: vi.fn(() => "/home/user/.jolli/jollimemory"),
+		saveConfig: vi.fn(),
+		saveConfigScoped: vi.fn(),
+	}));
 
 const {
 	cleanupV1IfExpired,
@@ -524,8 +516,6 @@ vi.mock("../../cli/src/core/SessionTracker.js", () => ({
 	getGlobalConfigDir,
 	saveConfig,
 	saveConfigScoped,
-	acquireLock,
-	releaseLock,
 }));
 
 vi.mock("../../cli/src/core/SummaryMigration.js", () => ({
@@ -1287,7 +1277,6 @@ describe("Extension", () => {
 
 		it("runs index migration when needed", async () => {
 			indexNeedsMigration.mockResolvedValue(true);
-			acquireLock.mockResolvedValue(true);
 			migrateIndexToV3.mockResolvedValue({ migrated: 3, skipped: 0 });
 
 			const ctx = makeContext();
@@ -1297,24 +1286,10 @@ describe("Extension", () => {
 				expect(migrateIndexToV3).toHaveBeenCalledWith("/test/workspace");
 			});
 
-			expect(acquireLock).toHaveBeenCalledWith("/test/workspace");
-			expect(releaseLock).toHaveBeenCalledWith("/test/workspace");
+			// migrateIndexToV3 acquires `orphan-write.lock` internally; the
+			// extension no longer wraps the call in an outer lock acquisition.
 			expect(mockCommitsStore.setMigrating).toHaveBeenCalledWith(true);
 			expect(mockCommitsStore.setMigrating).toHaveBeenCalledWith(false);
-		});
-
-		it("defers index migration when lock cannot be acquired", async () => {
-			indexNeedsMigration.mockResolvedValue(true);
-			acquireLock.mockResolvedValue(false);
-
-			const ctx = makeContext();
-			activate(ctx);
-
-			await vi.waitFor(() => {
-				expect(acquireLock).toHaveBeenCalled();
-			});
-
-			expect(migrateIndexToV3).not.toHaveBeenCalled();
 		});
 	});
 
@@ -2746,7 +2721,6 @@ describe("Extension", () => {
 
 		it("logs error and clears migrating state when index migration throws", async () => {
 			indexNeedsMigration.mockResolvedValue(true);
-			acquireLock.mockResolvedValue(true);
 			migrateIndexToV3.mockRejectedValue(new Error("corrupt index"));
 
 			const ctx = makeContext();
@@ -2763,9 +2737,6 @@ describe("Extension", () => {
 			expect(mockStatusStore.setMigrating).toHaveBeenCalledWith(false);
 			expect(mockCommitsStore.setMigrating).toHaveBeenCalledWith(false);
 			expect(mockFilesStore.setMigrating).toHaveBeenCalledWith(false);
-
-			// Lock should be released even on error
-			expect(releaseLock).toHaveBeenCalledWith("/test/workspace");
 		});
 	});
 
