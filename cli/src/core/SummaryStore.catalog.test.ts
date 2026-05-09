@@ -21,24 +21,20 @@ import {
 	toCatalogEntry,
 } from "./SummaryStore.js";
 
-vi.mock("./SessionTracker.js", async () => {
-	const actual = await vi.importActual<typeof import("./SessionTracker.js")>("./SessionTracker.js");
-	return {
-		...actual,
-		acquireLock: vi.fn(async () => true),
-		releaseLock: vi.fn(async () => undefined),
-	};
-});
+vi.mock("./Locks.js", () => ({
+	acquireOrphanWriteLock: vi.fn(async () => true),
+	releaseOrphanWriteLock: vi.fn(async () => undefined),
+}));
 
 vi.mock("./GitOps.js", () => ({
 	getDiffStats: vi.fn(async () => ({ filesChanged: 0, insertions: 0, deletions: 0 })),
 	getTreeHash: vi.fn(async () => "deadbeef"),
 }));
 
-import { acquireLock, releaseLock } from "./SessionTracker.js";
+import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 
-const mockAcquire = vi.mocked(acquireLock);
-const mockRelease = vi.mocked(releaseLock);
+const mockAcquire = vi.mocked(acquireOrphanWriteLock);
+const mockRelease = vi.mocked(releaseOrphanWriteLock);
 
 // ─── Memory-backed StorageProvider for hermetic tests ────────────────────────
 

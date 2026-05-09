@@ -37,8 +37,8 @@ import type {
 	TopicSummary,
 } from "../Types.js";
 import { getDiffStats, getTreeHash } from "./GitOps.js";
+import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
-import { acquireLock, releaseLock } from "./SessionTracker.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
 import { getDisplayDate } from "./SummaryFormat.js";
@@ -58,6 +58,40 @@ const log = createLogger("SummaryStore");
 
 const INDEX_FILE = "index.json";
 const CATALOG_FILE = "catalog.json";
+
+/**
+ * Default wait budget for orphan-write lock when an orphan-branch write must
+ * succeed (worker path). Kept generous because the lock is normally held only
+ * for milliseconds — exhausting 5 s means a real fault, not normal contention.
+ */
+const ORPHAN_WRITE_REQUIRED_TIMEOUT_MS = 5000;
+
+/**
+ * Default wait budget for orphan-write lock on best-effort paths
+ * (background scans, admin cleanup) where deferring is acceptable.
+ */
+const ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS = 1000;
+
+/**
+ * Acquires `orphan-write.lock` for a critical section that MUST land
+ * (worker path). Throws on timeout — callers rely on the lock to avoid
+ * lost-update races against background scans.
+ */
+async function withRequiredOrphanWriteLock<T>(
+	cwd: string | undefined,
+	label: string,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const acquired = await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_REQUIRED_TIMEOUT_MS });
+	if (!acquired) {
+		throw new Error(`${label}: could not acquire orphan-write lock within ${ORPHAN_WRITE_REQUIRED_TIMEOUT_MS}ms`);
+	}
+	try {
+		return await fn();
+	} finally {
+		await releaseOrphanWriteLock(cwd);
+	}
+}
 
 /**
  * Returns true if the entry is a root-level summary (not a child of a
@@ -95,64 +129,66 @@ export async function storeSummary(
 		readonly planProgress?: ReadonlyArray<PlanProgressArtifact>;
 	},
 ): Promise<void> {
-	const existingIndex = await loadIndex(cwd);
-	const existingCatalog = await loadCatalog(cwd);
-	const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
-	const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
+	await withRequiredOrphanWriteLock(cwd, "storeSummary", async () => {
+		const existingIndex = await loadIndex(cwd);
+		const existingCatalog = await loadCatalog(cwd);
+		const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
+		const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
 
-	// Duplicate guard: skip if root already indexed and force=false
-	if (!force && entryMap.has(summary.commitHash)) {
-		log.info(
-			"Summary for commit %s already exists — skipping (use force to overwrite)",
-			summary.commitHash.substring(0, 8),
-		);
-		return;
-	}
+		// Duplicate guard: skip if root already indexed and force=false
+		if (!force && entryMap.has(summary.commitHash)) {
+			log.info(
+				"Summary for commit %s already exists — skipping (use force to overwrite)",
+				summary.commitHash.substring(0, 8),
+			);
+			return;
+		}
 
-	// Flatten the entire tree into index entries and upsert
-	const newEntries = await flattenSummaryTree(summary, null, cwd, entryMap);
-	for (const entry of newEntries) {
-		entryMap.set(entry.commitHash, entry);
-	}
+		// Flatten the entire tree into index entries and upsert
+		const newEntries = await flattenSummaryTree(summary, null, cwd, entryMap);
+		for (const entry of newEntries) {
+			entryMap.set(entry.commitHash, entry);
+		}
 
-	const newIndex: SummaryIndex = {
-		version: 3,
-		entries: [...entryMap.values()],
-		commitAliases: existingIndex?.commitAliases,
-	};
+		const newIndex: SummaryIndex = {
+			version: 3,
+			entries: [...entryMap.values()],
+			commitAliases: existingIndex?.commitAliases,
+		};
 
-	const verb = force ? "Overwrite" : "Add";
-	const files: FileWrite[] = [
-		{ path: `summaries/${summary.commitHash}.json`, content: JSON.stringify(summary, null, "\t") },
-		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
-		buildCatalogFileWrite(existingCatalog, entryMap, summary),
-	];
+		const verb = force ? "Overwrite" : "Add";
+		const files: FileWrite[] = [
+			{ path: `summaries/${summary.commitHash}.json`, content: JSON.stringify(summary, null, "\t") },
+			{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
+			buildCatalogFileWrite(existingCatalog, entryMap, summary),
+		];
 
-	// Append transcript file if provided
-	if (artifacts?.transcript && artifacts.transcript.sessions.length > 0) {
-		files.push({
-			path: `transcripts/${summary.commitHash}.json`,
-			content: JSON.stringify(artifacts.transcript, null, "\t"),
-		});
-	}
-
-	// Append plan progress files if provided
-	if (artifacts?.planProgress) {
-		for (const progress of artifacts.planProgress) {
+		// Append transcript file if provided
+		if (artifacts?.transcript && artifacts.transcript.sessions.length > 0) {
 			files.push({
-				path: `plan-progress/${progress.planSlug}.json`,
-				content: JSON.stringify(progress, null, "\t"),
+				path: `transcripts/${summary.commitHash}.json`,
+				content: JSON.stringify(artifacts.transcript, null, "\t"),
 			});
 		}
-	}
 
-	const store = resolveStorage(undefined, cwd);
-	await store.writeFiles(
-		files,
-		`${verb} summary for ${summary.commitHash.substring(0, 8)}: ${summary.commitMessage.substring(0, 50)}`,
-	);
+		// Append plan progress files if provided
+		if (artifacts?.planProgress) {
+			for (const progress of artifacts.planProgress) {
+				files.push({
+					path: `plan-progress/${progress.planSlug}.json`,
+					content: JSON.stringify(progress, null, "\t"),
+				});
+			}
+		}
 
-	log.info("Summary stored successfully for commit %s", summary.commitHash.substring(0, 8));
+		const store = resolveStorage(undefined, cwd);
+		await store.writeFiles(
+			files,
+			`${verb} summary for ${summary.commitHash.substring(0, 8)}: ${summary.commitMessage.substring(0, 50)}`,
+		);
+
+		log.info("Summary stored successfully for commit %s", summary.commitHash.substring(0, 8));
+	});
 }
 
 /**
@@ -170,6 +206,17 @@ export async function storeSummary(
  * how `runSquashPipeline` propagates these fields on squash / amend.
  */
 export async function migrateOneToOne(
+	oldSummary: CommitSummary,
+	newCommitInfo: CommitInfo,
+	cwd?: string,
+	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
+): Promise<void> {
+	await withRequiredOrphanWriteLock(cwd, "migrateOneToOne", () =>
+		migrateOneToOneLocked(oldSummary, newCommitInfo, cwd, metadata),
+	);
+}
+
+async function migrateOneToOneLocked(
 	oldSummary: CommitSummary,
 	newCommitInfo: CommitInfo,
 	cwd?: string,
@@ -539,6 +586,18 @@ export async function mergeManyToOne(
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
 	consolidated?: ConsolidatedTopics,
 ): Promise<{ orphanedDocIds: number[] }> {
+	return withRequiredOrphanWriteLock(cwd, "mergeManyToOne", () =>
+		mergeManyToOneLocked(oldSummaries, newCommitInfo, cwd, metadata, consolidated),
+	);
+}
+
+async function mergeManyToOneLocked(
+	oldSummaries: ReadonlyArray<CommitSummary>,
+	newCommitInfo: CommitInfo,
+	cwd?: string,
+	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
+	consolidated?: ConsolidatedTopics,
+): Promise<{ orphanedDocIds: number[] }> {
 	log.info("Merging %d summaries into %s", oldSummaries.length, newCommitInfo.hash.substring(0, 8));
 
 	// Sort children by activity date descending (newest first) via getDisplayDate.
@@ -654,13 +713,21 @@ export async function mergeManyToOne(
  * Use only for admin cleanup of truly orphaned root entries.
  */
 export async function removeFromIndex(commitHash: string, cwd?: string): Promise<void> {
-	// Acquire the shared lock before touching index/catalog: this function
+	// Acquire orphan-write.lock before touching index/catalog: this function
 	// performs a multi-file write that races with QueueWorker / scanTreeHashAliases
 	// / storeSummary if unsynchronized. Loading the data inside the lock window
 	// guarantees we operate on the most recent on-disk state.
-	const locked = await acquireLock(cwd);
+	//
+	// Best-effort path: defer when the lock is contended. removeFromIndex is an
+	// admin cleanup and the caller can retry; deferring beats stomping a fresher
+	// concurrent write.
+	const locked = await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS });
 	if (!locked) {
-		log.warn("removeFromIndex: could not acquire lock — skipping removal of %s", commitHash.substring(0, 8));
+		log.warn(
+			"removeFromIndex: could not acquire orphan-write lock within %dms — skipping removal of %s",
+			ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS,
+			commitHash.substring(0, 8),
+		);
 		return;
 	}
 	try {
@@ -692,7 +759,7 @@ export async function removeFromIndex(commitHash: string, cwd?: string): Promise
 		await store.writeFiles(files, `Remove index entry for ${commitHash.substring(0, 8)}`);
 		log.info("Removed %s from index", commitHash.substring(0, 8));
 	} finally {
-		await releaseLock(cwd);
+		await releaseOrphanWriteLock(cwd);
 	}
 }
 
@@ -769,9 +836,11 @@ export async function saveTranscriptsBatch(
 		.filter(Boolean)
 		.join(", ");
 
-	const store = resolveStorage(undefined, cwd);
-	await store.writeFiles(files, `Update transcripts: ${summary}`);
-	log.info("Transcript batch: %s", summary);
+	await withRequiredOrphanWriteLock(cwd, "saveTranscriptsBatch", async () => {
+		const store = resolveStorage(undefined, cwd);
+		await store.writeFiles(files, `Update transcripts: ${summary}`);
+		log.info("Transcript batch: %s", summary);
+	});
 }
 
 /**
@@ -1145,12 +1214,14 @@ export async function scanTreeHashAliases(
 
 	if (Object.keys(newAliases).length === 0) return false;
 
-	// Acquire the shared lock before writing to the orphan branch.
-	// The Worker holds the same lock during summarization, and migrations hold
-	// it too — skipping the write here is safe since the next UI refresh will retry.
-	const locked = await acquireLock(cwd);
+	// Acquire orphan-write.lock before writing to the orphan branch.
+	// Background path: deferring is acceptable — the next UI refresh re-enters
+	// scanTreeHashAliases, which is why this used `log.warn` historically. The
+	// log level is now `debug` because deferral is the expected outcome under
+	// contention, not a warning condition.
+	const locked = await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS });
 	if (!locked) {
-		log.warn("scanTreeHashAliases: could not acquire lock — alias write deferred");
+		log.debug("scanTreeHashAliases: orphan-write lock contention — alias write deferred");
 		return false;
 	}
 	try {
@@ -1160,7 +1231,7 @@ export async function scanTreeHashAliases(
 		const store = resolveStorage(storage, cwd);
 		await store.writeFiles(files, `Add ${Object.keys(newAliases).length} tree hash alias(es)`);
 	} finally {
-		await releaseLock(cwd);
+		await releaseOrphanWriteLock(cwd);
 	}
 
 	return true;
@@ -1194,9 +1265,13 @@ export async function indexNeedsMigration(cwd?: string): Promise<boolean> {
  * For each top-level summary, loads the full JSON tree and flattens it into index entries.
  * Calls `getTreeHash` for each node to populate `treeHash` fields.
  *
- * All orphan branch writes use the shared lock (callers must hold `acquireLock` before calling).
+ * Acquires `orphan-write.lock` internally — callers no longer need to wrap.
  */
 export async function migrateIndexToV3(cwd?: string): Promise<{ migrated: number; skipped: number }> {
+	return withRequiredOrphanWriteLock(cwd, "migrateIndexToV3", () => migrateIndexToV3Locked(cwd));
+}
+
+async function migrateIndexToV3Locked(cwd?: string): Promise<{ migrated: number; skipped: number }> {
 	const existingIndex = await loadIndex(cwd);
 	if (!existingIndex) {
 		log.info("No index found — nothing to migrate");
@@ -1537,13 +1612,15 @@ export async function getCatalogWithLazyBuild(cwd?: string, storage?: StoragePro
 		return preflightCatalog;
 	}
 
-	// We have work to do. Acquire the shared lock so concurrent worker writes
+	// We have work to do. Acquire orphan-write.lock so concurrent worker writes
 	// can't race with our update; if the lock is contended, fall back to the
 	// preflight in-memory result (a stale-but-coherent view is better than
 	// stomping a fresher write).
-	const locked = await acquireLock(cwd);
+	const locked = await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS });
 	if (!locked) {
-		log.debug("getCatalogWithLazyBuild: lock contention — returning in-memory catalog without writeback");
+		log.debug(
+			"getCatalogWithLazyBuild: orphan-write lock contention — returning in-memory catalog without writeback",
+		);
 		// Build the in-memory updated view so caller still sees current roots.
 		const cleaned = preflightCatalog.entries.filter((e) => preflightRoots.has(e.commitHash));
 		const newEntries: CatalogEntry[] = [];
@@ -1593,7 +1670,7 @@ export async function getCatalogWithLazyBuild(cwd?: string, storage?: StoragePro
 		await store.writeFiles([{ path: CATALOG_FILE, content: JSON.stringify(updated, null, "\t") }], message);
 		return updated;
 	} finally {
-		await releaseLock(cwd);
+		await releaseOrphanWriteLock(cwd);
 	}
 }
 
@@ -1663,9 +1740,11 @@ export async function storePlans(
 		branch,
 	}));
 
-	const store = resolveStorage(undefined, cwd);
-	await store.writeFiles(files, commitMessage);
-	log.info("Stored %d plan file(s)", planFiles.length);
+	await withRequiredOrphanWriteLock(cwd, "storePlans", async () => {
+		const store = resolveStorage(undefined, cwd);
+		await store.writeFiles(files, commitMessage);
+		log.info("Stored %d plan file(s)", planFiles.length);
+	});
 }
 
 /**
@@ -1720,9 +1799,11 @@ export async function storeNotes(
 		branch,
 	}));
 
-	const store = resolveStorage(undefined, cwd);
-	await store.writeFiles(files, commitMessage);
-	log.info("Stored %d note file(s)", noteFiles.length);
+	await withRequiredOrphanWriteLock(cwd, "storeNotes", async () => {
+		const store = resolveStorage(undefined, cwd);
+		await store.writeFiles(files, commitMessage);
+		log.info("Stored %d note file(s)", noteFiles.length);
+	});
 }
 
 /**

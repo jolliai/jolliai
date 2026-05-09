@@ -14,14 +14,8 @@ import { join } from "node:path";
 import type { Command } from "commander";
 import { orphanBranchExists } from "../core/GitOps.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
-import {
-	countActiveQueueEntries,
-	getGlobalConfigDir,
-	isLockStale,
-	loadAllSessions,
-	loadConfig,
-	releaseLock,
-} from "../core/SessionTracker.js";
+import { isWorkerLockStale, releaseWorkerLock } from "../core/Locks.js";
+import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfig } from "../core/SessionTracker.js";
 import { traverseDistPaths } from "../install/DistPathResolver.js";
 import { getStatus, install } from "../install/Installer.js";
 import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
@@ -91,20 +85,24 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 		message: branchExists ? "exists" : "not yet created (will be created on first commit)",
 	});
 
-	// 3. Lock file (stuck = exists AND older than 5 min; a normal active lock is < 5 min)
-	const lockStale = await isLockStale(cwd);
-	if (lockStale) {
+	// 3. Worker lock (stuck = exists AND older than LOCK_TIMEOUT_MS; a normal worker
+	// refreshes mtime every minute, so any age > 5 min implies a crashed worker).
+	// `orphan-write.lock` is held only for milliseconds and is not surfaced here —
+	// if a stale orphan-write lock ever appears, doctor's `--fix` would release it
+	// implicitly via a re-run of the affected operation.
+	const workerLockStale = await isWorkerLockStale(cwd);
+	if (workerLockStale) {
 		checks.push({
-			name: "Lock file",
+			name: "Worker lock",
 			status: "fail",
 			message: "stuck (older than 5 min — Worker probably crashed) — use --fix to release",
 			fixer: async () => {
-				await releaseLock(cwd);
+				await releaseWorkerLock(cwd);
 				return "released";
 			},
 		});
 	} else {
-		checks.push({ name: "Lock file", status: "ok", message: "not stuck" });
+		checks.push({ name: "Worker lock", status: "ok", message: "not stuck" });
 	}
 
 	// 4. Active sessions (informational; stale entries are cleanup concerns → `clean`)

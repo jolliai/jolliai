@@ -21,8 +21,6 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		loadCursorForTranscript: vi.fn(),
 		saveCursor: vi.fn(),
 		loadConfig: vi.fn().mockResolvedValue({}),
-		acquireLock: vi.fn().mockResolvedValue(true),
-		releaseLock: vi.fn(),
 		loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
 		savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 		associatePlanWithCommit: vi.fn(),
@@ -31,9 +29,15 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		dequeueAllGitOperations: vi.fn().mockResolvedValue([]),
 		deleteQueueEntry: vi.fn(),
 		enqueueGitOperation: vi.fn(),
-		isLockHeld: vi.fn(),
 	};
 });
+
+vi.mock("../core/Locks.js", () => ({
+	acquireWorkerLock: vi.fn().mockResolvedValue(true),
+	releaseWorkerLock: vi.fn(),
+	refreshWorkerLockMtime: vi.fn(),
+	isWorkerLockHeld: vi.fn(),
+}));
 
 vi.mock("../core/TranscriptReader.js", () => ({
 	readTranscript: vi.fn(),
@@ -196,16 +200,15 @@ import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { LlmCredentialError } from "../core/LlmClient.js";
+import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
-	acquireLock,
 	dequeueAllGitOperations,
 	loadAllSessions,
 	loadConfig,
 	loadCursorForTranscript,
 	loadPlansRegistry,
-	releaseLock,
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
@@ -243,8 +246,8 @@ function setupPipelineMocks(hash = "abc12345def67890"): void {
 describe("QueueWorker", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
-		vi.mocked(acquireLock).mockResolvedValue(true);
-		vi.mocked(releaseLock).mockResolvedValue(undefined);
+		vi.mocked(acquireWorkerLock).mockResolvedValue(true);
+		vi.mocked(releaseWorkerLock).mockResolvedValue(undefined);
 		vi.mocked(dequeueAllGitOperations).mockResolvedValue([]);
 		vi.mocked(loadConfig).mockResolvedValue(
 			{} as ReturnType<typeof loadConfig> extends Promise<infer T> ? T : never,
@@ -383,7 +386,7 @@ describe("QueueWorker", () => {
 			await runWorker("/test/cwd");
 
 			// Worker should complete without throwing (error caught internally)
-			expect(releaseLock).toHaveBeenCalled();
+			expect(releaseWorkerLock).toHaveBeenCalled();
 		});
 
 		// The dispatcher's "fail loudly" promise (PR #93) is undermined if the

@@ -40,7 +40,6 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 
 import type { GitOperation, SessionInfo, SessionsRegistry, SquashPendingState, TranscriptCursor } from "../Types.js";
 import {
-	acquireLock,
 	associateNoteWithCommit,
 	associatePlanWithCommit,
 	checkStaleSquashPending,
@@ -55,8 +54,6 @@ import {
 	ensureJolliMemoryDir,
 	filterSessionsByEnabledIntegrations,
 	getGlobalConfigDir,
-	isLockHeld,
-	isLockStale,
 	loadAllSessions,
 	loadConfig,
 	loadConfigFromDir,
@@ -68,7 +65,6 @@ import {
 	loadSquashPending,
 	pruneStaleQueueEntries,
 	pruneStaleSessions,
-	releaseLock,
 	saveConfig,
 	saveConfigScoped,
 	saveCursor,
@@ -433,73 +429,6 @@ describe("SessionTracker", () => {
 			await writeFile(join(dir, "config.json"), "not json", "utf-8");
 			const config = await loadConfigFromDir(dir);
 			expect(config).toEqual({});
-		});
-	});
-
-	describe("acquireLock / releaseLock", () => {
-		it("should acquire and release lock", async () => {
-			const acquired = await acquireLock(tempDir);
-			expect(acquired).toBe(true);
-
-			await releaseLock(tempDir);
-
-			const acquired2 = await acquireLock(tempDir);
-			expect(acquired2).toBe(true);
-			await releaseLock(tempDir);
-		});
-
-		it("should fail to acquire when lock exists", async () => {
-			const acquired1 = await acquireLock(tempDir);
-			expect(acquired1).toBe(true);
-
-			const acquired2 = await acquireLock(tempDir);
-			expect(acquired2).toBe(false);
-
-			await releaseLock(tempDir);
-		});
-
-		it("should remove stale lock and acquire", async () => {
-			const dir = await ensureJolliMemoryDir(tempDir);
-			const lockPath = join(dir, "lock");
-			await writeFile(lockPath, "12345", "utf-8");
-
-			// Manually set mtime to 10 minutes ago
-			const { utimes } = await import("node:fs/promises");
-			const past = new Date(Date.now() - 10 * 60 * 1000);
-			await utimes(lockPath, past, past);
-
-			const acquired = await acquireLock(tempDir);
-			expect(acquired).toBe(true);
-			await releaseLock(tempDir);
-		});
-
-		it("should return false when checking the lock file fails unexpectedly", async () => {
-			const fsPromises = await import("node:fs/promises");
-			const statSpy = vi
-				.spyOn(fsPromises, "stat")
-				.mockRejectedValueOnce(Object.assign(new Error("stat failed"), { code: "EIO" }));
-
-			await expect(acquireLock(tempDir)).resolves.toBe(false);
-
-			statSpy.mockRestore();
-		});
-
-		it("should return false when creating the lock file loses a race", async () => {
-			const fsPromises = await import("node:fs/promises");
-			const writeSpy = vi.spyOn(fsPromises, "writeFile").mockRejectedValueOnce(new Error("already exists"));
-
-			await expect(acquireLock(tempDir)).resolves.toBe(false);
-
-			writeSpy.mockRestore();
-		});
-
-		it("should swallow filesystem errors when releasing the lock", async () => {
-			const fsPromises = await import("node:fs/promises");
-			const rmSpy = vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(new Error("permission denied"));
-
-			await expect(releaseLock(tempDir)).resolves.toBeUndefined();
-
-			rmSpy.mockRestore();
 		});
 	});
 
@@ -1139,26 +1068,6 @@ describe("SessionTracker", () => {
 		});
 	});
 
-	// ── isLockHeld ─────────────────────────────────────────────────────────
-
-	describe("isLockHeld", () => {
-		it("should return false when no lock file exists", async () => {
-			expect(await isLockHeld(tempDir)).toBe(false);
-		});
-
-		it("should return true when lock file exists and is fresh", async () => {
-			await acquireLock(tempDir);
-			expect(await isLockHeld(tempDir)).toBe(true);
-			await releaseLock(tempDir);
-		});
-
-		it("should return false after lock is released", async () => {
-			await acquireLock(tempDir);
-			await releaseLock(tempDir);
-			expect(await isLockHeld(tempDir)).toBe(false);
-		});
-	});
-
 	// ── loadConfig (global shorthand) ────────────────────────────────────
 
 	describe("loadConfig", () => {
@@ -1179,31 +1088,6 @@ describe("SessionTracker", () => {
 			await saveConfig({ apiKey: "global-key" });
 			const config = await loadConfig();
 			expect(config.apiKey).toBe("global-key");
-		});
-	});
-
-	// ── isLockStale ──────────────────────────────────────────────────────
-
-	describe("isLockStale", () => {
-		it("should return false when no lock file exists", async () => {
-			expect(await isLockStale(tempDir)).toBe(false);
-		});
-
-		it("should return false when lock file is fresh (< 5 min)", async () => {
-			await acquireLock(tempDir);
-			expect(await isLockStale(tempDir)).toBe(false);
-			await releaseLock(tempDir);
-		});
-
-		it("should return true when lock file is older than 5 min", async () => {
-			await acquireLock(tempDir);
-			// Backdate the lock file's mtime to 10 minutes ago
-			const lockPath = join(tempDir, ".jolli/jollimemory/lock");
-			const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000);
-			const { utimes } = await import("node:fs/promises");
-			await utimes(lockPath, tenMinAgo, tenMinAgo);
-			expect(await isLockStale(tempDir)).toBe(true);
-			await releaseLock(tempDir);
 		});
 	});
 

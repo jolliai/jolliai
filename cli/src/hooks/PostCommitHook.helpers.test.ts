@@ -124,7 +124,6 @@ vi.mock("../core/GitOps.js", () => ({
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({
-	acquireLock: vi.fn(),
 	associatePlanWithCommit: mockAssociatePlanWithCommit,
 	deleteAmendPending: vi.fn(),
 	deletePluginSource: mockDeletePluginSource,
@@ -137,9 +136,15 @@ vi.mock("../core/SessionTracker.js", () => ({
 	loadPlansRegistry: mockLoadPlansRegistry,
 	loadPluginSource: mockLoadPluginSource,
 	loadSquashPending: mockLoadSquashPending,
-	releaseLock: vi.fn(),
 	saveCursor: mockSaveCursor,
 	savePlansRegistry: mockSavePlansRegistry,
+}));
+
+vi.mock("../core/Locks.js", () => ({
+	acquireWorkerLock: vi.fn(async () => true),
+	releaseWorkerLock: vi.fn(),
+	refreshWorkerLockMtime: vi.fn(),
+	isWorkerLockHeld: vi.fn(),
 }));
 
 vi.mock("../core/SummaryStore.js", async (importOriginal) => {

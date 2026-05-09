@@ -5,10 +5,11 @@
  *   - sessions.json: Registry of all active Claude Code sessions (Map<sessionId, SessionInfo>)
  *   - cursors.json: Per-transcript cursor positions (Map<transcriptPath, TranscriptCursor>)
  *   - config.json: Optional configuration (API key, model, etc.)
- *   - lock: Concurrency lock file
  *
  * Supports multiple concurrent Claude Code sessions. Stale sessions (>48h)
  * are automatically pruned during saveSession, along with their cursors.
+ *
+ * Lock primitives (`worker.lock` / `orphan-write.lock`) live in `Locks.ts`.
  */
 
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -32,14 +33,10 @@ const log = createLogger("SessionTracker");
 const SESSIONS_FILE = "sessions.json";
 const CURSORS_FILE = "cursors.json";
 const CONFIG_FILE = "config.json";
-const LOCK_FILE = "lock";
 const PLANS_FILE = "plans.json";
 
 /** Sessions older than 48 hours are considered stale and pruned automatically */
 const SESSION_STALE_MS = 48 * 60 * 60 * 1000;
-
-/** Lock timeout: if a lock is older than this, consider it stale */
-const LOCK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 /**
  * Ensures the .jolli/jollimemory/ directory exists.
@@ -266,66 +263,6 @@ export async function loadConfig(): Promise<JolliMemoryConfig> {
  */
 export async function saveConfig(update: Partial<JolliMemoryConfig>): Promise<void> {
 	return saveConfigScoped(update, getGlobalConfigDir());
-}
-
-/**
- * Acquires a simple file-based lock to prevent concurrent operations.
- * Returns true if lock was acquired, false if another process holds it.
- *
- * If a lock file exists but is older than LOCK_TIMEOUT_MS, considers it stale
- * and removes it.
- */
-export async function acquireLock(cwd?: string): Promise<boolean> {
-	const dir = await ensureJolliMemoryDir(cwd);
-	const lockPath = join(dir, LOCK_FILE);
-
-	try {
-		// Check for existing lock
-		const lockStat = await stat(lockPath);
-		const age = Date.now() - lockStat.mtimeMs;
-
-		if (age < LOCK_TIMEOUT_MS) {
-			log.warn("Lock file exists (age: %dms), another process may be running", age);
-			return false;
-		}
-
-		// Stale lock — remove it
-		log.warn("Removing stale lock file (age: %dms)", age);
-		await rm(lockPath, { force: true });
-	} catch (error: unknown) {
-		const err = error as { code?: string };
-		/* v8 ignore next 4 - defensive: non-ENOENT errors from stat are rare filesystem issues */
-		if (err.code !== "ENOENT") {
-			log.error("Failed to check lock file: %s", (error as Error).message);
-			return false;
-		}
-		// No lock file exists, proceed
-	}
-
-	// Create lock file with PID
-	try {
-		await writeFile(lockPath, String(process.pid), { flag: "wx" });
-		return true;
-		/* v8 ignore next 4 - race condition: another process grabbed lock between check and write */
-	} catch {
-		log.warn("Failed to acquire lock (another process may have grabbed it)");
-		return false;
-	}
-}
-
-/**
- * Releases the file-based lock.
- */
-export async function releaseLock(cwd?: string): Promise<void> {
-	const dir = getJolliMemoryDir(cwd);
-	const lockPath = join(dir, LOCK_FILE);
-
-	try {
-		await rm(lockPath, { force: true });
-		/* v8 ignore next 3 - filesystem permission error during lock release */
-	} catch (error: unknown) {
-		log.error("Failed to release lock: %s", (error as Error).message);
-	}
 }
 
 const SQUASH_PENDING_FILE = "squash-pending.json";
@@ -617,40 +554,6 @@ export async function deleteQueueEntry(filePath: string): Promise<void> {
 		log.error("Failed to delete queue entry %s: %s", filePath, (error as Error).message);
 	}
 	/* v8 ignore stop */
-}
-
-/**
- * Checks whether the Worker lock is currently held (another Worker is running).
- * Used by PostRewriteHook to decide whether to spawn a Worker.
- */
-export async function isLockHeld(cwd?: string): Promise<boolean> {
-	const dir = getJolliMemoryDir(cwd);
-	const lockPath = join(dir, LOCK_FILE);
-	try {
-		const lockStat = await stat(lockPath);
-		const age = Date.now() - lockStat.mtimeMs;
-		// Lock is held if it exists and is not stale (< 5 min)
-		return age < LOCK_TIMEOUT_MS;
-	} catch {
-		return false; // No lock file = not held
-	}
-}
-
-/**
- * Checks whether the Worker lock file exists but is stale (older than LOCK_TIMEOUT_MS).
- * A stale lock indicates a crashed Worker that never cleaned up its lock file.
- * Used by `doctor` to detect stuck locks that need manual release.
- */
-export async function isLockStale(cwd?: string): Promise<boolean> {
-	const dir = getJolliMemoryDir(cwd);
-	const lockPath = join(dir, LOCK_FILE);
-	try {
-		const lockStat = await stat(lockPath);
-		const age = Date.now() - lockStat.mtimeMs;
-		return age >= LOCK_TIMEOUT_MS;
-	} catch {
-		return false; // No lock file = not stale
-	}
 }
 
 // --- plugin-source marker ---

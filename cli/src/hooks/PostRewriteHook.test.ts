@@ -23,7 +23,10 @@ vi.mock("../core/GitOps.js", () => ({
 
 vi.mock("../core/SessionTracker.js", () => ({
 	enqueueGitOperation: vi.fn(),
-	isLockHeld: vi.fn(),
+}));
+
+vi.mock("../core/Locks.js", () => ({
+	isWorkerLockHeld: vi.fn(),
 }));
 
 // Mock QueueWorker's launchWorker (imported by PostRewriteHook for conditional spawn)
@@ -36,7 +39,8 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
-import { enqueueGitOperation, isLockHeld } from "../core/SessionTracker.js";
+import { isWorkerLockHeld } from "../core/Locks.js";
+import { enqueueGitOperation } from "../core/SessionTracker.js";
 import { handlePostRewriteHook } from "./PostRewriteHook.js";
 import { launchWorker } from "./QueueWorker.js";
 
@@ -60,7 +64,7 @@ function setStdinLines(lines: string[]): void {
 describe("PostRewriteHook", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
-		vi.mocked(isLockHeld).mockResolvedValue(false);
+		vi.mocked(isWorkerLockHeld).mockResolvedValue(false);
 		vi.mocked(enqueueGitOperation).mockResolvedValue(true);
 		// Default: no plugin-source file
 		mockExistsSync.mockReturnValue(false);
@@ -86,7 +90,7 @@ describe("PostRewriteHook", () => {
 
 		it("should spawn Worker when lock is free after amend enqueue", async () => {
 			setStdinLines(["aaaa1111 bbbb2222"]);
-			vi.mocked(isLockHeld).mockResolvedValue(false);
+			vi.mocked(isWorkerLockHeld).mockResolvedValue(false);
 
 			await handlePostRewriteHook("amend", "/test/project");
 
@@ -95,7 +99,7 @@ describe("PostRewriteHook", () => {
 
 		it("should NOT spawn Worker when lock is held after amend enqueue", async () => {
 			setStdinLines(["aaaa1111 bbbb2222"]);
-			vi.mocked(isLockHeld).mockResolvedValue(true);
+			vi.mocked(isWorkerLockHeld).mockResolvedValue(true);
 
 			await handlePostRewriteHook("amend", "/test/project");
 
@@ -173,7 +177,7 @@ describe("PostRewriteHook", () => {
 
 		it("should spawn Worker when lock is free after rebase enqueue", async () => {
 			setStdinLines(["aaaa1111 bbbb2222"]);
-			vi.mocked(isLockHeld).mockResolvedValue(false);
+			vi.mocked(isWorkerLockHeld).mockResolvedValue(false);
 
 			await handlePostRewriteHook("rebase", "/test/project");
 
@@ -182,7 +186,7 @@ describe("PostRewriteHook", () => {
 
 		it("should NOT spawn Worker when lock is held after rebase enqueue", async () => {
 			setStdinLines(["aaaa1111 bbbb2222"]);
-			vi.mocked(isLockHeld).mockResolvedValue(true);
+			vi.mocked(isWorkerLockHeld).mockResolvedValue(true);
 
 			await handlePostRewriteHook("rebase", "/test/project");
 
@@ -284,5 +288,32 @@ describe("PostRewriteHook", () => {
 		await handlePostRewriteHook("unknown-command", "/test/project");
 
 		expect(enqueueGitOperation).not.toHaveBeenCalled();
+	});
+
+	// ── regression: orphan-write held but worker.lock empty ──────────────
+	//
+	// Before the lock split, a non-Worker holder of the (single) lock —
+	// notably scanTreeHashAliases triggered by VS Code's branch refresh —
+	// caused isLockHeld to return true; PostRewriteHook then assumed a
+	// Worker was running and skipped the spawn, leaving rebase-pick
+	// queue entries to rot. This test pins the new behaviour: only
+	// `worker.lock` blocks the spawn — orphan-write contention does not.
+	describe("regression: rebase + concurrent orphan-write does not orphan queue entries", () => {
+		it("spawns Worker even when only orphan-write.lock would have been held under the old single-lock model", async () => {
+			setStdinLines(["aaaa1111 bbbb2222"]);
+			// Worker.lock is free. Under the old shared-lock model, a background
+			// scan holding the (single) lock would also have flipped this to true
+			// and suppressed the spawn — that's the bug. The fix: the spawn
+			// decision consults worker.lock only.
+			vi.mocked(isWorkerLockHeld).mockResolvedValue(false);
+
+			await handlePostRewriteHook("rebase", "/test/project");
+
+			expect(enqueueGitOperation).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "rebase-pick", commitHash: "bbbb2222" }),
+				"/test/project",
+			);
+			expect(launchWorker).toHaveBeenCalledWith("/test/project");
+		});
 	});
 });

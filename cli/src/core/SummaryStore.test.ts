@@ -11,9 +11,9 @@ vi.mock("./GitOps.js", () => ({
 	orphanBranchExists: vi.fn().mockResolvedValue(true),
 }));
 
-vi.mock("./SessionTracker.js", () => ({
-	acquireLock: vi.fn(),
-	releaseLock: vi.fn(),
+vi.mock("./Locks.js", () => ({
+	acquireOrphanWriteLock: vi.fn(),
+	releaseOrphanWriteLock: vi.fn(),
 }));
 
 // Suppress console output
@@ -36,7 +36,7 @@ import {
 	readFileFromBranch,
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
-import { acquireLock, releaseLock } from "./SessionTracker.js";
+import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 import {
 	AmbiguousHashError,
 	deleteTranscript,
@@ -116,8 +116,8 @@ describe("SummaryStore", () => {
 		// Default: getTreeHash returns null (no treeHash tracking by default)
 		vi.mocked(getTreeHash).mockResolvedValue(null);
 		vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 2 });
-		vi.mocked(acquireLock).mockResolvedValue(true);
-		vi.mocked(releaseLock).mockResolvedValue(undefined);
+		vi.mocked(acquireOrphanWriteLock).mockResolvedValue(true);
+		vi.mocked(releaseOrphanWriteLock).mockResolvedValue(undefined);
 	});
 
 	describe("storeSummary", () => {
@@ -1931,15 +1931,15 @@ describe("SummaryStore", () => {
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
-		it("should defer alias writes when the shared lock cannot be acquired", async () => {
+		it("should defer alias writes when orphan-write lock cannot be acquired", async () => {
 			const index = v3Index([{ ...rootEntry("root1", "Root"), treeHash: "tree-1" }]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
-			vi.mocked(acquireLock).mockResolvedValueOnce(false);
+			vi.mocked(acquireOrphanWriteLock).mockResolvedValueOnce(false);
 
 			await expect(scanTreeHashAliases(["unknown1"])).resolves.toBe(false);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
-			expect(releaseLock).not.toHaveBeenCalled();
+			expect(releaseOrphanWriteLock).not.toHaveBeenCalled();
 		});
 
 		it("should alias to the most recent shallow match when tree hash depth ties", async () => {

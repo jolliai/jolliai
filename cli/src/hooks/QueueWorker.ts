@@ -34,11 +34,11 @@ import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { isLlmCredentialError } from "../core/LlmClient.js";
+import { acquireWorkerLock, refreshWorkerLockMtime, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import {
-	acquireLock,
 	associateNoteWithCommit,
 	associatePlanWithCommit,
 	deleteQueueEntry,
@@ -48,7 +48,6 @@ import {
 	loadConfig,
 	loadCursorForTranscript,
 	loadPlansRegistry,
-	releaseLock,
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
@@ -99,6 +98,13 @@ const log = createLogger("QueueWorker");
 
 /** Delay before retry on API failure (ms) */
 const RETRY_DELAY_MS = 2000;
+
+/**
+ * How often to bump the worker.lock's mtime while the worker is running.
+ * Comfortably below `LOCK_TIMEOUT_MS` (5 min) so even a missed tick keeps
+ * the lock alive against the stale-lock reclaimer.
+ */
+const WORKER_LOCK_REFRESH_INTERVAL_MS = 60_000;
 
 // ─── Shared helpers for plans & notes re-association ─────────────────────────
 
@@ -203,12 +209,20 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 	const storage = await createStorage(cwd, cwd);
 	setActiveStorage(storage);
 
-	// Acquire lock to prevent concurrent runs
-	const lockAcquired = await acquireLock(cwd);
+	// Acquire worker.lock to prevent concurrent runs (a second worker exits immediately)
+	const lockAcquired = await acquireWorkerLock(cwd);
 	if (!lockAcquired) {
-		log.warn("Could not acquire lock, another worker may be running. Exiting.");
+		log.warn("Could not acquire worker lock, another worker may be running. Exiting.");
 		return;
 	}
+
+	// Periodically bump the lock's mtime so a long-running LLM call (rare, but
+	// possible when an upstream is slow) cannot be reaped by the stale-lock
+	// reclaimer at LOCK_TIMEOUT_MS. Refresh interval is comfortably below the
+	// timeout so a missed tick still leaves plenty of margin.
+	const refreshTimer = setInterval(() => {
+		void refreshWorkerLockMtime(cwd);
+	}, WORKER_LOCK_REFRESH_INTERVAL_MS);
 
 	try {
 		// Drain the queue: process all entries, then check for new ones (added during processing)
@@ -254,7 +268,8 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		log.error("Worker failed: %s", (error as Error).message);
 	} finally {
 		/* v8 ignore stop */
-		await releaseLock(cwd);
+		clearInterval(refreshTimer);
+		await releaseWorkerLock(cwd);
 		log.info("=== Queue worker finished ===");
 	}
 
