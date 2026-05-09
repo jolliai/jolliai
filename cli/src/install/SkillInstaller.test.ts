@@ -79,15 +79,15 @@ describe("updateSkillsIfNeeded", () => {
 	// recall has no equivalent. Principle 6 gives a concrete word ceiling +
 	// explicit deep-dive escape hatch. **Length only — no form constraint.**
 	// LLM still picks the output shape (per Part B's "shape is your call").
-	it("recall template caps default answer length at ~400 words (principle #6)", async () => {
+	it("recall template caps default answer length at ~500 words (principle #6)", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
 		// Concrete word ceiling — actionable for LLM in a way "one screen" wasn't.
-		// 400 was picked over 200 after dogfood: a substantive 5-commit branch
-		// naturally produces ~700-800 words; 200 is too aggressive and forces
-		// loss of detail, 400 is roughly one screen of plain prose.
+		// 500 was picked after dogfood: a substantive 5-commit branch with
+		// quoted decisions naturally produces ~700-800 words; 400 was too tight
+		// once the verbatim-quote convention got upgraded to complete clauses.
 		expect(recall).toMatch(/Brief by default/);
-		expect(recall).toMatch(/~400 words at most/);
+		expect(recall).toMatch(/~500 words at most/);
 		// Escape hatch. Use \s+ to tolerate the line wrap inside the principle.
 		expect(recall).toMatch(/Long-form\s+output is opt-in/);
 		expect(recall).toMatch(/deep dive/);
@@ -248,16 +248,32 @@ describe("updateSkillsIfNeeded", () => {
 		expect(search).toMatch(/\[cli\/src\/Types\.ts\]\(cli\/src\/Types\.ts\)/);
 	});
 
-	it("search template forbids snippet dumps but ENCOURAGES short bold verbatim quotes from recap/decisions", async () => {
+	it("search template forbids snippet dumps and demands complete verbatim clauses with self-contained meaning", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// Synthesize-don't-dump is still in (no wall-of-fragments).
+		// Synthesize-don't-dump is still in.
 		expect(search).toMatch(/Synthesize, don't dump/);
 		expect(search).toMatch(/wall-of-fragments/);
-		// Bold verbatim quotes are explicitly encouraged.
-		expect(search).toMatch(/short verbatim quotes/);
-		// And a worked example anchoring the format the LLM should emit.
-		expect(search).toMatch(/\*\*"stateless, scales horizontally"\*\*/);
+		// Bold verbatim quotes are explicitly encouraged — but as complete
+		// clauses, not 2-3 word fragments that need surrounding paraphrase
+		// to be understood.
+		expect(search).toMatch(/verbatim quotes from stored data/);
+		expect(search).toMatch(/complete clauses \(typically 10-30 words\)/);
+		expect(search).toMatch(/not 2-3 word fragments/);
+		expect(search).toMatch(/skim the bold quote alone and understand its claim/);
+		// Worked example is a 17-word complete clause (anchors the LLM's
+		// output toward longer self-contained quotes, not snippet fragments).
+		expect(search).toMatch(
+			/\*\*"the stateless model lets us scale horizontally without a shared session store across regions"\*\*/,
+		);
+		// Bold-only-for-verbatim trust signal.
+		expect(search).toMatch(/Bold = verbatim from stored data/);
+		expect(search).toMatch(/Never use bold for general emphasis/);
+		// Negative: the deprecated 1-3 quotes-per-answer cap is gone (it
+		// interacted badly with recall's 400-word ceiling, starving the
+		// answer of grounding).
+		expect(search).not.toMatch(/Use sparingly \(1-3 quotes per answer\)/);
+		expect(search).not.toMatch(/short verbatim quotes/);
 	});
 
 	it("search template forbids exposing machinery (Phase 1 / Phase 2 / catalog / SearchHit)", async () => {
