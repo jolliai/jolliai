@@ -983,12 +983,20 @@ export function activate(context: vscode.ExtensionContext): void {
 		);
 	}
 
-	// ── Lock file watcher ────────────────────────────────────────────────
-	// When the post-commit Worker is running, it holds .jolli/jollimemory/lock.
-	// Disable Commit/Squash/Push buttons during this time to prevent race conditions
-	// (Bug 3: squash commit while previous Worker holds the lock).
+	// ── Worker lock file watcher ────────────────────────────────────────
+	// When the post-commit Worker is running, it holds
+	// `.jolli/jollimemory/worker.lock`. Disable Commit/Squash/Push buttons during
+	// this time to prevent race conditions (Bug 3: squash commit while previous
+	// Worker holds the lock).
+	//
+	// We deliberately watch only `worker.lock`, not the sibling
+	// `orphan-write.lock`. The orphan-write mutex is held for milliseconds at a
+	// time and exists to serialize concurrent orphan-branch writers; surfacing
+	// it as "worker busy" would flicker buttons every time a background scan
+	// writes a tree-hash alias. The split is the fix for the orphaned-queue-
+	// entry bug; pre-split, both roles shared a single `lock` file.
 	const lockWatcher = vscode.workspace.createFileSystemWatcher(
-		new vscode.RelativePattern(workspaceRoot, ".jolli/jollimemory/lock"),
+		new vscode.RelativePattern(workspaceRoot, ".jolli/jollimemory/worker.lock"),
 	);
 	const setWorkerBusy = (busy: boolean) => {
 		statusStore.setWorkerBusy(busy);

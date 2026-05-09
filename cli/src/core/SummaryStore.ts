@@ -60,22 +60,40 @@ const INDEX_FILE = "index.json";
 const CATALOG_FILE = "catalog.json";
 
 /**
- * Default wait budget for orphan-write lock when an orphan-branch write must
- * succeed (worker path). Kept generous because the lock is normally held only
- * for milliseconds — exhausting 5 s means a real fault, not normal contention.
+ * Wait budget for orphan-write lock on the worker path (writes that must land).
+ *
+ * 30 s is sized for the worst legitimate contention we expect: a fresh-install
+ * v1 → v3 migration on a large repository running concurrently with a commit
+ * (a few seconds of held lock). Normal background-scan contention is 50–200 ms,
+ * so 30 s leaves ~100× headroom.
+ *
+ * On timeout `withRequiredOrphanWriteLock` throws and the worker's outer
+ * `processQueueEntry` catch deletes the queue entry. We deliberately do NOT
+ * preserve the entry for retry: the cursor for read transcripts has already
+ * advanced past the relevant range by the time `storeSummary` is called
+ * (see `saveCursor` in QueueWorker), so a retried run would build a summary
+ * over the wrong transcript window — corrupt output is worse than missing
+ * output. This matches the system-wide "fire-and-forget, don't retry"
+ * philosophy documented at QueueWorker.runWorker's catch block.
+ *
+ * The probability of timing out at 30 s is far below other inherent failure
+ * modes (LLM call, network, user kill), so the practical loss risk is
+ * negligible.
  */
-const ORPHAN_WRITE_REQUIRED_TIMEOUT_MS = 5000;
+const ORPHAN_WRITE_REQUIRED_TIMEOUT_MS = 30_000;
 
 /**
- * Default wait budget for orphan-write lock on best-effort paths
- * (background scans, admin cleanup) where deferring is acceptable.
+ * Wait budget for orphan-write lock on best-effort paths (background scans,
+ * admin cleanup). 1 s is enough to ride out the typical 50–200 ms held
+ * window with margin; deferring on contention is acceptable because the
+ * caller will be re-invoked (next UI refresh, next admin run).
  */
 const ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS = 1000;
 
 /**
  * Acquires `orphan-write.lock` for a critical section that MUST land
- * (worker path). Throws on timeout — callers rely on the lock to avoid
- * lost-update races against background scans.
+ * (worker path). Throws on timeout — see `ORPHAN_WRITE_REQUIRED_TIMEOUT_MS`
+ * for why "lose this entry" is the chosen failure mode.
  */
 async function withRequiredOrphanWriteLock<T>(
 	cwd: string | undefined,
@@ -1182,26 +1200,29 @@ export async function scanTreeHashAliases(
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<boolean> {
-	const index = await loadIndex(cwd, storage);
-	if (!index || index.version !== 3) return false;
+	// ── Phase 1: preflight (no lock) ────────────────────────────────────────
+	// Compute candidate aliases against the current index. Tree-hash lookup is
+	// O(n) git calls — expensive — so we keep it outside the lock to avoid
+	// blocking concurrent worker writes. The lookup result is "tentative":
+	// Phase 2 re-validates against the freshly-loaded index inside the lock.
+	const preflightIndex = await loadIndex(cwd, storage);
+	if (!preflightIndex || preflightIndex.version !== 3) return false;
 
-	const existingAliases = { ...(index.commitAliases ?? {}) };
-	const entryHashSet = new Set(index.entries.map((e) => e.commitHash));
-	const entryMap = new Map(index.entries.map((e) => [e.commitHash, e]));
+	const preflightAliases = preflightIndex.commitAliases ?? {};
+	const preflightEntryHashSet = new Set(preflightIndex.entries.map((e) => e.commitHash));
+	const preflightEntryMap = new Map(preflightIndex.entries.map((e) => [e.commitHash, e]));
 
-	const newAliases: Record<string, string> = {};
-
+	const candidates: Record<string, string> = {};
 	for (const hash of commitHashes) {
-		// Skip if already known directly or via alias
-		if (entryHashSet.has(hash) || existingAliases[hash]) continue;
+		if (preflightEntryHashSet.has(hash) || preflightAliases[hash]) continue;
 
 		const treeHash = await getTreeHash(hash, cwd);
 		if (!treeHash) continue;
 
 		/* v8 ignore start -- tree hash match: requires real git repo with matching tree hashes */
-		const matchEntry = findShallowstByTreeHash(treeHash, index.entries, entryMap);
+		const matchEntry = findShallowstByTreeHash(treeHash, preflightIndex.entries, preflightEntryMap);
 		if (matchEntry) {
-			newAliases[hash] = matchEntry.commitHash;
+			candidates[hash] = matchEntry.commitHash;
 			log.info(
 				"Tree hash match: %s → %s (treeHash: %s)",
 				hash.substring(0, 8),
@@ -1212,29 +1233,54 @@ export async function scanTreeHashAliases(
 		/* v8 ignore stop */
 	}
 
-	if (Object.keys(newAliases).length === 0) return false;
+	if (Object.keys(candidates).length === 0) return false;
 
-	// Acquire orphan-write.lock before writing to the orphan branch.
-	// Background path: deferring is acceptable — the next UI refresh re-enters
-	// scanTreeHashAliases, which is why this used `log.warn` historically. The
-	// log level is now `debug` because deferral is the expected outcome under
-	// contention, not a warning condition.
+	// ── Phase 2: critical section (lock) ────────────────────────────────────
+	// Acquire orphan-write.lock and re-load the index. The previous
+	// implementation reused the preflight `index` object inside the lock, which
+	// caused a lost-update: a worker that wrote new entries after preflight but
+	// before our lock-acquire would see its `entries` clobbered when we wrote
+	// `{ ...preflightIndex, commitAliases }` back. Re-reading the freshly
+	// persisted index inside the lock and merging only `commitAliases` keeps
+	// the worker's `entries` intact.
+	//
+	// Background path: deferring is acceptable on contention — the next UI
+	// refresh re-enters scanTreeHashAliases. log.debug, not warn, because
+	// deferral is the expected outcome under contention.
 	const locked = await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS });
 	if (!locked) {
 		log.debug("scanTreeHashAliases: orphan-write lock contention — alias write deferred");
 		return false;
 	}
 	try {
-		const mergedAliases = { ...existingAliases, ...newAliases };
-		const newIndex: SummaryIndex = { ...index, commitAliases: mergedAliases };
+		const freshIndex = await loadIndex(cwd, storage);
+		if (!freshIndex || freshIndex.version !== 3) return false;
+
+		const freshAliases = freshIndex.commitAliases ?? {};
+		const freshEntryHashSet = new Set(freshIndex.entries.map((e) => e.commitHash));
+
+		// Drop candidates a concurrent writer has resolved (now in entries) or
+		// already aliased; only persist ones still genuinely missing.
+		const finalAliases: Record<string, string> = { ...freshAliases };
+		let added = 0;
+		for (const [aliasHash, targetHash] of Object.entries(candidates)) {
+			if (freshEntryHashSet.has(aliasHash)) continue;
+			if (finalAliases[aliasHash]) continue;
+			finalAliases[aliasHash] = targetHash;
+			added++;
+		}
+		if (added === 0) return false;
+
+		// Build newIndex from freshIndex (not preflightIndex) so any entries the
+		// worker added between preflight and lock-acquire are preserved.
+		const newIndex: SummaryIndex = { ...freshIndex, commitAliases: finalAliases };
 		const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
 		const store = resolveStorage(storage, cwd);
-		await store.writeFiles(files, `Add ${Object.keys(newAliases).length} tree hash alias(es)`);
+		await store.writeFiles(files, `Add ${added} tree hash alias(es)`);
+		return true;
 	} finally {
 		await releaseOrphanWriteLock(cwd);
 	}
-
-	return true;
 }
 
 /**

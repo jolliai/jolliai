@@ -1897,7 +1897,8 @@ describe("SummaryStore", () => {
 				],
 				{ knownAlias: "root1" },
 			);
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
+			// scanTreeHashAliases reads twice: preflight (no lock) + inside-lock re-read.
+			vi.mocked(readFileFromBranch).mockResolvedValue(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
 			const result = await scanTreeHashAliases(["unknown1", "root1", "knownAlias"]);
@@ -1947,7 +1948,8 @@ describe("SummaryStore", () => {
 				{ ...rootEntry("older-root", "Older", "2026-02-18T10:00:00Z"), treeHash: "tree-1" },
 				{ ...rootEntry("newer-root", "Newer", "2026-02-19T10:00:00Z"), treeHash: "tree-1" },
 			]);
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
+			// scanTreeHashAliases reads twice: preflight + inside-lock re-read.
+			vi.mocked(readFileFromBranch).mockResolvedValue(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
 			const result = await scanTreeHashAliases(["unknown1"]);
@@ -1983,7 +1985,8 @@ describe("SummaryStore", () => {
 					treeHash: "tree-1",
 				},
 			]);
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
+			// scanTreeHashAliases reads twice: preflight + inside-lock re-read.
+			vi.mocked(readFileFromBranch).mockResolvedValue(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
 			const result = await scanTreeHashAliases(["unknown1"]);
@@ -2015,7 +2018,8 @@ describe("SummaryStore", () => {
 					treeHash: "tree-1",
 				},
 			]);
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
+			// scanTreeHashAliases reads twice: preflight + inside-lock re-read.
+			vi.mocked(readFileFromBranch).mockResolvedValue(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
 			const result = await scanTreeHashAliases(["unknown1"]);
@@ -2024,6 +2028,92 @@ describe("SummaryStore", () => {
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const persistedIndex = JSON.parse(files[0].content) as SummaryIndex;
 			expect(persistedIndex.commitAliases).toEqual({ unknown1: "cycle-newer" });
+		});
+
+		// ── regression: lost-update race ─────────────────────────────────────
+		//
+		// Before this fix, scanTreeHashAliases read `index` outside the lock,
+		// computed `newAliases`, then acquired the lock and wrote
+		// `{ ...index, commitAliases: mergedAliases }`. If the worker wrote a
+		// new entry to `index.entries` between scan's preflight read and scan's
+		// lock-acquire, the worker's entry would be clobbered when scan wrote
+		// back its stale `entries`. The fix re-reads inside the lock and merges
+		// only `commitAliases` into the fresh index, preserving any entries the
+		// worker added concurrently.
+		it("preserves worker-written entries that landed between preflight and lock acquire", async () => {
+			const preflightIdx = v3Index(
+				[{ ...rootEntry("root1", "Root", "2026-02-18T10:00:00Z"), treeHash: "tree-1" }],
+				{},
+			);
+			// Simulates a worker that ran storeSummary between scan's preflight
+			// read and scan's inside-lock re-read: a brand-new root entry has
+			// landed in the index.
+			const freshIdx = v3Index(
+				[
+					{ ...rootEntry("root1", "Root", "2026-02-18T10:00:00Z"), treeHash: "tree-1" },
+					{ ...rootEntry("worker-new", "Worker added me", "2026-02-19T11:00:00Z"), treeHash: "tree-2" },
+				],
+				{},
+			);
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(JSON.stringify(preflightIdx)) // preflight (no lock)
+				.mockResolvedValueOnce(JSON.stringify(freshIdx)); // inside-lock re-read
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
+
+			const result = await scanTreeHashAliases(["unknown1"]);
+
+			expect(result).toBe(true);
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const persistedIndex = JSON.parse(files[0].content) as SummaryIndex;
+
+			// Critical assertion: the worker's new entry must survive scan's write.
+			const persistedHashes = persistedIndex.entries.map((e) => e.commitHash);
+			expect(persistedHashes).toContain("root1");
+			expect(persistedHashes).toContain("worker-new");
+			// And scan's alias is recorded.
+			expect(persistedIndex.commitAliases).toEqual({ unknown1: "root1" });
+		});
+
+		it("drops a candidate that was already aliased by a concurrent writer", async () => {
+			// Preflight: unknown1 is unaliased; tree-1 matches root1.
+			const preflightIdx = v3Index([{ ...rootEntry("root1", "Root"), treeHash: "tree-1" }], {});
+			// Fresh: a concurrent scan/writer already aliased unknown1 → root1.
+			const freshIdx = v3Index([{ ...rootEntry("root1", "Root"), treeHash: "tree-1" }], {
+				unknown1: "root1",
+			});
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(JSON.stringify(preflightIdx))
+				.mockResolvedValueOnce(JSON.stringify(freshIdx));
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
+
+			const result = await scanTreeHashAliases(["unknown1"]);
+
+			// Already-aliased → nothing new to write.
+			expect(result).toBe(false);
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("drops a candidate whose hash already exists as an entry in the fresh index", async () => {
+			// Preflight: unknown1 is missing entirely.
+			const preflightIdx = v3Index([{ ...rootEntry("root1", "Root"), treeHash: "tree-1" }], {});
+			// Fresh: a concurrent worker stored a real summary for unknown1
+			// (it is now a first-class entry, no alias needed).
+			const freshIdx = v3Index(
+				[
+					{ ...rootEntry("root1", "Root"), treeHash: "tree-1" },
+					{ ...rootEntry("unknown1", "Worker stored me", "2026-02-19T11:00:00Z"), treeHash: "tree-9" },
+				],
+				{},
+			);
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(JSON.stringify(preflightIdx))
+				.mockResolvedValueOnce(JSON.stringify(freshIdx));
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
+
+			const result = await scanTreeHashAliases(["unknown1"]);
+
+			expect(result).toBe(false);
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 	});
 
