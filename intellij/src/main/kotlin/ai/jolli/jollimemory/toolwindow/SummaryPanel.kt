@@ -1,6 +1,7 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.bridge.GitOps
+import ai.jolli.jollimemory.bridge.GitRemoteUtils
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.E2eTestScenario
 import ai.jolli.jollimemory.core.SessionTracker
@@ -251,7 +252,7 @@ class SummaryPanel(
         clipboard.setContents(StringSelection(markdown), null)
     }
 
-    private fun handlePushToJolli() {
+    private fun handlePushToJolli(retried: Boolean = false) {
         val summary = currentSummary
         val config = SessionTracker.loadConfig(cwd)
         if (config.jolliApiKey.isNullOrBlank()) {
@@ -274,6 +275,9 @@ class SummaryPanel(
         postToWebview("pushStarted")
         val baseUrl = resolvedBaseUrl.trimEnd('/')
 
+        val repoUrl = GitRemoteUtils.getCanonicalRepoUrl(cwd)
+        val relativePath = GitRemoteUtils.sanitizeBranchSlug(summary.branch)
+
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val planUrls = mutableListOf<PlanPushResult>()
@@ -286,9 +290,11 @@ class SummaryPanel(
                         title = SummaryUtils.buildPlanPushTitle(summary, plan.title),
                         content = planContent,
                         commitHash = summary.commitHash,
+                        docType = "plan",
                         branch = summary.branch,
-                        subFolder = "Plans",
                         docId = plan.jolliPlanDocId,
+                        repoUrl = repoUrl,
+                        relativePath = relativePath,
                     ))
                     planUrls.add(PlanPushResult(plan.slug, plan.title, "$baseUrl/articles?doc=${planResult.docId}", planResult.docId))
                 }
@@ -308,7 +314,9 @@ class SummaryPanel(
 
                 val result = JolliApiClient.pushToJolli(resolvedBaseUrl, config.jolliApiKey!!, JolliApiClient.JolliPushPayload(
                     title = pushTitle, content = markdown, commitHash = summary.commitHash,
+                    docType = "summary",
                     branch = summary.branch, docId = summary.jolliDocId,
+                    repoUrl = repoUrl, relativePath = relativePath,
                 ))
 
                 val fullUrl = "$baseUrl/articles?doc=${result.docId}"
@@ -334,6 +342,15 @@ class SummaryPanel(
                     val planMsg = if (planUrls.isNotEmpty()) " (with ${planUrls.size} plan${if (planUrls.size > 1) "s" else ""})" else ""
                     Messages.showInfoMessage(project, "$verb on Jolli Space$planMsg.", "Push Successful")
                 }
+            } catch (e: JolliApiClient.BindingRequiredError) {
+                if (retried) {
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("pushFailed")
+                        Messages.showErrorDialog(project, "Push failed: binding still not found after retry. Please try again.", "Push Error")
+                    }
+                } else {
+                    handleBindingRequired(e.repoUrl, resolvedBaseUrl, config.jolliApiKey!!)
+                }
             } catch (e: JolliApiClient.PluginOutdatedError) {
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("pushFailed")
@@ -343,6 +360,56 @@ class SummaryPanel(
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("pushFailed")
                     Messages.showErrorDialog(project, "Push failed: ${e.message}", "Push Error")
+                }
+            }
+        }
+    }
+
+    /**
+     * Handles a 412 binding_required error: fetches available spaces on the
+     * current background thread, then switches to the UI thread to show the
+     * chooser dialog. If the user picks a space, retries the push.
+     */
+    private fun handleBindingRequired(repoUrl: String, baseUrl: String, apiKey: String) {
+        val spacesResult = try {
+            JolliApiClient.listSpaces(baseUrl, apiKey)
+        } catch (e: Exception) {
+            ApplicationManager.getApplication().invokeLater {
+                postToWebview("pushFailed")
+                Messages.showErrorDialog(project, "Failed to load Memory spaces: ${e.message}", "Push Error")
+            }
+            return
+        }
+
+        val suggestedRepoName = GitRemoteUtils.deriveRepoNameFromUrl(repoUrl).ifEmpty { "repo" }
+
+        ApplicationManager.getApplication().invokeLater {
+            if (BindingChooserDialog.isAlreadyOpen(repoUrl)) {
+                postToWebview("pushFailed")
+                Messages.showInfoMessage(project, "A binding chooser is already open for this repo. Finish there, then push again.", "Chooser Already Open")
+                return@invokeLater
+            }
+
+            val dialog = BindingChooserDialog.open(
+                project, repoUrl, suggestedRepoName,
+                spacesResult.spaces, spacesResult.defaultSpaceId,
+                baseUrl, apiKey,
+            )
+            LOG.info("handleBindingRequired: showing chooser dialog (repoUrl=$repoUrl)")
+            dialog.show()
+            LOG.info("handleBindingRequired: dialog.show() returned; outcome=${dialog.getOutcome()}")
+
+            when (dialog.getOutcome()) {
+                is BindingChooserOutcome.Selected -> {
+                    handlePushToJolli(retried = true)
+                }
+                is BindingChooserOutcome.Cancelled -> {
+                    postToWebview("pushFailed")
+                    Messages.showInfoMessage(project, "Push cancelled — no Memory space was selected.", "Push Cancelled")
+                }
+                is BindingChooserOutcome.AnotherOpen -> {
+                    postToWebview("pushFailed")
+                    Messages.showInfoMessage(project, "A binding chooser is already open for this repo. Finish there, then push again.", "Chooser Already Open")
                 }
             }
         }

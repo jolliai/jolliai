@@ -126,6 +126,9 @@ object JolliAuthService {
                         return@createContext
                     }
 
+                    val paramKeys = params.keys.sorted().joinToString(", ")
+                    log.info("Callback params received: [%s]", paramKeys)
+
                     val error = params["error"]
                     if (error != null) {
                         val message = getErrorMessage(error)

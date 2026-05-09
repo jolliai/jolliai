@@ -106,10 +106,10 @@ class JolliApiClientTest {
 
     @Nested
     inner class ParseResponse {
-        private fun parseResponse(raw: String, statusCode: Int): Any {
-            val method: Method = JolliApiClient::class.java.getDeclaredMethod("parseResponse", String::class.java, Int::class.javaPrimitiveType)
+        private fun parseResponse(raw: String, statusCode: Int, payloadRepoUrl: String? = null): Any {
+            val method: Method = JolliApiClient::class.java.getDeclaredMethod("parseResponse", String::class.java, Int::class.javaPrimitiveType, String::class.java)
             method.isAccessible = true
-            return method.invoke(JolliApiClient, raw, statusCode)
+            return method.invoke(JolliApiClient, raw, statusCode, payloadRepoUrl)
         }
 
         @Test
@@ -163,10 +163,11 @@ class JolliApiClientTest {
 
     @Test
     fun `JolliPushPayload has correct defaults`() {
-        val payload = JolliApiClient.JolliPushPayload("Test", "Content", "abc123")
+        val payload = JolliApiClient.JolliPushPayload("Test", "Content", "abc123", "summary")
         payload.branch shouldBe null
-        payload.subFolder shouldBe null
         payload.docId shouldBe null
+        payload.repoUrl shouldBe null
+        payload.relativePath shouldBe null
     }
 
     @Test

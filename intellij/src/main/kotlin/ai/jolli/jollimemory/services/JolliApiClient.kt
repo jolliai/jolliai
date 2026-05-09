@@ -76,9 +76,11 @@ object JolliApiClient {
         val title: String,
         val content: String,
         val commitHash: String,
+        val docType: String,
         val branch: String? = null,
-        val subFolder: String? = null,
         val docId: Int? = null,
+        val repoUrl: String? = null,
+        val relativePath: String? = null,
     )
 
     /** Response from a successful push. */
@@ -103,6 +105,12 @@ object JolliApiClient {
 
     /** Thrown when the server rejects the request due to outdated plugin version (HTTP 426). */
     class PluginOutdatedError(message: String) : RuntimeException(message)
+
+    /** Thrown when the server returns 412 because the repo has no space binding yet. */
+    class BindingRequiredError(
+        val repoUrl: String,
+        message: String = "This repo is not bound to a Memory space yet.",
+    ) : RuntimeException(message)
 
     /**
      * Parsed base URL with optional tenant slug extracted from the path.
@@ -197,7 +205,7 @@ object JolliApiClient {
         val raw = response.body() ?: ""
         val statusCode = response.statusCode()
 
-        return parseResponse(raw, statusCode)
+        return parseResponse(raw, statusCode, payload.repoUrl)
     }
 
     /**
@@ -311,6 +319,165 @@ object JolliApiClient {
         }
     }
 
+    // ── JM Space Binding endpoints (JOLLI-1335) ──────────────────────────
+
+    /** Result of GET /api/jolli-memory/spaces. */
+    data class JmSpacesListResult(
+        val spaces: List<ai.jolli.jollimemory.toolwindow.JmSpaceSummary>,
+        val defaultSpaceId: Int?,
+    )
+
+    /**
+     * GET /api/jolli-memory/spaces
+     *
+     * Lists existing JolliMemory spaces visible to the authenticated user.
+     * Accepts both a flat array body and a `{ spaces, defaultSpaceId }` envelope
+     * from the server (the flat form yields `defaultSpaceId = null`).
+     */
+    fun listSpaces(baseUrl: String, apiKey: String): JmSpacesListResult {
+        val keyMeta = parseJolliApiKey(apiKey)
+        val parsed = parseBaseUrl(baseUrl)
+        val targetUri = URI.create("${parsed.origin}/api/jolli-memory/spaces")
+
+        val requestBuilder = HttpRequest.newBuilder()
+            .uri(targetUri)
+            .header("Authorization", "Bearer $apiKey")
+            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
+            .GET()
+            .timeout(Duration.ofSeconds(30))
+
+        if (parsed.tenantSlug != null) {
+            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        }
+        if (keyMeta?.o != null) {
+            requestBuilder.header("x-org-slug", keyMeta.o)
+        }
+
+        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+        val raw = response.body() ?: ""
+        val statusCode = response.statusCode()
+
+        if (statusCode == 426) {
+            throw PluginOutdatedError("Plugin version is outdated. Please update to the latest version.")
+        }
+        if (statusCode !in 200..299) {
+            throw RuntimeException("Failed to list spaces (HTTP $statusCode): ${raw.take(200)}")
+        }
+
+        return try {
+            val element = gson.fromJson(raw, com.google.gson.JsonElement::class.java)
+            if (element.isJsonArray) {
+                val spaces = element.asJsonArray.map { el ->
+                    val obj = el.asJsonObject
+                    ai.jolli.jollimemory.toolwindow.JmSpaceSummary(
+                        id = obj.get("id").asInt,
+                        name = obj.get("name").asString,
+                        slug = obj.get("slug").asString,
+                    )
+                }
+                JmSpacesListResult(spaces, defaultSpaceId = null)
+            } else {
+                val obj = element.asJsonObject
+                val spacesArr = obj.getAsJsonArray("spaces") ?: com.google.gson.JsonArray()
+                val spaces = spacesArr.map { el ->
+                    val s = el.asJsonObject
+                    ai.jolli.jollimemory.toolwindow.JmSpaceSummary(
+                        id = s.get("id").asInt,
+                        name = s.get("name").asString,
+                        slug = s.get("slug").asString,
+                    )
+                }
+                val defaultId = obj.get("defaultSpaceId")?.takeIf { it.isJsonPrimitive }?.asInt
+                JmSpacesListResult(spaces, defaultSpaceId = defaultId)
+            }
+        } catch (_: Exception) {
+            throw RuntimeException("Invalid JSON from list-spaces (HTTP $statusCode): ${raw.take(200)}")
+        }
+    }
+
+    /**
+     * POST /api/jolli-memory/bindings
+     *
+     * Binds a repo to a JM space. On success returns the binding info.
+     * Throws [ai.jolli.jollimemory.toolwindow.BindingAlreadyExistsException]
+     * on 409 when another user already bound the same repo (race condition).
+     */
+    fun createBinding(
+        baseUrl: String,
+        apiKey: String,
+        repoUrl: String,
+        repoName: String,
+        jmSpaceId: Int,
+    ): ai.jolli.jollimemory.toolwindow.BindingChooserResult {
+        val keyMeta = parseJolliApiKey(apiKey)
+        val parsed = parseBaseUrl(baseUrl)
+        val targetUri = URI.create("${parsed.origin}/api/jolli-memory/bindings")
+
+        val body = gson.toJson(mapOf(
+            "repoUrl" to repoUrl,
+            "repoName" to repoName,
+            "jmSpaceId" to jmSpaceId,
+        ))
+
+        val requestBuilder = HttpRequest.newBuilder()
+            .uri(targetUri)
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer $apiKey")
+            .header("x-jolli-client", "intellij-plugin/$pluginVersion")
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .timeout(Duration.ofSeconds(30))
+
+        if (parsed.tenantSlug != null) {
+            requestBuilder.header("x-tenant-slug", parsed.tenantSlug)
+        }
+        if (keyMeta?.o != null) {
+            requestBuilder.header("x-org-slug", keyMeta.o)
+        }
+
+        val response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+        val raw = response.body() ?: ""
+        val statusCode = response.statusCode()
+
+        if (statusCode == 426) {
+            throw PluginOutdatedError("Plugin version is outdated. Please update to the latest version.")
+        }
+
+        return try {
+            @Suppress("UNCHECKED_CAST")
+            val json = gson.fromJson(raw, Map::class.java) as Map<String, Any?>
+
+            if (statusCode == 409 && json["error"] == "binding_already_exists") {
+                throw ai.jolli.jollimemory.toolwindow.BindingAlreadyExistsException(
+                    ai.jolli.jollimemory.toolwindow.BindingChooserResult(
+                        id = (json["id"] as? Double)?.toInt() ?: 0,
+                        jmSpaceId = (json["jmSpaceId"] as? Double)?.toInt() ?: 0,
+                        jmSpaceName = json["jmSpaceName"] as? String ?: "",
+                        repoName = json["repoName"] as? String ?: "",
+                    ),
+                )
+            }
+
+            if (statusCode !in 200..299) {
+                throw RuntimeException(json["error"] as? String ?: "HTTP $statusCode")
+            }
+
+            ai.jolli.jollimemory.toolwindow.BindingChooserResult(
+                id = (json["id"] as? Double)?.toInt() ?: 0,
+                jmSpaceId = (json["jmSpaceId"] as? Double)?.toInt() ?: 0,
+                jmSpaceName = json["jmSpaceName"] as? String ?: "",
+                repoName = json["repoName"] as? String ?: "",
+            )
+        } catch (e: ai.jolli.jollimemory.toolwindow.BindingAlreadyExistsException) {
+            throw e
+        } catch (e: PluginOutdatedError) {
+            throw e
+        } catch (e: RuntimeException) {
+            throw e
+        } catch (_: Exception) {
+            throw RuntimeException("Invalid JSON from create-binding (HTTP $statusCode): ${raw.take(200)}")
+        }
+    }
+
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /**
@@ -331,7 +498,7 @@ object JolliApiClient {
     }
 
     /** Parses a push response, handling errors and status codes. */
-    private fun parseResponse(raw: String, statusCode: Int): JolliPushResult {
+    private fun parseResponse(raw: String, statusCode: Int, payloadRepoUrl: String? = null): JolliPushResult {
         return try {
             @Suppress("UNCHECKED_CAST")
             val json = gson.fromJson(raw, Map::class.java) as Map<String, Any?>
@@ -343,6 +510,10 @@ object JolliApiClient {
                     jrn = json["jrn"] as? String ?: "",
                     created = json["created"] as? Boolean ?: false,
                 )
+            } else if (statusCode == 412 && json["error"] == "binding_required") {
+                throw BindingRequiredError(
+                    repoUrl = json["repoUrl"] as? String ?: payloadRepoUrl ?: "",
+                )
             } else if (statusCode == 426) {
                 throw PluginOutdatedError(
                     json["message"] as? String
@@ -353,6 +524,8 @@ object JolliApiClient {
                     json["error"] as? String ?: "HTTP $statusCode"
                 )
             }
+        } catch (e: BindingRequiredError) {
+            throw e
         } catch (e: PluginOutdatedError) {
             throw e
         } catch (e: RuntimeException) {
