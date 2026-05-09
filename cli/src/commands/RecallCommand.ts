@@ -16,8 +16,9 @@ import { execFileSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { type Command, Option } from "commander";
-import type { BranchCatalog, ContextOutput } from "../core/ContextCompiler.js";
+import type { BranchCatalog } from "../core/ContextCompiler.js";
 import {
+	buildRecallPayload,
 	compileTaskContext,
 	DEFAULT_TOKEN_BUDGET,
 	listBranchCatalog,
@@ -212,15 +213,13 @@ async function outputRecall(
 		return;
 	}
 
-	// Output path 2: --format json -> full JSON for skill/agent consumption
+	// Output path 2: --format json -> structured RecallPayload for skill/agent
+	// consumption. The skill template's LLM does its own grounded synthesis
+	// from the structured fields; we deliberately do NOT pre-render markdown
+	// here (it would tempt the LLM back into paraphrase mode).
 	if (options.format === "json") {
-		const markdown = renderContextMarkdown(ctx, options.budget ?? DEFAULT_TOKEN_BUDGET);
-		const output: ContextOutput = {
-			type: "recall",
-			stats: ctx.stats,
-			renderedMarkdown: markdown,
-		};
-		console.log(JSON.stringify(output, null, 2));
+		const payload = buildRecallPayload(ctx, options.budget ?? DEFAULT_TOKEN_BUDGET);
+		console.log(JSON.stringify(payload, null, 2));
 		return;
 	}
 

@@ -25,15 +25,14 @@ import type {
 	SearchCatalogEntry,
 	SearchCatalogTopic,
 	SearchHit,
-	SearchHitTopic,
 	SearchResult,
 } from "./Search.js";
 import { DEFAULT_CATALOG_LIMIT, DEFAULT_SEARCH_BUDGET } from "./Search.js";
 import type { SearchProvider, SearchSource } from "./SearchProvider.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { getDisplayDate } from "./SummaryFormat.js";
+import { buildHit } from "./SummaryProjection.js";
 import { AmbiguousHashError, getCatalogWithLazyBuild, getIndex, getSummary } from "./SummaryStore.js";
-import { collectDisplayTopics } from "./SummaryTree.js";
 import { estimateTokens } from "./TokenEstimator.js";
 
 const log = createLogger("LocalSearchProvider");
@@ -310,42 +309,5 @@ function trimEntry(entry: SearchCatalogEntry): SearchCatalogEntry {
 	};
 }
 
-/**
- * Projects a full `CommitSummary` down to a `SearchHit`. Walks the v3 tree via
- * `collectDisplayTopics` so embedded children (legacy squash nests) are
- * resolved before being copied into the hit's `topics[]`.
- *
- * Drops internal metadata (`generatedAt` / `commitSource` / `transcriptEntries`
- * / `conversationTurns` / `llm` / `treeHash` / `jolliDocId/Url` /
- * `orphanedDocIds`) and large payloads with no search value
- * (`e2eTestGuide` / `plans` / `notes`). See SearchHit doc for the rationale.
- */
-function buildHit(summary: CommitSummary): SearchHit {
-	const topics = collectDisplayTopics(summary).map(
-		(t) =>
-			({
-				title: t.title,
-				trigger: t.trigger,
-				response: t.response,
-				decisions: t.decisions,
-				...(t.todo !== undefined && { todo: t.todo }),
-				...(t.filesAffected && t.filesAffected.length > 0 && { filesAffected: t.filesAffected }),
-				...(t.category !== undefined && { category: t.category }),
-				...(t.importance !== undefined && { importance: t.importance }),
-			}) satisfies SearchHitTopic,
-	);
-
-	return {
-		hash: summary.commitHash.substring(0, 8),
-		fullHash: summary.commitHash,
-		commitMessage: summary.commitMessage,
-		commitAuthor: summary.commitAuthor,
-		commitDate: summary.commitDate,
-		branch: summary.branch,
-		...(summary.commitType !== undefined && { commitType: summary.commitType }),
-		...(summary.ticketId && { ticketId: summary.ticketId }),
-		...(summary.diffStats !== undefined && { diffStats: summary.diffStats }),
-		...(summary.recap && { recap: summary.recap }),
-		topics,
-	};
-}
+// `buildHit` lives in SummaryProjection.ts so jolli-recall and jolli-search
+// share the exact same projection contract; see that module's doc for why.

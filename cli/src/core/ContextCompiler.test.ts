@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommitSummary, SummaryIndex } from "../Types.js";
-import { compileTaskContext, estimateTokens, listBranchCatalog, renderContextMarkdown } from "./ContextCompiler.js";
+import {
+	buildRecallPayload,
+	type CompiledContext,
+	compileTaskContext,
+	estimateTokens,
+	listBranchCatalog,
+	renderContextMarkdown,
+} from "./ContextCompiler.js";
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
@@ -1126,5 +1133,619 @@ describe("compileTaskContext — additional coverage", () => {
 
 		const ctx = await compileTaskContext({ branch: "feature/test" }, "/test");
 		expect(ctx.commitCount).toBe(1);
+	});
+});
+
+// ─── buildRecallPayload ──────────────────────────────────────────────────────
+
+describe("buildRecallPayload", () => {
+	function makeCtx(overrides: Partial<CompiledContext> = {}): CompiledContext {
+		return {
+			branch: "feature/test",
+			period: { start: "2026-03-01", end: "2026-03-15" },
+			commitCount: 1,
+			totalFilesChanged: 3,
+			totalInsertions: 100,
+			totalDeletions: 20,
+			summaries: [makeSummary()],
+			plans: [],
+			notes: [],
+			keyDecisions: [],
+			stats: {
+				topicCount: 1,
+				planCount: 0,
+				noteCount: 0,
+				decisionCount: 0,
+				topicTokens: 50,
+				planTokens: 0,
+				noteTokens: 0,
+				decisionTokens: 0,
+				transcriptTokens: 0,
+				totalTokens: 50,
+			},
+			...overrides,
+		};
+	}
+
+	it("projects each summary into a SearchHit and ships full payload at wide budget", () => {
+		const payload = buildRecallPayload(makeCtx(), 100_000);
+		expect(payload.type).toBe("recall");
+		expect(payload.commits).toHaveLength(1);
+		expect(payload.commits[0].fullHash).toBe("abc12345def67890");
+		expect(payload.commits[0].topics[0].decisions).toBe("Used factory pattern for extensibility");
+		expect(payload.truncated).toBeUndefined();
+	});
+
+	it("ships plans and notes top-level with content when budget allows", () => {
+		const payload = buildRecallPayload(
+			makeCtx({
+				plans: [{ slug: "p1", title: "P1", content: "plan body" }],
+				notes: [{ id: "n1", title: "N1", content: "note body" }],
+			}),
+			100_000,
+		);
+		expect(payload.plans[0]).toEqual({ slug: "p1", title: "P1", content: "plan body" });
+		expect(payload.notes[0]).toEqual({ id: "n1", title: "N1", content: "note body" });
+	});
+
+	it("under tight budget drops topic.response first (preserves trigger and decisions)", () => {
+		// Build a 4-commit ctx where the response field carries most of the bytes.
+		const summaries = [1, 2, 3, 4].map((i) =>
+			makeSummary({
+				commitHash: `aaaaaaaa00000000000000000000000000000000${i}`.slice(0, 40),
+				topics: [
+					{
+						title: `T${i}`,
+						trigger: `trig-${i}`,
+						response: "X".repeat(2000),
+						decisions: `dec-${i}`,
+					},
+				],
+			}),
+		);
+		const payload = buildRecallPayload(makeCtx({ summaries, commitCount: 4 }), 1500);
+		expect(payload.truncated).toBe(true);
+		// Older commits should have lost response first; decisions stays.
+		const oldest = payload.commits[0];
+		expect(oldest.topics[0].response).toBeUndefined();
+		expect(oldest.topics[0].decisions).toBeDefined();
+	});
+
+	it("escalates to dropping topic.trigger after response is gone", () => {
+		const summaries = [1, 2].map((i) =>
+			makeSummary({
+				commitHash: `bbbbbbbb00000000000000000000000000000000${i}`.slice(0, 40),
+				topics: [
+					{
+						title: `T${i}`,
+						trigger: "Y".repeat(1500),
+						response: "X".repeat(1500),
+						decisions: `dec-${i}`,
+					},
+				],
+			}),
+		);
+		const payload = buildRecallPayload(makeCtx({ summaries, commitCount: 2 }), 600);
+		expect(payload.truncated).toBe(true);
+		const oldest = payload.commits[0];
+		// Both verbose fields are gone; decisions remains.
+		expect(oldest.topics[0].response).toBeUndefined();
+		expect(oldest.topics[0].trigger).toBeUndefined();
+		expect(oldest.topics[0].decisions).toBeDefined();
+	});
+
+	it("drops plans[].content (keeps slug + title) before evicting commits", () => {
+		const payload = buildRecallPayload(
+			makeCtx({
+				plans: [{ slug: "p1", title: "P1", content: "Z".repeat(4000) }],
+			}),
+			500,
+		);
+		expect(payload.truncated).toBe(true);
+		// Plan entry survives as a citation anchor without content.
+		expect(payload.plans).toHaveLength(1);
+		expect(payload.plans[0]).toEqual({ slug: "p1", title: "P1" });
+	});
+
+	it("drops notes[].content (keeps id + title) under similar pressure", () => {
+		const payload = buildRecallPayload(
+			makeCtx({
+				notes: [{ id: "n1", title: "N1", content: "Z".repeat(4000) }],
+			}),
+			500,
+		);
+		expect(payload.truncated).toBe(true);
+		expect(payload.notes).toHaveLength(1);
+		expect(payload.notes[0]).toEqual({ id: "n1", title: "N1" });
+	});
+
+	it("evicts oldest commits wholesale when budget can't fit decisions", () => {
+		// Make every commit's decisions field huge so trim steps 1-4 don't help.
+		const summaries = [1, 2, 3].map((i) =>
+			makeSummary({
+				commitHash: `cccccccc00000000000000000000000000000000${i}`.slice(0, 40),
+				topics: [
+					{
+						title: `T${i}`,
+						trigger: `t${i}`,
+						response: `r${i}`,
+						decisions: "D".repeat(2000),
+					},
+				],
+			}),
+		);
+		const payload = buildRecallPayload(makeCtx({ summaries, commitCount: 3 }), 1200);
+		expect(payload.truncated).toBe(true);
+		expect(payload.commits.length).toBeLessThan(3);
+		// Every kept commit still has decisions on every topic — type contract honored.
+		for (const hit of payload.commits) {
+			for (const t of hit.topics) {
+				expect(t.decisions).toBeDefined();
+			}
+		}
+	});
+
+	// Coverage for the defensive early-return inside the response/trigger trim
+	// loops: when buildHit projection emits a topic without response/trigger
+	// (e.g. corrupt input where TopicSummary.response is missing), the trim step
+	// must skip it instead of double-counting `truncated`.
+	it("skips topics that already lack response when trim Step 1 runs", () => {
+		// Craft a summary whose topic genuinely lacks response/trigger by casting.
+		// buildHit's conditional spread propagates the absence to the SearchHit.
+		const summary = makeSummary({
+			commitHash: "ffffffff00000000000000000000000000000000",
+			topics: [
+				{
+					title: "T1",
+					// biome-ignore lint/suspicious/noExplicitAny: deliberately omitting required field for trim coverage
+					trigger: undefined as any,
+					// biome-ignore lint/suspicious/noExplicitAny: deliberately omitting required field for trim coverage
+					response: undefined as any,
+					decisions: "D".repeat(8000),
+				},
+				{ title: "T2", trigger: "tt", response: "X".repeat(8000), decisions: "dd" },
+			],
+		});
+		const payload = buildRecallPayload(makeCtx({ summaries: [summary], commitCount: 1 }), 2500);
+		expect(payload.truncated).toBe(true);
+		expect(payload.commits).toHaveLength(1);
+		// T2's response was the long field — it should be the one stripped, while
+		// T1 (which had no response in the first place) is left alone (early-return).
+		expect(payload.commits[0].topics[0].response).toBeUndefined();
+		expect(payload.commits[0].topics[1].response).toBeUndefined();
+	});
+
+	it("skips topics that already lack trigger when trim Step 2 runs", () => {
+		// Force both Step 1 and Step 2 to fire on the same commit. Topic 1 has no
+		// trigger, so Step 2's early-return branch fires for it; topic 2's
+		// trigger is the long field that must be stripped to fit budget.
+		const summary = makeSummary({
+			commitHash: "ffffeeee00000000000000000000000000000000",
+			topics: [
+				{
+					title: "T1",
+					// biome-ignore lint/suspicious/noExplicitAny: deliberately omitting required field for trim coverage
+					trigger: undefined as any,
+					response: "X".repeat(8000),
+					decisions: "A".repeat(1500),
+				},
+				{
+					title: "T2",
+					trigger: "B".repeat(2000),
+					response: "Y".repeat(8000),
+					decisions: "A".repeat(1500),
+				},
+			],
+		});
+		// Budget chosen so Step 1 (drop response) leaves us still over budget,
+		// forcing Step 2 (drop trigger) to fire.
+		const payload = buildRecallPayload(makeCtx({ summaries: [summary], commitCount: 1 }), 1100);
+		expect(payload.truncated).toBe(true);
+		expect(payload.commits).toHaveLength(1);
+		expect(payload.commits[0].topics[0].response).toBeUndefined();
+		expect(payload.commits[0].topics[1].response).toBeUndefined();
+		expect(payload.commits[0].topics[0].trigger).toBeUndefined();
+		expect(payload.commits[0].topics[1].trigger).toBeUndefined();
+	});
+
+	// Same defensive guard for the plan/note content trim steps. When a plan
+	// arrives without content (e.g. the orphan branch read returned empty),
+	// the trim step must skip it without flipping `truncated` for nothing.
+	it("skips plans/notes that already lack content when trim Step 3/4 runs", () => {
+		// Build a heavy ctx so we deterministically reach steps 3 and 4. Mix one
+		// content-bearing plan with one already-empty plan; same for notes.
+		const summary = makeSummary({
+			commitHash: "ffffffff10000000000000000000000000000000",
+			topics: [{ title: "T", trigger: "t", response: "r", decisions: "d" }],
+		});
+		const payload = buildRecallPayload(
+			makeCtx({
+				summaries: [summary],
+				commitCount: 1,
+				plans: [
+					{ slug: "p1", title: "P1", content: "Z".repeat(2000) },
+					// biome-ignore lint/suspicious/noExplicitAny: deliberately omitting content for trim coverage
+					{ slug: "p2", title: "P2", content: undefined as any },
+				],
+				notes: [
+					{ id: "n1", title: "N1", content: "Y".repeat(2000) },
+					// biome-ignore lint/suspicious/noExplicitAny: deliberately omitting content for trim coverage
+					{ id: "n2", title: "N2", content: undefined as any },
+				],
+			}),
+			500,
+		);
+		expect(payload.truncated).toBe(true);
+		// Both plans survive, both with content stripped (p2 was already absent).
+		expect(payload.plans).toHaveLength(2);
+		expect(payload.plans.find((p) => p.slug === "p1")?.content).toBeUndefined();
+		expect(payload.plans.find((p) => p.slug === "p2")?.content).toBeUndefined();
+		// Same for notes.
+		expect(payload.notes).toHaveLength(2);
+		expect(payload.notes.find((n) => n.id === "n1")?.content).toBeUndefined();
+		expect(payload.notes.find((n) => n.id === "n2")?.content).toBeUndefined();
+	});
+
+	// Pathological budgets used to evict every commit, leaving the ambiguous
+	// `commits=[]` state. Step 5 now stops at one commit — the empty array
+	// is reserved for "genuinely no records", and the skill template can keep
+	// its empty-handling rule simple. Pathological budgets accept a minor
+	// overage (estimatedTokens > budget) instead.
+	it("evicts oldest commits but always keeps at least one (avoids commits=[] ambiguity)", () => {
+		const summaries = [1, 2].map((i) =>
+			makeSummary({
+				commitHash: `dddddddd00000000000000000000000000000000${i}`.slice(0, 40),
+				topics: [{ title: `T${i}`, trigger: "t", response: "r", decisions: "D".repeat(1500) }],
+			}),
+		);
+		const payload = buildRecallPayload(makeCtx({ summaries, commitCount: 2 }), 50);
+		expect(payload.truncated).toBe(true);
+		// One commit kept (the most recent) — the older one is evicted.
+		expect(payload.commits).toHaveLength(1);
+		// Pathological budget: payload exceeds it. Truncation is signaled but
+		// the LLM still gets meaningful data instead of a misleading empty array.
+		expect(payload.estimatedTokens).toBeGreaterThan(50);
+	});
+
+	it("guarantees commits=[] iff commitCount=0 (empty-state invariant)", () => {
+		// Branch with no records at all → ctx.summaries empty → commits=[].
+		const empty = buildRecallPayload(makeCtx({ summaries: [], commitCount: 0 }), 100_000);
+		expect(empty.commits).toHaveLength(0);
+		expect(empty.commitCount).toBe(0);
+
+		// Branch with records but pathological budget → commits=[1], not [].
+		const tight = buildRecallPayload(
+			makeCtx({
+				summaries: [makeSummary({ topics: [{ title: "T", trigger: "t", response: "r", decisions: "D" }] })],
+				commitCount: 1,
+			}),
+			1,
+		);
+		expect(tight.commits.length).toBeGreaterThanOrEqual(1);
+		expect(tight.commitCount).toBe(1);
+	});
+
+	it("uses default DEFAULT_TOKEN_BUDGET (50K) when no budget is passed", () => {
+		const payload = buildRecallPayload(makeCtx());
+		// Default 50K easily fits a 1-commit fixture; nothing is truncated.
+		expect(payload.truncated).toBeUndefined();
+		expect(payload.commits).toHaveLength(1);
+	});
+
+	it("sets estimatedTokens to a positive number reflecting payload size", () => {
+		const payload = buildRecallPayload(makeCtx());
+		expect(payload.estimatedTokens).toBeGreaterThan(0);
+	});
+
+	// Stubs on commits must always resolve to a top-level entry. When a
+	// summary references a plan whose body couldn't be loaded (orphan-branch
+	// miss), the stub on the commit must be filtered out so the contract holds.
+	it("filters out plan stubs whose body did not load (no dangling stub)", () => {
+		const summary = makeSummary({
+			commitHash: "ee00000000000000000000000000000000000000",
+			plans: [
+				{
+					slug: "live-plan",
+					title: "Live",
+					editCount: 1,
+					addedAt: "2026-01-01",
+					updatedAt: "2026-01-01",
+				},
+				{
+					slug: "missing-plan",
+					title: "Missing",
+					editCount: 1,
+					addedAt: "2026-01-01",
+					updatedAt: "2026-01-01",
+				},
+			],
+		});
+		// ctx.plans only contains the resolved one — simulates readPlanFromBranch
+		// returning null for "missing-plan".
+		const payload = buildRecallPayload(
+			makeCtx({
+				summaries: [summary],
+				plans: [{ slug: "live-plan", title: "Live", content: "live body" }],
+			}),
+			100_000,
+		);
+		// Top-level has only the loaded plan.
+		expect(payload.plans.map((p) => p.slug)).toEqual(["live-plan"]);
+		// Commit's plan stubs are filtered to only the live one — no dangling stub.
+		expect(payload.commits[0].plans).toEqual([{ slug: "live-plan", title: "Live" }]);
+	});
+
+	it("filters out note stubs whose body did not load", () => {
+		const summary = makeSummary({
+			commitHash: "ee10000000000000000000000000000000000000",
+			notes: [
+				{ id: "live-note", title: "Live", format: "markdown", addedAt: "2026-01-01", updatedAt: "2026-01-01" },
+				{
+					id: "missing-note",
+					title: "Missing",
+					format: "markdown",
+					addedAt: "2026-01-01",
+					updatedAt: "2026-01-01",
+				},
+			],
+		});
+		const payload = buildRecallPayload(
+			makeCtx({
+				summaries: [summary],
+				notes: [{ id: "live-note", title: "Live", content: "live body" }],
+			}),
+			100_000,
+		);
+		expect(payload.notes.map((n) => n.id)).toEqual(["live-note"]);
+		expect(payload.commits[0].notes).toEqual([{ id: "live-note", title: "Live" }]);
+	});
+
+	it("strips ALL plan stubs when --no-plans leaves the top-level array empty", () => {
+		const summary = makeSummary({
+			commitHash: "ee20000000000000000000000000000000000000",
+			plans: [
+				{
+					slug: "p1",
+					title: "P1",
+					editCount: 1,
+					addedAt: "2026-01-01",
+					updatedAt: "2026-01-01",
+				},
+			],
+		});
+		const payload = buildRecallPayload(makeCtx({ summaries: [summary], plans: [] }), 100_000);
+		// No top-level entries → no commit stubs at all (the field is dropped).
+		expect(payload.plans).toEqual([]);
+		expect(payload.commits[0].plans).toBeUndefined();
+	});
+
+	it("strips ALL note stubs when --no-notes leaves the top-level array empty", () => {
+		const summary = makeSummary({
+			commitHash: "ee30000000000000000000000000000000000000",
+			notes: [{ id: "n1", title: "N1", format: "markdown", addedAt: "2026-01-01", updatedAt: "2026-01-01" }],
+		});
+		const payload = buildRecallPayload(makeCtx({ summaries: [summary], notes: [] }), 100_000);
+		expect(payload.notes).toEqual([]);
+		expect(payload.commits[0].notes).toBeUndefined();
+	});
+
+	// estimatedTokens / measure() must reflect the FULL JSON output, including
+	// the envelope (type/branch/period/stats/...) — not just commits/plans/notes.
+	// Otherwise tight budgets get a meaningfully under-counted figure.
+	it("estimatedTokens accounts for the envelope, not just commits/plans/notes", () => {
+		const payload = buildRecallPayload(makeCtx());
+		// The reported estimate should be at least as large as the bare commit
+		// JSON's tokens (envelope adds non-zero cost on top).
+		const justCommits = JSON.stringify(payload.commits);
+		// estimateTokens is char-len/4 for ASCII; envelope is ~150 chars → ~38
+		// extra tokens. Verify the gap so we know the envelope is in the count.
+		const bareLen = Math.max(1, Math.floor(justCommits.length / 4));
+		expect(payload.estimatedTokens).toBeGreaterThan(bareLen);
+	});
+
+	it("preserves branch-level aggregates verbatim", () => {
+		const payload = buildRecallPayload(
+			makeCtx({
+				branch: "feature/x",
+				commitCount: 7,
+				totalFilesChanged: 24,
+				totalInsertions: 312,
+				totalDeletions: 89,
+				period: { start: "2026-04-10", end: "2026-04-15" },
+			}),
+		);
+		expect(payload.branch).toBe("feature/x");
+		expect(payload.commitCount).toBe(7);
+		expect(payload.totalFilesChanged).toBe(24);
+		expect(payload.totalInsertions).toBe(312);
+		expect(payload.totalDeletions).toBe(89);
+		expect(payload.period).toEqual({ start: "2026-04-10", end: "2026-04-15" });
+	});
+});
+
+// ─── compileTaskContext: plan/note recursion + base-slug normalization ──────
+
+describe("compileTaskContext — recursive plan/note collection", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it("collects plans referenced from nested children (v3 legacy data)", async () => {
+		mockGetIndex.mockResolvedValueOnce(
+			makeIndex([
+				{
+					commitHash: "rootroot12345678",
+					parentCommitHash: null,
+					commitMessage: "root",
+					commitDate: "2026-03-28T10:00:00Z",
+					branch: "feature/test",
+					generatedAt: "2026-03-28T10:01:00Z",
+				},
+			]),
+		);
+		mockGetSummary.mockResolvedValue(
+			makeSummary({
+				commitHash: "rootroot12345678",
+				plans: undefined,
+				children: [
+					makeSummary({
+						commitHash: "childchild0011223344",
+						plans: [
+							{
+								slug: "nested-plan",
+								title: "Nested Plan",
+								editCount: 1,
+								addedAt: "2026-03-28",
+								updatedAt: "2026-03-28",
+							},
+						],
+					}),
+				],
+			}),
+		);
+		mockReadPlan.mockResolvedValueOnce("nested plan content");
+
+		const ctx = await compileTaskContext({ branch: "feature/test" }, "/test");
+		expect(ctx.plans).toHaveLength(1);
+		expect(ctx.plans[0].slug).toBe("nested-plan");
+		expect(ctx.plans[0].content).toBe("nested plan content");
+	});
+
+	it("collects notes referenced from nested children", async () => {
+		mockGetIndex.mockResolvedValueOnce(
+			makeIndex([
+				{
+					commitHash: "rootroot12345678",
+					parentCommitHash: null,
+					commitMessage: "root",
+					commitDate: "2026-03-28T10:00:00Z",
+					branch: "feature/test",
+					generatedAt: "2026-03-28T10:01:00Z",
+				},
+			]),
+		);
+		mockGetSummary.mockResolvedValue(
+			makeSummary({
+				commitHash: "rootroot12345678",
+				notes: undefined,
+				children: [
+					makeSummary({
+						commitHash: "childchild0011223344",
+						notes: [
+							{
+								id: "nested-note",
+								title: "Nested Note",
+								format: "markdown",
+								addedAt: "2026-03-28",
+								updatedAt: "2026-03-28",
+							},
+						],
+					}),
+				],
+			}),
+		);
+		mockReadNote.mockResolvedValueOnce("nested note content");
+
+		const ctx = await compileTaskContext({ branch: "feature/test" }, "/test");
+		expect(ctx.notes).toHaveLength(1);
+		expect(ctx.notes[0].id).toBe("nested-note");
+		expect(ctx.notes[0].content).toBe("nested note content");
+	});
+
+	it("normalizes plan slug to base slug when archive suffix is present", async () => {
+		// Commit hash starts with "06d0f729..."; plan slug ends with the same
+		// 8-char prefix. Top-level plans entry should expose the base slug.
+		mockGetIndex.mockResolvedValueOnce(
+			makeIndex([
+				{
+					commitHash: "06d0f7299912345abcdef0123456789abcdef012",
+					parentCommitHash: null,
+					commitMessage: "archived",
+					commitDate: "2026-03-28T10:00:00Z",
+					branch: "feature/test",
+					generatedAt: "2026-03-28T10:01:00Z",
+				},
+			]),
+		);
+		mockGetSummary.mockResolvedValue(
+			makeSummary({
+				commitHash: "06d0f7299912345abcdef0123456789abcdef012",
+				plans: [
+					{
+						slug: "auth-redesign-06d0f729",
+						title: "Auth Redesign",
+						editCount: 1,
+						addedAt: "2026-03-28",
+						updatedAt: "2026-03-28",
+					},
+				],
+			}),
+		);
+		mockReadPlan.mockResolvedValueOnce("plan body");
+
+		const ctx = await compileTaskContext({ branch: "feature/test" }, "/test");
+		expect(ctx.plans).toHaveLength(1);
+		// Top-level slug is the canonical base form.
+		expect(ctx.plans[0].slug).toBe("auth-redesign");
+		// Reading the body still goes through the original (archived) path.
+		expect(mockReadPlan).toHaveBeenCalledWith("auth-redesign-06d0f729", "/test");
+	});
+
+	it("dedupes the same logical plan across pre-archive and post-archive commits", async () => {
+		mockGetIndex.mockResolvedValueOnce(
+			makeIndex([
+				{
+					commitHash: "preeeeee0011223344556677889900112233445566",
+					parentCommitHash: null,
+					commitMessage: "pre",
+					commitDate: "2026-03-27T10:00:00Z",
+					branch: "feature/test",
+					generatedAt: "2026-03-27T10:00:00Z",
+				},
+				{
+					commitHash: "06d0f7299912345abcdef0123456789abcdef012",
+					parentCommitHash: null,
+					commitMessage: "post",
+					commitDate: "2026-03-28T10:00:00Z",
+					branch: "feature/test",
+					generatedAt: "2026-03-28T10:00:00Z",
+				},
+			]),
+		);
+		mockGetSummary.mockImplementation(async (hash: string) => {
+			if (hash === "preeeeee0011223344556677889900112233445566") {
+				return makeSummary({
+					commitHash: "preeeeee0011223344556677889900112233445566",
+					plans: [
+						{
+							slug: "auth-redesign",
+							title: "Auth Redesign",
+							editCount: 1,
+							addedAt: "2026-03-26",
+							updatedAt: "2026-03-26",
+						},
+					],
+				});
+			}
+			return makeSummary({
+				commitHash: "06d0f7299912345abcdef0123456789abcdef012",
+				plans: [
+					{
+						slug: "auth-redesign-06d0f729",
+						title: "Auth Redesign",
+						editCount: 1,
+						addedAt: "2026-03-26",
+						updatedAt: "2026-03-28",
+					},
+				],
+			});
+		});
+		mockReadPlan.mockResolvedValue("plan body");
+
+		const ctx = await compileTaskContext({ branch: "feature/test" }, "/test");
+		// Both commits referenced the same logical plan — dedup yields one entry,
+		// keyed by base slug.
+		expect(ctx.plans).toHaveLength(1);
+		expect(ctx.plans[0].slug).toBe("auth-redesign");
 	});
 });

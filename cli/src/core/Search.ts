@@ -101,11 +101,24 @@ export interface SearchCatalog {
  */
 export interface SearchHitTopic {
 	readonly title: string;
-	/** 1-2 sentences describing what prompted the work. */
-	readonly trigger: string;
-	/** Implementation summary; may include code references. Verbose. */
-	readonly response: string;
-	/** ★ Design choices + the reasoning behind each. Multi-line markdown bullets. */
+	/**
+	 * 1-2 sentences describing what prompted the work. Optional because recall
+	 * may drop it under tight `--budget`; search Phase 2 always populates it.
+	 */
+	readonly trigger?: string;
+	/**
+	 * Implementation summary; may include code references. Verbose. Optional
+	 * for the same reason as `trigger` — recall trimming drops `response` first
+	 * (longest field, lowest signal); search Phase 2 always populates it.
+	 */
+	readonly response?: string;
+	/**
+	 * ★ Design choices + the reasoning behind each. Multi-line markdown bullets.
+	 *
+	 * **Required.** Never dropped from a kept commit. Recall budget enforcement
+	 * removes the entire commit from `commits[]` when `decisions` won't fit,
+	 * rather than emitting a SearchHit topic without it.
+	 */
 	readonly decisions: string;
 	/** Residual work the LLM noticed during summarization (rare but valuable). */
 	readonly todo?: string;
@@ -138,7 +151,11 @@ export interface SearchHitTopic {
  *     leaf-level distillation.
  *   - No internal metadata (`generatedAt`, `commitSource`, `transcriptEntries`,
  *     `conversationTurns`, `llm`, `treeHash`, `jolliDocId/Url`,
- *     `orphanedDocIds`, `e2eTestGuide`, `plans`, `notes`).
+ *     `orphanedDocIds`, `e2eTestGuide`).
+ *
+ * Plan / note refs ARE shipped, as `plans?` / `notes?` stubs (slug/id +
+ * title only — bodies are not transmitted via SearchHit; recall ships them
+ * at the RecallPayload top level).
  */
 export interface SearchHit {
 	// Identity + provenance
@@ -159,6 +176,26 @@ export interface SearchHit {
 
 	// Structured body — the meaty field
 	readonly topics: ReadonlyArray<SearchHitTopic>;
+
+	/**
+	 * Plan refs that this commit (or one of its hoisted children) declared a
+	 * relationship with. Stub only — the slug+title pair is provided as a
+	 * grounding anchor.
+	 *
+	 * `slug` is the **base slug** (archive-suffix stripped via `extractBaseSlug`)
+	 * so it resolves consistently across pre-archive / post-archive commits and
+	 * can be used as a lookup key into `RecallPayload.plans` (in recall) or
+	 * left as a citation hint (in search, where bodies are not shipped).
+	 */
+	readonly plans?: ReadonlyArray<{ readonly slug: string; readonly title: string }>;
+
+	/**
+	 * Note refs that this commit (or one of its hoisted children) declared a
+	 * relationship with. Stub only.
+	 *
+	 * Notes have no archive-suffix mechanism, so `id` is the natural key.
+	 */
+	readonly notes?: ReadonlyArray<{ readonly id: string; readonly title: string }>;
 }
 
 /**
