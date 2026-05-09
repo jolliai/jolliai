@@ -117,6 +117,11 @@
 
         <!-- Memories panel actions -->
         <group id="JolliMemory.MemoriesActions" text="JolliMemory Memories">
+            <action id="JolliMemory.MemoryScope"
+                    class="ai.jolli.jollimemory.actions.MemoryScopeAction"
+                    text="Filter Scope"
+                    description="Filter memories by scope"
+                    icon="AllIcons.General.Filter"/>
             <action id="JolliMemory.SearchMemories"
                     class="ai.jolli.jollimemory.actions.SearchMemoriesAction"
                     text="Search Memories"
