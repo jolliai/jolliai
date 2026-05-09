@@ -19,10 +19,43 @@ import {
 	writeFileToBranch,
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
+import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 
 const log = createLogger("SummaryMigration");
 
 const INDEX_FILE = "index.json";
+
+/**
+ * Wait budget when v1→v3 migration tries to acquire `orphan-write.lock`.
+ * Migration is one-time per repo and runs at activation; it's tolerable to
+ * wait through a concurrent post-commit Worker writing a summary, so we use
+ * the same generous worker-path budget as in SummaryStore. See
+ * `ORPHAN_WRITE_REQUIRED_TIMEOUT_MS` there for full rationale.
+ */
+const MIGRATION_LOCK_TIMEOUT_MS = 30_000;
+
+/**
+ * Acquires `orphan-write.lock`, runs `fn`, releases on exit. Throws on
+ * timeout — migration runs at activation; if the lock can't be acquired
+ * inside 30 s, the caller logs and the migration is retried on next
+ * activation (the v1 branch isn't deleted until migration meta is written,
+ * so retry is safe).
+ */
+async function withMigrationOrphanWriteLock<T>(
+	cwd: string | undefined,
+	label: string,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const acquired = await acquireOrphanWriteLock(cwd, { timeoutMs: MIGRATION_LOCK_TIMEOUT_MS });
+	if (!acquired) {
+		throw new Error(`${label}: could not acquire orphan-write lock within ${MIGRATION_LOCK_TIMEOUT_MS}ms`);
+	}
+	try {
+		return await fn();
+	} finally {
+		await releaseOrphanWriteLock(cwd);
+	}
+}
 
 /**
  * Checks whether the legacy v1 orphan branch exists.
@@ -96,12 +129,18 @@ export async function migrateV1toV3(cwd?: string): Promise<{ migrated: number; s
 	}
 
 	if (filesToWrite.length > 0) {
-		await writeMultipleFilesToBranch(
-			ORPHAN_BRANCH,
-			filesToWrite,
-			`Migrate ${migrated} summaries from v1 to v3 tree format`,
-			cwd,
-		);
+		// Write under orphan-write.lock so we don't race the post-commit Worker
+		// (which also writes the orphan branch). This goes via raw GitOps rather
+		// than the StorageProvider abstraction, so the lock has to live here
+		// rather than being inherited from a StorageProvider wrapper.
+		await withMigrationOrphanWriteLock(cwd, "migrateV1toV3", async () => {
+			await writeMultipleFilesToBranch(
+				ORPHAN_BRANCH,
+				filesToWrite,
+				`Migrate ${migrated} summaries from v1 to v3 tree format`,
+				cwd,
+			);
+		});
 		log.info("Migration complete: %d migrated, %d skipped", migrated, skipped);
 	} else {
 		log.info("No summaries to migrate");
@@ -149,13 +188,16 @@ export async function hasMigrationMeta(cwd?: string): Promise<boolean> {
  */
 export async function writeMigrationMeta(cwd?: string): Promise<void> {
 	const meta: MigrationMeta = { v1MigratedAt: new Date().toISOString() };
-	await writeFileToBranch(
-		ORPHAN_BRANCH,
-		MIGRATION_META_FILE,
-		JSON.stringify(meta, null, "\t"),
-		"Record v1→v3 migration timestamp",
-		cwd,
-	);
+	// Single-file orphan-branch write — same lock semantics as migrateV1toV3.
+	await withMigrationOrphanWriteLock(cwd, "writeMigrationMeta", async () => {
+		await writeFileToBranch(
+			ORPHAN_BRANCH,
+			MIGRATION_META_FILE,
+			JSON.stringify(meta, null, "\t"),
+			"Record v1→v3 migration timestamp",
+			cwd,
+		);
+	});
 	log.info("Wrote migration metadata to %s", MIGRATION_META_FILE);
 }
 
