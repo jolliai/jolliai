@@ -598,14 +598,21 @@ class SettingsDialog(
         val kbSort = kbSortCombo.selectedItem as String
 
         val configDir = SessionTracker.getGlobalConfigDir()
-        // Both AI Summary and Sync tabs can set the Jolli API key — use whichever has a value
+        // Both AI Summary and Sync tabs can set the Jolli API key.
+        // If either field was shown, use its value. Prefer non-blank.
         val aiSummaryKey = jolliApiKeyFieldRef?.text?.trim() ?: ""
         val syncKey = syncApiKeyFieldRef?.text?.trim() ?: ""
-        val jolliApiKeyText = syncKey.ifBlank { aiSummaryKey }
+        // If either field is visible and non-blank, use it; otherwise take whatever is there
+        val jolliApiKeyText = when {
+            syncKey.isNotBlank() -> syncKey
+            aiSummaryKey.isNotBlank() -> aiSummaryKey
+            else -> "" // both blank — key was cleared
+        }
 
-        // If the Advanced field was shown and user cleared it, treat as sign-out
+        // Detect if jolli key was actively cleared (was present before, now blank)
         val preExisting = SessionTracker.loadConfigFromDir(configDir)
-        val jolliKeyCleared = jolliApiKeyFieldRef != null &&
+        val eitherFieldShown = jolliApiKeyFieldRef != null || syncApiKeyFieldRef != null
+        val jolliKeyCleared = eitherFieldShown &&
             jolliApiKeyText.isBlank() && !preExisting.jolliApiKey.isNullOrBlank()
         if (jolliKeyCleared) {
             JolliAuthService.signOut()
