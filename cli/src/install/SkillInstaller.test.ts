@@ -74,26 +74,30 @@ describe("updateSkillsIfNeeded", () => {
 		expect(recall).toMatch(/### Loaded `feature\/auth`\n\n- \*\*Period:/);
 	});
 
-	// recall outputs were running long (multi-screen) because the LLM had no
-	// length anchor — search bounds itself naturally via Step-3 picking,
-	// recall has no equivalent. Principle 6 gives a concrete word ceiling +
-	// explicit deep-dive escape hatch. **Length only — no form constraint.**
-	// LLM still picks the output shape (per Part B's "shape is your call").
-	it("recall template caps default answer length at ~500 words (principle #6)", async () => {
+	// Principle 6 still gives a length anchor — search bounds itself naturally
+	// via Step-3 picking, recall has no equivalent — but the earlier "~500
+	// words at most" hard ceiling was the root cause of inline-bold paragraph
+	// cramming on multi-theme branches: 5+ themes with verbatim-quote bullets
+	// naturally exceed 500 words, and forcing them under the cap collapsed
+	// `###` sections into inline-bold prefixes that read as a markdown wall.
+	// The new wording keeps the brevity nudge as a soft target but explicitly
+	// subordinates it to section structure.
+	it("recall template encourages brevity but never at the cost of section structure (principle #6)", async () => {
 		await updateSkillsIfNeeded(tempDir);
 		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
-		// Concrete word ceiling — actionable for LLM in a way "one screen" wasn't.
-		// 500 was picked after dogfood: a substantive 5-commit branch with
-		// quoted decisions naturally produces ~700-800 words; 400 was too tight
-		// once the verbatim-quote convention got upgraded to complete clauses.
 		expect(recall).toMatch(/Brief by default/);
-		expect(recall).toMatch(/~500 words at most/);
-		// Escape hatch. Use \s+ to tolerate the line wrap inside the principle.
-		expect(recall).toMatch(/Long-form\s+output is opt-in/);
+		// Soft target ("aim for ~500"), not a hard ceiling ("at most").
+		expect(recall).toMatch(/aim for ~500 words/);
+		expect(recall).not.toMatch(/~500 words at most/);
+		// The explicit constraint that solves the wall-of-fragments failure mode:
+		// section structure beats word count.
+		expect(recall).toMatch(/inline-bold paragraph prefixes/);
+		expect(recall).toMatch(/may\s+legitimately run longer/);
+		// Escape hatch for theme-specific elaboration.
 		expect(recall).toMatch(/deep dive/);
-		// Negative: principle 6 must NOT impose form constraints. Earlier drafts
-		// said "group by theme" / "3-5 decisions max" / "no subsection headings"
-		// — those conflict with Part B's "shape is your call". Length only.
+		// Negative: principle 6 still must NOT impose form constraints. Earlier
+		// drafts said "group by theme" / "3-5 decisions max" / "no subsection
+		// headings" — those conflict with Part B's "shape is your call".
 		expect(recall).not.toMatch(/Group commits by theme/);
 		expect(recall).not.toMatch(/3-5 key decisions max/);
 		expect(recall).not.toMatch(/No subsection headings/);
