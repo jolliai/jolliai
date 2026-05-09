@@ -1,7 +1,6 @@
 package ai.jolli.jollimemory.actions
 
 import ai.jolli.jollimemory.services.JolliMemoryService
-import ai.jolli.jollimemory.toolwindow.MemoriesPanel
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent

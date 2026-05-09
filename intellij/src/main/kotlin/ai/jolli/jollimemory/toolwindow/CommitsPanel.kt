@@ -215,11 +215,6 @@ class CommitsPanel(
         val myVersion = refreshVersion
 
         val status = service.getStatus()
-        // DEBUG: write to desktop file for easy access
-        try {
-            val debugFile = java.io.File(System.getProperty("user.home"), "Desktop/commits-debug.log")
-            debugFile.appendText("${java.time.Instant.now()} refreshFromGit: enabled=${status?.enabled}, myVer=$myVersion, curVer=$refreshVersion, thr=${Thread.currentThread().name}\n")
-        } catch (_: Exception) {}
         if (status == null) {
             SwingUtilities.invokeLater { if (refreshVersion == myVersion) showInitializing() }
             return
