@@ -1214,10 +1214,9 @@ export function buildSidebarScript(): string {
         el('i', { className: 'codicon codicon-copy' }),
       ]),
     ];
-    // The View Commit Memory link only makes sense when a summary actually
-    // exists — for memory-less commits the command would dead-end on a 404.
-    // Memories rows always have a summary so hasMemory is forced true at
-    // lookup time.
+    // The View Memory link only makes sense when a summary actually exists —
+    // for memory-less commits the command would dead-end on a 404. Memories
+    // rows always have a summary so hasMemory is forced true at lookup time.
     if (m.hasMemory) {
       // Memory rows route to the "memory" panel slot (viewMemorySummary);
       // Commit rows route to the "commit" panel slot (viewSummary). The two
@@ -1231,7 +1230,7 @@ export function buildSidebarScript(): string {
         'data-hash': m.commitHash,
       }, [
         el('i', { className: 'codicon codicon-eye' }),
-        el('span', { text: 'View Commit Memory' }),
+        el('span', { text: 'View Memory' }),
       ]));
     }
     kids.push(el('div', { className: 'hc-actions' }, actions));

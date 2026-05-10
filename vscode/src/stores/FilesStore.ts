@@ -236,9 +236,9 @@ export class FilesStore extends BaseStore<FilesChangeReason, FilesSnapshot> {
 		this.enabled = e;
 		// Clear cached data on disable so downstream UI (badge, visible count,
 		// "N files hidden" description) does not stick at the last enabled value
-		// while the viewsWelcome placeholder is shown.  Re-enabling triggers a
-		// fresh bridge refresh via refreshStatusBar / initialLoad, so the
-		// throwaway here is recoverable.
+		// while the sidebar webview's disabled-state empty copy is shown.
+		// Re-enabling triggers a fresh bridge refresh via refreshStatusBar /
+		// initialLoad, so the throwaway here is recoverable.
 		if (!e) {
 			this.rawFiles = [];
 			this.selectedPaths.clear();

@@ -145,10 +145,11 @@ export class MemoriesStore extends BaseStore<
 			return;
 		}
 		this.enabled = e;
-		// Clear cached data on disable so memoriesView.description does not
-		// stick at "N memories" or "foo — M results" while the viewsWelcome
-		// placeholder is shown.  `firstLoadDone` is reset so re-enable can
-		// lazy-load cleanly again on the next panel visibility event.
+		// Clear cached data on disable so the Memories description in the
+		// sidebar webview does not stick at "N memories" or "foo — M results"
+		// while the disabled-state empty copy is shown. `firstLoadDone` is
+		// reset so re-enable can lazy-load cleanly again on the next panel
+		// visibility event.
 		// `loadedCount` is reset to PAGE_SIZE so a prior Load More session
 		// does not carry its pagination cursor across a disable/enable cycle
 		// (otherwise the next refresh would request 20/30/... instead of 10).

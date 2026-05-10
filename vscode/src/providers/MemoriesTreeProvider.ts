@@ -135,7 +135,7 @@ function buildTooltip(entry: SummaryIndexEntry): vscode.MarkdownString {
 
 	const hashArg = encodeURIComponent(JSON.stringify([entry.commitHash]));
 	const copyLink = `[$(git-commit) \`${shortHash}\` $(copy)](command:jollimemory.copyCommitHash?${hashArg})`;
-	const viewLink = `[$(eye) View Commit Memory](command:jollimemory.viewMemorySummary?${hashArg})`;
+	const viewLink = `[$(eye) View Memory](command:jollimemory.viewMemorySummary?${hashArg})`;
 	md.appendMarkdown(`${copyLink}  |  ${viewLink}`);
 
 	return md;
@@ -157,7 +157,7 @@ export class MemoryItem extends vscode.TreeItem {
 		this.tooltip = buildTooltip(entry);
 		this.command = {
 			command: "jollimemory.viewMemorySummary",
-			title: "View Commit Memory",
+			title: "View Memory",
 			arguments: [this],
 		};
 	}

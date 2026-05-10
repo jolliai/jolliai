@@ -367,7 +367,7 @@ function buildTooltip(c: BranchCommit): vscode.MarkdownString {
 	const copyLink = `[$(git-commit) \`${c.shortHash}\` $(copy)](command:jollimemory.copyCommitHash?${hashArg})`;
 
 	if (c.hasSummary) {
-		const viewLink = `[$(eye) View Commit Memory](command:jollimemory.viewSummary?${hashArg})`;
+		const viewLink = `[$(eye) View Memory](command:jollimemory.viewSummary?${hashArg})`;
 		md.appendMarkdown(`${copyLink}  |  ${viewLink}`);
 	} else {
 		md.appendMarkdown(copyLink);

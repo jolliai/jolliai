@@ -463,8 +463,8 @@ vi.mock("vscode", () => ({
 		registerFileDecorationProvider: vi.fn(() => ({ dispose: vi.fn() })),
 		registerUriHandler: vi.fn(() => ({ dispose: vi.fn() })),
 		// Pass-through Progress mock — runs the user's callback so commands that
-		// wrap work in `vscode.window.withProgress(...)` (e.g. migrateToKnowledgeBase)
-		// actually execute that work in tests instead of silently no-oping.
+		// wrap work in `vscode.window.withProgress(...)` (e.g. SquashCommand's LLM
+		// call) actually execute that work in tests instead of silently no-oping.
 		withProgress: vi.fn(
 			async (
 				_options: unknown,
@@ -522,10 +522,10 @@ vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 	readPlanFromBranch,
 }));
 
-// Mock the KB folder-mode dependencies so auto-migration paths in `activate`
-// and the migrateToKnowledgeBase / rebuildKnowledgeBase commands run with
-// predictable, side-effect-free stand-ins. Each test that exercises those
-// paths overrides the relevant helper via `vi.mocked(...).mockReturnValueOnce`.
+// Mock the KB folder-mode dependencies so the auto-migration path in `activate`
+// and the rebuildKnowledgeBase command run with predictable, side-effect-free
+// stand-ins. Each test that exercises those paths overrides the relevant helper
+// via `vi.mocked(...).mockReturnValueOnce`.
 vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
 	extractRepoName: vi.fn(() => "test-repo"),
 	getRemoteUrl: vi.fn(() => null),
@@ -1137,7 +1137,6 @@ describe("Extension", () => {
 				"jollimemory.viewMemorySummary",
 				"jollimemory.copyCommitHash",
 				"jollimemory.openSettings",
-				"jollimemory.migrateToKnowledgeBase",
 			];
 
 			for (const cmd of expectedCommands) {
@@ -4361,34 +4360,6 @@ describe("Extension", () => {
 		});
 	});
 
-	// ── Memory Bank commands ─────────────────────────────────────────────
-	// The tree-view-coupled commands (refreshKnowledgeBase, focusKnowledgeBase,
-	// openKBCommitSummary) were removed when the 6 tree views were replaced by
-	// the sidebar webview. Only `migrateToKnowledgeBase` survives as a
-	// standalone migration trigger.
-
-	describe("Memory Bank commands", () => {
-		it("migrateToKnowledgeBase can be invoked without throwing", async () => {
-			const ctx = makeContext();
-			activate(ctx);
-
-			const handler = getRegisteredCommand(
-				"jollimemory.migrateToKnowledgeBase",
-			);
-			// The dynamic imports inside the handler will fail in the test
-			// environment, which triggers the catch block that shows an error
-			// message. We just verify the command is registered and callable.
-			await handler();
-
-			// Either shows an error message (import failure) or info message
-			// (no orphan branch) — command completes without unhandled rejection.
-			expect(
-				showErrorMessage.mock.calls.length +
-					showInformationMessage.mock.calls.length,
-			).toBeGreaterThanOrEqual(0);
-		});
-	});
-
 	// ── deactivate ──────────────────────────────────────────────────────
 
 	describe("deactivate", () => {
@@ -4688,79 +4659,6 @@ describe("Extension", () => {
 			await expect(handler("does-not-exist")).resolves.toBeUndefined();
 			expect(showInformationMessage).not.toHaveBeenCalledWith(
 				expect.stringContaining("has no readable content"),
-			);
-		});
-	});
-
-	// ── Coverage backfill: migrateToKnowledgeBase success / partial paths ──
-	describe("migrateToKnowledgeBase command (success/partial paths)", () => {
-		beforeEach(() => {
-			existsSync.mockReset();
-			existsSync.mockImplementation(() => true);
-			mockOrphanInstance.exists.mockReset();
-			mockOrphanInstance.exists.mockResolvedValue(true);
-			mockMigrationEngineInstance.runMigration.mockReset();
-			mockMigrationEngineInstance.runMigration.mockResolvedValue({
-				status: "completed",
-				migratedEntries: 7,
-				totalEntries: 7,
-			});
-		});
-
-		it("shows an info message when migration completes", async () => {
-			activate(makeContext());
-			const handler = getRegisteredCommand(
-				"jollimemory.migrateToKnowledgeBase",
-			);
-			await handler();
-
-			expect(showInformationMessage).toHaveBeenCalledWith(
-				expect.stringContaining("Migration completed"),
-			);
-		});
-
-		it("shows a warning when migration is partial", async () => {
-			mockMigrationEngineInstance.runMigration.mockResolvedValueOnce({
-				status: "partial",
-				migratedEntries: 3,
-				totalEntries: 7,
-			});
-			activate(makeContext());
-			const handler = getRegisteredCommand(
-				"jollimemory.migrateToKnowledgeBase",
-			);
-			await handler();
-
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("Migration partial"),
-			);
-		});
-
-		it("shows an info message when there is no orphan storage to migrate", async () => {
-			mockOrphanInstance.exists.mockResolvedValueOnce(false);
-			activate(makeContext());
-			const handler = getRegisteredCommand(
-				"jollimemory.migrateToKnowledgeBase",
-			);
-			await handler();
-
-			expect(showInformationMessage).toHaveBeenCalledWith(
-				expect.stringContaining("No git storage found"),
-			);
-		});
-
-		it("surfaces a failure as an error toast", async () => {
-			mockMigrationEngineInstance.runMigration.mockRejectedValueOnce(
-				new Error("disk full"),
-			);
-			activate(makeContext());
-			const handler = getRegisteredCommand(
-				"jollimemory.migrateToKnowledgeBase",
-			);
-			await handler();
-
-			expect(showErrorMessage).toHaveBeenCalledWith(
-				expect.stringContaining("Migration failed"),
 			);
 		});
 	});

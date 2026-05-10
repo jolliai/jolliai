@@ -507,7 +507,7 @@ describe("HistoryTreeProvider tree behavior", () => {
 		expect(tooltip.value).toContain("2 files changed");
 		expect(tooltip.value).not.toContain("insertion");
 		expect(tooltip.value).not.toContain("deletion");
-		expect(tooltip.value).not.toContain("View Commit Memory");
+		expect(tooltip.value).not.toContain("View Memory");
 		expect(item.contextValue).toBe("commit");
 	});
 
