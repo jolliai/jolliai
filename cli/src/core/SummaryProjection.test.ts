@@ -43,7 +43,7 @@ describe("buildHit", () => {
 	it("projects a v4 summary's identity, recap, topics, and diffStats", () => {
 		const hit = buildHit(
 			leaf({
-				ticketId: "JOLLI-123",
+				ticketId: "JIRA-123",
 				diffStats: { filesChanged: 3, insertions: 10, deletions: 2 },
 				recap: "did stuff",
 			}),
@@ -53,7 +53,7 @@ describe("buildHit", () => {
 		expect(hit.commitMessage).toBe("feat: thing");
 		expect(hit.commitAuthor).toBe("Test User");
 		expect(hit.branch).toBe("feature/test");
-		expect(hit.ticketId).toBe("JOLLI-123");
+		expect(hit.ticketId).toBe("JIRA-123");
 		expect(hit.diffStats).toEqual({ filesChanged: 3, insertions: 10, deletions: 2 });
 		expect(hit.recap).toBe("did stuff");
 		expect(hit.topics).toHaveLength(1);

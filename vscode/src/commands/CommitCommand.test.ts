@@ -861,7 +861,7 @@ describe("CommitCommand", () => {
 		// stageFiles is called three times: (1) index prep, (2) re-stage
 		// before commit, (3) re-stage previously-staged remainder.
 		//
-		// Contract (JOLLI-1326 P1): the first two — the user-selection path —
+		// Contract: the first two — the user-selection path —
 		// must opt in to missing-file tolerance with { allowMissing: true }.
 		// The third — the restore path — must NOT pass opts; it relies on
 		// `git add`'s loud failure to trigger the re-stage warning.

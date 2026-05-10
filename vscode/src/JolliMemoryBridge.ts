@@ -534,7 +534,6 @@ export class JolliMemoryBridge {
 	 * the deletion flavours that `git add` refuses (gitignored +
 	 * deleted, sparse-excluded, skip-worktree, staged-add-then-deleted,
 	 * post-`git rm --cached` deletions, and the status-vs-commit race).
-	 * See JOLLI-1326 for the full rationale.
 	 *
 	 * The existence check is `lstatSync(..., { throwIfNoEntry: false })`
 	 * rather than `existsSync` — the latter dereferences symlinks and

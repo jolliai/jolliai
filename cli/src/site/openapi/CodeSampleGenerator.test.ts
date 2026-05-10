@@ -1,7 +1,7 @@
 /**
  * Tests for CodeSampleGenerator.
  *
- * Ported from JOLLI-1392's nextra-generator. Same coverage: Python literal
+ * Ported from nextra-generator. Same coverage: Python literal
  * encoding, Go string-literal escaping, end-to-end sample emission with
  * tricky content (strings containing `true`/`false`/`null`, payloads with
  * backticks). New helper-targeted tests added for query-string + auth

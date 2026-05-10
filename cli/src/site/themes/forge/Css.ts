@@ -9,9 +9,7 @@
  * the end of the file so customer accent + sidebar/header bg overrides take
  * precedence via the cascade.
  *
- * Vendored from the SaaS Forge pack
- * (`tools/nextra-generator/src/themes/forge/styles/ForgeCss.ts` in jolli.ai/jolli)
- * post-JOLLI-1392. The auth banner block has been stripped (CLI sites don't
+ * Vendored from the SaaS Forge pack. The auth banner block has been stripped (CLI sites don't
  * have JWT auth) and the API-reference companion stylesheet (`buildApiCss`)
  * is intentionally not appended yet — it lands in a follow-up commit so the
  * OpenAPI page styling can be reviewed in isolation.

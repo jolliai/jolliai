@@ -34,23 +34,31 @@ export async function saveAuthToken(token: string): Promise<void> {
  * versa).
  *
  * Also writes `aiProvider: "jolli"` because clicking "Sign in to Jolli" is the
- * user's explicit declaration of intent to use Jolli for AI summaries. This
- * aligns the dispatcher's `resolveLlmCredentialSource` with the user's
- * onboarding choice — without it, a returning user who already had an
+ * user's explicit declaration of intent to use Jolli for AI summaries — UNLESS
+ * the user has already explicitly chosen `aiProvider: "anthropic"` in
+ * Settings. In that case we leave the choice alone: a deliberate Anthropic
+ * pick should outlast a sign-in (e.g. user signs in just to push, not to
+ * switch providers). When `aiProvider` is unset or already "jolli", we write
+ * "jolli" to align the dispatcher's `resolveLlmCredentialSource` with the
+ * user's onboarding choice — without it, a returning user who already had an
  * Anthropic API key in config would see Settings UI promise "using Jolli" but
  * the dispatcher would still pick Anthropic via the legacy precedence path.
  *
- * `clearAuthCredentials` rolls back this auto-write on logout so the config
- * doesn't keep a "jolli" preference whose credentials are gone.
+ * `clearAuthCredentials` rolls back this auto-write on logout (only when the
+ * stored value is still "jolli") so the config doesn't keep a "jolli"
+ * preference whose credentials are gone.
  */
 export async function saveAuthCredentials(credentials: {
 	readonly token: string;
 	readonly jolliApiKey?: string;
 }): Promise<void> {
-	const update: { authToken: string; jolliApiKey?: string; aiProvider: "jolli" } = {
+	const config = await loadConfig();
+	const update: { authToken: string; jolliApiKey?: string; aiProvider?: "jolli" } = {
 		authToken: credentials.token,
-		aiProvider: "jolli",
 	};
+	if (config.aiProvider !== "anthropic") {
+		update.aiProvider = "jolli";
+	}
 	if (credentials.jolliApiKey) {
 		validateJolliApiKey(credentials.jolliApiKey);
 		update.jolliApiKey = credentials.jolliApiKey;
@@ -68,13 +76,13 @@ export async function loadAuthToken(): Promise<string | undefined> {
 
 /**
  * Clears the auth token, Jolli API key, and (only if it equals "jolli") the
- * `aiProvider` preference, since `saveAuthCredentials` writes that preference
- * automatically on sign-in. Leaving it behind would keep
- * `resolveLlmCredentialSource` pinned to the proxy after the credentials are
- * gone — making subsequent commits fail silently in VS Code (where the CLI
- * warning copy never reaches the user). An explicit `aiProvider: "anthropic"`
- * choice is preserved so a user who deliberately picked Anthropic in Settings
- * isn't reset by an unrelated logout.
+ * `aiProvider` preference. Symmetric with `saveAuthCredentials`: that path
+ * writes "jolli" only when the current value isn't already "anthropic", so the
+ * "explicit anthropic survives a Jolli sign-in / logout round-trip" property
+ * holds end-to-end. Leaving "jolli" behind on logout would pin
+ * `resolveLlmCredentialSource` to the proxy after the credentials are gone —
+ * subsequent commits would then fail silently in VS Code (where the CLI
+ * warning copy never reaches the user).
  */
 export async function clearAuthCredentials(): Promise<void> {
 	const config = await loadConfig();

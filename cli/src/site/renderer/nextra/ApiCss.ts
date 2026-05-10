@@ -8,7 +8,7 @@
  * defaults to a Nextra-ish blue (220) — Phase 6 hardcodes this; theme
  * customisation is a future enhancement.
  *
- * Ported verbatim (modulo this header) from JOLLI-1392's themes/ApiCss.ts.
+ * Ported verbatim (modulo this header) from themes/ApiCss.ts.
  * That source layered the output onto Forge / Atlas / Classic theme-pack
  * stylesheets; we emit it standalone since jolliai has no theme packs.
  */

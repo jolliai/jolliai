@@ -12,7 +12,7 @@
  * - Path-based (dev): "https://jolli-local.me/test1/" → calls /api/push/... with X-Tenant-Slug header
  * - Subdomain-based (prod): "https://test1.jolli.ai" → subdomain resolved by backend
  *
- * Implements the JOLLI-1335 push contract:
+ * Implements the push contract:
  * - Sends `x-jolli-client: <kind>/<version>` header (e.g. `vscode-plugin/1.2.3`)
  *   so the server can identify the caller, gate on version, and route through
  *   the per-repo binding flow without parsing the body. (Here `<kind>` is the

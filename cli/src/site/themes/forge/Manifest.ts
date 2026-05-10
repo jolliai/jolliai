@@ -3,9 +3,7 @@
  * applied when a customer-overridable field on `theme` (in `site.json`) is
  * absent.
  *
- * Mirrors `FORGE_MANIFEST` from the SaaS Forge pack
- * (`tools/nextra-generator/src/themes/forge/Manifest.ts` in jolli.ai/jolli)
- * post-JOLLI-1392. Customer fields the CLI doesn't surface yet (e.g.
+ * Mirrors `FORGE_MANIFEST` from the SaaS Forge pack. Customer fields the CLI doesn't surface yet (e.g.
  * `requiredPackages` for SaaS deploy validation) are omitted — the CLI runs
  * `npm install` against the same `nextra-theme-docs` deps the default pack
  * already declares in `package.json`.

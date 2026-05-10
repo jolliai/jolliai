@@ -20,6 +20,6 @@ export function computeChangesBadge(
 	const selected = snap.selectedFiles.length;
 	return {
 		value: visible,
-		tooltip: `${visible} changed file${visible !== 1 ? "s" : ""}, ${selected} selected`,
+		tooltip: `${visible} changed, ${selected} selected`,
 	};
 }

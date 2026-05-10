@@ -2,7 +2,7 @@
  * BindingChooserWebviewPanel
  *
  * Per-repo webview shown when the server returns `412 binding_required` on a
- * push (JOLLI-1335). Lets the user pick an existing JM space and registers the
+ * push. Lets the user pick an existing JM space and registers the
  * binding via `JolliMemoryApiService` — the only binding-management UI the
  * plugin exposes. At most one chooser is open per `repoUrl`; multi-root
  * workspaces with several repos can each have their own chooser open at once.
