@@ -119,6 +119,21 @@ export interface GitOperation {
 	readonly createdAt: string; // ISO 8601
 }
 
+/**
+ * Which credential source was used to make an LLM call.
+ *
+ * Lives at the Types layer (and not next to `callLlm` in `core/LlmClient.ts`)
+ * because `LlmCallMetadata` below references it, and `LlmClient` already
+ * imports from this module via `Summarizer` — keeping the type here avoids
+ * a Types → LlmClient → Summarizer → Types layer cycle.
+ *
+ * Values match `resolveLlmCredentialSource` in `core/LlmClient.ts`:
+ *   - "anthropic-config": apiKey set in ~/.jolli/jollimemory/config.json (direct mode)
+ *   - "anthropic-env":    ANTHROPIC_API_KEY environment variable (direct mode)
+ *   - "jolli-proxy":      jolliApiKey (sk-jol-…) routed through the Jolli backend
+ */
+export type LlmCredentialSource = "anthropic-config" | "anthropic-env" | "jolli-proxy";
+
 /** Metadata from the LLM API call that generated this summary */
 export interface LlmCallMetadata {
 	/** Actual model used (from response, may differ from requested model due to aliasing) */
@@ -129,6 +144,13 @@ export interface LlmCallMetadata {
 	readonly apiLatencyMs: number;
 	/** API stop reason — "max_tokens" indicates the summary may have been truncated */
 	readonly stopReason: string | null;
+	/**
+	 * Which provider produced this summary. Optional because pre-existing
+	 * summaries on the orphan branch were written before this field existed
+	 * — readers must default to "unknown provider" when absent and not crash.
+	 * Populated for every new call by `callLlm` in `core/LlmClient.ts`.
+	 */
+	readonly source?: LlmCredentialSource;
 }
 
 /**
@@ -532,7 +554,7 @@ export interface CommitCatalog {
  * Callers load the full config and pass this subset to Summarizer functions,
  * so those functions don't need to know *how* config was loaded.
  */
-export type LlmConfig = Pick<JolliMemoryConfig, "apiKey" | "model" | "jolliApiKey">;
+export type LlmConfig = Pick<JolliMemoryConfig, "apiKey" | "model" | "jolliApiKey" | "aiProvider">;
 
 /** Configuration stored in .jolli/jollimemory/config.json */
 export interface JolliMemoryConfig {
@@ -566,6 +588,15 @@ export interface JolliMemoryConfig {
 	readonly pushAction?: "jolli" | "both";
 	/** OAuth auth token from browser login (stored by `jolli auth login`) */
 	readonly authToken?: string;
+	/**
+	 * Which AI summarization provider to use.
+	 *  - "anthropic": call Anthropic directly using `apiKey`.
+	 *  - "jolli":     call Jolli's proxy using `jolliApiKey`.
+	 *
+	 * Optional — when missing, surfaces derive a default (Jolli when signed in,
+	 * Anthropic otherwise) so existing configs keep working.
+	 */
+	readonly aiProvider?: "anthropic" | "jolli";
 }
 
 /** Result of enable/disable operations */

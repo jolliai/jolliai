@@ -33,6 +33,7 @@ import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
+import { isLlmCredentialError } from "../core/LlmClient.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
@@ -687,12 +688,24 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	try {
 		summaryResult = await generateSummary(summaryParams);
 	} catch (error: unknown) {
+		// Credential-config errors (no provider, missing key for the chosen
+		// provider) won't recover on retry, and writing an empty-topic
+		// placeholder would mask the user's loud-failure expectation set by
+		// the Settings dispatcher fix. Rethrow so the worker logs the
+		// offending commit hash and skips placeholder writes — no junk
+		// summary lands on the orphan branch, debug.log carries the cause.
+		if (isLlmCredentialError(error)) {
+			throw error;
+		}
 		log.warn("First API attempt failed: %s. Retrying in %dms...", (error as Error).message, RETRY_DELAY_MS);
 		await delay(RETRY_DELAY_MS);
 
 		try {
 			summaryResult = await generateSummary(summaryParams);
 		} catch (retryError: unknown) {
+			if (isLlmCredentialError(retryError)) {
+				throw retryError;
+			}
 			// LLM completely unavailable — save a summary with empty topics so the commit
 			// still has a record (metadata, diff stats, transcript). This prevents missing
 			// source summaries during squash/rebase merges. Topics can be back-filled later

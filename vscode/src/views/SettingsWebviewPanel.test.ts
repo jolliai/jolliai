@@ -2,8 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Hoisted mocks ────────────────────────────────────────────────────────────
 
-const { info, error: logError } = vi.hoisted(() => ({
+const {
+	info,
+	warn,
+	error: logError,
+} = vi.hoisted(() => ({
 	info: vi.fn(),
+	warn: vi.fn(),
 	error: vi.fn(),
 }));
 
@@ -35,10 +40,17 @@ const { mockShowOpenDialog } = vi.hoisted(() => ({
 	mockShowOpenDialog: vi.fn(),
 }));
 
+const { mockExecuteCommand } = vi.hoisted(() => ({
+	mockExecuteCommand: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("vscode", () => ({
 	window: {
 		createWebviewPanel,
 		showOpenDialog: mockShowOpenDialog,
+	},
+	commands: {
+		executeCommand: mockExecuteCommand,
 	},
 	ViewColumn: { Active: 1 },
 }));
@@ -99,7 +111,7 @@ vi.mock("../../../cli/src/install/Installer.js", () => ({
 }));
 
 vi.mock("../util/Logger.js", () => ({
-	log: { info, error: logError },
+	log: { info, warn, error: logError },
 }));
 
 const { mockBuildSettingsHtml } = vi.hoisted(() => ({
@@ -1776,6 +1788,494 @@ describe("SettingsWebviewPanel", () => {
 				expect.objectContaining({
 					command: "settingsLoaded",
 					maskedApiKey: "",
+				}),
+			);
+		});
+	});
+
+	// ── Tabbed-layout additions: aiProvider + auth-state cards ──
+
+	describe("aiProvider + auth state", () => {
+		it("settingsLoaded includes signedIn / hasJolliKey / jolliSiteLabel", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					signedIn: false,
+					hasJolliKey: false,
+					jolliSiteLabel: "Using Jolli to generate summaries",
+				}),
+			);
+		});
+
+		it("derives jolliSiteLabel from the embedded meta.u of the Jolli API key", async () => {
+			const meta = { t: "tenant1", u: "https://tenant1.jolli.ai" };
+			const encoded = Buffer.from(JSON.stringify(meta)).toString("base64url");
+			const jolliKey = `sk-jol-${encoded}.secret`;
+
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: jolliKey,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					hasJolliKey: true,
+					jolliSiteLabel:
+						"Signed in to tenant1.jolli.ai — using Jolli to generate summaries",
+				}),
+			);
+		});
+
+		it("settingsLoaded.settings.aiProvider defaults to 'anthropic' when unset and not signed in", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ aiProvider: "anthropic" }),
+				}),
+			);
+		});
+
+		it("settingsLoaded.settings.aiProvider honors an explicit 'jolli' value", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				aiProvider: "jolli",
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ aiProvider: "jolli" }),
+				}),
+			);
+		});
+
+		it("applySettings persists aiProvider verbatim", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+			// Reset hook mocks (some earlier tests in this file leave them rejecting).
+			mockInstallClaudeHook.mockResolvedValue({});
+			mockRemoveClaudeHook.mockResolvedValue({});
+			mockInstallGeminiHook.mockResolvedValue({});
+			mockRemoveGeminiHook.mockResolvedValue(undefined);
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			postMessage.mockClear();
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					aiProvider: "jolli",
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					openCodeEnabled: true,
+					cursorEnabled: true,
+					copilotEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ aiProvider: "jolli" }),
+				expect.any(String),
+			);
+		});
+	});
+
+	describe("signIn / signOut messages", () => {
+		it("dispatches the jollimemory.signIn command on a signIn message", async () => {
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "signIn" });
+			await flushPromises();
+
+			expect(mockExecuteCommand).toHaveBeenCalledWith("jollimemory.signIn");
+		});
+
+		it("dispatches the jollimemory.signOut command on a signOut message", async () => {
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "signOut" });
+			await flushPromises();
+
+			expect(mockExecuteCommand).toHaveBeenCalledWith("jollimemory.signOut");
+		});
+	});
+
+	describe("notifyAuthChanged", () => {
+		it("posts authStateChanged to the open panel with refreshed state", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			postMessage.mockClear();
+
+			// Server has just issued a Jolli API key — notifyAuthChanged should
+			// re-read the config and reflect the new state in the next message.
+			const meta = { t: "tenant", u: "https://tenant.jolli.ai" };
+			const encoded = Buffer.from(JSON.stringify(meta)).toString("base64url");
+			const jolliKey = `sk-jol-${encoded}.secret`;
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: jolliKey,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.notifyAuthChanged();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "authStateChanged",
+					hasJolliKey: true,
+					jolliSiteLabel: expect.stringContaining("tenant.jolli.ai"),
+				}),
+			);
+		});
+
+		it("is a no-op when no panel is open", async () => {
+			SettingsWebviewPanel.dispose();
+			postMessage.mockClear();
+			await SettingsWebviewPanel.notifyAuthChanged();
+			expect(postMessage).not.toHaveBeenCalled();
+		});
+
+		it("posts authStateChanged with the resolved aiProvider so the form can re-sync", async () => {
+			// Pin: sign-in writes aiProvider:"jolli" on disk via
+			// saveAuthCredentials. Without postAuthState relaying that, the
+			// open form's dropdown stays stale and the next Apply silently
+			// overwrites disk with the user's pre-sign-in choice. Whichever
+			// provider is on disk after the auth event has to round-trip into
+			// the message.
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				aiProvider: "jolli",
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			postMessage.mockClear();
+
+			await SettingsWebviewPanel.notifyAuthChanged();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "authStateChanged",
+					aiProvider: "jolli",
+				}),
+			);
+		});
+
+		it("posts authStateChanged with hasJolliKey=false when config has no Jolli key", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			postMessage.mockClear();
+
+			await SettingsWebviewPanel.notifyAuthChanged();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "authStateChanged",
+					hasJolliKey: false,
+					jolliSiteLabel: "Using Jolli to generate summaries",
+				}),
+			);
+		});
+	});
+
+	describe("rebuildKnowledgeBase message", () => {
+		it("forwards the command and posts success result back to the webview", async () => {
+			mockExecuteCommand.mockImplementation(async (cmd: string) => {
+				if (cmd === "jollimemory.rebuildKnowledgeBase") {
+					return { ok: true, message: "Migrated 42 memories" };
+				}
+				return undefined;
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "rebuildKnowledgeBase" });
+			await flushPromises();
+
+			expect(mockExecuteCommand).toHaveBeenCalledWith(
+				"jollimemory.rebuildKnowledgeBase",
+			);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "rebuildKnowledgeBaseDone",
+				success: true,
+				message: "Migrated 42 memories",
+			});
+		});
+
+		it("falls back to success=false / empty message when the command returns undefined", async () => {
+			mockExecuteCommand.mockResolvedValue(undefined);
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "rebuildKnowledgeBase" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "rebuildKnowledgeBaseDone",
+				success: false,
+				message: "",
+			});
+		});
+
+		it("posts the error message back when the command rejects with an Error", async () => {
+			mockExecuteCommand.mockRejectedValue(new Error("rebuild boom"));
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "rebuildKnowledgeBase" });
+			await flushPromises();
+
+			expect(logError).toHaveBeenCalledWith(
+				"SettingsPanel",
+				expect.stringContaining("rebuild boom"),
+			);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "rebuildKnowledgeBaseDone",
+				success: false,
+				message: "rebuild boom",
+			});
+		});
+
+		it("stringifies non-Error rejections in the failure message", async () => {
+			mockExecuteCommand.mockRejectedValue("plain string failure");
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "rebuildKnowledgeBase" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "rebuildKnowledgeBaseDone",
+				success: false,
+				message: "plain string failure",
+			});
+		});
+	});
+
+	describe("signIn / signOut command errors", () => {
+		it("logs an error and posts a user-visible banner when jollimemory.signIn rejects", async () => {
+			mockExecuteCommand.mockImplementation(async (cmd: string) => {
+				if (cmd === "jollimemory.signIn") throw new Error("oauth blew up");
+				return undefined;
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+			dispatch({ command: "signIn" });
+			await flushPromises();
+
+			expect(logError).toHaveBeenCalledWith(
+				"SettingsPanel",
+				expect.stringContaining("oauth blew up"),
+			);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "settingsError",
+				message: expect.stringContaining("oauth blew up"),
+			});
+		});
+
+		it("logs an error and posts a user-visible banner when jollimemory.signOut rejects", async () => {
+			mockExecuteCommand.mockImplementation(async (cmd: string) => {
+				if (cmd === "jollimemory.signOut") throw new Error("signout blew up");
+				return undefined;
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+			dispatch({ command: "signOut" });
+			await flushPromises();
+
+			expect(logError).toHaveBeenCalledWith(
+				"SettingsPanel",
+				expect.stringContaining("signout blew up"),
+			);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "settingsError",
+				message: expect.stringContaining("signout blew up"),
+			});
+		});
+	});
+
+	describe("handleLoadSettings — stored Jolli API key validation", () => {
+		it("posts a settingsError when the stored Jolli API key fails to decode", async () => {
+			// `sk-jol-` prefix with a single segment that isn't valid base64url JSON →
+			// parseJolliApiKey returns null → validateJolliApiKey throws.
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: "sk-jol-not.valid",
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsError",
+					message: expect.stringMatching(/key currently on disk is invalid/),
+				}),
+			);
+		});
+	});
+
+	describe("resolveProvider — auth-derived fallback", () => {
+		it("defaults aiProvider to 'jolli' when unset and authService reports signed-in", async () => {
+			const meta = { t: "tenant", u: "https://tenant.jolli.ai" };
+			const encoded = Buffer.from(JSON.stringify(meta)).toString("base64url");
+			const jolliKey = `sk-jol-${encoded}.secret`;
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: jolliKey,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			const fakeAuth = { isSignedIn: vi.fn().mockReturnValue(true) };
+
+			await SettingsWebviewPanel.show(
+				extensionUri,
+				workspaceRoot,
+				undefined,
+				fakeAuth as never,
+			);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(fakeAuth.isSignedIn).toHaveBeenCalled();
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					signedIn: true,
+					settings: expect.objectContaining({ aiProvider: "jolli" }),
 				}),
 			);
 		});

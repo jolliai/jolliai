@@ -81,6 +81,9 @@ function summaryLlmResult(text: string, overrides: Partial<LlmCallResult> = {}):
 		outputTokens: 50,
 		apiLatencyMs: 123,
 		stopReason: "end_turn",
+		// Default to direct config-key path for test brevity. Tests that
+		// specifically exercise proxy behavior override via the second arg.
+		source: "anthropic-config",
 		...overrides,
 	};
 }
@@ -779,6 +782,47 @@ ${delimited({
 			expect(record.topics).toHaveLength(0);
 		});
 
+		// Pins the round-trip the footer attribution feature relies on. The
+		// dispatcher is exhaustively tested in LlmClient.test.ts, but if a
+		// future refactor drops `source: llmResult.source` here in Summarizer
+		// the dispatcher tests still pass while every newly-written summary
+		// silently loses its `via Anthropic` / `via Jolli` footer label.
+		describe("LlmCallMetadata.source propagation", () => {
+			it("copies source from LlmCallResult onto the persisted llm metadata", async () => {
+				mockCallLlm.mockResolvedValueOnce(
+					summaryLlmResult(delimited({ title: "A", trigger: "t", response: "r", decisions: "d" }), {
+						source: "jolli-proxy",
+					}),
+				);
+				const record = await generateSummary({
+					conversation: "",
+					diff: "",
+					commitInfo: mockCommitInfo,
+					diffStats: mockDiffStats,
+					transcriptEntries: 0,
+					config: mockConfig,
+				});
+				expect(record.llm.source).toBe("jolli-proxy");
+			});
+
+			it("preserves anthropic-env source when env-mode call returns it", async () => {
+				mockCallLlm.mockResolvedValueOnce(
+					summaryLlmResult(delimited({ title: "A", trigger: "t", response: "r", decisions: "d" }), {
+						source: "anthropic-env",
+					}),
+				);
+				const record = await generateSummary({
+					conversation: "",
+					diff: "",
+					commitInfo: mockCommitInfo,
+					diffStats: mockDiffStats,
+					transcriptEntries: 0,
+					config: mockConfig,
+				});
+				expect(record.llm.source).toBe("anthropic-env");
+			});
+		});
+
 		describe("strict-retry on format failure", () => {
 			// A long-but-malformed first response: > 100 chars, no ===TOPIC=== / ---TICKETID--- /
 			// ---RECAP---. This is the failure mode the retry mechanism guards against
@@ -841,6 +885,29 @@ ${delimited({
 				expect(record.llm.inputTokens).toBe(130);
 				expect(record.llm.outputTokens).toBe(130);
 				expect(record.llm.apiLatencyMs).toBe(1500);
+			});
+
+			it("propagates source from the retry result onto the persisted metadata", async () => {
+				mockCallLlm
+					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown, { source: "anthropic-config" }))
+					.mockResolvedValueOnce(
+						summaryLlmResult(
+							delimited({ title: "Recovered topic", trigger: "t", response: "r", decisions: "d" }),
+							{ source: "jolli-proxy" },
+						),
+					);
+
+				const record = await generateSummary({
+					conversation: "x",
+					diff: "y",
+					commitInfo: mockCommitInfo,
+					diffStats: mockDiffStats,
+					transcriptEntries: 1,
+					config: mockConfig,
+				});
+
+				// Production code reads from the retry result by construction.
+				expect(record.llm.source).toBe("jolli-proxy");
 			});
 
 			it("accepts empty result when both first call and strict-retry produce no topics", async () => {
@@ -2087,6 +2154,21 @@ Test reordering
 				expect(result?.llm?.inputTokens).toBe(250);
 				expect(result?.llm?.outputTokens).toBe(180);
 				expect(result?.llm?.apiLatencyMs).toBe(2700);
+			});
+
+			it("propagates source from the strict-retry result onto squash llm metadata", async () => {
+				mockCallLlm
+					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown, { source: "anthropic-config" }))
+					.mockResolvedValueOnce(
+						summaryLlmResult(
+							"===TOPIC===\n---TITLE---\nRecovered\n---TRIGGER---\nt\n---RESPONSE---\nr\n---DECISIONS---\nReal decision\n",
+							{ source: "jolli-proxy" },
+						),
+					);
+				const result = await generateSquashConsolidation(
+					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
+				);
+				expect(result?.llm?.source).toBe("jolli-proxy");
 			});
 
 			it("falls through to null when both squash-consolidate and squash-consolidate-strict fail format check", async () => {

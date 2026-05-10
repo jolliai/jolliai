@@ -9,9 +9,15 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { createLogger } from "../Logger.js";
+import type { LlmCredentialSource } from "../Types.js";
 import { parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
 import { fillTemplate, findUnfilledPlaceholders, TEMPLATES } from "./PromptTemplates.js";
 import { resolveModelId } from "./Summarizer.js";
+
+// Re-export so existing imports of LlmCredentialSource from this module keep
+// working — the source-of-truth definition lives in Types.ts because
+// LlmCallMetadata references it (Types → LlmClient would cycle).
+export type { LlmCredentialSource } from "../Types.js";
 
 /** Module-level cache: reuse Anthropic client instances keyed by API key */
 const clientCache = new Map<string, Anthropic>();
@@ -107,14 +113,18 @@ interface LlmCredentials {
 	readonly model?: string;
 	/** Jolli Space API key for proxy mode (sk-jol-...) */
 	readonly jolliApiKey?: string;
+	/**
+	 * Explicit user preference from Settings UI / config.json. When set, takes
+	 * priority over the credential-presence precedence so the UI's "Provider"
+	 * dropdown is actually authoritative — without this, picking "Jolli" while
+	 * also having ANTHROPIC_API_KEY in config would silently route to Anthropic
+	 * (the "Settings says Jolli, doctor says Anthropic" bug).
+	 *
+	 * Optional — legacy configs without this field fall through to the
+	 * credential-presence precedence below.
+	 */
+	readonly aiProvider?: "anthropic" | "jolli";
 }
-
-/**
- * Which credential source `callLlm` will pick, in the same precedence order
- * the dispatcher uses. Exported so diagnostic tooling (e.g. `doctor`) can
- * report the exact source without re-implementing the precedence rules.
- */
-export type LlmCredentialSource = "anthropic-config" | "anthropic-env" | "jolli-proxy";
 
 /**
  * Resolves which credential source `callLlm` would use for these credentials,
@@ -122,10 +132,28 @@ export type LlmCredentialSource = "anthropic-config" | "anthropic-env" | "jolli-
  *
  * Must stay aligned with the dispatch logic in `callLlm` — and it does, because
  * `callLlm` itself routes through this function.
+ *
+ * Resolution order:
+ *   1. **Explicit `aiProvider` choice** (Settings UI / config.json). When set,
+ *      only the matching credential is considered. If that credential is
+ *      missing, returns `null` rather than silently falling back to the other
+ *      provider — silent cross-provider fallback was the root cause of the
+ *      "Settings says Jolli, doctor reports Anthropic" mismatch.
+ *   2. **Legacy precedence** (apiKey > ANTHROPIC_API_KEY env > jolliApiKey),
+ *      used when `aiProvider` is undefined so existing configs continue to
+ *      work unchanged.
  */
 export function resolveLlmCredentialSource(
-	credentials: Pick<LlmCredentials, "apiKey" | "jolliApiKey">,
+	credentials: Pick<LlmCredentials, "apiKey" | "jolliApiKey" | "aiProvider">,
 ): LlmCredentialSource | null {
+	if (credentials.aiProvider === "jolli") {
+		return credentials.jolliApiKey ? "jolli-proxy" : null;
+	}
+	if (credentials.aiProvider === "anthropic") {
+		if (credentials.apiKey) return "anthropic-config";
+		if (process.env.ANTHROPIC_API_KEY) return "anthropic-env";
+		return null;
+	}
 	if (credentials.apiKey) return "anthropic-config";
 	if (process.env.ANTHROPIC_API_KEY) return "anthropic-env";
 	if (credentials.jolliApiKey) return "jolli-proxy";
@@ -155,6 +183,13 @@ export interface LlmCallResult {
 	readonly apiLatencyMs: number;
 	/** Stop reason from the API (e.g. "end_turn"); undefined in proxy mode */
 	readonly stopReason?: string | null;
+	/**
+	 * Which credential source produced this result. Populated by `callLlm`
+	 * from the same `resolveLlmCredentialSource` call that picked the path,
+	 * so it's authoritative — callers shouldn't try to re-derive it.
+	 * Persisted into `LlmCallMetadata.source` for traceability of past summaries.
+	 */
+	readonly source: LlmCredentialSource;
 }
 
 /**
@@ -163,30 +198,62 @@ export interface LlmCallResult {
 export async function callLlm(options: LlmCallOptions): Promise<LlmCallResult> {
 	const source = resolveLlmCredentialSource(options);
 
+	// Single dispatch-site log so every call leaves a "which provider was used"
+	// trace, regardless of mode. Unifies what was previously asymmetric: only
+	// proxy mode logged on success (`callProxy` line below), direct mode was
+	// silent unless it errored. With this log, users can grep `debug.log`
+	// after a commit to verify Settings UI's provider choice was honored
+	// end-to-end. Skipped when source is null because the next switch branch
+	// throws "No LLM provider available" — no provider was actually used.
+	if (source) {
+		log.info("LLM call: action=%s source=%s", options.action, source);
+	}
+
 	switch (source) {
 		case "anthropic-config":
 			// resolveLlmCredentialSource returned "anthropic-config" → options.apiKey is set
-			return callDirect(options, options.apiKey as string);
+			return callDirect(options, options.apiKey as string, source);
 		case "anthropic-env":
 			// resolveLlmCredentialSource returned "anthropic-env" → env var is set
-			return callDirect(options, process.env.ANTHROPIC_API_KEY as string);
+			return callDirect(options, process.env.ANTHROPIC_API_KEY as string, source);
 		case "jolli-proxy": {
 			const jolliApiKey = options.jolliApiKey as string;
 			const baseUrl = parseJolliApiKey(jolliApiKey)?.u;
 			if (!baseUrl) {
 				throw new Error("Could not derive Jolli site URL from API key. Please regenerate your Jolli API Key.");
 			}
-			return callProxy(options, baseUrl);
+			return callProxy(options, baseUrl, source);
 		}
 		default:
-			throw new Error(
-				"No LLM provider available. Set an Anthropic API key (ANTHROPIC_API_KEY) or configure a Jolli Space API key (jolliApiKey).",
-			);
+			throw new Error(NO_LLM_PROVIDER_MESSAGE);
 	}
 }
 
+/**
+ * Thrown by `callLlm` when no provider can be resolved from the supplied
+ * credentials and `aiProvider` choice. Exported so callers (e.g. the queue
+ * worker) can distinguish credential-config errors from transient transport
+ * errors and skip retry/placeholder fallbacks that would mask the failure.
+ */
+export const NO_LLM_PROVIDER_MESSAGE =
+	"No LLM provider available. Set an Anthropic API key (ANTHROPIC_API_KEY) or configure a Jolli Space API key (jolliApiKey).";
+
+/**
+ * True when `err` is the "no LLM provider available" failure — i.e. a
+ * credential-config error that won't recover on retry. Callers use this to
+ * skip retry loops and placeholder writes that would otherwise hide the
+ * "fix your Settings" signal from the user.
+ */
+export function isLlmCredentialError(err: unknown): boolean {
+	return err instanceof Error && err.message === NO_LLM_PROVIDER_MESSAGE;
+}
+
 /** Direct mode: call Anthropic SDK locally */
-async function callDirect(options: LlmCallOptions, apiKey: string): Promise<LlmCallResult> {
+async function callDirect(
+	options: LlmCallOptions,
+	apiKey: string,
+	source: LlmCredentialSource,
+): Promise<LlmCallResult> {
 	const entry = TEMPLATES.get(options.action);
 	if (!entry) {
 		throw new Error(`Unknown LLM action: "${options.action}". Available: ${[...TEMPLATES.keys()].join(", ")}`);
@@ -244,11 +311,16 @@ async function callDirect(options: LlmCallOptions, apiKey: string): Promise<LlmC
 		outputTokens: response.usage.output_tokens,
 		apiLatencyMs: elapsed,
 		stopReason: response.stop_reason,
+		source,
 	};
 }
 
 /** Proxy mode: POST structured request to Jolli backend */
-async function callProxy(options: LlmCallOptions, baseUrl: string): Promise<LlmCallResult> {
+async function callProxy(
+	options: LlmCallOptions,
+	baseUrl: string,
+	source: LlmCredentialSource,
+): Promise<LlmCallResult> {
 	const { jolliApiKey } = options;
 	/* v8 ignore start -- callProxy is only reached via callLlm which already guards jolliApiKey */
 	if (!jolliApiKey) {
@@ -327,6 +399,7 @@ async function callProxy(options: LlmCallOptions, baseUrl: string): Promise<LlmC
 		inputTokens: (result.inputTokens as number) ?? 0,
 		outputTokens: (result.outputTokens as number) ?? 0,
 		apiLatencyMs: elapsed,
+		source,
 	};
 	/* v8 ignore stop */
 }

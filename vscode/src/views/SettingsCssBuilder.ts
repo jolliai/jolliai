@@ -29,23 +29,58 @@ export function buildSettingsCss(): string {
   .settings-page h1 {
     font-size: 22px;
     font-weight: 600;
-    margin-bottom: 24px;
+    margin-bottom: 16px;
     color: var(--vscode-foreground);
   }
 
-  /* ── Group cards ── */
-  .settings-group {
-    margin-bottom: 24px;
+  /* Universal display:none switch — keep all dynamic show/hide on this class
+     so it always wins over display:flex / display:block on the same element. */
+  .hidden { display: none !important; }
+
+  /* ── Tab navigation ── */
+  .tab-nav {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15));
+    margin-bottom: 20px;
   }
-  .settings-group h2 {
+  .tab-button {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 14px;
     font-size: 13px;
+    font-family: var(--vscode-font-family);
+    color: var(--vscode-descriptionForeground);
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    margin-bottom: -1px;
+  }
+  .tab-button:hover {
+    color: var(--vscode-foreground);
+  }
+  .tab-button.tab-active {
+    color: var(--vscode-foreground);
+    border-bottom-color: var(--vscode-focusBorder, var(--vscode-button-background));
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+  }
+
+  .tab-panel {
+    display: block;
+  }
+  .section-hint {
+    font-size: 12px;
     color: var(--vscode-descriptionForeground);
     margin-bottom: 12px;
-    padding-bottom: 6px;
-    border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15));
+    line-height: 1.5;
+  }
+
+  /* ── Card panels (provider/sync state cards inside a tab) ── */
+  .card-panel {
+    margin-bottom: 12px;
+  }
+  .card-panel + .card-panel {
+    margin-top: 8px;
   }
 
   /* ── Form rows ── */
@@ -182,7 +217,7 @@ export function buildSettingsCss(): string {
     transform: translateX(16px);
   }
 
-  /* ── Browse row ── */
+  /* ── Browse / secondary button ── */
   .browse-row {
     flex: 1;
     display: flex;
@@ -207,33 +242,52 @@ export function buildSettingsCss(): string {
   }
   .browse-btn:hover { opacity: 0.85; }
 
-  /* ── Radio / fieldset ── */
-  fieldset.settings-row.column {
+  /* ── Primary action button (Sign In etc.) ── */
+  .primary-btn {
+    padding: 6px 16px;
+    font-size: 13px;
+    font-family: var(--vscode-font-family);
     border: none;
-    padding: 0;
+    border-radius: 3px;
+    cursor: pointer;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    transition: opacity 0.15s;
   }
-  fieldset.settings-row.column legend {
-    margin-bottom: 8px;
-  }
-  .radio-label {
+  .primary-btn:hover { opacity: 0.9; }
+  .primary-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* ── Status indicators ── */
+  .status-ok,
+  .status-warn {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 6px;
     font-size: 13px;
-    color: var(--vscode-foreground);
-    padding: 3px 0;
+    line-height: 1.5;
+    padding: 4px 0 8px;
+  }
+  /* Reuse VS Code's theme tokens so high-contrast / light / dim themes stay
+     coherent. Hex fallbacks match the SidebarCssBuilder status icons so the
+     two webviews render identically when a theme omits the variable. */
+  .status-ok { color: var(--vscode-testing-iconPassed, #89d185); }
+  .status-warn { color: var(--vscode-testing-iconQueued, #cca700); }
+  .status-icon { font-size: 14px; flex-shrink: 0; }
+
+  /* ── Advanced toggle (link-style button) ── */
+  .link-btn {
+    background: none;
+    border: none;
+    padding: 4px 0;
+    font-size: 12px;
+    font-family: var(--vscode-font-family);
+    color: var(--vscode-textLink-foreground, var(--vscode-button-background));
     cursor: pointer;
+    text-decoration: none;
   }
-  .radio-label input[type="radio"] {
-    accent-color: var(--vscode-button-background);
-    cursor: pointer;
-  }
-  .radio-label input[type="radio"]:disabled {
-    cursor: not-allowed;
-  }
-  .radio-hint {
-    font-style: italic;
-  }
+  .link-btn:hover { text-decoration: underline; }
+  .advanced-link { display: inline-block; margin-top: 6px; }
+  .advanced-panel { margin-top: 8px; }
 
   /* ── Action bar ── */
   .action-bar {

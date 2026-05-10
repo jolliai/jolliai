@@ -137,6 +137,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
 		jolliApiKey: config.jolliApiKey,
+		aiProvider: config.aiProvider,
 	});
 
 	// Parse raw LLM text (both direct and proxy modes return raw text)
@@ -164,6 +165,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 		outputTokens: llmResult.outputTokens,
 		apiLatencyMs: llmResult.apiLatencyMs,
 		stopReason: llmResult.stopReason ?? null,
+		source: llmResult.source,
 	};
 	if (!isFormatCompliant(responseText)) {
 		log.error("=== LLM raw response (format-incompliant) START ===");
@@ -204,6 +206,10 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 					outputTokens: llmMeta.outputTokens + retryResult.outputTokens,
 					apiLatencyMs: llmMeta.apiLatencyMs + retryResult.apiLatencyMs,
 					stopReason: retryResult.stopReason ?? null,
+					// Retry uses the same credentials as the first call, so source
+					// is identical — pull from the retry result rather than the
+					// initial llmMeta to keep the construction local & explicit.
+					source: retryResult.source,
 				};
 			} else {
 				log.warn("Strict-retry response was also format-incompliant -- accepting first-response result");
@@ -657,6 +663,7 @@ export async function generateCommitMessage(params: CommitMessageParams): Promis
 		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
 		jolliApiKey: config.jolliApiKey,
+		aiProvider: config.aiProvider,
 	});
 
 	const message = (llmResult.text ?? "").trim().replace(/^["']|["']$/g, "");
@@ -735,6 +742,7 @@ export async function generateSquashMessage(params: SquashMessageParams): Promis
 		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
 		jolliApiKey: config.jolliApiKey,
+		aiProvider: config.aiProvider,
 	});
 
 	const message = (llmResult.text ?? "").trim().replace(/^["']|["']$/g, "");
@@ -903,6 +911,7 @@ export async function generateE2eTest(params: E2eTestParams): Promise<ReadonlyAr
 		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
 		jolliApiKey: config.jolliApiKey,
+		aiProvider: config.aiProvider,
 	});
 
 	const scenarios = parseE2eTestResponse(llmResult.text ?? "");
@@ -985,6 +994,7 @@ export async function generateRecap(params: RecapParams): Promise<string> {
 		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
 		jolliApiKey: config.jolliApiKey,
+		aiProvider: config.aiProvider,
 	});
 
 	const recap = parseRecapResponse(llmResult.text ?? "");
@@ -1017,6 +1027,7 @@ export async function translateToEnglish(params: TranslateParams): Promise<strin
 		apiKey: config.apiKey,
 		model: resolveModelId(config.model),
 		jolliApiKey: config.jolliApiKey,
+		aiProvider: config.aiProvider,
 	});
 
 	return llmResult.text ?? "";
@@ -1330,6 +1341,7 @@ export async function generateSquashConsolidation(
 			outputTokens: llmResult.outputTokens,
 			apiLatencyMs: llmResult.apiLatencyMs,
 			stopReason: llmResult.stopReason ?? null,
+			source: llmResult.source,
 		};
 		return { responseText, parsed, llm };
 	};
@@ -1394,6 +1406,9 @@ export async function generateSquashConsolidation(
 					outputTokens: first.llm.outputTokens + strict.llm.outputTokens,
 					apiLatencyMs: first.llm.apiLatencyMs + strict.llm.apiLatencyMs,
 					stopReason: strict.llm.stopReason,
+					// Same credentials across both calls; strict.llm.source is
+					// equal to first.llm.source by construction (callOnce → callLlm).
+					source: strict.llm.source,
 				};
 				return buildResult(strict.parsed, mergedLlm);
 			}

@@ -84,6 +84,7 @@ export async function evaluatePlanProgress(
 			apiKey: config.apiKey,
 			model: resolveModelId(config.model ?? "haiku"),
 			jolliApiKey: config.jolliApiKey,
+			aiProvider: config.aiProvider,
 		});
 	} catch (error: unknown) {
 		log.warn("Plan progress LLM call failed: %s", (error as Error).message);
@@ -139,6 +140,7 @@ export async function evaluatePlanProgress(
 		outputTokens: llmResult.outputTokens,
 		apiLatencyMs: llmResult.apiLatencyMs,
 		stopReason: llmResult.stopReason ?? null,
+		source: llmResult.source,
 	};
 
 	return { summary: parsed.summary, steps, llm };

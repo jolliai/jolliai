@@ -4261,14 +4261,60 @@ describe("CLI", () => {
 
 		it("should show API key reminder when Anthropic key remains after logout", async () => {
 			const { saveConfig, loadConfig } = await import("./core/SessionTracker.js");
-			vi.mocked(loadConfig).mockResolvedValueOnce({ apiKey: "sk-test" });
-			vi.mocked(saveConfig).mockResolvedValueOnce(undefined);
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" });
+			vi.mocked(saveConfig).mockResolvedValue(undefined);
 
 			await main(["auth", "logout"]);
 
 			const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
 			expect(calls.some((s) => s.includes("Auth token and Jolli API Key have been removed"))).toBe(true);
 			expect(calls.some((s) => s.includes("Anthropic API Key"))).toBe(true);
+			expect(calls.some((s) => s.includes("will continue to work"))).toBe(true);
+		});
+
+		it("clears the auto-set aiProvider='jolli' on logout so the Anthropic key becomes reachable again", async () => {
+			// `saveAuthCredentials` writes `aiProvider: "jolli"` automatically on
+			// sign-in. If logout left that preference behind, the dispatcher
+			// would refuse to fall back to a still-saved Anthropic key and
+			// commits would silently fail — VS Code users in particular never
+			// see the CLI warning copy. Pin the rollback so the happy-path
+			// message stays truthful.
+			const { saveConfig, loadConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(loadConfig).mockResolvedValue({
+				apiKey: "sk-test",
+				aiProvider: "jolli",
+			});
+			vi.mocked(saveConfig).mockResolvedValue(undefined);
+
+			await main(["auth", "logout"]);
+
+			expect(saveConfig).toHaveBeenCalledWith({
+				authToken: undefined,
+				jolliApiKey: undefined,
+				aiProvider: undefined,
+			});
+			const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+			expect(calls.some((s) => s.includes("will continue to work"))).toBe(true);
+		});
+
+		it("preserves an explicit aiProvider='anthropic' choice across logout", async () => {
+			// A user who picked Anthropic in Settings (not the auto-set value
+			// from sign-in) shouldn't have that choice erased by an unrelated
+			// logout. Only the sign-in-time auto-write of aiProvider="jolli"
+			// is rolled back.
+			const { saveConfig, loadConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(loadConfig).mockResolvedValue({
+				apiKey: "sk-test",
+				aiProvider: "anthropic",
+			});
+			vi.mocked(saveConfig).mockResolvedValue(undefined);
+
+			await main(["auth", "logout"]);
+
+			expect(saveConfig).toHaveBeenCalledWith({
+				authToken: undefined,
+				jolliApiKey: undefined,
+			});
 		});
 
 		it("should call browserLogin on auth login", async () => {

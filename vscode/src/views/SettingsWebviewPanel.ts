@@ -8,6 +8,9 @@
  * - Loading config from the global config directory
  * - API key masking (first 12 + **** + last 4)
  * - Saving config changes via saveConfigScoped
+ * - Sign-in / sign-out via the shared AuthService
+ * - Pushing auth-state-change messages so the webview re-renders provider/sync
+ *   cards without a full settings reload (mirrors IntelliJ's auth listener)
  */
 
 import { randomBytes } from "node:crypto";
@@ -16,7 +19,10 @@ import {
 	getProjectRootDir,
 	listWorktrees,
 } from "../../../cli/src/core/GitOps.js";
-import { validateJolliApiKey } from "../../../cli/src/core/JolliApiUtils.js";
+import {
+	parseJolliApiKey,
+	validateJolliApiKey,
+} from "../../../cli/src/core/JolliApiUtils.js";
 import {
 	getGlobalConfigDir,
 	loadConfigFromDir,
@@ -29,6 +35,7 @@ import {
 	removeGeminiHook,
 } from "../../../cli/src/install/Installer.js";
 import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
+import type { AuthService } from "../services/AuthService.js";
 import { log } from "../util/Logger.js";
 import { buildSettingsHtml } from "./SettingsHtmlBuilder.js";
 
@@ -37,6 +44,7 @@ interface SettingsPayload {
 	readonly apiKey: string;
 	readonly model: string;
 	readonly maxTokens: number | null;
+	readonly aiProvider: "anthropic" | "jolli";
 	readonly jolliApiKey: string;
 	readonly claudeEnabled: boolean;
 	readonly codexEnabled: boolean;
@@ -59,6 +67,8 @@ type SettingsMessage =
 	| { command: "loadSettings" }
 	| { command: "browseLocalFolder" }
 	| { command: "rebuildKnowledgeBase" }
+	| { command: "signIn" }
+	| { command: "signOut" }
 	| {
 			command: "applySettings";
 			settings: SettingsPayload;
@@ -80,11 +90,21 @@ function maskApiKey(key: string | undefined): string {
 	if (!hasKnownPrefix && key.length <= 16) {
 		return key;
 	}
-	// Always show prefix + **** + last 4.
-	// prefixLen is guaranteed >= 3: known-prefix keys are >= 7 chars,
-	// unknown-prefix keys reaching here are > 16 chars.
 	const prefixLen = Math.min(12, key.length - 4);
 	return `${key.substring(0, prefixLen)}****${key.substring(key.length - 4)}`;
+}
+
+/**
+ * Builds the human-friendly site label shown on the AI Summary > Jolli card.
+ * Mirrors the Kotlin port in `intellij/.../SettingsDialog.kt::refreshJolliFields`.
+ */
+function buildJolliSiteLabel(jolliApiKey: string | undefined): string {
+	if (!jolliApiKey) return "Using Jolli to generate summaries";
+	const meta = parseJolliApiKey(jolliApiKey);
+	const siteDisplay = meta?.u.replace(/^https?:\/\//, "") ?? "";
+	return siteDisplay
+		? `Signed in to ${siteDisplay} — using Jolli to generate summaries`
+		: "Using Jolli to generate summaries";
 }
 
 /** Callback type for post-save refresh. */
@@ -95,6 +115,7 @@ export class SettingsWebviewPanel {
 
 	private readonly panel: vscode.WebviewPanel;
 	private readonly workspaceRoot: string;
+	private readonly authService: AuthService | undefined;
 	private onSavedCallback: OnSavedCallback | undefined;
 	/** Full (unmasked) API keys from the last config load — used to detect unchanged masked values. */
 	private fullApiKey = "";
@@ -103,10 +124,12 @@ export class SettingsWebviewPanel {
 	private constructor(
 		extensionUri: vscode.Uri,
 		workspaceRoot: string,
-		onSaved?: OnSavedCallback,
+		onSaved: OnSavedCallback | undefined,
+		authService: AuthService | undefined,
 	) {
 		this.onSavedCallback = onSaved;
 		this.workspaceRoot = workspaceRoot;
+		this.authService = authService;
 		this.panel = vscode.window.createWebviewPanel(
 			"jollimemory.settings",
 			"Jolli Memory Settings",
@@ -135,6 +158,7 @@ export class SettingsWebviewPanel {
 		extensionUri: vscode.Uri,
 		workspaceRoot: string,
 		onSaved?: OnSavedCallback,
+		authService?: AuthService,
 	): void {
 		if (SettingsWebviewPanel.currentPanel) {
 			if (onSaved) {
@@ -147,6 +171,7 @@ export class SettingsWebviewPanel {
 			extensionUri,
 			workspaceRoot,
 			onSaved,
+			authService,
 		);
 	}
 
@@ -156,6 +181,19 @@ export class SettingsWebviewPanel {
 			SettingsWebviewPanel.currentPanel.panel.dispose();
 			SettingsWebviewPanel.currentPanel = undefined;
 		}
+	}
+
+	/**
+	 * Pushes the current auth state to the open panel (if any). Called from
+	 * Extension.ts after the OAuth callback completes (sign-in) or the sign-out
+	 * command runs, so the panel can re-render its provider/sync cards without
+	 * a full settings reload. Reads config fresh to pick up the API key the
+	 * server just issued.
+	 */
+	static async notifyAuthChanged(): Promise<void> {
+		const panel = SettingsWebviewPanel.currentPanel;
+		if (!panel) return;
+		await panel.postAuthState();
 	}
 
 	private handleMessage(message: SettingsMessage): void {
@@ -191,14 +229,34 @@ export class SettingsWebviewPanel {
 					});
 				});
 				break;
+			case "signIn":
+				// Delegate to the same command Extension.ts registers so the OAuth
+				// flow is identical to the sidebar's Sign In path.
+				vscode.commands
+					.executeCommand("jollimemory.signIn")
+					.then(undefined, (err: unknown) => {
+						log.error("SettingsPanel", `signIn command failed: ${err}`);
+						this.postError(
+							`Sign in failed: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					});
+				break;
+			case "signOut":
+				vscode.commands
+					.executeCommand("jollimemory.signOut")
+					.then(undefined, (err: unknown) => {
+						log.error("SettingsPanel", `signOut command failed: ${err}`);
+						this.postError(
+							`Sign out failed: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					});
+				break;
 		}
 	}
 
 	/**
 	 * Forwards the Settings → Migrate to Memory Bank button click to the
-	 * `jollimemory.rebuildKnowledgeBase` command. The command returns a result
-	 * object (or throws) which we relay back to the webview so the button can
-	 * reset its loading state.
+	 * `jollimemory.rebuildKnowledgeBase` command.
 	 */
 	private async handleRebuildKnowledgeBase(): Promise<void> {
 		const result = (await vscode.commands.executeCommand(
@@ -232,6 +290,19 @@ export class SettingsWebviewPanel {
 		return getGlobalConfigDir();
 	}
 
+	/**
+	 * Resolves the AI provider for the loaded config: explicit value when
+	 * present, else "jolli" if signed in (matches IntelliJ's default-derivation
+	 * in `populateFields`), else "anthropic".
+	 */
+	private resolveProvider(config: JolliMemoryConfig): "anthropic" | "jolli" {
+		if (config.aiProvider === "anthropic" || config.aiProvider === "jolli") {
+			return config.aiProvider;
+		}
+		const signedIn = this.authService?.isSignedIn(config) ?? false;
+		return signedIn ? "jolli" : "anthropic";
+	}
+
 	/** Loads config from the global directory and sends it to the webview. */
 	private async handleLoadSettings(): Promise<void> {
 		const configDir = this.resolveConfigDir();
@@ -247,6 +318,7 @@ export class SettingsWebviewPanel {
 			apiKey: maskedApiKey,
 			model: config.model ?? "sonnet",
 			maxTokens: config.maxTokens ?? null,
+			aiProvider: this.resolveProvider(config),
 			jolliApiKey: maskedJolliApiKey,
 			claudeEnabled: config.claudeEnabled !== false,
 			codexEnabled: config.codexEnabled !== false,
@@ -260,16 +332,19 @@ export class SettingsWebviewPanel {
 				: "",
 		};
 
+		const signedIn = this.authService?.isSignedIn(config) ?? false;
+		const hasJolliKey = this.fullJolliApiKey.length > 0;
+
 		this.panel.webview.postMessage({
 			command: "settingsLoaded",
 			settings: payload,
 			maskedApiKey,
 			maskedJolliApiKey,
+			signedIn,
+			hasJolliKey,
+			jolliSiteLabel: buildJolliSiteLabel(config.jolliApiKey),
 		});
 
-		// Surface invalid-but-saved Jolli API keys as soon as Settings opens.
-		// The webview only sees the masked form, so without this the user can't
-		// tell a malformed key is sitting in config until they try to save.
 		if (this.fullJolliApiKey.length > 0) {
 			try {
 				validateJolliApiKey(this.fullJolliApiKey);
@@ -284,13 +359,36 @@ export class SettingsWebviewPanel {
 		}
 	}
 
+	/**
+	 * Reads fresh config and pushes auth-state-only update to the webview.
+	 *
+	 * Includes the resolved `aiProvider` so a sign-in/sign-out that flipped
+	 * `aiProvider` on disk is reflected in the open form. Without this, the
+	 * webview's `aiProviderSelect.value` would stay stale, and the next Apply
+	 * would silently overwrite disk's freshly-set value with the user's
+	 * pre-sign-in dropdown selection.
+	 */
+	private async postAuthState(): Promise<void> {
+		const configDir = this.resolveConfigDir();
+		const config = await loadConfigFromDir(configDir);
+		this.fullJolliApiKey = config.jolliApiKey ?? "";
+		const signedIn = this.authService?.isSignedIn(config) ?? false;
+		const hasJolliKey = this.fullJolliApiKey.length > 0;
+		this.panel.webview.postMessage({
+			command: "authStateChanged",
+			signedIn,
+			hasJolliKey,
+			aiProvider: this.resolveProvider(config),
+			jolliSiteLabel: buildJolliSiteLabel(config.jolliApiKey),
+		});
+	}
+
 	/** Saves settings, resolving masked API keys back to full values. */
 	private async handleApplySettings(
 		settings: SettingsPayload,
 		sentMaskedApiKey: string,
 		sentMaskedJolliApiKey: string,
 	): Promise<void> {
-		// Resolve API keys: if the value matches the masked string we sent, keep the original
 		const resolvedApiKey =
 			settings.apiKey === sentMaskedApiKey ? this.fullApiKey : settings.apiKey;
 		const resolvedJolliApiKey =
@@ -298,9 +396,6 @@ export class SettingsWebviewPanel {
 				? this.fullJolliApiKey
 				: settings.jolliApiKey;
 
-		// Reject unrecognized key shapes and keys whose embedded `.u` points off
-		// the allowlist before we touch disk or sync hooks. Surface the specific
-		// error inline so the user knows which field is wrong.
 		if (resolvedJolliApiKey.length > 0) {
 			try {
 				validateJolliApiKey(resolvedJolliApiKey);
@@ -313,7 +408,6 @@ export class SettingsWebviewPanel {
 			}
 		}
 
-		// Parse exclude patterns from comma-separated string
 		const excludePatterns = settings.excludePatterns
 			.split(",")
 			.map((p) => p.trim())
@@ -323,6 +417,7 @@ export class SettingsWebviewPanel {
 			apiKey: resolvedApiKey.length > 0 ? resolvedApiKey : undefined,
 			model: settings.model === "sonnet" ? undefined : settings.model,
 			maxTokens: settings.maxTokens ?? undefined,
+			aiProvider: settings.aiProvider,
 			jolliApiKey:
 				resolvedJolliApiKey.length > 0 ? resolvedJolliApiKey : undefined,
 			claudeEnabled: settings.claudeEnabled,
@@ -338,15 +433,12 @@ export class SettingsWebviewPanel {
 			excludePatterns: excludePatterns.length > 0 ? excludePatterns : undefined,
 		};
 
-		// Sync hooks before persisting config so that a hook-sync failure
-		// does not leave config committed with hooks in an inconsistent state.
 		const repoRoot = await getProjectRootDir(this.workspaceRoot);
 		await this.syncHooks(repoRoot, settings);
 
 		const configDir = this.resolveConfigDir();
 		await saveConfigScoped(update, configDir);
 
-		// Update cached full keys after save
 		this.fullApiKey = resolvedApiKey;
 		this.fullJolliApiKey = resolvedJolliApiKey;
 

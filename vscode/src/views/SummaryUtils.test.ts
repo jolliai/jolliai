@@ -25,11 +25,13 @@ import {
 	buildPlanPushTitle,
 	buildPushTitle,
 	collectAllPlans,
+	collectLlmSources,
 	collectSortedTopics,
 	escAttr,
 	escHtml,
 	formatDate,
 	formatFullDate,
+	formatProviderLabel,
 	padIndex,
 	renderCalloutText,
 	sortTopics,
@@ -702,6 +704,81 @@ describe("SummaryUtils", () => {
 		it("uses _ as fallback for empty branch", () => {
 			expect(buildBranchRelativePath(undefined)).toBe("_");
 			expect(buildBranchRelativePath("")).toBe("_");
+		});
+	});
+
+	describe("LLM provider attribution (collectLlmSources / formatProviderLabel)", () => {
+		// Minimal CommitSummary scaffolding — only the fields the walker reads.
+		// Tests pin the *behavior* the footer renderers depend on:
+		//   1. Single-source summaries return the matching label.
+		//   2. Multi-source summaries (e.g. squash containers whose children
+		//      were summarized on different machines) get a "mixed: …" label.
+		//   3. Pre-attribution summaries (no `source` anywhere) return undefined,
+		//      so the footer can omit the segment instead of printing "via unknown".
+		const baseNode = {
+			version: 3 as const,
+			commitHash: "abc",
+			commitMessage: "x",
+			commitAuthor: "y",
+			commitDate: "2026-01-01T00:00:00Z",
+			branch: "main",
+			generatedAt: "2026-01-01T00:00:00Z",
+		};
+
+		function nodeWithSource(
+			source: "anthropic-config" | "anthropic-env" | "jolli-proxy" | undefined,
+			children?: ReadonlyArray<CommitSummary>,
+		): CommitSummary {
+			return {
+				...baseNode,
+				llm: source
+					? {
+							model: "claude-sonnet-4-6",
+							inputTokens: 1,
+							outputTokens: 1,
+							apiLatencyMs: 1,
+							stopReason: "end_turn",
+							source,
+						}
+					: undefined,
+				children,
+			};
+		}
+
+		it("returns the single source label for a leaf summary", () => {
+			expect(formatProviderLabel(nodeWithSource("anthropic-config"))).toBe(
+				"Anthropic",
+			);
+			expect(formatProviderLabel(nodeWithSource("anthropic-env"))).toBe(
+				"Anthropic (env)",
+			);
+			expect(formatProviderLabel(nodeWithSource("jolli-proxy"))).toBe(
+				"Jolli proxy",
+			);
+		});
+
+		it("recurses into children when the root node has no llm (squash containers)", () => {
+			const squash = nodeWithSource(undefined, [
+				nodeWithSource("anthropic-env"),
+				nodeWithSource("anthropic-env"),
+			]);
+			expect(collectLlmSources(squash)).toEqual(["anthropic-env"]);
+			expect(formatProviderLabel(squash)).toBe("Anthropic (env)");
+		});
+
+		it("returns mixed label when distinct sources appear across the tree", () => {
+			const mixed = nodeWithSource(undefined, [
+				nodeWithSource("anthropic-config"),
+				nodeWithSource("jolli-proxy"),
+			]);
+			expect(formatProviderLabel(mixed)).toBe("mixed: Anthropic, Jolli proxy");
+		});
+
+		it("returns undefined for pre-attribution summaries (no source anywhere)", () => {
+			// Critical for the footer fallback: without this, footer would
+			// print "via undefined" or "via unknown" on every legacy summary.
+			expect(collectLlmSources(nodeWithSource(undefined))).toEqual([]);
+			expect(formatProviderLabel(nodeWithSource(undefined))).toBeUndefined();
 		});
 	});
 });

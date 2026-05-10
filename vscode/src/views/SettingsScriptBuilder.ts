@@ -2,14 +2,17 @@
  * SettingsScriptBuilder
  *
  * Returns the JavaScript embedded in the Settings webview for:
- * - Form state management and dirty tracking
- * - Real-time validation (API key prefixes, maxTokens)
- * - API key masking detection (unchanged masked value = preserve original)
- * - Apply Changes button and feedback
+ *  - Tab switching between AI Agents / AI Summary / Sync to Jolli / Memory Bank / Others
+ *  - Provider card switching in AI Summary (Anthropic vs Jolli sub-states)
+ *  - Sync to Jolli card switching (signed-in vs signed-out)
+ *  - Advanced (Jolli API Key) toggle
+ *  - Sign-in / Sign-out wiring (extension host commands)
+ *  - Form state management, dirty tracking, validation, masking detection
  *
  * Pure string template — no logic dependencies on other view modules.
  */
 
+import { ALLOWED_JOLLI_HOSTS } from "../../../cli/src/core/JolliApiUtils.js";
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
 
 /** Returns the JavaScript for the Settings webview interactions. */
@@ -23,7 +26,11 @@ export function buildSettingsScript(): string {
   const apiKeyInput = document.getElementById('apiKey');
   const modelSelect = document.getElementById('model');
   const maxTokensInput = document.getElementById('maxTokens');
+  const aiProviderSelect = document.getElementById('aiProvider');
+  // Two Jolli API key inputs (jolli-ok and jolli-nokey cards) — kept in sync.
   const jolliApiKeyInput = document.getElementById('jolliApiKey');
+  const jolliApiKeyNoKeyInput = document.getElementById('jolliApiKeyNoKey');
+  const jolliSiteLabel = document.getElementById('jolliSiteLabel');
   const claudeEnabledInput = document.getElementById('claudeEnabled');
   const codexEnabledInput = document.getElementById('codexEnabled');
   const geminiEnabledInput = document.getElementById('geminiEnabled');
@@ -37,6 +44,11 @@ export function buildSettingsScript(): string {
   const excludePatternsInput = document.getElementById('excludePatterns');
   const applyBtn = document.getElementById('applyBtn');
   const saveFeedback = document.getElementById('saveFeedback');
+  const anthropicMissingWarn = document.getElementById('anthropicMissingWarn');
+  const summarySignInBtn = document.getElementById('summarySignInBtn');
+  const summaryReLoginBtn = document.getElementById('summaryReLoginBtn');
+  const syncSignInBtn = document.getElementById('syncSignInBtn');
+  const syncSignOutBtn = document.getElementById('syncSignOutBtn');
 
   // ── State ──
   let maskedApiKey = '';
@@ -44,9 +56,91 @@ export function buildSettingsScript(): string {
   let initialState = {};
   let isDirty = false;
   let hasErrors = false;
+  // Auth state pushed by the extension host (settingsLoaded + authStateChanged).
+  let signedIn = false;
+  let hasJolliKey = false;
+
+  // ── Tab switching ──
+  // Match by data-tab on the button to data-panel on the section. Use the
+  // shared .hidden class so the tab toggle doesn't fight any other display:*
+  // declared on the panel (matches the project's webview convention — see
+  // CLAUDE.md / feedback memory).
+  document.querySelectorAll('.tab-button').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var target = btn.getAttribute('data-tab');
+      document.querySelectorAll('.tab-button').forEach(function(b) {
+        b.classList.toggle('tab-active', b === btn);
+      });
+      document.querySelectorAll('.tab-panel').forEach(function(p) {
+        var matches = p.getAttribute('data-panel') === target;
+        p.classList.toggle('hidden', !matches);
+      });
+    });
+  });
+
+  // ── Provider / Sync card switching ──
+  function syncProviderCard() {
+    var provider = aiProviderSelect.value;
+    var which;
+    if (provider === 'anthropic') {
+      which = 'anthropic';
+    } else if (signedIn && hasJolliKey) {
+      which = 'jolli-ok';
+    } else if (signedIn && !hasJolliKey) {
+      which = 'jolli-nokey';
+    } else {
+      which = 'jolli-signin';
+    }
+    document.querySelectorAll('[data-card]').forEach(function(c) {
+      c.classList.toggle('hidden', c.getAttribute('data-card') !== which);
+    });
+    if (provider === 'anthropic') {
+      // Re-evaluate the missing-key warning whenever the Anthropic card shows.
+      updateAnthropicWarning();
+    }
+  }
+
+  function syncSyncCard() {
+    // Sync tab: signed-in if both signedIn AND hasJolliKey (matches IntelliJ
+    // CARD_SYNC_SIGNEDIN gating). Otherwise show signed-out — the user signs
+    // in (or pastes a key in AI Summary > Advanced) to reach the signed-in
+    // state. Keeping a single binary card here avoids a duplicate "no key"
+    // surface; AI Summary is where the missing-key recovery flow lives.
+    var which = (signedIn && hasJolliKey) ? 'signed-in' : 'signed-out';
+    document.querySelectorAll('[data-sync-card]').forEach(function(c) {
+      c.classList.toggle('hidden', c.getAttribute('data-sync-card') !== which);
+    });
+  }
+
+  function updateAnthropicWarning() {
+    var hasKey = apiKeyInput.value.trim().length > 0;
+    anthropicMissingWarn.classList.toggle('hidden', hasKey);
+  }
+
+  // ── Advanced (Jolli API Key) toggles ──
+  document.querySelectorAll('.advanced-link').forEach(function(link) {
+    link.addEventListener('click', function() {
+      var key = link.getAttribute('data-advanced');
+      var panel = document.querySelector('[data-advanced-panel="' + key + '"]');
+      if (!panel) return;
+      var willOpen = panel.classList.contains('hidden');
+      panel.classList.toggle('hidden', !willOpen);
+      link.textContent = willOpen ? 'Hide Advanced' : 'Advanced';
+    });
+  });
+
+  // ── Sign-in / Sign-out buttons ──
+  function postSignIn() { vscode.postMessage({ command: 'signIn' }); }
+  function postSignOut() { vscode.postMessage({ command: 'signOut' }); }
+  if (summarySignInBtn) summarySignInBtn.addEventListener('click', postSignIn);
+  if (syncSignInBtn) syncSignInBtn.addEventListener('click', postSignIn);
+  if (summaryReLoginBtn) summaryReLoginBtn.addEventListener('click', postSignOut);
+  if (syncSignOutBtn) syncSignOutBtn.addEventListener('click', postSignOut);
 
   // ── Validation ──
-  var ALLOWED_JOLLI_HOSTS = ['jolli.ai', 'jolli.dev', 'jolli.cloud', 'jolli-local.me'];
+  // Sourced from cli/src/core/JolliApiUtils.ts at extension build time so the
+  // CLI's authoritative allowlist and the webview's validator can't drift.
+  var ALLOWED_JOLLI_HOSTS = ${JSON.stringify(ALLOWED_JOLLI_HOSTS)};
 
   function decodeBase64url(seg) {
     try {
@@ -107,10 +201,10 @@ export function buildSettingsScript(): string {
     var msg = rule(value);
     if (msg) {
       input.classList.add('error');
-      errorEl.textContent = msg;
+      if (errorEl) errorEl.textContent = msg;
     } else {
       input.classList.remove('error');
-      errorEl.textContent = '';
+      if (errorEl) errorEl.textContent = '';
     }
     return !msg;
   }
@@ -124,7 +218,11 @@ export function buildSettingsScript(): string {
       }
       return '';
     }) && valid;
+    // Validate whichever Jolli key field is in scope. Both inputs share
+    // identical validation rules, so we run them through validateField and
+    // surface the error at the visible card's error slot.
     valid = validateField(jolliApiKeyInput, 'jolliApiKey-error', validateJolliApiKeyRule) && valid;
+    valid = validateField(jolliApiKeyNoKeyInput, 'jolliApiKeyNoKey-error', validateJolliApiKeyRule) && valid;
     valid = validateField(maxTokensInput, 'maxTokens-error', function(v) {
       if (v.length > 0 && (isNaN(Number(v)) || Number(v) < 1 || !Number.isInteger(Number(v)))) return 'Must be a positive integer';
       return '';
@@ -141,7 +239,7 @@ export function buildSettingsScript(): string {
     updateApplyBtn();
   }
 
-  // ── Local Memory Bank helpers ──
+  // ── Memory Bank helpers ──
   browseLocalFolderBtn.addEventListener('click', function() {
     vscode.postMessage({ command: 'browseLocalFolder' });
   });
@@ -154,12 +252,27 @@ export function buildSettingsScript(): string {
   });
 
   // ── Dirty tracking ──
+  function getActiveJolliApiKeyValue() {
+    // Prefer whichever input's card is currently visible. The two inputs are
+    // kept in sync by the input listeners below, so under normal interaction
+    // they'll match anyway — this just disambiguates after a programmatic
+    // setValue (e.g. on settingsLoaded).
+    var okCard = document.querySelector('[data-card="jolli-ok"]');
+    if (okCard && !okCard.classList.contains('hidden')) return jolliApiKeyInput.value;
+    var nokeyCard = document.querySelector('[data-card="jolli-nokey"]');
+    if (nokeyCard && !nokeyCard.classList.contains('hidden')) return jolliApiKeyNoKeyInput.value;
+    // Neither advanced card visible — fall back to the last-loaded masked
+    // value so dirty tracking sees no change.
+    return jolliApiKeyInput.value;
+  }
+
   function captureInitialState() {
     initialState = {
       apiKey: apiKeyInput.value,
       model: modelSelect.value,
       maxTokens: maxTokensInput.value,
-      jolliApiKey: jolliApiKeyInput.value,
+      aiProvider: aiProviderSelect.value,
+      jolliApiKey: getActiveJolliApiKeyValue(),
       claudeEnabled: claudeEnabledInput.checked,
       codexEnabled: codexEnabledInput.checked,
       geminiEnabled: geminiEnabledInput.checked,
@@ -177,7 +290,8 @@ export function buildSettingsScript(): string {
       apiKeyInput.value !== initialState.apiKey ||
       modelSelect.value !== initialState.model ||
       maxTokensInput.value !== initialState.maxTokens ||
-      jolliApiKeyInput.value !== initialState.jolliApiKey ||
+      aiProviderSelect.value !== initialState.aiProvider ||
+      getActiveJolliApiKeyValue() !== initialState.jolliApiKey ||
       claudeEnabledInput.checked !== initialState.claudeEnabled ||
       codexEnabledInput.checked !== initialState.codexEnabled ||
       geminiEnabledInput.checked !== initialState.geminiEnabled ||
@@ -203,11 +317,34 @@ export function buildSettingsScript(): string {
     saveFeedback.classList.remove('error');
   }
 
-  // ── Event listeners for all inputs ──
-  [apiKeyInput, jolliApiKeyInput, maxTokensInput, excludePatternsInput].forEach(function(input) {
+  // ── Event listeners ──
+  apiKeyInput.addEventListener('input', function() {
+    validateAll(); checkDirty(); clearSaveFeedback();
+    updateAnthropicWarning();
+  });
+  // Keep the two Jolli API key inputs mirrored: editing one updates the other
+  // silently so dirty tracking and validation behave identically regardless of
+  // which card the user opened. The silent update intentionally skips
+  // checkDirty/clearSaveFeedback to avoid double-counting the same edit.
+  jolliApiKeyInput.addEventListener('input', function() {
+    if (jolliApiKeyNoKeyInput.value !== jolliApiKeyInput.value) {
+      jolliApiKeyNoKeyInput.value = jolliApiKeyInput.value;
+    }
+    validateAll(); checkDirty(); clearSaveFeedback();
+  });
+  jolliApiKeyNoKeyInput.addEventListener('input', function() {
+    if (jolliApiKeyInput.value !== jolliApiKeyNoKeyInput.value) {
+      jolliApiKeyInput.value = jolliApiKeyNoKeyInput.value;
+    }
+    validateAll(); checkDirty(); clearSaveFeedback();
+  });
+  [maxTokensInput, excludePatternsInput].forEach(function(input) {
     input.addEventListener('input', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
   modelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+  aiProviderSelect.addEventListener('change', function() {
+    checkDirty(); clearSaveFeedback(); syncProviderCard();
+  });
   [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput].forEach(function(input) {
     input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
@@ -217,8 +354,6 @@ export function buildSettingsScript(): string {
     if (applyBtn.disabled) return;
     // Final client-side pass so inline errors stay in sync even if a field was
     // changed programmatically or before any input event had a chance to fire.
-    // Server-side validation runs regardless, but this gives the user the
-    // inline red-text field marker immediately.
     validateAll();
     if (hasErrors) {
       saveFeedback.textContent = 'Please fix the highlighted fields before saving';
@@ -233,7 +368,8 @@ export function buildSettingsScript(): string {
         apiKey: apiKeyInput.value.trim(),
         model: modelSelect.value,
         maxTokens: maxVal.length > 0 ? Number(maxVal) : null,
-        jolliApiKey: jolliApiKeyInput.value.trim(),
+        aiProvider: aiProviderSelect.value,
+        jolliApiKey: getActiveJolliApiKeyValue().trim(),
         claudeEnabled: claudeEnabledInput.checked,
         codexEnabled: codexEnabledInput.checked,
         geminiEnabled: geminiEnabledInput.checked,
@@ -249,6 +385,27 @@ export function buildSettingsScript(): string {
   });
 
   // ── Messages from extension host ──
+  function applyAuthState(msg) {
+    signedIn = !!msg.signedIn;
+    hasJolliKey = !!msg.hasJolliKey;
+    if (jolliSiteLabel && typeof msg.jolliSiteLabel === 'string') {
+      jolliSiteLabel.textContent = msg.jolliSiteLabel;
+    }
+    // Sign-in/sign-out flips aiProvider on disk; mirror that into the open
+    // form so the next Apply doesn't clobber disk with a stale dropdown
+    // value. Re-baseline initialState.aiProvider and recompute dirty so the
+    // user's other unsaved edits keep their dirty bit, but this externally-
+    // changed field doesn't show as a phantom user edit.
+    if ((msg.aiProvider === 'jolli' || msg.aiProvider === 'anthropic')
+        && aiProviderSelect.value !== msg.aiProvider) {
+      aiProviderSelect.value = msg.aiProvider;
+      initialState.aiProvider = msg.aiProvider;
+      checkDirty();
+    }
+    syncProviderCard();
+    syncSyncCard();
+  }
+
   window.addEventListener('message', function(event) {
     var msg = event.data;
     switch (msg.command) {
@@ -256,7 +413,9 @@ export function buildSettingsScript(): string {
         apiKeyInput.value = msg.maskedApiKey;
         modelSelect.value = msg.settings.model || 'sonnet';
         maxTokensInput.value = msg.settings.maxTokens != null ? String(msg.settings.maxTokens) : '';
+        aiProviderSelect.value = msg.settings.aiProvider || 'anthropic';
         jolliApiKeyInput.value = msg.maskedJolliApiKey;
+        jolliApiKeyNoKeyInput.value = msg.maskedJolliApiKey;
         claudeEnabledInput.checked = msg.settings.claudeEnabled;
         codexEnabledInput.checked = msg.settings.codexEnabled;
         geminiEnabledInput.checked = msg.settings.geminiEnabled;
@@ -271,7 +430,14 @@ export function buildSettingsScript(): string {
         document.querySelectorAll('.error').forEach(function(el) { el.classList.remove('error'); });
         document.querySelectorAll('.error-message').forEach(function(el) { el.textContent = ''; });
         hasErrors = false;
+        applyAuthState(msg);
+        updateAnthropicWarning();
         captureInitialState();
+        break;
+      case 'authStateChanged':
+        // Pushed after sign-in / sign-out so the cards re-render without
+        // requiring a full settings reload. Mirror IntelliJ's auth listener.
+        applyAuthState(msg);
         break;
       case 'setLocalFolder':
         localFolderInput.value = msg.path || '';

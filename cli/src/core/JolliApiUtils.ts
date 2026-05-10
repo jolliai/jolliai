@@ -99,7 +99,15 @@ export function validateJolliApiKey(key: string): void {
 	assertJolliOriginAllowed(meta.u);
 }
 
-const ALLOWED_JOLLI_HOSTS = ["jolli.ai", "jolli.dev", "jolli.cloud", "jolli-local.me"];
+/**
+ * Allowlist of host suffixes the Jolli API key / OAuth callback may target.
+ * Exported so the VS Code Settings webview can inline this exact list at
+ * extension build time (`SettingsScriptBuilder.buildSettingsScript`),
+ * eliminating drift between the CLI's `assertJolliOriginAllowed` and the
+ * webview-side validator. The IntelliJ port (`JolliApiClient.kt`) is the
+ * remaining cross-language sibling — keep all three in lockstep.
+ */
+export const ALLOWED_JOLLI_HOSTS: readonly string[] = ["jolli.ai", "jolli.dev", "jolli.cloud", "jolli-local.me"];
 
 /**
  * Rejects origins that are not on the Jolli allowlist. Called from the

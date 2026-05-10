@@ -23,9 +23,31 @@ describe("SettingsCssBuilder", () => {
 
 	it("contains form layout classes", () => {
 		expect(css).toContain(".settings-page");
-		expect(css).toContain(".settings-group");
+		expect(css).toContain(".tab-panel");
 		expect(css).toContain(".settings-row");
 		expect(css).toContain(".settings-label");
+	});
+
+	it("contains tab navigation styles", () => {
+		expect(css).toContain(".tab-nav");
+		expect(css).toContain(".tab-button");
+		expect(css).toContain(".tab-active");
+	});
+
+	it("contains a global .hidden display switch", () => {
+		// The webview's tab/card show-hide convention relies on this single
+		// class winning over any other display:* on the same element. Per
+		// CLAUDE.md memory: "vscode webview 用 .hidden class 切显隐".
+		expect(css).toMatch(/\.hidden\s*\{\s*display\s*:\s*none\s*!important/);
+	});
+
+	it("contains card-panel styles for provider/sync state cards", () => {
+		expect(css).toContain(".card-panel");
+	});
+
+	it("contains status indicator styles", () => {
+		expect(css).toContain(".status-ok");
+		expect(css).toContain(".status-warn");
 	});
 
 	it("contains toggle switch styles", () => {

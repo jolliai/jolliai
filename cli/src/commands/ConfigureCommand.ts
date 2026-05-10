@@ -17,6 +17,9 @@ const log = createLogger("ConfigureCommand");
 /** Valid values for the `logLevel` config key. */
 const VALID_LOG_LEVELS: ReadonlyArray<LogLevel> = ["debug", "info", "warn", "error"];
 
+/** Valid values for the `aiProvider` config key. */
+const VALID_AI_PROVIDERS: ReadonlyArray<NonNullable<JolliMemoryConfig["aiProvider"]>> = ["anthropic", "jolli"];
+
 /**
  * Valid config keys exposed via `jolli configure --set/--remove`.
  * Must stay in sync with {@link JolliMemoryConfig} in Types.ts.
@@ -35,6 +38,8 @@ const VALID_CONFIG_KEYS = [
 	"copilotEnabled",
 	"logLevel",
 	"excludePatterns",
+	"localFolder",
+	"aiProvider",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig>;
 
 type ConfigKey = (typeof VALID_CONFIG_KEYS)[number];
@@ -86,6 +91,12 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		}
 		return raw;
 	}
+	if (key === "aiProvider") {
+		if (!(VALID_AI_PROVIDERS as ReadonlyArray<string>).includes(raw)) {
+			throw new Error(`${key} must be one of: ${VALID_AI_PROVIDERS.join(", ")} (got: ${raw})`);
+		}
+		return raw;
+	}
 	// Array fields (comma-separated)
 	if (key === "excludePatterns") {
 		return raw
@@ -93,7 +104,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 			.map((s) => s.trim())
 			.filter(Boolean);
 	}
-	// String fields (apiKey, model, jolliApiKey, authToken)
+	// String fields (apiKey, model, jolliApiKey, authToken, localFolder)
 	return raw;
 }
 
@@ -124,6 +135,16 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	},
 	{ key: "logLevel", type: "enum", description: "Log level: debug | info | warn | error" },
 	{ key: "excludePatterns", type: "string[]", description: "Glob patterns for file exclusion (comma-separated)" },
+	{
+		key: "localFolder",
+		type: "string",
+		description: "Absolute path to the Memory Bank folder (per-machine)",
+	},
+	{
+		key: "aiProvider",
+		type: "enum",
+		description: "AI summary provider: anthropic | jolli (auto-set on `jolli auth login`)",
+	},
 ];
 
 /** Commander collector: collects multiple --set entries into a string array. */

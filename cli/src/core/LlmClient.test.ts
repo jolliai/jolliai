@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { callLlm, resolveLlmCredentialSource } from "./LlmClient.js";
+import { callLlm, isLlmCredentialError, NO_LLM_PROVIDER_MESSAGE, resolveLlmCredentialSource } from "./LlmClient.js";
 
-const { mockCreate, mockLogWarn } = vi.hoisted(() => ({
+const { mockCreate, mockLogInfo, mockLogWarn } = vi.hoisted(() => ({
 	mockCreate: vi.fn(),
+	mockLogInfo: vi.fn(),
 	mockLogWarn: vi.fn(),
 }));
 
@@ -17,7 +18,7 @@ vi.mock("@anthropic-ai/sdk", () => ({
 // Mock Logger
 vi.mock("../Logger.js", () => ({
 	createLogger: () => ({
-		info: vi.fn(),
+		info: mockLogInfo,
 		warn: mockLogWarn,
 		debug: vi.fn(),
 		error: vi.fn(),
@@ -36,6 +37,7 @@ describe("LlmClient", () => {
 	beforeEach(() => {
 		delete process.env.ANTHROPIC_API_KEY;
 		mockCreate.mockReset();
+		mockLogInfo.mockReset();
 		mockLogWarn.mockReset();
 		mockCreate.mockResolvedValue({
 			content: [{ type: "text", text: "response text" }],
@@ -78,6 +80,9 @@ describe("LlmClient", () => {
 			expect(result.inputTokens).toBe(50);
 			expect(result.outputTokens).toBe(10);
 			expect(result.stopReason).toBe("end_turn");
+			// Authoritative provider tag for the saved summary's metadata —
+			// must match resolveLlmCredentialSource for the same options.
+			expect(result.source).toBe("anthropic-config");
 		});
 
 		it("warns when direct mode params do not fill every placeholder", async () => {
@@ -108,6 +113,10 @@ describe("LlmClient", () => {
 			});
 
 			expect(result.text).toBe("response text");
+			// Env-var fallback distinguishes itself from the config-key path
+			// in the saved metadata — useful when a user has both set and we
+			// need to know which one actually fired.
+			expect(result.source).toBe("anthropic-env");
 		});
 
 		it("respects custom maxTokens", async () => {
@@ -277,6 +286,9 @@ describe("LlmClient", () => {
 			expect(result.text).toBe("proxy result");
 			expect(result.inputTokens).toBe(30);
 			expect(result.outputTokens).toBe(5);
+			// Proxy results have no model from the backend, but source is
+			// still carried back so saved metadata can record "via proxy".
+			expect(result.source).toBe("jolli-proxy");
 		});
 
 		// Pins the build-time identity in the `x-jolli-client` header. Kind
@@ -559,6 +571,167 @@ describe("LlmClient", () => {
 
 		it("returns null when no credentials are available", () => {
 			expect(resolveLlmCredentialSource({})).toBeNull();
+		});
+
+		// aiProvider as authoritative override — pins the bug fix that
+		// closed the "Settings UI says Jolli, dispatcher routes to Anthropic"
+		// mismatch. Settings explicit choice must win over credential
+		// presence; missing credential for the chosen provider returns null
+		// rather than silently fall through (silent fallback was the bug).
+
+		it("aiProvider='jolli' picks proxy even when an Anthropic config key is also set", () => {
+			expect(
+				resolveLlmCredentialSource({
+					apiKey: "sk-ant-cfg",
+					jolliApiKey: "sk-jol-test.secret",
+					aiProvider: "jolli",
+				}),
+			).toBe("jolli-proxy");
+		});
+
+		it("aiProvider='jolli' returns null when jolliApiKey is missing (no silent Anthropic fallback)", () => {
+			process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+			expect(
+				resolveLlmCredentialSource({
+					apiKey: "sk-ant-cfg",
+					aiProvider: "jolli",
+				}),
+			).toBeNull();
+		});
+
+		it("aiProvider='anthropic' picks config key over env when both are set", () => {
+			process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+			expect(
+				resolveLlmCredentialSource({
+					apiKey: "sk-ant-cfg",
+					jolliApiKey: "sk-jol-test.secret",
+					aiProvider: "anthropic",
+				}),
+			).toBe("anthropic-config");
+		});
+
+		it("aiProvider='anthropic' falls back to env var when no config key", () => {
+			process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+			expect(
+				resolveLlmCredentialSource({
+					jolliApiKey: "sk-jol-test.secret",
+					aiProvider: "anthropic",
+				}),
+			).toBe("anthropic-env");
+		});
+
+		it("aiProvider='anthropic' returns null with only a Jolli key (no silent proxy fallback)", () => {
+			expect(
+				resolveLlmCredentialSource({
+					jolliApiKey: "sk-jol-test.secret",
+					aiProvider: "anthropic",
+				}),
+			).toBeNull();
+		});
+
+		it("aiProvider undefined keeps the legacy precedence so older configs still resolve", () => {
+			// Pre-aiProvider configs (no field set) must keep working; a user
+			// who only ever had ANTHROPIC_API_KEY in env shouldn't suddenly
+			// see "no credentials" because the field defaults to undefined.
+			process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+			expect(
+				resolveLlmCredentialSource({
+					apiKey: "sk-ant-cfg",
+					jolliApiKey: "sk-jol-test.secret",
+				}),
+			).toBe("anthropic-config");
+		});
+	});
+
+	// Dispatch-site logging — every callLlm leaves a single info trace
+	// identifying the resolved provider, so users can grep `debug.log` after
+	// a commit and verify Settings UI's choice was actually honored. Pinned
+	// here because losing this log silently would re-create the original
+	// "Settings says Jolli, can't tell from logs what actually ran" gap.
+
+	describe("dispatch-site provider log", () => {
+		// Local fetch mock — proxy mode tests live in a sibling describe with
+		// their own fetchSpy beforeEach, but this block needs to exercise both
+		// modes from one place to keep the contract assertions co-located.
+		beforeEach(() => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn().mockResolvedValue({
+					ok: true,
+					json: vi.fn().mockResolvedValue({ text: "proxy result", inputTokens: 1, outputTokens: 1 }),
+				}),
+			);
+		});
+		afterEach(() => {
+			vi.unstubAllGlobals();
+		});
+
+		it("logs source=anthropic-config for direct mode (config key)", async () => {
+			await callLlm({
+				action: "translate",
+				params: { content: "test" },
+				apiKey: "sk-ant-cfg",
+			});
+			expect(mockLogInfo).toHaveBeenCalledWith("LLM call: action=%s source=%s", "translate", "anthropic-config");
+		});
+
+		it("logs source=anthropic-env for direct mode (env fallback)", async () => {
+			process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+			await callLlm({
+				action: "translate",
+				params: { content: "test" },
+			});
+			expect(mockLogInfo).toHaveBeenCalledWith("LLM call: action=%s source=%s", "translate", "anthropic-env");
+		});
+
+		it("logs source=jolli-proxy for proxy mode", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				jolliApiKey: "sk-jol-test.secret",
+			});
+			expect(mockLogInfo).toHaveBeenCalledWith("LLM call: action=%s source=%s", "commit-message", "jolli-proxy");
+		});
+
+		it("does NOT emit the dispatch log when no provider is available", async () => {
+			// When source resolves to null, callLlm throws before dispatching.
+			// The log line implies "an LLM call happened" — emitting it for the
+			// no-credential path would be misleading in postmortems.
+			await expect(callLlm({ action: "translate", params: { content: "x" } })).rejects.toThrow(
+				"No LLM provider available",
+			);
+			expect(mockLogInfo).not.toHaveBeenCalledWith(
+				"LLM call: action=%s source=%s",
+				expect.anything(),
+				expect.anything(),
+			);
+		});
+	});
+
+	describe("isLlmCredentialError", () => {
+		it("returns true for the canonical no-provider error", async () => {
+			let caught: unknown;
+			try {
+				await callLlm({ action: "translate", params: { content: "x" } });
+			} catch (err) {
+				caught = err;
+			}
+			expect(isLlmCredentialError(caught)).toBe(true);
+		});
+
+		it("returns true for an Error whose message matches the constant verbatim", () => {
+			expect(isLlmCredentialError(new Error(NO_LLM_PROVIDER_MESSAGE))).toBe(true);
+		});
+
+		it("returns false for unrelated errors", () => {
+			expect(isLlmCredentialError(new Error("network timeout"))).toBe(false);
+			expect(isLlmCredentialError(new Error("Could not derive Jolli site URL"))).toBe(false);
+		});
+
+		it("returns false for non-Error values", () => {
+			expect(isLlmCredentialError(undefined)).toBe(false);
+			expect(isLlmCredentialError("string error")).toBe(false);
+			expect(isLlmCredentialError({ message: NO_LLM_PROVIDER_MESSAGE })).toBe(false);
 		});
 	});
 });

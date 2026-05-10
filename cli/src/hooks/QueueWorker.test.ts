@@ -195,6 +195,7 @@ import { isCursorInstalled } from "../core/CursorDetector.js";
 import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
+import { NO_LLM_PROVIDER_MESSAGE } from "../core/LlmClient.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
@@ -383,6 +384,43 @@ describe("QueueWorker", () => {
 
 			// Worker should complete without throwing (error caught internally)
 			expect(releaseLock).toHaveBeenCalled();
+		});
+
+		// The dispatcher's "fail loudly" promise (PR #93) is undermined if the
+		// queue swallows the credential error into an empty-topic placeholder
+		// summary — the user would see no toast, no Status row change, and
+		// orphan-branch junk would accumulate. Pin both attempts: first call
+		// throws → no retry, no placeholder; retry-path same.
+		it("rethrows credential errors on first attempt without retry or placeholder write", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/cred.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(generateSummary).mockRejectedValueOnce(new Error(NO_LLM_PROVIDER_MESSAGE));
+
+			await runWorker("/test/cwd");
+
+			expect(generateSummary).toHaveBeenCalledTimes(1);
+			expect(storeSummary).not.toHaveBeenCalled();
+		});
+
+		it("rethrows credential errors that surface only on the retry attempt", async () => {
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/cred-retry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(generateSummary)
+				.mockRejectedValueOnce(new Error("transient transport error"))
+				.mockRejectedValueOnce(new Error(NO_LLM_PROVIDER_MESSAGE));
+
+			await runWorker("/test/cwd");
+
+			expect(generateSummary).toHaveBeenCalledTimes(2);
+			expect(storeSummary).not.toHaveBeenCalled();
 		});
 	});
 

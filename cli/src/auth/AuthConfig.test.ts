@@ -91,9 +91,37 @@ describe("AuthConfig", () => {
 
 	describe("clearAuthCredentials", () => {
 		it("should clear both authToken and jolliApiKey via saveConfig", async () => {
+			mockLoadConfig.mockResolvedValue({});
 			mockSaveConfig.mockResolvedValue(undefined);
 			await clearAuthCredentials();
 			expect(mockSaveConfig).toHaveBeenCalledWith({ authToken: undefined, jolliApiKey: undefined });
+		});
+
+		it("rolls back aiProvider when it was auto-set to 'jolli' on sign-in", async () => {
+			// `saveAuthCredentials` writes `aiProvider: "jolli"` as part of the
+			// sign-in contract. Leaving it after logout pins the dispatcher to
+			// the proxy with no credentials — silent commit failures, especially
+			// for VS Code users who don't see the CLI logout copy.
+			mockLoadConfig.mockResolvedValue({ aiProvider: "jolli" });
+			mockSaveConfig.mockResolvedValue(undefined);
+			await clearAuthCredentials();
+			expect(mockSaveConfig).toHaveBeenCalledWith({
+				authToken: undefined,
+				jolliApiKey: undefined,
+				aiProvider: undefined,
+			});
+		});
+
+		it("preserves an explicit aiProvider='anthropic' choice across logout", async () => {
+			// Only the sign-in-time auto-write of aiProvider is rolled back.
+			// A deliberate Settings-UI choice survives unrelated logout actions.
+			mockLoadConfig.mockResolvedValue({ aiProvider: "anthropic" });
+			mockSaveConfig.mockResolvedValue(undefined);
+			await clearAuthCredentials();
+			expect(mockSaveConfig).toHaveBeenCalledWith({
+				authToken: undefined,
+				jolliApiKey: undefined,
+			});
 		});
 	});
 
@@ -107,30 +135,53 @@ describe("AuthConfig", () => {
 		// Valid new-format key: meta is {t:"tenant",u:"https://tenant.jolli.ai"} base64url-encoded.
 		const VALID_KEY = "sk-jol-eyJ0IjoidGVuYW50IiwidSI6Imh0dHBzOi8vdGVuYW50LmpvbGxpLmFpIn0.secret";
 
-		it("should save both authToken and jolliApiKey in a single saveConfig call", async () => {
+		it("should save authToken, jolliApiKey, and aiProvider in a single saveConfig call", async () => {
+			// `aiProvider: "jolli"` is part of the auth-success contract: clicking
+			// "Sign in to Jolli" in the onboarding panel (or running `jolli auth
+			// login`) is the user's explicit declaration of provider intent.
+			// Persisting it alongside the credentials keeps the dispatcher's
+			// `resolveLlmCredentialSource` aligned with the user's choice.
 			mockSaveConfig.mockResolvedValue(undefined);
 			await saveAuthCredentials({ token: "tk-abc", jolliApiKey: VALID_KEY });
 			expect(mockSaveConfig).toHaveBeenCalledTimes(1);
-			expect(mockSaveConfig).toHaveBeenCalledWith({ authToken: "tk-abc", jolliApiKey: VALID_KEY });
+			expect(mockSaveConfig).toHaveBeenCalledWith({
+				authToken: "tk-abc",
+				jolliApiKey: VALID_KEY,
+				aiProvider: "jolli",
+			});
 		});
 
-		it("should omit jolliApiKey from the write when not provided", async () => {
+		it("should still write aiProvider when jolliApiKey is not provided", async () => {
+			// Even without a jolliApiKey (server didn't issue one), the user's
+			// intent to use Jolli is still recorded. Dispatcher will surface the
+			// "no jolliApiKey" gap as a separate error rather than silently
+			// falling back to Anthropic.
 			mockSaveConfig.mockResolvedValue(undefined);
 			await saveAuthCredentials({ token: "tk-abc" });
-			expect(mockSaveConfig).toHaveBeenCalledWith({ authToken: "tk-abc" });
+			expect(mockSaveConfig).toHaveBeenCalledWith({
+				authToken: "tk-abc",
+				aiProvider: "jolli",
+			});
 		});
 
-		it("should omit jolliApiKey when explicitly undefined", async () => {
+		it("should omit jolliApiKey when explicitly undefined but still write aiProvider", async () => {
 			mockSaveConfig.mockResolvedValue(undefined);
 			await saveAuthCredentials({ token: "tk-abc", jolliApiKey: undefined });
-			expect(mockSaveConfig).toHaveBeenCalledWith({ authToken: "tk-abc" });
+			expect(mockSaveConfig).toHaveBeenCalledWith({
+				authToken: "tk-abc",
+				aiProvider: "jolli",
+			});
 		});
 
 		it("should persist a new-format key whose embedded origin is on the allowlist", async () => {
 			mockSaveConfig.mockResolvedValue(undefined);
 			const key = buildNewFormatKey({ t: "tenant1", u: "https://tenant1.jolli.ai" });
 			await saveAuthCredentials({ token: "tk-abc", jolliApiKey: key });
-			expect(mockSaveConfig).toHaveBeenCalledWith({ authToken: "tk-abc", jolliApiKey: key });
+			expect(mockSaveConfig).toHaveBeenCalledWith({
+				authToken: "tk-abc",
+				jolliApiKey: key,
+				aiProvider: "jolli",
+			});
 		});
 
 		it("should reject a new-format key whose embedded origin is off the allowlist", async () => {
