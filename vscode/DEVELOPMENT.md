@@ -65,7 +65,7 @@ These hooks track which AI sessions are active. They only record session metadat
 | **GitHub Copilot CLI** | _(no hook)_ | Sessions discovered by `CopilotDetector` + `CopilotSessionDiscoverer` scanning the Copilot CLI session log. |
 | **VS Code Copilot Chat** | _(no hook)_ | Sessions discovered by `CopilotChatDetector` + `CopilotChatSessionDiscoverer` reading the Copilot Chat conversation cache. |
 
-Per-integration enable/disable lives in the global config (`claudeEnabled`, `geminiEnabled`, `codexEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`) and is toggled from the **Settings** webview. The single `copilotEnabled` switch covers both Copilot CLI and Copilot Chat — splitting them was rejected because users almost always want them together. Discoverable-but-disabled integrations show up in the Status panel as "detected but disabled". OpenCode and the Copilot family additionally surface a separate **scan-error** row when their backing store is present but unreadable (corrupt, locked, schema-incompatible) — this avoids the past failure mode where a corrupt DB rendered as a healthy-looking integration.
+Per-integration enable/disable lives in the global config (`claudeEnabled`, `geminiEnabled`, `codexEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`) and is toggled from the **Settings** webview's **AI Agents** tab. The single `copilotEnabled` switch covers both Copilot CLI and Copilot Chat — splitting them was rejected because users almost always want them together. Discoverable-but-disabled integrations show up in the sidebar **Status** tab as "detected but disabled". OpenCode and the Copilot family additionally surface a separate **scan-error** row when their backing store is present but unreadable (corrupt, locked, schema-incompatible) — this avoids the past failure mode where a corrupt DB rendered as a healthy-looking integration.
 
 ### Git Hooks — Summary Generation Pipeline
 
@@ -76,7 +76,11 @@ Per-integration enable/disable lives in the global config (`claudeEnabled`, `gem
 | **post-rewrite** (`PostRewriteHook`) | After rebase/amend | Migrates existing summaries to match new commit hashes (1:1 hash remapping). |
 | **`QueueWorker`** _(spawned, not installed)_ | When `post-commit` enqueues | Holds a 5-minute file lock, drains queue entries in timestamp order, runs the LLM where needed, and chain-spawns a successor if more entries arrive. |
 
-Summaries are stored on a git orphan branch (`jollimemory/summaries/v3`) using a v3 tree format. Raw AI conversations are optionally preserved as `transcripts/{commitHash}.json` alongside the distilled summaries. The orphan branch is **never checked out** — reads use `git show`, writes use plumbing (`hash-object`, `mktree`, `commit-tree`, `update-ref`).
+Summaries are stored on a git orphan branch (`jollimemory/summaries/v3`) using a v3 tree format. Raw AI conversations are preserved as `transcripts/{commitHash}.json` alongside the distilled summaries. The orphan branch is **never checked out** — reads use `git show`, writes use plumbing (`hash-object`, `mktree`, `commit-tree`, `update-ref`). On 0.99+ both summaries and transcripts go through `DualWriteStorage` by default, so each write also lands in the Memory Bank folder, which has two layers (see `cli/src/core/FolderStorage.ts` for the source of truth):
+- **Hidden** `<localFolder>/<repo>/.jolli/` — canonical JSON: `summaries/<commitHash>.json`, `transcripts/<commitHash>.json`, `index.json`, `shadow-status.json`. This is what `FolderStorage.readFile()` / `writeFiles()` read and write.
+- **Visible** `<localFolder>/<repo>/<branch>/...` — human-browsable Markdown auto-generated from the JSON: `<slug>-<hash8>.md` for summaries (`FolderStorage.generateSummaryMarkdown()`), `plan--<slug>.md` for plans, plus visible note copies. The slug comes from the commit message via `FolderStorage.slugify()`.
+
+The orphan branch stays the read source — the visible Markdown layer is generated, never read back. `<localFolder>` is the user-picked Memory Bank root (the `localFolder` config); `<repo>` is the per-repo subfolder created by `KBPathResolver.resolveKBPath()`.
 
 ---
 
@@ -91,8 +95,7 @@ src/
 ├── commands/                     # User-facing commands (registered in package.json + Extension.ts)
 │   ├── CommitCommand.ts          # AI commit flow (QuickPick + 3 actions)
 │   ├── PushCommand.ts            # Git push with force-push guard
-│   ├── SquashCommand.ts          # Squash flow (range selection + LLM message + force-push guard)
-│   └── ExportMemoriesCommand.ts  # Bulk export memories to ~/Documents/jollimemory/<project>/
+│   └── SquashCommand.ts          # Squash flow (range selection + LLM message + force-push guard)
 │
 ├── core/                         # Domain services local to the extension
 │   ├── PlanService.ts            # Plans registry (plans.json) — read/save/ignore, branch-aware visibility
@@ -127,7 +130,7 @@ src/
 │   └── KnowledgeBaseTreeProvider.ts  # Branch-aware Memory Bank folder tree (the class name keeps the legacy "KnowledgeBase" identifier)
 │
 ├── views/                        # Webview panels (HTML + CSS + JS, served via webview API)
-│   ├── SidebarWebviewProvider.ts         # Top-level sidebar webview that renders the onboarding flow, status, Memory Bank folders, and acts as the host for the in-sidebar panels
+│   ├── SidebarWebviewProvider.ts         # Top-level sidebar webview that hosts the 3 tabs (Branch / Memory Bank / Status) and the onboarding / api-key / disabled panels
 │   ├── SidebarHtmlBuilder.ts             # HTML assembly for the sidebar (onboarding panel, sections, Memory Bank tree)
 │   ├── SidebarCssBuilder.ts              # Sidebar stylesheet (CSP-compatible — no inline style)
 │   ├── SidebarScriptBuilder.ts           # Embedded JS — onboarding interactions, message bus, lazy data fetches
@@ -143,7 +146,7 @@ src/
 │   ├── BranchSummaryLoader.ts            # Walks the branch and loads every commit's stored summary for the aggregate PR builder
 │   ├── SummaryUtils.ts                   # Shared helpers (HTML escaping, date formatting, topic sorting)
 │   │
-│   ├── SettingsWebviewPanel.ts           # Singleton settings form (API keys, integrations, exclude patterns, push action)
+│   ├── SettingsWebviewPanel.ts           # Singleton 5-tab settings form (AI Agents / AI Summary / Sync to Jolli / Memory Bank / Others)
 │   ├── SettingsHtmlBuilder.ts
 │   ├── SettingsCssBuilder.ts
 │   ├── SettingsScriptBuilder.ts
@@ -153,7 +156,7 @@ src/
 │
 └── util/
     ├── CommitMessageUtils.ts     # Commit message formatting and validation
-    ├── ExcludeFilterManager.ts   # File-exclusion patterns for the Changes panel
+    ├── ExcludeFilterManager.ts   # File-exclusion patterns for the Changes section in the Branch tab
     ├── FormatUtils.ts            # Relative date / size formatting shared across panels
     ├── LockUtils.ts              # File-based concurrency lock (used to detect Worker busy state)
     ├── Logger.ts                 # Output-channel logger
@@ -229,12 +232,13 @@ In both cases the post-commit Worker calls `mergeManyToOne()` to combine existin
 
 ### Auth & Sign-in
 
-The extension declares `onUri` as an activation event. The OAuth flow opens the Jolli sign-in page in the user's browser, which redirects back to `vscode://jolli.jollimemory-vscode/auth-callback?token=…&jolli_api_key=sk-jol-…`. `Extension.ts` registers a `vscode.window.registerUriHandler` that delegates to `AuthService.handleAuthCallback()`:
+The extension declares `onUri` as an activation event. The OAuth flow opens the Jolli sign-in page in the user's browser, which redirects back to `vscode://jolli.jollimemory-vscode/auth-callback?code=<32-byte-hex>` (or `?error=<reason>` on failure) — the callback carries a one-time **authorization code only**, never the credentials themselves. `Extension.ts` registers a `vscode.window.registerUriHandler` that delegates to `AuthService.handleAuthCallback()`, which then POSTs the code to `/api/auth/cli-exchange` to redeem the actual `authToken` + `jolliApiKey` over a server-side channel. This is the RFC 6749 authorization-code exchange flagged in the 0.99.0 CHANGELOG as "Hardened sign-in" — it ensures secrets never appear in URL bars, browser history, OS-level URI dispatch logs, or any place a `vscode://` URL would otherwise be visible.
 
 - Credentials are saved to `~/.jolli/jollimemory/config.json` via the CLI's `saveAuthCredentials` — **not** VSCode SecretStorage. This keeps the CLI and extension in sync; signing in once works for both.
 - The `jollimemory.signedIn` context key drives sidebar UI (banners, the sign-in/sign-out menu items in `package.json`).
-- The URI handler logs the scheme/authority/path and a parameter count only — never `uri.toString()` or `uri.query`, because the Output channel persists for the window lifetime and frequently gets pasted into bug reports.
-- `validateJolliApiKey` is called save-time (OAuth callback, `configure --set`, settings UI). Request paths trust the saved value; the allowlist (`jolli.ai`, `jolli.dev`, `jolli.cloud`, `jolli-local.me`) lives in `cli/src/core/JolliApiUtils.ts` and is shared with the CLI.
+- The URI handler logs the scheme/authority/path and a parameter count only — never `uri.toString()` or `uri.query`. Even though the URI itself no longer carries credentials, the Output channel persists for the window lifetime and frequently gets pasted into bug reports, so we keep the redaction defensive.
+- A nonce/state value is generated before launching the browser and validated when the callback arrives, so a captured callback URL can't be replayed to inject a foreign session.
+- `validateJolliApiKey` is called save-time (OAuth callback exchange result, `configure --set`, settings UI). Request paths trust the saved value; the allowlist (`jolli.ai`, `jolli.dev`, `jolli.cloud`, `jolli-local.me`) lives in `cli/src/core/JolliApiUtils.ts` and is shared with the CLI.
 
 ---
 
@@ -242,7 +246,7 @@ The extension declares `onUri` as an activation event. The OAuth flow opens the 
 
 Both panels are singletons (one instance at a time, focused if reopened) and use webview CSP with no `unsafe-inline` — all dynamic styles go through CSS classes, all events through `addEventListener`.
 
-**SettingsWebviewPanel** renders the API keys, model, integration toggles (Claude / Gemini / Codex / OpenCode), Jolli push action, exclude patterns, and local folder. Save dispatches to `saveConfigScoped` and, when integration toggles changed, calls `installClaudeHook` / `installGeminiHook` / their counterparts across every worktree of the project. Hook-sync failures per worktree are surfaced individually instead of failing the whole save.
+**SettingsWebviewPanel** renders the 5-tab Settings UI (AI Agents / AI Summary / Sync to Jolli / Memory Bank / Others) — covering integration toggles (Claude / Gemini / Codex / OpenCode / Cursor / Copilot), the AI Summary `aiProvider` choice and its provider-specific cards (Anthropic `apiKey` + `model` + `maxTokens`, or the Jolli sign-in state with `jolliApiKey` under an Advanced disclosure), the Sync to Jolli sign-in/out actions, the Memory Bank `localFolder` + Migrate button, and `excludePatterns` for the Branch tab's Changes section. Save dispatches to `saveConfigScoped` and, when integration toggles changed, calls `installClaudeHook` / `installGeminiHook` / their counterparts across every worktree of the project. Hook-sync failures per worktree are surfaced individually instead of failing the whole save. The legacy `pushAction` config field and its "Push to Jolli & Local" pathway were fully removed — `cli/src/core/LocalPusher.ts` and the surrounding orchestration are gone. Memory Bank now covers the local-copy use case on every commit (dual-write), so an opt-in for manual local copies is no longer needed.
 
 **NoteEditorWebviewPanel** is the "Add Text Snippet" entry point in the unified Plans/Notes panel `+` menu. On save it writes the snippet to `.jolli/jollimemory/notes/<slug>.md`, registers it in `plans.json`, opens it in an editor tab for further editing, and closes itself.
 
@@ -258,28 +262,22 @@ Both panels are singletons (one instance at a time, focused if reopened) and use
 
 **Create & Update PR section** — `PrCommentService.ts` encapsulates all GitHub PR logic. It uses the `gh` CLI (zero new dependencies) to check commit count, PR existence, and current PR body. The summary is embedded in the PR description using dual HTML comment markers (`<!-- jollimemory-summary-start -->` / `<!-- jollimemory-summary-end -->`); on update, only the marker region is replaced, preserving any user-written content above and below. The section transitions through states: `loading` → `multipleCommits` | `unavailable` | `noPr` | `ready`. Cancel button state is managed via `prCurrentState` to restore the correct visibility (link row vs status text) without a full re-render.
 
-**Memories panel — lazy load + filter** — The Memories tree only fetches its first page on first visibility (`onDidChangeVisibility` in `Extension.ts`). Subsequent loads come from the in-store cache. When a filter is active, the bridge returns the matched set in one call and the "Load More" affordance is suppressed; without a filter it paginates. All this logic is split between `MemoriesStore` (cache + cursor) and `MemoriesDataService` (pure derivations like the description string and `canLoadMore`).
-
-**Bulk export** — `ExportMemoriesCommand` exports every memory in the workspace to `~/Documents/jollimemory/<project>/` via the core `SummaryExporter`. The result toast offers an **Open folder** action when anything was written or skipped.
+**Memories store — lazy load + filter** — `MemoriesTreeProvider` is no longer registered as a VS Code TreeView; the sidebar is a single webview that renders the Branch tab and Memory Bank tab directly. `MemoriesStore` and `MemoriesDataService` are kept as a data layer that the webview consumes via `JolliMemoryBridge`. The lazy-load pattern still applies: the first page is fetched on first visibility of the surface that consumes it, subsequent loads come from the in-store cache; when a filter is active the bridge returns the matched set in one call (no pagination), without a filter it paginates with a `canLoadMore` derivation.
 
 **Onboarding panel + auto-enable + durable opt-out** — `SidebarWebviewProvider` renders an onboarding flow on first activation (sign-in or inline Anthropic API key, then enable hooks). After the first repo is enabled, every newly opened workspace runs `installAll` automatically in the background. `ManualDisableFlag` records the user's explicit **Disable** decision into a per-repo file under `.jolli/jollimemory/`; on every activation the flag is checked first, so auto-enable never overrides a manual opt-out. Tests cover the four state combinations (never enabled, auto-enabled, manually enabled, manually disabled) so the durable flag does not get re-armed by unrelated config changes.
 
 **Aggregate PR descriptions for multi-commit branches** — `BranchSummaryLoader` walks every commit between the branch's fork point and HEAD and loads each commit's stored summary; `SummaryPrAggregateMarkdownBuilder` then composes a single PR description with one collapsible `<details>` block per topic across all commits, preceded by Plans and the E2E Test Guide. The single-commit code path is unchanged (`SummaryPrMarkdownBuilder`); `PrCommentService` picks the right builder based on commit count.
 
-**Memory Bank folder mode** — When the user opts in (Settings → Local Memory Bank → Migrate to Memory Bank), the extension drives the CLI's `StorageProvider` abstraction via `setActiveStorage()`. The sidebar webview shows a branch-aware folder view rendered by `KnowledgeBaseTreeProvider` (the class name still uses the legacy "KnowledgeBase" identifier; the user-facing label is "Memory Bank").
+**Memory Bank folder mode** — Memory Bank is on by default. `StorageFactory.createStorage` defaults to `"dual-write"`, so every commit's hooks write the memory to **both** the orphan branch and the configured Memory Bank folder; no `setActiveStorage()` toggle is involved at runtime. The orphan branch stays the system of record (reads come from there); the folder mirror is derivable from it. The Memory Bank sidebar tab renders a branch-aware folder view via `KnowledgeBaseTreeProvider` (the class name still uses the legacy "KnowledgeBase" identifier; the user-facing label is "Memory Bank").
 
-Two commands implement the lifecycle:
+Two migration paths populate the folder:
 
-- `jollimemory.migrateToKnowledgeBase` — first migration. Picks a target folder, copies every existing memory into it as Markdown via `MigrationEngine`, and switches the active storage to `DualWriteStorage`.
-- `jollimemory.rebuildKnowledgeBase` — re-migration. Triggered by clicking **Migrate to Memory Bank** in Settings after a previous migration. Creates a new `-N`-suffixed folder, runs the migration into it, and archives the previous folder's repo identity so the next `resolveKBPath()` picks the new one.
-
-Both commands keep the orphan branch as the system of record; the folder is always derivable from it.
+1. **Automatic, on every `activate()`** — the dominant path for typical users. The extension resolves `kbRoot` from `cfg.localFolder` (or the default), calls `MetadataManager.readMigrationState()`, and runs `MigrationEngine.runMigration()` whenever the orphan branch has data but `migrationState` is missing or not `"completed"`. No UI is shown beyond the eventual sidebar refresh. Failures are logged via `log.error("activate", "KB folder init/migration failed", err)` and don't abort the rest of activate.
+2. **`jollimemory.rebuildKnowledgeBase`** — internal command, NOT in the command palette. Wired only to the Settings webview's **Migrate to Memory Bank** button (`SettingsScriptBuilder.ts` posts `command: 'rebuildKnowledgeBase'`). Calls `findFreshKBPath()` to obtain a non-colliding path under the user's chosen `localFolder` (which adds a `-N` suffix only if the base path is already in use), runs the migration into the fresh folder, and — if the path actually moved — rewrites the **old** folder's `.jolli/config.json` to drop `remoteUrl` and rename `repoName` to `${repoName}-archived-${Date.now()}`, so future `resolveKBPath()` calls won't reuse it. Old content files are left untouched. Returns `{ ok, message }` for the webview to render in-place rather than firing a toast.
 
 ---
 
 ### Platform & UI
-
-**Disable state in tree views** — VS Code `when` clauses on view declarations only affect initial visibility. Once `createTreeView()` is called, the view is always shown regardless of context-key changes. The workaround: `setEnabled(false)` causes `getChildren()` to return `[]`, which triggers the `viewsWelcome` placeholder defined in `package.json`.
 
 **Webview CSP — no inline style/JS** — All webviews use a strict CSP with no `unsafe-inline`. Dynamic visibility uses a `.hidden` CSS class (not the HTML `hidden` attribute, which is silently overridden by `display: flex`). Inline `style=""` and inline event handlers are dropped silently and must be replaced by classes + `addEventListener`.
 

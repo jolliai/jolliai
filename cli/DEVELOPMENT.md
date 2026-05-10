@@ -65,7 +65,7 @@ jolli status
                            │ stdin JSON
                     ┌──────┴──────┐
                     │  StopHook   │  Saves session info to
-                    │  (Node.js)  │  ~/.jolli/jollimemory/sessions.json
+                    │  (Node.js)  │  <projectDir>/.jolli/jollimemory/sessions.json
                     └─────────────┘
                   (Codex sessions are discovered by scanning ~/.codex/sessions/
                    at post-commit time. OpenCode reads
@@ -117,11 +117,11 @@ jolli status
 
 | Module | Build Output | Purpose |
 |--------|-------------|---------|
-| [Cli.ts](src/Cli.ts) | `dist/Cli.js` | CLI commands (enable, disable, status, view, recall, migrate) |
+| [Cli.ts](src/Cli.ts) | `dist/Cli.js` | CLI commands — Memory: `enable` / `disable` / `status` / `doctor` / `clean` / `view` / `export` / `recall` / `search` / `configure` / `migrate`; Auth: `auth login` / `logout` / `signup` / `status`; Site: `new` / `convert` / `dev` / `build` / `start` |
 | [StopHook.ts](src/hooks/StopHook.ts) | `dist/StopHook.js` | Claude Code Stop event handler |
 | [SessionStartHook.ts](src/hooks/SessionStartHook.ts) | `dist/SessionStartHook.js` | Claude Code SessionStart hook (injects mini-briefing) |
 | [PostCommitHook.ts](src/hooks/PostCommitHook.ts) | `dist/PostCommitHook.js` | Git post-commit hook (operation detection + queue enqueue + worker spawn) |
-| [QueueWorker.ts](src/hooks/QueueWorker.ts) | `dist/QueueWorker.js` | Background queue processor (LLM pipeline, squash merge, rebase migration) |
+| [QueueWorker.ts](src/hooks/QueueWorker.ts) | `dist/QueueWorker.js` | Background queue processor — LLM summarization for `commit` / `amend`, LLM-driven `generateSquashConsolidation` (with mechanical merge as fallback) for `squash` / `rebase-squash`, and 1:1 hash migration for `rebase-pick` |
 | [PostRewriteHook.ts](src/hooks/PostRewriteHook.ts) | `dist/PostRewriteHook.js` | Git post-rewrite hook (enqueues amend/rebase entries) |
 | [PrepareMsgHook.ts](src/hooks/PrepareMsgHook.ts) | `dist/PrepareMsgHook.js` | Git prepare-commit-msg hook (squash detection) |
 | [GeminiAfterAgentHook.ts](src/hooks/GeminiAfterAgentHook.ts) | `dist/GeminiAfterAgentHook.js` | Gemini CLI AfterAgent event handler |
