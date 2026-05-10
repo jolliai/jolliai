@@ -83,9 +83,8 @@ export function buildScript(): string {
     });
   }
 
-  // Push button (Jolli only, or Jolli + Local depending on pushAction config)
+  // Push button (Jolli only — local push pathway was removed in 2026-05).
   var pushBtn = document.getElementById('pushJolliBtn');
-  var pushAction = pushBtn ? (pushBtn.dataset.pushAction || 'jolli') : 'jolli';
   if (pushBtn) {
     pushBtn.addEventListener('click', function() {
       vscode.postMessage({ command: 'push' });
@@ -93,40 +92,20 @@ export function buildScript(): string {
   }
 ${buildPrSectionScript()}
 
-  // ── Combined push result tracking ──
-  // When pushAction is "both", we wait for BOTH pushToJolliResult and
-  // pushToLocalResult before re-enabling the button. When pushAction
-  // is "jolli", only the Jolli result matters.
-  // The button label is never changed during push — disabled/enabled state
-  // is the only visual indicator. Success/failure feedback comes via
-  // vscode notifications and the panel re-render on success.
-  var pendingJolli = null;
-  var pendingLocal = null;
-
-  // Listen for messages from the extension (push + topic edit status updates)
+  // Listen for messages from the extension (push + topic edit status updates).
+  // The push button is disabled on 'pushStarted' and re-enabled on
+  // 'pushToJolliResult'. Success/failure feedback comes via vscode
+  // notifications and the panel re-render on success — the button label
+  // itself is never changed mid-push.
   window.addEventListener('message', function(event) {
     var msg = event.data;
 
     // ── Push status ──
     if (pushBtn && msg.command === 'pushStarted') {
       pushBtn.disabled = true;
-      pendingJolli = null;
-      pendingLocal = null;
     }
-
-    // Collect push results and re-enable button when all sides are done
-    if (msg.command === 'pushToJolliResult') {
-      pendingJolli = msg;
-    } else if (msg.command === 'pushToLocalResult') {
-      pendingLocal = msg;
-    }
-    if (pendingJolli) {
-      var ready = pushAction === 'jolli' ? true : !!pendingLocal;
-      if (ready) {
-        if (pushBtn) pushBtn.disabled = false;
-        pendingJolli = null;
-        pendingLocal = null;
-      }
+    if (pushBtn && msg.command === 'pushToJolliResult') {
+      pushBtn.disabled = false;
     }
 ${buildPrMessageScript()}
 

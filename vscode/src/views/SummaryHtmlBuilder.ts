@@ -43,26 +43,18 @@ export interface BuildHtmlOptions {
 	readonly planTranslateSet?: ReadonlySet<string>;
 	readonly noteTranslateSet?: ReadonlySet<string>;
 	readonly nonce?: string;
-	/** Controls the Push button label and data attribute. Defaults to "jolli". */
-	readonly pushAction?: "jolli" | "both";
 }
 
 /**
  * Assembles the complete HTML document from modular building blocks.
  * @param summary - The commit summary to render
- * @param opts - Options controlling transcript hashes, translate sets, nonce, and push action
+ * @param opts - Options controlling transcript hashes, translate sets, and nonce
  */
 export function buildHtml(
 	summary: CommitSummary,
 	opts: BuildHtmlOptions = {},
 ): string {
-	const {
-		transcriptHashSet,
-		planTranslateSet,
-		noteTranslateSet,
-		nonce,
-		pushAction = "jolli",
-	} = opts;
+	const { transcriptHashSet, planTranslateSet, noteTranslateSet, nonce } = opts;
 	const { topics: allTopics, sourceNodes } = collectSortedTopics(summary);
 	const stats = resolveDiffStats(summary);
 	const totalInsertions = stats.insertions;
@@ -93,7 +85,7 @@ ${csp}
 <body>
 <div class="page">
 ${buildAllConversationsSection(transcriptHashSet)}
-${buildHeader(summary, totalFiles, totalInsertions, totalDeletions, pushAction)}
+${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
 <hr class="separator" />
 ${buildRecapSection(summary.recap)}
 ${buildPrSectionHtml()}
@@ -199,30 +191,16 @@ function buildJolliRow(
 
 // ─── Header ───────────────────────────────────────────────────────────────────
 
-/** Returns the push button label (HTML-safe) based on whether the doc exists and the push action mode. */
-function buildPushButtonLabel(
-	isUpdate: boolean,
-	pushAction: "jolli" | "both",
-): string {
-	if (isUpdate) {
-		return pushAction === "both"
-			? "Update on Jolli &amp; Local"
-			: "Update on Jolli";
-	}
-	return pushAction === "both" ? "Push to Jolli &amp; Local" : "Push to Jolli";
-}
-
 /** Builds the page header: title + Notion-style properties table. */
 function buildHeader(
 	summary: CommitSummary,
 	totalFiles: number,
 	totalInsertions: number,
 	totalDeletions: number,
-	pushAction: "jolli" | "both",
 ): string {
 	const changesHtml = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, <span class="stat-add">${totalInsertions} insertion${totalInsertions !== 1 ? "s" : ""}(+)</span>, <span class="stat-del">${totalDeletions} deletion${totalDeletions !== 1 ? "s" : ""}(-)</span>`;
 	const totalTurns = aggregateTurns(summary);
-	const pushLabel = buildPushButtonLabel(!!summary.jolliDocUrl, pushAction);
+	const pushLabel = summary.jolliDocUrl ? "Update on Jolli" : "Push to Jolli";
 
 	return `
 <h1 class="page-title">${escHtml(summary.commitMessage)}</h1>
@@ -234,7 +212,7 @@ function buildHeader(
       <button class="split-menu-item" id="downloadMdBtn">Save as Markdown File</button>
     </div>
   </div>
-  <button class="action-btn primary" id="pushJolliBtn" data-push-action="${pushAction}">${pushLabel}</button>
+  <button class="action-btn primary" id="pushJolliBtn">${pushLabel}</button>
 </div>
 <div class="properties">
   <div class="prop-row">

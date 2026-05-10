@@ -69,18 +69,16 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).not.toContain("command: 'pushToJolli'");
 	});
 
-	it("reads pushAction from data attribute on the push button", () => {
-		expect(script).toContain("pushBtn.dataset.pushAction");
-	});
-
-	it("contains combined push result handler for pushToJolliResult and pushToLocalResult", () => {
+	it("re-enables the push button on pushToJolliResult and disables it on pushStarted", () => {
+		// The Jolli-only push pathway is the only one left after the
+		// pushAction/local-push removal — the script must consume the single
+		// pushToJolliResult message and never branch on a `pushAction` value
+		// or wait for a (now-gone) pushToLocalResult.
 		expect(script).toContain("pushToJolliResult");
-		expect(script).toContain("pushToLocalResult");
-	});
-
-	it("contains pending result tracking variables", () => {
-		expect(script).toContain("pendingJolli");
-		expect(script).toContain("pendingLocal");
+		expect(script).toContain("pushStarted");
+		expect(script).not.toContain("pushToLocalResult");
+		expect(script).not.toContain("pushAction");
+		expect(script).not.toContain("pendingLocal");
 	});
 
 	it("contains the PR section script from buildPrSectionScript()", () => {

@@ -15,13 +15,9 @@
 
 import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
 import * as vscode from "vscode";
-import type { SatelliteFile } from "../../../cli/src/core/LocalPusher.js";
-import { pushSummaryToLocal as corePushSummaryToLocal } from "../../../cli/src/core/LocalPusher.js";
 import {
 	loadPlansRegistry,
-	saveConfig,
 	savePlansRegistry,
 } from "../../../cli/src/core/SessionTracker.js";
 import {
@@ -223,8 +219,6 @@ export class SummaryWebviewPanel {
 	private planTranslateSet: Set<string> = new Set();
 	/** Cached set of note IDs whose content contains non-ASCII characters (need translation). */
 	private noteTranslateSet: Set<string> = new Set();
-	/** Cached push action mode loaded from global config. */
-	private pushAction: "jolli" | "both" = "jolli";
 	/** Guards against concurrent push invocations (re-click during active push). */
 	private pushInProgress = false;
 	/**
@@ -607,9 +601,6 @@ export class SummaryWebviewPanel {
 		mainBranch: string,
 		source: SummaryPanelSource = "commit",
 	): Promise<void> {
-		const config = await loadGlobalConfig();
-		const pushAction = config.pushAction ?? "jolli";
-
 		if (source === "commit" || source === "kb") {
 			const existing = SummaryWebviewPanel.commitPanels.get(summary.commitHash);
 			if (existing) {
@@ -620,19 +611,16 @@ export class SummaryWebviewPanel {
 				// op rewriting a plan body. Gating the refresh on summary-equality
 				// alone would leave those stale. The refreshes are cheap reads, so
 				// we always run them and then compare the full render-input set
-				// (summary + pushAction + 3 cache sets) to decide whether re-rendering
-				// the webview HTML is necessary.
-				const prevPushAction = existing.pushAction;
+				// (summary + 3 cache sets) to decide whether re-rendering the
+				// webview HTML is necessary.
 				const prevTranscriptHashSet = existing.transcriptHashSet;
 				const prevPlanTranslateSet = existing.planTranslateSet;
 				const prevNoteTranslateSet = existing.noteTranslateSet;
-				existing.pushAction = pushAction;
 				await existing.refreshTranscriptHashes(summary);
 				await existing.refreshPlanTranslateSet(summary);
 				await existing.refreshNoteTranslateSet(summary);
 				const inputsChanged =
 					!summariesEqual(existing.currentSummary, summary) ||
-					prevPushAction !== pushAction ||
 					!setsEqual(prevTranscriptHashSet, existing.transcriptHashSet) ||
 					!setsEqual(prevPlanTranslateSet, existing.planTranslateSet) ||
 					!setsEqual(prevNoteTranslateSet, existing.noteTranslateSet);
@@ -661,7 +649,6 @@ export class SummaryWebviewPanel {
 			bridge,
 			mainBranch,
 		);
-		instance.pushAction = pushAction;
 		if (source === "memory") {
 			SummaryWebviewPanel.currentMemoryPanel = instance;
 		} else {
@@ -689,7 +676,6 @@ export class SummaryWebviewPanel {
 			planTranslateSet: this.planTranslateSet,
 			noteTranslateSet: this.noteTranslateSet,
 			nonce,
-			pushAction: this.pushAction,
 		});
 	}
 
@@ -900,19 +886,16 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
-	 * Orchestrates push to Jolli Cloud and (optionally) to a local folder.
-	 *
-	 * - The Jolli push always runs.
-	 * - When `pushAction === "both"`, a local push runs concurrently via
-	 *   {@link runLocalPush}.
-	 * - Uses `Promise.allSettled` so one side's failure doesn't block the other.
-	 * - Posts independent result messages for each side.
+	 * Orchestrates the push to Jolli Cloud and posts the result message back
+	 * to the webview. Wrapped in `Promise.allSettled` semantics by
+	 * {@link toJolliResultMessage} so a thrown error becomes a structured
+	 * `pushToJolliResult` instead of an uncaught rejection.
 	 */
 	private async handlePush(): Promise<void> {
-		// Prevent concurrent pushes: the button can be re-clicked when (1)
-		// runJolliPush throws before posting pushStarted (button never disabled),
-		// or (2) runJolliPush succeeds and calls this.update() which replaces the
-		// webview HTML and re-enables the button while runLocalPush is still active.
+		// Prevent concurrent pushes: the button can be re-clicked when
+		// runJolliPush throws before posting pushStarted (button never
+		// disabled), or when a successful run calls this.update() which
+		// replaces the webview HTML mid-promise.
 		if (this.pushInProgress) {
 			return;
 		}
@@ -923,30 +906,10 @@ export class SummaryWebviewPanel {
 			// biome-ignore lint/style/noNonNullAssertion: dispatch guard ensures currentSummary is set
 			const summary = this.currentSummary!;
 			const config = await loadGlobalConfig();
-			const pushAction = config.pushAction ?? "jolli";
-
-			// Jolli side: always runs.
-			const jolliPromise = this.runJolliPush(summary, config.jolliApiKey);
-
-			// Local side: only when pushAction is "both".
-			// Pass the captured summary to avoid a race with runJolliPush mutating this.currentSummary.
-			let localPromise: Promise<{ filePath: string }> | undefined;
-			if (pushAction === "both") {
-				localPromise = this.runLocalPush(summary, config.localFolder);
-			}
-
-			const [jolliResult, localResult] = await Promise.allSettled([
-				jolliPromise,
-				localPromise ?? Promise.resolve(undefined),
+			const jolliResult = await Promise.allSettled([
+				this.runJolliPush(summary, config.jolliApiKey),
 			]);
-
-			// Post Jolli result (always).
-			this.panel.webview.postMessage(toJolliResultMessage(jolliResult));
-
-			// Post Local result only when we attempted it.
-			if (pushAction === "both") {
-				this.panel.webview.postMessage(toLocalResultMessage(localResult));
-			}
+			this.panel.webview.postMessage(toJolliResultMessage(jolliResult[0]));
 		} finally {
 			this.pushInProgress = false;
 		}
@@ -1114,130 +1077,6 @@ export class SummaryWebviewPanel {
 			}
 			throw err;
 		}
-	}
-
-	/**
-	 * Runs the local push: resolves the target folder (prompting with a picker
-	 * if needed), then delegates to the core {@link corePushSummaryToLocal}.
-	 *
-	 * @returns The file path of the written summary file.
-	 * @throws If no folder is selected or the push fails.
-	 */
-	private async runLocalPush(
-		summary: CommitSummary,
-		localFolder: string | undefined,
-	): Promise<{ filePath: string }> {
-		const folder = await this.resolveLocalFolder(localFolder);
-		if (!folder) {
-			throw new Error("No folder selected");
-		}
-
-		// Gather satellite plan/note content (mirrors JolliMemoryBridge.pushSummaryToLocal)
-		const satellites = await this.gatherSatellites(summary);
-		const summaryMarkdown = buildMarkdown(summary);
-
-		const result = await corePushSummaryToLocal({
-			folder,
-			summary,
-			summaryMarkdown,
-			satellites,
-			cwd: this.workspaceRoot,
-		});
-		return { filePath: result.summaryPath };
-	}
-
-	/**
-	 * Resolves the local folder for push-to-local. If `localFolder` is set and
-	 * exists on disk, returns it directly. Otherwise opens a folder picker and
-	 * persists the user's choice via {@link saveConfig}.
-	 *
-	 * @returns The resolved folder path, or `undefined` if the user cancelled.
-	 */
-	private async resolveLocalFolder(
-		localFolder: string | undefined,
-	): Promise<string | undefined> {
-		if (localFolder && existsSync(localFolder)) {
-			return localFolder;
-		}
-
-		const picked = await vscode.window.showOpenDialog({
-			canSelectFolders: true,
-			canSelectFiles: false,
-			canSelectMany: false,
-			openLabel: "Select folder for Push to Local",
-		});
-
-		if (!picked || picked.length === 0) {
-			return;
-		}
-
-		const chosenFolder = picked[0].fsPath;
-		await saveConfig({ localFolder: chosenFolder });
-		return chosenFolder;
-	}
-
-	/**
-	 * Gathers plan and note satellite files for a summary, reading content from
-	 * the orphan branch. Used by {@link runLocalPush} to build the satellite
-	 * array expected by the core local pusher.
-	 */
-	private async gatherSatellites(
-		summary: CommitSummary,
-	): Promise<Array<SatelliteFile>> {
-		const satellites: Array<SatelliteFile> = [];
-
-		// Plans
-		const planUrlBySlug = new Map(
-			(summary.plans ?? []).map((p) => [p.slug, p.jolliPlanDocUrl]),
-		);
-		for (const plan of summary.plans ?? []) {
-			const content = await readPlanFromBranch(plan.slug, this.workspaceRoot);
-			if (!content) {
-				continue;
-			}
-			satellites.push({
-				slug: plan.slug,
-				title: plan.title,
-				content,
-				jolliUrl: planUrlBySlug.get(plan.slug),
-			});
-		}
-
-		// Notes
-		const noteUrlById = new Map(
-			(summary.notes ?? []).map((n) => [n.id, n.jolliNoteDocUrl]),
-		);
-		for (const note of summary.notes ?? []) {
-			// Schema-guard for legacy/corrupt entries: snippet notes normally persist
-			// `content`, but rows from before the snippet feature shipped may be missing
-			// it. Log at warn level so the drift is visible instead of silently dropped.
-			let content: string;
-			if (note.format === "snippet") {
-				/* v8 ignore start -- schema-guard mirror of runJolliPush's legacy-snippet handling (which IS tested); reached only via the local-push path (pushAction="both"), whose orchestration is out of scope for this file's unit tests. Follow-up: lift into a shared helper so one test covers both call sites. */
-				if (note.content === undefined || note.content === "") {
-					log.warn(
-						"SummaryPanel",
-						`Snippet note ${note.id} has no content — skipping`,
-					);
-					continue;
-				}
-				/* v8 ignore stop */
-				content = note.content;
-			} else {
-				content = (await readNoteFromBranch(note.id, this.workspaceRoot)) ?? "";
-				if (!content) {
-					continue;
-				}
-			}
-			satellites.push({
-				slug: note.id,
-				title: note.title,
-				content,
-				jolliUrl: noteUrlById.get(note.id),
-			});
-		}
-
-		return satellites;
 	}
 
 	/** Uploads associated plans to Jolli and returns their published URLs. */
@@ -2594,24 +2433,6 @@ function toJolliResultMessage(
 	}
 	return {
 		command: "pushToJolliResult",
-		success: false,
-		error: extractSettledError(result),
-	};
-}
-
-/** Converts a settled local push result into the `pushToLocalResult` webview message. */
-function toLocalResultMessage(
-	result: PromiseSettledResult<{ filePath: string } | undefined>,
-): Record<string, unknown> {
-	if (result.status === "fulfilled" && result.value) {
-		return {
-			command: "pushToLocalResult",
-			success: true,
-			filePath: result.value.filePath,
-		};
-	}
-	return {
-		command: "pushToLocalResult",
 		success: false,
 		error: extractSettledError(result),
 	};

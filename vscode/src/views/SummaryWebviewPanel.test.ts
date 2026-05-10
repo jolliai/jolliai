@@ -628,7 +628,6 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: expect.any(Set),
 					noteTranslateSet: expect.any(Set),
 					nonce: "mocknonce1234567=",
-					pushAction: "jolli",
 				}),
 			);
 		});
@@ -737,42 +736,6 @@ describe("SummaryWebviewPanel", () => {
 			expect(mockGetTranscriptHashes).toHaveBeenCalled();
 			expect(mockBuildHtml).not.toHaveBeenCalled();
 			expect(reveal).toHaveBeenCalled();
-		});
-
-		it("commit slot: re-renders when pushAction config changed between clicks", async () => {
-			const summary = makeSummary({ commitHash: "aaa" });
-
-			mockLoadConfig.mockResolvedValueOnce({
-				apiKey: "k",
-				model: "m",
-				pushAction: "jolli",
-			});
-			await SummaryWebviewPanel.show(
-				summary,
-				extensionUri,
-				workspaceRoot,
-				stubBridge,
-				mainBranch,
-			);
-			mockBuildHtml.mockClear();
-
-			mockLoadConfig.mockResolvedValueOnce({
-				apiKey: "k",
-				model: "m",
-				pushAction: "both",
-			});
-			await SummaryWebviewPanel.show(
-				summary,
-				extensionUri,
-				workspaceRoot,
-				stubBridge,
-				mainBranch,
-			);
-
-			expect(mockBuildHtml).toHaveBeenCalledWith(
-				summary,
-				expect.objectContaining({ pushAction: "both" }),
-			);
 		});
 
 		it("commit slot: re-renders when orphan-branch transcript hashes changed between clicks", async () => {
@@ -951,7 +914,6 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: expect.any(Set),
 					noteTranslateSet: expect.any(Set),
 					nonce: "mocknonce1234567=",
-					pushAction: "jolli",
 				}),
 			);
 		});
@@ -975,7 +937,6 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: expect.any(Set),
 					noteTranslateSet: expect.any(Set),
 					nonce: "mocknonce1234567=",
-					pushAction: "jolli",
 				}),
 			);
 		});
@@ -1015,7 +976,6 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: new Set(["plan-1"]),
 					noteTranslateSet: expect.any(Set),
 					nonce: "mocknonce1234567=",
-					pushAction: "jolli",
 				}),
 			);
 		});
@@ -1048,7 +1008,6 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: new Set(["plan-ascii"]),
 					noteTranslateSet: expect.any(Set),
 					nonce: "mocknonce1234567=",
-					pushAction: "jolli",
 				}),
 			);
 		});
@@ -1088,7 +1047,6 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: expect.any(Set),
 					noteTranslateSet: new Set(["cn-note"]),
 					nonce: "mocknonce1234567=",
-					pushAction: "jolli",
 				}),
 			);
 		});
@@ -1121,7 +1079,6 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: expect.any(Set),
 					noteTranslateSet: new Set(["cn-snippet"]),
 					nonce: "mocknonce1234567=",
-					pushAction: "jolli",
 				}),
 			);
 		});
@@ -1154,7 +1111,6 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: expect.any(Set),
 					noteTranslateSet: new Set(["md-cn"]),
 					nonce: "mocknonce1234567=",
-					pushAction: "jolli",
 				}),
 			);
 		});
@@ -1188,7 +1144,6 @@ describe("SummaryWebviewPanel", () => {
 					planTranslateSet: expect.any(Set),
 					noteTranslateSet: new Set(),
 					nonce: "mocknonce1234567=",
-					pushAction: "jolli",
 				}),
 			);
 		});
@@ -4311,7 +4266,6 @@ describe("SummaryWebviewPanel", () => {
 						planTranslateSet: expect.any(Set),
 						noteTranslateSet: expect.any(Set),
 						nonce: "mocknonce1234567=",
-						pushAction: "jolli",
 					}),
 				);
 			});
@@ -4370,7 +4324,6 @@ describe("SummaryWebviewPanel", () => {
 						planTranslateSet: new Set(),
 						noteTranslateSet: expect.any(Set),
 						nonce: "mocknonce1234567=",
-						pushAction: "jolli",
 					}),
 				);
 			});
