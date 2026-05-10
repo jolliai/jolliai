@@ -13,12 +13,12 @@ When you work with AI agents like Claude Code, Codex, Gemini CLI, OpenCode, Curs
 
 ## This repository
 
-Monorepo hosting three deliverables that share the same product model and storage (a git orphan branch `jollimemory/summaries/v3`):
+Monorepo hosting three deliverables that share the same product model and storage. Memories are dual-written to **both** the git orphan branch `jollimemory/summaries/v3` (the source of truth) and a **Memory Bank** folder on disk (a plain-Markdown copy you can read or `grep` directly, no extension required):
 
 | Surface | Directory | What it's for |
 | -- | -- | -- |
-| **CLI** — `@jolli.ai/cli` | [`cli/`](cli/) | Standalone command-line tool. Installs git hooks, generates summaries on commit, and offers `view` / `export` / `recall` / `configure` / `doctor` commands. Also includes **Jolli Site** (`new` / `dev` / `build` / `start` / `convert`) for generating documentation sites from Markdown + OpenAPI. Works independent of any IDE. |
-| **VS Code extension** — Jolli Memory | [`vscode/`](vscode/) | Sidebar UI with panels for Status, Memories, Plans & Notes, Changes, Commits. Bundles the CLI internally; works whether or not the CLI is also installed globally. |
+| **CLI** — `@jolli.ai/cli` | [`cli/`](cli/) | Standalone command-line tool. Installs git hooks, generates summaries on commit, and offers `view` / `export` / `recall` / `search` / `configure` / `doctor` commands. Also includes **Jolli Site** (`new` / `dev` / `build` / `start` / `convert`) for generating documentation sites from Markdown + OpenAPI. Works independent of any IDE. |
+| **VS Code extension** — Jolli Memory | [`vscode/`](vscode/) | Sidebar with three tabs (Branch / Memory Bank / Status), a 5-tab Settings webview, and a per-commit Summary Webview. Bundles the CLI internally; works whether or not the CLI is also installed globally. |
 | **IntelliJ plugin** — Jolli Memory | [`intellij/`](intellij/) | JetBrains IDEs integration (IDEA, PyCharm, WebStorm, GoLand, …) — pure-Kotlin implementation. |
 
 ### Which one should I install?
@@ -42,7 +42,7 @@ Monorepo hosting three deliverables that share the same product model and storag
 
 - **Automatic** — git hooks run summary generation in a detached background process; your commit returns instantly (the summary appears 10–20 seconds later).
 - **Multi-agent** — works with Claude Code, Codex CLI, Gemini CLI, OpenCode, Cursor IDE, GitHub Copilot CLI, and VS Code Copilot Chat. Sessions are picked up automatically via agent hooks or filesystem/DB scanning.
-- **Local-first** — summaries and raw transcripts stay on your machine in a git orphan branch, and a **Memory Bank** folder additionally holds a plain-Markdown copy of every memory (dual-written automatically — the orphan branch is the source of truth). Opt-in **Push to Jolli** shares summaries (not transcripts) with your team.
+- **Local-first** — every memory is dual-written to **both** a git orphan branch (the source of truth) and a **Memory Bank** folder on disk, so you always have a plain-Markdown copy alongside the canonical orphan-branch entry. Raw AI session transcripts are dual-written the same way (orphan branch + Memory Bank `transcripts/` subfolder), kept as JSON for review and Summary-Webview replay. Opt-in **Push to Jolli** shares summaries (not transcripts) with your team.
 - **Structured format** — v3 tree with topics, triggers, decisions, and todos; correctly handles amend / squash / cherry-pick / rebase.
 - **Documentation site generator** — the CLI also ships a Nextra-based site generator (`jolli new` / `build` / `start` / `dev`) with theme packs, header / footer config, and an OpenAPI rich-rendering pipeline (per-endpoint MDX, no `swagger-ui-react` runtime).
 - **Privacy-respecting** — see the *Privacy* section in each surface's README for the exact data flow. The Jolli LLM proxy does not persist transcripts or diffs, and does not log them.

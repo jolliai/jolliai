@@ -4,7 +4,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. It also includes **Jolli Site** — generate polished documentation sites from Markdown and OpenAPI specs with a single command.
 
-When you work with AI agents like Claude Code, Codex, Gemini CLI or OpenCode, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents like Claude Code, Codex, Gemini CLI, OpenCode, Cursor IDE, GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 ## How It Works
 
@@ -22,7 +22,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
 | **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.5+) |
-| **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by scanning the Cursor workspace storage |
+| **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's local SQLite stores (`globalStorage/state.vscdb` plus per-workspace `workspaceStorage/` databases under your platform's Cursor user-data directory) |
 | **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning Copilot CLI's session log |
 | **VS Code Copilot Chat** | No hook needed — sessions are discovered automatically by reading the Copilot Chat conversation cache |
 
@@ -34,7 +34,7 @@ When you run `git commit`, three standard git hooks handle the rest:
 2. **After the commit** (`post-commit`): detects the operation type (commit, amend, squash, cherry-pick, revert), enqueues it, and spawns a background worker that reads the AI conversation + code diff, calls the LLM, and writes the summary
 3. **After rebase/amend** (`post-rewrite`): enqueues migration entries so summaries are re-associated with the new commit hashes
 
-Everything is stored in a git orphan branch (`jollimemory/summaries/v3`), completely separate from your code history.
+Every memory is dual-written to **both** the git orphan branch `jollimemory/summaries/v3` (the source of truth — completely separate from your code history) and the **Memory Bank** folder on disk, so you always have a plain-Markdown copy you can read, `grep`, or pipe into other tools without going through the CLI. The Memory Bank folder has two layers — a hidden `<localFolder>/<repo>/.jolli/summaries/<commitHash>.json` for canonical JSON, and a visible `<localFolder>/<repo>/<branch>/<slug>-<hash8>.md` for human-readable Markdown — and `<localFolder>` is your configured Memory Bank root (one root can hold multiple repos, each in its own `<repo>/` subfolder). Raw AI conversation transcripts are dual-written the same way — to `transcripts/<commitHash>.json` on the orphan branch and to `<localFolder>/<repo>/.jolli/transcripts/<commitHash>.json` in the Memory Bank folder.
 
 **Worktree-aware:** hooks and summaries work across `git worktree` checkouts — each worktree tracks its own current branch and its memories stay consistent.
 
@@ -113,7 +113,7 @@ The login flow opens your default browser for OAuth authentication. After comple
 
 ### `jolli status`
 
-Shows the current installation status, including CLI version, hook state, authentication state, active sessions, supported integrations (Claude, Codex, Gemini, OpenCode), and summary count.
+Shows the current installation status, including CLI version, hook state, authentication state, active sessions, supported integrations (Claude, Codex, Gemini, OpenCode, Cursor, Copilot CLI, Copilot Chat), and summary count.
 
 ```bash
 jolli status
@@ -176,29 +176,34 @@ jolli recall --output jollimemory-context.md
 # List all recorded branches
 jolli recall --catalog
 
-# JSON output for skills/agents (unlimited — no truncation)
+# JSON output for skills/agents — structured RecallPayload, not pre-rendered markdown
 jolli recall --format json
 
-# With token budget and JSON output
+# With token budget and JSON output (the payload is trimmed to fit the budget)
 jolli recall --budget 30000 --format json
 ```
 
+`--format json` returns a structured **`RecallPayload`** with discrete fields (`stats`, `plans[]`, `notes[]`, summaries…) so an agent skill can run its own grounded synthesis directly on the data instead of re-parsing a markdown blob. When `--budget` is set, lower-priority fields are trimmed first so the payload fits within the budget without truncating mid-record.
+
 ### `jolli search`
 
-Searches stored memories on the local catalog with a two-phase pipeline (catalog scan → topic match). Returns full topic bodies — not match snippets — and prints a stable `/summary/<hash>` URI per hit so an AI agent can deep-link back to the right memory. Also powers the [`/jolli-search` skill](#session-context-recall) for in-agent search.
+Searches stored memories with a two-phase pipeline: Phase 1 returns a catalog of matching commits (hash + branch + date + recap + topic titles); Phase 2 takes a comma-separated `--hashes` list and returns full topic bodies for those commits.
 
 ```bash
-# Search memories on the current branch
+# Phase 1 — catalog of matches on the current branch
 jolli search "rate limiter"
 
-# Limit to recent commits and a specific branch
-jolli search "auth refactor" --since 2026-04-01 --branch feature/auth
+# Filter to recent commits, cap entries, JSON for skills/agents
+jolli search "auth refactor" --since 2026-04-01 --limit 5 --format json
 
-# Cap the result count, JSON output for skills/agents
-jolli search "windows path" --limit 5 --format json
+# Phase 2 — load full topic bodies for chosen hashes
+jolli search "rate limiter" --hashes deadbeef,cafe1234 --format json
+
+# Cap the token budget on the catalog output
+jolli search "windows path" --budget 8000 --format json
 ```
 
-`--since` accepts an ISO date or RFC 3339 timestamp; bad values are rejected with exit 1 (no silent empty result). SHAs in `/summary/<hash>` URIs are always full 40-character SHAs.
+Available flags: `--since` (ISO date or relative `7d`/`2w`/`1m`/`3y`; bad values are rejected with exit 1), `--hashes`, `--limit`, `--budget`, `--format` (`json` default; `text` for terminal-friendly output), `--output`, `--cwd`. There is **no `--branch` flag** — the catalog is scanned across every branch in the repo by design.
 
 ### Site generation: `jolli new` / `build` / `start` / `dev`
 
@@ -220,7 +225,7 @@ jolli dev
 
 Highlights:
 
-- **Theme packs**: `Forge` (clean dev docs, sidebar-first, Inter) and `Atlas` (editorial, dark default, serif). Customize `accentHue`, `fontFamily`, logos, and default theme mode in `site.json`.
+- **Theme packs** — `theme.pack` in `site.json` accepts `"forge"` (clean dev docs, sidebar-first, Inter; the default), `"atlas"` (editorial, dark default, serif), or `"default"` (vanilla Nextra layout, no custom styling). Customize `accentHue`, `fontFamily`, logos, and default theme mode in `site.json`.
 - **Header / footer config**: `header.items` supports per-item dropdowns; `footer` supports copyright, link columns, and social icons.
 - **OpenAPI rich pipeline**: each endpoint is compiled into a per-endpoint MDX page with auto-generated cURL / JS / TS / Python / Go code samples — no `swagger-ui-react` runtime.
 
@@ -247,7 +252,7 @@ jolli configure --set excludePatterns=docs/**,*.log,node_modules
 jolli configure --remove jolliApiKey
 ```
 
-Supported keys: `apiKey`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `logLevel`, `excludePatterns`. `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
+Supported keys: `apiKey`, `aiProvider`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `localFolder`, `logLevel`, `excludePatterns`. `aiProvider` pins the summarization backend (`"anthropic"` or `"jolli"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. `localFolder` is the Memory Bank root on disk where every memory is dual-written. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
 
 ### `jolli doctor`
 
@@ -377,13 +382,13 @@ What it does: detects sidebar config, reorganizes directory structure, downgrade
 
 Jolli Memory feeds prior development context back into your AI agent so it can pick up where you (or a teammate) left off.
 
-**Automatic briefing** — every time a new Claude Code session starts, a lightweight briefing (~300 tokens) is injected into the conversation: branch name, commit count, date range, and last commit message. If it has been more than 3 days since the last commit, it suggests running the full recall command. This runs in under 200 ms and never blocks session startup.
+**Automatic briefing** — every time a new Claude Code session starts, a lightweight briefing (~300–500 tokens) is injected into the conversation: branch name, commit count, date range, and last commit message. If it has been more than 3 days since the last commit, it suggests running the full recall command. This runs in under 200 ms and never blocks session startup.
 
-**Full recall** — run `/jolli-recall` inside Claude Code (or any agent that supports it) to load the complete branch history: summaries, plans, decisions, and file-change statistics (up to ~30,000 tokens). The agent then reports what the branch is implementing, key technical decisions, what was last worked on, and the main files involved — so you can continue without re-reading the code.
+**Full recall** — run `/jolli-recall` inside Claude Code (or any agent that supports it) to load the complete branch history: summaries, plans, decisions, and file-change statistics (default budget ≈ 50,000 tokens; pass `--budget` to adjust). The agent then reports what the branch is implementing, key technical decisions, what was last worked on, and the main files involved — so you can continue without re-reading the code.
 
 If the current branch has no memories, the command shows a catalog of branches that do, letting you pick one to recall. You can also pass a branch name or keyword as an argument (e.g. `/jolli-recall auth-refactor`).
 
-**Targeted search** — run `/jolli-search <keyword>` (or `jolli search <keyword>` from the terminal) to search across every branch's memories. It returns full topic bodies along with `/summary/<hash>` URIs that the IntelliJ plugin and VS Code extension treat as deep links into the matching memory.
+**Targeted search** — run `/jolli-search <keyword>` (or `jolli search <keyword>` from the terminal) to search across every branch's memories. The raw CLI returns the catalog and full topic bodies (Phase 1 + Phase 2 via `--hashes`).
 
 ## Configuration
 
@@ -392,6 +397,7 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `apiKey` | string | `$ANTHROPIC_API_KEY` | Anthropic API key for summarization ([get one here](https://platform.anthropic.com/)) |
+| `aiProvider` | enum | (auto) | Pin which provider generates summaries: `"anthropic"` (use `apiKey` / `$ANTHROPIC_API_KEY`) or `"jolli"` (use `jolliApiKey`). When unset, the resolver falls back to the legacy precedence (`apiKey` → `$ANTHROPIC_API_KEY` → `jolliApiKey`). Each generated summary records the chosen source in its `LlmCallMetadata.source` field (`anthropic-config` / `anthropic-env` / `jolli-proxy`). |
 | `model` | string | `claude-sonnet-4-6` | Model used for summarization. Accepts an alias (`sonnet`, `haiku`) or a full model ID. |
 | `maxTokens` | integer | model default | Max output tokens per summarization call |
 | `jolliApiKey` | string | — | Jolli Space API key for pushing summaries to your team knowledge base |
@@ -403,6 +409,7 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 | `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (requires Node 22.5+) |
 | `cursorEnabled` | boolean | auto-detect | Enable Cursor IDE (Composer) session discovery |
 | `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |
+| `localFolder` | string | — | Memory Bank root on disk — every memory is dual-written here as Markdown alongside the orphan-branch copy. Set via the editor extensions' Memory Bank Settings tab. |
 | `excludePatterns` | string[] | — | Glob patterns for file exclusion (set via `jolli configure --set excludePatterns=glob1,glob2`) |
 
 **Authentication setup** — three options:
@@ -461,7 +468,7 @@ Each summary uses a **v3 tree structure**. A single commit can cover multiple in
 
 ## VSCode Extension
 
-The [Jolli Memory VS Code Extension](https://marketplace.visualstudio.com/items?itemName=jolli.jollimemory-vscode) adds a sidebar with panels for status, memories, plans & notes, file staging, commits, and full summary webviews. If you have both the CLI and the extension installed, they share the same data — the extension automatically detects the CLI and uses whichever version is newer.
+The [Jolli Memory VS Code Extension](https://marketplace.visualstudio.com/items?itemName=jolli.jollimemory-vscode) adds a sidebar with three tabs (Branch / Memory Bank / Status) and a per-commit Summary Webview, plus a 5-tab Settings page. If you have both the CLI and the extension installed, they share the same data — the extension bundles the CLI inline so it works whether or not a global CLI install is also present.
 
 ## Error Handling
 
@@ -485,7 +492,7 @@ To produce a summary, Jolli Memory reads your active AI session transcripts and 
 - If an **Anthropic `apiKey`** is configured — transcripts + diff are sent **directly to Anthropic**.
 - If only a **`jolliApiKey`** is configured (you signed in with `jolli auth login`) — transcripts + diff are sent to the **Jolli LLM proxy**, which forwards them to Anthropic on your behalf. The proxy **does not persist the transcripts or diff, and does not write them to any Jolli-side log** — payloads are held in memory only for the duration of the request and discarded once Anthropic responds.
 
-The generated summary is then written to the git orphan branch locally, and the raw transcripts are preserved alongside it for later review.
+The generated summary is then dual-written locally — to the git orphan branch (the source of truth) and to the Memory Bank folder on disk (canonical JSON at `<localFolder>/<repo>/.jolli/summaries/<commitHash>.json` plus human-readable Markdown at `<localFolder>/<repo>/<branch>/<slug>-<hash8>.md`). Raw transcripts are dual-written the same way: to `transcripts/<commitHash>.json` on the orphan branch and to `<localFolder>/<repo>/.jolli/transcripts/<commitHash>.json` in the Memory Bank folder.
 
 ### Uploads to Jolli Space
 
@@ -493,11 +500,16 @@ The CLI itself does not push summaries to Jolli Space — that action lives in t
 
 ### Session metadata
 
-Session IDs, transcript file paths, and timestamps are stored locally in `~/.jolli/jollimemory/`. Never uploaded anywhere.
+Session IDs, transcript file paths, and timestamps are stored locally in `<projectDir>/.jolli/jollimemory/sessions.json` (per-project, gitignored). Never uploaded anywhere.
 
 ### What stays 100% local
 
-Every file under `~/.jolli/jollimemory/` and every entry on the `jollimemory/summaries/v3` orphan branch — including raw transcripts — stays on your disk unless one of the specific actions above is triggered.
+Two `.jolli/jollimemory/` directories carry local state, both stay on your disk unless one of the specific actions above is triggered:
+
+- `~/.jolli/jollimemory/` (machine-global) — `config.json` (apiKey / authToken / jolliApiKey), hook entry scripts, dist-path indirection.
+- `<projectDir>/.jolli/jollimemory/` (per-project, gitignored) — `sessions.json` (session metadata), `plans.json`, `notes/`, `cursors.json`, `git-op-queue/`, `briefing-cache.json`, `debug.log`.
+
+Every entry on the `jollimemory/summaries/v3` orphan branch — and its mirror inside the Memory Bank folder, including raw transcripts — also stays on your disk unless one of the specific actions above is triggered.
 
 ## Support
 
