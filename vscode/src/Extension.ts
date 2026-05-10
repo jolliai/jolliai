@@ -198,17 +198,18 @@ function parseSummaryFrontmatter(
 // ─── activate ─────────────────────────────────────────────────────────────────
 
 /**
- * Names of every command declared in package.json. The two degraded paths
- * (no workspace, no git) need to register a no-op for each one so command-
- * palette invocations don't fail with "command not found"; lifting the list
- * to a constant keeps the two branches in lockstep.
+ * Commands the extension may receive in degraded mode (no workspace / no git).
+ * Each gets a no-op stub so that command-palette invocations and any leftover
+ * UI callers don't fail with "command not found". Kept in lockstep with the
+ * `contributes.commands` list in package.json plus the small set of
+ * programmatically-registered commands (`focusSidebar`, `saveAnthropicApiKey`)
+ * that the sidebar webview / inline panels may dispatch into.
  */
 const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
 	"jollimemory.enableJolliMemory",
 	"jollimemory.disableJolliMemory",
 	"jollimemory.refreshStatus",
 	"jollimemory.refreshMemories",
-	"jollimemory.migrateToKnowledgeBase",
 	"jollimemory.openSettings",
 	"jollimemory.refreshFiles",
 	"jollimemory.refreshHistory",
@@ -216,30 +217,16 @@ const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
 	"jollimemory.commitAI",
 	"jollimemory.squash",
 	"jollimemory.pushBranch",
-	"jollimemory.pushToJolli",
 	"jollimemory.selectAllFiles",
 	"jollimemory.selectAllCommits",
 	"jollimemory.searchMemories",
 	"jollimemory.clearMemoryFilter",
 	"jollimemory.loadMoreMemories",
-	"jollimemory.viewMemorySummary",
-	"jollimemory.viewSummary",
-	"jollimemory.copyCommitHash",
-	"jollimemory.copyRecallPrompt",
-	"jollimemory.openFileChange",
-	"jollimemory.openCommitFileChange",
-	"jollimemory.discardFileChanges",
 	"jollimemory.discardSelectedChanges",
 	"jollimemory.focusSidebar",
 	"jollimemory.addPlan",
-	"jollimemory.editPlan",
-	"jollimemory.removePlan",
 	"jollimemory.addMarkdownNote",
 	"jollimemory.addTextSnippet",
-	"jollimemory.editNote",
-	"jollimemory.removeNote",
-	"jollimemory.openMemoryFile",
-	"jollimemory.openInClaudeCode",
 	"jollimemory.signIn",
 	"jollimemory.signOut",
 	"jollimemory.saveAnthropicApiKey",
@@ -1035,7 +1022,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	void isWorkerBusy(workspaceRoot).then(setWorkerBusy);
 
 	// COMMITS title updates are handled by the commitsStore.onChange subscription
-	// registered near the createTreeView calls above — no provider hook needed.
+	// the sidebar webview wires up — no provider hook needed.
 
 	// CHANGES badge — surfaces the visible (post-exclude) changed-file count
 	// on the activity-bar icon. WebviewView shares the `.badge` API with
@@ -1080,85 +1067,6 @@ export function activate(context: vscode.ExtensionContext): void {
 		workspaceRoot,
 	);
 	context.subscriptions.push(
-		// Standalone orphan→folder migration. Triggered from settings or external
-		// plugins; not tied to a tree view. Surfaces the same MigrationEngine
-		// flow the activate() path runs automatically when the orphan branch has
-		// data but migration hasn't been completed.
-		vscode.commands.registerCommand(
-			"jollimemory.migrateToKnowledgeBase",
-			async () => {
-				try {
-					const {
-						extractRepoName,
-						getRemoteUrl,
-						initializeKBFolder,
-						resolveKBPath,
-					} = await import("../../cli/src/core/KBPathResolver.js");
-					const { MetadataManager } = await import(
-						"../../cli/src/core/MetadataManager.js"
-					);
-					const { OrphanBranchStorage } = await import(
-						"../../cli/src/core/OrphanBranchStorage.js"
-					);
-					const { FolderStorage } = await import(
-						"../../cli/src/core/FolderStorage.js"
-					);
-					const { MigrationEngine } = await import(
-						"../../cli/src/core/MigrationEngine.js"
-					);
-
-					const repoName = extractRepoName(workspaceRoot);
-					const remoteUrl = getRemoteUrl(workspaceRoot);
-					const cfg = await loadConfig();
-					const customKBPath = (cfg as Record<string, unknown>).localFolder as
-						| string
-						| undefined;
-					const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
-					initializeKBFolder(kbRoot, repoName, remoteUrl);
-
-					const orphan = new OrphanBranchStorage(workspaceRoot);
-					if (!(await orphan.exists())) {
-						vscode.window.showInformationMessage(
-							"No git storage found — nothing to migrate.",
-						);
-						return;
-					}
-
-					const mm = new MetadataManager(join(kbRoot, ".jolli"));
-					const folder = new FolderStorage(kbRoot, mm);
-					await folder.ensure();
-					const engine = new MigrationEngine(orphan, folder, mm);
-
-					await vscode.window.withProgress(
-						{
-							location: vscode.ProgressLocation.Notification,
-							title: "Migrating to Memory Bank...",
-						},
-						async (progress) => {
-							const result = await engine.runMigration((migrated, total) => {
-								progress.report({
-									message: `${migrated}/${total}`,
-									increment: (1 / total) * 100,
-								});
-							});
-							if (result.status === "completed") {
-								vscode.window.showInformationMessage(
-									`Migration completed: ${result.migratedEntries} memories migrated to ${kbRoot}`,
-								);
-							} else {
-								vscode.window.showWarningMessage(
-									`Migration ${result.status}: ${result.migratedEntries}/${result.totalEntries} entries`,
-								);
-							}
-						},
-					);
-				} catch (err) {
-					vscode.window.showErrorMessage(
-						`Migration failed: ${(err as Error).message}`,
-					);
-				}
-			},
-		),
 		// Settings → Migrate to Memory Bank. Re-runs the orphan→folder migration
 		// into a fresh `-N`-suffixed folder, leaves the old folder's content on
 		// disk, and "repoints" by archiving the old folder's repo identity so
@@ -2348,11 +2256,12 @@ function initialLoad(
 
 /**
  * Refreshes the status bar, the `jollimemory.enabled` context key, and the
- * enabled state on the files/history providers from the current bridge state.
+ * enabled state on the data-source stores from the current bridge state.
  *
  * - The context key drives the conditional icon in the Status panel title bar.
- * - Syncing the provider enabled flag makes them return [] when disabled,
- *   which triggers the viewsWelcome placeholder in the Files and History panels.
+ * - Syncing the store enabled flag makes them serve [] when disabled, so the
+ *   sidebar webview's Branch tab sections (Plans / Changes / Commits) and the
+ *   Memory Bank tab render their empty-state copy from `SidebarEmptyMessages`.
  */
 async function refreshStatusBar(
 	bridge: JolliMemoryBridge,
@@ -2366,8 +2275,9 @@ async function refreshStatusBar(
 
 	statusBar.update(status.enabled);
 
-	// Propagate the enabled flag to providers so their panels show the
-	// viewsWelcome placeholder (empty list) when JolliMemory is disabled.
+	// Propagate the enabled flag to the stores so the webview's data feed is
+	// empty when JolliMemory is disabled — the webview then renders its own
+	// empty-state copy via `SidebarEmptyMessages`.
 	memoriesStore.setEnabled(status.enabled);
 	plansStore.setEnabled(status.enabled);
 	filesStore.setEnabled(status.enabled);

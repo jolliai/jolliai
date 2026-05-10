@@ -1,9 +1,10 @@
 /**
  * StatusTreeProvider
  *
- * TreeDataProvider for the "STATUS" panel. Thin subscriber over StatusStore.
- * Renders three visual states:
- *   A. Disabled    — returns [] (viewsWelcome shows Enable button)
+ * Data source for the Status tab in the sidebar webview. Thin subscriber over
+ * StatusStore. Renders three visual states:
+ *   A. Disabled    — returns [] (sidebar webview shows the disabled-panel with
+ *                    the Enable Jolli Memory button)
  *   B. Migrating   — single "Migrating…" spinner item
  *   C. Full status — live rows + optional warnings + worker-busy indicator
  */

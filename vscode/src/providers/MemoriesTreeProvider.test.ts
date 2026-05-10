@@ -195,7 +195,7 @@ describe("MemoryItem", () => {
 		expect(item.contextValue).toBe("memory");
 		expect(item.command).toEqual({
 			command: "jollimemory.viewMemorySummary",
-			title: "View Commit Memory",
+			title: "View Memory",
 			arguments: [item],
 		});
 	});

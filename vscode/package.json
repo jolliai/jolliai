@@ -71,12 +71,6 @@
 		},
 		"commands": [
 			{
-				"command": "jollimemory.migrateToKnowledgeBase",
-				"title": "Migrate to Memory Bank",
-				"icon": "$(database)",
-				"category": "Jolli Memory"
-			},
-			{
 				"command": "jollimemory.refreshStatus",
 				"title": "Refresh Status",
 				"icon": "$(refresh)",
@@ -103,18 +97,6 @@
 			{
 				"command": "jollimemory.loadMoreMemories",
 				"title": "Load More Memories",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.copyRecallPrompt",
-				"title": "Copy Recall Prompt",
-				"icon": "$(copy)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.openInClaudeCode",
-				"title": "Open in Claude Code",
-				"icon": "$(comment-discussion)",
 				"category": "Jolli Memory"
 			},
 			{
@@ -149,25 +131,9 @@
 				"category": "Jolli Memory"
 			},
 			{
-				"command": "jollimemory.openFileChange",
-				"title": "Open Change",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.openCommitFileChange",
-				"title": "Open Commit File Diff",
-				"category": "Jolli Memory"
-			},
-			{
 				"command": "jollimemory.refreshFiles",
 				"title": "Refresh Files",
 				"icon": "$(refresh)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.discardFileChanges",
-				"title": "Discard Changes",
-				"icon": "$(discard)",
 				"category": "Jolli Memory"
 			},
 			{
@@ -203,43 +169,9 @@
 				"category": "Jolli Memory"
 			},
 			{
-				"command": "jollimemory.viewSummary",
-				"title": "View Commit Memory",
-				"icon": "$(eye)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.viewMemorySummary",
-				"title": "View Memory",
-				"icon": "$(eye)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.copyCommitHash",
-				"title": "Copy Commit Hash",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.pushToJolli",
-				"title": "Push to Jolli",
-				"category": "Jolli Memory"
-			},
-			{
 				"command": "jollimemory.refreshPlans",
 				"title": "Refresh Plans",
 				"icon": "$(refresh)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.editPlan",
-				"title": "Edit Plan",
-				"icon": "$(file-text)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.removePlan",
-				"title": "Remove Plan from List",
-				"icon": "$(trash)",
 				"category": "Jolli Memory"
 			},
 			{
@@ -261,18 +193,6 @@
 				"category": "Jolli Memory"
 			},
 			{
-				"command": "jollimemory.editNote",
-				"title": "Edit Note",
-				"icon": "$(edit)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.removeNote",
-				"title": "Remove Note",
-				"icon": "$(trash)",
-				"category": "Jolli Memory"
-			},
-			{
 				"command": "jollimemory.signIn",
 				"title": "Sign In to Jolli",
 				"icon": "$(sign-in)",
@@ -283,15 +203,9 @@
 				"title": "Sign Out of Jolli",
 				"icon": "$(sign-out)",
 				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.openMemoryFile",
-				"title": "Open Memory File",
-				"category": "Jolli Memory"
 			}
 		],
 		"menus": {
-			"view/title": [],
 			"jollimemory.addMenu": [
 				{
 					"command": "jollimemory.addPlan",
@@ -304,73 +218,6 @@
 				{
 					"command": "jollimemory.addTextSnippet",
 					"group": "1_add@3"
-				}
-			],
-			"view/item/context": [
-				{
-					"command": "jollimemory.copyRecallPrompt",
-					"when": "view == jollimemory.memoriesView && viewItem == memory",
-					"group": "inline@1"
-				},
-				{
-					"command": "jollimemory.copyRecallPrompt",
-					"when": "view == jollimemory.memoriesView && viewItem == memory",
-					"group": "1_recall@1"
-				},
-				{
-					"command": "jollimemory.openInClaudeCode",
-					"when": "view == jollimemory.memoriesView && viewItem == memory",
-					"group": "1_recall@2"
-				},
-				{
-					"command": "jollimemory.viewMemorySummary",
-					"when": "view == jollimemory.memoriesView && viewItem == memory",
-					"group": "2_view@1"
-				},
-				{
-					"command": "jollimemory.discardFileChanges",
-					"when": "view == jollimemory.filesView && viewItem == file",
-					"group": "inline@1"
-				},
-				{
-					"command": "jollimemory.discardFileChanges",
-					"when": "view == jollimemory.filesView && viewItem == file",
-					"group": "1_discard@1"
-				},
-				{
-					"command": "jollimemory.editPlan",
-					"when": "view == jollimemory.plansView && viewItem == plan",
-					"group": "1_plan@1"
-				},
-				{
-					"command": "jollimemory.removePlan",
-					"when": "view == jollimemory.plansView && viewItem == plan",
-					"group": "inline@2"
-				},
-				{
-					"command": "jollimemory.editNote",
-					"when": "view == jollimemory.plansView && viewItem == note",
-					"group": "1_note@1"
-				},
-				{
-					"command": "jollimemory.removeNote",
-					"when": "view == jollimemory.plansView && viewItem == note",
-					"group": "inline@2"
-				},
-				{
-					"command": "jollimemory.viewSummary",
-					"when": "view == jollimemory.historyView && viewItem == commitWithMemory",
-					"group": "inline@1"
-				},
-				{
-					"command": "jollimemory.viewSummary",
-					"when": "view == jollimemory.historyView && viewItem == commitWithMemory",
-					"group": "1_view@1"
-				},
-				{
-					"command": "jollimemory.copyCommitHash",
-					"when": "view == jollimemory.historyView && viewItem =~ /^commit/",
-					"group": "1_view@2"
 				}
 			]
 		}

@@ -194,10 +194,10 @@ export class CommitsStore extends BaseStore<
 			return;
 		}
 		this.enabled = e;
-		// Clear cached data on disable so historyView.title does not stick at
-		// "COMMITS (merged — read-only history)" while the viewsWelcome
-		// placeholder is shown.  Re-enabling triggers a fresh commits load
-		// via refreshStatusBar / initialLoad.
+		// Clear cached data on disable so the Commits-section header in the
+		// sidebar webview does not stick at "COMMITS (merged — read-only
+		// history)" while the disabled-state empty copy is shown. Re-enabling
+		// triggers a fresh commits load via refreshStatusBar / initialLoad.
 		if (!e) {
 			this.commits = [];
 			this.checkedHashes.clear();
