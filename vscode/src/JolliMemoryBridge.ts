@@ -17,11 +17,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { getDiffStats } from "../../cli/src/core/GitOps.js";
-import type {
-	LocalPushResult,
-	SatelliteFile,
-} from "../../cli/src/core/LocalPusher.js";
-import { pushSummaryToLocal as corePushSummaryToLocal } from "../../cli/src/core/LocalPusher.js";
 import {
 	savePluginSource,
 	saveSquashPending,
@@ -33,13 +28,10 @@ import {
 	generateSquashMessage,
 } from "../../cli/src/core/Summarizer.js";
 import { getDisplayDate } from "../../cli/src/core/SummaryFormat.js";
-import { buildMarkdown } from "../../cli/src/core/SummaryMarkdownBuilder.js";
 import {
 	getIndexEntryMap,
 	getSummary,
 	listSummaries,
-	readNoteFromBranch,
-	readPlanFromBranch,
 	scanTreeHashAliases,
 } from "../../cli/src/core/SummaryStore.js";
 import {
@@ -1491,103 +1483,6 @@ export class JolliMemoryBridge {
 	/** Removes a note: deletes file for uncommitted notes, removes from registry. */
 	async removeNote(id: string): Promise<void> {
 		await removeNote(id, this.cwd);
-	}
-
-	// ── Local push ───────────────────────────────────────────────────────
-
-	/**
-	 * Pushes a commit summary and its associated plans/notes to a local folder.
-	 *
-	 * Loads the full summary, filters plans and notes by commit hash, reads
-	 * each file from disk, builds the summary markdown, and delegates to the
-	 * core {@link corePushSummaryToLocal} function.
-	 *
-	 * @param commitHash - The commit hash whose summary to push
-	 * @param folder     - Destination folder for the exported files
-	 * @throws If no summary exists for the given commit hash
-	 */
-	async pushSummaryToLocal(
-		commitHash: string,
-		folder: string,
-	): Promise<LocalPushResult> {
-		const summary = await this.getSummary(commitHash);
-		if (!summary) {
-			throw new Error(`No summary found for commit ${commitHash}`);
-		}
-
-		const [allPlans, allNotes] = await Promise.all([
-			this.listPlans(),
-			this.listNotes(),
-		]);
-
-		const matchedPlans = allPlans.filter((p) => p.commitHash === commitHash);
-		const matchedNotes = allNotes.filter((n) => n.commitHash === commitHash);
-
-		// Build URL lookup maps from the summary's plan/note references.
-		// Older CommitSummary records may lack these fields, so default to empty arrays.
-		const planUrlBySlug = new Map(
-			(summary.plans ?? []).map((p) => [p.slug, p.jolliPlanDocUrl]),
-		);
-		const noteUrlById = new Map(
-			(summary.notes ?? []).map((n) => [n.id, n.jolliNoteDocUrl]),
-		);
-
-		const satellites: Array<SatelliteFile> = [];
-		const storage = await this.getStorage();
-
-		// Plans: read from disk if available, otherwise fall back to orphan branch
-		// (committed/archived plans have filePath="" and only exist on the orphan branch)
-		for (const plan of matchedPlans) {
-			const content = plan.filePath
-				? readFileSync(plan.filePath, "utf-8")
-				: await readPlanFromBranch(plan.slug, this.cwd, storage);
-			/* v8 ignore start -- both readFileSync (on-disk plan) and readPlanFromBranch (orphan-branch plan) return non-empty strings for any plan that was linked to this commit; empty content indicates corruption and is defensively skipped */
-			if (!content) {
-				continue;
-			}
-			/* v8 ignore stop */
-			satellites.push({
-				slug: plan.slug,
-				title: plan.title,
-				content,
-				jolliUrl: planUrlBySlug.get(plan.slug),
-			});
-		}
-
-		// Notes: read from disk if available, otherwise fall back to orphan branch.
-		// Snippet notes carry inline content in the summary and may have no file on disk.
-		const noteRefById = new Map((summary.notes ?? []).map((n) => [n.id, n]));
-		for (const note of matchedNotes) {
-			let content: string | null = null;
-			if (note.filePath) {
-				content = readFileSync(note.filePath, "utf-8");
-			} else {
-				const noteRef = noteRefById.get(note.id);
-				content =
-					noteRef?.format === "snippet" && noteRef.content
-						? noteRef.content
-						: await readNoteFromBranch(note.id, this.cwd, storage);
-			}
-			if (!content) {
-				continue;
-			}
-			satellites.push({
-				slug: note.id,
-				title: note.title,
-				content,
-				jolliUrl: noteUrlById.get(note.id),
-			});
-		}
-
-		const summaryMarkdown = buildMarkdown(summary);
-
-		return corePushSummaryToLocal({
-			folder,
-			summary,
-			summaryMarkdown,
-			satellites,
-			cwd: this.cwd,
-		});
 	}
 }
 

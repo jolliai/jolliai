@@ -581,11 +581,9 @@ export interface JolliMemoryConfig {
 	readonly logLevel?: LogLevel;
 	/** Per-module log level overrides (e.g. { "GitOps": "debug" }) */
 	readonly logLevelOverrides?: Readonly<Record<string, LogLevel>>;
-	/** Absolute path to the user-chosen folder for Push-to-Local output. */
+	/** Absolute path to the user-chosen Memory Bank folder (mirrors orphan-branch
+	 *  artifacts to disk when storageMode is "folder" or "dual-write"). */
 	readonly localFolder?: string;
-	/** Default push action for the summary details view.
-	 *  "jolli" = Jolli Cloud only (default). "both" = Jolli Cloud + local folder. */
-	readonly pushAction?: "jolli" | "both";
 	/** OAuth auth token from browser login (stored by `jolli auth login`) */
 	readonly authToken?: string;
 	/**

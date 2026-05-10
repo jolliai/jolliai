@@ -1522,8 +1522,9 @@ describe("SettingsWebviewPanel", () => {
 	});
 
 	// ── applySettings with localFolder ──────────────────────────────────────
-	// pushAction was removed in 2026-04 along with the "Default Push Action"
-	// fieldset; these tests track the surviving localFolder behavior.
+	// The legacy "Default Push Action" fieldset and its `pushAction` config
+	// field were retired across 2026-04 (UI) and 2026-05 (type + runtime);
+	// these tests track the surviving localFolder behavior.
 
 	describe("applySettings with localFolder", () => {
 		/** Loads settings to populate cached keys, then returns dispatch fn. */
@@ -1618,34 +1619,6 @@ describe("SettingsWebviewPanel", () => {
 				expect.any(String),
 			);
 		});
-
-		it("does not include pushAction in the saved config (field removed)", async () => {
-			const dispatch = await setupForLocalKnowledgeBase();
-
-			dispatch({
-				command: "applySettings",
-				maskedApiKey: "",
-				maskedJolliApiKey: "",
-				settings: {
-					apiKey: "",
-					model: "sonnet",
-					maxTokens: null,
-					jolliApiKey: "",
-					claudeEnabled: true,
-					codexEnabled: true,
-					geminiEnabled: true,
-					localFolder: "/some/path",
-					excludePatterns: "",
-				},
-			});
-			await flushPromises();
-
-			const savedArg = mockSaveConfigScoped.mock.calls.at(-1)?.[0] as
-				| Record<string, unknown>
-				| undefined;
-			expect(savedArg).toBeDefined();
-			expect(savedArg).not.toHaveProperty("pushAction");
-		});
 	});
 
 	// ── handleLoadSettings with localFolder ─────────────────────────────────
@@ -1705,34 +1678,6 @@ describe("SettingsWebviewPanel", () => {
 					}),
 				}),
 			);
-		});
-
-		it("does not include pushAction in the loaded payload (field removed)", async () => {
-			mockLoadConfigFromDir.mockResolvedValue({
-				apiKey: undefined,
-				model: "sonnet",
-				maxTokens: null,
-				jolliApiKey: undefined,
-				claudeEnabled: true,
-				codexEnabled: true,
-				geminiEnabled: true,
-				excludePatterns: [],
-			});
-
-			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
-			const dispatch = captureMessageHandler();
-			dispatch({ command: "loadSettings" });
-			await flushPromises();
-
-			const settingsLoadedCall = postMessage.mock.calls.find(
-				(c: unknown[]) =>
-					(c[0] as { command?: string }).command === "settingsLoaded",
-			);
-			expect(settingsLoadedCall).toBeDefined();
-			const settings = (
-				settingsLoadedCall?.[0] as { settings: Record<string, unknown> }
-			).settings;
-			expect(settings).not.toHaveProperty("pushAction");
 		});
 	});
 

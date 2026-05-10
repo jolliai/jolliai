@@ -406,33 +406,6 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("Push to Jolli");
 		});
 
-		it("shows push label 'Push to Jolli & Local' when pushAction is 'both' and no jolliDocUrl", () => {
-			const html = buildHtml(makeSummary({ jolliDocUrl: undefined }), {
-				pushAction: "both",
-			});
-			expect(html).toContain("Push to Jolli &amp; Local");
-		});
-
-		it("shows push label 'Update on Jolli & Local' when pushAction is 'both' and jolliDocUrl exists", () => {
-			const html = buildHtml(
-				makeSummary({ jolliDocUrl: "https://jolli.app/memory/123" }),
-				{
-					pushAction: "both",
-				},
-			);
-			expect(html).toContain("Update on Jolli &amp; Local");
-		});
-
-		it("adds data-push-action attribute to push button", () => {
-			const html = buildHtml(makeSummary(), { pushAction: "both" });
-			expect(html).toContain('data-push-action="both"');
-		});
-
-		it("defaults data-push-action to 'jolli' when not specified", () => {
-			const html = buildHtml(makeSummary());
-			expect(html).toContain('data-push-action="jolli"');
-		});
-
 		it("shows commit message tooltip in Jolli Memory row", () => {
 			const html = buildHtml(
 				makeSummary({

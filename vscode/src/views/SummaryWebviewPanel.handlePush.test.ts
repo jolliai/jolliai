@@ -164,26 +164,6 @@ vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
 	updateTopicInTree: mockUpdateTopicInTree,
 }));
 
-const { mockCorePushSummaryToLocal } = vi.hoisted(() => ({
-	mockCorePushSummaryToLocal: vi.fn().mockResolvedValue({
-		summaryPath: "/local/abc12345-summary.md",
-		satellitePaths: [],
-		indexPath: "/local/index.md",
-	}),
-}));
-
-vi.mock("../../../cli/src/core/LocalPusher.js", () => ({
-	pushSummaryToLocal: mockCorePushSummaryToLocal,
-}));
-
-const { mockExistsSync } = vi.hoisted(() => ({
-	mockExistsSync: vi.fn().mockReturnValue(true),
-}));
-
-vi.mock("node:fs", () => ({
-	existsSync: mockExistsSync,
-}));
-
 vi.mock("../../package.json", () => ({ version: "0.90.0" }));
 
 const {
@@ -475,22 +455,22 @@ describe("SummaryWebviewPanel handlePush", () => {
 		(
 			SummaryWebviewPanel as unknown as { commitPanels: Map<string, unknown> }
 		).commitPanels.clear();
-		// Default config returns pushAction: "jolli" (Jolli-only)
 		mockLoadConfig.mockResolvedValue({
 			apiKey: "test-key",
 			model: "test-model",
 		});
-		mockExistsSync.mockReturnValue(true);
 	});
 
-	// ── Test 1 ───────────────────────────────────────────────────────────────
-
-	describe("pushAction = 'jolli' runs Jolli only", () => {
-		it("calls pushToJolli and never calls pushSummaryToLocal", async () => {
+	describe("Jolli-only push", () => {
+		// The local-push pathway (and the "both" mode that drove it) was
+		// removed in 2026-05; handlePush now always runs runJolliPush and posts
+		// exactly one result message. Tests below pin that contract — anyone
+		// reintroducing a `pushAction` branch will trip the
+		// `pushToLocalResult NOT posted` assertion.
+		it("calls runJolliPush and posts a pushToJolliResult success message", async () => {
 			mockLoadConfig.mockResolvedValue({
 				apiKey: "test",
 				jolliApiKey: "jk_valid",
-				pushAction: "jolli",
 			});
 			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
 			mockPushToJolli.mockResolvedValue({ docId: 99 });
@@ -499,503 +479,31 @@ describe("SummaryWebviewPanel handlePush", () => {
 			dispatch({ command: "push" });
 			await flushPromises();
 
-			// Jolli push was executed
 			expect(mockPushToJolli).toHaveBeenCalled();
-			// Local push was NOT executed
-			expect(mockCorePushSummaryToLocal).not.toHaveBeenCalled();
-			// pushToJolliResult posted with success
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({
 					command: "pushToJolliResult",
 					success: true,
 				}),
 			);
-			// pushToLocalResult NOT posted
 			const localResultCalls = postMessage.mock.calls.filter(
 				(c: Array<unknown>) =>
 					(c[0] as Record<string, unknown>).command === "pushToLocalResult",
 			);
 			expect(localResultCalls).toHaveLength(0);
 		});
-
-		it("defaults to jolli when pushAction is undefined", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 99 });
-			const dispatch = await setupPanel();
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			expect(mockPushToJolli).toHaveBeenCalled();
-			expect(mockCorePushSummaryToLocal).not.toHaveBeenCalled();
-		});
 	});
-
-	// ── Test 2 ───────────────────────────────────────────────────────────────
-
-	describe("pushAction = 'both' with folder set runs both concurrently", () => {
-		it("calls both pushToJolli and pushSummaryToLocal, posts both results", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				localFolder: "/Users/me/docs",
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 42 });
-			mockExistsSync.mockReturnValue(true);
-			mockCorePushSummaryToLocal.mockResolvedValue({
-				summaryPath: "/Users/me/docs/abc12345-summary.md",
-				satellitePaths: [],
-				indexPath: "/Users/me/docs/index.md",
-			});
-			const dispatch = await setupPanel();
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			// Jolli push was executed
-			expect(mockPushToJolli).toHaveBeenCalled();
-			// Local push was executed with commitHash and localFolder
-			expect(mockCorePushSummaryToLocal).toHaveBeenCalledWith(
-				expect.objectContaining({ folder: "/Users/me/docs" }),
-			);
-			// pushToJolliResult posted with success
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToJolliResult",
-					success: true,
-				}),
-			);
-			// pushToLocalResult posted with success and filePath
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToLocalResult",
-					success: true,
-					filePath: "/Users/me/docs/abc12345-summary.md",
-				}),
-			);
-		});
-	});
-
-	// ── Test 3 ───────────────────────────────────────────────────────────────
-
-	describe("pushAction = 'both' with unset folder opens picker, saves, proceeds", () => {
-		it("opens showOpenDialog, persists folder, runs both pushes", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				// localFolder is undefined
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 42 });
-			showOpenDialog.mockResolvedValue([{ fsPath: "/Users/me/picked" }]);
-			mockCorePushSummaryToLocal.mockResolvedValue({
-				summaryPath: "/Users/me/picked/abc12345-summary.md",
-				satellitePaths: [],
-				indexPath: "/Users/me/picked/index.md",
-			});
-			const dispatch = await setupPanel();
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			// Folder picker was opened
-			expect(showOpenDialog).toHaveBeenCalledWith(
-				expect.objectContaining({
-					canSelectFolders: true,
-					canSelectFiles: false,
-					canSelectMany: false,
-					openLabel: "Select folder for Push to Local",
-				}),
-			);
-			// Config persistence was called with the picked folder
-			expect(mockSaveConfig).toHaveBeenCalledWith({
-				localFolder: "/Users/me/picked",
-			});
-			// Local push was called with the picked folder
-			expect(mockCorePushSummaryToLocal).toHaveBeenCalledWith(
-				expect.objectContaining({ folder: "/Users/me/picked" }),
-			);
-			// Both result messages posted
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToJolliResult",
-					success: true,
-				}),
-			);
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToLocalResult",
-					success: true,
-					filePath: "/Users/me/picked/abc12345-summary.md",
-				}),
-			);
-		});
-
-		it("opens picker when localFolder is set but path does not exist", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				localFolder: "/Users/me/gone",
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 42 });
-			mockExistsSync.mockReturnValue(false);
-			showOpenDialog.mockResolvedValue([{ fsPath: "/Users/me/new-folder" }]);
-			mockCorePushSummaryToLocal.mockResolvedValue({
-				summaryPath: "/Users/me/new-folder/abc12345-summary.md",
-				satellitePaths: [],
-				indexPath: "/Users/me/new-folder/index.md",
-			});
-			const dispatch = await setupPanel();
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			expect(showOpenDialog).toHaveBeenCalled();
-			expect(mockSaveConfig).toHaveBeenCalledWith({
-				localFolder: "/Users/me/new-folder",
-			});
-			expect(mockCorePushSummaryToLocal).toHaveBeenCalledWith(
-				expect.objectContaining({ folder: "/Users/me/new-folder" }),
-			);
-		});
-	});
-
-	// ── Test 4 ───────────────────────────────────────────────────────────────
-
-	describe("pushAction = 'both' with cancelled picker still runs Jolli", () => {
-		it("posts pushToJolliResult success and pushToLocalResult failure", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				// localFolder is undefined, so picker will open
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 42 });
-			showOpenDialog.mockResolvedValue(undefined); // user cancelled
-			const dispatch = await setupPanel();
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			// Jolli push still succeeds
-			expect(mockPushToJolli).toHaveBeenCalled();
-			// Local push was NOT executed
-			expect(mockCorePushSummaryToLocal).not.toHaveBeenCalled();
-			// pushToJolliResult posted with success
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToJolliResult",
-					success: true,
-				}),
-			);
-			// pushToLocalResult posted with failure
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToLocalResult",
-					success: false,
-					error: expect.stringMatching(/No folder/),
-				}),
-			);
-		});
-	});
-
-	// ── Test 5 ───────────────────────────────────────────────────────────────
-
-	describe("Jolli succeeds, Local fails - both results reported", () => {
-		it("posts success for Jolli and failure for Local", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				localFolder: "/Users/me/docs",
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 42 });
-			mockExistsSync.mockReturnValue(true);
-			mockCorePushSummaryToLocal.mockRejectedValue(new Error("disk full"));
-			const dispatch = await setupPanel();
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			// pushToJolliResult: success
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToJolliResult",
-					success: true,
-				}),
-			);
-			// pushToLocalResult: failure with error message
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToLocalResult",
-					success: false,
-					error: "disk full",
-				}),
-			);
-		});
-	});
-
-	// ── Test 6 ───────────────────────────────────────────────────────────────
-
-	describe("Jolli fails, Local succeeds - both results reported", () => {
-		it("posts failure for Jolli and success for Local", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				localFolder: "/Users/me/docs",
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockRejectedValue(new Error("server error"));
-			mockExistsSync.mockReturnValue(true);
-			mockCorePushSummaryToLocal.mockResolvedValue({
-				summaryPath: "/Users/me/docs/abc12345-summary.md",
-				satellitePaths: [],
-				indexPath: "/Users/me/docs/index.md",
-			});
-			const dispatch = await setupPanel();
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			// pushToJolliResult: failure
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToJolliResult",
-					success: false,
-					error: expect.stringContaining("server error"),
-				}),
-			);
-			// pushToLocalResult: success
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToLocalResult",
-					success: true,
-					filePath: "/Users/me/docs/abc12345-summary.md",
-				}),
-			);
-		});
-	});
-
-	// ── Test 7: gatherSatellites — plan and note content ────────────────────
-
-	describe("gatherSatellites collects plan and note content for local push", () => {
-		it("includes plan and markdown note satellites when content is available", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				localFolder: "/Users/me/docs",
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 42 });
-			mockExistsSync.mockReturnValue(true);
-			mockReadPlanFromBranch.mockResolvedValue(
-				"# Plan Content\nHere is the plan.",
-			);
-			mockReadNoteFromBranch.mockResolvedValue(
-				"# Note Content\nHere is the note.",
-			);
-			mockCorePushSummaryToLocal.mockResolvedValue({
-				summaryPath: "/Users/me/docs/abc12345-summary.md",
-				satellitePaths: [
-					"/Users/me/docs/plan-one.md",
-					"/Users/me/docs/note-1.md",
-				],
-				indexPath: "/Users/me/docs/index.md",
-			});
-
-			const dispatch = await setupPanel({
-				plans: [
-					{
-						slug: "plan-one",
-						title: "Plan One",
-						editCount: 2,
-						addedAt: "2025-01-01",
-						updatedAt: "2025-01-15",
-						jolliPlanDocUrl: "https://jolli.ai/doc/plan-one",
-					},
-				],
-				notes: [
-					{
-						id: "note-1",
-						title: "Note One",
-						format: "markdown" as const,
-						addedAt: "2025-01-01",
-						updatedAt: "2025-01-15",
-						jolliNoteDocUrl: "https://jolli.ai/doc/note-1",
-					},
-				],
-			});
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			// Verify readPlanFromBranch was called with the plan slug
-			expect(mockReadPlanFromBranch).toHaveBeenCalledWith(
-				"plan-one",
-				"/workspace",
-			);
-			// Verify readNoteFromBranch was called with the note id
-			expect(mockReadNoteFromBranch).toHaveBeenCalledWith(
-				"note-1",
-				"/workspace",
-			);
-
-			// corePushSummaryToLocal should include satellites
-			expect(mockCorePushSummaryToLocal).toHaveBeenCalledWith(
-				expect.objectContaining({
-					satellites: expect.arrayContaining([
-						expect.objectContaining({
-							slug: "plan-one",
-							title: "Plan One",
-							content: "# Plan Content\nHere is the plan.",
-							jolliUrl: "https://jolli.ai/doc/plan-one",
-						}),
-						expect.objectContaining({
-							slug: "note-1",
-							title: "Note One",
-							content: "# Note Content\nHere is the note.",
-							jolliUrl: "https://jolli.ai/doc/note-1",
-						}),
-					]),
-				}),
-			);
-
-			// Each pushToJolli call carries the right docType — server keys off it
-			// to set sourceMetadata.docType once the path is flat per branch.
-			const docTypes = mockPushToJolli.mock.calls
-				.map((c: Array<unknown>) => (c[2] as { docType?: string })?.docType)
-				.sort();
-			expect(docTypes).toEqual(["note", "plan", "summary"]);
-		});
-
-		it("skips plans and notes when readPlanFromBranch/readNoteFromBranch return null", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				localFolder: "/Users/me/docs",
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 42 });
-			mockExistsSync.mockReturnValue(true);
-			mockReadPlanFromBranch.mockResolvedValue(null);
-			mockReadNoteFromBranch.mockResolvedValue(null);
-			mockCorePushSummaryToLocal.mockResolvedValue({
-				summaryPath: "/Users/me/docs/abc12345-summary.md",
-				satellitePaths: [],
-				indexPath: "/Users/me/docs/index.md",
-			});
-
-			const dispatch = await setupPanel({
-				plans: [
-					{
-						slug: "p1",
-						title: "P1",
-						editCount: 1,
-						addedAt: "2025-01-01",
-						updatedAt: "2025-01-01",
-					},
-				],
-				notes: [
-					{
-						id: "n1",
-						title: "N1",
-						format: "markdown" as const,
-						addedAt: "2025-01-01",
-						updatedAt: "2025-01-01",
-					},
-				],
-			});
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			expect(mockCorePushSummaryToLocal).toHaveBeenCalledWith(
-				expect.objectContaining({ satellites: [] }),
-			);
-		});
-
-		it("uses note.content directly for snippet notes instead of readNoteFromBranch", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				localFolder: "/Users/me/docs",
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 42 });
-			mockExistsSync.mockReturnValue(true);
-			mockCorePushSummaryToLocal.mockResolvedValue({
-				summaryPath: "/Users/me/docs/abc12345-summary.md",
-				satellitePaths: [],
-				indexPath: "/Users/me/docs/index.md",
-			});
-
-			const dispatch = await setupPanel({
-				notes: [
-					{
-						id: "snippet-1",
-						title: "Snippet Note",
-						format: "snippet" as const,
-						content: "inline snippet content",
-						addedAt: "2025-01-01",
-						updatedAt: "2025-01-01",
-					},
-				],
-			});
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			// readNoteFromBranch should NOT be called for snippet notes
-			expect(mockReadNoteFromBranch).not.toHaveBeenCalled();
-
-			expect(mockCorePushSummaryToLocal).toHaveBeenCalledWith(
-				expect.objectContaining({
-					satellites: expect.arrayContaining([
-						expect.objectContaining({
-							slug: "snippet-1",
-							title: "Snippet Note",
-							content: "inline snippet content",
-						}),
-					]),
-				}),
-			);
-		});
-	});
-
 	// ── Test 8: result message edge cases ────────────────────────────────────
 
-	describe("toJolliResultMessage / toLocalResultMessage edge cases", () => {
+	describe("toJolliResultMessage edge cases", () => {
 		it("uses String() for non-Error Jolli rejection reason", async () => {
 			mockLoadConfig.mockResolvedValue({
 				apiKey: "test",
 				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				localFolder: "/Users/me/docs",
 			});
 			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
 			// Reject with a string, not an Error
 			mockPushToJolli.mockRejectedValue("string rejection reason");
-			mockExistsSync.mockReturnValue(true);
-			mockCorePushSummaryToLocal.mockResolvedValue({
-				summaryPath: "/Users/me/docs/abc12345-summary.md",
-				satellitePaths: [],
-				indexPath: "/Users/me/docs/index.md",
-			});
 			const dispatch = await setupPanel();
 
 			dispatch({ command: "push" });
@@ -1006,32 +514,6 @@ describe("SummaryWebviewPanel handlePush", () => {
 					command: "pushToJolliResult",
 					success: false,
 					error: "string rejection reason",
-				}),
-			);
-		});
-
-		it("uses String() for non-Error local push rejection reason", async () => {
-			mockLoadConfig.mockResolvedValue({
-				apiKey: "test",
-				jolliApiKey: "jk_valid",
-				pushAction: "both",
-				localFolder: "/Users/me/docs",
-			});
-			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
-			mockPushToJolli.mockResolvedValue({ docId: 42 });
-			mockExistsSync.mockReturnValue(true);
-			// Reject with a number, not an Error
-			mockCorePushSummaryToLocal.mockRejectedValue(42);
-			const dispatch = await setupPanel();
-
-			dispatch({ command: "push" });
-			await flushPromises();
-
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({
-					command: "pushToLocalResult",
-					success: false,
-					error: "42",
 				}),
 			);
 		});
@@ -1121,7 +603,6 @@ describe("SummaryWebviewPanel handlePush", () => {
 		const baseConfig = {
 			apiKey: "test",
 			jolliApiKey: "jk_valid",
-			pushAction: "jolli" as const,
 		};
 
 		it("opens BindingChooser with derived params and retries on confirm", async () => {
