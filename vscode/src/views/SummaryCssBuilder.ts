@@ -826,6 +826,15 @@ export function buildCss(): string {
     color: var(--text-tertiary);
     letter-spacing: 0.01em;
   }
+  /* Provider attribution segment — same row as .footer-generated, slightly
+     more muted so the timestamp stays the dominant element. Absent on
+     pre-attribution summaries; the .footer-provider span just isn't rendered. */
+  .footer-provider {
+    font-size: 0.8em;
+    color: var(--text-tertiary);
+    opacity: 0.75;
+    letter-spacing: 0.01em;
+  }
 
   /* ── Category pills (5 color groups, light theme) ── */
   body.vscode-light {

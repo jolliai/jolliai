@@ -33,36 +33,38 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).not.toContain('id="scope"');
 	});
 
-	it("contains config file path hint near API key", () => {
-		expect(html).toContain("Stored in ~/.jolli/jollimemory/config.json");
+	// ── Tab navigation ──
+
+	it("contains the 5 tab buttons", () => {
+		expect(html).toContain('data-tab="agents"');
+		expect(html).toContain('data-tab="summary"');
+		expect(html).toContain('data-tab="sync"');
+		expect(html).toContain('data-tab="bank"');
+		expect(html).toContain('data-tab="others"');
+		expect(html).toContain(">AI Agents<");
+		expect(html).toContain(">AI Summary<");
+		expect(html).toContain(">Sync to Jolli<");
+		expect(html).toContain(">Memory Bank<");
+		expect(html).toContain(">Others<");
 	});
 
-	it("contains AI Configuration group", () => {
-		expect(html).toContain("AI Configuration");
-		expect(html).toContain('id="apiKey"');
-		expect(html).toContain('id="model"');
-		expect(html).toContain('id="maxTokens"');
+	it("contains the 5 tab panels keyed by data-panel", () => {
+		expect(html).toContain('data-panel="agents"');
+		expect(html).toContain('data-panel="summary"');
+		expect(html).toContain('data-panel="sync"');
+		expect(html).toContain('data-panel="bank"');
+		expect(html).toContain('data-panel="others"');
 	});
 
-	it("contains model dropdown options", () => {
-		expect(html).toContain('value="haiku"');
-		expect(html).toContain('value="sonnet"');
-		expect(html).toContain('value="opus"');
-	});
+	// ── AI Agents tab ──
 
-	it("contains Integrations group", () => {
-		expect(html).toContain("Integrations");
-		expect(html).toContain('id="jolliApiKey"');
+	it("AI Agents tab lists all six per-source toggles", () => {
 		expect(html).toContain('id="claudeEnabled"');
 		expect(html).toContain('id="codexEnabled"');
 		expect(html).toContain('id="geminiEnabled"');
 		expect(html).toContain('id="openCodeEnabled"');
 		expect(html).toContain('id="cursorEnabled"');
-	});
-
-	it("includes a Copilot toggle row", () => {
 		expect(html).toContain('id="copilotEnabled"');
-		expect(html).toContain("Copilot");
 	});
 
 	it("Copilot toggle description mentions both CLI and Chat sources", () => {
@@ -70,10 +72,104 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain("Copilot Chat");
 	});
 
-	it("contains Files group with exclude patterns", () => {
-		expect(html).toContain("Files");
+	it("AI Agents tab carries the integrations validation slot", () => {
+		expect(html).toContain('id="integrations-error"');
+	});
+
+	// ── AI Summary tab ──
+
+	it("AI Summary tab contains the Provider dropdown", () => {
+		expect(html).toContain('id="aiProvider"');
+		expect(html).toContain('value="anthropic"');
+		expect(html).toContain('value="jolli"');
+	});
+
+	it("AI Summary tab contains the four provider cards", () => {
+		expect(html).toContain('data-card="anthropic"');
+		expect(html).toContain('data-card="jolli-ok"');
+		expect(html).toContain('data-card="jolli-nokey"');
+		expect(html).toContain('data-card="jolli-signin"');
+	});
+
+	it("Anthropic card carries API key, model, and max tokens fields", () => {
+		expect(html).toContain('id="apiKey"');
+		expect(html).toContain('id="model"');
+		expect(html).toContain('id="maxTokens"');
+		expect(html).toContain("Stored in ~/.jolli/jollimemory/config.json");
+	});
+
+	it("model dropdown has the three Claude tiers", () => {
+		expect(html).toContain('value="haiku"');
+		expect(html).toContain('value="sonnet"');
+		expect(html).toContain('value="opus"');
+	});
+
+	it("Anthropic card has a missing-key warning slot wired to anthropicMissingWarn", () => {
+		expect(html).toContain('id="anthropicMissingWarn"');
+	});
+
+	it("Jolli signed-in card has site label and Advanced toggle", () => {
+		expect(html).toContain('id="jolliSiteLabel"');
+		expect(html).toContain('data-advanced="summary"');
+		expect(html).toContain('data-advanced-panel="summary"');
+		expect(html).toContain('id="jolliApiKey"');
+	});
+
+	it("Jolli no-key card has its own API key input + re-login button", () => {
+		expect(html).toContain('id="jolliApiKeyNoKey"');
+		expect(html).toContain('id="summaryReLoginBtn"');
+		expect(html).toContain('data-advanced="summary-nokey"');
+	});
+
+	it("Jolli signed-out card exposes a sign-in button", () => {
+		expect(html).toContain('id="summarySignInBtn"');
+	});
+
+	// ── Sync to Jolli tab ──
+
+	it("Sync tab contains signed-in / signed-out cards", () => {
+		expect(html).toContain('data-sync-card="signed-in"');
+		expect(html).toContain('data-sync-card="signed-out"');
+		expect(html).toContain('id="syncSignInBtn"');
+		expect(html).toContain('id="syncSignOutBtn"');
+	});
+
+	// ── Memory Bank tab (Sort Order intentionally absent) ──
+
+	it("Memory Bank tab contains folder path input + Browse button", () => {
+		expect(html).toContain('id="localFolder"');
+		expect(html).toContain("readonly");
+		expect(html).toContain('id="browseLocalFolderBtn"');
+		expect(html).toContain("Browse");
+	});
+
+	it("Memory Bank tab contains the Migrate to Memory Bank button", () => {
+		expect(html).toContain('id="rebuildKbBtn"');
+		expect(html).toContain("Migrate to Memory Bank");
+		expect(html).toContain('id="rebuildKbStatus"');
+	});
+
+	it("Memory Bank tab does NOT contain a Sort Order control", () => {
+		// Intentionally omitted from this surface — IntelliJ exposes it but the
+		// vscode panel shouldn't grow an extra toggle that nothing reads in
+		// vscode-side code.
+		expect(html).not.toMatch(/id=["']sortOrder["']/i);
+		expect(html).not.toContain("Sort Order");
+	});
+
+	// ── Others tab (Pause Jolli Memory intentionally absent) ──
+
+	it("Others tab contains the exclude patterns input", () => {
 		expect(html).toContain('id="excludePatterns"');
 	});
+
+	it("Others tab does NOT contain a Pause Jolli Memory checkbox", () => {
+		// Intentionally omitted — pause is an IntelliJ-only feature.
+		expect(html).not.toMatch(/id=["']paused["']/i);
+		expect(html).not.toContain("Pause Jolli Memory");
+	});
+
+	// ── Action bar / shared ──
 
 	it("contains Apply Changes button", () => {
 		expect(html).toContain("Apply Changes");
@@ -85,20 +181,6 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('id="jolliApiKey-error"');
 		expect(html).toContain('id="maxTokens-error"');
 		expect(html).toContain('id="integrations-error"');
-	});
-
-	it("contains Local Memory Bank section with localFolder input and Browse button", () => {
-		expect(html).toContain("Local Memory Bank");
-		expect(html).toContain('id="localFolder"');
-		expect(html).toContain("readonly");
-		expect(html).toContain('id="browseLocalFolderBtn"');
-		expect(html).toContain("Browse");
-	});
-
-	it("contains Migrate to Memory Bank button", () => {
-		expect(html).toContain('id="rebuildKbBtn"');
-		expect(html).toContain("Migrate to Memory Bank");
-		expect(html).toContain('id="rebuildKbStatus"');
 	});
 
 	it("no longer contains the Default Push Action UI (removed)", () => {

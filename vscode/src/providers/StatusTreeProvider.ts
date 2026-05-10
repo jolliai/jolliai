@@ -9,6 +9,7 @@
  */
 
 import * as vscode from "vscode";
+import { resolveLlmCredentialSource } from "../../../cli/src/core/LlmClient.js";
 import type { JolliMemoryConfig, StatusInfo } from "../../../cli/src/Types.js";
 import { parseJolliApiKey } from "../services/JolliPushService.js";
 import type { StatusStore } from "../stores/StatusStore.js";
@@ -157,7 +158,27 @@ function buildFullStatusItems(
 		),
 	];
 
-	if (!config?.apiKey) {
+	// AI Summary Provider — single row that shows what the dispatcher will
+	// actually pick on next commit. Uses the same `resolveLlmCredentialSource`
+	// the LLM dispatcher uses, so this row's claim and the actual call route
+	// can never drift apart. Click opens Settings so the user can change it.
+	pushProviderItem(items, config);
+
+	// Anthropic API Key warning — suppressed when:
+	//   - the user has explicitly chosen `aiProvider: "jolli"` (nagging would
+	//     contradict the choice they just made on the AI Summary tab), or
+	//   - `ANTHROPIC_API_KEY` is in the environment, in which case the AI
+	//     Summary Provider row above already reports "Anthropic (env) ✓" via
+	//     `resolveLlmCredentialSource`. Without this env check, the env-only
+	//     setup contradicts itself in the same tree (provider row green,
+	//     warning row yellow).
+	// Legacy configs without `aiProvider` set still see the warning when
+	// neither config.apiKey nor the env var is present.
+	if (
+		!config?.apiKey &&
+		!process.env.ANTHROPIC_API_KEY &&
+		config?.aiProvider !== "jolli"
+	) {
 		const apiKeyItem = new StatusItem(
 			"Anthropic API Key",
 			"not configured — click to set",
@@ -366,6 +387,74 @@ function buildFullStatusItems(
 	}
 
 	return items;
+}
+
+/**
+ * Pushes the "AI Summary Provider" row. Uses `resolveLlmCredentialSource` so
+ * the displayed provider matches what the dispatcher will actually pick on the
+ * next commit — they can't drift, since both consult the same function.
+ *
+ * Click opens Settings so the user can flip the choice. The row stays visible
+ * even when no provider resolves (warning state) so the user sees the absence
+ * as a discoverable problem, not a missing UI element.
+ */
+function pushProviderItem(
+	items: Array<StatusItem>,
+	config: JolliMemoryConfig | null,
+): void {
+	const source = resolveLlmCredentialSource(config ?? {});
+	let description: string;
+	let icon: vscode.ThemeIcon;
+	let tooltip: string;
+	switch (source) {
+		case "anthropic-config":
+			description = "Anthropic";
+			icon = ICON_OK;
+			tooltip =
+				"AI summaries are generated via the Anthropic API key from your config.";
+			break;
+		case "anthropic-env":
+			description = "Anthropic (env)";
+			icon = ICON_OK;
+			tooltip =
+				"AI summaries are generated via the ANTHROPIC_API_KEY environment variable.";
+			break;
+		case "jolli-proxy":
+			description = "Jolli";
+			icon = ICON_OK;
+			tooltip = "AI summaries are routed through the Jolli backend proxy.";
+			break;
+		default: {
+			// Resolves to null — either no credentials at all, or an explicit
+			// aiProvider whose required credential is missing (e.g. user picked
+			// Jolli but no jolliApiKey is on file). Different sub-messages so
+			// the user can tell which gap they're looking at.
+			description = "not configured — click to set";
+			icon = ICON_WARN;
+			if (config?.aiProvider === "jolli") {
+				tooltip =
+					"Provider is set to Jolli but no Jolli API key is on file. Sign in again or set a key in Settings.";
+			} else if (config?.aiProvider === "anthropic") {
+				tooltip =
+					"Provider is set to Anthropic but no API key is configured. Open Settings to add one.";
+			} else {
+				tooltip =
+					"No AI provider is configured. Pick one (Anthropic or Jolli) in Settings.";
+			}
+			break;
+		}
+	}
+	const item = new StatusItem(
+		"AI Summary Provider",
+		description,
+		icon,
+		tooltip,
+	);
+	item.command = {
+		command: "jollimemory.openSettings",
+		title: "Open Settings",
+	};
+	items.push(item);
 }
 
 function pushIntegrationItem(

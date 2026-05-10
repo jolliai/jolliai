@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { loadConfigFromDir, getGlobalConfigDir, parseJolliApiKey } = vi.hoisted(
 	() => ({
@@ -116,10 +116,26 @@ function makeStatus(overrides: Record<string, unknown> = {}) {
 }
 
 describe("StatusTreeProvider", () => {
+	// Snapshot ANTHROPIC_API_KEY across the suite — the warning row and the
+	// provider row both consult it via `resolveLlmCredentialSource`, so a
+	// dev's local env (or a CI runner's accidentally-set var) would otherwise
+	// flip suppression on and off across tests. beforeEach deletes; afterAll
+	// restores so we don't leak the deletion outside this file.
+	const ORIG_ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
 	beforeEach(() => {
 		executeCommand.mockClear();
 		loadConfigFromDir.mockReset();
 		parseJolliApiKey.mockReset();
+		delete process.env.ANTHROPIC_API_KEY;
+	});
+
+	afterAll(() => {
+		if (ORIG_ANTHROPIC_API_KEY !== undefined) {
+			process.env.ANTHROPIC_API_KEY = ORIG_ANTHROPIC_API_KEY;
+		} else {
+			delete process.env.ANTHROPIC_API_KEY;
+		}
 	});
 
 	it("renders loading, migrating, and disabled states", () => {
@@ -176,9 +192,15 @@ describe("StatusTreeProvider", () => {
 		);
 
 		const items = provider.getChildren();
+		// AI Summary Provider row sits between Sessions and the credential
+		// rows so the high-level "who does the AI" question is answered first,
+		// before the per-credential warnings/details. Position chosen to keep
+		// the visual hierarchy infrastructure → telemetry → provider →
+		// details.
 		expect(items.map((item) => item.label)).toEqual([
 			"Hooks",
 			"Sessions",
+			"AI Summary Provider",
 			"Anthropic API Key",
 			"Jolli Site",
 			"Claude Integration",
@@ -188,11 +210,99 @@ describe("StatusTreeProvider", () => {
 		expect(items[0].description).toBe("3 Git + 2 Claude");
 		// Hooks icon is OK because gitHookInstalled is true
 		expect((items[0].iconPath as { id: string }).id).toBe("check");
-		expect(items[2].command).toEqual({
+		// Provider row uses dispatcher's resolveLlmCredentialSource — config
+		// here has only jolliApiKey + no aiProvider, so legacy precedence
+		// resolves to jolli-proxy → "Jolli" label.
+		const providerRow = items.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("Jolli");
+		expect(providerRow?.command).toEqual({
 			command: "jollimemory.openSettings",
 			title: "Open Settings",
 		});
-		expect(items[3].description).toBe("acme.jolli.app");
+		// Anthropic API Key warning still present because aiProvider is
+		// undefined (legacy config) — the suppression only kicks in when the
+		// user has explicitly chosen Jolli.
+		const apiKeyRow = items.find((it) => it.label === "Anthropic API Key");
+		expect(apiKeyRow?.command).toEqual({
+			command: "jollimemory.openSettings",
+			title: "Open Settings",
+		});
+		expect(items.find((it) => it.label === "Jolli Site")?.description).toBe(
+			"acme.jolli.app",
+		);
+	});
+
+	it("suppresses the Anthropic API Key warning when aiProvider is explicitly 'jolli'", async () => {
+		// Pinned because this is the user-driven product change: choosing
+		// Jolli on the AI Summary tab in Settings should silence the
+		// "Anthropic API key not configured" nag — it contradicts the choice
+		// they just made. Legacy configs (aiProvider undefined) keep the
+		// nag (covered by the test above).
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: undefined,
+			jolliApiKey: "jolli-key",
+			aiProvider: "jolli",
+		});
+		parseJolliApiKey.mockReturnValue({
+			u: "https://acme.jolli.app",
+			t: "acme",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const labels = items.map((it) => it.label);
+		expect(labels).not.toContain("Anthropic API Key");
+		// Provider row still present, showing the explicit choice.
+		expect(
+			items.find((it) => it.label === "AI Summary Provider")?.description,
+		).toBe("Jolli");
+	});
+
+	it("suppresses the Anthropic API Key warning when ANTHROPIC_API_KEY env is set", async () => {
+		// Without this suppression, an env-only setup contradicts itself in
+		// the same tree: the AI Summary Provider row reports "Anthropic
+		// (env) ✓" via resolveLlmCredentialSource, while the warning row
+		// would still claim the key is missing. Both rows consult the same
+		// env var so the verdict has to match.
+		process.env.ANTHROPIC_API_KEY = "sk-ant-env-only";
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: undefined,
+			jolliApiKey: undefined,
+			aiProvider: undefined,
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const labels = items.map((it) => it.label);
+		expect(labels).not.toContain("Anthropic API Key");
+		const providerRow = items.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("Anthropic (env)");
+	});
+
+	it("provider row warns when aiProvider='jolli' but no jolliApiKey is on file", async () => {
+		// Strict-honor edge case: dispatcher returns null for this combination,
+		// so the row must surface the gap rather than silently showing a
+		// happy-path label. Without this, the user could pick Jolli, sign out,
+		// and never realize summaries would now fail to dispatch.
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "sk-ant-still-here",
+			aiProvider: "jolli",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const providerRow = items.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("not configured — click to set");
+		expect((providerRow?.iconPath as { id: string }).id).toBe("warning");
 	});
 
 	it("tracks worker busy state and sign-in prompt when no Jolli credentials", async () => {

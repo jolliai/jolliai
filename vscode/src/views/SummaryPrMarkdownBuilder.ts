@@ -57,7 +57,7 @@ export function buildPrMarkdown(summary: CommitSummary): string {
 	pushRecapSection(lines, summary);
 	pushPrE2eTestSection(lines, summary.e2eTestGuide);
 	pushPrTopicsSection(lines, allTopics);
-	pushFooter(lines);
+	pushFooter(lines, summary);
 
 	return lines.join("\n");
 }

@@ -79,6 +79,7 @@ import { isWorkerBusy } from "./util/LockUtils.js";
 import { initLogger, log } from "./util/Logger.js";
 import { StatusBarManager } from "./util/StatusBarManager.js";
 import { getWorkspaceRoot } from "./util/WorkspaceUtils.js";
+import { computeChangesBadge } from "./views/ChangesBadge.js";
 import { NoteEditorWebviewPanel } from "./views/NoteEditorWebviewPanel.js";
 import { SettingsWebviewPanel } from "./views/SettingsWebviewPanel.js";
 import { SidebarWebviewProvider } from "./views/SidebarWebviewProvider.js";
@@ -1036,8 +1037,22 @@ export function activate(context: vscode.ExtensionContext): void {
 	// COMMITS title updates are handled by the commitsStore.onChange subscription
 	// registered near the createTreeView calls above — no provider hook needed.
 
-	// (filesView.badge / .description hooks removed — the sidebar's Files tab
-	// renders its own header text from the serialized snapshot.)
+	// CHANGES badge — surfaces the visible (post-exclude) changed-file count
+	// on the activity-bar icon. WebviewView shares the `.badge` API with
+	// TreeView (VS Code 1.72+), so the wiring forwards filesStore.onChange.
+	// The in-panel header is rendered by the webview itself, so only the
+	// activity-bar surface — which the webview can't reach on its own — is
+	// wired here. The "N files hidden" description override is intentionally
+	// not restored: the count is already visible in SidebarHtmlBuilder's
+	// in-panel header. Computation lives in `computeChangesBadge` so the
+	// disabled / migrating gates stay in lockstep with FilesTreeProvider.
+	function updateChangesBadge(): void {
+		sidebarProvider.setBadge(computeChangesBadge(filesStore.getSnapshot()));
+	}
+	context.subscriptions.push({
+		dispose: filesStore.onChange(updateChangesBadge),
+	});
+	updateChangesBadge();
 
 	// ── Commands ─────────────────────────────────────────────────────────────
 	const commitCommand = new CommitCommand(
@@ -1793,18 +1808,23 @@ export function activate(context: vscode.ExtensionContext): void {
 		// Opens the Commit Memory in the "commit" panel slot — fired from the
 		// Commits/history tree (CommitItem) and its tooltip command link.
 		// Behaviour is unchanged from before the memory/commit split.
+		//
+		// No-summary case is intentionally silent: COMMITS rows for unsummarized
+		// commits already render a `codicon-code` glyph (vs the tinted markdown
+		// glyph for memory rows), so the absence is visible in the UI itself; an
+		// extra information toast on every click was redundant noise. The same
+		// "guard early, return silently" shape is used by openMemoryFile below
+		// for empty paths. Sibling paths keep their notification on purpose:
+		//   - viewMemorySummary (next handler) — surfacing reaches a real
+		//     inconsistency (Memories list claimed a summary that's missing).
+		//   - URI handler (further down) — external deep links to non-existent
+		//     summaries are worth telling the user about.
 		vscode.commands.registerCommand(
 			"jollimemory.viewSummary",
 			async (item: CommitItem | string) => {
 				const hash = typeof item === "string" ? item : item.commit.hash;
-				const shortHash = hash.substring(0, 7);
 				const summary = await bridge.getSummary(hash);
-				if (!summary) {
-					vscode.window.showInformationMessage(
-						`Jolli Memory: No summary found for commit ${shortHash}.`,
-					);
-					return;
-				}
+				if (!summary) return;
 				await SummaryWebviewPanel.show(
 					summary,
 					context.extensionUri,
@@ -1995,6 +2015,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						handleError("openSettings.save")(err as Error);
 					}
 				},
+				authService,
 			);
 		}),
 
@@ -2007,6 +2028,13 @@ export function activate(context: vscode.ExtensionContext): void {
 		// configured:changed plumbing — no explicit success ack needed here.
 		// On failure we surface the message inline through
 		// notifyApiKeySaveError so the user sees it without leaving the panel.
+		//
+		// Also writes `aiProvider: "anthropic"` because clicking the onboarding
+		// "Configure Anthropic API key" button is the user's explicit choice of
+		// provider — symmetric with the `aiProvider: "jolli"` write that
+		// `saveAuthCredentials` does on Jolli sign-in. Without this, a user who
+		// later signs in to Jolli (even briefly) and signs out would see the
+		// dispatcher revert to Jolli-precedence on next config reload.
 		vscode.commands.registerCommand(
 			"jollimemory.saveAnthropicApiKey",
 			async (rawKey: unknown) => {
@@ -2017,7 +2045,10 @@ export function activate(context: vscode.ExtensionContext): void {
 					return;
 				}
 				try {
-					await saveConfigScoped({ apiKey: key }, getGlobalConfigDir());
+					await saveConfigScoped(
+						{ apiKey: key, aiProvider: "anthropic" },
+						getGlobalConfigDir(),
+					);
 					await statusStore.refresh();
 				} catch (err) {
 					const message =
@@ -2053,6 +2084,9 @@ export function activate(context: vscode.ExtensionContext): void {
 			currentAuthenticated = false;
 			sidebarProvider.notifyAuthChanged(false);
 			statusStore.refresh().catch(handleError("signOut.refresh"));
+			SettingsWebviewPanel.notifyAuthChanged().catch(
+				handleError("signOut.notifySettings"),
+			);
 		}),
 	);
 
@@ -2099,6 +2133,9 @@ export function activate(context: vscode.ExtensionContext): void {
 							"Signed in to Jolli successfully.",
 						);
 						statusStore.refresh().catch(handleError("uriHandler.refresh"));
+						SettingsWebviewPanel.notifyAuthChanged().catch(
+							handleError("uriHandler.notifySettings"),
+						);
 					} else {
 						vscode.window.showErrorMessage(
 							`Jolli sign-in failed: ${result.error}`,

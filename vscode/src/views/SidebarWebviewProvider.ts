@@ -109,11 +109,24 @@ export class SidebarWebviewProvider
 	private filesSub: { dispose(): void } | undefined;
 	private historySub: { dispose(): void } | undefined;
 	private firstVisibleFired = false;
+	/**
+	 * Latest activity-bar badge requested by the host (e.g. visible-changed-file
+	 * count from filesStore). Cached because callers may push a value before
+	 * `resolveWebviewView` has run — without the cache, badges set during
+	 * activation would be silently dropped and only re-appear after the next
+	 * filesStore.onChange. resolveWebviewView re-applies whatever's pending.
+	 */
+	private pendingBadge: vscode.WebviewView["badge"];
 
 	constructor(private readonly deps: SidebarWebviewDeps) {}
 
 	resolveWebviewView(view: vscode.WebviewView): void {
 		this.view = view;
+		// Re-apply any badge requested before the view resolved. WebviewView
+		// shares the `.badge` API with TreeView (VS Code 1.72+); this is the
+		// re-attachment point that replaces the legacy filesView.badge hooks
+		// dropped when the file tree moved into the unified webview.
+		view.badge = this.pendingBadge;
 		view.webview.options = {
 			enableScripts: true,
 			localResourceRoots: [this.deps.extensionUri],
@@ -172,6 +185,22 @@ export class SidebarWebviewProvider
 	postMessage(msg: SidebarInboundMsg): void {
 		if (!this.view) return;
 		void this.view.webview.postMessage(msg);
+	}
+
+	/**
+	 * Set the activity-bar badge for this view. Pass `undefined` to clear.
+	 * Safe to call before `resolveWebviewView` runs — the value is cached and
+	 * re-applied on resolve, so badges driven by stores that broadcast during
+	 * activation aren't lost when the user opens the sidebar later.
+	 *
+	 * Diverges from `postMessage`'s "drop-when-not-resolved" semantics on
+	 * purpose: filesStore.onChange may not fire again for a while, so silently
+	 * dropping the very first badge would leave the icon unbadged for the rest
+	 * of the session.
+	 */
+	setBadge(badge: vscode.WebviewView["badge"]): void {
+		this.pendingBadge = badge;
+		if (this.view) this.view.badge = badge;
 	}
 
 	/**

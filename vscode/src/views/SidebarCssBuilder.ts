@@ -316,19 +316,33 @@ export function buildSidebarCss(): string {
     background: transparent;
   }
   .tree-node .label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-  /* commit-file rows AND changes rows: label hugs its own width so the
-     .desc (dirname) can sit immediately to the right. The trailing
-     .gs-letter still gets pushed to the row edge by its own
-     margin-left:auto. Layout becomes:
-       <icon> <label> <dirname>  …spacer…  <letter> [<discard>]
-     Changes rows additionally show a hover-only discard button after
-     the letter (CSS for that lives in tree-node--changes rules above);
-     letter coexists with discard because inline-actions has its own
-     flex-shrink:0 and only toggles visibility, not layout. */
+  /* commit-file rows AND changes rows share one truncation priority: the
+     filename keeps its natural content width (no shrink, no max-width cap)
+     and the dirname (.desc) is the sole shrinkable segment that absorbs
+     overflow with a "…" tail. This mirrors native VSCode SCM behavior
+     (Source Control panel + Timeline file rows) where dirnames truncate
+     before filenames — losing the start of a path is much less ambiguous
+     than losing the start or end of a filename. Layout per row:
+       <icon> <label> <dirname-or-…>  …spacer…  <letter> [<discard>]
+     Changes rows additionally toggle their inline-actions on hover
+     (CSS in tree-node--changes rules below); the truncation priority
+     itself is identical between the two row kinds. */
   .tree-node[data-context="commitFile"] .label,
   .tree-node.tree-node--changes .label {
+    flex: 0 0 auto;
+    max-width: none;
+  }
+  /* Pair to the .label rule above: dirname collapses with ellipsis when
+     the row runs out of space. min-width:0 is required because flex items
+     default to min-width:auto (content-based), which would otherwise
+     prevent the ellipsis from ever firing. */
+  .tree-node[data-context="commitFile"] .desc,
+  .tree-node.tree-node--changes .desc {
     flex: 0 1 auto;
-    max-width: 60%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   /* Trailing kind tag for plan / note files. Memory has no tag — the
      tinted markdown icon already conveys it. P / N are 14×14 chips with
@@ -490,10 +504,21 @@ export function buildSidebarCss(): string {
     align-items: center;
     gap: 6px;
     padding: 4px 8px;
+    min-width: 0;
   }
   .status-entry:hover { background: var(--vscode-list-hoverBackground); cursor: pointer; }
-  .status-entry .label { flex-shrink: 0; }
-  .status-entry .desc { color: var(--vscode-descriptionForeground); }
+  .status-entry .label {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .status-entry .desc {
+    color: var(--vscode-descriptionForeground);
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   /* Codicon color classes — applied via className because CSP style-src has
      no 'unsafe-inline', so dynamic style="color:..." attributes are blocked.

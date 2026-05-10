@@ -23,6 +23,9 @@
 		"claude",
 		"codex",
 		"gemini",
+		"opencode",
+		"cursor",
+		"copilot",
 		"pr",
 		"summary"
 	],

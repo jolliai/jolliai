@@ -20,6 +20,8 @@ interface MockWebviewView {
 	onDidDispose: ReturnType<typeof vi.fn>;
 	show: ReturnType<typeof vi.fn>;
 	visible: boolean;
+	/** Activity-bar badge field — same shape as vscode.WebviewView.badge. */
+	badge: { value: number; tooltip: string } | undefined;
 }
 
 // Minimal mock Uri that satisfies vscode.Uri.joinPath usage in SidebarWebviewProvider.
@@ -79,6 +81,7 @@ function makeMockView(): MockWebviewView {
 		onDidDispose: vi.fn(() => ({ dispose: () => {} })),
 		show: vi.fn(),
 		visible: true,
+		badge: undefined,
 	};
 }
 
@@ -1584,5 +1587,49 @@ describe("SidebarWebviewProvider", () => {
 		expect(reset).toBeDefined();
 		expect((reset as { kbRepoFolder?: string }).kbRepoFolder).toBe("jolliai-2");
 		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
+	});
+
+	// setBadge re-attaches the activity-bar badge surface that the legacy
+	// TreeView-based sidebar provided. WebviewView shares the `.badge` API
+	// with TreeView — these tests pin the contract that (a) badges set
+	// after resolve apply immediately and (b) badges set before resolve
+	// are cached and re-applied on resolve, so callers don't need to know
+	// whether the user has opened the sidebar yet.
+
+	it("setBadge writes to view.badge after resolveWebviewView", () => {
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		provider.setBadge({ value: 3, tooltip: "3 changed files, 0 selected" });
+		expect(view.badge).toEqual({
+			value: 3,
+			tooltip: "3 changed files, 0 selected",
+		});
+		provider.setBadge(undefined);
+		expect(view.badge).toBeUndefined();
+	});
+
+	it("setBadge before resolveWebviewView caches and applies on resolve", () => {
+		// filesStore.onChange may fire during activate, before VS Code has
+		// resolved the WebviewView. Without caching, that very first badge
+		// would silently disappear and the icon would stay unbadged for the
+		// rest of the session — caching makes the wiring order independent.
+		provider.setBadge({ value: 7, tooltip: "7 changed files, 2 selected" });
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		expect(view.badge).toEqual({
+			value: 7,
+			tooltip: "7 changed files, 2 selected",
+		});
+	});
+
+	it("setBadge replaces an earlier cached badge before resolve", () => {
+		// Multiple filesStore.onChange firings before resolve must collapse
+		// to the latest value, not the first — otherwise a stale count from
+		// the initial empty snapshot would win over the post-refresh count.
+		provider.setBadge({ value: 1, tooltip: "stale" });
+		provider.setBadge({ value: 9, tooltip: "fresh" });
+		const view = makeMockView();
+		provider.resolveWebviewView(view as unknown as never);
+		expect(view.badge).toEqual({ value: 9, tooltip: "fresh" });
 	});
 });

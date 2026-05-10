@@ -31,13 +31,26 @@ export async function saveAuthToken(token: string): Promise<void> {
  * Saves the OAuth auth token and an optional Jolli API key in a single atomic
  * write. Use this when receiving both fields from the same auth callback, so
  * a partial failure can't leave the config with a token but no API key (or vice
- * versa). Symmetric with `clearAuthCredentials`.
+ * versa).
+ *
+ * Also writes `aiProvider: "jolli"` because clicking "Sign in to Jolli" is the
+ * user's explicit declaration of intent to use Jolli for AI summaries. This
+ * aligns the dispatcher's `resolveLlmCredentialSource` with the user's
+ * onboarding choice — without it, a returning user who already had an
+ * Anthropic API key in config would see Settings UI promise "using Jolli" but
+ * the dispatcher would still pick Anthropic via the legacy precedence path.
+ *
+ * `clearAuthCredentials` rolls back this auto-write on logout so the config
+ * doesn't keep a "jolli" preference whose credentials are gone.
  */
 export async function saveAuthCredentials(credentials: {
 	readonly token: string;
 	readonly jolliApiKey?: string;
 }): Promise<void> {
-	const update: { authToken: string; jolliApiKey?: string } = { authToken: credentials.token };
+	const update: { authToken: string; jolliApiKey?: string; aiProvider: "jolli" } = {
+		authToken: credentials.token,
+		aiProvider: "jolli",
+	};
 	if (credentials.jolliApiKey) {
 		validateJolliApiKey(credentials.jolliApiKey);
 		update.jolliApiKey = credentials.jolliApiKey;
@@ -53,7 +66,24 @@ export async function loadAuthToken(): Promise<string | undefined> {
 	return config.authToken;
 }
 
-/** Clears both auth token and Jolli API key from global config for a complete logout. */
+/**
+ * Clears the auth token, Jolli API key, and (only if it equals "jolli") the
+ * `aiProvider` preference, since `saveAuthCredentials` writes that preference
+ * automatically on sign-in. Leaving it behind would keep
+ * `resolveLlmCredentialSource` pinned to the proxy after the credentials are
+ * gone — making subsequent commits fail silently in VS Code (where the CLI
+ * warning copy never reaches the user). An explicit `aiProvider: "anthropic"`
+ * choice is preserved so a user who deliberately picked Anthropic in Settings
+ * isn't reset by an unrelated logout.
+ */
 export async function clearAuthCredentials(): Promise<void> {
-	await saveConfig({ authToken: undefined, jolliApiKey: undefined });
+	const config = await loadConfig();
+	const update: { authToken: undefined; jolliApiKey: undefined; aiProvider?: undefined } = {
+		authToken: undefined,
+		jolliApiKey: undefined,
+	};
+	if (config.aiProvider === "jolli") {
+		update.aiProvider = undefined;
+	}
+	await saveConfig(update);
 }

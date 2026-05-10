@@ -294,7 +294,10 @@ const {
 			return mockSquashCommand_;
 		}),
 		MockSummaryWebviewPanel: { show: vi.fn().mockResolvedValue(undefined) },
-		MockSettingsWebviewPanel: { show: vi.fn() },
+		MockSettingsWebviewPanel: {
+			show: vi.fn(),
+			notifyAuthChanged: vi.fn().mockResolvedValue(undefined),
+		},
 		MockNoteEditorWebviewPanel: { show: vi.fn() },
 		mockAuthService: mockAuthService_,
 		MockAuthService: vi.fn(function MockAuthService() {
@@ -774,6 +777,7 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		notifyEnabledChanged() {}
 		notifyAuthChanged() {}
 		notifyConfiguredChanged() {}
+		setBadge() {}
 		// Tracked via a shared vi.fn so saveAnthropicApiKey-error tests can
 		// assert the failure-path message routing without needing access to
 		// the constructed instance.
@@ -1511,7 +1515,14 @@ describe("Extension", () => {
 				);
 			});
 
-			it("shows info message when no summary is found", async () => {
+			it("silently returns when no summary is found (no toast, no panel)", async () => {
+				// Product decision: clicking a COMMITS row whose commit has no
+				// summary is a non-event — the row's `codicon-code` glyph (vs
+				// the tinted markdown glyph for memory rows) already conveys
+				// the absence visually, so a follow-up information toast on
+				// every click was redundant noise. The viewMemorySummary path
+				// (next describe) intentionally keeps its toast because hitting
+				// no-summary there indicates a real Memories↔bridge mismatch.
 				mockBridge.getSummary.mockResolvedValue(null);
 
 				const handler = getRegisteredCommand("jollimemory.viewSummary");
@@ -1519,21 +1530,23 @@ describe("Extension", () => {
 					commit: { hash: "abc1234567890", shortHash: "abc1234" },
 				});
 
-				expect(showInformationMessage).toHaveBeenCalledWith(
-					"Jolli Memory: No summary found for commit abc1234.",
-				);
+				expect(showInformationMessage).not.toHaveBeenCalled();
+				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
 			});
 
 			it("accepts a plain hash string instead of CommitItem", async () => {
+				// Pinned because the sidebar webview dispatches the command
+				// with a bare hash via `branch:openCommit`, not a CommitItem;
+				// regressing the string branch would break every commit-row
+				// click. The no-summary path is silent (see test above).
 				mockBridge.getSummary.mockResolvedValue(null);
 
 				const handler = getRegisteredCommand("jollimemory.viewSummary");
 				await handler("abc1234567890");
 
 				expect(mockBridge.getSummary).toHaveBeenCalledWith("abc1234567890");
-				expect(showInformationMessage).toHaveBeenCalledWith(
-					"Jolli Memory: No summary found for commit abc1234.",
-				);
+				expect(showInformationMessage).not.toHaveBeenCalled();
+				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
 			});
 		});
 
@@ -1616,10 +1629,13 @@ describe("Extension", () => {
 				const handler = getRegisteredCommand("jollimemory.openSettings");
 				handler();
 
+				// 4th arg is the AuthService — passed so the panel can resolve
+				// signed-in state for the AI Summary / Sync provider cards.
 				expect(MockSettingsWebviewPanel.show).toHaveBeenCalledWith(
 					expect.anything(),
 					"/test/workspace",
 					expect.any(Function),
+					expect.anything(),
 				);
 
 				// Activation already called filesStore.refresh / statusStore.refresh
@@ -4087,7 +4103,7 @@ describe("Extension", () => {
 			expect(handler).toBeDefined();
 		});
 
-		it("saves only the apiKey field and refreshes statusStore on success", async () => {
+		it("saves apiKey + aiProvider:'anthropic' and refreshes statusStore on success", async () => {
 			activate(makeContext());
 			saveConfigScoped.mockResolvedValueOnce(undefined);
 			mockStatusStore.refresh.mockClear();
@@ -4095,11 +4111,15 @@ describe("Extension", () => {
 			const handler = getRegisteredCommand("jollimemory.saveAnthropicApiKey");
 			await handler("sk-ant-test-key");
 
-			// The update is scoped to apiKey only — no hooks/integrations/etc.
-			// get rewritten. This is the contract that lets us bypass the
-			// full Settings webview without losing user-set fields elsewhere.
+			// The update is scoped to apiKey + aiProvider — no hooks /
+			// integrations / etc. get rewritten. This is the contract that lets
+			// us bypass the full Settings webview without losing user-set
+			// fields elsewhere. `aiProvider: "anthropic"` is part of the
+			// onboarding contract: clicking the "Configure Anthropic API key"
+			// button declares provider intent, symmetric with the Jolli
+			// sign-in path that writes `aiProvider: "jolli"`.
 			expect(saveConfigScoped).toHaveBeenCalledWith(
-				{ apiKey: "sk-ant-test-key" },
+				{ apiKey: "sk-ant-test-key", aiProvider: "anthropic" },
 				"/home/user/.jolli/jollimemory",
 			);
 			// statusStore.refresh re-derives `configured` from
@@ -4118,7 +4138,7 @@ describe("Extension", () => {
 			await handler("  sk-ant-pasted  \n");
 
 			expect(saveConfigScoped).toHaveBeenCalledWith(
-				{ apiKey: "sk-ant-pasted" },
+				{ apiKey: "sk-ant-pasted", aiProvider: "anthropic" },
 				expect.any(String),
 			);
 		});

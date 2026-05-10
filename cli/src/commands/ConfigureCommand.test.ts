@@ -1,9 +1,11 @@
 /**
- * Tests for ConfigureCommand — `jolli configure` copilotEnabled key.
+ * Tests for ConfigureCommand — `jolli configure` settable keys.
  *
  * Covers:
  *   - copilotEnabled accepted as a settable boolean key
- *   - copilotEnabled appears in --list-keys output
+ *   - localFolder accepted as a string path key (CLI-only setup parity)
+ *   - aiProvider accepted as the "anthropic" | "jolli" enum, rejected otherwise
+ *   - All three keys appear in --list-keys output
  */
 
 import { Command } from "commander";
@@ -71,7 +73,7 @@ async function runConfigureHelp(): Promise<string> {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-describe("ConfigureCommand — copilotEnabled key", () => {
+describe("ConfigureCommand — settable keys", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		savedConfig = {};
@@ -96,8 +98,54 @@ describe("ConfigureCommand — copilotEnabled key", () => {
 		expect((await loadConfig()).copilotEnabled).toBe(false);
 	});
 
-	it("lists copilotEnabled in help/description output", async () => {
+	it("accepts localFolder as a string path key", async () => {
+		// CLI-only setups (no VS Code Settings panel) need a way to point Memory
+		// Bank at a folder; without this key the only option was hand-editing
+		// config.json, which silently bypasses any future validation.
+		await runConfigure(["--set", "localFolder=/tmp/jolli-memory-bank"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ localFolder: "/tmp/jolli-memory-bank" }));
+		expect((await loadConfig()).localFolder).toBe("/tmp/jolli-memory-bank");
+	});
+
+	it("accepts aiProvider with the two allowed values", async () => {
+		await runConfigure(["--set", "aiProvider=anthropic"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: "anthropic" }));
+
+		await runConfigure(["--set", "aiProvider=jolli"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: "jolli" }));
+	});
+
+	it("rejects aiProvider values that aren't in the allowlist", async () => {
+		// Without this guard, `jolli configure --set aiProvider=openai` would
+		// silently corrupt the config — `resolveLlmCredentialSource` ignores
+		// unknown values, so commits would fall back to legacy precedence
+		// while the user thinks they switched providers.
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const prevExitCode = process.exitCode;
+		try {
+			await runConfigure(["--set", "aiProvider=openai"]);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("anthropic, jolli"));
+			expect(process.exitCode).toBe(1);
+			expect(mockSaveConfig).not.toHaveBeenCalled();
+		} finally {
+			errorSpy.mockRestore();
+			process.exitCode = prevExitCode;
+		}
+	});
+
+	it("removes localFolder and aiProvider via --remove", async () => {
+		// --remove writes `undefined` for the field, which saveConfig drops
+		// from the persisted JSON — this is what an "unset" looks like on disk.
+		await runConfigure(["--remove", "localFolder", "--remove", "aiProvider"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(
+			expect.objectContaining({ localFolder: undefined, aiProvider: undefined }),
+		);
+	});
+
+	it("lists copilotEnabled, localFolder, and aiProvider in help/description output", async () => {
 		const help = await runConfigureHelp();
 		expect(help).toContain("copilotEnabled");
+		expect(help).toContain("localFolder");
+		expect(help).toContain("aiProvider");
 	});
 });

@@ -130,6 +130,63 @@ describe("hover-reveal actions use visibility (no reflow)", () => {
 	});
 });
 
+describe("file-row truncation priority (filename over dirname)", () => {
+	// Product decision: in BOTH the Changes panel and the COMMITS expanded
+	// commit-file rows, the filename must always read in full and the dirname
+	// is the one that gives up space first. The two row kinds were briefly
+	// split during the rollout — commit-file rows kept their legacy 60%
+	// label cap — but a follow-up unified them under one rule so the
+	// truncation experience is consistent across the whole sidebar.
+	// The 60% cap is explicitly guarded as REMOVED below so a future merge
+	// can't reintroduce the asymmetric behavior accidentally.
+
+	it("changes-row filename keeps natural width (flex:0 0 auto, no max-width cap)", () => {
+		const css = buildSidebarCss();
+		expect(css).toMatch(
+			/\.tree-node\.tree-node--changes\s+\.label[^{]*{[^}]*flex:\s*0\s+0\s+auto/,
+		);
+		expect(css).toMatch(
+			/\.tree-node\.tree-node--changes\s+\.label[^{]*{[^}]*max-width:\s*none/,
+		);
+	});
+
+	it("commit-file row filename gets the same flip (no 60% cap, no shrink)", () => {
+		// Pinned because this rule was previously asymmetric — commit-file
+		// rows used to cap the label at 60% so the dirname could sit
+		// alongside it. The flip removes that cap. Regressing back to the
+		// 60% cap would silently revert the unified UX.
+		const css = buildSidebarCss();
+		expect(css).toMatch(
+			/\.tree-node\[data-context="commitFile"\][^{]*{[^}]*flex:\s*0\s+0\s+auto/,
+		);
+		expect(css).toMatch(
+			/\.tree-node\[data-context="commitFile"\][^{]*{[^}]*max-width:\s*none/,
+		);
+		// Negative assertion: the legacy 60% cap must not reappear anywhere
+		// scoped to commit-file rows.
+		expect(css).not.toMatch(
+			/\.tree-node\[data-context="commitFile"\][^{]*{[^}]*max-width:\s*60%/,
+		);
+	});
+
+	it("dirname desc shrinks with ellipsis on both row kinds", () => {
+		// min-width:0 is load-bearing: flex items default to min-width:auto
+		// which equals content width, and that prevents text-overflow:ellipsis
+		// from ever firing. Without it the desc would still refuse to shrink.
+		// Both selectors must satisfy the rule — they're combined in source.
+		const css = buildSidebarCss();
+		for (const selector of [
+			'\\.tree-node\\[data-context="commitFile"\\]\\s+\\.desc',
+			"\\.tree-node\\.tree-node--changes\\s+\\.desc",
+		]) {
+			expect(css).toMatch(new RegExp(`${selector}[^{]*{[^}]*min-width:\\s*0`));
+			expect(css).toMatch(
+				new RegExp(`${selector}[^{]*{[^}]*text-overflow:\\s*ellipsis`),
+			);
+		}
+	});
+});
+
 describe("git decoration colors", () => {
 	it("uses --vscode-gitDecoration-* variables for .gs-M/.gs-A/.gs-D etc", () => {
 		const css = buildSidebarCss();

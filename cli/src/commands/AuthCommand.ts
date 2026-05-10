@@ -35,7 +35,9 @@ export function registerAuthCommands(program: Command): void {
 		});
 
 	auth.command("logout")
-		.description("Clear the stored Jolli auth token and Jolli API Key (Anthropic API key, if any, is preserved)")
+		.description(
+			"Clear the stored Jolli auth token and Jolli API Key (Anthropic API key, if any, is preserved on disk)",
+		)
 		.action(async () => {
 			await clearAuthCredentials();
 			const config = await loadConfig();
@@ -44,6 +46,9 @@ export function registerAuthCommands(program: Command): void {
 			console.log("\n  Logged out.");
 			console.log("  Auth token and Jolli API Key have been removed from local config.");
 			if (hasAnthropicKey) {
+				// `clearAuthCredentials` already rolled back any sign-in-time
+				// `aiProvider: "jolli"` preference, so the dispatcher will fall
+				// back to the Anthropic key on the next commit.
 				console.log("\n  Your Anthropic API Key is still saved and will continue to work:");
 				console.log("    - Anthropic API Key  (remove with `jolli configure --remove apiKey`)");
 			}

@@ -31,6 +31,8 @@ function llmResult(text: string, overrides: Partial<LlmCallResult> = {}): LlmCal
 		outputTokens: 200,
 		apiLatencyMs: 350,
 		stopReason: "end_turn",
+		// Default to direct config-key path; proxy/env tests override.
+		source: "anthropic-config",
 		...overrides,
 	};
 }
@@ -135,6 +137,10 @@ describe("evaluatePlanProgress", () => {
 				outputTokens: 567,
 				apiLatencyMs: 890,
 				stopReason: "end_turn",
+				// Provider attribution is plumbed all the way through the
+				// evaluator — same call surface as Summarizer, same need to
+				// keep the source visible on the saved plan-progress record.
+				source: "anthropic-config",
 			});
 		});
 

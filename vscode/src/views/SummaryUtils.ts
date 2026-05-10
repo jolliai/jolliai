@@ -26,7 +26,67 @@ export {
 } from "../../../cli/src/core/SummaryFormat.js";
 
 import { formatDate as coreFormatDate } from "../../../cli/src/core/SummaryFormat.js";
+import type {
+	CommitSummary,
+	LlmCredentialSource,
+} from "../../../cli/src/Types.js";
 import { sanitizeBranchSlug } from "../util/GitRemoteUtils.js";
+
+// ─── LLM provider attribution ─────────────────────────────────────────────────
+
+/**
+ * Human-readable labels for each LLM credential source. Compact-style chosen
+ * over the more explicit `doctor` labels ("Anthropic API key (config)") because
+ * the footer is a one-line attribution — the distinction between config-key and
+ * env-key is preserved via "(env)" suffix without paying a lot of horizontal
+ * space. Swap to a more verbose form here if you want it surfaced differently;
+ * `formatProviderLabel` and the footer renderers downstream don't care.
+ */
+const PROVIDER_LABELS: Record<LlmCredentialSource, string> = {
+	"anthropic-config": "Anthropic",
+	"anthropic-env": "Anthropic (env)",
+	"jolli-proxy": "Jolli proxy",
+};
+
+/**
+ * Walks the v3 CommitSummary tree and collects every distinct
+ * `LlmCallMetadata.source` it finds. Used to derive the provider attribution
+ * in summary footers — squash / merge containers don't have their own LLM
+ * call (their `.llm` is absent) so we MUST recurse into `children` to surface
+ * the providers that actually produced the consolidated content.
+ *
+ * Returns sources in first-seen order across the depth-first walk.
+ */
+export function collectLlmSources(
+	summary: CommitSummary,
+): ReadonlyArray<LlmCredentialSource> {
+	const seen = new Set<LlmCredentialSource>();
+	const visit = (node: CommitSummary): void => {
+		if (node.llm?.source) seen.add(node.llm.source);
+		for (const child of node.children ?? []) visit(child);
+	};
+	visit(summary);
+	return [...seen];
+}
+
+/**
+ * Footer-ready provider attribution string. Returns:
+ *   - `undefined` when no node in the tree carries a `source` field — i.e.
+ *     the summary was generated before this field existed; callers should
+ *     omit the provider segment of the footer entirely instead of printing
+ *     "via unknown".
+ *   - A single label (e.g. `"Anthropic"`) for the common single-source case.
+ *   - `"mixed: A, B"` for cross-provider summaries (a squash whose source
+ *     commits were summarized on different machines / configs).
+ */
+export function formatProviderLabel(
+	summary: CommitSummary,
+): string | undefined {
+	const sources = collectLlmSources(summary);
+	if (sources.length === 0) return undefined;
+	if (sources.length === 1) return PROVIDER_LABELS[sources[0]];
+	return `mixed: ${sources.map((s) => PROVIDER_LABELS[s]).join(", ")}`;
+}
 
 // ─── Push contract: relativePath construction (server plan §8) ───────────────
 
