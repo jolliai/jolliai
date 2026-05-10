@@ -1126,7 +1126,7 @@ function validateTopicSummary(item: unknown, index: number): TopicSummary {
 
 /**
  * Pattern matching a project ticket prefix in a commit message or branch name.
- * Recognises forms like "PROJ-123", "FEAT-456", "JOLLI-789".
+ * Recognises forms like "PROJ-123", "FEAT-456", "JIRA-789".
  */
 const TICKET_PATTERN = /[A-Z][A-Z0-9]+-\d+/;
 

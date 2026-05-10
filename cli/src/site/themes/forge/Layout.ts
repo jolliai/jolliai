@@ -2,9 +2,7 @@
  * Forge layout generator — produces `app/layout.tsx` for sites that pick
  * `theme.pack === "forge"` in their `site.json`.
  *
- * Adapted from the SaaS Forge layout
- * (`tools/nextra-generator/src/themes/forge/templates/Layout.ts` in
- * jolli.ai/jolli) post-JOLLI-1392, with the SaaS-only bits stripped:
+ * Adapted from the SaaS Forge layout, with the SaaS-only bits stripped:
  *
  *   - `ScopedNextraLayout` → vanilla `<Layout>` from `nextra-theme-docs`
  *   - `<AuthBanner>` / `<Auth0Provider>` slots removed (CLI sites are

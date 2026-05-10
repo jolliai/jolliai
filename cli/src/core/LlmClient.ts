@@ -225,18 +225,31 @@ export async function callLlm(options: LlmCallOptions): Promise<LlmCallResult> {
 			return callProxy(options, baseUrl, source);
 		}
 		default:
-			throw new Error(NO_LLM_PROVIDER_MESSAGE);
+			throw new LlmCredentialError();
 	}
 }
 
 /**
- * Thrown by `callLlm` when no provider can be resolved from the supplied
- * credentials and `aiProvider` choice. Exported so callers (e.g. the queue
- * worker) can distinguish credential-config errors from transient transport
- * errors and skip retry/placeholder fallbacks that would mask the failure.
+ * User-facing message for the "no provider could be resolved" failure. Kept
+ * exported so callers that need to render the message inline (status panels,
+ * onboarding hints) don't duplicate the string.
  */
 export const NO_LLM_PROVIDER_MESSAGE =
 	"No LLM provider available. Set an Anthropic API key (ANTHROPIC_API_KEY) or configure a Jolli Space API key (jolliApiKey).";
+
+/**
+ * Thrown by `callLlm` when no provider can be resolved from the supplied
+ * credentials and `aiProvider` choice. Identified via `instanceof` so
+ * recognition survives any future tweak to `NO_LLM_PROVIDER_MESSAGE` (i18n,
+ * prefixing, wrapping with action context) without silently breaking the
+ * QueueWorker's "skip retry / placeholder writes" guard.
+ */
+export class LlmCredentialError extends Error {
+	constructor(message: string = NO_LLM_PROVIDER_MESSAGE) {
+		super(message);
+		this.name = "LlmCredentialError";
+	}
+}
 
 /**
  * True when `err` is the "no LLM provider available" failure — i.e. a
@@ -244,8 +257,8 @@ export const NO_LLM_PROVIDER_MESSAGE =
  * skip retry loops and placeholder writes that would otherwise hide the
  * "fix your Settings" signal from the user.
  */
-export function isLlmCredentialError(err: unknown): boolean {
-	return err instanceof Error && err.message === NO_LLM_PROVIDER_MESSAGE;
+export function isLlmCredentialError(err: unknown): err is LlmCredentialError {
+	return err instanceof LlmCredentialError;
 }
 
 /** Direct mode: call Anthropic SDK locally */

@@ -195,7 +195,7 @@ import { isCursorInstalled } from "../core/CursorDetector.js";
 import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
-import { NO_LLM_PROVIDER_MESSAGE } from "../core/LlmClient.js";
+import { LlmCredentialError } from "../core/LlmClient.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
@@ -398,7 +398,7 @@ describe("QueueWorker", () => {
 				.mockResolvedValueOnce([])
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks();
-			vi.mocked(generateSummary).mockRejectedValueOnce(new Error(NO_LLM_PROVIDER_MESSAGE));
+			vi.mocked(generateSummary).mockRejectedValueOnce(new LlmCredentialError());
 
 			await runWorker("/test/cwd");
 
@@ -415,7 +415,7 @@ describe("QueueWorker", () => {
 			setupPipelineMocks();
 			vi.mocked(generateSummary)
 				.mockRejectedValueOnce(new Error("transient transport error"))
-				.mockRejectedValueOnce(new Error(NO_LLM_PROVIDER_MESSAGE));
+				.mockRejectedValueOnce(new LlmCredentialError());
 
 			await runWorker("/test/cwd");
 

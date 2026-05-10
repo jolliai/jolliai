@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { callLlm, isLlmCredentialError, NO_LLM_PROVIDER_MESSAGE, resolveLlmCredentialSource } from "./LlmClient.js";
+import {
+	callLlm,
+	isLlmCredentialError,
+	LlmCredentialError,
+	NO_LLM_PROVIDER_MESSAGE,
+	resolveLlmCredentialSource,
+} from "./LlmClient.js";
 
 const { mockCreate, mockLogInfo, mockLogWarn } = vi.hoisted(() => ({
 	mockCreate: vi.fn(),
@@ -709,7 +715,7 @@ describe("LlmClient", () => {
 	});
 
 	describe("isLlmCredentialError", () => {
-		it("returns true for the canonical no-provider error", async () => {
+		it("returns true for the canonical no-provider error thrown by callLlm", async () => {
 			let caught: unknown;
 			try {
 				await callLlm({ action: "translate", params: { content: "x" } });
@@ -717,10 +723,23 @@ describe("LlmClient", () => {
 				caught = err;
 			}
 			expect(isLlmCredentialError(caught)).toBe(true);
+			// Belt-and-suspenders: the thrown value is the dedicated subclass,
+			// not just any Error with the canonical message. This is what lets
+			// the QueueWorker's `instanceof` guard survive future tweaks to
+			// NO_LLM_PROVIDER_MESSAGE.
+			expect(caught).toBeInstanceOf(LlmCredentialError);
 		});
 
-		it("returns true for an Error whose message matches the constant verbatim", () => {
-			expect(isLlmCredentialError(new Error(NO_LLM_PROVIDER_MESSAGE))).toBe(true);
+		it("returns true for a freshly-constructed LlmCredentialError", () => {
+			expect(isLlmCredentialError(new LlmCredentialError())).toBe(true);
+		});
+
+		// Pins the regression that motivated the subclass: a plain `new
+		// Error(NO_LLM_PROVIDER_MESSAGE)` must NOT be recognized as a credential
+		// error. This is what protects the QueueWorker guard from silently
+		// breaking if anyone reformats / prefixes / i18ns the message constant.
+		it("returns false for a plain Error whose message merely matches the constant", () => {
+			expect(isLlmCredentialError(new Error(NO_LLM_PROVIDER_MESSAGE))).toBe(false);
 		});
 
 		it("returns false for unrelated errors", () => {

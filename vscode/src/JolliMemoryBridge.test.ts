@@ -1058,7 +1058,7 @@ describe("JolliMemoryBridge", () => {
 			);
 		});
 
-		it("routes the reported JOLLI-1326 scenario (gitignored + deleted) to git rm --cached", async () => {
+		it("routes the reported scenario (gitignored + deleted) to git rm --cached", async () => {
 			// Selection contains a path that `git add` would reject because it
 			// is gitignored and deleted from the worktree — simulated here by
 			// lstatSync returning undefined for that path. The partition logic
@@ -2104,7 +2104,7 @@ describe("JolliMemoryBridge", () => {
 		});
 
 		it("returns unicode paths verbatim (no octal quoting)", async () => {
-			// Regression lock for the JOLLI-1326 bundled fix: without `-z`, git
+			// Regression lock for the bundled fix: without `-z`, git
 			// would emit `"fo\303\266.ts"` for this filename, which later breaks
 			// the re-stage round-trip.
 			mockExecFileSuccess("foö.ts\0");

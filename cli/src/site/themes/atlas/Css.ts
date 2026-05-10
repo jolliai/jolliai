@@ -5,9 +5,7 @@
  * cream when toggled to light), wider content column, airy spacing, masthead-
  * style footer. Accent color used as ambient glow rather than solid fill.
  *
- * Vendored from the SaaS Atlas pack
- * (`tools/nextra-generator/src/themes/atlas/styles/AtlasCss.ts` in jolli.ai/jolli)
- * post-JOLLI-1392. The auth banner block has been stripped (CLI sites have no
+ * Vendored from the SaaS Atlas pack. The auth banner block has been stripped (CLI sites have no
  * JWT auth) and the API-reference companion stylesheet is consumed via
  * `styles/api.css` from the rich-renderer pipeline rather than appended here.
  */

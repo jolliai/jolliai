@@ -30,13 +30,16 @@ describe("computeChangesBadge", () => {
 			computeChangesBadge(
 				snap({ visibleCount: 3, selectedFiles: [stubFile, stubFile] }),
 			),
-		).toEqual({ value: 3, tooltip: "3 changed files, 2 selected" });
+		).toEqual({ value: 3, tooltip: "3 changed, 2 selected" });
 	});
 
-	it("uses singular 'file' for visibleCount === 1", () => {
+	// Tooltip uses an unpluralized "changed" for parity with the trailing
+	// "selected" — both stay the same shape regardless of count, so the badge
+	// reads consistently at any size.
+	it("keeps tooltip shape for visibleCount === 1", () => {
 		expect(computeChangesBadge(snap({ visibleCount: 1 }))).toEqual({
 			value: 1,
-			tooltip: "1 changed file, 0 selected",
+			tooltip: "1 changed, 0 selected",
 		});
 	});
 

@@ -218,11 +218,21 @@ export function buildSettingsScript(): string {
       }
       return '';
     }) && valid;
-    // Validate whichever Jolli key field is in scope. Both inputs share
-    // identical validation rules, so we run them through validateField and
-    // surface the error at the visible card's error slot.
-    valid = validateField(jolliApiKeyInput, 'jolliApiKey-error', validateJolliApiKeyRule) && valid;
-    valid = validateField(jolliApiKeyNoKeyInput, 'jolliApiKeyNoKey-error', validateJolliApiKeyRule) && valid;
+    // Validate only the Jolli key input whose card is currently visible.
+    // The two inputs are kept in sync by paired listeners, but in transient
+    // states (advanced panel collapsed, programmatic setValue race) one may
+    // briefly hold a stale value — running the rule on a hidden input would
+    // surface its error in a card the user can't see, blocking Apply with
+    // no visible cause. When neither Jolli card is in scope (Anthropic
+    // selected, or signed-out) we skip Jolli validation entirely so a
+    // residual value can't gate Apply.
+    var jolliOkCard = document.querySelector('[data-card="jolli-ok"]');
+    var jolliNokeyCard = document.querySelector('[data-card="jolli-nokey"]');
+    if (jolliOkCard && !jolliOkCard.classList.contains('hidden')) {
+      valid = validateField(jolliApiKeyInput, 'jolliApiKey-error', validateJolliApiKeyRule) && valid;
+    } else if (jolliNokeyCard && !jolliNokeyCard.classList.contains('hidden')) {
+      valid = validateField(jolliApiKeyNoKeyInput, 'jolliApiKeyNoKey-error', validateJolliApiKeyRule) && valid;
+    }
     valid = validateField(maxTokensInput, 'maxTokens-error', function(v) {
       if (v.length > 0 && (isNaN(Number(v)) || Number(v) < 1 || !Number.isInteger(Number(v)))) return 'Must be a positive integer';
       return '';

@@ -6,7 +6,7 @@
  * repo in the OS temp dir, exercises the bridge against it, and
  * verifies the resulting index state via `git status --porcelain`.
  *
- * Purpose: end-to-end regression cover for JOLLI-1326. The unit tests
+ * Purpose: end-to-end regression cover for PROJ-1326. The unit tests
  * prove the partition logic in isolation; these tests prove the
  * partition's *design* matches real git's pathspec semantics.
  */
@@ -30,7 +30,7 @@ import { JolliMemoryBridge } from "./JolliMemoryBridge.js";
 let repoDir: string;
 
 beforeEach(() => {
-	repoDir = mkdtempSync(join(tmpdir(), "jolli-1326-"));
+	repoDir = mkdtempSync(join(tmpdir(), "proj-1326-"));
 	execSync("git init -q", { cwd: repoDir });
 	// Deterministic identity so commits succeed even in sandboxed env.
 	execSync('git -c commit.gpgsign=false config user.email "test@example.com"', {
@@ -52,7 +52,7 @@ function gitStatus(): string {
 }
 
 describe("stageFiles() — real git integration", () => {
-	it("allowMissing stages the deletion for the JOLLI-1326 bug state", async () => {
+	it("allowMissing stages the deletion for the PROJ-1326 bug state", async () => {
 		// Bug state: path was tracked, then `git rm --cached` removed it
 		// from the index, then the worktree copy was deleted. Running
 		// `git add -- foo.ts` in this state produces the exact error

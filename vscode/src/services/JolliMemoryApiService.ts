@@ -2,7 +2,7 @@
  * JolliMemoryApiService
  *
  * HTTP client for the Jolli Memory endpoints the VS Code plugin needs
- * to support the JOLLI-1335 first-bind chooser flow:
+ * to support the first-bind chooser flow:
  *
  *   - GET  /api/jolli-memory/spaces            -> list existing JM spaces
  *   - POST /api/jolli-memory/bindings          -> bind a repo to a JM space

@@ -5,9 +5,7 @@
  * reason to pick. Top-nav layout (vs Forge's sidebar-dominant), serif
  * headlines, dark-default mode, airy spacing, masthead-style footer.
  *
- * Mirrors `ATLAS_MANIFEST` from the SaaS Atlas pack
- * (`tools/nextra-generator/src/themes/atlas/Manifest.ts` in jolli.ai/jolli)
- * post-JOLLI-1392.
+ * Mirrors `ATLAS_MANIFEST` from the SaaS Atlas pack.
  */
 
 import type { DefaultThemeMode, FontFamily } from "../../Types.js";

@@ -2,9 +2,7 @@
  * Atlas layout generator — produces `app/layout.tsx` for sites that pick
  * `theme.pack === "atlas"` in their `site.json`.
  *
- * Adapted from the SaaS Atlas layout
- * (`tools/nextra-generator/src/themes/atlas/templates/Layout.ts` in
- * jolli.ai/jolli) post-JOLLI-1392, with the same SaaS-only bits stripped
+ * Adapted from the SaaS Atlas layout, with the same SaaS-only bits stripped
  * as the Forge port (`ScopedNextraLayout`, auth banner, auth provider,
  * `filterAuthFromPageMap`).
  *
