@@ -137,6 +137,26 @@ function setupExecFile(
 	});
 }
 
+/**
+ * Builds a gh-shaped error where stderr is attached as a property — matches
+ * how `tryExecGh` extracts stderr in production (`(err as { stderr? }).stderr`).
+ * `setupExecFile`'s handler throws this to simulate a non-zero gh exit with
+ * a stderr line that drives the noPr / lookupError discriminator.
+ */
+function ghError(opts: {
+	message: string;
+	stderr?: string;
+	code?: string | number;
+}): Error {
+	const err = new Error(opts.message) as Error & {
+		stderr?: string;
+		code?: string | number;
+	};
+	if (opts.stderr !== undefined) err.stderr = opts.stderr;
+	if (opts.code !== undefined) err.code = opts.code;
+	return err;
+}
+
 function setupTmpFile() {
 	tmpdirMock.mockReturnValue("/tmp");
 	randomBytesMock.mockReturnValue({ toString: () => "a1b2c3d4e5f6" });
@@ -376,7 +396,10 @@ describe("PrCommentService", () => {
 					return { stdout: "Logged in\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr") {
-					throw new Error("no PRs found");
+					throw ghError({
+						message: "gh exit 1",
+						stderr: "no pull requests found",
+					});
 				}
 				return { stdout: "" };
 			});
@@ -416,7 +439,12 @@ describe("PrCommentService", () => {
 					return { stdout: "gh version 2.40.0\n" };
 				}
 				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
-				if (cmd === "gh" && args[0] === "pr") throw new Error("no PR");
+				if (cmd === "gh" && args[0] === "pr") {
+					throw ghError({
+						message: "gh exit 1",
+						stderr: "no pull requests found",
+					});
+				}
 				return { stdout: "" };
 			});
 
@@ -542,7 +570,10 @@ describe("PrCommentService", () => {
 					return { stdout: "Logged in\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr") {
-					throw new Error("no PRs found");
+					throw ghError({
+						message: "gh exit 1",
+						stderr: "no pull requests found",
+					});
 				}
 				return { stdout: "" };
 			});
@@ -596,7 +627,11 @@ describe("PrCommentService", () => {
 			});
 		});
 
-		it("posts noPr when gh pr view returns non-JSON output", async () => {
+		it("posts unavailable with lookup-error reason when gh pr view returns non-JSON output", async () => {
+			// I-1 contract change: pre-refactor, unparseable JSON was folded
+			// into noPr, which then showed a Create PR button — a token-lapse
+			// could trick users into creating duplicate PRs. Now the
+			// lookupError lane surfaces a Retry button with the real reason.
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "rev-list") {
 					return { stdout: "1\n" };
@@ -611,7 +646,6 @@ describe("PrCommentService", () => {
 					return { stdout: "Logged in\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr") {
-					// Return non-JSON string — triggers the catch in findPrForBranch (lines 129-130)
 					return { stdout: "not valid json at all" };
 				}
 				return { stdout: "" };
@@ -619,11 +653,16 @@ describe("PrCommentService", () => {
 
 			await handleCheckPrStatus(CWD, postMessage);
 
-			expect(postMessage).toHaveBeenCalledWith({
-				command: "prStatus",
-				status: "noPr",
-				branch: "feature/branch",
-			});
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "prStatus",
+					status: "unavailable",
+					reason: expect.stringContaining("Unparseable response from gh"),
+				}),
+			);
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ status: "noPr" }),
+			);
 		});
 
 		it("posts noPr when gh pr view returns valid JSON with number: 0 (falsy)", async () => {
@@ -765,20 +804,8 @@ describe("PrCommentService", () => {
 			});
 		}
 
-		/** Builds an Error with `code` and `stderr` attached, mimicking child_process execFile rejection shape. */
-		function ghError(opts: {
-			message: string;
-			code?: string | number;
-			stderr?: string;
-		}): Error {
-			const err = new Error(opts.message) as Error & {
-				code?: string | number;
-				stderr?: string;
-			};
-			if (opts.code !== undefined) err.code = opts.code;
-			if (opts.stderr !== undefined) err.stderr = opts.stderr;
-			return err;
-		}
+		// `ghError` is defined at module top — shared by tests inside and
+		// outside this describe to keep gh-mock shape consistent.
 
 		it("does not emit warn/debug on the happy path (baseline)", async () => {
 			setupHappyProbesWithPrHandler(() => ({
@@ -818,7 +845,12 @@ describe("PrCommentService", () => {
 			);
 		});
 
-		it("logs at warn when gh pr view fails with a non-expected stderr (e.g. auth/ratelimit)", async () => {
+		it("posts unavailable (NOT noPr) when gh pr view fails with a non-expected stderr (e.g. auth/ratelimit)", async () => {
+			// I-1 contract change: auth lapses, rate limits, and other gh
+			// non-zero exits that don't say "no pull requests found" used to
+			// be folded into noPr — leading the user to click Create PR and
+			// either fail or duplicate. Now they surface as `unavailable`
+			// with the real stderr in `reason`, and the UI shows Retry.
 			setupHappyProbesWithPrHandler(() => {
 				throw ghError({
 					message: "gh: exit 1",
@@ -837,7 +869,13 @@ describe("PrCommentService", () => {
 			);
 			expect(debug).not.toHaveBeenCalled();
 			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
+				expect.objectContaining({
+					status: "unavailable",
+					reason: expect.stringContaining("authentication required"),
+				}),
+			);
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ status: "noPr" }),
 			);
 		});
 
@@ -857,7 +895,9 @@ describe("PrCommentService", () => {
 			);
 		});
 
-		it("logs at warn with Raw length when gh pr view returns unparseable JSON", async () => {
+		it("logs at warn with Raw length AND posts unavailable when gh pr view returns unparseable JSON", async () => {
+			// I-1: unparseable JSON now goes through lookupError → unavailable
+			// instead of being folded into noPr.
 			setupHappyProbesWithPrHandler(() => ({
 				stdout: "not-json-{{{",
 			}));
@@ -868,9 +908,11 @@ describe("PrCommentService", () => {
 				expect.any(String),
 				expect.stringMatching(/unparseable JSON.*Raw length: \d+/s),
 			);
-			// UI folding unchanged
 			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
+				expect.objectContaining({
+					status: "unavailable",
+					reason: expect.stringContaining("Unparseable response from gh"),
+				}),
 			);
 		});
 
@@ -898,7 +940,10 @@ describe("PrCommentService", () => {
 					if (sepIdx >= 0) {
 						prListHeadArg = args[sepIdx + 1];
 					}
-					return { stdout: "" };
+					throw ghError({
+						message: "gh exit 1",
+						stderr: "no pull requests found",
+					});
 				}
 				return { stdout: "" };
 			});
@@ -939,7 +984,10 @@ describe("PrCommentService", () => {
 						prViewBranchArg = args[sepIdx + 1];
 					}
 					// gh returns "no PR" for the stale name.
-					return { stdout: "" };
+					throw ghError({
+						message: "gh exit 1",
+						stderr: "no pull requests found",
+					});
 				}
 				return { stdout: "" };
 			});
@@ -975,7 +1023,10 @@ describe("PrCommentService", () => {
 					if (sepIdx >= 0) {
 						prListHeadArg = args[sepIdx + 1];
 					}
-					return { stdout: "" };
+					throw ghError({
+						message: "gh exit 1",
+						stderr: "no pull requests found",
+					});
 				}
 				return { stdout: "" };
 			});
@@ -1291,6 +1342,46 @@ describe("PrCommentService", () => {
 			expect(call.body).not.toContain("old content");
 		});
 
+		it("shows error AND re-runs status flow when PR lookup fails (auth/ratelimit/JSON)", async () => {
+			// I-1: lookupError must not fold into noPr. The error toast tells
+			// the user the real reason; the status refresh repaints the
+			// section so the Edit PR button's "Loading..." state is reset
+			// (the section will now show `unavailable` + Retry).
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "feature/test-branch\n" };
+				}
+				if (cmd === "gh" && args[0] === "--version") {
+					return { stdout: "gh 2.40.0\n" };
+				}
+				if (cmd === "gh" && args[0] === "auth") {
+					return { stdout: "ok\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					throw ghError({
+						message: "gh exit 4",
+						code: 4,
+						stderr: "HTTP 401: Bad credentials",
+					});
+				}
+				return { stdout: "" };
+			});
+
+			await handlePrepareUpdatePr(MARKDOWN, CWD, postMessage);
+
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("HTTP 401"),
+			);
+			// Status repaint triggers — section will show unavailable + Retry.
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "prStatus",
+					status: "unavailable",
+					reason: expect.stringContaining("HTTP 401"),
+				}),
+			);
+		});
+
 		it("shows warning AND re-runs status flow when no PR is found (un-sticks the Edit PR button)", async () => {
 			// Regression: the webview's Edit PR button sets itself to
 			// "Loading..." + disabled on click. If `handlePrepareUpdatePr`
@@ -1309,9 +1400,14 @@ describe("PrCommentService", () => {
 					return { stdout: "ok\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					// Mimic gh's "no pull requests found" stderr branch by
-					// throwing — findPrForBranch sees result.ok=false.
-					throw new Error("no pull requests found");
+					// Mimic gh's real non-zero exit with the "no pull requests
+					// found" stderr line — findPrForBranch reads it via
+					// `(err as { stderr? }).stderr`, matches the regex,
+					// returns `{ kind: "noPr" }`.
+					throw ghError({
+						message: "gh exit 1",
+						stderr: "no pull requests found",
+					});
 				}
 				return { stdout: "" };
 			});
@@ -1514,7 +1610,10 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "branch\n" };
 				}
-				throw new Error("no PR");
+				throw ghError({
+					message: "gh exit 1",
+					stderr: "no pull requests found",
+				});
 			});
 
 			await handleUpdatePr("T", "B", CWD, postMessage);
@@ -1523,6 +1622,35 @@ describe("PrCommentService", () => {
 			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdateFailed" });
 			expect(showWarningMessage).toHaveBeenCalledWith(
 				"No pull request found for branch branch.",
+			);
+		});
+
+		it("shows error toast and posts prUpdateFailed when PR lookup fails (auth/network)", async () => {
+			// I-1: distinguished from noPr — the form is open and the user
+			// clicked Submit. We surface the real error reason so they know
+			// it's not a "PR was deleted" situation, and bail out so they can
+			// retry.
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "branch\n" };
+				}
+				throw ghError({
+					message: "gh exit 4",
+					code: 4,
+					stderr: "HTTP 401: Bad credentials",
+				});
+			});
+
+			await handleUpdatePr("T", "B", CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdating" });
+			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdateFailed" });
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("HTTP 401"),
+			);
+			// Must NOT show the misleading "No pull request found" message.
+			expect(showWarningMessage).not.toHaveBeenCalledWith(
+				expect.stringContaining("No pull request found"),
 			);
 		});
 
