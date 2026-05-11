@@ -86,6 +86,13 @@ if ! "$cygwin" && ! "$darwin" && ! "$nonstop" ; then
     esac
 fi
 
+# Validate Java 21+ is available (required by build.gradle.kts jvmTarget)
+JAVA_MAJOR=$("$JAVACMD" -version 2>&1 | head -1 | sed 's/.*"\([0-9]*\).*/\1/')
+if [ "$JAVA_MAJOR" -lt 21 ] 2>/dev/null; then
+    die "ERROR: This project requires Java 21 or above, but found Java $JAVA_MAJOR.
+Please install JDK 21+ and set JAVA_HOME accordingly."
+fi
+
 CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
 
 # Collect all arguments for the java command
