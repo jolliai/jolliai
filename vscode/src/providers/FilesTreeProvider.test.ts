@@ -704,6 +704,126 @@ describe("FilesTreeProvider.serialize", () => {
 		store.dispose();
 	});
 
+	it("serialize forwards the raw porcelain v1 columns (indexStatus / worktreeStatus)", async () => {
+		// Pinned regression: bridge.discardFiles dispatches on the porcelain
+		// v1 columns, NOT on the collapsed `statusCode` display letter. If
+		// these get dropped from SerializedTreeItem, the webview's
+		// branch:discardFile route silently sends a partial FileStatus to
+		// the host, and untracked / added / renamed files all land in the
+		// wrong git-command branch (observable as a stale activity-bar badge
+		// after clicking discard on an untracked file).
+		const bridge = makeBridge([
+			{
+				absolutePath: "/repo/untracked.ts",
+				relativePath: "untracked.ts",
+				statusCode: "?",
+				indexStatus: "?",
+				worktreeStatus: "?",
+				isSelected: false,
+			},
+			{
+				absolutePath: "/repo/staged-and-dirty.ts",
+				relativePath: "staged-and-dirty.ts",
+				statusCode: "M",
+				indexStatus: "M",
+				worktreeStatus: "M",
+				isSelected: false,
+			},
+		]);
+		const store = new FilesStore(bridge as never, "/repo", makeExcludeFilter());
+		const provider = new FilesTreeProvider(store);
+		await store.refresh();
+
+		const items = provider.serialize();
+
+		expect(items[0]).toMatchObject({
+			label: "untracked.ts",
+			gitStatus: "?",
+			indexStatus: "?",
+			worktreeStatus: "?",
+		});
+		expect(items[1]).toMatchObject({
+			label: "staged-and-dirty.ts",
+			gitStatus: "M",
+			indexStatus: "M",
+			worktreeStatus: "M",
+		});
+
+		provider.dispose();
+		store.dispose();
+	});
+
+	it("serialize includes originalPath only for renames", async () => {
+		// `bridge.discardFiles` restores both paths on rename rows, so the
+		// renamed-from path has to travel all the way through. Non-rename
+		// rows must NOT carry an empty originalPath that the host might
+		// later mistake for a real source path.
+		const bridge = makeBridge([
+			{
+				absolutePath: "/repo/new.ts",
+				relativePath: "new.ts",
+				statusCode: "R",
+				indexStatus: "R",
+				worktreeStatus: " ",
+				originalPath: "old.ts",
+				isSelected: false,
+			},
+			{
+				absolutePath: "/repo/plain.ts",
+				relativePath: "plain.ts",
+				statusCode: "M",
+				indexStatus: " ",
+				worktreeStatus: "M",
+				isSelected: false,
+			},
+		]);
+		const store = new FilesStore(bridge as never, "/repo", makeExcludeFilter());
+		const provider = new FilesTreeProvider(store);
+		await store.refresh();
+
+		const items = provider.serialize();
+
+		expect(items[0]).toMatchObject({
+			label: "new.ts",
+			originalPath: "old.ts",
+		});
+		expect(items[1]).not.toHaveProperty("originalPath");
+
+		provider.dispose();
+		store.dispose();
+	});
+
+	it("serialize falls back to undefined idHint when resourceUri is missing", async () => {
+		// Defensive guard inside serialize() — FileItem's constructor always
+		// sets resourceUri via Uri.file(absolutePath), so the `: undefined`
+		// branch only fires if a downstream mutator wipes resourceUri. Pin
+		// the fallback so a future refactor that drops resourceUri (e.g. a
+		// non-file change type with no path) doesn't silently produce
+		// items with a stringified `undefined.fsPath` as their id.
+		const bridge = makeBridge([makeFile("src/orphan.ts", false)]);
+		const store = new FilesStore(bridge as never, "/repo", makeExcludeFilter());
+		const provider = new FilesTreeProvider(store);
+		await store.refresh();
+
+		// Force the `typeof ... === "string"` check to fail.
+		const orig = provider.getChildren;
+		provider.getChildren = () => {
+			const items = orig.call(provider);
+			for (const it of items) {
+				(it as unknown as { resourceUri: undefined }).resourceUri = undefined;
+			}
+			return items;
+		};
+
+		const serialized = provider.serialize();
+		// fsPath was the id source; with resourceUri removed, treeItemToSerialized
+		// receives idHint=undefined and synthesizes the id from label instead.
+		expect(serialized[0].id).not.toContain("/repo/src/orphan.ts");
+
+		provider.dispose();
+		store.dispose();
+	});
+
 	it("dispose clears the debounce timer", () => {
 		vi.useFakeTimers();
 		const provider = createProvider(

@@ -40,6 +40,10 @@ const { mockShowOpenDialog } = vi.hoisted(() => ({
 	mockShowOpenDialog: vi.fn(),
 }));
 
+const { mockShowWarningMessage } = vi.hoisted(() => ({
+	mockShowWarningMessage: vi.fn(),
+}));
+
 const { mockExecuteCommand } = vi.hoisted(() => ({
 	mockExecuteCommand: vi.fn().mockResolvedValue(undefined),
 }));
@@ -48,6 +52,7 @@ vi.mock("vscode", () => ({
 	window: {
 		createWebviewPanel,
 		showOpenDialog: mockShowOpenDialog,
+		showWarningMessage: mockShowWarningMessage,
 	},
 	commands: {
 		executeCommand: mockExecuteCommand,
@@ -2112,6 +2117,65 @@ describe("SettingsWebviewPanel", () => {
 		});
 	});
 
+	describe("confirmDirtyMigrate message", () => {
+		it("shows a modal warning and posts proceed=true when the user picks Apply Changes & Migrate", async () => {
+			mockShowWarningMessage.mockResolvedValue("Apply Changes & Migrate");
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "confirmDirtyMigrate" });
+			await flushPromises();
+
+			expect(mockShowWarningMessage).toHaveBeenCalledWith(
+				"Folder Path has unsaved changes",
+				expect.objectContaining({ modal: true }),
+				"Apply Changes & Migrate",
+			);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "confirmDirtyMigrateResult",
+				proceed: true,
+			});
+		});
+
+		it("posts proceed=false when the user dismisses the modal", async () => {
+			mockShowWarningMessage.mockResolvedValue(undefined);
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "confirmDirtyMigrate" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "confirmDirtyMigrateResult",
+				proceed: false,
+			});
+		});
+
+		it("falls back to proceed=false when the modal call throws", async () => {
+			mockShowWarningMessage.mockRejectedValue(new Error("modal blew up"));
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "confirmDirtyMigrate" });
+			await flushPromises();
+
+			expect(logError).toHaveBeenCalledWith(
+				"SettingsPanel",
+				expect.stringContaining("modal blew up"),
+			);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "confirmDirtyMigrateResult",
+				proceed: false,
+			});
+		});
+	});
+
 	describe("signIn / signOut command errors", () => {
 		it("logs an error and posts a user-visible banner when jollimemory.signIn rejects", async () => {
 			mockExecuteCommand.mockImplementation(async (cmd: string) => {
@@ -2154,6 +2218,51 @@ describe("SettingsWebviewPanel", () => {
 			expect(postMessage).toHaveBeenCalledWith({
 				command: "settingsError",
 				message: expect.stringContaining("signout blew up"),
+			});
+		});
+
+		// Counterparts to the two tests above: same code path with a
+		// **non-Error** rejection. The handler uses
+		// `err instanceof Error ? err.message : String(err)` to coerce the
+		// banner text — earlier tests exercised only the Error arm. Without
+		// these, the String(err) fallback would silently regress to printing
+		// `[object Object]` for command rejections that don't subclass Error
+		// (third-party command implementations can reject with anything,
+		// including raw strings or response objects).
+
+		it("stringifies non-Error rejections from jollimemory.signIn into the banner", async () => {
+			mockExecuteCommand.mockImplementation(async (cmd: string) => {
+				if (cmd === "jollimemory.signIn") throw "raw-string-reject";
+				return undefined;
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+			dispatch({ command: "signIn" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "settingsError",
+				message: expect.stringContaining("raw-string-reject"),
+			});
+		});
+
+		it("stringifies non-Error rejections from jollimemory.signOut into the banner", async () => {
+			mockExecuteCommand.mockImplementation(async (cmd: string) => {
+				if (cmd === "jollimemory.signOut") throw "raw-signout-reject";
+				return undefined;
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+			dispatch({ command: "signOut" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "settingsError",
+				message: expect.stringContaining("raw-signout-reject"),
 			});
 		});
 	});

@@ -75,17 +75,18 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("'kb:foldersData'");
 	});
 
-	it("handles kb:foldersReset by clearing folderCache and refreshing the repo header", () => {
+	it("handles kb:foldersReset by clearing folderCache and re-arming the auto-expand latch", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("'kb:foldersReset'");
 		// Cache must be wiped (not just root) — rebuild may rename paths at any depth.
 		expect(js).toContain("delete folderCache[k]");
-		// Repo header label is replaced when the host signals a rename
-		// (e.g. Rebuild → -N suffix), so the new name shows up immediately.
-		expect(js).toContain("kbRepoFolder = msg.kbRepoFolder");
-		// The dead auto-expand-by-name latch is gone — the repo header is
-		// rendered as a tree node now, no auto-expand-on-arrival needed.
-		expect(js).not.toContain("kbRepoFolderExpanded");
+		// One-shot latch is reset so the post-migration current-repo node gets
+		// auto-expanded on the next kb:foldersData arrival.
+		expect(js).toContain("currentRepoAutoExpanded = false");
+		// No more kbRepoFolder plumbing — the per-repo (current) suffix carries
+		// the "which repo is yours" signal directly inside the tree, so there's
+		// nothing to thread through kb:foldersReset's payload.
+		expect(js).not.toContain("kbRepoFolder");
 	});
 
 	it("re-attaches cached subtrees onto root listings so manual refresh keeps folders expanded", () => {
@@ -95,6 +96,28 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain(
 			"if (tree.relPath === '') tree = reattachExpandedFromCache(tree)",
 		);
+	});
+
+	it("propagateUp defensively merges repo-level identity fields onto lazy-expand responses", () => {
+		// Regression guard: an expand-repo-root response from KbFoldersService
+		// historically lacked the parent-root identity fields (configured name,
+		// isRepoRoot, isCurrentRepo). propagateUp used a full object replace,
+		// which then nuked those fields off folderCache[''].children[idx] —
+		// the repo rendered as a nameless folder. The defensive merge below
+		// preserves them when the incoming node forgot them. Pinned as a
+		// safety net alongside the server-side fix in KbFoldersService.
+		const js = buildSidebarScript();
+		// The conditional that triggers the merge — must be present AND must
+		// gate on BOTH "old has isRepoRoot" AND "new doesn't" (so legitimate
+		// transitions like demoting a repo aren't blocked).
+		expect(js).toMatch(
+			/oldChild\s*&&\s*oldChild\.isRepoRoot\s*&&\s*!currentNode\.isRepoRoot/,
+		);
+		// All three identity fields are folded forward — name (display),
+		// isRepoRoot (icon + class), isCurrentRepo (highlight).
+		expect(js).toMatch(/name:\s*oldChild\.name/);
+		expect(js).toMatch(/isRepoRoot:\s*oldChild\.isRepoRoot/);
+		expect(js).toMatch(/isCurrentRepo:\s*oldChild\.isCurrentRepo/);
 	});
 
 	it("renders Settings, Sign-in/out, Disable, Refresh icons on the Status tab toolbar", () => {
@@ -312,18 +335,46 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).not.toContain("'kb-toggle-search'");
 	});
 
-	it("renders kbRepoFolder as a repo-root header above the folder tree", () => {
+	it("renders repos as top-level nodes (no Memory Bank header banner)", () => {
 		const js = buildSidebarScript();
-		// renderFolders() must build a tree-node with data-kind="repo-root"
-		// whose label comes from kbRepoFolder. This is the IntelliJ-parity
-		// header that shows the real repo name (origin URL basename), not
-		// the worktree directory name. Children render at depth 1 below it.
-		expect(js).toContain("'data-kind': 'repo-root'");
-		expect(js).toContain("kbRepoFolder || 'Memory Bank'");
-		expect(js).toContain("renderFolderChildren(root.children, 1)");
-		// Repo-root clicks must early-return so the header doesn't accidentally
-		// fire kb:openFile (it has no data-path).
-		expect(js).toContain("if (kind === 'repo-root') return");
+		// renderFolders() has no separate header — repos render directly at
+		// depth 0. The banner row would have re-emitted data-kind="repo-root";
+		// removing that surface is the observable contract here.
+		expect(js).not.toContain("'data-kind': 'repo-root'");
+		expect(js).toContain("renderFolderChildren(root.children, 0)");
+	});
+
+	it("auto-expands the current repo via kb:expandFolder on first delivery", () => {
+		const js = buildSidebarScript();
+		// One-shot helper that walks root.children, finds the
+		// isCurrentRepo+isRepoRoot entry, and fires kb:expandFolder against
+		// its repoDirName. Without it the user has to click the current repo
+		// after every reload — the IntelliJ Memory Bank tool window auto-
+		// expands the current repo and this matches that UX.
+		expect(js).toContain("maybeAutoExpandCurrentRepo");
+		expect(js).toContain("currentRepoAutoExpanded");
+		expect(js).toMatch(/isCurrentRepo && c\.isRepoRoot/);
+	});
+
+	it("re-arms the auto-expand guard on kb:foldersReset", () => {
+		const js = buildSidebarScript();
+		// Migrate to Memory Bank emits kb:foldersReset and may rename the
+		// current repo's folder. The next kb:foldersData must auto-expand
+		// the (potentially renamed) current repo, so the one-shot has to
+		// reset alongside the cache wipe.
+		expect(js).toMatch(/kb:foldersReset[\s\S]*currentRepoAutoExpanded = false/);
+	});
+
+	it("treats data-kind=repo clicks as expand/collapse (not openFile)", () => {
+		const js = buildSidebarScript();
+		// Repo nodes are directories on disk; the previous handler fell
+		// through to kb:openFile because data-kind was 'repo' (not 'dir'),
+		// and the host's openTextDocument failed with "is a directory" —
+		// see the screenshot in this task's review. Repos must share the
+		// dir branch's toggle logic.
+		expect(js).toMatch(/kind === 'dir' \|\| kind === 'repo'/);
+		// And the dead 'repo-root' early-return is gone with the banner.
+		expect(js).not.toContain("if (kind === 'repo-root') return");
 	});
 
 	it("uses a codicon for the refresh button (matches VSCode toolbar style)", () => {
@@ -552,6 +603,30 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).not.toMatch(
 				/command:\s*['"]jollimemory\.discardFileChanges['"]/,
 			);
+		});
+
+		it("inline-discard and context-menu discard both carry indexStatus + worktreeStatus + originalPath", () => {
+			// Regression: bridge.discardFiles dispatches on the raw porcelain v1
+			// columns (worktree-only restore vs staged-worktree restore vs unlink
+			// for untracked / rename pair). Routing only the collapsed
+			// statusCode used to land every file in the
+			// `git restore --staged --worktree` branch and silently fail for
+			// untracked files — the activity-bar badge stayed at the pre-discard
+			// count even though the user had clicked discard.
+			//
+			// File rows must expose the porcelain columns as data-* attrs,
+			// and BOTH discard senders (inline button + context menu) must read
+			// them off the row when posting branch:discardFile.
+			const js = buildSidebarScript();
+			expect(js).toContain("'data-index-status'");
+			expect(js).toContain("'data-worktree-status'");
+			expect(js).toContain("'data-original-path'");
+			expect(js).toContain("data-index-status");
+			expect(js).toContain("data-worktree-status");
+			expect(js).toContain("data-original-path");
+			// Two readers (inline button + context menu) — count both.
+			const indexAttrReads = js.match(/data-index-status'/g)?.length ?? 0;
+			expect(indexAttrReads).toBeGreaterThanOrEqual(3); // 1 setter + 2 readers
 		});
 
 		it("renders dirname-only description (not the full path)", () => {

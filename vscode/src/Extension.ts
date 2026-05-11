@@ -13,7 +13,7 @@ import * as vscode from "vscode";
 import {
 	extractRepoName,
 	getRemoteUrl,
-	resolveKBPath,
+	resolveKbParent,
 } from "../../cli/src/core/KBPathResolver.js";
 import {
 	acquireLock,
@@ -529,35 +529,37 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	// ── Sidebar webview (3-tab) ──────────────────────────────────────────────
 	// Provides directory listing for the Folders tab in the sidebar webview.
-	// kbRoot resolution mirrors HEAD's KBPathResolver flow so the sidebar reads
-	// from the same on-disk location that auto-migration / FolderStorage write
-	// to (~/Documents/jolli/<repoName>/), not the legacy hardcoded path used in
-	// the original 828991c4 commit.
+	// The tree is rooted at the user's Memory Bank parent (`localFolder`) and
+	// each direct child is a discovered repo — opening one project doesn't
+	// hide memories from other projects, matching IntelliJ's Memory Bank tool
+	// window. Identity of the current project (repo name + origin URL) is
+	// passed through to KbFoldersService so it can mark the user's "home"
+	// repo for the sidebar's auto-expand / highlight behavior.
 	/* v8 ignore start -- cherry-picked sidebar wiring; covered indirectly via SidebarWebviewProvider tests; follow-up adds activate-level tests. */
 	const sidebarRepoName = extractRepoName(workspaceRoot);
 	const sidebarRemoteUrl = getRemoteUrl(workspaceRoot);
 	// Initial resolution skips customKBPath because loadConfig() is async.
 	// The async branch below re-resolves once config is loaded, and the
 	// settings-save callback re-resolves whenever the user picks a new folder.
-	let sidebarKbRoot = resolveKBPath(sidebarRepoName, sidebarRemoteUrl);
-	const kbFoldersService = new KbFoldersService(() => sidebarKbRoot);
+	let sidebarKbParent = resolveKbParent();
+	const kbFoldersService = new KbFoldersService(() => ({
+		kbParent: sidebarKbParent,
+		currentRepoName: sidebarRepoName,
+		currentRemoteUrl: sidebarRemoteUrl,
+	}));
 
-	// Re-resolves sidebarKbRoot from the latest config and (if the path has
+	// Re-resolves sidebarKbParent from the latest config and (if the path has
 	// changed) tells the sidebar webview to drop its cached folder tree so the
-	// next listing starts from the new root. Returns true when the root moved.
+	// next listing starts from the new parent. Returns true when the parent moved.
 	async function refreshSidebarKbRoot(): Promise<boolean> {
 		try {
 			const cfg = await loadConfig();
 			const customKBPath = (cfg as Record<string, unknown>).localFolder as
 				| string
 				| undefined;
-			const next = resolveKBPath(
-				sidebarRepoName,
-				sidebarRemoteUrl,
-				customKBPath,
-			);
-			if (next !== sidebarKbRoot) {
-				sidebarKbRoot = next;
+			const next = resolveKbParent(customKBPath);
+			if (next !== sidebarKbParent) {
+				sidebarKbParent = next;
 				return true;
 			}
 		} catch (err) {
@@ -566,12 +568,10 @@ export function activate(context: vscode.ExtensionContext): void {
 		return false;
 	}
 
-	// Display name for the repo-root header in the sidebar's KB tree (mirrors
-	// IntelliJ's KBExplorerPanel repo node). Identical to `sidebarRepoName`
-	// because cli's `extractRepoName` is the single source of truth for both
-	// the on-disk path and the UI label — opening a worktree shows e.g.
-	// "jolliai" (origin URL basename) instead of the worktree directory name.
-	const kbRepoFolder = sidebarRepoName;
+	// The Memory Bank header is the fixed root of the KB tree — individual
+	// repos surface as its children, mirroring IntelliJ's "KB > <repo> > ..."
+	// layout. The webview renders "Memory Bank" when no override is passed,
+	// so no per-repo string is needed here.
 
 	let currentBranchName = "";
 	let currentBranchDetached = false;
@@ -637,7 +637,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			kbMode: "folders",
 			branchName: currentBranchName,
 			detached: currentBranchDetached,
-			kbRepoFolder,
 		}),
 		extensionUri: context.extensionUri,
 		statusProvider: {
@@ -668,7 +667,10 @@ export function activate(context: vscode.ExtensionContext): void {
 			getMode: historyProvider.getMode.bind(historyProvider),
 		},
 		kbFolders: kbFoldersService,
-		resolveKbAbs: (relPath) => join(sidebarKbRoot, relPath),
+		// relPath's first segment is now a repo directory name under
+		// <kbParent>; join'ing on kbParent gives back the absolute on-disk
+		// path. Same shape as the IntelliJ Memory Bank tree.
+		resolveKbAbs: (relPath) => join(sidebarKbParent, relPath),
 		// MemoriesStore was previously loaded via memoriesView.onDidChangeVisibility;
 		// the webview replacement has no equivalent built-in event, so we plumb it
 		// through SidebarWebviewProvider's `case "ready"` instead.
@@ -1142,8 +1144,23 @@ export function activate(context: vscode.ExtensionContext): void {
 						}
 					}
 
-					const moved = await refreshSidebarKbRoot();
-					if (moved) sidebarProvider.refreshKnowledgeBaseFolders(kbRepoFolder);
+					// Rebuild's new folder lives under the SAME Memory Bank parent
+					// as the previous one (e.g. <localFolder>/<repo>-2/), so
+					// refreshSidebarKbRoot would return moved=false and the KB tree
+					// would still point at the archived directory until a window
+					// reload. The per-repo kbRoot changed, even though the parent
+					// did not — refresh + cache-invalidate unconditionally after a
+					// successful rebuild so the tree picks up the new folder and
+					// the multi-repo Memories aggregate drops entries discovered
+					// against the now-archived identity.
+					await refreshSidebarKbRoot();
+					sidebarProvider.refreshKnowledgeBaseFolders();
+					bridge.invalidateEntriesCache();
+					if (memoriesStore.hasFirstLoaded()) {
+						memoriesStore
+							.refresh()
+							.catch(handleError("rebuildKnowledgeBase.memories"));
+					}
 
 					if (result.status === "completed") {
 						return {
@@ -1393,6 +1410,34 @@ export function activate(context: vscode.ExtensionContext): void {
 			"jollimemory.discardFileChanges",
 			async (item: FileItem) => {
 				if (!item?.fileStatus) {
+					return;
+				}
+				// Defense in depth: `bridge.discardFiles` dispatches on indexStatus +
+				// worktreeStatus. A pre-fix bug routed `branch:discardFile` through
+				// here with those columns dropped, causing every file to land in the
+				// `git restore --staged --worktree` branch and silently failing for
+				// untracked files (pathspec unknown to git) — observable as a stale
+				// activity-bar badge. Surface the malformed shape immediately so any
+				// future caller that strips the porcelain columns is loud-failed at
+				// the boundary, not silently miscategorised inside the bridge.
+				//
+				// Porcelain v1 columns are always exactly one character (' ' or one
+				// of the M/A/D/R/C/?/! status letters); checking length === 1 catches
+				// both `undefined` and the empty-string fallback DOM readers fall
+				// through to when an attribute is missing.
+				if (
+					typeof item.fileStatus.indexStatus !== "string" ||
+					item.fileStatus.indexStatus.length !== 1 ||
+					typeof item.fileStatus.worktreeStatus !== "string" ||
+					item.fileStatus.worktreeStatus.length !== 1
+				) {
+					log.error(
+						"cmd",
+						`discardFileChanges rejected: fileStatus missing indexStatus / worktreeStatus for ${item.fileStatus.relativePath}`,
+					);
+					vscode.window.showErrorMessage(
+						`Jolli Memory: Cannot discard "${item.fileStatus.relativePath}" — internal error (missing git status columns). Please report this.`,
+					);
 					return;
 				}
 				const { relativePath, statusCode } = item.fileStatus;
@@ -1753,7 +1798,19 @@ export function activate(context: vscode.ExtensionContext): void {
 			async (item: MemoryItem | string) => {
 				const hash = typeof item === "string" ? item : item.entry.commitHash;
 				const shortHash = hash.substring(0, 7);
-				const summary = await bridge.getSummary(hash);
+				// Timeline view aggregates memories across every repo under the
+				// Memory Bank parent (see JolliMemoryBridge.listSummaryEntries),
+				// so a clicked row may belong to a non-current repo whose
+				// summary lives in that repo's FolderStorage rather than the
+				// current workspace's primary storage. getSummaryAnyRepoWith-
+				// Source walks the same discovery list as the Timeline's data
+				// fetch AND tells us which repo the summary came from — the
+				// panel needs the provenance so it can disable destructive
+				// actions (push/edit) when the summary is from a foreign repo,
+				// since those handlers all write to `workspaceRoot`'s git/
+				// orphan branch and would silently corrupt the wrong project.
+				const { summary, sourceRepoName } =
+					await bridge.getSummaryAnyRepoWithSource(hash);
 				if (!summary) {
 					vscode.window.showInformationMessage(
 						`Jolli Memory: No summary found for commit ${shortHash}.`,
@@ -1767,6 +1824,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					bridge,
 					commitsStore.getMainBranch(),
 					"memory",
+					sourceRepoName,
 				);
 			},
 		),
@@ -1791,7 +1849,13 @@ export function activate(context: vscode.ExtensionContext): void {
 				}
 				const meta = parseSummaryFrontmatter(absPath);
 				if (meta) {
-					const summary = await bridge.getSummary(meta.commitHash);
+					// Memory Bank folder view shows every repo under the parent
+					// (`localFolder`), so a clicked summary .md may belong to a
+					// non-current repo. Use the cross-repo lookup so the rich
+					// SummaryWebviewPanel renders for foreign-repo memories too;
+					// otherwise we'd silently fall through to plain markdown
+					// preview, losing the push / copy-as-recall affordances.
+					const summary = await bridge.getSummaryAnyRepo(meta.commitHash);
 					if (summary) {
 						await SummaryWebviewPanel.show(
 							summary,
@@ -1835,6 +1899,12 @@ export function activate(context: vscode.ExtensionContext): void {
 		// ── Memories panel commands ──────────────────────────────────────────
 
 		vscode.commands.registerCommand("jollimemory.refreshMemories", () => {
+			// Explicit user-initiated refresh: drop the aggregated cross-repo
+			// cache so a fresh discovery pass runs. Without this, writes made by
+			// other IDE windows to neighbour repos under the same Memory Bank
+			// parent (which don't move this workspace's orphan ref and don't
+			// touch its lock file) only show up after a window reload.
+			bridge.invalidateEntriesCache();
 			memoriesStore.refresh().catch(handleError("refreshMemories"));
 		}),
 
@@ -1855,11 +1925,15 @@ export function activate(context: vscode.ExtensionContext): void {
 		}),
 
 		// Copy recall prompt to clipboard — accepts MemoryItem or plain hash string.
+		// MemoryItem rows can come from any discovered repo (Memories tab is
+		// cross-repo aggregated), so the detail-fetch walks the same discovery
+		// list as listSummaryEntries — same reason viewMemorySummary above
+		// uses getSummaryAnyRepo.
 		vscode.commands.registerCommand(
 			"jollimemory.copyRecallPrompt",
 			async (item: MemoryItem | string) => {
 				const hash = typeof item === "string" ? item : item.entry.commitHash;
-				const summary = await bridge.getSummary(hash);
+				const summary = await bridge.getSummaryAnyRepo(hash);
 				if (!summary) {
 					vscode.window.showWarningMessage("No summary found for this commit.");
 					return;
@@ -1872,12 +1946,14 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
-		// Open in Claude Code via URI scheme
+		// Open in Claude Code via URI scheme. Same cross-repo reasoning as
+		// copyRecallPrompt above — MemoryItem rows may belong to a non-current
+		// repo discovered under the Memory Bank parent.
 		vscode.commands.registerCommand(
 			"jollimemory.openInClaudeCode",
 			async (item: MemoryItem | string) => {
 				const hash = typeof item === "string" ? item : item.entry.commitHash;
-				const summary = await bridge.getSummary(hash);
+				const summary = await bridge.getSummaryAnyRepo(hash);
 				if (!summary) {
 					vscode.window.showWarningMessage("No summary found for this commit.");
 					return;
@@ -2052,16 +2128,22 @@ export function activate(context: vscode.ExtensionContext): void {
 					return;
 				}
 
-				// Full 40-char SHA required — `bridge.getSummary` falls through to
-				// alias / tree-hash resolution for abbreviated input, which silently
-				// resolves the wrong commit when two distinct commits share the same
-				// tree (cherry-pick, identical re-commit, rebase). Same hardening as
-				// `search --hashes` in cli/src/commands/SearchCommand.ts.
+				// Full 40-char SHA required — `bridge.getSummary` / `getSummaryAnyRepo`
+				// fall through to alias / tree-hash resolution for abbreviated input,
+				// which silently resolves the wrong commit when two distinct commits
+				// share the same tree (cherry-pick, identical re-commit, rebase). Same
+				// hardening as `search --hashes` in cli/src/commands/SearchCommand.ts.
+				//
+				// Cross-repo: external deep links into vscode://…/summary/<sha> may
+				// target a memory whose summary lives in a non-current repo under
+				// the Memory Bank parent (e.g. a Slack link pasted while a different
+				// workspace is open). Use getSummaryAnyRepo so the deep link resolves
+				// against the same aggregated view the Memories tab presents.
 				const summaryMatch = uri.path.match(/^\/summary\/([0-9a-f]{40})$/);
 				if (summaryMatch) {
 					const hash = summaryMatch[1];
 					const shortHash = hash.substring(0, 7);
-					const summary = await bridge.getSummary(hash);
+					const summary = await bridge.getSummaryAnyRepo(hash);
 					if (!summary) {
 						vscode.window.showInformationMessage(
 							`Jolli Memory: No summary found for commit ${shortHash}.`,

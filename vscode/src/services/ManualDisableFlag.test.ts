@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -51,5 +51,16 @@ describe("ManualDisableFlag", () => {
 	it("write(false) is a no-op when the marker is already absent", async () => {
 		await expect(writeManualDisableFlag(cwd, false)).resolves.toBeUndefined();
 		expect(await readManualDisableFlag(cwd)).toBe(false);
+	});
+
+	it("write(false) rethrows non-ENOENT unlink errors instead of silently swallowing them", async () => {
+		// Pin the contract: ENOENT (already-gone) is the only error that
+		// write(false) is allowed to absorb — any other IO failure must
+		// propagate so the caller knows the opt-out didn't actually clear.
+		// Putting a directory at the marker path makes unlink throw
+		// EISDIR (Linux) / EPERM (macOS), both of which are non-ENOENT.
+		const markerPath = join(cwd, ".jolli", "jollimemory", "disabled-by-user");
+		await mkdir(markerPath, { recursive: true });
+		await expect(writeManualDisableFlag(cwd, false)).rejects.toThrow();
 	});
 });

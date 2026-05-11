@@ -102,8 +102,17 @@ const { homedir } = vi.hoisted(() => ({
 	homedir: vi.fn(() => "/home/user"),
 }));
 
-const { existsSync } = vi.hoisted(() => ({
+const { existsSync, readFileSync } = vi.hoisted(() => ({
 	existsSync: vi.fn(() => true),
+	// Default: throw ENOENT for every read so parseSummaryFrontmatter's
+	// readFileSync catch fires and returns null — matches the existing
+	// openMemoryFile tests that pass non-existent paths. Individual tests
+	// inside the parseSummaryFrontmatter describe block override per-call.
+	readFileSync: vi.fn(() => {
+		const err = new Error("ENOENT") as Error & { code: string };
+		err.code = "ENOENT";
+		throw err;
+	}),
 }));
 
 const { buildClaudeCodeContext } = vi.hoisted(() => ({
@@ -218,6 +227,18 @@ const {
 		disable: vi.fn().mockResolvedValue({ success: true }),
 		getStatus: vi.fn().mockResolvedValue({ enabled: true }),
 		getSummary: vi.fn().mockResolvedValue(null),
+		// Cross-repo Timeline / Memory Bank lookup. Defaults to null so
+		// existing tests that never assigned a return keep their "summary
+		// missing" semantics; tests that exercise the rich panel set this
+		// alongside (or instead of) getSummary depending on the call site.
+		getSummaryAnyRepo: vi.fn().mockResolvedValue(null),
+		// Provenance variant — viewMemorySummary uses this so the panel
+		// can disable destructive actions for foreign-origin summaries.
+		// Default sourceRepoName=null preserves the legacy "local panel"
+		// semantics for tests that don't care about provenance.
+		getSummaryAnyRepoWithSource: vi
+			.fn()
+			.mockResolvedValue({ summary: null, sourceRepoName: null }),
 		listPlans: vi.fn().mockResolvedValue([]),
 		removePlan: vi.fn().mockResolvedValue(undefined),
 		listNotes: vi.fn().mockResolvedValue([]),
@@ -530,6 +551,7 @@ vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
 	extractRepoName: vi.fn(() => "test-repo"),
 	getRemoteUrl: vi.fn(() => null),
 	resolveKBPath: vi.fn(() => "/test/kb"),
+	resolveKbParent: vi.fn(() => "/test/kb-parent"),
 	findFreshKBPath: vi.fn(() => "/test/kb-2"),
 	initializeKBFolder: vi.fn(),
 }));
@@ -821,6 +843,7 @@ vi.mock("node:os", () => ({
 
 vi.mock("node:fs", () => ({
 	existsSync,
+	readFileSync,
 }));
 
 // ─── Import under test ─────────────────────────────────────────────────────
@@ -1550,14 +1573,28 @@ describe("Extension", () => {
 		});
 
 		describe("viewMemorySummary (memory panel)", () => {
-			it("opens the webview panel in the memory slot for a MemoryItem", async () => {
+			// Note: viewMemorySummary now uses getSummaryAnyRepoWithSource (NOT
+			// getSummary) because Timeline view aggregates memories across all
+			// repos under the Memory Bank parent. Pinning the call to the
+			// provenance variant so a future refactor that reverts to single-
+			// repo getSummary doesn't silently regress non-current-repo
+			// Timeline clicks back to the "No summary found" toast bug. The
+			// `sourceRepoName` field is plumbed through to SummaryWebviewPanel
+			// so destructive actions can be disabled for foreign-origin
+			// summaries.
+			it("opens the webview panel in the memory slot for a local MemoryItem", async () => {
 				const summary = { hash: "def456", content: "memory summary" };
-				mockBridge.getSummary.mockResolvedValue(summary);
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
+					summary,
+					sourceRepoName: null,
+				});
 
 				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
 				await handler({ entry: { commitHash: "def4567890abc" } });
 
-				expect(mockBridge.getSummary).toHaveBeenCalledWith("def4567890abc");
+				expect(mockBridge.getSummaryAnyRepoWithSource).toHaveBeenCalledWith(
+					"def4567890abc",
+				);
 				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
 					summary,
 					expect.anything(),
@@ -1565,17 +1602,23 @@ describe("Extension", () => {
 					mockBridge,
 					expect.any(String),
 					"memory",
+					null,
 				);
 			});
 
 			it("accepts a plain hash string from a tooltip command link", async () => {
 				const summary = { hash: "ghi789", content: "memory summary" };
-				mockBridge.getSummary.mockResolvedValue(summary);
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
+					summary,
+					sourceRepoName: null,
+				});
 
 				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
 				await handler("ghi7890123456");
 
-				expect(mockBridge.getSummary).toHaveBeenCalledWith("ghi7890123456");
+				expect(mockBridge.getSummaryAnyRepoWithSource).toHaveBeenCalledWith(
+					"ghi7890123456",
+				);
 				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
 					summary,
 					expect.anything(),
@@ -1583,11 +1626,43 @@ describe("Extension", () => {
 					mockBridge,
 					expect.any(String),
 					"memory",
+					null,
 				);
 			});
 
-			it("shows info message when no summary is found", async () => {
-				mockBridge.getSummary.mockResolvedValue(null);
+			it("passes sourceRepoName through to the panel for foreign-origin memories", async () => {
+				// The whole point of the provenance plumbing: when a Memory
+				// Bank cross-repo lookup found the summary in `other-repo`,
+				// the panel must learn about it so destructive commands are
+				// disabled. Pinning the contract end-to-end (handler →
+				// bridge.getSummaryAnyRepoWithSource → panel.show) so any
+				// regression in the wiring fails this test instead of
+				// shipping silently and corrupting the wrong workspace.
+				const summary = { hash: "xyz999", content: "foreign memory" };
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
+					summary,
+					sourceRepoName: "other-repo",
+				});
+
+				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
+				await handler({ entry: { commitHash: "xyz9999999999" } });
+
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					summary,
+					expect.anything(),
+					"/test/workspace",
+					mockBridge,
+					expect.any(String),
+					"memory",
+					"other-repo",
+				);
+			});
+
+			it("shows info message when no summary is found in any discovered repo", async () => {
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
+					summary: null,
+					sourceRepoName: null,
+				});
 
 				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
 				await handler({ entry: { commitHash: "def4567890abc" } });
@@ -2197,14 +2272,22 @@ describe("Extension", () => {
 		// ── copyRecallPrompt command ────────────────────────────────────────
 
 		describe("copyRecallPrompt", () => {
+			// Pinned to getSummaryAnyRepo: MemoryItem rows can come from any
+			// discovered repo under the Memory Bank parent (Memories tab is
+			// cross-repo aggregated via listSummaryEntries), so a click on a
+			// non-current-repo row must walk the same discovery list. Reverting
+			// to getSummary would silently regress those rows to "No summary
+			// found", the same bug pattern caught for viewMemorySummary.
 			it("copies recall prompt to clipboard when summary exists (MemoryItem)", async () => {
 				const summary = { hash: "abc123", content: "summary text" };
-				mockBridge.getSummary.mockResolvedValue(summary);
+				mockBridge.getSummaryAnyRepo.mockResolvedValue(summary);
 
 				const handler = getRegisteredCommand("jollimemory.copyRecallPrompt");
 				await handler({ entry: { commitHash: "abc1234567890" } });
 
-				expect(mockBridge.getSummary).toHaveBeenCalledWith("abc1234567890");
+				expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+					"abc1234567890",
+				);
 				expect(buildClaudeCodeContext).toHaveBeenCalledWith(summary);
 				expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith(
 					"mock recall context",
@@ -2216,12 +2299,14 @@ describe("Extension", () => {
 
 			it("copies recall prompt to clipboard when given a plain hash string", async () => {
 				const summary = { hash: "def456", content: "other summary" };
-				mockBridge.getSummary.mockResolvedValue(summary);
+				mockBridge.getSummaryAnyRepo.mockResolvedValue(summary);
 
 				const handler = getRegisteredCommand("jollimemory.copyRecallPrompt");
 				await handler("def4567890abc");
 
-				expect(mockBridge.getSummary).toHaveBeenCalledWith("def4567890abc");
+				expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+					"def4567890abc",
+				);
 				expect(buildClaudeCodeContext).toHaveBeenCalledWith(summary);
 				expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith(
 					"mock recall context",
@@ -2229,7 +2314,7 @@ describe("Extension", () => {
 			});
 
 			it("shows warning when summary is not found", async () => {
-				mockBridge.getSummary.mockResolvedValue(null);
+				mockBridge.getSummaryAnyRepo.mockResolvedValue(null);
 
 				const handler = getRegisteredCommand("jollimemory.copyRecallPrompt");
 				await handler({ entry: { commitHash: "missing123" } });
@@ -2244,31 +2329,38 @@ describe("Extension", () => {
 		// ── openInClaudeCode command ────────────────────────────────────────
 
 		describe("openInClaudeCode", () => {
+			// Same cross-repo reasoning as copyRecallPrompt above — pinned to
+			// getSummaryAnyRepo so non-current-repo MemoryItem clicks don't
+			// silently regress to "No summary found".
 			it("opens external URI when summary exists (MemoryItem)", async () => {
 				const summary = { hash: "abc123", content: "summary text" };
-				mockBridge.getSummary.mockResolvedValue(summary);
+				mockBridge.getSummaryAnyRepo.mockResolvedValue(summary);
 
 				const handler = getRegisteredCommand("jollimemory.openInClaudeCode");
 				await handler({ entry: { commitHash: "abc1234567890" } });
 
-				expect(mockBridge.getSummary).toHaveBeenCalledWith("abc1234567890");
+				expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+					"abc1234567890",
+				);
 				expect(buildClaudeCodeContext).toHaveBeenCalledWith(summary);
 				expect(openExternal).toHaveBeenCalled();
 			});
 
 			it("accepts a plain hash string for openInClaudeCode", async () => {
 				const summary = { hash: "def789", content: "text" };
-				mockBridge.getSummary.mockResolvedValue(summary);
+				mockBridge.getSummaryAnyRepo.mockResolvedValue(summary);
 
 				const handler = getRegisteredCommand("jollimemory.openInClaudeCode");
 				await handler("def7891234567890");
 
-				expect(mockBridge.getSummary).toHaveBeenCalledWith("def7891234567890");
+				expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+					"def7891234567890",
+				);
 				expect(openExternal).toHaveBeenCalled();
 			});
 
 			it("shows warning when summary is not found", async () => {
-				mockBridge.getSummary.mockResolvedValue(null);
+				mockBridge.getSummaryAnyRepo.mockResolvedValue(null);
 
 				const handler = getRegisteredCommand("jollimemory.openInClaudeCode");
 				await handler({ entry: { commitHash: "missing456" } });
@@ -2376,6 +2468,163 @@ describe("Extension", () => {
 					"vscode.open",
 					expect.anything(),
 				);
+			});
+
+			// ── parseSummaryFrontmatter coverage via openMemoryFile ───────────
+			// parseSummaryFrontmatter is an internal helper invoked from
+			// openMemoryFile for every clicked .md. The earlier tests above
+			// pass non-existent paths so readFileSync (mocked to throw ENOENT
+			// by default) trips the catch and the function returns null on
+			// path-1 (markdown preview fallthrough). The block below stubs
+			// readFileSync per-test to drive the remaining parser branches:
+			//   - valid `type: commit` summary → rich SummaryWebviewPanel
+			//   - opening `---` but no closing → null → fallthrough
+			//   - missing leading `---\n` → null → fallthrough
+			//   - line without `:` → continue (silently skipped)
+			//   - `type: plan` (non-commit) → null → fallthrough
+			//   - `type: commit` without commitHash → null → fallthrough
+			//   - cross-repo bridge miss → fallthrough (not a hard error)
+			describe("parseSummaryFrontmatter (via openMemoryFile)", () => {
+				afterEach(() => {
+					readFileSync.mockReset();
+					// Restore the default ENOENT throw so unrelated tests in
+					// later blocks (e.g. openMemoryFile's existing trio above
+					// — wait, those run earlier in source order, but vitest's
+					// shared mock state still benefits from a clean baseline).
+					readFileSync.mockImplementation(() => {
+						const err = new Error("ENOENT") as Error & { code: string };
+						err.code = "ENOENT";
+						throw err;
+					});
+				});
+
+				it("opens the rich SummaryWebviewPanel for a valid type:commit summary frontmatter", async () => {
+					readFileSync.mockReturnValueOnce(
+						`---\ntype: commit\ncommitHash: abc123def456789\nignored\nbranch: main\n---\n# Body\n`,
+					);
+					const summary = { commitHash: "abc123def456789", topics: [] };
+					mockBridge.getSummaryAnyRepo.mockResolvedValueOnce(summary);
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/summary.md");
+
+					expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+						"abc123def456789",
+					);
+					expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+						summary,
+						expect.anything(),
+						"/test/workspace",
+						mockBridge,
+						expect.any(String),
+						"kb",
+					);
+					expect(executeCommand).not.toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+				});
+
+				it("falls through to markdown preview when frontmatter has opening --- but no closing fence", async () => {
+					readFileSync.mockReturnValueOnce(
+						`---\ntype: commit\ncommitHash: deadbeef\n`,
+					);
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/unclosed.md");
+
+					expect(mockBridge.getSummaryAnyRepo).not.toHaveBeenCalled();
+					expect(executeCommand).toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+				});
+
+				it("falls through to markdown preview when the file lacks the leading --- fence", async () => {
+					readFileSync.mockReturnValueOnce(`# Just a heading\nbody text\n`);
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/no-fm.md");
+
+					expect(mockBridge.getSummaryAnyRepo).not.toHaveBeenCalled();
+					expect(executeCommand).toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+				});
+
+				it("silently skips frontmatter lines that don't contain ':' (no parse error)", async () => {
+					// A colonless line must be tolerated — early YAML writers
+					// sometimes left dangling blank-ish lines in the block.
+					readFileSync.mockReturnValueOnce(
+						`---\ntype: commit\nbogus-line-without-colon\ncommitHash: 1234567890abcdef\n---\n`,
+					);
+					mockBridge.getSummaryAnyRepo.mockResolvedValueOnce({
+						commitHash: "1234567890abcdef",
+						topics: [],
+					});
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/stray.md");
+
+					// Parser ignored the colonless line and still found commitHash.
+					expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+						"1234567890abcdef",
+					);
+				});
+
+				it("falls through to markdown preview when type is not 'commit' (plan / note copies)", async () => {
+					readFileSync.mockReturnValueOnce(
+						`---\ntype: plan\ncommitHash: 1234567890abcdef\n---\nplan body\n`,
+					);
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/plan.md");
+
+					expect(mockBridge.getSummaryAnyRepo).not.toHaveBeenCalled();
+					expect(executeCommand).toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+				});
+
+				it("falls through to markdown preview when commitHash is missing under type:commit", async () => {
+					readFileSync.mockReturnValueOnce(
+						`---\ntype: commit\nbranch: main\n---\nbody\n`,
+					);
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/no-hash.md");
+
+					expect(mockBridge.getSummaryAnyRepo).not.toHaveBeenCalled();
+					expect(executeCommand).toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+				});
+
+				it("falls through to markdown preview when bridge returns null for the embedded hash", async () => {
+					// Frontmatter parsed fine, but the cross-repo lookup couldn't
+					// find the JSON summary (file deleted, repo wiped, etc.) —
+					// the user still sees their content via plain preview rather
+					// than a hard error toast.
+					readFileSync.mockReturnValueOnce(
+						`---\ntype: commit\ncommitHash: ffffffff00000000\n---\n`,
+					);
+					mockBridge.getSummaryAnyRepo.mockResolvedValueOnce(null);
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/orphan.md");
+
+					expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+						"ffffffff00000000",
+					);
+					expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
+					expect(executeCommand).toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+				});
 			});
 		});
 	});
@@ -3435,6 +3684,63 @@ describe("Extension", () => {
 			expect(showWarningMessage).not.toHaveBeenCalled();
 			expect(mockBridge.discardFiles).not.toHaveBeenCalled();
 		});
+
+		it("rejects malformed fileStatus where indexStatus / worktreeStatus are empty strings", async () => {
+			// DOM readers fall through to '' when an attribute is missing.
+			// Porcelain v1 columns are always exactly one character — the
+			// length===1 check rejects both undefined and '' so a future
+			// webview-side regression that drops one of the data-* attrs
+			// surfaces the same loud error.
+			const ctx = makeContext();
+			activate(ctx);
+			const handler = getRegisteredCommand("jollimemory.discardFileChanges");
+
+			await handler({
+				fileStatus: {
+					absolutePath: "/repo/file.ts",
+					relativePath: "file.ts",
+					statusCode: "M",
+					indexStatus: "",
+					worktreeStatus: "",
+				},
+			});
+
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining('Cannot discard "file.ts" — internal error'),
+			);
+			expect(mockBridge.discardFiles).not.toHaveBeenCalled();
+		});
+
+		it("rejects malformed fileStatus that is missing indexStatus / worktreeStatus", async () => {
+			// Defense in depth: bridge.discardFiles dispatches on the raw
+			// porcelain columns. A previous version of branch:discardFile only
+			// forwarded statusCode, which silently routed every file (including
+			// untracked) into the `git restore --staged --worktree` branch and
+			// failed without surfacing — the activity-bar badge then showed the
+			// pre-discard count even though the user had "discarded" the file.
+			// The guard makes any future caller that strips the columns loud-fail
+			// at the boundary with an error toast, rather than corrupting state.
+			const ctx = makeContext();
+			activate(ctx);
+			const handler = getRegisteredCommand("jollimemory.discardFileChanges");
+
+			await handler({
+				fileStatus: {
+					absolutePath: "/repo/untracked.ts",
+					relativePath: "untracked.ts",
+					statusCode: "?",
+					// intentionally missing indexStatus / worktreeStatus
+				},
+			});
+
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining(
+					'Cannot discard "untracked.ts" — internal error',
+				),
+			);
+			expect(showWarningMessage).not.toHaveBeenCalled();
+			expect(mockBridge.discardFiles).not.toHaveBeenCalled();
+		});
 	});
 
 	// ── discardSelectedChanges ──────────────────────────────────────
@@ -4271,9 +4577,14 @@ describe("Extension", () => {
 				};
 			}
 
+			// Cross-repo: external deep links may target a memory whose summary
+			// lives in a non-current repo under the Memory Bank parent, so the
+			// URI handler walks the same aggregated view the Memories tab uses
+			// (getSummaryAnyRepo) — pinned here for the same reason as the
+			// copyRecallPrompt / openInClaudeCode handlers above.
 			it("opens SummaryWebviewPanel in commit slot when the summary exists", async () => {
 				const summary = { hash: "abc1234", content: "summary text" };
-				mockBridge.getSummary.mockResolvedValue(summary);
+				mockBridge.getSummaryAnyRepo.mockResolvedValue(summary);
 
 				const handler = getHandler();
 				await handler.handleUri({
@@ -4283,7 +4594,7 @@ describe("Extension", () => {
 						"vscode://jolli.jollimemory-vscode/summary/0123456789abcdef0123456789abcdef01234567",
 				});
 
-				expect(mockBridge.getSummary).toHaveBeenCalledWith(
+				expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
 					"0123456789abcdef0123456789abcdef01234567",
 				);
 				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
@@ -4299,7 +4610,7 @@ describe("Extension", () => {
 			});
 
 			it("shows info message when no summary is found", async () => {
-				mockBridge.getSummary.mockResolvedValue(null);
+				mockBridge.getSummaryAnyRepo.mockResolvedValue(null);
 
 				const handler = getHandler();
 				await handler.handleUri({
@@ -4316,10 +4627,11 @@ describe("Extension", () => {
 			});
 
 			it("rejects abbreviated hashes (must be a full 40-char SHA)", async () => {
-				// `bridge.getSummary` falls through to alias / tree-hash resolution
-				// for non-direct hits, which silently resolves the wrong commit when
-				// two distinct commits share the same tree (cherry-pick, identical
-				// re-commit). Same hardening as `search --hashes`.
+				// `bridge.getSummaryAnyRepo` (and the current-repo `getSummary` it
+				// falls back to) walks alias / tree-hash resolution for non-direct
+				// hits, which silently resolves the wrong commit when two distinct
+				// commits share the same tree (cherry-pick, identical re-commit).
+				// Same hardening as `search --hashes`.
 				const handler = getHandler();
 				await handler.handleUri({
 					path: "/summary/abc1234",
@@ -4327,7 +4639,7 @@ describe("Extension", () => {
 					toString: () => "vscode://jolli.jollimemory-vscode/summary/abc1234",
 				});
 
-				expect(mockBridge.getSummary).not.toHaveBeenCalled();
+				expect(mockBridge.getSummaryAnyRepo).not.toHaveBeenCalled();
 				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
 			});
 

@@ -173,6 +173,14 @@ export class MetadataManager {
 		const manifest = this.readManifest();
 		if (manifest.files.length === 0) return 0;
 
+		// Cheap fast-path: skip the full walk when every recorded path is
+		// still on disk. M existsSync calls (manifest entry count) replace
+		// an O(N) recursive readdir + per-file readFile + sha256 across the
+		// whole kbRoot, which is what made the previous "reconcile every
+		// repo listing" approach too expensive to wire in unconditionally.
+		const anyStale = manifest.files.some((f) => !existsSync(join(kbRoot, f.path)));
+		if (!anyStale) return 0;
+
 		// Build fingerprint → path map for move detection
 		const currentFiles = new Map<string, string>();
 		try {

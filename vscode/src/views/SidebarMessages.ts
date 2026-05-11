@@ -44,16 +44,6 @@ export interface SidebarState {
 	readonly branchName: string;
 	readonly detached: boolean;
 	/**
-	 * Display name for the repo-root header rendered above the Folders tab
-	 * tree (mirrors IntelliJ's `KBExplorerPanel` repo node). The host computes
-	 * this with `resolveKbRepoFolderName` — origin URL basename when the repo
-	 * has a remote, falling back to `basename(workspaceRoot)` otherwise — so
-	 * opening a worktree shows the real repo name (e.g. "jolliai") instead of
-	 * the worktree directory name. Empty string degrades to a generic
-	 * "Memory Bank" header.
-	 */
-	readonly kbRepoFolder?: string;
-	/**
 	 * Set when activate() couldn't complete its normal init (no workspace folder
 	 * open, or workspace isn't a git repo). The webview swaps the standard
 	 * disabled banner for a reason-specific CTA (Open Folder / Initialize Git).
@@ -80,6 +70,22 @@ export interface SerializedTreeItem {
 	readonly gitStatus?: string;
 	/** Changes panel only: in-memory selection state. */
 	readonly isSelected?: boolean;
+	/**
+	 * Changes panel only: the two raw porcelain v1 columns. `gitStatus` collapses
+	 * them into a single display letter, but `bridge.discardFiles` needs both to
+	 * pick the correct git command (worktree-only `restore` vs staged-worktree
+	 * `restore --staged --worktree` vs untracked `unlink` etc.). Without these,
+	 * the webview-routed discard handler used to silently send a partial
+	 * FileStatus to the host and untracked / renamed / added files would fall
+	 * into the wrong branch and fail.
+	 */
+	readonly indexStatus?: string;
+	readonly worktreeStatus?: string;
+	/**
+	 * Changes panel only: source path for rename / copy rows (porcelain "R "/"C ").
+	 * `bridge.discardFiles` restores both the old and new paths from the index.
+	 */
+	readonly originalPath?: string;
 	/** Commits panel only: whether this commit has an associated memory summary. */
 	readonly hasMemory?: boolean;
 	/**
@@ -139,6 +145,20 @@ export interface FolderNode {
 	 * navigating into the file.
 	 */
 	readonly fileBranch?: string;
+	/**
+	 * Directory-only. True when this node is a top-level repo folder under the
+	 * Memory Bank parent (i.e. `<kbParent>/<repoName>/`), as opposed to a
+	 * subdirectory inside a repo. Lets the renderer apply repo-level styling
+	 * and grouping.
+	 */
+	readonly isRepoRoot?: boolean;
+	/**
+	 * Directory-only, repo nodes only. True when this repo matches the
+	 * currently opened project. Used to highlight / auto-expand the user's
+	 * "home" repo while keeping other repos collapsed by default — same
+	 * UX as IntelliJ's Memory Bank tool window.
+	 */
+	readonly isCurrentRepo?: boolean;
 }
 
 export interface MemoryItem {
@@ -146,7 +166,15 @@ export interface MemoryItem {
 	readonly title: string;
 	readonly commitHash: string;
 	readonly branch: string;
-	readonly project: string;
+	/**
+	 * Source repository name. For entries from the current workspace this
+	 * equals the workspace basename; for entries discovered under the
+	 * Memory Bank parent that belong to a different repo, this is the
+	 * other repo's name. The webview shows a repo badge on the row when
+	 * the visible memories span more than one distinct repoName so users
+	 * can disambiguate same-named branches across repos.
+	 */
+	readonly repoName: string;
 	/** ms since epoch. */
 	readonly timestamp: number;
 	/**
@@ -215,18 +243,27 @@ export type SidebarOutboundMsg =
 	| { readonly type: "branch:openCommit"; readonly hash: string }
 	| {
 			/**
-			 * Inline "discard" button on a Changes row. Mirrors the field set of
-			 * `branch:openChange` because `jollimemory.discardFileChanges` expects a
-			 * full `FileItem` instance (it reads `item.fileStatus.relativePath /
-			 * statusCode`); the host rebuilds a structurally-equivalent shape on
-			 * receipt rather than executing the command with a bare id string,
-			 * which the command's `if (!item?.fileStatus) return;` guard would
-			 * silently drop.
+			 * Inline "discard" button on a Changes row. The host rebuilds a full
+			 * `FileItem` from these fields rather than running the command with a
+			 * bare id (which the command's `if (!item?.fileStatus) return;` guard
+			 * would silently drop).
+			 *
+			 * `indexStatus` / `worktreeStatus` are NOT optional — `bridge.discardFiles`
+			 * routes on those two columns (worktree-only restore vs staged-worktree
+			 * restore vs untracked unlink etc.). Sending only `statusCode` (the
+			 * collapsed display letter) used to land every file in the
+			 * `git restore --staged --worktree` branch, which silently failed for
+			 * untracked / added / renamed files and left the activity-bar badge
+			 * showing the pre-discard count. `originalPath` is required for rename
+			 * rows so both the old and new paths get unstaged in one shot.
 			 */
 			readonly type: "branch:discardFile";
 			readonly filePath: string;
 			readonly relativePath: string;
 			readonly statusCode: string;
+			readonly indexStatus: string;
+			readonly worktreeStatus: string;
+			readonly originalPath?: string;
 	  }
 	| {
 			readonly type: "branch:toggleFileSelection";
@@ -261,12 +298,11 @@ export type SidebarInboundMsg =
 			 * Tells the client to discard its entire `folderCache` before the next
 			 * root listing arrives. Sent by the host after destructive operations
 			 * (currently: Migrate to Memory Bank) that may rename the repo folder
-			 * or invalidate already-expanded paths. `kbRepoFolder`, when present,
-			 * replaces the repo-root header label so the renamed `-N`-suffixed
-			 * folder shows up immediately in the tree.
+			 * or invalidate already-expanded paths. The renamed `-N`-suffixed
+			 * folder shows up via the next root listing — repos are now flat
+			 * top-level nodes, so there's no separate header to update.
 			 */
 			readonly type: "kb:foldersReset";
-			readonly kbRepoFolder?: string;
 	  }
 	| {
 			readonly type: "kb:memoriesData";

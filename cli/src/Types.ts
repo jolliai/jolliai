@@ -473,6 +473,15 @@ export interface SummaryIndexEntry {
 	readonly topicCount?: number;
 	/** Actual diff stats from `git diff --shortstat` — reflects the final commit result */
 	readonly diffStats?: DiffStats;
+	/**
+	 * Runtime-only annotation: the repo this entry was loaded from when the
+	 * caller aggregates entries across multiple repos (Memory Bank multi-repo
+	 * view). Never written to `index.json` — orphan branches are per-repo, so
+	 * persisting this would be redundant. `JSON.stringify` drops undefined
+	 * fields, so an aggregator can safely assign this without leaking into
+	 * any storage layer.
+	 */
+	readonly repoName?: string;
 }
 
 /** Index file stored in the orphan branch */

@@ -234,17 +234,22 @@ export class MemoriesTreeProvider
 		hasMore: boolean;
 	} {
 		const snap = this.store.getSnapshot();
+		// `listSummaryEntries` annotates every cross-repo entry with its source
+		// `repoName` (JolliMemoryBridge.ts) — that field is what disambiguates
+		// "same branch name across two repos" in the multi-repo Memories view.
+		// Fall back to the current workspace basename only when the entry came
+		// from a code path that didn't set repoName (orphan-only single-repo
+		// users, mostly).
+		const fallbackRepoName =
+			(this.store as unknown as { bridge: { cwd: string } }).bridge.cwd
+				.split(/[/\\]/)
+				.pop() ?? "";
 		const items: MemoryItemMessage[] = snap.entries.map((e) => ({
 			id: `memory-${e.commitHash}`,
 			title: e.commitMessage,
 			commitHash: e.commitHash,
 			branch: e.branch,
-			// Project name is the basename of the git repo root (stored in bridge.cwd)
-			// We access it via the store's bridge property (which is private, so we use type assertion)
-			project:
-				(this.store as unknown as { bridge: { cwd: string } }).bridge.cwd
-					.split(/[/\\]/)
-					.pop() ?? "",
+			repoName: e.repoName ?? fallbackRepoName,
 			timestamp: Date.parse(e.commitDate),
 			tooltip: buildPlainTextTooltip(e),
 			hover: buildHoverFields(e),

@@ -67,6 +67,7 @@ type SettingsMessage =
 	| { command: "loadSettings" }
 	| { command: "browseLocalFolder" }
 	| { command: "rebuildKnowledgeBase" }
+	| { command: "confirmDirtyMigrate" }
 	| { command: "signIn" }
 	| { command: "signOut" }
 	| {
@@ -229,6 +230,17 @@ export class SettingsWebviewPanel {
 					});
 				});
 				break;
+			case "confirmDirtyMigrate":
+				this.handleConfirmDirtyMigrate().catch((err: unknown) => {
+					log.error("SettingsPanel", `Confirm dirty migrate failed: ${err}`);
+					// Treat any failure as a cancel so the webview doesn't stay
+					// stuck waiting for a response.
+					this.panel.webview.postMessage({
+						command: "confirmDirtyMigrateResult",
+						proceed: false,
+					});
+				});
+				break;
 			case "signIn":
 				// Delegate to the same command Extension.ts registers so the OAuth
 				// flow is identical to the sidebar's Sign In path.
@@ -252,6 +264,32 @@ export class SettingsWebviewPanel {
 					});
 				break;
 		}
+	}
+
+	/**
+	 * Shows a native modal warning when the user clicks Migrate to Memory Bank
+	 * while Folder Path has been edited but not yet applied. Posts the user's
+	 * choice back so the webview can either chain Apply → Migrate or abort.
+	 *
+	 * The migrate command reads `localFolder` from disk; running it against an
+	 * unapplied Folder Path edit would migrate into the *previous* folder,
+	 * which is the opposite of what the visible form state suggests. Force a
+	 * choice instead of silently using the stale value.
+	 */
+	private async handleConfirmDirtyMigrate(): Promise<void> {
+		const choice = await vscode.window.showWarningMessage(
+			"Folder Path has unsaved changes",
+			{
+				modal: true,
+				detail:
+					"Migrate to Memory Bank reads the saved Folder Path from disk. Apply your changes first so the migration uses the path shown in the form.",
+			},
+			"Apply Changes & Migrate",
+		);
+		this.panel.webview.postMessage({
+			command: "confirmDirtyMigrateResult",
+			proceed: choice === "Apply Changes & Migrate",
+		});
 	}
 
 	/**

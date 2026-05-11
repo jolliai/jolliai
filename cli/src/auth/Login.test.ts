@@ -761,6 +761,9 @@ describe("Login", () => {
 
 			const openUrl = mockOpen.mock.calls[0][0] as string;
 			expect(openUrl).not.toContain("generate_api_key");
+			// client=cli identifies the originating surface; unrelated to whether
+			// a new key is being minted, so it must be present even when one exists.
+			expect(openUrl).toContain("client=cli");
 			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "browser-token-2" });
 		});
 

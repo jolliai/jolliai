@@ -171,6 +171,24 @@ interface TranscriptEntryUpdate {
 /** Source of the panel — determines which static slot it occupies. */
 export type SummaryPanelSource = "memory" | "commit" | "kb";
 
+/**
+ * Read-only whitelist used by the foreign-repo dispatch guard. Everything
+ * that DOESN'T appear here writes to `this.workspaceRoot` / `this.bridge`
+ * (push, edit*, plan/note saves, PR helpers, transcript saves) or queries
+ * the current workspace's git/orphan branch in a way that would surface
+ * incorrect results for a foreign-origin summary (PR status, transcript
+ * stats). Use a Set so the lookup is O(1) and stays explicit at the call
+ * site.
+ */
+const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
+	"copyMarkdown",
+	"downloadMarkdown",
+]);
+
+function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
+	return FOREIGN_SAFE_COMMANDS.has(command);
+}
+
 // Single source of truth for Create/Update PR body assembly. Aggregates
 // when the branch has 2+ summaries; otherwise falls back to single-summary
 // `buildPrMarkdown` and (when missingCount > 0) appends a "K skipped"
@@ -232,6 +250,18 @@ export class SummaryWebviewPanel {
 	// Snapshot of `CommitsStore.getMainBranch()` at panel creation. Revisit
 	// when `setMainBranch` is wired to a UI control (today there is no caller).
 	private readonly mainBranch: string;
+	/**
+	 * Provenance: the source repo's name when the summary was loaded from a
+	 * non-current repo (Memory Bank cross-repo lookup), otherwise null. When
+	 * non-null, the panel is read-only — every destructive webview command
+	 * (push / editTopic / editPlan / createPr / ...) writes to `this.bridge`
+	 * / `this.workspaceRoot`, both of which are bound to the *current*
+	 * workspace. Allowing those writes against a foreign-origin summary
+	 * would silently corrupt the wrong project. `dispatchWebviewMessage`
+	 * gates on `foreignRepoName != null` and short-circuits destructive
+	 * commands with a clear notification.
+	 */
+	private readonly foreignRepoName: string | null;
 
 	private constructor(
 		extensionUri: vscode.Uri,
@@ -240,6 +270,7 @@ export class SummaryWebviewPanel {
 		commitHash: string,
 		bridge: JolliMemoryBridge,
 		mainBranch: string,
+		foreignRepoName: string | null,
 	) {
 		this.extensionUri = extensionUri;
 		this.workspaceRoot = workspaceRoot;
@@ -247,6 +278,7 @@ export class SummaryWebviewPanel {
 		this.commitHash = commitHash;
 		this.bridge = bridge;
 		this.mainBranch = mainBranch;
+		this.foreignRepoName = foreignRepoName;
 		// Distinct viewType per source keeps the two panels independently identified by VSCode.
 		const viewType =
 			source === "memory"
@@ -293,6 +325,20 @@ export class SummaryWebviewPanel {
 	 * and displaying them via VS Code notifications.
 	 */
 	private dispatchWebviewMessage(message: WebviewMessage): void {
+		// Foreign-repo guard. When the loaded summary came from a repo OTHER
+		// than the current workspace (Memory Bank cross-repo lookup), every
+		// destructive handler below would write to this workspace's git /
+		// orphan branch using fields from a foreign summary — i.e. silently
+		// corrupt the wrong project. Whitelist the read-only commands and
+		// deny everything else. Default-deny (whitelist) is intentional so
+		// any future command lands in the safe branch unless explicitly
+		// vetted as workspace-independent.
+		if (this.foreignRepoName) {
+			if (!isForeignSafeCommand(message.command)) {
+				this.notifyForeignDenied(message.command);
+				return;
+			}
+		}
 		switch (message.command) {
 			case "copyMarkdown":
 				if (this.currentSummary) {
@@ -576,6 +622,23 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
+	 * User-facing notification used by the foreign-repo dispatch guard. The
+	 * webview ships every possible button without knowing its panel is
+	 * read-only, so clicks land here as ordinary messages — this surfaces
+	 * a clear "why didn't it work" cue instead of failing silently.
+	 *
+	 * Uses showInformationMessage rather than showWarningMessage because
+	 * the user's action wasn't an error — it's an expected outcome of
+	 * viewing a foreign-origin memory. Single notification per click; no
+	 * modal prompt so they aren't blocked from clicking around.
+	 */
+	private notifyForeignDenied(command: string): void {
+		void vscode.window.showInformationMessage(
+			`This memory is from ${this.foreignRepoName} — "${command}" is disabled to prevent writes to the current workspace. Open the source repo to edit.`,
+		);
+	}
+
+	/**
 	 * Opens the Commit Memory panel for the given summary.
 	 *
 	 * Memory source (single slot): the existing memory panel — if any — is
@@ -600,6 +663,7 @@ export class SummaryWebviewPanel {
 		bridge: JolliMemoryBridge,
 		mainBranch: string,
 		source: SummaryPanelSource = "commit",
+		foreignRepoName: string | null = null,
 	): Promise<void> {
 		if (source === "commit" || source === "kb") {
 			const existing = SummaryWebviewPanel.commitPanels.get(summary.commitHash);
@@ -648,6 +712,7 @@ export class SummaryWebviewPanel {
 			summary.commitHash,
 			bridge,
 			mainBranch,
+			foreignRepoName,
 		);
 		if (source === "memory") {
 			SummaryWebviewPanel.currentMemoryPanel = instance;
@@ -669,7 +734,14 @@ export class SummaryWebviewPanel {
 			return;
 		}
 		this.currentSummary = summary;
-		this.panel.title = buildPanelTitle(summary);
+		// Prefix the tab title with the foreign repo's name so the user can
+		// tell at a glance that this panel is read-only. The "<<" arrows
+		// echo IntelliJ's "from <repo>" convention while staying short
+		// enough not to truncate the commit message on narrow tab bars.
+		const baseTitle = buildPanelTitle(summary);
+		this.panel.title = this.foreignRepoName
+			? `← ${this.foreignRepoName}: ${baseTitle}`
+			: baseTitle;
 		const nonce = randomBytes(16).toString("base64");
 		this.panel.webview.html = buildHtml(summary, {
 			transcriptHashSet: this.transcriptHashSet,
