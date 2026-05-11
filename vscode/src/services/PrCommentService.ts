@@ -210,46 +210,6 @@ async function getCurrentBranch(cwd: string): Promise<string> {
 	return raw.trim();
 }
 
-// ─── Cross-branch detection ─────────────────────────────────────────────────
-//
-// A memory is "cross-branch" when the commit it was recorded for is NOT in
-// the current branch's history. That happens when the user is viewing a
-// memory from a different branch (e.g. browsing history while checked out
-// elsewhere), or when that branch was deleted and recreated pointing at
-// different commits.
-//
-// The common case is the opposite: the memory's commit IS in the current
-// branch's history. That is when Create/Update PR operations make sense,
-// because `git push origin HEAD` and `gh pr create` act on the current
-// branch — and the current branch is the one that actually contains the
-// commit the memory is about.
-//
-// We use commit reachability instead of comparing branch names because
-// names are mutable labels: `git branch -m`, delete-and-recreate, and
-// force-push all break name equality without changing whether the commit
-// is part of the current branch's history. Reachability is the invariant
-// that actually matches the semantics we want.
-
-/**
- * Returns true if `commitHash` is in the current branch's history (reachable
- * from HEAD).
- *
- * `git merge-base --is-ancestor` exits 0 when the commit is an ancestor of
- * HEAD, 1 when it is not, and other codes on internal errors — in all
- * failure modes we conservatively return false.
- */
-export async function isCommitReachableFromHead(
-	cwd: string,
-	commitHash: string,
-): Promise<boolean> {
-	try {
-		await execGit(["merge-base", "--is-ancestor", commitHash, "HEAD"], cwd);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 /** Pushes the current branch to origin (no-op if already pushed). */
 async function pushBranch(cwd: string): Promise<void> {
 	await execGit(["push", "-u", "origin", "HEAD"], cwd);
@@ -368,36 +328,20 @@ async function createPr(
 type PostMessageFn = (msg: Record<string, unknown>) => void;
 
 /**
- * Checks the PR status and sends the result to the webview.
+ * Checks the PR status for the current branch and sends the result to the webview.
  *
- * @param summaryBranch - The branch recorded in the summary at commit time.
- *   Resolved via {@link resolveTargetBranch} so we always pass an explicit
- *   branch to `gh pr view`, avoiding HEAD fall-through mis-association.
- * @param summaryCommitHash - The summary's commit hash. Used to determine if
- *   the memory belongs to the current branch via commit reachability, which is
- *   immune to branch rename / delete-and-recreate / force-push scenarios.
+ * PR operations are branch-scoped, not commit-scoped: we always look up the PR
+ * on the current branch (`gh pr list --head <currentBranch>`), regardless of
+ * which summary the user has open. This keeps the model predictable across
+ * rebase / branch-switch and removes the cross-branch footgun where a stale
+ * `summaryCommitHash` could route the lookup to the wrong branch.
  */
 export async function handleCheckPrStatus(
 	cwd: string,
 	postMessage: PostMessageFn,
-	summaryBranch?: string,
-	summaryCommitHash?: string,
 ): Promise<void> {
 	try {
-		// The happy path is !isCrossBranch: the memory's commit is on the
-		// current branch, so Create/Update PR acts on it. See the Cross-branch
-		// section above for why we rely on commit reachability here.
-		const isCrossBranch = summaryCommitHash
-			? !(await isCommitReachableFromHead(cwd, summaryCommitHash))
-			: false;
-
-		// PR lookup must use the branch that actually contains the commit:
-		//   • Normal / rename / force-push → current branch (memory is on it)
-		//   • Cross-branch → summary.branch (our best guess for the other branch)
-		const currentBranch = await getCurrentBranch(cwd);
-		const targetBranch = isCrossBranch
-			? (summaryBranch ?? currentBranch)
-			: currentBranch;
+		const targetBranch = await getCurrentBranch(cwd);
 
 		// Check gh availability — distinguish "not installed" (definitive) from
 		// transient spawn errors so the user gets an actionable message.
@@ -431,7 +375,6 @@ export async function handleCheckPrStatus(
 				command: "prStatus",
 				status: "noPr",
 				branch: targetBranch,
-				crossBranch: isCrossBranch,
 			});
 			return;
 		}
@@ -449,42 +392,22 @@ export async function handleCheckPrStatus(
 }
 
 /**
- * Creates a new PR with the user-provided title and body.
+ * Creates a new PR for the current branch using the user-provided title and body.
  *
- * @param summaryBranch - The branch recorded in the summary. Passed through
- *   to the post-create refresh so the PR section re-queries for the same
- *   target branch.
- * @param summaryCommitHash - The summary's commit hash. Used to check that
- *   the memory's commit is reachable from the current HEAD, meaning `git push
- *   origin HEAD` and `gh pr create` operate on a branch that actually contains
- *   this work. Immune to branch rename / delete-and-recreate / force-push.
+ * Branch-scoped: `git push -u origin HEAD` + `gh pr create` always act on the
+ * checked-out branch. The summary that the webview was opened with is purely
+ * informational here — it determines the PR body content (assembled by the
+ * caller) but never gates whether a PR can be created.
  */
 export async function handleCreatePr(
 	title: string,
 	body: string,
 	cwd: string,
 	postMessage: PostMessageFn,
-	summaryBranch?: string,
-	summaryCommitHash?: string,
 ): Promise<void> {
 	postMessage({ command: "prCreating" });
 
 	try {
-		// Cross-branch guard: if the memory's commit is NOT on the current
-		// branch, a PR created from HEAD would not contain this commit.
-		// Non-cross-branch (the normal case) falls through to the push +
-		// create flow below. See the Cross-branch section above.
-		if (
-			summaryCommitHash &&
-			!(await isCommitReachableFromHead(cwd, summaryCommitHash))
-		) {
-			postMessage({ command: "prCreateFailed" });
-			vscode.window.showWarningMessage(
-				"Cannot create a PR — the memory's commit is not in the current branch's history. Check out a branch that includes this commit first.",
-			);
-			return;
-		}
-
 		// Ensure branch is pushed
 		log.info(TAG, "Pushing branch to origin...");
 		await pushBranch(cwd);
@@ -495,12 +418,7 @@ export async function handleCreatePr(
 		log.info(TAG, `PR created: ${prUrl}`);
 
 		// Refresh section to show the new PR
-		await handleCheckPrStatus(
-			cwd,
-			postMessage,
-			summaryBranch,
-			summaryCommitHash,
-		);
+		await handleCheckPrStatus(cwd, postMessage);
 
 		// Toast with "Open PR" action
 		vscode.window
@@ -519,34 +437,21 @@ export async function handleCreatePr(
 }
 
 /**
- * Prepares the Update PR form by fetching the current PR data,
+ * Prepares the Update PR form by fetching the current branch's PR data,
  * replacing the marker region with the caller-provided markdown, and
  * sending the pre-filled title + body to the webview.
  *
- * The caller is responsible for assembling `markdown` (single-summary or
- * branch-aggregated) and for cross-branch detection — so this function
- * only handles the GitHub-side lookup + marker replacement, keeping its
- * single-responsibility scope. See `SummaryWebviewPanel.handlePrepareUpdatePr`.
- *
- * `summaryBranch` / `summaryCommitHash` are passed through to mirror the
- * branch-resolution logic in `handleCheckPrStatus` (cross-branch falls back
- * to `summaryBranch`; normal case uses the current branch).
+ * Branch-scoped: looks up the PR on the current branch. The caller assembles
+ * `markdown` (single-summary or branch-aggregated) — this function only
+ * handles the GitHub-side lookup + marker replacement.
  */
 export async function handlePrepareUpdatePr(
-	summaryBranch: string | undefined,
-	summaryCommitHash: string | undefined,
 	markdown: string,
 	cwd: string,
 	postMessage: PostMessageFn,
 ): Promise<void> {
 	try {
-		const isCrossBranch = summaryCommitHash
-			? !(await isCommitReachableFromHead(cwd, summaryCommitHash))
-			: false;
-		const currentBranch = await getCurrentBranch(cwd);
-		const targetBranch = isCrossBranch
-			? (summaryBranch ?? currentBranch)
-			: currentBranch;
+		const targetBranch = await getCurrentBranch(cwd);
 		const pr = await findPrForBranch(cwd, targetBranch);
 		if (!pr) {
 			vscode.window.showWarningMessage(
@@ -570,35 +475,21 @@ export async function handlePrepareUpdatePr(
 }
 
 /**
- * Updates the PR title and description with the user-edited values from the form.
+ * Updates the current branch's PR title and description with the user-edited
+ * values from the form.
  *
- * @param summaryBranch - The branch recorded in the summary. Resolved to an
- *   explicit branch name internally — never falls through to HEAD semantics.
- * @param summaryCommitHash - The summary's commit hash. Passed through to the
- *   post-update refresh so cross-branch detection stays consistent with
- *   `handleCheckPrStatus`.
+ * Branch-scoped: always updates the PR on the current branch.
  */
 export async function handleUpdatePr(
 	title: string,
 	body: string,
 	cwd: string,
 	postMessage: PostMessageFn,
-	summaryBranch?: string,
-	summaryCommitHash?: string,
 ): Promise<void> {
 	postMessage({ command: "prUpdating" });
 
 	try {
-		// Mirrors handleCheckPrStatus's lookup strategy:
-		//   • !isCrossBranch (normal case) → update the PR on current branch
-		//   • isCrossBranch → fall back to summary's stored branch
-		const isCrossBranch = summaryCommitHash
-			? !(await isCommitReachableFromHead(cwd, summaryCommitHash))
-			: false;
-		const currentBranch = await getCurrentBranch(cwd);
-		const targetBranch = isCrossBranch
-			? (summaryBranch ?? currentBranch)
-			: currentBranch;
+		const targetBranch = await getCurrentBranch(cwd);
 		const pr = await findPrForBranch(cwd, targetBranch);
 		if (!pr) {
 			postMessage({ command: "prUpdateFailed" });
@@ -619,12 +510,7 @@ export async function handleUpdatePr(
 		log.info(TAG, `Updated PR #${pr.number}`);
 
 		// Refresh section to reflect new state
-		await handleCheckPrStatus(
-			cwd,
-			postMessage,
-			summaryBranch,
-			summaryCommitHash,
-		);
+		await handleCheckPrStatus(cwd, postMessage);
 
 		vscode.window
 			.showInformationMessage(`Updated PR #${pr.number}`, "Open PR")
@@ -847,29 +733,22 @@ export function buildPrMessageScript(): string {
         prShow(prActions);
       } else if (s === 'noPr') {
         prHide(prLinkRow);
-        if (msg.crossBranch) {
-          prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '. Check out that branch to create a PR.';
-          prShow(prStatusText);
-          prActions.textContent = '';
-          prHide(prActions);
-        } else {
-          prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '.';
-          prShow(prStatusText);
-          prActions.textContent = '';
-          var btn = document.createElement('button');
-          btn.className = 'action-btn';
-          btn.id = 'createPrBtn';
-          btn.textContent = 'Create PR';
-          prActions.appendChild(btn);
-          prShow(prActions);
-          // Bind Create PR button — request fresh body from backend so that
-          // content generated after the webview opened (e.g. E2E test) is included.
-          btn.addEventListener('click', function() {
-            btn.disabled = true;
-            btn.textContent = 'Loading...';
-            vscode.postMessage({ command: 'prepareCreatePr' });
-          });
-        }
+        prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '.';
+        prShow(prStatusText);
+        prActions.textContent = '';
+        var btn = document.createElement('button');
+        btn.className = 'action-btn';
+        btn.id = 'createPrBtn';
+        btn.textContent = 'Create PR';
+        prActions.appendChild(btn);
+        prShow(prActions);
+        // Bind Create PR button — request fresh body from backend so that
+        // content generated after the webview opened (e.g. E2E test) is included.
+        btn.addEventListener('click', function() {
+          btn.disabled = true;
+          btn.textContent = 'Loading...';
+          vscode.postMessage({ command: 'prepareCreatePr' });
+        });
       } else if (s === 'ready') {
         var pr = msg.pr;
         prHide(prStatusText);

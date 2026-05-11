@@ -71,7 +71,6 @@ import {
 	handleCreatePr,
 	handlePrepareUpdatePr,
 	handleUpdatePr,
-	isCommitReachableFromHead,
 	wrapWithMarkers,
 } from "../services/PrCommentService.js";
 import {
@@ -189,23 +188,50 @@ function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
 	return FOREIGN_SAFE_COMMANDS.has(command);
 }
 
-// Single source of truth for Create/Update PR body assembly. Aggregates
-// when the branch has 2+ summaries; otherwise falls back to single-summary
-// `buildPrMarkdown` and (when missingCount > 0) appends a "K skipped"
-// footnote so partial-coverage branches don't render as misleading
-// single-commit PRs.
+// Single source of truth for Create/Update PR body assembly. Branch-first
+// three-tier selection:
+//   • ≥2 branch summaries → aggregate them
+//   • 1 branch summary    → use that one (NOT currentSummary, which may be
+//                           stale or from another branch the webview was
+//                           opened on)
+//   • 0 branch summaries  → fall back to currentSummary (rebase just happened
+//                           and the worker has not produced a summary for the
+//                           new commit hash yet — keeps the form usable)
+// `missingCount > 0` appends a "K skipped" footnote so partial-coverage
+// branches don't render as misleading.
 function buildPrBodyMarkdown(
 	currentSummary: CommitSummary,
 	summaries: ReadonlyArray<CommitSummary>,
 	missingCount: number,
-	isCrossBranch: boolean,
 ): string {
-	if (!isCrossBranch && summaries.length >= 2) {
+	if (summaries.length >= 2) {
 		return buildAggregatedPrMarkdown(summaries, missingCount);
 	}
-	const base = buildPrMarkdown(currentSummary);
+	const source = summaries.length === 1 ? summaries[0] : currentSummary;
+	const base = buildPrMarkdown(source);
 	if (missingCount <= 0) return base;
 	return `${base}\n\n> Note: ${missingCount} commit(s) without summary were skipped.`;
+}
+
+/**
+ * Picks the commit message to use as the PR title, mirroring
+ * {@link buildPrBodyMarkdown}'s three-tier selection so title and body always
+ * come from the same source.
+ *   • ≥2 branch summaries → the last (most recent) one's message
+ *   • 1 branch summary    → that summary's message
+ *   • 0 branch summaries  → fall back to currentSummary's message
+ */
+function pickPrTitle(
+	currentSummary: CommitSummary,
+	summaries: ReadonlyArray<CommitSummary>,
+): string {
+	if (summaries.length >= 2) {
+		return summaries[summaries.length - 1].commitMessage;
+	}
+	if (summaries.length === 1) {
+		return summaries[0].commitMessage;
+	}
+	return currentSummary.commitMessage;
 }
 
 export class SummaryWebviewPanel {
@@ -525,11 +551,8 @@ export class SummaryWebviewPanel {
 				);
 				break;
 			case "checkPrStatus":
-				handleCheckPrStatus(
-					this.workspaceRoot,
-					(msg) => this.panel.webview.postMessage(msg),
-					this.currentSummary?.branch,
-					this.currentSummary?.commitHash,
+				handleCheckPrStatus(this.workspaceRoot, (msg) =>
+					this.panel.webview.postMessage(msg),
 				).catch((err: unknown) =>
 					log.error("SummaryPanel", `Check PR status failed: ${err}`),
 				);
@@ -541,8 +564,6 @@ export class SummaryWebviewPanel {
 						message.body,
 						this.workspaceRoot,
 						(msg) => this.panel.webview.postMessage(msg),
-						this.currentSummary?.branch,
-						this.currentSummary?.commitHash,
 					),
 					"Create PR failed",
 				);
@@ -568,8 +589,6 @@ export class SummaryWebviewPanel {
 						this.workspaceRoot,
 						(msg: Record<string, unknown>) =>
 							this.panel.webview.postMessage(msg),
-						this.currentSummary?.branch,
-						this.currentSummary?.commitHash,
 					),
 					"Update PR failed",
 				);
@@ -864,22 +883,13 @@ export class SummaryWebviewPanel {
 			this.panel.webview.postMessage(msg);
 		};
 
-		if (await this.handleWorkerBusyOrContinue(summary, postMessage)) {
+		if (await this.handleWorkerBusyOrContinue(postMessage)) {
 			return;
 		}
 
-		const { isCrossBranch, summaries, missingCount } =
-			await this.resolveBranchContext(summary);
-		const markdown = buildPrBodyMarkdown(
-			summary,
-			summaries,
-			missingCount,
-			isCrossBranch,
-		);
-		const useAggregate = !isCrossBranch && summaries.length >= 2;
-		const title = useAggregate
-			? summaries[summaries.length - 1].commitMessage
-			: summary.commitMessage;
+		const { summaries, missingCount } = await this.loadCurrentBranchSummaries();
+		const markdown = buildPrBodyMarkdown(summary, summaries, missingCount);
+		const title = pickPrTitle(summary, summaries);
 		postMessage({
 			command: "prShowCreateForm",
 			body: wrapWithMarkers(markdown),
@@ -894,32 +904,19 @@ export class SummaryWebviewPanel {
 			this.panel.webview.postMessage(msg);
 		};
 
-		if (await this.handleWorkerBusyOrContinue(summary, postMessage)) {
+		if (await this.handleWorkerBusyOrContinue(postMessage)) {
 			return;
 		}
 
-		const { isCrossBranch, summaries, missingCount } =
-			await this.resolveBranchContext(summary);
-		const markdown = buildPrBodyMarkdown(
-			summary,
-			summaries,
-			missingCount,
-			isCrossBranch,
-		);
+		const { summaries, missingCount } = await this.loadCurrentBranchSummaries();
+		const markdown = buildPrBodyMarkdown(summary, summaries, missingCount);
 
-		await handlePrepareUpdatePr(
-			summary.branch,
-			summary.commitHash,
-			markdown,
-			this.workspaceRoot,
-			postMessage,
-		);
+		await handlePrepareUpdatePr(markdown, this.workspaceRoot, postMessage);
 	}
 
 	// Returns true when worker is busy: shows the toast and re-runs the
 	// status check so the click-time "Loading..." button gets rebuilt.
 	private async handleWorkerBusyOrContinue(
-		summary: CommitSummary,
 		postMessage: (msg: Record<string, unknown>) => void,
 	): Promise<boolean> {
 		if (!(await isWorkerBusy(this.workspaceRoot))) {
@@ -928,30 +925,16 @@ export class SummaryWebviewPanel {
 		vscode.window.showWarningMessage(
 			"Jolli Memory: AI summary is being generated. Please wait a moment.",
 		);
-		await handleCheckPrStatus(
-			this.workspaceRoot,
-			postMessage,
-			summary.branch,
-			summary.commitHash,
-		);
+		await handleCheckPrStatus(this.workspaceRoot, postMessage);
 		return true;
 	}
 
-	private async resolveBranchContext(summary: CommitSummary): Promise<{
-		isCrossBranch: boolean;
+	private async loadCurrentBranchSummaries(): Promise<{
 		summaries: ReadonlyArray<CommitSummary>;
 		missingCount: number;
 	}> {
-		const isCrossBranch = !(await isCommitReachableFromHead(
-			this.workspaceRoot,
-			summary.commitHash,
-		));
-		if (isCrossBranch) {
-			return { isCrossBranch: true, summaries: [], missingCount: 0 };
-		}
 		const result = await loadBranchSummaries(this.bridge, this.mainBranch);
 		return {
-			isCrossBranch: false,
 			summaries: result.summaries,
 			missingCount: result.missingCount,
 		};

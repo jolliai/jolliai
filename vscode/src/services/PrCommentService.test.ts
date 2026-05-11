@@ -383,7 +383,6 @@ describe("PrCommentService", () => {
 				command: "prStatus",
 				status: "noPr",
 				branch: "feature/my-branch",
-				crossBranch: false,
 			});
 		});
 
@@ -422,7 +421,6 @@ describe("PrCommentService", () => {
 				command: "prStatus",
 				status: "noPr",
 				branch: "feature/br",
-				crossBranch: false,
 			});
 		});
 
@@ -488,35 +486,6 @@ describe("PrCommentService", () => {
 			});
 		});
 
-		it("falls back to current branch when cross-branch detection yields no summary branch", async () => {
-			// Covers handleCheckPrStatus `summaryBranch ?? currentBranch` right branch:
-			// summaryCommitHash is set, merge-base --is-ancestor fails (cross-branch=true),
-			// but summaryBranch is undefined → fall back to currentBranch.
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
-				if (cmd === "git" && args[0] === "rev-parse")
-					return { stdout: "fallback-branch\n" };
-				// merge-base --is-ancestor fails → isCrossBranch=true
-				if (cmd === "git" && args[0] === "merge-base") {
-					throw new Error("not an ancestor");
-				}
-				if (cmd === "gh" && args[0] === "--version") return { stdout: "gh\n" };
-				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
-				if (cmd === "gh" && args[0] === "pr") throw new Error("no pr");
-				return { stdout: "" };
-			});
-
-			// summaryBranch=undefined, summaryCommitHash="deadbeef"
-			await handleCheckPrStatus(CWD, postMessage, undefined, "deadbeef");
-
-			expect(postMessage).toHaveBeenCalledWith({
-				command: "prStatus",
-				status: "noPr",
-				branch: "fallback-branch",
-				crossBranch: true,
-			});
-		});
-
 		it("posts unavailable when gh --version fails with a transient error twice", async () => {
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "rev-list") {
@@ -571,7 +540,6 @@ describe("PrCommentService", () => {
 				command: "prStatus",
 				status: "noPr",
 				branch: "feature/my-branch",
-				crossBranch: false,
 			});
 		});
 
@@ -642,7 +610,6 @@ describe("PrCommentService", () => {
 				command: "prStatus",
 				status: "noPr",
 				branch: "feature/branch",
-				crossBranch: false,
 			});
 		});
 
@@ -676,7 +643,6 @@ describe("PrCommentService", () => {
 				command: "prStatus",
 				status: "noPr",
 				branch: "feature/branch",
-				crossBranch: false,
 			});
 		});
 
@@ -752,137 +718,6 @@ describe("PrCommentService", () => {
 		});
 
 		// ── branch parameter tests ────────────────────────────────────────────
-
-		it("skips commit count check when commit is not reachable from HEAD (cross-branch)", async () => {
-			const prData = {
-				number: 10,
-				url: "https://pr/10",
-				title: "Old PR",
-				body: "",
-			};
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "rev-list") {
-					return { stdout: "5\n" }; // 5 commits on current branch
-				}
-				if (
-					cmd === "git" &&
-					args[0] === "merge-base" &&
-					args[1] === "--is-ancestor"
-				) {
-					// Non-ancestor: exit 1 → throw
-					throw new Error("not ancestor");
-				}
-				if (cmd === "gh" && args[0] === "--version") {
-					return { stdout: "ok\n" };
-				}
-				if (cmd === "gh" && args[0] === "auth") {
-					return { stdout: "ok\n" };
-				}
-				if (cmd === "gh" && args[0] === "pr") {
-					return { stdout: JSON.stringify(prData) };
-				}
-				return { stdout: "" };
-			});
-
-			// Commit not reachable from HEAD → cross-branch → skip multipleCommits
-			await handleCheckPrStatus(
-				CWD,
-				postMessage,
-				"feature/old-branch",
-				"abc123",
-			);
-
-			expect(postMessage).toHaveBeenCalledWith({
-				command: "prStatus",
-				status: "ready",
-				pr: { number: 10, url: "https://pr/10", title: "Old PR" },
-			});
-			expect(postMessage).not.toHaveBeenCalledWith(
-				expect.objectContaining({ status: "multipleCommits" }),
-			);
-		});
-
-		it("uses provided branch in noPr status message with crossBranch flag", async () => {
-			setupExecFile((cmd, args) => {
-				if (
-					cmd === "git" &&
-					args[0] === "merge-base" &&
-					args[1] === "--is-ancestor"
-				) {
-					// Non-ancestor → cross-branch
-					throw new Error("not ancestor");
-				}
-				if (cmd === "gh" && args[0] === "--version") {
-					return { stdout: "ok\n" };
-				}
-				if (cmd === "gh" && args[0] === "auth") {
-					return { stdout: "ok\n" };
-				}
-				if (cmd === "gh" && args[0] === "pr") {
-					throw new Error("no PR");
-				}
-				return { stdout: "" };
-			});
-
-			await handleCheckPrStatus(
-				CWD,
-				postMessage,
-				"feature/old-branch",
-				"abc123",
-			);
-
-			expect(postMessage).toHaveBeenCalledWith({
-				command: "prStatus",
-				status: "noPr",
-				branch: "feature/old-branch",
-				crossBranch: true,
-			});
-		});
-
-		it("uses current branch for PR lookup when commit is reachable (e.g. after rename)", async () => {
-			// Regression: after `git branch -m`, summary.branch holds the old name
-			// but the commit is still in the current branch's history. The PR
-			// lookup must target the CURRENT branch (not the summary's stale name)
-			// so a PR created after the rename is actually found.
-			setupExecFile((cmd, args) => {
-				if (
-					cmd === "git" &&
-					args[0] === "merge-base" &&
-					args[1] === "--is-ancestor"
-				) {
-					return { stdout: "" };
-				}
-				if (
-					cmd === "git" &&
-					args[0] === "rev-parse" &&
-					args[1] === "--abbrev-ref"
-				) {
-					return { stdout: "feature/new-name\n" };
-				}
-				if (cmd === "git" && args[0] === "rev-list") {
-					return { stdout: "1\n" };
-				}
-				if (cmd === "gh" && args[0] === "--version") {
-					return { stdout: "ok\n" };
-				}
-				if (cmd === "gh" && args[0] === "auth") {
-					return { stdout: "ok\n" };
-				}
-				if (cmd === "gh" && args[0] === "pr") {
-					throw new Error("no PR");
-				}
-				return { stdout: "" };
-			});
-
-			await handleCheckPrStatus(CWD, postMessage, "feature/old-name", "abc123");
-
-			expect(postMessage).toHaveBeenCalledWith({
-				command: "prStatus",
-				status: "noPr",
-				branch: "feature/new-name",
-				crossBranch: false,
-			});
-		});
 
 		// ── debug.log observability (non-goal: UI folding stays the same) ─────
 
@@ -1022,30 +857,44 @@ describe("PrCommentService", () => {
 	// ─── handleCreatePr ─────────────────────────────────────────────────────
 
 	describe("handleCreatePr", () => {
-		it("blocks creation when memory's commit is not reachable from current HEAD", async () => {
-			setupExecFile((cmd, args) => {
-				if (
-					cmd === "git" &&
-					args[0] === "merge-base" &&
-					args[1] === "--is-ancestor"
-				) {
-					throw new Error("not ancestor");
-				}
-				return { stdout: "" };
-			});
-
-			await handleCreatePr(
-				"Title",
-				"Body",
-				CWD,
-				postMessage,
-				"feature/other",
-				"abc123",
+		it("creates the PR even when the summary's commit is no longer reachable (rebase-just-happened regression)", async () => {
+			// Regression: pre-refactor, a non-reachable summary commit would block
+			// PR creation. Branch-first model: ignore commit reachability — push
+			// + create PR using the CURRENT branch.
+			const prUrl = "https://github.com/org/repo/pull/77";
+			setupExecFile(
+				buildRouter({
+					// Whatever ancestor probe might still happen elsewhere — irrelevant
+					// to handleCreatePr now; left as a non-ancestor to prove we don't
+					// gate on it.
+					"git:merge-base": () => {
+						throw new Error("not ancestor");
+					},
+					"git:push": () => ({ stdout: "" }),
+					"gh:pr:create": () => ({ stdout: `${prUrl}\n` }),
+					"git:rev-list": () => ({ stdout: "1\n" }),
+					"git:rev-parse": () => ({ stdout: "feature/branch\n" }),
+					"gh:--version": () => ({ stdout: "gh 2.40.0\n" }),
+					"gh:auth": () => ({ stdout: "ok\n" }),
+					"gh:pr:view": () => ({
+						stdout: JSON.stringify({
+							number: 77,
+							url: prUrl,
+							title: "Rebased PR",
+							body: "",
+						}),
+					}),
+				}),
 			);
+			showInformationMessage.mockResolvedValue(undefined);
+
+			await handleCreatePr("Rebased PR", "PR body", CWD, postMessage);
 
 			expect(postMessage).toHaveBeenCalledWith({ command: "prCreating" });
-			expect(postMessage).toHaveBeenCalledWith({ command: "prCreateFailed" });
-			expect(showWarningMessage).toHaveBeenCalledWith(
+			expect(postMessage).not.toHaveBeenCalledWith({
+				command: "prCreateFailed",
+			});
+			expect(showWarningMessage).not.toHaveBeenCalledWith(
 				expect.stringContaining("Cannot create a PR"),
 			);
 		});
@@ -1168,12 +1017,9 @@ describe("PrCommentService", () => {
 	// ─── handlePrepareUpdatePr ──────────────────────────────────────────────
 
 	describe("handlePrepareUpdatePr", () => {
-		// New signature: caller pre-builds the markdown and passes the branch +
-		// commit hash separately. The function is now PR-lookup + marker-merge
-		// only — single-summary vs aggregated rendering happens upstream in
-		// SummaryWebviewPanel before the call.
-		const SUMMARY_BRANCH = "feature/test-branch";
-		const SUMMARY_HASH = "deadbeef";
+		// Caller pre-builds the markdown. The function is purely PR-lookup +
+		// marker-merge — single-summary vs aggregated rendering happens upstream
+		// in SummaryWebviewPanel before the call.
 		const MARKDOWN = "## Summary\nFixed a bug";
 
 		it("posts prShowUpdateForm with merged body when PR exists", async () => {
@@ -1195,88 +1041,13 @@ describe("PrCommentService", () => {
 				return { stdout: "" };
 			});
 
-			await handlePrepareUpdatePr(
-				SUMMARY_BRANCH,
-				SUMMARY_HASH,
-				MARKDOWN,
-				CWD,
-				postMessage,
-			);
+			await handlePrepareUpdatePr(MARKDOWN, CWD, postMessage);
 
 			expect(postMessage).toHaveBeenCalledWith({
 				command: "prShowUpdateForm",
 				title: "PR Title",
 				body: `Old description\n\n${MARKER_START}\n## Summary\nFixed a bug\n${MARKER_END}`,
 			});
-		});
-
-		it("falls back to current branch when summaryBranch is undefined under cross-branch", async () => {
-			// Covers `summaryBranch ?? currentBranch` fallback. With a commit hash
-			// that fails merge-base --is-ancestor → isCrossBranch=true; with no
-			// summaryBranch passed, target falls through to currentBranch.
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "merge-base") {
-					throw new Error("not an ancestor");
-				}
-				if (cmd === "git" && args[0] === "rev-parse") {
-					return { stdout: "fallback-branch\n" };
-				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return {
-						stdout: JSON.stringify({
-							number: 1,
-							url: "u",
-							title: "t",
-							body: "",
-						}),
-					};
-				}
-				return { stdout: "" };
-			});
-
-			await handlePrepareUpdatePr(
-				undefined,
-				SUMMARY_HASH,
-				MARKDOWN,
-				CWD,
-				postMessage,
-			);
-
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({ command: "prShowUpdateForm" }),
-			);
-		});
-
-		it("treats undefined commitHash as not cross-branch (uses current branch)", async () => {
-			// When summaryCommitHash is undefined the cross-branch probe is skipped.
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "rev-parse") {
-					return { stdout: "feature/test-branch\n" };
-				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return {
-						stdout: JSON.stringify({
-							number: 5,
-							url: "u",
-							title: "t",
-							body: "",
-						}),
-					};
-				}
-				return { stdout: "" };
-			});
-
-			await handlePrepareUpdatePr(
-				SUMMARY_BRANCH,
-				undefined,
-				MARKDOWN,
-				CWD,
-				postMessage,
-			);
-
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({ command: "prShowUpdateForm" }),
-			);
 		});
 
 		it("replaces existing markers in PR body", async () => {
@@ -1298,13 +1069,7 @@ describe("PrCommentService", () => {
 				return { stdout: "" };
 			});
 
-			await handlePrepareUpdatePr(
-				SUMMARY_BRANCH,
-				SUMMARY_HASH,
-				MARKDOWN,
-				CWD,
-				postMessage,
-			);
+			await handlePrepareUpdatePr(MARKDOWN, CWD, postMessage);
 
 			const call = postMessage.mock.calls[0][0];
 			expect(call.body).toContain("Before\n");
@@ -1322,13 +1087,7 @@ describe("PrCommentService", () => {
 				throw new Error("no PR");
 			});
 
-			await handlePrepareUpdatePr(
-				SUMMARY_BRANCH,
-				SUMMARY_HASH,
-				MARKDOWN,
-				CWD,
-				postMessage,
-			);
+			await handlePrepareUpdatePr(MARKDOWN, CWD, postMessage);
 
 			expect(showWarningMessage).toHaveBeenCalledWith(
 				"No pull request found for branch feature/test-branch.",
@@ -1344,13 +1103,7 @@ describe("PrCommentService", () => {
 				return { stdout: "" };
 			});
 
-			await handlePrepareUpdatePr(
-				SUMMARY_BRANCH,
-				SUMMARY_HASH,
-				MARKDOWN,
-				CWD,
-				postMessage,
-			);
+			await handlePrepareUpdatePr(MARKDOWN, CWD, postMessage);
 
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				expect.stringContaining("git rev-parse exploded"),
@@ -1366,13 +1119,7 @@ describe("PrCommentService", () => {
 				return { stdout: "" };
 			});
 
-			await handlePrepareUpdatePr(
-				SUMMARY_BRANCH,
-				SUMMARY_HASH,
-				MARKDOWN,
-				CWD,
-				postMessage,
-			);
+			await handlePrepareUpdatePr(MARKDOWN, CWD, postMessage);
 
 			expect(showErrorMessage).toHaveBeenCalledWith(
 				expect.stringContaining("plain string error"),
@@ -1398,13 +1145,7 @@ describe("PrCommentService", () => {
 				return { stdout: "" };
 			});
 
-			await handlePrepareUpdatePr(
-				SUMMARY_BRANCH,
-				SUMMARY_HASH,
-				MARKDOWN,
-				CWD,
-				postMessage,
-			);
+			await handlePrepareUpdatePr(MARKDOWN, CWD, postMessage);
 
 			const call = postMessage.mock.calls[0][0];
 			expect(call.body).toBe(
@@ -1614,83 +1355,6 @@ describe("PrCommentService", () => {
 				"Updated PR #7",
 				"Open PR",
 			);
-		});
-
-		it("resolves target branch via summary branch when summaryCommitHash is unreachable", async () => {
-			// Covers handleUpdatePr's `summaryCommitHash ? ... : false` truthy branch,
-			// the `isCrossBranch ? ... : currentBranch` truthy branch, and the
-			// `summaryBranch ?? currentBranch` left branch (summaryBranch given).
-			const pr = { number: 9, url: "u", title: "Same", body: "" };
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "merge-base") {
-					throw new Error("not an ancestor");
-				}
-				if (cmd === "git" && args[0] === "rev-parse") {
-					return { stdout: "current-branch\n" };
-				}
-				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
-				if (cmd === "gh" && args[0] === "--version") return { stdout: "ok\n" };
-				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return { stdout: JSON.stringify(pr) };
-				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
-					return { stdout: "" };
-				}
-				return { stdout: "" };
-			});
-			showInformationMessage.mockResolvedValue(undefined);
-
-			await handleUpdatePr(
-				"Same",
-				"new body",
-				CWD,
-				postMessage,
-				"summary-branch",
-				"deadbeef",
-			);
-
-			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdating" });
-			// Verify the PR lookup used the summary branch (passed via the 2nd rev-parse)
-			const viewCall = mockExecFileAsync.mock.calls.find(
-				(c) => c[0] === "gh" && c[1][0] === "pr" && c[1][1] === "view",
-			);
-			expect(viewCall?.[1]).toContain("summary-branch");
-		});
-
-		it("falls back to current branch when summaryCommitHash is unreachable but summaryBranch is undefined", async () => {
-			// Covers the `summaryBranch ?? currentBranch` right branch in handleUpdatePr.
-			const pr = { number: 9, url: "u", title: "Same", body: "" };
-			setupExecFile((cmd, args) => {
-				if (cmd === "git" && args[0] === "merge-base") {
-					throw new Error("not an ancestor");
-				}
-				if (cmd === "git" && args[0] === "rev-parse") {
-					return { stdout: "current-branch\n" };
-				}
-				if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
-				if (cmd === "gh" && args[0] === "--version") return { stdout: "ok\n" };
-				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return { stdout: JSON.stringify(pr) };
-				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
-					return { stdout: "" };
-				}
-				return { stdout: "" };
-			});
-			showInformationMessage.mockResolvedValue(undefined);
-
-			await handleUpdatePr(
-				"Same",
-				"new body",
-				CWD,
-				postMessage,
-				undefined,
-				"deadbeef",
-			);
-
-			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdating" });
 		});
 
 		it("opens external URL when user clicks 'Open PR' after update", async () => {

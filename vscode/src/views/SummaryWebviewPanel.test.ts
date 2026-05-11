@@ -304,14 +304,11 @@ const {
 	mockHandleCreatePr,
 	mockHandlePrepareUpdatePr,
 	mockHandleUpdatePr,
-	mockIsCommitReachableFromHead,
 } = vi.hoisted(() => ({
 	mockHandleCheckPrStatus: vi.fn().mockResolvedValue(undefined),
 	mockHandleCreatePr: vi.fn().mockResolvedValue(undefined),
 	mockHandlePrepareUpdatePr: vi.fn().mockResolvedValue(undefined),
 	mockHandleUpdatePr: vi.fn().mockResolvedValue(undefined),
-	// Default: commit IS reachable from HEAD (i.e., NOT cross-branch).
-	mockIsCommitReachableFromHead: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("../services/PrCommentService.js", () => ({
@@ -319,7 +316,6 @@ vi.mock("../services/PrCommentService.js", () => ({
 	handleCreatePr: mockHandleCreatePr,
 	handlePrepareUpdatePr: mockHandlePrepareUpdatePr,
 	handleUpdatePr: mockHandleUpdatePr,
-	isCommitReachableFromHead: mockIsCommitReachableFromHead,
 	wrapWithMarkers: (s: string) => `[MARKERS]${s}[/MARKERS]`,
 }));
 
@@ -2561,8 +2557,6 @@ describe("SummaryWebviewPanel", () => {
 				expect(mockHandleCheckPrStatus).toHaveBeenCalledWith(
 					workspaceRoot,
 					expect.any(Function),
-					"feature/test",
-					"abc123",
 				);
 			});
 
@@ -2593,8 +2587,6 @@ describe("SummaryWebviewPanel", () => {
 					"PR Body",
 					workspaceRoot,
 					expect.any(Function),
-					"feature/test",
-					"abc123",
 				);
 			});
 
@@ -2689,21 +2681,67 @@ describe("SummaryWebviewPanel", () => {
 				);
 			});
 
-			it("uses single-summary path on cross-branch (commit not reachable from HEAD)", async () => {
-				mockIsCommitReachableFromHead.mockResolvedValueOnce(false);
-				mockBuildPrMarkdown.mockReturnValueOnce("# cross body");
-				const dispatch = await setupPanel({ commitMessage: "cross msg" });
+			it("branch has exactly 1 summary: uses summaries[0], NOT the webview's currentSummary", async () => {
+				// Branch-first guarantee: even if the panel was opened on a stale
+				// or different summary, when the current branch has one indexed
+				// summary the PR body/title come from THAT summary — the
+				// currentSummary is only a fallback for the length===0 tier.
+				const branchSummary = makeSummary({
+					commitHash: "BRANCH001",
+					commitMessage: "real branch commit",
+				});
+				mockLoadBranchSummaries.mockResolvedValueOnce({
+					summaries: [branchSummary],
+					missingCount: 0,
+					totalCount: 1,
+				});
+				mockBuildPrMarkdown.mockReturnValueOnce("# branch body");
+				const dispatch = await setupPanel({
+					commitHash: "STALEVIEW",
+					commitMessage: "stale viewer commit",
+				});
 
 				dispatch({ command: "prepareCreatePr" });
 				await flushPromises();
 
-				// Cross-branch must NOT call loadBranchSummaries.
-				expect(mockLoadBranchSummaries).not.toHaveBeenCalled();
+				// PR body source = summaries[0], not currentSummary
+				expect(mockBuildPrMarkdown).toHaveBeenCalledWith(
+					expect.objectContaining({ commitHash: "BRANCH001" }),
+				);
 				expect(mockBuildAggregatedPrMarkdown).not.toHaveBeenCalled();
 				expect(postMessage).toHaveBeenCalledWith({
 					command: "prShowCreateForm",
-					body: "[MARKERS]# cross body[/MARKERS]",
-					title: "cross msg",
+					body: "[MARKERS]# branch body[/MARKERS]",
+					title: "real branch commit",
+				});
+			});
+
+			it("branch has 0 summaries: falls back to currentSummary (rebase-not-yet-summarized tier)", async () => {
+				// Worker hasn't produced a summary for the rebased hash yet —
+				// the form should still be usable with the pre-rebase summary
+				// the webview was opened with.
+				mockLoadBranchSummaries.mockResolvedValueOnce({
+					summaries: [],
+					missingCount: 0,
+					totalCount: 0,
+				});
+				mockBuildPrMarkdown.mockReturnValueOnce("# fallback body");
+				const dispatch = await setupPanel({
+					commitHash: "PREREBASEHASH",
+					commitMessage: "pre-rebase msg",
+				});
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				expect(mockBuildPrMarkdown).toHaveBeenCalledWith(
+					expect.objectContaining({ commitHash: "PREREBASEHASH" }),
+				);
+				expect(mockBuildAggregatedPrMarkdown).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prShowCreateForm",
+					body: "[MARKERS]# fallback body[/MARKERS]",
+					title: "pre-rebase msg",
 				});
 			});
 
@@ -2756,8 +2794,6 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				expect(mockHandlePrepareUpdatePr).toHaveBeenCalledWith(
-					"feature/test",
-					"abc123",
 					"# update body",
 					workspaceRoot,
 					expect.any(Function),
@@ -2782,8 +2818,6 @@ describe("SummaryWebviewPanel", () => {
 
 				expect(mockBuildAggregatedPrMarkdown).toHaveBeenCalledWith([sA, sB], 0);
 				expect(mockHandlePrepareUpdatePr).toHaveBeenCalledWith(
-					"feature/test",
-					"abc123",
 					"# aggregated update",
 					workspaceRoot,
 					expect.any(Function),
@@ -2802,7 +2836,7 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "prepareUpdatePr" });
 				await flushPromises();
 
-				const md = mockHandlePrepareUpdatePr.mock.calls[0][2];
+				const md = mockHandlePrepareUpdatePr.mock.calls[0][0];
 				expect(md).toContain("# update body");
 				expect(md).toContain(
 					"> Note: 4 commit(s) without summary were skipped.",
@@ -2826,8 +2860,6 @@ describe("SummaryWebviewPanel", () => {
 			it("forwards postMessage callback to the webview panel", async () => {
 				mockHandlePrepareUpdatePr.mockImplementationOnce(
 					(
-						_branch: string,
-						_hash: string,
 						_md: string,
 						_cwd: string,
 						pm: (msg: Record<string, unknown>) => void,
@@ -2854,8 +2886,6 @@ describe("SummaryWebviewPanel", () => {
 					"Body",
 					workspaceRoot,
 					expect.any(Function),
-					"feature/test",
-					"abc123",
 				);
 			});
 
