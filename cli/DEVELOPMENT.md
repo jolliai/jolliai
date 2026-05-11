@@ -117,7 +117,7 @@ jolli status
 
 | Module | Build Output | Purpose |
 |--------|-------------|---------|
-| [Cli.ts](src/Cli.ts) | `dist/Cli.js` | CLI commands — Memory: `enable` / `disable` / `status` / `doctor` / `clean` / `view` / `export` / `recall` / `search` / `configure` / `migrate`; Auth: `auth login` / `logout` / `signup` / `status`; Site: `new` / `convert` / `dev` / `build` / `start` |
+| [Cli.ts](src/Cli.ts) | `dist/Cli.js` | CLI commands — Memory: `enable` / `disable` / `status` / `doctor` / `clean` / `view` / `export` / `recall` / `search` / `configure` / `migrate`; Auth: `auth login` / `logout` / `status`; Site: `new` / `convert` / `dev` / `build` / `start` |
 | [StopHook.ts](src/hooks/StopHook.ts) | `dist/StopHook.js` | Claude Code Stop event handler |
 | [SessionStartHook.ts](src/hooks/SessionStartHook.ts) | `dist/SessionStartHook.js` | Claude Code SessionStart hook (injects mini-briefing) |
 | [PostCommitHook.ts](src/hooks/PostCommitHook.ts) | `dist/PostCommitHook.js` | Git post-commit hook (operation detection + queue enqueue + worker spawn) |

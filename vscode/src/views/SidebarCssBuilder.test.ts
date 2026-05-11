@@ -51,21 +51,18 @@ describe("SidebarCssBuilder", () => {
 		expect(css).not.toContain(".kb-tag-memory");
 	});
 
-	it("styles the repo-root header (bold label, decorative cursor, no hover bg)", () => {
-		// The repo-root header mirrors IntelliJ KBExplorerPanel's repo node:
-		// bolded label for the current repo, and decorative (non-clickable)
-		// because folding the whole KB tree isn't useful in a single-repo view.
-		// Hover background is suppressed so the row doesn't suggest interaction.
+	it("bolds repo nodes (no longer has the dead repo-root banner styling)", () => {
+		// There's no Memory Bank header / banner row — repos sit at the top of
+		// the tree directly. The only surviving repo-level cue is
+		// the bold label on `[data-kind="repo"]`, which marks repos as the
+		// primary grouping in the flat listing. The previous repo-root rules
+		// (cursor:default, suppressed hover-bg) are removed since they styled
+		// a row that no longer renders.
 		const css = buildSidebarCss();
 		expect(css).toMatch(
-			/\.tree-node\[data-kind="repo-root"\][^{]*{\s*cursor:\s*default/,
+			/\.tree-node\[data-kind="repo"\]\s*>\s*\.label\s*{\s*font-weight:\s*600/,
 		);
-		expect(css).toMatch(
-			/\.tree-node\[data-kind="repo-root"\]\s*>\s*\.label\s*{\s*font-weight:\s*600/,
-		);
-		expect(css).toMatch(
-			/\.tree-node\[data-kind="repo-root"\]:hover\s*{\s*background:\s*transparent/,
-		);
+		expect(css).not.toContain('[data-kind="repo-root"]');
 	});
 });
 
@@ -130,34 +127,43 @@ describe("hover-reveal actions use visibility (no reflow)", () => {
 	});
 });
 
-describe("file-row truncation priority (filename over dirname)", () => {
+describe("file-row truncation priority (dirname-first, filename last-resort)", () => {
 	// Product decision: in BOTH the Changes panel and the COMMITS expanded
-	// commit-file rows, the filename must always read in full and the dirname
-	// is the one that gives up space first. The two row kinds were briefly
-	// split during the rollout — commit-file rows kept their legacy 60%
-	// label cap — but a follow-up unified them under one rule so the
-	// truncation experience is consistent across the whole sidebar.
-	// The 60% cap is explicitly guarded as REMOVED below so a future merge
-	// can't reintroduce the asymmetric behavior accidentally.
+	// commit-file rows, the dirname (.desc) absorbs essentially all overflow
+	// first; the filename (.label) only begins to ellipsize once the dirname
+	// has fully collapsed to 0. The two row kinds were briefly split during
+	// rollout (commit-file rows kept their legacy 60% label cap) but a
+	// follow-up unified them. The 60% cap is explicitly guarded as REMOVED
+	// below so a future merge can't reintroduce the asymmetric behavior.
+	//
+	// Why both labels CAN shrink (flex: 0 1 auto, not 0 0 auto): when even a
+	// fully-collapsed dirname can't make the row fit — e.g. a very long
+	// *.integration.test.ts in the Changes panel with the hover-only discard
+	// icon visible — the filename overflows the row visibly. Allowing the
+	// label to shrink at low priority (flex-shrink:1 vs desc's 9999) makes
+	// the filename ellipsize as a last resort instead of leaking out.
 
-	it("changes-row filename keeps natural width (flex:0 0 auto, no max-width cap)", () => {
+	it("changes-row filename shrinks at LOW priority (flex:0 1 auto + ellipsis)", () => {
 		const css = buildSidebarCss();
 		expect(css).toMatch(
-			/\.tree-node\.tree-node--changes\s+\.label[^{]*{[^}]*flex:\s*0\s+0\s+auto/,
+			/\.tree-node\.tree-node--changes\s+\.label[^{]*{[^}]*flex:\s*0\s+1\s+auto/,
 		);
 		expect(css).toMatch(
 			/\.tree-node\.tree-node--changes\s+\.label[^{]*{[^}]*max-width:\s*none/,
 		);
+		expect(css).toMatch(
+			/\.tree-node\.tree-node--changes\s+\.label[^{]*{[^}]*text-overflow:\s*ellipsis/,
+		);
 	});
 
-	it("commit-file row filename gets the same flip (no 60% cap, no shrink)", () => {
+	it("commit-file row filename gets the same low-priority shrink (no 60% cap)", () => {
 		// Pinned because this rule was previously asymmetric — commit-file
 		// rows used to cap the label at 60% so the dirname could sit
 		// alongside it. The flip removes that cap. Regressing back to the
 		// 60% cap would silently revert the unified UX.
 		const css = buildSidebarCss();
 		expect(css).toMatch(
-			/\.tree-node\[data-context="commitFile"\][^{]*{[^}]*flex:\s*0\s+0\s+auto/,
+			/\.tree-node\[data-context="commitFile"\][^{]*{[^}]*flex:\s*0\s+1\s+auto/,
 		);
 		expect(css).toMatch(
 			/\.tree-node\[data-context="commitFile"\][^{]*{[^}]*max-width:\s*none/,
@@ -169,16 +175,20 @@ describe("file-row truncation priority (filename over dirname)", () => {
 		);
 	});
 
-	it("dirname desc shrinks with ellipsis on both row kinds", () => {
-		// min-width:0 is load-bearing: flex items default to min-width:auto
-		// which equals content width, and that prevents text-overflow:ellipsis
-		// from ever firing. Without it the desc would still refuse to shrink.
+	it("dirname desc shrinks at HIGH priority (flex-shrink: 9999, with ellipsis)", () => {
+		// The 9999 vs 1 ratio is what enforces the priority — desc absorbs
+		// ~all overflow before the label gives up a single pixel. min-width:0
+		// is load-bearing: flex items default to min-width:auto (content-
+		// based), which would prevent text-overflow:ellipsis from ever firing.
 		// Both selectors must satisfy the rule — they're combined in source.
 		const css = buildSidebarCss();
 		for (const selector of [
 			'\\.tree-node\\[data-context="commitFile"\\]\\s+\\.desc',
 			"\\.tree-node\\.tree-node--changes\\s+\\.desc",
 		]) {
+			expect(css).toMatch(
+				new RegExp(`${selector}[^{]*{[^}]*flex:\\s*0\\s+9999\\s+auto`),
+			);
 			expect(css).toMatch(new RegExp(`${selector}[^{]*{[^}]*min-width:\\s*0`));
 			expect(css).toMatch(
 				new RegExp(`${selector}[^{]*{[^}]*text-overflow:\\s*ellipsis`),

@@ -58,6 +58,22 @@ describe("PlansDataService.mergeByLastModified", () => {
 		expect(merged[1].kind).toBe("note");
 	});
 
+	it("kind tie-break holds for both compare(plan,note) and compare(note,plan) call directions", () => {
+		// The previous test only exercises the cmp(plan, note) call direction
+		// — items=[p, n] is already in the desired order so sort never reverses
+		// the pair. With ≥3 same-timestamp items, the insertion-sort path
+		// inside Timsort triggers cmp(note, plan) when comparing the trailing
+		// note against an earlier-inserted plan. Pins the `: 1` branch of the
+		// `a.kind === "plan" ? -1 : 1` ternary so a future flip of that
+		// fallback doesn't silently scramble equal-timestamp ordering.
+		const ts = "2026-05-01T00:00:00Z";
+		const merged = PlansDataService.mergeByLastModified(
+			[makePlan(ts, "p1"), makePlan(ts, "p2")],
+			[makeNote(ts, "n1")],
+		);
+		expect(merged.map((m) => m.kind)).toEqual(["plan", "plan", "note"]);
+	});
+
 	it("handles only-plans and only-notes inputs", () => {
 		const plans = [makePlan("2026-01-01T00:00:00Z", "p1")];
 		const onlyPlans = PlansDataService.mergeByLastModified(plans, []);

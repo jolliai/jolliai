@@ -16,8 +16,17 @@ import { lstat, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { FolderStorage } from "../../cli/src/core/FolderStorage.js";
 import { getDiffStats } from "../../cli/src/core/GitOps.js";
 import {
+	extractRepoName,
+	getRemoteUrl,
+	resolveKbParent,
+} from "../../cli/src/core/KBPathResolver.js";
+import { discoverRepos } from "../../cli/src/core/KBRepoDiscoverer.js";
+import { MetadataManager } from "../../cli/src/core/MetadataManager.js";
+import {
+	loadConfig,
 	savePluginSource,
 	saveSquashPending,
 } from "../../cli/src/core/SessionTracker.js";
@@ -201,9 +210,17 @@ export class JolliMemoryBridge {
 	 * from the latest config. Called by the settings-save callback after the
 	 * user changes `storageMode` or `localFolder` so subsequent reads hit the
 	 * right backend without requiring a window reload.
+	 *
+	 * Also clears the aggregated cross-repo entries cache: when the user
+	 * changes `localFolder`, the discoverable set of foreign repos under the
+	 * Memory Bank parent changes too, so the cached merged list is stale by
+	 * definition. The old behavior left the cache in place, which is why
+	 * "switch Memory Bank folder then open Memories" used to show entries
+	 * from the previous folder until a window reload.
 	 */
 	reloadStorage(): void {
 		this.storagePromise = null;
+		this.cachedRootEntries = null;
 	}
 
 	// ── Enable / Disable ──────────────────────────────────────────────────
@@ -1285,12 +1302,21 @@ export class JolliMemoryBridge {
 	 * returns the total root count in a single index read. Sorted newest-first.
 	 * Used by the Memories panel for fast rendering.
 	 *
+	 * Aggregates entries across every repo discovered under the user's Memory
+	 * Bank parent (`localFolder`), tagging each with its source `repoName`.
+	 * The current workspace repo is loaded via the bridge's configured
+	 * storage (so orphan / dual-write users keep their original read path);
+	 * every other repo is read straight from its FolderStorage shadow on
+	 * disk. orphan-only users see only the current repo because foreign
+	 * orphan branches aren't reachable from this workspace.
+	 *
 	 * Results are cached; call {@link invalidateEntriesCache} when the orphan
 	 * ref changes to force a re-read on the next call.
 	 *
 	 * @param filter — optional case-insensitive substring matched against
-	 *   commitMessage and branch. When provided, only matching entries are
-	 *   returned and totalCount reflects the filtered set.
+	 *   commitMessage, branch, and repoName. Mirrors IntelliJ's Memory Bank
+	 *   search behaviour: the repo name itself is searchable so a query like
+	 *   "jolli" surfaces every memory across that repo.
 	 */
 	async listSummaryEntries(
 		count: number,
@@ -1301,11 +1327,75 @@ export class JolliMemoryBridge {
 		totalCount: number;
 	}> {
 		if (!this.cachedRootEntries) {
-			const storage = await this.getStorage();
-			const map = await getIndexEntryMap(this.cwd, storage);
-			// Deduplicate: aliases map different keys to the same entry object.
+			const merged: SummaryIndexEntry[] = [];
+			const currentRepoName = extractRepoName(this.cwd);
+
+			// 1. Current workspace repo — keep its configured storage path so
+			//    orphan/dual-write modes continue to read from their primary.
+			try {
+				const storage = await this.getStorage();
+				const map = await getIndexEntryMap(this.cwd, storage);
+				for (const entry of map.values()) {
+					merged.push({ ...entry, repoName: currentRepoName });
+				}
+			} catch (err) {
+				log.warn(
+					"listSummaryEntries",
+					`Failed to load current-repo entries: ${
+						err instanceof Error ? err.message : String(err)
+					}`,
+				);
+			}
+
+			// 2. Every other discovered repo — read straight from FolderStorage.
+			//    The current repo is skipped here because we've already loaded
+			//    it via its primary storage above; loading it again via folder
+			//    would double-count entries (deduping below would still drop the
+			//    duplicates, but the extra IO is wasted).
+			try {
+				const cfg = (await loadConfig()) as Record<string, unknown>;
+				const customKBPath = cfg.localFolder as string | undefined;
+				const kbParent = resolveKbParent(customKBPath);
+				const currentRemoteUrl = getRemoteUrl(this.cwd);
+				const repos = discoverRepos(
+					currentRepoName,
+					currentRemoteUrl,
+					kbParent,
+				);
+				for (const repo of repos) {
+					if (repo.isCurrentRepo) continue;
+					try {
+						const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
+						const repoStorage = new FolderStorage(repo.kbRoot, mm);
+						const map = await getIndexEntryMap(undefined, repoStorage);
+						for (const entry of map.values()) {
+							merged.push({ ...entry, repoName: repo.repoName });
+						}
+					} catch (err) {
+						log.warn(
+							"listSummaryEntries",
+							`Failed to load entries from repo '${repo.repoName}': ${
+								err instanceof Error ? err.message : String(err)
+							}`,
+						);
+					}
+				}
+			} catch (err) {
+				log.warn(
+					"listSummaryEntries",
+					`Multi-repo discovery failed: ${
+						err instanceof Error ? err.message : String(err)
+					}`,
+				);
+			}
+
+			// Deduplicate by commitHash. Current-repo entries were pushed first
+			// so when a tree-hash alias links the same commit across two repo
+			// folders (rare, but possible after rebase-pick across a fork) the
+			// current-repo copy wins — which is the version the user expects to
+			// see in their own workspace.
 			const seen = new Set<string>();
-			this.cachedRootEntries = [...map.values()]
+			this.cachedRootEntries = merged
 				.filter((e) => {
 					if (e.parentCommitHash != null || seen.has(e.commitHash)) {
 						return false;
@@ -1325,7 +1415,8 @@ export class JolliMemoryBridge {
 			entries = entries.filter(
 				(e) =>
 					e.commitMessage.toLowerCase().includes(lower) ||
-					e.branch.toLowerCase().includes(lower),
+					e.branch.toLowerCase().includes(lower) ||
+					(e.repoName ?? "").toLowerCase().includes(lower),
 			);
 		}
 		return {
@@ -1352,6 +1443,79 @@ export class JolliMemoryBridge {
 	async getSummary(hash: string): Promise<CommitSummary | null> {
 		const storage = await this.getStorage();
 		return getSummary(hash, this.cwd, storage);
+	}
+
+	/**
+	 * Cross-repo summary lookup. Tries the current repo's storage first (fast
+	 * path); on miss, scans every other repo discovered under the Memory Bank
+	 * parent (`localFolder`) using its FolderStorage shadow. Mirrors the same
+	 * discovery walk as {@link listSummaryEntries} so the Timeline view's
+	 * aggregated list and its detail-fetch click path stay in lockstep.
+	 *
+	 * Used by callers that present cross-repo data (Timeline, Memory Bank file
+	 * clicks). The single-repo {@link getSummary} stays the right choice for
+	 * paths that are guaranteed current-repo-only (COMMITS view, plain commit
+	 * hash deep links from this workspace).
+	 *
+	 * Returns null only when no repo under the Memory Bank parent has a
+	 * matching summary.
+	 */
+	async getSummaryAnyRepo(hash: string): Promise<CommitSummary | null> {
+		return (await this.getSummaryAnyRepoWithSource(hash)).summary;
+	}
+
+	/**
+	 * Same lookup as {@link getSummaryAnyRepo} but also returns the source
+	 * repo's `repoName` when the hit came from a non-current repo. Callers
+	 * that need to gate write actions (panel push/edit) on foreign-vs-local
+	 * provenance use this; callers that only need to render the summary
+	 * use the thinner {@link getSummaryAnyRepo} wrapper.
+	 *
+	 * `sourceRepoName: null` means the summary was found in the current
+	 * workspace's primary storage — safe for read+write. A non-null value
+	 * means the summary lives in another repo's FolderStorage; the caller
+	 * must treat the panel as read-only.
+	 */
+	async getSummaryAnyRepoWithSource(
+		hash: string,
+	): Promise<{ summary: CommitSummary | null; sourceRepoName: string | null }> {
+		const current = await this.getSummary(hash);
+		if (current) return { summary: current, sourceRepoName: null };
+
+		try {
+			const cfg = (await loadConfig()) as Record<string, unknown>;
+			const customKBPath = cfg.localFolder as string | undefined;
+			const kbParent = resolveKbParent(customKBPath);
+			const currentRepoName = extractRepoName(this.cwd);
+			const currentRemoteUrl = getRemoteUrl(this.cwd);
+			const repos = discoverRepos(currentRepoName, currentRemoteUrl, kbParent);
+			for (const repo of repos) {
+				if (repo.isCurrentRepo) continue;
+				try {
+					const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
+					const repoStorage = new FolderStorage(repo.kbRoot, mm);
+					const summary = await getSummary(hash, undefined, repoStorage);
+					if (summary) {
+						return { summary, sourceRepoName: repo.repoName };
+					}
+				} catch (err) {
+					log.warn(
+						"getSummaryAnyRepo",
+						`Failed to scan repo '${repo.repoName}': ${
+							err instanceof Error ? err.message : String(err)
+						}`,
+					);
+				}
+			}
+		} catch (err) {
+			log.warn(
+				"getSummaryAnyRepo",
+				`Multi-repo discovery failed: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			);
+		}
+		return { summary: null, sourceRepoName: null };
 	}
 
 	// ── Git utility methods ───────────────────────────────────────────────

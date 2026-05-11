@@ -96,10 +96,21 @@ export class FilesTreeProvider
 					? it.resourceUri.fsPath
 					: undefined;
 			const base = treeItemToSerialized(it, idHint);
+			// indexStatus / worktreeStatus are forwarded raw so the webview's
+			// discard path can rebuild a complete FileStatus on the host side.
+			// Routing only `statusCode` (which collapses both columns into one
+			// display letter) silently breaks bridge.discardFiles's dispatch —
+			// untracked / added / renamed files all need both columns to land
+			// in the right git-command branch.
 			return {
 				...base,
 				gitStatus: it.fileStatus.statusCode,
 				isSelected: it.fileStatus.isSelected,
+				indexStatus: it.fileStatus.indexStatus,
+				worktreeStatus: it.fileStatus.worktreeStatus,
+				...(it.fileStatus.originalPath
+					? { originalPath: it.fileStatus.originalPath }
+					: {}),
 			};
 		});
 	}

@@ -328,11 +328,22 @@ export class SidebarWebviewProvider
 				// command above. A bare id string would trip the handler's
 				// `if (!item?.fileStatus) return;` guard and the click would silently
 				// no-op, which is what the inline ↺ button hit before this case.
+				//
+				// indexStatus + worktreeStatus MUST be forwarded — `bridge.discardFiles`
+				// dispatches on the raw porcelain v1 columns (worktree-only restore vs
+				// staged-worktree restore vs unlink for untracked), not on the
+				// collapsed statusCode letter. Routing only statusCode used to land
+				// every file in the `git restore --staged --worktree` branch which
+				// silently failed for untracked files (pathspec unknown to git),
+				// leaving the activity-bar badge showing the pre-discard count.
 				void this.deps.executeCommand("jollimemory.discardFileChanges", {
 					fileStatus: {
 						absolutePath: msg.filePath,
 						relativePath: msg.relativePath,
 						statusCode: msg.statusCode,
+						indexStatus: msg.indexStatus,
+						worktreeStatus: msg.worktreeStatus,
+						...(msg.originalPath ? { originalPath: msg.originalPath } : {}),
 					},
 				});
 				return;
@@ -375,17 +386,16 @@ export class SidebarWebviewProvider
 	/**
 	 * Used by destructive host-side operations (currently Migrate to Memory Bank)
 	 * to force the client to drop its `folderCache` before the next listing
-	 * arrives. `newKbRepoFolder` replaces the client's auto-expand anchor so the
-	 * freshly created `-N`-suffixed folder is the one that gets auto-expanded.
+	 * arrives. The follow-up `handleExpandFolder("")` then re-fetches the root
+	 * listing — auto-expand of the new current repo is driven by the next
+	 * `kb:foldersData`'s `isCurrentRepo` flag, not by passing the folder name in
+	 * this message.
 	 *
 	 * Safe to call even when the view hasn't resolved yet — postMessage no-ops,
 	 * and the next `ready` will pick up the new state via getInitialState().
 	 */
-	refreshKnowledgeBaseFolders(newKbRepoFolder?: string): void {
-		this.postMessage({
-			type: "kb:foldersReset",
-			kbRepoFolder: newKbRepoFolder,
-		});
+	refreshKnowledgeBaseFolders(): void {
+		this.postMessage({ type: "kb:foldersReset" });
 		void this.handleExpandFolder("");
 	}
 

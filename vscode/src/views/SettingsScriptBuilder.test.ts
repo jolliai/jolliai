@@ -163,4 +163,47 @@ describe("SettingsScriptBuilder", () => {
 		expect(script).toContain("data-advanced-panel");
 		expect(script).toContain("Hide Advanced");
 	});
+
+	// ── Migrate-when-dirty confirmation ──
+	//
+	// The Migrate to Memory Bank command on the host reads localFolder from
+	// disk. If the user edited Folder Path but didn't Apply, naively firing the
+	// migrate posts to the *old* folder while the form shows the new one. The
+	// webview must (a) detect that dirty state, (b) defer to a host-side modal,
+	// (c) chain Apply → Migrate when the user confirms, and (d) abort the chain
+	// on settingsError. These assertions pin the pieces that, if removed, would
+	// silently revert to the old (misleading) behavior.
+
+	it("checks localFolder dirtiness before firing rebuildKnowledgeBase", () => {
+		expect(script).toContain("localFolderDirty");
+		expect(script).toContain(
+			"localFolderInput.value !== initialState.localFolder",
+		);
+	});
+
+	it("posts confirmDirtyMigrate to the host when Migrate is clicked with dirty Folder Path", () => {
+		expect(script).toContain("'confirmDirtyMigrate'");
+	});
+
+	it("handles the host's confirmDirtyMigrateResult to chain Apply → Migrate or abort", () => {
+		expect(script).toContain("confirmDirtyMigrateResult");
+		expect(script).toContain("pendingMigrateAfterApply");
+		// Apply path must be reused (not re-implemented) so the payload stays
+		// in lockstep with the Apply button click.
+		expect(script).toContain("submitApplySettings");
+	});
+
+	it("chains into startRebuild on settingsSaved when the migrate-after-apply flag is set", () => {
+		expect(script).toMatch(
+			/case 'settingsSaved':[\s\S]*pendingMigrateAfterApply[\s\S]*startRebuild\(\)/,
+		);
+	});
+
+	it("aborts the migrate-after-apply chain on settingsError", () => {
+		// Without this, a server-side rejection (e.g. invalid jolli key) would
+		// leave the migrate to run anyway against unsaved settings.
+		expect(script).toMatch(
+			/case 'settingsError':[\s\S]*pendingMigrateAfterApply = false/,
+		);
+	});
 });

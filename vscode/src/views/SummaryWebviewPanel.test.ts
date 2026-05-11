@@ -6583,6 +6583,144 @@ describe("SummaryWebviewPanel", () => {
 		});
 	});
 
+	// ── Foreign-repo dispatch guard ──────────────────────────────────────────
+	// When the panel was opened against a summary loaded from a NON-current
+	// repo (Memory Bank cross-repo lookup), every destructive webview command
+	// must short-circuit. The whitelist is small on purpose (default-deny):
+	// only commands that are workspace-independent reach their handler. This
+	// is the P1 silent-corruption guard — without it, push/edit clicks on a
+	// foreign memory write to the current workspace's orphan branch.
+
+	describe("foreign-repo guard", () => {
+		it("prefixes the panel title with the source repo name when foreign", async () => {
+			mockBuildPanelTitle.mockReturnValue("Original Title");
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo", // foreign provenance
+			);
+
+			const panel = createWebviewPanel.mock.results[0].value;
+			// `← <repo>:` prefix tells the user at a glance the tab is from
+			// another project. Without this, foreign panels were visually
+			// indistinguishable from a local read+write panel.
+			expect(panel.title).toBe("← other-repo: Original Title");
+		});
+
+		it("does NOT prefix the title when sourceRepoName is null (local panel)", async () => {
+			mockBuildPanelTitle.mockReturnValue("Original Title");
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				null,
+			);
+
+			const panel = createWebviewPanel.mock.results[0].value;
+			expect(panel.title).toBe("Original Title");
+		});
+
+		it("intercepts destructive commands and surfaces an info notification when foreign", async () => {
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+			);
+			const dispatch = captureMessageHandler();
+
+			// Sample of the destructive surface: push is the canonical write;
+			// editTopic exercises the edit family; createPr exercises the
+			// workspace-git family. All three must short-circuit before any
+			// handler runs.
+			dispatch({ command: "push" });
+			dispatch({ command: "editTopic", topicIndex: 0, updates: {} });
+			dispatch({
+				command: "createPr",
+				title: "x",
+				body: "y",
+			});
+			await flushPromises();
+
+			expect(showInformationMessage).toHaveBeenCalledTimes(3);
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/from other-repo.*push.*disabled/i),
+			);
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/from other-repo.*editTopic.*disabled/i),
+			);
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/from other-repo.*createPr.*disabled/i),
+			);
+		});
+
+		it("still allows the read-only whitelist (copyMarkdown, downloadMarkdown) on a foreign panel", async () => {
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+			);
+			const dispatch = captureMessageHandler();
+
+			// copyMarkdown is workspace-independent (clipboard only) so it
+			// must NOT trip the foreign guard. Verifying it makes it past
+			// the guard by checking that the denial notification did NOT
+			// fire — the handler itself goes on to use vscode.env.clipboard
+			// which is mocked elsewhere.
+			dispatch({ command: "copyMarkdown" });
+			await flushPromises();
+
+			// No "disabled to prevent writes" notification should have appeared.
+			const denialCalls = showInformationMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0].includes("disabled") : false,
+			);
+			expect(denialCalls).toHaveLength(0);
+		});
+
+		it("does NOT intercept any commands when sourceRepoName is null", async () => {
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				null,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// `push` goes to the real handler (which then runs handlePush
+			// against the bridge); the foreign-denial notification path
+			// must not fire for local panels.
+			const denialCalls = showInformationMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0].includes("disabled") : false,
+			);
+			expect(denialCalls).toHaveLength(0);
+		});
+	});
+
 	// ── Internal helpers (summariesEqual / setsEqual) ────────────────────────
 	describe("internal helpers", () => {
 		it("summariesEqual returns false when a is undefined", async () => {

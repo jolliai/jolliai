@@ -24,10 +24,10 @@ const KB_PARENT = join(homedir(), "Documents", "jolli");
 /**
  * Validates a user-configured KB parent path (`localFolder`) and returns the
  * effective parent dir. Falls back to the default `~/Documents/jolli/` when
- * the input is missing or unsafe. Centralized so `resolveKBPath` and the
- * legacy migration helper agree on the parent dir.
+ * the input is missing or unsafe. Centralized so `resolveKBPath`, the legacy
+ * migration helper, and `KBRepoDiscoverer` all agree on the parent dir.
  */
-function resolveParentDir(customPath?: string): string {
+export function resolveKbParent(customPath?: string): string {
 	if (!customPath) return KB_PARENT;
 	if (!isAbsolute(customPath) || customPath.includes("..")) {
 		log.warn(
@@ -43,7 +43,7 @@ function resolveParentDir(customPath?: string): string {
  * Resolves the KB root path for a repository.
  */
 export function resolveKBPath(repoName: string, remoteUrl: string | null, customPath?: string): string {
-	const parent = resolveParentDir(customPath);
+	const parent = resolveKbParent(customPath);
 	const basePath = join(parent, repoName);
 
 	if (!existsSync(basePath)) return basePath;
@@ -62,7 +62,7 @@ export function resolveKBPath(repoName: string, remoteUrl: string | null, custom
  * avoids reusing the current KB folder.
  */
 export function findFreshKBPath(repoName: string, customPath?: string): string {
-	const parent = resolveParentDir(customPath);
+	const parent = resolveKbParent(customPath);
 	const basePath = join(parent, repoName);
 	if (!existsSync(basePath)) return basePath;
 	for (let suffix = 2; suffix <= 99; suffix++) {

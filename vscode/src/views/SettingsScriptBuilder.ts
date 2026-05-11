@@ -59,6 +59,11 @@ export function buildSettingsScript(): string {
   // Auth state pushed by the extension host (settingsLoaded + authStateChanged).
   let signedIn = false;
   let hasJolliKey = false;
+  // Set when the user confirmed "Apply Changes & Migrate" in the dirty-folder
+  // dialog. We fire applySettings first, then chain into rebuildKnowledgeBase
+  // on settingsSaved (and abort the chain on settingsError so the migrate
+  // never runs against unsaved/invalid state).
+  let pendingMigrateAfterApply = false;
 
   // ── Tab switching ──
   // Match by data-tab on the button to data-panel on the section. Use the
@@ -254,11 +259,26 @@ export function buildSettingsScript(): string {
     vscode.postMessage({ command: 'browseLocalFolder' });
   });
 
-  rebuildKbBtn.addEventListener('click', function() {
-    if (rebuildKbBtn.disabled) return;
+  function localFolderDirty() {
+    return localFolderInput.value !== initialState.localFolder;
+  }
+
+  function startRebuild() {
     rebuildKbBtn.disabled = true;
     rebuildKbStatus.textContent = 'Rebuilding…';
     vscode.postMessage({ command: 'rebuildKnowledgeBase' });
+  }
+
+  rebuildKbBtn.addEventListener('click', function() {
+    if (rebuildKbBtn.disabled) return;
+    if (localFolderDirty()) {
+      // Host will show a native modal warning and post back the user's choice
+      // via 'confirmDirtyMigrateResult'. Don't disable the button yet so a
+      // Cancel leaves the UI exactly as the user left it.
+      vscode.postMessage({ command: 'confirmDirtyMigrate' });
+      return;
+    }
+    startRebuild();
   });
 
   // ── Dirty tracking ──
@@ -351,6 +371,16 @@ export function buildSettingsScript(): string {
   [maxTokensInput, excludePatternsInput].forEach(function(input) {
     input.addEventListener('input', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
+  // The Memory Bank folder input shares the same dirty/feedback handling as
+  // the other text fields. Additionally, editing the path makes any prior
+  // "Rebuild complete: ..." banner stale (the message echoes a path that no
+  // longer matches the form value), so clear it on input — same UX rule
+  // saveFeedback follows when a field is edited after a previous save.
+  localFolderInput.addEventListener('input', function() {
+    checkDirty();
+    clearSaveFeedback();
+    rebuildKbStatus.textContent = '';
+  });
   modelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
   aiProviderSelect.addEventListener('change', function() {
     checkDirty(); clearSaveFeedback(); syncProviderCard();
@@ -360,8 +390,10 @@ export function buildSettingsScript(): string {
   });
 
   // ── Apply Changes ──
-  applyBtn.addEventListener('click', function() {
-    if (applyBtn.disabled) return;
+  // Returns true if the apply message was posted, false if a validation error
+  // blocked the post. The Migrate-after-Apply chain uses the return value to
+  // decide whether to clear pendingMigrateAfterApply on the spot.
+  function submitApplySettings() {
     // Final client-side pass so inline errors stay in sync even if a field was
     // changed programmatically or before any input event had a chance to fire.
     validateAll();
@@ -369,7 +401,7 @@ export function buildSettingsScript(): string {
       saveFeedback.textContent = 'Please fix the highlighted fields before saving';
       saveFeedback.classList.add('error');
       saveFeedback.classList.add('visible');
-      return;
+      return false;
     }
     var maxVal = maxTokensInput.value.trim();
     vscode.postMessage({
@@ -392,6 +424,12 @@ export function buildSettingsScript(): string {
       maskedApiKey: maskedApiKey,
       maskedJolliApiKey: maskedJolliApiKey,
     });
+    return true;
+  }
+
+  applyBtn.addEventListener('click', function() {
+    if (applyBtn.disabled) return;
+    submitApplySettings();
   });
 
   // ── Messages from extension host ──
@@ -459,12 +497,31 @@ export function buildSettingsScript(): string {
           ? 'Rebuild complete: ' + (msg.message || '')
           : 'Rebuild failed: ' + (msg.message || 'unknown error');
         break;
+      case 'confirmDirtyMigrateResult':
+        if (!msg.proceed) {
+          // User cancelled — leave the form exactly as it was.
+          break;
+        }
+        // User chose "Apply Changes & Migrate". Try to submit the apply; if
+        // client-side validation blocks it, the chain is aborted (the same
+        // saveFeedback banner the regular Apply path would show is already up).
+        rebuildKbStatus.textContent = 'Saving settings…';
+        pendingMigrateAfterApply = true;
+        if (!submitApplySettings()) {
+          pendingMigrateAfterApply = false;
+          rebuildKbStatus.textContent = '';
+        }
+        break;
       case 'settingsSaved':
         saveFeedback.textContent = 'Settings saved';
         saveFeedback.classList.remove('error');
         saveFeedback.classList.add('visible');
         setTimeout(function() { saveFeedback.classList.remove('visible'); }, 2000);
         captureInitialState();
+        if (pendingMigrateAfterApply) {
+          pendingMigrateAfterApply = false;
+          startRebuild();
+        }
         break;
       case 'settingsError':
         // Persistent red banner — stays until the user edits a field (handled
@@ -472,6 +529,12 @@ export function buildSettingsScript(): string {
         saveFeedback.textContent = msg.message;
         saveFeedback.classList.add('error');
         saveFeedback.classList.add('visible');
+        if (pendingMigrateAfterApply) {
+          // Host rejected the save (e.g. server-side jolli key validation).
+          // Abort the chain so we don't migrate against unsaved state.
+          pendingMigrateAfterApply = false;
+          rebuildKbStatus.textContent = '';
+        }
         break;
     }
   });

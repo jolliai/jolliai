@@ -1,7 +1,7 @@
 /**
  * Browser OAuth Login Flow
  *
- * Opens the user's browser to the Jolli login/signup page and starts a local
+ * Opens the user's browser to the Jolli login page and starts a local
  * HTTP server to receive the OAuth callback. On success, redeems the
  * single-use exchange code and persists the auth token (and optionally an API
  * key) to the global config.
@@ -46,11 +46,13 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 
 					const callbackUrl = `http://127.0.0.1:${actualPort}/callback`;
 
-					// If no jolliApiKey yet, ask the server to generate one during login
+					// `client=cli` always identifies the originating surface to the
+					// server (telemetry, surface-aware behavior). `generate_api_key=true`
+					// is independent: only asked for when there's no existing key.
 					const config = await loadConfig();
-					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}`;
+					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}&client=cli`;
 					if (!config.jolliApiKey) {
-						loginUrl += "&generate_api_key=true&client=cli";
+						loginUrl += "&generate_api_key=true";
 					}
 
 					console.log("Opening browser to login...");

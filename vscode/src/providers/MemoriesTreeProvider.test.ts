@@ -617,7 +617,7 @@ describe("MemoriesTreeProvider", () => {
 // ── MemoriesTreeProvider.serialize ──────────────────────────────────────────
 
 describe("MemoriesTreeProvider.serialize", () => {
-	it("returns MemoryItem[] with id, title, hash, branch, project, timestamp", async () => {
+	it("returns MemoryItem[] with id, title, hash, branch, repoName, timestamp", async () => {
 		const entries = [
 			makeEntry({
 				commitHash: "aaaa",
@@ -644,7 +644,7 @@ describe("MemoriesTreeProvider.serialize", () => {
 						title: string;
 						commitHash: string;
 						branch: string;
-						project: string;
+						repoName: string;
 						timestamp: number;
 					}>;
 					hasMore: boolean;
@@ -658,10 +658,71 @@ describe("MemoriesTreeProvider.serialize", () => {
 			title: expect.any(String),
 			commitHash: expect.any(String),
 			branch: expect.any(String),
-			project: expect.any(String),
+			repoName: expect.any(String),
 			timestamp: expect.any(Number),
 		});
 		expect(result.hasMore).toBe(false);
+	});
+
+	it("propagates per-entry repoName from listSummaryEntries (cross-repo)", async () => {
+		const entries = [
+			makeEntry({
+				commitHash: "aaaa",
+				commitMessage: "Current repo entry",
+				commitDate: "2026-04-08T12:00:00.000Z",
+				branch: "main",
+				repoName: "test-project",
+			}),
+			makeEntry({
+				commitHash: "bbbb",
+				commitMessage: "Foreign repo entry",
+				commitDate: "2026-04-09T12:00:00.000Z",
+				branch: "main",
+				repoName: "other-repo",
+			}),
+		];
+		const bridge = makeBridge(entries);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => {
+					items: Array<{ commitHash: string; repoName: string }>;
+				};
+			}
+		).serialize();
+
+		const byHash = new Map(result.items.map((i) => [i.commitHash, i.repoName]));
+		expect(byHash.get("aaaa")).toBe("test-project");
+		expect(byHash.get("bbbb")).toBe("other-repo");
+	});
+
+	it("falls back to workspace basename when entry has no repoName", async () => {
+		const entry = makeEntry({
+			commitHash: "cccc",
+			commitMessage: "Legacy entry without repoName",
+			commitDate: "2026-04-10T12:00:00.000Z",
+			branch: "main",
+		});
+		// Strip repoName to simulate the orphan-only single-repo legacy code
+		// path that didn't annotate entries.
+		const stripped = {
+			...entry,
+			repoName: undefined,
+		} as unknown as SummaryIndexEntry;
+		const bridge = makeBridge([stripped]);
+		const provider = makeMemoriesProvider(bridge as never);
+		await provider.refresh();
+
+		const result = (
+			provider as unknown as {
+				serialize: () => { items: Array<{ repoName: string }> };
+			}
+		).serialize();
+
+		// bridge.cwd is "/home/user/test-project" — basename is "test-project".
+		expect(result.items[0].repoName).toBe("test-project");
 	});
 
 	it("returns hasMore=true when totalCount exceeds entries.length", async () => {

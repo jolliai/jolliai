@@ -396,4 +396,51 @@ describe("PlansStore — with watchers", () => {
 		await expect(store.refresh()).rejects.toThrow("bridge is down");
 		expect(bridge.listPlans).toHaveBeenCalled();
 	});
+
+	it("debounced timer catches a non-Error rejection and stringifies it for the log", async () => {
+		// Companion to the test above: the debounced-refresh .catch uses
+		// `err instanceof Error ? err.message : String(err)` to coerce the
+		// log message. The previous coverage pass only hit the `Error`
+		// branch (via a direct `store.refresh()` reject). This one routes a
+		// **string** rejection through the watcher → setTimeout → refresh
+		// path so the `: String(err)` arm runs. Pinned because a future
+		// refactor that drops the String(err) fallback would crash the log
+		// formatter on any non-Error rejection (e.g. third-party fetch libs
+		// that reject with raw response objects).
+		resetGlobals();
+		vi.useFakeTimers();
+		const bridge = makeBridge([], []);
+		const store = new PlansStore(bridge as never, DEFAULT_OPTIONS);
+		vi.spyOn(store, "refresh").mockRejectedValue("string-not-error");
+
+		watchers[0].fireChange({ fsPath: "/home/user/.claude/plans/x.md" });
+		vi.advanceTimersByTime(500);
+		// Let microtasks settle so the .catch runs before useRealTimers
+		// flushes anything pending.
+		await vi.runAllTicks();
+
+		vi.useRealTimers();
+		store.dispose();
+	});
+
+	it("handleNewPlanFile registerQueue catches and stringifies non-Error rejections from registerNewPlan", async () => {
+		// L209 mirror: the chained promise inside handleNewPlanFile has its
+		// own `instanceof Error ? .message : String(err)` log arm. Pin the
+		// non-Error path so a future refactor of the cross-project plan
+		// registration loop doesn't accidentally crash on a thrown string.
+		resetGlobals();
+		isPlanFromCurrentProject.mockResolvedValue(true);
+		registerNewPlan.mockRejectedValueOnce("registration-died-as-string");
+		const bridge = makeBridge([], []);
+		const store = new PlansStore(bridge as never, DEFAULT_OPTIONS);
+
+		watchers[0].fireCreate({ fsPath: "/home/user/.claude/plans/boom.md" });
+		await vi.waitFor(() => {
+			expect(registerNewPlan).toHaveBeenCalledWith("boom", "/repo");
+		});
+		// No assertion on log content — the contract under test is
+		// "doesn't throw / crash the watcher chain", which the absence of
+		// an unhandled rejection here proves.
+		store.dispose();
+	});
 });

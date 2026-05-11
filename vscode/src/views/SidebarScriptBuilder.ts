@@ -99,13 +99,6 @@ export function buildSidebarScript(): string {
   state.workerBusy = false;
   function persist() { vscode.setState(state); }
 
-  // Display name for the repo-root header rendered above the KB tree (origin
-  // URL basename when available, else workspace basename — see Extension.ts's
-  // resolveKbRepoFolderName). Populated from the init message and updated by
-  // kb:foldersReset. Empty string falls back to "Memory Bank" so the header
-  // still draws on a fresh KB before any push.
-  let kbRepoFolder = '';
-
   // ---- DOM refs ----
   const root = document.getElementById('sidebar-root');
   const tabBar = document.getElementById('tab-bar');
@@ -517,7 +510,6 @@ export function buildSidebarScript(): string {
         applyConfigured(msg.state.configured !== false);
         if (msg.state.activeTab) switchTab(msg.state.activeTab);
         if (msg.state.kbMode) state.kbMode = msg.state.kbMode;
-        if (typeof msg.state.kbRepoFolder === 'string') kbRepoFolder = msg.state.kbRepoFolder;
         renderBranchTabName(msg.state.branchName, msg.state.detached);
         renderToolbar();
         if (msg.state.enabled && state.activeTab === 'kb') {
@@ -612,9 +604,10 @@ export function buildSidebarScript(): string {
         // old paths under the prior repo folder no longer apply).
         for (const k in folderCache) delete folderCache[k];
         folderCache[''] = null;
-        // Refresh the repo-root header label — Migrate may move the Memory Bank
-        // folder to a -N-suffixed name, in which case the header must follow.
-        if (typeof msg.kbRepoFolder === 'string') kbRepoFolder = msg.kbRepoFolder;
+        // Migrate may swap which repo is "current" (post-migration the new
+        // -N-suffixed folder takes that role). Re-arm the one-shot so the
+        // next kb:foldersData re-expands the right repo.
+        currentRepoAutoExpanded = false;
         // Render immediately so the user sees "Loading..." instead of stale
         // tree contents while the host's follow-up kb:foldersData is in flight.
         if (state.activeTab === 'kb' && state.kbMode === 'folders') renderFolders();
@@ -893,6 +886,12 @@ export function buildSidebarScript(): string {
   // ---- Folders tree renderer ----
   // Cache: relPath → FolderNode (most recent server response merged in).
   const folderCache = { '': null };
+  // One-shot guard for the "auto-expand current repo" behavior. Set after we
+  // (a) see the current repo already has children populated, or (b) request a
+  // lazy expand for it. Reset by kb:foldersReset so a Migrate to Memory Bank
+  // — which renames the current repo's folder — gets to auto-expand the new
+  // current repo on the next data delivery.
+  let currentRepoAutoExpanded = false;
 
   function renderFolders() {
     const container = tabContents.kb;
@@ -901,43 +900,22 @@ export function buildSidebarScript(): string {
       mountIn(container, el('div', { className: 'placeholder', text: 'Loading...' }));
       return;
     }
-    // The Memory Bank tree is rendered with a single repo-root header node at
-    // depth 0, mirroring the IntelliJ Memory Bank view (MB > <repoName> >
-    // <branch> > <files>). The header label is kbRepoFolder, which
-    // Extension.ts computes from the git origin URL — so opening a worktree
-    // shows the real repo name, not the worktree directory name. Children
-    // always render at depth 1, regardless of whether the listing has data,
-    // so the header is visible (and useful) even on a fresh Memory Bank.
-    const repoLabel = kbRepoFolder || 'Memory Bank';
-    const repoHeader = el(
-      'div',
-      {
-        className: 'tree-node expanded',
-        'data-indent': '0',
-        'data-kind': 'repo-root',
-        title: repoLabel,
-      },
-      [
-        el('i', { className: 'codicon codicon-chevron-down commit-twirl' }),
-        el('span', { className: 'icon' }, [
-          el('i', { className: 'codicon codicon-repo' }),
-        ]),
-        el('span', { className: 'label', text: repoLabel }),
-      ],
-    );
-    const nodes = [repoHeader];
+    // Repos are promoted to top-level (depth 0): one node per discovered repo
+    // under <localFolder>. There's intentionally no "Memory Bank" / repo-name
+    // banner above this list — which repo is the user's own is already shown
+    // by the per-repo (current) suffix on current-repo-node. Matches the
+    // IntelliJ Memory Bank tool window's flat repo listing.
     if (!root.children || root.children.length === 0) {
-      nodes.push(
+      mountIn(
+        container,
         el('div', {
           className: 'empty-state',
           text: STRINGS.kbFoldersEmpty || 'No files yet.',
         }),
       );
-    } else {
-      const kids = renderFolderChildren(root.children, 1);
-      for (let i = 0; i < kids.length; i++) nodes.push(kids[i]);
+      return;
     }
-    mountIn(container, nodes);
+    mountIn(container, renderFolderChildren(root.children, 0));
   }
 
   function renderFolderChildren(children, depth) {
@@ -945,14 +923,21 @@ export function buildSidebarScript(): string {
     for (let i = 0; i < children.length; i++) {
       const child = children[i];
       const isDir = child.isDirectory;
+      const isRepoRoot = !!child.isRepoRoot;
+      const isCurrentRepo = !!child.isCurrentRepo;
       const expanded = isDir && Array.isArray(child.children);
       const fileKind = isDir ? '' : (child.fileKind || 'other');
       const attrs = {
-        className: 'tree-node' + (expanded ? ' expanded' : ''),
+        className:
+          'tree-node' +
+          (expanded ? ' expanded' : '') +
+          (isRepoRoot ? ' repo-root-node' : '') +
+          (isCurrentRepo ? ' current-repo-node' : ''),
         'data-indent': String(depth),
-        'data-kind': isDir ? 'dir' : 'file',
+        'data-kind': isRepoRoot ? 'repo' : (isDir ? 'dir' : 'file'),
         'data-path': child.relPath,
       };
+      if (isCurrentRepo) attrs['data-current-repo'] = '1';
       if (!isDir) {
         attrs['data-file-kind'] = fileKind;
         if (child.fileKey) attrs['data-key'] = child.fileKey;
@@ -981,13 +966,17 @@ export function buildSidebarScript(): string {
           })
         : el('span', { className: 'twirl' });
       // Icon column:
-      //   - dirs → codicon-folder (the repo-root header has its own renderer
-      //     with codicon-repo; children always start at depth >= 1 here)
+      //   - repo-root dirs → codicon-repo (top-level entries under the
+      //     Memory Bank header, one per discovered repo — matches the
+      //     IntelliJ Memory Bank tool window)
+      //   - plain dirs → codicon-folder
       //   - memory/plan/note files → codicon-markdown (all are .md), tinted
       //     by .kb-icon-{kind} class so the kind reads at a glance
       //   - other files → codicon-file
       let iconCodicon;
-      if (isDir) {
+      if (isRepoRoot) {
+        iconCodicon = 'repo';
+      } else if (isDir) {
         iconCodicon = 'folder';
       } else if (fileKind === 'memory' || fileKind === 'plan' || fileKind === 'note') {
         iconCodicon = 'markdown';
@@ -1042,8 +1031,24 @@ export function buildSidebarScript(): string {
       if (!parent || !parent.children) return;
       const idx = parent.children.findIndex(function(c) { return c.relPath === currentPath; });
       if (idx < 0) return;
+      // Defensive merge: a lazy-expand response describes the contents OF
+      // a node, not its identity AS displayed in its parent. If the existing
+      // child carries repo-level metadata (set by listParentRoot — name as
+      // configured, isRepoRoot, isCurrentRepo) that the incoming node
+      // forgot to carry over, fold those identity fields forward. Caught
+      // the bug where re-expanding the current repo replaced its name
+      // with "" and its repo icon with a generic folder.
+      const oldChild = parent.children[idx];
+      let merged = currentNode;
+      if (oldChild && oldChild.isRepoRoot && !currentNode.isRepoRoot) {
+        merged = Object.assign({}, currentNode, {
+          name: oldChild.name,
+          isRepoRoot: oldChild.isRepoRoot,
+          isCurrentRepo: oldChild.isCurrentRepo,
+        });
+      }
       const newKids = parent.children.slice();
-      newKids[idx] = currentNode;
+      newKids[idx] = merged;
       const newParent = Object.assign({}, parent, { children: newKids });
       folderCache[parentPath] = newParent;
       currentNode = newParent;
@@ -1077,6 +1082,31 @@ export function buildSidebarScript(): string {
     folderCache[tree.relPath] = tree;
     propagateUp(tree.relPath, tree);
     if (state.activeTab === 'kb' && state.kbMode === 'folders') renderFolders();
+    maybeAutoExpandCurrentRepo();
+  }
+
+  // Auto-expand the current repo on first delivery so the user lands inside
+  // their own memories instead of staring at a single bold row. One-shot: once
+  // we've done it (or seen it already expanded via reattachExpandedFromCache),
+  // we never auto-expand again so user-driven collapses stick. Triggers off
+  // any merge — usually the root listing, but a lazy expand reply that arrives
+  // before the root finishes is also fine.
+  function maybeAutoExpandCurrentRepo() {
+    if (currentRepoAutoExpanded) return;
+    const root = folderCache[''];
+    if (!root || !Array.isArray(root.children)) return;
+    const current = root.children.find(function(c) {
+      return c.isCurrentRepo && c.isRepoRoot;
+    });
+    if (!current) return;
+    if (Array.isArray(current.children)) {
+      // Already expanded (cache rehydrate / second delivery). Mark done so a
+      // later host refresh doesn't fight a user-initiated collapse.
+      currentRepoAutoExpanded = true;
+      return;
+    }
+    currentRepoAutoExpanded = true;
+    vscode.postMessage({ type: 'kb:expandFolder', path: current.relPath });
   }
 
   let memoriesState = { items: [], hasMore: false };
@@ -1101,12 +1131,34 @@ export function buildSidebarScript(): string {
       mountIn(container, nodes);
       return;
     }
+    // Detect cross-repo mode by counting distinct repoName values across the
+    // currently-loaded items. In single-repo views all items share the same
+    // repoName, so showing a repo badge would be visual noise; in multi-repo
+    // views (Memory Bank aggregating other repos) the badge disambiguates
+    // same-named branches across repos.
+    const repoNames = new Set();
+    for (let i = 0; i < memoriesState.items.length; i++) {
+      const r = memoriesState.items[i].repoName;
+      if (r) repoNames.add(r);
+    }
+    const showRepoBadge = repoNames.size > 1;
     for (let i = 0; i < memoriesState.items.length; i++) {
       const m = memoriesState.items[i];
       // No title= attribute — hover content is rendered by the custom
       // .hover-card popup (renderHoverCard / showHoverCard below) so the
       // legacy native MarkdownString experience (codicons + command links)
       // can be reproduced. A title= would surface a duplicate native tooltip.
+      const metaChildren = [
+        el('span', { className: 'hash', text: m.commitHash.slice(0, 8) }),
+        ' ',
+      ];
+      if (showRepoBadge && m.repoName) {
+        metaChildren.push(el('span', { className: 'repo', text: m.repoName }));
+        metaChildren.push(' ');
+      }
+      metaChildren.push(el('span', { className: 'branch', text: m.branch }));
+      metaChildren.push(' ');
+      metaChildren.push(el('span', { className: 'time', text: timeAgo(m.timestamp) }));
       const row = el('div', {
         className: 'memory-row',
         'data-id': m.id,
@@ -1120,13 +1172,7 @@ export function buildSidebarScript(): string {
         ]),
         el('div', { className: 'memory-row-main' }, [
           el('div', { className: 'title', text: m.title }),
-          el('div', { className: 'meta' }, [
-            el('span', { className: 'hash', text: m.commitHash.slice(0, 8) }),
-            ' ',
-            el('span', { className: 'branch', text: m.branch }),
-            ' ',
-            el('span', { className: 'time', text: timeAgo(m.timestamp) }),
-          ]),
+          el('div', { className: 'meta' }, metaChildren),
         ]),
         el('span', { className: 'inline-actions' }, [
           // Native title= is unreliable across webview focus transitions
@@ -1482,11 +1528,11 @@ export function buildSidebarScript(): string {
     if (!node) return;
     const kind = node.getAttribute('data-kind');
     const path = node.getAttribute('data-path');
-    // Repo-root header is a decorative banner — clicks fall through to a
-    // no-op (it has no data-path, and folding the whole tree isn't useful
-    // in a single-repo view).
-    if (kind === 'repo-root') return;
-    if (kind === 'dir') {
+    // Repo nodes are directories on disk (their data-path is the repo's dir
+    // name under <localFolder>) — clicking one must expand/collapse, not fire
+    // kb:openFile, which would route the path through openTextDocument and
+    // fail with "is a directory". 'repo' and 'dir' share the same toggle path.
+    if (kind === 'dir' || kind === 'repo') {
       const cached = folderCache[path];
       const expanded = cached && Array.isArray(cached.children);
       if (expanded) {
@@ -1774,12 +1820,19 @@ export function buildSidebarScript(): string {
       'data-indent': String(depth),
       'data-context': item.contextValue || '',
       'data-id': item.id,
-      // Stash the two extra fields the openFileChange command needs but
+      // Stash the fields the openFileChange / discardFile commands need but
       // can't recover from item.id alone (id is absolutePath; relativePath
       // and statusCode get dropped by the SerializedTreeItem → command
-      // bridge unless we surface them explicitly).
-      'data-rel-path':    item.description || '',
-      'data-status-code': gs,
+      // bridge unless we surface them explicitly). indexStatus +
+      // worktreeStatus are the porcelain v1 raw columns — bridge.discardFiles
+      // routes on those (not on the collapsed gs letter), so omitting them
+      // would silently break discard for untracked / added / renamed files
+      // and leave the activity-bar badge stale post-click.
+      'data-rel-path':       item.description || '',
+      'data-status-code':    gs,
+      'data-index-status':   item.indexStatus    || '',
+      'data-worktree-status':item.worktreeStatus || '',
+      'data-original-path':  item.originalPath   || '',
       title: item.tooltip || '',
     }, kids);
   }
@@ -2099,14 +2152,19 @@ export function buildSidebarScript(): string {
       if (action === 'discard') {
         // jollimemory.discardFileChanges expects a FileItem-shape (item.fileStatus.*),
         // not a bare id. Route through branch:discardFile so the host rebuilds
-        // {fileStatus:{absolutePath,relativePath,statusCode}} — same pattern as
-        // branch:openChange. data-rel-path / data-status-code live on the row
-        // (set by renderChangeRow) so we read them off the closest tree-node.
+        // {fileStatus:{absolutePath,relativePath,statusCode,indexStatus,worktreeStatus,...}}
+        // — same pattern as branch:openChange. data-* attrs live on the row
+        // (set by renderChangeRow). indexStatus + worktreeStatus must travel
+        // through because bridge.discardFiles routes on the raw porcelain
+        // columns, NOT on the collapsed gitStatus letter.
         vscode.postMessage({
           type: 'branch:discardFile',
-          filePath:     id,
-          relativePath: row ? (row.getAttribute('data-rel-path')    || '') : '',
-          statusCode:   row ? (row.getAttribute('data-status-code') || '') : '',
+          filePath:        id,
+          relativePath:    row ? (row.getAttribute('data-rel-path')        || '') : '',
+          statusCode:      row ? (row.getAttribute('data-status-code')     || '') : '',
+          indexStatus:     row ? (row.getAttribute('data-index-status')    || '') : '',
+          worktreeStatus:  row ? (row.getAttribute('data-worktree-status') || '') : '',
+          originalPath:    row ? (row.getAttribute('data-original-path')   || '') : '',
         });
       }
       if (action === 'viewSummary') {
@@ -2279,9 +2337,12 @@ export function buildSidebarScript(): string {
           label: 'Discard Changes',
           rawMessage: {
             type: 'branch:discardFile',
-            filePath:     id,
-            relativePath: row.getAttribute('data-rel-path')    || '',
-            statusCode:   row.getAttribute('data-status-code') || '',
+            filePath:        id,
+            relativePath:    row.getAttribute('data-rel-path')        || '',
+            statusCode:      row.getAttribute('data-status-code')     || '',
+            indexStatus:     row.getAttribute('data-index-status')    || '',
+            worktreeStatus:  row.getAttribute('data-worktree-status') || '',
+            originalPath:    row.getAttribute('data-original-path')   || '',
           },
         },
       ]);

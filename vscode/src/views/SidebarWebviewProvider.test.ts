@@ -354,7 +354,7 @@ describe("SidebarWebviewProvider", () => {
 						title: "t",
 						commitHash: "h",
 						branch: "b",
-						project: "p",
+						repoName: "p",
 						timestamp: 1,
 					},
 				],
@@ -651,6 +651,13 @@ describe("SidebarWebviewProvider", () => {
 		// guards on `if (!item?.fileStatus) return;` so the click silently
 		// no-op'd. The dedicated branch:discardFile message rebuilds the
 		// FileItem-shape on the host so the handler reads what it expects.
+		//
+		// indexStatus + worktreeStatus must travel through — bridge.discardFiles
+		// dispatches on the raw porcelain v1 columns, NOT on the collapsed
+		// statusCode letter. Dropping them previously routed every file to the
+		// `git restore --staged --worktree` branch, which silently failed for
+		// untracked files (pathspec unknown to git) and left the activity-bar
+		// badge showing the pre-discard count.
 		const view = makeMockView();
 		const exec = vi.fn();
 		const provider = new SidebarWebviewProvider({
@@ -671,12 +678,56 @@ describe("SidebarWebviewProvider", () => {
 			filePath: "/repo/src/App.ts",
 			relativePath: "src/App.ts",
 			statusCode: "M",
+			indexStatus: " ",
+			worktreeStatus: "M",
 		});
 		expect(exec).toHaveBeenCalledWith("jollimemory.discardFileChanges", {
 			fileStatus: {
 				absolutePath: "/repo/src/App.ts",
 				relativePath: "src/App.ts",
 				statusCode: "M",
+				indexStatus: " ",
+				worktreeStatus: "M",
+			},
+		});
+	});
+
+	it("forwards branch:discardFile with originalPath for rename rows", () => {
+		// Rename rows need the source path so the bridge can unstage both
+		// the old and the new path in one shot. Non-rename rows are tested
+		// above; their originalPath stays undefined and the host omits it.
+		const view = makeMockView();
+		const exec = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: { fsPath: "/mock", with: () => ({}) } as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:discardFile",
+			filePath: "/repo/new.ts",
+			relativePath: "new.ts",
+			statusCode: "R",
+			indexStatus: "R",
+			worktreeStatus: " ",
+			originalPath: "old.ts",
+		});
+		expect(exec).toHaveBeenCalledWith("jollimemory.discardFileChanges", {
+			fileStatus: {
+				absolutePath: "/repo/new.ts",
+				relativePath: "new.ts",
+				statusCode: "R",
+				indexStatus: "R",
+				worktreeStatus: " ",
+				originalPath: "old.ts",
 			},
 		});
 	});
@@ -1555,7 +1606,7 @@ describe("SidebarWebviewProvider", () => {
 		expect(() => provider.dispose()).not.toThrow();
 	});
 
-	it("refreshKnowledgeBaseFolders posts kb:foldersReset with new anchor and re-lists root", async () => {
+	it("refreshKnowledgeBaseFolders posts kb:foldersReset and re-lists root", async () => {
 		const view = makeMockView();
 		const tree = { name: "", relPath: "", isDirectory: true, children: [] };
 		const kbFolders = { listChildren: vi.fn().mockResolvedValue(tree) };
@@ -1575,7 +1626,7 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.postMessage.mockClear();
-		provider.refreshKnowledgeBaseFolders("jolliai-2");
+		provider.refreshKnowledgeBaseFolders();
 		await new Promise((r) => setTimeout(r, 0));
 		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
 		const reset = sent.find(
@@ -1585,7 +1636,10 @@ describe("SidebarWebviewProvider", () => {
 				(m as { type?: unknown }).type === "kb:foldersReset",
 		);
 		expect(reset).toBeDefined();
-		expect((reset as { kbRepoFolder?: string }).kbRepoFolder).toBe("jolliai-2");
+		// kb:foldersReset is intentionally payload-free now — the next root
+		// listing carries `isCurrentRepo` on every repo node, so callers don't
+		// need to thread the new anchor name through the message.
+		expect(Object.keys(reset as object)).toEqual(["type"]);
 		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
 	});
 

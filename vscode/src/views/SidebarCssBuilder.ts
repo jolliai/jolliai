@@ -54,8 +54,17 @@ export function buildSidebarCss(): string {
     border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
     flex-shrink: 0;
   }
+  /* Labeled tabs (Branch / Memory Bank) size to their content rather than
+     splitting the tab-bar evenly: flex-grow:0 stops them from claiming free
+     space, flex-basis:auto starts them at the natural label width, and
+     flex-shrink:1 + min-width:0 still let them collapse with text-overflow
+     when the sidebar is too narrow to fit them. max-width caps a single
+     long branch name (e.g. "feature/JOLLI-9999-long-name") so it can't
+     push the right-side toolbar off-screen. The status-indicator pill
+     overrides this with flex: 0 0 auto below. */
   .tab {
-    flex: 1;
+    flex: 0 1 auto;
+    max-width: 180px;
     padding: 6px 6px;
     font-size: 11px;
     color: var(--vscode-descriptionForeground);
@@ -253,14 +262,20 @@ export function buildSidebarCss(): string {
     white-space: nowrap;
     user-select: none;
   }
-  .tree-node[data-indent="1"] { padding-left: 20px; }
-  .tree-node[data-indent="2"] { padding-left: 32px; }
-  .tree-node[data-indent="3"] { padding-left: 44px; }
-  .tree-node[data-indent="4"] { padding-left: 56px; }
-  .tree-node[data-indent="5"] { padding-left: 68px; }
-  .tree-node[data-indent="6"] { padding-left: 80px; }
-  .tree-node[data-indent="7"] { padding-left: 92px; }
-  .tree-node[data-indent="8"] { padding-left: 104px; }
+  /* Per-level indent step is 20px (matching VS Code's default tree). The
+     row's leading column is chevron(12) + gap(4) + icon(16) = 32px+; with a
+     12px step a child's chevron landed between the parent's chevron and icon
+     and the hierarchy looked "aligned, not nested" — see Memory Bank tree
+     report. 20px ensures the child chevron is clearly past the parent
+     chevron column. */
+  .tree-node[data-indent="1"] { padding-left: 28px; }
+  .tree-node[data-indent="2"] { padding-left: 48px; }
+  .tree-node[data-indent="3"] { padding-left: 68px; }
+  .tree-node[data-indent="4"] { padding-left: 88px; }
+  .tree-node[data-indent="5"] { padding-left: 108px; }
+  .tree-node[data-indent="6"] { padding-left: 128px; }
+  .tree-node[data-indent="7"] { padding-left: 148px; }
+  .tree-node[data-indent="8"] { padding-left: 168px; }
   /* KB tab folder-mode rows carry data-kind="dir|file" (set by the
      folder renderer) — branch tab rows use data-context instead, so this
      selector cleanly scopes the spacing bump to folder mode. We match
@@ -301,44 +316,58 @@ export function buildSidebarCss(): string {
   .tree-node .icon.kb-icon-memory .codicon { color: var(--vscode-charts-blue,  #2f7adc); }
   .tree-node .icon.kb-icon-plan   .codicon { color: var(--vscode-charts-green, #388a34); }
   .tree-node .icon.kb-icon-note   .codicon { color: var(--vscode-charts-orange, #d18616); }
-  /* Repo-root header — bold label + non-interactive cursor mirror the
-     IntelliJ KBExplorerPanel renderer, which marks the current repo node
-     with REGULAR_BOLD_ATTRIBUTES. Hover background is suppressed because
-     the header is decorative (clicks no-op) and the hover affordance
-     would otherwise suggest folding the whole tree. */
-  .tree-node[data-kind="repo-root"] {
-    cursor: default;
-  }
-  .tree-node[data-kind="repo-root"] > .label {
+  /* Repo nodes inside the Memory Bank tree — one per discovered repo under
+     <localFolder>. Bold label marks repos as a primary grouping in the now
+     flat top-level listing. */
+  .tree-node[data-kind="repo"] > .label {
     font-weight: 600;
   }
-  .tree-node[data-kind="repo-root"]:hover {
-    background: transparent;
+  /* Current-repo cue: a 2px left accent bar (the same visual language
+     VSCode uses for "this is your active context") plus a quiet "(current)"
+     suffix. Mirrors IntelliJ's KBExplorerPanel isCurrentRepo highlight
+     without competing with the row's hover / selected background.
+     box-sizing here is content-box (the default), so a 2px border-left
+     pushes content 2px to the right. To keep this row's chevron column-
+     aligned with sibling repos (which have no border) we subtract those
+     2px from the depth-0 base padding (8px) — giving 6px padding here.
+     Total content offset stays 8px on every row. A hardcoded 18px once
+     lived here from when the base was different; the resulting +12px drift
+     made the (current) repo's chevron look like it belonged to a deeper
+     hierarchy level than its siblings.
+     Note: this override is depth-0 only — repo-root nodes never nest. */
+  .tree-node.current-repo-node {
+    border-left: 2px solid var(--vscode-focusBorder);
+    padding-left: 6px;
+  }
+  .tree-node.current-repo-node > .label::after {
+    content: " (current)";
+    color: var(--vscode-descriptionForeground);
+    font-weight: 400;
   }
   .tree-node .label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-  /* commit-file rows AND changes rows share one truncation priority: the
-     filename keeps its natural content width (no shrink, no max-width cap)
-     and the dirname (.desc) is the sole shrinkable segment that absorbs
-     overflow with a "…" tail. This mirrors native VSCode SCM behavior
-     (Source Control panel + Timeline file rows) where dirnames truncate
-     before filenames — losing the start of a path is much less ambiguous
-     than losing the start or end of a filename. Layout per row:
-       <icon> <label> <dirname-or-…>  …spacer…  <letter> [<discard>]
-     Changes rows additionally toggle their inline-actions on hover
-     (CSS in tree-node--changes rules below); the truncation priority
-     itself is identical between the two row kinds. */
+  /* Hierarchical truncation for changes / commit-file rows. The dirname
+     (.desc) gets flex-shrink:9999 vs the filename's :1, so dirname absorbs
+     essentially all overflow first and only after it collapses to 0 does
+     the filename begin to ellipsize. Result: reads filename-first like
+     native VSCode SCM, but recovers gracefully when even a fully-collapsed
+     dirname can't make the row fit (e.g. very long *.integration.test.ts
+     names in the Changes panel with the discard icon shown on hover).
+     min-width:0 on both is load-bearing — flex items default to
+     min-width:auto (content-based), which would prevent text-overflow:
+     ellipsis from ever firing. Layout per row:
+       <icon> <label> <dirname-or-…>  …spacer…  <letter> [<discard>] */
   .tree-node[data-context="commitFile"] .label,
   .tree-node.tree-node--changes .label {
-    flex: 0 0 auto;
+    flex: 0 1 auto;
+    min-width: 0;
     max-width: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  /* Pair to the .label rule above: dirname collapses with ellipsis when
-     the row runs out of space. min-width:0 is required because flex items
-     default to min-width:auto (content-based), which would otherwise
-     prevent the ellipsis from ever firing. */
   .tree-node[data-context="commitFile"] .desc,
   .tree-node.tree-node--changes .desc {
-    flex: 0 1 auto;
+    flex: 0 9999 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -379,14 +408,15 @@ export function buildSidebarCss(): string {
      - visibility (not display) toggle keeps the row from reflowing on
        hover; the slot stays reserved.
      - gs-letter override drops the margin-left:auto it'd inherit from
-       the commit-file default rule below — letter just sits 4px after
-       the inline-actions group. */
+       the commit-file default rule below — letter sits flush against
+       the inline-actions group (its own padding-left:4px supplies the
+       breathing room from the discard button's internal right padding). */
   .tree-node.tree-node--changes .inline-actions {
     visibility: hidden;
     margin-left: auto;
   }
   .tree-node.tree-node--changes:hover .inline-actions { visibility: visible; }
-  .tree-node.tree-node--changes .gs-letter { margin-left: 4px; }
+  .tree-node.tree-node--changes .gs-letter { margin-left: 0; }
 
   .memory-row {
     padding: 6px 12px;
@@ -579,7 +609,7 @@ export function buildSidebarCss(): string {
      the .gs-{code} class composed alongside .gs-letter. */
   .tree-node .gs-letter {
     margin-left: auto;
-    padding-left: 8px;
+    padding-left: 4px;
     font-size: 11px;
     flex-shrink: 0;
   }

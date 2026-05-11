@@ -3,9 +3,32 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Hoisted mocks ────────────────────────────────────────────────────────────
 
-const { savePluginSource, saveSquashPending } = vi.hoisted(() => ({
+const { loadConfig, savePluginSource, saveSquashPending } = vi.hoisted(() => ({
+	loadConfig: vi.fn().mockResolvedValue({}),
 	savePluginSource: vi.fn(),
 	saveSquashPending: vi.fn(),
+}));
+
+const { discoverRepos } = vi.hoisted(() => ({
+	discoverRepos: vi.fn().mockReturnValue([]),
+}));
+
+const { extractRepoName, getRemoteUrl, resolveKbParent } = vi.hoisted(() => ({
+	extractRepoName: vi.fn().mockReturnValue("test-repo"),
+	getRemoteUrl: vi.fn().mockReturnValue(null),
+	resolveKbParent: vi.fn().mockReturnValue("/mock/home/Documents/jolli"),
+}));
+
+const { MockFolderStorage, MockMetadataManager } = vi.hoisted(() => ({
+	MockFolderStorage: class {
+		constructor(
+			public readonly rootPath: string,
+			public readonly mm: unknown,
+		) {}
+	},
+	MockMetadataManager: class {
+		constructor(public readonly dir: string) {}
+	},
 }));
 
 const { loadGlobalConfig } = vi.hoisted(() => ({
@@ -115,8 +138,34 @@ const execFileMock = vi.hoisted(() => {
 // ── vi.mock calls ────────────────────────────────────────────────────────────
 
 vi.mock("../../cli/src/core/SessionTracker.js", () => ({
+	loadConfig,
 	savePluginSource,
 	saveSquashPending,
+}));
+
+vi.mock("../../cli/src/core/KBRepoDiscoverer.js", () => ({
+	discoverRepos,
+}));
+
+vi.mock("../../cli/src/core/KBPathResolver.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<
+			typeof import("../../cli/src/core/KBPathResolver.js")
+		>();
+	return {
+		...actual,
+		extractRepoName,
+		getRemoteUrl,
+		resolveKbParent,
+	};
+});
+
+vi.mock("../../cli/src/core/FolderStorage.js", () => ({
+	FolderStorage: MockFolderStorage,
+}));
+
+vi.mock("../../cli/src/core/MetadataManager.js", () => ({
+	MetadataManager: MockMetadataManager,
 }));
 
 vi.mock("./util/WorkspaceUtils.js", () => ({
@@ -287,6 +336,18 @@ describe("JolliMemoryBridge", () => {
 			apiKey: "test-key",
 			model: "claude-3",
 		});
+		// SessionTracker.loadConfig is read by StorageFactory.createStorage AND
+		// by listSummaryEntries (for the localFolder lookup). Default to an
+		// empty config so storageMode falls back to "dual-write" and there's no
+		// custom Memory Bank path.
+		loadConfig.mockResolvedValue({});
+		// Multi-repo helpers used by listSummaryEntries. Default to "no other
+		// repos discoverable" so existing single-repo tests keep their narrow
+		// expectations; cross-repo cases override per-test.
+		discoverRepos.mockReturnValue([]);
+		extractRepoName.mockReturnValue("test-repo");
+		getRemoteUrl.mockReturnValue(null);
+		resolveKbParent.mockReturnValue("/mock/home/Documents/jolli");
 		savePluginSource.mockResolvedValue(undefined);
 		saveSquashPending.mockResolvedValue(undefined);
 		installerInstall.mockResolvedValue({
@@ -2014,6 +2075,194 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
+	describe("getSummaryAnyRepo()", () => {
+		// Counterpart to listSummaryEntries' multi-repo aggregation: the
+		// Timeline view shows memories from every discovered repo, so the
+		// detail-fetch path that runs on row-click must also walk every
+		// repo. Without this, foreign-repo Timeline rows would surface a
+		// "No summary found for commit XXX" toast even though the data
+		// exists one folder over.
+
+		it("fast-paths to current-repo storage when the summary lives there", async () => {
+			const own = { commitHash: "aaa", topics: [] };
+			getSummary.mockResolvedValueOnce(own);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepo("aaa");
+
+			expect(result).toEqual(own);
+			// Discovery must not run when the fast path already returned a hit
+			// — needlessly walking foreign FolderStorages on every click would
+			// flood IO on users with many Memory Bank repos.
+			expect(discoverRepos).not.toHaveBeenCalled();
+		});
+
+		it("falls back to a non-current repo's FolderStorage when the current repo lacks the summary", async () => {
+			const foreign = { commitHash: "bbb", topics: [] };
+			// 1st call (current repo, primary storage) → null.
+			// 2nd call (foreign FolderStorage) → the summary.
+			getSummary.mockResolvedValueOnce(null).mockResolvedValueOnce(foreign);
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/home-repo",
+					repoName: "home-repo",
+					dirName: "home-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/other-repo",
+					repoName: "other-repo",
+					dirName: "other-repo",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepo("bbb");
+
+			expect(result).toEqual(foreign);
+			// The foreign lookup must be wired through a FolderStorage instance
+			// (NOT the bridge's primary storage), so the call shape on the
+			// fallback path differs from the current-repo fast path.
+			expect(getSummary).toHaveBeenLastCalledWith(
+				"bbb",
+				undefined,
+				expect.anything(),
+			);
+		});
+
+		it("returns null when no repo under the Memory Bank parent has the summary", async () => {
+			getSummary.mockResolvedValue(null);
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/home-repo",
+					repoName: "home-repo",
+					dirName: "home-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/other-repo",
+					repoName: "other-repo",
+					dirName: "other-repo",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepo("zzz");
+
+			expect(result).toBeNull();
+		});
+
+		it("swallows per-repo errors and keeps scanning the remaining repos", async () => {
+			const foreign = { commitHash: "ccc", topics: [] };
+			// Current: null. First foreign: throws. Second foreign: hit.
+			// The loop must NOT abort on the throw — partial outages on one
+			// FolderStorage shouldn't hide summaries that DO exist elsewhere.
+			getSummary
+				.mockResolvedValueOnce(null)
+				.mockRejectedValueOnce(new Error("ENOENT: stat .jolli"))
+				.mockResolvedValueOnce(foreign);
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/home",
+					repoName: "home",
+					dirName: "home",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/broken",
+					repoName: "broken",
+					dirName: "broken",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/healthy",
+					repoName: "healthy",
+					dirName: "healthy",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepo("ccc");
+
+			expect(result).toEqual(foreign);
+		});
+	});
+
+	describe("getSummaryAnyRepoWithSource()", () => {
+		// Provenance variant of getSummaryAnyRepo. The panel uses this to
+		// know whether a summary lived in the current workspace's primary
+		// storage (sourceRepoName=null → safe to edit) or in a foreign repo
+		// (sourceRepoName=<repo> → read-only, destructive commands blocked).
+		// Without provenance the panel could load a foreign-origin summary
+		// and then accept push/edit messages that write to the WRONG repo.
+
+		it("returns sourceRepoName=null when the summary lives in the current repo", async () => {
+			const own = { commitHash: "aaa", topics: [] };
+			getSummary.mockResolvedValueOnce(own);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepoWithSource("aaa");
+
+			expect(result.summary).toEqual(own);
+			// null is the load-bearing signal here — non-null would silently
+			// flip the panel to read-only even though the summary is local.
+			expect(result.sourceRepoName).toBeNull();
+			expect(discoverRepos).not.toHaveBeenCalled();
+		});
+
+		it("returns sourceRepoName=<foreign repoName> when the summary falls through to a non-current repo", async () => {
+			const foreign = { commitHash: "bbb", topics: [] };
+			getSummary.mockResolvedValueOnce(null).mockResolvedValueOnce(foreign);
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/home-repo",
+					repoName: "home-repo",
+					dirName: "home-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/other-repo",
+					repoName: "other-repo",
+					dirName: "other-repo",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepoWithSource("bbb");
+
+			expect(result.summary).toEqual(foreign);
+			// The repoName is the one from DiscoveredRepo (config.repoName,
+			// not dirName) — it's what the panel surfaces in the title and
+			// the "denied" notification, so users see a name they recognize
+			// from the Memory Bank tree, not a collision-suffixed dirname.
+			expect(result.sourceRepoName).toBe("other-repo");
+		});
+
+		it("returns sourceRepoName=null when no repo has the summary", async () => {
+			getSummary.mockResolvedValue(null);
+			discoverRepos.mockReturnValue([]);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepoWithSource("zzz");
+
+			expect(result.summary).toBeNull();
+			expect(result.sourceRepoName).toBeNull();
+		});
+	});
+
 	// ── Git utility methods ──────────────────────────────────────────────
 
 	describe("getCurrentUserName()", () => {
@@ -2991,6 +3240,298 @@ describe("JolliMemoryBridge", () => {
 
 			expect(result.entries).toHaveLength(0);
 			expect(result.totalCount).toBe(1);
+		});
+
+		// ── Multi-repo aggregation ───────────────────────────────────────────
+		// listSummaryEntries discovers every repo under the Memory Bank parent
+		// (mirroring IntelliJ's Memory Bank view) and merges their indexes so
+		// the user sees memories from all projects, not just the workspace
+		// they happen to have open.
+
+		it("tags current-repo entries with the current repoName", async () => {
+			extractRepoName.mockReturnValue("home-repo");
+			const e = makeEntry("aaa", "2025-01-01T00:00:00Z", "msg", "main");
+			getIndexEntryMap.mockResolvedValue(new Map([["aaa", e]]));
+
+			const bridge = makeBridge();
+			const result = await bridge.listSummaryEntries(10);
+
+			expect(result.entries[0]?.repoName).toBe("home-repo");
+		});
+
+		it("merges entries from every discovered repo and tags each with its repoName", async () => {
+			extractRepoName.mockReturnValue("home-repo");
+			// Current repo: entry "aaa"
+			const ownEntry = makeEntry("aaa", "2025-01-01T00:00:00Z", "own", "main");
+			getIndexEntryMap.mockResolvedValueOnce(new Map([["aaa", ownEntry]]));
+			// Other repo: entry "bbb" — getIndexEntryMap is also called for the
+			// foreign FolderStorage; the second mockResolvedValueOnce wires its
+			// return value.
+			const foreignEntry = makeEntry(
+				"bbb",
+				"2025-01-02T00:00:00Z",
+				"foreign",
+				"dev",
+			);
+			getIndexEntryMap.mockResolvedValueOnce(new Map([["bbb", foreignEntry]]));
+
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/home-repo",
+					repoName: "home-repo",
+					dirName: "home-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/other-repo",
+					repoName: "other-repo",
+					dirName: "other-repo",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+
+			const bridge = makeBridge();
+			const result = await bridge.listSummaryEntries(10);
+
+			const tagged = new Map(
+				result.entries.map((e) => [e.commitHash, e.repoName]),
+			);
+			expect(tagged.get("aaa")).toBe("home-repo");
+			expect(tagged.get("bbb")).toBe("other-repo");
+			// Sorted newest-first across repos: bbb (Jan 2) before aaa (Jan 1).
+			expect(result.entries.map((e) => e.commitHash)).toEqual(["bbb", "aaa"]);
+		});
+
+		it("filter matches against repoName, mirroring IntelliJ's search behaviour", async () => {
+			extractRepoName.mockReturnValue("home-repo");
+			// Current repo: a commit with no message/branch match for "marketing".
+			getIndexEntryMap.mockResolvedValueOnce(
+				new Map([
+					[
+						"aaa",
+						makeEntry("aaa", "2025-01-01T00:00:00Z", "unrelated", "main"),
+					],
+				]),
+			);
+			// Foreign repo "marketing-site": message/branch don't mention it,
+			// but the repoName itself does — IntelliJ surfaces this match.
+			getIndexEntryMap.mockResolvedValueOnce(
+				new Map([
+					["bbb", makeEntry("bbb", "2025-01-02T00:00:00Z", "fix link", "main")],
+				]),
+			);
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/home-repo",
+					repoName: "home-repo",
+					dirName: "home-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/marketing-site",
+					repoName: "marketing-site",
+					dirName: "marketing-site",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+
+			const bridge = makeBridge();
+			const result = await bridge.listSummaryEntries(10, 0, "marketing");
+
+			expect(result.entries).toHaveLength(1);
+			expect(result.entries[0]?.commitHash).toBe("bbb");
+		});
+
+		it("skips the current repo when iterating discovered repos to avoid double-counting", async () => {
+			extractRepoName.mockReturnValue("home-repo");
+			const entry = makeEntry("aaa", "2025-01-01T00:00:00Z", "msg", "main");
+			getIndexEntryMap.mockResolvedValue(new Map([["aaa", entry]]));
+
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/home-repo",
+					repoName: "home-repo",
+					dirName: "home-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+
+			const bridge = makeBridge();
+			const result = await bridge.listSummaryEntries(10);
+
+			// getIndexEntryMap is called exactly once — for the current repo
+			// via primary storage. The foreign-repo branch sees the
+			// isCurrentRepo flag and skips before constructing a second
+			// FolderStorage.
+			expect(getIndexEntryMap).toHaveBeenCalledTimes(1);
+			expect(result.entries).toHaveLength(1);
+		});
+	});
+
+	// ── listSummaryEntries — error paths ────────────────────────────────────
+
+	describe("listSummaryEntries() — error paths", () => {
+		// Both the current-repo path and the foreign-repo loop wrap their
+		// getIndexEntryMap calls in try/catch with `instanceof Error ?
+		// .message : String(err)` log coercion. Without dedicated tests
+		// these warn arms (and especially the String(err) fallback) sit
+		// uncovered, and a future refactor that turns the log helper into
+		// `.message` would crash on any non-Error rejection — IO libs are
+		// notorious for throwing raw strings / response objects.
+
+		it("logs and skips entries when current-repo getIndexEntryMap throws an Error", async () => {
+			getIndexEntryMap.mockRejectedValueOnce(new Error("EACCES: orphan ref"));
+			const bridge = makeBridge();
+
+			const result = await bridge.listSummaryEntries(10);
+
+			expect(result.entries).toEqual([]);
+			expect(result.totalCount).toBe(0);
+		});
+
+		it("logs and skips entries when current-repo getIndexEntryMap throws a non-Error", async () => {
+			getIndexEntryMap.mockRejectedValueOnce("raw-string-error");
+			const bridge = makeBridge();
+
+			const result = await bridge.listSummaryEntries(10);
+
+			expect(result.entries).toEqual([]);
+		});
+
+		it("logs but keeps scanning siblings when a foreign-repo getIndexEntryMap throws", async () => {
+			extractRepoName.mockReturnValue("home-repo");
+			// Current repo loads cleanly.
+			getIndexEntryMap.mockResolvedValueOnce(
+				new Map([
+					[
+						"aaa",
+						{
+							commitHash: "aaa",
+							commitDate: "2025-01-01T00:00:00Z",
+							commitMessage: "own",
+							branch: "main",
+							parentCommitHash: null,
+							topicCount: 1,
+						},
+					],
+				]),
+			);
+			// First foreign repo throws Error → covers L1367 Error arm.
+			getIndexEntryMap.mockRejectedValueOnce(new Error("foreign EACCES"));
+			// Second foreign throws a string → covers L1370 String(err) arm.
+			getIndexEntryMap.mockRejectedValueOnce("raw-foreign-string");
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/home-repo",
+					repoName: "home-repo",
+					dirName: "home-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/broken",
+					repoName: "broken",
+					dirName: "broken",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/raw-throw",
+					repoName: "raw-throw",
+					dirName: "raw-throw",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.listSummaryEntries(10);
+
+			// Current-repo entry survives even though both siblings failed.
+			expect(result.entries.map((e) => e.commitHash)).toEqual(["aaa"]);
+		});
+
+		it("logs but degrades gracefully when discoverRepos itself throws", async () => {
+			extractRepoName.mockReturnValue("home-repo");
+			// Current repo loads cleanly so we can prove the outer catch is
+			// what stops the foreign-loop, not a missing fast-path.
+			getIndexEntryMap.mockResolvedValueOnce(
+				new Map([
+					[
+						"aaa",
+						{
+							commitHash: "aaa",
+							commitDate: "2025-01-01T00:00:00Z",
+							commitMessage: "own",
+							branch: "main",
+							parentCommitHash: null,
+							topicCount: 1,
+						},
+					],
+				]),
+			);
+			discoverRepos.mockImplementation(() => {
+				throw new Error("scandir broke");
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.listSummaryEntries(10);
+
+			expect(result.entries.map((e) => e.commitHash)).toEqual(["aaa"]);
+		});
+
+		it("filter against repoName tolerates entries with no repoName tag (falls back to '')", async () => {
+			// Repeatable scenario: extractRepoName returns undefined on a
+			// repo whose .git is detached / has no working tree label. The
+			// merged entry then has `repoName: undefined`, and the filter's
+			// `(e.repoName ?? "").toLowerCase().includes(...)` must coerce
+			// without crashing. Pin the `?? ""` arm.
+			extractRepoName.mockReturnValue(undefined);
+			getIndexEntryMap.mockResolvedValueOnce(
+				new Map([
+					[
+						"aaa",
+						{
+							commitHash: "aaa",
+							commitDate: "2025-01-01T00:00:00Z",
+							commitMessage: "irrelevant",
+							branch: "main",
+							parentCommitHash: null,
+							topicCount: 1,
+						},
+					],
+				]),
+			);
+			const bridge = makeBridge();
+
+			const result = await bridge.listSummaryEntries(10, 0, "marketing");
+			// No repoName, no message/branch match → filtered out, no crash.
+			expect(result.entries).toEqual([]);
+		});
+	});
+
+	// ── reloadStorage ───────────────────────────────────────────────────────
+
+	describe("reloadStorage()", () => {
+		it("is callable and clears the internal storage cache without throwing", async () => {
+			// Settings-save callback invokes this after the user changes
+			// `storageMode` or `localFolder` so subsequent reads hit the right
+			// backend without a window reload. The method only nullifies a
+			// private storagePromise — no observable return — so the test
+			// asserts the contract that matters here: it doesn't throw and
+			// follow-up operations against the bridge still work.
+			const bridge = makeBridge();
+			expect(() => bridge.reloadStorage()).not.toThrow();
+			// Follow-up call must still resolve normally (no use-after-clear
+			// crash from a half-reset state).
+			getIndexEntryMap.mockResolvedValueOnce(new Map());
+			const result = await bridge.listSummaryEntries(10);
+			expect(result.entries).toEqual([]);
 		});
 	});
 
