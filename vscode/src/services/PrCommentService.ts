@@ -328,20 +328,22 @@ async function createPr(
 type PostMessageFn = (msg: Record<string, unknown>) => void;
 
 /**
- * Checks the PR status for the current branch and sends the result to the webview.
+ * Checks the PR status for the summary's branch and sends the result to the webview.
  *
- * PR operations are branch-scoped, not commit-scoped: we always look up the PR
- * on the current branch (`gh pr list --head <currentBranch>`), regardless of
- * which summary the user has open. This keeps the model predictable across
- * rebase / branch-switch and removes the cross-branch footgun where a stale
- * `summaryCommitHash` could route the lookup to the wrong branch.
+ * PR operations are branch-scoped, not commit-scoped: we look up the PR on
+ * `summaryBranch` (the branch the summary was generated on), with fallback to
+ * the current branch when no summary is in view. This keeps Memory Bank
+ * cross-branch navigation honest — clicking a summary on `feat-x` while
+ * checked out on `feat-y` shows `feat-x`'s PR, not `feat-y`'s. Commit hash
+ * is intentionally ignored to stay rebase-safe (the Flyer regression).
  */
 export async function handleCheckPrStatus(
 	cwd: string,
 	postMessage: PostMessageFn,
+	summaryBranch?: string,
 ): Promise<void> {
 	try {
-		const targetBranch = await getCurrentBranch(cwd);
+		const targetBranch = summaryBranch ?? (await getCurrentBranch(cwd));
 
 		// Check gh availability — distinguish "not installed" (definitive) from
 		// transient spawn errors so the user gets an actionable message.
@@ -392,22 +394,38 @@ export async function handleCheckPrStatus(
 }
 
 /**
- * Creates a new PR for the current branch using the user-provided title and body.
+ * Creates a new PR for the summary's branch.
  *
- * Branch-scoped: `git push -u origin HEAD` + `gh pr create` always act on the
- * checked-out branch. The summary that the webview was opened with is purely
- * informational here — it determines the PR body content (assembled by the
- * caller) but never gates whether a PR can be created.
+ * Routing is by `summaryBranch` (matches Check/Update PR), but the physical
+ * `git push -u origin HEAD` requires that branch to be the one currently
+ * checked out. So we guard: if `summaryBranch !== currentBranch` (Memory Bank
+ * cross-branch view), reject with `prCreateBlockedCrossBranch` and let the
+ * webview prompt the user to checkout first. When `summaryBranch` is undefined
+ * (no summary context), fall back to current-branch behavior.
  */
 export async function handleCreatePr(
 	title: string,
 	body: string,
 	cwd: string,
 	postMessage: PostMessageFn,
+	summaryBranch?: string,
 ): Promise<void> {
-	postMessage({ command: "prCreating" });
-
 	try {
+		const currentBranch = await getCurrentBranch(cwd);
+		if (summaryBranch && summaryBranch !== currentBranch) {
+			vscode.window.showWarningMessage(
+				`This summary is on branch ${summaryBranch}. Checkout ${summaryBranch} to create its PR.`,
+			);
+			postMessage({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch,
+				currentBranch,
+			});
+			return;
+		}
+
+		postMessage({ command: "prCreating" });
+
 		// Ensure branch is pushed
 		log.info(TAG, "Pushing branch to origin...");
 		await pushBranch(cwd);
@@ -418,7 +436,7 @@ export async function handleCreatePr(
 		log.info(TAG, `PR created: ${prUrl}`);
 
 		// Refresh section to show the new PR
-		await handleCheckPrStatus(cwd, postMessage);
+		await handleCheckPrStatus(cwd, postMessage, summaryBranch);
 
 		// Toast with "Open PR" action
 		vscode.window
@@ -437,11 +455,13 @@ export async function handleCreatePr(
 }
 
 /**
- * Prepares the Update PR form by fetching the current branch's PR data,
- * replacing the marker region with the caller-provided markdown, and
- * sending the pre-filled title + body to the webview.
+ * Prepares the Update PR form by fetching the summary's PR data, replacing
+ * the marker region with the caller-provided markdown, and sending the
+ * pre-filled title + body to the webview.
  *
- * Branch-scoped: looks up the PR on the current branch. The caller assembles
+ * Routes by `summaryBranch` (Memory Bank cross-branch viewing needs to target
+ * the summary's branch, not whatever the user has checked out). Falls back to
+ * `currentBranch` when `summaryBranch` is undefined. The caller assembles
  * `markdown` (single-summary or branch-aggregated) — this function only
  * handles the GitHub-side lookup + marker replacement.
  */
@@ -449,9 +469,10 @@ export async function handlePrepareUpdatePr(
 	markdown: string,
 	cwd: string,
 	postMessage: PostMessageFn,
+	summaryBranch?: string,
 ): Promise<void> {
 	try {
-		const targetBranch = await getCurrentBranch(cwd);
+		const targetBranch = summaryBranch ?? (await getCurrentBranch(cwd));
 		const pr = await findPrForBranch(cwd, targetBranch);
 		if (!pr) {
 			vscode.window.showWarningMessage(
@@ -475,21 +496,24 @@ export async function handlePrepareUpdatePr(
 }
 
 /**
- * Updates the current branch's PR title and description with the user-edited
- * values from the form.
+ * Updates the summary's PR title and description with the user-edited values
+ * from the form.
  *
- * Branch-scoped: always updates the PR on the current branch.
+ * Routes by `summaryBranch` (Memory Bank cross-branch viewing edits the
+ * summary's branch's PR, not currentBranch's). Falls back to `currentBranch`
+ * when `summaryBranch` is undefined.
  */
 export async function handleUpdatePr(
 	title: string,
 	body: string,
 	cwd: string,
 	postMessage: PostMessageFn,
+	summaryBranch?: string,
 ): Promise<void> {
 	postMessage({ command: "prUpdating" });
 
 	try {
-		const targetBranch = await getCurrentBranch(cwd);
+		const targetBranch = summaryBranch ?? (await getCurrentBranch(cwd));
 		const pr = await findPrForBranch(cwd, targetBranch);
 		if (!pr) {
 			postMessage({ command: "prUpdateFailed" });
@@ -509,8 +533,9 @@ export async function handleUpdatePr(
 
 		log.info(TAG, `Updated PR #${pr.number}`);
 
-		// Refresh section to reflect new state
-		await handleCheckPrStatus(cwd, postMessage);
+		// Refresh section to reflect new state — pass summaryBranch through so
+		// the refresh stays scoped to the same branch we just updated.
+		await handleCheckPrStatus(cwd, postMessage, summaryBranch);
 
 		vscode.window
 			.showInformationMessage(`Updated PR #${pr.number}`, "Open PR")
@@ -819,6 +844,20 @@ export function buildPrMessageScript(): string {
       prFormSubmit.textContent = 'Submit PR';
       prFormSubmit.disabled = false;
       prFormCancel.disabled = false;
+    }
+    // ── PR create blocked by cross-branch guard ──
+    // Fires when the summary's branch differs from the current branch. The
+    // extension side has already shown a warning toast; here we just revert
+    // any "Loading..." / "Creating..." UI back to a clickable state so the
+    // user can checkout the right branch and retry without a stale UI.
+    if (msg.command === 'prCreateBlockedCrossBranch') {
+      var blockedBtn = document.getElementById('createPrBtn');
+      if (blockedBtn) { blockedBtn.textContent = 'Create PR'; blockedBtn.disabled = false; }
+      if (prFormSubmit) {
+        prFormSubmit.textContent = 'Submit PR';
+        prFormSubmit.disabled = false;
+      }
+      if (prFormCancel) { prFormCancel.disabled = false; }
     }
     if (msg.command === 'prUpdating' && prFormSubmit) {
       prFormSubmit.textContent = 'Updating...';

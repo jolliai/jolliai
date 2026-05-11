@@ -717,8 +717,6 @@ describe("PrCommentService", () => {
 			});
 		});
 
-		// ── branch parameter tests ────────────────────────────────────────────
-
 		// ── debug.log observability (non-goal: UI folding stays the same) ─────
 
 		/**
@@ -851,6 +849,74 @@ describe("PrCommentService", () => {
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
 			);
+		});
+
+		// ── summaryBranch routing (Memory Bank) ──────────────────────────────
+		//
+		// When the user opens a summary from another branch in Memory Bank,
+		// the PR lookup must target the summary's branch, not the user's
+		// currently checked-out branch. We assert by capturing the `--head`
+		// argument passed to `gh pr list`.
+
+		it("queries the PR for the summary's branch when summaryBranch is passed", async () => {
+			let prListHeadArg: string | undefined;
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "feature/current\n" };
+				}
+				if (cmd === "gh" && args[0] === "--version") {
+					return { stdout: "gh 2.40.0\n" };
+				}
+				if (cmd === "gh" && args[0] === "auth") {
+					return { stdout: "ok\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					const sepIdx = args.indexOf("--");
+					if (sepIdx >= 0) {
+						prListHeadArg = args[sepIdx + 1];
+					}
+					return { stdout: "" };
+				}
+				return { stdout: "" };
+			});
+
+			await handleCheckPrStatus(CWD, postMessage, "feature/summary-branch");
+
+			expect(prListHeadArg).toBe("feature/summary-branch");
+			// noPr message also reflects the summary branch, not the current one.
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					status: "noPr",
+					branch: "feature/summary-branch",
+				}),
+			);
+		});
+
+		it("falls back to currentBranch when summaryBranch is undefined", async () => {
+			let prListHeadArg: string | undefined;
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "feature/current\n" };
+				}
+				if (cmd === "gh" && args[0] === "--version") {
+					return { stdout: "gh 2.40.0\n" };
+				}
+				if (cmd === "gh" && args[0] === "auth") {
+					return { stdout: "ok\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					const sepIdx = args.indexOf("--");
+					if (sepIdx >= 0) {
+						prListHeadArg = args[sepIdx + 1];
+					}
+					return { stdout: "" };
+				}
+				return { stdout: "" };
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(prListHeadArg).toBe("feature/current");
 		});
 	});
 
@@ -1012,6 +1078,86 @@ describe("PrCommentService", () => {
 			});
 			expect(uriParse).toHaveBeenCalledWith(prUrl);
 		});
+
+		// ── Cross-branch guard (Memory Bank) ─────────────────────────────────
+		//
+		// When the user is viewing a summary on branch X while checked out on
+		// branch Y, `git push -u origin HEAD` would push Y's commits to X's PR
+		// — silently wrong. The service-side guard must reject before any
+		// push/create runs.
+
+		it("cross-branch: rejects with prCreateBlockedCrossBranch and skips push/create when summaryBranch differs from currentBranch", async () => {
+			let gitPushCalled = false;
+			let prCreateCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:rev-parse": () => ({ stdout: "feature/current\n" }),
+					"git:push": () => {
+						gitPushCalled = true;
+						return { stdout: "" };
+					},
+					"gh:pr:create": () => {
+						prCreateCalled = true;
+						return { stdout: "https://example/0\n" };
+					},
+				}),
+			);
+
+			await handleCreatePr(
+				"T",
+				"B",
+				CWD,
+				postMessage,
+				"feature/summary-branch",
+			);
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prCreateBlockedCrossBranch",
+				summaryBranch: "feature/summary-branch",
+				currentBranch: "feature/current",
+			});
+			expect(postMessage).not.toHaveBeenCalledWith({ command: "prCreating" });
+			expect(gitPushCalled).toBe(false);
+			expect(prCreateCalled).toBe(false);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("feature/summary-branch"),
+			);
+		});
+
+		it("cross-branch: proceeds normally when summaryBranch equals currentBranch", async () => {
+			const prUrl = "https://github.com/org/repo/pull/123";
+			let gitPushCalled = false;
+			setupExecFile(
+				buildRouter({
+					"git:rev-parse": () => ({ stdout: "feature/same\n" }),
+					"git:push": () => {
+						gitPushCalled = true;
+						return { stdout: "" };
+					},
+					"gh:pr:create": () => ({ stdout: `${prUrl}\n` }),
+					"git:rev-list": () => ({ stdout: "1\n" }),
+					"gh:--version": () => ({ stdout: "gh 2.40.0\n" }),
+					"gh:auth": () => ({ stdout: "ok\n" }),
+					"gh:pr:view": () => ({
+						stdout: JSON.stringify({
+							number: 123,
+							url: prUrl,
+							title: "OK",
+							body: "",
+						}),
+					}),
+				}),
+			);
+			showInformationMessage.mockResolvedValue(undefined);
+
+			await handleCreatePr("T", "B", CWD, postMessage, "feature/same");
+
+			expect(gitPushCalled).toBe(true);
+			expect(postMessage).toHaveBeenCalledWith({ command: "prCreating" });
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "prCreateBlockedCrossBranch" }),
+			);
+		});
 	});
 
 	// ─── handlePrepareUpdatePr ──────────────────────────────────────────────
@@ -1151,6 +1297,41 @@ describe("PrCommentService", () => {
 			expect(call.body).toBe(
 				`${MARKER_START}\n## Summary\nFixed a bug\n${MARKER_END}`,
 			);
+		});
+
+		// ── summaryBranch routing (Memory Bank) ──────────────────────────────
+
+		it("looks up the PR on summaryBranch when provided, not currentBranch", async () => {
+			let prViewBranchArg: string | undefined;
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "feature/current\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					const sepIdx = args.indexOf("--");
+					if (sepIdx >= 0) {
+						prViewBranchArg = args[sepIdx + 1];
+					}
+					return {
+						stdout: JSON.stringify({
+							number: 5,
+							url: "https://url",
+							title: "T",
+							body: "",
+						}),
+					};
+				}
+				return { stdout: "" };
+			});
+
+			await handlePrepareUpdatePr(
+				MARKDOWN,
+				CWD,
+				postMessage,
+				"feature/summary-branch",
+			);
+
+			expect(prViewBranchArg).toBe("feature/summary-branch");
 		});
 	});
 
@@ -1369,6 +1550,50 @@ describe("PrCommentService", () => {
 				expect(openExternal).toHaveBeenCalled();
 			});
 			expect(uriParse).toHaveBeenCalledWith(prUrl);
+		});
+
+		// ── summaryBranch routing (Memory Bank) ──────────────────────────────
+
+		it("updates the PR on summaryBranch when provided, not currentBranch", async () => {
+			let prViewBranchArg: string | undefined;
+			setupTmpFile();
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") {
+					return { stdout: "feature/current\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					const sepIdx = args.indexOf("--");
+					if (sepIdx >= 0) {
+						prViewBranchArg = args[sepIdx + 1];
+					}
+					return {
+						stdout: JSON.stringify({
+							number: 11,
+							url: "https://url",
+							title: "T",
+							body: "",
+						}),
+					};
+				}
+				if (cmd === "gh" && args[0] === "--version") {
+					return { stdout: "gh 2.40.0\n" };
+				}
+				if (cmd === "gh" && args[0] === "auth") {
+					return { stdout: "ok\n" };
+				}
+				return { stdout: "" };
+			});
+			showInformationMessage.mockResolvedValue(undefined);
+
+			await handleUpdatePr(
+				"T",
+				"new body",
+				CWD,
+				postMessage,
+				"feature/summary-branch",
+			);
+
+			expect(prViewBranchArg).toBe("feature/summary-branch");
 		});
 	});
 });

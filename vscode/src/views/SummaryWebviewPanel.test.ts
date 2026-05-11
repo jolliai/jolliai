@@ -455,11 +455,15 @@ function makeSummary(overrides?: Partial<CommitSummary>): CommitSummary {
 
 const extensionUri = { fsPath: "/ext", toString: () => "/ext" } as never;
 const workspaceRoot = "/workspace";
-// Bridge stub used to satisfy the panel ctor signature; tests in this file
-// don't exercise branch-summary loading. Methods stay unused.
+// Bridge stub used to satisfy the panel ctor signature. `getCurrentBranch` is
+// the only method exercised here — by the cross-branch guard in
+// `handlePrepareCreatePr` and by `loadBranchSummariesForPr`. It defaults to
+// matching `makeSummary().branch` so existing tests stay on the same-branch
+// path; cross-branch tests override with `vi.spyOn(stubBridge, ...)`.
 const stubBridge = {
 	listBranchCommits: vi.fn(),
 	getSummary: vi.fn(),
+	getCurrentBranch: vi.fn().mockResolvedValue("feature/test"),
 } as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 const mainBranch = "main";
 
@@ -2548,7 +2552,7 @@ describe("SummaryWebviewPanel", () => {
 		// ── PR handlers ──────────────────────────────────────────────────────
 
 		describe("checkPrStatus", () => {
-			it("delegates to handleCheckPrStatus", async () => {
+			it("delegates to handleCheckPrStatus, passing summary.branch", async () => {
 				const dispatch = await setupPanel();
 
 				dispatch({ command: "checkPrStatus" });
@@ -2557,6 +2561,7 @@ describe("SummaryWebviewPanel", () => {
 				expect(mockHandleCheckPrStatus).toHaveBeenCalledWith(
 					workspaceRoot,
 					expect.any(Function),
+					"feature/test",
 				);
 			});
 
@@ -2576,7 +2581,7 @@ describe("SummaryWebviewPanel", () => {
 		});
 
 		describe("createPr", () => {
-			it("delegates to handleCreatePr", async () => {
+			it("delegates to handleCreatePr, passing summary.branch", async () => {
 				const dispatch = await setupPanel();
 
 				dispatch({ command: "createPr", title: "PR Title", body: "PR Body" });
@@ -2587,6 +2592,7 @@ describe("SummaryWebviewPanel", () => {
 					"PR Body",
 					workspaceRoot,
 					expect.any(Function),
+					"feature/test",
 				);
 			});
 
@@ -2658,11 +2664,17 @@ describe("SummaryWebviewPanel", () => {
 				});
 			});
 
-			it("appends missing-summary footnote when summaries.length <= 1 but missingCount > 0", async () => {
+			it("appends missing-summary footnote on the single-summary tier when missingCount > 0", async () => {
+				// Footnote contextualizes "alongside the 1 branch summary shown,
+				// N more on this branch were skipped" — coherent with the body.
+				const branchSummary = makeSummary({
+					commitHash: "BRANCHONLY",
+					commitMessage: "the one summary",
+				});
 				mockLoadBranchSummaries.mockResolvedValueOnce({
-					summaries: [],
+					summaries: [branchSummary],
 					missingCount: 3,
-					totalCount: 3,
+					totalCount: 4,
 				});
 				mockBuildPrMarkdown.mockReturnValueOnce("# only body");
 				const dispatch = await setupPanel({ commitMessage: "lone msg" });
@@ -2679,6 +2691,31 @@ describe("SummaryWebviewPanel", () => {
 				expect(body).toContain(
 					"> Note: 3 commit(s) without summary were skipped.",
 				);
+			});
+
+			it("zero-summary fallback (currentSummary) does NOT append footnote even when missingCount > 0", async () => {
+				// 0-summary tier = rebase just happened, worker hasn't caught up.
+				// Body comes from currentSummary (possibly stale or from another
+				// branch), so a current-branch "N skipped" note would describe
+				// commits unrelated to the body — drop the footnote.
+				mockLoadBranchSummaries.mockResolvedValueOnce({
+					summaries: [],
+					missingCount: 3,
+					totalCount: 3,
+				});
+				mockBuildPrMarkdown.mockReturnValueOnce("# fallback body");
+				const dispatch = await setupPanel({ commitMessage: "fallback msg" });
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => (c[0] as { command?: string }).command === "prShowCreateForm",
+				);
+				expect(call).toBeDefined();
+				const body = (call?.[0] as { body: string }).body;
+				expect(body).toContain("# fallback body");
+				expect(body).not.toContain("commit(s) without summary were skipped");
 			});
 
 			it("branch has exactly 1 summary: uses summaries[0], NOT the webview's currentSummary", async () => {
@@ -2783,6 +2820,33 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({ command: "prShowCreateForm" }),
 				);
 			});
+
+			it("cross-branch (Memory Bank): blocks Create PR with prCreateBlockedCrossBranch instead of opening the form", async () => {
+				// User has checked out branch Y but is looking at a summary on
+				// branch X in Memory Bank. Create PR must NOT push Y's HEAD to X's
+				// PR — block before the form opens.
+				(
+					stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce("feature/other-branch");
+				const dispatch = await setupPanel({ branch: "feature/test" });
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prCreateBlockedCrossBranch",
+					summaryBranch: "feature/test",
+					currentBranch: "feature/other-branch",
+				});
+				// Form must not open; loader must not be called.
+				expect(postMessage).not.toHaveBeenCalledWith(
+					expect.objectContaining({ command: "prShowCreateForm" }),
+				);
+				expect(mockLoadBranchSummaries).not.toHaveBeenCalled();
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("feature/test"),
+				);
+			});
 		});
 
 		describe("prepareUpdatePr", () => {
@@ -2797,6 +2861,7 @@ describe("SummaryWebviewPanel", () => {
 					"# update body",
 					workspaceRoot,
 					expect.any(Function),
+					"feature/test",
 				);
 			});
 
@@ -2821,10 +2886,36 @@ describe("SummaryWebviewPanel", () => {
 					"# aggregated update",
 					workspaceRoot,
 					expect.any(Function),
+					"feature/test",
 				);
 			});
 
-			it("appends missing-summary footnote on the single-summary fallback when missingCount > 0", async () => {
+			it("appends missing-summary footnote on the single-summary tier when missingCount > 0", async () => {
+				const branchSummary = makeSummary({
+					commitHash: "BRANCHONLY",
+					commitMessage: "the one summary",
+				});
+				mockLoadBranchSummaries.mockResolvedValueOnce({
+					summaries: [branchSummary],
+					missingCount: 4,
+					totalCount: 5,
+				});
+				mockBuildPrMarkdown.mockReturnValueOnce("# update body");
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "prepareUpdatePr" });
+				await flushPromises();
+
+				const md = mockHandlePrepareUpdatePr.mock.calls[0][0];
+				expect(md).toContain("# update body");
+				expect(md).toContain(
+					"> Note: 4 commit(s) without summary were skipped.",
+				);
+			});
+
+			it("zero-summary fallback does NOT append footnote even when missingCount > 0", async () => {
+				// Same semantic as the prepareCreatePr counterpart: body from
+				// currentSummary should not carry a current-branch footnote.
 				mockLoadBranchSummaries.mockResolvedValueOnce({
 					summaries: [],
 					missingCount: 4,
@@ -2838,9 +2929,7 @@ describe("SummaryWebviewPanel", () => {
 
 				const md = mockHandlePrepareUpdatePr.mock.calls[0][0];
 				expect(md).toContain("# update body");
-				expect(md).toContain(
-					"> Note: 4 commit(s) without summary were skipped.",
-				);
+				expect(md).not.toContain("commit(s) without summary were skipped");
 			});
 
 			it("worker-busy: shows warning + re-runs handleCheckPrStatus to reset the button", async () => {
@@ -2872,10 +2961,33 @@ describe("SummaryWebviewPanel", () => {
 
 				expect(postMessage).toHaveBeenCalledWith({ command: "prDataLoaded" });
 			});
+
+			it("cross-branch (Memory Bank): skips branch aggregation and uses currentSummary for the body", async () => {
+				// On Y looking at X's summary in Memory Bank: aggregating Y's
+				// commits into X's PR description is misleading — force the
+				// single-summary fallback by skipping loadBranchSummaries.
+				(
+					stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce("feature/other-branch");
+				mockBuildPrMarkdown.mockReturnValueOnce("# clicked summary body");
+				const dispatch = await setupPanel({ branch: "feature/test" });
+
+				dispatch({ command: "prepareUpdatePr" });
+				await flushPromises();
+
+				expect(mockLoadBranchSummaries).not.toHaveBeenCalled();
+				expect(mockBuildAggregatedPrMarkdown).not.toHaveBeenCalled();
+				expect(mockHandlePrepareUpdatePr).toHaveBeenCalledWith(
+					"# clicked summary body",
+					workspaceRoot,
+					expect.any(Function),
+					"feature/test",
+				);
+			});
 		});
 
 		describe("updatePr", () => {
-			it("delegates to handleUpdatePr", async () => {
+			it("delegates to handleUpdatePr, passing summary.branch", async () => {
 				const dispatch = await setupPanel();
 
 				dispatch({ command: "updatePr", title: "Updated", body: "Body" });
@@ -2886,6 +2998,7 @@ describe("SummaryWebviewPanel", () => {
 					"Body",
 					workspaceRoot,
 					expect.any(Function),
+					"feature/test",
 				);
 			});
 
