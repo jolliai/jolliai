@@ -898,12 +898,21 @@ export class SummaryWebviewPanel {
 		// Cross-branch guard: Create PR requires being checked out on the
 		// summary's branch (because `git push -u origin HEAD` pushes the current
 		// branch). Block before opening the form to avoid misleading the user.
+		//
+		// `bridge.getCurrentBranch()` returns the literal sentinel "HEAD" when
+		// `git rev-parse --abbrev-ref HEAD` yields nothing — detached HEAD,
+		// `.git/index.lock`, or permission failures. Telling the user to
+		// "checkout <summary.branch>" in that state is wrong (the repo is in
+		// a transient bad state, not on a different branch); they'd checkout
+		// and only then discover the real problem. Use a distinct message.
 		if (summary.branch) {
 			const currentBranch = await this.bridge.getCurrentBranch();
 			if (summary.branch !== currentBranch) {
-				vscode.window.showWarningMessage(
-					`This summary is on branch ${summary.branch}. Checkout ${summary.branch} to create its PR.`,
-				);
+				const message =
+					currentBranch === "HEAD"
+						? `Cannot determine the current branch (detached HEAD or git error). Resolve the repository state, then retry creating the PR for ${summary.branch}.`
+						: `This summary is on branch ${summary.branch}. Checkout ${summary.branch} to create its PR.`;
+				vscode.window.showWarningMessage(message);
 				postMessage({
 					command: "prCreateBlockedCrossBranch",
 					summaryBranch: summary.branch,

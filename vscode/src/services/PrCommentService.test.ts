@@ -232,6 +232,19 @@ describe("PrCommentService", () => {
 			expect(js).toContain("msg.command === 'prUpdating'");
 			expect(js).toContain("msg.command === 'prUpdateFailed'");
 		});
+
+		it("handles prCreateBlockedCrossBranch by resetting the Create PR / Submit button state", () => {
+			// Pins the cross-branch-guard reset branch into the rendered JS.
+			// Without this, a Biome auto-fix or dead-code sweep could silently
+			// drop the handler, and the user's clicked "Loading..." button
+			// would stay stuck forever when the panel-side guard fires.
+			const js = buildPrMessageScript();
+			expect(js).toContain("msg.command === 'prCreateBlockedCrossBranch'");
+			// The reset clears both the section-level Create PR button and the
+			// form-level Submit button so retry works after `checkout`.
+			expect(js).toContain("createPrBtn");
+			expect(js).toContain("prFormSubmit");
+		});
 	});
 
 	// ─── handleCheckPrStatus ────────────────────────────────────────────────
@@ -646,7 +659,12 @@ describe("PrCommentService", () => {
 			});
 		});
 
-		it("posts unavailable when gh available but getCurrentBranch throws", async () => {
+		it("posts unavailable with the real reason when gh is available but getCurrentBranch throws", async () => {
+			// Regression: the outer catch sits above both gh probes and the
+			// `getCurrentBranch` (git) call. Previously the UI always said
+			// "Could not reach GitHub CLI (gh)" — misleading when the failure
+			// was on the git side. The `reason` field lets the webview show
+			// the true error message.
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "rev-list") {
 					return { stdout: "1\n" };
@@ -657,7 +675,6 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				// getCurrentBranch (git rev-parse) throws — triggers outer catch
 				if (cmd === "git" && args[0] === "rev-parse") {
 					throw new Error("git exploded");
 				}
@@ -669,6 +686,7 @@ describe("PrCommentService", () => {
 			expect(postMessage).toHaveBeenCalledWith({
 				command: "prStatus",
 				status: "unavailable",
+				reason: "git exploded",
 			});
 			expect(logError).toHaveBeenCalled();
 		});
@@ -696,6 +714,7 @@ describe("PrCommentService", () => {
 			expect(postMessage).toHaveBeenCalledWith({
 				command: "prStatus",
 				status: "unavailable",
+				reason: "string error from git",
 			});
 			expect(logError).toHaveBeenCalledWith(
 				expect.any(String),
@@ -703,17 +722,21 @@ describe("PrCommentService", () => {
 			);
 		});
 
-		it("posts unavailable when all commands fail (gh not found path)", async () => {
+		it("posts unavailable with the underlying error reason when all commands fail", async () => {
 			setupExecFile(() => {
 				throw new Error("command not found");
 			});
 
 			await handleCheckPrStatus(CWD, postMessage);
 
-			// getCommitCount catches → returns 0, isGhAvailable catches → returns false
+			// `getCurrentBranch` is the first call in the handler — it throws
+			// "command not found" and the outer catch surfaces that as the
+			// reason, instead of the previous hard-coded "could not reach gh"
+			// text (which misled users when git was the broken side).
 			expect(postMessage).toHaveBeenCalledWith({
 				command: "prStatus",
 				status: "unavailable",
+				reason: "command not found",
 			});
 		});
 
@@ -888,6 +911,49 @@ describe("PrCommentService", () => {
 				expect.objectContaining({
 					status: "noPr",
 					branch: "feature/summary-branch",
+				}),
+			);
+		});
+
+		it("strict branch routing: summaryBranch wins over currentBranch even when stale (post-rename)", async () => {
+			// Contract: after `git branch -m feature/old feature/new`, the
+			// summary still points at `feature/old`. We MUST query
+			// `feature/old` and report `noPr` for it — NOT silently retarget
+			// to `feature/new` or to currentBranch. Auto-recovery from
+			// renames is a separate spike (see plan doc "Out of scope").
+			let prViewBranchArg: string | undefined;
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse") {
+					// User has already renamed → currentBranch is the new name.
+					return { stdout: "feature/new\n" };
+				}
+				if (cmd === "gh" && args[0] === "--version") {
+					return { stdout: "gh 2.40.0\n" };
+				}
+				if (cmd === "gh" && args[0] === "auth") {
+					return { stdout: "ok\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					const sepIdx = args.indexOf("--");
+					if (sepIdx >= 0) {
+						prViewBranchArg = args[sepIdx + 1];
+					}
+					// gh returns "no PR" for the stale name.
+					return { stdout: "" };
+				}
+				return { stdout: "" };
+			});
+
+			await handleCheckPrStatus(CWD, postMessage, "feature/old");
+
+			// The lookup must hit the stale summaryBranch, not currentBranch.
+			expect(prViewBranchArg).toBe("feature/old");
+			// And the user-facing message must name the stale branch — that's
+			// how they realize the rename caused the mismatch.
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					status: "noPr",
+					branch: "feature/old",
 				}),
 			);
 		});
@@ -1225,12 +1291,29 @@ describe("PrCommentService", () => {
 			expect(call.body).not.toContain("old content");
 		});
 
-		it("shows warning when no PR is found", async () => {
+		it("shows warning AND re-runs status flow when no PR is found (un-sticks the Edit PR button)", async () => {
+			// Regression: the webview's Edit PR button sets itself to
+			// "Loading..." + disabled on click. If `handlePrepareUpdatePr`
+			// returns silently on the no-PR path, the button stays stuck
+			// forever. After this fix, the no-PR path re-runs
+			// `handleCheckPrStatus` so the section is repainted and the
+			// button is rebuilt fresh.
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/test-branch\n" };
 				}
-				throw new Error("no PR");
+				if (cmd === "gh" && args[0] === "--version") {
+					return { stdout: "gh 2.40.0\n" };
+				}
+				if (cmd === "gh" && args[0] === "auth") {
+					return { stdout: "ok\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+					// Mimic gh's "no pull requests found" stderr branch by
+					// throwing — findPrForBranch sees result.ok=false.
+					throw new Error("no pull requests found");
+				}
+				return { stdout: "" };
 			});
 
 			await handlePrepareUpdatePr(MARKDOWN, CWD, postMessage);
@@ -1238,7 +1321,15 @@ describe("PrCommentService", () => {
 			expect(showWarningMessage).toHaveBeenCalledWith(
 				"No pull request found for branch feature/test-branch.",
 			);
-			expect(postMessage).not.toHaveBeenCalled();
+			// The section must repaint via prStatus so the click-time button
+			// state is reset.
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "prStatus",
+					status: "noPr",
+					branch: "feature/test-branch",
+				}),
+			);
 		});
 
 		it("shows error and logs when an unexpected error is thrown", async () => {
