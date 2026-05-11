@@ -197,8 +197,12 @@ function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
 //   • 0 branch summaries  → fall back to currentSummary (rebase just happened
 //                           and the worker has not produced a summary for the
 //                           new commit hash yet — keeps the form usable)
-// `missingCount > 0` appends a "K skipped" footnote so partial-coverage
-// branches don't render as misleading.
+// `missingCount > 0` appends a "K skipped" footnote ONLY when summaries.length
+// >= 1 — the footnote contextualizes "alongside the branch summaries shown, N
+// more were skipped". On the 0-summary fallback the body comes from
+// currentSummary (possibly stale or from another branch), so a current-branch
+// "N skipped" note would describe commits unrelated to the body and read as
+// noise.
 function buildPrBodyMarkdown(
 	currentSummary: CommitSummary,
 	summaries: ReadonlyArray<CommitSummary>,
@@ -209,7 +213,7 @@ function buildPrBodyMarkdown(
 	}
 	const source = summaries.length === 1 ? summaries[0] : currentSummary;
 	const base = buildPrMarkdown(source);
-	if (missingCount <= 0) return base;
+	if (missingCount <= 0 || summaries.length === 0) return base;
 	return `${base}\n\n> Note: ${missingCount} commit(s) without summary were skipped.`;
 }
 
@@ -551,8 +555,10 @@ export class SummaryWebviewPanel {
 				);
 				break;
 			case "checkPrStatus":
-				handleCheckPrStatus(this.workspaceRoot, (msg) =>
-					this.panel.webview.postMessage(msg),
+				handleCheckPrStatus(
+					this.workspaceRoot,
+					(msg) => this.panel.webview.postMessage(msg),
+					this.currentSummary?.branch,
 				).catch((err: unknown) =>
 					log.error("SummaryPanel", `Check PR status failed: ${err}`),
 				);
@@ -564,6 +570,7 @@ export class SummaryWebviewPanel {
 						message.body,
 						this.workspaceRoot,
 						(msg) => this.panel.webview.postMessage(msg),
+						this.currentSummary?.branch,
 					),
 					"Create PR failed",
 				);
@@ -589,6 +596,7 @@ export class SummaryWebviewPanel {
 						this.workspaceRoot,
 						(msg: Record<string, unknown>) =>
 							this.panel.webview.postMessage(msg),
+						this.currentSummary?.branch,
 					),
 					"Update PR failed",
 				);
@@ -887,7 +895,27 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		const { summaries, missingCount } = await this.loadCurrentBranchSummaries();
+		// Cross-branch guard: Create PR requires being checked out on the
+		// summary's branch (because `git push -u origin HEAD` pushes the current
+		// branch). Block before opening the form to avoid misleading the user.
+		if (summary.branch) {
+			const currentBranch = await this.bridge.getCurrentBranch();
+			if (summary.branch !== currentBranch) {
+				vscode.window.showWarningMessage(
+					`This summary is on branch ${summary.branch}. Checkout ${summary.branch} to create its PR.`,
+				);
+				postMessage({
+					command: "prCreateBlockedCrossBranch",
+					summaryBranch: summary.branch,
+					currentBranch,
+				});
+				return;
+			}
+		}
+
+		const { summaries, missingCount } = await this.loadBranchSummariesForPr(
+			summary.branch,
+		);
 		const markdown = buildPrBodyMarkdown(summary, summaries, missingCount);
 		const title = pickPrTitle(summary, summaries);
 		postMessage({
@@ -908,10 +936,17 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		const { summaries, missingCount } = await this.loadCurrentBranchSummaries();
+		const { summaries, missingCount } = await this.loadBranchSummariesForPr(
+			summary.branch,
+		);
 		const markdown = buildPrBodyMarkdown(summary, summaries, missingCount);
 
-		await handlePrepareUpdatePr(markdown, this.workspaceRoot, postMessage);
+		await handlePrepareUpdatePr(
+			markdown,
+			this.workspaceRoot,
+			postMessage,
+			summary.branch,
+		);
 	}
 
 	// Returns true when worker is busy: shows the toast and re-runs the
@@ -925,14 +960,40 @@ export class SummaryWebviewPanel {
 		vscode.window.showWarningMessage(
 			"Jolli Memory: AI summary is being generated. Please wait a moment.",
 		);
-		await handleCheckPrStatus(this.workspaceRoot, postMessage);
+		await handleCheckPrStatus(
+			this.workspaceRoot,
+			postMessage,
+			this.currentSummary?.branch,
+		);
 		return true;
 	}
 
-	private async loadCurrentBranchSummaries(): Promise<{
+	/**
+	 * Loads summaries for PR body aggregation, scoped to the summary's branch.
+	 *
+	 * Memory Bank lets the user open any historical summary, including ones on
+	 * branches they're not currently checked out on. In that cross-branch case
+	 * aggregating `currentBranch`'s commits into a PR for `summaryBranch` is
+	 * misleading — the body would describe commits unrelated to that PR. So we
+	 * force the single-summary fallback by returning an empty array, and
+	 * `buildPrBodyMarkdown` / `pickPrTitle` fall back to the clicked summary.
+	 *
+	 * When `summaryBranch === currentBranch` (or `summaryBranch` is undefined),
+	 * we run the existing HEAD-based `loadBranchSummaries` to get the full
+	 * branch-aggregation behavior.
+	 */
+	private async loadBranchSummariesForPr(
+		summaryBranch: string | undefined,
+	): Promise<{
 		summaries: ReadonlyArray<CommitSummary>;
 		missingCount: number;
 	}> {
+		if (summaryBranch) {
+			const currentBranch = await this.bridge.getCurrentBranch();
+			if (summaryBranch !== currentBranch) {
+				return { summaries: [], missingCount: 0 };
+			}
+		}
 		const result = await loadBranchSummaries(this.bridge, this.mainBranch);
 		return {
 			summaries: result.summaries,
