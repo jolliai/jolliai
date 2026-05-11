@@ -223,6 +223,21 @@ interface PrInfo {
 }
 
 /**
+ * Discriminated result of `findPrForBranch`.
+ *
+ * Pre-refactor this function returned `PrInfo | undefined` and collapsed four
+ * distinct outcomes into the same `undefined` value: real no-PR, auth/network
+ * failure, unparseable JSON, and zero-numbered JSON. Callers then showed a
+ * "No PR found" + Create PR button for all four, which misled users into
+ * creating duplicate PRs after a token lapse. The union forces each caller
+ * to decide between the three real outcomes.
+ */
+type PrLookup =
+	| { kind: "found"; pr: PrInfo }
+	| { kind: "noPr" }
+	| { kind: "lookupError"; reason: string };
+
+/**
  * Returns PR info for the given branch.
  * Uses `gh pr view -- <branch>` which works for open, merged, and closed PRs.
  *
@@ -231,10 +246,7 @@ interface PrInfo {
  * argument rather than a flag. This is a defense-in-depth measure since the
  * value originates from persisted JSON on the orphan branch.
  */
-async function findPrForBranch(
-	cwd: string,
-	branch: string,
-): Promise<PrInfo | undefined> {
+async function findPrForBranch(cwd: string, branch: string): Promise<PrLookup> {
 	const args = ["pr", "view", "--json", "number,url,title,body", "--", branch];
 	const result = await tryExecGh(args, cwd);
 
@@ -247,26 +259,34 @@ async function findPrForBranch(
 		const isExpectedNoPr = /no pull requests? found/i.test(stderr);
 		if (isExpectedNoPr) {
 			log.debug(TAG, `No PR for branch ${branch}`);
-		} else {
-			log.warn(
-				TAG,
-				`gh pr view failed for branch ${branch} (code=${result.code}): ${result.err.message}${
-					stderr ? ` | stderr: ${stderr.trim()}` : ""
-				}`,
-			);
+			return { kind: "noPr" };
 		}
-		return;
+		const reason = stderr.trim() || result.err.message;
+		log.warn(
+			TAG,
+			`gh pr view failed for branch ${branch} (code=${result.code}): ${result.err.message}${
+				stderr ? ` | stderr: ${stderr.trim()}` : ""
+			}`,
+		);
+		return { kind: "lookupError", reason };
 	}
 
 	try {
 		const parsed = JSON.parse(result.stdout) as PrInfo;
-		return parsed.number ? parsed : undefined;
+		// `gh pr view --json number` returns `{"number": 0}` only in edge
+		// cases (e.g. the JSON shape changed in a future gh release).
+		// Treat as a real noPr — defense-in-depth, not a known reproducer.
+		return parsed.number ? { kind: "found", pr: parsed } : { kind: "noPr" };
 	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
 		log.warn(
 			TAG,
-			`gh pr view returned unparseable JSON for branch ${branch}: ${(err as Error).message}. Raw length: ${result.stdout.length}`,
+			`gh pr view returned unparseable JSON for branch ${branch}: ${message}. Raw length: ${result.stdout.length}`,
 		);
-		return;
+		return {
+			kind: "lookupError",
+			reason: `Unparseable response from gh: ${message}`,
+		};
 	}
 }
 
@@ -370,9 +390,21 @@ export async function handleCheckPrStatus(
 		}
 
 		// Always pass an explicit branch — never rely on HEAD semantics
-		const pr = await findPrForBranch(cwd, targetBranch);
+		const lookup = await findPrForBranch(cwd, targetBranch);
 
-		if (!pr) {
+		if (lookup.kind === "lookupError") {
+			// Reuse the `unavailable + reason` channel (already wired for the
+			// outer-catch git/gh failures). The user sees the real cause and
+			// gets a Retry button instead of a misleading "Create PR" CTA.
+			postMessage({
+				command: "prStatus",
+				status: "unavailable",
+				reason: lookup.reason,
+			});
+			return;
+		}
+
+		if (lookup.kind === "noPr") {
 			postMessage({
 				command: "prStatus",
 				status: "noPr",
@@ -381,6 +413,7 @@ export async function handleCheckPrStatus(
 			return;
 		}
 
+		const { pr } = lookup;
 		postMessage({
 			command: "prStatus",
 			status: "ready",
@@ -478,20 +511,28 @@ export async function handlePrepareUpdatePr(
 ): Promise<void> {
 	try {
 		const targetBranch = summaryBranch ?? (await getCurrentBranch(cwd));
-		const pr = await findPrForBranch(cwd, targetBranch);
-		if (!pr) {
-			vscode.window.showWarningMessage(
-				`No pull request found for branch ${targetBranch}.`,
+		const lookup = await findPrForBranch(cwd, targetBranch);
+
+		// Both `noPr` and `lookupError` paths need to repaint the section:
+		// the webview's Edit PR button sets itself to "Loading..." + disabled
+		// on click. Returning without `prStatus` leaves it stuck forever.
+		if (lookup.kind === "lookupError") {
+			vscode.window.showErrorMessage(
+				`Could not load PR for branch ${targetBranch} — ${lookup.reason}`,
 			);
-			// Re-run the status flow so the section rebuilds: the click-time
-			// `Edit PR` button is set to "Loading..." + disabled by the webview
-			// (see editBtn handler below). Returning silently leaves it stuck.
-			// `prStatus` repaints the section from scratch and replaces the
-			// stale button with a fresh `Create PR` / `Edit PR` / noPr UI.
 			await handleCheckPrStatus(cwd, postMessage, summaryBranch);
 			return;
 		}
 
+		if (lookup.kind === "noPr") {
+			vscode.window.showWarningMessage(
+				`No pull request found for branch ${targetBranch}.`,
+			);
+			await handleCheckPrStatus(cwd, postMessage, summaryBranch);
+			return;
+		}
+
+		const { pr } = lookup;
 		const newBody = replaceSummaryInBody(pr.body || "", markdown);
 
 		postMessage({
@@ -525,14 +566,25 @@ export async function handleUpdatePr(
 
 	try {
 		const targetBranch = summaryBranch ?? (await getCurrentBranch(cwd));
-		const pr = await findPrForBranch(cwd, targetBranch);
-		if (!pr) {
+		const lookup = await findPrForBranch(cwd, targetBranch);
+
+		if (lookup.kind === "lookupError") {
+			postMessage({ command: "prUpdateFailed" });
+			vscode.window.showErrorMessage(
+				`Could not update PR for branch ${targetBranch} — ${lookup.reason}`,
+			);
+			return;
+		}
+
+		if (lookup.kind === "noPr") {
 			postMessage({ command: "prUpdateFailed" });
 			vscode.window.showWarningMessage(
 				`No pull request found for branch ${targetBranch}.`,
 			);
 			return;
 		}
+
+		const { pr } = lookup;
 
 		// Update title if changed
 		if (title !== pr.title) {
