@@ -335,7 +335,7 @@ type PostMessageFn = (msg: Record<string, unknown>) => void;
  * the current branch when no summary is in view. This keeps Memory Bank
  * cross-branch navigation honest — clicking a summary on `feat-x` while
  * checked out on `feat-y` shows `feat-x`'s PR, not `feat-y`'s. Commit hash
- * is intentionally ignored to stay rebase-safe (the Flyer regression).
+ * is intentionally ignored to stay rebase-safe across squash/amend.
  */
 export async function handleCheckPrStatus(
 	cwd: string,
@@ -389,7 +389,12 @@ export async function handleCheckPrStatus(
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : String(err);
 		log.error(TAG, `Check PR status failed: ${msg}`);
-		postMessage({ command: "prStatus", status: "unavailable" });
+		// Surface the real reason so the webview can distinguish git failures
+		// (e.g. detached HEAD, .git/index.lock, permission) from gh failures.
+		// The previous "Could not reach GitHub CLI (gh)" text was misleading
+		// whenever the throw came from `getCurrentBranch` rather than the gh
+		// probes — the catch sits above both code paths.
+		postMessage({ command: "prStatus", status: "unavailable", reason: msg });
 	}
 }
 
@@ -478,6 +483,12 @@ export async function handlePrepareUpdatePr(
 			vscode.window.showWarningMessage(
 				`No pull request found for branch ${targetBranch}.`,
 			);
+			// Re-run the status flow so the section rebuilds: the click-time
+			// `Edit PR` button is set to "Loading..." + disabled by the webview
+			// (see editBtn handler below). Returning silently leaves it stuck.
+			// `prStatus` repaints the section from scratch and replaces the
+			// stale button with a fresh `Create PR` / `Edit PR` / noPr UI.
+			await handleCheckPrStatus(cwd, postMessage, summaryBranch);
 			return;
 		}
 
@@ -743,7 +754,9 @@ export function buildPrMessageScript(): string {
         prActions.appendChild(retryAuthBtn);
         prShow(prActions);
       } else if (s === 'unavailable') {
-        prStatusText.textContent = 'Could not reach GitHub CLI (gh). This is often transient — retry, or check the extension log.';
+        prStatusText.textContent = msg.reason
+          ? ('Could not load PR status — ' + msg.reason + '. Retry, or check the extension log.')
+          : 'Could not reach GitHub CLI (gh). This is often transient — retry, or check the extension log.';
         prShow(prStatusText);
         prHide(prLinkRow);
         prActions.textContent = '';

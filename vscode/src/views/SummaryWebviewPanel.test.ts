@@ -2847,6 +2847,34 @@ describe("SummaryWebviewPanel", () => {
 					expect.stringContaining("feature/test"),
 				);
 			});
+
+			it("detached HEAD / git error: gives a distinct message rather than asking the user to 'checkout HEAD'", async () => {
+				// Regression: `bridge.getCurrentBranch()` returns the sentinel
+				// string "HEAD" when git can't resolve the current branch
+				// (detached, .git/index.lock, permission). Telling the user to
+				// "Checkout HEAD" is nonsense — the repo is in a transient bad
+				// state, not on a different branch. We must surface that.
+				(
+					stubBridge.getCurrentBranch as ReturnType<typeof vi.fn>
+				).mockResolvedValueOnce("HEAD");
+				const dispatch = await setupPanel({ branch: "feature/test" });
+
+				dispatch({ command: "prepareCreatePr" });
+				await flushPromises();
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prCreateBlockedCrossBranch",
+					summaryBranch: "feature/test",
+					currentBranch: "HEAD",
+				});
+				// Distinct toast — NOT "Checkout HEAD to create its PR".
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Cannot determine the current branch"),
+				);
+				expect(showWarningMessage).not.toHaveBeenCalledWith(
+					expect.stringContaining("Checkout HEAD"),
+				);
+			});
 		});
 
 		describe("prepareUpdatePr", () => {
