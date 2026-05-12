@@ -17,7 +17,7 @@ import { log } from "../util/Logger.js";
 import { BaseStore, type Snapshot } from "./BaseStore.js";
 
 /** Number of entries loaded per batch. */
-const PAGE_SIZE = 10;
+const PAGE_SIZE = 18;
 /** Upper bound on entries returned during search (keeps memory bounded). */
 const MAX_SEARCH_ENTRIES = 500;
 

@@ -1,9 +1,17 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ManifestEntry } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
+
+const { mockTryMarkHidden } = vi.hoisted(() => ({
+	mockTryMarkHidden: vi.fn(),
+}));
+
+vi.mock("../util/WindowsHidden.js", () => ({
+	tryMarkHiddenOnWindows: mockTryMarkHidden,
+}));
 
 function makeTmpDir(): string {
 	const dir = join(tmpdir(), `kb-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -45,6 +53,10 @@ describe("MetadataManager", () => {
 	});
 
 	describe("ensure", () => {
+		beforeEach(() => {
+			mockTryMarkHidden.mockClear();
+		});
+
 		it("creates jolli dir and default files", () => {
 			manager.ensure();
 			expect(existsSync(jolliDir)).toBe(true);
@@ -64,6 +76,19 @@ describe("MetadataManager", () => {
 			manager.updateManifest(makeEntry());
 			manager.ensure();
 			expect(manager.readManifest().files).toHaveLength(1);
+		});
+
+		it("calls tryMarkHiddenOnWindows once on fresh create", () => {
+			manager.ensure();
+			expect(mockTryMarkHidden).toHaveBeenCalledTimes(1);
+			expect(mockTryMarkHidden).toHaveBeenCalledWith(jolliDir);
+		});
+
+		it("does not call tryMarkHiddenOnWindows when the directory already exists", () => {
+			manager.ensure();
+			mockTryMarkHidden.mockClear();
+			manager.ensure();
+			expect(mockTryMarkHidden).not.toHaveBeenCalled();
 		});
 	});
 

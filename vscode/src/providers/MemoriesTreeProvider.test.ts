@@ -355,7 +355,7 @@ describe("MemoriesTreeProvider", () => {
 
 			await provider.refresh();
 
-			expect(bridge.listSummaryEntries).toHaveBeenCalledWith(10, 0, undefined); // PAGE_SIZE, no filter
+			expect(bridge.listSummaryEntries).toHaveBeenCalledWith(18, 0, undefined); // PAGE_SIZE, no filter
 			const children = provider.getChildren();
 			expect(children).toHaveLength(2);
 			expect(children[0]).toBeInstanceOf(MemoryItem);
@@ -527,7 +527,7 @@ describe("MemoriesTreeProvider", () => {
 			await provider.setFilter("");
 
 			// Should call with PAGE_SIZE and no filter
-			expect(bridge.listSummaryEntries).toHaveBeenCalledWith(10, 0, undefined);
+			expect(bridge.listSummaryEntries).toHaveBeenCalledWith(18, 0, undefined);
 		});
 
 		it("setFilter updates snapshot filter state", async () => {
@@ -560,8 +560,8 @@ describe("MemoriesTreeProvider", () => {
 
 			await provider.loadMore();
 
-			// Should have fetched with loadedCount = 10 + 10 = 20, no filter
-			expect(bridge.listSummaryEntries).toHaveBeenCalledWith(20, 0, undefined);
+			// Should have fetched with loadedCount = 18 + 18 = 36, no filter
+			expect(bridge.listSummaryEntries).toHaveBeenCalledWith(36, 0, undefined);
 		});
 	});
 
