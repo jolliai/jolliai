@@ -1,10 +1,43 @@
-# Jolli Memory
+# Jolli CLI
 
-> *Every commit deserves a Memory. Every memory deserves a Recall.*
+The `@jolli.ai/cli` package has two main uses:
 
-**Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. It also includes **Jolli Site** — generate polished documentation sites from Markdown and OpenAPI specs with a single command.
+## 1. Jolli Memory — automatic AI session summaries
 
-When you work with AI agents like Claude Code, Codex, Gemini CLI, OpenCode, Cursor IDE, GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+Turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. When you work with AI agents like Claude Code, Codex, Gemini CLI, OpenCode, Cursor IDE, GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+
+**What it does:**
+
+- **Automatic capture** — after each commit, reads your AI transcripts + diff, calls the LLM, and stores a structured summary alongside the commit. The commit returns instantly; the summary is generated in a detached background process (~10–20 s).
+- **Seven supported agents** — Claude Code, Codex, Gemini CLI, OpenCode, Cursor IDE (Composer), GitHub Copilot CLI, and VS Code Copilot Chat.
+- **Dual storage** — every memory is written to a dedicated git orphan branch (`jollimemory/summaries/v3`, the source of truth) **and** to a human-browsable Memory Bank folder on disk (canonical JSON + Markdown).
+- **Worktree-aware** — hooks and summaries work across `git worktree` checkouts.
+- **Squash / amend / rebase safe** — a unified operation queue migrates or consolidates summaries when commits are rewritten, so memories are never lost.
+- **Session context recall** — `jolli recall` (or the `/jolli-recall` skill) loads complete branch history back into your AI agent so it can pick up where you left off. A lightweight briefing is also injected at the start of every Claude Code session.
+- **Cross-branch search** — `jolli search <keyword>` searches every branch's memories with a two-phase pipeline (catalog → full topic bodies).
+- **Privacy-first** — transcripts and diff go straight to Anthropic (with your `apiKey`) or via the Jolli LLM proxy (in-memory, never persisted). Raw transcripts are never uploaded to Jolli Space.
+
+Jump to: [Jolli Memory](#jolli-memory) · [How It Works](#how-it-works) · [Installation](#installation) · [CLI Commands](#cli-commands) · [Session Context Recall](#session-context-recall) · [Configuration](#configuration) · [Privacy](#privacy)
+
+## 2. Jolli Site — documentation site generation
+
+Turns a plain folder of Markdown files and OpenAPI specs into a polished documentation site with a single command. Designed for product or API documentation alongside your code.
+
+**What it does:**
+
+- **Zero-config scaffolding** — `jolli new my-docs` creates a starter `Content_Folder` plus a `site.json` configuration file.
+- **Hot-reload dev server** — `jolli dev` watches your content and re-syncs Markdown, MDX, and OpenAPI changes instantly via Next.js HMR.
+- **Static builds with full-text search** — `jolli build` ships a Pagefind-indexed static site; `jolli start` builds + serves it locally.
+- **OpenAPI rich pipeline** — each endpoint compiles into a per-endpoint MDX page with auto-generated cURL / JavaScript / TypeScript / Python / Go code samples (no `swagger-ui-react` runtime).
+- **Theme packs** — choose `forge` (clean developer docs, sidebar-first, the default), `atlas` (editorial, dark serif), or `default`. Customize `accentHue`, fonts, logos, and default theme mode in `site.json`.
+- **Header / footer / sidebar config** — `header.items` supports per-item dropdowns; `footer` supports copyright, link columns, and social icons; `sidebar` overrides folder labels.
+- **Docusaurus migration** — `jolli convert` rewrites an existing Docusaurus folder to Jolli-compatible structure (with a timestamped backup when converting in-place).
+
+Jump to: [Jolli Sites](#jolli-site--documentation-from-your-content-folder) · [`site.json` reference](#sitejson-reference) · [examples/](examples/)
+
+---
+
+## Jolli Memory
 
 ## How It Works
 
@@ -205,32 +238,6 @@ jolli search "windows path" --budget 8000 --format json
 
 Available flags: `--since` (ISO date or relative `7d`/`2w`/`1m`/`3y`; bad values are rejected with exit 1), `--hashes`, `--limit`, `--budget`, `--format` (`json` default; `text` for terminal-friendly output), `--output`, `--cwd`. There is **no `--branch` flag** — the catalog is scanned across every branch in the repo by design.
 
-### Site generation: `jolli new` / `build` / `start` / `dev`
-
-Generates a Nextra v4 documentation site from a `Content_Folder` of Markdown plus optional OpenAPI specs. Designed for product / API documentation alongside (or instead of) your AI commit memories.
-
-```bash
-# Scaffold a new site (creates Content_Folder/ + site.json)
-jolli new my-docs
-
-# Build the static site to <out>/dist
-jolli build
-
-# Serve the built site
-jolli start
-
-# Hot-reload dev server (watches Content_Folder/ and re-syncs on change)
-jolli dev
-```
-
-Highlights:
-
-- **Theme packs** — `theme.pack` in `site.json` accepts `"forge"` (clean dev docs, sidebar-first, Inter; the default), `"atlas"` (editorial, dark default, serif), or `"default"` (vanilla Nextra layout, no custom styling). Customize `accentHue`, `fontFamily`, logos, and default theme mode in `site.json`.
-- **Header / footer config**: `header.items` supports per-item dropdowns; `footer` supports copyright, link columns, and social icons.
-- **OpenAPI rich pipeline**: each endpoint is compiled into a per-endpoint MDX page with auto-generated cURL / JS / TS / Python / Go code samples — no `swagger-ui-react` runtime.
-
-See [`docs/site-json-reference.md`](docs/site-json-reference.md) and [`examples/`](examples/) for runnable configurations.
-
 ### `jolli configure`
 
 Manages settings stored in `~/.jolli/jollimemory/config.json`. API keys are masked in the display output.
@@ -290,93 +297,6 @@ jolli clean --yes
 ```
 
 **Safety**: in a non-TTY environment (CI, pipes, redirected stdin), `clean` refuses to delete without `--yes` and exits with code 1. This prevents scripts from silently wiping data.
-
-## Jolli Site — documentation from your content folder
-
-The CLI also includes a site generation surface that turns a plain folder of Markdown files and OpenAPI specs into a polished Nextra v4 documentation site.
-
-### `jolli new [folder-name]`
-
-Scaffolds a new Content_Folder with starter files: `site.json` (configuration), sample Markdown pages, and an example OpenAPI spec.
-
-```bash
-jolli new my-docs
-cd my-docs
-jolli dev          # live preview at localhost:3000
-```
-
-### `jolli dev [source-root]`
-
-Starts a development server with hot reload. Edits to Markdown, MDX, or OpenAPI files in the source folder are mirrored and rendered instantly via Next.js HMR.
-
-```bash
-jolli dev                  # current directory
-jolli dev ./my-docs        # specific folder
-jolli dev --migrate        # re-detect framework config
-jolli dev --verbose        # detailed build output
-```
-
-### `jolli build [source-root]`
-
-Builds a static site with full-text search indexing (Pagefind). No server is started.
-
-```bash
-jolli build
-```
-
-### `jolli start [source-root]`
-
-Builds the static site + search index, then serves it locally.
-
-```bash
-jolli start
-```
-
-### `jolli convert [source]`
-
-Converts an existing Docusaurus documentation folder to Nextra-compatible structure. Creates a timestamped backup when converting in-place.
-
-```bash
-jolli convert                      # convert current directory
-jolli convert ./old-docs           # convert specific folder
-jolli convert --output ./new-docs  # output to a different folder
-```
-
-What it does: detects sidebar config, reorganizes directory structure, downgrades incompatible `.mdx` to `.md`, rewrites image paths, writes a clean `site.json`, and removes framework-specific files.
-
-### How it works
-
-1. **Content_Folder** — your Markdown files, images, and OpenAPI specs live in a plain folder. `site.json` at the root configures title, navigation, theme, and footer.
-2. **Mirror + Render** — the CLI mirrors content into a hidden build directory (`~/.jolli/sites/<hash>/`), renders OpenAPI specs into interactive API docs, generates sidebar navigation from the folder structure, and runs Next.js under the hood.
-3. **Theme Packs** — choose from `forge` (clean developer-docs, default), `default` (vanilla Nextra), or `atlas` (editorial, dark serif). Set in `site.json` under `theme.pack`.
-
-### `site.json` reference
-
-```json
-{
-  "title": "My Docs",
-  "description": "Project documentation",
-  "nav": [
-    { "title": "Home", "href": "/" },
-    { "title": "API", "href": "/api/openapi" }
-  ],
-  "theme": { "pack": "forge" }
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `title` | string | Site title (required) |
-| `description` | string | Site description (required) |
-| `nav` | array | Top navbar links (required) |
-| `header` | object | Advanced dropdown navbar |
-| `footer` | object | Copyright, columns, social icons |
-| `sidebar` | object | Folder → navigation label overrides |
-| `pathMappings` | object | Source → target folder remapping |
-| `theme` | object | Pack, colors, fonts, logo |
-| `favicon` | string | Path to favicon file |
-
----
 
 ## Session Context Recall
 
@@ -510,6 +430,95 @@ Two `.jolli/jollimemory/` directories carry local state, both stay on your disk 
 - `<projectDir>/.jolli/jollimemory/` (per-project, gitignored) — `sessions.json` (session metadata), `plans.json`, `notes/`, `cursors.json`, `git-op-queue/`, `briefing-cache.json`, `debug.log`.
 
 Every entry on the `jollimemory/summaries/v3` orphan branch — and its mirror inside the Memory Bank folder, including raw transcripts — also stays on your disk unless one of the specific actions above is triggered.
+
+---
+
+## Jolli Site — documentation from your content folder
+
+The CLI also includes a site generation surface that turns a plain folder of Markdown files and OpenAPI specs into a polished documentation site.
+
+### `jolli new [folder-name]`
+
+Scaffolds a new Content_Folder with starter files: `site.json` (configuration), sample Markdown pages, and an example OpenAPI spec.
+
+```bash
+jolli new my-docs
+cd my-docs
+jolli dev          # live preview at localhost:3000
+```
+
+### `jolli dev [source-root]`
+
+Starts a development server with hot reload. Edits to Markdown, MDX, or OpenAPI files in the source folder are mirrored and rendered instantly via Next.js HMR.
+
+```bash
+jolli dev                  # current directory
+jolli dev ./my-docs        # specific folder
+jolli dev --migrate        # re-detect framework config
+jolli dev --verbose        # detailed build output
+```
+
+### `jolli build [source-root]`
+
+Builds a static site with full-text search indexing (Pagefind). No server is started.
+
+```bash
+jolli build
+```
+
+### `jolli start [source-root]`
+
+Builds the static site + search index, then serves it locally.
+
+```bash
+jolli start
+```
+
+### `jolli convert [source]`
+
+Converts an existing Docusaurus documentation folder to Jolli-compatible structure. Creates a timestamped backup when converting in-place.
+
+```bash
+jolli convert                      # convert current directory
+jolli convert ./old-docs           # convert specific folder
+jolli convert --output ./new-docs  # output to a different folder
+```
+
+What it does: detects sidebar config, reorganizes directory structure, downgrades incompatible `.mdx` to `.md`, rewrites image paths, writes a clean `site.json`, and removes framework-specific files.
+
+### How it works
+
+1. **Content_Folder** — your Markdown files, images, and OpenAPI specs live in a plain folder. `site.json` at the root configures title, navigation, theme, and footer.
+2. **Mirror + Render** — the CLI mirrors content into a hidden build directory (`~/.jolli/sites/<hash>/`), renders OpenAPI specs into interactive API docs, generates sidebar navigation from the folder structure, and runs Next.js under the hood.
+3. **Theme Packs** — choose from `forge` (clean developer-docs, default), `default`, or `atlas` (editorial, dark serif). Set in `site.json` under `theme.pack`.
+
+### `site.json` reference
+
+```json
+{
+  "title": "My Docs",
+  "description": "Project documentation",
+  "nav": [
+    { "title": "Home", "href": "/" },
+    { "title": "API", "href": "/api/openapi" }
+  ],
+  "theme": { "pack": "forge" }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | Site title (required) |
+| `description` | string | Site description (required) |
+| `nav` | array | Top navbar links (required) |
+| `header` | object | Advanced dropdown navbar |
+| `footer` | object | Copyright, columns, social icons |
+| `sidebar` | object | Folder → navigation label overrides |
+| `pathMappings` | object | Source → target folder remapping |
+| `theme` | object | Pack, colors, fonts, logo |
+| `favicon` | string | Path to favicon file |
+
+---
 
 ## Support
 
