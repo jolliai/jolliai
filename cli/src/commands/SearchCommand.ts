@@ -23,7 +23,7 @@ import { type Command, Option } from "commander";
 import { LocalSearchProvider } from "../core/LocalSearchProvider.js";
 import { DEFAULT_CATALOG_LIMIT, DEFAULT_SEARCH_BUDGET, type SearchCatalog, type SearchResult } from "../core/Search.js";
 import { setLogDir } from "../Logger.js";
-import { isSafeQuery, parsePositiveInt, resolveProjectDir } from "./CliUtils.js";
+import { isSafeQuery, parsePositiveInt, readStdin, resolveProjectDir } from "./CliUtils.js";
 
 /**
  * Pattern matching a comma-separated list of **8- to 40-char hex SHAs**.
@@ -48,6 +48,7 @@ interface SearchOptions {
 	format?: "json" | "text";
 	output?: string;
 	cwd?: string;
+	argStdin?: boolean;
 }
 
 /**
@@ -164,6 +165,7 @@ export function registerSearchCommand(program: Command): void {
 		)
 		.addOption(new Option("--format <fmt>", "Output format").choices(["json", "text"]).default("json"))
 		.option("--output <path>", "Write output to file instead of stdout")
+		.option("--arg-stdin", "Read the query argument from stdin instead of argv (used by SKILL.md here-doc bridge)")
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
 		.action(async (words: string[], options: SearchOptions) => {
 			try {
@@ -172,7 +174,24 @@ export function registerSearchCommand(program: Command): void {
 				const projectDir = options.cwd as string;
 				setLogDir(projectDir);
 
-				const query = words.length > 0 ? words.join(" ") : "";
+				// --arg-stdin is mutually exclusive with positional words. The skill
+				// template's here-doc pipeline pushes the query via stdin and CLI
+				// flags via argv; allowing both at once would silently concatenate
+				// or drop one side and undermine the injection-defense contract.
+				if (options.argStdin && words.length > 0) {
+					emitError(
+						options,
+						"--arg-stdin and positional [words...] are mutually exclusive. Pass the query via stdin OR positional, not both.",
+					);
+					return;
+				}
+
+				let query: string;
+				if (options.argStdin) {
+					query = await readStdin();
+				} else {
+					query = words.length > 0 ? words.join(" ") : "";
+				}
 
 				// Validate query characters when present (prevents shell injection).
 				// Uses isSafeQuery — a deny-list of characters that escape a double-

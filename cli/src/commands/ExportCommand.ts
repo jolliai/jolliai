@@ -5,7 +5,8 @@
  *   - `export` — Export commit summaries as markdown files to ~/Documents/jollimemory/<project>/
  *   - `export-prompt` — Print prompt templates to stdout, or write to a folder
  *      with manifest.json (for backend DB seeding) plus per-prompt .md files
- *      (for human review). See plan 121 for the manifest schema.
+ *      (for human review). The manifest schema is the `Manifest` /
+ *      `ManifestEntry` interfaces declared below.
  */
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -35,7 +36,7 @@ function extractPlaceholders(template: string): ReadonlyArray<string> {
 	return [...set].sort();
 }
 
-/** Manifest entry for a single prompt template — see plan 121 for schema. */
+/** Manifest entry for a single prompt template. */
 interface ManifestEntry {
 	readonly action: string;
 	readonly version: number;

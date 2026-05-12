@@ -203,7 +203,7 @@ export interface LegacyCommitSummary {
 
 // ─── Commit-level classification types ───────────────────────────────────────
 
-/** How the commit was created (based on doc 34 §4.1 Hook participation matrix) */
+/** How the commit was created — the hook-participation classification. */
 export type CommitType = "commit" | "amend" | "squash" | "rebase" | "cherry-pick" | "revert";
 
 /** Whether the operation was triggered from the VSCode plugin or CLI/other git client */

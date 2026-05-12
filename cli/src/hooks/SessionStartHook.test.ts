@@ -293,7 +293,9 @@ describe("SessionStartHook", () => {
 
 		expect(writeSpy).toHaveBeenCalledTimes(1);
 		const output = writeSpy.mock.calls[0][0] as string;
-		expect(output).toContain("Tip: /jolli-recall");
+		// v5: cross-platform phrasing covers Codex / Cursor / etc. as well.
+		expect(output).toContain("Tip: run the jolli-recall skill");
+		expect(output).toContain("/jolli-recall in Claude Code");
 		expect(output).not.toContain("Warning:");
 		writeSpy.mockRestore();
 	});
@@ -1145,7 +1147,8 @@ describe("SessionStartHook", () => {
 
 		expect(writeSpy).toHaveBeenCalledTimes(1);
 		const output = writeSpy.mock.calls[0][0] as string;
-		expect(output).toContain("Tip: /jolli-recall");
+		expect(output).toContain("Tip: run the jolli-recall skill");
+		expect(output).toContain("/jolli-recall in Claude Code");
 		expect(output).not.toContain("Warning:");
 		writeSpy.mockRestore();
 	});

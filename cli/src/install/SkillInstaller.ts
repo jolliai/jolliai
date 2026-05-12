@@ -1,17 +1,33 @@
 /**
  * Skill Installer
  *
- * Manages the installation, update, and cleanup of Jolli skill files for
- * Claude Code (`.claude/skills/<name>/SKILL.md`).
+ * Writes one byte-identical SKILL.md per skill to **both** target directories:
+ *
+ *   - `<projectDir>/.claude/skills/<name>/SKILL.md`  — for Claude Code
+ *   - `<projectDir>/.agents/skills/<name>/SKILL.md`  — for the cross-platform
+ *     Agent Skills standard, picked up by Codex CLI, Cursor 2.4+, Windsurf,
+ *     OpenCode, Gemini CLI, GitHub Copilot.
+ *
+ * Frontmatter is spec-compliant only (`name`, `description`, `metadata`) —
+ * no Claude-private fields (`argument-hint`, `user-invocable`) — so the same
+ * file passes `skills-ref validate` and runs on every host.
+ *
+ * **SECURITY — shell injection defense**: skill templates instruct the host
+ * LLM to invoke `jolli recall --arg-stdin` / `jolli search --arg-stdin` and
+ * feed the user's argument through a here-doc with a **fresh, LLM-generated
+ * 16-char hex delimiter** per invocation. The single-quoted delimiter token
+ * (`<<'JOLLI_ARG_<DELIM>_END'`) is POSIX's only here-doc form that suppresses
+ * every metacharacter (`$()`, backticks, `${VAR}`, `\`). Per-invocation high-
+ * entropy delimiters defeat prompt-injection attempts that pre-compute the
+ * delimiter into a payload. Known residual risks (the LLM not following the
+ * recipe, a 1-in-2^64 delimiter collision, a host that strips here-docs from
+ * the command before execution) are accepted trade-offs of this design.
  *
  * Each skill is upserted **independently** by hash of its template content
  * compared with the version recorded in the file. This avoids the trap where
  * a single skill's version match short-circuits the whole installer and
  * prevents a newer skill (e.g. `jolli-search`) from ever being installed on
  * projects whose `jolli-recall` already matches the current version.
- *
- * Future extensions: MCP server registration for Codex CLI / Gemini CLI /
- * Cursor / Windsurf — added by appending a new entry to {@link SKILLS}.
  */
 
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -32,11 +48,51 @@ const SKILL_VERSION = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ :
 /** Legacy skill directory names from previous versions (v1 and v2) */
 const LEGACY_SKILL_DIRS = ["jollimemory-recall", "jolli-memory-recall"];
 
-/** Each registered skill: directory name and template builder. */
+/**
+ * A Skill registration: directory name + template builder. Template content is
+ * host-agnostic — the same string is written into every target directory.
+ */
 interface SkillRegistration {
 	readonly name: string;
 	readonly build: () => string;
 }
+
+/**
+ * A target directory family for skill writes.
+ *
+ * - `host` is a stable identifier used in logs / tests.
+ * - `relativeDir` is the path under `<projectDir>` where SKILL.md files live.
+ * - `enabled` decides whether to write into this target for the given config.
+ *   `.claude/skills/` is gated on `config.claudeEnabled !== false`. The
+ *   `.agents/skills/` cross-platform target is unconditional today — splitting
+ *   it across a per-host detector list (`isCodexInstalled || isGeminiInstalled
+ *   || …`) would miss Cursor / OpenCode / Copilot-only users, and the cost is
+ *   ~10 KB of two SKILL.md files that `.git/info/exclude` keeps out of `git
+ *   status`.
+ */
+export interface SkillTarget {
+	readonly host: "claude-code" | "agents-std";
+	readonly relativeDir: ReadonlyArray<string>;
+	readonly enabled: (config: { claudeEnabled?: boolean }) => boolean;
+}
+
+/**
+ * Where `jolli enable` writes SKILL.md files. Order is preserved so logs and
+ * tests can rely on a stable iteration order.
+ */
+export const SKILL_TARGETS: ReadonlyArray<SkillTarget> = [
+	{
+		host: "claude-code",
+		relativeDir: [".claude", "skills"],
+		enabled: (config) => config.claudeEnabled !== false,
+	},
+	{
+		host: "agents-std",
+		relativeDir: [".agents", "skills"],
+		// Always-on. See SkillTarget JSDoc for the rationale.
+		enabled: () => true,
+	},
+];
 
 /**
  * Registry of skills installed by `jolli enable`. Adding a new skill is
@@ -48,15 +104,31 @@ const SKILLS: ReadonlyArray<SkillRegistration> = [
 ];
 
 /**
- * Installs or updates Jolli skill files in the project's `.claude/skills/`
- * directory. Cleans up legacy directory names from prior versions.
- *
- * Each skill is checked and upserted independently, so installing a new skill
- * (or updating one of several) is not blocked by another skill's version
- * matching the running CLI.
+ * Skill paths recorded in `.git/info/exclude` so they don't pollute
+ * `git status` in user repositories. Always 4 entries: 2 skills × 2 targets.
+ * Path format follows git's gitignore syntax — leading `/` anchors to the
+ * repo root, trailing `/` matches the directory and its contents.
  */
-export async function updateSkillsIfNeeded(projectDir: string): Promise<void> {
-	// Clean up legacy skill directories from previous versions
+export const SKILL_GIT_EXCLUDE_PATHS: ReadonlyArray<string> = SKILL_TARGETS.flatMap((target) =>
+	SKILLS.map((skill) => `/${target.relativeDir.join("/")}/${skill.name}/`),
+);
+
+/**
+ * Installs or updates Jolli skill files. The same byte-identical SKILL.md is
+ * written into each enabled target directory under {@link SKILL_TARGETS}; the
+ * Claude Code target is gated on `config.claudeEnabled !== false`, the
+ * cross-platform `.agents/skills/` target is unconditional.
+ *
+ * Cleans up legacy directory names from prior versions. Each skill is checked
+ * and upserted independently, so installing a new skill (or updating one of
+ * several) is not blocked by another skill's version matching the running CLI.
+ */
+export async function updateSkillsIfNeeded(
+	projectDir: string,
+	config: { claudeEnabled?: boolean } = {},
+): Promise<void> {
+	// Clean up legacy skill directories from previous versions. These only
+	// ever lived under `.claude/skills/` — `.agents/skills/` is a new target.
 	for (const legacyName of LEGACY_SKILL_DIRS) {
 		const legacyDir = join(projectDir, ".claude", "skills", legacyName);
 		try {
@@ -68,8 +140,12 @@ export async function updateSkillsIfNeeded(projectDir: string): Promise<void> {
 		/* v8 ignore stop */
 	}
 
-	for (const skill of SKILLS) {
-		await upsertSkill(projectDir, skill.name, skill.build());
+	for (const target of SKILL_TARGETS) {
+		if (!target.enabled(config)) continue;
+		const targetDir = join(projectDir, ...target.relativeDir);
+		for (const skill of SKILLS) {
+			await upsertSkill(targetDir, skill.name, skill.build());
+		}
 	}
 }
 
@@ -81,26 +157,40 @@ export async function updateSkillsIfNeeded(projectDir: string): Promise<void> {
  * old name is kept as a thin wrapper to avoid touching every call site in
  * one PR.
  */
-export async function updateSkillIfNeeded(projectDir: string): Promise<void> {
-	return updateSkillsIfNeeded(projectDir);
+export async function updateSkillIfNeeded(projectDir: string, config: { claudeEnabled?: boolean } = {}): Promise<void> {
+	return updateSkillsIfNeeded(projectDir, config);
 }
+
+/**
+ * Matches the version line in a SKILL.md frontmatter. Accepts:
+ *   - `metadata.version: "x.y.z"` (current — spec compliant, nested under
+ *     `metadata:` two-space-indented block).
+ *   - Legacy top-level `jolli-skill-version: x.y.z` /
+ *     `jollimemory-version: x.y.z` (kept so an old SKILL.md on disk is still
+ *     recognized as "up-to-date" and not needlessly rewritten on every install).
+ *
+ * Multi-line mode so `^  version:` matches the nested form. Captured group is
+ * the version string with surrounding whitespace and quotes trimmed downstream.
+ */
+const SKILL_VERSION_LINE = /(?:^|\n)(?:[ \t]+version|jolli-skill-version|jollimemory-version):\s*([^\r\n]+)/;
 
 /**
  * Writes one skill's SKILL.md file when its content version differs from
  * what's on disk. Idempotent.
  */
-async function upsertSkill(projectDir: string, name: string, content: string): Promise<void> {
-	const skillDir = join(projectDir, ".claude", "skills", name);
+async function upsertSkill(skillsDir: string, name: string, content: string): Promise<void> {
+	const skillDir = join(skillsDir, name);
 	const skillPath = join(skillDir, "SKILL.md");
 
 	try {
 		const existing = await readFile(skillPath, "utf-8");
-		const versionMatch = existing.match(/(?:jolli-skill-version|jollimemory-version):\s*(.+)/);
-		/* v8 ignore start -- version match: SKILL_VERSION is always "dev" in tests */
-		if (versionMatch && versionMatch[1].trim() === SKILL_VERSION) {
-			return; // Up to date
+		const versionMatch = existing.match(SKILL_VERSION_LINE);
+		if (versionMatch) {
+			const found = versionMatch[1].trim().replace(/^["']|["']$/g, "");
+			if (found === SKILL_VERSION) {
+				return; // Up to date
+			}
 		}
-		/* v8 ignore stop */
 	} catch {
 		// File doesn't exist — will create
 	}
@@ -119,22 +209,74 @@ async function upsertSkill(projectDir: string, name: string, content: string): P
 // ─── Skill Templates ────────────────────────────────────────────────────────
 
 /**
- * Recall skill template.
+ * Shared Step-1 preamble — instructs the LLM to invoke the CLI via a here-doc
+ * with a freshly-generated 16-char hex delimiter, and to STOP if the host
+ * can't support that recipe rather than fall back to an `argv` interpolation
+ * that would re-open the shell-injection door.
  *
- * **SECURITY NOTE**: every `${...}` placeholder substituted by the agent host
- * MUST be wrapped in double quotes when interpolated into a shell command.
- * Without quotes, user-supplied query text containing shell metacharacters
- * (`;`, `|`, `&`, backticks, etc.) executes as additional commands. The
- * `\${ARGUMENTS}` below sits inside `"..."` for that reason. CI should
- * enforce this with a lint check on this file.
+ * Also pins the shell choice on Windows: Git Bash, not WSL bash and not
+ * PowerShell. The Jolli entry script is written via Windows Node's
+ * `os.homedir()` to `%USERPROFILE%\\.jolli\\jollimemory\\run-cli`. Only Git
+ * Bash's `$HOME` aligns with `%USERPROFILE%`; WSL bash sees a separate Linux
+ * home and would miss the script even when it is correctly installed.
+ *
+ * The literal `<DELIM>` placeholder is intentional: the LLM is the one that
+ * generates the random value each invocation, which is what makes pre-computed
+ * prompt-injection payloads useless.
+ */
+function heredocInvocation(subcommand: "recall" | "search", flagSuffix: string): string {
+	return `### Shell prerequisite
+
+This block requires a POSIX bash shell. On Linux/macOS the system bash works.
+**On Windows, use Git Bash** (the bash bundled with Git for Windows). Other
+Windows "bash" options — \`C:\\Windows\\System32\\bash.exe\`, the WindowsApps
+alias, or any WSL bash — see a separate Linux home directory and will not
+find the Jolli entry script that lives under \`%USERPROFILE%\`.
+
+If Git Bash is not available on Windows, STOP and tell the user:
+"Jolli skill needs Git Bash on Windows. Install Git for Windows from
+https://git-scm.com/download/win and retry."
+
+Do NOT fall back to \`npm run\`, \`npx\`, \`node\` directly, PowerShell-native
+commands, WSL bash, or any workspace-local script — those bypass the
+security recipe and the dist resolver and will not produce valid output.
+
+### Invocation
+
+Generate a fresh random 16-character hex string (the "delimiter token") for
+this invocation — e.g. \`3f8a9b2c5d7e1f4a\`. Quickly scan the user's argument:
+if the argument text contains a line that is exactly \`JOLLI_ARG_<delimiter
+token>_END\`, regenerate the delimiter token and re-check.
+
+Then run this Bash, replacing the two \`<DELIM>\` occurrences with your
+delimiter token and replacing \`<user-arg>\` with the user's input verbatim:
+
+\`\`\`bash
+"$HOME/.jolli/jollimemory/run-cli" ${subcommand} --arg-stdin${flagSuffix} <<'JOLLI_ARG_<DELIM>_END'
+<user-arg>
+JOLLI_ARG_<DELIM>_END
+\`\`\`
+
+If you cannot follow the above structure (e.g., your environment doesn't
+support here-docs), STOP and tell the user "Jolli skill cannot run safely
+in this environment." DO NOT attempt to interpolate the argument into argv
+or any double-quoted shell string — that path has a known shell injection
+vector.`;
+}
+
+/**
+ * Recall skill template — describes the multi-step recall workflow to the
+ * host LLM. Byte-identical across every {@link SKILL_TARGETS} entry, so the
+ * file passes `skills-ref validate` and works on Claude Code, Codex, Cursor,
+ * Windsurf, OpenCode, and Gemini without per-host divergence.
  */
 function buildRecallSkillTemplate(): string {
 	return `---
 name: jolli-recall
-description: Recall prior development context from Jolli for the current branch
-argument-hint: "[branch or keyword]"
-user-invocable: true
-jolli-skill-version: ${SKILL_VERSION}
+description: Recall prior development context from Jolli for the current branch. Use when the user wants to recall, remember, or resume prior work on a branch.
+metadata:
+  version: "${SKILL_VERSION}"
+  vendor: "jolli.ai"
 ---
 
 # Jolli Recall
@@ -146,23 +288,18 @@ distilled topics (trigger / response / decisions / files), plus any plans
 and notes that the work referenced. Synthesize a grounded answer to the
 user's prompt about that branch.
 
-## Step 1: Parse the argument
+## Step 1: Run the CLI
 
-The user's input is either a branch name (exact or fragment) or empty (use
-the current git branch). Quote it when constructing bash to prevent shell
-injection.
+The user's input \`<user-arg>\` is either a branch name (exact or fragment) or
+empty (in which case the CLI uses the current git branch).
 
-## Step 2: Run the CLI
-
-\`\`\`
-"$HOME/.jolli/jollimemory/run-cli" recall "\${ARGUMENTS}" --format json
-\`\`\`
+${heredocInvocation("recall", " --format json")}
 
 If \`~/.jolli/jollimemory/run-cli\` does not exist, tell the user:
 "Jolli not installed. Please install via \`npm install -g @jolli.ai/cli && jolli enable\` or install the Jolli VS Code extension."
 Do not attempt further processing.
 
-## Step 3: Handle the response
+## Step 2: Handle the response
 
 The output is JSON with a \`type\` field. Three cases:
 
@@ -298,8 +435,8 @@ If a \`query\` field is present, semantic-match the user's input against
 \`branch\`, \`commitMessages\`, and \`topicTitles\` (the highest-signal source);
 support cross-language matching and time-relative queries.
 
-- One match: re-run \`"$HOME/.jolli/jollimemory/run-cli" recall "<branch>" --format json\`
-  and continue from Step 3.
+- One match: re-run Step 1 with the chosen branch as the user-arg and
+  continue from Step 2.
 - Multiple matches: list candidates, ask user to choose.
 - No matches: show the catalog, ask user to clarify.
 
@@ -319,22 +456,21 @@ payload from nothing.
 }
 
 /**
- * Search skill template.
+ * Search skill template — describes the two-phase catalog/detail search
+ * workflow to the host LLM. Byte-identical across every {@link SKILL_TARGETS}
+ * entry, same spec-compliant frontmatter as recall.
  *
  * Two-phase pattern: catalog scan → hash-targeted detail load. The chat LLM
  * does all semantic work (matching the user's query against catalog content);
  * the CLI is purely a deterministic data source.
- *
- * **SECURITY NOTE**: same shell-injection caveat as recall — every `${...}`
- * placeholder must be wrapped in double quotes when interpolated into Bash.
  */
 function buildSearchSkillTemplate(): string {
 	return `---
 name: jolli-search
-description: Search structured commit memories across all branches — decisions, topics, files
-argument-hint: "<keyword> [--since 2w]"
-user-invocable: true
-jolli-skill-version: ${SKILL_VERSION}
+description: Search structured commit memories across all branches — decisions, topics, files. Use when the user wants to find prior decisions, related commits, or how a topic was handled before.
+metadata:
+  version: "${SKILL_VERSION}"
+  vendor: "jolli.ai"
 ---
 
 # Jolli Search
@@ -352,13 +488,13 @@ for the chat LLM that runs this skill.
 
 ## When NOT to use
 
-- Need full context of a known branch → \`/jolli-recall <branch>\`.
+- Need full context of a known branch → run jolli-recall.
 - Looking at the current code → grep / read files directly.
 
-## Step 1: Parse \${ARGUMENTS} into query + flags
+## Step 1: Parse the user input into query + flags
 
-The user can include flags inline, e.g. \`/jolli-search auth --since 2w\`. Before
-invoking the CLI, split the argument string into two parts:
+The user can include flags inline, e.g. \`auth --since 2w\`. Before invoking
+the CLI, split the user's argument into two parts:
 
 1. **Query**: the user's keyword / sentence (everything that is NOT a CLI flag).
    The query may be in any human language and contain natural punctuation
@@ -367,20 +503,27 @@ invoking the CLI, split the argument string into two parts:
    \`--output <path>\`. Pass these through verbatim. Ignore any other token starting
    with \`--\`.
 
-Quote ONLY the query when constructing bash; pass flags as separate unquoted
-tokens. Examples:
+The query is delivered to the CLI on stdin via a here-doc, and flags go on
+argv as separate tokens. Never put flags inside the here-doc body.
+
+## Step 2: Run the catalog phase
+
+${heredocInvocation("search", " <flags> --format json")}
+
+Replace \`<flags>\` with the parsed flags from Step 1 (e.g. \`--since 2w --limit 30\`)
+or remove the placeholder entirely if there are no flags. Always include
+\`--format json\`.
+
+Worked examples (the part the LLM has to construct):
 
 | User input                                  | Bash you should run                                                                                |
 |---------------------------------------------|----------------------------------------------------------------------------------------------------|
-| \`auth\`                                    | \`"$HOME/.jolli/jollimemory/run-cli" search "auth" --format json\`                                |
-| \`auth --since 2w\`                         | \`"$HOME/.jolli/jollimemory/run-cli" search "auth" --since 2w --format json\`                     |
-| \`why did we choose X over Y? --since 1m\`  | \`"$HOME/.jolli/jollimemory/run-cli" search "why did we choose X over Y?" --since 1m --format json\` |
+| \`auth\`                                    | \`run-cli search --arg-stdin --format json <<'JOLLI_ARG_<DELIM>_END' …\`                            |
+| \`auth --since 2w\`                         | \`run-cli search --arg-stdin --since 2w --format json <<'JOLLI_ARG_<DELIM>_END' …\`                 |
+| \`why did we choose X over Y? --since 1m\`  | \`run-cli search --arg-stdin --since 1m --format json <<'JOLLI_ARG_<DELIM>_END' …\`                 |
 
-Always include \`--format json\`. Never put flags inside the query quotes.
-
-## Step 2: Get the catalog
-
-Run the bash command you constructed in Step 1.
+The \`…\` after \`<<'JOLLI_ARG_<DELIM>_END'\` is the here-doc body containing
+the query, followed on a new line by the closing \`JOLLI_ARG_<DELIM>_END\`.
 
 **Failure handling**:
 - If \`~/.jolli/jollimemory/run-cli\` does not exist: tell the user
@@ -434,12 +577,16 @@ larger budget still doesn't surface relevant commits.
 
 ## Step 4: Load full content for the picks
 
-Construct the Phase 2 bash with the same query quoting + flag separation rule
-from Step 1, plus \`--hashes <fullHash1,fullHash2,fullHash3>\`:
+Construct the Phase 2 bash with the same here-doc recipe from Step 2, but add
+\`--hashes <fullHash1,fullHash2,fullHash3>\` to the flags:
 
+\`\`\`bash
+"$HOME/.jolli/jollimemory/run-cli" search --arg-stdin --hashes <fullHash1>,<fullHash2>,<fullHash3> --format json <<'JOLLI_ARG_<DELIM>_END'
+<the query>
+JOLLI_ARG_<DELIM>_END
 \`\`\`
-"$HOME/.jolli/jollimemory/run-cli" search "<the query>" --hashes <fullHash1>,<fullHash2>,<fullHash3> --format json
-\`\`\`
+
+(Generate a new \`<DELIM>\` token for this invocation as in Step 2.)
 
 **Use \`hit.fullHash\` (40-char SHA), NOT \`hit.hash\` (8-char display)**. The
 CLI rejects abbreviated hashes — the 8-char display \`hash\` is for showing in

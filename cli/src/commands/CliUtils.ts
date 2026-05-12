@@ -141,6 +141,42 @@ export function isInteractive(): boolean {
 	return process.stdin.isTTY === true;
 }
 
+/**
+ * Reads the entire contents of `process.stdin` to a string, trims one trailing
+ * newline (LF or CRLF) if present, and returns the result.
+ *
+ * Used by `recall --arg-stdin` / `search --arg-stdin` to receive user-supplied
+ * argument text without it ever passing through the shell's argv parser. Skill
+ * templates pipe the user's input via a here-doc, so the argument cannot trigger
+ * `$()` / backtick expansion — that's the whole reason this exists.
+ *
+ * Behavior:
+ *   - Reads all chunks from stdin until EOF; binary safe (concatenates as UTF-8).
+ *   - Trims a single trailing `\n` or `\r\n` (a here-doc always appends one).
+ *     Inner newlines are preserved verbatim — the caller decides whether to
+ *     accept a multi-line argument.
+ *   - Resolves to `""` on empty stdin (the caller distinguishes that from a
+ *     missing flag).
+ */
+export function readStdin(): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const chunks: Buffer[] = [];
+		const stdin = process.stdin;
+		stdin.on("data", (chunk: Buffer | string) => {
+			chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+		});
+		stdin.on("end", () => {
+			let text = Buffer.concat(chunks).toString("utf-8");
+			if (text.endsWith("\r\n")) text = text.slice(0, -2);
+			else if (text.endsWith("\n")) text = text.slice(0, -1);
+			resolve(text);
+		});
+		/* v8 ignore start -- defensive: stdin error events are rare in practice */
+		stdin.on("error", reject);
+		/* v8 ignore stop */
+	});
+}
+
 const AMBIGUOUS_DISPLAY_LIMIT = 10;
 
 /**

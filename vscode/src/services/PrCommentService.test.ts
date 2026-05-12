@@ -839,7 +839,6 @@ describe("PrCommentService", () => {
 				expect.stringContaining("No PR for branch feature/br"),
 			);
 			expect(warn).not.toHaveBeenCalled();
-			// UI folding unchanged — see plan non-goal
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
 			);
@@ -965,7 +964,7 @@ describe("PrCommentService", () => {
 			// summary still points at `feature/old`. We MUST query
 			// `feature/old` and report `noPr` for it — NOT silently retarget
 			// to `feature/new` or to currentBranch. Auto-recovery from
-			// renames is a separate spike (see plan doc "Out of scope").
+			// renames is out of scope here.
 			let prViewBranchArg: string | undefined;
 			setupExecFile((cmd, args) => {
 				if (cmd === "git" && args[0] === "rev-parse") {

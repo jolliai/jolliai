@@ -62,6 +62,7 @@ import {
 	traverseDistPaths,
 } from "./DistPathResolver.js";
 import { installGeminiHook, isGeminiHookInstalled, removeGeminiHook } from "./GeminiHookInstaller.js";
+import { updateGitExclude } from "./GitExclude.js";
 import {
 	installGitHook,
 	installPostRewriteHook,
@@ -75,7 +76,7 @@ import {
 	removePrepareMsgHook,
 } from "./GitHookInstaller.js";
 import type { HookOpResult } from "./HookSettingsHelper.js";
-import { updateSkillIfNeeded } from "./SkillInstaller.js";
+import { SKILL_GIT_EXCLUDE_PATHS, updateSkillIfNeeded } from "./SkillInstaller.js";
 
 // ─── Re-exports for backward compatibility ──────────────────────────────────
 // External consumers import from "./Installer.js" — these re-exports keep
@@ -193,6 +194,17 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 				}
 				/* v8 ignore stop */
 			}
+			// SKILL.md is written for every enabled target — the cross-platform
+			// `.agents/skills/` target is unconditional, and `.claude/skills/`
+			// is gated inside the installer on `config.claudeEnabled !== false`.
+			// We update SKILL.md before the Claude-hook gate below so disabling
+			// Claude doesn't strand the `.agents/` skills target unupdated.
+			await updateSkillIfNeeded(wt, { claudeEnabled: config.claudeEnabled });
+			// Keep the user's `git status` clean by adding Jolli-managed skill
+			// paths to `.git/info/exclude`. Worktree-aware: linked worktrees
+			// may have their own gitdir, so we resolve per-worktree.
+			await updateGitExclude(wt, SKILL_GIT_EXCLUDE_PATHS);
+
 			if (config.claudeEnabled === false) continue;
 			const result = await installClaudeHook(wt);
 			/* v8 ignore start -- defensive: installClaudeHook currently never returns warnings */
@@ -204,8 +216,6 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			if (wt === projectDir || claudeResult.path === undefined) {
 				claudeResult = result;
 			}
-			// Write/update SKILL.md if version changed
-			await updateSkillIfNeeded(wt);
 			// Install SessionStart hook for auto-briefing
 			await installSessionStartHook(wt);
 		}
@@ -456,6 +466,18 @@ export async function uninstall(cwd?: string): Promise<InstallResult> {
 
 		await removePostRewriteHook(projectDir);
 		await removePrepareMsgHook(projectDir);
+
+		// Conservative skill-cleanup policy: leave the generated SKILL.md files
+		// AND the `.git/info/exclude` block alone. Users sometimes ship their
+		// own skills alongside Jolli's under `.claude/skills/` or
+		// `.agents/skills/`, and a blind `rm -rf` of those directories on
+		// uninstall would delete unrelated user content. The exclude block is
+		// also harmless if left behind — git silently ignores entries that no
+		// longer match anything. Leaving the files behind also means re-enabling
+		// Jolli later is a no-op.
+		warnings.push(
+			"Skill files were left in place. To remove them manually: `rm -rf .agents/skills/jolli-* .claude/skills/jolli-*` and delete the `# >>> jolli skill exclude >>>` block from `.git/info/exclude` if you no longer want it.",
+		);
 
 		log.info("Uninstallation complete");
 		return {

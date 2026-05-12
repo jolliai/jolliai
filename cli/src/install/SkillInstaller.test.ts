@@ -1,13 +1,28 @@
 /**
- * Focused tests for the per-skill upsert refactor: ensures both jolli-recall
- * and jolli-search are installed, that the alias `updateSkillIfNeeded` still
- * works, and that templates carry the security-required quoted ARGUMENTS.
+ * SkillInstaller tests.
+ *
+ * Asserts the v5 spec-compliant cross-platform shape:
+ *
+ * - One byte-identical SKILL.md written to both `.claude/skills/<name>/` and
+ *   `.agents/skills/<name>/` per skill.
+ * - Frontmatter contains only the spec-allowed fields (`name`, `description`,
+ *   `metadata`) — no Claude-private fields like `argument-hint` or `user-invocable`.
+ * - The invocation block uses a here-doc with an LLM-generated high-entropy
+ *   delimiter (`JOLLI_ARG_<DELIM>_END`) and `--arg-stdin`, NOT a fixed string,
+ *   NOT `$ARGUMENTS` argv interpolation, NOT a double-quoted argv string.
+ * - The Claude-target gate (`config.claudeEnabled === false`) skips
+ *   `.claude/skills/` but still writes `.agents/skills/`.
  */
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { updateSkillIfNeeded, updateSkillsIfNeeded } from "./SkillInstaller.js";
+import { SKILL_GIT_EXCLUDE_PATHS, updateSkillIfNeeded, updateSkillsIfNeeded } from "./SkillInstaller.js";
+
+// Vitest reuses vite's `define` config, so `__PKG_VERSION__` is the real
+// package.json version in tests. Use that value when planting legacy SKILL.md
+// fixtures so the version-up-to-date short-circuit can fire.
+const CURRENT_VERSION = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
 
 let tempDir: string;
 
@@ -19,158 +34,320 @@ afterEach(() => {
 	rmSync(tempDir, { recursive: true, force: true });
 });
 
-describe("updateSkillsIfNeeded", () => {
-	it("installs both jolli-recall and jolli-search SKILL.md files", async () => {
+// ─── Convenience readers ────────────────────────────────────────────────────
+
+function readRecall(target: "claude" | "agents" = "claude"): string {
+	const dir = target === "claude" ? ".claude/skills/jolli-recall" : ".agents/skills/jolli-recall";
+	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
+}
+
+function readSearch(target: "claude" | "agents" = "claude"): string {
+	const dir = target === "claude" ? ".claude/skills/jolli-search" : ".agents/skills/jolli-search";
+	return readFileSync(join(tempDir, dir, "SKILL.md"), "utf-8");
+}
+
+// ─── Dual-target write ──────────────────────────────────────────────────────
+
+describe("updateSkillsIfNeeded — target dimension", () => {
+	it("writes both skills into both .claude/skills/ and .agents/skills/", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		expect(recall).toContain("name: jolli-recall");
-		expect(search).toContain("name: jolli-search");
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
 	});
 
-	// Plan/note stubs on commits must use the right key names — `slug` for
-	// plans (because plan slugs carry archive-suffix semantics), `id` for
-	// notes (no archive mechanism). Earlier templates conflated both as
-	// "(slug + title)", which would point the LLM at a non-existent field
-	// when looking up a note.
-	it("recall template documents plan stubs (slug+title) and note stubs (id+title) distinctly", async () => {
+	it("writes byte-identical SKILL.md to .claude/skills/ and .agents/skills/", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
+		expect(readRecall("claude")).toBe(readRecall("agents"));
+		expect(readSearch("claude")).toBe(readSearch("agents"));
+	});
+
+	it("with claudeEnabled=false, skips .claude/skills/ but still writes .agents/skills/", async () => {
+		await updateSkillsIfNeeded(tempDir, { claudeEnabled: false });
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(false);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(false);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
+	});
+
+	it("with claudeEnabled=undefined (default), writes both targets", async () => {
+		await updateSkillsIfNeeded(tempDir, {});
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+	});
+
+	it("exports the 4 git-exclude paths for the two skills × two targets", () => {
+		expect(SKILL_GIT_EXCLUDE_PATHS).toEqual([
+			"/.claude/skills/jolli-recall/",
+			"/.claude/skills/jolli-search/",
+			"/.agents/skills/jolli-recall/",
+			"/.agents/skills/jolli-search/",
+		]);
+	});
+});
+
+// ─── Frontmatter spec compliance ────────────────────────────────────────────
+
+describe("recall template frontmatter", () => {
+	it("uses spec-compliant fields only — name, description, metadata.version, metadata.vendor", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		expect(recall).toMatch(/^---\nname: jolli-recall\n/);
+		expect(recall).toMatch(/description: Recall prior development context/);
+		expect(recall).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+	});
+
+	it("does NOT contain Claude-private top-level frontmatter fields", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		// argument-hint / user-invocable / disable-model-invocation were Claude-only
+		// extensions. agentskills.io spec rejects them; Claude.ai App rejects them.
+		expect(recall).not.toMatch(/^argument-hint:/m);
+		expect(recall).not.toMatch(/^user-invocable:/m);
+		expect(recall).not.toMatch(/^disable-model-invocation:/m);
+	});
+
+	it("does NOT carry the legacy top-level jolli-skill-version key", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		// New templates put the version under `metadata.version`. The legacy
+		// top-level key is still RECOGNIZED on read (so an existing SKILL.md
+		// from an older Jolli isn't needlessly rewritten), but new writes use
+		// the nested form only.
+		expect(recall).not.toMatch(/^jolli-skill-version:/m);
+		expect(recall).not.toMatch(/^jollimemory-version:/m);
+	});
+});
+
+describe("search template frontmatter", () => {
+	it("uses spec-compliant fields only", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readSearch();
+		expect(search).toMatch(/^---\nname: jolli-search\n/);
+		expect(search).toMatch(/description: Search structured commit memories/);
+		expect(search).toMatch(/metadata:\n {2}version: "[^"]+"\n {2}vendor: "jolli\.ai"/);
+	});
+
+	it("does NOT contain Claude-private top-level frontmatter fields", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readSearch();
+		expect(search).not.toMatch(/^argument-hint:/m);
+		expect(search).not.toMatch(/^user-invocable:/m);
+		expect(search).not.toMatch(/^disable-model-invocation:/m);
+	});
+});
+
+// ─── Shell-injection defense — here-doc + high-entropy delimiter ────────────
+
+describe("here-doc invocation pattern (security)", () => {
+	it("recall template uses --arg-stdin + here-doc with <DELIM> placeholder", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		expect(recall).toMatch(/run-cli" recall --arg-stdin --format json <<'JOLLI_ARG_<DELIM>_END'/);
+		expect(recall).toMatch(/^JOLLI_ARG_<DELIM>_END$/m);
+	});
+
+	it("search template uses --arg-stdin + here-doc with <DELIM> placeholder", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readSearch();
+		expect(search).toMatch(/run-cli" search --arg-stdin .*<<'JOLLI_ARG_<DELIM>_END'/);
+		expect(search).toMatch(/^JOLLI_ARG_<DELIM>_END$/m);
+	});
+
+	it("recall template requires LLM to generate a fresh 16-char hex delimiter per invocation", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		expect(recall).toMatch(/Generate a fresh random 16-character hex string/);
+		expect(recall).toMatch(/Quickly scan the user's argument/);
+		expect(recall).toMatch(/regenerate the delimiter token and re-check/);
+	});
+
+	it("recall template has a STOP-if-unsafe instruction (refuses to interpolate into argv)", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		expect(recall).toMatch(/STOP and tell the user/);
+		expect(recall).toMatch(/DO NOT attempt to interpolate the argument into argv/);
+		// Phrase wraps over a line break in the template, so allow whitespace
+		// between "injection" and "vector".
+		expect(recall).toMatch(/known shell injection\s+vector/);
+	});
+
+	it("search template has the same STOP-if-unsafe instruction", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readSearch();
+		expect(search).toMatch(/STOP and tell the user/);
+		expect(search).toMatch(/DO NOT attempt to interpolate the argument into argv/);
+	});
+
+	// ── Shell-prerequisite pin: Git Bash on Windows ─────────────────────────
+	// Without this guidance, hosts whose default shell is WSL bash
+	// (`C:\Windows\System32\bash.exe`) miss the Jolli entry script because
+	// WSL's `$HOME` points to a separate Linux home, not `%USERPROFILE%`.
+	it("recall template pins the shell to Git Bash on Windows", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		expect(recall).toMatch(/Git Bash/);
+		expect(recall).toMatch(/git-scm\.com\/download\/win/);
+		expect(recall).toMatch(/Install Git for Windows/);
+		// Must call out WSL bash specifically as not-supported.
+		expect(recall).toMatch(/WSL bash/);
+	});
+
+	it("search template pins the shell to Git Bash on Windows", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readSearch();
+		expect(search).toMatch(/Git Bash/);
+		expect(search).toMatch(/git-scm\.com\/download\/win/);
+		expect(search).toMatch(/Install Git for Windows/);
+		expect(search).toMatch(/WSL bash/);
+	});
+
+	it("recall template forbids npm/npx/PowerShell fallback shortcuts", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		// The "Do NOT fall back" line names the specific shortcuts a host LLM
+		// is most likely to invent when bash here-doc fails. All must be listed.
+		expect(recall).toMatch(/Do NOT fall back/);
+		expect(recall).toMatch(/`npm run`/);
+		expect(recall).toMatch(/`npx`/);
+		expect(recall).toMatch(/PowerShell-native/);
+	});
+
+	it("search template forbids npm/npx/PowerShell fallback shortcuts", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readSearch();
+		expect(search).toMatch(/Do NOT fall back/);
+		expect(search).toMatch(/`npm run`/);
+		expect(search).toMatch(/`npx`/);
+		expect(search).toMatch(/PowerShell-native/);
+	});
+
+	// ── Regression guards: residue from v3/v4 must NOT slip back in ──
+	it("recall template carries no $ARGUMENTS residue", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		// Legacy bash placeholders `${ARGUMENTS}` and `$ARGUMENTS` must be
+		// gone — the v5 template uses a here-doc instead.
+		expect(recall).not.toMatch(/\$\{ARGUMENTS\}/);
+		expect(recall).not.toMatch(/"\$ARGUMENTS"/);
+		expect(recall).not.toMatch(/'\$ARGUMENTS'/);
+	});
+
+	it("search template carries no $ARGUMENTS residue", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readSearch();
+		expect(search).not.toMatch(/\$\{ARGUMENTS\}/);
+		expect(search).not.toMatch(/"\$ARGUMENTS"/);
+		expect(search).not.toMatch(/'\$ARGUMENTS'/);
+	});
+
+	it("recall template does NOT use a fixed delimiter (must be <DELIM> placeholder, not JOLLI_ARG_EOF)", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
+		// v3 used a fixed delimiter (`JOLLI_ARG_EOF`). v5 requires the delimiter
+		// to be a per-invocation LLM-generated random hex value so prompt-injection
+		// attacks can't predict it. The marker has to remain a literal `<DELIM>`
+		// placeholder in the template so the LLM is told to substitute it.
+		expect(recall).not.toMatch(/<<'JOLLI_ARG_EOF'/);
+		expect(recall).not.toMatch(/^JOLLI_ARG_EOF$/m);
+	});
+
+	it("search template does NOT use a fixed delimiter", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const search = readSearch();
+		expect(search).not.toMatch(/<<'JOLLI_ARG_EOF'/);
+		expect(search).not.toMatch(/^JOLLI_ARG_EOF$/m);
+	});
+});
+
+// ─── Recall-template content pins (carried over from prior versions) ────────
+
+describe("recall template content", () => {
+	it("documents plan stubs (slug+title) and note stubs (id+title) distinctly", async () => {
+		await updateSkillsIfNeeded(tempDir);
+		const recall = readRecall();
 		expect(recall).toMatch(/`plans\?` — `\{ slug, title \}\[\]`/);
 		expect(recall).toMatch(/`notes\?` — `\{ id, title \}\[\]`/);
-		// Neither shape is described as the other.
 		expect(recall).not.toMatch(/`notes\?`[^.]*slug \+ title/);
 	});
 
-	// The stub-quoting paragraph used to unconditionally claim "content is
-	// already in your context" — but budget trimming can drop content while
-	// keeping the slug/title anchor. Without a conditional rule the LLM
-	// would fabricate quotes from a body it never received.
-	it("recall template conditionally guides quoting based on whether content is present", async () => {
+	it("conditionally guides quoting based on whether content is present", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
-		// Affirmative branch — content present → quote verbatim with attribution.
+		const recall = readRecall();
 		expect(recall).toMatch(/If the entry has `content`/);
-		// Negative branch — content absent → title-only anchor, no fabricated quotes.
 		expect(recall).toMatch(/If `content` is absent/);
 		expect(recall).toMatch(/never fabricate a quote/);
 	});
 
-	// Fact opener used to render as a single prose line that visually merged
-	// with the synthesis below. The skill template now mandates a heading +
-	// bullet block so the user has a clear, scannable verification anchor.
-	it("recall template Part A renders as `### Loaded` heading + bullet block (not a single prose line)", async () => {
+	it("Part A renders as `### Loaded` heading + bullet block", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
-		// The mandated example heading anchored on a real branch name.
+		const recall = readRecall();
 		expect(recall).toMatch(/### Loaded `feature\/auth`/);
-		// The bullet items the LLM should fill in.
 		expect(recall).toMatch(/\*\*Period:\*\*/);
 		expect(recall).toMatch(/\*\*Commits:\*\*/);
 		expect(recall).toMatch(/\*\*Captured:\*\*/);
-		// And the explicit ban on collapsing back to a single prose line.
 		expect(recall).toMatch(/heading \+ bullet shape is required/);
-		// The empty line between heading and bullets keeps markdown rendering correct.
 		expect(recall).toMatch(/### Loaded `feature\/auth`\n\n- \*\*Period:/);
 	});
 
-	// Principle 6 still gives a length anchor — search bounds itself naturally
-	// via Step-3 picking, recall has no equivalent — but the earlier "~500
-	// words at most" hard ceiling was the root cause of inline-bold paragraph
-	// cramming on multi-theme branches: 5+ themes with verbatim-quote bullets
-	// naturally exceed 500 words, and forcing them under the cap collapsed
-	// `###` sections into inline-bold prefixes that read as a markdown wall.
-	// The new wording keeps the brevity nudge as a soft target but explicitly
-	// subordinates it to section structure.
-	it("recall template encourages brevity but never at the cost of section structure (principle #6)", async () => {
+	it("encourages brevity but never at the cost of section structure (principle #6)", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
+		const recall = readRecall();
 		expect(recall).toMatch(/Brief by default/);
-		// Soft target ("aim for ~500"), not a hard ceiling ("at most").
 		expect(recall).toMatch(/aim for ~500 words/);
 		expect(recall).not.toMatch(/~500 words at most/);
-		// The explicit constraint that solves the wall-of-fragments failure mode:
-		// section structure beats word count.
 		expect(recall).toMatch(/inline-bold paragraph prefixes/);
 		expect(recall).toMatch(/may\s+legitimately run longer/);
-		// Escape hatch for theme-specific elaboration.
 		expect(recall).toMatch(/deep dive/);
-		// Negative: principle 6 still must NOT impose form constraints. Earlier
-		// drafts said "group by theme" / "3-5 decisions max" / "no subsection
-		// headings" — those conflict with Part B's "shape is your call".
 		expect(recall).not.toMatch(/Group commits by theme/);
 		expect(recall).not.toMatch(/3-5 key decisions max/);
 		expect(recall).not.toMatch(/No subsection headings/);
 	});
+});
 
-	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal $\{ARGUMENTS} is the bash placeholder being asserted on
-	it("recall template quotes ${ARGUMENTS} (shell-injection defense)", async () => {
+// ─── Search-template content pins (carried over from prior versions) ────────
+
+describe("search template content", () => {
+	it("instructs the LLM to split the input into query + flags", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
-		// Recall takes the raw user input as branch/keyword; ${ARGUMENTS} must be
-		// wrapped in double quotes when interpolated into bash.
-		expect(recall).toMatch(/"\$\{ARGUMENTS\}"/);
-		// And no unquoted variants slipped in.
-		expect(recall).not.toMatch(/[^"]\$\{ARGUMENTS\}/);
+		const search = readSearch();
+		expect(search).toMatch(/Parse the user input into query \+ flags/);
+		// Worked-example table shows where flags go on argv (not in the here-doc body).
+		expect(search).toMatch(/--since 2w/);
 	});
 
-	it("search template instructs the LLM to split query and flags before invoking bash", async () => {
+	it("includes stale-CLI detection (older install missing the search command)", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// Search no longer interpolates ${ARGUMENTS} verbatim because that would
-		// swallow flags like `--since 2w` into the query string. The template tells
-		// the LLM to construct bash with the query quoted and flags as separate
-		// unquoted tokens. Sanity-check that this guidance is present.
-		expect(search).toMatch(/Parse \$\{ARGUMENTS\} into query \+ flags/);
-		expect(search).toMatch(/"auth" --since 2w/);
-		// And the search template still uses double-quoted bash strings around the
-		// query portion in the worked examples.
-		expect(search).toMatch(/search "auth" --format json/);
-	});
-
-	it("search template includes stale-CLI detection (older install missing the search command)", async () => {
-		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		const search = readSearch();
 		expect(search).toMatch(/unknown command 'search'/);
 		expect(search).toMatch(/npm update -g @jolli\.ai\/cli/);
 	});
 
-	it("search template explains catalog is not pre-filtered by query", async () => {
+	it("explains catalog is not pre-filtered by query", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		const search = readSearch();
 		expect(search).toMatch(/catalog is NOT pre-filtered by the user's query/);
 	});
 
-	it("search template forbids programmatic processing (temp files / scoring scripts)", async () => {
+	it("forbids programmatic processing (temp files / scoring scripts)", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// Compressed wording vs earlier 4-bullet list, but covers the same two
-		// failure modes: writing to /tmp and running scoring shell scripts.
+		const search = readSearch();
 		expect(search).toMatch(/DO NOT\*\* process programmatically/);
 		expect(search).toMatch(/no temp files/);
 		expect(search).toMatch(/jq\/python\/grep/);
-		// Semantic picking is the affirmative side.
 		expect(search).toMatch(/Semantic picking/);
 	});
 
-	it("search template tells the LLM to retry with bigger budget before bothering the user", async () => {
+	it("tells the LLM to retry with bigger budget before bothering the user", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		const search = readSearch();
 		expect(search).toMatch(/--budget 50000/);
 	});
 
-	// ── Schema documentation in Step 5 ──
-	// The skill template now hands LLM the full SearchHit schema and lets it
-	// pick the output shape. These tests pin that the schema doc is present
-	// and complete, so any future SearchHit-shape change in Search.ts must be
-	// mirrored in the template.
-
-	it("search template documents every SearchHit identity / provenance field", async () => {
+	it("documents every SearchHit identity / provenance field", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// Each top-level SearchHit field appears in the schema list. Some are
-		// self-explanatory and have no em-dash description (e.g. `branch`); we
-		// just assert the field name appears in `backticks` form.
+		const search = readSearch();
 		expect(search).toMatch(/`hash` —/);
 		expect(search).toMatch(/`fullHash` —/);
 		expect(search).toMatch(/`commitMessage` —/);
@@ -183,22 +360,17 @@ describe("updateSkillsIfNeeded", () => {
 		expect(search).toMatch(/`recap\?` —/);
 	});
 
-	it("search template marks `decisions` as the star field with explicit emphasis", async () => {
+	it("marks `decisions` as the star field with explicit emphasis", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// Decisions is the highest-signal topic field; the template must call
-		// it out so the LLM leans on it for "why" / "rationale" queries.
+		const search = readSearch();
 		expect(search).toMatch(/`decisions` ★ \*\*THE STAR FIELD\*\*/);
-		// And a usage hint anchoring the LLM to the right query types.
 		expect(search).toMatch(/why did we choose X/);
 	});
 
-	it("search template documents every per-topic field", async () => {
+	it("documents every per-topic field", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		const search = readSearch();
 		expect(search).toMatch(/`title` —/);
-		// `trigger` and `response` are now optional in SearchHitTopic — the schema
-		// doc reflects that with `?` so the LLM doesn't expect them on every hit.
 		expect(search).toMatch(/`trigger\?` —/);
 		expect(search).toMatch(/`response\?` —/);
 		expect(search).toMatch(/`decisions` ★/);
@@ -208,157 +380,108 @@ describe("updateSkillsIfNeeded", () => {
 		expect(search).toMatch(/`importance\?` —/);
 	});
 
-	// `diffStats` schema: actual interface is { filesChanged, insertions,
-	// deletions } — older template wrongly wrote `files`. This test pins the
-	// fix so a future revert can't go unnoticed.
-	it("search template uses correct diffStats field name (filesChanged, not files)", async () => {
+	it("uses correct diffStats field name (filesChanged, not files)", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		const search = readSearch();
 		expect(search).toMatch(/`diffStats\?` — `\{ filesChanged, insertions, deletions \}`/);
 		expect(search).not.toMatch(/`diffStats\?` — `\{ files,/);
 	});
 
-	// Plan / note stubs: SearchHit now carries plan/note refs (slug/id + title)
-	// so the LLM can use them as grounding anchors. Search ships only stubs
-	// (no plan body) — the template must say so explicitly to avoid promising
-	// the user navigation that doesn't exist.
-	it("search template documents plan/note stubs and forbids navigation promises", async () => {
+	it("documents plan/note stubs and forbids navigation promises", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		const search = readSearch();
 		expect(search).toMatch(/`plans\?` — `\{ slug, title \}\[\]`/);
 		expect(search).toMatch(/`notes\?` — `\{ id, title \}\[\]`/);
 		expect(search).toMatch(/Do NOT promise the user they can navigate to the plan body/);
-		// Don't suggest /jolli-recall as a "see the plan body" path either —
-		// recall also doesn't show plan content directly to the user.
-		expect(search).not.toMatch(/see plan content via \/jolli-recall/);
 	});
 
-	// ── Universal principles ──
-	// The principles encode lessons from past dogfood failures and are the only
-	// hard constraints (the output shape itself is up to the LLM). These tests
-	// pin each principle so a careless edit can't silently drop one.
-
-	it("search template lists Lead-with-the-answer principle and forbids preamble openers", async () => {
+	it("lists Lead-with-the-answer principle and forbids preamble openers", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		const search = readSearch();
 		expect(search).toMatch(/Lead with the answer/);
-		// The compressed principle 1 directly forbids the two stock LLM openers.
 		expect(search).toMatch(/No "Let me analyze\.\.\." or "Found N commits\.\.\." preamble/);
 	});
 
-	it("search template requires file paths as markdown links", async () => {
+	it("requires file paths as markdown links", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		const search = readSearch();
 		expect(search).toMatch(/\[cli\/src\/Types\.ts\]\(cli\/src\/Types\.ts\)/);
 	});
 
-	it("search template forbids snippet dumps and demands complete verbatim clauses with self-contained meaning", async () => {
+	it("forbids snippet dumps and demands complete verbatim clauses", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// Synthesize-don't-dump is still in.
+		const search = readSearch();
 		expect(search).toMatch(/Synthesize, don't dump/);
 		expect(search).toMatch(/wall-of-fragments/);
-		// Bold verbatim quotes are explicitly encouraged — but as complete
-		// clauses, not 2-3 word fragments that need surrounding paraphrase
-		// to be understood.
 		expect(search).toMatch(/verbatim quotes from stored data/);
 		expect(search).toMatch(/complete clauses \(typically 10-30 words\)/);
 		expect(search).toMatch(/not 2-3 word fragments/);
 		expect(search).toMatch(/skim the bold quote alone and understand its claim/);
-		// Worked example is a 17-word complete clause (anchors the LLM's
-		// output toward longer self-contained quotes, not snippet fragments).
 		expect(search).toMatch(
 			/\*\*"the stateless model lets us scale horizontally without a shared session store across regions"\*\*/,
 		);
-		// Bold-only-for-verbatim trust signal.
 		expect(search).toMatch(/Bold = verbatim from stored data/);
 		expect(search).toMatch(/Never use bold for general emphasis/);
-		// Negative: the deprecated 1-3 quotes-per-answer cap is gone (it
-		// interacted badly with recall's 400-word ceiling, starving the
-		// answer of grounding).
 		expect(search).not.toMatch(/Use sparingly \(1-3 quotes per answer\)/);
-		expect(search).not.toMatch(/short verbatim quotes/);
 	});
 
-	it("search template forbids exposing machinery (Phase 1 / Phase 2 / catalog / SearchHit)", async () => {
+	it("forbids exposing machinery", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
+		const search = readSearch();
 		expect(search).toMatch(/Don't expose machinery/);
-		// Specific machinery names are listed so the LLM has concrete forbids.
 		expect(search).toMatch(/"Phase 1"/);
 		expect(search).toMatch(/"Phase 2"/);
 		expect(search).toMatch(/"catalog"/);
 		expect(search).toMatch(/"SearchHit"/);
 	});
 
-	// Principle 7 ("No vscode:// links") and principle 4 ("Skip near-duplicates")
-	// were removed in the principles-simplification refactor. Pin both deletions
-	// so a casual revert can't reintroduce noise the template doesn't need.
-	it("search template does NOT carry the legacy vscode:// principle", async () => {
+	it("does NOT carry the legacy vscode:// principle", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// CLI is the only "open commit" path now — but it's still mentioned by Step
-		// 4 as the disambiguation tool. The principle that called it out as a
-		// vscode:// alternative is gone.
+		const search = readSearch();
 		expect(search).not.toMatch(/Open in IDE/);
 		expect(search).not.toMatch(/vscode:\/\//);
 	});
 
-	it("search template does NOT carry the legacy near-duplicate principle (root-only filter handles it)", async () => {
+	it("does NOT carry the legacy near-duplicate principle", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// Skip-near-duplicates was redundant with the catalog-side root-only filter
-		// and burned attention budget; removed. Don't reintroduce.
+		const search = readSearch();
 		expect(search).not.toMatch(/Skip near-duplicates/);
 	});
 
-	// ── Free-shape rendering (the central design point) ──
-
-	it("search template explicitly tells the LLM the output shape is its call", async () => {
+	it("explicitly tells the LLM the output shape is its call", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// The whole point of the rewrite — pin the language that liberates the
-		// LLM from a fixed template. If a future edit adds back "Section 1 / 2 / 3"
-		// rigidity, this test catches it.
+		const search = readSearch();
 		expect(search).toMatch(/Output shape is entirely your call/);
-		// And the negative: no Section-N rigidity left over.
 		expect(search).not.toMatch(/Section 1 — Top-line summary/);
-		expect(search).not.toMatch(/Section 2 — Core commits table/);
-		expect(search).not.toMatch(/Section 3 — Grouped synthesis/);
-		// Don't even suggest specific shapes — earlier iterations had a 5-row
-		// "what is X → prose, compare A vs B → side-by-side, …" suggestion
-		// table that contradicted the "completely free shape" intent. Catch
-		// any future re-introduction.
-		expect(search).not.toMatch(/"compare A vs B".*side-by-side/);
 	});
 
-	it("search template tightens the Step 3 picks limit from 5-15 to 5-10", async () => {
+	it("tightens the Step 3 picks limit to 5-10", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		// Phase 2 now carries full topic content per hit — picking 15 risks
-		// blowing the chat context budget. 5-10 is the new band.
+		const search = readSearch();
 		expect(search).toMatch(/Pick \*\*5-10\*\*/);
 		expect(search).not.toMatch(/Pick 5-15/);
 	});
+});
 
-	// Skill templates ship to international users — they must stay English-only
-	// (the LLM is told to translate replies into the user's language). Lock this
-	// in: any future template edit that slips CJK / Hiragana / Katakana / Hangul
-	// chars into either SKILL.md is a regression caught here.
-	const CJK_AND_OTHER_NON_LATIN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]/u;
+// ─── No CJK leakage ─────────────────────────────────────────────────────────
+
+describe("English-only", () => {
+	const CJK_AND_OTHER_NON_LATIN = /[㐀-䶿一-鿿豈-﫿぀-ゟ゠-ヿ가-힯]/u;
 
 	it("recall template contains no CJK characters", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const recall = readFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), "utf-8");
-		expect(recall).not.toMatch(CJK_AND_OTHER_NON_LATIN);
+		expect(readRecall()).not.toMatch(CJK_AND_OTHER_NON_LATIN);
 	});
 
 	it("search template contains no CJK characters", async () => {
 		await updateSkillsIfNeeded(tempDir);
-		const search = readFileSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"), "utf-8");
-		expect(search).not.toMatch(CJK_AND_OTHER_NON_LATIN);
+		expect(readSearch()).not.toMatch(CJK_AND_OTHER_NON_LATIN);
 	});
+});
 
+// ─── Legacy cleanup + idempotency ───────────────────────────────────────────
+
+describe("legacy directories", () => {
 	it("removes legacy skill directories from previous versions", async () => {
 		const fs = await import("node:fs");
 		fs.mkdirSync(join(tempDir, ".claude/skills/jollimemory-recall"), { recursive: true });
@@ -368,21 +491,56 @@ describe("updateSkillsIfNeeded", () => {
 	});
 
 	it("upserts search even when recall already exists at the current version", async () => {
-		// Install once.
 		await updateSkillsIfNeeded(tempDir);
 		const fs = await import("node:fs");
-		// Manually delete the search skill to simulate the legacy-installer scenario
-		// (where only jolli-recall exists in .claude/skills/ on an older project).
 		fs.rmSync(join(tempDir, ".claude/skills/jolli-search"), { recursive: true, force: true });
-		// Re-run: search should be re-installed even though recall is at the current version.
 		await updateSkillsIfNeeded(tempDir);
 		expect(fs.existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
 	});
 
-	it("backward-compat alias updateSkillIfNeeded still installs both skills", async () => {
+	it("backward-compat alias updateSkillIfNeeded installs both skills into both targets", async () => {
 		await updateSkillIfNeeded(tempDir);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-search/SKILL.md"))).toBe(true);
+	});
+
+	it("backward-compat alias respects claudeEnabled=false", async () => {
+		await updateSkillIfNeeded(tempDir, { claudeEnabled: false });
+		expect(existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(false);
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+	});
+});
+
+// ─── Version-line recognition (legacy keys still respected on read) ─────────
+
+describe("version-line compatibility", () => {
+	it("recognizes a SKILL.md with the legacy `jolli-skill-version` key as up-to-date if the version matches", async () => {
+		// Plant a SKILL.md using the legacy top-level key at the CURRENT version.
+		// The installer should treat it as already up-to-date and not rewrite,
+		// even though the template now uses `metadata.version`. This protects
+		// users from a needless rewrite on upgrade.
 		const fs = await import("node:fs");
-		expect(fs.existsSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"))).toBe(true);
-		expect(fs.existsSync(join(tempDir, ".claude/skills/jolli-search/SKILL.md"))).toBe(true);
+		const planted = `---\nname: jolli-recall\njolli-skill-version: ${CURRENT_VERSION}\n---\nlegacy body`;
+		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
+		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
+		await updateSkillsIfNeeded(tempDir);
+		// .claude path was up-to-date: the legacy file was preserved verbatim.
+		expect(readRecall()).toBe(planted);
+		// .agents path didn't exist at all — installer creates it fresh.
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+	});
+
+	it("rewrites when the file contains an unrecognized version line", async () => {
+		const fs = await import("node:fs");
+		const planted = `---\nname: jolli-recall\njolli-skill-version: 0.0.0-old\n---\nold body`;
+		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
+		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
+		await updateSkillsIfNeeded(tempDir);
+		// Was rewritten — content no longer matches the plant.
+		expect(readRecall()).not.toBe(planted);
+		// And it now carries the new metadata.version form.
+		expect(readRecall()).toMatch(/metadata:\n {2}version:/);
 	});
 });

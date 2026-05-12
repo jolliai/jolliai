@@ -557,4 +557,82 @@ describe("registerSearchCommand", () => {
 		expect(stdout).toContain('"type":"error"');
 		expect(stdout).toContain("string error");
 	});
+
+	// ─── --arg-stdin (here-doc bridge from SKILL.md) ─────────────────────
+	// The skill templates pipe user-supplied query text via a here-doc with an
+	// LLM-generated random delimiter; the CLI reads stdin instead of argv so
+	// shell metacharacters never reach a shell parser. These tests confirm
+	// the wiring: stdin content arrives at the search pipeline verbatim,
+	// mutual exclusion with positional args fires, and the empty-stdin case
+	// degrades to the same behavior as an empty positional query.
+
+	async function runWithStdin(args: string[], stdinPayload: string): Promise<{ stdout: string; stderr: string }> {
+		const { Readable } = await import("node:stream");
+		const origStdin = process.stdin;
+		const stream = Readable.from([stdinPayload]);
+		Object.defineProperty(process, "stdin", { value: stream, configurable: true });
+		try {
+			return await runCommand(args);
+		} finally {
+			Object.defineProperty(process, "stdin", { value: origStdin, configurable: true });
+		}
+	}
+
+	it("--arg-stdin reads the query from stdin verbatim (shell metacharacters preserved)", async () => {
+		// `$(date)` is a shell-injection probe — feeding it on stdin must NOT
+		// trigger the deny-list (the user input never went through the shell).
+		// The CLI rejects it because the query content still violates the
+		// `isSafeQuery` policy, but the value the CLI inspected is the literal
+		// string, not a command output.
+		const { stdout } = await runWithStdin(["--arg-stdin", "--cwd", "/tmp/jolli-search-test-empty"], "$(date)\n");
+		// Query is rejected at the validation layer, but the rejection means
+		// the CLI saw the literal `$(date)` — not the shell-expansion result.
+		expect(stdout).toContain('"type":"error"');
+		expect(stdout).toContain("Invalid characters");
+	});
+
+	it("--arg-stdin accepts a safe natural-language query and runs the catalog phase", async () => {
+		const { stdout } = await runWithStdin(
+			["--arg-stdin", "--cwd", "/tmp/jolli-search-test-empty"],
+			"why did we choose X?\n",
+		);
+		expect(stdout).toContain('"type": "search-catalog"');
+		expect(stdout).toContain('"query": "why did we choose X?"');
+	});
+
+	it("--arg-stdin with empty stdin behaves like an empty positional query (catalog only)", async () => {
+		const { stdout } = await runWithStdin(["--arg-stdin", "--cwd", "/tmp/jolli-search-test-empty"], "");
+		expect(stdout).toContain('"type": "search-catalog"');
+	});
+
+	it("--arg-stdin combined with --hashes performs the Phase 2 lookup using stdin as the highlight query", async () => {
+		mockGetSummary.mockResolvedValueOnce({
+			version: 4,
+			commitHash: "abcd1234abcd1234abcd1234abcd1234abcd1234",
+			commitMessage: "msg",
+			commitAuthor: "dev",
+			commitDate: "2026-04-01T00:00:00.000Z",
+			branch: "x",
+			generatedAt: "2026-04-01T00:00:00.000Z",
+			topics: [{ title: "t", trigger: "tr", response: "rs", decisions: "d" }],
+		});
+		const { stdout } = await runWithStdin(
+			[
+				"--arg-stdin",
+				"--hashes",
+				"abcd1234abcd1234abcd1234abcd1234abcd1234",
+				"--cwd",
+				"/tmp/jolli-search-test-found",
+			],
+			"auth\n",
+		);
+		expect(stdout).toContain('"type": "search"');
+	});
+
+	it("rejects --arg-stdin combined with positional words (mutually exclusive)", async () => {
+		const { stdout } = await runCommand(["--arg-stdin", "auth", "--cwd", "/tmp/jolli-search-test-empty"]);
+		expect(stdout).toContain('"type":"error"');
+		expect(stdout).toContain("mutually exclusive");
+		expect(process.exitCode).toBe(1);
+	});
 });
