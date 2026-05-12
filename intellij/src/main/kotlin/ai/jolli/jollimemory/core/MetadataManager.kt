@@ -35,7 +35,12 @@ class MetadataManager(private val jolliDir: Path) {
 
     /** Ensures the .jolli/ directory and default files exist. */
     fun ensure() {
+        val freshCreate = !Files.exists(jolliDir)
         Files.createDirectories(jolliDir)
+        if (freshCreate) {
+            // Dot prefix does not auto-hide on Windows; set NTFS hidden once at creation only.
+            WindowsHidden.tryMarkHidden(jolliDir)
+        }
         if (!Files.exists(manifestPath)) {
             atomicWrite(manifestPath, gson.toJson(Manifest()))
         }

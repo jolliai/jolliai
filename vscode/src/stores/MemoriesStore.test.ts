@@ -81,7 +81,7 @@ describe("MemoriesStore — filter, loadMore, enabled", () => {
 		await store.refresh();
 		bridge.listSummaryEntries.mockClear();
 		await store.loadMore();
-		expect(bridge.listSummaryEntries).toHaveBeenCalledWith(20, 0, undefined);
+		expect(bridge.listSummaryEntries).toHaveBeenCalledWith(36, 0, undefined);
 	});
 
 	it("setEnabled is idempotent when unchanged", () => {
@@ -124,12 +124,12 @@ describe("MemoriesStore — filter, loadMore, enabled", () => {
 	it("setEnabled(false) resets loadedCount so Load More state does not cross disable/enable", async () => {
 		const bridge = makeBridge([makeEntry("a")], 100);
 		const store = new MemoriesStore(bridge as never);
-		// Simulate initial load + two Load More presses: loadedCount 10 → 20 → 30.
+		// Simulate initial load + two Load More presses: loadedCount 18 → 36 → 54.
 		await store.refresh();
 		await store.loadMore();
 		await store.loadMore();
 		expect(bridge.listSummaryEntries).toHaveBeenLastCalledWith(
-			30,
+			54,
 			0,
 			undefined,
 		);
@@ -140,7 +140,7 @@ describe("MemoriesStore — filter, loadMore, enabled", () => {
 		store.setEnabled(true);
 		bridge.listSummaryEntries.mockClear();
 		await store.refresh();
-		expect(bridge.listSummaryEntries).toHaveBeenCalledWith(10, 0, undefined);
+		expect(bridge.listSummaryEntries).toHaveBeenCalledWith(18, 0, undefined);
 	});
 });
 

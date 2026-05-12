@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { createLogger } from "../Logger.js";
+import { tryMarkHiddenOnWindows } from "../util/WindowsHidden.js";
 import type { BranchesJson, BranchMapping, KBConfig, Manifest, ManifestEntry, MigrationState } from "./KBTypes.js";
 
 const log = createLogger("MetadataManager");
@@ -31,7 +32,11 @@ export class MetadataManager {
 
 	/** Ensures the .jolli/ directory and default files exist. */
 	ensure(): void {
-		mkdirSync(this.jolliDir, { recursive: true });
+		const created = mkdirSync(this.jolliDir, { recursive: true });
+		if (created !== undefined) {
+			// Dot prefix does not auto-hide on Windows; set NTFS hidden once at creation only.
+			tryMarkHiddenOnWindows(this.jolliDir);
+		}
 		if (!existsSync(this.manifestPath)) {
 			this.atomicWrite(this.manifestPath, JSON.stringify({ version: 1, files: [] }, null, "\t"));
 		}
