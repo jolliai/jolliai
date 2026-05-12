@@ -828,7 +828,8 @@ class SummaryPanel(
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val seen = mutableSetOf<String>()
-                var totalEntries = 0; var claudeSessions = 0; var codexSessions = 0
+                var totalEntries = 0
+                val sessionsBySource = mutableMapOf<String, Int>()
                 for (hash in hashSnapshot) {
                     val transcript = store.readTranscript(hash) ?: continue
                     @Suppress("SENSELESS_COMPARISON")
@@ -841,11 +842,11 @@ class SummaryPanel(
                         totalEntries += entries.size
                         if (seen.contains(key)) continue
                         seen.add(key)
-                        if (source == "codex") codexSessions++ else claudeSessions++
+                        sessionsBySource[source] = (sessionsBySource[source] ?: 0) + 1
                     }
                 }
                 ApplicationManager.getApplication().invokeLater {
-                    postToWebview("transcriptStatsLoaded", mapOf("totalEntries" to totalEntries, "claudeSessions" to claudeSessions, "codexSessions" to codexSessions))
+                    postToWebview("transcriptStatsLoaded", mapOf("totalEntries" to totalEntries, "sessionsBySource" to sessionsBySource))
                 }
             } catch (e: Exception) {
                 LOG.warn("Failed to load transcript stats: ${e.message}", e)

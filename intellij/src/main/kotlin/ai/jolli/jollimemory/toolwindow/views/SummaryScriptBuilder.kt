@@ -973,7 +973,8 @@ ${buildPrMessageScript()}
     var tabsHtml = '';
     for (var t = 0; t < groupOrder.length; t++) {
       var tabGroup = groups[groupOrder[t]];
-      var tabSourceLabel = tabGroup.source === 'codex' ? 'Codex' : 'Claude';
+      var displayNames = {claude:'Claude',codex:'Codex',gemini:'Gemini',opencode:'OpenCode',cursor:'Cursor',copilot:'Copilot',copilotChat:'Copilot Chat'};
+      var tabSourceLabel = displayNames[tabGroup.source] || tabGroup.source;
       var tabEntryCount = tabGroup.entries.length;
       var activeClass = t === 0 ? ' active' : '';
       tabsHtml += '<button class="modal-tab' + activeClass + '" data-tab-key="' + groupOrder[t] + '">';
@@ -1358,11 +1359,16 @@ ${buildPrMessageScript()}
     }
     if (msg.command === 'transcriptStatsLoaded') {
       if (conversationsStats) {
+        var displayNames = {claude:'Claude',codex:'Codex',gemini:'Gemini',opencode:'OpenCode',cursor:'Cursor',copilot:'Copilot',copilotChat:'Copilot Chat'};
+        var sources = msg.sessionsBySource || {};
         var parts = [];
-        if (msg.claudeSessions > 0) parts.push('<strong>' + msg.claudeSessions + '</strong> Claude');
-        if (msg.codexSessions > 0) parts.push('<strong>' + msg.codexSessions + '</strong> Codex');
-        var totalSessions = (msg.claudeSessions || 0) + (msg.codexSessions || 0);
-        conversationsStats.innerHTML = '<strong>' + msg.totalEntries + '</strong> entries across <strong>' + totalSessions + '</strong> session' + (totalSessions !== 1 ? 's' : '') + ' (' + parts.join(', ') + ')';
+        var totalSessions = 0;
+        Object.keys(sources).forEach(function(key) {
+          var count = sources[key];
+          totalSessions += count;
+          parts.push('<strong>' + count + '</strong> ' + (displayNames[key] || key));
+        });
+        conversationsStats.innerHTML = '<strong>' + msg.totalEntries + '</strong> entries across <strong>' + totalSessions + '</strong> session' + (totalSessions !== 1 ? 's' : '') + (parts.length > 0 ? ' (' + parts.join(', ') + ')' : '');
       }
     }
   });

@@ -100,7 +100,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
 
     fun initialize() {
         if (isInitialized) return
-        val sb = StringBuilder()
+val sb = StringBuilder()
         val basePath = project.basePath
         sb.appendLine("basePath=$basePath")
 
@@ -120,6 +120,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
         val gitOps = GitOps(basePath)
         val resolvedRoot = gitOps.resolveMainWorktreeRoot() ?: basePath
         mainRepoRoot = resolvedRoot
+        JmLogger.setLogDir(resolvedRoot)
         sb.appendLine("resolvedRoot=$resolvedRoot")
 
         // Check key files in resolved root

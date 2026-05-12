@@ -2,7 +2,6 @@ package ai.jolli.jollimemory.core
 
 import com.google.gson.JsonParser
 import java.io.File
-import java.sql.DriverManager
 import java.time.Instant
 
 /**
@@ -31,17 +30,36 @@ object OpenCodeSupport {
 
 	/** Checks whether the OpenCode database exists. */
 	fun isOpenCodeInstalled(): Boolean {
-		return File(getDbPath()).isFile
+		val dbPath = getDbPath()
+		val exists = File(dbPath).isFile
+		return exists
+	}
+
+	/**
+	 * Lightweight DB health check — opens the database and runs a trivial query
+	 * to detect locked/corrupt/permission errors without scanning all rows.
+	 */
+	fun checkDbHealth(): SqliteScanError? {
+		val dbPath = getDbPath()
+		if (!File(dbPath).isFile) return null
+		return try {
+			withReadOnlyDb(dbPath) { conn ->
+				conn.prepareStatement("SELECT 1 FROM session LIMIT 1").use { it.executeQuery() }
+			}
+			null
+		} catch (e: Exception) {
+			classifyScanError(e)
+		}
 	}
 
 	/**
 	 * Discovers OpenCode sessions relevant to the given project directory.
 	 * Queries the global DB for recent sessions (within 48h) matching projectDir.
 	 */
-	fun discoverSessions(projectDir: String): List<SessionInfo> {
+	fun discoverSessions(projectDir: String): ScanResult {
 		val dbPath = getDbPath()
 		val dbFile = File(dbPath)
-		if (!dbFile.isFile) return emptyList()
+		if (!dbFile.isFile) return ScanResult(emptyList())
 
 		val cutoffMs = System.currentTimeMillis() - SESSION_STALE_MS
 		val isWindows = System.getProperty("os.name").lowercase().contains("win")
@@ -77,11 +95,12 @@ object OpenCodeSupport {
 					}
 				}
 				log.info("Discovered %d OpenCode session(s) for %s", sessions.size, projectDir)
-				sessions
+				ScanResult(sessions)
 			}
 		} catch (e: Exception) {
-			log.error("OpenCode scan failed: %s", e.message)
-			emptyList()
+			val scanError = classifyScanError(e)
+			log.error("OpenCode scan failed (%s): %s", scanError.kind, scanError.message)
+			ScanResult(emptyList(), scanError)
 		}
 	}
 
@@ -191,32 +210,6 @@ object OpenCodeSupport {
 		val timeCreated: Long,
 		val parts: List<String>,
 	)
-
-	/**
-	 * Opens a read-only JDBC connection to the SQLite database, runs the callback,
-	 * and closes the connection.
-	 */
-	private fun <T> withReadOnlyDb(dbPath: String, block: (java.sql.Connection) -> T): T {
-		val url = "jdbc:sqlite:file:$dbPath?mode=ro"
-		val conn = DriverManager.getConnection(url)
-		return try {
-			block(conn)
-		} finally {
-			conn.close()
-		}
-	}
-
-	/**
-	 * Parses a synthetic transcript path into its DB path and session ID components.
-	 * Format: "<dbPath>#<sessionId>"
-	 */
-	private fun parseSyntheticPath(transcriptPath: String): Pair<String, String> {
-		val hashIndex = transcriptPath.lastIndexOf('#')
-		if (hashIndex == -1 || hashIndex == 0 || hashIndex == transcriptPath.length - 1) {
-			throw IllegalArgumentException("Invalid OpenCode transcript path: $transcriptPath")
-		}
-		return Pair(transcriptPath.substring(0, hashIndex), transcriptPath.substring(hashIndex + 1))
-	}
 
 	/**
 	 * Parses a single OpenCode message into a TranscriptEntry.

@@ -241,6 +241,7 @@ object TranscriptReader {
         val sessionId: String,
         val transcriptPath: String,
         val entries: List<TranscriptEntry>,
+        val source: TranscriptSource? = null,
     )
 }
 

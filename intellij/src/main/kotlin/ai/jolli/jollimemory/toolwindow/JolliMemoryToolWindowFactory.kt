@@ -467,6 +467,8 @@ private class StatusIndicatorLabel(
         if (!status.gitHookInstalled) return true
         if (status.claudeDetected == true && !status.claudeHookInstalled) return true
         if (status.geminiDetected == true && !status.geminiHookInstalled) return true
+        if (status.openCodeScanError != null) return true
+        if (status.cursorScanError != null) return true
         return false
     }
 
@@ -538,7 +540,7 @@ private class StatusIndicatorLabel(
         sb.append("<p><span style='color:$hookColor'>\u25CF</span> <b>Hooks:</b> $hooksDesc</p>")
 
         // Sessions
-        sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Sessions:</b> ${status.activeSessions}</p>")
+        sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Sessions (Claude/Gemini):</b> ${status.activeSessions}</p>")
 
         // Stored Memories
         sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Stored Memories:</b> ${status.summaryCount} total</p>")
@@ -570,6 +572,28 @@ private class StatusIndicatorLabel(
             val color = if (status.geminiHookInstalled) "#3FB950" else "#D29922"
             val desc = if (status.geminiHookInstalled) "hook installed" else "hook not installed"
             sb.append("<p><span style='color:$color'>\u25CF</span> <b>Gemini:</b> $desc</p>")
+        }
+        if (status.openCodeDetected == true) {
+            val scanError = status.openCodeScanError
+            if (scanError != null) {
+                val detail = if (scanError.message != null) "${scanError.kind}: ${scanError.message}" else scanError.kind
+                sb.append("<p><span style='color:#F85149'>\u25CF</span> <b>OpenCode:</b> unavailable \u2014 $detail</p>")
+            } else if (status.openCodeEnabled == false) {
+                sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>OpenCode:</b> detected but disabled</p>")
+            } else {
+                sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>OpenCode:</b> detected</p>")
+            }
+        }
+        if (status.cursorDetected == true) {
+            val scanError = status.cursorScanError
+            if (scanError != null) {
+                val detail = if (scanError.message != null) "${scanError.kind}: ${scanError.message}" else scanError.kind
+                sb.append("<p><span style='color:#F85149'>\u25CF</span> <b>Cursor:</b> unavailable \u2014 $detail</p>")
+            } else if (status.cursorEnabled == false) {
+                sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>Cursor:</b> detected but disabled</p>")
+            } else {
+                sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Cursor:</b> detected</p>")
+            }
         }
 
         // Error
