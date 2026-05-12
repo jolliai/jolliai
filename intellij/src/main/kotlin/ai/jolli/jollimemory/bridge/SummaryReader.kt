@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.bridge
 
 import ai.jolli.jollimemory.core.CodexSessionDiscoverer
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.CursorSupport
 import ai.jolli.jollimemory.core.GeminiSupport
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.OpenCodeSupport
@@ -30,6 +31,15 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
         val branchExists = git.branchExists(ORPHAN_BRANCH)
         val summaryCount = if (branchExists) countSummaries() else 0
 
+        // Lightweight DB health checks — no full scan, just open + trivial query
+        val openCodeInstalled = OpenCodeSupport.isOpenCodeInstalled()
+        val openCodeError = if (openCodeInstalled && config.openCodeEnabled != false)
+            OpenCodeSupport.checkDbHealth() else null
+
+        val cursorInstalled = CursorSupport.isCursorInstalled()
+        val cursorError = if (cursorInstalled && config.cursorEnabled != false)
+            CursorSupport.checkDbHealth() else null
+
         return StatusInfo(
             enabled = hooksInstalled,
             claudeHookInstalled = installer.isClaudeHookInstalled(),
@@ -45,8 +55,12 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
             codexEnabled = config.codexEnabled,
             geminiDetected = GeminiSupport.isGeminiInstalled(),
             geminiEnabled = config.geminiEnabled,
-            openCodeDetected = OpenCodeSupport.isOpenCodeInstalled(),
+            openCodeDetected = openCodeInstalled,
             openCodeEnabled = config.openCodeEnabled,
+            openCodeScanError = openCodeError,
+            cursorDetected = cursorInstalled,
+            cursorEnabled = config.cursorEnabled,
+            cursorScanError = cursorError,
         )
     }
 

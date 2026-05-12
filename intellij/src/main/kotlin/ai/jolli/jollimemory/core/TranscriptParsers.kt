@@ -56,5 +56,6 @@ fun getParserForSource(source: TranscriptSource): TranscriptParser {
         TranscriptSource.claude -> ClaudeTranscriptParser()
         TranscriptSource.gemini -> ClaudeTranscriptParser() // Gemini uses dedicated reader
         TranscriptSource.opencode -> ClaudeTranscriptParser() // OpenCode uses dedicated reader
+        TranscriptSource.cursor -> ClaudeTranscriptParser() // Cursor uses dedicated reader
     }
 }

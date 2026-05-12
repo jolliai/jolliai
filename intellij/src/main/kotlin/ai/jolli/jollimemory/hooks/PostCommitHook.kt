@@ -155,11 +155,17 @@ object PostCommitHook {
 
             // On-demand discovery: OpenCode (SQLite-backed, no hook)
             if (config.openCodeEnabled != false && OpenCodeSupport.isOpenCodeInstalled()) {
-                allSessions.addAll(OpenCodeSupport.discoverSessions(cwd))
+                allSessions.addAll(OpenCodeSupport.discoverSessions(cwd).sessions)
+            }
+
+            // On-demand discovery: Cursor (SQLite-backed, no hook)
+            if (config.cursorEnabled != false && CursorSupport.isCursorInstalled()) {
+                allSessions.addAll(CursorSupport.discoverSessions(cwd).sessions)
             }
 
             val sessions = allSessions
-            log.info("Total sessions found: %d", sessions.size)
+            log.info("Discovered %d session(s): %s", sessions.size,
+                sessions.joinToString(", ") { "${it.source ?: "claude"}:${it.sessionId.take(8)}" })
             if (sessions.isEmpty()) {
                 log.info("No active sessions — skipping summarization")
                 return
@@ -171,30 +177,51 @@ object PostCommitHook {
 
             for (session in sessions) {
                 val source = session.source ?: TranscriptSource.claude
-                val cursor = SessionTracker.loadCursorForTranscript(session.transcriptPath, cwd)
+                try {
+                    val cursor = SessionTracker.loadCursorForTranscript(session.transcriptPath, cwd)
+                    log.info("Reading session %s source=%s cursor=%s",
+                        session.sessionId.take(8), source, cursor?.lineNumber ?: "none")
 
-                val result = when (source) {
-                    TranscriptSource.gemini -> {
-                        val entries = GeminiSupport.readGeminiTranscript(session.transcriptPath)
-                        TranscriptReadResult(entries, TranscriptCursor(session.transcriptPath, entries.size, Instant.now().toString()), entries.size)
+                    val result = when (source) {
+                        TranscriptSource.gemini -> {
+                            val entries = GeminiSupport.readGeminiTranscript(session.transcriptPath)
+                            TranscriptReadResult(entries, TranscriptCursor(session.transcriptPath, entries.size, Instant.now().toString()), entries.size)
+                        }
+                        TranscriptSource.opencode -> {
+                            OpenCodeSupport.readTranscript(session.transcriptPath, cursor, commitInfo.date)
+                        }
+                        TranscriptSource.cursor -> {
+                            CursorSupport.readTranscript(session.transcriptPath, cursor, commitInfo.date)
+                        }
+                        else -> {
+                            val parser = getParserForSource(source)
+                            TranscriptReader.readTranscript(session.transcriptPath, cursor, parser)
+                        }
                     }
-                    TranscriptSource.opencode -> {
-                        OpenCodeSupport.readTranscript(session.transcriptPath, cursor)
-                    }
-                    else -> {
-                        val parser = getParserForSource(source)
-                        TranscriptReader.readTranscript(session.transcriptPath, cursor, parser)
-                    }
-                }
 
-                if (result.entries.isNotEmpty()) {
-                    sessionTranscripts.add(TranscriptReader.SessionTranscript(
-                        session.sessionId, session.transcriptPath, result.entries
-                    ))
+                    log.info("Session %s (%s): %d entries, %d lines read",
+                        session.sessionId.take(8), source, result.entries.size, result.totalLinesRead)
+                    for ((idx, entry) in result.entries.take(3).withIndex()) {
+                        val snippet = entry.content.take(120).replace("\n", " ")
+                        log.info("  entry[%d] role=%s: %s%s", idx, entry.role, snippet,
+                            if (entry.content.length > 120) "..." else "")
+                    }
+                    if (result.entries.size > 3) {
+                        log.info("  ...and %d more entries", result.entries.size - 3)
+                    }
+
+                    if (result.entries.isNotEmpty()) {
+                        sessionTranscripts.add(TranscriptReader.SessionTranscript(
+                            session.sessionId, session.transcriptPath, result.entries, source
+                        ))
+                    }
+                    totalEntries += result.totalLinesRead
+                    totalTurns += result.entries.count { it.role == "human" }
+                    SessionTracker.saveCursor(result.newCursor, cwd)
+                } catch (e: Exception) {
+                    log.warn("Failed to read transcript for session %s (%s), skipping: %s",
+                        session.sessionId.take(8), source, e.message ?: e.toString())
                 }
-                totalEntries += result.totalLinesRead
-                totalTurns += result.entries.count { it.role == "human" }
-                SessionTracker.saveCursor(result.newCursor, cwd)
             }
 
             // 5. Get diff
@@ -310,9 +337,11 @@ object PostCommitHook {
 
             // Store transcript data alongside summary
             val storedSessions = sessionTranscripts.map { st ->
-                StoredSession(st.sessionId, entries = st.entries)
+                log.info("StoredSession: sessionId=%s, source=%s, entries=%d", st.sessionId.take(8), st.source, st.entries.size)
+                StoredSession(st.sessionId, source = st.source, entries = st.entries)
             }
             val storedTranscript = StoredTranscript(storedSessions)
+            log.info("StoredTranscript: %d session(s) total", storedSessions.size)
 
             log.info("Step 9: Calling store.storeSummary for %s (branch=%s)", commitInfo.hash.take(8), branch)
             store.storeSummary(summary, force = force, transcript = storedTranscript, planProgress = planProgressArtifacts.takeIf { it.isNotEmpty() })

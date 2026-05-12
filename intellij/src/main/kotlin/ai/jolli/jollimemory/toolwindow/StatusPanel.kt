@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.toolwindow
 import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.core.CodexSessionDiscoverer
 import ai.jolli.jollimemory.core.GeminiSupport
+import ai.jolli.jollimemory.core.CursorSupport
 import ai.jolli.jollimemory.core.OpenCodeSupport
 import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.SessionTracker
@@ -131,12 +132,12 @@ class StatusPanel(
             tooltip = hooksTooltip,
         ))
 
-        // 2. Sessions (generic label covering all integrations)
+        // 2. Sessions (Claude/Gemini — other sources are discovered on-demand at commit time)
         listModel.addElement(StatusRow(
             icon = Icon.PULSE,
             label = "Sessions",
             description = "${status.activeSessions}",
-            tooltip = "${status.activeSessions} active session${if (status.activeSessions != 1) "s" else ""} across all integrations",
+            tooltip = "${status.activeSessions} active Claude/Gemini session${if (status.activeSessions != 1) "s" else ""}",
         ))
 
         // 4. Stored Memories
@@ -206,15 +207,49 @@ class StatusPanel(
         // 9. OpenCode Integration (no hooks needed — just detection)
         val openCodeDetected = status.openCodeDetected ?: OpenCodeSupport.isOpenCodeInstalled()
         if (openCodeDetected) {
-            val enabled = config.openCodeEnabled != false
-            addIntegrationRow(
-                enabled = enabled,
-                hookInstalled = null,
-                label = "OpenCode Integration",
-                enabledTooltip = "OpenCode database found — session discovery is enabled",
-                disabledTooltip = "OpenCode detected but session discovery is disabled in config",
-                hookMissingTooltip = null,
-            )
+            val openCodeEnabled = config.openCodeEnabled != false
+            val openCodeScanError = status.openCodeScanError
+            if (openCodeEnabled && openCodeScanError != null) {
+                listModel.addElement(StatusRow(
+                    Icon.WARN,
+                    "OpenCode Integration",
+                    "unavailable — ${openCodeScanError.kind}",
+                    "OpenCode DB scan failed (${openCodeScanError.kind}): ${openCodeScanError.message}",
+                ))
+            } else {
+                addIntegrationRow(
+                    enabled = openCodeEnabled,
+                    hookInstalled = null,
+                    label = "OpenCode Integration",
+                    enabledTooltip = "OpenCode database found — session discovery is enabled",
+                    disabledTooltip = "OpenCode detected but session discovery is disabled in config",
+                    hookMissingTooltip = null,
+                )
+            }
+        }
+
+        // 10. Cursor Integration (no hooks needed — just detection)
+        val cursorDetected = status.cursorDetected ?: CursorSupport.isCursorInstalled()
+        if (cursorDetected) {
+            val cursorEnabled = config.cursorEnabled != false
+            val cursorScanError = status.cursorScanError
+            if (cursorEnabled && cursorScanError != null) {
+                listModel.addElement(StatusRow(
+                    Icon.WARN,
+                    "Cursor Integration",
+                    "unavailable — ${cursorScanError.kind}",
+                    "Cursor DB scan failed (${cursorScanError.kind}): ${cursorScanError.message}",
+                ))
+            } else {
+                addIntegrationRow(
+                    enabled = cursorEnabled,
+                    hookInstalled = null,
+                    label = "Cursor Integration",
+                    enabledTooltip = "Cursor database found — Composer session discovery is enabled",
+                    disabledTooltip = "Cursor detected but Composer session discovery is disabled in config",
+                    hookMissingTooltip = null,
+                )
+            }
         }
 
         add(JBScrollPane(statusList), BorderLayout.CENTER)
