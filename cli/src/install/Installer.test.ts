@@ -2367,12 +2367,52 @@ describe("Installer", () => {
 
 			const skillPath = join(tempDir, ".claude", "skills", "jolli-recall", "SKILL.md");
 			const contentBefore = await readFile(skillPath, "utf-8");
-			expect(contentBefore).toContain("jolli-skill-version:");
+			// v5: version now lives under spec-compliant `metadata.version`.
+			// We still recognize the legacy top-level key on read so a stale
+			// file isn't needlessly rewritten — see SkillInstaller.test.ts.
+			expect(contentBefore).toMatch(/metadata:\n {2}version:/);
 
 			// Record the file content, install again — should not overwrite
 			await install(tempDir);
 			const contentAfter = await readFile(skillPath, "utf-8");
 			expect(contentAfter).toBe(contentBefore);
+		});
+
+		it("writes SKILL.md to both .claude/skills/ and .agents/skills/", async () => {
+			await install(tempDir);
+			const recallClaude = join(tempDir, ".claude", "skills", "jolli-recall", "SKILL.md");
+			const recallAgents = join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md");
+			const searchClaude = join(tempDir, ".claude", "skills", "jolli-search", "SKILL.md");
+			const searchAgents = join(tempDir, ".agents", "skills", "jolli-search", "SKILL.md");
+			const claudeR = await readFile(recallClaude, "utf-8");
+			const agentsR = await readFile(recallAgents, "utf-8");
+			const claudeS = await readFile(searchClaude, "utf-8");
+			const agentsS = await readFile(searchAgents, "utf-8");
+			// Byte-identical across targets (v5 single-template invariant).
+			expect(claudeR).toBe(agentsR);
+			expect(claudeS).toBe(agentsS);
+		});
+	});
+
+	describe("install — uninstall conservative skill cleanup", () => {
+		it("uninstall logs a manual-cleanup hint instead of deleting skill directories", async () => {
+			// Install first so SKILL.md files exist in both target dirs.
+			await install(tempDir);
+
+			const recallClaude = join(tempDir, ".claude", "skills", "jolli-recall", "SKILL.md");
+			const recallAgents = join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md");
+			// Sanity: both written.
+			expect((await stat(recallClaude)).isFile()).toBe(true);
+			expect((await stat(recallAgents)).isFile()).toBe(true);
+
+			const result = await uninstall(tempDir);
+			expect(result.success).toBe(true);
+			// Skill files are deliberately left in place — users sometimes ship
+			// their own skills alongside Jolli's; a blind rm -rf would delete them.
+			expect((await stat(recallClaude)).isFile()).toBe(true);
+			expect((await stat(recallAgents)).isFile()).toBe(true);
+			// And the user is told how to remove them manually if they want to.
+			expect(result.warnings.some((w) => w.includes("rm -rf .agents/skills/jolli-*"))).toBe(true);
 		});
 	});
 

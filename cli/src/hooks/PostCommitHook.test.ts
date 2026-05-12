@@ -1385,7 +1385,7 @@ describe("queue-driven Worker", () => {
 			);
 			// The message-only amend ALSO writes diffStats (the full commit diff) on
 			// the migrated summary, so display code doesn't fall back to recursive
-			// aggregation of children. This was previously missed — see plan.
+			// aggregation of children.
 			const summaryArg = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
 			expect(summaryArg.diffStats).toEqual({ filesChanged: 3, insertions: 70, deletions: 15 });
 			// `stats` field stays undefined on the migrated summary (this path never

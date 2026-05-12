@@ -2050,6 +2050,7 @@ describe("CLI", () => {
 			await main(["recall", "branch;rm -rf /", "--format", "json", "--cwd", "/tmp/test"]);
 
 			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Invalid characters"));
+			expect(process.exitCode).toBe(1);
 		});
 
 		it("should handle errors gracefully with human-readable output by default", async () => {
@@ -2067,6 +2068,9 @@ describe("CLI", () => {
 			await main(["recall", "feature/auth", "--catalog", "--format", "json", "--cwd", "/tmp/test"]);
 
 			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("disk error"));
+			// Exit code MUST be 1 even on the JSON branch — CI / shell pipelines
+			// detect failure via exit code, not stdout parsing.
+			expect(process.exitCode).toBe(1);
 		});
 
 		it("should handle non-Error throws in recall catch block", async () => {
@@ -2075,6 +2079,7 @@ describe("CLI", () => {
 			await main(["recall", "feature/auth", "--catalog", "--cwd", "/tmp/test"]);
 
 			expect(console.error).toHaveBeenCalledWith(expect.stringContaining("string error"));
+			expect(process.exitCode).toBe(1);
 		});
 
 		it("should pass depth and budget options to compileTaskContext", async () => {
@@ -2460,6 +2465,121 @@ describe("CLI", () => {
 			const parsed = JSON.parse(output);
 			expect(parsed.type).toBe("error");
 			expect(parsed.message).toContain("No Jolli Memory records found");
+		});
+
+		// ── --arg-stdin (here-doc bridge from SKILL.md) ──
+		// The skill templates pipe the user's branch/keyword via a here-doc;
+		// recall reads stdin via the `--arg-stdin` flag so user-supplied shell
+		// metacharacters never reach the shell parser.
+
+		async function withStdin<T>(payload: string, fn: () => Promise<T>): Promise<T> {
+			const { Readable } = await import("node:stream");
+			const origStdin = process.stdin;
+			const stream = Readable.from([payload]);
+			Object.defineProperty(process, "stdin", { value: stream, configurable: true });
+			try {
+				return await fn();
+			} finally {
+				Object.defineProperty(process, "stdin", { value: origStdin, configurable: true });
+			}
+		}
+
+		it("--arg-stdin reads the branch/keyword from stdin (matching catalog branch)", async () => {
+			vi.mocked(listBranchCatalog).mockResolvedValueOnce({
+				type: "catalog",
+				branches: [
+					{
+						branch: "feature/auth",
+						commitCount: 1,
+						period: { start: "2026-03-28", end: "2026-03-28" },
+						commitMessages: ["c"],
+					},
+				],
+			});
+			vi.mocked(compileTaskContext).mockResolvedValueOnce({
+				branch: "feature/auth",
+				period: { start: "2026-03-28", end: "2026-03-28" },
+				commitCount: 1,
+				totalFilesChanged: 1,
+				totalInsertions: 0,
+				totalDeletions: 0,
+				summaries: [],
+				plans: [],
+				notes: [],
+				keyDecisions: [],
+				stats: {
+					topicCount: 0,
+					planCount: 0,
+					noteCount: 0,
+					decisionCount: 0,
+					topicTokens: 0,
+					planTokens: 0,
+					noteTokens: 0,
+					decisionTokens: 0,
+					transcriptTokens: 0,
+					totalTokens: 0,
+				},
+			});
+
+			await withStdin("feature/auth\n", () => main(["recall", "--arg-stdin", "--cwd", "/tmp/test"]));
+
+			expect(compileTaskContext).toHaveBeenCalledWith(
+				expect.objectContaining({ branch: "feature/auth" }),
+				"/tmp/test",
+			);
+		});
+
+		it("--arg-stdin with shell metacharacters in stdin is rejected by the safety pattern", async () => {
+			// The point of --arg-stdin is that the user input never touched a
+			// shell — the literal bytes arrive at the CLI verbatim. The deny-
+			// list still rejects them as a downstream safety net before the
+			// content can flow into git operations.
+			await withStdin("$(touch /tmp/jolli-pwn-stdin)\n", () =>
+				main(["recall", "--arg-stdin", "--format", "json", "--cwd", "/tmp/test"]),
+			);
+			const output = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.join("");
+			expect(output).toContain('"type":"error"');
+			expect(output).toContain("Invalid characters");
+			expect(process.exitCode).toBe(1);
+		});
+
+		it("--arg-stdin with empty stdin falls back to current branch (or empty catalog)", async () => {
+			// Empty stdin means "no branch supplied" — same behavior as omitting
+			// the positional words. With no current branch (mocked detached
+			// HEAD) and an empty catalog, recall emits the "no records" message.
+			mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+				const a = args as string[];
+				if (a.includes("--show-current")) throw new Error("detached HEAD");
+				if (a.includes("--show-toplevel")) return "/tmp/test\n";
+				return "";
+			});
+			vi.mocked(listBranchCatalog).mockResolvedValueOnce({ type: "catalog", branches: [] });
+
+			await withStdin("", () => main(["recall", "--arg-stdin", "--cwd", "/tmp/test"]));
+
+			expect(console.log).toHaveBeenCalledWith(expect.stringContaining("No Jolli Memory records found"));
+		});
+
+		it("rejects --arg-stdin combined with positional words (mutually exclusive, JSON output)", async () => {
+			await main(["recall", "--arg-stdin", "feature/auth", "--format", "json", "--cwd", "/tmp/test"]);
+
+			const output = vi
+				.mocked(console.log)
+				.mock.calls.map((c) => String(c[0]))
+				.join("");
+			expect(output).toContain('"type":"error"');
+			expect(output).toContain("mutually exclusive");
+			expect(process.exitCode).toBe(1);
+		});
+
+		it("rejects --arg-stdin combined with positional words (mutually exclusive, text output)", async () => {
+			await main(["recall", "--arg-stdin", "feature/auth", "--cwd", "/tmp/test"]);
+
+			expect(console.error).toHaveBeenCalledWith(expect.stringContaining("mutually exclusive"));
+			expect(process.exitCode).toBe(1);
 		});
 	});
 

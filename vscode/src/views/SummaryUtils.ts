@@ -88,7 +88,7 @@ export function formatProviderLabel(
 	return `mixed: ${sources.map((s) => PROVIDER_LABELS[s]).join(", ")}`;
 }
 
-// ─── Push contract: relativePath construction (server plan §8) ───────────────
+// ─── Push contract: relativePath construction ───────────────────────────────
 
 /**
  * Returns the `relativePath` for any push: `<branchSlug>`. Summary, plan, and

@@ -27,7 +27,7 @@ import {
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { setLogDir } from "../Logger.js";
 import type { CommitSummary } from "../Types.js";
-import { formatShortDate, parsePositiveInt, resolveProjectDir, SAFE_ARGUMENT_PATTERN } from "./CliUtils.js";
+import { formatShortDate, parsePositiveInt, readStdin, resolveProjectDir, SAFE_ARGUMENT_PATTERN } from "./CliUtils.js";
 
 /**
  * Maximum branches shown in terminal-friendly catalog output.
@@ -146,7 +146,7 @@ function renderShortSummary(ctx: {
 	lines.push(`  Files changed: ${ctx.totalFilesChanged}`);
 	lines.push("");
 	lines.push("  Run with --full or --output <path> for full context.");
-	lines.push("  Run /jolli-recall in Claude Code for AI-assisted recall.");
+	lines.push("  Run the jolli-recall skill (e.g. /jolli-recall in Claude Code) for AI-assisted recall.");
 	lines.push("");
 
 	return lines.join("\n");
@@ -250,15 +250,44 @@ export function registerRecallCommand(program: Command): void {
 		.option("--include-transcripts", "Include transcript excerpts")
 		.option("--no-plans", "Exclude plan content")
 		.option("--catalog", "List all recorded branches (lightweight)")
+		.option(
+			"--arg-stdin",
+			"Read the branch/keyword argument from stdin instead of argv (used by SKILL.md here-doc bridge)",
+		)
 		.addOption(new Option("--format <fmt>", "Output format").choices(["md", "json"]))
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
 		.action(async (words: string[], options) => {
-			const branchOrKeyword = words.length > 0 ? words.join(" ") : undefined;
 			try {
 				const projectDir = options.cwd;
 				setLogDir(projectDir);
 
-				// Validate argument (prevent shell injection via $ARGUMENTS)
+				// --arg-stdin is mutually exclusive with positional words. The skill
+				// template's here-doc pipeline relies on stdin being the single
+				// source of truth for the user's argument; mixing them would silently
+				// drop one or the other and undermine the injection-defense contract.
+				if (options.argStdin && words.length > 0) {
+					const message =
+						"--arg-stdin and positional [words...] are mutually exclusive. Pass the argument via stdin OR positional, not both.";
+					if (options.format === "json") {
+						console.log(JSON.stringify({ type: "error", message }));
+					} else {
+						console.error(`\n  Error: ${message}\n`);
+					}
+					process.exitCode = 1;
+					return;
+				}
+
+				let branchOrKeyword: string | undefined;
+				if (options.argStdin) {
+					const fromStdin = await readStdin();
+					branchOrKeyword = fromStdin.length > 0 ? fromStdin : undefined;
+				} else {
+					branchOrKeyword = words.length > 0 ? words.join(" ") : undefined;
+				}
+
+				// Validate argument (defense in depth: the user input has already
+				// bypassed shell parsing via here-doc/argv, but malicious content
+				// could still flow downstream into git operations).
 				if (branchOrKeyword && !SAFE_ARGUMENT_PATTERN.test(branchOrKeyword)) {
 					const message =
 						"Invalid characters in argument. Only letters, numbers, hyphens, underscores, slashes, and dots are allowed.";
@@ -266,8 +295,8 @@ export function registerRecallCommand(program: Command): void {
 						console.log(JSON.stringify({ type: "error", message }));
 					} else {
 						console.error(`\n  Error: ${message}\n`);
-						process.exitCode = 1;
 					}
+					process.exitCode = 1;
 					return;
 				}
 
@@ -350,8 +379,10 @@ export function registerRecallCommand(program: Command): void {
 					console.log(JSON.stringify({ type: "error", message }));
 				} else {
 					console.error(`\n  Error: ${message}\n`);
-					process.exitCode = 1;
 				}
+				// Always set a non-zero exit code so CI / shell pipelines detect the
+				// failure regardless of which output format the caller asked for.
+				process.exitCode = 1;
 			}
 		});
 }

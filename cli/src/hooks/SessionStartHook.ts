@@ -287,13 +287,16 @@ function buildBriefingText(
 		lines.push(`Plans: ${planNames.join("; ")}`);
 	}
 
-	// Line 6: Recall suggestion based on time gap
+	// Line 6: Recall suggestion based on time gap. Phrasing covers every
+	// agent host — Claude Code uses `/jolli-recall`, other platforms (Codex,
+	// Cursor, OpenCode, Windsurf, Gemini) invoke the same skill via natural
+	// language, mentions, or their own slash syntax.
 	if (daysSinceLastCommit > 3) {
 		lines.push(
-			`Warning: ${daysSinceLastCommit} days since last commit. Suggest running /jolli-recall for full context.`,
+			`Warning: ${daysSinceLastCommit} days since last commit. Suggest running the jolli-recall skill (e.g. /jolli-recall in Claude Code) for full context.`,
 		);
 	} else if (daysSinceLastCommit > 0) {
-		lines.push("Tip: /jolli-recall for full context");
+		lines.push("Tip: run the jolli-recall skill (e.g. /jolli-recall in Claude Code) for full context");
 	}
 
 	return lines.join("\n");

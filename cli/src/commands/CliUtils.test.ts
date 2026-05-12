@@ -5,7 +5,7 @@
  * resolveProjectDir caching, and interactive detection.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockExecFileSync } = vi.hoisted(() => ({
 	mockExecFileSync: vi.fn(),
@@ -318,6 +318,69 @@ describe("CliUtils", () => {
 				console.log = origLog;
 			}
 			expect(stdoutLines).toEqual([]);
+		});
+	});
+
+	// ─── readStdin ───────────────────────────────────────────────────────
+	// `readStdin` reads `process.stdin` to EOF and trims one trailing newline.
+	// The trim matters because the SKILL.md here-doc bridge always appends
+	// a `\n` before the terminator, so without the trim the user-input would
+	// gain an artificial trailing newline relative to a positional argument.
+	describe("readStdin", () => {
+		// Replace process.stdin with a synthetic Readable so each test feeds
+		// deterministic bytes. Restore the original handle in afterEach so a
+		// later test that imports something incidentally touching stdin
+		// (DistPathResolver, etc.) isn't broken.
+		const origStdin = process.stdin;
+		afterEach(() => {
+			Object.defineProperty(process, "stdin", { value: origStdin, configurable: true });
+		});
+
+		async function withFakeStdin(payload: string | Buffer): Promise<string> {
+			const { Readable } = await import("node:stream");
+			const stream = Readable.from(typeof payload === "string" ? [payload] : [payload]);
+			Object.defineProperty(process, "stdin", { value: stream, configurable: true });
+			const { readStdin } = await import("./CliUtils.js");
+			return readStdin();
+		}
+
+		it("returns the full body when stdin has no trailing newline", async () => {
+			expect(await withFakeStdin("feature/auth")).toBe("feature/auth");
+		});
+
+		it("trims a single trailing LF", async () => {
+			expect(await withFakeStdin("feature/auth\n")).toBe("feature/auth");
+		});
+
+		it("trims a single trailing CRLF (Windows here-doc)", async () => {
+			expect(await withFakeStdin("feature/auth\r\n")).toBe("feature/auth");
+		});
+
+		it("only trims ONE trailing newline (preserves intentional inner blanks)", async () => {
+			expect(await withFakeStdin("line1\nline2\n\n")).toBe("line1\nline2\n");
+		});
+
+		it("returns empty string when stdin is empty", async () => {
+			expect(await withFakeStdin("")).toBe("");
+		});
+
+		it("passes shell metacharacters through verbatim ($(), backticks, quotes)", async () => {
+			// This is the whole point of the --arg-stdin bridge: user-supplied
+			// shell metacharacters must arrive at the CLI as literal bytes,
+			// never going through any shell parser.
+			const evil = 'feature/$(touch /tmp/jolli-pwn-readstdin) `whoami` "quote\'mix"';
+			expect(await withFakeStdin(evil)).toBe(evil);
+		});
+
+		it("handles a Buffer chunk (not just string)", async () => {
+			expect(await withFakeStdin(Buffer.from("buf-input\n", "utf-8"))).toBe("buf-input");
+		});
+
+		it("handles multi-byte UTF-8 input correctly", async () => {
+			// UTF-8 bytes split across chunks would be a real failure mode if
+			// readStdin concatenated strings naively. Buffer.concat handles it.
+			const cjk = "中文-branch-名";
+			expect(await withFakeStdin(cjk)).toBe(cjk);
 		});
 	});
 
