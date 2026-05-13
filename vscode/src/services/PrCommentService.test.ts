@@ -292,7 +292,7 @@ describe("PrCommentService", () => {
 						title: "Multi-commit PR",
 						body: "",
 					};
-					return { stdout: JSON.stringify(prData) };
+					return { stdout: JSON.stringify([{ ...prData, state: "OPEN" }]) };
 				}
 				return { stdout: "" };
 			});
@@ -310,6 +310,7 @@ describe("PrCommentService", () => {
 					url: "https://github.com/example/repo/pull/42",
 					title: "Multi-commit PR",
 				},
+				history: [],
 			});
 		});
 
@@ -396,10 +397,8 @@ describe("PrCommentService", () => {
 					return { stdout: "Logged in\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr") {
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					// gh pr list returns an empty array (success exit) when no PRs match.
+					return { stdout: "[]" };
 				}
 				return { stdout: "" };
 			});
@@ -419,6 +418,7 @@ describe("PrCommentService", () => {
 				command: "prStatus",
 				status: "noPr",
 				branch: "feature/my-branch",
+				history: [],
 			});
 		});
 
@@ -440,10 +440,8 @@ describe("PrCommentService", () => {
 				}
 				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
 				if (cmd === "gh" && args[0] === "pr") {
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					// gh pr list returns an empty array (success exit) when no PRs match.
+					return { stdout: "[]" };
 				}
 				return { stdout: "" };
 			});
@@ -462,6 +460,7 @@ describe("PrCommentService", () => {
 				command: "prStatus",
 				status: "noPr",
 				branch: "feature/br",
+				history: [],
 			});
 		});
 
@@ -570,10 +569,8 @@ describe("PrCommentService", () => {
 					return { stdout: "Logged in\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr") {
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					// gh pr list returns an empty array (success exit) when no PRs match.
+					return { stdout: "[]" };
 				}
 				return { stdout: "" };
 			});
@@ -584,6 +581,7 @@ describe("PrCommentService", () => {
 				command: "prStatus",
 				status: "noPr",
 				branch: "feature/my-branch",
+				history: [],
 			});
 		});
 
@@ -609,7 +607,7 @@ describe("PrCommentService", () => {
 					return { stdout: "Logged in\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr") {
-					return { stdout: JSON.stringify(prData) };
+					return { stdout: JSON.stringify([{ ...prData, state: "OPEN" }]) };
 				}
 				return { stdout: "" };
 			});
@@ -624,6 +622,7 @@ describe("PrCommentService", () => {
 					url: "https://github.com/org/repo/pull/42",
 					title: "My PR",
 				},
+				history: [],
 			});
 		});
 
@@ -683,7 +682,9 @@ describe("PrCommentService", () => {
 				}
 				if (cmd === "gh" && args[0] === "pr") {
 					return {
-						stdout: JSON.stringify({ number: 0, url: "", title: "", body: "" }),
+						stdout: JSON.stringify([
+							{ number: 0, url: "", title: "", body: "", state: "OPEN" },
+						]),
 					};
 				}
 				return { stdout: "" };
@@ -695,6 +696,7 @@ describe("PrCommentService", () => {
 				command: "prStatus",
 				status: "noPr",
 				branch: "feature/branch",
+				history: [],
 			});
 		});
 
@@ -809,12 +811,15 @@ describe("PrCommentService", () => {
 
 		it("does not emit warn/debug on the happy path (baseline)", async () => {
 			setupHappyProbesWithPrHandler(() => ({
-				stdout: JSON.stringify({
-					number: 7,
-					url: "https://pr/7",
-					title: "t",
-					body: "b",
-				}),
+				stdout: JSON.stringify([
+					{
+						number: 7,
+						url: "https://pr/7",
+						title: "t",
+						body: "b",
+						state: "OPEN",
+					},
+				]),
 			}));
 
 			await handleCheckPrStatus(CWD, postMessage);
@@ -823,14 +828,13 @@ describe("PrCommentService", () => {
 			expect(debug).not.toHaveBeenCalled();
 		});
 
-		it("logs at debug when gh pr view stderr indicates 'no pull requests found'", async () => {
-			setupHappyProbesWithPrHandler(() => {
-				throw ghError({
-					message: "gh: exit 1",
-					code: 1,
-					stderr: "no pull requests found for branch feature/br\n",
-				});
-			});
+		it("logs at debug when gh pr list returns an empty array (no PRs match)", async () => {
+			// gh pr list returns `[]` on success exit when no PRs match the
+			// --head filter. findPrForBranch logs at debug and returns noPr —
+			// this is the standard "no PR" miss path under the list-based
+			// implementation, replacing the old stderr "no pull requests found"
+			// regex match.
+			setupHappyProbesWithPrHandler(() => ({ stdout: "[]" }));
 
 			await handleCheckPrStatus(CWD, postMessage);
 
@@ -840,16 +844,20 @@ describe("PrCommentService", () => {
 			);
 			expect(warn).not.toHaveBeenCalled();
 			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
+				expect.objectContaining({
+					status: "noPr",
+					branch: "feature/br",
+					history: [],
+				}),
 			);
 		});
 
-		it("posts unavailable (NOT noPr) when gh pr view fails with a non-expected stderr (e.g. auth/ratelimit)", async () => {
+		it("posts unavailable (NOT noPr) when gh pr list fails with a non-empty stderr (e.g. auth/ratelimit)", async () => {
 			// I-1 contract change: auth lapses, rate limits, and other gh
-			// non-zero exits that don't say "no pull requests found" used to
-			// be folded into noPr — leading the user to click Create PR and
-			// either fail or duplicate. Now they surface as `unavailable`
-			// with the real stderr in `reason`, and the UI shows Retry.
+			// non-zero exits used to be folded into noPr — leading the user
+			// to click Create PR and either fail or duplicate. Now they
+			// surface as `unavailable` with the real stderr in `reason`,
+			// and the UI shows Retry.
 			setupHappyProbesWithPrHandler(() => {
 				throw ghError({
 					message: "gh: exit 1",
@@ -863,7 +871,7 @@ describe("PrCommentService", () => {
 			expect(warn).toHaveBeenCalledWith(
 				expect.any(String),
 				expect.stringMatching(
-					/gh pr view failed for branch feature\/br.*code=1.*stderr:.*authentication required/s,
+					/gh pr list failed for branch feature\/br.*code=1.*stderr:.*authentication required/s,
 				),
 			);
 			expect(debug).not.toHaveBeenCalled();
@@ -934,15 +942,13 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prListHeadArg = args[sepIdx + 1];
 					}
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					// gh pr list returns an empty array (success exit) when no PRs match.
+					return { stdout: "[]" };
 				}
 				return { stdout: "" };
 			});
@@ -955,6 +961,7 @@ describe("PrCommentService", () => {
 				expect.objectContaining({
 					status: "noPr",
 					branch: "feature/summary-branch",
+					history: [],
 				}),
 			);
 		});
@@ -977,16 +984,14 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prViewBranchArg = args[sepIdx + 1];
 					}
 					// gh returns "no PR" for the stale name.
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					// gh pr list returns an empty array (success exit) when no PRs match.
+					return { stdout: "[]" };
 				}
 				return { stdout: "" };
 			});
@@ -1001,6 +1006,7 @@ describe("PrCommentService", () => {
 				expect.objectContaining({
 					status: "noPr",
 					branch: "feature/old",
+					history: [],
 				}),
 			);
 		});
@@ -1017,15 +1023,13 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prListHeadArg = args[sepIdx + 1];
 					}
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					// gh pr list returns an empty array (success exit) when no PRs match.
+					return { stdout: "[]" };
 				}
 				return { stdout: "" };
 			});
@@ -1061,12 +1065,15 @@ describe("PrCommentService", () => {
 					if (cmd === "gh" && args[0] === "pr") {
 						ghPrCalls.push(args);
 						return {
-							stdout: JSON.stringify({
-								number: 7,
-								url: "https://github.com/other/repo/pull/7",
-								title: "Foreign PR",
-								body: "",
-							}),
+							stdout: JSON.stringify([
+								{
+									number: 7,
+									url: "https://github.com/other/repo/pull/7",
+									title: "Foreign PR",
+									body: "",
+									state: "OPEN",
+								},
+							]),
 						};
 					}
 					return { stdout: "" };
@@ -1100,7 +1107,247 @@ describe("PrCommentService", () => {
 						url: "https://github.com/other/repo/pull/7",
 						title: "Foreign PR",
 					},
+					history: [],
 				});
+			});
+
+			it("posts unavailable when repoUrl is provided without summaryBranch (foreign-repo guard)", async () => {
+				// Foreign-repo lookups MUST be paired with an explicit
+				// summaryBranch: the cwd-bound `getCurrentBranch` fallback would
+				// describe the *current* repo, which is the wrong branch when
+				// the user is viewing a Memory Bank summary from a different
+				// project. Pre-guard the call rather than send a misleading
+				// PR status from the wrong repo.
+				await handleCheckPrStatus(
+					CWD,
+					postMessage,
+					undefined,
+					"https://github.com/foreign/repo",
+				);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prStatus",
+					status: "unavailable",
+				});
+				// No gh / git probes should have run on this guard path.
+				expect(mockExecFileAsync).not.toHaveBeenCalled();
+			});
+		});
+
+		// ─── Previously: PR history strip ────────────────────────────────────
+		// Covers the new `gh pr list --state all` shape: an active open PR is
+		// shown front-and-center while merged/closed PRs from the same branch
+		// flow into a "Previously:" inline strip below the actions. These
+		// tests pin both the discriminator (open → kind:found, merged-only →
+		// kind:noPr) AND the ordering (number-desc, latest first).
+		describe("PR history (Previously: strip)", () => {
+			function happyProbes(pr: ReadonlyArray<unknown>): void {
+				setupExecFile((cmd, args) => {
+					if (cmd === "git" && args[0] === "rev-list") return { stdout: "1\n" };
+					if (cmd === "git" && args[0] === "rev-parse")
+						return { stdout: "feature/br\n" };
+					if (cmd === "gh" && args[0] === "--version")
+						return { stdout: "ok\n" };
+					if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+					if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+						return { stdout: JSON.stringify(pr) };
+					}
+					return { stdout: "" };
+				});
+			}
+
+			it("passes merged/closed PRs as history alongside ready status when an open PR exists", async () => {
+				happyProbes([
+					{
+						number: 104,
+						url: "https://pr/104",
+						title: "Active",
+						body: "",
+						state: "OPEN",
+					},
+					{
+						number: 102,
+						url: "https://pr/102",
+						title: "Old",
+						body: "",
+						state: "MERGED",
+					},
+					{
+						number: 98,
+						url: "https://pr/98",
+						title: "Older",
+						body: "",
+						state: "CLOSED",
+					},
+				]);
+
+				await handleCheckPrStatus(CWD, postMessage);
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prStatus",
+					status: "ready",
+					pr: { number: 104, url: "https://pr/104", title: "Active" },
+					history: [
+						{ number: 102, url: "https://pr/102", state: "MERGED" },
+						{ number: 98, url: "https://pr/98", state: "CLOSED" },
+					],
+				});
+			});
+
+			it("returns noPr (NOT ready on merged) when only merged/closed PRs exist", async () => {
+				// Pre-refactor (gh pr view) would surface a merged PR as
+				// `kind: "found"` because gh returns it for the branch. That
+				// showed Edit PR on a merged PR — editing a merged title/body
+				// works but is almost never what the user wants. Switching to
+				// gh pr list + state filter keeps merged/closed out of the
+				// "active PR" slot.
+				happyProbes([
+					{
+						number: 102,
+						url: "https://pr/102",
+						title: "Old",
+						body: "",
+						state: "MERGED",
+					},
+				]);
+
+				await handleCheckPrStatus(CWD, postMessage);
+
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prStatus",
+					status: "noPr",
+					branch: "feature/br",
+					history: [{ number: 102, url: "https://pr/102", state: "MERGED" }],
+				});
+			});
+
+			it("orders history by number descending (latest first)", async () => {
+				// gh's own order isn't guaranteed; we sort so the user always
+				// sees the most recently-numbered PR first.
+				happyProbes([
+					{
+						number: 50,
+						url: "https://pr/50",
+						title: "B",
+						body: "",
+						state: "MERGED",
+					},
+					{
+						number: 200,
+						url: "https://pr/200",
+						title: "C",
+						body: "",
+						state: "CLOSED",
+					},
+					{
+						number: 1,
+						url: "https://pr/1",
+						title: "A",
+						body: "",
+						state: "MERGED",
+					},
+				]);
+
+				await handleCheckPrStatus(CWD, postMessage);
+
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						status: "noPr",
+						history: [
+							{ number: 200, url: "https://pr/200", state: "CLOSED" },
+							{ number: 50, url: "https://pr/50", state: "MERGED" },
+							{ number: 1, url: "https://pr/1", state: "MERGED" },
+						],
+					}),
+				);
+			});
+
+			it("picks the highest-numbered open PR when gh returns more than one (anomaly)", async () => {
+				// GitHub allows at most one open PR per head branch, but if gh
+				// returns more we deterministically pick the latest and surface
+				// the older one(s) as history so nothing silently disappears.
+				happyProbes([
+					{
+						number: 10,
+						url: "https://pr/10",
+						title: "Stale open",
+						body: "",
+						state: "OPEN",
+					},
+					{
+						number: 20,
+						url: "https://pr/20",
+						title: "Newer open",
+						body: "",
+						state: "OPEN",
+					},
+				]);
+
+				await handleCheckPrStatus(CWD, postMessage);
+
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						status: "ready",
+						pr: expect.objectContaining({ number: 20 }),
+					}),
+				);
+			});
+
+			it("drops malformed entries with number 0 or missing state from history", async () => {
+				// Defense-in-depth: gh has been observed to return number 0 in
+				// rare edge cases; we'd rather show fewer history pills than
+				// crash the section. State is `unknown`-cast at parse, so a
+				// missing `state` survives type-check but must be filtered.
+				happyProbes([
+					{
+						number: 0,
+						url: "https://pr/0",
+						title: "",
+						body: "",
+						state: "MERGED",
+					},
+					{
+						number: 50,
+						url: "https://pr/50",
+						title: "Real",
+						body: "" /* no state */,
+					},
+					{
+						number: 60,
+						url: "https://pr/60",
+						title: "Real",
+						body: "",
+						state: "MERGED",
+					},
+				]);
+
+				await handleCheckPrStatus(CWD, postMessage);
+
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						status: "noPr",
+						history: [{ number: 60, url: "https://pr/60", state: "MERGED" }],
+					}),
+				);
+			});
+
+			it("posts unavailable with reason when gh returns non-array JSON (shape regression)", async () => {
+				// gh could conceivably return a single object instead of an
+				// array if its output shape changes; we treat that as a
+				// lookupError rather than guessing how to coerce it.
+				happyProbes(
+					JSON.parse(
+						'{"number":1,"state":"OPEN","url":"x","title":"y","body":""}',
+					) as ReadonlyArray<unknown>,
+				);
+
+				await handleCheckPrStatus(CWD, postMessage);
+
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						status: "unavailable",
+						reason: expect.stringContaining("expected array"),
+					}),
+				);
 			});
 		});
 	});
@@ -1127,13 +1374,16 @@ describe("PrCommentService", () => {
 					"git:rev-parse": () => ({ stdout: "feature/branch\n" }),
 					"gh:--version": () => ({ stdout: "gh 2.40.0\n" }),
 					"gh:auth": () => ({ stdout: "ok\n" }),
-					"gh:pr:view": () => ({
-						stdout: JSON.stringify({
-							number: 77,
-							url: prUrl,
-							title: "Rebased PR",
-							body: "",
-						}),
+					"gh:pr:list": () => ({
+						stdout: JSON.stringify([
+							{
+								number: 77,
+								url: prUrl,
+								title: "Rebased PR",
+								body: "",
+								state: "OPEN",
+							},
+						]),
 					}),
 				}),
 			);
@@ -1169,13 +1419,16 @@ describe("PrCommentService", () => {
 					"git:rev-parse": () => ({ stdout: "feature/branch\n" }),
 					"gh:--version": () => ({ stdout: "gh 2.40.0\n" }),
 					"gh:auth": () => ({ stdout: "ok\n" }),
-					"gh:pr:view": () => ({
-						stdout: JSON.stringify({
-							number: 99,
-							url: prUrl,
-							title: "New PR",
-							body: "",
-						}),
+					"gh:pr:list": () => ({
+						stdout: JSON.stringify([
+							{
+								number: 99,
+								url: prUrl,
+								title: "New PR",
+								body: "",
+								state: "OPEN",
+							},
+						]),
 					}),
 				}),
 			);
@@ -1242,13 +1495,16 @@ describe("PrCommentService", () => {
 					"git:rev-parse": () => ({ stdout: "branch\n" }),
 					"gh:--version": () => ({ stdout: "ok\n" }),
 					"gh:auth": () => ({ stdout: "ok\n" }),
-					"gh:pr:view": () => ({
-						stdout: JSON.stringify({
-							number: 55,
-							url: prUrl,
-							title: "T",
-							body: "",
-						}),
+					"gh:pr:list": () => ({
+						stdout: JSON.stringify([
+							{
+								number: 55,
+								url: prUrl,
+								title: "T",
+								body: "",
+								state: "OPEN",
+							},
+						]),
 					}),
 				}),
 			);
@@ -1323,13 +1579,16 @@ describe("PrCommentService", () => {
 					"git:rev-list": () => ({ stdout: "1\n" }),
 					"gh:--version": () => ({ stdout: "gh 2.40.0\n" }),
 					"gh:auth": () => ({ stdout: "ok\n" }),
-					"gh:pr:view": () => ({
-						stdout: JSON.stringify({
-							number: 123,
-							url: prUrl,
-							title: "OK",
-							body: "",
-						}),
+					"gh:pr:list": () => ({
+						stdout: JSON.stringify([
+							{
+								number: 123,
+								url: prUrl,
+								title: "OK",
+								body: "",
+								state: "OPEN",
+							},
+						]),
 					}),
 				}),
 			);
@@ -1359,14 +1618,17 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/test-branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
-							number: 10,
-							url: "https://url",
-							title: "PR Title",
-							body: existingBody,
-						}),
+						stdout: JSON.stringify([
+							{
+								number: 10,
+								url: "https://url",
+								title: "PR Title",
+								body: existingBody,
+								state: "OPEN",
+							},
+						]),
 					};
 				}
 				return { stdout: "" };
@@ -1387,14 +1649,17 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/test-branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
-							number: 10,
-							url: "https://url",
-							title: "T",
-							body: existingBody,
-						}),
+						stdout: JSON.stringify([
+							{
+								number: 10,
+								url: "https://url",
+								title: "T",
+								body: existingBody,
+								state: "OPEN",
+							},
+						]),
 					};
 				}
 				return { stdout: "" };
@@ -1425,7 +1690,7 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					throw ghError({
 						message: "gh exit 4",
 						code: 4,
@@ -1467,15 +1732,13 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					// Mimic gh's real non-zero exit with the "no pull requests
 					// found" stderr line — findPrForBranch reads it via
 					// `(err as { stderr? }).stderr`, matches the regex,
 					// returns `{ kind: "noPr" }`.
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					// gh pr list returns an empty array (success exit) when no PRs match.
+					return { stdout: "[]" };
 				}
 				return { stdout: "" };
 			});
@@ -1492,6 +1755,7 @@ describe("PrCommentService", () => {
 					command: "prStatus",
 					status: "noPr",
 					branch: "feature/test-branch",
+					history: [],
 				}),
 			);
 		});
@@ -1533,14 +1797,17 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/test-branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
-							number: 10,
-							url: "https://url",
-							title: "T",
-							body: "",
-						}),
+						stdout: JSON.stringify([
+							{
+								number: 10,
+								url: "https://url",
+								title: "T",
+								body: "",
+								state: "OPEN",
+							},
+						]),
 					};
 				}
 				return { stdout: "" };
@@ -1562,18 +1829,21 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/current\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prViewBranchArg = args[sepIdx + 1];
 					}
 					return {
-						stdout: JSON.stringify({
-							number: 5,
-							url: "https://url",
-							title: "T",
-							body: "",
-						}),
+						stdout: JSON.stringify([
+							{
+								number: 5,
+								url: "https://url",
+								title: "T",
+								body: "",
+								state: "OPEN",
+							},
+						]),
 					};
 				}
 				return { stdout: "" };
@@ -1603,8 +1873,8 @@ describe("PrCommentService", () => {
 
 			setupExecFile((cmd, args) => {
 				// findPrForBranch
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return { stdout: JSON.stringify(pr) };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					return { stdout: JSON.stringify([{ ...pr, state: "OPEN" }]) };
 				}
 				// execGh for pr edit (title change)
 				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
@@ -1678,10 +1948,8 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "branch\n" };
 				}
-				throw ghError({
-					message: "gh exit 1",
-					stderr: "no pull requests found",
-				});
+				// gh pr list returns an empty array (success exit) when no PRs match.
+				return { stdout: "[]" };
 			});
 
 			await handleUpdatePr("T", "B", CWD, postMessage);
@@ -1729,14 +1997,17 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
-							number: 5,
-							url: "u",
-							title: "T",
-							body: "",
-						}),
+						stdout: JSON.stringify([
+							{
+								number: 5,
+								url: "u",
+								title: "T",
+								body: "",
+								state: "OPEN",
+							},
+						]),
 					};
 				}
 				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
@@ -1763,14 +2034,17 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
-							number: 5,
-							url: "u",
-							title: "T",
-							body: "",
-						}),
+						stdout: JSON.stringify([
+							{
+								number: 5,
+								url: "u",
+								title: "T",
+								body: "",
+								state: "OPEN",
+							},
+						]),
 					};
 				}
 				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
@@ -1790,8 +2064,8 @@ describe("PrCommentService", () => {
 		it("succeeds even when temp file cleanup fails (removeTempFile catch)", async () => {
 			const pr = { number: 7, url: "https://pr/7", title: "T", body: "" };
 			setupExecFile((cmd, args) => {
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return { stdout: JSON.stringify(pr) };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					return { stdout: JSON.stringify([{ ...pr, state: "OPEN" }]) };
 				}
 				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
 					return { stdout: "" };
@@ -1848,18 +2122,21 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/current\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prViewBranchArg = args[sepIdx + 1];
 					}
 					return {
-						stdout: JSON.stringify({
-							number: 11,
-							url: "https://url",
-							title: "T",
-							body: "",
-						}),
+						stdout: JSON.stringify([
+							{
+								number: 11,
+								url: "https://url",
+								title: "T",
+								body: "",
+								state: "OPEN",
+							},
+						]),
 					};
 				}
 				if (cmd === "gh" && args[0] === "--version") {

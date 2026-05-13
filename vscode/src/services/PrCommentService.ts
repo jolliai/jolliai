@@ -223,7 +223,25 @@ interface PrInfo {
 }
 
 /**
+ * A closed (merged or closed-without-merge) PR shown in the "Previously"
+ * history strip below the active PR actions. URL is included so the webview
+ * can render each entry as a clickable link without re-querying gh.
+ */
+export interface PrHistoryEntry {
+	readonly number: number;
+	readonly url: string;
+	readonly state: "MERGED" | "CLOSED";
+}
+
+/**
  * Discriminated result of `findPrForBranch`.
+ *
+ * `kind === "found"` strictly means there is an open PR — when only merged /
+ * closed PRs exist on the branch we return `kind === "noPr"` with `history`
+ * populated. This keeps Edit PR off merged/closed entries (editing a merged
+ * PR's title/body works but is almost never what the user wants) and lets the
+ * user create a new PR on the same branch with the previous one visible as
+ * history.
  *
  * Pre-refactor this function returned `PrInfo | undefined` and collapsed four
  * distinct outcomes into the same `undefined` value: real no-PR, auth/network
@@ -233,18 +251,33 @@ interface PrInfo {
  * to decide between the three real outcomes.
  */
 type PrLookup =
-	| { kind: "found"; pr: PrInfo }
-	| { kind: "noPr" }
+	| { kind: "found"; pr: PrInfo; history: ReadonlyArray<PrHistoryEntry> }
+	| { kind: "noPr"; history: ReadonlyArray<PrHistoryEntry> }
 	| { kind: "lookupError"; reason: string };
+
+/** Raw row shape returned by `gh pr list --json number,url,title,body,state`. */
+interface RawPrListRow {
+	readonly number: number;
+	readonly url: string;
+	readonly title: string;
+	readonly body: string;
+	readonly state: "OPEN" | "MERGED" | "CLOSED";
+}
 
 /**
  * Returns PR info for the given branch.
- * Uses `gh pr view -- <branch>` which works for open, merged, and closed PRs.
  *
- * The `--` end-of-options sentinel prevents option injection: even if `branch`
- * starts with `-` (e.g. `--repo owner/evil`), `gh` treats it as a positional
- * argument rather than a flag. This is a defense-in-depth measure since the
- * value originates from persisted JSON on the orphan branch.
+ * Uses `gh pr list --state all --head <branch>` so we get the active PR (if
+ * any) AND closed history in a single round-trip. The webview shows the active
+ * one front-and-center, history as a "Previously: #N (merged) · ..." strip.
+ *
+ * Why list instead of view: `gh pr view <branch>` only returns the most-recent
+ * PR regardless of state, so a force-pushed branch with PR1 merged + PR2 open
+ * showed only PR2; PR1 disappeared from the UI even though the user could
+ * still navigate to it on GitHub. List + state filtering is the right shape.
+ *
+ * `gh pr list` returns `[]` (success exit, empty JSON array) when no PRs match,
+ * so we no longer need the brittle stderr regex for "no pull requests found".
  */
 async function findPrForBranch(
 	cwd: string,
@@ -259,53 +292,100 @@ async function findPrForBranch(
 	const repoArgs = repoUrl ? ["--repo", repoUrl] : [];
 	const args = [
 		"pr",
-		"view",
-		"--json",
-		"number,url,title,body",
-		...repoArgs,
-		"--",
+		"list",
+		"--state",
+		"all",
+		"--head",
 		branch,
+		"--json",
+		"number,url,title,body,state",
+		...repoArgs,
 	];
 	const result = await tryExecGh(args, cwd);
 
 	if (!result.ok) {
 		const stderr = result.stderr ?? "";
-		// "no pull requests found" is the expected miss path — keep it at
-		// debug to avoid noise on every WebView open. Anything else (auth,
-		// rate limit, network, repo config, non-zero exits) is a real
-		// failure and deserves warn so it shows at default log level.
-		const isExpectedNoPr = /no pull requests? found/i.test(stderr);
-		if (isExpectedNoPr) {
-			log.debug(TAG, `No PR for branch ${branch}`);
-			return { kind: "noPr" };
-		}
 		const reason = stderr.trim() || result.err.message;
 		log.warn(
 			TAG,
-			`gh pr view failed for branch ${branch} (code=${result.code}): ${result.err.message}${
+			`gh pr list failed for branch ${branch} (code=${result.code}): ${result.err.message}${
 				stderr ? ` | stderr: ${stderr.trim()}` : ""
 			}`,
 		);
 		return { kind: "lookupError", reason };
 	}
 
+	let parsed: ReadonlyArray<RawPrListRow>;
 	try {
-		const parsed = JSON.parse(result.stdout) as PrInfo;
-		// `gh pr view --json number` returns `{"number": 0}` only in edge
-		// cases (e.g. the JSON shape changed in a future gh release).
-		// Treat as a real noPr — defense-in-depth, not a known reproducer.
-		return parsed.number ? { kind: "found", pr: parsed } : { kind: "noPr" };
+		const raw = JSON.parse(result.stdout) as unknown;
+		// Defense in depth: gh could conceivably change its return shape; we
+		// only proceed when we got the array we expect.
+		if (!Array.isArray(raw)) {
+			log.warn(
+				TAG,
+				`gh pr list returned non-array JSON for branch ${branch}. Raw length: ${result.stdout.length}`,
+			);
+			return {
+				kind: "lookupError",
+				reason: "Unexpected response shape from gh (expected array)",
+			};
+		}
+		parsed = raw as ReadonlyArray<RawPrListRow>;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
+		// JSON.parse only throws SyntaxError (an Error subclass), so we can
+		// type-assert here and avoid an `instanceof Error ? : String()` branch
+		// whose `String()` fallback would be unreachable.
+		const message = (err as Error).message;
 		log.warn(
 			TAG,
-			`gh pr view returned unparseable JSON for branch ${branch}: ${message}. Raw length: ${result.stdout.length}`,
+			`gh pr list returned unparseable JSON for branch ${branch}: ${message}. Raw length: ${result.stdout.length}`,
 		);
 		return {
 			kind: "lookupError",
 			reason: `Unparseable response from gh: ${message}`,
 		};
 	}
+
+	// Skip entries that look malformed — e.g. missing number (which `gh` has
+	// returned as 0 in edge cases) or missing state. We'd rather show fewer
+	// history pills than crash the section.
+	const valid = parsed.filter(
+		(p) => p.number > 0 && typeof p.state === "string",
+	);
+	// Open: GitHub allows at most one open PR per head branch; if more than
+	// one appears (gh/GitHub anomaly) pick the highest-numbered (most recent).
+	const openPrs = valid
+		.filter((p) => p.state === "OPEN")
+		.sort((a, b) => b.number - a.number);
+	const closedPrs = valid
+		.filter((p) => p.state === "MERGED" || p.state === "CLOSED")
+		.sort((a, b) => b.number - a.number);
+
+	const history: ReadonlyArray<PrHistoryEntry> = closedPrs.map((p) => ({
+		number: p.number,
+		url: p.url,
+		state: p.state as "MERGED" | "CLOSED",
+	}));
+
+	if (openPrs.length === 0) {
+		// `log.debug` only when the branch has zero PRs at all — a branch with
+		// closed/merged-only PRs still flows into kind:noPr (so Edit PR stays
+		// off), but it's not "no PR at all", so spamming the same debug line
+		// would be misleading.
+		if (valid.length === 0) {
+			log.debug(TAG, `No PR for branch ${branch}`);
+		}
+		return { kind: "noPr", history };
+	}
+
+	const openPr = openPrs[0];
+	const pr: PrInfo = {
+		number: openPr.number,
+		url: openPr.url,
+		title: openPr.title,
+		body: openPr.body,
+	};
+	return { kind: "found", pr, history };
 }
 
 // ─── Temp file helper ────────────────────────────────────────────────────────
@@ -438,15 +518,17 @@ export async function handleCheckPrStatus(
 				command: "prStatus",
 				status: "noPr",
 				branch: targetBranch,
+				history: lookup.history,
 			});
 			return;
 		}
 
-		const { pr } = lookup;
+		const { pr, history } = lookup;
 		postMessage({
 			command: "prStatus",
 			status: "ready",
 			pr: { number: pr.number, url: pr.url, title: pr.title },
+			history,
 		});
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -659,6 +741,7 @@ export function buildPrSectionHtml(): string {
   <p class="pr-status-text" id="prStatusText">Checking PR status...</p>
   <div class="pr-link-row pr-hidden" id="prLinkRow"></div>
   <div class="pr-actions pr-hidden" id="prActions"></div>
+  <div class="pr-history pr-hidden" id="prHistory"></div>
   <div class="pr-form pr-hidden" id="prForm">
     <label class="pr-form-label">Title</label>
     <input type="text" class="pr-form-input" id="prTitleInput" />
@@ -705,6 +788,38 @@ export function buildPrSectionCss(): string {
   }
   .pr-actions {
     margin: 8px 0 4px;
+  }
+  /* ── PR History (Previously: …) ── */
+  /*
+   * Inline pill row shown beneath the active PR's actions. GitHub's own
+   * merged-purple / closed-red are used so the colors are recognizable, but
+   * a textual "(merged)" / "(closed)" label is also rendered — colorblind /
+   * high-contrast theme users still read the state from the text.
+   */
+  .pr-history {
+    margin: 6px 0 4px;
+    font-size: 0.88em;
+    color: var(--vscode-descriptionForeground);
+    line-height: 1.5;
+  }
+  .pr-history-label {
+    margin-right: 4px;
+  }
+  .pr-history a {
+    text-decoration: none;
+  }
+  .pr-history a:hover {
+    text-decoration: underline;
+  }
+  .pr-history-merged {
+    color: #8957e5;
+  }
+  .pr-history-closed {
+    color: #cf222e;
+  }
+  .pr-history-sep {
+    margin: 0 6px;
+    color: var(--vscode-descriptionForeground);
   }
   /* ── PR Create Form ── */
   .pr-form {
@@ -758,6 +873,7 @@ export function buildPrSectionScript(): string {
   var prStatusText = document.getElementById('prStatusText');
   var prLinkRow = document.getElementById('prLinkRow');
   var prActions = document.getElementById('prActions');
+  var prHistory = document.getElementById('prHistory');
   var prForm = document.getElementById('prForm');
   var prTitleInput = document.getElementById('prTitleInput');
   var prBodyInput = document.getElementById('prBodyInput');
@@ -765,10 +881,48 @@ export function buildPrSectionScript(): string {
   var prFormSubmit = document.getElementById('prFormSubmit');
 
   var prCurrentState = 'loading';
+  // Cache the last 'Previously:' history so the form-cancel handler can
+  // restore the strip without re-running gh.
+  var prLastHistory = [];
 
   /** Toggle visibility via the pr-hidden CSS class (CSP blocks inline style attributes). */
   function prShow(el) { if (el) el.classList.remove('pr-hidden'); }
   function prHide(el) { if (el) el.classList.add('pr-hidden'); }
+
+  /**
+   * Renders the "Previously: #N (merged) · #M (closed) · ..." strip.
+   * Hides the row when history is empty. Each entry links to the PR URL;
+   * merged/closed are color-coded AND text-labeled so users in high-contrast
+   * themes still see the state without depending on color.
+   */
+  function renderPrHistory(history) {
+    prLastHistory = Array.isArray(history) ? history : [];
+    if (prLastHistory.length === 0) {
+      prHide(prHistory);
+      return;
+    }
+    prHistory.textContent = '';
+    var label = document.createElement('span');
+    label.className = 'pr-history-label';
+    label.textContent = 'Previously:';
+    prHistory.appendChild(label);
+    for (var i = 0; i < prLastHistory.length; i++) {
+      var h = prLastHistory[i];
+      if (i > 0) {
+        var sep = document.createElement('span');
+        sep.className = 'pr-history-sep';
+        sep.textContent = '·';
+        prHistory.appendChild(sep);
+      }
+      var link = document.createElement('a');
+      link.href = h.url;
+      link.title = 'Open PR in browser';
+      link.className = h.state === 'MERGED' ? 'pr-history-merged' : 'pr-history-closed';
+      link.textContent = '#' + h.number + ' (' + (h.state === 'MERGED' ? 'merged' : 'closed') + ')';
+      prHistory.appendChild(link);
+    }
+    prShow(prHistory);
+  }
 
   // Auto-check PR status on load
   vscode.postMessage({ command: 'checkPrStatus' });
@@ -789,6 +943,8 @@ export function buildPrSectionScript(): string {
         prShow(prStatusText);
         prHide(prLinkRow);
       }
+      // Restore the 'Previously:' strip from the cached last history.
+      renderPrHistory(prLastHistory);
     });
   }
   if (prFormSubmit) {
@@ -820,6 +976,7 @@ export function buildPrMessageScript(): string {
         prShow(prStatusText);
         prHide(prLinkRow);
         prHide(prActions);
+        prHide(prHistory);
       } else if (s === 'notAuthenticated') {
         prStatusText.textContent = 'GitHub CLI (gh) is not authenticated. Run "gh auth login" in a terminal, then retry.';
         prShow(prStatusText);
@@ -834,6 +991,7 @@ export function buildPrMessageScript(): string {
         });
         prActions.appendChild(retryAuthBtn);
         prShow(prActions);
+        prHide(prHistory);
       } else if (s === 'unavailable') {
         prStatusText.textContent = msg.reason
           ? ('Could not load PR status — ' + msg.reason + '. Retry, or check the extension log.')
@@ -850,6 +1008,7 @@ export function buildPrMessageScript(): string {
         });
         prActions.appendChild(retryBtn);
         prShow(prActions);
+        prHide(prHistory);
       } else if (s === 'noPr') {
         prHide(prLinkRow);
         prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '.';
@@ -868,6 +1027,7 @@ export function buildPrMessageScript(): string {
           btn.textContent = 'Loading...';
           vscode.postMessage({ command: 'prepareCreatePr' });
         });
+        renderPrHistory(msg.history);
       } else if (s === 'ready') {
         var pr = msg.pr;
         prHide(prStatusText);
@@ -893,6 +1053,7 @@ export function buildPrMessageScript(): string {
           editBtn.disabled = true;
           vscode.postMessage({ command: 'prepareUpdatePr' });
         });
+        renderPrHistory(msg.history);
       }
     }
 
@@ -903,6 +1064,7 @@ export function buildPrMessageScript(): string {
       var createBtn = document.getElementById('createPrBtn');
       if (createBtn) { createBtn.textContent = 'Create PR'; createBtn.disabled = false; }
       prHide(prActions);
+      prHide(prHistory);
       prShow(prForm);
       prForm.dataset.mode = 'create';
       prFormSubmit.textContent = 'Submit PR';
@@ -918,6 +1080,7 @@ export function buildPrMessageScript(): string {
       prHide(prStatusText);
       prHide(prLinkRow);
       prHide(prActions);
+      prHide(prHistory);
       prShow(prForm);
       prForm.dataset.mode = 'update';
       prFormSubmit.textContent = 'Update PR';
