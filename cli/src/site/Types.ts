@@ -111,10 +111,25 @@ export type PathMappings = Record<string, string>;
  */
 export type ThemePack = "default" | "forge" | "atlas";
 
-/** Initial colour scheme for visitors. */
+/**
+ * Initial colour scheme for visitors.
+ *   - `"light"` — always start in light mode
+ *   - `"dark"`  — always start in dark mode
+ *   - `"system"` — follow the visitor's OS preference (`prefers-color-scheme`)
+ *
+ * Pack defaults differ: Forge defaults to `"light"`, Atlas to `"dark"`,
+ * and the `"default"` pack to `"system"`.
+ */
 export type DefaultThemeMode = "light" | "dark" | "system";
 
-/** Font families a pack can resolve via Google Fonts. */
+/**
+ * Font families a pack can resolve via Google Fonts.
+ *   - `"inter"` — Inter, a geometric sans-serif designed for UI readability
+ *   - `"space-grotesk"` — Space Grotesk, a proportional sans with monospace-inspired geometry
+ *   - `"ibm-plex"` — IBM Plex Sans, IBM's open corporate typeface (neutral, highly legible)
+ *   - `"source-sans"` — Source Sans 3 (formerly Source Sans Pro), Adobe's first open sans-serif
+ *   - `"source-serif"` — Source Serif 4, Adobe's transitional serif companion to Source Sans
+ */
 export type FontFamily = "inter" | "space-grotesk" | "ibm-plex" | "source-sans" | "source-serif";
 
 /**
@@ -130,8 +145,12 @@ export type LogoDisplay = "text" | "image" | "both";
 
 /**
  * Visual theme block in site.json. All fields are optional; each pack's
- * manifest supplies defaults (e.g. Forge defaults to `primaryHue: 228`,
- * `defaultTheme: "light"`, `fontFamily: "inter"`).
+ * manifest supplies defaults.
+ *
+ * Pack-specific defaults:
+ *   - **Forge** — `primaryHue: 228`, `fontFamily: "inter"`, `defaultTheme: "light"`
+ *   - **Atlas** — `primaryHue: 200`, `fontFamily: "source-serif"`, `defaultTheme: "dark"`
+ *   - **Default** — no pack CSS; `defaultTheme: "system"`, no opinionated hue or font
  */
 export interface ThemeConfig {
 	pack?: ThemePack;
