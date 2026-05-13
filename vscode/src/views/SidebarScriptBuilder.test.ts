@@ -1144,4 +1144,218 @@ describe("SidebarScriptBuilder", () => {
 			expect(js.slice(start, end)).toMatch(/applyEnabled\(state\.enabled\)/);
 		});
 	});
+
+	describe("Commit Memory button visibility on the Changes section", () => {
+		// User-visible CTA must remain rendered (a) when Changes is empty (so
+		// users can discover it during onboarding before they've staged
+		// anything), AND (b) when the Changes section is collapsed (Commit
+		// Memory is a group action across Plans + Changes + Commits — folding
+		// Changes alone shouldn't hide it). It is implicitly hidden in
+		// foreign-readonly mode because the whole Changes section is dropped
+		// above the predicate. Neither items.length nor `collapsed` may gate
+		// the push site.
+		it("pushes the button on the Changes section without gating on items.length or collapsed", () => {
+			const js = buildSidebarScript();
+			// Find the push site. Must match `s.id === 'changes'` but NOT
+			// include `!collapsed` (regression — collapsing Changes hid the
+			// group CTA) nor `s.items.length` (regression — empty Changes hid
+			// the discoverability affordance).
+			const renderSectionStart = js.indexOf("function renderSection");
+			expect(renderSectionStart).toBeGreaterThan(-1);
+			const renderSectionEnd = js.indexOf(
+				"function ",
+				renderSectionStart + "function renderSection".length,
+			);
+			const body = js.slice(renderSectionStart, renderSectionEnd);
+			expect(body).toMatch(
+				/if\s*\(\s*s\.id\s*===\s*'changes'\s*\)\s*\{\s*sectionKids\.push\(renderCommitMemoryButton\(\)\)/,
+			);
+			// Defense-in-depth: neither old buggy predicate may reappear.
+			expect(body).not.toMatch(
+				/s\.items\.length\s*>\s*0[\s\S]{0,80}renderCommitMemoryButton/,
+			);
+			expect(body).not.toMatch(
+				/!collapsed[\s\S]{0,80}renderCommitMemoryButton/,
+			);
+		});
+
+		it("Changes section is dropped entirely in foreign-readonly mode (renderBranch only pushes plans/changes when !foreign)", () => {
+			const js = buildSidebarScript();
+			// The two non-Memories sections must be guarded by the foreign check
+			// so the button predicate above never has a chance to match a foreign
+			// branch tab. This is the implicit "hide the button when foreign"
+			// path: no section, no predicate match, no button.
+			const renderBranchStart = js.indexOf("function renderBranch");
+			expect(renderBranchStart).toBeGreaterThan(-1);
+			const renderBranchEnd = js.indexOf(
+				"function ",
+				renderBranchStart + "function renderBranch".length,
+			);
+			const body = js.slice(renderBranchStart, renderBranchEnd);
+			expect(body).toMatch(/const foreign\s*=\s*isViewingForeign\(\)/);
+			expect(body).toMatch(/if\s*\(\s*!foreign\s*\)/);
+		});
+	});
+
+	describe("foreign-mode memory click routes through cross-repo lookup", () => {
+		// Regression: after switching to a foreign repo/branch via the breadcrumb,
+		// clicking a row in the Branch tab's Memories section silently no-ops.
+		// Root cause: `branch:openCommit` → `jollimemory.viewSummary` →
+		// `bridge.getSummary` is single-repo. Foreign memories live in another
+		// repo's FolderStorage, so getSummary returns null and the handler's
+		// `if (!summary) return;` swallows the click. The fix: in foreign mode,
+		// route through `kb:openMemory` (→ `viewMemorySummary` → cross-repo
+		// `getSummaryAnyRepoWithSource`), same path the KB tab already uses.
+		it("commitWithMemory row click posts kb:openMemory in foreign mode", () => {
+			const js = buildSidebarScript();
+			// Locate the row-dispatch block inside tabContents.branch click handler.
+			const branchClickIdx = js.indexOf(
+				"tabContents.branch.addEventListener('click'",
+			);
+			expect(branchClickIdx).toBeGreaterThan(-1);
+			const ctxBlockIdx = js.indexOf(
+				"ctx === 'commit' || ctx === 'commitWithMemory'",
+				branchClickIdx,
+			);
+			expect(ctxBlockIdx).toBeGreaterThan(-1);
+			// The window after the predicate must show both branches:
+			// foreign → kb:openMemory; workspace → branch:openCommit.
+			const window = js.slice(ctxBlockIdx, ctxBlockIdx + 1200);
+			expect(window).toContain("isViewingForeign()");
+			expect(window).toContain("'kb:openMemory'");
+			expect(window).toContain("'branch:openCommit'");
+		});
+
+		it("inline viewSummary button routes through viewMemorySummary in foreign mode", () => {
+			const js = buildSidebarScript();
+			// Find the inline-action `viewSummary` branch inside the Branch tab
+			// click handler — the eye-icon button on commitWithMemory rows.
+			const viewSummaryIdx = js.indexOf("action === 'viewSummary'");
+			expect(viewSummaryIdx).toBeGreaterThan(-1);
+			const window = js.slice(viewSummaryIdx, viewSummaryIdx + 800);
+			// Foreign mode must dispatch the cross-repo command; workspace mode
+			// keeps the single-repo viewSummary (panel slot "commit").
+			expect(window).toContain("isViewingForeign()");
+			expect(window).toContain("'jollimemory.viewMemorySummary'");
+			expect(window).toContain("'jollimemory.viewSummary'");
+		});
+	});
+
+	describe("selection:set lazy branch-memories trigger", () => {
+		// Regression: when the user picked a foreign branch directly (without
+		// first picking a repo) the trigger guarded on state.selectedRepoName,
+		// which is undefined on that path. The request never fired, the
+		// Memories list rendered empty until the user also picked a repo.
+		// Render, isViewingForeign, and the response handler all use the
+		// `selectedX || currentX` fallback; the trigger must match.
+		it("falls back to currentRepoName/branchName when the explicit pick omits the repo", () => {
+			const js = buildSidebarScript();
+			const setStart = js.indexOf("case 'selection:set'");
+			expect(setStart).toBeGreaterThan(-1);
+			const setEnd = js.indexOf("case '", setStart + 1);
+			const block = js.slice(setStart, setEnd);
+			// Both the repo and branch must be computed via the fallback —
+			// otherwise picking only a branch (workspace repo + foreign branch)
+			// never reaches selection:requestBranchMemories.
+			expect(block).toMatch(
+				/state\.selectedRepoName\s*\|\|\s*state\.currentRepoName/,
+			);
+			expect(block).toMatch(
+				/state\.selectedBranchName\s*\|\|\s*state\.branchName/,
+			);
+			// And the resulting `repo`/`branch` locals must be what the trigger
+			// sends to the host (not the raw state.selected* properties).
+			expect(block).toMatch(
+				/selection:requestBranchMemories[\s\S]*repoName:\s*repo[\s\S]*branchName:\s*branch/,
+			);
+		});
+	});
+
+	describe("selection:invalidateBranchMemories handler", () => {
+		// Pins the three-way cache-key alignment (trigger / response / render)
+		// extended to a fourth call site: invalidate. branchMemoriesCache is
+		// session-sticky once written, so toolbar Refresh in foreign mode would
+		// be a no-op without this handler. The fallback expression here must
+		// match the other three call sites or invalidate refetches an empty key.
+		it("drops every cache entry and re-fires the request with the same fallback key", () => {
+			const js = buildSidebarScript();
+			const caseStart = js.indexOf("case 'selection:invalidateBranchMemories'");
+			expect(caseStart).toBeGreaterThan(-1);
+			const caseEnd = js.indexOf("case '", caseStart + 1);
+			const block = js.slice(caseStart, caseEnd);
+
+			// All cached keys are dropped — refresh implies the user expects a
+			// fresh read for any repo+branch they navigate to next, not just
+			// the active one.
+			expect(block).toMatch(
+				/for\s*\(\s*const\s+\w+\s+in\s+branchMemoriesCache\s*\)\s*delete/,
+			);
+			expect(block).toMatch(
+				/for\s*\(\s*const\s+\w+\s+in\s+branchMemoriesPending\s*\)\s*delete/,
+			);
+
+			// Same fallback expression as the selection:set trigger and the
+			// response-match check — drift here means refresh sends a request
+			// for one key while the render path reads from another.
+			expect(block).toMatch(
+				/state\.selectedRepoName\s*\|\|\s*state\.currentRepoName/,
+			);
+			expect(block).toMatch(
+				/state\.selectedBranchName\s*\|\|\s*state\.branchName/,
+			);
+			expect(block).toMatch(
+				/selection:requestBranchMemories[\s\S]*repoName:\s*repo[\s\S]*branchName:\s*branch/,
+			);
+		});
+	});
+
+	describe("breadcrumb dropdown filter + scrolling", () => {
+		it("renders the menu body as a search header plus a scrollable list", () => {
+			const js = buildSidebarScript();
+			// The list container is what scrolls (overflow-y is on .dropdown-list,
+			// not the outer .dropdown-menu) so the search header stays pinned.
+			expect(js).toContain("className: 'dropdown-list'");
+			expect(js).toContain("className: 'dropdown-search'");
+		});
+
+		it("only shows the filter input when the list is large enough to be worth searching", () => {
+			const js = buildSidebarScript();
+			// Threshold is encoded as a single constant so a future tweak only
+			// touches one place; keep the assertion loose enough to survive a
+			// rename but tight enough to catch a silent removal.
+			expect(js).toMatch(/SEARCH_THRESHOLD\s*=\s*\d+/);
+			expect(js).toContain("items.length >= SEARCH_THRESHOLD");
+		});
+
+		it("filters items by case-insensitive substring against the item label", () => {
+			const js = buildSidebarScript();
+			// Lowercase the query and the label, then check substring inclusion.
+			// Matching the source verbatim is brittle, but these two anchors
+			// together pin the algorithm down.
+			expect(js).toMatch(/\.toLowerCase\(\)/);
+			expect(js).toMatch(/rows\[i\]\.label\.indexOf\(q\)/);
+		});
+
+		it("toggles a 'No matches' message when the filter produces zero visible rows", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("'No matches'");
+			expect(js).toContain(
+				"emptyMsg.classList.toggle('hidden', visible !== 0)",
+			);
+		});
+
+		it("clamps the menu height to the space below the anchor so the list scrolls in-bounds", () => {
+			const js = buildSidebarScript();
+			// CSS caps at 50vh; JS tightens to whatever space is left below the
+			// anchor. Without this the dropdown overflows the viewport bottom
+			// edge with no scrollbar (the bug being fixed here).
+			expect(js).toContain("window.innerHeight - r.bottom");
+			expect(js).toContain("breadcrumbMenu.style.maxHeight");
+		});
+
+		it("focuses the filter input on open so the user can type immediately", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("searchInput.focus()");
+		});
+	});
 });

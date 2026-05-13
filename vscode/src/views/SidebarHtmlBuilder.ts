@@ -25,9 +25,24 @@
  *     drops the option cards and shows a single primary "Enable" button. The
  *     legacy disabled-banner inside the Status panel is kept for the degraded
  *     (no-workspace / no-git) fallback only.
- *   - 2 labeled tab buttons (branch / Memory Bank) + a right-side icon area
- *     holding a status indicator icon (settings moved into the Status tab toolbar)
- *   - 3 tab content panels (one shown at a time, the others have the `.hidden` class)
+ *   - A header bar (`#tab-bar`) split into two halves:
+ *       * Left: breadcrumb showing `<repo> / <branch>` with chevron dropdown
+ *         affordances. The dropdowns are populated on demand by the host via
+ *         `selection:repos` / `selection:branches` messages; when only one
+ *         repo or one branch is known, the chevron is suppressed so the row
+ *         doesn't dangle a no-op affordance. The breadcrumb text doubles as
+ *         the "what am I viewing" indicator — `branchName` lives here now
+ *         instead of inside a labeled tab.
+ *       * Right: 3 icon buttons — Memory Bank, Settings, Status. Memory Bank
+ *         and Status are toggle buttons (`data-tab="kb"` / `data-tab="status"`)
+ *         that open the corresponding overlay panel; clicking an already-active
+ *         icon collapses the overlay back to the default Branch view. Settings
+ *         posts `jollimemory.openSettings` (moved out of the Status toolbar so
+ *         configuration lives in the same row as the other top-level actions).
+ *   - 3 tab content panels (one shown at a time, the others have the `.hidden` class).
+ *     The Branch panel is the persistent default; KB / Status are toggled by
+ *     the icon buttons. Renamed user-facing string: "Commits" → "Memories"
+ *     (the section is still keyed `commits` internally for back-compat).
  *   - A disabled-state intro rendered inside the Status panel itself, used only
  *     for the degraded fallback (no workspace / no git). The standard
  *     user-disabled state shows the disabled-panel above instead.
@@ -125,15 +140,33 @@ export function buildSidebarHtml(
       </header>
       <button type="button" id="disabled-enable-btn" class="ob-btn ob-btn--primary">Enable Jolli Memory</button>
     </div>
-    <div class="tab-bar hidden" id="tab-bar" role="tablist">
-      <button class="tab active" type="button" data-tab="branch" role="tab" id="tab-button-branch"><i class="codicon codicon-git-branch tab-icon-leading" aria-hidden="true"></i><span class="tab-label">(loading)</span></button>
-      <button class="tab" type="button" data-tab="kb" role="tab" id="tab-button-kb"><i class="codicon codicon-book tab-icon-leading" aria-hidden="true"></i><span class="tab-label">MEMORY BANK</span></button>
+    <div class="tab-bar hidden" id="tab-bar" role="toolbar" aria-label="Jolli Memory header">
+      <div class="breadcrumb" id="breadcrumb">
+        <button class="breadcrumb-seg" type="button" id="breadcrumb-repo-btn" aria-haspopup="menu" aria-expanded="false">
+          <i class="codicon codicon-repo breadcrumb-seg-icon" aria-hidden="true"></i>
+          <span class="breadcrumb-seg-label" id="breadcrumb-repo-label">(repo)</span>
+          <i class="codicon codicon-chevron-down breadcrumb-seg-chevron hidden" aria-hidden="true"></i>
+        </button>
+        <span class="breadcrumb-sep" aria-hidden="true">/</span>
+        <button class="breadcrumb-seg" type="button" id="breadcrumb-branch-btn" aria-haspopup="menu" aria-expanded="false">
+          <i class="codicon codicon-git-branch breadcrumb-seg-icon" aria-hidden="true"></i>
+          <span class="breadcrumb-seg-label" id="breadcrumb-branch-label">(loading)</span>
+          <i class="codicon codicon-chevron-down breadcrumb-seg-chevron hidden" aria-hidden="true"></i>
+        </button>
+      </div>
       <div class="tab-bar-right">
-        <button class="tab tab-icon" type="button" data-tab="status" id="status-icon-btn">
+        <button class="tab tab-icon" type="button" data-tab="kb" id="kb-icon-btn" aria-label="Memory Bank">
+          <i class="codicon codicon-book" aria-hidden="true"></i>
+        </button>
+        <button class="tab tab-icon" type="button" data-action="open-settings" id="settings-icon-btn" aria-label="Settings">
+          <i class="codicon codicon-gear" aria-hidden="true"></i>
+        </button>
+        <button class="tab tab-icon" type="button" data-tab="status" id="status-icon-btn" aria-label="Status">
           <i class="codicon codicon-circle-filled"></i>
         </button>
       </div>
     </div>
+    <div class="dropdown-menu hidden" id="breadcrumb-menu" role="menu"></div>
     <div class="tab-toolbar hidden" id="tab-toolbar"></div>
     <div class="tab-content hidden" id="tab-content-kb"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-branch"><p class="placeholder">Loading...</p></div>

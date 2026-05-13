@@ -287,4 +287,173 @@ describe("DualWriteStorage", () => {
 		const dual = new DualWriteStorage(primary, shadow);
 		await expect(dual.writeFiles([{ path: "ok.txt", content: "data" }], "write")).resolves.toBeUndefined();
 	});
+
+	describe("deleteVisibleMarkdown delegation", () => {
+		it("delegates to the folder-side provider", async () => {
+			const folderDelete = vi.fn().mockResolvedValue(undefined);
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				deleteVisibleMarkdown: folderDelete,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			const entry = {
+				commitHash: "deadbeef",
+				parentCommitHash: null,
+				commitMessage: "Add login",
+				commitDate: "2026-05-12T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-05-12T00:00:00Z",
+			};
+			await dual.deleteVisibleMarkdown(entry);
+			expect(folderDelete).toHaveBeenCalledWith(entry);
+		});
+
+		it("is a no-op when the folder side lacks the method", async () => {
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			await expect(
+				dual.deleteVisibleMarkdown({
+					commitHash: "deadbeef",
+					parentCommitHash: null,
+					commitMessage: "x",
+					commitDate: "2026-05-12T00:00:00Z",
+					branch: "main",
+					generatedAt: "2026-05-12T00:00:00Z",
+				}),
+			).resolves.toBeUndefined();
+		});
+
+		it("marks dirty when the folder side throws", async () => {
+			const folderDelete = vi.fn().mockRejectedValue(new Error("disk gone"));
+			const markDirty = vi.fn();
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				deleteVisibleMarkdown: folderDelete,
+				markDirty,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			await dual.deleteVisibleMarkdown({
+				commitHash: "deadbeef",
+				parentCommitHash: null,
+				commitMessage: "x",
+				commitDate: "2026-05-12T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-05-12T00:00:00Z",
+			});
+			expect(markDirty).toHaveBeenCalled();
+		});
+	});
+
+	describe("regenerateVisibleMarkdown delegation", () => {
+		const entry = {
+			commitHash: "deadbeef",
+			parentCommitHash: null,
+			commitMessage: "Restore me",
+			commitDate: "2026-05-12T00:00:00Z",
+			branch: "main",
+			generatedAt: "2026-05-12T00:00:00Z",
+		};
+
+		it("delegates to the folder-side provider and propagates the boolean result", async () => {
+			const folderRegen = vi.fn().mockResolvedValue(true);
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				regenerateVisibleMarkdown: folderRegen,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			const ok = await dual.regenerateVisibleMarkdown(entry);
+			expect(folderRegen).toHaveBeenCalledWith(entry);
+			expect(ok).toBe(true);
+		});
+
+		it("returns false when the folder side lacks the method (no visible layer)", async () => {
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			await expect(dual.regenerateVisibleMarkdown(entry)).resolves.toBe(false);
+		});
+
+		it("marks dirty and returns false when the folder side throws", async () => {
+			const folderRegen = vi.fn().mockRejectedValue(new Error("disk gone"));
+			const markDirty = vi.fn();
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				regenerateVisibleMarkdown: folderRegen,
+				markDirty,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			const ok = await dual.regenerateVisibleMarkdown(entry);
+			expect(ok).toBe(false);
+			expect(markDirty).toHaveBeenCalled();
+		});
+	});
 });

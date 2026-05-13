@@ -51,7 +51,9 @@ import {
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
+import { cleanupBranchStaleChildMarkdown } from "../core/StaleChildMarkdownCleanup.js";
 import { createStorage } from "../core/StorageFactory.js";
+import type { StorageProvider } from "../core/StorageProvider.js";
 import {
 	extractTicketIdFromMessage,
 	generateSquashConsolidation,
@@ -239,7 +241,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 				// exit cleanly. The subsequent chain-spawn (line below) picks up leftovers.
 				if (processedCount >= MAX_ENTRIES_PER_RUN) break;
 				try {
-					await processQueueEntry(op, cwd, force);
+					await processQueueEntry(op, cwd, storage, force);
 				} catch (error: unknown) {
 					// Queue entries are deleted regardless of success or failure (fire-and-forget).
 					// Retry is intentionally not implemented: pipeline steps (transcript cursor
@@ -287,7 +289,12 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
  * Processes a single queue entry based on its type.
  * Called by runWorker() for each entry in the queue.
  */
-async function processQueueEntry(op: GitOperation, cwd: string, force: boolean): Promise<void> {
+async function processQueueEntry(
+	op: GitOperation,
+	cwd: string,
+	storage: StorageProvider,
+	force: boolean,
+): Promise<void> {
 	log.info("Processing queue entry: type=%s hash=%s", op.type, op.commitHash.substring(0, 8));
 
 	switch (op.type) {
@@ -313,6 +320,34 @@ async function processQueueEntry(op: GitOperation, cwd: string, force: boolean):
 
 		default:
 			log.warn("Unknown queue entry type: %s", (op as GitOperation).type);
+	}
+
+	// Tail step: prune visible .md files for hoisted older versions
+	// (`parentCommitHash != null`) on the branch the op landed on. Reading
+	// the live branch would point at the wrong tree if the user has `git
+	// checkout`'d away between enqueue and drain, so we use op.branch (set
+	// by every hook in this version). Pre-0.99.x queue entries that lack
+	// op.branch are skipped — guessing the live branch is exactly the bug
+	// the captured field is meant to prevent. Failures MUST NOT roll back
+	// the op.
+	if (!op.branch) {
+		log.warn(
+			"Stale-child cleanup skipped for %s: queue entry has no branch field (pre-0.99.x format)",
+			op.commitHash.substring(0, 8),
+		);
+		return;
+	}
+	try {
+		const { deleted, failed } = await cleanupBranchStaleChildMarkdown(cwd, op.branch, storage);
+		if (deleted > 0 || failed > 0) {
+			log.info("Stale-child cleanup on %s: deleted=%d failed=%d", op.branch, deleted, failed);
+		}
+	} catch (err) {
+		log.warn(
+			"Stale-child cleanup tail step failed for %s: %s",
+			op.commitHash.substring(0, 8),
+			err instanceof Error ? err.message : String(err),
+		);
 	}
 }
 
@@ -1625,6 +1660,7 @@ export const __test__ = {
 	handleSquashFromQueue,
 	loadSessionTranscripts,
 	buildStoredTranscript,
+	processQueueEntry,
 };
 
 /**

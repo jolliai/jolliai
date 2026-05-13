@@ -51,4 +51,18 @@ describe("SummaryCssBuilder", () => {
 		expect(css).toContain("--callout-detail-bg");
 		expect(css).toContain("--callout-detail-label");
 	});
+
+	// ─── Foreign-repo read-only mode ──────────────────────────────────────
+	// SummaryHtmlBuilder marks .page with `foreign-readonly` when the loaded
+	// summary belongs to a non-current repo. The CSS below hides every
+	// destructive control. PR section is NOT hidden — checkPrStatus is
+	// reachable in foreign mode via gh `--repo <remoteUrl>` so the panel
+	// still surfaces the foreign repo's PR (read-only).
+	describe("foreign-readonly mode", () => {
+		it("hides every non-whitelisted button under .page.foreign-readonly", () => {
+			expect(css).toMatch(
+				/\.page\.foreign-readonly\s+button:not\(\[data-foreign-safe\]\)\s*\{[^}]*display:\s*none/,
+			);
+		});
+	});
 });

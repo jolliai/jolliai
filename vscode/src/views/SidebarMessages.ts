@@ -44,6 +44,30 @@ export interface SidebarState {
 	readonly branchName: string;
 	readonly detached: boolean;
 	/**
+	 * Display name of the workspace's repo. Used as the left segment of the
+	 * header breadcrumb and as the "home" anchor for the cross-repo dropdown.
+	 * Optional during early-init / degraded modes where extractRepoName has not
+	 * yet run; the webview falls back to "(workspace)" when undefined.
+	 */
+	readonly currentRepoName?: string;
+	/**
+	 * Which repo the user is currently *viewing* through the breadcrumb. When
+	 * equal to currentRepoName (or undefined), the sidebar is in normal mode.
+	 * When different, the sidebar is in foreign-readonly mode — Plans & Notes
+	 * and Changes are hidden; the Memories list drops its checkboxes and
+	 * squash/push toolbar buttons. The host is responsible for refilling the
+	 * branch:* data feeds with the selected repo's content; this field is
+	 * the renderer's signal to switch to read-only chrome.
+	 */
+	readonly selectedRepoName?: string;
+	/**
+	 * Which branch is being viewed inside the selected repo. Same readonly
+	 * semantics as selectedRepoName: when this differs from branchName (the
+	 * workspace's actual HEAD) the sidebar enters foreign-readonly mode even
+	 * if the repo matches. Undefined = "viewing the workspace branch".
+	 */
+	readonly selectedBranchName?: string;
+	/**
 	 * Set when activate() couldn't complete its normal init (no workspace folder
 	 * open, or workspace isn't a git repo). The webview swaps the standard
 	 * disabled banner for a reason-specific CTA (Open Folder / Initialize Git).
@@ -213,9 +237,62 @@ export interface MemoryHover {
 	readonly shortHash: string;
 }
 
+/**
+ * Minimal projection of `SummaryIndexEntry` for the foreign-readonly Branch
+ * tab Memories section. Carries just the display fields the webview's
+ * commit-row renderer reads, so the wire payload stays small. Does NOT
+ * collapse amend/rebase chains — one item per stored summary file.
+ */
+export interface BranchMemoryItem {
+	readonly commitHash: string;
+	/** Commit message (first line; rendered as the row's primary label). */
+	readonly title: string;
+	/** Branch name as stored in the index. */
+	readonly branch: string;
+	/** Repo name (echoed from the request so the webview can key its cache). */
+	readonly repoName: string;
+	/** ms since epoch derived from `commitDate` / `generatedAt`. */
+	readonly timestamp: number;
+}
+
+/**
+ * Entry in the breadcrumb repo dropdown. `repoName` is the display label and
+ * the selector key; `remoteUrl` is forwarded to the host so a cross-repo
+ * memory fetch can pin its remote-bound queries (e.g. `gh pr view --repo
+ * <url>`) without re-deriving them. `isCurrent` flags the workspace's own
+ * repo so the dropdown can sort / style it specially.
+ */
+export interface RepoChoice {
+	readonly repoName: string;
+	readonly remoteUrl?: string;
+	readonly isCurrent: boolean;
+}
+
 export type SidebarOutboundMsg =
 	| { readonly type: "ready" }
 	| { readonly type: "tab:switched"; readonly tab: SidebarTab }
+	| {
+			/**
+			 * Webview asks the host to materialize the breadcrumb selection
+			 * change. Host responds by repopulating branch:* feeds with the
+			 * selected repo+branch and (eventually) by pushing a `selection:set`
+			 * confirmation. Either field undefined = "stay on current".
+			 */
+			readonly type: "selection:request";
+			readonly repoName?: string;
+			readonly branchName?: string;
+	  }
+	| {
+			/**
+			 * Foreign-readonly Branch tab can't derive its Memories section
+			 * from `branchData.commits` (workspace-HEAD-bound) — webview asks
+			 * the host for all memories on the picked repo+branch instead.
+			 * Host responds with `selection:branchMemories`.
+			 */
+			readonly type: "selection:requestBranchMemories";
+			readonly repoName: string;
+			readonly branchName: string;
+	  }
 	| { readonly type: "kb:setMode"; readonly mode: KbMode }
 	| { readonly type: "kb:expandFolder"; readonly path: string }
 	| { readonly type: "kb:openFile"; readonly path: string }
@@ -335,6 +412,60 @@ export type SidebarInboundMsg =
 	| { readonly type: "auth:changed"; readonly authenticated: boolean }
 	| { readonly type: "configured:changed"; readonly configured: boolean }
 	| { readonly type: "worker:busy"; readonly busy: boolean }
+	| {
+			/**
+			 * Push the list of repos discoverable under the Memory Bank parent.
+			 * Drives the breadcrumb repo dropdown. When `repos.length <= 1`, the
+			 * webview hides the dropdown affordance entirely (no point offering
+			 * a switcher with one option).
+			 */
+			readonly type: "selection:repos";
+			readonly repos: ReadonlyArray<RepoChoice>;
+	  }
+	| {
+			/**
+			 * Push the list of branches available inside the currently selected
+			 * repo. Re-sent whenever the user switches repos.
+			 */
+			readonly type: "selection:branches";
+			readonly repoName: string;
+			readonly branches: ReadonlyArray<string>;
+	  }
+	| {
+			/**
+			 * Host confirms the breadcrumb selection has been applied. The
+			 * webview adopts these values and recomputes its readonly chrome.
+			 * `repoName === currentRepoName && branchName === workspace branch`
+			 * means "back to normal mode".
+			 */
+			readonly type: "selection:set";
+			readonly repoName?: string;
+			readonly branchName?: string;
+	  }
+	| {
+			/**
+			 * Response to `selection:requestBranchMemories`. Items are the raw
+			 * unfiltered SummaryIndexEntry projection for the requested
+			 * repo+branch — includes amend/rebase children that the global
+			 * KB Memories list collapses out. Used only by the foreign-readonly
+			 * Branch tab Memories section.
+			 */
+			readonly type: "selection:branchMemories";
+			readonly repoName: string;
+			readonly branchName: string;
+			readonly items: ReadonlyArray<BranchMemoryItem>;
+	  }
+	| {
+			/**
+			 * Host tells the webview to drop its `branchMemoriesCache` (and any
+			 * in-flight `branchMemoriesPending` marker) and re-trigger the lazy
+			 * `selection:requestBranchMemories` fetch for the active foreign
+			 * selection. Sent on toolbar Refresh — without this signal the
+			 * session-sticky cache would never re-fetch, leaving the Memories
+			 * panel pinned to whatever the first selection load returned.
+			 */
+			readonly type: "selection:invalidateBranchMemories";
+	  }
 	| {
 			/**
 			 * Posted only on the failure path of the inline onboarding API key

@@ -362,6 +362,234 @@ describe("FolderStorage", () => {
 		});
 	});
 
+	describe("deleteVisibleMarkdown", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		it("deletes the visible md file and leaves .jolli/ untouched", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "deadbeef12345678",
+				commitMessage: "Add login",
+				branch: "feature/login",
+			});
+			await storage.writeFiles([{ path: "summaries/deadbeef12345678.json", content: summaryJson }], "seed");
+
+			const visiblePath = join(rootPath, "feature-login", "add-login-deadbeef.md");
+			expect(existsSync(visiblePath)).toBe(true);
+
+			await storage.deleteVisibleMarkdown({
+				commitHash: "deadbeef12345678",
+				commitMessage: "Add login",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "feature/login",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(existsSync(visiblePath)).toBe(false);
+			// Hidden JSON intact.
+			const hiddenPath = join(rootPath, ".jolli", "summaries", "deadbeef12345678.json");
+			expect(existsSync(hiddenPath)).toBe(true);
+		});
+
+		it("is idempotent on a missing file (no throw)", async () => {
+			await expect(
+				storage.deleteVisibleMarkdown({
+					commitHash: "ffffffffffffffff",
+					commitMessage: "ghost",
+					commitDate: "2026-01-15T10:00:00Z",
+					branch: "ghost-branch",
+					generatedAt: "2026-01-15T10:00:00Z",
+					parentCommitHash: null,
+				}),
+			).resolves.toBeUndefined();
+		});
+
+		it("preserves a hand-edited md (fingerprint mismatch — same protection cleanupSupersededDescendants gives at write time)", async () => {
+			// Regression: cleanupBranchStaleChildMarkdown (called by QueueWorker
+			// tail and MigrationEngine) routes through this method to delete
+			// hoisted older versions. Without fingerprint protection here, a
+			// user who hand-edited a stale child MD before the worker drained
+			// would silently lose those edits — only the write-time path's
+			// cleanupSupersededDescendants protected them, and that path is not
+			// involved in the tail-cleanup or migration flows.
+			const summaryJson = makeSummaryJson({
+				commitHash: "deadbeef12345678",
+				commitMessage: "Add login",
+				branch: "feature/login",
+			});
+			await storage.writeFiles([{ path: "summaries/deadbeef12345678.json", content: summaryJson }], "seed");
+
+			const visiblePath = join(rootPath, "feature-login", "add-login-deadbeef.md");
+			expect(existsSync(visiblePath)).toBe(true);
+
+			writeFileSync(visiblePath, "# Hand-edited\n\nUser changed this", "utf-8");
+
+			await storage.deleteVisibleMarkdown({
+				commitHash: "deadbeef12345678",
+				commitMessage: "Add login",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "feature/login",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: "newroot1234567890",
+			});
+
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(readFileSync(visiblePath, "utf-8")).toContain("Hand-edited");
+			expect(metadataManager.findById("deadbeef12345678")).toBeDefined();
+		});
+
+		it("drops the manifest entry alongside the visible md on successful delete", async () => {
+			// Mirrors cleanupSupersededDescendants' "ghost entry" cleanup: if we
+			// removed the file but kept the manifest record, future migrations
+			// / scans would re-trip on a path that no longer exists.
+			const summaryJson = makeSummaryJson({
+				commitHash: "cafe1234cafe1234",
+				commitMessage: "Add cafe",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/cafe1234cafe1234.json", content: summaryJson }], "seed");
+			expect(metadataManager.findById("cafe1234cafe1234")).toBeDefined();
+
+			await storage.deleteVisibleMarkdown({
+				commitHash: "cafe1234cafe1234",
+				commitMessage: "Add cafe",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: "newroot1234567890",
+			});
+
+			expect(metadataManager.findById("cafe1234cafe1234")).toBeUndefined();
+		});
+
+		it("leaves the <branch>/ directory in place after the last md is removed", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "aaaa11112222bbbb",
+				commitMessage: "Solo entry",
+				branch: "lone-branch",
+			});
+			await storage.writeFiles([{ path: "summaries/aaaa11112222bbbb.json", content: summaryJson }], "seed");
+
+			await storage.deleteVisibleMarkdown({
+				commitHash: "aaaa11112222bbbb",
+				commitMessage: "Solo entry",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "lone-branch",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			const branchDir = join(rootPath, "lone-branch");
+			expect(existsSync(branchDir)).toBe(true);
+		});
+	});
+
+	describe("regenerateVisibleMarkdown", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		it("re-emits the visible md from hidden JSON when the .md is missing", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "deadbeef12345678",
+				commitMessage: "Restore me",
+				branch: "feature/restore",
+			});
+			// Seed both hidden + visible.
+			await storage.writeFiles([{ path: "summaries/deadbeef12345678.json", content: summaryJson }], "seed");
+			const visiblePath = join(rootPath, "feature-restore", "restore-me-deadbeef.md");
+			expect(existsSync(visiblePath)).toBe(true);
+			// Simulate post-0.99.2 disk state: head .md deleted, hidden JSON intact.
+			require("node:fs").unlinkSync(visiblePath);
+			expect(existsSync(visiblePath)).toBe(false);
+
+			const wrote = await storage.regenerateVisibleMarkdown({
+				commitHash: "deadbeef12345678",
+				commitMessage: "Restore me",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "feature/restore",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(wrote).toBe(true);
+			expect(existsSync(visiblePath)).toBe(true);
+		});
+
+		it("returns true and is a no-op when the visible md already exists", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "cafebabe12345678",
+				commitMessage: "Already here",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/cafebabe12345678.json", content: summaryJson }], "seed");
+			const visiblePath = join(rootPath, "main", "already-here-cafebabe.md");
+			const before = require("node:fs").readFileSync(visiblePath, "utf-8");
+
+			const wrote = await storage.regenerateVisibleMarkdown({
+				commitHash: "cafebabe12345678",
+				commitMessage: "Already here",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(wrote).toBe(true);
+			// File untouched (idempotent fast path).
+			const after = require("node:fs").readFileSync(visiblePath, "utf-8");
+			expect(after).toBe(before);
+		});
+
+		it("returns false when hidden JSON source is missing — cannot regenerate", async () => {
+			const wrote = await storage.regenerateVisibleMarkdown({
+				commitHash: "ffffffffffffffff",
+				commitMessage: "Lost summary",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "ghost-branch",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(wrote).toBe(false);
+		});
+
+		it("preserves existing manifest title when regenerating (companion of backfillTitle)", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "feedbabe12345678",
+				commitMessage: "Auto-generated message",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/feedbabe12345678.json", content: summaryJson }], "seed");
+			// Simulate user-edited title in manifest, then delete the .md to mimic
+			// the post-0.99.2 disk state.
+			const mm = new MetadataManager(join(rootPath, ".jolli"));
+			mm.updateManifest({
+				path: "main/auto-generated-message-feedbabe.md",
+				fileId: "feedbabe12345678",
+				type: "commit",
+				fingerprint: "fp",
+				source: { commitHash: "feedbabe12345678", branch: "main" },
+				title: "Hand-edited title",
+			});
+			require("node:fs").unlinkSync(join(rootPath, "main", "auto-generated-message-feedbabe.md"));
+
+			await storage.regenerateVisibleMarkdown({
+				commitHash: "feedbabe12345678",
+				commitMessage: "Auto-generated message",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			// .md regenerated, but manifest title preserved.
+			expect(mm.findById("feedbabe12345678")?.title).toBe("Hand-edited title");
+		});
+	});
+
 	describe("slugify", () => {
 		it("basic message", () => {
 			expect(FolderStorage.slugify("Add login feature")).toBe("add-login-feature");

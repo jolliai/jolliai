@@ -75,6 +75,11 @@ vi.mock("../core/StorageFactory.js", () => ({
 	}),
 }));
 
+vi.mock("../core/StaleChildMarkdownCleanup.js", () => ({
+	cleanupBranchStaleChildMarkdown: vi.fn().mockResolvedValue({ deleted: 0, failed: 0 }),
+	cleanupAllBranchesStaleChildMarkdown: vi.fn().mockResolvedValue({ deleted: 0, failed: 0 }),
+}));
+
 vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/SummaryStore.js")>();
 	return {
@@ -212,6 +217,7 @@ import {
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
+import { cleanupBranchStaleChildMarkdown } from "../core/StaleChildMarkdownCleanup.js";
 import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary } from "../core/SummaryStore.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
@@ -951,6 +957,114 @@ describe("QueueWorker", () => {
 				expect.objectContaining({ commitSource: "cli", commitType: "squash" }),
 				expect.objectContaining({ topics: expect.any(Array) }),
 			);
+		});
+	});
+
+	describe("post-op stale-child cleanup", () => {
+		const mockStorage = {
+			readFile: vi.fn(),
+			writeFiles: vi.fn(),
+			listFiles: vi.fn(),
+			exists: vi.fn().mockResolvedValue(true),
+			ensure: vi.fn(),
+			deleteVisibleMarkdown: vi.fn(),
+		};
+
+		beforeEach(() => {
+			vi.mocked(cleanupBranchStaleChildMarkdown).mockClear();
+			vi.mocked(cleanupBranchStaleChildMarkdown).mockResolvedValue({
+				deleted: 0,
+				failed: 0,
+			});
+			// getCurrentBranch is consumed by the tail cleanup step regardless of op
+			// type; setupPipelineMocks() at the top of every other test rebuilds the
+			// full mock pack, but here we only need the branch reader.
+			vi.mocked(getCurrentBranch).mockResolvedValue("feature/test");
+		});
+
+		// Use op.type === "rebase-pick" with no sourceHashes: the handler early-
+		// returns at the top of handleRebasePickFromQueue without any LLM /
+		// transcript machinery, so processQueueEntry's switch falls through cleanly
+		// into the tail cleanup. This isolates the test to the cleanup wiring.
+		it("invokes cleanupBranchStaleChildMarkdown after the op handler returns", async () => {
+			await __test__.processQueueEntry(
+				{
+					type: "rebase-pick",
+					commitHash: "deadbeef1234567890abcdef0123456789abcdef",
+					branch: "feature/test",
+					createdAt: new Date().toISOString(),
+				} as never,
+				"/test/cwd",
+				mockStorage as never,
+				false,
+			);
+
+			expect(cleanupBranchStaleChildMarkdown).toHaveBeenCalledWith("/test/cwd", "feature/test", mockStorage);
+		});
+
+		it("swallows cleanup errors — the op succeeds even when cleanup throws", async () => {
+			vi.mocked(cleanupBranchStaleChildMarkdown).mockRejectedValueOnce(new Error("disk-gone"));
+
+			await expect(
+				__test__.processQueueEntry(
+					{
+						type: "rebase-pick",
+						commitHash: "feedface1234567890abcdef0123456789abcdef",
+						branch: "feature/test",
+						createdAt: new Date().toISOString(),
+					} as never,
+					"/test/cwd",
+					mockStorage as never,
+					false,
+				),
+			).resolves.toBeUndefined();
+		});
+
+		// Regression: the tail step used to read getCurrentBranch(cwd) every
+		// time, which is wrong when the user has `git checkout`'d to a different
+		// branch between enqueue and drain. The cleanup would then prune the
+		// wrong branch's directory and leave the original branch's hoisted
+		// older versions stranded on disk. The branch must come from the queued
+		// op (captured at enqueue time inside the git hook).
+		it("uses op.branch for cleanup, not the live getCurrentBranch", async () => {
+			// Simulate: enqueued on feature/A, user has since switched to main.
+			vi.mocked(getCurrentBranch).mockResolvedValue("main");
+
+			await __test__.processQueueEntry(
+				{
+					type: "rebase-pick",
+					commitHash: "deadbeef1234567890abcdef0123456789abcdef",
+					branch: "feature/A",
+					createdAt: new Date().toISOString(),
+				} as never,
+				"/test/cwd",
+				mockStorage as never,
+				false,
+			);
+
+			expect(cleanupBranchStaleChildMarkdown).toHaveBeenCalledWith("/test/cwd", "feature/A", mockStorage);
+			expect(cleanupBranchStaleChildMarkdown).not.toHaveBeenCalledWith("/test/cwd", "main", mockStorage);
+		});
+
+		it("skips cleanup (no live-branch fallback) when op.branch is missing", async () => {
+			// Stale on-disk queue entries from before the branch-recording
+			// landed have no op.branch. The conservative choice is to skip
+			// rather than fall through to getCurrentBranch — falling through
+			// is precisely the bug we're fixing.
+			vi.mocked(getCurrentBranch).mockResolvedValue("main");
+
+			await __test__.processQueueEntry(
+				{
+					type: "rebase-pick",
+					commitHash: "feedface1234567890abcdef0123456789abcdef",
+					createdAt: new Date().toISOString(),
+				} as never,
+				"/test/cwd",
+				mockStorage as never,
+				false,
+			);
+
+			expect(cleanupBranchStaleChildMarkdown).not.toHaveBeenCalled();
 		});
 	});
 });

@@ -53,4 +53,23 @@ export interface MigrationState {
 	readonly migratedEntries: number;
 	readonly failedHashes?: readonly string[];
 	readonly lastMigratedHash?: string;
+	/**
+	 * v2 leaf-cleanup step (shipped briefly in 0.99.2, never read after that
+	 * release). Its algorithm was inverted under v4 Hoist semantics — it kept
+	 * stale children and deleted heads. Retained in the type purely so existing
+	 * on-disk migration.json entries that carry this field still parse; the
+	 * field is never written or read by code after 0.99.2.
+	 * @deprecated use {@link staleChildCleanup} instead.
+	 */
+	readonly leafCleanup?: { readonly completedAt: string };
+	/**
+	 * v3 stale-child cleanup step (added 2026-05-12 to replace the inverted
+	 * `leafCleanup` from 0.99.2): one-shot deletion of visible .md files for
+	 * v4 Hoist hoisted children (entries with `parentCommitHash != null`),
+	 * combined with one-shot regeneration of head .md files erroneously
+	 * deleted by 0.99.2's inverted pass. `completedAt` set on first successful
+	 * run; subsequent activate runs skip when present. Absent = not yet
+	 * attempted (or only the 0.99.2 inverted pass ran — re-run is required).
+	 */
+	readonly staleChildCleanup?: { readonly completedAt: string };
 }

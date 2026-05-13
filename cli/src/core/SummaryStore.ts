@@ -1529,12 +1529,18 @@ async function loadIndex(cwd?: string, storage?: StorageProvider): Promise<Summa
 	if (!content) {
 		// Surface as warn: in a healthy installation the index always exists
 		// once any summary has been generated. A null read here means either
-		// (a) fresh repo / no summaries yet, or (b) git failed to read from
-		// the orphan branch — `store.readFile` swallows the underlying git
-		// error and returns null, so production needs the warn to notice (b).
-		// Callers (`getSummary`, `listSummaries`, …) treat this as "nothing
-		// to return" rather than throwing, so the warn is the only signal.
-		log.warn("loadIndex: index.json unreadable from orphan branch (fresh repo or git read failed)");
+		// (a) fresh repo / no summaries yet, or (b) the backend's read failed
+		// (git plumbing for OrphanBranchStorage; fs/EACCES for FolderStorage)
+		// — `store.readFile` swallows the underlying error and returns null,
+		// so production needs the warn to notice (b). Callers (`getSummary`,
+		// `listSummaries`, …) treat this as "nothing to return" rather than
+		// throwing, so the warn is the only signal. Tagging the storage class
+		// keeps cross-repo foreign reads (FolderStorage on a sibling Memory
+		// Bank) from being misread as workspace orphan-branch failures.
+		log.warn(
+			"loadIndex: index.json unreadable from %s (fresh repo or backend read failed)",
+			store.constructor.name,
+		);
 		return null;
 	}
 

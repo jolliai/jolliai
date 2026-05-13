@@ -635,6 +635,12 @@ export function activate(context: vscode.ExtensionContext): void {
 			kbMode: "folders",
 			branchName: currentBranchName,
 			detached: currentBranchDetached,
+			// Display name of the workspace's repo — feeds the left half of the
+			// header breadcrumb. Without this the webview shows `(workspace)`
+			// as a placeholder and `isViewingForeign()` can't compare repo
+			// identity, so foreign-readonly chrome stays inactive even after
+			// the user picks another repo from the dropdown.
+			currentRepoName: sidebarRepoName,
 		}),
 		extensionUri: context.extensionUri,
 		statusProvider: {
@@ -665,6 +671,31 @@ export function activate(context: vscode.ExtensionContext): void {
 			getMode: historyProvider.getMode.bind(historyProvider),
 		},
 		kbFolders: kbFoldersService,
+		// Breadcrumb dropdowns. The discoverRepos output carries `kbRoot` /
+		// `dirName` fields that the webview doesn't need (selector key is
+		// the configured repoName, with remoteUrl forwarded for cross-repo
+		// PR lookups); flatten to RepoChoice here so SidebarMessages stays
+		// the single source of truth for what crosses the wire.
+		selection: {
+			listRepos: () =>
+				kbFoldersService.listRepos().map((r) => ({
+					repoName: r.repoName,
+					remoteUrl: r.remoteUrl ?? undefined,
+					isCurrent: r.isCurrentRepo,
+				})),
+			listBranches: (repoName: string) =>
+				kbFoldersService.listBranches(repoName),
+			listBranchMemories: async (repoName: string, branchName: string) => {
+				const entries = await bridge.listBranchMemories(repoName, branchName);
+				return entries.map((e) => ({
+					commitHash: e.commitHash,
+					title: e.commitMessage.split("\n")[0] || e.commitHash.slice(0, 8),
+					branch: e.branch,
+					repoName: e.repoName ?? repoName,
+					timestamp: Date.parse(e.commitDate || e.generatedAt) || 0,
+				}));
+			},
+		},
 		// relPath's first segment is now a repo directory name under
 		// <kbParent>; join'ing on kbParent gives back the absolute on-disk
 		// path. Same shape as the IntelliJ Memory Bank tree.
@@ -829,11 +860,20 @@ export function activate(context: vscode.ExtensionContext): void {
 			initializeKBFolder(kbRoot, repoName, remoteUrl);
 
 			// Auto-migrate if orphan branch has data but migration not completed.
-			// This covers two real-world entry points: (1) fresh install of the
-			// folder-mode extension on a repo previously using orphan storage, and
-			// (2) the user manually wiped the KB folder (which also nukes
-			// migration.json, making readMigrationState() return null and forcing
-			// a re-migration).
+			// Three entry points:
+			//   (1) Fresh install of the folder-mode extension on a repo
+			//       previously using orphan storage.
+			//   (2) User manually wiped the KB folder (which also nukes
+			//       migration.json, making readMigrationState() return null
+			//       and forcing a re-migration).
+			//   (3) Already-migrated user whose v1 migration completed before
+			//       v3 stale-child cleanup shipped (or who only got 0.99.2's
+			//       inverted leaf-only pass, which mistakenly deleted heads
+			//       and kept hoisted children). runStaleChildCleanup is
+			//       idempotent via state.staleChildCleanup.completedAt; we
+			//       intentionally do NOT look at state.leafCleanup — that
+			//       legacy flag tracked the inverted pass and must not block
+			//       the corrective re-run.
 			const orphan = new OrphanBranchStorage(workspaceRoot);
 			if (await orphan.exists()) {
 				const mm = new MetadataManager(join(kbRoot, ".jolli"));
@@ -854,6 +894,16 @@ export function activate(context: vscode.ExtensionContext): void {
 					// until the user clicks Refresh — a UX bug that surfaces every
 					// post-wipe reload. Push a reset so the client re-fetches once
 					// migration's writes are on disk.
+					sidebarProvider.refreshKnowledgeBaseFolders();
+				} else if (!migrationState.staleChildCleanup?.completedAt) {
+					const folder = new FolderStorage(kbRoot, mm);
+					await folder.ensure();
+					const engine = new MigrationEngine(orphan, folder, mm);
+					const result = await engine.runStaleChildCleanup();
+					log.info(
+						"activate",
+						`KB v3 stale-child cleanup: completedAt=${result.staleChildCleanup?.completedAt ?? "n/a"}`,
+					);
 					sidebarProvider.refreshKnowledgeBaseFolders();
 				}
 			}
@@ -1815,7 +1865,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				// actions (push/edit) when the summary is from a foreign repo,
 				// since those handlers all write to `workspaceRoot`'s git/
 				// orphan branch and would silently corrupt the wrong project.
-				const { summary, sourceRepoName } =
+				const { summary, sourceRepoName, sourceRemoteUrl } =
 					await bridge.getSummaryAnyRepoWithSource(hash);
 				if (!summary) {
 					vscode.window.showInformationMessage(
@@ -1831,6 +1881,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					commitsStore.getMainBranch(),
 					"memory",
 					sourceRepoName,
+					sourceRemoteUrl,
 				);
 			},
 		),
@@ -1857,11 +1908,16 @@ export function activate(context: vscode.ExtensionContext): void {
 				if (meta) {
 					// Memory Bank folder view shows every repo under the parent
 					// (`localFolder`), so a clicked summary .md may belong to a
-					// non-current repo. Use the cross-repo lookup so the rich
-					// SummaryWebviewPanel renders for foreign-repo memories too;
-					// otherwise we'd silently fall through to plain markdown
-					// preview, losing the push / copy-as-recall affordances.
-					const summary = await bridge.getSummaryAnyRepo(meta.commitHash);
+					// non-current repo. Use the provenance-bearing cross-repo
+					// lookup so the rich SummaryWebviewPanel renders for
+					// foreign-repo memories AND learns which repo the summary
+					// came from. Without `sourceRepoName`, the panel would
+					// allow destructive commands (push / edit / createPr) that
+					// write to `workspaceRoot`'s git / orphan branch — silently
+					// pushing a foreign repo's memory to the *current* repo's
+					// Jolli Memory space, corrupting the wrong project.
+					const { summary, sourceRepoName, sourceRemoteUrl } =
+						await bridge.getSummaryAnyRepoWithSource(meta.commitHash);
 					if (summary) {
 						await SummaryWebviewPanel.show(
 							summary,
@@ -1870,6 +1926,8 @@ export function activate(context: vscode.ExtensionContext): void {
 							bridge,
 							commitsStore.getMainBranch(),
 							"kb",
+							sourceRepoName,
+							sourceRemoteUrl,
 						);
 						return;
 					}
@@ -2143,13 +2201,18 @@ export function activate(context: vscode.ExtensionContext): void {
 				// Cross-repo: external deep links into vscode://…/summary/<sha> may
 				// target a memory whose summary lives in a non-current repo under
 				// the Memory Bank parent (e.g. a Slack link pasted while a different
-				// workspace is open). Use getSummaryAnyRepo so the deep link resolves
-				// against the same aggregated view the Memories tab presents.
+				// workspace is open). Use the provenance-bearing cross-repo lookup
+				// so the panel learns which repo the summary came from; without
+				// `sourceRepoName`, destructive commands (push / edit / createPr)
+				// would write to `workspaceRoot`'s git / orphan branch and silently
+				// route the foreign repo's memory to the *current* repo's Jolli
+				// Memory space.
 				const summaryMatch = uri.path.match(/^\/summary\/([0-9a-f]{40})$/);
 				if (summaryMatch) {
 					const hash = summaryMatch[1];
 					const shortHash = hash.substring(0, 7);
-					const summary = await bridge.getSummaryAnyRepo(hash);
+					const { summary, sourceRepoName, sourceRemoteUrl } =
+						await bridge.getSummaryAnyRepoWithSource(hash);
 					if (!summary) {
 						vscode.window.showInformationMessage(
 							`Jolli Memory: No summary found for commit ${shortHash}.`,
@@ -2163,6 +2226,8 @@ export function activate(context: vscode.ExtensionContext): void {
 						bridge,
 						commitsStore.getMainBranch(),
 						"commit",
+						sourceRepoName,
+						sourceRemoteUrl,
 					);
 					return;
 				}

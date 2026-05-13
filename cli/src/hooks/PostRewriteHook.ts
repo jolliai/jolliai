@@ -25,6 +25,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { getCurrentBranch } from "../core/GitOps.js";
 import { isWorkerLockHeld } from "../core/Locks.js";
 import { enqueueGitOperation } from "../core/SessionTracker.js";
 import { createLogger, getJolliMemoryDir, setLogDir } from "../Logger.js";
@@ -59,10 +60,22 @@ export async function handlePostRewriteHook(command: string, cwd: string): Promi
 	// Detect commit source (plugin vs CLI)
 	const commitSource: CommitSource = detectCommitSource(cwd);
 
+	// Capture branch once for both subhandlers so the worker's tail cleanup
+	// can target the right `<branch>/` directory even if the user checks
+	// out elsewhere between this hook firing and the worker draining.
+	// Empty on read failure → enqueue omits the field and the worker's
+	// tail-step skips cleanup rather than guessing the live branch.
+	let branch = "";
+	try {
+		branch = await getCurrentBranch(cwd);
+	} catch (err) {
+		log.warn("Failed to read current branch: %s — proceeding without tail cleanup hint", String(err));
+	}
+
 	if (command === "amend") {
-		await handleAmend(mappings, commitSource, cwd);
+		await handleAmend(mappings, commitSource, cwd, branch);
 	} else if (command === "rebase") {
-		await handleRebase(mappings, commitSource, cwd);
+		await handleRebase(mappings, commitSource, cwd, branch);
 	} else {
 		log.info("Unknown command '%s', skipping", command);
 	}
@@ -89,11 +102,13 @@ async function handleAmend(
 	mappings: ReadonlyArray<HashMapping>,
 	commitSource: CommitSource,
 	cwd: string,
+	branch: string,
 ): Promise<void> {
 	const { oldHash, newHash } = mappings[0];
 	const op: GitOperation = {
 		type: "amend",
 		commitHash: newHash,
+		...(branch && { branch }),
 		sourceHashes: [oldHash],
 		commitSource,
 		createdAt: new Date().toISOString(),
@@ -110,6 +125,7 @@ async function handleRebase(
 	mappings: ReadonlyArray<HashMapping>,
 	commitSource: CommitSource,
 	cwd: string,
+	branch: string,
 ): Promise<void> {
 	// Group by new-hash: pick = {new: [old]}, squash = {new: [old1, old2, ...]}
 	const groups = new Map<string, string[]>();
@@ -126,6 +142,7 @@ async function handleRebase(
 		const op: GitOperation = {
 			type,
 			commitHash: newHash,
+			...(branch && { branch }),
 			sourceHashes: oldHashes,
 			commitSource,
 			createdAt: new Date().toISOString(),

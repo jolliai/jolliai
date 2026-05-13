@@ -1035,6 +1035,75 @@ describe("PrCommentService", () => {
 
 			expect(prListHeadArg).toBe("feature/current");
 		});
+
+		// ─── Explicit-repo (foreign) path ───────────────────────────────────
+		// Memory Bank cross-repo browsing: when the panel knows the summary
+		// belongs to a non-current repo, it passes the foreign repo's
+		// remoteUrl as the 4th arg. The handler must skip the cwd-bound
+		// current-branch lookup and instead pin every gh command to
+		// `--repo <url>`. Without this, the panel would either query the
+		// wrong repo's PR (silent data leak) or sit stuck on "Checking PR
+		// status..." because the dispatch guard rejected the message.
+		describe("foreign-repo path (gh --repo)", () => {
+			it("skips git lookups and pins `gh pr view` to the supplied remote url", async () => {
+				const ghPrCalls: Array<Array<string>> = [];
+				setupExecFile((cmd, args) => {
+					if (cmd === "git") {
+						// Any git invocation here is a regression: foreign-repo
+						// path has no working tree to query.
+						throw new Error(`unexpected git ${args.join(" ")}`);
+					}
+					if (cmd === "gh" && args[0] === "--version") {
+						return { stdout: "gh version 2.40.0\n" };
+					}
+					if (cmd === "gh" && args[0] === "auth") {
+						return { stdout: "Logged in\n" };
+					}
+					if (cmd === "gh" && args[0] === "pr") {
+						ghPrCalls.push(args);
+						return {
+							stdout: JSON.stringify({
+								number: 7,
+								url: "https://github.com/other/repo/pull/7",
+								title: "Foreign PR",
+								body: "",
+							}),
+						};
+					}
+					return { stdout: "" };
+				});
+
+				await handleCheckPrStatus(
+					CWD,
+					postMessage,
+					"feature/foreign-branch",
+					"https://github.com/other/repo.git",
+				);
+
+				expect(ghPrCalls).toHaveLength(1);
+				expect(ghPrCalls[0]).toEqual(
+					expect.arrayContaining([
+						"--repo",
+						"https://github.com/other/repo.git",
+					]),
+				);
+				// targetBranch must come from summaryBranch — never from
+				// `getCurrentBranch(cwd)` (cwd is the current repo, not the
+				// foreign one).
+				expect(ghPrCalls[0]).toEqual(
+					expect.arrayContaining(["feature/foreign-branch"]),
+				);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "prStatus",
+					status: "ready",
+					pr: {
+						number: 7,
+						url: "https://github.com/other/repo/pull/7",
+						title: "Foreign PR",
+					},
+				});
+			});
+		});
 	});
 
 	// ─── handleCreatePr ─────────────────────────────────────────────────────

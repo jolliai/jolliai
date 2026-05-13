@@ -47,6 +47,12 @@ function truncate(str: string, maxLen: number): string {
 
 /**
  * Filters root entries from the index and returns them sorted newest-first.
+ *
+ * Intentionally root-only (not leaf): aligned with `jolli search` and
+ * `SessionStartHook`. The 2026-05-12 leaf-only-memory-display redesign
+ * switched the VS Code display surfaces (Timeline, Memory Bank tree,
+ * Branch tab) to leaves; the CLI surfaces stay on root semantics until
+ * a follow-up explicitly verifies their tests + UX under the leaf model.
  */
 function getRootEntries(entries: ReadonlyArray<SummaryIndexEntry>): Array<SummaryIndexEntry> {
 	return entries

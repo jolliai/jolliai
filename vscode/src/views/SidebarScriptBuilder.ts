@@ -106,9 +106,29 @@ export function buildSidebarScript(): string {
   const disabledBanner = document.getElementById('disabled-banner');
   const enableBtn = document.getElementById('enable-btn');
   const ctxMenu = document.getElementById('context-menu');
-  const tabButtonKb = document.getElementById('tab-button-kb');
-  const tabBranchBtn = document.getElementById('tab-button-branch');
+  const kbIconBtn = document.getElementById('kb-icon-btn');
   const statusIconBtn = document.getElementById('status-icon-btn');
+  const settingsIconBtn = document.getElementById('settings-icon-btn');
+  const breadcrumbRepoBtn = document.getElementById('breadcrumb-repo-btn');
+  const breadcrumbBranchBtn = document.getElementById('breadcrumb-branch-btn');
+  const breadcrumbRepoLabel = document.getElementById('breadcrumb-repo-label');
+  const breadcrumbBranchLabel = document.getElementById('breadcrumb-branch-label');
+  const breadcrumbMenu = document.getElementById('breadcrumb-menu');
+  // Repo/branch enumeration for the dropdowns. Populated by selection:repos /
+  // selection:branches inbound messages. Until the host pushes either, the
+  // chevron stays hidden and the segment behaves as a static label.
+  let repoChoices = [];
+  let branchChoicesByRepo = {};
+  // Cache of unfiltered per-branch memories for the foreign-readonly Branch
+  // tab. Keyed by '<repoName>::<branchName>'. Host populates lazily in
+  // response to selection:requestBranchMemories. Cache-miss while a fetch is
+  // in flight = empty array → empty state in the Memories section, which
+  // immediately fills once selection:branchMemories arrives.
+  const branchMemoriesCache = {};
+  const branchMemoriesPending = {};
+  function branchMemoriesKey(repoName, branchName) {
+    return (repoName || '') + '::' + (branchName || '');
+  }
   // Onboarding panel — full-viewport replacement for the tab UI when the
   // user has not configured AI yet (no Jolli sign-in and no Anthropic key).
   const onboardingPanel = document.getElementById('onboarding-panel');
@@ -205,12 +225,20 @@ export function buildSidebarScript(): string {
     return el;
   }
 
-  // Status icon lives in the static HTML skeleton (not the toolbar), so attach
-  // its tooltip once here. renderStatus updates dataset.tip in lockstep with
-  // the indicator color so the hover text always matches the dot.
+  // Header-bar icons live in the static HTML skeleton (not the toolbar), so
+  // attach their tooltips once here. renderStatus updates dataset.tip on
+  // statusIconBtn in lockstep with the indicator color so the hover text
+  // always matches the dot; KB and Settings have static tooltips.
   if (statusIconBtn) attachTextTip(statusIconBtn, 'Jolli Memory: All good');
+  if (kbIconBtn) attachTextTip(kbIconBtn, 'Memory Bank');
+  if (settingsIconBtn) attachTextTip(settingsIconBtn, 'Settings');
 
   // ---- Tab switching ----
+  // The new icon-driven header doesn't have a Branch button — the Branch view
+  // is the default that surfaces whenever no overlay (KB / Status) is active.
+  // Clicking the active KB or Status icon a second time collapses back to
+  // Branch; that toggle behavior is implemented at the click-handler level
+  // (icon clicks pass the icon's data-tab through a switchTabFromIcon shim).
   function switchTab(tab) {
     if (state.activeTab === tab) return;
     const outgoing = tabContents[state.activeTab];
@@ -218,7 +246,9 @@ export function buildSidebarScript(): string {
 
     state.activeTab = tab;
     persist();
-    document.querySelectorAll('.tab').forEach(function(elBtn) {
+    // Only tab-icon buttons (KB / Status) carry .active — Branch is the
+    // implicit default so no button is highlighted in Branch mode.
+    document.querySelectorAll('.tab[data-tab]').forEach(function(elBtn) {
       elBtn.classList.toggle('active', elBtn.getAttribute('data-tab') === tab);
     });
     Object.keys(tabContents).forEach(function(t) { tabContents[t].classList.toggle('hidden', t !== tab); });
@@ -245,11 +275,20 @@ export function buildSidebarScript(): string {
     vscode.postMessage({ type: 'tab:switched', tab: tab });
   }
 
-  document.querySelectorAll('.tab').forEach(function(elBtn) {
-    elBtn.addEventListener('click', function() { switchTab(elBtn.getAttribute('data-tab')); });
+  // Icon buttons own the click-to-toggle behavior: clicking the icon that
+  // matches the active tab collapses back to Branch instead of being a no-op.
+  // Only [data-tab] elements participate; [data-action] icons (Settings)
+  // route through the open-settings handler below.
+  document.querySelectorAll('.tab[data-tab]').forEach(function(elBtn) {
+    elBtn.addEventListener('click', function() {
+      const target = elBtn.getAttribute('data-tab');
+      if (state.activeTab === target) switchTab('branch');
+      else switchTab(target);
+    });
   });
 
-  // Settings button in the tab-bar-right area — not a .tab so not covered above.
+  // Settings icon lives in tab-bar-right with data-action="open-settings".
+  // Routes to the openSettings command rather than the tab dispatch.
   tabBar.addEventListener('click', function(e) {
     const settingsBtn = e.target.closest('[data-action="open-settings"]');
     if (settingsBtn) {
@@ -312,16 +351,15 @@ export function buildSidebarScript(): string {
       items.push(iconButton('refresh', 'Refresh', 'refresh'));
       mountIn(tabToolbar, items);
     } else if (state.activeTab === 'status') {
-      // Order: configuration → account → power → refresh.
-      // - Settings (was on the global tab bar; moved here so configuration lives
-      //   in the same panel as the status it affects).
+      // Order: account → power → refresh. Settings has been promoted to the
+      // top-level icon row on the header bar so it's reachable from every
+      // panel, not just Status.
       // - Sign In / Sign Out swaps based on state.authenticated; only one is
       //   ever visible (mutually exclusive flows, no point showing both).
       // - Disable: visible only when enabled — toolbar itself is hidden in
       //   disabled mode, and Enable is offered on the disabled-banner instead.
       // - Refresh: rightmost (matches the convention used on the other tabs).
       const items = [
-        iconButton('open-settings', 'Settings', 'gear'),
         state.authenticated
           ? iconButton('sign-out', 'Sign Out', 'sign-out')
           : iconButton('sign-in', 'Sign In', 'sign-in'),
@@ -510,7 +548,12 @@ export function buildSidebarScript(): string {
         applyConfigured(msg.state.configured !== false);
         if (msg.state.activeTab) switchTab(msg.state.activeTab);
         if (msg.state.kbMode) state.kbMode = msg.state.kbMode;
-        renderBranchTabName(msg.state.branchName, msg.state.detached);
+        state.branchName = msg.state.branchName;
+        state.detached = !!msg.state.detached;
+        state.currentRepoName = msg.state.currentRepoName;
+        state.selectedRepoName = msg.state.selectedRepoName;
+        state.selectedBranchName = msg.state.selectedBranchName;
+        renderBreadcrumb();
         renderToolbar();
         if (msg.state.enabled && state.activeTab === 'kb') {
           if (state.kbMode === 'folders') {
@@ -589,7 +632,116 @@ export function buildSidebarScript(): string {
         break;
       }
       case 'branch:branchName':
-        renderBranchTabName(msg.name, msg.detached);
+        state.branchName = msg.name;
+        state.detached = !!msg.detached;
+        renderBreadcrumb();
+        // Workspace branch changed — if the user was viewing the workspace
+        // branch (no override), the breadcrumb label has just updated and
+        // foreign-readonly chrome may need to lift. If the user was viewing
+        // a foreign branch the predicate is unaffected.
+        if (state.activeTab === 'branch') renderBranch();
+        break;
+      case 'selection:repos':
+        repoChoices = Array.isArray(msg.repos) ? msg.repos.slice() : [];
+        renderBreadcrumb();
+        break;
+      case 'selection:branches':
+        if (msg.repoName) {
+          branchChoicesByRepo[msg.repoName] = Array.isArray(msg.branches) ? msg.branches.slice() : [];
+          renderBreadcrumb();
+        }
+        break;
+      case 'selection:set':
+        state.selectedRepoName = msg.repoName;
+        state.selectedBranchName = msg.branchName;
+        renderBreadcrumb();
+        // Picking a repo/branch from the breadcrumb returns focus to the
+        // Branch tab — the Memory Bank and Status overlays are global
+        // workspace-oriented surfaces, so leaving them open while the
+        // breadcrumb has shifted to a different context is disorienting.
+        // switchTab handles the panel swap + Branch re-render itself; the
+        // else branch covers the already-on-Branch case where we still
+        // need to re-render to pick up the new selection.
+        if (state.activeTab !== 'branch') {
+          switchTab('branch');
+        } else {
+          renderBranch();
+        }
+        // Branch tab foreign view needs per-branch memories from the host
+        // (workspace-bound branchData.commits can't represent a foreign pick).
+        // Request lazily when the selection materializes; the response fills
+        // branchMemoriesCache and a renderBranch() inside that handler paints
+        // the rows. Skip if already cached or a fetch is pending — host pushes
+        // are sticky for the life of the session.
+        //
+        // Repo/branch fall back to the workspace's own — picking only a branch
+        // (without first picking a repo) leaves state.selectedRepoName
+        // undefined but should still trigger a fetch for currentRepoName +
+        // pickedBranch. The render path, isViewingForeign, and the response
+        // handler all use the same selectedX-||-currentX fallback; the
+        // trigger key MUST match or the request never fires and the Memories
+        // section stays empty until the user re-picks the repo.
+        {
+          const repo = state.selectedRepoName || state.currentRepoName;
+          const branch = state.selectedBranchName || state.branchName;
+          if (isViewingForeign() && repo && branch) {
+            const key = branchMemoriesKey(repo, branch);
+            if (!branchMemoriesCache[key] && !branchMemoriesPending[key]) {
+              branchMemoriesPending[key] = true;
+              vscode.postMessage({
+                type: 'selection:requestBranchMemories',
+                repoName: repo,
+                branchName: branch,
+              });
+            }
+          }
+        }
+        break;
+      case 'selection:branchMemories':
+        // Cache by repoName::branchName. The response echoes both keys so we
+        // can match even if state.selected* has moved on (user picked again
+        // mid-fetch). If the result still matches the active selection AND
+        // we're on the Branch tab in foreign mode, re-render so the section
+        // populates.
+        {
+          const k = branchMemoriesKey(msg.repoName, msg.branchName);
+          branchMemoriesCache[k] = msg.items.slice();
+          delete branchMemoriesPending[k];
+          const activeKey = branchMemoriesKey(
+            state.selectedRepoName || state.currentRepoName,
+            state.selectedBranchName || state.branchName,
+          );
+          if (k === activeKey && state.activeTab === 'branch' && isViewingForeign()) {
+            renderBranch();
+          }
+        }
+        break;
+      case 'selection:invalidateBranchMemories':
+        // Toolbar Refresh while viewing a foreign repo+branch: the cache is
+        // session-sticky (populated once per key on selection:set, never
+        // re-fetched) so without this signal Refresh would not change what
+        // the user sees. Drop every cached key, then re-trigger the lazy
+        // fetch for the currently-active foreign selection. Other keys
+        // refetch on demand the next time the user navigates to them.
+        {
+          for (const k in branchMemoriesCache) delete branchMemoriesCache[k];
+          for (const k in branchMemoriesPending) delete branchMemoriesPending[k];
+          const repo = state.selectedRepoName || state.currentRepoName;
+          const branch = state.selectedBranchName || state.branchName;
+          if (isViewingForeign() && repo && branch) {
+            const key = branchMemoriesKey(repo, branch);
+            branchMemoriesPending[key] = true;
+            vscode.postMessage({
+              type: 'selection:requestBranchMemories',
+              repoName: repo,
+              branchName: branch,
+            });
+            // Repaint while the request is in flight so the section drops
+            // its old rows for an empty "Loading"-equivalent state until
+            // selection:branchMemories arrives.
+            if (state.activeTab === 'branch') renderBranch();
+          }
+        }
         break;
       case 'status:data':
         renderStatus(msg.entries);
@@ -664,11 +816,10 @@ export function buildSidebarScript(): string {
     lastStatusEntriesJson = null;
 
     if (enabled) {
-      // Restore tab-button labels (cleared by disabled-mode overrides if any)
-      // and sync .active class against the persisted active tab.
-      tabButtonKb.classList.remove('hidden');
-      tabBranchBtn.classList.remove('hidden');
-      document.querySelectorAll('.tab').forEach(function(elBtn) {
+      // Sync .active class on the icon buttons against the persisted active
+      // tab. Branch has no button so it never gets .active — the absence of
+      // .active on KB/Status icons is the visual signal that Branch is current.
+      document.querySelectorAll('.tab[data-tab]').forEach(function(elBtn) {
         elBtn.classList.toggle('active', elBtn.getAttribute('data-tab') === state.activeTab);
       });
       // Normal mode: only the active tab's content is visible.
@@ -682,7 +833,7 @@ export function buildSidebarScript(): string {
       tabContents.kb.classList.add('hidden');
       tabContents.branch.classList.add('hidden');
       tabContents.status.classList.add('hidden');
-      document.querySelectorAll('.tab').forEach(function(elBtn) {
+      document.querySelectorAll('.tab[data-tab]').forEach(function(elBtn) {
         elBtn.classList.remove('active');
       });
     }
@@ -747,25 +898,215 @@ export function buildSidebarScript(): string {
     }
   }
 
-  function renderBranchTabName(name, detached) {
-    // Tab button is "<i class=codicon> + <span class=tab-label>" — only update
-    // the label text so we never wipe the leading icon. textContent on the
-    // button itself would clobber the <i> child.
-    const labelEl = tabBranchBtn.querySelector('.tab-label');
+  function renderBreadcrumbBranchLabel(name, detached) {
+    // Only update the label text — leave the leading icon and chevron alone.
     if (!name) {
-      if (labelEl) labelEl.textContent = '(no branch)';
-      tabBranchBtn.title = '';
+      breadcrumbBranchLabel.textContent = '(no branch)';
+      breadcrumbBranchBtn.title = '';
       return;
     }
     if (detached) {
       const short = name.length > 7 ? name.slice(0, 7) : name;
-      if (labelEl) labelEl.textContent = '(detached: ' + short + ')';
-      tabBranchBtn.title = 'detached HEAD: ' + name;
+      breadcrumbBranchLabel.textContent = '(detached: ' + short + ')';
+      breadcrumbBranchBtn.title = 'detached HEAD: ' + name;
       return;
     }
-    if (labelEl) labelEl.textContent = name;
-    tabBranchBtn.title = name;
+    breadcrumbBranchLabel.textContent = name;
+    breadcrumbBranchBtn.title = name;
   }
+
+  function renderBreadcrumbRepoLabel(name) {
+    breadcrumbRepoLabel.textContent = name || '(workspace)';
+    breadcrumbRepoBtn.title = name || '';
+  }
+
+  // Single source of truth for "is the user browsing somewhere other than the
+  // workspace's own repo+branch?" The renderers consult this to decide
+  // whether to render checkboxes, squash/push buttons, plans/changes
+  // sections. The host is responsible for refilling branch:* data when the
+  // selection changes; this function only flips the visual chrome.
+  function isViewingForeign() {
+    const repoMatch = !state.selectedRepoName || state.selectedRepoName === state.currentRepoName;
+    const branchMatch = !state.selectedBranchName || state.selectedBranchName === state.branchName;
+    return !(repoMatch && branchMatch);
+  }
+
+  function applyForeignReadonly() {
+    root.classList.toggle('foreign-readonly', isViewingForeign());
+  }
+
+  function renderBreadcrumb() {
+    // Repo: show selectedRepoName when set, else currentRepoName. The chevron
+    // is only meaningful when there is a real choice (>= 2 repos).
+    const repoDisplay = state.selectedRepoName || state.currentRepoName || '';
+    renderBreadcrumbRepoLabel(repoDisplay);
+    const repoChevron = breadcrumbRepoBtn.querySelector('.breadcrumb-seg-chevron');
+    if (repoChevron) repoChevron.classList.toggle('hidden', repoChoices.length < 2);
+    // Branch: show selectedBranchName when set, else fall back to the
+    // workspace branch (branchName/detached are always the workspace's).
+    const branchDisplay = state.selectedBranchName || state.branchName;
+    const detached = state.selectedBranchName ? false : state.detached;
+    renderBreadcrumbBranchLabel(branchDisplay, detached);
+    const repoForBranches = state.selectedRepoName || state.currentRepoName || '';
+    const branchList = branchChoicesByRepo[repoForBranches] || [];
+    const branchChevron = breadcrumbBranchBtn.querySelector('.breadcrumb-seg-chevron');
+    if (branchChevron) branchChevron.classList.toggle('hidden', branchList.length < 2);
+    applyForeignReadonly();
+  }
+
+  function hideBreadcrumbMenu() {
+    breadcrumbMenu.classList.add('hidden');
+    breadcrumbRepoBtn.setAttribute('aria-expanded', 'false');
+    breadcrumbBranchBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function showBreadcrumbMenu(anchorBtn, items, onPick) {
+    if (!items || items.length === 0) return;
+    clear(breadcrumbMenu);
+    // Reset inline max-height left over from a previous open so the CSS
+    // default (50vh) governs again until we compute the real cap below.
+    breadcrumbMenu.style.maxHeight = '';
+
+    // Show the filter input only when scanning by eye gets tedious. 8 is
+    // roughly one viewport-height of rows in a typical sidebar width.
+    const SEARCH_THRESHOLD = 8;
+    const showSearch = items.length >= SEARCH_THRESHOLD;
+
+    const list = el('div', { className: 'dropdown-list', role: 'none' });
+    const rows = [];
+    items.forEach(function(it) {
+      const isCurrent = !!it.current;
+      const row = el('div', {
+        className: 'dropdown-item' + (isCurrent ? ' current' : ''),
+        role: 'menuitem',
+        'data-value': it.value,
+      }, [
+        el('i', {
+          className: 'codicon dropdown-item-check ' + (isCurrent ? 'codicon-check' : ''),
+          'aria-hidden': 'true',
+        }),
+        el('span', { text: it.label }),
+      ]);
+      row.addEventListener('click', function() {
+        hideBreadcrumbMenu();
+        onPick(it.value);
+      });
+      list.appendChild(row);
+      rows.push({ el: row, label: String(it.label || '').toLowerCase() });
+    });
+    const emptyMsg = el('div', { className: 'dropdown-empty hidden', text: 'No matches' });
+    list.appendChild(emptyMsg);
+
+    let searchInput = null;
+    if (showSearch) {
+      searchInput = el('input', {
+        type: 'text',
+        placeholder: 'Filter...',
+        'aria-label': 'Filter list',
+        autocomplete: 'off',
+        spellcheck: 'false',
+      });
+      searchInput.addEventListener('input', function() {
+        const q = String(searchInput.value || '').trim().toLowerCase();
+        let visible = 0;
+        for (let i = 0; i < rows.length; i++) {
+          const match = q === '' || rows[i].label.indexOf(q) !== -1;
+          rows[i].el.classList.toggle('hidden', !match);
+          if (match) visible++;
+        }
+        emptyMsg.classList.toggle('hidden', visible !== 0);
+      });
+      // The document-level click handler closes the menu on outside clicks;
+      // clicks inside the menu already short-circuit via breadcrumbMenu.contains,
+      // but stopping propagation on the input itself keeps the menu open even
+      // if a future change tightens that guard.
+      searchInput.addEventListener('click', function(e) { e.stopPropagation(); });
+      searchInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+          // Let the document-level Escape handler close the menu so behaviour
+          // matches clicking outside; stopping here would trap focus.
+          return;
+        }
+      });
+      const searchWrap = el('div', { className: 'dropdown-search' }, [searchInput]);
+      breadcrumbMenu.appendChild(searchWrap);
+    }
+    breadcrumbMenu.appendChild(list);
+
+    // Position relative to the viewport. The menu uses position:absolute
+    // anchored to the document, so getBoundingClientRect is enough. CSS
+    // caps the menu at 50vh; if the anchor sits close to the viewport
+    // bottom we tighten that further to whatever space remains, so the
+    // list scrolls inside the menu instead of overflowing off-screen.
+    const r = anchorBtn.getBoundingClientRect();
+    breadcrumbMenu.style.left = String(Math.round(r.left)) + 'px';
+    breadcrumbMenu.style.top = String(Math.round(r.bottom + 2)) + 'px';
+    const availableBelow = window.innerHeight - r.bottom - 12;
+    const cap50vh = Math.round(window.innerHeight * 0.5);
+    // Math.max with a floor keeps the menu usable even when the anchor is
+    // pinned near the bottom edge (e.g. user shrank the sidebar height).
+    const cappedMax = Math.max(120, Math.min(cap50vh, availableBelow));
+    breadcrumbMenu.style.maxHeight = String(cappedMax) + 'px';
+    breadcrumbMenu.classList.remove('hidden');
+    anchorBtn.setAttribute('aria-expanded', 'true');
+    if (searchInput) searchInput.focus();
+  }
+
+  breadcrumbRepoBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    if (repoChoices.length < 2) return;
+    const isOpen = breadcrumbRepoBtn.getAttribute('aria-expanded') === 'true';
+    hideBreadcrumbMenu();
+    if (isOpen) return;
+    const items = repoChoices.map(function(rc) {
+      return {
+        value: rc.repoName,
+        label: rc.repoName + (rc.isCurrent ? ' (current)' : ''),
+        current: rc.repoName === (state.selectedRepoName || state.currentRepoName),
+      };
+    });
+    showBreadcrumbMenu(breadcrumbRepoBtn, items, function(picked) {
+      vscode.postMessage({ type: 'selection:request', repoName: picked });
+    });
+  });
+
+  breadcrumbBranchBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    const repoForBranches = state.selectedRepoName || state.currentRepoName || '';
+    const list = branchChoicesByRepo[repoForBranches] || [];
+    if (list.length < 2) return;
+    const isOpen = breadcrumbBranchBtn.getAttribute('aria-expanded') === 'true';
+    hideBreadcrumbMenu();
+    if (isOpen) return;
+    const currentBranchInRepo = state.selectedBranchName || state.branchName;
+    const isWorkspaceRepo = repoForBranches === state.currentRepoName;
+    const items = list.map(function(b) {
+      const isWorkspaceBranch = isWorkspaceRepo && b === state.branchName;
+      return {
+        value: b,
+        label: b + (isWorkspaceBranch ? ' (current)' : ''),
+        current: b === currentBranchInRepo,
+      };
+    });
+    showBreadcrumbMenu(breadcrumbBranchBtn, items, function(picked) {
+      vscode.postMessage({ type: 'selection:request', branchName: picked });
+    });
+  });
+
+  // Dismiss the dropdown on any outside click — guarding against clicks
+  // inside the menu itself, which would otherwise close before onPick runs.
+  document.addEventListener('click', function(e) {
+    if (breadcrumbMenu.classList.contains('hidden')) return;
+    if (breadcrumbMenu.contains(e.target)) return;
+    if (breadcrumbRepoBtn.contains(e.target)) return;
+    if (breadcrumbBranchBtn.contains(e.target)) return;
+    hideBreadcrumbMenu();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && !breadcrumbMenu.classList.contains('hidden')) {
+      hideBreadcrumbMenu();
+    }
+  });
 
   // Map iconColor / iconKey to a predefined CSS class (defined in
   // SidebarCssBuilder). We use a class instead of a dynamic style="color:..."
@@ -1126,7 +1467,14 @@ export function buildSidebarScript(): string {
   function renderMemories() {
     const container = tabContents.kb;
     const nodes = [];
-    if (memoriesState.items.length === 0) {
+    // KB tab Memories timeline is intentionally NOT scoped by the breadcrumb —
+    // it's the global "every memory I've created" activity stream. The
+    // breadcrumb selection drives the Branch tab Memories section instead,
+    // via branchMemoriesCache / getForeignCommitItems. Showing the same data
+    // in both places, gated differently, was the source of confusion that
+    // led to two separate code paths.
+    const visibleItems = memoriesState.items;
+    if (visibleItems.length === 0) {
       nodes.push(el('div', { className: 'empty-state', text: STRINGS.kbMemoriesEmpty || 'No memories yet.' }));
       mountIn(container, nodes);
       return;
@@ -1137,13 +1485,13 @@ export function buildSidebarScript(): string {
     // views (Memory Bank aggregating other repos) the badge disambiguates
     // same-named branches across repos.
     const repoNames = new Set();
-    for (let i = 0; i < memoriesState.items.length; i++) {
-      const r = memoriesState.items[i].repoName;
+    for (let i = 0; i < visibleItems.length; i++) {
+      const r = visibleItems[i].repoName;
       if (r) repoNames.add(r);
     }
     const showRepoBadge = repoNames.size > 1;
-    for (let i = 0; i < memoriesState.items.length; i++) {
-      const m = memoriesState.items[i];
+    for (let i = 0; i < visibleItems.length; i++) {
+      const m = visibleItems[i];
       // No title= attribute — hover content is rendered by the custom
       // .hover-card popup (renderHoverCard / showHoverCard below) so the
       // legacy native MarkdownString experience (codicons + command links)
@@ -1571,12 +1919,56 @@ export function buildSidebarScript(): string {
 
   function renderBranch() {
     const container = tabContents.branch;
-    const sections = [
-      { id: 'plans', title: 'Plans & Notes', items: branchData.plans, emptyText: STRINGS.plansEmpty || 'No plans or notes yet.' },
-      { id: 'changes', title: 'Changes', items: branchData.changes, emptyText: STRINGS.changesEmpty || 'No changes.' },
-      { id: 'commits', title: 'Commits', items: branchData.commits, emptyText: STRINGS.commitsEmpty || 'No commits yet.' },
-    ];
+    // Plans & Notes and Changes are workspace-local — they have no meaningful
+    // representation for a foreign repo/branch selection. Drop them entirely
+    // in foreign-readonly mode so the panel reduces to the Memories list.
+    const foreign = isViewingForeign();
+    const sections = [];
+    if (!foreign) {
+      sections.push({ id: 'plans', title: 'Plans & Notes', items: branchData.plans, emptyText: STRINGS.plansEmpty || 'No plans or notes yet.' });
+      sections.push({ id: 'changes', title: 'Changes', items: branchData.changes, emptyText: STRINGS.changesEmpty || 'No changes.' });
+    }
+    // Section id stays 'commits' (back-compat: section-toggle state and CSS
+    // selectors key off it), but the user-facing title is now "Memories"
+    // because every selected row maps to — or will become — a Jolli memory.
+    //
+    // Data source switches with the breadcrumb selection:
+    //  - workspace view → branchData.commits (rich BranchCommit shape pushed
+    //    by host via branch:commitsData; supports checkboxes / squash / push).
+    //  - foreign view   → memoriesState.items filtered by selectedRepoName +
+    //    selectedBranchName, adapted to the display-item shape renderCommitRow
+    //    consumes. Host doesn't refetch commits on selection change (the bridge
+    //    only knows how to git-log workspace HEAD), so we re-derive locally
+    //    from the cross-repo summary index that's already loaded.
+    const commitsItems = foreign ? getForeignCommitItems() : branchData.commits;
+    sections.push({ id: 'commits', title: 'Memories', items: commitsItems, emptyText: STRINGS.commitsEmpty || 'No memories yet.' });
     mountIn(container, sections.map(renderSection));
+  }
+
+  // Adapts BranchMemoryItem → the minimal display-item shape renderCommitRow
+  // reads. Foreign-readonly mode already suppresses squash / push / checkbox
+  // (renderSectionActions returns [] and isMulti is forced false), so the
+  // BranchCommit-specific fields (isSelected, children-as-files, etc.) don't
+  // need real values — null/false placeholders are enough.
+  //
+  // Data source is branchMemoriesCache (host-fetched per repo+branch, no
+  // parent filter — matches Memory Bank tree's count). Cache miss returns []
+  // until the pending selection:branchMemories response arrives.
+  function getForeignCommitItems() {
+    const repo = state.selectedRepoName || state.currentRepoName || '';
+    const branch = state.selectedBranchName || state.branchName || '';
+    if (!repo || !branch) return [];
+    const items = branchMemoriesCache[branchMemoriesKey(repo, branch)] || [];
+    return items.map(function(m) {
+      return {
+        id: m.commitHash,
+        label: m.title || m.commitHash.slice(0, 8),
+        description: m.timestamp ? timeAgo(m.timestamp) : '',
+        contextValue: 'commitWithMemory',
+        children: null,
+        isSelected: false,
+      };
+    });
   }
 
   function renderSection(s) {
@@ -1608,13 +2000,46 @@ export function buildSidebarScript(): string {
               }
               return acc;
             }, []));
+    // Primary CTA mounted as a SIBLING of .section-body so it survives the
+    // Changes section being collapsed. Commit Memory operates on the group
+    // (Plans + Changes + Commits selections together), so hiding it whenever
+    // the user folds Changes makes the cross-panel action unreachable. The
+    // header sparkle iconbtn is too easy to miss, and a labelled button
+    // mirrors the SCM "Commit" pattern users expect. Stays visible when
+    // Changes is empty (sits below the empty-state placeholder, disabled via
+    // renderCommitMemoryButton's selectedCount===0 guard). Foreign-readonly
+    // mode drops the Changes section entirely above, so the s.id==='changes'
+    // predicate already implicitly excludes foreign view — no extra check
+    // needed.
+    const sectionKids = [
+      el('div', { className: 'section-header' }, headerKids),
+      el('div', { className: 'section-body' }, bodyKids),
+    ];
+    if (s.id === 'changes') {
+      sectionKids.push(renderCommitMemoryButton());
+    }
     return el('div', {
       className: 'collapsible-section' + (collapsed ? ' collapsed' : ''),
       'data-section': s.id,
+    }, sectionKids);
+  }
+
+  function renderCommitMemoryButton() {
+    const selectedCount = branchData.changes.filter(function(c) {
+      return !!c.isSelected;
+    }).length;
+    const disabled = selectedCount === 0 || state.workerBusy;
+    const btn = el('button', {
+      type: 'button',
+      className: 'commit-memory-btn',
+      'data-action': 'changes-commit-memory',
+      'aria-label': 'Commit Memory',
     }, [
-      el('div', { className: 'section-header' }, headerKids),
-      el('div', { className: 'section-body' }, bodyKids),
+      el('i', { className: 'codicon codicon-sparkle' }),
+      el('span', { className: 'commit-memory-btn-label', text: 'Commit Memory' }),
     ]);
+    if (disabled) btn.disabled = true;
+    return el('div', { className: 'commit-memory-action' }, [btn]);
   }
 
   function renderSectionActions(sectionId) {
@@ -1646,6 +2071,10 @@ export function buildSidebarScript(): string {
       ];
     }
     if (sectionId === 'commits') {
+      // Foreign-readonly: hide every write-action on the Memories section
+      // (Squash, Push Branch, Select All). The user can still open and read
+      // individual memories via the row's inline View Memory icon.
+      if (isViewingForeign()) return [];
       const m = branchData.commitsMode;
       if (m === 'multi') {
         // Squash is only meaningful with 2+ commits selected. Disable the
@@ -1861,7 +2290,9 @@ export function buildSidebarScript(): string {
     // ThemeIcon("git-commit") whenever the checkbox was hidden). The slot
     // width is kept constant so commit rows align horizontally with
     // commit-file rows regardless of mode.
-    const isMulti = branchData.commitsMode === 'multi';
+    // Foreign-readonly suppresses the checkbox even in multi mode — squash
+    // wouldn't be meaningful against a foreign repo's history.
+    const isMulti = branchData.commitsMode === 'multi' && !isViewingForeign();
     let leading;
     if (isMulti) {
       const cb = el('input', {
@@ -2080,6 +2511,15 @@ export function buildSidebarScript(): string {
   // must run before the section-header collapse-toggle catch-all — otherwise
   // every action-button click also collapses the panel.
   tabContents.branch.addEventListener('click', function(e) {
+    // Bottom-of-section Commit Memory CTA — not gated on .section-actions
+    // because it lives inside .section-body, not the header. Routes to the
+    // same command as the header sparkle iconbtn.
+    const commitMemoryBtn = e.target.closest('.commit-memory-btn[data-action="changes-commit-memory"]');
+    if (commitMemoryBtn && !commitMemoryBtn.disabled) {
+      vscode.postMessage({ type: 'command', command: 'jollimemory.commitAI' });
+      e.stopPropagation();
+      return;
+    }
     // Section toolbar actions.
     const sectionAction = e.target.closest('.section-actions [data-action]');
     if (sectionAction) {
@@ -2168,7 +2608,11 @@ export function buildSidebarScript(): string {
         });
       }
       if (action === 'viewSummary') {
-        vscode.postMessage({ type: 'command', command: 'jollimemory.viewSummary', args: [id] });
+        // Foreign rows live in another repo's storage — single-repo
+        // viewSummary silently misses. Route through viewMemorySummary
+        // (cross-repo) and into the "memory" panel slot in foreign mode.
+        const cmd = isViewingForeign() ? 'jollimemory.viewMemorySummary' : 'jollimemory.viewSummary';
+        vscode.postMessage({ type: 'command', command: cmd, args: [id] });
       }
       e.stopPropagation();
       return;
@@ -2208,7 +2652,14 @@ export function buildSidebarScript(): string {
         });
       }
       if (ctx === 'commit' || ctx === 'commitWithMemory') {
-        vscode.postMessage({ type: 'branch:openCommit', hash: id });
+        // Foreign rows are cross-repo memories — reuse kb:openMemory
+        // (→ viewMemorySummary, cross-repo) so the Memory slot opens
+        // instead of the Commit slot's single-repo lookup silently missing.
+        if (isViewingForeign()) {
+          vscode.postMessage({ type: 'kb:openMemory', commitHash: id });
+        } else {
+          vscode.postMessage({ type: 'branch:openCommit', hash: id });
+        }
       }
       if (ctx === 'commitFile') {
         const oldPath = row.getAttribute('data-old-path');

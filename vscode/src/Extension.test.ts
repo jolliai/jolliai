@@ -228,9 +228,11 @@ const {
 		// can disable destructive actions for foreign-origin summaries.
 		// Default sourceRepoName=null preserves the legacy "local panel"
 		// semantics for tests that don't care about provenance.
-		getSummaryAnyRepoWithSource: vi
-			.fn()
-			.mockResolvedValue({ summary: null, sourceRepoName: null }),
+		getSummaryAnyRepoWithSource: vi.fn().mockResolvedValue({
+			summary: null,
+			sourceRepoName: null,
+			sourceRemoteUrl: null,
+		}),
 		listPlans: vi.fn().mockResolvedValue([]),
 		removePlan: vi.fn().mockResolvedValue(undefined),
 		listNotes: vi.fn().mockResolvedValue([]),
@@ -564,6 +566,12 @@ const {
 			status: "completed" as const,
 			migratedEntries: 0,
 			totalEntries: 0,
+		})),
+		runStaleChildCleanup: vi.fn(async () => ({
+			status: "completed" as const,
+			migratedEntries: 0,
+			totalEntries: 0,
+			staleChildCleanup: { completedAt: "2026-05-12T00:00:00Z" },
 		})),
 	};
 	return {
@@ -1293,6 +1301,135 @@ describe("Extension", () => {
 		});
 	});
 
+	// ── KB folder auto-init / v3 stale-child cleanup on activate ─────────────
+	//
+	// Regression coverage for two related bugs:
+	//   (1) Users whose v1 KB migration had already completed before v2 leaf
+	//       cleanup shipped never had the backlog drained — runLeafCleanup
+	//       was only invoked at the tail of runMigration, and runMigration
+	//       only ran when migration state was missing or non-completed.
+	//   (2) Worse, the 0.99.2 leaf-only algorithm was inverted under v4
+	//       Hoist semantics — it kept hoisted stale children and deleted
+	//       heads. So even when leafCleanup did run, it broke disk state.
+	// The activate path now invokes runStaleChildCleanup independently for
+	// the already-completed branch. State key is `staleChildCleanup`. The
+	// legacy `leafCleanup.completedAt` flag is intentionally NOT consulted —
+	// 0.99.2 users must re-run the corrective pass.
+	describe("activate — KB v3 stale-child cleanup", () => {
+		beforeEach(() => {
+			mockOrphanInstance.exists.mockReset();
+			mockMigrationEngineInstance.runMigration.mockReset();
+			mockMigrationEngineInstance.runMigration.mockResolvedValue({
+				status: "completed",
+				migratedEntries: 0,
+				totalEntries: 0,
+			});
+			mockMigrationEngineInstance.runStaleChildCleanup.mockReset();
+			mockMigrationEngineInstance.runStaleChildCleanup.mockResolvedValue({
+				status: "completed",
+				migratedEntries: 0,
+				totalEntries: 0,
+				staleChildCleanup: { completedAt: "2026-05-12T00:00:00Z" },
+			});
+			mockMetadataManagerInstance.readMigrationState.mockReset();
+		});
+
+		it("runs runStaleChildCleanup when v1 migration is completed but staleChildCleanup has never run", async () => {
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
+				status: "completed",
+				totalEntries: 5,
+				migratedEntries: 5,
+			});
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(
+					mockMigrationEngineInstance.runStaleChildCleanup,
+				).toHaveBeenCalledTimes(1);
+			});
+			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
+		});
+
+		it("skips runStaleChildCleanup when staleChildCleanup.completedAt is already set", async () => {
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
+				status: "completed",
+				totalEntries: 5,
+				migratedEntries: 5,
+				staleChildCleanup: { completedAt: "2026-05-01T00:00:00Z" },
+			});
+
+			activate(makeContext());
+
+			// Give activate's fire-and-forget initializeKB() a chance to settle.
+			await vi.waitFor(() => {
+				expect(mockOrphanInstance.exists).toHaveBeenCalled();
+			});
+			expect(
+				mockMigrationEngineInstance.runStaleChildCleanup,
+			).not.toHaveBeenCalled();
+			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
+		});
+
+		it("still runs runStaleChildCleanup even when the legacy 0.99.2 leafCleanup.completedAt is set (corrective re-run)", async () => {
+			// Critical regression: 0.99.2 users carry leafCleanup.completedAt
+			// from the inverted pass. They must NOT be short-circuited — the
+			// new step has to run to undo the damage.
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
+				status: "completed",
+				totalEntries: 5,
+				migratedEntries: 5,
+				leafCleanup: { completedAt: "2026-05-12T10:00:00Z" },
+			});
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(
+					mockMigrationEngineInstance.runStaleChildCleanup,
+				).toHaveBeenCalledTimes(1);
+			});
+		});
+
+		it("runs full runMigration (not runStaleChildCleanup) on fresh install with no migration state", async () => {
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMetadataManagerInstance.readMigrationState.mockReturnValue(null);
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(mockMigrationEngineInstance.runMigration).toHaveBeenCalledTimes(
+					1,
+				);
+			});
+			expect(
+				mockMigrationEngineInstance.runStaleChildCleanup,
+			).not.toHaveBeenCalled();
+		});
+
+		it("does nothing when orphan branch does not exist", async () => {
+			mockOrphanInstance.exists.mockResolvedValue(false);
+			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
+				status: "completed",
+				totalEntries: 5,
+				migratedEntries: 5,
+			});
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(mockOrphanInstance.exists).toHaveBeenCalled();
+			});
+			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
+			expect(
+				mockMigrationEngineInstance.runStaleChildCleanup,
+			).not.toHaveBeenCalled();
+		});
+	});
+
 	// ── Command handlers ────────────────────────────────────────────────
 
 	describe("command handlers", () => {
@@ -1562,6 +1699,7 @@ describe("Extension", () => {
 				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
 					summary,
 					sourceRepoName: null,
+					sourceRemoteUrl: null,
 				});
 
 				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
@@ -1578,6 +1716,7 @@ describe("Extension", () => {
 					expect.any(String),
 					"memory",
 					null,
+					null,
 				);
 			});
 
@@ -1586,6 +1725,7 @@ describe("Extension", () => {
 				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
 					summary,
 					sourceRepoName: null,
+					sourceRemoteUrl: null,
 				});
 
 				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
@@ -1602,21 +1742,22 @@ describe("Extension", () => {
 					expect.any(String),
 					"memory",
 					null,
+					null,
 				);
 			});
 
-			it("passes sourceRepoName through to the panel for foreign-origin memories", async () => {
-				// The whole point of the provenance plumbing: when a Memory
-				// Bank cross-repo lookup found the summary in `other-repo`,
-				// the panel must learn about it so destructive commands are
-				// disabled. Pinning the contract end-to-end (handler →
-				// bridge.getSummaryAnyRepoWithSource → panel.show) so any
-				// regression in the wiring fails this test instead of
-				// shipping silently and corrupting the wrong workspace.
+			it("passes sourceRepoName and sourceRemoteUrl through to the panel for foreign-origin memories", async () => {
+				// End-to-end pinning of provenance plumbing: a Memory Bank
+				// cross-repo lookup found the summary in `other-repo` AND
+				// captured its remote URL. The panel needs both — repoName
+				// gates destructive commands, remoteUrl powers the read-only
+				// `gh pr view --repo` query for the PR section. A regression
+				// dropping either breaks a different user-facing surface.
 				const summary = { hash: "xyz999", content: "foreign memory" };
 				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
 					summary,
 					sourceRepoName: "other-repo",
+					sourceRemoteUrl: "https://github.com/other/repo.git",
 				});
 
 				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
@@ -1630,6 +1771,7 @@ describe("Extension", () => {
 					expect.any(String),
 					"memory",
 					"other-repo",
+					"https://github.com/other/repo.git",
 				);
 			});
 
@@ -2478,12 +2620,16 @@ describe("Extension", () => {
 						`---\ntype: commit\ncommitHash: abc123def456789\nignored\nbranch: main\n---\n# Body\n`,
 					);
 					const summary = { commitHash: "abc123def456789", topics: [] };
-					mockBridge.getSummaryAnyRepo.mockResolvedValueOnce(summary);
+					mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+						summary,
+						sourceRepoName: null,
+						sourceRemoteUrl: null,
+					});
 
 					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
 					await handler("/fake/summary.md");
 
-					expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+					expect(mockBridge.getSummaryAnyRepoWithSource).toHaveBeenCalledWith(
 						"abc123def456789",
 					);
 					expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
@@ -2493,6 +2639,8 @@ describe("Extension", () => {
 						mockBridge,
 						expect.any(String),
 						"kb",
+						null,
+						null,
 					);
 					expect(executeCommand).not.toHaveBeenCalledWith(
 						"markdown.showPreview",
@@ -2534,16 +2682,16 @@ describe("Extension", () => {
 					readFileSync.mockReturnValueOnce(
 						`---\ntype: commit\nbogus-line-without-colon\ncommitHash: 1234567890abcdef\n---\n`,
 					);
-					mockBridge.getSummaryAnyRepo.mockResolvedValueOnce({
-						commitHash: "1234567890abcdef",
-						topics: [],
+					mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+						summary: { commitHash: "1234567890abcdef", topics: [] },
+						sourceRepoName: null,
 					});
 
 					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
 					await handler("/fake/stray.md");
 
 					// Parser ignored the colonless line and still found commitHash.
-					expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+					expect(mockBridge.getSummaryAnyRepoWithSource).toHaveBeenCalledWith(
 						"1234567890abcdef",
 					);
 				});
@@ -2586,16 +2734,61 @@ describe("Extension", () => {
 					readFileSync.mockReturnValueOnce(
 						`---\ntype: commit\ncommitHash: ffffffff00000000\n---\n`,
 					);
-					mockBridge.getSummaryAnyRepo.mockResolvedValueOnce(null);
+					mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+						summary: null,
+						sourceRepoName: null,
+					});
 
 					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
 					await handler("/fake/orphan.md");
 
-					expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+					expect(mockBridge.getSummaryAnyRepoWithSource).toHaveBeenCalledWith(
 						"ffffffff00000000",
 					);
 					expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
 					expect(executeCommand).toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+				});
+
+				it("passes sourceRepoName through to the panel for foreign-origin Memory Bank entries", async () => {
+					// Memory Bank cross-repo provenance: when the clicked .md
+					// belongs to a non-current repo (KBRepoDiscoverer aggregates
+					// every repo under the localFolder parent), the panel must
+					// learn about it so destructive commands (push / edit /
+					// createPr) are disabled — their handlers all write to
+					// `workspaceRoot`'s git / orphan branch and would silently
+					// corrupt the wrong project's Jolli Memory space. Same
+					// provenance contract pinned in the viewMemorySummary test
+					// block above; this entry point is independent of that one.
+					readFileSync.mockReturnValueOnce(
+						`---\ntype: commit\ncommitHash: deadbeefcafef00d\n---\nfrom-other-repo\n`,
+					);
+					const summary = { commitHash: "deadbeefcafef00d", topics: [] };
+					mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+						summary,
+						sourceRepoName: "other-repo",
+						sourceRemoteUrl: "https://github.com/other/repo.git",
+					});
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/foreign-repo-summary.md");
+
+					expect(mockBridge.getSummaryAnyRepoWithSource).toHaveBeenCalledWith(
+						"deadbeefcafef00d",
+					);
+					expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+						summary,
+						expect.anything(),
+						"/test/workspace",
+						mockBridge,
+						expect.any(String),
+						"kb",
+						"other-repo",
+						"https://github.com/other/repo.git",
+					);
+					expect(executeCommand).not.toHaveBeenCalledWith(
 						"markdown.showPreview",
 						expect.anything(),
 					);
@@ -4551,11 +4744,17 @@ describe("Extension", () => {
 			// Cross-repo: external deep links may target a memory whose summary
 			// lives in a non-current repo under the Memory Bank parent, so the
 			// URI handler walks the same aggregated view the Memories tab uses
-			// (getSummaryAnyRepo) — pinned here for the same reason as the
-			// copyRecallPrompt / openInClaudeCode handlers above.
+			// (getSummaryAnyRepoWithSource) — pinned here for the same reason
+			// as the copyRecallPrompt / openInClaudeCode handlers above, with
+			// the provenance variant so the panel can disable destructive
+			// actions for foreign-origin summaries.
 			it("opens SummaryWebviewPanel in commit slot when the summary exists", async () => {
 				const summary = { hash: "abc1234", content: "summary text" };
-				mockBridge.getSummaryAnyRepo.mockResolvedValue(summary);
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+					summary,
+					sourceRepoName: null,
+					sourceRemoteUrl: null,
+				});
 
 				const handler = getHandler();
 				await handler.handleUri({
@@ -4565,7 +4764,7 @@ describe("Extension", () => {
 						"vscode://jolli.jollimemory-vscode/summary/0123456789abcdef0123456789abcdef01234567",
 				});
 
-				expect(mockBridge.getSummaryAnyRepo).toHaveBeenCalledWith(
+				expect(mockBridge.getSummaryAnyRepoWithSource).toHaveBeenCalledWith(
 					"0123456789abcdef0123456789abcdef01234567",
 				);
 				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
@@ -4575,13 +4774,19 @@ describe("Extension", () => {
 					expect.anything(), // bridge
 					"main", // mainBranch from mocked CommitsStore.getMainBranch()
 					"commit",
+					null,
+					null,
 				);
 				// Summary route must NOT trigger the OAuth path.
 				expect(mockAuthService.handleAuthCallback).not.toHaveBeenCalled();
 			});
 
 			it("shows info message when no summary is found", async () => {
-				mockBridge.getSummaryAnyRepo.mockResolvedValue(null);
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+					summary: null,
+					sourceRepoName: null,
+					sourceRemoteUrl: null,
+				});
 
 				const handler = getHandler();
 				await handler.handleUri({
@@ -4597,12 +4802,48 @@ describe("Extension", () => {
 				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
 			});
 
+			it("passes sourceRepoName through to the panel for foreign-origin deep links", async () => {
+				// External deep links (Slack message, browser bookmark) may land
+				// on a SHA whose summary lives in a non-current repo under the
+				// Memory Bank parent. Same provenance contract as
+				// viewMemorySummary / openMemoryFile: without `sourceRepoName`
+				// the panel would let the user click Push to Jolli, which
+				// pushes the foreign repo's memory to the *current* repo's
+				// Jolli Memory space, corrupting the wrong project.
+				const summary = { hash: "abc1234", content: "foreign summary" };
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+					summary,
+					sourceRepoName: "other-repo",
+					sourceRemoteUrl: "https://github.com/other/repo.git",
+				});
+
+				const handler = getHandler();
+				await handler.handleUri({
+					path: "/summary/0123456789abcdef0123456789abcdef01234567",
+					query: "",
+					toString: () =>
+						"vscode://jolli.jollimemory-vscode/summary/0123456789abcdef0123456789abcdef01234567",
+				});
+
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					summary,
+					expect.anything(),
+					"/test/workspace",
+					expect.anything(), // bridge
+					"main",
+					"commit",
+					"other-repo",
+					"https://github.com/other/repo.git",
+				);
+			});
+
 			it("rejects abbreviated hashes (must be a full 40-char SHA)", async () => {
-				// `bridge.getSummaryAnyRepo` (and the current-repo `getSummary` it
-				// falls back to) walks alias / tree-hash resolution for non-direct
-				// hits, which silently resolves the wrong commit when two distinct
-				// commits share the same tree (cherry-pick, identical re-commit).
-				// Same hardening as `search --hashes`.
+				// `bridge.getSummaryAnyRepoWithSource` (and the current-repo
+				// `getSummary` it falls back to) walks alias / tree-hash
+				// resolution for non-direct hits, which silently resolves the
+				// wrong commit when two distinct commits share the same tree
+				// (cherry-pick, identical re-commit). Same hardening as
+				// `search --hashes`.
 				const handler = getHandler();
 				await handler.handleUri({
 					path: "/summary/abc1234",
@@ -4610,7 +4851,7 @@ describe("Extension", () => {
 					toString: () => "vscode://jolli.jollimemory-vscode/summary/abc1234",
 				});
 
-				expect(mockBridge.getSummaryAnyRepo).not.toHaveBeenCalled();
+				expect(mockBridge.getSummaryAnyRepoWithSource).not.toHaveBeenCalled();
 				expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
 			});
 

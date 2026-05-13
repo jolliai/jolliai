@@ -99,6 +99,11 @@ async function generateBriefing(projectDir: string): Promise<string | null> {
 		return null;
 	}
 
+	// Intentionally root-only (not leaf): aligned with `jolli view` and
+	// `jolli search`. The 2026-05-12 leaf-only-memory-display redesign flipped
+	// the VS Code display surfaces (Timeline, Memory Bank tree, Branch tab) to
+	// leaves; this session-briefing path stays on root semantics until a
+	// follow-up explicitly verifies its tests + UX under the leaf model.
 	const rootEntries = index.entries.filter(
 		(e) => e.branch === branch && (e.parentCommitHash === null || e.parentCommitHash === undefined),
 	);

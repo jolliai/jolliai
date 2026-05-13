@@ -111,6 +111,19 @@ export interface GitOperation {
 	readonly type: "commit" | "amend" | "squash" | "rebase-pick" | "rebase-squash" | "cherry-pick" | "revert";
 	/** Target commit hash */
 	readonly commitHash: string;
+	/**
+	 * Branch the operation landed on, captured at enqueue time.
+	 *
+	 * Required so the worker's tail cleanup (cleanupBranchStaleChildMarkdown)
+	 * targets the right `<branch>/` directory even if the user has `git
+	 * checkout`'d away between enqueue and drain. Reading the live branch
+	 * from the worker would clean the wrong tree.
+	 *
+	 * Optional in the type only to tolerate stale on-disk queue entries
+	 * written by pre-0.99.x code; the worker skips cleanup when missing
+	 * rather than guessing the live branch.
+	 */
+	readonly branch?: string;
 	/** Source hashes: amend's oldHash, squash/rebase's source commit hashes */
 	readonly sourceHashes?: ReadonlyArray<string>;
 	/** Whether the operation was triggered from the VSCode plugin or CLI */

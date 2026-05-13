@@ -811,6 +811,70 @@ describe("KbFoldersService — multi-repo & parent listing", () => {
 	});
 });
 
+describe("KbFoldersService — breadcrumb selection helpers", () => {
+	let tmpParent: string;
+	let svc: KbFoldersService;
+
+	beforeEach(() => {
+		tmpParent = mkdtempSync(join(tmpdir(), "kbfolders-sel-"));
+	});
+	afterEach(() => {
+		rmSync(tmpParent, { recursive: true, force: true });
+	});
+
+	it("listRepos surfaces every Memory Bank repo with isCurrentRepo set against the workspace identity", () => {
+		seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		seedRepo(tmpParent, "beta", { repoName: "beta" });
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "beta",
+			currentRemoteUrl: null,
+		}));
+		const repos = svc.listRepos();
+		expect(repos.map((r) => r.repoName).sort()).toEqual(["alpha", "beta"]);
+		const beta = repos.find((r) => r.repoName === "beta");
+		expect(beta?.isCurrentRepo).toBe(true);
+		const alpha = repos.find((r) => r.repoName === "alpha");
+		expect(alpha?.isCurrentRepo).toBe(false);
+	});
+
+	it("listBranches returns branches.json mappings (canonical names, not folder names) for the named repo", () => {
+		const repoDir = seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		// Drive the registry via resolveFolderForBranch so the sanitization
+		// transcode (e.g. `feature/x` → `feature-x`) is exercised — listBranches
+		// must return the original branch name, not the on-disk folder.
+		const mm = new MetadataManager(join(repoDir, ".jolli"));
+		mm.resolveFolderForBranch("main");
+		mm.resolveFolderForBranch("feature/x");
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "alpha",
+			currentRemoteUrl: null,
+		}));
+		expect(svc.listBranches("alpha")).toEqual(["feature/x", "main"]);
+	});
+
+	it("listBranches returns [] for an unknown repo without throwing", () => {
+		seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "alpha",
+			currentRemoteUrl: null,
+		}));
+		expect(svc.listBranches("does-not-exist")).toEqual([]);
+	});
+
+	it("listBranches returns [] when the repo has no branches.json yet (fresh repo)", () => {
+		seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "alpha",
+			currentRemoteUrl: null,
+		}));
+		expect(svc.listBranches("alpha")).toEqual([]);
+	});
+});
+
 describe("parseMdTitle", () => {
 	it("extracts a basic H1", () => {
 		expect(parseMdTitle("# hello\nbody")).toBe("hello");

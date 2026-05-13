@@ -15,7 +15,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { createLogger } from "../Logger.js";
-import type { CommitSummary, FileWrite, SummaryIndex } from "../Types.js";
+import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "../Types.js";
 import { MetadataManager } from "./MetadataManager.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
@@ -110,6 +110,140 @@ export class FolderStorage implements StorageProvider {
 	isDirty(): boolean {
 		const statusPath = join(this.rootPath, ".jolli", "shadow-status.json");
 		return existsSync(statusPath);
+	}
+
+	/**
+	 * Remove ONLY the visible <branch>/<slug>-<hash8>.md file for this entry.
+	 * Leaves .jolli/summaries/<hash>.json and .jolli/index.json in place;
+	 * drops the manifest entry on successful delete (mirrors cleanupSuperseded-
+	 * Descendants — keeping a manifest record for a deleted file would let
+	 * future scans re-trip on a ghost path). Idempotent on a missing file.
+	 *
+	 * Fingerprint-guarded: skips deletion when the on-disk SHA differs from
+	 * the manifest's recorded fingerprint, since that means a user has
+	 * hand-edited the file. Same protection cleanupSupersededDescendants
+	 * applies at write time, lifted into the StorageProvider boundary so
+	 * tail-cleanup (QueueWorker) and migration callers inherit it.
+	 *
+	 * See StorageProvider.deleteVisibleMarkdown for the contract.
+	 */
+	async deleteVisibleMarkdown(entry: SummaryIndexEntry): Promise<void> {
+		const manifestEntry = this.metadataManager.findById(entry.commitHash);
+		const branchFolder = this.metadataManager.resolveFolderForBranch(entry.branch);
+		const slug = FolderStorage.slugify(entry.commitMessage);
+		const hash8 = entry.commitHash.substring(0, 8);
+		const relativePath = manifestEntry?.path ?? `${branchFolder}/${slug}-${hash8}.md`;
+		const absPath = join(this.rootPath, relativePath);
+
+		if (!existsSync(absPath)) {
+			if (manifestEntry) this.metadataManager.removeFromManifest(entry.commitHash);
+			return;
+		}
+
+		if (manifestEntry?.fingerprint) {
+			let onDiskFingerprint: string;
+			try {
+				onDiskFingerprint = MetadataManager.sha256(readFileSync(absPath, "utf-8"));
+			} catch (err) {
+				log.warn("Cannot read %s for fingerprint check: %s — keeping file", relativePath, String(err));
+				return;
+			}
+			if (onDiskFingerprint !== manifestEntry.fingerprint) {
+				log.warn(
+					"Skipping cleanup of %s — file modified since manifest record (likely hand-edited)",
+					relativePath,
+				);
+				return;
+			}
+		}
+
+		try {
+			unlinkSync(absPath);
+			if (manifestEntry) this.metadataManager.removeFromManifest(entry.commitHash);
+			log.info("Deleted visible MD: %s", relativePath);
+		} catch (err) {
+			// TOCTOU between existsSync above and unlinkSync here: a concurrent
+			// writer / cleanup pass may have removed the file. Treat ENOENT as
+			// success (drop the manifest entry, same as the missing-file branch
+			// above) and surface anything else so callers can record dirty state.
+			const code = (err as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") {
+				if (manifestEntry) this.metadataManager.removeFromManifest(entry.commitHash);
+				return;
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Re-emit the visible <branch>/<slug>-<hash8>.md from the hidden
+	 * .jolli/summaries/<hash>.json source. Idempotent: a `.md` already on disk
+	 * causes an early return without re-reading or re-writing. Used by
+	 * MigrationEngine.runStaleChildCleanup to recover head `.md` files that
+	 * 0.99.2's inverted leaf-only pass mistakenly deleted.
+	 *
+	 * Returns true when the `.md` ended up on disk (regenerated or already
+	 * present), false when the hidden JSON source was missing or unparseable
+	 * — in which case regeneration is impossible and the caller can surface
+	 * a warning. See StorageProvider.regenerateVisibleMarkdown for the contract.
+	 *
+	 * Does NOT reuse `generateSummaryMarkdown`. That path is the normal-write
+	 * pipeline and has two side effects we must avoid here:
+	 *   - it overwrites the manifest `title` field, clobbering user-edited
+	 *     titles (which `backfillTitle` is contractually obligated to preserve);
+	 *   - it calls `cleanupSupersededDescendants`, which only makes sense after
+	 *     a fresh write where a new root has just superseded older children —
+	 *     not when we're merely restoring a previously deleted head.
+	 */
+	async regenerateVisibleMarkdown(entry: SummaryIndexEntry): Promise<boolean> {
+		const branchFolder = this.metadataManager.resolveFolderForBranch(entry.branch);
+		const slug = FolderStorage.slugify(entry.commitMessage);
+		const hash8 = entry.commitHash.substring(0, 8);
+		const relativePath = `${branchFolder}/${slug}-${hash8}.md`;
+		const absPath = join(this.rootPath, relativePath);
+		if (existsSync(absPath)) return true;
+
+		const summaryJson = await this.readFile(`summaries/${entry.commitHash}.json`);
+		if (!summaryJson) {
+			log.warn("regenerateVisibleMarkdown: hidden summaries/%s.json missing", entry.commitHash.substring(0, 8));
+			return false;
+		}
+		let summary: CommitSummary;
+		try {
+			summary = JSON.parse(summaryJson) as CommitSummary;
+		} catch (err) {
+			log.warn(
+				"regenerateVisibleMarkdown: malformed summaries/%s.json — %s",
+				entry.commitHash.substring(0, 8),
+				err instanceof Error ? err.message : String(err),
+			);
+			return false;
+		}
+
+		const frontmatter = this.buildYamlFrontmatter(summary);
+		const body = buildMarkdown(summary);
+		const markdown = `${frontmatter}\n${body}`;
+		this.atomicWrite(absPath, markdown);
+
+		// Update manifest to track the regenerated .md, but preserve any
+		// existing title — backfillTitle's contract is "do not touch entries
+		// that already have a title", and regenerate is its companion.
+		const existing = this.metadataManager.findById(entry.commitHash);
+		const fingerprint = MetadataManager.sha256(markdown);
+		this.metadataManager.updateManifest({
+			path: relativePath,
+			fileId: summary.commitHash,
+			type: "commit",
+			fingerprint,
+			source: {
+				commitHash: summary.commitHash,
+				branch: summary.branch,
+				generatedAt: summary.generatedAt,
+			},
+			title: existing?.title ?? summary.commitMessage,
+		});
+		log.info("Regenerated visible MD: %s", relativePath);
+		return true;
 	}
 
 	// ── Markdown generation ────────────────────────────────────────────────
