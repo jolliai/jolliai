@@ -1,6 +1,10 @@
 # Changelog
 
-<!-- Last synced commit: 322b6a73 | 2026-05-10 -->
+<!-- Last synced commit: d53654bc | 2026-05-13 -->
+
+## 0.99.1
+
+- Bug fixes
 
 ## 0.99.0
 

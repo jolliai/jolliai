@@ -19,7 +19,7 @@ describe("AuthConfig", () => {
 
 	describe("getJolliUrl", () => {
 		it("should return default URL when no env var is set", () => {
-			expect(getJolliUrl()).toBe("https://app.jolli.ai");
+			expect(getJolliUrl()).toBe("https://auth.jolli.ai");
 		});
 
 		it("should return JOLLI_URL env var when set", () => {
@@ -34,7 +34,7 @@ describe("AuthConfig", () => {
 
 		it("should return default when JOLLI_URL is empty", () => {
 			process.env.JOLLI_URL = "   ";
-			expect(getJolliUrl()).toBe("https://app.jolli.ai");
+			expect(getJolliUrl()).toBe("https://auth.jolli.ai");
 		});
 
 		it("should accept a staging jolli.dev host with trailing slash stripped", () => {

@@ -8,7 +8,7 @@
 import { assertJolliOriginAllowed, validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { loadConfig, saveConfig } from "../core/SessionTracker.js";
 
-const DEFAULT_JOLLI_URL = "https://app.jolli.ai";
+const DEFAULT_JOLLI_URL = "https://auth.jolli.ai";
 
 /**
  * Returns the Jolli server URL. Checks JOLLI_URL env var, then falls back to default.
