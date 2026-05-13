@@ -310,6 +310,32 @@ describe("generateForgeLayoutTsx", () => {
 		expect(result).toContain("https://gh.example");
 	});
 
+	// ── CTA button (header.primary) ─────────────────────────────────────────
+
+	it("renders a CTA button in the navbar when header.primary is set", () => {
+		const result = generateForgeLayoutTsx({
+			...BASE_INPUT,
+			header: { items: [], primary: { label: "Get Started", href: "/start" } },
+		});
+		expect(result).toContain('className="forge-cta-button"');
+		expect(result).toContain('{"Get Started"}');
+		expect(result).toContain('href={"/start"}');
+	});
+
+	it("does not render a CTA button when header.primary is absent", () => {
+		const result = generateForgeLayoutTsx(BASE_INPUT);
+		expect(result).not.toContain("forge-cta-button");
+	});
+
+	it("sanitizes javascript: URLs in header.primary.href", () => {
+		const result = generateForgeLayoutTsx({
+			...BASE_INPUT,
+			header: { items: [], primary: { label: "Bad", href: "javascript:alert(1)" } },
+		});
+		expect(result).not.toMatch(/javascript:alert/i);
+		expect(result).toContain('href={"#"}');
+	});
+
 	it("sanitizes javascript: URLs in footer links and social links", () => {
 		const result = generateForgeLayoutTsx({
 			...BASE_INPUT,

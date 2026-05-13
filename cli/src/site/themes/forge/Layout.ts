@@ -173,6 +173,10 @@ export function generateForgeLayoutTsx(input: ForgeLayoutInput): string {
 	const logo = buildLogoSlots(input);
 	const logoMarkup = composeLogoMarkup(input, logo, "<span>{TEXT}</span>");
 
+	const primaryButton = input.header?.primary
+		? `<a href={${JSON.stringify(sanitizeUrl(input.header.primary.href))}} className="forge-cta-button">{${JSON.stringify(input.header.primary.label)}}</a>`
+		: "";
+
 	const footerBody = buildForgeFooterBody(input.title, input.footer);
 	const footerJsx = `<Footer>${footerBody}</Footer>`;
 
@@ -195,7 +199,7 @@ const SiteLogo = () => (
   </span>
 )
 
-const navbar = <Navbar logo={<SiteLogo />}><ThemeSwitch /></Navbar>
+const navbar = <Navbar logo={<SiteLogo />}>${primaryButton}<ThemeSwitch /></Navbar>
 const footer = ${footerJsx}
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {

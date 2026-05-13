@@ -1065,6 +1065,24 @@ body > div:has(> [role="listbox"]) [role="option"] {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   CTA BUTTON — primary call-to-action rendered in the navbar
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.atlas-cta-button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.375rem 0.875rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  border-radius: 0.375rem;
+  background: var(--atlas-accent);
+  color: white;
+  text-decoration: none;
+  transition: opacity 0.15s;
+}
+.atlas-cta-button:hover { opacity: 0.85; }
+
 `;
 
 export interface AtlasOverrideInput {

@@ -477,6 +477,10 @@ export function generateDefaultLayout(config: NextraProjectConfig): string {
 	const faviconHref = config.favicon ?? config.theme?.favicon;
 	const faviconLink = faviconHref ? `<link rel="icon" href={${JSON.stringify(sanitizeUrl(faviconHref))}} />` : "";
 
+	const primaryButton = config.header?.primary
+		? `<a href={${JSON.stringify(sanitizeUrl(config.header.primary.href))}} style={{ display: 'inline-flex', alignItems: 'center', padding: '0.375rem 0.875rem', fontSize: '0.875rem', fontWeight: 500, borderRadius: '0.375rem', background: 'hsl(var(--nextra-primary-hue, 212) 84% 45%)', color: 'white', textDecoration: 'none' }}>{${JSON.stringify(config.header.primary.label)}}</a>`
+		: "";
+
 	return `import { Footer, Navbar } from 'nextra-theme-docs'
 import { Head } from 'nextra/components'
 import { getPageMap } from 'nextra/page-map'
@@ -499,7 +503,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       <body>
         <ScopedNextraLayout
           navbar={
-            <Navbar logo={<span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>${logoMarkup}</span>} />
+            ${primaryButton ? `<Navbar logo={<span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>${logoMarkup}</span>}>${primaryButton}</Navbar>` : `<Navbar logo={<span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>${logoMarkup}</span>} />`}
           }
           pageMap={await getPageMap()}
           footer={${footerJsx}}

@@ -347,6 +347,37 @@ describe("NextraProjectWriter.generateLayout", () => {
 		expect(result).toContain("nextra-theme-docs");
 	});
 
+	// ── CTA button (header.primary -- default theme) ─────────────────────────
+
+	it("default layout renders a CTA button with inline styles when header.primary is set", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({
+			...SAMPLE_CONFIG,
+			header: { items: [], primary: { label: "Get Started", href: "/start" } },
+		});
+		expect(result).toContain('{"Get Started"}');
+		expect(result).toContain('href={"/start"}');
+		expect(result).toContain("background:");
+	});
+
+	it("default layout does not render a CTA button when header.primary is absent", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout(SAMPLE_CONFIG);
+		expect(result).not.toContain("Get Started");
+		// The self-closing <Navbar ... /> form should be used (no </Navbar> closing tag)
+		expect(result).toContain("} />");
+	});
+
+	it("default layout sanitizes javascript: URLs in header.primary.href", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({
+			...SAMPLE_CONFIG,
+			header: { items: [], primary: { label: "Bad", href: "javascript:alert(1)" } },
+		});
+		expect(result).not.toMatch(/javascript:alert/i);
+		expect(result).toContain('href={"#"}');
+	});
+
 	// ── footer (default theme: inline-style fallback, no pack CSS) ────────────
 	// These tests pin behavior of the vanilla `nextra-theme-docs` default
 	// layout — `theme: { pack: "default" }` is required because the dispatcher

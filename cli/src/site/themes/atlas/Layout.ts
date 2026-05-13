@@ -168,6 +168,10 @@ export function generateAtlasLayoutTsx(input: AtlasLayoutInput): string {
 	const logo = buildLogoSlots(input);
 	const logoMarkup = composeLogoMarkup(input, logo, "<span>{TEXT}</span>");
 
+	const primaryButton = input.header?.primary
+		? `<a href={${JSON.stringify(sanitizeUrl(input.header.primary.href))}} className="atlas-cta-button">{${JSON.stringify(input.header.primary.label)}}</a>`
+		: "";
+
 	const footerBody = buildAtlasFooterBody(input.title, input.footer);
 	const footerJsx = `<Footer>${footerBody}</Footer>`;
 
@@ -190,7 +194,7 @@ const SiteLogo = () => (
   </span>
 )
 
-const navbar = <Navbar logo={<SiteLogo />} />
+const navbar = ${primaryButton ? `<Navbar logo={<SiteLogo />}>${primaryButton}</Navbar>` : `<Navbar logo={<SiteLogo />} />`}
 const footer = ${footerJsx}
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {

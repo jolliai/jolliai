@@ -1244,6 +1244,24 @@ footer {
 .forge-footer-social a:hover {
   color: var(--forge-accent) !important;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CTA BUTTON — primary call-to-action rendered in the navbar
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.forge-cta-button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.375rem 0.875rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  border-radius: 0.375rem;
+  background: var(--forge-accent);
+  color: white;
+  text-decoration: none;
+  transition: opacity 0.15s;
+}
+.forge-cta-button:hover { opacity: 0.85; }
 `;
 
 /**
