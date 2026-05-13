@@ -143,6 +143,20 @@ describe("SiteJsonReader.readSiteJson", () => {
 		expect(() => JSON.parse(content)).not.toThrow();
 	});
 
+	it("generated site.json includes $schema as the first key", async () => {
+		mockPrompt("Schema Test");
+		const { readSiteJson, SITE_JSON_SCHEMA_REF } = await import("./SiteJsonReader.js");
+
+		await readSiteJson(tempDir);
+
+		const raw = await readFile(join(tempDir, "site.json"), "utf-8");
+		const parsed = JSON.parse(raw);
+		expect(parsed.$schema).toBe(SITE_JSON_SCHEMA_REF);
+		// Verify $schema is the first key in the serialized JSON
+		const firstKey = Object.keys(parsed)[0];
+		expect(firstKey).toBe("$schema");
+	});
+
 	it("uses user-provided title when input is given", async () => {
 		mockPrompt("My Docs");
 		const { readSiteJson } = await import("./SiteJsonReader.js");

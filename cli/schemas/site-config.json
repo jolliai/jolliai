@@ -1,0 +1,244 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://jolli.ai/schemas/site-config.json",
+	"title": "Jolli Site Configuration",
+	"description": "Configuration file for Jolli-generated documentation sites (site.json).",
+	"type": "object",
+	"required": ["title"],
+	"additionalProperties": true,
+	"properties": {
+		"$schema": {
+			"type": "string",
+			"description": "JSON Schema reference for editor autocompletion."
+		},
+		"title": {
+			"type": "string",
+			"description": "The site title displayed in the navbar and browser tab."
+		},
+		"description": {
+			"type": "string",
+			"description": "Short description of the documentation site."
+		},
+		"nav": {
+			"type": "array",
+			"description": "Legacy flat navbar links. Prefer header.items for new sites.",
+			"items": {
+				"type": "object",
+				"required": ["label", "href"],
+				"additionalProperties": false,
+				"properties": {
+					"label": { "type": "string" },
+					"href": { "type": "string" }
+				}
+			}
+		},
+		"header": {
+			"type": "object",
+			"description": "Header navbar configuration with support for dropdowns.",
+			"additionalProperties": false,
+			"properties": {
+				"items": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/headerItem"
+					}
+				}
+			}
+		},
+		"footer": {
+			"type": "object",
+			"description": "Site footer configuration.",
+			"additionalProperties": false,
+			"properties": {
+				"copyright": {
+					"type": "string",
+					"description": "Copyright notice displayed in the footer."
+				},
+				"columns": {
+					"type": "array",
+					"description": "Footer link columns.",
+					"items": {
+						"type": "object",
+						"required": ["title", "links"],
+						"additionalProperties": false,
+						"properties": {
+							"title": { "type": "string" },
+							"links": {
+								"type": "array",
+								"items": { "$ref": "#/$defs/externalLink" }
+							}
+						}
+					}
+				},
+				"socialLinks": {
+					"$ref": "#/$defs/socialLinks",
+					"description": "Social media icon URLs for the footer."
+				},
+				"social": {
+					"$ref": "#/$defs/socialLinks",
+					"description": "Deprecated alias for socialLinks. Use socialLinks instead.",
+					"deprecated": true
+				}
+			}
+		},
+		"theme": {
+			"type": "object",
+			"description": "Visual theme configuration.",
+			"additionalProperties": false,
+			"properties": {
+				"pack": {
+					"type": "string",
+					"enum": ["default", "forge", "atlas"],
+					"description": "Theme pack. 'forge' is the default when unset."
+				},
+				"logoUrl": {
+					"type": "string",
+					"description": "Logo image URL (light mode / fallback)."
+				},
+				"logoUrlDark": {
+					"type": "string",
+					"description": "Optional dark-mode logo variant."
+				},
+				"logoText": {
+					"type": "string",
+					"description": "Custom logo text. Falls back to site title when unset."
+				},
+				"logoDisplay": {
+					"type": "string",
+					"enum": ["text", "image", "both"],
+					"description": "Whether the navbar logo shows image, text, or both."
+				},
+				"favicon": {
+					"type": "string",
+					"description": "Favicon URL."
+				},
+				"primaryHue": {
+					"type": "number",
+					"minimum": 0,
+					"maximum": 360,
+					"description": "Primary accent hue (0-360)."
+				},
+				"defaultTheme": {
+					"type": "string",
+					"enum": ["light", "dark", "system"],
+					"description": "Initial colour scheme for visitors."
+				},
+				"fontFamily": {
+					"type": "string",
+					"enum": ["inter", "space-grotesk", "ibm-plex", "source-sans", "source-serif"],
+					"description": "Body/heading font family resolved via Google Fonts."
+				}
+			}
+		},
+		"sidebar": {
+			"type": "object",
+			"description": "Sidebar overrides keyed by directory path (e.g. '/', '/get-started').",
+			"additionalProperties": {
+				"type": "object",
+				"additionalProperties": {
+					"oneOf": [
+						{ "type": "string" },
+						{
+							"type": "object",
+							"properties": {
+								"title": { "type": "string" },
+								"href": { "type": "string" },
+								"type": { "type": "string", "enum": ["separator"] }
+							},
+							"additionalProperties": false
+						}
+					]
+				}
+			}
+		},
+		"pathMappings": {
+			"type": "object",
+			"description": "Maps source folder paths to target folder paths.",
+			"additionalProperties": { "type": "string" }
+		},
+		"favicon": {
+			"type": "string",
+			"description": "Deprecated: use theme.favicon instead.",
+			"deprecated": true
+		},
+		"renderer": {
+			"type": "string",
+			"description": "Renderer identifier."
+		},
+		"branding": {
+			"type": "object",
+			"description": "Deprecated nested-shape alias for theme. Use theme instead.",
+			"deprecated": true,
+			"properties": {
+				"themePack": {
+					"type": "string",
+					"enum": ["default", "forge", "atlas"]
+				},
+				"logo": {
+					"type": "object",
+					"properties": {
+						"text": { "type": "string" },
+						"image": { "type": "string" },
+						"imageDark": { "type": "string" },
+						"display": { "type": "string", "enum": ["text", "image", "both"] },
+						"alt": { "type": "string" }
+					},
+					"additionalProperties": false
+				},
+				"favicon": { "type": "string" },
+				"colors": {
+					"type": "object",
+					"properties": {
+						"primaryHue": { "type": "number", "minimum": 0, "maximum": 360 }
+					},
+					"additionalProperties": false
+				},
+				"fontFamily": {
+					"type": "string",
+					"enum": ["inter", "space-grotesk", "ibm-plex", "source-sans", "source-serif"]
+				},
+				"defaultTheme": {
+					"type": "string",
+					"enum": ["light", "dark", "system"]
+				}
+			},
+			"additionalProperties": false
+		}
+	},
+	"$defs": {
+		"externalLink": {
+			"type": "object",
+			"required": ["label", "url"],
+			"additionalProperties": false,
+			"properties": {
+				"label": { "type": "string" },
+				"url": { "type": "string" }
+			}
+		},
+		"headerItem": {
+			"type": "object",
+			"required": ["label"],
+			"additionalProperties": false,
+			"properties": {
+				"label": { "type": "string" },
+				"url": { "type": "string" },
+				"items": {
+					"type": "array",
+					"items": { "$ref": "#/$defs/externalLink" }
+				}
+			}
+		},
+		"socialLinks": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"github": { "type": "string" },
+				"twitter": { "type": "string" },
+				"x": { "type": "string", "description": "Alias for twitter." },
+				"discord": { "type": "string" },
+				"linkedin": { "type": "string" },
+				"youtube": { "type": "string" }
+			}
+		}
+	}
+}

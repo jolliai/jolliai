@@ -27,6 +27,11 @@ export interface SiteJsonResult {
 	usedDefault: boolean;
 }
 
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+/** Schema reference written as the first field in generated site.json files. */
+export const SITE_JSON_SCHEMA_REF = "./node_modules/@jolli.ai/cli/schemas/site-config.json";
+
 // ─── Default configuration ────────────────────────────────────────────────────
 
 export const DEFAULT_SITE_JSON: SiteJson = {
@@ -246,7 +251,8 @@ async function createSiteJson(sourceRoot: string, filePath: string): Promise<Sit
 		config.favicon = conversion.favicon;
 	}
 
-	await writeFile(filePath, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
+	const withSchema = { $schema: SITE_JSON_SCHEMA_REF, ...config };
+	await writeFile(filePath, `${JSON.stringify(withSchema, null, 2)}\n`, "utf-8");
 	console.log(`  Created ${filePath}`);
 
 	return { config, usedDefault: true };
