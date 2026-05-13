@@ -97,6 +97,7 @@ async function readExistingSiteJson(filePath: string): Promise<SiteJsonResult> {
 
 	coerceBrandingToTheme(config);
 	coerceFooterSocialAlias(config);
+	coerceFooterXAlias(config);
 
 	return { config, usedDefault: false };
 }
@@ -176,6 +177,19 @@ function coerceFooterSocialAlias(config: SiteJson): void {
 	if (!config.footer) return;
 	if (config.footer.social && !config.footer.socialLinks) {
 		config.footer.socialLinks = config.footer.social;
+	}
+}
+
+/**
+ * Copies `footer.socialLinks.x` into `footer.socialLinks.twitter` when
+ * `twitter` is not already set. This lets site.json authors use `"x"` as
+ * a modern alias for the Twitter/X platform link.
+ */
+function coerceFooterXAlias(config: SiteJson): void {
+	const links = config.footer?.socialLinks;
+	if (!links) return;
+	if (links.x && !links.twitter) {
+		links.twitter = links.x;
 	}
 }
 

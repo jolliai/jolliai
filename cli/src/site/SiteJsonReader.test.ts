@@ -567,4 +567,52 @@ describe("SiteJsonReader.readSiteJson", () => {
 		const result = await readSiteJson(tempDir);
 		expect(result.config.footer?.socialLinks).toEqual({ github: "https://github.com/new" });
 	});
+
+	// ── footer.socialLinks.x → twitter alias ────────────────────────────────
+
+	it("coerces footer.socialLinks.x into footer.socialLinks.twitter when twitter is not set", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: { socialLinks: { x: "https://x.com/acme" } },
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.footer?.socialLinks?.twitter).toBe("https://x.com/acme");
+	});
+
+	it("preserves footer.socialLinks.twitter when both x and twitter are set", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: {
+				socialLinks: {
+					twitter: "https://twitter.com/acme",
+					x: "https://x.com/acme",
+				},
+			},
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.footer?.socialLinks?.twitter).toBe("https://twitter.com/acme");
+		expect(result.config.footer?.socialLinks?.x).toBe("https://x.com/acme");
+	});
+
+	it("leaves twitter intact when only twitter is set (no x)", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			footer: { socialLinks: { twitter: "https://twitter.com/acme" } },
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.footer?.socialLinks?.twitter).toBe("https://twitter.com/acme");
+		expect(result.config.footer?.socialLinks?.x).toBeUndefined();
+	});
 });

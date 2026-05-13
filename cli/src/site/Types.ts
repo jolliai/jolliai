@@ -37,6 +37,8 @@ export interface HeaderItem {
 /** Header navigation config in site.json. */
 export interface HeaderConfig {
 	items: HeaderItem[];
+	/** Primary CTA button rendered in the navbar (e.g. "Get Started"). */
+	primary?: { label: string; href: string };
 }
 
 /** A footer column with a heading and a list of links. */
@@ -49,6 +51,8 @@ export interface FooterColumn {
 export interface SocialLinks {
 	github?: string;
 	twitter?: string;
+	/** Alias for `twitter`. When set and `twitter` is not, treated as `twitter`. */
+	x?: string;
 	discord?: string;
 	linkedin?: string;
 	youtube?: string;
