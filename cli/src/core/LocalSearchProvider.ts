@@ -99,6 +99,11 @@ export class LocalSearchProvider implements SearchProvider {
 		// getDisplayDate for the same reason.
 		const sinceTimestamp = sinceParsed.kind === "ok" ? sinceParsed.ts : null;
 		const indexEntries = index?.entries ?? [];
+		// Intentionally root-only (not leaf): aligned with `jolli view` and
+		// `SessionStartHook`. The 2026-05-12 leaf-only-memory-display redesign
+		// flipped the VS Code display surfaces (Timeline, Memory Bank tree,
+		// Branch tab) to leaves; CLI catalog/search stays on root semantics
+		// until a follow-up explicitly verifies its tests + UX under leaves.
 		const candidates = indexEntries
 			.filter(isRootEntry)
 			.filter((e) => sinceTimestamp === null || new Date(getDisplayDate(e)).getTime() >= sinceTimestamp)

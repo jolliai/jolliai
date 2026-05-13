@@ -263,6 +263,30 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).not.toContain("nonce=");
 		});
 
+		// ─── Foreign-repo read-only mode ──────────────────────────────────────
+		// When the panel renders a summary that came from a non-current repo
+		// (Memory Bank cross-repo lookup), every destructive control must be
+		// removed from the UI rather than just denied at the message layer —
+		// users should never see a Push / Edit / Delete affordance they can't
+		// actually use. SummaryHtmlBuilder exposes a hook class
+		// `foreign-readonly` on the .page root; SummaryCssBuilder owns the
+		// matching `display: none` rules. The default (no foreignRepoName)
+		// path stays free of foreign markup so non-foreign panels are
+		// untouched.
+		describe("foreign-repo read-only mode", () => {
+			it("adds the foreign-readonly hook class on the .page root when foreignRepoName is set", () => {
+				const html = buildHtml(makeSummary(), {
+					foreignRepoName: "other-repo",
+				});
+				expect(html).toMatch(/class="page foreign-readonly"/);
+			});
+
+			it("renders no foreign-readonly markup when foreignRepoName is omitted", () => {
+				const html = buildHtml(makeSummary());
+				expect(html).not.toContain("foreign-readonly");
+			});
+		});
+
 		it('shows "No topics available" message when topics are empty', () => {
 			collectSortedTopics.mockReturnValue({
 				topics: [],

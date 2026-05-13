@@ -43,6 +43,15 @@ export interface BuildHtmlOptions {
 	readonly planTranslateSet?: ReadonlySet<string>;
 	readonly noteTranslateSet?: ReadonlySet<string>;
 	readonly nonce?: string;
+	/**
+	 * When set, the summary belongs to a non-current repo (Memory Bank
+	 * cross-repo lookup). The .page root receives a `foreign-readonly` hook
+	 * class; SummaryCssBuilder hides every destructive control under that
+	 * class so users only see read-only affordances (Copy / Download).
+	 * The panel tab title (set in SummaryWebviewPanel.update) already names
+	 * the source repo, so this layer does not render an additional banner.
+	 */
+	readonly foreignRepoName?: string | null;
 }
 
 /**
@@ -55,6 +64,7 @@ export function buildHtml(
 	opts: BuildHtmlOptions = {},
 ): string {
 	const { transcriptHashSet, planTranslateSet, noteTranslateSet, nonce } = opts;
+	const pageClass = opts.foreignRepoName ? "page foreign-readonly" : "page";
 	const { topics: allTopics, sourceNodes } = collectSortedTopics(summary);
 	const stats = resolveDiffStats(summary);
 	const totalInsertions = stats.insertions;
@@ -83,7 +93,7 @@ ${csp}
 <style${nonceAttr}>${buildCss()}</style>
 </head>
 <body>
-<div class="page">
+<div class="${pageClass}">
 ${buildAllConversationsSection(transcriptHashSet)}
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
 <hr class="separator" />
@@ -95,7 +105,7 @@ ${buildSourceCommits(sourceNodes)}
 <div class="section">
   <div class="section-header">
     <div class="section-title" title="${topicsLabel}">&#x1F4DD; ${allTopics.length === 1 ? "Topic" : "Topics"} <span class="section-count">${allTopics.length}</span></div>
-    <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all topics">Collapse All</button>
+    <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all topics" data-foreign-safe>Collapse All</button>
   </div>
   ${topicsHtml}
 </div>
@@ -206,10 +216,10 @@ function buildHeader(
 <h1 class="page-title">${escHtml(summary.commitMessage)}</h1>
 <div class="header-actions">
   <div class="split-btn-group">
-    <button class="action-btn" id="copyMdBtn">Copy Markdown</button>
-    <button class="action-btn split-toggle" id="copyMdDropdown" title="More export options">&#x25BE;</button>
+    <button class="action-btn" id="copyMdBtn" data-foreign-safe>Copy Markdown</button>
+    <button class="action-btn split-toggle" id="copyMdDropdown" title="More export options" data-foreign-safe>&#x25BE;</button>
     <div class="split-menu" id="copyMdMenu">
-      <button class="split-menu-item" id="downloadMdBtn">Save as Markdown File</button>
+      <button class="split-menu-item" id="downloadMdBtn" data-foreign-safe>Save as Markdown File</button>
     </div>
   </div>
   <button class="action-btn primary" id="pushJolliBtn">${pushLabel}</button>
@@ -219,7 +229,7 @@ function buildHeader(
     <div class="prop-label">Commit</div>
     <div class="prop-value">
       <span class="hash">${escHtml(summary.commitHash.substring(0, 8))}</span>
-      <button class="hash-copy" data-hash="${escHtml(summary.commitHash)}" title="Copy full hash">\u29C9</button>
+      <button class="hash-copy" data-hash="${escHtml(summary.commitHash)}" title="Copy full hash" data-foreign-safe>\u29C9</button>
     </div>
   </div>
   <div class="prop-row">
@@ -437,7 +447,7 @@ export function buildE2eTestSection(summary: CommitSummary): string {
   <div class="section-header">
     <div class="section-title">\uD83E\uDDEA E2E Test <span class="section-count">${scenarios.length}</span></div>
     <span class="topic-actions">
-      <button class="toggle-all-btn" id="toggleAllE2eBtn" title="Expand / Collapse all scenarios">Collapse All</button>
+      <button class="toggle-all-btn" id="toggleAllE2eBtn" title="Expand / Collapse all scenarios" data-foreign-safe>Collapse All</button>
       <button class="topic-action-btn" id="regenE2eBtn" title="Regenerate">&#x21BB;</button>
       <button class="topic-action-btn" id="deleteE2eBtn" title="Delete">\uD83D\uDDD1</button>
     </span>

@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { FolderStorage } from "../../cli/src/core/FolderStorage.js";
 import { getDiffStats } from "../../cli/src/core/GitOps.js";
+import { filterToBranchHeads } from "../../cli/src/core/HeadEntryFilter.js";
 import {
 	extractRepoName,
 	getRemoteUrl,
@@ -1389,17 +1390,17 @@ export class JolliMemoryBridge {
 				);
 			}
 
-			// Deduplicate by commitHash. Current-repo entries were pushed first
-			// so when a tree-hash alias links the same commit across two repo
-			// folders (rare, but possible after rebase-pick across a fork) the
-			// current-repo copy wins — which is the version the user expects to
-			// see in their own workspace.
+			// Head filter is the headline behavior: keeps only v4 Hoist roots
+			// (`parentCommitHash == null` — the live commit version), hiding
+			// every older version hoisted into some head's children[]. The
+			// trailing dedup is a separate concern — same commit can appear
+			// under two repos via tree-hash aliasing, and the current-repo
+			// copy wins (it was pushed to `merged` first in step 1).
 			const seen = new Set<string>();
-			this.cachedRootEntries = merged
+			const heads = filterToBranchHeads(merged);
+			this.cachedRootEntries = heads
 				.filter((e) => {
-					if (e.parentCommitHash != null || seen.has(e.commitHash)) {
-						return false;
-					}
+					if (seen.has(e.commitHash)) return false;
 					seen.add(e.commitHash);
 					return true;
 				})
@@ -1428,6 +1429,93 @@ export class JolliMemoryBridge {
 	/** Clears the cached root entries so the next listSummaryEntries call re-reads the index. */
 	invalidateEntriesCache(): void {
 		this.cachedRootEntries = null;
+	}
+
+	/**
+	 * Lists every head {@link SummaryIndexEntry} stored for one specific
+	 * repo's one specific branch. Used by the sidebar's foreign-readonly view
+	 * where the user picked a non-workspace branch from the breadcrumb
+	 * dropdown and expects the Memories section to match the Memory Bank
+	 * tree's count for that branch.
+	 *
+	 * Filter semantics aligned with {@link listSummaryEntries}: both apply
+	 * {@link filterToBranchHeads} — only entries with `parentCommitHash == null`
+	 * (v4 Hoist roots, the live commit versions) surface. Older versions that
+	 * have been hoisted into some head's children[] stay hidden. This keeps
+	 * the Memory Bank tree count, Memories panel count, and these counts in
+	 * agreement.
+	 *
+	 * Resolves the right storage based on whether `repoName` is the workspace
+	 * repo (uses the active storage configured for the workspace) or a foreign
+	 * one (instantiates {@link FolderStorage} pointed at that repo's kbRoot,
+	 * mirroring how {@link listSummaryEntries} step 2 walks discovered repos).
+	 */
+	async listBranchMemories(
+		repoName: string,
+		branchName: string,
+	): Promise<ReadonlyArray<SummaryIndexEntry>> {
+		const currentRepoName = extractRepoName(this.cwd);
+		let storage: StorageProvider;
+		let cwd: string | undefined;
+		if (repoName === currentRepoName) {
+			storage = await this.getStorage();
+			cwd = this.cwd;
+		} else {
+			try {
+				const cfg = (await loadConfig()) as Record<string, unknown>;
+				const customKBPath = cfg.localFolder as string | undefined;
+				const kbParent = resolveKbParent(customKBPath);
+				const currentRemoteUrl = getRemoteUrl(this.cwd);
+				const repos = discoverRepos(
+					currentRepoName,
+					currentRemoteUrl,
+					kbParent,
+				);
+				const target = repos.find((r) => r.repoName === repoName);
+				if (!target) return [];
+				const mm = new MetadataManager(join(target.kbRoot, ".jolli"));
+				storage = new FolderStorage(target.kbRoot, mm);
+				cwd = undefined;
+			} catch (err) {
+				log.warn(
+					"listBranchMemories",
+					`Failed to resolve foreign repo '${repoName}': ${
+						err instanceof Error ? err.message : String(err)
+					}`,
+				);
+				return [];
+			}
+		}
+
+		try {
+			const map = await getIndexEntryMap(cwd, storage);
+			// `getIndexEntryMap` registers each entry under both its canonical
+			// commitHash AND every alias hash from `index.commitAliases` (set by
+			// rebase-pick / tree-hash cross-branch matching). So `map.values()`
+			// can return the same entry object multiple times. Dedup by
+			// commitHash before returning, mirroring listSummaryEntries' step 3.
+			const seen = new Set<string>();
+			const branchEntries: SummaryIndexEntry[] = [];
+			for (const entry of map.values()) {
+				if (entry.branch !== branchName) continue;
+				if (seen.has(entry.commitHash)) continue;
+				seen.add(entry.commitHash);
+				branchEntries.push({ ...entry, repoName });
+			}
+			const heads = filterToBranchHeads(branchEntries);
+			heads.sort(
+				(a, b) => Date.parse(getDisplayDate(b)) - Date.parse(getDisplayDate(a)),
+			);
+			return heads;
+		} catch (err) {
+			log.warn(
+				"listBranchMemories",
+				`Failed to load entries: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			);
+			return [];
+		}
 	}
 
 	/**
@@ -1466,21 +1554,32 @@ export class JolliMemoryBridge {
 
 	/**
 	 * Same lookup as {@link getSummaryAnyRepo} but also returns the source
-	 * repo's `repoName` when the hit came from a non-current repo. Callers
-	 * that need to gate write actions (panel push/edit) on foreign-vs-local
-	 * provenance use this; callers that only need to render the summary
+	 * repo's `repoName` and `remoteUrl` when the hit came from a non-current
+	 * repo. Callers that need to gate write actions on foreign-vs-local
+	 * provenance use `sourceRepoName`; callers that need to drive read-only
+	 * remote queries against the foreign repo (e.g. `gh pr view --repo …`)
+	 * use `sourceRemoteUrl`. Callers that only need to render the summary
 	 * use the thinner {@link getSummaryAnyRepo} wrapper.
 	 *
 	 * `sourceRepoName: null` means the summary was found in the current
 	 * workspace's primary storage — safe for read+write. A non-null value
 	 * means the summary lives in another repo's FolderStorage; the caller
-	 * must treat the panel as read-only.
+	 * must treat the panel as read-only. `sourceRemoteUrl` is null when no
+	 * remoteUrl was recorded in that KB folder's config (local-only repo).
 	 */
-	async getSummaryAnyRepoWithSource(
-		hash: string,
-	): Promise<{ summary: CommitSummary | null; sourceRepoName: string | null }> {
+	async getSummaryAnyRepoWithSource(hash: string): Promise<{
+		summary: CommitSummary | null;
+		sourceRepoName: string | null;
+		sourceRemoteUrl: string | null;
+	}> {
 		const current = await this.getSummary(hash);
-		if (current) return { summary: current, sourceRepoName: null };
+		if (current) {
+			return {
+				summary: current,
+				sourceRepoName: null,
+				sourceRemoteUrl: null,
+			};
+		}
 
 		try {
 			const cfg = (await loadConfig()) as Record<string, unknown>;
@@ -1496,7 +1595,11 @@ export class JolliMemoryBridge {
 					const repoStorage = new FolderStorage(repo.kbRoot, mm);
 					const summary = await getSummary(hash, undefined, repoStorage);
 					if (summary) {
-						return { summary, sourceRepoName: repo.repoName };
+						return {
+							summary,
+							sourceRepoName: repo.repoName,
+							sourceRemoteUrl: repo.remoteUrl,
+						};
 					}
 				} catch (err) {
 					log.warn(
@@ -1515,7 +1618,7 @@ export class JolliMemoryBridge {
 				}`,
 			);
 		}
-		return { summary: null, sourceRepoName: null };
+		return { summary: null, sourceRepoName: null, sourceRemoteUrl: null };
 	}
 
 	// ── Git utility methods ───────────────────────────────────────────────

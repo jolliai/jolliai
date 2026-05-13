@@ -632,6 +632,30 @@ describe("SummaryWebviewPanel", () => {
 			);
 		});
 
+		it("passes foreignRepoName through to buildHtml so CSS can hide destructive controls", async () => {
+			// The foreign-readonly hook lives in SummaryHtmlBuilder /
+			// SummaryCssBuilder. SummaryWebviewPanel's responsibility is
+			// just plumbing — make sure update() forwards the provenance the
+			// constructor received so the rendered HTML actually gets the
+			// hook class. Without this assertion a regression that drops the
+			// argument from the options object would still ship green tests
+			// at the buildHtml layer.
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+			);
+			expect(mockBuildHtml).toHaveBeenCalledWith(
+				summary,
+				expect.objectContaining({ foreignRepoName: "other-repo" }),
+			);
+		});
+
 		it("dispose handler removes the commit panel from the per-hash map", async () => {
 			const summary = makeSummary();
 			await SummaryWebviewPanel.show(
@@ -2552,7 +2576,10 @@ describe("SummaryWebviewPanel", () => {
 		// ── PR handlers ──────────────────────────────────────────────────────
 
 		describe("checkPrStatus", () => {
-			it("delegates to handleCheckPrStatus, passing summary.branch", async () => {
+			it("delegates to handleCheckPrStatus with null repoUrl for the local panel", async () => {
+				// Local panels (foreignRepoName=null) leave the 4th arg null so
+				// PrCommentService falls back to its existing implicit-repo
+				// path (`gh pr view -- <branch>` from `cwd`'s working tree).
 				const dispatch = await setupPanel();
 
 				dispatch({ command: "checkPrStatus" });
@@ -2562,6 +2589,36 @@ describe("SummaryWebviewPanel", () => {
 					workspaceRoot,
 					expect.any(Function),
 					"feature/test",
+					null,
+				);
+			});
+
+			it("passes foreign repo's remoteUrl as the 4th arg when the panel is foreign-origin", async () => {
+				// Memory Bank cross-repo browsing path: the panel was created
+				// with foreignRepoName + foreignRepoUrl, so checkPrStatus must
+				// hand the remote URL to PrCommentService — pinning the gh
+				// query to the foreign repo instead of the current workspace.
+				const summary = makeSummary();
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/other/repo.git",
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "checkPrStatus" });
+				await flushPromises();
+
+				expect(mockHandleCheckPrStatus).toHaveBeenCalledWith(
+					workspaceRoot,
+					expect.any(Function),
+					"feature/test",
+					"https://github.com/other/repo.git",
 				);
 			});
 
@@ -3131,7 +3188,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -6359,7 +6422,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -6404,7 +6473,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -6449,7 +6524,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -6491,7 +6572,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });
@@ -6536,7 +6623,13 @@ describe("SummaryWebviewPanel", () => {
 				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap);
 
 				const summary = makeSummary();
-				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot);
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "loadTranscriptStats" });

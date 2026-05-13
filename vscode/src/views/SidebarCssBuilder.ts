@@ -48,70 +48,185 @@ export function buildSidebarCss(): string {
     background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
   }
 
+  /* Header bar — was the tab-bar in the previous tab-UI design; now a flex
+     row with breadcrumb on the left and a fixed icon strip on the right.
+     The old .tab class names (data-tab="kb" / data-tab="status") are kept on
+     the icon buttons so the script's existing switchTab dispatch keeps
+     working — only the visual treatment changed. */
   .tab-bar {
     display: flex;
+    align-items: center;
     background: var(--vscode-sideBarSectionHeader-background, transparent);
     border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
     flex-shrink: 0;
+    gap: 4px;
+    padding: 2px 4px 2px 6px;
+    min-height: 28px;
   }
-  /* Labeled tabs (Branch / Memory Bank) size to their content rather than
-     splitting the tab-bar evenly: flex-grow:0 stops them from claiming free
-     space, flex-basis:auto starts them at the natural label width, and
-     flex-shrink:1 + min-width:0 still let them collapse with text-overflow
-     when the sidebar is too narrow to fit them. max-width caps a single
-     long branch name (e.g. "feature/JOLLI-9999-long-name") so it can't
-     push the right-side toolbar off-screen. The status-indicator pill
-     overrides this with flex: 0 0 auto below. */
-  .tab {
-    flex: 0 1 auto;
-    max-width: 180px;
-    padding: 6px 6px;
-    font-size: 11px;
-    color: var(--vscode-descriptionForeground);
-    cursor: pointer;
-    border: none;
-    background: transparent;
-    border-bottom: 2px solid transparent;
-    /* inline-flex centers icon+label horizontally; min-width:0 lets the
-       label span shrink with text-overflow inside the flex item. */
+
+  /* Breadcrumb: <repo-seg> / <branch-seg>. Each segment is a button so the
+     dropdown affordance is keyboard-reachable; when there's only one repo
+     (the workspace's own) the chevron is removed by toggling .hidden on
+     .breadcrumb-seg-chevron and the segment behaves like static text. */
+  .breadcrumb {
     display: inline-flex;
     align-items: center;
-    justify-content: center;
+    gap: 2px;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .breadcrumb-seg {
+    display: inline-flex;
+    align-items: center;
     gap: 4px;
+    padding: 3px 6px;
+    border: none;
+    background: transparent;
+    color: var(--vscode-foreground);
+    cursor: pointer;
+    font-size: 11px;
+    border-radius: 3px;
     min-width: 0;
   }
-  .tab .tab-icon-leading {
-    flex: 0 0 auto;
-    font-size: 14px;
-    line-height: 1;
-  }
-  .tab .tab-label {
+  .breadcrumb-seg:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }
+  .breadcrumb-seg[aria-expanded="true"] { background: var(--vscode-toolbar-activeBackground, rgba(0,122,204,0.2)); }
+  .breadcrumb-seg-icon { flex: 0 0 auto; font-size: 13px; opacity: 0.8; }
+  .breadcrumb-seg-label {
     min-width: 0;
+    max-width: 140px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .tab.active {
-    color: var(--vscode-foreground);
-    border-bottom-color: var(--vscode-focusBorder, #007acc);
+  .breadcrumb-seg-chevron { flex: 0 0 auto; font-size: 11px; opacity: 0.6; }
+  .breadcrumb-sep {
+    color: var(--vscode-descriptionForeground);
+    font-size: 11px;
+    flex: 0 0 auto;
+    user-select: none;
   }
-  .tab:hover { color: var(--vscode-foreground); }
+  /* Right-side icon strip — Memory Bank / Settings / Status. \`margin-left: auto\`
+     pins it to the right when the breadcrumb collapses; \`flex-shrink: 0\` stops
+     it from being elided when the sidebar is narrow (the breadcrumb truncates
+     instead via text-overflow on .breadcrumb-seg-label). */
+  .tab-bar-right { display: flex; align-items: center; gap: 2px; margin-left: auto; flex-shrink: 0; }
 
-  /* Right-side icon area in the tab bar — holds status indicator + settings + future icons.
-     \`margin-left: auto\` keeps it pinned to the right when the labeled KB / Branch tabs are
-     present (their \`flex: 1\` already consumes free space, so the auto margin is a no-op) AND
-     when those tabs are .hidden in disabled mode (auto margin then pushes this block right). */
-  .tab-bar-right { display: flex; align-items: center; gap: 4px; padding: 0 6px; margin-left: auto; flex-shrink: 0; }
+  /* Header-bar icon button — square button hosting a single codicon. The
+     legacy .tab class is preserved so the existing switchTab dispatch
+     (document.querySelectorAll('.tab[data-tab]')) still finds these buttons.
+     The .active marker means the corresponding overlay panel is currently
+     open; clicking the active icon again collapses back to the Branch view. */
+  .tab {
+    flex: 0 0 auto;
+    padding: 4px 6px;
+    border: none;
+    background: transparent;
+    color: var(--vscode-icon-foreground, var(--vscode-foreground));
+    cursor: pointer;
+    border-radius: 3px;
+    min-width: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .tab.tab-icon { /* explicit modifier preserved for selector specificity in legacy hover/active rules */ }
+  .tab:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }
+  .tab.active { background: var(--vscode-toolbar-activeBackground, rgba(0,122,204,0.2)); color: var(--vscode-foreground); }
 
-  /* Icon-style "tab" — used for the status indicator. Visually distinct from labeled tabs. */
-  .tab.tab-icon { flex: 0 0 auto; padding: 4px 6px; border-bottom: none; min-width: 24px; }
-  .tab.tab-icon.active { border-bottom: none; background: var(--vscode-toolbar-activeBackground, rgba(0,122,204,0.2)); }
-  .tab.tab-icon:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }
+  /* Dropdown menu for the breadcrumb repo / branch pickers. Anchored to the
+     triggering segment via inline left/top set by the script (we can't
+     position it with CSS alone because the segment widths vary with their
+     labels). */
+  .dropdown-menu {
+    position: absolute;
+    z-index: 10;
+    min-width: 160px;
+    max-width: 280px;
+    background: var(--vscode-menu-background, var(--vscode-editor-background));
+    color: var(--vscode-menu-foreground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, rgba(128,128,128,0.3)));
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    padding: 4px 0;
+    border-radius: 3px;
+    display: flex;
+    flex-direction: column;
+    max-height: 50vh;
+  }
+  /* Search box stays pinned at the top; only the list scrolls. The host
+     also sets an inline max-height on the menu when the available viewport
+     space is tighter than 50vh — see showBreadcrumbMenu. */
+  .dropdown-search {
+    flex: 0 0 auto;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--vscode-menu-separatorBackground, var(--vscode-panel-border, rgba(128,128,128,0.3)));
+  }
+  .dropdown-search input {
+    width: 100%;
+    padding: 3px 6px;
+    font-size: 12px;
+    font-family: inherit;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 2px;
+    outline: none;
+  }
+  .dropdown-search input:focus {
+    border-color: var(--vscode-focusBorder);
+  }
+  .dropdown-list {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    min-height: 0;
+  }
+  .dropdown-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .dropdown-item:hover { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground)); }
+  .dropdown-item .dropdown-item-check { width: 14px; flex: 0 0 14px; font-size: 12px; }
+  .dropdown-item.current { font-weight: 600; }
+  .dropdown-empty {
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground);
+    font-style: italic;
+  }
 
   /* Status indicator color classes — applied to the codicon-circle-filled inside #status-icon-btn. */
   .status-icon-ok { color: var(--vscode-testing-iconPassed, #89d185); }
   .status-icon-warn { color: var(--vscode-testing-iconQueued, #cca700); }
   .status-icon-error { color: var(--vscode-testing-iconFailed, #f48771); }
+
+  /* Foreign-readonly chrome on the Branch panel. Mirrors the
+     SummaryWebviewPanel.foreign-readonly default-deny: when the user is
+     viewing a non-workspace repo or non-current branch, the writable surfaces
+     collapse so a click can't trigger a write against a foreign repo.
+     - Plans & Notes and Changes sections vanish entirely (their data is
+       inherently workspace-local; rendering them with a "n/a" placeholder
+       would just be noise). The script also skips pushing these sections in
+       foreign mode (see renderBranch), so the CSS rule is defense in depth
+       against a future code path that forgets to gate.
+     - Memory checkboxes hidden via visibility (not display:none, which would
+       collapse the row-leading slot and break commit-row alignment with
+       commit-file child rows).
+     - The Memories-section header actions (Squash / Push) are suppressed at
+       the script level (renderSectionActions returns []), so no CSS rule is
+       needed there — and adding display:none to .section-actions reflows
+       the section-header (legacy bug, guarded by the test "never uses
+       display:none for .section-actions"). */
+  .sidebar-root.foreign-readonly .collapsible-section[data-section="plans"],
+  .sidebar-root.foreign-readonly .collapsible-section[data-section="changes"] {
+    display: none;
+  }
+  .sidebar-root.foreign-readonly .collapsible-section[data-section="commits"] input[type="checkbox"][data-checkbox-kind="commit"] {
+    visibility: hidden;
+  }
 
   .tab-toolbar {
     display: flex;
@@ -251,6 +366,55 @@ export function buildSidebarCss(): string {
   }
   .collapsible-section .section-header:hover .section-actions { visibility: visible; }
   .collapsible-section.collapsed .section-body { display: none; }
+
+  /* Bottom-of-section "Commit Memory" CTA — sits at the tail of the Changes
+     section body, separated from the file list by a thin top border so the
+     action chrome reads as "section footer" rather than "another file row".
+     Button aligns right (SCM-view convention) and the wrapper carries the
+     vertical breathing room that makes the divider feel intentional rather
+     than cramped. Button itself reuses VS Code's primary-button tokens so it
+     adapts to theme. Disabled state matches .iconbtn:disabled (opacity-only,
+     no hover background change) so the visual semantics are consistent with
+     the header sparkle iconbtn that points at the same command. */
+  .commit-memory-action {
+    /* Horizontal spacing lives in padding (inside the border) so the
+       border-top can span the full webview width — flush to the
+       tab-content edges. Vertical padding is symmetric so the button has
+       equal breathing room above (from the divider) and below (to the
+       next section's own border-top); margin-top supplies the gap from
+       the last file row above the divider, and margin-bottom is 0 because
+       the next section header already brings its own 1px divider. */
+    margin: 12px 0 0 0;
+    padding: 12px 8px 12px 8px;
+    display: flex;
+    justify-content: flex-end;
+    border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border, var(--vscode-panel-border)));
+  }
+  .commit-memory-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: 1px solid transparent;
+    border-radius: 3px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .commit-memory-btn:hover {
+    background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+  }
+  .commit-memory-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .commit-memory-btn:disabled:hover {
+    background: var(--vscode-button-background);
+  }
+  .commit-memory-btn .codicon {
+    font-size: 14px;
+  }
 
   .tree-node {
     display: flex;

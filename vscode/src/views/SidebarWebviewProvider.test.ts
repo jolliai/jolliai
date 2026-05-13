@@ -1686,4 +1686,209 @@ describe("SidebarWebviewProvider", () => {
 		provider.resolveWebviewView(view as unknown as never);
 		expect(view.badge).toEqual({ value: 9, tooltip: "fresh" });
 	});
+
+	// ── Breadcrumb selection (selection:repos / selection:branches / selection:request) ──
+	// These tests verify the host-side wiring of the breadcrumb dropdowns —
+	// the previous gap (UI built, host wiring missing) is what made the repo
+	// segment render as `(workspace)` and both chevrons stay hidden.
+
+	function makeSelectionProvider(opts: {
+		listRepos: ReturnType<typeof vi.fn>;
+		listBranches: ReturnType<typeof vi.fn>;
+		currentRepoName?: string;
+	}): SidebarWebviewProvider {
+		return new SidebarWebviewProvider({
+			executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+				currentRepoName: opts.currentRepoName ?? "workspace-repo",
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			selection: {
+				listRepos: opts.listRepos,
+				listBranches: opts.listBranches,
+			},
+		});
+	}
+
+	it("pushes selection:repos and selection:branches for the current repo on ready", async () => {
+		const view = makeMockView();
+		const listRepos = vi.fn().mockReturnValue([
+			{ repoName: "workspace-repo", isCurrent: true },
+			{ repoName: "other-repo", isCurrent: false, remoteUrl: "git@x:y" },
+		]);
+		const listBranches = vi
+			.fn()
+			.mockImplementation((r: string) =>
+				r === "workspace-repo" ? ["main", "feature-x"] : ["topic"],
+			);
+		const provider = makeSelectionProvider({ listRepos, listBranches });
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => c[0],
+		) as SidebarInboundMsg[];
+		expect(sent).toContainEqual({
+			type: "selection:repos",
+			repos: [
+				{ repoName: "workspace-repo", isCurrent: true },
+				{ repoName: "other-repo", isCurrent: false, remoteUrl: "git@x:y" },
+			],
+		});
+		// listBranches is consulted only for the workspace repo at ready-time;
+		// foreign-repo branches are lazy-loaded when the user picks the repo.
+		expect(listBranches).toHaveBeenCalledTimes(1);
+		expect(listBranches).toHaveBeenCalledWith("workspace-repo");
+		expect(sent).toContainEqual({
+			type: "selection:branches",
+			repoName: "workspace-repo",
+			branches: ["main", "feature-x"],
+		});
+	});
+
+	it("init carries currentRepoName so the breadcrumb shows the real repo name (not (workspace))", async () => {
+		const view = makeMockView();
+		const provider = makeSelectionProvider({
+			listRepos: vi.fn().mockReturnValue([]),
+			listBranches: vi.fn().mockReturnValue([]),
+			currentRepoName: "jollimemory",
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
+		const init = view.webview.postMessage.mock.calls
+			.map((c) => c[0] as SidebarInboundMsg)
+			.find(
+				(m): m is SidebarInboundMsg & { type: "init" } => m.type === "init",
+			);
+		expect(init).toBeDefined();
+		expect((init as { state: SidebarState }).state.currentRepoName).toBe(
+			"jollimemory",
+		);
+	});
+
+	it("selection:request with repoName pushes selection:branches and selection:set with auto-picked branch", () => {
+		const view = makeMockView();
+		const listRepos = vi.fn().mockReturnValue([
+			{ repoName: "workspace-repo", isCurrent: true },
+			{ repoName: "other-repo", isCurrent: false },
+		]);
+		const listBranches = vi
+			.fn()
+			.mockImplementation((r: string) =>
+				r === "other-repo" ? ["release", "draft"] : [],
+			);
+		const provider = makeSelectionProvider({ listRepos, listBranches });
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		view.webview.triggerMessage({
+			type: "selection:request",
+			repoName: "other-repo",
+		});
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => c[0],
+		) as SidebarInboundMsg[];
+		expect(sent).toContainEqual({
+			type: "selection:branches",
+			repoName: "other-repo",
+			branches: ["release", "draft"],
+		});
+		expect(sent).toContainEqual({
+			type: "selection:set",
+			repoName: "other-repo",
+			branchName: "release",
+		});
+	});
+
+	it("selection:request with only branchName posts selection:set without re-listing branches", () => {
+		const view = makeMockView();
+		const listRepos = vi.fn().mockReturnValue([
+			{ repoName: "workspace-repo", isCurrent: true },
+			{ repoName: "other-repo", isCurrent: false },
+		]);
+		const listBranches = vi
+			.fn()
+			.mockImplementation((r: string) =>
+				r === "other-repo" ? ["release", "draft"] : ["main"],
+			);
+		const provider = makeSelectionProvider({ listRepos, listBranches });
+		provider.resolveWebviewView(view as unknown as never);
+		// First land on a foreign repo so selectedRepoName is populated.
+		view.webview.triggerMessage({
+			type: "selection:request",
+			repoName: "other-repo",
+		});
+		view.webview.postMessage.mockClear();
+		listBranches.mockClear();
+		view.webview.triggerMessage({
+			type: "selection:request",
+			branchName: "draft",
+		});
+		expect(listBranches).not.toHaveBeenCalled();
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => c[0],
+		) as SidebarInboundMsg[];
+		expect(sent).toEqual([
+			{
+				type: "selection:set",
+				repoName: "other-repo",
+				branchName: "draft",
+			},
+		]);
+	});
+
+	it("selection:request for an unknown repo is a no-op (no messages, no state mutation)", () => {
+		const view = makeMockView();
+		const listRepos = vi
+			.fn()
+			.mockReturnValue([{ repoName: "workspace-repo", isCurrent: true }]);
+		const listBranches = vi.fn().mockReturnValue([]);
+		const provider = makeSelectionProvider({ listRepos, listBranches });
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		view.webview.triggerMessage({
+			type: "selection:request",
+			repoName: "ghost-repo",
+		});
+		expect(view.webview.postMessage).not.toHaveBeenCalled();
+		expect(listBranches).not.toHaveBeenCalled();
+	});
+
+	it("selection:request is silently ignored when the selection dep is absent", () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+				currentRepoName: "workspace-repo",
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		expect(() =>
+			view.webview.triggerMessage({
+				type: "selection:request",
+				repoName: "anything",
+			}),
+		).not.toThrow();
+		// No selection:* messages posted because the dep isn't wired.
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => (c[0] as SidebarInboundMsg).type,
+		);
+		expect(sent.filter((t) => t.startsWith("selection:"))).toEqual([]);
+	});
 });

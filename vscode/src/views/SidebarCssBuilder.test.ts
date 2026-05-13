@@ -336,4 +336,27 @@ describe("onboarding panel styles", () => {
 		// first paint.
 		expect(css).toMatch(/\.ob-btn:disabled\s*\{/);
 	});
+
+	it("caps the breadcrumb dropdown and lets the inner list scroll", () => {
+		const css = buildSidebarCss();
+		// The outer .dropdown-menu becomes a flex column so the search header
+		// stays pinned while .dropdown-list scrolls. Without max-height the
+		// long branch list overflows the viewport with no scrollbar (the
+		// original bug). Without min-height:0 on the flex child, overflow on
+		// .dropdown-list is silently ignored — a classic flex foot-gun.
+		expect(css).toMatch(/\.dropdown-menu\s*\{[^}]*max-height:\s*50vh/);
+		expect(css).toMatch(/\.dropdown-menu\s*\{[^}]*flex-direction:\s*column/);
+		expect(css).toMatch(/\.dropdown-list\s*\{[^}]*overflow-y:\s*auto/);
+		expect(css).toMatch(/\.dropdown-list\s*\{[^}]*min-height:\s*0/);
+	});
+
+	it("declares the breadcrumb dropdown search and empty-state classes", () => {
+		const css = buildSidebarCss();
+		// Search input is themed against --vscode-input-* so it matches the
+		// rest of the host UI. The empty-state row is the "No matches" line
+		// the script shows when the filter clears every row.
+		expect(css).toContain(".dropdown-search");
+		expect(css).toContain(".dropdown-empty");
+		expect(css).toContain("var(--vscode-input-background)");
+	});
 });

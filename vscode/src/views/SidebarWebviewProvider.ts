@@ -13,8 +13,10 @@ import { log } from "../util/Logger.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
 import { buildSidebarHtml } from "./SidebarHtmlBuilder.js";
 import type {
+	BranchMemoryItem,
 	FolderNode,
 	MemoryItem,
+	RepoChoice,
 	SerializedTreeItem,
 	SidebarInboundMsg,
 	SidebarOutboundMsg,
@@ -42,6 +44,29 @@ export interface SidebarWebviewDeps {
 		getWorkerBusy(): boolean;
 	};
 	kbFolders?: { listChildren(relPath: string): Promise<FolderNode> };
+	/**
+	 * Source for the breadcrumb repo/branch dropdowns. `listRepos` enumerates
+	 * every Memory Bank repo (current + foreign); `listBranches(repoName)`
+	 * returns the branches known for that repo. Kept separate from `kbFolders`
+	 * because the breadcrumb has no Folders-tab dependency: a webview with
+	 * only the breadcrumb wired (e.g. a future trimmed-down host) still needs
+	 * these. Both are sync — implementations read JSON metadata that's already
+	 * cheap to slurp; pushRepos fires inside `handleReady`'s synchronous tail.
+	 */
+	selection?: {
+		listRepos(): readonly RepoChoice[];
+		listBranches(repoName: string): readonly string[];
+		/**
+		 * Returns every memory stored for the named repo+branch — including
+		 * amend/rebase children — so the foreign-readonly Branch tab Memories
+		 * section can match Memory Bank tree counts. The global KB Memories
+		 * list intentionally collapses chains; this path bypasses that filter.
+		 */
+		listBranchMemories(
+			repoName: string,
+			branchName: string,
+		): Promise<ReadonlyArray<BranchMemoryItem>>;
+	};
 	/** Returns absolute path under kbRoot for a relative path. */
 	resolveKbAbs?: (relPath: string) => string;
 	memoriesProvider?: {
@@ -117,6 +142,15 @@ export class SidebarWebviewProvider
 	 * filesStore.onChange. resolveWebviewView re-applies whatever's pending.
 	 */
 	private pendingBadge: vscode.WebviewView["badge"];
+	/**
+	 * Breadcrumb selection — mirrors `state.selectedRepoName` /
+	 * `selectedBranchName` on the webview side. Undefined = viewing the
+	 * workspace's own repo / branch (no foreign-readonly chrome). Held on the
+	 * host so a webview reload can resync via `getInitialState`-adjacent
+	 * pushes; today we drop on reload since the dropdowns re-populate fresh.
+	 */
+	private selectedRepoName: string | undefined;
+	private selectedBranchName: string | undefined;
 
 	constructor(private readonly deps: SidebarWebviewDeps) {}
 
@@ -244,6 +278,15 @@ export class SidebarWebviewProvider
 				detached: cur.detached,
 			});
 		}
+		// Populate the breadcrumb dropdowns. Repos are pushed unconditionally
+		// — even a single-repo result lets the webview decide whether to hide
+		// the chevron (it suppresses < 2 entries). Branches are pushed for the
+		// workspace's own repo so the branch dropdown is immediately usable;
+		// foreign-repo branches are fetched lazily when the user picks that
+		// repo via `selection:request`.
+		this.pushRepos();
+		const init = this.deps.getInitialState();
+		if (init.currentRepoName) this.pushBranches(init.currentRepoName);
 	}
 
 	private handleOutbound(raw: unknown): void {
@@ -356,9 +399,118 @@ export class SidebarWebviewProvider
 			case "refresh":
 				this.handleRefresh(msg.scope);
 				return;
+			case "selection:request":
+				this.handleSelectionRequest(msg.repoName, msg.branchName);
+				return;
+			case "selection:requestBranchMemories":
+				void this.handleBranchMemoriesRequest(msg.repoName, msg.branchName);
+				return;
 			default:
 				return;
 		}
+	}
+
+	/**
+	 * Resolves a breadcrumb pick from the webview into:
+	 *   - updated host-side selection state (so subsequent pushes stay
+	 *     consistent if we ever wire foreign-repo data into commitsStore),
+	 *   - a `selection:set` ack so the webview can re-render its breadcrumb
+	 *     and flip `.foreign-readonly` chrome,
+	 *   - (when the repo changed) a fresh `selection:branches` for the newly
+	 *     selected repo so its branch dropdown is populated.
+	 *
+	 * Repo picks auto-default to the first known branch. If the repo has no
+	 * branches registered in `.jolli/branches.json` (e.g. an empty Memory
+	 * Bank entry), `selectedBranchName` is left undefined and the webview
+	 * falls back to showing the workspace branch label — a known minor UX
+	 * wart for an edge case rather than a correctness bug.
+	 */
+	private handleSelectionRequest(
+		repoName: string | undefined,
+		branchName: string | undefined,
+	): void {
+		if (!this.deps.selection) return;
+		if (repoName) {
+			const repos = this.deps.selection.listRepos();
+			const target = repos.find((r) => r.repoName === repoName);
+			if (!target) return;
+			this.selectedRepoName = target.repoName;
+			const branches = this.deps.selection.listBranches(target.repoName);
+			this.selectedBranchName = branches[0];
+			this.postMessage({
+				type: "selection:branches",
+				repoName: target.repoName,
+				branches: [...branches],
+			});
+			this.postMessage({
+				type: "selection:set",
+				repoName: this.selectedRepoName,
+				branchName: this.selectedBranchName,
+			});
+			return;
+		}
+		if (branchName) {
+			this.selectedBranchName = branchName;
+			this.postMessage({
+				type: "selection:set",
+				repoName: this.selectedRepoName,
+				branchName,
+			});
+		}
+	}
+
+	/**
+	 * Resolves a webview request for "all memories on this repo+branch".
+	 * Always echoes the request's repoName+branchName on the response so the
+	 * webview can match it against its own cache key even if a faster newer
+	 * request has already overwritten its in-flight selection state.
+	 */
+	private async handleBranchMemoriesRequest(
+		repoName: string,
+		branchName: string,
+	): Promise<void> {
+		if (!this.deps.selection) return;
+		try {
+			const items = await this.deps.selection.listBranchMemories(
+				repoName,
+				branchName,
+			);
+			this.postMessage({
+				type: "selection:branchMemories",
+				repoName,
+				branchName,
+				items: [...items],
+			});
+		} catch (err) {
+			log.warn(
+				"SidebarWebviewProvider",
+				`handleBranchMemoriesRequest failed for ${repoName}/${branchName}: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			);
+			this.postMessage({
+				type: "selection:branchMemories",
+				repoName,
+				branchName,
+				items: [],
+			});
+		}
+	}
+
+	private pushRepos(): void {
+		if (!this.deps.selection) return;
+		const repos = this.deps.selection.listRepos();
+		this.postMessage({ type: "selection:repos", repos: [...repos] });
+	}
+
+	private pushBranches(repoName: string): void {
+		if (!this.deps.selection) return;
+		const branches = this.deps.selection.listBranches(repoName);
+		this.postMessage({
+			type: "selection:branches",
+			repoName,
+			branches: [...branches],
+		});
 	}
 
 	/**
@@ -377,6 +529,14 @@ export class SidebarWebviewProvider
 			void this.deps.executeCommand("jollimemory.refreshPlans");
 			void this.deps.executeCommand("jollimemory.refreshFiles");
 			void this.deps.executeCommand("jollimemory.refreshHistory");
+			// The workspace-scoped refresh* commands above don't reach the
+			// foreign-readonly Branch view's `branchMemoriesCache` (host pushes
+			// land in branchData but the foreign render path reads from the
+			// per-(repo, branch) cache instead). Without this signal a user
+			// viewing a foreign repo+branch sees the Memories section frozen on
+			// whatever the first selection load returned, no matter how many
+			// times they click Refresh.
+			this.postMessage({ type: "selection:invalidateBranchMemories" });
 		}
 		if (scope === "status" || scope === "all") {
 			void this.deps.executeCommand("jollimemory.refreshStatus");

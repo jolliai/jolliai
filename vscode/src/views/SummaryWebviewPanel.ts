@@ -182,6 +182,11 @@ export type SummaryPanelSource = "memory" | "commit" | "kb";
 const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
 	"copyMarkdown",
 	"downloadMarkdown",
+	// Read-only PR lookup. The case handler routes the call through
+	// `gh --repo <foreignRepoUrl>` so this never touches the current
+	// workspace's git/GitHub; when foreignRepoUrl is null (local-only
+	// foreign repo) the handler short-circuits with `unavailable`.
+	"checkPrStatus",
 ]);
 
 function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
@@ -292,6 +297,14 @@ export class SummaryWebviewPanel {
 	 * commands with a clear notification.
 	 */
 	private readonly foreignRepoName: string | null;
+	/**
+	 * Foreign repo's `remote.origin.url` (from the KB folder's
+	 * `.jolli/config.json`). Non-null only when `foreignRepoName` is also
+	 * non-null. Used by the read-only PR section to route `gh pr view`
+	 * through `--repo <url>`, so the displayed PR matches the foreign
+	 * summary rather than the current workspace's repo.
+	 */
+	private readonly foreignRepoUrl: string | null;
 
 	private constructor(
 		extensionUri: vscode.Uri,
@@ -301,6 +314,7 @@ export class SummaryWebviewPanel {
 		bridge: JolliMemoryBridge,
 		mainBranch: string,
 		foreignRepoName: string | null,
+		foreignRepoUrl: string | null,
 	) {
 		this.extensionUri = extensionUri;
 		this.workspaceRoot = workspaceRoot;
@@ -309,6 +323,7 @@ export class SummaryWebviewPanel {
 		this.bridge = bridge;
 		this.mainBranch = mainBranch;
 		this.foreignRepoName = foreignRepoName;
+		this.foreignRepoUrl = foreignRepoUrl;
 		// Distinct viewType per source keeps the two panels independently identified by VSCode.
 		const viewType =
 			source === "memory"
@@ -555,10 +570,17 @@ export class SummaryWebviewPanel {
 				);
 				break;
 			case "checkPrStatus":
+				// Foreign-origin panels route the query to the foreign repo
+				// via `gh --repo <foreignRepoUrl>` so the displayed PR matches
+				// the loaded summary, not the current workspace. When the
+				// foreign repo is local-only (no remoteUrl in its KB config),
+				// pass null and let PrCommentService short-circuit to
+				// `unavailable` rather than silently querying this workspace.
 				handleCheckPrStatus(
 					this.workspaceRoot,
 					(msg) => this.panel.webview.postMessage(msg),
 					this.currentSummary?.branch,
+					this.foreignRepoName ? this.foreignRepoUrl : null,
 				).catch((err: unknown) =>
 					log.error("SummaryPanel", `Check PR status failed: ${err}`),
 				);
@@ -691,6 +713,7 @@ export class SummaryWebviewPanel {
 		mainBranch: string,
 		source: SummaryPanelSource = "commit",
 		foreignRepoName: string | null = null,
+		foreignRepoUrl: string | null = null,
 	): Promise<void> {
 		if (source === "commit" || source === "kb") {
 			const existing = SummaryWebviewPanel.commitPanels.get(summary.commitHash);
@@ -740,6 +763,7 @@ export class SummaryWebviewPanel {
 			bridge,
 			mainBranch,
 			foreignRepoName,
+			foreignRepoUrl,
 		);
 		if (source === "memory") {
 			SummaryWebviewPanel.currentMemoryPanel = instance;
@@ -775,6 +799,7 @@ export class SummaryWebviewPanel {
 			planTranslateSet: this.planTranslateSet,
 			noteTranslateSet: this.noteTranslateSet,
 			nonce,
+			foreignRepoName: this.foreignRepoName,
 		});
 	}
 

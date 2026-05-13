@@ -16,6 +16,7 @@ import { createLogger } from "../Logger.js";
 import type { CommitSummary, SummaryIndex } from "../Types.js";
 import type { MigrationState } from "./KBTypes.js";
 import type { MetadataManager } from "./MetadataManager.js";
+import { cleanupAllBranchesStaleChildMarkdown } from "./StaleChildMarkdownCleanup.js";
 import type { StorageProvider } from "./StorageProvider.js";
 
 const log = createLogger("MigrationEngine");
@@ -128,6 +129,17 @@ export class MigrationEngine {
 			skipped,
 			failedHashes.length,
 		);
+
+		// v3 step: regenerate any head visible .md files that 0.99.2's inverted
+		// leaf cleanup wrongly deleted, then drain the stale-child backlog left
+		// by amend / rebase / squash sequences from before this code shipped.
+		// Idempotent. See runStaleChildCleanup for details.
+		try {
+			await this.runStaleChildCleanup();
+		} catch (err) {
+			log.warn("stale-child cleanup raised: %s", err instanceof Error ? err.message : String(err));
+		}
+
 		return finalState;
 	}
 
@@ -162,6 +174,135 @@ export class MigrationEngine {
 			);
 		}
 		return valid;
+	}
+
+	/**
+	 * v3 step (replaces the inverted v2 `runLeafCleanup` from 0.99.2): one-shot
+	 * reconciliation of the visible .md layer with the v4 Hoist storage model:
+	 *
+	 *   1. Regenerate any head .md (`parentCommitHash == null` entry) whose
+	 *      visible file is missing — undoes the damage of 0.99.2's leaf-only
+	 *      pass which inverted the semantics and deleted heads while keeping
+	 *      hoisted older children.
+	 *   2. Delete every stale-child .md (`parentCommitHash != null`) — these
+	 *      are older versions hoisted into a head's `children[]` and should
+	 *      not surface as standalone Memories.
+	 *
+	 * Idempotent via `state.staleChildCleanup.completedAt`. The legacy
+	 * `state.leafCleanup` field from 0.99.2 is intentionally NOT consulted —
+	 * users who ran 0.99.2 must run this pass exactly once to repair the
+	 * inverted state, regardless of what `leafCleanup.completedAt` says.
+	 *
+	 * Called from `runMigration` after v1 completes; also invoked directly
+	 * from VS Code/IDE activate paths for already-migrated users who need
+	 * the one-shot repair.
+	 */
+	async runStaleChildCleanup(): Promise<MigrationState> {
+		const existing = this.metadataManager.readMigrationState();
+		if (existing?.staleChildCleanup?.completedAt) {
+			log.info("stale-child cleanup already completed at %s — skipping", existing.staleChildCleanup.completedAt);
+			return existing;
+		}
+
+		log.info("=== stale-child cleanup started ===");
+
+		// Phase 1: regenerate head .md that 0.99.2's inverted pass deleted.
+		const regen = await this.regenerateMissingHeadMarkdown();
+		log.info(
+			"Head regenerate: regenerated=%d skipped=%d failed=%d",
+			regen.regenerated,
+			regen.skipped,
+			regen.failed,
+		);
+
+		// Phase 2: delete every stale-child visible .md.
+		const result = await cleanupAllBranchesStaleChildMarkdown(undefined, this.folderStorage);
+		log.info("Stale-child cleanup: deleted=%d failed=%d", result.deleted, result.failed);
+
+		// Only stamp `staleChildCleanup.completedAt` when both phases ran clean.
+		// The stamp is a permanent skip-gate read at the top of this method; if
+		// we wrote it on partial failure, the 0.99.2 recovery we couldn't
+		// finish would never be retried on the next VS Code activate and the
+		// missing head .md files would be silently lost. Returning state
+		// without the stamp lets the next invocation re-attempt.
+		const cleanRun = regen.failed === 0 && result.failed === 0;
+		const merged: MigrationState = {
+			status: existing?.status ?? "completed",
+			totalEntries: existing?.totalEntries ?? 0,
+			migratedEntries: existing?.migratedEntries ?? 0,
+			...(existing?.failedHashes ? { failedHashes: existing.failedHashes } : {}),
+			...(existing?.lastMigratedHash ? { lastMigratedHash: existing.lastMigratedHash } : {}),
+			// Preserve the legacy 0.99.2 field if present so we don't accidentally
+			// invalidate it for any host code that still reads it during transition.
+			...(existing?.leafCleanup ? { leafCleanup: existing.leafCleanup } : {}),
+			...(cleanRun ? { staleChildCleanup: { completedAt: new Date().toISOString() } } : {}),
+		};
+		if (!cleanRun) {
+			log.warn(
+				"stale-child cleanup did not finish cleanly (regen.failed=%d, child.failed=%d) — will retry on next invocation",
+				regen.failed,
+				result.failed,
+			);
+		}
+		this.metadataManager.saveMigrationState(merged);
+		return merged;
+	}
+
+	/**
+	 * Walk every head entry (`parentCommitHash == null`) in the folder index
+	 * and re-emit its visible `.md` from the hidden JSON source if missing.
+	 * Idempotent (skips entries whose `.md` is already on disk). Used by
+	 * runStaleChildCleanup to recover heads that 0.99.2 erroneously deleted.
+	 */
+	private async regenerateMissingHeadMarkdown(): Promise<{
+		regenerated: number;
+		skipped: number;
+		failed: number;
+	}> {
+		if (!this.folderStorage.regenerateVisibleMarkdown) {
+			return { regenerated: 0, skipped: 0, failed: 0 };
+		}
+		const indexJson = await this.folderStorage.readFile("index.json");
+		if (!indexJson) {
+			// Folder index.json should always exist by the time this runs (runMigration
+			// writes it; the VS Code activate caller only invokes us when migration has
+			// previously completed). Missing index here implies corruption / wipe, not
+			// a legitimately-empty state — surface as failure so runStaleChildCleanup
+			// withholds its idempotency stamp and retries on the next invocation.
+			log.warn("regenerateMissingHeadMarkdown: folder index.json missing — treating as failure");
+			return { regenerated: 0, skipped: 0, failed: 1 };
+		}
+		let index: SummaryIndex;
+		try {
+			index = JSON.parse(indexJson) as SummaryIndex;
+		} catch (e) {
+			log.warn(
+				"regenerateMissingHeadMarkdown: cannot parse index.json — %s",
+				e instanceof Error ? e.message : String(e),
+			);
+			return { regenerated: 0, skipped: 0, failed: 1 };
+		}
+		const heads = index.entries.filter((e) => e.parentCommitHash == null);
+
+		let regenerated = 0;
+		let skipped = 0;
+		let failed = 0;
+		for (const head of heads) {
+			try {
+				const wrote = await this.folderStorage.regenerateVisibleMarkdown(head);
+				if (wrote) regenerated++;
+				else skipped++;
+			} catch (err) {
+				failed++;
+				log.warn(
+					"regenerateVisibleMarkdown failed for %s on %s: %s",
+					head.commitHash.substring(0, 8),
+					head.branch,
+					err instanceof Error ? err.message : String(err),
+				);
+			}
+		}
+		return { regenerated, skipped, failed };
 	}
 
 	/** Loads migration state. */

@@ -9,6 +9,7 @@
 
 import { createLogger } from "../Logger.js";
 import type { CommitSummary, SummaryIndexEntry } from "../Types.js";
+import { filterToBranchHeads } from "./HeadEntryFilter.js";
 import { extractBaseSlug } from "./PlanSlug.js";
 import type { SearchHit } from "./Search.js";
 import { collectAllNotesWithHosts, collectAllPlansWithHosts, getDisplayDate } from "./SummaryFormat.js";
@@ -166,10 +167,15 @@ export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
 		return { type: "catalog", branches: [] };
 	}
 
-	const rootEntries = index.entries.filter((e) => e.parentCommitHash === null || e.parentCommitHash === undefined);
+	// One entry per (branch, live-tip-version) via v4 Hoist heads (parent==null —
+	// see HeadEntryFilter for the invariant). Earlier amend/squash versions live
+	// on as children and are intentionally excluded: the branch catalog anchors
+	// LLM context on what `git log` currently shows, not on every historical
+	// version that has been superseded.
+	const headEntries = filterToBranchHeads(index.entries);
 
 	const branchMap = new Map<string, SummaryIndexEntry[]>();
-	for (const entry of rootEntries) {
+	for (const entry of headEntries) {
 		const list = branchMap.get(entry.branch);
 		if (list) {
 			list.push(entry);
@@ -310,29 +316,31 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
 		return emptyContext(branch);
 	}
 
-	// Step 1: Filter root entries for this branch
-	let rootEntries = index.entries.filter(
-		(e) => e.branch === branch && (e.parentCommitHash === null || e.parentCommitHash === undefined),
-	);
+	// Step 1: Filter to v4 Hoist heads (parent==null — see HeadEntryFilter) on
+	// the requested branch. Heads are the live tips of commit history — what
+	// `git log` currently shows — and serve as the narrative anchors for LLM
+	// context. Superseded versions live as children and are excluded so the
+	// model isn't fed multiple variants of the same logical commit.
+	let headEntries = filterToBranchHeads(index.entries.filter((e) => e.branch === branch));
 
 	// Step 2: Sort by activity date (oldest first for narrative).
 	// Uses getDisplayDate so amended old commits surface as recent activity.
-	rootEntries = [...rootEntries].sort(
+	headEntries = [...headEntries].sort(
 		(a, b) => new Date(getDisplayDate(a)).getTime() - new Date(getDisplayDate(b)).getTime(),
 	);
 
 	// Step 3: Apply depth limit
-	if (depth !== undefined && depth > 0 && rootEntries.length > depth) {
-		rootEntries = rootEntries.slice(-depth);
+	if (depth !== undefined && depth > 0 && headEntries.length > depth) {
+		headEntries = headEntries.slice(-depth);
 	}
 
-	if (rootEntries.length === 0) {
+	if (headEntries.length === 0) {
 		return emptyContext(branch);
 	}
 
 	// Step 4: Load full summaries
 	const summaries: CommitSummary[] = [];
-	for (const entry of rootEntries) {
+	for (const entry of headEntries) {
 		const summary = await getSummary(entry.commitHash, cwd);
 		if (summary) {
 			summaries.push(summary);

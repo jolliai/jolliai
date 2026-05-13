@@ -10,7 +10,7 @@
  * which has the authoritative old-to-new hash mapping from git's stdin.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,6 +46,20 @@ export function postCommitEntry(cwd: string): void {
 	} catch (err: unknown) {
 		log.error("Failed to read HEAD hash: %s", (err as Error).message);
 		return;
+	}
+
+	// Capture branch at hook time. The worker's tail cleanup targets this
+	// directory, so reading the live branch when the worker drains would
+	// pick the wrong one if the user has `git checkout`'d away in between.
+	// Detached HEAD's "HEAD" label is preserved — head-detached commits
+	// still land in a logical branch directory under that label.
+	let branch: string;
+	try {
+		branch =
+			execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, encoding: "utf-8" }).trim() || "HEAD";
+	} catch (err: unknown) {
+		log.warn("Failed to read current branch: %s — proceeding without tail cleanup hint", (err as Error).message);
+		branch = "";
 	}
 
 	// Detect commit source (plugin vs CLI)
@@ -93,6 +107,7 @@ export function postCommitEntry(cwd: string): void {
 	const op: GitOperation = {
 		type: opType,
 		commitHash,
+		...(branch && { branch }),
 		...(sourceHashes && { sourceHashes }),
 		commitSource,
 		createdAt: new Date().toISOString(),

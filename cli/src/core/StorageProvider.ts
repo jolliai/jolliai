@@ -1,4 +1,4 @@
-import type { FileWrite } from "../Types.js";
+import type { FileWrite, SummaryIndexEntry } from "../Types.js";
 
 export interface StorageProvider {
 	/** Read a file's content. Returns null if not found. */
@@ -31,4 +31,31 @@ export interface StorageProvider {
 
 	/** Check if storage is marked as out-of-sync. Optional. */
 	isDirty?(): boolean;
+
+	/**
+	 * Remove the user-visible Markdown copy for a single summary entry.
+	 * Does NOT touch .jolli/summaries/<hash>.json, .jolli/index.json, or any
+	 * orphan-branch state. Idempotent: a missing file is not an error.
+	 *
+	 * Optional: implemented by FolderStorage and delegated by DualWriteStorage.
+	 * OrphanBranchStorage does not implement it (no visible layer).
+	 */
+	deleteVisibleMarkdown?(entry: SummaryIndexEntry): Promise<void>;
+
+	/**
+	 * Re-emit the user-visible Markdown copy for a single summary entry from
+	 * the hidden `.jolli/summaries/<hash>.json` source. Used to recover head
+	 * (`parentCommitHash == null`) `.md` files that were erroneously deleted by
+	 * 0.99.2's inverted leaf-only cleanup. Does NOT touch hidden JSON, index,
+	 * or orphan-branch state.
+	 *
+	 * Returns true when a `.md` was (re)written, false when the hidden JSON
+	 * source is missing (cannot regenerate). The implementation is allowed to
+	 * skip when the target `.md` already exists on disk; callers must not
+	 * depend on whether a write actually happened (idempotent contract).
+	 *
+	 * Optional: implemented by FolderStorage and delegated by DualWriteStorage.
+	 * OrphanBranchStorage does not implement it (no visible layer).
+	 */
+	regenerateVisibleMarkdown?(entry: SummaryIndexEntry): Promise<boolean>;
 }

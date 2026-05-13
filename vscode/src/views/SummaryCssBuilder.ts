@@ -1220,6 +1220,21 @@ export function buildCss(): string {
     color: #fff;
   }
 
+  /* Foreign-repo read-only mode.
+     When SummaryHtmlBuilder marks .page with the foreign-readonly hook
+     class (SummaryWebviewPanel sets it when the loaded summary belongs
+     to a non-current repo via Memory Bank cross-repo lookup), every
+     button without an explicit data-foreign-safe whitelist marker is
+     hidden. The destructive-message guard in
+     SummaryWebviewPanel.dispatchWebviewMessage already short-circuits
+     the underlying handlers; this layer removes the affordance so
+     users never see a Push / Edit / Delete control they cannot use.
+     Safe controls today: Copy / Save Markdown, copy-hash, the two
+     expand/collapse toggles. */
+  .page.foreign-readonly button:not([data-foreign-safe]) {
+    display: none !important;
+  }
+
 ${buildPrSectionCss()}
 `;
 }

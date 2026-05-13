@@ -2206,7 +2206,7 @@ describe("JolliMemoryBridge", () => {
 		// Without provenance the panel could load a foreign-origin summary
 		// and then accept push/edit messages that write to the WRONG repo.
 
-		it("returns sourceRepoName=null when the summary lives in the current repo", async () => {
+		it("returns sourceRepoName=null and sourceRemoteUrl=null when the summary lives in the current repo", async () => {
 			const own = { commitHash: "aaa", topics: [] };
 			getSummary.mockResolvedValueOnce(own);
 			const bridge = makeBridge();
@@ -2217,10 +2217,11 @@ describe("JolliMemoryBridge", () => {
 			// null is the load-bearing signal here — non-null would silently
 			// flip the panel to read-only even though the summary is local.
 			expect(result.sourceRepoName).toBeNull();
+			expect(result.sourceRemoteUrl).toBeNull();
 			expect(discoverRepos).not.toHaveBeenCalled();
 		});
 
-		it("returns sourceRepoName=<foreign repoName> when the summary falls through to a non-current repo", async () => {
+		it("returns sourceRepoName and sourceRemoteUrl from the foreign DiscoveredRepo when the summary falls through", async () => {
 			const foreign = { commitHash: "bbb", topics: [] };
 			getSummary.mockResolvedValueOnce(null).mockResolvedValueOnce(foreign);
 			discoverRepos.mockReturnValue([
@@ -2235,7 +2236,12 @@ describe("JolliMemoryBridge", () => {
 					kbRoot: "/mock/home/Documents/jolli/other-repo",
 					repoName: "other-repo",
 					dirName: "other-repo",
-					remoteUrl: null,
+					// remoteUrl is the load-bearing field for the new PR-section
+					// foreign path: the panel hands it to PrCommentService which
+					// pins gh to `--repo <url>`. A regression that dropped this
+					// field would silently fall back to querying the current
+					// workspace's PR (data leak), so we pin the propagation here.
+					remoteUrl: "https://github.com/other/repo.git",
 					isCurrentRepo: false,
 				},
 			]);
@@ -2244,14 +2250,11 @@ describe("JolliMemoryBridge", () => {
 			const result = await bridge.getSummaryAnyRepoWithSource("bbb");
 
 			expect(result.summary).toEqual(foreign);
-			// The repoName is the one from DiscoveredRepo (config.repoName,
-			// not dirName) — it's what the panel surfaces in the title and
-			// the "denied" notification, so users see a name they recognize
-			// from the Memory Bank tree, not a collision-suffixed dirname.
 			expect(result.sourceRepoName).toBe("other-repo");
+			expect(result.sourceRemoteUrl).toBe("https://github.com/other/repo.git");
 		});
 
-		it("returns sourceRepoName=null when no repo has the summary", async () => {
+		it("returns sourceRepoName=null and sourceRemoteUrl=null when no repo has the summary", async () => {
 			getSummary.mockResolvedValue(null);
 			discoverRepos.mockReturnValue([]);
 			const bridge = makeBridge();
@@ -2260,6 +2263,7 @@ describe("JolliMemoryBridge", () => {
 
 			expect(result.summary).toBeNull();
 			expect(result.sourceRepoName).toBeNull();
+			expect(result.sourceRemoteUrl).toBeNull();
 		});
 	});
 
@@ -2873,6 +2877,100 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
+	// ── listBranchMemories ──────────────────────────────────────────
+
+	describe("listBranchMemories()", () => {
+		function makeEntry(
+			hash: string,
+			date: string,
+			msg: string,
+			branch: string,
+			parent?: string,
+		) {
+			return {
+				commitHash: hash,
+				commitDate: date,
+				commitMessage: msg,
+				branch,
+				parentCommitHash: parent ?? null,
+				topicCount: 1,
+			};
+		}
+
+		it("dedupes commitAliases that point to the same head — alias from rebase-pick must not double-count", async () => {
+			// Regression: getIndexEntryMap registers each entry under BOTH its
+			// canonical commitHash and every alias from index.commitAliases.
+			// A real-world observation: alias `8d8ac10f → c5801c12` (rebase-pick
+			// produced the alias) made `map.values()` yield the c5801c12 entry
+			// twice, so listBranchMemories returned [c5801c12, c5801c12, af74e2cb]
+			// and the sidebar rendered three rows for two heads. Fix: dedup by
+			// commitHash, mirroring listSummaryEntries.
+			const head1 = makeEntry(
+				"aaa",
+				"2025-01-01T00:00:00Z",
+				"First head",
+				"main",
+			);
+			const head2 = makeEntry(
+				"bbb",
+				"2025-01-02T00:00:00Z",
+				"Second head",
+				"main",
+			);
+			// Simulate the Map shape returned by getIndexEntryMap when commitAliases
+			// is present: an alias key `aliasaaa` points to the SAME entry object
+			// as `aaa`. Both keys enumerate via `.values()`.
+			getIndexEntryMap.mockResolvedValue(
+				new Map([
+					["aaa", head1],
+					["aliasaaa", head1], // alias for aaa
+					["bbb", head2],
+				]),
+			);
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchMemories("test-repo", "main");
+			expect(result.map((e) => e.commitHash).sort()).toEqual(["aaa", "bbb"]);
+			expect(result).toHaveLength(2);
+		});
+
+		it("returns only v4 Hoist heads (parent=null) on the named branch", async () => {
+			// `aaa` is the live head (parent=null). `bbb` is a hoisted older
+			// version (parent=aaa). Under v4 Hoist semantics the head surfaces;
+			// `bbb` is internal history that lives inside aaa.children[].
+			const head = makeEntry("aaa", "2025-01-01T00:00:00Z", "head", "main");
+			const hoisted = makeEntry(
+				"bbb",
+				"2025-01-02T00:00:00Z",
+				"hoisted older version",
+				"main",
+				"aaa",
+			);
+			const other = makeEntry(
+				"ccc",
+				"2025-01-03T00:00:00Z",
+				"other branch",
+				"feature",
+			);
+			getIndexEntryMap.mockResolvedValue(
+				new Map([
+					["aaa", head],
+					["bbb", hoisted],
+					["ccc", other],
+				]),
+			);
+
+			const bridge = makeBridge();
+			// Pass the mocked currentRepoName ("test-repo") so listBranchMemories
+			// routes through the workspace-storage branch — that path uses the
+			// already-mocked getIndexEntryMap. Foreign routing goes through
+			// discoverRepos (which is mocked to []), so foreign callers would
+			// short-circuit before reaching the index.
+			const result = await bridge.listBranchMemories("test-repo", "main");
+			expect(result.map((e) => e.commitHash)).toEqual(["aaa"]);
+		});
+	});
+
 	// ── resolveCommitMeta (tested indirectly via listBranchCommits) ──────
 
 	describe("resolveCommitMeta edge cases", () => {
@@ -3119,27 +3217,85 @@ describe("JolliMemoryBridge", () => {
 			expect(result.totalCount).toBe(3);
 		});
 
-		it("filters out entries with parentCommitHash", async () => {
-			const root = makeEntry("aaa", "2025-01-01T00:00:00Z", "root", "main");
-			const child = makeEntry(
+		it("filters hoisted older versions out, surfacing only the head", async () => {
+			// `aaa` is the live head (parent=null). `bbb` was hoisted into
+			// aaa.children[] by squash/amend — it represents an older version
+			// of the same commit. Display surfaces the head, hides bbb.
+			const head = makeEntry("aaa", "2025-01-01T00:00:00Z", "head", "main");
+			const hoisted = makeEntry(
 				"bbb",
 				"2025-01-02T00:00:00Z",
-				"child",
+				"hoisted older version",
 				"main",
 				"aaa",
 			);
 			getIndexEntryMap.mockResolvedValue(
 				new Map([
-					["aaa", root],
-					["bbb", child],
+					["aaa", head],
+					["bbb", hoisted],
 				]),
 			);
 
 			const bridge = makeBridge();
 			const result = await bridge.listSummaryEntries(10);
 
+			// New semantics (v4 Hoist): heads only. `aaa` is the head, `bbb`
+			// hides as internal history under aaa.children[].
 			expect(result.entries).toHaveLength(1);
 			expect(result.entries[0].commitHash).toBe("aaa");
+		});
+
+		it("surfaces every parent=null head on a branch regardless of cross-branch parent pointers", async () => {
+			// Two independent heads, one on each branch. The head test is
+			// strictly per-entry (parentCommitHash == null), so branch labels
+			// and stray cross-branch parent pointers don't change the result.
+			const xHead = makeEntry(
+				"aaa",
+				"2025-01-01T00:00:00Z",
+				"X head",
+				"feature-x",
+			);
+			const yHead = makeEntry(
+				"bbb",
+				"2025-01-02T00:00:00Z",
+				"Y head",
+				"feature-y",
+			);
+			getIndexEntryMap.mockResolvedValue(
+				new Map([
+					["aaa", xHead],
+					["bbb", yHead],
+				]),
+			);
+
+			const bridge = makeBridge();
+			const result = await bridge.listSummaryEntries(10);
+
+			expect(result.entries.map((e) => e.commitHash).sort()).toEqual([
+				"aaa",
+				"bbb",
+			]);
+		});
+
+		it("does NOT surface an entry whose parent is missing from the index (semantics change vs old leaf filter)", async () => {
+			// Only the hoisted child remains; its head was dropped from the
+			// index (corrupt/partial state). The old ChainLeafFilter treated
+			// this as "dangling parent → root → leaf" and surfaced it. The
+			// v4 Hoist head test is stricter: parentCommitHash has a non-null
+			// value, so this is categorically not a head. Reflecting that
+			// honestly is more useful than papering over corrupt state.
+			const orphanedChild = makeEntry(
+				"bbb",
+				"2025-01-02T00:00:00Z",
+				"orphan child",
+				"main",
+				"aaa",
+			);
+			getIndexEntryMap.mockResolvedValue(new Map([["bbb", orphanedChild]]));
+
+			const bridge = makeBridge();
+			const result = await bridge.listSummaryEntries(10);
+			expect(result.entries).toHaveLength(0);
 		});
 
 		it("deduplicates aliases with the same commitHash", async () => {

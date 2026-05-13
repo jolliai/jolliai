@@ -78,6 +78,40 @@ export interface KbFoldersContext {
 export class KbFoldersService {
 	constructor(private readonly getContext: () => KbFoldersContext) {}
 
+	/**
+	 * Enumerates every Memory Bank repo under `<kbParent>`. Wraps `discoverRepos`
+	 * with the cached context (kbParent / currentRepoName / currentRemoteUrl).
+	 * Used by the sidebar breadcrumb to populate the repo dropdown — `isCurrentRepo`
+	 * flags the workspace's own repo for sorting / labeling.
+	 */
+	listRepos(): readonly DiscoveredRepo[] {
+		const ctx = this.getContext();
+		return discoverRepos(
+			ctx.currentRepoName,
+			ctx.currentRemoteUrl,
+			ctx.kbParent,
+		);
+	}
+
+	/**
+	 * Lists every branch known for a discovered repo. The source of truth is
+	 * `<kbRoot>/.jolli/branches.json` (`MetadataManager.listBranchMappings()`),
+	 * not a `readdirSync` of `<kbRoot>` — git allows `/` in branch names which
+	 * get sanitized on disk, and the mapping preserves the original branch
+	 * name; scanning the filesystem would also surface user-dropped folders as
+	 * fake branches. Result is de-duplicated and sorted alphabetically. An
+	 * unknown repo returns `[]`; a fresh repo with no `branches.json` yet
+	 * also returns `[]` because `MetadataManager` defaults to an empty
+	 * mapping registry (readJson swallows missing-file / parse errors).
+	 */
+	listBranches(repoName: string): readonly string[] {
+		const repo = this.listRepos().find((r) => r.repoName === repoName);
+		if (!repo) return [];
+		const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
+		const names = mm.listBranchMappings().map((m) => m.branch);
+		return Array.from(new Set(names)).sort();
+	}
+
 	async listChildren(relPath: string): Promise<FolderNode> {
 		const safe = this.validateRelPath(relPath);
 		const ctx = this.getContext();

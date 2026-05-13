@@ -246,8 +246,26 @@ type PrLookup =
  * argument rather than a flag. This is a defense-in-depth measure since the
  * value originates from persisted JSON on the orphan branch.
  */
-async function findPrForBranch(cwd: string, branch: string): Promise<PrLookup> {
-	const args = ["pr", "view", "--json", "number,url,title,body", "--", branch];
+async function findPrForBranch(
+	cwd: string,
+	branch: string,
+	repoUrl?: string | null,
+): Promise<PrLookup> {
+	// When repoUrl is provided we are looking up a PR for a non-current
+	// repo (Memory Bank cross-repo browsing). gh resolves --repo via the
+	// REST API so the spawn cwd no longer needs to be inside a git working
+	// tree; the local cwd is still passed because spawn requires one and
+	// it doubles as a sensible default for stderr / temp-file locality.
+	const repoArgs = repoUrl ? ["--repo", repoUrl] : [];
+	const args = [
+		"pr",
+		"view",
+		"--json",
+		"number,url,title,body",
+		...repoArgs,
+		"--",
+		branch,
+	];
 	const result = await tryExecGh(args, cwd);
 
 	if (!result.ok) {
@@ -361,8 +379,19 @@ export async function handleCheckPrStatus(
 	cwd: string,
 	postMessage: PostMessageFn,
 	summaryBranch?: string,
+	repoUrl?: string | null,
 ): Promise<void> {
 	try {
+		// Foreign-repo path (Memory Bank cross-repo browsing): when the
+		// caller hands us an explicit repoUrl, the panel is showing a
+		// summary that belongs to a non-current repo. The cwd-bound
+		// current-branch fallback would describe the *current* repo, so we
+		// require summaryBranch and let `findPrForBranch` route the gh call
+		// through `--repo`.
+		if (repoUrl && !summaryBranch) {
+			postMessage({ command: "prStatus", status: "unavailable" });
+			return;
+		}
 		const targetBranch = summaryBranch ?? (await getCurrentBranch(cwd));
 
 		// Check gh availability — distinguish "not installed" (definitive) from
@@ -390,7 +419,7 @@ export async function handleCheckPrStatus(
 		}
 
 		// Always pass an explicit branch — never rely on HEAD semantics
-		const lookup = await findPrForBranch(cwd, targetBranch);
+		const lookup = await findPrForBranch(cwd, targetBranch, repoUrl);
 
 		if (lookup.kind === "lookupError") {
 			// Reuse the `unavailable + reason` channel (already wired for the

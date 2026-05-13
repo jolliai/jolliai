@@ -7,7 +7,7 @@
  */
 
 import { createLogger } from "../Logger.js";
-import type { FileWrite } from "../Types.js";
+import type { FileWrite, SummaryIndexEntry } from "../Types.js";
 import type { StorageProvider } from "./StorageProvider.js";
 
 const log = createLogger("DualWriteStorage");
@@ -33,6 +33,39 @@ export class DualWriteStorage implements StorageProvider {
 		} catch (e) {
 			log.warn("Shadow write failed (folder storage): %s", e instanceof Error ? e.message : String(e));
 			this.shadow.markDirty?.(message);
+		}
+	}
+
+	async deleteVisibleMarkdown(entry: SummaryIndexEntry): Promise<void> {
+		if (!this.shadow.deleteVisibleMarkdown) return;
+		try {
+			await this.shadow.deleteVisibleMarkdown(entry);
+		} catch (err) {
+			const hash8 = entry.commitHash.substring(0, 8);
+			log.warn(
+				"Shadow deleteVisibleMarkdown failed (folder storage) for %s/%s: %s",
+				entry.branch,
+				hash8,
+				err instanceof Error ? err.message : String(err),
+			);
+			this.shadow.markDirty?.(`deleteVisibleMarkdown ${entry.branch}/${hash8}`);
+		}
+	}
+
+	async regenerateVisibleMarkdown(entry: SummaryIndexEntry): Promise<boolean> {
+		if (!this.shadow.regenerateVisibleMarkdown) return false;
+		try {
+			return await this.shadow.regenerateVisibleMarkdown(entry);
+		} catch (err) {
+			const hash8 = entry.commitHash.substring(0, 8);
+			log.warn(
+				"Shadow regenerateVisibleMarkdown failed (folder storage) for %s/%s: %s",
+				entry.branch,
+				hash8,
+				err instanceof Error ? err.message : String(err),
+			);
+			this.shadow.markDirty?.(`regenerateVisibleMarkdown ${entry.branch}/${hash8}`);
+			return false;
 		}
 	}
 

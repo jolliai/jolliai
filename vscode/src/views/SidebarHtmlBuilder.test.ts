@@ -33,28 +33,48 @@ describe("SidebarHtmlBuilder", () => {
 		expect(occurrences).toBeGreaterThanOrEqual(3);
 	});
 
-	it("renders 2 labeled tab buttons + status icon button + settings icon button", () => {
+	it("renders the header bar with breadcrumb (repo + branch) and 3 right-side icon buttons", () => {
 		const html = buildSidebarHtml(
 			"n",
 			"vscode-resource:",
 			"https://example/codicon.css",
 			SIDEBAR_EMPTY_STRINGS,
 		);
-		// Two labeled tabs
+		// Breadcrumb segments: repo on the left, branch on the right, with a
+		// chevron-down per segment that the script hides when there is no
+		// real choice (initially hidden via .hidden in the static skeleton so
+		// the breadcrumb doesn't dangle a no-op affordance before the host
+		// pushes the repo/branch enumeration).
+		expect(html).toContain('id="breadcrumb"');
+		expect(html).toContain('id="breadcrumb-repo-btn"');
+		expect(html).toContain('id="breadcrumb-branch-btn"');
+		expect(html).toContain('id="breadcrumb-repo-label"');
+		expect(html).toContain('id="breadcrumb-branch-label"');
+		expect(html).toMatch(
+			/<i[^>]*class="codicon codicon-chevron-down breadcrumb-seg-chevron hidden"/,
+		);
+		// 3 icon buttons on the right side. Memory Bank and Status carry
+		// data-tab for the switchTab dispatch; Settings carries
+		// data-action="open-settings" so the existing event handler routes it
+		// to the openSettings command without going through tab dispatch.
+		expect(html).toContain('id="kb-icon-btn"');
 		expect(html).toContain('data-tab="kb"');
-		expect(html).toContain('data-tab="branch"');
-		// Status icon button (not a labeled tab — lives in tab-bar-right)
+		expect(html).toContain('id="settings-icon-btn"');
+		expect(html).toContain('data-action="open-settings"');
 		expect(html).toContain('id="status-icon-btn"');
-		expect(html).toContain("codicon-circle-filled");
-		// Settings was moved into the Status tab toolbar (rendered by JS), so it
-		// must NOT live in the static HTML skeleton anymore.
-		expect(html).not.toContain('data-action="open-settings"');
-		// Status icon still carries data-tab="status" for switchTab compatibility
 		expect(html).toContain('data-tab="status"');
+		expect(html).toContain("codicon-circle-filled");
+		// The branch label is now part of the breadcrumb, not a tab button.
+		// data-tab="branch" no longer appears anywhere because Branch is the
+		// implicit default view that surfaces whenever no overlay is active.
+		expect(html).not.toContain('data-tab="branch"');
 		// Native title="Status" was removed in favor of attachTextTip (which
 		// renders a dynamic OK/Warnings/Errors tooltip from JS). Keeping both
 		// would cause the native title to flash before the project tip shows.
 		expect(html).not.toContain('id="status-icon-btn" title=');
+		// Dropdown menu container — empty by default, populated on demand by
+		// the script when a breadcrumb segment is clicked.
+		expect(html).toContain('id="breadcrumb-menu"');
 	});
 
 	it("includes 3 tab content panels with stable ids", () => {

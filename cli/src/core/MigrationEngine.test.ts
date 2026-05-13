@@ -694,6 +694,281 @@ describe("MigrationEngine", () => {
 		});
 	});
 
+	describe("v3 stale-child cleanup", () => {
+		// Local helpers — self-contained so as not to touch outer beforeEach state.
+		let kbRoot: string;
+
+		beforeEach(() => {
+			kbRoot = makeTmpDir();
+		});
+
+		afterEach(() => {
+			rmrf(kbRoot);
+		});
+
+		function makeFolderStorage(): FolderStorage {
+			const mm = new MetadataManager(join(kbRoot, ".jolli"));
+			return new FolderStorage(kbRoot, mm);
+		}
+
+		function makeOrphanStorage(): InMemoryStorage {
+			return new InMemoryStorage();
+		}
+
+		function makeMetadataManager(rootPath: string): MetadataManager {
+			return new MetadataManager(join(rootPath, ".jolli"));
+		}
+
+		function visibleMdExists(rootPath: string, branch: string, slugAndHash: string): boolean {
+			const { existsSync } = require("node:fs");
+			return existsSync(join(rootPath, branch, `${slugAndHash}.md`));
+		}
+
+		/** Seed a v4 Hoist chain: head `aaa` (parent=null), hoisted child `bbb` (parent=aaa). */
+		async function seedHoistChain(fs2: FolderStorage): Promise<void> {
+			await fs2.writeFiles(
+				[
+					{
+						path: "summaries/aaa.json",
+						content: JSON.stringify({
+							version: 3,
+							commitHash: "aaa",
+							commitMessage: "head",
+							commitAuthor: "x",
+							commitDate: "2026-05-12T00:00:00Z",
+							branch: "main",
+							generatedAt: "2026-05-12T00:00:00Z",
+							topics: [],
+						}),
+					},
+					{
+						path: "summaries/bbb.json",
+						content: JSON.stringify({
+							version: 3,
+							commitHash: "bbb",
+							commitMessage: "stalechild",
+							commitAuthor: "x",
+							commitDate: "2026-05-12T00:00:00Z",
+							branch: "main",
+							generatedAt: "2026-05-12T00:00:00Z",
+							topics: [],
+						}),
+					},
+					{
+						path: "index.json",
+						content: JSON.stringify({
+							version: 3,
+							entries: [
+								{
+									commitHash: "aaa",
+									parentCommitHash: null,
+									commitMessage: "head",
+									commitDate: "2026-05-12T00:00:00Z",
+									branch: "main",
+									generatedAt: "2026-05-12T00:00:00Z",
+								},
+								{
+									commitHash: "bbb",
+									parentCommitHash: "aaa",
+									commitMessage: "stalechild",
+									commitDate: "2026-05-12T00:00:00Z",
+									branch: "main",
+									generatedAt: "2026-05-12T00:00:00Z",
+								},
+							],
+						}),
+					},
+				],
+				"seed",
+			);
+		}
+
+		it("deletes stale children (parent!=null) and keeps heads (parent=null), records completedAt", async () => {
+			const fs2 = makeFolderStorage();
+			await seedHoistChain(fs2);
+
+			const mm = makeMetadataManager(kbRoot);
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			const state = await engine.runStaleChildCleanup();
+
+			expect(state.staleChildCleanup?.completedAt).toBeTruthy();
+			// head `aaa` kept; stale child `bbb` deleted.
+			expect(visibleMdExists(kbRoot, "main", "head-aaa")).toBe(true);
+			expect(visibleMdExists(kbRoot, "main", "stalechild-bbb")).toBe(false);
+		});
+
+		it("regenerates missing head .md from hidden JSON before deleting stale children (recovery from 0.99.2's inverted pass)", async () => {
+			const fs2 = makeFolderStorage();
+			await seedHoistChain(fs2);
+
+			// Simulate the post-0.99.2 disk state: head .md was wrongly deleted,
+			// stale child .md was wrongly kept.
+			const { unlinkSync } = require("node:fs");
+			unlinkSync(join(kbRoot, "main", "head-aaa.md"));
+
+			const mm = makeMetadataManager(kbRoot);
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			await engine.runStaleChildCleanup();
+
+			// Head was regenerated from hidden summaries/aaa.json.
+			expect(visibleMdExists(kbRoot, "main", "head-aaa")).toBe(true);
+			// Stale child cleaned.
+			expect(visibleMdExists(kbRoot, "main", "stalechild-bbb")).toBe(false);
+		});
+
+		it("is a no-op when staleChildCleanup.completedAt is already set", async () => {
+			const fs2 = makeFolderStorage();
+			const mm = makeMetadataManager(kbRoot);
+			mm.saveMigrationState({
+				status: "completed",
+				totalEntries: 0,
+				migratedEntries: 0,
+				staleChildCleanup: { completedAt: "2026-05-01T00:00:00Z" },
+			});
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			const state = await engine.runStaleChildCleanup();
+			expect(state.staleChildCleanup?.completedAt).toBe("2026-05-01T00:00:00Z");
+		});
+
+		it("does NOT short-circuit on the legacy 0.99.2 leafCleanup.completedAt — that pass was inverted and must be re-done", async () => {
+			const fs2 = makeFolderStorage();
+			await seedHoistChain(fs2);
+
+			// Delete head .md to simulate the inverted 0.99.2 outcome, and set
+			// the legacy leafCleanup flag as if 0.99.2 already "completed" the job.
+			const { unlinkSync } = require("node:fs");
+			unlinkSync(join(kbRoot, "main", "head-aaa.md"));
+
+			const mm = makeMetadataManager(kbRoot);
+			mm.saveMigrationState({
+				status: "completed",
+				totalEntries: 2,
+				migratedEntries: 2,
+				leafCleanup: { completedAt: "2026-05-12T10:00:00Z" },
+			});
+
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			const state = await engine.runStaleChildCleanup();
+
+			// New step ran regardless of legacy flag — head regenerated, stale child deleted.
+			expect(visibleMdExists(kbRoot, "main", "head-aaa")).toBe(true);
+			expect(visibleMdExists(kbRoot, "main", "stalechild-bbb")).toBe(false);
+			expect(state.staleChildCleanup?.completedAt).toBeTruthy();
+			// Legacy field preserved so any host code in transition still sees it.
+			expect(state.leafCleanup?.completedAt).toBe("2026-05-12T10:00:00Z");
+		});
+
+		// C1: failure-gate. If regenerate or stale-child cleanup raised on any
+		// entry, writing `staleChildCleanup.completedAt` would permanently mute
+		// the recovery path on the next startup. The 0.99.2 head-deletion bug
+		// is exactly the scenario this step exists to repair — silent
+		// permanent-skip on partial failure would mean the .md files we
+		// claimed to regenerate are gone forever and the user has no signal.
+		it("does NOT record completedAt when regenerateVisibleMarkdown raises for some heads", async () => {
+			const fs2 = makeFolderStorage();
+			await seedHoistChain(fs2);
+			// Force regenerateVisibleMarkdown to throw — simulates a corrupt
+			// hidden summaries/aaa.json or a transient write error.
+			const origRegen = fs2.regenerateVisibleMarkdown?.bind(fs2);
+			if (!origRegen) throw new Error("FolderStorage missing regenerateVisibleMarkdown");
+			(fs2 as { regenerateVisibleMarkdown?: typeof origRegen }).regenerateVisibleMarkdown = async () => {
+				throw new Error("synthetic regen failure");
+			};
+
+			const mm = makeMetadataManager(kbRoot);
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			const state = await engine.runStaleChildCleanup();
+
+			// Gate NOT written → next startup will retry.
+			expect(state.staleChildCleanup?.completedAt).toBeFalsy();
+			// Persisted state agrees with returned state (no silent divergence).
+			expect(mm.readMigrationState()?.staleChildCleanup?.completedAt).toBeFalsy();
+		});
+
+		// C1 self-healing: a failed run leaves the gate open. The next run on
+		// the same MetadataManager (e.g. next VS Code activate) must NOT
+		// short-circuit. Pins the round-trip behaviour the user actually sees.
+		it("re-runs on the next invocation after a failed run (does not short-circuit)", async () => {
+			const fs2 = makeFolderStorage();
+			await seedHoistChain(fs2);
+			const origRegen = fs2.regenerateVisibleMarkdown?.bind(fs2);
+			if (!origRegen) throw new Error("FolderStorage missing regenerateVisibleMarkdown");
+
+			let regenCalls = 0;
+			(fs2 as { regenerateVisibleMarkdown?: typeof origRegen }).regenerateVisibleMarkdown = async (entry) => {
+				regenCalls++;
+				if (regenCalls === 1) throw new Error("first run fails");
+				return origRegen(entry);
+			};
+
+			// Delete the head .md so a successful regen has work to do on retry.
+			const { unlinkSync } = require("node:fs");
+			unlinkSync(join(kbRoot, "main", "head-aaa.md"));
+
+			const mm = makeMetadataManager(kbRoot);
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+
+			// Run 1 fails → gate not set.
+			await engine.runStaleChildCleanup();
+			expect(mm.readMigrationState()?.staleChildCleanup?.completedAt).toBeFalsy();
+
+			// Run 2 succeeds → gate set, head regenerated.
+			const state2 = await engine.runStaleChildCleanup();
+			expect(state2.staleChildCleanup?.completedAt).toBeTruthy();
+			expect(visibleMdExists(kbRoot, "main", "head-aaa")).toBe(true);
+		});
+
+		// C2: an unreadable / unparseable folder index.json is the exact
+		// post-0.99.2 corruption shape this step is supposed to recover from.
+		// regenerateMissingHeadMarkdown returning {0,0,0} (success-shaped) for
+		// this case would let runStaleChildCleanup write the gate and never
+		// retry — same permanent-mute trap as C1, different entry point.
+		it("does NOT record completedAt when folder index.json is unreadable", async () => {
+			const fs2 = makeFolderStorage();
+			// Seed only hidden summaries; no index.json at all so the regen
+			// step has nothing to consult.
+			await fs2.writeFiles(
+				[
+					{
+						path: "summaries/aaa.json",
+						content: JSON.stringify({
+							version: 3,
+							commitHash: "aaa",
+							commitMessage: "head",
+							commitAuthor: "x",
+							commitDate: "2026-05-12T00:00:00Z",
+							branch: "main",
+							generatedAt: "2026-05-12T00:00:00Z",
+							topics: [],
+						}),
+					},
+				],
+				"seed summary without index",
+			);
+
+			const mm = makeMetadataManager(kbRoot);
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			const state = await engine.runStaleChildCleanup();
+
+			expect(state.staleChildCleanup?.completedAt).toBeFalsy();
+			expect(mm.readMigrationState()?.staleChildCleanup?.completedAt).toBeFalsy();
+		});
+
+		// C2: index.json present but corrupt — exercises the JSON.parse catch
+		// path in regenerateMissingHeadMarkdown. Same gate-policy guarantee.
+		it("does NOT record completedAt when folder index.json is unparseable", async () => {
+			const fs2 = makeFolderStorage();
+			await fs2.writeFiles([{ path: "index.json", content: "{ this is not json" }], "corrupt index");
+
+			const mm = makeMetadataManager(kbRoot);
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			const state = await engine.runStaleChildCleanup();
+
+			expect(state.staleChildCleanup?.completedAt).toBeFalsy();
+			expect(mm.readMigrationState()?.staleChildCleanup?.completedAt).toBeFalsy();
+		});
+	});
+
 	describe("malformed orphan parse errors as non-Error", () => {
 		// Mock JSON.parse to throw a non-Error so the parse-error log path takes
 		// the `String(e)` else branch in `e instanceof Error ? e.message : String(e)`.
