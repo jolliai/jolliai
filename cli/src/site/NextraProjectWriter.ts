@@ -323,6 +323,10 @@ export default withNextra({${exportLines}
   webpack(config) {
     // See JSDoc above for why this is here.
     config.infrastructureLogging = { ...(config.infrastructureLogging ?? {}), level: 'error' }
+    // Bare image paths in markdown (e.g. "logo.png" instead of "./logo.png")
+    // are common in Docusaurus content. Without preferRelative, webpack treats
+    // them as module imports and fails with "Module not found".
+    config.resolve.preferRelative = true
     return config
   },
 })
@@ -671,9 +675,9 @@ const Wrapper = useMDXComponents({}).wrapper
 export default async function Page(props: { params: Promise<{ mdxPath?: string[] }> }) {
   const params = await props.params
   const result = await importPage(params.mdxPath ?? [])
-  const { default: MDXContent, toc, metadata } = result
+  const { default: MDXContent, ...rest } = result
   return (
-    <Wrapper toc={toc} metadata={metadata}>
+    <Wrapper {...rest}>
       <MDXContent />
     </Wrapper>
   )
