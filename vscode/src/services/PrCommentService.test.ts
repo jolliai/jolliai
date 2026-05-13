@@ -164,6 +164,74 @@ function setupTmpFile() {
 	unlinkMock.mockResolvedValue(undefined);
 }
 
+/**
+ * Builds a `gh pr list --json …` stdout for a single PR.
+ *
+ * `gh pr list` returns an array; we wrap the input so callers can stay terse
+ * (`prJson({ number: 7 })`). State / isCrossRepository default to "OPEN" /
+ * `false` so the bulk of existing fixtures keep their semantics — they meant
+ * "an editable PR exists for this branch".
+ */
+function prJson(pr: {
+	number: number;
+	url?: string;
+	title?: string;
+	body?: string;
+	state?: "OPEN" | "CLOSED" | "MERGED";
+	isCrossRepository?: boolean;
+}): string {
+	return JSON.stringify([
+		{
+			url: "",
+			title: "",
+			body: "",
+			state: "OPEN" as const,
+			isCrossRepository: false,
+			...pr,
+		},
+	]);
+}
+
+/** Empty `gh pr list` response — drives the noPr branch in findPrForBranch. */
+const PR_LIST_EMPTY = "[]";
+
+/**
+ * Routes `gh pr list` by its `--state` argument so a single test can program
+ * both queries that `findPrForBranch` may make (first `--state open`, then
+ * `--state all` as fallback). git/auth/version probes are stubbed to success.
+ */
+function setupListByState(opts: {
+	currentBranch?: string;
+	open: string;
+	all: string;
+}): void {
+	setupExecFile((cmd, args) => {
+		if (cmd === "git" && args[0] === "rev-parse") {
+			return { stdout: `${opts.currentBranch ?? "feature/br"}\n` };
+		}
+		if (cmd === "gh" && args[0] === "--version") return { stdout: "gh 2.40\n" };
+		if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+		if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+			const stateIdx = args.indexOf("--state");
+			const state = stateIdx >= 0 ? args[stateIdx + 1] : "";
+			return { stdout: state === "open" ? opts.open : opts.all };
+		}
+		return { stdout: "" };
+	});
+}
+
+/** Counts how many `gh pr list` calls reached the mock — used to assert that
+ * the open-hit happy path skips the second `--state all` query. */
+function countPrListCalls(): number {
+	return mockExecFileAsync.mock.calls.filter(
+		(call: Array<unknown>) =>
+			call[0] === "gh" &&
+			Array.isArray(call[1]) &&
+			(call[1] as Array<string>)[0] === "pr" &&
+			(call[1] as Array<string>)[1] === "list",
+	).length;
+}
+
 const CWD = "/fake/repo";
 const MARKER_START = "<!-- jollimemory-summary-start -->";
 const MARKER_END = "<!-- jollimemory-summary-end -->";
@@ -292,7 +360,7 @@ describe("PrCommentService", () => {
 						title: "Multi-commit PR",
 						body: "",
 					};
-					return { stdout: JSON.stringify(prData) };
+					return { stdout: prJson(prData) };
 				}
 				return { stdout: "" };
 			});
@@ -396,10 +464,7 @@ describe("PrCommentService", () => {
 					return { stdout: "Logged in\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr") {
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					return { stdout: PR_LIST_EMPTY };
 				}
 				return { stdout: "" };
 			});
@@ -440,10 +505,7 @@ describe("PrCommentService", () => {
 				}
 				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
 				if (cmd === "gh" && args[0] === "pr") {
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					return { stdout: PR_LIST_EMPTY };
 				}
 				return { stdout: "" };
 			});
@@ -570,10 +632,7 @@ describe("PrCommentService", () => {
 					return { stdout: "Logged in\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr") {
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					return { stdout: PR_LIST_EMPTY };
 				}
 				return { stdout: "" };
 			});
@@ -609,7 +668,7 @@ describe("PrCommentService", () => {
 					return { stdout: "Logged in\n" };
 				}
 				if (cmd === "gh" && args[0] === "pr") {
-					return { stdout: JSON.stringify(prData) };
+					return { stdout: prJson(prData) };
 				}
 				return { stdout: "" };
 			});
@@ -683,7 +742,7 @@ describe("PrCommentService", () => {
 				}
 				if (cmd === "gh" && args[0] === "pr") {
 					return {
-						stdout: JSON.stringify({ number: 0, url: "", title: "", body: "" }),
+						stdout: prJson({ number: 0, url: "", title: "", body: "" }),
 					};
 				}
 				return { stdout: "" };
@@ -809,7 +868,7 @@ describe("PrCommentService", () => {
 
 		it("does not emit warn/debug on the happy path (baseline)", async () => {
 			setupHappyProbesWithPrHandler(() => ({
-				stdout: JSON.stringify({
+				stdout: prJson({
 					number: 7,
 					url: "https://pr/7",
 					title: "t",
@@ -823,34 +882,27 @@ describe("PrCommentService", () => {
 			expect(debug).not.toHaveBeenCalled();
 		});
 
-		it("logs at debug when gh pr view stderr indicates 'no pull requests found'", async () => {
-			setupHappyProbesWithPrHandler(() => {
-				throw ghError({
-					message: "gh: exit 1",
-					code: 1,
-					stderr: "no pull requests found for branch feature/br\n",
-				});
-			});
+		it("posts noPr with branch name when gh pr list returns an empty array (no PR exists)", async () => {
+			// `gh pr list` never errors when no PR matches — it returns `[]`.
+			// The Task-1 noPr arm therefore replaces the old "stderr says no
+			// pull requests found" path: empty stdout array, no warn, no debug.
+			setupHappyProbesWithPrHandler(() => ({ stdout: PR_LIST_EMPTY }));
 
 			await handleCheckPrStatus(CWD, postMessage);
 
-			expect(debug).toHaveBeenCalledWith(
-				expect.any(String),
-				expect.stringContaining("No PR for branch feature/br"),
-			);
 			expect(warn).not.toHaveBeenCalled();
-			// UI folding unchanged — see plan non-goal
+			expect(debug).not.toHaveBeenCalled();
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
 			);
 		});
 
-		it("posts unavailable (NOT noPr) when gh pr view fails with a non-expected stderr (e.g. auth/ratelimit)", async () => {
+		it("posts unavailable (NOT noPr) when gh pr list fails with a non-expected stderr (e.g. auth/ratelimit)", async () => {
 			// I-1 contract change: auth lapses, rate limits, and other gh
-			// non-zero exits that don't say "no pull requests found" used to
-			// be folded into noPr — leading the user to click Create PR and
-			// either fail or duplicate. Now they surface as `unavailable`
-			// with the real stderr in `reason`, and the UI shows Retry.
+			// non-zero exits used to be folded into noPr — leading the user
+			// to click Create PR and either fail or duplicate. Now they
+			// surface as `unavailable` with the real stderr in `reason`, and
+			// the UI shows Retry.
 			setupHappyProbesWithPrHandler(() => {
 				throw ghError({
 					message: "gh: exit 1",
@@ -864,7 +916,7 @@ describe("PrCommentService", () => {
 			expect(warn).toHaveBeenCalledWith(
 				expect.any(String),
 				expect.stringMatching(
-					/gh pr view failed for branch feature\/br.*code=1.*stderr:.*authentication required/s,
+					/gh pr list --state open failed for branch feature\/br.*code=1.*stderr:.*authentication required/s,
 				),
 			);
 			expect(debug).not.toHaveBeenCalled();
@@ -935,15 +987,12 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prListHeadArg = args[sepIdx + 1];
 					}
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					return { stdout: PR_LIST_EMPTY };
 				}
 				return { stdout: "" };
 			});
@@ -978,16 +1027,13 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prViewBranchArg = args[sepIdx + 1];
 					}
 					// gh returns "no PR" for the stale name.
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					return { stdout: PR_LIST_EMPTY };
 				}
 				return { stdout: "" };
 			});
@@ -1018,15 +1064,12 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prListHeadArg = args[sepIdx + 1];
 					}
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					return { stdout: PR_LIST_EMPTY };
 				}
 				return { stdout: "" };
 			});
@@ -1034,6 +1077,221 @@ describe("PrCommentService", () => {
 			await handleCheckPrStatus(CWD, postMessage);
 
 			expect(prListHeadArg).toBe("feature/current");
+		});
+
+		// ── state dispatch + previousPr + cross-repo + future state ──────────
+		//
+		// These pin the Task-1/Task-2 contract: findPrForBranch must prefer
+		// OPEN over historic state, must skip cross-repository PRs and unknown
+		// states, and the dispatch must hand the right shape to the webview.
+
+		it("posts ready (no previousPr) when --state open hits an OPEN PR and skips the --state all call", async () => {
+			setupListByState({
+				currentBranch: "feature/br",
+				open: prJson({
+					number: 7,
+					url: "https://pr/7",
+					title: "Open PR",
+					state: "OPEN",
+				}),
+				all: prJson({ number: 999, state: "MERGED" }), // never reached
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prStatus",
+				status: "ready",
+				pr: { number: 7, url: "https://pr/7", title: "Open PR" },
+			});
+			// Confirm no `previousPr` leaked into the ready payload.
+			const readyCall = postMessage.mock.calls.find(
+				(c) => (c[0] as { status?: string }).status === "ready",
+			);
+			expect(readyCall?.[0]).not.toHaveProperty("previousPr");
+			// And the historic-state fallback query never ran.
+			expect(countPrListCalls()).toBe(1);
+		});
+
+		it("posts noPr + previousPr.state=MERGED when --state open is empty and --state all returns a MERGED PR", async () => {
+			setupListByState({
+				currentBranch: "feature/br",
+				open: PR_LIST_EMPTY,
+				all: prJson({
+					number: 42,
+					url: "https://pr/42",
+					title: "Merged",
+					state: "MERGED",
+				}),
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prStatus",
+				status: "noPr",
+				branch: "feature/br",
+				previousPr: {
+					number: 42,
+					url: "https://pr/42",
+					state: "MERGED",
+				},
+			});
+			// Both queries fired — open (empty) then all (hit).
+			expect(countPrListCalls()).toBe(2);
+		});
+
+		it("posts noPr + previousPr.state=CLOSED when --state open is empty and --state all returns a CLOSED PR", async () => {
+			setupListByState({
+				currentBranch: "feature/br",
+				open: PR_LIST_EMPTY,
+				all: prJson({
+					number: 11,
+					url: "https://pr/11",
+					title: "Closed",
+					state: "CLOSED",
+				}),
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "prStatus",
+				status: "noPr",
+				branch: "feature/br",
+				previousPr: {
+					number: 11,
+					url: "https://pr/11",
+					state: "CLOSED",
+				},
+			});
+		});
+
+		it("treats an unrecognised PR state as noPr and warns about it (defense-in-depth)", async () => {
+			// Future-proofing: if GitHub adds a fourth state value (e.g.
+			// "FROZEN" or "ARCHIVED"), don't render a confident UI — degrade
+			// to noPr with a warn log so the user can still Create PR.
+			setupListByState({
+				currentBranch: "feature/br",
+				open: prJson({ number: 5, state: "FROZEN" as never }),
+				all: PR_LIST_EMPTY,
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(warn).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.stringContaining('unexpected state "FROZEN"'),
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
+			);
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ status: "ready" }),
+			);
+		});
+
+		it("treats a cross-repository (fork) PR as noPr — falls back through both queries", async () => {
+			// `gh pr list --head <branch>` matches fork heads of the same name
+			// because the manual doesn't accept `<owner>:<branch>`. Filtering
+			// `isCrossRepository === true` keeps Edit PR from binding to a
+			// stranger's PR; the safe degradation is "show Create PR".
+			setupListByState({
+				currentBranch: "feature/br",
+				open: prJson({
+					number: 100,
+					state: "OPEN",
+					isCrossRepository: true,
+				}),
+				all: prJson({
+					number: 101,
+					state: "MERGED",
+					isCrossRepository: true,
+				}),
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(debug).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.stringContaining(
+					"Ignoring cross-repository PR #100 for branch feature/br",
+				),
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ status: "noPr", branch: "feature/br" }),
+			);
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ previousPr: expect.anything() }),
+			);
+		});
+
+		it("tryExecGh wraps non-Error rejections into Error so lookupError still carries a reason", async () => {
+			// Defensive coverage for the `e instanceof Error ? e : new Error(String(e))`
+			// branch in tryExecGh — exercised when gh rejects with a non-Error value
+			// (very rare but possible if a future Node child_process runtime tweak
+			// skips the Error wrap). The reason field must still contain the
+			// stringified rejection so the webview shows it instead of a blank pane.
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "feature/br\n" };
+				if (cmd === "gh" && args[0] === "--version")
+					return { stdout: "gh 2.40\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					throw "raw string rejection";
+				}
+				return { stdout: "" };
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					status: "unavailable",
+					reason: expect.stringContaining("raw string rejection"),
+				}),
+			);
+		});
+
+		it("does NOT issue a second --state all call when --state open errors (avoid duplicate failure)", async () => {
+			// Reflects the Task-1 decision: an error on the first query bubbles
+			// to lookupError immediately so the user gets one accurate reason,
+			// rather than two warn logs and a misleading "no PR" fallback.
+			let openCalled = false;
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "feature/br\n" };
+				if (cmd === "gh" && args[0] === "--version")
+					return { stdout: "gh 2.40\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const stateIdx = args.indexOf("--state");
+					const state = stateIdx >= 0 ? args[stateIdx + 1] : "";
+					if (state === "open") {
+						openCalled = true;
+						throw ghError({
+							message: "gh: exit 1",
+							code: 1,
+							stderr: "network down",
+						});
+					}
+					// If we ever fall through here, the test fails the assertion below.
+					return { stdout: PR_LIST_EMPTY };
+				}
+				return { stdout: "" };
+			});
+
+			await handleCheckPrStatus(CWD, postMessage);
+
+			expect(openCalled).toBe(true);
+			expect(countPrListCalls()).toBe(1);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					status: "unavailable",
+					reason: expect.stringContaining("network down"),
+				}),
+			);
 		});
 	});
 
@@ -1059,8 +1317,8 @@ describe("PrCommentService", () => {
 					"git:rev-parse": () => ({ stdout: "feature/branch\n" }),
 					"gh:--version": () => ({ stdout: "gh 2.40.0\n" }),
 					"gh:auth": () => ({ stdout: "ok\n" }),
-					"gh:pr:view": () => ({
-						stdout: JSON.stringify({
+					"gh:pr:list": () => ({
+						stdout: prJson({
 							number: 77,
 							url: prUrl,
 							title: "Rebased PR",
@@ -1101,8 +1359,8 @@ describe("PrCommentService", () => {
 					"git:rev-parse": () => ({ stdout: "feature/branch\n" }),
 					"gh:--version": () => ({ stdout: "gh 2.40.0\n" }),
 					"gh:auth": () => ({ stdout: "ok\n" }),
-					"gh:pr:view": () => ({
-						stdout: JSON.stringify({
+					"gh:pr:list": () => ({
+						stdout: prJson({
 							number: 99,
 							url: prUrl,
 							title: "New PR",
@@ -1174,8 +1432,8 @@ describe("PrCommentService", () => {
 					"git:rev-parse": () => ({ stdout: "branch\n" }),
 					"gh:--version": () => ({ stdout: "ok\n" }),
 					"gh:auth": () => ({ stdout: "ok\n" }),
-					"gh:pr:view": () => ({
-						stdout: JSON.stringify({
+					"gh:pr:list": () => ({
+						stdout: prJson({
 							number: 55,
 							url: prUrl,
 							title: "T",
@@ -1255,8 +1513,8 @@ describe("PrCommentService", () => {
 					"git:rev-list": () => ({ stdout: "1\n" }),
 					"gh:--version": () => ({ stdout: "gh 2.40.0\n" }),
 					"gh:auth": () => ({ stdout: "ok\n" }),
-					"gh:pr:view": () => ({
-						stdout: JSON.stringify({
+					"gh:pr:list": () => ({
+						stdout: prJson({
 							number: 123,
 							url: prUrl,
 							title: "OK",
@@ -1275,6 +1533,84 @@ describe("PrCommentService", () => {
 				expect.objectContaining({ command: "prCreateBlockedCrossBranch" }),
 			);
 		});
+
+		it("refresh after successful Create PR flips section from MERGED+previousPr to ready (Task 6 regression)", async () => {
+			// Two-phase scenario across one `mockExecFileAsync.mockImplementation`:
+			//   Phase A (before pr create): --state open returns []; --state all
+			//                                returns a historic MERGED PR — the
+			//                                webview should see noPr + previousPr.
+			//   Phase B (after pr create):  --state open returns the new OPEN PR;
+			//                                the post-create refresh should
+			//                                surface it as ready without `previousPr`.
+			let phase: "before" | "after" = "before";
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "feature/br\n" };
+				if (cmd === "git" && args[0] === "push") return { stdout: "" };
+				if (cmd === "gh" && args[0] === "--version")
+					return { stdout: "gh 2.40\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+					phase = "after";
+					return { stdout: "https://pr/200\n" };
+				}
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const stateIdx = args.indexOf("--state");
+					const state = stateIdx >= 0 ? args[stateIdx + 1] : "";
+					if (phase === "before") {
+						if (state === "open") return { stdout: PR_LIST_EMPTY };
+						return {
+							stdout: prJson({
+								number: 100,
+								url: "https://pr/100",
+								title: "Old merged",
+								state: "MERGED",
+							}),
+						};
+					}
+					// Phase B: the new OPEN PR exists; --state all must not be
+					// queried because findPrForBranch returns on the open hit.
+					if (state === "open") {
+						return {
+							stdout: prJson({
+								number: 200,
+								url: "https://pr/200",
+								title: "New PR",
+								state: "OPEN",
+							}),
+						};
+					}
+					return { stdout: PR_LIST_EMPTY };
+				}
+				return { stdout: "" };
+			});
+
+			// Phase A: assert the pre-create section dispatched noPr + MERGED.
+			await handleCheckPrStatus(CWD, postMessage);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					status: "noPr",
+					previousPr: expect.objectContaining({ state: "MERGED" }),
+				}),
+			);
+
+			postMessage.mockClear();
+
+			// Phase B: handleCreatePr flips phase via gh pr create, then its
+			// internal handleCheckPrStatus must dispatch ready with the new PR.
+			await handleCreatePr("New PR", "Body", CWD, postMessage);
+
+			const readyCalls = postMessage.mock.calls.filter(
+				(c) => (c[0] as { status?: string }).status === "ready",
+			);
+			expect(readyCalls).toHaveLength(1);
+			expect(readyCalls[0][0]).toEqual({
+				command: "prStatus",
+				status: "ready",
+				pr: { number: 200, url: "https://pr/200", title: "New PR" },
+			});
+			expect(readyCalls[0][0]).not.toHaveProperty("previousPr");
+		});
 	});
 
 	// ─── handlePrepareUpdatePr ──────────────────────────────────────────────
@@ -1291,9 +1627,9 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/test-branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
+						stdout: prJson({
 							number: 10,
 							url: "https://url",
 							title: "PR Title",
@@ -1319,9 +1655,9 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/test-branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
+						stdout: prJson({
 							number: 10,
 							url: "https://url",
 							title: "T",
@@ -1357,7 +1693,7 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					throw ghError({
 						message: "gh exit 4",
 						code: 4,
@@ -1399,15 +1735,12 @@ describe("PrCommentService", () => {
 				if (cmd === "gh" && args[0] === "auth") {
 					return { stdout: "ok\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					// Mimic gh's real non-zero exit with the "no pull requests
 					// found" stderr line — findPrForBranch reads it via
 					// `(err as { stderr? }).stderr`, matches the regex,
 					// returns `{ kind: "noPr" }`.
-					throw ghError({
-						message: "gh exit 1",
-						stderr: "no pull requests found",
-					});
+					return { stdout: PR_LIST_EMPTY };
 				}
 				return { stdout: "" };
 			});
@@ -1465,9 +1798,9 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/test-branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
+						stdout: prJson({
 							number: 10,
 							url: "https://url",
 							title: "T",
@@ -1494,13 +1827,13 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/current\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prViewBranchArg = args[sepIdx + 1];
 					}
 					return {
-						stdout: JSON.stringify({
+						stdout: prJson({
 							number: 5,
 							url: "https://url",
 							title: "T",
@@ -1520,6 +1853,75 @@ describe("PrCommentService", () => {
 
 			expect(prViewBranchArg).toBe("feature/summary-branch");
 		});
+
+		// ── Task 3: state-guarded prepareUpdatePr ────────────────────────────
+		//
+		// When `findPrForBranch` returns a terminal-state PR (the panel's
+		// retainContextWhenHidden lets the user click a stale Edit PR after
+		// an external merge/close), prepareUpdatePr must refuse to assemble
+		// the form, warn explicitly, and re-emit prStatus so the section
+		// rebuilds with the noPr + previousPr view (button stops being stuck).
+
+		it("refuses to open the update form when PR is MERGED and repaints the section + warns", async () => {
+			setupListByState({
+				currentBranch: "feature/br",
+				open: PR_LIST_EMPTY,
+				all: prJson({
+					number: 42,
+					url: "https://pr/42",
+					title: "Merged",
+					state: "MERGED",
+				}),
+			});
+
+			await handlePrepareUpdatePr("body", CWD, postMessage);
+
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "prShowUpdateForm" }),
+			);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				"PR #42 is merged — open a new PR instead.",
+			);
+			// prStatus repaint flips the main area to noPr + previousPr so
+			// the Edit PR button (Loading state) is discarded by the rebuild.
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "prStatus",
+					status: "noPr",
+					previousPr: expect.objectContaining({
+						number: 42,
+						state: "MERGED",
+					}),
+				}),
+			);
+		});
+
+		it("refuses to open the update form when PR is CLOSED and repaints + warns", async () => {
+			setupListByState({
+				currentBranch: "feature/br",
+				open: PR_LIST_EMPTY,
+				all: prJson({
+					number: 13,
+					url: "https://pr/13",
+					title: "Closed",
+					state: "CLOSED",
+				}),
+			});
+
+			await handlePrepareUpdatePr("body", CWD, postMessage);
+
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "prShowUpdateForm" }),
+			);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				"PR #13 is closed — open a new PR instead.",
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					previousPr: expect.objectContaining({ state: "CLOSED" }),
+				}),
+			);
+		});
 	});
 
 	// ─── handleUpdatePr ─────────────────────────────────────────────────────
@@ -1535,8 +1937,8 @@ describe("PrCommentService", () => {
 
 			setupExecFile((cmd, args) => {
 				// findPrForBranch
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return { stdout: JSON.stringify(pr) };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					return { stdout: prJson(pr) };
 				}
 				// execGh for pr edit (title change)
 				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
@@ -1610,10 +2012,7 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "branch\n" };
 				}
-				throw ghError({
-					message: "gh exit 1",
-					stderr: "no pull requests found",
-				});
+				return { stdout: PR_LIST_EMPTY };
 			});
 
 			await handleUpdatePr("T", "B", CWD, postMessage);
@@ -1661,9 +2060,9 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
+						stdout: prJson({
 							number: 5,
 							url: "u",
 							title: "T",
@@ -1695,9 +2094,9 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "branch\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
 					return {
-						stdout: JSON.stringify({
+						stdout: prJson({
 							number: 5,
 							url: "u",
 							title: "T",
@@ -1722,8 +2121,8 @@ describe("PrCommentService", () => {
 		it("succeeds even when temp file cleanup fails (removeTempFile catch)", async () => {
 			const pr = { number: 7, url: "https://pr/7", title: "T", body: "" };
 			setupExecFile((cmd, args) => {
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					return { stdout: JSON.stringify(pr) };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					return { stdout: prJson(pr) };
 				}
 				if (cmd === "gh" && args[0] === "pr" && args[1] === "edit") {
 					return { stdout: "" };
@@ -1780,13 +2179,13 @@ describe("PrCommentService", () => {
 				if (cmd === "git" && args[0] === "rev-parse") {
 					return { stdout: "feature/current\n" };
 				}
-				if (cmd === "gh" && args[0] === "pr" && args[1] === "view") {
-					const sepIdx = args.indexOf("--");
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					const sepIdx = args.indexOf("--head");
 					if (sepIdx >= 0) {
 						prViewBranchArg = args[sepIdx + 1];
 					}
 					return {
-						stdout: JSON.stringify({
+						stdout: prJson({
 							number: 11,
 							url: "https://url",
 							title: "T",
@@ -1813,6 +2212,164 @@ describe("PrCommentService", () => {
 			);
 
 			expect(prViewBranchArg).toBe("feature/summary-branch");
+		});
+
+		// ── Task 3: state guard + symmetric repaint on noPr/lookupError ─────
+
+		it("refuses to update when PR is MERGED — clears Updating loading and repaints + warns", async () => {
+			setupListByState({
+				currentBranch: "feature/br",
+				open: PR_LIST_EMPTY,
+				all: prJson({
+					number: 42,
+					url: "https://pr/42",
+					title: "Merged",
+					state: "MERGED",
+				}),
+			});
+
+			await handleUpdatePr("T", "B", CWD, postMessage);
+
+			// Loading dismissed first so the form's Submit doesn't stay spinning.
+			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdateFailed" });
+			// No gh pr edit was attempted.
+			const editCalls = mockExecFileAsync.mock.calls.filter(
+				(c: Array<unknown>) =>
+					c[0] === "gh" &&
+					Array.isArray(c[1]) &&
+					(c[1] as Array<string>)[1] === "edit",
+			);
+			expect(editCalls).toHaveLength(0);
+			// Section repaint flips the main area to noPr + previousPr.
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "prStatus",
+					status: "noPr",
+					previousPr: expect.objectContaining({ state: "MERGED" }),
+				}),
+			);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				"PR #42 was merged between checking and updating — open a new PR instead.",
+			);
+		});
+
+		it("refuses to update when PR is CLOSED with the same clear-loading + repaint + warn shape", async () => {
+			setupListByState({
+				currentBranch: "feature/br",
+				open: PR_LIST_EMPTY,
+				all: prJson({ number: 13, state: "CLOSED" }),
+			});
+
+			await handleUpdatePr("T", "B", CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdateFailed" });
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				"PR #13 was closed between checking and updating — open a new PR instead.",
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					previousPr: expect.objectContaining({ state: "CLOSED" }),
+				}),
+			);
+		});
+
+		it("noPr path also repaints the section (symmetric with handlePrepareUpdatePr)", async () => {
+			// Pre-fix asymmetry: updatePr only emitted prUpdateFailed and
+			// left the main area on a stale ready view. Now both Update form
+			// (Submit → prUpdateFailed) AND the main section (Edit PR button)
+			// get re-synced when the PR vanishes mid-submit.
+			setupListByState({
+				currentBranch: "feature/br",
+				open: PR_LIST_EMPTY,
+				all: PR_LIST_EMPTY,
+			});
+
+			await handleUpdatePr("T", "B", CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdateFailed" });
+			// The repaint sent a noPr prStatus, no previousPr (truly no PR).
+			const prStatusCalls = postMessage.mock.calls.filter(
+				(c) => (c[0] as { command?: string }).command === "prStatus",
+			);
+			expect(prStatusCalls).toHaveLength(1);
+			expect(prStatusCalls[0][0]).toEqual({
+				command: "prStatus",
+				status: "noPr",
+				branch: "feature/br",
+			});
+		});
+
+		it("lookupError path also repaints the section (symmetric with handlePrepareUpdatePr)", async () => {
+			setupExecFile((cmd, args) => {
+				if (cmd === "git" && args[0] === "rev-parse")
+					return { stdout: "feature/br\n" };
+				if (cmd === "gh" && args[0] === "--version")
+					return { stdout: "gh 2.40\n" };
+				if (cmd === "gh" && args[0] === "auth") return { stdout: "ok\n" };
+				if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+					throw ghError({
+						message: "gh: exit 1",
+						code: 1,
+						stderr: "network down",
+					});
+				}
+				return { stdout: "" };
+			});
+
+			await handleUpdatePr("T", "B", CWD, postMessage);
+
+			expect(postMessage).toHaveBeenCalledWith({ command: "prUpdateFailed" });
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("network down"),
+			);
+			// The repaint surfaces the same reason via prStatus.unavailable.
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "prStatus",
+					status: "unavailable",
+					reason: expect.stringContaining("network down"),
+				}),
+			);
+		});
+	});
+
+	// ─── buildPrMessageScript: previousPr rendering (Task 4) ───────────────
+
+	describe("buildPrMessageScript previousPr rendering", () => {
+		it("includes the previousPr branch in the noPr handler with DOM-safe construction", () => {
+			const js = buildPrMessageScript();
+			// The branch reads `msg.previousPr` (presence triggers the link).
+			expect(js).toContain("msg.previousPr");
+			// Anchor is built via DOM API — no innerHTML, no inline events.
+			expect(js).toContain("document.createElement('a')");
+			expect(js).not.toContain("innerHTML");
+			// state suffix is lowercased on render so users see "(merged)".
+			expect(js).toContain("msg.previousPr.state.toLowerCase()");
+			// "Previous PR #" literal is what the user reads above Create PR.
+			expect(js).toContain("'Previous PR #'");
+			// Sanity: the textContent reset on the noPr branch must occur so
+			// a "ready → noPr" transition doesn't leave the ready anchor in
+			// the DOM for the Cancel handler's firstChild test to resurface.
+			const noPrIdx = js.indexOf("s === 'noPr'");
+			const readyIdx = js.indexOf("s === 'ready'");
+			expect(noPrIdx).toBeGreaterThan(0);
+			expect(readyIdx).toBeGreaterThan(noPrIdx);
+			const noPrBlock = js.slice(noPrIdx, readyIdx);
+			expect(noPrBlock).toContain("prLinkRow.textContent = ''");
+		});
+	});
+
+	// ─── buildPrSectionScript: Cancel firstChild visibility (Task 5) ───────
+
+	describe("buildPrSectionScript Cancel handler firstChild visibility", () => {
+		it("decides link-row visibility off prLinkRow.firstChild (not blanket hide)", () => {
+			const js = buildPrSectionScript();
+			// Cancel handler must keep a "Previous PR #N" anchor visible when
+			// it survived the form-show, but hide an empty link row.
+			expect(js).toContain("prLinkRow.firstChild");
+			// Both branches present — the firstChild test must drive show/hide.
+			expect(js).toContain("prShow(prLinkRow)");
+			expect(js).toContain("prHide(prLinkRow)");
 		});
 	});
 });

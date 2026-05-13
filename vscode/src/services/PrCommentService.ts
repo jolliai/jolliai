@@ -220,6 +220,8 @@ interface PrInfo {
 	url: string;
 	title: string;
 	body: string;
+	state: "OPEN" | "CLOSED" | "MERGED";
+	isCrossRepository: boolean;
 }
 
 /**
@@ -239,55 +241,106 @@ type PrLookup =
 
 /**
  * Returns PR info for the given branch.
- * Uses `gh pr view -- <branch>` which works for open, merged, and closed PRs.
  *
- * The `--` end-of-options sentinel prevents option injection: even if `branch`
- * starts with `-` (e.g. `--repo owner/evil`), `gh` treats it as a positional
- * argument rather than a flag. This is a defense-in-depth measure since the
- * value originates from persisted JSON on the orphan branch.
+ * Uses two `gh pr list --head <branch>` queries — first `--state open`, then
+ * `--state all` as fallback — to make the "OPEN takes precedence over historic
+ * terminal-state PRs" policy explicit. `gh pr view <branch>` collapses all
+ * states into one undocumented "most relevant" result, so we couldn't tell an
+ * OPEN PR apart from a MERGED follow-up that happens to share a branch.
+ *
+ * A branch can have multiple PRs over time: CLOSED-then-reopened, or the
+ * MERGED-then-follow-up pattern. We render the OPEN one when it exists, and
+ * the most recent terminal-state one (MERGED/CLOSED) as the "previousPr" hint
+ * when the branch has only history. See {@link handleCheckPrStatus} for how
+ * the dispatch decides between "Edit PR" and "Create PR + Previous PR" CTAs.
+ *
+ * `gh pr list --head <branch>` does NOT support `<owner>:<branch>` syntax —
+ * bare branch names can match same-named heads on forks. We filter
+ * `isCrossRepository === true` results to avoid mis-binding to a fork's PR;
+ * the safe degradation is "show Create PR" rather than editing someone else's.
  */
 async function findPrForBranch(cwd: string, branch: string): Promise<PrLookup> {
-	const args = ["pr", "view", "--json", "number,url,title,body", "--", branch];
+	const open = await listFirstPr(cwd, branch, "open");
+	// `found` → OPEN PR ready to edit. `lookupError` → don't paper over with a
+	// second call that may also fail; surface the real reason to the user.
+	if (open.kind !== "noPr") return open;
+	// No OPEN PR: try terminal-state PRs to surface a "Previous PR" hint.
+	return listFirstPr(cwd, branch, "all");
+}
+
+/**
+ * Runs `gh pr list --head <branch> --state <state> --limit 1` and returns
+ * the first valid PR (or `noPr` / `lookupError`).
+ *
+ * Rejects cross-repo (fork) PRs and unknown state values as `noPr` — the
+ * caller falls back to the next state query (or to overall `noPr`), keeping
+ * the error semantics strictly on gh invocation failure / JSON parse failure.
+ */
+async function listFirstPr(
+	cwd: string,
+	branch: string,
+	state: "open" | "all",
+): Promise<PrLookup> {
+	const args = [
+		"pr",
+		"list",
+		"--head",
+		branch,
+		"--state",
+		state,
+		"--limit",
+		"1",
+		"--json",
+		"number,url,title,body,state,isCrossRepository",
+	];
 	const result = await tryExecGh(args, cwd);
 
 	if (!result.ok) {
 		const stderr = result.stderr ?? "";
-		// "no pull requests found" is the expected miss path — keep it at
-		// debug to avoid noise on every WebView open. Anything else (auth,
-		// rate limit, network, repo config, non-zero exits) is a real
-		// failure and deserves warn so it shows at default log level.
-		const isExpectedNoPr = /no pull requests? found/i.test(stderr);
-		if (isExpectedNoPr) {
-			log.debug(TAG, `No PR for branch ${branch}`);
-			return { kind: "noPr" };
-		}
 		const reason = stderr.trim() || result.err.message;
 		log.warn(
 			TAG,
-			`gh pr view failed for branch ${branch} (code=${result.code}): ${result.err.message}${
+			`gh pr list --state ${state} failed for branch ${branch} (code=${result.code}): ${result.err.message}${
 				stderr ? ` | stderr: ${stderr.trim()}` : ""
 			}`,
 		);
 		return { kind: "lookupError", reason };
 	}
 
+	let arr: Array<PrInfo>;
 	try {
-		const parsed = JSON.parse(result.stdout) as PrInfo;
-		// `gh pr view --json number` returns `{"number": 0}` only in edge
-		// cases (e.g. the JSON shape changed in a future gh release).
-		// Treat as a real noPr — defense-in-depth, not a known reproducer.
-		return parsed.number ? { kind: "found", pr: parsed } : { kind: "noPr" };
+		arr = JSON.parse(result.stdout) as Array<PrInfo>;
 	} catch (err) {
+		/* v8 ignore next -- JSON.parse only throws SyntaxError (an Error); the String(err) fallback is defensive only */
 		const message = err instanceof Error ? err.message : String(err);
 		log.warn(
 			TAG,
-			`gh pr view returned unparseable JSON for branch ${branch}: ${message}. Raw length: ${result.stdout.length}`,
+			`gh pr list returned unparseable JSON for branch ${branch}: ${message}. Raw length: ${result.stdout.length}`,
 		);
 		return {
 			kind: "lookupError",
 			reason: `Unparseable response from gh: ${message}`,
 		};
 	}
+
+	if (!Array.isArray(arr) || arr.length === 0) return { kind: "noPr" };
+	const pr = arr[0];
+	if (!pr.number) return { kind: "noPr" };
+	if (pr.state !== "OPEN" && pr.state !== "CLOSED" && pr.state !== "MERGED") {
+		log.warn(
+			TAG,
+			`gh pr list returned unexpected state "${pr.state}" for branch ${branch}; ignoring.`,
+		);
+		return { kind: "noPr" };
+	}
+	if (pr.isCrossRepository) {
+		log.debug(
+			TAG,
+			`Ignoring cross-repository PR #${pr.number} for branch ${branch}`,
+		);
+		return { kind: "noPr" };
+	}
+	return { kind: "found", pr };
 }
 
 // ─── Temp file helper ────────────────────────────────────────────────────────
@@ -414,10 +467,27 @@ export async function handleCheckPrStatus(
 		}
 
 		const { pr } = lookup;
+		if (pr.state === "OPEN") {
+			postMessage({
+				command: "prStatus",
+				status: "ready",
+				pr: { number: pr.number, url: pr.url, title: pr.title },
+			});
+			return;
+		}
+		// MERGED or CLOSED: present as "no PR to edit" so the CTA flips to
+		// Create PR (a branch can host multiple PRs over time), but pass the
+		// terminal-state PR through as `previousPr` so the webview can render
+		// a one-line "Previous PR #N (merged|closed)" link above the button.
 		postMessage({
 			command: "prStatus",
-			status: "ready",
-			pr: { number: pr.number, url: pr.url, title: pr.title },
+			status: "noPr",
+			branch: targetBranch,
+			previousPr: {
+				number: pr.number,
+				url: pr.url,
+				state: pr.state,
+			},
 		});
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -533,6 +603,22 @@ export async function handlePrepareUpdatePr(
 		}
 
 		const { pr } = lookup;
+		if (pr.state !== "OPEN") {
+			// The webview's Edit PR button only renders when state is OPEN, but
+			// `retainContextWhenHidden` means a stale ready-view can still click
+			// through after an external merge/close. Repaint the section so the
+			// button gets rebuilt against the fresh (noPr + previousPr) state
+			// and the user gets an explicit reason for the rejection.
+			log.info(
+				TAG,
+				`Skipping prepareUpdatePr: PR #${pr.number} is ${pr.state}`,
+			);
+			vscode.window.showWarningMessage(
+				`PR #${pr.number} is ${pr.state.toLowerCase()} — open a new PR instead.`,
+			);
+			await handleCheckPrStatus(cwd, postMessage, summaryBranch);
+			return;
+		}
 		const newBody = replaceSummaryInBody(pr.body || "", markdown);
 
 		postMessage({
@@ -573,6 +659,10 @@ export async function handleUpdatePr(
 			vscode.window.showErrorMessage(
 				`Could not update PR for branch ${targetBranch} — ${lookup.reason}`,
 			);
+			// Symmetric with handlePrepareUpdatePr: also repaint the section so
+			// the main area syncs to the unavailable state — otherwise the user
+			// closes the form and still sees a stale ready view.
+			await handleCheckPrStatus(cwd, postMessage, summaryBranch);
 			return;
 		}
 
@@ -581,10 +671,23 @@ export async function handleUpdatePr(
 			vscode.window.showWarningMessage(
 				`No pull request found for branch ${targetBranch}.`,
 			);
+			await handleCheckPrStatus(cwd, postMessage, summaryBranch);
 			return;
 		}
 
 		const { pr } = lookup;
+		if (pr.state !== "OPEN") {
+			// Stale state: PR was merged/closed between checkPrStatus and the
+			// Submit click. Solve the same way prepareUpdatePr does — repaint
+			// + warn — but also clear the form's "Updating..." loading first.
+			postMessage({ command: "prUpdateFailed" });
+			log.info(TAG, `Skipping updatePr: PR #${pr.number} is ${pr.state}`);
+			vscode.window.showWarningMessage(
+				`PR #${pr.number} was ${pr.state.toLowerCase()} between checking and updating — open a new PR instead.`,
+			);
+			await handleCheckPrStatus(cwd, postMessage, summaryBranch);
+			return;
+		}
 
 		// Update title if changed
 		if (title !== pr.title) {
@@ -752,13 +855,22 @@ export function buildPrSectionScript(): string {
       // Restore Edit PR button state
       var editBtn = document.getElementById('editPrBtn');
       if (editBtn) { editBtn.textContent = 'Edit PR'; editBtn.disabled = false; }
-      // Restore correct visibility based on current state
+      // Restore correct visibility based on current state. For ready state
+      // the link row holds the current PR anchor. For noPr the link row is
+      // either empty (truly no PR) or holds a "Previous PR #N" anchor when
+      // the branch has a MERGED/CLOSED history — both cases are encoded by
+      // the noPr branch above as either an empty link row or a populated
+      // one, so firstChild is the right discriminator.
       if (prCurrentState === 'ready') {
         prHide(prStatusText);
         prShow(prLinkRow);
       } else {
         prShow(prStatusText);
-        prHide(prLinkRow);
+        if (prLinkRow.firstChild) {
+          prShow(prLinkRow);
+        } else {
+          prHide(prLinkRow);
+        }
       }
     });
   }
@@ -823,7 +935,26 @@ export function buildPrMessageScript(): string {
         prShow(prActions);
       } else if (s === 'noPr') {
         prHide(prLinkRow);
-        prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '.';
+        // Clear residual link-row content so the Cancel handler's
+        // firstChild-based visibility check never resurfaces a stale ready
+        // anchor when this branch ran after a "ready → noPr" transition.
+        prLinkRow.textContent = '';
+        if (msg.previousPr) {
+          // A branch can host multiple PRs over time. When the most recent
+          // one is MERGED/CLOSED, surface it as a discoverable link above
+          // the Create PR button so the user can revisit the historic
+          // review/discussion without thinking it's the "current" PR.
+          prStatusText.textContent = 'No open pull request for branch ' + msg.branch + '.';
+          var prevA = document.createElement('a');
+          prevA.href = msg.previousPr.url;
+          prevA.textContent = 'Previous PR #' + msg.previousPr.number +
+            ' (' + msg.previousPr.state.toLowerCase() + ')';
+          prLinkRow.appendChild(prevA);
+          prShow(prLinkRow);
+        } else {
+          prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '.';
+          // link row already cleared and hidden above; nothing more to do.
+        }
         prShow(prStatusText);
         prActions.textContent = '';
         var btn = document.createElement('button');
