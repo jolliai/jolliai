@@ -190,7 +190,28 @@ export function buildSidebarCss(): string {
   }
   .dropdown-item:hover { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground)); }
   .dropdown-item .dropdown-item-check { width: 14px; flex: 0 0 14px; font-size: 12px; }
-  .dropdown-item.current { font-weight: 600; }
+  /* .current = the row currently selected for viewing (drives the check icon).
+     .workspace = the IDE's workspace repo/branch, pinned to the top of the
+     dropdown by pinWorkspaceFirst() and bolded here so the user can always
+     spot the way back home — even when viewing a foreign repo or a sibling
+     branch. Same font-weight on both so two simultaneously-true rows look
+     uniform; the check icon alone distinguishes them. */
+  .dropdown-item.current,
+  .dropdown-item.workspace { font-weight: 600; }
+  /* Divider below the pinned workspace row groups it as its own section at
+     the top of the dropdown, mirroring VS Code's native branch picker which
+     separates the active branch from the alphabetical list. Applied as a
+     border-top on the *next* .dropdown-item via the adjacent-sibling
+     combinator (rather than border-bottom on the workspace row itself) so
+     the rule only matches when there genuinely is a next data row to
+     separate from — no orphan line when the workspace row is the only item
+     in the list, and the empty-state div (which is not a .dropdown-item)
+     never triggers it. */
+  .dropdown-item.workspace + .dropdown-item {
+    border-top: 1px solid var(--vscode-menu-separatorBackground, var(--vscode-panel-border, rgba(128,128,128,0.3)));
+    margin-top: 2px;
+    padding-top: 4px;
+  }
   .dropdown-empty {
     padding: 6px 10px;
     font-size: 12px;
@@ -367,28 +388,33 @@ export function buildSidebarCss(): string {
   .collapsible-section .section-header:hover .section-actions { visibility: visible; }
   .collapsible-section.collapsed .section-body { display: none; }
 
-  /* Bottom-of-section "Commit Memory" CTA — sits at the tail of the Changes
-     section body, separated from the file list by a thin top border so the
-     action chrome reads as "section footer" rather than "another file row".
-     Button aligns right (SCM-view convention) and the wrapper carries the
-     vertical breathing room that makes the divider feel intentional rather
-     than cramped. Button itself reuses VS Code's primary-button tokens so it
-     adapts to theme. Disabled state matches .iconbtn:disabled (opacity-only,
-     no hover background change) so the visual semantics are consistent with
-     the header sparkle iconbtn that points at the same command. */
+  /* Divider that separates the Changes file list from the Commit Memory CTA
+     below. Lives on the section body's bottom edge (not on the CTA wrapper)
+     so it inherits the section-body's collapse behaviour — when CHANGES is
+     collapsed, .section-body { display: none } hides both the file list and
+     this border in one go, while the CTA itself (a sibling of section-body)
+     stays visible and tucks directly under the header. Scoped to the Changes
+     section because that's the only section that mounts a CTA below it.
+     padding-bottom gives the line breathing room above the last file row so
+     the divider reads as intentional rather than cramped against content. */
+  .collapsible-section[data-section="changes"] .section-body {
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border, var(--vscode-panel-border)));
+  }
+
+  /* Bottom-of-section "Commit Memory" CTA — sits below the Changes section
+     body. Button aligns right (SCM-view convention) and the wrapper carries
+     vertical breathing room above (gap from the divider that lives on the
+     section body) and below (gap to the next section header). Button reuses
+     VS Code's primary-button tokens so it adapts to theme. Disabled state
+     matches .iconbtn:disabled (opacity-only, no hover background change) so
+     the visual semantics are consistent with the header sparkle iconbtn that
+     points at the same command. */
   .commit-memory-action {
-    /* Horizontal spacing lives in padding (inside the border) so the
-       border-top can span the full webview width — flush to the
-       tab-content edges. Vertical padding is symmetric so the button has
-       equal breathing room above (from the divider) and below (to the
-       next section's own border-top); margin-top supplies the gap from
-       the last file row above the divider, and margin-bottom is 0 because
-       the next section header already brings its own 1px divider. */
     margin: 12px 0 0 0;
-    padding: 12px 8px 12px 8px;
+    padding: 0 8px 12px 8px;
     display: flex;
     justify-content: flex-end;
-    border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border, var(--vscode-panel-border)));
   }
   .commit-memory-btn {
     display: inline-flex;

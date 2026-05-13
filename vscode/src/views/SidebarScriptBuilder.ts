@@ -931,6 +931,24 @@ export function buildSidebarScript(): string {
     return !(repoMatch && branchMatch);
   }
 
+  // Branch list as the dropdown should see it. The host's listBranches reads
+  // <kbRoot>/.jolli/branches.json, so a brand-new git branch the user just
+  // created in the workspace — but on which no memory has been generated yet
+  // — is absent from the saved mapping. That left the user with no way to
+  // return to it after picking a foreign branch from the breadcrumb. Inject
+  // the workspace branch (state.branchName) when it's missing from the
+  // workspace repo's branch list so the breadcrumb stays round-trippable
+  // even before the first commit summary lands. No injection for foreign
+  // repos — they have no "workspace branch" concept.
+  function getEffectiveBranchList(repoName) {
+    const saved = branchChoicesByRepo[repoName] || [];
+    if (repoName !== state.currentRepoName) return saved;
+    const wb = state.branchName;
+    if (!wb) return saved;
+    if (saved.indexOf(wb) !== -1) return saved;
+    return [wb].concat(saved);
+  }
+
   function applyForeignReadonly() {
     root.classList.toggle('foreign-readonly', isViewingForeign());
   }
@@ -948,7 +966,7 @@ export function buildSidebarScript(): string {
     const detached = state.selectedBranchName ? false : state.detached;
     renderBreadcrumbBranchLabel(branchDisplay, detached);
     const repoForBranches = state.selectedRepoName || state.currentRepoName || '';
-    const branchList = branchChoicesByRepo[repoForBranches] || [];
+    const branchList = getEffectiveBranchList(repoForBranches);
     const branchChevron = breadcrumbBranchBtn.querySelector('.breadcrumb-seg-chevron');
     if (branchChevron) branchChevron.classList.toggle('hidden', branchList.length < 2);
     applyForeignReadonly();
@@ -976,8 +994,13 @@ export function buildSidebarScript(): string {
     const rows = [];
     items.forEach(function(it) {
       const isCurrent = !!it.current;
+      const isWorkspace = !!it.workspace;
+      // Two independent class flags: .current drives the leading check
+      // icon (selected for viewing); .workspace drives bold weight (the
+      // IDE's actual repo/branch). They can co-occur (initial state) or
+      // be on different rows (after the user picks a foreign target).
       const row = el('div', {
-        className: 'dropdown-item' + (isCurrent ? ' current' : ''),
+        className: 'dropdown-item' + (isCurrent ? ' current' : '') + (isWorkspace ? ' workspace' : ''),
         role: 'menuitem',
         'data-value': it.value,
       }, [
@@ -1052,20 +1075,39 @@ export function buildSidebarScript(): string {
     if (searchInput) searchInput.focus();
   }
 
+  // Pulls items flagged as 'workspace' to the front while preserving the
+  // host-supplied order (alphabetical) for the remainder. There is at most
+  // one workspace item per list — see renderBreadcrumbMenu callers — so this
+  // is effectively "move one element to index 0" with a guard for the
+  // already-first case.
+  function pinWorkspaceFirst(items) {
+    const idx = items.findIndex(function(it) { return !!it.workspace; });
+    if (idx <= 0) return items;
+    const head = items[idx];
+    return [head].concat(items.slice(0, idx)).concat(items.slice(idx + 1));
+  }
+
   breadcrumbRepoBtn.addEventListener('click', function(e) {
     e.stopPropagation();
     if (repoChoices.length < 2) return;
     const isOpen = breadcrumbRepoBtn.getAttribute('aria-expanded') === 'true';
     hideBreadcrumbMenu();
     if (isOpen) return;
+    // workspace flag marks the IDE-workspace repo and pins it to the top
+    // regardless of which repo the user has selected. The 'current' flag
+    // still tracks the picked-for-viewing repo (drives the check-mark) and
+    // is independent — when the user views a foreign repo, the workspace
+    // row is bold (.workspace) without a check and the foreign row carries
+    // the check without bold.
     const items = repoChoices.map(function(rc) {
       return {
         value: rc.repoName,
         label: rc.repoName + (rc.isCurrent ? ' (current)' : ''),
         current: rc.repoName === (state.selectedRepoName || state.currentRepoName),
+        workspace: !!rc.isCurrent,
       };
     });
-    showBreadcrumbMenu(breadcrumbRepoBtn, items, function(picked) {
+    showBreadcrumbMenu(breadcrumbRepoBtn, pinWorkspaceFirst(items), function(picked) {
       vscode.postMessage({ type: 'selection:request', repoName: picked });
     });
   });
@@ -1073,7 +1115,11 @@ export function buildSidebarScript(): string {
   breadcrumbBranchBtn.addEventListener('click', function(e) {
     e.stopPropagation();
     const repoForBranches = state.selectedRepoName || state.currentRepoName || '';
-    const list = branchChoicesByRepo[repoForBranches] || [];
+    // Effective list ensures the workspace branch is selectable even when
+    // it has no saved memories yet — without this a freshly-created branch
+    // becomes a trap: the user can leave it via the dropdown but cannot
+    // come back.
+    const list = getEffectiveBranchList(repoForBranches);
     if (list.length < 2) return;
     const isOpen = breadcrumbBranchBtn.getAttribute('aria-expanded') === 'true';
     hideBreadcrumbMenu();
@@ -1086,9 +1132,10 @@ export function buildSidebarScript(): string {
         value: b,
         label: b + (isWorkspaceBranch ? ' (current)' : ''),
         current: b === currentBranchInRepo,
+        workspace: isWorkspaceBranch,
       };
     });
-    showBreadcrumbMenu(breadcrumbBranchBtn, items, function(picked) {
+    showBreadcrumbMenu(breadcrumbBranchBtn, pinWorkspaceFirst(items), function(picked) {
       vscode.postMessage({ type: 'selection:request', branchName: picked });
     });
   });
