@@ -117,11 +117,15 @@ jobs:
                     IDENTITY_REGEX: '^.+@jolli\.ai$'
                     OIDC_ISSUER: 'https://github.com/login/oauth'
                 run: |
-                    # Verify the tag *object* (refs/tags/...) — not the bare
-                    # tag name, which gitsign's revision parser could resolve to
-                    # a same-named branch or a commit pointed at by a lightweight
-                    # tag. The previous step asserted this is an annotated tag.
-                    if ! gitsign verify "refs/tags/${TAG}" \
+                    # `gitsign verify-tag` is the tag-specific verifier; the
+                    # bare `gitsign verify` is for commit envelopes and rejects
+                    # tag signatures with "unsupported signature type". Pass the
+                    # bare tag name — the previous step already asserted
+                    # refs/tags/${TAG} is an annotated tag object, so the
+                    # revision-parser ambiguity that bare names normally invite
+                    # (same-named branch, or lightweight tag at a commit) has
+                    # been ruled out before we reach this point.
+                    if ! gitsign verify-tag "${TAG}" \
                         --certificate-identity-regexp="${IDENTITY_REGEX}" \
                         --certificate-oidc-issuer="${OIDC_ISSUER}"; then
                         echo "::error::tag ${TAG} is not signed via sigstore by a trusted identity"
