@@ -18,6 +18,10 @@ const { loadConfig } = vi.hoisted(() => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
 }));
 
+const { getDeviceLabel } = vi.hoisted(() => ({
+	getDeviceLabel: vi.fn(),
+}));
+
 const {
 	executeCommand,
 	openExternal,
@@ -105,6 +109,10 @@ vi.mock("../../../cli/src/auth/CliExchange.js", () => ({
 	exchangeCliCode,
 }));
 
+vi.mock("../../../cli/src/auth/DeviceLabel.js", () => ({
+	getDeviceLabel,
+}));
+
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadConfig,
 }));
@@ -156,6 +164,9 @@ describe("AuthService", () => {
 		// Default: code-exchange succeeds and returns a token only. Tests that
 		// need an API key or different failure modes override per-call.
 		exchangeCliCode.mockResolvedValue({ token: "test-token" });
+		// Default: no device label so URL-construction tests that don't care
+		// about the param stay unchanged. Multi-device tests override per-call.
+		getDeviceLabel.mockReturnValue(undefined);
 		service = new AuthService();
 	});
 
@@ -756,6 +767,65 @@ describe("AuthService", () => {
 			const parsed = uriParse.mock.calls[0]?.[0] ?? "";
 			expect(parsed).not.toContain("generate_api_key");
 			expect(parsed).toContain("client=vscode");
+		});
+
+		// ── device_name (per-device API-key scoping) ──────────────────────
+		// The server uses device_name to scope its auto-generated-key
+		// idempotency check so signing in from a second machine doesn't
+		// invalidate the first machine's key. Only meaningful when paired
+		// with generate_api_key=true.
+
+		it("appends device_name when generate_api_key is requested and getDeviceLabel returns a value", async () => {
+			getDeviceLabel.mockReturnValue("Foster-MBP");
+
+			await service.openSignInPage();
+
+			const parsed = uriParse.mock.calls[0]?.[0] ?? "";
+			expect(parsed).toContain("generate_api_key=true");
+			expect(new URL(parsed).searchParams.get("device_name")).toBe(
+				"Foster-MBP",
+			);
+		});
+
+		it("URL-encodes a device_name that contains spaces or dots", async () => {
+			// Hostnames like "Foster MacBook Pro.local" must round-trip safely
+			// through the URL — otherwise the server sees a malformed query.
+			getDeviceLabel.mockReturnValue("Foster MacBook Pro.local");
+
+			await service.openSignInPage();
+
+			const parsed = uriParse.mock.calls[0]?.[0] ?? "";
+			expect(parsed).toContain("device_name=Foster%20MacBook%20Pro.local");
+			expect(new URL(parsed).searchParams.get("device_name")).toBe(
+				"Foster MacBook Pro.local",
+			);
+		});
+
+		it("omits device_name when getDeviceLabel returns undefined (sanitized to empty)", async () => {
+			// Hostnames that sanitize to undefined (empty / only disallowed
+			// characters) must not appear on the URL so the server falls back
+			// to its legacy keyName path.
+			getDeviceLabel.mockReturnValue(undefined);
+
+			await service.openSignInPage();
+
+			const parsed = uriParse.mock.calls[0]?.[0] ?? "";
+			expect(parsed).toContain("generate_api_key=true");
+			expect(parsed).not.toContain("device_name");
+		});
+
+		it("omits device_name when generate_api_key is not being requested", async () => {
+			// Pre-existing jolliApiKey → no generate_api_key. device_name is
+			// only meaningful at key-creation time, so it must not appear here
+			// even if the machine has a perfectly valid hostname.
+			loadConfig.mockResolvedValueOnce({ jolliApiKey: "sk-jol-existing" });
+			getDeviceLabel.mockReturnValue("Foster-MBP");
+
+			await service.openSignInPage();
+
+			const parsed = uriParse.mock.calls[0]?.[0] ?? "";
+			expect(parsed).not.toContain("generate_api_key");
+			expect(parsed).not.toContain("device_name");
 		});
 
 		it("should show an error message when openExternal returns false", async () => {

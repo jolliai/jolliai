@@ -14,6 +14,7 @@ import open from "open";
 import { loadConfig } from "../core/SessionTracker.js";
 import { saveAuthCredentials } from "./AuthConfig.js";
 import { exchangeCliCode } from "./CliExchange.js";
+import { getDeviceLabel } from "./DeviceLabel.js";
 
 /**
  * Opens the browser to `${jolliUrl}/login` with a CLI callback URL, waits for
@@ -53,6 +54,14 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}&client=cli`;
 					if (!config.jolliApiKey) {
 						loginUrl += "&generate_api_key=true";
+						// `device_name` scopes the server's per-user idempotency key so
+						// signing in from a second machine doesn't invalidate the first
+						// machine's auto-generated API key. Only meaningful when we're
+						// asking the server to mint a new key — paired with generate_api_key.
+						const deviceLabel = getDeviceLabel();
+						if (deviceLabel) {
+							loginUrl += `&device_name=${encodeURIComponent(deviceLabel)}`;
+						}
 					}
 
 					console.log("Opening browser to login...");
