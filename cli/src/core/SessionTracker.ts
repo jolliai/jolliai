@@ -20,6 +20,9 @@ import type {
 	CursorsRegistry,
 	GitOperation,
 	JolliMemoryConfig,
+	LinearIssueEntry,
+	LinearIssueRef,
+	NoteEntry,
 	PlanEntry,
 	PlansRegistry,
 	SessionInfo,
@@ -786,4 +789,206 @@ export async function associateNoteWithCommit(noteId: string, commitHash: string
 export async function loadPlanEntry(slug: string, cwd?: string): Promise<PlanEntry | null> {
 	const registry = await loadPlansRegistry(cwd);
 	return registry.plans[slug] ?? null;
+}
+
+// ─── Linear issue registry helpers ──────────────────────────────────────────
+
+/**
+ * Returns the ticketIds of Linear issues that are "active" for the given branch:
+ *   - commitHash === null (uncommitted)
+ *   - !ignored
+ *   - !contentHashAtCommit (not a guard from a prior commit)
+ *   - branch matches
+ *
+ * Used by:
+ *   - QueueWorker post-commit (to archive these into LinearIssueCommitRef[])
+ *   - Stage 2 prompt assembly (to inject as <linear-issues> block)
+ *   - VS Code panel (visible entries)
+ */
+export async function detectUncommittedLinearIssueIds(cwd: string, branch: string): Promise<ReadonlyArray<string>> {
+	const registry = await loadPlansRegistry(cwd);
+	const ids: string[] = [];
+	for (const [key, entry] of Object.entries(registry.linearIssues ?? {})) {
+		if (entry.branch !== branch) continue;
+		if (entry.commitHash !== null) continue;
+		if (entry.ignored) continue;
+		if (entry.contentHashAtCommit !== undefined) continue;
+		ids.push(key);
+	}
+	log.debug("Linear issue registry scan: %d uncommitted on %s: [%s]", ids.length, branch, ids.join(", "));
+	return ids;
+}
+
+/**
+ * Returns the entries (not just keys) of Linear issues active for the given branch.
+ * Same filter as detectUncommittedLinearIssueIds — used by the VS Code service
+ * and Stage 2 prompt assembly.
+ */
+export async function getLinearIssueEntriesForBranch(
+	cwd: string,
+	branch: string,
+): Promise<ReadonlyArray<LinearIssueEntry>> {
+	const registry = await loadPlansRegistry(cwd);
+	const entries: LinearIssueEntry[] = [];
+	for (const entry of Object.values(registry.linearIssues ?? {})) {
+		if (entry.branch !== branch) continue;
+		if (entry.commitHash !== null) continue;
+		if (entry.ignored) continue;
+		if (entry.contentHashAtCommit !== undefined) continue;
+		entries.push(entry);
+	}
+	return entries;
+}
+
+/**
+ * Upsert a Linear issue entry into plans.json.linearIssues.
+ *
+ * Field preservation contract (mirrors Plans semantics, see StopHook.ts:196-241):
+ *
+ * Case A: entry exists with `contentHashAtCommit` (guard from prior commit)
+ *   - If `ignored` → return unchanged (user permanently dismissed; never resurrect)
+ *   - If contentHash matches the stored guard → return unchanged (guard intact)
+ *   - If contentHash differs → REPLACE with a fresh uncommitted entry (clears ignored,
+ *     contentHashAtCommit, commitHash, addedAt). Linear payload changed → re-surface.
+ *
+ * Case B: entry exists without `contentHashAtCommit` (currently uncommitted)
+ *   - If `ignored` → return unchanged
+ *   - Else: refresh `title` / `url` / `sourcePath` / `sourceToolName` / `updatedAt`;
+ *     PRESERVE `addedAt`, `branch`, `commitHash` (still null), `ignored`.
+ *
+ * Case C: entry does not exist → insert fresh.
+ *
+ * Concurrency: uses near-write reread + commitHash diff merge (mirrors StopHook
+ * plan-discovery protection, line 249-257). This avoids overwriting a commitHash
+ * that PostCommitHook wrote between our read and write.
+ */
+export async function upsertLinearIssueEntry(
+	ref: LinearIssueRef,
+	sourcePath: string,
+	contentHash: string,
+	branch: string,
+	cwd?: string,
+): Promise<void> {
+	const beforeRegistry = await loadPlansRegistry(cwd);
+	const existing = beforeRegistry.linearIssues?.[ref.ticketId];
+	const now = new Date().toISOString();
+
+	if (existing && existing.contentHashAtCommit !== undefined) {
+		if (existing.ignored) return;
+		if (existing.contentHashAtCommit === contentHash) return;
+		// fall through to replacement
+	} else if (existing?.ignored) {
+		return;
+	}
+
+	// Branch-mismatch refresh: if the existing entry was created on a different
+	// branch, treat as a fresh entry on the current branch (don't smuggle the
+	// foreign branch through a refresh). Caller already filters by branch in
+	// `detectUncommittedLinearIssueIds`, but the upsert path runs for ANY ref
+	// from the extractor — defensive isolation.
+	const canRefreshUncommitted = existing && existing.contentHashAtCommit === undefined && existing.branch === branch;
+
+	const next: LinearIssueEntry = canRefreshUncommitted
+		? {
+				// Refresh uncommitted entry on the same branch
+				...existing,
+				title: ref.title,
+				url: ref.url,
+				sourcePath,
+				sourceToolName: ref.toolName,
+				updatedAt: now,
+			}
+		: {
+				// Fresh entry (new OR replacing a guard that no longer matches OR
+				// existing-on-foreign-branch)
+				ticketId: ref.ticketId,
+				title: ref.title,
+				url: ref.url,
+				sourcePath,
+				branch,
+				addedAt: now,
+				updatedAt: now,
+				commitHash: null,
+				sourceToolName: ref.toolName,
+			};
+
+	// Near-write reread: PostCommitHook may have written a commitHash between
+	// our beforeRegistry read and now. Merge that delta into our write so we
+	// don't clobber it.
+	const freshRegistry = await loadPlansRegistry(cwd);
+	const freshEntry = freshRegistry.linearIssues?.[ref.ticketId];
+	/* v8 ignore start -- near-write reread merge: only fires when PostCommitHook writes a new commitHash between our loadPlansRegistry calls. Race-window guard mirrored from StopHook plan-discovery (StopHook.ts:249-257); not deterministically reachable in unit tests without a concurrent process. */
+	const merged: LinearIssueEntry =
+		freshEntry !== undefined &&
+		freshEntry.commitHash !== null &&
+		freshEntry.commitHash !== (existing?.commitHash ?? null)
+			? { ...next, commitHash: freshEntry.commitHash, contentHashAtCommit: freshEntry.contentHashAtCommit }
+			: next;
+	/* v8 ignore stop */
+
+	const linearIssues = { ...(freshRegistry.linearIssues ?? {}), [ref.ticketId]: merged };
+	await savePlansRegistry({ ...freshRegistry, linearIssues }, cwd);
+	log.info("upsertLinearIssueEntry: %s on %s (%s)", ref.ticketId, branch, existing === undefined ? "new" : "updated");
+}
+
+/**
+ * Update commitHash on a specific Linear issue snapshot entry (keyed by `archivedKey`).
+ * Used by reassociateMetadata when squash/amend/rebase rewrites the commit hash —
+ * the archivedKey from CommitSummary.linearIssues uniquely identifies the snapshot.
+ *
+ * NOTE: This does NOT rename the map key. The `archivedKey` records the original
+ * archival commit (a historical artifact); commitHash tracks the latest commit
+ * that owns this snapshot. Mirrors associatePlanWithCommit semantics.
+ */
+export async function associateLinearIssueWithCommit(
+	archivedKey: string,
+	newHash: string,
+	cwd?: string,
+): Promise<void> {
+	const registry = await loadPlansRegistry(cwd);
+	const entry = registry.linearIssues?.[archivedKey];
+	if (!entry) {
+		log.debug("associateLinearIssueWithCommit: key %s not in registry, skipping", archivedKey);
+		return;
+	}
+	const linearIssues = registry.linearIssues as NonNullable<PlansRegistry["linearIssues"]>;
+	const updated: PlansRegistry = {
+		...registry,
+		linearIssues: {
+			...linearIssues,
+			[archivedKey]: { ...entry, commitHash: newHash, updatedAt: new Date().toISOString() },
+		},
+	};
+	await savePlansRegistry(updated, cwd);
+	log.info("associateLinearIssueWithCommit: %s → %s", archivedKey, newHash.substring(0, 8));
+}
+
+// ─── Active-entry queries for Stage 2 prompt assembly ───────────────────────
+
+/** Active plans on the given branch — uncommitted, not ignored, not guard-archived. */
+export async function detectActivePlansForBranch(cwd: string, branch: string): Promise<ReadonlyArray<PlanEntry>> {
+	const registry = await loadPlansRegistry(cwd);
+	const entries: PlanEntry[] = [];
+	for (const entry of Object.values(registry.plans)) {
+		if (entry.branch !== branch) continue;
+		if (entry.commitHash !== null) continue;
+		if (entry.ignored) continue;
+		if (entry.contentHashAtCommit !== undefined) continue;
+		entries.push(entry);
+	}
+	return entries;
+}
+
+/** Active notes on the given branch — uncommitted, not ignored, not guard-archived. */
+export async function detectActiveNotesForBranch(cwd: string, branch: string): Promise<ReadonlyArray<NoteEntry>> {
+	const registry = await loadPlansRegistry(cwd);
+	const entries: NoteEntry[] = [];
+	for (const entry of Object.values(registry.notes ?? {})) {
+		if (entry.branch !== branch) continue;
+		if (entry.commitHash !== null) continue;
+		if (entry.ignored) continue;
+		if (entry.contentHashAtCommit !== undefined) continue;
+		entries.push(entry);
+	}
+	return entries;
 }

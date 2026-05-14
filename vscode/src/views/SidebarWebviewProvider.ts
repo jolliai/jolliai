@@ -345,6 +345,24 @@ export class SidebarWebviewProvider
 					msg.noteId,
 				);
 				return;
+			case "branch:openLinearIssue":
+				void this.deps.executeCommand(
+					"jollimemory.openLinearIssue",
+					msg.mapKey,
+				);
+				return;
+			case "branch:openLinearIssueMarkdown":
+				void this.deps.executeCommand(
+					"jollimemory.openLinearIssueMarkdown",
+					msg.mapKey,
+				);
+				return;
+			case "branch:ignoreLinearIssue":
+				void this.deps.executeCommand(
+					"jollimemory.ignoreLinearIssue",
+					msg.mapKey,
+				);
+				return;
 			case "branch:openChange":
 				// Rebuild the minimum FileItem-shape the command handler reads.
 				// jollimemory.openFileChange in Extension.ts only touches

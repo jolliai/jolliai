@@ -38,8 +38,16 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
-import type { GitOperation, SessionInfo, SessionsRegistry, SquashPendingState, TranscriptCursor } from "../Types.js";
+import type {
+	GitOperation,
+	LinearIssueRef,
+	SessionInfo,
+	SessionsRegistry,
+	SquashPendingState,
+	TranscriptCursor,
+} from "../Types.js";
 import {
+	associateLinearIssueWithCommit,
 	associateNoteWithCommit,
 	associatePlanWithCommit,
 	checkStaleSquashPending,
@@ -50,10 +58,14 @@ import {
 	deleteQueueEntry,
 	deleteSquashPending,
 	dequeueAllGitOperations,
+	detectActiveNotesForBranch,
+	detectActivePlansForBranch,
+	detectUncommittedLinearIssueIds,
 	enqueueGitOperation,
 	ensureJolliMemoryDir,
 	filterSessionsByEnabledIntegrations,
 	getGlobalConfigDir,
+	getLinearIssueEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
 	loadConfigFromDir,
@@ -72,6 +84,7 @@ import {
 	savePluginSource,
 	saveSession,
 	saveSquashPending,
+	upsertLinearIssueEntry,
 } from "./SessionTracker.js";
 
 describe("SessionTracker", () => {
@@ -1310,6 +1323,415 @@ describe("SessionTracker", () => {
 			await mkdir(dir, { recursive: true });
 			await writeFile(join(dir, "squash-pending.json"), "not json");
 			expect(await checkStaleSquashPending(tempDir)).toBe(true);
+		});
+	});
+
+	// ─── Linear issue registry helpers ──────────────────────────────────────
+
+	describe("detectUncommittedLinearIssueIds / getLinearIssueEntriesForBranch", () => {
+		const ref = (overrides: Partial<LinearIssueRef> = {}): LinearIssueRef => ({
+			ticketId: "JOLLI-1528",
+			title: "t",
+			url: "https://linear.app/x/JOLLI-1528",
+			toolName: "mcp__linear__get_issue",
+			referencedAt: "2026-05-14T06:00:00Z",
+			...overrides,
+		});
+
+		async function seed(entries: Record<string, object>) {
+			await savePlansRegistry(
+				{ version: 1, plans: {}, linearIssues: entries } as Parameters<typeof savePlansRegistry>[0],
+				tempDir,
+			);
+		}
+
+		it("returns uncommitted entries on the current branch", async () => {
+			await upsertLinearIssueEntry(ref(), "/s/JOLLI-1528.md", "hash-1", "main", tempDir);
+			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual(["JOLLI-1528"]);
+			expect((await getLinearIssueEntriesForBranch(tempDir, "main")).map((e) => e.ticketId)).toEqual([
+				"JOLLI-1528",
+			]);
+		});
+
+		it("filters out entries on other branches", async () => {
+			await upsertLinearIssueEntry(ref(), "/s/JOLLI-1528.md", "hash-1", "feature-a", tempDir);
+			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual([]);
+		});
+
+		it("filters out ignored entries", async () => {
+			await seed({
+				"JOLLI-1": {
+					ticketId: "JOLLI-1",
+					title: "t",
+					url: "u",
+					sourcePath: "p",
+					branch: "main",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: null,
+					sourceToolName: "mcp__linear__get_issue",
+					ignored: true,
+				},
+			});
+			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual([]);
+		});
+
+		it("filters out guard entries (have contentHashAtCommit)", async () => {
+			await seed({
+				"JOLLI-1": {
+					ticketId: "JOLLI-1",
+					title: "t",
+					url: "u",
+					sourcePath: "p",
+					branch: "main",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: "abc1234",
+					contentHashAtCommit: "hash",
+					sourceToolName: "mcp__linear__get_issue",
+				},
+			});
+			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual([]);
+		});
+
+		it("filters out archived snapshot entries (commitHash set)", async () => {
+			await seed({
+				"JOLLI-1-abc1234": {
+					ticketId: "JOLLI-1",
+					title: "t",
+					url: "u",
+					sourcePath: "p",
+					branch: "main",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: "abc1234",
+					sourceToolName: "mcp__linear__get_issue",
+				},
+			});
+			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual([]);
+		});
+
+		it("returns empty for repos with no linearIssues section", async () => {
+			await savePlansRegistry({ version: 1, plans: {} }, tempDir);
+			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual([]);
+			expect(await getLinearIssueEntriesForBranch(tempDir, "main")).toEqual([]);
+		});
+	});
+
+	describe("upsertLinearIssueEntry", () => {
+		const ref = (overrides: Partial<LinearIssueRef> = {}): LinearIssueRef => ({
+			ticketId: "JOLLI-1528",
+			title: "Treat referenced Linear issues",
+			url: "https://linear.app/x/JOLLI-1528",
+			toolName: "mcp__linear__get_issue",
+			referencedAt: "2026-05-14T06:00:00Z",
+			...overrides,
+		});
+
+		it("creates a fresh entry when none exists", async () => {
+			await upsertLinearIssueEntry(ref(), "/abs/JOLLI-1528.md", "hash-1", "main", tempDir);
+			const reg = await loadPlansRegistry(tempDir);
+			const e = reg.linearIssues?.["JOLLI-1528"];
+			expect(e).toBeDefined();
+			expect(e?.commitHash).toBeNull();
+			expect(e?.contentHashAtCommit).toBeUndefined();
+			expect(e?.branch).toBe("main");
+			expect(e?.sourcePath).toBe("/abs/JOLLI-1528.md");
+			expect(e?.sourceToolName).toBe("mcp__linear__get_issue");
+		});
+
+		it("preserves addedAt, branch, ignored on update of existing uncommitted entry", async () => {
+			await upsertLinearIssueEntry(ref(), "/abs/JOLLI-1528.md", "hash-1", "main", tempDir);
+			const first = await loadPlansRegistry(tempDir);
+			const addedAt = first.linearIssues?.["JOLLI-1528"]?.addedAt;
+			// Pretend the user ignored it manually
+			await savePlansRegistry(
+				{
+					...first,
+					linearIssues: {
+						...first.linearIssues,
+						"JOLLI-1528": { ...first.linearIssues?.["JOLLI-1528"], ignored: true },
+					},
+				},
+				tempDir,
+			);
+			// Second upsert (StopHook re-discovers) should NOT clear ignored, but should be a no-op
+			await upsertLinearIssueEntry(
+				ref({ title: "new title", referencedAt: "2026-05-14T07:00:00Z" }),
+				"/abs/JOLLI-1528.md",
+				"hash-1",
+				"main",
+				tempDir,
+			);
+			const after = await loadPlansRegistry(tempDir);
+			const e = after.linearIssues?.["JOLLI-1528"];
+			expect(e?.ignored).toBe(true);
+			expect(e?.title).toBe("Treat referenced Linear issues"); // unchanged because ignored
+			expect(e?.addedAt).toBe(addedAt);
+		});
+
+		it("refreshes title/url/sourceToolName on uncommitted entry without ignored", async () => {
+			await upsertLinearIssueEntry(ref(), "/abs/JOLLI-1528.md", "hash-1", "main", tempDir);
+			const before = await loadPlansRegistry(tempDir);
+			const addedAt = before.linearIssues?.["JOLLI-1528"]?.addedAt;
+
+			await upsertLinearIssueEntry(
+				ref({
+					title: "new title",
+					url: "https://linear.app/x/JOLLI-1528/v2",
+					toolName: "mcp__linear__list_issues",
+				}),
+				"/abs/JOLLI-1528.md",
+				"hash-2",
+				"main",
+				tempDir,
+			);
+			const after = await loadPlansRegistry(tempDir);
+			const e = after.linearIssues?.["JOLLI-1528"];
+			expect(e?.title).toBe("new title");
+			expect(e?.url).toBe("https://linear.app/x/JOLLI-1528/v2");
+			expect(e?.sourceToolName).toBe("mcp__linear__list_issues");
+			expect(e?.addedAt).toBe(addedAt); // preserved
+		});
+
+		it("returns no-op when an existing guard's contentHashAtCommit matches", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					linearIssues: {
+						"JOLLI-1528": {
+							ticketId: "JOLLI-1528",
+							title: "old",
+							url: "u",
+							sourcePath: "/p",
+							branch: "main",
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+							commitHash: "abc1234",
+							contentHashAtCommit: "matching-hash",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					},
+				},
+				tempDir,
+			);
+			await upsertLinearIssueEntry(ref({ title: "new title" }), "/p", "matching-hash", "main", tempDir);
+			const after = await loadPlansRegistry(tempDir);
+			expect(after.linearIssues?.["JOLLI-1528"]?.title).toBe("old"); // unchanged
+			expect(after.linearIssues?.["JOLLI-1528"]?.commitHash).toBe("abc1234");
+		});
+
+		it("replaces a guard entry with a fresh uncommitted one when content hash differs", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					linearIssues: {
+						"JOLLI-1528": {
+							ticketId: "JOLLI-1528",
+							title: "old",
+							url: "u",
+							sourcePath: "/p",
+							branch: "main",
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+							commitHash: "abc1234",
+							contentHashAtCommit: "old-hash",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					},
+				},
+				tempDir,
+			);
+			await upsertLinearIssueEntry(ref({ title: "new" }), "/p", "new-hash", "main", tempDir);
+			const after = await loadPlansRegistry(tempDir);
+			const e = after.linearIssues?.["JOLLI-1528"];
+			expect(e?.title).toBe("new");
+			expect(e?.commitHash).toBeNull();
+			expect(e?.contentHashAtCommit).toBeUndefined();
+		});
+
+		it("creates a fresh entry when an existing one is on a different branch (defensive isolation)", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					linearIssues: {
+						"JOLLI-1528": {
+							ticketId: "JOLLI-1528",
+							title: "old on feature-a",
+							url: "u",
+							sourcePath: "/p",
+							branch: "feature-a",
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+							commitHash: null,
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					},
+				},
+				tempDir,
+			);
+			// Upsert from a different branch — defensive replacement to a fresh entry on "main"
+			await upsertLinearIssueEntry(
+				ref({ title: "fresh on main" }),
+				"/abs/JOLLI-1528.md",
+				"hash-x",
+				"main",
+				tempDir,
+			);
+			const after = await loadPlansRegistry(tempDir);
+			const e = after.linearIssues?.["JOLLI-1528"];
+			expect(e?.branch).toBe("main");
+			expect(e?.title).toBe("fresh on main");
+		});
+
+		it("never resurrects an entry whose guard is ignored", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					linearIssues: {
+						"JOLLI-1528": {
+							ticketId: "JOLLI-1528",
+							title: "old",
+							url: "u",
+							sourcePath: "/p",
+							branch: "main",
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+							commitHash: "abc1234",
+							contentHashAtCommit: "old-hash",
+							ignored: true,
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					},
+				},
+				tempDir,
+			);
+			await upsertLinearIssueEntry(ref({ title: "new" }), "/p", "new-hash", "main", tempDir);
+			const after = await loadPlansRegistry(tempDir);
+			expect(after.linearIssues?.["JOLLI-1528"]?.title).toBe("old"); // unchanged
+			expect(after.linearIssues?.["JOLLI-1528"]?.ignored).toBe(true);
+		});
+	});
+
+	describe("associateLinearIssueWithCommit", () => {
+		it("updates commitHash on the entry keyed by archivedKey", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					linearIssues: {
+						"JOLLI-1528-abc1234": {
+							ticketId: "JOLLI-1528",
+							title: "t",
+							url: "u",
+							sourcePath: "/p",
+							branch: "main",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: "abc1234",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					},
+				},
+				tempDir,
+			);
+			await associateLinearIssueWithCommit("JOLLI-1528-abc1234", "def5678abc", tempDir);
+			const after = await loadPlansRegistry(tempDir);
+			expect(after.linearIssues?.["JOLLI-1528-abc1234"]?.commitHash).toBe("def5678abc");
+		});
+
+		it("is a no-op when the archivedKey is not in the registry", async () => {
+			await savePlansRegistry({ version: 1, plans: {}, linearIssues: {} }, tempDir);
+			await associateLinearIssueWithCommit("JOLLI-99-zzz", "newhash", tempDir);
+			const after = await loadPlansRegistry(tempDir);
+			expect(after.linearIssues).toEqual({});
+		});
+	});
+
+	describe("detectActivePlansForBranch / detectActiveNotesForBranch", () => {
+		it("returns uncommitted plans for current branch", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {
+						"plan-1": {
+							slug: "plan-1",
+							title: "t",
+							sourcePath: "/p",
+							branch: "main",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+							editCount: 1,
+						},
+						"plan-2": {
+							slug: "plan-2",
+							title: "t",
+							sourcePath: "/p",
+							branch: "feature",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+							editCount: 1,
+						},
+						"plan-3": {
+							slug: "plan-3",
+							title: "t",
+							sourcePath: "/p",
+							branch: "main",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+							editCount: 1,
+							ignored: true,
+						},
+					},
+				},
+				tempDir,
+			);
+			const plans = await detectActivePlansForBranch(tempDir, "main");
+			expect(plans.map((p) => p.slug)).toEqual(["plan-1"]);
+		});
+
+		it("returns uncommitted notes for current branch", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					notes: {
+						"note-1": {
+							id: "note-1",
+							title: "t",
+							format: "snippet",
+							branch: "main",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+						},
+						"note-2": {
+							id: "note-2",
+							title: "t",
+							format: "snippet",
+							branch: "main",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: "abc",
+						},
+					},
+				},
+				tempDir,
+			);
+			const notes = await detectActiveNotesForBranch(tempDir, "main");
+			expect(notes.map((n) => n.id)).toEqual(["note-1"]);
+		});
+
+		it("returns empty when registry has no notes section", async () => {
+			await savePlansRegistry({ version: 1, plans: {} }, tempDir);
+			expect(await detectActiveNotesForBranch(tempDir, "main")).toEqual([]);
 		});
 	});
 });

@@ -52,6 +52,7 @@ import {
 	mergeManyToOne,
 	migrateIndexToV3,
 	migrateOneToOne,
+	readLinearIssueFromBranch,
 	readNoteFromBranch,
 	readPlanFromBranch,
 	readPlanProgress,
@@ -60,6 +61,7 @@ import {
 	removeFromIndex,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
+	storeLinearIssues,
 	storeNotes,
 	storePlans,
 	storeSummary,
@@ -1535,6 +1537,74 @@ describe("SummaryStore", () => {
 			expect(merged.children?.[1].notes).toBeUndefined();
 		});
 
+		it("should hoist and dedupe linearIssues from children by newest referencedAt", async () => {
+			const old1: CommitSummary = {
+				...createMockSummary("old1", "Old 1"),
+				linearIssues: [
+					{
+						archivedKey: "JOLLI-1-old1",
+						ticketId: "JOLLI-1",
+						title: "Old title",
+						url: "https://linear.app/x/JOLLI-1",
+						referencedAt: "2026-02-18T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+				children: [
+					{
+						...createMockSummary("nested-child", "Nested child"),
+						linearIssues: [
+							{
+								archivedKey: "JOLLI-1-old1",
+								ticketId: "JOLLI-1",
+								title: "Newer title",
+								url: "https://linear.app/x/JOLLI-1",
+								referencedAt: "2026-02-20T00:00:00Z",
+								sourceToolName: "mcp__linear__get_issue",
+							},
+							{
+								archivedKey: "JOLLI-2-nested",
+								ticketId: "JOLLI-2",
+								title: "Nested Only",
+								url: "https://linear.app/x/JOLLI-2",
+								referencedAt: "2026-02-19T00:00:00Z",
+								sourceToolName: "mcp__linear__get_issue",
+							},
+						],
+					},
+				],
+			};
+			const old2: CommitSummary = {
+				...createMockSummary("old2", "Old 2"),
+				linearIssues: [
+					{
+						archivedKey: "JOLLI-3-old2",
+						ticketId: "JOLLI-3",
+						title: "Root Only",
+						url: "https://linear.app/x/JOLLI-3",
+						referencedAt: "2026-02-19T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			};
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			// 3 refs after dedupe-keep-latest on archivedKey
+			expect(merged.linearIssues).toHaveLength(3);
+			const dup = merged.linearIssues?.find((r) => r.archivedKey === "JOLLI-1-old1");
+			expect(dup?.title).toBe("Newer title");
+			expect(dup?.referencedAt).toBe("2026-02-20T00:00:00Z");
+			expect(merged.linearIssues?.find((r) => r.archivedKey === "JOLLI-2-nested")).toBeDefined();
+			expect(merged.linearIssues?.find((r) => r.archivedKey === "JOLLI-3-old2")).toBeDefined();
+			// Children should have linearIssues stripped
+			expect(merged.children?.[0].linearIssues).toBeUndefined();
+			expect(merged.children?.[1].linearIssues).toBeUndefined();
+		});
+
 		it("should not have orphanedDocIds when no summaries have jolliDocId", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
@@ -2501,6 +2571,43 @@ describe("SummaryStore", () => {
 			await storeNotes([], "Empty commit");
 
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("storeLinearIssues / readLinearIssueFromBranch", () => {
+		it("should write Linear issue files to the orphan branch under linear-issues/<archivedKey>.md", async () => {
+			await storeLinearIssues(
+				[
+					{ archivedKey: "JOLLI-1-abc1234", content: "# Issue 1\nbody" },
+					{ archivedKey: "JOLLI-2-abc1234", content: "# Issue 2\nbody" },
+				],
+				"Archive linear issues for commit abc1234",
+			);
+
+			expect(writeMultipleFilesToBranch).toHaveBeenCalledWith(
+				expect.any(String),
+				[
+					{ path: "linear-issues/JOLLI-1-abc1234.md", content: "# Issue 1\nbody" },
+					{ path: "linear-issues/JOLLI-2-abc1234.md", content: "# Issue 2\nbody" },
+				],
+				"Archive linear issues for commit abc1234",
+				undefined,
+			);
+		});
+
+		it("should skip writing when linearFiles array is empty", async () => {
+			await storeLinearIssues([], "Empty commit");
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("readLinearIssueFromBranch reads markdown content from orphan branch by archivedKey", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce("# Archived Issue\nContent here");
+			await expect(readLinearIssueFromBranch("JOLLI-1-abc1234")).resolves.toBe("# Archived Issue\nContent here");
+		});
+
+		it("readLinearIssueFromBranch returns null when the orphan branch file is absent", async () => {
+			vi.mocked(readFileFromBranch).mockRejectedValueOnce(new Error("ENOENT"));
+			await expect(readLinearIssueFromBranch("JOLLI-missing")).resolves.toBeNull();
 		});
 	});
 

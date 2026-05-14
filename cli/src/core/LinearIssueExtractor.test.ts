@@ -1,0 +1,899 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { mockReadFile } = vi.hoisted(() => ({
+	mockReadFile: vi.fn<(path: string, encoding: string) => Promise<string>>(),
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	return { ...actual, readFile: mockReadFile };
+});
+
+import type { LinearIssueRef } from "../Types.js";
+import { extractLinearIssuesFromTranscript, formatLinearIssuesBlock } from "./LinearIssueExtractor.js";
+
+// ─── Fixture builders ────────────────────────────────────────────────────────
+
+function toolUseLine(opts: {
+	toolUseId: string;
+	toolName: string;
+	timestamp: string;
+	isSidechain?: boolean;
+	inputJson?: string;
+}): string {
+	const input = opts.inputJson ?? '{"id":"JOLLI-1528"}';
+	return JSON.stringify({
+		isSidechain: opts.isSidechain ?? false,
+		message: {
+			role: "assistant",
+			content: [
+				{
+					type: "tool_use",
+					id: opts.toolUseId,
+					name: opts.toolName,
+					input: JSON.parse(input),
+				},
+			],
+		},
+		timestamp: opts.timestamp,
+	});
+}
+
+function toolResultLine(opts: { toolUseId: string; timestamp: string; payload: object | object[] | string }): string {
+	const payloadText = typeof opts.payload === "string" ? opts.payload : JSON.stringify(opts.payload);
+	return JSON.stringify({
+		isSidechain: false,
+		type: "user",
+		message: {
+			role: "user",
+			content: [
+				{
+					tool_use_id: opts.toolUseId,
+					type: "tool_result",
+					content: [{ type: "text", text: payloadText }],
+				},
+			],
+		},
+		timestamp: opts.timestamp,
+	});
+}
+
+const SAMPLE_ISSUE_PAYLOAD = {
+	id: "JOLLI-1528",
+	title: "Treat referenced Linear issues as a first-class panel item",
+	description: "## Problem\n\nLinear issues are high-density context.",
+	status: "In Progress",
+	priority: { value: 0, name: "No priority" },
+	labels: ["JolliMemory", "Feature"],
+	url: "https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues",
+};
+
+const SAMPLE_ISSUE_PAYLOAD_2 = {
+	id: "JOLLI-1404",
+	title: "Include active Plans/Notes as input",
+	description: "## Problem\n\nPlans/Notes not in summarize.",
+	status: "Backlog",
+	priority: { value: 2, name: "High" },
+	labels: ["Feature"],
+	url: "https://linear.app/jolliai/issue/JOLLI-1404/include-active-plans-notes",
+};
+
+function makeJsonl(...lines: string[]): string {
+	return `${lines.join("\n")}\n`;
+}
+
+beforeEach(() => {
+	mockReadFile.mockReset();
+});
+
+// ─── extractLinearIssuesFromTranscript ───────────────────────────────────────
+
+describe("extractLinearIssuesFromTranscript", () => {
+	it("extracts a single get_issue payload as one ref with full description", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_1",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:06:00.228Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_1",
+				timestamp: "2026-05-14T06:06:01.123Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues, lastLineNumberScanned } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+		expect(issues[0]).toMatchObject({
+			ticketId: "JOLLI-1528",
+			title: SAMPLE_ISSUE_PAYLOAD.title,
+			url: SAMPLE_ISSUE_PAYLOAD.url,
+			status: "In Progress",
+			priority: "No priority",
+			labels: ["JolliMemory", "Feature"],
+			toolName: "mcp__linear__get_issue",
+			referencedAt: "2026-05-14T06:06:01.123Z",
+		});
+		expect(issues[0].description).toContain("Linear issues are high-density");
+		expect(lastLineNumberScanned).toBe(2);
+	});
+
+	it("extracts all issues from a list_issues array result, preserving order", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_2",
+				toolName: "mcp__linear__list_issues",
+				timestamp: "2026-05-14T06:00:00.000Z",
+				inputJson: '{"team":"Jolli"}',
+			}),
+			toolResultLine({
+				toolUseId: "toolu_2",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: [SAMPLE_ISSUE_PAYLOAD, SAMPLE_ISSUE_PAYLOAD_2],
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues.map((i) => i.ticketId)).toEqual(["JOLLI-1528", "JOLLI-1404"]);
+		expect(issues.every((i) => i.toolName === "mcp__linear__list_issues")).toBe(true);
+	});
+
+	it("dedupes same ticketId across multiple references, keeping the latest referencedAt", async () => {
+		const jsonl = makeJsonl(
+			// First: list result (no description)
+			toolUseLine({
+				toolUseId: "toolu_list",
+				toolName: "mcp__linear__list_issues",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_list",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: [{ id: "JOLLI-1528", title: "old title", url: SAMPLE_ISSUE_PAYLOAD.url }],
+			}),
+			// Then: get_issue with full description, later timestamp
+			toolUseLine({
+				toolUseId: "toolu_get",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T07:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_get",
+				timestamp: "2026-05-14T07:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+		expect(issues[0].title).toBe(SAMPLE_ISSUE_PAYLOAD.title);
+		expect(issues[0].referencedAt).toBe("2026-05-14T07:00:01.000Z");
+		expect(issues[0].description).toContain("Linear issues are high-density");
+	});
+
+	it("silently drops a tool_use that has no matching tool_result", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_orphan",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			// no tool_result line for toolu_orphan
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(0);
+	});
+
+	it("skips tool_result whose text is not valid JSON without throwing", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_bad",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_bad",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: "{not valid json",
+			}),
+			toolUseLine({
+				toolUseId: "toolu_good",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:01:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_good",
+				timestamp: "2026-05-14T06:01:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+		expect(issues[0].ticketId).toBe("JOLLI-1528");
+	});
+
+	it("filters out payloads whose shape does not match an issue (e.g. list_teams)", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_teams",
+				toolName: "mcp__linear__list_teams",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_teams",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: [
+					{ id: "team-uuid-1", name: "Jolli", key: "JOL" }, // not a Linear issue shape
+					{ id: "team-uuid-2", name: "Other", key: "OTH" },
+				],
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(0);
+	});
+
+	it("ignores non-Linear MCP tools via the mcp__linear__ prefix gate", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_gh",
+				toolName: "mcp__github__search_issues",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_gh",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				// even though this payload has issue-like shape, the tool name fails the prefix gate
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(0);
+	});
+
+	it("respects beforeTimestamp cutoff, dropping tool_results after the cutoff", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_early",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_early",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+			toolUseLine({
+				toolUseId: "toolu_late",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T07:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_late",
+				timestamp: "2026-05-14T07:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD_2,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl", {
+			beforeTimestamp: "2026-05-14T06:30:00.000Z",
+		});
+
+		expect(issues).toHaveLength(1);
+		expect(issues[0].ticketId).toBe("JOLLI-1528");
+	});
+
+	it("starts scanning from fromLineNumber and reports lastLineNumberScanned", async () => {
+		const earlyLines = Array.from({ length: 90 }, () =>
+			JSON.stringify({ message: { role: "user", content: [{ type: "text", text: "noise" }] } }),
+		);
+		const jsonl = makeJsonl(
+			...earlyLines,
+			toolUseLine({
+				toolUseId: "toolu_new",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_new",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues, lastLineNumberScanned } = await extractLinearIssuesFromTranscript("/fake.jsonl", {
+			fromLineNumber: 90,
+		});
+
+		expect(issues).toHaveLength(1);
+		expect(lastLineNumberScanned).toBe(92);
+	});
+
+	it("does NOT filter out sidechain (subagent) entries — they still count as references", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_sub",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+				isSidechain: true,
+			}),
+			toolResultLine({
+				toolUseId: "toolu_sub",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+	});
+
+	it("handles edge case: tool_result payload contains literal 'name:mcp__linear__list_issues' string", async () => {
+		// JOLLI-1528 itself discusses MCP tool names in its description, which means a real Linear
+		// payload can include the substring "name":"mcp__linear__list_issues". The two-tier filter
+		// + role-based dispatch must classify this line as a tool_result (role=user), not as a
+		// tool_use (which would require role=assistant). Otherwise we'd mis-handle the payload.
+		const payloadWithToolNameLiteral = {
+			...SAMPLE_ISSUE_PAYLOAD,
+			description:
+				'Reference the JSON `{"name":"mcp__linear__list_issues","input":{}}` literally in description.',
+		};
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_self",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_self",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: payloadWithToolNameLiteral,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+		expect(issues[0].description).toContain("mcp__linear__list_issues");
+	});
+
+	it("rejects payloads whose id does not match the Linear ticket format", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_bad_id",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_bad_id",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				// id "12345" doesn't match /^[A-Z][A-Z0-9_]*-\d+$/
+				payload: { id: "12345", title: "x", url: "https://linear.app/x" },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(0);
+	});
+
+	it("rejects payloads whose title is the empty string", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_empty_title",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_empty_title",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: { id: "JOLLI-1", title: "", url: "https://linear.app/x/JOLLI-1" },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		expect(issues).toHaveLength(0);
+	});
+
+	it("rejects payloads whose url does not start with http:// or https://", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_bad_url",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_bad_url",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: { id: "JOLLI-1", title: "x", url: "ftp://linear.app/x" },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(0);
+	});
+
+	it("handles payloads wrapped in {items: [...]} or {issues: [...]} forms", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_w",
+				toolName: "mcp__linear__list_issues",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_w",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: { items: [SAMPLE_ISSUE_PAYLOAD], total: 1 },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+		expect(issues[0].ticketId).toBe("JOLLI-1528");
+	});
+
+	it("skips entries that aren't valid JSON without breaking the rest", async () => {
+		const jsonl = makeJsonl(
+			"this is not json",
+			toolUseLine({
+				toolUseId: "toolu_v",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_v",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+	});
+
+	it("silently skips lines that look Linear-like but fail JSON.parse on the outer envelope", async () => {
+		const jsonl = makeJsonl(
+			// Contains "name":"mcp__linear__" substring but is malformed JSON
+			'{"name":"mcp__linear__get_issue", broken json...',
+			toolUseLine({
+				toolUseId: "toolu_x",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_x",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+	});
+
+	it("ignores entries whose role is neither assistant nor user even if they match the prefix", async () => {
+		const systemLine = JSON.stringify({
+			message: {
+				role: "system",
+				content: [{ type: "tool_use", id: "x", name: "mcp__linear__get_issue", input: {} }],
+			},
+			timestamp: "2026-05-14T06:00:00.000Z",
+		});
+		const jsonl = makeJsonl(
+			systemLine,
+			toolUseLine({
+				toolUseId: "toolu_normal",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:01:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_normal",
+				timestamp: "2026-05-14T06:01:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+	});
+
+	it("returns empty when transcript file is missing or unreadable", async () => {
+		mockReadFile.mockRejectedValue(new Error("ENOENT"));
+
+		const { issues, lastLineNumberScanned } = await extractLinearIssuesFromTranscript("/missing.jsonl");
+
+		expect(issues).toHaveLength(0);
+		expect(lastLineNumberScanned).toBe(0);
+	});
+
+	it("treats string priority (not object) as plain string", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_p",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_p",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: { ...SAMPLE_ISSUE_PAYLOAD, priority: "Urgent" },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues[0].priority).toBe("Urgent");
+	});
+
+	it("treats priority object whose name is empty string as no-priority", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_p2",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_p2",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: { ...SAMPLE_ISSUE_PAYLOAD, priority: { value: 0, name: "" } },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		expect(issues[0].priority).toBeUndefined();
+	});
+
+	it("drops labels array of non-strings, leaving labels undefined on the ref", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_l",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_l",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				// labels is an array but contains only non-strings → filter empties it → labels undefined
+				payload: { ...SAMPLE_ISSUE_PAYLOAD, labels: [123, null] },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		expect(issues[0].labels).toBeUndefined();
+	});
+
+	it("dedup keeps the FIRST ref when same ticketId appears with an older referencedAt second", async () => {
+		// Exercises the !== branch of the dedup keep-latest check
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_a",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T08:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_a",
+				timestamp: "2026-05-14T08:00:01.000Z",
+				payload: { ...SAMPLE_ISSUE_PAYLOAD, title: "newer" },
+			}),
+			toolUseLine({
+				toolUseId: "toolu_b",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_b",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: { ...SAMPLE_ISSUE_PAYLOAD, title: "older" },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		expect(issues).toHaveLength(1);
+		expect(issues[0].title).toBe("newer");
+	});
+
+	it("accepts a tool_result whose content is a direct string (not an array of text blocks)", async () => {
+		// Some MCP servers emit content as a bare string. The extractor must handle both shapes.
+		const toolUseLineStr = toolUseLine({
+			toolUseId: "toolu_str",
+			toolName: "mcp__linear__get_issue",
+			timestamp: "2026-05-14T06:00:00.000Z",
+		});
+		// Hand-craft a tool_result with `content` as a plain string instead of [{type:"text", text:"..."}]
+		const toolResultStringContent = JSON.stringify({
+			isSidechain: false,
+			type: "user",
+			message: {
+				role: "user",
+				content: [
+					{
+						tool_use_id: "toolu_str",
+						type: "tool_result",
+						content: JSON.stringify(SAMPLE_ISSUE_PAYLOAD),
+					},
+				],
+			},
+			timestamp: "2026-05-14T06:00:01.000Z",
+		});
+		mockReadFile.mockResolvedValue(makeJsonl(toolUseLineStr, toolResultStringContent));
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		expect(issues).toHaveLength(1);
+		expect(issues[0].ticketId).toBe("JOLLI-1528");
+	});
+
+	it("handles a tool_use entry that has no timestamp field", async () => {
+		// Forces readTimestamp's non-string branch + the `timestamp ?? \"\"` fallback in walkPayload dispatch.
+		const toolUseWithoutTs = JSON.stringify({
+			isSidechain: false,
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "toolu_no_ts",
+						name: "mcp__linear__get_issue",
+						input: { id: "JOLLI-1528" },
+					},
+				],
+			},
+			// no timestamp field
+		});
+		const toolResultLineStr = toolResultLine({
+			toolUseId: "toolu_no_ts",
+			timestamp: "2026-05-14T06:00:01.000Z",
+			payload: SAMPLE_ISSUE_PAYLOAD,
+		});
+		mockReadFile.mockResolvedValue(makeJsonl(toolUseWithoutTs, toolResultLineStr));
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		expect(issues).toHaveLength(1);
+	});
+
+	it("skips an orphan tool_result whose tool_use_id does not match any pending Linear use", async () => {
+		// A non-Linear tool_result (e.g. from a Bash call) appearing AFTER a Linear
+		// tool_use is pending; substring pre-filter lets the line through (pending.size > 0 +
+		// "tool_use_id" present) but pending.get returns undefined → continue branch fires.
+		const linearUse = toolUseLine({
+			toolUseId: "toolu_linear",
+			toolName: "mcp__linear__get_issue",
+			timestamp: "2026-05-14T06:00:00.000Z",
+		});
+		const unrelatedToolResult = JSON.stringify({
+			isSidechain: false,
+			type: "user",
+			message: {
+				role: "user",
+				content: [
+					{
+						tool_use_id: "toolu_unrelated_bash",
+						type: "tool_result",
+						content: [{ type: "text", text: "bash output here" }],
+					},
+				],
+			},
+			timestamp: "2026-05-14T06:00:00.500Z",
+		});
+		const linearResult = toolResultLine({
+			toolUseId: "toolu_linear",
+			timestamp: "2026-05-14T06:00:01.000Z",
+			payload: SAMPLE_ISSUE_PAYLOAD,
+		});
+		mockReadFile.mockResolvedValue(makeJsonl(linearUse, unrelatedToolResult, linearResult));
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		expect(issues).toHaveLength(1);
+	});
+
+	it("ignores a tool_use line whose role is reported as something other than assistant or user", async () => {
+		const systemLine = JSON.stringify({
+			message: {
+				role: "system",
+				content: [{ type: "tool_use", id: "toolu_sys", name: "mcp__linear__get_issue", input: {} }],
+			},
+			timestamp: "2026-05-14T06:00:00.000Z",
+		});
+		mockReadFile.mockResolvedValue(makeJsonl(systemLine));
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		expect(issues).toHaveLength(0);
+	});
+
+	it("treats missing priority/labels/status/description gracefully", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_min",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_min",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: { id: "JOLLI-99", title: "minimal", url: "https://linear.app/x/JOLLI-99" },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+		expect(issues[0].description).toBeUndefined();
+		expect(issues[0].status).toBeUndefined();
+		expect(issues[0].priority).toBeUndefined();
+		expect(issues[0].labels).toBeUndefined();
+	});
+});
+
+// ─── formatLinearIssuesBlock ─────────────────────────────────────────────────
+
+function makeRef(overrides: Partial<LinearIssueRef> = {}): LinearIssueRef {
+	return {
+		ticketId: "JOLLI-1528",
+		title: "Treat referenced Linear issues",
+		url: "https://linear.app/jolliai/issue/JOLLI-1528/",
+		status: "In Progress",
+		priority: "No priority",
+		labels: ["JolliMemory", "Feature"],
+		description: "## Problem\n\nLinear issues are high-density context.",
+		toolName: "mcp__linear__get_issue",
+		referencedAt: "2026-05-14T06:00:01.000Z",
+		...overrides,
+	};
+}
+
+describe("formatLinearIssuesBlock", () => {
+	it("returns empty string when given empty array", () => {
+		expect(formatLinearIssuesBlock([])).toBe("");
+	});
+
+	it("renders one issue with full XML structure", () => {
+		const out = formatLinearIssuesBlock([makeRef()]);
+
+		expect(out).toContain("<linear-issues>");
+		expect(out).toContain("</linear-issues>");
+		expect(out).toContain('id="JOLLI-1528"');
+		expect(out).toContain('status="In Progress"');
+		expect(out).toContain('priority="No priority"');
+		expect(out).toContain('labels="JolliMemory, Feature"');
+		expect(out).toContain("<title>Treat referenced Linear issues</title>");
+		expect(out).toContain("<url>https://linear.app/jolliai/issue/JOLLI-1528/</url>");
+		expect(out).toContain("<description>");
+		expect(out).toContain("</description>");
+		expect(out).toContain("Linear issues are high-density");
+	});
+
+	it("escapes XML-special characters in attributes and text", () => {
+		const ref = makeRef({
+			title: 'Title with <tag> & "quote"',
+			description: "Body with </description> and <script>alert(1)</script>",
+		});
+
+		const out = formatLinearIssuesBlock([ref]);
+
+		expect(out).toContain('Title with &lt;tag&gt; &amp; "quote"');
+		expect(out).toContain("&lt;/description&gt;");
+		expect(out).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+	});
+
+	it("preserves SUMMARIZE sentinel strings verbatim (defense is via prompt warning, not escape)", () => {
+		const ref = makeRef({
+			description: "Reviewer wants ===SUMMARY=== and ---TICKETID--- discussed inline.",
+		});
+
+		const out = formatLinearIssuesBlock([ref]);
+
+		expect(out).toContain("===SUMMARY===");
+		expect(out).toContain("---TICKETID---");
+	});
+
+	it("truncates a single description over maxCharsPerIssue with a truncation suffix", () => {
+		const longBody = "x".repeat(5000);
+		const ref = makeRef({ description: longBody });
+
+		const out = formatLinearIssuesBlock([ref], { maxCharsPerIssue: 1000 });
+
+		expect(out).toContain("…[truncated, ");
+		expect(out.length).toBeLessThan(longBody.length + 1000); // truncation happened
+	});
+
+	it("enforces maxTotalChars by dropping oldest-referenced issues first", () => {
+		const refs = [
+			makeRef({
+				ticketId: "JOLLI-1",
+				description: "x".repeat(2500),
+				referencedAt: "2026-05-14T01:00:00.000Z",
+			}),
+			makeRef({
+				ticketId: "JOLLI-2",
+				description: "y".repeat(2500),
+				referencedAt: "2026-05-14T02:00:00.000Z",
+			}),
+			makeRef({
+				ticketId: "JOLLI-3",
+				description: "z".repeat(2500),
+				referencedAt: "2026-05-14T03:00:00.000Z",
+			}),
+		];
+
+		const out = formatLinearIssuesBlock(refs, {
+			maxCharsPerIssue: 3000,
+			maxTotalChars: 6000,
+		});
+
+		expect(out.length).toBeLessThanOrEqual(6500); // small wrapper budget
+		expect(out).toContain('id="JOLLI-3"'); // newest preserved
+		expect(out).not.toContain('id="JOLLI-1"'); // oldest dropped
+	});
+
+	it("returns empty when the budget is too small to fit even one issue", () => {
+		const out = formatLinearIssuesBlock([makeRef()], { maxCharsPerIssue: 100, maxTotalChars: 10 });
+		expect(out).toBe("");
+	});
+
+	it("renders refs in ascending referencedAt order", () => {
+		const refs = [
+			makeRef({ ticketId: "JOLLI-3", referencedAt: "2026-05-14T03:00:00.000Z" }),
+			makeRef({ ticketId: "JOLLI-1", referencedAt: "2026-05-14T01:00:00.000Z" }),
+			makeRef({ ticketId: "JOLLI-2", referencedAt: "2026-05-14T02:00:00.000Z" }),
+		];
+
+		const out = formatLinearIssuesBlock(refs);
+
+		const idx1 = out.indexOf('id="JOLLI-1"');
+		const idx2 = out.indexOf('id="JOLLI-2"');
+		const idx3 = out.indexOf('id="JOLLI-3"');
+		expect(idx1).toBeLessThan(idx2);
+		expect(idx2).toBeLessThan(idx3);
+	});
+
+	it("omits optional fields cleanly when they are undefined", () => {
+		const minimal = makeRef({
+			status: undefined,
+			priority: undefined,
+			labels: undefined,
+			description: undefined,
+		});
+
+		const out = formatLinearIssuesBlock([minimal]);
+
+		expect(out).toContain('id="JOLLI-1528"');
+		expect(out).not.toContain("status=");
+		expect(out).not.toContain("priority=");
+		expect(out).not.toContain("labels=");
+		expect(out).not.toContain("<description>");
+	});
+});

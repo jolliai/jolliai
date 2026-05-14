@@ -85,6 +85,18 @@ export interface SummarizeParams {
 	readonly transcriptEntries: number;
 	/** Actual conversation turns (count of human-role entries); computed by caller */
 	readonly conversationTurns?: number;
+	/**
+	 * Pre-rendered <linear-issues> XML block (or "" when none). The caller
+	 * (QueueWorker) reads plans.json + per-issue markdown and calls
+	 * formatLinearIssuesBlock; we just pass it through to the prompt template.
+	 * Optional for backward compat with callers that pre-date Stage 2 wiring;
+	 * defaults to "" so the placeholder collapses cleanly.
+	 */
+	readonly linearIssues?: string;
+	/** Pre-rendered <plans> XML block (or ""). Mirrors linearIssues. */
+	readonly plans?: string;
+	/** Pre-rendered <notes> XML block (or ""). Mirrors linearIssues. */
+	readonly notes?: string;
 	/** LLM credentials and model selection loaded by the caller */
 	readonly config: LlmConfig;
 }
@@ -129,6 +141,9 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 		commitDate: commitInfo.date,
 		conversation,
 		diff,
+		linearIssues: params.linearIssues ?? "",
+		plans: params.plans ?? "",
+		notes: params.notes ?? "",
 	};
 	const llmResult = await callLlm({
 		action: "summarize",

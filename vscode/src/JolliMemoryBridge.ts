@@ -61,6 +61,12 @@ import type {
 	StatusInfo,
 	SummaryIndexEntry,
 } from "../../cli/src/Types.js";
+import {
+	detectLinearIssues,
+	openLinearIssueInBrowser as openLinearIssueInBrowserImpl,
+	openLinearIssueMarkdown as openLinearIssueMarkdownImpl,
+	setLinearIssueIgnored,
+} from "./core/LinearIssueService.js";
 import { detectNotes, removeNote, saveNote } from "./core/NoteService.js";
 import { detectPlans, ignorePlan } from "./core/PlanService.js";
 import type {
@@ -68,6 +74,7 @@ import type {
 	BranchCommitsResult,
 	CommitFileInfo,
 	FileStatus,
+	LinearIssueInfo,
 	NoteInfo,
 	PlanInfo,
 } from "./Types.js";
@@ -1749,6 +1756,28 @@ export class JolliMemoryBridge {
 	/** Removes a note: deletes file for uncommitted notes, removes from registry. */
 	async removeNote(id: string): Promise<void> {
 		await removeNote(id, this.cwd);
+	}
+
+	// ── Linear issues ────────────────────────────────────────────────────
+
+	/** Lists Linear issues discovered from Claude Code MCP transcripts. */
+	listLinearIssues(): Promise<ReadonlyArray<LinearIssueInfo>> {
+		return detectLinearIssues(this.cwd);
+	}
+
+	/** Marks a Linear issue as ignored (hidden from the panel). */
+	async ignoreLinearIssue(mapKey: string): Promise<void> {
+		await setLinearIssueIgnored(this.cwd, mapKey, true);
+	}
+
+	/** Opens the Linear issue's URL in the user's default browser. */
+	openLinearIssue(info: LinearIssueInfo): Promise<boolean> {
+		return openLinearIssueInBrowserImpl(info);
+	}
+
+	/** Opens the per-issue markdown file in a VS Code editor tab. */
+	openLinearIssueMarkdown(info: LinearIssueInfo): Promise<void> {
+		return openLinearIssueMarkdownImpl(info);
 	}
 }
 

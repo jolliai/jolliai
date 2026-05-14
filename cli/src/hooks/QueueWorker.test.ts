@@ -25,12 +25,36 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 		associatePlanWithCommit: vi.fn(),
 		associateNoteWithCommit: vi.fn(),
+		associateLinearIssueWithCommit: vi.fn().mockResolvedValue(undefined),
+		detectUncommittedLinearIssueIds: vi.fn().mockResolvedValue([]),
+		detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
+		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
+		getLinearIssueEntriesForBranch: vi.fn().mockResolvedValue([]),
 		filterSessionsByEnabledIntegrations: actual.filterSessionsByEnabledIntegrations,
 		dequeueAllGitOperations: vi.fn().mockResolvedValue([]),
 		deleteQueueEntry: vi.fn(),
 		enqueueGitOperation: vi.fn(),
 	};
 });
+
+// LinearIssueStore is fs-bound; mock it so QueueWorker tests don't touch disk
+vi.mock("../core/LinearIssueStore.js", () => ({
+	linearIssuePath: vi.fn((key: string, cwd: string) => `${cwd}/.jolli/jollimemory/linear-issues/${key}.md`),
+	readLinearIssueMarkdown: vi.fn().mockResolvedValue(null),
+	renameLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../core/LinearIssueExtractor.js", () => ({
+	formatLinearIssuesBlock: vi.fn().mockReturnValue(""),
+}));
+
+vi.mock("../core/PlanPromptFormatter.js", () => ({
+	formatPlansBlock: vi.fn().mockResolvedValue(""),
+}));
+
+vi.mock("../core/NotePromptFormatter.js", () => ({
+	formatNotesBlock: vi.fn().mockResolvedValue(""),
+}));
 
 vi.mock("../core/Locks.js", () => ({
 	acquireWorkerLock: vi.fn().mockResolvedValue(true),
@@ -89,6 +113,7 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		migrateOneToOne: vi.fn(),
 		storePlans: vi.fn(),
 		storeNotes: vi.fn(),
+		storeLinearIssues: vi.fn().mockResolvedValue(undefined),
 		setActiveStorage: vi.fn(),
 		// Real implementations -- runSquashPipeline / handleAmendPipeline call
 		// these to expand source commits and copy-hoist topics. The mocks above
@@ -106,6 +131,14 @@ vi.mock("node:fs", async (importOriginal) => {
 		...actual,
 		existsSync: vi.fn().mockReturnValue(false),
 		readFileSync: vi.fn().mockReturnValue(""),
+	};
+});
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	return {
+		...actual,
+		readFile: vi.fn().mockResolvedValue(""),
 	};
 });
 
@@ -209,7 +242,12 @@ import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
+	associateLinearIssueWithCommit,
 	dequeueAllGitOperations,
+	detectActiveNotesForBranch,
+	detectActivePlansForBranch,
+	detectUncommittedLinearIssueIds,
+	getLinearIssueEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
 	loadCursorForTranscript,
@@ -263,6 +301,11 @@ describe("QueueWorker", () => {
 		vi.mocked(saveCursor).mockResolvedValue(undefined);
 		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
 		vi.mocked(savePlansRegistry).mockResolvedValue(undefined);
+		vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue([]);
+		vi.mocked(associateLinearIssueWithCommit).mockResolvedValue(undefined);
+		vi.mocked(detectActivePlansForBranch).mockResolvedValue([]);
+		vi.mocked(detectActiveNotesForBranch).mockResolvedValue([]);
+		vi.mocked(getLinearIssueEntriesForBranch).mockResolvedValue([]);
 		vi.mocked(isCodexInstalled).mockResolvedValue(false);
 		vi.mocked(isOpenCodeInstalled).mockResolvedValue(false);
 		vi.mocked(isCursorInstalled).mockResolvedValue(false);
@@ -382,6 +425,100 @@ describe("QueueWorker", () => {
 			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
 			// Notes should be absent because the only note ID was not found in the registry
 			expect(savedSummary.notes).toBeUndefined();
+		});
+	});
+
+	describe("runWorker — Linear issue association", () => {
+		it("archives Linear issues into the summary with archivedKey populated", async () => {
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue(["JOLLI-1528"]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				linearIssues: {
+					"JOLLI-1528": {
+						ticketId: "JOLLI-1528",
+						title: "Treat referenced Linear issues",
+						url: "https://linear.app/jolliai/issue/JOLLI-1528/",
+						sourcePath: "/test/cwd/.jolli/jollimemory/linear-issues/JOLLI-1528.md",
+						branch: "feature/test",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						commitHash: null,
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+			const { readLinearIssueMarkdown, renameLinearIssueMarkdown } = await import("../core/LinearIssueStore.js");
+			vi.mocked(readLinearIssueMarkdown).mockResolvedValue({
+				ticketId: "JOLLI-1528",
+				title: "Treat referenced Linear issues",
+				url: "https://linear.app/jolliai/issue/JOLLI-1528/",
+				status: "In Progress",
+				priority: "No priority",
+				labels: ["JolliMemory", "Feature"],
+				description: "## Problem\nbody",
+				toolName: "mcp__linear__get_issue",
+				referencedAt: "2026-05-14T06:06:01.123Z",
+			});
+
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("file content");
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(savedSummary.linearIssues).toBeDefined();
+			expect(savedSummary.linearIssues?.[0].archivedKey).toBe("JOLLI-1528-abc12345");
+			expect(savedSummary.linearIssues?.[0].ticketId).toBe("JOLLI-1528");
+			expect(savedSummary.linearIssues?.[0].title).toBe("Treat referenced Linear issues");
+			expect(renameLinearIssueMarkdown).toHaveBeenCalledWith(
+				"/test/cwd/.jolli/jollimemory/linear-issues/JOLLI-1528.md",
+				"/test/cwd/.jolli/jollimemory/linear-issues/JOLLI-1528-abc12345.md",
+			);
+		});
+
+		it("skips Linear issues whose source markdown is unreadable but still completes the pipeline", async () => {
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue(["JOLLI-1528"]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				linearIssues: {
+					"JOLLI-1528": {
+						ticketId: "JOLLI-1528",
+						title: "t",
+						url: "u",
+						sourcePath: "/missing.md",
+						branch: "feature/test",
+						addedAt: "x",
+						updatedAt: "x",
+						commitHash: null,
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+			const { readLinearIssueMarkdown } = await import("../core/LinearIssueStore.js");
+			vi.mocked(readLinearIssueMarkdown).mockResolvedValue(null);
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(savedSummary.linearIssues).toBeUndefined();
 		});
 	});
 

@@ -1358,4 +1358,20 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("searchInput.focus()");
 		});
 	});
+
+	describe("Linear issue row icon", () => {
+		// Final shape after several iterations: the row uses the codicon
+		// `issue-opened` glyph (provider-supplied via iconKey) with NO
+		// brand-specific tint. Prior attempts — inlining Linear's SVG, then
+		// routing through a `linearIssue.iconColor` ThemeColor, then a
+		// context-driven `.icon-color-linear` class — were all dropped at
+		// the user's request to keep rows visually uniform.
+		it("does not apply a Linear-specific colour class on linearissue rows", () => {
+			const js = buildSidebarScript();
+			// Webview-side: no .icon-color-linear class is emitted, nor any
+			// `linearIssue.iconColor` ThemeColor mapping.
+			expect(js).not.toContain("icon-color-linear");
+			expect(js).not.toContain("linearIssue.iconColor");
+		});
+	});
 });

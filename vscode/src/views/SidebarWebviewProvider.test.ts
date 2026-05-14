@@ -549,6 +549,90 @@ describe("SidebarWebviewProvider", () => {
 		).toBeGreaterThanOrEqual(2);
 	});
 
+	it("forwards branch:openLinearIssue via jollimemory.openLinearIssue", () => {
+		// Sidebar row-click → open Linear issue in browser. Pins the
+		// case-branch added for the panel's Linear Issues row type.
+		const view = makeMockView();
+		const exec = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: { fsPath: "/mock", with: () => ({}) } as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:openLinearIssue",
+			mapKey: "JOLLI-1528",
+		});
+		expect(exec).toHaveBeenCalledWith(
+			"jollimemory.openLinearIssue",
+			"JOLLI-1528",
+		);
+	});
+
+	it("forwards branch:openLinearIssueMarkdown via jollimemory.openLinearIssueMarkdown", () => {
+		// Context-menu "Open Markdown" path — opens the on-disk markdown copy
+		// rather than the browser URL. Distinct command from openLinearIssue.
+		const view = makeMockView();
+		const exec = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: { fsPath: "/mock", with: () => ({}) } as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:openLinearIssueMarkdown",
+			mapKey: "JOLLI-1528",
+		});
+		expect(exec).toHaveBeenCalledWith(
+			"jollimemory.openLinearIssueMarkdown",
+			"JOLLI-1528",
+		);
+	});
+
+	it("forwards branch:ignoreLinearIssue via jollimemory.ignoreLinearIssue", () => {
+		// Trash-button path — hides the Linear issue from the panel. Mirrors
+		// the existing Plan/Note ignore wiring.
+		const view = makeMockView();
+		const exec = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: { fsPath: "/mock", with: () => ({}) } as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:ignoreLinearIssue",
+			mapKey: "JOLLI-1528",
+		});
+		expect(exec).toHaveBeenCalledWith(
+			"jollimemory.ignoreLinearIssue",
+			"JOLLI-1528",
+		);
+	});
+
 	it("forwards branch:openPlan via jollimemory.openPlanForPreview", () => {
 		const view = makeMockView();
 		const exec = vi.fn();

@@ -10,6 +10,18 @@ vi.mock("../core/SessionTracker.js", () => ({
 	saveCursor: vi.fn().mockResolvedValue(undefined),
 	loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
 	savePlansRegistry: vi.fn().mockResolvedValue(undefined),
+	upsertLinearIssueEntry: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Mock LinearIssueExtractor — pure-function module called from StopHook
+vi.mock("../core/LinearIssueExtractor.js", () => ({
+	extractLinearIssuesFromTranscript: vi.fn().mockResolvedValue({ issues: [], lastLineNumberScanned: 0 }),
+}));
+
+// Mock LinearIssueStore — fs IO module called from StopHook
+vi.mock("../core/LinearIssueStore.js", () => ({
+	writeLinearIssueMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/abs/JOLLI-1.md", contentHash: "fake-hash" }),
+	hashLinearIssueContent: vi.fn().mockReturnValue("fake-hash"),
 }));
 
 // Mock node:fs so we can control existsSync / readFileSync / createReadStream
@@ -39,6 +51,8 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { extractLinearIssuesFromTranscript } from "../core/LinearIssueExtractor.js";
+import { writeLinearIssueMarkdown } from "../core/LinearIssueStore.js";
 import {
 	loadConfig,
 	loadCursorForTranscript,
@@ -46,6 +60,7 @@ import {
 	saveCursor,
 	savePlansRegistry,
 	saveSession,
+	upsertLinearIssueEntry,
 } from "../core/SessionTracker.js";
 import { handleStopHook } from "./StopHook.js";
 
@@ -977,5 +992,131 @@ describe("StopHook — plan discovery", () => {
 		// The error handler resolves the promise (does not reject).
 		// Cursor should still be updated (totalLines = 0 since no lines were read).
 		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+});
+
+describe("StopHook — Linear issue discovery", () => {
+	const TRANSCRIPT_PATH = "/path/to/session.jsonl";
+	const PROJECT_DIR = "/my/project";
+	const REF = {
+		ticketId: "JOLLI-1528",
+		title: "Treat referenced Linear issues",
+		url: "https://linear.app/x/JOLLI-1528",
+		toolName: "mcp__linear__get_issue",
+		referencedAt: "2026-05-14T06:06:01.123Z",
+		description: "## Problem\nbody",
+	} as const;
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		process.env.CLAUDE_PROJECT_DIR = PROJECT_DIR;
+		vi.mocked(loadConfig).mockResolvedValue({});
+		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
+		vi.mocked(existsSync).mockReturnValue(false);
+		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
+			issues: [],
+			lastLineNumberScanned: 0,
+		});
+	});
+
+	afterEach(() => {
+		process.env.CLAUDE_PROJECT_DIR = undefined;
+	});
+
+	it("skips when transcript file does not exist", async () => {
+		vi.mocked(existsSync).mockReturnValue(false);
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+		expect(extractLinearIssuesFromTranscript).not.toHaveBeenCalled();
+		expect(upsertLinearIssueEntry).not.toHaveBeenCalled();
+	});
+
+	it("writes markdown + upserts entry when an issue is extracted", async () => {
+		// existsSync called twice: once for plan discovery (false), once for linear (true).
+		// Use mockImplementation to return true only for the linear path.
+		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
+		// Plan discovery emits no slugs (transcript stream returns no lines).
+		mockTranscriptWithLines([]);
+		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
+			issues: [REF],
+			lastLineNumberScanned: 42,
+		});
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(writeLinearIssueMarkdown).toHaveBeenCalledWith(REF, PROJECT_DIR);
+		expect(upsertLinearIssueEntry).toHaveBeenCalledWith(
+			REF,
+			"/abs/JOLLI-1.md",
+			"fake-hash",
+			expect.any(String),
+			PROJECT_DIR,
+		);
+		expect(saveCursor).toHaveBeenCalledWith(
+			expect.objectContaining({
+				transcriptPath: `linear:${TRANSCRIPT_PATH}`,
+				lineNumber: 42,
+			}),
+			PROJECT_DIR,
+		);
+	});
+
+	it("advances cursor even when no issues found, as long as new lines were scanned", async () => {
+		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
+		mockTranscriptWithLines([]);
+		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
+			issues: [],
+			lastLineNumberScanned: 10,
+		});
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(upsertLinearIssueEntry).not.toHaveBeenCalled();
+		expect(saveCursor).toHaveBeenCalledWith(
+			expect.objectContaining({
+				transcriptPath: `linear:${TRANSCRIPT_PATH}`,
+				lineNumber: 10,
+			}),
+			PROJECT_DIR,
+		);
+	});
+
+	it("does not save cursor when there are no new lines since last scan", async () => {
+		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
+		mockTranscriptWithLines([]);
+		vi.mocked(loadCursorForTranscript).mockResolvedValue({
+			transcriptPath: `linear:${TRANSCRIPT_PATH}`,
+			lineNumber: 5,
+			updatedAt: new Date().toISOString(),
+		});
+		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
+			issues: [],
+			lastLineNumberScanned: 5,
+		});
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		// saveCursor should not be called for the linear: prefix when lastLine === fromLine
+		const linearSaves = vi
+			.mocked(saveCursor)
+			.mock.calls.filter(
+				(c) => (c[0] as { transcriptPath: string }).transcriptPath === `linear:${TRANSCRIPT_PATH}`,
+			);
+		expect(linearSaves).toHaveLength(0);
+	});
+
+	it("logs the error and continues when extractor throws", async () => {
+		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
+		mockTranscriptWithLines([]);
+		vi.mocked(extractLinearIssuesFromTranscript).mockRejectedValue(new Error("boom"));
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		// Should not throw; handleStopHook swallows the error
+		await expect(handleStopHook()).resolves.toBeUndefined();
+		expect(upsertLinearIssueEntry).not.toHaveBeenCalled();
 	});
 });

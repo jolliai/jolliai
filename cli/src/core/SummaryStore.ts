@@ -28,6 +28,7 @@ import type {
 	DiffStats,
 	E2eTestScenario,
 	FileWrite,
+	LinearIssueCommitRef,
 	NoteReference,
 	PlanProgressArtifact,
 	PlanReference,
@@ -403,6 +404,45 @@ function stripNotes(node: CommitSummary): CommitSummary {
 	return { ...rest, children: rest.children.map(stripNotes) } as CommitSummary;
 }
 
+/** Returns a deep copy of the summary tree with linearIssues stripped from all nodes. */
+function stripLinearIssues(node: CommitSummary): CommitSummary {
+	const { linearIssues: _, ...rest } = node;
+	if (!rest.children) return rest as CommitSummary;
+	return { ...rest, children: rest.children.map(stripLinearIssues) } as CommitSummary;
+}
+
+/**
+ * Recursively collects all LinearIssueCommitRefs from a list of summaries,
+ * deduped by `archivedKey`. Parallel to collectChildPlans / collectChildNotes:
+ * on squash / rebase-pick the root must inherit referenced Linear issues from
+ * every source commit, otherwise stripLinearIssues (called below) drops them.
+ */
+function collectChildLinearIssues(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<LinearIssueCommitRef> {
+	const refMap = new Map<string, LinearIssueCommitRef>();
+	for (const node of nodes) {
+		if (node.linearIssues) {
+			for (const ref of node.linearIssues) {
+				const existing = refMap.get(ref.archivedKey);
+				/* v8 ignore next -- "existing+older" tie-breaker fires only when the same archivedKey appears twice at the same tree depth with diff referencedAt; uncommon in real commit trees. */
+				if (!existing || ref.referencedAt > existing.referencedAt) {
+					refMap.set(ref.archivedKey, ref);
+				}
+			}
+		}
+		/* v8 ignore start -- recursive child descent + tie-breaker for cross-depth duplicate archivedKey; the merge-hoist test covers shallow dedupe, but cross-depth same-key with diff referencedAt is a rare squash-of-merge case. */
+		if (node.children) {
+			for (const child of collectChildLinearIssues(node.children)) {
+				const existing = refMap.get(child.archivedKey);
+				if (!existing || child.referencedAt > existing.referencedAt) {
+					refMap.set(child.archivedKey, child);
+				}
+			}
+		}
+		/* v8 ignore stop */
+	}
+	return [...refMap.values()];
+}
+
 /** Returns a deep copy of the summary tree with Jolli metadata stripped from all nodes. */
 function stripJolliMetadata(node: CommitSummary): CommitSummary {
 	const { jolliDocId: _d, jolliDocUrl: _u, orphanedDocIds: _o, ...rest } = node;
@@ -556,10 +596,11 @@ export function expandSourcesForConsolidation(oldSummary: CommitSummary): Readon
 }
 
 /**
- * Strips all 8 Hoist-managed fields from a summary node and its descendants.
+ * Strips all 9 Hoist-managed fields from a summary node and its descendants.
  *
- * Hoist family (8 fields):
- *   - Copy-Hoist (6): jolliDocId, jolliDocUrl, orphanedDocIds, plans, notes, e2eTestGuide
+ * Hoist family (9 fields):
+ *   - Copy-Hoist (7): jolliDocId, jolliDocUrl, orphanedDocIds, plans, notes,
+ *                    linearIssues, e2eTestGuide
  *   - Consolidate-Hoist (2): topics, recap
  *
  * `version` is intentionally NOT stripped -- it's an identity field, like
@@ -567,7 +608,9 @@ export function expandSourcesForConsolidation(oldSummary: CommitSummary): Readon
  * data on first migration); helpers always look at the root's own version.
  */
 export function stripFunctionalMetadata(node: CommitSummary): CommitSummary {
-	return stripJolliMetadata(stripNotes(stripPlans(stripE2eTestGuide(stripTopics(stripRecap(node))))));
+	return stripJolliMetadata(
+		stripLinearIssues(stripNotes(stripPlans(stripE2eTestGuide(stripTopics(stripRecap(node)))))),
+	);
 }
 
 /**
@@ -633,6 +676,7 @@ async function mergeManyToOneLocked(
 	const hoistedE2e = collectChildE2eScenarios(children);
 	const hoistedPlans = collectChildPlans(children);
 	const hoistedNotes = collectChildNotes(children);
+	const hoistedLinearIssues = collectChildLinearIssues(children);
 	const jolliMeta = collectChildJolliMeta(children);
 	const inheritedOrphanIds = children.flatMap((c) => c.orphanedDocIds ?? []);
 	const allOrphanedDocIds = [...jolliMeta.orphanedDocIds, ...inheritedOrphanIds];
@@ -670,6 +714,7 @@ async function mergeManyToOneLocked(
 		...(hoistedE2e.length > 0 && { e2eTestGuide: hoistedE2e }),
 		...(hoistedPlans.length > 0 && { plans: hoistedPlans }),
 		...(hoistedNotes.length > 0 && { notes: hoistedNotes }),
+		...(hoistedLinearIssues.length > 0 && { linearIssues: hoistedLinearIssues }),
 		...(jolliMeta.winner && { jolliDocId: jolliMeta.winner.jolliDocId, jolliDocUrl: jolliMeta.winner.jolliDocUrl }),
 		...(allOrphanedDocIds.length > 0 && { orphanedDocIds: allOrphanedDocIds }),
 		topics: consolidatedTopics,
@@ -1866,6 +1911,53 @@ export async function readNoteFromBranch(id: string, cwd?: string, storage?: Sto
 	try {
 		const store = resolveStorage(storage, cwd);
 		return await store.readFile(`notes/${id}.md`);
+	} catch {
+		return null;
+	}
+}
+
+// ─── Linear issue storage (parallel to plans / notes) ───────────────────────
+
+/**
+ * Stores Linear issue markdown files in the orphan branch under `linear-issues/<archivedKey>.md`.
+ * Atomic write — all linear issues are committed in a single orphan-branch commit.
+ *
+ * `archivedKey` is `<ticketId>-<shortHash>` (the post-archive registry key,
+ * mirrors the slug-rename pattern from storePlans).
+ */
+export async function storeLinearIssues(
+	linearFiles: ReadonlyArray<{ archivedKey: string; content: string }>,
+	commitMessage: string,
+	cwd?: string,
+	branch?: string,
+): Promise<void> {
+	if (linearFiles.length === 0) return;
+
+	const files: FileWrite[] = linearFiles.map((l) => ({
+		path: `linear-issues/${l.archivedKey}.md`,
+		content: l.content,
+		branch,
+	}));
+
+	await withRequiredOrphanWriteLock(cwd, "storeLinearIssues", async () => {
+		const store = resolveStorage(undefined, cwd);
+		await store.writeFiles(files, commitMessage);
+		log.info("Stored %d Linear issue file(s)", linearFiles.length);
+	});
+}
+
+/**
+ * Reads a Linear issue archived markdown from the orphan branch.
+ * Returns the markdown content, or null if the file doesn't exist.
+ */
+export async function readLinearIssueFromBranch(
+	archivedKey: string,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<string | null> {
+	try {
+		const store = resolveStorage(storage, cwd);
+		return await store.readFile(`linear-issues/${archivedKey}.md`);
 	} catch {
 		return null;
 	}

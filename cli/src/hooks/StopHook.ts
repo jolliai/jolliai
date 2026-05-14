@@ -24,6 +24,8 @@ import { homedir } from "node:os";
 import { basename, join, resolve as pathResolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { extractLinearIssuesFromTranscript } from "../core/LinearIssueExtractor.js";
+import { writeLinearIssueMarkdown } from "../core/LinearIssueStore.js";
 import {
 	loadConfig,
 	loadCursorForTranscript,
@@ -31,6 +33,7 @@ import {
 	saveCursor,
 	savePlansRegistry,
 	saveSession,
+	upsertLinearIssueEntry,
 } from "../core/SessionTracker.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ClaudeHookInput, SessionInfo } from "../Types.js";
@@ -122,6 +125,14 @@ export async function handleStopHook(): Promise<void> {
 		await discoverPlansFromTranscript(sessionInfo, projectDir);
 	} catch (error: unknown) {
 		log.error("Plan discovery failed: %s", (error as Error).message);
+	}
+
+	// Incrementally scan transcript for Linear MCP issue references → write
+	// markdown files + plans.json.linearIssues
+	try {
+		await discoverLinearIssuesFromTranscript(sessionInfo, projectDir);
+	} catch (error: unknown) {
+		log.error("Linear issue discovery failed: %s", (error as Error).message);
 	}
 }
 
@@ -310,6 +321,63 @@ function scanTranscriptForPlans(
 		rl.on("error", () => resolve({ slugs, totalLines: lineNumber }));
 		/* v8 ignore stop */
 	});
+}
+
+// ─── Linear Issue Discovery ─────────────────────────────────────────────────
+
+/** Cursor key prefix for Linear issue scan position, parallel to PLAN_CURSOR_PREFIX. */
+const LINEAR_CURSOR_PREFIX = "linear:";
+
+/**
+ * Incrementally scans the transcript for Linear MCP tool_use/tool_result pairs
+ * and persists discovered issues:
+ *   1. extractLinearIssuesFromTranscript with cursor → LinearIssueRef[]
+ *   2. For each ref:
+ *        - writeLinearIssueMarkdown → .jolli/jollimemory/linear-issues/<ticketId>.md
+ *        - upsertLinearIssueEntry → plans.json.linearIssues
+ *   3. Persist cursor advance.
+ *
+ * Each StopHook invocation only reads newly appended JSONL lines. The cursor
+ * for this scan is independent of plan-discovery's cursor (different prefix).
+ */
+async function discoverLinearIssuesFromTranscript(sessionInfo: SessionInfo, cwd: string): Promise<void> {
+	const transcriptPath = sessionInfo.transcriptPath;
+	if (!existsSync(transcriptPath)) return;
+
+	const cursorKey = `${LINEAR_CURSOR_PREFIX}${transcriptPath}`;
+	const cursor = await loadCursorForTranscript(cursorKey, cwd);
+	const fromLineNumber = cursor?.lineNumber ?? 0;
+
+	const { issues, lastLineNumberScanned } = await extractLinearIssuesFromTranscript(transcriptPath, {
+		fromLineNumber,
+	});
+
+	if (issues.length === 0) {
+		// Even with no issues, advance the cursor so we don't re-scan the same lines next time.
+		if (lastLineNumberScanned > fromLineNumber) {
+			await saveCursor(
+				{ transcriptPath: cursorKey, lineNumber: lastLineNumberScanned, updatedAt: new Date().toISOString() },
+				cwd,
+			);
+		}
+		return;
+	}
+
+	const branch = getCurrentBranch(cwd);
+	for (const ref of issues) {
+		const { sourcePath, contentHash } = await writeLinearIssueMarkdown(ref, cwd);
+		await upsertLinearIssueEntry(ref, sourcePath, contentHash, branch, cwd);
+	}
+	log.info(
+		"Linear issue discovery: upserted %d ref(s): [%s]",
+		issues.length,
+		issues.map((i) => i.ticketId).join(", "),
+	);
+
+	await saveCursor(
+		{ transcriptPath: cursorKey, lineNumber: lastLineNumberScanned, updatedAt: new Date().toISOString() },
+		cwd,
+	);
 }
 
 /** Extracts the first # heading from a markdown file. */

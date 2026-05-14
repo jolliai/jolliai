@@ -2155,8 +2155,9 @@ export function buildSidebarScript(): string {
     // Icon comes from the SerializedTreeItem.iconKey set by
     // PlansTreeProvider — committed entries get "lock" with charts.green,
     // uncommitted plans get "file-text", notes get "note", snippets get
-    // "comment". Falls back to a kind-appropriate codicon if iconKey is
-    // missing (defensive — should always be set by the provider).
+    // "comment", linear issues get "issue-opened". No row-icon recolour
+    // for Linear issues — the default text colour matches every other row
+    // and avoids a brand-specific tint that the user explicitly rejected.
     const iconKey = item.iconKey || (isNote ? 'note' : 'file-text');
     const colorClass = pickIconColorClass(item.iconColor, iconKey);
     const iconEl = el('i', {
@@ -2473,10 +2474,17 @@ export function buildSidebarScript(): string {
     // If real contextValue differs, this just returns null and falls through to plain row.
     const isPlanLike = ctx === 'plan' || ctx === 'note' || ctx === 'plansItem';
     const isFile = ctx === 'file' || ctx === 'fileChange';
+    const isLinearIssue = ctx === 'linearissue';
     if (isPlanLike) {
       return el('span', { className: 'inline-actions' }, [
         el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'edit', 'data-id': item.id, title: 'Edit', text: '✎' }),
         el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'remove', 'data-id': item.id, title: 'Remove', text: '🗑' }),
+      ]);
+    }
+    if (isLinearIssue) {
+      return el('span', { className: 'inline-actions' }, [
+        el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'open-linear', 'data-id': item.id, title: 'Open in Linear', text: '↗' }),
+        el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'ignore-linear', 'data-id': item.id, title: 'Ignore', text: '🗑' }),
       ]);
     }
     if (isFile) {
@@ -2661,6 +2669,12 @@ export function buildSidebarScript(): string {
         const cmd = isViewingForeign() ? 'jollimemory.viewMemorySummary' : 'jollimemory.viewSummary';
         vscode.postMessage({ type: 'command', command: cmd, args: [id] });
       }
+      if (action === 'open-linear') {
+        vscode.postMessage({ type: 'branch:openLinearIssue', mapKey: id });
+      }
+      if (action === 'ignore-linear') {
+        vscode.postMessage({ type: 'branch:ignoreLinearIssue', mapKey: id });
+      }
       e.stopPropagation();
       return;
     }
@@ -2685,6 +2699,9 @@ export function buildSidebarScript(): string {
       }
       if (ctx === 'note') {
         vscode.postMessage({ type: 'branch:openNote', noteId: id });
+      }
+      if (ctx === 'linearissue') {
+        vscode.postMessage({ type: 'branch:openLinearIssueMarkdown', mapKey: id });
       }
       if (ctx === 'file' || ctx === 'fileChange') {
         // Forward all three fields the openFileChange command needs.
@@ -2826,6 +2843,15 @@ export function buildSidebarScript(): string {
       const label = ctx === 'note' ? 'Edit Note' : 'Edit Plan';
       showContextMenu(e.clientX, e.clientY, [
         { label: label, command: cmd, args: [id] },
+      ]);
+      return;
+    }
+    if (ctx === 'linearissue') {
+      showContextMenu(e.clientX, e.clientY, [
+        { label: 'Open in Linear',  rawMessage: { type: 'branch:openLinearIssue',         mapKey: id } },
+        { label: 'Open Markdown',   rawMessage: { type: 'branch:openLinearIssueMarkdown', mapKey: id } },
+        { separator: true },
+        { label: 'Ignore',          rawMessage: { type: 'branch:ignoreLinearIssue',       mapKey: id } },
       ]);
       return;
     }

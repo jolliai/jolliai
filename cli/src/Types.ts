@@ -311,6 +311,8 @@ export interface CommitSummary {
 	readonly plans?: ReadonlyArray<PlanReference>;
 	/** User-created notes associated with this commit */
 	readonly notes?: ReadonlyArray<NoteReference>;
+	/** Linear issues referenced via MCP and associated with this commit */
+	readonly linearIssues?: ReadonlyArray<LinearIssueCommitRef>;
 }
 
 /** A single E2E test scenario for one feature or bug fix */
@@ -364,6 +366,7 @@ export interface PlansRegistry {
 	readonly version: 1;
 	readonly plans: Readonly<Record<string, PlanEntry>>;
 	readonly notes?: Readonly<Record<string, NoteEntry>>;
+	readonly linearIssues?: Readonly<Record<string, LinearIssueEntry>>;
 }
 
 // ─── Note types ─────────────────────────────────────────────────────────────
@@ -440,6 +443,84 @@ export interface NoteReference {
 	readonly jolliNoteDocUrl?: string;
 	/** Server-side article ID for direct update on subsequent pushes */
 	readonly jolliNoteDocId?: number;
+}
+
+// ─── Linear issue types ─────────────────────────────────────────────────────
+
+/**
+ * Linear issue payload as extracted from a single MCP tool_result in the transcript.
+ * Ephemeral — produced by LinearIssueExtractor, consumed by markdown writer + prompt formatter.
+ * Not persisted as-is (description goes into markdown body, metadata into LinearIssueEntry).
+ */
+export interface LinearIssueRef {
+	/** Stable Linear ticket id, e.g. "JOLLI-1528" — matches /^[A-Z][A-Z0-9_]*-\d+$/ */
+	readonly ticketId: string;
+	readonly title: string;
+	readonly url: string;
+	readonly status?: string;
+	readonly priority?: string;
+	readonly labels?: ReadonlyArray<string>;
+	/** Raw markdown body from Linear (may be truncated by Linear MCP upstream) */
+	readonly description?: string;
+	/** MCP tool name that surfaced this issue, e.g. "mcp__linear__get_issue" */
+	readonly toolName: string;
+	/** ISO 8601 timestamp of the tool_result entry */
+	readonly referencedAt: string;
+}
+
+/**
+ * Persisted Linear issue entry in plans.json registry (linearIssues section).
+ *
+ * Map key follows the Plans archive pattern (QueueWorker.ts:490-518):
+ * - Uncommitted: key = ticketId (e.g. "JOLLI-1528")
+ * - After archive: TWO entries exist:
+ *   - key = ticketId       → guard entry (contentHashAtCommit set)
+ *   - key = ticketId-<shortHash> → archived snapshot (no contentHashAtCommit)
+ *
+ * Panel filters out both: guard hidden when hash matches; snapshot hidden when
+ * commitHash set and contentHashAtCommit absent.
+ */
+export interface LinearIssueEntry {
+	/** Stable Linear ticket id, never changes across archive */
+	readonly ticketId: string;
+	/** Cached for fast panel render without reading the markdown file */
+	readonly title: string;
+	/** Cached for "Open in Linear" command without reading the markdown file */
+	readonly url: string;
+	/** Absolute path to the markdown file (mirrors Plans/Notes sourcePath convention) */
+	readonly sourcePath: string;
+	readonly branch: string;
+	readonly addedAt: string;
+	readonly updatedAt: string;
+	readonly commitHash: string | null;
+	/** SHA-256 hash of the markdown content at archive time (guard pattern) */
+	readonly contentHashAtCommit?: string;
+	/** When true, hidden from panel */
+	readonly ignored?: boolean;
+	/** MCP tool name that originally surfaced this issue (e.g. "mcp__linear__get_issue") */
+	readonly sourceToolName: string;
+}
+
+/**
+ * Reference to a Linear issue associated with a commit (stored in CommitSummary.linearIssues).
+ *
+ * `archivedKey` mirrors PlanReference.slug semantics: the POST-archive map key in plans.json
+ * (`<ticketId>-<shortHash>`). Used by reassociateMetadata for amend/squash/rebase to
+ * unambiguously locate the snapshot entry — storing only ticketId would be ambiguous when
+ * the same ticket is referenced across multiple commits.
+ */
+export interface LinearIssueCommitRef {
+	/** Exact pointer into plans.json: "<ticketId>-<shortHash>" */
+	readonly archivedKey: string;
+	/** Stable Linear ticket id (e.g. "JOLLI-1528") */
+	readonly ticketId: string;
+	readonly title: string;
+	readonly url: string;
+	readonly status?: string;
+	readonly priority?: string;
+	readonly labels?: ReadonlyArray<string>;
+	readonly referencedAt: string;
+	readonly sourceToolName: string;
 }
 
 /** Git diff statistics */

@@ -16,7 +16,7 @@ const platformPath = (p: string): string => resolve(p);
 const isoFromNow = (msAgo = 1_000): string => new Date(Date.now() - msAgo).toISOString();
 
 vi.mock("node:fs/promises", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("node:fs/promises")>("node:fs/promises");
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
 	return { ...actual, stat: vi.fn(actual.stat) };
 });
 

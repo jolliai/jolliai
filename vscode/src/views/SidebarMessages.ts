@@ -302,6 +302,9 @@ export type SidebarOutboundMsg =
 	| { readonly type: "kb:clearSearch" }
 	| { readonly type: "branch:openPlan"; readonly planId: string }
 	| { readonly type: "branch:openNote"; readonly noteId: string }
+	| { readonly type: "branch:openLinearIssue"; readonly mapKey: string }
+	| { readonly type: "branch:openLinearIssueMarkdown"; readonly mapKey: string }
+	| { readonly type: "branch:ignoreLinearIssue"; readonly mapKey: string }
 	| {
 			readonly type: "branch:openChange";
 			/** Absolute path (FileItem.resourceUri.fsPath in the native tree). */
