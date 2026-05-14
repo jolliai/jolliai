@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mockSaveAuthCredentials = vi.fn();
 const mockLoadConfig = vi.fn();
 const mockExchangeCliCode = vi.fn();
+const mockGetDeviceLabel = vi.fn();
 
 vi.mock("./AuthConfig.js", () => ({
 	saveAuthCredentials: (...args: unknown[]) => mockSaveAuthCredentials(...args),
@@ -15,6 +16,10 @@ vi.mock("../core/SessionTracker.js", () => ({
 
 vi.mock("./CliExchange.js", () => ({
 	exchangeCliCode: (...args: unknown[]) => mockExchangeCliCode(...args),
+}));
+
+vi.mock("./DeviceLabel.js", () => ({
+	getDeviceLabel: () => mockGetDeviceLabel(),
 }));
 
 const mockOpen = vi.fn();
@@ -39,6 +44,9 @@ describe("Login", () => {
 		mockLoadConfig.mockResolvedValue({});
 		// Default: exchange succeeds with token only. Tests override per-call.
 		mockExchangeCliCode.mockResolvedValue({ token: "tk-default" });
+		// Default: no device label so URL-construction tests that don't care
+		// about the param stay unchanged. Multi-device tests override per-call.
+		mockGetDeviceLabel.mockReturnValue(undefined);
 	});
 
 	afterEach(() => {
@@ -765,6 +773,73 @@ describe("Login", () => {
 			// a new key is being minted, so it must be present even when one exists.
 			expect(openUrl).toContain("client=cli");
 			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "browser-token-2" });
+		});
+
+		// ── device_name (per-device API-key scoping) ──────────────────────
+		// The server uses device_name to scope its auto-generated-key
+		// idempotency check so signing in from a second machine doesn't
+		// invalidate the first machine's key. Only meaningful when paired
+		// with generate_api_key=true.
+
+		it("appends device_name when generate_api_key is requested and getDeviceLabel returns a value", async () => {
+			mockLoadConfig.mockResolvedValue({});
+			mockGetDeviceLabel.mockReturnValue("Foster-MBP");
+			mockExchangeCliCode.mockResolvedValue({ token: "dev-tk" });
+			mockOpen.mockImplementation(simulateBrowserCallback("dev-code"));
+
+			await browserLogin(TEST_JOLLI_URL);
+
+			const openedUrl = mockOpen.mock.calls[0][0] as string;
+			expect(openedUrl).toContain("generate_api_key=true");
+			expect(new URL(openedUrl).searchParams.get("device_name")).toBe("Foster-MBP");
+		});
+
+		it("URL-encodes a device_name that contains spaces or dots", async () => {
+			// Hostnames like "Foster MacBook Pro.local" must round-trip safely
+			// through the URL — otherwise the server sees a malformed query.
+			mockLoadConfig.mockResolvedValue({});
+			mockGetDeviceLabel.mockReturnValue("Foster MacBook Pro.local");
+			mockExchangeCliCode.mockResolvedValue({ token: "enc-tk" });
+			mockOpen.mockImplementation(simulateBrowserCallback("enc-code"));
+
+			await browserLogin(TEST_JOLLI_URL);
+
+			const openedUrl = mockOpen.mock.calls[0][0] as string;
+			// Raw URL must show percent-encoding for the space.
+			expect(openedUrl).toContain("device_name=Foster%20MacBook%20Pro.local");
+			// And the decoded value matches what getDeviceLabel returned.
+			expect(new URL(openedUrl).searchParams.get("device_name")).toBe("Foster MacBook Pro.local");
+		});
+
+		it("omits device_name when getDeviceLabel returns undefined (sanitized to empty)", async () => {
+			// Hostname like "中文" sanitizes to undefined — we must not send the
+			// param so the server falls back to its legacy keyName path.
+			mockLoadConfig.mockResolvedValue({});
+			mockGetDeviceLabel.mockReturnValue(undefined);
+			mockExchangeCliCode.mockResolvedValue({ token: "nodl-tk" });
+			mockOpen.mockImplementation(simulateBrowserCallback("nodl-code"));
+
+			await browserLogin(TEST_JOLLI_URL);
+
+			const openedUrl = mockOpen.mock.calls[0][0] as string;
+			expect(openedUrl).toContain("generate_api_key=true");
+			expect(openedUrl).not.toContain("device_name");
+		});
+
+		it("omits device_name when generate_api_key is not being requested", async () => {
+			// Pre-existing jolliApiKey → no generate_api_key. device_name is
+			// only meaningful at key-creation time, so it must not appear here
+			// even if the machine has a perfectly valid hostname.
+			mockLoadConfig.mockResolvedValue({ jolliApiKey: "jk_existing" });
+			mockGetDeviceLabel.mockReturnValue("Foster-MBP");
+			mockExchangeCliCode.mockResolvedValue({ token: "no-gen-tk" });
+			mockOpen.mockImplementation(simulateBrowserCallback("no-gen-code"));
+
+			await browserLogin(TEST_JOLLI_URL);
+
+			const openedUrl = mockOpen.mock.calls[0][0] as string;
+			expect(openedUrl).not.toContain("generate_api_key");
+			expect(openedUrl).not.toContain("device_name");
 		});
 
 		it("rejects when open() throws (e.g. headless server)", async () => {

@@ -19,6 +19,7 @@ import {
 	saveAuthCredentials,
 } from "../../../cli/src/auth/AuthConfig.js";
 import { exchangeCliCode } from "../../../cli/src/auth/CliExchange.js";
+import { getDeviceLabel } from "../../../cli/src/auth/DeviceLabel.js";
 import { loadConfig } from "../../../cli/src/core/SessionTracker.js";
 import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
 import { log } from "../util/Logger.js";
@@ -221,6 +222,14 @@ export class AuthService {
 		// Mirrors the CLI's browserLogin() behaviour in Login.ts.
 		const { jolliApiKey } = await loadConfig();
 		const generateKeyParam = jolliApiKey ? "" : "&generate_api_key=true";
+		// `device_name` scopes the server's per-user idempotency key so signing
+		// in from a second machine doesn't invalidate the first machine's
+		// auto-generated API key. Only meaningful when we're asking the server
+		// to mint a new key — paired with generate_api_key.
+		const deviceLabel = jolliApiKey ? undefined : getDeviceLabel();
+		const deviceLabelParam = deviceLabel
+			? `&device_name=${encodeURIComponent(deviceLabel)}`
+			: "";
 		// 256-bit CSRF nonce per RFC 6749 §10.12. Sent on the login URL and
 		// validated on the matching handleAuthCallback().
 		const state = randomBytes(32).toString("hex");
@@ -229,7 +238,7 @@ export class AuthService {
 		// a friendly error dialog instead of an unhandled command exception.
 		let loginUrl: string;
 		try {
-			loginUrl = `${getJolliUrl()}/login?cli_callback=${encodeURIComponent(callbackUri)}&state=${state}${generateKeyParam}&client=vscode`;
+			loginUrl = `${getJolliUrl()}/login?cli_callback=${encodeURIComponent(callbackUri)}&state=${state}${generateKeyParam}${deviceLabelParam}&client=vscode`;
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			log.error("AuthService", "getJolliUrl rejected: %s", message);
