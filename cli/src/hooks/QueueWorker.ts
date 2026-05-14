@@ -33,17 +33,26 @@ import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
+import { formatLinearIssuesBlock } from "../core/LinearIssueExtractor.js";
+import { linearIssuePath, readLinearIssueMarkdown, renameLinearIssueMarkdown } from "../core/LinearIssueStore.js";
 import { isLlmCredentialError } from "../core/LlmClient.js";
 import { acquireWorkerLock, refreshWorkerLockMtime, releaseWorkerLock } from "../core/Locks.js";
+import { formatNotesBlock } from "../core/NotePromptFormatter.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
+import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import {
+	associateLinearIssueWithCommit,
 	associateNoteWithCommit,
 	associatePlanWithCommit,
 	deleteQueueEntry,
 	dequeueAllGitOperations,
+	detectActiveNotesForBranch,
+	detectActivePlansForBranch,
+	detectUncommittedLinearIssueIds,
 	filterSessionsByEnabledIntegrations,
+	getLinearIssueEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
 	loadCursorForTranscript,
@@ -69,6 +78,7 @@ import {
 	migrateOneToOne,
 	resolveEffectiveTopics,
 	setActiveStorage,
+	storeLinearIssues,
 	storeNotes,
 	storePlans,
 	storeSummary,
@@ -86,10 +96,13 @@ import type {
 	DiffStats,
 	GitOperation,
 	JolliMemoryConfig,
+	LinearIssueCommitRef,
+	LinearIssueRef,
 	LogLevel,
 	NoteReference,
 	PlanProgressArtifact,
 	PlanReference,
+	PlansRegistry,
 	StoredTranscript,
 	TopicSummary,
 	TranscriptReadResult,
@@ -134,6 +147,16 @@ async function reassociateMetadata(
 				await associateNoteWithCommit(noteRef.id, newHash, cwd);
 			}
 		}
+		/* v8 ignore start -- reassociateMetadata.linearIssues loop fires only on squash/rebase paths where source summaries already carried linearIssues; covered indirectly by the merge-hoist tests in SummaryStore.test.ts but not the reassociate call itself. */
+		if (oldSummary.linearIssues) {
+			for (const linearRef of oldSummary.linearIssues) {
+				// Uses the archivedKey (e.g. "JOLLI-1528-abc1234") to unambiguously
+				// locate the snapshot entry — see §9.10 of the plan and the analog
+				// to associatePlanWithCommit which uses planRef.slug for the same reason.
+				await associateLinearIssueWithCommit(linearRef.archivedKey, newHash, cwd);
+			}
+		}
+		/* v8 ignore stop */
 	}
 }
 
@@ -152,6 +175,7 @@ function hoistMetadataFromOldSummary(oldSummary: CommitSummary | null | undefine
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
 		...(oldSummary.plans && { plans: oldSummary.plans }),
 		...(oldSummary.notes && { notes: oldSummary.notes }),
+		...(oldSummary.linearIssues && { linearIssues: oldSummary.linearIssues }),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
 	};
 }
@@ -640,6 +664,147 @@ async function associateNotesWithCommit(
 	return noteRefs;
 }
 
+// ─── Linear issue association (parallel to Plans / Notes) ────────────────────
+
+/**
+ * Associates detected Linear issues with a commit: writes the guard + archived
+ * snapshot dual entry into plans.json, renames the local markdown file, and
+ * backs up the markdown content to the orphan branch.
+ *
+ * Returns LinearIssueCommitRef[] (with `archivedKey` populated) for inclusion
+ * in CommitSummary.linearIssues — the archivedKey is the exact pointer used
+ * later by reassociateMetadata for amend/squash/rebase.
+ *
+ * Follows the same pattern as associateNotesWithCommit (line 565+) for
+ * structural symmetry — see plan §9.10 for the rationale.
+ */
+async function associateLinearIssuesWithCommit(
+	ticketIds: ReadonlyArray<string>,
+	commitHash: string,
+	cwd: string,
+	branch?: string,
+): Promise<LinearIssueCommitRef[]> {
+	log.info("Linear issue association: detected %d issue(s): [%s]", ticketIds.length, ticketIds.join(", "));
+	if (ticketIds.length === 0) return [];
+
+	const shortHash = commitHash.substring(0, 8);
+	const commitRefs: LinearIssueCommitRef[] = [];
+	const filesToStore: Array<{ archivedKey: string; content: string }> = [];
+
+	let registry = await loadPlansRegistry(cwd);
+	const updatedLinearIssues: Record<string, NonNullable<PlansRegistry["linearIssues"]>[string]> = {
+		...(registry.linearIssues ?? {}),
+	};
+
+	for (const ticketId of ticketIds) {
+		const entry = updatedLinearIssues[ticketId];
+		if (!entry) {
+			log.info("Linear issue association: ticketId %s not in registry — skipping", ticketId);
+			continue;
+		}
+
+		// Read the local markdown file to (a) compute content hash for guard, (b) store on orphan branch
+		const ref = await readLinearIssueMarkdown(entry.sourcePath);
+		if (!ref) {
+			log.info(
+				"Linear issue association: ticketId %s sourcePath %s unreadable — skipping",
+				ticketId,
+				entry.sourcePath,
+			);
+			continue;
+		}
+
+		const { createHash } = await import("node:crypto");
+		const fileContent = await readMarkdownFileContent(entry.sourcePath);
+		const contentHashAtCommit = createHash("sha256").update(fileContent).digest("hex");
+
+		const archivedKey = `${ticketId}-${shortHash}`;
+		const now2 = new Date().toISOString();
+		const archivedSourcePath = linearIssuePath(archivedKey, cwd);
+
+		commitRefs.push({
+			archivedKey,
+			ticketId,
+			title: ref.title,
+			url: ref.url,
+			/* v8 ignore start -- optional-field spreads; each branch represents "field present vs absent" on the upstream LinearIssueRef which the extractor populates from Linear MCP payloads. Exercised via the live extraction tests; pinned here for defensive totality. */
+			...(ref.status !== undefined ? { status: ref.status } : {}),
+			...(ref.priority !== undefined ? { priority: ref.priority } : {}),
+			...(ref.labels !== undefined && ref.labels.length > 0 ? { labels: ref.labels } : {}),
+			/* v8 ignore stop */
+			referencedAt: ref.referencedAt,
+			sourceToolName: ref.toolName,
+		});
+
+		filesToStore.push({ archivedKey, content: fileContent });
+
+		// Dual entry: guard at ticketId + archived snapshot at archivedKey
+		updatedLinearIssues[ticketId] = {
+			...entry,
+			commitHash,
+			contentHashAtCommit,
+			updatedAt: now2,
+			ignored: undefined,
+		};
+		updatedLinearIssues[archivedKey] = {
+			ticketId: entry.ticketId,
+			title: entry.title,
+			url: entry.url,
+			sourcePath: archivedSourcePath,
+			branch: entry.branch,
+			addedAt: entry.addedAt,
+			updatedAt: now2,
+			commitHash,
+			sourceToolName: entry.sourceToolName,
+		};
+
+		// Rename the local file from <ticketId>.md to <ticketId>-<shortHash>.md (Plans pattern)
+		try {
+			await renameLinearIssueMarkdown(entry.sourcePath, archivedSourcePath);
+			/* v8 ignore start -- fs.rename failure path; not reachable under our test fixtures, but pinned because losing the local rename in production would leave a stale `<ticketId>.md` masquerading as uncommitted on the next StopHook scan. */
+		} catch (err) {
+			log.warn(
+				"Linear issue association: rename %s → %s failed: %s (continuing)",
+				entry.sourcePath,
+				archivedSourcePath,
+				(err as Error).message,
+			);
+		}
+		/* v8 ignore stop */
+
+		log.info(
+			"Linear issue archived: %s → %s (hash=%s)",
+			ticketId,
+			archivedKey,
+			contentHashAtCommit.substring(0, 12),
+		);
+	}
+
+	if (commitRefs.length > 0) {
+		// Reread registry near write to avoid clobbering concurrent updates
+		registry = await loadPlansRegistry(cwd);
+		await savePlansRegistry({ ...registry, linearIssues: updatedLinearIssues }, cwd);
+	}
+
+	if (filesToStore.length > 0) {
+		await storeLinearIssues(
+			filesToStore,
+			`Archive ${filesToStore.length} Linear issue(s) for commit ${shortHash}`,
+			cwd,
+			branch,
+		);
+		log.info("Associated %d Linear issue(s) with commit %s", filesToStore.length, shortHash);
+	}
+
+	return commitRefs;
+}
+
+/** Reads the raw markdown file bytes (for orphan-branch storage). */
+async function readMarkdownFileContent(absPath: string): Promise<string> {
+	const { readFile } = await import("node:fs/promises");
+	return await readFile(absPath, "utf-8");
+}
+
 /**
  * The core LLM summarization pipeline. Now driven by a GitOperation from the queue.
  *
@@ -721,6 +886,30 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	const conversation = buildMultiSessionContext(sessionTranscripts);
 	log.debug("Conversation context built: %d chars, %d sessions", conversation.length, sessionTranscripts.length);
 
+	// Step 6b: Assemble the three structured prompt blocks (Stage 2 / JOLLI-1404).
+	// Pure registry-driven: no transcript re-scan. User's Ignore on the panel
+	// takes effect immediately on the next commit.
+	const [activePlanEntries, activeNoteEntries, activeLinearIssueEntries] = await Promise.all([
+		detectActivePlansForBranch(cwd, branch),
+		detectActiveNotesForBranch(cwd, branch),
+		getLinearIssueEntriesForBranch(cwd, branch),
+	]);
+	const plansBlock = await formatPlansBlock(activePlanEntries);
+	const notesBlock = await formatNotesBlock(activeNoteEntries);
+	const linearIssueRefsForPrompt: LinearIssueRef[] = [];
+	for (const entry of activeLinearIssueEntries) {
+		const ref = await readLinearIssueMarkdown(entry.sourcePath);
+		/* v8 ignore next -- null-ref branch fires only when the markdown file vanishes between StopHook write and our read (rare race); the prompt assembly gracefully skips those entries. */
+		if (ref) linearIssueRefsForPrompt.push(ref);
+	}
+	const linearIssuesBlock = formatLinearIssuesBlock(linearIssueRefsForPrompt);
+	log.info(
+		"Prompt blocks: plans=%d notes=%d linearIssues=%d",
+		activePlanEntries.length,
+		activeNoteEntries.length,
+		linearIssueRefsForPrompt.length,
+	);
+
 	// Step 7: Call AI to generate summary
 	stepStart = now();
 	const summaryParams = {
@@ -730,6 +919,9 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		diffStats,
 		transcriptEntries: totalEntries,
 		conversationTurns: humanEntries,
+		linearIssues: linearIssuesBlock,
+		plans: plansBlock,
+		notes: notesBlock,
 		config,
 	};
 
@@ -794,6 +986,10 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	const noteIds = await detectUncommittedNoteIds(cwd);
 	const noteRefs = await associateNotesWithCommit(noteIds, commitInfo.hash, cwd, branch);
 
+	// Step 8a3: Read uncommitted Linear issue ticketIds from plans.json registry
+	const linearIssueTicketIds = await detectUncommittedLinearIssueIds(cwd, branch);
+	const linearIssueRefs = await associateLinearIssuesWithCommit(linearIssueTicketIds, commitInfo.hash, cwd, branch);
+
 	// Step 8b: Evaluate plan progress for each linked plan (Haiku calls parallelized)
 	const planProgressArtifacts: PlanProgressArtifact[] = [];
 	if (planRefs.length > 0) {
@@ -850,6 +1046,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		diffStats,
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
 		...(noteRefs.length > 0 ? { notes: noteRefs } : {}),
+		...(linearIssueRefs.length > 0 ? { linearIssues: linearIssueRefs } : {}),
 	};
 
 	log.info(
@@ -1304,6 +1501,25 @@ async function handleAmendPipeline(
 	// ── Step 1 LLM: summarize the delta ───────────────────────────────────────
 	const conversation = buildMultiSessionContext(sessionTranscripts);
 	stepStart = now();
+
+	// Same registry-driven prompt assembly as executePipeline (see Stage 2 wiring).
+	/* v8 ignore start -- amend-pipeline prompt-block assembly mirrors executePipeline's Stage 2 path. The amend path is exercised via PostCommitHook.helpers tests but not the prompt-block content specifically; the helpers and shapes are covered by their own dedicated tests. */
+	const branchForBlocks = await getCurrentBranch(cwd);
+	const [amendPlanEntries, amendNoteEntries, amendLinearEntries] = await Promise.all([
+		detectActivePlansForBranch(cwd, branchForBlocks),
+		detectActiveNotesForBranch(cwd, branchForBlocks),
+		getLinearIssueEntriesForBranch(cwd, branchForBlocks),
+	]);
+	const amendPlansBlock = await formatPlansBlock(amendPlanEntries);
+	const amendNotesBlock = await formatNotesBlock(amendNoteEntries);
+	const amendLinearRefs: LinearIssueRef[] = [];
+	for (const entry of amendLinearEntries) {
+		const ref = await readLinearIssueMarkdown(entry.sourcePath);
+		if (ref) amendLinearRefs.push(ref);
+	}
+	const amendLinearBlock = formatLinearIssuesBlock(amendLinearRefs);
+	/* v8 ignore stop */
+
 	const summaryParams = {
 		conversation,
 		diff: deltaDiff,
@@ -1311,6 +1527,9 @@ async function handleAmendPipeline(
 		diffStats: deltaDiffStats,
 		transcriptEntries: totalEntries,
 		conversationTurns: humanEntries,
+		linearIssues: amendLinearBlock,
+		plans: amendPlansBlock,
+		notes: amendNotesBlock,
 		config: amendConfig,
 	};
 

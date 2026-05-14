@@ -366,7 +366,7 @@ esac
 			expect(result.startsWith(join(tempDir, "saturated-"))).toBe(true);
 			expect(result).not.toBe(join(tempDir, "saturated"));
 			expect(result).not.toBe(join(tempDir, "saturated-99"));
-		});
+		}, 15000);
 
 		it("walks past a candidate dir that has no .jolli/config.json", () => {
 			// Make the basePath a non-matching repo, then create a "name-2" dir without

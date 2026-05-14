@@ -201,6 +201,9 @@ describe("PromptTemplates", () => {
 				"commitDate",
 				"conversation",
 				"diff",
+				"linearIssues",
+				"plans",
+				"notes",
 				"previousResponse",
 			]),
 		);
@@ -239,7 +242,17 @@ describe("PromptTemplates", () => {
 			placeholders.add(match[1]);
 		}
 		expect(placeholders).toEqual(
-			new Set(["commitHash", "commitMessage", "commitAuthor", "commitDate", "conversation", "diff"]),
+			new Set([
+				"commitHash",
+				"commitMessage",
+				"commitAuthor",
+				"commitDate",
+				"conversation",
+				"diff",
+				"linearIssues",
+				"plans",
+				"notes",
+			]),
 		);
 	});
 
@@ -399,10 +412,21 @@ describe("PromptTemplates", () => {
 			for (const match of summarize.matchAll(/\{\{\s*(\w+)\s*\}\}/g)) {
 				placeholders.add(match[1]);
 			}
-			// Caller still must pass commit info + conversation + diff. No more
-			// topicGuidance or workSize-derived field.
+			// Caller still must pass commit info + conversation + diff plus the
+			// three Stage 2 structured-context blocks (linearIssues / plans / notes).
+			// No more topicGuidance or workSize-derived field.
 			expect(placeholders).toEqual(
-				new Set(["commitHash", "commitMessage", "commitAuthor", "commitDate", "conversation", "diff"]),
+				new Set([
+					"commitHash",
+					"commitMessage",
+					"commitAuthor",
+					"commitDate",
+					"conversation",
+					"diff",
+					"linearIssues",
+					"plans",
+					"notes",
+				]),
 			);
 		});
 
@@ -415,6 +439,9 @@ describe("PromptTemplates", () => {
 				commitDate: "2026-01-01",
 				conversation: "conv",
 				diff: "diff",
+				linearIssues: "",
+				plans: "",
+				notes: "",
 			});
 			expect(filled).not.toContain("{{");
 			// The bucket rule lands sandwiched between rule 5 and rule 8 (sanity

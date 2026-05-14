@@ -203,6 +203,21 @@
 				"title": "Sign Out of Jolli",
 				"icon": "$(sign-out)",
 				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openLinearIssue",
+				"title": "Open Linear Issue in Browser",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openLinearIssueMarkdown",
+				"title": "Open Linear Issue Markdown",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.ignoreLinearIssue",
+				"title": "Ignore Linear Issue",
+				"category": "Jolli Memory"
 			}
 		],
 		"menus": {

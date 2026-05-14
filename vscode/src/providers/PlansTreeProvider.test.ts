@@ -75,7 +75,13 @@ vi.mock("vscode", () => ({
 }));
 
 import { PlansStore } from "../stores/PlansStore.js";
-import { NoteItem, PlanItem, PlansTreeProvider } from "./PlansTreeProvider.js";
+import type { LinearIssueInfo } from "../Types.js";
+import {
+	LinearIssueItem,
+	NoteItem,
+	PlanItem,
+	PlansTreeProvider,
+} from "./PlansTreeProvider.js";
 
 /**
  * Test facade: real PlansStore + PlansTreeProvider with the legacy shim
@@ -222,6 +228,88 @@ describe("NoteItem", () => {
 	});
 });
 
+function makeLinearIssue(
+	overrides: Partial<LinearIssueInfo> = {},
+): LinearIssueInfo {
+	return {
+		kind: "linearissue",
+		mapKey: "JOLLI-1528",
+		ticketId: "JOLLI-1528",
+		title: "Sample Issue",
+		url: "https://linear.app/test/issue/JOLLI-1528",
+		filename: "JOLLI-1528.md",
+		filePath: "/repo/.jolli/jollimemory/linear-issues/JOLLI-1528.md",
+		lastModified: "2026-03-30T11:00:00.000Z",
+		addedAt: "2026-03-30T09:00:00.000Z",
+		updatedAt: "2026-03-30T11:00:00.000Z",
+		branch: "feature/test",
+		commitHash: null,
+		...overrides,
+	};
+}
+
+describe("LinearIssueItem", () => {
+	it("renders ticketId · title with date-only description (status intentionally omitted)", () => {
+		// `buildLinearIssueDescription` now ALWAYS returns the relative date
+		// alone — the captured status field was dropped from the row text
+		// because it can drift from the live Linear value (we don't poll), so
+		// surfacing it risked misleading users with stale labels. Tooltip
+		// retains the status for hover-inspection of captured state.
+		const item = new LinearIssueItem(makeLinearIssue({ status: undefined }));
+
+		expect(item.label).toBe("JOLLI-1528 — Sample Issue");
+		expect(item.contextValue).toBe("linearissue");
+		expect(item.description).not.toContain("undefined");
+		// Icon is the GitHub-style "issue-opened" codicon tinted with the
+		// Linear brand purple (linearIssue.iconColor). Earlier iterations
+		// used `circle-large-filled` (semantically meaningless dot) and an
+		// inlined SVG of the Linear logo (failed to render legibly at 16x16).
+		expect((item.iconPath as { id: string }).id).toBe("issue-opened");
+		expect(item.command).toEqual({
+			command: "jollimemory.openLinearIssueMarkdown",
+			title: "Open Linear Issue Markdown",
+			arguments: [item],
+		});
+	});
+
+	it("never includes status in the row description even when status is present", () => {
+		// Regression guard: prior to the stale-data fix this row read
+		// `In Progress · 2 days ago`. Status now lives only in the tooltip.
+		const item = new LinearIssueItem(
+			makeLinearIssue({
+				status: "In Progress",
+				priority: "High",
+				labels: ["bug", "frontend"],
+				description: "A short description of the issue.",
+			}),
+		);
+
+		expect(item.description).not.toContain("In Progress");
+		expect(item.description).not.toContain("·");
+		const tooltip = item.tooltip as { value: string; isTrusted: boolean };
+		expect(tooltip.isTrusted).toBe(true);
+		// Tooltip is the deliberate-hover surface — captured state still
+		// surfaces there for users who want to inspect it.
+		expect(tooltip.value).toContain("Status: In Progress");
+		expect(tooltip.value).toContain("Priority: High");
+		expect(tooltip.value).toContain("Labels: bug, frontend");
+		expect(tooltip.value).toContain("https://linear.app/test/issue/JOLLI-1528");
+		expect(tooltip.value).toContain("A short description");
+	});
+
+	it("truncates descriptions longer than 200 chars with an ellipsis", () => {
+		// Pins the description-length branch — `slice(0, 200) + (length > 200 ? '…' : '')`.
+		const longDescription = "X".repeat(250);
+		const item = new LinearIssueItem(
+			makeLinearIssue({ description: longDescription }),
+		);
+
+		const tooltip = item.tooltip as { value: string };
+		expect(tooltip.value).toContain("…");
+		expect(tooltip.value).not.toContain("X".repeat(201));
+	});
+});
+
 describe("PlansTreeProvider", () => {
 	beforeEach(() => {
 		executeCommand.mockClear();
@@ -235,6 +323,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => plans),
 			listNotes: vi.fn(async () => []),
+			listLinearIssues: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -258,6 +347,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => [makePlan()]),
 			listNotes: vi.fn(async () => []),
+			listLinearIssues: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -272,6 +362,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => []),
 			listNotes: vi.fn(async () => []),
+			listLinearIssues: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -298,6 +389,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => plans),
 			listNotes: vi.fn(async () => notes),
+			listLinearIssues: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -314,6 +406,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => [makePlan()]),
 			listNotes: vi.fn(async () => [makeNote()]),
+			listLinearIssues: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 		provider.setEnabled(false);
@@ -325,6 +418,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => []),
 			listNotes: vi.fn(async () => []),
+			listLinearIssues: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 		const emitter = (
@@ -373,6 +467,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => plans),
 			listNotes: vi.fn(async () => notes),
+			listLinearIssues: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -402,6 +497,7 @@ describe("PlansTreeProvider", () => {
 			const bridge = {
 				listPlans: vi.fn(async () => plans),
 				listNotes: vi.fn(async () => []),
+				listLinearIssues: vi.fn(async () => []),
 			};
 			const provider = makePlansProvider(bridge as never);
 
@@ -416,6 +512,7 @@ describe("PlansTreeProvider", () => {
 			const bridge = {
 				listPlans: vi.fn(async () => []),
 				listNotes: vi.fn(async () => notes),
+				listLinearIssues: vi.fn(async () => []),
 			};
 			const provider = makePlansProvider(bridge as never);
 

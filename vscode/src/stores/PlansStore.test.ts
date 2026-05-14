@@ -99,10 +99,15 @@ function makeNote(id: string, lastModified: string): NoteInfo {
 	};
 }
 
-function makeBridge(plans: Array<PlanInfo>, notes: Array<NoteInfo>) {
+function makeBridge(
+	plans: Array<PlanInfo>,
+	notes: Array<NoteInfo>,
+	linearIssues: ReadonlyArray<unknown> = [],
+) {
 	return {
 		listPlans: vi.fn(async () => plans),
 		listNotes: vi.fn(async () => notes),
+		listLinearIssues: vi.fn(async () => linearIssues),
 	};
 }
 
@@ -386,6 +391,7 @@ describe("PlansStore — with watchers", () => {
 		const bridge = {
 			listPlans: vi.fn().mockRejectedValue(new Error("bridge is down")),
 			listNotes: vi.fn(async () => []),
+			listLinearIssues: vi.fn(async () => []),
 		};
 		const store = new PlansStore(bridge as never, DEFAULT_OPTIONS);
 		// Calling refresh directly triggers the same bridge.listPlans path;

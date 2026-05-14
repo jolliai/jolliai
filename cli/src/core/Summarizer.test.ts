@@ -460,7 +460,9 @@ ${delimited({
 			});
 
 			// Topic-count guidance now lives inside the prompt itself; CLI no longer
-			// passes topicGuidance / workSize. params is just the standard input set.
+			// passes topicGuidance / workSize. params is the standard input set
+			// plus the three Stage 2 structured-context blocks (default to "" when
+			// caller does not supply them — see SummarizeParams optional fields).
 			expect(mockCallLlm).toHaveBeenCalledWith(
 				expect.objectContaining({
 					action: "summarize",
@@ -471,6 +473,9 @@ ${delimited({
 						commitDate: mockCommitInfo.date,
 						conversation: "User: Fix login bug\nAssistant: Done",
 						diff: "diff --git a/src/login.ts",
+						linearIssues: "",
+						plans: "",
+						notes: "",
 					},
 				}),
 			);

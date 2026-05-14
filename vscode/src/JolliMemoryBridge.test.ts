@@ -236,6 +236,13 @@ vi.mock("./core/NoteService.js", () => ({
 	removeNote: removeNoteFn,
 }));
 
+vi.mock("./core/LinearIssueService.js", () => ({
+	detectLinearIssues: vi.fn().mockResolvedValue([]),
+	setLinearIssueIgnored: vi.fn().mockResolvedValue(undefined),
+	openLinearIssueInBrowser: vi.fn().mockResolvedValue(true),
+	openLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("./util/CommitMessageUtils.js", () => ({
 	mergeCommitMessages,
 }));
@@ -2265,6 +2272,56 @@ describe("JolliMemoryBridge", () => {
 			expect(result.sourceRepoName).toBeNull();
 			expect(result.sourceRemoteUrl).toBeNull();
 		});
+
+		it("returns nulls when discovery throws (covers outer-catch swallow)", async () => {
+			// Provenance must degrade to "no answer" rather than bubble — the panel
+			// invokes this on every commit click, and a thrown error would crash
+			// the webview message loop. Force the outer-catch via discoverRepos.
+			getSummary.mockResolvedValueOnce(null);
+			discoverRepos.mockImplementationOnce(() => {
+				throw new Error("kb parent unreadable");
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepoWithSource("zzz");
+
+			expect(result.summary).toBeNull();
+			expect(result.sourceRepoName).toBeNull();
+			expect(result.sourceRemoteUrl).toBeNull();
+		});
+
+		it("logs and continues when one foreign repo's getSummary throws (covers per-repo catch)", async () => {
+			// Per-repo failures must not abort the scan — the loop continues so
+			// the next repo can still hit. Mirrors how listSummaryEntries handles
+			// a single broken FolderStorage shadow.
+			const foreign = { commitHash: "xxx", topics: [] };
+			getSummary
+				.mockResolvedValueOnce(null) // current repo miss
+				.mockRejectedValueOnce(new Error("broken shadow")) // foreign #1 throws
+				.mockResolvedValueOnce(foreign); // foreign #2 hits
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/broken",
+					repoName: "broken",
+					dirName: "broken",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/good",
+					repoName: "good",
+					dirName: "good",
+					remoteUrl: "https://github.com/good/repo.git",
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepoWithSource("xxx");
+
+			expect(result.summary).toEqual(foreign);
+			expect(result.sourceRepoName).toBe("good");
+		});
 	});
 
 	// ── Git utility methods ──────────────────────────────────────────────
@@ -2481,6 +2538,81 @@ describe("JolliMemoryBridge", () => {
 			await bridge.removeNote("note-id");
 
 			expect(removeNoteFn).toHaveBeenCalledWith("note-id", TEST_CWD);
+		});
+	});
+
+	// ── Linear issues ────────────────────────────────────────────────────
+
+	describe("Linear issue bridge methods", () => {
+		it("listLinearIssues() delegates to detectLinearIssues", async () => {
+			const { detectLinearIssues } = await import(
+				"./core/LinearIssueService.js"
+			);
+			const issues = [{ kind: "linearissue", ticketId: "JOLLI-1" }];
+			(detectLinearIssues as ReturnType<typeof vi.fn>).mockResolvedValue(
+				issues,
+			);
+			const bridge = makeBridge();
+
+			const result = await bridge.listLinearIssues();
+
+			expect(detectLinearIssues).toHaveBeenCalledWith(TEST_CWD);
+			expect(result).toEqual(issues);
+		});
+
+		it("ignoreLinearIssue() delegates to setLinearIssueIgnored with mapKey + true", async () => {
+			const { setLinearIssueIgnored } = await import(
+				"./core/LinearIssueService.js"
+			);
+			(setLinearIssueIgnored as ReturnType<typeof vi.fn>).mockResolvedValue(
+				undefined,
+			);
+			const bridge = makeBridge();
+
+			await bridge.ignoreLinearIssue("JOLLI-1528");
+
+			expect(setLinearIssueIgnored).toHaveBeenCalledWith(
+				TEST_CWD,
+				"JOLLI-1528",
+				true,
+			);
+		});
+
+		it("openLinearIssue() delegates to openLinearIssueInBrowser", async () => {
+			const { openLinearIssueInBrowser } = await import(
+				"./core/LinearIssueService.js"
+			);
+			(openLinearIssueInBrowser as ReturnType<typeof vi.fn>).mockResolvedValue(
+				true,
+			);
+			const info = {
+				kind: "linearissue",
+				url: "https://linear.app/x/JOLLI-1",
+			} as unknown as Parameters<typeof bridge.openLinearIssue>[0];
+			const bridge = makeBridge();
+
+			const result = await bridge.openLinearIssue(info);
+
+			expect(openLinearIssueInBrowser).toHaveBeenCalledWith(info);
+			expect(result).toBe(true);
+		});
+
+		it("openLinearIssueMarkdown() delegates to openLinearIssueMarkdown impl", async () => {
+			const { openLinearIssueMarkdown } = await import(
+				"./core/LinearIssueService.js"
+			);
+			(openLinearIssueMarkdown as ReturnType<typeof vi.fn>).mockResolvedValue(
+				undefined,
+			);
+			const info = {
+				kind: "linearissue",
+				sourcePath: "/x.md",
+			} as unknown as Parameters<typeof bridge.openLinearIssueMarkdown>[0];
+			const bridge = makeBridge();
+
+			await bridge.openLinearIssueMarkdown(info);
+
+			expect(openLinearIssueMarkdown).toHaveBeenCalledWith(info);
 		});
 	});
 
@@ -2968,6 +3100,32 @@ describe("JolliMemoryBridge", () => {
 			// short-circuit before reaching the index.
 			const result = await bridge.listBranchMemories("test-repo", "main");
 			expect(result.map((e) => e.commitHash)).toEqual(["aaa"]);
+		});
+
+		it("returns [] when getIndexEntryMap rejects (covers outer try/catch swallow)", async () => {
+			// Sidebar callers must never throw out of this method — a transient
+			// storage failure should hide rows for that branch, not crash the
+			// panel. Pins the catch arm that downgrades to []+log.
+			getIndexEntryMap.mockRejectedValueOnce(new Error("storage offline"));
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchMemories("test-repo", "main");
+
+			expect(result).toEqual([]);
+		});
+
+		it("returns [] when foreign repo resolution throws (covers foreign-discovery catch)", async () => {
+			// Foreign-routed listBranchMemories has its own pre-storage try block
+			// (loadConfig → discoverRepos). A discoverRepos failure must not bubble
+			// into the panel; this test pins the warn+return branch.
+			discoverRepos.mockImplementationOnce(() => {
+				throw new Error("disk read failed");
+			});
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchMemories("foreign-repo", "main");
+
+			expect(result).toEqual([]);
 		});
 	});
 

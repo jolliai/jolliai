@@ -44,6 +44,11 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 		associatePlanWithCommit: vi.fn(),
 		associateNoteWithCommit: vi.fn(),
+		associateLinearIssueWithCommit: vi.fn().mockResolvedValue(undefined),
+		detectUncommittedLinearIssueIds: vi.fn().mockResolvedValue([]),
+		detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
+		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
+		getLinearIssueEntriesForBranch: vi.fn().mockResolvedValue([]),
 		filterSessionsByEnabledIntegrations: actual.filterSessionsByEnabledIntegrations,
 		// Queue functions
 		dequeueAllGitOperations: vi.fn(),
@@ -51,6 +56,20 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		enqueueGitOperation: vi.fn(),
 	};
 });
+
+vi.mock("../core/LinearIssueStore.js", () => ({
+	linearIssuePath: vi.fn((key: string, cwd: string) => `${cwd}/.jolli/jollimemory/linear-issues/${key}.md`),
+	readLinearIssueMarkdown: vi.fn().mockResolvedValue(null),
+	renameLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../core/PlanPromptFormatter.js", () => ({
+	formatPlansBlock: vi.fn().mockResolvedValue(""),
+}));
+
+vi.mock("../core/NotePromptFormatter.js", () => ({
+	formatNotesBlock: vi.fn().mockResolvedValue(""),
+}));
 
 vi.mock("../core/Locks.js", () => ({
 	acquireWorkerLock: vi.fn(),

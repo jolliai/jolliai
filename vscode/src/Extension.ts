@@ -57,7 +57,11 @@ import {
 	MemoriesTreeProvider,
 	type MemoryItem,
 } from "./providers/MemoriesTreeProvider.js";
-import type { NoteItem, PlanItem } from "./providers/PlansTreeProvider.js";
+import type {
+	LinearIssueItem,
+	NoteItem,
+	PlanItem,
+} from "./providers/PlansTreeProvider.js";
 import { PlansTreeProvider } from "./providers/PlansTreeProvider.js";
 import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
 import { AuthService } from "./services/AuthService.js";
@@ -1791,6 +1795,46 @@ export function activate(context: vscode.ExtensionContext): void {
 					typeof itemOrId === "string" ? itemOrId : itemOrId.note.id;
 				log.info("cmd", `removeNote invoked: ${noteId}`);
 				await bridge.removeNote(noteId);
+				await plansStore.refresh();
+			},
+		),
+
+		// ── Linear issue commands ───────────────────────────────────────────────
+		// All three accept either a LinearIssueItem (from native tree) or a bare
+		// mapKey string (from webview). The mapKey is "<ticketId>" pre-archive or
+		// "<ticketId>-<shortHash>" post-archive — see plan §9.10.
+
+		vscode.commands.registerCommand(
+			"jollimemory.openLinearIssue",
+			async (itemOrKey: LinearIssueItem | string) => {
+				const mapKey =
+					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.issue.mapKey;
+				log.info("cmd", `openLinearIssue: ${mapKey}`);
+				const issues = await bridge.listLinearIssues();
+				const info = issues.find((i) => i.mapKey === mapKey);
+				if (info) await bridge.openLinearIssue(info);
+			},
+		),
+
+		vscode.commands.registerCommand(
+			"jollimemory.openLinearIssueMarkdown",
+			async (itemOrKey: LinearIssueItem | string) => {
+				const mapKey =
+					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.issue.mapKey;
+				log.info("cmd", `openLinearIssueMarkdown: ${mapKey}`);
+				const issues = await bridge.listLinearIssues();
+				const info = issues.find((i) => i.mapKey === mapKey);
+				if (info) await bridge.openLinearIssueMarkdown(info);
+			},
+		),
+
+		vscode.commands.registerCommand(
+			"jollimemory.ignoreLinearIssue",
+			async (itemOrKey: LinearIssueItem | string) => {
+				const mapKey =
+					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.issue.mapKey;
+				log.info("cmd", `ignoreLinearIssue: ${mapKey}`);
+				await bridge.ignoreLinearIssue(mapKey);
 				await plansStore.refresh();
 			},
 		),

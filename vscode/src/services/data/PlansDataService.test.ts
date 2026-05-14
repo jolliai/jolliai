@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { NoteInfo, PlanInfo } from "../../Types.js";
+import type { LinearIssueInfo, NoteInfo, PlanInfo } from "../../Types.js";
 import { PlansDataService } from "./PlansDataService.js";
 
 function makePlan(lastModified: string, slug = "plan"): PlanInfo {
@@ -121,5 +121,98 @@ describe("PlansDataService.isEmpty", () => {
 		expect(
 			PlansDataService.isEmpty([], [makeNote("2026-01-01T00:00:00Z")]),
 		).toBe(false);
+	});
+
+	it("returns false when only linear issues exist", () => {
+		expect(
+			PlansDataService.isEmpty(
+				[],
+				[],
+				[makeLinearIssue("2026-01-01T00:00:00Z")],
+			),
+		).toBe(false);
+	});
+
+	it("returns true when explicit empty linearIssues array is passed", () => {
+		expect(PlansDataService.isEmpty([], [], [])).toBe(true);
+	});
+});
+
+function makeLinearIssue(
+	lastModified: string,
+	ticketId = "JOLLI-1",
+): LinearIssueInfo {
+	return {
+		kind: "linearissue",
+		ticketId,
+		mapKey: ticketId,
+		title: `Issue ${ticketId}`,
+		url: `https://linear.app/x/${ticketId}`,
+		sourcePath: `/.jolli/.../${ticketId}.md`,
+		branch: "main",
+		addedAt: lastModified,
+		updatedAt: lastModified,
+		lastModified,
+		commitHash: null,
+		ignored: false,
+		sourceToolName: "mcp__linear__get_issue",
+	};
+}
+
+describe("PlansDataService.mergeByLastModified — three-way merge", () => {
+	it("includes linear issues in the merged output", () => {
+		const merged = PlansDataService.mergeByLastModified(
+			[],
+			[],
+			[makeLinearIssue("2026-05-14T06:00:00Z", "JOLLI-1")],
+		);
+		expect(merged).toHaveLength(1);
+		expect(merged[0].kind).toBe("linearissue");
+	});
+
+	it("interleaves all three kinds by lastModified descending", () => {
+		const plans = [makePlan("2026-05-14T03:00:00Z", "plan-mid")];
+		const notes = [makeNote("2026-05-14T05:00:00Z", "note-newest")];
+		const linearIssues = [
+			makeLinearIssue("2026-05-14T01:00:00Z", "JOLLI-old"),
+			makeLinearIssue("2026-05-14T04:00:00Z", "JOLLI-mid"),
+		];
+
+		const merged = PlansDataService.mergeByLastModified(
+			plans,
+			notes,
+			linearIssues,
+		);
+
+		const order = merged.map((m) => {
+			if (m.kind === "plan") return m.plan.slug;
+			if (m.kind === "note") return m.note.id;
+			return m.linearIssue.ticketId;
+		});
+		expect(order).toEqual([
+			"note-newest",
+			"JOLLI-mid",
+			"plan-mid",
+			"JOLLI-old",
+		]);
+	});
+
+	it("uses kind rank for deterministic tie-break (plan < note < linearissue)", () => {
+		const same = "2026-05-14T00:00:00Z";
+		const merged = PlansDataService.mergeByLastModified(
+			[makePlan(same, "p")],
+			[makeNote(same, "n")],
+			[makeLinearIssue(same, "JOLLI-1")],
+		);
+		expect(merged.map((m) => m.kind)).toEqual(["plan", "note", "linearissue"]);
+	});
+
+	it("defaults linearIssues to [] when omitted (backward compat)", () => {
+		const merged = PlansDataService.mergeByLastModified(
+			[makePlan("2026-01-01T00:00:00Z")],
+			[],
+		);
+		expect(merged).toHaveLength(1);
+		expect(merged[0].kind).toBe("plan");
 	});
 });

@@ -8,7 +8,7 @@
 
 import * as vscode from "vscode";
 import type { PlansStore } from "../stores/PlansStore.js";
-import type { NoteInfo, PlanInfo } from "../Types.js";
+import type { LinearIssueInfo, NoteInfo, PlanInfo } from "../Types.js";
 import {
 	escMd,
 	formatRelativeDate,
@@ -19,7 +19,7 @@ import { treeItemToSerialized } from "../views/SidebarSerialize.js";
 
 // ─── Tree item types ────────────────────────────────────────────────────────
 
-type TreeItem = PlanItem | NoteItem;
+type TreeItem = PlanItem | NoteItem | LinearIssueItem;
 
 export class PlanItem extends vscode.TreeItem {
 	readonly plan: PlanInfo;
@@ -59,6 +59,24 @@ export class NoteItem extends vscode.TreeItem {
 	}
 }
 
+export class LinearIssueItem extends vscode.TreeItem {
+	readonly issue: LinearIssueInfo;
+
+	constructor(issue: LinearIssueInfo) {
+		super(buildLinearIssueLabel(issue), vscode.TreeItemCollapsibleState.None);
+		this.issue = issue;
+		this.description = buildLinearIssueDescription(issue);
+		this.iconPath = new vscode.ThemeIcon("issue-opened");
+		this.contextValue = "linearissue";
+		this.tooltip = buildLinearIssueTooltip(issue);
+		this.command = {
+			command: "jollimemory.openLinearIssueMarkdown",
+			title: "Open Linear Issue Markdown",
+			arguments: [this],
+		};
+	}
+}
+
 // ─── PlansTreeProvider ──────────────────────────────────────────────────────
 
 export class PlansTreeProvider
@@ -91,16 +109,19 @@ export class PlansTreeProvider
 		if (!snap.isEnabled) {
 			return [];
 		}
-		return snap.merged.map((entry) =>
-			entry.kind === "plan"
-				? (new PlanItem(entry.plan) as TreeItem)
-				: (new NoteItem(entry.note) as TreeItem),
-		);
+		return snap.merged.map((entry) => {
+			if (entry.kind === "plan") return new PlanItem(entry.plan) as TreeItem;
+			if (entry.kind === "note") return new NoteItem(entry.note) as TreeItem;
+			return new LinearIssueItem(entry.linearIssue) as TreeItem;
+		});
 	}
 
 	serialize(): ReadonlyArray<SerializedTreeItem> {
 		return this.getChildren().map((it) => {
-			const idHint = it instanceof PlanItem ? it.plan.slug : it.note.id;
+			let idHint: string;
+			if (it instanceof PlanItem) idHint = it.plan.slug;
+			else if (it instanceof NoteItem) idHint = it.note.id;
+			else idHint = it.issue.mapKey;
 			return treeItemToSerialized(it, idHint);
 		});
 	}
@@ -208,5 +229,42 @@ function buildNoteTooltip(note: NoteInfo): vscode.MarkdownString {
 		`[$(edit) Edit Note](command:jollimemory.editNote?${noteArg})`,
 	);
 
+	return md;
+}
+
+// ─── Linear issue label / tooltip helpers ───────────────────────────────────
+
+function buildLinearIssueLabel(issue: LinearIssueInfo): string {
+	return `${issue.ticketId} — ${issue.title}`;
+}
+
+function buildLinearIssueDescription(issue: LinearIssueInfo): string {
+	// Intentionally omits the issue.status field. The status captured at
+	// reference time can drift from the live Linear value (we don't poll), so
+	// displaying it in the row description risked misleading users with stale
+	// "In Progress" / "Backlog" labels. The status remains in the tooltip's
+	// markdown body for users who explicitly hover to inspect captured state.
+	return formatShortRelativeDate(issue.lastModified);
+}
+
+function buildLinearIssueTooltip(
+	issue: LinearIssueInfo,
+): vscode.MarkdownString {
+	const md = new vscode.MarkdownString("", true);
+	md.isTrusted = true;
+	md.appendMarkdown(`**${escMd(issue.ticketId)}** — ${escMd(issue.title)}\n\n`);
+	if (issue.status) md.appendMarkdown(`Status: ${escMd(issue.status)}  \n`);
+	if (issue.priority)
+		md.appendMarkdown(`Priority: ${escMd(issue.priority)}  \n`);
+	if (issue.labels && issue.labels.length > 0) {
+		md.appendMarkdown(`Labels: ${escMd(issue.labels.join(", "))}  \n`);
+	}
+	md.appendMarkdown(`\n[$(link-external) Open in Linear](${issue.url})`);
+	if (issue.description) {
+		const preview = issue.description.slice(0, 200);
+		md.appendMarkdown(
+			`\n\n---\n\n${escMd(preview)}${issue.description.length > 200 ? "…" : ""}`,
+		);
+	}
 	return md;
 }

@@ -25,7 +25,7 @@ import {
 	PlansDataService,
 	type PlansOrNote,
 } from "../services/data/PlansDataService.js";
-import type { NoteInfo, PlanInfo } from "../Types.js";
+import type { LinearIssueInfo, NoteInfo, PlanInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
 import { BaseStore, type Snapshot } from "./BaseStore.js";
 
@@ -34,6 +34,7 @@ export type PlansChangeReason = "init" | "refresh" | "enabled";
 export interface PlansSnapshot extends Snapshot<PlansChangeReason> {
 	readonly plans: ReadonlyArray<PlanInfo>;
 	readonly notes: ReadonlyArray<NoteInfo>;
+	readonly linearIssues: ReadonlyArray<LinearIssueInfo>;
 	readonly merged: ReadonlyArray<PlansOrNote>;
 	readonly isEmpty: boolean;
 	readonly isEnabled: boolean;
@@ -42,6 +43,7 @@ export interface PlansSnapshot extends Snapshot<PlansChangeReason> {
 const EMPTY: PlansSnapshot = {
 	plans: [],
 	notes: [],
+	linearIssues: [],
 	merged: [],
 	isEmpty: true,
 	isEnabled: true,
@@ -54,12 +56,14 @@ export interface PlansStoreOptions {
 	readonly workspaceRoot: string;
 	readonly plansDir: string;
 	readonly notesDir: string;
+	readonly linearIssuesDir?: string;
 }
 
 export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 	private snapshot: PlansSnapshot = EMPTY;
 	private plans: Array<PlanInfo> = [];
 	private notes: Array<NoteInfo> = [];
+	private linearIssues: Array<LinearIssueInfo> = [];
 	private enabled = true;
 	private debounceTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -119,6 +123,22 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 		notesWatcher.onDidChange(debouncedPlansRefresh);
 		notesWatcher.onDidDelete(debouncedPlansRefresh);
 		this.disposables.push(notesWatcher);
+
+		// Linear issues directory watcher — file creates from StopHook trigger panel refresh
+		/* v8 ignore start -- linearIssuesDir is optional; tests typically construct PlansStore without it, so the watcher-setup branch is covered indirectly by Extension.ts wiring rather than store-unit tests. */
+		if (options.linearIssuesDir) {
+			const linearIssuesWatcher = vscode.workspace.createFileSystemWatcher(
+				new vscode.RelativePattern(
+					vscode.Uri.file(options.linearIssuesDir),
+					"*.md",
+				),
+			);
+			linearIssuesWatcher.onDidCreate(debouncedPlansRefresh);
+			linearIssuesWatcher.onDidChange(debouncedPlansRefresh);
+			linearIssuesWatcher.onDidDelete(debouncedPlansRefresh);
+			this.disposables.push(linearIssuesWatcher);
+		}
+		/* v8 ignore stop */
 	}
 
 	protected getCurrentSnapshot(): PlansSnapshot {
@@ -139,11 +159,18 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 		if (!this.enabled) {
 			this.plans = [];
 			this.notes = [];
+			this.linearIssues = [];
 			this.rebuildSnapshot("refresh");
 			return;
 		}
-		this.plans = await this.bridge.listPlans();
-		this.notes = await this.bridge.listNotes();
+		const [plans, notes, linearIssues] = await Promise.all([
+			this.bridge.listPlans(),
+			this.bridge.listNotes(),
+			this.bridge.listLinearIssues(),
+		]);
+		this.plans = plans;
+		this.notes = notes;
+		this.linearIssues = [...linearIssues];
 		this.rebuildSnapshot("refresh");
 	}
 
@@ -155,6 +182,7 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 		if (!e) {
 			this.plans = [];
 			this.notes = [];
+			this.linearIssues = [];
 		}
 		this.rebuildSnapshot("enabled");
 	}
@@ -212,12 +240,21 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 	}
 
 	private rebuildSnapshot(reason: PlansChangeReason): void {
-		const merged = PlansDataService.mergeByLastModified(this.plans, this.notes);
+		const merged = PlansDataService.mergeByLastModified(
+			this.plans,
+			this.notes,
+			this.linearIssues,
+		);
 		this.snapshot = {
 			plans: this.plans,
 			notes: this.notes,
+			linearIssues: this.linearIssues,
 			merged,
-			isEmpty: PlansDataService.isEmpty(this.plans, this.notes),
+			isEmpty: PlansDataService.isEmpty(
+				this.plans,
+				this.notes,
+				this.linearIssues,
+			),
 			isEnabled: this.enabled,
 			changeReason: reason,
 		};

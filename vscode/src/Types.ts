@@ -118,6 +118,7 @@ export interface PlansRegistry {
 	readonly version: 1;
 	readonly plans: Readonly<Record<string, PlanEntry>>;
 	readonly notes?: Readonly<Record<string, NoteEntry>>;
+	readonly linearIssues?: Readonly<Record<string, LinearIssueEntry>>;
 }
 
 // ─── Note types ─────────────────────────────────────────────────────────────
@@ -125,8 +126,21 @@ export interface PlansRegistry {
 // Re-export core note types to avoid duplication
 export type { NoteEntry, NoteFormat } from "../../cli/src/Types.js";
 
-// Import for use in PlansRegistry / NoteInfo above and below
-import type { NoteEntry, NoteFormat } from "../../cli/src/Types.js";
+// ─── Linear issue types ─────────────────────────────────────────────────────
+
+// Re-export core Linear types to avoid duplication
+export type {
+	LinearIssueCommitRef,
+	LinearIssueEntry,
+	LinearIssueRef,
+} from "../../cli/src/Types.js";
+
+// Import for use in PlansRegistry / NoteInfo / LinearIssueInfo
+import type {
+	LinearIssueEntry,
+	NoteEntry,
+	NoteFormat,
+} from "../../cli/src/Types.js";
 
 /** Display-level note metadata for the VSCode tree view */
 export interface NoteInfo {
@@ -143,4 +157,28 @@ export interface NoteInfo {
 	readonly filename?: string;
 	/** Absolute file path */
 	readonly filePath?: string;
+}
+
+/** Display-level Linear issue metadata for the VSCode panel */
+export interface LinearIssueInfo {
+	readonly kind: "linearissue";
+	/** Stable Linear ticket id (e.g. "JOLLI-1528") */
+	readonly ticketId: string;
+	/** Current map key in plans.json (= ticketId when uncommitted, = ticketId-shortHash after archive) */
+	readonly mapKey: string;
+	readonly title: string;
+	readonly url: string;
+	readonly sourcePath: string;
+	readonly status?: string;
+	readonly priority?: string;
+	readonly labels?: ReadonlyArray<string>;
+	readonly description?: string;
+	readonly branch: string;
+	readonly addedAt: string;
+	readonly updatedAt: string;
+	/** ISO 8601 — same as updatedAt for sort consistency with PlanInfo / NoteInfo */
+	readonly lastModified: string;
+	readonly commitHash: string | null;
+	readonly ignored: boolean;
+	readonly sourceToolName: string;
 }
