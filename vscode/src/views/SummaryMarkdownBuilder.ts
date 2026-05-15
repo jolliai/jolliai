@@ -118,7 +118,8 @@ export function pushPlansAndNotesSection(
 ): void {
 	const plans = summary.plans ?? [];
 	const notes = summary.notes ?? [];
-	const totalCount = plans.length + notes.length;
+	const linearIssues = summary.linearIssues ?? [];
+	const totalCount = plans.length + notes.length + linearIssues.length;
 	if (totalCount === 0) {
 		return;
 	}
@@ -133,6 +134,14 @@ export function pushPlansAndNotesSection(
 	for (const note of notes) {
 		const noteUrl = note.jolliNoteDocUrl;
 		lines.push(noteUrl ? `- [${note.title}](${noteUrl})` : `- ${note.title}`);
+	}
+
+	// Linear issues render with the ticketId prefix so reviewers can grep
+	// the PR description for a specific ticket without parsing titles.
+	// We prefer the upstream Linear URL over any internal Jolli doc URL,
+	// since Linear is the authoritative tracker.
+	for (const issue of linearIssues) {
+		lines.push(`- [${issue.ticketId} — ${issue.title}](${issue.url})`);
 	}
 }
 

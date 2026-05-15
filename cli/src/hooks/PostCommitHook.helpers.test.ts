@@ -347,14 +347,14 @@ describe("PostCommitHook helpers", () => {
 			mockLoadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: {
-					"alpha-plan": { slug: "alpha-plan", commitHash: null, ignored: false },
-					"beta-plan": { slug: "beta-plan", commitHash: null, ignored: false },
-					"committed-plan": { slug: "committed-plan", commitHash: "abc123", ignored: false },
-					"ignored-plan": { slug: "ignored-plan", commitHash: null, ignored: true },
+					"alpha-plan": { slug: "alpha-plan", commitHash: null, ignored: false, branch: "main" },
+					"beta-plan": { slug: "beta-plan", commitHash: null, ignored: false, branch: "main" },
+					"committed-plan": { slug: "committed-plan", commitHash: "abc123", ignored: false, branch: "main" },
+					"ignored-plan": { slug: "ignored-plan", commitHash: null, ignored: true, branch: "main" },
 				},
 			});
 
-			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo");
+			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo", "main");
 			expect([...slugs].sort()).toEqual(["alpha-plan", "beta-plan"]);
 		});
 
@@ -362,12 +362,12 @@ describe("PostCommitHook helpers", () => {
 			mockLoadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: {
-					done: { slug: "done", commitHash: "abc", ignored: false },
-					skipped: { slug: "skipped", commitHash: null, ignored: true },
+					done: { slug: "done", commitHash: "abc", ignored: false, branch: "main" },
+					skipped: { slug: "skipped", commitHash: null, ignored: true, branch: "main" },
 				},
 			});
 
-			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo");
+			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo", "main");
 			expect(slugs.size).toBe(0);
 		});
 
@@ -380,13 +380,42 @@ describe("PostCommitHook helpers", () => {
 						commitHash: null,
 						ignored: false,
 						contentHashAtCommit: "hash123",
+						branch: "main",
 					},
-					eligible: { slug: "eligible", commitHash: null, ignored: false },
+					eligible: { slug: "eligible", commitHash: null, ignored: false, branch: "main" },
 				},
 			});
 
-			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo");
+			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo", "main");
 			expect([...slugs]).toEqual(["eligible"]);
+		});
+
+		it("excludes uncommitted plans whose branch differs from the target branch", async () => {
+			// Regression guard for the cross-branch leak: before adding the branch
+			// filter, plans on `feature/summarize-include-linear-issues` were being
+			// associated with a commit on `feature/linear-issues-as-panel-item`,
+			// polluting the orphan branch under the wrong branch directory and
+			// generating phantom plan refs on the wrong commit's summary.
+			mockLoadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: {
+					"current-branch": {
+						slug: "current-branch",
+						commitHash: null,
+						ignored: false,
+						branch: "feature/active",
+					},
+					"other-branch": {
+						slug: "other-branch",
+						commitHash: null,
+						ignored: false,
+						branch: "feature/idle",
+					},
+				},
+			});
+
+			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo", "feature/active");
+			expect([...slugs]).toEqual(["current-branch"]);
 		});
 	});
 
@@ -553,6 +582,11 @@ describe("PostCommitHook helpers", () => {
 
 	describe("executePipeline", () => {
 		it("stores plan references on the summary when transcript slug detection finds a plan", async () => {
+			// Align the current-branch mock with the plan's branch so the
+			// branch-filtered detectPlanSlugsFromRegistry picks it up. Without
+			// this override the default "main" from beforeEach would suppress
+			// the plan and silently drop the assertion target.
+			mockGetCurrentBranch.mockResolvedValue("feature/test");
 			mockLoadAllSessions.mockResolvedValue([
 				{
 					sessionId: "sess-1",
@@ -625,6 +659,8 @@ describe("PostCommitHook helpers", () => {
 		});
 
 		it("stores plan progress artifacts with correct commit metadata when evaluator returns a result", async () => {
+			// Match the plan's branch (see sibling test rationale above).
+			mockGetCurrentBranch.mockResolvedValue("feature/test");
 			mockLoadAllSessions.mockResolvedValue([
 				{
 					sessionId: "sess-1",

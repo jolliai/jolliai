@@ -808,14 +808,49 @@ describe("QueueWorker", () => {
 				},
 			});
 
-			const ids = await __test__.detectUncommittedNoteIds("/test/cwd");
+			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "main");
 			expect([...ids].sort()).toEqual(["fresh"]);
 		});
 
 		it("returns empty set when registry has no notes field", async () => {
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({ version: 1, plans: {} });
-			const ids = await __test__.detectUncommittedNoteIds("/test/cwd");
+			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "main");
 			expect(ids.size).toBe(0);
+		});
+
+		it("excludes notes whose branch differs from the target branch", async () => {
+			// Regression guard for the cross-branch leak: parallels the
+			// detectPlanSlugsFromRegistry test in PostCommitHook.helpers.test.ts.
+			// Without the branch filter, notes from `feature/idle` would be
+			// associated with a commit on `feature/active`.
+			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
+				version: 1,
+				plans: {},
+				notes: {
+					"current-note": {
+						id: "current-note",
+						title: "Current",
+						format: "markdown" as const,
+						sourcePath: "/p",
+						addedAt: "x",
+						updatedAt: "y",
+						branch: "feature/active",
+						commitHash: null,
+					},
+					"other-note": {
+						id: "other-note",
+						title: "Other",
+						format: "markdown" as const,
+						sourcePath: "/p",
+						addedAt: "x",
+						updatedAt: "y",
+						branch: "feature/idle",
+						commitHash: null,
+					},
+				},
+			});
+			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "feature/active");
+			expect([...ids]).toEqual(["current-note"]);
 		});
 	});
 

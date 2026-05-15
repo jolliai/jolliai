@@ -159,4 +159,29 @@ describe("SummaryScriptBuilder", () => {
 	it("places copilot-chat after copilot in source ordering", () => {
 		expect(script).toMatch(/'copilot',\s*'copilot-chat'/);
 	});
+
+	describe("Linear issue actions", () => {
+		it("routes the 3 Linear actions through their own data-action cases", () => {
+			// Each case must read the data-linear-key attribute and post a
+			// message back to the host with that key. The host-side handlers
+			// in SummaryWebviewPanel rely on this exact case-name spelling.
+			expect(script).toContain("case 'openLinearIssue'");
+			expect(script).toContain("case 'openLinearIssueMarkdown'");
+			expect(script).toContain("case 'removeLinearIssue'");
+		});
+
+		it("openLinearIssue forwards both archivedKey and url so the host doesn't re-query orphan branch", () => {
+			expect(script).toContain("'data-linear-url'");
+			expect(script).toMatch(
+				/command:\s*'openLinearIssue',\s*archivedKey:[^,]+,\s*url:/,
+			);
+		});
+
+		it("removeLinearIssue forwards archivedKey + ticketId so the host can mark both registry keys ignored", () => {
+			expect(script).toContain("'data-linear-ticket'");
+			expect(script).toMatch(
+				/command:\s*'removeLinearIssue',\s*archivedKey:[^,]+,\s*ticketId:/,
+			);
+		});
+	});
 });

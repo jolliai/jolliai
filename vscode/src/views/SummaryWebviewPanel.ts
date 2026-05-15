@@ -15,6 +15,7 @@
 
 import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { join } from "node:path";
 import * as vscode from "vscode";
 import {
 	loadPlansRegistry,
@@ -46,6 +47,7 @@ import type {
 	PlanReference,
 	StoredTranscript,
 } from "../../../cli/src/Types.js";
+import { setLinearIssueIgnored } from "../core/LinearIssueService.js";
 import {
 	archiveNoteForCommit,
 	ignoreNote,
@@ -140,6 +142,13 @@ type WebviewMessage =
 	| { command: "previewNote"; id: string; title: string }
 	| { command: "translateNote"; id: string }
 	| { command: "removeNote"; id: string; title: string }
+	| { command: "openLinearIssue"; archivedKey: string; url: string }
+	| { command: "openLinearIssueMarkdown"; archivedKey: string }
+	| {
+			command: "removeLinearIssue";
+			archivedKey: string;
+			ticketId: string;
+	  }
 	| { command: "checkPrStatus" }
 	| { command: "prepareCreatePr" }
 	| { command: "createPr"; title: string; body: string }
@@ -567,6 +576,26 @@ export class SummaryWebviewPanel {
 				this.catchAndShow(
 					this.handleRemoveNote(message.id, message.title),
 					"Remove note failed",
+				);
+				break;
+			case "openLinearIssue":
+				// `url` is round-tripped from the rendered row so we don't have
+				// to re-load the orphan branch summary to find the link target.
+				this.catchAndShow(
+					this.handleOpenLinearIssue(message.archivedKey, message.url),
+					"Open Linear issue failed",
+				);
+				break;
+			case "openLinearIssueMarkdown":
+				this.catchAndShow(
+					this.handleOpenLinearIssueMarkdown(message.archivedKey),
+					"Open Linear issue markdown failed",
+				);
+				break;
+			case "removeLinearIssue":
+				this.catchAndShow(
+					this.handleRemoveLinearIssue(message.archivedKey, message.ticketId),
+					"Remove Linear issue failed",
 				);
 				break;
 			case "checkPrStatus":
@@ -2057,6 +2086,92 @@ export class SummaryWebviewPanel {
 		// Mark as ignored so the note doesn't reappear in the sidebar on next refresh
 		// (unassociate only sets commitHash=null — the entry would still be visible)
 		await ignoreNote(id, this.workspaceRoot);
+		this.update(updatedSummary);
+	}
+
+	// ── Linear issue actions ─────────────────────────────────────────────────
+
+	/**
+	 * Opens the upstream Linear issue URL in the user's default browser.
+	 * The row already carries the URL as a data attribute, so we don't have
+	 * to re-resolve it from the orphan-branch summary.
+	 */
+	private async handleOpenLinearIssue(
+		_archivedKey: string,
+		url: string,
+	): Promise<void> {
+		if (!url) return;
+		await vscode.env.openExternal(vscode.Uri.parse(url));
+	}
+
+	/**
+	 * Opens the captured-at-commit markdown snapshot for a Linear issue. The
+	 * archived snapshot file lives at .jolli/jollimemory/linear-issues/<key>.md
+	 * — the same on-disk path the QueueWorker renamed it to during commit
+	 * association (`<ticketId>.md` → `<ticketId>-<shortHash>.md`).
+	 */
+	private async handleOpenLinearIssueMarkdown(
+		archivedKey: string,
+	): Promise<void> {
+		if (!archivedKey) return;
+		const filePath = join(
+			this.workspaceRoot,
+			".jolli",
+			"jollimemory",
+			"linear-issues",
+			`${archivedKey}.md`,
+		);
+		await vscode.window.showTextDocument(vscode.Uri.file(filePath));
+	}
+
+	/**
+	 * Dissociates a Linear issue from this commit's summary. Mirrors
+	 * `handleRemovePlan` / `handleRemoveNote`: prompts for confirmation,
+	 * filters the issue out of `summary.linearIssues[]`, persists, then
+	 * marks both the guard and snapshot entries ignored so the issue stays
+	 * hidden from the sidebar panel even if the live file is touched again.
+	 */
+	private async handleRemoveLinearIssue(
+		archivedKey: string,
+		ticketId: string,
+	): Promise<void> {
+		const summary = this.currentSummary;
+		if (!summary?.linearIssues) {
+			return;
+		}
+
+		const choice = await vscode.window.showWarningMessage(
+			`Remove Linear issue "${ticketId}" from this commit?`,
+			{
+				modal: true,
+				detail:
+					"The issue will no longer be linked to this commit's summary. The captured markdown snapshot is preserved on the orphan branch.",
+			},
+			"Remove",
+		);
+		if (choice !== "Remove") {
+			return;
+		}
+
+		const updatedLinearIssues = summary.linearIssues.filter(
+			(l) => l.archivedKey !== archivedKey,
+		);
+		const updatedSummary: CommitSummary = {
+			...summary,
+			linearIssues:
+				updatedLinearIssues.length > 0 ? updatedLinearIssues : undefined,
+		};
+		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		this.currentSummary = updatedSummary;
+
+		// Hide both entries from the panel: the snapshot key and the ticketId
+		// guard entry. `setLinearIssueIgnored` accepts either, mirroring the
+		// dual-key archive layout in plans.json (see LinearIssueStore).
+		await setLinearIssueIgnored(this.workspaceRoot, archivedKey, true);
+		if (ticketId && ticketId !== archivedKey) {
+			await setLinearIssueIgnored(this.workspaceRoot, ticketId, true);
+		}
+
 		this.update(updatedSummary);
 	}
 

@@ -395,15 +395,20 @@ function formatElapsed(startMs: number): string {
  * Plans are discovered by the StopHook at transcript scan time, so the
  * registry is already up-to-date when the post-commit hook runs.
  */
-async function detectPlanSlugsFromRegistry(cwd: string): Promise<Set<string>> {
+async function detectPlanSlugsFromRegistry(cwd: string, branch: string): Promise<Set<string>> {
 	const registry = await loadPlansRegistry(cwd);
 	const slugs = new Set<string>();
 	for (const [slug, entry] of Object.entries(registry.plans)) {
+		// branch filter is load-bearing: without it, uncommitted plans from OTHER
+		// branches get falsely associated with the current commit (observed bug:
+		// cross-branch plans archived to feature/linear-issues-as-panel-item's
+		// 786c5330 even though their entry.branch said feature/summarize-include-linear-issues).
+		if (entry.branch !== branch) continue;
 		if (entry.commitHash === null && !entry.ignored && !entry.contentHashAtCommit) {
 			slugs.add(slug);
 		}
 	}
-	log.info("Plan registry scan: found %d uncommitted slug(s): [%s]", slugs.size, [...slugs].join(", "));
+	log.info("Plan registry scan: found %d uncommitted slug(s) on %s: [%s]", slugs.size, branch, [...slugs].join(", "));
 	return slugs;
 }
 
@@ -558,15 +563,20 @@ async function associatePlansWithCommit(
  * Notes with `commitHash === null` and no `contentHashAtCommit` (not yet archived)
  * are candidates for association with the current commit.
  */
-async function detectUncommittedNoteIds(cwd: string): Promise<Set<string>> {
+async function detectUncommittedNoteIds(cwd: string, branch: string): Promise<Set<string>> {
 	const registry = await loadPlansRegistry(cwd);
 	const ids = new Set<string>();
 	for (const [id, entry] of Object.entries(registry.notes ?? {})) {
+		// branch filter mirrors detectPlanSlugsFromRegistry / detectUncommittedLinearIssueIds
+		// — without it, notes from another branch would be wrongly associated with
+		// the current commit on commit. See the cross-branch leak documented at
+		// detectPlanSlugsFromRegistry above.
+		if (entry.branch !== branch) continue;
 		if (entry.commitHash === null && !entry.ignored && !entry.contentHashAtCommit) {
 			ids.add(id);
 		}
 	}
-	log.info("Note registry scan: found %d uncommitted note(s): [%s]", ids.size, [...ids].join(", "));
+	log.info("Note registry scan: found %d uncommitted note(s) on %s: [%s]", ids.size, branch, [...ids].join(", "));
 	return ids;
 }
 
@@ -978,12 +988,12 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	log.info("API summary generated (%s)", formatElapsed(stepStart));
 
 	// Step 8a: Read uncommitted plan slugs from plans.json registry
-	const planSlugs = await detectPlanSlugsFromRegistry(cwd);
+	const planSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
 	const planAssociation = await associatePlansWithCommit(planSlugs, commitInfo.hash, cwd, branch);
 	const planRefs = planAssociation.refs;
 
 	// Step 8a2: Read uncommitted note IDs from plans.json registry
-	const noteIds = await detectUncommittedNoteIds(cwd);
+	const noteIds = await detectUncommittedNoteIds(cwd, branch);
 	const noteRefs = await associateNotesWithCommit(noteIds, commitInfo.hash, cwd, branch);
 
 	// Step 8a3: Read uncommitted Linear issue ticketIds from plans.json registry
@@ -1050,12 +1060,15 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	};
 
 	log.info(
-		"Summary built for %s: recap=%s, topics=%d, plans=%s, notes=%s",
+		"Summary built for %s: recap=%s, topics=%d, plans=%s, notes=%s, linearIssues=%s",
 		commitInfo.hash.substring(0, 8),
 		summary.recap ? "yes" : "no",
 		summary.topics?.length ?? 0,
 		summary.plans ? `${summary.plans.length} ref(s): [${summary.plans.map((p) => p.slug).join(", ")}]` : "absent",
 		summary.notes ? `${summary.notes.length} ref(s): [${summary.notes.map((n) => n.id).join(", ")}]` : "absent",
+		summary.linearIssues
+			? `${summary.linearIssues.length} ref(s): [${summary.linearIssues.map((l) => l.ticketId).join(", ")}]`
+			: "absent",
 	);
 
 	// Step 8c: Build StoredTranscript from session transcripts for persistence
@@ -1069,11 +1082,12 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		...(planProgressArtifacts.length > 0 ? { planProgress: planProgressArtifacts } : {}),
 	});
 	log.info(
-		"Summary stored successfully for commit %s (%s, %d plans, %d notes)",
+		"Summary stored successfully for commit %s (%s, %d plans, %d notes, %d linearIssues)",
 		commitInfo.hash.substring(0, 8),
 		formatElapsed(stepStart),
 		planRefs.length,
 		noteRefs.length,
+		linearIssueRefs.length,
 	);
 
 	// Note: Old Step 10 (amend-pending Scenario 1) has been removed.

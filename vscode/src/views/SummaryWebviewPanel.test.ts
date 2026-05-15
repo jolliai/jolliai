@@ -28,6 +28,7 @@ const {
 	openExternal,
 	executeCommand,
 	getConfiguration,
+	showTextDocument,
 } = vi.hoisted(() => ({
 	postMessage: vi.fn().mockResolvedValue(true),
 	onDidReceiveMessage: vi.fn(),
@@ -44,6 +45,7 @@ const {
 	openExternal: vi.fn(),
 	executeCommand: vi.fn(),
 	getConfiguration: vi.fn(() => ({ get: vi.fn() })),
+	showTextDocument: vi.fn().mockResolvedValue(undefined),
 }));
 
 const { createWebviewPanel } = vi.hoisted(() => ({
@@ -70,6 +72,7 @@ vi.mock("vscode", () => ({
 		showQuickPick,
 		showOpenDialog,
 		showSaveDialog,
+		showTextDocument,
 	},
 	env: {
 		clipboard: { writeText: clipboardWriteText },
@@ -229,6 +232,14 @@ vi.mock("../core/NoteService.js", () => ({
 	archiveNoteForCommit: mockArchiveNoteForCommit,
 	unassociateNoteFromCommit: mockUnassociateNoteFromCommit,
 	ignoreNote: mockIgnoreNote,
+}));
+
+const { mockSetLinearIssueIgnored } = vi.hoisted(() => ({
+	mockSetLinearIssueIgnored: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../core/LinearIssueService.js", () => ({
+	setLinearIssueIgnored: mockSetLinearIssueIgnored,
 }));
 
 const {
@@ -6002,6 +6013,244 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				expect(showWarningMessage).not.toHaveBeenCalled();
+			});
+		});
+
+		// ── Linear issue handlers ────────────────────────────────────────────
+		//
+		// Mirrors the removePlan / removeNote test shape but exercises the
+		// three new commands wired in the message-type union (openLinearIssue,
+		// openLinearIssueMarkdown, removeLinearIssue). The captured-at-commit
+		// markdown lives at `.jolli/jollimemory/linear-issues/<archivedKey>.md`
+		// — see QueueWorker.associateLinearIssuesWithCommit.
+
+		describe("openLinearIssue", () => {
+			it("opens the upstream URL via vscode.env.openExternal", async () => {
+				const dispatch = await setupPanel({
+					linearIssues: [
+						{
+							archivedKey: "JOLLI-1-aaaaaaaa",
+							ticketId: "JOLLI-1",
+							title: "T",
+							url: "https://linear.app/x/issue/JOLLI-1/test",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "openLinearIssue",
+					archivedKey: "JOLLI-1-aaaaaaaa",
+					url: "https://linear.app/x/issue/JOLLI-1/test",
+				});
+				await flushPromises();
+
+				expect(openExternal).toHaveBeenCalledTimes(1);
+				const arg = openExternal.mock.calls[0][0] as { toString(): string };
+				expect(arg.toString()).toBe("https://linear.app/x/issue/JOLLI-1/test");
+			});
+
+			it("no-ops when url is empty (defensive against missing data-attr)", async () => {
+				const dispatch = await setupPanel();
+
+				dispatch({
+					command: "openLinearIssue",
+					archivedKey: "JOLLI-1-aaaaaaaa",
+					url: "",
+				});
+				await flushPromises();
+
+				expect(openExternal).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("openLinearIssueMarkdown", () => {
+			it("opens the archived markdown file under .jolli/jollimemory/linear-issues", async () => {
+				const dispatch = await setupPanel();
+
+				dispatch({
+					command: "openLinearIssueMarkdown",
+					archivedKey: "JOLLI-1-aaaaaaaa",
+				});
+				await flushPromises();
+
+				expect(showTextDocument).toHaveBeenCalledTimes(1);
+				const uriArg = showTextDocument.mock.calls[0][0] as {
+					fsPath: string;
+				};
+				// Path layout follows QueueWorker.associateLinearIssuesWithCommit
+				// (rename to <ticketId>-<shortHash>.md inside the linear-issues dir).
+				expect(uriArg.fsPath).toContain("linear-issues");
+				expect(uriArg.fsPath).toContain("JOLLI-1-aaaaaaaa.md");
+			});
+
+			it("no-ops when archivedKey is empty", async () => {
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "openLinearIssueMarkdown", archivedKey: "" });
+				await flushPromises();
+
+				expect(showTextDocument).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("removeLinearIssue", () => {
+			it("confirms and dissociates the issue from this commit", async () => {
+				showWarningMessage.mockResolvedValue("Remove");
+				const dispatch = await setupPanel({
+					linearIssues: [
+						{
+							archivedKey: "JOLLI-1-aaaaaaaa",
+							ticketId: "JOLLI-1",
+							title: "T1",
+							url: "https://linear.app/x/issue/JOLLI-1/test",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+						{
+							archivedKey: "JOLLI-2-aaaaaaaa",
+							ticketId: "JOLLI-2",
+							title: "T2",
+							url: "https://linear.app/x/issue/JOLLI-2/test",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "removeLinearIssue",
+					archivedKey: "JOLLI-1-aaaaaaaa",
+					ticketId: "JOLLI-1",
+				});
+				await flushPromises();
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					'Remove Linear issue "JOLLI-1" from this commit?',
+					expect.objectContaining({ modal: true }),
+					"Remove",
+				);
+				// Both snapshot key and ticketId guard key get marked ignored so
+				// the issue stays hidden from the sidebar panel after dissociate.
+				expect(mockSetLinearIssueIgnored).toHaveBeenCalledWith(
+					workspaceRoot,
+					"JOLLI-1-aaaaaaaa",
+					true,
+				);
+				expect(mockSetLinearIssueIgnored).toHaveBeenCalledWith(
+					workspaceRoot,
+					"JOLLI-1",
+					true,
+				);
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({
+						linearIssues: [
+							expect.objectContaining({ archivedKey: "JOLLI-2-aaaaaaaa" }),
+						],
+					}),
+					workspaceRoot,
+					true,
+				);
+			});
+
+			it("clears linearIssues field when last issue is removed", async () => {
+				showWarningMessage.mockResolvedValue("Remove");
+				const dispatch = await setupPanel({
+					linearIssues: [
+						{
+							archivedKey: "JOLLI-9-bbbbbbbb",
+							ticketId: "JOLLI-9",
+							title: "Only",
+							url: "https://linear.app/x/issue/JOLLI-9/test",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "removeLinearIssue",
+					archivedKey: "JOLLI-9-bbbbbbbb",
+					ticketId: "JOLLI-9",
+				});
+				await flushPromises();
+
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ linearIssues: undefined }),
+					workspaceRoot,
+					true,
+				);
+			});
+
+			it("does nothing when user cancels the confirmation", async () => {
+				showWarningMessage.mockResolvedValue(undefined);
+				const dispatch = await setupPanel({
+					linearIssues: [
+						{
+							archivedKey: "JOLLI-1-aaaaaaaa",
+							ticketId: "JOLLI-1",
+							title: "T",
+							url: "https://linear.app/x/issue/JOLLI-1/test",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "removeLinearIssue",
+					archivedKey: "JOLLI-1-aaaaaaaa",
+					ticketId: "JOLLI-1",
+				});
+				await flushPromises();
+
+				expect(mockSetLinearIssueIgnored).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+
+			it("returns early when summary has no linear issues", async () => {
+				const dispatch = await setupPanel(); // no linearIssues
+				vi.clearAllMocks();
+
+				dispatch({
+					command: "removeLinearIssue",
+					archivedKey: "JOLLI-1-aaaaaaaa",
+					ticketId: "JOLLI-1",
+				});
+				await flushPromises();
+
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				expect(mockSetLinearIssueIgnored).not.toHaveBeenCalled();
+			});
+
+			it("skips the duplicate-key ignore call when ticketId equals archivedKey", async () => {
+				// Defensive guard: if ticketId happens to equal archivedKey (would
+				// be an invariant violation, but we don't crash on it), the second
+				// setLinearIssueIgnored call must be suppressed to avoid an
+				// extra no-op write.
+				showWarningMessage.mockResolvedValue("Remove");
+				const dispatch = await setupPanel({
+					linearIssues: [
+						{
+							archivedKey: "JOLLI-1",
+							ticketId: "JOLLI-1",
+							title: "T",
+							url: "https://linear.app/x/issue/JOLLI-1/test",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "removeLinearIssue",
+					archivedKey: "JOLLI-1",
+					ticketId: "JOLLI-1",
+				});
+				await flushPromises();
+
+				expect(mockSetLinearIssueIgnored).toHaveBeenCalledTimes(1);
 			});
 		});
 
