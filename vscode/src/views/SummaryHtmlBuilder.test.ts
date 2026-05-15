@@ -114,6 +114,7 @@ vi.mock("./SummaryUtils.js", () => ({
 import type {
 	CommitSummary,
 	E2eTestScenario,
+	LinearIssueCommitRef,
 	NoteReference,
 	PlanReference,
 } from "../../../cli/src/Types.js";
@@ -170,6 +171,20 @@ function makeNote(overrides?: Partial<NoteReference>): NoteReference {
 		format: "snippet",
 		addedAt: "2026-01-15T10:00:00Z",
 		updatedAt: "2026-01-15T10:05:00Z",
+		...overrides,
+	};
+}
+
+function makeLinear(
+	overrides?: Partial<LinearIssueCommitRef>,
+): LinearIssueCommitRef {
+	return {
+		archivedKey: "JOLLI-1-abcdef12",
+		ticketId: "JOLLI-1",
+		title: "Test Linear Issue",
+		url: "https://linear.app/jolliai/issue/JOLLI-1/test-linear-issue",
+		referencedAt: "2026-01-15T10:00:00Z",
+		sourceToolName: "mcp__linear__get_issue",
 		...overrides,
 	};
 }
@@ -543,6 +558,76 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain('data-action="removeNote"');
 			expect(html).toContain('data-note-id="rm-note"');
 			expect(html).toContain('data-note-title="Remove Me"');
+		});
+
+		it("linear issues section renders ticketId, title, and upstream URL", () => {
+			// Linear issue rows are auto-captured by QueueWorker; the WebView
+			// needs to surface them under the same "Plans & Notes" header so
+			// reviewers see them alongside plans/notes when reading a commit.
+			const linearIssues = [
+				makeLinear({
+					archivedKey: "JOLLI-1528-786c5330",
+					ticketId: "JOLLI-1528",
+					title: "Treat referenced Linear issues as a first-class panel item",
+					url: "https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
+				}),
+			];
+			const html = buildHtml(makeSummary({ linearIssues }));
+
+			expect(html).toContain("JOLLI-1528");
+			expect(html).toContain(
+				"Treat referenced Linear issues as a first-class panel item",
+			);
+			expect(html).toContain(
+				"https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
+			);
+			expect(html).toContain('id="linear-JOLLI-1528-786c5330"');
+		});
+
+		it("linear issues section wires Open / Open Markdown / Remove actions", () => {
+			// All three actions must be reachable via data-action attributes so
+			// the CSP-strict event delegation in SummaryScriptBuilder can route
+			// them. Removing any of these would silently disable a button.
+			const linearIssues = [
+				makeLinear({
+					archivedKey: "JOLLI-9-aaaaaaaa",
+					ticketId: "JOLLI-9",
+					url: "https://linear.app/x/issue/JOLLI-9/test",
+				}),
+			];
+			const html = buildHtml(makeSummary({ linearIssues }));
+
+			expect(html).toContain('data-action="openLinearIssue"');
+			expect(html).toContain('data-action="openLinearIssueMarkdown"');
+			expect(html).toContain('data-action="removeLinearIssue"');
+			expect(html).toContain('data-linear-key="JOLLI-9-aaaaaaaa"');
+			expect(html).toContain('data-linear-ticket="JOLLI-9"');
+			expect(html).toContain(
+				'data-linear-url="https://linear.app/x/issue/JOLLI-9/test"',
+			);
+		});
+
+		it("linear issues count rolls into the section header count badge", () => {
+			// Header reads "Plans & Notes (N)" where N = plans + notes + linears
+			// (≥2 triggers the badge). Without the fold-in, the badge would
+			// undercount and look inconsistent with the rendered rows.
+			const html = buildHtml(
+				makeSummary({
+					plans: [makePlan({ slug: "p1" })],
+					linearIssues: [
+						makeLinear({
+							archivedKey: "JOLLI-1-aaaaaaaa",
+							ticketId: "JOLLI-1",
+						}),
+						makeLinear({
+							archivedKey: "JOLLI-2-aaaaaaaa",
+							ticketId: "JOLLI-2",
+						}),
+					],
+				}),
+			);
+
+			expect(html).toContain('<span class="section-count">3</span>');
 		});
 
 		it("plans section shows count badge when more than 1 plan", () => {

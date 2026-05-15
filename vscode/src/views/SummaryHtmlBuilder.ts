@@ -14,6 +14,7 @@ import {
 import type {
 	CommitSummary,
 	E2eTestScenario,
+	LinearIssueCommitRef,
 	NoteReference,
 	PlanReference,
 	TopicCategory,
@@ -99,7 +100,7 @@ ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
 <hr class="separator" />
 ${buildRecapSection(summary.recap)}
 ${buildPrSectionHtml()}
-${buildPlansAndNotesSection(summary.plans, summary.notes, planTranslateSet, noteTranslateSet)}
+${buildPlansAndNotesSection(summary.plans, summary.notes, summary.linearIssues, planTranslateSet, noteTranslateSet)}
 ${buildE2eTestSection(summary)}
 ${buildSourceCommits(sourceNodes)}
 <div class="section">
@@ -318,12 +319,14 @@ export function buildRecapSection(recap: string | undefined): string {
 function buildPlansAndNotesSection(
 	plans: ReadonlyArray<PlanReference> | undefined,
 	notes: ReadonlyArray<NoteReference> | undefined,
+	linearIssues: ReadonlyArray<LinearIssueCommitRef> | undefined,
 	planTranslateSet?: ReadonlySet<string>,
 	noteTranslateSet?: ReadonlySet<string>,
 ): string {
 	const planList = plans ?? [];
 	const noteList = notes ?? [];
-	const totalCount = planList.length + noteList.length;
+	const linearList = linearIssues ?? [];
+	const totalCount = planList.length + noteList.length + linearList.length;
 
 	const planItems = planList
 		.map((p) => {
@@ -380,7 +383,30 @@ function buildPlansAndNotesSection(
 		})
 		.join("\n");
 
-	const allItems = planItems + noteItems;
+	// Linear issues: mirror the row layout used by plans/notes but with a
+	// distinct action set — open the upstream URL in a browser, open the
+	// captured-at-commit markdown locally, or dissociate from this commit's
+	// summary (data-action "removeLinearIssue"). Linear issues are auto-
+	// detected from MCP tool calls in the transcript and have no inline
+	// editor, so the pencil button is omitted.
+	const linearItems = linearList
+		.map((l) => {
+			const key = l.archivedKey;
+			return `
+  <div class="plan-item" id="linear-${escAttr(key)}">
+    <div class="plan-header">
+      <a class="plan-title plan-title-link" href="#" title="Open Linear issue markdown" data-action="openLinearIssueMarkdown" data-linear-key="${escAttr(key)}" data-linear-ticket="${escAttr(l.ticketId)}">${escHtml(l.ticketId)} &mdash; ${escHtml(l.title)}</a>
+      <span class="plan-header-actions">
+        <button class="topic-action-btn" title="Open in Linear" data-linear-key="${escAttr(key)}" data-linear-url="${escAttr(l.url)}" data-action="openLinearIssue">&#x1F310;</button>
+        <button class="topic-action-btn plan-remove-btn" title="Remove Linear Issue" data-linear-key="${escAttr(key)}" data-linear-ticket="${escAttr(l.ticketId)}" data-action="removeLinearIssue">&#x1F5D1;</button>
+      </span>
+    </div>
+    <div class="plan-meta">${escHtml(key)}.md</div>
+  </div>`;
+		})
+		.join("\n");
+
+	const allItems = planItems + noteItems + linearItems;
 	const countBadge =
 		totalCount > 1 ? ` <span class="section-count">${totalCount}</span>` : "";
 

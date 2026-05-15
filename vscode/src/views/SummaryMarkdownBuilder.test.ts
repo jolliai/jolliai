@@ -346,6 +346,98 @@ describe("SummaryMarkdownBuilder", () => {
 				expect(md).toContain("## Plans & Notes (2)");
 			});
 
+			it("renders linear issues with ticketId-prefixed title and upstream URL", () => {
+				// Captured during QueueWorker's associateLinearIssuesWithCommit,
+				// these end up in summary.linearIssues[]. PR-readers expect to be
+				// able to grep "JOLLI-1528" out of the description, so ticketId
+				// must lead the bullet (not just the title).
+				const summary = makeSummary({
+					linearIssues: [
+						{
+							archivedKey: "JOLLI-1528-786c5330",
+							ticketId: "JOLLI-1528",
+							title:
+								"Treat referenced Linear issues as a first-class panel item",
+							url: "https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+				setupDefaults(summary);
+
+				const md = buildMarkdown(summary);
+
+				expect(md).toContain("## Plans & Notes");
+				expect(md).toContain(
+					"- [JOLLI-1528 — Treat referenced Linear issues as a first-class panel item](https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and)",
+				);
+			});
+
+			it("includes linear-issue count in the section header alongside plans/notes", () => {
+				const summary = makeSummary({
+					plans: [
+						{
+							slug: "p1",
+							title: "P1",
+							editCount: 1,
+							addedAt: "2026-03-30T09:00:00Z",
+							updatedAt: "2026-03-30T09:30:00Z",
+						},
+					],
+					linearIssues: [
+						{
+							archivedKey: "JOLLI-1-aaaa1111",
+							ticketId: "JOLLI-1",
+							title: "Linear A",
+							url: "https://linear.app/x/issue/JOLLI-1/a",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+						{
+							archivedKey: "JOLLI-2-aaaa1111",
+							ticketId: "JOLLI-2",
+							title: "Linear B",
+							url: "https://linear.app/x/issue/JOLLI-2/b",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+				setupDefaults(summary);
+
+				const md = buildMarkdown(summary);
+
+				// 1 plan + 0 notes + 2 linear = 3 total — header carries the count.
+				expect(md).toContain("## Plans & Notes (3)");
+			});
+
+			it("renders section with linear issues alone (no plans, no notes)", () => {
+				// Until this change the section would be omitted entirely when
+				// plans/notes were both empty; now linear issues alone are
+				// enough to surface the section.
+				const summary = makeSummary({
+					linearIssues: [
+						{
+							archivedKey: "JOLLI-1-aaaa1111",
+							ticketId: "JOLLI-1",
+							title: "Solo",
+							url: "https://linear.app/x/issue/JOLLI-1/solo",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+				setupDefaults(summary);
+
+				const md = buildMarkdown(summary);
+
+				expect(md).toContain("## Plans & Notes");
+				expect(md).toContain(
+					"- [JOLLI-1 — Solo](https://linear.app/x/issue/JOLLI-1/solo)",
+				);
+			});
+
 			it("omits section when no plans or notes exist", () => {
 				const summary = makeSummary();
 				setupDefaults(summary);

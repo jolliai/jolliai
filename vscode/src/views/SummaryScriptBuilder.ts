@@ -980,6 +980,26 @@ ${buildPrMessageScript()}
         vscode.postMessage({ command: 'removeNote', id: noteId, title: noteTitle });
         break;
       }
+      case 'openLinearIssue': {
+        // Hand the upstream URL through so the host doesn't need to re-query
+        // the orphan branch summary — the row already has it as a data attr.
+        var lkOpen = target.getAttribute('data-linear-key') || '';
+        var lUrl = target.getAttribute('data-linear-url') || '';
+        vscode.postMessage({ command: 'openLinearIssue', archivedKey: lkOpen, url: lUrl });
+        break;
+      }
+      case 'openLinearIssueMarkdown': {
+        var lkMd = target.getAttribute('data-linear-key') || '';
+        e.preventDefault();
+        vscode.postMessage({ command: 'openLinearIssueMarkdown', archivedKey: lkMd });
+        break;
+      }
+      case 'removeLinearIssue': {
+        var lkRm = target.getAttribute('data-linear-key') || '';
+        var lTicket = target.getAttribute('data-linear-ticket') || '';
+        vscode.postMessage({ command: 'removeLinearIssue', archivedKey: lkRm, ticketId: lTicket });
+        break;
+      }
     }
   });
 

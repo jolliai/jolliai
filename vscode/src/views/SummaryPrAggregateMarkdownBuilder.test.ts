@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
 	CommitSummary,
 	E2eTestScenario,
+	LinearIssueCommitRef,
 	NoteReference,
 	PlanReference,
 	TopicSummary,
@@ -59,6 +60,7 @@ interface SummaryOpts {
 	jolliDocUrl?: string;
 	plans?: ReadonlyArray<PlanReference>;
 	notes?: ReadonlyArray<NoteReference>;
+	linearIssues?: ReadonlyArray<LinearIssueCommitRef>;
 	e2eTestGuide?: ReadonlyArray<E2eTestScenario>;
 	topics?: ReadonlyArray<TopicSummary>;
 }
@@ -77,6 +79,7 @@ function makeSummary(opts: SummaryOpts): CommitSummary {
 		jolliDocUrl: opts.jolliDocUrl,
 		plans: opts.plans,
 		notes: opts.notes,
+		linearIssues: opts.linearIssues,
 		e2eTestGuide: opts.e2eTestGuide,
 		topics: opts.topics,
 	} as unknown as CommitSummary;
@@ -244,6 +247,67 @@ describe("buildAggregatedPrMarkdown", () => {
 		const md = buildAggregatedPrMarkdown(summaries, 0);
 		expect(md.match(/Note 1/g)?.length).toBe(1);
 		expect(md.match(/Note 2/g)?.length).toBe(1);
+	});
+
+	it("dedupes linear issues across commits by ticketId — same ticket on multiple commits collapses to one row", () => {
+		// The archivedKey suffix is the per-commit shortHash, so the same
+		// ticket referenced from two commits would yield two distinct
+		// archivedKeys ("JOLLI-1-aaaa1111", "JOLLI-1-bbbb2222") — both pointing
+		// at the same logical Linear issue. Without ticketId-based dedup,
+		// the PR description would render two bullets for one ticket.
+		const issueAt1: LinearIssueCommitRef = {
+			archivedKey: "JOLLI-1-aaaa1111",
+			ticketId: "JOLLI-1",
+			title: "Linear issue title",
+			url: "https://linear.app/x/issue/JOLLI-1/test",
+			referencedAt: "2026-05-06T00:00:00Z",
+			sourceToolName: "mcp__linear__get_issue",
+		};
+		const issueAt2: LinearIssueCommitRef = {
+			...issueAt1,
+			archivedKey: "JOLLI-1-bbbb2222",
+		};
+		const issueOther: LinearIssueCommitRef = {
+			archivedKey: "JOLLI-2-aaaa1111",
+			ticketId: "JOLLI-2",
+			title: "Linear issue B",
+			url: "https://linear.app/x/issue/JOLLI-2/test",
+			referencedAt: "2026-05-06T00:00:00Z",
+			sourceToolName: "mcp__linear__get_issue",
+		};
+		const summaries = [
+			makeSummary({ hash: "AAAA1234", linearIssues: [issueAt1, issueOther] }),
+			makeSummary({ hash: "BBBB5678", linearIssues: [issueAt2] }),
+		];
+
+		const md = buildAggregatedPrMarkdown(summaries, 0);
+
+		expect(md.match(/Linear issue title/g)?.length).toBe(1);
+		expect(md.match(/Linear issue B/g)?.length).toBe(1);
+		expect(md).toContain("## Plans & Notes (2)");
+	});
+
+	it("renders linear issues even when plans and notes are both empty", () => {
+		// Pre-fix the merge function bailed out when plans+notes were both
+		// empty, dropping linear issues entirely. The fixed bail-out also
+		// considers mergedLinear.length.
+		const issue: LinearIssueCommitRef = {
+			archivedKey: "JOLLI-9-cccc3333",
+			ticketId: "JOLLI-9",
+			title: "Solo Linear",
+			url: "https://linear.app/x/issue/JOLLI-9/test",
+			referencedAt: "2026-05-06T00:00:00Z",
+			sourceToolName: "mcp__linear__get_issue",
+		};
+		const summaries = [
+			makeSummary({ hash: "AAAA1234", linearIssues: [issue] }),
+			makeSummary({ hash: "BBBB5678", linearIssues: [issue] }), // dedup target
+		];
+
+		const md = buildAggregatedPrMarkdown(summaries, 0);
+
+		expect(md).toContain("## Plans & Notes");
+		expect(md.match(/Solo Linear/g)?.length).toBe(1);
 	});
 
 	it("emits Quick recap blocks only for commits with non-empty recap, header carries the (N) count", () => {
