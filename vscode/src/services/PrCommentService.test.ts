@@ -265,6 +265,43 @@ describe("PrCommentService", () => {
 			expect(js).toContain("createPrBtn");
 			expect(js).toContain("prFormSubmit");
 		});
+
+		it("renders Edit PR only under the 'ready' branch, never under 'noPr' (merged-only branches must not show Edit PR)", () => {
+			// PR description's core promise: a branch with only merged/closed
+			// PRs flows into kind:noPr and the panel surfaces a Create PR
+			// button, never Edit PR. The two branches are emitted as adjacent
+			// `if` blocks in the same JS string, so a future refactor that
+			// accidentally hoists editPrBtn into the noPr branch would silently
+			// regress this guarantee. Slice the noPr block out and assert the
+			// Edit PR identifier appears ONLY after that slice ends.
+			const js = buildPrMessageScript();
+			const noPrIdx = js.indexOf("s === 'noPr'");
+			const readyIdx = js.indexOf("s === 'ready'");
+			expect(noPrIdx).toBeGreaterThan(-1);
+			expect(readyIdx).toBeGreaterThan(noPrIdx);
+			const noPrBlock = js.slice(noPrIdx, readyIdx);
+			expect(noPrBlock).not.toContain("editPrBtn");
+			expect(noPrBlock).not.toContain("'Edit PR'");
+			// And the Create PR button MUST be the one wired up in the noPr branch.
+			expect(noPrBlock).toContain("createPrBtn");
+			expect(noPrBlock).toContain("'Create PR'");
+		});
+	});
+
+	// ─── PR history webview rendering: defense-in-depth assertions ──────────
+
+	describe("renderPrHistory (webview JS string)", () => {
+		it("guards history-link href with an https:// prefix check before assignment", () => {
+			// The webview never trusts upstream gh output unconditionally: an
+			// entry whose `url` is not an https:// string must be silently
+			// dropped so a malformed/compromised gh response cannot smuggle a
+			// `javascript:` or `data:` link into the panel. This pins the
+			// guard's literal substring so a refactor that loosens it (e.g.
+			// dropping the check, replacing with regex-less prefix match)
+			// fails the test instead of regressing the safety net.
+			const js = buildPrSectionScript();
+			expect(js).toContain("h.url.indexOf('https://')");
+		});
 	});
 
 	// ─── handleCheckPrStatus ────────────────────────────────────────────────
@@ -1261,10 +1298,14 @@ describe("PrCommentService", () => {
 				);
 			});
 
-			it("picks the highest-numbered open PR when gh returns more than one (anomaly)", async () => {
-				// GitHub allows at most one open PR per head branch, but if gh
-				// returns more we deterministically pick the latest and surface
-				// the older one(s) as history so nothing silently disappears.
+			it("picks the highest-numbered open PR when gh returns more than one (anomaly) and warns about the dropped IDs", async () => {
+				// GitHub enforces ≤1 open PR per head branch; if gh ever returns
+				// more (replication lag, stale cache, future API change), the
+				// lookup picks the latest by number. The other OPEN entries are
+				// NOT downgraded into the history strip — that would encode the
+				// anomaly into PrHistoryEntry's public shape. Instead they are
+				// logged via log.warn so the dropped IDs are recoverable from
+				// debug.log without bloating the type surface.
 				happyProbes([
 					{
 						number: 10,
@@ -1290,6 +1331,16 @@ describe("PrCommentService", () => {
 						pr: expect.objectContaining({ number: 20 }),
 					}),
 				);
+				// Dropped OPEN ids must surface in debug.log so the operator
+				// can correlate against gh / GitHub UI when this fires.
+				const warnCalls = warn.mock.calls.map((c) => c.join(" "));
+				const matched = warnCalls.find(
+					(line) =>
+						line.includes("Multiple open PRs") &&
+						line.includes("#20") &&
+						line.includes("#10"),
+				);
+				expect(matched).toBeDefined();
 			});
 
 			it("drops malformed entries with number 0 or missing state from history", async () => {

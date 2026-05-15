@@ -352,11 +352,27 @@ async function findPrForBranch(
 	const valid = parsed.filter(
 		(p) => p.number > 0 && typeof p.state === "string",
 	);
-	// Open: GitHub allows at most one open PR per head branch; if more than
-	// one appears (gh/GitHub anomaly) pick the highest-numbered (most recent).
+	// Open: GitHub enforces at most one open PR per head branch, so this
+	// filter normally yields 0 or 1 entries. The sort + slice[0] selection
+	// below is defensive: a transient gh/GitHub anomaly (replication lag,
+	// stale cache) could surface multiple OPEN rows briefly. We pick the
+	// highest-numbered (most recent) and log a warning so the dropped IDs
+	// are recoverable from debug.log; we deliberately do NOT widen the
+	// PrHistoryEntry type to carry OPEN — keeping that path unreachable in
+	// practice avoids encoding the anomaly into the public type surface.
 	const openPrs = valid
 		.filter((p) => p.state === "OPEN")
 		.sort((a, b) => b.number - a.number);
+	if (openPrs.length > 1) {
+		const dropped = openPrs
+			.slice(1)
+			.map((p) => `#${p.number}`)
+			.join(", ");
+		log.warn(
+			TAG,
+			`Multiple open PRs for branch ${branch} (GitHub usually allows one): kept #${openPrs[0].number} as active, ignored ${dropped}.`,
+		);
+	}
 	const closedPrs = valid
 		.filter((p) => p.state === "MERGED" || p.state === "CLOSED")
 		.sort((a, b) => b.number - a.number);
@@ -906,9 +922,18 @@ export function buildPrSectionScript(): string {
     label.className = 'pr-history-label';
     label.textContent = 'Previously:';
     prHistory.appendChild(label);
+    var renderedCount = 0;
     for (var i = 0; i < prLastHistory.length; i++) {
       var h = prLastHistory[i];
-      if (i > 0) {
+      // Defense in depth: the url comes from \`gh pr list --json url\` and is
+      // expected to be a github.com PR URL, but the webview never trusts
+      // upstream output unconditionally — anything that isn't https:// is
+      // skipped so a malformed/compromised gh response can't smuggle a
+      // javascript:/data: link into the panel. Separator emission is gated
+      // on renderedCount (not the loop index) so a dropped entry never
+      // leaves a stranded '·' bullet.
+      if (typeof h.url !== 'string' || h.url.indexOf('https://') !== 0) continue;
+      if (renderedCount > 0) {
         var sep = document.createElement('span');
         sep.className = 'pr-history-sep';
         sep.textContent = '·';
@@ -920,6 +945,7 @@ export function buildPrSectionScript(): string {
       link.className = h.state === 'MERGED' ? 'pr-history-merged' : 'pr-history-closed';
       link.textContent = '#' + h.number + ' (' + (h.state === 'MERGED' ? 'merged' : 'closed') + ')';
       prHistory.appendChild(link);
+      renderedCount++;
     }
     prShow(prHistory);
   }
