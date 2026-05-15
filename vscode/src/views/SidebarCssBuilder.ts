@@ -704,6 +704,19 @@ export function buildSidebarCss(): string {
     color: var(--vscode-descriptionForeground);
     font-size: 11px;
   }
+  /* Description preview (Linear issue body / future plan-note preview).
+     pre-wrap keeps paragraph breaks visible — without it the default
+     'normal' whitespace handling collapses '\n\n' into a single space
+     and the preview reads as one run-on line. word-break ensures very
+     long unbroken tokens (URLs, slugs) wrap inside the card. */
+  .hover-card .hc-description {
+    color: var(--vscode-descriptionForeground);
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 8em;
+    overflow: hidden;
+  }
   .hover-card .hc-actions { display: flex; gap: 12px; align-items: center; }
   .hover-card .hc-link {
     color: var(--vscode-textLink-foreground);

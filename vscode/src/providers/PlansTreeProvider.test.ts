@@ -286,27 +286,83 @@ describe("LinearIssueItem", () => {
 
 		expect(item.description).not.toContain("In Progress");
 		expect(item.description).not.toContain("·");
-		const tooltip = item.tooltip as { value: string; isTrusted: boolean };
-		expect(tooltip.isTrusted).toBe(true);
-		// Tooltip is the deliberate-hover surface — captured state still
-		// surfaces there for users who want to inspect it.
-		expect(tooltip.value).toContain("Status: In Progress");
-		expect(tooltip.value).toContain("Priority: High");
-		expect(tooltip.value).toContain("Labels: bug, frontend");
-		expect(tooltip.value).toContain("https://linear.app/test/issue/JOLLI-1528");
-		expect(tooltip.value).toContain("A short description");
+		// Plain-text tooltip (not MarkdownString) — the panel webview renders
+		// TreeItem tooltips via textContent, which would surface markdown
+		// source verbatim if we used a MarkdownString here. See the
+		// buildLinearIssueTooltip docstring for the full reasoning.
+		const tooltip = item.tooltip as string;
+		expect(typeof tooltip).toBe("string");
+		expect(tooltip).toContain("Status: In Progress");
+		expect(tooltip).toContain("Priority: High");
+		expect(tooltip).toContain("Labels: bug, frontend");
+		expect(tooltip).toContain("https://linear.app/test/issue/JOLLI-1528");
+		expect(tooltip).toContain("A short description");
+		// No backslash escapes and no markdown markers — the previous
+		// MarkdownString version emitted `**JOLLI\-1528**` etc. that the
+		// webview rendered as literal text.
+		expect(tooltip).not.toContain("\\-");
+		expect(tooltip).not.toContain("\\#");
+		expect(tooltip).not.toContain("**");
+		expect(tooltip).not.toContain("$(link-external)");
 	});
 
-	it("truncates descriptions longer than 200 chars with an ellipsis", () => {
-		// Pins the description-length branch — `slice(0, 200) + (length > 200 ? '…' : '')`.
+	it("truncates descriptions longer than 200 chars with an ellipsis in the plain-text tooltip", () => {
+		// Pins the description-length branch in `buildLinearIssueTooltip`
+		// (the activity-bar TreeView fallback). The webview hover-card no
+		// longer surfaces the description preview at all — see the
+		// LinearIssueItem comment for why; users open the upstream Linear
+		// link if they want the full body.
 		const longDescription = "X".repeat(250);
 		const item = new LinearIssueItem(
 			makeLinearIssue({ description: longDescription }),
 		);
 
-		const tooltip = item.tooltip as { value: string };
-		expect(tooltip.value).toContain("…");
-		expect(tooltip.value).not.toContain("X".repeat(201));
+		const tooltip = item.tooltip as string;
+		expect(tooltip).toContain("…");
+		expect(tooltip).not.toContain("X".repeat(201));
+	});
+
+	it("exposes structured linearHover data for the webview hover-card renderer", () => {
+		// The activity-bar TreeView ignores `linearHover` (it reads tooltip),
+		// but the webview's SidebarSerialize picks this field off the item and
+		// forwards it on the wire so renderLinearHoverCard can produce the
+		// codicon-rich popover. No descriptionPreview — the field was dropped
+		// to keep the hover card concise.
+		const item = new LinearIssueItem(
+			makeLinearIssue({
+				status: "In Progress",
+				priority: "High",
+				labels: ["bug", "frontend"],
+				description: "A short description of the issue.",
+			}),
+		);
+
+		const hover = (item as unknown as { linearHover: Record<string, unknown> })
+			.linearHover;
+		expect(hover.title).toBe("JOLLI-1528 — Sample Issue");
+		expect(hover.status).toBe("In Progress");
+		expect(hover.priority).toBe("High");
+		expect(hover.labels).toBe("bug, frontend");
+		expect(hover.url).toBe("https://linear.app/test/issue/JOLLI-1528");
+		// descriptionPreview was removed from LinearIssueHover — even when
+		// the source issue has a description, the field must NOT appear
+		// on the wire payload.
+		expect("descriptionPreview" in hover).toBe(false);
+	});
+
+	it("omits optional fields in linearHover when the source LinearIssueInfo lacks them", () => {
+		// Pins the conditional spread shape: missing status / priority / labels
+		// must NOT appear as undefined keys on the wire (the JSON would still
+		// serialize them, but consumers would have to null-check).
+		const item = new LinearIssueItem(makeLinearIssue({ status: undefined }));
+
+		const hover = (item as unknown as { linearHover: Record<string, unknown> })
+			.linearHover;
+		expect("status" in hover).toBe(false);
+		expect("priority" in hover).toBe(false);
+		expect("labels" in hover).toBe(false);
+		expect(hover.title).toBeDefined();
+		expect(hover.url).toBeDefined();
 	});
 });
 

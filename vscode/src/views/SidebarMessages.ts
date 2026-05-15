@@ -119,6 +119,28 @@ export interface SerializedTreeItem {
 	 */
 	readonly hover?: MemoryHover;
 	/**
+	 * Plans & Notes panel only (Plan rows): structured hover-card data, same
+	 * popover infrastructure as `hover`/MemoryHover. Set by SidebarSerialize
+	 * when the source TreeItem is a PlanItem. Drives the rich tooltip in the
+	 * webview panel (codicons + clickable actions) instead of native title=
+	 * which would just show MarkdownString source as plain text.
+	 */
+	readonly planHover?: PlanHover;
+	/**
+	 * Plans & Notes panel only (Note rows): structured hover-card data.
+	 * Parallels `planHover` — set by SidebarSerialize for NoteItem instances.
+	 */
+	readonly noteHover?: NoteHover;
+	/**
+	 * Plans & Notes panel only (Linear issue rows): structured hover-card data
+	 * driven through the same popover infrastructure as `hover`/MemoryHover.
+	 * Lets Linear rows display a rich tooltip (codicons, status / priority /
+	 * labels / link) instead of the markdown-source plain text that would show
+	 * if we routed `tooltip` through the webview's textContent fallback. Set
+	 * by SidebarSerialize when the source TreeItem is a LinearIssueItem.
+	 */
+	readonly linearHover?: LinearIssueHover;
+	/**
 	 * Commits panel only: the four fields needed to dispatch
 	 * jollimemory.openCommitFileChange from the webview. Set by
 	 * HistoryTreeProvider when serializing CommitFileItem children. We can't
@@ -235,6 +257,83 @@ export interface MemoryHover {
 	readonly statsLine?: string;
 	/** First 8 chars of commitHash — displayed as monospace. */
 	readonly shortHash: string;
+}
+
+/**
+ * Structured hover-card data for Plan rows in the Plans & Notes section.
+ * Same popover infrastructure as MemoryHover and LinearIssueHover — only the
+ * renderer (renderPlanHoverCard) and click-action set differ. The shape
+ * mirrors what the legacy MarkdownString tooltip carried (filename heading,
+ * clock+date row, edit-count row, optional commit-hash + preview/edit links)
+ * so users see the same information they did before, but rendered as
+ * codicons + structured rows instead of raw markdown source.
+ */
+export interface PlanHover {
+	/** Plan title — rendered bold at the top of the card. */
+	readonly title: string;
+	/** Filename (e.g. "my-plan.md") — paired with a markdown icon. */
+	readonly filename: string;
+	/** "just now" / "2h ago" / "Apr 28" — paired with a clock icon. */
+	readonly relativeDate: string;
+	/**
+	 * Full commit hash when this plan is associated with a commit. The card
+	 * uses the first 8 chars as the visible link label; the full hash is
+	 * passed to jollimemory.copyCommitHash via data-hash.
+	 */
+	readonly commitHash?: string;
+	/**
+	 * Plan slug — used as the action target for jollimemory.openPlanForPreview
+	 * (both committed and uncommitted plans use the same panel command).
+	 */
+	readonly slug: string;
+}
+
+/**
+ * Structured hover-card data for Note rows in the Plans & Notes section.
+ * Parallels PlanHover but with note-specific fields (format label, snippet
+ * content preview).
+ */
+export interface NoteHover {
+	/** Note title — rendered bold at the top of the card. */
+	readonly title: string;
+	/** Filename (e.g. "my-note.md") — paired with the format icon. */
+	readonly filename: string;
+	/** "just now" / "2h ago" / "Apr 28" — paired with a clock icon. */
+	readonly relativeDate: string;
+	/** "Markdown file" or "Text snippet" — paired with note / comment icon. */
+	readonly formatLabel: string;
+	/** Format key — selects the leading codicon (note vs comment). */
+	readonly format: "markdown" | "snippet";
+	/**
+	 * Snippet content preview (first 200 chars). Only set for snippet notes;
+	 * undefined for markdown notes (the filename is enough context for those).
+	 */
+	readonly contentPreview?: string;
+	/** Full commit hash when committed; first 8 chars are the visible label. */
+	readonly commitHash?: string;
+	/** Note id — used as the action target for jollimemory.openNoteForPreview. */
+	readonly noteId: string;
+}
+
+/**
+ * Structured hover-card data for Linear issue rows in the Plans & Notes
+ * section. Mirrors `MemoryHover` so the webview can drive Linear hover-cards
+ * through the same `.hover-card` popover infrastructure (positioning, show
+ * delay, hide grace) — only the content renderer differs. Plain-text
+ * `tooltip` on the SerializedTreeItem stays as the activity-bar TreeView
+ * fallback; this richer field is webview-only.
+ */
+export interface LinearIssueHover {
+	/** "JOLLI-1528 — Treat referenced Linear issues..." — bold at the top. */
+	readonly title: string;
+	/** Linear status (e.g. "In Progress") — paired with a circle-large-filled icon. */
+	readonly status?: string;
+	/** Linear priority (e.g. "Urgent" / "No priority") — paired with a flame icon. */
+	readonly priority?: string;
+	/** Joined labels, e.g. "JolliMemory, Feature" — paired with a tag icon. */
+	readonly labels?: string;
+	/** Upstream Linear URL — used by the Open-in-Linear action link. */
+	readonly url: string;
 }
 
 /**

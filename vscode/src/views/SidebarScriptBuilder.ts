@@ -1678,6 +1678,167 @@ export function buildSidebarScript(): string {
     return kids;
   }
 
+  // Renders the .hover-card body for a Plan row. Same shape as the Memories
+  // card (hc-title + hc-row stack + hc-actions) so the shared popover element
+  // and CSS work unchanged. Action set differs by committed/uncommitted state:
+  // committed plans get hash-copy + Preview Plan, uncommitted plans get just
+  // a Preview Plan link (the panel's openPlanForPreview command handles both
+  // states — there is no separate edit command at the panel layer).
+  function renderPlanHoverCard(slug, h) {
+    if (!h) return null;
+    const kids = [el('div', { className: 'hc-title', text: h.title })];
+    kids.push(el('div', { className: 'hc-row' }, [
+      el('i', { className: 'codicon codicon-clock' }),
+      el('span', { text: h.relativeDate }),
+    ]));
+    kids.push(el('div', { className: 'hc-row' }, [
+      el('i', { className: 'codicon codicon-markdown' }),
+      el('span', { text: h.filename }),
+    ]));
+    // No "edited N times" row — the count from PlanInfo.editCount is
+    // populated by transcript scanning, which misses plan touches that
+    // happen outside Claude's tool calls, so the number was misleading
+    // (often showing "0 times" for actively-edited plans).
+    kids.push(el('hr'));
+    const actions = [];
+    if (h.commitHash) {
+      // Committed: short hash + copy icon, then a separator, then Preview.
+      actions.push(el('span', {
+        className: 'hc-link',
+        'data-cmd': 'jollimemory.copyCommitHash',
+        'data-hash': h.commitHash,
+        title: 'Copy commit hash',
+      }, [
+        el('i', { className: 'codicon codicon-git-commit' }),
+        el('span', { className: 'hc-hash', text: h.commitHash.substring(0, 8) }),
+        el('i', { className: 'codicon codicon-copy' }),
+      ]));
+      actions.push(el('span', { className: 'hc-sep', text: '|' }));
+    }
+    actions.push(el('span', {
+      className: 'hc-link',
+      'data-cmd': 'jollimemory.openPlanForPreview',
+      'data-hash': slug,
+      title: 'Open plan',
+    }, [
+      el('i', { className: 'codicon codicon-eye' }),
+      el('span', { text: 'Open Plan' }),
+    ]));
+    kids.push(el('div', { className: 'hc-actions' }, actions));
+    return kids;
+  }
+
+  // Renders the .hover-card body for a Note row. Layout mirrors the Plan card
+  // but with note-specific fields: the leading icon switches between "note"
+  // and "comment" based on format, and the format label replaces the
+  // edit-count row (notes don't track edit counts).
+  function renderNoteHoverCard(noteId, h) {
+    if (!h) return null;
+    const kids = [el('div', { className: 'hc-title', text: h.title })];
+    kids.push(el('div', { className: 'hc-row' }, [
+      el('i', { className: 'codicon codicon-clock' }),
+      el('span', { text: h.relativeDate }),
+    ]));
+    const fileIcon = h.format === 'snippet' ? 'codicon-comment' : 'codicon-note';
+    kids.push(el('div', { className: 'hc-row' }, [
+      el('i', { className: 'codicon ' + fileIcon }),
+      el('span', { text: h.filename }),
+    ]));
+    kids.push(el('div', { className: 'hc-row' }, [
+      el('i', { className: 'codicon codicon-tag' }),
+      el('span', { text: h.formatLabel }),
+    ]));
+    if (h.contentPreview) {
+      kids.push(el('hr'));
+      // Same hc-description class as Linear's description preview — snippet
+      // bodies can contain newlines that hc-stats's default whitespace
+      // handling would silently collapse.
+      kids.push(el('div', { className: 'hc-description', text: h.contentPreview }));
+    }
+    kids.push(el('hr'));
+    const actions = [];
+    if (h.commitHash) {
+      actions.push(el('span', {
+        className: 'hc-link',
+        'data-cmd': 'jollimemory.copyCommitHash',
+        'data-hash': h.commitHash,
+        title: 'Copy commit hash',
+      }, [
+        el('i', { className: 'codicon codicon-git-commit' }),
+        el('span', { className: 'hc-hash', text: h.commitHash.substring(0, 8) }),
+        el('i', { className: 'codicon codicon-copy' }),
+      ]));
+      actions.push(el('span', { className: 'hc-sep', text: '|' }));
+    }
+    actions.push(el('span', {
+      className: 'hc-link',
+      'data-cmd': 'jollimemory.openNoteForPreview',
+      'data-hash': noteId,
+      title: 'Open note',
+    }, [
+      el('i', { className: 'codicon codicon-eye' }),
+      el('span', { text: 'Open Note' }),
+    ]));
+    kids.push(el('div', { className: 'hc-actions' }, actions));
+    return kids;
+  }
+
+  // Renders the .hover-card body for a Linear issue row. Mirrors
+  // renderHoverCard's shape (hc-title + hc-row stack + hc-actions) so the
+  // shared popover element (#memory-hover) and its CSS work unchanged. The
+  // Linear card swaps the commit-specific fields (date / commitType / branch
+  // / statsLine / hash) for ticket-specific fields (status / priority /
+  // labels / description preview / Open-in-Linear link).
+  function renderLinearHoverCard(mapKey, h) {
+    if (!h) return null;
+    const kids = [el('div', { className: 'hc-title', text: h.title })];
+    if (h.status) {
+      kids.push(el('div', { className: 'hc-row' }, [
+        el('i', { className: 'codicon codicon-circle-large-filled' }),
+        el('span', { text: h.status }),
+      ]));
+    }
+    if (h.priority) {
+      kids.push(el('div', { className: 'hc-row' }, [
+        el('i', { className: 'codicon codicon-flame' }),
+        el('span', { text: h.priority }),
+      ]));
+    }
+    if (h.labels) {
+      kids.push(el('div', { className: 'hc-row' }, [
+        el('i', { className: 'codicon codicon-tag' }),
+        el('span', { text: h.labels }),
+      ]));
+    }
+    // Description preview removed — see LinearIssueItem comment for why.
+    // The Open-in-Linear action below is the way to see the full body.
+    kids.push(el('hr'));
+    // Single action row: Open in Linear. The trash / open-markdown actions
+    // already live as inline buttons on the row itself (see renderPlanRow),
+    // so the card stays focused on jumping to the upstream ticket. Reuse
+    // the data-cmd / data-hash dispatch the memory card already uses
+    // (the hoverCardEl click handler routes [data-cmd][data-hash] to
+    // vscode.postMessage{ command, args: [hash] }); the registered
+    // jollimemory.openLinearIssue command accepts a mapKey string.
+    const openLink = el('span', {
+      className: 'hc-link',
+      'data-cmd': 'jollimemory.openLinearIssue',
+      'data-hash': mapKey,
+      title: 'Open in Linear',
+    }, [
+      el('i', { className: 'codicon codicon-link-external' }),
+      el('span', { text: 'Open in Linear' }),
+    ]);
+    kids.push(el('div', { className: 'hc-actions' }, [openLink]));
+    return kids;
+  }
+
+  // Linear-specific show / schedule functions were removed: the branch-tab
+  // mouseover handler now goes through scheduleShowBranchHoverCard (defined
+  // alongside lookupBranchHoverById below), which is type-agnostic and
+  // accepts the pre-rendered card DOM. Keeping the old Linear-only path
+  // would have duplicated the timer dance per row type.
+
   // Anchor the popover's top-left corner exactly at the cursor — the
   // row→popover transition is then a zero-distance hop, so mouseout's
   // relatedTarget is the popover and the existing guard keeps it open.
@@ -1828,6 +1989,82 @@ export function buildSidebarScript(): string {
     cancelHoverShow();
     scheduleHideHoverCard();
   });
+  // Plans & Notes panel (branch tab): wire plan / note / linearissue rows
+  // into the same hover-card popover that the Memories section uses. Each
+  // row type carries its own structured hover field (planHover / noteHover /
+  // linearHover) on the serialized item — the lookup returns the matching
+  // entry along with its context so the mouseover handler can pick the right
+  // renderer. Plain-text tooltip on the SerializedTreeItem remains the
+  // activity-bar TreeView fallback.
+  function lookupBranchHoverById(rowId) {
+    const items = (branchData && branchData.plans) || [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].id !== rowId) continue;
+      if (items[i].planHover) return { kind: 'plan', hover: items[i].planHover };
+      if (items[i].noteHover) return { kind: 'note', hover: items[i].noteHover };
+      if (items[i].linearHover) return { kind: 'linearissue', hover: items[i].linearHover };
+      return null;
+    }
+    return null;
+  }
+  // Pre-rendered hover-card content scheduler. Mirrors the timer dance of
+  // scheduleShowHoverCard (memory rows) — same key-equality re-hover guard,
+  // same hide-timer-cancel — but accepts an already-built DOM fragment so
+  // the dispatch site doesn't have to know which renderer to call. The
+  // alternative (one schedule-show per kind) would duplicate this timer
+  // logic three times.
+  function scheduleShowBranchHoverCard(rowId, content, mouseX, mouseY) {
+    if (hoverCurrentHash === rowId && !hoverCardEl.classList.contains('hidden')) {
+      if (hoverHideTimer) { clearTimeout(hoverHideTimer); hoverHideTimer = null; }
+      return;
+    }
+    cancelHoverShow();
+    hoverShowTimer = setTimeout(function() {
+      hoverShowTimer = null;
+      if (hoverHideTimer) { clearTimeout(hoverHideTimer); hoverHideTimer = null; }
+      mountIn(hoverCardEl, content);
+      hoverCardEl.classList.remove('hidden');
+      hoverCurrentHash = rowId;
+      positionHoverCard(mouseX, mouseY);
+    }, HOVER_SHOW_DELAY_MS);
+  }
+  tabContents.branch.addEventListener('mouseover', function(e) {
+    const row = e.target.closest('.tree-node[data-id]');
+    if (!row) return;
+    const ctx = row.getAttribute('data-context');
+    // Only plan / note / linearissue rows opt into the hover card — commit
+    // rows have their own dedicated hover (see renderCommitRow + lookupHoverEntry),
+    // and change rows are too dense for one.
+    if (ctx !== 'plan' && ctx !== 'note' && ctx !== 'linearissue') return;
+    // Inline action buttons own their own visual feedback; dismiss the row
+    // hover card to avoid stacking a popover on top of a button tooltip.
+    if (e.target.closest('.inline-actions')) {
+      dismissHoverCard();
+      return;
+    }
+    const rowId = row.getAttribute('data-id');
+    const found = lookupBranchHoverById(rowId);
+    if (!found) return;
+    let content;
+    if (found.kind === 'plan') content = renderPlanHoverCard(rowId, found.hover);
+    else if (found.kind === 'note') content = renderNoteHoverCard(rowId, found.hover);
+    else content = renderLinearHoverCard(rowId, found.hover);
+    if (!content) return;
+    scheduleShowBranchHoverCard(rowId, content, e.clientX, e.clientY);
+  });
+  tabContents.branch.addEventListener('mouseout', function(e) {
+    const row = e.target.closest('.tree-node[data-id]');
+    if (!row) return;
+    const ctx = row.getAttribute('data-context');
+    if (ctx !== 'plan' && ctx !== 'note' && ctx !== 'linearissue') return;
+    const to = e.relatedTarget;
+    // Stay open if mouse moved onto the card itself or stayed on the row
+    // (transitioning between child spans — label / desc / icon).
+    if (to && (to === hoverCardEl || hoverCardEl.contains(to) || row.contains(to))) return;
+    cancelHoverShow();
+    scheduleHideHoverCard();
+  });
+
   hoverCardEl.addEventListener('mouseenter', function() {
     if (hoverHideTimer) { clearTimeout(hoverHideTimer); hoverHideTimer = null; }
   });
@@ -2152,6 +2389,14 @@ export function buildSidebarScript(): string {
 
   function renderPlanRow(item, depth) {
     const isNote = item.contextValue === 'note';
+    // isLinearIssue is read below for the title= suppression. It was
+    // accidentally removed when the icon-color refactor went through, but
+    // the title= reference stayed — every renderPlanRow call threw
+    // ReferenceError and the Plans & Notes section rendered as empty even
+    // when plans.json had entries. Regression-tested by the "renderPlanRow
+    // suppresses native title= on linearissue rows" test in
+    // SidebarScriptBuilder.test.ts.
+    const isLinearIssue = item.contextValue === 'linearissue';
     // Icon comes from the SerializedTreeItem.iconKey set by
     // PlansTreeProvider — committed entries get "lock" with charts.green,
     // uncommitted plans get "file-text", notes get "note", snippets get
@@ -2192,12 +2437,17 @@ export function buildSidebarScript(): string {
         }, [el('i', { className: 'codicon codicon-trash' })]),
       ]),
     );
+    // Suppress the native title= on every row type that drives the .hover-card
+    // popover (plan / note / linearissue — see the tabContents.branch mouseover
+    // handler). A title= would surface a duplicate native tooltip showing the
+    // MarkdownString-source plain text, and worse it would trigger on a
+    // different timer than the card so the two tooltips would compete.
     return el('div', {
       className: 'tree-node',
       'data-indent': String(depth),
       'data-context': item.contextValue || '',
       'data-id': item.id,
-      title: item.tooltip || '',
+      title: null,
     }, kids);
   }
 
@@ -2641,7 +2891,15 @@ export function buildSidebarScript(): string {
         vscode.postMessage({ type: 'command', command: cmd, args: [id] });
       }
       if (action === 'remove') {
-        const cmd = ctx === 'note' ? 'jollimemory.removeNote' : 'jollimemory.removePlan';
+        // Plan / Note / Linear-issue rows all share the trash button rendered
+        // by renderPlanRow, so the click handler has to route by contextValue.
+        // Before this branch existed, Linear rows dispatched jollimemory.removePlan
+        // — which doesn't know about Linear mapKeys, so the trash button
+        // silently no-op'd on Linear issues while working fine on plans/notes.
+        const cmd =
+          ctx === 'note'         ? 'jollimemory.removeNote' :
+          ctx === 'linearissue'  ? 'jollimemory.ignoreLinearIssue' :
+                                   'jollimemory.removePlan';
         vscode.postMessage({ type: 'command', command: cmd, args: [id] });
       }
       if (action === 'discard') {
