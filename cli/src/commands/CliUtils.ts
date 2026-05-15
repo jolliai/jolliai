@@ -142,6 +142,15 @@ export function isInteractive(): boolean {
 }
 
 /**
+ * Hard cap on `--arg-stdin` payload size. The flag only ever carries a branch
+ * name or short keyword query (skill templates pipe a single line via here-doc).
+ * 64 KiB is many orders of magnitude above any legitimate input but small
+ * enough that a compromised or buggy upstream cannot OOM the CLI by streaming
+ * gigabytes into stdin.
+ */
+export const STDIN_MAX_BYTES = 64 * 1024;
+
+/**
  * Reads the entire contents of `process.stdin` to a string, trims one trailing
  * newline (LF or CRLF) if present, and returns the result.
  *
@@ -151,7 +160,11 @@ export function isInteractive(): boolean {
  * `$()` / backtick expansion — that's the whole reason this exists.
  *
  * Behavior:
+ *   - Rejects immediately when stdin is an interactive TTY. The flag is only
+ *     meaningful with piped input; calling it interactively would otherwise
+ *     hang forever waiting for EOF with no prompt to the user.
  *   - Reads all chunks from stdin until EOF; binary safe (concatenates as UTF-8).
+ *   - Rejects when the cumulative byte count exceeds {@link STDIN_MAX_BYTES}.
  *   - Trims a single trailing `\n` or `\r\n` (a here-doc always appends one).
  *     Inner newlines are preserved verbatim — the caller decides whether to
  *     accept a multi-line argument.
@@ -160,12 +173,31 @@ export function isInteractive(): boolean {
  */
 export function readStdin(): Promise<string> {
 	return new Promise((resolve, reject) => {
-		const chunks: Buffer[] = [];
 		const stdin = process.stdin;
+		if (stdin.isTTY) {
+			reject(
+				new Error(
+					"--arg-stdin requires piped stdin; it cannot be used interactively. Pipe the argument via a here-doc or echo.",
+				),
+			);
+			return;
+		}
+		const chunks: Buffer[] = [];
+		let total = 0;
+		let rejected = false;
 		stdin.on("data", (chunk: Buffer | string) => {
-			chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+			if (rejected) return;
+			const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+			total += buf.length;
+			if (total > STDIN_MAX_BYTES) {
+				rejected = true;
+				reject(new Error(`--arg-stdin payload exceeds ${STDIN_MAX_BYTES} bytes`));
+				return;
+			}
+			chunks.push(buf);
 		});
 		stdin.on("end", () => {
+			if (rejected) return;
 			let text = Buffer.concat(chunks).toString("utf-8");
 			if (text.endsWith("\r\n")) text = text.slice(0, -2);
 			else if (text.endsWith("\n")) text = text.slice(0, -1);

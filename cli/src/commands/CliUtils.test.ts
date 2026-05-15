@@ -382,6 +382,54 @@ describe("CliUtils", () => {
 			const cjk = "中文-branch-名";
 			expect(await withFakeStdin(cjk)).toBe(cjk);
 		});
+
+		it("rejects immediately when stdin is an interactive TTY (no waiting for EOF)", async () => {
+			// Without this guard, `jolli recall --arg-stdin` in a normal
+			// terminal would hang forever — there's no EOF coming, no prompt
+			// shown to the user. The rejection happens synchronously after
+			// the Promise constructor runs, so a TTY caller exits in
+			// milliseconds with a clear error.
+			const fakeTty = { isTTY: true };
+			Object.defineProperty(process, "stdin", { value: fakeTty, configurable: true });
+			const { readStdin } = await import("./CliUtils.js");
+			await expect(readStdin()).rejects.toThrow(/requires piped stdin/);
+		});
+
+		it("rejects when stdin payload exceeds STDIN_MAX_BYTES (64 KiB cap)", async () => {
+			// Defense in depth: the --arg-stdin path only ever carries a
+			// branch name or short keyword query (skill templates pipe one
+			// line via here-doc). A compromised upstream feeding gigabytes
+			// must not be able to OOM the CLI. 64 KiB is many orders of
+			// magnitude above any legitimate input.
+			const { STDIN_MAX_BYTES } = await import("./CliUtils.js");
+			const tooBig = Buffer.alloc(STDIN_MAX_BYTES + 1, 0x61); // 'a' * (cap + 1)
+			await expect(withFakeStdin(tooBig)).rejects.toThrow(/exceeds .* bytes/);
+		});
+
+		it("accepts a payload at exactly STDIN_MAX_BYTES (boundary)", async () => {
+			// Boundary regression: the cap is "more than", not "at or above".
+			// An input of exactly the limit must succeed so this catches a
+			// future `>=` typo in the size check.
+			const { STDIN_MAX_BYTES } = await import("./CliUtils.js");
+			const atCap = Buffer.alloc(STDIN_MAX_BYTES, 0x62); // 'b' * cap
+			const result = await withFakeStdin(atCap);
+			expect(result.length).toBe(STDIN_MAX_BYTES);
+		});
+
+		it("ignores additional chunks that arrive after the cap-rejection has fired", async () => {
+			// Stream semantics: when a data event triggers the size-cap
+			// rejection, any subsequent data event still arrives (Readable
+			// drains the iterable before emitting 'end'). The `rejected`
+			// guard inside the data handler prevents the late chunk from
+			// pushing past the cap or fighting the already-rejected Promise.
+			const { STDIN_MAX_BYTES, readStdin } = await import("./CliUtils.js");
+			const { Readable } = await import("node:stream");
+			const first = Buffer.alloc(STDIN_MAX_BYTES + 1, 0x63);
+			const second = Buffer.from("trailing-garbage", "utf-8");
+			const stream = Readable.from([first, second]);
+			Object.defineProperty(process, "stdin", { value: stream, configurable: true });
+			await expect(readStdin()).rejects.toThrow(/exceeds .* bytes/);
+		});
 	});
 
 	describe("AmbiguousHashError construction invariants", () => {
