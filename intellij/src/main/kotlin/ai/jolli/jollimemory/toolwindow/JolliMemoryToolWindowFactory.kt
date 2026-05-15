@@ -1,13 +1,10 @@
 package ai.jolli.jollimemory.toolwindow
 
-import ai.jolli.jollimemory.JolliMemoryIcons
-import ai.jolli.jollimemory.actions.CloudSyncAction
-import ai.jolli.jollimemory.actions.TogglePanelAction
 import ai.jolli.jollimemory.core.SessionTracker
-import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
-import com.intellij.openapi.actionSystem.DefaultActionGroup
+import ai.jolli.jollimemory.toolwindow.sidebar.JCEFFallbackPanel
+import ai.jolli.jollimemory.toolwindow.sidebar.JCEFSidebarPanel
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
@@ -16,20 +13,13 @@ import com.intellij.openapi.vcs.ProjectLevelVcsManager
 import com.intellij.openapi.vcs.VcsListener
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
-import git4idea.repo.GitRepository
-import git4idea.repo.GitRepositoryChangeListener
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.content.ContentFactory
+import com.intellij.ui.jcef.JBCefApp
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.awt.CardLayout
-import java.awt.Cursor
-import java.awt.event.MouseAdapter
-import java.awt.event.MouseEvent
-import javax.swing.JLabel
 import javax.swing.JPanel
-import javax.swing.Popup
-import javax.swing.PopupFactory
 import javax.swing.SwingUtilities
 
 /**
@@ -103,13 +93,10 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
     }
 
     /**
-     * Creates the full tool window content with all five collapsible panels.
-     * Initializes the service if needed.
+     * Creates the full tool window content using the unified JCEF webview sidebar.
      *
-     * Subscribes to [ProjectLevelVcsManager.VCS_CONFIGURATION_CHANGED] and
-     * service status changes so that if `.git` is removed while the plugin
-     * is running, the tool window automatically switches back to the
-     * "no Git" placeholder.
+     * Falls back to JCEFFallbackPanel when JCEF is unavailable.
+     * Uses a CardLayout to switch between onboarding and main views.
      */
     private fun createFullContent(project: Project, toolWindow: ToolWindow) {
         val service = project.getService(JolliMemoryService::class.java)
@@ -123,7 +110,6 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         }
 
         // Listen for .git removal — switch back to placeholder when detected.
-        // Two detection paths: VCS config change (rm -rf .git) and service error (git command failure).
         val basePath = project.basePath
         val vcsConnection = project.messageBus.connect()
         var gitCheckActive = true
@@ -149,82 +135,6 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             }
         }
 
-        // Create the five panels
-        val statusPanel = StatusPanel(project, service)
-        val plansPanel = PlansPanel(project, service)
-        val changesPanel = ChangesPanel(project, service)
-        val commitsPanel = CommitsPanel(project, service)
-        val memoriesPanel = MemoriesPanel(project, service)
-
-        // Register panels for action lookup
-        val registry = PanelRegistry().apply {
-            this.statusPanel = statusPanel
-            this.plansPanel = plansPanel
-            this.changesPanel = changesPanel
-            this.commitsPanel = commitsPanel
-            this.memoriesPanel = memoriesPanel
-        }
-        service.panelRegistry = registry
-
-        // Status indicator icon for the MEMORIES header — shows health as green/yellow/red circle.
-        // Hover triggers a popup with the full status details (same content as the STATUS panel).
-        val statusIndicator = StatusIndicatorLabel(service)
-
-        // Build collapsible sections (uppercase titles)
-        val statusCollapsible = CollapsiblePanel("STATUS", "JolliMemory.StatusActions", statusPanel)
-        val plansCollapsible = CollapsiblePanel("PLANS & NOTES", "JolliMemory.PlansActions", plansPanel)
-        val changesCollapsible = CollapsiblePanel("CHANGES", "JolliMemory.ChangesActions", changesPanel)
-        val commitsCollapsible = CollapsiblePanel("COMMITS", "JolliMemory.CommitsActions", commitsPanel)
-        val memoriesCollapsible = CollapsiblePanel(
-            "MEMORIES", "JolliMemory.MemoriesActions", memoriesPanel,
-            headerExtra = statusIndicator,
-        )
-
-        // Auto-hide STATUS panel when enabled, show when disabled
-        fun syncStatusVisibility() {
-            val status = service.getStatus()
-            val enabled = status?.enabled == true
-            statusCollapsible.setPanelVisible(!enabled)
-        }
-        syncStatusVisibility()
-        service.addStatusListener { SwingUtilities.invokeLater { syncStatusVisibility() } }
-
-        // Use an accordion layout so collapsed panels shrink to header-only height
-        // and expanded panels share the remaining vertical space proportionally.
-        // Resize dividers between panels allow users to drag and adjust panel heights.
-        val accordionPanel = JPanel(AccordionLayout()).apply {
-            add(statusCollapsible)
-            add(ResizeDivider())
-            add(memoriesCollapsible)
-            add(ResizeDivider())
-            add(plansCollapsible)
-            add(ResizeDivider())
-            add(changesCollapsible)
-            add(ResizeDivider())
-            add(commitsCollapsible)
-        }
-
-        // Add gear menu toggle actions to the tool window title bar,
-        // allowing users to show/hide individual panels — like VS Code's "..." menu.
-        val gearActions = DefaultActionGroup().apply {
-            add(TogglePanelAction(statusCollapsible))
-            add(TogglePanelAction(memoriesCollapsible))
-            add(TogglePanelAction(plansCollapsible))
-            add(TogglePanelAction(changesCollapsible))
-            add(TogglePanelAction(commitsCollapsible))
-        }
-        toolWindow.setAdditionalGearActions(gearActions)
-
-        // Title bar actions — always visible regardless of which panels are open.
-        toolWindow.setTitleActions(listOf(
-            ai.jolli.jollimemory.actions.StatusSettingsAction(),
-            CloudSyncAction(),
-        ))
-
-        val mainPanel = JPanel(BorderLayout()).apply {
-            add(accordionPanel, BorderLayout.CENTER)
-        }
-
         // ── Onboarding / Main card layout ──────────────────────
         val rootCardLayout = CardLayout()
         val rootPanel = JPanel(rootCardLayout)
@@ -232,7 +142,6 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         fun isConfigured(): Boolean {
             val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
             if (config.paused == true) return true
-            // Check if any LLM credential is actually available (matches LlmClient fallback chain)
             if (!config.apiKey.isNullOrBlank()) return true
             if (!System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return true
             if (!config.jolliApiKey.isNullOrBlank()) return true
@@ -258,13 +167,20 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             },
         )
 
+        // Create the JCEF sidebar or fallback panel
+        val contentDisposable = Disposer.newDisposable("JolliMemorySidebarContent")
+        val mainPanel: JPanel = if (JBCefApp.isSupported()) {
+            JCEFSidebarPanel(project, contentDisposable)
+        } else {
+            JCEFFallbackPanel()
+        }
+
         rootPanel.add(onboardingPanel, CARD_ONBOARDING)
         rootPanel.add(mainPanel, CARD_MAIN)
 
-        // Auth listener on the factory: handles sign-in → main, sign-out → onboarding
+        // Auth listener: handles sign-in → main, sign-out → onboarding
         val factoryAuthDisposable = JolliAuthService.addAuthListener {
             if (!JolliAuthService.isSignedIn()) {
-                // Sign-out: check if any LLM credential remains
                 val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
                 val hasCredentials = !config.apiKey.isNullOrBlank() ||
                     !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
@@ -276,75 +192,36 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                     }
                 }
             }
-            SwingUtilities.invokeLater { syncView() }
+            SwingUtilities.invokeLater {
+                syncView()
+                // Notify sidebar that configured state changed
+                if (mainPanel is JCEFSidebarPanel) {
+                    mainPanel.pushConfiguredChanged(isConfigured())
+                }
+            }
         }
 
         syncView()
 
-        // Also sync view on status changes (e.g. settings dialog clears API key → uninstall → status changes)
-        service.addStatusListener { SwingUtilities.invokeLater { syncView() } }
-
-        // Content 1: Memory Bank — KB folder browser
-        val kbPanel = KBExplorerPanel(project, service)
-        val memoriesContent = ContentFactory.getInstance().createContent(kbPanel, "\uD83D\uDCDA Memory Bank", false).apply {
-            isCloseable = false
-            setDisposer(Disposer.newDisposable("JolliMemoryMemoriesContent").also { parentDisposable ->
-                Disposer.register(parentDisposable, kbPanel)
-            })
-        }
-
-        // Content 2: Branch — current branch name with emoji
-        val currentBranch = service.getGitOps()?.getCurrentBranch() ?: "Branch"
-        val branchContent = ContentFactory.getInstance().createContent(rootPanel, "\uD83C\uDF3F $currentBranch", false).apply {
-            isCloseable = false
-            setDisposer(Disposer.newDisposable("JolliMemoryBranchContent").also { parentDisposable ->
-                Disposer.register(parentDisposable, onboardingPanel)
-                Disposer.register(parentDisposable, factoryAuthDisposable)
-                Disposer.register(parentDisposable, statusPanel)
-                Disposer.register(parentDisposable, plansPanel)
-                Disposer.register(parentDisposable, changesPanel)
-                Disposer.register(parentDisposable, commitsPanel)
-                Disposer.register(parentDisposable, memoriesPanel)
-            })
-        }
-
-        // Auto-update branch tab title on branch switch — multiple detection paths
-        var lastBranch = currentBranch
-        val updateBranchTitle: () -> Unit = {
-            val newBranch = service.getGitOps()?.getCurrentBranch() ?: "Branch"
-            if (newBranch != lastBranch) {
-                lastBranch = newBranch
-                SwingUtilities.invokeLater { branchContent.displayName = "\uD83C\uDF3F $newBranch" }
+        // Sync view on status changes
+        service.addStatusListener {
+            SwingUtilities.invokeLater {
+                syncView()
+                if (mainPanel is JCEFSidebarPanel) {
+                    mainPanel.pushConfiguredChanged(isConfigured())
+                }
             }
         }
 
-        // Path 1: IntelliJ git repository change event
-        val branchUpdateConnection = project.messageBus.connect()
-        branchUpdateConnection.subscribe(
-            GitRepository.GIT_REPO_CHANGE,
-            GitRepositoryChangeListener { updateBranchTitle() },
-        )
-
-        // Path 2: VCS configuration change (catches terminal branch operations)
-        branchUpdateConnection.subscribe(
-            ProjectLevelVcsManager.VCS_CONFIGURATION_CHANGED,
-            VcsListener { updateBranchTitle() },
-        )
-
-        // Path 3: Periodic poll every 2 seconds (catches all edge cases)
-        javax.swing.Timer(2000) { updateBranchTitle() }.apply {
-            isRepeats = true
-            start()
+        val content = ContentFactory.getInstance().createContent(rootPanel, "", false).apply {
+            isCloseable = false
+            setDisposer(contentDisposable.also { parentDisposable ->
+                Disposer.register(parentDisposable, onboardingPanel)
+                Disposer.register(parentDisposable, factoryAuthDisposable)
+            })
         }
 
-        // Path 4: Service status change
-        service.addStatusListener { updateBranchTitle() }
-
-        toolWindow.contentManager.addContent(branchContent)
-        toolWindow.contentManager.addContent(memoriesContent)
-
-        // Load KB tree on background thread
-        ApplicationManager.getApplication().executeOnPooledThread { kbPanel.load() }
+        toolWindow.contentManager.addContent(content)
     }
 
     override fun shouldBeAvailable(project: Project): Boolean {
@@ -354,202 +231,5 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
     companion object {
         private const val CARD_ONBOARDING = "onboarding"
         private const val CARD_MAIN = "main"
-    }
-}
-
-/**
- * A small status indicator label that shows a colored circle icon
- * (green/yellow/red) based on the JolliMemory service state.
- *
- * - Green: enabled without errors
- * - Yellow: enabled but with warnings (e.g., missing hooks, missing API key)
- * - Red: not enabled or failed to enable
- *
- * On mouse hover, a popup appears showing a summary of the status information
- * (same data as the STATUS panel, rendered as HTML).
- */
-private class StatusIndicatorLabel(
-    private val service: JolliMemoryService,
-) : JLabel() {
-
-    private var activePopup: Popup? = null
-
-    init {
-        border = JBUI.Borders.emptyLeft(6)
-        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-        updateIcon()
-
-        // Listen for status changes to update the icon color
-        service.addStatusListener { SwingUtilities.invokeLater { updateIcon() } }
-
-        addMouseListener(object : MouseAdapter() {
-            override fun mouseEntered(e: MouseEvent) {
-                showStatusPopup(e)
-            }
-
-            override fun mouseExited(e: MouseEvent) {
-                hideStatusPopup()
-            }
-        })
-    }
-
-    private fun updateIcon() {
-        val status = service.getStatus()
-        icon = when {
-            // Not enabled or no status — red
-            status == null || !status.enabled -> JolliMemoryIcons.CircleRed
-
-            // Enabled but has warnings (missing hooks, lastError set)
-            hasWarnings(status) -> JolliMemoryIcons.CircleYellow
-
-            // All good — green
-            else -> JolliMemoryIcons.CircleGreen
-        }
-    }
-
-    /**
-     * Checks whether the current status has any warnings:
-     * - No LLM credentials configured (selected provider can't work)
-     * - Service has a lastError
-     * - Git hooks not fully installed
-     * - Claude hooks not installed when Claude is detected
-     * - Gemini hooks not installed when Gemini is detected
-     */
-    private fun hasWarnings(status: ai.jolli.jollimemory.core.StatusInfo): Boolean {
-        // Check if the selected provider's credential is missing
-        val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-        when (config.aiProvider) {
-            "anthropic" -> {
-                if (config.apiKey.isNullOrBlank() && System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return true
-            }
-            "jolli" -> {
-                if (config.jolliApiKey.isNullOrBlank()) return true
-            }
-            else -> {
-                // No provider set — warn if nothing at all
-                val hasAny = !config.apiKey.isNullOrBlank() ||
-                    !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
-                    !config.jolliApiKey.isNullOrBlank()
-                if (!hasAny) return true
-            }
-        }
-
-        if (service.lastError != null) return true
-        if (!status.gitHookInstalled) return true
-        if (status.claudeDetected == true && !status.claudeHookInstalled) return true
-        if (status.geminiDetected == true && !status.geminiHookInstalled) return true
-        return false
-    }
-
-    private fun showStatusPopup(e: MouseEvent) {
-        hideStatusPopup()
-
-        val html = buildStatusHtml()
-        val label = com.intellij.ui.components.JBLabel(html).apply {
-            border = JBUI.Borders.empty(8)
-        }
-        val wrapper = JPanel(java.awt.BorderLayout()).apply {
-            add(label, java.awt.BorderLayout.CENTER)
-            border = JBUI.Borders.customLine(
-                javax.swing.UIManager.getColor("Separator.separatorColor") ?: java.awt.Color.GRAY,
-            )
-            background = javax.swing.UIManager.getColor("ToolTip.background")
-                ?: javax.swing.UIManager.getColor("Panel.background")
-        }
-
-        val location = e.component.locationOnScreen
-        val x = location.x
-        val y = location.y + e.component.height + 2
-
-        activePopup = PopupFactory.getSharedInstance().getPopup(e.component, wrapper, x, y)
-        activePopup?.show()
-    }
-
-    private fun hideStatusPopup() {
-        activePopup?.hide()
-        activePopup = null
-    }
-
-    /** Builds an HTML summary of the current status, mirroring the STATUS panel content. */
-    private fun buildStatusHtml(): String {
-        val status = service.getStatus()
-        val sb = StringBuilder("<html><div style='padding:2px'>")
-
-        if (status == null || !status.enabled) {
-            sb.append("<b>Jolli Memory is not enabled.</b>")
-            val err = service.lastError
-            if (err != null) {
-                sb.append("<br/><span style='color:#F85149'>$err</span>")
-            }
-            sb.append("</div></html>")
-            return sb.toString()
-        }
-
-        // Credential warning for selected provider
-        val credConfig = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-        val providerMissing = when (credConfig.aiProvider) {
-            "anthropic" -> credConfig.apiKey.isNullOrBlank() && System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
-            "jolli" -> credConfig.jolliApiKey.isNullOrBlank()
-            else -> credConfig.apiKey.isNullOrBlank() &&
-                System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() &&
-                credConfig.jolliApiKey.isNullOrBlank()
-        }
-        if (providerMissing) {
-            val providerName = if (credConfig.aiProvider == "jolli") "Jolli" else "Anthropic"
-            sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>$providerName API key missing</b> — open Settings to add one</p>")
-        }
-
-        // Hooks
-        val hookParts = mutableListOf<String>()
-        if (status.gitHookInstalled) hookParts.add("3 Git")
-        if (status.claudeHookInstalled) hookParts.add("2 Claude")
-        if (status.geminiHookInstalled) hookParts.add("1 Gemini CLI")
-        val hooksDesc = if (hookParts.isNotEmpty()) hookParts.joinToString(" + ") else "none installed"
-        val hookColor = if (status.gitHookInstalled) "#3FB950" else "#F85149"
-        sb.append("<p><span style='color:$hookColor'>\u25CF</span> <b>Hooks:</b> $hooksDesc</p>")
-
-        // Sessions
-        sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Sessions:</b> ${status.activeSessions}</p>")
-
-        // Stored Memories
-        sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Stored Memories:</b> ${status.summaryCount} total</p>")
-
-        // Jolli Site
-        val cwd = service.mainRepoRoot
-        val config = SessionTracker.loadConfig(cwd)
-        if (!config.jolliApiKey.isNullOrBlank()) {
-            val meta = JolliApiClient.parseJolliApiKey(config.jolliApiKey!!)
-            val siteUrl = meta?.u
-            if (siteUrl != null) {
-                val display = siteUrl.removePrefix("https://").removePrefix("http://")
-                sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Jolli Site:</b> $display</p>")
-            }
-        } else {
-            sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>Jolli API Key:</b> not configured</p>")
-        }
-
-        // Integrations
-        if (status.claudeDetected == true) {
-            val color = if (status.claudeHookInstalled) "#3FB950" else "#D29922"
-            val desc = if (status.claudeHookInstalled) "hook installed" else "hook not installed"
-            sb.append("<p><span style='color:$color'>\u25CF</span> <b>Claude:</b> $desc</p>")
-        }
-        if (status.codexDetected == true) {
-            sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Codex:</b> detected</p>")
-        }
-        if (status.geminiDetected == true) {
-            val color = if (status.geminiHookInstalled) "#3FB950" else "#D29922"
-            val desc = if (status.geminiHookInstalled) "hook installed" else "hook not installed"
-            sb.append("<p><span style='color:$color'>\u25CF</span> <b>Gemini:</b> $desc</p>")
-        }
-
-        // Error
-        val err = service.lastError
-        if (err != null) {
-            sb.append("<p><span style='color:#F85149'>\u25CF</span> <b>Error:</b> $err</p>")
-        }
-
-        sb.append("</div></html>")
-        return sb.toString()
     }
 }

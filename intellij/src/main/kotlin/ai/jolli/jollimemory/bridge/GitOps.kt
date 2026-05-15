@@ -197,7 +197,7 @@ class GitOps(private val projectDir: String) {
 
     /** Get git status in porcelain format (preserves leading spaces in status codes). */
     fun getStatus(): String? {
-        return exec("status", "--porcelain=v1", trim = false)
+        return exec("status", "--porcelain=v1", "-uall", trim = false)
     }
 
     /**

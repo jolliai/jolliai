@@ -7,6 +7,7 @@ import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
@@ -66,10 +67,19 @@ class CommitAIAction : AnAction() {
             return
         }
 
-        // Step 2: Get selected files from ChangesPanel
+        // Step 2: Get selected files. Priority:
+        //   1. JCEF webview's selection (set by JCEFSidebarPanel.init)
+        //   2. Legacy Swing ChangesPanel selection (only present pre-webview)
+        //   3. Fallback: every changed file
+        // Without #1 the unified-webview build silently committed everything because
+        // the Swing panel registration is gone.
         val changesPanel = service.panelRegistry?.changesPanel
-        val selectedFiles = changesPanel?.getSelectedFiles()?.takeIf { it.isNotEmpty() }
-            ?: service.getChangedFiles()
+        val allFiles = changesPanel?.getFiles() ?: service.getChangedFiles()
+        val webviewPaths = service.webviewSelectedPaths?.invoke().orEmpty()
+        val selectedFiles: List<ai.jolli.jollimemory.services.FileChange> = when {
+            webviewPaths.isNotEmpty() -> allFiles.filter { it.relativePath in webviewPaths }
+            else -> changesPanel?.getSelectedFiles()?.takeIf { it.isNotEmpty() } ?: allFiles
+        }
         if (selectedFiles.isEmpty()) {
             Messages.showWarningDialog(project, "No changed files to commit.", "Jolli Memory")
             return
@@ -79,7 +89,6 @@ class CommitAIAction : AnAction() {
 
         // Compute unselected tracked files (exclude untracked "?" files — git restore --staged
         // would error on files never in the index)
-        val allFiles = changesPanel?.getFiles() ?: service.getChangedFiles()
         val selectedPathSet = selectedPaths.toSet()
         val unselectedTrackedPaths = allFiles
             .filter { it.relativePath !in selectedPathSet && it.statusCode != "?" }
@@ -188,10 +197,11 @@ class CommitAIAction : AnAction() {
                                         service.refreshStatus()
                                     }
                                 } catch (ex: Exception) {
+                                    LOG.warn("Commit failed during action execution (action=${result.action})", ex)
                                     // Restore index on commit failure
                                     git.readTree(originalIndexTree)
                                     ApplicationManager.getApplication().invokeLater {
-                                        Messages.showErrorDialog(project, "Commit failed: ${ex.message}", "Jolli Memory")
+                                        Messages.showErrorDialog(project, "Commit failed: ${ex.message ?: ex.javaClass.simpleName}", "Jolli Memory")
                                     }
                                 }
                             }
@@ -203,8 +213,9 @@ class CommitAIAction : AnAction() {
                         }
                     }
                 } catch (ex: Exception) {
+                    LOG.warn("AI Commit flow failed (outer)", ex)
                     ApplicationManager.getApplication().invokeLater {
-                        Messages.showErrorDialog(project, "Failed: ${ex.message}", "Jolli Memory")
+                        Messages.showErrorDialog(project, "Failed: ${ex.message ?: ex.javaClass.simpleName}", "Jolli Memory")
                     }
                 }
             }
@@ -285,5 +296,9 @@ class CommitAIAction : AnAction() {
         val cwd = service?.mainRepoRoot ?: e.project?.basePath
         val workerBusy = cwd != null && SessionTracker.isWorkerBusy(cwd)
         e.presentation.isEnabled = status != null && status.enabled && !workerBusy
+    }
+
+    companion object {
+        private val LOG = Logger.getInstance(CommitAIAction::class.java)
     }
 }

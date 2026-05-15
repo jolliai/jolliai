@@ -42,6 +42,7 @@ import javax.swing.UIManager
  */
 class SquashAction : AnAction() {
     private val log = JmLogger.create("SquashAction")
+    private val ideLog = com.intellij.openapi.diagnostic.Logger.getInstance(SquashAction::class.java)
 
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
@@ -58,10 +59,17 @@ class SquashAction : AnAction() {
 
         val config = SessionTracker.loadConfig(cwd)
 
-        // Get selected commits from CommitsPanel if available, otherwise use all branch commits
-        val commitsPanel = service.panelRegistry?.commitsPanel
-        val selectedCommits = commitsPanel?.getSelectedCommits()?.takeIf { it.isNotEmpty() }
-        val commits = selectedCommits ?: service.getBranchCommits()
+        // Selection priority matches CommitAIAction's: JCEF webview hook first,
+        // then legacy Swing CommitsPanel, then "all branch commits". Without #1
+        // the unified-webview build silently squashed every commit because the
+        // Swing panel registration is gone.
+        val webviewHashes = service.webviewSelectedCommitHashes?.invoke().orEmpty()
+        val branchCommits = service.getBranchCommits()
+        val commits: List<ai.jolli.jollimemory.bridge.CommitSummaryBrief> = when {
+            webviewHashes.isNotEmpty() -> branchCommits.filter { it.hash in webviewHashes }
+            else -> service.panelRegistry?.commitsPanel?.getSelectedCommits()?.takeIf { it.isNotEmpty() } ?: branchCommits
+        }
+        ideLog.info("Squash invoked: webviewHashes=${webviewHashes.size}, branchCommits=${branchCommits.size}, resolvedCommits=${commits.size}")
         if (commits.size < 2) {
             Messages.showWarningDialog(project, "Need at least 2 commits to squash.", "Jolli Memory")
             return

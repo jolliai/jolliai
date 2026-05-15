@@ -252,10 +252,31 @@ object JolliApiClient {
         val outputTokens: Int,
     )
 
+    /**
+     * Pinned prompt template versions, mirroring VS Code's `TEMPLATES` map in
+     * cli/src/core/PromptTemplates.ts. The backend uses (action, version) to
+     * look up the prompt; omitting `version` makes the dev backend 500 on
+     * actions it can't resolve via the max-revision fallback. Keep this in
+     * lockstep with `cli/src/core/PromptTemplates.ts` — drifting either side
+     * silently breaks proxy calls for the affected action.
+     */
+    private val ACTION_VERSIONS: Map<String, Int> = mapOf(
+        "commit-message" to 2,
+        "squash-message" to 2,
+        "summarize" to 2,
+        "summarize-strict" to 2,
+        "squash-consolidate" to 2,
+        "e2e-test" to 2,
+        "translate" to 2,
+        "plan-progress" to 2,
+        "recap" to 1,
+    )
+
     /** Payload sent to the LLM proxy endpoint. */
     private data class LlmProxyPayload(
         val action: String,
         val params: Map<String, String>,
+        val version: Int? = null,
     )
 
     /**
@@ -273,7 +294,12 @@ object JolliApiClient {
         val parsed = parseBaseUrl(resolvedBaseUrl)
         val targetUri = URI.create("${parsed.origin}/api/push/llm/complete")
 
-        val body = gson.toJson(LlmProxyPayload(action, params))
+        // Mirror VS Code: when a known version is available, pin it; otherwise
+        // omit so the backend falls back to its max-revision lookup. Gson's
+        // default behavior already drops null fields when registered without
+        // `serializeNulls`, but we use a non-null `version` only when present
+        // so the wire shape never includes `"version": null`.
+        val body = gson.toJson(LlmProxyPayload(action, params, ACTION_VERSIONS[action]))
         val requestBuilder = HttpRequest.newBuilder()
             .uri(targetUri)
             .header("Content-Type", "application/json")

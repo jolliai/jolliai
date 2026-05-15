@@ -11,22 +11,12 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
-import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.openapi.ui.popup.PopupStep
 import com.intellij.openapi.ui.popup.util.BaseListPopupStep
-import com.intellij.ui.components.JBLabel
-import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.components.JBTextArea
-import com.intellij.ui.components.JBTextField
-import com.intellij.util.ui.JBUI
-import java.awt.BorderLayout
-import java.awt.Dimension
 import java.io.File
 import java.time.Instant
 import java.util.UUID
-import javax.swing.JComponent
-import javax.swing.JPanel
 
 /**
  * Adds a note to the plans.json registry.
@@ -87,25 +77,11 @@ class AddNoteAction : AnAction() {
     }
 
     private fun addSnippetNote(project: com.intellij.openapi.project.Project, service: JolliMemoryService) {
-        val dialog = SnippetDialog(project)
-        if (!dialog.showAndGet()) return
-
-        val title = dialog.snippetTitle.trim()
-        val content = dialog.snippetContent.trim()
-        if (title.isBlank() || content.isBlank()) return
-
-        ApplicationManager.getApplication().executeOnPooledThread {
-            val cwd = service.mainRepoRoot ?: project.basePath ?: return@executeOnPooledThread
-            val noteId = UUID.randomUUID().toString().take(8)
-            val notesDir = File(SessionTracker.getNotesDir(cwd))
-            notesDir.mkdirs()
-
-            // Write snippet content as a markdown file
-            val destFile = File(notesDir, "$noteId.md")
-            destFile.writeText("# $title\n\n$content", Charsets.UTF_8)
-
-            saveNoteEntry(noteId, title, NoteFormat.snippet, destFile.absolutePath, cwd, service)
-        }
+        // Opens as a dedicated editor tab (NoteEditorFileEditor) rather than a
+        // blocking modal — matches VS Code's webview panel UX. The editor owns
+        // its own save flow; we just open the tab here.
+        val virtualFile = ai.jolli.jollimemory.toolwindow.NoteEditorVirtualFile()
+        com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).openFile(virtualFile, true)
     }
 
     private fun saveNoteEntry(
@@ -149,46 +125,54 @@ class AddNoteAction : AnAction() {
         e.presentation.isEnabled = status != null && status.enabled
     }
 
-    /**
-     * Simple dialog for creating a text snippet note with title and content fields.
-     */
-    private class SnippetDialog(
-        project: com.intellij.openapi.project.Project,
-    ) : DialogWrapper(project) {
-
-        private val titleField = JBTextField()
-        private val contentArea = JBTextArea(8, 40)
-
-        val snippetTitle: String get() = titleField.text
-        val snippetContent: String get() = contentArea.text
-
-        init {
-            title = "Add Text Snippet"
-            init()
+    companion object {
+        /**
+         * Direct entry into the markdown-file sub-flow without showing the
+         * "Add Markdown / Add Text Snippet" picker popup. Used by the JCEF
+         * sidebar, which already presents that choice in its own `+` menu.
+         */
+        fun openMarkdownPicker(project: com.intellij.openapi.project.Project) {
+            val service = project.getService(JolliMemoryService::class.java) ?: return
+            val descriptor = FileChooserDescriptorFactory.createSingleFileDescriptor("md")
+                .withTitle("Select Markdown File")
+            val chosen = FileChooser.chooseFile(descriptor, project, null) ?: return
+            val sourceFile = File(chosen.path)
+            if (!sourceFile.exists()) return
+            ApplicationManager.getApplication().executeOnPooledThread {
+                val cwd = service.mainRepoRoot ?: project.basePath ?: return@executeOnPooledThread
+                val noteId = UUID.randomUUID().toString().take(8)
+                val title = PlanService.extractPlanTitle(sourceFile.readText(Charsets.UTF_8))
+                val notesDir = File(SessionTracker.getNotesDir(cwd))
+                notesDir.mkdirs()
+                val destFile = File(notesDir, "$noteId.md")
+                sourceFile.copyTo(destFile, overwrite = true)
+                val registry = SessionTracker.loadPlansRegistry(cwd)
+                val now = Instant.now().toString()
+                val branch = service.getGitOps()?.getCurrentBranch() ?: "unknown"
+                val entry = NoteEntry(
+                    id = noteId,
+                    title = title,
+                    format = NoteFormat.markdown,
+                    addedAt = now,
+                    updatedAt = now,
+                    branch = branch,
+                    commitHash = null,
+                    sourcePath = destFile.absolutePath,
+                )
+                val updatedNotes = (registry.notes ?: emptyMap()).toMutableMap()
+                updatedNotes[noteId] = entry
+                SessionTracker.savePlansRegistry(registry.copy(notes = updatedNotes), cwd)
+                service.refreshStatus()
+            }
         }
 
-        override fun createCenterPanel(): JComponent {
-            val panel = JPanel(BorderLayout(0, JBUI.scale(8)))
-            panel.border = JBUI.Borders.empty(8)
-
-            // Title row
-            val titlePanel = JPanel(BorderLayout(JBUI.scale(8), 0)).apply {
-                add(JBLabel("Title:"), BorderLayout.WEST)
-                add(titleField, BorderLayout.CENTER)
-            }
-            panel.add(titlePanel, BorderLayout.NORTH)
-
-            // Content area
-            val contentPanel = JPanel(BorderLayout(0, JBUI.scale(4))).apply {
-                add(JBLabel("Content:"), BorderLayout.NORTH)
-                contentArea.lineWrap = true
-                contentArea.wrapStyleWord = true
-                add(JBScrollPane(contentArea), BorderLayout.CENTER)
-            }
-            panel.add(contentPanel, BorderLayout.CENTER)
-
-            panel.preferredSize = Dimension(JBUI.scale(450), JBUI.scale(300))
-            return panel
+        /**
+         * Direct entry into the snippet sub-flow without showing the picker
+         * popup. Opens the dedicated note editor tab.
+         */
+        fun openSnippetEditor(project: com.intellij.openapi.project.Project) {
+            val virtualFile = ai.jolli.jollimemory.toolwindow.NoteEditorVirtualFile()
+            com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).openFile(virtualFile, true)
         }
     }
 }

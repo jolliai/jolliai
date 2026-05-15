@@ -36,6 +36,10 @@
         <fileEditorProvider
             implementation="ai.jolli.jollimemory.toolwindow.SummaryEditorProvider"/>
 
+        <!-- Editor tab provider for the "Add Text Snippet" note creation flow -->
+        <fileEditorProvider
+            implementation="ai.jolli.jollimemory.toolwindow.NoteEditorProvider"/>
+
         <!-- Notification group for balloon notifications (e.g., no-Git warning) -->
         <notificationGroup
             id="JolliMemory"

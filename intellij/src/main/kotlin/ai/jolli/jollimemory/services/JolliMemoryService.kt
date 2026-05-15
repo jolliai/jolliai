@@ -59,6 +59,22 @@ class JolliMemoryService(private val project: Project) : Disposable {
     var panelRegistry: PanelRegistry? = null
 
     /**
+     * Callback the unified JCEF sidebar installs so non-sidebar actions (e.g.
+     * CommitAIAction) can read the user's webview-side file selection. Returns
+     * the set of selected `FileChange.relativePath` values. Null when the
+     * JCEF panel isn't mounted — actions then fall back to the legacy
+     * `panelRegistry.changesPanel` or to "all changed files".
+     */
+    var webviewSelectedPaths: (() -> Set<String>)? = null
+
+    /**
+     * Same idea as [webviewSelectedPaths] but for commit hash selections in
+     * the Memories section. Lets SquashAction etc. honor the webview-side
+     * checkboxes after the legacy Swing CommitsPanel was retired.
+     */
+    var webviewSelectedCommitHashes: (() -> Set<String>)? = null
+
+    /**
      * Adds a status listener. If the service is already initialized (has cached status),
      * the listener is immediately invoked so late-registering panels receive the current state.
      */
@@ -472,10 +488,27 @@ class JolliMemoryService(private val project: Project) : Disposable {
         return output.lines()
             .filter { it.isNotBlank() && it.length > 3 }
             .map { line ->
-                FileChange(
-                    relativePath = line.substring(3),
-                    statusCode = line.substring(0, 2).trim(),
-                )
+                // Preserve raw 2-char porcelain XY (index + worktree). Trimming
+                // collapses " M" (worktree-only) and "M " (staged-only) to "M",
+                // losing the position info the discard dispatch relies on to
+                // pick between `restore --staged` vs `restore --`.
+                val statusCode = line.substring(0, 2)
+                val pathPart = line.substring(3)
+                // Rename / copy entries (R / C in the index column) come back as
+                // "<old> -> <new>"; split so relativePath is the new name and
+                // oldPath holds the original. Lets the discard dispatch undo
+                // both sides of the rename properly.
+                val isRenameOrCopy = statusCode[0] == 'R' || statusCode[0] == 'C'
+                val arrow = if (isRenameOrCopy) pathPart.indexOf(" -> ") else -1
+                if (arrow >= 0) {
+                    FileChange(
+                        relativePath = pathPart.substring(arrow + 4),
+                        statusCode = statusCode,
+                        oldPath = pathPart.substring(0, arrow),
+                    )
+                } else {
+                    FileChange(relativePath = pathPart, statusCode = statusCode)
+                }
             }
     }
 
@@ -498,24 +531,36 @@ class JolliMemoryService(private val project: Project) : Disposable {
             mergeBase = null
         }
 
-        // If merge-base equals HEAD, we're on main or branch is fully merged.
-        // When on main with a remote, show unpushed commits (origin/main..HEAD).
-        // When on main with no remote or on a fresh branch with no own commits,
-        // return empty — matches VS Code behavior where Commits panel clears on new branch.
-        val range = when {
+        // If merge-base equals HEAD, the branch is fully merged into base. Match
+        // VS Code's "merged mode": use the local reflog to find this branch's
+        // creation point, then filter `<creationPoint>..HEAD` to commits the
+        // current git user authored. Keeps memories visible after a merge.
+        var authorFilter: String? = null
+        val range: String? = when {
             mergeBase == null -> null // No common ancestor
             mergeBase == headHash && baseRef.startsWith("origin/") -> "$baseRef..HEAD"
-            mergeBase == headHash -> return emptyList() // On main or fresh branch — no branch-specific commits
+            mergeBase == headHash -> {
+                val branch = g.exec("rev-parse", "--abbrev-ref", "HEAD")?.trim()
+                val creationPoint = if (!branch.isNullOrBlank() && branch != "HEAD") findBranchCreationPoint(g, branch) else null
+                val userName = getCurrentUserName(g)
+                if (creationPoint != null && !userName.isNullOrBlank()) {
+                    authorFilter = userName
+                    "$creationPoint..HEAD"
+                } else {
+                    return emptyList()
+                }
+            }
             else -> "$mergeBase..HEAD"
         }
 
         // Get commits with full metadata
-        val logArgs = if (range != null) {
-            arrayOf("log", range, "--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00", "--no-merges")
-        } else {
-            arrayOf("log", "--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00", "--no-merges", "-20")
-        }
-        val output = g.exec(*logArgs) ?: return emptyList()
+        val logArgsList = mutableListOf("log")
+        if (range != null) logArgsList.add(range)
+        logArgsList.add("--format=%H%x00%s%x00%an%x00%ae%x00%aI%x00%x00")
+        logArgsList.add("--no-merges")
+        if (range == null) logArgsList.add("-20")
+        if (authorFilter != null) logArgsList.add("--author=$authorFilter")
+        val output = g.exec(*logArgsList.toTypedArray()) ?: return emptyList()
         if (output.isBlank()) return emptyList()
 
         // Parse entries (split on double-NUL separator)
@@ -675,6 +720,31 @@ class JolliMemoryService(private val project: Project) : Disposable {
     }
 
     /**
+     * Walks the local reflog for [branch] backwards to find where it was
+     * originally created. Returns the commit hash at creation, or null if
+     * the reflog is empty or has expired (fresh clone).
+     */
+    private fun findBranchCreationPoint(g: ai.jolli.jollimemory.bridge.GitOps, branch: String): String? {
+        val reflog = g.exec("reflog", "show", branch, "--format=%H %gs") ?: return null
+        if (reflog.isBlank()) return null
+        val lines = reflog.lines().filter { it.isNotBlank() }
+        if (lines.isEmpty()) return null
+        // Prefer the explicit "branch: Created from ..." entry — most reliable signal.
+        for (i in lines.indices.reversed()) {
+            if (lines[i].contains("branch: Created from")) {
+                return lines[i].substringBefore(' ').takeIf { it.isNotBlank() }
+            }
+        }
+        // Fallback to the oldest reflog entry.
+        return lines.last().substringBefore(' ').takeIf { it.isNotBlank() }
+    }
+
+    /** Current git user.name (used as the --author filter in merged mode). */
+    private fun getCurrentUserName(g: ai.jolli.jollimemory.bridge.GitOps): String? {
+        return g.exec("config", "user.name")?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    /**
      * Checks whether the current branch is fully merged into main.
      * A branch is merged when merge-base(HEAD, main) equals HEAD itself,
      * meaning all branch commits are already reachable from main.
@@ -688,6 +758,30 @@ class JolliMemoryService(private val project: Project) : Disposable {
         val mergeBase = g.exec("merge-base", "HEAD", baseRef)?.trim()
         return !mergeBase.isNullOrBlank() && mergeBase == headHash
     }
+
+    // ── Sidebar convenience accessors ──────────────────────────────────────
+
+    fun isEnabled(): Boolean = cachedStatus?.enabled == true
+
+    fun isAuthenticated(): Boolean {
+        val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+        return !config.apiKey.isNullOrBlank() ||
+            !config.jolliApiKey.isNullOrBlank() ||
+            !config.authToken.isNullOrBlank() ||
+            !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()
+    }
+
+    fun isConfigured(): Boolean = isEnabled() && isAuthenticated()
+
+    val currentBranchName: String?
+        get() = git?.getCurrentBranch()?.trim()?.takeIf { it.isNotBlank() }
+
+    val currentRepoName: String?
+        get() = mainRepoRoot?.let { KBPathResolver.extractRepoName(it) }
+
+    fun isDetached(): Boolean = currentBranchName == "HEAD"
+
+    // ─────────────────────────────────────────────────────────────────────────
 
     fun getGitOps(): GitOps? = git
     fun getInstallerDebug(): String = installer?.getDebugInfo() ?: "installer is null"
@@ -704,6 +798,8 @@ data class FileChange(
     val relativePath: String,
     val statusCode: String,
     var isSelected: Boolean = true,
+    /** Original path for renamed/copied entries (statusCode index == 'R' or 'C'). */
+    val oldPath: String? = null,
 )
 
 /** A file changed in a specific commit — matches VS Code CommitFileInfo. */
