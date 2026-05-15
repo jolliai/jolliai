@@ -89,3 +89,46 @@ export function formatShortRelativeDate(iso: string): string {
 export function escMd(str: string): string {
 	return str.replace(/[\\`*_{}[\]()#+\-.!|<>]/g, "\\$&");
 }
+
+/**
+ * Strips common Markdown formatting markers so the underlying prose can be
+ * shown verbatim in a plain-text context (e.g. the hover-card description
+ * preview, which uses textContent rendering — markdown source would surface
+ * literally otherwise). Newlines are preserved so callers can pair this with
+ * `white-space: pre-wrap` CSS to keep paragraph breaks visible.
+ *
+ * Not a full Markdown renderer — only handles the markers that actually show
+ * up in Linear / Plan / Note descriptions (headings, bold, italic, inline
+ * code, links). Tables / code blocks / lists are left alone since they
+ * already read sensibly as plain text.
+ */
+export function stripMarkdown(str: string): string {
+	return (
+		str
+			// Headings: `## Foo` (and any of #..######) at line start → `Foo`.
+			.replace(/^#{1,6}\s+/gm, "")
+			// Bold first, before single-asterisk italic, so `**foo**` doesn't
+			// collapse to `*foo*` by the italic rule.
+			.replace(/\*\*(.+?)\*\*/g, "$1")
+			// Bold via underscores needs word-boundary guards. Without them,
+			// `__foo__` inside identifiers like `mcp__linear__get_issue`
+			// would match and the underscores would be eaten — regression
+			// observed in the Linear inline-code-span test case.
+			.replace(/(?<!\w)__([^_\n]+?)__(?!\w)/g, "$1")
+			// Italic: `*foo*` / `_foo_` → `foo`. Conservative — won't touch
+			// asterisks that aren't paired (e.g. a literal "5 * 3").
+			.replace(/\*([^*\n]+?)\*/g, "$1")
+			.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, "$1")
+			// Inline code: `` `foo` `` → `foo`.
+			.replace(/`([^`\n]+)`/g, "$1")
+			// Markdown links: `[label](url)` → `label`.
+			.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+			// Linear's inline issue references: `<issue id="...">JOLLI-1404</issue>`
+			// → `JOLLI-1404`. Linear MCP returns these embedded in description
+			// prose and they read terribly as raw HTML.
+			.replace(/<issue\s+id="[^"]*">([^<]*)<\/issue>/g, "$1")
+			// Collapse 3+ blank lines to a single paragraph break so previews
+			// don't waste vertical space on Linear's verbose spacing.
+			.replace(/\n{3,}/g, "\n\n")
+	);
+}

@@ -1374,4 +1374,134 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).not.toContain("linearIssue.iconColor");
 		});
 	});
+
+	describe("Linear issue hover card", () => {
+		// The plain-text tooltip routed through textContent (the prior plan/note
+		// fallback) showed markdown source verbatim for Linear issues — backslash
+		// escapes from escMd plus literal ** / $() markers. Linear-issue rows now
+		// drive the same .hover-card popover used by the Memories section so they
+		// get the rich codicon layout (status circle, priority flame, label tag,
+		// description preview, Open-in-Linear link).
+		it("declares renderLinearHoverCard for the Linear-issue card body", () => {
+			// The earlier per-kind show / schedule functions were collapsed
+			// into a single scheduleShowBranchHoverCard once plans and notes
+			// also went through the hover card — only the renderer is
+			// kind-specific now. See the "Plan / Note / Linear hover card"
+			// describe block for the unified-dispatch tests.
+			const js = buildSidebarScript();
+			expect(js).toContain("function renderLinearHoverCard");
+		});
+
+		it("Open-in-Linear hover-card link uses data-cmd + data-hash so the shared dispatch works", () => {
+			const js = buildSidebarScript();
+			// The hoverCardEl click handler routes [data-cmd][data-hash] →
+			// vscode.postMessage({command, args:[hash]}). Reusing those attribute
+			// names means we don't duplicate the dispatch code.
+			expect(js).toContain("'data-cmd': 'jollimemory.openLinearIssue'");
+			expect(js).toMatch(/'data-hash':\s*mapKey/);
+		});
+
+		it("renders the codicon row stack (status / priority / labels) + Open-in-Linear action", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("codicon-circle-large-filled");
+			expect(js).toContain("codicon-flame");
+			expect(js).toContain("codicon-tag");
+			expect(js).toContain("codicon-link-external");
+		});
+
+		it("renderPlanRow suppresses native title= on every row type (all three drive the hover card)", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderPlanRow");
+			const fnEnd = js.indexOf("function gitStatusToCodicon", fnStart);
+			const body = js.slice(fnStart, fnEnd);
+			// Plan / note / linear-issue rows all route through the shared
+			// hover-card mouseover handler now, so the native title attribute
+			// is universally nulled — keeping it would surface a duplicate
+			// tooltip on an independent timer.
+			expect(body).toContain("title: null");
+			expect(body).not.toContain("title: item.tooltip");
+		});
+	});
+
+	describe("Plan / Note / Linear hover card", () => {
+		// The three Plans & Notes section row types share one popover element
+		// (#memory-hover) and one set of show / hide timers — only the content
+		// renderer differs. mouseover dispatches on data-context to pick the
+		// right renderPlan/Note/LinearHoverCard.
+		it("declares renderPlanHoverCard + renderNoteHoverCard alongside Linear's", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("function renderPlanHoverCard");
+			expect(js).toContain("function renderNoteHoverCard");
+			expect(js).toContain("function renderLinearHoverCard");
+		});
+
+		it("plan hover card includes clock + filename rows + Open-Plan action (no edit-count row)", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderPlanHoverCard");
+			const fnEnd = js.indexOf("function renderNoteHoverCard", fnStart);
+			const body = js.slice(fnStart, fnEnd);
+			expect(body).toContain("codicon-clock");
+			expect(body).toContain("codicon-markdown");
+			// "edited N times" was removed — the count is populated by
+			// transcript scanning and misses non-Claude plan touches, so
+			// it routinely showed "0 times" for actively-edited plans.
+			expect(body).not.toContain("h.editInfo");
+			expect(body).not.toContain("codicon-edit");
+			expect(body).toContain("'jollimemory.openPlanForPreview'");
+			// Committed plans get the copy-hash link in addition to Open Plan.
+			expect(body).toContain("'jollimemory.copyCommitHash'");
+		});
+
+		it("note hover card swaps file icon by format and exposes Open-Note action", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderNoteHoverCard");
+			const fnEnd = js.indexOf("function renderLinearHoverCard", fnStart);
+			const body = js.slice(fnStart, fnEnd);
+			expect(body).toContain("'codicon-comment'");
+			expect(body).toContain("'codicon-note'");
+			expect(body).toContain("'jollimemory.openNoteForPreview'");
+		});
+
+		it("mouseover dispatches by data-context to plan / note / linear renderers", () => {
+			const js = buildSidebarScript();
+			// Single selector + branch on ctx — three separate listeners would
+			// invite race conditions on the show / hide timers.
+			expect(js).toContain("'.tree-node[data-id]'");
+			expect(js).toMatch(
+				/ctx\s*!==\s*'plan'\s*&&\s*ctx\s*!==\s*'note'\s*&&\s*ctx\s*!==\s*'linearissue'/,
+			);
+			expect(js).toContain("renderPlanHoverCard(rowId");
+			expect(js).toContain("renderNoteHoverCard(rowId");
+			expect(js).toContain("renderLinearHoverCard(rowId");
+		});
+
+		it("unified lookup reads planHover / noteHover / linearHover off the matching serialized item", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("function lookupBranchHoverById");
+			expect(js).toContain("items[i].planHover");
+			expect(js).toContain("items[i].noteHover");
+			expect(js).toContain("items[i].linearHover");
+		});
+
+		it("trash button (data-inline='remove') routes by row contextValue to the right command", () => {
+			// Regression: renderPlanRow shared one inline-actions block across
+			// plan / note / linearissue rows (all hardcoded data-inline="remove").
+			// The click delegation initially branched only plan-vs-note, so
+			// Linear rows fell into the else and dispatched jollimemory.removePlan
+			// with a Linear mapKey — which removePlan doesn't recognize, so the
+			// trash button silently no-op'd on Linear rows while working on
+			// plan/note rows. The three-way ternary in the dispatch ensures
+			// each row type's trash routes to its own host-side handler.
+			const js = buildSidebarScript();
+			expect(js).toContain("'jollimemory.removeNote'");
+			expect(js).toContain("'jollimemory.removePlan'");
+			expect(js).toContain("'jollimemory.ignoreLinearIssue'");
+			// The three branches must coexist in the same dispatch — a future
+			// regression that dropped any of them would re-introduce the
+			// silent-no-op symptom on the corresponding row type.
+			expect(js).toMatch(
+				/ctx\s*===\s*'note'[\s\S]{0,150}ctx\s*===\s*'linearissue'/,
+			);
+		});
+	});
 });
