@@ -255,13 +255,21 @@ type PrLookup =
 	| { kind: "noPr"; history: ReadonlyArray<PrHistoryEntry> }
 	| { kind: "lookupError"; reason: string };
 
-/** Raw row shape returned by `gh pr list --json number,url,title,body,state`. */
+/**
+ * Raw row shape returned by `gh pr list --json
+ * number,url,title,body,state,isCrossRepository`.
+ *
+ * `isCrossRepository` is true when the PR was opened from a fork against this
+ * repo. We never want to show or edit a fork PR through this panel — see
+ * the filter in {@link findPrForBranch}.
+ */
 interface RawPrListRow {
 	readonly number: number;
 	readonly url: string;
 	readonly title: string;
 	readonly body: string;
 	readonly state: "OPEN" | "MERGED" | "CLOSED";
+	readonly isCrossRepository?: boolean;
 }
 
 /**
@@ -298,7 +306,7 @@ async function findPrForBranch(
 		"--head",
 		branch,
 		"--json",
-		"number,url,title,body,state",
+		"number,url,title,body,state,isCrossRepository",
 		...repoArgs,
 	];
 	const result = await tryExecGh(args, cwd);
@@ -349,9 +357,26 @@ async function findPrForBranch(
 	// Skip entries that look malformed — e.g. missing number (which `gh` has
 	// returned as 0 in edge cases) or missing state. We'd rather show fewer
 	// history pills than crash the section.
-	const valid = parsed.filter(
+	//
+	// Strict same-repo filter: `gh pr list --head <branch>` matches by branch
+	// name alone, so a contributor fork that happens to share the head-branch
+	// name (common in open-source repos) would otherwise be picked up here
+	// and — if it had the highest number — be selected as the "active" PR.
+	// That made Edit PR a wrong-target write vector. Dropping rows where
+	// `isCrossRepository` is true scopes the lookup to upstream-owned PRs,
+	// matching the old `gh pr view` behavior the previous CLI surface had.
+	const wellFormed = parsed.filter(
 		(p) => p.number > 0 && typeof p.state === "string",
 	);
+	const forkPrs = wellFormed.filter((p) => p.isCrossRepository === true);
+	if (forkPrs.length > 0) {
+		const dropped = forkPrs.map((p) => `#${p.number}`).join(", ");
+		log.warn(
+			TAG,
+			`Ignoring ${forkPrs.length} cross-repository (fork) PR(s) on branch ${branch}: ${dropped}. The panel only manages PRs owned by the upstream repo.`,
+		);
+	}
+	const valid = wellFormed.filter((p) => p.isCrossRepository !== true);
 	// Open: GitHub enforces at most one open PR per head branch, so this
 	// filter normally yields 0 or 1 entries. The sort + slice[0] selection
 	// below is defensive: a transient gh/GitHub anomaly (replication lag,

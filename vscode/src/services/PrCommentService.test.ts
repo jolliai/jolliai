@@ -1343,6 +1343,98 @@ describe("PrCommentService", () => {
 				expect(matched).toBeDefined();
 			});
 
+			it("ignores cross-repository (fork) PRs even when they have the highest number, and warns about each dropped ID", async () => {
+				// `gh pr list --head <branch>` matches by branch name only,
+				// which means a contributor fork that shares the head-branch
+				// name with the user's local branch shows up in the result.
+				// Without isCrossRepository filtering, the fork PR (#250)
+				// would be picked over the user's own upstream PR (#42) and
+				// — worse — become the target of Edit PR writes.
+				happyProbes([
+					{
+						number: 250,
+						url: "https://pr/250",
+						title: "Fork contribution",
+						body: "",
+						state: "OPEN",
+						isCrossRepository: true,
+					},
+					{
+						number: 42,
+						url: "https://pr/42",
+						title: "Upstream PR",
+						body: "",
+						state: "OPEN",
+						isCrossRepository: false,
+					},
+					{
+						number: 30,
+						url: "https://pr/30",
+						title: "Old fork PR",
+						body: "",
+						state: "MERGED",
+						isCrossRepository: true,
+					},
+					{
+						number: 25,
+						url: "https://pr/25",
+						title: "Upstream merged",
+						body: "",
+						state: "MERGED",
+						isCrossRepository: false,
+					},
+				]);
+
+				await handleCheckPrStatus(CWD, postMessage);
+
+				// The active PR must be the upstream-owned one, not the
+				// higher-numbered fork. History must only carry upstream
+				// rows, never fork rows.
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						status: "ready",
+						pr: expect.objectContaining({ number: 42 }),
+						history: [{ number: 25, url: "https://pr/25", state: "MERGED" }],
+					}),
+				);
+				// Both dropped fork IDs must appear in the warn log so the
+				// operator can reconcile against the gh / GitHub UI.
+				const warnCalls = warn.mock.calls.map((c) => c.join(" "));
+				const matched = warnCalls.find(
+					(line) =>
+						line.includes("cross-repository") &&
+						line.includes("#250") &&
+						line.includes("#30"),
+				);
+				expect(matched).toBeDefined();
+			});
+
+			it("returns noPr when every matching PR is a cross-repository fork PR", async () => {
+				// Pure-fork edge case: the user's branch happens to share its
+				// name with a contributor fork PR but the user has not opened
+				// their own PR yet. The panel must surface a Create PR
+				// affordance (kind:noPr), not present the fork PR as theirs.
+				happyProbes([
+					{
+						number: 99,
+						url: "https://pr/99",
+						title: "Contributor PR",
+						body: "",
+						state: "OPEN",
+						isCrossRepository: true,
+					},
+				]);
+
+				await handleCheckPrStatus(CWD, postMessage);
+
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						status: "noPr",
+						history: [],
+					}),
+				);
+			});
+
 			it("drops malformed entries with number 0 or missing state from history", async () => {
 				// Defense-in-depth: gh has been observed to return number 0 in
 				// rare edge cases; we'd rather show fewer history pills than

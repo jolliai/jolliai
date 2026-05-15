@@ -6931,6 +6931,43 @@ describe("SummaryWebviewPanel", () => {
 			);
 		});
 
+		it("also intercepts prepareUpdatePr and updatePr — neither must reach PrCommentService on a foreign panel", async () => {
+			// Regression guard: PrCommentService.handlePrepareUpdatePr /
+			// handleUpdatePr do NOT carry the foreign repoUrl plumbing that
+			// handleCheckPrStatus does, so if either ever leaked past the
+			// allowlist it would silently target a same-named branch PR in
+			// the CURRENT workspace's repo instead of the foreign repo's PR.
+			// Pin them into the deny list at the dispatcher layer so a
+			// future allowlist edit can't accidentally regress this.
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "prepareUpdatePr" });
+			dispatch({
+				command: "updatePr",
+				title: "x",
+				body: "y",
+			});
+			await flushPromises();
+
+			expect(showInformationMessage).toHaveBeenCalledTimes(2);
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/from other-repo.*prepareUpdatePr.*disabled/i),
+			);
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/from other-repo.*updatePr.*disabled/i),
+			);
+		});
+
 		it("still allows the read-only whitelist (copyMarkdown, downloadMarkdown) on a foreign panel", async () => {
 			const summary = makeSummary();
 			await SummaryWebviewPanel.show(
