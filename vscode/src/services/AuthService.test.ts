@@ -660,6 +660,11 @@ describe("AuthService", () => {
 			);
 			expect(parsed).toContain("generate_api_key=true");
 			expect(parsed).toContain("client=vscode");
+			// client_version pairs with client=vscode so server-side min-version
+			// gating can run at sign-in. Test bundles don't define __PKG_VERSION__,
+			// so the fallback "dev" is what reaches the URL here — what matters
+			// is that the param is populated and not the literal value.
+			expect(parsed).toMatch(/[?&]client_version=[^&]+/);
 		});
 
 		it("should include a 256-bit hex state nonce on the login URL (RFC 6749 §10.12)", async () => {
