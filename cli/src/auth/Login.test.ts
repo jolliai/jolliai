@@ -741,6 +741,11 @@ describe("Login", () => {
 			expect(openedUrl).toContain("https://app.jolli.ai/login?");
 			expect(openedUrl).toContain("generate_api_key=true");
 			expect(openedUrl).toContain("client=cli");
+			// client_version pairs with client=cli so server-side min-version
+			// gating can run at sign-in. Test runs under tsx without
+			// __PKG_VERSION__ defined, so the fallback "dev" reaches the URL;
+			// what matters is that the param is populated.
+			expect(openedUrl).toMatch(/[?&]client_version=[^&]+/);
 			expect(mockExchangeCliCode).toHaveBeenCalledWith(TEST_JOLLI_URL, "browser-code");
 			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "browser-token" });
 		});

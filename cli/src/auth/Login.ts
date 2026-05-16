@@ -7,6 +7,8 @@
  * key) to the global config.
  */
 
+/// <reference path="../Globals.d.ts" />
+
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
@@ -15,6 +17,17 @@ import { loadConfig } from "../core/SessionTracker.js";
 import { saveAuthCredentials } from "./AuthConfig.js";
 import { exchangeCliCode } from "./CliExchange.js";
 import { getDeviceLabel } from "./DeviceLabel.js";
+
+/**
+ * Surface version sent on the login URL as `client_version`. Pairs with
+ * `client=cli` so the server can gate sign-in (and downstream auto-prompts)
+ * on the same min-version policy applied to subsequent `x-jolli-client`
+ * HTTP requests. Build-time `__PKG_VERSION__` is the `cli/package.json`
+ * version in the standalone CLI bundle and falls back to `"dev"` under
+ * tsx / tests, matching the convention in `core/LlmClient.ts`.
+ */
+/* v8 ignore next -- compile-time ternary: always "dev" in tests, always __PKG_VERSION__ in build */
+const CLIENT_VERSION = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
 
 /**
  * Opens the browser to `${jolliUrl}/login` with a CLI callback URL, waits for
@@ -48,10 +61,12 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 					const callbackUrl = `http://127.0.0.1:${actualPort}/callback`;
 
 					// `client=cli` always identifies the originating surface to the
-					// server (telemetry, surface-aware behavior). `generate_api_key=true`
+					// server (telemetry, surface-aware behavior). `client_version`
+					// pairs with it so server-side min-version gating can run at
+					// sign-in, not only on later API calls. `generate_api_key=true`
 					// is independent: only asked for when there's no existing key.
 					const config = await loadConfig();
-					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}&client=cli`;
+					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}&client=cli&client_version=${encodeURIComponent(CLIENT_VERSION)}`;
 					if (!config.jolliApiKey) {
 						loginUrl += "&generate_api_key=true";
 						// `device_name` scopes the server's per-user idempotency key so

@@ -93,9 +93,18 @@ object JolliAuthService {
             SecureRandom().nextBytes(stateBytes)
             val state = stateBytes.joinToString("") { "%02x".format(it) }
             val callbackUrl = "http://localhost:$port/callback?state=$state"
-            val encodedCallback = java.net.URLEncoder.encode(callbackUrl, Charsets.UTF_8)
-            val loginUrl = "$jolliUrl/login?cli_callback=$encodedCallback" +
-                "&generate_api_key=true&client=intellij"
+            // Only ask the server to mint a fresh Jolli API key when the user
+            // doesn't already have one — otherwise sign-in would overwrite a
+            // manually configured key (and a subsequent sign-out would then
+            // delete it). Mirrors the conditional in browserLogin() / VS Code
+            // openSignInPage().
+            val existingApiKey = SessionTracker.loadConfig().jolliApiKey
+            val loginUrl = buildLoginUrl(
+                jolliUrl = jolliUrl,
+                callbackUrl = callbackUrl,
+                clientVersion = JolliApiClient.pluginVersion,
+                generateApiKey = existingApiKey.isNullOrBlank(),
+            )
             log.info("Login URL: %s", loginUrl)
 
             httpServer.createContext("/callback") { exchange ->
@@ -217,6 +226,44 @@ object JolliAuthService {
         server = null
         serverExecutor?.shutdownNow()
         serverExecutor = null
+    }
+
+    /**
+     * Builds the OAuth launch URL. `client=intellij` identifies the originating
+     * surface; `client_version` pairs with it so the server can attribute the
+     * resulting `signup_source` / `signup_client_version` and apply per-surface
+     * min-version gating at sign-in, not only on later `x-jolli-client` HTTP
+     * requests. Mirrors the CLI / VS Code wire shape — query params are in the
+     * same order across all three surfaces (`cli_callback`, `state`*, `client`,
+     * `client_version`, `generate_api_key`) so the URL reads identically modulo
+     * the surface label.
+     *
+     * (*) IntelliJ omits a top-level `state=` param because the CSRF nonce is
+     *     embedded inside the callback URL itself; the other params still
+     *     align positionally.
+     *
+     * Defensive URL-encoding: normal semver and the `"0.0.0"` fallback are
+     * URL-safe, but a pre-release tag with `+` or whitespace would otherwise
+     * be lost. The `"0.0.0"` from `JolliApiClient.pluginVersion` is a
+     * deliberately gate-failing sentinel — a missing classpath resource trips
+     * the server's min-version check loudly instead of attributing a real
+     * sign-in to a misleading version. The TypeScript ports use `"dev"`
+     * instead because their bundler injects `__PKG_VERSION__` at build time;
+     * a missing constant there means a tsx/test run (a benign developer
+     * build), not a packaging error.
+     */
+    internal fun buildLoginUrl(
+        jolliUrl: String,
+        callbackUrl: String,
+        clientVersion: String,
+        generateApiKey: Boolean,
+    ): String {
+        val encodedCallback = java.net.URLEncoder.encode(callbackUrl, Charsets.UTF_8)
+        val encodedVersion = java.net.URLEncoder.encode(clientVersion, Charsets.UTF_8)
+        val generateKeyParam = if (generateApiKey) "&generate_api_key=true" else ""
+        return "$jolliUrl/login?cli_callback=$encodedCallback" +
+            "&client=intellij&client_version=$encodedVersion" +
+            generateKeyParam
     }
 
     internal fun parseQuery(query: String): Map<String, String> {

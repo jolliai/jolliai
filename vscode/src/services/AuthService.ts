@@ -11,6 +11,8 @@
  * Display info (site URL, tenant) is derived from the API key metadata.
  */
 
+/// <reference path="../../../cli/src/Globals.d.ts" />
+
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as vscode from "vscode";
 import {
@@ -24,6 +26,19 @@ import { loadConfig } from "../../../cli/src/core/SessionTracker.js";
 import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
 import { log } from "../util/Logger.js";
 import { EXTENSION_ID, resolveUriScheme } from "../util/UriSchemeResolver.js";
+
+/**
+ * Surface version sent on the login URL as `client_version`. Pairs with
+ * `client=vscode` so the server can gate sign-in on the same min-version
+ * policy applied to subsequent `x-jolli-client` HTTP requests. Build-time
+ * `__PKG_VERSION__` is the `vscode/package.json` version (the surface the
+ * user installed and would upgrade), not the inlined CLI package version,
+ * matching the convention in `core/LlmClient.ts`. Falls back to `"dev"`
+ * under tsx / tests.
+ */
+/* v8 ignore next -- compile-time ternary: always "dev" in tests, always __PKG_VERSION__ in build */
+const CLIENT_VERSION =
+	typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
 
 /** VSCode URI callback path for OAuth redirects */
 const AUTH_CALLBACK_PATH = "/auth-callback";
@@ -281,7 +296,11 @@ export class AuthService {
 		// a friendly error dialog instead of an unhandled command exception.
 		let loginUrl: string;
 		try {
-			loginUrl = `${getJolliUrl()}/login?cli_callback=${encodeURIComponent(callbackUri)}&state=${state}${generateKeyParam}${deviceLabelParam}&client=vscode`;
+			// Param order matches CLI / IntelliJ:
+			// cli_callback → state → client → client_version → generate_api_key → device_name.
+			// A pinned ordering keeps the three surfaces visually comparable in
+			// captures / logs and protects against silent drift on isolated edits.
+			loginUrl = `${getJolliUrl()}/login?cli_callback=${encodeURIComponent(callbackUri)}&state=${state}&client=vscode&client_version=${encodeURIComponent(CLIENT_VERSION)}${generateKeyParam}${deviceLabelParam}`;
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			log.error("AuthService", "getJolliUrl rejected: %s", message);

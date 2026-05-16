@@ -56,6 +56,70 @@ class JolliAuthServiceTest {
         result["key"] shouldBe "second"
     }
 
+    // --- buildLoginUrl tests ---
+
+    @Test
+    fun `buildLoginUrl pairs client with client_version and orders params consistently`() {
+        // client=intellij + client_version is what the backend reads via
+        // useCaptureCliCallback to populate signup_source /
+        // signup_client_version. Mirrors the CLI / VS Code login URL shape —
+        // keep these params in lockstep across all three surfaces.
+        val url = JolliAuthService.buildLoginUrl(
+            jolliUrl = "https://app.jolli.ai",
+            callbackUrl = "http://localhost:54321/callback?state=abc",
+            clientVersion = "1.4.2",
+            generateApiKey = true,
+        )
+        url shouldContain "https://app.jolli.ai/login?cli_callback="
+        url shouldContain "client=intellij"
+        url shouldContain "client_version=1.4.2"
+        url shouldContain "generate_api_key=true"
+        // Callback must be percent-encoded so the `?state=` inside doesn't
+        // collide with the outer query string's `&`.
+        url shouldContain "http%3A%2F%2Flocalhost%3A54321%2Fcallback%3Fstate%3Dabc"
+        // Param order should match CLI / VS Code:
+        // cli_callback → client → client_version → generate_api_key. A pinned
+        // ordering keeps the three surfaces' URLs visually comparable in
+        // captures / logs and protects against silent drift when one surface
+        // is refactored in isolation.
+        val clientIdx = url.indexOf("client=intellij")
+        val versionIdx = url.indexOf("client_version=")
+        val generateIdx = url.indexOf("generate_api_key=")
+        (clientIdx < versionIdx) shouldBe true
+        (versionIdx < generateIdx) shouldBe true
+    }
+
+    @Test
+    fun `buildLoginUrl omits generate_api_key when caller flags an existing key`() {
+        // Preserves manually configured keys: if we always asked the server to
+        // mint one, the new key would clobber the existing entry on sign-in.
+        // Matches CLI's `if (!config.jolliApiKey) loginUrl += "&generate_api_key=true"`
+        // and VS Code's `generateKeyParam = jolliApiKey ? "" : "&generate_api_key=true"`.
+        val url = JolliAuthService.buildLoginUrl(
+            jolliUrl = "https://app.jolli.ai",
+            callbackUrl = "http://localhost:54321/callback",
+            clientVersion = "1.4.2",
+            generateApiKey = false,
+        )
+        url shouldContain "client=intellij"
+        url shouldContain "client_version=1.4.2"
+        (url.contains("generate_api_key")) shouldBe false
+    }
+
+    @Test
+    fun `buildLoginUrl URL-encodes unusual version strings defensively`() {
+        // The fallback "0.0.0" and normal semver are URL-safe, but a stray
+        // pre-release tag with "+" or whitespace would otherwise be lost.
+        // Encoding keeps the param value round-trippable on the server.
+        val url = JolliAuthService.buildLoginUrl(
+            jolliUrl = "https://app.jolli.ai",
+            callbackUrl = "http://localhost:54321/callback",
+            clientVersion = "1.4.2+build 7",
+            generateApiKey = true,
+        )
+        url shouldContain "client_version=1.4.2%2Bbuild+7"
+    }
+
     // --- getErrorMessage tests ---
 
     @Test
