@@ -9,11 +9,11 @@
  * - Folder exists + different remoteUrl → add suffix: {repoName}-2, -3, etc.
  */
 
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { createLogger } from "../Logger.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 import type { KBConfig } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
 
@@ -127,11 +127,10 @@ export function extractRepoName(projectPath: string): string {
 
 function tryGitCommand(cwd: string, args: string[]): string | null {
 	try {
-		const out = execFileSync("git", args, {
+		const out = execFileSyncHidden("git", args, {
 			cwd,
 			encoding: "utf-8",
 			timeout: 5000,
-			windowsHide: true,
 		}).trim();
 		return out || null;
 	} catch {

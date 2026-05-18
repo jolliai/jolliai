@@ -11,7 +11,6 @@
  * - Filtering: Branch-aware visibility, archive guards, ignored entries
  */
 
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -30,6 +29,7 @@ import {
 import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
 import { storePlans } from "../../../cli/src/core/SummaryStore.js";
 import type { PlanReference } from "../../../cli/src/Types.js";
+import { execFileSyncHidden } from "../../../cli/src/util/Subprocess.js";
 import type { PlanEntry, PlanInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
 
@@ -497,7 +497,7 @@ function hashFileContent(filePath: string): string {
 
 export function getCurrentBranch(cwd: string): string {
 	try {
-		return execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+		return execFileSyncHidden("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
 			cwd,
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "ignore"],

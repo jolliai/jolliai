@@ -9,7 +9,7 @@
  * throwing, so the caller can print the error and set the exit code.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawnSyncHidden } from "../util/Subprocess.js";
 import type { PagefindResult } from "./Types.js";
 
 /**
@@ -32,7 +32,7 @@ export type { PagefindResult };
 export function runPagefind(buildDir: string): PagefindResult {
 	const rawArgs = ["pagefind", "--site", "out", "--output-path", "out/_pagefind"];
 	const [cmd, args] = IS_WIN ? /* v8 ignore next */ [`npx ${rawArgs.join(" ")}`, []] : ["npx", rawArgs];
-	const result = spawnSync(cmd, args, {
+	const result = spawnSyncHidden(cmd, args, {
 		cwd: buildDir,
 		stdio: "pipe",
 		...SHELL_OPTS,

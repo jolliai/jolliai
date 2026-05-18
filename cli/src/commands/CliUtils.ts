@@ -7,11 +7,11 @@
  * interactive prompt helpers, and other common CLI helpers.
  */
 
-import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import type { AmbiguousHashError } from "../core/SummaryStore.js";
 import { compareSemver, traverseDistPaths } from "../install/DistPathResolver.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 
 /** Package version — injected by Vite at build time, falls back to "dev" when running via tsx. */
 /* v8 ignore start -- compile-time ternary: always "dev" in test/tsx, always __PKG_VERSION__ in build */
@@ -119,9 +119,8 @@ let _cachedProjectDir: string | undefined;
 export function resolveProjectDir(): string {
 	if (_cachedProjectDir !== undefined) return _cachedProjectDir;
 	try {
-		_cachedProjectDir = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+		_cachedProjectDir = execFileSyncHidden("git", ["rev-parse", "--show-toplevel"], {
 			encoding: "utf-8",
-			windowsHide: true,
 		}).trim();
 	} catch {
 		_cachedProjectDir = process.cwd();

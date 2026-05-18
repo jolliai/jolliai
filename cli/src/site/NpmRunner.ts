@@ -6,9 +6,9 @@
  * throwing, so the caller can print the error and set the exit code.
  */
 
-import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { spawnHidden, spawnSyncHidden } from "../util/Subprocess.js";
 import { engineNeedsInstall, ensureEngine, linkEngineModules } from "./EngineManager.js";
 import { createOutputFilter } from "./OutputFilter.js";
 import type { NpmRunResult } from "./Types.js";
@@ -58,7 +58,7 @@ export async function runNpmInstall(buildDir: string): Promise<NpmRunResult> {
  */
 export async function runNpmBuild(buildDir: string): Promise<NpmRunResult> {
 	const [cmd, args] = shellCmd("npm", ["run", "build"]);
-	const result = spawnSync(cmd, args, {
+	const result = spawnSyncHidden(cmd, args, {
 		cwd: buildDir,
 		stdio: "pipe",
 		...SHELL_OPTS,
@@ -107,7 +107,7 @@ function runLongProcess(rawCmd: string, rawArgs: string[], cwd: string, verbose:
 		const filter = createOutputFilter(verbose);
 		const [cmd, args] = shellCmd(rawCmd, rawArgs);
 
-		const child = spawn(cmd, args, {
+		const child = spawnHidden(cmd, args, {
 			cwd,
 			stdio: "pipe",
 			...SHELL_OPTS,

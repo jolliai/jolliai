@@ -44,6 +44,7 @@ import {
 } from "../core/SessionTracker.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ClaudeHookInput, PlanEntry, SessionInfo } from "../Types.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 import { readStdin } from "./HookUtils.js";
 
 const log = createLogger("StopHook");
@@ -618,8 +619,7 @@ function extractPlanTitle(filePath: string): string {
 /** Returns the current git branch name. */
 function getCurrentBranch(cwd: string): string {
 	try {
-		const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
-		return execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+		return execFileSyncHidden("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
 			cwd,
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "ignore"],

@@ -12,7 +12,6 @@
  *   - `--catalog`: list all recorded branches
  */
 
-import { execFileSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { type Command, Option } from "commander";
@@ -27,6 +26,7 @@ import {
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { setLogDir } from "../Logger.js";
 import type { CommitSummary } from "../Types.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 import { formatShortDate, parsePositiveInt, readStdin, resolveProjectDir, SAFE_ARGUMENT_PATTERN } from "./CliUtils.js";
 
 /**
@@ -318,10 +318,9 @@ export function registerRecallCommand(program: Command): void {
 				let branch = branchOrKeyword as string | undefined;
 				if (!branch) {
 					try {
-						branch = execFileSync("git", ["branch", "--show-current"], {
+						branch = execFileSyncHidden("git", ["branch", "--show-current"], {
 							encoding: "utf-8",
 							cwd: projectDir,
-							windowsHide: true,
 						}).trim();
 					} catch {
 						branch = undefined;

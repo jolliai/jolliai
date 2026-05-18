@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("node:child_process", () => ({
-	execSync: vi.fn(),
+vi.mock("../util/Subprocess.js", () => ({
+	execFileSyncHidden: vi.fn(),
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -34,11 +34,11 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
-import { execSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { getCommitRange, getHeadHash, getLastReflogAction, isAncestor, readOrigHead } from "../core/GitOps.js";
 import { loadSquashPending, saveSquashPending } from "../core/SessionTracker.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 import {
 	detectCommitOperation,
 	detectResetSquash,
@@ -136,19 +136,19 @@ describe("GitOperationDetector", () => {
 
 	describe("readLastReflogSubject", () => {
 		it("should return the trimmed reflog subject on success", () => {
-			vi.mocked(execSync).mockReturnValueOnce("commit (amend): Fix typo\n");
+			vi.mocked(execFileSyncHidden).mockReturnValueOnce("commit (amend): Fix typo\n");
 
 			const result = readLastReflogSubject("/test/repo");
 
 			expect(result).toBe("commit (amend): Fix typo");
-			expect(execSync).toHaveBeenCalledWith("git reflog -1 --format=%gs", {
+			expect(execFileSyncHidden).toHaveBeenCalledWith("git", ["reflog", "-1", "--format=%gs"], {
 				cwd: "/test/repo",
 				encoding: "utf-8",
 			});
 		});
 
-		it("should return null when execSync throws", () => {
-			vi.mocked(execSync).mockImplementationOnce(() => {
+		it("should return null when execFileSyncHidden throws", () => {
+			vi.mocked(execFileSyncHidden).mockImplementationOnce(() => {
 				throw new Error("fatal: reflog is empty");
 			});
 
@@ -219,7 +219,7 @@ describe("GitOperationDetector", () => {
 		});
 
 		it("should detect amend via reflog subject", () => {
-			vi.mocked(execSync).mockReturnValueOnce("commit (amend): Fix typo\n");
+			vi.mocked(execFileSyncHidden).mockReturnValueOnce("commit (amend): Fix typo\n");
 
 			const result = detectCommitOperation(CWD);
 
@@ -243,7 +243,7 @@ describe("GitOperationDetector", () => {
 		});
 
 		it("should fall back to 'commit' when no special signals are present", () => {
-			vi.mocked(execSync).mockReturnValueOnce("commit: Add new feature\n");
+			vi.mocked(execFileSyncHidden).mockReturnValueOnce("commit: Add new feature\n");
 
 			const result = detectCommitOperation(CWD);
 
@@ -251,7 +251,7 @@ describe("GitOperationDetector", () => {
 		});
 
 		it("should fall back to 'commit' when reflog cannot be read", () => {
-			vi.mocked(execSync).mockImplementationOnce(() => {
+			vi.mocked(execFileSyncHidden).mockImplementationOnce(() => {
 				throw new Error("fatal: reflog is empty");
 			});
 
@@ -277,7 +277,7 @@ describe("GitOperationDetector", () => {
 			vi.mocked(existsSync).mockImplementation((p) => {
 				return String(p).endsWith("squash-pending.json");
 			});
-			vi.mocked(execSync).mockReturnValueOnce("commit (amend): Fix typo\n");
+			vi.mocked(execFileSyncHidden).mockReturnValueOnce("commit (amend): Fix typo\n");
 
 			const result = detectCommitOperation(CWD);
 
@@ -460,7 +460,7 @@ describe("GitOperationDetector", () => {
 		});
 
 		it("should detect amend via reflog subject", () => {
-			vi.mocked(execSync).mockReturnValueOnce("commit (amend): fix typo\n");
+			vi.mocked(execFileSyncHidden).mockReturnValueOnce("commit (amend): fix typo\n");
 
 			const result = detectCommitOperation(CWD);
 
@@ -485,7 +485,7 @@ describe("GitOperationDetector", () => {
 
 		it("should default to commit when nothing else matches", () => {
 			// execSync returns normal commit reflog
-			vi.mocked(execSync).mockReturnValueOnce("commit: add feature\n");
+			vi.mocked(execFileSyncHidden).mockReturnValueOnce("commit: add feature\n");
 
 			const result = detectCommitOperation(CWD);
 
@@ -493,7 +493,7 @@ describe("GitOperationDetector", () => {
 		});
 
 		it("should default to commit when reflog read fails", () => {
-			vi.mocked(execSync).mockImplementationOnce(() => {
+			vi.mocked(execFileSyncHidden).mockImplementationOnce(() => {
 				throw new Error("reflog empty");
 			});
 

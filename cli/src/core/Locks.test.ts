@@ -11,10 +11,11 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 	return { ...original };
 });
 
-// Same trick for node:child_process — needed by the fallback-path test, which
-// forces `git rev-parse` to fail to exercise the per-worktree fallback.
-vi.mock("node:child_process", async (importOriginal) => {
-	const original = await importOriginal<typeof import("node:child_process")>();
+// Same trick for the Subprocess wrapper — needed by the fallback-path test,
+// which forces `git rev-parse` to fail to exercise the per-worktree fallback.
+// Locks.ts calls `Subprocess.execFileAsyncHidden`, so we spy on this module.
+vi.mock("../util/Subprocess.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../util/Subprocess.js")>();
 	return { ...original };
 });
 
@@ -378,18 +379,15 @@ describe("Locks", () => {
 		});
 
 		it("falls back to <cwd>/.jolli/jollimemory/ when git rev-parse fails", async () => {
-			// Force the resolver into the catch path by making `execFile` throw.
-			// Tests run with `mkdtemp` so the cache hasn't seen tempDir yet — but
-			// reset to be safe in case a previous it-block populated it.
+			// Force the resolver into the catch path by making the Subprocess
+			// wrapper reject. Tests run with `mkdtemp` so the cache hasn't seen
+			// tempDir yet — but reset to be safe in case a previous it-block
+			// populated it.
 			__resetSharedLockDirCache();
-			const childProcess = await import("node:child_process");
-			const execSpy = vi.spyOn(childProcess, "execFile").mockImplementation(
-				// @ts-expect-error -- vi.spyOn signature for overloaded execFile is awkward; the runtime call shape matches what the resolver invokes
-				(_file: string, _args: ReadonlyArray<string>, _opts: unknown, cb: (err: Error) => void) => {
-					cb(new Error("simulated: git not found"));
-					return {} as unknown;
-				},
-			);
+			const Subprocess = await import("../util/Subprocess.js");
+			const execSpy = vi
+				.spyOn(Subprocess, "execFileAsyncHidden")
+				.mockRejectedValue(new Error("simulated: git not found"));
 
 			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
 			const fallback = join(tempDir, ".jolli", "jollimemory", ORPHAN_WRITE_LOCK_FILE);
@@ -402,8 +400,8 @@ describe("Locks", () => {
 
 		it("caches the resolved path so repeated polls don't spawn git on every iteration", async () => {
 			__resetSharedLockDirCache();
-			const childProcess = await import("node:child_process");
-			const execSpy = vi.spyOn(childProcess, "execFile");
+			const Subprocess = await import("../util/Subprocess.js");
+			const execSpy = vi.spyOn(Subprocess, "execFileAsyncHidden");
 
 			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
 			await releaseOrphanWriteLock(tempDir);

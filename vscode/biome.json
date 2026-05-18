@@ -1,0 +1,40 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.2.6/schema.json",
+	"files": {
+		"includes": ["src/**"]
+	},
+	"assist": {
+		"enabled": false
+	},
+	"formatter": {
+		"enabled": false
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"style": {
+				"noRestrictedImports": {
+					"level": "error",
+					"options": {
+						"paths": {
+							"node:child_process": "Use cli/src/util/Subprocess.ts wrappers (execFileSyncHidden, execFileAsyncHidden, spawnHidden, spawnSyncHidden, execSyncHidden) instead — they inject windowsHide:true so child processes do not flash a console window on Windows. *.test.ts files are exempt via overrides."
+						}
+					}
+				}
+			}
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["**/*.test.ts"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": "off"
+					}
+				}
+			}
+		}
+	]
+}

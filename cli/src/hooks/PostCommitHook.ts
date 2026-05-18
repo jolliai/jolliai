@@ -10,12 +10,12 @@
  * which has the authoritative old-to-new hash mapping from git's stdin.
  */
 
-import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLogger } from "../Logger.js";
 import type { CommitSource, GitOperation } from "../Types.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 import { detectCommitOperation, isRebaseInProgress, resolveGitDir } from "./GitOperationDetector.js";
 import { launchWorker } from "./QueueWorker.js";
 
@@ -42,7 +42,7 @@ export function postCommitEntry(cwd: string): void {
 	// Read commit hash (HEAD is the just-created commit)
 	let commitHash: string;
 	try {
-		commitHash = execSync("git rev-parse HEAD", { cwd, encoding: "utf-8" }).trim();
+		commitHash = execFileSyncHidden("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf-8" }).trim();
 	} catch (err: unknown) {
 		log.error("Failed to read HEAD hash: %s", (err as Error).message);
 		return;
@@ -56,7 +56,8 @@ export function postCommitEntry(cwd: string): void {
 	let branch: string;
 	try {
 		branch =
-			execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, encoding: "utf-8" }).trim() || "HEAD";
+			execFileSyncHidden("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, encoding: "utf-8" }).trim() ||
+			"HEAD";
 	} catch (err: unknown) {
 		log.warn("Failed to read current branch: %s — proceeding without tail cleanup hint", (err as Error).message);
 		branch = "";
@@ -79,7 +80,7 @@ export function postCommitEntry(cwd: string): void {
 			// so stale files should not occur. This validation is retained as a defensive fallback.
 			// !pending.expectedParentHash is intentional backward compatibility: older squash-pending
 			// files may lack this field, and should still be treated as valid.
-			const parentHash = execSync("git rev-parse HEAD~1", { cwd, encoding: "utf-8" }).trim();
+			const parentHash = execFileSyncHidden("git", ["rev-parse", "HEAD~1"], { cwd, encoding: "utf-8" }).trim();
 			if (!pending.expectedParentHash || parentHash === pending.expectedParentHash) {
 				sourceHashes = pending.sourceHashes;
 				log.info("Squash-pending validated: %d source hashes", pending.sourceHashes.length);

@@ -31,7 +31,15 @@
 			"style": {
 				"useConst": "warn",
 				"useImportType": "warn",
-				"useNodejsImportProtocol": "warn"
+				"useNodejsImportProtocol": "warn",
+				"noRestrictedImports": {
+					"level": "error",
+					"options": {
+						"paths": {
+							"node:child_process": "Use src/util/Subprocess.ts wrappers (execFileSyncHidden, execFileAsyncHidden, spawnHidden, spawnSyncHidden, execSyncHidden) instead — they inject windowsHide:true so child processes do not flash a console window on Windows. Subprocess.ts itself and *.test.ts files are exempt via overrides."
+						}
+					}
+				}
 			},
 			"suspicious": {
 				"noExplicitAny": "error"
@@ -43,5 +51,17 @@
 			"quoteStyle": "double",
 			"semicolons": "always"
 		}
-	}
+	},
+	"overrides": [
+		{
+			"includes": ["src/util/Subprocess.ts", "**/*.test.ts"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": "off"
+					}
+				}
+			}
+		}
+	]
 }

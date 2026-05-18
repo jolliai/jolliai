@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // ─── Hoisted mocks ───────────────────────────────────────────────────────────
 
 const mocks = vi.hoisted(() => ({
-	execFileSync: vi.fn(),
+	execFileSyncHidden: vi.fn(),
 	existsSync: vi.fn(),
 	mkdirSync: vi.fn(),
 	readdirSync: vi.fn(),
@@ -21,7 +21,7 @@ const mocks = vi.hoisted(() => ({
 	buildMarkdown: vi.fn(),
 }));
 
-vi.mock("node:child_process", () => ({ execFileSync: mocks.execFileSync }));
+vi.mock("../util/Subprocess.js", () => ({ execFileSyncHidden: mocks.execFileSyncHidden }));
 vi.mock("node:fs", () => ({
 	existsSync: mocks.existsSync,
 	mkdirSync: mocks.mkdirSync,
@@ -66,7 +66,7 @@ describe("SummaryExporter", () => {
 		vi.clearAllMocks();
 		writtenFiles.clear();
 		mocks.homedir.mockReturnValue("/home/user");
-		mocks.execFileSync.mockReturnValue("/mock/project\n");
+		mocks.execFileSyncHidden.mockReturnValue("/mock/project\n");
 		mocks.existsSync.mockImplementation((p: string) => writtenFiles.has(p));
 		mocks.writeFileSync.mockImplementation((p: string) => writtenFiles.add(p));
 		mocks.readdirSync.mockReturnValue([]);
@@ -176,7 +176,7 @@ describe("SummaryExporter", () => {
 	});
 
 	it("should derive project name from git repo root", async () => {
-		mocks.execFileSync.mockReturnValue("/home/user/repos/cool-project\n");
+		mocks.execFileSyncHidden.mockReturnValue("/home/user/repos/cool-project\n");
 		mocks.listSummaries.mockResolvedValue([]);
 
 		const result = await exportSummaries({});
@@ -203,7 +203,7 @@ describe("SummaryExporter", () => {
 	});
 
 	it("should fall back to cwd basename when git command fails", async () => {
-		mocks.execFileSync.mockImplementation(() => {
+		mocks.execFileSyncHidden.mockImplementation(() => {
 			throw new Error("not a git repo");
 		});
 		mocks.listSummaries.mockResolvedValue([]);
@@ -214,7 +214,7 @@ describe("SummaryExporter", () => {
 	});
 
 	it("should fall back to process.cwd when git command fails and no cwd provided", async () => {
-		mocks.execFileSync.mockImplementation(() => {
+		mocks.execFileSyncHidden.mockImplementation(() => {
 			throw new Error("not a git repo");
 		});
 		mocks.listSummaries.mockResolvedValue([]);
