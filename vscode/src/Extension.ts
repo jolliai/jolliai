@@ -1128,6 +1128,30 @@ export function activate(context: vscode.ExtensionContext): void {
 		statusBar,
 		workspaceRoot,
 	);
+
+	// Shared resolver for the three Linear-issue webview commands. The webview
+	// may dispatch a mapKey that was archived or ignored between render and
+	// click (listLinearIssues applies the branch/ignored/archived filter), so
+	// each command re-reads the list before acting and surfaces a warning
+	// toast on miss instead of silently no-op'ing.
+	const resolveLinearIssueForCommand = async (
+		mapKey: string,
+		cmdLabel: string,
+	) => {
+		const issues = await bridge.listLinearIssues();
+		const info = issues.find((i) => i.mapKey === mapKey);
+		if (!info) {
+			log.warn(
+				"cmd",
+				`${cmdLabel}: mapKey ${mapKey} not found (likely archived or ignored after webview cached it)`,
+			);
+			vscode.window.showWarningMessage(
+				`Linear issue ${mapKey} is no longer in the active panel — it may have been archived or ignored. Refresh and try again.`,
+			);
+		}
+		return info;
+	};
+
 	context.subscriptions.push(
 		// Settings → Migrate to Memory Bank. Re-runs the orphan→folder migration
 		// into a fresh `-N`-suffixed folder, leaves the old folder's content on
@@ -1802,7 +1826,9 @@ export function activate(context: vscode.ExtensionContext): void {
 		// ── Linear issue commands ───────────────────────────────────────────────
 		// All three accept either a LinearIssueItem (from native tree) or a bare
 		// mapKey string (from webview). The mapKey is "<ticketId>" pre-archive or
-		// "<ticketId>-<shortHash>" post-archive — see plan §9.10.
+		// "<ticketId>-<shortHash>" post-archive — see plan §9.10. The webview-
+		// originated mapKey is resolved through `resolveLinearIssueForCommand`
+		// above so a stale cache hit becomes a warning toast, not a silent no-op.
 
 		vscode.commands.registerCommand(
 			"jollimemory.openLinearIssue",
@@ -1810,8 +1836,10 @@ export function activate(context: vscode.ExtensionContext): void {
 				const mapKey =
 					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.issue.mapKey;
 				log.info("cmd", `openLinearIssue: ${mapKey}`);
-				const issues = await bridge.listLinearIssues();
-				const info = issues.find((i) => i.mapKey === mapKey);
+				const info = await resolveLinearIssueForCommand(
+					mapKey,
+					"openLinearIssue",
+				);
 				if (info) await bridge.openLinearIssue(info);
 			},
 		),
@@ -1822,8 +1850,10 @@ export function activate(context: vscode.ExtensionContext): void {
 				const mapKey =
 					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.issue.mapKey;
 				log.info("cmd", `openLinearIssueMarkdown: ${mapKey}`);
-				const issues = await bridge.listLinearIssues();
-				const info = issues.find((i) => i.mapKey === mapKey);
+				const info = await resolveLinearIssueForCommand(
+					mapKey,
+					"openLinearIssueMarkdown",
+				);
 				if (info) await bridge.openLinearIssueMarkdown(info);
 			},
 		),
@@ -1834,6 +1864,14 @@ export function activate(context: vscode.ExtensionContext): void {
 				const mapKey =
 					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.issue.mapKey;
 				log.info("cmd", `ignoreLinearIssue: ${mapKey}`);
+				// Same stale-mapKey guard as openLinearIssue / openLinearIssueMarkdown:
+				// without this the LinearIssueService.setLinearIssueIgnored "entry not
+				// found → silent return" path swallowed the click with zero feedback.
+				const info = await resolveLinearIssueForCommand(
+					mapKey,
+					"ignoreLinearIssue",
+				);
+				if (!info) return;
 				await bridge.ignoreLinearIssue(mapKey);
 				await plansStore.refresh();
 			},

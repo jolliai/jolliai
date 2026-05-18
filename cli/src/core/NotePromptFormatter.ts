@@ -1,10 +1,11 @@
 /**
  * Note prompt formatter — renders active notes as the <notes> XML block for SUMMARIZE.
  *
- * Reads each note's markdown via `sourcePath`. Snippet-format notes have their
- * content directly in the file; markdown-format notes reference an external file.
- * Both render the same way: file content goes into <content>. Body lengths are
- * smaller than plans (notes are typically <2KB), so caps are tighter.
+ * Reads each note's body bytes from `entry.sourcePath` (both `snippet` and
+ * `markdown` formats — the format field only differentiates the on-disk origin
+ * and panel icon; the prompt-side read path is identical). Body lengths are
+ * smaller than plans (notes are typically <2KB), so the per-note and total
+ * caps are tighter.
  */
 
 import { readFile } from "node:fs/promises";
@@ -54,7 +55,11 @@ async function readNoteBody(entry: NoteEntry): Promise<string> {
 	try {
 		return await readFile(entry.sourcePath, "utf-8");
 	} catch (err) {
-		log.debug("Cannot read note markdown %s: %s", entry.sourcePath, (err as Error).message);
+		// log.warn (not debug): see the parallel comment in
+		// PlanPromptFormatter.readPlanBody — empty <note> body in the
+		// SUMMARIZE prompt is indistinguishable from a genuinely-empty note
+		// unless this read failure leaves a trace in debug.log.
+		log.warn("Cannot read note markdown %s: %s", entry.sourcePath, (err as Error).message);
 		return "";
 	}
 }

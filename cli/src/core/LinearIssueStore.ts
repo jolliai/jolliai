@@ -2,29 +2,29 @@
  * Linear Issue Store — local markdown IO.
  *
  * Each Linear issue surfaced via MCP is persisted as a per-issue markdown file
- * at `.jolli/jollimemory/linear-issues/<key>.md` where <key> is the current
+ * at `<jolliMemoryDir>/linear-issues/<key>.md` where <key> is the current
  * registry map key (= ticketId for uncommitted, = ticketId-<shortHash> after
- * archive — same pattern as Plans).
+ * archive — same pattern as Plans). The `<jolliMemoryDir>` path is resolved
+ * via `getJolliMemoryDir()` so worktrees (which mount the same .git into a
+ * different working tree) get their own per-project state.
  *
  * File format: YAML-style frontmatter + markdown body. Frontmatter values are
- * JSON-encoded (single-quoted from string types), which simplifies parsing
- * (every value is `JSON.parse`-able) and handles all special characters
- * without bringing in a YAML dependency.
+ * JSON-encoded (i.e. `JSON.stringify`'d strings render as double-quoted), so
+ * parsing is `JSON.parse` per line — handles all special characters without
+ * bringing in a YAML dependency.
  */
 
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createLogger } from "../Logger.js";
+import { createLogger, getJolliMemoryDir } from "../Logger.js";
 import type { LinearIssueRef } from "../Types.js";
 
 const log = createLogger("LinearIssueStore");
 
-const LINEAR_ISSUES_SUBDIR = join(".jolli", "jollimemory", "linear-issues");
-
-/** Absolute directory `<cwd>/.jolli/jollimemory/linear-issues`. */
+/** Absolute directory `<jolliMemoryDir>/linear-issues`. */
 export function linearIssueDir(cwd: string): string {
-	return join(cwd, LINEAR_ISSUES_SUBDIR);
+	return join(getJolliMemoryDir(cwd), "linear-issues");
 }
 
 /** Absolute path to the per-issue markdown file by map key. */
@@ -151,6 +151,16 @@ function renderMarkdown(ref: LinearIssueRef): string {
 	return `${lines.join("\n")}\n`;
 }
 
+/**
+ * LOCKSTEP: a second YAML-frontmatter parser lives in
+ * `vscode/src/core/LinearIssueService.ts::readFrontmatter`. The two read the
+ * same on-disk format from different sides (CLI archive readback vs panel
+ * render enrichment) and MUST agree on field shapes — same precedent as
+ * `parseJolliApiKey` (see CLAUDE.md). If you change the frontmatter writer
+ * `renderMarkdown` below, update both parsers in the same commit. Extracting
+ * a shared helper is tracked as a follow-up; until then, this comment is
+ * the only guardrail.
+ */
 function parseMarkdown(content: string): LinearIssueRef | null {
 	const lines = content.split("\n");
 	if (lines[0]?.trim() !== "---") return null;

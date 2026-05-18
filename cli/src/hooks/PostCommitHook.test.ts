@@ -226,6 +226,7 @@ import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
+	associateLinearIssueWithCommit,
 	associateNoteWithCommit,
 	associatePlanWithCommit,
 	deleteQueueEntry,
@@ -1115,6 +1116,72 @@ describe("queue-driven Worker", () => {
 			expect(getCommitInfo).not.toHaveBeenCalled();
 		});
 
+		it("re-associates plans, notes, and linearIssues when the source summary carries them", async () => {
+			// Coverage gap: squash and amend already had reassociateMetadata
+			// tests for linearIssues, but rebase-pick goes through its own
+			// handleRebasePickFromQueue path. Without this test, a future
+			// regression that dropped reassociateMetadata from rebase-pick
+			// (or stopped iterating linearIssues there) would silently leave
+			// the archived registry entries pointing at the old commit hash.
+			const rebasePickOp = {
+				op: {
+					type: "rebase-pick" as const,
+					commitHash: "newHash",
+					sourceHashes: ["oldHash"],
+					createdAt: "2026-02-19T00:00:00.000Z",
+				},
+				filePath: "/test/project/.jolli/jollimemory/git-op-queue/1234567890-newHash.json",
+			};
+			vi.mocked(dequeueAllGitOperations).mockResolvedValueOnce([rebasePickOp]).mockResolvedValue([]);
+			vi.mocked(getSummary).mockResolvedValue({
+				...createMockSummary("oldHash"),
+				plans: [
+					{
+						slug: "plan-old",
+						title: "Old plan",
+						editCount: 1,
+						addedAt: "2026-02-19T00:00:00Z",
+						updatedAt: "2026-02-19T00:00:00Z",
+					},
+				],
+				notes: [
+					{
+						id: "note-old",
+						title: "Old note",
+						format: "markdown" as const,
+						addedAt: "2026-02-19T00:00:00Z",
+						updatedAt: "2026-02-19T00:00:00Z",
+					},
+				],
+				linearIssues: [
+					{
+						archivedKey: "PROJ-1528-oldHash",
+						ticketId: "PROJ-1528",
+						title: "Old Linear issue",
+						url: "https://linear.app/x/PROJ-1528",
+						referencedAt: "2026-02-19T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			});
+			vi.mocked(getCommitInfo).mockResolvedValue({
+				hash: "newHash",
+				message: "Rebased commit",
+				author: "John",
+				date: "2026-02-19",
+			});
+
+			await runWorker("/test/project");
+
+			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
+			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
+			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
+				"PROJ-1528-oldHash",
+				"newHash",
+				"/test/project",
+			);
+		});
+
 		it("forwards commitSource from the queue entry into migrateOneToOne", async () => {
 			// The queue entry's commitSource (e.g. "plugin") must reach the
 			// migrated summary; squash and amend already do this — rebase-pick
@@ -1703,10 +1770,10 @@ describe("queue-driven Worker", () => {
 		});
 	});
 
-	// ─── reassociateMetadata coverage (plans + notes on squash) ──────────────
+	// ─── reassociateMetadata coverage (plans + notes + linearIssues on squash) ─
 
 	describe("reassociateMetadata in squash", () => {
-		it("re-associates plans and notes from source summaries on squash", async () => {
+		it("re-associates plans, notes, and linearIssues from source summaries on squash", async () => {
 			const squashOp = {
 				op: {
 					type: "squash" as const,
@@ -1724,7 +1791,12 @@ describe("queue-driven Worker", () => {
 				author: "John",
 				date: "2026-02-19",
 			});
-			// Old summary has both plans and notes
+			// Old summary has plans, notes, and linearIssues — the squash must
+			// re-associate all three categories under the new commit hash.
+			// Without the linearIssues branch in reassociateMetadata, the
+			// archived ticket entry's commitHash would still point at oldHash1
+			// while the summary on newHash carried the same archivedKey —
+			// silently orphaning the registry pointer.
 			vi.mocked(getSummary).mockResolvedValue({
 				...createMockSummary("oldHash1"),
 				plans: [
@@ -1745,6 +1817,16 @@ describe("queue-driven Worker", () => {
 						updatedAt: "2026-02-19T00:00:00Z",
 					},
 				],
+				linearIssues: [
+					{
+						archivedKey: "PROJ-1528-oldHash1",
+						ticketId: "PROJ-1528",
+						title: "Old Linear issue",
+						url: "https://linear.app/x/PROJ-1528",
+						referencedAt: "2026-02-19T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
 			});
 			vi.mocked(mergeManyToOne).mockResolvedValue({ orphanedDocIds: [] });
 
@@ -1752,10 +1834,15 @@ describe("queue-driven Worker", () => {
 
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
 			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
+			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
+				"PROJ-1528-oldHash1",
+				"newHash",
+				"/test/project",
+			);
 		});
 	});
 
-	// ─── reassociateMetadata coverage (plans + notes on amend, all 3 paths) ──
+	// ─── reassociateMetadata coverage (plans + notes + linearIssues on amend, 3 paths) ─
 
 	describe("reassociateMetadata in amend", () => {
 		const AMEND_OP = {
@@ -1790,6 +1877,16 @@ describe("queue-driven Worker", () => {
 						updatedAt: "2026-02-19T00:00:00Z",
 					},
 				],
+				linearIssues: [
+					{
+						archivedKey: "PROJ-1528-oldHash",
+						ticketId: "PROJ-1528",
+						title: "Old Linear issue",
+						url: "https://linear.app/x/PROJ-1528",
+						referencedAt: "2026-02-19T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
 			};
 		}
 
@@ -1821,6 +1918,11 @@ describe("queue-driven Worker", () => {
 			expect(storeSummary).toHaveBeenCalled();
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
 			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
+			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
+				"PROJ-1528-oldHash",
+				"newHash",
+				"/test/project",
+			);
 		});
 
 		it("re-associates plans and notes on short-circuit B (1 LLM, empty delta)", async () => {
@@ -1850,6 +1952,11 @@ describe("queue-driven Worker", () => {
 			expect(storeSummary).toHaveBeenCalled();
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
 			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
+			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
+				"PROJ-1528-oldHash",
+				"newHash",
+				"/test/project",
+			);
 		});
 
 		it("re-associates plans and notes on full path (2 LLM, non-empty delta)", async () => {
@@ -1874,6 +1981,11 @@ describe("queue-driven Worker", () => {
 			expect(storeSummary).toHaveBeenCalled();
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
 			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
+			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
+				"PROJ-1528-oldHash",
+				"newHash",
+				"/test/project",
+			);
 		});
 	});
 

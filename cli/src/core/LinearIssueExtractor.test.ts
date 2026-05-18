@@ -720,6 +720,41 @@ describe("extractLinearIssuesFromTranscript", () => {
 		expect(issues).toHaveLength(1);
 	});
 
+	it("drops a tool_result whose payload text is not valid JSON without leaving the pending entry orphaned", async () => {
+		// Regression for the C2 bug: previously `pending.delete()` ran BEFORE
+		// `JSON.parse(payloadText)`, so a corrupted payload silently lost the
+		// pending entry. Now the delete runs only after walkPayload completes —
+		// or, on parse failure, the catch branch deletes it explicitly so the
+		// pending map doesn't grow unbounded across retries.
+		const linearUse = toolUseLine({
+			toolUseId: "toolu_bad",
+			toolName: "mcp__linear__get_issue",
+			timestamp: "2026-05-14T06:00:00.000Z",
+		});
+		const malformedPayload = toolResultLine({
+			toolUseId: "toolu_bad",
+			timestamp: "2026-05-14T06:00:00.500Z",
+			payload: "not-json-{",
+		});
+		// A second, well-formed pair on a different tool_use_id still produces
+		// an issue, proving the malformed payload didn't poison the scan state.
+		const linearUse2 = toolUseLine({
+			toolUseId: "toolu_good",
+			toolName: "mcp__linear__get_issue",
+			timestamp: "2026-05-14T06:00:01.000Z",
+		});
+		const goodPayload = toolResultLine({
+			toolUseId: "toolu_good",
+			timestamp: "2026-05-14T06:00:01.500Z",
+			payload: SAMPLE_ISSUE_PAYLOAD,
+		});
+		mockReadFile.mockResolvedValue(makeJsonl(linearUse, malformedPayload, linearUse2, goodPayload));
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		expect(issues).toHaveLength(1);
+		expect(issues[0].ticketId).toBe("PROJ-1528");
+	});
+
 	it("ignores a tool_use line whose role is reported as something other than assistant or user", async () => {
 		const systemLine = JSON.stringify({
 			message: {

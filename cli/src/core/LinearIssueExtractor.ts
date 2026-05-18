@@ -13,9 +13,11 @@
  *   2. On match, parse the JSON and dispatch by `message.role`:
  *        - assistant + tool_use named mcp__linear__* → record id in pending map
  *        - user + tool_result with tool_use_id in pending map → extract payload
- *      The role dispatch — not just the substring — is what makes the algorithm
- *      robust against the §3.6 edge case where a tool_result's description
- *      payload happens to contain the string `"name":"mcp__linear__..."`.
+ *      The role dispatch — not just the substring — is what keeps the algorithm
+ *      robust against the edge case where a Linear tool_result's description /
+ *      comment payload itself contains the substring `"name":"mcp__linear__..."`:
+ *      a substring-only match would mis-classify the user-role tool_result line
+ *      as an assistant-role tool_use and pollute the pending map.
  *   3. Walk the parsed payload (object / array / wrapped {items|issues|...})
  *      and collect every object that matches the issue shape filter.
  *
@@ -27,9 +29,16 @@
  * Dedupe: same ticketId → keep the entry with the latest `referencedAt`.
  * If timestamps tie, the later-seen entry wins (preserves get→list resolution).
  *
- * Defense-in-depth: every JSON.parse / payload walk is wrapped in try/catch.
- * Failure on any single line is silently logged and the rest of the file is
- * scanned. Missing transcript file returns an empty result, not an error.
+ * Defense-in-depth: every JSON.parse / payload walk is wrapped in try/catch
+ * and the catch emits log.warn with the line index or tool_use_id plus a
+ * short payload preview, so a corrupted transcript line is debuggable in
+ * debug.log instead of dropping silently. Pending tool_use entries are
+ * cleared from the pending map at exactly one of two points: (a) after
+ * walkPayload completes successfully, or (b) inside the payload-parse catch
+ * (so a single bad payload doesn't grow the pending map across retries).
+ * The delete is NEVER skipped on failure — that was the prior bug where
+ * pending entries leaked across StopHook invocations. Missing transcript
+ * file returns an empty result, not an error.
  */
 
 import { readFile } from "node:fs/promises";
@@ -103,7 +112,14 @@ export async function extractLinearIssuesFromTranscript(
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(line);
-		} catch {
+		} catch (err) {
+			log.warn(
+				"Skipping malformed transcript line %d in %s: %s | preview=%s",
+				i,
+				transcriptPath,
+				(err as Error).message,
+				line.slice(0, 200),
+			);
 			continue;
 		}
 
@@ -189,18 +205,34 @@ function collectToolResults(
 		/* v8 ignore stop */
 		const pendingEntry = pending.get(b.tool_use_id);
 		if (!pendingEntry) continue;
-		pending.delete(b.tool_use_id);
 		const payloadText = extractResultPayloadText(b.content);
 		/* v8 ignore start -- defensive against malformed payload (no text content); live transcripts always include payload text. */
-		if (payloadText === undefined) continue;
+		if (payloadText === undefined) {
+			pending.delete(b.tool_use_id);
+			continue;
+		}
 		/* v8 ignore stop */
 		let parsedPayload: unknown;
 		try {
 			parsedPayload = JSON.parse(payloadText);
-		} catch {
+		} catch (err) {
+			log.warn(
+				"Dropping Linear tool_result for %s (%s): payload JSON.parse failed: %s | preview=%s",
+				b.tool_use_id,
+				pendingEntry.toolName,
+				(err as Error).message,
+				payloadText.slice(0, 200),
+			);
+			pending.delete(b.tool_use_id);
 			continue;
 		}
+		// Delete only after walkPayload completes so a thrown payload walk
+		// leaves the pending entry available for retry on a later line that
+		// references the same tool_use_id (defensive — walkPayload itself is
+		// total today, but the delete-before-walk order silently lost the
+		// ticket reference for any future failure mode).
 		walkPayload(parsedPayload, pendingEntry.toolName, timestamp ?? "", collected);
+		pending.delete(b.tool_use_id);
 	}
 }
 

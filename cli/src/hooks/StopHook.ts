@@ -15,6 +15,11 @@
  *   2. Incrementally scans the transcript for plan file references and updates
  *      .jolli/jollimemory/plans.json — so the VSCode PLANS panel can display them
  *      without expensive full-transcript scans.
+ *   3. Incrementally scans the transcript for Linear MCP issue references
+ *      (mcp__linear__* tool_use → tool_result pairs), writes per-issue
+ *      markdown to .jolli/jollimemory/linear-issues/, and upserts the
+ *      linearIssues registry inside plans.json so the same PLANS panel can
+ *      show them alongside plans and notes.
  *
  * This hook runs with { "async": true } so it doesn't block Claude Code.
  */
@@ -364,14 +369,33 @@ async function discoverLinearIssuesFromTranscript(sessionInfo: SessionInfo, cwd:
 	}
 
 	const branch = getCurrentBranch(cwd);
+	const upserted: string[] = [];
+	const failed: string[] = [];
 	for (const ref of issues) {
-		const { sourcePath, contentHash } = await writeLinearIssueMarkdown(ref, cwd);
-		await upsertLinearIssueEntry(ref, sourcePath, contentHash, branch, cwd);
+		// Per-iteration try/catch: a single bad ticket (e.g. permission error
+		// writing markdown, or a transient plans.json write contention) must
+		// not abort the batch — otherwise subsequent refs are lost AND the
+		// cursor save below is skipped, so the next StopHook re-processes the
+		// same refs and hits the same failure in a loop.
+		try {
+			const { sourcePath, contentHash } = await writeLinearIssueMarkdown(ref, cwd);
+			await upsertLinearIssueEntry(ref, sourcePath, contentHash, branch, cwd);
+			upserted.push(ref.ticketId);
+		} catch (err) {
+			log.error(
+				"Linear issue discovery: failed to persist %s: %s — continuing with rest of batch",
+				ref.ticketId,
+				(err as Error).message,
+			);
+			failed.push(ref.ticketId);
+		}
 	}
 	log.info(
-		"Linear issue discovery: upserted %d ref(s): [%s]",
+		"Linear issue discovery: upserted %d of %d ref(s): [%s]%s",
+		upserted.length,
 		issues.length,
-		issues.map((i) => i.ticketId).join(", "),
+		upserted.join(", "),
+		failed.length > 0 ? ` (failed: [${failed.join(", ")}])` : "",
 	);
 
 	await saveCursor(

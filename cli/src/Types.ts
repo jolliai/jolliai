@@ -471,21 +471,33 @@ export interface LinearIssueRef {
 /**
  * Persisted Linear issue entry in plans.json registry (linearIssues section).
  *
- * Map key follows the Plans archive pattern (QueueWorker.ts:490-518):
+ * Map key follows the Plans archive pattern (see `associatePlansWithCommit`
+ * in QueueWorker.ts):
  * - Uncommitted: key = ticketId (e.g. "PROJ-1234")
  * - After archive: TWO entries exist:
  *   - key = ticketId       → guard entry (contentHashAtCommit set)
  *   - key = ticketId-<shortHash> → archived snapshot (no contentHashAtCommit)
  *
- * Panel filters out both: guard hidden when hash matches; snapshot hidden when
- * commitHash set and contentHashAtCommit absent.
+ * Panel filter (LinearIssueService.toPanelInfo):
+ *   - guard entry (contentHashAtCommit set) → always hidden
+ *   - snapshot entry (commitHash set)       → always hidden
+ *   - ignored entry                         → always hidden
+ *   - branch mismatch                       → hidden
+ * Note: the guard's contentHashAtCommit hash is consulted by
+ * SessionTracker.upsertLinearIssueEntry (to decide whether to re-surface a
+ * changed payload), NOT by the panel filter — the filter just sees "guard
+ * set, hide". Don't confuse the two.
  */
 export interface LinearIssueEntry {
 	/** Stable Linear ticket id, never changes across archive */
 	readonly ticketId: string;
-	/** Cached for fast panel render without reading the markdown file */
+	/**
+	 * Title cached at upsert/archive time. The panel render still re-reads
+	 * the markdown frontmatter every refresh (for status/priority/labels),
+	 * so this cache only avoids one extra read when title alone is needed.
+	 */
 	readonly title: string;
-	/** Cached for "Open in Linear" command without reading the markdown file */
+	/** URL cached at upsert/archive time — used by "Open in Linear" without reading markdown. */
 	readonly url: string;
 	/** Absolute path to the markdown file (mirrors Plans/Notes sourcePath convention) */
 	readonly sourcePath: string;

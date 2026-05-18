@@ -56,7 +56,11 @@ async function readPlanBody(sourcePath: string): Promise<string> {
 	try {
 		return await readFile(sourcePath, "utf-8");
 	} catch (err) {
-		log.debug("Cannot read plan markdown %s: %s", sourcePath, (err as Error).message);
+		// log.warn (not debug): the SUMMARIZE prompt receives an empty <plan>
+		// body when this fires, which the LLM can't distinguish from a
+		// genuinely-empty plan. Without this signal in debug.log a
+		// permissions/deletion bug surfaces only as a degraded summary.
+		log.warn("Cannot read plan markdown %s: %s", sourcePath, (err as Error).message);
 		return "";
 	}
 }
