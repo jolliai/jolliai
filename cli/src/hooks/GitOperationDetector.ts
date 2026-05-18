@@ -33,12 +33,12 @@
  *   "cherry-pick: <message>"       — cherry-pick
  */
 
-import { execSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { getCommitRange, getHeadHash, getLastReflogAction, isAncestor, readOrigHead } from "../core/GitOps.js";
 import { loadSquashPending, saveSquashPending } from "../core/SessionTracker.js";
 import { createLogger } from "../Logger.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 
 const log = createLogger("GitOperationDetector");
 
@@ -97,7 +97,7 @@ export function isRebaseInProgress(cwd: string): boolean {
  */
 export function readLastReflogSubject(cwd: string): string | null {
 	try {
-		return execSync("git reflog -1 --format=%gs", { cwd, encoding: "utf-8" }).trim();
+		return execFileSyncHidden("git", ["reflog", "-1", "--format=%gs"], { cwd, encoding: "utf-8" }).trim();
 	} catch {
 		log.debug("Failed to read git reflog");
 		return null;

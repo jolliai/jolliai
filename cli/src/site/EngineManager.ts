@@ -120,11 +120,11 @@ export async function ensureEngine(): Promise<NpmRunResult> {
 		// Run npm install — on Windows, npm is a .cmd script that requires
 		// shell: true since Node 22.5+ (CVE-2024-27980). Pass the full command
 		// as a single string to avoid the DEP0190 warning about shell + args.
-		const { spawnSync } = await import("node:child_process");
+		const { spawnSyncHidden } = await import("../util/Subprocess.js");
 		const isWin = process.platform === "win32";
 		const shellOpts = isWin ? /* v8 ignore next */ ({ shell: true } as const) : {};
 		const [cmd, args] = isWin ? /* v8 ignore next */ ["npm install", []] : ["npm", ["install"]];
-		const result = spawnSync(cmd, args, {
+		const result = spawnSyncHidden(cmd, args, {
 			cwd: engineDir,
 			stdio: "pipe",
 			...shellOpts,

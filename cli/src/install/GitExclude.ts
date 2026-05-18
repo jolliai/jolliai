@@ -18,13 +18,11 @@
  * themselves still get written; the user just may see them in `git status`.
  */
 
-import { execFile } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, posix as posixPath, win32 as win32Path } from "node:path";
-import { promisify } from "node:util";
 import { createLogger } from "../Logger.js";
+import { execFileAsyncHidden } from "../util/Subprocess.js";
 
-const execFileAsync = promisify(execFile);
 const log = createLogger("GitExclude");
 
 /**
@@ -73,9 +71,8 @@ export function normalizeGitPathOutput(relOrAbs: string, projectDir: string): st
 
 export async function resolveGitExcludePath(projectDir: string): Promise<string | null> {
 	try {
-		const { stdout } = await execFileAsync("git", ["rev-parse", "--git-path", "info/exclude"], {
+		const { stdout } = await execFileAsyncHidden("git", ["rev-parse", "--git-path", "info/exclude"], {
 			cwd: projectDir,
-			windowsHide: true,
 		});
 		const relOrAbs = stdout.trim();
 		/* v8 ignore start -- defensive: git rev-parse always emits a non-empty path on success */

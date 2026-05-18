@@ -1068,7 +1068,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["add", "--", "a.ts", "b.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenCalledTimes(1);
@@ -1108,7 +1108,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["add", "--", "a.ts", "b.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenCalledTimes(1);
@@ -1124,7 +1124,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["rm", "--cached", "--ignore-unmatch", "--", "a.ts", "b.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenCalledTimes(1);
@@ -1144,14 +1144,14 @@ describe("JolliMemoryBridge", () => {
 				1,
 				"git",
 				["add", "--", "a.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenNthCalledWith(
 				2,
 				"git",
 				["rm", "--cached", "--ignore-unmatch", "--", "b.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1178,14 +1178,14 @@ describe("JolliMemoryBridge", () => {
 				1,
 				"git",
 				["add", "--", "healthy.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenNthCalledWith(
 				2,
 				"git",
 				["rm", "--cached", "--ignore-unmatch", "--", "ignored-and-gone.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1204,7 +1204,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["add", "--", "dangling-link"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenCalledTimes(1);
@@ -1269,7 +1269,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--", "src/main.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1285,7 +1285,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--", "a.ts", "b.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1336,7 +1336,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1350,7 +1350,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--worktree", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1364,7 +1364,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--worktree", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1378,7 +1378,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1392,7 +1392,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--worktree", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1408,7 +1408,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--", "new.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
@@ -1425,7 +1425,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--", "new.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
@@ -1470,7 +1470,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--", "copy.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/copy.ts`);
@@ -1488,13 +1488,13 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--", "new.ts", "old.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--", "old.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
@@ -1511,7 +1511,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--", "new.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			// Should NOT call git restore -- (worktree restore, without --staged)
@@ -1536,13 +1536,13 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--", "new.ts", "old.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--", "old.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -1590,7 +1590,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--", "new.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			// No separate restore for old path
@@ -1614,13 +1614,13 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--staged", "--worktree", "--", "staged.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["restore", "--", "unstaged.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
@@ -2093,7 +2093,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenLastCalledWith(
 				"git",
 				["push", "-u", "origin", "feature/new"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -2112,7 +2112,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenLastCalledWith(
 				"git",
 				["push", "-u", "origin", "feature/test"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -2131,7 +2131,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenLastCalledWith(
 				"git",
 				["push"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -2152,7 +2152,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenLastCalledWith(
 				"git",
 				["push", "--force-with-lease"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -2534,7 +2534,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["diff", "--cached", "-z", "--name-only"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -2571,7 +2571,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["read-tree", "tree123"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});
@@ -2585,7 +2585,7 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
 				["reset"],
-				{ cwd: TEST_CWD, encoding: "utf8" },
+				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 		});

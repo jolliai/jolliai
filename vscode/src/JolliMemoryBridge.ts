@@ -10,12 +10,10 @@
  * - All git operations → subprocess via execGit() helper
  */
 
-import { execFile } from "node:child_process";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { lstat, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import { FolderStorage } from "../../cli/src/core/FolderStorage.js";
 import { getDiffStats } from "../../cli/src/core/GitOps.js";
 import { filterToBranchHeads } from "../../cli/src/core/HeadEntryFilter.js";
@@ -73,6 +71,7 @@ import type {
 	StoredTranscript,
 	SummaryIndexEntry,
 } from "../../cli/src/Types.js";
+import { execFileAsyncHidden } from "../../cli/src/util/Subprocess.js";
 import {
 	detectLinearIssues,
 	openLinearIssueInBrowser as openLinearIssueInBrowserImpl,
@@ -103,8 +102,6 @@ import { mergeCommitMessages } from "./util/CommitMessageUtils.js";
 import { log } from "./util/Logger.js";
 import { loadGlobalConfig } from "./util/WorkspaceUtils.js";
 
-const execFileAsync = promisify(execFile);
-
 // ─── Git helpers ────────────────────────────────────────────────────────────
 
 /**
@@ -112,7 +109,7 @@ const execFileAsync = promisify(execFile);
  * Throws on non-zero exit.
  */
 async function execGit(args: Array<string>, cwd: string): Promise<string> {
-	const { stdout } = await execFileAsync("git", args, {
+	const { stdout } = await execFileAsyncHidden("git", args, {
 		cwd,
 		encoding: "utf8",
 	});

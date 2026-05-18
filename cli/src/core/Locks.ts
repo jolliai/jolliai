@@ -59,23 +59,20 @@
  * release path.
  */
 
-import * as childProcess from "node:child_process";
 import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
-import { promisify } from "node:util";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
+import * as Subprocess from "../util/Subprocess.js";
 
 const log = createLogger("Locks");
 
 /**
- * Lazily promisify so tests that swap out `childProcess.execFile` after module
- * load (via `vi.spyOn`) actually pick up the mock — eager promisification at
- * module load would close over the original function.
+ * Calls through `Subprocess` (rather than capturing a local reference) so
+ * tests can `vi.spyOn(Subprocess, "execFileAsyncHidden")` and have the
+ * resolver pick up the mock without us pre-binding the function.
  */
-function gitRevParseCommonDir(cwd: string): Promise<{ stdout: string }> {
-	return promisify(childProcess.execFile)("git", ["rev-parse", "--git-common-dir"], { cwd }) as Promise<{
-		stdout: string;
-	}>;
+function gitRevParseCommonDir(cwd: string): Promise<{ stdout: string; stderr: string }> {
+	return Subprocess.execFileAsyncHidden("git", ["rev-parse", "--git-common-dir"], { cwd });
 }
 
 export const WORKER_LOCK_FILE = "worker.lock";

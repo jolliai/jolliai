@@ -13,11 +13,11 @@
  * - "Copy Markdown" button exports the summary as plain Markdown to the clipboard
  */
 
-import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import * as vscode from "vscode";
+import { execFileSyncHidden } from "../../../cli/src/util/Subprocess.js";
 import {
 	loadPlansRegistry,
 	savePlansRegistry,
@@ -1538,13 +1538,10 @@ export class SummaryWebviewPanel {
 		// Get diff for the commit (truncated to avoid huge prompts)
 		let diff = "";
 		try {
-			diff = execSync(
-				`git diff ${summary.commitHash}~1 ${summary.commitHash} -- . ":(exclude)*.lock"`,
-				{
-					cwd: this.workspaceRoot,
-					encoding: "utf-8",
-					maxBuffer: 512 * 1024,
-				},
+			diff = execFileSyncHidden(
+				"git",
+				["diff", `${summary.commitHash}~1`, summary.commitHash, "--", ".", ":(exclude)*.lock"],
+				{ cwd: this.workspaceRoot, encoding: "utf-8", maxBuffer: 512 * 1024 },
 			).substring(0, 30000);
 		} catch {
 			// Diff may fail for initial commits; proceed without it

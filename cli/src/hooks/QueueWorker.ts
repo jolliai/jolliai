@@ -16,7 +16,6 @@
  * Entry point: can be run directly with `--worker --cwd <path>` or spawned by `launchWorker()`.
  */
 
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -114,6 +113,7 @@ import type {
 	TranscriptReadResult,
 	TranscriptSource,
 } from "../Types.js";
+import { spawnHidden } from "../util/Subprocess.js";
 
 const log = createLogger("QueueWorker");
 
@@ -205,7 +205,7 @@ export function launchWorker(cwd: string): void {
 	const dir = dirname(fileURLToPath(import.meta.url));
 	const scriptPath = join(dir, "QueueWorker.js");
 
-	const child = spawn(
+	const child = spawnHidden(
 		process.execPath,
 		// --disable-warning silences node:sqlite's ExperimentalWarning during OpenCode
 		// scans; it also suppresses any other experimental warnings in this subprocess.
@@ -214,7 +214,6 @@ export function launchWorker(cwd: string): void {
 			detached: true,
 			stdio: "ignore",
 			cwd,
-			windowsHide: true,
 		},
 	);
 	child.unref();

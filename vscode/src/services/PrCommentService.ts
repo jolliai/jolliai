@@ -12,16 +12,13 @@
  * All GitHub/git operations go through the `gh` / `git` CLI — no new dependencies.
  */
 
-import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import * as vscode from "vscode";
+import { execFileAsyncHidden } from "../../../cli/src/util/Subprocess.js";
 import { log } from "../util/Logger.js";
-
-const execFileAsync = promisify(execFile);
 
 const TAG = "PrSection";
 
@@ -57,7 +54,10 @@ function replaceSummaryInBody(
 
 /** Runs a gh command and returns stdout. Throws on non-zero exit. */
 async function execGh(args: Array<string>, cwd: string): Promise<string> {
-	const { stdout } = await execFileAsync("gh", args, { cwd, encoding: "utf8" });
+	const { stdout } = await execFileAsyncHidden("gh", args, {
+		cwd,
+		encoding: "utf8",
+	});
 	return stdout;
 }
 
@@ -113,7 +113,7 @@ async function probeGh(
 	cwd: string,
 ): Promise<GhProbeResult> {
 	try {
-		const { stdout } = await execFileAsync("gh", args, {
+		const { stdout } = await execFileAsyncHidden("gh", args, {
 			cwd,
 			encoding: "utf8",
 		});
@@ -197,7 +197,7 @@ async function checkGhAuthenticated(
 
 /** Runs a git command and returns stdout. */
 async function execGit(args: Array<string>, cwd: string): Promise<string> {
-	const { stdout } = await execFileAsync("git", args, {
+	const { stdout } = await execFileAsyncHidden("git", args, {
 		cwd,
 		encoding: "utf8",
 	});

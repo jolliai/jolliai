@@ -5,7 +5,6 @@
  * Called by VSCode when the extension activates (workspaceContains:.git).
  */
 
-import { execFileSync, execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import * as vscode from "vscode";
@@ -34,6 +33,7 @@ import {
 } from "../../cli/src/core/SummaryStore.js";
 import { ORPHAN_BRANCH } from "../../cli/src/Logger.js";
 import type { StatusInfo } from "../../cli/src/Types.js";
+import { execFileSyncHidden } from "../../cli/src/util/Subprocess.js";
 import { CommitCommand } from "./commands/CommitCommand.js";
 import { PushCommand } from "./commands/PushCommand.js";
 import { SquashCommand } from "./commands/SquashCommand.js";
@@ -151,11 +151,14 @@ function resolveGitPath(
 	relativeToGitDir: string,
 ): string | undefined {
 	try {
-		const out = execSync(`git rev-parse --git-path ${relativeToGitDir}`, {
-			cwd,
-		})
-			.toString()
-			.trim();
+		const out = execFileSyncHidden(
+			"git",
+			["rev-parse", "--git-path", relativeToGitDir],
+			{
+				cwd,
+				encoding: "utf-8",
+			},
+		).trim();
 		return isAbsolute(out) ? out : resolve(cwd, out);
 	} catch {
 		return;
@@ -295,7 +298,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	if (!existsSync(join(workspaceRoot, ".git"))) {
 		const initGit = () => {
 			try {
-				execFileSync("git", ["init"], { cwd: workspaceRoot });
+				execFileSyncHidden("git", ["init"], { cwd: workspaceRoot });
 				return vscode.window
 					.showInformationMessage(
 						"Git initialized. Please reload the window to activate Jolli Memory.",

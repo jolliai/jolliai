@@ -112,23 +112,28 @@ const { buildClaudeCodeContext } = vi.hoisted(() => ({
 }));
 
 const { execSync, execFileSync } = vi.hoisted(() => ({
-	// Mock git rev-parse --git-path calls used by resolveGitPath() in Extension.ts.
-	// Returns realistic paths so HEAD and orphan-ref watchers are created in tests,
-	// preserving the createFileSystemWatcher mock call order.
+	// `execSync` is retained for any legacy mock paths but Extension.ts itself
+	// no longer calls it — kept here so the `node:child_process` mock factory
+	// below has something to export. Default impl throws so any unexpected
+	// caller fails loudly.
 	execSync: vi.fn((cmd: string) => {
-		if (cmd.includes("rev-parse --git-path HEAD")) {
-			return Buffer.from("/test/workspace/.git/HEAD\n");
-		}
-		if (cmd.includes("rev-parse --git-path refs/heads/")) {
-			return Buffer.from(
-				"/test/workspace/.git/refs/heads/__jolli_orphan_branch__\n",
-			);
-		}
 		throw new Error(`Unmocked exec: ${cmd}`);
 	}),
-	// Used by the no-git Initialize Git path. Default impl throws so unmocked
-	// calls fail loudly; the no-git tests override .mockImplementation per case.
+	// resolveGitPath() now uses execFileSyncHidden("git", ["rev-parse", "--git-path", rel])
+	// so we intercept those calls here. Returns realistic paths so HEAD and
+	// orphan-ref watchers are created, preserving the createFileSystemWatcher
+	// mock call order.
+	// The no-git Initialize Git path calls execFileSyncHidden("git", ["init"]) —
+	// those tests override .mockImplementation per case.
 	execFileSync: vi.fn((bin: string, args: ReadonlyArray<string>) => {
+		if (bin === "git" && args[0] === "rev-parse" && args[1] === "--git-path") {
+			if (args[2] === "HEAD") {
+				return "/test/workspace/.git/HEAD\n";
+			}
+			if (typeof args[2] === "string" && args[2].startsWith("refs/heads/")) {
+				return "/test/workspace/.git/refs/heads/__jolli_orphan_branch__\n";
+			}
+		}
 		throw new Error(`Unmocked execFile: ${bin} ${args.join(" ")}`);
 	}),
 }));
@@ -1003,7 +1008,7 @@ describe("Extension", () => {
 		it("warns but keeps activating when rev-parse --git-path fails", () => {
 			// Throw for all resolveGitPath queries → both HEAD and orphan-ref watchers
 			// skip creation, hitting the `else` branches that log auto-refresh-disabled warnings.
-			execSync.mockImplementation(() => {
+			execFileSync.mockImplementation(() => {
 				throw new Error("not a git repo");
 			});
 			const ctx = makeContext();
@@ -1023,15 +1028,26 @@ describe("Extension", () => {
 
 		it("resolves non-absolute git-paths against cwd", () => {
 			// Returns a relative path → covers the `isAbsolute(out) ? out : resolve(cwd, out)` right branch.
-			execSync.mockImplementation((cmd: string) => {
-				if (cmd.includes("rev-parse --git-path HEAD")) {
-					return Buffer.from(".git/HEAD\n");
-				}
-				if (cmd.includes("rev-parse --git-path refs/heads/")) {
-					return Buffer.from(".git/refs/heads/__jolli_orphan_branch__\n");
-				}
-				throw new Error(`Unmocked exec: ${cmd}`);
-			});
+			execFileSync.mockImplementation(
+				(bin: string, args: ReadonlyArray<string>) => {
+					if (
+						bin === "git" &&
+						args[0] === "rev-parse" &&
+						args[1] === "--git-path"
+					) {
+						if (args[2] === "HEAD") {
+							return ".git/HEAD\n";
+						}
+						if (
+							typeof args[2] === "string" &&
+							args[2].startsWith("refs/heads/")
+						) {
+							return ".git/refs/heads/__jolli_orphan_branch__\n";
+						}
+					}
+					throw new Error(`Unmocked execFile: ${bin} ${args.join(" ")}`);
+				},
+			);
 			const ctx = makeContext();
 
 			activate(ctx);

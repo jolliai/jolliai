@@ -8,11 +8,11 @@
  * in the output directory (matched by the 8-char commit hash prefix).
  */
 
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { CommitSummary } from "../Types.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 import { getDisplayDate } from "./SummaryFormat.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 import { getSummary, listSummaries } from "./SummaryStore.js";
@@ -48,10 +48,9 @@ export interface ExportResult {
 /** Resolves the project name from the git repo root directory name. */
 function resolveProjectName(cwd?: string): string {
 	try {
-		const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+		const repoRoot = execFileSyncHidden("git", ["rev-parse", "--show-toplevel"], {
 			encoding: "utf-8",
 			cwd,
-			windowsHide: true,
 		}).trim();
 		return basename(repoRoot);
 	} catch {

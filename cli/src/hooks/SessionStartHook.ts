@@ -23,7 +23,6 @@
  *   - .jolli/jollimemory/plans.json → associated plan names
  */
 
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readFileFromBranch } from "../core/GitOps.js";
@@ -32,6 +31,7 @@ import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
 import type { CommitSummary, DiffStats, PlansRegistry, SummaryIndexEntry } from "../Types.js";
+import { execFileSyncHidden } from "../util/Subprocess.js";
 import { readStdin } from "./HookUtils.js";
 
 const log = createLogger("SessionStartHook");
@@ -378,10 +378,9 @@ function saveBriefingCache(projectDir: string, branch: string, lastCommitHash: s
 function getCurrentHeadHash(projectDir: string): string | null {
 	try {
 		return (
-			execFileSync("git", ["rev-parse", "HEAD"], {
+			execFileSyncHidden("git", ["rev-parse", "HEAD"], {
 				encoding: "utf-8",
 				cwd: projectDir,
-				windowsHide: true,
 			}).trim() || null
 		);
 	} catch {
@@ -392,10 +391,9 @@ function getCurrentHeadHash(projectDir: string): string | null {
 function getCurrentBranch(projectDir: string): string | null {
 	try {
 		return (
-			execFileSync("git", ["branch", "--show-current"], {
+			execFileSyncHidden("git", ["branch", "--show-current"], {
 				encoding: "utf-8",
 				cwd: projectDir,
-				windowsHide: true,
 			}).trim() || null
 		);
 	} catch {

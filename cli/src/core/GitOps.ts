@@ -8,14 +8,12 @@
  * Pattern adapted from: tools/jolliagent/src/tools/tools/git_shared.ts
  */
 
-import { execFile, spawn } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { createLogger } from "../Logger.js";
 import type { CommitInfo, DiffStats, FileWrite, GitCommandResult } from "../Types.js";
+import { execFileAsyncHidden, spawnHidden } from "../util/Subprocess.js";
 
-const execFileAsync = promisify(execFile);
 const MAX_GIT_BUFFER_BYTES = 10 * 1024 * 1024; // 10MB
 /** NUL byte — used as entry separator in `git ls-tree -z` output. */
 const NUL = "\x00";
@@ -31,9 +29,8 @@ export async function execGit(args: ReadonlyArray<string>, cwd?: string): Promis
 	log.debug("git %s", fullArgs.join(" "));
 
 	try {
-		const { stdout, stderr } = await execFileAsync("git", fullArgs, {
+		const { stdout, stderr } = await execFileAsyncHidden("git", fullArgs, {
 			maxBuffer: MAX_GIT_BUFFER_BYTES,
-			windowsHide: true,
 		});
 		const result: GitCommandResult = {
 			stdout: stdout.trimEnd(),
@@ -563,7 +560,7 @@ function execGitWithStdin(args: ReadonlyArray<string>, input: string, cwd?: stri
 	log.debug("git (stdin) %s", fullArgs.join(" "));
 
 	return new Promise((resolve, reject) => {
-		const proc = spawn("git", fullArgs, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+		const proc = spawnHidden("git", fullArgs, { stdio: ["pipe", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
 
