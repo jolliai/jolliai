@@ -8,6 +8,28 @@ describe("SidebarScriptBuilder", () => {
 		expect(js.length).toBeGreaterThan(0);
 	});
 
+	it("output parses as valid JS — backtick / undeclared-symbol smoke test", () => {
+		// Regression for two bug classes that ship-tested but tests-passed:
+		//   1. Backtick trap: SidebarScriptBuilder warns about it in its
+		//      docstring because an unescaped backtick inside the template
+		//      literal closes the outer literal early and corrupts the JS.
+		//      Substring assertions like `toContain("function foo")` happily
+		//      match a truncated, syntactically-broken script.
+		//   2. Empty-panel ReferenceError: a renderer referencing an
+		//      undeclared symbol crashes only when the empty path actually
+		//      renders, which substring tests don't catch.
+		//
+		// Wrapping in `new Function(...)` parses the entire body under strict-
+		// mode constraints (any stray backtick, missing paren, unbalanced
+		// template-literal, or reference to a reserved word fails here).
+		// The webview-host globals are passed in as parameters so the script
+		// body sees `acquireVsCodeApi` as a defined name at parse time.
+		const js = buildSidebarScript();
+		expect(
+			() => new Function("window", "document", "acquireVsCodeApi", js),
+		).not.toThrow();
+	});
+
 	it("acquires the VSCode API", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("acquireVsCodeApi");

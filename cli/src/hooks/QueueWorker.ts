@@ -152,7 +152,6 @@ async function reassociateMetadata(
 				await associateNoteWithCommit(noteRef.id, newHash, cwd);
 			}
 		}
-		/* v8 ignore start -- reassociateMetadata.linearIssues loop fires only on squash/rebase paths where source summaries already carried linearIssues; covered indirectly by the merge-hoist tests in SummaryStore.test.ts but not the reassociate call itself. */
 		if (oldSummary.linearIssues) {
 			for (const linearRef of oldSummary.linearIssues) {
 				// Uses the archivedKey (e.g. "PROJ-1234-abc1234") to unambiguously
@@ -161,16 +160,19 @@ async function reassociateMetadata(
 				await associateLinearIssueWithCommit(linearRef.archivedKey, newHash, cwd);
 			}
 		}
-		/* v8 ignore stop */
 	}
 }
 
 /**
- * Extracts hoisted metadata fields (plans, notes, jolliDoc, orphanedDocIds, e2eTestGuide)
- * from an old summary for inclusion in a new summary root node.
+ * Extracts hoisted metadata fields from an old summary for inclusion in a new
+ * summary root node. The full hoist set is: jolliDocId, jolliDocUrl,
+ * orphanedDocIds, plans, notes, linearIssues, e2eTestGuide. Keep this list
+ * synced with the spread block below — drift is the bug we're avoiding by
+ * enumerating it here.
  *
- * Used when building amend/squash summary containers that wrap the old summary as a child.
- * Returns a partial object suitable for spreading into a CommitSummary.
+ * Used when building amend/squash summary containers that wrap the old summary
+ * as a child. Returns a partial object suitable for spreading into a
+ * CommitSummary.
  */
 function hoistMetadataFromOldSummary(oldSummary: CommitSummary | null | undefined): Partial<CommitSummary> {
 	if (!oldSummary) return {};
@@ -690,8 +692,8 @@ async function associateNotesWithCommit(
  * in CommitSummary.linearIssues — the archivedKey is the exact pointer used
  * later by reassociateMetadata for amend/squash/rebase.
  *
- * Follows the same pattern as associateNotesWithCommit (line 565+) for
- * structural symmetry — see plan §9.10 for the rationale.
+ * Follows the same pattern as `associateNotesWithCommit` for structural
+ * symmetry — see plan §9.10 for the rationale.
  */
 async function associateLinearIssuesWithCommit(
 	ticketIds: ReadonlyArray<string>,
@@ -705,6 +707,13 @@ async function associateLinearIssuesWithCommit(
 	const shortHash = commitHash.substring(0, 8);
 	const commitRefs: LinearIssueCommitRef[] = [];
 	const filesToStore: Array<{ archivedKey: string; content: string }> = [];
+	// Tracks every ticketId that was detected upstream but not actually
+	// archived. Without aggregation, the three silent-degrade paths each
+	// emit a single log.info per drop — easy to miss when scanning debug.log
+	// and indistinguishable from "user only referenced 3 of 5 tickets".
+	// At pipeline end we emit a single log.warn so the count + ratio show up
+	// in one line for triage.
+	const droppedTicketIds: string[] = [];
 
 	let registry = await loadPlansRegistry(cwd);
 	const updatedLinearIssues: Record<string, NonNullable<PlansRegistry["linearIssues"]>[string]> = {
@@ -715,6 +724,7 @@ async function associateLinearIssuesWithCommit(
 		const entry = updatedLinearIssues[ticketId];
 		if (!entry) {
 			log.info("Linear issue association: ticketId %s not in registry — skipping", ticketId);
+			droppedTicketIds.push(ticketId);
 			continue;
 		}
 
@@ -726,6 +736,7 @@ async function associateLinearIssuesWithCommit(
 				ticketId,
 				entry.sourcePath,
 			);
+			droppedTicketIds.push(ticketId);
 			continue;
 		}
 
@@ -831,6 +842,16 @@ async function associateLinearIssuesWithCommit(
 			branch,
 		);
 		log.info("Associated %d Linear issue(s) with commit %s", filesToStore.length, shortHash);
+	}
+
+	if (droppedTicketIds.length > 0) {
+		log.warn(
+			"Linear issue association: dropped %d of %d ticket(s) [%s] for commit %s — see prior log lines for per-ticket reason (registry miss / sourcePath unreadable)",
+			droppedTicketIds.length,
+			ticketIds.length,
+			droppedTicketIds.join(", "),
+			shortHash,
+		);
 	}
 
 	return commitRefs;

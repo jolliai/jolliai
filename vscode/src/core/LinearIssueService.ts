@@ -69,11 +69,29 @@ export async function setLinearIssueIgnored(
 	await savePlansRegistry({ ...registry, linearIssues }, cwd);
 }
 
-/** Opens the Linear issue's URL in the default browser. */
+/**
+ * Opens the Linear issue's URL in the default browser.
+ *
+ * Defense-in-depth: the extractor already gates incoming Linear payloads
+ * through `^https?://`, but the URL flows through plans.json (a local user-
+ * editable file). Re-validate the scheme at the sink so a hand-edited
+ * `javascript:` / `data:` / `file:` URL can't smuggle through openExternal.
+ */
 export async function openLinearIssueInBrowser(
 	info: LinearIssueInfo,
 ): Promise<boolean> {
-	return vscode.env.openExternal(vscode.Uri.parse(info.url));
+	const uri = vscode.Uri.parse(info.url);
+	if (uri.scheme !== "http" && uri.scheme !== "https") {
+		log.warn(
+			"linearissue",
+			`refusing non-http(s) URL for ${info.ticketId}: scheme=${uri.scheme}`,
+		);
+		vscode.window.showWarningMessage(
+			`Linear issue ${info.ticketId} has a non-http(s) URL — refusing to open.`,
+		);
+		return false;
+	}
+	return vscode.env.openExternal(uri);
 }
 
 /** Opens the per-issue markdown file in VS Code. */
@@ -136,6 +154,13 @@ interface ParsedFrontmatter {
  * Best-effort YAML frontmatter parse: tolerant of missing file / malformed content.
  * On any failure, returns an empty object so the panel can still render
  * id/title/url from the plans.json entry.
+ *
+ * LOCKSTEP: the authoritative parser lives in
+ * `cli/src/core/LinearIssueStore.ts::parseMarkdown` and the writer is
+ * `LinearIssueStore.renderMarkdown`. Field shapes must agree across both
+ * sides. Same precedent as `parseJolliApiKey` (see CLAUDE.md). If the writer
+ * format changes, update both readers in the same commit. Extracting a
+ * shared helper is tracked as a follow-up.
  */
 function readFrontmatter(sourcePath: string): ParsedFrontmatter {
 	let content: string;
@@ -175,7 +200,11 @@ function readFrontmatter(sourcePath: string): ParsedFrontmatter {
 					const v = JSON.parse(m[1]) as unknown;
 					if (typeof v === "string") labels.push(v);
 				} catch {
-					return {};
+					// Skip just this bad label line. The prior behaviour
+					// returned {} from the whole parser, which dropped any
+					// already-collected labels plus the status/priority
+					// fields parsed before the labels block — far more
+					// destructive than the original failure warranted.
 				}
 				continue;
 			}

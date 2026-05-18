@@ -843,7 +843,8 @@ export async function getLinearIssueEntriesForBranch(
 /**
  * Upsert a Linear issue entry into plans.json.linearIssues.
  *
- * Field preservation contract (mirrors Plans semantics, see StopHook.ts:196-241):
+ * Field preservation contract (mirrors Plans semantics — see the plan-discovery
+ * block inside StopHook's `main()`):
  *
  * Case A: entry exists with `contentHashAtCommit` (guard from prior commit)
  *   - If `ignored` → return unchanged (user permanently dismissed; never resurrect)
@@ -858,9 +859,9 @@ export async function getLinearIssueEntriesForBranch(
  *
  * Case C: entry does not exist → insert fresh.
  *
- * Concurrency: uses near-write reread + commitHash diff merge (mirrors StopHook
- * plan-discovery protection, line 249-257). This avoids overwriting a commitHash
- * that PostCommitHook wrote between our read and write.
+ * Concurrency: uses near-write reread + commitHash diff merge (mirrors the
+ * plan-discovery near-write reread inside StopHook's `main()`). This avoids
+ * overwriting a commitHash that PostCommitHook wrote between our read and write.
  */
 export async function upsertLinearIssueEntry(
 	ref: LinearIssueRef,

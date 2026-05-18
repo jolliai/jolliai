@@ -32,12 +32,18 @@ vi.mock("node:fs", async (importOriginal) => {
 
 vi.mock("vscode", () => ({
 	Uri: {
-		parse: vi.fn((u: string) => ({ toString: () => u })),
+		// scheme is needed by the openLinearIssueInBrowser scheme guard —
+		// minimal regex extract matches what vscode.Uri.parse would set.
+		parse: vi.fn((u: string) => {
+			const m = /^([a-z][a-z0-9+.-]*):/i.exec(u);
+			return { scheme: m?.[1] ?? "", toString: () => u };
+		}),
 		file: vi.fn((p: string) => ({ toString: () => p })),
 	},
 	env: { openExternal: mockOpenExternal },
 	window: {
 		showTextDocument: mockShowTextDocument,
+		showWarningMessage: vi.fn(),
 		createOutputChannel: vi.fn(() => ({
 			appendLine: vi.fn(),
 			append: vi.fn(),
@@ -237,7 +243,12 @@ describe("detectLinearIssues", () => {
 		expect(result[0].status).toBeUndefined();
 	});
 
-	it("returns empty frontmatter when labels list contains invalid JSON", async () => {
+	it("skips a bad label line but preserves status / description already parsed", async () => {
+		// Regression for the labels-parse bail bug: previously a single
+		// malformed label line caused the entire frontmatter parser to
+		// `return {}`, dropping status / priority / earlier labels /
+		// description. The graceful behavior keeps everything the parser
+		// successfully extracted and silently skips just the bad line.
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
@@ -247,8 +258,9 @@ describe("detectLinearIssues", () => {
 			'---\nstatus: "In Progress"\nlabels:\n  - not-json-quoted\n---\nbody\n',
 		);
 		const result = await detectLinearIssues("/repo");
-		expect(result[0].labels).toBeUndefined();
-		expect(result[0].status).toBeUndefined();
+		expect(result[0].status).toBe("In Progress");
+		expect(result[0].labels).toBeUndefined(); // the one label couldn't be parsed
+		expect(result[0].description).toBe("body");
 	});
 
 	it("frontmatter parse: labels present but body empty (covers line 202 FALSE branch)", async () => {

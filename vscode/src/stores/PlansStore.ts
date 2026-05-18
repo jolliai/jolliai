@@ -56,7 +56,6 @@ export interface PlansStoreOptions {
 	readonly workspaceRoot: string;
 	readonly plansDir: string;
 	readonly notesDir: string;
-	readonly linearIssuesDir?: string;
 }
 
 export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
@@ -124,21 +123,9 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 		notesWatcher.onDidDelete(debouncedPlansRefresh);
 		this.disposables.push(notesWatcher);
 
-		// Linear issues directory watcher — file creates from StopHook trigger panel refresh
-		/* v8 ignore start -- linearIssuesDir is optional; tests typically construct PlansStore without it, so the watcher-setup branch is covered indirectly by Extension.ts wiring rather than store-unit tests. */
-		if (options.linearIssuesDir) {
-			const linearIssuesWatcher = vscode.workspace.createFileSystemWatcher(
-				new vscode.RelativePattern(
-					vscode.Uri.file(options.linearIssuesDir),
-					"*.md",
-				),
-			);
-			linearIssuesWatcher.onDidCreate(debouncedPlansRefresh);
-			linearIssuesWatcher.onDidChange(debouncedPlansRefresh);
-			linearIssuesWatcher.onDidDelete(debouncedPlansRefresh);
-			this.disposables.push(linearIssuesWatcher);
-		}
-		/* v8 ignore stop */
+		// Linear issue file changes flow through the plans.json watcher above —
+		// StopHook upserts go to plans.json, associate/ignore writes go to
+		// plans.json. A dedicated linear-issues/*.md watcher is redundant.
 	}
 
 	protected getCurrentSnapshot(): PlansSnapshot {
