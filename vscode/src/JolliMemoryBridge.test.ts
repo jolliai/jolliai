@@ -2548,7 +2548,7 @@ describe("JolliMemoryBridge", () => {
 			const { detectLinearIssues } = await import(
 				"./core/LinearIssueService.js"
 			);
-			const issues = [{ kind: "linearissue", ticketId: "JOLLI-1" }];
+			const issues = [{ kind: "linearissue", ticketId: "PROJ-1" }];
 			(detectLinearIssues as ReturnType<typeof vi.fn>).mockResolvedValue(
 				issues,
 			);
@@ -2569,11 +2569,11 @@ describe("JolliMemoryBridge", () => {
 			);
 			const bridge = makeBridge();
 
-			await bridge.ignoreLinearIssue("JOLLI-1528");
+			await bridge.ignoreLinearIssue("PROJ-1528");
 
 			expect(setLinearIssueIgnored).toHaveBeenCalledWith(
 				TEST_CWD,
-				"JOLLI-1528",
+				"PROJ-1528",
 				true,
 			);
 		});
@@ -2587,7 +2587,7 @@ describe("JolliMemoryBridge", () => {
 			);
 			const info = {
 				kind: "linearissue",
-				url: "https://linear.app/x/JOLLI-1",
+				url: "https://linear.app/x/PROJ-1",
 			} as unknown as Parameters<typeof bridge.openLinearIssue>[0];
 			const bridge = makeBridge();
 

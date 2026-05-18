@@ -182,13 +182,13 @@ describe("FormatUtils", () => {
 
 		it("unwraps Linear inline-issue tags to the visible ticketId", () => {
 			// Linear MCP returns descriptions like:
-			// <issue id="e143cd5b-…">JOLLI-1404</issue>
+			// <issue id="e143cd5b-…">PROJ-1404</issue>
 			// — these read terribly as raw HTML in the preview.
 			expect(
 				stripMarkdown(
-					'see <issue id="e143cd5b-fd3f-450c-92a7-044783011be4">JOLLI-1404</issue> for context',
+					'see <issue id="e143cd5b-fd3f-450c-92a7-044783011be4">PROJ-1404</issue> for context',
 				),
-			).toBe("see JOLLI-1404 for context");
+			).toBe("see PROJ-1404 for context");
 		});
 
 		it("collapses 3+ consecutive newlines to a paragraph break", () => {
@@ -207,9 +207,9 @@ describe("FormatUtils", () => {
 			// Captures the exact regression the user reported: markdown
 			// source bleeding through the hover-card.
 			const input =
-				'## Problem\n\nLike Plans/Notes (see <issue id="abc">JOLLI-1404</issue>), Linear issues are often **the highest-density context**.';
+				'## Problem\n\nLike Plans/Notes (see <issue id="abc">PROJ-1404</issue>), Linear issues are often **the highest-density context**.';
 			expect(stripMarkdown(input)).toBe(
-				"Problem\n\nLike Plans/Notes (see JOLLI-1404), Linear issues are often the highest-density context.",
+				"Problem\n\nLike Plans/Notes (see PROJ-1404), Linear issues are often the highest-density context.",
 			);
 		});
 	});

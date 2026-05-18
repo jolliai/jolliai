@@ -888,6 +888,51 @@ describe("SummaryStore", () => {
 			expect(newSummaryContent.children?.[0].e2eTestGuide).toBeUndefined();
 		});
 
+		it("should hoist linearIssues onto the rebase container node (regression: rebase silently dropped Linear refs)", async () => {
+			// Regression: migrateOneToOne carried plans/notes/e2eTestGuide
+			// forward to the new root summary but forgot linearIssues. After
+			// rebasing a branch carrying Linear-issue archives, the rebased
+			// commits' summaries had linearIssues:[] on the orphan branch even
+			// though the registry still pointed at the (renamed-on-disk)
+			// snapshot files — panel + PR markdown stopped showing the
+			// associations until the next manual commit.
+			const oldHash = "oldhash0000000000000001";
+			const newHash = "newhash0000000000000002";
+			const oldSummary: CommitSummary = {
+				...createMockSummary(oldHash, "Old message"),
+				linearIssues: [
+					{
+						archivedKey: "PROJ-1528-oldhash0",
+						ticketId: "PROJ-1528",
+						title: "Treat referenced Linear issues as a first-class panel item",
+						url: "https://linear.app/jolliai/issue/PROJ-1528/test",
+						referencedAt: "2026-05-14T09:11:43.708Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			};
+
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
+			expect(newSummaryContent.linearIssues).toEqual([
+				{
+					archivedKey: "PROJ-1528-oldhash0",
+					ticketId: "PROJ-1528",
+					title: "Treat referenced Linear issues as a first-class panel item",
+					url: "https://linear.app/jolliai/issue/PROJ-1528/test",
+					referencedAt: "2026-05-14T09:11:43.708Z",
+					sourceToolName: "mcp__linear__get_issue",
+				},
+			]);
+			// Wrapped child must have linearIssues stripped (Hoist invariant —
+			// root is the only authoritative carrier; same rule as plans/notes).
+			expect(newSummaryContent.children?.[0].linearIssues).toBeUndefined();
+		});
+
 		it("should hoist notes onto the rebase container node", async () => {
 			const oldHash = "oldhash0000000000000001";
 			const newHash = "newhash0000000000000002";
@@ -1542,10 +1587,10 @@ describe("SummaryStore", () => {
 				...createMockSummary("old1", "Old 1"),
 				linearIssues: [
 					{
-						archivedKey: "JOLLI-1-old1",
-						ticketId: "JOLLI-1",
+						archivedKey: "PROJ-1-old1",
+						ticketId: "PROJ-1",
 						title: "Old title",
-						url: "https://linear.app/x/JOLLI-1",
+						url: "https://linear.app/x/PROJ-1",
 						referencedAt: "2026-02-18T00:00:00Z",
 						sourceToolName: "mcp__linear__get_issue",
 					},
@@ -1555,18 +1600,18 @@ describe("SummaryStore", () => {
 						...createMockSummary("nested-child", "Nested child"),
 						linearIssues: [
 							{
-								archivedKey: "JOLLI-1-old1",
-								ticketId: "JOLLI-1",
+								archivedKey: "PROJ-1-old1",
+								ticketId: "PROJ-1",
 								title: "Newer title",
-								url: "https://linear.app/x/JOLLI-1",
+								url: "https://linear.app/x/PROJ-1",
 								referencedAt: "2026-02-20T00:00:00Z",
 								sourceToolName: "mcp__linear__get_issue",
 							},
 							{
-								archivedKey: "JOLLI-2-nested",
-								ticketId: "JOLLI-2",
+								archivedKey: "PROJ-2-nested",
+								ticketId: "PROJ-2",
 								title: "Nested Only",
-								url: "https://linear.app/x/JOLLI-2",
+								url: "https://linear.app/x/PROJ-2",
 								referencedAt: "2026-02-19T00:00:00Z",
 								sourceToolName: "mcp__linear__get_issue",
 							},
@@ -1578,10 +1623,10 @@ describe("SummaryStore", () => {
 				...createMockSummary("old2", "Old 2"),
 				linearIssues: [
 					{
-						archivedKey: "JOLLI-3-old2",
-						ticketId: "JOLLI-3",
+						archivedKey: "PROJ-3-old2",
+						ticketId: "PROJ-3",
 						title: "Root Only",
-						url: "https://linear.app/x/JOLLI-3",
+						url: "https://linear.app/x/PROJ-3",
 						referencedAt: "2026-02-19T00:00:00Z",
 						sourceToolName: "mcp__linear__get_issue",
 					},
@@ -1595,11 +1640,11 @@ describe("SummaryStore", () => {
 			const merged = JSON.parse(files[0].content) as CommitSummary;
 			// 3 refs after dedupe-keep-latest on archivedKey
 			expect(merged.linearIssues).toHaveLength(3);
-			const dup = merged.linearIssues?.find((r) => r.archivedKey === "JOLLI-1-old1");
+			const dup = merged.linearIssues?.find((r) => r.archivedKey === "PROJ-1-old1");
 			expect(dup?.title).toBe("Newer title");
 			expect(dup?.referencedAt).toBe("2026-02-20T00:00:00Z");
-			expect(merged.linearIssues?.find((r) => r.archivedKey === "JOLLI-2-nested")).toBeDefined();
-			expect(merged.linearIssues?.find((r) => r.archivedKey === "JOLLI-3-old2")).toBeDefined();
+			expect(merged.linearIssues?.find((r) => r.archivedKey === "PROJ-2-nested")).toBeDefined();
+			expect(merged.linearIssues?.find((r) => r.archivedKey === "PROJ-3-old2")).toBeDefined();
 			// Children should have linearIssues stripped
 			expect(merged.children?.[0].linearIssues).toBeUndefined();
 			expect(merged.children?.[1].linearIssues).toBeUndefined();
@@ -2578,8 +2623,8 @@ describe("SummaryStore", () => {
 		it("should write Linear issue files to the orphan branch under linear-issues/<archivedKey>.md", async () => {
 			await storeLinearIssues(
 				[
-					{ archivedKey: "JOLLI-1-abc1234", content: "# Issue 1\nbody" },
-					{ archivedKey: "JOLLI-2-abc1234", content: "# Issue 2\nbody" },
+					{ archivedKey: "PROJ-1-abc1234", content: "# Issue 1\nbody" },
+					{ archivedKey: "PROJ-2-abc1234", content: "# Issue 2\nbody" },
 				],
 				"Archive linear issues for commit abc1234",
 			);
@@ -2587,8 +2632,8 @@ describe("SummaryStore", () => {
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledWith(
 				expect.any(String),
 				[
-					{ path: "linear-issues/JOLLI-1-abc1234.md", content: "# Issue 1\nbody" },
-					{ path: "linear-issues/JOLLI-2-abc1234.md", content: "# Issue 2\nbody" },
+					{ path: "linear-issues/PROJ-1-abc1234.md", content: "# Issue 1\nbody" },
+					{ path: "linear-issues/PROJ-2-abc1234.md", content: "# Issue 2\nbody" },
 				],
 				"Archive linear issues for commit abc1234",
 				undefined,
@@ -2602,12 +2647,12 @@ describe("SummaryStore", () => {
 
 		it("readLinearIssueFromBranch reads markdown content from orphan branch by archivedKey", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce("# Archived Issue\nContent here");
-			await expect(readLinearIssueFromBranch("JOLLI-1-abc1234")).resolves.toBe("# Archived Issue\nContent here");
+			await expect(readLinearIssueFromBranch("PROJ-1-abc1234")).resolves.toBe("# Archived Issue\nContent here");
 		});
 
 		it("readLinearIssueFromBranch returns null when the orphan branch file is absent", async () => {
 			vi.mocked(readFileFromBranch).mockRejectedValueOnce(new Error("ENOENT"));
-			await expect(readLinearIssueFromBranch("JOLLI-missing")).resolves.toBeNull();
+			await expect(readLinearIssueFromBranch("PROJ-missing")).resolves.toBeNull();
 		});
 	});
 

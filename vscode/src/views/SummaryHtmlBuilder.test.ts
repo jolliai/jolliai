@@ -179,10 +179,10 @@ function makeLinear(
 	overrides?: Partial<LinearIssueCommitRef>,
 ): LinearIssueCommitRef {
 	return {
-		archivedKey: "JOLLI-1-abcdef12",
-		ticketId: "JOLLI-1",
+		archivedKey: "PROJ-1-abcdef12",
+		ticketId: "PROJ-1",
 		title: "Test Linear Issue",
-		url: "https://linear.app/jolliai/issue/JOLLI-1/test-linear-issue",
+		url: "https://linear.app/jolliai/issue/PROJ-1/test-linear-issue",
 		referencedAt: "2026-01-15T10:00:00Z",
 		sourceToolName: "mcp__linear__get_issue",
 		...overrides,
@@ -566,22 +566,22 @@ describe("SummaryHtmlBuilder", () => {
 			// reviewers see them alongside plans/notes when reading a commit.
 			const linearIssues = [
 				makeLinear({
-					archivedKey: "JOLLI-1528-786c5330",
-					ticketId: "JOLLI-1528",
+					archivedKey: "PROJ-1528-786c5330",
+					ticketId: "PROJ-1528",
 					title: "Treat referenced Linear issues as a first-class panel item",
-					url: "https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
+					url: "https://linear.app/jolliai/issue/PROJ-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
 				}),
 			];
 			const html = buildHtml(makeSummary({ linearIssues }));
 
-			expect(html).toContain("JOLLI-1528");
+			expect(html).toContain("PROJ-1528");
 			expect(html).toContain(
 				"Treat referenced Linear issues as a first-class panel item",
 			);
 			expect(html).toContain(
-				"https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
+				"https://linear.app/jolliai/issue/PROJ-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
 			);
-			expect(html).toContain('id="linear-JOLLI-1528-786c5330"');
+			expect(html).toContain('id="linear-PROJ-1528-786c5330"');
 		});
 
 		it("linear issues section wires Open / Open Markdown / Remove actions", () => {
@@ -590,9 +590,9 @@ describe("SummaryHtmlBuilder", () => {
 			// them. Removing any of these would silently disable a button.
 			const linearIssues = [
 				makeLinear({
-					archivedKey: "JOLLI-9-aaaaaaaa",
-					ticketId: "JOLLI-9",
-					url: "https://linear.app/x/issue/JOLLI-9/test",
+					archivedKey: "PROJ-9-aaaaaaaa",
+					ticketId: "PROJ-9",
+					url: "https://linear.app/x/issue/PROJ-9/test",
 				}),
 			];
 			const html = buildHtml(makeSummary({ linearIssues }));
@@ -600,10 +600,10 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain('data-action="openLinearIssue"');
 			expect(html).toContain('data-action="openLinearIssueMarkdown"');
 			expect(html).toContain('data-action="removeLinearIssue"');
-			expect(html).toContain('data-linear-key="JOLLI-9-aaaaaaaa"');
-			expect(html).toContain('data-linear-ticket="JOLLI-9"');
+			expect(html).toContain('data-linear-key="PROJ-9-aaaaaaaa"');
+			expect(html).toContain('data-linear-ticket="PROJ-9"');
 			expect(html).toContain(
-				'data-linear-url="https://linear.app/x/issue/JOLLI-9/test"',
+				'data-linear-url="https://linear.app/x/issue/PROJ-9/test"',
 			);
 		});
 
@@ -616,12 +616,12 @@ describe("SummaryHtmlBuilder", () => {
 					plans: [makePlan({ slug: "p1" })],
 					linearIssues: [
 						makeLinear({
-							archivedKey: "JOLLI-1-aaaaaaaa",
-							ticketId: "JOLLI-1",
+							archivedKey: "PROJ-1-aaaaaaaa",
+							ticketId: "PROJ-1",
 						}),
 						makeLinear({
-							archivedKey: "JOLLI-2-aaaaaaaa",
-							ticketId: "JOLLI-2",
+							archivedKey: "PROJ-2-aaaaaaaa",
+							ticketId: "PROJ-2",
 						}),
 					],
 				}),

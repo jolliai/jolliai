@@ -231,19 +231,25 @@ describe("NoteItem", () => {
 function makeLinearIssue(
 	overrides: Partial<LinearIssueInfo> = {},
 ): LinearIssueInfo {
+	// Field names taken from Types.ts LinearIssueInfo — uses sourcePath
+	// (not filename / filePath like PlanInfo / NoteInfo) and requires
+	// `ignored` and `sourceToolName`. Earlier versions of this fixture
+	// copy-pasted the plan/note field names and silently failed tsc
+	// (npm run all doesn't run tsc; only npx tsc --noEmit catches it).
 	return {
 		kind: "linearissue",
-		mapKey: "JOLLI-1528",
-		ticketId: "JOLLI-1528",
+		mapKey: "PROJ-1528",
+		ticketId: "PROJ-1528",
 		title: "Sample Issue",
-		url: "https://linear.app/test/issue/JOLLI-1528",
-		filename: "JOLLI-1528.md",
-		filePath: "/repo/.jolli/jollimemory/linear-issues/JOLLI-1528.md",
+		url: "https://linear.app/test/issue/PROJ-1528",
+		sourcePath: "/repo/.jolli/jollimemory/linear-issues/PROJ-1528.md",
 		lastModified: "2026-03-30T11:00:00.000Z",
 		addedAt: "2026-03-30T09:00:00.000Z",
 		updatedAt: "2026-03-30T11:00:00.000Z",
 		branch: "feature/test",
 		commitHash: null,
+		ignored: false,
+		sourceToolName: "mcp__linear__get_issue",
 		...overrides,
 	};
 }
@@ -257,7 +263,7 @@ describe("LinearIssueItem", () => {
 		// retains the status for hover-inspection of captured state.
 		const item = new LinearIssueItem(makeLinearIssue({ status: undefined }));
 
-		expect(item.label).toBe("JOLLI-1528 — Sample Issue");
+		expect(item.label).toBe("PROJ-1528 — Sample Issue");
 		expect(item.contextValue).toBe("linearissue");
 		expect(item.description).not.toContain("undefined");
 		// Icon is the GitHub-style "issue-opened" codicon tinted with the
@@ -295,7 +301,7 @@ describe("LinearIssueItem", () => {
 		expect(tooltip).toContain("Status: In Progress");
 		expect(tooltip).toContain("Priority: High");
 		expect(tooltip).toContain("Labels: bug, frontend");
-		expect(tooltip).toContain("https://linear.app/test/issue/JOLLI-1528");
+		expect(tooltip).toContain("https://linear.app/test/issue/PROJ-1528");
 		expect(tooltip).toContain("A short description");
 		// No backslash escapes and no markdown markers — the previous
 		// MarkdownString version emitted `**JOLLI\-1528**` etc. that the
@@ -339,11 +345,11 @@ describe("LinearIssueItem", () => {
 
 		const hover = (item as unknown as { linearHover: Record<string, unknown> })
 			.linearHover;
-		expect(hover.title).toBe("JOLLI-1528 — Sample Issue");
+		expect(hover.title).toBe("PROJ-1528 — Sample Issue");
 		expect(hover.status).toBe("In Progress");
 		expect(hover.priority).toBe("High");
 		expect(hover.labels).toBe("bug, frontend");
-		expect(hover.url).toBe("https://linear.app/test/issue/JOLLI-1528");
+		expect(hover.url).toBe("https://linear.app/test/issue/PROJ-1528");
 		// descriptionPreview was removed from LinearIssueHover — even when
 		// the source issue has a description, the field must NOT appear
 		// on the wire payload.

@@ -123,8 +123,8 @@ export function stripMarkdown(str: string): string {
 			.replace(/`([^`\n]+)`/g, "$1")
 			// Markdown links: `[label](url)` → `label`.
 			.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-			// Linear's inline issue references: `<issue id="...">JOLLI-1404</issue>`
-			// → `JOLLI-1404`. Linear MCP returns these embedded in description
+			// Linear's inline issue references: `<issue id="...">PROJ-1234</issue>`
+			// → `PROJ-1234`. Linear MCP returns these embedded in description
 			// prose and they read terribly as raw HTML.
 			.replace(/<issue\s+id="[^"]*">([^<]*)<\/issue>/g, "$1")
 			// Collapse 3+ blank lines to a single paragraph break so previews

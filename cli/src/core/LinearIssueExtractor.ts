@@ -20,7 +20,7 @@
  *      and collect every object that matches the issue shape filter.
  *
  * Shape filter (must satisfy ALL):
- *   - `id`     matches /^[A-Z][A-Z0-9_]*-\d+$/ (e.g. "JOLLI-1528")
+ *   - `id`     matches /^[A-Z][A-Z0-9_]*-\d+$/ (e.g. "PROJ-1234")
  *   - `title`  is a non-empty string
  *   - `url`    starts with "http://" or "https://"
  *

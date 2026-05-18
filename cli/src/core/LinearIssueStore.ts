@@ -41,11 +41,21 @@ export interface WriteResult {
  * Write or overwrite `<cwd>/.jolli/jollimemory/linear-issues/<ticketId>.md`.
  * Idempotent: if existing on-disk content byte-equals what we'd write, skips the write
  * to avoid touching mtime (which would trigger watchers / log noise unnecessarily).
+ *
+ * The returned `contentHash` excludes `referencedAt` (see hashLinearIssueContent)
+ * so that re-referencing the same logical issue with a fresh timestamp doesn't
+ * invalidate the guard match in SessionTracker.upsertLinearIssueEntry.
  */
 export async function writeLinearIssueMarkdown(ref: LinearIssueRef, cwd: string): Promise<WriteResult> {
 	const sourcePath = linearIssuePath(ref.ticketId, cwd);
 	const content = renderMarkdown(ref);
-	const contentHash = sha256(content);
+	// Hash via the canonical referencedAt-excluding scheme. Hashing raw `content`
+	// here (which includes referencedAt) was the original bug: every fresh MCP
+	// re-reference produced a different hash, so SessionTracker.upsertLinearIssueEntry's
+	// guard comparison always missed and the entry was wrongly resurfaced as a
+	// new uncommitted entry. hashLinearIssueContent was designed for this case
+	// from day one but stayed dead code until this fix wired it in.
+	const contentHash = hashLinearIssueContent(ref);
 
 	let existing: string | undefined;
 	try {
@@ -90,6 +100,27 @@ export async function readLinearIssueMarkdown(sourcePath: string): Promise<Linea
  */
 export function hashLinearIssueContent(ref: LinearIssueRef): string {
 	return sha256(renderMarkdown({ ...ref, referencedAt: "" }));
+}
+
+/**
+ * Compute the canonical referencedAt-excluding hash from a raw markdown
+ * string (as it lives on disk / in the orphan branch). QueueWorker uses this
+ * at archive time when it only has file bytes — without it we'd need to
+ * parse → render → hash, but the simpler path is to strip the referencedAt
+ * line and re-hash. Same scheme as `hashLinearIssueContent(ref)` so the
+ * two hashes match for the same logical content.
+ *
+ * The frontmatter is one `referencedAt: "..."` line that we rewrite to
+ * `referencedAt: ""` before hashing — mirrors hashLinearIssueContent's
+ * `{ ...ref, referencedAt: "" }` substitution at the data-shape layer.
+ */
+export function hashLinearIssueContentFromMarkdown(content: string): string {
+	// Match the rendered shape: `referencedAt: "..."` (JSON-encoded string).
+	// Only the value is rewritten — line position and indentation stay so the
+	// normalized output byte-equals what renderMarkdown produces for
+	// `{ ...ref, referencedAt: "" }`.
+	const normalized = content.replace(/^referencedAt: "[^"]*"$/m, 'referencedAt: ""');
+	return sha256(normalized);
 }
 
 /** Wrap fs.rename so callers can mock IO uniformly via LinearIssueStore. */

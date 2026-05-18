@@ -349,16 +349,16 @@ describe("SummaryMarkdownBuilder", () => {
 			it("renders linear issues with ticketId-prefixed title and upstream URL", () => {
 				// Captured during QueueWorker's associateLinearIssuesWithCommit,
 				// these end up in summary.linearIssues[]. PR-readers expect to be
-				// able to grep "JOLLI-1528" out of the description, so ticketId
+				// able to grep "PROJ-1528" out of the description, so ticketId
 				// must lead the bullet (not just the title).
 				const summary = makeSummary({
 					linearIssues: [
 						{
-							archivedKey: "JOLLI-1528-786c5330",
-							ticketId: "JOLLI-1528",
+							archivedKey: "PROJ-1528-786c5330",
+							ticketId: "PROJ-1528",
 							title:
 								"Treat referenced Linear issues as a first-class panel item",
-							url: "https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
+							url: "https://linear.app/jolliai/issue/PROJ-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
 							referencedAt: "2026-05-14T09:11:43.708Z",
 							sourceToolName: "mcp__linear__get_issue",
 						},
@@ -370,7 +370,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				expect(md).toContain("## Plans & Notes");
 				expect(md).toContain(
-					"- [JOLLI-1528 — Treat referenced Linear issues as a first-class panel item](https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and)",
+					"- [PROJ-1528 — Treat referenced Linear issues as a first-class panel item](https://linear.app/jolliai/issue/PROJ-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and)",
 				);
 			});
 
@@ -387,18 +387,18 @@ describe("SummaryMarkdownBuilder", () => {
 					],
 					linearIssues: [
 						{
-							archivedKey: "JOLLI-1-aaaa1111",
-							ticketId: "JOLLI-1",
+							archivedKey: "PROJ-1-aaaa1111",
+							ticketId: "PROJ-1",
 							title: "Linear A",
-							url: "https://linear.app/x/issue/JOLLI-1/a",
+							url: "https://linear.app/x/issue/PROJ-1/a",
 							referencedAt: "2026-05-14T09:11:43.708Z",
 							sourceToolName: "mcp__linear__get_issue",
 						},
 						{
-							archivedKey: "JOLLI-2-aaaa1111",
-							ticketId: "JOLLI-2",
+							archivedKey: "PROJ-2-aaaa1111",
+							ticketId: "PROJ-2",
 							title: "Linear B",
-							url: "https://linear.app/x/issue/JOLLI-2/b",
+							url: "https://linear.app/x/issue/PROJ-2/b",
 							referencedAt: "2026-05-14T09:11:43.708Z",
 							sourceToolName: "mcp__linear__get_issue",
 						},
@@ -419,10 +419,10 @@ describe("SummaryMarkdownBuilder", () => {
 				const summary = makeSummary({
 					linearIssues: [
 						{
-							archivedKey: "JOLLI-1-aaaa1111",
-							ticketId: "JOLLI-1",
+							archivedKey: "PROJ-1-aaaa1111",
+							ticketId: "PROJ-1",
 							title: "Solo",
-							url: "https://linear.app/x/issue/JOLLI-1/solo",
+							url: "https://linear.app/x/issue/PROJ-1/solo",
 							referencedAt: "2026-05-14T09:11:43.708Z",
 							sourceToolName: "mcp__linear__get_issue",
 						},
@@ -434,7 +434,7 @@ describe("SummaryMarkdownBuilder", () => {
 
 				expect(md).toContain("## Plans & Notes");
 				expect(md).toContain(
-					"- [JOLLI-1 — Solo](https://linear.app/x/issue/JOLLI-1/solo)",
+					"- [PROJ-1 — Solo](https://linear.app/x/issue/PROJ-1/solo)",
 				);
 			});
 

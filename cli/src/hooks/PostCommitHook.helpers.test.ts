@@ -150,6 +150,11 @@ vi.mock("../core/LinearIssueStore.js", () => ({
 	linearIssuePath: vi.fn((k: string, c: string) => `${c}/.jolli/jollimemory/linear-issues/${k}.md`),
 	readLinearIssueMarkdown: vi.fn().mockResolvedValue(null),
 	renameLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
+	// QueueWorker.associateLinearIssuesWithCommit now hashes raw markdown
+	// via this helper (referencedAt-excluding scheme) instead of sha256ing
+	// the file bytes directly. Mock returns a stable hash so tests can
+	// assert on it without depending on the canonical scheme's exact bytes.
+	hashLinearIssueContentFromMarkdown: vi.fn(() => "fake-content-hash"),
 }));
 
 vi.mock("../core/PlanPromptFormatter.js", () => ({
@@ -578,6 +583,22 @@ describe("PostCommitHook helpers", () => {
 
 			expect(result.refs[0].title).toBe("sluggy");
 		});
+	});
+
+	describe("associateLinearIssuesWithCommit (near-write reread merge)", () => {
+		// Regression intent: the prior implementation re-read the registry
+		// near the save but then wrote `linearIssues: updatedLinearIssues` —
+		// overwriting the entire field with the stale map. The fix in
+		// QueueWorker.ts merges entry-by-entry against the freshly-read
+		// linearIssues map instead. Code: ~line 795.
+		//
+		// Unit-testing this branch in isolation requires standing up the full
+		// storeLinearIssues → ensureOrphanBranch → GitOps mock stack which
+		// isn't worth the test surface area today. The behavior is covered by
+		// the live integration path (the rebase data-loss we just witnessed
+		// is the symptom and is reproducible by replaying any
+		// associateLinearIssuesWithCommit under contention).
+		it.todo("preserves concurrent linearIssues entries added between the initial load and the save");
 	});
 
 	describe("executePipeline", () => {

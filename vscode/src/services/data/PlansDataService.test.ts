@@ -99,9 +99,17 @@ describe("PlansDataService.mergeByLastModified", () => {
 			makeNote("2026-03-01T00:00:00Z", "n-new"),
 		];
 		const merged = PlansDataService.mergeByLastModified(plans, notes);
-		const order = merged.map((m) =>
-			m.kind === "plan" ? m.plan.slug : m.note.id,
-		);
+		// PlansOrNote is a 3-way union (plan / note / linearissue) since
+		// PROJ-1528 added linear-issue rows. This test only feeds plans
+		// and notes, but TypeScript still narrows by `kind` rather than
+		// the negation-of-plan implying note. Branch on each kind
+		// explicitly; the linearissue arm is unreachable but required
+		// for total-function narrowing.
+		const order = merged.map((m) => {
+			if (m.kind === "plan") return m.plan.slug;
+			if (m.kind === "note") return m.note.id;
+			return m.linearIssue.mapKey;
+		});
 		expect(order).toEqual(["p-new", "n-new", "n-old", "p-old"]);
 	});
 });
@@ -140,7 +148,7 @@ describe("PlansDataService.isEmpty", () => {
 
 function makeLinearIssue(
 	lastModified: string,
-	ticketId = "JOLLI-1",
+	ticketId = "PROJ-1",
 ): LinearIssueInfo {
 	return {
 		kind: "linearissue",
@@ -164,7 +172,7 @@ describe("PlansDataService.mergeByLastModified — three-way merge", () => {
 		const merged = PlansDataService.mergeByLastModified(
 			[],
 			[],
-			[makeLinearIssue("2026-05-14T06:00:00Z", "JOLLI-1")],
+			[makeLinearIssue("2026-05-14T06:00:00Z", "PROJ-1")],
 		);
 		expect(merged).toHaveLength(1);
 		expect(merged[0].kind).toBe("linearissue");
@@ -174,8 +182,8 @@ describe("PlansDataService.mergeByLastModified — three-way merge", () => {
 		const plans = [makePlan("2026-05-14T03:00:00Z", "plan-mid")];
 		const notes = [makeNote("2026-05-14T05:00:00Z", "note-newest")];
 		const linearIssues = [
-			makeLinearIssue("2026-05-14T01:00:00Z", "JOLLI-old"),
-			makeLinearIssue("2026-05-14T04:00:00Z", "JOLLI-mid"),
+			makeLinearIssue("2026-05-14T01:00:00Z", "PROJ-old"),
+			makeLinearIssue("2026-05-14T04:00:00Z", "PROJ-mid"),
 		];
 
 		const merged = PlansDataService.mergeByLastModified(
@@ -189,12 +197,7 @@ describe("PlansDataService.mergeByLastModified — three-way merge", () => {
 			if (m.kind === "note") return m.note.id;
 			return m.linearIssue.ticketId;
 		});
-		expect(order).toEqual([
-			"note-newest",
-			"JOLLI-mid",
-			"plan-mid",
-			"JOLLI-old",
-		]);
+		expect(order).toEqual(["note-newest", "PROJ-mid", "plan-mid", "PROJ-old"]);
 	});
 
 	it("uses kind rank for deterministic tie-break (plan < note < linearissue)", () => {
@@ -202,7 +205,7 @@ describe("PlansDataService.mergeByLastModified — three-way merge", () => {
 		const merged = PlansDataService.mergeByLastModified(
 			[makePlan(same, "p")],
 			[makeNote(same, "n")],
-			[makeLinearIssue(same, "JOLLI-1")],
+			[makeLinearIssue(same, "PROJ-1")],
 		);
 		expect(merged.map((m) => m.kind)).toEqual(["plan", "note", "linearissue"]);
 	});

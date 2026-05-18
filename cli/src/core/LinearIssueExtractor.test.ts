@@ -21,7 +21,7 @@ function toolUseLine(opts: {
 	isSidechain?: boolean;
 	inputJson?: string;
 }): string {
-	const input = opts.inputJson ?? '{"id":"JOLLI-1528"}';
+	const input = opts.inputJson ?? '{"id":"PROJ-1528"}';
 	return JSON.stringify({
 		isSidechain: opts.isSidechain ?? false,
 		message: {
@@ -59,23 +59,23 @@ function toolResultLine(opts: { toolUseId: string; timestamp: string; payload: o
 }
 
 const SAMPLE_ISSUE_PAYLOAD = {
-	id: "JOLLI-1528",
+	id: "PROJ-1528",
 	title: "Treat referenced Linear issues as a first-class panel item",
 	description: "## Problem\n\nLinear issues are high-density context.",
 	status: "In Progress",
 	priority: { value: 0, name: "No priority" },
 	labels: ["JolliMemory", "Feature"],
-	url: "https://linear.app/jolliai/issue/JOLLI-1528/treat-referenced-linear-issues",
+	url: "https://linear.app/jolliai/issue/PROJ-1528/treat-referenced-linear-issues",
 };
 
 const SAMPLE_ISSUE_PAYLOAD_2 = {
-	id: "JOLLI-1404",
+	id: "PROJ-1404",
 	title: "Include active Plans/Notes as input",
 	description: "## Problem\n\nPlans/Notes not in summarize.",
 	status: "Backlog",
 	priority: { value: 2, name: "High" },
 	labels: ["Feature"],
-	url: "https://linear.app/jolliai/issue/JOLLI-1404/include-active-plans-notes",
+	url: "https://linear.app/jolliai/issue/PROJ-1404/include-active-plans-notes",
 };
 
 function makeJsonl(...lines: string[]): string {
@@ -108,7 +108,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 
 		expect(issues).toHaveLength(1);
 		expect(issues[0]).toMatchObject({
-			ticketId: "JOLLI-1528",
+			ticketId: "PROJ-1528",
 			title: SAMPLE_ISSUE_PAYLOAD.title,
 			url: SAMPLE_ISSUE_PAYLOAD.url,
 			status: "In Progress",
@@ -139,7 +139,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 
 		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
 
-		expect(issues.map((i) => i.ticketId)).toEqual(["JOLLI-1528", "JOLLI-1404"]);
+		expect(issues.map((i) => i.ticketId)).toEqual(["PROJ-1528", "PROJ-1404"]);
 		expect(issues.every((i) => i.toolName === "mcp__linear__list_issues")).toBe(true);
 	});
 
@@ -154,7 +154,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 			toolResultLine({
 				toolUseId: "toolu_list",
 				timestamp: "2026-05-14T06:00:01.000Z",
-				payload: [{ id: "JOLLI-1528", title: "old title", url: SAMPLE_ISSUE_PAYLOAD.url }],
+				payload: [{ id: "PROJ-1528", title: "old title", url: SAMPLE_ISSUE_PAYLOAD.url }],
 			}),
 			// Then: get_issue with full description, later timestamp
 			toolUseLine({
@@ -222,7 +222,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
 
 		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("JOLLI-1528");
+		expect(issues[0].ticketId).toBe("PROJ-1528");
 	});
 
 	it("filters out payloads whose shape does not match an issue (e.g. list_teams)", async () => {
@@ -299,7 +299,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 		});
 
 		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("JOLLI-1528");
+		expect(issues[0].ticketId).toBe("PROJ-1528");
 	});
 
 	it("starts scanning from fromLineNumber and reports lastLineNumberScanned", async () => {
@@ -351,7 +351,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 	});
 
 	it("handles edge case: tool_result payload contains literal 'name:mcp__linear__list_issues' string", async () => {
-		// JOLLI-1528 itself discusses MCP tool names in its description, which means a real Linear
+		// PROJ-1528 itself discusses MCP tool names in its description, which means a real Linear
 		// payload can include the substring "name":"mcp__linear__list_issues". The two-tier filter
 		// + role-based dispatch must classify this line as a tool_result (role=user), not as a
 		// tool_use (which would require role=assistant). Otherwise we'd mis-handle the payload.
@@ -411,7 +411,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 			toolResultLine({
 				toolUseId: "toolu_empty_title",
 				timestamp: "2026-05-14T06:00:01.000Z",
-				payload: { id: "JOLLI-1", title: "", url: "https://linear.app/x/JOLLI-1" },
+				payload: { id: "PROJ-1", title: "", url: "https://linear.app/x/PROJ-1" },
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
@@ -429,7 +429,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 			toolResultLine({
 				toolUseId: "toolu_bad_url",
 				timestamp: "2026-05-14T06:00:01.000Z",
-				payload: { id: "JOLLI-1", title: "x", url: "ftp://linear.app/x" },
+				payload: { id: "PROJ-1", title: "x", url: "ftp://linear.app/x" },
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
@@ -457,7 +457,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
 
 		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("JOLLI-1528");
+		expect(issues[0].ticketId).toBe("PROJ-1528");
 	});
 
 	it("skips entries that aren't valid JSON without breaking the rest", async () => {
@@ -654,7 +654,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 
 		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
 		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("JOLLI-1528");
+		expect(issues[0].ticketId).toBe("PROJ-1528");
 	});
 
 	it("handles a tool_use entry that has no timestamp field", async () => {
@@ -668,7 +668,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 						type: "tool_use",
 						id: "toolu_no_ts",
 						name: "mcp__linear__get_issue",
-						input: { id: "JOLLI-1528" },
+						input: { id: "PROJ-1528" },
 					},
 				],
 			},
@@ -743,7 +743,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 			toolResultLine({
 				toolUseId: "toolu_min",
 				timestamp: "2026-05-14T06:00:01.000Z",
-				payload: { id: "JOLLI-99", title: "minimal", url: "https://linear.app/x/JOLLI-99" },
+				payload: { id: "PROJ-99", title: "minimal", url: "https://linear.app/x/PROJ-99" },
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
@@ -762,9 +762,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 
 function makeRef(overrides: Partial<LinearIssueRef> = {}): LinearIssueRef {
 	return {
-		ticketId: "JOLLI-1528",
+		ticketId: "PROJ-1528",
 		title: "Treat referenced Linear issues",
-		url: "https://linear.app/jolliai/issue/JOLLI-1528/",
+		url: "https://linear.app/jolliai/issue/PROJ-1528/",
 		status: "In Progress",
 		priority: "No priority",
 		labels: ["JolliMemory", "Feature"],
@@ -785,12 +785,12 @@ describe("formatLinearIssuesBlock", () => {
 
 		expect(out).toContain("<linear-issues>");
 		expect(out).toContain("</linear-issues>");
-		expect(out).toContain('id="JOLLI-1528"');
+		expect(out).toContain('id="PROJ-1528"');
 		expect(out).toContain('status="In Progress"');
 		expect(out).toContain('priority="No priority"');
 		expect(out).toContain('labels="JolliMemory, Feature"');
 		expect(out).toContain("<title>Treat referenced Linear issues</title>");
-		expect(out).toContain("<url>https://linear.app/jolliai/issue/JOLLI-1528/</url>");
+		expect(out).toContain("<url>https://linear.app/jolliai/issue/PROJ-1528/</url>");
 		expect(out).toContain("<description>");
 		expect(out).toContain("</description>");
 		expect(out).toContain("Linear issues are high-density");
@@ -833,17 +833,17 @@ describe("formatLinearIssuesBlock", () => {
 	it("enforces maxTotalChars by dropping oldest-referenced issues first", () => {
 		const refs = [
 			makeRef({
-				ticketId: "JOLLI-1",
+				ticketId: "PROJ-1",
 				description: "x".repeat(2500),
 				referencedAt: "2026-05-14T01:00:00.000Z",
 			}),
 			makeRef({
-				ticketId: "JOLLI-2",
+				ticketId: "PROJ-2",
 				description: "y".repeat(2500),
 				referencedAt: "2026-05-14T02:00:00.000Z",
 			}),
 			makeRef({
-				ticketId: "JOLLI-3",
+				ticketId: "PROJ-3",
 				description: "z".repeat(2500),
 				referencedAt: "2026-05-14T03:00:00.000Z",
 			}),
@@ -855,8 +855,8 @@ describe("formatLinearIssuesBlock", () => {
 		});
 
 		expect(out.length).toBeLessThanOrEqual(6500); // small wrapper budget
-		expect(out).toContain('id="JOLLI-3"'); // newest preserved
-		expect(out).not.toContain('id="JOLLI-1"'); // oldest dropped
+		expect(out).toContain('id="PROJ-3"'); // newest preserved
+		expect(out).not.toContain('id="PROJ-1"'); // oldest dropped
 	});
 
 	it("returns empty when the budget is too small to fit even one issue", () => {
@@ -866,16 +866,16 @@ describe("formatLinearIssuesBlock", () => {
 
 	it("renders refs in ascending referencedAt order", () => {
 		const refs = [
-			makeRef({ ticketId: "JOLLI-3", referencedAt: "2026-05-14T03:00:00.000Z" }),
-			makeRef({ ticketId: "JOLLI-1", referencedAt: "2026-05-14T01:00:00.000Z" }),
-			makeRef({ ticketId: "JOLLI-2", referencedAt: "2026-05-14T02:00:00.000Z" }),
+			makeRef({ ticketId: "PROJ-3", referencedAt: "2026-05-14T03:00:00.000Z" }),
+			makeRef({ ticketId: "PROJ-1", referencedAt: "2026-05-14T01:00:00.000Z" }),
+			makeRef({ ticketId: "PROJ-2", referencedAt: "2026-05-14T02:00:00.000Z" }),
 		];
 
 		const out = formatLinearIssuesBlock(refs);
 
-		const idx1 = out.indexOf('id="JOLLI-1"');
-		const idx2 = out.indexOf('id="JOLLI-2"');
-		const idx3 = out.indexOf('id="JOLLI-3"');
+		const idx1 = out.indexOf('id="PROJ-1"');
+		const idx2 = out.indexOf('id="PROJ-2"');
+		const idx3 = out.indexOf('id="PROJ-3"');
 		expect(idx1).toBeLessThan(idx2);
 		expect(idx2).toBeLessThan(idx3);
 	});
@@ -890,7 +890,7 @@ describe("formatLinearIssuesBlock", () => {
 
 		const out = formatLinearIssuesBlock([minimal]);
 
-		expect(out).toContain('id="JOLLI-1528"');
+		expect(out).toContain('id="PROJ-1528"');
 		expect(out).not.toContain("status=");
 		expect(out).not.toContain("priority=");
 		expect(out).not.toContain("labels=");
