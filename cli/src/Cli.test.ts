@@ -195,7 +195,7 @@ vi.mock("./core/ContextCompiler.js", () => ({
 		},
 		estimatedTokens: 0,
 	}),
-	DEFAULT_TOKEN_BUDGET: 50000,
+	DEFAULT_TOKEN_BUDGET: 20000,
 }));
 
 // Suppress console output
@@ -206,7 +206,12 @@ vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
 import { main } from "./Cli.js";
-import { compileTaskContext, listBranchCatalog, renderContextMarkdown } from "./core/ContextCompiler.js";
+import {
+	buildRecallPayload,
+	compileTaskContext,
+	listBranchCatalog,
+	renderContextMarkdown,
+} from "./core/ContextCompiler.js";
 import { loadConfigFromDir } from "./core/SessionTracker.js";
 import { exportSummaries } from "./core/SummaryExporter.js";
 import { hasMigrationMeta, migrateV1toV3 } from "./core/SummaryMigration.js";
@@ -1836,7 +1841,7 @@ describe("CLI", () => {
 			await main(["recall", "--catalog", "--format", "json", "--cwd", "/tmp/test"]);
 
 			expect(listBranchCatalog).toHaveBeenCalledWith("/tmp/test");
-			expect(console.log).toHaveBeenCalledWith(JSON.stringify(catalog, null, 2));
+			expect(console.log).toHaveBeenCalledWith(JSON.stringify(catalog));
 		});
 
 		it("should output markdown context for an exact branch match", async () => {
@@ -1933,6 +1938,99 @@ describe("CLI", () => {
 					(typeof c[0] === "string" && c[0].includes('"type": "recall"')),
 			);
 			expect(jsonCall).toBeDefined();
+		});
+
+		it("--verbose forwards verbose: true to buildRecallPayload", async () => {
+			// The real buildRecallPayload is mocked at module-load time (see top
+			// of file), so this test asserts the CLI surface — i.e. that the
+			// flag arrives at the projection layer. The behavioural contract
+			// (minor drop + >8-commit response drop opt-out) is covered by the
+			// unit tests in ContextCompiler.test.ts which exercise the real
+			// implementation.
+			vi.mocked(listBranchCatalog).mockResolvedValueOnce({
+				type: "catalog",
+				branches: [
+					{
+						branch: "feature/keep-everything",
+						commitCount: 9,
+						period: { start: "2026-05-15", end: "2026-05-17" },
+						commitMessages: ["c"],
+					},
+				],
+			});
+			vi.mocked(compileTaskContext).mockResolvedValueOnce({
+				branch: "feature/keep-everything",
+				period: { start: "2026-05-15", end: "2026-05-17" },
+				commitCount: 9,
+				totalFilesChanged: 1,
+				totalInsertions: 1,
+				totalDeletions: 0,
+				summaries: [],
+				plans: [],
+				notes: [],
+				keyDecisions: [],
+				stats: {
+					topicCount: 0,
+					planCount: 0,
+					noteCount: 0,
+					decisionCount: 0,
+					topicTokens: 0,
+					planTokens: 0,
+					noteTokens: 0,
+					decisionTokens: 0,
+					transcriptTokens: 0,
+					totalTokens: 0,
+				},
+			});
+
+			await main(["recall", "feature/keep-everything", "--format", "json", "--verbose", "--cwd", "/tmp/test"]);
+
+			// The third positional arg to buildRecallPayload must carry verbose:true.
+			expect(buildRecallPayload).toHaveBeenCalledWith(expect.anything(), expect.any(Number), { verbose: true });
+		});
+
+		it("recall without --verbose forwards verbose: false to buildRecallPayload (default trim active)", async () => {
+			vi.mocked(listBranchCatalog).mockResolvedValueOnce({
+				type: "catalog",
+				branches: [
+					{
+						branch: "feature/keep-everything",
+						commitCount: 3,
+						period: { start: "2026-05-15", end: "2026-05-17" },
+						commitMessages: ["c"],
+					},
+				],
+			});
+			vi.mocked(compileTaskContext).mockResolvedValueOnce({
+				branch: "feature/keep-everything",
+				period: { start: "2026-05-15", end: "2026-05-17" },
+				commitCount: 3,
+				totalFilesChanged: 1,
+				totalInsertions: 1,
+				totalDeletions: 0,
+				summaries: [],
+				plans: [],
+				notes: [],
+				keyDecisions: [],
+				stats: {
+					topicCount: 0,
+					planCount: 0,
+					noteCount: 0,
+					decisionCount: 0,
+					topicTokens: 0,
+					planTokens: 0,
+					noteTokens: 0,
+					decisionTokens: 0,
+					transcriptTokens: 0,
+					totalTokens: 0,
+				},
+			});
+
+			await main(["recall", "feature/keep-everything", "--format", "json", "--cwd", "/tmp/test"]);
+
+			// Default path: third arg explicitly carries verbose:false so the
+			// projection layer's pre-passes engage as designed.
+			expect(buildRecallPayload).toHaveBeenCalledWith(expect.anything(), expect.any(Number), { verbose: false });
 		});
 
 		it("should output error JSON when commitCount is 0", async () => {
@@ -2268,7 +2366,7 @@ describe("CLI", () => {
 			await main(["context", "--catalog", "--format", "json", "--cwd", "/tmp/test"]);
 
 			expect(listBranchCatalog).toHaveBeenCalledWith("/tmp/test");
-			expect(console.log).toHaveBeenCalledWith(JSON.stringify(catalog, null, 2));
+			expect(console.log).toHaveBeenCalledWith(JSON.stringify(catalog));
 		});
 
 		it("should output markdown (not JSON) when no exact match and format is not json", async () => {
