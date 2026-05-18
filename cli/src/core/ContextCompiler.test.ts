@@ -1648,30 +1648,6 @@ describe("buildRecallPayload", () => {
 		expect(payload.truncated).toBeUndefined();
 	});
 
-	it("does not drop minor topics when called with verbose: true", () => {
-		const summary = makeSummary({
-			topics: [
-				{
-					title: "Major",
-					trigger: "t",
-					response: "r",
-					decisions: "d",
-					importance: "major",
-				},
-				{
-					title: "Minor",
-					trigger: "t",
-					response: "r",
-					decisions: "d",
-					importance: "minor",
-				},
-			],
-		});
-		const payload = buildRecallPayload(makeCtx({ summaries: [summary] }), 100_000, { verbose: true });
-		expect(payload.commits[0].topics).toHaveLength(2);
-		expect(payload.truncated).toBeUndefined();
-	});
-
 	it("keeps topic.response for branches with at most 8 commits", () => {
 		const summaries = Array.from({ length: 8 }, (_, i) =>
 			makeSummary({
@@ -1717,26 +1693,6 @@ describe("buildRecallPayload", () => {
 		expect(payload.truncated).toBe(true);
 	});
 
-	it("keeps topic.response on >8 commits when called with verbose: true", () => {
-		const summaries = Array.from({ length: 12 }, (_, i) =>
-			makeSummary({
-				commitHash: `eeeeeeee00000000000000000000000000000${String(i).padStart(3, "0")}`.slice(0, 40),
-				topics: [
-					{
-						title: `T${i}`,
-						trigger: `trig-${i}`,
-						response: `resp-${i}`,
-						decisions: `dec-${i}`,
-						importance: "major",
-					},
-				],
-			}),
-		);
-		const payload = buildRecallPayload(makeCtx({ summaries, commitCount: 12 }), 100_000, { verbose: true });
-		expect(payload.commits.every((c) => c.topics[0].response !== undefined)).toBe(true);
-		expect(payload.truncated).toBeUndefined();
-	});
-
 	it("applies the >8-commit response-drop tier after minor-topic filtering, not before", () => {
 		// Build 10 commits but 3 of them are all-minor → after minor filter we have 7 commits.
 		// 7 ≤ 8, so the tier MUST NOT fire even though the raw count was >8.
@@ -1778,6 +1734,41 @@ describe("buildRecallPayload", () => {
 		// 7 commits survived the minor filter; that's ≤8, so response stays.
 		expect(payload.commits).toHaveLength(7);
 		expect(payload.commits.every((c) => c.topics[0].response !== undefined)).toBe(true);
+	});
+
+	it("chains pre-pass 2 with the budget loop: response stripped by tier, trigger stripped by budget on oldest", () => {
+		// 12 commits, each topic with verbose trigger + response. The tier
+		// (>8) drops every response. Budget then runs Step 2 (drop trigger
+		// from oldest commits) until measure() <= budget. The middle / newest
+		// commits keep their trigger; the oldest one(s) lose it. Decisions
+		// survives on every kept commit. The budget loop's Step 1 (drop
+		// response) is dead code on this path — pre-pass 2 already cleared
+		// it; the new responseAlreadyStripped guard skips Step 1 entirely.
+		const summaries = Array.from({ length: 12 }, (_, i) =>
+			makeSummary({
+				commitHash: `12345678000000000000000000000000000000${String(i).padStart(2, "0")}`.slice(0, 40),
+				topics: [
+					{
+						title: `T${i}`,
+						trigger: "T".repeat(1500),
+						response: "R".repeat(1500),
+						decisions: `dec-${i}`,
+						importance: "major",
+					},
+				],
+			}),
+		);
+		const payload = buildRecallPayload(makeCtx({ summaries, commitCount: 12 }), 2000);
+		expect(payload.truncated).toBe(true);
+		// Pre-pass 2: response gone everywhere.
+		expect(payload.commits.every((c) => c.topics[0].response === undefined)).toBe(true);
+		// Budget loop: at least the oldest commit lost trigger to fit the
+		// 2000-token budget; the newest commit kept its trigger because the
+		// loop stops as soon as measure() <= budget.
+		expect(payload.commits[0].topics[0].trigger).toBeUndefined();
+		expect(payload.commits[payload.commits.length - 1].topics[0].trigger).toBe("T".repeat(1500));
+		// Decisions survive on every kept commit (skill-template invariant).
+		expect(payload.commits.every((c) => typeof c.topics[0].decisions === "string")).toBe(true);
 	});
 });
 

@@ -171,7 +171,6 @@ async function outputRecall(
 		format?: string;
 		full?: boolean;
 		output?: string;
-		verbose?: boolean;
 	},
 	projectDir: string,
 ): Promise<void> {
@@ -219,9 +218,7 @@ async function outputRecall(
 	// from the structured fields; we deliberately do NOT pre-render markdown
 	// here (it would tempt the LLM back into paraphrase mode).
 	if (options.format === "json") {
-		const payload = buildRecallPayload(ctx, options.budget ?? DEFAULT_TOKEN_BUDGET, {
-			verbose: options.verbose === true,
-		});
+		const payload = buildRecallPayload(ctx, options.budget ?? DEFAULT_TOKEN_BUDGET);
 		console.log(JSON.stringify(payload));
 		return;
 	}
@@ -253,10 +250,6 @@ export function registerRecallCommand(program: Command): void {
 		.option("--include-transcripts", "Include transcript excerpts")
 		.option("--no-plans", "Exclude plan content")
 		.option("--catalog", "List all recorded branches (lightweight)")
-		.option(
-			"--verbose",
-			"Disable the minor-topic and >8-commit response pre-trims. Budget-driven trimming still applies — pass a higher --budget if you also want to suppress that.",
-		)
 		.option(
 			"--arg-stdin",
 			"Read the branch/keyword argument from stdin instead of argv (used by SKILL.md here-doc bridge)",
