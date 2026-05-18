@@ -96,6 +96,8 @@ data class LlmCallMetadata(
     val outputTokens: Int,
     val apiLatencyMs: Long,
     val stopReason: String?,
+    /** Which credential source produced this summary (e.g. "anthropic-config", "jolli-proxy"). */
+    val source: String? = null,
 )
 
 /** How the commit was created */

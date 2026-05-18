@@ -13,7 +13,11 @@ object LlmClient {
 
     private val log = JmLogger.create("LlmClient")
 
-    enum class CredentialSource { ANTHROPIC_CONFIG, ANTHROPIC_ENV, JOLLI_PROXY }
+    enum class CredentialSource(val wireValue: String) {
+        ANTHROPIC_CONFIG("anthropic-config"),
+        ANTHROPIC_ENV("anthropic-env"),
+        JOLLI_PROXY("jolli-proxy"),
+    }
 
     data class LlmCallResult(
         val text: String?,
@@ -22,6 +26,8 @@ object LlmClient {
         val outputTokens: Int,
         val apiLatencyMs: Long,
         val stopReason: String?,
+        /** Which credential source produced this result (e.g. "anthropic-config", "jolli-proxy"). */
+        val source: String? = null,
     )
 
     /**
@@ -73,11 +79,12 @@ object LlmClient {
 
         log.info("LLM call: action=%s, source=%s", action, source)
 
-        return when (source) {
+        val result = when (source) {
             CredentialSource.ANTHROPIC_CONFIG -> callDirect(prompt!!, apiKey!!, model, maxTokens)
             CredentialSource.ANTHROPIC_ENV -> callDirect(prompt!!, System.getenv("ANTHROPIC_API_KEY"), model, maxTokens)
             CredentialSource.JOLLI_PROXY -> callProxy(jolliApiKey!!, action, params)
         }
+        return result.copy(source = source.wireValue)
     }
 
     private fun callDirect(prompt: String, apiKey: String, model: String?, maxTokens: Int?): LlmCallResult {
