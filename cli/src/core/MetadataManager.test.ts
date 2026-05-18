@@ -339,6 +339,28 @@ describe("MetadataManager", () => {
 			expect(manager.reconcile(kbRoot)).toBe(0);
 		});
 
+		// Coverage: line that pushes a still-on-disk entry unchanged during a
+		// slow-path reconcile. Existing "no changes when files in place" hits
+		// the fast-path early return at `!anyStale`; this case enters the
+		// slow path (one missing entry triggers it) and keeps the surviving
+		// entry intact.
+		it("keeps an unmoved entry intact when another entry's file disappeared", () => {
+			const kbRoot = join(jolliDir, "..");
+			mkdirSync(join(kbRoot, "main"), { recursive: true });
+			// Entry A's file is present → fast-path-pushed (line 202).
+			writeFileSync(join(kbRoot, "main/present.md"), "# Present");
+			manager.updateManifest(makeEntry({ path: "main/present.md", fileId: "A", fingerprint: "fpA" }));
+			// Entry B's file is missing → triggers slow-path scan + keeps the
+			// orphan to avoid data loss.
+			manager.updateManifest(makeEntry({ path: "main/gone.md", fileId: "B", fingerprint: "fpB" }));
+
+			const fixed = manager.reconcile(kbRoot);
+			// No fingerprint match for B; A stays unchanged.
+			expect(fixed).toBe(0);
+			expect(manager.findById("A")?.path.replace(/\\/g, "/")).toBe("main/present.md");
+			expect(manager.findById("B")?.path.replace(/\\/g, "/")).toBe("main/gone.md");
+		});
+
 		it("walkDir skips dot-prefixed dirs and non-md files while scanning fingerprints", () => {
 			const kbRoot = join(jolliDir, "..");
 			mkdirSync(join(kbRoot, "main"), { recursive: true });

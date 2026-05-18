@@ -34,6 +34,12 @@ const mockExtensionUri = {
 // Mock vscode module — Uri.joinPath, Uri.file, and window.createOutputChannel are needed.
 // window.createOutputChannel is used by Logger (imported transitively via the log.info calls
 // added to pushCommits/pushMemories for diagnostic purposes).
+//
+// `workspace.workspaceFolders` is also referenced from `branch:openConversation`'s
+// happy path (`vscode.workspace.workspaceFolders?.[0]?.uri.fsPath` becomes the
+// `projectDir` passed to ConversationDetailsPanel.show). The mock value is an
+// array so tests can mutate the first slot per-case without re-mocking.
+const mockWorkspaceFolders: Array<{ uri: { fsPath: string } }> = [];
 vi.mock("vscode", () => ({
 	Uri: {
 		joinPath: vi.fn((_base: unknown, ...segments: string[]) => ({
@@ -49,6 +55,22 @@ vi.mock("vscode", () => ({
 			show: vi.fn(),
 			dispose: vi.fn(),
 		})),
+	},
+	workspace: {
+		get workspaceFolders() {
+			return mockWorkspaceFolders.length > 0 ? mockWorkspaceFolders : undefined;
+		},
+	},
+}));
+
+// Stub ConversationDetailsPanel.show so happy-path branch:openConversation
+// tests can assert how the host wires its arguments — and grab the
+// `onSessionHidden` callback so we can invoke it and prove pushConversations
+// fires when the panel reports a list-level hide.
+const showMock = vi.fn();
+vi.mock("./ConversationDetailsPanel.js", () => ({
+	ConversationDetailsPanel: {
+		show: (...args: unknown[]) => showMock(...args),
 	},
 }));
 
@@ -851,6 +873,193 @@ describe("SidebarWebviewProvider", () => {
 		expect(
 			msgs.filter((m) => m.type === "branch:commitsData").length,
 		).toBeGreaterThanOrEqual(2);
+	});
+
+	it("rejects branch:openConversation with an unknown source (TranscriptSource allow-list)", () => {
+		// `source` arrives from the webview message bus; static typing alone
+		// is not a boundary check. A crafted payload with a value outside
+		// the closed TranscriptSource enum must be dropped silently and
+		// must NOT call into ConversationDetailsPanel.show.
+		const view = makeMockView();
+		const exec = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: { fsPath: "/mock", with: () => ({}) } as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:openConversation",
+			sessionId: "s1",
+			source: "../../etc/passwd",
+			transcriptPath: "/tmp/x.jsonl",
+			title: "spoofed",
+		});
+		// No command dispatched, no panel created (we trust the dispatcher
+		// returned without invoking ConversationDetailsPanel.show).
+		expect(exec).not.toHaveBeenCalled();
+	});
+
+	// Source goes through `isTranscriptSource`, but the rest of the payload
+	// is just trusted today. Defence in depth: sessionId / transcriptPath /
+	// title each cross a trust boundary into either the file system
+	// (createReadStream(transcriptPath)) or the panel DOM (escapeHtml(title))
+	// or the panel registry key. Anything that isn't a non-empty string
+	// must be dropped at the dispatcher rather than forwarded.
+	it.each([
+		[
+			"sessionId is missing",
+			{ source: "claude", transcriptPath: "/t.jsonl", title: "ok" },
+		],
+		[
+			"sessionId is empty",
+			{
+				sessionId: "",
+				source: "claude",
+				transcriptPath: "/t.jsonl",
+				title: "ok",
+			},
+		],
+		[
+			"sessionId is a number",
+			{
+				sessionId: 42,
+				source: "claude",
+				transcriptPath: "/t.jsonl",
+				title: "ok",
+			},
+		],
+		[
+			"transcriptPath is missing",
+			{ sessionId: "s1", source: "claude", title: "ok" },
+		],
+		[
+			"transcriptPath is empty",
+			{ sessionId: "s1", source: "claude", transcriptPath: "", title: "ok" },
+		],
+		[
+			"transcriptPath is a boolean",
+			{ sessionId: "s1", source: "claude", transcriptPath: true, title: "ok" },
+		],
+		[
+			"title is missing",
+			{ sessionId: "s1", source: "claude", transcriptPath: "/t.jsonl" },
+		],
+		[
+			"title is empty",
+			{
+				sessionId: "s1",
+				source: "claude",
+				transcriptPath: "/t.jsonl",
+				title: "",
+			},
+		],
+		[
+			"title is an object",
+			{
+				sessionId: "s1",
+				source: "claude",
+				transcriptPath: "/t.jsonl",
+				title: { x: 1 },
+			},
+		],
+	])("rejects branch:openConversation when %s", (_label, badFields) => {
+		const view = makeMockView();
+		const exec = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: { fsPath: "/mock", with: () => ({}) } as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:openConversation",
+			...badFields,
+		});
+		// Dispatcher must short-circuit before any host-side side-effect.
+		expect(exec).not.toHaveBeenCalled();
+	});
+
+	// Happy-path: a well-formed `branch:openConversation` reaches
+	// ConversationDetailsPanel.show with the workspace folder threaded through
+	// as `projectDir`. The onSessionHidden callback the host hands the panel
+	// must, when invoked, kick a re-pull of conversations so the now-hidden
+	// row disappears.
+	it("dispatches branch:openConversation to ConversationDetailsPanel.show with projectDir threaded and onSessionHidden re-pulls", () => {
+		showMock.mockReset();
+		mockWorkspaceFolders.length = 0;
+		mockWorkspaceFolders.push({ uri: { fsPath: "/abs/proj" } });
+		try {
+			const view = makeMockView();
+			const listWithDiagnostics = vi
+				.fn()
+				.mockResolvedValue({ items: [], failedSources: [] });
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn() as never,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					configured: true,
+					activeTab: "branch",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: { fsPath: "/mock", with: () => ({}) } as never,
+				activeSessionsProvider: { listWithDiagnostics } as unknown as never,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({
+				type: "branch:openConversation",
+				sessionId: "claude-sess-1",
+				source: "claude",
+				transcriptPath: "/tmp/sess.jsonl",
+				title: "Wire dark mode",
+			});
+			expect(showMock).toHaveBeenCalledTimes(1);
+			const call = showMock.mock.calls[0][0] as {
+				sessionId: string;
+				source: string;
+				transcriptPath: string;
+				title: string;
+				projectDir: string;
+				onSessionHidden: () => void;
+			};
+			expect(call.sessionId).toBe("claude-sess-1");
+			expect(call.source).toBe("claude");
+			expect(call.transcriptPath).toBe("/tmp/sess.jsonl");
+			expect(call.title).toBe("Wire dark mode");
+			// workspaceFolders[0].uri.fsPath flowed through as projectDir —
+			// the panel uses it to resolve the conversation-edits overlay
+			// directory. A missing/empty workspace would have left this
+			// undefined; the mock pushes a folder so the happy branch runs.
+			expect(call.projectDir).toBe("/abs/proj");
+
+			// Invoking the captured onSessionHidden simulates the panel
+			// finishing a "Mark All as Deleted" save. The arrow is what
+			// re-pulls conversations so the now-hidden row disappears from
+			// the CONVERSATIONS list. Without this assertion the closure
+			// stays uncovered by v8 (the arrow counts as its own function).
+			listWithDiagnostics.mockClear();
+			call.onSessionHidden();
+			expect(listWithDiagnostics).toHaveBeenCalled();
+		} finally {
+			mockWorkspaceFolders.length = 0;
+		}
 	});
 
 	it("forwards branch:openCommit via jollimemory.viewSummary", () => {
@@ -1779,6 +1988,7 @@ describe("SidebarWebviewProvider", () => {
 	function makeSelectionProvider(opts: {
 		listRepos: ReturnType<typeof vi.fn>;
 		listBranches: ReturnType<typeof vi.fn>;
+		listBranchMemories?: ReturnType<typeof vi.fn>;
 		currentRepoName?: string;
 	}): SidebarWebviewProvider {
 		return new SidebarWebviewProvider({
@@ -1797,6 +2007,11 @@ describe("SidebarWebviewProvider", () => {
 			selection: {
 				listRepos: opts.listRepos,
 				listBranches: opts.listBranches,
+				// Default to an empty-result stub so callers that only care
+				// about listRepos/listBranches keep working — the
+				// `selection:requestBranchMemories` tests configure their own.
+				listBranchMemories:
+					opts.listBranchMemories ?? vi.fn().mockResolvedValue([]),
 			},
 		});
 	}
@@ -1974,5 +2189,426 @@ describe("SidebarWebviewProvider", () => {
 			(c) => (c[0] as SidebarInboundMsg).type,
 		);
 		expect(sent.filter((t) => t.startsWith("selection:"))).toEqual([]);
+	});
+
+	// ── selection:requestBranchMemories lazy-data channel ──────────────────
+	// The Branch tab's "Memories" section is lazy-loaded: when the user picks
+	// a foreign repo/branch, the webview sends `selection:requestBranchMemories`
+	// and the host replies with `selection:branchMemories`. The response MUST
+	// echo back the requested repoName+branchName so the webview can match it
+	// against its cache key — a faster newer request may have overwritten the
+	// in-flight selection state by the time the response lands.
+
+	it("selection:requestBranchMemories posts branch memories on success", async () => {
+		const view = makeMockView();
+		const items = [
+			{
+				commitHash: "abc123",
+				title: "Wire up dark mode",
+				branch: "feature-x",
+				repoName: "other-repo",
+				timestamp: 1_700_000_000_000,
+			},
+		];
+		const listBranchMemories = vi.fn().mockResolvedValue(items);
+		const provider = makeSelectionProvider({
+			listRepos: vi.fn().mockReturnValue([]),
+			listBranches: vi.fn().mockReturnValue([]),
+			listBranchMemories,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		view.webview.triggerMessage({
+			type: "selection:requestBranchMemories",
+			repoName: "other-repo",
+			branchName: "feature-x",
+		});
+		// handleBranchMemoriesRequest is async; let the microtask queue drain
+		// so the post-await postMessage runs before we inspect the calls.
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(listBranchMemories).toHaveBeenCalledWith("other-repo", "feature-x");
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => c[0],
+		) as SidebarInboundMsg[];
+		expect(sent).toContainEqual({
+			type: "selection:branchMemories",
+			repoName: "other-repo",
+			branchName: "feature-x",
+			items,
+		});
+	});
+
+	it("selection:requestBranchMemories posts empty items when listBranchMemories throws", async () => {
+		const view = makeMockView();
+		const listBranchMemories = vi
+			.fn()
+			.mockRejectedValue(new Error("kbRoot unreadable"));
+		const provider = makeSelectionProvider({
+			listRepos: vi.fn().mockReturnValue([]),
+			listBranches: vi.fn().mockReturnValue([]),
+			listBranchMemories,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		view.webview.triggerMessage({
+			type: "selection:requestBranchMemories",
+			repoName: "foreign",
+			branchName: "topic",
+		});
+		// Two microtask flushes: one for the await on listBranchMemories
+		// (rejection), one for the catch-arm postMessage.
+		await Promise.resolve();
+		await Promise.resolve();
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => c[0],
+		) as SidebarInboundMsg[];
+		// The catch arm still posts a response — empty items — so the webview
+		// can resolve its Loading state instead of spinning forever. The
+		// repoName/branchName echo is preserved so cache keys still match.
+		expect(sent).toContainEqual({
+			type: "selection:branchMemories",
+			repoName: "foreign",
+			branchName: "topic",
+			items: [],
+		});
+	});
+
+	it("selection:requestBranchMemories survives a non-Error rejection from listBranchMemories", async () => {
+		// The catch arm reads `err instanceof Error ? err.message : String(err)`.
+		// Rejections from native handlers / older runtimes sometimes throw
+		// non-Error values; the `String(err)` fallback path stays uncovered
+		// unless we throw a string here, which would otherwise leave a
+		// subtle log-format regression undetected by tests.
+		const view = makeMockView();
+		const listBranchMemories = vi.fn().mockRejectedValue("not-an-error");
+		const provider = makeSelectionProvider({
+			listRepos: vi.fn().mockReturnValue([]),
+			listBranches: vi.fn().mockReturnValue([]),
+			listBranchMemories,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		view.webview.triggerMessage({
+			type: "selection:requestBranchMemories",
+			repoName: "foreign",
+			branchName: "topic",
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => c[0],
+		) as SidebarInboundMsg[];
+		expect(sent).toContainEqual({
+			type: "selection:branchMemories",
+			repoName: "foreign",
+			branchName: "topic",
+			items: [],
+		});
+	});
+
+	it("selection:requestBranchMemories is silently ignored when the selection dep is absent", async () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+				currentRepoName: "workspace-repo",
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		view.webview.triggerMessage({
+			type: "selection:requestBranchMemories",
+			repoName: "anything",
+			branchName: "any-branch",
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		// No selection:branchMemories was posted because the dep isn't wired.
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => (c[0] as SidebarInboundMsg).type,
+		);
+		expect(sent).not.toContain("selection:branchMemories");
+	});
+
+	// ── Active Conversations failedSources plumbing ─────────────────────────
+	// pushConversations must use listWithDiagnostics() (not list()) so the
+	// webview can render a partial-data hint when some discoverers fail. The
+	// previous wiring called list() and dropped failedSources on the floor.
+	it("pushConversations forwards failedSources from activeSessionsProvider.listWithDiagnostics", async () => {
+		const view = makeMockView();
+		const listWithDiagnostics = vi.fn().mockResolvedValue({
+			items: [
+				{
+					sessionId: "s1",
+					source: "cursor",
+					title: "Cursor session",
+					messageCount: 4,
+					updatedAt: "2026-05-17T10:00:00.000Z",
+					transcriptPath: "/state.vscdb#s1",
+				},
+			],
+			failedSources: ["opencode", "copilot"],
+		});
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			activeSessionsProvider: { listWithDiagnostics } as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
+		const conv = view.webview.postMessage.mock.calls
+			.map((c) => c[0] as SidebarInboundMsg)
+			.find(
+				(m): m is SidebarInboundMsg & { type: "branch:conversationsData" } =>
+					m.type === "branch:conversationsData",
+			);
+		expect(conv).toBeDefined();
+		expect(listWithDiagnostics).toHaveBeenCalled();
+		expect(
+			(conv as { failedSources?: readonly string[] }).failedSources,
+		).toEqual(["opencode", "copilot"]);
+		expect((conv as { items: readonly unknown[] }).items).toHaveLength(1);
+	});
+
+	it("pushConversations posts empty failedSources when listWithDiagnostics throws", async () => {
+		const view = makeMockView();
+		const listWithDiagnostics = vi
+			.fn()
+			.mockRejectedValue(new Error("provider down"));
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			activeSessionsProvider: { listWithDiagnostics } as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
+		const conv = view.webview.postMessage.mock.calls
+			.map((c) => c[0] as SidebarInboundMsg)
+			.find(
+				(m): m is SidebarInboundMsg & { type: "branch:conversationsData" } =>
+					m.type === "branch:conversationsData",
+			);
+		expect(conv).toBeDefined();
+		expect((conv as { items: readonly unknown[] }).items).toEqual([]);
+		expect(
+			(conv as { failedSources?: readonly string[] }).failedSources,
+		).toEqual([]);
+	});
+
+	// Mirrors the Error-rejection test above but throws a non-Error value to
+	// pin the `err instanceof Error ? err.message : err` ternary in the catch
+	// arm of pushConversations. Without this case the log-format fallback
+	// branch stays uncovered and a regression that always assumed Error
+	// shape would slip past the suite.
+	it("pushConversations still recovers when listWithDiagnostics rejects with a non-Error", async () => {
+		const view = makeMockView();
+		const listWithDiagnostics = vi.fn().mockRejectedValue("plain-string");
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			activeSessionsProvider: { listWithDiagnostics } as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
+		const conv = view.webview.postMessage.mock.calls
+			.map((c) => c[0] as SidebarInboundMsg)
+			.find(
+				(m): m is SidebarInboundMsg & { type: "branch:conversationsData" } =>
+					m.type === "branch:conversationsData",
+			);
+		expect(conv).toBeDefined();
+		expect((conv as { items: readonly unknown[] }).items).toEqual([]);
+		expect(
+			(conv as { failedSources?: readonly string[] }).failedSources,
+		).toEqual([]);
+	});
+
+	// ── Active Conversations periodic refresh (1-minute timer) ──────────────
+	// The five no-hook AI sources have no host-side watcher, so the sidebar
+	// polls them on a fixed cadence. These tests pin: (a) the timer fires
+	// the aggregator on top of the initial ready-push, (b) ticks while the
+	// view is hidden short-circuit before doing any work, and (c) disposing
+	// the provider stops further ticks.
+	it("polls listWithDiagnostics every 60s after view resolves", async () => {
+		vi.useFakeTimers();
+		try {
+			const view = makeMockView();
+			const listWithDiagnostics = vi
+				.fn()
+				.mockResolvedValue({ items: [], failedSources: [] });
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					configured: true,
+					activeTab: "branch",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				activeSessionsProvider: { listWithDiagnostics } as unknown as never,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({ type: "ready" });
+			await flushReady();
+			// Initial handleReady push.
+			expect(listWithDiagnostics).toHaveBeenCalledTimes(1);
+			// One tick.
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(listWithDiagnostics).toHaveBeenCalledTimes(2);
+			// Two more ticks confirm the timer keeps firing (not a one-shot).
+			await vi.advanceTimersByTimeAsync(120_000);
+			expect(listWithDiagnostics).toHaveBeenCalledTimes(4);
+			provider.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("skips refresh ticks while the sidebar view is hidden", async () => {
+		vi.useFakeTimers();
+		try {
+			const view = makeMockView();
+			view.visible = false;
+			const listWithDiagnostics = vi
+				.fn()
+				.mockResolvedValue({ items: [], failedSources: [] });
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					configured: true,
+					activeTab: "branch",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				activeSessionsProvider: { listWithDiagnostics } as unknown as never,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({ type: "ready" });
+			await flushReady();
+			// Initial handleReady push still happens (handleReady ignores visibility).
+			expect(listWithDiagnostics).toHaveBeenCalledTimes(1);
+			// Timer fires but tick short-circuits because view.visible === false.
+			await vi.advanceTimersByTimeAsync(180_000);
+			expect(listWithDiagnostics).toHaveBeenCalledTimes(1);
+			// Flipping visibility back on lets subsequent ticks proceed.
+			view.visible = true;
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(listWithDiagnostics).toHaveBeenCalledTimes(2);
+			provider.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("stops the refresh timer on dispose", async () => {
+		vi.useFakeTimers();
+		try {
+			const view = makeMockView();
+			const listWithDiagnostics = vi
+				.fn()
+				.mockResolvedValue({ items: [], failedSources: [] });
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					configured: true,
+					activeTab: "branch",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				activeSessionsProvider: { listWithDiagnostics } as unknown as never,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({ type: "ready" });
+			await flushReady();
+			expect(listWithDiagnostics).toHaveBeenCalledTimes(1);
+			provider.dispose();
+			await vi.advanceTimersByTimeAsync(300_000);
+			expect(listWithDiagnostics).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("skips installing the refresh timer when activeSessionsProvider is missing", async () => {
+		vi.useFakeTimers();
+		try {
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					configured: true,
+					activeTab: "branch",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.triggerMessage({ type: "ready" });
+			await flushReady();
+			// No throw, no posted conversation message, and dispose is a no-op
+			// even though the provider never registered a timer.
+			await vi.advanceTimersByTimeAsync(180_000);
+			const convCalls = view.webview.postMessage.mock.calls
+				.map((c) => c[0] as SidebarInboundMsg)
+				.filter((m) => m.type === "branch:conversationsData");
+			expect(convCalls).toEqual([]);
+			expect(() => provider.dispose()).not.toThrow();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

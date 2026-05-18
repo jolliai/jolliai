@@ -1,0 +1,295 @@
+// biome-ignore-all lint/style/useTemplate: webview script builder must stay
+// backtick-free — template literals here are silently truncated by the
+// CSP-strict webview pipeline (CLAUDE.md "Builder template-literal backtick trap").
+
+/**
+ * Client-side script for ConversationDetailsPanel.
+ *
+ * Deliberately does NOT reuse buildTranscriptEntriesScript() from
+ * TranscriptEntryRenderer.ts — that renderer is summary-modal-specific
+ * (depends on scope vars like modalBody / modalTabs / originalTranscripts
+ * and helpers like attachSessionDeleteHandler that don't exist here, and
+ * implements a tab bar for multi-session views that this single-session
+ * panel doesn't need). A self-contained renderer is the right cost.
+ *
+ * State model:
+ *   - originalEntries: ReadonlyArray<DisplayEntry> — last payload from
+ *     host. Each entry carries a `displayIndex` (its position in this
+ *     list); the host translates those indices back to identity-based
+ *     overlay rules on save. Re-set on every transcriptLoaded message so
+ *     pending state is dropped after Save (host re-fetches and pushes).
+ *   - editedContent: Record<displayIndex, string> — pending replacements
+ *     keyed by display index.
+ *   - deletedIndices: Set<number> — display indices marked for deletion.
+ *   - rawContentMap: Record<displayIndex, string> — current displayed
+ *     content (original or edited); kept so re-entering edit mode shows
+ *     the user's latest text.
+ */
+
+const TRASH_ICON = "\\uD83D\\uDDD1"; // 🗑 U+1F5D1
+const RESTORE_ICON = "\\u21A9"; // ↩ U+21A9
+
+export function buildConversationDetailsScript(): string {
+	return [
+		"const vscode = acquireVsCodeApi();",
+		"const TRASH_ICON = '" + TRASH_ICON + "';",
+		"const RESTORE_ICON = '" + RESTORE_ICON + "';",
+		"",
+		"const entriesEl = document.getElementById('entries');",
+		"const footerEl = document.getElementById('footer');",
+		"const saveBtn = document.getElementById('saveBtn');",
+		"const cancelBtn = document.getElementById('cancelBtn');",
+		"const markAllBtn = document.getElementById('markAllBtn');",
+		"const footerSummary = document.getElementById('footerSummary');",
+		"",
+		"let originalEntries = [];",
+		// editedContent[idx] = string when index `idx` has a pending content edit.
+		"let editedContent = {};",
+		// deletedIndices contains original indices currently marked deleted.
+		"let deletedIndices = new Set();",
+		// rawContentMap[idx] = the currently-displayed content. May equal the
+		// original or the latest pending edit.
+		"let rawContentMap = {};",
+		"let activeTextarea = null;",
+		"",
+		"function roleLabel(role) { return role === 'human' ? 'You' : 'Assistant'; }",
+		"",
+		"function formatTime(iso) {",
+		"  if (!iso) return '';",
+		"  try {",
+		"    var d = new Date(iso);",
+		"    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });",
+		"  } catch (e) { return ''; }",
+		"}",
+		"",
+		"function pendingChangeCount() {",
+		"  var editedCount = 0;",
+		"  for (var k in editedContent) {",
+		"    if (Object.prototype.hasOwnProperty.call(editedContent, k)) editedCount++;",
+		"  }",
+		"  return { edited: editedCount, deleted: deletedIndices.size };",
+		"}",
+		"",
+		"function refreshFooter() {",
+		"  var counts = pendingChangeCount();",
+		"  var total = counts.edited + counts.deleted;",
+		"  if (total === 0) {",
+		"    footerSummary.textContent = 'No changes';",
+		"  } else {",
+		"    var parts = [];",
+		"    if (counts.edited) parts.push(counts.edited + ' modified');",
+		"    if (counts.deleted) parts.push(counts.deleted + ' deleted');",
+		"    footerSummary.textContent = parts.join(' \\u00B7 ');",
+		"  }",
+		"  if (saveBtn) saveBtn.disabled = total === 0;",
+		"  if (saveBtn) saveBtn.textContent = total > 0 ? ('Save All (' + total + ')') : 'Save All';",
+		// Mark All toggles to disabled once every visible entry is already
+		// deleted (or there are no entries at all) so repeated clicks are
+		// a no-op and the button reflects "nothing left to delete".
+		"  if (markAllBtn) {",
+		"    markAllBtn.disabled = originalEntries.length === 0 || counts.deleted >= originalEntries.length;",
+		"  }",
+		"}",
+		"",
+		"function renderEntries() {",
+		"  if (!entriesEl) return;",
+		"  entriesEl.replaceChildren();",
+		"  if (originalEntries.length === 0) {",
+		"    var empty = document.createElement('div');",
+		"    empty.className = 'empty-state';",
+		"    empty.textContent = 'No conversation entries to display.';",
+		"    entriesEl.appendChild(empty);",
+		"    return;",
+		"  }",
+		"  for (var i = 0; i < originalEntries.length; i++) {",
+		"    entriesEl.appendChild(renderEntry(originalEntries[i]));",
+		"  }",
+		"}",
+		"",
+		"function renderEntry(entry) {",
+		"  var row = document.createElement('div');",
+		"  row.className = 'transcript-entry';",
+		"  row.setAttribute('data-role', entry.role);",
+		"  row.setAttribute('data-index', String(entry.displayIndex));",
+		"  var isDeleted = deletedIndices.has(entry.displayIndex);",
+		"  if (isDeleted) row.classList.add('deleted');",
+		"",
+		"  var header = document.createElement('div');",
+		"  header.className = 'entry-header';",
+		"",
+		"  if (!INIT.readOnly) {",
+		"    var del = document.createElement('button');",
+		"    del.type = 'button';",
+		"    del.className = 'entry-delete-btn';",
+		"    del.title = isDeleted ? 'Restore entry' : 'Delete entry';",
+		"    del.textContent = isDeleted ? RESTORE_ICON : TRASH_ICON;",
+		"    del.addEventListener('click', function(ev) {",
+		"      ev.stopPropagation();",
+		"      toggleDelete(entry.displayIndex);",
+		"    });",
+		"    header.appendChild(del);",
+		"  }",
+		"",
+		"  var role = document.createElement('span');",
+		"  role.className = 'role';",
+		"  role.textContent = roleLabel(entry.role);",
+		"  header.appendChild(role);",
+		"",
+		"  var time = document.createElement('span');",
+		"  time.className = 'entry-time';",
+		"  time.textContent = formatTime(entry.timestamp);",
+		"  header.appendChild(time);",
+		"",
+		"  row.appendChild(header);",
+		"",
+		"  var body = document.createElement('div');",
+		"  body.className = 'entry-content';",
+		"  var content = rawContentMap[entry.displayIndex];",
+		"  body.textContent = typeof content === 'string' ? content : entry.content;",
+		"  if (!INIT.readOnly) {",
+		"    body.addEventListener('click', function() { enterEditMode(row, entry.displayIndex); });",
+		"  }",
+		"  row.appendChild(body);",
+		"  return row;",
+		"}",
+		"",
+		"function toggleDelete(idx) {",
+		"  if (deletedIndices.has(idx)) deletedIndices.delete(idx);",
+		"  else deletedIndices.add(idx);",
+		"  // Re-render just the affected row to preserve scroll position.",
+		"  var row = entriesEl.querySelector('.transcript-entry[data-index=\"' + idx + '\"]');",
+		"  if (!row) return;",
+		"  var entry = findEntry(idx);",
+		"  if (!entry) return;",
+		"  var fresh = renderEntry(entry);",
+		"  row.replaceWith(fresh);",
+		"  refreshFooter();",
+		"}",
+		"",
+		"function findEntry(idx) {",
+		"  for (var i = 0; i < originalEntries.length; i++) {",
+		"    if (originalEntries[i].displayIndex === idx) return originalEntries[i];",
+		"  }",
+		"  return null;",
+		"}",
+		"",
+		"function enterEditMode(row, idx) {",
+		"  if (INIT.readOnly) return;",
+		"  if (row.classList.contains('deleted')) return;",
+		"  if (row.classList.contains('editing')) return;",
+		"  if (activeTextarea) activeTextarea.blur();",
+		"  row.classList.add('editing');",
+		"  var current = rawContentMap[idx];",
+		"  var initial = typeof current === 'string' ? current : (findEntry(idx) || {}).content || '';",
+		"  var ta = document.createElement('textarea');",
+		"  ta.className = 'entry-edit-textarea';",
+		"  ta.value = initial;",
+		"  ta.rows = Math.max(3, initial.split('\\n').length + 1);",
+		"  row.appendChild(ta);",
+		"  ta.focus();",
+		"  activeTextarea = ta;",
+		"  ta.addEventListener('input', function() {",
+		"    ta.style.height = 'auto';",
+		"    ta.style.height = ta.scrollHeight + 'px';",
+		"  });",
+		"  ta.style.height = ta.scrollHeight + 'px';",
+		"  ta.addEventListener('blur', function() {",
+		"    var entry = findEntry(idx);",
+		"    var originalContent = entry ? entry.content : '';",
+		"    var next = ta.value;",
+		"    rawContentMap[idx] = next;",
+		"    if (next === originalContent) delete editedContent[idx];",
+		"    else editedContent[idx] = next;",
+		"    row.removeChild(ta);",
+		"    row.classList.remove('editing');",
+		"    activeTextarea = null;",
+		"    var body = row.querySelector('.entry-content');",
+		"    if (body) body.textContent = next;",
+		"    refreshFooter();",
+		"  });",
+		"}",
+		"",
+		"function resetPendingState() {",
+		"  editedContent = {};",
+		"  deletedIndices = new Set();",
+		"  rawContentMap = {};",
+		"  for (var i = 0; i < originalEntries.length; i++) {",
+		"    rawContentMap[originalEntries[i].displayIndex] = originalEntries[i].content;",
+		"  }",
+		"  refreshFooter();",
+		"  renderEntries();",
+		"}",
+		"",
+		"if (cancelBtn) {",
+		"  cancelBtn.addEventListener('click', function() { resetPendingState(); });",
+		"}",
+		"",
+		// Mark all visible entries for deletion in one click. Doesn't touch
+		// editedContent — the existing save path drops edits at indices that
+		// are also in deletedIndices (deletion wins), so we don't need to
+		// pre-prune here. The user can still Cancel before Save to roll back.
+		"if (markAllBtn) {",
+		"  markAllBtn.addEventListener('click', function() {",
+		"    if (originalEntries.length === 0) return;",
+		"    for (var i = 0; i < originalEntries.length; i++) {",
+		"      deletedIndices.add(originalEntries[i].displayIndex);",
+		"    }",
+		"    renderEntries();",
+		"    refreshFooter();",
+		"  });",
+		"}",
+		"",
+		"if (saveBtn) {",
+		"  saveBtn.addEventListener('click', function() {",
+		"    var deletedArr = [];",
+		"    deletedIndices.forEach(function(v) { deletedArr.push(v); });",
+		// Drop edits at indices the user also marked deleted — the overlay
+		// store has the same precedence (deletion wins) but sending a
+		// shorter payload keeps the file tidy.
+		"    var editsPayload = {};",
+		"    for (var k in editedContent) {",
+		"      if (!Object.prototype.hasOwnProperty.call(editedContent, k)) continue;",
+		"      if (deletedIndices.has(parseInt(k, 10))) continue;",
+		"      editsPayload[k] = editedContent[k];",
+		"    }",
+		"    saveBtn.disabled = true;",
+		"    saveBtn.textContent = 'Saving…';",
+		"    vscode.postMessage({",
+		"      type: 'saveOverrides',",
+		"      deletedIndices: deletedArr,",
+		"      edits: editsPayload,",
+		"    });",
+		"  });",
+		"}",
+		"",
+		// kick off initial load
+		"vscode.postMessage({ type: 'requestTranscript', sessionId: INIT.sessionId, source: INIT.source, transcriptPath: INIT.transcriptPath });",
+		"",
+		"window.addEventListener('message', function(event) {",
+		"  var msg = event.data;",
+		"  if (!msg) return;",
+		"  if (msg.type === 'transcriptLoaded') {",
+		"    originalEntries = msg.entries || [];",
+		"    resetPendingState();",
+		"  } else if (msg.type === 'overridesSaved') {",
+		// host follows with a fresh transcriptLoaded; just leave the
+		// save button in a transient state until that arrives.
+		"    if (saveBtn) saveBtn.textContent = 'Saved \\u2713';",
+		"  } else if (msg.type === 'overridesSaveError') {",
+		"    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Save All'; }",
+		"    if (footerSummary) footerSummary.textContent = 'Save failed: ' + (msg.message || 'unknown error');",
+		"  } else if (msg.type === 'panelReshown') {",
+		// Host sends panelReshown when the user clicks the same row again
+		// (sidebar polling may have surfaced fresh unread content). Only
+		// re-fetch when there is no pending state — otherwise a refresh
+		// would call resetPendingState() and silently throw away unsaved
+		// edits/deletes. The user can still Save or Cancel and click the
+		// row again to pull the latest view.
+		"    var c = pendingChangeCount();",
+		"    if (c.edited === 0 && c.deleted === 0) {",
+		"      vscode.postMessage({ type: 'requestTranscript', sessionId: INIT.sessionId, source: INIT.source, transcriptPath: INIT.transcriptPath });",
+		"    }",
+		"  }",
+		"});",
+	].join("\n");
+}

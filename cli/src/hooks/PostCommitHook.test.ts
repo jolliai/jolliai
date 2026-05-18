@@ -205,6 +205,30 @@ vi.mock("../core/TranscriptParser.js", () => ({
 	getParserForSource: vi.fn().mockReturnValue({ parseLine: vi.fn() }),
 }));
 
+// ConversationOverlayStore reads per-session overlay JSON files at
+// loadSessionTranscripts time (used for summary input + stored transcript).
+// Under fake timers the underlying fs/promises calls don't resolve,
+// hanging the worker. Stub to identity + empty load so the pipeline can
+// proceed in tests that don't care about overlay behavior.
+vi.mock("../core/ConversationOverlayStore.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/ConversationOverlayStore.js")>();
+	return {
+		...actual,
+		applyOverlaysToSessions: vi.fn(async (sessions: unknown) => sessions),
+		loadOverlay: vi.fn(async () => null),
+	};
+});
+
+// HiddenConversationsStore: aggregator and pipeline both read this. Empty
+// state under fake timers; tests that need hidden behavior can override.
+vi.mock("../core/HiddenConversationsStore.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/HiddenConversationsStore.js")>();
+	return {
+		...actual,
+		loadHiddenConversations: vi.fn(async () => ({ version: 1, entries: {} })),
+	};
+});
+
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -260,6 +284,21 @@ function createMockResult(): SummaryResult {
 				decisions: "Use JWT tokens",
 			},
 		],
+	};
+}
+
+/**
+ * Variant of `createMockSummary` that fully populates the optional Hoist
+ * fields (recap + ticketId + llm). Used by tests that exercise the truthy
+ * arms of the `oldSummary.recap !== undefined && {...}` (and friends)
+ * conditional spreads in `handleAmendPipeline` and `buildHoistedAmendRoot`.
+ */
+function createMockSummaryFull(hash = "abc123"): CommitSummary {
+	return {
+		...createMockSummary(hash),
+		recap: "carried-recap",
+		ticketId: "JOLLI-1234",
+		llm: { model: "test-model", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
 	};
 }
 
@@ -1477,6 +1516,41 @@ describe("queue-driven Worker", () => {
 			// `stats` field stays undefined on the migrated summary (this path never
 			// ran an LLM and had no local `stats` value to assign).
 			expect(summaryArg.stats).toBeUndefined();
+		});
+
+		// Coverage: short-circuit A with a fully-populated old summary so
+		// every `oldSummary.X !== undefined && {...}` spread takes the
+		// truthy arm, plus buildHoistedAmendRoot's optional metadata
+		// spreads (recap, ticketId, llm carried via hoistMetadataFromOldSummary).
+		it("short-circuit A copies recap + ticketId + llm from a fully-populated old summary", async () => {
+			setupAmendPipeline({ hasOldSummary: true, hasTranscript: false, hasDiff: false });
+			vi.mocked(getSummary).mockResolvedValue(createMockSummaryFull("oldHash"));
+			vi.mocked(getDiffStats)
+				.mockResolvedValueOnce({ filesChanged: 0, insertions: 0, deletions: 0 })
+				.mockResolvedValueOnce({ filesChanged: 1, insertions: 2, deletions: 1 });
+			await runWorker("/test/project");
+			const summaryArg = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
+			expect(summaryArg.recap).toBe("carried-recap");
+			expect(summaryArg.ticketId).toBe("JOLLI-1234");
+		});
+
+		// Coverage: short-circuit B path (1 LLM, delta empty) with the
+		// same fully-populated old summary — exercises lines 1354/1355
+		// truthy arms.
+		it("short-circuit B copies recap + ticketId from a fully-populated old summary", async () => {
+			setupAmendPipeline({ hasOldSummary: true, hasTranscript: true, hasDiff: true });
+			vi.mocked(getSummary).mockResolvedValue(createMockSummaryFull("oldHash"));
+			// Delta runs the LLM but it produces no topics + no recap, so
+			// the short-circuit B path fires.
+			vi.mocked(generateSummary).mockResolvedValue({
+				transcriptEntries: 1,
+				topics: [],
+				stats: { filesChanged: 0, insertions: 0, deletions: 0 },
+			} as never);
+			await runWorker("/test/project");
+			const summaryArg = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
+			expect(summaryArg.recap).toBe("carried-recap");
+			expect(summaryArg.ticketId).toBe("JOLLI-1234");
 		});
 	});
 

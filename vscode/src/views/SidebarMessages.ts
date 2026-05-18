@@ -8,6 +8,9 @@
  * jollimemory.* command is added.
  */
 
+import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
+import type { TranscriptSource } from "../../../cli/src/Types.js";
+
 export type SidebarTab = "kb" | "branch" | "status";
 export type KbMode = "folders" | "memories";
 
@@ -422,6 +425,26 @@ export type SidebarOutboundMsg =
 	| { readonly type: "branch:openCommit"; readonly hash: string }
 	| {
 			/**
+			 * User clicked a row in the CONVERSATIONS section. Host opens a
+			 * dedicated ConversationDetailsPanel keyed by `sessionId`, reading
+			 * the transcript from `transcriptPath` using the source-specific
+			 * reader (Claude / Codex / Gemini / OpenCode / Cursor / Copilot).
+			 */
+			readonly type: "branch:openConversation";
+			readonly sessionId: string;
+			readonly source: TranscriptSource;
+			readonly transcriptPath: string;
+			/**
+			 * The exact string shown in the CONVERSATIONS row label — already
+			 * fallback-resolved on the webview side (`item.title || '(untitled)'`),
+			 * so the panel can render it verbatim without re-deriving the
+			 * fallback. Keeping the fallback in one place guarantees the panel
+			 * tab title and the row label never drift.
+			 */
+			readonly title: string;
+	  }
+	| {
+			/**
 			 * Inline "discard" button on a Changes row. The host rebuilds a full
 			 * `FileItem` from these fields rather than running the command with a
 			 * bare id (which the command's `if (!item?.fileStatus) return;` guard
@@ -505,6 +528,20 @@ export type SidebarInboundMsg =
 			readonly type: "branch:commitsData";
 			readonly items: ReadonlyArray<SerializedTreeItem>;
 			readonly mode: "multi" | "single" | "merged" | "empty";
+	  }
+	| {
+			readonly type: "branch:conversationsData";
+			readonly items: readonly ActiveConversationItem[];
+			/**
+			 * TranscriptSource keys whose discoverer failed (threw or returned a
+			 * structured `r.error`) during this aggregator pass. The webview
+			 * renders a partial-data hint when this list is non-empty so the
+			 * user knows the list is incomplete rather than truly small.
+			 * Typed against the closed enum so a renderer's icon/label lookup
+			 * is exhaustive — matches the outbound `branch:openConversation`
+			 * shape rather than widening back to bare `string`.
+			 */
+			readonly failedSources: ReadonlyArray<TranscriptSource>;
 	  }
 	| {
 			readonly type: "status:data";

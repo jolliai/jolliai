@@ -15,6 +15,28 @@ export const JOLLI_DIR = ".jolli";
 export const JOLLIMEMORY_DIR = "jollimemory";
 export const LOG_FILE = "debug.log";
 
+/**
+ * Stringify an unknown error value for inclusion in a log message. Replaces
+ * the inline `err instanceof Error ? err.message : String(err)` idiom so
+ * callers don't each carry the same ternary branches — there's a single
+ * place to extend the logic if we later want to render the stack, code
+ * field, or other structured properties.
+ */
+export function errMsg(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * `fs/promises` and stream errors carry a `code` field on the underlying
+ * Error object. ENOENT means the path didn't exist — usually an expected
+ * absence the caller should treat as silence, distinct from genuine read
+ * failures (permission denied, disk error, schema drift). Centralizing the
+ * check here keeps the multi-and short-circuit out of each caller.
+ */
+export function isEnoent(err: unknown): boolean {
+	return err instanceof Error && (err as Error & { code?: string }).code === "ENOENT";
+}
+
 /** Orphan branch name for storing summaries (matches CommitSummary version 3) */
 export const ORPHAN_BRANCH = "jollimemory/summaries/v3";
 

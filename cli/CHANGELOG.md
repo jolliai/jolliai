@@ -2,6 +2,10 @@
 
 <!-- Last synced commit: d53654bc | 2026-05-13 -->
 
+## 0.99.2
+
+- Bug fixes
+
 ## 0.99.1
 
 - Bug fixes

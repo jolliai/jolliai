@@ -9,7 +9,10 @@
 
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
+import { isTranscriptSource } from "../../../cli/src/Types.js";
+import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
 import { log } from "../util/Logger.js";
+import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
 import { buildSidebarHtml } from "./SidebarHtmlBuilder.js";
 import type {
@@ -93,6 +96,15 @@ export interface SidebarWebviewDeps {
 		getMode?(): "multi" | "single" | "merged" | "empty";
 	};
 	/**
+	 * Source for the Branch tab's Active Conversations section. Optional so
+	 * existing tests can omit it. Re-queried on `handleReady()` and on every
+	 * Branch-scope refresh — there's no `onDidChangeTreeData` channel here
+	 * because the five no-hook sources (Codex/OpenCode/Cursor/Copilot CLI/
+	 * Copilot Chat) have no host-side watchers; refresh is the only update
+	 * path. Errors are already swallowed inside the provider.
+	 */
+	activeSessionsProvider?: ActiveSessionsProvider;
+	/**
 	 * Called once when the sidebar webview first becomes visible. Used to trigger
 	 * lazy-loaded data sources (e.g. MemoriesStore.ensureFirstLoad()) that the
 	 * original tree views populated via onDidChangeVisibility — replaced here
@@ -126,6 +138,17 @@ export class SidebarWebviewProvider
 {
 	static readonly viewId = "jollimemory.mainView";
 
+	/**
+	 * Cadence for the Active Conversations background refresh. The five
+	 * no-hook sources (Codex/OpenCode/Cursor/Copilot CLI/Copilot Chat) only
+	 * surface state through on-disk transcripts that the host can't watch
+	 * cheaply, so we poll. One minute is the lowest cadence that feels
+	 * "live" without making the aggregator (which opens SQLite handles for
+	 * Cursor/Copilot Chat) a notable background cost. Ticks while the view
+	 * is hidden short-circuit before touching disk — see `tickConversations`.
+	 */
+	private static readonly CONVERSATIONS_REFRESH_INTERVAL_MS = 60_000;
+
 	private view: vscode.WebviewView | undefined;
 	private statusSub: { dispose(): void } | undefined;
 	private memoriesSub: { dispose(): void } | undefined;
@@ -133,6 +156,7 @@ export class SidebarWebviewProvider
 	private plansSub: { dispose(): void } | undefined;
 	private filesSub: { dispose(): void } | undefined;
 	private historySub: { dispose(): void } | undefined;
+	private conversationsRefreshTimer: ReturnType<typeof setInterval> | undefined;
 	private firstVisibleFired = false;
 	/**
 	 * Latest activity-bar badge requested by the host (e.g. visible-changed-file
@@ -213,6 +237,30 @@ export class SidebarWebviewProvider
 				() => void this.pushCommits(),
 			);
 		}
+		// Background poll for Active Conversations. Started here (rather than
+		// in handleReady) so it survives webview reloads — the timer is bound
+		// to the view's lifetime, not the client-`ready` cycle. Guard against
+		// double-registration when resolveWebviewView is called multiple times
+		// (e.g. user drags the sidebar between activity bar and panel), same
+		// pattern as the `!this.statusSub` checks above.
+		if (this.deps.activeSessionsProvider && !this.conversationsRefreshTimer) {
+			this.conversationsRefreshTimer = setInterval(
+				() => this.tickConversations(),
+				SidebarWebviewProvider.CONVERSATIONS_REFRESH_INTERVAL_MS,
+			);
+		}
+	}
+
+	/**
+	 * Single tick of the Active Conversations refresh timer. Short-circuits
+	 * when the view is hidden so a sidebar the user has collapsed doesn't
+	 * keep paying the aggregator's SQLite reads in the background — on
+	 * re-show the webview reloads and `handleReady` pushes a fresh list
+	 * anyway, so we don't risk staleness by skipping ticks while hidden.
+	 */
+	private tickConversations(): void {
+		if (!this.view?.visible) return;
+		void this.pushConversations();
 	}
 
 	/** Send a message to the webview client. No-op when the view is not resolved. */
@@ -270,6 +318,7 @@ export class SidebarWebviewProvider
 		this.pushPlans();
 		this.pushChanges();
 		void this.pushCommits();
+		void this.pushConversations();
 		if (this.deps.branchWatcher) {
 			const cur = this.deps.branchWatcher.current();
 			this.postMessage({
@@ -382,6 +431,65 @@ export class SidebarWebviewProvider
 				return;
 			case "branch:openCommit":
 				void this.deps.executeCommand("jollimemory.viewSummary", msg.hash);
+				return;
+			case "branch:openConversation":
+				// Same sessionId reveals the existing panel; a different sessionId
+				// disposes the prior panel and opens a fresh one. The source-specific
+				// transcript reader is selected inside ConversationDetailsPanel from
+				// `source` + `transcriptPath`. `title` is the already-fallback-resolved
+				// label string from the row — panel uses it verbatim for both the
+				// VS Code tab title and the in-panel header. `projectDir` is the
+				// workspace root used to resolve the conversation-edits overlay
+				// directory; undefined when no workspace is open, in which case
+				// the panel becomes read-only.
+				//
+				// Webview messages cross a trust boundary — static typing only
+				// describes the agreed wire shape, the actual runtime value is
+				// `unknown`. `source` decides which overlay directory we touch
+				// and is checked against the closed `TranscriptSource` enum.
+				// `sessionId` keys the panel registry and the hide store;
+				// `transcriptPath` ends up in `createReadStream` downstream;
+				// `title` flows through `escapeHtml` into the panel header.
+				// All three must be non-empty strings — anything else is
+				// either a bug in the renderer or a spoofed message we drop
+				// rather than forwarding into the file system / DOM.
+				if (!isTranscriptSource(msg.source)) {
+					log.warn(
+						"SidebarWebviewProvider",
+						"Rejected branch:openConversation with unknown source",
+						{ source: String(msg.source) },
+					);
+					return;
+				}
+				if (
+					typeof msg.sessionId !== "string" ||
+					msg.sessionId.length === 0 ||
+					typeof msg.transcriptPath !== "string" ||
+					msg.transcriptPath.length === 0 ||
+					typeof msg.title !== "string" ||
+					msg.title.length === 0
+				) {
+					log.warn(
+						"SidebarWebviewProvider",
+						"Rejected branch:openConversation with non-string or empty sessionId/transcriptPath/title",
+					);
+					return;
+				}
+				ConversationDetailsPanel.show({
+					extensionUri: this.deps.extensionUri,
+					sessionId: msg.sessionId,
+					source: msg.source,
+					transcriptPath: msg.transcriptPath,
+					title: msg.title,
+					projectDir: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+					onSessionHidden: () => {
+						// The panel just wrote HiddenConversationsStore; re-pull
+						// the list so the now-hidden row stops rendering. No need
+						// to scope by sessionId — the aggregator filter is the
+						// source of truth and re-derives the visible set.
+						void this.pushConversations();
+					},
+				});
 				return;
 			case "branch:discardFile":
 				// jollimemory.discardFileChanges reads item.fileStatus.{relativePath,
@@ -555,6 +663,11 @@ export class SidebarWebviewProvider
 			// whatever the first selection load returned, no matter how many
 			// times they click Refresh.
 			this.postMessage({ type: "selection:invalidateBranchMemories" });
+			// Active Conversations has no host-side watcher (the five no-hook
+			// sources — Codex/OpenCode/Cursor/Copilot CLI/Copilot Chat — only
+			// surface state through on-disk transcripts), so refresh is the
+			// only update path after the initial `handleReady` push.
+			void this.pushConversations();
 		}
 		if (scope === "status" || scope === "all") {
 			void this.deps.executeCommand("jollimemory.refreshStatus");
@@ -671,6 +784,43 @@ export class SidebarWebviewProvider
 		}
 	}
 
+	/**
+	 * Pushes the Branch tab's Active Conversations list. Always emits a
+	 * message when the provider is wired, so the webview can swap its
+	 * "Loading…" placeholder for an empty state on first paint.
+	 *
+	 * Uses `listWithDiagnostics()` (not the simpler `list()`) so the outbound
+	 * message carries `failedSources` — the set of TranscriptSource keys
+	 * whose discoverer threw or returned a structured `r.error`. The webview
+	 * surfaces that as a partial-data hint instead of silently presenting an
+	 * incomplete list. The catch below is a defensive double-guard: the
+	 * provider already swallows aggregator throws, but a future change that
+	 * re-throws should still leave the webview in a renderable state.
+	 */
+	private async pushConversations(): Promise<void> {
+		if (!this.deps.activeSessionsProvider) return;
+		try {
+			const { items, failedSources } =
+				await this.deps.activeSessionsProvider.listWithDiagnostics();
+			this.postMessage({
+				type: "branch:conversationsData",
+				items,
+				failedSources: [...failedSources],
+			});
+		} catch (err) {
+			log.warn(
+				"SidebarWebviewProvider",
+				"pushConversations: listWithDiagnostics() threw — emitting empty conversations",
+				err instanceof Error ? err.message : err,
+			);
+			this.postMessage({
+				type: "branch:conversationsData",
+				items: [],
+				failedSources: [],
+			});
+		}
+	}
+
 	private async handleExpandFolder(relPath: string): Promise<void> {
 		if (!this.deps.kbFolders) return;
 		try {
@@ -730,6 +880,10 @@ export class SidebarWebviewProvider
 		if (this.historySub) {
 			this.historySub.dispose();
 			this.historySub = undefined;
+		}
+		if (this.conversationsRefreshTimer) {
+			clearInterval(this.conversationsRefreshTimer);
+			this.conversationsRefreshTimer = undefined;
 		}
 	}
 }

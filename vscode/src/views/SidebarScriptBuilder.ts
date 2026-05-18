@@ -37,6 +37,12 @@ export function buildSidebarScript(): string {
   })();
 
   // ---- DOM helper (used by every renderer). ----
+  // Allowed attrs: className, tabIndex, text, title, plus anything that goes
+  // through setAttribute. The 'hidden' HTML property and inline 'style' attr
+  // are deliberately NOT supported — sidebar CSP forbids inline styles, and
+  // visibility flips must go through the .hidden CSS class so 'display: flex'
+  // overrides don't silently outrank the HTML hidden attribute (see CLAUDE.md
+  // memories on webview .hidden class + inline style/JS prohibition).
   function el(tag, attrs, children) {
     const n = document.createElement(tag);
     if (attrs) {
@@ -44,8 +50,7 @@ export function buildSidebarScript(): string {
         const v = attrs[k];
         if (v == null || v === false) continue;
         if (k === 'className') n.className = String(v);
-        else if (k === 'hidden' || k === 'tabIndex') n[k] = v;
-        else if (k === 'style') n.setAttribute('style', String(v));
+        else if (k === 'tabIndex') n[k] = v;
         else if (k === 'text') n.textContent = String(v);
         else if (k === 'title') n.title = String(v);
         else n.setAttribute(k, String(v));
@@ -779,6 +784,11 @@ export function buildSidebarScript(): string {
       case 'branch:commitsData':
         branchData.commits = msg.items.slice();
         branchData.commitsMode = msg.mode || 'empty';
+        if (state.activeTab === 'branch') renderBranch();
+        break;
+      case 'branch:conversationsData':
+        branchData.conversations = msg.items.slice();
+        branchData.conversationsFailedSources = Array.isArray(msg.failedSources) ? msg.failedSources.slice() : [];
         if (state.activeTab === 'branch') renderBranch();
         break;
       // Renderers added in later phases handle the remaining message types.
@@ -2195,7 +2205,7 @@ export function buildSidebarScript(): string {
   });
 
   // ---- Branch tab renderer ----
-  let branchData = { plans: [], changes: [], commits: [], commitsMode: 'empty' };
+  let branchData = { plans: [], changes: [], commits: [], commitsMode: 'empty', conversations: [], conversationsFailedSources: [] };
 
   function isCollapsed(section) {
     return !!state.sectionsCollapsed[section];
@@ -2209,6 +2219,15 @@ export function buildSidebarScript(): string {
     const foreign = isViewingForeign();
     const sections = [];
     if (!foreign) {
+      // failedSources is the list of TranscriptSource keys whose discoverer
+      // failed (threw or returned r.error) during the most recent aggregator
+      // pass. When non-empty, the section renders a small banner above the
+      // rows so the user understands "list incomplete", not "list truly empty".
+      const failedSources = branchData.conversationsFailedSources || [];
+      const conversationsWarning = failedSources.length > 0
+        ? 'Some sources unavailable (' + failedSources.join(', ') + '). List may be incomplete.'
+        : null;
+      sections.push({ id: 'conversations', title: 'CONVERSATIONS', items: branchData.conversations, emptyText: 'No active AI conversations in the last 2 days.', warning: conversationsWarning });
       sections.push({ id: 'plans', title: 'Plans & Notes', items: branchData.plans, emptyText: STRINGS.plansEmpty || 'No plans or notes yet.' });
       sections.push({ id: 'changes', title: 'Changes', items: branchData.changes, emptyText: STRINGS.changesEmpty || 'No changes.' });
     }
@@ -2263,6 +2282,7 @@ export function buildSidebarScript(): string {
       el('span', { className: 'section-actions', 'data-section-actions': s.id }, renderSectionActions(s.id)),
     ];
     const rowFn =
+      s.id === 'conversations' ? renderConversationRow :
       s.id === 'plans'   ? renderPlanRow :
       s.id === 'changes' ? renderChangeRow :
       s.id === 'commits' ? renderCommitRow :
@@ -2284,6 +2304,12 @@ export function buildSidebarScript(): string {
               }
               return acc;
             }, []));
+    // Partial-data banner — prepended to the body so it survives both the
+    // empty-state and the populated-list rendering paths. Sections that don't
+    // set a warning skip this entirely.
+    if (bodyKids && s.warning) {
+      bodyKids.unshift(el('div', { className: 'conversations-warning', text: s.warning }));
+    }
     // Primary CTA mounted as a SIBLING of .section-body so it survives the
     // Changes section being collapsed. Commit Memory operates on the group
     // (Plans + Changes + Commits selections together), so hiding it whenever
@@ -2449,6 +2475,73 @@ export function buildSidebarScript(): string {
       'data-id': item.id,
       title: null,
     }, kids);
+  }
+
+  // CONVERSATIONS section: lists active AI coding sessions (Claude, Cursor,
+  // Codex, Gemini, OpenCode, Copilot, Copilot Chat) updated in the last 2
+  // days. Pure read — clicking posts branch:openConversation to the host
+  // (extension decides how to surface the transcript). updatedAt arrives as
+  // an ISO-8601 string per ActiveConversationItem; timeAgo wants a numeric
+  // epoch ms, so parse first and fall back to empty string on garbage input
+  // rather than rendering "NaN ms ago".
+  function renderConversationRow(item, depth) {
+    const ts = Date.parse(item.updatedAt);
+    const relative = Number.isFinite(ts) ? timeAgo(ts) : '';
+    // Fallback-resolve once here so the row label and the panel tab title
+    // share an identical string (panel renders msg.title verbatim, no
+    // re-derived fallback).
+    const displayTitle = item.title || '(untitled)';
+    const kids = [
+      el('span', { className: 'twirl' }),
+      el('span', { className: 'icon' }, [
+        el('i', { className: 'codicon codicon-comment-discussion' }),
+      ]),
+      el('span', { className: 'label', text: displayTitle }),
+      el('span', {
+        className: 'badge transcript-source-' + item.source,
+        text: providerLabel(item.source),
+      }),
+      el('span', { className: 'count', text: String(item.messageCount) }),
+    ];
+    if (relative) {
+      kids.push(el('span', { className: 'time', text: relative }));
+    }
+    const root = el('div', {
+      className: 'tree-node conversation-row',
+      'data-indent': String(depth),
+      'data-session-id': item.sessionId,
+      'data-source': item.source,
+      title: displayTitle,
+    }, kids);
+    root.addEventListener('click', function() {
+      // Belt-and-suspenders: the aggregator already filters rows with
+      // messageCount === 0 (those would open a panel that just says
+      // 'No conversation entries to display.'). If a future change
+      // bypasses that filter, this guard at the click site keeps the panel
+      // from opening on a row the user cannot meaningfully interact with.
+      if (!item.messageCount || item.messageCount <= 0) return;
+      vscode.postMessage({
+        type: 'branch:openConversation',
+        sessionId: item.sessionId,
+        source: item.source,
+        transcriptPath: item.transcriptPath,
+        title: displayTitle,
+      });
+    });
+    return root;
+  }
+
+  function providerLabel(source) {
+    switch (source) {
+      case 'claude':       return 'Claude';
+      case 'cursor':       return 'Cursor';
+      case 'codex':        return 'Codex';
+      case 'gemini':       return 'Gemini';
+      case 'opencode':     return 'OpenCode';
+      case 'copilot':      return 'Copilot';
+      case 'copilot-chat': return 'Copilot Chat';
+      default:             return source;
+    }
   }
 
   function gitStatusToCodicon(s) {

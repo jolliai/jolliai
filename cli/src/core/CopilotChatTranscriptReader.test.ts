@@ -293,6 +293,45 @@ describe("readCopilotChatTranscript", () => {
 		const path = writeJsonl("bad-shape.jsonl", [{ kind: 0, v: { requests: "not-an-array" } }]);
 		await expect(readCopilotChatTranscript(path)).rejects.toThrow(/schema|requests/);
 	});
+
+	// Both turns of a single request share the request's ISO timestamp so
+	// ConversationOverlayStore.sameIdentity can distinguish two physically
+	// distinct turns whose user text happens to be identical (e.g. the user
+	// typed "continue" twice in the same session). Without per-turn
+	// timestamps, deleting one fans out to all matching rows.
+	it("emits request.timestamp (ms → ISO) on both human and assistant entries", async () => {
+		const events = [
+			{ kind: 0, v: { requests: [] } },
+			{ kind: 1, k: ["requests", 0, "message", "text"], v: "continue" },
+			{ kind: 1, k: ["requests", 0, "response"], v: [{ value: "ok 1" }] },
+			{ kind: 1, k: ["requests", 0, "timestamp"], v: Date.parse("2026-05-18T09:00:00.000Z") },
+			{ kind: 1, k: ["requests", 1, "message", "text"], v: "continue" },
+			{ kind: 1, k: ["requests", 1, "response"], v: [{ value: "ok 2" }] },
+			{ kind: 1, k: ["requests", 1, "timestamp"], v: Date.parse("2026-05-18T09:01:00.000Z") },
+		];
+		const path = writeJsonl("ts.jsonl", events);
+		const result = await readCopilotChatTranscript(path);
+		expect(result.entries).toEqual([
+			{ role: "human", content: "continue", timestamp: "2026-05-18T09:00:00.000Z" },
+			{ role: "assistant", content: "ok 1", timestamp: "2026-05-18T09:00:00.000Z" },
+			{ role: "human", content: "continue", timestamp: "2026-05-18T09:01:00.000Z" },
+			{ role: "assistant", content: "ok 2", timestamp: "2026-05-18T09:01:00.000Z" },
+		]);
+	});
+
+	it("omits timestamp when the request has no numeric timestamp (preserves legacy behavior)", async () => {
+		const events = [
+			{ kind: 0, v: { requests: [] } },
+			{ kind: 1, k: ["requests", 0, "message", "text"], v: "no-ts" },
+			{ kind: 1, k: ["requests", 0, "response"], v: [{ value: "reply" }] },
+		];
+		const path = writeJsonl("no-ts.jsonl", events);
+		const result = await readCopilotChatTranscript(path);
+		expect(result.entries).toEqual([
+			{ role: "human", content: "no-ts" },
+			{ role: "assistant", content: "reply" },
+		]);
+	});
 });
 
 describe("readCopilotChatTranscript dispatcher", () => {
@@ -546,8 +585,8 @@ describe("readCopilotChatTranscript beforeTimestamp gate", () => {
 		);
 		const result = await readCopilotChatTranscript(path, undefined, "2026-05-07T10:00:00.000Z");
 		expect(result.entries).toEqual([
-			{ role: "human", content: "early" },
-			{ role: "assistant", content: "early reply" },
+			{ role: "human", content: "early", timestamp: "2026-05-07T09:00:00.000Z" },
+			{ role: "assistant", content: "early reply", timestamp: "2026-05-07T09:00:00.000Z" },
 		]);
 		// Cursor stays at requests[1] so the next read picks up "late".
 		expect(result.newCursor.lineNumber).toBe(1);

@@ -7,8 +7,30 @@
 import type { CopilotChatScanError } from "./core/CopilotChatTranscriptReader.js";
 import type { SqliteScanError } from "./core/SqliteHelpers.js";
 
-/** Which AI coding agent produced the transcript */
-export type TranscriptSource = "claude" | "codex" | "gemini" | "opencode" | "cursor" | "copilot" | "copilot-chat";
+/**
+ * Closed enumeration of every known TranscriptSource. Single source of truth
+ * for both the runtime allowlist (used at trust boundaries: webview → host,
+ * overlay file load, etc.) and the static union below. Removing or renaming
+ * an entry here breaks every consumer at compile time — no dual-maintenance
+ * drift between the runtime array and the TS union.
+ */
+export const TRANSCRIPT_SOURCES = [
+	"claude",
+	"codex",
+	"gemini",
+	"opencode",
+	"cursor",
+	"copilot",
+	"copilot-chat",
+] as const;
+
+/** Which AI coding agent produced the transcript. Derived from the runtime allowlist. */
+export type TranscriptSource = (typeof TRANSCRIPT_SOURCES)[number];
+
+/** Runtime type-guard for TranscriptSource. */
+export function isTranscriptSource(value: unknown): value is TranscriptSource {
+	return typeof value === "string" && (TRANSCRIPT_SOURCES as readonly string[]).includes(value);
+}
 
 /** Metadata about an AI coding session, saved by the Stop hook (Claude) or discovered on-demand (Codex) */
 export interface SessionInfo {
@@ -17,6 +39,12 @@ export interface SessionInfo {
 	readonly updatedAt: string; // ISO 8601
 	/** Which agent produced this session. Defaults to "claude" for backward compatibility. */
 	readonly source?: TranscriptSource;
+	/**
+	 * Native title from the source's own session metadata, if present.
+	 * Populated by discoverers that have cheap access to this field (e.g. sqlite columns).
+	 * Empty string and missing both mean "no native title" — caller falls back to truncation.
+	 */
+	readonly title?: string;
 }
 
 /** Cursor tracking position in a transcript file */

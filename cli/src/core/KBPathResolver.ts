@@ -114,9 +114,11 @@ export function extractRepoName(projectPath: string): string {
 	if (commonDir) {
 		const abs = isAbsolute(commonDir) ? commonDir : join(projectPath, commonDir);
 		const mainRepoDir = dirname(abs);
+		// `mainRepoDir` is the parent of `.git` — i.e. the main repo's
+		// working tree. Skip the filesystem-root / cwd-marker cases so a
+		// `basename` of `/` or `.` doesn't slip through.
 		if (mainRepoDir && mainRepoDir !== "/" && mainRepoDir !== ".") {
-			const name = basename(mainRepoDir);
-			if (name) return name;
+			return basename(mainRepoDir);
 		}
 	}
 

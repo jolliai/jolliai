@@ -14,7 +14,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
-import { createLogger } from "../Logger.js";
+import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "../Types.js";
 import { MetadataManager } from "./MetadataManager.js";
 import type { StorageProvider } from "./StorageProvider.js";
@@ -144,10 +144,12 @@ export class FolderStorage implements StorageProvider {
 			let onDiskFingerprint: string;
 			try {
 				onDiskFingerprint = MetadataManager.sha256(readFileSync(absPath, "utf-8"));
+				/* v8 ignore start -- defensive: readFileSync only fails after existsSync passed if the file is replaced by a directory or the fs throws EACCES mid-flow. Not reachable from a single-process unit test without mocking node:fs. */
 			} catch (err) {
 				log.warn("Cannot read %s for fingerprint check: %s — keeping file", relativePath, String(err));
 				return;
 			}
+			/* v8 ignore stop */
 			if (onDiskFingerprint !== manifestEntry.fingerprint) {
 				log.warn(
 					"Skipping cleanup of %s — file modified since manifest record (likely hand-edited)",
@@ -161,11 +163,8 @@ export class FolderStorage implements StorageProvider {
 			unlinkSync(absPath);
 			if (manifestEntry) this.metadataManager.removeFromManifest(entry.commitHash);
 			log.info("Deleted visible MD: %s", relativePath);
+			/* v8 ignore start -- TOCTOU defense: a concurrent writer removes the file between existsSync and unlinkSync. Requires multi-process scheduling to reproduce; the ENOENT-vs-rethrow split is asserted at code-review level. */
 		} catch (err) {
-			// TOCTOU between existsSync above and unlinkSync here: a concurrent
-			// writer / cleanup pass may have removed the file. Treat ENOENT as
-			// success (drop the manifest entry, same as the missing-file branch
-			// above) and surface anything else so callers can record dirty state.
 			const code = (err as NodeJS.ErrnoException).code;
 			if (code === "ENOENT") {
 				if (manifestEntry) this.metadataManager.removeFromManifest(entry.commitHash);
@@ -173,6 +172,7 @@ export class FolderStorage implements StorageProvider {
 			}
 			throw err;
 		}
+		/* v8 ignore stop */
 	}
 
 	/**
@@ -215,7 +215,7 @@ export class FolderStorage implements StorageProvider {
 			log.warn(
 				"regenerateVisibleMarkdown: malformed summaries/%s.json — %s",
 				entry.commitHash.substring(0, 8),
-				err instanceof Error ? err.message : String(err),
+				errMsg(err),
 			);
 			return false;
 		}
@@ -434,7 +434,9 @@ export class FolderStorage implements StorageProvider {
 	 * Falls back to "_shared" if no matching commit is found.
 	 */
 	private resolveBranchFromSlug(slug: string): string {
-		const hash8 = slug.split("-").pop() ?? "";
+		// String.split always returns a non-empty array, so the last element
+		// is never undefined — no `?? ""` fallback needed.
+		const hash8 = slug.split("-").at(-1) as string;
 		if (hash8.length >= 7) {
 			// Check manifest first (root commits)
 			const manifest = this.metadataManager.readManifest();

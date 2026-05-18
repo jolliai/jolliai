@@ -12,7 +12,7 @@
  * - Backfills missing titles on re-migration
  */
 
-import { createLogger } from "../Logger.js";
+import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary, SummaryIndex } from "../Types.js";
 import type { MigrationState } from "./KBTypes.js";
 import type { MetadataManager } from "./MetadataManager.js";
@@ -137,7 +137,7 @@ export class MigrationEngine {
 		try {
 			await this.runStaleChildCleanup();
 		} catch (err) {
-			log.warn("stale-child cleanup raised: %s", err instanceof Error ? err.message : String(err));
+			log.warn("stale-child cleanup raised: %s", errMsg(err));
 		}
 
 		return finalState;
@@ -276,10 +276,7 @@ export class MigrationEngine {
 		try {
 			index = JSON.parse(indexJson) as SummaryIndex;
 		} catch (e) {
-			log.warn(
-				"regenerateMissingHeadMarkdown: cannot parse index.json — %s",
-				e instanceof Error ? e.message : String(e),
-			);
+			log.warn("regenerateMissingHeadMarkdown: cannot parse index.json — %s", errMsg(e));
 			return { regenerated: 0, skipped: 0, failed: 1 };
 		}
 		const heads = index.entries.filter((e) => e.parentCommitHash == null);
@@ -298,7 +295,7 @@ export class MigrationEngine {
 					"regenerateVisibleMarkdown failed for %s on %s: %s",
 					head.commitHash.substring(0, 8),
 					head.branch,
-					err instanceof Error ? err.message : String(err),
+					errMsg(err),
 				);
 			}
 		}

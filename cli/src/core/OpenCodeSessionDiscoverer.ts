@@ -193,6 +193,7 @@ export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCode
 						transcriptPath: `${dbPath}#${row.id}`,
 						updatedAt: new Date(row.time_updated).toISOString(),
 						source: "opencode",
+						title: typeof row.title === "string" && row.title.trim().length > 0 ? row.title : undefined,
 					},
 				];
 			});

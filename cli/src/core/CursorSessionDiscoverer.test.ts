@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -420,6 +420,35 @@ describe("discoverCursorSessions", () => {
 		expect(sessions[0].sessionId).toBe("c-1");
 	});
 
+	// Same shape as the ENOENT test below, but the workspace state.vscdb
+	// triggers a NON-ENOENT error so the warn-log branch in
+	// `readCursorAnchorComposerIds` runs (and the function still returns []
+	// gracefully, keeping the scan alive). A self-referential symlink loop
+	// gives a real `ELOOP` from `stat()` without requiring a filesystem-level
+	// mock — `isEnoent` correctly classifies this as non-ENOENT and we land
+	// in the warn arm.
+	it("warns and continues when workspace state.vscdb stat fails with a non-ENOENT error", async () => {
+		const fresh = Date.now() - 60 * 1000;
+		const userDir = join(tmpHome, "Library/Application Support/Cursor/User");
+		await mkdir(join(userDir, "globalStorage"), { recursive: true });
+		createCursorGlobalDb(join(userDir, "globalStorage", "state.vscdb"), [
+			{ composerId: "fresh-1", createdAtMs: fresh, lastUpdatedAtMs: fresh },
+		]);
+		const wsDir = join(userDir, "workspaceStorage", "ws-00000000");
+		await mkdir(wsDir, { recursive: true });
+		await writeFile(
+			join(wsDir, "workspace.json"),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
+		);
+		// Self-referential symlink — stat() chases the link, hits itself,
+		// throws ELOOP. Not ENOENT, so the discoverer logs at warn level
+		// and treats the workspace as having no anchors.
+		await symlink("state.vscdb", join(wsDir, "state.vscdb"));
+
+		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
+		expect(sessions.map((s) => s.sessionId)).toEqual(["fresh-1"]);
+	});
+
 	it("returns time-window-only sessions when workspace state.vscdb is missing", async () => {
 		// Workspace folder matches but its state.vscdb file does not exist —
 		// readCursorAnchorComposerIds must swallow the stat() ENOENT and return [].
@@ -568,6 +597,69 @@ describe("discoverCursorSessions", () => {
 
 		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions.map((s) => s.sessionId)).toEqual(["dup-1"]);
+	});
+
+	it("populates SessionInfo.title from composerData.name when present", async () => {
+		const fresh = Date.now() - 60 * 1000;
+		await setupCursorHome(tmpHome, {
+			globalComposers: [
+				{
+					composerId: "c-1",
+					name: "Wire up dark mode toggle",
+					createdAtMs: fresh,
+					lastUpdatedAtMs: fresh,
+				},
+			],
+			workspaces: [
+				{
+					folder: toFileUri("/Users/flyer/work/proj-a"),
+					pointers: { lastFocusedComposerIds: ["c-1"] },
+				},
+			],
+		});
+
+		const result = await scanCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
+		expect(result.sessions).toHaveLength(1);
+		expect(result.sessions[0].title).toBe("Wire up dark mode toggle");
+	});
+
+	it("leaves SessionInfo.title undefined when composerData.name is missing or empty", async () => {
+		const fresh = Date.now() - 60 * 1000;
+
+		// Fixture A: explicit empty string for `name` (createCursorGlobalDb passes it through
+		// because nullish-coalescing only falls back on null/undefined, not "").
+		// Fixture B: row inserted directly to omit the `name` key entirely.
+		const userDir = join(tmpHome, "Library/Application Support/Cursor/User");
+		await mkdir(join(userDir, "globalStorage"), { recursive: true });
+		const globalDbPath = join(userDir, "globalStorage", "state.vscdb");
+		createCursorGlobalDb(globalDbPath, [
+			{
+				composerId: "empty-name",
+				name: "",
+				createdAtMs: fresh,
+				lastUpdatedAtMs: fresh,
+			},
+		]);
+
+		// Append a second row with no `name` field at all.
+		const globalDb = new DatabaseSync(globalDbPath);
+		globalDb
+			.prepare("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)")
+			.run("composerData:missing-name", JSON.stringify({ composerId: "missing-name", lastUpdatedAt: fresh }));
+		globalDb.close();
+
+		const wsDir = join(userDir, "workspaceStorage", "ws-00000000");
+		await mkdir(wsDir, { recursive: true });
+		await writeFile(
+			join(wsDir, "workspace.json"),
+			JSON.stringify({ folder: toFileUri("/Users/flyer/work/proj-a") }),
+		);
+		createCursorWorkspaceDb(join(wsDir, "state.vscdb"), null);
+
+		const result = await scanCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
+		const byId = new Map(result.sessions.map((s) => [s.sessionId, s]));
+		expect(byId.get("empty-name")?.title).toBeUndefined();
+		expect(byId.get("missing-name")?.title).toBeUndefined();
 	});
 
 	it("normalizes paths case-insensitively on win32", async () => {

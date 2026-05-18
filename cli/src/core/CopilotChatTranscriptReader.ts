@@ -135,6 +135,7 @@ function throwScanError(kind: CopilotChatScanError["kind"], message: string): ne
 interface ChatRequest {
 	message?: { text?: string };
 	response?: ReadonlyArray<{ value?: string }>;
+	timestamp?: number;
 }
 
 interface EventsLineEvent {
@@ -264,22 +265,38 @@ async function readPatchLog(
 	let lastEmittedIdx = fromIdx;
 
 	for (let i = fromIdx; i < requests.length; i++) {
-		const req = requests[i] as ChatRequest & { timestamp?: number };
+		const req = requests[i] as ChatRequest;
 		// beforeTimestamp gate: stop without advancing cursor past this request
 		// so the next read picks it up within a wider cutoff window.
 		if (typeof req?.timestamp === "number" && req.timestamp > cutoffMs) {
 			break;
 		}
+		// Convert the request's numeric ms timestamp to ISO so the emitted
+		// entries carry a stable identity dimension. Without this, two distinct
+		// turns whose user text happens to match (the user typed "continue"
+		// twice, or two identical assistant replies in the same session) share
+		// `(role, content)` and ConversationOverlayStore.sameIdentity collapses
+		// them — editing or deleting one fans out to every match. Both the
+		// human and assistant entries from this request share the timestamp
+		// (they are the same conversation turn); that matches the
+		// events.jsonl path which already emits per-event timestamps.
+		const ts = typeof req?.timestamp === "number" ? new Date(req.timestamp).toISOString() : undefined;
 		const userText = req?.message?.text;
 		if (typeof userText === "string" && userText.length > 0) {
-			entries.push({ role: "human", content: userText });
+			entries.push(
+				ts ? { role: "human", content: userText, timestamp: ts } : { role: "human", content: userText },
+			);
 		}
 		const responseList = Array.isArray(req?.response) ? req.response : [];
 		const assistantText = responseList
 			.map((chunk) => (typeof chunk?.value === "string" ? chunk.value : ""))
 			.join("");
 		if (assistantText.length > 0) {
-			entries.push({ role: "assistant", content: assistantText });
+			entries.push(
+				ts
+					? { role: "assistant", content: assistantText, timestamp: ts }
+					: { role: "assistant", content: assistantText },
+			);
 		}
 		lastEmittedIdx = i + 1;
 	}

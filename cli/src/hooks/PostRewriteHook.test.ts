@@ -19,6 +19,9 @@ vi.mock("node:fs", async (importOriginal) => {
 
 vi.mock("../core/GitOps.js", () => ({
 	getCommitInfo: vi.fn(),
+	// Default to a falsy / throw — individual tests opt-in to a real branch
+	// name when they need to exercise the truthy spread arm.
+	getCurrentBranch: vi.fn().mockResolvedValue(""),
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({
@@ -39,6 +42,7 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
+import { getCurrentBranch } from "../core/GitOps.js";
 import { isWorkerLockHeld } from "../core/Locks.js";
 import { enqueueGitOperation } from "../core/SessionTracker.js";
 import { handlePostRewriteHook } from "./PostRewriteHook.js";
@@ -66,6 +70,10 @@ describe("PostRewriteHook", () => {
 		vi.clearAllMocks();
 		vi.mocked(isWorkerLockHeld).mockResolvedValue(false);
 		vi.mocked(enqueueGitOperation).mockResolvedValue(true);
+		// Default: branch read returns empty (falsy short-circuit on the
+		// `...(branch && { branch })` spread). Tests that need the truthy
+		// arm override via `vi.mocked(getCurrentBranch).mockResolvedValue("main")`.
+		vi.mocked(getCurrentBranch).mockResolvedValue("");
 		// Default: no plugin-source file
 		mockExistsSync.mockReturnValue(false);
 	});
@@ -107,6 +115,19 @@ describe("PostRewriteHook", () => {
 			expect(launchWorker).not.toHaveBeenCalled();
 		});
 
+		// Coverage: the `...(branch && { branch })` spread's truthy arm in
+		// handleAmend. Previous tests run with branch="" so the field is
+		// omitted; this one pins the on-branch case.
+		it("includes the current branch on the amend op when getCurrentBranch resolves a name", async () => {
+			setStdinLines(["aaaa1111 bbbb2222"]);
+			vi.mocked(getCurrentBranch).mockResolvedValue("feature/x");
+			await handlePostRewriteHook("amend", "/test/project");
+			expect(enqueueGitOperation).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "amend", branch: "feature/x" }),
+				"/test/project",
+			);
+		});
+
 		it("should not enqueue when amend has no stdin mappings", async () => {
 			setStdinLines([]);
 
@@ -130,6 +151,32 @@ describe("PostRewriteHook", () => {
 					commitHash: "bbbb2222",
 					sourceHashes: ["aaaa1111"],
 				}),
+				"/test/project",
+			);
+		});
+
+		// Coverage: getCurrentBranch's catch branch — when it rejects, the
+		// outer flow logs and continues with branch="" (falsy spread arm).
+		it("logs and continues when getCurrentBranch rejects", async () => {
+			setStdinLines(["aaaa1111 bbbb2222"]);
+			vi.mocked(getCurrentBranch).mockRejectedValueOnce(new Error("git not found"));
+			await handlePostRewriteHook("rebase", "/test/project");
+			expect(enqueueGitOperation).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "rebase-pick" }),
+				"/test/project",
+			);
+			// `branch` field must be omitted because the read failed.
+			const call = vi.mocked(enqueueGitOperation).mock.calls[0]?.[0] as { branch?: string };
+			expect(call?.branch).toBeUndefined();
+		});
+
+		// Coverage: rebase-handler's truthy `...(branch && { branch })` arm.
+		it("includes the current branch on rebase ops when getCurrentBranch resolves a name", async () => {
+			setStdinLines(["aaaa1111 bbbb2222"]);
+			vi.mocked(getCurrentBranch).mockResolvedValue("topic/y");
+			await handlePostRewriteHook("rebase", "/test/project");
+			expect(enqueueGitOperation).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "rebase-pick", branch: "topic/y" }),
 				"/test/project",
 			);
 		});

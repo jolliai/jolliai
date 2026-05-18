@@ -63,7 +63,7 @@ export async function scanCopilotSessions(projectDir: string): Promise<CopilotSc
 					 WHERE ${cwdMatch}
 					 ORDER BY updated_at DESC`,
 				)
-				.all({ cwd: normalized }) as ReadonlyArray<{ id: string; updated_at: string }>;
+				.all({ cwd: normalized }) as ReadonlyArray<{ id: string; updated_at: string; summary: unknown }>;
 			return rows.flatMap((row): SessionInfo[] => {
 				const ms = Date.parse(row.updated_at);
 				if (!Number.isFinite(ms)) {
@@ -81,6 +81,8 @@ export async function scanCopilotSessions(projectDir: string): Promise<CopilotSc
 						transcriptPath: `${dbPath}#${row.id}`,
 						updatedAt: new Date(ms).toISOString(),
 						source: "copilot",
+						title:
+							typeof row.summary === "string" && row.summary.trim().length > 0 ? row.summary : undefined,
 					},
 				];
 			});
