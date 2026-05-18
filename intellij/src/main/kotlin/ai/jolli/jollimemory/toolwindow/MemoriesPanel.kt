@@ -129,11 +129,7 @@ class MemoriesPanel(
 
     private fun refreshFromIndex() {
         val status = service.getStatus()
-        if (status == null) {
-            SwingUtilities.invokeLater { showInitializing() }
-            return
-        }
-        if (!status.enabled) {
+        if (status == null || !status.enabled) {
             SwingUtilities.invokeLater { showInitializing() }
             return
         }

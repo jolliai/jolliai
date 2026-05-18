@@ -133,6 +133,18 @@ class GitOps(private val projectDir: String) {
         return exec("rev-parse", "--abbrev-ref", "HEAD")
     }
 
+    /** List local branch names, current branch first. */
+    fun listBranches(): List<String> {
+        val output = exec("branch", "--format=%(refname:short)") ?: return emptyList()
+        val branches = output.lines().filter { it.isNotBlank() }
+        val current = getCurrentBranch()
+        return if (current != null) {
+            listOf(current) + branches.filter { it != current }
+        } else {
+            branches
+        }
+    }
+
     /** Get commits on current branch not in main. */
     fun getBranchCommits(baseBranch: String = "main"): String? {
         return exec("log", "$baseBranch..HEAD", "--format=%H|%h|%s|%an|%aI", "--no-merges")

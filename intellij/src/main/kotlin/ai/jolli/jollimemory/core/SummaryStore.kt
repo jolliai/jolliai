@@ -156,9 +156,11 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
             commitAliases = existingIndex?.commitAliases,
         )
 
+        val indexJson = gson.toJson(newIndex)
+
         val files = mutableListOf(
             FileWrite("summaries/${summary.commitHash}.json", gson.toJson(summary)),
-            FileWrite(INDEX_FILE, gson.toJson(newIndex)),
+            FileWrite(INDEX_FILE, indexJson),
         )
         if (transcript != null && transcript.sessions.isNotEmpty()) {
             files.add(FileWrite("transcripts/${summary.commitHash}.json", gson.toJson(transcript)))
@@ -170,7 +172,6 @@ class SummaryStore(private val cwd: String, private val git: GitOps, private val
         }
 
         storage.writeFiles(files, "Add summary for ${summary.commitHash.take(8)}: ${summary.commitMessage.take(50)}")
-        log.info("Summary stored for commit %s", summary.commitHash.take(8))
     }
 
     fun migrateOneToOne(oldSummary: CommitSummary, newCommitInfo: CommitInfo) {

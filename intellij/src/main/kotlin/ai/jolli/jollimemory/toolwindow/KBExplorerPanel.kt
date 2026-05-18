@@ -16,6 +16,10 @@ import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.intellij.icons.AllIcons
 import com.intellij.ide.actions.RevealFileAction
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.AnAction
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.diagnostic.Logger
@@ -56,9 +60,7 @@ import java.nio.file.StandardCopyOption
 import javax.swing.BoxLayout
 import javax.swing.JButton
 import javax.swing.JLabel
-import javax.swing.JMenuItem
 import javax.swing.JPanel
-import javax.swing.JPopupMenu
 import javax.swing.JToggleButton
 import javax.swing.JTree
 import javax.swing.SwingConstants
@@ -85,7 +87,7 @@ class KBExplorerPanel(
     private val service: JolliMemoryService,
 ) : JPanel(BorderLayout()), Disposable {
 
-    private enum class ViewMode { TREE, TIMELINE, AZ }
+    private enum class ViewMode { TREE, TIMELINE }
 
     private var tree: Tree? = null
     private var treeModel: DefaultTreeModel? = null
@@ -93,11 +95,14 @@ class KBExplorerPanel(
     private var metadataManager: MetadataManager? = null
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
 
+    /** Relativize and normalize to forward slashes so lookups match manifest paths on Windows. */
+    private fun relPath(root: Path, child: Path): String =
+        root.relativize(child).toString().replace('\\', '/')
+
     private var currentView = ViewMode.TREE
     private val contentPanel = JPanel(CardLayout())
     private val treePanel = JPanel(BorderLayout())
     private val timelinePanel = JPanel(BorderLayout())
-    private val azPanel = JPanel(BorderLayout())
     private var cachedRepos: List<KBRepoDiscoverer.DiscoveredRepo> = emptyList()
     private var searchQuery: String = ""
 
@@ -112,6 +117,11 @@ class KBExplorerPanel(
         val isRepoRoot: Boolean = false,
         val isCurrentRepo: Boolean = false,
         val badge: String? = null,
+        /** Branch the entry came from — used to build the recall prompt. Null for non-memory nodes. */
+        val branch: String? = null,
+        /** The repo-specific KB root this entry belongs to. Distinct from the panel's current kbRoot
+         *  for cross-repo views (Timeline); needed to find the right `.jolli/` for summaries. */
+        val entryKbRoot: Path? = null,
     )
 
     init {
@@ -121,52 +131,53 @@ class KBExplorerPanel(
         val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 2, 0)).apply {
             border = JBUI.Borders.empty(2)
         }
-        val btnTree = JToggleButton("Tree", true).apply { toolTipText = "Tree view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "first") }
-        val btnTimeline = JToggleButton("Timeline").apply { toolTipText = "Timeline view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "middle") }
-        val btnAZ = JToggleButton("A-Z").apply { toolTipText = "Alphabetical view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "last") }
-        val viewButtons = listOf(btnTree, btnTimeline, btnAZ)
-        fun selectView(mode: ViewMode) {
-            currentView = mode
-            viewButtons.forEach { it.isSelected = false }
-            when (mode) { ViewMode.TREE -> btnTree; ViewMode.TIMELINE -> btnTimeline; ViewMode.AZ -> btnAZ }.isSelected = true
-            (contentPanel.layout as CardLayout).show(contentPanel, mode.name)
-            ApplicationManager.getApplication().executeOnPooledThread { rebuildCurrentView() }
-        }
-        btnTree.addActionListener { selectView(ViewMode.TREE) }
-        btnTimeline.addActionListener { selectView(ViewMode.TIMELINE) }
-        btnAZ.addActionListener { selectView(ViewMode.AZ) }
-        toolbar.add(btnTree)
-        toolbar.add(btnTimeline)
-        toolbar.add(btnAZ)
-        toolbar.add(javax.swing.Box.createHorizontalStrut(8))
-
-        // Search field
+        val btnTree = JToggleButton("Tree").apply { toolTipText = "Tree view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "first") }
+        val btnTimeline = JToggleButton("Timeline").apply { toolTipText = "Timeline view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "last") }
+        val viewButtons = listOf(btnTree, btnTimeline)
+        // Search field — only visible in Timeline view
         val searchField = com.intellij.ui.SearchTextField(false).apply {
             toolTipText = "Search across all repos"
             textEditor.columns = 12
+            isVisible = false
         }
         searchField.addDocumentListener(object : DocumentListener {
             override fun insertUpdate(e: DocumentEvent?) = onSearchChanged(searchField.text)
             override fun removeUpdate(e: DocumentEvent?) = onSearchChanged(searchField.text)
             override fun changedUpdate(e: DocumentEvent?) = onSearchChanged(searchField.text)
         })
-        toolbar.add(searchField)
-        toolbar.add(javax.swing.Box.createHorizontalStrut(4))
+        fun selectView(mode: ViewMode) {
+            currentView = mode
+            viewButtons.forEach { it.isSelected = false }
+            when (mode) { ViewMode.TREE -> btnTree; ViewMode.TIMELINE -> btnTimeline }.isSelected = true
+            searchField.isVisible = mode == ViewMode.TIMELINE
+            (contentPanel.layout as CardLayout).show(contentPanel, mode.name)
+            ApplicationManager.getApplication().executeOnPooledThread { rebuildCurrentView() }
+        }
+        btnTree.addActionListener { selectView(ViewMode.TREE) }
+        btnTimeline.addActionListener { selectView(ViewMode.TIMELINE) }
+        toolbar.add(btnTree)
+        toolbar.add(btnTimeline)
+        toolbar.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(4)))
 
-        // Reset button
+        // Reset (re-migrate) button
         val btnReset = JButton(AllIcons.Actions.Refresh).apply {
             toolTipText = "Reset — re-migrate from orphan branch"
             isBorderPainted = false
+            isFocusPainted = false
             isContentAreaFilled = false
+            preferredSize = Dimension(JBUI.scale(22), JBUI.scale(22))
+            maximumSize = Dimension(JBUI.scale(22), JBUI.scale(22))
+            margin = JBUI.emptyInsets()
             addActionListener {
                 ApplicationManager.getApplication().executeOnPooledThread { resetMigration() }
             }
         }
         toolbar.add(btnReset)
+        toolbar.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(4)))
+        toolbar.add(searchField)
 
         contentPanel.add(treePanel, ViewMode.TREE.name)
         contentPanel.add(timelinePanel, ViewMode.TIMELINE.name)
-        contentPanel.add(azPanel, ViewMode.AZ.name)
 
         add(toolbar, BorderLayout.NORTH)
         add(contentPanel, BorderLayout.CENTER)
@@ -207,6 +218,7 @@ class KBExplorerPanel(
         try {
             resolveKBRoot()
             reconcile()
+            reloadCache()
             buildTree()
         } catch (e: Exception) {
             showMessage("Error: ${e.javaClass.simpleName}: ${e.message}")
@@ -237,7 +249,6 @@ class KBExplorerPanel(
         when (currentView) {
             ViewMode.TREE -> buildTree()
             ViewMode.TIMELINE -> buildTimeline()
-            ViewMode.AZ -> buildAZ()
         }
     }
 
@@ -273,11 +284,27 @@ class KBExplorerPanel(
             val repoMM = MetadataManager(repo.kbRoot.resolve(".jolli"))
             val badgeMap = mutableMapOf<String, String>()
             val titleMap = mutableMapOf<String, String>()
+            val branchMap = mutableMapOf<String, String>()
+
+            // Build set of paths to hide (child entries after squash/consolidation)
+            val index = repoMM.readIndex()
+            val childHashes = index?.entries
+                ?.filter { it.parentCommitHash != null }
+                ?.map { it.commitHash }
+                ?.toSet()
+                ?: emptySet()
+            val hiddenPaths = mutableSetOf<String>()
+
             repoMM.readManifest().files.forEach { entry ->
                 badgeMap[entry.path] = when (entry.type) {
                     "commit" -> "C"; "plan" -> "P"; "note" -> "N"; else -> ""
                 }
                 if (entry.title != null) titleMap[entry.path] = entry.title
+                entry.source.branch?.let { branchMap[entry.path] = it }
+                // Track paths of child entries to hide from tree
+                if (entry.type == "commit" && entry.fileId in childHashes) {
+                    hiddenPaths.add(entry.path)
+                }
             }
 
             val repoNode = DefaultMutableTreeNode(KBNodeData(
@@ -294,7 +321,7 @@ class KBExplorerPanel(
             }
             for (dir in dirs) {
                 val branchNode = DefaultMutableTreeNode(KBNodeData(dir, dir.name, isDirectory = true))
-                addChildren(branchNode, dir, repo.kbRoot, badgeMap, titleMap)
+                addChildren(branchNode, dir, repo.kbRoot, badgeMap, titleMap, branchMap, hiddenPaths)
                 repoNode.add(branchNode)
             }
 
@@ -304,9 +331,17 @@ class KBExplorerPanel(
                     .filter { !it.name.startsWith(".") && it.name != "index.json" }
                     .sorted(compareBy { it.name })
                     .forEach { file ->
-                        val relPath = repo.kbRoot.relativize(file).toString()
+                        val relPath = relPath(repo.kbRoot, file)
+                        if (relPath in hiddenPaths) return@forEach
                         repoNode.add(DefaultMutableTreeNode(
-                            KBNodeData(file, file.name, displayName = titleMap[relPath], isDirectory = false, badge = badgeMap[relPath])
+                            KBNodeData(
+                                file, file.name,
+                                displayName = titleMap[relPath],
+                                isDirectory = false,
+                                badge = badgeMap[relPath],
+                                branch = branchMap[relPath],
+                                entryKbRoot = repo.kbRoot,
+                            )
                         ))
                     }
             }
@@ -398,23 +433,55 @@ class KBExplorerPanel(
         }
     }
 
+    /** Memory-only popup for the Timeline view — no file-ops items there. */
+    private fun showMemoryPopup(e: MouseEvent, t: Tree) {
+        val row = t.getRowForLocation(e.x, e.y)
+        if (row < 0) return
+        t.setSelectionRow(row)
+        val node = t.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return
+        val data = node.userObject as? KBNodeData ?: return
+        if (data.isDirectory || data.badge != "C") return
+
+        val group = DefaultActionGroup().apply {
+            data.branch?.let { branch ->
+                add(object : AnAction("Copy Recall Prompt") {
+                    override fun actionPerformed(ev: AnActionEvent) = copyRecallPromptForBranch(branch)
+                })
+            }
+            add(object : AnAction("View Commit Memory") {
+                override fun actionPerformed(ev: AnActionEvent) = openCommitSummary(data)
+            })
+        }
+        val menu = ActionManager.getInstance().createActionPopupMenu("JolliMemory.KBMemoryMenu", group)
+        menu.component.show(e.component, e.x, e.y)
+    }
+
     private fun addChildren(
         parentNode: DefaultMutableTreeNode, dir: Path, kbRoot: Path,
         badgeMap: Map<String, String>, titleMap: Map<String, String>,
+        branchMap: Map<String, String>, hiddenPaths: Set<String>,
     ) {
         try {
             Files.list(dir).use { s ->
                 s.filter { !it.name.startsWith(".") }
                     .sorted(compareByDescending<Path> { it.isDirectory() }.thenBy { it.name })
                     .forEach { child ->
-                        val relPath = kbRoot.relativize(child).toString()
+                        val relPath = relPath(kbRoot, child)
                         if (child.isDirectory()) {
                             val n = DefaultMutableTreeNode(KBNodeData(child, child.name, isDirectory = true))
-                            addChildren(n, child, kbRoot, badgeMap, titleMap)
+                            addChildren(n, child, kbRoot, badgeMap, titleMap, branchMap, hiddenPaths)
                             parentNode.add(n)
                         } else {
+                            if (relPath in hiddenPaths) return@forEach
                             parentNode.add(DefaultMutableTreeNode(
-                                KBNodeData(child, child.name, displayName = titleMap[relPath], isDirectory = false, badge = badgeMap[relPath])
+                                KBNodeData(
+                                    child, child.name,
+                                    displayName = titleMap[relPath],
+                                    isDirectory = false,
+                                    badge = badgeMap[relPath],
+                                    branch = branchMap[relPath],
+                                    entryKbRoot = kbRoot,
+                                )
                             ))
                         }
                     }
@@ -492,8 +559,8 @@ class KBExplorerPanel(
                             }
 
                             Files.move(internalSource, dest, StandardCopyOption.REPLACE_EXISTING)
-                            val oldRel = root.relativize(internalSource).toString()
-                            val newRel = root.relativize(dest).toString()
+                            val oldRel = relPath(root, internalSource)
+                            val newRel = relPath(root, dest)
                             if (Files.isDirectory(dest)) {
                                 mm.renameBranchFolder(oldRel, newRel)
                             } else {
@@ -525,8 +592,8 @@ class KBExplorerPanel(
 
                                 if (source.startsWith(root)) {
                                     Files.move(source, dest, StandardCopyOption.REPLACE_EXISTING)
-                                    val oldRel = root.relativize(source).toString()
-                                    val newRel = root.relativize(dest).toString()
+                                    val oldRel = relPath(root, source)
+                                    val newRel = relPath(root, dest)
                                     val entry = mm.findByPath(oldRel)
                                     if (entry != null) mm.updatePath(entry.fileId, newRel)
                                 } else {
@@ -550,9 +617,8 @@ class KBExplorerPanel(
     // ── Context menu ───────────────────────────────────────────────────────
 
     private fun showContextMenu(e: MouseEvent, data: KBNodeData?) {
-        val root = kbRoot ?: return
-        val mm = metadataManager ?: return
-        val popup = JPopupMenu()
+        val root = data?.entryKbRoot ?: kbRoot ?: return
+        val mm = if (data?.entryKbRoot != null) MetadataManager(root.resolve(".jolli")) else metadataManager ?: return
 
         val targetDir = when {
             data == null -> root
@@ -560,41 +626,57 @@ class KBExplorerPanel(
             else -> data.path.parent ?: root
         }
 
-        popup.add(JMenuItem("New Folder").apply {
-            addActionListener { doNewFolder(targetDir) }
+        val group = DefaultActionGroup()
+
+        // Memory-entry actions appear first when the node is a commit memory file
+        if (data != null && !data.isDirectory && data.badge == "C") {
+            data.branch?.let { branch ->
+                group.add(object : AnAction("Copy Recall Prompt") {
+                    override fun actionPerformed(ev: AnActionEvent) = copyRecallPromptForBranch(branch)
+                })
+            }
+            group.add(object : AnAction("View Commit Memory") {
+                override fun actionPerformed(ev: AnActionEvent) = openCommitSummary(data)
+            })
+            group.addSeparator()
+        }
+
+        group.add(object : AnAction("New Folder") {
+            override fun actionPerformed(ev: AnActionEvent) = doNewFolder(targetDir)
         })
-        popup.add(JMenuItem("New Markdown File").apply {
-            addActionListener { doNewFile(targetDir) }
+        group.add(object : AnAction("New Markdown File") {
+            override fun actionPerformed(ev: AnActionEvent) = doNewFile(targetDir)
         })
-        popup.add(JMenuItem("Import File(s)...").apply {
-            addActionListener { doImportFiles(targetDir) }
+        group.add(object : AnAction("Import File(s)...") {
+            override fun actionPerformed(ev: AnActionEvent) = doImportFiles(targetDir)
         })
 
         if (data != null) {
-            popup.addSeparator()
-            popup.add(JMenuItem("Rename").apply {
-                addActionListener { doRename(data, root, mm) }
+            group.addSeparator()
+            group.add(object : AnAction("Rename") {
+                override fun actionPerformed(ev: AnActionEvent) = doRename(data, root, mm)
             })
             if (!data.isDirectory) {
-                popup.add(JMenuItem("Move to...").apply {
-                    addActionListener { doMove(data, root, mm) }
+                group.add(object : AnAction("Move to...") {
+                    override fun actionPerformed(ev: AnActionEvent) = doMove(data, root, mm)
                 })
             }
-            popup.addSeparator()
-            popup.add(JMenuItem("Delete").apply {
-                addActionListener { doDelete(data, root, mm) }
+            group.addSeparator()
+            group.add(object : AnAction("Delete") {
+                override fun actionPerformed(ev: AnActionEvent) = doDelete(data, root, mm)
             })
         }
 
-        popup.addSeparator()
-        popup.add(JMenuItem(RevealFileAction.getActionName()).apply {
-            addActionListener {
+        group.addSeparator()
+        group.add(object : AnAction(RevealFileAction.getActionName()) {
+            override fun actionPerformed(ev: AnActionEvent) {
                 val target = data?.path ?: root
                 RevealFileAction.openFile(target.toFile())
             }
         })
 
-        popup.show(e.component, e.x, e.y)
+        val menu = ActionManager.getInstance().createActionPopupMenu("JolliMemory.KBTreeMenu", group)
+        menu.component.show(e.component, e.x, e.y)
     }
 
     // ── File operations ────────────────────────────────────────────────────
@@ -660,8 +742,8 @@ class KBExplorerPanel(
             if (data.isDirectory) {
                 mm.renameBranchFolder(oldName, newName)
             } else {
-                val oldRelPath = root.relativize(data.path).toString()
-                val newRelPath = root.relativize(newPath).toString()
+                val oldRelPath = relPath(root, data.path)
+                val newRelPath = relPath(root, newPath)
                 val entry = mm.findByPath(oldRelPath)
                 if (entry != null) {
                     mm.updatePath(entry.fileId, newRelPath)
@@ -689,8 +771,8 @@ class KBExplorerPanel(
             val destPath = destDir.resolve(data.name)
             Files.move(data.path, destPath)
 
-            val oldRelPath = root.relativize(data.path).toString()
-            val newRelPath = root.relativize(destPath).toString()
+            val oldRelPath = relPath(root, data.path)
+            val newRelPath = relPath(root, destPath)
             val entry = mm.findByPath(oldRelPath)
             if (entry != null) {
                 mm.updatePath(entry.fileId, newRelPath)
@@ -717,7 +799,7 @@ class KBExplorerPanel(
                 mm.removeBranchFolder(data.name)
             } else {
                 Files.deleteIfExists(data.path)
-                val relPath = root.relativize(data.path).toString()
+                val relPath = relPath(root, data.path)
                 val entry = mm.findByPath(relPath)
                 if (entry != null) {
                     mm.removeFromManifest(entry.fileId)
@@ -738,9 +820,12 @@ class KBExplorerPanel(
     }
 
     private fun openCommitSummary(data: KBNodeData) {
-        val root = kbRoot ?: return
-        val mm = metadataManager ?: return
-        val relativePath = root.relativize(data.path).toString()
+        // Use the node's own repo root when present so Timeline / A-Z entries from
+        // discovered foreign repos resolve their manifest correctly. Falls back to
+        // the panel's current-repo kbRoot for legacy Tree-only callers.
+        val root = data.entryKbRoot ?: kbRoot ?: return
+        val mm = if (data.entryKbRoot != null) MetadataManager(root.resolve(".jolli")) else metadataManager ?: return
+        val relativePath = relPath(root, data.path)
         val entry = mm.findByPath(relativePath) ?: run { openFile(data.path); return }
         val summaryPath = root.resolve(".jolli/summaries/${entry.fileId}.json")
         if (!Files.exists(summaryPath)) { openFile(data.path); return }
@@ -750,8 +835,9 @@ class KBExplorerPanel(
                 val json = Files.readString(summaryPath, java.nio.charset.StandardCharsets.UTF_8)
                 val summary = gson.fromJson(json, CommitSummary::class.java)
                 if (summary != null) {
+                    val isForeign = data.entryKbRoot != null && data.entryKbRoot != kbRoot
                     SwingUtilities.invokeLater {
-                        FileEditorManager.getInstance(project).openFile(SummaryVirtualFile(summary), true)
+                        FileEditorManager.getInstance(project).openFile(SummaryVirtualFile(summary, readOnly = isForeign), true)
                     }
                 } else {
                     SwingUtilities.invokeLater { openFile(data.path) }
@@ -764,6 +850,17 @@ class KBExplorerPanel(
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
+
+    private fun copyRecallPromptForBranch(branch: String) {
+        val prompt = "Invoke the \"jolli-recall\" skill with args \"$branch\"."
+        val clipboard = java.awt.Toolkit.getDefaultToolkit().systemClipboard
+        clipboard.setContents(StringSelection(prompt), null)
+        Messages.showInfoMessage(
+            project,
+            "Recall prompt copied — paste it into Claude Code.",
+            "Copy Recall Prompt",
+        )
+    }
 
     private fun backgroundRefresh() {
         ApplicationManager.getApplication().executeOnPooledThread { refresh() }
@@ -821,6 +918,7 @@ class KBExplorerPanel(
                 dateNode.add(DefaultMutableTreeNode(KBNodeData(
                     entry.fullPath, entry.path, displayName = display,
                     isDirectory = false, badge = "C",
+                    branch = entry.branch, entryKbRoot = entry.kbRoot,
                 )))
             }
             rootNode.add(dateNode)
@@ -845,6 +943,8 @@ class KBExplorerPanel(
                         if (!data.isDirectory) openCommitSummary(data)
                     }
                 }
+                override fun mousePressed(e: MouseEvent) { if (e.isPopupTrigger) showMemoryPopup(e, t) }
+                override fun mouseReleased(e: MouseEvent) { if (e.isPopupTrigger) showMemoryPopup(e, t) }
             })
             // Expand all date groups
             for (i in 0 until rootNode.childCount) {
@@ -854,46 +954,6 @@ class KBExplorerPanel(
             timelinePanel.add(JBScrollPane(t), BorderLayout.CENTER)
             timelinePanel.revalidate()
             timelinePanel.repaint()
-        }
-    }
-
-    // ── A-Z view ──────────────────────────────────────────────────────────
-
-    private fun buildAZ() {
-        val entries = KBDataCache.byAlpha()
-            .filter { matchesSearch(it.repo, it.branch, it.title, it.path) }
-        if (entries.isEmpty()) {
-            showMessageIn(azPanel, if (searchQuery.isEmpty()) "No memories yet" else "No results for \"$searchQuery\"")
-            return
-        }
-
-        val rootNode = DefaultMutableTreeNode("A-Z")
-        for (entry in entries) {
-            val label = "${entry.repo} :: ${entry.branch ?: "?"} :: ${entry.title ?: entry.path}"
-            rootNode.add(DefaultMutableTreeNode(KBNodeData(
-                entry.fullPath, label, isDirectory = false, badge = "C",
-            )))
-        }
-
-        SwingUtilities.invokeLater {
-            val t = Tree(DefaultTreeModel(rootNode)).apply {
-                isRootVisible = false
-                showsRootHandles = false
-                cellRenderer = AZCellRenderer()
-            }
-            t.addMouseListener(object : MouseAdapter() {
-                override fun mouseClicked(e: MouseEvent) {
-                    if (e.clickCount == 2) {
-                        val node = t.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return
-                        val data = node.userObject as? KBNodeData ?: return
-                        if (!data.isDirectory) openCommitSummary(data)
-                    }
-                }
-            })
-            azPanel.removeAll()
-            azPanel.add(JBScrollPane(t), BorderLayout.CENTER)
-            azPanel.revalidate()
-            azPanel.repaint()
         }
     }
 
@@ -914,7 +974,6 @@ class KBExplorerPanel(
     private fun showMessage(text: String) {
         showMessageIn(treePanel, text)
         showMessageIn(timelinePanel, text)
-        showMessageIn(azPanel, text)
     }
 
     private fun findNodeByPath(node: DefaultMutableTreeNode, targetPath: Path): DefaultMutableTreeNode? {
@@ -988,25 +1047,4 @@ class KBExplorerPanel(
         }
     }
 
-    private class AZCellRenderer : ColoredTreeCellRenderer() {
-        override fun customizeCellRenderer(
-            tree: JTree, value: Any?, selected: Boolean,
-            expanded: Boolean, leaf: Boolean, row: Int, hasFocus: Boolean,
-        ) {
-            val node = value as? DefaultMutableTreeNode ?: return
-            val data = node.userObject as? KBNodeData ?: return
-            icon = AllIcons.Vcs.CommitNode
-            // name is already "repo :: branch :: title"
-            val parts = data.name.split(" :: ", limit = 3)
-            if (parts.size == 3) {
-                append(parts[0], SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                append(" :: ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                append(parts[1], SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                append(" :: ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                append(parts[2])
-            } else {
-                append(data.name)
-            }
-        }
-    }
 }

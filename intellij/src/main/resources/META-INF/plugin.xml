@@ -20,7 +20,7 @@
         <projectService
             serviceImplementation="ai.jolli.jollimemory.services.JolliMemoryService"/>
 
-        <!-- Tool window: sidebar with collapsible STATUS, MEMORIES, PLANS & NOTES, CHANGES, COMMITS panels -->
+        <!-- Tool window: sidebar with collapsible STATUS, MEMORIES, PLANS & NOTES, CHANGES panels -->
         <toolWindow
             id="JOLLI"
             anchor="right"
@@ -112,30 +112,6 @@
                     class="ai.jolli.jollimemory.actions.RefreshCommitsAction"
                     text="Refresh Commits"
                     description="Refresh commit history"
-                    icon="AllIcons.Actions.Refresh"/>
-        </group>
-
-        <!-- Memories panel actions -->
-        <group id="JolliMemory.MemoriesActions" text="JolliMemory Memories">
-            <action id="JolliMemory.MemoryScope"
-                    class="ai.jolli.jollimemory.actions.MemoryScopeAction"
-                    text="Filter Scope"
-                    description="Filter memories by scope"
-                    icon="AllIcons.General.Filter"/>
-            <action id="JolliMemory.SearchMemories"
-                    class="ai.jolli.jollimemory.actions.SearchMemoriesAction"
-                    text="Search Memories"
-                    description="Search memories by commit message or branch name"
-                    icon="AllIcons.Actions.Search"/>
-            <action id="JolliMemory.ClearMemoryFilter"
-                    class="ai.jolli.jollimemory.actions.ClearMemoryFilterAction"
-                    text="Clear Filter"
-                    description="Clear the active memory search filter"
-                    icon="AllIcons.Actions.Close"/>
-            <action id="JolliMemory.RefreshMemories"
-                    class="ai.jolli.jollimemory.actions.RefreshMemoriesAction"
-                    text="Refresh Memories"
-                    description="Refresh the memories list"
                     icon="AllIcons.Actions.Refresh"/>
         </group>
 

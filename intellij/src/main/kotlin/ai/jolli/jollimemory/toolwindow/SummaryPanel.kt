@@ -61,6 +61,7 @@ import java.awt.BorderLayout
 class SummaryPanel(
     private val project: Project,
     summary: CommitSummary,
+    private val readOnly: Boolean = false,
 ) : JPanel(BorderLayout()) {
 
     @Volatile
@@ -137,7 +138,7 @@ class SummaryPanel(
             }, b.cefBrowser)
 
             val isDark = !JBColor.isBright()
-            val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript)
+            val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly)
             b.loadHTML(html)
             b.component
         } catch (e: Exception) {
@@ -176,7 +177,7 @@ class SummaryPanel(
 
     private fun refreshHtml() {
         val isDark = !JBColor.isBright()
-        val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript)
+        val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly)
         browser?.loadHTML(html)
     }
 
@@ -210,8 +211,20 @@ class SummaryPanel(
 
     // ── Message dispatcher ──────────────────────────────────────────────────
 
+    /** Commands that modify data — blocked in read-only mode. */
+    private val writeCommands = setOf(
+        "pushToJolli", "editTopic", "deleteTopic", "generateE2eTest", "editE2eTest",
+        "deleteE2eTest", "savePlan", "removePlan", "translatePlan", "associatePlan",
+        "createPr", "updatePr", "saveAllTranscripts", "deleteAllTranscripts",
+        "generateRecap", "editRecap",
+    )
+
     private fun dispatchWebviewMessage(json: JsonObject) {
         val command = json.get("command")?.asString ?: return
+        if (readOnly && command in writeCommands) {
+            LOG.info("Blocked write command '$command' in read-only mode")
+            return
+        }
         try {
             when (command) {
                 "copyMarkdown" -> handleCopyMarkdown()

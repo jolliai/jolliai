@@ -60,6 +60,7 @@ class SquashAction : AnAction() {
 
         // Get selected commits from CommitsPanel if available, otherwise use all branch commits
         val commitsPanel = service.panelRegistry?.commitsPanel
+        if (commitsPanel?.isForeignMode == true) return
         val selectedCommits = commitsPanel?.getSelectedCommits()?.takeIf { it.isNotEmpty() }
         val commits = selectedCommits ?: service.getBranchCommits()
         if (commits.size < 2) {
@@ -256,7 +257,8 @@ class SquashAction : AnAction() {
         val status = service?.getStatus()
         val cwd = service?.mainRepoRoot ?: e.project?.basePath
         val workerBusy = cwd != null && SessionTracker.isWorkerBusy(cwd)
-        e.presentation.isEnabled = status != null && status.enabled && !workerBusy
+        val isForeign = service?.panelRegistry?.commitsPanel?.isForeignMode == true
+        e.presentation.isEnabled = status != null && status.enabled && !workerBusy && !isForeign
     }
 }
 

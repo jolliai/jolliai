@@ -17,7 +17,7 @@ class SummaryFileEditor(
     private val file: SummaryVirtualFile,
 ) : UserDataHolderBase(), FileEditor {
 
-    private val panel = SummaryPanel(project, file.summary)
+    private val panel = SummaryPanel(project, file.summary, file.readOnly)
 
     override fun getComponent(): JComponent = panel
 

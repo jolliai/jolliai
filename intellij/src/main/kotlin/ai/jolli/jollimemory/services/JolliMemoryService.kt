@@ -417,8 +417,9 @@ class JolliMemoryService(private val project: Project) : Disposable {
     fun listMemoryEntries(count: Int, filter: String? = null, scope: String = "branch"): Pair<List<ai.jolli.jollimemory.core.SummaryIndexEntry>, Int> {
         val g = git ?: return emptyList<ai.jolli.jollimemory.core.SummaryIndexEntry>() to 0
         val projectPath = mainRepoRoot ?: ""
-            val store = ai.jolli.jollimemory.core.SummaryStore(projectPath, g, StorageFactory.create(g, projectPath))
-        val index = store.loadIndex() ?: return emptyList<ai.jolli.jollimemory.core.SummaryIndexEntry>() to 0
+        val store = ai.jolli.jollimemory.core.SummaryStore(projectPath, g, StorageFactory.create(g, projectPath))
+        val index = store.loadIndex()
+            ?: return emptyList<ai.jolli.jollimemory.core.SummaryIndexEntry>() to 0
 
         // Filter to root entries only (no child/incremental summaries)
         var entries = index.entries

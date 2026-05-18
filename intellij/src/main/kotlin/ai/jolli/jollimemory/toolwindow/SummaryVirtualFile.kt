@@ -9,6 +9,7 @@ import com.intellij.testFramework.LightVirtualFile
  */
 class SummaryVirtualFile(
     val summary: CommitSummary,
+    val readOnly: Boolean = false,
 ) : LightVirtualFile(
     "\u2728 ${summary.commitHash.take(8)} — ${summary.commitMessage.take(50)}",
     "",
