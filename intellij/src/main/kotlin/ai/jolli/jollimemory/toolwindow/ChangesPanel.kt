@@ -30,8 +30,13 @@ import java.awt.FlowLayout
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.io.File
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DataContext
+import com.intellij.openapi.actionSystem.Presentation
 import javax.swing.Box
 import javax.swing.BoxLayout
+import javax.swing.JButton
 import javax.swing.JCheckBox
 import javax.swing.JLabel
 import javax.swing.JPanel
@@ -60,6 +65,7 @@ class ChangesPanel(
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
     }
     private var changes: List<FileChange> = emptyList()
+    private var commitBtn: JButton? = null
     private var debounceTimer: Timer? = null
     private var gitChangeDebounceTimer: Timer? = null
     /** Project-level bus for GIT_REPO_CHANGE events. */
@@ -186,6 +192,45 @@ class ChangesPanel(
             add(JBScrollPane(fileListPanel).apply {
                 horizontalScrollBarPolicy = JBScrollPane.HORIZONTAL_SCROLLBAR_NEVER
             }, BorderLayout.CENTER)
+
+            // AI Commit button at the bottom (matches VS Code "Commit Memory" button)
+            commitBtn = JButton("Commit Memory", JolliMemoryIcons.Sparkle).apply {
+                toolTipText = "Generate AI commit message and commit selected files"
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                isEnabled = checkboxes.any { it.isSelected }
+                foreground = Color.WHITE
+                isOpaque = false
+                isFocusPainted = false
+                isContentAreaFilled = false
+                isBorderPainted = false
+                border = JBUI.Borders.empty(6, 14)
+                ui = object : javax.swing.plaf.basic.BasicButtonUI() {
+                    override fun paint(g: java.awt.Graphics, c: javax.swing.JComponent) {
+                        val g2 = g.create() as java.awt.Graphics2D
+                        g2.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING, java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
+                        val btn = c as JButton
+                        g2.color = if (btn.isEnabled) Color(0x0078D4) else Color(0x0078D4).darker().darker()
+                        g2.fillRoundRect(0, 0, c.width, c.height, 8, 8)
+                        g2.dispose()
+                        btn.foreground = Color.WHITE
+                        super.paint(g, c)
+                    }
+                }
+                addActionListener {
+                    val action = ActionManager.getInstance().getAction("JolliMemory.CommitAI") ?: return@addActionListener
+                    val dataContext = DataContext { key ->
+                        when (key) {
+                            com.intellij.openapi.actionSystem.CommonDataKeys.PROJECT.name -> project
+                            else -> null
+                        }
+                    }
+                    val event = AnActionEvent.createFromAnAction(action, null, "JolliMemoryChangesPanel", dataContext)
+                    action.actionPerformed(event)
+                }
+            }
+            val btnPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 4))
+            btnPanel.add(commitBtn)
+            add(btnPanel, BorderLayout.SOUTH)
         }
 
         revalidate(); repaint()
@@ -202,6 +247,7 @@ class ChangesPanel(
     fun toggleSelectAll() {
         val anyUnchecked = checkboxes.any { !it.isSelected }
         checkboxes.forEach { it.isSelected = anyUnchecked }
+        commitBtn?.isEnabled = checkboxes.any { it.isSelected }
         repaint()
     }
 
@@ -219,6 +265,7 @@ class ChangesPanel(
         val cb = JCheckBox("", change.isSelected).apply {
             isOpaque = false
             border = JBUI.Borders.empty()
+            addActionListener { commitBtn?.isEnabled = checkboxes.any { cb -> cb.isSelected } }
         }
         checkboxes.add(cb)
 

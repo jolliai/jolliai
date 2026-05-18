@@ -44,6 +44,7 @@ object SummaryHtmlBuilder {
         transcriptHashSet: Set<String> = emptySet(),
         planTranslateSet: Set<String> = emptySet(),
         bridgeScript: String = "",
+        readOnly: Boolean = false,
     ): String {
         val (allTopics, sourceNodes, showRecordDates) = collectSortedTopics(summary)
         val stats = SummaryTree.aggregateStats(summary)
@@ -69,7 +70,14 @@ object SummaryHtmlBuilder {
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Commit Memory</title>
-<style>${SummaryCssBuilder.buildCss(isDark)}</style>
+<style>${SummaryCssBuilder.buildCss(isDark)}${if (readOnly) """
+/* Read-only mode: hide all write-action buttons but keep Copy Markdown */
+.topic-action-btn, .associate-plan-btn, .plan-actions,
+#pushJolliBtn, #generateE2eBtn, #editE2eBtn, #regenE2eBtn, #deleteE2eBtn,
+#generateRecapBtn, #editRecapBtn, #regenerateRecapBtn,
+#openTranscriptsBtn, #deleteTranscriptsBtn,
+.pr-section, .topic-card .topic-actions { display: none !important; }
+""" else ""}</style>
 </head>
 <body>
 <div class="page">

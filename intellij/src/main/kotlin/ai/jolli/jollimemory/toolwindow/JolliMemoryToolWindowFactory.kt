@@ -149,12 +149,11 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             }
         }
 
-        // Create the five panels
+        // Create the panels (Memories + Commits are merged into CommitsPanel)
         val statusPanel = StatusPanel(project, service)
         val plansPanel = PlansPanel(project, service)
         val changesPanel = ChangesPanel(project, service)
         val commitsPanel = CommitsPanel(project, service)
-        val memoriesPanel = MemoriesPanel(project, service)
 
         // Register panels for action lookup
         val registry = PanelRegistry().apply {
@@ -162,67 +161,106 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             this.plansPanel = plansPanel
             this.changesPanel = changesPanel
             this.commitsPanel = commitsPanel
-            this.memoriesPanel = memoriesPanel
         }
         service.panelRegistry = registry
 
-        // Status indicator icon for the MEMORIES header — shows health as green/yellow/red circle.
-        // Hover triggers a popup with the full status details (same content as the STATUS panel).
-        val statusIndicator = StatusIndicatorLabel(service)
-
         // Build collapsible sections (uppercase titles)
-        val statusCollapsible = CollapsiblePanel("STATUS", "JolliMemory.StatusActions", statusPanel)
+        // CommitsPanel is titled "MEMORIES" — it shows commits in workspace mode
+        // and foreign memories in read-only mode (matching VS Code's unified section).
+        // STATUS is no longer a collapsible — it takes the full content area as
+        // a dedicated card when the breadcrumb status button is toggled on,
+        // matching VS Code's full-pane status view.
         val plansCollapsible = CollapsiblePanel("PLANS & NOTES", "JolliMemory.PlansActions", plansPanel)
         val changesCollapsible = CollapsiblePanel("CHANGES", "JolliMemory.ChangesActions", changesPanel)
-        val commitsCollapsible = CollapsiblePanel("COMMITS", "JolliMemory.CommitsActions", commitsPanel)
         val memoriesCollapsible = CollapsiblePanel(
-            "MEMORIES", "JolliMemory.MemoriesActions", memoriesPanel,
-            headerExtra = statusIndicator,
+            "MEMORIES", "JolliMemory.CommitsActions", commitsPanel,
         )
-
-        // Auto-hide STATUS panel when enabled, show when disabled
-        fun syncStatusVisibility() {
-            val status = service.getStatus()
-            val enabled = status?.enabled == true
-            statusCollapsible.setPanelVisible(!enabled)
-        }
-        syncStatusVisibility()
-        service.addStatusListener { SwingUtilities.invokeLater { syncStatusVisibility() } }
 
         // Use an accordion layout so collapsed panels shrink to header-only height
         // and expanded panels share the remaining vertical space proportionally.
         // Resize dividers between panels allow users to drag and adjust panel heights.
         val accordionPanel = JPanel(AccordionLayout()).apply {
-            add(statusCollapsible)
-            add(ResizeDivider())
-            add(memoriesCollapsible)
-            add(ResizeDivider())
             add(plansCollapsible)
             add(ResizeDivider())
             add(changesCollapsible)
             add(ResizeDivider())
-            add(commitsCollapsible)
+            add(memoriesCollapsible)
         }
 
         // Add gear menu toggle actions to the tool window title bar,
         // allowing users to show/hide individual panels — like VS Code's "..." menu.
         val gearActions = DefaultActionGroup().apply {
-            add(TogglePanelAction(statusCollapsible))
             add(TogglePanelAction(memoriesCollapsible))
             add(TogglePanelAction(plansCollapsible))
             add(TogglePanelAction(changesCollapsible))
-            add(TogglePanelAction(commitsCollapsible))
         }
         toolWindow.setAdditionalGearActions(gearActions)
 
         // Title bar actions — always visible regardless of which panels are open.
         toolWindow.setTitleActions(listOf(
-            ai.jolli.jollimemory.actions.StatusSettingsAction(),
             CloudSyncAction(),
         ))
 
+        // ── Content area: CardLayout swaps accordion / KB explorer / status full-pane ──
+        val contentCardLayout = CardLayout()
+        val contentCards = JPanel(contentCardLayout)
+        contentCards.add(accordionPanel, CARD_ACCORDION)
+
+        val kbPanel = KBExplorerPanel(project, service)
+        contentCards.add(kbPanel, CARD_KB)
+
+        // StatusPanel lives directly as a card so the breadcrumb status button can
+        // swap it in to occupy the full content area (matches VS Code's behavior).
+        contentCards.add(statusPanel, CARD_STATUS)
+
+        // Breadcrumb header: repo/branch selectors + icon buttons (always visible)
+        val breadcrumb = BreadcrumbHeaderPanel(
+            service = service,
+            onSelectionChanged = { repo, branch, isForeign ->
+                if (isForeign && repo != null && branch != null) {
+                    plansCollapsible.isVisible = false
+                    changesCollapsible.isVisible = false
+                    commitsPanel.setForeignMode(repo, branch)
+                } else {
+                    plansCollapsible.isVisible = plansCollapsible.isPanelVisible()
+                    changesCollapsible.isVisible = changesCollapsible.isPanelVisible()
+                    commitsPanel.clearForeignMode()
+                }
+            },
+            onShowAccordion = {
+                contentCardLayout.show(contentCards, CARD_ACCORDION)
+            },
+            onShowKB = {
+                contentCardLayout.show(contentCards, CARD_KB)
+            },
+            onShowStatus = {
+                contentCardLayout.show(contentCards, CARD_STATUS)
+            },
+            onSettingsClicked = {
+                SettingsDialog(project, service).show()
+            },
+        )
+
+        // Auto-switch to the STATUS card when Jolli Memory is disabled (preserves
+        // the install/setup discoverability the accordion's auto-show provided),
+        // and auto-return to accordion once it becomes enabled.
+        fun syncStatusCard() {
+            val enabled = service.getStatus()?.enabled == true
+            breadcrumb.setStatusActive(!enabled)
+        }
+        syncStatusCard()
+        val statusSyncListener: () -> Unit = { SwingUtilities.invokeLater { syncStatusCard() } }
+        service.addStatusListener(statusSyncListener)
+        val statusListenerDisposable = com.intellij.openapi.Disposable {
+            service.removeStatusListener(statusSyncListener)
+        }
+
+        // Refresh breadcrumb data on background thread
+        ApplicationManager.getApplication().executeOnPooledThread { breadcrumb.refresh() }
+
         val mainPanel = JPanel(BorderLayout()).apply {
-            add(accordionPanel, BorderLayout.CENTER)
+            add(breadcrumb, BorderLayout.NORTH)
+            add(contentCards, BorderLayout.CENTER)
         }
 
         // ── Onboarding / Main card layout ──────────────────────
@@ -232,7 +270,6 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         fun isConfigured(): Boolean {
             val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
             if (config.paused == true) return true
-            // Check if any LLM credential is actually available (matches LlmClient fallback chain)
             if (!config.apiKey.isNullOrBlank()) return true
             if (!System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return true
             if (!config.jolliApiKey.isNullOrBlank()) return true
@@ -264,7 +301,6 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // Auth listener on the factory: handles sign-in → main, sign-out → onboarding
         val factoryAuthDisposable = JolliAuthService.addAuthListener {
             if (!JolliAuthService.isSignedIn()) {
-                // Sign-out: check if any LLM credential remains
                 val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
                 val hasCredentials = !config.apiKey.isNullOrBlank() ||
                     !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
@@ -281,67 +317,57 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 
         syncView()
 
-        // Also sync view on status changes (e.g. settings dialog clears API key → uninstall → status changes)
-        service.addStatusListener { SwingUtilities.invokeLater { syncView() } }
-
-        // Content 1: Memory Bank — KB folder browser
-        val kbPanel = KBExplorerPanel(project, service)
-        val memoriesContent = ContentFactory.getInstance().createContent(kbPanel, "\uD83D\uDCDA Memory Bank", false).apply {
-            isCloseable = false
-            setDisposer(Disposer.newDisposable("JolliMemoryMemoriesContent").also { parentDisposable ->
-                Disposer.register(parentDisposable, kbPanel)
-            })
+        val syncViewListener: () -> Unit = { SwingUtilities.invokeLater { syncView() } }
+        service.addStatusListener(syncViewListener)
+        val syncViewDisposable = com.intellij.openapi.Disposable {
+            service.removeStatusListener(syncViewListener)
         }
 
-        // Content 2: Branch — current branch name with emoji
-        val currentBranch = service.getGitOps()?.getCurrentBranch() ?: "Branch"
-        val branchContent = ContentFactory.getInstance().createContent(rootPanel, "\uD83C\uDF3F $currentBranch", false).apply {
+        // Single content — breadcrumb stays visible across accordion/KB views
+        val content = ContentFactory.getInstance().createContent(rootPanel, "", false).apply {
             isCloseable = false
-            setDisposer(Disposer.newDisposable("JolliMemoryBranchContent").also { parentDisposable ->
+            setDisposer(Disposer.newDisposable("JolliMemoryContent").also { parentDisposable ->
                 Disposer.register(parentDisposable, onboardingPanel)
                 Disposer.register(parentDisposable, factoryAuthDisposable)
+                Disposer.register(parentDisposable, statusListenerDisposable)
+                Disposer.register(parentDisposable, syncViewDisposable)
                 Disposer.register(parentDisposable, statusPanel)
                 Disposer.register(parentDisposable, plansPanel)
                 Disposer.register(parentDisposable, changesPanel)
                 Disposer.register(parentDisposable, commitsPanel)
-                Disposer.register(parentDisposable, memoriesPanel)
+                Disposer.register(parentDisposable, kbPanel)
             })
         }
 
-        // Auto-update branch tab title on branch switch — multiple detection paths
-        var lastBranch = currentBranch
-        val updateBranchTitle: () -> Unit = {
-            val newBranch = service.getGitOps()?.getCurrentBranch() ?: "Branch"
-            if (newBranch != lastBranch) {
-                lastBranch = newBranch
-                SwingUtilities.invokeLater { branchContent.displayName = "\uD83C\uDF3F $newBranch" }
-            }
+        // Update breadcrumb on branch switch — multiple detection paths
+        val updateBreadcrumbBranch: () -> Unit = {
+            val newBranch = service.getGitOps()?.getCurrentBranch()
+            if (newBranch != null) breadcrumb.updateCurrentBranch(newBranch)
         }
 
         // Path 1: IntelliJ git repository change event
         val branchUpdateConnection = project.messageBus.connect()
         branchUpdateConnection.subscribe(
             GitRepository.GIT_REPO_CHANGE,
-            GitRepositoryChangeListener { updateBranchTitle() },
+            GitRepositoryChangeListener { updateBreadcrumbBranch() },
         )
 
         // Path 2: VCS configuration change (catches terminal branch operations)
         branchUpdateConnection.subscribe(
             ProjectLevelVcsManager.VCS_CONFIGURATION_CHANGED,
-            VcsListener { updateBranchTitle() },
+            VcsListener { updateBreadcrumbBranch() },
         )
 
         // Path 3: Periodic poll every 2 seconds (catches all edge cases)
-        javax.swing.Timer(2000) { updateBranchTitle() }.apply {
+        javax.swing.Timer(2000) { updateBreadcrumbBranch() }.apply {
             isRepeats = true
             start()
         }
 
         // Path 4: Service status change
-        service.addStatusListener { updateBranchTitle() }
+        service.addStatusListener { updateBreadcrumbBranch() }
 
-        toolWindow.contentManager.addContent(branchContent)
-        toolWindow.contentManager.addContent(memoriesContent)
+        toolWindow.contentManager.addContent(content)
 
         // Load KB tree on background thread
         ApplicationManager.getApplication().executeOnPooledThread { kbPanel.load() }
@@ -354,6 +380,9 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
     companion object {
         private const val CARD_ONBOARDING = "onboarding"
         private const val CARD_MAIN = "main"
+        private const val CARD_ACCORDION = "accordion"
+        private const val CARD_KB = "kb"
+        private const val CARD_STATUS = "status"
     }
 }
 

@@ -284,6 +284,7 @@ class CommitAIAction : AnAction() {
         val status = service?.getStatus()
         val cwd = service?.mainRepoRoot ?: e.project?.basePath
         val workerBusy = cwd != null && SessionTracker.isWorkerBusy(cwd)
-        e.presentation.isEnabled = status != null && status.enabled && !workerBusy
+        val hasSelectedFiles = service?.panelRegistry?.changesPanel?.getSelectedFiles()?.isNotEmpty() ?: false
+        e.presentation.isEnabled = status != null && status.enabled && !workerBusy && hasSelectedFiles
     }
 }
