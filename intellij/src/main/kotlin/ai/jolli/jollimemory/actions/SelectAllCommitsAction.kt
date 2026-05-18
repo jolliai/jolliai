@@ -8,14 +8,18 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 
 /** Toggles selection of all commits in the Commits panel. */
 class SelectAllCommitsAction : AnAction() {
-    override fun actionPerformed(e: AnActionEvent) {
-        val project = e.project ?: return
-        val registry = project.getService(JolliMemoryService::class.java).panelRegistry
-        registry?.commitsPanel?.toggleSelectAll()
-    }
+	override fun actionPerformed(e: AnActionEvent) {
+		val project = e.project ?: return
+		val registry = project.getService(JolliMemoryService::class.java).panelRegistry
+		val panel = registry?.commitsPanel ?: return
+		if (panel.isForeignMode) return
+		panel.toggleSelectAll()
+	}
 
-    override fun update(e: AnActionEvent) {
-        val status = e.project?.getService(JolliMemoryService::class.java)?.getStatus()
-        e.presentation.isEnabled = status != null && status.enabled
-    }
+	override fun update(e: AnActionEvent) {
+		val service = e.project?.getService(JolliMemoryService::class.java)
+		val status = service?.getStatus()
+		val isForeign = service?.panelRegistry?.commitsPanel?.isForeignMode == true
+		e.presentation.isEnabled = status != null && status.enabled && !isForeign
+	}
 }

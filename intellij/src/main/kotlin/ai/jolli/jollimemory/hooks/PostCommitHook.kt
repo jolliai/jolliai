@@ -85,12 +85,15 @@ object PostCommitHook {
     /** Worker: runs the actual summarization pipeline. */
     fun runWorker(cwd: String, force: Boolean = false) {
         JmLogger.setLogDir(cwd)
-        log.info("=== PostCommitHook worker started ===")
+        log.info("=== PostCommitHook worker started (cwd=%s, force=%s) ===", cwd, force)
 
         val git = GitOps(cwd)
+        log.info("Creating storage via StorageFactory.create")
         val storage = StorageFactory.create(git, cwd)
+        log.info("Storage created: %s", storage::class.simpleName)
         val store = SummaryStore(cwd, git, storage)
         val config = SessionTracker.loadConfig(cwd)
+        log.info("Config loaded: apiKey=%s, jolliApiKey=%s, model=%s", if (config.apiKey != null) "set" else "null", if (config.jolliApiKey != null) "set" else "null", config.model ?: "default")
 
         // Load log level from config
         val logLevel = config.logLevel?.let { try { LogLevel.valueOf(it) } catch (_: Exception) { null } }
@@ -147,6 +150,7 @@ object PostCommitHook {
             }
 
             // 4. Load sessions and read transcripts
+            log.info("Step 4: Loading sessions")
             val allSessions = SessionTracker.loadAllSessions(cwd).toMutableList()
 
             // On-demand discovery: OpenCode (SQLite-backed, no hook)
@@ -155,6 +159,7 @@ object PostCommitHook {
             }
 
             val sessions = allSessions
+            log.info("Total sessions found: %d", sessions.size)
             if (sessions.isEmpty()) {
                 log.info("No active sessions — skipping summarization")
                 return
@@ -193,9 +198,11 @@ object PostCommitHook {
             }
 
             // 5. Get diff
+            log.info("Step 5: Getting diff (transcripts=%d entries, %d turns)", totalEntries, totalTurns)
             val diff = git.getDiffContent() ?: ""
             val diffStatStr = git.getDiffStats() ?: ""
             val diffStats = parseDiffStats(diffStatStr)
+            log.info("Diff: %d files changed, +%d -%d, diff length=%d chars", diffStats.filesChanged, diffStats.insertions, diffStats.deletions, diff.length)
 
             // 6. Guard: skip if no transcript and no file changes
             if (sessionTranscripts.isEmpty() && diffStats.filesChanged == 0) {
@@ -213,6 +220,7 @@ object PostCommitHook {
                 return
             }
 
+            log.info("Step 8: Calling LLM for summary generation (conversation=%d chars)", conversation.length)
             val summaryResult = Summarizer.generateSummary(Summarizer.SummarizeParams(
                 conversation = conversation,
                 diff = diff,
@@ -225,8 +233,7 @@ object PostCommitHook {
                 jolliApiKey = config.jolliApiKey,
                 aiProvider = config.aiProvider,
             ))
-
-            log.debug("Summary result recap: %s", if (summaryResult.recap != null) "${summaryResult.recap!!.length} chars" else "null")
+            log.info("Step 8: LLM call completed, topics=%d, recap=%s", summaryResult.topics?.size ?: 0, if (summaryResult.recap != null) "${summaryResult.recap!!.length} chars" else "null")
 
             // 8b. Detect uncommitted plans, archive, and evaluate progress
             val planRefs = mutableListOf<PlanReference>()
@@ -307,8 +314,9 @@ object PostCommitHook {
             }
             val storedTranscript = StoredTranscript(storedSessions)
 
+            log.info("Step 9: Calling store.storeSummary for %s (branch=%s)", commitInfo.hash.take(8), branch)
             store.storeSummary(summary, force = force, transcript = storedTranscript, planProgress = planProgressArtifacts.takeIf { it.isNotEmpty() })
-            log.info("=== PostCommitHook worker finished ===")
+            log.info("=== PostCommitHook worker finished successfully for %s ===", commitInfo.hash.take(8))
 
         } finally {
             SessionTracker.releaseLock(cwd)

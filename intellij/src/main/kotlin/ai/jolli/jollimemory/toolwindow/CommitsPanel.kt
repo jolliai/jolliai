@@ -2,12 +2,20 @@ package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.bridge.CommitSummaryBrief
+import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.KBDataCache
+import com.google.gson.Gson
 import ai.jolli.jollimemory.services.CommitFileInfo
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
+import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.AnAction
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
@@ -18,6 +26,8 @@ import com.intellij.util.ui.JBUI
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryChangeListener
 import java.awt.BorderLayout
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.awt.Color
@@ -40,6 +50,8 @@ import javax.swing.JOptionPane
 import javax.swing.JPanel
 import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
+import javax.swing.JSeparator
+import javax.swing.JWindow
 import javax.swing.Timer
 import javax.swing.UIManager
 
@@ -86,9 +98,29 @@ class CommitsPanel(
     private val commitRowStates = mutableMapOf<String, CommitRowState>()
     /** True when the branch is fully merged into main (read-only history view). */
     private var isMerged = false
+
+    // ─── Foreign mode state ──────────────────────────────────────────────────
+    /** When non-null, the panel shows read-only memories from a foreign repo/branch. */
+    private var foreignRepo: String? = null
+    private var foreignBranch: String? = null
+    private var foreignEntries: List<KBDataCache.KBEntry> = emptyList()
+
     private val statusListener: () -> Unit = { SwingUtilities.invokeLater { refresh() } }
     private val messageBusConnection: MessageBusConnection = project.messageBus.connect()
     private var gitChangeDebounceTimer: Timer? = null
+
+    // ─── Sticky hover popup (matching VS Code hover-card UX) ────────────────
+    private var hoverPopup: JWindow? = null
+    private var hoverRow: JPanel? = null
+    private var hoverShowTimer: Timer? = null
+    private val hoverDismissTimer = Timer(HOVER_HIDE_GRACE_MS) { dismissHoverPopup() }.apply { isRepeats = false }
+    private companion object {
+        val LOG: com.intellij.openapi.diagnostic.Logger = com.intellij.openapi.diagnostic.Logger.getInstance(CommitsPanel::class.java)
+        const val ARROW_RIGHT = "\u25B6" // ▶
+        const val ARROW_DOWN = "\u25BC"  // ▼
+        const val HOVER_SHOW_DELAY_MS = 1000
+        const val HOVER_HIDE_GRACE_MS = 200
+    }
 
     /**
      * Monotonically increasing version counter to prevent stale renders.
@@ -132,6 +164,11 @@ class CommitsPanel(
     }
 
     fun refresh() {
+        if (isForeignMode) {
+            // Re-filter from cache in case KBDataCache was reloaded
+            setForeignMode(foreignRepo!!, foreignBranch!!)
+            return
+        }
         refreshVersion++
         ApplicationManager.getApplication().executeOnPooledThread { refreshFromGit() }
     }
@@ -359,7 +396,14 @@ class CommitsPanel(
             add(leftPanel, BorderLayout.WEST)
             add(messageLabel, BorderLayout.CENTER)
             add(rightPanel, BorderLayout.EAST)
-            toolTipText = buildTooltipHtml(commit)
+        }
+        // Sticky hover popup — matches VS Code: 1s show delay, 200ms hide grace.
+        val hoverListener = object : MouseAdapter() {
+            override fun mouseEntered(e: MouseEvent) { scheduleShowHoverPopup(row, commit) }
+            override fun mouseExited(e: MouseEvent) { scheduleHoverDismiss() }
+        }
+        for (child in listOf(arrowLabel, messageLabel, leftPanel, rightPanel, row)) {
+            child.addMouseListener(hoverListener)
         }
 
         // File container — initially hidden, shown on expand
@@ -381,6 +425,7 @@ class CommitsPanel(
         // Click anywhere on the commit row (except checkbox/eye) toggles expand/collapse
         val expandClickListener = object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
+                if (!SwingUtilities.isLeftMouseButton(e)) return
                 if (e.clickCount == 2 && commit.hasSummary) {
                     viewSummary(commit.hash)
                 } else if (e.clickCount == 1) {
@@ -391,6 +436,34 @@ class CommitsPanel(
         for (child in listOf(arrowLabel, messageLabel, leftPanel, row)) {
             child.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
             child.addMouseListener(expandClickListener)
+        }
+
+        // Right-click context menu — only for commits with a summary,
+        // matching VS Code's MemoryItem menu (Copy Recall Prompt + View Memory).
+        // Built via IntelliJ's ActionPopupMenu so it picks up IDE theming
+        // (hover highlight, keyboard nav, Darcula colors).
+        if (commit.hasSummary) {
+            val popupListener = object : MouseAdapter() {
+                override fun mousePressed(e: MouseEvent) = maybeShow(e)
+                override fun mouseReleased(e: MouseEvent) = maybeShow(e)
+                private fun maybeShow(e: MouseEvent) {
+                    if (!e.isPopupTrigger) return
+                    val group = DefaultActionGroup().apply {
+                        add(object : AnAction("Copy Recall Prompt") {
+                            override fun actionPerformed(ev: AnActionEvent) = copyRecallPrompt(commit.hash)
+                        })
+                        add(object : AnAction("View Commit Memory") {
+                            override fun actionPerformed(ev: AnActionEvent) = viewSummary(commit.hash)
+                        })
+                    }
+                    val menu = ActionManager.getInstance()
+                        .createActionPopupMenu("JolliMemory.CommitRowMenu", group)
+                    menu.component.show(e.component, e.x, e.y)
+                }
+            }
+            for (child in listOf(arrowLabel, messageLabel, leftPanel, eyeLabel, rightPanel, row)) {
+                child.addMouseListener(popupListener)
+            }
         }
 
         row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
@@ -606,7 +679,226 @@ class CommitsPanel(
         }
     }
 
+    // ─── Foreign mode ──────────────────────────────────────────────────────
+
+    /** Whether the panel is currently in foreign (read-only) mode. */
+    val isForeignMode: Boolean get() = foreignRepo != null
+
+    /**
+     * Switches to foreign read-only mode, showing memories from a different repo/branch.
+     * Data comes from [KBDataCache] rather than git.
+     */
+    fun setForeignMode(repo: String, branch: String) {
+        refreshVersion++
+        foreignRepo = repo
+        foreignBranch = branch
+        foreignEntries = KBDataCache.all()
+            .filter { it.repo == repo && it.branch == branch && it.type == "commit" }
+            .sortedByDescending { it.date ?: "" }
+        SwingUtilities.invokeLater { updateForeignList() }
+    }
+
+    /** Exits foreign mode and restores normal commit view. */
+    fun clearForeignMode() {
+        if (foreignRepo == null) return
+        foreignRepo = null
+        foreignBranch = null
+        foreignEntries = emptyList()
+        refresh()
+    }
+
+    private fun updateForeignList() {
+        removeAll()
+        listPanel.removeAll()
+        commitRowStates.clear()
+
+        if (foreignEntries.isEmpty()) {
+            emptyLabel.text = "<html><center>No memories found for " +
+                "${escHtml(foreignRepo ?: "")} / ${escHtml(foreignBranch ?: "")}.</center></html>"
+            add(emptyLabel, BorderLayout.CENTER)
+        } else {
+            // Banner
+            val banner = JBLabel(
+                "Viewing memories from ${foreignRepo} / ${foreignBranch} (read-only)",
+            ).apply {
+                foreground = Color.GRAY
+                border = JBUI.Borders.empty(2, 4, 6, 4)
+            }
+            banner.alignmentX = Component.LEFT_ALIGNMENT
+            listPanel.add(banner)
+
+            for (entry in foreignEntries) {
+                listPanel.add(createForeignMemoryRow(entry))
+            }
+            listPanel.add(Box.createVerticalGlue())
+
+            add(JBScrollPane(listPanel).apply {
+                horizontalScrollBarPolicy = JBScrollPane.HORIZONTAL_SCROLLBAR_NEVER
+            }, BorderLayout.CENTER)
+        }
+        revalidate(); repaint()
+    }
+
+    /**
+     * Creates a read-only row for a foreign memory entry:
+     *   [eye-icon] <title>         <relative date> [copy-icon]
+     */
+    private fun createForeignMemoryRow(entry: KBDataCache.KBEntry): JPanel {
+        val iconLabel = JLabel(JolliMemoryIcons.Eye)
+
+        val messageLabel = JLabel(entry.title ?: "(untitled)").apply {
+            minimumSize = Dimension(0, preferredSize.height)
+        }
+
+        val dateLabel = JLabel(formatShortRelativeDate(entry.date ?: "")).apply {
+            foreground = Color.GRAY
+        }
+
+        val copyLabel = JLabel(AllIcons.Actions.Copy).apply {
+            toolTipText = "Copy recall prompt"
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) {
+                    copyRecallPromptForBranch(entry.branch ?: "")
+                }
+            })
+        }
+
+        val leftPanel = JPanel(GridBagLayout()).apply {
+            isOpaque = false
+            val gbc = GridBagConstraints().apply {
+                gridy = 0; anchor = GridBagConstraints.WEST
+                fill = GridBagConstraints.NONE; weighty = 1.0
+            }
+            gbc.gridx = 0; gbc.weightx = 0.0; gbc.insets = JBUI.insetsRight(6)
+            add(iconLabel, gbc)
+            gbc.gridx = 1; gbc.weightx = 1.0; gbc.fill = GridBagConstraints.HORIZONTAL
+            gbc.insets = JBUI.emptyInsets()
+            add(messageLabel, gbc)
+        }
+
+        val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+            isOpaque = false
+            add(dateLabel)
+            add(Box.createHorizontalStrut(JBUI.scale(8)))
+            add(copyLabel)
+        }
+
+        val row = JPanel(BorderLayout()).apply {
+            isOpaque = true
+            border = JBUI.Borders.empty(4, 8)
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(leftPanel, BorderLayout.CENTER)
+            add(rightPanel, BorderLayout.EAST)
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        }
+
+        // Click opens summary (reads from KB folder)
+        val clickListener = object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (e.clickCount == 1) viewForeignSummary(entry)
+            }
+        }
+        for (child in listOf(iconLabel, messageLabel, dateLabel, leftPanel, row)) {
+            child.addMouseListener(clickListener)
+        }
+
+        row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
+        return row
+    }
+
+    /** Opens a foreign memory's summary by reading from the KB folder JSON. */
+    private fun viewForeignSummary(entry: KBDataCache.KBEntry) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            // Try to extract commit hash from the file path (format: <slug>-<hash8>.md or summaries/<hash>.json)
+            val jsonPath = entry.kbRoot.resolve(".jolli").resolve("summaries")
+            val fileName = entry.fullPath.fileName.toString()
+            // Hash is the last 8 chars before .md extension
+            val hash8 = fileName.removeSuffix(".md").takeLast(8)
+            // Look for a matching JSON file in summaries/
+            val matchingJson = try {
+                java.nio.file.Files.list(jsonPath).use { stream ->
+                    stream.filter { it.fileName.toString().startsWith(hash8) || it.fileName.toString().contains(hash8) }
+                        .findFirst().orElse(null)
+                }
+            } catch (_: Exception) { null }
+
+            if (matchingJson != null) {
+                try {
+                    val json = java.nio.file.Files.readString(matchingJson, java.nio.charset.StandardCharsets.UTF_8)
+                    val summary = Gson().fromJson(json, CommitSummary::class.java)
+                    SwingUtilities.invokeLater {
+                        if (summary != null) {
+                            val vFile = SummaryVirtualFile(summary, readOnly = true)
+                            com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).openFile(vFile, true)
+                        }
+                    }
+                } catch (e: Exception) {
+                    LOG.warn("Failed to read foreign summary from $matchingJson", e)
+                }
+            }
+        }
+    }
+
+    // ─── Copy recall prompt ──────────────────────────────────────────────────
+
+    /**
+     * Copies the recall prompt to clipboard for a commit hash.
+     * Fetches the full summary to get the branch name.
+     */
+    fun copyRecallPrompt(commitHash: String) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val summary = service.getSummary(commitHash)
+            SwingUtilities.invokeLater {
+                if (summary == null) {
+                    JOptionPane.showMessageDialog(
+                        this, "No summary found for this commit.",
+                        "Copy Recall Prompt", JOptionPane.WARNING_MESSAGE,
+                    )
+                    return@invokeLater
+                }
+                copyRecallPromptForBranch(summary.branch)
+            }
+        }
+    }
+
+    /** Copies the recall prompt for a given branch name. */
+    private fun copyRecallPromptForBranch(branch: String) {
+        val prompt = "Invoke the \"jolli-recall\" skill with args \"$branch\"."
+        val clipboard = Toolkit.getDefaultToolkit().systemClipboard
+        clipboard.setContents(StringSelection(prompt), null)
+        com.intellij.openapi.ui.Messages.showInfoMessage(
+            project,
+            "Recall prompt copied \u2014 paste it into Claude Code.",
+            "Copy Recall Prompt",
+        )
+    }
+
+    private fun formatShortRelativeDate(isoDate: String): String {
+        return try {
+            val then = Instant.parse(isoDate)
+            val now = Instant.now()
+            val duration = Duration.between(then, now)
+            val minutes = duration.toMinutes()
+            val hours = duration.toHours()
+            val days = duration.toDays()
+            when {
+                minutes < 1 -> "now"
+                minutes < 60 -> "${minutes}m ago"
+                hours < 24 -> "${hours}h ago"
+                days < 30 -> "${days}d ago"
+                days < 365 -> "${days / 30}mo ago"
+                else -> "${days / 365}y ago"
+            }
+        } catch (_: Exception) {
+            isoDate.take(10)
+        }
+    }
+
+    private fun escHtml(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     override fun dispose() {
+        dismissHoverPopup()
         service.removeStatusListener(statusListener)
         gitChangeDebounceTimer?.stop()
         messageBusConnection.disconnect()
@@ -624,40 +916,142 @@ class CommitsPanel(
         var filesLoaded: Boolean,
     )
 
-    /** Builds HTML tooltip matching VS Code's MarkdownString tooltip layout. */
-    private fun buildTooltipHtml(c: CommitSummaryBrief): String {
-        val relDate = formatRelativeDate(c.date)
-        val sb = StringBuilder("<html>")
+    // ─── Sticky hover popup (VS Code hover-card pattern, native Swing) ────
 
-        // Row 1: author + relative date
-        sb.append("<b>${esc(c.author)}</b> &nbsp; \uD83D\uDD52 $relDate<br/>")
-
-        // Commit type badge
-        if (c.commitType != null) {
-            sb.append("\uD83C\uDFF7\uFE0F ${esc(c.commitType)}<br/>")
+    private fun scheduleShowHoverPopup(row: JPanel, commit: CommitSummaryBrief) {
+        hoverDismissTimer.stop()
+        if (hoverRow == row && hoverPopup?.isVisible == true) return
+        hoverShowTimer?.stop()
+        hoverShowTimer = Timer(HOVER_SHOW_DELAY_MS) { showHoverPopup(row, commit) }.apply {
+            isRepeats = false
+            start()
         }
-
-        // Row 2: message
-        val tooltipMessage = c.message.ifBlank { c.shortHash }
-        sb.append("<br/>${esc(tooltipMessage)}<br/>")
-
-        // Stats
-        sb.append("<hr/>")
-        val stats = mutableListOf("${c.filesChanged} file${if (c.filesChanged != 1) "s" else ""} changed")
-        if (c.insertions > 0) stats.add("${c.insertions} insertion${if (c.insertions != 1) "s" else ""}(+)")
-        if (c.deletions > 0) stats.add("${c.deletions} deletion${if (c.deletions != 1) "s" else ""}(-)")
-        sb.append("${stats.joinToString(", ")}<br/>")
-
-        // Hash
-        sb.append("<hr/>")
-        sb.append("<code>${c.shortHash}</code>")
-        if (c.hasSummary) sb.append(" &nbsp;|&nbsp; \uD83D\uDC41 View Commit Memory")
-
-        sb.append("</html>")
-        return sb.toString()
     }
 
-    private fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    private fun showHoverPopup(row: JPanel, c: CommitSummaryBrief) {
+        hoverShowTimer?.stop()
+        dismissHoverPopup()
+
+        val window = SwingUtilities.getWindowAncestor(row) ?: return
+        val popup = JWindow(window)
+
+        val bg = UIManager.getColor("ToolTip.background") ?: background
+        val fg = UIManager.getColor("ToolTip.foreground") ?: foreground
+        val dimFg = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
+        val borderColor = UIManager.getColor("ToolTip.borderColor") ?: Color.GRAY
+
+        val relDate = formatRelativeDate(c.date)
+        val msg = c.message.ifBlank { c.shortHash }
+
+        val content = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            background = bg
+            border = JBUI.Borders.empty(8, 10)
+
+            // Title (bold)
+            add(JBLabel(msg).apply {
+                foreground = fg
+                font = font.deriveFont(java.awt.Font.BOLD)
+                alignmentX = Component.LEFT_ALIGNMENT
+            })
+            add(Box.createVerticalStrut(JBUI.scale(4)))
+
+            // Clock + relative date
+            add(JBLabel(relDate, AllIcons.Vcs.History, SwingConstants.LEFT).apply {
+                foreground = fg
+                iconTextGap = JBUI.scale(6)
+                alignmentX = Component.LEFT_ALIGNMENT
+            })
+
+            // Commit type badge
+            if (c.commitType != null) {
+                add(Box.createVerticalStrut(JBUI.scale(2)))
+                add(JBLabel(c.commitType, AllIcons.Nodes.Tag, SwingConstants.LEFT).apply {
+                    foreground = fg
+                    iconTextGap = JBUI.scale(6)
+                    alignmentX = Component.LEFT_ALIGNMENT
+                })
+            }
+
+            // Separator + stats
+            add(Box.createVerticalStrut(JBUI.scale(4)))
+            add(JSeparator().apply { alignmentX = Component.LEFT_ALIGNMENT; maximumSize = Dimension(Int.MAX_VALUE, 1) })
+            add(Box.createVerticalStrut(JBUI.scale(4)))
+
+            val stats = mutableListOf("${c.filesChanged} file${if (c.filesChanged != 1) "s" else ""} changed")
+            if (c.insertions > 0) stats.add("${c.insertions} insertion${if (c.insertions != 1) "s" else ""}(+)")
+            if (c.deletions > 0) stats.add("${c.deletions} deletion${if (c.deletions != 1) "s" else ""}(-)")
+            add(JBLabel(stats.joinToString(", ")).apply {
+                foreground = dimFg
+                font = font.deriveFont(font.size2D - 1f)
+                alignmentX = Component.LEFT_ALIGNMENT
+            })
+
+            // Separator + hash / View Memory
+            add(Box.createVerticalStrut(JBUI.scale(4)))
+            add(JSeparator().apply { alignmentX = Component.LEFT_ALIGNMENT; maximumSize = Dimension(Int.MAX_VALUE, 1) })
+            add(Box.createVerticalStrut(JBUI.scale(4)))
+
+            add(JBLabel(c.shortHash, AllIcons.Vcs.CommitNode, SwingConstants.LEFT).apply {
+                foreground = fg
+                iconTextGap = JBUI.scale(6)
+                font = java.awt.Font(java.awt.Font.MONOSPACED, java.awt.Font.PLAIN, font.size)
+                alignmentX = Component.LEFT_ALIGNMENT
+            })
+
+            if (c.hasSummary) {
+                add(Box.createVerticalStrut(JBUI.scale(4)))
+                val linkColor = JBUI.CurrentTheme.Link.Foreground.ENABLED
+                add(JBLabel("View Memory").apply {
+                    foreground = linkColor
+                    cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                    alignmentX = Component.LEFT_ALIGNMENT
+                    addMouseListener(object : MouseAdapter() {
+                        override fun mouseClicked(e: MouseEvent) {
+                            dismissHoverPopup()
+                            viewSummary(c.hash)
+                        }
+                        override fun mouseEntered(e: MouseEvent) { hoverDismissTimer.stop() }
+                        override fun mouseExited(e: MouseEvent) { scheduleHoverDismiss() }
+                    })
+                })
+            }
+        }
+
+        popup.contentPane = JPanel(BorderLayout()).apply {
+            background = bg
+            border = javax.swing.BorderFactory.createLineBorder(borderColor)
+            add(content, BorderLayout.CENTER)
+        }
+        popup.pack()
+
+        val rowLoc = row.locationOnScreen
+        popup.setLocation(rowLoc.x, rowLoc.y + row.height + 2)
+
+        val popupHoverListener = object : MouseAdapter() {
+            override fun mouseEntered(e: MouseEvent) { hoverDismissTimer.stop() }
+            override fun mouseExited(e: MouseEvent) { scheduleHoverDismiss() }
+        }
+        popup.addMouseListener(popupHoverListener)
+        content.addMouseListener(popupHoverListener)
+
+        hoverPopup = popup
+        hoverRow = row
+        popup.isVisible = true
+    }
+
+    private fun scheduleHoverDismiss() {
+        hoverShowTimer?.stop()
+        hoverDismissTimer.restart()
+    }
+
+    private fun dismissHoverPopup() {
+        hoverShowTimer?.stop()
+        hoverDismissTimer.stop()
+        hoverPopup?.dispose()
+        hoverPopup = null
+        hoverRow = null
+    }
 
     private fun statusColor(code: String): Color {
         return when (code) {
@@ -690,8 +1084,4 @@ class CommitsPanel(
         }
     }
 
-    companion object {
-        private const val ARROW_RIGHT = "\u25B6" // ▶
-        private const val ARROW_DOWN = "\u25BC"  // ▼
-    }
 }

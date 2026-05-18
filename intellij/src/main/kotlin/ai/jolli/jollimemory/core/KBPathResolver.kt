@@ -73,10 +73,41 @@ object KBPathResolver {
     }
 
     /**
-     * Extracts the repository name from a project path.
-     * Uses the directory name of the git root.
+     * Extracts the canonical repository name from a project path.
+     * Three-layer fallback matching the CLI's extractRepoName():
+     *   1. remote.origin.url basename (worktrees + main repo resolve identically)
+     *   2. git rev-parse --git-common-dir parent basename (local-only worktrees)
+     *   3. directory basename (last resort)
      */
     fun extractRepoName(projectPath: String): String {
+        // Layer 1: remote URL basename — canonical for repos with a remote
+        try {
+            val remoteUrl = getRemoteUrl(projectPath)
+            if (remoteUrl != null) {
+                val name = remoteUrl.trimEnd('/').removeSuffix(".git")
+                    .substringAfterLast('/').substringAfterLast(':')
+                if (name.isNotBlank()) return name
+            }
+        } catch (_: Exception) { /* fall through */ }
+
+        // Layer 2: git-common-dir — follows worktree pointer back to main repo
+        try {
+            val pb = ProcessBuilder("git", "rev-parse", "--git-common-dir")
+                .directory(java.io.File(projectPath))
+                .redirectErrorStream(false)
+            val process = pb.start()
+            val output = process.inputStream.bufferedReader().use { it.readText().trim() }
+            process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            if (process.exitValue() == 0 && output.isNotBlank()) {
+                val commonDir = Path.of(output)
+                // --git-common-dir returns the .git dir; parent is the repo root
+                val repoRoot = if (commonDir.isAbsolute) commonDir.parent else Path.of(projectPath).resolve(commonDir).normalize().parent
+                val name = repoRoot?.fileName?.toString()
+                if (!name.isNullOrBlank()) return name
+            }
+        } catch (_: Exception) { /* fall through */ }
+
+        // Layer 3: directory basename (last resort)
         return Path.of(projectPath).fileName?.toString() ?: "unknown"
     }
 

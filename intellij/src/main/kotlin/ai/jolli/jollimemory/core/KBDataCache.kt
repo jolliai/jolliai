@@ -28,7 +28,18 @@ object KBDataCache {
         for (repo in repos) {
             val mm = MetadataManager(repo.kbRoot.resolve(".jolli"))
             val manifest = mm.readManifest()
+
+            // Read index.json to identify child entries (parentCommitHash != null)
+            // that should be hidden after squash/consolidation, matching VS Code behavior.
+            val index = mm.readIndex()
+            val childHashes = index?.entries
+                ?.filter { it.parentCommitHash != null }
+                ?.map { it.commitHash }
+                ?.toSet()
+                ?: emptySet()
+
             for (entry in manifest.files) {
+                if (entry.type == "commit" && entry.fileId in childHashes) continue
                 entries.add(KBEntry(
                     repo = repo.repoName,
                     branch = entry.source.branch,
