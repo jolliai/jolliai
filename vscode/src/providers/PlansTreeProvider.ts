@@ -339,7 +339,7 @@ function buildLinearIssueTooltip(issue: LinearIssueInfo): string {
 	// attachTextTip helper — native HTML title= is unreliable inside the
 	// webview iframe). textContent doesn't interpret markdown, so a
 	// MarkdownString here would render its escaped source verbatim:
-	// `**JOLLI\-1528**` instead of bold `JOLLI-1528`, `\#\# Problem` instead
+	// `**PROJ\-1234**` instead of bold `PROJ-1234`, `\#\# Heading` instead
 	// of a heading, `[$(link-external) ...](url)` instead of a link, etc.
 	// Plain text round-trips identically through both surfaces.
 	const lines: Array<string> = [];

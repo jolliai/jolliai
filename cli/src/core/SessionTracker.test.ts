@@ -1330,9 +1330,9 @@ describe("SessionTracker", () => {
 
 	describe("detectUncommittedLinearIssueIds / getLinearIssueEntriesForBranch", () => {
 		const ref = (overrides: Partial<LinearIssueRef> = {}): LinearIssueRef => ({
-			ticketId: "JOLLI-1528",
+			ticketId: "PROJ-1528",
 			title: "t",
-			url: "https://linear.app/x/JOLLI-1528",
+			url: "https://linear.app/x/PROJ-1528",
 			toolName: "mcp__linear__get_issue",
 			referencedAt: "2026-05-14T06:00:00Z",
 			...overrides,
@@ -1346,22 +1346,22 @@ describe("SessionTracker", () => {
 		}
 
 		it("returns uncommitted entries on the current branch", async () => {
-			await upsertLinearIssueEntry(ref(), "/s/JOLLI-1528.md", "hash-1", "main", tempDir);
-			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual(["JOLLI-1528"]);
+			await upsertLinearIssueEntry(ref(), "/s/PROJ-1528.md", "hash-1", "main", tempDir);
+			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual(["PROJ-1528"]);
 			expect((await getLinearIssueEntriesForBranch(tempDir, "main")).map((e) => e.ticketId)).toEqual([
-				"JOLLI-1528",
+				"PROJ-1528",
 			]);
 		});
 
 		it("filters out entries on other branches", async () => {
-			await upsertLinearIssueEntry(ref(), "/s/JOLLI-1528.md", "hash-1", "feature-a", tempDir);
+			await upsertLinearIssueEntry(ref(), "/s/PROJ-1528.md", "hash-1", "feature-a", tempDir);
 			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual([]);
 		});
 
 		it("filters out ignored entries", async () => {
 			await seed({
-				"JOLLI-1": {
-					ticketId: "JOLLI-1",
+				"PROJ-1": {
+					ticketId: "PROJ-1",
 					title: "t",
 					url: "u",
 					sourcePath: "p",
@@ -1378,8 +1378,8 @@ describe("SessionTracker", () => {
 
 		it("filters out guard entries (have contentHashAtCommit)", async () => {
 			await seed({
-				"JOLLI-1": {
-					ticketId: "JOLLI-1",
+				"PROJ-1": {
+					ticketId: "PROJ-1",
 					title: "t",
 					url: "u",
 					sourcePath: "p",
@@ -1396,8 +1396,8 @@ describe("SessionTracker", () => {
 
 		it("filters out archived snapshot entries (commitHash set)", async () => {
 			await seed({
-				"JOLLI-1-abc1234": {
-					ticketId: "JOLLI-1",
+				"PROJ-1-abc1234": {
+					ticketId: "PROJ-1",
 					title: "t",
 					url: "u",
 					sourcePath: "p",
@@ -1420,37 +1420,48 @@ describe("SessionTracker", () => {
 
 	describe("upsertLinearIssueEntry", () => {
 		const ref = (overrides: Partial<LinearIssueRef> = {}): LinearIssueRef => ({
-			ticketId: "JOLLI-1528",
+			ticketId: "PROJ-1528",
 			title: "Treat referenced Linear issues",
-			url: "https://linear.app/x/JOLLI-1528",
+			url: "https://linear.app/x/PROJ-1528",
 			toolName: "mcp__linear__get_issue",
 			referencedAt: "2026-05-14T06:00:00Z",
 			...overrides,
 		});
 
 		it("creates a fresh entry when none exists", async () => {
-			await upsertLinearIssueEntry(ref(), "/abs/JOLLI-1528.md", "hash-1", "main", tempDir);
+			await upsertLinearIssueEntry(ref(), "/abs/PROJ-1528.md", "hash-1", "main", tempDir);
 			const reg = await loadPlansRegistry(tempDir);
-			const e = reg.linearIssues?.["JOLLI-1528"];
+			const e = reg.linearIssues?.["PROJ-1528"];
 			expect(e).toBeDefined();
 			expect(e?.commitHash).toBeNull();
 			expect(e?.contentHashAtCommit).toBeUndefined();
 			expect(e?.branch).toBe("main");
-			expect(e?.sourcePath).toBe("/abs/JOLLI-1528.md");
+			expect(e?.sourcePath).toBe("/abs/PROJ-1528.md");
 			expect(e?.sourceToolName).toBe("mcp__linear__get_issue");
 		});
 
 		it("preserves addedAt, branch, ignored on update of existing uncommitted entry", async () => {
-			await upsertLinearIssueEntry(ref(), "/abs/JOLLI-1528.md", "hash-1", "main", tempDir);
+			await upsertLinearIssueEntry(ref(), "/abs/PROJ-1528.md", "hash-1", "main", tempDir);
 			const first = await loadPlansRegistry(tempDir);
-			const addedAt = first.linearIssues?.["JOLLI-1528"]?.addedAt;
+			// Optional chaining + explicit defined check: the upsert above
+			// guarantees this exists, but the registry type's
+			// optional-chaining returns LinearIssueEntry | undefined which
+			// spreads as all-optional and the resulting object literal then
+			// fails to satisfy LinearIssueEntry's required fields. The
+			// `if (!existing) throw` guard narrows the type and replaces a
+			// `!` non-null assertion (biome forbids those).
+			const existing = first.linearIssues?.["PROJ-1528"];
+			if (!existing) {
+				throw new Error("test setup invariant: upserted entry missing");
+			}
+			const addedAt = existing.addedAt;
 			// Pretend the user ignored it manually
 			await savePlansRegistry(
 				{
 					...first,
 					linearIssues: {
 						...first.linearIssues,
-						"JOLLI-1528": { ...first.linearIssues?.["JOLLI-1528"], ignored: true },
+						"PROJ-1528": { ...existing, ignored: true },
 					},
 				},
 				tempDir,
@@ -1458,38 +1469,38 @@ describe("SessionTracker", () => {
 			// Second upsert (StopHook re-discovers) should NOT clear ignored, but should be a no-op
 			await upsertLinearIssueEntry(
 				ref({ title: "new title", referencedAt: "2026-05-14T07:00:00Z" }),
-				"/abs/JOLLI-1528.md",
+				"/abs/PROJ-1528.md",
 				"hash-1",
 				"main",
 				tempDir,
 			);
 			const after = await loadPlansRegistry(tempDir);
-			const e = after.linearIssues?.["JOLLI-1528"];
+			const e = after.linearIssues?.["PROJ-1528"];
 			expect(e?.ignored).toBe(true);
 			expect(e?.title).toBe("Treat referenced Linear issues"); // unchanged because ignored
 			expect(e?.addedAt).toBe(addedAt);
 		});
 
 		it("refreshes title/url/sourceToolName on uncommitted entry without ignored", async () => {
-			await upsertLinearIssueEntry(ref(), "/abs/JOLLI-1528.md", "hash-1", "main", tempDir);
+			await upsertLinearIssueEntry(ref(), "/abs/PROJ-1528.md", "hash-1", "main", tempDir);
 			const before = await loadPlansRegistry(tempDir);
-			const addedAt = before.linearIssues?.["JOLLI-1528"]?.addedAt;
+			const addedAt = before.linearIssues?.["PROJ-1528"]?.addedAt;
 
 			await upsertLinearIssueEntry(
 				ref({
 					title: "new title",
-					url: "https://linear.app/x/JOLLI-1528/v2",
+					url: "https://linear.app/x/PROJ-1528/v2",
 					toolName: "mcp__linear__list_issues",
 				}),
-				"/abs/JOLLI-1528.md",
+				"/abs/PROJ-1528.md",
 				"hash-2",
 				"main",
 				tempDir,
 			);
 			const after = await loadPlansRegistry(tempDir);
-			const e = after.linearIssues?.["JOLLI-1528"];
+			const e = after.linearIssues?.["PROJ-1528"];
 			expect(e?.title).toBe("new title");
-			expect(e?.url).toBe("https://linear.app/x/JOLLI-1528/v2");
+			expect(e?.url).toBe("https://linear.app/x/PROJ-1528/v2");
 			expect(e?.sourceToolName).toBe("mcp__linear__list_issues");
 			expect(e?.addedAt).toBe(addedAt); // preserved
 		});
@@ -1500,8 +1511,8 @@ describe("SessionTracker", () => {
 					version: 1,
 					plans: {},
 					linearIssues: {
-						"JOLLI-1528": {
-							ticketId: "JOLLI-1528",
+						"PROJ-1528": {
+							ticketId: "PROJ-1528",
 							title: "old",
 							url: "u",
 							sourcePath: "/p",
@@ -1518,8 +1529,8 @@ describe("SessionTracker", () => {
 			);
 			await upsertLinearIssueEntry(ref({ title: "new title" }), "/p", "matching-hash", "main", tempDir);
 			const after = await loadPlansRegistry(tempDir);
-			expect(after.linearIssues?.["JOLLI-1528"]?.title).toBe("old"); // unchanged
-			expect(after.linearIssues?.["JOLLI-1528"]?.commitHash).toBe("abc1234");
+			expect(after.linearIssues?.["PROJ-1528"]?.title).toBe("old"); // unchanged
+			expect(after.linearIssues?.["PROJ-1528"]?.commitHash).toBe("abc1234");
 		});
 
 		it("replaces a guard entry with a fresh uncommitted one when content hash differs", async () => {
@@ -1528,8 +1539,8 @@ describe("SessionTracker", () => {
 					version: 1,
 					plans: {},
 					linearIssues: {
-						"JOLLI-1528": {
-							ticketId: "JOLLI-1528",
+						"PROJ-1528": {
+							ticketId: "PROJ-1528",
 							title: "old",
 							url: "u",
 							sourcePath: "/p",
@@ -1546,7 +1557,7 @@ describe("SessionTracker", () => {
 			);
 			await upsertLinearIssueEntry(ref({ title: "new" }), "/p", "new-hash", "main", tempDir);
 			const after = await loadPlansRegistry(tempDir);
-			const e = after.linearIssues?.["JOLLI-1528"];
+			const e = after.linearIssues?.["PROJ-1528"];
 			expect(e?.title).toBe("new");
 			expect(e?.commitHash).toBeNull();
 			expect(e?.contentHashAtCommit).toBeUndefined();
@@ -1558,8 +1569,8 @@ describe("SessionTracker", () => {
 					version: 1,
 					plans: {},
 					linearIssues: {
-						"JOLLI-1528": {
-							ticketId: "JOLLI-1528",
+						"PROJ-1528": {
+							ticketId: "PROJ-1528",
 							title: "old on feature-a",
 							url: "u",
 							sourcePath: "/p",
@@ -1576,13 +1587,13 @@ describe("SessionTracker", () => {
 			// Upsert from a different branch — defensive replacement to a fresh entry on "main"
 			await upsertLinearIssueEntry(
 				ref({ title: "fresh on main" }),
-				"/abs/JOLLI-1528.md",
+				"/abs/PROJ-1528.md",
 				"hash-x",
 				"main",
 				tempDir,
 			);
 			const after = await loadPlansRegistry(tempDir);
-			const e = after.linearIssues?.["JOLLI-1528"];
+			const e = after.linearIssues?.["PROJ-1528"];
 			expect(e?.branch).toBe("main");
 			expect(e?.title).toBe("fresh on main");
 		});
@@ -1593,8 +1604,8 @@ describe("SessionTracker", () => {
 					version: 1,
 					plans: {},
 					linearIssues: {
-						"JOLLI-1528": {
-							ticketId: "JOLLI-1528",
+						"PROJ-1528": {
+							ticketId: "PROJ-1528",
 							title: "old",
 							url: "u",
 							sourcePath: "/p",
@@ -1612,8 +1623,8 @@ describe("SessionTracker", () => {
 			);
 			await upsertLinearIssueEntry(ref({ title: "new" }), "/p", "new-hash", "main", tempDir);
 			const after = await loadPlansRegistry(tempDir);
-			expect(after.linearIssues?.["JOLLI-1528"]?.title).toBe("old"); // unchanged
-			expect(after.linearIssues?.["JOLLI-1528"]?.ignored).toBe(true);
+			expect(after.linearIssues?.["PROJ-1528"]?.title).toBe("old"); // unchanged
+			expect(after.linearIssues?.["PROJ-1528"]?.ignored).toBe(true);
 		});
 	});
 
@@ -1624,8 +1635,8 @@ describe("SessionTracker", () => {
 					version: 1,
 					plans: {},
 					linearIssues: {
-						"JOLLI-1528-abc1234": {
-							ticketId: "JOLLI-1528",
+						"PROJ-1528-abc1234": {
+							ticketId: "PROJ-1528",
 							title: "t",
 							url: "u",
 							sourcePath: "/p",
@@ -1639,14 +1650,14 @@ describe("SessionTracker", () => {
 				},
 				tempDir,
 			);
-			await associateLinearIssueWithCommit("JOLLI-1528-abc1234", "def5678abc", tempDir);
+			await associateLinearIssueWithCommit("PROJ-1528-abc1234", "def5678abc", tempDir);
 			const after = await loadPlansRegistry(tempDir);
-			expect(after.linearIssues?.["JOLLI-1528-abc1234"]?.commitHash).toBe("def5678abc");
+			expect(after.linearIssues?.["PROJ-1528-abc1234"]?.commitHash).toBe("def5678abc");
 		});
 
 		it("is a no-op when the archivedKey is not in the registry", async () => {
 			await savePlansRegistry({ version: 1, plans: {}, linearIssues: {} }, tempDir);
-			await associateLinearIssueWithCommit("JOLLI-99-zzz", "newhash", tempDir);
+			await associateLinearIssueWithCommit("PROJ-99-zzz", "newhash", tempDir);
 			const after = await loadPlansRegistry(tempDir);
 			expect(after.linearIssues).toEqual({});
 		});

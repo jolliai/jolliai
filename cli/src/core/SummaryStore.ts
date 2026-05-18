@@ -248,8 +248,9 @@ async function migrateOneToOneLocked(
 	);
 
 	// Wrap the old summary as a child rather than replacing its hash.
-	// stripFunctionalMetadata strips all 8 Hoist fields (Copy-Hoist 6 + the
-	// new Consolidate-Hoist topics/recap) so the root is solely authoritative.
+	// stripFunctionalMetadata strips all 9 Hoist fields (the original 8 plus
+	// the Linear-issues field added when that integration shipped) so the
+	// root is solely authoritative.
 	const strippedOld = stripFunctionalMetadata(oldSummary);
 	const docUrl = oldSummary.jolliDocUrl;
 
@@ -280,6 +281,14 @@ async function migrateOneToOneLocked(
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
 		...(oldSummary.plans && { plans: oldSummary.plans }),
 		...(oldSummary.notes && { notes: oldSummary.notes }),
+		// Linear issues — same Copy-Hoist treatment as plans / notes. Without
+		// this line, rebase-pick / migrate-1-to-1 paths would silently drop
+		// linearIssues refs from the new root summary even though the registry
+		// still pointed at correctly-archived snapshot files. Observed bug:
+		// after rebasing this branch onto origin/main, the 3 feature commits'
+		// summaries on the orphan branch had linearIssues:[] and the panel /
+		// PR markdown stopped showing the Linear issue associations.
+		...(oldSummary.linearIssues && { linearIssues: oldSummary.linearIssues }),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
 		topics: hoistedTopics,
 		...(oldSummary.recap && { recap: oldSummary.recap }),

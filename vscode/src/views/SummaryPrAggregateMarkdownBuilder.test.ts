@@ -252,26 +252,26 @@ describe("buildAggregatedPrMarkdown", () => {
 	it("dedupes linear issues across commits by ticketId — same ticket on multiple commits collapses to one row", () => {
 		// The archivedKey suffix is the per-commit shortHash, so the same
 		// ticket referenced from two commits would yield two distinct
-		// archivedKeys ("JOLLI-1-aaaa1111", "JOLLI-1-bbbb2222") — both pointing
+		// archivedKeys ("PROJ-1-aaaa1111", "PROJ-1-bbbb2222") — both pointing
 		// at the same logical Linear issue. Without ticketId-based dedup,
 		// the PR description would render two bullets for one ticket.
 		const issueAt1: LinearIssueCommitRef = {
-			archivedKey: "JOLLI-1-aaaa1111",
-			ticketId: "JOLLI-1",
+			archivedKey: "PROJ-1-aaaa1111",
+			ticketId: "PROJ-1",
 			title: "Linear issue title",
-			url: "https://linear.app/x/issue/JOLLI-1/test",
+			url: "https://linear.app/x/issue/PROJ-1/test",
 			referencedAt: "2026-05-06T00:00:00Z",
 			sourceToolName: "mcp__linear__get_issue",
 		};
 		const issueAt2: LinearIssueCommitRef = {
 			...issueAt1,
-			archivedKey: "JOLLI-1-bbbb2222",
+			archivedKey: "PROJ-1-bbbb2222",
 		};
 		const issueOther: LinearIssueCommitRef = {
-			archivedKey: "JOLLI-2-aaaa1111",
-			ticketId: "JOLLI-2",
+			archivedKey: "PROJ-2-aaaa1111",
+			ticketId: "PROJ-2",
 			title: "Linear issue B",
-			url: "https://linear.app/x/issue/JOLLI-2/test",
+			url: "https://linear.app/x/issue/PROJ-2/test",
 			referencedAt: "2026-05-06T00:00:00Z",
 			sourceToolName: "mcp__linear__get_issue",
 		};
@@ -292,10 +292,10 @@ describe("buildAggregatedPrMarkdown", () => {
 		// empty, dropping linear issues entirely. The fixed bail-out also
 		// considers mergedLinear.length.
 		const issue: LinearIssueCommitRef = {
-			archivedKey: "JOLLI-9-cccc3333",
-			ticketId: "JOLLI-9",
+			archivedKey: "PROJ-9-cccc3333",
+			ticketId: "PROJ-9",
 			title: "Solo Linear",
-			url: "https://linear.app/x/issue/JOLLI-9/test",
+			url: "https://linear.app/x/issue/PROJ-9/test",
 			referencedAt: "2026-05-06T00:00:00Z",
 			sourceToolName: "mcp__linear__get_issue",
 		};

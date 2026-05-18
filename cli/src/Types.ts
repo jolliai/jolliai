@@ -453,7 +453,7 @@ export interface NoteReference {
  * Not persisted as-is (description goes into markdown body, metadata into LinearIssueEntry).
  */
 export interface LinearIssueRef {
-	/** Stable Linear ticket id, e.g. "JOLLI-1528" — matches /^[A-Z][A-Z0-9_]*-\d+$/ */
+	/** Stable Linear ticket id, e.g. "PROJ-1234" — matches /^[A-Z][A-Z0-9_]*-\d+$/ */
 	readonly ticketId: string;
 	readonly title: string;
 	readonly url: string;
@@ -472,7 +472,7 @@ export interface LinearIssueRef {
  * Persisted Linear issue entry in plans.json registry (linearIssues section).
  *
  * Map key follows the Plans archive pattern (QueueWorker.ts:490-518):
- * - Uncommitted: key = ticketId (e.g. "JOLLI-1528")
+ * - Uncommitted: key = ticketId (e.g. "PROJ-1234")
  * - After archive: TWO entries exist:
  *   - key = ticketId       → guard entry (contentHashAtCommit set)
  *   - key = ticketId-<shortHash> → archived snapshot (no contentHashAtCommit)
@@ -512,7 +512,7 @@ export interface LinearIssueEntry {
 export interface LinearIssueCommitRef {
 	/** Exact pointer into plans.json: "<ticketId>-<shortHash>" */
 	readonly archivedKey: string;
-	/** Stable Linear ticket id (e.g. "JOLLI-1528") */
+	/** Stable Linear ticket id (e.g. "PROJ-1234") */
 	readonly ticketId: string;
 	readonly title: string;
 	readonly url: string;

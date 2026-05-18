@@ -20,7 +20,7 @@ vi.mock("../core/LinearIssueExtractor.js", () => ({
 
 // Mock LinearIssueStore — fs IO module called from StopHook
 vi.mock("../core/LinearIssueStore.js", () => ({
-	writeLinearIssueMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/abs/JOLLI-1.md", contentHash: "fake-hash" }),
+	writeLinearIssueMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/abs/PROJ-1.md", contentHash: "fake-hash" }),
 	hashLinearIssueContent: vi.fn().mockReturnValue("fake-hash"),
 }));
 
@@ -999,9 +999,9 @@ describe("StopHook — Linear issue discovery", () => {
 	const TRANSCRIPT_PATH = "/path/to/session.jsonl";
 	const PROJECT_DIR = "/my/project";
 	const REF = {
-		ticketId: "JOLLI-1528",
+		ticketId: "PROJ-1528",
 		title: "Treat referenced Linear issues",
-		url: "https://linear.app/x/JOLLI-1528",
+		url: "https://linear.app/x/PROJ-1528",
 		toolName: "mcp__linear__get_issue",
 		referencedAt: "2026-05-14T06:06:01.123Z",
 		description: "## Problem\nbody",
@@ -1049,7 +1049,7 @@ describe("StopHook — Linear issue discovery", () => {
 		expect(writeLinearIssueMarkdown).toHaveBeenCalledWith(REF, PROJECT_DIR);
 		expect(upsertLinearIssueEntry).toHaveBeenCalledWith(
 			REF,
-			"/abs/JOLLI-1.md",
+			"/abs/PROJ-1.md",
 			"fake-hash",
 			expect.any(String),
 			PROJECT_DIR,

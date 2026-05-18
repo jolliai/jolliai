@@ -42,6 +42,11 @@ vi.mock("../core/LinearIssueStore.js", () => ({
 	linearIssuePath: vi.fn((key: string, cwd: string) => `${cwd}/.jolli/jollimemory/linear-issues/${key}.md`),
 	readLinearIssueMarkdown: vi.fn().mockResolvedValue(null),
 	renameLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
+	// QueueWorker.associateLinearIssuesWithCommit hashes raw markdown via this
+	// helper (referencedAt-excluding scheme) instead of sha256ing file bytes
+	// directly. Mock returns a stable hex hash so existing test assertions on
+	// the persisted contentHashAtCommit field stay deterministic.
+	hashLinearIssueContentFromMarkdown: vi.fn(() => "fake-content-hash"),
 }));
 
 vi.mock("../core/LinearIssueExtractor.js", () => ({
@@ -437,16 +442,16 @@ describe("QueueWorker", () => {
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks("abc12345def67890");
 
-			vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue(["JOLLI-1528"]);
+			vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue(["PROJ-1528"]);
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
 				version: 1,
 				plans: {},
 				linearIssues: {
-					"JOLLI-1528": {
-						ticketId: "JOLLI-1528",
+					"PROJ-1528": {
+						ticketId: "PROJ-1528",
 						title: "Treat referenced Linear issues",
-						url: "https://linear.app/jolliai/issue/JOLLI-1528/",
-						sourcePath: "/test/cwd/.jolli/jollimemory/linear-issues/JOLLI-1528.md",
+						url: "https://linear.app/jolliai/issue/PROJ-1528/",
+						sourcePath: "/test/cwd/.jolli/jollimemory/linear-issues/PROJ-1528.md",
 						branch: "feature/test",
 						addedAt: "2026-04-01T00:00:00Z",
 						updatedAt: "2026-04-01T00:00:00Z",
@@ -457,9 +462,9 @@ describe("QueueWorker", () => {
 			});
 			const { readLinearIssueMarkdown, renameLinearIssueMarkdown } = await import("../core/LinearIssueStore.js");
 			vi.mocked(readLinearIssueMarkdown).mockResolvedValue({
-				ticketId: "JOLLI-1528",
+				ticketId: "PROJ-1528",
 				title: "Treat referenced Linear issues",
-				url: "https://linear.app/jolliai/issue/JOLLI-1528/",
+				url: "https://linear.app/jolliai/issue/PROJ-1528/",
 				status: "In Progress",
 				priority: "No priority",
 				labels: ["JolliMemory", "Feature"],
@@ -476,12 +481,12 @@ describe("QueueWorker", () => {
 			expect(storeSummary).toHaveBeenCalledTimes(1);
 			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
 			expect(savedSummary.linearIssues).toBeDefined();
-			expect(savedSummary.linearIssues?.[0].archivedKey).toBe("JOLLI-1528-abc12345");
-			expect(savedSummary.linearIssues?.[0].ticketId).toBe("JOLLI-1528");
+			expect(savedSummary.linearIssues?.[0].archivedKey).toBe("PROJ-1528-abc12345");
+			expect(savedSummary.linearIssues?.[0].ticketId).toBe("PROJ-1528");
 			expect(savedSummary.linearIssues?.[0].title).toBe("Treat referenced Linear issues");
 			expect(renameLinearIssueMarkdown).toHaveBeenCalledWith(
-				"/test/cwd/.jolli/jollimemory/linear-issues/JOLLI-1528.md",
-				"/test/cwd/.jolli/jollimemory/linear-issues/JOLLI-1528-abc12345.md",
+				"/test/cwd/.jolli/jollimemory/linear-issues/PROJ-1528.md",
+				"/test/cwd/.jolli/jollimemory/linear-issues/PROJ-1528-abc12345.md",
 			);
 		});
 
@@ -493,13 +498,13 @@ describe("QueueWorker", () => {
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks("abc12345def67890");
 
-			vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue(["JOLLI-1528"]);
+			vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue(["PROJ-1528"]);
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
 				version: 1,
 				plans: {},
 				linearIssues: {
-					"JOLLI-1528": {
-						ticketId: "JOLLI-1528",
+					"PROJ-1528": {
+						ticketId: "PROJ-1528",
 						title: "t",
 						url: "u",
 						sourcePath: "/missing.md",

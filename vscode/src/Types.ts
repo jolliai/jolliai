@@ -162,7 +162,7 @@ export interface NoteInfo {
 /** Display-level Linear issue metadata for the VSCode panel */
 export interface LinearIssueInfo {
 	readonly kind: "linearissue";
-	/** Stable Linear ticket id (e.g. "JOLLI-1528") */
+	/** Stable Linear ticket id (e.g. "PROJ-1234") */
 	readonly ticketId: string;
 	/** Current map key in plans.json (= ticketId when uncommitted, = ticketId-shortHash after archive) */
 	readonly mapKey: string;

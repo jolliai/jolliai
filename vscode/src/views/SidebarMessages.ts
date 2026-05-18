@@ -324,7 +324,7 @@ export interface NoteHover {
  * fallback; this richer field is webview-only.
  */
 export interface LinearIssueHover {
-	/** "JOLLI-1528 — Treat referenced Linear issues..." — bold at the top. */
+	/** "PROJ-1234 — Issue title..." — bold at the top. */
 	readonly title: string;
 	/** Linear status (e.g. "In Progress") — paired with a circle-large-filled icon. */
 	readonly status?: string;

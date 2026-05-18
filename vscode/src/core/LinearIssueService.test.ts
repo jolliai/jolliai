@@ -60,10 +60,10 @@ function makeEntry(
 	overrides: Partial<LinearIssueEntry> = {},
 ): LinearIssueEntry {
 	return {
-		ticketId: "JOLLI-1528",
+		ticketId: "PROJ-1528",
 		title: "Treat referenced Linear issues",
-		url: "https://linear.app/jolliai/issue/JOLLI-1528/",
-		sourcePath: "/repo/.jolli/jollimemory/linear-issues/JOLLI-1528.md",
+		url: "https://linear.app/jolliai/issue/PROJ-1528/",
+		sourcePath: "/repo/.jolli/jollimemory/linear-issues/PROJ-1528.md",
 		branch: "main",
 		addedAt: "2026-05-13T00:00:00Z",
 		updatedAt: "2026-05-14T06:06:01.123Z",
@@ -86,7 +86,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry() },
+			linearIssues: { "PROJ-1528": makeEntry() },
 		});
 
 		const result = await detectLinearIssues("/repo");
@@ -94,10 +94,10 @@ describe("detectLinearIssues", () => {
 		expect(result).toHaveLength(1);
 		expect(result[0]).toMatchObject({
 			kind: "linearissue",
-			ticketId: "JOLLI-1528",
-			mapKey: "JOLLI-1528",
+			ticketId: "PROJ-1528",
+			mapKey: "PROJ-1528",
 			title: "Treat referenced Linear issues",
-			url: "https://linear.app/jolliai/issue/JOLLI-1528/",
+			url: "https://linear.app/jolliai/issue/PROJ-1528/",
 			commitHash: null,
 			ignored: false,
 		});
@@ -107,7 +107,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry({ ignored: true }) },
+			linearIssues: { "PROJ-1528": makeEntry({ ignored: true }) },
 		});
 		const result = await detectLinearIssues("/repo");
 		expect(result).toHaveLength(0);
@@ -118,7 +118,7 @@ describe("detectLinearIssues", () => {
 			version: 1,
 			plans: {},
 			linearIssues: {
-				"JOLLI-1528": makeEntry({
+				"PROJ-1528": makeEntry({
 					contentHashAtCommit: "h",
 					commitHash: "abc",
 				}),
@@ -133,7 +133,7 @@ describe("detectLinearIssues", () => {
 			version: 1,
 			plans: {},
 			linearIssues: {
-				"JOLLI-1528-abc1234": makeEntry({ commitHash: "abc1234" }),
+				"PROJ-1528-abc1234": makeEntry({ commitHash: "abc1234" }),
 			},
 		});
 		const result = await detectLinearIssues("/repo");
@@ -144,7 +144,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry({ branch: "feature-x" }) },
+			linearIssues: { "PROJ-1528": makeEntry({ branch: "feature-x" }) },
 		});
 		mockGetCurrentBranch.mockReturnValue("main");
 		const result = await detectLinearIssues("/repo");
@@ -161,25 +161,25 @@ describe("detectLinearIssues", () => {
 			version: 1,
 			plans: {},
 			linearIssues: {
-				"JOLLI-1": makeEntry({
-					ticketId: "JOLLI-1",
+				"PROJ-1": makeEntry({
+					ticketId: "PROJ-1",
 					updatedAt: "2026-05-14T03:00:00Z",
 				}),
-				"JOLLI-2": makeEntry({
-					ticketId: "JOLLI-2",
+				"PROJ-2": makeEntry({
+					ticketId: "PROJ-2",
 					updatedAt: "2026-05-14T01:00:00Z",
 				}),
-				"JOLLI-3": makeEntry({
-					ticketId: "JOLLI-3",
+				"PROJ-3": makeEntry({
+					ticketId: "PROJ-3",
 					updatedAt: "2026-05-14T02:00:00Z",
 				}),
 			},
 		});
 		const result = await detectLinearIssues("/repo");
 		expect(result.map((r) => r.ticketId)).toEqual([
-			"JOLLI-1",
-			"JOLLI-3",
-			"JOLLI-2",
+			"PROJ-1",
+			"PROJ-3",
+			"PROJ-2",
 		]);
 	});
 
@@ -187,10 +187,10 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry() },
+			linearIssues: { "PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockReturnValue(
-			'---\nticketId: "JOLLI-1528"\ntitle: "t"\nurl: "u"\nstatus: "In Progress"\npriority: "Urgent"\nlabels:\n  - "A"\n  - "B"\nreferencedAt: "x"\nsourceToolName: "y"\n---\n## Problem\n\nbody here\n',
+			'---\nticketId: "PROJ-1528"\ntitle: "t"\nurl: "u"\nstatus: "In Progress"\npriority: "Urgent"\nlabels:\n  - "A"\n  - "B"\nreferencedAt: "x"\nsourceToolName: "y"\n---\n## Problem\n\nbody here\n',
 		);
 		const result = await detectLinearIssues("/repo");
 		expect(result[0]).toMatchObject({
@@ -205,7 +205,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry() },
+			linearIssues: { "PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockImplementation(() => {
 			throw new Error("ENOENT");
@@ -219,7 +219,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry() },
+			linearIssues: { "PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockReturnValue("no frontmatter at all");
 		const result = await detectLinearIssues("/repo");
@@ -230,7 +230,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry() },
+			linearIssues: { "PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockReturnValue('---\nstatus: "x"\n(no closing)');
 		const result = await detectLinearIssues("/repo");
@@ -241,7 +241,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry() },
+			linearIssues: { "PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockReturnValue(
 			'---\nstatus: "In Progress"\nlabels:\n  - not-json-quoted\n---\nbody\n',
@@ -255,7 +255,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry() },
+			linearIssues: { "PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockReturnValue(
 			'---\nstatus: "X"\nlabels:\n  - "A"\n---\n',
@@ -269,7 +269,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry() },
+			linearIssues: { "PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockReturnValue('---\nstatus: "X"\n---\nbody text');
 		const result = await detectLinearIssues("/repo");
@@ -281,7 +281,7 @@ describe("detectLinearIssues", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry({ branch: "feature-x" }) },
+			linearIssues: { "PROJ-1528": makeEntry({ branch: "feature-x" }) },
 		});
 		mockGetCurrentBranch.mockReturnValue(null);
 		const result = await detectLinearIssues("/repo");
@@ -294,23 +294,23 @@ describe("setLinearIssueIgnored", () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry() },
+			linearIssues: { "PROJ-1528": makeEntry() },
 		});
-		await setLinearIssueIgnored("/repo", "JOLLI-1528", true);
+		await setLinearIssueIgnored("/repo", "PROJ-1528", true);
 		expect(mockSavePlansRegistry).toHaveBeenCalled();
 		const saved = mockSavePlansRegistry.mock.calls[0][0];
-		expect(saved.linearIssues["JOLLI-1528"].ignored).toBe(true);
+		expect(saved.linearIssues["PROJ-1528"].ignored).toBe(true);
 	});
 
 	it("clears ignored when set to false", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			linearIssues: { "JOLLI-1528": makeEntry({ ignored: true }) },
+			linearIssues: { "PROJ-1528": makeEntry({ ignored: true }) },
 		});
-		await setLinearIssueIgnored("/repo", "JOLLI-1528", false);
+		await setLinearIssueIgnored("/repo", "PROJ-1528", false);
 		const saved = mockSavePlansRegistry.mock.calls[0][0];
-		expect(saved.linearIssues["JOLLI-1528"].ignored).toBeUndefined();
+		expect(saved.linearIssues["PROJ-1528"].ignored).toBeUndefined();
 	});
 
 	it("is a no-op when mapKey is not in the registry", async () => {
@@ -319,13 +319,13 @@ describe("setLinearIssueIgnored", () => {
 			plans: {},
 			linearIssues: {},
 		});
-		await setLinearIssueIgnored("/repo", "JOLLI-99", true);
+		await setLinearIssueIgnored("/repo", "PROJ-99", true);
 		expect(mockSavePlansRegistry).not.toHaveBeenCalled();
 	});
 
 	it("handles missing linearIssues section gracefully", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {} });
-		await setLinearIssueIgnored("/repo", "JOLLI-99", true);
+		await setLinearIssueIgnored("/repo", "PROJ-99", true);
 		expect(mockSavePlansRegistry).not.toHaveBeenCalled();
 	});
 });
@@ -333,11 +333,11 @@ describe("setLinearIssueIgnored", () => {
 describe("open helpers", () => {
 	const info: LinearIssueInfo = {
 		kind: "linearissue",
-		ticketId: "JOLLI-1528",
-		mapKey: "JOLLI-1528",
+		ticketId: "PROJ-1528",
+		mapKey: "PROJ-1528",
 		title: "t",
-		url: "https://linear.app/x/JOLLI-1528",
-		sourcePath: "/repo/.jolli/jollimemory/linear-issues/JOLLI-1528.md",
+		url: "https://linear.app/x/PROJ-1528",
+		sourcePath: "/repo/.jolli/jollimemory/linear-issues/PROJ-1528.md",
 		branch: "main",
 		addedAt: "x",
 		updatedAt: "x",

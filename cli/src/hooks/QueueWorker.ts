@@ -34,7 +34,12 @@ import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { formatLinearIssuesBlock } from "../core/LinearIssueExtractor.js";
-import { linearIssuePath, readLinearIssueMarkdown, renameLinearIssueMarkdown } from "../core/LinearIssueStore.js";
+import {
+	hashLinearIssueContentFromMarkdown,
+	linearIssuePath,
+	readLinearIssueMarkdown,
+	renameLinearIssueMarkdown,
+} from "../core/LinearIssueStore.js";
 import { isLlmCredentialError } from "../core/LlmClient.js";
 import { acquireWorkerLock, refreshWorkerLockMtime, releaseWorkerLock } from "../core/Locks.js";
 import { formatNotesBlock } from "../core/NotePromptFormatter.js";
@@ -150,9 +155,9 @@ async function reassociateMetadata(
 		/* v8 ignore start -- reassociateMetadata.linearIssues loop fires only on squash/rebase paths where source summaries already carried linearIssues; covered indirectly by the merge-hoist tests in SummaryStore.test.ts but not the reassociate call itself. */
 		if (oldSummary.linearIssues) {
 			for (const linearRef of oldSummary.linearIssues) {
-				// Uses the archivedKey (e.g. "JOLLI-1528-abc1234") to unambiguously
-				// locate the snapshot entry — see §9.10 of the plan and the analog
-				// to associatePlanWithCommit which uses planRef.slug for the same reason.
+				// Uses the archivedKey (e.g. "PROJ-1234-abc1234") to unambiguously
+				// locate the snapshot entry — analog to associatePlanWithCommit
+				// which uses planRef.slug for the same reason.
 				await associateLinearIssueWithCommit(linearRef.archivedKey, newHash, cwd);
 			}
 		}
@@ -724,9 +729,15 @@ async function associateLinearIssuesWithCommit(
 			continue;
 		}
 
-		const { createHash } = await import("node:crypto");
 		const fileContent = await readMarkdownFileContent(entry.sourcePath);
-		const contentHashAtCommit = createHash("sha256").update(fileContent).digest("hex");
+		// hashLinearIssueContentFromMarkdown strips the referencedAt frontmatter
+		// line before hashing so the stored guard matches a future StopHook
+		// rediscovery (which also hashes via the referencedAt-excluding scheme
+		// — see writeLinearIssueMarkdown → hashLinearIssueContent). Hashing the
+		// raw file bytes here was the prior bug: referencedAt was a fresh
+		// timestamp per MCP fetch, so the guard hash diverged on every reference
+		// and the entry was wrongly resurfaced as new uncommitted.
+		const contentHashAtCommit = hashLinearIssueContentFromMarkdown(fileContent);
 
 		const archivedKey = `${ticketId}-${shortHash}`;
 		const now2 = new Date().toISOString();
@@ -791,9 +802,25 @@ async function associateLinearIssuesWithCommit(
 	}
 
 	if (commitRefs.length > 0) {
-		// Reread registry near write to avoid clobbering concurrent updates
-		registry = await loadPlansRegistry(cwd);
-		await savePlansRegistry({ ...registry, linearIssues: updatedLinearIssues }, cwd);
+		// Near-write reread: pull the freshest registry to pick up any plans /
+		// notes / linearIssues writes that happened during this archive (e.g.
+		// concurrent StopHook upsert, ignoreLinearIssue command). Then merge
+		// our updates entry-by-entry on top of the fresh linearIssues map —
+		// the prior `linearIssues: updatedLinearIssues` overwrite would drop
+		// any keys added/changed by the concurrent writer because
+		// `updatedLinearIssues` was built from the stale snapshot at the top
+		// of this function. Mirrors the same merge pattern used by
+		// SessionTracker.upsertLinearIssueEntry's near-write reread.
+		const freshRegistry = await loadPlansRegistry(cwd);
+		const mergedLinearIssues = { ...(freshRegistry.linearIssues ?? {}) };
+		for (const key of Object.keys(updatedLinearIssues)) {
+			mergedLinearIssues[key] = updatedLinearIssues[key];
+		}
+		await savePlansRegistry({ ...freshRegistry, linearIssues: mergedLinearIssues }, cwd);
+		// Keep the outer `registry` variable in sync with what's on disk so any
+		// later read by this function (none today, but defensive against future
+		// edits adding one) sees the latest state.
+		registry = freshRegistry;
 	}
 
 	if (filesToStore.length > 0) {
@@ -896,9 +923,9 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	const conversation = buildMultiSessionContext(sessionTranscripts);
 	log.debug("Conversation context built: %d chars, %d sessions", conversation.length, sessionTranscripts.length);
 
-	// Step 6b: Assemble the three structured prompt blocks (Stage 2 / JOLLI-1404).
-	// Pure registry-driven: no transcript re-scan. User's Ignore on the panel
-	// takes effect immediately on the next commit.
+	// Step 6b: Assemble the three structured prompt blocks (plans / notes /
+	// linear-issues). Pure registry-driven: no transcript re-scan. User's
+	// Ignore on the panel takes effect immediately on the next commit.
 	const [activePlanEntries, activeNoteEntries, activeLinearIssueEntries] = await Promise.all([
 		detectActivePlansForBranch(cwd, branch),
 		detectActiveNotesForBranch(cwd, branch),
@@ -1888,6 +1915,7 @@ export const __test__ = {
 	detectUncommittedNoteIds,
 	hoistMetadataFromOldSummary,
 	associatePlansWithCommit,
+	associateLinearIssuesWithCommit,
 	executePipeline,
 	handleAmendPipeline,
 	handleSquashFromQueue,

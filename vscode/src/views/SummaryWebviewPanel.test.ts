@@ -29,6 +29,7 @@ const {
 	executeCommand,
 	getConfiguration,
 	showTextDocument,
+	openTextDocument,
 } = vi.hoisted(() => ({
 	postMessage: vi.fn().mockResolvedValue(true),
 	onDidReceiveMessage: vi.fn(),
@@ -46,6 +47,7 @@ const {
 	executeCommand: vi.fn(),
 	getConfiguration: vi.fn(() => ({ get: vi.fn() })),
 	showTextDocument: vi.fn().mockResolvedValue(undefined),
+	openTextDocument: vi.fn().mockResolvedValue({}),
 }));
 
 const { createWebviewPanel } = vi.hoisted(() => ({
@@ -86,7 +88,14 @@ vi.mock("vscode", () => ({
 		})),
 	},
 	ViewColumn: { Beside: 2 },
-	workspace: { getConfiguration, fs: { writeFile: fsWriteFile } },
+	workspace: {
+		getConfiguration,
+		fs: { writeFile: fsWriteFile },
+		// openTextDocument is used by handleOpenLinearIssueMarkdown's orphan-
+		// branch fallback path; default returns a stub doc, individual tests
+		// can override via openTextDocument.mockResolvedValueOnce(...).
+		openTextDocument,
+	},
 	commands: { executeCommand },
 }));
 
@@ -131,6 +140,7 @@ vi.mock("../../../cli/src/core/Summarizer.js", () => ({
 
 const {
 	mockGetTranscriptHashes,
+	mockReadLinearIssueFromBranch,
 	mockReadNoteFromBranch,
 	mockReadPlanFromBranch,
 	mockReadTranscriptsForCommits,
@@ -140,6 +150,7 @@ const {
 	mockStoreSummary,
 } = vi.hoisted(() => ({
 	mockGetTranscriptHashes: vi.fn().mockResolvedValue(new Set<string>()),
+	mockReadLinearIssueFromBranch: vi.fn().mockResolvedValue(null),
 	mockReadNoteFromBranch: vi.fn().mockResolvedValue(null),
 	mockReadPlanFromBranch: vi.fn().mockResolvedValue(null),
 	mockReadTranscriptsForCommits: vi.fn().mockResolvedValue(new Map()),
@@ -151,6 +162,7 @@ const {
 
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	getTranscriptHashes: mockGetTranscriptHashes,
+	readLinearIssueFromBranch: mockReadLinearIssueFromBranch,
 	readNoteFromBranch: mockReadNoteFromBranch,
 	readPlanFromBranch: mockReadPlanFromBranch,
 	readTranscriptsForCommits: mockReadTranscriptsForCommits,
@@ -6029,10 +6041,10 @@ describe("SummaryWebviewPanel", () => {
 				const dispatch = await setupPanel({
 					linearIssues: [
 						{
-							archivedKey: "JOLLI-1-aaaaaaaa",
-							ticketId: "JOLLI-1",
+							archivedKey: "PROJ-1-aaaaaaaa",
+							ticketId: "PROJ-1",
 							title: "T",
-							url: "https://linear.app/x/issue/JOLLI-1/test",
+							url: "https://linear.app/x/issue/PROJ-1/test",
 							referencedAt: "x",
 							sourceToolName: "mcp__linear__get_issue",
 						},
@@ -6041,14 +6053,14 @@ describe("SummaryWebviewPanel", () => {
 
 				dispatch({
 					command: "openLinearIssue",
-					archivedKey: "JOLLI-1-aaaaaaaa",
-					url: "https://linear.app/x/issue/JOLLI-1/test",
+					archivedKey: "PROJ-1-aaaaaaaa",
+					url: "https://linear.app/x/issue/PROJ-1/test",
 				});
 				await flushPromises();
 
 				expect(openExternal).toHaveBeenCalledTimes(1);
 				const arg = openExternal.mock.calls[0][0] as { toString(): string };
-				expect(arg.toString()).toBe("https://linear.app/x/issue/JOLLI-1/test");
+				expect(arg.toString()).toBe("https://linear.app/x/issue/PROJ-1/test");
 			});
 
 			it("no-ops when url is empty (defensive against missing data-attr)", async () => {
@@ -6056,7 +6068,7 @@ describe("SummaryWebviewPanel", () => {
 
 				dispatch({
 					command: "openLinearIssue",
-					archivedKey: "JOLLI-1-aaaaaaaa",
+					archivedKey: "PROJ-1-aaaaaaaa",
 					url: "",
 				});
 				await flushPromises();
@@ -6066,12 +6078,15 @@ describe("SummaryWebviewPanel", () => {
 		});
 
 		describe("openLinearIssueMarkdown", () => {
-			it("opens the archived markdown file under .jolli/jollimemory/linear-issues", async () => {
+			it("opens the local archived markdown file when it exists at .jolli/jollimemory/linear-issues", async () => {
+				// Local file exists → fast path: open it directly via showTextDocument,
+				// no orphan-branch read needed.
+				mockExistsSync.mockReturnValue(true);
 				const dispatch = await setupPanel();
 
 				dispatch({
 					command: "openLinearIssueMarkdown",
-					archivedKey: "JOLLI-1-aaaaaaaa",
+					archivedKey: "PROJ-1-aaaaaaaa",
 				});
 				await flushPromises();
 
@@ -6082,7 +6097,62 @@ describe("SummaryWebviewPanel", () => {
 				// Path layout follows QueueWorker.associateLinearIssuesWithCommit
 				// (rename to <ticketId>-<shortHash>.md inside the linear-issues dir).
 				expect(uriArg.fsPath).toContain("linear-issues");
-				expect(uriArg.fsPath).toContain("JOLLI-1-aaaaaaaa.md");
+				expect(uriArg.fsPath).toContain("PROJ-1-aaaaaaaa.md");
+				// Fast path must not touch the orphan branch.
+				expect(mockReadLinearIssueFromBranch).not.toHaveBeenCalled();
+			});
+
+			it("falls back to the orphan-branch snapshot when the local file is missing (clean checkout / cleanup scenario)", async () => {
+				// Regression: pre-fix the handler called showTextDocument on a
+				// nonexistent path → user got a VSCode error toast and thought
+				// the snapshot was lost, even though the archived content
+				// lives durably on the orphan branch (and in Memory Bank).
+				mockExistsSync.mockReturnValue(false);
+				mockReadLinearIssueFromBranch.mockResolvedValueOnce(
+					'---\nticketId: "PROJ-1"\n---\nbody from orphan branch',
+				);
+				openTextDocument.mockClear();
+				const dispatch = await setupPanel();
+
+				dispatch({
+					command: "openLinearIssueMarkdown",
+					archivedKey: "PROJ-1-aaaaaaaa",
+				});
+				await flushPromises();
+
+				expect(mockReadLinearIssueFromBranch).toHaveBeenCalledWith(
+					"PROJ-1-aaaaaaaa",
+					workspaceRoot,
+				);
+				// Opens an untitled markdown doc with the orphan-branch content
+				// — does NOT re-materialize the local file (user / cleanup may
+				// have deleted it intentionally; orphan branch stays the
+				// source of truth for archived snapshots).
+				expect(openTextDocument).toHaveBeenCalledWith({
+					language: "markdown",
+					content: '---\nticketId: "PROJ-1"\n---\nbody from orphan branch',
+				});
+			});
+
+			it("shows an error when both local and orphan-branch lookups miss", async () => {
+				// Defensive: archivedKey was passed in but no snapshot anywhere.
+				// User gets an explicit error instead of a silent no-op so
+				// they understand "this snapshot is genuinely gone, not just
+				// not-yet-loaded".
+				mockExistsSync.mockReturnValue(false);
+				mockReadLinearIssueFromBranch.mockResolvedValueOnce(null);
+				const dispatch = await setupPanel();
+
+				dispatch({
+					command: "openLinearIssueMarkdown",
+					archivedKey: "PROJ-MISSING-12345678",
+				});
+				await flushPromises();
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("PROJ-MISSING-12345678"),
+				);
+				expect(showTextDocument).not.toHaveBeenCalled();
 			});
 
 			it("no-ops when archivedKey is empty", async () => {
@@ -6092,6 +6162,7 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				expect(showTextDocument).not.toHaveBeenCalled();
+				expect(mockReadLinearIssueFromBranch).not.toHaveBeenCalled();
 			});
 		});
 
@@ -6101,18 +6172,18 @@ describe("SummaryWebviewPanel", () => {
 				const dispatch = await setupPanel({
 					linearIssues: [
 						{
-							archivedKey: "JOLLI-1-aaaaaaaa",
-							ticketId: "JOLLI-1",
+							archivedKey: "PROJ-1-aaaaaaaa",
+							ticketId: "PROJ-1",
 							title: "T1",
-							url: "https://linear.app/x/issue/JOLLI-1/test",
+							url: "https://linear.app/x/issue/PROJ-1/test",
 							referencedAt: "x",
 							sourceToolName: "mcp__linear__get_issue",
 						},
 						{
-							archivedKey: "JOLLI-2-aaaaaaaa",
-							ticketId: "JOLLI-2",
+							archivedKey: "PROJ-2-aaaaaaaa",
+							ticketId: "PROJ-2",
 							title: "T2",
-							url: "https://linear.app/x/issue/JOLLI-2/test",
+							url: "https://linear.app/x/issue/PROJ-2/test",
 							referencedAt: "x",
 							sourceToolName: "mcp__linear__get_issue",
 						},
@@ -6121,13 +6192,13 @@ describe("SummaryWebviewPanel", () => {
 
 				dispatch({
 					command: "removeLinearIssue",
-					archivedKey: "JOLLI-1-aaaaaaaa",
-					ticketId: "JOLLI-1",
+					archivedKey: "PROJ-1-aaaaaaaa",
+					ticketId: "PROJ-1",
 				});
 				await flushPromises();
 
 				expect(showWarningMessage).toHaveBeenCalledWith(
-					'Remove Linear issue "JOLLI-1" from this commit?',
+					'Remove Linear issue "PROJ-1" from this commit?',
 					expect.objectContaining({ modal: true }),
 					"Remove",
 				);
@@ -6135,18 +6206,18 @@ describe("SummaryWebviewPanel", () => {
 				// the issue stays hidden from the sidebar panel after dissociate.
 				expect(mockSetLinearIssueIgnored).toHaveBeenCalledWith(
 					workspaceRoot,
-					"JOLLI-1-aaaaaaaa",
+					"PROJ-1-aaaaaaaa",
 					true,
 				);
 				expect(mockSetLinearIssueIgnored).toHaveBeenCalledWith(
 					workspaceRoot,
-					"JOLLI-1",
+					"PROJ-1",
 					true,
 				);
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({
 						linearIssues: [
-							expect.objectContaining({ archivedKey: "JOLLI-2-aaaaaaaa" }),
+							expect.objectContaining({ archivedKey: "PROJ-2-aaaaaaaa" }),
 						],
 					}),
 					workspaceRoot,
@@ -6159,10 +6230,10 @@ describe("SummaryWebviewPanel", () => {
 				const dispatch = await setupPanel({
 					linearIssues: [
 						{
-							archivedKey: "JOLLI-9-bbbbbbbb",
-							ticketId: "JOLLI-9",
+							archivedKey: "PROJ-9-bbbbbbbb",
+							ticketId: "PROJ-9",
 							title: "Only",
-							url: "https://linear.app/x/issue/JOLLI-9/test",
+							url: "https://linear.app/x/issue/PROJ-9/test",
 							referencedAt: "x",
 							sourceToolName: "mcp__linear__get_issue",
 						},
@@ -6171,8 +6242,8 @@ describe("SummaryWebviewPanel", () => {
 
 				dispatch({
 					command: "removeLinearIssue",
-					archivedKey: "JOLLI-9-bbbbbbbb",
-					ticketId: "JOLLI-9",
+					archivedKey: "PROJ-9-bbbbbbbb",
+					ticketId: "PROJ-9",
 				});
 				await flushPromises();
 
@@ -6188,10 +6259,10 @@ describe("SummaryWebviewPanel", () => {
 				const dispatch = await setupPanel({
 					linearIssues: [
 						{
-							archivedKey: "JOLLI-1-aaaaaaaa",
-							ticketId: "JOLLI-1",
+							archivedKey: "PROJ-1-aaaaaaaa",
+							ticketId: "PROJ-1",
 							title: "T",
-							url: "https://linear.app/x/issue/JOLLI-1/test",
+							url: "https://linear.app/x/issue/PROJ-1/test",
 							referencedAt: "x",
 							sourceToolName: "mcp__linear__get_issue",
 						},
@@ -6200,8 +6271,8 @@ describe("SummaryWebviewPanel", () => {
 
 				dispatch({
 					command: "removeLinearIssue",
-					archivedKey: "JOLLI-1-aaaaaaaa",
-					ticketId: "JOLLI-1",
+					archivedKey: "PROJ-1-aaaaaaaa",
+					ticketId: "PROJ-1",
 				});
 				await flushPromises();
 
@@ -6215,8 +6286,8 @@ describe("SummaryWebviewPanel", () => {
 
 				dispatch({
 					command: "removeLinearIssue",
-					archivedKey: "JOLLI-1-aaaaaaaa",
-					ticketId: "JOLLI-1",
+					archivedKey: "PROJ-1-aaaaaaaa",
+					ticketId: "PROJ-1",
 				});
 				await flushPromises();
 
@@ -6233,10 +6304,10 @@ describe("SummaryWebviewPanel", () => {
 				const dispatch = await setupPanel({
 					linearIssues: [
 						{
-							archivedKey: "JOLLI-1",
-							ticketId: "JOLLI-1",
+							archivedKey: "PROJ-1",
+							ticketId: "PROJ-1",
 							title: "T",
-							url: "https://linear.app/x/issue/JOLLI-1/test",
+							url: "https://linear.app/x/issue/PROJ-1/test",
 							referencedAt: "x",
 							sourceToolName: "mcp__linear__get_issue",
 						},
@@ -6245,8 +6316,8 @@ describe("SummaryWebviewPanel", () => {
 
 				dispatch({
 					command: "removeLinearIssue",
-					archivedKey: "JOLLI-1",
-					ticketId: "JOLLI-1",
+					archivedKey: "PROJ-1",
+					ticketId: "PROJ-1",
 				});
 				await flushPromises();
 

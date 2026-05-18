@@ -569,11 +569,11 @@ describe("SidebarWebviewProvider", () => {
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({
 			type: "branch:openLinearIssue",
-			mapKey: "JOLLI-1528",
+			mapKey: "PROJ-1528",
 		});
 		expect(exec).toHaveBeenCalledWith(
 			"jollimemory.openLinearIssue",
-			"JOLLI-1528",
+			"PROJ-1528",
 		);
 	});
 
@@ -597,11 +597,11 @@ describe("SidebarWebviewProvider", () => {
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({
 			type: "branch:openLinearIssueMarkdown",
-			mapKey: "JOLLI-1528",
+			mapKey: "PROJ-1528",
 		});
 		expect(exec).toHaveBeenCalledWith(
 			"jollimemory.openLinearIssueMarkdown",
-			"JOLLI-1528",
+			"PROJ-1528",
 		);
 	});
 
@@ -625,11 +625,11 @@ describe("SidebarWebviewProvider", () => {
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({
 			type: "branch:ignoreLinearIssue",
-			mapKey: "JOLLI-1528",
+			mapKey: "PROJ-1528",
 		});
 		expect(exec).toHaveBeenCalledWith(
 			"jollimemory.ignoreLinearIssue",
-			"JOLLI-1528",
+			"PROJ-1528",
 		);
 	});
 

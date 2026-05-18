@@ -15,6 +15,7 @@
 
 import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import * as vscode from "vscode";
 import {
@@ -28,6 +29,7 @@ import {
 } from "../../../cli/src/core/Summarizer.js";
 import {
 	getTranscriptHashes,
+	readLinearIssueFromBranch,
 	readNoteFromBranch,
 	readPlanFromBranch,
 	readTranscriptsForCommits,
@@ -2105,10 +2107,19 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
-	 * Opens the captured-at-commit markdown snapshot for a Linear issue. The
-	 * archived snapshot file lives at .jolli/jollimemory/linear-issues/<key>.md
-	 * — the same on-disk path the QueueWorker renamed it to during commit
-	 * association (`<ticketId>.md` → `<ticketId>-<shortHash>.md`).
+	 * Opens the captured-at-commit markdown snapshot for a Linear issue.
+	 *
+	 * Lookup order (matches plan/note preview's branch-then-local pattern):
+	 *   1. Local `.jolli/jollimemory/linear-issues/<key>.md` — the same
+	 *      on-disk path QueueWorker renamed to during commit association
+	 *      (`<ticketId>.md` → `<ticketId>-<shortHash>.md`).
+	 *   2. Orphan branch `linear-issues/<key>.md` — the durable copy. Falls
+	 *      back here when the local file is missing (fresh checkout, user
+	 *      cleaned .jolli, working from a different machine).
+	 *
+	 * Without the orphan fallback this handler would `showTextDocument` on a
+	 * nonexistent path → VSCode error toast → user thinks the snapshot is
+	 * lost, even though the archived content is durable on the orphan branch.
 	 */
 	private async handleOpenLinearIssueMarkdown(
 		archivedKey: string,
@@ -2121,7 +2132,29 @@ export class SummaryWebviewPanel {
 			"linear-issues",
 			`${archivedKey}.md`,
 		);
-		await vscode.window.showTextDocument(vscode.Uri.file(filePath));
+		if (existsSync(filePath)) {
+			await vscode.window.showTextDocument(vscode.Uri.file(filePath));
+			return;
+		}
+		const content = await readLinearIssueFromBranch(
+			archivedKey,
+			this.workspaceRoot,
+		);
+		if (!content) {
+			vscode.window.showErrorMessage(
+				`Linear issue snapshot "${archivedKey}" not found locally or on the orphan branch.`,
+			);
+			return;
+		}
+		// Untitled doc — we don't re-materialize the local file. Avoids
+		// silently re-creating files the user (or .jolli cleanup) chose to
+		// remove, and keeps the orphan branch as the single source of truth
+		// for archived snapshots.
+		const doc = await vscode.workspace.openTextDocument({
+			language: "markdown",
+			content,
+		});
+		await vscode.window.showTextDocument(doc);
 	}
 
 	/**
