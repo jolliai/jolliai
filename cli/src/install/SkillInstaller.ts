@@ -317,9 +317,15 @@ You have a \`RecallPayload\` with these fields:
   - \`recap?\` — 1-3 paragraphs of plain-English narrative.
   - \`topics[]\` — each with **always present**: \`title\`, **\`decisions\` (★)**;
     **may be absent**: \`trigger?\`, \`response?\`, \`todo?\`, \`filesAffected?\`,
-    \`category?\`, \`importance?\`. \`trigger\` and \`response\` may be dropped by
-    budget trimming; \`decisions\` is never dropped from a kept commit (if the
-    budget can't fit it, the whole commit is omitted from \`commits[]\`).
+    \`category?\`, \`importance?\`. Trimming rules differ by field:
+    - \`response\` is **policy-trimmed unconditionally** when the branch
+      ships more than 8 kept commits — raising \`--budget\` will not bring
+      it back. Additionally, on tight budgets it may be dropped
+      oldest-first on shorter branches.
+    - \`trigger\` is only dropped by \`--budget\` (oldest-first); raising
+      \`--budget\` can restore it.
+    - \`decisions\` is never dropped from a kept commit (if the budget
+      can't fit it, the whole commit is omitted from \`commits[]\`).
   - \`plans?\` — \`{ slug, title }[]\` refs only; \`slug\` is the **normalized
     base slug** that always resolves to an entry in payload-level \`plans\`.
   - \`notes?\` — \`{ id, title }[]\` refs only; \`id\` always resolves to an
