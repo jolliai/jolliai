@@ -310,7 +310,7 @@ export const DEFAULT_TOKEN_BUDGET = 20000;
 /**
  * Commit-count threshold above which `buildRecallPayload` automatically
  * drops `topic.response` from every kept commit. Below or equal to this,
- * full `response` survives so short branches keep their verbose narrative.
+ * full `response` survives so short branches keep their narrative detail.
  *
  * Measured: `response` is consistently the longest topic field (~500–800
  * bytes typical) while contributing the least unique signal — `decisions`
@@ -318,25 +318,10 @@ export const DEFAULT_TOKEN_BUDGET = 20000;
  * Branches past this size are being used for "remind me of the shape",
  * not "walk me through the implementation".
  *
- * Override the auto-drop with `--verbose` on the CLI (sets
- * `BuildRecallPayloadOptions.verbose = true`).
+ * No opt-out: this is a policy trim. Use `jolli view --commit <hash>` to
+ * inspect a single commit's full stored topic content when needed.
  */
-export const RECALL_COMMIT_VERBOSE_THRESHOLD = 8;
-
-/**
- * Behaviour switches for {@link buildRecallPayload} that are not part of the
- * token budget — kept separate so existing callers passing only a number
- * keep compiling.
- */
-export interface BuildRecallPayloadOptions {
-	/**
-	 * When true, skip the recall-only pre-passes that drop `"minor"` topics
-	 * and (above the commit-count threshold) drop `topic.response`. The
-	 * regular budget-driven trim loop still runs. Use for "give me everything"
-	 * recall (`jolli recall <branch> --verbose --format json`).
-	 */
-	readonly verbose?: boolean;
-}
+export const RECALL_LARGE_BRANCH_THRESHOLD = 8;
 
 /**
  * Compiles task context for a branch from Jolli Memory's orphan branch data.
@@ -525,13 +510,8 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
  * shipped without decisions — the skill template can rely on "all kept hits
  * are complete".
  */
-export function buildRecallPayload(
-	ctx: CompiledContext,
-	tokenBudget?: number,
-	options: BuildRecallPayloadOptions = {},
-): RecallPayload {
+export function buildRecallPayload(ctx: CompiledContext, tokenBudget?: number): RecallPayload {
 	const budget = tokenBudget ?? DEFAULT_TOKEN_BUDGET;
-	const verbose = options.verbose === true;
 
 	let plans: RecallPayloadPlan[] = ctx.plans.map((p) => ({ slug: p.slug, title: p.title, content: p.content }));
 	let notes: RecallPayloadNote[] = ctx.notes.map((n) => ({ id: n.id, title: n.title, content: n.content }));
@@ -551,46 +531,45 @@ export function buildRecallPayload(
 	let commits: SearchHit[] = ctx.summaries.map((s) => filterStubs(buildHit(s), resolvedPlanSlugs, resolvedNoteIds));
 	let truncated = false;
 
-	// Recall-only pre-pass: drop topics the LLM flagged as `"minor"`. These
+	// Recall-only pre-pass 1: drop topics the LLM flagged as `"minor"`. These
 	// are noise at the branch level — by definition the summarizer thought
 	// they don't carry decision-grade signal. Search Phase 2 keeps them
 	// (it ships the full SearchHit shape) so this trimming lives here, not
 	// in `buildHit`. If a commit's topics become empty after the filter,
 	// drop the whole commit — kept commits must always carry decisions
 	// per the skill-template contract. Safety: if the filter would evict
-	// every commit (pathological branch where every topic is minor),
-	// revert so downstream `commits=[]` doesn't ambiguously mean "no
-	// records found".
-	if (!verbose) {
-		const filtered: SearchHit[] = [];
-		let anyTopicDropped = false;
-		let anyCommitDropped = false;
-		for (const hit of commits) {
-			const kept = hit.topics.filter((t) => t.importance !== "minor");
-			if (kept.length === hit.topics.length) {
-				filtered.push(hit);
-				continue;
-			}
-			anyTopicDropped = true;
-			if (kept.length === 0) {
-				anyCommitDropped = true;
-				continue;
-			}
-			filtered.push({ ...hit, topics: kept });
+	// every commit (pathological branch where every topic is minor), skip
+	// the assignment so the original commits stay in place and downstream
+	// `commits=[]` doesn't ambiguously mean "no records found".
+	const filtered: SearchHit[] = [];
+	let anyTopicDropped = false;
+	let anyCommitDropped = false;
+	for (const hit of commits) {
+		const kept = hit.topics.filter((t) => t.importance !== "minor");
+		if (kept.length === hit.topics.length) {
+			filtered.push(hit);
+			continue;
 		}
-		if (filtered.length > 0) {
-			commits = filtered;
-			if (anyTopicDropped || anyCommitDropped) truncated = true;
+		anyTopicDropped = true;
+		if (kept.length === 0) {
+			anyCommitDropped = true;
+			continue;
 		}
+		filtered.push({ ...hit, topics: kept });
+	}
+	if (filtered.length > 0) {
+		commits = filtered;
+		if (anyTopicDropped || anyCommitDropped) truncated = true;
 	}
 
-	// Recall-only pre-pass: above the verbose threshold, `topic.response`
-	// drops from every kept commit. The measurement runs AFTER the minor
-	// filter so we tier by what would actually ship, not what was loaded.
-	// `trigger` and `decisions` survive — only `response` is targeted here;
-	// the existing budget-trim loop below may further drop `trigger` if
-	// it still doesn't fit.
-	if (!verbose && commits.length > RECALL_COMMIT_VERBOSE_THRESHOLD) {
+	// Recall-only pre-pass 2: above the large-branch threshold, drop
+	// `topic.response` from every kept commit. The measurement runs AFTER
+	// pre-pass 1 so we tier by what would actually ship, not what was
+	// loaded. `trigger` and `decisions` survive — only `response` is
+	// targeted here; the existing budget-trim loop below may further drop
+	// `trigger` if --budget still leaves us over-pressure.
+	const responseAlreadyStripped = commits.length > RECALL_LARGE_BRANCH_THRESHOLD;
+	if (responseAlreadyStripped) {
 		let anyDropped = false;
 		commits = commits.map((hit) => {
 			const trimmed = hit.topics.map((t) => {
@@ -621,8 +600,10 @@ export function buildRecallPayload(
 
 	const measure = (): number => estimateTokens(JSON.stringify({ ...envelope, commits, plans, notes }));
 
-	// Step 1: drop topic.response from oldest commits
-	for (let i = 0; i < commits.length && measure() > budget; i++) {
+	// Step 1: drop topic.response from oldest commits.
+	// Skip when pre-pass 2 already stripped response from every commit —
+	// the loop would otherwise spread-copy every topic for no reason.
+	for (let i = 0; !responseAlreadyStripped && i < commits.length && measure() > budget; i++) {
 		const hit = commits[i];
 		const trimmed = hit.topics.map((t) => {
 			if (t.response === undefined) return t;
