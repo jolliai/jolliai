@@ -205,6 +205,7 @@ The developer added drag-handle reordering to the article sidebar: articles can 
             outputTokens = result.outputTokens,
             apiLatencyMs = result.apiLatencyMs,
             stopReason = result.stopReason,
+            source = result.source,
         )
 
         return SummaryResult(

@@ -47,7 +47,7 @@ object SummaryPrMarkdownBuilder {
         pushPrRecapSection(lines, summary)
         pushPrE2eTestSection(lines, summary.e2eTestGuide)
         pushPrTopicsSection(lines, allTopics)
-        SummaryMarkdownBuilder.pushFooter(lines)
+        SummaryMarkdownBuilder.pushFooter(lines, summary)
 
         return lines.joinToString("\n")
     }
