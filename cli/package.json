@@ -1,6 +1,6 @@
 {
 	"name": "@jolli.ai/cli",
-	"version": "0.99.1",
+	"version": "0.99.2",
 	"description": "AI development process auto-documentation tool - generates structured commit summaries from Claude Code, Codex, Gemini, OpenCode, Cursor, and Copilot sessions",
 	"main": "./dist/Cli.js",
 	"type": "module",

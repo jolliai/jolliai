@@ -37,6 +37,11 @@ interface SeedSession {
 	id: string;
 	cwd: string;
 	updated_at: string;
+	// Optional override for the sessions.summary column. `undefined` (default)
+	// inserts SQL NULL — matches the historical fixture shape so existing tests
+	// stay unchanged. Explicit `null` also maps to NULL; any string is passed
+	// through verbatim, including the empty string.
+	summary?: string | null;
 }
 
 async function makeFixtureDb(sessions: SeedSession[]): Promise<{ dbPath: string; cleanup: () => Promise<void> }> {
@@ -46,9 +51,9 @@ async function makeFixtureDb(sessions: SeedSession[]): Promise<{ dbPath: string;
 	for (const stmt of SCHEMA_STATEMENTS) db.prepare(stmt).run();
 	const insertSql =
 		"INSERT INTO sessions (id, cwd, repository, host_type, branch, summary, created_at, updated_at) " +
-		"VALUES (?, ?, NULL, 'github', NULL, NULL, ?, ?)";
+		"VALUES (?, ?, NULL, 'github', NULL, ?, ?, ?)";
 	const insert = db.prepare(insertSql);
-	for (const s of sessions) insert.run(s.id, s.cwd, s.updated_at, s.updated_at);
+	for (const s of sessions) insert.run(s.id, s.cwd, s.summary ?? null, s.updated_at, s.updated_at);
 	db.close();
 	return { dbPath, cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
@@ -191,6 +196,32 @@ describe("scanCopilotSessions", () => {
 		const { discoverCopilotSessions } = await import("./CopilotSessionDiscoverer.js");
 		const sessions = await discoverCopilotSessions(platformPath("/p"));
 		expect(sessions.map((s) => s.sessionId)).toEqual(["a"]);
+	});
+
+	it("propagates the sessions.summary column to SessionInfo.title", async () => {
+		await withFixture([
+			{
+				id: "a",
+				cwd: platformPath("/p"),
+				updated_at: isoFromNow(),
+				summary: "怎么测试copilot integration?",
+			},
+		]);
+		const { scanCopilotSessions } = await import("./CopilotSessionDiscoverer.js");
+		const { sessions } = await scanCopilotSessions(platformPath("/p"));
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0].title).toBe("怎么测试copilot integration?");
+	});
+
+	it("leaves title undefined when summary is null or empty string", async () => {
+		await withFixture([
+			{ id: "null-summary", cwd: platformPath("/p"), updated_at: isoFromNow(1_000), summary: null },
+			{ id: "empty-summary", cwd: platformPath("/p"), updated_at: isoFromNow(2_000), summary: "" },
+		]);
+		const { scanCopilotSessions } = await import("./CopilotSessionDiscoverer.js");
+		const { sessions } = await scanCopilotSessions(platformPath("/p"));
+		expect(sessions).toHaveLength(2);
+		for (const s of sessions) expect(s.title).toBeUndefined();
 	});
 
 	it("discoverCopilotSessions returns an empty list and logs a warning when the scan fails", async () => {

@@ -353,6 +353,20 @@ export function buildSidebarCss(): string {
     line-height: 1.5;
   }
 
+  /* Partial-data banner shown above a section's rows when some upstream
+     loaders failed (e.g. one SQLite-backed source locked / schema-drifted).
+     Lower-prominence than an error toast — the list is still useful, the
+     hint just keeps the user from misreading missing rows as "truly empty". */
+  .conversations-warning {
+    margin: 4px 8px;
+    padding: 6px 8px;
+    font-size: 11px;
+    color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+    background: var(--vscode-inputValidation-warningBackground, transparent);
+    border-left: 2px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground, #cca700));
+    border-radius: 2px;
+  }
+
   .collapsible-section { display: flex; flex-direction: column; }
   .collapsible-section .section-header {
     display: flex;
@@ -607,6 +621,53 @@ export function buildSidebarCss(): string {
   }
   .tree-node.tree-node--changes:hover .inline-actions { visibility: visible; }
   .tree-node.tree-node--changes .gs-letter { margin-left: 0; }
+
+  /* CONVERSATIONS section rows: one active AI session per row. Inherits the
+     base .tree-node flex layout; the extra rules below set the per-row gap
+     and add a small badge + meta column for source / message count / time.
+     .label keeps the existing .tree-node .label ellipsis behavior. */
+  .tree-node.conversation-row {
+    gap: 8px;
+  }
+  /* Source badge — outline pill. Default to descriptionForeground for unknown
+     sources; per-source rules below override fg/bg/border with the brand hue.
+     Why outline + half-transparent fill (rgba *, 0.12): the row sits over
+     sidebar bg, hover bg, and selected bg; a solid fill would either fight
+     one of those backgrounds or need three hover overrides per source. */
+  .tree-node.conversation-row .badge {
+    font-size: 11px;
+    line-height: 16px;
+    padding: 0 6px;
+    border-radius: 4px;
+    border: 1px solid var(--vscode-descriptionForeground);
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+    flex-shrink: 0;
+    font-weight: 500;
+  }
+  /* Per-source brand hues. Chosen to be readable on both light and dark
+     VSCode themes (mid-lightness OKLCH-equivalent hex). Claude purple +
+     Cursor teal match the UI mockup; other five fill out the rainbow so
+     every transcript source has its own identity.
+
+     Selector must include '.tree-node.conversation-row .badge' so the
+     specificity (0,4,0) beats the neutral fallback above (0,3,0); a bare
+     '.transcript-source-X' rule (0,1,0) is silently overridden and the
+     badge stays descriptionForeground-gray. */
+  .tree-node.conversation-row .badge.transcript-source-claude       { color: #a78bfa; border-color: #a78bfa; background: rgba(167,139,250,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-cursor       { color: #2dd4bf; border-color: #2dd4bf; background: rgba(45,212,191,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-codex        { color: #4ade80; border-color: #4ade80; background: rgba(74,222,128,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-gemini       { color: #60a5fa; border-color: #60a5fa; background: rgba(96,165,250,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-opencode     { color: #fb923c; border-color: #fb923c; background: rgba(251,146,60,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-copilot      { color: #94a3b8; border-color: #94a3b8; background: rgba(148,163,184,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-copilot-chat { color: #fbbf24; border-color: #fbbf24; background: rgba(251,191,36,0.12); }
+
+  .tree-node.conversation-row .count,
+  .tree-node.conversation-row .time {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    flex-shrink: 0;
+  }
 
   .memory-row {
     padding: 6px 12px;

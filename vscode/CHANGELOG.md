@@ -2,6 +2,10 @@
 
 <!-- Last synced commit: d53654bc | 2026-05-13 -->
 
+## 0.99.2
+
+- **Active AI Conversations panel** — a new **CONVERSATIONS** section in the Branch tab lists your recent AI coding sessions across every supported tool, with the title, agent, and message count at a glance. Click a row to open the full transcript and edit or delete messages — the next commit's memory is generated from your curated version, not the raw conversation.
+
 ## 0.99.1
 
 - Bug fixes

@@ -24,7 +24,7 @@
  * OrphanBranchStorage).
  */
 
-import { createLogger } from "../Logger.js";
+import { createLogger, errMsg } from "../Logger.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { getIndexEntryMap } from "./SummaryStore.js";
 
@@ -59,7 +59,7 @@ export async function cleanupBranchStaleChildMarkdown(
 				"deleteVisibleMarkdown failed for %s on %s: %s",
 				entry.commitHash.substring(0, 8),
 				branch,
-				err instanceof Error ? err.message : String(err),
+				errMsg(err),
 			);
 		}
 	}
@@ -89,7 +89,7 @@ export async function cleanupAllBranchesStaleChildMarkdown(
 				"deleteVisibleMarkdown failed for %s on %s: %s",
 				entry.commitHash.substring(0, 8),
 				entry.branch,
-				err instanceof Error ? err.message : String(err),
+				errMsg(err),
 			);
 		}
 	}

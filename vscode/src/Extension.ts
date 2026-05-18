@@ -64,6 +64,7 @@ import type {
 } from "./providers/PlansTreeProvider.js";
 import { PlansTreeProvider } from "./providers/PlansTreeProvider.js";
 import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
+import { ActiveSessionsProvider } from "./services/ActiveSessionsProvider.js";
 import { AuthService } from "./services/AuthService.js";
 import { KbFoldersService } from "./services/KbFoldersService.js";
 import {
@@ -726,6 +727,12 @@ export function activate(context: vscode.ExtensionContext): void {
 			filesStore.applyCheckboxBatch([[filePath, selected]]),
 		applyCommitCheckbox: (hash, selected) =>
 			commitsStore.onCheckboxToggle(hash, selected),
+		// Active Conversations source for the Branch tab. Reads workspaceCwd
+		// lazily so a future workspace-folder change doesn't strand the
+		// provider on a stale path.
+		activeSessionsProvider: new ActiveSessionsProvider({
+			getWorkspaceCwd: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+		}),
 		initialStateReady,
 	});
 	context.subscriptions.push(

@@ -6,7 +6,7 @@
  * are logged as warnings but never block the primary write path.
  */
 
-import { createLogger } from "../Logger.js";
+import { createLogger, errMsg } from "../Logger.js";
 import type { FileWrite, SummaryIndexEntry } from "../Types.js";
 import type { StorageProvider } from "./StorageProvider.js";
 
@@ -46,7 +46,7 @@ export class DualWriteStorage implements StorageProvider {
 				"Shadow deleteVisibleMarkdown failed (folder storage) for %s/%s: %s",
 				entry.branch,
 				hash8,
-				err instanceof Error ? err.message : String(err),
+				errMsg(err),
 			);
 			this.shadow.markDirty?.(`deleteVisibleMarkdown ${entry.branch}/${hash8}`);
 		}
@@ -62,7 +62,7 @@ export class DualWriteStorage implements StorageProvider {
 				"Shadow regenerateVisibleMarkdown failed (folder storage) for %s/%s: %s",
 				entry.branch,
 				hash8,
-				err instanceof Error ? err.message : String(err),
+				errMsg(err),
 			);
 			this.shadow.markDirty?.(`regenerateVisibleMarkdown ${entry.branch}/${hash8}`);
 			return false;

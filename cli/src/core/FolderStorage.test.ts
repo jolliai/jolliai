@@ -464,6 +464,83 @@ describe("FolderStorage", () => {
 			expect(metadataManager.findById("cafe1234cafe1234")).toBeUndefined();
 		});
 
+		// Coverage: manifestEntry truthy + file already gone — drops the
+		// orphaned manifest entry (line 139 truthy arm).
+		it("drops the manifest entry when the visible md is already gone", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "f00d0000f00d0000",
+				commitMessage: "Already gone",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/f00d0000f00d0000.json", content: summaryJson }], "seed");
+			// Manually delete the visible MD so the next call hits the
+			// `!existsSync + manifestEntry` early-return branch.
+			const visiblePath = join(rootPath, "main", "already-gone-f00d0000.md");
+			require("node:fs").unlinkSync(visiblePath);
+			expect(metadataManager.findById("f00d0000f00d0000")).toBeDefined();
+
+			await storage.deleteVisibleMarkdown({
+				commitHash: "f00d0000f00d0000",
+				commitMessage: "Already gone",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+			// Manifest entry was cleaned up.
+			expect(metadataManager.findById("f00d0000f00d0000")).toBeUndefined();
+		});
+
+		// Coverage: manifestEntry exists but its `fingerprint` field is
+		// undefined — proceeds with the unlinkSync without the
+		// fingerprint-mismatch guard (line 143 falsy arm).
+		it("deletes without fingerprint guard when the manifest entry lacks a fingerprint", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "1234567812345678",
+				commitMessage: "Legacy",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/1234567812345678.json", content: summaryJson }], "seed");
+			const visiblePath = join(rootPath, "main", "legacy-12345678.md");
+			expect(existsSync(visiblePath)).toBe(true);
+			// Clobber the manifest entry's fingerprint to simulate a legacy
+			// entry that predates fingerprint tracking.
+			const entry = metadataManager.findById("1234567812345678");
+			if (!entry) throw new Error("seeded entry vanished");
+			const { fingerprint: _omit, ...withoutFp } = entry;
+			metadataManager.updateManifest(withoutFp);
+
+			await storage.deleteVisibleMarkdown({
+				commitHash: "1234567812345678",
+				commitMessage: "Legacy",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+			expect(existsSync(visiblePath)).toBe(false);
+		});
+
+		// Coverage: visible MD on disk with NO manifest entry (e.g. a stale
+		// file from a previous version) — unlinkSync runs but the
+		// removeFromManifest is skipped (line 164 falsy arm).
+		it("deletes the file even when there is no manifest entry", async () => {
+			require("node:fs").mkdirSync(join(rootPath, "main"), { recursive: true });
+			const visiblePath = join(rootPath, "main", "no-manifest-deadbeef.md");
+			require("node:fs").writeFileSync(visiblePath, "# Orphan", "utf-8");
+			expect(metadataManager.findById("deadbeefdeadbeef")).toBeUndefined();
+
+			await storage.deleteVisibleMarkdown({
+				commitHash: "deadbeefdeadbeef",
+				commitMessage: "no manifest",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+			expect(existsSync(visiblePath)).toBe(false);
+		});
+
 		it("leaves the <branch>/ directory in place after the last md is removed", async () => {
 			const summaryJson = makeSummaryJson({
 				commitHash: "aaaa11112222bbbb",
@@ -587,6 +664,53 @@ describe("FolderStorage", () => {
 
 			// .md regenerated, but manifest title preserved.
 			expect(mm.findById("feedbabe12345678")?.title).toBe("Hand-edited title");
+		});
+	});
+
+	describe("regenerateVisibleMarkdown title fallback", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		// Coverage: when no manifest entry yet exists for the commit (e.g.
+		// a fresh recovery against an orphan-branch summary), the manifest
+		// title falls back to the summary's commit message (line 243 falsy
+		// arm of `existing?.title ?? summary.commitMessage`).
+		it("falls back to summary.commitMessage when manifest has no prior entry", async () => {
+			const commitHash = "ad0bead0bead0bea"; // 16-char placeholder
+			// Write the hidden JSON directly without going through writeFiles
+			// so no manifest entry gets created up-front. regenerateVisibleMarkdown
+			// must still produce a manifest row keyed on summary.commitMessage.
+			await storage.writeFiles(
+				[
+					{
+						path: `summaries/${commitHash}.json`,
+						content: makeSummaryJson({
+							commitHash,
+							commitMessage: "Fresh recovery commit",
+							branch: "main",
+						}),
+					},
+				],
+				"seed hidden only",
+			);
+			// Strip the manifest entry that writeFiles auto-created so the
+			// regenerate call sees `existing === undefined`.
+			metadataManager.removeFromManifest(commitHash);
+			require("node:fs").unlinkSync(join(rootPath, "main", "fresh-recovery-commit-ad0bead0.md"));
+			expect(metadataManager.findById(commitHash)).toBeUndefined();
+
+			const wrote = await storage.regenerateVisibleMarkdown({
+				commitHash,
+				commitMessage: "Fresh recovery commit",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+			expect(wrote).toBe(true);
+			// Manifest title now mirrors the summary commit message.
+			expect(metadataManager.findById(commitHash)?.title).toBe("Fresh recovery commit");
 		});
 	});
 

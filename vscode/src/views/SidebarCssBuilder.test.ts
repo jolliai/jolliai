@@ -359,4 +359,69 @@ describe("onboarding panel styles", () => {
 		expect(css).toContain(".dropdown-empty");
 		expect(css).toContain("var(--vscode-input-background)");
 	});
+
+	describe("CONVERSATIONS source badge", () => {
+		it("declares an outline-pill .badge on conversation rows", () => {
+			// The badge column on each conversation row uses an outline pill
+			// (border + same-hue text + half-transparent fill) instead of the
+			// solid --vscode-badge-background chip, so per-source brand colors
+			// can override fg/bg/border without fighting a solid backdrop.
+			const css = buildSidebarCss();
+			expect(css).toMatch(
+				/\.tree-node\.conversation-row\s+\.badge\s*\{[^}]*border:\s*1px solid/,
+			);
+			expect(css).toMatch(
+				/\.tree-node\.conversation-row\s+\.badge\s*\{[^}]*background:\s*transparent/,
+			);
+		});
+
+		it("declares per-source brand colors for every TranscriptSource", () => {
+			// Each TranscriptSource value gets its own .transcript-source-* rule
+			// with a matching color + border-color + half-transparent background.
+			// If a new TranscriptSource lands in cli/src/Types.ts, this test must
+			// be updated alongside it so the sidebar never falls back to the
+			// neutral "unknown" outline silently.
+			const css = buildSidebarCss();
+			const sources = [
+				"claude",
+				"cursor",
+				"codex",
+				"gemini",
+				"opencode",
+				"copilot",
+				"copilot-chat",
+			];
+			for (const source of sources) {
+				const re = new RegExp(
+					`\\.transcript-source-${source}\\b[^{]*\\{[^}]*color:\\s*#[0-9a-f]{3,6}[^}]*border-color:`,
+					"i",
+				);
+				expect(css).toMatch(re);
+			}
+		});
+
+		it("brand-color rules out-specify the neutral .badge fallback", () => {
+			// Regression guard: the neutral '.tree-node.conversation-row .badge'
+			// rule has specificity 0,3,0. A bare '.transcript-source-X' rule
+			// (0,1,0) loses the cascade and the badge stays gray. Every brand
+			// rule must include the conversation-row + badge prefix so it
+			// reaches 0,4,0 and actually paints.
+			const css = buildSidebarCss();
+			const sources = [
+				"claude",
+				"cursor",
+				"codex",
+				"gemini",
+				"opencode",
+				"copilot",
+				"copilot-chat",
+			];
+			for (const source of sources) {
+				const re = new RegExp(
+					`\\.tree-node\\.conversation-row\\s+\\.badge\\.transcript-source-${source}\\b`,
+				);
+				expect(css).toMatch(re);
+			}
+		});
+	});
 });

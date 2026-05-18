@@ -278,6 +278,49 @@ describe("OpenCodeSessionDiscoverer", () => {
 			expect(sessions).toHaveLength(0);
 		});
 
+		it("propagates the native session title from the DB into SessionInfo.title", async () => {
+			const now = Date.now();
+			const dbDir = join(fakeHome, ".local", "share", "opencode");
+			await createOpenCodeDb(dbDir, [
+				{
+					id: "titled",
+					directory: projectDir,
+					title: "Refactor session storage layer",
+					time_created: now - 1000,
+					time_updated: now - 100,
+				},
+			]);
+
+			const result = await scanOpenCodeSessions(projectDir);
+
+			expect(result.sessions).toHaveLength(1);
+			expect(result.sessions[0].title).toBe("Refactor session storage layer");
+		});
+
+		// Coverage: `title` is propagated only when the DB cell is a
+		// non-blank string. An empty / whitespace-only / non-string title
+		// must collapse to `undefined` so the resolver's fallback cascade
+		// runs instead of surfacing a blank label.
+		it.each([
+			["empty string", ""],
+			["whitespace only", "   \t"],
+		])("collapses to undefined title when row.title is %s", async (_label, raw) => {
+			const now = Date.now();
+			const dbDir = join(fakeHome, ".local", "share", "opencode");
+			await createOpenCodeDb(dbDir, [
+				{
+					id: "blank-title",
+					directory: projectDir,
+					title: raw,
+					time_created: now - 1000,
+					time_updated: now - 100,
+				},
+			]);
+			const result = await scanOpenCodeSessions(projectDir);
+			expect(result.sessions).toHaveLength(1);
+			expect(result.sessions[0].title).toBeUndefined();
+		});
+
 		it("converts time_updated from unix ms to ISO 8601", async () => {
 			const now = Date.now();
 			const dbDir = join(fakeHome, ".local", "share", "opencode");

@@ -269,6 +269,24 @@ describe("MigrationEngine", () => {
 			await createEngine().runMigration();
 			expect(await createEngine().validateMigration()).toBe(true);
 		});
+
+		// Coverage: the runMigration() outer try/catch around runStaleChildCleanup
+		// (the v3 leaf-cleanup recovery step). Migration must still complete
+		// even if the cleanup pass blows up — the partial-recovery path is
+		// guarded by its own `staleChildCleanup.completedAt` gate, so it's
+		// fine to log-and-continue here.
+		it("logs and continues when runStaleChildCleanup throws", async () => {
+			seedOrphan(orphan, [{ hash: "aaa11111aaa11111" }]);
+			const engine = createEngine();
+			// Force the stale-child cleanup pass to throw so the catch block
+			// in runMigration fires (errMsg + log.warn). Migration overall
+			// must still complete.
+			(engine as unknown as { runStaleChildCleanup: () => Promise<unknown> }).runStaleChildCleanup = async () => {
+				throw new Error("synthetic cleanup failure");
+			};
+			const state = await engine.runMigration();
+			expect(state.status).toBe("completed");
+		});
 	});
 
 	describe("plan-progress migration", () => {
@@ -828,6 +846,37 @@ describe("MigrationEngine", () => {
 			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
 			const state = await engine.runStaleChildCleanup();
 			expect(state.staleChildCleanup?.completedAt).toBe("2026-05-01T00:00:00Z");
+		});
+
+		// Coverage: the `lastMigratedHash` field on existing state must be
+		// preserved across runStaleChildCleanup. Pins the truthy arm of the
+		// conditional spread that copies it forward.
+		it("preserves existing lastMigratedHash on the persisted state", async () => {
+			const fs2 = makeFolderStorage();
+			await seedHoistChain(fs2);
+			const mm = makeMetadataManager(kbRoot);
+			mm.saveMigrationState({
+				status: "completed",
+				totalEntries: 2,
+				migratedEntries: 2,
+				lastMigratedHash: "aaa11111aaa11111",
+			});
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			await engine.runStaleChildCleanup();
+			expect(mm.readMigrationState()?.lastMigratedHash).toBe("aaa11111aaa11111");
+		});
+
+		// Coverage: regenerateMissingHeadMarkdown's JSON-parse catch fires
+		// when index.json is unparseable — withholds the idempotency stamp
+		// and reports a failure count.
+		it("returns failed > 0 when folder index.json contains invalid JSON", async () => {
+			const fs2 = makeFolderStorage();
+			await fs2.writeFiles([{ path: "index.json", content: "{not-valid-json" }], "seed bad index");
+			const mm = makeMetadataManager(kbRoot);
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			const state = await engine.runStaleChildCleanup();
+			// Gate withheld so the next invocation retries.
+			expect(state.staleChildCleanup?.completedAt).toBeFalsy();
 		});
 
 		it("does NOT short-circuit on the legacy 0.99.2 leafCleanup.completedAt — that pass was inverted and must be re-done", async () => {

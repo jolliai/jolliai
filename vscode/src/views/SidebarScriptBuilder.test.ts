@@ -1526,4 +1526,39 @@ describe("SidebarScriptBuilder", () => {
 			);
 		});
 	});
+
+	// ── Active Conversations partial-data hint ────────────────────────────
+	// `branch:conversationsData` now carries a `failedSources` array. When
+	// non-empty, the Branch tab's Active Conversations section must render
+	// a small banner above the rows so the user understands the list is
+	// incomplete rather than truly empty.
+	//
+	// NOTE: this whole file uses string assertions on the generated script
+	// rather than executing it in a DOM (jsdom). The checks below probe
+	// specific control-flow tokens (the `.length` guard, the className,
+	// and the message-handler field assignment) so that a regression that
+	// drops the guard or the banner element will trip these tests, not
+	// just a regression that renames the variable. Promoting this file to
+	// jsdom-backed behavior testing is a separate follow-up.
+	describe("failedSources partial-data warning", () => {
+		it("stores failedSources from the incoming message onto branchData so the renderer can read it", () => {
+			const js = buildSidebarScript();
+			// The branch:conversationsData handler must assign the array
+			// from the message — assignment shape, not just word presence.
+			expect(js).toMatch(
+				/conversationsFailedSources\s*=\s*[^;]*msg\.failedSources/,
+			);
+		});
+
+		it("renders the warning element only when failedSources is non-empty", () => {
+			const js = buildSidebarScript();
+			// The renderer must (a) read the array from branchData, (b)
+			// guard on length > 0 before producing the warning string, and
+			// (c) emit the className the CSS layer styles. All three
+			// together prove the banner is conditional, not always-rendered.
+			expect(js).toContain("branchData.conversationsFailedSources");
+			expect(js).toMatch(/\.length\s*>\s*0/);
+			expect(js).toContain("'conversations-warning'");
+		});
+	});
 });

@@ -35,7 +35,7 @@
 
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
-import { createLogger } from "../Logger.js";
+import { createLogger, errMsg, isEnoent } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
 import { getCursorGlobalDbPath } from "./CursorDetector.js";
 import { classifyScanError, type SqliteScanError, withSqliteDb } from "./SqliteHelpers.js";
@@ -152,12 +152,16 @@ export async function scanCursorSessions(projectDir: string): Promise<CursorScan
 				}
 				seenIds.add(composerId);
 
+				const nameRaw = typeof parsed.name === "string" ? parsed.name.trim() : "";
+				const title = nameRaw.length > 0 ? nameRaw : undefined;
+
 				out.push({
 					sessionId: composerId,
 					// Synthetic path: global DB path + composer discriminator (matches OpenCode pattern)
 					transcriptPath: `${globalDbPath}#${composerId}`,
 					updatedAt: new Date(lastUpdatedAt).toISOString(),
 					source: "cursor",
+					title,
 				});
 			}
 		});
@@ -209,7 +213,15 @@ async function readCursorAnchorComposerIds(wsHash: string): Promise<ReadonlyArra
 
 	try {
 		await stat(wsDbPath);
-	} catch {
+	} catch (err) {
+		// Genuine absence (ENOENT) is the common case — workspace was opened
+		// outside Cursor or storage was pruned. Anything else (EACCES from a
+		// sandboxed user-data dir, EIO, etc.) is a real environmental
+		// problem the user should hear about, not a "not found" mis-label.
+		if (!isEnoent(err)) {
+			log.warn("Cursor workspace DB stat failed at %s: %s", wsDbPath, errMsg(err));
+			return [];
+		}
 		log.debug("Cursor workspace DB not found at %s — skipping anchor extraction", wsDbPath);
 		return [];
 	}
@@ -244,7 +256,7 @@ async function readCursorAnchorComposerIds(wsHash: string): Promise<ReadonlyArra
 			return Array.from(union);
 		});
 	} catch (error: unknown) {
-		log.warn("Failed to read Cursor workspace anchor IDs from %s: %s", wsDbPath, (error as Error).message);
+		log.warn("Failed to read Cursor workspace anchor IDs from %s: %s", wsDbPath, errMsg(error));
 		return [];
 	}
 }
