@@ -423,9 +423,12 @@ top-level \`plans\` / \`notes\` array by its \`slug\` (plans) or \`id\` (notes):
 
 - Empty \`commits\`: tell the user no records were found; suggest running
   \`jolli enable\` if they expected records.
-- \`truncated: true\`: budget enforcement dropped fields or commits. Mention
-  it with a one-liner if the user asks for deeper detail; otherwise stay
-  silent.
+- \`truncated: true\`: policy trims or budget enforcement dropped fields
+  or commits. Policy trims drop \`importance: "minor"\` topics (and any
+  commit whose every topic is minor) and drop \`topic.response\` when the
+  branch ships more than 8 commits; budget trims drop oldest-first
+  \`response\` / \`trigger\` / plan / note content. Mention it with a
+  one-liner if the user asks for deeper detail; otherwise stay silent.
 
 ### type: "catalog" — branch lookup needed
 

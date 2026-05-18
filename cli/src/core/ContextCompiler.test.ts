@@ -1425,9 +1425,9 @@ describe("buildRecallPayload", () => {
 		expect(tight.commitCount).toBe(1);
 	});
 
-	it("uses default DEFAULT_TOKEN_BUDGET (50K) when no budget is passed", () => {
+	it("uses default DEFAULT_TOKEN_BUDGET (20K) when no budget is passed", () => {
 		const payload = buildRecallPayload(makeCtx());
-		// Default 50K easily fits a 1-commit fixture; nothing is truncated.
+		// Default 20K easily fits a 1-commit fixture; nothing is truncated.
 		expect(payload.truncated).toBeUndefined();
 		expect(payload.commits).toHaveLength(1);
 	});
@@ -1560,6 +1560,224 @@ describe("buildRecallPayload", () => {
 		expect(payload.totalInsertions).toBe(312);
 		expect(payload.totalDeletions).toBe(89);
 		expect(payload.period).toEqual({ start: "2026-04-10", end: "2026-04-15" });
+	});
+
+	it('drops topics with importance === "minor" from the payload', () => {
+		const summary = makeSummary({
+			topics: [
+				{
+					title: "Major work",
+					trigger: "t1",
+					response: "r1",
+					decisions: "d1",
+					importance: "major",
+				},
+				{
+					title: "Minor tweak",
+					trigger: "t2",
+					response: "r2",
+					decisions: "d2",
+					importance: "minor",
+				},
+			],
+		});
+		const payload = buildRecallPayload(makeCtx({ summaries: [summary] }), 100_000);
+		expect(payload.commits).toHaveLength(1);
+		expect(payload.commits[0].topics).toHaveLength(1);
+		expect(payload.commits[0].topics[0].title).toBe("Major work");
+		expect(payload.truncated).toBe(true);
+	});
+
+	it("drops the whole commit when every topic on it is minor", () => {
+		const major = makeSummary({
+			commitHash: "aaaaaaaa00000000000000000000000000000001",
+			topics: [
+				{
+					title: "Real work",
+					trigger: "t",
+					response: "r",
+					decisions: "d",
+					importance: "major",
+				},
+			],
+		});
+		const allMinor = makeSummary({
+			commitHash: "bbbbbbbb00000000000000000000000000000002",
+			topics: [
+				{
+					title: "Nit 1",
+					trigger: "t",
+					response: "r",
+					decisions: "d",
+					importance: "minor",
+				},
+				{
+					title: "Nit 2",
+					trigger: "t",
+					response: "r",
+					decisions: "d",
+					importance: "minor",
+				},
+			],
+		});
+		const payload = buildRecallPayload(makeCtx({ summaries: [major, allMinor], commitCount: 2 }), 100_000);
+		expect(payload.commits).toHaveLength(1);
+		expect(payload.commits[0].fullHash).toBe(major.commitHash);
+		expect(payload.truncated).toBe(true);
+		// Envelope commitCount reflects what was loaded (still 2), not what was kept (1).
+		expect(payload.commitCount).toBe(2);
+	});
+
+	it("keeps all topics when filtering minors would leave commits[] empty (pathological branch)", () => {
+		const onlyMinor = makeSummary({
+			topics: [
+				{
+					title: "Only nit",
+					trigger: "t",
+					response: "r",
+					decisions: "d",
+					importance: "minor",
+				},
+			],
+		});
+		const payload = buildRecallPayload(makeCtx({ summaries: [onlyMinor] }), 100_000);
+		// Filter would have evicted everything; safety guard keeps the topic so
+		// the downstream "commits=[] means no records" invariant is preserved.
+		expect(payload.commits).toHaveLength(1);
+		expect(payload.commits[0].topics).toHaveLength(1);
+		expect(payload.truncated).toBeUndefined();
+	});
+
+	it("does not drop minor topics when called with verbose: true", () => {
+		const summary = makeSummary({
+			topics: [
+				{
+					title: "Major",
+					trigger: "t",
+					response: "r",
+					decisions: "d",
+					importance: "major",
+				},
+				{
+					title: "Minor",
+					trigger: "t",
+					response: "r",
+					decisions: "d",
+					importance: "minor",
+				},
+			],
+		});
+		const payload = buildRecallPayload(makeCtx({ summaries: [summary] }), 100_000, { verbose: true });
+		expect(payload.commits[0].topics).toHaveLength(2);
+		expect(payload.truncated).toBeUndefined();
+	});
+
+	it("keeps topic.response for branches with at most 8 commits", () => {
+		const summaries = Array.from({ length: 8 }, (_, i) =>
+			makeSummary({
+				commitHash: `cccccccc00000000000000000000000000000${String(i).padStart(3, "0")}`.slice(0, 40),
+				topics: [
+					{
+						title: `T${i}`,
+						trigger: `trig-${i}`,
+						response: `resp-${i}`,
+						decisions: `dec-${i}`,
+						importance: "major",
+					},
+				],
+			}),
+		);
+		const payload = buildRecallPayload(makeCtx({ summaries, commitCount: 8 }), 100_000);
+		expect(payload.commits).toHaveLength(8);
+		expect(payload.commits.every((c) => c.topics[0].response !== undefined)).toBe(true);
+		expect(payload.truncated).toBeUndefined();
+	});
+
+	it("drops topic.response from every commit when the branch has more than 8 commits", () => {
+		const summaries = Array.from({ length: 9 }, (_, i) =>
+			makeSummary({
+				commitHash: `dddddddd00000000000000000000000000000${String(i).padStart(3, "0")}`.slice(0, 40),
+				topics: [
+					{
+						title: `T${i}`,
+						trigger: `trig-${i}`,
+						response: `resp-${i}`,
+						decisions: `dec-${i}`,
+						importance: "major",
+					},
+				],
+			}),
+		);
+		const payload = buildRecallPayload(makeCtx({ summaries, commitCount: 9 }), 100_000);
+		expect(payload.commits).toHaveLength(9);
+		expect(payload.commits.every((c) => c.topics[0].response === undefined)).toBe(true);
+		// trigger and decisions both survive — only response is targeted at this tier.
+		expect(payload.commits[0].topics[0].trigger).toBe("trig-0");
+		expect(payload.commits[0].topics[0].decisions).toBe("dec-0");
+		expect(payload.truncated).toBe(true);
+	});
+
+	it("keeps topic.response on >8 commits when called with verbose: true", () => {
+		const summaries = Array.from({ length: 12 }, (_, i) =>
+			makeSummary({
+				commitHash: `eeeeeeee00000000000000000000000000000${String(i).padStart(3, "0")}`.slice(0, 40),
+				topics: [
+					{
+						title: `T${i}`,
+						trigger: `trig-${i}`,
+						response: `resp-${i}`,
+						decisions: `dec-${i}`,
+						importance: "major",
+					},
+				],
+			}),
+		);
+		const payload = buildRecallPayload(makeCtx({ summaries, commitCount: 12 }), 100_000, { verbose: true });
+		expect(payload.commits.every((c) => c.topics[0].response !== undefined)).toBe(true);
+		expect(payload.truncated).toBeUndefined();
+	});
+
+	it("applies the >8-commit response-drop tier after minor-topic filtering, not before", () => {
+		// Build 10 commits but 3 of them are all-minor → after minor filter we have 7 commits.
+		// 7 ≤ 8, so the tier MUST NOT fire even though the raw count was >8.
+		const majorCommits = Array.from({ length: 7 }, (_, i) =>
+			makeSummary({
+				commitHash: `ffffffff00000000000000000000000000000${String(i).padStart(3, "0")}`.slice(0, 40),
+				topics: [
+					{
+						title: `T${i}`,
+						trigger: "t",
+						response: `resp-${i}`,
+						decisions: "d",
+						importance: "major",
+					},
+				],
+			}),
+		);
+		const minorOnlyCommits = Array.from({ length: 3 }, (_, i) =>
+			makeSummary({
+				commitHash: `99999999000000000000000000000000000${String(i).padStart(4, "0")}`.slice(0, 40),
+				topics: [
+					{
+						title: `M${i}`,
+						trigger: "t",
+						response: "r",
+						decisions: "d",
+						importance: "minor",
+					},
+				],
+			}),
+		);
+		const payload = buildRecallPayload(
+			makeCtx({
+				summaries: [...majorCommits, ...minorOnlyCommits],
+				commitCount: 10,
+			}),
+			100_000,
+		);
+		// 7 commits survived the minor filter; that's ≤8, so response stays.
+		expect(payload.commits).toHaveLength(7);
+		expect(payload.commits.every((c) => c.topics[0].response !== undefined)).toBe(true);
 	});
 });
 
