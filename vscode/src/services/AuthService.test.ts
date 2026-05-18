@@ -688,23 +688,54 @@ describe("AuthService", () => {
 			expect(first).not.toBe(second);
 		});
 
-		it("should clear pendingState when openExternal returns false (covers leak-on-launch-failure path)", async () => {
-			// Sets pendingState, then openExternal fails → state must be
-			// cleared so it doesn't validate a future code callback.
+		it("should preserve pendingState when openExternal returns false (Copy path completes via paste-in-browser)", async () => {
+			// `openExternal` resolves `false` when the user picks either "Copy"
+			// or "Cancel" in VSCode's external-URI consent dialog. The API
+			// doesn't distinguish them, but the Copy flow needs the nonce
+			// preserved — the user is about to paste the URL into a browser
+			// and finish sign-in normally. A captured nonce from the URL must
+			// therefore validate successfully on the subsequent callback.
 			openExternal.mockResolvedValueOnce(false);
 			await service.openSignInPage();
 
-			// A subsequent code callback would fail with "state mismatch" even
-			// if it carries the nonce from the failed attempt's URL — because
-			// pendingState is null again.
-			const failedUrl = uriParse.mock.calls[0]?.[0] ?? "";
-			const failedState = new URL(failedUrl).searchParams.get("state") ?? "";
+			const url = uriParse.mock.calls[0]?.[0] ?? "";
+			const state = new URL(url).searchParams.get("state") ?? "";
 			const result = await service.handleAuthCallback(
-				makeUri("/auth-callback", `code=stale&state=${failedState}`) as never,
+				makeUri("/auth-callback", `code=abc123&state=${state}`) as never,
 			);
-			expect(result.success).toBe(false);
-			if (!result.success) {
-				expect(result.error).toContain("state mismatch");
+
+			expect(result).toEqual({ success: true });
+			expect(exchangeCliCode).toHaveBeenCalledWith(
+				"https://app.jolli.ai",
+				"abc123",
+			);
+		});
+
+		it("should expire pendingState after the TTL when no callback arrives (Cancel path leftover)", async () => {
+			// The Cancel branch of the consent dialog can't be distinguished
+			// from Copy at the API surface, so we keep the nonce alive for
+			// PENDING_STATE_TTL_MS (5 min) and then drop it. After expiry,
+			// a callback carrying the same state must be rejected.
+			vi.useFakeTimers();
+			try {
+				openExternal.mockResolvedValueOnce(false);
+				await service.openSignInPage();
+
+				const url = uriParse.mock.calls[0]?.[0] ?? "";
+				const state = new URL(url).searchParams.get("state") ?? "";
+
+				// Advance just past the 5-minute TTL.
+				vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+
+				const result = await service.handleAuthCallback(
+					makeUri("/auth-callback", `code=late&state=${state}`) as never,
+				);
+				expect(result.success).toBe(false);
+				if (!result.success) {
+					expect(result.error).toContain("state mismatch");
+				}
+			} finally {
+				vi.useRealTimers();
 			}
 		});
 
@@ -716,6 +747,54 @@ describe("AuthService", () => {
 			const failedState = new URL(failedUrl).searchParams.get("state") ?? "";
 			const result = await service.handleAuthCallback(
 				makeUri("/auth-callback", `code=stale&state=${failedState}`) as never,
+			);
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("state mismatch");
+			}
+		});
+
+		it("should cancel a stale TTL timer when a fresh sign-in is started", async () => {
+			// First attempt: Copy/Cancel path arms a 5-min TTL timer for nonce A.
+			// Second attempt: a successful launch arms a fresh nonce B. The
+			// previous timer must be cancelled — otherwise it would fire 5 min
+			// later and wipe nonce B mid-flight, breaking the second sign-in.
+			vi.useFakeTimers();
+			try {
+				openExternal.mockResolvedValueOnce(false); // attempt 1: Copy/Cancel
+				await service.openSignInPage();
+				openExternal.mockResolvedValueOnce(true); // attempt 2: Open
+				await service.openSignInPage();
+
+				// Advance past attempt 1's TTL. If its timer wasn't cancelled,
+				// it would null out the freshly-committed nonce B here.
+				vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+
+				const secondUrl = uriParse.mock.calls[1]?.[0] ?? "";
+				const secondState = new URL(secondUrl).searchParams.get("state") ?? "";
+				const result = await service.handleAuthCallback(
+					makeUri("/auth-callback", `code=abc&state=${secondState}`) as never,
+				);
+				expect(result).toEqual({ success: true });
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("should drop in-flight pendingState on signOut", async () => {
+			// signOut is meant to clear *all* auth state. A late callback from
+			// a sign-in attempt that started before sign-out must not retroactively
+			// complete sign-in against the cleared credentials.
+			openExternal.mockResolvedValueOnce(false);
+			await service.openSignInPage();
+
+			const url = uriParse.mock.calls[0]?.[0] ?? "";
+			const state = new URL(url).searchParams.get("state") ?? "";
+
+			await service.signOut();
+
+			const result = await service.handleAuthCallback(
+				makeUri("/auth-callback", `code=abc&state=${state}`) as never,
 			);
 			expect(result.success).toBe(false);
 			if (!result.success) {
@@ -828,14 +907,18 @@ describe("AuthService", () => {
 			expect(parsed).not.toContain("device_name");
 		});
 
-		it("should show an error message when openExternal returns false", async () => {
+		it("should NOT show an error message when openExternal returns false (Copy path is a legitimate user choice, not a failure)", async () => {
+			// Previously the `!opened` branch surfaced "Couldn't launch the
+			// browser…" — but that fires under the Copy path too, where the
+			// user *intends* to complete sign-in by pasting the URL. Showing
+			// an error there mis-signals failure and (paired with the old
+			// pendingState reset) made the subsequent callback fail with
+			// "state mismatch". The branch is now a silent log only.
 			openExternal.mockResolvedValueOnce(false);
 
 			await service.openSignInPage();
 
-			expect(showErrorMessage).toHaveBeenCalledWith(
-				expect.stringContaining("Couldn't launch the browser"),
-			);
+			expect(showErrorMessage).not.toHaveBeenCalled();
 		});
 
 		it("should show an error message when openExternal throws", async () => {

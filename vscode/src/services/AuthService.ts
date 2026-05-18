@@ -29,6 +29,18 @@ import { EXTENSION_ID, resolveUriScheme } from "../util/UriSchemeResolver.js";
 const AUTH_CALLBACK_PATH = "/auth-callback";
 
 /**
+ * How long an in-flight sign-in nonce stays valid when {@link vscode.env.openExternal}
+ * resolves `false`. That return value is ambiguous — it means the user picked
+ * either "Copy" or "Cancel" from VSCode's external-URI consent dialog, and the
+ * API doesn't distinguish them. The Copy path must keep the nonce because the
+ * user will paste the URL into a browser and complete sign-in normally; the
+ * Cancel path leaves a nonce we'd otherwise never reclaim. Picking a TTL
+ * shorter than the server-side `state` TTL (typically ~10 minutes) lets the
+ * Cancel-leftover age out before the server-issued state does.
+ */
+const PENDING_STATE_TTL_MS = 5 * 60 * 1000;
+
+/**
  * Result of handling an auth callback URI. Discriminated on `success` so the
  * error branch is guaranteed to carry a message — prevents UIs from surfacing
  * "...: undefined" when something goes wrong.
@@ -62,6 +74,26 @@ export class AuthService {
 	private pendingState: string | null = null;
 
 	/**
+	 * Deferred-expiry timer for {@link pendingState}. Started only when
+	 * {@link vscode.env.openExternal} resolves `false` — VSCode's "Open
+	 * external URI?" consent dialog returns `false` for both "Copy" (URL
+	 * copied to clipboard, user pastes into browser, sign-in still
+	 * proceeds) and "Cancel" (user aborted). The API can't tell them
+	 * apart, so we keep the nonce alive for {@link PENDING_STATE_TTL_MS}
+	 * so the Copy path can complete, and let the Cancel path's leftover
+	 * nonce age out automatically.
+	 */
+	private pendingStateTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** Cancels any pending TTL expiry. Safe to call when no timer is set. */
+	private cancelPendingStateTimer(): void {
+		if (this.pendingStateTimer !== null) {
+			clearTimeout(this.pendingStateTimer);
+			this.pendingStateTimer = null;
+		}
+	}
+
+	/**
 	 * Handles the OAuth callback URI from the browser redirect.
 	 *
 	 * Two callback shapes are accepted, in priority order:
@@ -87,6 +119,13 @@ export class AuthService {
 			log.warn("AuthService", "Ignoring unknown URI path: %s", uri.path);
 			return { success: false, error: "Unknown callback path" };
 		}
+
+		// The callback has arrived — cancel any deferred-expiry timer started
+		// by openSignInPage()'s `!opened` branch. Single-consumption of
+		// pendingState happens a few lines down; the timer is purely a
+		// belt-and-suspenders for the "user cancelled the consent dialog"
+		// case where no callback ever arrives.
+		this.cancelPendingStateTimer();
 
 		const params = new URLSearchParams(uri.query);
 		const error = params.get("error");
@@ -196,6 +235,10 @@ export class AuthService {
 
 	/** Clears auth credentials from config.json and resets the context key. */
 	async signOut(): Promise<void> {
+		// Drop any in-flight sign-in alongside the persisted credentials so a
+		// late callback from a prior attempt can't land after signOut.
+		this.cancelPendingStateTimer();
+		this.pendingState = null;
 		// Writes `{ authToken: undefined, jolliApiKey: undefined }` to the global
 		// config — JSON.stringify omits undefined fields so both are removed.
 		await clearAuthCredentials();
@@ -249,19 +292,40 @@ export class AuthService {
 		}
 		// Commit pendingState only after the URL builds — otherwise a thrown
 		// getJolliUrl() would leave behind a state that pairs with no
-		// outgoing nonce.
+		// outgoing nonce. Clear any prior deferred-expiry timer so a rapid
+		// second sign-in attempt doesn't wipe its own freshly-committed
+		// state when the previous attempt's TTL fires.
+		this.cancelPendingStateTimer();
 		this.pendingState = state;
 		log.info("AuthService", "Opening browser for sign-in");
 		try {
 			const opened = await vscode.env.openExternal(vscode.Uri.parse(loginUrl));
 			if (!opened) {
-				this.pendingState = null;
-				log.warn("AuthService", "openExternal returned false for login URL");
-				vscode.window.showErrorMessage(
-					"Couldn't launch the browser for sign-in. Please try again.",
+				// `openExternal` resolves `false` for BOTH "Copy" and "Cancel" in
+				// VSCode's external-URI consent dialog — the API doesn't
+				// distinguish them. The Copy flow needs pendingState preserved
+				// so the user can paste the URL into a browser and complete
+				// sign-in normally; the Cancel flow leaves a nonce we'd
+				// otherwise never reclaim. Defer expiry by PENDING_STATE_TTL_MS
+				// so Copy works and Cancel leftovers age out automatically.
+				log.info(
+					"AuthService",
+					"openExternal returned false (user picked Copy or Cancel); preserving nonce for %d ms",
+					PENDING_STATE_TTL_MS,
 				);
+				this.pendingStateTimer = setTimeout(() => {
+					this.pendingState = null;
+					this.pendingStateTimer = null;
+				}, PENDING_STATE_TTL_MS);
+				// Don't block process exit on the timer — the extension host
+				// shouldn't be kept alive by an idle sign-in TTL.
+				this.pendingStateTimer.unref?.();
 			}
 		} catch (err: unknown) {
+			// A genuine launch failure (no available URI handler, browser
+			// process unavailable, etc.) — no callback can ever arrive, so
+			// drop the nonce immediately and surface the error.
+			this.cancelPendingStateTimer();
 			this.pendingState = null;
 			const message = err instanceof Error ? err.message : String(err);
 			log.error("AuthService", "openExternal failed: %s", message);
