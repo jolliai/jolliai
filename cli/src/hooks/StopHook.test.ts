@@ -74,6 +74,7 @@ import {
 	saveSession,
 	upsertLinearIssueEntry,
 } from "../core/SessionTracker.js";
+import type { PlanEntry } from "../Types.js";
 import { withPlatform } from "../testUtils/withPlatform.js";
 import { handleStopHook } from "./StopHook.js";
 
@@ -879,15 +880,18 @@ describe("StopHook — plan discovery", () => {
 		);
 	});
 
-	it("should preserve commitHash from PostCommitHook even when StopHook scans the same slug", async () => {
-		// Simulates the race: PostCommitHook writes commitHash between StopHook's two
-		// loadPlansRegistry calls. The second (fresh) read sees the commitHash, and
-		// StopHook must not overwrite it — even though this slug was in its own scan.
+	it("should accept the fresh registry's archive-guard state when QueueWorker wins the race", async () => {
+		// Race: PostCommitHook / QueueWorker archives the plan between StopHook's
+		// two loadPlansRegistry calls. The fresh entry now has BOTH commitHash and
+		// contentHashAtCommit — the archive-guard pair. StopHook's merge must
+		// take the fresh entry wholesale rather than overlay just commitHash on
+		// its stale local copy: dropping contentHashAtCommit would cause
+		// PlanService.toPlanInfo to misclassify the entry as a snapshot copy.
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file
 			.mockReturnValueOnce(true); // plan file
 
-		// First loadPlansRegistry: plan is still uncommitted
+		// First load: plan is still uncommitted
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
 				version: 1,
@@ -904,7 +908,9 @@ describe("StopHook — plan discovery", () => {
 					},
 				},
 			})
-			// Second (fresh) loadPlansRegistry: PostCommitHook has now written commitHash
+			// Fresh load: QueueWorker has archived → both commitHash AND
+			// contentHashAtCommit are present (this is what associatePlansWithCommit
+			// actually writes in production).
 			.mockResolvedValueOnce({
 				version: 1,
 				plans: {
@@ -915,13 +921,16 @@ describe("StopHook — plan discovery", () => {
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "main",
-						commitHash: "abc12345", // PostCommitHook wrote this
+						commitHash: "abc12345",
+						contentHashAtCommit: "deadbeefhash",
 						editCount: 3,
 					},
 				},
 			});
 
-		// StopHook scans the transcript and finds race-plan (editCount +1)
+		// StopHook scans the transcript and would increment editCount under
+		// the old per-field overlay; with the wholesale-fresh fix, editCount
+		// stays at 3 (the local +1 is dropped on purpose).
 		mockTranscriptWithLines([
 			'{"type":"tool_use","name":"Edit","input":{"file_path":"/home/user/.claude/plans/race-plan.md"}}',
 		]);
@@ -929,21 +938,19 @@ describe("StopHook — plan discovery", () => {
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
 
-		// commitHash from PostCommitHook must be preserved — not wiped by StopHook's write
-		expect(savePlansRegistry).toHaveBeenCalledWith(
-			expect.objectContaining({
-				plans: expect.objectContaining({
-					"race-plan": expect.objectContaining({
-						commitHash: "abc12345",
-						editCount: 4, // editCount still incremented by StopHook
-					}),
-				}),
-			}),
-			PROJECT_DIR,
-		);
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		expect(saved?.plans["race-plan"]?.commitHash).toBe("abc12345");
+		// Critical: contentHashAtCommit must come through so the archive-guard
+		// branch in upsertEntry can revive this entry on the next file edit.
+		expect(saved?.plans["race-plan"]?.contentHashAtCommit).toBe("deadbeefhash");
 	});
 
-	it("should ignore fresh registry commit hashes for slugs not present in the current scan result", async () => {
+	it("should preserve concurrent slugs added between load and save (no per-slug clobber)", async () => {
+		// Race regression: while StopHook scans the transcript for `current-plan`,
+		// a sibling writer (QueueWorker, parallel StopHook, extension) appends
+		// `other-plan` to plans.json. The save-time merge must include the
+		// concurrent slug, not overwrite the whole plans map with our local
+		// snapshot that's missing it.
 		vi.mocked(existsSync).mockReturnValueOnce(true).mockReturnValueOnce(true);
 
 		vi.mocked(loadPlansRegistry)
@@ -994,8 +1001,264 @@ describe("StopHook — plan discovery", () => {
 		await handleStopHook();
 
 		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		// We don't touch `other-plan`, so its concurrent state passes through unchanged.
+		expect(saved?.plans["other-plan"]).toBeDefined();
+		expect(saved?.plans["other-plan"]?.commitHash).toBe("abc12345");
 		expect(saved?.plans["current-plan"]?.commitHash).toBeNull();
-		expect(saved?.plans["other-plan"]).toBeUndefined();
+	});
+
+	it("should preserve a QueueWorker archive entry written between load and save", async () => {
+		// Race scenario: AI edits docs/refactor-api.md → StopHook starts. User
+		// commits in parallel → QueueWorker promotes the plan to an archive
+		// guard and adds `refactor-api-abc12345`. StopHook's writeback must
+		// preserve both the guard upgrade and the new archive entry.
+		vi.mocked(existsSync).mockReturnValueOnce(true).mockReturnValueOnce(true);
+
+		// First load: uncommitted state (before QueueWorker's writes)
+		vi.mocked(loadPlansRegistry)
+			.mockResolvedValueOnce({
+				version: 1,
+				plans: {
+					"refactor-api": {
+						slug: "refactor-api",
+						title: "Refactor API",
+						sourcePath: "/repo/docs/refactor-api.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: null,
+						editCount: 5,
+					},
+				},
+			})
+			// Second load (freshRegistry): QueueWorker has run, guard installed + archive added
+			.mockResolvedValueOnce({
+				version: 1,
+				plans: {
+					"refactor-api": {
+						slug: "refactor-api",
+						title: "Refactor API",
+						sourcePath: "/repo/docs/refactor-api.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: "abc12345cafebabe",
+						contentHashAtCommit: "deadbeefhash",
+						editCount: 5,
+					},
+					"refactor-api-abc12345": {
+						slug: "refactor-api-abc12345",
+						title: "Refactor API",
+						sourcePath: "/repo/docs/refactor-api.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: "abc12345cafebabe",
+						editCount: 5,
+					},
+				},
+			});
+
+		// AI edited the external .md → our local plans will touch `refactor-api`
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/refactor-api.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		// 1. Archive entry from QueueWorker must NOT be dropped.
+		expect(saved?.plans["refactor-api-abc12345"]).toBeDefined();
+		expect(saved?.plans["refactor-api-abc12345"]?.commitHash).toBe("abc12345cafebabe");
+		// 2. Our edit on `refactor-api` should carry the concurrent commitHash through.
+		expect(saved?.plans["refactor-api"]?.commitHash).toBe("abc12345cafebabe");
+		// 3. Critical: contentHashAtCommit must come through too. Without it,
+		//    PlanService.toPlanInfo's snapshot-copy filter (commitHash != null
+		//    && !contentHashAtCommit) catches the entry and hides it from the
+		//    panel, AND the upsertEntry archive-guard revive branch can never
+		//    fire because it gates on `existing.contentHashAtCommit`.
+		expect(saved?.plans["refactor-api"]?.contentHashAtCommit).toBe("deadbeefhash");
+	});
+
+	it("should let a subsequent file edit revive after QueueWorker won an earlier race", async () => {
+		// Integration regression: simulates two consecutive Stop events.
+		// Event 1: QueueWorker wins → freshRegistry has archive guard. After
+		//   our merge, plans.json's refactor-api carries the full guard pair.
+		// Event 2: user edits the file again → StopHook runs against the
+		//   post-merge registry. The upsertEntry archive-guard branch should
+		//   detect that the file content no longer matches contentHashAtCommit
+		//   and revive the entry as fresh uncommitted (commitHash back to null).
+		const planPath = "/repo/docs/refactor-api.md";
+
+		// ── Event 1: QueueWorker-wins race ──
+		vi.mocked(existsSync).mockReturnValue(true);
+		vi.mocked(loadPlansRegistry)
+			.mockResolvedValueOnce({
+				version: 1,
+				plans: {
+					"refactor-api": {
+						slug: "refactor-api",
+						title: "Refactor API",
+						sourcePath: planPath,
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: null,
+						editCount: 5,
+					},
+				},
+			})
+			.mockResolvedValueOnce({
+				version: 1,
+				plans: {
+					"refactor-api": {
+						slug: "refactor-api",
+						title: "Refactor API",
+						sourcePath: planPath,
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: "abc12345cafebabe",
+						contentHashAtCommit: "snapshot-hash",
+						editCount: 5,
+					},
+				},
+			});
+
+		mockTranscriptWithLines([`{"type":"tool_use","name":"Edit","input":{"file_path":"${planPath}"}}`]);
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const afterEvent1 = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		expect(afterEvent1?.plans["refactor-api"]?.contentHashAtCommit).toBe("snapshot-hash");
+
+		// ── Event 2: user edits the file again ──
+		// File content changed → sha256 of new content differs from
+		// "snapshot-hash". Mock readFileSync to return content whose hash will
+		// definitely not equal "snapshot-hash" (the mock default already does
+		// this — content "# Plan Title\n\nContent" hashes to a different value).
+		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+		vi.mocked(loadPlansRegistry).mockReset();
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: { "refactor-api": afterEvent1?.plans["refactor-api"] as PlanEntry },
+		});
+		vi.mocked(savePlansRegistry).mockClear();
+		mockTranscriptWithLines([`{"type":"tool_use","name":"Edit","input":{"file_path":"${planPath}"}}`]);
+		mockStdin(hookJson("/path/to/session-2.jsonl", PROJECT_DIR));
+		await handleStopHook();
+
+		// upsertEntry archive-guard branch should fire: contentHashAtCommit
+		// present → compute file hash → mismatch → resurrect as fresh
+		// uncommitted entry with commitHash null.
+		const afterEvent2 = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		expect(afterEvent2?.plans["refactor-api"]?.commitHash).toBeNull();
+		expect(afterEvent2?.plans["refactor-api"]?.contentHashAtCommit).toBeUndefined();
+	});
+
+	it("should preserve an extension-flipped ignored flag on a slug we did not touch", async () => {
+		// Race scenario: while StopHook scans for `our-plan`, the user clicks
+		// Ignore on `unrelated-plan` in the panel. The extension writes
+		// ignored:true. StopHook's writeback must NOT clobber it.
+		vi.mocked(existsSync).mockReturnValueOnce(true).mockReturnValueOnce(true);
+
+		vi.mocked(loadPlansRegistry)
+			.mockResolvedValueOnce({
+				version: 1,
+				plans: {
+					"our-plan": {
+						slug: "our-plan",
+						title: "Ours",
+						sourcePath: "/home/user/.claude/plans/our-plan.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: null,
+						editCount: 0,
+					},
+					"unrelated-plan": {
+						slug: "unrelated-plan",
+						title: "Unrelated",
+						sourcePath: "/home/user/.claude/plans/unrelated-plan.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: null,
+						editCount: 0,
+					},
+				},
+			})
+			.mockResolvedValueOnce({
+				version: 1,
+				plans: {
+					"our-plan": {
+						slug: "our-plan",
+						title: "Ours",
+						sourcePath: "/home/user/.claude/plans/our-plan.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: null,
+						editCount: 0,
+					},
+					"unrelated-plan": {
+						slug: "unrelated-plan",
+						title: "Unrelated",
+						sourcePath: "/home/user/.claude/plans/unrelated-plan.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: null,
+						editCount: 0,
+						ignored: true, // extension flipped this between the two reads
+					},
+				},
+			});
+
+		mockTranscriptWithLines(['{"type":"tool_result","slug":"our-plan","content":"..."}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		expect(saved?.plans["unrelated-plan"]?.ignored).toBe(true);
+	});
+
+	it("should preserve a slug added by a parallel StopHook between load and save", async () => {
+		// Race scenario: two Claude Code sessions open on the same repo. Both
+		// StopHooks fire near-simultaneously. Session A registers `plan-a`,
+		// Session B registers `plan-b`. Neither's save should drop the other's.
+		vi.mocked(existsSync).mockReturnValueOnce(true).mockReturnValueOnce(true);
+
+		vi.mocked(loadPlansRegistry)
+			.mockResolvedValueOnce({ version: 1, plans: {} })
+			.mockResolvedValueOnce({
+				version: 1,
+				plans: {
+					"plan-b": {
+						slug: "plan-b",
+						title: "Plan B (from sibling)",
+						sourcePath: "/repo/docs/plan-b.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "unknown",
+						commitHash: null,
+						editCount: 1,
+					},
+				},
+			});
+
+		// Our session is registering `plan-a`
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/plan-a.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		expect(saved?.plans["plan-a"]).toBeDefined();
+		expect(saved?.plans["plan-b"]).toBeDefined();
+		expect(saved?.plans["plan-b"]?.title).toBe("Plan B (from sibling)");
 	});
 
 	it("should resolve gracefully when readline emits an error during transcript scan", async () => {
@@ -1197,8 +1460,9 @@ describe("StopHook — plan discovery", () => {
 	});
 
 	it("should accept .md paths outside the workspace (e.g. cross-project plans directory)", async () => {
-		// `E:\jm-docs\` style paths must not be rejected — see "设计决策:不限制
-		// 外部路径必须位于 cwd 之内" in the plan doc.
+		// Cross-project plan directories (notes/specs stored outside the repo's
+		// own workspace) are a primary supported use case — auto-discovery
+		// must not reject absolute paths simply because they live outside cwd.
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file
 			.mockReturnValueOnce(true); // external plan file
@@ -1244,7 +1508,8 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: "/repo/docs/design.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
+					// "unknown" matches getCurrentBranch() default in tests (no git repo)
+					branch: "unknown",
 					commitHash: null,
 				},
 			},
@@ -1280,7 +1545,7 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "C:\\Repo\\Docs\\Design.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "main",
+						branch: "unknown", // matches getCurrentBranch() default in tests
 						commitHash: null,
 					},
 				},
@@ -1296,6 +1561,139 @@ describe("StopHook — plan discovery", () => {
 
 			expect(savePlansRegistry).not.toHaveBeenCalled();
 		});
+	});
+
+	it("should register a plan when a note exists for the same file BUT on a different branch", async () => {
+		// L1 regression: notes are branch-scoped (NoteService.toNoteInfo hides
+		// notes from other branches), so the note guard must also be
+		// branch-scoped. Without this check, a `main` note silently suppresses
+		// plan auto-registration on `feature/x`, even though the user can't see
+		// the note on that branch.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // .md file on disk
+
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {},
+			notes: {
+				"n-other": {
+					id: "n-other",
+					title: "Design (main)",
+					format: "markdown",
+					sourcePath: "/repo/docs/design.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					branch: "main",
+					commitHash: null,
+				},
+			},
+		});
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/design.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		// getCurrentBranch falls back to "unknown" under test (no git repo),
+		// which differs from the note's "main" → guard does NOT apply →
+		// plan IS registered.
+		expect(savePlansRegistry).toHaveBeenCalledWith(
+			expect.objectContaining({
+				plans: expect.objectContaining({
+					design: expect.objectContaining({ sourcePath: "/repo/docs/design.md" }),
+				}),
+			}),
+			PROJECT_DIR,
+		);
+	});
+
+	it("should NOT register a canonical ~/.claude/plans/ plan when it is already a note (L2)", async () => {
+		// L2 regression: a user can pick a file under ~/.claude/plans/ via the
+		// "Add Markdown File" picker, registering it as a note. The note guard
+		// must apply to the canonical loop too, not just the external loop.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // canonical plan file
+
+		const canonicalPath = join("/home/user", ".claude", "plans", "shared.md");
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {},
+			notes: {
+				"n-shared": {
+					id: "n-shared",
+					title: "Shared",
+					format: "markdown",
+					sourcePath: canonicalPath,
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					branch: "unknown", // matches getCurrentBranch() default in tests
+					commitHash: null,
+				},
+			},
+		});
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/home/user/.claude/plans/shared.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		// Canonical loop matched the slug but the note guard suppressed the upsert.
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	it("should preserve notes and linearIssues fields when writing back to plans.json (C1)", async () => {
+		// C1 regression: discoverPlansFromTranscript previously wrote
+		// `{ version: 1, plans }` which silently dropped sibling fields
+		// (notes / linearIssues). loadPlansRegistry's contract is "spread to
+		// preserve optional fields"; the writeback must honor that.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // external plan file
+
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {},
+			notes: {
+				"n-keep": {
+					id: "n-keep",
+					title: "Keep me",
+					format: "snippet",
+					sourcePath: "/repo/.jolli/jollimemory/notes/n-keep.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					branch: "unknown",
+					commitHash: null,
+				},
+			},
+			linearIssues: {
+				"PROJ-1": {
+					ticketId: "PROJ-1",
+					title: "Keep me too",
+					url: "https://linear.app/x/PROJ-1",
+					sourcePath: "/repo/.jolli/jollimemory/linear-issues/PROJ-1.md",
+					branch: "main",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					commitHash: null,
+					sourceToolName: "mcp__linear__get_issue",
+				},
+			},
+		});
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/new-plan.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		expect(saved?.notes).toBeDefined();
+		expect(saved?.notes?.["n-keep"]).toBeDefined();
+		expect(saved?.linearIssues).toBeDefined();
+		expect(saved?.linearIssues?.["PROJ-1"]).toBeDefined();
 	});
 
 	it("should skip external .md when source file no longer exists at upsert time", async () => {

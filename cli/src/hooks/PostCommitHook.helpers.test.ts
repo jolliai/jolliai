@@ -675,6 +675,42 @@ describe("PostCommitHook helpers", () => {
 
 			expect(result.refs[0].title).toBe("sluggy");
 		});
+
+		it("reads the source file from entry.sourcePath for external plan paths (C2 regression)", async () => {
+			// Guards the switch from `join(plansDir, slug + ".md")` to
+			// `entry.sourcePath`. Old logic computed a synthetic ~/.claude/plans/
+			// path; external plans (e.g. docs/foo.md) lived outside that dir and
+			// would have failed existsSync silently. The new logic must read
+			// directly from the registry's sourcePath.
+			const externalPath = "/repo/docs/external-plan.md";
+			mockLoadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: {
+					external: {
+						slug: "external",
+						title: "External",
+						sourcePath: externalPath,
+						addedAt: "2026-02-18T00:00:00Z",
+						updatedAt: "2026-02-18T00:00:00Z",
+						branch: "feature/test",
+						commitHash: null,
+						editCount: 1,
+					},
+				},
+			});
+			mockExistsSync.mockImplementation((p: string) => p === externalPath);
+			mockReadFileSync.mockImplementation((p: string) => (p === externalPath ? "# External\nbody" : ""));
+
+			const result = await __test__.associatePlansWithCommit(new Set(["external"]), "deadbeefcafebabe", "/repo");
+
+			expect(result.refs[0].slug).toBe("external-deadbeef");
+			expect(mockStorePlans).toHaveBeenCalledWith(
+				[{ slug: "external-deadbeef", content: "# External\nbody" }],
+				expect.stringContaining("deadbeef"),
+				"/repo",
+				undefined,
+			);
+		});
 	});
 
 	describe("associateLinearIssuesWithCommit (near-write reread merge)", () => {

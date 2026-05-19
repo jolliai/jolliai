@@ -27,7 +27,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve as pathResolve } from "node:path";
+import { join, resolve as pathResolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { extractLinearIssuesFromTranscript } from "../core/LinearIssueExtractor.js";
@@ -167,24 +167,30 @@ const PLANS_PATH_SLUG_REGEX = /[/\\]{1,2}\.claude[/\\]{1,2}plans[/\\]{1,2}([^/\\
  */
 const ANY_MD_PATH_REGEX = /"file_path":"([^"]+\.md)"/;
 
-/** Path segments excluded from external plan detection. */
-const EXTERNAL_EXCLUDE_SEGMENTS = [/[/\\]\.claude[/\\]/, /[/\\]node_modules[/\\]/, /[/\\]\.github[/\\]/];
+/**
+ * Path segments excluded from external plan detection. Case-insensitive (`i`
+ * flag) so Windows/macOS variants like `Node_Modules/` or `.GitHub/` are also
+ * filtered — matches the case-insensitive basename check below.
+ */
+const EXTERNAL_EXCLUDE_SEGMENTS = [/[/\\]\.claude[/\\]/i, /[/\\]node_modules[/\\]/i, /[/\\]\.github[/\\]/i];
 
 /** Basenames excluded — stored lowercase, compared after toLowerCase() on input. */
 const EXTERNAL_EXCLUDE_BASENAMES = new Set([
 	"claude.md",
+	"claude.local.md",
 	"agents.md",
 	"readme.md",
 	"changelog.md",
 	"contributing.md",
 	"license.md",
 	"security.md",
+	"code_of_conduct.md",
 ]);
 
 /**
- * Decide whether an external .md path is a plan candidate. Excludes
- * ~/.claude/ subtree (memory/skill/agent/session), node_modules, .github, and
- * common non-plan filenames at any depth (README.md, CLAUDE.md, etc.).
+ * Decide whether an external .md path is a plan candidate. Excludes any path
+ * under `.claude/`, `node_modules/`, or `.github/`, plus common non-plan
+ * filenames (README.md, CLAUDE.md, etc.) at any depth.
  */
 function isExternalPlanCandidate(absPath: string): boolean {
 	if (EXTERNAL_EXCLUDE_SEGMENTS.some((re) => re.test(absPath))) return false;
@@ -274,6 +280,12 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 	const now = new Date().toISOString();
 	let branch: string | undefined;
 	let changed = false;
+	// Tracks slugs we actually modified in this run. Used at writeback time to
+	// merge our changes onto the freshest registry snapshot per-slug rather
+	// than overwriting the whole plans map — without this, any slug a sibling
+	// pipeline (QueueWorker archive, extension ignore, parallel StopHook) wrote
+	// between our load and save would be silently dropped.
+	const touchedSlugs = new Set<string>();
 
 	const upsertEntry = (slug: string, planFile: string, editCount: number): void => {
 		const existing = plans[slug];
@@ -296,12 +308,14 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 					editCount,
 				};
 				changed = true;
+				touchedSlugs.add(slug);
 				log.info("Plan discovery: archived plan %s file changed — creating new entry", slug);
 			}
 		} else if (existing) {
 			if (existing.commitHash === null && !existing.ignored) {
 				plans[slug] = { ...existing, editCount: existing.editCount + editCount, updatedAt: now };
 				changed = true;
+				touchedSlugs.add(slug);
 			}
 		} else {
 			branch ??= getCurrentBranch(cwd);
@@ -316,31 +330,51 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 				editCount,
 			};
 			changed = true;
+			touchedSlugs.add(slug);
 		}
 	};
+
+	// Build a Set of normalized paths that already belong to a markdown note
+	// on the current branch. Markdown notes added via "Add Markdown File" can
+	// point at arbitrary user .md files (NoteService allows
+	// `sourcePath = <user-picked path>`). If the AI later edits that same file,
+	// we must NOT also register it as a plan — it would shadow the user's
+	// explicit note semantics, double-archive into the orphan branch, and
+	// surface the same file twice in the panel (plans + notes are merged
+	// without sourcePath dedup downstream).
+	//
+	// Branch scoping: notes are branch-filtered in NoteService.toNoteInfo, so a
+	// note on `main` is invisible on `feature/x`. The guard must mirror that
+	// scope, otherwise a hidden cross-branch note silently suppresses plan
+	// auto-registration on the current branch.
+	const noteSourcePaths = new Set<string>();
+	const notesArr = Object.values(registry.notes ?? {});
+	if (notesArr.length > 0) {
+		branch ??= getCurrentBranch(cwd);
+		for (const note of notesArr) {
+			if (note.branch && note.branch !== branch) continue;
+			if (note.sourcePath) noteSourcePaths.add(normalizePathForCompare(note.sourcePath));
+		}
+	}
 
 	// 1. Canonical ~/.claude/plans/ slugs. We still route through
 	//    resolveUniqueSlug so that if an external entry was registered first
 	//    under the same slug (e.g. docs/foo.md → "foo"), the canonical
 	//    ~/.claude/plans/foo.md gets a hash-suffixed slug rather than silently
 	//    overwriting the external entry's sourcePath via upsertEntry.
+	//
+	//    Note guard is applied here too: a user may have added
+	//    `~/.claude/plans/foo.md` as a note via "Add Markdown File" (file
+	//    picker is unrestricted), so the same dedup applies.
 	for (const [rawSlug, editCount] of slugs) {
 		const planFile = join(homedir(), ".claude", "plans", `${rawSlug}.md`);
 		if (!existsSync(planFile)) continue;
+		if (noteSourcePaths.has(normalizePathForCompare(planFile))) {
+			log.info("Plan discovery: %s already a note — skipping plan registration", planFile);
+			continue;
+		}
 		const slug = resolveUniqueSlug(rawSlug, planFile, plans);
 		upsertEntry(slug, planFile, editCount);
-	}
-
-	// Build a Set of normalized paths that already belong to a markdown note.
-	// Markdown notes added via "Add Markdown File" can point at arbitrary user
-	// .md files (NoteService allows `sourcePath = <user-picked path>`). If the
-	// AI later edits that same file, we must NOT also register it as a plan —
-	// it would shadow the user's explicit note semantics, double-archive into
-	// the orphan branch, and surface the same file twice in the panel
-	// (plans + notes are merged without sourcePath dedup downstream).
-	const noteSourcePaths = new Set<string>();
-	for (const note of Object.values(registry.notes ?? {})) {
-		if (note.sourcePath) noteSourcePaths.add(normalizePathForCompare(note.sourcePath));
 	}
 
 	// 2. External .md paths — slug resolved against current plans snapshot.
@@ -358,20 +392,53 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 	}
 
 	if (changed) {
-		// Re-read once more and preserve any commitHash updates from PostCommitHook.
-		// Only apply when the commitHash changed between reads — meaning PostCommitHook
-		// wrote it during this window. This avoids restoring a stale commitHash onto
-		// archive-guard entries that we deliberately reset to null.
+		// Re-read once more and merge per-slug onto the freshest snapshot.
+		//
+		// Why not just write our local `plans`: between our initial load and
+		// this save, sibling pipelines may have written to plans.json:
+		//   - QueueWorker may have added a `<slug>-<commitHash8>` archive entry
+		//     and upgraded the original slug into an archive guard
+		//   - Another StopHook (parallel session) may have added a new slug
+		//   - The extension may have flipped `ignored` on an entry
+		//
+		// Strategy: start with freshRegistry.plans as the baseline (preserves
+		// every concurrent write), then layer ONLY the slugs we explicitly
+		// touched on top. For each touched slug, also pull through any
+		// concurrent commitHash update (the PostCommitHook race already
+		// covered by the prior implementation).
 		const freshRegistry = await loadPlansRegistry(cwd);
-		for (const [slug, freshEntry] of Object.entries(freshRegistry.plans)) {
-			if (!freshEntry.commitHash) continue;
-			if (!plans[slug]) continue;
+		const merged: Record<string, PlanEntry> = { ...freshRegistry.plans };
+		for (const slug of touchedSlugs) {
+			const ours = plans[slug];
+			if (!ours) continue;
+			const fresh = freshRegistry.plans[slug];
+			const freshCommitHash = fresh?.commitHash;
 			const originalCommitHash = registry.plans[slug]?.commitHash ?? null;
-			if (freshEntry.commitHash !== originalCommitHash) {
-				plans[slug] = { ...plans[slug], commitHash: freshEntry.commitHash };
+			if (fresh && freshCommitHash && freshCommitHash !== originalCommitHash) {
+				// A sibling writer (typically QueueWorker) transitioned this slug
+				// from uncommitted to archived between our load and save: it set
+				// both `commitHash` AND `contentHashAtCommit` (the archive-guard
+				// pair). Use the fresh entry wholesale rather than overlaying one
+				// field on ours — otherwise `contentHashAtCommit` is dropped, the
+				// entry trips the snapshot-copy filter in PlanService.toPlanInfo
+				// (vanishes from the panel), and the upsertEntry archive-guard
+				// revive branch can never fire again (because it gates on
+				// `existing.contentHashAtCommit`).
+				//
+				// Our local editCount increment is intentionally dropped: once
+				// archived, editCount is invisible to the panel; the next
+				// Write/Edit will resurrect a fresh uncommitted entry with the
+				// correct count via the archive-guard branch in upsertEntry.
+				merged[slug] = fresh;
+			} else {
+				merged[slug] = ours;
 			}
 		}
-		await savePlansRegistry({ version: 1, plans }, cwd);
+		// Spread freshRegistry first to preserve notes / linearIssues — otherwise
+		// any sibling pipeline that wrote them between our load and save (e.g.
+		// the note service from the extension, the Linear discovery loop below)
+		// loses its work.
+		await savePlansRegistry({ ...freshRegistry, version: 1, plans: merged }, cwd);
 		log.info(
 			"Plan discovery: upserted %d slug(s) + %d external path(s) into plans.json",
 			slugs.size,
@@ -431,9 +498,18 @@ function scanTranscriptForPlans(
 				} else {
 					const extMatch = ANY_MD_PATH_REGEX.exec(line);
 					if (extMatch?.[1]) {
-						// Transcript JSON-escapes backslashes as "\\"; unescape before use
-						const absPath = extMatch[1].replace(/\\\\/g, "\\");
-						if (isExternalPlanCandidate(absPath)) {
+						// Transcripts are JSONL: the captured substring lives inside a JSON
+						// string literal, so all of `\\`, `\"`, `\n`, `\uXXXX` etc. are
+						// possible. Decode via JSON.parse to handle every escape uniformly
+						// — a simple `replace(/\\\\/g, "\\")` misses unicode-escaped
+						// non-ASCII filenames and any other valid JSON escape.
+						let absPath: string | null = null;
+						try {
+							absPath = JSON.parse(`"${extMatch[1]}"`) as string;
+						} catch {
+							// Malformed escape sequence — treat as non-candidate.
+						}
+						if (absPath && isExternalPlanCandidate(absPath)) {
 							externalPlans.set(absPath, (externalPlans.get(absPath) ?? 0) + 1);
 						}
 					}
@@ -526,12 +602,16 @@ async function discoverLinearIssuesFromTranscript(sessionInfo: SessionInfo, cwd:
 
 /** Extracts the first # heading from a markdown file. */
 function extractPlanTitle(filePath: string): string {
+	// Use a platform-agnostic basename for the fallback: node:path.basename
+	// only recognizes the current platform's separator, so a Windows path
+	// processed on POSIX would degrade into the entire path string.
+	const fallback = filePath.split(/[/\\]/).pop() ?? filePath;
 	try {
 		const content = readFileSync(filePath, "utf-8");
 		const match = /^#\s+(.+)/m.exec(content);
-		return match?.[1]?.trim() ?? basename(filePath);
+		return match?.[1]?.trim() ?? fallback;
 	} catch {
-		return basename(filePath);
+		return fallback;
 	}
 }
 

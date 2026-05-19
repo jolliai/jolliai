@@ -25,10 +25,9 @@
  */
 export function normalizePathForCompare(p: string): string {
 	let unified = p.replace(/\\/g, "/");
-	// Strip trailing slashes via a bounded loop rather than `/\/+$/` to avoid
-	// CodeQL "polynomial regex on uncontrolled data" (alert #28 on PR #122).
-	// The regex itself is linear-time, but switching to char-by-char keeps the
-	// security report clean for open-source release.
+	// Strip trailing slashes via a bounded loop rather than `/\/+$/`. The regex
+	// is linear-time, but CodeQL flags any unbounded quantifier on input as a
+	// polynomial-regex risk; the loop form removes the false positive.
 	let end = unified.length;
 	while (end > 0 && unified[end - 1] === "/") end--;
 	if (end !== unified.length) unified = unified.slice(0, end);
