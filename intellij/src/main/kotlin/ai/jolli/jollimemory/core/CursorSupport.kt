@@ -2,8 +2,6 @@ package ai.jolli.jollimemory.core
 
 import com.google.gson.JsonParser
 import java.io.File
-import java.net.URI
-import java.nio.file.Paths
 import java.time.Instant
 
 /**
@@ -47,32 +45,10 @@ object CursorSupport {
 	/** Cursor bubble.type → transcript role. Other values (system messages, tool calls) are skipped. */
 	private val BUBBLE_TYPE_TO_ROLE = mapOf(1 to "human", 2 to "assistant")
 
-	/** Returns the user-data root for Cursor on the current platform. */
-	private fun getUserDataDir(): String {
-		val home = System.getProperty("user.home")
-		val osName = System.getProperty("os.name").lowercase()
-		return when {
-			osName.contains("mac") ->
-				home + File.separator + "Library" + File.separator + "Application Support" + File.separator + "Cursor"
-			osName.contains("win") ->
-				// `cursor.appdata.override` is a test hook: Java cannot unset env vars, so tests
-				// that need to redirect away from the real %APPDATA% set this system property instead.
-				(System.getProperty("cursor.appdata.override")
-					?: System.getenv("APPDATA")
-					?: (home + File.separator + "AppData" + File.separator + "Roaming")) +
-					File.separator + "Cursor"
-			else ->
-				home + File.separator + ".config" + File.separator + "Cursor"
-		}
-	}
-
 	/** Returns the path to Cursor's global SQLite database. */
 	fun getGlobalDbPath(): String =
-		getUserDataDir() + File.separator + "User" + File.separator + "globalStorage" + File.separator + "state.vscdb"
-
-	/** Returns the workspaceStorage directory containing per-workspace state.vscdb files. */
-	private fun getWorkspaceStorageDir(): String =
-		getUserDataDir() + File.separator + "User" + File.separator + "workspaceStorage"
+		getVscodeUserDataDir(VscodeFlavor.Cursor) + File.separator + "User" +
+			File.separator + "globalStorage" + File.separator + "state.vscdb"
 
 	/** Checks whether Cursor's global database file exists. */
 	fun isCursorInstalled(): Boolean {
@@ -108,7 +84,7 @@ object CursorSupport {
 		if (!globalDbFile.isFile) return ScanResult(emptyList())
 
 		// Step 1: Workspace lookup
-		val wsHash = findWorkspaceHash(projectDir)
+		val wsHash = findVscodeWorkspaceHash(VscodeFlavor.Cursor, projectDir)
 		if (wsHash == null) {
 			log.debug("No Cursor workspace found matching %s", projectDir)
 			return ScanResult(emptyList())
@@ -314,54 +290,13 @@ object CursorSupport {
 	// ── Internal helpers ─────────────────────────────────────────────────────
 
 	/**
-	 * Scans workspaceStorage for an entry whose `workspace.json` has a `folder`
-	 * URI resolving to projectDir. Returns the workspace hash on match, null otherwise.
-	 * Single-folder workspaces only — multi-root `.code-workspace` files are skipped.
-	 */
-	private fun findWorkspaceHash(projectDir: String): String? {
-		val wsStorageDir = File(getWorkspaceStorageDir())
-		if (!wsStorageDir.isDirectory) {
-			log.debug("Cursor workspaceStorage not readable at %s", wsStorageDir.path)
-			return null
-		}
-
-		val target = normalizePathForMatch(projectDir)
-		val entries = wsStorageDir.listFiles() ?: return null
-
-		for (entry in entries) {
-			val wsJson = File(entry, "workspace.json")
-			if (!wsJson.isFile) continue
-
-			val folderUri = try {
-				JsonParser.parseString(wsJson.readText()).asJsonObject
-					.get("folder")?.takeIf { it.isJsonPrimitive }?.asString
-			} catch (_: Exception) {
-				continue
-			} ?: continue
-
-			if (!folderUri.startsWith("file://")) continue
-
-			val folderPath = try {
-				Paths.get(URI(folderUri)).toString()
-			} catch (_: Exception) {
-				log.warn("Cursor workspace %s has unparseable folder URI: %s", entry.name, folderUri)
-				continue
-			}
-
-			if (normalizePathForMatch(folderPath) == target) {
-				return entry.name
-			}
-		}
-		return null
-	}
-
-	/**
 	 * Reads the per-workspace state.vscdb and extracts anchor composer IDs from the
 	 * `composer.composerData` row in ItemTable. Returns an empty list on any failure —
 	 * workspace-level errors do NOT abort the broader scan.
 	 */
 	private fun readAnchorComposerIds(wsHash: String): List<String> {
-		val wsDbPath = getWorkspaceStorageDir() + File.separator + wsHash + File.separator + "state.vscdb"
+		val wsDbPath = getVscodeWorkspaceStorageDir(VscodeFlavor.Cursor) +
+			File.separator + wsHash + File.separator + "state.vscdb"
 		if (!File(wsDbPath).isFile) {
 			log.debug("Cursor workspace DB not found at %s — skipping anchor extraction", wsDbPath)
 			return emptyList()
@@ -398,16 +333,4 @@ object CursorSupport {
 		}
 	}
 
-	/**
-	 * Normalises a filesystem path for workspace matching:
-	 *   - Backslashes → forward slashes (Windows path comparison)
-	 *   - Strip trailing slashes
-	 *   - Lowercase on macOS and Windows (case-insensitive filesystems)
-	 */
-	private fun normalizePathForMatch(p: String): String {
-		val fwd = p.replace('\\', '/')
-		val trimmed = fwd.trimEnd('/')
-		val osName = System.getProperty("os.name").lowercase()
-		return if (osName.contains("mac") || osName.contains("win")) trimmed.lowercase() else trimmed
-	}
 }

@@ -7,7 +7,7 @@ package ai.jolli.jollimemory.core
  */
 
 /** Which AI coding agent produced the transcript */
-enum class TranscriptSource { claude, codex, gemini, opencode, cursor }
+enum class TranscriptSource { claude, codex, gemini, opencode, cursor, copilot, `copilot-chat` }
 
 /** Metadata about an AI coding session */
 data class SessionInfo(
@@ -293,6 +293,7 @@ data class JolliMemoryConfig(
     val geminiEnabled: Boolean? = null,
     val openCodeEnabled: Boolean? = null,
     val cursorEnabled: Boolean? = null,
+    val copilotEnabled: Boolean? = null,
     /** AI summarization provider: "jolli" (proxy) or "anthropic" (direct). null defers to legacy "Anthropic wins" routing. */
     val aiProvider: String? = null,
     val logLevel: String? = null,
@@ -375,6 +376,11 @@ data class StatusInfo(
     val cursorDetected: Boolean? = null,
     val cursorEnabled: Boolean? = null,
     val cursorScanError: SqliteScanError? = null,
+    val copilotDetected: Boolean? = null,
+    val copilotEnabled: Boolean? = null,
+    val copilotScanError: SqliteScanError? = null,
+    val copilotChatDetected: Boolean? = null,
+    val copilotChatScanError: CopilotChatScanError? = null,
 )
 
 /** Log levels */

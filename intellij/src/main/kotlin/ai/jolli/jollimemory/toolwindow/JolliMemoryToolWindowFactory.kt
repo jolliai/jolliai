@@ -595,6 +595,28 @@ private class StatusIndicatorLabel(
                 sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Cursor:</b> detected</p>")
             }
         }
+        if (status.copilotDetected == true) {
+            val scanError = status.copilotScanError
+            if (scanError != null) {
+                val msg = scanError.message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                sb.append("<p><span style='color:#F85149'>\u25CF</span> <b>Copilot CLI:</b> unavailable \u2014 ${scanError.kind}<br/><span style='color:gray'>$msg</span></p>")
+            } else if (status.copilotEnabled == false) {
+                sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>Copilot CLI:</b> detected but disabled</p>")
+            } else {
+                sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Copilot CLI:</b> detected</p>")
+            }
+        }
+        if (status.copilotChatDetected == true) {
+            val scanError = status.copilotChatScanError
+            if (scanError != null) {
+                val msg = scanError.message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                sb.append("<p><span style='color:#F85149'>\u25CF</span> <b>Copilot Chat:</b> unavailable \u2014 ${scanError.kind}<br/><span style='color:gray'>$msg</span></p>")
+            } else if (status.copilotEnabled == false) {
+                sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>Copilot Chat:</b> detected but disabled</p>")
+            } else {
+                sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Copilot Chat:</b> detected</p>")
+            }
+        }
 
         // Error
         val err = service.lastError
