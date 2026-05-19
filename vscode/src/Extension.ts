@@ -7,7 +7,6 @@
 
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import * as vscode from "vscode";
 import {
@@ -1665,8 +1664,30 @@ export function activate(context: vscode.ExtensionContext): void {
 					// Open rendered markdown preview (read-only) from orphan branch
 					await showPlanPreview(slug, planTitle);
 				} else {
-					// Open source file for editing
-					const filePath = join(homedir(), ".claude", "plans", `${slug}.md`);
+					// Resolve filePath via the registry. PlanItem (tree click) carries
+					// it directly; tooltip invocations pass only the slug, in which
+					// case we fall back to bridge.listPlans(). No filePath at this
+					// point means the registry is out of sync with the panel state —
+					// surface that explicitly rather than silently opening a stale
+					// ~/.claude/plans/<slug>.md that almost certainly does not exist.
+					let filePath: string | undefined;
+					if (typeof itemOrSlug !== "string") {
+						filePath = itemOrSlug.plan.filePath;
+					}
+					if (!filePath) {
+						const plans = await bridge.listPlans();
+						filePath = plans.find((p) => p.slug === slug)?.filePath;
+					}
+					if (!filePath) {
+						log.warn(
+							"cmd",
+							`editPlan: no filePath for slug ${slug} — registry may be stale`,
+						);
+						vscode.window.showWarningMessage(
+							`Plan "${slug}" not found — refresh the PLANS panel and try again.`,
+						);
+						return;
+					}
 					const doc = await vscode.workspace.openTextDocument(filePath);
 					await vscode.window.showTextDocument(doc);
 				}
@@ -1769,14 +1790,19 @@ export function activate(context: vscode.ExtensionContext): void {
 				log.info("cmd", `openPlanForPreview: ${slug}`);
 				// Look up plan info to know whether a committed snapshot exists.
 				// PlansStore already holds the latest snapshot; no need to ask
-				// the bridge.
+				// the bridge. We prefer the registry's filePath so external paths
+				// (e.g. docs/foo.md, E:\jm-docs\bar.md) render the on-disk file
+				// rather than a missing ~/.claude/plans/<slug>.md.
 				const snap = plansStore.getSnapshot();
 				const plan = snap.merged.find(
 					(e) => e.kind === "plan" && e.plan.slug === slug,
 				);
 				const planTitle = plan && plan.kind === "plan" ? plan.plan.title : slug;
-				const localPath = join(homedir(), ".claude", "plans", `${slug}.md`);
-				if (existsSync(localPath)) {
+				const localPath =
+					plan && plan.kind === "plan" && plan.plan.filePath
+						? plan.plan.filePath
+						: undefined;
+				if (localPath && existsSync(localPath)) {
 					await vscode.commands.executeCommand(
 						"markdown.showPreview",
 						vscode.Uri.file(localPath),

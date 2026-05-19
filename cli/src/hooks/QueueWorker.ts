@@ -19,7 +19,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
@@ -492,7 +491,6 @@ async function associatePlansWithCommit(
 			.map(([s, e]) => `${s}(commitHash=${e.commitHash})`)
 			.join(", "),
 	);
-	const plansDir = join(homedir(), ".claude", "plans");
 	const planRefs: PlanReference[] = [];
 	const planFiles: Array<{ slug: string; content: string }> = [];
 	const markdownBySlug = new Map<string, string>();
@@ -526,7 +524,7 @@ async function associatePlansWithCommit(
 			continue;
 		}
 
-		const planFile = join(plansDir, `${slug}.md`);
+		const planFile = entry.sourcePath;
 		if (!existsSync(planFile)) continue;
 
 		// Read plan file content for orphan branch backup + content hash

@@ -2017,10 +2017,15 @@ describe("Extension", () => {
 				);
 			});
 
-			it("opens source file for uncommitted plans", async () => {
+			it("opens source file for uncommitted plans using filePath from PlanItem", async () => {
 				const handler = getRegisteredCommand("jollimemory.editPlan");
 				await handler({
-					plan: { slug: "my-plan", title: "My Plan", commitHash: undefined },
+					plan: {
+						slug: "my-plan",
+						title: "My Plan",
+						commitHash: undefined,
+						filePath: normalize("/home/user/.claude/plans/my-plan.md"),
+					},
 				});
 
 				expect(openTextDocument).toHaveBeenCalledWith(
@@ -2028,22 +2033,65 @@ describe("Extension", () => {
 				);
 			});
 
-			it("accepts string slug instead of PlanItem", async () => {
+			it("opens external-path plan using filePath from PlanItem", async () => {
+				// External plan: filePath is an arbitrary absolute path outside ~/.claude/plans/
 				const handler = getRegisteredCommand("jollimemory.editPlan");
-				// editPlan(slug: string, committed: false, title: "My Plan")
+				await handler({
+					plan: {
+						slug: "foo-plan",
+						title: "External Foo",
+						commitHash: undefined,
+						filePath: normalize("/repo/docs/foo-plan.md"),
+					},
+				});
+
+				expect(openTextDocument).toHaveBeenCalledWith(
+					normalize("/repo/docs/foo-plan.md"),
+				);
+			});
+
+			it("falls back to bridge.listPlans() when invoked with bare slug", async () => {
+				mockBridge.listPlans.mockResolvedValue([
+					{
+						slug: "my-plan",
+						filePath: normalize("/home/user/.claude/plans/my-plan.md"),
+					},
+				]);
+
+				const handler = getRegisteredCommand("jollimemory.editPlan");
 				await handler("my-plan", false, "My Plan");
 
+				expect(mockBridge.listPlans).toHaveBeenCalled();
 				expect(openTextDocument).toHaveBeenCalledWith(
 					normalize("/home/user/.claude/plans/my-plan.md"),
 				);
 			});
 
 			it("uses default committed and title values when only a slug is provided", async () => {
+				mockBridge.listPlans.mockResolvedValue([
+					{
+						slug: "my-plan",
+						filePath: normalize("/home/user/.claude/plans/my-plan.md"),
+					},
+				]);
+
 				const handler = getRegisteredCommand("jollimemory.editPlan");
 				await handler("my-plan");
 
 				expect(openTextDocument).toHaveBeenCalledWith(
 					normalize("/home/user/.claude/plans/my-plan.md"),
+				);
+			});
+
+			it("warns and returns when filePath cannot be resolved", async () => {
+				mockBridge.listPlans.mockResolvedValue([]);
+
+				const handler = getRegisteredCommand("jollimemory.editPlan");
+				await handler("missing-from-registry");
+
+				expect(openTextDocument).not.toHaveBeenCalled();
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("missing-from-registry"),
 				);
 			});
 
@@ -5059,7 +5107,11 @@ describe("Extension", () => {
 				merged: [
 					{
 						kind: "plan",
-						plan: { slug: "my-plan", title: "My Plan" },
+						plan: {
+							slug: "my-plan",
+							title: "My Plan",
+							filePath: "/home/user/.claude/plans/my-plan.md",
+						},
 					},
 				],
 				changeReason: "init",
@@ -5072,6 +5124,36 @@ describe("Extension", () => {
 			expect(executeCommand).toHaveBeenCalledWith(
 				"markdown.showPreview",
 				expect.objectContaining({ fsPath: expect.stringContaining("my-plan") }),
+			);
+		});
+
+		it("opens an external-path plan via its registry filePath", async () => {
+			const ctx = makeContext();
+			activate(ctx);
+
+			mockPlansStore.getSnapshot.mockReturnValueOnce({
+				merged: [
+					{
+						kind: "plan",
+						plan: {
+							slug: "foo-plan",
+							title: "External Foo",
+							filePath: "/repo/docs/foo-plan.md",
+						},
+					},
+				],
+				changeReason: "init",
+			} as never);
+			existsSync.mockImplementationOnce(() => true);
+
+			const handler = getRegisteredCommand("jollimemory.openPlanForPreview");
+			await handler("foo-plan");
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"markdown.showPreview",
+				expect.objectContaining({
+					fsPath: expect.stringContaining("foo-plan.md"),
+				}),
 			);
 		});
 

@@ -35,6 +35,17 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
+// Pin homedir() so fixtures' "/home/user/.claude/plans/<slug>.md" sourcePaths
+// align with what the implementation computes via join(homedir(), ...) — keeps
+// tests deterministic across Windows local and POSIX CI environments.
+vi.mock("node:os", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:os")>();
+	return {
+		...actual,
+		homedir: vi.fn().mockReturnValue("/home/user"),
+	};
+});
+
 // Mock node:readline so we can simulate line-by-line transcript scanning
 vi.mock("node:readline", () => ({
 	createInterface: vi.fn(),
@@ -50,6 +61,7 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import { createReadStream, existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { extractLinearIssuesFromTranscript } from "../core/LinearIssueExtractor.js";
 import { writeLinearIssueMarkdown } from "../core/LinearIssueStore.js";
@@ -512,12 +524,15 @@ describe("StopHook — plan discovery", () => {
 		);
 	});
 
-	it("should ignore Write/Edit tool calls that do not target the plans directory", async () => {
+	it("should ignore Write/Edit tool calls targeting non-.md files", async () => {
+		// Pure non-.md paths must not be registered. (External .md handling has its own
+		// suite below; the original `/tmp/not-a-plan.md` style path is now accepted as
+		// an external plan by design — see "External .md path detection" tests.)
 		vi.mocked(existsSync).mockReturnValue(true);
 
 		mockTranscriptWithLines([
-			'{"type":"tool_use","name":"Write","input":{"file_path":"/tmp/not-a-plan.md"}}',
-			'{"type":"tool_use","name":"Edit","input":{"file_path":"C:\\\\Users\\\\user\\\\Desktop\\\\note.md"}}',
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/src/index.ts"}}',
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/config.json"}}',
 		]);
 
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
@@ -992,6 +1007,302 @@ describe("StopHook — plan discovery", () => {
 		// The error handler resolves the promise (does not reject).
 		// Cursor should still be updated (totalLines = 0 since no lines were read).
 		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	// ─── External .md path detection ────────────────────────────────────────
+
+	it("should register external .md file (docs/foo.md) as a plan", async () => {
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // external plan file
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/foo-plan.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).toHaveBeenCalledWith(
+			expect.objectContaining({
+				plans: expect.objectContaining({
+					"foo-plan": expect.objectContaining({
+						slug: "foo-plan",
+						sourcePath: "/repo/docs/foo-plan.md",
+						commitHash: null,
+						editCount: 1,
+					}),
+				}),
+			}),
+			PROJECT_DIR,
+		);
+	});
+
+	it("should not register .md files under .claude/ (memory, skill, agent)", async () => {
+		vi.mocked(existsSync).mockReturnValue(true);
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/home/user/.claude/memory/feedback_x.md"}}',
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/home/user/.claude/skill/foo.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	it("should not register .md files under node_modules/", async () => {
+		vi.mocked(existsSync).mockReturnValue(true);
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/node_modules/pkg/README.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	it("should not register common non-plan basenames (README.md / CLAUDE.md / case-insensitive variants)", async () => {
+		vi.mocked(existsSync).mockReturnValue(true);
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/README.md"}}',
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/CLAUDE.md"}}',
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/Claude.md"}}',
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/claude.md"}}',
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/AGENTS.md"}}',
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/CHANGELOG.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	it("should accumulate editCount across multiple Edit calls to the same external .md", async () => {
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // external plan file
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/multi.md"}}',
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/multi.md"}}',
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/multi.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).toHaveBeenCalledWith(
+			expect.objectContaining({
+				plans: expect.objectContaining({
+					multi: expect.objectContaining({ editCount: 3 }),
+				}),
+			}),
+			PROJECT_DIR,
+		);
+	});
+
+	it("should disambiguate external .md whose basename collides with an existing ~/.claude/plans/ slug", async () => {
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // external plan file
+
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {
+				foo: {
+					slug: "foo",
+					title: "Canonical Foo",
+					sourcePath: "/home/user/.claude/plans/foo.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					branch: "main",
+					commitHash: null,
+					editCount: 1,
+				},
+			},
+		});
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/foo.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		// Original `foo` is untouched, new slug is `foo-<hash8>`
+		expect(saved?.plans.foo?.sourcePath).toBe("/home/user/.claude/plans/foo.md");
+		const externalSlug = Object.keys(saved?.plans ?? {}).find((s) => /^foo-[0-9a-f]{8}$/.test(s));
+		expect(externalSlug).toBeDefined();
+		expect(saved?.plans[externalSlug as string]?.sourcePath).toBe("/repo/docs/foo.md");
+	});
+
+	it("should reuse hash-suffixed slug on subsequent edits (idempotent reverse-lookup)", async () => {
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // external plan file
+
+		// Registry has ONLY the hash-suffixed entry — base `foo` slot was cleaned up.
+		// Reverse-lookup by sourcePath must still find this entry and reuse its slug,
+		// rather than naively registering a fresh `foo` entry.
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {
+				"foo-a3b7c2d1": {
+					slug: "foo-a3b7c2d1",
+					title: "External Foo",
+					sourcePath: "/repo/docs/foo.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					branch: "main",
+					commitHash: null,
+					editCount: 1,
+				},
+			},
+		});
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/foo.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		// Same slug reused, editCount incremented; no spurious `foo` entry created
+		expect(saved?.plans["foo-a3b7c2d1"]?.editCount).toBe(2);
+		expect(saved?.plans.foo).toBeUndefined();
+	});
+
+	it("should advance cursor + write registry when transcript has only external .md plans (no slug)", async () => {
+		// Regression guard: the early-exit must consider externalPlans, not just slugs.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // external plan file
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/lonely.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).toHaveBeenCalled();
+		expect(saveCursor).toHaveBeenCalledWith(
+			expect.objectContaining({
+				transcriptPath: `plan:${TRANSCRIPT_PATH}`,
+				lineNumber: 1,
+			}),
+			PROJECT_DIR,
+		);
+	});
+
+	it("should accept .md paths outside the workspace (e.g. cross-project plans directory)", async () => {
+		// `E:\jm-docs\` style paths must not be rejected — see "设计决策:不限制
+		// 外部路径必须位于 cwd 之内" in the plan doc.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // external plan file
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"E:\\\\jm-docs\\\\some-plan.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		// The slug is the basename ("some-plan"); sourcePath is the un-escaped Windows path.
+		expect(savePlansRegistry).toHaveBeenCalledWith(
+			expect.objectContaining({
+				plans: expect.objectContaining({
+					"some-plan": expect.objectContaining({
+						sourcePath: "E:\\jm-docs\\some-plan.md",
+					}),
+				}),
+			}),
+			PROJECT_DIR,
+		);
+	});
+
+	it("should skip external .md when source file no longer exists at upsert time", async () => {
+		// Transcript exists but the .md was deleted between Edit and Stop.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(false); // external plan file gone
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/gone.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	it("should derive slug platform-agnostically from Windows-style transcript paths (CI regression)", async () => {
+		// node:path.basename is platform-specific: on POSIX CI it does NOT
+		// recognize `\` as a separator, so `basename("E:\\jm-docs\\some-plan.md", ".md")`
+		// returns the entire string with `.md` stripped. The implementation must
+		// use a separator-agnostic split so this case yields slug "some-plan"
+		// regardless of the runtime platform.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // external plan file
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Edit","input":{"file_path":"E:\\\\jm-docs\\\\some-plan.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		expect(saved?.plans["some-plan"]).toBeDefined();
+		// Make sure the buggy full-path slug never appears
+		const buggySlug = Object.keys(saved?.plans ?? {}).find((s) => s.includes("\\") || s.includes("/"));
+		expect(buggySlug).toBeUndefined();
+	});
+
+	it("should hash-suffix a canonical ~/.claude/plans/ slug when an external entry already holds the base slug", async () => {
+		// Collision-order regression: external `docs/foo.md` was registered first
+		// at slug `foo`. Later, a canonical `~/.claude/plans/foo.md` edit must
+		// NOT overwrite the external entry's sourcePath via upsertEntry — it
+		// must claim a hash-suffixed slot.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // canonical plan file
+
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {
+				foo: {
+					slug: "foo",
+					title: "External Foo",
+					sourcePath: "/repo/docs/foo.md", // external lives at base slug
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					branch: "main",
+					commitHash: null,
+					editCount: 1,
+				},
+			},
+		});
+
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/home/user/.claude/plans/foo.md"}}',
+		]);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		// External entry's sourcePath must be untouched
+		expect(saved?.plans.foo?.sourcePath).toBe("/repo/docs/foo.md");
+		// Canonical lands in a hash-suffixed slug; assert via join() so the
+		// expected separators match what the implementation's `join(homedir(),
+		// ...)` produces on the current platform.
+		const canonicalSlug = Object.keys(saved?.plans ?? {}).find((s) => /^foo-[0-9a-f]{8}$/.test(s));
+		expect(canonicalSlug).toBeDefined();
+		expect(saved?.plans[canonicalSlug as string]?.sourcePath).toBe(
+			join("/home/user", ".claude", "plans", "foo.md"),
+		);
 	});
 });
 

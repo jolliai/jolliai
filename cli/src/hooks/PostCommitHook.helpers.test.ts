@@ -726,7 +726,7 @@ describe("PostCommitHook helpers", () => {
 						sluggy: {
 							slug: "sluggy",
 							title: "Sluggy",
-							sourcePath: "/mock-home/.claude/plans/sluggy.md",
+							sourcePath: planPath,
 							addedAt: "2026-02-18T00:00:00Z",
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
@@ -741,7 +741,7 @@ describe("PostCommitHook helpers", () => {
 						sluggy: {
 							slug: "sluggy",
 							title: "Sluggy",
-							sourcePath: "/mock-home/.claude/plans/sluggy.md",
+							sourcePath: planPath,
 							addedAt: "2026-02-18T00:00:00Z",
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
