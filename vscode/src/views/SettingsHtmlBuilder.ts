@@ -182,11 +182,21 @@ export function buildSettingsHtml(nonce: string): string {
 
     <!-- ── Tab 5: Others ── -->
     <section class="tab-panel hidden" data-panel="others" role="tabpanel">
-      <p class="section-hint">Hide files from the Changes panel and AI commits.</p>
+      <div class="toggle-row">
+        <label class="settings-label" for="dcoSignoff">
+          Sign commits with DCO
+          <span class="hint">Adds a <code>Signed-off-by</code> trailer (<code>git commit -s</code>) to commits made by Jolli Memory (commit / amend / squash). Required by many open-source projects' CI.</span>
+        </label>
+        <label class="toggle-switch">
+          <input type="checkbox" id="dcoSignoff" />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
       <div class="settings-row column">
         <label class="settings-label" for="excludePatterns">
-          Patterns
-          <span class="hint">Comma-separated globs, e.g. **/*.vsix, dist/**, node_modules/*</span>
+          Exclude Patterns
+          <span class="hint">Hide files from the Changes panel and AI commits. Comma-separated globs, e.g. <code>**/*.vsix</code>, <code>dist/**</code>, <code>node_modules/*</code>.</span>
         </label>
         <input type="text" id="excludePatterns" placeholder="**/*.vsix, docs/*.md" spellcheck="false" />
       </div>

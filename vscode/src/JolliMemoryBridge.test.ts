@@ -1677,6 +1677,27 @@ describe("JolliMemoryBridge", () => {
 			expect(savePluginSource).toHaveBeenCalledWith(TEST_CWD);
 			expect(hash).toBe("abc123def456");
 		});
+
+		it("omits -s when dcoSignoff is false (default)", async () => {
+			mockExecFileSuccess(""); // commit
+			mockExecFileSuccess("abc\n"); // rev-parse
+
+			await makeBridge().commit("feat: x");
+
+			const args = execFileMock.mock.calls[0]?.[1] as ReadonlyArray<string>;
+			expect(args).toEqual(["commit", "-m", "feat: x"]);
+		});
+
+		it("inserts -s into commit args when dcoSignoff is true", async () => {
+			loadConfig.mockResolvedValue({ dcoSignoff: true });
+			mockExecFileSuccess(""); // commit
+			mockExecFileSuccess("abc\n"); // rev-parse
+
+			await makeBridge().commit("feat: x");
+
+			const args = execFileMock.mock.calls[0]?.[1] as ReadonlyArray<string>;
+			expect(args).toEqual(["commit", "-s", "-m", "feat: x"]);
+		});
 	});
 
 	// ── amendCommit ──────────────────────────────────────────────────────
@@ -1697,6 +1718,29 @@ describe("JolliMemoryBridge", () => {
 			// amend-pending.json is no longer written — post-rewrite handles amend detection
 			expect(hash).toBe("newHash456");
 		});
+
+		it("omits -s when dcoSignoff is false (default)", async () => {
+			mockExecFileSuccess("old\n");
+			mockExecFileSuccess(""); // amend
+			mockExecFileSuccess("new\n");
+
+			await makeBridge().amendCommit("fix: x");
+
+			const args = execFileMock.mock.calls[1]?.[1] as ReadonlyArray<string>;
+			expect(args).toEqual(["commit", "--amend", "-m", "fix: x"]);
+		});
+
+		it("inserts -s into amend args when dcoSignoff is true", async () => {
+			loadConfig.mockResolvedValue({ dcoSignoff: true });
+			mockExecFileSuccess("old\n");
+			mockExecFileSuccess(""); // amend
+			mockExecFileSuccess("new\n");
+
+			await makeBridge().amendCommit("fix: x");
+
+			const args = execFileMock.mock.calls[1]?.[1] as ReadonlyArray<string>;
+			expect(args).toEqual(["commit", "--amend", "-s", "-m", "fix: x"]);
+		});
 	});
 
 	// ── amendCommitNoEdit ───────────────────────────────────────────────
@@ -1716,6 +1760,29 @@ describe("JolliMemoryBridge", () => {
 			expect(savePluginSource).toHaveBeenCalledWith(TEST_CWD);
 			// amend-pending.json is no longer written — post-rewrite handles amend detection
 			expect(hash).toBe("newHash456");
+		});
+
+		it("omits -s when dcoSignoff is false (default)", async () => {
+			mockExecFileSuccess("old\n");
+			mockExecFileSuccess(""); // amend --no-edit
+			mockExecFileSuccess("new\n");
+
+			await makeBridge().amendCommitNoEdit();
+
+			const args = execFileMock.mock.calls[1]?.[1] as ReadonlyArray<string>;
+			expect(args).toEqual(["commit", "--amend", "--no-edit"]);
+		});
+
+		it("inserts -s into amend --no-edit args when dcoSignoff is true", async () => {
+			loadConfig.mockResolvedValue({ dcoSignoff: true });
+			mockExecFileSuccess("old\n");
+			mockExecFileSuccess(""); // amend --no-edit
+			mockExecFileSuccess("new\n");
+
+			await makeBridge().amendCommitNoEdit();
+
+			const args = execFileMock.mock.calls[1]?.[1] as ReadonlyArray<string>;
+			expect(args).toEqual(["commit", "--amend", "-s", "--no-edit"]);
 		});
 	});
 
@@ -1950,6 +2017,35 @@ describe("JolliMemoryBridge", () => {
 
 			expect(hash).toBe("newSquashHash");
 			expect(saveSquashPending).toHaveBeenCalledWith([], "forkPoint", TEST_CWD);
+		});
+
+		it("omits -s on the squash commit when dcoSignoff is false (default)", async () => {
+			mockExecFileSuccess("headBefore\n");
+			mockExecFileSuccess("forkPoint\n");
+			mockExecFileSuccess(""); // reset --soft
+			mockExecFileSuccess(""); // commit
+			mockExecFileSuccess("newSquashHash\n");
+
+			await makeBridge().squashCommits(["oldest", "newest"], "msg");
+
+			const commitArgs = execFileMock.mock
+				.calls[3]?.[1] as ReadonlyArray<string>;
+			expect(commitArgs).toEqual(["commit", "-m", "msg"]);
+		});
+
+		it("inserts -s into the squash commit args when dcoSignoff is true", async () => {
+			loadConfig.mockResolvedValue({ dcoSignoff: true });
+			mockExecFileSuccess("headBefore\n");
+			mockExecFileSuccess("forkPoint\n");
+			mockExecFileSuccess(""); // reset --soft
+			mockExecFileSuccess(""); // commit
+			mockExecFileSuccess("newSquashHash\n");
+
+			await makeBridge().squashCommits(["oldest", "newest"], "msg");
+
+			const commitArgs = execFileMock.mock
+				.calls[3]?.[1] as ReadonlyArray<string>;
+			expect(commitArgs).toEqual(["commit", "-s", "-m", "msg"]);
 		});
 	});
 

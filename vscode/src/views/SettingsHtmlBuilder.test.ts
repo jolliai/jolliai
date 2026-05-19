@@ -169,6 +169,13 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).not.toContain("Pause Jolli Memory");
 	});
 
+	it("Others tab contains the DCO sign-off toggle", () => {
+		expect(html).toContain('id="dcoSignoff"');
+		expect(html).toContain("Sign commits with DCO");
+		// Hint references the trailer added by `-s`.
+		expect(html).toContain("Signed-off-by");
+	});
+
 	// ── Action bar / shared ──
 
 	it("contains Apply Changes button", () => {

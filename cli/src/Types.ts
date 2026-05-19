@@ -738,6 +738,13 @@ export interface JolliMemoryConfig {
 	 * Anthropic otherwise) so existing configs keep working.
 	 */
 	readonly aiProvider?: "anthropic" | "jolli";
+	/**
+	 * When true, plugin-initiated `git commit` / `--amend` / squash invocations
+	 * pass `-s` to add a DCO `Signed-off-by:` trailer. Off by default. Read at
+	 * each commit site; not cached. The `-s` flag is idempotent — git skips
+	 * the trailer if an identical line already exists in the message.
+	 */
+	readonly dcoSignoff?: boolean;
 }
 
 /** Result of enable/disable operations */

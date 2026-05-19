@@ -42,6 +42,7 @@ export function buildSettingsScript(): string {
   const rebuildKbBtn = document.getElementById('rebuildKbBtn');
   const rebuildKbStatus = document.getElementById('rebuildKbStatus');
   const excludePatternsInput = document.getElementById('excludePatterns');
+  const dcoSignoffInput = document.getElementById('dcoSignoff');
   const applyBtn = document.getElementById('applyBtn');
   const saveFeedback = document.getElementById('saveFeedback');
   const anthropicMissingWarn = document.getElementById('anthropicMissingWarn');
@@ -311,6 +312,7 @@ export function buildSettingsScript(): string {
       copilotEnabled: copilotEnabledInput.checked,
       localFolder: localFolderInput.value,
       excludePatterns: excludePatternsInput.value,
+      dcoSignoff: dcoSignoffInput.checked,
     };
     checkDirty();
   }
@@ -329,7 +331,8 @@ export function buildSettingsScript(): string {
       cursorEnabledInput.checked !== initialState.cursorEnabled ||
       copilotEnabledInput.checked !== initialState.copilotEnabled ||
       localFolderInput.value !== initialState.localFolder ||
-      excludePatternsInput.value !== initialState.excludePatterns
+      excludePatternsInput.value !== initialState.excludePatterns ||
+      dcoSignoffInput.checked !== initialState.dcoSignoff
     );
     updateApplyBtn();
   }
@@ -388,6 +391,7 @@ export function buildSettingsScript(): string {
   [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput].forEach(function(input) {
     input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
+  dcoSignoffInput.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
 
   // ── Apply Changes ──
   // Returns true if the apply message was posted, false if a validation error
@@ -420,6 +424,7 @@ export function buildSettingsScript(): string {
         copilotEnabled: copilotEnabledInput.checked,
         localFolder: localFolderInput.value.trim(),
         excludePatterns: excludePatternsInput.value,
+        dcoSignoff: dcoSignoffInput.checked,
       },
       maskedApiKey: maskedApiKey,
       maskedJolliApiKey: maskedJolliApiKey,
@@ -472,6 +477,7 @@ export function buildSettingsScript(): string {
         copilotEnabledInput.checked = msg.settings.copilotEnabled;
         localFolderInput.value = msg.settings.localFolder || '';
         excludePatternsInput.value = msg.settings.excludePatterns;
+        dcoSignoffInput.checked = !!msg.settings.dcoSignoff;
         maskedApiKey = msg.maskedApiKey;
         maskedJolliApiKey = msg.maskedJolliApiKey;
         // Clear all validation errors on fresh load

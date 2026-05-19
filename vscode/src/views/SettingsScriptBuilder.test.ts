@@ -92,6 +92,28 @@ describe("SettingsScriptBuilder", () => {
 		);
 	});
 
+	// ── DCO sign-off toggle ──
+
+	it("references the dcoSignoff DOM input", () => {
+		expect(script).toContain("getElementById('dcoSignoff')");
+	});
+
+	it("ships dcoSignoff in the save payload", () => {
+		expect(script).toContain("dcoSignoff: dcoSignoffInput.checked");
+	});
+
+	it("loads dcoSignoff from host message and coerces to boolean", () => {
+		expect(script).toContain(
+			"dcoSignoffInput.checked = !!msg.settings.dcoSignoff",
+		);
+	});
+
+	it("includes dcoSignoff in dirty tracking", () => {
+		expect(script).toContain(
+			"dcoSignoffInput.checked !== initialState.dcoSignoff",
+		);
+	});
+
 	// ── Tab switching ──
 
 	it("wires .tab-button clicks to .tab-active toggle and panel show/hide", () => {

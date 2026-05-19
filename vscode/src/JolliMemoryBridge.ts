@@ -731,11 +731,22 @@ export class JolliMemoryBridge {
 
 	// ── Commit operations ─────────────────────────────────────────────────
 
+	/**
+	 * Returns `["-s"]` when the user has enabled DCO sign-off in settings,
+	 * otherwise `[]`. Read on each call so a settings flip takes effect
+	 * immediately without an extension reload.
+	 */
+	private async signoffArgs(): Promise<Array<string>> {
+		const cfg = await loadConfig();
+		return cfg.dcoSignoff ? ["-s"] : [];
+	}
+
 	/** Creates a new commit with the given message. Returns the new commit hash. */
 	async commit(message: string): Promise<string> {
 		log.info("bridge", "commit()", { message });
 		await savePluginSource(this.cwd);
-		await execGit(["commit", "-m", message], this.cwd);
+		const signoff = await this.signoffArgs();
+		await execGit(["commit", ...signoff, "-m", message], this.cwd);
 		const hash = await this.getHEADHash();
 		log.info("bridge", `Commit created: ${hash}`);
 		return hash;
@@ -752,7 +763,8 @@ export class JolliMemoryBridge {
 		// Amend detection is handled by post-rewrite(amend) which enqueues the operation
 		// with the old→new hash mapping from git's stdin.
 		await savePluginSource(this.cwd);
-		await execGit(["commit", "--amend", "-m", message], this.cwd);
+		const signoff = await this.signoffArgs();
+		await execGit(["commit", "--amend", ...signoff, "-m", message], this.cwd);
 		const hash = await this.getHEADHash();
 		log.info("bridge", "Amend created", {
 			headBeforeAmend: shortHash(headBeforeAmend),
@@ -768,7 +780,8 @@ export class JolliMemoryBridge {
 			headBeforeAmend: shortHash(headBeforeAmend),
 		});
 		await savePluginSource(this.cwd);
-		await execGit(["commit", "--amend", "--no-edit"], this.cwd);
+		const signoff = await this.signoffArgs();
+		await execGit(["commit", "--amend", ...signoff, "--no-edit"], this.cwd);
 		const hash = await this.getHEADHash();
 		log.info("bridge", "Amend (no-edit) created", {
 			headBeforeAmend: shortHash(headBeforeAmend),
@@ -1254,7 +1267,8 @@ export class JolliMemoryBridge {
 		log.debug("bridge", "git reset --soft complete");
 
 		// Step 4: create the squash commit
-		await execGit(["commit", "-m", message], this.cwd);
+		const signoff = await this.signoffArgs();
+		await execGit(["commit", ...signoff, "-m", message], this.cwd);
 		const newHash = await this.getHEADHash();
 		log.info("bridge", "Squash commit created", {
 			headBeforeSquash: shortHash(headBeforeSquash),
