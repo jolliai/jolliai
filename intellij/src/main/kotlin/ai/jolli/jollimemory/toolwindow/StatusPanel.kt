@@ -2,6 +2,8 @@ package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
 import ai.jolli.jollimemory.core.CodexSessionDiscoverer
+import ai.jolli.jollimemory.core.CopilotChatSupport
+import ai.jolli.jollimemory.core.CopilotSupport
 import ai.jolli.jollimemory.core.GeminiSupport
 import ai.jolli.jollimemory.core.CursorSupport
 import ai.jolli.jollimemory.core.OpenCodeSupport
@@ -250,6 +252,41 @@ class StatusPanel(
                     hookMissingTooltip = null,
                 )
             }
+        }
+
+        // 11. Copilot Integration (no hooks needed — covers both CLI and VS Code Chat under one toggle)
+        val copilotCliDetected = status.copilotDetected ?: CopilotSupport.isCopilotInstalled()
+        val copilotChatDetected = status.copilotChatDetected ?: CopilotChatSupport.isCopilotChatInstalled()
+        val copilotScanError = status.copilotScanError
+        val copilotChatScanError = status.copilotChatScanError
+        if (copilotScanError != null) {
+            listModel.addElement(StatusRow(
+                Icon.WARN,
+                "Copilot Integration",
+                "unavailable — ${copilotScanError.kind}",
+                "Copilot CLI DB scan failed (${copilotScanError.kind}): ${copilotScanError.message}",
+            ))
+        }
+        if (copilotChatScanError != null) {
+            listModel.addElement(StatusRow(
+                Icon.WARN,
+                "Copilot Chat",
+                "unavailable — ${copilotChatScanError.kind}",
+                "Copilot Chat scan failed (${copilotChatScanError.kind}): ${copilotChatScanError.message}",
+            ))
+        }
+        if (copilotCliDetected || copilotChatDetected) {
+            val enabled = config.copilotEnabled != false
+            val cliMark = if (copilotCliDetected) "✓" else "✗"
+            val chatMark = if (copilotChatDetected) "✓" else "✗"
+            addIntegrationRow(
+                enabled = enabled,
+                hookInstalled = null,
+                label = "Copilot Integration",
+                enabledTooltip = "GitHub Copilot detected (CLI: $cliMark, Chat: $chatMark) — session discovery is enabled",
+                disabledTooltip = "GitHub Copilot detected (CLI: $cliMark, Chat: $chatMark) but session discovery is disabled in config",
+                hookMissingTooltip = null,
+            )
         }
 
         add(JBScrollPane(statusList), BorderLayout.CENTER)

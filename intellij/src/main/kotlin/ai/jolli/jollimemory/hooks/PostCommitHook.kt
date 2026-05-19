@@ -163,6 +163,16 @@ object PostCommitHook {
                 allSessions.addAll(CursorSupport.discoverSessions(cwd).sessions)
             }
 
+            // On-demand discovery: Copilot CLI (SQLite-backed, no hook)
+            if (config.copilotEnabled != false && CopilotSupport.isCopilotInstalled()) {
+                allSessions.addAll(CopilotSupport.discoverSessions(cwd).sessions)
+            }
+
+            // On-demand discovery: Copilot Chat (JSONL-backed, no hook) — shares copilotEnabled with the CLI source
+            if (config.copilotEnabled != false && CopilotChatSupport.isCopilotChatInstalled()) {
+                allSessions.addAll(CopilotChatSupport.discoverSessions(cwd).sessions)
+            }
+
             val sessions = allSessions
             log.info("Discovered %d session(s): %s", sessions.size,
                 sessions.joinToString(", ") { "${it.source ?: "claude"}:${it.sessionId.take(8)}" })
@@ -192,6 +202,12 @@ object PostCommitHook {
                         }
                         TranscriptSource.cursor -> {
                             CursorSupport.readTranscript(session.transcriptPath, cursor, commitInfo.date)
+                        }
+                        TranscriptSource.copilot -> {
+                            CopilotSupport.readTranscript(session.transcriptPath, cursor, commitInfo.date)
+                        }
+                        TranscriptSource.`copilot-chat` -> {
+                            CopilotChatSupport.readTranscript(session.transcriptPath, cursor, commitInfo.date)
                         }
                         else -> {
                             val parser = getParserForSource(source)

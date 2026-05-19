@@ -2,6 +2,8 @@ package ai.jolli.jollimemory.bridge
 
 import ai.jolli.jollimemory.core.CodexSessionDiscoverer
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.CopilotChatSupport
+import ai.jolli.jollimemory.core.CopilotSupport
 import ai.jolli.jollimemory.core.CursorSupport
 import ai.jolli.jollimemory.core.GeminiSupport
 import ai.jolli.jollimemory.core.JmLogger
@@ -40,6 +42,12 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
         val cursorError = if (cursorInstalled && config.cursorEnabled != false)
             CursorSupport.checkDbHealth() else null
 
+        val copilotInstalled = CopilotSupport.isCopilotInstalled()
+        val copilotError = if (copilotInstalled && config.copilotEnabled != false)
+            CopilotSupport.checkDbHealth() else null
+
+        val copilotChatInstalled = CopilotChatSupport.isCopilotChatInstalled()
+
         return StatusInfo(
             enabled = hooksInstalled,
             claudeHookInstalled = installer.isClaudeHookInstalled(),
@@ -61,6 +69,11 @@ class SummaryReader(private val projectDir: String, private val git: GitOps) {
             cursorDetected = cursorInstalled,
             cursorEnabled = config.cursorEnabled,
             cursorScanError = cursorError,
+            copilotDetected = copilotInstalled,
+            copilotEnabled = config.copilotEnabled,
+            copilotScanError = copilotError,
+            copilotChatDetected = copilotChatInstalled,
+            copilotChatScanError = null,
         )
     }
 
