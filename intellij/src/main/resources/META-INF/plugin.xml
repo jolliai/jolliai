@@ -89,6 +89,11 @@
                     text="AI Commit"
                     description="Generate AI commit message and commit selected files"
                     icon="/icons/sparkle.svg"/>
+            <action id="JolliMemory.DiscardSelected"
+                    class="ai.jolli.jollimemory.actions.DiscardSelectedAction"
+                    text="Discard Selected"
+                    description="Discard changes for all selected files"
+                    icon="/icons/discard.svg"/>
             <action id="JolliMemory.RefreshChanges"
                     class="ai.jolli.jollimemory.actions.RefreshChangesAction"
                     text="Refresh Changes"
