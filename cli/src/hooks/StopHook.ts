@@ -24,6 +24,7 @@
  * This hook runs with { "async": true } so it doesn't block Claude Code.
  */
 
+import { createHash } from "node:crypto";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve as pathResolve } from "node:path";
@@ -41,7 +42,7 @@ import {
 	upsertLinearIssueEntry,
 } from "../core/SessionTracker.js";
 import { createLogger, setLogDir } from "../Logger.js";
-import type { ClaudeHookInput, SessionInfo } from "../Types.js";
+import type { ClaudeHookInput, PlanEntry, SessionInfo } from "../Types.js";
 import { readStdin } from "./HookUtils.js";
 
 const log = createLogger("StopHook");
@@ -159,15 +160,103 @@ const WRITE_EDIT_REGEX = /"name":"(?:Write|Edit)"/;
 const PLANS_PATH_SLUG_REGEX = /[/\\]{1,2}\.claude[/\\]{1,2}plans[/\\]{1,2}([^/\\.]+)\.md/;
 
 /**
+ * Fallback regex: matches any Write/Edit tool_use file_path ending in .md.
+ * Runs only when PLANS_PATH_SLUG_REGEX misses, so ~/.claude/plans/ stays
+ * handled by the original slug-keyed code path.
+ */
+const ANY_MD_PATH_REGEX = /"file_path":"([^"]+\.md)"/;
+
+/** Path segments excluded from external plan detection. */
+const EXTERNAL_EXCLUDE_SEGMENTS = [/[/\\]\.claude[/\\]/, /[/\\]node_modules[/\\]/, /[/\\]\.github[/\\]/];
+
+/** Basenames excluded — stored lowercase, compared after toLowerCase() on input. */
+const EXTERNAL_EXCLUDE_BASENAMES = new Set([
+	"claude.md",
+	"agents.md",
+	"readme.md",
+	"changelog.md",
+	"contributing.md",
+	"license.md",
+	"security.md",
+]);
+
+/**
+ * Normalize a path for case/separator-insensitive comparison. Used wherever
+ * two strings should be treated as "same file" even if Windows case or
+ * separator differs.
+ *
+ * Deliberately does NOT use `path.resolve` because on Windows, POSIX-absolute
+ * paths like `/home/user/foo.md` (which Claude transcripts can produce when
+ * running under WSL or via cross-platform tooling) are treated as relative and
+ * resolved against the runtime cwd. That made same-file checks platform-
+ * dependent. All callers pass absolute paths, so separator + case normalization
+ * is sufficient.
+ */
+function normalizePathForCompare(p: string): string {
+	const normalized = p.replace(/\\/g, "/");
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+/**
+ * Decide whether an external .md path is a plan candidate. Excludes
+ * ~/.claude/ subtree (memory/skill/agent/session), node_modules, .github, and
+ * common non-plan filenames at any depth (README.md, CLAUDE.md, etc.).
+ */
+function isExternalPlanCandidate(absPath: string): boolean {
+	if (EXTERNAL_EXCLUDE_SEGMENTS.some((re) => re.test(absPath))) return false;
+	const base = (absPath.split(/[/\\]/).pop() ?? "").toLowerCase();
+	return !EXTERNAL_EXCLUDE_BASENAMES.has(base);
+}
+
+/**
+ * Platform-agnostic basename + extension stripping. node:path.basename is
+ * locked to the runtime platform's separator — on POSIX it doesn't recognize
+ * `\` as a separator, so a Windows-style transcript path parsed on Linux CI
+ * yields `E:\jm-docs\some-plan` instead of `some-plan`. Splitting on both
+ * separators avoids that.
+ */
+function basenameNoExt(absPath: string, ext: string): string {
+	const last = absPath.split(/[/\\]/).pop() ?? "";
+	return last.endsWith(ext) ? last.slice(0, -ext.length) : last;
+}
+
+/**
+ * Returns a unique registry slug for a given absolute path.
+ *
+ * Resolution order:
+ *   1. SourcePath reverse-lookup: scan all entries, return the slug whose
+ *      sourcePath normalize-equals absPath. Idempotent — same file always
+ *      resolves to the same slug, including when the base slug entry has
+ *      been cleaned up but a hash-suffixed entry remains.
+ *   2. Base slug free: no entry at baseSlug → use baseSlug.
+ *   3. Base slug taken by a different file → `<baseSlug>-<pathHash8>`
+ *      (sha256(normalized absPath) first 8 hex chars).
+ *
+ * Existing entries are never renamed — backward-compatible across upgrades.
+ */
+function resolveUniqueSlug(baseSlug: string, absPath: string, plans: Record<string, PlanEntry>): string {
+	const targetNorm = normalizePathForCompare(absPath);
+	for (const [slug, entry] of Object.entries(plans)) {
+		if (normalizePathForCompare(entry.sourcePath) === targetNorm) return slug;
+	}
+	if (!plans[baseSlug]) return baseSlug;
+	const shortHash = createHash("sha256").update(targetNorm).digest("hex").slice(0, 8);
+	return `${baseSlug}-${shortHash}`;
+}
+
+/**
  * Incrementally scans the transcript for plan file references and updates plans.json.
  *
  * Uses a dedicated cursor (prefixed with "plan:") in cursors.json to track
  * how far the transcript has been scanned, so each StopHook invocation only
  * reads the newly appended lines.
  *
- * Detection covers two scenarios:
+ * Detection covers three scenarios:
  *   1. Plan mode: the transcript contains a "slug":"xxx" field
- *   2. Direct write: a Write/Edit tool call targets ~/.claude/plans/xxx.md
+ *   2. Direct write to ~/.claude/plans/: Write/Edit tool call hits the canonical dir
+ *   3. External .md files (e.g. docs/foo.md, E:\jm-docs\bar.md): Write/Edit tool
+ *      call on any .md path not excluded by isExternalPlanCandidate — slug is
+ *      derived from basename via resolveUniqueSlug for cross-path collisions.
  */
 async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string): Promise<void> {
 	const transcriptPath = sessionInfo.transcriptPath;
@@ -180,11 +269,11 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 	const cursor = await loadCursorForTranscript(cursorKey, cwd);
 	const startLine = cursor?.lineNumber ?? 0;
 
-	// Scan transcript from startLine, collecting discovered slugs and edit counts
-	const { slugs, totalLines } = await scanTranscriptForPlans(transcriptPath, startLine);
+	// Scan transcript from startLine, collecting discovered slugs / external paths
+	const { slugs, externalPlans, totalLines } = await scanTranscriptForPlans(transcriptPath, startLine);
 
-	if (slugs.size === 0) {
-		// No plans found, but still update cursor to avoid re-scanning
+	if (slugs.size === 0 && externalPlans.size === 0) {
+		// Nothing found, but still update cursor to avoid re-scanning
 		if (totalLines > startLine) {
 			await saveCursor(
 				{ transcriptPath: cursorKey, lineNumber: totalLines, updatedAt: new Date().toISOString() },
@@ -194,31 +283,23 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 		return;
 	}
 
-	// Upsert discovered slugs into plans.json
-	// Re-read registry right before writing to minimize race window with PostCommitHook
+	// Upsert into plans.json. Re-read registry right before writing to
+	// minimize race window with PostCommitHook.
 	const registry = await loadPlansRegistry(cwd);
 	const plans = { ...registry.plans };
 	const now = new Date().toISOString();
 	let branch: string | undefined;
 	let changed = false;
 
-	for (const [slug, editCount] of slugs) {
-		const planFile = join(homedir(), ".claude", "plans", `${slug}.md`);
-		if (!existsSync(planFile)) {
-			continue;
-		}
-
+	const upsertEntry = (slug: string, planFile: string, editCount: number): void => {
 		const existing = plans[slug];
 		if (existing?.contentHashAtCommit) {
 			// Archived guard — never resurrect if user explicitly removed it
 			if (existing.ignored) {
-				continue;
+				return;
 			}
-			// Check if the source file was overwritten with new content
-			const { createHash } = require("node:crypto") as typeof import("node:crypto");
 			const currentHash = createHash("sha256").update(readFileSync(planFile, "utf-8")).digest("hex");
 			if (currentHash !== existing.contentHashAtCommit) {
-				// File overwritten → create fresh uncommitted entry
 				branch ??= getCurrentBranch(cwd);
 				plans[slug] = {
 					slug,
@@ -233,15 +314,12 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 				changed = true;
 				log.info("Plan discovery: archived plan %s file changed — creating new entry", slug);
 			}
-			// If unchanged, skip (guard still active)
 		} else if (existing) {
-			// Increment editCount for uncommitted plans; skip committed/ignored
 			if (existing.commitHash === null && !existing.ignored) {
 				plans[slug] = { ...existing, editCount: existing.editCount + editCount, updatedAt: now };
 				changed = true;
 			}
 		} else {
-			// New plan entry — lazy-evaluate branch only when needed
 			branch ??= getCurrentBranch(cwd);
 			plans[slug] = {
 				slug,
@@ -255,6 +333,28 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 			};
 			changed = true;
 		}
+	};
+
+	// 1. Canonical ~/.claude/plans/ slugs. We still route through
+	//    resolveUniqueSlug so that if an external entry was registered first
+	//    under the same slug (e.g. docs/foo.md → "foo"), the canonical
+	//    ~/.claude/plans/foo.md gets a hash-suffixed slug rather than silently
+	//    overwriting the external entry's sourcePath via upsertEntry.
+	for (const [rawSlug, editCount] of slugs) {
+		const planFile = join(homedir(), ".claude", "plans", `${rawSlug}.md`);
+		if (!existsSync(planFile)) continue;
+		const slug = resolveUniqueSlug(rawSlug, planFile, plans);
+		upsertEntry(slug, planFile, editCount);
+	}
+
+	// 2. External .md paths — slug resolved against current plans snapshot.
+	//    basenameNoExt is platform-agnostic so a Windows-style path parsed on
+	//    POSIX CI still yields a clean filename slug.
+	for (const [absPath, editCount] of externalPlans) {
+		if (!existsSync(absPath)) continue;
+		const baseSlug = basenameNoExt(absPath, ".md");
+		const slug = resolveUniqueSlug(baseSlug, absPath, plans);
+		upsertEntry(slug, absPath, editCount);
 	}
 
 	if (changed) {
@@ -272,7 +372,11 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 			}
 		}
 		await savePlansRegistry({ version: 1, plans }, cwd);
-		log.info("Plan discovery: upserted %d slug(s) into plans.json: [%s]", slugs.size, [...slugs.keys()].join(", "));
+		log.info(
+			"Plan discovery: upserted %d slug(s) + %d external path(s) into plans.json",
+			slugs.size,
+			externalPlans.size,
+		);
 	}
 
 	// Update cursor so next invocation starts where we left off
@@ -281,14 +385,19 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 
 /**
  * Scans a transcript JSONL file starting from a given line, looking for plan references.
- * Returns a map of slug → editCount for all plans discovered in the new lines.
+ *
+ * Returns two maps:
+ *   - `slugs`: slug → editCount for plans in ~/.claude/plans/ (slug-keyed)
+ *   - `externalPlans`: absPath → editCount for .md files outside ~/.claude/plans/
+ *     (slug resolution deferred to the upsert phase, which has the registry snapshot)
  */
 function scanTranscriptForPlans(
 	transcriptPath: string,
 	startLine: number,
-): Promise<{ slugs: Map<string, number>; totalLines: number }> {
+): Promise<{ slugs: Map<string, number>; externalPlans: Map<string, number>; totalLines: number }> {
 	return new Promise((resolve) => {
 		const slugs = new Map<string, number>();
+		const externalPlans = new Map<string, number>();
 		let lineNumber = 0;
 
 		const stream = createReadStream(transcriptPath, { encoding: "utf-8" });
@@ -311,19 +420,30 @@ function scanTranscriptForPlans(
 				}
 			}
 
-			// Detect Write/Edit to ~/.claude/plans/*.md
+			// Detect Write/Edit tool calls. First try the slug-keyed
+			// ~/.claude/plans/ path; only fall back to the generic .md regex
+			// when that misses, so existing behavior is preserved.
 			if (line.includes('"type":"tool_use"') && WRITE_EDIT_REGEX.test(line)) {
 				const pathMatch = PLANS_PATH_SLUG_REGEX.exec(line);
 				if (pathMatch?.[1]) {
 					const slug = pathMatch[1];
 					slugs.set(slug, (slugs.get(slug) ?? 0) + 1);
+				} else {
+					const extMatch = ANY_MD_PATH_REGEX.exec(line);
+					if (extMatch?.[1]) {
+						// Transcript JSON-escapes backslashes as "\\"; unescape before use
+						const absPath = extMatch[1].replace(/\\\\/g, "\\");
+						if (isExternalPlanCandidate(absPath)) {
+							externalPlans.set(absPath, (externalPlans.get(absPath) ?? 0) + 1);
+						}
+					}
 				}
 			}
 		});
 
-		rl.on("close", () => resolve({ slugs, totalLines: lineNumber }));
+		rl.on("close", () => resolve({ slugs, externalPlans, totalLines: lineNumber }));
 		/* v8 ignore start - defensive: readline error handler for rare stream failures */
-		rl.on("error", () => resolve({ slugs, totalLines: lineNumber }));
+		rl.on("error", () => resolve({ slugs, externalPlans, totalLines: lineNumber }));
 		/* v8 ignore stop */
 	});
 }

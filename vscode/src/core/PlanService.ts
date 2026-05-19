@@ -115,7 +115,7 @@ function toPlanInfo(entry: PlanEntry, currentBranch?: string): PlanInfo | null {
 
 	// Skip archive guards (source file unchanged)
 	if (entry.contentHashAtCommit) {
-		const planFile = join(getPlansDir(), `${entry.slug}.md`);
+		const planFile = entry.sourcePath;
 		if (
 			!existsSync(planFile) ||
 			hashFileContent(planFile) === entry.contentHashAtCommit
@@ -396,13 +396,19 @@ export async function archivePlanForCommit(
 		cwd,
 	);
 
-	// Store plan file in orphan branch under new slug. branch is intentionally
-	// left undefined: FolderStorage.resolveBranchFromSlug uses the commit hash
-	// embedded in `newSlug` to look up the commit's branch from the manifest /
-	// index — that's the right home for the visible <branch>/plan--<slug>.md.
-	// Passing entry.branch would point at the plan's *home* branch, which can
-	// differ from the commit's branch when editing summaries cross-branch.
-	const planFile = join(getPlansDir(), `${slug}.md`);
+	// Store plan file in orphan branch under new slug.
+	//
+	// Source path: read from entry.sourcePath (same path used for
+	// contentHashAtCommit above) so the two snapshots can't diverge — and so
+	// external plans (e.g. docs/foo.md) are archived correctly.
+	//
+	// storePlans branch arg (below): intentionally left undefined.
+	// FolderStorage.resolveBranchFromSlug uses the commit hash embedded in
+	// `newSlug` to look up the commit's branch from the manifest / index —
+	// that's the right home for the visible <branch>/plan--<slug>.md. Passing
+	// entry.branch would point at the plan's *home* branch, which can differ
+	// from the commit's branch when editing summaries cross-branch.
+	const planFile = entry.sourcePath;
 	if (existsSync(planFile)) {
 		const content = fsReadFileSync(planFile, "utf-8");
 		await storePlans(

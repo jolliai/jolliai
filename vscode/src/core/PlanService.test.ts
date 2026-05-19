@@ -515,8 +515,10 @@ describe("PlanService", () => {
 			expect(saved.plans["test-plan"].contentHashAtCommit).toBeUndefined();
 		});
 
-		it("skips storePlans when plan file does not exist during archive", async () => {
-			// Use a sourcePath different from the PLANS_DIR slug path so we can mock them separately
+		it("skips storePlans when sourcePath does not exist on disk", async () => {
+			// sourcePath gone → both the contentHash branch and the orphan-store branch
+			// skip, but the registry update still happens (so the caller can record
+			// the association even if the file vanished between detection and archive).
 			const entry = makeEntry({
 				editCount: 2,
 				sourcePath: "/other/path/test-plan.md",
@@ -526,13 +528,7 @@ describe("PlanService", () => {
 				plans: { "test-plan": entry },
 			});
 			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
-			// sourcePath exists (line 262 true branch), but planFile in PLANS_DIR does not (line 296 false branch)
-			mockExistsSync.mockImplementation((path: string) => {
-				if (path === "/other/path/test-plan.md") {
-					return true;
-				}
-				return false;
-			});
+			mockExistsSync.mockReturnValue(false);
 
 			const result = await archivePlanForCommit(
 				"test-plan",
@@ -542,6 +538,41 @@ describe("PlanService", () => {
 
 			expect(result).not.toBeNull();
 			expect(storePlans).not.toHaveBeenCalled();
+		});
+
+		it("reads content from entry.sourcePath for external plan paths", async () => {
+			// Regression guard: archivePlanForCommit must read the actual sourcePath,
+			// not a synthetic ~/.claude/plans/<slug>.md path, so external plans like
+			// docs/foo.md are archived correctly.
+			const externalPath = "/repo/docs/foo-plan.md";
+			const entry = makeEntry({
+				slug: "foo-plan",
+				editCount: 1,
+				sourcePath: externalPath,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "foo-plan": entry },
+			});
+			mockReadFileSync.mockImplementation((path: unknown) =>
+				path === externalPath ? "# External\nbody" : "",
+			);
+			mockExistsSync.mockImplementation(
+				(path: unknown) => path === externalPath,
+			);
+
+			await archivePlanForCommit("foo-plan", "deadbeefcafebabe", CWD);
+
+			expect(storePlans).toHaveBeenCalledWith(
+				[
+					expect.objectContaining({
+						slug: "foo-plan-deadbeef",
+						content: "# External\nbody",
+					}),
+				],
+				expect.any(String),
+				CWD,
+			);
 		});
 	});
 
@@ -868,6 +899,35 @@ describe("PlanService", () => {
 			expect(savePlansRegistry).not.toHaveBeenCalled();
 			// toPlanInfo filters it out since it's still an unchanged archive guard
 			expect(plans.find((p) => p.slug === "guarded-plan")).toBeUndefined();
+		});
+
+		it("toPlanInfo guard reads from entry.sourcePath for external plan paths", async () => {
+			// Regression guard: the archive-guard check must hash entry.sourcePath
+			// (the actual on-disk file, possibly outside ~/.claude/plans/) rather than
+			// a synthetic PLANS_DIR/<slug>.md path.
+			const externalPath = "/repo/docs/foo-plan.md";
+			const guardEntry = makeEntry({
+				slug: "foo-plan",
+				commitHash: "abc12345",
+				contentHashAtCommit: "mock-hash", // matches what mockCreateHash returns
+				sourcePath: externalPath,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "foo-plan": guardEntry },
+			});
+
+			mockExistsSync.mockImplementation(
+				(path: unknown) => path === externalPath,
+			);
+			mockReadFileSync.mockImplementation((path: unknown) =>
+				path === externalPath ? "# Foo" : "",
+			);
+
+			const plans = await detectPlans(CWD);
+
+			// Hash matches → guard still active → not shown in panel
+			expect(plans.find((p) => p.slug === "foo-plan")).toBeUndefined();
 		});
 
 		it("shows committed plan with changed content (archive guard with modified file)", async () => {
