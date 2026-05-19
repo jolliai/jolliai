@@ -26,6 +26,7 @@ import {
 } from "../../cli/src/core/KBPathResolver.js";
 import { discoverRepos } from "../../cli/src/core/KBRepoDiscoverer.js";
 import { MetadataManager } from "../../cli/src/core/MetadataManager.js";
+import { normalizePathForCompare } from "../../cli/src/core/PathUtils.js";
 import {
 	loadConfig,
 	savePluginSource,
@@ -168,29 +169,6 @@ function hasUnmigratedHooks(content: string): boolean {
 	const hasJolliMemoryHook =
 		lower.includes("stophook") || lower.includes("postcommithook");
 	return hasJolliMemoryHook && !lower.includes("dist-path");
-}
-
-/**
- * Normalizes a filesystem path for equality comparison.
- *
- * Handles three sources of spurious inequality that can leak in between the
- * `context.extensionPath` we get at runtime and the `distDir` we previously
- * wrote to `dist-paths/<source>`:
- *   1. Mixed separators (`\` vs `/`) — Windows freely mixes both.
- *   2. Case differences — Windows/macOS filesystems are case-insensitive by
- *      default, so `C:\Users` and `c:\users` refer to the same directory.
- *   3. Trailing slashes.
- *
- * NOT resolved: symlinks and `..` segments. `realpath` would require extra I/O
- * and could mask legitimate upgrades if either endpoint is a stale symlink.
- */
-function normalizePathForCompare(p: string): string {
-	const unified = p.replace(/\\/g, "/").replace(/\/+$/, "");
-	/* v8 ignore start -- process.platform is fixed per test-runner host (macOS CI); covering the Linux branch would require a cross-platform matrix */
-	return process.platform === "win32" || process.platform === "darwin"
-		? unified.toLowerCase()
-		: unified;
-	/* v8 ignore stop */
 }
 
 // ─── JolliMemoryBridge class ─────────────────────────────────────────────────
