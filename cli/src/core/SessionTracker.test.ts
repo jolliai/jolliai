@@ -698,6 +698,173 @@ describe("SessionTracker", () => {
 			await expect(loadPlansRegistry(tempDir)).resolves.toEqual(before);
 		});
 
+		// Squash / rebase reuses associatePlanWithCommit to re-anchor metadata on the
+		// new commit. Pre-fix, only the archive entry's commitHash got updated and the
+		// guard entry was left pointing at the soon-to-be-orphan commit — so a user
+		// edit to the source file would "revive" the guard with a stale hash label.
+		describe("guard-entry migration on squash/rebase", () => {
+			it("should migrate the guard entry's commitHash and recompute contentHashAtCommit when the file is unchanged", async () => {
+				const planFile = join(tempDir, "plan.md");
+				const planBody = "# My Plan\n\nstep 1\n";
+				await writeFile(planFile, planBody, "utf-8");
+				const { createHash } = await import("node:crypto");
+				const fileHash = createHash("sha256").update(planBody).digest("hex");
+
+				const before = {
+					version: 1 as const,
+					plans: {
+						"my-plan": {
+							slug: "my-plan",
+							title: "My Plan",
+							sourcePath: planFile,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+							contentHashAtCommit: fileHash,
+							editCount: 1,
+						},
+						"my-plan-35080b05": {
+							slug: "my-plan-35080b05",
+							title: "My Plan",
+							sourcePath: planFile,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+							editCount: 1,
+						},
+					},
+				};
+				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
+
+				await associatePlanWithCommit("my-plan-35080b05", "6c66a12e50f0cf1129f8e63b340897832d22ecee", tempDir);
+
+				const after = await loadPlansRegistry(tempDir);
+				expect(after.plans["my-plan-35080b05"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
+				expect(after.plans["my-plan"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
+				expect(after.plans["my-plan"]?.contentHashAtCommit).toBe(fileHash);
+			});
+
+			it("should preserve contentHashAtCommit even when the source file has been edited since archive (revival signal must survive squash)", async () => {
+				// squash/rebase only rewrites the commit hash; it does not commit
+				// the working-tree state. If the user edited the source between the
+				// original archive and the squash, those edits remain uncommitted —
+				// the next post-commit detection must still see liveHash !==
+				// contentHashAtCommit to surface the revival. Recomputing from the
+				// live file here would silently consume that signal.
+				const planFile = join(tempDir, "plan.md");
+				const oldBody = "# Old Plan\n";
+				const newBody = "# New Plan\n\nadded after squash\n";
+				await writeFile(planFile, newBody, "utf-8");
+				const { createHash } = await import("node:crypto");
+				const oldHash = createHash("sha256").update(oldBody).digest("hex");
+				const newHash = createHash("sha256").update(newBody).digest("hex");
+				expect(oldHash).not.toBe(newHash);
+
+				const before = {
+					version: 1 as const,
+					plans: {
+						"my-plan": {
+							slug: "my-plan",
+							title: "My Plan",
+							sourcePath: planFile,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+							contentHashAtCommit: oldHash,
+							editCount: 1,
+						},
+						"my-plan-deadbeef": {
+							slug: "my-plan-deadbeef",
+							title: "My Plan",
+							sourcePath: planFile,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+							editCount: 1,
+						},
+					},
+				};
+				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
+
+				await associatePlanWithCommit("my-plan-deadbeef", "feedfacefeedfacefeedfacefeedfacefeedface", tempDir);
+
+				const after = await loadPlansRegistry(tempDir);
+				expect(after.plans["my-plan"]?.commitHash).toBe("feedfacefeedfacefeedfacefeedfacefeedface");
+				expect(after.plans["my-plan"]?.contentHashAtCommit).toBe(oldHash);
+			});
+
+			it("should preserve the existing contentHashAtCommit when the source file is missing", async () => {
+				const before = {
+					version: 1 as const,
+					plans: {
+						"my-plan": {
+							slug: "my-plan",
+							title: "My Plan",
+							sourcePath: join(tempDir, "does-not-exist.md"),
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+							contentHashAtCommit: "stalehash",
+							editCount: 1,
+						},
+						"my-plan-35080b05": {
+							slug: "my-plan-35080b05",
+							title: "My Plan",
+							sourcePath: join(tempDir, "does-not-exist.md"),
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+							editCount: 1,
+						},
+					},
+				};
+				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
+
+				await associatePlanWithCommit("my-plan-35080b05", "6c66a12e50f0cf1129f8e63b340897832d22ecee", tempDir);
+
+				const after = await loadPlansRegistry(tempDir);
+				expect(after.plans["my-plan"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
+				expect(after.plans["my-plan"]?.contentHashAtCommit).toBe("stalehash");
+			});
+
+			it("should not migrate any guard when the archive id has no -<shortHash> suffix", async () => {
+				// Defensive: a caller could pass a base-slug-shaped id (no suffix). The
+				// function must not invent a guard target out of an unrelated entry.
+				const before = {
+					version: 1 as const,
+					plans: {
+						"my-plan": {
+							slug: "my-plan",
+							title: "My Plan",
+							sourcePath: join(tempDir, "plan.md"),
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: null,
+							contentHashAtCommit: "stalehash",
+							editCount: 1,
+						},
+					},
+				};
+				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
+
+				await associatePlanWithCommit("my-plan", "6c66a12e50f0cf1129f8e63b340897832d22ecee", tempDir);
+
+				const after = await loadPlansRegistry(tempDir);
+				// Direct migration of the named entry still happens, but contentHashAtCommit
+				// is left alone — only guard-entry migration triggered through an archive id
+				// recomputes it.
+				expect(after.plans["my-plan"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
+				expect(after.plans["my-plan"]?.contentHashAtCommit).toBe("stalehash");
+			});
+		});
+
 		it("should load a single plan entry by slug", async () => {
 			const registry = {
 				version: 1 as const,
@@ -784,6 +951,200 @@ describe("SessionTracker", () => {
 			await associateNoteWithCommit("missing-note", "abcdef1234567890", tempDir);
 
 			await expect(loadPlansRegistry(tempDir)).resolves.toEqual(before);
+		});
+
+		describe("guard-entry migration on squash/rebase", () => {
+			it("should migrate the guard entry's commitHash and recompute contentHashAtCommit when the source file is unchanged", async () => {
+				const noteFile = join(tempDir, "note.md");
+				const body = "# Active AI Conversations — Design Document\n\nA note body.\n";
+				await writeFile(noteFile, body, "utf-8");
+				const { createHash } = await import("node:crypto");
+				const fileHash = createHash("sha256").update(body).digest("hex");
+
+				const before = {
+					version: 1 as const,
+					plans: {},
+					notes: {
+						"note-035b": {
+							id: "note-035b",
+							title: "Active AI Conversations — Design Document",
+							format: "markdown" as const,
+							sourcePath: noteFile,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/active-conversations",
+							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+							contentHashAtCommit: fileHash,
+						},
+						"note-035b-35080b05": {
+							id: "note-035b-35080b05",
+							title: "Active AI Conversations — Design Document",
+							format: "markdown" as const,
+							sourcePath: noteFile,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/active-conversations",
+							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+						},
+					},
+				};
+				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
+
+				await associateNoteWithCommit(
+					"note-035b-35080b05",
+					"6c66a12e50f0cf1129f8e63b340897832d22ecee",
+					tempDir,
+				);
+
+				const after = await loadPlansRegistry(tempDir);
+				expect(after.notes?.["note-035b-35080b05"]?.commitHash).toBe(
+					"6c66a12e50f0cf1129f8e63b340897832d22ecee",
+				);
+				expect(after.notes?.["note-035b"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
+				expect(after.notes?.["note-035b"]?.contentHashAtCommit).toBe(fileHash);
+			});
+
+			it("should preserve contentHashAtCommit even when the source file has been edited since archive (revival signal must survive squash)", async () => {
+				// Same invariant as the plan-side test: squash only rewrites the
+				// commit hash, so contentHashAtCommit (the archive-time anchor)
+				// must not be replaced with the live file hash — otherwise the
+				// revival signal for uncommitted edits is lost.
+				const noteFile = join(tempDir, "note.md");
+				const oldBody = "# Old Note\n";
+				const newBody = "# New Note\n\nadded after squash\n";
+				await writeFile(noteFile, newBody, "utf-8");
+				const { createHash } = await import("node:crypto");
+				const oldHash = createHash("sha256").update(oldBody).digest("hex");
+				const newHash = createHash("sha256").update(newBody).digest("hex");
+				expect(oldHash).not.toBe(newHash);
+
+				const before = {
+					version: 1 as const,
+					plans: {},
+					notes: {
+						"note-035b": {
+							id: "note-035b",
+							title: "Old Note",
+							format: "markdown" as const,
+							sourcePath: noteFile,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+							contentHashAtCommit: oldHash,
+						},
+						"note-035b-deadbeef": {
+							id: "note-035b-deadbeef",
+							title: "Old Note",
+							format: "markdown" as const,
+							sourcePath: noteFile,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+						},
+					},
+				};
+				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
+
+				await associateNoteWithCommit(
+					"note-035b-deadbeef",
+					"feedfacefeedfacefeedfacefeedfacefeedface",
+					tempDir,
+				);
+
+				const after = await loadPlansRegistry(tempDir);
+				expect(after.notes?.["note-035b"]?.commitHash).toBe("feedfacefeedfacefeedfacefeedfacefeedface");
+				expect(after.notes?.["note-035b"]?.contentHashAtCommit).toBe(oldHash);
+			});
+
+			it("should preserve the existing contentHashAtCommit when the source file is missing", async () => {
+				const before = {
+					version: 1 as const,
+					plans: {},
+					notes: {
+						"note-035b": {
+							id: "note-035b",
+							title: "Gone Note",
+							format: "markdown" as const,
+							sourcePath: join(tempDir, "missing.md"),
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+							contentHashAtCommit: "stalehash",
+						},
+						"note-035b-35080b05": {
+							id: "note-035b-35080b05",
+							title: "Gone Note",
+							format: "markdown" as const,
+							sourcePath: join(tempDir, "missing.md"),
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+						},
+					},
+				};
+				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
+
+				await associateNoteWithCommit(
+					"note-035b-35080b05",
+					"6c66a12e50f0cf1129f8e63b340897832d22ecee",
+					tempDir,
+				);
+
+				const after = await loadPlansRegistry(tempDir);
+				expect(after.notes?.["note-035b"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
+				expect(after.notes?.["note-035b"]?.contentHashAtCommit).toBe("stalehash");
+			});
+
+			it("should leave the guard alone when its commitHash does not match the archive id suffix", async () => {
+				// Defensive: if the guard already points at a different commit (e.g.
+				// user manually edited plans.json, or a parallel migration ran first),
+				// don't clobber its commitHash based on a stale archive id.
+				const before = {
+					version: 1 as const,
+					plans: {},
+					notes: {
+						"note-035b": {
+							id: "note-035b",
+							title: "Note",
+							format: "snippet" as const,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+							contentHashAtCommit: "stalehash",
+						},
+						"note-035b-deadbeef": {
+							id: "note-035b-deadbeef",
+							title: "Note",
+							format: "snippet" as const,
+							addedAt: "2026-03-01T10:00:00Z",
+							updatedAt: "2026-03-01T10:00:00Z",
+							branch: "feature/x",
+							commitHash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+						},
+					},
+				};
+				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
+
+				await associateNoteWithCommit(
+					"note-035b-deadbeef",
+					"6c66a12e50f0cf1129f8e63b340897832d22ecee",
+					tempDir,
+				);
+
+				const after = await loadPlansRegistry(tempDir);
+				expect(after.notes?.["note-035b-deadbeef"]?.commitHash).toBe(
+					"6c66a12e50f0cf1129f8e63b340897832d22ecee",
+				);
+				// Guard untouched because its commitHash didn't match the archive id's
+				// `deadbeef` suffix — different commit lineage.
+				expect(after.notes?.["note-035b"]?.commitHash).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+				expect(after.notes?.["note-035b"]?.contentHashAtCommit).toBe("stalehash");
+			});
 		});
 	});
 

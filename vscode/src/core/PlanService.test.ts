@@ -459,6 +459,8 @@ describe("PlanService", () => {
 				[{ slug: "test-plan-06d0f729", content: "# Test Plan\nContent" }],
 				expect.stringContaining("Associate plan"),
 				CWD,
+				undefined,
+				undefined,
 			);
 		});
 

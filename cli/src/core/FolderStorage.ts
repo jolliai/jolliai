@@ -128,15 +128,46 @@ export class FolderStorage implements StorageProvider {
 	 * See StorageProvider.deleteVisibleMarkdown for the contract.
 	 */
 	async deleteVisibleMarkdown(entry: SummaryIndexEntry): Promise<void> {
-		const manifestEntry = this.metadataManager.findById(entry.commitHash);
-		const branchFolder = this.metadataManager.resolveFolderForBranch(entry.branch);
 		const slug = FolderStorage.slugify(entry.commitMessage);
 		const hash8 = entry.commitHash.substring(0, 8);
-		const relativePath = manifestEntry?.path ?? `${branchFolder}/${slug}-${hash8}.md`;
+		await this.deleteVisibleArtifact(entry.commitHash, entry.branch, `${slug}-${hash8}.md`);
+	}
+
+	/**
+	 * See StorageProvider.deletePlanVisible for the contract. Delegates to the
+	 * shared `deleteVisibleArtifact` helper with the plan's manifest fileId
+	 * (`plan:<slug>`) and the conventional `plan--<slug>.md` filename.
+	 */
+	async deletePlanVisible(slug: string, branch: string): Promise<void> {
+		await this.deleteVisibleArtifact(`plan:${slug}`, branch, `plan--${slug}.md`);
+	}
+
+	/**
+	 * See StorageProvider.deleteNoteVisible for the contract. Delegates to the
+	 * shared `deleteVisibleArtifact` helper with the note's manifest fileId
+	 * (`note:<id>`) and the conventional `note--<id>.md` filename.
+	 */
+	async deleteNoteVisible(id: string, branch: string): Promise<void> {
+		await this.deleteVisibleArtifact(`note:${id}`, branch, `note--${id}.md`);
+	}
+
+	/**
+	 * Shared body for `deleteVisibleMarkdown` (summary), `deletePlanVisible`,
+	 * and `deleteNoteVisible`. Looks up the manifest entry by `fileId`, falls
+	 * back to a convention-based `<branchFolder>/<fallbackFileName>` path when
+	 * the manifest record is missing, fingerprint-guards against hand-edits,
+	 * and drops the manifest record on successful delete (or when the file is
+	 * already gone — keeping a manifest entry for a deleted file would let
+	 * future scans re-trip on a ghost path).
+	 */
+	private async deleteVisibleArtifact(fileId: string, branch: string, fallbackFileName: string): Promise<void> {
+		const manifestEntry = this.metadataManager.findById(fileId);
+		const branchFolder = this.metadataManager.resolveFolderForBranch(branch);
+		const relativePath = manifestEntry?.path ?? `${branchFolder}/${fallbackFileName}`;
 		const absPath = join(this.rootPath, relativePath);
 
 		if (!existsSync(absPath)) {
-			if (manifestEntry) this.metadataManager.removeFromManifest(entry.commitHash);
+			if (manifestEntry) this.metadataManager.removeFromManifest(fileId);
 			return;
 		}
 
@@ -161,13 +192,13 @@ export class FolderStorage implements StorageProvider {
 
 		try {
 			unlinkSync(absPath);
-			if (manifestEntry) this.metadataManager.removeFromManifest(entry.commitHash);
+			if (manifestEntry) this.metadataManager.removeFromManifest(fileId);
 			log.info("Deleted visible MD: %s", relativePath);
 			/* v8 ignore start -- TOCTOU defense: a concurrent writer removes the file between existsSync and unlinkSync. Requires multi-process scheduling to reproduce; the ENOENT-vs-rethrow split is asserted at code-review level. */
 		} catch (err) {
 			const code = (err as NodeJS.ErrnoException).code;
 			if (code === "ENOENT") {
-				if (manifestEntry) this.metadataManager.removeFromManifest(entry.commitHash);
+				if (manifestEntry) this.metadataManager.removeFromManifest(fileId);
 				return;
 			}
 			throw err;

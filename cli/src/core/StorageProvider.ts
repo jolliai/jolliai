@@ -58,4 +58,25 @@ export interface StorageProvider {
 	 * OrphanBranchStorage does not implement it (no visible layer).
 	 */
 	regenerateVisibleMarkdown?(entry: SummaryIndexEntry): Promise<boolean>;
+
+	/**
+	 * Remove the user-visible Markdown copy of a plan for the given branch
+	 * (`<branchFolder>/plan--<slug>.md`). Mirrors `deleteVisibleMarkdown`'s
+	 * contract — does NOT touch the orphan-branch source, `.jolli/plans/<slug>.md`,
+	 * or the local plans registry. Fingerprint-guarded: a hand-edited file is
+	 * left in place. Idempotent on a missing file.
+	 *
+	 * Optional: implemented by FolderStorage and delegated by DualWriteStorage.
+	 * OrphanBranchStorage does not implement it (no visible layer).
+	 */
+	deletePlanVisible?(slug: string, branch: string): Promise<void>;
+
+	/**
+	 * Remove the user-visible Markdown copy of a note for the given branch
+	 * (`<branchFolder>/note--<id>.md`). Same contract as `deletePlanVisible`.
+	 *
+	 * Optional: implemented by FolderStorage and delegated by DualWriteStorage.
+	 * OrphanBranchStorage does not implement it (no visible layer).
+	 */
+	deleteNoteVisible?(id: string, branch: string): Promise<void>;
 }

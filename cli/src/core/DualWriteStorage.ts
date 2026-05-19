@@ -69,6 +69,26 @@ export class DualWriteStorage implements StorageProvider {
 		}
 	}
 
+	async deletePlanVisible(slug: string, branch: string): Promise<void> {
+		if (!this.shadow.deletePlanVisible) return;
+		try {
+			await this.shadow.deletePlanVisible(slug, branch);
+		} catch (err) {
+			log.warn("Shadow deletePlanVisible failed (folder storage) for %s on %s: %s", slug, branch, errMsg(err));
+			this.shadow.markDirty?.(`deletePlanVisible ${branch}/${slug}`);
+		}
+	}
+
+	async deleteNoteVisible(id: string, branch: string): Promise<void> {
+		if (!this.shadow.deleteNoteVisible) return;
+		try {
+			await this.shadow.deleteNoteVisible(id, branch);
+		} catch (err) {
+			log.warn("Shadow deleteNoteVisible failed (folder storage) for %s on %s: %s", id, branch, errMsg(err));
+			this.shadow.markDirty?.(`deleteNoteVisible ${branch}/${id}`);
+		}
+	}
+
 	async listFiles(prefix: string): Promise<string[]> {
 		return this.primary.listFiles(prefix);
 	}

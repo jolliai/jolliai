@@ -39,10 +39,17 @@ import {
 } from "../../cli/src/core/Summarizer.js";
 import { getDisplayDate } from "../../cli/src/core/SummaryFormat.js";
 import {
+	deleteNoteVisibleArtifact,
+	deletePlanVisibleArtifact,
 	getIndexEntryMap,
 	getSummary,
 	listSummaries,
+	saveTranscriptsBatch,
 	scanTreeHashAliases,
+	storeLinearIssues,
+	storeNotes,
+	storePlans,
+	storeSummary,
 } from "../../cli/src/core/SummaryStore.js";
 import {
 	compareSemver,
@@ -58,7 +65,11 @@ import { ORPHAN_BRANCH } from "../../cli/src/Logger.js";
 import type {
 	CommitSummary,
 	NoteFormat,
+	NoteReference,
+	PlanProgressArtifact,
+	PlanReference,
 	StatusInfo,
+	StoredTranscript,
 	SummaryIndexEntry,
 } from "../../cli/src/Types.js";
 import {
@@ -67,8 +78,17 @@ import {
 	openLinearIssueMarkdown as openLinearIssueMarkdownImpl,
 	setLinearIssueIgnored,
 } from "./core/LinearIssueService.js";
-import { detectNotes, removeNote, saveNote } from "./core/NoteService.js";
-import { detectPlans, ignorePlan } from "./core/PlanService.js";
+import {
+	archiveNoteForCommit,
+	detectNotes,
+	removeNote,
+	saveNote,
+} from "./core/NoteService.js";
+import {
+	archivePlanForCommit,
+	detectPlans,
+	ignorePlan,
+} from "./core/PlanService.js";
 import type {
 	BranchCommit,
 	BranchCommitsResult,
@@ -1628,6 +1648,101 @@ export class JolliMemoryBridge {
 		return { summary: null, sourceRepoName: null, sourceRemoteUrl: null };
 	}
 
+	// ── Storage-threaded writers (webview-initiated) ─────────────────────
+	//
+	// All `SummaryStore` writers default to `resolveStorage(undefined, cwd)`,
+	// which falls back to a fresh `OrphanBranchStorage(cwd)` because the
+	// extension process never installs `setActiveStorage` (only QueueWorker
+	// does — it runs in a separate process). That fallback writes only to the
+	// orphan branch, leaving the Memory Bank folder out of sync whenever a
+	// panel action (translate / editTopic / removePlan / archiveLinear / …)
+	// rewrites a summary or content artifact.
+	//
+	// These thin wrappers fetch the Bridge's `DualWriteStorage` once and pass
+	// it through to the underlying writer's new `storage?` parameter, so
+	// every webview-driven write hits both backends. Callers in
+	// `SummaryWebviewPanel` use these instead of importing the SummaryStore /
+	// PlanService / NoteService writers directly.
+
+	/** Writes a summary via the Bridge's DualWriteStorage instance. */
+	async storeSummary(
+		summary: CommitSummary,
+		force = false,
+		artifacts?: {
+			readonly transcript?: StoredTranscript;
+			readonly planProgress?: ReadonlyArray<PlanProgressArtifact>;
+		},
+	): Promise<void> {
+		const storage = await this.getStorage();
+		await storeSummary(summary, this.cwd, force, artifacts, storage);
+	}
+
+	/** Writes plan files (orphan-branch + Memory Bank visible MD). */
+	async storePlans(
+		planFiles: ReadonlyArray<{ slug: string; content: string }>,
+		commitMessage: string,
+		branch?: string,
+	): Promise<void> {
+		const storage = await this.getStorage();
+		await storePlans(planFiles, commitMessage, this.cwd, branch, storage);
+	}
+
+	/** Writes note files (orphan-branch + Memory Bank visible MD). */
+	async storeNotes(
+		noteFiles: ReadonlyArray<{ id: string; content: string }>,
+		commitMessage: string,
+		branch?: string,
+	): Promise<void> {
+		const storage = await this.getStorage();
+		await storeNotes(noteFiles, commitMessage, this.cwd, branch, storage);
+	}
+
+	/** Writes Linear-issue archived snapshots. */
+	async storeLinearIssues(
+		linearFiles: ReadonlyArray<{ archivedKey: string; content: string }>,
+		commitMessage: string,
+		branch?: string,
+	): Promise<void> {
+		const storage = await this.getStorage();
+		await storeLinearIssues(
+			linearFiles,
+			commitMessage,
+			this.cwd,
+			branch,
+			storage,
+		);
+	}
+
+	/** Batched transcript write+delete. */
+	async saveTranscriptsBatch(
+		writes: ReadonlyArray<{
+			readonly hash: string;
+			readonly data: StoredTranscript;
+		}>,
+		deletes: ReadonlyArray<string>,
+	): Promise<void> {
+		const storage = await this.getStorage();
+		await saveTranscriptsBatch(writes, deletes, this.cwd, storage);
+	}
+
+	/** Archives a plan and associates it with a commit. */
+	async archivePlanForCommit(
+		slug: string,
+		commitHash: string,
+	): Promise<PlanReference | null> {
+		const storage = await this.getStorage();
+		return archivePlanForCommit(slug, commitHash, this.cwd, storage);
+	}
+
+	/** Archives a note and associates it with a commit. */
+	async archiveNoteForCommit(
+		id: string,
+		commitHash: string,
+	): Promise<NoteReference | null> {
+		const storage = await this.getStorage();
+		return archiveNoteForCommit(id, commitHash, this.cwd, storage);
+	}
+
 	// ── Git utility methods ───────────────────────────────────────────────
 
 	/** Returns the git user.name configured for this repo. */
@@ -1736,6 +1851,23 @@ export class JolliMemoryBridge {
 		await ignorePlan(slug, this.cwd);
 	}
 
+	/**
+	 * Cleans up the user-visible `<branch>/plan--<slug>.md` in the Memory Bank
+	 * folder. Routed through the Bridge's storage instance so the call honours
+	 * the configured `storageMode` (dual-write / folder-only) — calling the
+	 * SummaryStore wrapper directly from the panel would fall back to a fresh
+	 * `OrphanBranchStorage(cwd)` (no visible-layer methods) and silently no-op,
+	 * because the extension process does not install `setActiveStorage`.
+	 * No-op when the active backend has no visible layer (orphan-only mode).
+	 */
+	async cleanupVisiblePlanArtifact(
+		slug: string,
+		branch: string,
+	): Promise<void> {
+		const storage = await this.getStorage();
+		await deletePlanVisibleArtifact(slug, branch, this.cwd, storage);
+	}
+
 	// ── Notes ────────────────────────────────────────────────────────────
 
 	/** Lists user-created notes from plans.json registry. */
@@ -1756,6 +1888,17 @@ export class JolliMemoryBridge {
 	/** Removes a note: deletes file for uncommitted notes, removes from registry. */
 	async removeNote(id: string): Promise<void> {
 		await removeNote(id, this.cwd);
+	}
+
+	/**
+	 * Cleans up the user-visible `<branch>/note--<id>.md` in the Memory Bank
+	 * folder. See `cleanupVisiblePlanArtifact` for why this must route through
+	 * the Bridge's storage instance rather than the SummaryStore wrapper's
+	 * default-storage fallback.
+	 */
+	async cleanupVisibleNoteArtifact(id: string, branch: string): Promise<void> {
+		const storage = await this.getStorage();
+		await deleteNoteVisibleArtifact(id, branch, this.cwd, storage);
 	}
 
 	// ── Linear issues ────────────────────────────────────────────────────

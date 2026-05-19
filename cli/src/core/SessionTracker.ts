@@ -741,8 +741,29 @@ export async function savePlansRegistry(registry: PlansRegistry, cwd?: string): 
 }
 
 /**
+ * If `archivedKey` looks like a per-commit archive id (base + `-XXXXXXXX` short
+ * hash), returns the base/guard key plus the embedded oldShortHash. Otherwise
+ * returns null — callers then skip guard-entry migration entirely. This is the
+ * single inflection point that distinguishes "first-time association" from
+ * "squash/rebase re-anchoring of an existing archive".
+ */
+function splitArchivedKey(archivedKey: string): { baseKey: string; oldShortHash: string } | null {
+	const match = archivedKey.match(/^(.+)-([0-9a-f]{8})$/);
+	if (!match) return null;
+	return { baseKey: match[1] as string, oldShortHash: match[2] as string };
+}
+
+/**
  * Updates a single plan entry's commitHash in the registry.
- * Called by PostCommitHook (on commit) and PostRewriteHook (on rebase).
+ * Called via `reassociateMetadata` from `QueueWorker` after squash / rebase.
+ *
+ * When `slug` is an archive id (`<baseSlug>-<oldShortHash>`) and the
+ * corresponding guard entry exists with `commitHash` matching that old short
+ * hash, the guard is migrated alongside it: its `commitHash` is moved to the
+ * new hash. `contentHashAtCommit` is left untouched — squash/rebase only
+ * rewrites commit metadata, not file content, so the archive-time anchor must
+ * survive so that uncommitted edits to the source still surface as a revived
+ * guard on the next post-commit detection.
  */
 export async function associatePlanWithCommit(slug: string, commitHash: string, cwd?: string): Promise<void> {
 	const registry = await loadPlansRegistry(cwd);
@@ -751,18 +772,36 @@ export async function associatePlanWithCommit(slug: string, commitHash: string, 
 		log.debug("associatePlanWithCommit: slug %s not in registry, skipping", slug);
 		return;
 	}
-	const updated: PlansRegistry = {
-		...registry,
-		plans: {
-			...registry.plans,
-			[slug]: { ...entry, commitHash, updatedAt: new Date().toISOString() },
-		},
+	const now = new Date().toISOString();
+	const nextPlans: Record<string, PlanEntry> = {
+		...registry.plans,
+		[slug]: { ...entry, commitHash, updatedAt: now },
 	};
+
+	const split = splitArchivedKey(slug);
+	if (split) {
+		const guard = registry.plans[split.baseKey];
+		if (guard?.contentHashAtCommit && guard.commitHash?.startsWith(split.oldShortHash)) {
+			nextPlans[split.baseKey] = {
+				...guard,
+				commitHash,
+				updatedAt: now,
+			};
+			log.info("associatePlanWithCommit: also migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
+		}
+	}
+
+	const updated: PlansRegistry = { ...registry, plans: nextPlans };
 	await savePlansRegistry(updated, cwd);
 	log.info("associatePlanWithCommit: %s → %s", slug, commitHash.substring(0, 8));
 }
 
-/** Updates the commitHash for a note entry in the registry (used after squash/rebase). */
+/**
+ * Updates the commitHash for a note entry in the registry (used after squash/rebase).
+ *
+ * Same guard-entry migration semantics as `associatePlanWithCommit` — see that
+ * function's doc-comment for the rationale.
+ */
 export async function associateNoteWithCommit(noteId: string, commitHash: string, cwd?: string): Promise<void> {
 	const registry = await loadPlansRegistry(cwd);
 	const entry = registry.notes?.[noteId];
@@ -770,14 +809,27 @@ export async function associateNoteWithCommit(noteId: string, commitHash: string
 		log.debug("associateNoteWithCommit: id %s not in registry, skipping", noteId);
 		return;
 	}
+	const now = new Date().toISOString();
 	const notes = registry.notes as NonNullable<PlansRegistry["notes"]>;
-	const updated: PlansRegistry = {
-		...registry,
-		notes: {
-			...notes,
-			[noteId]: { ...entry, commitHash, updatedAt: new Date().toISOString() },
-		},
+	const nextNotes: Record<string, NoteEntry> = {
+		...notes,
+		[noteId]: { ...entry, commitHash, updatedAt: now },
 	};
+
+	const split = splitArchivedKey(noteId);
+	if (split) {
+		const guard = notes[split.baseKey];
+		if (guard?.contentHashAtCommit && guard.commitHash?.startsWith(split.oldShortHash)) {
+			nextNotes[split.baseKey] = {
+				...guard,
+				commitHash,
+				updatedAt: now,
+			};
+			log.info("associateNoteWithCommit: also migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
+		}
+	}
+
+	const updated: PlansRegistry = { ...registry, notes: nextNotes };
 	await savePlansRegistry(updated, cwd);
 	log.info("associateNoteWithCommit: %s → %s", noteId, commitHash.substring(0, 8));
 }

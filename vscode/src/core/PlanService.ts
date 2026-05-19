@@ -27,6 +27,7 @@ import {
 	loadPlansRegistry,
 	savePlansRegistry,
 } from "../../../cli/src/core/SessionTracker.js";
+import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
 import { storePlans } from "../../../cli/src/core/SummaryStore.js";
 import type { PlanReference } from "../../../cli/src/Types.js";
 import type { PlanEntry, PlanInfo } from "../Types.js";
@@ -333,6 +334,7 @@ export async function archivePlanForCommit(
 	slug: string,
 	commitHash: string,
 	cwd: string,
+	storage?: StorageProvider,
 ): Promise<PlanReference | null> {
 	const registry = await loadPlansRegistry(cwd);
 	let entry = registry.plans[slug];
@@ -394,7 +396,12 @@ export async function archivePlanForCommit(
 		cwd,
 	);
 
-	// Store plan file in orphan branch under new slug
+	// Store plan file in orphan branch under new slug. branch is intentionally
+	// left undefined: FolderStorage.resolveBranchFromSlug uses the commit hash
+	// embedded in `newSlug` to look up the commit's branch from the manifest /
+	// index — that's the right home for the visible <branch>/plan--<slug>.md.
+	// Passing entry.branch would point at the plan's *home* branch, which can
+	// differ from the commit's branch when editing summaries cross-branch.
 	const planFile = join(getPlansDir(), `${slug}.md`);
 	if (existsSync(planFile)) {
 		const content = fsReadFileSync(planFile, "utf-8");
@@ -402,6 +409,8 @@ export async function archivePlanForCommit(
 			[{ slug: newSlug, content }],
 			`Associate plan ${newSlug} with commit ${shortHash}`,
 			cwd,
+			undefined,
+			storage,
 		);
 	}
 

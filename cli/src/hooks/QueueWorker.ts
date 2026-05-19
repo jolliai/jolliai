@@ -17,6 +17,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -399,9 +400,32 @@ function formatElapsed(startMs: number): string {
 }
 
 /**
+ * Reads the live source file at `path` and returns its sha256 hex digest.
+ * Returns null when the file is missing or unreadable — callers treat that
+ * as "no comparison data available" rather than a re-archive trigger.
+ */
+function safeHashFileSync(path: string): string | null {
+	if (!existsSync(path)) return null;
+	try {
+		const body = readFileSync(path, "utf-8");
+		return createHash("sha256").update(body).digest("hex");
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Reads uncommitted plan slugs from plans.json registry.
  * Plans are discovered by the StopHook at transcript scan time, so the
  * registry is already up-to-date when the post-commit hook runs.
+ *
+ * Surfaces two distinct categories:
+ *   1. Fresh — never archived (`commitHash === null`, no `contentHashAtCommit`).
+ *   2. Revived guard — previously archived, but the source file has been edited
+ *      since archive (`contentHashAtCommit` exists and no longer matches the
+ *      file's live hash). Without this, a user iterating on the same plan
+ *      across commits would see the panel "stuck" on a stale commit hash —
+ *      see PLANS & NOTES guard-revival bug.
  */
 async function detectPlanSlugsFromRegistry(cwd: string, branch: string): Promise<Set<string>> {
 	const registry = await loadPlansRegistry(cwd);
@@ -412,8 +436,16 @@ async function detectPlanSlugsFromRegistry(cwd: string, branch: string): Promise
 		// cross-branch plans archived to feature/linear-issues-as-panel-item's
 		// 786c5330 even though their entry.branch said feature/summarize-include-linear-issues).
 		if (entry.branch !== branch) continue;
-		if (entry.commitHash === null && !entry.ignored && !entry.contentHashAtCommit) {
+		if (entry.ignored) continue;
+		if (entry.commitHash === null && !entry.contentHashAtCommit) {
 			slugs.add(slug);
+			continue;
+		}
+		if (entry.commitHash !== null && entry.contentHashAtCommit && entry.sourcePath) {
+			const liveHash = safeHashFileSync(entry.sourcePath);
+			if (liveHash && liveHash !== entry.contentHashAtCommit) {
+				slugs.add(slug);
+			}
 		}
 	}
 	log.info("Plan registry scan: found %d uncommitted slug(s) on %s: [%s]", slugs.size, branch, [...slugs].join(", "));
@@ -473,18 +505,21 @@ async function associatePlansWithCommit(
 			log.info("Plan association: slug %s not in registry — skipping", slug);
 			continue;
 		}
-		// Skip if ignored (user removed from list), archived, or already associated
+		// Skip if ignored, or if the entry is a per-commit archive snapshot
+		// (commitHash set but no contentHashAtCommit — these are the
+		// `slug-<shortHash>` artifacts, not user-facing working-area rows).
+		// Guard entries (commitHash + contentHashAtCommit) are deliberately
+		// NOT skipped here: detectPlanSlugsFromRegistry only forwards them
+		// when their source file diverged from the guard hash, which means
+		// the user iterated on the plan and we need to re-archive the new
+		// content under this commit.
 		if (entry.ignored) {
 			log.info("Plan association: slug %s is ignored — skipping", slug);
 			continue;
 		}
-		if (entry.contentHashAtCommit) {
-			log.info("Plan association: slug %s is a guard entry (already archived) — skipping", slug);
-			continue;
-		}
-		if (entry.commitHash !== null) {
+		if (entry.commitHash !== null && !entry.contentHashAtCommit) {
 			log.info(
-				"Plan association: slug %s already associated with %s — skipping",
+				"Plan association: slug %s is an archive snapshot for %s — skipping",
 				slug,
 				entry.commitHash.substring(0, 8),
 			);
@@ -568,8 +603,10 @@ async function associatePlansWithCommit(
 
 /**
  * Reads uncommitted note IDs from plans.json registry.
- * Notes with `commitHash === null` and no `contentHashAtCommit` (not yet archived)
- * are candidates for association with the current commit.
+ *
+ * Surfaces two distinct categories — the same fresh / revived-guard split that
+ * detectPlanSlugsFromRegistry uses. See that function's doc-comment for the
+ * iterative-commit revival rationale.
  */
 async function detectUncommittedNoteIds(cwd: string, branch: string): Promise<Set<string>> {
 	const registry = await loadPlansRegistry(cwd);
@@ -580,8 +617,16 @@ async function detectUncommittedNoteIds(cwd: string, branch: string): Promise<Se
 		// the current commit on commit. See the cross-branch leak documented at
 		// detectPlanSlugsFromRegistry above.
 		if (entry.branch !== branch) continue;
-		if (entry.commitHash === null && !entry.ignored && !entry.contentHashAtCommit) {
+		if (entry.ignored) continue;
+		if (entry.commitHash === null && !entry.contentHashAtCommit) {
 			ids.add(id);
+			continue;
+		}
+		if (entry.commitHash !== null && entry.contentHashAtCommit && entry.sourcePath) {
+			const liveHash = safeHashFileSync(entry.sourcePath);
+			if (liveHash && liveHash !== entry.contentHashAtCommit) {
+				ids.add(id);
+			}
 		}
 	}
 	log.info("Note registry scan: found %d uncommitted note(s) on %s: [%s]", ids.size, branch, [...ids].join(", "));

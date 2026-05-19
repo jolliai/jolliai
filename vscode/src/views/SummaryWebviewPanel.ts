@@ -33,10 +33,6 @@ import {
 	readNoteFromBranch,
 	readPlanFromBranch,
 	readTranscriptsForCommits,
-	saveTranscriptsBatch,
-	storeNotes,
-	storePlans,
-	storeSummary,
 } from "../../../cli/src/core/SummaryStore.js";
 import {
 	deleteTopicInTree,
@@ -51,13 +47,11 @@ import type {
 } from "../../../cli/src/Types.js";
 import { setLinearIssueIgnored } from "../core/LinearIssueService.js";
 import {
-	archiveNoteForCommit,
 	ignoreNote,
 	saveNote,
 	unassociateNoteFromCommit,
 } from "../core/NoteService.js";
 import {
-	archivePlanForCommit,
 	ignorePlan,
 	listAvailablePlans,
 	unassociatePlanFromCommit,
@@ -1189,7 +1183,7 @@ export class SummaryWebviewPanel {
 					? { notes: applyNoteUrls(summary.notes, noteUrls) }
 					: {}),
 			};
-			await storeSummary(updatedSummary, this.workspaceRoot, true);
+			await this.bridge.storeSummary(updatedSummary, true);
 
 			// Update in-memory state and fully re-render the WebView so PR section picks up
 			// the new plan/note URLs and jolliDocUrl in its markdown body
@@ -1212,7 +1206,7 @@ export class SummaryWebviewPanel {
 				updatedSummary,
 				baseUrl,
 				jolliApiKey,
-				this.workspaceRoot,
+				this.bridge,
 			);
 			if (cleanedSummary) {
 				this.currentSummary = cleanedSummary;
@@ -1403,7 +1397,7 @@ export class SummaryWebviewPanel {
 			throw new Error(`Memory index ${topicIndex} is out of range`);
 		}
 
-		await storeSummary(result.result, this.workspaceRoot, true);
+		await this.bridge.storeSummary(result.result, true);
 		this.currentSummary = result.result;
 
 		// Re-render just the updated topic and send the HTML to the webview for in-place replacement.
@@ -1433,7 +1427,7 @@ export class SummaryWebviewPanel {
 		const updated: CommitSummary = trimmed
 			? { ...summary, recap: trimmed }
 			: { ...summary, recap: undefined };
-		await storeSummary(updated, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updated, true);
 		this.currentSummary = updated;
 		// Server-render the section so the webview gets the canonical HTML
 		// (including the trailing <hr/> separator). Empty result removes the
@@ -1487,7 +1481,7 @@ export class SummaryWebviewPanel {
 		}
 
 		const updated: CommitSummary = { ...summary, recap: trimmed };
-		await storeSummary(updated, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updated, true);
 		this.currentSummary = updated;
 
 		this.panel.webview.postMessage({
@@ -1525,7 +1519,7 @@ export class SummaryWebviewPanel {
 			throw new Error(`Memory index ${topicIndex} is out of range`);
 		}
 
-		await storeSummary(result.result, this.workspaceRoot, true);
+		await this.bridge.storeSummary(result.result, true);
 		this.update(result.result);
 		this.panel.webview.postMessage({ command: "topicDeleted", topicIndex });
 	}
@@ -1580,7 +1574,7 @@ export class SummaryWebviewPanel {
 			...summary,
 			e2eTestGuide: scenarios,
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
 		// Send rendered HTML to webview for in-place replacement
@@ -1608,7 +1602,7 @@ export class SummaryWebviewPanel {
 			...summary,
 			e2eTestGuide: scenarios,
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
 		const html = buildE2eTestSection(updatedSummary);
@@ -1662,7 +1656,7 @@ export class SummaryWebviewPanel {
 			...summary,
 			e2eTestGuide: newScenarios,
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
 		const html = renderE2eScenario(merged, index);
@@ -1713,7 +1707,7 @@ export class SummaryWebviewPanel {
 			...summary,
 			e2eTestGuide: remaining.length > 0 ? remaining : undefined,
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
 		const html = buildE2eTestSection(updatedSummary);
@@ -1743,7 +1737,7 @@ export class SummaryWebviewPanel {
 			...summary,
 			e2eTestGuide: undefined,
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
 		const html = buildE2eTestSection(updatedSummary);
@@ -1768,11 +1762,7 @@ export class SummaryWebviewPanel {
 	}
 
 	private async handleSavePlan(slug: string, content: string): Promise<void> {
-		await storePlans(
-			[{ slug, content }],
-			`Edit plan ${slug}`,
-			this.workspaceRoot,
-		);
+		await this.bridge.storePlans([{ slug, content }], `Edit plan ${slug}`);
 		await this.syncPlanTitle(slug, content);
 
 		this.panel.webview.postMessage({ command: "planSaved", slug });
@@ -1798,7 +1788,7 @@ export class SummaryWebviewPanel {
 			...this.currentSummary,
 			plans: updatedPlans,
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 		this.update(updatedSummary);
 
@@ -1826,7 +1816,7 @@ export class SummaryWebviewPanel {
 			{
 				modal: true,
 				detail:
-					"The plan will no longer be associated with this commit. The plan file itself is not deleted.",
+					"The plan will be unlinked from this commit and its Memory Bank copy in the branch folder will be removed. The plan source on the orphan branch is preserved.",
 			},
 			"Remove",
 		);
@@ -1840,7 +1830,7 @@ export class SummaryWebviewPanel {
 			...summary,
 			plans: updatedPlans.length > 0 ? updatedPlans : undefined,
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
 		// Clear commitHash in plans.json
@@ -1849,6 +1839,14 @@ export class SummaryWebviewPanel {
 		// Mark as ignored so the plan doesn't reappear in the sidebar on next refresh
 		// (unassociate only sets commitHash=null — the entry would still be visible)
 		await ignorePlan(slug, this.workspaceRoot);
+
+		// Remove the visible <branchFolder>/plan--<slug>.md in dual-write/folder
+		// modes so the Memory Bank tree view stops showing a ghost file. Goes
+		// through the Bridge so it picks up the extension's DualWriteStorage
+		// instance — calling the SummaryStore wrapper directly here would fall
+		// back to OrphanBranchStorage and silently no-op (the extension process
+		// does not install setActiveStorage; only QueueWorker does).
+		await this.bridge.cleanupVisiblePlanArtifact(slug, summary.branch);
 
 		this.update(updatedSummary);
 	}
@@ -1879,10 +1877,9 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		const planRef = await archivePlanForCommit(
+		const planRef = await this.bridge.archivePlanForCommit(
 			selected.slug,
 			summary.commitHash,
-			this.workspaceRoot,
 		);
 		if (!planRef) {
 			vscode.window.showErrorMessage(
@@ -1896,7 +1893,7 @@ export class SummaryWebviewPanel {
 			...summary,
 			plans: [...existingPlans, planRef],
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 		this.update(updatedSummary);
 	}
@@ -1923,10 +1920,9 @@ export class SummaryWebviewPanel {
 			"markdown",
 			this.workspaceRoot,
 		);
-		const noteRef = await archiveNoteForCommit(
+		const noteRef = await this.bridge.archiveNoteForCommit(
 			noteInfo.id,
 			summary.commitHash,
-			this.workspaceRoot,
 		);
 		if (!noteRef) {
 			// Clean up the orphaned note entry so it doesn't linger in the sidebar
@@ -1942,7 +1938,7 @@ export class SummaryWebviewPanel {
 			...summary,
 			notes: [...existingNotes, noteRef],
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 		await this.refreshNoteTranslateSet(updatedSummary);
 		this.update(updatedSummary);
@@ -1967,10 +1963,9 @@ export class SummaryWebviewPanel {
 			"snippet",
 			this.workspaceRoot,
 		);
-		const noteRef = await archiveNoteForCommit(
+		const noteRef = await this.bridge.archiveNoteForCommit(
 			noteInfo.id,
 			summary.commitHash,
-			this.workspaceRoot,
 		);
 		if (!noteRef) {
 			await ignoreNote(noteInfo.id, this.workspaceRoot);
@@ -1985,7 +1980,7 @@ export class SummaryWebviewPanel {
 			...summary,
 			notes: [...existingNotes, noteRef],
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 		await this.refreshNoteTranslateSet(updatedSummary);
 		this.update(updatedSummary);
@@ -2030,7 +2025,7 @@ export class SummaryWebviewPanel {
 		content: string,
 		format: string,
 	): Promise<void> {
-		await storeNotes([{ id, content }], `Edit note ${id}`, this.workspaceRoot);
+		await this.bridge.storeNotes([{ id, content }], `Edit note ${id}`);
 
 		// Sync title and (for snippets) inline content in the summary
 		if (this.currentSummary?.notes) {
@@ -2053,7 +2048,7 @@ export class SummaryWebviewPanel {
 				...this.currentSummary,
 				notes: updatedNotes,
 			};
-			await storeSummary(updatedSummary, this.workspaceRoot, true);
+			await this.bridge.storeSummary(updatedSummary, true);
 			this.currentSummary = updatedSummary;
 			this.update(updatedSummary);
 		}
@@ -2070,7 +2065,11 @@ export class SummaryWebviewPanel {
 
 		const choice = await vscode.window.showWarningMessage(
 			`Remove note "${title}" from this commit?`,
-			{ modal: true },
+			{
+				modal: true,
+				detail:
+					"The note will be unlinked from this commit and its Memory Bank copy in the branch folder will be removed. The note source on the orphan branch is preserved.",
+			},
 			"Remove",
 		);
 		if (choice !== "Remove") {
@@ -2082,12 +2081,19 @@ export class SummaryWebviewPanel {
 			...summary,
 			notes: updatedNotes.length > 0 ? updatedNotes : undefined,
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 		await unassociateNoteFromCommit(id, this.workspaceRoot);
 		// Mark as ignored so the note doesn't reappear in the sidebar on next refresh
 		// (unassociate only sets commitHash=null — the entry would still be visible)
 		await ignoreNote(id, this.workspaceRoot);
+
+		// Remove the visible <branchFolder>/note--<id>.md in dual-write/folder
+		// modes so the Memory Bank tree view stops showing a ghost file. Goes
+		// through the Bridge so it picks up the extension's DualWriteStorage
+		// instance (see handleRemovePlan for the rationale).
+		await this.bridge.cleanupVisibleNoteArtifact(id, summary.branch);
+
 		this.update(updatedSummary);
 	}
 
@@ -2194,7 +2200,7 @@ export class SummaryWebviewPanel {
 			linearIssues:
 				updatedLinearIssues.length > 0 ? updatedLinearIssues : undefined,
 		};
-		await storeSummary(updatedSummary, this.workspaceRoot, true);
+		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
 		// Hide both entries from the panel: the snapshot key and the ticketId
@@ -2238,10 +2244,9 @@ export class SummaryWebviewPanel {
 		});
 
 		// Save translated content and sync title to summary + registry
-		await storePlans(
+		await this.bridge.storePlans(
 			[{ slug, content: translated }],
 			`Translate plan ${slug} to English`,
-			this.workspaceRoot,
 		);
 		await this.syncPlanTitle(slug, translated);
 
@@ -2293,10 +2298,9 @@ export class SummaryWebviewPanel {
 		});
 
 		// Save translated content to orphan branch
-		await storeNotes(
+		await this.bridge.storeNotes(
 			[{ id, content: translated }],
 			`Translate note ${id} to English`,
-			this.workspaceRoot,
 		);
 
 		// Sync title and (for snippets) inline content in the summary
@@ -2320,7 +2324,7 @@ export class SummaryWebviewPanel {
 				...this.currentSummary,
 				notes: updatedNotes,
 			};
-			await storeSummary(updatedSummary, this.workspaceRoot, true);
+			await this.bridge.storeSummary(updatedSummary, true);
 			this.currentSummary = updatedSummary;
 		}
 
@@ -2548,7 +2552,7 @@ export class SummaryWebviewPanel {
 		}
 
 		if (writes.length > 0 || deletes.length > 0) {
-			await saveTranscriptsBatch(writes, deletes, this.workspaceRoot);
+			await this.bridge.saveTranscriptsBatch(writes, deletes);
 		}
 
 		// Refresh cache and webview
@@ -2567,7 +2571,7 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		await saveTranscriptsBatch([], hashes, this.workspaceRoot);
+		await this.bridge.saveTranscriptsBatch([], hashes);
 
 		// Refresh cache and webview
 		if (this.currentSummary) {
@@ -2665,7 +2669,7 @@ async function cleanupOrphanedDocs(
 	updatedSummary: CommitSummary,
 	baseUrl: string,
 	apiKey: string,
-	workspaceRoot: string,
+	bridge: JolliMemoryBridge,
 ): Promise<CommitSummary | null> {
 	const orphanedIds = originalSummary.orphanedDocIds
 		? [...originalSummary.orphanedDocIds]
@@ -2705,7 +2709,7 @@ async function cleanupOrphanedDocs(
 			? { orphanedDocIds: remaining }
 			: { orphanedDocIds: undefined }),
 	};
-	await storeSummary(cleaned, workspaceRoot, true);
+	await bridge.storeSummary(cleaned, true);
 	return cleaned;
 }
 

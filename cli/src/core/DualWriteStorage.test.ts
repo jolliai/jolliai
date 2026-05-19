@@ -456,4 +456,114 @@ describe("DualWriteStorage", () => {
 			expect(markDirty).toHaveBeenCalled();
 		});
 	});
+
+	describe("deletePlanVisible delegation", () => {
+		const orphanStub = () =>
+			({
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			}) as unknown as StorageProvider;
+
+		it("delegates to the folder-side provider", async () => {
+			const folderDelete = vi.fn().mockResolvedValue(undefined);
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				deletePlanVisible: folderDelete,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphanStub(), folder);
+			await dual.deletePlanVisible("my-plan", "main");
+			expect(folderDelete).toHaveBeenCalledWith("my-plan", "main");
+		});
+
+		it("is a no-op when the folder side lacks the method", async () => {
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphanStub(), folder);
+			await expect(dual.deletePlanVisible("my-plan", "main")).resolves.toBeUndefined();
+		});
+
+		it("marks dirty when the folder side throws", async () => {
+			const folderDelete = vi.fn().mockRejectedValue(new Error("disk gone"));
+			const markDirty = vi.fn();
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				deletePlanVisible: folderDelete,
+				markDirty,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphanStub(), folder);
+			await dual.deletePlanVisible("my-plan", "main");
+			expect(markDirty).toHaveBeenCalled();
+		});
+	});
+
+	describe("deleteNoteVisible delegation", () => {
+		const orphanStub = () =>
+			({
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			}) as unknown as StorageProvider;
+
+		it("delegates to the folder-side provider", async () => {
+			const folderDelete = vi.fn().mockResolvedValue(undefined);
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				deleteNoteVisible: folderDelete,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphanStub(), folder);
+			await dual.deleteNoteVisible("note-123", "main");
+			expect(folderDelete).toHaveBeenCalledWith("note-123", "main");
+		});
+
+		it("is a no-op when the folder side lacks the method", async () => {
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphanStub(), folder);
+			await expect(dual.deleteNoteVisible("note-123", "main")).resolves.toBeUndefined();
+		});
+
+		it("marks dirty when the folder side throws", async () => {
+			const folderDelete = vi.fn().mockRejectedValue(new Error("disk gone"));
+			const markDirty = vi.fn();
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				deleteNoteVisible: folderDelete,
+				markDirty,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphanStub(), folder);
+			await dual.deleteNoteVisible("note-123", "main");
+			expect(markDirty).toHaveBeenCalled();
+		});
+	});
 });

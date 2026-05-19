@@ -437,10 +437,27 @@ async function setupPanel(
 }
 
 // Bridge stub used only to satisfy the panel ctor signature; handlePush tests
-// don't exercise branch-summary loading, so the stub's methods stay unused.
+// exercise the push path which threads writes through `this.bridge.storeSummary`,
+// so the stub delegates to module-level mockStoreSummary to keep existing
+// assertions like `expect(mockStoreSummary).toHaveBeenCalled()` working.
 const stubBridge = {
 	listBranchCommits: vi.fn(),
 	getSummary: vi.fn(),
+	storeSummary: vi.fn(
+		(
+			summary: import("../../../cli/src/Types.js").CommitSummary,
+			force = false,
+			artifacts?: unknown,
+		): Promise<void> =>
+			artifacts === undefined
+				? (mockStoreSummary(summary, "/workspace", force) as Promise<void>)
+				: (mockStoreSummary(
+						summary,
+						"/workspace",
+						force,
+						artifacts,
+					) as Promise<void>),
+	),
 } as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 
 // ── Tests ────────────────────────────────────────────────────────────────────

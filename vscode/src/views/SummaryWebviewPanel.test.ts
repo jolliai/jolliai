@@ -487,6 +487,70 @@ const stubBridge = {
 	listBranchCommits: vi.fn(),
 	getSummary: vi.fn(),
 	getCurrentBranch: vi.fn().mockResolvedValue("feature/test"),
+	cleanupVisiblePlanArtifact: vi.fn().mockResolvedValue(undefined),
+	cleanupVisibleNoteArtifact: vi.fn().mockResolvedValue(undefined),
+	// Bridge wrappers delegate to the module-level SummaryStore/PlanService/
+	// NoteService mocks with workspaceRoot injected, so existing assertions
+	// like `expect(mockStoreSummary).toHaveBeenCalledWith(summary, workspaceRoot, true)`
+	// keep working after the panel migrated to `this.bridge.storeSummary(...)`.
+	// Delegate the bridge wrappers without forwarding trailing `undefined`
+	// arguments — `toHaveBeenLastCalledWith` is arity-strict and existing
+	// assertions only specify the args that were originally passed.
+	storeSummary: vi.fn(
+		(
+			summary: import("../../../cli/src/Types.js").CommitSummary,
+			force = false,
+			artifacts?: unknown,
+		): Promise<void> =>
+			artifacts === undefined
+				? (mockStoreSummary(summary, workspaceRoot, force) as Promise<void>)
+				: (mockStoreSummary(
+						summary,
+						workspaceRoot,
+						force,
+						artifacts,
+					) as Promise<void>),
+	),
+	storePlans: vi.fn(
+		(
+			planFiles: ReadonlyArray<{ slug: string; content: string }>,
+			message: string,
+			branch?: string,
+		): Promise<void> =>
+			branch === undefined
+				? (mockStorePlans(planFiles, message, workspaceRoot) as Promise<void>)
+				: (mockStorePlans(
+						planFiles,
+						message,
+						workspaceRoot,
+						branch,
+					) as Promise<void>),
+	),
+	storeNotes: vi.fn(
+		(
+			noteFiles: ReadonlyArray<{ id: string; content: string }>,
+			message: string,
+			branch?: string,
+		): Promise<void> =>
+			branch === undefined
+				? (mockStoreNotes(noteFiles, message, workspaceRoot) as Promise<void>)
+				: (mockStoreNotes(
+						noteFiles,
+						message,
+						workspaceRoot,
+						branch,
+					) as Promise<void>),
+	),
+	saveTranscriptsBatch: vi.fn(
+		(writes: ReadonlyArray<unknown>, deletes: ReadonlyArray<string>) =>
+			mockSaveTranscriptsBatch(writes, deletes, workspaceRoot) as Promise<void>,
+	),
+	archivePlanForCommit: vi.fn((slug: string, commitHash: string) =>
+		mockArchivePlanForCommit(slug, commitHash, workspaceRoot),
+	),
+	archiveNoteForCommit: vi.fn((id: string, commitHash: string) =>
+		mockArchiveNoteForCommit(id, commitHash, workspaceRoot),
+	),
 } as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 const mainBranch = "main";
 
@@ -2441,6 +2505,15 @@ describe("SummaryWebviewPanel", () => {
 					}),
 					workspaceRoot,
 					true,
+				);
+				// Cleans up the visible <branch>/plan--<slug>.md in dual-write mode
+				// so the Memory Bank tree view doesn't keep a ghost file behind.
+				// Routes through the Bridge so it picks up the extension's
+				// DualWriteStorage instance (the SummaryStore wrapper alone
+				// would fall back to OrphanBranchStorage and silently no-op).
+				expect(stubBridge.cleanupVisiblePlanArtifact).toHaveBeenCalledWith(
+					"plan-a",
+					expect.any(String),
 				);
 			});
 
@@ -5954,7 +6027,7 @@ describe("SummaryWebviewPanel", () => {
 
 				expect(showWarningMessage).toHaveBeenCalledWith(
 					'Remove note "Note A" from this commit?',
-					{ modal: true },
+					expect.objectContaining({ modal: true }),
 					"Remove",
 				);
 				expect(mockUnassociateNoteFromCommit).toHaveBeenCalledWith(
@@ -5969,6 +6042,13 @@ describe("SummaryWebviewPanel", () => {
 					}),
 					workspaceRoot,
 					true,
+				);
+				// Cleans up the visible <branch>/note--<id>.md in dual-write mode
+				// so the Memory Bank tree view doesn't keep a ghost file behind.
+				// Routes through the Bridge (see removePlan test for rationale).
+				expect(stubBridge.cleanupVisibleNoteArtifact).toHaveBeenCalledWith(
+					"note-a",
+					expect.any(String),
 				);
 			});
 
