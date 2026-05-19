@@ -524,8 +524,15 @@ async function associatePlansWithCommit(
 			continue;
 		}
 
+		// Read the source file from the registry rather than rebuilding the
+		// path from slug — entries can point at arbitrary external `.md` files
+		// (see the symmetric explanation in vscode/src/core/PlanService.ts
+		// archivePlanForCommit).
 		const planFile = entry.sourcePath;
-		if (!existsSync(planFile)) continue;
+		if (!existsSync(planFile)) {
+			log.warn("Plan association: slug %s sourcePath %s missing on disk — skipping archive", slug, planFile);
+			continue;
+		}
 
 		// Read plan file content for orphan branch backup + content hash
 		const content = readFileSync(planFile, "utf-8");

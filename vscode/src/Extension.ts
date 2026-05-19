@@ -1688,6 +1688,20 @@ export function activate(context: vscode.ExtensionContext): void {
 						);
 						return;
 					}
+					// Mirror the existsSync guard in openPlanForPreview. Without it,
+					// a stale registry entry whose underlying file has been deleted
+					// fires openTextDocument → VSCode throws FileNotFound → command
+					// handler swallows it → user clicks but nothing happens.
+					if (!existsSync(filePath)) {
+						log.warn(
+							"cmd",
+							`editPlan: file missing on disk for ${slug}: ${filePath}`,
+						);
+						vscode.window.showWarningMessage(
+							`Plan "${slug}" file not found on disk: ${filePath}`,
+						);
+						return;
+					}
 					const doc = await vscode.workspace.openTextDocument(filePath);
 					await vscode.window.showTextDocument(doc);
 				}

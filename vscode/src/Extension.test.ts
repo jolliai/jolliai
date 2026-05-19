@@ -2095,6 +2095,29 @@ describe("Extension", () => {
 				);
 			});
 
+			it("warns and returns when the resolved filePath does not exist on disk", async () => {
+				// C5 regression: registry can point at a file that has since been
+				// deleted (user moved/renamed it). editPlan must surface that
+				// rather than firing openTextDocument and letting VSCode swallow
+				// the FileNotFound error.
+				existsSync.mockReturnValueOnce(false);
+
+				const handler = getRegisteredCommand("jollimemory.editPlan");
+				await handler({
+					plan: {
+						slug: "stale-plan",
+						title: "Stale",
+						commitHash: undefined,
+						filePath: normalize("/repo/docs/stale-plan.md"),
+					},
+				});
+
+				expect(openTextDocument).not.toHaveBeenCalled();
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("not found on disk"),
+				);
+			});
+
 			it("shows error when committed plan content is not found", async () => {
 				readPlanFromBranch.mockResolvedValue(null);
 
@@ -5154,6 +5177,40 @@ describe("Extension", () => {
 				expect.objectContaining({
 					fsPath: expect.stringContaining("foo-plan.md"),
 				}),
+			);
+		});
+
+		it("falls back to the orphan-branch snapshot when the plan has no filePath (I16)", async () => {
+			// Plan is in the snapshot but `filePath` is empty (committed-plan case
+			// where the source file path is intentionally blanked). The preview
+			// command must fall through to showPlanPreview rather than firing
+			// markdown.showPreview against a missing local path. The signal is
+			// readPlanFromBranch being invoked, which only happens in the
+			// orphan-branch fallback.
+			const ctx = makeContext();
+			activate(ctx);
+
+			mockPlansStore.getSnapshot.mockReturnValueOnce({
+				merged: [
+					{
+						kind: "plan",
+						plan: {
+							slug: "committed-plan",
+							title: "Committed",
+							filePath: "",
+						},
+					},
+				],
+				changeReason: "init",
+			} as never);
+			readPlanFromBranch.mockResolvedValueOnce("# Body");
+
+			const handler = getRegisteredCommand("jollimemory.openPlanForPreview");
+			await handler("committed-plan");
+
+			expect(readPlanFromBranch).toHaveBeenCalledWith(
+				"committed-plan",
+				"/test/workspace",
 			);
 		});
 

@@ -572,6 +572,11 @@ describe("PlanService", () => {
 				],
 				expect.any(String),
 				CWD,
+				// branch / storage are intentionally undefined — see archivePlanForCommit
+				// comment about FolderStorage resolving the branch from the commit hash
+				// embedded in the slug.
+				undefined,
+				undefined,
 			);
 		});
 	});
