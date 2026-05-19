@@ -39,7 +39,9 @@ import javax.swing.BoxLayout
 import javax.swing.JButton
 import javax.swing.JCheckBox
 import javax.swing.JLabel
+import javax.swing.JMenuItem
 import javax.swing.JPanel
+import javax.swing.JPopupMenu
 import javax.swing.SwingUtilities
 import javax.swing.Timer
 
@@ -251,6 +253,57 @@ class ChangesPanel(
         repaint()
     }
 
+    /** Discards changes for all selected files after confirmation. */
+    fun discardSelected() {
+        val selected = getSelectedFiles()
+        if (selected.isEmpty()) return
+
+        val willDelete = selected.filter { it.statusCode in listOf("??", "A", "AM", "AD") }
+        val fileList = selected.take(10).joinToString("\n") { "  • ${it.relativePath}" }
+        val overflow = if (selected.size > 10) "\n  ...and ${selected.size - 10} more" else ""
+        val deleteWarning = if (willDelete.isNotEmpty()) {
+            "\n\n⚠ ${willDelete.size} file(s) will be permanently deleted (untracked/added)."
+        } else ""
+
+        val result = Messages.showYesNoDialog(
+            project,
+            "Discard changes to ${selected.size} file(s)?\n\n$fileList$overflow$deleteWarning\n\nThis action cannot be undone.",
+            "Discard Selected Changes",
+            "Discard All",
+            "Cancel",
+            Messages.getWarningIcon(),
+        )
+        if (result != Messages.YES) return
+
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val gitOps = service.getGitOps() ?: return@executeOnPooledThread
+            val repoRoot = service.mainRepoRoot ?: project.basePath ?: return@executeOnPooledThread
+            discardFiles(selected, gitOps, repoRoot)
+            refreshFromGit()
+        }
+    }
+
+    /** Performs the git operations to discard a list of file changes. */
+    private fun discardFiles(files: List<FileChange>, gitOps: ai.jolli.jollimemory.bridge.GitOps, repoRoot: String) {
+        for (change in files) {
+            when (change.statusCode) {
+                "??" -> {
+                    try {
+                        val f = File(repoRoot, change.relativePath)
+                        if (f.isDirectory) f.deleteRecursively() else f.delete()
+                    } catch (_: Exception) { }
+                }
+                "A", "AM", "AD" -> {
+                    gitOps.exec("reset", "HEAD", "--", change.relativePath)
+                    try { File(repoRoot, change.relativePath).delete() } catch (_: Exception) { }
+                }
+                else -> {
+                    gitOps.exec("checkout", "HEAD", "--", change.relativePath)
+                }
+            }
+        }
+    }
+
     /**
      * Creates a VS Code-style file row:
      *   [checkbox] [icon] filename parentDir/   M  [⤺ discard on hover]
@@ -332,7 +385,9 @@ class ChangesPanel(
             border = JBUI.Borders.emptyLeft(2)
             addMouseListener(object : MouseAdapter() {
                 override fun mouseClicked(e: MouseEvent) {
-                    discardFile(change)
+                    if (SwingUtilities.isLeftMouseButton(e)) {
+                        discardFile(change)
+                    }
                 }
             })
         }
@@ -383,10 +438,26 @@ class ChangesPanel(
             child.addMouseListener(diffClickListener)
         }
 
+        // Right-click context menu
+        val contextMenuListener = object : MouseAdapter() {
+            override fun mousePressed(e: MouseEvent) { maybeShowPopup(e) }
+            override fun mouseReleased(e: MouseEvent) { maybeShowPopup(e) }
+            private fun maybeShowPopup(e: MouseEvent) {
+                if (!e.isPopupTrigger) return
+                val menu = JPopupMenu()
+                menu.add(JMenuItem("Discard Changes").apply {
+                    addActionListener { discardFile(change) }
+                })
+                menu.show(e.component, e.x, e.y)
+            }
+        }
+
         // Attach hover listener to the row and all child components
         row.addMouseListener(hoverListener)
+        row.addMouseListener(contextMenuListener)
         for (child in listOf(leftPanel, rightPanel, cb, iconLabel, nameLabel, pathLabel, statusLabel, discardLabel)) {
             child.addMouseListener(hoverListener)
+            child.addMouseListener(contextMenuListener)
         }
 
         // Constrain row height so BoxLayout doesn't stretch rows apart
@@ -416,28 +487,7 @@ class ChangesPanel(
         ApplicationManager.getApplication().executeOnPooledThread {
             val gitOps = service.getGitOps() ?: return@executeOnPooledThread
             val repoRoot = service.mainRepoRoot ?: project.basePath ?: return@executeOnPooledThread
-
-            when (change.statusCode) {
-                "??" -> {
-                    // Untracked file — delete it
-                    try {
-                        File(repoRoot, change.relativePath).delete()
-                    } catch (_: Exception) { /* best effort */ }
-                }
-                "A" -> {
-                    // Staged new file — unstage then delete
-                    gitOps.exec("reset", "HEAD", "--", change.relativePath)
-                    try {
-                        File(repoRoot, change.relativePath).delete()
-                    } catch (_: Exception) { /* best effort */ }
-                }
-                else -> {
-                    // Modified, deleted, renamed — restore from HEAD
-                    gitOps.exec("checkout", "HEAD", "--", change.relativePath)
-                }
-            }
-
-            // Refresh after discard
+            discardFiles(listOf(change), gitOps, repoRoot)
             refreshFromGit()
         }
     }
