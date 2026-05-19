@@ -54,6 +54,7 @@ interface SettingsPayload {
 	readonly copilotEnabled: boolean;
 	readonly localFolder: string;
 	readonly excludePatterns: string;
+	readonly dcoSignoff: boolean;
 }
 
 interface HookSyncFailure {
@@ -368,6 +369,7 @@ export class SettingsWebviewPanel {
 			excludePatterns: config.excludePatterns
 				? config.excludePatterns.join(", ")
 				: "",
+			dcoSignoff: config.dcoSignoff === true,
 		};
 
 		const signedIn = this.authService?.isSignedIn(config) ?? false;
@@ -469,6 +471,7 @@ export class SettingsWebviewPanel {
 					? settings.localFolder
 					: undefined,
 			excludePatterns: excludePatterns.length > 0 ? excludePatterns : undefined,
+			dcoSignoff: settings.dcoSignoff ? true : undefined,
 		};
 
 		const repoRoot = await getProjectRootDir(this.workspaceRoot);

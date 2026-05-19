@@ -316,6 +316,57 @@ describe("SettingsWebviewPanel", () => {
 			);
 		});
 
+		it("forwards dcoSignoff: true to settingsLoaded when set on disk", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+				dcoSignoff: true,
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ dcoSignoff: true }),
+				}),
+			);
+		});
+
+		it("defaults dcoSignoff to false when absent from config", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ dcoSignoff: false }),
+				}),
+			);
+		});
+
 		it("returns short key without known prefix as-is", async () => {
 			mockLoadConfigFromDir.mockResolvedValue({
 				apiKey: "shortkey",
@@ -725,6 +776,60 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
 				expect.objectContaining({ excludePatterns: undefined }),
+				expect.any(String),
+			);
+		});
+
+		it("saves dcoSignoff: true when toggle is on", async () => {
+			const dispatch = await setupWithLoadedConfig();
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+					dcoSignoff: true,
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ dcoSignoff: true }),
+				expect.any(String),
+			);
+		});
+
+		it("omits dcoSignoff (undefined) when toggle is off", async () => {
+			const dispatch = await setupWithLoadedConfig();
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+					dcoSignoff: false,
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ dcoSignoff: undefined }),
 				expect.any(String),
 			);
 		});
