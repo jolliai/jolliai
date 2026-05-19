@@ -52,7 +52,21 @@ export function setActiveStorage(storage: StorageProvider | undefined): void {
 }
 
 export function resolveStorage(storage?: StorageProvider, cwd?: string): StorageProvider {
-	return storage ?? activeStorageOverride ?? new OrphanBranchStorage(cwd);
+	if (storage) return storage;
+	if (activeStorageOverride) return activeStorageOverride;
+	// Fail-safe fallback: orphan branch is the system of record, so a missed storage
+	// thread still preserves data. But it bypasses DualWriteStorage, so folder-mode
+	// users silently lose this write. Warn so the gap shows up in debug.log instead
+	// of as a phantom missing file weeks later. VITEST guard mirrors Logger.ts.
+	/* v8 ignore start -- warning only fires outside VITEST; coverage runs are always under VITEST. */
+	if (!process.env.VITEST) {
+		log.warn(
+			"resolveStorage fallback to OrphanBranchStorage — caller did not thread storage or call setActiveStorage. Folder-mode users will miss this write. cwd=%s",
+			cwd ?? "(undef)",
+		);
+	}
+	/* v8 ignore stop */
+	return new OrphanBranchStorage(cwd);
 }
 
 const log = createLogger("SummaryStore");
@@ -147,6 +161,7 @@ export async function storeSummary(
 		readonly transcript?: StoredTranscript;
 		readonly planProgress?: ReadonlyArray<PlanProgressArtifact>;
 	},
+	storage?: StorageProvider,
 ): Promise<void> {
 	await withRequiredOrphanWriteLock(cwd, "storeSummary", async () => {
 		const existingIndex = await loadIndex(cwd);
@@ -200,7 +215,7 @@ export async function storeSummary(
 			}
 		}
 
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		await store.writeFiles(
 			files,
 			`${verb} summary for ${summary.commitHash.substring(0, 8)}: ${summary.commitMessage.substring(0, 50)}`,
@@ -882,6 +897,7 @@ export async function saveTranscriptsBatch(
 	writes: ReadonlyArray<{ readonly hash: string; readonly data: StoredTranscript }>,
 	deletes: ReadonlyArray<string>,
 	cwd?: string,
+	storage?: StorageProvider,
 ): Promise<void> {
 	const files: FileWrite[] = [];
 
@@ -909,7 +925,7 @@ export async function saveTranscriptsBatch(
 		.join(", ");
 
 	await withRequiredOrphanWriteLock(cwd, "saveTranscriptsBatch", async () => {
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		await store.writeFiles(files, `Update transcripts: ${summary}`);
 		log.info("Transcript batch: %s", summary);
 	});
@@ -1837,6 +1853,7 @@ export async function storePlans(
 	commitMessage: string,
 	cwd?: string,
 	branch?: string,
+	storage?: StorageProvider,
 ): Promise<void> {
 	if (planFiles.length === 0) return;
 
@@ -1847,7 +1864,7 @@ export async function storePlans(
 	}));
 
 	await withRequiredOrphanWriteLock(cwd, "storePlans", async () => {
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		await store.writeFiles(files, commitMessage);
 		log.info("Stored %d plan file(s)", planFiles.length);
 	});
@@ -1868,6 +1885,28 @@ export async function readPlanFromBranch(
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Removes ONLY the user-visible `<branch>/plan--<slug>.md` from the Memory
+ * Bank folder layer. Leaves the orphan-branch source (`plans/<slug>.md`),
+ * the hidden `.jolli/plans/<slug>.md` mirror, and the local plans registry
+ * untouched — callers that want to dissociate a plan from a commit (rather
+ * than delete the plan itself) use this to clean up the per-branch visible
+ * artifact while the plan remains addressable for future re-association.
+ *
+ * No-op when the active storage backend has no visible layer (e.g.
+ * OrphanBranchStorage in legacy `orphan-only` mode).
+ */
+export async function deletePlanVisibleArtifact(
+	slug: string,
+	branch: string,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<void> {
+	const store = resolveStorage(storage, cwd);
+	if (!store.deletePlanVisible) return;
+	await store.deletePlanVisible(slug, branch);
 }
 
 /**
@@ -1896,6 +1935,7 @@ export async function storeNotes(
 	commitMessage: string,
 	cwd?: string,
 	branch?: string,
+	storage?: StorageProvider,
 ): Promise<void> {
 	if (noteFiles.length === 0) return;
 
@@ -1906,10 +1946,29 @@ export async function storeNotes(
 	}));
 
 	await withRequiredOrphanWriteLock(cwd, "storeNotes", async () => {
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		await store.writeFiles(files, commitMessage);
 		log.info("Stored %d note file(s)", noteFiles.length);
 	});
+}
+
+/**
+ * Removes ONLY the user-visible `<branch>/note--<id>.md` from the Memory
+ * Bank folder layer. Symmetric with `deletePlanVisibleArtifact` — the
+ * orphan-branch source (`notes/<id>.md`), the hidden `.jolli/notes/<id>.md`
+ * mirror, and the local notes registry are left untouched.
+ *
+ * No-op when the active storage backend has no visible layer.
+ */
+export async function deleteNoteVisibleArtifact(
+	id: string,
+	branch: string,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<void> {
+	const store = resolveStorage(storage, cwd);
+	if (!store.deleteNoteVisible) return;
+	await store.deleteNoteVisible(id, branch);
 }
 
 /**
@@ -1939,6 +1998,7 @@ export async function storeLinearIssues(
 	commitMessage: string,
 	cwd?: string,
 	branch?: string,
+	storage?: StorageProvider,
 ): Promise<void> {
 	if (linearFiles.length === 0) return;
 
@@ -1949,7 +2009,7 @@ export async function storeLinearIssues(
 	}));
 
 	await withRequiredOrphanWriteLock(cwd, "storeLinearIssues", async () => {
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		await store.writeFiles(files, commitMessage);
 		log.info("Stored %d Linear issue file(s)", linearFiles.length);
 	});

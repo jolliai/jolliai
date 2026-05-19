@@ -22,6 +22,7 @@ import {
 	loadPlansRegistry,
 	savePlansRegistry,
 } from "../../../cli/src/core/SessionTracker.js";
+import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
 import { storeNotes } from "../../../cli/src/core/SummaryStore.js";
 import { getJolliMemoryDir } from "../../../cli/src/Logger.js";
 import type { NoteFormat, NoteReference } from "../../../cli/src/Types.js";
@@ -191,6 +192,7 @@ export async function archiveNoteForCommit(
 	id: string,
 	commitHash: string,
 	cwd: string,
+	storage?: StorageProvider,
 ): Promise<NoteReference | null> {
 	const registry = await loadPlansRegistry(cwd);
 	const notes = { ...(registry.notes ?? {}) };
@@ -234,11 +236,15 @@ export async function archiveNoteForCommit(
 	};
 	await savePlansRegistry({ ...registry, notes }, cwd);
 
-	// Store note in orphan branch
+	// Store note in orphan branch. branch left undefined — see archivePlan-
+	// ForCommit for the rationale (FolderStorage resolves the commit's branch
+	// from the hash suffix in newId).
 	await storeNotes(
 		[{ id: newId, content: noteContent }],
 		`Associate note ${newId} with commit ${shortHash}`,
 		cwd,
+		undefined,
+		storage,
 	);
 
 	// Clean up the local snippet file — content is now in the orphan branch

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock GitOps
 vi.mock("./GitOps.js", () => ({
@@ -37,8 +37,11 @@ import {
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
 import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
+import type { StorageProvider } from "./StorageProvider.js";
 import {
 	AmbiguousHashError,
+	deleteNoteVisibleArtifact,
+	deletePlanVisibleArtifact,
 	deleteTranscript,
 	expandSourcesForConsolidation,
 	getIndex,
@@ -61,6 +64,7 @@ import {
 	removeFromIndex,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
+	setActiveStorage,
 	storeLinearIssues,
 	storeNotes,
 	storePlans,
@@ -2340,6 +2344,39 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockRejectedValueOnce(new Error("missing"));
 			await expect(readPlanFromBranch("plan-a")).resolves.toBeNull();
 		});
+
+		describe("deletePlanVisibleArtifact", () => {
+			afterEach(() => {
+				setActiveStorage(undefined);
+			});
+
+			it("delegates to the active storage when it implements deletePlanVisible", async () => {
+				const deletePlanVisible = vi.fn().mockResolvedValue(undefined);
+				setActiveStorage({
+					readFile: vi.fn(),
+					writeFiles: vi.fn(),
+					listFiles: vi.fn(),
+					exists: vi.fn().mockResolvedValue(true),
+					ensure: vi.fn(),
+					deletePlanVisible,
+				} as unknown as StorageProvider);
+
+				await deletePlanVisibleArtifact("my-plan-abc12345", "feature/login");
+				expect(deletePlanVisible).toHaveBeenCalledWith("my-plan-abc12345", "feature/login");
+			});
+
+			it("is a no-op when the active storage lacks deletePlanVisible (orphan-only mode)", async () => {
+				setActiveStorage({
+					readFile: vi.fn(),
+					writeFiles: vi.fn(),
+					listFiles: vi.fn(),
+					exists: vi.fn().mockResolvedValue(true),
+					ensure: vi.fn(),
+				} as unknown as StorageProvider);
+
+				await expect(deletePlanVisibleArtifact("plan-a", "main")).resolves.toBeUndefined();
+			});
+		});
 	});
 
 	describe("readPlanProgress", () => {
@@ -2616,6 +2653,39 @@ describe("SummaryStore", () => {
 			await storeNotes([], "Empty commit");
 
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		describe("deleteNoteVisibleArtifact", () => {
+			afterEach(() => {
+				setActiveStorage(undefined);
+			});
+
+			it("delegates to the active storage when it implements deleteNoteVisible", async () => {
+				const deleteNoteVisible = vi.fn().mockResolvedValue(undefined);
+				setActiveStorage({
+					readFile: vi.fn(),
+					writeFiles: vi.fn(),
+					listFiles: vi.fn(),
+					exists: vi.fn().mockResolvedValue(true),
+					ensure: vi.fn(),
+					deleteNoteVisible,
+				} as unknown as StorageProvider);
+
+				await deleteNoteVisibleArtifact("note-42", "main");
+				expect(deleteNoteVisible).toHaveBeenCalledWith("note-42", "main");
+			});
+
+			it("is a no-op when the active storage lacks deleteNoteVisible", async () => {
+				setActiveStorage({
+					readFile: vi.fn(),
+					writeFiles: vi.fn(),
+					listFiles: vi.fn(),
+					exists: vi.fn().mockResolvedValue(true),
+					ensure: vi.fn(),
+				} as unknown as StorageProvider);
+
+				await expect(deleteNoteVisibleArtifact("note-42", "main")).resolves.toBeUndefined();
+			});
 		});
 	});
 

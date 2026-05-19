@@ -563,6 +563,120 @@ describe("FolderStorage", () => {
 		});
 	});
 
+	describe("deletePlanVisible", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		it("deletes the visible plan--<slug>.md and leaves .jolli/plans/<slug>.md untouched", async () => {
+			await storage.writeFiles(
+				[{ path: "plans/my-plan-abc12345.md", content: "# Plan\n\nBody", branch: "feature/login" }],
+				"seed plan",
+			);
+			const visiblePath = join(rootPath, "feature-login", "plan--my-plan-abc12345.md");
+			const hiddenPath = join(rootPath, ".jolli", "plans", "my-plan-abc12345.md");
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(existsSync(hiddenPath)).toBe(true);
+
+			await storage.deletePlanVisible("my-plan-abc12345", "feature/login");
+
+			expect(existsSync(visiblePath)).toBe(false);
+			// Hidden mirror is intentionally preserved — the orphan branch source
+			// stays addressable so a re-association regenerates the visible copy.
+			expect(existsSync(hiddenPath)).toBe(true);
+			expect(metadataManager.findById("plan:my-plan-abc12345")).toBeUndefined();
+		});
+
+		it("is idempotent on a missing file", async () => {
+			await expect(storage.deletePlanVisible("ghost-plan", "ghost-branch")).resolves.toBeUndefined();
+		});
+
+		it("preserves a hand-edited plan md (fingerprint mismatch)", async () => {
+			await storage.writeFiles(
+				[{ path: "plans/edited-plan-abc12345.md", content: "# Plan\n\nOriginal", branch: "main" }],
+				"seed plan",
+			);
+			const visiblePath = join(rootPath, "main", "plan--edited-plan-abc12345.md");
+			expect(existsSync(visiblePath)).toBe(true);
+
+			writeFileSync(visiblePath, "---\ntype: plan\n---\n\n# Hand-edited\n\nUser changed this", "utf-8");
+
+			await storage.deletePlanVisible("edited-plan-abc12345", "main");
+
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(readFileSync(visiblePath, "utf-8")).toContain("Hand-edited");
+			// Manifest entry kept — the hand-edited file is still tracked.
+			expect(metadataManager.findById("plan:edited-plan-abc12345")).toBeDefined();
+		});
+
+		it("falls back to <branchFolder>/plan--<slug>.md when no manifest entry exists", async () => {
+			// Simulate a stale visible file without a manifest record (e.g. from
+			// a folder that pre-dates manifest tracking).
+			mkdirSync(join(rootPath, "main"), { recursive: true });
+			const visiblePath = join(rootPath, "main", "plan--orphan-plan.md");
+			writeFileSync(visiblePath, "# Stale", "utf-8");
+			expect(metadataManager.findById("plan:orphan-plan")).toBeUndefined();
+
+			await storage.deletePlanVisible("orphan-plan", "main");
+
+			expect(existsSync(visiblePath)).toBe(false);
+		});
+	});
+
+	describe("deleteNoteVisible", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		it("deletes the visible note--<id>.md and leaves .jolli/notes/<id>.md untouched", async () => {
+			await storage.writeFiles(
+				[{ path: "notes/my-note-abc12345.md", content: "# Note\n\nBody", branch: "feature/x" }],
+				"seed note",
+			);
+			const visiblePath = join(rootPath, "feature-x", "note--my-note-abc12345.md");
+			const hiddenPath = join(rootPath, ".jolli", "notes", "my-note-abc12345.md");
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(existsSync(hiddenPath)).toBe(true);
+
+			await storage.deleteNoteVisible("my-note-abc12345", "feature/x");
+
+			expect(existsSync(visiblePath)).toBe(false);
+			expect(existsSync(hiddenPath)).toBe(true);
+			expect(metadataManager.findById("note:my-note-abc12345")).toBeUndefined();
+		});
+
+		it("is idempotent on a missing file", async () => {
+			await expect(storage.deleteNoteVisible("ghost-note", "ghost-branch")).resolves.toBeUndefined();
+		});
+
+		it("preserves a hand-edited note md (fingerprint mismatch)", async () => {
+			await storage.writeFiles(
+				[{ path: "notes/edited-note-abc12345.md", content: "# Note\n\nOriginal", branch: "main" }],
+				"seed note",
+			);
+			const visiblePath = join(rootPath, "main", "note--edited-note-abc12345.md");
+			expect(existsSync(visiblePath)).toBe(true);
+
+			writeFileSync(visiblePath, "---\ntype: note\n---\n\n# Hand-edited", "utf-8");
+
+			await storage.deleteNoteVisible("edited-note-abc12345", "main");
+
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(metadataManager.findById("note:edited-note-abc12345")).toBeDefined();
+		});
+
+		it("falls back to <branchFolder>/note--<id>.md when no manifest entry exists", async () => {
+			mkdirSync(join(rootPath, "main"), { recursive: true });
+			const visiblePath = join(rootPath, "main", "note--orphan-note.md");
+			writeFileSync(visiblePath, "# Stale", "utf-8");
+			expect(metadataManager.findById("note:orphan-note")).toBeUndefined();
+
+			await storage.deleteNoteVisible("orphan-note", "main");
+
+			expect(existsSync(visiblePath)).toBe(false);
+		});
+	});
+
 	describe("regenerateVisibleMarkdown", () => {
 		beforeEach(async () => {
 			await storage.ensure();

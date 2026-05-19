@@ -395,6 +395,98 @@ describe("PostCommitHook helpers", () => {
 			expect([...slugs]).toEqual(["eligible"]);
 		});
 
+		// Iterative-commit revival: user edits a previously-archived plan and commits
+		// again. The guard entry's contentHashAtCommit no longer matches the file,
+		// and we want the new content to be re-archived into the new commit (a fresh
+		// `slug-<newShortHash>` entry plus an updated guard). Before this fix the
+		// detect function skipped guards outright, leaving the plan visibly "stuck"
+		// in the PLANS & NOTES panel pointing at the previous commit hash.
+		it("includes revived guard plans whose source file no longer matches contentHashAtCommit", async () => {
+			const { createHash } = await import("node:crypto");
+			const oldHash = createHash("sha256").update("v1 content\n").digest("hex");
+			const liveBody = "v2 content\n";
+			mockLoadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: {
+					"revived-plan": {
+						slug: "revived-plan",
+						title: "Revived",
+						sourcePath: "/repo/plans/revived-plan.md",
+						commitHash: "deadbeefdeadbeef",
+						contentHashAtCommit: oldHash,
+						branch: "main",
+						editCount: 0,
+						addedAt: "x",
+						updatedAt: "y",
+					},
+				},
+			});
+			mockExistsSync.mockImplementation((p: string) => p === "/repo/plans/revived-plan.md");
+			mockReadFileSync.mockImplementation((p: string) => {
+				if (p === "/repo/plans/revived-plan.md") return liveBody;
+				throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+			});
+
+			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo", "main");
+			expect([...slugs]).toEqual(["revived-plan"]);
+		});
+
+		it("excludes guard plans whose source file still matches contentHashAtCommit", async () => {
+			const { createHash } = await import("node:crypto");
+			const body = "v1 content\n";
+			const hash = createHash("sha256").update(body).digest("hex");
+			mockLoadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: {
+					"stable-plan": {
+						slug: "stable-plan",
+						title: "Stable",
+						sourcePath: "/repo/plans/stable-plan.md",
+						commitHash: "deadbeefdeadbeef",
+						contentHashAtCommit: hash,
+						branch: "main",
+						editCount: 0,
+						addedAt: "x",
+						updatedAt: "y",
+					},
+				},
+			});
+			mockExistsSync.mockImplementation((p: string) => p === "/repo/plans/stable-plan.md");
+			mockReadFileSync.mockImplementation((p: string) => {
+				if (p === "/repo/plans/stable-plan.md") return body;
+				throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+			});
+
+			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo", "main");
+			expect(slugs.size).toBe(0);
+		});
+
+		it("excludes guard plans whose source file is missing on disk", async () => {
+			// Source gone → panel already hides via the "file missing" branch in
+			// toPlanInfo; we don't want to surface it as "uncommitted" and try to
+			// re-archive a file we can't read.
+			mockLoadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: {
+					"gone-plan": {
+						slug: "gone-plan",
+						title: "Gone",
+						sourcePath: "/repo/plans/gone-plan.md",
+						commitHash: "deadbeefdeadbeef",
+						contentHashAtCommit: "anything",
+						branch: "main",
+						editCount: 0,
+						addedAt: "x",
+						updatedAt: "y",
+					},
+				},
+			});
+			mockExistsSync.mockReturnValue(false);
+
+			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo", "main");
+			expect(slugs.size).toBe(0);
+		});
+
 		it("excludes uncommitted plans whose branch differs from the target branch", async () => {
 			// Regression guard for the cross-branch leak: before adding the branch
 			// filter, plans on `feature/summarize-include-linear-issues` were being

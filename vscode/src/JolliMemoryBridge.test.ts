@@ -40,13 +40,31 @@ const { generateCommitMessage, generateSquashMessage } = vi.hoisted(() => ({
 	generateSquashMessage: vi.fn(),
 }));
 
-const { getIndexEntryMap, getSummary, listSummaries, scanTreeHashAliases } =
-	vi.hoisted(() => ({
-		getIndexEntryMap: vi.fn(),
-		getSummary: vi.fn(),
-		listSummaries: vi.fn(),
-		scanTreeHashAliases: vi.fn(),
-	}));
+const {
+	deleteNoteVisibleArtifact,
+	deletePlanVisibleArtifact,
+	getIndexEntryMap,
+	getSummary,
+	listSummaries,
+	saveTranscriptsBatch,
+	scanTreeHashAliases,
+	storeLinearIssues,
+	storeNotes,
+	storePlans,
+	storeSummary,
+} = vi.hoisted(() => ({
+	deleteNoteVisibleArtifact: vi.fn(),
+	deletePlanVisibleArtifact: vi.fn(),
+	getIndexEntryMap: vi.fn(),
+	getSummary: vi.fn(),
+	listSummaries: vi.fn(),
+	saveTranscriptsBatch: vi.fn(),
+	scanTreeHashAliases: vi.fn(),
+	storeLinearIssues: vi.fn(),
+	storeNotes: vi.fn(),
+	storePlans: vi.fn(),
+	storeSummary: vi.fn(),
+}));
 
 const { getDiffStats } = vi.hoisted(() => ({
 	getDiffStats: vi.fn(),
@@ -72,16 +90,19 @@ const { installerInstall, installerUninstall, installerGetStatus } = vi.hoisted(
 	}),
 );
 
-const { detectPlans, ignorePlan } = vi.hoisted(() => ({
+const { archivePlanForCommit, detectPlans, ignorePlan } = vi.hoisted(() => ({
+	archivePlanForCommit: vi.fn(),
 	detectPlans: vi.fn(),
 	ignorePlan: vi.fn(),
 }));
 
 const {
+	archiveNoteForCommit,
 	detectNotes,
 	saveNote: saveNoteFn,
 	removeNote: removeNoteFn,
 } = vi.hoisted(() => ({
+	archiveNoteForCommit: vi.fn(),
 	detectNotes: vi.fn(),
 	saveNote: vi.fn(),
 	removeNote: vi.fn(),
@@ -178,10 +199,17 @@ vi.mock("../../cli/src/core/Summarizer.js", () => ({
 }));
 
 vi.mock("../../cli/src/core/SummaryStore.js", () => ({
+	deleteNoteVisibleArtifact,
+	deletePlanVisibleArtifact,
 	getIndexEntryMap,
 	getSummary,
 	listSummaries,
+	saveTranscriptsBatch,
 	scanTreeHashAliases,
+	storeLinearIssues,
+	storeNotes,
+	storePlans,
+	storeSummary,
 }));
 
 vi.mock("../../cli/src/core/GitOps.js", () => ({
@@ -226,11 +254,13 @@ vi.mock("../../cli/src/Logger.js", () => ({
 }));
 
 vi.mock("./core/PlanService.js", () => ({
+	archivePlanForCommit,
 	detectPlans,
 	ignorePlan,
 }));
 
 vi.mock("./core/NoteService.js", () => ({
+	archiveNoteForCommit,
 	detectNotes,
 	saveNote: saveNoteFn,
 	removeNote: removeNoteFn,
@@ -2491,6 +2521,29 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
+	describe("cleanupVisiblePlanArtifact()", () => {
+		it("passes the Bridge's storage instance through to deletePlanVisibleArtifact", async () => {
+			// Reason: SummaryStore wrappers fall back to `new OrphanBranchStorage(cwd)`
+			// when no storage is passed, which silently no-ops (no `deletePlanVisible`
+			// method). The Bridge must thread its DualWriteStorage in so the visible
+			// `<branch>/plan--<slug>.md` actually gets deleted.
+			deletePlanVisibleArtifact.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			await bridge.cleanupVisiblePlanArtifact("my-plan", "feature/x");
+
+			expect(deletePlanVisibleArtifact).toHaveBeenCalledWith(
+				"my-plan",
+				"feature/x",
+				TEST_CWD,
+				expect.objectContaining({
+					readFile: expect.any(Function),
+					writeFiles: expect.any(Function),
+				}),
+			);
+		});
+	});
+
 	// ── Notes ─────────────────────────────────────────────────────────────
 
 	describe("listNotes()", () => {
@@ -2538,6 +2591,167 @@ describe("JolliMemoryBridge", () => {
 			await bridge.removeNote("note-id");
 
 			expect(removeNoteFn).toHaveBeenCalledWith("note-id", TEST_CWD);
+		});
+	});
+
+	describe("cleanupVisibleNoteArtifact()", () => {
+		it("passes the Bridge's storage instance through to deleteNoteVisibleArtifact", async () => {
+			deleteNoteVisibleArtifact.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			await bridge.cleanupVisibleNoteArtifact("note-42", "main");
+
+			expect(deleteNoteVisibleArtifact).toHaveBeenCalledWith(
+				"note-42",
+				"main",
+				TEST_CWD,
+				expect.objectContaining({
+					readFile: expect.any(Function),
+					writeFiles: expect.any(Function),
+				}),
+			);
+		});
+	});
+
+	// ── Storage-threaded writers ─────────────────────────────────────────
+	// Every wrapper must forward the Bridge's DualWriteStorage as the trailing
+	// `storage` arg — otherwise the underlying SummaryStore writer falls back
+	// to `resolveStorage(undefined, cwd)` (= a fresh `OrphanBranchStorage`) and
+	// the Memory Bank folder never gets the write.
+
+	const storageShape = expect.objectContaining({
+		readFile: expect.any(Function),
+		writeFiles: expect.any(Function),
+	});
+
+	describe("storeSummary()", () => {
+		it("forwards the Bridge's storage to SummaryStore.storeSummary", async () => {
+			storeSummary.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+			const summary = {
+				version: 3,
+				commitHash: "abc1",
+				commitMessage: "test",
+				commitDate: "2026-05-18T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-05-18T00:00:01Z",
+			} as never;
+
+			await bridge.storeSummary(summary, true);
+
+			expect(storeSummary).toHaveBeenCalledWith(
+				summary,
+				TEST_CWD,
+				true,
+				undefined,
+				storageShape,
+			);
+		});
+	});
+
+	describe("storePlans()", () => {
+		it("forwards the Bridge's storage to SummaryStore.storePlans", async () => {
+			storePlans.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			await bridge.storePlans(
+				[{ slug: "p1", content: "# Plan" }],
+				"msg",
+				"feature/x",
+			);
+
+			expect(storePlans).toHaveBeenCalledWith(
+				[{ slug: "p1", content: "# Plan" }],
+				"msg",
+				TEST_CWD,
+				"feature/x",
+				storageShape,
+			);
+		});
+	});
+
+	describe("storeNotes()", () => {
+		it("forwards the Bridge's storage to SummaryStore.storeNotes", async () => {
+			storeNotes.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			await bridge.storeNotes([{ id: "n1", content: "# Note" }], "msg");
+
+			expect(storeNotes).toHaveBeenCalledWith(
+				[{ id: "n1", content: "# Note" }],
+				"msg",
+				TEST_CWD,
+				undefined,
+				storageShape,
+			);
+		});
+	});
+
+	describe("storeLinearIssues()", () => {
+		it("forwards the Bridge's storage to SummaryStore.storeLinearIssues", async () => {
+			storeLinearIssues.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			await bridge.storeLinearIssues(
+				[{ archivedKey: "PROJ-1-abcd1234", content: "# Issue" }],
+				"msg",
+			);
+
+			expect(storeLinearIssues).toHaveBeenCalledWith(
+				[{ archivedKey: "PROJ-1-abcd1234", content: "# Issue" }],
+				"msg",
+				TEST_CWD,
+				undefined,
+				storageShape,
+			);
+		});
+	});
+
+	describe("saveTranscriptsBatch()", () => {
+		it("forwards the Bridge's storage to SummaryStore.saveTranscriptsBatch", async () => {
+			saveTranscriptsBatch.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			await bridge.saveTranscriptsBatch([], ["hash1"]);
+
+			expect(saveTranscriptsBatch).toHaveBeenCalledWith(
+				[],
+				["hash1"],
+				TEST_CWD,
+				storageShape,
+			);
+		});
+	});
+
+	describe("archivePlanForCommit()", () => {
+		it("forwards the Bridge's storage to PlanService.archivePlanForCommit", async () => {
+			archivePlanForCommit.mockResolvedValue(null);
+			const bridge = makeBridge();
+
+			await bridge.archivePlanForCommit("plan-a", "deadbeef");
+
+			expect(archivePlanForCommit).toHaveBeenCalledWith(
+				"plan-a",
+				"deadbeef",
+				TEST_CWD,
+				storageShape,
+			);
+		});
+	});
+
+	describe("archiveNoteForCommit()", () => {
+		it("forwards the Bridge's storage to NoteService.archiveNoteForCommit", async () => {
+			archiveNoteForCommit.mockResolvedValue(null);
+			const bridge = makeBridge();
+
+			await bridge.archiveNoteForCommit("note-1", "deadbeef");
+
+			expect(archiveNoteForCommit).toHaveBeenCalledWith(
+				"note-1",
+				"deadbeef",
+				TEST_CWD,
+				storageShape,
+			);
 		});
 	});
 

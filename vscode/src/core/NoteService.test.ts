@@ -1118,6 +1118,8 @@ describe("NoteService", () => {
 				[{ id: "test-note-06d0f729", content: "file content" }],
 				expect.stringContaining("Associate note"),
 				CWD,
+				undefined,
+				undefined,
 			);
 		});
 

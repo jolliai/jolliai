@@ -857,6 +857,89 @@ describe("QueueWorker", () => {
 			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "feature/active");
 			expect([...ids]).toEqual(["current-note"]);
 		});
+
+		// Iterative-commit revival mirror of detectPlanSlugsFromRegistry: a previously
+		// archived note's source file has been edited since archive, so the new
+		// content needs to re-enter the working area and be carried into the next
+		// commit.
+		it("includes revived guard notes whose source file no longer matches contentHashAtCommit", async () => {
+			const { createHash } = await import("node:crypto");
+			const oldHash = createHash("sha256").update("v1\n").digest("hex");
+			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
+				version: 1,
+				plans: {},
+				notes: {
+					"revived-note": {
+						id: "revived-note",
+						title: "Revived",
+						format: "markdown" as const,
+						sourcePath: "/repo/notes/revived-note.md",
+						addedAt: "x",
+						updatedAt: "y",
+						branch: "main",
+						commitHash: "deadbeefdeadbeef",
+						contentHashAtCommit: oldHash,
+					},
+				},
+			});
+			vi.mocked(existsSync).mockImplementation((p) => p === "/repo/notes/revived-note.md");
+			vi.mocked(readFileSync).mockImplementation((p) => (p === "/repo/notes/revived-note.md" ? "v2\n" : ""));
+
+			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "main");
+			expect([...ids]).toEqual(["revived-note"]);
+		});
+
+		it("excludes guard notes whose source file still matches contentHashAtCommit", async () => {
+			const { createHash } = await import("node:crypto");
+			const body = "v1\n";
+			const hash = createHash("sha256").update(body).digest("hex");
+			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
+				version: 1,
+				plans: {},
+				notes: {
+					"stable-note": {
+						id: "stable-note",
+						title: "Stable",
+						format: "markdown" as const,
+						sourcePath: "/repo/notes/stable-note.md",
+						addedAt: "x",
+						updatedAt: "y",
+						branch: "main",
+						commitHash: "deadbeefdeadbeef",
+						contentHashAtCommit: hash,
+					},
+				},
+			});
+			vi.mocked(existsSync).mockImplementation((p) => p === "/repo/notes/stable-note.md");
+			vi.mocked(readFileSync).mockImplementation((p) => (p === "/repo/notes/stable-note.md" ? body : ""));
+
+			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "main");
+			expect(ids.size).toBe(0);
+		});
+
+		it("excludes guard notes whose source file is missing on disk", async () => {
+			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
+				version: 1,
+				plans: {},
+				notes: {
+					"gone-note": {
+						id: "gone-note",
+						title: "Gone",
+						format: "markdown" as const,
+						sourcePath: "/repo/notes/gone-note.md",
+						addedAt: "x",
+						updatedAt: "y",
+						branch: "main",
+						commitHash: "deadbeefdeadbeef",
+						contentHashAtCommit: "anything",
+					},
+				},
+			});
+			vi.mocked(existsSync).mockReturnValue(false);
+
+			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "main");
+			expect(ids.size).toBe(0);
+		});
 	});
 
 	describe("buildStoredTranscript", () => {
