@@ -1,5 +1,6 @@
 import {
 	chmodSync,
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -375,6 +376,303 @@ describe("KbFoldersService — single repo (under multi-repo parent)", () => {
 		expect(manifestOnDisk.files[0].path).toBe(
 			"renamed-branch/memory-abc12345.md",
 		);
+	});
+
+	it("regenerates a missing visible .md before returning the listing when hidden JSON is intact", async () => {
+		// Regression: manifest entry present, hidden JSON intact, visible .md
+		// deleted externally (iCloud eviction, manual rm, prior cleanup bugs).
+		// reconcile() alone only WARN-logs the missing file. listChildren must
+		// finish the heal inline so the recovered file is already on disk by
+		// the time the tree it returns is enumerated — otherwise the user has
+		// to refresh twice to see it come back.
+		const summaryJson = JSON.stringify({
+			version: 3,
+			commitHash: "0011223344556677",
+			commitMessage: "feat: icon style",
+			commitAuthor: "Author Name",
+			commitDate: "2026-05-14T18:15:00Z",
+			branch: "feature/icon-style",
+			generatedAt: "2026-05-14T18:15:01Z",
+			topics: [{ title: "Icon", trigger: "t", response: "r", decisions: "d" }],
+			stats: { filesChanged: 1, insertions: 2, deletions: 0 },
+		});
+		mkdirSync(join(repoDir, ".jolli", "summaries"), { recursive: true });
+		writeFileSync(
+			join(repoDir, ".jolli", "summaries", "0011223344556677.json"),
+			summaryJson,
+		);
+
+		const visibleRelPath = "feature-icon-style/feat-icon-style-00112233.md";
+		writeFileSync(
+			join(repoDir, ".jolli", "manifest.json"),
+			JSON.stringify({
+				version: 1,
+				files: [
+					{
+						path: visibleRelPath,
+						type: "commit",
+						fileId: "0011223344556677",
+						fingerprint: "fp-stale",
+						source: {
+							commitHash: "0011223344556677",
+							branch: "feature/icon-style",
+							generatedAt: "2026-05-14T18:15:01Z",
+						},
+						title: "feat: icon style",
+					},
+				],
+			}),
+		);
+
+		// Branch folder exists (with another file so the directory survives)
+		// but the target .md is missing — simulates external deletion.
+		mkdirSync(join(repoDir, "feature-icon-style"), { recursive: true });
+		writeFileSync(
+			join(repoDir, "feature-icon-style", "other-commit.md"),
+			"# unrelated\n",
+		);
+
+		// Trigger the reconcile + heal pipeline on the repo root.
+		await svc.listChildren("myrepo");
+
+		// Heal awaits inline — by the time listChildren returns the file must
+		// already be on disk. No polling needed.
+		const target = join(repoDir, visibleRelPath);
+		expect(existsSync(target)).toBe(true);
+		// And the regenerated content carries the YAML frontmatter the
+		// FolderStorage emitter writes — proves we went through the proper
+		// regenerate path, not a partial restore.
+		const regenerated = readFileSync(target, "utf-8");
+		expect(regenerated).toContain("commitHash: 0011223344556677");
+		expect(regenerated).toContain("branch: feature/icon-style");
+	});
+
+	it("invokes onHealed callback when heal regenerated files, allowing the consumer to refresh siblings", async () => {
+		const summaryJson = JSON.stringify({
+			version: 3,
+			commitHash: "aaaabbbbccccdddd",
+			commitMessage: "fix: bug",
+			commitAuthor: "Author",
+			commitDate: "2026-05-14T18:15:00Z",
+			branch: "main",
+			generatedAt: "2026-05-14T18:15:01Z",
+		});
+		mkdirSync(join(repoDir, ".jolli", "summaries"), { recursive: true });
+		writeFileSync(
+			join(repoDir, ".jolli", "summaries", "aaaabbbbccccdddd.json"),
+			summaryJson,
+		);
+		writeFileSync(
+			join(repoDir, ".jolli", "manifest.json"),
+			JSON.stringify({
+				version: 1,
+				files: [
+					{
+						path: "main/fix-bug-aaaabbbb.md",
+						type: "commit",
+						fileId: "aaaabbbbccccdddd",
+						fingerprint: "fp",
+						source: {
+							commitHash: "aaaabbbbccccdddd",
+							branch: "main",
+							generatedAt: "2026-05-14T18:15:01Z",
+						},
+						title: "fix: bug",
+					},
+				],
+			}),
+		);
+		mkdirSync(join(repoDir, "main"), { recursive: true });
+
+		const calls: Array<{
+			repoDirName: string;
+			healed: number;
+			droppedIds: readonly string[];
+		}> = [];
+		const svcWithCallback = new KbFoldersService(
+			() => ({
+				kbParent: tmpParent,
+				currentRepoName: "myrepo",
+				currentRemoteUrl: null,
+			}),
+			(info) => calls.push(info),
+		);
+
+		await svcWithCallback.listChildren("myrepo");
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.repoDirName).toBe("myrepo");
+		expect(calls[0]?.healed).toBe(1);
+	});
+
+	it("skips reconcile + heal on a second listing for the same repo when the first pass was clean", async () => {
+		// No missing files at all — first call records repo as clean, second
+		// call must not re-run reconcile (which would touch the manifest file
+		// mtime even on no-op).
+		writeFileSync(
+			join(repoDir, ".jolli", "manifest.json"),
+			JSON.stringify({ version: 1, files: [] }),
+		);
+
+		await svc.listChildren("myrepo");
+		const manifestPath = join(repoDir, ".jolli", "manifest.json");
+		const mtimeAfterFirst = require("node:fs").statSync(manifestPath).mtimeMs;
+
+		// Wait a tick so a re-write would produce a measurable mtime delta.
+		await new Promise((r) => setTimeout(r, 20));
+
+		await svc.listChildren("myrepo");
+		const mtimeAfterSecond = require("node:fs").statSync(manifestPath).mtimeMs;
+
+		expect(mtimeAfterSecond).toBe(mtimeAfterFirst);
+	});
+
+	it("notifyDirty() re-arms reconcile + heal after a clean pass", async () => {
+		// Regression: cleanRepos was a per-session memo with no caller-visible
+		// invalidation path. After the first clean pass, manual Refresh /
+		// kb:foldersReset and external file deletion (iCloud eviction, manual
+		// rm) all left the memo intact, so subsequent listChildren skipped
+		// reconcile + heal and the deleted .md was never restored. This test
+		// pins the contract: notifyDirty() drops the memo so the next
+		// listChildren actually re-runs heal — observable by deleting a
+		// visible .md the manifest references and watching heal regenerate it.
+		const summaryJson = JSON.stringify({
+			version: 3,
+			commitHash: "deadbeef11112222",
+			commitMessage: "fix: thing",
+			commitAuthor: "Author",
+			commitDate: "2026-05-19T18:15:00Z",
+			branch: "main",
+			generatedAt: "2026-05-19T18:15:01Z",
+		});
+		mkdirSync(join(repoDir, ".jolli", "summaries"), { recursive: true });
+		writeFileSync(
+			join(repoDir, ".jolli", "summaries", "deadbeef11112222.json"),
+			summaryJson,
+		);
+		const visibleRel = "main/fix-thing-deadbeef.md";
+		mkdirSync(join(repoDir, "main"), { recursive: true });
+		writeFileSync(join(repoDir, visibleRel), "# existing\n");
+		writeFileSync(
+			join(repoDir, ".jolli", "manifest.json"),
+			JSON.stringify({
+				version: 1,
+				files: [
+					{
+						path: visibleRel,
+						type: "commit",
+						fileId: "deadbeef11112222",
+						fingerprint: "fp",
+						source: {
+							commitHash: "deadbeef11112222",
+							branch: "main",
+							generatedAt: "2026-05-19T18:15:01Z",
+						},
+						title: "fix: thing",
+					},
+				],
+			}),
+		);
+
+		// First listing — visible md is on disk, heal counts it as skipped,
+		// healed=0 && failed=0, so the repo is marked clean.
+		await svc.listChildren("myrepo");
+
+		// External actor deletes the visible md. Without notifyDirty(), the
+		// memo would block heal and the file would stay deleted.
+		rmSync(join(repoDir, visibleRel));
+		expect(existsSync(join(repoDir, visibleRel))).toBe(false);
+
+		// Confirm the memo really does block heal on its own — sanity check.
+		await svc.listChildren("myrepo");
+		expect(existsSync(join(repoDir, visibleRel))).toBe(false);
+
+		// notifyDirty() drops the memo; next listing must re-run heal and
+		// regenerate the deleted file from the hidden JSON.
+		svc.notifyDirty();
+		await svc.listChildren("myrepo");
+		expect(existsSync(join(repoDir, visibleRel))).toBe(true);
+	});
+
+	it("does NOT leak the clean memo across kbParent roots that share a repo basename", async () => {
+		// Regression: cleanRepos was keyed by `firstSeg` (repo dirName) rather
+		// than the absolute kbRoot path. When the user changed "Local Folder"
+		// in settings, the same KbFoldersService instance survived with stale
+		// memo entries. If the new parent happened to host a repo with the
+		// same basename, its first listing would skip reconcile + heal based
+		// on a clean flag set by a completely different repo. Pinning by
+		// absolute kbRoot prevents the cross-root leak — we exercise this by
+		// re-pointing the service's context at a new kbParent and verifying
+		// heal still runs against the new repo even though its basename
+		// matches one already memoized in the old root.
+		writeFileSync(
+			join(repoDir, ".jolli", "manifest.json"),
+			JSON.stringify({ version: 1, files: [] }),
+		);
+
+		// Mutable context so the test can flip kbParent mid-flight, the same
+		// way refreshSidebarKbRoot() does in Extension.ts.
+		let activeParent = tmpParent;
+		const swapSvc = new KbFoldersService(() => ({
+			kbParent: activeParent,
+			currentRepoName: "myrepo",
+			currentRemoteUrl: null,
+		}));
+
+		await swapSvc.listChildren("myrepo");
+
+		const altParent = mkdtempSync(join(tmpdir(), "kbfolders-alt-"));
+		try {
+			const altRepoDir = seedRepo(altParent, "myrepo", { repoName: "myrepo" });
+			// Seed alt repo with a missing visible .md so heal has real work.
+			const summaryJson = JSON.stringify({
+				version: 3,
+				commitHash: "feed12340000aaaa",
+				commitMessage: "alt: real",
+				commitAuthor: "Author",
+				commitDate: "2026-05-19T18:15:00Z",
+				branch: "main",
+				generatedAt: "2026-05-19T18:15:01Z",
+			});
+			mkdirSync(join(altRepoDir, ".jolli", "summaries"), { recursive: true });
+			writeFileSync(
+				join(altRepoDir, ".jolli", "summaries", "feed12340000aaaa.json"),
+				summaryJson,
+			);
+			const altVisibleRel = "main/alt-real-feed1234.md";
+			mkdirSync(join(altRepoDir, "main"), { recursive: true });
+			writeFileSync(
+				join(altRepoDir, ".jolli", "manifest.json"),
+				JSON.stringify({
+					version: 1,
+					files: [
+						{
+							path: altVisibleRel,
+							type: "commit",
+							fileId: "feed12340000aaaa",
+							fingerprint: "fp",
+							source: {
+								commitHash: "feed12340000aaaa",
+								branch: "main",
+								generatedAt: "2026-05-19T18:15:01Z",
+							},
+							title: "alt: real",
+						},
+					],
+				}),
+			);
+
+			// Flip the context — same service instance, new kbParent. If the
+			// memo were keyed by dirName, the existing "myrepo" entry from
+			// the original root would suppress heal here; keying by absolute
+			// kbRoot keeps the new repo unmemoized so heal runs and the
+			// missing .md gets regenerated.
+			activeParent = altParent;
+			await swapSvc.listChildren("myrepo");
+			expect(existsSync(join(altRepoDir, altVisibleRel))).toBe(true);
+		} finally {
+			rmSync(altParent, { recursive: true, force: true });
+		}
 	});
 
 	it("classifies a single-file relPath via manifest", async () => {

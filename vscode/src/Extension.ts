@@ -544,11 +544,26 @@ export function activate(context: vscode.ExtensionContext): void {
 	// The async branch below re-resolves once config is loaded, and the
 	// settings-save callback re-resolves whenever the user picks a new folder.
 	let sidebarKbParent = resolveKbParent();
-	const kbFoldersService = new KbFoldersService(() => ({
-		kbParent: sidebarKbParent,
-		currentRepoName: sidebarRepoName,
-		currentRemoteUrl: sidebarRemoteUrl,
-	}));
+	// Forward-declared so KbFoldersService can post a refresh into the
+	// sidebar when a background heal regenerates `.md` files. SidebarWebviewProvider
+	// is constructed later in activate(); the ref is filled in then.
+	let sidebarProviderRef: { refreshKnowledgeBaseFolders(): void } | undefined;
+	const kbFoldersService = new KbFoldersService(
+		() => ({
+			kbParent: sidebarKbParent,
+			currentRepoName: sidebarRepoName,
+			currentRemoteUrl: sidebarRemoteUrl,
+		}),
+		(info) => {
+			// Heal recovered files during this listChildren — the call itself
+			// already awaited the heal so the recovered files are in the tree
+			// it returned. But cached subtrees the webview is still showing
+			// (sibling branches, repos under the same parent) need a redraw
+			// so manifest-derived labels stay in sync. Cheap; refresh is a
+			// single repaint.
+			if (info.healed > 0) sidebarProviderRef?.refreshKnowledgeBaseFolders();
+		},
+	);
 
 	// Re-resolves sidebarKbParent from the latest config and (if the path has
 	// changed) tells the sidebar webview to drop its cached folder tree so the
@@ -734,6 +749,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		}),
 		initialStateReady,
 	});
+	sidebarProviderRef = sidebarProvider;
 	context.subscriptions.push(
 		sidebarProvider,
 		vscode.window.registerWebviewViewProvider(

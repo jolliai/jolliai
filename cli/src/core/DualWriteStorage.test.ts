@@ -566,4 +566,180 @@ describe("DualWriteStorage", () => {
 			expect(markDirty).toHaveBeenCalled();
 		});
 	});
+
+	describe("healMissingVisibleMarkdown delegation", () => {
+		it("delegates to the folder-side provider and propagates the result", async () => {
+			const folderHeal = vi.fn().mockResolvedValue({ healed: 3, skipped: 5, failed: 1 });
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				healMissingVisibleMarkdown: folderHeal,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			const result = await dual.healMissingVisibleMarkdown();
+			expect(folderHeal).toHaveBeenCalled();
+			expect(result).toEqual({ healed: 3, skipped: 5, failed: 1 });
+		});
+
+		// Dual-write has the orphan branch as the truth source, so this seam
+		// MUST flip the drop flag on by default — that's the only way reconcile
+		// stops re-reporting ghost rows that migration can repopulate.
+		it("forwards dropOrphanedManifestEntries=true to the shadow by default", async () => {
+			const folderHeal = vi.fn().mockResolvedValue({ healed: 0, skipped: 0, failed: 0 });
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				healMissingVisibleMarkdown: folderHeal,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			await dual.healMissingVisibleMarkdown();
+			expect(folderHeal).toHaveBeenCalledWith({ dropOrphanedManifestEntries: true });
+		});
+
+		it("honours an explicit dropOrphanedManifestEntries=false override", async () => {
+			const folderHeal = vi.fn().mockResolvedValue({ healed: 0, skipped: 0, failed: 0 });
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				healMissingVisibleMarkdown: folderHeal,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			await dual.healMissingVisibleMarkdown({ dropOrphanedManifestEntries: false });
+			expect(folderHeal).toHaveBeenCalledWith({ dropOrphanedManifestEntries: false });
+		});
+
+		it("returns zero counts when the folder side lacks the method (no visible layer)", async () => {
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			await expect(dual.healMissingVisibleMarkdown()).resolves.toEqual({ healed: 0, skipped: 0, failed: 0 });
+		});
+
+		// Symmetry: if shadow lacks heal but primary has it (someone swapped
+		// them at construction), the fallback path is exercised. Today the
+		// canonical wiring is primary=orphan / shadow=folder; this test pins
+		// that the lookup is by capability, not slot.
+		it("falls back to the primary side when only the primary implements heal", async () => {
+			const primaryHeal = vi.fn().mockResolvedValue({ healed: 2, skipped: 0, failed: 0 });
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				healMissingVisibleMarkdown: primaryHeal,
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			const result = await dual.healMissingVisibleMarkdown();
+			expect(primaryHeal).toHaveBeenCalled();
+			expect(result.healed).toBe(2);
+		});
+
+		it("marks dirty and returns error-tagged result when the folder side throws", async () => {
+			const folderHeal = vi.fn().mockRejectedValue(new Error("manifest read failed"));
+			const markDirty = vi.fn();
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				healMissingVisibleMarkdown: folderHeal,
+				markDirty,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			const result = await dual.healMissingVisibleMarkdown();
+			expect(result.healed).toBe(0);
+			expect(result.skipped).toBe(0);
+			expect(result.failed).toBe(0);
+			// The error channel distinguishes a true no-op from a swallowed
+			// throw — the CLI / sidebar use this to avoid lying to the user.
+			expect(result.error).toBe("manifest read failed");
+			expect(markDirty).toHaveBeenCalledWith("healMissingVisibleMarkdown");
+		});
+
+		// When the swallowed throw carries an errno (EACCES on a permission
+		// issue, ENOSPC on a full disk, EBUSY on antivirus locks) the surfaced
+		// error must prepend the code so a downstream operator can dispatch on
+		// the failure category, not just guess from prose.
+		it("prepends the errno code to the surfaced error message", async () => {
+			const eacces = Object.assign(new Error("manifest is read-only"), { code: "EACCES" });
+			const folderHeal = vi.fn().mockRejectedValue(eacces);
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				healMissingVisibleMarkdown: folderHeal,
+				markDirty: vi.fn(),
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			const result = await dual.healMissingVisibleMarkdown();
+			expect(result.error).toBe("[EACCES] manifest is read-only");
+		});
+	});
 });

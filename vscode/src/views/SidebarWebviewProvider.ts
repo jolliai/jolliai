@@ -46,7 +46,15 @@ export interface SidebarWebviewDeps {
 		 */
 		getWorkerBusy(): boolean;
 	};
-	kbFolders?: { listChildren(relPath: string): Promise<FolderNode> };
+	kbFolders?: {
+		listChildren(relPath: string): Promise<FolderNode>;
+		/**
+		 * Drops the per-session "this repo is clean" memo so the next
+		 * listChildren re-runs reconcile + heal. Optional so existing tests
+		 * (which inject only `listChildren`) keep working.
+		 */
+		notifyDirty?: (kbRoot?: string) => void;
+	};
 	/**
 	 * Source for the breadcrumb repo/branch dropdowns. `listRepos` enumerates
 	 * every Memory Bank repo (current + foreign); `listBranches(repoName)`
@@ -686,6 +694,13 @@ export class SidebarWebviewProvider
 	 * and the next `ready` will pick up the new state via getInitialState().
 	 */
 	refreshKnowledgeBaseFolders(): void {
+		// Drop the "this repo is clean" memo before re-fetching so external
+		// writes (post-commit, migration, manual file deletion / iCloud
+		// eviction) actually re-trigger reconcile + heal. Without this the
+		// memo would survive the kb:foldersReset and the follow-up
+		// handleExpandFolder("") would short-circuit past the heal pipeline,
+		// leaving evicted .md files unrecovered until a window reload.
+		this.deps.kbFolders?.notifyDirty?.();
 		this.postMessage({ type: "kb:foldersReset" });
 		void this.handleExpandFolder("");
 	}

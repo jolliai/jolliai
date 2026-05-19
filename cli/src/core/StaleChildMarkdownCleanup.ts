@@ -15,9 +15,11 @@
  *     op so the disk invariant is restored after amend / rebase / squash.
  *   - cleanupAllBranchesStaleChildMarkdown(cwd, storage): walks every branch
  *     in the index. Called by MigrationEngine's one-shot step on activate to
- *     drain any backlog accumulated before this code shipped (and to undo
- *     the inverted 0.99.2 leaf-only deletion that wrongly preserved children
- *     and deleted heads).
+ *     drain any backlog of hoisted children (`parentCommitHash != null`)
+ *     accumulated before this code shipped. CANNOT restore heads that the
+ *     0.99.2 inverted leaf-only deletion bug already removed from disk —
+ *     that recovery path is `FolderStorage.healMissingVisibleMarkdown`,
+ *     which re-emits visible Markdown from hidden `summaries/<hash>.json`.
  *
  * Reads from index via getIndexEntryMap. Deletes via storage.deleteVisibleMarkdown
  * (optional method; no-op when the storage backend has no visible layer, e.g.

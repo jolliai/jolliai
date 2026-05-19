@@ -17,7 +17,7 @@ import { dirname, join, relative } from "node:path";
 import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "../Types.js";
 import { MetadataManager } from "./MetadataManager.js";
-import type { StorageProvider } from "./StorageProvider.js";
+import type { HealOptions, HealResult, StorageProvider } from "./StorageProvider.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 
 const log = createLogger("FolderStorage");
@@ -209,22 +209,19 @@ export class FolderStorage implements StorageProvider {
 	/**
 	 * Re-emit the visible <branch>/<slug>-<hash8>.md from the hidden
 	 * .jolli/summaries/<hash>.json source. Idempotent: a `.md` already on disk
-	 * causes an early return without re-reading or re-writing. Used by
-	 * MigrationEngine.runStaleChildCleanup to recover head `.md` files that
-	 * 0.99.2's inverted leaf-only pass mistakenly deleted.
+	 * causes an early return.
 	 *
 	 * Returns true when the `.md` ended up on disk (regenerated or already
-	 * present), false when the hidden JSON source was missing or unparseable
-	 * — in which case regeneration is impossible and the caller can surface
-	 * a warning. See StorageProvider.regenerateVisibleMarkdown for the contract.
+	 * present), false when the hidden JSON was missing or unparseable.
+	 * See StorageProvider.regenerateVisibleMarkdown for the contract.
 	 *
-	 * Does NOT reuse `generateSummaryMarkdown`. That path is the normal-write
-	 * pipeline and has two side effects we must avoid here:
+	 * Does NOT reuse `generateSummaryMarkdown`. That path has two side
+	 * effects we must avoid when restoring a previously written entry:
 	 *   - it overwrites the manifest `title` field, clobbering user-edited
-	 *     titles (which `backfillTitle` is contractually obligated to preserve);
-	 *   - it calls `cleanupSupersededDescendants`, which only makes sense after
-	 *     a fresh write where a new root has just superseded older children —
-	 *     not when we're merely restoring a previously deleted head.
+	 *     titles that `backfillTitle` is contractually obligated to preserve;
+	 *   - it calls `cleanupSupersededDescendants`, which only makes sense
+	 *     after a fresh write where a new root has just superseded older
+	 *     children — not when we're merely restoring a previously deleted head.
 	 */
 	async regenerateVisibleMarkdown(entry: SummaryIndexEntry): Promise<boolean> {
 		const branchFolder = this.metadataManager.resolveFolderForBranch(entry.branch);
@@ -275,6 +272,188 @@ export class FolderStorage implements StorageProvider {
 		});
 		log.info("Regenerated visible MD: %s", relativePath);
 		return true;
+	}
+
+	/**
+	 * See StorageProvider.healMissingVisibleMarkdown for the contract.
+	 *
+	 * Implementation notes (the non-obvious bits):
+	 *
+	 *   - The hidden `.jolli/summaries/<hash>.json` is the single source of
+	 *     truth for `branch` + `commitMessage`. Manifest derivatives drift:
+	 *     `source.branch` is optional (legacy pre-backfill rows omit it; a
+	 *     `?? ""` fallback would route through `transcodeBranchName("")` →
+	 *     `"default"` and pollute `branches.json`), and `title` is preserved
+	 *     across regenerate to honour user edits.
+	 *   - ENOENT on the hidden JSON is treated differently from other read
+	 *     errors. ENOENT is "really gone" and (when the caller opts in)
+	 *     eligible for manifest drop; EACCES / EBUSY / EIO are transient and
+	 *     NEVER drop — the manifest row is the last record we have.
+	 *   - Manifest drops are batched into a single rewrite at the end. The
+	 *     prior per-row `removeFromManifest` was O(N²) on ghost-heavy
+	 *     manifests and could leave the file half-cleaned on mid-loop failure.
+	 *   - When the recomputed `${branchFolder}/${slug}-${hash8}.md` differs
+	 *     from the manifest's existing `entry.path` (e.g. user renamed a
+	 *     branch folder by hand, or slugify changed across versions), we WARN
+	 *     and skip rather than silently rewriting the manifest path.
+	 */
+	async healMissingVisibleMarkdown(opts?: HealOptions): Promise<HealResult> {
+		const manifest = this.metadataManager.readManifest();
+		const commitEntries = manifest.files.filter((f) => f.type === "commit");
+
+		let healed = 0;
+		let skipped = 0;
+		let failed = 0;
+		const dropCandidates: string[] = [];
+
+		for (const entry of commitEntries) {
+			const absPath = join(this.rootPath, entry.path);
+			if (existsSync(absPath)) {
+				skipped++;
+				continue;
+			}
+
+			const hiddenJsonAbs = join(this.rootPath, ".jolli", "summaries", `${entry.fileId}.json`);
+			let summaryJson: string;
+			try {
+				summaryJson = readFileSync(hiddenJsonAbs, "utf-8");
+			} catch (err) {
+				const code = (err as NodeJS.ErrnoException).code;
+				if (code === "ENOENT") {
+					failed++;
+					if (opts?.dropOrphanedManifestEntries) {
+						dropCandidates.push(entry.fileId);
+						log.warn(
+							"healMissingVisibleMarkdown: hidden JSON missing for %s — will drop manifest entry",
+							entry.fileId.substring(0, 8),
+						);
+					} else {
+						log.warn(
+							"healMissingVisibleMarkdown: hidden JSON missing for %s — keeping manifest entry (no truth source to repopulate)",
+							entry.fileId.substring(0, 8),
+						);
+					}
+					continue;
+				}
+				// EACCES / EBUSY / EIO / antivirus lock: never drop on a
+				// transient read failure — the manifest row is the last
+				// breadcrumb. Caller (reconcile / CLI) will retry next pass.
+				failed++;
+				log.warn(
+					"healMissingVisibleMarkdown: hidden JSON read failed for %s [%s]: %s — keeping manifest entry",
+					entry.fileId.substring(0, 8),
+					code ?? "?",
+					errMsg(err),
+				);
+				continue;
+			}
+
+			let summary: CommitSummary;
+			try {
+				summary = JSON.parse(summaryJson) as CommitSummary;
+			} catch (err) {
+				failed++;
+				log.warn(
+					"healMissingVisibleMarkdown: malformed hidden JSON for %s: %s",
+					entry.fileId.substring(0, 8),
+					errMsg(err),
+				);
+				continue;
+			}
+
+			// Compute where regenerate WILL write, then compare against the
+			// manifest's recorded path. A mismatch means the manifest has
+			// drifted (rename, slugify-rule change, branch-folder collision
+			// suffix); rewriting it silently would orphan whatever the user
+			// has been navigating to. WARN and skip — let the next reconcile
+			// pick this up explicitly.
+			const branchFolder = this.metadataManager.resolveFolderForBranch(summary.branch);
+			const slug = FolderStorage.slugify(summary.commitMessage);
+			const hash8 = summary.commitHash.substring(0, 8);
+			const computedRelPath = `${branchFolder}/${slug}-${hash8}.md`;
+			if (computedRelPath !== entry.path) {
+				// Path drift is not a heal failure: the hidden JSON is intact,
+				// readable, and parseable — we're choosing not to overwrite the
+				// manifest path silently. Count it as skipped so the CLI's
+				// `failed` summary (which says "hidden JSON missing, malformed,
+				// or read-blocked") stays accurate. Reconcile is the right tool
+				// to resolve drift.
+				skipped++;
+				log.warn(
+					"healMissingVisibleMarkdown: manifest path drift for %s — manifest=%s computed=%s — keeping manifest entry, run reconcile",
+					entry.fileId.substring(0, 8),
+					entry.path,
+					computedRelPath,
+				);
+				continue;
+			}
+
+			const syntheticEntry: SummaryIndexEntry = {
+				commitHash: summary.commitHash,
+				parentCommitHash: null,
+				commitMessage: summary.commitMessage,
+				commitDate: summary.commitDate,
+				branch: summary.branch,
+				generatedAt: summary.generatedAt,
+			};
+
+			try {
+				const wrote = await this.regenerateVisibleMarkdown(syntheticEntry);
+				if (wrote) {
+					healed++;
+				} else {
+					// regenerate could not recover (hidden JSON disappeared
+					// between our read above and regenerate's re-read — TOCTOU
+					// — or the parse inside regenerate failed). Source was
+					// intact a moment ago; treat as transient, keep the row.
+					failed++;
+					log.warn(
+						"healMissingVisibleMarkdown: regenerate returned false for %s — retry on next pass",
+						entry.fileId.substring(0, 8),
+					);
+				}
+			} catch (err) {
+				failed++;
+				log.warn(
+					"healMissingVisibleMarkdown: regenerate failed for %s: %s",
+					entry.fileId.substring(0, 8),
+					errMsg(err),
+				);
+			}
+		}
+
+		// Batch drop — one manifest read+write covers every orphaned row,
+		// instead of N rewrites inside the loop.
+		const droppedIds = dropCandidates.length > 0 ? this.dropManifestEntries(dropCandidates) : [];
+
+		if (healed > 0 || failed > 0) {
+			log.info(
+				"healMissingVisibleMarkdown: healed=%d skipped=%d failed=%d dropped=%d",
+				healed,
+				skipped,
+				failed,
+				droppedIds.length,
+			);
+		}
+		// Only surface droppedIds when there's something to report — keeps the
+		// no-op result shape `{healed:0,skipped:N,failed:0}` simple.
+		return droppedIds.length > 0 ? { healed, skipped, failed, droppedIds } : { healed, skipped, failed };
+	}
+
+	private dropManifestEntries(fileIds: readonly string[]): string[] {
+		if (fileIds.length === 0) return [];
+		const drop = new Set(fileIds);
+		const before = this.metadataManager.readManifest();
+		// Return what was actually in the manifest at write time, not the
+		// caller's wish list. Heal collects candidates from an earlier read,
+		// so a concurrent writer (git hook QueueWorker, migration) may have
+		// removed some rows in between. Reporting candidate IDs would tell the
+		// user we dropped rows that were already gone.
+		const actuallyDropped = before.files.filter((f) => drop.has(f.fileId)).map((f) => f.fileId);
+		if (actuallyDropped.length === 0) return [];
+		const kept = before.files.filter((f) => !drop.has(f.fileId));
+		this.metadataManager.replaceFiles(kept);
+		return actuallyDropped;
 	}
 
 	// ── Markdown generation ────────────────────────────────────────────────
