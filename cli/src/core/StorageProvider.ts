@@ -44,15 +44,10 @@ export interface StorageProvider {
 
 	/**
 	 * Re-emit the user-visible Markdown copy for a single summary entry from
-	 * the hidden `.jolli/summaries/<hash>.json` source. Used to recover head
-	 * (`parentCommitHash == null`) `.md` files that were erroneously deleted by
-	 * 0.99.2's inverted leaf-only cleanup. Does NOT touch hidden JSON, index,
-	 * or orphan-branch state.
-	 *
-	 * Returns true when a `.md` was (re)written, false when the hidden JSON
-	 * source is missing (cannot regenerate). The implementation is allowed to
-	 * skip when the target `.md` already exists on disk; callers must not
-	 * depend on whether a write actually happened (idempotent contract).
+	 * the hidden `.jolli/summaries/<hash>.json` source. Idempotent: skips when
+	 * the target `.md` already exists. Returns true when the file is on disk
+	 * after the call (regenerated or already there), false when the hidden
+	 * JSON source is missing or unparseable.
 	 *
 	 * Optional: implemented by FolderStorage and delegated by DualWriteStorage.
 	 * OrphanBranchStorage does not implement it (no visible layer).
@@ -79,4 +74,67 @@ export interface StorageProvider {
 	 * OrphanBranchStorage does not implement it (no visible layer).
 	 */
 	deleteNoteVisible?(id: string, branch: string): Promise<void>;
+
+	/**
+	 * Walk the manifest and re-emit any commit-typed visible `.md` the manifest
+	 * still records but the filesystem no longer contains. Reads the hidden
+	 * `.jolli/summaries/<hash>.json` as the authoritative source for branch +
+	 * commit message (manifest fields can drift across renames or user edits).
+	 *
+	 * Counts:
+	 * - `healed`: visible `.md` written this pass.
+	 * - `skipped`: manifest entries whose `.md` was already on disk, AND
+	 *   entries whose recomputed visible path differs from the manifest's
+	 *   recorded path (heal refuses to silently rewrite — reconcile owns
+	 *   that). The hidden JSON is intact in both cases.
+	 * - `failed`: manifest entries that could not be recovered (hidden JSON
+	 *   missing / unreadable / malformed, or regenerate refused).
+	 *
+	 * Idempotent: a second pass with no new deletions reports every entry as
+	 * `skipped` (the loop's own `existsSync` short-circuits before reaching the
+	 * regenerate step).
+	 *
+	 * When `opts.dropOrphanedManifestEntries` is true, manifest rows whose
+	 * hidden JSON is also missing (ENOENT only — transient EACCES/EBUSY/EIO
+	 * never drop) are removed from the manifest and returned in `droppedIds`.
+	 * Callers MUST only set this flag when a higher-level truth source (e.g.
+	 * the orphan branch in dual-write mode) can re-source the entries — in
+	 * folder-only mode dropping is permanent data loss.
+	 *
+	 * Optional: implemented by FolderStorage and delegated by DualWriteStorage.
+	 * OrphanBranchStorage does not implement it (no visible layer).
+	 */
+	healMissingVisibleMarkdown?(opts?: HealOptions): Promise<HealResult>;
+}
+
+/** Options for a heal-missing-markdown pass. */
+export interface HealOptions {
+	/**
+	 * Drop manifest entries whose hidden JSON is ALSO missing (ENOENT only).
+	 * Default false — safe for any storage mode. Callers backed by a truth
+	 * source that can repopulate the manifest (orphan branch, dual-write
+	 * primary) may set this to true to stop reconcile from re-reporting
+	 * unrecoverable rows; folder-only callers must NOT set this — the
+	 * manifest is the last record and dropping it is data loss.
+	 */
+	readonly dropOrphanedManifestEntries?: boolean;
+}
+
+/** Outcome of a heal-missing-markdown pass; consumed by reconcile-callers and the `jolli heal-folder` CLI. */
+export interface HealResult {
+	readonly healed: number;
+	readonly skipped: number;
+	readonly failed: number;
+	/**
+	 * Manifest entries that were dropped because their hidden JSON was also
+	 * missing AND `opts.dropOrphanedManifestEntries` was true. Empty when no
+	 * rows were dropped (either nothing to drop, or the caller opted out).
+	 */
+	readonly droppedIds?: readonly string[];
+	/**
+	 * Populated when the heal pass aborted with an exception (e.g. delegated
+	 * shadow storage threw before completing). The numeric counts may be
+	 * partial in that case; treat the pass as "errored", not "no-op".
+	 */
+	readonly error?: string;
 }

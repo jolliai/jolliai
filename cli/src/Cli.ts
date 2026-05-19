@@ -33,6 +33,7 @@ import { registerConvertCommand } from "./commands/ConvertCommand.js";
 import { registerDoctorCommand } from "./commands/DoctorCommand.js";
 import { registerDisableCommand, registerEnableCommand } from "./commands/EnableCommand.js";
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
+import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerNewCommand } from "./commands/NewCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
@@ -182,6 +183,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerRecallCommand(program);
 	registerSearchCommand(program);
 	registerMigrateCommand(program);
+	registerHealFolderCommand(program);
 	registerExportPromptCommand(program);
 	registerExportCommand(program);
 	registerAuthCommands(program);

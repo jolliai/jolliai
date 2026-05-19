@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -825,6 +825,406 @@ describe("FolderStorage", () => {
 			expect(wrote).toBe(true);
 			// Manifest title now mirrors the summary commit message.
 			expect(metadataManager.findById(commitHash)?.title).toBe("Fresh recovery commit");
+		});
+	});
+
+	// Regression coverage for the "visible .md vanished, manifest entry kept,
+	// hidden JSON intact" disk state. Pins the contract that:
+	//   - MetadataManager.reconcile preserves the manifest row (it's
+	//     deliberately conservative — its missing-file branch only logs WARN).
+	//   - Recovery is the explicit responsibility of healMissingVisibleMarkdown
+	//     (or regenerateVisibleMarkdown for a single entry).
+	describe("reconcile preserves missing entries; heal is the recovery path", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		it("reconcile keeps the manifest entry and leaves the .md missing", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "0011223344556677",
+				commitMessage: "feat: icon style",
+				branch: "feature/icon-style",
+			});
+			await storage.writeFiles([{ path: "summaries/0011223344556677.json", content: summaryJson }], "seed");
+
+			const branchDir = join(rootPath, "feature-icon-style");
+			const visiblePath = join(branchDir, "feat-icon-style-00112233.md");
+			const hiddenJsonPath = join(rootPath, ".jolli", "summaries", "0011223344556677.json");
+
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(existsSync(hiddenJsonPath)).toBe(true);
+			expect(metadataManager.findById("0011223344556677")).toBeDefined();
+
+			unlinkSync(visiblePath);
+
+			const fixed = metadataManager.reconcile(rootPath);
+
+			expect(fixed).toBe(0);
+			expect(metadataManager.findById("0011223344556677")).toBeDefined();
+			expect(existsSync(hiddenJsonPath)).toBe(true);
+			// reconcile is intentionally non-healing — recovery lives in heal.
+			expect(existsSync(visiblePath)).toBe(false);
+		});
+
+		it("regenerateVisibleMarkdown recovers the same file reconcile leaves missing", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "0011223344556677",
+				commitMessage: "feat: icon style",
+				branch: "feature/icon-style",
+			});
+			await storage.writeFiles([{ path: "summaries/0011223344556677.json", content: summaryJson }], "seed");
+			const visiblePath = join(rootPath, "feature-icon-style", "feat-icon-style-00112233.md");
+			unlinkSync(visiblePath);
+			metadataManager.reconcile(rootPath);
+			expect(existsSync(visiblePath)).toBe(false);
+
+			const wrote = await storage.regenerateVisibleMarkdown({
+				commitHash: "0011223344556677",
+				commitMessage: "feat: icon style",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "feature/icon-style",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(wrote).toBe(true);
+			expect(existsSync(visiblePath)).toBe(true);
+		});
+	});
+
+	describe("healMissingVisibleMarkdown", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		it("returns zero counts for an empty manifest", async () => {
+			const result = await storage.healMissingVisibleMarkdown();
+			expect(result).toEqual({ healed: 0, skipped: 0, failed: 0 });
+		});
+
+		it("regenerates the visible md when only the .md was deleted (hidden JSON intact)", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "0011223344556677",
+				commitMessage: "feat: icon style",
+				branch: "feature/icon-style",
+			});
+			await storage.writeFiles([{ path: "summaries/0011223344556677.json", content: summaryJson }], "seed");
+			const visiblePath = join(rootPath, "feature-icon-style", "feat-icon-style-00112233.md");
+			unlinkSync(visiblePath);
+
+			const result = await storage.healMissingVisibleMarkdown();
+
+			expect(result).toEqual({ healed: 1, skipped: 0, failed: 0 });
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(metadataManager.findById("0011223344556677")).toBeDefined();
+		});
+
+		it("skips entries whose visible md is already on disk (counts as skipped)", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "alreadyhere12345",
+				commitMessage: "Already here",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/alreadyhere12345.json", content: summaryJson }], "seed");
+			const visiblePath = join(rootPath, "main", "already-here-alreadyh.md");
+			const beforeBytes = readFileSync(visiblePath, "utf-8");
+
+			const result = await storage.healMissingVisibleMarkdown();
+
+			expect(result).toEqual({ healed: 0, skipped: 1, failed: 0 });
+			// Untouched (regenerateVisibleMarkdown short-circuits on existing file).
+			expect(readFileSync(visiblePath, "utf-8")).toBe(beforeBytes);
+		});
+
+		// Folder-only safety contract: the default heal call (no opts) must NOT
+		// drop manifest entries whose hidden JSON is also missing — the manifest
+		// is the last record we have in folder-only mode, and dropping it is
+		// permanent data loss.
+		it("keeps manifest entry when hidden JSON is also missing (default opts)", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "ghost11111111111",
+				commitMessage: "Lost commit",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/ghost11111111111.json", content: summaryJson }], "seed");
+			unlinkSync(join(rootPath, "main", "lost-commit-ghost111.md"));
+			unlinkSync(join(rootPath, ".jolli", "summaries", "ghost11111111111.json"));
+
+			const result = await storage.healMissingVisibleMarkdown();
+
+			expect(result).toEqual({ healed: 0, skipped: 0, failed: 1 });
+			// Manifest entry preserved — no truth source to repopulate from.
+			expect(metadataManager.findById("ghost11111111111")).toBeDefined();
+		});
+
+		// Opt-in drop contract: callers backed by a truth source (orphan branch
+		// via DualWriteStorage, `jolli heal-folder` in dual-write mode) can
+		// request the drop so reconcile stops re-reporting the ghost.
+		it("drops manifest entry when hidden JSON is missing AND dropOrphanedManifestEntries=true", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "ghost22222222222",
+				commitMessage: "Lost commit",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/ghost22222222222.json", content: summaryJson }], "seed");
+			unlinkSync(join(rootPath, "main", "lost-commit-ghost222.md"));
+			unlinkSync(join(rootPath, ".jolli", "summaries", "ghost22222222222.json"));
+
+			const result = await storage.healMissingVisibleMarkdown({ dropOrphanedManifestEntries: true });
+
+			expect(result.healed).toBe(0);
+			expect(result.failed).toBe(1);
+			expect(result.droppedIds).toEqual(["ghost22222222222"]);
+			expect(metadataManager.findById("ghost22222222222")).toBeUndefined();
+		});
+
+		// EACCES / EBUSY / EIO / antivirus locks must NEVER drop the manifest
+		// entry. Read errors that are not ENOENT are treated as transient.
+		it("does not drop manifest entry on transient (non-ENOENT) read errors even with drop opt-in", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "transientread123",
+				commitMessage: "Transient read",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/transientread123.json", content: summaryJson }], "seed");
+			unlinkSync(join(rootPath, "main", "transient-read-transien.md"));
+
+			// Replace the hidden JSON file with a directory of the same name.
+			// readFileSync(dir, ...) throws with code "EISDIR" — a non-ENOENT
+			// failure that must NOT trigger a manifest drop.
+			const hiddenJsonPath = join(rootPath, ".jolli", "summaries", "transientread123.json");
+			unlinkSync(hiddenJsonPath);
+			mkdirSync(hiddenJsonPath, { recursive: true });
+
+			const result = await storage.healMissingVisibleMarkdown({ dropOrphanedManifestEntries: true });
+
+			expect(result.healed).toBe(0);
+			expect(result.failed).toBe(1);
+			expect(result.droppedIds).toBeUndefined();
+			expect(metadataManager.findById("transientread123")).toBeDefined();
+		});
+
+		// Malformed hidden JSON: heal cannot reconstruct without parseable data,
+		// but the data file is present so this is recoverable (user could fix
+		// the JSON by hand). Counts as failed; never drops.
+		it("counts malformed hidden JSON as failed and keeps the manifest entry", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "malformedjson456",
+				commitMessage: "Bad JSON",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/malformedjson456.json", content: summaryJson }], "seed");
+			// hash8 = first 8 chars of commitHash ("malforme").
+			unlinkSync(join(rootPath, "main", "bad-json-malforme.md"));
+
+			const hiddenJsonPath = join(rootPath, ".jolli", "summaries", "malformedjson456.json");
+			writeFileSync(hiddenJsonPath, "{ this is : not valid json", "utf-8");
+
+			const result = await storage.healMissingVisibleMarkdown({ dropOrphanedManifestEntries: true });
+
+			expect(result.healed).toBe(0);
+			expect(result.failed).toBe(1);
+			expect(result.droppedIds).toBeUndefined();
+			expect(metadataManager.findById("malformedjson456")).toBeDefined();
+		});
+
+		// Path drift: the manifest's recorded path no longer matches the path
+		// the hidden JSON would produce. Heal must NOT silently rewrite the
+		// manifest path — that's a separate decision the caller should make
+		// after seeing the WARN.
+		it("WARNs and skips when the recomputed path diverges from the manifest path", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "drift00000000abcd",
+				commitMessage: "Original subject",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/drift00000000abcd.json", content: summaryJson }], "seed");
+			const computedPath = join(rootPath, "main", "original-subject-drift000.md");
+			unlinkSync(computedPath);
+
+			// Forge the manifest so the recorded path points at a different file
+			// name. Heal must refuse to rewrite — that would orphan whatever the
+			// user has been navigating to.
+			const manifestPath = join(rootPath, ".jolli", "manifest.json");
+			const manifestRaw = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
+				files: Array<{ fileId: string; path: string }>;
+			};
+			for (const f of manifestRaw.files) {
+				if (f.fileId === "drift00000000abcd") {
+					f.path = "renamed-folder/handpicked-name.md";
+				}
+			}
+			writeFileSync(manifestPath, JSON.stringify(manifestRaw, null, "\t"));
+			metadataManager = new MetadataManager(join(rootPath, ".jolli"));
+			storage = new FolderStorage(rootPath, metadataManager);
+
+			const result = await storage.healMissingVisibleMarkdown();
+
+			expect(result.healed).toBe(0);
+			// Path drift is counted under `skipped`, not `failed`: the hidden
+			// JSON is intact and the entry is recoverable via reconcile.
+			// `failed` is reserved for "hidden JSON missing / unreadable /
+			// malformed / regenerate refused" — those four cases the CLI's
+			// summary line names explicitly. Pinning this here so a future
+			// counter swap can't silently change what users see.
+			expect(result.failed).toBe(0);
+			expect(result.skipped).toBe(1);
+			// Manifest path NOT rewritten.
+			expect(metadataManager.findById("drift00000000abcd")?.path).toBe("renamed-folder/handpicked-name.md");
+			// Computed path NOT written either.
+			expect(existsSync(computedPath)).toBe(false);
+		});
+
+		it("ignores plan and note entries (only commits use heal-via-hidden-JSON)", async () => {
+			// One commit (will be healed), one plan, one note — heal must touch only the commit.
+			const summaryJson = makeSummaryJson({
+				commitHash: "commit1234567890",
+				commitMessage: "Real commit",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/commit1234567890.json", content: summaryJson }], "c");
+			await storage.writeFiles([{ path: "plans/some-plan-deadbeef.md", content: "# Plan", branch: "main" }], "p");
+			await storage.writeFiles([{ path: "notes/some-note-cafebabe.md", content: "# Note", branch: "main" }], "n");
+
+			unlinkSync(join(rootPath, "main", "real-commit-commit12.md"));
+			unlinkSync(join(rootPath, "main", "plan--some-plan-deadbeef.md"));
+			unlinkSync(join(rootPath, "main", "note--some-note-cafebabe.md"));
+
+			const result = await storage.healMissingVisibleMarkdown();
+
+			expect(result.healed).toBe(1);
+			expect(result.failed).toBe(0);
+			expect(existsSync(join(rootPath, "main", "real-commit-commit12.md"))).toBe(true);
+			// Plans and notes have no hidden-JSON recovery path here — they aren't healed,
+			// but their manifest entries also aren't dropped (heal scope is commits only).
+			expect(metadataManager.findById("plan:some-plan-deadbeef")).toBeDefined();
+			expect(metadataManager.findById("note:some-note-cafebabe")).toBeDefined();
+		});
+
+		it("is idempotent — second call after a successful heal is a no-op", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "idempotent123456",
+				commitMessage: "Round trip",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/idempotent123456.json", content: summaryJson }], "seed");
+			unlinkSync(join(rootPath, "main", "round-trip-idempote.md"));
+
+			const first = await storage.healMissingVisibleMarkdown();
+			const second = await storage.healMissingVisibleMarkdown();
+
+			expect(first.healed).toBe(1);
+			expect(second.healed).toBe(0);
+			expect(second.skipped).toBe(1);
+		});
+
+		// Reads the authoritative branch from the hidden JSON, not the manifest.
+		// The synthetic entry must NOT use `entry.source.branch` because legacy
+		// manifests can omit it — a `?? ""` fallback would route through
+		// `transcodeBranchName("")` → "default" and pollute branches.json.
+		it("uses the hidden JSON branch when the manifest entry's source.branch is absent", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "legacysrcbranch1",
+				commitMessage: "Legacy entry",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/legacysrcbranch1.json", content: summaryJson }], "seed");
+			const correctPath = join(rootPath, "main", "legacy-entry-legacysr.md");
+			unlinkSync(correctPath);
+
+			// Simulate a legacy manifest entry that lost its source.branch backfill.
+			const manifestPath = join(rootPath, ".jolli", "manifest.json");
+			const manifestRaw = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
+				files: Array<{ fileId: string; source: { branch?: string } }>;
+			};
+			for (const f of manifestRaw.files) {
+				if (f.fileId === "legacysrcbranch1") {
+					delete (f.source as { branch?: string }).branch;
+				}
+			}
+			writeFileSync(manifestPath, JSON.stringify(manifestRaw, null, "\t"));
+			metadataManager = new MetadataManager(join(rootPath, ".jolli"));
+			storage = new FolderStorage(rootPath, metadataManager);
+
+			const result = await storage.healMissingVisibleMarkdown();
+
+			expect(result).toEqual({ healed: 1, skipped: 0, failed: 0 });
+			expect(existsSync(correctPath)).toBe(true);
+			// Must NOT have written to a "default" branch folder.
+			expect(existsSync(join(rootPath, "default", "legacy-entry-legacysr.md"))).toBe(false);
+			// Must NOT have polluted branches.json with a ghost empty-branch mapping.
+			const branchesRaw = JSON.parse(readFileSync(join(rootPath, ".jolli", "branches.json"), "utf-8")) as {
+				mappings: Array<{ branch: string; folder: string }>;
+			};
+			expect(branchesRaw.mappings.find((m) => m.branch === "")).toBeUndefined();
+		});
+
+		// Reads the authoritative commitMessage from the hidden JSON, not the
+		// manifest. `entry.title` is preserved across regenerate to honour user
+		// edits and so can already diverge from the original commit subject;
+		// using it would emit a .md under a different slug.
+		it("uses the hidden JSON commitMessage when the manifest title has diverged", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "divergedtitle345",
+				commitMessage: "Original commit subject",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/divergedtitle345.json", content: summaryJson }], "seed");
+			const correctPath = join(rootPath, "main", "original-commit-subject-diverged.md");
+			unlinkSync(correctPath);
+
+			// Simulate a manifest whose title field drifted away from the
+			// original commit subject (e.g. a future user-rename feature).
+			const manifestPath = join(rootPath, ".jolli", "manifest.json");
+			const manifestRaw = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
+				files: Array<{ fileId: string; title?: string }>;
+			};
+			for (const f of manifestRaw.files) {
+				if (f.fileId === "divergedtitle345") {
+					f.title = "User renamed this entry";
+				}
+			}
+			writeFileSync(manifestPath, JSON.stringify(manifestRaw, null, "\t"));
+			metadataManager = new MetadataManager(join(rootPath, ".jolli"));
+			storage = new FolderStorage(rootPath, metadataManager);
+
+			const result = await storage.healMissingVisibleMarkdown();
+
+			expect(result).toEqual({ healed: 1, skipped: 0, failed: 0 });
+			expect(existsSync(correctPath)).toBe(true);
+			// Must NOT have written under the diverged title's slug.
+			expect(existsSync(join(rootPath, "main", "user-renamed-this-entry-diverged.md"))).toBe(false);
+		});
+
+		// Batch drop: N ghost rows must result in a single manifest rewrite,
+		// not N. We can't observe the IO directly without instrumenting, but
+		// we can verify the post-state is consistent (all N rows dropped,
+		// manifest still parseable, droppedIds returns all N fileIds).
+		it("batches manifest drops in a single rewrite when multiple entries are ghosts", async () => {
+			const ids = ["ghostA0000000aaaa", "ghostB0000000bbbb", "ghostC0000000cccc"];
+			for (const id of ids) {
+				const summaryJson = makeSummaryJson({
+					commitHash: id,
+					commitMessage: `Ghost ${id.slice(5, 6)}`,
+					branch: "main",
+				});
+				await storage.writeFiles([{ path: `summaries/${id}.json`, content: summaryJson }], "seed");
+				unlinkSync(join(rootPath, ".jolli", "summaries", `${id}.json`));
+			}
+			// Delete the visible files for all of them too.
+			for (const id of ids) {
+				const slugLetter = id.slice(5, 6).toUpperCase();
+				const hash8 = id.slice(0, 8);
+				unlinkSync(join(rootPath, "main", `ghost-${slugLetter.toLowerCase()}-${hash8}.md`));
+			}
+
+			const result = await storage.healMissingVisibleMarkdown({ dropOrphanedManifestEntries: true });
+
+			expect(result.failed).toBe(ids.length);
+			expect(result.droppedIds).toEqual(expect.arrayContaining(ids));
+			for (const id of ids) {
+				expect(metadataManager.findById(id)).toBeUndefined();
+			}
 		});
 	});
 

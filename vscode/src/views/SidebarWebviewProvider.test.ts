@@ -1936,6 +1936,42 @@ describe("SidebarWebviewProvider", () => {
 		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
 	});
 
+	it("refreshKnowledgeBaseFolders invalidates the kbFolders cleanRepos memo", async () => {
+		// Regression: refreshKnowledgeBaseFolders posted kb:foldersReset and
+		// re-fetched the root, but the kbFoldersService.cleanRepos memo lived
+		// for the whole session. After the first clean pass, manual Refresh /
+		// settings save / external file deletion (iCloud eviction) all
+		// short-circuited reconcile + heal and the deleted file was never
+		// restored. Pinning notifyDirty() on this path keeps every refresh
+		// entrypoint re-armed.
+		const view = makeMockView();
+		const tree = { name: "", relPath: "", isDirectory: true, children: [] };
+		const notifyDirty = vi.fn();
+		const kbFolders = {
+			listChildren: vi.fn().mockResolvedValue(tree),
+			notifyDirty,
+		};
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			kbFolders,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		notifyDirty.mockClear();
+		provider.refreshKnowledgeBaseFolders();
+		await new Promise((r) => setTimeout(r, 0));
+		expect(notifyDirty).toHaveBeenCalledTimes(1);
+	});
+
 	// setBadge re-attaches the activity-bar badge surface that the legacy
 	// TreeView-based sidebar provided. WebviewView shares the `.badge` API
 	// with TreeView — these tests pin the contract that (a) badges set

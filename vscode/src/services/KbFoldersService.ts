@@ -49,6 +49,7 @@
 
 import { promises as fs } from "node:fs";
 import { isAbsolute, join, normalize } from "node:path";
+import { FolderStorage } from "../../../cli/src/core/FolderStorage.js";
 import {
 	type DiscoveredRepo,
 	discoverRepos,
@@ -75,8 +76,47 @@ export interface KbFoldersContext {
 	readonly currentRemoteUrl: string | null;
 }
 
+/**
+ * Optional callback the consumer can pass to be notified when a background
+ * heal pass actually regenerated visible `.md` files. The consumer is
+ * expected to refresh the sidebar tree so the recovered files become visible
+ * without the user having to click again.
+ */
+export type KbFoldersHealedCallback = (info: {
+	repoDirName: string;
+	healed: number;
+	droppedIds: readonly string[];
+}) => void;
+
 export class KbFoldersService {
-	constructor(private readonly getContext: () => KbFoldersContext) {}
+	/**
+	 * Absolute kbRoot paths whose last heal pass returned `healed=0 && failed=0`.
+	 * The manifest is in sync with disk; future listChildren calls for those
+	 * repos skip the reconcile + heal pipeline entirely. Cleared by
+	 * `notifyDirty()` so manual refresh / external write events re-arm the
+	 * check. Keyed by absolute path rather than dirName so that switching
+	 * `kbParent` (the user's "Local Folder" setting) cannot leak a clean memo
+	 * onto a same-basename repo under the new parent.
+	 */
+	private readonly cleanRepos = new Set<string>();
+
+	constructor(
+		private readonly getContext: () => KbFoldersContext,
+		private readonly onHealed?: KbFoldersHealedCallback,
+	) {}
+
+	/**
+	 * Drop the per-session "this repo is clean" memo. Called from
+	 * `SidebarWebviewProvider.refreshKnowledgeBaseFolders()` so every refresh
+	 * path — manual Refresh button, settings save, migration, rebuild, kbParent
+	 * move — re-arms the check on the next listChildren. The optional
+	 * `kbRoot` argument scopes invalidation to a single repo for callers that
+	 * know exactly which one changed; omit it to clear the whole memo.
+	 */
+	notifyDirty(kbRoot?: string): void {
+		if (kbRoot) this.cleanRepos.delete(kbRoot);
+		else this.cleanRepos.clear();
+	}
 
 	/**
 	 * Enumerates every Memory Bank repo under `<kbParent>`. Wraps `discoverRepos`
@@ -131,26 +171,87 @@ export class KbFoldersService {
 
 		if (repo) {
 			// Reconcile manifest paths against the live filesystem before
-			// listing inside this repo. Matches IntelliJ's KBExplorerPanel,
-			// which calls reconcile() prior to building its tree. Without
-			// this the VSCode Folders tab kept stale manifest paths after a
-			// user manually renamed a branch folder under the Memory Bank,
-			// dropping every file in that folder back to fileKind="other" —
-			// its memory / plan / note labels disappeared, even though the
-			// orphan branch and .jolli/index.json were unaffected. Runs on
-			// every list-inside-repo (not just subRel === "") so the
-			// webview's lazy-expand cache restoration — which can call
-			// listChildren on a deep path directly after reload, skipping
-			// the repo root — still reaches a self-healed manifest. The
-			// per-call cost stays bounded because reconcile() short-circuits
-			// when every manifest path is still on disk; the full walk only
-			// fires once after a real rename. Swallows failures because the
-			// reconcile is a best-effort heal — a manifest write failure
-			// here would degrade labelling but must not block the listing.
-			try {
-				new MetadataManager(join(repo.kbRoot, ".jolli")).reconcile(repo.kbRoot);
-			} catch {
-				/* best-effort heal; degrade to stale labels rather than empty tree */
+			// listing inside this repo. Matches IntelliJ's KBExplorerPanel.
+			// Without this the VSCode Folders tab kept stale manifest paths
+			// after a user manually renamed a branch folder, dropping every
+			// file in that folder back to fileKind="other" — labels disappeared
+			// even though the orphan branch and .jolli/index.json were intact.
+			// Runs on every list-inside-repo (not just subRel === "") so a
+			// webview lazy-expand that lands on a deep path directly still
+			// reaches a self-healed manifest. Per-call cost stays bounded
+			// because reconcile() short-circuits when every manifest path is
+			// still on disk; the full walk only fires after a real rename.
+			//
+			// Heal awaits inline (not fire-and-forget): the regenerated `.md`
+			// files MUST be on disk before listInRepo enumerates the folder,
+			// otherwise this listChildren call returns a tree that still
+			// omits the recovered files and the user has to refresh again.
+			// Heal is cheap in steady state — M existsSync + one manifest
+			// read; the per-session `cleanRepos` set skips even that once the
+			// manifest is known clean.
+			//
+			// Folder-only safety: heal here passes `dropOrphanedManifestEntries:
+			// false` explicitly. Manifest rows whose hidden JSON is also missing
+			// are kept (failed++) rather than silently deleted — the sidebar
+			// path can't tell whether the active StorageProvider is folder-only
+			// or dual-write (it constructs a bare FolderStorage to skip the
+			// per-listing factory cost), so we MUST assume folder-only and
+			// preserve. The explicit `jolli heal-folder` CLI reads the
+			// storageMode config and is the place where dropping can be opted
+			// into. Passing the flag explicitly (rather than relying on the
+			// FolderStorage default) makes that contract visible at the call
+			// site and survives future signature changes.
+			//
+			// Concurrency note: this path now writes (regenerate + possibly
+			// replaceFiles) but holds no lock. Two concurrent listChildren
+			// calls on the same repo (e.g. webview re-init racing with manual
+			// Refresh) can both miss `cleanRepos` and both run heal. Single
+			// `.md` writes are safe (atomicWrite); the manifest read-modify-
+			// write window is bounded by reconcile + replaceFiles, both via
+			// MetadataManager's atomicWrite. With drop disabled here, the only
+			// manifest mutation the sidebar heal can do is `updateManifest`
+			// inside regenerate, which is keyed by fileId and is idempotent
+			// under concurrent re-runs.
+			if (!this.cleanRepos.has(repo.kbRoot)) {
+				try {
+					const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
+					mm.reconcile(repo.kbRoot);
+					const storage = new FolderStorage(repo.kbRoot, mm);
+					const healResult = await storage.healMissingVisibleMarkdown({
+						dropOrphanedManifestEntries: false,
+					});
+					if (healResult.healed === 0 && healResult.failed === 0) {
+						this.cleanRepos.add(repo.kbRoot);
+					}
+					if (healResult.healed > 0) {
+						this.onHealed?.({
+							repoDirName: firstSeg,
+							healed: healResult.healed,
+							droppedIds: healResult.droppedIds ?? [],
+						});
+					}
+				} catch (err) {
+					// Surface user-actionable disk / permission errors so the
+					// extension's debug log captures them. Heal is best-effort
+					// for labelling — we still list the tree below.
+					const code = (err as NodeJS.ErrnoException)?.code;
+					const message = err instanceof Error ? err.message : String(err);
+					if (
+						code === "ENOSPC" ||
+						code === "EROFS" ||
+						code === "EACCES" ||
+						code === "EPERM"
+					) {
+						// Loud category — caller should consider toasting.
+						console.warn(
+							`[KbFolders] heal blocked for ${firstSeg} [${code}]: ${message}`,
+						);
+					} else {
+						console.warn(
+							`[KbFolders] heal failed for ${firstSeg} [${code ?? "?"}]: ${message}`,
+						);
+					}
+				}
 			}
 			const node = await this.listInRepo(repo.kbRoot, subRel);
 			// Prefix every relPath with the firstSeg so cached webview paths

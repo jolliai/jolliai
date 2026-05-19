@@ -70,6 +70,17 @@ export class MetadataManager {
 		return true;
 	}
 
+	/**
+	 * Replace the manifest's files array in a single atomic write. Used by
+	 * batch operations (heal-folder, migration cleanup) where touching the
+	 * manifest once per row would be O(N²) and leave half-cleaned state on
+	 * mid-loop failure.
+	 */
+	replaceFiles(files: readonly ManifestEntry[]): void {
+		const manifest = this.readManifest();
+		this.atomicWrite(this.manifestPath, JSON.stringify({ ...manifest, files: [...files] }, null, "\t"));
+	}
+
 	findByPath(path: string): ManifestEntry | undefined {
 		return this.readManifest().files.find((f) => f.path === path);
 	}

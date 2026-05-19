@@ -87,6 +87,30 @@ describe("StaleChildMarkdownCleanup", () => {
 			expect(storage.deletions).toEqual([]);
 		});
 
+		it("keeps a series of plain commits on the active branch across many branches in the index", async () => {
+			// Customer-shaped fixture: the index carries plain-commit heads from
+			// several historical branches plus the active branch. The cleanup
+			// pass is scoped to one branch, so heads on the OTHER branches must
+			// never be touched even when they share the same parent=null shape.
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a1", e("a1", "feat-2747", null)],
+					["a2", e("a2", "feat-2747", null)],
+					["a3", e("a3", "feat-2747", null)],
+					["a4", e("a4", "feat-2747", null)],
+					["a5", e("a5", "feat-2747", null)],
+					["b1", e("b1", "feat-2841", null)],
+					["b2", e("b2", "feat-2841", null)],
+					["c1", e("c1", "feat-2719", null)],
+				]),
+			);
+			const storage = makeStorage();
+			const result = await cleanupBranchStaleChildMarkdown("/cwd", "feat-2747", storage);
+			expect(result.deleted).toBe(0);
+			expect(result.failed).toBe(0);
+			expect(storage.deletions).toEqual([]);
+		});
+
 		it("is a no-op when storage lacks deleteVisibleMarkdown", async () => {
 			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
 				new Map<string, SummaryIndexEntry>([
