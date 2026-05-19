@@ -74,6 +74,7 @@ import {
 	saveSession,
 	upsertLinearIssueEntry,
 } from "../core/SessionTracker.js";
+import { withPlatform } from "../testUtils/withPlatform.js";
 import { handleStopHook } from "./StopHook.js";
 
 /** Helper to mock stdin with given content */
@@ -1220,6 +1221,81 @@ describe("StopHook — plan discovery", () => {
 			}),
 			PROJECT_DIR,
 		);
+	});
+
+	it("should NOT register external .md as a plan when it is already a markdown note", async () => {
+		// Product-regression guard: a user added `docs/design.md` via "Add Markdown
+		// File" (note semantics, manual selection). The AI then edits the same
+		// file in a session. StopHook must not also register it as a plan — that
+		// would shadow the user's note semantics, double-archive into the orphan
+		// branch, and surface the same file twice in the panel.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // .md file on disk
+
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {},
+			notes: {
+				"n-abc123": {
+					id: "n-abc123",
+					title: "Design Doc",
+					format: "markdown",
+					sourcePath: "/repo/docs/design.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					branch: "main",
+					commitHash: null,
+				},
+			},
+		});
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/design.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	it("should match note sourcePath case-insensitively on Windows (and Darwin)", async () => {
+		// Filesystem case mismatch (Note registered as "Design.md", AI edits "design.md"
+		// referring to same file on case-insensitive FS) must still trigger the
+		// note-shadowing guard. Asserts normalizePathForCompare is being applied
+		// to both sides of the lookup. Pinned to win32 via withPlatform so the
+		// case-folding branch runs on the Linux CI runner as well.
+		await withPlatform("win32", async () => {
+			vi.mocked(existsSync)
+				.mockReturnValueOnce(true) // transcript file
+				.mockReturnValueOnce(true); // .md file on disk
+
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				notes: {
+					"n-abc": {
+						id: "n-abc",
+						title: "Design",
+						format: "markdown",
+						sourcePath: "C:\\Repo\\Docs\\Design.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						branch: "main",
+						commitHash: null,
+					},
+				},
+			});
+
+			mockTranscriptWithLines([
+				// AI used lowercase form
+				'{"type":"tool_use","name":"Edit","input":{"file_path":"c:\\\\repo\\\\docs\\\\design.md"}}',
+			]);
+
+			mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+			await handleStopHook();
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
 	});
 
 	it("should skip external .md when source file no longer exists at upsert time", async () => {

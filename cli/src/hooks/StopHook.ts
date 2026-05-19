@@ -32,6 +32,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { extractLinearIssuesFromTranscript } from "../core/LinearIssueExtractor.js";
 import { writeLinearIssueMarkdown } from "../core/LinearIssueStore.js";
+import { normalizePathForCompare } from "../core/PathUtils.js";
 import {
 	loadConfig,
 	loadCursorForTranscript,
@@ -179,23 +180,6 @@ const EXTERNAL_EXCLUDE_BASENAMES = new Set([
 	"license.md",
 	"security.md",
 ]);
-
-/**
- * Normalize a path for case/separator-insensitive comparison. Used wherever
- * two strings should be treated as "same file" even if Windows case or
- * separator differs.
- *
- * Deliberately does NOT use `path.resolve` because on Windows, POSIX-absolute
- * paths like `/home/user/foo.md` (which Claude transcripts can produce when
- * running under WSL or via cross-platform tooling) are treated as relative and
- * resolved against the runtime cwd. That made same-file checks platform-
- * dependent. All callers pass absolute paths, so separator + case normalization
- * is sufficient.
- */
-function normalizePathForCompare(p: string): string {
-	const normalized = p.replace(/\\/g, "/");
-	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
 
 /**
  * Decide whether an external .md path is a plan candidate. Excludes
@@ -347,11 +331,27 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 		upsertEntry(slug, planFile, editCount);
 	}
 
+	// Build a Set of normalized paths that already belong to a markdown note.
+	// Markdown notes added via "Add Markdown File" can point at arbitrary user
+	// .md files (NoteService allows `sourcePath = <user-picked path>`). If the
+	// AI later edits that same file, we must NOT also register it as a plan —
+	// it would shadow the user's explicit note semantics, double-archive into
+	// the orphan branch, and surface the same file twice in the panel
+	// (plans + notes are merged without sourcePath dedup downstream).
+	const noteSourcePaths = new Set<string>();
+	for (const note of Object.values(registry.notes ?? {})) {
+		if (note.sourcePath) noteSourcePaths.add(normalizePathForCompare(note.sourcePath));
+	}
+
 	// 2. External .md paths — slug resolved against current plans snapshot.
 	//    basenameNoExt is platform-agnostic so a Windows-style path parsed on
 	//    POSIX CI still yields a clean filename slug.
 	for (const [absPath, editCount] of externalPlans) {
 		if (!existsSync(absPath)) continue;
+		if (noteSourcePaths.has(normalizePathForCompare(absPath))) {
+			log.info("Plan discovery: %s already a note — skipping plan registration", absPath);
+			continue;
+		}
 		const baseSlug = basenameNoExt(absPath, ".md");
 		const slug = resolveUniqueSlug(baseSlug, absPath, plans);
 		upsertEntry(slug, absPath, editCount);
