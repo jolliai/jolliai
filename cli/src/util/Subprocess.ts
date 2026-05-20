@@ -16,12 +16,8 @@ import {
 	type ExecFileSyncOptions,
 	type ExecFileSyncOptionsWithBufferEncoding,
 	type ExecFileSyncOptionsWithStringEncoding,
-	type ExecSyncOptions,
-	type ExecSyncOptionsWithBufferEncoding,
-	type ExecSyncOptionsWithStringEncoding,
 	execFile,
 	execFileSync,
-	execSync,
 	type SpawnOptions,
 	type SpawnSyncOptions,
 	type SpawnSyncOptionsWithBufferEncoding,
@@ -74,13 +70,6 @@ export function execFileSyncHidden(
 	options?: ExecFileSyncOptions,
 ): Buffer | string {
 	return execFileSync(file, args as ReadonlyArray<string>, { ...HIDDEN, ...(options ?? {}) });
-}
-
-export function execSyncHidden(command: string, options: ExecSyncOptionsWithStringEncoding): string;
-export function execSyncHidden(command: string, options: ExecSyncOptionsWithBufferEncoding): Buffer;
-export function execSyncHidden(command: string, options?: ExecSyncOptions): Buffer | string;
-export function execSyncHidden(command: string, options?: ExecSyncOptions): Buffer | string {
-	return execSync(command, { ...HIDDEN, ...(options ?? {}) });
 }
 
 /**
