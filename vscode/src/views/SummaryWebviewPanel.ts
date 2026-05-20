@@ -1122,6 +1122,20 @@ export class SummaryWebviewPanel {
 	 * to the webview. Wrapped in `Promise.allSettled` semantics by
 	 * {@link toJolliResultMessage} so a thrown error becomes a structured
 	 * `pushToJolliResult` instead of an uncaught rejection.
+	 *
+	 * Known race window (intentionally not double-guarded): once
+	 * `pushToJolli` has been kicked off (1–3s HTTP round-trip in practice),
+	 * an amend landing mid-call would let `runJolliPush` persist the
+	 * resulting `jolliDocId` to the now-orphaned commit's summary. We accept
+	 * this because:
+	 *   - the window is short and requires concurrent user action on the
+	 *     same workspace (sidebar Amend / terminal `git commit --amend`),
+	 *   - re-checking AFTER pushToJolli but BEFORE storeSummary would leave
+	 *     the article created on the Jolli side without a local record,
+	 *     causing the next push of the new HEAD to create a duplicate
+	 *     article instead of updating in place.
+	 * Trade-off is favourable for the common case; documented here so a
+	 * future maintainer doesn't quietly add the re-check without realising.
 	 */
 	private async handlePush(): Promise<void> {
 		// Prevent concurrent pushes: the button can be re-clicked when
@@ -1552,6 +1566,12 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
+		// Race-window re-check: amend can land during the LLM call (10–60s).
+		// Without this the recap would be persisted to the now-orphaned commit.
+		if (!(await this.ensureCommitNotRewritten("generate recap"))) {
+			return;
+		}
+
 		const updated: CommitSummary = { ...summary, recap: trimmed };
 		await this.bridge.storeSummary(updated, true);
 		this.currentSummary = updated;
@@ -1588,6 +1608,13 @@ export class SummaryWebviewPanel {
 			"Delete",
 		);
 		if (choice !== "Delete") {
+			return;
+		}
+
+		// Race-window re-check: amend can land between the entry guard and the
+		// user dismissing the modal. Without this the delete would persist to
+		// the now-orphaned commit's summary.
+		if (!(await this.ensureCommitNotRewritten("delete memory"))) {
 			return;
 		}
 
@@ -1644,6 +1671,11 @@ export class SummaryWebviewPanel {
 				"No major topics in this commit, so there's nothing to test.",
 			);
 			this.panel.webview.postMessage({ command: "e2eTestError" });
+			return;
+		}
+
+		// Race-window re-check: amend can land during the LLM call (10–60s).
+		if (!(await this.ensureCommitNotRewritten("generate E2E test guide"))) {
 			return;
 		}
 
@@ -1789,6 +1821,11 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
+		// Race-window re-check: amend can land while the confirm modal is open.
+		if (!(await this.ensureCommitNotRewritten("delete E2E scenario"))) {
+			return;
+		}
+
 		const remaining = summary.e2eTestGuide.filter((_, i) => i !== index);
 		const updatedSummary: CommitSummary = {
 			...summary,
@@ -1821,6 +1858,11 @@ export class SummaryWebviewPanel {
 			"Delete",
 		);
 		if (choice !== "Delete") {
+			return;
+		}
+
+		// Race-window re-check: amend can land while the confirm modal is open.
+		if (!(await this.ensureCommitNotRewritten("delete E2E test guide"))) {
 			return;
 		}
 
@@ -1928,6 +1970,11 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
+		// Race-window re-check: amend can land while the confirm modal is open.
+		if (!(await this.ensureCommitNotRewritten("remove plan"))) {
+			return;
+		}
+
 		// Update CommitSummary: remove plan from plans array
 		const updatedPlans = summary.plans.filter((p) => p.slug !== slug);
 		const updatedSummary: CommitSummary = {
@@ -1986,6 +2033,14 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
+		// Race-window re-check: amend can land while the QuickPick is open.
+		// `archivePlanForCommit` would otherwise bind the plan to an orphaned
+		// commit hash, and the subsequent `storeSummary` would write to the
+		// orphaned summary.
+		if (!(await this.ensureCommitNotRewritten("add plan"))) {
+			return;
+		}
+
 		const planRef = await this.bridge.archivePlanForCommit(
 			selected.slug,
 			summary.commitHash,
@@ -2024,6 +2079,13 @@ export class SummaryWebviewPanel {
 			title: "Select a Markdown file to add as a note",
 		});
 		if (!fileUri || fileUri.length === 0) {
+			return;
+		}
+
+		// Race-window re-check: amend can land while the file picker is open.
+		// `archiveNoteForCommit` would otherwise bind the note to an orphaned
+		// commit hash.
+		if (!(await this.ensureCommitNotRewritten("add markdown note"))) {
 			return;
 		}
 
@@ -2202,6 +2264,11 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
+		// Race-window re-check: amend can land while the confirm modal is open.
+		if (!(await this.ensureCommitNotRewritten("remove note"))) {
+			return;
+		}
+
 		const updatedNotes = summary.notes.filter((n) => n.id !== id);
 		const updatedSummary: CommitSummary = {
 			...summary,
@@ -2322,6 +2389,11 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
+		// Race-window re-check: amend can land while the confirm modal is open.
+		if (!(await this.ensureCommitNotRewritten("remove Linear issue"))) {
+			return;
+		}
+
 		const updatedLinearIssues = summary.linearIssues.filter(
 			(l) => l.archivedKey !== archivedKey,
 		);
@@ -2376,6 +2448,14 @@ export class SummaryWebviewPanel {
 			content,
 			config: translateConfig,
 		});
+
+		// Race-window re-check: amend can land during the LLM call (10–60s).
+		// `syncPlanTitle` would otherwise persist the new title to the stale
+		// commit's summary. `storePlans` is global content so we let it run
+		// regardless — losing the translated body would discard real user work.
+		if (!(await this.ensureCommitNotRewritten("translate plan"))) {
+			return;
+		}
 
 		// Save translated content and sync title to summary + registry
 		await this.bridge.storePlans(
@@ -2434,6 +2514,13 @@ export class SummaryWebviewPanel {
 			content,
 			config: translateConfig,
 		});
+
+		// Race-window re-check: amend can land during the LLM call (10–60s).
+		// The note body sync below would otherwise persist to the stale summary.
+		// `storeNotes` is global content so we let it run regardless.
+		if (!(await this.ensureCommitNotRewritten("translate note"))) {
+			return;
+		}
 
 		// Save translated content to orphan branch
 		await this.bridge.storeNotes(
