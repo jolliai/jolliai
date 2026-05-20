@@ -1653,6 +1653,22 @@ export class JolliMemoryBridge {
 	// `SummaryWebviewPanel` use these instead of importing the SummaryStore /
 	// PlanService / NoteService writers directly.
 
+	/**
+	 * Loads the orphan-branch index entry map via the Bridge's storage
+	 * instance. Threading storage matters in folder-mode (or any non-default
+	 * `storageMode`) because the default `resolveStorage()` falls back to a
+	 * fresh `OrphanBranchStorage` that would read the wrong file. Callers like
+	 * the SummaryWebviewPanel's stale-commit guard rely on the live index, so
+	 * routing through the Bridge keeps the read consistent with every
+	 * webview-driven write.
+	 */
+	async getSummaryIndexEntryMap(): Promise<
+		ReadonlyMap<string, import("../../cli/src/Types.js").SummaryIndexEntry>
+	> {
+		const storage = await this.getStorage();
+		return getIndexEntryMap(this.cwd, storage);
+	}
+
 	/** Writes a summary via the Bridge's DualWriteStorage instance. */
 	async storeSummary(
 		summary: CommitSummary,

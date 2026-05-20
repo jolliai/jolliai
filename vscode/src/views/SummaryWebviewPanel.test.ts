@@ -551,6 +551,11 @@ const stubBridge = {
 	archiveNoteForCommit: vi.fn((id: string, commitHash: string) =>
 		mockArchiveNoteForCommit(id, commitHash, workspaceRoot),
 	),
+	// Stale-commit guard reads the index via this bridge wrapper (storage
+	// threading — see JolliMemoryBridge.getSummaryIndexEntryMap docstring).
+	// Default to "empty index" so existing tests are unaffected; the
+	// stale-commit describe block overrides per test.
+	getSummaryIndexEntryMap: vi.fn().mockResolvedValue(new Map()),
 } as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 const mainBranch = "main";
 
@@ -7419,6 +7424,693 @@ describe("SummaryWebviewPanel", () => {
 				typeof c[0] === "string" ? c[0].includes("disabled") : false,
 			);
 			expect(denialCalls).toHaveLength(0);
+		});
+	});
+
+	// ── Stale-commit (rewritten-into) guard ──────────────────────────────────
+	// When a commit shown in the panel is rewritten by amend / squash / rebase,
+	// the panel for the OLD hash stays open and any subsequent write from it
+	// silently overwrites the orphaned commit's summary on the orphan branch.
+	// Most visibly, Push to Jolli writes `jolliDocId` / `jolliDocUrl` to the
+	// orphaned commit, leaving the live HEAD's summary without those fields.
+	// `ensureCommitNotRewritten` blocks every write handler when the panel's
+	// commitHash is no longer a root entry in the index — i.e. has a non-null
+	// `parentCommitHash`, the marker jollimemory writes when the original commit
+	// is folded into a new root by amend/squash/rebase.
+
+	describe("stale-commit guard", () => {
+		// Helper: build an index entry map representing the chain
+		// `commitHash` → `parentCommitHash` → ... → `rootHash`. Returns the map
+		// in the shape `getIndexEntryMap` resolves to.
+		function buildChainEntryMap(
+			chain: ReadonlyArray<{ hash: string; parent: string | null }>,
+		): Map<string, { commitHash: string; parentCommitHash: string | null }> {
+			const map = new Map<
+				string,
+				{ commitHash: string; parentCommitHash: string | null }
+			>();
+			for (const link of chain) {
+				map.set(link.hash, {
+					commitHash: link.hash,
+					parentCommitHash: link.parent,
+				});
+			}
+			return map;
+		}
+
+		async function setupCommit(
+			hash: string,
+		): Promise<(msg: Record<string, unknown>) => void> {
+			await SummaryWebviewPanel.show(
+				makeSummary({ commitHash: hash }),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			return captureMessageHandler();
+		}
+
+		it("allows push when the commit is still a root entry", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([{ hash: "abc123", parent: null }]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// Guard let it through; runJolliPush would be reached. Since no API
+			// key is configured by default, the user-facing warning is the
+			// "configure Jolli API Key" one — NOT our "rewritten into" message.
+			const rewriteWarnings = showWarningMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0].includes("rewritten into") : false,
+			);
+			expect(rewriteWarnings).toHaveLength(0);
+		});
+
+		it("allows push when the commit is absent from the index (legacy / external / pre-index)", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(new Map());
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			const rewriteWarnings = showWarningMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0].includes("rewritten into") : false,
+			);
+			expect(rewriteWarnings).toHaveLength(0);
+		});
+
+		it("blocks push when the commit was rewritten into a new root", async () => {
+			// abc123 → ROOT_NEW (one-step rewrite, e.g. single amend)
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// User-facing warning surfaces the live root's short hash.
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("rewritten into rootnew0"),
+			);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("abc123"),
+			);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("push to Jolli"),
+			);
+			// Side effect: panel disposed so the stale tab can't be reused.
+			expect(
+				firstCommitPanel<{ panel: { dispose: ReturnType<typeof vi.fn> } }>()
+					.panel.dispose,
+			).toHaveBeenCalled();
+			// And the storage write never happened.
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("walks a multi-hop parent chain to the final live root", async () => {
+			// abc123 → mid0001 → mid0002 → finalroot
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "mid0001" },
+					{ hash: "mid0001", parent: "mid0002" },
+					{ hash: "mid0002", parent: "finalrt" },
+					{ hash: "finalrt", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("rewritten into finalrt"),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("breaks out of a cyclic parent chain instead of looping forever", async () => {
+			// Defensive: index links form a DAG by construction, but a corrupted
+			// file shouldn't lock the UI in an infinite loop.
+			//   abc123 → cyclea → cycleb → cyclea (cycle back)
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "cyclea0" },
+					{ hash: "cyclea0", parent: "cycleb0" },
+					{ hash: "cycleb0", parent: "cyclea0" },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// We surface whichever hash the walk landed on before detecting the
+			// cycle — either cyclea0 or cycleb0, depending on iteration order;
+			// the important thing is that no crash and no storage write happens.
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/rewritten into (cyclea0|cycleb0)/),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks the same write across all guarded handlers (edit memory)", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({
+				command: "editTopic",
+				topicIndex: 0,
+				updates: { title: "new" },
+			});
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("edit memory"),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks generate E2E test guide with the correct operation label", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "generateE2eTest" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("generate E2E test guide"),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks edit E2E scenario when the commit was rewritten", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					e2eTestGuide: [
+						{
+							title: "Scenario 1",
+							preconditions: "",
+							steps: ["step"],
+							expectedResults: ["ok"],
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({
+				command: "editE2eScenario",
+				index: 0,
+				updates: { title: "x" },
+			});
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("edit E2E scenario"),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks delete E2E scenario BEFORE the confirm dialog", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					e2eTestGuide: [
+						{
+							title: "Scenario 1",
+							preconditions: "",
+							steps: ["step"],
+							expectedResults: ["ok"],
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "deleteE2eScenario", index: 0 });
+			await flushPromises();
+
+			// Stale warning surfaced, confirm dialog ("Delete scenario ...?") never shown.
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("delete E2E scenario"),
+			);
+			const confirmCalls = showWarningMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0].startsWith("Delete scenario") : false,
+			);
+			expect(confirmCalls).toHaveLength(0);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks delete E2E test guide BEFORE the confirm dialog", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "deleteE2eTest" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("delete E2E test guide"),
+			);
+			const confirmCalls = showWarningMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0] === "Delete E2E Test Guide?" : false,
+			);
+			expect(confirmCalls).toHaveLength(0);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks generate recap with the correct operation label", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "generateRecap" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("generate recap"),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks delete memory BEFORE the confirm dialog", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "deleteTopic", topicIndex: 0 });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("delete memory"),
+			);
+			// Confirm dialog ("Delete memory?" / "Delete this memory?") never shown.
+			const confirmCalls = showWarningMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0].startsWith("Delete") : false,
+			);
+			expect(confirmCalls).toHaveLength(0);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks edit E2E test guide (deprecated bulk edit path)", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "editE2eTest", scenarios: [] });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("edit E2E test guide"),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		// Plan / note / Linear-issue write entry points — same stale-commit bug
+		// class as the E2E/topic/recap handlers above. Each here drives a write
+		// to `bridge.storeSummary` with the stale `currentSummary.commitHash`,
+		// or an archive call (archivePlanForCommit / archiveNoteForCommit) that
+		// binds new content to the orphaned commit.
+
+		it("blocks remove plan BEFORE confirm + storeSummary", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					plans: [{ slug: "p", title: "P" }],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "removePlan", slug: "p", title: "P" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("remove plan"),
+			);
+			const confirmCalls = showWarningMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0].startsWith("Remove plan") : false,
+			);
+			expect(confirmCalls).toHaveLength(0);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks remove note BEFORE confirm + storeSummary", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					notes: [{ id: "n", title: "N", format: "snippet" }],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "removeNote", id: "n", title: "N" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("remove note"),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks remove Linear issue BEFORE confirm + storeSummary", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					linearIssues: [
+						{
+							archivedKey: "JOLLI-1-abc",
+							ticketId: "JOLLI-1",
+							title: "T",
+							url: "https://linear.app/x",
+							capturedAt: "2026-01-01T00:00:00Z",
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({
+				command: "removeLinearIssue",
+				archivedKey: "JOLLI-1-abc",
+				ticketId: "JOLLI-1",
+			});
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("remove Linear issue"),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks add plan BEFORE the QuickPick + archivePlanForCommit", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			mockListAvailablePlans.mockReturnValue([
+				{ slug: "available-plan", title: "Available Plan" },
+			]);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "addPlan" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("add plan"),
+			);
+			expect(showQuickPick).not.toHaveBeenCalled();
+			expect(mockArchivePlanForCommit).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks add markdown note BEFORE the file picker", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "addMarkdownNote" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("add markdown note"),
+			);
+			expect(showOpenDialog).not.toHaveBeenCalled();
+			expect(mockArchiveNoteForCommit).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks save snippet (no saveNote / archive / storeSummary)", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({
+				command: "saveSnippet",
+				title: "T",
+				content: "some content",
+			});
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("save snippet"),
+			);
+			expect(mockSaveNote).not.toHaveBeenCalled();
+			expect(mockArchiveNoteForCommit).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks save plan BEFORE storePlans (no plan content write)", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({
+				command: "savePlan",
+				slug: "p",
+				content: "# Title\n\nbody",
+			});
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("save plan"),
+			);
+			expect(mockStorePlans).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks save note BEFORE storeNotes", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({
+				command: "saveNote",
+				id: "n",
+				content: "# Title\n\nbody",
+				format: "markdown",
+			});
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("save note"),
+			);
+			expect(mockStoreNotes).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks translate plan BEFORE readPlanFromBranch", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "translatePlan", slug: "p" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("translate plan"),
+			);
+			expect(mockReadPlanFromBranch).not.toHaveBeenCalled();
+			expect(mockStorePlans).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks translate note when the commit was rewritten", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					notes: [{ id: "n", title: "N", format: "snippet", content: "中文" }],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "translateNote", id: "n" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("translate note"),
+			);
+			expect(mockStoreNotes).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("reads the index via the bridge (storage-threaded), not via direct SummaryStore", async () => {
+			// Storage-threading regression guard: ensureCommitNotRewritten must
+			// route through bridge.getSummaryIndexEntryMap so folder-mode users
+			// get the correct backend. A direct `getIndexEntryMap(cwd)` call
+			// would silently fall back to OrphanBranchStorage and read the wrong
+			// file under non-default storage modes.
+			const spy = stubBridge.getSummaryIndexEntryMap as ReturnType<
+				typeof vi.fn
+			>;
+			spy.mockResolvedValue(new Map());
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			expect(spy).toHaveBeenCalled();
 		});
 	});
 

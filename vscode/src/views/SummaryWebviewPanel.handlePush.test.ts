@@ -458,6 +458,9 @@ const stubBridge = {
 						artifacts,
 					) as Promise<void>),
 	),
+	// Stale-commit guard reads the index via this bridge wrapper. Default to
+	// "empty index" so push tests stay on the happy path.
+	getSummaryIndexEntryMap: vi.fn().mockResolvedValue(new Map()),
 } as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 
 // ── Tests ────────────────────────────────────────────────────────────────────
