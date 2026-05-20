@@ -36,7 +36,8 @@
 					"level": "error",
 					"options": {
 						"paths": {
-							"node:child_process": "Use src/util/Subprocess.ts wrappers (execFileSyncHidden, execFileAsyncHidden, spawnHidden, spawnSyncHidden, execSyncHidden) instead — they inject windowsHide:true so child processes do not flash a console window on Windows. Subprocess.ts itself and *.test.ts files are exempt via overrides."
+							"node:child_process": "Use src/util/Subprocess.ts wrappers (execFileSyncHidden, execFileAsyncHidden, spawnHidden, spawnSyncHidden) instead — they inject windowsHide:true so child processes do not flash a console window on Windows. Subprocess.ts itself and *.test.ts files are exempt via overrides.",
+							"child_process": "Use src/util/Subprocess.ts wrappers (execFileSyncHidden, execFileAsyncHidden, spawnHidden, spawnSyncHidden) instead — they inject windowsHide:true so child processes do not flash a console window on Windows. Subprocess.ts itself and *.test.ts files are exempt via overrides."
 						}
 					}
 				}

@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockExecFileSync = vi.fn().mockReturnValue(Buffer.from("ok"));
-const mockExecSync = vi.fn().mockReturnValue(Buffer.from("ok"));
 const mockSpawn = vi.fn().mockReturnValue({ pid: 1, unref: vi.fn() });
 const mockSpawnSync = vi
 	.fn()
@@ -21,7 +20,6 @@ const mockExecFile = vi
 
 vi.mock("node:child_process", () => ({
 	execFileSync: mockExecFileSync,
-	execSync: mockExecSync,
 	spawn: mockSpawn,
 	spawnSync: mockSpawnSync,
 	execFile: mockExecFile,
@@ -30,7 +28,6 @@ vi.mock("node:child_process", () => ({
 describe("Subprocess", () => {
 	beforeEach(() => {
 		mockExecFileSync.mockClear();
-		mockExecSync.mockClear();
 		mockSpawn.mockClear();
 		mockSpawnSync.mockClear();
 		mockExecFile.mockClear();
@@ -75,29 +72,6 @@ describe("Subprocess", () => {
 				undefined,
 				expect.objectContaining({ windowsHide: true }),
 			);
-		});
-	});
-
-	describe("execSyncHidden", () => {
-		it("injects windowsHide:true when no options given", async () => {
-			const { execSyncHidden } = await import("./Subprocess.js");
-			execSyncHidden("git status");
-			expect(mockExecSync).toHaveBeenCalledWith("git status", expect.objectContaining({ windowsHide: true }));
-		});
-
-		it("preserves user options and adds windowsHide:true", async () => {
-			const { execSyncHidden } = await import("./Subprocess.js");
-			execSyncHidden("git status", { cwd: "/tmp", encoding: "utf-8" });
-			expect(mockExecSync).toHaveBeenCalledWith(
-				"git status",
-				expect.objectContaining({ cwd: "/tmp", encoding: "utf-8", windowsHide: true }),
-			);
-		});
-
-		it("lets caller override windowsHide:false explicitly", async () => {
-			const { execSyncHidden } = await import("./Subprocess.js");
-			execSyncHidden("git status", { windowsHide: false });
-			expect(mockExecSync).toHaveBeenCalledWith("git status", expect.objectContaining({ windowsHide: false }));
 		});
 	});
 
