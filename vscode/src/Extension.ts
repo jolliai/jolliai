@@ -9,6 +9,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import * as vscode from "vscode";
 import {
+	conversationKey,
+	setExcluded,
+} from "../../cli/src/core/CommitSelectionStore.js";
+import {
 	extractRepoName,
 	getRemoteUrl,
 	resolveKbParent,
@@ -36,6 +40,10 @@ import type { StatusInfo } from "../../cli/src/Types.js";
 import { execFileSyncHidden } from "../../cli/src/util/Subprocess.js";
 import { CommitCommand } from "./commands/CommitCommand.js";
 import { PushCommand } from "./commands/PushCommand.js";
+import {
+	selectAllConversationsCommand,
+	selectAllPlansAndNotesCommand,
+} from "./commands/SelectAllSelection.js";
 import { SquashCommand } from "./commands/SquashCommand.js";
 import { getNotesDir } from "./core/NoteService.js";
 import {
@@ -224,6 +232,8 @@ const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
 	"jollimemory.pushBranch",
 	"jollimemory.selectAllFiles",
 	"jollimemory.selectAllCommits",
+	"jollimemory.selectAllConversations",
+	"jollimemory.selectAllPlansAndNotes",
 	"jollimemory.searchMemories",
 	"jollimemory.clearMemoryFilter",
 	"jollimemory.loadMoreMemories",
@@ -513,7 +523,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	// ── Tree providers (thin subscribers over stores) ────────────────────────
 	const statusProvider = new StatusTreeProvider(statusStore);
 	const memoriesProvider = new MemoriesTreeProvider(memoriesStore);
-	const plansProvider = new PlansTreeProvider(plansStore);
+	const plansProvider = new PlansTreeProvider(plansStore, workspaceRoot);
 	const filesProvider = new FilesTreeProvider(filesStore);
 	const historyProvider = new HistoryTreeProvider(commitsStore);
 
@@ -646,7 +656,14 @@ export function activate(context: vscode.ExtensionContext): void {
 		resolveInitialStateReady = resolve;
 	});
 
-	const sidebarProvider = new SidebarWebviewProvider({
+	// Hoisted so selectAllConversationsCommand can reference it directly
+	// in the command registration below without going through sidebarProvider.
+	const activeSessionsProvider = new ActiveSessionsProvider({
+		getWorkspaceCwd: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+	});
+
+	let sidebarProvider: SidebarWebviewProvider;
+	sidebarProvider = new SidebarWebviewProvider({
 		executeCommand: (cmd, ...args) =>
 			vscode.commands.executeCommand(cmd, ...args),
 		getInitialState: () => ({
@@ -744,12 +761,26 @@ export function activate(context: vscode.ExtensionContext): void {
 			filesStore.applyCheckboxBatch([[filePath, selected]]),
 		applyCommitCheckbox: (hash, selected) =>
 			commitsStore.onCheckboxToggle(hash, selected),
-		// Active Conversations source for the Branch tab. Reads workspaceCwd
-		// lazily so a future workspace-folder change doesn't strand the
-		// provider on a stale path.
-		activeSessionsProvider: new ActiveSessionsProvider({
-			getWorkspaceCwd: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
-		}),
+		applyConversationCheckbox: async (source, sessionId, selected) => {
+			await setExcluded(
+				workspaceRoot,
+				"conversations",
+				conversationKey(source, sessionId),
+				!selected,
+			);
+			await sidebarProvider.refreshConversationsPanel();
+		},
+		applyPlanCheckbox: async (planId, selected) => {
+			await setExcluded(workspaceRoot, "plans", planId, !selected);
+			await plansProvider.refreshExclusions();
+		},
+		applyNoteCheckbox: async (noteId, selected) => {
+			await setExcluded(workspaceRoot, "notes", noteId, !selected);
+			await plansProvider.refreshExclusions();
+		},
+		// Active Conversations source for the Branch tab (hoisted above so
+		// selectAllConversationsCommand can reference it directly).
+		activeSessionsProvider: activeSessionsProvider,
 		initialStateReady,
 	});
 	sidebarProviderRef = sidebarProvider;
@@ -1103,6 +1134,14 @@ export function activate(context: vscode.ExtensionContext): void {
 		}
 		// Refresh PLANS panel so commit hash prefix appears after Worker associates plans.
 		plansStore.refresh().catch(handleError("lockWatcher.onDidDelete.plans"));
+		// Refresh CONVERSATIONS panel too — the worker advanced cursors for the
+		// included sessions, so those rows should drop out immediately rather
+		// than waiting up to 60s for the background poll. Excluded rows stay
+		// because their cursors weren't touched (see QueueWorker
+		// loadSessionTranscripts pre-read exclusion filter).
+		sidebarProvider
+			.refreshConversationsPanel()
+			.catch(handleError("lockWatcher.onDidDelete.conversations"));
 	});
 	context.subscriptions.push(lockWatcher);
 	// Check initial state — lock file might already exist on activation
@@ -1427,6 +1466,24 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand("jollimemory.selectAllFiles", () => {
 			filesStore.toggleSelectAll();
 		}),
+
+		vscode.commands.registerCommand("jollimemory.selectAllConversations", () =>
+			selectAllConversationsCommand({
+				cwd: workspaceRoot,
+				activeSessions: activeSessionsProvider,
+				plansProvider,
+				onChanged: () => sidebarProvider.refreshConversationsPanel(),
+			}),
+		),
+
+		vscode.commands.registerCommand("jollimemory.selectAllPlansAndNotes", () =>
+			selectAllPlansAndNotesCommand({
+				cwd: workspaceRoot,
+				activeSessions: activeSessionsProvider,
+				plansProvider,
+				onChanged: () => sidebarProvider.refreshPlansPanel(),
+			}),
+		),
 
 		vscode.commands.registerCommand("jollimemory.commitAI", () => {
 			log.info("cmd", "commitAI invoked");

@@ -371,6 +371,10 @@ export function buildSidebarCss(): string {
   .collapsible-section .section-header {
     display: flex;
     align-items: center;
+    /* Mirror .tree-node's gap:4px so the section title starts at the same
+       x-coordinate as the row's row-leading slot — i.e. the section title
+       text left edge column-aligns with the row's checkbox / leading icon. */
+    gap: 4px;
     background: var(--vscode-sideBarSectionHeader-background, transparent);
     color: var(--vscode-sideBarSectionHeader-foreground, var(--vscode-foreground));
     padding: 4px 8px;
@@ -396,7 +400,10 @@ export function buildSidebarCss(): string {
   .collapsible-section .section-actions {
     display: inline-flex;
     gap: 2px;
-    margin-left: 8px;
+    /* 4px here + 4px from the section-header flex gap above = 8px of breathing
+       room to the right of the section title (the value before the header gap
+       existed). Keep these two numbers in lockstep if either changes. */
+    margin-left: 4px;
     visibility: hidden;
   }
   .collapsible-section .section-header:hover .section-actions { visibility: visible; }
@@ -623,11 +630,18 @@ export function buildSidebarCss(): string {
   .tree-node.tree-node--changes .gs-letter { margin-left: 0; }
 
   /* CONVERSATIONS section rows: one active AI session per row. Inherits the
-     base .tree-node flex layout; the extra rules below set the per-row gap
-     and add a small badge + meta column for source / message count / time.
-     .label keeps the existing .tree-node .label ellipsis behavior. */
-  .tree-node.conversation-row {
-    gap: 8px;
+     base .tree-node flex layout (gap: 4px) so the leading checkbox / icon
+     column-aligns with plan, note, and change rows in the sibling sections.
+     The wider 8px breathing room around the trailing metadata chips
+     (badge / count / time) is restored via per-chip margin-left below —
+     overriding the row-level gap would also widen twirl → row-leading and
+     break section column alignment. */
+  .tree-node.conversation-row .badge,
+  .tree-node.conversation-row .count,
+  .tree-node.conversation-row .time {
+    /* 4px here + 4px from the base .tree-node flex gap = 8px total spacing
+       to the left neighbor. Keep these two numbers paired if either moves. */
+    margin-left: 4px;
   }
   /* Source badge — outline pill. Default to descriptionForeground for unknown
      sources; per-source rules below override fg/bg/border with the brand hue.
@@ -852,7 +866,11 @@ export function buildSidebarCss(): string {
     width: 18px;
     display: inline-flex;
     align-items: center;
-    justify-content: center;
+    /* Left-align so the checkbox / leading icon's left edge column-aligns with
+       the .section-header's title text (both sit at padding 8 + twirl 12 +
+       gap 4 = 24px from the row's left edge). Centering instead would push
+       the checkbox right by ~2.5px and break the alignment with the header. */
+    justify-content: flex-start;
     flex-shrink: 0;
   }
   .row-leading input[type="checkbox"] {

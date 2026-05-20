@@ -14,6 +14,7 @@
 
 import { createLogger, errMsg } from "../Logger.js";
 import type { SessionInfo, TranscriptEntry, TranscriptSource } from "../Types.js";
+import { conversationKey, readExclusions } from "./CommitSelectionStore.js";
 import { isStillHidden, loadHiddenConversations } from "./HiddenConversationsStore.js";
 import { resolveSessionTitle } from "./SessionTitleResolver.js";
 import { loadMergedTranscript, loadUnreadMergedTranscript } from "./TranscriptMessageCounter.js";
@@ -27,6 +28,14 @@ export interface ActiveConversationItem {
 	readonly messageCount: number;
 	readonly updatedAt: string;
 	readonly transcriptPath: string;
+	/**
+	 * Per-commit-selection signal. `false` = user has unchecked this row;
+	 * the QueueWorker will skip its transcript when generating the next
+	 * summary. Default `true` for any row absent from
+	 * `commit-selection.json`. Independent of `HiddenConversationsStore`
+	 * (which hides the row entirely).
+	 */
+	readonly isSelected: boolean;
 }
 
 export interface ListActiveOptions {
@@ -58,7 +67,11 @@ export async function listActiveConversationsWithDiagnostics(
 	const windowMs = opts.windowMs ?? DEFAULT_WINDOW_MS;
 	const cutoff = Date.now() - windowMs;
 
-	const [collected, hidden] = await Promise.all([collectFromAllSources(opts.cwd), loadHiddenConversations(opts.cwd)]);
+	const [collected, hidden, exclusions] = await Promise.all([
+		collectFromAllSources(opts.cwd),
+		loadHiddenConversations(opts.cwd),
+		readExclusions(opts.cwd),
+	]);
 	const fresh = collected.sessions.filter((s) => Date.parse(s.updatedAt) >= cutoff);
 
 	// Dedupe by (source, sessionId), keeping the most-recently-updated entry.
@@ -102,13 +115,15 @@ export async function listActiveConversationsWithDiagnostics(
 			// still visible. For sources that already carry a title, the extra
 			// read is harmless and skipped by resolveSessionTitle immediately.
 			const titleEntries = unread.length > 0 ? await safeLoadMerged(s, opts.cwd) : unread;
+			const source = s.source ?? "claude";
 			return {
 				sessionId: s.sessionId,
-				source: s.source ?? "claude",
+				source,
 				title: await resolveSessionTitle(s, titleEntries),
 				messageCount: unread.length,
 				updatedAt: s.updatedAt,
 				transcriptPath: s.transcriptPath,
+				isSelected: !exclusions.conversations.has(conversationKey(source, s.sessionId)),
 			};
 		}),
 	);

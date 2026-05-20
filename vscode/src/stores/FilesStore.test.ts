@@ -181,19 +181,23 @@ describe("FilesStore — mutations", () => {
 		]);
 	});
 
-	it("toggleSelectAll selects all then deselects all with selectAll reason", async () => {
+	it("toggleSelectAll deselects all (default-selected) then re-selects all with selectAll reason", async () => {
 		const bridge = makeBridge([makeFile("a.ts"), makeFile("b.ts")]);
 		const store = new FilesStore(bridge as never, "/repo", makeFilter());
 		await store.refresh();
+		// After refresh all files are default-selected.
+		expect(store.getSnapshot().selectedFiles).toHaveLength(2);
 
+		// First toggle: all selected → deselects all.
 		store.toggleSelectAll();
 		let snap = store.getSnapshot();
 		expect(snap.changeReason).toBe("selectAll");
-		expect(snap.selectedFiles).toHaveLength(2);
+		expect(snap.selectedFiles).toHaveLength(0);
 
+		// Second toggle: none selected → selects all.
 		store.toggleSelectAll();
 		snap = store.getSnapshot();
-		expect(snap.selectedFiles).toHaveLength(0);
+		expect(snap.selectedFiles).toHaveLength(2);
 	});
 
 	it("applyExcludeFilterChange recomputes visibility without re-querying bridge", async () => {
@@ -306,9 +310,9 @@ describe("FilesStore — mutations", () => {
 		const bridge = makeBridge([makeFile("a.ts"), makeFile("ignore.log")]);
 		const store = new FilesStore(bridge as never, "/repo", filter);
 		await store.refresh();
-		store.applyCheckboxBatch([["a.ts", true]]);
+		// Both files are default-selected after refresh.
 		expect(store.getSnapshot().visibleCount).toBeGreaterThan(0);
-		expect(store.getSnapshot().selectedFiles.length).toBe(1);
+		expect(store.getSnapshot().selectedFiles.length).toBe(2);
 
 		store.setEnabled(false);
 
@@ -327,7 +331,8 @@ describe("FilesStore — misc coverage", () => {
 		const bridge = makeBridge([makeFile("a.ts"), makeFile("b.ts")]);
 		const store = new FilesStore(bridge as never, "/repo", makeFilter());
 		await store.refresh();
-		store.applyCheckboxBatch([["a.ts", true]]);
+		// Both files are default-selected; uncheck b.ts so only a.ts remains.
+		store.applyCheckboxBatch([["b.ts", false]]);
 		expect([...store.getSelectedPaths()]).toEqual(["a.ts"]);
 	});
 
@@ -416,6 +421,84 @@ describe("FilesStore — concurrency", () => {
 		const bridge = makeBridge([makeFile("a.ts", true)]);
 		const store = new FilesStore(bridge as never, "/repo", makeFilter());
 		await store.refresh();
+		expect(
+			store.getSnapshot().selectedFiles.map((f) => f.relativePath),
+		).toEqual(["a.ts"]);
+	});
+});
+
+describe("FilesStore — default-select behaviour", () => {
+	it("seeds selectedPaths with every raw file on first refresh", async () => {
+		const bridge = makeBridge([
+			makeFile("a.ts"),
+			makeFile("b.ts"),
+			makeFile("c.ts"),
+		]);
+		const store = new FilesStore(bridge as never, "/repo", makeFilter());
+		await store.refresh();
+		const visible = store.getSnapshot().visibleFiles;
+		expect(visible.map((f) => f.relativePath).sort()).toEqual([
+			"a.ts",
+			"b.ts",
+			"c.ts",
+		]);
+		for (const f of visible) {
+			expect(f.isSelected).toBe(true);
+		}
+	});
+
+	it("preserves an explicit user uncheck across a same-raw refresh", async () => {
+		const bridge = makeBridge([makeFile("a.ts"), makeFile("b.ts")]);
+		const store = new FilesStore(bridge as never, "/repo", makeFilter());
+		await store.refresh();
+		store.applyCheckboxBatch([["a.ts", false]]);
+		await store.refresh();
+		const visible = store.getSnapshot().visibleFiles;
+		expect(visible.find((f) => f.relativePath === "a.ts")?.isSelected).toBe(
+			false,
+		);
+		expect(visible.find((f) => f.relativePath === "b.ts")?.isSelected).toBe(
+			true,
+		);
+	});
+
+	it("re-checks a path that was previously unchecked, surviving refresh as selected", async () => {
+		const bridge = makeBridge([makeFile("a.ts")]);
+		const store = new FilesStore(bridge as never, "/repo", makeFilter());
+		await store.refresh();
+		store.applyCheckboxBatch([["a.ts", false]]); // user unchecks
+		store.applyCheckboxBatch([["a.ts", true]]); // user re-checks
+		await store.refresh();
+		const visible = store.getSnapshot().visibleFiles;
+		expect(visible.find((f) => f.relativePath === "a.ts")?.isSelected).toBe(
+			true,
+		);
+	});
+
+	it("toggleSelectAll deselect populates unselectedPaths so refresh keeps files deselected", async () => {
+		const bridge = makeBridge([makeFile("a.ts"), makeFile("b.ts")]);
+		const store = new FilesStore(bridge as never, "/repo", makeFilter());
+		await store.refresh();
+		// All selected by default; deselect all via toggleSelectAll.
+		store.toggleSelectAll();
+		expect(store.getSnapshot().selectedFiles).toHaveLength(0);
+		// Refresh must not re-select them.
+		await store.refresh();
+		expect(store.getSnapshot().selectedFiles).toHaveLength(0);
+	});
+
+	it("prunes vanished paths from unselectedPaths so they don't affect future refreshes", async () => {
+		const bridge = {
+			listFiles: vi
+				.fn()
+				.mockResolvedValueOnce([makeFile("a.ts"), makeFile("b.ts")])
+				.mockResolvedValueOnce([makeFile("a.ts")]),
+		};
+		const store = new FilesStore(bridge as never, "/repo", makeFilter());
+		await store.refresh();
+		store.applyCheckboxBatch([["b.ts", false]]); // uncheck b.ts
+		await store.refresh(); // b.ts vanishes from status
+		// a.ts must still be selected (default).
 		expect(
 			store.getSnapshot().selectedFiles.map((f) => f.relativePath),
 		).toEqual(["a.ts"]);

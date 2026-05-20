@@ -167,7 +167,7 @@ export async function scanCopilotChatSessions(projectDir: string): Promise<Copil
 		log.debug("Both scans errored; reporting Scan A's, dropped Scan B's: %s", b.error.message);
 	}
 	if (sessions.length > 0) {
-		log.info("Discovered %d Copilot Chat session(s) for %s", sessions.length, projectDir);
+		log.debug("Discovered %d Copilot Chat session(s) for %s", sessions.length, projectDir);
 	}
 	return { sessions, error };
 }

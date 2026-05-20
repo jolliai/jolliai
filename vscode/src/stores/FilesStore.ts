@@ -68,6 +68,7 @@ export class FilesStore extends BaseStore<FilesChangeReason, FilesSnapshot> {
 	/** Latest bridge output, before selection overlay / sort / exclude. */
 	private rawFiles: ReadonlyArray<FileStatus> = [];
 	private readonly selectedPaths = new Set<string>();
+	private unselectedPaths?: Set<string>;
 	private fileOrder = new Map<string, number>();
 	private enabled = true;
 	private migrating = false;
@@ -139,15 +140,21 @@ export class FilesStore extends BaseStore<FilesChangeReason, FilesSnapshot> {
 				this.selectedPaths.delete(p);
 			}
 		}
+		// Mirror prune on the negative-memory set so dead unchecks don't accumulate.
+		if (this.unselectedPaths) {
+			for (const p of [...this.unselectedPaths]) {
+				if (!currentPaths.has(p)) {
+					this.unselectedPaths.delete(p);
+				}
+			}
+		}
 
-		// Seed selection from any `isSelected: true` entries returned by the
-		// bridge.  In production the bridge always returns `isSelected: false`
-		// because selection is host-side UI state, but callers (and tests) may
-		// pre-populate the flag to bootstrap a "this file is selected" fixture.
-		// Migrating those into `selectedPaths` keeps the legacy semantics and
-		// keeps selection state centralized in the store.
+		// Default-select: every freshly-seen path enters `selectedPaths` unless
+		// the user has explicitly unchecked it (held in `unselectedPaths`). This
+		// matches the per-row default semantics added in commit-selection design
+		// for the conversations / plans / notes panels.
 		for (const f of raw) {
-			if (f.isSelected) {
+			if (!this.unselectedPaths?.has(f.relativePath)) {
 				this.selectedPaths.add(f.relativePath);
 			}
 		}
@@ -170,8 +177,11 @@ export class FilesStore extends BaseStore<FilesChangeReason, FilesSnapshot> {
 		for (const [path, checked] of items) {
 			if (checked) {
 				this.selectedPaths.add(path);
+				this.unselectedPaths?.delete(path);
 			} else {
 				this.selectedPaths.delete(path);
+				this.unselectedPaths ??= new Set<string>();
+				this.unselectedPaths.add(path);
 			}
 		}
 		this.rebuildSnapshot({ reorder: false, reason: "userCheckbox" });
@@ -186,8 +196,11 @@ export class FilesStore extends BaseStore<FilesChangeReason, FilesSnapshot> {
 		for (const f of visible) {
 			if (target) {
 				this.selectedPaths.add(f.relativePath);
+				this.unselectedPaths?.delete(f.relativePath);
 			} else {
 				this.selectedPaths.delete(f.relativePath);
+				this.unselectedPaths ??= new Set<string>();
+				this.unselectedPaths.add(f.relativePath);
 			}
 		}
 		this.rebuildSnapshot({ reorder: false, reason: "selectAll" });
@@ -202,18 +215,27 @@ export class FilesStore extends BaseStore<FilesChangeReason, FilesSnapshot> {
 		for (const f of this.rawFiles) {
 			if (this.excludeFilter.isExcluded(f.relativePath)) {
 				this.selectedPaths.delete(f.relativePath);
+				this.unselectedPaths?.delete(f.relativePath);
 			}
 		}
 		this.rebuildSnapshot({ reorder: false, reason: "excludeFilter" });
 	}
 
-	/** Programmatic deselect of specific paths (e.g. after discard). */
+	/**
+	 * Programmatic deselect of specific paths (e.g. after discard).
+	 *
+	 * Also records each path in `unselectedPaths` so the next `refresh()` does
+	 * not silently re-seed them via the default-select loop. The negative
+	 * memory is what makes "user-driven uncheck" survive across refreshes.
+	 */
 	deselectPaths(paths: ReadonlyArray<string>): void {
 		let changed = false;
 		for (const p of paths) {
 			if (this.selectedPaths.delete(p)) {
 				changed = true;
 			}
+			this.unselectedPaths ??= new Set<string>();
+			this.unselectedPaths.add(p);
 		}
 		if (!changed) {
 			return;
@@ -242,6 +264,7 @@ export class FilesStore extends BaseStore<FilesChangeReason, FilesSnapshot> {
 		if (!e) {
 			this.rawFiles = [];
 			this.selectedPaths.clear();
+			this.unselectedPaths = undefined;
 			this.fileOrder.clear();
 		}
 		this.rebuildSnapshot({ reorder: false, reason: "enabled" });

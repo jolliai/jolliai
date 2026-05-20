@@ -5,6 +5,7 @@
 ## 0.99.2
 
 - **Active AI Conversations panel** — a new **CONVERSATIONS** section in the Branch tab lists your recent AI coding sessions across every supported tool, with the title, agent, and message count at a glance. Click a row to open the full transcript and edit or delete messages — the next commit's memory is generated from your curated version, not the raw conversation.
+- **Per-item commit selection** — uncheck any conversation, plan, note, or file in the Branch tab to keep it out of the next commit's memory. Your choice sticks across commits and restarts until you put it back, and each section has a `Select / Deselect All` shortcut at the top.
 
 ## 0.99.1
 

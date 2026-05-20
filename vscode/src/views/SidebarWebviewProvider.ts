@@ -9,6 +9,7 @@
 
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
+import type { TranscriptSource } from "../../../cli/src/Types.js";
 import { isTranscriptSource } from "../../../cli/src/Types.js";
 import type { ActiveSessionsProvider } from "../services/ActiveSessionsProvider.js";
 import { log } from "../util/Logger.js";
@@ -123,6 +124,22 @@ export interface SidebarWebviewDeps {
 	applyFileCheckbox?: (filePath: string, selected: boolean) => void;
 	/** Toggle a single commit's selection state in CommitsStore. */
 	applyCommitCheckbox?: (hash: string, selected: boolean) => void;
+	/** Toggle a single conversation's selection state in ConversationsStore. */
+	applyConversationCheckbox?: (
+		source: TranscriptSource,
+		sessionId: string,
+		selected: boolean,
+	) => void | Promise<void>;
+	/** Toggle a single plan's selection state in PlansStore. */
+	applyPlanCheckbox?: (
+		planId: string,
+		selected: boolean,
+	) => void | Promise<void>;
+	/** Toggle a single note's selection state in NotesStore. */
+	applyNoteCheckbox?: (
+		noteId: string,
+		selected: boolean,
+	) => void | Promise<void>;
 	/**
 	 * Resolves once the host has finished its first-pass initial load — in
 	 * particular once `statusStore.refresh()` has run so `getInitialState()`
@@ -530,6 +547,27 @@ export class SidebarWebviewProvider
 			case "branch:toggleCommitSelection":
 				this.deps.applyCommitCheckbox?.(msg.hash, msg.selected);
 				return;
+			case "branch:toggleConversationSelection":
+				if (!isTranscriptSource(msg.source)) {
+					log.warn(
+						"SidebarWebviewProvider",
+						"Rejected branch:toggleConversationSelection with unknown source",
+						{ source: String(msg.source) },
+					);
+					return;
+				}
+				void this.deps.applyConversationCheckbox?.(
+					msg.source,
+					msg.sessionId,
+					msg.selected,
+				);
+				return;
+			case "branch:togglePlanSelection":
+				void this.deps.applyPlanCheckbox?.(msg.planId, msg.selected);
+				return;
+			case "branch:toggleNoteSelection":
+				void this.deps.applyNoteCheckbox?.(msg.noteId, msg.selected);
+				return;
 			case "refresh":
 				this.handleRefresh(msg.scope);
 				return;
@@ -869,6 +907,14 @@ export class SidebarWebviewProvider
 		} else {
 			void this.deps.executeCommand("vscode.open", vscode.Uri.file(abs));
 		}
+	}
+
+	public async refreshConversationsPanel(): Promise<void> {
+		await this.pushConversations();
+	}
+
+	public async refreshPlansPanel(): Promise<void> {
+		this.pushPlans();
 	}
 
 	dispose(): void {

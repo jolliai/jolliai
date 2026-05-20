@@ -20,6 +20,8 @@ const WINDOW_MS = 2 * 24 * 60 * 60 * 1000; // 48h, per spec §3
  * tests and a single seam to swap implementations.
  */
 export class ActiveSessionsProvider {
+	private lastAggregatorFailure: string | undefined;
+
 	constructor(private readonly deps: ActiveSessionsDeps) {}
 
 	async list(): Promise<readonly ActiveConversationItem[]> {
@@ -39,10 +41,12 @@ export class ActiveSessionsProvider {
 		const cwd = this.deps.getWorkspaceCwd();
 		if (!cwd) return { items: [], failedSources: [] };
 		try {
-			return await listActiveConversationsWithDiagnostics({
+			const result = await listActiveConversationsWithDiagnostics({
 				cwd,
 				windowMs: WINDOW_MS,
 			});
+			this.lastAggregatorFailure = undefined;
+			return result;
 		} catch (err) {
 			// Aggregator itself threw (not just one source) — every source is
 			// effectively unavailable. Reporting `failedSources: []` would
@@ -50,11 +54,15 @@ export class ActiveSessionsProvider {
 			// from a healthy-but-empty list and suppresses the partial-data
 			// banner. Flag the full TRANSCRIPT_SOURCES set instead so the
 			// user sees the broken state surfaced in the UI.
-			log.warn(
-				"ActiveSessionsProvider",
-				"listActiveConversations threw",
-				errMsg(err),
-			);
+			const message = errMsg(err);
+			if (this.lastAggregatorFailure !== message) {
+				log.warn(
+					"ActiveSessionsProvider",
+					"listActiveConversations threw",
+					message,
+				);
+				this.lastAggregatorFailure = message;
+			}
 			return { items: [], failedSources: [...TRANSCRIPT_SOURCES] };
 		}
 	}

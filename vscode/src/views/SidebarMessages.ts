@@ -478,6 +478,22 @@ export type SidebarOutboundMsg =
 			readonly selected: boolean;
 	  }
 	| {
+			readonly type: "branch:toggleConversationSelection";
+			readonly source: TranscriptSource;
+			readonly sessionId: string;
+			readonly selected: boolean;
+	  }
+	| {
+			readonly type: "branch:togglePlanSelection";
+			readonly planId: string;
+			readonly selected: boolean;
+	  }
+	| {
+			readonly type: "branch:toggleNoteSelection";
+			readonly noteId: string;
+			readonly selected: boolean;
+	  }
+	| {
 			readonly type: "section:toggle";
 			readonly section: string;
 			readonly open: boolean;

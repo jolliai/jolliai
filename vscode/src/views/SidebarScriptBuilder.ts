@@ -2356,8 +2356,14 @@ export function buildSidebarScript(): string {
     // Codicons mirror the legacy native TreeView action icons declared in
     // package.json contributes.commands — keeping a single source of truth so
     // webview UI matches command palette / keybindings.
+    if (sectionId === 'conversations') {
+      return [
+        iconButton('conversations-select-all', 'Select/Deselect All Conversations', 'check-all'),
+      ];
+    }
     if (sectionId === 'plans') {
       return [
+        iconButton('plans-select-all', 'Select/Deselect All Plans & Notes', 'check-all'),
         iconButton('plans-add-menu', 'Add Plan / Note / Snippet', 'add'),
       ];
     }
@@ -2434,13 +2440,40 @@ export function buildSidebarScript(): string {
     const iconEl = el('i', {
       className: 'codicon codicon-' + iconKey + (colorClass ? ' ' + colorClass : ''),
     });
-    // Plans rows omit the .row-leading checkbox slot — that 18px column
-    // only carries weight in the Changes section (where it holds a real
-    // checkbox). Keeping it on plans rows just to vertically align with
-    // changes was over-alignment: the two sections are visually
-    // independent, so the empty slot read as "something missing".
+    // Selection checkbox — only for plan and note rows; Linear-issue rows
+    // are not user-selectable (no exclusion key applies) and get no checkbox.
+    // 'data-checkbox="1"' opts into the delegated click guard so clicking
+    // the checkbox does not also open the plan or note editor.
+    // For plans: 'data-plan-id' carries the plan slug (item.id = slug from
+    // PlansTreeProvider.serialize). For notes: 'data-note-id' carries the
+    // note id (item.id = note.id from the same serialize path).
+    let rowCheck = null;
+    if (isNote) {
+      const noteCb = el('input', {
+        type: 'checkbox',
+        className: 'jm-note-check',
+        'data-checkbox': '1',
+        'data-note-id': item.id,
+      });
+      noteCb.checked = !!item.isSelected;
+      rowCheck = noteCb;
+    } else if (!isLinearIssue) {
+      const planCb = el('input', {
+        type: 'checkbox',
+        className: 'jm-plan-check',
+        'data-checkbox': '1',
+        'data-plan-id': item.id,
+      });
+      planCb.checked = !!item.isSelected;
+      rowCheck = planCb;
+    }
+    // Wrap checkbox in .row-leading so plan/note rows share the same fixed
+    // 18px leading slot as Changes rows — column-aligns across sections.
+    // Linear-issue rows have no checkbox but still get an empty slot so they
+    // stay column-aligned with their sibling plan/note rows in the same list.
     const kids = [
       el('span', { className: 'twirl' }),
+      el('span', { className: 'row-leading' }, rowCheck ? [rowCheck] : []),
       el('span', { className: 'icon' }, [iconEl]),
       el('span', { className: 'label', text: item.label }),
     ];
@@ -2491,8 +2524,22 @@ export function buildSidebarScript(): string {
     // share an identical string (panel renders msg.title verbatim, no
     // re-derived fallback).
     const displayTitle = item.title || '(untitled)';
+    // Selection checkbox — wrapped in .row-leading after the twirl so it
+    // shares the same fixed 18px leading slot as Changes rows (column-
+    // aligned across sections). 'data-checkbox="1"' opts into the delegated
+    // click guard so clicking the checkbox does not also fire the row's
+    // open-conversation listener.
+    const convCb = el('input', {
+      type: 'checkbox',
+      className: 'jm-conv-check',
+      'data-checkbox': '1',
+      'data-source': item.source,
+      'data-session': item.sessionId,
+    });
+    convCb.checked = !!item.isSelected;
     const kids = [
       el('span', { className: 'twirl' }),
+      el('span', { className: 'row-leading' }, [convCb]),
       el('span', { className: 'icon' }, [
         el('i', { className: 'codicon codicon-comment-discussion' }),
       ]),
@@ -2513,7 +2560,12 @@ export function buildSidebarScript(): string {
       'data-source': item.source,
       title: displayTitle,
     }, kids);
-    root.addEventListener('click', function() {
+    root.addEventListener('click', function(e) {
+      // Guard: clicking the checkbox should not also open the conversation
+      // panel. 'data-checkbox="1"' is enough for the delegated click handler
+      // at the tabContents.branch level, but this direct listener fires on
+      // the same click event, so we need to bail out here too.
+      if (e.target && e.target.closest && e.target.closest('[data-checkbox="1"]')) return;
       // Belt-and-suspenders: the aggregator already filters rows with
       // messageCount === 0 (those would open a panel that just says
       // 'No conversation entries to display.'). If a future change
@@ -2748,8 +2800,13 @@ export function buildSidebarScript(): string {
       'data-id': item.id,
     }, kids);
     if (!expanded) return row;
+    // Children share the parent commit's depth (not depth + 1) so the
+    // file-row icon column-aligns with the commit row's leading M↓ /
+    // git-commit icon. The chevron on the commit row already signals the
+    // parent/child relationship, so an extra 20px indent on the file rows
+    // would just visually break the icon column without adding info.
     const fileRows = item.children.map(function(c) {
-      return renderCommitFileRow(c, depth + 1);
+      return renderCommitFileRow(c, depth);
     });
     return [row].concat(fileRows);
   }
@@ -2934,12 +2991,14 @@ export function buildSidebarScript(): string {
         return;
       }
       const cmdMap = {
-        'changes-select-all':  'jollimemory.selectAllFiles',
-        'changes-commit-ai':   'jollimemory.commitAI',
-        'changes-discard':     'jollimemory.discardSelectedChanges',
-        'commits-select-all':  'jollimemory.selectAllCommits',
-        'commits-squash':      'jollimemory.squash',
-        'commits-push-branch': 'jollimemory.pushBranch',
+        'changes-select-all':        'jollimemory.selectAllFiles',
+        'changes-commit-ai':         'jollimemory.commitAI',
+        'changes-discard':           'jollimemory.discardSelectedChanges',
+        'commits-select-all':        'jollimemory.selectAllCommits',
+        'commits-squash':            'jollimemory.squash',
+        'commits-push-branch':       'jollimemory.pushBranch',
+        'conversations-select-all':  'jollimemory.selectAllConversations',
+        'plans-select-all':          'jollimemory.selectAllPlansAndNotes',
       };
       if (cmdMap[a]) {
         vscode.postMessage({ type: 'command', command: cmdMap[a] });
@@ -3095,15 +3154,50 @@ export function buildSidebarScript(): string {
     }
   });
 
-  // Checkbox toggle — routed by data-checkbox-kind:
-  //   'commit' → branch:toggleCommitSelection (commits squash flow)
-  //   anything else (default 'file') → branch:toggleFileSelection (changes
-  //   discard / commit flow). The default-to-file fallback preserves the
-  //   original behaviour for renderChangeRow which doesn't set the kind.
+  // Checkbox toggle — routed by class name for conversation/plan/note rows,
+  // then by data-checkbox-kind for commit rows, and finally the default-to-file
+  // fallback for renderChangeRow (which does not set 'data-checkbox-kind').
+  //
+  // Conversation rows: 'jm-conv-check' class → branch:toggleConversationSelection
+  //   data-source + data-session identify the session uniquely across providers.
+  // Plan rows: 'jm-plan-check' class → branch:togglePlanSelection
+  //   data-plan-id carries the plan slug (same key as 'setExcluded' uses).
+  // Note rows: 'jm-note-check' class → branch:toggleNoteSelection
+  //   data-note-id carries the note id (same key as 'setExcluded' uses).
+  // Commit rows: data-checkbox-kind='commit' → branch:toggleCommitSelection
+  // File rows: everything else → branch:toggleFileSelection (default fallback)
   tabContents.branch.addEventListener('change', function(e) {
     const cb = e.target.closest('[data-checkbox="1"]');
     if (!cb) return;
     e.stopPropagation();
+    // Conversation checkbox — class 'jm-conv-check'
+    if (cb.classList.contains('jm-conv-check')) {
+      vscode.postMessage({
+        type: 'branch:toggleConversationSelection',
+        source: cb.getAttribute('data-source'),
+        sessionId: cb.getAttribute('data-session'),
+        selected: !!cb.checked,
+      });
+      return;
+    }
+    // Plan checkbox — class 'jm-plan-check'
+    if (cb.classList.contains('jm-plan-check')) {
+      vscode.postMessage({
+        type: 'branch:togglePlanSelection',
+        planId: cb.getAttribute('data-plan-id'),
+        selected: !!cb.checked,
+      });
+      return;
+    }
+    // Note checkbox — class 'jm-note-check'
+    if (cb.classList.contains('jm-note-check')) {
+      vscode.postMessage({
+        type: 'branch:toggleNoteSelection',
+        noteId: cb.getAttribute('data-note-id'),
+        selected: !!cb.checked,
+      });
+      return;
+    }
     const kind = cb.getAttribute('data-checkbox-kind') || 'file';
     if (kind === 'commit') {
       vscode.postMessage({

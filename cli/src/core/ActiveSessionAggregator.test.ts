@@ -20,6 +20,7 @@ vi.mock("./TranscriptMessageCounter.js", () => ({
 
 import { listActiveConversations } from "./ActiveSessionAggregator.js";
 import { discoverCodexSessions } from "./CodexSessionDiscoverer.js";
+import { conversationKey, setExcluded } from "./CommitSelectionStore.js";
 import { scanCopilotChatSessions } from "./CopilotChatSessionDiscoverer.js";
 import { scanCopilotSessions } from "./CopilotSessionDiscoverer.js";
 import { scanCursorSessions } from "./CursorSessionDiscoverer.js";
@@ -586,5 +587,47 @@ describe("listActiveConversations", () => {
 			// log path.
 			expect(items).toEqual([]);
 		});
+	});
+
+	it("stamps isSelected=false on rows whose key is in the exclusion file", async () => {
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const projectDir = mkdtempSync(join(tmpdir(), "agg-selected-false-"));
+		try {
+			const sessionId = "sel-false-session";
+			vi.mocked(scanCursorSessions).mockResolvedValueOnce(
+				scan([{ sessionId, transcriptPath: "/x", updatedAt: iso(-HOUR), source: "cursor" }]),
+			);
+			await setExcluded(projectDir, "conversations", conversationKey("cursor", sessionId), true);
+
+			const items = await listActiveConversations({ cwd: projectDir, windowMs: 2 * DAY });
+
+			expect(items).toHaveLength(1);
+			expect(items[0].isSelected).toBe(false);
+		} finally {
+			rmSync(projectDir, { recursive: true, force: true });
+		}
+	});
+
+	it("defaults isSelected=true when the row is not in the exclusion file", async () => {
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const projectDir = mkdtempSync(join(tmpdir(), "agg-selected-true-"));
+		try {
+			vi.mocked(scanCursorSessions).mockResolvedValueOnce(
+				scan([
+					{ sessionId: "sel-true-session", transcriptPath: "/x", updatedAt: iso(-HOUR), source: "cursor" },
+				]),
+			);
+
+			const items = await listActiveConversations({ cwd: projectDir, windowMs: 2 * DAY });
+
+			expect(items).toHaveLength(1);
+			expect(items[0].isSelected).toBe(true);
+		} finally {
+			rmSync(projectDir, { recursive: true, force: true });
+		}
 	});
 });

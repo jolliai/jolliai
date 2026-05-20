@@ -87,7 +87,7 @@ export async function scanCopilotSessions(projectDir: string): Promise<CopilotSc
 				];
 			});
 		});
-		log.info("Discovered %d Copilot session(s) for %s", sessions.length, normalized);
+		log.debug("Discovered %d Copilot session(s) for %s", sessions.length, normalized);
 		return { sessions };
 	} catch (error: unknown) {
 		const scanError = classifyScanError(error);

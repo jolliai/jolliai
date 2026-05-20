@@ -229,6 +229,23 @@ vi.mock("../core/HiddenConversationsStore.js", async (importOriginal) => {
 	};
 });
 
+// CommitSelectionStore: pipeline reads this at the top of executePipeline /
+// handleAmendPipeline. Real readFile under fake timers can hang because the
+// I/O completion callback never gets scheduled. Mock with empty exclusions
+// by default; tests covering the exclusion filter live in
+// QueueWorker.selection.test.ts which does not use fake timers.
+vi.mock("../core/CommitSelectionStore.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/CommitSelectionStore.js")>();
+	return {
+		...actual,
+		readExclusions: vi.fn(async () => ({
+			conversations: new Set<string>(),
+			plans: new Set<string>(),
+			notes: new Set<string>(),
+		})),
+	};
+});
+
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
