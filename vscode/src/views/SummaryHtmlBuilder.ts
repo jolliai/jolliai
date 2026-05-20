@@ -53,6 +53,25 @@ export interface BuildHtmlOptions {
 	 * the source repo, so this layer does not render an additional banner.
 	 */
 	readonly foreignRepoName?: string | null;
+	/**
+	 * Full 40-char hash of the live root commit when the panel's commit has
+	 * been rewritten by amend / squash / rebase. The `.page` root receives
+	 * a `stale-readonly` hook class (parallel to `foreign-readonly`) so the
+	 * same CSS rule that hides destructive buttons takes effect, and a
+	 * persistent banner is rendered at the top explaining where to go.
+	 *
+	 * The banner displays an 8-char short form for readability while the
+	 * action button's `data-target-hash` attribute carries the FULL hash.
+	 * Navigation needs the full hash because `getSummary()` only resolves
+	 * `commitAliases` for 40-char inputs and throws `AmbiguousHashError`
+	 * on prefix collisions.
+	 *
+	 * The banner is needed (unlike foreign-readonly which relies on the
+	 * tab-title prefix) because the rewrite happens during the panel's
+	 * lifetime — the user already had it open and would otherwise just see
+	 * buttons disappear without knowing why.
+	 */
+	readonly staleRewrittenInto?: string | null;
 }
 
 /**
@@ -65,7 +84,14 @@ export function buildHtml(
 	opts: BuildHtmlOptions = {},
 ): string {
 	const { transcriptHashSet, planTranslateSet, noteTranslateSet, nonce } = opts;
-	const pageClass = opts.foreignRepoName ? "page foreign-readonly" : "page";
+	// Both readonly modes share the same CSS rule that hides destructive
+	// buttons (see SummaryCssBuilder). A panel can in principle be both
+	// foreign AND stale (cross-repo summary whose commit was rewritten in
+	// the source repo) — emit both hook classes so the rule still matches.
+	const pageClasses = ["page"];
+	if (opts.foreignRepoName) pageClasses.push("foreign-readonly");
+	if (opts.staleRewrittenInto) pageClasses.push("stale-readonly");
+	const pageClass = pageClasses.join(" ");
 	const { topics: allTopics, sourceNodes } = collectSortedTopics(summary);
 	const stats = resolveDiffStats(summary);
 	const totalInsertions = stats.insertions;
@@ -84,6 +110,20 @@ export function buildHtml(
 		: "";
 	const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
 
+	// Display short-form (8 chars) for readability; the action button keeps
+	// the full hash in data-target-hash so navigation goes through
+	// getSummary()'s 40-char alias-resolution path rather than the
+	// prefix-scan path that throws on collisions.
+	const staleFullHash = opts.staleRewrittenInto ?? "";
+	const staleShortHash = staleFullHash.substring(0, 8);
+	const staleBannerHtml = opts.staleRewrittenInto
+		? `<div class="stale-banner" role="status">
+  <span class="stale-banner-icon" aria-hidden="true">&#x26A0;&#xFE0F;</span>
+  <span class="stale-banner-text">This commit was rewritten into <code class="stale-banner-hash">${escHtml(staleShortHash)}</code>. This view is read-only; open the new commit's summary to make changes.</span>
+  <button class="stale-banner-action" id="staleOpenNewBtn" data-foreign-safe data-target-hash="${escHtml(staleFullHash)}">Open new commit's summary</button>
+</div>`
+		: "";
+
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -95,6 +135,7 @@ ${csp}
 </head>
 <body>
 <div class="${pageClass}">
+${staleBannerHtml}
 ${buildAllConversationsSection(transcriptHashSet)}
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
 <hr class="separator" />

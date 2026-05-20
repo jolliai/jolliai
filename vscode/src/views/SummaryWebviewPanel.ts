@@ -159,7 +159,8 @@ type WebviewMessage =
 	  }
 	| { command: "deleteAllTranscripts" }
 	| { command: "editRecap"; recap: string }
-	| { command: "generateRecap" };
+	| { command: "generateRecap" }
+	| { command: "openRewrittenCommit"; hash: string };
 
 /** Entry data sent back from the webview on Save All. */
 interface TranscriptEntryUpdate {
@@ -192,6 +193,10 @@ const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
 	// workspace's git/GitHub; when foreignRepoUrl is null (local-only
 	// foreign repo) the handler short-circuits with `unavailable`.
 	"checkPrStatus",
+	// Navigation-only — fires `jollimemory.viewSummary` against a hash
+	// supplied by the stale banner the panel itself rendered. No write
+	// path, no workspace coupling beyond opening another panel.
+	"openRewrittenCommit",
 ]);
 
 function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
@@ -285,6 +290,25 @@ export class SummaryWebviewPanel {
 	 * skip the webview write (panel.webview.html throws on a disposed panel).
 	 */
 	private disposed = false;
+	/**
+	 * Full 40-char hash of the live root commit when this panel's commit has
+	 * been rewritten by amend / squash / rebase (set by
+	 * `ensureCommitNotRewritten` on first detection). Once non-null the panel
+	 * renders in stale-readonly mode: every destructive button is hidden via
+	 * CSS, the banner explains where to go, and subsequent write attempts
+	 * short-circuit silently without re-showing the modal. The field is
+	 * never cleared — once the underlying commit is gone, the only sane
+	 * transition is for the user to open the new commit's summary in its
+	 * own panel.
+	 *
+	 * Why full hash: the banner's "Open new commit's summary" button posts
+	 * this value through to `jollimemory.viewSummary` → `getSummary()`.
+	 * `getSummary()` only resolves `commitAliases` for 40-char inputs and
+	 * throws `AmbiguousHashError` on prefix collisions. A short prefix here
+	 * would silently fail to navigate in those cases. Display short-form is
+	 * computed at render time in `buildHtml`.
+	 */
+	private staleRewrittenInto: string | undefined;
 
 	private readonly bridge: JolliMemoryBridge;
 	// Snapshot of `CommitsStore.getMainBranch()` at panel creation. Revisit
@@ -674,6 +698,12 @@ export class SummaryWebviewPanel {
 					"Delete transcripts failed",
 				);
 				break;
+			case "openRewrittenCommit":
+				this.catchAndShow(
+					this.openRewrittenCommit(message.hash),
+					"Open rewritten commit failed",
+				);
+				break;
 		}
 	}
 
@@ -726,16 +756,29 @@ export class SummaryWebviewPanel {
 	 * We detect this via the index: every rewrite by jollimemory's own queue
 	 * sets `parentCommitHash` on the old entry pointing at the new root. An
 	 * entry with `parentCommitHash != null` therefore means "this commit has
-	 * been folded into another" — block the write, surface where to go (the
-	 * live root reached by walking the parent chain), and dispose the panel so
-	 * the stale tab can't be reused.
+	 * been folded into another" — block the write and transition the panel
+	 * into stale-readonly mode (parallel to foreign-readonly): a banner
+	 * appears, every destructive button is hidden via CSS, and a one-time
+	 * modal offers the user a button to jump straight to the new commit's
+	 * summary. The panel itself is kept open so the user can still read the
+	 * orphaned commit's content (which they may need for context) and so they
+	 * don't lose their place mid-task (e.g. mid-LLM-wait).
 	 *
 	 * Returns `true` when the operation may proceed (commit is still a root,
 	 * or absent from the index entirely — legacy / external commits / freshly
 	 * created entries the worker has not yet indexed). Returns `false` after
-	 * surfacing the warning and disposing; callers must short-circuit.
+	 * triggering the stale-readonly transition; callers must short-circuit.
+	 *
+	 * Idempotent: once the panel is already in stale-readonly mode, returns
+	 * false silently without re-firing the modal — every subsequent click on
+	 * a destructive control would otherwise spam the user.
 	 */
 	private async ensureCommitNotRewritten(operation: string): Promise<boolean> {
+		// Already stale → short-circuit without re-prompting. The CSS hides
+		// the destructive buttons; this guards the dispatcher path against
+		// any direct postMessage from a stale tab that survived a webview
+		// reload.
+		if (this.staleRewrittenInto) return false;
 		if (!this.currentSummary) return true;
 		const hash = this.currentSummary.commitHash;
 		// Route through the Bridge so the read picks up the extension's
@@ -762,11 +805,63 @@ export class SummaryWebviewPanel {
 			rootHash = parent.parentCommitHash;
 		}
 
-		void vscode.window.showWarningMessage(
-			`Cannot ${operation}: commit ${hash.substring(0, 8)} was rewritten into ${rootHash.substring(0, 8)}. Open that commit's summary instead.`,
-		);
-		this.panel.dispose();
+		await this.enterStaleReadonlyMode(operation, hash, rootHash);
 		return false;
+	}
+
+	/**
+	 * Transitions the panel into stale-readonly mode after a guard detects
+	 * the underlying commit was rewritten. One-shot: only the FIRST guard
+	 * trip reaches here (subsequent attempts short-circuit on the
+	 * `staleRewrittenInto` field). Fires a modal so the user understands
+	 * what changed and gets a one-click jump to the live commit's panel,
+	 * then re-renders the webview in stale-readonly mode so the banner
+	 * appears and destructive buttons disappear.
+	 */
+	private async enterStaleReadonlyMode(
+		operation: string,
+		hash: string,
+		rootHash: string,
+	): Promise<void> {
+		const shortRoot = rootHash.substring(0, 8);
+		const shortHash = hash.substring(0, 8);
+		// Store the FULL hash so the banner's "Open new commit's summary"
+		// action resolves through `getSummary()`'s alias lookup (40-char
+		// only) and side-steps prefix-collision throws. Display short-form
+		// is derived at render time in `buildHtml`.
+		this.staleRewrittenInto = rootHash;
+		// Re-render BEFORE the modal so the banner and hidden-button state
+		// are visible the moment the user dismisses the modal — they get
+		// instant feedback that the panel changed even if they click
+		// "Stay here".
+		if (this.currentSummary) {
+			this.update(this.currentSummary);
+		}
+		const openLabel = "Open new commit's summary";
+		const choice = await vscode.window.showWarningMessage(
+			`Cannot ${operation}: commit ${shortHash} was rewritten into ${shortRoot}.`,
+			{
+				modal: true,
+				detail:
+					"This panel is now read-only. The buttons that write to the commit's summary have been hidden so further edits don't land on the orphaned commit. Open the new commit's summary to continue your work — or stay here to keep reading.",
+			},
+			openLabel,
+		);
+		if (choice === openLabel) {
+			await this.openRewrittenCommit(rootHash);
+		}
+	}
+
+	/**
+	 * Opens the summary panel for the live root that replaced this panel's
+	 * (now-orphaned) commit. Delegates to the existing
+	 * `jollimemory.viewSummary` command rather than calling
+	 * `SummaryWebviewPanel.show` directly so the lookup path stays uniform
+	 * (it handles "summary not found" with a toast and runs the same
+	 * pre-render refresh as the sidebar entry point).
+	 */
+	private async openRewrittenCommit(rootHash: string): Promise<void> {
+		await vscode.commands.executeCommand("jollimemory.viewSummary", rootHash);
 	}
 
 	/**
@@ -867,14 +962,16 @@ export class SummaryWebviewPanel {
 			return;
 		}
 		this.currentSummary = summary;
-		// Prefix the tab title with the foreign repo's name so the user can
-		// tell at a glance that this panel is read-only. The "<<" arrows
-		// echo IntelliJ's "from <repo>" convention while staying short
-		// enough not to truncate the commit message on narrow tab bars.
+		// Prefix the tab title to communicate panel state at a glance.
+		// Foreign-repo prefix comes first since it's intrinsic to the panel,
+		// stale prefix comes second since it's a transient state of the
+		// underlying commit. Both can coexist on a foreign panel whose
+		// source commit was rewritten in the foreign repo.
 		const baseTitle = buildPanelTitle(summary);
-		this.panel.title = this.foreignRepoName
-			? `← ${this.foreignRepoName}: ${baseTitle}`
-			: baseTitle;
+		let title = baseTitle;
+		if (this.foreignRepoName) title = `← ${this.foreignRepoName}: ${title}`;
+		if (this.staleRewrittenInto) title = `⚠ Rewritten — ${title}`;
+		this.panel.title = title;
 		const nonce = randomBytes(16).toString("base64");
 		this.panel.webview.html = buildHtml(summary, {
 			transcriptHashSet: this.transcriptHashSet,
@@ -882,6 +979,7 @@ export class SummaryWebviewPanel {
 			noteTranslateSet: this.noteTranslateSet,
 			nonce,
 			foreignRepoName: this.foreignRepoName,
+			staleRewrittenInto: this.staleRewrittenInto ?? null,
 		});
 	}
 
@@ -2696,6 +2794,14 @@ export class SummaryWebviewPanel {
 	private async handleSaveAllTranscripts(
 		entries: ReadonlyArray<TranscriptEntryUpdate>,
 	): Promise<void> {
+		// Stale-commit guard: transcript writes are keyed by the panel's
+		// `transcriptHashSet`, which reflects the stale tree after amend.
+		// Letting these go through would mutate the orphaned commit's
+		// `transcripts/<hash>.json` files instead of the new HEAD's — same
+		// silent-mismatch class the summary handlers guard against.
+		if (!(await this.ensureCommitNotRewritten("save transcripts"))) {
+			return;
+		}
 		// Group entries by commitHash
 		const byCommit = new Map<string, Array<TranscriptEntryUpdate>>();
 		for (const entry of entries) {
@@ -2791,6 +2897,13 @@ export class SummaryWebviewPanel {
 
 	/** Deletes all transcript files for the current summary tree (scoped by operation boundary). */
 	private async handleDeleteAllTranscripts(): Promise<void> {
+		// Stale-commit guard: same rationale as handleSaveAllTranscripts —
+		// `transcriptHashSet` reflects the orphaned tree post-amend, and a
+		// bulk delete against it would wipe transcripts the new HEAD still
+		// references as descendants of its hoisted tree.
+		if (!(await this.ensureCommitNotRewritten("delete transcripts"))) {
+			return;
+		}
 		const hashes = [...this.transcriptHashSet];
 		if (hashes.length === 0) {
 			return;

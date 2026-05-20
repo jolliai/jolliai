@@ -7471,6 +7471,26 @@ describe("SummaryWebviewPanel", () => {
 			return captureMessageHandler();
 		}
 
+		/**
+		 * Asserts the stale-commit modal was raised with the expected
+		 * substrings in its message. `showWarningMessage` is called with
+		 * `(msg, { modal: true, detail }, "Open new commit's summary")` —
+		 * checking presence via mock.calls.some lets each test target a
+		 * specific operation label without binding to the full arg shape.
+		 */
+		function expectStaleModalShown(...substrings: ReadonlyArray<string>): void {
+			const matched = showWarningMessage.mock.calls.find(
+				(c) =>
+					typeof c[0] === "string" &&
+					substrings.every((s) => (c[0] as string).includes(s)) &&
+					typeof c[1] === "object" &&
+					c[1] !== null &&
+					(c[1] as { modal?: boolean }).modal === true &&
+					c[2] === "Open new commit's summary",
+			);
+			expect(matched).toBeDefined();
+		}
+
 		it("allows push when the commit is still a root entry", async () => {
 			(
 				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
@@ -7521,21 +7541,23 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "push" });
 			await flushPromises();
 
-			// User-facing warning surfaces the live root's short hash.
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("rewritten into rootnew0"),
+			// User-facing modal carries the old and new short hashes plus the
+			// operation label so the user knows exactly what was blocked.
+			expectStaleModalShown(
+				"rewritten into rootnew0",
+				"abc123",
+				"push to Jolli",
 			);
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("abc123"),
+			// Panel transitions to stale-readonly (NOT disposed) — buildHtml is
+			// re-invoked with `staleRewrittenInto` set so the rendered output
+			// gets the .stale-readonly hook class and the banner. We verify
+			// the option, not the rendered HTML, because buildHtml is mocked.
+			const staleRender = mockBuildHtml.mock.calls.find(
+				(c) =>
+					(c[1] as { staleRewrittenInto?: string } | undefined)
+						?.staleRewrittenInto === "rootnew0",
 			);
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("push to Jolli"),
-			);
-			// Side effect: panel disposed so the stale tab can't be reused.
-			expect(
-				firstCommitPanel<{ panel: { dispose: ReturnType<typeof vi.fn> } }>()
-					.panel.dispose,
-			).toHaveBeenCalled();
+			expect(staleRender).toBeDefined();
 			// And the storage write never happened.
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
@@ -7557,9 +7579,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "push" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("rewritten into finalrt"),
-			);
+			expectStaleModalShown("rewritten into finalrt");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -7584,9 +7604,13 @@ describe("SummaryWebviewPanel", () => {
 			// We surface whichever hash the walk landed on before detecting the
 			// cycle — either cyclea0 or cycleb0, depending on iteration order;
 			// the important thing is that no crash and no storage write happens.
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringMatching(/rewritten into (cyclea0|cycleb0)/),
+			const cycleModal = showWarningMessage.mock.calls.find(
+				(c) =>
+					typeof c[0] === "string" &&
+					/rewritten into (cyclea0|cycleb0)/.test(c[0]) &&
+					c[2] === "Open new commit's summary",
 			);
+			expect(cycleModal).toBeDefined();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -7608,9 +7632,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("edit memory"),
-			);
+			expectStaleModalShown("edit memory");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -7628,9 +7650,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "generateE2eTest" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("generate E2E test guide"),
-			);
+			expectStaleModalShown("generate E2E test guide");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -7669,9 +7689,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("edit E2E scenario"),
-			);
+			expectStaleModalShown("edit E2E scenario");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -7707,9 +7725,7 @@ describe("SummaryWebviewPanel", () => {
 			await flushPromises();
 
 			// Stale warning surfaced, confirm dialog ("Delete scenario ...?") never shown.
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("delete E2E scenario"),
-			);
+			expectStaleModalShown("delete E2E scenario");
 			const confirmCalls = showWarningMessage.mock.calls.filter((c) =>
 				typeof c[0] === "string" ? c[0].startsWith("Delete scenario") : false,
 			);
@@ -7731,9 +7747,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "deleteE2eTest" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("delete E2E test guide"),
-			);
+			expectStaleModalShown("delete E2E test guide");
 			const confirmCalls = showWarningMessage.mock.calls.filter((c) =>
 				typeof c[0] === "string" ? c[0] === "Delete E2E Test Guide?" : false,
 			);
@@ -7755,9 +7769,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "generateRecap" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("generate recap"),
-			);
+			expectStaleModalShown("generate recap");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -7775,9 +7787,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "deleteTopic", topicIndex: 0 });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("delete memory"),
-			);
+			expectStaleModalShown("delete memory");
 			// Confirm dialog ("Delete memory?" / "Delete this memory?") never shown.
 			const confirmCalls = showWarningMessage.mock.calls.filter((c) =>
 				typeof c[0] === "string" ? c[0].startsWith("Delete") : false,
@@ -7800,9 +7810,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "editE2eTest", scenarios: [] });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("edit E2E test guide"),
-			);
+			expectStaleModalShown("edit E2E test guide");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -7844,9 +7852,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "removePlan", slug: "p", title: "P" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("remove plan"),
-			);
+			expectStaleModalShown("remove plan");
 			const confirmCalls = showWarningMessage.mock.calls.filter((c) =>
 				typeof c[0] === "string" ? c[0].startsWith("Remove plan") : false,
 			);
@@ -7886,9 +7892,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "removeNote", id: "n", title: "N" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("remove note"),
-			);
+			expectStaleModalShown("remove note");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -7929,9 +7933,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("remove Linear issue"),
-			);
+			expectStaleModalShown("remove Linear issue");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -7952,9 +7954,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "addPlan" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("add plan"),
-			);
+			expectStaleModalShown("add plan");
 			expect(showQuickPick).not.toHaveBeenCalled();
 			expect(mockArchivePlanForCommit).not.toHaveBeenCalled();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
@@ -7974,9 +7974,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "addMarkdownNote" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("add markdown note"),
-			);
+			expectStaleModalShown("add markdown note");
 			expect(showOpenDialog).not.toHaveBeenCalled();
 			expect(mockArchiveNoteForCommit).not.toHaveBeenCalled();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
@@ -8000,9 +7998,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("save snippet"),
-			);
+			expectStaleModalShown("save snippet");
 			expect(mockSaveNote).not.toHaveBeenCalled();
 			expect(mockArchiveNoteForCommit).not.toHaveBeenCalled();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
@@ -8026,9 +8022,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("save plan"),
-			);
+			expectStaleModalShown("save plan");
 			expect(mockStorePlans).not.toHaveBeenCalled();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
@@ -8052,9 +8046,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("save note"),
-			);
+			expectStaleModalShown("save note");
 			expect(mockStoreNotes).not.toHaveBeenCalled();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
@@ -8073,9 +8065,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "translatePlan", slug: "p" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("translate plan"),
-			);
+			expectStaleModalShown("translate plan");
 			expect(mockReadPlanFromBranch).not.toHaveBeenCalled();
 			expect(mockStorePlans).not.toHaveBeenCalled();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
@@ -8114,9 +8104,7 @@ describe("SummaryWebviewPanel", () => {
 			dispatch({ command: "translateNote", id: "n" });
 			await flushPromises();
 
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("translate note"),
-			);
+			expectStaleModalShown("translate note");
 			expect(mockStoreNotes).not.toHaveBeenCalled();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
@@ -8188,9 +8176,7 @@ describe("SummaryWebviewPanel", () => {
 			// LLM call DID happen (entry guard let it through); the result was
 			// discarded by the pre-write guard.
 			expect(mockGenerateE2eTest).toHaveBeenCalled();
-			expect(showWarningMessage).toHaveBeenCalledWith(
-				expect.stringContaining("rewritten into rootnew0"),
-			);
+			expectStaleModalShown("rewritten into rootnew0");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -8293,6 +8279,197 @@ describe("SummaryWebviewPanel", () => {
 			expect(mockTranslateToEnglish).toHaveBeenCalled();
 			expect(mockStorePlans).not.toHaveBeenCalled();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		// ── Stale-readonly mode transitions ───────────────────────────────
+
+		it("clicking 'Open new commit's summary' on the modal fires jollimemory.viewSummary with the live root hash", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			// User chooses to navigate to the live commit's summary.
+			showWarningMessage.mockResolvedValueOnce("Open new commit's summary");
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.viewSummary",
+				"rootnew0",
+			);
+		});
+
+		it("dismissing the modal leaves the panel open in stale-readonly mode (no viewSummary dispatch)", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			// User dismisses the modal (Esc or "x" button) — undefined return.
+			showWarningMessage.mockResolvedValueOnce(undefined);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// No navigation triggered, but panel was re-rendered in stale mode.
+			const viewSummaryCalls = executeCommand.mock.calls.filter(
+				(c) => c[0] === "jollimemory.viewSummary",
+			);
+			expect(viewSummaryCalls).toHaveLength(0);
+			const staleRender = mockBuildHtml.mock.calls.find(
+				(c) =>
+					(c[1] as { staleRewrittenInto?: string } | undefined)
+						?.staleRewrittenInto === "rootnew0",
+			);
+			expect(staleRender).toBeDefined();
+		});
+
+		it("openRewrittenCommit webview message (banner button click) opens the new commit's panel", async () => {
+			// Set up a fresh panel — banner action is independent of the modal
+			// flow, the webview can post it any time the user clicks the
+			// banner button (e.g. after dismissing the modal).
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "openRewrittenCommit", hash: "newroot0" });
+			await flushPromises();
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.viewSummary",
+				"newroot0",
+			);
+		});
+
+		it("second guard trip is silent: no second modal, no second re-render", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			showWarningMessage.mockResolvedValue(undefined);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			const firstModalCount = showWarningMessage.mock.calls.filter(
+				(c) =>
+					typeof c[0] === "string" &&
+					(c[0] as string).includes("rewritten into"),
+			).length;
+			const firstStaleRenders = mockBuildHtml.mock.calls.filter(
+				(c) =>
+					(c[1] as { staleRewrittenInto?: string } | undefined)
+						?.staleRewrittenInto === "rootnew0",
+			).length;
+
+			// Second click on any guarded action — should NOT raise another
+			// modal or re-render. The dispatcher / handler short-circuits
+			// purely on the `staleRewrittenInto` field.
+			dispatch({ command: "generateE2eTest" });
+			await flushPromises();
+
+			const secondModalCount = showWarningMessage.mock.calls.filter(
+				(c) =>
+					typeof c[0] === "string" &&
+					(c[0] as string).includes("rewritten into"),
+			).length;
+			const secondStaleRenders = mockBuildHtml.mock.calls.filter(
+				(c) =>
+					(c[1] as { staleRewrittenInto?: string } | undefined)
+						?.staleRewrittenInto === "rootnew0",
+			).length;
+			expect(secondModalCount).toBe(firstModalCount);
+			expect(secondStaleRenders).toBe(firstStaleRenders);
+		});
+
+		it("passes the FULL 40-char root hash to buildHtml (not the short display form)", async () => {
+			// Regression guard for the banner's "Open new commit's summary"
+			// action. buildHtml receives `staleRewrittenInto` and is
+			// responsible for rendering the short form for display while
+			// keeping the full hash in `data-target-hash`. The panel must
+			// store the full hash; if it pre-truncates, navigation breaks
+			// (getSummary alias lookup is 40-char only, prefix scan can
+			// throw on collisions).
+			const fullChildHash = "a".repeat(40);
+			const fullRootHash = "b".repeat(40);
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: fullChildHash, parent: fullRootHash },
+					{ hash: fullRootHash, parent: null },
+				]),
+			);
+			showWarningMessage.mockResolvedValueOnce(undefined);
+			const dispatch = await setupCommit(fullChildHash);
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// buildHtml gets the untruncated value.
+			const staleRender = mockBuildHtml.mock.calls.find(
+				(c) =>
+					(c[1] as { staleRewrittenInto?: string } | undefined)
+						?.staleRewrittenInto === fullRootHash,
+			);
+			expect(staleRender).toBeDefined();
+			// The modal still uses the short form for readability.
+			expectStaleModalShown(
+				"rewritten into bbbbbbbb",
+				"aaaaaaaa",
+				"push to Jolli",
+			);
+		});
+
+		// ── Transcript handlers (P2 #2) ──────────────────────────────────
+
+		it("blocks save all transcripts when the commit was rewritten", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "saveAllTranscripts", entries: [] });
+			await flushPromises();
+
+			expectStaleModalShown("save transcripts");
+			expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
+		});
+
+		it("blocks delete all transcripts when the commit was rewritten", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "deleteAllTranscripts" });
+			await flushPromises();
+
+			expectStaleModalShown("delete transcripts");
+			expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
 		});
 	});
 

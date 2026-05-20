@@ -91,6 +91,19 @@ export function buildScript(): string {
       vscode.postMessage({ command: 'push' });
     });
   }
+
+  // Stale-readonly banner: "Open new commit's summary" button. The live
+  // root hash is rendered into data-target-hash by buildHtml; the
+  // extension routes the message to jollimemory.viewSummary.
+  var staleOpenBtn = document.getElementById('staleOpenNewBtn');
+  if (staleOpenBtn) {
+    staleOpenBtn.addEventListener('click', function() {
+      var hash = staleOpenBtn.getAttribute('data-target-hash');
+      if (hash) {
+        vscode.postMessage({ command: 'openRewrittenCommit', hash: hash });
+      }
+    });
+  }
 ${buildPrSectionScript()}
 
   // Listen for messages from the extension (push + topic edit status updates).
