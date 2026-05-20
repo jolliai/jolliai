@@ -56,7 +56,7 @@ export async function discoverCodexSessions(projectDir: string): Promise<Readonl
 	const archivedSessions = await scanFlatDirectory(archivedDir, resolvedProject);
 	sessions.push(...archivedSessions);
 
-	log.info("Discovered %d Codex session(s)", sessions.length);
+	log.debug("Discovered %d Codex session(s)", sessions.length);
 	return sessions;
 }
 

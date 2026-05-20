@@ -256,10 +256,14 @@ describe("FilesTreeProvider", () => {
 			"a.ts",
 			"ignore.log",
 		]);
-		// ignore.log is selected but excluded by *.log — getSelectedFiles() must filter it out
+		// Default-select seeds every freshly-seen path; the *.log exclude pattern
+		// then drops ignore.log from getSelectedFiles even though it was seeded.
 		expect(
-			provider.getSelectedFiles().map((file) => file.relativePath),
-		).toEqual(["a.ts"]);
+			provider
+				.getSelectedFiles()
+				.map((file) => file.relativePath)
+				.sort(),
+		).toEqual(["a.ts", "b.ts"]);
 		expect(provider.getExcludedCount()).toBe(1);
 		expect(provider.getVisibleFileCount()).toBe(2);
 		expect(
@@ -459,14 +463,16 @@ describe("FilesTreeProvider", () => {
 		);
 		await provider.refresh();
 
-		// Select all visible (a.ts, b.ts — skip.log is excluded)
+		// After refresh the default-select seed has already selected every
+		// visible path (skip.log is excluded). First toggle therefore flips
+		// the all-selected state to "all unselected".
+		provider.toggleSelectAll();
+		expect(provider.getSelectedFiles()).toHaveLength(0);
+
+		// Second toggle re-selects every visible file.
 		provider.toggleSelectAll();
 		const selected = provider.getSelectedFiles().map((f) => f.relativePath);
 		expect(selected.sort()).toEqual(["a.ts", "b.ts"]);
-
-		// Toggle again → deselect all visible
-		provider.toggleSelectAll();
-		expect(provider.getSelectedFiles()).toHaveLength(0);
 	});
 
 	it("keeps already-selected visible files selected when selecting the remaining files", async () => {
@@ -478,6 +484,13 @@ describe("FilesTreeProvider", () => {
 			makeExcludeFilter(),
 		);
 		await provider.refresh();
+
+		// Default-select seeds both as selected; uncheck a.ts so the panel is
+		// in a mixed state (b.ts selected, a.ts unselected). toggleSelectAll
+		// should converge to "all selected" rather than "all unselected"
+		// because not every visible row is currently selected.
+		const [itemA] = provider.getChildren();
+		provider.onCheckboxToggle(itemA, false);
 
 		provider.toggleSelectAll();
 
@@ -549,8 +562,13 @@ describe("FilesTreeProvider", () => {
 			makeExcludeFilter(),
 		);
 		await provider.refresh();
-		const [itemA] = provider.getChildren();
+		const [itemA, itemB] = provider.getChildren();
 
+		// Default-select gives both files isSelected:true. Uncheck b.ts so the
+		// batch that targets only a.ts has a distinct "other" file to leave
+		// alone. The batch then re-asserts a.ts:true (no-op) and b.ts stays
+		// unchecked.
+		provider.onCheckboxToggle(itemB, false);
 		provider.onCheckboxToggleBatch([[itemA, true]]);
 
 		expect(provider.getFiles()).toEqual([
@@ -899,8 +917,11 @@ describe("FilesTreeProvider.serialize", () => {
 		);
 		await provider.refresh(true);
 
-		const [itemA] = provider.getChildren();
-		provider.onCheckboxToggle(itemA, true);
+		// Both files default-select after refresh. Uncheck b.ts so the next
+		// refresh has to remember a real uncheck (this exercises the negative
+		// memory in FilesStore.unselectedPaths).
+		const [, itemB] = provider.getChildren();
+		provider.onCheckboxToggle(itemB, false);
 
 		bridge.listFiles.mockResolvedValueOnce([
 			makeFile("a.ts", false),

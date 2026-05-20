@@ -7,6 +7,10 @@
  */
 
 import * as vscode from "vscode";
+import {
+	type CommitExclusions,
+	readExclusions,
+} from "../../../cli/src/core/CommitSelectionStore.js";
 import type { PlansStore } from "../stores/PlansStore.js";
 import type { LinearIssueInfo, NoteInfo, PlanInfo } from "../Types.js";
 import {
@@ -173,9 +177,18 @@ export class PlansTreeProvider
 	>();
 	readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
+	private readonly store: PlansStore;
 	private readonly unsubscribe: () => void;
+	private readonly cwd: string;
+	private exclusions: CommitExclusions = {
+		conversations: new Set(),
+		plans: new Set(),
+		notes: new Set(),
+	};
 
-	constructor(private readonly store: PlansStore) {
+	constructor(store: PlansStore, cwd = "") {
+		this.store = store;
+		this.cwd = cwd;
 		this.unsubscribe = store.onChange((snap) => {
 			void vscode.commands.executeCommand(
 				"setContext",
@@ -184,6 +197,12 @@ export class PlansTreeProvider
 			);
 			this._onDidChangeTreeData.fire(undefined);
 		});
+		void this.refreshExclusions();
+	}
+
+	async refreshExclusions(): Promise<void> {
+		this.exclusions = await readExclusions(this.cwd);
+		this._onDidChangeTreeData.fire(undefined);
 	}
 
 	getTreeItem(element: TreeItem): vscode.TreeItem {
@@ -205,10 +224,19 @@ export class PlansTreeProvider
 	serialize(): ReadonlyArray<SerializedTreeItem> {
 		return this.getChildren().map((it) => {
 			let idHint: string;
-			if (it instanceof PlanItem) idHint = it.plan.slug;
-			else if (it instanceof NoteItem) idHint = it.note.id;
-			else idHint = it.issue.mapKey;
-			return treeItemToSerialized(it, idHint);
+			let isSelected = true;
+			if (it instanceof PlanItem) {
+				idHint = it.plan.slug;
+				isSelected = !this.exclusions.plans.has(idHint);
+			} else if (it instanceof NoteItem) {
+				idHint = it.note.id;
+				isSelected = !this.exclusions.notes.has(idHint);
+			} else {
+				idHint = it.issue.mapKey;
+				// Linear-issue rows are not user-selectable; default true (no exclusion key applies).
+			}
+			const ser = treeItemToSerialized(it, idHint);
+			return { ...ser, isSelected };
 		});
 	}
 

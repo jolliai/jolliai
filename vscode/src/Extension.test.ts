@@ -28,6 +28,10 @@ const { mockNotifyApiKeySaveError } = vi.hoisted(() => ({
 	mockNotifyApiKeySaveError: vi.fn(),
 }));
 
+const { mockRefreshConversationsPanel } = vi.hoisted(() => ({
+	mockRefreshConversationsPanel: vi.fn(() => Promise.resolve()),
+}));
+
 const { isWorkerBusy } = vi.hoisted(() => ({
 	isWorkerBusy: vi.fn(),
 }));
@@ -799,6 +803,7 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		resolveWebviewView() {}
 		dispose() {}
 		refreshKnowledgeBaseFolders() {}
+		refreshConversationsPanel = mockRefreshConversationsPanel;
 		notifyEnabledChanged() {}
 		notifyAuthChanged() {}
 		notifyConfiguredChanged() {}
@@ -3114,7 +3119,8 @@ describe("Extension", () => {
 			activate(ctx);
 		});
 
-		it("refreshes history and plans when the worker lock is deleted", async () => {
+		it("refreshes history, plans, and conversations when the worker lock is deleted", async () => {
+			mockRefreshConversationsPanel.mockClear();
 			const lockWatcher = createFileSystemWatcher.mock.results[3]?.value;
 			const onDelete = lockWatcher?.onDidDelete.mock.calls[0]?.[0] as
 				| (() => void)
@@ -3127,6 +3133,11 @@ describe("Extension", () => {
 				expect(mockStatusStore.setWorkerBusy).toHaveBeenCalledWith(false);
 				expect(mockCommitsStore.refresh).toHaveBeenCalled();
 				expect(mockPlansStore.refresh).toHaveBeenCalled();
+				// The CONVERSATIONS section is polled on a 60s timer, so without
+				// this hook the row that the worker just consumed would linger
+				// for up to a minute. Refreshing here keeps the section in sync
+				// with the worker's cursor advance.
+				expect(mockRefreshConversationsPanel).toHaveBeenCalled();
 			});
 			expect(executeCommand).toHaveBeenCalledWith(
 				"setContext",

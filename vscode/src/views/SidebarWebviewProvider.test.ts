@@ -1651,6 +1651,112 @@ describe("SidebarWebviewProvider", () => {
 		expect(applyCommitCheckbox).toHaveBeenCalledWith("abc1234", true);
 	});
 
+	it("dispatches branch:toggleConversationSelection to applyConversationCheckbox", () => {
+		const view = makeMockView();
+		const applyConversationCheckbox = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			applyConversationCheckbox,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:toggleConversationSelection",
+			source: "claude",
+			sessionId: "abc",
+			selected: false,
+		});
+		expect(applyConversationCheckbox).toHaveBeenCalledWith(
+			"claude",
+			"abc",
+			false,
+		);
+	});
+
+	it("rejects branch:toggleConversationSelection with an unknown source", () => {
+		const view = makeMockView();
+		const applyConversationCheckbox = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			applyConversationCheckbox,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:toggleConversationSelection",
+			source: "../../etc/passwd",
+			sessionId: "abc",
+			selected: false,
+		});
+		expect(applyConversationCheckbox).not.toHaveBeenCalled();
+	});
+
+	it("dispatches branch:togglePlanSelection to applyPlanCheckbox", () => {
+		const view = makeMockView();
+		const applyPlanCheckbox = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			applyPlanCheckbox,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:togglePlanSelection",
+			planId: "plan-slug",
+			selected: false,
+		});
+		expect(applyPlanCheckbox).toHaveBeenCalledWith("plan-slug", false);
+	});
+
+	it("dispatches branch:toggleNoteSelection to applyNoteCheckbox", () => {
+		const view = makeMockView();
+		const applyNoteCheckbox = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			applyNoteCheckbox,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:toggleNoteSelection",
+			noteId: "note-id",
+			selected: false,
+		});
+		expect(applyNoteCheckbox).toHaveBeenCalledWith("note-id", false);
+	});
+
 	// switch's `default` arm — message has a string `type` but it isn't one of
 	// the handled cases. Must not throw and must not invoke any side effects.
 	it("ignores unknown outbound message types via the switch default", () => {

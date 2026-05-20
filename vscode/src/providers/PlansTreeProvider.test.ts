@@ -1,4 +1,8 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { setExcluded } from "../../../cli/src/core/CommitSelectionStore.js";
 import type { NoteInfo, PlanInfo } from "../Types.js";
 
 const {
@@ -582,6 +586,69 @@ describe("PlansTreeProvider", () => {
 
 			const items = provider.serialize?.();
 			expect(items?.[0]?.id).toBe("note-abc");
+		});
+	});
+
+	describe("isSelected via exclusions cache", () => {
+		/**
+		 * Build a PlansStore+PlansTreeProvider pair with the given plan slugs
+		 * rooted at cwd. The store is pre-populated via an initial refresh() call.
+		 */
+		async function makePlansProviderWithCwd(
+			slugs: readonly string[],
+			cwd: string,
+		) {
+			const plans = slugs.map((slug) => makePlan({ slug, title: slug }));
+			const bridge = {
+				listPlans: vi.fn(async () => plans),
+				listNotes: vi.fn(async () => []),
+				listLinearIssues: vi.fn(async () => []),
+			};
+			const store = new PlansStore(bridge as never);
+			const provider = new PlansTreeProvider(store, cwd);
+			// Populate the store before serializing
+			await store.refresh();
+			return provider;
+		}
+
+		it("stamps isSelected=false on a plan row whose slug is in the exclusion set", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "jolli-test-"));
+			try {
+				await setExcluded(cwd, "plans", "plan-skip", true);
+
+				const provider = await makePlansProviderWithCwd(
+					["plan-keep", "plan-skip"],
+					cwd,
+				);
+				await provider.refreshExclusions();
+				const items = provider.serialize();
+
+				const skip = items.find(
+					(i) => typeof i.id === "string" && i.id.endsWith("plan-skip"),
+				);
+				const keep = items.find(
+					(i) => typeof i.id === "string" && i.id.endsWith("plan-keep"),
+				);
+				expect(skip?.isSelected).toBe(false);
+				expect(keep?.isSelected).toBe(true);
+			} finally {
+				fs.rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+
+		it("stamps isSelected=true by default when no exclusion file is present", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "jolli-test-"));
+			try {
+				const provider = await makePlansProviderWithCwd(["plan-alpha"], cwd);
+				await provider.refreshExclusions();
+				const items = provider.serialize();
+
+				for (const item of items) {
+					expect(item.isSelected).toBe(true);
+				}
+			} finally {
+				fs.rmSync(cwd, { recursive: true, force: true });
+			}
 		});
 	});
 });

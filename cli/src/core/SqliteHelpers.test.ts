@@ -122,4 +122,75 @@ describe("withSqliteDb", () => {
 			}),
 		).rejects.toThrow("boom");
 	});
+
+	it("retries the callback when SQLITE_BUSY is thrown and eventually succeeds", async () => {
+		const { tmpdir } = await import("node:os");
+		const { mkdtemp } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const { DatabaseSync } = await import("node:sqlite");
+		const dir = await mkdtemp(join(tmpdir(), "sqlite-helpers-"));
+		const dbPath = join(dir, "x.db");
+		new DatabaseSync(dbPath).close();
+
+		let attempts = 0;
+		const value = await withSqliteDb(
+			dbPath,
+			() => {
+				attempts++;
+				if (attempts < 2) {
+					throw new Error("SQLITE_BUSY: database is locked");
+				}
+				return "ok";
+			},
+			{ baseDelayMs: 0 },
+		);
+		expect(value).toBe("ok");
+		expect(attempts).toBe(2);
+	});
+
+	it("does not retry non-locked errors", async () => {
+		const { tmpdir } = await import("node:os");
+		const { mkdtemp } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const { DatabaseSync } = await import("node:sqlite");
+		const dir = await mkdtemp(join(tmpdir(), "sqlite-helpers-"));
+		const dbPath = join(dir, "x.db");
+		new DatabaseSync(dbPath).close();
+
+		let attempts = 0;
+		await expect(
+			withSqliteDb(
+				dbPath,
+				() => {
+					attempts++;
+					throw new Error("SQLITE_CORRUPT: database disk image is malformed");
+				},
+				{ baseDelayMs: 0 },
+			),
+		).rejects.toThrow(/SQLITE_CORRUPT/);
+		expect(attempts).toBe(1);
+	});
+
+	it("gives up after maxAttempts and throws the last locked error", async () => {
+		const { tmpdir } = await import("node:os");
+		const { mkdtemp } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const { DatabaseSync } = await import("node:sqlite");
+		const dir = await mkdtemp(join(tmpdir(), "sqlite-helpers-"));
+		const dbPath = join(dir, "x.db");
+		new DatabaseSync(dbPath).close();
+
+		let attempts = 0;
+		await expect(
+			withSqliteDb(
+				dbPath,
+				() => {
+					attempts++;
+					throw new Error("SQLITE_BUSY: database is locked");
+				},
+				{ maxAttempts: 3, baseDelayMs: 0 },
+			),
+		).rejects.toThrow(/SQLITE_BUSY/);
+		expect(attempts).toBe(3);
+	});
 });

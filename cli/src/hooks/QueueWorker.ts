@@ -21,6 +21,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
+import { conversationKey, readExclusions } from "../core/CommitSelectionStore.js";
 import { applyOverlaysToSessions } from "../core/ConversationOverlayStore.js";
 import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
 import { discoverCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
@@ -955,7 +956,11 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		return;
 	}
 
-	// Step 3+4: Load sessions and read transcripts with time cutoff for queue-driven attribution
+	// Step 3+4: Load sessions and read transcripts with time cutoff for queue-driven attribution.
+	// Excluded conversations are filtered inside `loadSessionTranscripts` BEFORE any cursor
+	// advance — keep the plans/notes exclusion read here, but no `sessionTranscripts.filter`
+	// step is needed.
+	const exclusions = await readExclusions(cwd);
 	const { sessionTranscripts, totalEntries, humanEntries } = await loadSessionTranscripts(cwd, config, op.createdAt);
 
 	// Step 5: Get git diff and stats (moved before guard to enable diff-only summaries)
@@ -997,11 +1002,13 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	// Step 6b: Assemble the three structured prompt blocks (plans / notes /
 	// linear-issues). Pure registry-driven: no transcript re-scan. User's
 	// Ignore on the panel takes effect immediately on the next commit.
-	const [activePlanEntries, activeNoteEntries, activeLinearIssueEntries] = await Promise.all([
+	const [rawActivePlanEntries, rawActiveNoteEntries, activeLinearIssueEntries] = await Promise.all([
 		detectActivePlansForBranch(cwd, branch),
 		detectActiveNotesForBranch(cwd, branch),
 		getLinearIssueEntriesForBranch(cwd, branch),
 	]);
+	const activePlanEntries = rawActivePlanEntries.filter((p) => !exclusions.plans.has(p.slug));
+	const activeNoteEntries = rawActiveNoteEntries.filter((n) => !exclusions.notes.has(n.id));
 	const plansBlock = await formatPlansBlock(activePlanEntries);
 	const notesBlock = await formatNotesBlock(activeNoteEntries);
 	const linearIssueRefsForPrompt: LinearIssueRef[] = [];
@@ -1085,13 +1092,21 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	}
 	log.info("API summary generated (%s)", formatElapsed(stepStart));
 
-	// Step 8a: Read uncommitted plan slugs from plans.json registry
+	// Step 8a: Read uncommitted plan slugs from plans.json registry.
+	// Apply per-item exclusions BEFORE associate* — these helpers have side effects
+	// (savePlansRegistry archive entry + storePlans to the orphan branch), so a
+	// post-filter on `planAssociation.refs` would still leave the excluded plan
+	// archived on disk. The prompt-block filter at Step 6b only governs LLM input;
+	// the archive path is a separate registry scan and must be filtered here.
 	const planSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
+	for (const excludedSlug of exclusions.plans) planSlugs.delete(excludedSlug);
 	const planAssociation = await associatePlansWithCommit(planSlugs, commitInfo.hash, cwd, branch);
 	const planRefs = planAssociation.refs;
 
-	// Step 8a2: Read uncommitted note IDs from plans.json registry
+	// Step 8a2: Read uncommitted note IDs from plans.json registry.
+	// Same archive-side exclusion as Step 8a — see comment above.
 	const noteIds = await detectUncommittedNoteIds(cwd, branch);
+	for (const excludedId of exclusions.notes) noteIds.delete(excludedId);
 	const noteRefs = await associateNotesWithCommit(noteIds, commitInfo.hash, cwd, branch);
 
 	// Step 8a3: Read uncommitted Linear issue ticketIds from plans.json registry
@@ -1549,8 +1564,11 @@ async function handleAmendPipeline(
 		log.info("No old summary found for %s — will create fresh summary for amended commit", oldHash.substring(0, 8));
 	}
 
-	// Load sessions and read transcripts with time cutoff.
+	// Load sessions and read transcripts with time cutoff. Excluded conversations are
+	// filtered inside `loadSessionTranscripts` BEFORE any cursor advance — keep the
+	// plans/notes exclusion read here, but no `sessionTranscripts.filter` step is needed.
 	const amendConfig = await loadConfig();
+	const amendExclusions = await readExclusions(cwd);
 	const { sessionTranscripts, totalEntries, humanEntries } = await loadSessionTranscripts(
 		cwd,
 		amendConfig,
@@ -1634,11 +1652,13 @@ async function handleAmendPipeline(
 	// Same registry-driven prompt assembly as executePipeline (see Stage 2 wiring).
 	/* v8 ignore start -- amend-pipeline prompt-block assembly mirrors executePipeline's Stage 2 path. The amend path is exercised via PostCommitHook.helpers tests but not the prompt-block content specifically; the helpers and shapes are covered by their own dedicated tests. */
 	const branchForBlocks = await getCurrentBranch(cwd);
-	const [amendPlanEntries, amendNoteEntries, amendLinearEntries] = await Promise.all([
+	const [rawAmendPlanEntries, rawAmendNoteEntries, amendLinearEntries] = await Promise.all([
 		detectActivePlansForBranch(cwd, branchForBlocks),
 		detectActiveNotesForBranch(cwd, branchForBlocks),
 		getLinearIssueEntriesForBranch(cwd, branchForBlocks),
 	]);
+	const amendPlanEntries = rawAmendPlanEntries.filter((p) => !amendExclusions.plans.has(p.slug));
+	const amendNoteEntries = rawAmendNoteEntries.filter((n) => !amendExclusions.notes.has(n.id));
 	const amendPlansBlock = await formatPlansBlock(amendPlanEntries);
 	const amendNotesBlock = await formatNotesBlock(amendNoteEntries);
 	const amendLinearRefs: LinearIssueRef[] = [];
@@ -1911,7 +1931,21 @@ async function loadSessionTranscripts(
 		log.info("No active sessions found — will infer topics from diff if available");
 	}
 
-	const raw = await readAllTranscripts(allSessions, cwd, beforeTimestamp);
+	// Drop sessions the user unchecked in the sidebar BEFORE reading transcripts.
+	// Reading advances per-transcript cursors via `saveCursor`, and the sidebar's
+	// active-conversations list uses `messageCount > 0` (unread = cursor → EOF)
+	// to decide whether to render a row — so any cursor advance silently removes
+	// the row on the next 60-second refresh. That regression made *unchecked*
+	// conversations disappear alongside the committed ones after every commit;
+	// excluding here keeps them visible with the unchecked box, as the per-item
+	// selection design spec requires ("excluded items stay visible so the user
+	// knows the item exists and can put it back in").
+	const conversationExclusions = (await readExclusions(cwd)).conversations;
+	const includedSessions = allSessions.filter(
+		(s) => !conversationExclusions.has(conversationKey(s.source ?? "claude", s.sessionId)),
+	);
+
+	const raw = await readAllTranscripts(includedSessions, cwd, beforeTimestamp);
 
 	// Apply per-session conversation-edit overlays (panel-authored deletes/edits
 	// from ConversationDetailsPanel) BEFORE the values flow into either the

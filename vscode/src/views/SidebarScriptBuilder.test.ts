@@ -1561,4 +1561,114 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("'conversations-warning'");
 		});
 	});
+
+	// ── Per-row selection checkboxes (conversations, plans, notes) ────────────
+	// Task 8: each conversation row, plan row, and note row renders a leading
+	// checkbox that posts a toggle message when changed. Tests assert on the
+	// generated JS/HTML strings because the wider test suite uses string-based
+	// assertions throughout (no jsdom execution).
+	describe("per-row selection checkboxes", () => {
+		it("renderConversationRow emits a jm-conv-check checkbox with data-source and data-session", () => {
+			const js = buildSidebarScript();
+			// The 'jm-conv-check' class must appear in the renderConversationRow
+			// function body.
+			const fnStart = js.indexOf("function renderConversationRow");
+			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
+			const fn =
+				fnEnd > fnStart
+					? js.slice(fnStart, fnEnd)
+					: js.slice(fnStart, fnStart + 3000);
+			expect(fn).toContain("'jm-conv-check'");
+			expect(fn).toContain("'data-source'");
+			expect(fn).toContain("'data-session'");
+			// The '.checked' assignment that drives the isSelected state.
+			expect(fn).toMatch(/\.checked\s*=\s*!!item\.isSelected/);
+		});
+
+		it("renderConversationRow guards the click listener against checkbox clicks", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderConversationRow");
+			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
+			const fn =
+				fnEnd > fnStart
+					? js.slice(fnStart, fnEnd)
+					: js.slice(fnStart, fnStart + 3000);
+			// The direct click listener must bail out when the click target
+			// is a checkbox, so clicking 'jm-conv-check' does not also open
+			// the conversation panel.
+			expect(fn).toMatch(/\[data-checkbox="1"\]/);
+		});
+
+		it("renderPlanRow emits a jm-plan-check checkbox with data-plan-id for plan rows", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderPlanRow");
+			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
+			const fn =
+				fnEnd > fnStart
+					? js.slice(fnStart, fnEnd)
+					: js.slice(fnStart, fnStart + 3000);
+			expect(fn).toContain("'jm-plan-check'");
+			expect(fn).toContain("'data-plan-id'");
+			// The plan slug is stored in item.id and carried into 'data-plan-id'.
+			expect(fn).toMatch(/data-plan-id.*item\.id/);
+		});
+
+		it("renderPlanRow emits a jm-note-check checkbox with data-note-id for note rows", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderPlanRow");
+			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
+			const fn =
+				fnEnd > fnStart
+					? js.slice(fnStart, fnEnd)
+					: js.slice(fnStart, fnStart + 3000);
+			expect(fn).toContain("'jm-note-check'");
+			expect(fn).toContain("'data-note-id'");
+			// The note id is stored in item.id and carried into 'data-note-id'.
+			expect(fn).toMatch(/data-note-id.*item\.id/);
+		});
+
+		it("renderPlanRow does not emit a checkbox for linearissue rows (not user-selectable)", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderPlanRow");
+			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
+			const fn =
+				fnEnd > fnStart
+					? js.slice(fnStart, fnEnd)
+					: js.slice(fnStart, fnStart + 3000);
+			// The checkbox is gated on '!isLinearIssue', so 'isLinearIssue' must
+			// appear in the function as the exclusion guard.
+			expect(fn).toMatch(/isLinearIssue/);
+		});
+
+		it("change listener posts branch:toggleConversationSelection for jm-conv-check", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("type: 'branch:toggleConversationSelection'");
+			expect(js).toContain("'jm-conv-check'");
+		});
+
+		it("change listener posts branch:togglePlanSelection for jm-plan-check", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("type: 'branch:togglePlanSelection'");
+			expect(js).toContain("'jm-plan-check'");
+		});
+
+		it("change listener posts branch:toggleNoteSelection for jm-note-check", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("type: 'branch:toggleNoteSelection'");
+			expect(js).toContain("'jm-note-check'");
+		});
+
+		it("change listener sends planId from data-plan-id and noteId from data-note-id", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("getAttribute('data-plan-id')");
+			expect(js).toContain("getAttribute('data-note-id')");
+		});
+
+		it("change listener sends source and sessionId from data-source and data-session", () => {
+			const js = buildSidebarScript();
+			// Conversation toggle reads data-source and data-session off the checkbox.
+			expect(js).toContain("getAttribute('data-source')");
+			expect(js).toContain("getAttribute('data-session')");
+		});
+	});
 });

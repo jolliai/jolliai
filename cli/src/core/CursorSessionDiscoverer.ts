@@ -166,7 +166,7 @@ export async function scanCursorSessions(projectDir: string): Promise<CursorScan
 			}
 		});
 
-		log.info("Discovered %d Cursor session(s) for %s", out.length, projectDir);
+		log.debug("Discovered %d Cursor session(s) for %s", out.length, projectDir);
 		return { sessions: out };
 	} catch (error: unknown) {
 		const scanError = classifyScanError(error);

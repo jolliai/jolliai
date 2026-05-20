@@ -199,7 +199,7 @@ export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCode
 			});
 		});
 
-		log.info("Discovered %d OpenCode session(s) for %s", sessions.length, projectDir);
+		log.debug("Discovered %d OpenCode session(s) for %s", sessions.length, projectDir);
 		return { sessions };
 	} catch (error: unknown) {
 		const scanError = classifyScanError(error);

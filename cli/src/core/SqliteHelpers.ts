@@ -30,14 +30,43 @@ export interface SqliteDbHandle {
  * The module is imported dynamically so the ExperimentalWarning only appears
  * when this helper is actually invoked — not when PostCommitHook merely
  * transitively imports this file.
+ *
+ * SQLITE_BUSY recovery: when the host application (OpenCode, Cursor, Copilot
+ * Chat) is mid-write at the moment the QueueWorker tries to read, the open or
+ * first query fails with `database is locked`. Those write transactions are
+ * millisecond-scale, so a short exponential retry (150ms × 2^attempt) clears
+ * the race the overwhelming majority of the time. Without this, a busy-lock at
+ * worker start time silently drops the entire source's sessions from the
+ * commit's attribution — including any conversation the user just checked in
+ * the sidebar, which then never gets a cursor advance and stays visible
+ * forever. Only `locked` retries; other classified errors (corrupt, permission,
+ * schema) are persistent and rethrown immediately.
  */
-export async function withSqliteDb<T>(dbPath: string, fn: (db: SqliteDbHandle) => T): Promise<T> {
+export interface WithSqliteDbOptions {
+	readonly maxAttempts?: number;
+	readonly baseDelayMs?: number;
+}
+
+export async function withSqliteDb<T>(
+	dbPath: string,
+	fn: (db: SqliteDbHandle) => T,
+	opts: WithSqliteDbOptions = {},
+): Promise<T> {
+	const maxAttempts = opts.maxAttempts ?? 3;
+	const baseDelayMs = opts.baseDelayMs ?? 150;
 	const { DatabaseSync } = await import("node:sqlite");
-	const db = new DatabaseSync(dbPath, { readOnly: true });
-	try {
-		return fn(db as unknown as SqliteDbHandle);
-	} finally {
-		db.close();
+	for (let attempt = 1; ; attempt++) {
+		let db: InstanceType<typeof DatabaseSync> | undefined;
+		try {
+			db = new DatabaseSync(dbPath, { readOnly: true });
+			return fn(db as unknown as SqliteDbHandle);
+		} catch (err) {
+			const kind = classifyScanError(err)?.kind;
+			if (kind !== "locked" || attempt >= maxAttempts) throw err;
+			await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)));
+		} finally {
+			db?.close();
+		}
 	}
 }
 
