@@ -713,6 +713,63 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
+	 * Pre-write guard for handlers that persist to the orphan branch.
+	 *
+	 * The panel is keyed by `commitHash` in the static `commitPanels` map, so a
+	 * panel opened against commit X stays open after amend / squash / rebase
+	 * rewrites X into Y. Without this guard, any subsequent write from the
+	 * still-open panel (Push to Jolli, Generate E2E, edit memory / recap /
+	 * scenario) silently overwrites the orphaned commit's summary on the orphan
+	 * branch — most visibly losing `jolliDocId` / `jolliDocUrl` for the user
+	 * because the new HEAD's summary was hoisted from the pre-push old summary.
+	 *
+	 * We detect this via the index: every rewrite by jollimemory's own queue
+	 * sets `parentCommitHash` on the old entry pointing at the new root. An
+	 * entry with `parentCommitHash != null` therefore means "this commit has
+	 * been folded into another" — block the write, surface where to go (the
+	 * live root reached by walking the parent chain), and dispose the panel so
+	 * the stale tab can't be reused.
+	 *
+	 * Returns `true` when the operation may proceed (commit is still a root,
+	 * or absent from the index entirely — legacy / external commits / freshly
+	 * created entries the worker has not yet indexed). Returns `false` after
+	 * surfacing the warning and disposing; callers must short-circuit.
+	 */
+	private async ensureCommitNotRewritten(operation: string): Promise<boolean> {
+		if (!this.currentSummary) return true;
+		const hash = this.currentSummary.commitHash;
+		// Route through the Bridge so the read picks up the extension's
+		// DualWriteStorage / FolderStorage instance instead of the
+		// `resolveStorage()` fallback to a fresh OrphanBranchStorage. In
+		// folder-mode the index lives in the folder, not the orphan branch —
+		// missing this would let the guard miss real rewrites (or fire on
+		// stale orphan-branch data) under that storage mode.
+		const entryMap = await this.bridge.getSummaryIndexEntryMap();
+		const entry = entryMap.get(hash);
+
+		// Not in index (legacy / external / pre-index race) or still a root → allow.
+		if (!entry || entry.parentCommitHash == null) return true;
+
+		// Walk up the parentCommitHash chain to find the live root. The cycle
+		// guard is defensive — index links form a DAG by construction, but a
+		// corrupted file shouldn't lock the UI in an infinite loop.
+		let rootHash = entry.parentCommitHash;
+		const visited = new Set<string>([hash]);
+		while (!visited.has(rootHash)) {
+			visited.add(rootHash);
+			const parent = entryMap.get(rootHash);
+			if (!parent || parent.parentCommitHash == null) break;
+			rootHash = parent.parentCommitHash;
+		}
+
+		void vscode.window.showWarningMessage(
+			`Cannot ${operation}: commit ${hash.substring(0, 8)} was rewritten into ${rootHash.substring(0, 8)}. Open that commit's summary instead.`,
+		);
+		this.panel.dispose();
+		return false;
+	}
+
+	/**
 	 * Opens the Commit Memory panel for the given summary.
 	 *
 	 * Memory source (single slot): the existing memory panel — if any — is
@@ -1074,6 +1131,12 @@ export class SummaryWebviewPanel {
 		if (this.pushInProgress) {
 			return;
 		}
+		// Check BEFORE setting pushInProgress so that a stale-commit early exit
+		// doesn't leave the flag stuck (the panel is about to be disposed anyway,
+		// but defensive against future code paths that survive the guard).
+		if (!(await this.ensureCommitNotRewritten("push to Jolli"))) {
+			return;
+		}
 		this.pushInProgress = true;
 
 		try {
@@ -1391,6 +1454,9 @@ export class SummaryWebviewPanel {
 		if (!summary) {
 			return;
 		}
+		if (!(await this.ensureCommitNotRewritten("edit memory"))) {
+			return;
+		}
 
 		const result = updateTopicInTree(summary, topicIndex, updates);
 		if (!result) {
@@ -1421,6 +1487,9 @@ export class SummaryWebviewPanel {
 	private async handleEditRecap(recap: string): Promise<void> {
 		const summary = this.currentSummary;
 		if (!summary) {
+			return;
+		}
+		if (!(await this.ensureCommitNotRewritten("edit recap"))) {
 			return;
 		}
 		const trimmed = recap.trim();
@@ -1454,6 +1523,9 @@ export class SummaryWebviewPanel {
 	private async handleGenerateRecap(): Promise<void> {
 		const summary = this.currentSummary;
 		if (!summary) {
+			return;
+		}
+		if (!(await this.ensureCommitNotRewritten("generate recap"))) {
 			return;
 		}
 
@@ -1499,6 +1571,11 @@ export class SummaryWebviewPanel {
 		if (!summary) {
 			return;
 		}
+		// Check BEFORE the confirm dialog so the user isn't asked to confirm a
+		// destructive action that won't actually take effect on this commit.
+		if (!(await this.ensureCommitNotRewritten("delete memory"))) {
+			return;
+		}
 
 		const choice = await vscode.window.showWarningMessage(
 			title ? "Delete memory?" : "Delete this memory?",
@@ -1528,6 +1605,9 @@ export class SummaryWebviewPanel {
 	private async handleGenerateE2eTest(): Promise<void> {
 		const summary = this.currentSummary;
 		if (!summary) {
+			return;
+		}
+		if (!(await this.ensureCommitNotRewritten("generate E2E test guide"))) {
 			return;
 		}
 
@@ -1594,6 +1674,9 @@ export class SummaryWebviewPanel {
 		if (!summary) {
 			return;
 		}
+		if (!(await this.ensureCommitNotRewritten("edit E2E test guide"))) {
+			return;
+		}
 
 		const updatedSummary: CommitSummary = {
 			...summary,
@@ -1625,6 +1708,9 @@ export class SummaryWebviewPanel {
 				"editE2eScenario: index out of range",
 				index,
 			);
+			return;
+		}
+		if (!(await this.ensureCommitNotRewritten("edit E2E scenario"))) {
 			return;
 		}
 
@@ -1688,6 +1774,10 @@ export class SummaryWebviewPanel {
 			);
 			return;
 		}
+		// Check BEFORE the confirm dialog (same rationale as handleDeleteTopic).
+		if (!(await this.ensureCommitNotRewritten("delete E2E scenario"))) {
+			return;
+		}
 
 		const scenarioTitle = title ?? summary.e2eTestGuide[index].title;
 		const choice = await vscode.window.showWarningMessage(
@@ -1715,6 +1805,10 @@ export class SummaryWebviewPanel {
 	private async handleDeleteE2eTest(): Promise<void> {
 		const summary = this.currentSummary;
 		if (!summary) {
+			return;
+		}
+		// Check BEFORE the confirm dialog (same rationale as handleDeleteTopic).
+		if (!(await this.ensureCommitNotRewritten("delete E2E test guide"))) {
 			return;
 		}
 
@@ -1759,6 +1853,15 @@ export class SummaryWebviewPanel {
 	}
 
 	private async handleSavePlan(slug: string, content: string): Promise<void> {
+		// Block the plan-write BEFORE it lands: although plan files are global
+		// (one copy per slug, not per commit), this handler's side effect is
+		// syncPlanTitle which writes back to the panel's stale summary. Letting
+		// the plan write proceed alone would persist user intent but the title
+		// sync would silently apply to an orphaned commit's summary, so we
+		// treat the whole handler as a write against the stale commit.
+		if (!(await this.ensureCommitNotRewritten("save plan"))) {
+			return;
+		}
 		await this.bridge.storePlans([{ slug, content }], `Edit plan ${slug}`);
 		await this.syncPlanTitle(slug, content);
 
@@ -1807,6 +1910,10 @@ export class SummaryWebviewPanel {
 		if (!summary?.plans) {
 			return;
 		}
+		// Check BEFORE the confirm dialog (same rationale as handleDeleteTopic).
+		if (!(await this.ensureCommitNotRewritten("remove plan"))) {
+			return;
+		}
 
 		const choice = await vscode.window.showWarningMessage(
 			`Remove plan "${title}" from this commit?`,
@@ -1851,6 +1958,11 @@ export class SummaryWebviewPanel {
 	private async handleAddPlan(): Promise<void> {
 		const summary = this.currentSummary;
 		if (!summary) {
+			return;
+		}
+		// Check BEFORE the QuickPick so the user isn't prompted to pick a plan
+		// that would be associated with an orphaned commit.
+		if (!(await this.ensureCommitNotRewritten("add plan"))) {
 			return;
 		}
 
@@ -1898,6 +2010,11 @@ export class SummaryWebviewPanel {
 	private async handleAddMarkdownNote(): Promise<void> {
 		const summary = this.currentSummary;
 		if (!summary) {
+			return;
+		}
+		// Check BEFORE the file picker so the user isn't asked to choose a note
+		// that would be archived against an orphaned commit.
+		if (!(await this.ensureCommitNotRewritten("add markdown note"))) {
 			return;
 		}
 
@@ -1951,6 +2068,9 @@ export class SummaryWebviewPanel {
 		}
 		if (!content.trim()) {
 			throw new Error("Snippet content is required");
+		}
+		if (!(await this.ensureCommitNotRewritten("save snippet"))) {
+			return;
 		}
 
 		const noteInfo = await saveNote(
@@ -2022,6 +2142,11 @@ export class SummaryWebviewPanel {
 		content: string,
 		format: string,
 	): Promise<void> {
+		// Same rationale as handleSavePlan: the note body is global, but the
+		// title/content sync writes back to the panel's stale summary.
+		if (!(await this.ensureCommitNotRewritten("save note"))) {
+			return;
+		}
 		await this.bridge.storeNotes([{ id, content }], `Edit note ${id}`);
 
 		// Sync title and (for snippets) inline content in the summary
@@ -2057,6 +2182,10 @@ export class SummaryWebviewPanel {
 	private async handleRemoveNote(id: string, title: string): Promise<void> {
 		const summary = this.currentSummary;
 		if (!summary?.notes) {
+			return;
+		}
+		// Check BEFORE the confirm dialog (same rationale as handleDeleteTopic).
+		if (!(await this.ensureCommitNotRewritten("remove note"))) {
 			return;
 		}
 
@@ -2175,6 +2304,10 @@ export class SummaryWebviewPanel {
 		if (!summary?.linearIssues) {
 			return;
 		}
+		// Check BEFORE the confirm dialog (same rationale as handleDeleteTopic).
+		if (!(await this.ensureCommitNotRewritten("remove Linear issue"))) {
+			return;
+		}
 
 		const choice = await vscode.window.showWarningMessage(
 			`Remove Linear issue "${ticketId}" from this commit?`,
@@ -2213,6 +2346,10 @@ export class SummaryWebviewPanel {
 
 	/** Translates a plan from its current language to English via LLM. */
 	private async handleTranslatePlan(slug: string): Promise<void> {
+		// Same rationale as handleSavePlan: title sync goes to the stale summary.
+		if (!(await this.ensureCommitNotRewritten("translate plan"))) {
+			return;
+		}
 		const content = await readPlanFromBranch(slug, this.workspaceRoot);
 		if (content === null) {
 			vscode.window.showErrorMessage(
@@ -2265,6 +2402,10 @@ export class SummaryWebviewPanel {
 	private async handleTranslateNote(id: string): Promise<void> {
 		const noteRef = this.currentSummary?.notes?.find((n) => n.id === id);
 		if (!noteRef) {
+			return;
+		}
+		// Same rationale as handleSavePlan: title sync goes to the stale summary.
+		if (!(await this.ensureCommitNotRewritten("translate note"))) {
 			return;
 		}
 		const content =
