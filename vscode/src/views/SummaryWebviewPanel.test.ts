@@ -7824,7 +7824,15 @@ describe("SummaryWebviewPanel", () => {
 			await SummaryWebviewPanel.show(
 				makeSummary({
 					commitHash: "abc123",
-					plans: [{ slug: "p", title: "P" }],
+					plans: [
+						{
+							slug: "p",
+							title: "P",
+							editCount: 0,
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+						},
+					],
 				}),
 				extensionUri,
 				workspaceRoot,
@@ -7858,7 +7866,15 @@ describe("SummaryWebviewPanel", () => {
 			await SummaryWebviewPanel.show(
 				makeSummary({
 					commitHash: "abc123",
-					notes: [{ id: "n", title: "N", format: "snippet" }],
+					notes: [
+						{
+							id: "n",
+							title: "N",
+							format: "snippet",
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+						},
+					],
 				}),
 				extensionUri,
 				workspaceRoot,
@@ -7894,7 +7910,8 @@ describe("SummaryWebviewPanel", () => {
 							ticketId: "JOLLI-1",
 							title: "T",
 							url: "https://linear.app/x",
-							capturedAt: "2026-01-01T00:00:00Z",
+							referencedAt: "2026-01-01T00:00:00Z",
+							sourceToolName: "linear:get-issue",
 						},
 					],
 				}),
@@ -8076,7 +8093,16 @@ describe("SummaryWebviewPanel", () => {
 			await SummaryWebviewPanel.show(
 				makeSummary({
 					commitHash: "abc123",
-					notes: [{ id: "n", title: "N", format: "snippet", content: "中文" }],
+					notes: [
+						{
+							id: "n",
+							title: "N",
+							format: "snippet",
+							content: "中文",
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+						},
+					],
 				}),
 				extensionUri,
 				workspaceRoot,
@@ -8111,6 +8137,162 @@ describe("SummaryWebviewPanel", () => {
 			await flushPromises();
 
 			expect(spy).toHaveBeenCalled();
+		});
+
+		// ── Race-window: amend lands BETWEEN entry guard and write ───────────
+		// Entry guard passes (commit is still root at click time) but the
+		// commit gets rewritten during the long-async step (LLM call /
+		// QuickPick / confirm modal). The second guard must catch this and
+		// block the write. Verifying by flipping the index entry map between
+		// the first and second `getSummaryIndexEntryMap` calls.
+
+		/** Returns a `getSummaryIndexEntryMap` mock that resolves to `firstMap`
+		 *  on the first call and `restMap` on every subsequent call — simulates
+		 *  an amend landing between entry guard and pre-write re-check. */
+		function makeRacingEntryMapMock(
+			firstMap: ReadonlyMap<
+				string,
+				{ commitHash: string; parentCommitHash: string | null }
+			>,
+			restMap: ReadonlyMap<
+				string,
+				{ commitHash: string; parentCommitHash: string | null }
+			>,
+		) {
+			let calls = 0;
+			return vi.fn(() => {
+				calls += 1;
+				return Promise.resolve(calls === 1 ? firstMap : restMap);
+			});
+		}
+
+		it("race-window: blocks generate E2E test guide if amend lands during the LLM call", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			mockGenerateE2eTest.mockResolvedValue([
+				{ title: "Scenario", steps: [], expectedResults: [] },
+			]);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "generateE2eTest" });
+			await flushPromises();
+
+			// LLM call DID happen (entry guard let it through); the result was
+			// discarded by the pre-write guard.
+			expect(mockGenerateE2eTest).toHaveBeenCalled();
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("rewritten into rootnew0"),
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("race-window: blocks delete memory if amend lands while confirm modal is open", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			// User confirms the deletion — modal returns "Delete".
+			showWarningMessage.mockResolvedValueOnce("Delete");
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "deleteTopic", topicIndex: 0 });
+			await flushPromises();
+
+			// Confirm modal WAS shown (entry guard let it through); the
+			// post-confirm guard blocked the storeSummary write.
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/^Delete /),
+				expect.any(Object),
+				"Delete",
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("race-window: blocks add plan if amend lands while QuickPick is open", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			mockListAvailablePlans.mockReturnValue([{ slug: "p", title: "P" }]);
+			// User picks a plan from the QuickPick.
+			showQuickPick.mockResolvedValueOnce({
+				label: "P",
+				description: "p.md",
+				slug: "p",
+			});
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "addPlan" });
+			await flushPromises();
+
+			// QuickPick DID open (entry guard let it through); the post-pick
+			// guard blocked both the archive and storeSummary.
+			expect(showQuickPick).toHaveBeenCalled();
+			expect(mockArchivePlanForCommit).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("race-window: blocks translate plan if amend lands during the LLM call", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			mockReadPlanFromBranch.mockResolvedValue("# 中文标题\n\nbody");
+			mockTranslateToEnglish.mockResolvedValue("# English Title\n\nbody");
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					plans: [
+						{
+							slug: "p",
+							title: "中文标题",
+							editCount: 0,
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "translatePlan", slug: "p" });
+			await flushPromises();
+
+			// LLM translate DID run (entry guard let it through); the post-LLM
+			// guard blocked storePlans + syncPlanTitle (storeSummary).
+			expect(mockTranslateToEnglish).toHaveBeenCalled();
+			expect(mockStorePlans).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 	});
 
