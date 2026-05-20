@@ -1235,6 +1235,64 @@ export function buildCss(): string {
     display: none !important;
   }
 
+  /* Stale-readonly mode.
+     Triggered when the panel's commit has been rewritten by amend / squash /
+     rebase during the panel's lifetime (SummaryWebviewPanel sets it from
+     ensureCommitNotRewritten). Reuses the data-foreign-safe whitelist so
+     both readonly modes share a single set of "always allowed" controls
+     (Copy / Save Markdown / Toggle / copy-hash / the stale banner's
+     Open-new-commit action button). The destructive-message guards in
+     SummaryWebviewPanel handlers already short-circuit the writes; this
+     layer removes the affordance so the user has no clickable trap.
+
+     Unlike foreign-readonly, this mode also renders a persistent banner
+     (.stale-banner) at the top of the page — the rewrite is a state
+     change during the panel's lifetime, so the user needs in-panel
+     context for why their buttons just disappeared. */
+  .page.stale-readonly button:not([data-foreign-safe]) {
+    display: none !important;
+  }
+
+  .stale-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 0 0 16px 0;
+    padding: 12px 16px;
+    background: var(--vscode-inputValidation-warningBackground, #5a4a1a);
+    border: 1px solid var(--vscode-inputValidation-warningBorder, #cca700);
+    border-radius: 6px;
+    color: var(--vscode-foreground);
+  }
+  .stale-banner-icon {
+    font-size: 18px;
+    line-height: 1;
+  }
+  .stale-banner-text {
+    flex: 1;
+    line-height: 1.5;
+  }
+  .stale-banner-hash {
+    background: var(--vscode-textCodeBlock-background, rgba(0, 0, 0, 0.2));
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.92em;
+  }
+  .stale-banner-action {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: none;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .stale-banner-action:hover {
+    background: var(--vscode-button-hoverBackground);
+  }
+
 ${buildPrSectionCss()}
 `;
 }
