@@ -17,7 +17,7 @@ import {
 	validateNavigationPaths,
 } from "../site/ContentPlanner.js";
 import type { RootApiSpec, RootInjectionInput } from "../site/MetaGenerator.js";
-import { needsInstall, runNpmInstall, runServe } from "../site/NpmRunner.js";
+import { needsInstall, runNpmInstall, runNpmStart } from "../site/NpmRunner.js";
 import { buildPipeline } from "../site/openapi/OpenApiPipeline.js";
 import { deriveSpecName } from "../site/openapi/SpecName.js";
 import { runPagefind } from "../site/PagefindRunner.js";
@@ -397,6 +397,7 @@ async function buildAndIndex(
 	buildDir: string,
 	v: boolean,
 	renderer: SiteRenderer,
+	staticExport = true,
 ): Promise<{ success: boolean; pagesBuilt?: number }> {
 	console.log("  Building site…");
 	const buildResult = await renderer.runBuild(buildDir);
@@ -414,7 +415,11 @@ async function buildAndIndex(
 		console.log("  ✓ Built successfully");
 	}
 
-	const pagefindResult = await runPagefind(buildDir);
+	// Pagefind indexes static HTML. For static export it indexes `out/`;
+	// for production server mode it indexes `.next/server/app/` (pre-rendered).
+	const pagefindSite = staticExport ? "out" : ".next/server/app";
+	const pagefindOutput = staticExport ? "out/_pagefind" : "public/_pagefind";
+	const pagefindResult = runPagefind(buildDir, pagefindSite, pagefindOutput);
 	if (!pagefindResult.success) {
 		console.error(v ? pagefindResult.output : "  Error: Search indexing failed");
 		process.exitCode = 1;
@@ -456,7 +461,7 @@ export function registerBuildCommand(program: Command): void {
 export function registerStartCommand(program: Command): void {
 	program
 		.command("start")
-		.description("Build a static site with search indexing, then serve it")
+		.description("Build and serve a production site")
 		.argument("[source-root]", "Path to the Content_Folder (default: current directory)")
 		.option("--migrate", "Re-detect framework config and regenerate site.json")
 		.option("--verbose", "Show detailed build output")
@@ -467,14 +472,18 @@ export function registerStartCommand(program: Command): void {
 			const contentDir = join(buildDir, "content");
 			const publicDir = join(buildDir, "public");
 
-			const result = await prepareContent(sourceRoot, buildDir, contentDir, publicDir, true, opts);
+			// Use non-static-export mode so `next start` can serve with
+			// proper RSC (React Server Components) support. Static export
+			// + `npx serve` breaks client-side hydration because the static
+			// server can't handle RSC flight data requests (?_rsc=1).
+			const result = await prepareContent(sourceRoot, buildDir, contentDir, publicDir, false, opts);
 			if (!result.success) return;
 
-			const buildResult = await buildAndIndex(buildDir, opts.verbose === true, result.renderer);
+			const buildResult = await buildAndIndex(buildDir, opts.verbose === true, result.renderer, false);
 			if (!buildResult.success) return;
 
 			console.log("");
-			const serveResult = await runServe(buildDir, opts.verbose === true);
+			const serveResult = await runNpmStart(buildDir, opts.verbose === true);
 			if (!serveResult.success) {
 				if (serveResult.output) console.error(serveResult.output);
 				process.exitCode = 1;

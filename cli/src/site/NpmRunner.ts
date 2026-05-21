@@ -93,9 +93,19 @@ export function runNpmDev(buildDir: string, verbose = false): Promise<ServerResu
 
 /**
  * Serves the static `out/` directory inside `buildDir` using `npx serve`.
+ * Used by `jolli build` output preview. Does NOT support RSC hydration.
  */
 export function runServe(buildDir: string, verbose = false): Promise<ServerResult> {
 	return runLongProcess("npx", ["serve", "out"], buildDir, verbose);
+}
+
+/**
+ * Runs `npm start` (next start) inside `buildDir` as a production server.
+ * Unlike `runServe`, this handles RSC flight data requests correctly so
+ * client-side hydration works.
+ */
+export function runNpmStart(buildDir: string, verbose = false): Promise<ServerResult> {
+	return runLongProcess("npm", ["start"], buildDir, verbose);
 }
 
 /**
