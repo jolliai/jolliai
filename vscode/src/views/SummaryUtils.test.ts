@@ -29,6 +29,7 @@ import {
 	collectSortedTopics,
 	escAttr,
 	escHtml,
+	formatActiveProviderLabel,
 	formatDate,
 	formatFullDate,
 	formatProviderLabel,
@@ -779,6 +780,57 @@ describe("SummaryUtils", () => {
 			// print "via undefined" or "via unknown" on every legacy summary.
 			expect(collectLlmSources(nodeWithSource(undefined))).toEqual([]);
 			expect(formatProviderLabel(nodeWithSource(undefined))).toBeUndefined();
+		});
+	});
+
+	describe("formatActiveProviderLabel — current-config attribution for previews", () => {
+		const origEnv = process.env.ANTHROPIC_API_KEY;
+		afterEach(() => {
+			if (origEnv === undefined) delete process.env.ANTHROPIC_API_KEY;
+			else process.env.ANTHROPIC_API_KEY = origEnv;
+		});
+
+		it("returns 'Jolli proxy' when aiProvider is jolli AND jolliApiKey is set", () => {
+			expect(
+				formatActiveProviderLabel({ aiProvider: "jolli", jolliApiKey: "jk" } as never),
+			).toBe("Jolli proxy");
+		});
+
+		it("returns undefined when aiProvider is jolli but jolliApiKey is missing", () => {
+			expect(formatActiveProviderLabel({ aiProvider: "jolli" } as never)).toBeUndefined();
+		});
+
+		it("returns 'Anthropic' when aiProvider is anthropic with config apiKey", () => {
+			expect(
+				formatActiveProviderLabel({ aiProvider: "anthropic", apiKey: "k" } as never),
+			).toBe("Anthropic");
+		});
+
+		it("returns 'Anthropic (env)' when aiProvider is anthropic with only env apiKey", () => {
+			delete process.env.ANTHROPIC_API_KEY;
+			process.env.ANTHROPIC_API_KEY = "envkey";
+			expect(formatActiveProviderLabel({ aiProvider: "anthropic" } as never)).toBe(
+				"Anthropic (env)",
+			);
+		});
+
+		it("returns undefined when aiProvider is anthropic but no apiKey anywhere", () => {
+			delete process.env.ANTHROPIC_API_KEY;
+			expect(formatActiveProviderLabel({ aiProvider: "anthropic" } as never)).toBeUndefined();
+		});
+
+		it("falls back via legacy precedence when aiProvider is unset", () => {
+			delete process.env.ANTHROPIC_API_KEY;
+			expect(formatActiveProviderLabel({ apiKey: "k" } as never)).toBe("Anthropic");
+			process.env.ANTHROPIC_API_KEY = "envkey";
+			expect(formatActiveProviderLabel({} as never)).toBe("Anthropic (env)");
+			delete process.env.ANTHROPIC_API_KEY;
+			expect(formatActiveProviderLabel({ jolliApiKey: "jk" } as never)).toBe("Jolli proxy");
+		});
+
+		it("returns undefined when nothing is configured", () => {
+			delete process.env.ANTHROPIC_API_KEY;
+			expect(formatActiveProviderLabel({} as never)).toBeUndefined();
 		});
 	});
 });

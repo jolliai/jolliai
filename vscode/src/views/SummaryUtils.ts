@@ -28,6 +28,7 @@ export {
 import { formatDate as coreFormatDate } from "../../../cli/src/core/SummaryFormat.js";
 import type {
 	CommitSummary,
+	LlmConfig,
 	LlmCredentialSource,
 } from "../../../cli/src/Types.js";
 import { sanitizeBranchSlug } from "../util/GitRemoteUtils.js";
@@ -86,6 +87,37 @@ export function formatProviderLabel(
 	if (sources.length === 0) return undefined;
 	if (sources.length === 1) return PROVIDER_LABELS[sources[0]];
 	return `mixed: ${sources.map((s) => PROVIDER_LABELS[s]).join(", ")}`;
+}
+
+/**
+ * Returns a footer-ready provider attribution string for the CURRENT LlmConfig
+ * — i.e. the provider that an LLM call started right now would use.
+ *
+ * Pairs with `formatProviderLabel(summary)` which reflects which provider
+ * historically generated an existing summary. Use this one when previewing
+ * what a NEW call is about to do (e.g. the Regenerate confirm dialog).
+ *
+ * Mirrors the same precedence as `resolveLlmCredentialSource` in
+ * cli/src/core/LlmClient.ts and returns `undefined` whenever that resolver
+ * would also fail — so callers omit "via …" instead of promising a provider
+ * that will throw at call time.
+ */
+export function formatActiveProviderLabel(
+	config: LlmConfig,
+): string | undefined {
+	if (config.aiProvider === "jolli") {
+		return config.jolliApiKey ? "Jolli proxy" : undefined;
+	}
+	if (config.aiProvider === "anthropic") {
+		if (config.apiKey) return "Anthropic";
+		if (process.env.ANTHROPIC_API_KEY) return "Anthropic (env)";
+		return undefined;
+	}
+	// Legacy precedence when aiProvider is unset: apiKey → $ANTHROPIC_API_KEY → jolliApiKey
+	if (config.apiKey) return "Anthropic";
+	if (process.env.ANTHROPIC_API_KEY) return "Anthropic (env)";
+	if (config.jolliApiKey) return "Jolli proxy";
+	return undefined;
 }
 
 // ─── Push contract: relativePath construction ───────────────────────────────
