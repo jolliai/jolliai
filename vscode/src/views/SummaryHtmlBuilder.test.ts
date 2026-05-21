@@ -122,6 +122,7 @@ import {
 	buildE2eTestSection,
 	buildHtml,
 	buildRecapSection,
+	buildTopicsSection,
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
 import type { TopicWithDate } from "./SummaryUtils.js";
@@ -1312,5 +1313,49 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).toContain(expectedClass);
 			}
 		});
+	});
+});
+
+describe("buildTopicsSection", () => {
+	it("wraps topics in a section element with id='topicsSection'", () => {
+		const summary = makeSummary({
+			topics: [makeTopic({ title: "Sample topic" })],
+		});
+		const html = buildTopicsSection(summary);
+		expect(html).toMatch(/<div class="section" id="topicsSection"/);
+	});
+
+	it("produces output that is byte-equal to the corresponding region inside buildHtml", () => {
+		const summary = makeSummary({
+			topics: [makeTopic({ title: "Sample topic" })],
+		});
+		const pageHtml = buildHtml(summary);
+		const sectionHtml = buildTopicsSection(summary);
+		expect(pageHtml).toContain(sectionHtml.trim());
+	});
+
+	it("renders the empty-state placeholder when topics is empty", () => {
+		const html = buildTopicsSection(makeSummary({ topics: [] }));
+		expect(html).toContain('id="topicsSection"');
+		expect(html).toContain("No topics available for this commit.");
+	});
+});
+
+describe("buildAllConversationsSection — Regenerate button", () => {
+	it("renders an enabled Regenerate button when transcripts exist", () => {
+		const summary = makeSummary();
+		const html = buildHtml(summary, {
+			transcriptHashSet: new Set([summary.commitHash]),
+		});
+		expect(html).toContain('id="regenerateSummaryBtn"');
+		expect(html).not.toMatch(/id="regenerateSummaryBtn"[^>]*disabled/);
+	});
+
+	it("renders exactly one Regenerate button even in the empty-transcript branch", () => {
+		const summary = makeSummary();
+		const html = buildHtml(summary); // no transcriptHashSet → empty branch
+		const matches = html.match(/id="regenerateSummaryBtn"/g) ?? [];
+		expect(matches.length).toBe(1);
+		expect(html).not.toMatch(/id="regenerateSummaryBtn"[^>]*disabled/);
 	});
 });

@@ -207,6 +207,51 @@ ${buildPrMessageScript()}
         regenBtn2.disabled = false;
       }
     }
+
+    // ── Regenerate summary status ──
+    if (msg.command === 'summaryRegenerating') {
+      var rBtn = document.getElementById('regenerateSummaryBtn');
+      if (rBtn) {
+        rBtn.classList.add('generating');
+        rBtn.disabled = true;
+        rBtn.innerHTML = '\\u21BB Regenerating\\u2026';
+      }
+      freezeSummarySections();
+      return;
+    }
+    if (msg.command === 'summaryRegenerated') {
+      // Success: replaceSection drops the old DOM (including dataset markers
+      // set by freezeSummarySections), so we do NOT call thawSummarySections.
+      if (msg.topicsHtml) replaceSection('topicsSection', msg.topicsHtml);
+      if (msg.recapHtml) replaceSection('recapSection', msg.recapHtml);
+      resetRegenerateButton();
+      // Re-attach handlers on the NEW DOM nodes inside topics + recap.
+      // NOTE: do NOT re-attach attachRegenerateSummaryHandler — the Regenerate
+      // button lives in the Conversations card, OUTSIDE topicsSection /
+      // recapSection, so replaceSection never touched it and its original
+      // listener is still bound. Re-attaching would add a duplicate listener
+      // each regenerate, making the Nth click post N messages.
+      attachEditRecapHandler();
+      attachGenerateRecapHandler();
+      var newTopicsRoot = document.getElementById('topicsSection');
+      if (newTopicsRoot) {
+        attachTopicHandlers(newTopicsRoot);
+        // attachTopicHandlers wires the edit/delete buttons inside .toggle,
+        // but NOT the toggle-header expand/collapse click — that's a
+        // separate handler set up once at page load. Re-attach it on the
+        // new headers so topics still expand. The function is idempotent
+        // (skips headers it has already wired via the _toggleAttached flag).
+        newTopicsRoot.querySelectorAll('.toggle-header').forEach(attachToggleHeader);
+      }
+      return;
+    }
+    if (msg.command === 'summaryRegenerateError') {
+      // Error / cancel: sections were NOT replaced — restore the original
+      // disabled state instead of leaving everything inert.
+      thawSummarySections();
+      resetRegenerateButton();
+      return;
+    }
   });
 
   // Toggle All: expand / collapse all topic toggles and timeline groups.
@@ -582,6 +627,89 @@ ${buildPrMessageScript()}
     });
   }
   attachGenerateRecapHandler();
+
+  // ── Regenerate-summary click handler + DOM helpers ─────────────────────
+  // Drives the end-to-end re-run from the Conversations card. The actual
+  // confirm dialog + LLM call lives on the extension host; this side only
+  // gates the click and renders progress state.
+  function attachRegenerateSummaryHandler() {
+    var btn = document.getElementById('regenerateSummaryBtn');
+    if (!btn) return;
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (btn.disabled) return;
+      // Block when user has unsaved edits in topics or recap — otherwise a
+      // 30-second LLM call would silently overwrite in-progress work.
+      if (document.querySelector('#topicsSection .toggle.editing, #recapSection.recap-editing')) {
+        alert('You have unsaved edits in topics or recap. Save or cancel them before regenerating.');
+        return;
+      }
+      // Block when another LLM action is already in flight.
+      if (document.querySelector('.generating')) {
+        alert('Another action is in progress. Please wait for it to finish.');
+        return;
+      }
+      vscode.postMessage({ command: 'regenerateSummary' });
+    });
+  }
+  attachRegenerateSummaryHandler();
+
+  // Disable every focusable control inside topics + recap during regenerate.
+  // Each touched control is tagged data-was-disabled so the error path can
+  // restore the pre-regenerate state without flipping legitimately-disabled
+  // buttons back on.
+  function freezeSummarySections() {
+    var sections = [document.getElementById('topicsSection'), document.getElementById('recapSection')];
+    sections.forEach(function(sec) {
+      if (!sec) return;
+      sec.classList.add('regenerating');
+      var ctrls = sec.querySelectorAll('button, textarea, input');
+      ctrls.forEach(function(c) {
+        if (c.disabled) {
+          c.dataset.wasDisabled = '1';
+        } else {
+          c.dataset.wasDisabled = '0';
+          c.disabled = true;
+        }
+      });
+    });
+  }
+
+  function thawSummarySections() {
+    var sections = [document.getElementById('topicsSection'), document.getElementById('recapSection')];
+    sections.forEach(function(sec) {
+      if (!sec) return;
+      sec.classList.remove('regenerating');
+      var ctrls = sec.querySelectorAll('button, textarea, input');
+      ctrls.forEach(function(c) {
+        if (c.dataset.wasDisabled === '0') c.disabled = false;
+        delete c.dataset.wasDisabled;
+      });
+    });
+  }
+
+  function replaceSection(id, html) {
+    var old = document.getElementById(id);
+    if (!old) return;
+    var wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    var nodes = Array.prototype.slice.call(wrap.childNodes).filter(function(n) { return n.nodeType === 1; });
+    if (nodes.length === 0) return;
+    // Recap section emits "<div>...</div><hr/>"; topics emits a single <div>.
+    // Drop the trailing <hr> that belongs to the OLD recap before splicing,
+    // so we don't end up with two separators stacked.
+    var sep = old.nextElementSibling;
+    if (sep && sep.tagName === 'HR' && id === 'recapSection') sep.remove();
+    old.replaceWith.apply(old, nodes);
+  }
+
+  function resetRegenerateButton() {
+    var rBtn = document.getElementById('regenerateSummaryBtn');
+    if (!rBtn) return;
+    rBtn.classList.remove('generating');
+    rBtn.disabled = false;
+    rBtn.innerHTML = '\\u21BB Regenerate';
+  }
 
   // Recap status messages — generation flow only. The 'recapUpdated' /
   // 'recapUpdateError' messages are handled in the top-level message

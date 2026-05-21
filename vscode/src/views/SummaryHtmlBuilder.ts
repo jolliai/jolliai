@@ -92,18 +92,11 @@ export function buildHtml(
 	if (opts.foreignRepoName) pageClasses.push("foreign-readonly");
 	if (opts.staleRewrittenInto) pageClasses.push("stale-readonly");
 	const pageClass = pageClasses.join(" ");
-	const { topics: allTopics, sourceNodes } = collectSortedTopics(summary);
+	const { sourceNodes } = collectSortedTopics(summary);
 	const stats = resolveDiffStats(summary);
 	const totalInsertions = stats.insertions;
 	const totalDeletions = stats.deletions;
 	const totalFiles = stats.filesChanged;
-
-	const topicsHtml =
-		allTopics.length === 0
-			? '<p class="empty">No topics available for this commit.</p>'
-			: allTopics.map((t, i) => renderTopic(t, i)).join("\n");
-
-	const topicsLabel = `${allTopics.length} topic${allTopics.length !== 1 ? "s" : ""} extracted from this commit`;
 
 	const csp = nonce
 		? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src data:;" />`
@@ -144,13 +137,7 @@ ${buildPrSectionHtml()}
 ${buildPlansAndNotesSection(summary.plans, summary.notes, summary.linearIssues, planTranslateSet, noteTranslateSet)}
 ${buildE2eTestSection(summary)}
 ${buildSourceCommits(sourceNodes)}
-<div class="section">
-  <div class="section-header">
-    <div class="section-title" title="${topicsLabel}">&#x1F4DD; ${allTopics.length === 1 ? "Topic" : "Topics"} <span class="section-count">${allTopics.length}</span></div>
-    <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all topics" data-foreign-safe>Collapse All</button>
-  </div>
-  ${topicsHtml}
-</div>
+${buildTopicsSection(summary)}
 ${buildFooter(summary)}
 </div>
 <script${nonceAttr}>${buildScript()}</script>
@@ -352,6 +339,33 @@ export function buildRecapSection(recap: string | undefined): string {
   <div class="recap-body">${bodyHtml}</div>
 </div>
 <hr class="separator" />`;
+}
+
+// ─── Topics Section ──────────────────────────────────────────────────────────
+
+/**
+ * Renders the topic grid as a self-contained section.
+ *
+ * Exported so the regenerate-summary handler can rebuild this region in
+ * isolation after a successful re-run (the webview's replaceSection picks the
+ * node up by `id="topicsSection"`). The output is byte-equal to the topics
+ * region inside `buildHtml`, so embedding `${buildTopicsSection(summary)}`
+ * there is the canonical way to keep the two render paths in sync.
+ */
+export function buildTopicsSection(summary: CommitSummary): string {
+	const { topics: allTopics } = collectSortedTopics(summary);
+	const topicsHtml =
+		allTopics.length === 0
+			? '<p class="empty">No topics available for this commit.</p>'
+			: allTopics.map((t, i) => renderTopic(t, i)).join("\n");
+	const topicsLabel = `${allTopics.length} topic${allTopics.length !== 1 ? "s" : ""} extracted from this commit`;
+	return `<div class="section" id="topicsSection">
+  <div class="section-header">
+    <div class="section-title" title="${topicsLabel}">&#x1F4DD; ${allTopics.length === 1 ? "Topic" : "Topics"} <span class="section-count">${allTopics.length}</span></div>
+    <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all topics" data-foreign-safe>Collapse All</button>
+  </div>
+  ${topicsHtml}
+</div>`;
 }
 
 // ─── Plans & Notes Section ───────────────────────────────────────────────────
@@ -599,6 +613,9 @@ function buildAllConversationsSection(
   <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
     <div class="section-title">&#x1F4AC; All Conversations</div>
+    <span class="conversations-actions">
+      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>
+    </span>
   </div>
   <p class="empty">No conversation transcripts saved for this commit.</p>
 </div>`;
@@ -609,7 +626,10 @@ function buildAllConversationsSection(
   <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
     <div class="section-title">&#x1F4AC; All Conversations</div>
-    <button class="action-btn" id="openTranscriptsBtn">Manage</button>
+    <span class="conversations-actions">
+      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>
+      <button class="action-btn" id="openTranscriptsBtn">Manage</button>
+    </span>
   </div>
   <p class="conversations-description">Raw AI conversation transcripts captured during development.</p>
   <p class="conversations-stats" id="conversationsStats">
