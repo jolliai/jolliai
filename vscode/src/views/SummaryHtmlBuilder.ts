@@ -303,6 +303,14 @@ function buildHeader(
  * Paragraph splitting on `\n\n` is defensive: the LLM may emit one or several
  * paragraphs depending on how many topics it weaves in, and HTML collapses
  * whitespace by default so a textual blank line would otherwise disappear.
+ *
+ * CONTRACT (do not break): the returned HTML is shaped
+ *   `<div class="section recap-section" id="recapSection">…</div><hr class="separator"/>`
+ * — two top-level sibling elements. The webview's `replaceSection('recapSection', …)`
+ * in SummaryScriptBuilder.ts depends on this shape to strip the trailing <hr>
+ * before splicing in the regenerated recap (otherwise stacked or missing
+ * separators result). If you change the wrapping to a single self-contained
+ * <div> (or any other shape), update replaceSection in the same change.
  */
 export function buildRecapSection(recap: string | undefined): string {
 	const trimmed = recap?.trim();

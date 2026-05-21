@@ -100,11 +100,7 @@ import {
 	collectSortedTopics,
 	formatActiveProviderLabel,
 } from "./SummaryUtils.js";
-import {
-	loadRegenerateContext,
-	type RegenerateContext,
-} from "../../../cli/src/core/RegenerateContext.js";
-import { regenerateSummary } from "../../../cli/src/core/Regenerator.js";
+import type { RegenerateContext } from "../../../cli/src/core/RegenerateContext.js";
 import type { LlmConfig } from "../../../cli/src/Types.js";
 
 /** Memory field updates sent from the webview edit form. */
@@ -210,6 +206,40 @@ const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
 
 function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
 	return FOREIGN_SAFE_COMMANDS.has(command);
+}
+
+/**
+ * Read-only whitelist used by the regenerate-in-flight dispatch guard. While
+ * regenerateSummary is awaiting the LLM, any other write to the orphan
+ * branch (push, edit*, plan/note saves, generateRecap, generateE2eTest…)
+ * would race with the eventual `storeSummary(outcome.updated, true)` at the
+ * end of regenerate — whichever finished last would overwrite the other.
+ *
+ * Default-deny: only commands that don't touch the summary (read-only
+ * stats, navigation, clipboard) are allowed through. The webview-side
+ * `.regenerating-readonly` CSS already hides the affordances for everything
+ * else; this is the second-layer guard against any postMessage that slips
+ * past (e.g. from a queued event before the readonly mode took effect).
+ */
+const REGENERATE_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
+	"copyMarkdown",
+	"downloadMarkdown",
+	"checkPrStatus",
+	"openRewrittenCommit",
+	"loadTranscriptStats",
+	"loadAllTranscripts",
+	"loadPlanContent",
+	"loadNoteContent",
+	"previewPlan",
+	"previewNote",
+	"openLinearIssue",
+	"openLinearIssueMarkdown",
+	// regenerateSummary itself is denied while one is in flight; the
+	// handler's own `regenerateInProgress` guard short-circuits a re-entry.
+]);
+
+function isRegenerateSafeCommand(command: WebviewMessage["command"]): boolean {
+	return REGENERATE_SAFE_COMMANDS.has(command);
 }
 
 // Single source of truth for Create/Update PR body assembly. Branch-first
@@ -419,6 +449,21 @@ export class SummaryWebviewPanel {
 		if (this.foreignRepoName) {
 			if (!isForeignSafeCommand(message.command)) {
 				this.notifyForeignDenied(message.command);
+				return;
+			}
+		}
+		// Regenerate-in-flight guard. The webview's regenerating-readonly
+		// mode already hides the affordances for every command outside this
+		// allow-list; this is the second layer protecting against any
+		// postMessage that slipped past (queued / late / programmatic). A
+		// write while regenerate's LLM call is awaiting would be silently
+		// clobbered by the final `storeSummary(outcome.updated, true)` at
+		// the end of the regenerate path.
+		if (this.regenerateInProgress) {
+			if (!isRegenerateSafeCommand(message.command)) {
+				// Silent drop — the webview's regenerating-readonly chrome
+				// already hides the affordance; an in-flight late postMessage
+				// from a queued event isn't worth a user-visible notification.
 				return;
 			}
 		}
@@ -1712,6 +1757,26 @@ export class SummaryWebviewPanel {
 		const summary = this.currentSummary;
 		if (!summary) return;
 		if (this.regenerateInProgress) return;
+		// Reject if a Push to Jolli is already mid-flight. Push writes back
+		// jolliDocId / jolliDocUrl on completion (handlePush:1428); regenerate
+		// captures the summary snapshot NOW and writes back at the end of its
+		// LLM call. If push completes between the two writes, regenerate's
+		// final storeSummary clobbers the jolliDocId — the next push would
+		// then create a duplicate article instead of updating in place.
+		// (The reverse direction — push during regenerate — is already
+		// blocked by the regenerate-in-flight dispatchWebviewMessage guard.)
+		//
+		// INVARIANT: this panel-local check assumes pushes always originate
+		// from a webview panel (via handlePush) — the only producer of
+		// pushInProgress today. If JolliPushService is ever exposed to the
+		// CLI or a scheduled task, this check becomes blind to those callers;
+		// replace with a bridge-level write lock at that point.
+		if (this.pushInProgress) {
+			vscode.window.showInformationMessage(
+				"A push to Jolli is in progress. Wait for it to finish before regenerating.",
+			);
+			return;
+		}
 		// Set the flag SYNCHRONOUSLY (before any await) so a double-click can't
 		// race past the guard while the first invocation is suspended awaiting
 		// ensureCommitNotRewritten. The flag stays set across the confirm
@@ -1722,7 +1787,11 @@ export class SummaryWebviewPanel {
 
 			// loadRegenerateContext always resolves; zero-valued ctx for legacy
 			// summaries with no stored transcript, the confirm dialog adjusts copy.
-			const ctx = await loadRegenerateContext(summary, this.workspaceRoot);
+			// Route through the Bridge so folder-only Memory Bank users hit
+			// FolderStorage rather than the OrphanBranchStorage fallback in
+			// resolveStorage. The bare CLI helper does not know about the
+			// extension's active storage backend.
+			const ctx = await this.bridge.loadRegenerateContext(summary);
 
 			// Load config BEFORE the confirm dialog so the dialog can show the
 			// provider label the next call will actually use. Same config feeds
@@ -1752,12 +1821,23 @@ export class SummaryWebviewPanel {
 					cancellable: true,
 				},
 				async (_progress, token) => {
-					// AbortController wiring: if Summarizer.callLlm doesn't accept
-					// a signal, we still honor cancel by dropping the LLM result.
+					// AbortController wiring: Summarizer.callLlm / LlmClient don't
+					// accept an AbortSignal today, so user-cancel only drops the
+					// LLM result locally — the in-flight HTTP request keeps running
+					// to completion in the background and we pay for those tokens.
+					// TODO: when Summarizer.SummarizeParams gains a `signal?:
+					// AbortSignal` field and forwards it to the Anthropic SDK's
+					// `messages.create({ signal })` (and combines with the proxy
+					// fetch's existing timeout signal), thread `token` through
+					// `this.bridge.regenerateSummary(summary, config, signal)` so
+					// cancel actually aborts the request.
 					const cancelled = new Promise<"cancelled">((resolve) => {
 						token.onCancellationRequested(() => resolve("cancelled"));
 					});
-					const work = regenerateSummary(summary, this.workspaceRoot, config);
+					// Route through the Bridge so the read path (transcripts,
+					// archived plans/notes/linear) hits the active storage
+					// backend rather than the OrphanBranchStorage fallback.
+					const work = this.bridge.regenerateSummary(summary, config);
 					const outcome = await Promise.race([work, cancelled]);
 					if (outcome === "cancelled") {
 						this.panel.webview.postMessage({

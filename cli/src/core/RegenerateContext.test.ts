@@ -103,6 +103,24 @@ describe("loadRegenerateContext", () => {
 		expect(ctx.sources).toEqual(["Claude"]);
 	});
 
+	it("defaults missing session.source to 'claude' for sessionId dedup keys", async () => {
+		// Legacy / partial stored sessions may not carry .source. The
+		// dedup key uses `session.source ?? "claude"` so two sessions
+		// with the same sessionId but neither carrying source collapse
+		// to one session count.
+		vi.mocked(SummaryStore.readTranscriptsForCommits).mockResolvedValue(
+			singleHashMap(baseSummary.commitHash, {
+				sessions: [
+					{ sessionId: "dup", entries: [] },
+					{ sessionId: "dup", entries: [] },
+				],
+			}),
+		);
+
+		const ctx = await loadRegenerateContext(baseSummary, "/repo");
+		expect(ctx.sessionCount).toBe(1);
+	});
+
 	it("dedups sessionCount by source:sessionId when the same session appears in multiple commit transcripts", async () => {
 		// A single AI session can have its entries spliced across multiple
 		// commit transcripts (squash slicing, amend rewriting). The webview's

@@ -1,7 +1,10 @@
 import { createLogger } from "../Logger.js";
-import type { CommitSummary, LlmConfig, SummaryResult } from "../Types.js";
+import type { CommitSummary, LlmConfig } from "../Types.js";
 import { getDiffContent } from "./GitOps.js";
-import { generateSummary } from "./Summarizer.js";
+import { truncate } from "./LinearIssueExtractor.js";
+import { escapeForAttr, escapeForText } from "./PromptXmlEscape.js";
+import type { StorageProvider } from "./StorageProvider.js";
+import { generateSummary, type SummaryResult } from "./Summarizer.js";
 import {
 	normalizeToV4,
 	readLinearIssueFromBranch,
@@ -68,6 +71,7 @@ export async function regenerateSummary(
 	summary: CommitSummary,
 	cwd: string,
 	config: LlmConfig,
+	storage?: StorageProvider,
 ): Promise<RegenerateResult> {
 	log.info("Regenerating summary for %s", summary.commitHash.substring(0, 8));
 
@@ -76,9 +80,12 @@ export async function regenerateSummary(
 	const normalized = normalizeToV4(summary);
 
 	// Aggregate transcripts across the entire tree (see "Transcript aggregation"
-	// in the doc comment above).
+	// in the doc comment above). `storage` is threaded so folder-only Memory
+	// Bank users read from FolderStorage instead of the OrphanBranchStorage
+	// fallback in resolveStorage — without it the LLM would see an empty
+	// conversation on every regenerate in folder-only mode.
 	const treeHashes = collectAllTranscriptHashes(normalized);
-	const transcriptMap = await readTranscriptsForCommits(treeHashes, cwd);
+	const transcriptMap = await readTranscriptsForCommits(treeHashes, cwd, storage);
 	const sessions: SessionTranscript[] = [];
 	for (const stored of transcriptMap.values()) {
 		for (const s of stored.sessions) {
@@ -94,9 +101,9 @@ export async function regenerateSummary(
 	const diff = await getDiffContent(`${normalized.commitHash}~1`, normalized.commitHash, cwd);
 
 	const [linearIssues, plans, notes] = await Promise.all([
-		rebuildLinearBlock(normalized, cwd),
-		rebuildPlansBlock(normalized, cwd),
-		rebuildNotesBlock(normalized, cwd),
+		rebuildLinearBlock(normalized, cwd, storage),
+		rebuildPlansBlock(normalized, cwd, storage),
+		rebuildNotesBlock(normalized, cwd, storage),
 	]);
 
 	const totalEntries = sessions.reduce((sum, s) => sum + s.entries.length, 0);
@@ -155,67 +162,111 @@ export async function regenerateSummary(
 // All three helpers receive a NORMALIZED summary, so root.{plans,notes,
 // linearIssues} are already the authoritative tree-wide union.
 
-async function rebuildLinearBlock(summary: CommitSummary, cwd: string): Promise<string> {
+// Budgets — must stay aligned with the first-run formatters byte-for-byte.
+// See PlanPromptFormatter.ts:18-19, NotePromptFormatter.ts:18-19, and
+// LinearIssueExtractor.ts:57-58 for the source-of-truth defaults. Without
+// these caps a single pathologically large plan / note / linear issue could
+// blow out the SUMMARIZE prompt's token budget and inflate cost. Drifting
+// from first-run also makes summary-quality A/B comparison apples-to-oranges
+// because the LLM sees different input shapes on the two paths.
+const PLAN_MAX_CHARS = 20000;
+const PLAN_TOTAL_CHARS = 60000;
+const NOTE_MAX_CHARS = 4000;
+const NOTE_TOTAL_CHARS = 12000;
+const LINEAR_MAX_CHARS = 4000;
+const LINEAR_TOTAL_CHARS = 30000;
+
+async function rebuildLinearBlock(
+	summary: CommitSummary,
+	cwd: string,
+	storage: StorageProvider | undefined,
+): Promise<string> {
 	const refs = summary.linearIssues ?? [];
 	if (refs.length === 0) return "";
+	// Newest reference first; selection is greedy until LINEAR_TOTAL_CHARS,
+	// dropped refs silently omitted (user already saw the count in the
+	// confirm dialog; skipping the oldest is the safer of two over-budget
+	// outcomes vs. arbitrary mid-truncation).
+	// Defensive `?? ""` against legacy fixtures or v3 data missing the
+	// timestamp — the sort doesn't promise stable ordering for those, but
+	// it must not crash.
+	const sorted = [...refs].sort((a, b) => (b.referencedAt ?? "").localeCompare(a.referencedAt ?? ""));
+
 	const rendered: string[] = [];
-	for (const ref of refs) {
-		const md = await readLinearIssueFromBranch(ref.archivedKey, cwd);
+	let totalLen = 0;
+	for (const ref of sorted) {
+		const md = await readLinearIssueFromBranch(ref.archivedKey, cwd, storage);
 		if (md === null) continue;
-		rendered.push(
-			[
-				`<issue id="${escapeAttr(ref.ticketId)}">`,
-				`  <title>${escapeText(ref.title)}</title>`,
-				`  <url>${escapeText(ref.url)}</url>`,
-				"  <archived-markdown>",
-				escapeText(md),
-				"  </archived-markdown>",
-				"</issue>",
-			].join("\n"),
-		);
+		const body = truncate(md, LINEAR_MAX_CHARS);
+		const block = [
+			`<issue id="${escapeForAttr(ref.ticketId)}">`,
+			`  <title>${escapeForText(ref.title)}</title>`,
+			`  <url>${escapeForText(ref.url ?? "")}</url>`,
+			"  <archived-markdown>",
+			escapeForText(body),
+			"  </archived-markdown>",
+			"</issue>",
+		].join("\n");
+		if (totalLen + block.length > LINEAR_TOTAL_CHARS) break;
+		rendered.push(block);
+		totalLen += block.length;
 	}
 	if (rendered.length === 0) return "";
 	return `<linear-issues>\n${rendered.join("\n")}\n</linear-issues>`;
 }
 
-async function rebuildPlansBlock(summary: CommitSummary, cwd: string): Promise<string> {
+async function rebuildPlansBlock(
+	summary: CommitSummary,
+	cwd: string,
+	storage: StorageProvider | undefined,
+): Promise<string> {
 	const refs = summary.plans ?? [];
 	if (refs.length === 0) return "";
+	const sorted = [...refs].sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+
 	const rendered: string[] = [];
-	for (const ref of refs) {
-		const md = await readPlanFromBranch(ref.slug, cwd);
+	let totalLen = 0;
+	for (const ref of sorted) {
+		const md = await readPlanFromBranch(ref.slug, cwd, storage);
 		if (md === null) continue;
-		rendered.push(
-			[`<plan slug="${escapeAttr(ref.slug)}" title="${escapeAttr(ref.title)}">`, escapeText(md), "</plan>"].join(
-				"\n",
-			),
-		);
+		const body = truncate(md, PLAN_MAX_CHARS);
+		const block = [
+			`<plan slug="${escapeForAttr(ref.slug)}" title="${escapeForAttr(ref.title)}">`,
+			escapeForText(body),
+			"</plan>",
+		].join("\n");
+		if (totalLen + block.length > PLAN_TOTAL_CHARS) break;
+		rendered.push(block);
+		totalLen += block.length;
 	}
 	if (rendered.length === 0) return "";
 	return `<plans>\n${rendered.join("\n")}\n</plans>`;
 }
 
-async function rebuildNotesBlock(summary: CommitSummary, cwd: string): Promise<string> {
+async function rebuildNotesBlock(
+	summary: CommitSummary,
+	cwd: string,
+	storage: StorageProvider | undefined,
+): Promise<string> {
 	const refs = summary.notes ?? [];
 	if (refs.length === 0) return "";
+	const sorted = [...refs].sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+
 	const rendered: string[] = [];
-	for (const ref of refs) {
-		const md = await readNoteFromBranch(ref.id, cwd);
+	let totalLen = 0;
+	for (const ref of sorted) {
+		const md = await readNoteFromBranch(ref.id, cwd, storage);
 		if (md === null) continue;
-		rendered.push(
-			[`<note id="${escapeAttr(ref.id)}" title="${escapeAttr(ref.title)}">`, escapeText(md), "</note>"].join(
-				"\n",
-			),
-		);
+		const body = truncate(md, NOTE_MAX_CHARS);
+		const block = [
+			`<note id="${escapeForAttr(ref.id)}" title="${escapeForAttr(ref.title)}">`,
+			escapeForText(body),
+			"</note>",
+		].join("\n");
+		if (totalLen + block.length > NOTE_TOTAL_CHARS) break;
+		rendered.push(block);
+		totalLen += block.length;
 	}
 	if (rendered.length === 0) return "";
 	return `<notes>\n${rendered.join("\n")}\n</notes>`;
-}
-
-function escapeAttr(s: string): string {
-	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
-}
-
-function escapeText(s: string): string {
-	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

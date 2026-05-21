@@ -1947,6 +1947,44 @@ describe("SummaryStore", () => {
 			expect(result.has("hash3")).toBe(true);
 		});
 
+		it("threads an explicit StorageProvider to readTranscript instead of the orphan-branch fallback", async () => {
+			// Folder-only Memory Bank correctness: when the caller (e.g.
+			// JolliMemoryBridge.loadRegenerateContext) passes a storage
+			// argument, the read MUST go through that provider, not the
+			// resolveStorage fallback that always returns OrphanBranchStorage.
+			const fakeStorage = {
+				readFile: vi.fn().mockResolvedValue(
+					JSON.stringify({
+						sessions: [{ sessionId: "from-folder", entries: [] }],
+					}),
+				),
+			} as unknown as Parameters<typeof readTranscript>[2];
+
+			const result = await readTranscript("abc123", undefined, fakeStorage);
+
+			expect(fakeStorage?.readFile).toHaveBeenCalledWith("transcripts/abc123.json");
+			expect(result?.sessions[0]?.sessionId).toBe("from-folder");
+		});
+
+		it("threads StorageProvider through readTranscriptsForCommits to each read", async () => {
+			// The batch wrapper must forward storage to every underlying
+			// readTranscript so folder-only users get the same backend on
+			// every hash.
+			const fakeStorage = {
+				readFile: vi
+					.fn()
+					.mockResolvedValueOnce(JSON.stringify({ sessions: [{ sessionId: "a", entries: [] }] }))
+					.mockResolvedValueOnce(JSON.stringify({ sessions: [{ sessionId: "b", entries: [] }] })),
+			} as unknown as Parameters<typeof readTranscriptsForCommits>[2];
+
+			const result = await readTranscriptsForCommits(["h1", "h2"], undefined, fakeStorage);
+
+			expect(fakeStorage?.readFile).toHaveBeenCalledTimes(2);
+			expect(fakeStorage?.readFile).toHaveBeenNthCalledWith(1, "transcripts/h1.json");
+			expect(fakeStorage?.readFile).toHaveBeenNthCalledWith(2, "transcripts/h2.json");
+			expect(result.size).toBe(2);
+		});
+
 		it("should write and delete transcript files in a single batch", async () => {
 			await saveTranscriptsBatch(
 				[{ hash: "hash1", data: { sessions: [{ sessionId: "s1", entries: [] }] } }],
