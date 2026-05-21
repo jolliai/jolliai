@@ -261,35 +261,76 @@ export function hasIncompatibleImports(content: string, rules?: ContentRules): b
 // ─── stripIncompatibleContent (internal helper) ──────────────────────────────
 
 /**
- * Strips incompatible MDX content to produce plain markdown:
- *   1. Removes all `import` and `export` statements
- *   2. Removes ALL JSX component tags (uppercase): `<Foo ... />` and `<Foo>...</Foo>`
- *   3. Removes Docusaurus admonition syntax (`:::tip`, `:::warning`, etc.)
- *   4. Preserves code blocks, headings, paragraphs, lists, links, images, etc.
+ * Strips incompatible MDX content while preserving safe imports and their
+ * components. Only removes:
+ *   1. Imports from unknown packages (not in safe prefixes)
+ *   2. JSX components that came from unsafe imports or are unknown
+ *   3. `export` statements
+ *   4. Docusaurus admonition syntax (`:::tip`, `:::warning`, etc.)
  *
- * Since the file is being downgraded to `.md`, no JSX components will work —
- * so we strip them all, keeping only the text content inside open/close pairs.
+ * Safe imports (e.g. `nextra/components`) and their components (e.g.
+ * `<Callout>`, `<Tabs>`) are preserved so the file can stay `.mdx`.
+ *
+ * Returns `{ content, hasSafeJsx }` — when `hasSafeJsx` is `true`, the
+ * caller should keep the `.mdx` extension instead of downgrading to `.md`.
  */
-export function stripIncompatibleContent(content: string): string {
+export function stripIncompatibleContent(content: string, rules?: ContentRules): StripResult {
+	const safePrefixes = rules?.safeImportPrefixes ?? DEFAULT_SAFE_IMPORT_PREFIXES;
+	const providedComponents = rules?.providedComponents ?? DEFAULT_PROVIDED_COMPONENTS;
+
+	// Build set of safe component names from safe imports + framework-provided.
+	// Components explicitly imported from unsafe sources are removed from the
+	// safe set — the explicit import overrides the framework-provided status.
+	const safeComponents = new Set<string>(providedComponents);
+	for (const match of content.matchAll(/import\s+\{([^}]+)\}\s+from\s+['"](.*?)['"]/g)) {
+		const specifier = match[2];
+		const names = match[1]
+			.split(",")
+			.map((n) =>
+				n
+					.trim()
+					.split(/\s+as\s+/)
+					.pop()
+					?.trim(),
+			)
+			.filter(Boolean);
+		if (isSafeSpecifier(specifier, safePrefixes)) {
+			for (const name of names) safeComponents.add(name);
+		} else {
+			for (const name of names) safeComponents.delete(name);
+		}
+	}
+	for (const match of content.matchAll(/import\s+(\w+)\s+from\s+['"](.*?)['"]/g)) {
+		if (isSafeSpecifier(match[2], safePrefixes)) {
+			safeComponents.add(match[1]);
+		} else {
+			safeComponents.delete(match[1]);
+		}
+	}
+
 	let result = content;
 
-	// Remove import/export lines
-	result = result.replace(/^(import|export)\s+.*$/gm, "");
+	// Remove only unsafe import lines; keep safe ones
+	result = result.replace(/^import\s+.*?from\s+['"](.*?)['"].*$/gm, (line, specifier: string) => {
+		if (isSafeSpecifier(specifier, safePrefixes)) return line;
+		return "";
+	});
 
-	// Remove self-closing JSX tags: <ComponentName ... />
-	result = result.replace(/<[A-Z]\w+\s[^>]*?\/>/g, "");
-	result = result.replace(/<[A-Z]\w+\s*\/>/g, "");
+	// Remove export statements
+	result = result.replace(/^export\s+.*$/gm, "");
 
-	// Remove JSX open/close tags but KEEP their children content.
-	// This preserves text/code inside <Tabs><TabItem>...</TabItem></Tabs>.
-	// Process iteratively since tags may be nested.
+	// Remove only unsafe self-closing JSX tags: <UnsafeComponent ... />
+	result = result.replace(/<([A-Z]\w+)\s[^>]*?\/>/g, (m, name: string) => (safeComponents.has(name) ? m : ""));
+	result = result.replace(/<([A-Z]\w+)\s*\/>/g, (m, name: string) => (safeComponents.has(name) ? m : ""));
+
+	// Remove unsafe open/close tags but KEEP their children content.
 	let prev = "";
 	while (prev !== result) {
 		prev = result;
-		// Remove opening tags: <ComponentName ...> or <ComponentName>
-		result = result.replace(/<[A-Z]\w+(?:\s[^>]*)?>[ \t]*/g, "");
-		// Remove closing tags: </ComponentName>
-		result = result.replace(/[ \t]*<\/[A-Z]\w+>/g, "");
+		result = result.replace(/<([A-Z]\w+)(?:\s[^>]*)?>[ \t]*/g, (m, name: string) =>
+			safeComponents.has(name) ? m : "",
+		);
+		result = result.replace(/[ \t]*<\/([A-Z]\w+)>/g, (m, name: string) => (safeComponents.has(name) ? m : ""));
 	}
 
 	// Convert JSX style={{ ... }} to HTML style="..."
@@ -302,7 +343,7 @@ export function stripIncompatibleContent(content: string): string {
 				const cssKey = key
 					.trim()
 					.replace(/([A-Z])/g, "-$1")
-					.toLowerCase(); // camelCase → kebab-case
+					.toLowerCase();
 				const cssVal = valParts
 					.join(":")
 					.trim()
@@ -320,7 +361,21 @@ export function stripIncompatibleContent(content: string): string {
 	// Clean up excessive blank lines left by removals
 	result = result.replace(/\n{3,}/g, "\n\n");
 
-	return `${result.trim()}\n`;
+	const cleaned = `${result.trim()}\n`;
+	// Check if any safe JSX remains (import lines or uppercase JSX tags)
+	const hasSafeJsx = /^import\s+/m.test(cleaned) || /<[A-Z]\w+[\s/>]/.test(cleaned);
+	return { content: cleaned, hasSafeJsx };
+}
+
+export interface StripResult {
+	content: string;
+	/** `true` when safe imports/JSX survive — file should stay `.mdx`. */
+	hasSafeJsx: boolean;
+}
+
+function isSafeSpecifier(specifier: string, safePrefixes: readonly string[]): boolean {
+	if (specifier.startsWith("./") || specifier.startsWith("../")) return true;
+	return safePrefixes.some((prefix) => specifier === prefix || specifier.startsWith(`${prefix}/`));
 }
 
 // ─── canCompileMdx (internal helper) ─────────────────────────────────────────
@@ -355,13 +410,16 @@ async function downgradeMdx(
 	contentDir: string,
 	result: MirrorResult,
 ): Promise<void> {
-	const cleaned = stripIncompatibleContent(mdxContent);
-	const mdRelPath = relPath.replace(/\.mdx$/, ".md");
-	const destPath = join(contentDir, mdRelPath);
+	const stripped = stripIncompatibleContent(mdxContent);
+	// If safe JSX survives, keep the .mdx extension so Nextra compiles it
+	const outRelPath = stripped.hasSafeJsx ? relPath : relPath.replace(/\.mdx$/, ".md");
+	const destPath = join(contentDir, outRelPath);
 	await ensureDir(destPath);
-	await writeFile(destPath, cleaned, "utf-8");
-	result.markdownFiles.push(mdRelPath);
-	result.downgradedCount++;
+	await writeFile(destPath, stripped.content, "utf-8");
+	result.markdownFiles.push(outRelPath);
+	if (!stripped.hasSafeJsx) {
+		result.downgradedCount++;
+	}
 }
 
 // ─── clearDir ────────────────────────────────────────────────────────────────

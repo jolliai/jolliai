@@ -771,7 +771,7 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = "import Tabs from '@theme/Tabs'\nimport TabItem from '@theme/TabItem'\n\n# Title\n";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).not.toContain("import");
 		expect(result).toContain("# Title");
@@ -781,7 +781,7 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = "export const meta = { title: 'Test' }\n\n# Title\n";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).not.toContain("export");
 		expect(result).toContain("# Title");
@@ -791,7 +791,7 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = '# Title\n\n<LiteYouTubeEmbed id="abc123" />\n\nText after.\n';
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).not.toContain("LiteYouTubeEmbed");
 		expect(result).toContain("Text after.");
@@ -801,31 +801,43 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = "# Title\n\n<Spacer/>\n\nText.\n";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).not.toContain("Spacer");
 		expect(result).toContain("Text.");
 	});
 
-	it("removes opening and closing JSX tags but keeps children", async () => {
+	it("removes unsafe JSX tags but keeps children; preserves safe components", async () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
+		// Docusaurus-style import (unsafe) + usage of its components
 		const input =
-			'# Code\n\n<Tabs>\n<TabItem value="js" label="JS">\n\n```js\nconsole.log()\n```\n\n</TabItem>\n</Tabs>\n';
+			"import Tabs from '@theme/Tabs'\nimport TabItem from '@theme/TabItem'\n\n# Code\n\n<Tabs>\n<TabItem value=\"js\" label=\"JS\">\n\n```js\nconsole.log()\n```\n\n</TabItem>\n</Tabs>\n";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
+		expect(result).not.toContain("@theme/Tabs");
 		expect(result).not.toContain("<Tabs");
 		expect(result).not.toContain("<TabItem");
-		expect(result).not.toContain("</Tabs");
-		expect(result).not.toContain("</TabItem");
 		expect(result).toContain("console.log()");
+	});
+
+	it("preserves framework-provided components when no import is present", async () => {
+		const { stripIncompatibleContent } = await import("./ContentMirror.js");
+		// Nextra-provided Tabs (no import needed — framework provides them)
+		const input = '# Code\n\n<Tabs items={["a","b"]}>\n<Tab>\nContent A\n</Tab>\n</Tabs>\n';
+
+		const result = stripIncompatibleContent(input).content;
+
+		expect(result).toContain("<Tabs");
+		expect(result).toContain("<Tab>");
+		expect(result).toContain("Content A");
 	});
 
 	it("converts JSX style objects to HTML style strings", async () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = '# Title\n\n<div style={{backgroundColor: "red", fontSize: "14px"}}>content</div>\n';
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).toContain('style="background-color: red; font-size: 14px"');
 		expect(result).not.toContain("{{");
@@ -837,7 +849,7 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = "<div style={{noColon, color: red}}>x</div>";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).toContain('style="color: red"');
 		expect(result).not.toContain("noColon");
@@ -847,7 +859,7 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = "# Title\n\n:::tip\nThis is a tip.\n:::\n\nMore text.\n";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).not.toContain(":::");
 		expect(result).toContain("This is a tip.");
@@ -858,7 +870,7 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = ":::warning\nBe careful!\n:::\n";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).not.toContain(":::warning");
 		expect(result).toContain("Be careful!");
@@ -868,7 +880,7 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = "import X from 'x'\n\n\n\n\n# Title\n\n\n\n\nText.\n";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).not.toMatch(/\n{4,}/);
 	});
@@ -877,7 +889,7 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = "\n\n# Title\n\n";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).toMatch(/\n$/);
 		expect(result).not.toMatch(/^\n/);
@@ -887,7 +899,7 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = "<Outer>\n<Inner>\nDeep content\n</Inner>\n</Outer>\n";
 
-		const result = stripIncompatibleContent(input);
+		const result = stripIncompatibleContent(input).content;
 
 		expect(result).not.toContain("<Outer");
 		expect(result).not.toContain("<Inner");

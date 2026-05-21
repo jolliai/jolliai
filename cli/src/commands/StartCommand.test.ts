@@ -22,6 +22,9 @@ import { getBuildDir } from "./StartCommand.js";
 const {
 	mockExistsSync,
 	mockReadSiteJson,
+	mockResolveFavicon,
+	mockBuildNavigationContentPlan,
+	mockApplyNavigationContentPlan,
 	mockInitNextraProject,
 	mockMirrorContent,
 	mockGenerateMetaFiles,
@@ -35,6 +38,9 @@ const {
 } = vi.hoisted(() => ({
 	mockExistsSync: vi.fn(),
 	mockReadSiteJson: vi.fn(),
+	mockResolveFavicon: vi.fn(),
+	mockBuildNavigationContentPlan: vi.fn(),
+	mockApplyNavigationContentPlan: vi.fn(),
 	mockInitNextraProject: vi.fn(),
 	mockMirrorContent: vi.fn(),
 	mockGenerateMetaFiles: vi.fn(),
@@ -55,12 +61,23 @@ vi.mock("../site/SiteJsonReader.js", () => ({
 	readSiteJson: mockReadSiteJson,
 }));
 
+vi.mock("../site/AssetResolver.js", () => ({
+	resolveFavicon: mockResolveFavicon,
+}));
+
+vi.mock("../site/ContentPlanner.js", () => ({
+	buildNavigationContentPlan: mockBuildNavigationContentPlan,
+	applyNavigationContentPlan: mockApplyNavigationContentPlan,
+	validateNavigationPaths: () => [],
+}));
+
 vi.mock("../site/NextraProjectWriter.js", () => ({
 	initNextraProject: mockInitNextraProject,
 }));
 
 vi.mock("../site/ContentMirror.js", () => ({
 	clearDir: vi.fn(),
+	applyPathMapping: vi.fn((relPath: string) => relPath),
 	mirrorContent: mockMirrorContent,
 }));
 
@@ -171,6 +188,11 @@ function setupSuccessfulRun(
 ): void {
 	mockExistsSync.mockReturnValue(true);
 	mockReadSiteJson.mockResolvedValue(DEFAULT_SITE_JSON_RESULT);
+	mockResolveFavicon.mockResolvedValue(undefined);
+	mockBuildNavigationContentPlan.mockReturnValue({ pages: [] });
+	mockApplyNavigationContentPlan.mockImplementation(
+		async (_sourceRoot: string, _contentDir: string, markdownFiles: string[]) => markdownFiles,
+	);
 	mockInitNextraProject.mockResolvedValue({ isNew: false });
 	const openapiFiles = overrides.openapiFiles ?? DEFAULT_MIRROR_RESULT.openapiFiles;
 	const openapiDocs = overrides.openapiDocs ?? Object.fromEntries(openapiFiles.map((p) => [p, SAMPLE_OPENAPI_DOC]));
@@ -689,6 +711,111 @@ describe("StartCommand additional branches", () => {
 		expect(mockRenderOpenApiSpecs).not.toHaveBeenCalled();
 	});
 
+	it("when navigation declares OpenAPI tabs, renders only the declared specs", async () => {
+		setupSuccessfulRun({
+			openapiFiles: ["apis/public/openapi.yaml", "apis/admin/openapi.yaml", "apis/internal/openapi.yaml"],
+		});
+		mockReadSiteJson.mockResolvedValue({
+			config: {
+				title: "Test Site",
+				description: "A test site",
+				nav: [],
+				navigation: [
+					{ page: "Public API", openapi: "apis/public/openapi.yaml" },
+					{ page: "Admin API", openapi: "apis/admin/openapi.yaml" },
+				],
+			},
+			usedDefault: false,
+		});
+		const program = await makeProgram();
+		await program.parseAsync(["build", "/my-docs"], { from: "user" });
+
+		expect(mockRenderOpenApiSpecs).toHaveBeenCalledOnce();
+		const [, , specs] = mockRenderOpenApiSpecs.mock.calls[0] as [
+			string,
+			string,
+			Array<{ specName: string; sourceRelPath: string }>,
+		];
+		expect(specs.map((spec) => ({ specName: spec.specName, sourceRelPath: spec.sourceRelPath }))).toEqual([
+			{ specName: "public-api", sourceRelPath: "apis/public/openapi.yaml" },
+			{ specName: "admin-api", sourceRelPath: "apis/admin/openapi.yaml" },
+		]);
+	});
+
+	it("uses navigation roots as spec slugs when present so route keys stay aligned", async () => {
+		setupSuccessfulRun({
+			openapiFiles: ["apis/public/openapi.yaml"],
+		});
+		mockReadSiteJson.mockResolvedValue({
+			config: {
+				title: "Test Site",
+				description: "A test site",
+				nav: [],
+				navigation: [{ page: "API Reference", root: "/api-openapi", openapi: "apis/public/openapi.yaml" }],
+			},
+			usedDefault: false,
+		});
+		const program = await makeProgram();
+		await program.parseAsync(["build", "/my-docs"], { from: "user" });
+
+		expect(process.exitCode).toBe(0);
+		const [, , specs] = mockRenderOpenApiSpecs.mock.calls[0] as [
+			string,
+			string,
+			Array<{ specName: string; displayTitle?: string }>,
+		];
+		expect(specs).toEqual([
+			expect.objectContaining({
+				specName: "openapi",
+				displayTitle: "API Reference",
+			}),
+		]);
+	});
+
+	it("uses navigation route-derived spec slugs so same-basename specs do not collide", async () => {
+		setupSuccessfulRun({
+			openapiFiles: ["apis/public/openapi.yaml", "apis/admin/openapi.yaml"],
+		});
+		mockReadSiteJson.mockResolvedValue({
+			config: {
+				title: "Test Site",
+				description: "A test site",
+				nav: [],
+				navigation: [
+					{ page: "Public API", openapi: "apis/public/openapi.yaml" },
+					{ page: "Admin API", openapi: "apis/admin/openapi.yaml" },
+				],
+			},
+			usedDefault: false,
+		});
+		const program = await makeProgram();
+		await program.parseAsync(["build", "/my-docs"], { from: "user" });
+
+		expect(process.exitCode).toBe(0);
+		const [, , specs] = mockRenderOpenApiSpecs.mock.calls[0] as [string, string, Array<{ specName: string }>];
+		expect(specs.map((spec) => spec.specName)).toEqual(["public-api", "admin-api"]);
+	});
+
+	it("fails clearly when a declared OpenAPI page points to a missing or invalid file", async () => {
+		setupSuccessfulRun({ openapiFiles: ["apis/public/openapi.yaml"] });
+		mockReadSiteJson.mockResolvedValue({
+			config: {
+				title: "Test Site",
+				description: "A test site",
+				nav: [],
+				navigation: [{ page: "Admin API", openapi: "apis/admin/openapi.yaml" }],
+			},
+			usedDefault: false,
+		});
+		const program = await makeProgram();
+		await program.parseAsync(["build", "/my-docs"], { from: "user" });
+
+		expect(process.exitCode).toBe(1);
+		const errOutput = consoleErrorSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+		expect(errOutput).toContain('Declared OpenAPI spec "apis/admin/openapi.yaml"');
+		expect(mockRenderOpenApiSpecs).not.toHaveBeenCalled();
+	});
+
 	it("does not render OpenAPI specs when openapiFiles is empty", async () => {
 		setupSuccessfulRun({ openapiFiles: [] });
 		const program = await makeProgram();
@@ -957,5 +1084,25 @@ describe("buildRootInjectionInput", () => {
 			{ specName: "petstore", title: undefined },
 			{ specName: "users", title: undefined },
 		]);
+	});
+
+	it("prefers declared navigation tab titles for apiSpecs when spec inputs are provided", async () => {
+		const { buildRootInjectionInput } = await import("./StartCommand.js");
+		const mirror: MirrorResult = {
+			...EMPTY_MIRROR,
+			openapiFiles: ["apis/public/openapi.yaml"],
+			openapiDocs: {
+				"apis/public/openapi.yaml": { info: { title: "Spec Title" } },
+			} as unknown as OpenApiDocs,
+		};
+		const result = buildRootInjectionInput(undefined, [], mirror, [
+			{
+				specName: "public-api",
+				sourceRelPath: "apis/public/openapi.yaml",
+				displayTitle: "Public API",
+				pipeline: {} as never,
+			},
+		]);
+		expect(result.apiSpecs).toEqual([{ specName: "public-api", title: "Public API" }]);
 	});
 });

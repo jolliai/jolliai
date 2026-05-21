@@ -10,7 +10,12 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Command } from "commander";
 import { resolveFavicon } from "../site/AssetResolver.js";
-import { clearDir, mirrorContent } from "../site/ContentMirror.js";
+import { applyPathMapping, clearDir, mirrorContent } from "../site/ContentMirror.js";
+import {
+	applyNavigationContentPlan,
+	buildNavigationContentPlan,
+	validateNavigationPaths,
+} from "../site/ContentPlanner.js";
 import type { RootApiSpec, RootInjectionInput } from "../site/MetaGenerator.js";
 import { needsInstall, runNpmInstall, runServe } from "../site/NpmRunner.js";
 import { buildPipeline } from "../site/openapi/OpenApiPipeline.js";
@@ -20,7 +25,8 @@ import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
 import type { OpenApiSpecInput } from "../site/renderer/SiteRenderer.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
 import { startSourceWatcher } from "../site/SourceWatcher.js";
-import type { HeaderItem, NavLink } from "../site/Types.js";
+import { parseNavigation } from "../site/StructureParser.js";
+import type { HeaderItem, NavLink, PathMappings } from "../site/Types.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -38,6 +44,7 @@ function verbose(msg: string, isVerbose: boolean): void {
 interface CmdOpts {
 	migrate?: boolean;
 	verbose?: boolean;
+	theme?: string;
 }
 
 /**
@@ -47,15 +54,54 @@ interface CmdOpts {
  * from the source-file basename. Throws on a `specName` collision —
  * silently dropping a spec would result in missing pages.
  */
-function buildOpenApiSpecInputs(mirrorResult: Awaited<ReturnType<typeof mirrorContent>>): OpenApiSpecInput[] {
+interface DeclaredOpenApiPage {
+	key: string;
+	title: string;
+	href: string;
+	specPath: string;
+	specName: string;
+}
+
+function normalizeDeclaredOpenApiPath(specPath: string): string {
+	return specPath.replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "");
+}
+
+function buildOpenApiSpecInputs(
+	mirrorResult: Awaited<ReturnType<typeof mirrorContent>>,
+	declaredOpenApiPages?: DeclaredOpenApiPage[],
+	pathMappings?: PathMappings,
+): OpenApiSpecInput[] {
 	const inputs: OpenApiSpecInput[] = [];
 	const claimed = new Map<string, string>();
-	for (const sourceRelPath of mirrorResult.openapiFiles) {
+	const selectedSpecs =
+		declaredOpenApiPages && declaredOpenApiPages.length > 0
+			? declaredOpenApiPages.map((page) => {
+					const normalized = normalizeDeclaredOpenApiPath(page.specPath);
+					const mapped = applyPathMapping(normalized, pathMappings);
+					const sourceRelPath = mirrorResult.openapiDocs[mapped]
+						? mapped
+						: mirrorResult.openapiDocs[normalized]
+							? normalized
+							: undefined;
+					if (!sourceRelPath) {
+						throw new Error(
+							`Declared OpenAPI spec "${page.specPath}" for page "${page.title}" was not found or is not a valid OpenAPI file.`,
+						);
+					}
+					return { sourceRelPath, specName: page.specName, displayTitle: page.title };
+				})
+			: mirrorResult.openapiFiles.map((sourceRelPath) => ({
+					sourceRelPath,
+					specName: deriveSpecName(sourceRelPath),
+					displayTitle: undefined,
+				}));
+
+	for (const selected of selectedSpecs) {
+		const { sourceRelPath, specName, displayTitle } = selected;
 		const doc = mirrorResult.openapiDocs[sourceRelPath];
 		if (!doc) {
 			continue;
 		}
-		const specName = deriveSpecName(sourceRelPath);
 		const existing = claimed.get(specName);
 		if (existing) {
 			throw new Error(
@@ -64,7 +110,7 @@ function buildOpenApiSpecInputs(mirrorResult: Awaited<ReturnType<typeof mirrorCo
 			);
 		}
 		claimed.set(specName, sourceRelPath);
-		inputs.push({ specName, sourceRelPath, pipeline: buildPipeline(doc) });
+		inputs.push({ specName, sourceRelPath, pipeline: buildPipeline(doc), displayTitle });
 	}
 	return inputs;
 }
@@ -104,6 +150,35 @@ async function syncContent(
 		publicDir,
 		renderer.getContentRules(),
 	);
+	const parsedNavigation = siteJsonResult.config.navigation
+		? parseNavigation(siteJsonResult.config.navigation)
+		: undefined;
+
+	if (siteJsonResult.config.navigation) {
+		// Validate navigation paths against source files before building
+		const mismatches = validateNavigationPaths(siteJsonResult.config.navigation, mirrorResult.markdownFiles);
+		if (mismatches.length > 0) {
+			console.warn("\n  ⚠ Navigation path mismatches found in site.json:\n");
+			for (const m of mismatches) {
+				console.warn(`    ✗ "${m.label}" → ${m.expectedPath}`);
+				console.warn(`      ${m.suggestion}\n`);
+			}
+		}
+
+		const plan = buildNavigationContentPlan(siteJsonResult.config.navigation, mirrorResult.markdownFiles);
+		try {
+			mirrorResult.markdownFiles = await applyNavigationContentPlan(
+				sourceRoot,
+				contentDir,
+				mirrorResult.markdownFiles,
+				plan,
+				renderer.getContentRules(),
+			);
+		} catch (err) {
+			console.error(`  Error: ${err instanceof Error ? err.message : String(err)}`);
+			return { success: false };
+		}
+	}
 
 	// Fix sidebar index key if a file was renamed during mirror.
 	const sidebar = siteJsonResult.config.sidebar;
@@ -113,10 +188,15 @@ async function syncContent(
 		sidebar["/"] = { index: label, ...sidebar["/"] };
 	}
 
+	let specInputs: OpenApiSpecInput[] | undefined;
+
 	if (mirrorResult.openapiFiles.length > 0) {
-		let specInputs: OpenApiSpecInput[];
 		try {
-			specInputs = buildOpenApiSpecInputs(mirrorResult);
+			specInputs = buildOpenApiSpecInputs(
+				mirrorResult,
+				parsedNavigation?.openapiPages,
+				siteJsonResult.config.pathMappings,
+			);
 		} catch (err) {
 			// Spec-name collisions throw with a clear "Rename one of the source
 			// files" message. In the dev watcher, an uncaught throw becomes an
@@ -130,17 +210,35 @@ async function syncContent(
 		await renderer.renderOpenApiSpecs(contentDir, publicDir, specInputs);
 	}
 
-	// Build the root-_meta.js injection payload. The renderer turns these
-	// into native Nextra page tabs (chevron / hover / mobile drawer) by
-	// writing them to the root `content/_meta.js` — no JSX nav-children
-	// rendering in `<Navbar>`.
+	// Navigation generation. Priority: navigation > sidebar (legacy).
+	// When neither navigation nor sidebar is set, the sidebar is empty
+	// (matches web tool strict-mode behavior).
 	const rootInjection = buildRootInjectionInput(
 		siteJsonResult.config.header?.items,
 		siteJsonResult.config.nav,
 		mirrorResult,
+		specInputs,
 	);
 
-	await renderer.generateNavigation(contentDir, sidebar, rootInjection);
+	if (parsedNavigation) {
+		if (parsedNavigation.rootPages?.length) {
+			rootInjection.structurePages = parsedNavigation.rootPages;
+		} else {
+			// Simple mode — no pages, suppress type:"page" auto-injection
+			rootInjection.simpleMode = true;
+		}
+		if (parsedNavigation.defaultPageHref) {
+			rootInjection.defaultPageHref = parsedNavigation.defaultPageHref;
+		}
+		await renderer.generateNavigation(contentDir, parsedNavigation.sidebar, rootInjection);
+	} else if (sidebar && Object.keys(sidebar).length > 0) {
+		// Legacy sidebar overrides
+		await renderer.generateNavigation(contentDir, sidebar, rootInjection);
+	} else {
+		// No navigation, no sidebar — empty sidebar (no filesystem auto-discovery)
+		rootInjection.simpleMode = true;
+		await renderer.generateNavigation(contentDir, {}, rootInjection);
+	}
 
 	return { success: true, mirrorResult };
 }
@@ -159,12 +257,24 @@ export function buildRootInjectionInput(
 	headerItems: HeaderItem[] | undefined,
 	legacyNav: NavLink[] | undefined,
 	mirrorResult: Awaited<ReturnType<typeof mirrorContent>>,
+	specInputs?: OpenApiSpecInput[],
 ): RootInjectionInput {
-	const apiSpecs: RootApiSpec[] = mirrorResult.openapiFiles.map((relPath) => {
-		const doc = mirrorResult.openapiDocs[relPath];
-		const title = typeof doc?.info?.title === "string" ? doc.info.title : undefined;
-		return { specName: deriveSpecName(relPath), title };
-	});
+	const apiSpecs: RootApiSpec[] =
+		specInputs && specInputs.length > 0
+			? specInputs.map((spec) => ({
+					specName: spec.specName,
+					title:
+						typeof spec.displayTitle === "string" && spec.displayTitle.trim().length > 0
+							? spec.displayTitle
+							: typeof mirrorResult.openapiDocs[spec.sourceRelPath]?.info?.title === "string"
+								? mirrorResult.openapiDocs[spec.sourceRelPath]?.info?.title
+								: undefined,
+				}))
+			: mirrorResult.openapiFiles.map((relPath) => {
+					const doc = mirrorResult.openapiDocs[relPath];
+					const title = typeof doc?.info?.title === "string" ? doc.info.title : undefined;
+					return { specName: deriveSpecName(relPath), title };
+				});
 	const effectiveHeaderItems =
 		headerItems && headerItems.length > 0
 			? headerItems
@@ -217,9 +327,25 @@ async function prepareContent(
 		return { success: false };
 	}
 
+	// Extract navigation data for the layout (before initProject).
+	const configAny = siteJsonResult.config as Record<string, unknown>;
+	if (siteJsonResult.config.navigation) {
+		const parsed = parseNavigation(siteJsonResult.config.navigation);
+		if (parsed.rootPages?.length) {
+			configAny.structurePages = parsed.rootPages;
+		}
+		if (parsed.pages?.length && parsed.pages.length >= 2) {
+			configAny.navigationPages = parsed.pages;
+		}
+	}
+
 	// Initialize build directory
 	verbose(`Initializing build directory… (${buildDir})`, v);
-	await renderer.initProject(buildDir, siteJsonResult.config, { staticExport });
+	await renderer.initProject(buildDir, siteJsonResult.config, {
+		staticExport,
+		sourceRoot,
+		themePath: opts.theme,
+	});
 
 	// Clear caches
 	await clearDir(publicDir);
@@ -310,6 +436,7 @@ export function registerBuildCommand(program: Command): void {
 		.argument("[source-root]", "Path to the Content_Folder (default: current directory)")
 		.option("--migrate", "Re-detect framework config and regenerate site.json")
 		.option("--verbose", "Show detailed build output")
+		.option("--theme <path>", "Path to a custom theme pack folder")
 		.action(async (sourceRootArg: string | undefined, opts: CmdOpts) => {
 			const sourceRoot = resolve(sourceRootArg ?? process.cwd());
 			const buildDir = getBuildDir(sourceRoot);
@@ -333,6 +460,7 @@ export function registerStartCommand(program: Command): void {
 		.argument("[source-root]", "Path to the Content_Folder (default: current directory)")
 		.option("--migrate", "Re-detect framework config and regenerate site.json")
 		.option("--verbose", "Show detailed build output")
+		.option("--theme <path>", "Path to a custom theme pack folder")
 		.action(async (sourceRootArg: string | undefined, opts: CmdOpts) => {
 			const sourceRoot = resolve(sourceRootArg ?? process.cwd());
 			const buildDir = getBuildDir(sourceRoot);
@@ -354,6 +482,49 @@ export function registerStartCommand(program: Command): void {
 		});
 }
 
+/**
+ * Runs the dev server for a source folder. Exported for reuse by
+ * `jolli theme preview` — the command itself delegates here.
+ */
+export async function runDevServer(
+	sourceRoot: string,
+	opts: { theme?: string; verbose?: boolean; migrate?: boolean },
+): Promise<void> {
+	const buildDir = getBuildDir(sourceRoot);
+	const contentDir = join(buildDir, "content");
+	const publicDir = join(buildDir, "public");
+
+	const result = await prepareContent(sourceRoot, buildDir, contentDir, publicDir, false, opts);
+	if (!result.success) return;
+
+	console.log("  Watching source folder for changes…");
+	const watcher = startSourceWatcher(sourceRoot, {
+		onChange: async () => {
+			const sync = await syncContent(sourceRoot, contentDir, publicDir, result.renderer, opts);
+			if (sync.success) {
+				const total =
+					sync.mirrorResult.markdownFiles.length +
+					sync.mirrorResult.imageFiles.length +
+					sync.mirrorResult.openapiFiles.length;
+				const ignored = sync.mirrorResult.ignoredFiles.length;
+				const suffix = ignored > 0 ? ` (${ignored} ignored)` : "";
+				console.log(`  ↻ Synced ${total} files${suffix}`);
+			}
+		},
+	});
+
+	console.log("");
+	try {
+		const devResult = await result.renderer.runDev(buildDir, opts.verbose === true);
+		if (!devResult.success) {
+			if (devResult.output) console.error(devResult.output);
+			process.exitCode = 1;
+		}
+	} finally {
+		await watcher.close();
+	}
+}
+
 export function registerDevCommand(program: Command): void {
 	program
 		.command("dev")
@@ -361,43 +532,8 @@ export function registerDevCommand(program: Command): void {
 		.argument("[source-root]", "Path to the Content_Folder (default: current directory)")
 		.option("--migrate", "Re-detect framework config and regenerate site.json")
 		.option("--verbose", "Show detailed build output")
+		.option("--theme <path>", "Path to a custom theme pack folder")
 		.action(async (sourceRootArg: string | undefined, opts: CmdOpts) => {
-			const sourceRoot = resolve(sourceRootArg ?? process.cwd());
-			const buildDir = getBuildDir(sourceRoot);
-			const contentDir = join(buildDir, "content");
-			const publicDir = join(buildDir, "public");
-
-			const result = await prepareContent(sourceRoot, buildDir, contentDir, publicDir, false, opts);
-			if (!result.success) return;
-
-			// Watch the source folder so edits trigger an incremental re-mirror
-			// + re-render of OpenAPI specs while the dev server is running.
-			// Next.js's HMR picks up the writes to <buildDir>/content/.
-			console.log("  Watching source folder for changes…");
-			const watcher = startSourceWatcher(sourceRoot, {
-				onChange: async () => {
-					const sync = await syncContent(sourceRoot, contentDir, publicDir, result.renderer, opts);
-					if (sync.success) {
-						const total =
-							sync.mirrorResult.markdownFiles.length +
-							sync.mirrorResult.imageFiles.length +
-							sync.mirrorResult.openapiFiles.length;
-						const ignored = sync.mirrorResult.ignoredFiles.length;
-						const suffix = ignored > 0 ? ` (${ignored} ignored)` : "";
-						console.log(`  ↻ Synced ${total} files${suffix}`);
-					}
-				},
-			});
-
-			console.log("");
-			try {
-				const devResult = await result.renderer.runDev(buildDir, opts.verbose === true);
-				if (!devResult.success) {
-					if (devResult.output) console.error(devResult.output);
-					process.exitCode = 1;
-				}
-			} finally {
-				await watcher.close();
-			}
+			await runDevServer(resolve(sourceRootArg ?? process.cwd()), opts);
 		});
 }

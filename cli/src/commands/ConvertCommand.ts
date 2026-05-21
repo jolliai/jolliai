@@ -244,20 +244,23 @@ async function processFile(
 				}
 
 				if (hasIncompatibleImports(mdxContent)) {
-					// Downgrade to .md
-					const cleaned = stripIncompatibleContent(mdxContent);
-					const mdDestPath = destPath.replace(/\.mdx$/, ".md");
-					// Rewrite image paths if file was remapped
-					const mdMappedRelPath = mappedRelPath.replace(/\.mdx$/, ".md");
+					// Strip unsafe content; keep safe Nextra JSX when present
+					const stripped = stripIncompatibleContent(mdxContent);
+					const cleaned = stripped.content;
+					const downgraded = !stripped.hasSafeJsx;
+					const mdDestPath = downgraded ? destPath.replace(/\.mdx$/, ".md") : destPath;
+					const mdMappedRelPath = downgraded ? mappedRelPath.replace(/\.mdx$/, ".md") : mappedRelPath;
 					const rewritten =
 						originalRelPath !== mdMappedRelPath
 							? rewriteRelativeImagePaths(cleaned, originalRelPath, mdMappedRelPath, pathMappings)
 							: cleaned;
 					await writeFile(mdDestPath, rewritten, "utf-8");
-					stats.downgraded++;
+					if (downgraded) {
+						stats.downgraded++;
+					}
 
-					// Remove original .mdx if in-place (we wrote .md instead)
-					if (inPlace) {
+					// Remove original .mdx if in-place and we wrote .md instead
+					if (inPlace && downgraded) {
 						await safeRemove(fullPath);
 					}
 					return;

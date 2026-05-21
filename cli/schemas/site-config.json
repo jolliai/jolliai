@@ -1,0 +1,540 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://jolli.ai/schemas/site-config.json",
+	"title": "Jolli site.json",
+	"description": "Configuration file for a Jolli documentation site.",
+	"type": "object",
+	"required": ["title"],
+	"additionalProperties": true,
+	"properties": {
+		"$schema": {
+			"type": "string",
+			"description": "URL of this JSON schema (for editor autocompletion)."
+		},
+		"title": {
+			"type": "string",
+			"description": "Site title shown in the browser tab and SEO metadata."
+		},
+		"description": {
+			"type": "string",
+			"description": "Site meta description used for SEO."
+		},
+		"nav": {
+			"type": "array",
+			"description": "Legacy flat navbar links. Ignored when `header` is present.",
+			"items": {
+				"$ref": "#/$defs/NavLink"
+			}
+		},
+		"header": {
+			"$ref": "#/$defs/HeaderConfig"
+		},
+		"footer": {
+			"$ref": "#/$defs/FooterConfig"
+		},
+		"theme": {
+			"$ref": "#/$defs/ThemeConfig"
+		},
+		"navigation": {
+			"description": "Content navigation tree. Two modes: page mode (array of NavigationPage) for multi-section sites, or simple mode (array of groups/articles) for single-section sites.",
+			"oneOf": [
+				{
+					"type": "array",
+					"description": "Page mode — multiple named top-level sections.",
+					"items": {
+						"$ref": "#/$defs/NavigationPage"
+					}
+				},
+				{
+					"type": "array",
+					"description": "Simple mode — flat sidebar of groups and articles.",
+					"items": {
+						"oneOf": [
+							{ "$ref": "#/$defs/NavigationGroup" },
+							{ "$ref": "#/$defs/NavigationArticle" }
+						]
+					}
+				}
+			]
+		},
+		"sidebar": {
+			"type": "object",
+			"description": "Sidebar ordering and label overrides keyed by directory path (e.g. \"/\", \"/get-started\"). Items are written in declaration order; Nextra auto-appends unlisted filesystem items alphabetically.",
+			"additionalProperties": {
+				"type": "object",
+				"description": "Ordered map of filename-key → label or Nextra meta object.",
+				"additionalProperties": {
+					"$ref": "#/$defs/SidebarItemValue"
+				}
+			}
+		},
+		"pathMappings": {
+			"type": "object",
+			"description": "Maps source folder paths to target folder paths (e.g. { \"sql\": \"pipelines/sql\" }).",
+			"additionalProperties": {
+				"type": "string"
+			}
+		},
+		"favicon": {
+			"type": "string",
+			"description": "Favicon URL. Wins over theme.favicon when both are set (deprecated alias)."
+		},
+		"anchors": {
+			"type": "array",
+			"description": "Persistent links rendered at the bottom of the sidebar (Blog, Community, etc.).",
+			"items": {
+				"$ref": "#/$defs/AnchorItem"
+			}
+		},
+		"renderer": {
+			"type": "string",
+			"description": "Renderer selection (default: Nextra). Reserved for future non-Nextra renderers."
+		},
+		"branding": {
+			"$ref": "#/$defs/BrandingConfig"
+		}
+	},
+	"$defs": {
+		"AnchorItem": {
+			"type": "object",
+			"description": "Persistent sidebar-bottom link.",
+			"required": ["label", "href"],
+			"additionalProperties": false,
+			"properties": {
+				"label": {
+					"type": "string",
+					"description": "Display text."
+				},
+				"href": {
+					"type": "string",
+					"description": "Destination URL."
+				},
+				"icon": {
+					"type": "string",
+					"description": "Optional icon (emoji or text prefix)."
+				}
+			}
+		},
+		"NavLink": {
+			"type": "object",
+			"required": ["label", "href"],
+			"additionalProperties": false,
+			"properties": {
+				"label": {
+					"type": "string",
+					"description": "Display text."
+				},
+				"href": {
+					"type": "string",
+					"description": "Destination URL."
+				}
+			}
+		},
+		"ExternalLink": {
+			"type": "object",
+			"required": ["label", "url"],
+			"additionalProperties": false,
+			"properties": {
+				"label": {
+					"type": "string",
+					"description": "Display text."
+				},
+				"url": {
+					"type": "string",
+					"description": "Destination URL."
+				}
+			}
+		},
+		"HeaderItem": {
+			"type": "object",
+			"required": ["label"],
+			"additionalProperties": false,
+			"description": "A navbar item — either a direct link (url) or a dropdown menu (items).",
+			"properties": {
+				"label": {
+					"type": "string",
+					"description": "Display text."
+				},
+				"url": {
+					"type": "string",
+					"description": "Destination URL (mutually exclusive with items)."
+				},
+				"items": {
+					"type": "array",
+					"description": "Dropdown sub-items (mutually exclusive with url).",
+					"items": {
+						"$ref": "#/$defs/ExternalLink"
+					}
+				}
+			},
+			"oneOf": [
+				{ "required": ["url"] },
+				{ "required": ["items"] }
+			]
+		},
+		"HeaderConfig": {
+			"type": "object",
+			"description": "Top navigation bar with dropdown support. Supersedes `nav`.",
+			"required": ["items"],
+			"additionalProperties": false,
+			"properties": {
+				"items": {
+					"type": "array",
+					"description": "Ordered list of navigation items.",
+					"items": {
+						"$ref": "#/$defs/HeaderItem"
+					}
+				},
+				"primary": {
+					"type": "object",
+					"description": "Primary CTA button rendered in the navbar (e.g. \"Get Started\").",
+					"required": ["label", "href"],
+					"additionalProperties": false,
+					"properties": {
+						"label": {
+							"type": "string",
+							"description": "Button text."
+						},
+						"href": {
+							"type": "string",
+							"description": "Button destination URL."
+						}
+					}
+				}
+			}
+		},
+		"FooterColumn": {
+			"type": "object",
+			"required": ["title", "links"],
+			"additionalProperties": false,
+			"properties": {
+				"title": {
+					"type": "string",
+					"description": "Column heading."
+				},
+				"links": {
+					"type": "array",
+					"description": "Links in this column.",
+					"items": {
+						"$ref": "#/$defs/ExternalLink"
+					}
+				}
+			}
+		},
+		"SocialLinks": {
+			"type": "object",
+			"description": "Social-icon URLs rendered alongside footer columns.",
+			"additionalProperties": false,
+			"properties": {
+				"github": { "type": "string", "description": "GitHub URL." },
+				"twitter": { "type": "string", "description": "Twitter/X URL." },
+				"x": { "type": "string", "description": "Alias for twitter. When set and twitter is not, treated as twitter." },
+				"discord": { "type": "string", "description": "Discord URL." },
+				"linkedin": { "type": "string", "description": "LinkedIn URL." },
+				"youtube": { "type": "string", "description": "YouTube URL." },
+				"bluesky": { "type": "string", "description": "Bluesky URL." }
+			}
+		},
+		"FooterConfig": {
+			"type": "object",
+			"description": "Page footer configuration.",
+			"additionalProperties": false,
+			"properties": {
+				"copyright": {
+					"type": "string",
+					"description": "Copyright notice displayed at the bottom of the page."
+				},
+				"columns": {
+					"type": "array",
+					"description": "Link columns displayed in the footer body.",
+					"items": {
+						"$ref": "#/$defs/FooterColumn"
+					}
+				},
+				"socialLinks": {
+					"$ref": "#/$defs/SocialLinks"
+				},
+				"social": {
+					"$ref": "#/$defs/SocialLinks",
+					"description": "Deprecated alias for socialLinks."
+				}
+			}
+		},
+		"ThemeConfig": {
+			"type": "object",
+			"description": "Visual appearance settings. All fields are optional; each pack supplies defaults.",
+			"additionalProperties": false,
+			"properties": {
+				"pack": {
+					"type": "string",
+					"description": "Theme pack name. Install external packs via npm or the ~/.jolli/themes/ directory. Use \"default\" for the vanilla nextra-theme-docs layout."
+				},
+				"logoUrl": {
+					"type": "string",
+					"description": "Logo image URL for light mode (and fallback when logoUrlDark is unset)."
+				},
+				"logoUrlDark": {
+					"type": "string",
+					"description": "Dark-mode logo variant."
+				},
+				"logoText": {
+					"type": "string",
+					"description": "Custom logo text. Defaults to the site title."
+				},
+				"logoDisplay": {
+					"type": "string",
+					"enum": ["text", "image", "both"],
+					"description": "Controls logo rendering. Auto-defaults to \"both\" if logoUrl is set, \"text\" otherwise."
+				},
+				"favicon": {
+					"type": "string",
+					"description": "Favicon URL. Note: top-level favicon wins when both are set."
+				},
+				"primaryColor": {
+					"type": "string",
+					"pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$",
+					"description": "Primary accent colour as a hex value (e.g. \"#3B82F6\"). Preferred over primaryHue."
+				},
+				"primaryHue": {
+					"type": "number",
+					"minimum": 0,
+					"maximum": 360,
+					"description": "Deprecated. Primary accent hue (HSL, 0–360). Use primaryColor instead."
+				},
+				"colors": {
+					"type": "object",
+					"description": "Richer colour model using hex values. colors.primary takes precedence over primaryHue.",
+					"required": ["primary"],
+					"additionalProperties": false,
+					"properties": {
+						"primary": {
+							"type": "string",
+							"pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$",
+							"description": "Main accent colour (hex, e.g. \"#4F46E5\")."
+						},
+						"light": {
+							"type": "string",
+							"pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$",
+							"description": "Lighter variant for hover/soft backgrounds (auto-derived if omitted)."
+						},
+						"dark": {
+							"type": "string",
+							"pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$",
+							"description": "Variant used in dark mode (auto-derived if omitted)."
+						}
+					}
+				},
+				"background": {
+					"type": "object",
+					"description": "Custom page background colour per colour scheme.",
+					"additionalProperties": false,
+					"properties": {
+						"light": {
+							"type": "string",
+							"pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$",
+							"description": "Background for light mode (hex)."
+						},
+						"dark": {
+							"type": "string",
+							"pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$",
+							"description": "Background for dark mode (hex)."
+						}
+					}
+				},
+				"defaultTheme": {
+					"type": "string",
+					"enum": ["light", "dark", "system"],
+					"description": "Initial colour scheme. Forge default: \"light\", Atlas default: \"dark\", Default: \"system\"."
+				},
+				"fontFamily": {
+					"type": "string",
+					"enum": ["inter", "space-grotesk", "ibm-plex", "source-sans", "source-serif"],
+					"description": "Body/heading font. Forge default: \"inter\", Atlas default: \"source-serif\"."
+				}
+			}
+		},
+		"BrandingConfig": {
+			"type": "object",
+			"description": "Deprecated nested-shape alias for theme. Coerced to theme at load time; theme wins when both are set.",
+			"additionalProperties": false,
+			"properties": {
+				"themePack": {
+					"type": "string",
+					"description": "Maps to theme.pack."
+				},
+				"logo": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"text": { "type": "string" },
+						"image": { "type": "string" },
+						"imageDark": { "type": "string" },
+						"display": { "type": "string", "enum": ["text", "image", "both"] },
+						"alt": { "type": "string" }
+					}
+				},
+				"favicon": { "type": "string" },
+				"colors": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"primaryHue": { "type": "number", "minimum": 0, "maximum": 360 }
+					}
+				},
+				"fontFamily": {
+					"type": "string",
+					"enum": ["inter", "space-grotesk", "ibm-plex", "source-sans", "source-serif"]
+				},
+				"defaultTheme": {
+					"type": "string",
+					"enum": ["light", "dark", "system"]
+				}
+			}
+		},
+		"NavigationPage": {
+			"type": "object",
+			"description": "A named top-level section. Content page, OpenAPI page, or menu page.",
+			"required": ["page"],
+			"additionalProperties": false,
+			"properties": {
+				"page": {
+					"type": "string",
+					"description": "Display title shown in the navigation."
+				},
+				"root": {
+					"type": "string",
+					"description": "Base URL path. Article href values are resolved relative to this."
+				},
+				"sourceRoot": {
+					"type": "string",
+					"description": "Physical source directory (overrides logical root for file resolution)."
+				},
+				"content": {
+					"type": "array",
+					"description": "Ordered list of groups and/or articles.",
+					"items": {
+						"oneOf": [
+							{ "$ref": "#/$defs/NavigationGroup" },
+							{ "$ref": "#/$defs/NavigationArticle" }
+						]
+					}
+				},
+				"openapi": {
+					"type": "string",
+					"description": "Relative path to an OpenAPI spec file. Mutually exclusive with content."
+				},
+				"type": {
+					"type": "string",
+					"enum": ["menu"],
+					"description": "When \"menu\", renders as a navbar dropdown instead of a content section."
+				},
+				"items": {
+					"type": "array",
+					"description": "Links displayed in the dropdown. Only valid when type is \"menu\".",
+					"items": {
+						"$ref": "#/$defs/NavigationMenuItem"
+					}
+				}
+			}
+		},
+		"NavigationGroup": {
+			"type": "object",
+			"description": "A non-clickable section heading that clusters articles.",
+			"required": ["group", "content"],
+			"additionalProperties": false,
+			"properties": {
+				"group": {
+					"type": "string",
+					"description": "Display label for the section heading."
+				},
+				"root": {
+					"type": "string",
+					"description": "Optional sub-path. Article href values in this group are resolved relative to this."
+				},
+				"sourceRoot": {
+					"type": "string",
+					"description": "Physical source directory for this group."
+				},
+				"content": {
+					"type": "array",
+					"description": "Ordered list of articles. Groups cannot nest inside groups.",
+					"items": {
+						"$ref": "#/$defs/NavigationArticle"
+					}
+				}
+			}
+		},
+		"NavigationArticle": {
+			"type": "object",
+			"description": "A navigable sidebar item. Can nest child articles as a collapsible dropdown.",
+			"required": ["article", "href"],
+			"additionalProperties": false,
+			"properties": {
+				"article": {
+					"type": "string",
+					"description": "Display label shown in the sidebar."
+				},
+				"href": {
+					"type": "string",
+					"description": "Path to the content. Resolved relative to the nearest ancestor root."
+				},
+				"source": {
+					"type": "string",
+					"description": "Optional source markdown path (overrides href-based file resolution)."
+				},
+				"type": {
+					"type": "string",
+					"enum": ["external"],
+					"description": "Use \"external\" for links that open outside the site."
+				},
+				"articles": {
+					"type": "array",
+					"description": "Nested child articles rendered as a collapsible dropdown.",
+					"items": {
+						"$ref": "#/$defs/NavigationArticle"
+					}
+				},
+				"expanded": {
+					"type": "boolean",
+					"description": "Whether the dropdown is open by default. Defaults to false."
+				}
+			}
+		},
+		"NavigationMenuItem": {
+			"type": "object",
+			"description": "A link entry inside a menu page dropdown.",
+			"required": ["label", "url"],
+			"additionalProperties": false,
+			"properties": {
+				"label": {
+					"type": "string",
+					"description": "Display text."
+				},
+				"url": {
+					"type": "string",
+					"description": "Destination URL — internal path or external URL."
+				}
+			}
+		},
+		"SidebarItemValue": {
+			"oneOf": [
+				{
+					"type": "string",
+					"description": "Custom display label."
+				},
+				{
+					"type": "object",
+					"description": "Nextra _meta.js object (external link, hidden item, or separator).",
+					"properties": {
+						"title": { "type": "string" },
+						"href": { "type": "string" },
+						"type": { "type": "string", "enum": ["separator"] },
+						"display": { "type": "string", "enum": ["hidden"] },
+						"icon": { "type": "string", "description": "Optional icon (emoji) prepended to the title." }
+					},
+					"additionalProperties": false
+				}
+			]
+		}
+	}
+}

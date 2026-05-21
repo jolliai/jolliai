@@ -46,6 +46,8 @@ export interface OpenApiSpecInput {
 	 * diagnostics; emitters do not need to read the source file again.
 	 */
 	sourceRelPath: string;
+	/** Optional UI-facing title when the spec is explicitly declared in site.json navigation. */
+	displayTitle?: string;
 	/** Pre-built parser + per-operation code samples. */
 	pipeline: OpenApiPipelineResult;
 }
@@ -60,7 +62,11 @@ export interface SiteRenderer {
 	 * Initialize (or update) the build project scaffold in `buildDir`.
 	 * Creates package.json, config files, layout files, etc.
 	 */
-	initProject(buildDir: string, config: SiteJson, options: { staticExport?: boolean }): Promise<{ isNew: boolean }>;
+	initProject(
+		buildDir: string,
+		config: SiteJson,
+		options: { staticExport?: boolean; sourceRoot?: string; themePath?: string },
+	): Promise<{ isNew: boolean }>;
 
 	/**
 	 * Returns paths that should be cleared between runs

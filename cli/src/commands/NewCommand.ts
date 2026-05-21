@@ -9,7 +9,7 @@
  * message. On failure, prints the error message and sets process.exitCode = 1.
  */
 
-import { join } from "node:path";
+import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import type { Command } from "commander";
 import { scaffoldProject } from "../site/StarterKit.js";
@@ -49,7 +49,7 @@ export function registerNewCommand(program: Command): void {
 				}
 			}
 
-			const targetDir = join(process.cwd(), folderName);
+			const targetDir = resolve(process.cwd(), folderName);
 			const result = await scaffoldProject(targetDir);
 
 			if (result.success) {

@@ -18,17 +18,28 @@ import type { ScaffoldResult } from "./Types.js";
 
 const SITE_JSON = JSON.stringify(
 	{
+		$schema: "https://jolli.ai/schemas/site-config.json",
 		title: "My API Docs",
 		description: "Documentation site powered by Jolli",
-		nav: [
-			{ label: "Home", href: "/" },
-			{ label: "Getting Started", href: "/getting-started" },
-			{ label: "API Reference", href: "/api/openapi" },
-			{ label: "Guides", href: "/guides/introduction" },
-		],
-		// Forge — clean developer-docs visual style. Drop or change to
-		// `"default"` to render with vanilla `nextra-theme-docs` instead.
 		theme: { pack: "forge" },
+		navigation: [
+			{
+				page: "Documentation",
+				root: "/docs",
+				content: [
+					{ article: "Getting Started", href: "getting-started" },
+					{
+						group: "Guides",
+						root: "guides",
+						content: [{ article: "Introduction", href: "introduction" }],
+					},
+				],
+			},
+			{
+				page: "API Reference",
+				root: "/api-openapi",
+			},
+		],
 	},
 	null,
 	2,
@@ -42,17 +53,22 @@ Welcome to your new documentation site, powered by **Jolli**.
 
 | File / Folder | Purpose |
 |---|---|
-| \`site.json\` | Site title, description, and navigation bar |
+| \`site.json\` | Site config — title, navigation pages, and theme |
 | \`index.md\` | This page — the home page |
-| \`getting-started.md\` | A quick-start guide for new users |
-| \`api/openapi.yaml\` | Example OpenAPI 3.x specification |
-| \`guides/introduction.md\` | Nested subfolder navigation example |
+| \`docs/\` | Documentation page content |
+| \`api/openapi.yaml\` | OpenAPI spec — auto-rendered as API Reference page |
 
 ## Next steps
 
-1. Edit \`site.json\` to set your site title and navigation links.
+1. Edit \`site.json\` to configure your navigation pages and theme.
 2. Replace the example markdown files with your own content.
-3. Run \`jolli start\` to build and preview your site.
+3. Replace \`api/openapi.yaml\` with your own OpenAPI spec.
+4. Run \`jolli dev\` to preview, or \`jolli start\` to build and serve.
+`;
+
+const DOCS_INDEX_MD = `# Documentation
+
+Welcome to the documentation. Use the sidebar to navigate between pages.
 `;
 
 const GETTING_STARTED_MD = `# Getting Started
@@ -67,37 +83,51 @@ This guide walks you through the basics of your new documentation site.
 ## Running the site locally
 
 \`\`\`bash
+jolli dev
+\`\`\`
+
+This starts a live dev server with hot-reload. For a production build:
+
+\`\`\`bash
 jolli start
 \`\`\`
 
-This command reads your content folder, generates a Nextra v4 project in
-\`.jolli-site/\`, installs dependencies (first run only), builds the site, and
-indexes it for full-text search.
+## Project structure
 
-## Editing content
+\`\`\`
+my-docs/
+├── site.json            # Navigation pages, theme, footer
+├── index.md             # Home page
+├── docs/                # Documentation page
+│   ├── getting-started.md
+│   └── guides/
+│       └── introduction.md
+└── api/
+    └── openapi.yaml     # Auto-rendered as API Reference page
+\`\`\`
 
-All content lives in this folder. You can:
+## How navigation works
 
-- Add or edit \`.md\` / \`.mdx\` files for documentation pages.
-- Add \`.yaml\` / \`.json\` OpenAPI specs for interactive API reference pages.
-- Organise pages into subfolders — the folder structure becomes the navigation.
+\`site.json\` defines pages at the top of your site. Each page maps to a
+content folder:
 
-## Configuring the site
+- **Documentation** page → \`docs/\` folder (markdown pages)
+- **API Reference** page → auto-generated from \`api/openapi.yaml\`
 
-Edit \`site.json\` to change the site title, description, top navigation bar,
-and visual theme. Available theme packs: \`"forge"\` (clean developer docs,
-default) or \`"default"\` (vanilla \`nextra-theme-docs\`).
+Any \`.yaml\` or \`.json\` file with an \`openapi\` field is automatically
+detected and rendered as an interactive API Reference with code samples
+in cURL, JavaScript, TypeScript, Python, and Go.
+
+## Adding a theme
 
 \`\`\`json
 {
-  "title": "My API Docs",
-  "description": "Documentation site powered by Jolli",
-  "nav": [
-    { "label": "Home", "href": "/" }
-  ],
-  "theme": { "pack": "forge", "primaryHue": 228 }
+  "theme": { "pack": "forge" }
 }
 \`\`\`
+
+Theme packs are installed automatically from the Jolli theme registry.
+Use \`"default"\` for the vanilla Nextra theme with no pack styling.
 `;
 
 const OPENAPI_YAML = `openapi: "3.1.0"
@@ -315,15 +345,16 @@ export async function scaffoldProject(targetDir: string): Promise<ScaffoldResult
 	try {
 		// Create root and subdirectories
 		await mkdir(join(targetDir, "api"), { recursive: true });
-		await mkdir(join(targetDir, "guides"), { recursive: true });
+		await mkdir(join(targetDir, "docs", "guides"), { recursive: true });
 
 		// Write all starter files in parallel
 		await Promise.all([
 			writeFile(join(targetDir, "site.json"), SITE_JSON, "utf-8"),
 			writeFile(join(targetDir, "index.md"), INDEX_MD, "utf-8"),
-			writeFile(join(targetDir, "getting-started.md"), GETTING_STARTED_MD, "utf-8"),
+			writeFile(join(targetDir, "docs", "index.md"), DOCS_INDEX_MD, "utf-8"),
+			writeFile(join(targetDir, "docs", "getting-started.md"), GETTING_STARTED_MD, "utf-8"),
+			writeFile(join(targetDir, "docs", "guides", "introduction.md"), GUIDES_INTRODUCTION_MD, "utf-8"),
 			writeFile(join(targetDir, "api", "openapi.yaml"), OPENAPI_YAML, "utf-8"),
-			writeFile(join(targetDir, "guides", "introduction.md"), GUIDES_INTRODUCTION_MD, "utf-8"),
 		]);
 
 		return {

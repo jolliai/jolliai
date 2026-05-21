@@ -240,14 +240,13 @@ describe("NextraProjectWriter.generateLayout", () => {
 
 	// ── theme.pack dispatcher (Phase 1) ──────────────────────────────────────
 
-	it("uses the Forge layout when theme.pack is unset (Forge is the implicit default)", async () => {
-		const { generateLayout, generateForgeLayout } = await import("./NextraProjectWriter.js");
+	it("uses the default layout when theme.pack is unset (no built-in packs registered)", async () => {
+		const { generateLayout, generateDefaultLayout } = await import("./NextraProjectWriter.js");
 		const config = {
 			title: "My API Docs",
 			description: "Documentation for My API",
-			// no `theme` block — must dispatch to Forge, not the vanilla default.
 		};
-		expect(generateLayout(config)).toBe(generateForgeLayout(config));
+		expect(generateLayout(config)).toBe(generateDefaultLayout(config));
 	});
 
 	it("uses the default layout when theme.pack is explicitly 'default'", async () => {
@@ -255,20 +254,11 @@ describe("NextraProjectWriter.generateLayout", () => {
 		expect(generateLayout(SAMPLE_CONFIG)).toBe(generateDefaultLayout(SAMPLE_CONFIG));
 	});
 
-	it("forge pack returns the Forge layout (forge-sidebar-logo + forge.css import)", async () => {
-		const { generateLayout } = await import("./NextraProjectWriter.js");
-		const config = { ...SAMPLE_CONFIG, theme: { pack: "forge" as const } };
-		const result = generateLayout(config);
-		expect(result).toContain("forge-sidebar-logo");
-		expect(result).toContain("./themes/forge.css");
-	});
-
-	it("atlas pack returns the Atlas layout (atlas-navbar-logo + atlas.css import)", async () => {
-		const { generateLayout } = await import("./NextraProjectWriter.js");
-		const config = { ...SAMPLE_CONFIG, theme: { pack: "atlas" as const } };
-		const result = generateLayout(config);
-		expect(result).toContain("atlas-navbar-logo");
-		expect(result).toContain("./themes/atlas.css");
+	it("unregistered pack falls back to the default layout", async () => {
+		const { generateLayout, generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const config = { ...SAMPLE_CONFIG, theme: { pack: "nonexistent-pack-xyz" } };
+		// Unknown pack name is not in the registry — falls back to default
+		expect(generateLayout(config)).toBe(generateDefaultLayout(config));
 	});
 
 	it("default layout renders the title in <b> when no logo image or text is configured", async () => {
@@ -345,6 +335,37 @@ describe("NextraProjectWriter.generateLayout", () => {
 		});
 		expect(result).toContain("My API Docs");
 		expect(result).toContain("nextra-theme-docs");
+	});
+
+	// ── CTA button (header.primary — default theme) ─────────────────────────
+
+	it("default layout renders a CTA button with inline styles when header.primary is set", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({
+			...SAMPLE_CONFIG,
+			header: { items: [], primary: { label: "Get Started", href: "/start" } },
+		});
+		expect(result).toContain('{"Get Started"}');
+		expect(result).toContain('href={"/start"}');
+		expect(result).toContain("background:");
+	});
+
+	it("default layout does not render a CTA button when header.primary is absent", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout(SAMPLE_CONFIG);
+		expect(result).not.toContain("Get Started");
+		// The self-closing <Navbar ... /> form should be used (no </Navbar> closing tag)
+		expect(result).toContain("} />");
+	});
+
+	it("default layout sanitizes javascript: URLs in header.primary.href", async () => {
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		const result = generateDefaultLayout({
+			...SAMPLE_CONFIG,
+			header: { items: [], primary: { label: "Bad", href: "javascript:alert(1)" } },
+		});
+		expect(result).not.toMatch(/javascript:alert/i);
+		expect(result).toContain('href={"#"}');
 	});
 
 	// ── footer (default theme: inline-style fallback, no pack CSS) ────────────
@@ -456,6 +477,34 @@ describe("NextraProjectWriter.generateLayout", () => {
 		expect(result).not.toContain("data:text/html");
 		// Both unsafe URLs should have been replaced with "#".
 		expect(result.match(/<a href={"#"}/g)?.length).toBeGreaterThanOrEqual(2);
+	});
+
+	// ── Sidebar anchors ─────────────────────────────────────────────────────
+
+	it("default layout renders sidebar anchors when configured", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			theme: DEFAULT_PACK_THEME,
+			anchors: [
+				{ label: "Blog", href: "https://blog.example.com" },
+				{ label: "Community", href: "https://discord.gg/x", icon: "💬" },
+			],
+		});
+		expect(result).toContain("Blog");
+		expect(result).toContain("Community");
+		expect(result).toContain("💬");
+	});
+
+	it("default layout omits anchor block when no anchors configured", async () => {
+		const { generateLayout } = await import("./NextraProjectWriter.js");
+		const result = generateLayout({
+			title: "T",
+			description: "D",
+			theme: DEFAULT_PACK_THEME,
+		});
+		expect(result).not.toContain("sidebar-anchors");
 	});
 });
 
@@ -756,114 +805,14 @@ describe("NextraProjectWriter.initNextraProject", () => {
 		expect(content).toContain("export default");
 	});
 
-	// ── Forge pack: writes app/themes/forge.css ──────────────────────────────
-
-	it("writes app/themes/forge.css when theme.pack is 'forge'", async () => {
-		const { initNextraProject } = await import("./NextraProjectWriter.js");
-		const buildDir = join(tempDir, ".jolli-site");
-		const config = { ...SAMPLE_CONFIG, theme: { pack: "forge" as const } };
-
-		await initNextraProject(buildDir, config);
-
-		expect(existsSync(join(buildDir, "app", "themes", "forge.css"))).toBe(true);
-	});
-
-	it("does NOT write app/themes/forge.css when theme.pack is explicitly 'default'", async () => {
+	it("does NOT write any pack CSS when theme.pack is explicitly 'default'", async () => {
 		const { initNextraProject } = await import("./NextraProjectWriter.js");
 		const buildDir = join(tempDir, ".jolli-site");
 
 		await initNextraProject(buildDir, SAMPLE_CONFIG);
 
-		expect(existsSync(join(buildDir, "app", "themes", "forge.css"))).toBe(false);
-	});
-
-	it("DOES write app/themes/forge.css when theme.pack is unset (Forge is the implicit default)", async () => {
-		const { initNextraProject } = await import("./NextraProjectWriter.js");
-		const buildDir = join(tempDir, ".jolli-site");
-		const config = {
-			title: "My API Docs",
-			description: "Documentation for My API",
-			// no `theme` block — Forge CSS still has to land or the layout import breaks.
-		};
-
-		await initNextraProject(buildDir, config);
-
-		expect(existsSync(join(buildDir, "app", "themes", "forge.css"))).toBe(true);
-	});
-
-	it("forge.css reflects theme.primaryHue in the generated overrides", async () => {
-		const { initNextraProject } = await import("./NextraProjectWriter.js");
-		const buildDir = join(tempDir, ".jolli-site");
-		const config = { ...SAMPLE_CONFIG, theme: { pack: "forge" as const, primaryHue: 145 } };
-
-		await initNextraProject(buildDir, config);
-
-		const css = await readFile(join(buildDir, "app", "themes", "forge.css"), "utf-8");
-		expect(css).toContain("--nextra-primary-hue:        145");
-		expect(css).toContain("hsl(145");
-	});
-
-	it("forge.css reflects theme.fontFamily in the generated overrides", async () => {
-		const { initNextraProject } = await import("./NextraProjectWriter.js");
-		const buildDir = join(tempDir, ".jolli-site");
-		const config = {
-			...SAMPLE_CONFIG,
-			theme: { pack: "forge" as const, fontFamily: "ibm-plex" as const },
-		};
-
-		await initNextraProject(buildDir, config);
-
-		const css = await readFile(join(buildDir, "app", "themes", "forge.css"), "utf-8");
-		expect(css).toContain("--forge-font-family:");
-		expect(css).toContain("IBM Plex Sans");
-	});
-
-	// ── Atlas pack: writes app/themes/atlas.css ──────────────────────────────
-
-	it("writes app/themes/atlas.css when theme.pack is 'atlas'", async () => {
-		const { initNextraProject } = await import("./NextraProjectWriter.js");
-		const buildDir = join(tempDir, ".jolli-site");
-		const config = { ...SAMPLE_CONFIG, theme: { pack: "atlas" as const } };
-
-		await initNextraProject(buildDir, config);
-
-		expect(existsSync(join(buildDir, "app", "themes", "atlas.css"))).toBe(true);
-	});
-
-	it("does NOT write app/themes/atlas.css for the forge pack", async () => {
-		const { initNextraProject } = await import("./NextraProjectWriter.js");
-		const buildDir = join(tempDir, ".jolli-site");
-		const config = { ...SAMPLE_CONFIG, theme: { pack: "forge" as const } };
-
-		await initNextraProject(buildDir, config);
-
-		expect(existsSync(join(buildDir, "app", "themes", "atlas.css"))).toBe(false);
-	});
-
-	it("atlas.css uses Atlas's manifest hue (200) when primaryHue is unset", async () => {
-		const { initNextraProject } = await import("./NextraProjectWriter.js");
-		const buildDir = join(tempDir, ".jolli-site");
-		const config = { ...SAMPLE_CONFIG, theme: { pack: "atlas" as const } };
-
-		await initNextraProject(buildDir, config);
-
-		const css = await readFile(join(buildDir, "app", "themes", "atlas.css"), "utf-8");
-		expect(css).toContain("--nextra-primary-hue:        200");
-	});
-
-	it("atlas.css reflects theme.fontFamily in the generated overrides", async () => {
-		const { initNextraProject } = await import("./NextraProjectWriter.js");
-		const buildDir = join(tempDir, ".jolli-site");
-		const config = {
-			...SAMPLE_CONFIG,
-			theme: { pack: "atlas" as const, fontFamily: "source-sans" as const },
-		};
-
-		await initNextraProject(buildDir, config);
-
-		const css = await readFile(join(buildDir, "app", "themes", "atlas.css"), "utf-8");
-		expect(css).toContain("--atlas-font-family:");
-		expect(css).toContain("Source Sans 3");
+		// The default theme has no CSS — no themes/ directory should be created.
+		expect(existsSync(join(buildDir, "app", "themes", "default.css"))).toBe(false);
 	});
 });
 
