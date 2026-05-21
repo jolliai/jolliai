@@ -65,6 +65,23 @@ const { createWebviewPanel } = vi.hoisted(() => ({
 	})),
 }));
 
+const { withProgress } = vi.hoisted(() => ({
+	// Default: pass-through the task with a non-cancelled token. Individual
+	// tests can override via withProgress.mockImplementationOnce(...).
+	// NOTE: NOT async — we want to forward the task's promise directly so
+	// caller's `await withProgress(...)` resolves on the same microtask
+	// chain as the task body's internal awaits.
+	withProgress: vi.fn(
+		(
+			_opts: unknown,
+			task: (
+				progress: { report: (v: unknown) => void },
+				token: { onCancellationRequested: (cb: () => void) => void },
+			) => unknown,
+		) => task({ report: vi.fn() }, { onCancellationRequested: vi.fn() }),
+	),
+}));
+
 vi.mock("vscode", () => ({
 	window: {
 		createWebviewPanel,
@@ -75,7 +92,9 @@ vi.mock("vscode", () => ({
 		showOpenDialog,
 		showSaveDialog,
 		showTextDocument,
+		withProgress,
 	},
+	ProgressLocation: { Notification: 15, Window: 10, SourceControl: 1 },
 	env: {
 		clipboard: { writeText: clipboardWriteText },
 		openExternal,
@@ -136,6 +155,19 @@ vi.mock("../../../cli/src/core/Summarizer.js", () => ({
 	generateE2eTest: mockGenerateE2eTest,
 	generateRecap: mockGenerateRecap,
 	translateToEnglish: mockTranslateToEnglish,
+}));
+
+const { mockRegenerateSummary, mockLoadRegenerateContext } = vi.hoisted(() => ({
+	mockRegenerateSummary: vi.fn(),
+	mockLoadRegenerateContext: vi.fn(),
+}));
+
+vi.mock("../../../cli/src/core/Regenerator.js", () => ({
+	regenerateSummary: mockRegenerateSummary,
+}));
+
+vi.mock("../../../cli/src/core/RegenerateContext.js", () => ({
+	loadRegenerateContext: mockLoadRegenerateContext,
 }));
 
 const {
@@ -377,12 +409,14 @@ const {
 	mockBuildHtml,
 	mockBuildE2eTestSection,
 	mockBuildRecapSection,
+	mockBuildTopicsSection,
 	mockRenderTopic,
 	mockRenderE2eScenario,
 } = vi.hoisted(() => ({
 	mockBuildHtml: vi.fn().mockReturnValue("<html>mock</html>"),
 	mockBuildE2eTestSection: vi.fn().mockReturnValue("<div>e2e</div>"),
 	mockBuildRecapSection: vi.fn().mockReturnValue("<div>recap</div>"),
+	mockBuildTopicsSection: vi.fn().mockReturnValue("<div>topics</div>"),
 	mockRenderTopic: vi.fn().mockReturnValue("<div>topic</div>"),
 	mockRenderE2eScenario: vi.fn().mockReturnValue("<div>scenario</div>"),
 }));
@@ -391,6 +425,7 @@ vi.mock("./SummaryHtmlBuilder.js", () => ({
 	buildHtml: mockBuildHtml,
 	buildE2eTestSection: mockBuildE2eTestSection,
 	buildRecapSection: mockBuildRecapSection,
+	buildTopicsSection: mockBuildTopicsSection,
 	renderTopic: mockRenderTopic,
 	renderE2eScenario: mockRenderE2eScenario,
 }));
@@ -428,6 +463,10 @@ const {
 	mockBuildBranchRelativePath: vi.fn().mockReturnValue("main"),
 }));
 
+const { mockFormatActiveProviderLabel } = vi.hoisted(() => ({
+	mockFormatActiveProviderLabel: vi.fn().mockReturnValue("Anthropic"),
+}));
+
 vi.mock("./SummaryUtils.js", () => ({
 	buildPanelTitle: mockBuildPanelTitle,
 	buildPushTitle: mockBuildPushTitle,
@@ -436,6 +475,7 @@ vi.mock("./SummaryUtils.js", () => ({
 	collectSortedTopics: mockCollectSortedTopics,
 	collectAllPlans: mockCollectAllPlans,
 	buildBranchRelativePath: mockBuildBranchRelativePath,
+	formatActiveProviderLabel: mockFormatActiveProviderLabel,
 }));
 
 const { mockExecSync } = vi.hoisted(() => ({
@@ -1916,6 +1956,318 @@ describe("SummaryWebviewPanel", () => {
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({ command: "recapUpdateError" }),
 				);
+			});
+		});
+
+		// ── regenerateSummary ───────────────────────────────────────────────
+
+		describe("regenerateSummary", () => {
+			const stubCtx = () => ({
+				entryCount: 7,
+				sessionCount: 1,
+				sources: ["Claude"],
+				humanTurns: 3,
+				plansCount: 0,
+				notesCount: 0,
+				linearCount: 0,
+			});
+			const stubUpdated = () =>
+				makeSummary({
+					topics: [],
+					recap: "regenerated",
+					commitMessage: "after regen",
+				});
+
+			beforeEach(() => {
+				mockLoadRegenerateContext.mockReset();
+				mockRegenerateSummary.mockReset();
+				withProgress.mockClear();
+				mockBuildTopicsSection.mockReturnValue('<div id="topicsSection">t</div>');
+				mockBuildRecapSection.mockReturnValue('<div id="recapSection">r</div>');
+			});
+
+			it("no-ops when the user cancels the confirm dialog", async () => {
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				expect(mockRegenerateSummary).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+
+			it("persists the updated summary and posts re-render on success", async () => {
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				showWarningMessage.mockResolvedValueOnce("Regenerate");
+				mockRegenerateSummary.mockResolvedValue({
+					updated: stubUpdated(),
+					result: {} as never,
+				});
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ recap: "regenerated" }),
+					workspaceRoot,
+					true,
+				);
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({
+						command: "summaryRegenerated",
+						topicsHtml: '<div id="topicsSection">t</div>',
+						recapHtml: '<div id="recapSection">r</div>',
+					}),
+				);
+			});
+
+			it("does NOT pass artifacts to bridge.storeSummary on success", async () => {
+				// Regression guard: artifacts must stay undefined or the orphan-
+				// branch transcripts / plan-progress written at first-run time
+				// would be overwritten on every regenerate.
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				showWarningMessage.mockResolvedValueOnce("Regenerate");
+				mockRegenerateSummary.mockResolvedValue({
+					updated: stubUpdated(),
+					result: {} as never,
+				});
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				// bridge.storeSummary signature is (summary, force, artifacts?);
+				// stubBridge forwards positional args without the trailing
+				// undefined, so the recorded call should be (summary, root, true).
+				const lastCall = mockStoreSummary.mock.calls[mockStoreSummary.mock.calls.length - 1];
+				expect(lastCall.length).toBe(3);
+			});
+
+			it("includes entry/session counts and the active provider in the confirm dialog detail", async () => {
+				mockLoadRegenerateContext.mockResolvedValue({
+					entryCount: 7,
+					sessionCount: 1,
+					sources: ["Claude"],
+					humanTurns: 3,
+					plansCount: 0,
+					notesCount: 0,
+					linearCount: 0,
+				});
+				mockLoadConfig.mockResolvedValueOnce({ apiKey: "k", model: "haiku" });
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				const [, opts] = showWarningMessage.mock.calls[0];
+				expect(opts.detail).toContain(
+					"7 transcript entries from 1 session (Claude)",
+				);
+				expect(opts.detail).toContain("OVERWRITTEN");
+				expect(opts.detail).toContain("via Anthropic");
+				expect(opts.detail).not.toContain("PRESERVED");
+			});
+
+			it("uses the zero-transcript copy when no AI sessions were saved", async () => {
+				mockLoadRegenerateContext.mockResolvedValue({
+					entryCount: 0,
+					sessionCount: 0,
+					sources: [],
+					humanTurns: 0,
+					plansCount: 0,
+					notesCount: 0,
+					linearCount: 0,
+				});
+				mockLoadConfig.mockResolvedValueOnce({ apiKey: "k", model: "haiku" });
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				const [, opts] = showWarningMessage.mock.calls[0];
+				expect(opts.detail).toContain("No saved AI conversations");
+				expect(showErrorMessage).not.toHaveBeenCalled();
+			});
+
+			it("posts summaryRegenerateError when the user cancels via the progress notification", async () => {
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				showWarningMessage.mockResolvedValueOnce("Regenerate");
+				// regenerateSummary never resolves; we trigger the cancel token instead.
+				mockRegenerateSummary.mockReturnValue(new Promise(() => {}));
+				// Override withProgress for this test only: fire the cancellation
+				// token before returning the task's result, so the Promise.race
+				// inside the handler resolves to "cancelled".
+				withProgress.mockImplementationOnce(
+					(_opts: unknown, task: (p: unknown, t: unknown) => Promise<unknown>) => {
+						let cancelCb: (() => void) | null = null;
+						const token = {
+							onCancellationRequested: (cb: () => void) => {
+								cancelCb = cb;
+							},
+						};
+						const taskPromise = task({ report: vi.fn() }, token);
+						// Fire cancel on the next microtask so the handler's
+						// Promise.race sees a "cancelled" winner.
+						queueMicrotask(() => cancelCb?.());
+						return taskPromise;
+					},
+				);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "summaryRegenerateError" }),
+				);
+			});
+
+			it("uses singular 'entry'/'session' copy when count is 1", async () => {
+				mockLoadRegenerateContext.mockResolvedValue({
+					entryCount: 1,
+					sessionCount: 1,
+					sources: ["Claude"],
+					humanTurns: 1,
+					plansCount: 0,
+					notesCount: 0,
+					linearCount: 0,
+				});
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				const [, opts] = showWarningMessage.mock.calls[0];
+				// "1 transcript entry from 1 session" — no plural "s".
+				expect(opts.detail).toContain("1 transcript entry from 1 session");
+				expect(opts.detail).not.toContain("entries");
+				expect(opts.detail).not.toContain("sessions");
+			});
+
+			it("includes only the plans line when plans is the sole attached artifact", async () => {
+				// Covers the false branches of the notesCount / linearCount
+				// conditionals inside buildRegenerateConfirmDetail.
+				mockLoadRegenerateContext.mockResolvedValue({
+					entryCount: 5,
+					sessionCount: 1,
+					sources: ["Claude"],
+					humanTurns: 2,
+					plansCount: 1,
+					notesCount: 0,
+					linearCount: 0,
+				});
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				const [, opts] = showWarningMessage.mock.calls[0];
+				expect(opts.detail).toContain("Archived 1 plan attached");
+				expect(opts.detail).not.toContain("note");
+				expect(opts.detail).not.toContain("Linear");
+			});
+
+			it("includes attached plans/notes/linear lines when any are present", async () => {
+				mockLoadRegenerateContext.mockResolvedValue({
+					entryCount: 5,
+					sessionCount: 2,
+					sources: ["Claude"],
+					humanTurns: 2,
+					plansCount: 2,
+					notesCount: 1,
+					linearCount: 3,
+				});
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				const [, opts] = showWarningMessage.mock.calls[0];
+				expect(opts.detail).toContain("2 plans");
+				expect(opts.detail).toContain("1 note");
+				expect(opts.detail).toContain("3 Linear issues");
+			});
+
+			it("omits the 'via {provider}' suffix when no credentials are configured", async () => {
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				mockFormatActiveProviderLabel.mockReturnValueOnce(undefined);
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				const [, opts] = showWarningMessage.mock.calls[0];
+				// Bare period ends the line; no provider attribution appended.
+				expect(opts.detail).toMatch(/This typically takes 20–40 seconds\.\s*$/);
+				expect(opts.detail).not.toMatch(/seconds\s+·\s+via\s/);
+			});
+
+			it("posts summaryRegenerateError when storeSummary throws (catchAndShow error path)", async () => {
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				showWarningMessage.mockResolvedValueOnce("Regenerate");
+				mockRegenerateSummary.mockResolvedValue({
+					updated: stubUpdated(),
+					result: {} as never,
+				});
+				mockStoreSummary.mockRejectedValueOnce(new Error("disk full"));
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Regenerate failed"),
+				);
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "summaryRegenerateError" }),
+				);
+			});
+
+			it("shows 'Unknown' source label when ctx.sources is empty but entryCount > 0", async () => {
+				mockLoadRegenerateContext.mockResolvedValue({
+					entryCount: 2,
+					sessionCount: 1,
+					sources: [],
+					humanTurns: 1,
+					plansCount: 0,
+					notesCount: 0,
+					linearCount: 0,
+				});
+				showWarningMessage.mockResolvedValueOnce(undefined);
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				const [, opts] = showWarningMessage.mock.calls[0];
+				expect(opts.detail).toContain("(Unknown)");
+			});
+
+			it("does nothing when a regenerate is already in flight (double-click guard)", async () => {
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				// Only ONE mockResolvedValueOnce — the second dispatch must
+				// short-circuit BEFORE reaching showWarningMessage. Two onces
+				// would leave a stale "Regenerate" in the queue for later tests.
+				showWarningMessage.mockResolvedValueOnce("Regenerate");
+				// Never-resolving promise → first call locks the in-flight flag.
+				mockRegenerateSummary.mockReturnValue(new Promise(() => {}));
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				expect(mockRegenerateSummary).toHaveBeenCalledTimes(1);
 			});
 		});
 
@@ -7770,6 +8122,101 @@ describe("SummaryWebviewPanel", () => {
 			await flushPromises();
 
 			expectStaleModalShown("generate recap");
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks regenerate summary BEFORE the confirm dialog", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "regenerateSummary" });
+			await flushPromises();
+
+			expectStaleModalShown("regenerate summary");
+			// Confirm dialog ("Regenerate this summary?") never shown.
+			const confirmCalls = showWarningMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0] === "Regenerate this summary?" : false,
+			);
+			expect(confirmCalls).toHaveLength(0);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks regenerate summary when commit goes stale DURING the LLM call", async () => {
+			// First two guards (entry + post-modal) → not stale; the third
+			// re-check (after the LLM returns) sees a stale chain and aborts
+			// before storeSummary. summaryRegenerateError is posted.
+			(stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>)
+				.mockResolvedValueOnce(new Map())
+				.mockResolvedValueOnce(new Map())
+				.mockResolvedValueOnce(
+					buildChainEntryMap([
+						{ hash: "abc123", parent: "rootnew0" },
+						{ hash: "rootnew0", parent: null },
+					]),
+				);
+			mockLoadRegenerateContext.mockResolvedValue({
+				entryCount: 1,
+				sessionCount: 1,
+				sources: ["Claude"],
+				humanTurns: 1,
+				plansCount: 0,
+				notesCount: 0,
+				linearCount: 0,
+			});
+			showWarningMessage.mockResolvedValueOnce("Regenerate");
+			mockRegenerateSummary.mockResolvedValue({
+				updated: makeSummary({ commitHash: "abc123", recap: "fresh" }),
+				result: {} as never,
+			});
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "regenerateSummary" });
+			await flushPromises();
+
+			expectStaleModalShown("regenerate summary");
+			expect(mockRegenerateSummary).toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ command: "summaryRegenerateError" }),
+			);
+		});
+
+		it("blocks regenerate summary when commit goes stale BETWEEN entry guard and confirm acceptance", async () => {
+			// First entry-guard call → not stale. Modal-accept guard → stale.
+			// Confirms the post-modal race-window re-check fires; storeSummary
+			// never runs because the LLM step is short-circuited.
+			(stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>)
+				.mockResolvedValueOnce(new Map())
+				.mockResolvedValueOnce(
+					buildChainEntryMap([
+						{ hash: "abc123", parent: "rootnew0" },
+						{ hash: "rootnew0", parent: null },
+					]),
+				);
+			mockLoadRegenerateContext.mockResolvedValue({
+				entryCount: 1,
+				sessionCount: 1,
+				sources: ["Claude"],
+				humanTurns: 1,
+				plansCount: 0,
+				notesCount: 0,
+				linearCount: 0,
+			});
+			showWarningMessage.mockResolvedValueOnce("Regenerate");
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "regenerateSummary" });
+			await flushPromises();
+
+			expectStaleModalShown("regenerate summary");
+			expect(mockRegenerateSummary).not.toHaveBeenCalled();
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 

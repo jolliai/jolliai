@@ -262,6 +262,23 @@ export function buildCss(): string {
     cursor: wait;
     animation: spin 1s linear infinite;
   }
+  /* Regenerate-summary in-flight: dim topics + recap so the user reads them
+     as stale-pending. pointer-events is redundant w/ button[disabled]
+     (Task 5 freezes every focusable control), but it's a cheap belt-and-
+     suspenders against any non-disabled clickable that slipped through. */
+  .section.regenerating {
+    opacity: 0.5;
+    pointer-events: none;
+    transition: opacity 0.2s;
+  }
+  .section.regenerating button[disabled],
+  .section.regenerating textarea[disabled],
+  .section.regenerating input[disabled] {
+    cursor: not-allowed;
+  }
+  #regenerateSummaryBtn.generating {
+    animation: spin 1.2s linear infinite;
+  }
   .plan-title-link {
     color: var(--vscode-foreground);
     text-decoration: none;

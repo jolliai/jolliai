@@ -1,3 +1,5 @@
+import { TRANSCRIPT_SOURCE_LABELS } from "../../../cli/src/core/TranscriptSourceLabel.js";
+
 /**
  * Shared client-side renderer for transcript entries.
  *
@@ -14,6 +16,10 @@
  * fields that originate from extension-host data are passed through
  * 'esc()' before interpolation, exactly as before.
  *
+ * getSourceLabel BODY is generated from the TS-side TRANSCRIPT_SOURCE_LABELS
+ * map so the extension host and the webview always agree on labels (the
+ * extension uses the TS helper directly; this file emits the equivalent JS).
+ *
  * RUNTIME CONTRACT: the surrounding script must provide these symbols in
  * the enclosing scope (they are NOT params, to keep the call-site
  * signature unchanged):
@@ -28,14 +34,14 @@
  * in a comment) would prematurely terminate that literal.
  */
 export function buildTranscriptEntriesScript(): string {
+	// Generate the `if (source === 'X') return 'Y';` lines for every non-Claude
+	// entry from the shared TS map. Claude is the fallback (return at the end).
+	const labelBranches = Object.entries(TRANSCRIPT_SOURCE_LABELS)
+		.filter(([key]) => key !== "claude")
+		.map(([key, label]) => `    if (source === '${key}') return '${label}';`);
 	return [
 		"  function getSourceLabel(source) {",
-		"    if (source === 'codex') return 'Codex';",
-		"    if (source === 'gemini') return 'Gemini';",
-		"    if (source === 'opencode') return 'OpenCode';",
-		"    if (source === 'cursor') return 'Cursor';",
-		"    if (source === 'copilot') return 'Copilot';",
-		"    if (source === 'copilot-chat') return 'Copilot Chat';",
+		...labelBranches,
 		"    return 'Claude';",
 		"  }",
 		"",

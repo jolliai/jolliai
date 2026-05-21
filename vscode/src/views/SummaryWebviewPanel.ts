@@ -84,6 +84,7 @@ import {
 	buildE2eTestSection,
 	buildHtml,
 	buildRecapSection,
+	buildTopicsSection,
 	renderE2eScenario,
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
@@ -97,7 +98,14 @@ import {
 	buildPlanPushTitle,
 	buildPushTitle,
 	collectSortedTopics,
+	formatActiveProviderLabel,
 } from "./SummaryUtils.js";
+import {
+	loadRegenerateContext,
+	type RegenerateContext,
+} from "../../../cli/src/core/RegenerateContext.js";
+import { regenerateSummary } from "../../../cli/src/core/Regenerator.js";
+import type { LlmConfig } from "../../../cli/src/Types.js";
 
 /** Memory field updates sent from the webview edit form. */
 interface TopicUpdates {
@@ -160,6 +168,7 @@ type WebviewMessage =
 	| { command: "deleteAllTranscripts" }
 	| { command: "editRecap"; recap: string }
 	| { command: "generateRecap" }
+	| { command: "regenerateSummary" }
 	| { command: "openRewrittenCommit"; hash: string };
 
 /** Entry data sent back from the webview on Save All. */
@@ -457,6 +466,15 @@ export class SummaryWebviewPanel {
 					"Recap generation failed",
 					{
 						command: "recapUpdateError",
+					},
+				);
+				break;
+			case "regenerateSummary":
+				this.catchAndShow(
+					this.handleRegenerateSummary(),
+					"Regenerate failed",
+					{
+						command: "summaryRegenerateError",
 					},
 				);
 				break;
@@ -1678,6 +1696,141 @@ export class SummaryWebviewPanel {
 			command: "recapUpdated",
 			html: buildRecapSection(updated.recap),
 		});
+	}
+
+	private regenerateInProgress = false;
+
+	/**
+	 * End-to-end re-run of the summary LLM. Replaces topics + recap (plus
+	 * supporting fields like diffStats, transcriptEntries, llm); preserves
+	 * ticketId, e2eTestGuide, plans, notes, linearIssues, children, and all
+	 * push metadata. See cli/src/core/Regenerator.ts for the isolation
+	 * contract (no cursor advance, no archive re-write, no queue side
+	 * effects).
+	 */
+	private async handleRegenerateSummary(): Promise<void> {
+		const summary = this.currentSummary;
+		if (!summary) return;
+		if (this.regenerateInProgress) return;
+		// Set the flag SYNCHRONOUSLY (before any await) so a double-click can't
+		// race past the guard while the first invocation is suspended awaiting
+		// ensureCommitNotRewritten. The flag stays set across the confirm
+		// dialog too — if the user cancels, finally clears it.
+		this.regenerateInProgress = true;
+		try {
+			if (!(await this.ensureCommitNotRewritten("regenerate summary"))) return;
+
+			// loadRegenerateContext always resolves; zero-valued ctx for legacy
+			// summaries with no stored transcript, the confirm dialog adjusts copy.
+			const ctx = await loadRegenerateContext(summary, this.workspaceRoot);
+
+			// Load config BEFORE the confirm dialog so the dialog can show the
+			// provider label the next call will actually use. Same config feeds
+			// the regenerate call below.
+			const config = await loadGlobalConfig();
+
+			const detail = this.buildRegenerateConfirmDetail(
+				ctx,
+				config,
+				summary.commitHash,
+			);
+			const choice = await vscode.window.showWarningMessage(
+				"Regenerate this summary?",
+				{ modal: true, detail },
+				"Regenerate",
+			);
+			if (choice !== "Regenerate") return;
+
+			if (!(await this.ensureCommitNotRewritten("regenerate summary"))) return;
+
+			this.panel.webview.postMessage({ command: "summaryRegenerating" });
+
+			await vscode.window.withProgress(
+				{
+					location: vscode.ProgressLocation.Notification,
+					title: "Regenerating summary…",
+					cancellable: true,
+				},
+				async (_progress, token) => {
+					// AbortController wiring: if Summarizer.callLlm doesn't accept
+					// a signal, we still honor cancel by dropping the LLM result.
+					const cancelled = new Promise<"cancelled">((resolve) => {
+						token.onCancellationRequested(() => resolve("cancelled"));
+					});
+					const work = regenerateSummary(summary, this.workspaceRoot, config);
+					const outcome = await Promise.race([work, cancelled]);
+					if (outcome === "cancelled") {
+						this.panel.webview.postMessage({
+							command: "summaryRegenerateError",
+						});
+						return;
+					}
+
+					// Race-window re-check: amend can land during the 30 s LLM call.
+					if (!(await this.ensureCommitNotRewritten("regenerate summary"))) {
+						this.panel.webview.postMessage({
+							command: "summaryRegenerateError",
+						});
+						return;
+					}
+
+					await this.bridge.storeSummary(outcome.updated, true);
+					this.currentSummary = outcome.updated;
+					this.panel.webview.postMessage({
+						command: "summaryRegenerated",
+						topicsHtml: buildTopicsSection(outcome.updated),
+						recapHtml: buildRecapSection(outcome.updated.recap),
+					});
+					vscode.window.showInformationMessage("Summary regenerated.");
+				},
+			);
+		} finally {
+			this.regenerateInProgress = false;
+		}
+	}
+
+	private buildRegenerateConfirmDetail(
+		ctx: RegenerateContext,
+		config: LlmConfig,
+		commitHash: string,
+	): string {
+		const s = (n: number): string => (n === 1 ? "" : "s");
+		const sources = ctx.sources.length > 0 ? ctx.sources.join(", ") : "Unknown";
+		const shortHash = commitHash.substring(0, 8);
+		const provider = formatActiveProviderLabel(config);
+
+		const lines: string[] = [];
+		lines.push("The LLM will be re-run using:");
+		if (ctx.entryCount === 0) {
+			lines.push(
+				"  • No saved AI conversations for this commit — regenerating from the diff and attached metadata alone",
+			);
+		} else {
+			lines.push(
+				`  • ${ctx.entryCount} transcript ${ctx.entryCount === 1 ? "entry" : "entries"} from ${ctx.sessionCount} session${s(ctx.sessionCount)} (${sources})`,
+			);
+		}
+		lines.push(`  • The commit diff (reconstructed via \`git show ${shortHash}\`)`);
+		if (ctx.plansCount + ctx.notesCount + ctx.linearCount > 0) {
+			const parts: string[] = [];
+			if (ctx.plansCount > 0) parts.push(`${ctx.plansCount} plan${s(ctx.plansCount)}`);
+			if (ctx.notesCount > 0) parts.push(`${ctx.notesCount} note${s(ctx.notesCount)}`);
+			if (ctx.linearCount > 0) {
+				parts.push(`${ctx.linearCount} Linear issue${s(ctx.linearCount)}`);
+			}
+			lines.push(`  • Archived ${parts.join(", ")} attached to this commit`);
+		}
+		lines.push("");
+		lines.push("These fields will be OVERWRITTEN:");
+		lines.push("  • Topics — including any you have edited");
+		lines.push("  • Recap — including any you have edited");
+		lines.push("");
+		lines.push(
+			provider
+				? `This typically takes 20–40 seconds · via ${provider}`
+				: "This typically takes 20–40 seconds.",
+		);
+		return lines.join("\n");
 	}
 
 	/** Handles deleting a memory at the given global index (with confirmation). */
