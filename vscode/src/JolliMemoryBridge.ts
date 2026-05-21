@@ -20,6 +20,7 @@ import { filterToBranchHeads } from "../../cli/src/core/HeadEntryFilter.js";
 import {
 	extractRepoName,
 	getRemoteUrl,
+	resolveKBPath,
 	resolveKbParent,
 } from "../../cli/src/core/KBPathResolver.js";
 import {
@@ -28,6 +29,7 @@ import {
 } from "../../cli/src/core/KBRepoDiscoverer.js";
 import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
 import { MetadataManager } from "../../cli/src/core/MetadataManager.js";
+import { OrphanBranchStorage } from "../../cli/src/core/OrphanBranchStorage.js";
 import { normalizePathForCompare } from "../../cli/src/core/PathUtils.js";
 import {
 	loadConfig,
@@ -184,20 +186,40 @@ export class JolliMemoryBridge {
 	readonly cwd: string;
 
 	/**
-	 * Storage backend the bridge passes explicitly into every SummaryStore call,
-	 * so reads honour the user's storageMode (orphan / dual-write / folder)
-	 * without relying on the module-level `setActiveStorage` global. The
-	 * QueueWorker still uses that global because it lives in a separate process;
-	 * the extension process owns this instance instead.
+	 * Storage backend used for **writes** (and as the read fallback in
+	 * `orphan` storageMode). In `dual-write` mode this is a
+	 * `DualWriteStorage` whose `primary` is the orphan branch and whose
+	 * `shadow` is the FolderStorage under `<localFolder>/<repo>/.jolli/`.
+	 * Writes go to both so the Memory Bank folder and orphan branch stay
+	 * in lockstep for everything this device commits locally.
 	 *
-	 * Lazy: created on first `getStorage()` call rather than in the constructor,
-	 * so bridge methods that don't touch SummaryStore (git ops, install, etc.)
-	 * don't pay for config reads / FolderStorage init they'll never use.
-	 * `reloadStorage()` clears the cache so the next `getStorage()` rebuilds
-	 * from the latest config (used after a settings-save changes storageMode
-	 * or localFolder).
+	 * Reads use {@link getReadStorage}, NOT this — see that helper for
+	 * the rationale (sync visibility regression).
+	 *
+	 * Lazy: created on first `getStorage()` call rather than in the
+	 * constructor, so bridge methods that don't touch SummaryStore (git
+	 * ops, install, etc.) don't pay for config reads / FolderStorage
+	 * init they'll never use. `reloadStorage()` clears the cache so the
+	 * next `getStorage()` rebuilds from the latest config (used after a
+	 * settings-save changes storageMode or localFolder).
 	 */
 	private storagePromise: Promise<StorageProvider> | null = null;
+
+	/**
+	 * Companion storage for **reads** on the current workspace repo. See
+	 * {@link getReadStorage} for the full rationale; the short version is
+	 * that Memory Bank sync writes peer commits only to
+	 * `<localFolder>/<repo>/.jolli/`, so reads going through
+	 * `DualWriteStorage` (whose `readFile` is hardwired to `primary` =
+	 * orphan branch) silently miss everything sync brought in. Decoupling
+	 * the read path lets the panel match what Memory Bank Tree view and
+	 * the foreign-repo step of {@link listSummaryEntries} already see.
+	 *
+	 * Cleared by `reloadStorage()` alongside `storagePromise` so a
+	 * settings-driven `storageMode` flip takes effect on the next read
+	 * without a window reload.
+	 */
+	private readStoragePromise: Promise<StorageProvider> | null = null;
 
 	constructor(
 		/** Absolute path to the workspace root (git repo) */
@@ -207,8 +229,10 @@ export class JolliMemoryBridge {
 	}
 
 	/**
-	 * Returns the current StorageProvider, awaiting the initial creation or any
-	 * in-flight reload. Internal helper used by every SummaryStore wrapper below.
+	 * Returns the StorageProvider used for **writes** against the
+	 * current workspace repo. Awaits the initial creation or any
+	 * in-flight reload. Internal helper used by every SummaryStore
+	 * wrapper that *mutates* state.
 	 */
 	private getStorage(): Promise<StorageProvider> {
 		if (!this.storagePromise) {
@@ -218,20 +242,83 @@ export class JolliMemoryBridge {
 	}
 
 	/**
-	 * Drops the cached storage backend so the next `getStorage()` rebuilds
-	 * from the latest config. Called by the settings-save callback after the
-	 * user changes `storageMode` or `localFolder` so subsequent reads hit the
-	 * right backend without requiring a window reload.
+	 * Returns the StorageProvider used for **reads** against the current
+	 * workspace repo. In `dual-write` (default) and `folder` modes this
+	 * is a FolderStorage rooted at the same `<localFolder>/<repo>/`
+	 * directory that the Memory Bank tree walks — making the workspace
+	 * repo's read surface identical to every foreign-repo path in
+	 * {@link listSummaryEntries} step 2 ({@link getSummaryAnyRepo}, etc).
+	 *
+	 * Why split read from write: Memory Bank sync pulls peer commits
+	 * into the FolderStorage shadow only — the orphan branch on the
+	 * workspace repo is never updated by a sync round. Reads going
+	 * through `DualWriteStorage.readFile` (hardwired to `primary` =
+	 * orphan) therefore miss every sync-pulled row, which surfaces as
+	 * Memories / Timeline showing pre-sync state while the Memory Bank
+	 * Tree view (walks disk) shows the new commits. Two views, one
+	 * source of truth, used to disagree.
+	 *
+	 * Falls back to {@link getStorage} (orphan-flavoured) for
+	 * `storageMode = "orphan"`, where no folder data exists on disk —
+	 * legacy single-mode users see no behavior change.
+	 *
+	 * Writes intentionally stay on {@link getStorage} so they continue
+	 * to land on both backends; only reads pivot.
+	 */
+	private getReadStorage(): Promise<StorageProvider> {
+		if (!this.readStoragePromise) {
+			this.readStoragePromise = this.createReadStorage();
+		}
+		return this.readStoragePromise;
+	}
+
+	private async createReadStorage(): Promise<StorageProvider> {
+		let config: Record<string, unknown>;
+		try {
+			config = (await loadConfig()) as Record<string, unknown>;
+		} catch (err) {
+			log.warn(
+				"bridge",
+				"createReadStorage: failed to load config (%s) — falling back to write storage",
+				err instanceof Error ? err.message : String(err),
+			);
+			return this.getStorage();
+		}
+		const mode = (config.storageMode as string | undefined) ?? "dual-write";
+		if (mode === "orphan") {
+			return new OrphanBranchStorage(this.cwd);
+		}
+		const customKBPath = config.localFolder as string | undefined;
+		const repoName = extractRepoName(this.cwd);
+		const remoteUrl = getRemoteUrl(this.cwd);
+		const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
+		const mm = new MetadataManager(join(kbRoot, ".jolli"));
+		return new FolderStorage(kbRoot, mm);
+	}
+
+	/**
+	 * Drops the cached storage backends so the next read/write rebuilds
+	 * from the latest config. Called by the settings-save callback after
+	 * the user changes `storageMode` or `localFolder` so subsequent
+	 * reads/writes hit the right backend without requiring a window
+	 * reload.
+	 *
+	 * Clears both `storagePromise` (write path) AND `readStoragePromise`
+	 * (read path) — leaving the read cache in place after an
+	 * `orphan` ↔ `dual-write` flip would keep reads silently parked on
+	 * the previous mode's storage until window reload, which is exactly
+	 * the surprise this method exists to prevent.
 	 *
 	 * Also clears the aggregated cross-repo entries cache: when the user
-	 * changes `localFolder`, the discoverable set of foreign repos under the
-	 * Memory Bank parent changes too, so the cached merged list is stale by
-	 * definition. The old behavior left the cache in place, which is why
-	 * "switch Memory Bank folder then open Memories" used to show entries
-	 * from the previous folder until a window reload.
+	 * changes `localFolder`, the discoverable set of foreign repos under
+	 * the Memory Bank parent changes too, so the cached merged list is
+	 * stale by definition. The old behavior left the cache in place,
+	 * which is why "switch Memory Bank folder then open Memories" used
+	 * to show entries from the previous folder until a window reload.
 	 */
 	reloadStorage(): void {
 		this.storagePromise = null;
+		this.readStoragePromise = null;
 		this.cachedRootEntries = null;
 	}
 
@@ -901,8 +988,14 @@ export class JolliMemoryBridge {
 			.filter((parts) => parts.length >= 5);
 
 		const commitHashes = parsedEntries.map((parts) => parts[0]);
-		const storage = await this.getStorage();
-		const indexEntryMap = await getIndexEntryMap(this.cwd, storage);
+		// Read storage: post-sync data lives in the FolderStorage shadow
+		// when the user is on dual-write/folder mode, not on the orphan
+		// branch. Write storage (for the background alias scan below)
+		// stays on DualWriteStorage so aliases still land on both
+		// backends.
+		const readStorage = await this.getReadStorage();
+		const writeStorage = await this.getStorage();
+		const indexEntryMap = await getIndexEntryMap(this.cwd, readStorage);
 
 		const commits: Array<BranchCommit> = [];
 
@@ -942,16 +1035,19 @@ export class JolliMemoryBridge {
 		// Fire-and-forget — when new aliases are found, callers should refresh the panel.
 		const unmatchedHashes = commitHashes.filter((h) => !indexEntryMap.has(h));
 		if (unmatchedHashes.length > 0) {
-			void scanTreeHashAliases(unmatchedHashes, this.cwd, storage).then(
-				(anyFound) => {
-					if (anyFound) {
-						log.info(
-							"commits",
-							"Tree hash aliases found — panel refresh recommended",
-						);
-					}
-				},
-			);
+			void scanTreeHashAliases(
+				unmatchedHashes,
+				this.cwd,
+				writeStorage,
+				readStorage,
+			).then((anyFound) => {
+				if (anyFound) {
+					log.info(
+						"commits",
+						"Tree hash aliases found — panel refresh recommended",
+					);
+				}
+			});
 		}
 
 		const cachedCount = commits.filter(
@@ -1160,7 +1256,11 @@ export class JolliMemoryBridge {
 		}> = [];
 		let ticketId: string | undefined;
 
-		const storage = await this.getStorage();
+		// Squash-message prompt is a pure read of the summaries that will
+		// be merged — getReadStorage() so a peer-synced commit (only in
+		// the folder shadow on this device) still contributes its topics
+		// instead of being silently skipped as "no summary".
+		const storage = await this.getReadStorage();
 		for (const hash of hashes) {
 			const msg = (
 				await tryExecGit(["log", "-1", "--pretty=format:%s", hash], this.cwd)
@@ -1307,9 +1407,9 @@ export class JolliMemoryBridge {
 
 	// ── Summary access ────────────────────────────────────────────────────
 
-	/** Lists the most recent summaries from the JolliMemory orphan branch. */
+	/** Lists the most recent summaries for the workspace repo. */
 	async listSummaries(count: number): Promise<Array<CommitSummary>> {
-		const storage = await this.getStorage();
+		const storage = await this.getReadStorage();
 		const entries = await listSummaries(count, this.cwd, storage);
 		const summaries: Array<CommitSummary> = [];
 		for (const entry of entries) {
@@ -1357,10 +1457,14 @@ export class JolliMemoryBridge {
 			const merged: SummaryIndexEntry[] = [];
 			const currentRepoName = extractRepoName(this.cwd);
 
-			// 1. Current workspace repo — keep its configured storage path so
-			//    orphan/dual-write modes continue to read from their primary.
+			// 1. Current workspace repo — read through the FolderStorage
+			//    shadow when storageMode has one (dual-write / folder), so
+			//    rows pulled in by Memory Bank sync are visible. orphan-only
+			//    users fall back to the orphan branch via getReadStorage()
+			//    so their behavior is unchanged. See getReadStorage() for
+			//    the full rationale.
 			try {
-				const storage = await this.getStorage();
+				const storage = await this.getReadStorage();
 				const map = await getIndexEntryMap(this.cwd, storage);
 				for (const entry of map.values()) {
 					merged.push({ ...entry, repoName: currentRepoName });
@@ -1472,9 +1576,10 @@ export class JolliMemoryBridge {
 	 * agreement.
 	 *
 	 * Resolves the right storage based on whether `repoName` is the workspace
-	 * repo (uses the active storage configured for the workspace) or a foreign
-	 * one (instantiates {@link FolderStorage} pointed at that repo's kbRoot,
-	 * mirroring how {@link listSummaryEntries} step 2 walks discovered repos).
+	 * repo (routes through {@link getReadStorage} so sync-pulled rows are
+	 * visible) or a foreign one (instantiates {@link FolderStorage} pointed at
+	 * that repo's kbRoot, mirroring how {@link listSummaryEntries} step 2
+	 * walks discovered repos).
 	 */
 	async listBranchMemories(
 		repoName: string,
@@ -1484,7 +1589,7 @@ export class JolliMemoryBridge {
 		let storage: StorageProvider;
 		let cwd: string | undefined;
 		if (repoName === currentRepoName) {
-			storage = await this.getStorage();
+			storage = await this.getReadStorage();
 			cwd = this.cwd;
 		} else {
 			try {
@@ -1555,7 +1660,7 @@ export class JolliMemoryBridge {
 	 * wrap this in try/catch and surface a "use a longer prefix" hint.
 	 */
 	async getSummary(hash: string): Promise<CommitSummary | null> {
-		const storage = await this.getStorage();
+		const storage = await this.getReadStorage();
 		return getSummary(hash, this.cwd, storage);
 	}
 
@@ -1871,7 +1976,7 @@ export class JolliMemoryBridge {
 	async getSummaryIndexEntryMap(): Promise<
 		ReadonlyMap<string, import("../../cli/src/Types.js").SummaryIndexEntry>
 	> {
-		const storage = await this.getStorage();
+		const storage = await this.getReadStorage();
 		return getIndexEntryMap(this.cwd, storage);
 	}
 

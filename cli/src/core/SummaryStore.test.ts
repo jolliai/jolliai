@@ -2272,6 +2272,94 @@ describe("SummaryStore", () => {
 			expect(result).toBe(false);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
+
+		// ── readStorage split (sync-visibility regression) ───────────────────
+		//
+		// The VS Code bridge passes `readStorage = FolderStorage` (sees
+		// sync-pulled peer rows) and `storage = DualWriteStorage` (alias
+		// writes still hit both backends). Pinning the two-storage split here
+		// keeps the function contract honest as the bridge evolves.
+		it("uses readStorage for preflight + lock-held re-read while alias write stays on storage", async () => {
+			const indexJson = JSON.stringify(
+				v3Index(
+					[
+						{
+							...rootEntry("root1", "Root", "2026-02-18T10:00:00Z"),
+							treeHash: "tree-X",
+						},
+					],
+					{},
+				),
+			);
+			const readStorage: StorageProvider = {
+				readFile: vi.fn().mockResolvedValue(indexJson),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			};
+			const writeStorage: StorageProvider = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn().mockResolvedValue(undefined),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			};
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-X");
+
+			const result = await scanTreeHashAliases(["unknown1"], undefined, writeStorage, readStorage);
+
+			expect(result).toBe(true);
+			// Both the preflight and the inside-lock re-read flow through
+			// readStorage (two readFile calls); the write storage never gets
+			// read from so a stale orphan index can't override the folder's
+			// post-sync candidate set.
+			expect(readStorage.readFile).toHaveBeenCalledTimes(2);
+			expect(writeStorage.readFile).not.toHaveBeenCalled();
+			// Alias write must hit the write storage (so dual-write
+			// propagates it to BOTH backends). Routing the write through the
+			// folder side only would lose the alias from the orphan branch.
+			expect(writeStorage.writeFiles).toHaveBeenCalledTimes(1);
+			expect(readStorage.writeFiles).not.toHaveBeenCalled();
+			const [persistedFiles] = vi.mocked(writeStorage.writeFiles).mock.calls[0] as [
+				ReadonlyArray<FileWrite>,
+				string,
+			];
+			const persistedIndex = JSON.parse(persistedFiles[0].content) as SummaryIndex;
+			expect(persistedIndex.commitAliases).toEqual({ unknown1: "root1" });
+		});
+
+		it("falls back to single-storage behavior when readStorage is omitted", async () => {
+			// Existing single-storage callers (`storage` only) must continue
+			// to work unchanged: both preflight and write flow through that
+			// one storage. Without this fallback, CLI surfaces and tests
+			// that have never heard of readStorage would regress.
+			const indexJson = JSON.stringify(
+				v3Index(
+					[
+						{
+							...rootEntry("root1", "Root", "2026-02-18T10:00:00Z"),
+							treeHash: "tree-Y",
+						},
+					],
+					{},
+				),
+			);
+			const storage: StorageProvider = {
+				readFile: vi.fn().mockResolvedValue(indexJson),
+				writeFiles: vi.fn().mockResolvedValue(undefined),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			};
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-Y");
+
+			const result = await scanTreeHashAliases(["unknown1"], undefined, storage);
+
+			expect(result).toBe(true);
+			expect(storage.readFile).toHaveBeenCalledTimes(2);
+			expect(storage.writeFiles).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	describe("index migration", () => {

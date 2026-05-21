@@ -3109,7 +3109,9 @@ describe("JolliMemoryBridge", () => {
 			const result = await bridge.getSummaryIndexEntryMap();
 
 			expect(result).toBe(fakeMap);
-			expect(getIndexEntryMap).toHaveBeenCalledWith(TEST_CWD, storageShape);
+			// Read path uses FolderStorage (not DualWriteStorage); storage
+			// identity is pinned in the "current-repo reads" describe below.
+			expect(getIndexEntryMap).toHaveBeenCalledWith(TEST_CWD, expect.any(Object));
 		});
 	});
 
@@ -3602,9 +3604,13 @@ describe("JolliMemoryBridge", () => {
 
 			// Wait for the fire-and-forget promise to resolve
 			await vi.waitFor(() => {
+				// (hashes, cwd, writeStorage, readStorage). The 4-arg shape
+				// is the contract for sync-aware reads — see the dedicated
+				// regression block at the bottom of this file for the why.
 				expect(scanTreeHashAliases).toHaveBeenCalledWith(
 					["commitHash1"],
 					TEST_CWD,
+					expect.anything(),
 					expect.anything(),
 				);
 				expect(info).toHaveBeenCalledWith(
@@ -4980,6 +4986,231 @@ describe("JolliMemoryBridge", () => {
 			);
 
 			expect(result).not.toBeNull();
+		});
+	});
+
+	// ── Current-repo read path (sync-pulled visibility regression) ──────────
+	//
+	// Pre-fix: every read for the workspace repo (Memories, Timeline,
+	// branch-memories, single-summary, branch-history index lookup) went
+	// through `getStorage()` → `DualWriteStorage` → `primary` =
+	// `OrphanBranchStorage`. Memory Bank sync writes peer commits only to
+	// `<localFolder>/<repo>/.jolli/` (the FolderStorage shadow), so the
+	// orphan branch on the workspace repo never sees them; the Memories /
+	// Timeline panel showed empty while the Memory Bank tree (walks the
+	// folder) and other (foreign) repos (already use FolderStorage in
+	// step 2 of listSummaryEntries) both showed the new data.
+	//
+	// Fix contract pinned by these tests: for `dual-write` (default) and
+	// `folder` storageMode, the workspace-repo READ surface is a
+	// FolderStorage rooted at the same `<localFolder>/<repo>/` that the
+	// Memory Bank tree walks. For `orphan` mode (no folder data exists)
+	// the legacy path is preserved.
+	describe("current-repo reads use FolderStorage (sync-visibility regression)", () => {
+		it("listSummaryEntries hands a FolderStorage to getIndexEntryMap in dual-write mode (default)", async () => {
+			getIndexEntryMap.mockResolvedValue(new Map());
+			const bridge = makeBridge();
+
+			await bridge.listSummaryEntries(10);
+
+			expect(getIndexEntryMap).toHaveBeenCalled();
+			// The storage argument is the load-bearing assertion: a
+			// DualWriteStorage / OrphanBranchStorage would silently skip
+			// sync-pulled rows because their reads come from the orphan
+			// branch in the workspace repo, which sync never updates.
+			const [, storageArg] = getIndexEntryMap.mock.calls[0];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("listSummaryEntries falls back to legacy storage in orphan mode (no folder data on disk)", async () => {
+			loadConfig.mockResolvedValue({ storageMode: "orphan" });
+			getIndexEntryMap.mockResolvedValue(new Map());
+			const bridge = makeBridge();
+
+			await bridge.listSummaryEntries(10);
+
+			const [, storageArg] = getIndexEntryMap.mock.calls[0];
+			// Orphan-only users never wrote folder data, so flipping their
+			// reads to FolderStorage would return empty across the board.
+			// Their behavior must stay unchanged.
+			expect(storageArg).not.toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("listSummaryEntries uses FolderStorage in folder-only storage mode", async () => {
+			loadConfig.mockResolvedValue({ storageMode: "folder" });
+			getIndexEntryMap.mockResolvedValue(new Map());
+			const bridge = makeBridge();
+
+			await bridge.listSummaryEntries(10);
+
+			const [, storageArg] = getIndexEntryMap.mock.calls[0];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("getSummary hands a FolderStorage to SummaryStore.getSummary in dual-write mode", async () => {
+			getSummary.mockResolvedValue({ commitHash: "abc", topics: [] });
+			const bridge = makeBridge();
+
+			await bridge.getSummary("abc");
+
+			const [hashArg, , storageArg] = getSummary.mock.calls[0];
+			expect(hashArg).toBe("abc");
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("getSummaryIndexEntryMap hands a FolderStorage to getIndexEntryMap in dual-write mode", async () => {
+			getIndexEntryMap.mockResolvedValue(new Map());
+			const bridge = makeBridge();
+
+			await bridge.getSummaryIndexEntryMap();
+
+			const [, storageArg] = getIndexEntryMap.mock.calls[0];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("listBranchCommits hands a FolderStorage to getIndexEntryMap (peer commits become hasSummary=true)", async () => {
+			// Full pipeline so listBranchCommits runs to its index lookup.
+			mockExecFileSuccess("feature/test\n"); // getCurrentBranch
+			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef
+			mockExecFileSuccess("headhash123\n"); // getHEADHash
+			mockExecFileSuccess("mergebase456\n"); // merge-base
+			const logEntry = `commitHash1\x00fix: test change\x00John Doe\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`;
+			mockExecFileSuccess(logEntry); // git log
+			mockExecFileSuccess("origin/feature/test\n"); // upstream rev-parse
+			mockExecFileSuccess("def\n"); // refExists upstream
+			mockExecFileSuccess("\n"); // rev-list unpushed (empty)
+			getIndexEntryMap.mockResolvedValue(
+				new Map([
+					[
+						"commitHash1",
+						{
+							commitHash: "commitHash1",
+							parentCommitHash: null,
+							commitType: "commit",
+							commitMessage: "fix: test change",
+							commitDate: "2025-03-15T10:00:00Z",
+							branch: "feature/test",
+							generatedAt: "2025-03-15T10:00:00Z",
+							topicCount: 1,
+							diffStats: { filesChanged: 2, insertions: 10, deletions: 3 },
+						},
+					],
+				]),
+			);
+			const bridge = makeBridge();
+
+			const result = await bridge.listBranchCommits("main");
+
+			expect(result.commits[0].hasSummary).toBe(true);
+			const [, storageArg] = getIndexEntryMap.mock.calls[0];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("listBranchCommits routes scanTreeHashAliases with (writeStorage, readStorage) so alias writes still dual-write", async () => {
+			// Background alias scan: reads from the folder (so post-sync
+			// peer commits don't get queued as 'unmatched' merely because
+			// orphan is stale), writes through the bridge's DualWriteStorage
+			// so the alias lands in both backends.
+			mockExecFileSuccess("feature/test\n");
+			mockExecFileSuccess("abc\n");
+			mockExecFileSuccess("headhash123\n");
+			mockExecFileSuccess("mergebase456\n");
+			// Two commits in log; only one is in the index, so the other
+			// becomes an unmatched candidate that triggers the scan.
+			const logEntry =
+				`matched\x00fix\x00A\x00a@x\x002025-03-15T10:00:00Z\x00\x00\n` +
+				`unmatched\x00wip\x00A\x00a@x\x002025-03-15T11:00:00Z\x00\x00\n`;
+			mockExecFileSuccess(logEntry);
+			mockExecFileSuccess("origin/feature/test\n");
+			mockExecFileSuccess("def\n");
+			mockExecFileSuccess("\n");
+			getIndexEntryMap.mockResolvedValue(
+				new Map([
+					[
+						"matched",
+						{
+							commitHash: "matched",
+							parentCommitHash: null,
+							commitType: "commit",
+							commitMessage: "fix",
+							commitDate: "2025-03-15T10:00:00Z",
+							branch: "feature/test",
+							generatedAt: "2025-03-15T10:00:00Z",
+							topicCount: 1,
+							diffStats: { filesChanged: 1, insertions: 1, deletions: 0 },
+						},
+					],
+				]),
+			);
+			// Unmatched falls through to git diff for stats — stub the
+			// fallback so resolveCommitMeta doesn't choke.
+			getDiffStats.mockResolvedValueOnce({
+				filesChanged: 0,
+				insertions: 0,
+				deletions: 0,
+			});
+			scanTreeHashAliases.mockResolvedValue(false);
+			const bridge = makeBridge();
+
+			await bridge.listBranchCommits("main");
+
+			// Wait one microtask flush for the fire-and-forget scan.
+			await new Promise((resolve) => setImmediate(resolve));
+
+			expect(scanTreeHashAliases).toHaveBeenCalledTimes(1);
+			const [hashesArg, cwdArg, writeStorageArg, readStorageArg] =
+				scanTreeHashAliases.mock.calls[0];
+			expect(hashesArg).toEqual(["unmatched"]);
+			expect(cwdArg).toBe(TEST_CWD);
+			// Write path stays on DualWriteStorage so aliases land on both
+			// backends — flipping this to FolderStorage would orphan the
+			// alias from the orphan branch and break orphan-only readers.
+			expect(writeStorageArg).not.toBeInstanceOf(MockFolderStorage);
+			// Read path uses FolderStorage so the candidate set reflects
+			// post-sync index state, not the stale workspace orphan branch.
+			expect(readStorageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("falls back to the write storage when loadConfig throws (defensive catch)", async () => {
+			// Config corruption / FS error / EACCES on the global config
+			// file: createReadStorage cannot pick a mode, so it routes
+			// through getStorage() rather than crash the panel. The bridge
+			// stays functional — reads just lose the sync-visibility
+			// benefit until the next reload that succeeds.
+			loadConfig.mockRejectedValueOnce(new Error("EACCES: config locked"));
+			getIndexEntryMap.mockResolvedValue(new Map());
+			const bridge = makeBridge();
+
+			await bridge.listSummaryEntries(10);
+
+			const [, storageArg] = getIndexEntryMap.mock.calls[0];
+			// Fallback hits the dual-write composite (write storage), not
+			// a fresh FolderStorage. The negative assertion captures the
+			// contract without naming the exact composite class.
+			expect(storageArg).not.toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("reloadStorage() clears the read-storage cache (next read re-resolves under new config)", async () => {
+			// First read under dual-write picks FolderStorage.
+			getIndexEntryMap.mockResolvedValue(new Map());
+			const bridge = makeBridge();
+			await bridge.listSummaryEntries(10);
+			const [, firstStorageArg] = getIndexEntryMap.mock.calls[0];
+			expect(firstStorageArg).toBeInstanceOf(MockFolderStorage);
+
+			// Settings flips storageMode to orphan and calls reloadStorage().
+			loadConfig.mockResolvedValue({ storageMode: "orphan" });
+			bridge.reloadStorage();
+			bridge.invalidateEntriesCache();
+
+			await bridge.listSummaryEntries(10);
+			const [, secondStorageArg] =
+				getIndexEntryMap.mock.calls[getIndexEntryMap.mock.calls.length - 1];
+			// Without clearing the read-storage cache, the orphan-mode flip
+			// would silently stay on FolderStorage until window reload —
+			// exactly the kind of stale-state surprise reloadStorage exists
+			// to prevent for its write counterpart.
+			expect(secondStorageArg).not.toBeInstanceOf(MockFolderStorage);
 		});
 	});
 });

@@ -1347,19 +1347,32 @@ export async function getIndexEntryMap(
  *
  * Designed to run as a background fire-and-forget scan from `listBranchCommits`.
  *
+ * @param storage      — write path. Determines where the alias gets
+ *   persisted; callers in dual-write mode pass a `DualWriteStorage` so the
+ *   alias lands on both backends.
+ * @param readStorage  — optional read path for the preflight + lock-held
+ *   re-load. When provided, candidate determination and freshness re-check
+ *   read from this storage instead of `storage`. Used by the VS Code bridge
+ *   to point the preflight at the FolderStorage shadow (which sees
+ *   sync-pulled peer commits) while keeping alias writes flowing through
+ *   `storage` (so orphan-branch readers still get the alias). Falls back to
+ *   `storage` when omitted to preserve the original single-storage callers.
+ *
  * @returns `true` if any new aliases were written, `false` otherwise
  */
 export async function scanTreeHashAliases(
 	commitHashes: string[],
 	cwd?: string,
 	storage?: StorageProvider,
+	readStorage?: StorageProvider,
 ): Promise<boolean> {
+	const effectiveReadStorage = readStorage ?? storage;
 	// ── Phase 1: preflight (no lock) ────────────────────────────────────────
 	// Compute candidate aliases against the current index. Tree-hash lookup is
 	// O(n) git calls — expensive — so we keep it outside the lock to avoid
 	// blocking concurrent worker writes. The lookup result is "tentative":
 	// Phase 2 re-validates against the freshly-loaded index inside the lock.
-	const preflightIndex = await loadIndex(cwd, storage);
+	const preflightIndex = await loadIndex(cwd, effectiveReadStorage);
 	if (!preflightIndex || preflightIndex.version !== 3) return false;
 
 	const preflightAliases = preflightIndex.commitAliases ?? {};
@@ -1407,7 +1420,12 @@ export async function scanTreeHashAliases(
 		return false;
 	}
 	try {
-		const freshIndex = await loadIndex(cwd, storage);
+		// Re-load via the SAME source as the preflight so the candidate
+		// freshness check sees the same dataset. If the bridge passed a
+		// FolderStorage read-side, post-sync rows that arrived since
+		// preflight (rare; e.g. a sync round finishing mid-scan) are
+		// still observable here, keeping the candidate filter coherent.
+		const freshIndex = await loadIndex(cwd, effectiveReadStorage);
 		if (!freshIndex || freshIndex.version !== 3) return false;
 
 		const freshAliases = freshIndex.commitAliases ?? {};
