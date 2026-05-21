@@ -349,7 +349,7 @@ async function migrateOneToOneLocked(
 }
 
 /** Recursively collects all E2E test scenarios from a list of summaries. */
-function collectChildE2eScenarios(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<E2eTestScenario> {
+export function collectChildE2eScenarios(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<E2eTestScenario> {
 	const scenarios: E2eTestScenario[] = [];
 	for (const node of nodes) {
 		if (node.e2eTestGuide) scenarios.push(...node.e2eTestGuide);
@@ -366,7 +366,7 @@ function stripE2eTestGuide(node: CommitSummary): CommitSummary {
 }
 
 /** Recursively collects all PlanReferences from a list of summaries, deduped by slug. */
-function collectChildPlans(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<PlanReference> {
+export function collectChildPlans(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<PlanReference> {
 	const planMap = new Map<string, PlanReference>();
 	for (const node of nodes) {
 		if (node.plans) {
@@ -398,7 +398,7 @@ function stripPlans(node: CommitSummary): CommitSummary {
 }
 
 /** Recursively collects all NoteReferences from a list of summaries, deduped by id. */
-function collectChildNotes(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<NoteReference> {
+export function collectChildNotes(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<NoteReference> {
 	const noteMap = new Map<string, NoteReference>();
 	for (const node of nodes) {
 		if (node.notes) {
@@ -441,7 +441,7 @@ function stripLinearIssues(node: CommitSummary): CommitSummary {
  * on squash / rebase-pick the root must inherit referenced Linear issues from
  * every source commit, otherwise stripLinearIssues (called below) drops them.
  */
-function collectChildLinearIssues(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<LinearIssueCommitRef> {
+export function collectChildLinearIssues(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<LinearIssueCommitRef> {
 	const refMap = new Map<string, LinearIssueCommitRef>();
 	for (const node of nodes) {
 		if (node.linearIssues) {
@@ -475,7 +475,7 @@ function stripJolliMetadata(node: CommitSummary): CommitSummary {
 }
 
 /** Hoist result for Jolli memory article metadata from children. */
-interface JolliMetaHoistResult {
+export interface JolliMetaHoistResult {
 	/**
 	 * The most recent descendant's Jolli metadata (to hoist to merged root), or null if no
 	 * candidates were found. Carries the winner's own commitDate/generatedAt so that when a
@@ -493,7 +493,7 @@ interface JolliMetaHoistResult {
 }
 
 /** Recursively collects jolliDocId/jolliDocUrl from children, picks newest as winner. */
-function collectChildJolliMeta(nodes: ReadonlyArray<CommitSummary>): JolliMetaHoistResult {
+export function collectChildJolliMeta(nodes: ReadonlyArray<CommitSummary>): JolliMetaHoistResult {
 	const candidates: Array<{ jolliDocId: number; jolliDocUrl: string; commitDate: string; generatedAt: string }> = [];
 	for (const node of nodes) {
 		const url = node.jolliDocUrl;
@@ -522,6 +522,81 @@ function collectChildJolliMeta(nodes: ReadonlyArray<CommitSummary>): JolliMetaHo
 	const winner = candidates[0];
 	const orphanedDocIds = candidates.slice(1).map((c) => c.jolliDocId);
 	return { winner, orphanedDocIds };
+}
+
+/**
+ * Recursively walks descendants and collects every node's orphanedDocIds.
+ * Companion to collectChildJolliMeta: that helper only surfaces orphans
+ * created by the current merge, but legacy children may already carry their
+ * own pending-cleanup queue. Used by normalizeToV4 so a v3 → v4 migration
+ * doesn't lose previously-orphaned doc IDs at the strip step.
+ */
+function collectDescendantOrphanedDocIds(children: ReadonlyArray<CommitSummary> | undefined): number[] {
+	const ids: number[] = [];
+	for (const child of children ?? []) {
+		if (child.orphanedDocIds) ids.push(...child.orphanedDocIds);
+		ids.push(...collectDescendantOrphanedDocIds(child.children));
+	}
+	return ids;
+}
+
+/**
+ * Pure in-memory v3 → v4 (unified Hoist) normalization. No I/O — caller
+ * persists the result via storeSummary if it wants the migration to stick.
+ *
+ * Establishes the same invariant first-run amend / squash already enforce via
+ * `buildHoistedAmendRoot` / `mergeManyToOne`:
+ *   - version: 4
+ *   - root holds the authoritative Copy-Hoist fields (plans / notes /
+ *     linearIssues / e2eTestGuide / jolliDocId / jolliDocUrl /
+ *     orphanedDocIds), unioned across the whole tree via the same
+ *     `collectChild*` helpers
+ *   - every descendant is stripped of own-hoist fields
+ *
+ * Deliberately leaves `topics`, `recap`, `ticketId` on the root untouched.
+ * Regenerate (the primary caller) overwrites topics + recap from a fresh
+ * LLM call afterwards; ticketId is preserved per the same rule that lives
+ * in Regenerator.ts. A no-op for v4 input (returns the same reference).
+ *
+ * Used by Regenerator and RegenerateContext to collapse all v3-special-
+ * casing in their hot paths — once normalized, downstream code can assume
+ * a clean v4 tree.
+ */
+export function normalizeToV4(summary: CommitSummary): CommitSummary {
+	if (summary.version >= 4) return summary;
+
+	const hoistedE2e = collectChildE2eScenarios([summary]);
+	const hoistedPlans = collectChildPlans([summary]);
+	const hoistedNotes = collectChildNotes([summary]);
+	const hoistedLinear = collectChildLinearIssues([summary]);
+	const jolliMeta = collectChildJolliMeta([summary]);
+	// Dedup orphanedDocIds across the tree: jolliMeta surfaces orphans from
+	// this normalize step's loser candidates; root + descendants may already
+	// have their own pending cleanup queue.
+	const allOrphanedDocIds = Array.from(
+		new Set<number>([
+			...jolliMeta.orphanedDocIds,
+			...(summary.orphanedDocIds ?? []),
+			...collectDescendantOrphanedDocIds(summary.children),
+		]),
+	);
+
+	return {
+		...summary,
+		version: 4,
+		...(hoistedE2e.length > 0 ? { e2eTestGuide: hoistedE2e } : {}),
+		...(hoistedPlans.length > 0 ? { plans: hoistedPlans } : {}),
+		...(hoistedNotes.length > 0 ? { notes: hoistedNotes } : {}),
+		...(hoistedLinear.length > 0 ? { linearIssues: hoistedLinear } : {}),
+		...(jolliMeta.winner
+			? {
+					jolliDocId: jolliMeta.winner.jolliDocId,
+					jolliDocUrl: jolliMeta.winner.jolliDocUrl,
+				}
+			: {}),
+		...(allOrphanedDocIds.length > 0 ? { orphanedDocIds: allOrphanedDocIds } : {}),
+		...(summary.children !== undefined ? { children: summary.children.map(stripFunctionalMetadata) } : {}),
+	};
 }
 
 /** Returns a deep copy of the summary tree with topics stripped from all nodes. */

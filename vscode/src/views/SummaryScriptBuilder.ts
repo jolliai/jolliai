@@ -243,6 +243,11 @@ ${buildPrMessageScript()}
         // (skips headers it has already wired via the _toggleAttached flag).
         newTopicsRoot.querySelectorAll('.toggle-header').forEach(attachToggleHeader);
       }
+      // The fresh topicsSection brings a NEW #toggleAllBtn whose click
+      // listener doesn't carry over from the old DOM. Reset allCollapsed
+      // because the new topics are always rendered uncollapsed, then re-bind.
+      allCollapsed = false;
+      attachToggleAllBtnHandler();
       return;
     }
     if (msg.command === 'summaryRegenerateError') {
@@ -257,9 +262,19 @@ ${buildPrMessageScript()}
   // Toggle All: expand / collapse all topic toggles and timeline groups.
   // Scoped to topics — explicitly excludes .e2e-scenario so the E2E section
   // has its own independent #toggleAllE2eBtn.
+  //
+  // allCollapsed lives in the buildScript closure so the state survives a
+  // regenerate re-render. The handler is only called twice in the lifecycle:
+  // once at page load, and once after summaryRegenerated swaps in a brand-new
+  // #toggleAllBtn element (the old element is gone, so the new one needs its
+  // own listener — not a re-bind on the same node).
   var allCollapsed = false;
-  var toggleAllBtn = document.getElementById('toggleAllBtn');
-  if (toggleAllBtn) {
+  function attachToggleAllBtnHandler() {
+    var toggleAllBtn = document.getElementById('toggleAllBtn');
+    if (!toggleAllBtn) return;
+    // Sync the button label with allCollapsed so a regenerate's freshly-
+    // rendered topics (always uncollapsed) and the button text agree.
+    toggleAllBtn.textContent = allCollapsed ? 'Expand All' : 'Collapse All';
     toggleAllBtn.addEventListener('click', function() {
       var items = document.querySelectorAll('.toggle:not(.e2e-scenario), .timeline-group');
       allCollapsed = !allCollapsed;
@@ -273,6 +288,7 @@ ${buildPrMessageScript()}
       toggleAllBtn.textContent = allCollapsed ? 'Expand All' : 'Collapse All';
     });
   }
+  attachToggleAllBtnHandler();
 
   // ── Attach collapsible callout toggle handlers inside a root element ──
   function attachCollapsibleHandlers(root) {

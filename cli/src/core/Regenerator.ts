@@ -2,7 +2,14 @@ import { createLogger } from "../Logger.js";
 import type { CommitSummary, LlmConfig, SummaryResult } from "../Types.js";
 import { getDiffContent } from "./GitOps.js";
 import { generateSummary } from "./Summarizer.js";
-import { readLinearIssueFromBranch, readNoteFromBranch, readPlanFromBranch, readTranscript } from "./SummaryStore.js";
+import {
+	normalizeToV4,
+	readLinearIssueFromBranch,
+	readNoteFromBranch,
+	readPlanFromBranch,
+	readTranscriptsForCommits,
+} from "./SummaryStore.js";
+import { collectAllTranscriptHashes } from "./SummaryTree.js";
 import { buildMultiSessionContext, type SessionTranscript } from "./TranscriptReader.js";
 
 const log = createLogger("Regenerator");
@@ -25,14 +32,37 @@ export interface RegenerateResult {
  * Fields replaced:        topics, recap, diffStats, transcriptEntries,
  *                         conversationTurns, llm, generatedAt
  * Fields preserved:       ticketId, e2eTestGuide, plans, notes, linearIssues,
- *                         children, commitType, commitSource, jolliDocUrl,
- *                         jolliDocId, orphanedDocIds, everything else.
+ *                         commitType, commitSource, jolliDocUrl, jolliDocId,
+ *                         orphanedDocIds, everything else on root.
+ *
+ * The function opens by calling `normalizeToV4(summary)` — a pure helper
+ * that collapses every v3-special-case into the v4 unified-Hoist invariant
+ * the rest of the regenerate path depends on:
+ *   - root holds the authoritative Copy-Hoist fields (unioned across the
+ *     whole tree, so child-only attachments and pending-cleanup doc IDs are
+ *     surfaced to root)
+ *   - every descendant is stripped of own-hoist fields
+ *   - version is 4
+ *
+ * Downstream code (transcript aggregation, prompt-block rebuild, LLM
+ * generation, updated-summary assembly) then assumes v4 without further
+ * special-casing.
+ *
+ * Transcript aggregation:
+ *   - Reads transcripts for EVERY commit hash in the (normalized) summary
+ *     tree via `collectAllTranscriptHashes` + `readTranscriptsForCommits`.
+ *     Squash / amend / rebase summaries persist AI conversations under each
+ *     source commit's hash; reading only `summary.commitHash` would feed an
+ *     empty conversation to the LLM. Mirrors the webview's All Conversations
+ *     card (`SummaryWebviewPanel.refreshTranscriptHashes`).
  *
  * Preservation of ticketId and e2eTestGuide is deliberate (see plan §1.2):
- *   - ticketId is a stable identifier; the LLM may not see the original ticket
- *     ID in this re-run and would otherwise drop or change it.
+ *   - ticketId is a stable identifier; the LLM may not see the original
+ *     ticket ID in this re-run and would otherwise drop or change it.
  *   - e2eTestGuide is a user-initiated secondary artifact; the user can
- *     regenerate it independently if they want.
+ *     regenerate it independently. Note that `normalizeToV4` may surface a
+ *     child-only e2e to root — that's the deferred-migration completing,
+ *     not a behavior change.
  */
 export async function regenerateSummary(
 	summary: CommitSummary,
@@ -41,21 +71,32 @@ export async function regenerateSummary(
 ): Promise<RegenerateResult> {
 	log.info("Regenerating summary for %s", summary.commitHash.substring(0, 8));
 
-	const stored = await readTranscript(summary.commitHash, cwd);
+	// One-shot v3 → v4 normalization; the rest of this function reads from
+	// `normalized` and assumes the v4 invariant. No-op for v4 input.
+	const normalized = normalizeToV4(summary);
 
-	const sessions: SessionTranscript[] = (stored?.sessions ?? []).map((s) => ({
-		sessionId: s.sessionId,
-		transcriptPath: s.transcriptPath ?? "(stored)",
-		...(s.source !== undefined ? { source: s.source } : {}),
-		entries: s.entries,
-	}));
+	// Aggregate transcripts across the entire tree (see "Transcript aggregation"
+	// in the doc comment above).
+	const treeHashes = collectAllTranscriptHashes(normalized);
+	const transcriptMap = await readTranscriptsForCommits(treeHashes, cwd);
+	const sessions: SessionTranscript[] = [];
+	for (const stored of transcriptMap.values()) {
+		for (const s of stored.sessions) {
+			sessions.push({
+				sessionId: s.sessionId,
+				transcriptPath: s.transcriptPath ?? "(stored)",
+				...(s.source !== undefined ? { source: s.source } : {}),
+				entries: s.entries,
+			});
+		}
+	}
 	const conversation = buildMultiSessionContext(sessions);
-	const diff = await getDiffContent(`${summary.commitHash}~1`, summary.commitHash, cwd);
+	const diff = await getDiffContent(`${normalized.commitHash}~1`, normalized.commitHash, cwd);
 
 	const [linearIssues, plans, notes] = await Promise.all([
-		rebuildLinearBlock(summary, cwd),
-		rebuildPlansBlock(summary, cwd),
-		rebuildNotesBlock(summary, cwd),
+		rebuildLinearBlock(normalized, cwd),
+		rebuildPlansBlock(normalized, cwd),
+		rebuildNotesBlock(normalized, cwd),
 	]);
 
 	const totalEntries = sessions.reduce((sum, s) => sum + s.entries.length, 0);
@@ -65,12 +106,17 @@ export async function regenerateSummary(
 		conversation,
 		diff,
 		commitInfo: {
-			hash: summary.commitHash,
-			message: summary.commitMessage,
-			author: summary.commitAuthor,
-			date: summary.commitDate,
+			hash: normalized.commitHash,
+			message: normalized.commitMessage,
+			author: normalized.commitAuthor,
+			date: normalized.commitDate,
 		},
-		diffStats: summary.diffStats ?? summary.stats ?? { filesChanged: 0, insertions: 0, deletions: 0 },
+		// Fallback chain: v4 stores `diffStats`; v3 legacy stored `stats`
+		// (resolveDiffStats elsewhere does the same fallback for display).
+		// normalizeToV4 doesn't touch either field, so a freshly-normalized
+		// v3 still has only `stats` populated until the LLM call below
+		// returns a fresh diffStats we overwrite with.
+		diffStats: normalized.diffStats ?? normalized.stats ?? { filesChanged: 0, insertions: 0, deletions: 0 },
 		transcriptEntries: totalEntries,
 		conversationTurns: humanTurns,
 		linearIssues,
@@ -80,9 +126,12 @@ export async function regenerateSummary(
 	});
 
 	const updated: CommitSummary = {
-		...summary,
+		...normalized,
 		topics: result.topics,
-		...(result.recap !== undefined ? { recap: result.recap } : {}),
+		// Always overwrite recap — confirm dialog promises Recap is OVERWRITTEN.
+		// Empty string communicates "no recap this time" when the LLM omits one,
+		// instead of silently preserving the prior recap.
+		recap: result.recap ?? "",
 		llm: result.llm,
 		transcriptEntries: result.transcriptEntries,
 		...(result.conversationTurns !== undefined ? { conversationTurns: result.conversationTurns } : {}),
@@ -102,6 +151,9 @@ export async function regenerateSummary(
 // — sourcePath may be stale or missing. The simplified block preserves the
 // tag shape (`<plans>`, `<notes>`, `<linear-issues>`) so the SUMMARIZE prompt
 // template's placeholders collapse the same way.
+//
+// All three helpers receive a NORMALIZED summary, so root.{plans,notes,
+// linearIssues} are already the authoritative tree-wide union.
 
 async function rebuildLinearBlock(summary: CommitSummary, cwd: string): Promise<string> {
 	const refs = summary.linearIssues ?? [];
