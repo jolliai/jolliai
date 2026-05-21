@@ -1110,3 +1110,99 @@ describe("buildRootInjectionInput", () => {
 		expect(result.apiSpecs).toEqual([{ specName: "public-api", title: "Public API" }]);
 	});
 });
+
+// ─── pickRootRedirectHref / writeRootRedirectIndex unit tests ─────────────────
+
+describe("pickRootRedirectHref", () => {
+	it("returns the first navigable page href when no page is rooted at /", async () => {
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		const parsed = {
+			sidebar: {},
+			pages: [
+				{ key: "docs", title: "Get Started", href: "/docs" },
+				{ key: "api", title: "API", href: "/api" },
+			],
+			defaultPageHref: "/docs",
+		};
+		expect(pickRootRedirectHref(parsed)).toBe("/docs");
+	});
+
+	it("returns undefined when one of the pages claims the root", async () => {
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		const parsed = {
+			sidebar: {},
+			pages: [
+				{ key: "home", title: "Home", href: "/" },
+				{ key: "docs", title: "Docs", href: "/docs" },
+			],
+			defaultPageHref: "/",
+		};
+		expect(pickRootRedirectHref(parsed)).toBeUndefined();
+	});
+
+	it("skips menu pages (href:#) when picking the first navigable target", async () => {
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		const parsed = {
+			sidebar: {},
+			pages: [
+				{ key: "community", title: "Community", href: "#", type: "menu" as const },
+				{ key: "docs", title: "Docs", href: "/docs" },
+			],
+			defaultPageHref: "#",
+		};
+		expect(pickRootRedirectHref(parsed)).toBe("/docs");
+	});
+
+	it("returns undefined when parsedNavigation is missing or in simple mode", async () => {
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		expect(pickRootRedirectHref(undefined)).toBeUndefined();
+		expect(pickRootRedirectHref({ sidebar: {} })).toBeUndefined();
+	});
+});
+
+describe("writeRootRedirectIndex", () => {
+	let contentDir: string;
+	let cleanup: Array<() => Promise<void>>;
+
+	beforeEach(async () => {
+		const { mkdtemp } = await import("node:fs/promises");
+		const { tmpdir } = await import("node:os");
+		contentDir = await mkdtemp(join(tmpdir(), "jolli-redirect-test-"));
+		cleanup = [];
+	});
+
+	afterEach(async () => {
+		const { rm } = await import("node:fs/promises");
+		await rm(contentDir, { recursive: true, force: true });
+		for (const fn of cleanup) await fn();
+	});
+
+	it("replaces index.md with an index.mdx redirect stub", async () => {
+		const { writeFile, readFile, stat } = await import("node:fs/promises");
+		await writeFile(join(contentDir, "index.md"), "# Old home\n", "utf-8");
+
+		const { writeRootRedirectIndex } = await import("./StartCommand.js");
+		await writeRootRedirectIndex(contentDir, "/docs");
+
+		const mdx = await readFile(join(contentDir, "index.mdx"), "utf-8");
+		expect(mdx).toContain(`window.location.replace("/docs")`);
+		expect(mdx).toContain("Redirecting…");
+		expect(mdx).toContain("<noscript>");
+
+		// Old index.md is gone — Nextra picks up index.mdx as the route.
+		await expect(stat(join(contentDir, "index.md"))).rejects.toBeDefined();
+	});
+
+	it("escapes the redirect href to defuse JS-string injection", async () => {
+		const { readFile } = await import("node:fs/promises");
+		const { writeRootRedirectIndex } = await import("./StartCommand.js");
+
+		await writeRootRedirectIndex(contentDir, `/docs"</script><script>alert(1)//`);
+
+		const mdx = await readFile(join(contentDir, "index.mdx"), "utf-8");
+		// The href is round-tripped through JSON.stringify, so the quote and
+		// closing tag are escaped — no raw </script> in the inline JS.
+		expect(mdx).not.toMatch(/<\/script>.*alert/);
+		expect(mdx).toContain('\\"');
+	});
+});

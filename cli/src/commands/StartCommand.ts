@@ -6,6 +6,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Command } from "commander";
@@ -220,6 +221,19 @@ async function syncContent(
 		specInputs,
 	);
 
+	// When the site is in page mode and no page is rooted at `/`, the auto-
+	// mirrored root `index.md` is dead weight — `SidebarTabs.tsx` ends up
+	// client-side redirecting from `/` to the first tab, which produces a
+	// visible flash of the index page before the JS runs. Replace the root
+	// index with an inline `<script>` redirect so the browser navigates away
+	// before React even hydrates. We do this *before* `generateNavigation` so
+	// the `_meta.js` writer picks up the rewritten file and emits the standard
+	// `{ "index": { display: "hidden" } }` entry to keep it out of the sidebar.
+	const redirectHref = pickRootRedirectHref(parsedNavigation);
+	if (redirectHref) {
+		await writeRootRedirectIndex(contentDir, redirectHref);
+	}
+
 	if (parsedNavigation) {
 		if (parsedNavigation.rootPages?.length) {
 			rootInjection.structurePages = parsedNavigation.rootPages;
@@ -241,6 +255,65 @@ async function syncContent(
 	}
 
 	return { success: true, mirrorResult };
+}
+
+/**
+ * Returns the href to redirect `/` to, or `undefined` when no redirect is
+ * needed. We redirect only when:
+ *   - The site is in page mode (navigation has `pages`)
+ *   - No page is rooted at `/` (the user didn't claim the root)
+ *   - The first navigable (non-`menu`) page resolves to a real href
+ *
+ * Exported for unit testing — call site is in `syncContent`.
+ */
+export function pickRootRedirectHref(
+	parsedNavigation: ReturnType<typeof parseNavigation> | undefined,
+): string | undefined {
+	if (!parsedNavigation?.pages?.length) return undefined;
+	const claimsRoot = parsedNavigation.pages.some((p) => p.href === "/");
+	if (claimsRoot) return undefined;
+	const firstNavigable = parsedNavigation.pages.find((p) => p.type !== "menu" && p.href && p.href !== "#");
+	return firstNavigable?.href;
+}
+
+/**
+ * Overwrites `<contentDir>/index.{md,mdx}` with a tiny stub that redirects
+ * `/` to `href` via an inline `<script>`. The script runs before React
+ * hydration, so the user never sees the original index content flash. The
+ * `<noscript>` fallback covers JS-disabled browsers and crawlers.
+ *
+ * Exported for unit testing — call site is in `syncContent`.
+ */
+export async function writeRootRedirectIndex(contentDir: string, href: string): Promise<void> {
+	// `jsHref` is for the inline JS string. JSON.stringify handles backslash,
+	// quote, and unicode escapes — but a literal `</script>` inside the JS
+	// string still terminates the surrounding `<script>` tag at HTML parse
+	// time. Replace `<` with its `<` JS-string escape so the rendered
+	// HTML never contains `</script>` inside the inline script body.
+	const jsHref = JSON.stringify(href).replace(/</g, "\\u003c");
+	// `htmlHref` is for the noscript `<a>` href attribute. HTML attribute
+	// escaping is different from JS string escaping — a JSON-encoded value
+	// dropped into an HTML attribute could still let a `</script>` etc. land
+	// in the document as raw markup once a hostile href passes through.
+	const htmlHref = escapeHtml(href);
+	const mdx = `---
+title: Redirecting…
+sidebarTitle: ' '
+---
+
+<script dangerouslySetInnerHTML={{ __html: \`window.location.replace(${jsHref})\` }} />
+
+<noscript>
+  Redirecting to <a href="${htmlHref}">${htmlHref}</a>…
+</noscript>
+`;
+	await mkdir(contentDir, { recursive: true });
+	await rm(join(contentDir, "index.md"), { force: true });
+	await writeFile(join(contentDir, "index.mdx"), mdx, "utf-8");
+}
+
+function escapeHtml(s: string): string {
+	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 /**

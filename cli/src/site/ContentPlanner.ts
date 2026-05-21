@@ -126,7 +126,15 @@ function addArticlePlan(
 			? resolveExplicitSourceMarkdown(sourceBase, availableMarkdownFiles)
 			: resolveSourceMarkdown(sourceBase, availableMarkdownFiles);
 		const sourceExt = sourceRelPath.endsWith(".mdx") ? ".mdx" : ".md";
-		const targetRelPath = `${targetBase}${sourceExt}`;
+		// When the article has nested children, write the parent page as
+		// `<targetBase>/index.<ext>` so the child files can live under
+		// `<targetBase>/`. Writing `<targetBase>.<ext>` next to a `<targetBase>/`
+		// folder is a Nextra v4 layout conflict: the folder shadows the file,
+		// the sidebar entry collapses to a non-clickable expandable group, and
+		// the child routes become unreachable.
+		const targetRelPath = article.articles?.length
+			? `${targetBase}/index${sourceExt}`
+			: `${targetBase}${sourceExt}`;
 		pages.push({ sourceRelPath, targetRelPath, title: article.article });
 	} else if (!article.articles?.length) {
 		// No source file AND no children — likely an auto-generated route
@@ -387,9 +395,37 @@ async function rewritePlannedPage(
 	}
 
 	const rewritten = rewriteRelativeImagePaths(content, page.sourceRelPath, finalTargetRelPath);
+	// When the planner re-homed a non-index source (e.g. `guides/deployment.mdx`)
+	// to `<folder>/index.<ext>` because the article has nested children, mark the
+	// rewritten file with `asIndexPage: true`. Nextra v4 reads this frontmatter
+	// flag and treats the index as the folder's representative page — the folder
+	// header in the sidebar becomes a clickable link to the index instead of a
+	// non-clickable expand toggle, and Nextra suppresses the duplicate
+	// auto-discovered index entry from the folder's children list.
+	const sourceIsIndex = /(^|\/)index\.(md|mdx)$/i.test(page.sourceRelPath);
+	const targetIsIndex = /(^|\/)index\.(md|mdx)$/i.test(finalTargetRelPath);
+	const finalContent = targetIsIndex && !sourceIsIndex ? injectAsIndexPageFrontmatter(rewritten) : rewritten;
 	await mkdir(dirname(join(contentDir, finalTargetRelPath)), { recursive: true });
-	await writeFile(join(contentDir, finalTargetRelPath), rewritten, "utf-8");
+	await writeFile(join(contentDir, finalTargetRelPath), finalContent, "utf-8");
 	return finalTargetRelPath;
+}
+
+/**
+ * Adds `asIndexPage: true` to the YAML frontmatter of a markdown/MDX file. If
+ * the file has no frontmatter, prepends a new block. If the frontmatter
+ * already declares `asIndexPage`, leaves it as authored.
+ */
+function injectAsIndexPageFrontmatter(content: string): string {
+	const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+	if (!fmMatch) {
+		return `---\nasIndexPage: true\n---\n${content}`;
+	}
+	const body = fmMatch[1];
+	if (/^\s*asIndexPage\s*:/m.test(body)) {
+		return content;
+	}
+	const newFm = `---\n${body}\nasIndexPage: true\n---\n`;
+	return newFm + content.slice(fmMatch[0].length);
 }
 
 export async function applyNavigationContentPlan(

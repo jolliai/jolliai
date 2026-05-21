@@ -246,6 +246,26 @@ describe("MetaGenerator.generateMetaFiles", () => {
 		expect(content).toContain('"guide"');
 	});
 
+	it("omits the index key entirely when the index file declares asIndexPage:true", async () => {
+		// Regression: Nextra v4 errors with "field key 'index' refers to a page
+		// that cannot be found" when the index has `asIndexPage: true` (Nextra
+		// promotes it to the folder's representative page and removes it from
+		// children) AND `_meta.js` still references "index".
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await writeFile(
+			join(contentDir, "index.mdx"),
+			"---\ntitle: Deployment\nasIndexPage: true\n---\n# Deployment",
+			"utf-8",
+		);
+		await writeFile(join(contentDir, "docker.md"), "# Docker", "utf-8");
+
+		await generateMetaFiles(contentDir);
+
+		const content = await readFile(join(contentDir, "_meta.js"), "utf-8");
+		expect(content).not.toContain('"index"');
+		expect(content).toContain('"docker"');
+	});
+
 	it("_meta.js entries are sorted alphabetically", async () => {
 		const { generateMetaFiles } = await import("./MetaGenerator.js");
 		await writeFile(join(contentDir, "zebra.md"), "# Zebra", "utf-8");

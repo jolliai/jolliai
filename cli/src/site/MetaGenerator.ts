@@ -13,7 +13,7 @@
  * title-cased labels (backward-compatible default behavior).
  */
 
-import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join, relative, sep } from "node:path";
 import { sanitizeUrl } from "./Sanitize.js";
 import type { HeaderItem, SidebarItemValue, SidebarOverrides } from "./Types.js";
@@ -105,17 +105,21 @@ export function toTitleCase(filename: string): string {
  * their custom values. Remaining filesystem items are NOT included — Nextra
  * will auto-append them alphabetically at runtime.
  */
-export function buildMetaEntries(filenames: string[], override?: Record<string, SidebarItemValue>): MetaEntry[] {
+export function buildMetaEntries(
+	filenames: string[],
+	override?: Record<string, SidebarItemValue>,
+	options?: { indexHasAsIndexPage?: boolean },
+): MetaEntry[] {
 	if (override) {
-		return buildOverriddenEntries(filenames, override);
+		return buildOverriddenEntries(filenames, override, options);
 	}
-	return buildDefaultEntries(filenames);
+	return buildDefaultEntries(filenames, options);
 }
 
 /**
  * Default behavior: all items alphabetically sorted with auto-generated labels.
  */
-function buildDefaultEntries(filenames: string[]): MetaEntry[] {
+function buildDefaultEntries(filenames: string[], options?: { indexHasAsIndexPage?: boolean }): MetaEntry[] {
 	const seen = new Set<string>();
 	const entries: MetaEntry[] = [];
 
@@ -126,8 +130,15 @@ function buildDefaultEntries(filenames: string[]): MetaEntry[] {
 		// Hide index files from sidebar — they serve as the folder's own page.
 		// Using display: "hidden" prevents Nextra from auto-appending them
 		// as visible children while still allowing them to be the folder page.
+		// When the index has `asIndexPage: true` in its frontmatter, Nextra
+		// promotes it to the folder's representative page and removes it from
+		// children entirely — emitting an `"index"` _meta entry in that case
+		// produces "field key 'index' refers to a page that cannot be found"
+		// at build time, so we skip it.
 		if (key === "index") {
-			entries.push({ key, value: { display: "hidden" } });
+			if (!options?.indexHasAsIndexPage) {
+				entries.push({ key, value: { display: "hidden" } });
+			}
 			seen.add(key);
 			continue;
 		}
@@ -147,17 +158,23 @@ function buildDefaultEntries(filenames: string[]): MetaEntry[] {
  * Items declared in the override that don't exist on the filesystem are
  * included (they may be external links or separators).
  */
-function buildOverriddenEntries(filenames: string[], override: Record<string, SidebarItemValue>): MetaEntry[] {
+function buildOverriddenEntries(
+	filenames: string[],
+	override: Record<string, SidebarItemValue>,
+	options?: { indexHasAsIndexPage?: boolean },
+): MetaEntry[] {
 	const entries: MetaEntry[] = [];
 
 	// If the folder has an index file but the override doesn't mention it,
 	// add it as hidden to prevent Nextra from showing it as a duplicate child.
+	// When the index has `asIndexPage: true`, skip — see the matching comment
+	// in `buildDefaultEntries` for why.
 	const hasIndexFile = filenames.some((f) => {
 		const ext = extname(f);
 		const key = ext ? basename(f, ext) : f;
 		return key === "index";
 	});
-	if (hasIndexFile && !override.index) {
+	if (hasIndexFile && !override.index && !options?.indexHasAsIndexPage) {
 		entries.push({ key: "index", value: { display: "hidden" } });
 	}
 
@@ -178,6 +195,26 @@ function buildOverriddenEntries(filenames: string[], override: Record<string, Si
 	}
 
 	return entries;
+}
+
+/**
+ * Reads `index.mdx` / `index.md` if present in `contentItems` and reports
+ * whether its frontmatter sets `asIndexPage: true`. Nextra v4 uses this flag
+ * to promote the index to the folder's representative page; the folder's
+ * `_meta.js` must omit the `"index"` key in that case.
+ */
+async function detectAsIndexPage(dir: string, contentItems: string[]): Promise<boolean> {
+	const indexFile = contentItems.find((f) => f === "index.mdx" || f === "index.md");
+	if (!indexFile) return false;
+	let raw: string;
+	try {
+		raw = await readFile(join(dir, indexFile), "utf-8");
+	} catch {
+		return false;
+	}
+	const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+	if (!fm) return false;
+	return /^\s*asIndexPage\s*:\s*true\s*$/m.test(fm[1]);
 }
 
 // ─── generateMetaFiles ────────────────────────────────────────────────────────
@@ -254,7 +291,8 @@ async function processDir(
 	const pathKey = `/${relPath.split(sep).join("/")}`.replace(/\/$/, "") || "/";
 
 	const override = sidebarOverrides?.[pathKey];
-	let metaEntries = buildMetaEntries(contentItems, override);
+	const indexHasAsIndexPage = await detectAsIndexPage(dir, contentItems);
+	let metaEntries = buildMetaEntries(contentItems, override, { indexHasAsIndexPage });
 
 	// Root-only augmentation: auto-inject `Documentation` / `API Reference`
 	// page tabs and materialise `header.items` as Nextra-native tabs.

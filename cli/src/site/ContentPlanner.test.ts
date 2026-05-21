@@ -168,6 +168,61 @@ describe("buildNavigationContentPlan", () => {
 		]);
 	});
 
+	it("writes parent article as index.<ext> inside its folder when it has nested children", () => {
+		// Regression: when an article has both an `href` matching a source file
+		// AND nested `articles`, the parent must be written as
+		// `<href>/index.<ext>` — not `<href>.<ext>` next to the children's
+		// `<href>/` folder, which Nextra v4 sees as a layout conflict (sidebar
+		// entry collapses to a non-clickable expandable folder; children 404).
+		const plan = buildNavigationContentPlan(
+			[
+				{
+					page: "Get Started",
+					root: "/docs",
+					content: [
+						{
+							group: "Guides",
+							root: "guides",
+							content: [
+								{
+									article: "Deployment",
+									href: "deployment",
+									articles: [
+										{ article: "Docker", href: "deployment/docker" },
+										{ article: "Kubernetes", href: "deployment/kubernetes" },
+									],
+								},
+							],
+						},
+					],
+				},
+			],
+			[
+				"docs/guides/deployment.mdx",
+				"docs/guides/deployment/docker.mdx",
+				"docs/guides/deployment/kubernetes.mdx",
+			],
+		);
+
+		expect(plan.pages).toEqual([
+			{
+				sourceRelPath: "docs/guides/deployment.mdx",
+				targetRelPath: "docs/guides/deployment/index.mdx",
+				title: "Deployment",
+			},
+			{
+				sourceRelPath: "docs/guides/deployment/docker.mdx",
+				targetRelPath: "docs/guides/deployment/docker.mdx",
+				title: "Docker",
+			},
+			{
+				sourceRelPath: "docs/guides/deployment/kubernetes.mdx",
+				targetRelPath: "docs/guides/deployment/kubernetes.mdx",
+				title: "Kubernetes",
+			},
+		]);
+	});
+
 	it("throws when two logical pages claim the same target path", () => {
 		expect(() =>
 			buildNavigationContentPlan(
@@ -235,5 +290,43 @@ describe("applyNavigationContentPlan", () => {
 		expect(existsSync(join(contentDir, "docs", "intro.md"))).toBe(true);
 		const rewritten = await readFile(join(contentDir, "docs", "intro.md"), "utf-8");
 		expect(rewritten).toContain("![Diagram](../assets/arch.png)");
+	});
+
+	it("injects asIndexPage:true frontmatter when a non-index source is re-homed to <folder>/index.<ext>", async () => {
+		// Regression for the parent-article-with-nested-children case: the
+		// planner writes `<href>/index.<ext>` instead of `<href>.<ext>` so the
+		// folder can hold child pages, and the frontmatter flag makes Nextra v4
+		// route the folder header to the index (instead of just expanding) and
+		// suppress the duplicate auto-discovered index entry in the sidebar.
+		sourceRoot = await makeTempDir();
+		contentDir = await makeTempDir();
+
+		// No existing frontmatter → flag block is prepended.
+		await writeFile(join(sourceRoot, "deployment.mdx"), "# Deployment\nBody.\n", "utf-8");
+		// Existing frontmatter → flag is merged in.
+		await writeFile(join(sourceRoot, "operations.mdx"), "---\ntitle: Ops\n---\n# Operations\n", "utf-8");
+		// Real index source (basename === index) → flag NOT injected; we only
+		// touch frontmatter when we renamed a non-index source into an index slot.
+		await writeFile(join(sourceRoot, "home.mdx"), "---\ntitle: Home\n---\n# Home\n", "utf-8");
+
+		await applyNavigationContentPlan(sourceRoot, contentDir, ["deployment.mdx", "operations.mdx", "home.mdx"], {
+			pages: [
+				{ sourceRelPath: "deployment.mdx", targetRelPath: "guides/deployment/index.mdx", title: "Deployment" },
+				{ sourceRelPath: "operations.mdx", targetRelPath: "sql/operations/index.mdx", title: "Operations" },
+				{ sourceRelPath: "home.mdx", targetRelPath: "home.mdx", title: "Home" },
+			],
+		});
+
+		const deployment = await readFile(join(contentDir, "guides/deployment/index.mdx"), "utf-8");
+		expect(deployment).toMatch(/^---\nasIndexPage: true\n---\n/);
+		expect(deployment).toContain("# Deployment");
+
+		const operations = await readFile(join(contentDir, "sql/operations/index.mdx"), "utf-8");
+		expect(operations).toMatch(/^---\ntitle: Ops\nasIndexPage: true\n---\n/);
+		expect(operations).toContain("# Operations");
+
+		// Source was an .mdx that didn't need renaming → frontmatter untouched.
+		const home = await readFile(join(contentDir, "home.mdx"), "utf-8");
+		expect(home).not.toContain("asIndexPage");
 	});
 });

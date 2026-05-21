@@ -83,6 +83,57 @@ describe("parseNavigation (simple mode)", () => {
 		expect(result.sidebar["/sql/operations"].aggregate).toBe("Aggregate");
 		expect(result.sidebar["/sql/operations"].window).toBe("Window");
 	});
+
+	it("emits theme.collapsed:false for nested articles when expanded:true is set", () => {
+		const nav = [
+			{
+				group: "Guides",
+				root: "guides",
+				content: [
+					{
+						article: "Deployment",
+						href: "deployment",
+						expanded: true,
+						articles: [
+							{ article: "Docker", href: "deployment/docker" } as NavigationArticle,
+							{ article: "Kubernetes", href: "deployment/kubernetes" } as NavigationArticle,
+						],
+					} as NavigationArticle,
+				],
+			} as NavigationGroup,
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/guides"].deployment).toEqual({
+			title: "Deployment",
+			theme: { collapsed: false },
+		});
+	});
+
+	it("keeps plain string entry when expanded is unset or there are no nested articles", () => {
+		const nav = [
+			{
+				group: "Guides",
+				root: "guides",
+				content: [
+					// Has children but expanded omitted → plain string (default-collapsed)
+					{
+						article: "Deployment",
+						href: "deployment",
+						articles: [{ article: "Docker", href: "deployment/docker" } as NavigationArticle],
+					} as NavigationArticle,
+					// expanded:true but no children → still plain string
+					{
+						article: "Quickstart",
+						href: "quickstart",
+						expanded: true,
+					} as NavigationArticle,
+				],
+			} as NavigationGroup,
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/guides"].deployment).toBe("Deployment");
+		expect(result.sidebar["/guides"].quickstart).toBe("Quickstart");
+	});
 });
 
 // ─── parseNavigation: page mode ───────────────────────────────────────────────
