@@ -25,6 +25,7 @@ export {
 	type TopicWithDate,
 } from "../../../cli/src/core/SummaryFormat.js";
 
+import { resolveLlmCredentialSource } from "../../../cli/src/core/LlmClient.js";
 import { formatDate as coreFormatDate } from "../../../cli/src/core/SummaryFormat.js";
 import type {
 	CommitSummary,
@@ -97,27 +98,18 @@ export function formatProviderLabel(
  * historically generated an existing summary. Use this one when previewing
  * what a NEW call is about to do (e.g. the Regenerate confirm dialog).
  *
- * Mirrors the same precedence as `resolveLlmCredentialSource` in
- * cli/src/core/LlmClient.ts and returns `undefined` whenever that resolver
- * would also fail — so callers omit "via …" instead of promising a provider
- * that will throw at call time.
+ * Delegates the precedence ladder to `resolveLlmCredentialSource` so the
+ * "would this provider actually work" decision lives in one place; null
+ * back from the resolver becomes `undefined` here so callers can omit
+ * "via …" instead of promising a provider that will throw at call time.
+ * Label strings come from the same PROVIDER_LABELS map `formatProviderLabel`
+ * uses — there's no separate inline string table to drift.
  */
 export function formatActiveProviderLabel(
 	config: LlmConfig,
 ): string | undefined {
-	if (config.aiProvider === "jolli") {
-		return config.jolliApiKey ? "Jolli proxy" : undefined;
-	}
-	if (config.aiProvider === "anthropic") {
-		if (config.apiKey) return "Anthropic";
-		if (process.env.ANTHROPIC_API_KEY) return "Anthropic (env)";
-		return undefined;
-	}
-	// Legacy precedence when aiProvider is unset: apiKey → $ANTHROPIC_API_KEY → jolliApiKey
-	if (config.apiKey) return "Anthropic";
-	if (process.env.ANTHROPIC_API_KEY) return "Anthropic (env)";
-	if (config.jolliApiKey) return "Jolli proxy";
-	return undefined;
+	const source = resolveLlmCredentialSource(config);
+	return source === null ? undefined : PROVIDER_LABELS[source];
 }
 
 // ─── Push contract: relativePath construction ───────────────────────────────

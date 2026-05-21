@@ -262,27 +262,14 @@ export function buildCss(): string {
     cursor: wait;
     animation: spin 1s linear infinite;
   }
-  /* Regenerate-summary in-flight: dim topics + recap so the user reads them
-     as stale-pending. pointer-events: none on the section is redundant with
-     button[disabled] (the host freezes every focusable control), but it's a
-     cheap belt-and-suspenders against any non-disabled clickable that
-     slipped through. */
-  .section.regenerating {
+  /* Regenerate-summary in-flight: dim topics + recap as "stale, about to be
+     replaced". The page-level .regenerating-readonly class already hides
+     every action button via the foreign-safe whitelist (see further below),
+     so this rule is purely visual — no disabled / pointer-events games. */
+  .page.regenerating-readonly #topicsSection,
+  .page.regenerating-readonly #recapSection {
     opacity: 0.5;
-    pointer-events: none;
     transition: opacity 0.2s;
-  }
-  /* Re-enable pointer-events on the disabled controls themselves so the
-     browser still computes hover state and renders the not-allowed cursor;
-     the disabled attribute still blocks click, so this is purely visual. */
-  .section.regenerating button[disabled],
-  .section.regenerating textarea[disabled],
-  .section.regenerating input[disabled] {
-    pointer-events: auto;
-    cursor: not-allowed;
-  }
-  #regenerateSummaryBtn.generating {
-    animation: spin 1.2s linear infinite;
   }
   .plan-title-link {
     color: var(--vscode-foreground);
@@ -1256,6 +1243,47 @@ export function buildCss(): string {
   .page.foreign-readonly button:not([data-foreign-safe]) {
     display: none !important;
   }
+
+  /* Regenerating-readonly mode.
+     Active for the 20-40s window while the regenerate-summary LLM call is
+     in flight. Same selector + whitelist as foreign-readonly / stale-readonly
+     so it inherits the same allow-list of data-foreign-safe controls (Copy /
+     Save Markdown / Toggle / Hash copy). Host-side dispatchWebviewMessage
+     guard short-circuits any unsafe command that slips through anyway.
+
+     Unlike the other two readonly modes this one is BOUNDED: the
+     summaryRegenerated / summaryRegenerateError message removes the
+     class and the corresponding banner, returning the page to its normal
+     interactive state. */
+  .page.regenerating-readonly button:not([data-foreign-safe]) {
+    display: none !important;
+  }
+
+  /* Regenerating banner - same chrome as .stale-banner but with a spinner
+     and a transient (not persistent) lifetime. Inserted at the top of
+     div.page by the webview's summaryRegenerating handler. */
+  .regenerating-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 0 0 16px 0;
+    padding: 12px 16px;
+    background: var(--vscode-inputValidation-infoBackground, #2a4a5a);
+    color: var(--vscode-inputValidation-infoForeground, #cfe2ff);
+    border: 1px solid var(--vscode-inputValidation-infoBorder, #4a8ab5);
+    border-radius: 6px;
+    font-size: 0.9em;
+  }
+  /* Spinning icon reinforces the in-progress state for users who don't
+     see the lower-right system-progress notification (e.g. focus on the
+     panel). Uses the same spin keyframes as other in-flight indicators
+     (.topic-action-btn.generating). */
+  .regenerating-banner-spinner {
+    display: inline-block;
+    animation: spin 1.2s linear infinite;
+    font-size: 1.1em;
+  }
+  .regenerating-banner-text { flex: 1; }
 
   /* Stale-readonly mode.
      Triggered when the panel's commit has been rewritten by amend / squash /

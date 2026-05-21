@@ -931,8 +931,12 @@ export async function removeFromIndex(commitHash: string, cwd?: string): Promise
  * Reads a transcript for a specific commit from the orphan branch.
  * Returns null if no transcript file exists for the given commit hash.
  */
-export async function readTranscript(commitHash: string, cwd?: string): Promise<StoredTranscript | null> {
-	const store = resolveStorage(undefined, cwd);
+export async function readTranscript(
+	commitHash: string,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<StoredTranscript | null> {
+	const store = resolveStorage(storage, cwd);
 	const raw = await store.readFile(`transcripts/${commitHash}.json`);
 	if (!raw) return null;
 	try {
@@ -950,10 +954,11 @@ export async function readTranscript(commitHash: string, cwd?: string): Promise<
 export async function readTranscriptsForCommits(
 	commitHashes: ReadonlyArray<string>,
 	cwd?: string,
+	storage?: StorageProvider,
 ): Promise<Map<string, StoredTranscript>> {
 	const result = new Map<string, StoredTranscript>();
 	for (const hash of commitHashes) {
-		const transcript = await readTranscript(hash, cwd);
+		const transcript = await readTranscript(hash, cwd, storage);
 		if (transcript) {
 			result.set(hash, transcript);
 		}
