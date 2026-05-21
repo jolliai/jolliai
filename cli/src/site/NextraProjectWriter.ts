@@ -433,7 +433,8 @@ export function generateNextConfig(staticExport?: boolean): string {
 	return `import nextra from 'nextra'
 
 const withNextra = nextra({
-  contentDirBasePath: '/'
+  contentDirBasePath: '/',
+  search: { codeblocks: false }
 })
 
 export default withNextra({${exportLines}
