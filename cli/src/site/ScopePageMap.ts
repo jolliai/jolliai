@@ -96,11 +96,25 @@ function scopeDataBlock(
 	data: Record<string, unknown>,
 	isApiScope: boolean,
 	activeSpecKey: string | undefined,
+	activeSectionKey: string | undefined,
 ): Record<string, unknown> {
 	const newData: Record<string, unknown> = {};
 	for (const [key, val] of Object.entries(data)) {
 		if (!key.startsWith(API_PREFIX)) {
-			newData[key] = val;
+			// For non-api entries that are type:"page" with href: strip href
+			// when this key is the active section so Nextra binds the folder
+			// for sidebar scoping instead of treating it as a navigation link.
+			if (
+				activeSectionKey &&
+				key === activeSectionKey &&
+				val !== null &&
+				typeof val === "object" &&
+				"href" in val
+			) {
+				newData[key] = unhideActiveSpec(val);
+			} else {
+				newData[key] = val;
+			}
 			continue;
 		}
 		const scoped = scopedApiDataEntry(key, val, isApiScope, activeSpecKey);
@@ -125,11 +139,19 @@ function collectLinkFormApiKeys(pageMap: ReadonlyArray<ScopePageMapItem>): Set<s
 			continue;
 		}
 		for (const [key, val] of Object.entries(item.data)) {
-			if (!key.startsWith(API_PREFIX)) {
+			if (val === null || typeof val !== "object" || !("href" in val)) {
 				continue;
 			}
-			if (val !== null && typeof val === "object" && "href" in val) {
+			const href = (val as { href: string }).href;
+			const target = href.replace(/^\//, "");
+			// Direct match: key is an api-* entry with href (e.g. "api-openapi")
+			if (key.startsWith(API_PREFIX)) {
 				out.add(key);
+			}
+			// Indirect match: entry points to an api-* folder via href
+			// (e.g. "api-reference" with href "/api-openapi")
+			if (target.startsWith(API_PREFIX)) {
+				out.add(target);
 			}
 		}
 	}
@@ -164,10 +186,21 @@ export function scopePageMap(pageMap: ReadonlyArray<ScopePageMapItem>, pathname:
 
 	const linkFormKeys = collectLinkFormApiKeys(pageMap);
 
+	// Detect the active section from the pathname — the first path segment
+	// that matches a type:"page" data entry with href. Used to strip href
+	// so Nextra binds the folder for sidebar scoping.
+	const firstSegment = pathname.split("/").filter(Boolean)[0];
+	const activeSectionKey = firstSegment && !firstSegment.startsWith(API_PREFIX) ? firstSegment : undefined;
+
 	const scoped: Array<ScopePageMapItem> = [];
 	for (const item of pageMap) {
 		if ("data" in item && item.data) {
-			const newData = scopeDataBlock(item.data as Record<string, unknown>, isApiScope, activeSpecKey);
+			const newData = scopeDataBlock(
+				item.data as Record<string, unknown>,
+				isApiScope,
+				activeSpecKey,
+				activeSectionKey,
+			);
 			// biome-ignore lint/suspicious/noExplicitAny: Nextra's PageMap union widens unsafely on spread; cast at the boundary.
 			scoped.push({ ...(item as any), data: newData });
 			continue;
@@ -253,11 +286,15 @@ function scopedApiDataEntry(key, val, isApiScope, activeSpecKey) {
   return;
 }
 
-function scopeDataBlock(data, isApiScope, activeSpecKey) {
+function scopeDataBlock(data, isApiScope, activeSpecKey, activeSectionKey) {
   const newData = {};
   for (const [key, val] of Object.entries(data)) {
     if (!key.startsWith(API_PREFIX)) {
-      newData[key] = val;
+      if (activeSectionKey && key === activeSectionKey && val !== null && typeof val === "object" && "href" in val) {
+        newData[key] = unhideActiveSpec(val);
+      } else {
+        newData[key] = val;
+      }
       continue;
     }
     const scoped = scopedApiDataEntry(key, val, isApiScope, activeSpecKey);
@@ -275,11 +312,16 @@ function collectLinkFormApiKeys(pageMap) {
       continue;
     }
     for (const [key, val] of Object.entries(item.data)) {
-      if (!key.startsWith(API_PREFIX)) {
+      if (val === null || typeof val !== "object" || !("href" in val)) {
         continue;
       }
-      if (val !== null && typeof val === "object" && "href" in val) {
+      const href = val.href;
+      const target = href.replace(/^\\//, "");
+      if (key.startsWith(API_PREFIX)) {
         out.add(key);
+      }
+      if (target.startsWith(API_PREFIX)) {
+        out.add(target);
       }
     }
   }
@@ -292,10 +334,13 @@ function scopePageMap(pageMap, pathname) {
   const activeSpecKey = apiMatch ? apiMatch[1] : undefined;
   const isMultiSpec = countApiMentions(pageMap) > 2;
   const linkFormKeys = collectLinkFormApiKeys(pageMap);
+  const segments = pathname.split("/").filter(Boolean);
+  const firstSeg = segments[0];
+  const activeSectionKey = firstSeg && !firstSeg.startsWith(API_PREFIX) ? firstSeg : undefined;
   const scoped = [];
   for (const item of pageMap) {
     if ("data" in item && item.data) {
-      const newData = scopeDataBlock(item.data, isApiScope, activeSpecKey);
+      const newData = scopeDataBlock(item.data, isApiScope, activeSpecKey, activeSectionKey);
       scoped.push({ ...item, data: newData });
       continue;
     }

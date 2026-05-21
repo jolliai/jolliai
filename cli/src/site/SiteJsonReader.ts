@@ -33,6 +33,7 @@ export const DEFAULT_SITE_JSON: SiteJson = {
 	title: "My Documentation Site",
 	description: "A documentation site powered by Jolli",
 	nav: [],
+	theme: { pack: "forge" },
 };
 
 // ─── promptSiteTitle ─────────────────────────────────────────────────────────
@@ -97,6 +98,7 @@ async function readExistingSiteJson(filePath: string): Promise<SiteJsonResult> {
 
 	coerceBrandingToTheme(config);
 	coerceFooterSocialAlias(config);
+	coerceFooterXAlias(config);
 
 	return { config, usedDefault: false };
 }
@@ -179,6 +181,19 @@ function coerceFooterSocialAlias(config: SiteJson): void {
 	}
 }
 
+/**
+ * Copies `footer.socialLinks.x` into `footer.socialLinks.twitter` when
+ * `twitter` is not already set. This lets site.json authors use `"x"` as
+ * a modern alias for the Twitter/X platform link.
+ */
+function coerceFooterXAlias(config: SiteJson): void {
+	const links = config.footer?.socialLinks;
+	if (!links) return;
+	if (links.x && !links.twitter) {
+		links.twitter = links.x;
+	}
+}
+
 // ─── createSiteJson ──────────────────────────────────────────────────────────
 
 async function createSiteJson(sourceRoot: string, filePath: string): Promise<SiteJsonResult> {
@@ -232,7 +247,8 @@ async function createSiteJson(sourceRoot: string, filePath: string): Promise<Sit
 		config.favicon = conversion.favicon;
 	}
 
-	await writeFile(filePath, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
+	const output = { $schema: "https://jolli.ai/schemas/site-config.json", ...config };
+	await writeFile(filePath, `${JSON.stringify(output, null, 2)}\n`, "utf-8");
 	console.log(`  Created ${filePath}`);
 
 	return { config, usedDefault: true };

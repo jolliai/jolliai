@@ -17,20 +17,18 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { sanitizeUrl } from "./Sanitize.js";
 import { SCOPE_PAGE_MAP_RUNTIME_SOURCE } from "./ScopePageMap.js";
-import type { FooterConfig, HeaderConfig, LogoDisplay, ThemeConfig, ThemePack } from "./Types.js";
-import {
-	buildAtlasCss,
-	buildAtlasFontFamilyCssValue,
-	generateAtlasLayoutTsx,
-	resolveAtlasLayoutInput,
-} from "./themes/atlas/index.js";
+import type {
+	AnchorItem,
+	FooterConfig,
+	HeaderConfig,
+	LogoDisplay,
+	Navigation,
+	NavigationPage,
+	ThemeConfig,
+} from "./Types.js";
 import { SOCIAL_PLATFORMS } from "./themes/Footer.js";
-import {
-	buildForgeCss,
-	buildForgeFontFamilyCssValue,
-	generateForgeLayoutTsx,
-	resolveForgeLayoutInput,
-} from "./themes/forge/index.js";
+import type { ThemePackProvider } from "./themes/ThemeRegistry.js";
+import { discoverPack, resolvePack } from "./themes/ThemeRegistry.js";
 
 // ─── NextraProjectConfig ──────────────────────────────────────────────────────
 
@@ -43,6 +41,17 @@ export interface NextraProjectConfig {
 	description: string;
 	header?: HeaderConfig;
 	footer?: FooterConfig;
+	/** Persistent sidebar-bottom links (Blog, Community, etc.). */
+	anchors?: AnchorItem[];
+	/** Structure-declared pages (for Nextra root `type: "page"` entries). */
+	structurePages?: Array<{ key: string; title: string; href: string }>;
+	/**
+	 * Navigation pages for the page switcher UI. When present, the layout
+	 * renders a page bar (Forge: inside sidebar, Atlas: below navbar).
+	 */
+	navigationPages?: Array<{ key: string; title: string; href: string }>;
+	/** The navigation field from site.json (used for theme capability validation). */
+	navigation?: Navigation;
 	/**
 	 * Legacy top-level `favicon` URL. Deprecated alias for `theme.favicon`;
 	 * when both are set the top-level value wins so existing sites keep
@@ -67,9 +76,21 @@ export interface NextraProjectConfig {
 export async function initNextraProject(
 	buildDir: string,
 	config: NextraProjectConfig,
-	options: { staticExport?: boolean } = {},
+	options: { staticExport?: boolean; sourceRoot?: string; themePath?: string } = {},
 ): Promise<{ isNew: boolean }> {
 	const isNew = !existsSync(buildDir);
+
+	// Discover the theme pack (built-in, user dir, npm, or --theme path).
+	// This must run before layout/CSS generation so the provider is registered.
+	const packProvider = await discoverPack(config, {
+		themePath: options.themePath,
+		sourceRoot: options.sourceRoot,
+	});
+
+	// Validate theme capabilities against navigation config.
+	if (packProvider && config.navigation) {
+		validateThemeCapabilities(packProvider, config.navigation);
+	}
 
 	// Create the build directory and subdirectories if needed.
 	await mkdir(join(buildDir, "content"), { recursive: true });
@@ -78,39 +99,71 @@ export async function initNextraProject(
 	// Always regenerate config files so they reflect the latest site.json values.
 	await writeFile(join(buildDir, "package.json"), generatePackageJson(), "utf-8");
 	await writeFile(join(buildDir, "next.config.mjs"), generateNextConfig(options.staticExport), "utf-8");
-	await writeLayoutTsx(buildDir, config);
+	await writeLayoutTsx(buildDir, config, packProvider);
 	await writeFile(join(buildDir, "app", "not-found.tsx"), generateNotFound(), "utf-8");
 	await writeFile(join(buildDir, "app", "[[...mdxPath]]", "page.tsx"), generateCatchAllPage(), "utf-8");
 	await writeFile(join(buildDir, "mdx-components.tsx"), generateMdxComponents(), "utf-8");
 	await writeFile(join(buildDir, "tsconfig.json"), generateTsConfig(), "utf-8");
 	await writeScopedNextraLayoutComponent(buildDir);
-
-	// Pack-specific stylesheet. Forge is the implicit default: a site.json
-	// with no `theme.pack` renders Forge. The vanilla `nextra-theme-docs`
-	// look is still reachable via `theme.pack: "default"`, which writes no
-	// pack CSS.
-	const pack = config.theme?.pack ?? "forge";
-	if (pack === "forge") {
-		await mkdir(join(buildDir, "app", "themes"), { recursive: true });
-		const primaryHue = config.theme?.primaryHue ?? 228;
-		const fontFamily = config.theme?.fontFamily ?? "inter";
-		const css = buildForgeCss({
-			accentHue: primaryHue,
-			fontFamily: buildForgeFontFamilyCssValue(fontFamily),
-		});
-		await writeFile(join(buildDir, "app", "themes", "forge.css"), css, "utf-8");
-	} else if (pack === "atlas") {
-		await mkdir(join(buildDir, "app", "themes"), { recursive: true });
-		const primaryHue = config.theme?.primaryHue ?? 200;
-		const fontFamily = config.theme?.fontFamily ?? "source-serif";
-		const css = buildAtlasCss({
-			accentHue: primaryHue,
-			fontFamily: buildAtlasFontFamilyCssValue(fontFamily),
-		});
-		await writeFile(join(buildDir, "app", "themes", "atlas.css"), css, "utf-8");
+	// SidebarTabs component for the sidebar tab switcher.
+	// Uses Nextra's useConfig() hook — always written since the component
+	// self-hides when fewer than 2 top-level page items exist.
+	await writeSidebarTabsComponent(buildDir);
+	// Pack-specific stylesheet. Packs that return `undefined` (e.g. the
+	// default theme) skip CSS generation entirely.
+	if (packProvider) {
+		const css = packProvider.buildCss(config);
+		if (css) {
+			await mkdir(join(buildDir, "app", "themes"), { recursive: true });
+			await writeFile(join(buildDir, "app", "themes", `${packProvider.manifest.name}.css`), css, "utf-8");
+		}
 	}
 
 	return { isNew };
+}
+
+// ─── validateThemeCapabilities ──────────────────────────────────────────────
+
+function isNavigationPage(node: unknown): node is NavigationPage {
+	return typeof node === "object" && node !== null && "page" in node;
+}
+
+/**
+ * Checks the theme's declared capabilities against the navigation config
+ * and warns when the site.json uses features the theme doesn't support.
+ * Prevents users from deploying a site with silently broken navigation.
+ */
+function validateThemeCapabilities(provider: ThemePackProvider, navigation: Navigation): void {
+	const supports = provider.manifest.supports;
+	// All capabilities default to true when omitted.
+	if (!supports) return;
+	if (navigation.length === 0) return;
+
+	const themeName = provider.manifest.displayName || provider.manifest.name;
+
+	if (supports.pages === false && isNavigationPage(navigation[0])) {
+		const pages = (navigation as NavigationPage[]).filter((p) => p.type !== "menu");
+		if (pages.length > 0) {
+			const names = pages.map((p) => p.page).join(", ");
+			console.warn(
+				`\n  ⚠ Theme "${themeName}" does not support page navigation.\n` +
+					`    Pages "${names}" will not be accessible because ${themeName}\n` +
+					`    hides the navbar where page links are rendered.\n` +
+					`    Consider using simple mode (groups/articles) instead.\n`,
+			);
+		}
+	}
+
+	if (supports.menuPages === false && isNavigationPage(navigation[0])) {
+		const menus = (navigation as NavigationPage[]).filter((p) => p.type === "menu");
+		if (menus.length > 0) {
+			const names = menus.map((p) => p.page).join(", ");
+			console.warn(
+				`\n  ⚠ Theme "${themeName}" does not support menu page dropdowns.\n` +
+					`    Menu pages "${names}" will not be visible.\n`,
+			);
+		}
+	}
 }
 
 // ─── writeScopedNextraLayoutComponent ────────────────────────────────────────
@@ -195,6 +248,65 @@ export default function ScopedNextraLayout({ pageMap, children, ...layoutProps }
 	await writeFile(join(buildDir, "components", "ScopedNextraLayout.tsx"), content, "utf-8");
 }
 
+// ─── writeSidebarTabsComponent ──────────────────────────────────────────────
+
+/**
+ * Emits `<buildDir>/components/SidebarTabs.tsx` — a client component that
+ * reads Nextra's `useConfig().normalizePagesResult.topLevelNavbarItems`
+ * and renders tab buttons in the Forge sidebar (below search, above nav).
+ *
+ * Uses Nextra's own data — no need to hardcode tab lists.
+ */
+async function writeSidebarTabsComponent(buildDir: string): Promise<void> {
+	await mkdir(join(buildDir, "components"), { recursive: true });
+	const content = `// @ts-nocheck
+"use client";
+
+import { useConfig } from "nextra-theme-docs";
+import { usePathname } from "next/navigation";
+
+export default function SidebarTabs({ className }) {
+  const { normalizePagesResult } = useConfig();
+  const pathname = usePathname() ?? "/";
+  const items = normalizePagesResult?.topLevelNavbarItems;
+
+  if (!items || items.length < 2) return null;
+
+  const routeItems = items.filter(item => item.route);
+  const anyActive = routeItems.some(item =>
+    pathname === item.route || pathname === item.route + "/" || pathname.startsWith(item.route + "/")
+  );
+
+  // If no tab matches the current URL, redirect to the first tab
+  if (!anyActive && routeItems.length > 0 && typeof window !== "undefined") {
+    window.location.href = routeItems[0].route;
+    return null;
+  }
+
+  return (
+    <div className={className}>
+      {routeItems.map((item) => {
+        const isActive = pathname === item.route
+          || pathname === item.route + "/"
+          || pathname.startsWith(item.route + "/");
+        return (
+          <a
+            key={item.route}
+            href={item.route}
+            className={(className || "").replace(/-tabs$/, "-tab") + (isActive ? " active" : "")}
+            data-active={isActive || undefined}
+          >
+            {item.title}
+          </a>
+        );
+      })}
+    </div>
+  );
+}
+`;
+	await writeFile(join(buildDir, "components", "SidebarTabs.tsx"), content, "utf-8");
+}
+
 // ─── writeLayoutTsx (internal) ───────────────────────────────────────────────
 
 /**
@@ -203,9 +315,13 @@ export default function ScopedNextraLayout({ pageMap, children, ...layoutProps }
  * `_meta.js` injection, so the layout is written once during
  * `initNextraProject` and never re-written per-render.
  */
-async function writeLayoutTsx(buildDir: string, config: NextraProjectConfig): Promise<void> {
+async function writeLayoutTsx(
+	buildDir: string,
+	config: NextraProjectConfig,
+	packProvider?: ThemePackProvider,
+): Promise<void> {
 	await mkdir(join(buildDir, "app"), { recursive: true });
-	await writeFile(join(buildDir, "app", "layout.tsx"), generateLayout(config), "utf-8");
+	await writeFile(join(buildDir, "app", "layout.tsx"), generateLayout(config, packProvider), "utf-8");
 }
 
 // ─── generatePackageJson ──────────────────────────────────────────────────────
@@ -284,6 +400,8 @@ export function generatePackageJson(): string {
 		dependencies: { ...NEXTRA_DEPENDENCIES },
 		devDependencies: { ...NEXTRA_DEV_DEPENDENCIES },
 		overrides: { ...NEXTRA_OVERRIDES },
+		// Yarn uses `resolutions` instead of npm's `overrides`
+		resolutions: { ...NEXTRA_OVERRIDES },
 	};
 
 	return JSON.stringify(pkg, null, 2);
@@ -409,23 +527,24 @@ function buildFooterBody(footer: FooterConfig | undefined): string {
 // ─── generateLayout (dispatcher) ─────────────────────────────────────────────
 
 /**
- * Returns the contents of `app/layout.tsx`. Dispatches to a pack-specific
- * generator based on `config.theme?.pack`:
- *   - unset (or `forge`) → Forge pack (clean dev docs)
- *   - `atlas` → Atlas pack (editorial)
- *   - `default` → vanilla `nextra-theme-docs` (back-compat opt-in for sites
- *     that explicitly want the pre-pack visual)
+ * Returns the contents of `app/layout.tsx`. Dispatches through the theme
+ * registry to the active pack's `generateLayout()` method. Falls back to
+ * the vanilla `generateDefaultLayout()` when no external theme can be loaded.
  */
-export function generateLayout(config: NextraProjectConfig): string {
-	const pack: ThemePack = config.theme?.pack ?? "forge";
-	switch (pack) {
-		case "atlas":
-			return generateAtlasLayout(config);
-		case "default":
-			return generateDefaultLayout(config);
-		default:
-			return generateForgeLayout(config);
+export function generateLayout(config: NextraProjectConfig, provider?: ThemePackProvider): string {
+	const packProvider = provider ?? resolvePack(config);
+	if (packProvider) {
+		return packProvider.generateLayout(config);
 	}
+	// No registered pack found — fall back to the vanilla Nextra layout.
+	const packName = config.theme?.pack;
+	if (packName && packName !== "default") {
+		console.warn(
+			`Theme pack "${packName}" is not registered. Falling back to the default Nextra layout. ` +
+				`Install the pack or use --theme to point at a local theme folder.`,
+		);
+	}
+	return generateDefaultLayout(config);
 }
 
 // ─── generateDefaultLayout ───────────────────────────────────────────────────
@@ -477,6 +596,12 @@ export function generateDefaultLayout(config: NextraProjectConfig): string {
 	const faviconHref = config.favicon ?? config.theme?.favicon;
 	const faviconLink = faviconHref ? `<link rel="icon" href={${JSON.stringify(sanitizeUrl(faviconHref))}} />` : "";
 
+	const primaryButton = config.header?.primary
+		? `<a href={${JSON.stringify(sanitizeUrl(config.header.primary.href))}} style={{ display: 'inline-flex', alignItems: 'center', padding: '0.375rem 0.875rem', fontSize: '0.875rem', fontWeight: 500, borderRadius: '0.375rem', background: 'hsl(var(--nextra-primary-hue, 212) 84% 45%)', color: 'white', textDecoration: 'none' }}>{${JSON.stringify(config.header.primary.label)}}</a>`
+		: "";
+
+	const anchorBlock = buildDefaultAnchorBlock(config.anchors);
+
 	return `import { Footer, Navbar } from 'nextra-theme-docs'
 import { Head } from 'nextra/components'
 import { getPageMap } from 'nextra/page-map'
@@ -497,9 +622,9 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         ${logoDarkSwapStyle}
       </Head>
       <body>
-        <ScopedNextraLayout
+${anchorBlock}        <ScopedNextraLayout
           navbar={
-            <Navbar logo={<span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>${logoMarkup}</span>} />
+            ${primaryButton ? `<Navbar logo={<span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>${logoMarkup}</span>}>${primaryButton}</Navbar>` : `<Navbar logo={<span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>${logoMarkup}</span>} />`}
           }
           pageMap={await getPageMap()}
           footer={${footerJsx}}
@@ -511,6 +636,24 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     </html>
   )
 }
+`;
+}
+
+// ─── Default-layout anchor helper ───────────────────────────────────────────
+
+/** Renders sidebar-bottom anchor links for the default theme using inline styles. */
+function buildDefaultAnchorBlock(anchors: AnchorItem[] | undefined): string {
+	if (!anchors?.length) return "";
+	const links = anchors
+		.map((a) => {
+			const href = sanitizeUrl(a.href);
+			const icon = a.icon ? `<span style={{ marginRight: '0.375rem' }}>{${JSON.stringify(a.icon)}}</span>` : "";
+			return `          <a href={${JSON.stringify(href)}} style={{ display: 'flex', alignItems: 'center', padding: '0.25rem 0', fontSize: '0.8125rem', color: 'var(--nextra-primary-color, #666)', textDecoration: 'none' }}>${icon}{${JSON.stringify(a.label)}}</a>`;
+		})
+		.join("\n");
+	return `        <div style={{ padding: '0.5rem 1rem', borderTop: '1px solid var(--nextra-border-color, #eee)' }}>
+${links}
+        </div>
 `;
 }
 
@@ -566,44 +709,6 @@ function buildDefaultLogoMarkup(config: NextraProjectConfig): string {
 		default:
 			return `${imageMarkup}${textMarkup}`;
 	}
-}
-
-// ─── generateForgeLayout ─────────────────────────────────────────────────────
-
-/**
- * Forge pack layout — clean developer-docs visual style. The pack-specific
- * stylesheet is written to `app/themes/forge.css` by `initNextraProject`.
- * See `themes/forge/Layout.ts` for the template.
- */
-export function generateForgeLayout(config: NextraProjectConfig): string {
-	const input = resolveForgeLayoutInput({
-		title: config.title,
-		description: config.description,
-		header: config.header,
-		footer: config.footer,
-		theme: config.theme,
-		legacyFavicon: config.favicon,
-	});
-	return generateForgeLayoutTsx(input);
-}
-
-// ─── generateAtlasLayout ─────────────────────────────────────────────────────
-
-/**
- * Atlas pack layout — editorial handbook visual style. The pack-specific
- * stylesheet is written to `app/themes/atlas.css` by `initNextraProject`.
- * See `themes/atlas/Layout.ts` for the template.
- */
-export function generateAtlasLayout(config: NextraProjectConfig): string {
-	const input = resolveAtlasLayoutInput({
-		title: config.title,
-		description: config.description,
-		header: config.header,
-		footer: config.footer,
-		theme: config.theme,
-		legacyFavicon: config.favicon,
-	});
-	return generateAtlasLayoutTsx(input);
 }
 
 // ─── generateNotFound ───────────────────────────────────────────────────────

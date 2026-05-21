@@ -21,16 +21,18 @@ import { escapeHtml, sanitizeUrl } from "../Sanitize.js";
 import type { FooterConfig, SocialLinks } from "../Types.js";
 
 /** Social platforms recognised by the footer renderer (in display order). */
-export const SOCIAL_PLATFORMS = ["github", "twitter", "discord", "linkedin", "youtube"] as const;
+export const SOCIAL_PLATFORMS = ["github", "twitter", "x", "discord", "linkedin", "youtube", "bluesky"] as const;
 export type SocialPlatform = (typeof SOCIAL_PLATFORMS)[number];
 
 /** Human-readable labels used for `aria-label` on social-icon links. */
 export const SOCIAL_LABELS: Record<SocialPlatform, string> = {
 	github: "GitHub",
 	twitter: "Twitter",
+	x: "X",
 	discord: "Discord",
 	linkedin: "LinkedIn",
 	youtube: "YouTube",
+	bluesky: "Bluesky",
 };
 
 // ─── renderFooterColumns ─────────────────────────────────────────────────────
@@ -58,14 +60,26 @@ export function renderFooterColumns(footerConfig: FooterConfig, classPrefix: str
 
 /**
  * Render the social-icon link row. Returns "" when no platforms are set.
+ *
+ * `x` is treated as an alias for `twitter`: when `x` is set but `twitter`
+ * is not, the `x` URL is rendered under the `twitter` slot (same icon /
+ * class / aria-label). When both are set, both render independently.
  */
 export function renderSocialLinks(socialLinks: SocialLinks | undefined, classPrefix: string): string {
 	if (!socialLinks) {
 		return "";
 	}
-	const links = SOCIAL_PLATFORMS.filter((platform) => socialLinks[platform])
+
+	// Normalise: promote `x` into the `twitter` slot when `twitter` is empty.
+	const effective: SocialLinks = { ...socialLinks };
+	if (effective.x && !effective.twitter) {
+		effective.twitter = effective.x;
+		effective.x = undefined;
+	}
+
+	const links = SOCIAL_PLATFORMS.filter((platform) => effective[platform])
 		.map((platform) => {
-			const url = escapeHtml(sanitizeUrl(socialLinks[platform] as string));
+			const url = escapeHtml(sanitizeUrl(effective[platform] as string));
 			const label = SOCIAL_LABELS[platform];
 			return `<a href="${url}" aria-label="${label}" className="${classPrefix}-footer-social-${platform}">${label}</a>`;
 		})

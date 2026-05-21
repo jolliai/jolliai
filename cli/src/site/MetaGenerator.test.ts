@@ -167,6 +167,35 @@ describe("MetaGenerator.buildMetaEntries", () => {
 		const entries = buildMetaEntries(["zebra.md", "apple.md"]);
 		expect(entries.map((e) => e.key)).toEqual(["apple", "zebra"]);
 	});
+
+	it("composes icon into title for sidebar items with icon field", async () => {
+		const { buildMetaEntries } = await import("./MetaGenerator.js");
+		const entries = buildMetaEntries(["index.md"], {
+			"get-started": { title: "Get Started", icon: "📖" },
+		});
+		const entry = entries.find((e) => e.key === "get-started");
+		expect(entry).toBeDefined();
+		expect((entry?.value as Record<string, unknown>).title).toBe("📖 Get Started");
+		expect((entry?.value as Record<string, unknown>).icon).toBeUndefined();
+	});
+
+	it("uses key as fallback title when icon is set but title is missing", async () => {
+		const { buildMetaEntries } = await import("./MetaGenerator.js");
+		const entries = buildMetaEntries(["index.md"], {
+			tutorials: { icon: "🔧" },
+		});
+		const entry = entries.find((e) => e.key === "tutorials");
+		expect((entry?.value as Record<string, unknown>).title).toBe("🔧 tutorials");
+	});
+
+	it("ignores icon field when it is empty", async () => {
+		const { buildMetaEntries } = await import("./MetaGenerator.js");
+		const entries = buildMetaEntries(["index.md"], {
+			"get-started": { title: "Get Started", icon: "" },
+		});
+		const entry = entries.find((e) => e.key === "get-started");
+		expect((entry?.value as Record<string, unknown>).title).toBe("Get Started");
+	});
 });
 
 // ─── generateMetaFiles unit tests ────────────────────────────────────────────
@@ -977,5 +1006,82 @@ describe("MetaGenerator.generateMetaFiles with rootInjection", () => {
 		const nestedMeta = await readFile(join(tempDir, "guides", "_meta.js"), "utf-8");
 		expect(nestedMeta).not.toContain("__documentation");
 		expect(nestedMeta).not.toContain("api-petstore");
+	});
+
+	it("injects structurePages as type:page entries in root _meta.js", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			structurePages: [
+				{ key: "docs", title: "Documentation", href: "/" },
+				{ key: "tutorials", title: "Tutorials", href: "/tutorials" },
+			],
+		});
+
+		const content = await readFile(join(tempDir, "_meta.js"), "utf-8");
+		expect(content).toContain('"docs"');
+		expect(content).toContain('"Documentation"');
+		expect(content).toContain('"type":"page"');
+		expect(content).toContain('"tutorials"');
+		expect(content).toContain('"Tutorials"');
+	});
+
+	it("structurePages do not duplicate existing keys", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(
+			tempDir,
+			{ "/": { about: "About Us" } },
+			{
+				structurePages: [{ key: "about", title: "About Tab", href: "/about" }],
+			},
+		);
+
+		const content = await readFile(join(tempDir, "_meta.js"), "utf-8");
+		// "about" is already in sidebar overrides, so structurePages should not duplicate it
+		expect(content).toContain('"about"');
+		// Should appear only once
+		const matches = content.match(/"about"/g);
+		expect(matches?.length).toBe(1);
+	});
+
+	it("renders page entries as type:page for sidebar scoping when defaultPageHref is set", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			structurePages: [
+				{ key: "docs", title: "Documentation", href: "/docs" },
+				{ key: "api", title: "API", href: "/api" },
+			],
+			defaultPageHref: "/docs",
+		});
+
+		const content = await readFile(join(tempDir, "_meta.js"), "utf-8");
+		// Page entries use Nextra type:"page" for sidebar scoping
+		expect(content).toContain('"docs"');
+		expect(content).toContain('"Documentation"');
+		expect(content).toContain('"type":"page"');
+	});
+
+	it("renders menu page entries as type:menu with items", async () => {
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await generateMetaFiles(tempDir, undefined, {
+			structurePages: [
+				{ key: "docs", title: "Documentation", href: "/docs" },
+				{
+					key: "community",
+					title: "Community",
+					href: "#",
+					type: "menu",
+					menuItems: {
+						slack: { title: "Slack", href: "https://slack.example.com" },
+						github: { title: "GitHub", href: "https://github.com/example" },
+					},
+				},
+			],
+		});
+
+		const content = await readFile(join(tempDir, "_meta.js"), "utf-8");
+		expect(content).toContain('"community"');
+		expect(content).toContain('"Community"');
+		expect(content).toContain('"type":"menu"');
+		expect(content).toContain('"items"');
 	});
 });

@@ -100,33 +100,42 @@ describe("StarterKit.scaffoldProject", () => {
 		expect((parsed.description as string).length).toBeGreaterThan(0);
 	});
 
-	it("site.json contains a nav array with label and href on each entry", async () => {
+	it("site.json contains navigation pages with Documentation and API Reference", async () => {
 		const { scaffoldProject } = await import("./StarterKit.js");
 		const targetDir = join(tempBase, "my-docs");
 
 		await scaffoldProject(targetDir);
 
 		const raw = await readFile(join(targetDir, "site.json"), "utf-8");
-		const parsed = JSON.parse(raw) as { nav?: unknown };
-		expect(Array.isArray(parsed.nav)).toBe(true);
+		const parsed = JSON.parse(raw) as { navigation?: unknown };
+		expect(parsed.navigation).toBeDefined();
+		expect(Array.isArray(parsed.navigation)).toBe(true);
 
-		const nav = parsed.nav as Array<{ label?: unknown; href?: unknown }>;
-		expect(nav.length).toBeGreaterThan(0);
-
-		for (const entry of nav) {
-			expect(typeof entry.label).toBe("string");
-			expect(typeof entry.href).toBe("string");
-		}
+		const pages = parsed.navigation as Array<{ page: string }>;
+		const pageNames = pages.map((p) => p.page);
+		expect(pageNames).toContain("Documentation");
+		expect(pageNames).toContain("API Reference");
 	});
 
-	it("site.json defaults theme.pack to forge so new sites get the polished look out of the box", async () => {
+	it("site.json includes a $schema URL for editor autocompletion", async () => {
 		const { scaffoldProject } = await import("./StarterKit.js");
 		const targetDir = join(tempBase, "my-docs");
 
 		await scaffoldProject(targetDir);
 
 		const raw = await readFile(join(targetDir, "site.json"), "utf-8");
-		const parsed = JSON.parse(raw) as { theme?: { pack?: unknown } };
+		const parsed = JSON.parse(raw) as { $schema?: unknown };
+		expect(parsed.$schema).toBe("https://jolli.ai/schemas/site-config.json");
+	});
+
+	it("site.json includes theme.pack: 'forge' so new sites explicitly request the Forge theme", async () => {
+		const { scaffoldProject } = await import("./StarterKit.js");
+		const targetDir = join(tempBase, "my-docs");
+
+		await scaffoldProject(targetDir);
+
+		const raw = await readFile(join(targetDir, "site.json"), "utf-8");
+		const parsed = JSON.parse(raw) as { theme?: { pack?: string } };
 		expect(parsed.theme?.pack).toBe("forge");
 	});
 
@@ -141,13 +150,13 @@ describe("StarterKit.scaffoldProject", () => {
 		expect(existsSync(join(targetDir, "index.md"))).toBe(true);
 	});
 
-	it("writes getting-started.md at the root", async () => {
+	it("writes docs/getting-started.md under the docs folder", async () => {
 		const { scaffoldProject } = await import("./StarterKit.js");
 		const targetDir = join(tempBase, "my-docs");
 
 		await scaffoldProject(targetDir);
 
-		expect(existsSync(join(targetDir, "getting-started.md"))).toBe(true);
+		expect(existsSync(join(targetDir, "docs", "getting-started.md"))).toBe(true);
 	});
 
 	// ── OpenAPI file (Requirement 1.5) ─────────────────────────────────────
@@ -183,13 +192,13 @@ describe("StarterKit.scaffoldProject", () => {
 
 	// ── Nested subfolder (Requirement 1.6) ─────────────────────────────────
 
-	it("creates a guides/ subfolder with introduction.md", async () => {
+	it("creates a docs/guides/ subfolder with introduction.md", async () => {
 		const { scaffoldProject } = await import("./StarterKit.js");
 		const targetDir = join(tempBase, "my-docs");
 
 		await scaffoldProject(targetDir);
 
-		expect(existsSync(join(targetDir, "guides", "introduction.md"))).toBe(true);
+		expect(existsSync(join(targetDir, "docs", "guides", "introduction.md"))).toBe(true);
 	});
 
 	// ── Error: target already exists (Requirement 1.2 / Task 2.7) ──────────

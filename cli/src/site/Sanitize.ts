@@ -3,9 +3,8 @@
  *
  * Single source of truth for the allow-list-based URL sanitiser used by every
  * layout, footer renderer, and `_meta.js` writer. Previously these helpers
- * were duplicated across `themes/forge/Layout.ts`, `themes/atlas/Layout.ts`,
- * `themes/Footer.ts`, `NextraProjectWriter.ts`, and `renderer/nextra/Components.ts` —
- * five copies of the same allow-list. Consolidating here means a future
+ * were previously duplicated across layout generators, `themes/Footer.ts`,
+ * `NextraProjectWriter.ts`, and `renderer/nextra/Components.ts`. Consolidating here means a future
  * tightening of the allow-list (e.g. blocking `data:` even where benign) only
  * has to be made once.
  *

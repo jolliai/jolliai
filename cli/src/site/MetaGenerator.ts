@@ -13,7 +13,7 @@
  * title-cased labels (backward-compatible default behavior).
  */
 
-import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join, relative, sep } from "node:path";
 import { sanitizeUrl } from "./Sanitize.js";
 import type { HeaderItem, SidebarItemValue, SidebarOverrides } from "./Types.js";
@@ -44,6 +44,30 @@ export interface RootInjectionInput {
 	 * for `items`-bearing dropdowns) instead of custom JSX.
 	 */
 	headerItems?: HeaderItem[];
+	/**
+	 * Pages declared via `navigation` field. Each becomes a Nextra
+	 * `type: "page"` entry (or `type: "menu"` for menu pages) in the
+	 * root `_meta.js`.
+	 */
+	structurePages?: Array<{
+		key: string;
+		title: string;
+		href: string;
+		type?: "menu";
+		menuItems?: Record<string, { title: string; href: string }>;
+	}>;
+	/**
+	 * When navigation pages are used, the root `index` entry should redirect
+	 * to this href so the first page is the default landing page.
+	 */
+	defaultPageHref?: string;
+	/**
+	 * When `true`, the navigation uses simple mode (groups/articles only, no
+	 * pages). Auto-injection of `type: "page"` entries (Documentation, API
+	 * Reference) is suppressed — those entries break Nextra validation in
+	 * simple mode because there's no page-level scoping.
+	 */
+	simpleMode?: boolean;
 }
 
 // ─── MetaEntry ────────────────────────────────────────────────────────────────
@@ -142,7 +166,14 @@ function buildOverriddenEntries(filenames: string[], override: Record<string, Si
 		if (typeof value === "string") {
 			entries.push({ key, value });
 		} else {
-			entries.push({ key, value: value as Record<string, unknown> });
+			const obj = { ...value } as Record<string, unknown>;
+			// Compose icon into title for Nextra (no native icon support)
+			if (typeof obj.icon === "string" && obj.icon) {
+				const title = typeof obj.title === "string" ? obj.title : key;
+				obj.title = `${obj.icon} ${title}`;
+				delete obj.icon;
+			}
+			entries.push({ key, value: obj });
 		}
 	}
 
@@ -190,7 +221,7 @@ async function processDir(
 	const contentItems: string[] = [];
 
 	for (const entry of entries) {
-		if (entry.startsWith(".") || entry === "_meta.js") continue;
+		if (entry.startsWith(".") || entry === "_meta.js" || entry === "_meta.ts") continue;
 
 		const fullPath = join(dir, entry);
 
@@ -300,7 +331,7 @@ function navKeyFromLabel(label: string, idx: number): string {
  *
  * Order matters: Nextra renders root tabs in `_meta.js` declaration order,
  * and we want `Documentation` first (primary anchor), `API Reference` next,
- * then user-supplied tabs.
+ * then user-supplied pages.
  */
 function injectRootNavEntries(existing: MetaEntry[], input: RootInjectionInput): MetaEntry[] {
 	const apiSpecs = input.apiSpecs ?? [];
@@ -321,12 +352,27 @@ function injectRootNavEntries(existing: MetaEntry[], input: RootInjectionInput):
 	for (const item of headerItems) {
 		userLabels.add(item.label.trim().toLowerCase());
 	}
+	// Navigation pages also count as user-supplied labels so auto-injection
+	// doesn't duplicate entries the user already defined.
+	for (const sp of input.structurePages ?? []) {
+		userLabels.add(sp.title.trim().toLowerCase());
+	}
 	const skipDocumentation = [...DOCUMENTATION_LABELS].some((label) => userLabels.has(label));
 	const skipApiReference = [...API_REFERENCE_LABELS].some((label) => userLabels.has(label));
 
 	const injected: MetaEntry[] = [];
 
-	if (apiSpecs.length > 0 && !skipDocumentation) {
+	// In simple mode (no pages), skip auto-injection of type:"page" entries —
+	// they break Nextra validation when there's no page-level scoping.
+	if (input.simpleMode) {
+		return existing;
+	}
+
+	// When the user has explicit navigation pages (structurePages), they've
+	// defined their own page structure — don't auto-inject "Documentation".
+	const hasExplicitPages = (input.structurePages ?? []).length > 0;
+
+	if (apiSpecs.length > 0 && !skipDocumentation && !hasExplicitPages) {
 		injected.push({
 			key: DOC_HOME_NAV_KEY,
 			value: { title: "Documentation", type: "page", href: "/" },
@@ -427,16 +473,55 @@ function injectRootNavEntries(existing: MetaEntry[], input: RootInjectionInput):
 		}
 	});
 
+	// Navigation pages — `type: "page"` for Nextra sidebar scoping, or
+	// `type: "menu"` for navbar dropdown pages.
+	// Nextra renders these as navbar links; pack CSS repositions them
+	// as a second-row tab bar with active underline via aria-current.
+	if (input.structurePages) {
+		for (const sp of input.structurePages) {
+			if (!usedNavKeys.has(sp.key)) {
+				if (sp.type === "menu" && sp.menuItems) {
+					injected.push({
+						key: sp.key,
+						value: { title: sp.title, type: "menu", items: sp.menuItems },
+					});
+				} else {
+					injected.push({
+						key: sp.key,
+						value: { title: sp.title, type: "page", href: sp.href },
+					});
+				}
+				usedNavKeys.add(sp.key);
+			}
+		}
+	}
+
 	if (injected.length === 0) {
 		return existing;
 	}
 
-	// De-duplicate against keys the existing entry list already declares
-	// (e.g. when the customer wrote a manual `_meta.js` override that
-	// already pins `__documentation`).
-	const existingKeys = new Set(existing.map((e) => e.key));
-	const filtered = injected.filter((e) => !existingKeys.has(e.key));
-	return [...filtered, ...existing];
+	// Structure pages must replace filesystem-discovered entries with the
+	// same key (e.g. a folder "documentation" becomes `type: "page"` tab).
+	const structureKeys = new Set((input.structurePages ?? []).map((p) => p.key));
+	// When a structure page's href points to a different folder (e.g. key
+	// "api-reference" → href "/api-openapi"), suppress the filesystem-
+	// discovered entry so it doesn't appear as a duplicate nav item.
+	// scopePageMap's collectLinkFormApiKeys resolves href targets from
+	// non-api data entries, so the folder is still kept client-side.
+	const structureHrefTargets = new Set(
+		(input.structurePages ?? []).map((p) => p.href.replace(/^\//, "")).filter((h) => h.length > 0),
+	);
+	const filteredExisting = existing.filter((e) => {
+		if (structureKeys.has(e.key)) return false;
+		if (structureHrefTargets.has(e.key)) return false;
+		return true;
+	});
+
+	// Non-structure injected entries (API specs, header items) should not
+	// duplicate existing keys.
+	const existingKeys = new Set(filteredExisting.map((e) => e.key));
+	const filtered = injected.filter((e) => structureKeys.has(e.key) || !existingKeys.has(e.key));
+	return [...filtered, ...filteredExisting];
 }
 
 // ─── writeMetaFile (internal helper) ─────────────────────────────────────────
@@ -458,4 +543,15 @@ async function writeMetaFile(dir: string, entries: MetaEntry[]): Promise<void> {
 
 	await mkdir(dir, { recursive: true });
 	await writeFile(join(dir, "_meta.js"), content, "utf-8");
+
+	// Remove any _meta.ts in the same directory to prevent conflicts.
+	// The OpenAPI pipeline writes _meta.ts for endpoint ordering; when
+	// MetaGenerator also writes _meta.js, Nextra may load both and
+	// produce inconsistent navigation.
+	const tsPath = join(dir, "_meta.ts");
+	try {
+		await rm(tsPath);
+	} catch {
+		// Not found — nothing to clean up
+	}
 }

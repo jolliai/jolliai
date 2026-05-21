@@ -114,6 +114,7 @@ export async function ensureEngine(): Promise<NpmRunResult> {
 			dependencies: { ...NEXTRA_DEPENDENCIES },
 			devDependencies: { ...NEXTRA_DEV_DEPENDENCIES },
 			overrides: { ...NEXTRA_OVERRIDES },
+			resolutions: { ...NEXTRA_OVERRIDES },
 		};
 		await writeFile(join(engineDir, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`, "utf-8");
 

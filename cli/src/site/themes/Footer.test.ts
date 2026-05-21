@@ -202,6 +202,30 @@ describe("renderSocialLinks", () => {
 		expect(result).toContain("atlas-footer-social-github");
 		expect(result).toContain('<div className="atlas-footer-social">');
 	});
+
+	it("renders x as twitter when only x is set", () => {
+		const result = renderSocialLinks({ x: "https://x.com/acme" }, "forge");
+		expect(result).toContain('aria-label="Twitter"');
+		expect(result).toContain('className="forge-footer-social-twitter"');
+		expect(result).toContain("https://x.com/acme");
+		// x slot should not render separately when promoted to twitter
+		expect(result).not.toContain('aria-label="X"');
+	});
+
+	it("renders both twitter and x independently when both are set", () => {
+		const result = renderSocialLinks({ twitter: "https://twitter.com/acme", x: "https://x.com/acme" }, "forge");
+		expect(result).toContain('aria-label="Twitter"');
+		expect(result).toContain('aria-label="X"');
+		expect(result).toContain("twitter.com/acme");
+		expect(result).toContain("x.com/acme");
+	});
+
+	it("renders twitter normally when only twitter is set (no x)", () => {
+		const result = renderSocialLinks({ twitter: "https://twitter.com/acme" }, "forge");
+		expect(result).toContain('aria-label="Twitter"');
+		expect(result).toContain("twitter.com/acme");
+		expect(result).not.toContain('aria-label="X"');
+	});
 });
 
 // ─── buildFooterScaffold ─────────────────────────────────────────────────────

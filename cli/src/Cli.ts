@@ -37,9 +37,11 @@ import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerNewCommand } from "./commands/NewCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
+import { registerReverseCommand } from "./commands/ReverseCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
 import { registerBuildCommand, registerDevCommand, registerStartCommand } from "./commands/StartCommand.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
+import { registerThemeCommand } from "./commands/ThemeCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
 import { setSilentConsole } from "./Logger.js";
 
@@ -76,7 +78,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 		"export",
 		"auth",
 	]);
-	const SITE_COMMAND_NAMES = new Set(["new", "convert", "dev", "build", "start"]);
+	const SITE_COMMAND_NAMES = new Set(["new", "convert", "dev", "build", "start", "reverse", "theme"]);
 
 	const MEMORY_DESCRIPTION =
 		"Auto-documents your AI-assisted development. Lightweight git and AI-agent\nhooks turn each commit into a structured summary (intent, decisions,\nprogress) stored on a git orphan branch, so you can recall context across\nbranches, machines, and teammates.";
@@ -192,6 +194,8 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerDevCommand(program);
 	registerBuildCommand(program);
 	registerStartCommand(program);
+	registerReverseCommand(program);
+	registerThemeCommand(program);
 
 	checkVersionMismatch();
 

@@ -8,8 +8,7 @@
  * defaults to a Nextra-ish blue (220).
  *
  * Emitted as a standalone `styles/api.css` file and imported alongside
- * any pack stylesheet (`themes/forge.css` / `themes/atlas.css`) by the
- * generated `app/layout.tsx`.
+ * any external pack stylesheet by the generated `app/layout.tsx`.
  */
 
 import type { TemplateFile } from "./Types.js";
