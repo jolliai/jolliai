@@ -35,6 +35,7 @@ const {
 	mockRunNpmDev,
 	mockRunPagefind,
 	mockRunServe,
+	mockRunNpmStart,
 } = vi.hoisted(() => ({
 	mockExistsSync: vi.fn(),
 	mockReadSiteJson: vi.fn(),
@@ -51,6 +52,7 @@ const {
 	mockRunNpmDev: vi.fn(),
 	mockRunPagefind: vi.fn(),
 	mockRunServe: vi.fn(),
+	mockRunNpmStart: vi.fn(),
 }));
 
 vi.mock("node:fs", () => ({
@@ -133,6 +135,7 @@ vi.mock("../site/NpmRunner.js", () => ({
 	runNpmBuild: mockRunNpmBuild,
 	runNpmDev: mockRunNpmDev,
 	runServe: mockRunServe,
+	runNpmStart: mockRunNpmStart,
 }));
 
 vi.mock("../site/PagefindRunner.js", () => ({
@@ -208,8 +211,9 @@ function setupSuccessfulRun(
 	mockRunNpmInstall.mockResolvedValue({ success: true, output: "" });
 	mockRunNpmBuild.mockResolvedValue({ success: true, output: "" });
 	mockRunNpmDev.mockResolvedValue({ success: true, output: "" });
-	mockRunPagefind.mockResolvedValue({ success: true, output: "Indexed 5 pages", pagesIndexed: 5 });
+	mockRunPagefind.mockReturnValue({ success: true, output: "Indexed 5 pages", pagesIndexed: 5 });
 	mockRunServe.mockResolvedValue({ success: true, output: "" });
+	mockRunNpmStart.mockResolvedValue({ success: true, output: "" });
 	mockStartSourceWatcher.mockReturnValue({ close: vi.fn().mockResolvedValue(undefined) });
 }
 
@@ -396,7 +400,7 @@ describe("jolli build", () => {
 
 	it("sets exitCode = 1 when pagefind fails", async () => {
 		setupSuccessfulRun();
-		mockRunPagefind.mockResolvedValue({ success: false, output: "Pagefind error" });
+		mockRunPagefind.mockReturnValue({ success: false, output: "Pagefind error" });
 		const program = await makeProgram();
 		await program.parseAsync(["build", "/my-docs"], { from: "user" });
 
@@ -441,17 +445,17 @@ describe("jolli start", () => {
 
 		expect(mockRunNpmBuild).toHaveBeenCalledOnce();
 		expect(mockRunPagefind).toHaveBeenCalledOnce();
-		expect(mockRunServe).toHaveBeenCalledOnce();
+		expect(mockRunNpmStart).toHaveBeenCalledOnce();
 		expect(mockRunNpmDev).not.toHaveBeenCalled();
 	});
 
-	it("passes staticExport: true to initNextraProject", async () => {
+	it("passes staticExport: false to initNextraProject (production server mode)", async () => {
 		setupSuccessfulRun();
 		const program = await makeProgram();
 		await program.parseAsync(["start", "/my-docs"], { from: "user" });
 
 		const [, , options] = mockInitNextraProject.mock.calls[0] as [string, unknown, { staticExport?: boolean }];
-		expect(options.staticExport).toBe(true);
+		expect(options.staticExport).toBe(false);
 	});
 
 	it("sets exitCode = 1 when next build fails", async () => {
@@ -466,7 +470,7 @@ describe("jolli start", () => {
 
 	it("sets exitCode = 1 when pagefind fails", async () => {
 		setupSuccessfulRun();
-		mockRunPagefind.mockResolvedValue({ success: false, output: "Pagefind error" });
+		mockRunPagefind.mockReturnValue({ success: false, output: "Pagefind error" });
 		const program = await makeProgram();
 		await program.parseAsync(["start", "/my-docs"], { from: "user" });
 
@@ -476,7 +480,7 @@ describe("jolli start", () => {
 
 	it("prints pages indexed count", async () => {
 		setupSuccessfulRun();
-		mockRunPagefind.mockResolvedValue({ success: true, output: "", pagesIndexed: 42 });
+		mockRunPagefind.mockReturnValue({ success: true, output: "", pagesIndexed: 42 });
 		const program = await makeProgram();
 		await program.parseAsync(["start", "/my-docs"], { from: "user" });
 
@@ -886,7 +890,7 @@ describe("StartCommand additional branches", () => {
 
 	it("sets exitCode = 1 when serve fails with output", async () => {
 		setupSuccessfulRun();
-		mockRunServe.mockResolvedValue({ success: false, output: "Serve error details" });
+		mockRunNpmStart.mockResolvedValue({ success: false, output: "Serve error details" });
 		const program = await makeProgram();
 		await program.parseAsync(["start", "/my-docs"], { from: "user" });
 
@@ -897,7 +901,7 @@ describe("StartCommand additional branches", () => {
 
 	it("handles serve failure without output", async () => {
 		setupSuccessfulRun();
-		mockRunServe.mockResolvedValue({ success: false, output: "" });
+		mockRunNpmStart.mockResolvedValue({ success: false, output: "" });
 		const program = await makeProgram();
 		await program.parseAsync(["start", "/my-docs"], { from: "user" });
 
@@ -926,7 +930,7 @@ describe("StartCommand additional branches", () => {
 
 	it("shows verbose pagefind error when --verbose is set", async () => {
 		setupSuccessfulRun();
-		mockRunPagefind.mockResolvedValue({ success: false, output: "detailed pagefind error" });
+		mockRunPagefind.mockReturnValue({ success: false, output: "detailed pagefind error" });
 		const program = await makeProgram();
 		await program.parseAsync(["build", "--verbose", "/my-docs"], { from: "user" });
 
@@ -983,7 +987,7 @@ describe("StartCommand additional branches", () => {
 
 	it("handles pagefind without pagesIndexed field", async () => {
 		setupSuccessfulRun();
-		mockRunPagefind.mockResolvedValue({ success: true, output: "Done" });
+		mockRunPagefind.mockReturnValue({ success: true, output: "Done" });
 		const program = await makeProgram();
 		await program.parseAsync(["build", "/my-docs"], { from: "user" });
 

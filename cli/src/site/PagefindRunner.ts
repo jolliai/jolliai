@@ -29,8 +29,8 @@ export type { PagefindResult };
  * indexed (e.g. "Indexed 42 pages"). Returns `{ success: true, output, pagesIndexed }`
  * on exit code 0, or `{ success: false, output }` on any non-zero exit code.
  */
-export function runPagefind(buildDir: string): PagefindResult {
-	const rawArgs = ["pagefind", "--site", "out", "--output-path", "out/_pagefind"];
+export function runPagefind(buildDir: string, site = "out", outputPath = "out/_pagefind"): PagefindResult {
+	const rawArgs = ["pagefind", "--site", site, "--output-path", outputPath];
 	const [cmd, args] = IS_WIN ? /* v8 ignore next */ [`npx ${rawArgs.join(" ")}`, []] : ["npx", rawArgs];
 	const result = spawnSyncHidden(cmd, args, {
 		cwd: buildDir,
