@@ -263,17 +263,22 @@ export function buildCss(): string {
     animation: spin 1s linear infinite;
   }
   /* Regenerate-summary in-flight: dim topics + recap so the user reads them
-     as stale-pending. pointer-events is redundant w/ button[disabled]
-     (Task 5 freezes every focusable control), but it's a cheap belt-and-
-     suspenders against any non-disabled clickable that slipped through. */
+     as stale-pending. pointer-events: none on the section is redundant with
+     button[disabled] (the host freezes every focusable control), but it's a
+     cheap belt-and-suspenders against any non-disabled clickable that
+     slipped through. */
   .section.regenerating {
     opacity: 0.5;
     pointer-events: none;
     transition: opacity 0.2s;
   }
+  /* Re-enable pointer-events on the disabled controls themselves so the
+     browser still computes hover state and renders the not-allowed cursor;
+     the disabled attribute still blocks click, so this is purely visual. */
   .section.regenerating button[disabled],
   .section.regenerating textarea[disabled],
   .section.regenerating input[disabled] {
+    pointer-events: auto;
     cursor: not-allowed;
   }
   #regenerateSummaryBtn.generating {

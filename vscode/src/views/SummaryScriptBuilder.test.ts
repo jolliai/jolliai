@@ -160,6 +160,46 @@ describe("SummaryScriptBuilder", () => {
 		expect(script).toMatch(/'copilot',\s*'copilot-chat'/);
 	});
 
+	describe("Regenerate summary re-render wiring", () => {
+		// The emitted JS runs in the webview iframe and is not unit-testable
+		// at runtime in vitest. These string-contain assertions pin the
+		// regenerate handlers in place so a refactor that drops them breaks
+		// the build instead of silently regressing webview behavior. Each
+		// matches a load-bearing line from SummaryScriptBuilder's
+		// summaryRegenerated branch.
+
+		it("emits the named handler so success-path re-binds the new #toggleAllBtn", () => {
+			// Function defined and called once at page-load init.
+			expect(script).toContain("function attachToggleAllBtnHandler");
+			// Re-invoked from the summaryRegenerated message branch because
+			// replaceSection swaps in a brand-new #toggleAllBtn element whose
+			// click listener doesn't carry over from the old DOM.
+			expect(script).toMatch(/summaryRegenerated[\s\S]*attachToggleAllBtnHandler\(\)/);
+		});
+
+		it("resets allCollapsed to false before re-binding so button text matches the freshly-uncollapsed topics", () => {
+			expect(script).toMatch(
+				/summaryRegenerated[\s\S]*allCollapsed\s*=\s*false[\s\S]*attachToggleAllBtnHandler/,
+			);
+		});
+
+		it("re-attaches toggle-header handlers on the new topics root (collapse on click still works)", () => {
+			expect(script).toMatch(
+				/summaryRegenerated[\s\S]*\.toggle-header[\s\S]*attachToggleHeader/,
+			);
+		});
+
+		it("does NOT re-attach attachRegenerateSummaryHandler in the success path (button lives outside topicsSection / recapSection)", () => {
+			// The regenerate button is in the Conversations card, which
+			// replaceSection never touches; re-attaching would double-bind
+			// the listener and post N messages on the Nth click after N
+			// regenerates.
+			const summaryRegeneratedBranch = script.split("summaryRegenerated")[1] ?? "";
+			const cancelBranch = summaryRegeneratedBranch.split("summaryRegenerateError")[0] ?? "";
+			expect(cancelBranch).not.toContain("attachRegenerateSummaryHandler(");
+		});
+	});
+
 	describe("Linear issue actions", () => {
 		it("routes the 3 Linear actions through their own data-action cases", () => {
 			// Each case must read the data-linear-key attribute and post a
