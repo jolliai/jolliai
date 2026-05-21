@@ -413,7 +413,13 @@ function renderOneIssue(ref: LinearIssueRef, maxCharsPerIssue: number): string {
 	return lines.join("\n");
 }
 
-function truncate(s: string, maxChars: number): string {
+/**
+ * Truncates `s` to `maxChars` and appends a "...[truncated, N more chars]"
+ * marker so the LLM sees that data was cut. Shared by the regenerate path's
+ * prompt-block builder (Regenerator.ts) — same wire format keeps the LLM's
+ * cue text identical across first-run and regenerate.
+ */
+export function truncate(s: string, maxChars: number): string {
 	if (s.length <= maxChars) return s;
 	const remaining = s.length - maxChars;
 	return `${s.slice(0, maxChars)}\n…[truncated, ${remaining} more chars]`;

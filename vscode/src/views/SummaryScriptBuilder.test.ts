@@ -198,6 +198,44 @@ describe("SummaryScriptBuilder", () => {
 			const cancelBranch = summaryRegeneratedBranch.split("summaryRegenerateError")[0] ?? "";
 			expect(cancelBranch).not.toContain("attachRegenerateSummaryHandler(");
 		});
+
+		it("enters regenerating-readonly mode on summaryRegenerating (banner + page class)", () => {
+			// CSS for .page.regenerating-readonly hides every action button via
+			// the foreign-safe whitelist, and the banner explains why. The
+			// previous freezeSummarySections / thawSummarySections approach
+			// has been removed in favor of this single class toggle — pin
+			// it so a refactor doesn't silently revert.
+			expect(script).toContain("function enterRegeneratingReadonly");
+			expect(script).toContain("function leaveRegeneratingReadonly");
+			expect(script).toContain("regenerating-readonly");
+			expect(script).toMatch(
+				/summaryRegenerating[\s\S]*enterRegeneratingReadonly\(\)/,
+			);
+		});
+
+		it("leaves regenerating-readonly on BOTH success and error/cancel paths", () => {
+			// Either summaryRegenerated OR summaryRegenerateError must
+			// restore the page chrome — otherwise the user is stuck with
+			// every action button hidden until they reload.
+			expect(script).toMatch(
+				/summaryRegenerated[\s\S]*leaveRegeneratingReadonly\(\)/,
+			);
+			expect(script).toMatch(
+				/summaryRegenerateError[\s\S]*leaveRegeneratingReadonly\(\)/,
+			);
+		});
+
+		it("inserts a banner with the regenerating-banner-spinner element so users see a spinner", () => {
+			expect(script).toContain("regenerating-banner-spinner");
+			expect(script).toContain("regenerating-banner-text");
+			expect(script).toContain("Regenerating summary");
+		});
+
+		it("does NOT contain the removed freeze/thaw helpers (deprecated by regenerating-readonly)", () => {
+			expect(script).not.toContain("function freezeSummarySections");
+			expect(script).not.toContain("function thawSummarySections");
+			expect(script).not.toContain("function resetRegenerateButton");
+		});
 	});
 
 	describe("Linear issue actions", () => {

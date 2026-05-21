@@ -1,4 +1,5 @@
 import type { CommitSummary } from "../Types.js";
+import type { StorageProvider } from "./StorageProvider.js";
 import { normalizeToV4, readTranscriptsForCommits } from "./SummaryStore.js";
 import { collectAllTranscriptHashes } from "./SummaryTree.js";
 import { transcriptSourceLabel } from "./TranscriptSourceLabel.js";
@@ -35,10 +36,18 @@ export interface RegenerateContext {
 	readonly linearCount: number;
 }
 
-export async function loadRegenerateContext(summary: CommitSummary, cwd: string): Promise<RegenerateContext> {
+export async function loadRegenerateContext(
+	summary: CommitSummary,
+	cwd: string,
+	storage?: StorageProvider,
+): Promise<RegenerateContext> {
 	const normalized = normalizeToV4(summary);
 	const treeHashes = collectAllTranscriptHashes(normalized);
-	const transcriptMap = await readTranscriptsForCommits(treeHashes, cwd);
+	// `storage` is threaded so folder-only Memory Bank users read transcripts
+	// from FolderStorage instead of the OrphanBranchStorage fallback in
+	// resolveStorage — otherwise the confirm dialog would report 0 transcript
+	// entries even when the user can see them in the All Conversations card.
+	const transcriptMap = await readTranscriptsForCommits(treeHashes, cwd, storage);
 
 	let entryCount = 0;
 	let humanTurns = 0;

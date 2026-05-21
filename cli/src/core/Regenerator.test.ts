@@ -255,10 +255,12 @@ describe("regenerateSummary", () => {
 
 		await regenerateSummary(withRefs, "/repo", config);
 
-		expect(SummaryStore.readPlanFromBranch).toHaveBeenCalledWith("p-1", "/repo");
-		expect(SummaryStore.readPlanFromBranch).toHaveBeenCalledWith("p-2", "/repo");
-		expect(SummaryStore.readNoteFromBranch).toHaveBeenCalledWith("n-1", "/repo");
-		expect(SummaryStore.readLinearIssueFromBranch).toHaveBeenCalledWith("JOLLI-1-abc", "/repo");
+		// Third arg is the optional StorageProvider; tests pass undefined,
+		// production code routes through bridge.regenerateSummary which supplies it.
+		expect(SummaryStore.readPlanFromBranch).toHaveBeenCalledWith("p-1", "/repo", undefined);
+		expect(SummaryStore.readPlanFromBranch).toHaveBeenCalledWith("p-2", "/repo", undefined);
+		expect(SummaryStore.readNoteFromBranch).toHaveBeenCalledWith("n-1", "/repo", undefined);
+		expect(SummaryStore.readLinearIssueFromBranch).toHaveBeenCalledWith("JOLLI-1-abc", "/repo", undefined);
 
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
 		expect(params.plans).toContain("plan body 1");
@@ -580,9 +582,9 @@ describe("regenerateSummary", () => {
 		await regenerateSummary(v3ChildOnlyRefs, "/repo", config);
 
 		// The reads went through under the hoisted slug / id / archivedKey.
-		expect(SummaryStore.readPlanFromBranch).toHaveBeenCalledWith("p-child", "/repo");
-		expect(SummaryStore.readNoteFromBranch).toHaveBeenCalledWith("n-child", "/repo");
-		expect(SummaryStore.readLinearIssueFromBranch).toHaveBeenCalledWith("JOLLI-7-leaf", "/repo");
+		expect(SummaryStore.readPlanFromBranch).toHaveBeenCalledWith("p-child", "/repo", undefined);
+		expect(SummaryStore.readNoteFromBranch).toHaveBeenCalledWith("n-child", "/repo", undefined);
+		expect(SummaryStore.readLinearIssueFromBranch).toHaveBeenCalledWith("JOLLI-7-leaf", "/repo", undefined);
 
 		// And the bodies landed in the prompt.
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
@@ -650,6 +652,314 @@ describe("regenerateSummary", () => {
 
 		expect(new Set(updated.orphanedDocIds ?? [])).toEqual(new Set([1, 4, 5]));
 		expect(updated.children?.[0]?.children?.[0]?.orphanedDocIds).toBeUndefined();
+	});
+
+	it("truncates oversized plan bodies at PLAN_MAX_CHARS (20000) so a pathological plan can't blow out the prompt", async () => {
+		// Without per-item truncation, a 100KB plan body would be embedded
+		// verbatim in the <plan> block and dominate the LLM call cost.
+		const withBigPlan: CommitSummary = {
+			...baseSummary,
+			plans: [
+				{
+					slug: "huge",
+					title: "Huge",
+					editCount: 1,
+					addedAt: "2026-05-20T00:00:00Z",
+					updatedAt: "2026-05-20T00:00:00Z",
+				} as never,
+			],
+		} as CommitSummary;
+		const big = "x".repeat(50000);
+		vi.mocked(SummaryStore.readPlanFromBranch).mockResolvedValueOnce(big);
+
+		await regenerateSummary(withBigPlan, "/repo", config);
+
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		// Truncation marker present, body cut to ~20000 chars (plus the
+		// truncation tail) rather than the full 50000.
+		expect(params.plans).toContain("[truncated,");
+		expect((params.plans ?? "").length).toBeLessThan(30000);
+	});
+
+	it("truncates oversized linear-issue bodies at LINEAR_MAX_CHARS (4000)", async () => {
+		const withBigLinear: CommitSummary = {
+			...baseSummary,
+			linearIssues: [
+				{
+					archivedKey: "JOLLI-1-abc",
+					ticketId: "JOLLI-1",
+					title: "T",
+					url: "https://linear.app/x",
+					referencedAt: "2026-05-21T00:00:00Z",
+					sourceToolName: "mcp__linear__get_issue",
+				} as never,
+			],
+		} as CommitSummary;
+		const big = "y".repeat(10000);
+		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValueOnce(big);
+
+		await regenerateSummary(withBigLinear, "/repo", config);
+
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		expect(params.linearIssues).toContain("[truncated,");
+	});
+
+	it("caps the total <linear-issues> block at LINEAR_TOTAL_CHARS (30000) by dropping the oldest", async () => {
+		const mkRef = (key: string, referencedAt: string) =>
+			({
+				archivedKey: key,
+				ticketId: key,
+				title: key,
+				url: "https://linear.app/x",
+				referencedAt,
+				sourceToolName: "mcp__linear__get_issue",
+			}) as never;
+		const withMany: CommitSummary = {
+			...baseSummary,
+			linearIssues: [
+				mkRef("oldest", "2026-05-18T00:00:00Z"),
+				mkRef("middle", "2026-05-19T00:00:00Z"),
+				mkRef("newer", "2026-05-20T00:00:00Z"),
+				mkRef("newest", "2026-05-21T00:00:00Z"),
+				mkRef("freshest", "2026-05-22T00:00:00Z"),
+				mkRef("future", "2026-05-23T00:00:00Z"),
+				mkRef("further", "2026-05-24T00:00:00Z"),
+				mkRef("furthest", "2026-05-25T00:00:00Z"),
+				mkRef("beyond", "2026-05-26T00:00:00Z"),
+			],
+		} as CommitSummary;
+		const big = "y".repeat(4000);
+		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValue(big);
+
+		await regenerateSummary(withMany, "/repo", config);
+
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		// Newest selected; oldest dropped under greedy newest-first.
+		expect(params.linearIssues).toContain('id="beyond"');
+		expect(params.linearIssues).not.toContain('id="oldest"');
+	});
+
+	it("truncates oversized note bodies at NOTE_MAX_CHARS (4000) and caps total at NOTE_TOTAL_CHARS (12000)", async () => {
+		const mkNote = (id: string, updatedAt: string) =>
+			({
+				id,
+				title: id,
+				format: "snippet",
+				addedAt: updatedAt,
+				updatedAt,
+			}) as never;
+		const withManyNotes: CommitSummary = {
+			...baseSummary,
+			notes: [
+				mkNote("oldest-note", "2026-05-18T00:00:00Z"),
+				mkNote("middle-note", "2026-05-19T00:00:00Z"),
+				mkNote("newer-note", "2026-05-20T00:00:00Z"),
+				mkNote("newest-note", "2026-05-21T00:00:00Z"),
+				mkNote("freshest-note", "2026-05-22T00:00:00Z"),
+			],
+		} as CommitSummary;
+		const big = "n".repeat(8000);
+		vi.mocked(SummaryStore.readNoteFromBranch).mockResolvedValue(big);
+
+		await regenerateSummary(withManyNotes, "/repo", config);
+
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		// 4000-char per-note hits truncate; total cap kicks in around 3 notes.
+		expect(params.notes).toContain("[truncated,");
+		expect(params.notes).toContain('id="freshest-note"');
+		expect(params.notes).not.toContain('id="oldest-note"');
+	});
+
+	it("preserves transcript session.source when stored session has a source set", async () => {
+		// And omits the `source` key when StoredSession.source is undefined —
+		// the conditional spread covers the optional-field shape that the
+		// SessionTranscript consumer (buildMultiSessionContext) expects.
+		vi.mocked(SummaryStore.readTranscriptsForCommits).mockResolvedValue(
+			new Map([
+				[
+					baseSummary.commitHash,
+					{
+						sessions: [
+							// One with source, one without — exercises both branches
+							// of the `s.source !== undefined ? ... : {}` spread.
+							{ sessionId: "with-src", source: "claude", entries: [] },
+							{ sessionId: "no-src", entries: [] },
+						],
+					},
+				],
+			]),
+		);
+
+		await regenerateSummary(baseSummary, "/repo", config);
+
+		const sessionsArg = vi.mocked(TranscriptReader.buildMultiSessionContext).mock.calls[0][0];
+		expect(sessionsArg[0]).toMatchObject({ sessionId: "with-src", source: "claude" });
+		expect(sessionsArg[1]).toMatchObject({ sessionId: "no-src" });
+		expect(sessionsArg[1]).not.toHaveProperty("source");
+	});
+
+	it("preserves transcript transcriptPath when stored session carries it (vs the '(stored)' fallback)", async () => {
+		// Default fixture uses no transcriptPath → we fall back to "(stored)".
+		// This case feeds a real one through so the ?? branch the other side
+		// of that nullish-coalesce gets exercised.
+		vi.mocked(SummaryStore.readTranscriptsForCommits).mockResolvedValue(
+			new Map([
+				[
+					baseSummary.commitHash,
+					{
+						sessions: [
+							{
+								sessionId: "with-path",
+								source: "claude",
+								transcriptPath: "/abs/path/to/transcript.jsonl",
+								entries: [],
+							},
+						],
+					},
+				],
+			]),
+		);
+
+		await regenerateSummary(baseSummary, "/repo", config);
+
+		const sessionsArg = vi.mocked(TranscriptReader.buildMultiSessionContext).mock.calls[0][0];
+		expect(sessionsArg[0]?.transcriptPath).toBe("/abs/path/to/transcript.jsonl");
+	});
+
+	it("falls back to summary.stats when diffStats is absent (v3 legacy)", async () => {
+		// normalizeToV4 doesn't touch diffStats / stats, so a v3 legacy
+		// commit whose original summary only carried `.stats` still needs
+		// the `?? normalized.stats` fallback before generateSummary sees it.
+		const v3Stats: CommitSummary = {
+			...baseSummary,
+			version: 3,
+			diffStats: undefined,
+			stats: { filesChanged: 7, insertions: 9, deletions: 11 },
+		} as CommitSummary;
+
+		await regenerateSummary(v3Stats, "/repo", config);
+
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		expect(params.diffStats).toEqual({ filesChanged: 7, insertions: 9, deletions: 11 });
+	});
+
+	it("falls back to zero diffStats when both diffStats and stats are absent", async () => {
+		const noStats: CommitSummary = {
+			...baseSummary,
+			diffStats: undefined,
+			stats: undefined,
+		} as CommitSummary;
+
+		await regenerateSummary(noStats, "/repo", config);
+
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		expect(params.diffStats).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
+	});
+
+	it("omits conversationTurns from the updated summary when generateSummary returns it undefined", async () => {
+		vi.mocked(Summarizer.generateSummary).mockResolvedValueOnce({
+			...successResult,
+			conversationTurns: undefined,
+		});
+
+		const { updated } = await regenerateSummary(baseSummary, "/repo", config);
+
+		expect("conversationTurns" in updated).toBe(false);
+	});
+
+	it("does not crash when linearIssues / notes refs lack their timestamp fields (legacy v3)", async () => {
+		// Defensive `?? ""` against legacy data with no referencedAt /
+		// updatedAt. Two refs each so the Array.sort comparator actually
+		// runs (a single-element array short-circuits the comparator).
+		const legacyTimestamps: CommitSummary = {
+			...baseSummary,
+			linearIssues: [
+				{
+					archivedKey: "L-1",
+					ticketId: "T1",
+					title: "t1",
+					url: "u1",
+					referencedAt: undefined,
+					sourceToolName: "x",
+				} as never,
+				{
+					archivedKey: "L-2",
+					ticketId: "T2",
+					title: "t2",
+					url: "u2",
+					referencedAt: undefined,
+					sourceToolName: "x",
+				} as never,
+			],
+			notes: [
+				{ id: "n-1", title: "n1", format: "snippet", updatedAt: undefined } as never,
+				{ id: "n-2", title: "n2", format: "snippet", updatedAt: undefined } as never,
+			],
+		} as CommitSummary;
+		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValue("LB");
+		vi.mocked(SummaryStore.readNoteFromBranch).mockResolvedValue("NB");
+
+		await expect(regenerateSummary(legacyTimestamps, "/repo", config)).resolves.toBeDefined();
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		expect(params.linearIssues).toContain("LB");
+		expect(params.notes).toContain("NB");
+	});
+
+	it("uses empty string for ref.url when LinearIssueCommitRef.url is missing", async () => {
+		// Legacy/corrupt LinearIssueCommitRef may lack the url field — the
+		// `ref.url ?? ""` fallback ensures escapeForText doesn't choke on
+		// undefined. Output renders `<url></url>` (empty inner text).
+		const noUrl: CommitSummary = {
+			...baseSummary,
+			linearIssues: [
+				{
+					archivedKey: "JOLLI-9-abc",
+					ticketId: "JOLLI-9",
+					title: "T",
+					url: undefined,
+					referencedAt: "2026-05-21T00:00:00Z",
+					sourceToolName: "mcp__linear__get_issue",
+				} as never,
+			],
+		} as CommitSummary;
+		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValueOnce("body");
+
+		await regenerateSummary(noUrl, "/repo", config);
+
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		expect(params.linearIssues).toContain("<url></url>");
+	});
+
+	it("caps the total <plans> block at PLAN_TOTAL_CHARS (60000) and drops the oldest plan when exceeded", async () => {
+		// 4 plans, each at PLAN_MAX_CHARS — fits 3 within 60000 budget,
+		// drops the 4th (oldest). Confirms greedy-newest-first selection.
+		const mkPlan = (slug: string, updatedAt: string) =>
+			({
+				slug,
+				title: slug,
+				editCount: 1,
+				addedAt: updatedAt,
+				updatedAt,
+			}) as never;
+		const withManyPlans: CommitSummary = {
+			...baseSummary,
+			plans: [
+				mkPlan("oldest", "2026-05-18T00:00:00Z"),
+				mkPlan("middle", "2026-05-19T00:00:00Z"),
+				mkPlan("newer", "2026-05-20T00:00:00Z"),
+				mkPlan("newest", "2026-05-21T00:00:00Z"),
+			],
+		} as CommitSummary;
+		const big = "x".repeat(20000);
+		vi.mocked(SummaryStore.readPlanFromBranch).mockResolvedValue(big);
+
+		await regenerateSummary(withManyPlans, "/repo", config);
+
+		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+		expect(params.plans).toContain("newest");
+		expect(params.plans).toContain("newer");
+		// The 4th (oldest) plan is the one dropped under greedy newest-first.
+		expect(params.plans).not.toContain('slug="oldest"');
 	});
 
 	it("dedups same-slug plans across the v3 tree by picking the newer updatedAt", async () => {

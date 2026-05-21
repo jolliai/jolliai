@@ -596,6 +596,16 @@ const stubBridge = {
 	// Default to "empty index" so existing tests are unaffected; the
 	// stale-commit describe block overrides per test.
 	getSummaryIndexEntryMap: vi.fn().mockResolvedValue(new Map()),
+	// Regenerate flow now routes through bridge wrappers so the storage
+	// provider is threaded (folder-only Memory Bank correctness). Bridge
+	// wrappers delegate to mockLoadRegenerateContext / mockRegenerateSummary
+	// — same shape as the rest of this stub bridge's mocks.
+	loadRegenerateContext: vi.fn((summary: unknown) =>
+		mockLoadRegenerateContext(summary, workspaceRoot),
+	),
+	regenerateSummary: vi.fn((summary: unknown, config: unknown) =>
+		mockRegenerateSummary(summary, workspaceRoot, config),
+	),
 } as unknown as import("../JolliMemoryBridge.js").JolliMemoryBridge;
 const mainBranch = "main";
 
@@ -2103,18 +2113,24 @@ describe("SummaryWebviewPanel", () => {
 				// token before returning the task's result, so the Promise.race
 				// inside the handler resolves to "cancelled".
 				withProgress.mockImplementationOnce(
-					(_opts: unknown, task: (p: unknown, t: unknown) => Promise<unknown>) => {
+					(
+						_opts: unknown,
+						task: (
+							progress: { report: (v: unknown) => void },
+							token: { onCancellationRequested: (cb: () => void) => void },
+						) => unknown,
+					): unknown => {
 						let cancelCb: (() => void) | null = null;
 						const token = {
 							onCancellationRequested: (cb: () => void) => {
 								cancelCb = cb;
 							},
 						};
-						const taskPromise = task({ report: vi.fn() }, token);
+						const taskResult = task({ report: vi.fn() }, token);
 						// Fire cancel on the next microtask so the handler's
 						// Promise.race sees a "cancelled" winner.
 						queueMicrotask(() => cancelCb?.());
-						return taskPromise;
+						return taskResult;
 					},
 				);
 				const dispatch = await setupPanel();
@@ -2268,6 +2284,82 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				expect(mockRegenerateSummary).toHaveBeenCalledTimes(1);
+			});
+
+			it("rejects regenerate when a push is already in flight (race against push's writeback)", async () => {
+				// Push completion writes back jolliDocId / jolliDocUrl. If
+				// regenerate captures the pre-push summary snapshot and writes
+				// at the end of its 30 s LLM call, push's writeback gets
+				// silently clobbered — next push creates a duplicate article.
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				const dispatch = await setupPanel();
+
+				// Reach into the panel instance and flip pushInProgress on
+				// — same pattern as the currentSummary-null tests above.
+				const panel = firstCommitPanel<{ pushInProgress: boolean }>();
+				panel.pushInProgress = true;
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				// Regenerate must have early-returned with a toast — no
+				// confirm dialog, no LLM call, no storeSummary.
+				expect(mockRegenerateSummary).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("push to Jolli is in progress"),
+				);
+			});
+
+			it("denies mutating commands while regenerate is in flight (host-side guard)", async () => {
+				// Set up a never-resolving regenerate so the in-flight flag
+				// stays set; then dispatch a representative set of mutating
+				// commands and confirm the storeSummary mock is never called
+				// (the guard short-circuits before the handler runs).
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				showWarningMessage.mockResolvedValueOnce("Regenerate");
+				mockRegenerateSummary.mockReturnValue(new Promise(() => {}));
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+				// Sanity: we're now in flight; storeSummary has not been called yet.
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+
+				// All of these would normally write to the orphan branch — under
+				// the guard they must be silently dropped.
+				dispatch({ command: "push" });
+				dispatch({ command: "generateRecap" });
+				dispatch({ command: "generateE2eTest" });
+				dispatch({
+					command: "editTopic",
+					topicIndex: 0,
+					updates: { title: "x" },
+				});
+				dispatch({ command: "deleteTopic", topicIndex: 0 });
+				dispatch({ command: "editRecap", recap: "hi" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(mockGenerateRecap).not.toHaveBeenCalled();
+				expect(mockGenerateE2eTest).not.toHaveBeenCalled();
+			});
+
+			it("allows read-only commands (copyMarkdown) while regenerate is in flight", async () => {
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				showWarningMessage.mockResolvedValueOnce("Regenerate");
+				mockRegenerateSummary.mockReturnValue(new Promise(() => {}));
+				mockBuildMarkdown.mockReturnValue("# md");
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				dispatch({ command: "copyMarkdown" });
+				await flushPromises();
+
+				// copyMarkdown went through — clipboard was written.
+				expect(clipboardWriteText).toHaveBeenCalledWith("# md");
 			});
 		});
 

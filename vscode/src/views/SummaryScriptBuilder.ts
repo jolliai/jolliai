@@ -209,52 +209,47 @@ ${buildPrMessageScript()}
     }
 
     // ── Regenerate summary status ──
+    // Lifecycle:
+    //   summaryRegenerating  → enter regenerating-readonly mode (CSS hides
+    //                          every action button via the foreign-safe
+    //                          allow-list), insert the top-of-page banner
+    //   summaryRegenerated   → swap in new topics/recap HTML, leave
+    //                          regenerating-readonly mode, remove banner
+    //   summaryRegenerateError → leave regenerating-readonly mode, remove
+    //                          banner; topics/recap DOM untouched
     if (msg.command === 'summaryRegenerating') {
-      var rBtn = document.getElementById('regenerateSummaryBtn');
-      if (rBtn) {
-        rBtn.classList.add('generating');
-        rBtn.disabled = true;
-        rBtn.innerHTML = '\\u21BB Regenerating\\u2026';
-      }
-      freezeSummarySections();
+      enterRegeneratingReadonly();
       return;
     }
     if (msg.command === 'summaryRegenerated') {
-      // Success: replaceSection drops the old DOM (including dataset markers
-      // set by freezeSummarySections), so we do NOT call thawSummarySections.
       if (msg.topicsHtml) replaceSection('topicsSection', msg.topicsHtml);
       if (msg.recapHtml) replaceSection('recapSection', msg.recapHtml);
-      resetRegenerateButton();
+      leaveRegeneratingReadonly();
       // Re-attach handlers on the NEW DOM nodes inside topics + recap.
-      // NOTE: do NOT re-attach attachRegenerateSummaryHandler — the Regenerate
-      // button lives in the Conversations card, OUTSIDE topicsSection /
-      // recapSection, so replaceSection never touched it and its original
-      // listener is still bound. Re-attaching would add a duplicate listener
-      // each regenerate, making the Nth click post N messages.
+      // NOTE: do NOT re-attach attachRegenerateSummaryHandler — the
+      // Regenerate button lives in the Conversations card, OUTSIDE
+      // topicsSection / recapSection, so replaceSection never touched it
+      // and its original listener is still bound. Re-attaching would add
+      // a duplicate listener each regenerate.
       attachEditRecapHandler();
       attachGenerateRecapHandler();
       var newTopicsRoot = document.getElementById('topicsSection');
       if (newTopicsRoot) {
         attachTopicHandlers(newTopicsRoot);
-        // attachTopicHandlers wires the edit/delete buttons inside .toggle,
-        // but NOT the toggle-header expand/collapse click — that's a
-        // separate handler set up once at page load. Re-attach it on the
-        // new headers so topics still expand. The function is idempotent
-        // (skips headers it has already wired via the _toggleAttached flag).
+        // attachTopicHandlers wires edit/delete inside .toggle but NOT the
+        // toggle-header expand/collapse click — re-attach explicitly on
+        // the new headers. The function is idempotent (_toggleAttached).
         newTopicsRoot.querySelectorAll('.toggle-header').forEach(attachToggleHeader);
       }
-      // The fresh topicsSection brings a NEW #toggleAllBtn whose click
-      // listener doesn't carry over from the old DOM. Reset allCollapsed
-      // because the new topics are always rendered uncollapsed, then re-bind.
+      // Fresh topicsSection brings a NEW #toggleAllBtn whose click listener
+      // doesn't carry over from the old DOM. Reset allCollapsed because the
+      // new topics are always rendered uncollapsed, then re-bind.
       allCollapsed = false;
       attachToggleAllBtnHandler();
       return;
     }
     if (msg.command === 'summaryRegenerateError') {
-      // Error / cancel: sections were NOT replaced — restore the original
-      // disabled state instead of leaving everything inert.
-      thawSummarySections();
-      resetRegenerateButton();
+      leaveRegeneratingReadonly();
       return;
     }
   });
@@ -670,40 +665,48 @@ ${buildPrMessageScript()}
   }
   attachRegenerateSummaryHandler();
 
-  // Disable every focusable control inside topics + recap during regenerate.
-  // Each touched control is tagged data-was-disabled so the error path can
-  // restore the pre-regenerate state without flipping legitimately-disabled
-  // buttons back on.
-  function freezeSummarySections() {
-    var sections = [document.getElementById('topicsSection'), document.getElementById('recapSection')];
-    sections.forEach(function(sec) {
-      if (!sec) return;
-      sec.classList.add('regenerating');
-      var ctrls = sec.querySelectorAll('button, textarea, input');
-      ctrls.forEach(function(c) {
-        if (c.disabled) {
-          c.dataset.wasDisabled = '1';
-        } else {
-          c.dataset.wasDisabled = '0';
-          c.disabled = true;
-        }
-      });
-    });
+  // Toggle the page into / out of regenerating-readonly mode. CSS
+  // (.page.regenerating-readonly button:not([data-foreign-safe])) takes
+  // care of hiding every action button; the banner explains why. The
+  // host's dispatchWebviewMessage adds a second-layer guard against any
+  // postMessage that slips through (e.g. from a tab still on the old
+  // pre-readonly DOM).
+  function enterRegeneratingReadonly() {
+    var page = document.querySelector('.page');
+    if (page) page.classList.add('regenerating-readonly');
+    insertRegeneratingBanner();
   }
 
-  function thawSummarySections() {
-    var sections = [document.getElementById('topicsSection'), document.getElementById('recapSection')];
-    sections.forEach(function(sec) {
-      if (!sec) return;
-      sec.classList.remove('regenerating');
-      var ctrls = sec.querySelectorAll('button, textarea, input');
-      ctrls.forEach(function(c) {
-        if (c.dataset.wasDisabled === '0') c.disabled = false;
-        delete c.dataset.wasDisabled;
-      });
-    });
+  function leaveRegeneratingReadonly() {
+    var page = document.querySelector('.page');
+    if (page) page.classList.remove('regenerating-readonly');
+    removeRegeneratingBanner();
   }
 
+  function insertRegeneratingBanner() {
+    if (document.getElementById('regeneratingBanner')) return;
+    var page = document.querySelector('.page');
+    if (!page) return;
+    var banner = document.createElement('div');
+    banner.id = 'regeneratingBanner';
+    banner.className = 'regenerating-banner';
+    banner.setAttribute('role', 'status');
+    banner.innerHTML =
+      '<span class="regenerating-banner-spinner" aria-hidden="true">\\u21BB</span>' +
+      '<span class="regenerating-banner-text">Regenerating summary\\u2026 Other actions are temporarily disabled.</span>';
+    page.insertBefore(banner, page.firstChild);
+  }
+
+  function removeRegeneratingBanner() {
+    var banner = document.getElementById('regeneratingBanner');
+    if (banner) banner.remove();
+  }
+
+  // CONTRACT: this function depends on buildRecapSection in
+  // SummaryHtmlBuilder.ts emitting "<div id='recapSection'>...</div><hr/>"
+  // (two siblings) and buildTopicsSection emitting a single <div>. If either
+  // shape changes, update this function in the same commit — otherwise the
+  // regenerate success path leaves stacked or missing <hr class="separator">.
   function replaceSection(id, html) {
     var old = document.getElementById(id);
     if (!old) return;
@@ -711,20 +714,11 @@ ${buildPrMessageScript()}
     wrap.innerHTML = html;
     var nodes = Array.prototype.slice.call(wrap.childNodes).filter(function(n) { return n.nodeType === 1; });
     if (nodes.length === 0) return;
-    // Recap section emits "<div>...</div><hr/>"; topics emits a single <div>.
-    // Drop the trailing <hr> that belongs to the OLD recap before splicing,
+    // Drop the OLD recap's trailing <hr> before splicing in the new node(s),
     // so we don't end up with two separators stacked.
     var sep = old.nextElementSibling;
     if (sep && sep.tagName === 'HR' && id === 'recapSection') sep.remove();
     old.replaceWith.apply(old, nodes);
-  }
-
-  function resetRegenerateButton() {
-    var rBtn = document.getElementById('regenerateSummaryBtn');
-    if (!rBtn) return;
-    rBtn.classList.remove('generating');
-    rBtn.disabled = false;
-    rBtn.innerHTML = '\\u21BB Regenerate';
   }
 
   // Recap status messages — generation flow only. The 'recapUpdated' /

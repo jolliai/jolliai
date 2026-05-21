@@ -1682,6 +1682,39 @@ export class JolliMemoryBridge {
 		await storeSummary(summary, this.cwd, force, artifacts, storage);
 	}
 
+	/**
+	 * Loads regenerate-context (confirm-dialog counts) through the Bridge's
+	 * StorageProvider so folder-only Memory Bank users read transcripts from
+	 * FolderStorage instead of the OrphanBranchStorage fallback baked into
+	 * the underlying SummaryStore helpers. Without this wrapper the dialog
+	 * reports 0 transcripts on every regenerate in folder-only mode.
+	 */
+	async loadRegenerateContext(
+		summary: CommitSummary,
+	): Promise<import("../../cli/src/core/RegenerateContext.js").RegenerateContext> {
+		const storage = await this.getStorage();
+		const { loadRegenerateContext } = await import(
+			"../../cli/src/core/RegenerateContext.js"
+		);
+		return loadRegenerateContext(summary, this.cwd, storage);
+	}
+
+	/**
+	 * Runs the regenerate-summary LLM call through the Bridge's
+	 * StorageProvider — same folder-only correctness rationale as
+	 * `loadRegenerateContext`. Transcripts, archived plans/notes/linear
+	 * issues all read from the active backend (FolderStorage in folder
+	 * mode, OrphanBranchStorage in legacy mode, DualWriteStorage by default).
+	 */
+	async regenerateSummary(
+		summary: CommitSummary,
+		config: import("../../cli/src/Types.js").LlmConfig,
+	): Promise<import("../../cli/src/core/Regenerator.js").RegenerateResult> {
+		const storage = await this.getStorage();
+		const { regenerateSummary } = await import("../../cli/src/core/Regenerator.js");
+		return regenerateSummary(summary, this.cwd, config, storage);
+	}
+
 	/** Writes plan files (orphan-branch + Memory Bank visible MD). */
 	async storePlans(
 		planFiles: ReadonlyArray<{ slug: string; content: string }>,
