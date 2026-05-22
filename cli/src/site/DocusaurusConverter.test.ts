@@ -388,4 +388,160 @@ describe("DocusaurusConverter branch coverage", () => {
 
 		expect(result.sidebar).toEqual({});
 	});
+
+	it("loads sidebar from ESM module without default export", async () => {
+		const { convertDocusaurusSidebar } = await import("./DocusaurusConverter.js");
+		const sidebarPath = join(tempDir, "sidebars.mjs");
+		await writeFile(sidebarPath, `export const docsSidebar = ['intro'];`, "utf-8");
+
+		const result = await convertDocusaurusSidebar(sidebarPath);
+
+		expect(result.sidebar["/"].intro).toBe("Intro");
+	});
+
+	it("records pathMapping when category actual dir differs from logical dir", async () => {
+		const { convertDocusaurusSidebar } = await import("./DocusaurusConverter.js");
+		const sidebarPath = join(tempDir, "sidebars.js");
+		// link.id puts the category's actual dir at use_cases/fraud, but the
+		// catKey becomes "fraud" so logical child dir is /fraud — actualRel != logicalRel.
+		await writeFile(
+			sidebarPath,
+			`module.exports = { docsSidebar: [
+				{ type: 'category', label: 'Fraud', link: { type: 'doc', id: 'use_cases/fraud/index' }, items: [
+					'use_cases/fraud/intro'
+				] }
+			] }`,
+			"utf-8",
+		);
+
+		const result = await convertDocusaurusSidebar(sidebarPath);
+
+		expect(result.pathMappings["use_cases/fraud"]).toBe("fraud");
+	});
+
+	it("iterates path mappings to resolve nested category parent (both match and skip)", async () => {
+		const { convertDocusaurusSidebar } = await import("./DocusaurusConverter.js");
+		const sidebarPath = join(tempDir, "sidebars.js");
+		// First sibling creates pathMapping tools/eth -> eth (target != "fraud" later).
+		// Second sibling creates pathMapping use_cases/fraud -> fraud, then nests a
+		// category whose parentActualDir must come from logicalToActualDir lookup —
+		// the for-loop will skip the "eth" entry (false) and match the "fraud" entry (true).
+		await writeFile(
+			sidebarPath,
+			`module.exports = { docsSidebar: [
+				{ type: 'category', label: 'Ethers', link: { type: 'doc', id: 'tools/eth/index' }, items: [
+					'tools/eth/intro'
+				] },
+				{ type: 'category', label: 'Fraud', link: { type: 'doc', id: 'use_cases/fraud/index' }, items: [
+					{ type: 'category', label: 'Ops', items: ['use_cases/fraud/ops/intro'] }
+				] }
+			] }`,
+			"utf-8",
+		);
+
+		const result = await convertDocusaurusSidebar(sidebarPath);
+
+		expect(result.sidebar["/fraud"].ops).toBe("Ops");
+		expect(result.sidebar["/fraud/ops"]).toBeDefined();
+		expect(result.pathMappings["tools/eth"]).toBe("eth");
+	});
+
+	it("skips sidebar items with unknown type", async () => {
+		const { convertDocusaurusSidebar } = await import("./DocusaurusConverter.js");
+		const sidebarPath = join(tempDir, "sidebars.js");
+		await writeFile(
+			sidebarPath,
+			`module.exports = { docsSidebar: [
+				'intro',
+				{ type: 'html', value: '<hr />' }
+			] }`,
+			"utf-8",
+		);
+
+		const result = await convertDocusaurusSidebar(sidebarPath);
+
+		expect(result.sidebar["/"].intro).toBe("Intro");
+		expect(Object.keys(result.sidebar["/"])).toHaveLength(1);
+	});
+
+	it("falls back to slugified label when actualDir has no segments", async () => {
+		const { convertDocusaurusSidebar } = await import("./DocusaurusConverter.js");
+		const sidebarPath = join(tempDir, "sidebars.js");
+		// link.id has only one segment; first item is a string with no slash;
+		// so resolveCategoryActualDir falls back to /slugify(label).
+		await writeFile(
+			sidebarPath,
+			`module.exports = { docsSidebar: [
+				{ type: 'category', label: 'Quick Start', link: { type: 'doc', id: 'intro' }, items: ['overview'] }
+			] }`,
+			"utf-8",
+		);
+
+		const result = await convertDocusaurusSidebar(sidebarPath);
+
+		expect(result.sidebar["/"]["quick-start"]).toBe("Quick Start");
+	});
+
+	it("falls back to slugified label when first doc item id has no slash", async () => {
+		const { convertDocusaurusSidebar } = await import("./DocusaurusConverter.js");
+		const sidebarPath = join(tempDir, "sidebars.js");
+		await writeFile(
+			sidebarPath,
+			`module.exports = { docsSidebar: [
+				{ type: 'category', label: 'Reference', items: [
+					{ type: 'doc', id: 'overview' }
+				] }
+			] }`,
+			"utf-8",
+		);
+
+		const result = await convertDocusaurusSidebar(sidebarPath);
+
+		expect(result.sidebar["/"].reference).toBe("Reference");
+	});
+
+	it("falls back to slugified label when actualDir resolves to root under a remapped parent", async () => {
+		const { convertDocusaurusSidebar } = await import("./DocusaurusConverter.js");
+		const sidebarPath = join(tempDir, "sidebars.js");
+		// Outer category remaps use_cases/fraud -> /fraud, so the inner
+		// category sits under a non-root parent. The inner category's items
+		// have no slashes and its label slugifies to "", so actualDir is "/"
+		// — different from parentActualDir, which means collectEntries doesn't
+		// flatten and resolveCategoryKey runs with empty segments, exercising
+		// the || slugify(label) fallback branch.
+		await writeFile(
+			sidebarPath,
+			`module.exports = { docsSidebar: [
+				{ type: 'category', label: 'Fraud', link: { type: 'doc', id: 'use_cases/fraud/index' }, items: [
+					{ type: 'category', label: '???', items: ['intro'] }
+				] }
+			] }`,
+			"utf-8",
+		);
+
+		const result = await convertDocusaurusSidebar(sidebarPath);
+
+		expect(result.sidebar["/fraud"]).toBeDefined();
+	});
+
+	it("does not overwrite existing pathMapping when a doc reuses the same actual dir", async () => {
+		const { convertDocusaurusSidebar } = await import("./DocusaurusConverter.js");
+		const sidebarPath = join(tempDir, "sidebars.js");
+		// Outer category creates pathMapping use_cases/fraud -> fraud, then a
+		// doc child whose actualDir is also use_cases/fraud — addDocPathMapping
+		// must short-circuit because pathMappings[actualDir] already exists.
+		await writeFile(
+			sidebarPath,
+			`module.exports = { docsSidebar: [
+				{ type: 'category', label: 'Fraud', link: { type: 'doc', id: 'use_cases/fraud/index' }, items: [
+					{ type: 'doc', id: 'use_cases/fraud/intro', label: 'Intro' }
+				] }
+			] }`,
+			"utf-8",
+		);
+
+		const result = await convertDocusaurusSidebar(sidebarPath);
+
+		expect(result.pathMappings["use_cases/fraud"]).toBe("fraud");
+	});
 });

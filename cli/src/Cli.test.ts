@@ -246,6 +246,26 @@ describe("CLI", () => {
 			expect(helpOutput).not.toContain("export-prompt");
 			exitSpy.mockRestore();
 		});
+
+		it("should defer to Commander's default formatter for subcommand --help", async () => {
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["auth", "--help"]);
+			} catch {
+				// Commander calls process.exit after --help
+			}
+			const writes = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
+			const helpOutput = writes.join("");
+			// Subcommand help uses Commander's default formatter, which renders
+			// "Usage:" but not the grouped "Jolli Memory" / "Jolli Site" sections.
+			expect(helpOutput).toContain("Usage:");
+			expect(helpOutput).toContain("auth");
+			expect(helpOutput).not.toContain("Jolli Memory — Auto-document");
+			expect(helpOutput).not.toContain("Jolli Site — Generate");
+			exitSpy.mockRestore();
+		});
 	});
 
 	describe("enable command", () => {
@@ -2991,6 +3011,33 @@ describe("CLI", () => {
 			}
 		});
 
+		it("should error and set exit code when manual Jolli key fails validation", async () => {
+			const { saveConfigScoped } = await import("./core/SessionTracker.js");
+			vi.mocked(saveConfigScoped).mockClear();
+			// Choose "2" (manual), enter a key that parseJolliApiKey will reject (no sk-jol- prefix),
+			// then skip the Anthropic key prompt that follows.
+			mockUserInput("2", "bad-key", "");
+			mockExistsSync.mockReturnValue(false);
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const origKey = process.env.ANTHROPIC_API_KEY;
+			delete process.env.ANTHROPIC_API_KEY;
+
+			try {
+				await main(["enable"]);
+
+				const errorCalls = errorSpy.mock.calls.map((c) => String(c[0]));
+				expect(errorCalls.some((s) => s.includes("Error:"))).toBe(true);
+				expect(process.exitCode).toBe(1);
+				// validateJolliApiKey threw before saveConfigScoped could persist the key.
+				expect(saveConfigScoped).not.toHaveBeenCalled();
+			} finally {
+				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+				errorSpy.mockRestore();
+				if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
+			}
+		});
+
 		it("should show no-API-keys warning when manual key is skipped and no Anthropic key", async () => {
 			// Choose "2" (manual), skip Jolli API key, skip Anthropic key
 			mockUserInput("2", "", "");
@@ -3912,6 +3959,12 @@ describe("CLI", () => {
 			expect(output).toContain("Would remove 6 items");
 		});
 
+		it("uses singular item wording in dry-run when exactly one stale item exists", async () => {
+			const output = (await runClean(["clean", "--dry-run"], { staleSessions: 1 })).join("\n");
+			expect(output).toContain("Would remove 1 item.");
+			expect(output).not.toContain("Would remove 1 items");
+		});
+
 		it("does not surface orphan summaries in the output", async () => {
 			const childHash = "abc1111111111111111";
 			const rootHash = "def2222222222222222";
@@ -4437,6 +4490,51 @@ describe("CLI", () => {
 				authToken: undefined,
 				jolliApiKey: undefined,
 			});
+		});
+
+		it("omits the Anthropic-key reminder on logout when no Anthropic key is configured", async () => {
+			// No config.apiKey and no ANTHROPIC_API_KEY env var — the reminder
+			// block is suppressed so users without a fallback aren't told a
+			// non-existent key "will continue to work".
+			const { saveConfig, loadConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(loadConfig).mockResolvedValue({});
+			vi.mocked(saveConfig).mockResolvedValue(undefined);
+			const origKey = process.env.ANTHROPIC_API_KEY;
+			delete process.env.ANTHROPIC_API_KEY;
+
+			try {
+				await main(["auth", "logout"]);
+
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => s.includes("Logged out"))).toBe(true);
+				expect(calls.some((s) => s.includes("will continue to work"))).toBe(false);
+			} finally {
+				if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
+			}
+		});
+
+		it("shows the Anthropic-key reminder on logout when only ANTHROPIC_API_KEY env var is set", async () => {
+			// Env-var-only fallback: config.apiKey is unset but the dispatcher
+			// can still pick up ANTHROPIC_API_KEY from the environment, so the
+			// reminder must fire on that branch too.
+			const { saveConfig, loadConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(loadConfig).mockResolvedValue({});
+			vi.mocked(saveConfig).mockResolvedValue(undefined);
+			const origKey = process.env.ANTHROPIC_API_KEY;
+			process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+
+			try {
+				await main(["auth", "logout"]);
+
+				const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+				expect(calls.some((s) => s.includes("will continue to work"))).toBe(true);
+			} finally {
+				if (origKey === undefined) {
+					delete process.env.ANTHROPIC_API_KEY;
+				} else {
+					process.env.ANTHROPIC_API_KEY = origKey;
+				}
+			}
 		});
 
 		it("should call browserLogin on auth login", async () => {

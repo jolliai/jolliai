@@ -3,10 +3,18 @@
  */
 
 import { existsSync, lstatSync, readFileSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Re-export node:fs/promises through a mock so individual tests can `vi.spyOn`
+// specific members (ESM exports are not configurable by default).
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const original = await importOriginal<typeof import("node:fs/promises")>();
+	return { ...original };
+});
 
 // ─── Mock homedir to use temp directory ─────────────────────────────────────
 
@@ -317,19 +325,36 @@ describe("EngineManager.ensureEngine lock contention early return", () => {
 	it("returns success when engine becomes ready while waiting for lock", async () => {
 		const { ensureEngine, getEngineDir, computeDepsHash } = await import("./EngineManager.js");
 		const engineDir = getEngineDir();
-		// Create a fresh lock (not stale) to simulate another process installing
+		// Pre-create the engine dir + a fresh lock so acquireLock fails and we
+		// enter the waitForLock branch. engineNeedsInstall is true here.
 		await mkdir(engineDir, { recursive: true });
-		await writeFile(join(engineDir, ".install-lock"), String(Date.now()));
-		// Also create a valid engine so that after "waiting", engineNeedsInstall returns false
-		await mkdir(join(engineDir, "node_modules"), { recursive: true });
-		await writeFile(
-			join(engineDir, "engine.json"),
-			JSON.stringify({ depsHash: computeDepsHash(), installedAt: new Date().toISOString() }),
-		);
+		const lockPath = join(engineDir, ".install-lock");
+		await writeFile(lockPath, String(Date.now()));
 
+		// Spy on readFile: when waitForLock reads the lock contents, simulate
+		// another process having finished the install (write engine.json +
+		// node_modules) and return a stale timestamp so waitForLock releases
+		// the lock and returns true. The second engineNeedsInstall() inside
+		// ensureEngine then sees the engine as ready and hits the early return.
+		const readFileSpy = vi.spyOn(fsPromises, "readFile").mockImplementation((async (path: string) => {
+			if (typeof path === "string" && path.endsWith(".install-lock")) {
+				await mkdir(join(engineDir, "node_modules"), { recursive: true });
+				await writeFile(
+					join(engineDir, "engine.json"),
+					JSON.stringify({ depsHash: computeDepsHash(), installedAt: new Date().toISOString() }),
+				);
+				return "0"; // stale timestamp -> waitForLock releases + returns true
+			}
+			throw new Error(`unexpected readFile path: ${String(path)}`);
+		}) as typeof fsPromises.readFile);
+
+		mockSpawnSync.mockClear();
 		const result = await ensureEngine();
+		readFileSpy.mockRestore();
 
-		// Should detect engine is ready without running npm install
 		expect(result.success).toBe(true);
+		expect(result.output).toBe("");
+		// Should detect engine is ready without running npm install
+		expect(mockSpawnSync).not.toHaveBeenCalled();
 	});
 });

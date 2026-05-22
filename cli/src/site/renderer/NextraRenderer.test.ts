@@ -115,6 +115,80 @@ describe("NextraRenderer", () => {
 		}
 	});
 
+	// theme.colors.primary 是合法 hex 时，色相从 hex 中解析，优先级最高
+	it("api.css derives accent hue from theme.colors.primary when set (highest precedence)", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-colors-primary-"));
+		try {
+			// 纯红 #ff0000 → 色相 0；同时设置 primaryColor 和 primaryHue 都应被覆盖
+			const config = {
+				title: "T",
+				description: "D",
+				nav: [],
+				theme: { colors: { primary: "#ff0000" }, primaryColor: "#00ff00", primaryHue: 200 },
+			};
+			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
+			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
+			expect(css).toContain("hsl(0 84% 50%)");
+		} finally {
+			await rm(buildDir, { recursive: true, force: true });
+		}
+	});
+
+	// theme.colors.primary 是无效 hex 时，应降级到下一级（这里降到 primaryHue）
+	it("api.css falls through when theme.colors.primary is an invalid hex", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-colors-invalid-"));
+		try {
+			const config = {
+				title: "T",
+				description: "D",
+				nav: [],
+				theme: { colors: { primary: "not-a-hex" }, primaryHue: 90 },
+			};
+			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
+			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
+			expect(css).toContain("hsl(90 84% 50%)");
+		} finally {
+			await rm(buildDir, { recursive: true, force: true });
+		}
+	});
+
+	// theme.primaryColor 是合法 hex 时，色相从 hex 中解析（colors.primary 缺失时启用）
+	it("api.css derives accent hue from theme.primaryColor when colors.primary is absent", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-primarycolor-"));
+		try {
+			// 纯蓝 #0000ff → 色相 240
+			const config = {
+				title: "T",
+				description: "D",
+				nav: [],
+				theme: { primaryColor: "#0000ff", primaryHue: 200 },
+			};
+			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
+			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
+			expect(css).toContain("hsl(240 84% 50%)");
+		} finally {
+			await rm(buildDir, { recursive: true, force: true });
+		}
+	});
+
+	// theme.primaryColor 是无效 hex 时，应降级到 primaryHue
+	it("api.css falls through when theme.primaryColor is an invalid hex", async () => {
+		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-primarycolor-invalid-"));
+		try {
+			const config = {
+				title: "T",
+				description: "D",
+				nav: [],
+				theme: { primaryColor: "garbage", primaryHue: 77 },
+			};
+			await new NextraRenderer().initProject(buildDir, config, { staticExport: true });
+			const css = await readFile(join(buildDir, "styles", "api.css"), "utf-8");
+			expect(css).toContain("hsl(77 84% 50%)");
+		} finally {
+			await rm(buildDir, { recursive: true, force: true });
+		}
+	});
+
 	it("api.css uses generateApiCss's internal default (220) when pack has no primaryHue set", async () => {
 		const buildDir = await mkdtemp(join(tmpdir(), "jolli-nextra-nohue-"));
 		try {

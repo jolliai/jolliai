@@ -791,6 +791,93 @@ describe("extractLinearIssuesFromTranscript", () => {
 		expect(issues[0].priority).toBeUndefined();
 		expect(issues[0].labels).toBeUndefined();
 	});
+
+	it("skips a Linear-like line whose message.content is not an array", async () => {
+		// readContentBlocks returns undefined when content is not an array → line is skipped.
+		// The top-level `name` key makes the line satisfy the `"name":"mcp__linear__` substring
+		// pre-filter so we exercise the non-array branch inside readContentBlocks.
+		const nonArrayContentLine = JSON.stringify({
+			name: "mcp__linear__get_issue",
+			message: {
+				role: "assistant",
+				content: "stringified content instead of an array",
+			},
+			timestamp: "2026-05-14T06:00:00.000Z",
+		});
+		const jsonl = makeJsonl(
+			nonArrayContentLine,
+			toolUseLine({
+				toolUseId: "toolu_after",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:01.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_after",
+				timestamp: "2026-05-14T06:00:02.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+		expect(issues[0].ticketId).toBe("PROJ-1528");
+	});
+
+	it("drops a tool_result whose timestamp is after the beforeTimestamp cutoff even though its tool_use was inside the window", async () => {
+		// tool_use inside cutoff → enters pending. tool_result outside cutoff →
+		// collectToolResults' beforeTimestamp guard returns before walkPayload.
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_split",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_split",
+				timestamp: "2026-05-14T07:00:01.000Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl", {
+			beforeTimestamp: "2026-05-14T06:30:00.000Z",
+		});
+
+		expect(issues).toHaveLength(0);
+	});
+
+	it("accepts a tool_result without a timestamp field, falling back to empty referencedAt", async () => {
+		// Forces the `timestamp ?? \"\"` fallback when forwarding to walkPayload.
+		const toolUseLineStr = toolUseLine({
+			toolUseId: "toolu_no_res_ts",
+			toolName: "mcp__linear__get_issue",
+			timestamp: "2026-05-14T06:00:00.000Z",
+		});
+		const toolResultNoTs = JSON.stringify({
+			isSidechain: false,
+			type: "user",
+			message: {
+				role: "user",
+				content: [
+					{
+						tool_use_id: "toolu_no_res_ts",
+						type: "tool_result",
+						content: [{ type: "text", text: JSON.stringify(SAMPLE_ISSUE_PAYLOAD) }],
+					},
+				],
+			},
+			// no timestamp field on the tool_result
+		});
+		mockReadFile.mockResolvedValue(makeJsonl(toolUseLineStr, toolResultNoTs));
+
+		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+
+		expect(issues).toHaveLength(1);
+		expect(issues[0].referencedAt).toBe("");
+	});
 });
 
 // ─── formatLinearIssuesBlock ─────────────────────────────────────────────────

@@ -176,7 +176,9 @@ function addSidebarEntry(
 	if (!sidebar.has(dirPath)) {
 		sidebar.set(dirPath, []);
 	}
+	/* v8 ignore start -- defensive: `has` above guarantees `get` returns the array */
 	const entries = sidebar.get(dirPath) ?? [];
+	/* v8 ignore stop */
 	if (!entries.some(([k]) => k === key)) {
 		entries.push([key, value]);
 	}
@@ -268,7 +270,9 @@ function addDocPathMapping(docId: string, logicalDir: string, pathMappings: Path
 	// The doc is in a different directory — add folder mapping
 	if (!pathMappings[actualDir]) {
 		const folderName = parts[parts.length - 2]; // "fraud_detection"
+		/* v8 ignore start -- defensive: `!logicalDirRel` guard above already returned */
 		const logicalTarget = logicalDirRel ? `${logicalDirRel}/${folderName}` : folderName;
+		/* v8 ignore stop */
 		pathMappings[actualDir] = logicalTarget;
 	}
 }

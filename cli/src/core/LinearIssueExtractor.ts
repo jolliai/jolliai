@@ -130,7 +130,9 @@ export async function extractLinearIssuesFromTranscript(
 
 		if (role === "assistant") {
 			collectToolUses(blocks, timestamp, opts.beforeTimestamp, pending);
+			/* v8 ignore start -- readRole returns only "assistant" | "user" | undefined; undefined is filtered above, so the else-if's false branch is unreachable. */
 		} else if (role === "user") {
+			/* v8 ignore stop */
 			collectToolResults(blocks, timestamp, opts.beforeTimestamp, pending, collected);
 		}
 	}

@@ -201,6 +201,55 @@ describe("registerHealFolderCommand", () => {
 		expect(process.exitCode).toBe(1);
 	});
 
+	// failed > 0 with skipped === 0: covers the "Skipped:" line being omitted
+	// alongside the failed line.
+	it("omits the Skipped line when only failed entries exist", async () => {
+		mockCreateStorage.mockResolvedValue(makeStorageWith({ healed: 0, skipped: 0, failed: 2 }));
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-only-failed"]);
+		expect(stdout).toContain("Failed:   2");
+		expect(stdout).not.toMatch(/Skipped:\s+\d/);
+	});
+
+	// When more than 5 IDs were dropped the preview is truncated to the first
+	// 5 followed by ", ..." — covers the trailing-ellipsis branch.
+	it("truncates the dropped-id preview to 5 entries with an ellipsis when more were dropped", async () => {
+		const droppedIds = [
+			"aaaaaaaa00000001",
+			"bbbbbbbb00000002",
+			"cccccccc00000003",
+			"dddddddd00000004",
+			"eeeeeeee00000005",
+			"ffffffff00000006",
+		];
+		mockCreateStorage.mockResolvedValue(makeStorageWith({ healed: 0, skipped: 0, failed: 6, droppedIds }));
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-many-dropped"]);
+		expect(stdout).toContain("Dropped from manifest: 6");
+		expect(stdout).toContain("aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee, ...");
+		expect(stdout).not.toContain("ffffffff");
+	});
+
+	// loadConfig may throw (missing / unreadable config file). The CLI must
+	// fall back to "dual-write" mode instead of crashing the heal command.
+	it("falls back to dual-write mode when loadConfig throws", async () => {
+		mockLoadConfig.mockRejectedValue(new Error("config.json unreadable"));
+		mockCreateStorage.mockResolvedValue(makeStorageWith({ healed: 0, skipped: 0, failed: 0 }));
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-config-throw"]);
+		expect(stdout).toContain("Manifest is empty");
+	});
+
+	// dual-write mode with a transient read error: heal reports failed > 0 but
+	// did not drop any manifest rows. The CLI tells the user to re-run later
+	// instead of suggesting `jolli enable` (which only applies when rows were
+	// actually dropped).
+	it("dual-write mode keeps failed entries with the 'transient read error' hint when no IDs were dropped", async () => {
+		mockCreateStorage.mockResolvedValue(makeStorageWith({ healed: 0, skipped: 2, failed: 1 }));
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-transient"]);
+		expect(stdout).toContain("Failed:   1");
+		expect(stdout).not.toContain("Dropped from manifest");
+		expect(stdout).not.toContain("Re-run `jolli enable`");
+		expect(stdout).toContain("transient read error");
+	});
+
 	// When the underlying error carries an errno code (EACCES / ENOSPC / ...)
 	// the CLI must surface it so operators see the failure category, not just
 	// a bare message.

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { NextraProjectConfig } from "../NextraProjectWriter.js";
 import type { ThemePackProvider } from "./ThemeRegistry.js";
-import { discoverPack, getPack, listPacks, registerPack, resolvePack } from "./ThemeRegistry.js";
+import { discoverPack, getPack, listPacks, readManifestVersion, registerPack, resolvePack } from "./ThemeRegistry.js";
 
 const MINIMAL_CONFIG: NextraProjectConfig = {
 	title: "Test",
@@ -134,5 +134,80 @@ export default theme;
 			{ themePath: testThemeDir },
 		);
 		expect(pack?.manifest.name).toBe("discover-test");
+	});
+});
+
+// ─── readManifestVersion tests ─────────────────────────────────────────────
+//
+// The version check in `checkAndUpdateCachedTheme` deliberately reads
+// manifest.mjs via text scan instead of `await import(...)` — see the long
+// comment in ThemeRegistry.ts for why. These tests pin that behaviour: the
+// extracted version must match what an ESM importer would see for the same
+// file, and the function must never throw for missing / malformed input
+// (callers treat `undefined` as "cached version unknown → fetch fresh").
+
+describe("readManifestVersion", () => {
+	const fixtureDir = join(tmpdir(), "jolli-readmanifest-test");
+
+	beforeAll(() => {
+		mkdirSync(fixtureDir, { recursive: true });
+	});
+
+	afterAll(() => {
+		rmSync(fixtureDir, { recursive: true, force: true });
+	});
+
+	it("extracts the version literal from a typical forge-style manifest", async () => {
+		const path = join(fixtureDir, "forge-style.mjs");
+		writeFileSync(
+			path,
+			`const manifest = {
+	name: "forge",
+	version: "1.2.3",
+	displayName: "Forge",
+	defaults: { primaryHue: 228 },
+};
+export default manifest;
+`,
+		);
+		expect(await readManifestVersion(path)).toBe("1.2.3");
+	});
+
+	it("tolerates single quotes around the version literal", async () => {
+		const path = join(fixtureDir, "single-quote.mjs");
+		writeFileSync(path, `export default { name: 'x', version: '0.9.0' };\n`);
+		expect(await readManifestVersion(path)).toBe("0.9.0");
+	});
+
+	it("tolerates extra whitespace around the colon", async () => {
+		const path = join(fixtureDir, "whitespace.mjs");
+		writeFileSync(path, `export default { version   :    "4.5.6-beta.1" };\n`);
+		expect(await readManifestVersion(path)).toBe("4.5.6-beta.1");
+	});
+
+	it("returns undefined when the file does not exist", async () => {
+		expect(await readManifestVersion(join(fixtureDir, "missing-file.mjs"))).toBeUndefined();
+	});
+
+	it("returns undefined when no version literal is present", async () => {
+		const path = join(fixtureDir, "no-version.mjs");
+		writeFileSync(path, `export default { name: "x", displayName: "X" };\n`);
+		expect(await readManifestVersion(path)).toBeUndefined();
+	});
+
+	it("does not pollute Node's ESM cache (smoke test)", async () => {
+		// Regression: a previous implementation used `await import(fileUrl)` to
+		// read the version, which seeded Node's ESM cache with the file URL.
+		// If `downloadTheme` then overwrote the file, a subsequent re-import of
+		// the same URL would return the stale cached module. The text-scan
+		// implementation must not have that side effect — we verify by reading
+		// once, mutating the file, reading again, and confirming we see the
+		// new version (which an `import()` based reader would *not* see).
+		const path = join(fixtureDir, "mutation.mjs");
+		writeFileSync(path, `export default { version: "1.0.0" };\n`);
+		expect(await readManifestVersion(path)).toBe("1.0.0");
+
+		writeFileSync(path, `export default { version: "2.0.0" };\n`);
+		expect(await readManifestVersion(path)).toBe("2.0.0");
 	});
 });

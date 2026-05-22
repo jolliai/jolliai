@@ -10,6 +10,13 @@ vi.mock("./GitOps.js", () => ({
 	execGit: vi.fn(),
 }));
 
+// Mock Locks so we can simulate lock-acquisition failure without touching the
+// real filesystem. Default behavior matches a happy-path acquire.
+vi.mock("./Locks.js", () => ({
+	acquireOrphanWriteLock: vi.fn().mockResolvedValue(true),
+	releaseOrphanWriteLock: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -24,6 +31,7 @@ import {
 	writeFileToBranch,
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
+import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 import {
 	cleanupV1IfExpired,
 	deleteV1Branch,
@@ -448,6 +456,16 @@ describe("SummaryMigration", () => {
 			expect(migrated.commitSource).toBe("cli");
 			expect(migrated.conversationTurns).toBe(5);
 			expect(migrated.llm?.model).toBe("claude");
+		});
+
+		it("should throw and skip release when the orphan-write lock cannot be acquired", async () => {
+			vi.mocked(orphanBranchExists).mockResolvedValueOnce(true);
+			vi.mocked(acquireOrphanWriteLock).mockResolvedValueOnce(false);
+
+			await expect(migrateV1toV3()).rejects.toThrow(/could not acquire orphan-write lock/);
+			expect(listFilesInBranch).not.toHaveBeenCalled();
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+			expect(releaseOrphanWriteLock).not.toHaveBeenCalled();
 		});
 
 		it("should preserve commitType/commitSource and conversationTurns/llm in multi-record migration children", async () => {

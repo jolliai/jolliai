@@ -126,9 +126,13 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 		lines.push(`Usage: ${helper.commandUsage(cmd)}`, "");
 
 		const description = helper.commandDescription(cmd);
+		/* v8 ignore start -- root program always has a description (set via .description() above) */
 		if (description) lines.push(description, "");
+		/* v8 ignore stop */
 
+		/* v8 ignore start -- root program always has visible options (--help, --version) */
 		if (visibleOpts.length > 0) {
+			/* v8 ignore stop */
 			lines.push("Options:");
 			for (const opt of visibleOpts) {
 				lines.push(formatRow(helper.optionTerm(opt), helper.optionDescription(opt)));
@@ -136,7 +140,9 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
+		/* v8 ignore start -- root program always registers Jolli Memory commands */
 		if (memoryCmds.length > 0) {
+			/* v8 ignore stop */
 			lines.push("Jolli Memory — Auto-document AI development sessions");
 			lines.push(renderSectionDescription(MEMORY_DESCRIPTION), "");
 			lines.push("Commands:");
@@ -146,7 +152,9 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
+		/* v8 ignore start -- root program always registers Jolli Site commands */
 		if (siteCmds.length > 0) {
+			/* v8 ignore stop */
 			lines.push("Jolli Site — Generate a docs site from your content folder");
 			lines.push(renderSectionDescription(SITE_DESCRIPTION), "");
 			lines.push("Commands:");
@@ -156,7 +164,9 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
+		/* v8 ignore start -- root program always registers other commands (search, heal-folder, …) */
 		if (otherCmds.length > 0) {
+			/* v8 ignore stop */
 			lines.push("Other commands:");
 			for (const c of otherCmds) {
 				lines.push(formatRow(helper.subcommandTerm(c), helper.subcommandDescription(c)));
