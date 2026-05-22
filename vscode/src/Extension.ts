@@ -12,11 +12,13 @@ import {
 	conversationKey,
 	setExcluded,
 } from "../../cli/src/core/CommitSelectionStore.js";
+import type { FolderStorage } from "../../cli/src/core/FolderStorage.js";
 import {
 	extractRepoName,
 	getRemoteUrl,
 	resolveKbParent,
 } from "../../cli/src/core/KBPathResolver.js";
+import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
 import {
 	getGlobalConfigDir,
 	loadConfig,
@@ -29,12 +31,8 @@ import {
 	migrateV1toV3,
 	writeMigrationMeta,
 } from "../../cli/src/core/SummaryMigration.js";
-import {
-	indexNeedsMigration,
-	migrateIndexToV3,
-	readNoteFromBranch,
-	readPlanFromBranch,
-} from "../../cli/src/core/SummaryStore.js";
+import { readNoteFromBranch, readPlanFromBranch } from "../../cli/src/core/SummaryStore.js";
+import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
 import { ORPHAN_BRANCH } from "../../cli/src/Logger.js";
 import type { StatusInfo } from "../../cli/src/Types.js";
 import { execFileSyncHidden } from "../../cli/src/util/Subprocess.js";
@@ -61,6 +59,7 @@ import {
 	HistoryTreeProvider,
 } from "./providers/HistoryTreeProvider.js";
 import {
+	buildHoverFields,
 	MemoriesTreeProvider,
 	type MemoryItem,
 } from "./providers/MemoriesTreeProvider.js";
@@ -78,6 +77,7 @@ import {
 	readManualDisableFlag,
 	writeManualDisableFlag,
 } from "./services/ManualDisableFlag.js";
+import { MemoryFileDecorationProvider } from "./services/MemoryFileDecorationProvider.js";
 import { CommitsStore } from "./stores/CommitsStore.js";
 import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
@@ -119,14 +119,12 @@ function toGitUri(fileUri: vscode.Uri, ref: string): vscode.Uri {
  * Creates a FileSystemWatcher and subscribes `callback` to both create and
  * change events. Both are required on Windows, where git atomic renames (e.g.
  * `.git/HEAD.lock` → `.git/HEAD` during branch switch) fire as create events
- * rather than change events. Optionally subscribes to delete events when
- * `opts.delete` is true.
+ * rather than change events.
  */
 function watchFile(
 	base: string | vscode.Uri,
 	pattern: string,
 	callback: () => void,
-	opts?: { delete?: boolean },
 ): vscode.FileSystemWatcher {
 	const watcher = vscode.workspace.createFileSystemWatcher(
 		new vscode.RelativePattern(base, pattern),
@@ -137,9 +135,6 @@ function watchFile(
 	};
 	watcher.onDidCreate(wrap("create"));
 	watcher.onDidChange(wrap("change"));
-	if (opts?.delete) {
-		watcher.onDidDelete(wrap("delete"));
-	}
 	return watcher;
 }
 
@@ -207,6 +202,44 @@ function parseSummaryFrontmatter(
 	if (type !== "commit" || !commitHash) return null;
 	return { commitHash };
 }
+
+/**
+ * Resolve the branch that the revert command should pass to
+ * `FolderStorage.forceRegenerateVisibleMarkdown` /
+ * `regenerateVisiblePlan` / `regenerateVisibleNote`. Branch-agnostic across
+ * all three manifest entry types — commit, plan, and note — so a single
+ * helper is the single point where a silent `?? "main"` would otherwise
+ * leak in.
+ *
+ * Order:
+ *   1. `manifestEntry.source.branch` when present — the canonical record set by
+ *      `FolderStorage.regenerateVisibleMarkdown` / `generatePlanMarkdown` /
+ *      `generateNoteMarkdown` whenever the writer knows the branch (i.e.
+ *      every call from `writeFiles` and the revert command itself, post-fix).
+ *   2. Reverse-lookup of the first segment of `manifestEntry.path` against
+ *      `branches.json` — handles legacy manifest entries written before the
+ *      `source.branch` field was persisted, and any future writer that drops
+ *      source but still places the file under a registered branchFolder.
+ *
+ * Returns null when neither lookup yields a branch (unregistered folder, or
+ * the manifest entry has a malformed path). Callers must surface a warning
+ * rather than fall back to "main" silently — that fallback is the bug this
+ * helper exists to fix.
+ */
+function resolveBranch(folderStorage: FolderStorage, manifestEntry: ManifestEntry): string | null {
+	if (manifestEntry.source?.branch) return manifestEntry.source.branch;
+	const segments = manifestEntry.path.split("/");
+	const folder = segments.length > 1 ? segments[0] : null;
+	if (!folder) return null;
+	return folderStorage.resolveBranchForFolder(folder);
+}
+
+// Tracks Memory Bank summary `.md` files for which the divergence info
+// message has already been shown in this session, so re-opening a
+// known-diverged file does not re-pop the toast. Module-scoped — lifetime
+// is the extension host process, matching the "once per session" contract
+// stated in the user-facing message. Cleared implicitly on window reload.
+const divergenceMessageShown = new Set<string>();
 
 // ─── activate ─────────────────────────────────────────────────────────────────
 
@@ -356,6 +389,59 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Bridge now calls Installer functions directly — no CLI subprocess needed.
 	const bridge = new JolliMemoryBridge(workspaceRoot);
 
+	// ── Memory Bank `.md` divergence decorator ───────────────────────────────
+	// Adds a small `✎` badge to Memory Bank `.md` files that have been edited
+	// on disk and now diverge from the orphan-branch system view. Declared at
+	// activate() scope so the revert command (registered below) can call
+	// `memoryFileDecorationProvider.refreshUri(uri)` to clear the badge
+	// immediately after a successful revert.
+	const memoryFileDecorationProvider = new MemoryFileDecorationProvider(
+		bridge,
+	);
+	context.subscriptions.push(
+		vscode.window.registerFileDecorationProvider(
+			memoryFileDecorationProvider,
+		),
+		memoryFileDecorationProvider,
+	);
+	// TODO(memory-bank-edit-protection): wire KbFoldersService file-change
+	// events to memoryFileDecorationProvider.refreshUri so the badge clears
+	// immediately after a system write. Today the badge updates on the next
+	// VS Code re-poll of decorations.
+
+	// `jollimemory.isMemoryBankFile` context key — drives the visibility of
+	// the right-click "Revert Edits to System Version" explorer menu
+	// (declared in `package.json` contributes.menus.explorer/context).
+	//
+	// Trade-off: VS Code's `when` clause for the explorer context menu can
+	// only read context keys, not synchronously inspect each row. We update
+	// the key whenever the active editor changes and base its value on
+	// whether the editor's file resolves to a Memory Bank manifest entry.
+	// This makes the menu appear in the most common revert scenario — the
+	// diverged file is open in an editor — at the cost of not appearing for
+	// a pure right-click on a closed file in the explorer tree. The
+	// `revertMemoryFileEdits` command body still works defensively if
+	// invoked by URI directly (e.g. via the divergence info-message button).
+	const updateMemoryBankContext = async (
+		editor: vscode.TextEditor | undefined,
+	): Promise<void> => {
+		const fsPath = editor?.document.uri.fsPath;
+		const isMemoryBankFile = fsPath
+			? (await bridge.resolveMemoryFile(fsPath)) !== null
+			: false;
+		await vscode.commands.executeCommand(
+			"setContext",
+			"jollimemory.isMemoryBankFile",
+			isMemoryBankFile,
+		);
+	};
+	context.subscriptions.push(
+		vscode.window.onDidChangeActiveTextEditor(updateMemoryBankContext),
+	);
+	// Initial set so reopening a window already focused on a Memory Bank
+	// file picks up the right context immediately.
+	void updateMemoryBankContext(vscode.window.activeTextEditor);
+
 	// ── Auth service ─────────────────────────────────────────────────────────
 	const authService = new AuthService();
 
@@ -392,8 +478,20 @@ export function activate(context: vscode.ExtensionContext): void {
 		),
 	);
 
-	async function showPlanPreview(slug: string, title: string): Promise<void> {
-		const content = await readPlanFromBranch(slug, workspaceRoot);
+	async function showPlanPreview(
+		slug: string,
+		title: string,
+		readStorage?: StorageProvider,
+	): Promise<void> {
+		// Threading `readStorage` so foreign-repo previews read the plan
+		// body from the foreign FolderStorage. For local panels the
+		// caller passes `undefined` and the helper falls through to the
+		// workspace's default storage.
+		const content = await readPlanFromBranch(
+			slug,
+			workspaceRoot,
+			readStorage,
+		);
 		if (!content) {
 			vscode.window.showErrorMessage(
 				`Could not read plan "${slug}" from the orphan branch.`,
@@ -444,8 +542,16 @@ export function activate(context: vscode.ExtensionContext): void {
 		),
 	);
 
-	async function showNotePreview(id: string, title: string): Promise<void> {
-		const content = await readNoteFromBranch(id, workspaceRoot);
+	async function showNotePreview(
+		id: string,
+		title: string,
+		readStorage?: StorageProvider,
+	): Promise<void> {
+		// Mirrors showPlanPreview: foreign-repo note previews thread their
+		// FolderStorage in so the body comes from the foreign repo's
+		// `<kbRoot>/.jolli/notes/<id>.md` instead of the current workspace's
+		// orphan branch (where it doesn't exist).
+		const content = await readNoteFromBranch(id, workspaceRoot, readStorage);
 		if (!content) {
 			vscode.window.showErrorMessage(
 				`Could not read note "${title}" from the orphan branch.`,
@@ -732,6 +838,10 @@ export function activate(context: vscode.ExtensionContext): void {
 					branch: e.branch,
 					repoName: e.repoName ?? repoName,
 					timestamp: Date.parse(e.commitDate || e.generatedAt) || 0,
+					// Reuse the KB-tab Memories list builder so the foreign-mode
+					// Branch panel renders an identical hover-card (message, time,
+					// commit type, branch, stats, short hash).
+					hover: buildHoverFields(e),
 				}));
 			},
 		},
@@ -877,7 +987,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			filesStore,
 		);
 		await migrateIndexIfNeeded(
-			workspaceRoot,
+			bridge,
 			statusStore,
 			commitsStore,
 			filesStore,
@@ -1721,6 +1831,13 @@ export function activate(context: vscode.ExtensionContext): void {
 				itemOrSlug: PlanItem | string,
 				committedFlag?: boolean,
 				titleHint?: string,
+				// Foreign-provenance hint forwarded by SummaryWebviewPanel's
+				// `previewPlan` dispatch. Non-null only when the source panel
+				// itself is foreign — in that case we resolve the foreign
+				// repo's FolderStorage so the rendered preview reads the
+				// right plan body.
+				foreignRepoName?: string | null,
+				foreignRepoUrl?: string | null,
 			) => {
 				let slug: string;
 				let committed: boolean;
@@ -1737,8 +1854,21 @@ export function activate(context: vscode.ExtensionContext): void {
 				log.info("cmd", `editPlan invoked: ${slug} (committed=${committed})`);
 
 				if (committed) {
-					// Open rendered markdown preview (read-only) from orphan branch
-					await showPlanPreview(slug, planTitle);
+					// Open rendered markdown preview (read-only). Foreign
+					// panels supply repoName/url so we resolve the foreign
+					// FolderStorage; local panels pass nulls and the preview
+					// falls back to workspace-default storage.
+					const readStorageResult = foreignRepoName
+						? await bridge.createStorageForRepo(
+								foreignRepoName,
+								foreignRepoUrl ?? null,
+							)
+						: null;
+					await showPlanPreview(
+						slug,
+						planTitle,
+						readStorageResult?.storage,
+					);
 				} else {
 					// Resolve filePath via the registry. PlanItem (tree click) carries
 					// it directly; tooltip invocations pass only the slug, in which
@@ -1837,8 +1967,23 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		vscode.commands.registerCommand(
 			"jollimemory.previewNote",
-			async (id: string, title: string) => {
-				await showNotePreview(id, title);
+			async (
+				id: string,
+				title: string,
+				// Same foreign-provenance hint as `jollimemory.editPlan`'s
+				// committed branch above — supplied by the foreign panel so
+				// the rendered note preview reads from the foreign
+				// FolderStorage instead of the current workspace's storage.
+				foreignRepoName?: string | null,
+				foreignRepoUrl?: string | null,
+			) => {
+				const readStorageResult = foreignRepoName
+					? await bridge.createStorageForRepo(
+							foreignRepoName,
+							foreignRepoUrl ?? null,
+						)
+					: null;
+				await showNotePreview(id, title, readStorageResult?.storage);
 			},
 		),
 
@@ -2039,6 +2184,13 @@ export function activate(context: vscode.ExtensionContext): void {
 				const hash = typeof item === "string" ? item : item.commit.hash;
 				const summary = await bridge.getSummary(hash);
 				if (!summary) return;
+				// Local commits also read from the Memory Bank folder layer so
+				// the detail-panel data path is uniform with foreign-repo
+				// panels (and with the user-visible KB tree). Falls back to
+				// null when the workspace has no KB folder yet — panel then
+				// uses bridge-default reads.
+				const readStorageResult =
+					await bridge.createReadStorageForCurrentRepo();
 				await SummaryWebviewPanel.show(
 					summary,
 					context.extensionUri,
@@ -2046,6 +2198,9 @@ export function activate(context: vscode.ExtensionContext): void {
 					bridge,
 					commitsStore.getMainBranch(),
 					"commit",
+					null,
+					null,
+					readStorageResult?.storage ?? null,
 				);
 			},
 		),
@@ -2078,6 +2233,16 @@ export function activate(context: vscode.ExtensionContext): void {
 					);
 					return;
 				}
+				// Foreign hit → use the foreign FolderStorage; local hit →
+				// fall back to the current workspace's FolderStorage. Either
+				// way the panel reads transcripts/plans/notes from the
+				// Memory Bank folder layer, not the dual-write primary.
+				const readStorageResult = sourceRepoName
+					? await bridge.createStorageForRepo(
+							sourceRepoName,
+							sourceRemoteUrl,
+						)
+					: await bridge.createReadStorageForCurrentRepo();
 				await SummaryWebviewPanel.show(
 					summary,
 					context.extensionUri,
@@ -2087,6 +2252,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					"memory",
 					sourceRepoName,
 					sourceRemoteUrl,
+					readStorageResult?.storage ?? null,
 				);
 			},
 		),
@@ -2111,6 +2277,35 @@ export function activate(context: vscode.ExtensionContext): void {
 				}
 				const meta = parseSummaryFrontmatter(absPath);
 				if (meta) {
+					// On-disk divergence gate: when the user has edited the
+					// Markdown copy by hand, the JSON-derived SummaryWebviewPanel
+					// view would silently disagree with what's on disk. Show a
+					// one-shot info message offering revert, then fall through
+					// to a plain markdown preview so the user sees their actual
+					// edits instead of the stale system view.
+					if (await bridge.isMemoryFileDivergedOnDisk(absPath)) {
+						if (!divergenceMessageShown.has(absPath)) {
+							divergenceMessageShown.add(absPath);
+							const choice = await vscode.window.showInformationMessage(
+								"This memory file has on-disk edits. System view is unavailable until reverted.",
+								"Revert",
+								"Dismiss",
+							);
+							if (choice === "Revert") {
+								await vscode.commands.executeCommand(
+									"jollimemory.revertMemoryFileEdits",
+									absPath,
+								);
+								return;
+							}
+						}
+						await vscode.commands.executeCommand(
+							"markdown.showPreview",
+							uri,
+						);
+						return;
+					}
+
 					// Memory Bank folder view shows every repo under the parent
 					// (`localFolder`), so a clicked summary .md may belong to a
 					// non-current repo. Use the provenance-bearing cross-repo
@@ -2124,6 +2319,12 @@ export function activate(context: vscode.ExtensionContext): void {
 					const { summary, sourceRepoName, sourceRemoteUrl } =
 						await bridge.getSummaryAnyRepoWithSource(meta.commitHash);
 					if (summary) {
+						const readStorageResult = sourceRepoName
+							? await bridge.createStorageForRepo(
+									sourceRepoName,
+									sourceRemoteUrl,
+								)
+							: await bridge.createReadStorageForCurrentRepo();
 						await SummaryWebviewPanel.show(
 							summary,
 							context.extensionUri,
@@ -2133,6 +2334,7 @@ export function activate(context: vscode.ExtensionContext): void {
 							"kb",
 							sourceRepoName,
 							sourceRemoteUrl,
+							readStorageResult?.storage ?? null,
 						);
 						return;
 					}
@@ -2145,6 +2347,141 @@ export function activate(context: vscode.ExtensionContext): void {
 					);
 				}
 				await vscode.commands.executeCommand("markdown.showPreview", uri);
+			},
+		),
+
+		// Memory Bank `.md` edit-protection revert command. Restores the
+		// visible Markdown copy from the hidden JSON source (orphan-branch-
+		// derived) so the badge clears and the rich SummaryWebviewPanel /
+		// plan / note preview comes back. Dispatched from:
+		// 1. The "[Revert]" button on the on-disk-divergence info message
+		//    surfaced by `openMemoryFile`.
+		// 2. The right-click "Revert Edits to System Version" explorer menu
+		//    (declared in package.json contributes.menus.explorer/context).
+		// The handler is intentionally tolerant of bad inputs — non-string
+		// / empty / unresolved paths surface a warning toast rather than
+		// throwing, so even if the `jollimemory.isMemoryBankFile` context
+		// key briefly shows the right-click entry on a non-kbRoot path
+		// (e.g. between editor switches), invoking it is harmless.
+		vscode.commands.registerCommand(
+			"jollimemory.revertMemoryFileEdits",
+			async (absPath: unknown) => {
+				if (typeof absPath !== "string" || absPath.length === 0) return;
+				const resolved = await bridge.resolveMemoryFile(absPath);
+				if (!resolved) {
+					vscode.window.showWarningMessage(
+						"Memory Bank: cannot revert — file is not under a known kbRoot.",
+					);
+					return;
+				}
+				const { folderStorage, manifestEntry } = resolved;
+				let ok = false;
+				if (manifestEntry.type === "commit") {
+					const branch = resolveBranch(folderStorage, manifestEntry);
+					if (!branch) {
+						vscode.window.showWarningMessage(
+							`Memory Bank: cannot revert ${absPath} — manifest entry has no recorded branch and the path's folder is not a known branch mapping.`,
+						);
+						return;
+					}
+					// `forceRegenerateVisibleMarkdown` reads its title/body/date
+					// fields from the hidden `summaries/<hash>.json`, not from
+					// the entry we pass in (see FolderStorage.regenerateVisibleMarkdown).
+					// `commitDate` / `generatedAt` on the entry are de-facto dead args
+					// — but `?? ""` would fabricate a misleading "manifest is complete"
+					// signal for future readers and silently mask manifest gaps.
+					// Refuse instead, symmetric with plan/note.
+					const generatedAt = manifestEntry.source?.generatedAt;
+					if (!generatedAt) {
+						vscode.window.showWarningMessage(
+							`Memory Bank: cannot revert ${absPath} — manifest entry is missing source.generatedAt (manifest row is incomplete).`,
+						);
+						return;
+					}
+					ok = await folderStorage.forceRegenerateVisibleMarkdown({
+						commitHash: manifestEntry.fileId,
+						commitMessage: manifestEntry.title ?? manifestEntry.fileId,
+						commitDate: generatedAt,
+						branch,
+						generatedAt,
+						parentCommitHash: null,
+					});
+				} else if (manifestEntry.type === "plan") {
+					const slug = manifestEntry.fileId.replace(/^plan:/, "");
+					const branch = resolveBranch(folderStorage, manifestEntry);
+					if (!branch) {
+						vscode.window.showWarningMessage(
+							`Memory Bank: cannot revert ${absPath} — manifest entry has no recorded branch and the path's folder is not a known branch mapping.`,
+						);
+						return;
+					}
+					ok = await folderStorage.regenerateVisiblePlan(slug, branch);
+				} else if (manifestEntry.type === "note") {
+					const id = manifestEntry.fileId.replace(/^note:/, "");
+					const branch = resolveBranch(folderStorage, manifestEntry);
+					if (!branch) {
+						vscode.window.showWarningMessage(
+							`Memory Bank: cannot revert ${absPath} — manifest entry has no recorded branch and the path's folder is not a known branch mapping.`,
+						);
+						return;
+					}
+					ok = await folderStorage.regenerateVisibleNote(id, branch);
+				} else {
+					// Unknown manifest entry type — surface a distinct warning
+					// instead of falling through to the misleading
+					// "hidden source missing" branch below. Possible if a
+					// future schema bump adds a new entry type and an older
+					// extension build reads it before being upgraded.
+					vscode.window.showWarningMessage(
+						`Memory Bank: cannot revert ${absPath} — unrecognized manifest entry type '${manifestEntry.type}'.`,
+					);
+					return;
+				}
+				if (ok) {
+					// Successful revert clears the "we already showed the
+					// divergence info-message for this path" guard so the
+					// next divergence on the same path can re-prompt. Also
+					// prevents the Set from growing unbounded over a long
+					// extension-host lifetime.
+					divergenceMessageShown.delete(absPath);
+					memoryFileDecorationProvider.refreshUri(
+						vscode.Uri.file(absPath),
+					);
+					// Force the KB folders tree to drop its cached
+					// `isDiverged` for this path so the ✎ marker disappears
+					// without waiting for the user to hit refresh. The
+					// existing decoration-provider refresh above only covers
+					// VS Code's native file UIs; the webview-rendered KB
+					// tree reads divergence from the cached FolderNode and
+					// needs its own re-fetch signal.
+					sidebarProvider.refreshKnowledgeBaseFolders();
+					vscode.window.showInformationMessage(
+						`Reverted to system version: ${absPath}`,
+					);
+				} else {
+					vscode.window.showWarningMessage(
+						`Memory Bank: revert failed for ${absPath} — hidden source missing.`,
+					);
+				}
+			},
+		),
+
+		// Webview-facing variant of revertMemoryFileEdits. The Memory Bank
+		// sidebar's right-click menu only knows kbRoot-relative paths
+		// (FolderNode.relPath → data-path attribute), so we resolve here
+		// using the same `join(sidebarKbParent, relPath)` expression
+		// `resolveKbAbs` uses (line 851) — keeping the wrapper aligned with
+		// config-change re-binds of sidebarKbParent. Bad input is dropped
+		// silently, matching the abs-path command's defensive guard above.
+		vscode.commands.registerCommand(
+			"jollimemory.revertMemoryFileByRelPath",
+			async (relPath: unknown) => {
+				if (typeof relPath !== "string" || relPath.length === 0) return;
+				const abs = join(sidebarKbParent, relPath);
+				await vscode.commands.executeCommand(
+					"jollimemory.revertMemoryFileEdits",
+					abs,
+				);
 			},
 		),
 
@@ -2424,6 +2761,12 @@ export function activate(context: vscode.ExtensionContext): void {
 						);
 						return;
 					}
+					const readStorageResult = sourceRepoName
+						? await bridge.createStorageForRepo(
+								sourceRepoName,
+								sourceRemoteUrl,
+							)
+						: await bridge.createReadStorageForCurrentRepo();
 					await SummaryWebviewPanel.show(
 						summary,
 						context.extensionUri,
@@ -2433,6 +2776,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						"commit",
 						sourceRepoName,
 						sourceRemoteUrl,
+						readStorageResult?.storage ?? null,
 					);
 					return;
 				}
@@ -2674,7 +3018,7 @@ function handleError(commandName: string): (err: unknown) => void {
  * Sets all providers to "migrating" state and refreshes them afterward.
  */
 async function migrateIndexIfNeeded(
-	cwd: string,
+	bridge: JolliMemoryBridge,
 	statusStore: StatusStore,
 	commitsStore: CommitsStore,
 	filesStore: FilesStore,
@@ -2682,7 +3026,7 @@ async function migrateIndexIfNeeded(
 	try {
 		// Early-return so that no-op cases (most activations) skip the expensive
 		// commitsStore.refresh() and migration-state toggling below.
-		const needsMigration = await indexNeedsMigration(cwd);
+		const needsMigration = await bridge.indexNeedsMigration();
 		if (!needsMigration) {
 			return;
 		}
@@ -2699,7 +3043,7 @@ async function migrateIndexIfNeeded(
 	try {
 		log.info("migrate", "Index v1 detected — migrating to v3 flat format");
 
-		const { migrated, skipped } = await migrateIndexToV3(cwd);
+		const { migrated, skipped } = await bridge.migrateIndexToV3();
 		log.info(
 			"migrate",
 			`Index migration complete: ${migrated} entries migrated, ${skipped} skipped`,

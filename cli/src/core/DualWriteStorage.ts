@@ -89,6 +89,17 @@ export class DualWriteStorage implements StorageProvider {
 		}
 	}
 
+	async pruneBranchMappings(branches: readonly string[]): Promise<number> {
+		if (!this.shadow.pruneBranchMappings) return 0;
+		try {
+			return await this.shadow.pruneBranchMappings(branches);
+		} catch (err) {
+			log.warn("Shadow pruneBranchMappings failed (folder storage): %s", errMsg(err));
+			this.shadow.markDirty?.(`pruneBranchMappings ${branches.length}`);
+			return 0;
+		}
+	}
+
 	async healMissingVisibleMarkdown(opts?: HealOptions): Promise<HealResult> {
 		// Heal target is the visible layer — only the folder side has one.
 		// Try shadow first (the canonical wiring in StorageFactory), then

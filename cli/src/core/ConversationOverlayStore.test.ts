@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { TranscriptEntry } from "../Types.js";
 import {
@@ -10,7 +10,9 @@ import {
 	type ConversationOverlay,
 	loadOverlay,
 	mergeOverlay,
+	type OverlayableSession,
 	overlayPath,
+	pruneConsumedOverlayRules,
 	saveOverlay,
 } from "./ConversationOverlayStore.js";
 
@@ -828,6 +830,121 @@ describe("ConversationOverlayStore", () => {
 			];
 			const result = applyOverlay(entries, overlay);
 			expect(result.map((e) => e.content)).toEqual(["pong"]);
+		});
+	});
+
+	describe("pruneConsumedOverlayRules", () => {
+		const sid = "session-prune";
+		const overlayFile = () => overlayPath({ projectDir, source: "claude", sessionId: sid });
+
+		it("removes rules whose identity matches an entry in the consumed slice", async () => {
+			await saveOverlay(
+				{ projectDir, source: "claude", sessionId: sid },
+				{
+					deletes: [
+						{ role: "human", content: "ask-A", timestamp: "t1" },
+						{ role: "human", content: "ask-B", timestamp: "t2" },
+					],
+					edits: [{ role: "assistant", content: "raw-C", timestamp: "t3", newContent: "edited-C" }],
+				},
+			);
+
+			const session: OverlayableSession = {
+				sessionId: sid,
+				source: "claude",
+				entries: [
+					// matches the first delete rule by identity
+					{ role: "human", content: "ask-A", timestamp: "t1" },
+					// matches the edit rule by raw identity (NOT by newContent)
+					{ role: "assistant", content: "raw-C", timestamp: "t3" },
+					// ask-B is NOT in the slice → that delete rule must survive
+				],
+			};
+
+			await pruneConsumedOverlayRules([session], projectDir);
+
+			const remaining = await loadOverlay({ projectDir, source: "claude", sessionId: sid });
+			expect(remaining?.deletes).toEqual([{ role: "human", content: "ask-B", timestamp: "t2" }]);
+			expect(remaining?.edits).toEqual([]);
+		});
+
+		it("unlinks the overlay file when all rules are consumed", async () => {
+			await saveOverlay(
+				{ projectDir, source: "claude", sessionId: sid },
+				{
+					deletes: [{ role: "human", content: "only", timestamp: "t1" }],
+					edits: [],
+				},
+			);
+			expect(existsSync(overlayFile())).toBe(true);
+
+			const session: OverlayableSession = {
+				sessionId: sid,
+				source: "claude",
+				entries: [{ role: "human", content: "only", timestamp: "t1" }],
+			};
+
+			await pruneConsumedOverlayRules([session], projectDir);
+
+			expect(existsSync(overlayFile())).toBe(false);
+		});
+
+		it("is a no-op when the overlay file does not exist", async () => {
+			const session: OverlayableSession = {
+				sessionId: "never-saved",
+				source: "claude",
+				entries: [{ role: "human", content: "x", timestamp: "t" }],
+			};
+			await expect(pruneConsumedOverlayRules([session], projectDir)).resolves.toBeUndefined();
+		});
+
+		it("does not re-write the file when nothing matched (idempotent, mtime stable)", async () => {
+			await saveOverlay(
+				{ projectDir, source: "claude", sessionId: sid },
+				{
+					deletes: [{ role: "human", content: "ask-X", timestamp: "tX" }],
+					edits: [],
+				},
+			);
+			const path = overlayFile();
+			const mtimeBefore = statSync(path).mtimeMs;
+
+			// Wait long enough that a rewrite would change mtime measurably on
+			// macOS/Linux (filesystem timestamp granularity is ms or coarser).
+			await new Promise((r) => setTimeout(r, 20));
+
+			const session: OverlayableSession = {
+				sessionId: sid,
+				source: "claude",
+				entries: [{ role: "human", content: "unrelated", timestamp: "tY" }],
+			};
+			await pruneConsumedOverlayRules([session], projectDir);
+
+			expect(statSync(path).mtimeMs).toBe(mtimeBefore);
+		});
+
+		it("isolates per-session errors so one bad overlay does not abort the sweep", async () => {
+			// Good overlay for s1 — should be pruned and the file unlinked.
+			await saveOverlay(
+				{ projectDir, source: "claude", sessionId: "s1" },
+				{ deletes: [{ role: "human", content: "ask", timestamp: "t1" }], edits: [] },
+			);
+			// Corrupt overlay for s2 — loadOverlay returns null, prune skips it.
+			const s2Path = overlayPath({ projectDir, source: "claude", sessionId: "s2" });
+			mkdirSync(dirname(s2Path), { recursive: true });
+			writeFileSync(s2Path, "not json", "utf8");
+
+			const sessions: ReadonlyArray<OverlayableSession> = [
+				{ sessionId: "s1", source: "claude", entries: [{ role: "human", content: "ask", timestamp: "t1" }] },
+				{ sessionId: "s2", source: "claude", entries: [] },
+			];
+
+			await pruneConsumedOverlayRules(sessions, projectDir);
+
+			expect(existsSync(overlayPath({ projectDir, source: "claude", sessionId: "s1" }))).toBe(false);
+			// Corrupt file is left alone — operator can inspect, and prune treats it
+			// like "no overlay" (loadOverlay returned null).
+			expect(existsSync(s2Path)).toBe(true);
 		});
 	});
 });

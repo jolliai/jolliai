@@ -424,4 +424,22 @@ describe("onboarding panel styles", () => {
 			}
 		});
 	});
+
+	describe(".edited-icon — applies to both conversation rows and KB folder file rows", () => {
+		it("declares the visual block under both scopes with the same color token", () => {
+			// The KB folders tree renders the same codicon-edit ✎ glyph that
+			// conversation rows do, with the same color token, so a user who
+			// recognizes one indicator recognizes both. We DON'T relax to a
+			// bare '.edited-icon' selector because conversation rows carry an
+			// extra +4px margin grouping (see .conversation-row .badge group
+			// above) that KB tree rows should not inherit.
+			const css = buildSidebarCss();
+			expect(css).toMatch(
+				/\.tree-node\.conversation-row\s+\.edited-icon\s*\{[^}]*color:\s*var\(--vscode-gitDecoration-modifiedResourceForeground/,
+			);
+			expect(css).toMatch(
+				/\.tree-node\[data-kind="file"\]\s+\.edited-icon\s*\{[^}]*color:\s*var\(--vscode-gitDecoration-modifiedResourceForeground/,
+			);
+		});
+	});
 });

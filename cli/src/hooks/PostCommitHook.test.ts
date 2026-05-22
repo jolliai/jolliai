@@ -216,6 +216,12 @@ vi.mock("../core/ConversationOverlayStore.js", async (importOriginal) => {
 		...actual,
 		applyOverlaysToSessions: vi.fn(async (sessions: unknown) => sessions),
 		loadOverlay: vi.fn(async () => null),
+		// Stub to no-op for the same fake-timer reason as applyOverlaysToSessions:
+		// the real implementation calls module-local loadOverlay (ESM binding,
+		// not the mock above), which under fake timers fs/promises does not
+		// resolve. Tests that need overlay-GC behavior assert directly against
+		// pruneConsumedOverlayRules in QueueWorker.overlay.test.ts (real timers).
+		pruneConsumedOverlayRules: vi.fn(async () => undefined),
 	};
 });
 

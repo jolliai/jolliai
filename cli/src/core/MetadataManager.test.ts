@@ -227,6 +227,34 @@ describe("MetadataManager", () => {
 			expect(manager.readManifest().files).toHaveLength(1);
 			expect(manager.listBranchMappings().some((m) => m.folder === "feature-empty")).toBe(false);
 		});
+
+		it("unregisterBranches drops only the named mappings and leaves the manifest untouched", () => {
+			manager.resolveFolderForBranch("main");
+			manager.resolveFolderForBranch("feature/ghost");
+			manager.resolveFolderForBranch("feature/kept");
+			manager.updateManifest(makeEntry({ path: "feature-ghost/x.md", fileId: "x" }));
+
+			const removed = manager.unregisterBranches(["feature/ghost"]);
+			expect(removed).toBe(1);
+			const remaining = manager
+				.listBranchMappings()
+				.map((m) => m.branch)
+				.sort();
+			expect(remaining).toEqual(["feature/kept", "main"]);
+			// Manifest is intentionally untouched: hoisted-child .md has been
+			// removed by the cleanup pass already, and any remaining row is
+			// independently policed by reconcile / heal.
+			expect(manager.readManifest().files).toHaveLength(1);
+		});
+
+		it("unregisterBranches is idempotent: unknown branches and duplicates are no-ops", () => {
+			manager.resolveFolderForBranch("main");
+
+			expect(manager.unregisterBranches([])).toBe(0);
+			expect(manager.unregisterBranches(["does-not-exist"])).toBe(0);
+			expect(manager.unregisterBranches(["main", "main"])).toBe(1);
+			expect(manager.listBranchMappings()).toEqual([]);
+		});
 	});
 
 	describe("transcodeBranchName", () => {

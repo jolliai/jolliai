@@ -15,6 +15,7 @@
 import { createLogger, errMsg } from "../Logger.js";
 import type { SessionInfo, TranscriptEntry, TranscriptSource } from "../Types.js";
 import { conversationKey, readExclusions } from "./CommitSelectionStore.js";
+import { hasOverlayChanges, loadOverlay } from "./ConversationOverlayStore.js";
 import { isStillHidden, loadHiddenConversations } from "./HiddenConversationsStore.js";
 import { resolveSessionTitle } from "./SessionTitleResolver.js";
 import { loadMergedTranscript, loadUnreadMergedTranscript } from "./TranscriptMessageCounter.js";
@@ -28,6 +29,8 @@ export interface ActiveConversationItem {
 	readonly messageCount: number;
 	readonly updatedAt: string;
 	readonly transcriptPath: string;
+	/** True when the persisted overlay contains saved edits or deletions. */
+	readonly isEdited: boolean;
 	/**
 	 * Per-commit-selection signal. `false` = user has unchecked this row;
 	 * the QueueWorker will skip its transcript when generating the next
@@ -109,13 +112,16 @@ export async function listActiveConversationsWithDiagnostics(
 	// yet been consumed into a commit summary.
 	const items: ActiveConversationItem[] = await Promise.all(
 		visible.map(async (s) => {
-			const unread = await safeLoadUnreadMerged(s, opts.cwd);
+			const source = s.source ?? "claude";
+			const [unread, isEdited] = await Promise.all([
+				safeLoadUnreadMerged(s, opts.cwd),
+				safeHasOverlayChanges(source, s.sessionId, opts.cwd),
+			]);
 			// Preserve title quality for sources without a native title by
 			// resolving against the full merged transcript when the session is
 			// still visible. For sources that already carry a title, the extra
 			// read is harmless and skipped by resolveSessionTitle immediately.
 			const titleEntries = unread.length > 0 ? await safeLoadMerged(s, opts.cwd) : unread;
-			const source = s.source ?? "claude";
 			return {
 				sessionId: s.sessionId,
 				source,
@@ -123,6 +129,7 @@ export async function listActiveConversationsWithDiagnostics(
 				messageCount: unread.length,
 				updatedAt: s.updatedAt,
 				transcriptPath: s.transcriptPath,
+				isEdited,
 				isSelected: !exclusions.conversations.has(conversationKey(source, s.sessionId)),
 			};
 		}),
@@ -172,6 +179,19 @@ async function safeLoadUnreadMerged(s: SessionInfo, projectDir: string): Promise
 			errMsg(err),
 		);
 		return [];
+	}
+}
+
+async function safeHasOverlayChanges(
+	source: TranscriptSource,
+	sessionId: string,
+	projectDir: string,
+): Promise<boolean> {
+	try {
+		return hasOverlayChanges(await loadOverlay({ projectDir, source, sessionId }));
+	} catch (err) {
+		log.warn("loadOverlay failed for %s/%s when computing edited badge: %s", source, sessionId, errMsg(err));
+		return false;
 	}
 }
 

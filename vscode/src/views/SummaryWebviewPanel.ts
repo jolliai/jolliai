@@ -28,12 +28,13 @@ import {
 	translateToEnglish,
 } from "../../../cli/src/core/Summarizer.js";
 import {
-	getTranscriptHashes,
+	getTranscriptHashes as coreGetTranscriptHashes,
 	readLinearIssueFromBranch,
 	readNoteFromBranch,
 	readPlanFromBranch,
-	readTranscriptsForCommits,
+	readTranscriptsForCommits as coreReadTranscriptsForCommits,
 } from "../../../cli/src/core/SummaryStore.js";
+import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
 import {
 	deleteTopicInTree,
 	updateTopicInTree,
@@ -202,6 +203,17 @@ const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
 	// supplied by the stale banner the panel itself rendered. No write
 	// path, no workspace coupling beyond opening another panel.
 	"openRewrittenCommit",
+	// Detail-panel read paths reached in foreign (cross-repo) view-only
+	// mode. Transcripts (stats + Manage modal) and the rendered Markdown
+	// previews for plans / notes are pure reads against the foreign repo's
+	// FolderStorage — `loadPlanContent` / `loadNoteContent` (the inline
+	// edit form's data loaders) are intentionally NOT here because edits
+	// to a foreign-repo body are disabled in this mode and the edit
+	// affordances are already CSS-hidden in `.foreign-readonly`.
+	"loadTranscriptStats",
+	"loadAllTranscripts",
+	"previewPlan",
+	"previewNote",
 ]);
 
 function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
@@ -373,6 +385,17 @@ export class SummaryWebviewPanel {
 	 * summary rather than the current workspace's repo.
 	 */
 	private readonly foreignRepoUrl: string | null;
+	/**
+	 * StorageProvider rooted at the foreign repo's Memory Bank `.jolli/`
+	 * directory. Non-null only when `foreignRepoName` is also non-null —
+	 * built by Extension via `bridge.createStorageForRepo(...)` and threaded
+	 * through every read path (transcripts, plans, notes) so the detail
+	 * panel renders data from the foreign repo's storage instead of the
+	 * current workspace's cwd-rooted storage. Without this, foreign-mode
+	 * panels would show empty "All Conversations" / empty plan/note bodies
+	 * because the cwd storage has no files for the foreign commit hash.
+	 */
+	private readonly foreignStorage: StorageProvider | null;
 
 	private constructor(
 		extensionUri: vscode.Uri,
@@ -383,6 +406,7 @@ export class SummaryWebviewPanel {
 		mainBranch: string,
 		foreignRepoName: string | null,
 		foreignRepoUrl: string | null,
+		foreignStorage: StorageProvider | null,
 	) {
 		this.extensionUri = extensionUri;
 		this.workspaceRoot = workspaceRoot;
@@ -392,6 +416,7 @@ export class SummaryWebviewPanel {
 		this.mainBranch = mainBranch;
 		this.foreignRepoName = foreignRepoName;
 		this.foreignRepoUrl = foreignRepoUrl;
+		this.foreignStorage = foreignStorage;
 		// Distinct viewType per source keeps the two panels independently identified by VSCode.
 		const viewType =
 			source === "memory"
@@ -588,11 +613,17 @@ export class SummaryWebviewPanel {
 				);
 				break;
 			case "previewPlan":
+				// Pass the panel's foreign provenance through so the editPlan
+				// command can resolve the foreign repo's FolderStorage and
+				// read the plan body from there. Local panels pass null/null
+				// and the command falls back to workspace-default reads.
 				void vscode.commands.executeCommand(
 					"jollimemory.editPlan",
 					message.slug,
 					true,
 					message.title,
+					this.foreignRepoName,
+					this.foreignRepoUrl,
 				);
 				break;
 			case "removePlan":
@@ -639,10 +670,13 @@ export class SummaryWebviewPanel {
 				);
 				break;
 			case "previewNote":
+				// Same foreign-provenance plumbing as previewPlan above.
 				void vscode.commands.executeCommand(
 					"jollimemory.previewNote",
 					message.id,
 					message.title,
+					this.foreignRepoName,
+					this.foreignRepoUrl,
 				);
 				break;
 			case "translateNote":
@@ -954,6 +988,7 @@ export class SummaryWebviewPanel {
 		source: SummaryPanelSource = "commit",
 		foreignRepoName: string | null = null,
 		foreignRepoUrl: string | null = null,
+		foreignStorage: StorageProvider | null = null,
 	): Promise<void> {
 		if (source === "commit" || source === "kb") {
 			const existing = SummaryWebviewPanel.commitPanels.get(summary.commitHash);
@@ -1004,6 +1039,7 @@ export class SummaryWebviewPanel {
 			mainBranch,
 			foreignRepoName,
 			foreignRepoUrl,
+			foreignStorage,
 		);
 		if (source === "memory") {
 			SummaryWebviewPanel.currentMemoryPanel = instance;
@@ -1053,7 +1089,18 @@ export class SummaryWebviewPanel {
 	private async refreshTranscriptHashes(summary: CommitSummary): Promise<void> {
 		try {
 			const treeHashes = collectTreeHashes(summary);
-			const allFileHashes = await getTranscriptHashes(this.workspaceRoot);
+			// Foreign mode: read the transcript file listing from the foreign
+			// repo's `.jolli/transcripts/` via the supplied StorageProvider.
+			// Going through `this.bridge.getTranscriptHashes()` here would hit
+			// `this.cwd`'s storage and return hashes disjoint from the foreign
+			// commit — which is what made "All Conversations" render empty for
+			// every cross-repo summary.
+			const allFileHashes = this.foreignStorage
+				? await coreGetTranscriptHashes(
+						this.workspaceRoot,
+						this.foreignStorage,
+					)
+				: await this.bridge.getTranscriptHashes();
 			this.transcriptHashSet = new Set(
 				[...treeHashes].filter((h) => allFileHashes.has(h)),
 			);
@@ -1084,7 +1131,11 @@ export class SummaryWebviewPanel {
 			}
 			// Body check (reads from orphan branch)
 			try {
-				const content = await readPlanFromBranch(plan.slug, this.workspaceRoot);
+				const content = await readPlanFromBranch(
+					plan.slug,
+					this.workspaceRoot,
+					this.foreignStorage ?? undefined,
+				);
 				if (content && SummaryWebviewPanel.CJK_RE.test(content)) {
 					result.add(plan.slug);
 				}
@@ -1117,7 +1168,11 @@ export class SummaryWebviewPanel {
 			}
 			// Markdown notes — read from orphan branch
 			try {
-				const content = await readNoteFromBranch(note.id, this.workspaceRoot);
+				const content = await readNoteFromBranch(
+					note.id,
+					this.workspaceRoot,
+					this.foreignStorage ?? undefined,
+				);
 				if (content && SummaryWebviewPanel.CJK_RE.test(content)) {
 					result.add(note.id);
 				}
@@ -2211,6 +2266,10 @@ export class SummaryWebviewPanel {
 	// ── Plan handlers ────────────────────────────────────────────────────────
 
 	private async handleLoadPlanContent(slug: string): Promise<void> {
+		// Inline-edit data loader — never reachable in foreign mode (the
+		// edit affordances are CSS-hidden under `.foreign-readonly` and
+		// `loadPlanContent` is not on the foreign-safe whitelist). Reads
+		// stay on the workspace's default storage.
 		const content = await readPlanFromBranch(slug, this.workspaceRoot);
 		if (content === null) {
 			vscode.window.showErrorMessage(
@@ -2507,7 +2566,9 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		// Snippets carry their content inline; markdown notes read from orphan branch
+		// Snippets carry their content inline; markdown notes read from orphan branch.
+		// Same rationale as handleLoadPlanContent: inline-edit loader, not
+		// reachable in foreign mode — workspace-default storage stays correct.
 		let content: string | null;
 		if (format === "snippet" && noteRef.content) {
 			content = noteRef.content;
@@ -2933,10 +2994,15 @@ export class SummaryWebviewPanel {
 		if (this.transcriptHashSet.size === 0) {
 			return;
 		}
-		const transcriptMap = await readTranscriptsForCommits(
-			[...this.transcriptHashSet],
-			this.workspaceRoot,
-		);
+		const transcriptMap = this.foreignStorage
+			? await coreReadTranscriptsForCommits(
+					[...this.transcriptHashSet],
+					this.workspaceRoot,
+					this.foreignStorage,
+				)
+			: await this.bridge.readTranscriptsForCommits([
+					...this.transcriptHashSet,
+				]);
 		const enabledSources = await this.getEnabledSources();
 
 		// Deduplicate sessions by source:sessionId (same session may appear in multiple commit transcripts)
@@ -2976,10 +3042,13 @@ export class SummaryWebviewPanel {
 		this.panel.webview.postMessage({ command: "transcriptsLoading" });
 
 		const hashesWithTranscripts = [...this.transcriptHashSet];
-		const transcriptMap = await readTranscriptsForCommits(
-			hashesWithTranscripts,
-			this.workspaceRoot,
-		);
+		const transcriptMap = this.foreignStorage
+			? await coreReadTranscriptsForCommits(
+					hashesWithTranscripts,
+					this.workspaceRoot,
+					this.foreignStorage,
+				)
+			: await this.bridge.readTranscriptsForCommits(hashesWithTranscripts);
 		const enabledSources = await this.getEnabledSources();
 
 		// Build tagged entries: each entry carries its commit hash, session info, and original index
@@ -3047,10 +3116,7 @@ export class SummaryWebviewPanel {
 		}
 
 		// Re-read originals to preserve session metadata (e.g. transcriptPath) that is not round-tripped via the DOM
-		const originalTranscriptMap = await readTranscriptsForCommits(
-			[...this.transcriptHashSet],
-			this.workspaceRoot,
-		);
+		const originalTranscriptMap = await this.bridge.readTranscriptsForCommits([...this.transcriptHashSet]);
 
 		// Reconstruct StoredTranscript per commit, merging with original session metadata
 		const writes: Array<{ hash: string; data: StoredTranscript }> = [];

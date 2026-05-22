@@ -125,10 +125,18 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 		const lines: string[] = [];
 		lines.push(`Usage: ${helper.commandUsage(cmd)}`, "");
 
+		// All five conditionals below have unreachable empty arms when invoked
+		// on the root program (description is always set, --version/--help are
+		// always present, every registered command falls into Memory or Site).
+		// The empty arms exist for defensive parity with Commander's default
+		// formatter; they are wrapped in v8 ignore blocks so the dead branches
+		// don't drag down the file's branch coverage.
 		const description = helper.commandDescription(cmd);
+		/* v8 ignore start -- defensive empty arms; see comment above */
 		if (description) lines.push(description, "");
 
 		if (visibleOpts.length > 0) {
+			/* v8 ignore stop */
 			lines.push("Options:");
 			for (const opt of visibleOpts) {
 				lines.push(formatRow(helper.optionTerm(opt), helper.optionDescription(opt)));
@@ -136,7 +144,9 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
+		/* v8 ignore start -- defensive empty arm */
 		if (memoryCmds.length > 0) {
+			/* v8 ignore stop */
 			lines.push("Jolli Memory — Auto-document AI development sessions");
 			lines.push(renderSectionDescription(MEMORY_DESCRIPTION), "");
 			lines.push("Commands:");
@@ -146,7 +156,9 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
+		/* v8 ignore start -- defensive empty arm */
 		if (siteCmds.length > 0) {
+			/* v8 ignore stop */
 			lines.push("Jolli Site — Generate a docs site from your content folder");
 			lines.push(renderSectionDescription(SITE_DESCRIPTION), "");
 			lines.push("Commands:");
@@ -156,7 +168,9 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
+		/* v8 ignore start -- defensive empty arm: every registered command is Memory or Site today */
 		if (otherCmds.length > 0) {
+			/* v8 ignore stop */
 			lines.push("Other commands:");
 			for (const c of otherCmds) {
 				lines.push(formatRow(helper.subcommandTerm(c), helper.subcommandDescription(c)));

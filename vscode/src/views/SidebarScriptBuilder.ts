@@ -227,6 +227,16 @@ export function buildSidebarScript(): string {
     el.addEventListener('mouseleave', function() {
       hideTextTip();
     });
+    // VSCode modal dialogs (showWarningMessage with { modal: true }, command
+    // palettes, etc.) overlay the webview at the native layer without
+    // dispatching mouseleave — from the DOM's view, the cursor never moved.
+    // A tooltip that was already visible when the user clicked therefore
+    // outlives the click and stays pinned until the user wiggles the mouse
+    // back over and off the button. mousedown fires before the modal opens
+    // so dismissing here closes the gap.
+    el.addEventListener('mousedown', function() {
+      hideTextTip();
+    });
     return el;
   }
 
@@ -1292,6 +1302,11 @@ export function buildSidebarScript(): string {
   let currentRepoAutoExpanded = false;
 
   function renderFolders() {
+    // mountIn replaces the whole subtree below: any rows currently anchoring
+    // a visible tooltip will be detached without firing mouseleave, leaving
+    // the tip orphaned on screen. Dismissing here mirrors renderStatus /
+    // renderToolbar and keeps every section-level re-render symmetric.
+    hideTextTip();
     const container = tabContents.kb;
     const root = folderCache[''];
     if (!root) {
@@ -1339,6 +1354,12 @@ export function buildSidebarScript(): string {
       if (!isDir) {
         attrs['data-file-kind'] = fileKind;
         if (child.fileKey) attrs['data-key'] = child.fileKey;
+        // Drives the conditional "Revert to System Version" entry in the
+        // right-click contextmenu. Mirrors the ✎ codicon below: if the
+        // marker shows, the menu entry shows. Boolean-attr convention —
+        // presence means true, absence means false — same as the
+        // data-current-repo flag on the repo-root container above.
+        if (child.isDiverged) attrs['data-diverged'] = '1';
       }
       // Manifest-tracked files show their human-readable title (commit message
       // for memories, slug/id for plans/notes) in place of the slug-style
@@ -1393,11 +1414,29 @@ export function buildSidebarScript(): string {
       ];
       if (!isDir && (fileKind === 'plan' || fileKind === 'note')) {
         labelChildren.push(
-          el('span', {
-            className: 'kb-tag kb-tag-' + fileKind,
-            text: fileKind === 'plan' ? 'P' : 'N',
-            title: fileKind === 'plan' ? 'Plan' : 'Note',
-          }),
+          attachTextTip(
+            el('span', {
+              className: 'kb-tag kb-tag-' + fileKind,
+              text: fileKind === 'plan' ? 'P' : 'N',
+            }),
+            fileKind === 'plan' ? 'Plan' : 'Note',
+          ),
+        );
+      }
+      // "Edited on disk" ✎ marker — mirrors the conversation-row pattern
+      // (renderConversationRow above). Same codicon, same .edited-icon
+      // class, same color token, so a user familiar with the conversations
+      // edit indicator recognises this immediately. Tooltip phrasing
+      // matches MemoryFileDecorationProvider's native badge.
+      if (!isDir && child.isDiverged) {
+        labelChildren.push(
+          attachTextTip(
+            el('i', {
+              className: 'codicon codicon-edit edited-icon',
+              'aria-label': 'Edited',
+            }),
+            'Edited on disk — system view unavailable',
+          ),
         );
       }
       const rowChildren = [twirl, iconEl].concat(labelChildren);
@@ -1522,6 +1561,7 @@ export function buildSidebarScript(): string {
   }
 
   function renderMemories() {
+    hideTextTip();
     const container = tabContents.kb;
     const nodes = [];
     // KB tab Memories timeline is intentionally NOT scoped by the breadcrumb —
@@ -1654,16 +1694,18 @@ export function buildSidebarScript(): string {
     }
     kids.push(el('hr'));
     const actions = [
-      el('span', {
-        className: 'hc-link',
-        'data-cmd': 'jollimemory.copyCommitHash',
-        'data-hash': m.commitHash,
-        title: 'Copy commit hash',
-      }, [
-        el('i', { className: 'codicon codicon-git-commit' }),
-        el('span', { className: 'hc-hash', text: h.shortHash }),
-        el('i', { className: 'codicon codicon-copy' }),
-      ]),
+      attachTextTip(
+        el('span', {
+          className: 'hc-link',
+          'data-cmd': 'jollimemory.copyCommitHash',
+          'data-hash': m.commitHash,
+        }, [
+          el('i', { className: 'codicon codicon-git-commit' }),
+          el('span', { className: 'hc-hash', text: h.shortHash }),
+          el('i', { className: 'codicon codicon-copy' }),
+        ]),
+        'Copy commit hash',
+      ),
     ];
     // The View Memory link only makes sense when a summary actually exists —
     // for memory-less commits the command would dead-end on a 404. Memories
@@ -1713,27 +1755,31 @@ export function buildSidebarScript(): string {
     const actions = [];
     if (h.commitHash) {
       // Committed: short hash + copy icon, then a separator, then Preview.
-      actions.push(el('span', {
-        className: 'hc-link',
-        'data-cmd': 'jollimemory.copyCommitHash',
-        'data-hash': h.commitHash,
-        title: 'Copy commit hash',
-      }, [
-        el('i', { className: 'codicon codicon-git-commit' }),
-        el('span', { className: 'hc-hash', text: h.commitHash.substring(0, 8) }),
-        el('i', { className: 'codicon codicon-copy' }),
-      ]));
+      actions.push(attachTextTip(
+        el('span', {
+          className: 'hc-link',
+          'data-cmd': 'jollimemory.copyCommitHash',
+          'data-hash': h.commitHash,
+        }, [
+          el('i', { className: 'codicon codicon-git-commit' }),
+          el('span', { className: 'hc-hash', text: h.commitHash.substring(0, 8) }),
+          el('i', { className: 'codicon codicon-copy' }),
+        ]),
+        'Copy commit hash',
+      ));
       actions.push(el('span', { className: 'hc-sep', text: '|' }));
     }
-    actions.push(el('span', {
-      className: 'hc-link',
-      'data-cmd': 'jollimemory.openPlanForPreview',
-      'data-hash': slug,
-      title: 'Open plan',
-    }, [
-      el('i', { className: 'codicon codicon-eye' }),
-      el('span', { text: 'Open Plan' }),
-    ]));
+    actions.push(attachTextTip(
+      el('span', {
+        className: 'hc-link',
+        'data-cmd': 'jollimemory.openPlanForPreview',
+        'data-hash': slug,
+      }, [
+        el('i', { className: 'codicon codicon-eye' }),
+        el('span', { text: 'Open Plan' }),
+      ]),
+      'Open plan',
+    ));
     kids.push(el('div', { className: 'hc-actions' }, actions));
     return kids;
   }
@@ -1768,27 +1814,31 @@ export function buildSidebarScript(): string {
     kids.push(el('hr'));
     const actions = [];
     if (h.commitHash) {
-      actions.push(el('span', {
-        className: 'hc-link',
-        'data-cmd': 'jollimemory.copyCommitHash',
-        'data-hash': h.commitHash,
-        title: 'Copy commit hash',
-      }, [
-        el('i', { className: 'codicon codicon-git-commit' }),
-        el('span', { className: 'hc-hash', text: h.commitHash.substring(0, 8) }),
-        el('i', { className: 'codicon codicon-copy' }),
-      ]));
+      actions.push(attachTextTip(
+        el('span', {
+          className: 'hc-link',
+          'data-cmd': 'jollimemory.copyCommitHash',
+          'data-hash': h.commitHash,
+        }, [
+          el('i', { className: 'codicon codicon-git-commit' }),
+          el('span', { className: 'hc-hash', text: h.commitHash.substring(0, 8) }),
+          el('i', { className: 'codicon codicon-copy' }),
+        ]),
+        'Copy commit hash',
+      ));
       actions.push(el('span', { className: 'hc-sep', text: '|' }));
     }
-    actions.push(el('span', {
-      className: 'hc-link',
-      'data-cmd': 'jollimemory.openNoteForPreview',
-      'data-hash': noteId,
-      title: 'Open note',
-    }, [
-      el('i', { className: 'codicon codicon-eye' }),
-      el('span', { text: 'Open Note' }),
-    ]));
+    actions.push(attachTextTip(
+      el('span', {
+        className: 'hc-link',
+        'data-cmd': 'jollimemory.openNoteForPreview',
+        'data-hash': noteId,
+      }, [
+        el('i', { className: 'codicon codicon-eye' }),
+        el('span', { text: 'Open Note' }),
+      ]),
+      'Open note',
+    ));
     kids.push(el('div', { className: 'hc-actions' }, actions));
     return kids;
   }
@@ -1830,15 +1880,17 @@ export function buildSidebarScript(): string {
     // (the hoverCardEl click handler routes [data-cmd][data-hash] to
     // vscode.postMessage{ command, args: [hash] }); the registered
     // jollimemory.openLinearIssue command accepts a mapKey string.
-    const openLink = el('span', {
-      className: 'hc-link',
-      'data-cmd': 'jollimemory.openLinearIssue',
-      'data-hash': mapKey,
-      title: 'Open in Linear',
-    }, [
-      el('i', { className: 'codicon codicon-link-external' }),
-      el('span', { text: 'Open in Linear' }),
-    ]);
+    const openLink = attachTextTip(
+      el('span', {
+        className: 'hc-link',
+        'data-cmd': 'jollimemory.openLinearIssue',
+        'data-hash': mapKey,
+      }, [
+        el('i', { className: 'codicon codicon-link-external' }),
+        el('span', { text: 'Open in Linear' }),
+      ]),
+      'Open in Linear',
+    );
     kids.push(el('div', { className: 'hc-actions' }, [openLink]));
     return kids;
   }
@@ -1852,24 +1904,42 @@ export function buildSidebarScript(): string {
   // Anchor the popover's top-left corner exactly at the cursor — the
   // row→popover transition is then a zero-distance hop, so mouseout's
   // relatedTarget is the popover and the existing guard keeps it open.
-  // Default extends down-right from cursor; flips so the bottom-right
-  // corner aligns to the cursor when the default would overflow. A final
-  // clamp is a safety net for viewports smaller than the popover.
+  // Vertical: prefer extending down from cursor; flip to bottom-at-cursor
+  // when the natural height does not fit below; finally, if neither side
+  // can host the full card (panel shorter than card), pick the larger
+  // side and cap the card's height with an inline overflow so it never
+  // bleeds past the viewport. Reset maxHeight/overflowY first so the
+  // measurement reflects natural height, not the previous popover's cap.
   function positionHoverCard(mouseX, mouseY) {
     hoverCardEl.style.left = '-9999px';
     hoverCardEl.style.top = '0px';
+    hoverCardEl.style.maxHeight = '';
+    hoverCardEl.style.overflowY = '';
     const cardRect = hoverCardEl.getBoundingClientRect();
     const edge = 8;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const spaceBelow = vh - mouseY - edge;
+    const spaceAbove = mouseY - edge;
+    let top;
+    if (cardRect.height <= spaceBelow) {
+      top = mouseY;
+    } else if (cardRect.height <= spaceAbove) {
+      top = mouseY - cardRect.height;
+    } else if (spaceAbove >= spaceBelow) {
+      top = edge;
+      hoverCardEl.style.maxHeight = spaceAbove + 'px';
+      hoverCardEl.style.overflowY = 'auto';
+    } else {
+      top = mouseY;
+      hoverCardEl.style.maxHeight = spaceBelow + 'px';
+      hoverCardEl.style.overflowY = 'auto';
+    }
     let left = mouseX;
-    let top = mouseY;
-    if (left + cardRect.width > window.innerWidth - edge) {
+    if (left + cardRect.width > vw - edge) {
       left = mouseX - cardRect.width;
     }
-    if (top + cardRect.height > window.innerHeight - edge) {
-      top = mouseY - cardRect.height;
-    }
     if (left < edge) left = edge;
-    if (top < edge) top = edge;
     hoverCardEl.style.left = left + 'px';
     hoverCardEl.style.top = top + 'px';
   }
@@ -1904,6 +1974,31 @@ export function buildSidebarScript(): string {
           hasMemory: !!commits[j].hasMemory,
           viewMemoryCommand: 'jollimemory.viewSummary',
         };
+      }
+    }
+    // Foreign-mode branch view: workspace's branchData.commits does not carry
+    // memories from another repo+branch, so fall back to the per-selection
+    // cache. The active key matches whatever the breadcrumb currently shows;
+    // when the user pivots, the renderBranch() call rebuilds the rows so this
+    // lookup will already be aligned with what is on screen.
+    const foreignRepo = state.selectedRepoName || state.currentRepoName;
+    const foreignBranch = state.selectedBranchName || state.branchName;
+    if (foreignRepo && foreignBranch) {
+      const foreignItems = branchMemoriesCache[branchMemoriesKey(foreignRepo, foreignBranch)] || [];
+      for (let k = 0; k < foreignItems.length; k++) {
+        if (foreignItems[k].commitHash === hash) {
+          return {
+            commitHash: hash,
+            hover: foreignItems[k].hover,
+            // Foreign rows always represent a stored memory — the list itself
+            // is sourced from the cross-repo summary index, not git log.
+            hasMemory: true,
+            // Cross-repo lookup so the popover's bottom command link opens the
+            // right summary panel (same routing the inline "Copy Recall"
+            // button uses for foreign rows).
+            viewMemoryCommand: 'jollimemory.viewMemorySummary',
+          };
+        }
       }
     }
     return null;
@@ -2114,15 +2209,38 @@ export function buildSidebarScript(): string {
       e.preventDefault();
       dismissHoverCard();
       if (node.getAttribute('data-kind') !== 'file') return;
-      if (node.getAttribute('data-file-kind') !== 'memory') return;
-      const key = node.getAttribute('data-key');
-      if (!key) return;
-      showContextMenu(e.clientX, e.clientY, [
-        { label: 'Copy Recall Prompt',  command: 'jollimemory.copyRecallPrompt',  args: [key] },
-        { label: 'Open in Claude Code', command: 'jollimemory.openInClaudeCode',  args: [key] },
-        { separator: true },
-        { label: 'View Memory',         command: 'jollimemory.viewMemorySummary', args: [key] },
-      ]);
+      const fileKind = node.getAttribute('data-file-kind');
+      // Build menu items per file kind. memory carries the legacy 3-action
+      // set keyed off the manifest hash; plan / note are revert-only and
+      // start with an empty base list. Other / untracked files exit early
+      // so the native browser context menu stays suppressed (the
+      // preventDefault above already did that) and nothing replaces it.
+      const items = [];
+      if (fileKind === 'memory') {
+        const key = node.getAttribute('data-key');
+        if (!key) return;
+        items.push({ label: 'Copy Recall Prompt',  command: 'jollimemory.copyRecallPrompt',  args: [key] });
+        items.push({ label: 'Open in Claude Code', command: 'jollimemory.openInClaudeCode',  args: [key] });
+        items.push({ separator: true });
+        items.push({ label: 'View Memory',         command: 'jollimemory.viewMemorySummary', args: [key] });
+      } else if (fileKind !== 'plan' && fileKind !== 'note') {
+        return;
+      }
+      // Append Revert when the renderer flagged this row as diverged. The
+      // data-diverged='1' attribute is set in renderFolderChildren above,
+      // mirroring the ✎ codicon — so menu visibility tracks the marker
+      // exactly. relPath drives the kbRoot-relative wrapper command which
+      // resolves to an abs path host-side before delegating to the
+      // existing jollimemory.revertMemoryFileEdits handler.
+      if (node.getAttribute('data-diverged') === '1') {
+        const relPath = node.getAttribute('data-path');
+        if (relPath) {
+          if (items.length > 0) items.push({ separator: true });
+          items.push({ label: 'Revert to System Version', command: 'jollimemory.revertMemoryFileByRelPath', args: [relPath] });
+        }
+      }
+      if (items.length === 0) return;
+      showContextMenu(e.clientX, e.clientY, items);
       return;
     }
     const row = e.target.closest('.memory-row[data-hash]');
@@ -2212,6 +2330,7 @@ export function buildSidebarScript(): string {
   }
 
   function renderBranch() {
+    hideTextTip();
     const container = tabContents.branch;
     // Plans & Notes and Changes are workspace-local — they have no meaningful
     // representation for a foreign repo/branch selection. Drop them entirely
@@ -2244,7 +2363,25 @@ export function buildSidebarScript(): string {
     //    only knows how to git-log workspace HEAD), so we re-derive locally
     //    from the cross-repo summary index that's already loaded.
     const commitsItems = foreign ? getForeignCommitItems() : branchData.commits;
-    sections.push({ id: 'commits', title: 'Memories', items: commitsItems, emptyText: STRINGS.commitsEmpty || 'No memories yet.' });
+    // Foreign-mode banner — placed at the top of the Memories section body
+    // so the user sees an explicit in-panel signal that they are viewing
+    // another repo (the chrome-only foreign-readonly CSS class is silent on
+    // its own). Wording mirrors IntelliJ CommitsPanel.kt:722 so the two
+    // surfaces stay aligned. Uses sectionBanner (not warning) to keep the
+    // partial-data orange affordance free for the conversations failure case.
+    //
+    // The "(read-only)" suffix only renders when the repo itself is foreign;
+    // browsing another branch in the workspace repo drops the suffix because
+    // those branches are not actually read-only (the user could check them
+    // out). Both foreign-flavors get a "Switch back to current workspace"
+    // affordance so the user is never stranded after a breadcrumb pick.
+    const repo = state.selectedRepoName || state.currentRepoName || '';
+    const branch = state.selectedBranchName || state.branchName || '';
+    const repoForeign = !!state.selectedRepoName && state.selectedRepoName !== state.currentRepoName;
+    const memoriesBanner = foreign && repo && branch
+      ? { text: 'Viewing memories from ' + repo + ' / ' + branch + (repoForeign ? ' (read-only)' : ''), showResetLink: true }
+      : null;
+    sections.push({ id: 'commits', title: 'Memories', items: commitsItems, emptyText: STRINGS.commitsEmpty || 'No memories yet.', sectionBanner: memoriesBanner });
     mountIn(container, sections.map(renderSection));
   }
 
@@ -2270,6 +2407,10 @@ export function buildSidebarScript(): string {
         contextValue: 'commitWithMemory',
         children: null,
         isSelected: false,
+        // hover is forwarded straight through — the lookup at hover time reads
+        // it back from the cache (see lookupHoverEntry), so the foreign Branch
+        // panel renders the same popover the KB-tab Memories list shows.
+        hover: m.hover,
       };
     });
   }
@@ -2309,6 +2450,28 @@ export function buildSidebarScript(): string {
     // set a warning skip this entirely.
     if (bodyKids && s.warning) {
       bodyKids.unshift(el('div', { className: 'conversations-warning', text: s.warning }));
+    }
+    // Foreign-readonly banner ("Viewing memories from <repo> / <branch>
+    // [(read-only)]") — prepended after the warning so it sits at the very
+    // top of the section body and reads as a section-scoped label rather
+    // than a row. Distinct className from the warning above so styling
+    // (muted gray vs partial-data orange) is independent. The trailing
+    // "Switch back to current workspace" button is a link-styled <button>
+    // so it works under the webview's strict CSP (no inline onclick, no
+    // javascript: href). Click is handled by the tabContents.branch
+    // delegation block keyed off data-action="reset-to-workspace".
+    if (bodyKids && s.sectionBanner) {
+      const kids = [document.createTextNode(s.sectionBanner.text)];
+      if (s.sectionBanner.showResetLink) {
+        kids.push(document.createTextNode(' '));
+        kids.push(el('button', {
+          type: 'button',
+          className: 'foreign-banner-reset',
+          'data-action': 'reset-to-workspace',
+          text: 'Switch back to current workspace',
+        }));
+      }
+      bodyKids.unshift(el('div', { className: 'foreign-banner' }, kids));
     }
     // Primary CTA mounted as a SIBLING of .section-body so it survives the
     // Changes section being collapsed. Commit Memory operates on the group
@@ -2486,14 +2649,16 @@ export function buildSidebarScript(): string {
     // so a separate edit affordance was redundant.
     kids.push(
       el('span', { className: 'inline-actions' }, [
-        el('button', {
-          type: 'button',
-          className: 'iconbtn',
-          'data-inline': 'remove',
-          'data-id': item.id,
-          title: 'Remove',
-          'aria-label': 'Remove',
-        }, [el('i', { className: 'codicon codicon-trash' })]),
+        attachTextTip(
+          el('button', {
+            type: 'button',
+            className: 'iconbtn',
+            'data-inline': 'remove',
+            'data-id': item.id,
+            'aria-label': 'Remove',
+          }, [el('i', { className: 'codicon codicon-trash' })]),
+          'Remove',
+        ),
       ]),
     );
     // Suppress the native title= on every row type that drives the .hover-card
@@ -2544,22 +2709,30 @@ export function buildSidebarScript(): string {
         el('i', { className: 'codicon codicon-comment-discussion' }),
       ]),
       el('span', { className: 'label', text: displayTitle }),
-      el('span', {
-        className: 'badge transcript-source-' + item.source,
-        text: providerLabel(item.source),
-      }),
-      el('span', { className: 'count', text: String(item.messageCount) }),
     ];
+    if (item.isEdited) {
+      kids.push(attachTextTip(
+        el('i', {
+          className: 'codicon codicon-edit edited-icon',
+          'aria-label': 'Edited',
+        }),
+        'Conversation content has been modified',
+      ));
+    }
+    kids.push(el('span', {
+      className: 'badge transcript-source-' + item.source,
+      text: providerLabel(item.source),
+    }));
+    kids.push(el('span', { className: 'count', text: String(item.messageCount) }));
     if (relative) {
       kids.push(el('span', { className: 'time', text: relative }));
     }
-    const root = el('div', {
+    const root = attachTextTip(el('div', {
       className: 'tree-node conversation-row',
       'data-indent': String(depth),
       'data-session-id': item.sessionId,
       'data-source': item.source,
-      title: displayTitle,
-    }, kids);
+    }, kids), displayTitle);
     root.addEventListener('click', function(e) {
       // Guard: clicking the checkbox should not also open the conversation
       // panel. 'data-checkbox="1"' is enough for the delegated click handler
@@ -2669,14 +2842,16 @@ export function buildSidebarScript(): string {
     // TreeView affordance 1:1.
     kids.push(
       el('span', { className: 'inline-actions' }, [
-        el('button', {
-          type: 'button',
-          className: 'iconbtn',
-          'data-inline': 'discard',
-          'data-id': item.id,
-          title: 'Discard Changes',
-          'aria-label': 'Discard Changes',
-        }, [el('i', { className: 'codicon codicon-discard' })]),
+        attachTextTip(
+          el('button', {
+            type: 'button',
+            className: 'iconbtn',
+            'data-inline': 'discard',
+            'data-id': item.id,
+            'aria-label': 'Discard Changes',
+          }, [el('i', { className: 'codicon codicon-discard' })]),
+          'Discard Changes',
+        ),
       ]),
     );
     if (gs) {
@@ -2684,7 +2859,7 @@ export function buildSidebarScript(): string {
         el('span', { className: 'gs-letter gs-' + gs, text: gs }),
       );
     }
-    return el('div', {
+    return attachTextTip(el('div', {
       // tree-node--changes is the hover-reveal hook for inline-actions
       // (CSS scopes the visibility toggle to changes rows so plans / commits
       // keep their always-visible inline buttons).
@@ -2705,8 +2880,7 @@ export function buildSidebarScript(): string {
       'data-index-status':   item.indexStatus    || '',
       'data-worktree-status':item.worktreeStatus || '',
       'data-original-path':  item.originalPath   || '',
-      title: item.tooltip || '',
-    }, kids);
+    }, kids), item.tooltip || '');
   }
 
   function renderCommitRow(item, depth) {
@@ -2718,14 +2892,16 @@ export function buildSidebarScript(): string {
     const expandable = !!(item.children && item.children.length > 0);
     const expanded = expandable && !!state.commitsExpanded[item.id];
     const twirl = expandable
-      ? el('i', {
-          className:
-            'codicon ' +
-            (expanded ? 'codicon-chevron-down' : 'codicon-chevron-right') +
-            ' commit-twirl',
-          'data-commit-toggle': item.id,
-          title: expanded ? 'Collapse' : 'Expand',
-        })
+      ? attachTextTip(
+          el('i', {
+            className:
+              'codicon ' +
+              (expanded ? 'codicon-chevron-down' : 'codicon-chevron-right') +
+              ' commit-twirl',
+            'data-commit-toggle': item.id,
+          }),
+          expanded ? 'Collapse' : 'Expand',
+        )
       : el('span', { className: 'twirl' });
     // Multi-commit mode renders a checkbox for squash-selection; single /
     // merged modes show a git-commit codicon in the slot instead, matching
@@ -2774,18 +2950,39 @@ export function buildSidebarScript(): string {
       kids.push(el('span', { className: 'desc', text: item.description }));
     }
     if (hasMem) {
-      kids.push(
-        el('span', { className: 'inline-actions' }, [
-          el('button', {
-            type: 'button',
-            className: 'iconbtn',
-            'data-inline': 'viewSummary',
-            'data-id': item.id,
-            title: 'View Memory',
-            'aria-label': 'View Memory',
-          }, [el('i', { className: 'codicon codicon-eye' })]),
-        ]),
-      );
+      // Foreign Memories rows (any non-workspace selection — foreign repo OR
+      // foreign branch in the workspace repo) mirror the KB-tab timeline
+      // view: the primary inline affordance is "Copy Recall Prompt"
+      // (codicon-copy), not "View Memory" (codicon-eye). The View Memory
+      // route still lives in the row's hover-card + the contextmenu below,
+      // so it's not lost — just demoted from the primary tap-target because
+      // out-of-workspace browsing is dominated by "pull this memory into
+      // the AI context" rather than "open the heavy detail panel".
+      // isViewingForeign() returns true for both flavors (see its
+      // definition: not (repoMatch and branchMatch)), so workspace-view rows
+      // (same repo + same branch) keep the eye icon unchanged.
+      const inlineBtn = isViewingForeign()
+        ? attachTextTip(
+            el('button', {
+              type: 'button',
+              className: 'iconbtn',
+              'data-inline': 'copy-recall',
+              'data-id': item.id,
+              'aria-label': 'Copy Recall Prompt',
+            }, [el('i', { className: 'codicon codicon-copy' })]),
+            'Copy Recall Prompt',
+          )
+        : attachTextTip(
+            el('button', {
+              type: 'button',
+              className: 'iconbtn',
+              'data-inline': 'viewSummary',
+              'data-id': item.id,
+              'aria-label': 'View Memory',
+            }, [el('i', { className: 'codicon codicon-eye' })]),
+            'View Memory',
+          );
+      kids.push(el('span', { className: 'inline-actions' }, [inlineBtn]));
     } else {
       kids.push(el('span', { className: 'inline-actions' }));
     }
@@ -2854,7 +3051,7 @@ export function buildSidebarScript(): string {
     }
     // Stash the four fields we need to dispatch openCommitFileChange via
     // data-* attributes — DOM-only state, no extra lookup table needed.
-    return el('div', {
+    return attachTextTip(el('div', {
       className: 'tree-node',
       'data-indent': String(depth),
       'data-context': 'commitFile',
@@ -2863,8 +3060,7 @@ export function buildSidebarScript(): string {
       'data-rel-path':    cf.relativePath || '',
       'data-status-code': cf.statusCode || '',
       'data-old-path':    cf.oldPath || '',
-      title: item.tooltip || '',
-    }, kids);
+    }, kids), item.tooltip || '');
   }
 
   function renderInlineButtons(item) {
@@ -2877,19 +3073,19 @@ export function buildSidebarScript(): string {
     const isLinearIssue = ctx === 'linearissue';
     if (isPlanLike) {
       return el('span', { className: 'inline-actions' }, [
-        el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'edit', 'data-id': item.id, title: 'Edit', text: '✎' }),
-        el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'remove', 'data-id': item.id, title: 'Remove', text: '🗑' }),
+        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'edit', 'data-id': item.id, text: '✎' }), 'Edit'),
+        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'remove', 'data-id': item.id, text: '🗑' }), 'Remove'),
       ]);
     }
     if (isLinearIssue) {
       return el('span', { className: 'inline-actions' }, [
-        el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'open-linear', 'data-id': item.id, title: 'Open in Linear', text: '↗' }),
-        el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'ignore-linear', 'data-id': item.id, title: 'Ignore', text: '🗑' }),
+        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'open-linear', 'data-id': item.id, text: '↗' }), 'Open in Linear'),
+        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'ignore-linear', 'data-id': item.id, text: '🗑' }), 'Ignore'),
       ]);
     }
     if (isFile) {
       return el('span', { className: 'inline-actions' }, [
-        el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'discard', 'data-id': item.id, title: 'Discard', text: '↻' }),
+        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'discard', 'data-id': item.id, text: '↻' }), 'Discard'),
       ]);
     }
     return null;
@@ -2906,13 +3102,12 @@ export function buildSidebarScript(): string {
     }
     const inline = renderInlineButtons(item);
     if (inline) kids.push(inline);
-    return el('div', {
+    return attachTextTip(el('div', {
       className: 'tree-node',
       'data-indent': String(depth),
       'data-context': item.contextValue || '',
       'data-id': item.id,
-      title: item.tooltip || '',
-    }, kids);
+    }, kids), item.tooltip || '');
   }
 
   // Context menu: show and handle clicks.
@@ -2966,6 +3161,24 @@ export function buildSidebarScript(): string {
   // must run before the section-header collapse-toggle catch-all — otherwise
   // every action-button click also collapses the panel.
   tabContents.branch.addEventListener('click', function(e) {
+    // Foreign-banner "Switch back to current workspace" — sent as TWO
+    // selection:request messages because the host handler is single-field
+    // if/else (a combined { repoName, branchName } payload would silently
+    // drop the branch). First message resets the repo (host auto-picks
+    // branches[0]); second message overrides that pick with the workspace
+    // branch. Net effect: webview state.selectedRepoName / selectedBranchName
+    // collapse back to the workspace identity and the chrome lifts.
+    const resetBtn = e.target.closest('[data-action="reset-to-workspace"]');
+    if (resetBtn) {
+      if (state.currentRepoName) {
+        vscode.postMessage({ type: 'selection:request', repoName: state.currentRepoName });
+      }
+      if (state.branchName) {
+        vscode.postMessage({ type: 'selection:request', branchName: state.branchName });
+      }
+      e.stopPropagation();
+      return;
+    }
     // Bottom-of-section Commit Memory CTA — not gated on .section-actions
     // because it lives inside .section-body, not the header. Routes to the
     // same command as the header sparkle iconbtn.
@@ -3078,6 +3291,15 @@ export function buildSidebarScript(): string {
         // (cross-repo) and into the "memory" panel slot in foreign mode.
         const cmd = isViewingForeign() ? 'jollimemory.viewMemorySummary' : 'jollimemory.viewSummary';
         vscode.postMessage({ type: 'command', command: cmd, args: [id] });
+      }
+      if (action === 'copy-recall') {
+        // Foreign Memories rows (any non-workspace repo/branch) expose
+        // Copy Recall Prompt as the primary inline action (matches the
+        // KB-tab timeline view's copy-icon idiom). The command is the same
+        // one the KB tab's memory rows dispatch — copyRecallPrompt resolves
+        // the commit hash through the multi-repo summary index so it works
+        // for both workspace and foreign hashes.
+        vscode.postMessage({ type: 'command', command: 'jollimemory.copyRecallPrompt', args: [id] });
       }
       if (action === 'open-linear') {
         vscode.postMessage({ type: 'branch:openLinearIssue', mapKey: id });
@@ -3274,6 +3496,23 @@ export function buildSidebarScript(): string {
     const ctx = row.getAttribute('data-context');
     const id = row.getAttribute('data-id');
     if (ctx === 'commit' || ctx === 'commitWithMemory') {
+      // Foreign Memories rows (any non-workspace selection — foreign repo
+      // OR foreign branch in the workspace repo, as defined by
+      // isViewingForeign) get the same 3-action menu the KB-tab timeline
+      // view exposes: Copy Recall Prompt / Open in Claude Code / sep /
+      // View Memory. View Memory routes through viewMemorySummary so it
+      // resolves the commit through the multi-repo summary index,
+      // matching the KB tab's behavior. Workspace-view rows (same repo +
+      // same branch) keep the original View Memory + Copy Commit Hash pair.
+      if (isViewingForeign() && ctx === 'commitWithMemory') {
+        showContextMenu(e.clientX, e.clientY, [
+          { label: 'Copy Recall Prompt',  command: 'jollimemory.copyRecallPrompt',  args: [id] },
+          { label: 'Open in Claude Code', command: 'jollimemory.openInClaudeCode',  args: [id] },
+          { separator: true },
+          { label: 'View Memory',         command: 'jollimemory.viewMemorySummary', args: [id] },
+        ]);
+        return;
+      }
       const items = [];
       if (ctx === 'commitWithMemory') {
         items.push({ label: 'View Memory',      command: 'jollimemory.viewSummary',    args: [id] });

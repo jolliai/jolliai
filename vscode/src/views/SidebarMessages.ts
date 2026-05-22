@@ -195,6 +195,16 @@ export interface FolderNode {
 	 */
 	readonly fileBranch?: string;
 	/**
+	 * File-only. True when the file is manifest-tracked AND its on-disk sha256
+	 * differs from the manifest fingerprint — i.e. the user edited the
+	 * visible `.md` outside the system. Drives the trailing ✎ marker in the
+	 * KB folders tree, mirroring `MemoryFileDecorationProvider`'s badge on
+	 * the native explorer. Computed in `KbFoldersService.listInRepo`;
+	 * absent (undefined / false) for directories, untracked files, and
+	 * cross-repo nodes from `listParentRoot` that have no manifest context.
+	 */
+	readonly isDiverged?: boolean;
+	/**
 	 * Directory-only. True when this node is a top-level repo folder under the
 	 * Memory Bank parent (i.e. `<kbParent>/<repoName>/`), as opposed to a
 	 * subdirectory inside a repo. Lets the renderer apply repo-level styling
@@ -355,6 +365,14 @@ export interface BranchMemoryItem {
 	readonly repoName: string;
 	/** ms since epoch derived from `commitDate` / `generatedAt`. */
 	readonly timestamp: number;
+	/**
+	 * Structured hover-card data — same shape as MemoryItem.hover so the
+	 * webview's renderHoverCard / lookupHoverEntry can render foreign-mode
+	 * memory rows through the same popover the KB-tab Memories list uses.
+	 * Optional because callers built before the Branch-tab foreign hover-card
+	 * landed may still pass items without it.
+	 */
+	readonly hover?: MemoryHover;
 }
 
 /**

@@ -32,6 +32,15 @@ const { mockRefreshConversationsPanel } = vi.hoisted(() => ({
 	mockRefreshConversationsPanel: vi.fn(() => Promise.resolve()),
 }));
 
+const { mockRefreshKnowledgeBaseFolders } = vi.hoisted(() => ({
+	mockRefreshKnowledgeBaseFolders: vi.fn(),
+}));
+
+const { mockNotifyEnabledChanged, mockNotifyAuthChanged } = vi.hoisted(() => ({
+	mockNotifyEnabledChanged: vi.fn(),
+	mockNotifyAuthChanged: vi.fn(),
+}));
+
 const { isWorkerBusy } = vi.hoisted(() => ({
 	isWorkerBusy: vi.fn(),
 }));
@@ -259,6 +268,39 @@ const {
 		invalidateEntriesCache: vi.fn(),
 		getCurrentBranch: vi.fn().mockResolvedValue("main"),
 		reloadStorage: vi.fn(),
+		// Bridge wrappers added when storage threading replaced direct
+		// SummaryStore calls in `migrateIndexIfNeeded`. Delegate to the
+		// hoisted SummaryStore mocks so existing assertions on
+		// `indexNeedsMigration` / `migrateIndexToV3` keep working without
+		// rewriting every "called with /test/workspace" check.
+		indexNeedsMigration: vi.fn(() => indexNeedsMigration("/test/workspace")),
+		migrateIndexToV3: vi.fn(() => migrateIndexToV3("/test/workspace")),
+		// Memory Bank `.md` edit-protection probe. Default false so existing
+		// openMemoryFile tests keep the rich-panel branch; divergence-specific
+		// tests override per-call via mockResolvedValueOnce.
+		isMemoryFileDivergedOnDisk: vi.fn().mockResolvedValue(false),
+		// Memory Bank `.md` revert dispatcher source-of-truth. Default null so
+		// the registered command short-circuits to the "cannot revert" warning
+		// in tests that don't care about the resolve step; revert-specific
+		// tests override per-call via mockResolvedValueOnce / mockResolvedValue.
+		resolveMemoryFile: vi.fn().mockResolvedValue(null),
+		// Read-storage factories — Extension.ts threads the returned
+		// FolderStorage into SummaryWebviewPanel.show() as `readStorage`
+		// so transcripts/plans/notes load from the Memory Bank folder
+		// layer for BOTH local and foreign panels. Default null mirrors
+		// the "fresh repo, no KB folder yet" case: panel falls back to
+		// bridge-default reads — preserves legacy assertions in tests
+		// that don't care about storage threading.
+		createStorageForRepo: vi.fn().mockResolvedValue(null),
+		createReadStorageForCurrentRepo: vi.fn().mockResolvedValue(null),
+		// Linear-issue surface — used by the three Linear-issue commands and the
+		// shared resolveLinearIssueForCommand helper. Default: empty list so the
+		// "not found" warning branch is the test-driven path; tests that want
+		// the resolve+forward path push entries with mockResolvedValueOnce.
+		listLinearIssues: vi.fn().mockResolvedValue([]),
+		openLinearIssue: vi.fn().mockResolvedValue(undefined),
+		openLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
+		ignoreLinearIssue: vi.fn().mockResolvedValue(undefined),
 	};
 
 	const mockCommitCommand_ = { execute: vi.fn().mockResolvedValue(undefined) };
@@ -356,6 +398,7 @@ const {
 	registerTextDocumentContentProvider,
 	openTextDocument,
 	onDidSaveTextDocument,
+	onDidChangeActiveTextEditor,
 	checkboxCallbacks,
 	visibilityCallbacks,
 	openExternal,
@@ -414,6 +457,7 @@ const {
 		registerTextDocumentContentProvider: vi.fn(() => ({ dispose: vi.fn() })),
 		openTextDocument: vi.fn().mockResolvedValue({ uri: "mock-doc" }),
 		onDidSaveTextDocument: vi.fn(() => ({ dispose: vi.fn() })),
+		onDidChangeActiveTextEditor: vi.fn(() => ({ dispose: vi.fn() })),
 		checkboxCallbacks: checkboxCallbacks_,
 		visibilityCallbacks: visibilityCallbacks_,
 		openExternal: vi.fn().mockResolvedValue(true),
@@ -486,6 +530,14 @@ vi.mock("vscode", () => ({
 		})),
 		registerFileDecorationProvider: vi.fn(() => ({ dispose: vi.fn() })),
 		registerUriHandler: vi.fn(() => ({ dispose: vi.fn() })),
+		// Memory Bank context-key wiring subscribes to active-editor changes
+		// to set `jollimemory.isMemoryBankFile` for the explorer right-click
+		// menu. Initial-call branch is exercised via `activeTextEditor =
+		// undefined`; tests that need the truthy `(await resolveMemoryFile)
+		// !== null` branch read the callback off `mock.calls[0][0]` and
+		// invoke it with a stub editor.
+		onDidChangeActiveTextEditor,
+		activeTextEditor: undefined,
 		// Pass-through Progress mock — runs the user's callback so commands that
 		// wrap work in `vscode.window.withProgress(...)` (e.g. SquashCommand's LLM
 		// call) actually execute that work in tests instead of silently no-oping.
@@ -636,6 +688,17 @@ vi.mock("./commands/PushCommand.js", () => ({
 
 vi.mock("./commands/SquashCommand.js", () => ({
 	SquashCommand: MockSquashCommand,
+}));
+
+const { selectAllConversationsCommand, selectAllPlansAndNotesCommand } =
+	vi.hoisted(() => ({
+		selectAllConversationsCommand: vi.fn().mockResolvedValue(undefined),
+		selectAllPlansAndNotesCommand: vi.fn().mockResolvedValue(undefined),
+	}));
+
+vi.mock("./commands/SelectAllSelection.js", () => ({
+	selectAllConversationsCommand,
+	selectAllPlansAndNotesCommand,
 }));
 
 vi.mock("./core/PlanService.js", () => ({
@@ -802,10 +865,11 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		}
 		resolveWebviewView() {}
 		dispose() {}
-		refreshKnowledgeBaseFolders() {}
+		refreshKnowledgeBaseFolders = mockRefreshKnowledgeBaseFolders;
 		refreshConversationsPanel = mockRefreshConversationsPanel;
-		notifyEnabledChanged() {}
-		notifyAuthChanged() {}
+		refreshPlansPanel() {}
+		notifyEnabledChanged = mockNotifyEnabledChanged;
+		notifyAuthChanged = mockNotifyAuthChanged;
 		notifyConfiguredChanged() {}
 		setBadge() {}
 		// Tracked via a shared vi.fn so saveAnthropicApiKey-error tests can
@@ -993,6 +1057,42 @@ describe("Extension", () => {
 			// Should register stub commands so buttons don't throw "command not found"
 			expect(registerCommand).toHaveBeenCalled();
 			expect(ctx.subscriptions.length).toBeGreaterThan(0);
+		});
+
+		// Degraded-mode SidebarWebviewProvider receives two callback deps —
+		// `executeCommand` (passes through to vscode.commands.executeCommand)
+		// and `getInitialState` (returns a no-workspace banner-shaped state).
+		// Invoking them exercises the inline arrow bodies that the webview
+		// would otherwise call at first render; without these assertions the
+		// branches stay uncovered.
+		it("wires degraded-sidebar deps to executeCommand and a stable initial state", async () => {
+			getWorkspaceRoot.mockReturnValue(undefined);
+			const ctx = makeContext();
+			activate(ctx);
+
+			const deps = sidebarDepsCaptured as {
+				executeCommand: (cmd: string, ...args: unknown[]) => unknown;
+				getInitialState: () => {
+					enabled: boolean;
+					configured: boolean;
+					activeTab: string;
+					degradedReason: string;
+				};
+			};
+			expect(typeof deps.executeCommand).toBe("function");
+
+			executeCommand.mockClear();
+			await deps.executeCommand("jollimemory.openFolder", "arg1");
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.openFolder",
+				"arg1",
+			);
+
+			const state = deps.getInitialState();
+			expect(state.enabled).toBe(false);
+			expect(state.configured).toBe(true);
+			expect(state.activeTab).toBe("status");
+			expect(state.degradedReason).toBe("no-workspace");
 		});
 	});
 
@@ -1394,6 +1494,37 @@ describe("Extension", () => {
 			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
 		});
 
+		// runStaleChildCleanup is best-effort: it can return a state object that
+		// omits the new `staleChildCleanup` slot (no work was needed, or partial
+		// state from an older engine version). The post-run log line then has
+		// `result.staleChildCleanup?.completedAt` resolve to undefined and must
+		// fall back to "n/a" rather than logging "completedAt=undefined". Covers
+		// the right-hand `?? "n/a"` arm of the template literal.
+		it("logs `completedAt=n/a` when runStaleChildCleanup returns no staleChildCleanup field", async () => {
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
+				status: "completed",
+				totalEntries: 5,
+				migratedEntries: 5,
+			});
+			mockMigrationEngineInstance.runStaleChildCleanup.mockReset();
+			mockMigrationEngineInstance.runStaleChildCleanup.mockResolvedValue({
+				status: "completed",
+				totalEntries: 5,
+				migratedEntries: 5,
+				// no staleChildCleanup field
+			});
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(info).toHaveBeenCalledWith(
+					"activate",
+					"KB v3 stale-child cleanup: completedAt=n/a",
+				);
+			});
+		});
+
 		it("still runs runStaleChildCleanup even when the legacy 0.99.2 leafCleanup.completedAt is set (corrective re-run)", async () => {
 			// Critical regression: 0.99.2 users carry leafCleanup.completedAt
 			// from the inverted pass. They must NOT be short-circuited — the
@@ -1429,6 +1560,26 @@ describe("Extension", () => {
 			expect(
 				mockMigrationEngineInstance.runStaleChildCleanup,
 			).not.toHaveBeenCalled();
+		});
+
+		// initializeKB is a fire-and-forget async block at activate time —
+		// any throw inside must funnel through the surrounding catch so the
+		// extension doesn't unhandled-reject during activation. Pinned by
+		// rejecting orphan.exists() (the first await inside the try block)
+		// and asserting the catch-side log.error gets fired with the right
+		// log key.
+		it("logs the catch path when initializeKB throws (orphan.exists rejects)", async () => {
+			mockOrphanInstance.exists.mockRejectedValueOnce(new Error("git failed"));
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(error).toHaveBeenCalledWith(
+					"activate",
+					"KB folder init/migration failed",
+					expect.any(Error),
+				);
+			});
 		});
 
 		it("does nothing when orphan branch does not exist", async () => {
@@ -1582,6 +1733,54 @@ describe("Extension", () => {
 
 				expect(mockStatusStore.refresh).toHaveBeenCalled();
 			});
+
+			// refreshStatus tracks `currentEnabled` / `currentAuthenticated`
+			// across calls and only notifies the sidebar when the value actually
+			// changes. The diff-based notify keeps the webview from re-rendering
+			// on every poll. Covers the `status.enabled !== currentEnabled` and
+			// `nextAuth !== currentAuthenticated` if-true branches by flipping
+			// each after activation.
+			it("notifies the sidebar when enabled / auth state flip on a subsequent refresh", async () => {
+				// activate's initialLoad already invoked the handler once with
+				// the default mock state (enabled:true, authToken:undefined),
+				// seeding currentEnabled=true / currentAuthenticated=false.
+				// Flip both, then call refreshStatus directly so the diff
+				// branches fire.
+				mockBridge.getStatus.mockResolvedValue({
+					enabled: false,
+					gitHookInstalled: true,
+					worktreeHooksInstalled: true,
+				});
+				loadConfig.mockResolvedValueOnce({
+					authToken: "tok-123",
+				});
+				mockNotifyEnabledChanged.mockClear();
+				mockNotifyAuthChanged.mockClear();
+
+				const handler = getRegisteredCommand("jollimemory.refreshStatus");
+				await handler();
+
+				expect(mockNotifyEnabledChanged).toHaveBeenCalledWith(false);
+				expect(mockNotifyAuthChanged).toHaveBeenCalledWith(true);
+			});
+
+			// Companion to the test above: refreshStatus's catch block
+			// surfaces any failure through handleError so the activate-time
+			// catch doesn't silently swallow it.
+			it("routes errors through handleError when refreshStatus throws", async () => {
+				mockBridge.getStatus.mockRejectedValueOnce(
+					new Error("status fetch failed"),
+				);
+
+				const handler = getRegisteredCommand("jollimemory.refreshStatus");
+				await handler();
+
+				expect(error).toHaveBeenCalledWith(
+					"cmd",
+					"refreshStatus failed: status fetch failed",
+					expect.any(Error),
+				);
+			});
 		});
 
 		describe("refreshFiles", () => {
@@ -1608,6 +1807,194 @@ describe("Extension", () => {
 				handler();
 
 				expect(mockCommitsStore.toggleSelectAll).toHaveBeenCalled();
+			});
+		});
+
+		// ── Linear-issue commands ──────────────────────────────────────────────
+		// Three thin command wrappers that share `resolveLinearIssueForCommand`.
+		// Pinned together because the wrapping logic is identical: typeof-narrow
+		// the arg into a mapKey, log, resolve, dispatch. A regression in any
+		// branch tends to break all three; the tests exercise both the "resolved"
+		// path (bridge.openLinearIssue is called) and the "missing" path (warning
+		// modal, no dispatch).
+
+		describe("Linear-issue commands", () => {
+			beforeEach(() => {
+				mockBridge.listLinearIssues.mockReset().mockResolvedValue([]);
+				mockBridge.openLinearIssue.mockClear();
+				mockBridge.openLinearIssueMarkdown.mockClear();
+				mockBridge.ignoreLinearIssue.mockClear();
+				showWarningMessage.mockClear();
+			});
+
+			it("openLinearIssue: dispatches to bridge when mapKey resolves", async () => {
+				const info = {
+					mapKey: "ENG-1",
+					issue: { mapKey: "ENG-1", url: "https://linear.app/x" },
+				};
+				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+
+				const handler = getRegisteredCommand("jollimemory.openLinearIssue");
+				await handler("ENG-1");
+
+				expect(mockBridge.openLinearIssue).toHaveBeenCalledWith(info);
+				expect(showWarningMessage).not.toHaveBeenCalled();
+			});
+
+			it("openLinearIssue: shows a warning toast when mapKey is no longer in the list", async () => {
+				const handler = getRegisteredCommand("jollimemory.openLinearIssue");
+				await handler("ENG-archived");
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("ENG-archived"),
+				);
+				expect(mockBridge.openLinearIssue).not.toHaveBeenCalled();
+			});
+
+			it("openLinearIssue: extracts mapKey from a LinearIssueItem object", async () => {
+				const info = {
+					mapKey: "ENG-2",
+					issue: { mapKey: "ENG-2", url: "https://linear.app/y" },
+				};
+				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+
+				const handler = getRegisteredCommand("jollimemory.openLinearIssue");
+				await handler({ issue: { mapKey: "ENG-2" } });
+
+				expect(mockBridge.openLinearIssue).toHaveBeenCalledWith(info);
+			});
+
+			it("openLinearIssueMarkdown: dispatches to bridge when mapKey resolves", async () => {
+				const info = {
+					mapKey: "ENG-3",
+					issue: { mapKey: "ENG-3" },
+				};
+				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+
+				const handler = getRegisteredCommand(
+					"jollimemory.openLinearIssueMarkdown",
+				);
+				await handler("ENG-3");
+
+				expect(mockBridge.openLinearIssueMarkdown).toHaveBeenCalledWith(info);
+			});
+
+			it("openLinearIssueMarkdown: extracts mapKey from a LinearIssueItem object", async () => {
+				const info = {
+					mapKey: "ENG-md-2",
+					issue: { mapKey: "ENG-md-2" },
+				};
+				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+
+				const handler = getRegisteredCommand(
+					"jollimemory.openLinearIssueMarkdown",
+				);
+				await handler({ issue: { mapKey: "ENG-md-2" } });
+
+				expect(mockBridge.openLinearIssueMarkdown).toHaveBeenCalledWith(info);
+			});
+
+			it("ignoreLinearIssue: extracts mapKey from a LinearIssueItem object", async () => {
+				const info = {
+					mapKey: "ENG-ign-2",
+					issue: { mapKey: "ENG-ign-2" },
+				};
+				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+				mockPlansStore.refresh.mockClear();
+
+				const handler = getRegisteredCommand("jollimemory.ignoreLinearIssue");
+				await handler({ issue: { mapKey: "ENG-ign-2" } });
+
+				expect(mockBridge.ignoreLinearIssue).toHaveBeenCalledWith("ENG-ign-2");
+				expect(mockPlansStore.refresh).toHaveBeenCalled();
+			});
+
+			it("openLinearIssueMarkdown: warns on miss without dispatching", async () => {
+				const handler = getRegisteredCommand(
+					"jollimemory.openLinearIssueMarkdown",
+				);
+				await handler("ENG-missing");
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("ENG-missing"),
+				);
+				expect(mockBridge.openLinearIssueMarkdown).not.toHaveBeenCalled();
+			});
+
+			it("ignoreLinearIssue: marks the issue ignored and refreshes plans", async () => {
+				const info = {
+					mapKey: "ENG-4",
+					issue: { mapKey: "ENG-4" },
+				};
+				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+				mockPlansStore.refresh.mockClear();
+
+				const handler = getRegisteredCommand("jollimemory.ignoreLinearIssue");
+				await handler("ENG-4");
+
+				expect(mockBridge.ignoreLinearIssue).toHaveBeenCalledWith("ENG-4");
+				expect(mockPlansStore.refresh).toHaveBeenCalled();
+			});
+
+			it("ignoreLinearIssue: no-op when mapKey is no longer in the list", async () => {
+				const handler = getRegisteredCommand("jollimemory.ignoreLinearIssue");
+				await handler("ENG-gone");
+
+				expect(mockBridge.ignoreLinearIssue).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("selectAllConversations / selectAllPlansAndNotes", () => {
+			// Sidebar-side bulk-select commands. The activate-time wiring forwards
+			// workspaceRoot + activeSessions + plansProvider into the shared command
+			// function, plus an `onChanged` callback that re-pushes the affected
+			// panel. The onChanged callback fires inside the command function
+			// (mocked), so we invoke it directly to assert the wiring rather than
+			// re-mocking the inner exclusion-state machinery.
+			it("invokes selectAllConversationsCommand and forwards a refresh-Conversations callback", async () => {
+				const handler = getRegisteredCommand(
+					"jollimemory.selectAllConversations",
+				);
+				selectAllConversationsCommand.mockClear();
+				mockRefreshConversationsPanel.mockClear();
+
+				await handler();
+
+				expect(selectAllConversationsCommand).toHaveBeenCalledWith(
+					expect.objectContaining({
+						cwd: "/test/workspace",
+						onChanged: expect.any(Function),
+					}),
+				);
+				// Invoke the captured onChanged so the inner arrow function body
+				// (sidebar refresh) is counted as covered.
+				const ctxArg = selectAllConversationsCommand.mock.calls[0]?.[0] as {
+					onChanged: () => unknown;
+				};
+				await ctxArg.onChanged();
+				expect(mockRefreshConversationsPanel).toHaveBeenCalled();
+			});
+
+			it("invokes selectAllPlansAndNotesCommand and forwards a refresh-Plans callback", async () => {
+				const handler = getRegisteredCommand(
+					"jollimemory.selectAllPlansAndNotes",
+				);
+				selectAllPlansAndNotesCommand.mockClear();
+				await handler();
+
+				expect(selectAllPlansAndNotesCommand).toHaveBeenCalledWith(
+					expect.objectContaining({
+						cwd: "/test/workspace",
+						onChanged: expect.any(Function),
+					}),
+				);
+				const ctxArg = selectAllPlansAndNotesCommand.mock.calls[0]?.[0] as {
+					onChanged: () => unknown;
+				};
+				// Invoking onChanged exercises the inner arrow body
+				// (sidebarProvider.refreshPlansPanel()) — the stub returns
+				// undefined synchronously so we just assert it doesn't throw.
+				expect(() => ctxArg.onChanged()).not.toThrow();
 			});
 		});
 
@@ -1667,6 +2054,13 @@ describe("Extension", () => {
 					mockBridge,
 					expect.any(String),
 					"commit",
+					// foreignRepoName / foreignRepoUrl: null for local viewSummary.
+					// readStorage: null in this default mock setup
+					// (createReadStorageForCurrentRepo returns null), proving the
+					// fallback path stays available for fresh repos.
+					null,
+					null,
+					null,
 				);
 			});
 
@@ -1738,6 +2132,10 @@ describe("Extension", () => {
 					"memory",
 					null,
 					null,
+					// readStorage: null in default mock (no kbRoot match);
+					// non-null cases are exercised in the foreign-origin test
+					// further down where createStorageForRepo is set up explicitly.
+					null,
 				);
 			});
 
@@ -1762,6 +2160,7 @@ describe("Extension", () => {
 					mockBridge,
 					expect.any(String),
 					"memory",
+					null,
 					null,
 					null,
 				);
@@ -1793,6 +2192,85 @@ describe("Extension", () => {
 					"memory",
 					"other-repo",
 					"https://github.com/other/repo.git",
+					// readStorage: foreign hit calls createStorageForRepo; default
+					// mock returns null so the assertion stays null here. A
+					// dedicated foreign-storage-threading test below pins the
+					// non-null wiring with mockResolvedValueOnce.
+					null,
+				);
+			});
+
+			it("threads the foreign FolderStorage into the panel when createStorageForRepo resolves non-null", async () => {
+				// Pins the non-null branch of the readStorage ternary that
+				// Extension.ts uses to forward foreign reads down into the
+				// SummaryWebviewPanel: without this, transcripts / plans /
+				// notes on the panel still fall back to the workspace's
+				// default storage instead of the foreign FolderStorage.
+				const summary = { hash: "fff111", content: "foreign memory" };
+				const foreignStorage = { kind: "foreign-storage" };
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
+					summary,
+					sourceRepoName: "other-repo",
+					sourceRemoteUrl: "https://github.com/other/repo.git",
+				});
+				mockBridge.createStorageForRepo.mockResolvedValueOnce({
+					storage: foreignStorage,
+					kbRoot: "/mock/kb/other-repo",
+				});
+
+				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
+				await handler({ entry: { commitHash: "fff1111111111" } });
+
+				expect(mockBridge.createStorageForRepo).toHaveBeenCalledWith(
+					"other-repo",
+					"https://github.com/other/repo.git",
+				);
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					summary,
+					expect.anything(),
+					"/test/workspace",
+					mockBridge,
+					expect.any(String),
+					"memory",
+					"other-repo",
+					"https://github.com/other/repo.git",
+					foreignStorage,
+				);
+			});
+
+			it("threads the current-repo FolderStorage into the panel when createReadStorageForCurrentRepo resolves non-null (local hit)", async () => {
+				// Same coverage role as the foreign-mode test above, but for
+				// the local-hit ternary branch in viewMemorySummary — the
+				// "uniform reads from the Memory Bank folder layer" goal
+				// (orphan → folder consistency) hinges on this fallback.
+				const summary = { hash: "loc222", content: "local memory" };
+				const localStorage = { kind: "local-folder-storage" };
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValue({
+					summary,
+					sourceRepoName: null,
+					sourceRemoteUrl: null,
+				});
+				mockBridge.createReadStorageForCurrentRepo.mockResolvedValueOnce({
+					storage: localStorage,
+					kbRoot: "/mock/kb/cur",
+				});
+
+				const handler = getRegisteredCommand("jollimemory.viewMemorySummary");
+				await handler({ entry: { commitHash: "loc2222222222" } });
+
+				expect(
+					mockBridge.createReadStorageForCurrentRepo,
+				).toHaveBeenCalled();
+				expect(MockSummaryWebviewPanel.show).toHaveBeenCalledWith(
+					summary,
+					expect.anything(),
+					"/test/workspace",
+					mockBridge,
+					expect.any(String),
+					"memory",
+					null,
+					null,
+					localStorage,
 				);
 			});
 
@@ -1931,14 +2409,70 @@ describe("Extension", () => {
 
 				await handler("note-1", "My Note");
 
+				// Third arg is the foreign-storage override — `undefined`
+				// here because the command was invoked without foreign
+				// provenance, so showNotePreview passes the default storage.
 				expect(readNoteFromBranch).toHaveBeenCalledWith(
 					"note-1",
 					"/test/workspace",
+					undefined,
 				);
 				expect(openTextDocument).toHaveBeenCalled();
 				expect(executeCommand).toHaveBeenCalledWith(
 					"markdown.showPreview",
 					expect.anything(),
+				);
+			});
+
+			it("passes null to createStorageForRepo when foreignRepoUrl is undefined for previewNote", async () => {
+				mockBridge.createStorageForRepo.mockResolvedValueOnce({
+					storage: { kind: "foreign-note-storage-no-url" },
+					kbRoot: "/mock/kb/no-url",
+				});
+				readNoteFromBranch.mockResolvedValue("# body");
+
+				const handler = getRegisteredCommand("jollimemory.previewNote");
+				await handler(
+					"note-7",
+					"Foreign Note",
+					"other-repo",
+					// foreignRepoUrl deliberately omitted
+				);
+
+				expect(mockBridge.createStorageForRepo).toHaveBeenCalledWith(
+					"other-repo",
+					null,
+				);
+			});
+
+			it("resolves the foreign FolderStorage when previewNote is invoked with a foreignRepoName hint", async () => {
+				// Foreign branch of the previewNote ternary — mirrors the
+				// editPlan foreign test above. Without this, foreign-mode
+				// note previews fall back to the workspace's note storage
+				// and either render the wrong body or error out.
+				const foreignStorage = { kind: "foreign-note-storage" };
+				mockBridge.createStorageForRepo.mockResolvedValueOnce({
+					storage: foreignStorage,
+					kbRoot: "/mock/kb/other",
+				});
+				readNoteFromBranch.mockResolvedValue("# Foreign note body");
+
+				const handler = getRegisteredCommand("jollimemory.previewNote");
+				await handler(
+					"note-7",
+					"Foreign Note",
+					"other-repo",
+					"https://github.com/other/repo.git",
+				);
+
+				expect(mockBridge.createStorageForRepo).toHaveBeenCalledWith(
+					"other-repo",
+					"https://github.com/other/repo.git",
+				);
+				expect(readNoteFromBranch).toHaveBeenCalledWith(
+					"note-7",
+					"/test/workspace",
+					foreignStorage,
 				);
 			});
 
@@ -2006,9 +2540,76 @@ describe("Extension", () => {
 					plan: { slug: "my-plan", title: "My Plan", commitHash: "abc123" },
 				});
 
+				// Third arg is the foreign-storage override — `undefined`
+				// for this local invocation (no foreignRepoName supplied).
 				expect(readPlanFromBranch).toHaveBeenCalledWith(
 					"my-plan",
 					"/test/workspace",
+					undefined,
+				);
+			});
+
+			// Foreign repo with no URL hint: panel-side dispatch can pass
+			// foreignRepoName only (legacy panels, or repos whose remote URL
+			// hasn't been resolved yet). The `foreignRepoUrl ?? null` fallback
+			// must hand a literal `null` to bridge.createStorageForRepo
+			// instead of forwarding `undefined`, which would silently dispatch
+			// the cache-by-url indexer to a different bucket. Pinned so a
+			// future refactor that drops the `?? null` re-binds the URL-key
+			// behaviour.
+			it("passes null to createStorageForRepo when foreignRepoUrl is undefined for editPlan", async () => {
+				mockBridge.createStorageForRepo.mockResolvedValueOnce({
+					storage: { kind: "foreign-storage-no-url" },
+					kbRoot: "/mock/kb/no-url",
+				});
+				readPlanFromBranch.mockResolvedValue("# body");
+
+				const handler = getRegisteredCommand("jollimemory.editPlan");
+				await handler(
+					"my-plan",
+					true,
+					"My Plan",
+					"other-repo",
+					// foreignRepoUrl deliberately omitted
+				);
+
+				expect(mockBridge.createStorageForRepo).toHaveBeenCalledWith(
+					"other-repo",
+					null,
+				);
+			});
+
+			it("resolves the foreign FolderStorage when committed-plan preview is invoked with a foreignRepoName hint", async () => {
+				// Foreign branch of the committed-plan ternary: panel-side
+				// previewPlan dispatch passes foreignRepoName / Url; the
+				// command must call bridge.createStorageForRepo and thread
+				// the returned storage into showPlanPreview so the rendered
+				// preview reads the foreign repo's plan body, not the
+				// current workspace's.
+				const foreignStorage = { kind: "foreign-plan-storage" };
+				mockBridge.createStorageForRepo.mockResolvedValueOnce({
+					storage: foreignStorage,
+					kbRoot: "/mock/kb/other",
+				});
+				readPlanFromBranch.mockResolvedValue("# Foreign plan body");
+
+				const handler = getRegisteredCommand("jollimemory.editPlan");
+				await handler(
+					"my-plan",
+					true,
+					"My Plan",
+					"other-repo",
+					"https://github.com/other/repo.git",
+				);
+
+				expect(mockBridge.createStorageForRepo).toHaveBeenCalledWith(
+					"other-repo",
+					"https://github.com/other/repo.git",
+				);
+				expect(readPlanFromBranch).toHaveBeenCalledWith(
+					"my-plan",
+					"/test/workspace",
+					foreignStorage,
 				);
 			});
 
@@ -2590,9 +3191,12 @@ describe("Extension", () => {
 				const handler = getRegisteredCommand("jollimemory.previewNote");
 				await handler("note-123", "My Note");
 
+				// Third arg is the (now optional) foreign-storage override;
+				// undefined in this local invocation.
 				expect(readNoteFromBranch).toHaveBeenCalledWith(
 					"note-123",
 					"/test/workspace",
+					undefined,
 				);
 				expect(executeCommand).toHaveBeenCalledWith(
 					"markdown.showPreview",
@@ -2732,6 +3336,12 @@ describe("Extension", () => {
 						expect.any(String),
 						"kb",
 						null,
+						null,
+						// readStorage: null in default mock setup
+						// (createReadStorageForCurrentRepo mocked to null) — the
+						// panel falls back to bridge-default reads, which
+						// preserves legacy behavior for tests that don't care
+						// about storage threading.
 						null,
 					);
 					expect(executeCommand).not.toHaveBeenCalledWith(
@@ -2879,12 +3489,693 @@ describe("Extension", () => {
 						"kb",
 						"other-repo",
 						"https://github.com/other/repo.git",
+						// readStorage: foreign branch calls createStorageForRepo;
+						// default mock returns null. Storage-threading is pinned
+						// separately in JolliMemoryBridge.test.ts.
+						null,
 					);
 					expect(executeCommand).not.toHaveBeenCalledWith(
 						"markdown.showPreview",
 						expect.anything(),
 					);
 				});
+			});
+
+			// ── divergence routing (Task 9) ──────────────────────────────
+			// The clicked .md may be edited on disk by the user; in that
+			// case the JSON-derived SummaryWebviewPanel would silently
+			// disagree with the file contents. The handler probes
+			// `bridge.isMemoryFileDivergedOnDisk(absPath)` AFTER parsing
+			// frontmatter and BEFORE looking up the summary — when true,
+			// routes to `markdown.showPreview` (so the user sees their
+			// own edits) and surfaces a one-shot "[Revert] / [Dismiss]"
+			// info message. The `divergenceMessageShown` set is module-
+			// scoped, so the "only once per session per file" test below
+			// uses a path distinct from the other divergence tests to
+			// avoid cross-test bleed.
+			describe("openMemoryFile divergence routing", () => {
+				const FM_SUMMARY = `---\ntype: commit\ncommitHash: abcdef1234567890\n---\n# Body`;
+
+				afterEach(() => {
+					readFileSync.mockReset();
+					readFileSync.mockImplementation(() => {
+						const err = new Error("ENOENT") as Error & { code: string };
+						err.code = "ENOENT";
+						throw err;
+					});
+					mockBridge.isMemoryFileDivergedOnDisk.mockReset();
+					mockBridge.isMemoryFileDivergedOnDisk.mockResolvedValue(false);
+				});
+
+				it("routes a diverged summary .md to markdown.showPreview, not SummaryWebviewPanel", async () => {
+					readFileSync.mockReturnValueOnce(FM_SUMMARY);
+					mockBridge.isMemoryFileDivergedOnDisk.mockResolvedValueOnce(true);
+					showInformationMessage.mockResolvedValueOnce(undefined);
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/diverged-1.md");
+
+					expect(
+						mockBridge.isMemoryFileDivergedOnDisk,
+					).toHaveBeenCalledWith("/fake/diverged-1.md");
+					expect(MockSummaryWebviewPanel.show).not.toHaveBeenCalled();
+					expect(executeCommand).toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+					// The diverged path must NOT consult the cross-repo
+					// lookup — the panel branch is fully skipped.
+					expect(
+						mockBridge.getSummaryAnyRepoWithSource,
+					).not.toHaveBeenCalled();
+				});
+
+				it("routes a non-diverged summary .md to SummaryWebviewPanel as usual", async () => {
+					readFileSync.mockReturnValueOnce(FM_SUMMARY);
+					mockBridge.isMemoryFileDivergedOnDisk.mockResolvedValueOnce(false);
+					const summary = {
+						commitHash: "abcdef1234567890",
+						topics: [],
+					};
+					mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+						summary,
+						sourceRepoName: null,
+						sourceRemoteUrl: null,
+					});
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/clean-1.md");
+
+					expect(MockSummaryWebviewPanel.show).toHaveBeenCalled();
+					expect(showInformationMessage).not.toHaveBeenCalled();
+				});
+
+				it("dispatches jollimemory.revertMemoryFileEdits when the user picks 'Revert'", async () => {
+					readFileSync.mockReturnValueOnce(FM_SUMMARY);
+					mockBridge.isMemoryFileDivergedOnDisk.mockResolvedValueOnce(true);
+					showInformationMessage.mockResolvedValueOnce("Revert");
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/diverged-revert.md");
+
+					expect(executeCommand).toHaveBeenCalledWith(
+						"jollimemory.revertMemoryFileEdits",
+						"/fake/diverged-revert.md",
+					);
+					// Revert path returns early — markdown preview must NOT
+					// be opened as a fallback after dispatching revert.
+					expect(executeCommand).not.toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+				});
+
+				it("falls through to markdown.showPreview when the user picks 'Dismiss'", async () => {
+					readFileSync.mockReturnValueOnce(FM_SUMMARY);
+					mockBridge.isMemoryFileDivergedOnDisk.mockResolvedValueOnce(true);
+					showInformationMessage.mockResolvedValueOnce("Dismiss");
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					await handler("/fake/diverged-dismiss.md");
+
+					expect(executeCommand).not.toHaveBeenCalledWith(
+						"jollimemory.revertMemoryFileEdits",
+						expect.anything(),
+					);
+					expect(executeCommand).toHaveBeenCalledWith(
+						"markdown.showPreview",
+						expect.anything(),
+					);
+				});
+
+				it("shows the divergence info message only once per session per file", async () => {
+					// Each handler invocation re-parses frontmatter (via
+					// readFileSync) and re-probes divergence, but the
+					// module-scoped `divergenceMessageShown` set
+					// short-circuits the toast on the second click.
+					readFileSync.mockReturnValue(FM_SUMMARY);
+					mockBridge.isMemoryFileDivergedOnDisk.mockResolvedValue(true);
+					showInformationMessage.mockResolvedValue(undefined);
+
+					const handler = getRegisteredCommand("jollimemory.openMemoryFile");
+					// Use a path distinct from the other divergence tests
+					// in this block so we measure only the calls triggered
+					// from inside this single test.
+					await handler("/fake/diverged-once.md");
+					await handler("/fake/diverged-once.md");
+					await handler("/fake/diverged-once.md");
+
+					const callsForThisFile = showInformationMessage.mock.calls.filter(
+						(args: ReadonlyArray<unknown>) =>
+							typeof args[0] === "string" &&
+							args[0] ===
+								"This memory file has on-disk edits. System view is unavailable until reverted.",
+					);
+					expect(callsForThisFile.length).toBe(1);
+					// But every click still opens the markdown preview —
+					// suppression is on the toast, not on the routing.
+					const previewCalls = executeCommand.mock.calls.filter(
+						(args: ReadonlyArray<unknown>) =>
+							args[0] === "markdown.showPreview",
+					);
+					expect(previewCalls.length).toBe(3);
+				});
+			});
+		});
+
+		// ── revertMemoryFileEdits (Task 11) ─────────────────────────────────
+		// The command accepts an absPath, asks the bridge to locate the
+		// (FolderStorage, ManifestEntry) pair, and dispatches to the right
+		// regenerate helper based on the entry's `type`. Tests cover one
+		// dispatch per type plus the "not under any kbRoot" warning branch.
+		// Indented to the same level as other command handler describes —
+		// it tests a registered command, so it sits inside `command handlers`.
+		describe("revertMemoryFileEdits", () => {
+			const absPath = "/tmp/kb-fake/repo/main/foo-abcdef12.md";
+
+			it("calls forceRegenerateVisibleMarkdown for a commit-type file", async () => {
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue(true),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "main/foo-abcdef12.md",
+						fileId: "abcdef1234567890abcdef1234567890abcdef12",
+						type: "commit",
+						fingerprint: "old",
+						source: {
+							commitHash: "abcdef1234567890abcdef1234567890abcdef12",
+							branch: "main",
+							generatedAt: "2026-01-15T10:00:00Z",
+						},
+						title: "Add foo",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler(absPath);
+
+				expect(folderStorage.forceRegenerateVisibleMarkdown).toHaveBeenCalledWith(
+					expect.objectContaining({
+						commitHash: "abcdef1234567890abcdef1234567890abcdef12",
+						branch: "main",
+					}),
+				);
+				expect(folderStorage.regenerateVisiblePlan).not.toHaveBeenCalled();
+				expect(folderStorage.regenerateVisibleNote).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					`Reverted to system version: ${absPath}`,
+				);
+				// The KB folders tree caches `isDiverged` on each FolderNode;
+				// without an explicit refresh signal the ✎ marker would survive
+				// the revert until the next user-initiated refresh. Pin the
+				// refresh trigger so a future refactor that silently drops it
+				// re-introduces the stale-marker bug.
+				expect(mockRefreshKnowledgeBaseFolders).toHaveBeenCalled();
+			});
+
+			it("does NOT call refreshKnowledgeBaseFolders when the regenerate helper returns false", async () => {
+				// Failure path: the post-revert refresh trigger should only fire
+				// on a successful regenerate. A false return means the hidden
+				// source was missing, so the ✎ state on disk hasn't actually
+				// changed — re-rendering the tree would be wasted work and
+				// could even surprise the user with collapsing expanded folders.
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue(false),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "main/foo-abcdef12.md",
+						fileId: "abcdef1234567890abcdef1234567890abcdef12",
+						type: "commit",
+						fingerprint: "old",
+						source: {
+							commitHash: "abcdef1234567890abcdef1234567890abcdef12",
+							branch: "main",
+							generatedAt: "2026-01-15T10:00:00Z",
+						},
+						title: "Add foo",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler(absPath);
+
+				expect(mockRefreshKnowledgeBaseFolders).not.toHaveBeenCalled();
+			});
+
+			it("calls regenerateVisiblePlan for a plan-type file", async () => {
+				const planAbs = "/tmp/kb-fake/repo/feature-x/plan--abcd1234abcd1234.md";
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn().mockResolvedValue(true),
+					regenerateVisibleNote: vi.fn(),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "feature-x/plan--abcd1234abcd1234.md",
+						fileId: "plan:abcd1234abcd1234",
+						type: "plan",
+						fingerprint: "old",
+						source: { branch: "feature/x" },
+						title: "Plan x",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler(planAbs);
+
+				expect(folderStorage.regenerateVisiblePlan).toHaveBeenCalledWith(
+					"abcd1234abcd1234",
+					"feature/x",
+				);
+				expect(
+					folderStorage.forceRegenerateVisibleMarkdown,
+				).not.toHaveBeenCalled();
+				expect(folderStorage.regenerateVisibleNote).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					`Reverted to system version: ${planAbs}`,
+				);
+			});
+
+			it("calls regenerateVisibleNote for a note-type file", async () => {
+				const noteAbs = "/tmp/kb-fake/repo/fix-y/note--ef01ef01ef01ef01.md";
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn().mockResolvedValue(true),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "fix-y/note--ef01ef01ef01ef01.md",
+						fileId: "note:ef01ef01ef01ef01",
+						type: "note",
+						fingerprint: "old",
+						source: { branch: "fix/y" },
+						title: "Note y",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler(noteAbs);
+
+				expect(folderStorage.regenerateVisibleNote).toHaveBeenCalledWith(
+					"ef01ef01ef01ef01",
+					"fix/y",
+				);
+				expect(
+					folderStorage.forceRegenerateVisibleMarkdown,
+				).not.toHaveBeenCalled();
+				expect(folderStorage.regenerateVisiblePlan).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					`Reverted to system version: ${noteAbs}`,
+				);
+			});
+
+			it("warns when the file is not under any known kbRoot", async () => {
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce(null);
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("/random/elsewhere.md");
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					"Memory Bank: cannot revert — file is not under a known kbRoot.",
+				);
+				expect(showInformationMessage).not.toHaveBeenCalled();
+			});
+
+			it("warns and skips on non-string / empty inputs", async () => {
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("");
+				await handler(undefined);
+				await handler(42);
+
+				expect(mockBridge.resolveMemoryFile).not.toHaveBeenCalled();
+				expect(showInformationMessage).not.toHaveBeenCalled();
+				expect(showWarningMessage).not.toHaveBeenCalled();
+			});
+
+			it("warns when the regenerate helper returns false (hidden source missing)", async () => {
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue(false),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "main/foo-abcdef12.md",
+						fileId: "abcdef1234567890abcdef1234567890abcdef12",
+						type: "commit",
+						fingerprint: "old",
+						source: {
+							commitHash: "abcdef1234567890abcdef1234567890abcdef12",
+							branch: "main",
+							generatedAt: "2026-01-15T10:00:00Z",
+						},
+						title: "Add foo",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler(absPath);
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					`Memory Bank: revert failed for ${absPath} — hidden source missing.`,
+				);
+				expect(showInformationMessage).not.toHaveBeenCalled();
+			});
+
+			it("falls back to path-based reverse lookup when a legacy commit manifestEntry.source.branch is missing", async () => {
+				// Symmetric with the plan/note legacy reverse-lookup tests.
+				// Legacy commit entry has no source.branch but DOES carry
+				// source.generatedAt; revert must reverse-lookup the path's
+				// first segment via branches.json instead of defaulting to
+				// "main" silently — that default would overwrite the wrong
+				// branch's hidden JSON when the commit lives on a feature
+				// branch.
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue(true),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+					resolveBranchForFolder: vi.fn().mockReturnValue("feature/login"),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "feature-login/legacy-deadbeef.md",
+						fileId: "deadbeef1234567890",
+						type: "commit",
+						fingerprint: "old",
+						// source.branch intentionally absent → legacy entry
+						source: { generatedAt: "2026-01-15T10:00:00Z" },
+						// title intentionally absent → exercises `?? fileId`
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("/tmp/kb-fake/repo/feature-login/legacy-deadbeef.md");
+
+				expect(folderStorage.resolveBranchForFolder).toHaveBeenCalledWith("feature-login");
+				expect(
+					folderStorage.forceRegenerateVisibleMarkdown,
+				).toHaveBeenCalledWith(
+					expect.objectContaining({
+						commitHash: "deadbeef1234567890",
+						commitMessage: "deadbeef1234567890",
+						branch: "feature/login",
+						generatedAt: "2026-01-15T10:00:00Z",
+						commitDate: "2026-01-15T10:00:00Z",
+					}),
+				);
+			});
+
+			it("warns and aborts when a legacy commit manifestEntry has no branch and the folder is unregistered", async () => {
+				// Symmetric with the plan/note "warns and aborts" tests — and
+				// the bug fix this PR carries. Pre-fix code defaulted to "main"
+				// here, which routed the revert through the wrong branch's
+				// hidden JSON.
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+					resolveBranchForFolder: vi.fn().mockReturnValue(null),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "stranded/commit-deadbeef.md",
+						fileId: "deadbeef1234567890",
+						type: "commit",
+						fingerprint: "old",
+						source: { generatedAt: "2026-01-15T10:00:00Z" },
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("/tmp/kb-fake/repo/stranded/commit-deadbeef.md");
+
+				expect(folderStorage.forceRegenerateVisibleMarkdown).not.toHaveBeenCalled();
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("manifest entry has no recorded branch"),
+				);
+			});
+
+			it("warns and aborts when a commit manifestEntry has no source.generatedAt", async () => {
+				// `forceRegenerateVisibleMarkdown` reads its date fields from
+				// hidden JSON, so a missing generatedAt would not literally
+				// break the regenerate today. But synthesizing `""` would mask
+				// an incomplete manifest row for future readers and code that
+				// might one day surface entry fields directly. Refuse instead.
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+					resolveBranchForFolder: vi.fn().mockReturnValue("feature/login"),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "feature-login/legacy-deadbeef.md",
+						fileId: "deadbeef1234567890",
+						type: "commit",
+						fingerprint: "old",
+						// source.generatedAt intentionally absent
+						source: { branch: "feature/login" },
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("/tmp/kb-fake/repo/feature-login/legacy-deadbeef.md");
+
+				expect(folderStorage.forceRegenerateVisibleMarkdown).not.toHaveBeenCalled();
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("missing source.generatedAt"),
+				);
+			});
+
+			it("falls back to path-based reverse lookup when a legacy plan manifestEntry.source is missing", async () => {
+				// Legacy entry (pre-F2 fix) has no source.branch. Revert must
+				// reverse-lookup the path's first segment via branches.json
+				// instead of defaulting to "main", which would overwrite the
+				// wrong file when the plan lives on a feature branch.
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn().mockResolvedValue(true),
+					regenerateVisibleNote: vi.fn(),
+					resolveBranchForFolder: vi.fn().mockReturnValue("feature/login"),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "feature-login/plan--legacy.md",
+						fileId: "plan:legacy",
+						type: "plan",
+						fingerprint: "old",
+						// source intentionally absent → legacy entry
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("/tmp/kb-fake/repo/feature-login/plan--legacy.md");
+
+				expect(folderStorage.resolveBranchForFolder).toHaveBeenCalledWith("feature-login");
+				expect(folderStorage.regenerateVisiblePlan).toHaveBeenCalledWith(
+					"legacy",
+					"feature/login",
+				);
+			});
+
+			it("warns and aborts when a legacy plan manifestEntry has no branch and the folder is unregistered", async () => {
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+					resolveBranchForFolder: vi.fn().mockReturnValue(null),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "stranded/plan--orphan.md",
+						fileId: "plan:orphan",
+						type: "plan",
+						fingerprint: "old",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("/tmp/kb-fake/repo/stranded/plan--orphan.md");
+
+				expect(folderStorage.regenerateVisiblePlan).not.toHaveBeenCalled();
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("manifest entry has no recorded branch"),
+				);
+			});
+
+			it("falls back to path-based reverse lookup when a legacy note manifestEntry.source is missing", async () => {
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn().mockResolvedValue(true),
+					resolveBranchForFolder: vi.fn().mockReturnValue("fix/doc-bug"),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "fix-doc-bug/note--legacy.md",
+						fileId: "note:legacy",
+						type: "note",
+						fingerprint: "old",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("/tmp/kb-fake/repo/fix-doc-bug/note--legacy.md");
+
+				expect(folderStorage.resolveBranchForFolder).toHaveBeenCalledWith("fix-doc-bug");
+				expect(folderStorage.regenerateVisibleNote).toHaveBeenCalledWith(
+					"legacy",
+					"fix/doc-bug",
+				);
+			});
+
+			it("warns and aborts when a legacy note manifestEntry has no branch and the folder is unregistered", async () => {
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+					resolveBranchForFolder: vi.fn().mockReturnValue(null),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "stranded/note--orphan.md",
+						fileId: "note:orphan",
+						type: "note",
+						fingerprint: "old",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("/tmp/kb-fake/repo/stranded/note--orphan.md");
+
+				expect(folderStorage.regenerateVisibleNote).not.toHaveBeenCalled();
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("manifest entry has no recorded branch"),
+				);
+			});
+
+			it("warns for an unrecognized manifest entry type (defensive fallthrough)", async () => {
+				// Unknown types now produce a distinct "unrecognized manifest
+				// entry type" warning instead of falling through to the
+				// misleading "hidden source missing" branch.
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn(),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "main/mystery.md",
+						fileId: "mystery",
+						// type is some future / unknown value
+						type: "unknown-future-type",
+						fingerprint: "old",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler("/tmp/kb-fake/repo/main/mystery.md");
+
+				expect(folderStorage.forceRegenerateVisibleMarkdown).not.toHaveBeenCalled();
+				expect(folderStorage.regenerateVisiblePlan).not.toHaveBeenCalled();
+				expect(folderStorage.regenerateVisibleNote).not.toHaveBeenCalled();
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("unrecognized manifest entry type"),
+				);
+			});
+		});
+
+		// ── revertMemoryFileByRelPath (webview wrapper) ──────────────────
+		// Webview's right-click "Revert to System Version" menu posts the
+		// kbRoot-relative path back to the host. This wrapper resolves it
+		// to abs via the same `join(sidebarKbParent, relPath)` expression
+		// `resolveKbAbs` uses, then delegates to the abs-path command above.
+		describe("revertMemoryFileByRelPath", () => {
+			it("resolves relPath under sidebarKbParent and delegates to revertMemoryFileEdits", async () => {
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileByRelPath",
+				);
+				executeCommand.mockClear();
+				await handler("repo/main/foo-abcdef12.md");
+				expect(executeCommand).toHaveBeenCalledWith(
+					"jollimemory.revertMemoryFileEdits",
+					"/test/kb-parent/repo/main/foo-abcdef12.md",
+				);
+			});
+
+			it("no-ops on empty string relPath without calling the abs command", async () => {
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileByRelPath",
+				);
+				executeCommand.mockClear();
+				await handler("");
+				expect(executeCommand).not.toHaveBeenCalledWith(
+					"jollimemory.revertMemoryFileEdits",
+					expect.anything(),
+				);
+			});
+
+			it("no-ops on non-string input", async () => {
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileByRelPath",
+				);
+				executeCommand.mockClear();
+				await handler(undefined);
+				await handler(42);
+				expect(executeCommand).not.toHaveBeenCalledWith(
+					"jollimemory.revertMemoryFileEdits",
+					expect.anything(),
+				);
 			});
 		});
 	});
@@ -3144,6 +4435,78 @@ describe("Extension", () => {
 				"jollimemory.workerBusy",
 				false,
 			);
+		});
+
+		// Lazy-load gate: the lockWatcher onDelete handler only triggers
+		// memoriesStore.refresh() when the user has already opened the Memories
+		// section once (hasFirstLoaded=true). The default mock returns false so
+		// no other test covers the truthy branch — without this, refactoring
+		// the gate to drop the lazy-load could silently start polling the
+		// orphan-branch list in the background. Same lazy-load pattern is
+		// asserted for the orphan-ref watcher below.
+		it("refreshes memories on lock-delete when memoriesStore.hasFirstLoaded is true", async () => {
+			mockMemoriesStore.hasFirstLoaded.mockReturnValueOnce(true);
+			mockMemoriesStore.refresh.mockClear();
+			const lockWatcher = createFileSystemWatcher.mock.results[3]?.value;
+			const onDelete = lockWatcher?.onDidDelete.mock.calls[0]?.[0] as
+				| (() => void)
+				| undefined;
+
+			onDelete?.();
+
+			await vi.waitFor(() => {
+				expect(mockMemoriesStore.refresh).toHaveBeenCalled();
+			});
+		});
+
+		// updateMemoryBankContext (the active-editor callback) sets the
+		// `jollimemory.isMemoryBankFile` context key to true when the focused
+		// file resolves to a Memory Bank manifest entry. The default flow
+		// (bridge.resolveMemoryFile → null) covers the false branch via the
+		// initial call with `activeTextEditor=undefined`; this test invokes
+		// the captured callback with a stub editor and a non-null
+		// resolveMemoryFile to cover the truthy ternary arm.
+		it("sets the isMemoryBankFile context to true when the active editor resolves to a manifest entry", async () => {
+			mockBridge.resolveMemoryFile.mockResolvedValue({
+				path: "main/feat-abc.md",
+				kind: "memory",
+			});
+			executeCommand.mockClear();
+
+			const lastCall =
+				onDidChangeActiveTextEditor.mock.calls[
+					onDidChangeActiveTextEditor.mock.calls.length - 1
+				];
+			const cb = lastCall?.[0] as
+				| ((editor: { document: { uri: { fsPath: string } } }) => Promise<void>)
+				| undefined;
+			expect(cb).toBeDefined();
+
+			await cb?.({
+				document: { uri: { fsPath: "/test/workspace/main/feat-abc.md" } },
+			});
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"setContext",
+				"jollimemory.isMemoryBankFile",
+				true,
+			);
+		});
+
+		it("refreshes memories on orphan-ref change when hasFirstLoaded is true", async () => {
+			mockMemoriesStore.hasFirstLoaded.mockReturnValueOnce(true);
+			mockMemoriesStore.refresh.mockClear();
+			// Watcher indices: 0=sessions, 1=head, 2=orphan-ref, 3=lock.
+			const orphanWatcher = createFileSystemWatcher.mock.results[2]?.value;
+			const onChange = orphanWatcher?.onDidChange.mock.calls[0]?.[0] as
+				| (() => void)
+				| undefined;
+
+			onChange?.();
+
+			await vi.waitFor(() => {
+				expect(mockMemoriesStore.refresh).toHaveBeenCalled();
+			});
 		});
 
 		it("marks the worker busy when the lock watcher is created or changed", () => {
@@ -4560,6 +5923,35 @@ describe("Extension", () => {
 				});
 				expect(mockBridge.enable).not.toHaveBeenCalled();
 			});
+
+			// bridge.enable() can soft-fail (success:false) — e.g. a hook directory
+			// permission problem the user can fix later. The auto-enable path
+			// must log this and skip the follow-up statusStore.refresh / status
+			// bar refresh path, otherwise the panel jumps to "enabled" state
+			// with an unhealthy hook chain underneath. Covers the
+			// `if (!enableResult.success)` branch of the auto-enable block.
+			it("logs `Auto-enable failed` when bridge.enable returns success:false", async () => {
+				mockBridge.getStatus.mockResolvedValue({
+					enabled: false,
+					gitHookInstalled: false,
+					worktreeHooksInstalled: false,
+				});
+				mockBridge.enable
+					.mockClear()
+					.mockResolvedValueOnce({ success: false, message: "hook EACCES" });
+				readManualDisableFlag.mockResolvedValue(false);
+
+				const ctx = makeContext();
+				activate(ctx);
+
+				await vi.waitFor(() => {
+					expect(warn).toHaveBeenCalledWith(
+						"activate",
+						"Auto-enable failed",
+						expect.objectContaining({ message: "hook EACCES" }),
+					);
+				});
+			});
 		});
 
 		it("logs error when refreshHookPathsIfStale rejects", async () => {
@@ -4750,6 +6142,23 @@ describe("Extension", () => {
 				"EROFS: read-only fs",
 			);
 		});
+
+		// Defensive fallback: a non-Error rejection (a plain string from a
+		// misbehaving lower layer) must still surface a user-readable message
+		// via notifyApiKeySaveError rather than blowing up the inline-save
+		// flow. Covers the `err instanceof Error ? ... : "Failed to save the
+		// API key."` else-branch in handleSaveAnthropicApiKey's catch.
+		it("falls back to a generic message when saveConfigScoped rejects with a non-Error", async () => {
+			activate(makeContext());
+			saveConfigScoped.mockRejectedValueOnce("plain-string-failure");
+
+			const handler = getRegisteredCommand("jollimemory.saveAnthropicApiKey");
+			await handler("sk-ant-real-key");
+
+			expect(mockNotifyApiKeySaveError).toHaveBeenCalledWith(
+				"Failed to save the API key.",
+			);
+		});
 	});
 
 	describe("URI handler", () => {
@@ -4874,6 +6283,9 @@ describe("Extension", () => {
 					"commit",
 					null,
 					null,
+					// readStorage: null in default mock setup; bridge-default
+					// reads cover the legacy path for fresh repos without KB.
+					null,
 				);
 				// Summary route must NOT trigger the OAuth path.
 				expect(mockAuthService.handleAuthCallback).not.toHaveBeenCalled();
@@ -4932,6 +6344,10 @@ describe("Extension", () => {
 					"commit",
 					"other-repo",
 					"https://github.com/other/repo.git",
+					// readStorage: foreign hit calls createStorageForRepo;
+					// default mock returns null. Storage threading itself is
+					// covered in JolliMemoryBridge.test.ts.
+					null,
 				);
 			});
 
@@ -5235,9 +6651,13 @@ describe("Extension", () => {
 			const handler = getRegisteredCommand("jollimemory.openPlanForPreview");
 			await handler("committed-plan");
 
+			// Third arg = foreign-storage override; undefined here because
+			// openPlanForPreview doesn't take a foreign hint (only the
+			// SummaryWebviewPanel-driven editPlan path does).
 			expect(readPlanFromBranch).toHaveBeenCalledWith(
 				"committed-plan",
 				"/test/workspace",
+				undefined,
 			);
 		});
 
@@ -5261,6 +6681,7 @@ describe("Extension", () => {
 			expect(readPlanFromBranch).toHaveBeenCalledWith(
 				"orphan-only",
 				"/test/workspace",
+				undefined,
 			);
 		});
 
@@ -5318,7 +6739,11 @@ describe("Extension", () => {
 			const handler = getRegisteredCommand("jollimemory.openNoteForPreview");
 			await handler("n-1");
 
-			expect(readNoteFromBranch).toHaveBeenCalledWith("n-1", "/test/workspace");
+			expect(readNoteFromBranch).toHaveBeenCalledWith(
+				"n-1",
+				"/test/workspace",
+				undefined,
+			);
 		});
 
 		it("shows an info message when neither local file nor commitHash is available", async () => {
@@ -5379,6 +6804,21 @@ describe("Extension", () => {
 			expect(result.message).toContain("memories migrated");
 			// "Repoint": old KB identity is rewritten so resolveKBPath stops reusing it.
 			expect(mockMetadataManagerInstance.saveConfig).toHaveBeenCalled();
+		});
+
+		// Same successful-rebuild path, but with memoriesStore.hasFirstLoaded
+		// flipped to true so the post-rebuild refresh of the Memories panel
+		// fires. Default mock returns false (lazy panel never opened) so
+		// the previous test only exercises the gated branch.
+		it("refreshes memoriesStore after a successful rebuild when hasFirstLoaded is true", async () => {
+			mockMemoriesStore.hasFirstLoaded.mockReturnValueOnce(true);
+			mockMemoriesStore.refresh.mockClear();
+
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
+			await handler();
+
+			expect(mockMemoriesStore.refresh).toHaveBeenCalled();
 		});
 
 		it("returns not-ok with No git storage found when orphan branch is missing", async () => {

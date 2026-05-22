@@ -177,4 +177,24 @@ describe("treeItemToSerialized", () => {
 		const out = treeItemToSerialized(item as never);
 		expect(out.id).toBe("hello:world");
 	});
+
+	// linearHover is one of three optional rich-popover fields (plan/note/linear).
+	// Default serialization drops it, but Linear-issue tree items attach it
+	// directly on the TreeItem instance — the serializer must forward it
+	// through to the webview verbatim. This also covers the truthy branch of
+	// the `linearHover ? { linearHover } : {}` spread in the serializer.
+	it("forwards linearHover when present on the tree item", () => {
+		const item = new TreeItem("Issue title") as unknown as Parameters<
+			typeof treeItemToSerialized
+		>[0] & { linearHover?: unknown };
+		(item as { linearHover?: unknown }).linearHover = {
+			identifier: "ENG-123",
+			title: "Issue title",
+		};
+		const out = treeItemToSerialized(item as never);
+		expect((out as { linearHover?: unknown }).linearHover).toEqual({
+			identifier: "ENG-123",
+			title: "Issue title",
+		});
+	});
 });

@@ -22,7 +22,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
 import { conversationKey, readExclusions } from "../core/CommitSelectionStore.js";
-import { applyOverlaysToSessions } from "../core/ConversationOverlayStore.js";
+import { applyOverlaysToSessions, pruneConsumedOverlayRules } from "../core/ConversationOverlayStore.js";
 import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
 import { discoverCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
 import { readCopilotChatTranscript } from "../core/CopilotChatTranscriptReader.js";
@@ -1954,7 +1954,24 @@ async function loadSessionTranscripts(
 	// branch stored transcript would diverge from the recap that referenced
 	// it. Recount totalEntries / humanEntries so the "skip when nothing to
 	// summarize" guard also respects overlay-driven removals.
+	//
+	// Apply does NOT mutate `raw.sessionTranscripts`: it returns a new array
+	// with `entries: applyOverlay(s.entries, overlay)` (see
+	// ConversationOverlayStore.applyOverlaysToSessions). That means the next
+	// step's identity-based GC can keep using `raw.sessionTranscripts` for
+	// comparison — original content + original role + original timestamp.
 	const sessionTranscripts = (await applyOverlaysToSessions(raw.sessionTranscripts, cwd)) as SessionTranscript[];
+
+	// Cursor-aware overlay GC. Runs AFTER apply so the slice's overlay rules
+	// have already taken effect in `sessionTranscripts`; pruning here only
+	// drops rules that were just consumed (their `(role, content, timestamp)`
+	// identity matches an entry in `raw.sessionTranscripts`, the cursor-
+	// trimmed pre-apply slice). Cursor advance already happened inside
+	// readAllTranscripts and is decoupled from any downstream success — so
+	// the rules dropped here will never apply again no matter what the
+	// pipeline does next. GC is fire-and-forget; per-session errors only
+	// warn-log.
+	await pruneConsumedOverlayRules(raw.sessionTranscripts, cwd);
 	let totalEntries = 0;
 	let humanEntries = 0;
 	for (const s of sessionTranscripts) {

@@ -367,6 +367,39 @@ export function buildSidebarCss(): string {
     border-radius: 2px;
   }
 
+  /* Foreign-readonly mode banner ("Viewing memories from <repo> / <branch>
+     [(read-only)]") prepended to the Memories section body. Quieter than the
+     partial-data warning above — informational, not an alert — so the
+     muted descriptionForeground color keeps it from competing with the
+     section header for attention. Mirrors IntelliJ CommitsPanel's gray
+     JBLabel above the foreign rows. */
+  .foreign-banner {
+    margin: 4px 8px;
+    padding: 2px 4px 6px 4px;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  }
+
+  /* Inline "Switch back to current workspace" affordance trailing the
+     foreign-banner text. Rendered as a <button> for CSP/a11y (no inline
+     onclick, no javascript: href) but styled as a link so it reads as
+     "click me to navigate" rather than "form submit". Inherits the banner's
+     11px font-size so the chip and text line up baseline-to-baseline. */
+  .foreign-banner-reset {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--vscode-textLink-foreground, var(--vscode-foreground));
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .foreign-banner-reset:hover,
+  .foreign-banner-reset:focus-visible {
+    color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground, var(--vscode-foreground)));
+    outline: none;
+  }
+
   .collapsible-section { display: flex; flex-direction: column; }
   .collapsible-section .section-header {
     display: flex;
@@ -637,6 +670,7 @@ export function buildSidebarCss(): string {
      overriding the row-level gap would also widen twirl → row-leading and
      break section column alignment. */
   .tree-node.conversation-row .badge,
+  .tree-node.conversation-row .edited-icon,
   .tree-node.conversation-row .count,
   .tree-node.conversation-row .time {
     /* 4px here + 4px from the base .tree-node flex gap = 8px total spacing
@@ -675,6 +709,27 @@ export function buildSidebarCss(): string {
   .tree-node.conversation-row .badge.transcript-source-opencode     { color: #fb923c; border-color: #fb923c; background: rgba(251,146,60,0.12); }
   .tree-node.conversation-row .badge.transcript-source-copilot      { color: #94a3b8; border-color: #94a3b8; background: rgba(148,163,184,0.12); }
   .tree-node.conversation-row .badge.transcript-source-copilot-chat { color: #fbbf24; border-color: #fbbf24; background: rgba(251,191,36,0.12); }
+
+  /* "Edited" marker — codicon-edit pencil glyph rendered inline after the
+     row title. Intentionally a thin icon (no pill / border / fill) so it
+     reads as a status modifier on the title rather than a second badge
+     competing with the AI agent badge for visual weight. Color follows
+     VS Code's standard "modified file" hue for cross-product consistency.
+     Same visual treatment is reused on KB folders-tree file rows
+     (data-kind="file") for the on-disk-divergence ✎ marker — the rule
+     below repeats the visual block under that scope rather than relaxing
+     to a bare ".edited-icon" so unrelated future ".edited-icon" usages
+     don't silently inherit conversation-row spacing. */
+  .tree-node.conversation-row .edited-icon {
+    font-size: 12px;
+    color: var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-focusBorder));
+    flex-shrink: 0;
+  }
+  .tree-node[data-kind="file"] .edited-icon {
+    font-size: 12px;
+    color: var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-focusBorder));
+    flex-shrink: 0;
+  }
 
   .tree-node.conversation-row .count,
   .tree-node.conversation-row .time {
@@ -792,7 +847,19 @@ export function buildSidebarCss(): string {
     max-height: 8em;
     overflow: hidden;
   }
-  .hover-card .hc-actions { display: flex; gap: 12px; align-items: center; }
+  /* Actions row pins to the card's bottom edge so the hash + View Memory
+     link stays visible even when positionHoverCard falls back to a capped
+     maxHeight + overflowY:auto (narrow sidebars where stats wraps to 2+
+     lines, or very long commit messages). The background match is what
+     prevents text scrolled underneath the sticky row from bleeding through. */
+  .hover-card .hc-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    position: sticky;
+    bottom: 0;
+    background: var(--vscode-editorHoverWidget-background);
+  }
   .hover-card .hc-link {
     color: var(--vscode-textLink-foreground);
     cursor: pointer;

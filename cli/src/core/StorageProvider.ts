@@ -76,6 +76,20 @@ export interface StorageProvider {
 	deleteNoteVisible?(id: string, branch: string): Promise<void>;
 
 	/**
+	 * Remove `branches.json` mappings for the given branch names without
+	 * touching the manifest. Called by `StaleChildMarkdownCleanup` after it
+	 * deletes the visible `.md` files of hoisted older versions, so the
+	 * "Folders" sidebar tab does not surface a branch whose only index
+	 * entries are hoisted children (the "ghost branch" bug). Idempotent on
+	 * unknown branch names; returns the count of mappings actually removed.
+	 *
+	 * Optional: implemented by FolderStorage and delegated by DualWriteStorage.
+	 * OrphanBranchStorage does not implement it (the orphan branch carries no
+	 * `branches.json` — that artifact is folder-only).
+	 */
+	pruneBranchMappings?(branches: readonly string[]): Promise<number>;
+
+	/**
 	 * Walk the manifest and re-emit any commit-typed visible `.md` the manifest
 	 * still records but the filesystem no longer contains. Reads the hidden
 	 * `.jolli/summaries/<hash>.json` as the authoritative source for branch +

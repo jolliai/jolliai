@@ -1523,6 +1523,75 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).not.toHaveBeenCalled();
 	});
 
+	it("ignores notes without a sourcePath in the shadow set (covers `note.sourcePath` falsy arm)", async () => {
+		// A note created via the "snippet" path can lack `sourcePath` (it's
+		// stored inline). The plan-shadow guard must skip such entries — they
+		// have no file to compare against the in-progress plan candidates.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // .md file on disk
+
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {},
+			notes: {
+				"n-snippet": {
+					id: "n-snippet",
+					title: "Inline snippet",
+					format: "snippet",
+					// no sourcePath — falls through the `if (note.sourcePath)` guard
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					branch: "unknown",
+					commitHash: null,
+				} as never,
+			},
+		});
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/standalone.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		// Plan registration proceeds — the note had no path to shadow against.
+		expect(savePlansRegistry).toHaveBeenCalled();
+	});
+
+	it("should still treat a legacy note WITHOUT a branch field as a shadowing source (covers `note.branch` falsy arm)", async () => {
+		// Legacy notes (created before the branch field landed) omit `branch`.
+		// The `note.branch && note.branch !== branch` short-circuits to false
+		// when `note.branch` is undefined → the note is treated as global
+		// shadow, suppressing the would-be plan registration. Pins that arm.
+		vi.mocked(existsSync)
+			.mockReturnValueOnce(true) // transcript file
+			.mockReturnValueOnce(true); // .md file on disk
+
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {},
+			notes: {
+				"n-legacy": {
+					id: "n-legacy",
+					title: "Legacy global note",
+					format: "markdown",
+					sourcePath: "/repo/docs/legacy.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					// no `branch` field — pre-branch-scope legacy entry
+					commitHash: null,
+				} as never,
+			},
+		});
+
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/legacy.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		// Branch-less note still shadows: no plan auto-registration.
+		expect(savePlansRegistry).not.toHaveBeenCalled();
+	});
+
 	it("should match note sourcePath case-insensitively on Windows (and Darwin)", async () => {
 		// Filesystem case mismatch (Note registered as "Design.md", AI edits "design.md"
 		// referring to same file on case-insensitive FS) must still trigger the
@@ -1903,5 +1972,40 @@ describe("StopHook — Linear issue discovery", () => {
 		// Should not throw; handleStopHook swallows the error
 		await expect(handleStopHook()).resolves.toBeUndefined();
 		expect(upsertLinearIssueEntry).not.toHaveBeenCalled();
+	});
+
+	it("continues with the rest of the batch when one issue's persistence fails", async () => {
+		// Per-issue persistence failures (writeLinearIssueMarkdown / upsert)
+		// must NOT abort the loop — skipping cursor save on the first failure
+		// would put the StopHook in a re-process loop hammering the same ref.
+		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
+		mockTranscriptWithLines([]);
+		const okRef = { ...REF, ticketId: "PROJ-OK" };
+		const badRef = { ...REF, ticketId: "PROJ-BAD" };
+		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
+			issues: [badRef, okRef],
+			lastLineNumberScanned: 7,
+		});
+		// First write throws (per-batch failure path), second succeeds.
+		vi.mocked(writeLinearIssueMarkdown)
+			.mockRejectedValueOnce(new Error("EACCES — write blocked"))
+			.mockResolvedValueOnce({ sourcePath: "/abs/PROJ-OK.md", contentHash: "fake-hash" });
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		// Only the surviving ref reaches upsert.
+		const upsertCalls = vi.mocked(upsertLinearIssueEntry).mock.calls;
+		expect(upsertCalls).toHaveLength(1);
+		expect(upsertCalls[0]?.[0]).toMatchObject({ ticketId: "PROJ-OK" });
+		// Cursor still advances — preventing the StopHook from re-processing
+		// the same window on the next invocation.
+		expect(saveCursor).toHaveBeenCalledWith(
+			expect.objectContaining({
+				transcriptPath: `linear:${TRANSCRIPT_PATH}`,
+				lineNumber: 7,
+			}),
+			PROJECT_DIR,
+		);
 	});
 });

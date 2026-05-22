@@ -44,6 +44,7 @@ import {
 	saveConfigScoped,
 } from "../core/SessionTracker.js";
 import type { SqliteScanError } from "../core/SqliteHelpers.js";
+import type { StorageProvider } from "../core/StorageProvider.js";
 import { getSummaryCount } from "../core/SummaryStore.js";
 import { createLogger, getJolliMemoryDir, ORPHAN_BRANCH } from "../Logger.js";
 import type { InstallResult, JolliMemoryConfig, SessionInfo, StatusInfo, TranscriptSource } from "../Types.js";
@@ -503,9 +504,13 @@ export async function uninstall(cwd?: string): Promise<InstallResult> {
  * installed. Git repo information is resolved gracefully — if not in a git repo,
  * worktree-related fields are omitted.
  *
- * @param cwd - Optional working directory (defaults to process.cwd())
+ * @param cwd     - Optional working directory (defaults to process.cwd())
+ * @param storage - Optional StorageProvider for `getSummaryCount`. Threaded by
+ *                  the VS Code extension's `JolliMemoryBridge`; the CLI/hook
+ *                  process omits it and relies on the module-level
+ *                  `setActiveStorage` override installed by `QueueWorker`.
  */
-export async function getStatus(cwd?: string): Promise<StatusInfo> {
+export async function getStatus(cwd?: string, storage?: StorageProvider): Promise<StatusInfo> {
 	/* v8 ignore next - process.cwd() fallback only used when called without cwd arg */
 	const projectDir = cwd ?? process.cwd();
 	log.info("Checking Jolli Memory status");
@@ -517,7 +522,7 @@ export async function getStatus(cwd?: string): Promise<StatusInfo> {
 		(await isHookSectionInstalled(projectDir, "prepare-commit-msg", PREPARE_MSG_MARKER_START));
 	const sessions = await loadAllSessions(projectDir);
 	const branchExists = await orphanBranchExists(ORPHAN_BRANCH, projectDir);
-	const summaryCount = branchExists ? await getSummaryCount(projectDir) : 0;
+	const summaryCount = branchExists ? await getSummaryCount(projectDir, storage) : 0;
 	const geminiHookInstalled = await isGeminiHookInstalled(projectDir);
 	const claudeDetected = await isClaudeInstalled();
 	const codexDetected = await isCodexInstalled();

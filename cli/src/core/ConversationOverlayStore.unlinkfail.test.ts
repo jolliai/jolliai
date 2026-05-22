@@ -19,7 +19,7 @@
  * real `mkdir`/`writeFile`/etc. for fixture setup.
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import * as realFsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,7 +35,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 	};
 });
 
-import { saveOverlay } from "./ConversationOverlayStore.js";
+import { type OverlayableSession, pruneConsumedOverlayRules, saveOverlay } from "./ConversationOverlayStore.js";
 
 describe("saveOverlay unlink-also-fails cleanup", () => {
 	let projectDir: string;
@@ -75,6 +75,55 @@ describe("saveOverlay unlink-also-fails cleanup", () => {
 		// Confirm the failing unlink was actually attempted (otherwise the
 		// arrow path wasn't exercised even if the test passed for unrelated
 		// reasons).
+		expect(realFsPromises.unlink).toHaveBeenCalled();
+	});
+});
+
+describe("pruneConsumedOverlayRules unlink-failure", () => {
+	let projectDir: string;
+
+	beforeEach(() => {
+		projectDir = mkdtempSync(join(tmpdir(), "overlay-prune-unlink-fail-"));
+		vi.mocked(realFsPromises.unlink).mockClear();
+	});
+
+	afterEach(() => {
+		rmSync(projectDir, { recursive: true, force: true });
+	});
+
+	it("swallows a non-ENOENT unlink error and warn-logs instead of throwing", async () => {
+		// Plant a real overlay with a single delete rule so prune has something
+		// to consume — when all rules are matched, prune calls unlink to remove
+		// the now-empty overlay file.
+		const sessionId = "prune-unlink-fail";
+		const rule = { role: "human" as const, content: "ask-prune", timestamp: "tp1" };
+		await saveOverlay({ projectDir, source: "claude", sessionId }, { deletes: [rule], edits: [] });
+
+		// Confirm the file exists before prune runs.
+		const overlayDir = join(projectDir, ".jolli", "jollimemory", "conversation-edits");
+		const overlayFile = join(overlayDir, "claude--prune-unlink-fail.json");
+		expect(existsSync(overlayFile)).toBe(true);
+
+		// Force unlink to throw a non-ENOENT error — the inner catch re-throws
+		// it (because isEnoent returns false), which lifts the error into the
+		// outer try/catch that warn-logs and swallows it.
+		vi.mocked(realFsPromises.unlink).mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+		// The session whose entries fully match the planted rule — prune will
+		// choose the unlink path after filtering leaves zero remaining rules.
+		const session: OverlayableSession = {
+			sessionId,
+			source: "claude",
+			entries: [{ role: "human", content: "ask-prune", timestamp: "tp1" }],
+		};
+
+		// Must resolve (not throw) — the outer catch swallows the error.
+		await expect(pruneConsumedOverlayRules([session], projectDir)).resolves.toBeUndefined();
+
+		// The overlay file is still on disk because unlink failed.
+		expect(existsSync(overlayFile)).toBe(true);
+
+		// Confirm unlink was actually called so the branch was exercised.
 		expect(realFsPromises.unlink).toHaveBeenCalled();
 	});
 });

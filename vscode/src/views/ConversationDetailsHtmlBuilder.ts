@@ -20,18 +20,31 @@ export interface BuildHtmlOptions {
 	 * (no workspace open → nowhere to persist overrides).
 	 */
 	readonly readOnly: boolean;
+	/**
+	 * `webview.cspSource` of the panel. Required because the edited-notice
+	 * banner uses a codicon glyph, which loads a stylesheet + font file from
+	 * the extension's bundled asset URI — both have to be allowlisted in CSP.
+	 */
+	readonly cspSource: string;
+	/**
+	 * Result of `webview.asWebviewUri(extensionUri/assets/codicons/codicon.css)`.
+	 * Linked into <head> so `<i class="codicon codicon-edit">` renders the
+	 * pencil glyph in the edited-notice banner.
+	 */
+	readonly codiconCssUri: string;
 }
 
 export function buildConversationDetailsHtml(opts: BuildHtmlOptions): string {
-	// Match SidebarHtmlBuilder's strict CSP: nonce-only for both script and
-	// style. CLAUDE.md "VSCode webview CSP forbids inline style/JS" relies on
-	// this — relaxing style-src to 'unsafe-inline' here would let future
-	// inline style="..." regressions render in this panel while being
-	// silently stripped elsewhere.
+	// Mirrors SidebarHtmlBuilder's CSP: nonce for inline <script>/<style>,
+	// cspSource for the bundled codicon stylesheet + font. CLAUDE.md "VSCode
+	// webview CSP forbids inline style/JS" applies — keep style-src and
+	// script-src nonce-only (no 'unsafe-inline') so future inline regressions
+	// fail loudly here just like everywhere else.
 	const csp = [
 		"default-src 'none'",
 		"img-src 'self' data:",
-		"style-src 'nonce-" + opts.nonce + "'",
+		"style-src " + opts.cspSource + " 'nonce-" + opts.nonce + "'",
+		"font-src " + opts.cspSource,
 		"script-src 'nonce-" + opts.nonce + "'",
 	].join("; ");
 
@@ -52,6 +65,7 @@ export function buildConversationDetailsHtml(opts: BuildHtmlOptions): string {
 		"<head>",
 		'<meta charset="UTF-8">',
 		'<meta http-equiv="Content-Security-Policy" content="' + csp + '">',
+		'<link rel="stylesheet" href="' + opts.codiconCssUri + '" />',
 		'<style nonce="' + opts.nonce + '">',
 		"body { font-family: var(--vscode-font-family); padding: 16px 16px 72px 16px; }",
 		".header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }",
@@ -70,6 +84,13 @@ export function buildConversationDetailsHtml(opts: BuildHtmlOptions): string {
 		".badge.transcript-source-opencode     { color: #fb923c; border-color: #fb923c; background: rgba(251,146,60,0.12); }",
 		".badge.transcript-source-copilot      { color: #94a3b8; border-color: #94a3b8; background: rgba(148,163,184,0.12); }",
 		".badge.transcript-source-copilot-chat { color: #fbbf24; border-color: #fbbf24; background: rgba(251,191,36,0.12); }",
+		".edited-notice { display: flex; align-items: center; gap: 8px; margin: 0 0 16px 0; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-focusBorder)); background: color-mix(in srgb, var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-focusBorder)) 12%, transparent); color: var(--vscode-foreground); }",
+		".edited-notice.hidden { display: none; }",
+		/* Leading marker — codicon-edit glyph in modified-file yellow. Matches
+		   the sidebar CONVERSATIONS row marker so the same visual vocabulary
+		   carries from the entry point into the detail view. */
+		".edited-notice .edited-icon { font-size: 14px; color: var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-focusBorder)); flex-shrink: 0; }",
+		".edited-notice .edited-text { font-size: 12px; line-height: 1.45; }",
 		".transcript-entry { position: relative; padding: 8px 10px; margin-bottom: 6px; border-radius: 4px; }",
 		".transcript-entry[data-role=human] { background: var(--vscode-editor-inactiveSelectionBackground); }",
 		".transcript-entry[data-role=assistant] { background: transparent; }",
@@ -103,6 +124,7 @@ export function buildConversationDetailsHtml(opts: BuildHtmlOptions): string {
 			escapeHtml(providerLabel(opts.source)) +
 			"</span>",
 		"</div>",
+		'<div class="edited-notice hidden" id="editedNotice"><i class="codicon codicon-edit edited-icon" aria-hidden="true"></i><span class="edited-text">Conversation content has been modified. Future summaries will use this edited version.</span></div>',
 		'<div id="entries"><div class="empty-state">Loading conversation…</div></div>',
 		'<div class="footer' + (opts.readOnly ? " hidden" : "") + '" id="footer">',
 		'<button class="mark-all-btn" id="markAllBtn" type="button">Mark All as Deleted</button>',

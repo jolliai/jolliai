@@ -1148,6 +1148,85 @@ describe("SessionTracker", () => {
 		});
 	});
 
+	describe("detectActiveNotesForBranch", () => {
+		// Active = uncommitted (commitHash null), not ignored, no guard
+		// (contentHashAtCommit undefined). Pins the four filter arms.
+		it("returns only active notes on the requested branch (filters branch / commitHash / ignored / guard)", async () => {
+			const registry = {
+				version: 1 as const,
+				plans: {},
+				notes: {
+					"note-active": {
+						id: "note-active",
+						title: "Active note",
+						format: "snippet" as const,
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						branch: "feature/x",
+						commitHash: null,
+					},
+					"note-other-branch": {
+						id: "note-other-branch",
+						title: "Other branch note",
+						format: "snippet" as const,
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						branch: "feature/y",
+						commitHash: null,
+					},
+					"note-committed": {
+						id: "note-committed",
+						title: "Already committed",
+						format: "snippet" as const,
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						branch: "feature/x",
+						commitHash: "deadbeefcafebabe",
+					},
+					"note-ignored": {
+						id: "note-ignored",
+						title: "Ignored note",
+						format: "snippet" as const,
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						branch: "feature/x",
+						commitHash: null,
+						ignored: true,
+					},
+					"note-guarded": {
+						id: "note-guarded",
+						title: "Guard-archived",
+						format: "snippet" as const,
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						branch: "feature/x",
+						commitHash: null,
+						contentHashAtCommit: "fakehash",
+					},
+				},
+			};
+			await savePlansRegistry(registry as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
+
+			const result = await detectActiveNotesForBranch(tempDir, "feature/x");
+
+			expect(result.map((n) => n.id)).toEqual(["note-active"]);
+		});
+
+		it("returns [] when the registry has no notes field at all", async () => {
+			// `Object.values(registry.notes ?? {})` short-circuits to an empty
+			// iteration — used by post-commit StopHook when the registry was
+			// freshly initialized.
+			await savePlansRegistry(
+				{ version: 1 as const, plans: {} } as unknown as Parameters<typeof savePlansRegistry>[0],
+				tempDir,
+			);
+
+			const result = await detectActiveNotesForBranch(tempDir, "main");
+
+			expect(result).toEqual([]);
+		});
+	});
+
 	describe("getGlobalConfigDir", () => {
 		it("should return a path containing .jolli/jollimemory", () => {
 			const dir = getGlobalConfigDir();
@@ -1777,6 +1856,76 @@ describe("SessionTracker", () => {
 			expect(await detectUncommittedLinearIssueIds(tempDir, "main")).toEqual([]);
 			expect(await getLinearIssueEntriesForBranch(tempDir, "main")).toEqual([]);
 		});
+
+		// Pins each of the four filter arms (branch / commitHash / ignored /
+		// contentHashAtCommit) for `getLinearIssueEntriesForBranch` itself —
+		// detectUncommittedLinearIssueIds covers the same arms separately but
+		// v8 tracks them per function.
+		it("getLinearIssueEntriesForBranch filters by branch / commitHash / ignored / guard arms", async () => {
+			await seed({
+				"PROJ-active": {
+					ticketId: "PROJ-active",
+					title: "active",
+					url: "u",
+					sourcePath: "p",
+					branch: "main",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: null,
+					sourceToolName: "mcp__linear__get_issue",
+				},
+				"PROJ-otherbranch": {
+					ticketId: "PROJ-otherbranch",
+					title: "other",
+					url: "u",
+					sourcePath: "p",
+					branch: "feature-b",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: null,
+					sourceToolName: "mcp__linear__get_issue",
+				},
+				"PROJ-committed": {
+					ticketId: "PROJ-committed",
+					title: "committed",
+					url: "u",
+					sourcePath: "p",
+					branch: "main",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: "deadbeef",
+					sourceToolName: "mcp__linear__get_issue",
+				},
+				"PROJ-ignored": {
+					ticketId: "PROJ-ignored",
+					title: "ignored",
+					url: "u",
+					sourcePath: "p",
+					branch: "main",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: null,
+					ignored: true,
+					sourceToolName: "mcp__linear__get_issue",
+				},
+				"PROJ-guard": {
+					ticketId: "PROJ-guard",
+					title: "guard",
+					url: "u",
+					sourcePath: "p",
+					branch: "main",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: null,
+					contentHashAtCommit: "fakehash",
+					sourceToolName: "mcp__linear__get_issue",
+				},
+			});
+
+			const result = await getLinearIssueEntriesForBranch(tempDir, "main");
+
+			expect(result.map((e) => e.ticketId)).toEqual(["PROJ-active"]);
+		});
 	});
 
 	describe("upsertLinearIssueEntry", () => {
@@ -2067,6 +2216,52 @@ describe("SessionTracker", () => {
 			);
 			const plans = await detectActivePlansForBranch(tempDir, "main");
 			expect(plans.map((p) => p.slug)).toEqual(["plan-1"]);
+		});
+
+		it("detectActivePlansForBranch skips committed and guarded plans (covers commitHash + contentHash filter arms)", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {
+						"plan-active": {
+							slug: "plan-active",
+							title: "active",
+							sourcePath: "/p",
+							branch: "main",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+							editCount: 0,
+						},
+						"plan-committed": {
+							slug: "plan-committed",
+							title: "committed",
+							sourcePath: "/p",
+							branch: "main",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: "abcdef1234567890",
+							editCount: 0,
+						},
+						"plan-guarded": {
+							slug: "plan-guarded",
+							title: "guarded",
+							sourcePath: "/p",
+							branch: "main",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+							contentHashAtCommit: "fakehash",
+							editCount: 0,
+						},
+					},
+				},
+				tempDir,
+			);
+
+			const plans = await detectActivePlansForBranch(tempDir, "main");
+
+			expect(plans.map((p) => p.slug)).toEqual(["plan-active"]);
 		});
 
 		it("returns uncommitted notes for current branch", async () => {

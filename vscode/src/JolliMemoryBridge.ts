@@ -22,7 +22,11 @@ import {
 	getRemoteUrl,
 	resolveKbParent,
 } from "../../cli/src/core/KBPathResolver.js";
-import { discoverRepos } from "../../cli/src/core/KBRepoDiscoverer.js";
+import {
+	type DiscoveredRepo,
+	discoverRepos,
+} from "../../cli/src/core/KBRepoDiscoverer.js";
+import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
 import { MetadataManager } from "../../cli/src/core/MetadataManager.js";
 import { normalizePathForCompare } from "../../cli/src/core/PathUtils.js";
 import {
@@ -42,7 +46,12 @@ import {
 	deletePlanVisibleArtifact,
 	getIndexEntryMap,
 	getSummary,
+	getTranscriptHashes,
+	indexNeedsMigration,
 	listSummaries,
+	migrateIndexToV3,
+	readTranscript,
+	readTranscriptsForCommits,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
 	storeLinearIssues,
@@ -374,7 +383,8 @@ export class JolliMemoryBridge {
 	/** Returns the current JolliMemory status by calling Installer.getStatus() directly. */
 	async getStatus(): Promise<StatusInfo> {
 		try {
-			return await installerGetStatus(this.cwd);
+			const storage = await this.getStorage();
+			return await installerGetStatus(this.cwd, storage);
 		} catch (err) {
 			log.error("bridge", "getStatus() failed: %s", String(err));
 			return {
@@ -1637,6 +1647,202 @@ export class JolliMemoryBridge {
 		return { summary: null, sourceRepoName: null, sourceRemoteUrl: null };
 	}
 
+	/**
+	 * Builds a {@link StorageProvider} rooted at a foreign repo's Memory Bank
+	 * `.jolli/` directory so callers can issue cross-repo reads (transcripts,
+	 * plans, notes) without going through the current workspace's primary
+	 * storage. Callers pass back the `sourceRepoName` / `sourceRemoteUrl`
+	 * returned by {@link getSummaryAnyRepoWithSource}; this method re-runs
+	 * the same {@link discoverRepos} scan and finds the matching foreign
+	 * repo, preferring `remoteUrl` over `repoName` (mirrors
+	 * `KBRepoDiscoverer.isCurrentRepo`'s identity rule).
+	 *
+	 * Returns null when no foreign repo matches — caller should fall back to
+	 * displaying empty content rather than reading from the wrong storage.
+	 * Skips the currentRepo entry intentionally: this factory exists only to
+	 * enable foreign-mode reads; returning the current repo would be a silent
+	 * no-op against caller intent.
+	 */
+	/**
+	 * Builds a {@link StorageProvider} rooted at the CURRENT workspace's
+	 * Memory Bank `.jolli/` directory. Counterpart to
+	 * {@link createStorageForRepo}: that one is foreign-only; this one
+	 * returns the `isCurrentRepo` match from the same discovery scan.
+	 *
+	 * The SummaryWebviewPanel passes the result as `readStorage` for every
+	 * detail panel (local + foreign) so all detail-panel reads
+	 * (transcripts, plans, notes) uniformly hit the Memory Bank folder
+	 * layer instead of the dual-write primary (orphan branch). Returns
+	 * null on fresh repos whose KB folder hasn't been created yet —
+	 * callers should fall back to bridge-default reads in that case.
+	 */
+	async createReadStorageForCurrentRepo(): Promise<{
+		storage: StorageProvider;
+		kbRoot: string;
+	} | null> {
+		try {
+			const cfg = (await loadConfig()) as Record<string, unknown>;
+			const customKBPath = cfg.localFolder as string | undefined;
+			const kbParent = resolveKbParent(customKBPath);
+			const currentRepoName = extractRepoName(this.cwd);
+			const currentRemoteUrl = getRemoteUrl(this.cwd);
+			const repos = discoverRepos(currentRepoName, currentRemoteUrl, kbParent);
+			for (const repo of repos) {
+				if (!repo.isCurrentRepo) continue;
+				const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
+				const storage = new FolderStorage(repo.kbRoot, mm);
+				return { storage, kbRoot: repo.kbRoot };
+			}
+		} catch (err) {
+			log.warn(
+				"createReadStorageForCurrentRepo",
+				`Discovery failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		return null;
+	}
+
+	async createStorageForRepo(
+		repoName: string,
+		remoteUrl: string | null,
+	): Promise<{ storage: StorageProvider; kbRoot: string } | null> {
+		try {
+			const cfg = (await loadConfig()) as Record<string, unknown>;
+			const customKBPath = cfg.localFolder as string | undefined;
+			const kbParent = resolveKbParent(customKBPath);
+			const currentRepoName = extractRepoName(this.cwd);
+			const currentRemoteUrl = getRemoteUrl(this.cwd);
+			const repos = discoverRepos(currentRepoName, currentRemoteUrl, kbParent);
+			for (const repo of repos) {
+				if (repo.isCurrentRepo) continue;
+				const urlMatches =
+					remoteUrl != null &&
+					repo.remoteUrl != null &&
+					repo.remoteUrl === remoteUrl;
+				const nameMatches = repo.repoName === repoName;
+				if (!urlMatches && !nameMatches) continue;
+				// When the caller supplied a remoteUrl AND this repo has one, we
+				// require the remote to match — name-only matches across distinct
+				// remotes would be a silent identity collision (folder renames
+				// produce this; see KBRepoDiscoverer.isCurrentRepo).
+				if (
+					remoteUrl != null &&
+					repo.remoteUrl != null &&
+					repo.remoteUrl !== remoteUrl
+				) {
+					continue;
+				}
+				const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
+				const storage = new FolderStorage(repo.kbRoot, mm);
+				return { storage, kbRoot: repo.kbRoot };
+			}
+		} catch (err) {
+			log.warn(
+				"createStorageForRepo",
+				`Discovery failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		return null;
+	}
+
+	/**
+	 * Locates the Memory Bank repo that contains `absPath` and returns the
+	 * matching {@link DiscoveredRepo} alongside a {@link MetadataManager} and
+	 * the kbRoot-relative path. Returns null if the file isn't under any
+	 * discovered kbRoot or if discovery itself fails.
+	 *
+	 * Shared by {@link isMemoryFileDivergedOnDisk} and
+	 * {@link resolveMemoryFile}; both used to inline this discovery walk
+	 * verbatim, so any future change to identity resolution (e.g. trailing-
+	 * slash handling, symlink resolution, Windows case folding) only has to
+	 * land here.
+	 *
+	 * Path comparison runs `normalizePathForCompare` over both endpoints for
+	 * the `startsWith` check so it survives Windows separator/case mismatches.
+	 * The returned `relPath` is produced from a separator-only normalization
+	 * of the original `absPath` — backslashes flipped to forward slashes but
+	 * casing preserved — because {@link FolderStorage} writes manifest
+	 * entries with literal `/` joins (e.g. `${branchFolder}/${fileName}`) at
+	 * the branch's original casing, and {@link MetadataManager.findByPath}
+	 * does strict `===` matching. Re-using `absNormalized` for the slice
+	 * would lowercase the branch name on darwin/win32 and miss every entry
+	 * for branches with uppercase characters (see user memory
+	 * `feedback_windows_path_separator_and_case.md`).
+	 */
+	private async findRepoForAbsPath(absPath: string): Promise<{
+		repo: DiscoveredRepo;
+		mm: MetadataManager;
+		relPath: string;
+	} | null> {
+		try {
+			const cfg = (await loadConfig()) as Record<string, unknown>;
+			const customKBPath = cfg.localFolder as string | undefined;
+			const kbParent = resolveKbParent(customKBPath);
+			const currentRepoName = extractRepoName(this.cwd);
+			const currentRemoteUrl = getRemoteUrl(this.cwd);
+			const repos = discoverRepos(currentRepoName, currentRemoteUrl, kbParent);
+			const absNormalized = normalizePathForCompare(absPath);
+			const absSlashed = absPath.replace(/\\/g, "/");
+			for (const repo of repos) {
+				const kbRootSlashed = repo.kbRoot.replace(/\\/g, "/");
+				const prefixSlashed = kbRootSlashed.endsWith("/")
+					? kbRootSlashed
+					: `${kbRootSlashed}/`;
+				const prefixNormalized = normalizePathForCompare(prefixSlashed);
+				if (!absNormalized.startsWith(prefixNormalized)) continue;
+				const relPath = absSlashed.slice(prefixSlashed.length);
+				const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
+				return { repo, mm, relPath };
+			}
+		} catch (err) {
+			log.warn(
+				"findRepoForAbsPath",
+				`${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		return null;
+	}
+
+	/**
+	 * Returns true if `absPath` is under a known Memory Bank kbRoot AND its
+	 * sha256 differs from the manifest fingerprint recorded when the system
+	 * last wrote that path. Used by the VS Code extension to drive the
+	 * divergence banner, decoration provider, and revert command.
+	 *
+	 * Returns false on any of: absPath not under a known kbRoot; manifest
+	 * has no fingerprint (legacy); file matches manifest. The "false on
+	 * unknown" choice is deliberate — the decoration provider asks about
+	 * every VS Code file URI it sees and must not flag files outside the
+	 * Memory Bank.
+	 */
+	async isMemoryFileDivergedOnDisk(absPath: string): Promise<boolean> {
+		const located = await this.findRepoForAbsPath(absPath);
+		if (!located) return false;
+		const { repo, mm, relPath } = located;
+		const entry = mm.findByPath(relPath);
+		if (!entry) return false;
+		const storage = new FolderStorage(repo.kbRoot, mm);
+		return storage.isUserEditedOnDisk(absPath, entry.fingerprint);
+	}
+
+	/**
+	 * Locate the FolderStorage + manifest entry responsible for `absPath`,
+	 * or null if the file is not under any known Memory Bank kbRoot. Used
+	 * by the revert command to dispatch to the correct regenerate helper.
+	 */
+	async resolveMemoryFile(absPath: string): Promise<{
+		folderStorage: FolderStorage;
+		manifestEntry: ManifestEntry;
+	} | null> {
+		const located = await this.findRepoForAbsPath(absPath);
+		if (!located) return null;
+		const { repo, mm, relPath } = located;
+		const manifestEntry = mm.findByPath(relPath);
+		if (!manifestEntry) return null;
+		const folderStorage = new FolderStorage(repo.kbRoot, mm);
+		return { folderStorage, manifestEntry };
+	}
+
 	// ── Storage-threaded writers (webview-initiated) ─────────────────────
 	//
 	// All `SummaryStore` writers default to `resolveStorage(undefined, cwd)`,
@@ -1761,6 +1967,38 @@ export class JolliMemoryBridge {
 	): Promise<void> {
 		const storage = await this.getStorage();
 		await saveTranscriptsBatch(writes, deletes, this.cwd, storage);
+	}
+
+	/** Returns the set of commit hashes that have transcript files. */
+	async getTranscriptHashes(): Promise<Set<string>> {
+		const storage = await this.getStorage();
+		return getTranscriptHashes(this.cwd, storage);
+	}
+
+	/** Reads a single transcript by commit hash, or null if absent. */
+	async readTranscript(commitHash: string): Promise<StoredTranscript | null> {
+		const storage = await this.getStorage();
+		return readTranscript(commitHash, this.cwd, storage);
+	}
+
+	/** Reads transcripts for a batch of commit hashes. */
+	async readTranscriptsForCommits(
+		commitHashes: ReadonlyArray<string>,
+	): Promise<Map<string, StoredTranscript>> {
+		const storage = await this.getStorage();
+		return readTranscriptsForCommits(commitHashes, this.cwd, storage);
+	}
+
+	/** Returns true if the index needs migration to v3 flat format. */
+	async indexNeedsMigration(): Promise<boolean> {
+		const storage = await this.getStorage();
+		return indexNeedsMigration(this.cwd, storage);
+	}
+
+	/** Migrates a v1 index to v3 flat format. */
+	async migrateIndexToV3(): Promise<{ migrated: number; skipped: number }> {
+		const storage = await this.getStorage();
+		return migrateIndexToV3(this.cwd, storage);
 	}
 
 	/** Archives a plan and associates it with a commit. */

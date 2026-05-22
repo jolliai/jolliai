@@ -1287,6 +1287,13 @@ ${buildTranscriptEntriesScript()}
     contentEl.addEventListener('click', function() {
       if (entryEl.classList.contains('deleted')) return;
       if (entryEl.classList.contains('editing')) return;
+      // Readonly modes (foreign repo, stale commit, in-flight regenerate) hide
+      // the entry-delete and modal Save/Cancel buttons via CSS, but the click-
+      // to-edit affordance is an event handler — CSS can't suppress it. Without
+      // this guard a click in cross-repo "View" mode would still pop a textarea
+      // the user can type into and immediately lose on blur (no projectDir to
+      // persist the overlay).
+      if (document.querySelector('.page.foreign-readonly, .page.stale-readonly, .page.regenerating-readonly')) return;
 
       // Blur any active textarea first
       if (activeTextarea) activeTextarea.blur();

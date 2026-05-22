@@ -244,9 +244,10 @@ export async function migrateOneToOne(
 	newCommitInfo: CommitInfo,
 	cwd?: string,
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
+	storage?: StorageProvider,
 ): Promise<void> {
 	await withRequiredOrphanWriteLock(cwd, "migrateOneToOne", () =>
-		migrateOneToOneLocked(oldSummary, newCommitInfo, cwd, metadata),
+		migrateOneToOneLocked(oldSummary, newCommitInfo, cwd, metadata, storage),
 	);
 }
 
@@ -255,6 +256,7 @@ async function migrateOneToOneLocked(
 	newCommitInfo: CommitInfo,
 	cwd?: string,
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
+	storage?: StorageProvider,
 ): Promise<void> {
 	log.info(
 		"Migrating summary 1:1: %s → %s",
@@ -311,8 +313,8 @@ async function migrateOneToOneLocked(
 		children: [strippedOld],
 	};
 
-	const existingIndex = await loadIndex(cwd);
-	const existingCatalog = await loadCatalog(cwd);
+	const existingIndex = await loadIndex(cwd, storage);
+	const existingCatalog = await loadCatalog(cwd, storage);
 	const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
 	const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
 
@@ -340,7 +342,7 @@ async function migrateOneToOneLocked(
 		buildCatalogFileWrite(existingCatalog, entryMap, newSummary),
 	];
 
-	const store = resolveStorage(undefined, cwd);
+	const store = resolveStorage(storage, cwd);
 	await store.writeFiles(
 		files,
 		`Migrate summary ${oldSummary.commitHash.substring(0, 8)} → ${newCommitInfo.hash.substring(0, 8)}`,
@@ -745,9 +747,10 @@ export async function mergeManyToOne(
 	cwd?: string,
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
 	consolidated?: ConsolidatedTopics,
+	storage?: StorageProvider,
 ): Promise<{ orphanedDocIds: number[] }> {
 	return withRequiredOrphanWriteLock(cwd, "mergeManyToOne", () =>
-		mergeManyToOneLocked(oldSummaries, newCommitInfo, cwd, metadata, consolidated),
+		mergeManyToOneLocked(oldSummaries, newCommitInfo, cwd, metadata, consolidated, storage),
 	);
 }
 
@@ -757,6 +760,7 @@ async function mergeManyToOneLocked(
 	cwd?: string,
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
 	consolidated?: ConsolidatedTopics,
+	storage?: StorageProvider,
 ): Promise<{ orphanedDocIds: number[] }> {
 	log.info("Merging %d summaries into %s", oldSummaries.length, newCommitInfo.hash.substring(0, 8));
 
@@ -822,8 +826,8 @@ async function mergeManyToOneLocked(
 		children: strippedChildren,
 	};
 
-	const existingIndex = await loadIndex(cwd);
-	const existingCatalog = await loadCatalog(cwd);
+	const existingIndex = await loadIndex(cwd, storage);
+	const existingCatalog = await loadCatalog(cwd, storage);
 	const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
 	const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
 
@@ -852,7 +856,7 @@ async function mergeManyToOneLocked(
 		buildCatalogFileWrite(existingCatalog, entryMap, mergedSummary),
 	];
 
-	const store = resolveStorage(undefined, cwd);
+	const store = resolveStorage(storage, cwd);
 	await store.writeFiles(files, `Merge summaries [${oldHashesStr}] → ${newCommitInfo.hash.substring(0, 8)}`);
 	log.info(
 		"Summaries merged: [%s] → %s (%d children, %d orphaned docs)",
@@ -874,7 +878,7 @@ async function mergeManyToOneLocked(
  *
  * Use only for admin cleanup of truly orphaned root entries.
  */
-export async function removeFromIndex(commitHash: string, cwd?: string): Promise<void> {
+export async function removeFromIndex(commitHash: string, cwd?: string, storage?: StorageProvider): Promise<void> {
 	// Acquire orphan-write.lock before touching index/catalog: this function
 	// performs a multi-file write that races with QueueWorker / scanTreeHashAliases
 	// / storeSummary if unsynchronized. Loading the data inside the lock window
@@ -893,7 +897,7 @@ export async function removeFromIndex(commitHash: string, cwd?: string): Promise
 		return;
 	}
 	try {
-		const existingIndex = await loadIndex(cwd);
+		const existingIndex = await loadIndex(cwd, storage);
 		if (!existingIndex) {
 			return;
 		}
@@ -911,13 +915,13 @@ export async function removeFromIndex(commitHash: string, cwd?: string): Promise
 		const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
 
 		// Keep catalog aligned: drop the entry for this hash if catalog tracks it.
-		const existingCatalog = await loadCatalog(cwd);
+		const existingCatalog = await loadCatalog(cwd, storage);
 		const catalogWrite = buildCatalogRemoveFileWrite(existingCatalog, commitHash);
 		if (catalogWrite) {
 			files.push(catalogWrite);
 		}
 
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		await store.writeFiles(files, `Remove index entry for ${commitHash.substring(0, 8)}`);
 		log.info("Removed %s from index", commitHash.substring(0, 8));
 	} finally {
@@ -1014,16 +1018,16 @@ export async function saveTranscriptsBatch(
 /**
  * Deletes a single transcript file from the orphan branch.
  */
-export async function deleteTranscript(commitHash: string, cwd?: string): Promise<void> {
-	await saveTranscriptsBatch([], [commitHash], cwd);
+export async function deleteTranscript(commitHash: string, cwd?: string, storage?: StorageProvider): Promise<void> {
+	await saveTranscriptsBatch([], [commitHash], cwd, storage);
 }
 
 /**
  * Returns the set of commit hashes that have transcript files in the orphan branch.
  * Scans the `transcripts/` prefix via the active storage provider.
  */
-export async function getTranscriptHashes(cwd?: string): Promise<Set<string>> {
-	const store = resolveStorage(undefined, cwd);
+export async function getTranscriptHashes(cwd?: string, storage?: StorageProvider): Promise<Set<string>> {
+	const store = resolveStorage(storage, cwd);
 	const files = await store.listFiles("transcripts/");
 	const hashes = new Set<string>();
 	for (const filePath of files) {
@@ -1438,8 +1442,8 @@ export async function scanTreeHashAliases(
  * from squash/amend trees). Uses the index for accurate counting so the
  * result matches the Memories panel and CLI `view` list.
  */
-export async function getSummaryCount(cwd?: string): Promise<number> {
-	const index = await loadIndex(cwd);
+export async function getSummaryCount(cwd?: string, storage?: StorageProvider): Promise<number> {
+	const index = await loadIndex(cwd, storage);
 	if (!index) {
 		return 0;
 	}
@@ -1450,8 +1454,8 @@ export async function getSummaryCount(cwd?: string): Promise<number> {
  * Returns true if the current index needs migration to v3 flat format.
  * A v1 index (all entries lack `parentCommitHash`) should be migrated.
  */
-export async function indexNeedsMigration(cwd?: string): Promise<boolean> {
-	const index = await loadIndex(cwd);
+export async function indexNeedsMigration(cwd?: string, storage?: StorageProvider): Promise<boolean> {
+	const index = await loadIndex(cwd, storage);
 	if (!index || index.entries.length === 0) return false;
 	return index.version !== 3;
 }
@@ -1463,12 +1467,18 @@ export async function indexNeedsMigration(cwd?: string): Promise<boolean> {
  *
  * Acquires `orphan-write.lock` internally — callers no longer need to wrap.
  */
-export async function migrateIndexToV3(cwd?: string): Promise<{ migrated: number; skipped: number }> {
-	return withRequiredOrphanWriteLock(cwd, "migrateIndexToV3", () => migrateIndexToV3Locked(cwd));
+export async function migrateIndexToV3(
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<{ migrated: number; skipped: number }> {
+	return withRequiredOrphanWriteLock(cwd, "migrateIndexToV3", () => migrateIndexToV3Locked(cwd, storage));
 }
 
-async function migrateIndexToV3Locked(cwd?: string): Promise<{ migrated: number; skipped: number }> {
-	const existingIndex = await loadIndex(cwd);
+async function migrateIndexToV3Locked(
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<{ migrated: number; skipped: number }> {
+	const existingIndex = await loadIndex(cwd, storage);
 	if (!existingIndex) {
 		log.info("No index found — nothing to migrate");
 		return { migrated: 0, skipped: 0 };
@@ -1490,7 +1500,7 @@ async function migrateIndexToV3Locked(cwd?: string): Promise<{ migrated: number;
 
 	for (const entry of existingIndex.entries) {
 		// In v1, all entries are top-level (no parentCommitHash field)
-		const summaryContent = await readSummaryFile(entry.commitHash, cwd);
+		const summaryContent = await readSummaryFile(entry.commitHash, cwd, storage);
 		if (!summaryContent) {
 			log.warn("Could not load summary for %s — skipping", entry.commitHash.substring(0, 8));
 			skipped++;
@@ -1522,7 +1532,7 @@ async function migrateIndexToV3Locked(cwd?: string): Promise<{ migrated: number;
 		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
 		{ path: CATALOG_FILE, content: JSON.stringify(newCatalog, null, "\t") },
 	];
-	const store = resolveStorage(undefined, cwd);
+	const store = resolveStorage(storage, cwd);
 	await store.writeFiles(files, `Migrate index v1 → v3 (${migrated} entries)`);
 
 	log.info("Index migrated to v3: %d migrated, %d skipped", migrated, skipped);
@@ -1993,9 +2003,13 @@ export async function deletePlanVisibleArtifact(
  * Reads a plan progress artifact from the orphan branch.
  * Returns the parsed artifact, or null if the file doesn't exist or fails to parse.
  */
-export async function readPlanProgress(slug: string, cwd?: string): Promise<PlanProgressArtifact | null> {
+export async function readPlanProgress(
+	slug: string,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<PlanProgressArtifact | null> {
 	try {
-		const store = resolveStorage(undefined, cwd);
+		const store = resolveStorage(storage, cwd);
 		const json = await store.readFile(`plan-progress/${slug}.json`);
 		if (!json) return null;
 		return JSON.parse(json) as PlanProgressArtifact;

@@ -360,6 +360,41 @@ describe("FolderStorage", () => {
 			const mds = readdirSync(mainDir).filter((f: string) => f.endsWith(".md"));
 			expect(mds).toHaveLength(1);
 		});
+
+		// Legacy manifest entries (pre-fingerprint era) carry no fingerprint
+		// baseline, so cleanupSupersededDescendants cannot prove the system
+		// wrote the on-disk file. It must skip the delete and leave both the
+		// MD file and the manifest entry in place — anything else risks
+		// deleting hand-edited content that predates the fingerprint feature.
+		it("preserves descendant MD AND manifest entry when the entry has no fingerprint baseline (legacy)", async () => {
+			const oldJson = summaryWithChildren("legacynofp000000", "Legacy descendant");
+			await storage.writeFiles([{ path: "summaries/legacynofp000000.json", content: oldJson }], "old");
+			const mainDir = join(rootPath, "main");
+			const oldName = readdirSync(mainDir).find((f: string) => f.includes("legacyno"));
+			expect(oldName).toBeDefined();
+			const oldPath = join(mainDir, oldName as string);
+
+			// Strip fingerprint to simulate a pre-fingerprint manifest row.
+			const legacyEntry = metadataManager.findById("legacynofp000000");
+			if (!legacyEntry) throw new Error("legacy entry must exist before strip");
+			metadataManager.updateManifest({
+				path: legacyEntry.path,
+				fileId: legacyEntry.fileId,
+				type: legacyEntry.type,
+				fingerprint: undefined as unknown as string,
+				source: legacyEntry.source,
+				title: legacyEntry.title,
+			});
+
+			// Wrap the legacy entry as a child of a new root → triggers cleanup.
+			const newJson = summaryWithChildren("newroot000000000", "New root", [JSON.parse(oldJson)]);
+			await storage.writeFiles([{ path: "summaries/newroot000000000.json", content: newJson }], "new");
+
+			// Legacy descendant MD survives — no baseline = no proof we wrote it.
+			expect(existsSync(oldPath)).toBe(true);
+			expect(metadataManager.findById("legacynofp000000")).toBeDefined();
+			expect(metadataManager.findById("newroot000000000")).toBeDefined();
+		});
 	});
 
 	describe("deleteVisibleMarkdown", () => {
@@ -1226,6 +1261,113 @@ describe("FolderStorage", () => {
 				expect(metadataManager.findById(id)).toBeUndefined();
 			}
 		});
+
+		// TOCTOU: hidden JSON disappeared (or parse failed inside regenerate)
+		// between heal's existsSync probe and the actual regenerate call. The
+		// manifest row is kept (the source was intact a moment ago); failed++
+		// so the CLI's "transient read error — re-run later" hint surfaces.
+		it("counts as failed when regenerateVisibleMarkdown returns false (TOCTOU between probe and write)", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "toctoufalse00000",
+				commitMessage: "Toctou false",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/toctoufalse00000.json", content: summaryJson }], "seed");
+			unlinkSync(join(rootPath, "main", "toctou-false-toctoufa.md"));
+			const spy = vi.spyOn(storage, "regenerateVisibleMarkdown").mockResolvedValueOnce(false);
+
+			const result = await storage.healMissingVisibleMarkdown();
+
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(result.healed).toBe(0);
+			expect(result.failed).toBe(1);
+			// Row preserved — heal will retry on the next pass.
+			expect(metadataManager.findById("toctoufalse00000")).toBeDefined();
+			spy.mockRestore();
+		});
+
+		it("counts as failed when regenerateVisibleMarkdown throws (errMsg path)", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "regenerateboom00",
+				commitMessage: "Regen boom",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/regenerateboom00.json", content: summaryJson }], "seed");
+			unlinkSync(join(rootPath, "main", "regen-boom-regenera.md"));
+			const spy = vi
+				.spyOn(storage, "regenerateVisibleMarkdown")
+				.mockRejectedValueOnce(new Error("ENOSPC during write"));
+
+			const result = await storage.healMissingVisibleMarkdown();
+
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(result.healed).toBe(0);
+			expect(result.failed).toBe(1);
+			expect(metadataManager.findById("regenerateboom00")).toBeDefined();
+			spy.mockRestore();
+		});
+	});
+
+	describe("pruneBranchMappings", () => {
+		it("delegates to MetadataManager.unregisterBranches and returns the removal count", async () => {
+			// Pre-seed branches.json with three mappings (resolveFolderForBranch
+			// auto-creates them on first lookup) then prune two; the third must
+			// survive both at the branches.json level and as a resolvable mapping.
+			await storage.ensure();
+			metadataManager.resolveFolderForBranch("alive/branch");
+			metadataManager.resolveFolderForBranch("dead/one");
+			metadataManager.resolveFolderForBranch("dead/two");
+			const before = metadataManager.readBranches();
+			expect(before.mappings).toHaveLength(3);
+
+			const removed = await storage.pruneBranchMappings(["dead/one", "dead/two"]);
+
+			expect(removed).toBe(2);
+			const after = metadataManager.readBranches();
+			expect(after.mappings.map((m) => m.branch)).toEqual(["alive/branch"]);
+		});
+
+		it("returns 0 when none of the requested branches are mapped", async () => {
+			await storage.ensure();
+			metadataManager.resolveFolderForBranch("real/branch");
+
+			const removed = await storage.pruneBranchMappings(["never/mapped"]);
+
+			expect(removed).toBe(0);
+		});
+	});
+
+	describe("regenerateVisibleMarkdown — malformed hidden JSON", () => {
+		// `regenerateVisibleMarkdown` is reused by heal AND by the explicit
+		// revert flow. A malformed hidden JSON must NOT throw — it returns
+		// false so callers count it as "transient" rather than aborting.
+		it("returns false (does not throw) when the hidden JSON cannot be parsed", async () => {
+			await storage.ensure();
+			const summaryJson = makeSummaryJson({
+				commitHash: "malformedregen00",
+				commitMessage: "Malformed regen",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/malformedregen00.json", content: summaryJson }], "seed");
+			// Trash the hidden JSON in-place so regenerate's parseJSON throws.
+			writeFileSync(join(rootPath, ".jolli", "summaries", "malformedregen00.json"), "{ not valid json", "utf-8");
+			const visiblePath = join(rootPath, "main", "malformed-regen-malforme.md");
+			unlinkSync(visiblePath);
+
+			const entry = metadataManager.findById("malformedregen00");
+			if (!entry) throw new Error("entry must exist");
+			const result = await storage.regenerateVisibleMarkdown({
+				commitHash: "malformedregen00",
+				parentCommitHash: null,
+				commitMessage: "Malformed regen",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+			});
+
+			expect(result).toBe(false);
+			expect(existsSync(visiblePath)).toBe(false);
+		});
 	});
 
 	describe("slugify", () => {
@@ -1627,6 +1769,450 @@ describe("FolderStorage", () => {
 			);
 			const entry = metadataManager.findById("note:no-heading-aaa11111");
 			expect(entry?.title).toBe("no-heading-aaa11111");
+		});
+	});
+
+	describe("isUserEditedOnDisk", () => {
+		it("returns false when the file does not exist", () => {
+			const result = storage.isUserEditedOnDisk(join(rootPath, "nope.md"), "abc123");
+			expect(result).toBe(false);
+		});
+
+		it("returns false when no manifest fingerprint baseline is available", () => {
+			const absPath = join(rootPath, "main", "foo.md");
+			mkdirSync(join(rootPath, "main"), { recursive: true });
+			writeFileSync(absPath, "anything", "utf-8");
+			const result = storage.isUserEditedOnDisk(absPath, undefined);
+			expect(result).toBe(false);
+		});
+
+		it("returns false when on-disk content matches the fingerprint", () => {
+			const absPath = join(rootPath, "main", "foo.md");
+			mkdirSync(join(rootPath, "main"), { recursive: true });
+			const content = "stable content";
+			writeFileSync(absPath, content, "utf-8");
+			const fingerprint = MetadataManager.sha256(content);
+			const result = storage.isUserEditedOnDisk(absPath, fingerprint);
+			expect(result).toBe(false);
+		});
+
+		it("returns true when on-disk content diverges from the fingerprint", () => {
+			const absPath = join(rootPath, "main", "foo.md");
+			mkdirSync(join(rootPath, "main"), { recursive: true });
+			writeFileSync(absPath, "edited content", "utf-8");
+			const fingerprint = MetadataManager.sha256("original content");
+			const result = storage.isUserEditedOnDisk(absPath, fingerprint);
+			expect(result).toBe(true);
+		});
+	});
+
+	describe("generateSummaryMarkdown: write protection", () => {
+		it("skips overwriting a user-edited visible markdown", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "abcdef1234567890",
+				commitMessage: "Add feature",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/abcdef1234567890.json", content: summaryJson }], "seed");
+
+			const visiblePath = join(rootPath, "main", "add-feature-abcdef12.md");
+			expect(existsSync(visiblePath)).toBe(true);
+
+			const editedContent = "# User edited content\n\nThis must survive.";
+			writeFileSync(visiblePath, editedContent, "utf-8");
+
+			await storage.writeFiles([{ path: "summaries/abcdef1234567890.json", content: summaryJson }], "regenerate");
+
+			expect(readFileSync(visiblePath, "utf-8")).toBe(editedContent);
+		});
+
+		it("overwrites normally when the on-disk file matches the manifest fingerprint", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "11112222deadbeef",
+				commitMessage: "Refactor module",
+				branch: "main",
+				commitAuthor: "Alice",
+			});
+			await storage.writeFiles([{ path: "summaries/11112222deadbeef.json", content: summaryJson }], "seed");
+
+			const visiblePath = join(rootPath, "main", "refactor-module-11112222.md");
+			const before = readFileSync(visiblePath, "utf-8");
+
+			// Keep commitMessage (and thus filename) stable. Change a frontmatter
+			// field — buildMarkdown is mocked to a constant in this suite, so the
+			// body alone won't show a difference; the YAML frontmatter will.
+			const updatedJson = makeSummaryJson({
+				commitHash: "11112222deadbeef",
+				commitMessage: "Refactor module",
+				branch: "main",
+				commitAuthor: "Bob",
+			});
+			await storage.writeFiles([{ path: "summaries/11112222deadbeef.json", content: updatedJson }], "update");
+
+			const after = readFileSync(visiblePath, "utf-8");
+			expect(after).not.toBe(before);
+		});
+
+		it("overwrites legacy entries without a fingerprint, then protects on next write", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "3333444455556666",
+				commitMessage: "Old commit",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/3333444455556666.json", content: summaryJson }], "seed");
+
+			const visiblePath = join(rootPath, "main", "old-commit-33334444.md");
+			const manifestEntry = metadataManager.findById("3333444455556666");
+			expect(manifestEntry).toBeDefined();
+			expect(manifestEntry?.fingerprint).toBeDefined();
+			if (!manifestEntry) throw new Error("manifestEntry must be defined");
+
+			// Simulate legacy by deleting the fingerprint from the manifest entry.
+			metadataManager.updateManifest({
+				path: manifestEntry.path,
+				fileId: manifestEntry.fileId,
+				type: manifestEntry.type,
+				fingerprint: undefined as unknown as string,
+				source: manifestEntry.source,
+				title: manifestEntry.title,
+			});
+
+			writeFileSync(visiblePath, "# Legacy hand-edit", "utf-8");
+
+			await storage.writeFiles(
+				[{ path: "summaries/3333444455556666.json", content: summaryJson }],
+				"rewrite-legacy",
+			);
+
+			// Legacy: overwrite was permitted (no baseline to protect).
+			expect(readFileSync(visiblePath, "utf-8")).not.toContain("Legacy hand-edit");
+
+			// Now there IS a fingerprint; a fresh hand-edit must be protected.
+			writeFileSync(visiblePath, "# Post-legacy hand-edit", "utf-8");
+			await storage.writeFiles(
+				[{ path: "summaries/3333444455556666.json", content: summaryJson }],
+				"second-rewrite",
+			);
+			expect(readFileSync(visiblePath, "utf-8")).toContain("Post-legacy hand-edit");
+		});
+	});
+
+	describe("generatePlanMarkdown: manifest source.branch persistence", () => {
+		it("records source.branch on the plan manifest entry so revert can route back to the source branch", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "ffff1111aaaa2222",
+				commitMessage: "Plan branch persist",
+				branch: "feature/login",
+			});
+			await storage.writeFiles(
+				[{ path: "summaries/ffff1111aaaa2222.json", content: summaryJson }],
+				"seed-summary",
+			);
+			await storage.writeFiles(
+				[
+					{
+						path: "plans/ffff1111aaaa2222.md",
+						content: "# Plan body\n\nLogin scope.",
+						branch: "feature/login",
+					},
+				],
+				"seed-plan",
+			);
+			const manifest = metadataManager.readManifest();
+			const entry = manifest.files.find((f) => f.fileId === "plan:ffff1111aaaa2222");
+			expect(entry?.source?.branch).toBe("feature/login");
+		});
+	});
+
+	describe("generateNoteMarkdown: manifest source.branch persistence", () => {
+		it("records source.branch on the note manifest entry so revert can route back to the source branch", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "eeee5555ffff6666",
+				commitMessage: "Note branch persist",
+				branch: "fix/doc-bug",
+			});
+			await storage.writeFiles(
+				[{ path: "summaries/eeee5555ffff6666.json", content: summaryJson }],
+				"seed-summary",
+			);
+			await storage.writeFiles(
+				[
+					{
+						path: "notes/eeee5555ffff6666.md",
+						content: "# Note body",
+						branch: "fix/doc-bug",
+					},
+				],
+				"seed-note",
+			);
+			const manifest = metadataManager.readManifest();
+			const entry = manifest.files.find((f) => f.fileId === "note:eeee5555ffff6666");
+			expect(entry?.source?.branch).toBe("fix/doc-bug");
+		});
+	});
+
+	describe("resolveBranchForFolder", () => {
+		it("returns the registered branch for a known folder", async () => {
+			metadataManager.resolveFolderForBranch("feature/login");
+			expect(storage.resolveBranchForFolder("feature-login")).toBe("feature/login");
+		});
+
+		it("returns null for an unregistered folder", () => {
+			expect(storage.resolveBranchForFolder("does-not-exist")).toBeNull();
+		});
+	});
+
+	describe("generatePlanMarkdown: write protection", () => {
+		it("skips overwriting a user-edited visible plan markdown", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "aaaa1111bbbb2222",
+				commitMessage: "Add login",
+				branch: "feature/login",
+			});
+			await storage.writeFiles(
+				[{ path: "summaries/aaaa1111bbbb2222.json", content: summaryJson }],
+				"seed-summary",
+			);
+			await storage.writeFiles(
+				[
+					{
+						path: "plans/aaaa1111bbbb2222.md",
+						content: "# Plan body\n\nThink about login.",
+						branch: "feature/login",
+					},
+				],
+				"seed-plan",
+			);
+
+			const visiblePath = join(rootPath, "feature-login", "plan--aaaa1111bbbb2222.md");
+			expect(existsSync(visiblePath)).toBe(true);
+
+			const editedContent = "# Hand-edited plan\n\nMust survive.";
+			writeFileSync(visiblePath, editedContent, "utf-8");
+
+			await storage.writeFiles(
+				[
+					{
+						path: "plans/aaaa1111bbbb2222.md",
+						content: "# Plan body\n\nThink about login.",
+						branch: "feature/login",
+					},
+				],
+				"regenerate-plan",
+			);
+
+			expect(readFileSync(visiblePath, "utf-8")).toBe(editedContent);
+		});
+	});
+
+	describe("generateNoteMarkdown: write protection", () => {
+		it("skips overwriting a user-edited visible note markdown", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "cccc3333dddd4444",
+				commitMessage: "Doc bug",
+				branch: "fix/doc-bug",
+			});
+			await storage.writeFiles(
+				[{ path: "summaries/cccc3333dddd4444.json", content: summaryJson }],
+				"seed-summary",
+			);
+			await storage.writeFiles(
+				[
+					{
+						path: "notes/cccc3333dddd4444.md",
+						content: "# Note body",
+						branch: "fix/doc-bug",
+					},
+				],
+				"seed-note",
+			);
+
+			const visiblePath = join(rootPath, "fix-doc-bug", "note--cccc3333dddd4444.md");
+			expect(existsSync(visiblePath)).toBe(true);
+
+			const editedContent = "# Hand-edited note\n\nMust survive.";
+			writeFileSync(visiblePath, editedContent, "utf-8");
+
+			await storage.writeFiles(
+				[
+					{
+						path: "notes/cccc3333dddd4444.md",
+						content: "# Note body",
+						branch: "fix/doc-bug",
+					},
+				],
+				"regenerate-note",
+			);
+
+			expect(readFileSync(visiblePath, "utf-8")).toBe(editedContent);
+		});
+	});
+
+	describe("forceRegenerateVisibleMarkdown", () => {
+		it("overwrites a diverged visible markdown back to the JSON-derived version", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "5555666677778888",
+				commitMessage: "Add tests",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/5555666677778888.json", content: summaryJson }], "seed");
+
+			const visiblePath = join(rootPath, "main", "add-tests-55556666.md");
+			const original = readFileSync(visiblePath, "utf-8");
+
+			writeFileSync(visiblePath, "# Diverged content", "utf-8");
+			expect(readFileSync(visiblePath, "utf-8")).toBe("# Diverged content");
+
+			const result = await storage.forceRegenerateVisibleMarkdown({
+				commitHash: "5555666677778888",
+				commitMessage: "Add tests",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(result).toBe(true);
+			expect(readFileSync(visiblePath, "utf-8")).toBe(original);
+		});
+
+		it("returns false when the hidden JSON source is missing", async () => {
+			const result = await storage.forceRegenerateVisibleMarkdown({
+				commitHash: "9999000011112222",
+				commitMessage: "Phantom",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+			expect(result).toBe(false);
+		});
+	});
+
+	describe("regenerateVisiblePlan", () => {
+		it("overwrites a diverged visible plan from the hidden plans/ source", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "abcd1234abcd1234",
+				commitMessage: "Plan thing",
+				branch: "feature/plan-thing",
+			});
+			await storage.writeFiles(
+				[{ path: "summaries/abcd1234abcd1234.json", content: summaryJson }],
+				"seed-summary",
+			);
+			await storage.writeFiles(
+				[
+					{
+						path: "plans/abcd1234abcd1234.md",
+						content: "# Original plan",
+						branch: "feature/plan-thing",
+					},
+				],
+				"seed-plan",
+			);
+
+			const visiblePath = join(rootPath, "feature-plan-thing", "plan--abcd1234abcd1234.md");
+			writeFileSync(visiblePath, "# Diverged plan", "utf-8");
+
+			const result = await storage.regenerateVisiblePlan("abcd1234abcd1234", "feature/plan-thing");
+
+			expect(result).toBe(true);
+			expect(readFileSync(visiblePath, "utf-8")).toContain("Original plan");
+			expect(readFileSync(visiblePath, "utf-8")).not.toContain("Diverged");
+		});
+
+		it("returns false when the hidden plans/ source is missing", async () => {
+			const result = await storage.regenerateVisiblePlan("nonexistent", "main");
+			expect(result).toBe(false);
+		});
+
+		// The unlink-first branch only fires when a visible file actually
+		// exists. The opposite — hidden source present but visible already
+		// missing — must skip the unlink and write the visible directly.
+		// Pins the `existsSync(visiblePath) === false` arm.
+		it("writes the visible plan without unlinking when no prior visible file exists", async () => {
+			await storage.writeFiles(
+				[
+					{
+						path: "plans/freshplan11111.md",
+						content: "# Fresh plan",
+						branch: "feature/fresh-plan",
+					},
+				],
+				"seed-plan",
+			);
+			const visiblePath = join(rootPath, "feature-fresh-plan", "plan--freshplan11111.md");
+			// Remove visible so the existsSync branch in regenerate takes the
+			// "no prior file" path.
+			unlinkSync(visiblePath);
+			expect(existsSync(visiblePath)).toBe(false);
+
+			const result = await storage.regenerateVisiblePlan("freshplan11111", "feature/fresh-plan");
+
+			expect(result).toBe(true);
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(readFileSync(visiblePath, "utf-8")).toContain("Fresh plan");
+		});
+	});
+
+	describe("regenerateVisibleNote", () => {
+		it("overwrites a diverged visible note from the hidden notes/ source", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "ef0123ef0123ef01",
+				commitMessage: "Note thing",
+				branch: "fix/note-thing",
+			});
+			await storage.writeFiles(
+				[{ path: "summaries/ef0123ef0123ef01.json", content: summaryJson }],
+				"seed-summary",
+			);
+			await storage.writeFiles(
+				[
+					{
+						path: "notes/ef0123ef0123ef01.md",
+						content: "# Original note",
+						branch: "fix/note-thing",
+					},
+				],
+				"seed-note",
+			);
+
+			const visiblePath = join(rootPath, "fix-note-thing", "note--ef0123ef0123ef01.md");
+			writeFileSync(visiblePath, "# Diverged note", "utf-8");
+
+			const result = await storage.regenerateVisibleNote("ef0123ef0123ef01", "fix/note-thing");
+
+			expect(result).toBe(true);
+			expect(readFileSync(visiblePath, "utf-8")).toContain("Original note");
+		});
+
+		it("returns false when the hidden notes/ source is missing", async () => {
+			const result = await storage.regenerateVisibleNote("nonexistent", "main");
+			expect(result).toBe(false);
+		});
+
+		// Mirrors the regenerateVisiblePlan "no prior visible" test; pins the
+		// `existsSync(visiblePath) === false` arm for the note path.
+		it("writes the visible note without unlinking when no prior visible file exists", async () => {
+			await storage.writeFiles(
+				[
+					{
+						path: "notes/freshnote2222.md",
+						content: "# Fresh note",
+						branch: "fix/fresh-note",
+					},
+				],
+				"seed-note",
+			);
+			const visiblePath = join(rootPath, "fix-fresh-note", "note--freshnote2222.md");
+			unlinkSync(visiblePath);
+			expect(existsSync(visiblePath)).toBe(false);
+
+			const result = await storage.regenerateVisibleNote("freshnote2222", "fix/fresh-note");
+
+			expect(result).toBe(true);
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(readFileSync(visiblePath, "utf-8")).toContain("Fresh note");
 		});
 	});
 });

@@ -28,8 +28,6 @@ vi.mock("node:os", async (importOriginal) => {
 	return { ...actual, homedir: () => mockHomedir() };
 });
 
-vi.stubGlobal("__PKG_VERSION__", "1.0.0");
-
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -268,6 +266,10 @@ describe("DistPathResolver", () => {
 
 	describe("resolveDistPath", () => {
 		it("should return caller info without candidate collection", async () => {
+			// vite.config.ts sets `unstubGlobals: true`, which calls
+			// `vi.unstubAllGlobals()` before each test — so the stub must live inside
+			// the it() body, not at module top-level, to survive into the assertion.
+			vi.stubGlobal("__PKG_VERSION__", "1.0.0");
 			const result = await resolveDistPath(tempDir, "/some/dist", "cli");
 			expect(result).toEqual({
 				distDir: "/some/dist",

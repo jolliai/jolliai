@@ -35,6 +35,11 @@ export interface ShowOptions {
 	 * panel disposes itself before invoking the callback.
 	 */
 	readonly onSessionHidden?: (sessionId: string) => void;
+	/**
+	 * Invoked after any successful persisted edit/delete save so list surfaces
+	 * (like the sidebar CONVERSATIONS row) can refresh badges/counts.
+	 */
+	readonly onSessionChanged?: (sessionId: string) => void;
 }
 
 /**
@@ -102,6 +107,7 @@ export class ConversationDetailsPanel {
 	private readonly transcriptPath: string;
 	private readonly projectDir: string | undefined;
 	private readonly onSessionHidden: ((sessionId: string) => void) | undefined;
+	private readonly onSessionChanged: ((sessionId: string) => void) | undefined;
 
 	private constructor(opts: ShowOptions) {
 		this.sessionId = opts.sessionId;
@@ -109,6 +115,7 @@ export class ConversationDetailsPanel {
 		this.transcriptPath = opts.transcriptPath;
 		this.projectDir = opts.projectDir;
 		this.onSessionHidden = opts.onSessionHidden;
+		this.onSessionChanged = opts.onSessionChanged;
 		this.panel = vscode.window.createWebviewPanel(
 			"jollimemory.conversationDetails",
 			opts.title,
@@ -120,6 +127,14 @@ export class ConversationDetailsPanel {
 			},
 		);
 		const nonce = randomBytes(16).toString("hex");
+		const codiconCssUri = this.panel.webview.asWebviewUri(
+			vscode.Uri.joinPath(
+				opts.extensionUri,
+				"assets",
+				"codicons",
+				"codicon.css",
+			),
+		);
 		this.panel.webview.html = buildConversationDetailsHtml({
 			nonce,
 			sessionId: opts.sessionId,
@@ -127,6 +142,8 @@ export class ConversationDetailsPanel {
 			transcriptPath: opts.transcriptPath,
 			title: opts.title,
 			readOnly: this.projectDir === undefined,
+			cspSource: this.panel.webview.cspSource,
+			codiconCssUri: codiconCssUri.toString(),
 		});
 		this.panel.onDidDispose(() => {
 			ConversationDetailsPanel.panels.delete(
@@ -189,11 +206,6 @@ export class ConversationDetailsPanel {
 		}
 	}
 
-	private async loadMergedEntries(): Promise<ReadonlyArray<TranscriptEntry>> {
-		const view = await this.loadEntriesForView();
-		return view.displayed;
-	}
-
 	/**
 	 * Loads the cursor-trimmed transcript plus the saved overlay and returns
 	 * two views of the same length and order:
@@ -220,11 +232,12 @@ export class ConversationDetailsPanel {
 	private async loadEntriesForView(): Promise<{
 		readonly displayed: ReadonlyArray<TranscriptEntry>;
 		readonly rawByIndex: ReadonlyArray<TranscriptEntry>;
+		readonly isEdited: boolean;
 	}> {
 		const { loadUnreadTranscript } = await import(
 			"../../../cli/src/core/TranscriptMessageCounter.js"
 		);
-		const { loadOverlay, applyOverlay, applyDeletes } = await import(
+		const { loadOverlay, applyOverlay, applyDeletes, hasOverlayChanges } = await import(
 			"../../../cli/src/core/ConversationOverlayStore.js"
 		);
 		const raw = await loadUnreadTranscript(
@@ -245,18 +258,20 @@ export class ConversationDetailsPanel {
 		return {
 			displayed: applyOverlay(raw, overlay),
 			rawByIndex: applyDeletes(raw, overlay),
+			isEdited: hasOverlayChanges(overlay),
 		};
 	}
 
 	private async sendTranscript(): Promise<void> {
-		const merged = await this.loadMergedEntries();
-		const wireEntries: DisplayEntry[] = merged.map((entry, displayIndex) => ({
+		const { displayed, isEdited } = await this.loadEntriesForView();
+		const wireEntries: DisplayEntry[] = displayed.map((entry, displayIndex) => ({
 			...entry,
 			displayIndex,
 		}));
 		void this.panel.webview.postMessage({
 			type: "transcriptLoaded",
 			entries: wireEntries,
+			isEdited,
 		});
 	}
 
@@ -331,28 +346,33 @@ export class ConversationDetailsPanel {
 			// Re-fetch the merged view so the panel reflects the persisted
 			// state and surfaces any new entries appended by the source app
 			// since the last load.
-			const afterMerged = await this.loadMergedEntries();
+			const afterView = await this.loadEntriesForView();
 			void this.panel.webview.postMessage({
 				type: "transcriptLoaded",
-				entries: afterMerged.map((entry, displayIndex) => ({
+				entries: afterView.displayed.map((entry, displayIndex) => ({
 					...entry,
 					displayIndex,
 				})),
+				isEdited: afterView.isEdited,
 			});
 
 			// If the user emptied the merged transcript (Mark All as Deleted, or
 			// piecewise deletion of every entry), persist a list-level hide and
 			// dispose the panel — the row in CONVERSATIONS will disappear on the
 			// next pushConversations() triggered by onSessionHidden.
-			if (afterMerged.length === 0) {
+			if (afterView.displayed.length === 0) {
 				const { hideConversation } = await import(
 					"../../../cli/src/core/HiddenConversationsStore.js"
 				);
 				await hideConversation(this.projectDir, this.source, this.sessionId);
 				const cb = this.onSessionHidden;
+				const changeCb = this.onSessionChanged;
 				const sid = this.sessionId;
 				this.panel.dispose();
+				if (changeCb) changeCb(sid);
 				if (cb) cb(sid);
+			} else if (this.onSessionChanged) {
+				this.onSessionChanged(this.sessionId);
 			}
 		} catch (err) {
 			// User-visible banner via postMessage, plus an extension-log
