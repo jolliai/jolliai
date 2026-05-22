@@ -1057,6 +1057,16 @@ export function activate(context: vscode.ExtensionContext): void {
 						"activate",
 						`KB auto-migration: ${result.status} (${result.migratedEntries}/${result.totalEntries})`,
 					);
+					// Bust the bridge's read-storage cache. initializeKB is
+					// fire-and-forget, so UI surfaces (Memories / Timeline)
+					// can hit `getReadStorage()` BEFORE migration finishes —
+					// at which point the folder lacks index.json and the C2
+					// fallback caches an OrphanBranchStorage promise. Without
+					// this reset, the cached fallback survives migration
+					// completion and the session stays stuck on orphan reads
+					// (cross-machine folder-synced rows stay invisible) until
+					// a window reload or settings change.
+					bridge.reloadStorage();
 					// initializeKB is fire-and-forget (`void initializeKB()` below),
 					// so the sidebar webview can resolve and request kb:expandFolder
 					// before migration writes its first MD. Without an explicit
@@ -1074,6 +1084,10 @@ export function activate(context: vscode.ExtensionContext): void {
 						"activate",
 						`KB v3 stale-child cleanup: completedAt=${result.staleChildCleanup?.completedAt ?? "n/a"}`,
 					);
+					// Same rationale as above — staleChildCleanup mutates the
+					// folder's index.json, and a bridge cache that snapshotted
+					// pre-cleanup state would keep returning stale rows.
+					bridge.reloadStorage();
 					sidebarProvider.refreshKnowledgeBaseFolders();
 				}
 			}
@@ -2510,7 +2524,14 @@ export function activate(context: vscode.ExtensionContext): void {
 			// other IDE windows to neighbour repos under the same Memory Bank
 			// parent (which don't move this workspace's orphan ref and don't
 			// touch its lock file) only show up after a window reload.
+			//
+			// Also re-probe the read-storage fallback: a dual-write session
+			// that initially fell back to OrphanBranchStorage because the
+			// Memory Bank folder lacked `index.json` would otherwise keep
+			// serving that cached instance forever once peer-sync repopulates
+			// the folder.
 			bridge.invalidateEntriesCache();
+			bridge.reloadReadStorage();
 			memoriesStore.refresh().catch(handleError("refreshMemories"));
 		}),
 

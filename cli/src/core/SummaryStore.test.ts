@@ -2273,13 +2273,16 @@ describe("SummaryStore", () => {
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
-		// ── readStorage split (sync-visibility regression) ───────────────────
+		// ── two-storage contract (readStorage for candidates, storage for write) ───
 		//
-		// The VS Code bridge passes `readStorage = FolderStorage` (sees
-		// sync-pulled peer rows) and `storage = DualWriteStorage` (alias
-		// writes still hit both backends). Pinning the two-storage split here
-		// keeps the function contract honest as the bridge evolves.
-		it("uses readStorage for preflight + lock-held re-read while alias write stays on storage", async () => {
+		// Read-side and write-side may legitimately hold different rows (e.g.
+		// a FolderStorage shadow has rows the orphan-branch primary lacks, or
+		// vice versa). Preflight candidate discovery uses readStorage so the
+		// candidate set reflects what the UI is showing; the inside-lock
+		// re-read and the alias write use storage so the persisted entries
+		// array matches what's already on the write storage's primary backend
+		// (otherwise the dual-write would clobber primary rows).
+		it("preflight reads via readStorage; in-lock re-read + write go via storage", async () => {
 			const indexJson = JSON.stringify(
 				v3Index(
 					[
@@ -2299,7 +2302,7 @@ describe("SummaryStore", () => {
 				ensure: vi.fn(),
 			};
 			const writeStorage: StorageProvider = {
-				readFile: vi.fn(),
+				readFile: vi.fn().mockResolvedValue(indexJson),
 				writeFiles: vi.fn().mockResolvedValue(undefined),
 				listFiles: vi.fn().mockResolvedValue([]),
 				exists: vi.fn().mockResolvedValue(true),
@@ -2310,15 +2313,15 @@ describe("SummaryStore", () => {
 			const result = await scanTreeHashAliases(["unknown1"], undefined, writeStorage, readStorage);
 
 			expect(result).toBe(true);
-			// Both the preflight and the inside-lock re-read flow through
-			// readStorage (two readFile calls); the write storage never gets
-			// read from so a stale orphan index can't override the folder's
-			// post-sync candidate set.
+			// Preflight (1) reads readStorage; in-lock re-read reads BOTH:
+			// writeStorage to build the persisted entries, then readStorage
+			// again for the symmetric divergence check that prevents
+			// shadow-clobber. Two reads on readStorage, one on writeStorage.
 			expect(readStorage.readFile).toHaveBeenCalledTimes(2);
-			expect(writeStorage.readFile).not.toHaveBeenCalled();
-			// Alias write must hit the write storage (so dual-write
-			// propagates it to BOTH backends). Routing the write through the
-			// folder side only would lose the alias from the orphan branch.
+			expect(writeStorage.readFile).toHaveBeenCalledTimes(1);
+			// Alias write hits writeStorage so the alias propagates to both
+			// dual-write backends. Routing the write to readStorage would
+			// orphan the alias from the primary backend.
 			expect(writeStorage.writeFiles).toHaveBeenCalledTimes(1);
 			expect(readStorage.writeFiles).not.toHaveBeenCalled();
 			const [persistedFiles] = vi.mocked(writeStorage.writeFiles).mock.calls[0] as [
@@ -2327,6 +2330,107 @@ describe("SummaryStore", () => {
 			];
 			const persistedIndex = JSON.parse(persistedFiles[0].content) as SummaryIndex;
 			expect(persistedIndex.commitAliases).toEqual({ unknown1: "root1" });
+		});
+
+		it("preserves storage's entries when readStorage lacks rows (no orphan-row clobber)", async () => {
+			// C1 regression: read-side (FolderStorage shadow) is one row short
+			// of the write-side (DualWrite primary = orphan branch). A previous
+			// implementation re-read the freshIndex via readStorage and persisted
+			// readStorage.entries to BOTH backends — silently deleting the
+			// orphan-only row on the primary. Pin the fix: write payload's
+			// entries must come from storage so the primary's rows survive.
+			const orphanIndex = JSON.stringify(
+				v3Index(
+					[
+						{ ...rootEntry("root1", "Root", "2026-02-18T10:00:00Z"), treeHash: "tree-X" },
+						{
+							...rootEntry("orphan-only", "Orphan only row", "2026-02-19T10:00:00Z"),
+							treeHash: "tree-O",
+						},
+					],
+					{},
+				),
+			);
+			const folderIndex = JSON.stringify(
+				v3Index([{ ...rootEntry("root1", "Root", "2026-02-18T10:00:00Z"), treeHash: "tree-X" }], {}),
+			);
+			const readStorage: StorageProvider = {
+				readFile: vi.fn().mockResolvedValue(folderIndex),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			};
+			const writeStorage: StorageProvider = {
+				readFile: vi.fn().mockResolvedValue(orphanIndex),
+				writeFiles: vi.fn().mockResolvedValue(undefined),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			};
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-X");
+
+			await scanTreeHashAliases(["unknown1"], undefined, writeStorage, readStorage);
+
+			const [persistedFiles] = vi.mocked(writeStorage.writeFiles).mock.calls[0] as [
+				ReadonlyArray<FileWrite>,
+				string,
+			];
+			const persistedIndex = JSON.parse(persistedFiles[0].content) as SummaryIndex;
+			const persistedHashes = persistedIndex.entries.map((e) => e.commitHash);
+			// Both rows survive — orphan-only row is the load-bearing one.
+			expect(persistedHashes).toContain("root1");
+			expect(persistedHashes).toContain("orphan-only");
+			// And the alias still landed.
+			expect(persistedIndex.commitAliases).toEqual({ unknown1: "root1" });
+		});
+
+		it("defers alias write when readStorage has rows storage lacks (no folder-row clobber)", async () => {
+			// Symmetric counterpart to the orphan-row-clobber regression above.
+			// readStorage (FolderStorage shadow) holds a row that writeStorage
+			// (DualWrite → orphan primary) doesn't — e.g. cross-machine cloud
+			// sync landed `folder-only` in the folder before this machine
+			// pulled the orphan branch. Persisting `freshIndex.entries` from
+			// writeStorage via dual-write would overwrite the folder's
+			// index.json and delete the synced row. The fix: detect the
+			// divergence inside the lock and skip the alias write. Aliases
+			// are cross-branch optimization; deferring is safe.
+			const orphanIndex = JSON.stringify(
+				v3Index([{ ...rootEntry("root1", "Root", "2026-02-18T10:00:00Z"), treeHash: "tree-X" }], {}),
+			);
+			const folderIndex = JSON.stringify(
+				v3Index(
+					[
+						{ ...rootEntry("root1", "Root", "2026-02-18T10:00:00Z"), treeHash: "tree-X" },
+						{
+							...rootEntry("folder-only", "Sync-only row", "2026-02-19T10:00:00Z"),
+							treeHash: "tree-F",
+						},
+					],
+					{},
+				),
+			);
+			const readStorage: StorageProvider = {
+				readFile: vi.fn().mockResolvedValue(folderIndex),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			};
+			const writeStorage: StorageProvider = {
+				readFile: vi.fn().mockResolvedValue(orphanIndex),
+				writeFiles: vi.fn().mockResolvedValue(undefined),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			};
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-X");
+
+			const result = await scanTreeHashAliases(["unknown1"], undefined, writeStorage, readStorage);
+
+			// Deferred — no alias landed, no folder row destroyed.
+			expect(result).toBe(false);
+			expect(writeStorage.writeFiles).not.toHaveBeenCalled();
 		});
 
 		it("falls back to single-storage behavior when readStorage is omitted", async () => {
@@ -2717,6 +2821,287 @@ describe("SummaryStore", () => {
 			// summary.json on disk reflects the same value — single source of truth
 			const summaryContent = JSON.parse(files[0].content) as CommitSummary;
 			expect(summaryContent.diffStats).toEqual({ filesChanged: 7, insertions: 77, deletions: 17 });
+		});
+	});
+
+	describe("storeSummary union protection for dual-write readStorage", () => {
+		afterEach(() => {
+			setActiveStorage(undefined);
+		});
+
+		function makeStorage(indexEntries: SummaryIndexEntry[]): StorageProvider {
+			const index: SummaryIndex = { version: 3, entries: indexEntries };
+			return {
+				readFile: vi.fn(async (path: string) => {
+					if (path === "index.json") return JSON.stringify(index);
+					return null;
+				}),
+				writeFiles: vi.fn(async () => undefined),
+				listFiles: vi.fn(async () => []),
+				exists: vi.fn(async () => true),
+				ensure: vi.fn(async () => undefined),
+			} as unknown as StorageProvider;
+		}
+
+		it("preserves rows that exist only on the readStorage when force-writing through a separate writeStorage", async () => {
+			// Reviewer scenario: another machine peer-synced an entry into the
+			// folder shadow that hasn't reached the orphan branch yet. A
+			// force-write through DualWriteStorage previously read the index
+			// from orphan-only, then wrote the rebuilt index to BOTH backends,
+			// silently dropping the folder-only entry. With readStorage threaded,
+			// the union-base includes both sides and the dual-write preserves
+			// the folder-only row.
+			const writeStorage = makeStorage([rootEntry("orphanonly", "Orphan only")]);
+			const readStorage = makeStorage([
+				rootEntry("orphanonly", "Orphan only"),
+				rootEntry("foldersync", "Folder-only peer sync"),
+			]);
+
+			await storeSummary(createMockSummary("newcommit"), undefined, false, undefined, writeStorage, readStorage);
+
+			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
+			expect(writeFilesMock).toHaveBeenCalledTimes(1);
+			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
+			const indexFile = files.find((f) => f.path === "index.json");
+			const newIndex = JSON.parse(indexFile?.content ?? "{}") as SummaryIndex;
+			const hashes = newIndex.entries.map((e) => e.commitHash);
+			expect(hashes).toContain("orphanonly");
+			expect(hashes).toContain("foldersync");
+			expect(hashes).toContain("newcommit");
+		});
+
+		it("falls back to writeStorage-only loading when readStorage is omitted (callers that don't dual-write)", async () => {
+			// QueueWorker and the CLI summarize command don't pass readStorage —
+			// they share one storage instance for both paths. The pre-existing
+			// behavior must survive: the index is read from the single storage
+			// and no union is attempted (so no extra readFile happens against
+			// a non-existent shadow).
+			const onlyStorage = makeStorage([rootEntry("existing", "Existing")]);
+
+			await storeSummary(createMockSummary("new"), undefined, false, undefined, onlyStorage);
+
+			const writeFilesMock = onlyStorage.writeFiles as ReturnType<typeof vi.fn>;
+			expect(writeFilesMock).toHaveBeenCalledTimes(1);
+			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
+			const indexFile = files.find((f) => f.path === "index.json");
+			const newIndex = JSON.parse(indexFile?.content ?? "{}") as SummaryIndex;
+			const hashes = newIndex.entries.map((e) => e.commitHash);
+			expect(hashes).toEqual(expect.arrayContaining(["existing", "new"]));
+		});
+
+		it("merges commitAliases from both backends, with write-side keys winning on overlap", async () => {
+			// Aliases get the same union treatment as entries. Read-side-only
+			// aliases (cross-machine tree-hash matches) must survive the
+			// rewrite. On the rare collision where both sides hold the same
+			// alias key with different target hashes, the write side (orphan,
+			// system of record) wins.
+			const writeStorage: StorageProvider = {
+				readFile: vi.fn(async (path: string) => {
+					if (path === "index.json") {
+						return JSON.stringify({
+							version: 3,
+							entries: [rootEntry("a", "A")],
+							commitAliases: { sharedKey: "writeTarget" },
+						} satisfies SummaryIndex);
+					}
+					return null;
+				}),
+				writeFiles: vi.fn(async () => undefined),
+				listFiles: vi.fn(async () => []),
+				exists: vi.fn(async () => true),
+				ensure: vi.fn(async () => undefined),
+			} as unknown as StorageProvider;
+			const readStorage: StorageProvider = {
+				readFile: vi.fn(async (path: string) => {
+					if (path === "index.json") {
+						return JSON.stringify({
+							version: 3,
+							entries: [rootEntry("a", "A")],
+							commitAliases: {
+								sharedKey: "readTarget",
+								folderOnlyKey: "folderTarget",
+							},
+						} satisfies SummaryIndex);
+					}
+					return null;
+				}),
+				writeFiles: vi.fn(async () => undefined),
+				listFiles: vi.fn(async () => []),
+				exists: vi.fn(async () => true),
+				ensure: vi.fn(async () => undefined),
+			} as unknown as StorageProvider;
+
+			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+
+			const files = (writeStorage.writeFiles as ReturnType<typeof vi.fn>).mock
+				.calls[0][0] as ReadonlyArray<FileWrite>;
+			const newIndex = JSON.parse(files.find((f) => f.path === "index.json")?.content ?? "{}") as SummaryIndex;
+			expect(newIndex.commitAliases?.sharedKey).toBe("writeTarget");
+			expect(newIndex.commitAliases?.folderOnlyKey).toBe("folderTarget");
+		});
+
+		// ── payload backfill for folder-only entries ────────────────────────
+		// Union'ing the index alone leaves orphan with index rows that point
+		// at `summaries/<hash>.json` files only the folder side actually has.
+		// Every orphan-only reader (`getSummary` → `readSummaryFile`,
+		// `QueueWorker.loadSourceSummaries`, `SummaryExporter.exportSummaries`)
+		// still resolves payloads through the active storage's primary, so a
+		// folder-only row whose payload never reached orphan surfaces as a
+		// dangling reference. The dual-write must lift those payloads.
+
+		function makeStorageWithFiles(
+			indexEntries: SummaryIndexEntry[],
+			files: Record<string, string>,
+		): StorageProvider {
+			const index: SummaryIndex = { version: 3, entries: indexEntries };
+			return {
+				readFile: vi.fn(async (path: string) => {
+					if (path === "index.json") return JSON.stringify(index);
+					return files[path] ?? null;
+				}),
+				writeFiles: vi.fn(async () => undefined),
+				listFiles: vi.fn(async () => []),
+				exists: vi.fn(async () => true),
+				ensure: vi.fn(async () => undefined),
+			} as unknown as StorageProvider;
+		}
+
+		it("lifts folder-only summary payloads from readStorage into the writeStorage batch", async () => {
+			// readStorage holds a peer-synced root entry plus its backing
+			// `summaries/<hash>.json` payload. writeStorage (orphan) has not
+			// seen this entry yet. After storeSummary, the writeStorage batch
+			// must include both the new commit's summary AND the folder-only
+			// summary file — otherwise the freshly-unioned orphan index
+			// points at a summaries/foldersync.json that doesn't exist on
+			// orphan, and `getSummary` (which goes through DualWriteStorage's
+			// primary-only readFile) returns null on lookup.
+			const folderOnlyPayload = JSON.stringify({
+				...createMockSummary("foldersync", "Folder-only peer sync"),
+			});
+			const writeStorage = makeStorageWithFiles([rootEntry("orphanonly", "Orphan only")], {});
+			const readStorage = makeStorageWithFiles(
+				[rootEntry("orphanonly", "Orphan only"), rootEntry("foldersync", "Folder-only peer sync")],
+				{ "summaries/foldersync.json": folderOnlyPayload },
+			);
+
+			await storeSummary(createMockSummary("newcommit"), undefined, false, undefined, writeStorage, readStorage);
+
+			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
+			expect(writeFilesMock).toHaveBeenCalledTimes(1);
+			const filesWritten = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
+			const paths = filesWritten.map((f) => f.path);
+			expect(paths).toContain("summaries/newcommit.json");
+			expect(paths).toContain("summaries/foldersync.json");
+			// Backfilled payload is the readStorage content verbatim — orphan
+			// must end up byte-identical to the folder copy so downstream
+			// readers don't diverge based on which backend they hit.
+			const backfilled = filesWritten.find((f) => f.path === "summaries/foldersync.json");
+			expect(backfilled?.content).toBe(folderOnlyPayload);
+		});
+
+		it("lifts folder-only transcripts alongside their summaries", async () => {
+			// Transcripts are keyed by the same commitHash as their summary
+			// (`transcripts/<hash>.json`). Without backfill, a folder-only
+			// entry's transcript is missing on orphan — `readTranscript`
+			// (driven through the active storage's primary) returns null
+			// and the squash pipeline / sidebar transcript view silently
+			// drop data.
+			const folderOnlySummary = JSON.stringify(createMockSummary("foldersync", "Folder-only peer sync"));
+			const folderOnlyTranscript = JSON.stringify({ sessions: [{ id: "s1", events: [] }] });
+			const writeStorage = makeStorageWithFiles([], {});
+			const readStorage = makeStorageWithFiles([rootEntry("foldersync", "Folder-only peer sync")], {
+				"summaries/foldersync.json": folderOnlySummary,
+				"transcripts/foldersync.json": folderOnlyTranscript,
+			});
+
+			await storeSummary(createMockSummary("newcommit"), undefined, false, undefined, writeStorage, readStorage);
+
+			const filesWritten = (writeStorage.writeFiles as ReturnType<typeof vi.fn>).mock
+				.calls[0][0] as ReadonlyArray<FileWrite>;
+			const transcript = filesWritten.find((f) => f.path === "transcripts/foldersync.json");
+			expect(transcript?.content).toBe(folderOnlyTranscript);
+		});
+
+		it("skips backfill silently when readStorage has the index row but no payload (embedded child case)", async () => {
+			// Children of a squash/amend tree live inside the root's
+			// `summaries/<rootHash>.json` blob, so the child's own
+			// `summaries/<childHash>.json` file may not exist as a separate
+			// artifact. The backfill must tolerate a missing payload without
+			// emitting a phantom write (which would land empty/`null` content
+			// on orphan and corrupt every subsequent direct-read attempt).
+			const writeStorage = makeStorageWithFiles([], {});
+			const readStorage = makeStorageWithFiles(
+				[rootEntry("embeddedchild", "Squashed away")],
+				// no summaries/embeddedchild.json, no transcripts/embeddedchild.json
+				{},
+			);
+
+			await storeSummary(createMockSummary("newcommit"), undefined, false, undefined, writeStorage, readStorage);
+
+			const filesWritten = (writeStorage.writeFiles as ReturnType<typeof vi.fn>).mock
+				.calls[0][0] as ReadonlyArray<FileWrite>;
+			const paths = filesWritten.map((f) => f.path);
+			expect(paths).not.toContain("summaries/embeddedchild.json");
+			expect(paths).not.toContain("transcripts/embeddedchild.json");
+			// The index still carries the row (union preservation), even
+			// though the payload is intentionally absent.
+			const newIndex = JSON.parse(
+				filesWritten.find((f) => f.path === "index.json")?.content ?? "{}",
+			) as SummaryIndex;
+			expect(newIndex.entries.map((e) => e.commitHash)).toContain("embeddedchild");
+		});
+
+		it("does not double-write the headline summary's payload when the same hash also lives folder-only", async () => {
+			// Edge case: user force-writes a commit hash that already exists
+			// as a folder-only row (peer-synced). Both the headline write
+			// path and the backfill loop would emit `summaries/<hash>.json`,
+			// producing two batch entries with the same path. The git tree
+			// builder + folder writer would have to pick one and silently
+			// drop the other. Skip the backfill probe for the headline's
+			// own hash so the batch is uniquely keyed.
+			const writeStorage = makeStorageWithFiles([], {});
+			const readStorage = makeStorageWithFiles([rootEntry("dupe", "Older folder copy")], {
+				"summaries/dupe.json": JSON.stringify(createMockSummary("dupe", "Older folder copy")),
+				"transcripts/dupe.json": JSON.stringify({ sessions: [] }),
+			});
+
+			await storeSummary(
+				createMockSummary("dupe", "Force-rewrite via summarize"),
+				undefined,
+				true,
+				undefined,
+				writeStorage,
+				readStorage,
+			);
+
+			const filesWritten = (writeStorage.writeFiles as ReturnType<typeof vi.fn>).mock
+				.calls[0][0] as ReadonlyArray<FileWrite>;
+			const dupeSummaryPayloads = filesWritten.filter((f) => f.path === "summaries/dupe.json");
+			expect(dupeSummaryPayloads).toHaveLength(1);
+			// The single entry that survives is the headline write
+			// (fresh summary content), not the stale folder copy.
+			const survived = JSON.parse(dupeSummaryPayloads[0].content) as CommitSummary;
+			expect(survived.commitMessage).toBe("Force-rewrite via summarize");
+		});
+
+		it("does not read backfill paths when readStorage is omitted", async () => {
+			// The single-storage callers (QueueWorker, CLI summarize) must
+			// not pay extra readFile round-trips for backfill — there's no
+			// secondary backend to lift from, and probing the same storage
+			// would be wasted IO. Asserts the no-union baseline is untouched.
+			const onlyStorage = makeStorageWithFiles([rootEntry("existing", "Existing")], {
+				"summaries/existing.json": JSON.stringify(createMockSummary("existing", "Existing")),
+			});
+
+			await storeSummary(createMockSummary("new"), undefined, false, undefined, onlyStorage);
+
+			const readFileMock = onlyStorage.readFile as ReturnType<typeof vi.fn>;
+			// The only legitimate readFile calls on the single-storage path
+			// are `index.json` + catalog probes; no `summaries/existing.json`
+			// or `transcripts/existing.json` should be probed for backfill.
+			const probedPaths = readFileMock.mock.calls.map((c) => c[0] as string);
+			expect(probedPaths).not.toContain("summaries/existing.json");
+			expect(probedPaths).not.toContain("transcripts/existing.json");
 		});
 	});
 
