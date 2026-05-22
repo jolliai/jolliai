@@ -20,12 +20,6 @@ const THEMES_REPO = "jolliai/themes";
 const REGISTRY_URL = `https://raw.githubusercontent.com/${THEMES_REPO}/main/registry.json`;
 const USER_THEMES_DIR = join(homedir(), ".jolli", "themes");
 
-/**
- * Fallback local registry path — used during development before the
- * GitHub repo is created, or when offline. Set via JOLLI_THEMES_DIR env.
- */
-const LOCAL_THEMES_DIR = process.env.JOLLI_THEMES_DIR ?? join(homedir(), "jolli.ai", "themes");
-
 interface RegistryTheme {
 	name: string;
 	version: string;
@@ -80,82 +74,57 @@ async function writeInstalledMeta(name: string, version: string): Promise<void> 
 }
 
 async function fetchRegistry(): Promise<RegistryData> {
-	// Try GitHub first
+	let res: Response;
 	try {
-		const res = await fetch(REGISTRY_URL);
-		if (res.ok) {
-			return (await res.json()) as RegistryData;
-		}
-	} catch {
-		// Network error — fall through to local
+		res = await fetch(REGISTRY_URL);
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		throw new Error(`Could not reach ${REGISTRY_URL}: ${detail}`);
 	}
-
-	// Fallback: local registry.json (development / offline)
-	const localRegistry = join(LOCAL_THEMES_DIR, "registry.json");
-	if (existsSync(localRegistry)) {
-		const { readFile } = await import("node:fs/promises");
-		const raw = await readFile(localRegistry, "utf-8");
-		return JSON.parse(raw) as RegistryData;
+	if (!res.ok) {
+		throw new Error(`Could not fetch theme registry from ${REGISTRY_URL}: ${res.status} ${res.statusText}`);
 	}
-
-	throw new Error("Could not fetch theme registry from GitHub or local fallback");
+	return (await res.json()) as RegistryData;
 }
 
 /**
- * Downloads a theme to `~/.jolli/themes/<name>/`.
- * GitHub is the source of truth; local themes directory is the offline fallback.
- * Saves version metadata from registry when available.
+ * Downloads a theme to `~/.jolli/themes/<name>/` from the canonical GitHub
+ * repo (`github.com/jolliai/themes`). Saves version metadata from the
+ * registry when available. Throws on network error or when the theme is
+ * not present in the repo — callers decide whether to fall back to the
+ * already-cached copy under `~/.jolli/themes/<name>/`.
  */
 export async function downloadTheme(name: string, version?: string): Promise<string> {
 	const destDir = join(USER_THEMES_DIR, name);
+	const contentsUrl = `https://api.github.com/repos/${THEMES_REPO}/contents/${name}`;
 
-	// 1) GitHub Contents API (source of truth)
+	let res: Response;
 	try {
-		const contentsUrl = `https://api.github.com/repos/${THEMES_REPO}/contents/${name}`;
-		const res = await fetch(contentsUrl, {
-			headers: { Accept: "application/vnd.github.v3+json" },
-		});
-		if (res.ok) {
-			const files = (await res.json()) as Array<{
-				name: string;
-				download_url: string | null;
-				type: string;
-			}>;
-			await mkdir(destDir, { recursive: true });
-			for (const file of files) {
-				if (file.type !== "file" || !file.download_url) continue;
-				const fileRes = await fetch(file.download_url);
-				if (!fileRes.ok) {
-					throw new Error(`Failed to download ${file.name}: ${fileRes.status}`);
-				}
-				const content = await fileRes.text();
-				await writeFile(join(destDir, file.name), content, "utf-8");
-			}
-			if (version) await writeInstalledMeta(name, version);
-			return destDir;
-		}
-		if (res.status !== 404) {
-			throw new Error(`GitHub API error: ${res.status} ${res.statusText}`);
-		}
+		res = await fetch(contentsUrl, { headers: { Accept: "application/vnd.github.v3+json" } });
 	} catch (err) {
-		// Network error — fall through to local fallback
-		if (err instanceof Error && err.message.startsWith("GitHub API")) throw err;
+		const detail = err instanceof Error ? err.message : String(err);
+		throw new Error(`Could not reach ${contentsUrl}: ${detail}`);
+	}
+	if (res.status === 404) {
+		throw new Error(`Theme "${name}" not found in ${THEMES_REPO}`);
+	}
+	if (!res.ok) {
+		throw new Error(`GitHub API error fetching "${name}": ${res.status} ${res.statusText}`);
 	}
 
-	// 2) Local themes directory (offline fallback)
-	const localThemeDir = join(LOCAL_THEMES_DIR, name);
-	if (existsSync(localThemeDir)) {
-		await mkdir(destDir, { recursive: true });
-		const { readdir, copyFile } = await import("node:fs/promises");
-		const files = await readdir(localThemeDir);
-		for (const file of files) {
-			await copyFile(join(localThemeDir, file), join(destDir, file));
+	const files = (await res.json()) as Array<{ name: string; download_url: string | null; type: string }>;
+	await mkdir(destDir, { recursive: true });
+	for (const file of files) {
+		if (file.type !== "file" || !file.download_url) continue;
+		const fileRes = await fetch(file.download_url);
+		if (!fileRes.ok) {
+			throw new Error(`Failed to download ${file.name}: ${fileRes.status}`);
 		}
-		if (version) await writeInstalledMeta(name, version);
-		return destDir;
+		const content = await fileRes.text();
+		await writeFile(join(destDir, file.name), content, "utf-8");
 	}
-
-	throw new Error(`Theme "${name}" not found in ${THEMES_REPO} or local themes directory`);
+	if (version) await writeInstalledMeta(name, version);
+	return destDir;
 }
 
 // ─── Subcommands ─────────────────────────────────────────────────────────────

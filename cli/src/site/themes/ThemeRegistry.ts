@@ -171,14 +171,25 @@ export async function discoverPack(
 	}
 
 	// 7) GitHub registry: github.com/jolliai/themes/<name>/
+	//
+	// On any failure here (network unreachable, theme not in repo, …) the
+	// cached copy under ~/.jolli/themes/<name>/ would have been picked up by
+	// step 4 above. So if we got here, neither GitHub nor the cache had the
+	// theme — log a clear error and let the caller (`generateLayout`) fall
+	// back to the vanilla Nextra layout.
 	try {
 		const { downloadTheme } = await import("../../commands/ThemeCommand.js");
 		console.log(`  Downloading theme "${name}" from GitHub...`);
 		const destDir = await downloadTheme(name);
 		console.log(`  ✓ Theme "${name}" installed to ${destDir}`);
 		return loadFromPath(destDir);
-	} catch {
-		// not found on GitHub
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		console.error(
+			`  Error: Could not load theme "${name}" — ${detail}.\n` +
+				`         No cached copy at ${join(USER_THEMES_DIR, name)} either. ` +
+				`Falling back to the default Nextra layout.`,
+		);
 	}
 
 	return undefined;
