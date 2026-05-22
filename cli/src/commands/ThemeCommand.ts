@@ -8,13 +8,11 @@
  */
 
 import { existsSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join, normalize } from "node:path";
+import { gunzipSync } from "node:zlib";
 import type { Command } from "commander";
-import { extract } from "tar";
 import { scaffoldProject } from "../site/StarterKit.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -106,6 +104,83 @@ async function fetchRegistry(): Promise<RegistryData> {
 	return (await res.json()) as RegistryData;
 }
 
+// ─── Minimal tar.gz extractor (zero dependencies) ──────────────────────────
+//
+// tar format: each entry = 512-byte header + ceil(size/512)*512 bytes of data.
+// Header fields are NUL-terminated octal ASCII strings at fixed offsets.
+// We only need: name (0, 100), size (124, 12), typeflag (156, 1), prefix (345, 155).
+
+interface TarEntry {
+	path: string;
+	type: "file" | "dir";
+	data: Buffer;
+}
+
+/** Parse a NUL-terminated octal string from a tar header field. */
+function parseOctal(buf: Buffer, offset: number, length: number): number {
+	const slice = buf.subarray(offset, offset + length);
+	const str = slice.toString("ascii").replace(/\0.*$/, "").trim();
+	return str.length === 0 ? 0 : Number.parseInt(str, 8);
+}
+
+/** Read a NUL-terminated ASCII string from a tar header field. */
+function parseString(buf: Buffer, offset: number, length: number): string {
+	const slice = buf.subarray(offset, offset + length);
+	const idx = slice.indexOf(0);
+	return (idx >= 0 ? slice.subarray(0, idx) : slice).toString("ascii");
+}
+
+/**
+ * Extracts all entries from a .tar.gz buffer using only `node:zlib`.
+ * Returns entries whose path starts with `prefix/` (if given), with
+ * the prefix stripped so callers get repo-relative paths.
+ */
+function extractTarGz(gzBuf: Buffer, filterPrefix?: string): TarEntry[] {
+	// Decompress gzip → raw tar bytes
+	const tar = gunzipSync(gzBuf);
+
+	const entries: TarEntry[] = [];
+	let offset = 0;
+
+	while (offset + 512 <= tar.length) {
+		const header = tar.subarray(offset, offset + 512);
+		// Two consecutive zero blocks = end of archive
+		if (header.every((b) => b === 0)) break;
+
+		const prefix = parseString(header, 345, 155);
+		const rawName = parseString(header, 0, 100);
+		const fullPath = prefix ? `${prefix}/${rawName}` : rawName;
+		const size = parseOctal(header, 124, 12);
+		const typeflag = header[156];
+
+		offset += 512; // move past header
+
+		// typeflag: 0 or ASCII '0' = file, '5' = directory, others skipped
+		const isFile = typeflag === 0 || typeflag === 0x30; // 0x30 = '0'
+		const isDir = typeflag === 0x35; // '5'
+
+		if ((isFile || isDir) && fullPath.length > 0) {
+			const data = isFile ? Buffer.from(tar.subarray(offset, offset + size)) : Buffer.alloc(0);
+			let entryPath = fullPath;
+			if (filterPrefix) {
+				if (!entryPath.startsWith(filterPrefix)) {
+					offset += Math.ceil(size / 512) * 512;
+					continue;
+				}
+				entryPath = entryPath.slice(filterPrefix.length);
+			}
+			if (entryPath.length > 0) {
+				entries.push({ path: entryPath, type: isFile ? "file" : "dir", data });
+			}
+		}
+
+		// Advance past data blocks (rounded up to 512-byte boundary)
+		offset += Math.ceil(size / 512) * 512;
+	}
+
+	return entries;
+}
+
 /**
  * Downloads a theme to `~/.jolli/themes/<name>/` from the canonical GitHub
  * repo (`github.com/jolliai/themes`). Saves version metadata from the
@@ -113,9 +188,9 @@ async function fetchRegistry(): Promise<RegistryData> {
  * not present in the repo — callers decide whether to fall back to the
  * already-cached copy under `~/.jolli/themes/<name>/`.
  *
- * Uses the public `codeload.github.com` tarball endpoint (one request for
- * the whole repo, no `api.github.com` rate-limit consumption) and extracts
- * only the requested `<name>/` directory into the destination.
+ * Uses the public `codeload.github.com` tarball endpoint (single request,
+ * no API rate-limit) and a built-in tar.gz parser — zero external
+ * dependencies, works on all platforms.
  */
 export async function downloadTheme(name: string, version?: string): Promise<string> {
 	const destDir = join(USER_THEMES_DIR, name);
@@ -128,40 +203,43 @@ export async function downloadTheme(name: string, version?: string): Promise<str
 		const detail = err instanceof Error ? err.message : String(err);
 		throw new Error(`Could not reach ${tarballUrl}: ${detail}`);
 	}
-	if (!res.ok || !res.body) {
+	if (!res.ok) {
 		const hint = res.status === 401 || res.status === 403 || res.status === 404 ? ` ${AUTH_HINT}` : "";
 		throw new Error(`Could not fetch theme repo from ${tarballUrl}: ${res.status} ${res.statusText}.${hint}`);
 	}
 
-	const tmpRoot = await mkdtemp(join(tmpdir(), "jolli-themes-"));
-	try {
-		// `tar.extract` auto-detects the gzip layer; pipe the response into it.
-		// fetch returns a web ReadableStream; Readable.fromWeb bridges to a node stream.
-		const nodeStream = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]);
-		await pipeline(nodeStream, extract({ cwd: tmpRoot }));
+	const gzBuf = Buffer.from(await res.arrayBuffer());
 
-		// codeload tarballs unpack into a single root directory like
-		// `themes-main/` (repo-ref). Look up that root and resolve the theme.
-		const rootEntries = await readdir(tmpRoot);
-		if (rootEntries.length !== 1) {
-			throw new Error(`Unexpected tarball layout: ${rootEntries.length} entries at root`);
-		}
-		const srcDir = join(tmpRoot, rootEntries[0], name);
-		if (!existsSync(srcDir)) {
-			throw new Error(`Theme "${name}" not found in ${THEMES_REPO}`);
-		}
+	// codeload tarballs have a single root dir like `themes-main/`. Detect it
+	// by reading the first entry, then filter for `<root>/<name>/`.
+	const allEntries = extractTarGz(gzBuf);
+	if (allEntries.length === 0) throw new Error("Empty tarball");
+	const rootDir = allEntries[0].path.split("/")[0];
+	const prefix = `${rootDir}/${name}/`;
 
-		// Replace the destination with the extracted copy so a partial older
-		// install can't leave stale files lying around.
-		await rm(destDir, { recursive: true, force: true });
-		await mkdir(destDir, { recursive: true });
-		await cp(srcDir, destDir, { recursive: true });
-
-		if (version) await writeInstalledMeta(name, version);
-		return destDir;
-	} finally {
-		await rm(tmpRoot, { recursive: true, force: true });
+	const themeEntries = extractTarGz(gzBuf, prefix);
+	if (themeEntries.length === 0) {
+		throw new Error(`Theme "${name}" not found in ${THEMES_REPO}`);
 	}
+
+	// Replace the destination so stale files don't linger.
+	await rm(destDir, { recursive: true, force: true });
+
+	for (const entry of themeEntries) {
+		// Guard against path traversal (e.g. `../../etc/passwd`)
+		const dest = normalize(join(destDir, entry.path));
+		if (!dest.startsWith(destDir)) continue;
+
+		if (entry.type === "dir") {
+			await mkdir(dest, { recursive: true });
+		} else {
+			await mkdir(normalize(join(dest, "..")), { recursive: true });
+			await writeFile(dest, entry.data);
+		}
+	}
+
+	if (version) await writeInstalledMeta(name, version);
+	return destDir;
 }
 
 // ─── Subcommands ─────────────────────────────────────────────────────────────
