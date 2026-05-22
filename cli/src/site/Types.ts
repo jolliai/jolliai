@@ -115,11 +115,10 @@ export type SidebarOverrides = Record<string, Record<string, SidebarItemValue>>;
 export type PathMappings = Record<string, string>;
 
 /**
- * A `ThemePack` value is a theme pack name, a path, or a package reference:
- *   - `"forge"` / `"atlas"` — well-known external packs (installed via npm or GitHub)
+ * A `ThemePack` value is a theme pack name or a path:
+ *   - `"forge"` / `"atlas"` — well-known external packs (installed from the GitHub registry)
  *   - `"default"` — vanilla `nextra-theme-docs` (no pack CSS)
  *   - `"./my-theme.js"` — local file path (resolved relative to source root)
- *   - `"@acme/docs-theme"` — npm package name
  *
  * The `(string & {})` intersection keeps TypeScript's autocomplete for
  * well-known names while accepting any arbitrary string.

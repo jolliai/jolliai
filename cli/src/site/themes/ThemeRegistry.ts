@@ -11,12 +11,11 @@
  *   2. Registry (packs registered at runtime)
  *   3. Explicit file path in site.json (starts with `./` or `/`)
  *   4. User theme directory → ~/.jolli/themes/<name>/index.mjs
- *   5. npm package → jolli-theme-<name>
- *   6. npm scoped package → @jolli/theme-<name>
- *   7. GitHub registry → github.com/jolliai/themes/<name>/
+ *   5. GitHub registry → github.com/jolliai/themes/<name>/
  */
 
 import { existsSync, statSync } from "node:fs";
+import { stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -121,9 +120,7 @@ const USER_THEMES_DIR = join(homedir(), ".jolli", "themes");
  *   2. Registry (packs registered at runtime)
  *   3. Explicit file path in site.json (starts with `./` or `/`)
  *   4. User theme directory (`~/.jolli/themes/<name>/index.mjs`)
- *   5. npm package (`jolli-theme-<name>`)
- *   6. npm scoped package (`@jolli/theme-<name>`)
- *   7. GitHub registry (`github.com/jolliai/themes/<name>/`)
+ *   5. GitHub registry (`github.com/jolliai/themes/<name>/`)
  *
  * Returns the provider (now also registered) or `undefined` if not found.
  */
@@ -156,21 +153,7 @@ export async function discoverPack(
 		return loadFromPath(userThemePath);
 	}
 
-	// 5) npm package: jolli-theme-<name>
-	try {
-		return await loadFromModule(`jolli-theme-${name}`);
-	} catch {
-		// not found as npm package
-	}
-
-	// 6) npm scoped package: @jolli/theme-<name>
-	try {
-		return await loadFromModule(`@jolli/theme-${name}`);
-	} catch {
-		// not found
-	}
-
-	// 7) GitHub registry: github.com/jolliai/themes/<name>/
+	// 5) GitHub registry: github.com/jolliai/themes/<name>/
 	//
 	// On any failure here (network unreachable, theme not in repo, …) the
 	// cached copy under ~/.jolli/themes/<name>/ would have been picked up by
@@ -198,11 +181,55 @@ export async function discoverPack(
 // ─── Cache version check ────────────────────────────────────────────────
 
 /**
+ * How long a cached theme is considered "fresh" before we re-check the
+ * registry. 24 h is enough to pick up a published theme update within a day
+ * while reducing GitHub traffic from "every build" to "once per day per
+ * machine per theme".
+ */
+const VERSION_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Sentinel file whose mtime records the last successful version-check attempt. */
+const LAST_CHECKED_FILE = ".last-checked";
+
+/**
+ * Returns `true` when the cached theme has never been version-checked or the
+ * last check was longer ago than the TTL. Missing / unreadable sentinel
+ * counts as "never checked" so a fresh install always probes once.
+ */
+async function isVersionCheckDue(cachedPath: string): Promise<boolean> {
+	try {
+		const info = await stat(join(cachedPath, LAST_CHECKED_FILE));
+		return Date.now() - info.mtimeMs >= VERSION_CHECK_TTL_MS;
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * Marks the cached theme as version-checked at the start of the check so a
+ * transient GitHub outage during the network call doesn't cause every
+ * subsequent build to retry — we wait out the TTL and try again later.
+ */
+async function markVersionChecked(cachedPath: string): Promise<void> {
+	try {
+		await writeFile(join(cachedPath, LAST_CHECKED_FILE), new Date().toISOString(), "utf-8");
+	} catch {
+		// Best-effort; failing to write just means the next build re-checks early.
+	}
+}
+
+/**
  * Checks the cached theme's version against the GitHub registry.
  * If a newer version is available, re-downloads the theme in-place.
  * Fails silently (keeps cached version) on network errors.
+ *
+ * Skips the network call entirely when the previous check was within
+ * `VERSION_CHECK_TTL_MS` — see `isVersionCheckDue`.
  */
 async function checkAndUpdateCachedTheme(name: string, _cachedPath: string): Promise<void> {
+	if (!(await isVersionCheckDue(_cachedPath))) return;
+	await markVersionChecked(_cachedPath);
+
 	try {
 		const { downloadTheme, githubAuthHeaders } = await import("../../commands/ThemeCommand.js");
 
@@ -261,7 +288,7 @@ async function loadFromPath(themePath: string): Promise<ThemePackProvider> {
 }
 
 /**
- * Dynamically imports a theme module (file URL or npm package name),
+ * Dynamically imports a theme module from a file URL,
  * validates the default export, and registers it.
  */
 async function loadFromModule(moduleSpecifier: string): Promise<ThemePackProvider> {
