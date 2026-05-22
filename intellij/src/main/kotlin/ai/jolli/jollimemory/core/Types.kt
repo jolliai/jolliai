@@ -15,6 +15,8 @@ data class SessionInfo(
     val transcriptPath: String,
     val updatedAt: String,
     val source: TranscriptSource? = null,
+    /** Native title from the source (e.g. OpenCode DB title, Cursor composer name). */
+    val title: String? = null,
 )
 
 /** Cursor tracking position in a transcript file */
@@ -387,3 +389,27 @@ data class StatusInfo(
 enum class LogLevel(val priority: Int) {
     debug(0), info(1), warn(2), error(3)
 }
+
+// ── Active Conversations types ─────────────────────────────────────────────
+
+/** A session enriched with display data for the active conversations panel. */
+data class ActiveConversationItem(
+    val sessionId: String,
+    val source: TranscriptSource,
+    val title: String,
+    val messageCount: Int,
+    val updatedAt: String,
+    val transcriptPath: String,
+    /**
+     * Per-commit-selection signal. `false` = user has unchecked this row;
+     * the QueueWorker will skip its transcript when generating the next
+     * summary. Default `true` for any row absent from commit-selection state.
+     */
+    val isSelected: Boolean = true,
+)
+
+/** Result envelope from the active session aggregator. */
+data class ActiveConversationsResult(
+    val items: List<ActiveConversationItem>,
+    val failedSources: List<TranscriptSource>,
+)
