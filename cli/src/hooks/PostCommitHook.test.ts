@@ -1444,8 +1444,10 @@ describe("queue-driven Worker", () => {
 			vi.mocked(getCurrentBranch).mockResolvedValue("feature-branch");
 			vi.mocked(getDiffContent).mockResolvedValue(hasDiff ? "diff content" : "");
 			vi.mocked(getDiffStats).mockResolvedValue(
+				// Default diff > TRIVIAL_AMEND_DELTA_LINES (50) so tests that
+				// exercise the LLM pipeline aren't accidentally short-circuited.
 				hasDiff
-					? { filesChanged: 1, insertions: 5, deletions: 2 }
+					? { filesChanged: 1, insertions: 100, deletions: 0 }
 					: { filesChanged: 0, insertions: 0, deletions: 0 },
 			);
 			vi.mocked(discoverCodexSessions).mockResolvedValue([]);
@@ -1508,6 +1510,64 @@ describe("queue-driven Worker", () => {
 			expect(summaryArg.children).toBeUndefined();
 		});
 
+		// Regression: the fresh-leaf path (amend with no oldSummary) must associate
+		// plans/notes/linearIssues on the branch with the new amend commit hash,
+		// matching what a normal commit does. Without this fix the fresh leaf
+		// silently dropped these references, breaking plan-progress aggregation
+		// and search/reverse-lookups for plans authored before this tool was installed.
+		it("fresh leaf path associates active plans/notes with the amend commit", async () => {
+			setupAmendPipeline({ hasOldSummary: false });
+			const planSourcePath = "/test/project/.jolli/jollimemory/plans/freshly-authored-plan.md";
+			const noteSourcePath = "/test/project/.jolli/jollimemory/notes/leaf-note.md";
+
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {
+					"freshly-authored-plan": {
+						slug: "freshly-authored-plan",
+						title: "Freshly authored plan",
+						editCount: 1,
+						sourcePath: planSourcePath,
+						addedAt: "2026-02-19T00:00:00.000Z",
+						updatedAt: "2026-02-19T00:00:00.000Z",
+						branch: "feature-branch",
+						commitHash: null,
+					},
+				},
+				notes: {
+					"leaf-note": {
+						id: "leaf-note",
+						title: "Leaf note",
+						format: "markdown" as const,
+						sourcePath: noteSourcePath,
+						addedAt: "2026-02-19T00:00:00.000Z",
+						updatedAt: "2026-02-19T00:00:00.000Z",
+						branch: "feature-branch",
+						commitHash: null,
+					},
+				},
+			});
+
+			vi.mocked(existsSync).mockImplementation((path) => path === planSourcePath || path === noteSourcePath);
+			vi.mocked(readFileSync).mockImplementation(((path: unknown) => {
+				if (path === planSourcePath) return "# Freshly authored plan\n\nbody";
+				if (path === noteSourcePath) return "# Leaf note\n\nbody";
+				return "";
+			}) as typeof readFileSync);
+
+			await runWorker("/test/project");
+
+			const summaryArg = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
+			// Without the fix, plans/notes would be undefined on the fresh leaf even
+			// though the branch has uncommitted entries.
+			expect(summaryArg.plans).toBeDefined();
+			expect(summaryArg.plans).toEqual(
+				expect.arrayContaining([expect.objectContaining({ title: "Freshly authored plan" })]),
+			);
+			expect(summaryArg.notes).toBeDefined();
+			expect(summaryArg.notes).toEqual(expect.arrayContaining([expect.objectContaining({ title: "Leaf note" })]));
+		});
+
 		it("skips LLM but migrates index for message-only amend (no diff, no transcript)", async () => {
 			setupAmendPipeline({ hasOldSummary: true, hasTranscript: false, hasDiff: false });
 			// Second getDiffStats call (for `{newHash}^..{newHash}` integral) returns
@@ -1522,14 +1582,17 @@ describe("queue-driven Worker", () => {
 
 			// LLM should NOT be called for a message-only amend
 			expect(generateSummary).not.toHaveBeenCalled();
-			// storeSummary should still be called for index migration
-			expect(storeSummary).toHaveBeenCalledWith(
+			// storeSummary should still be called for index migration. The helper now
+			// passes (root, cwd, force, artifacts?) — match the prefix.
+			expect(vi.mocked(storeSummary).mock.calls.length).toBeGreaterThanOrEqual(1);
+			const [migratedRoot, migratedCwd] = vi.mocked(storeSummary).mock.calls[0];
+			expect(migratedCwd).toBe("/test/project");
+			expect(migratedRoot).toEqual(
 				expect.objectContaining({
 					commitHash: "newHash",
 					commitType: "amend",
 					children: expect.arrayContaining([expect.objectContaining({ commitHash: "oldHash" })]),
 				}),
-				"/test/project",
 			);
 			// The message-only amend ALSO writes diffStats (the full commit diff) on
 			// the migrated summary, so display code doesn't fall back to recursive
@@ -1541,11 +1604,11 @@ describe("queue-driven Worker", () => {
 			expect(summaryArg.stats).toBeUndefined();
 		});
 
-		// Coverage: short-circuit A with a fully-populated old summary so
+		// Coverage: pre-LLM short-circuit with a fully-populated old summary so
 		// every `oldSummary.X !== undefined && {...}` spread takes the
 		// truthy arm, plus buildHoistedAmendRoot's optional metadata
 		// spreads (recap, ticketId, llm carried via hoistMetadataFromOldSummary).
-		it("short-circuit A copies recap + ticketId + llm from a fully-populated old summary", async () => {
+		it("pre-LLM short-circuit copies recap + ticketId + llm from a fully-populated old summary", async () => {
 			setupAmendPipeline({ hasOldSummary: true, hasTranscript: false, hasDiff: false });
 			vi.mocked(getSummary).mockResolvedValue(createMockSummaryFull("oldHash"));
 			vi.mocked(getDiffStats)
@@ -1557,14 +1620,14 @@ describe("queue-driven Worker", () => {
 			expect(summaryArg.ticketId).toBe("JOLLI-1234");
 		});
 
-		// Coverage: short-circuit B path (1 LLM, delta empty) with the
+		// Coverage: post-LLM short-circuit (1 LLM, delta empty) with the
 		// same fully-populated old summary — exercises lines 1354/1355
 		// truthy arms.
-		it("short-circuit B copies recap + ticketId from a fully-populated old summary", async () => {
+		it("post-LLM short-circuit copies recap + ticketId from a fully-populated old summary", async () => {
 			setupAmendPipeline({ hasOldSummary: true, hasTranscript: true, hasDiff: true });
 			vi.mocked(getSummary).mockResolvedValue(createMockSummaryFull("oldHash"));
-			// Delta runs the LLM but it produces no topics + no recap, so
-			// the short-circuit B path fires.
+			// Delta runs the LLM but it produces no topics, so
+			// the post-LLM short-circuit fires.
 			vi.mocked(generateSummary).mockResolvedValue({
 				transcriptEntries: 1,
 				topics: [],
@@ -1810,7 +1873,9 @@ describe("queue-driven Worker", () => {
 			vi.mocked(buildMultiSessionContext).mockReturnValue("[Human]: Amend");
 			vi.mocked(getCurrentBranch).mockResolvedValue("feature-branch");
 			vi.mocked(getDiffContent).mockResolvedValue("diff content");
-			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 2 });
+			// Default diff > TRIVIAL_AMEND_DELTA_LINES (50) so tests that
+			// exercise the LLM pipeline aren't accidentally short-circuited.
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
 			vi.mocked(discoverCodexSessions).mockResolvedValue([]);
 			vi.mocked(isCodexInstalled).mockResolvedValue(true);
 		}
@@ -2000,17 +2065,17 @@ describe("queue-driven Worker", () => {
 			vi.mocked(getCurrentBranch).mockResolvedValue("feature-branch");
 		}
 
-		it("re-associates plans and notes on short-circuit A (trivial delta, 0 LLM)", async () => {
+		it("re-associates plans and notes on pre-LLM short-circuit (trivial delta, 0 LLM)", async () => {
 			setupAmend();
 			vi.mocked(getSummary).mockResolvedValue(oldSummaryWithMetadata());
-			// No sessions + tiny diff -> isTrivialAmendDelta=true -> short-circuit A
+			// No sessions + tiny diff -> isTrivialAmendDelta=true -> pre-LLM short-circuit
 			vi.mocked(loadAllSessions).mockResolvedValue([]);
 			vi.mocked(getDiffContent).mockResolvedValue("");
 			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 0, insertions: 0, deletions: 0 });
 
 			await runWorker("/test/project");
 
-			// Short-circuit A must NOT call generateSummary (0 LLM)
+			// Pre-LLM short-circuit must NOT call generateSummary (0 LLM)
 			expect(generateSummary).not.toHaveBeenCalled();
 			expect(storeSummary).toHaveBeenCalled();
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
@@ -2022,10 +2087,11 @@ describe("queue-driven Worker", () => {
 			);
 		});
 
-		it("re-associates plans and notes on short-circuit B (1 LLM, empty delta)", async () => {
+		it("re-associates plans and notes on post-LLM short-circuit (1 LLM, empty topics)", async () => {
 			setupAmend();
 			vi.mocked(getSummary).mockResolvedValue(oldSummaryWithMetadata());
-			// Sessions with entries -> not trivial. Delta returns no topics + no recap -> short-circuit B.
+			// Diff > TRIVIAL_AMEND_DELTA_LINES so pre-LLM short-circuit doesn't fire.
+			// Delta returns no topics -> post-LLM short-circuit (1 LLM, step2 skipped).
 			vi.mocked(loadAllSessions).mockResolvedValue([
 				{ sessionId: "sess-1", transcriptPath: "/path/to/transcript.jsonl", updatedAt: "2026-02-19" },
 			]);
@@ -2036,7 +2102,7 @@ describe("queue-driven Worker", () => {
 			});
 			vi.mocked(buildMultiSessionContext).mockReturnValue("[Human]: Amend");
 			vi.mocked(getDiffContent).mockResolvedValue("diff content");
-			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 2 });
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
 			vi.mocked(generateSummary).mockResolvedValue({
 				...createMockResult(),
 				topics: [],
@@ -2069,7 +2135,8 @@ describe("queue-driven Worker", () => {
 			});
 			vi.mocked(buildMultiSessionContext).mockReturnValue("[Human]: Amend");
 			vi.mocked(getDiffContent).mockResolvedValue("diff content");
-			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 2 });
+			// Diff > TRIVIAL_AMEND_DELTA_LINES so pre-LLM short-circuit doesn't fire.
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
 			// Delta returns substantive topics -> full path (consolidate runs)
 			vi.mocked(generateSummary).mockResolvedValue(createMockResult());
 
@@ -2275,11 +2342,14 @@ describe("queue-driven Worker", () => {
 
 			await runWorker("/test/project");
 
-			expect(storeSummary).toHaveBeenCalledWith(
+			// Helper passes (root, cwd, force, artifacts?) — match the prefix.
+			expect(vi.mocked(storeSummary).mock.calls.length).toBeGreaterThanOrEqual(1);
+			const [e2eRoot, e2eCwd] = vi.mocked(storeSummary).mock.calls[0];
+			expect(e2eCwd).toBe("/test/project");
+			expect(e2eRoot).toEqual(
 				expect.objectContaining({
 					e2eTestGuide: expect.any(Array),
 				}),
-				"/test/project",
 			);
 		});
 	});

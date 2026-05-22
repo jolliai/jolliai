@@ -1435,38 +1435,49 @@ async function handleRebaseSquashFromQueue(op: GitOperation, cwd: string): Promi
 }
 
 /**
- * Threshold for the trivial-amend short-circuit A (line count of the delta diff).
- * 10 is intentionally conservative -- prefer running the LLM (false negative)
- * over silently skipping a substantive change (false positive).
+ * Threshold for the pre-LLM amend short-circuit (line count of the delta diff,
+ * insertions + deletions).
+ *
+ * 50 is calibrated to cover most "polish" amends — rename a variable across
+ * call sites, fix a typo in several files, add a guard clause, apply a
+ * formatter pass, refactor a small helper. Truly substantive method rewrites
+ * or new features generally exceed 50 lines and still hit the LLM.
+ *
+ * The transcript artifact is preserved either way, so even when the
+ * short-circuit fires during an active AI chat session, the conversation is
+ * aggregated in the "All Conversations" view via recursive child walking —
+ * no information is lost. Topics/recap stay frozen to the parent commit's
+ * values until the next non-amend commit naturally refreshes them.
  */
-const TRIVIAL_AMEND_DELTA_LINES = 10;
+const TRIVIAL_AMEND_DELTA_LINES = 50;
 
 /**
- * Detects "no real conversation, mechanical-only delta" amends so we can skip
- * the LLM entirely. Examples that should match:
+ * Detects "mechanical-only delta" amends so we can skip the LLM entirely.
+ * Examples that should match:
  *   - `git commit --amend --no-edit`
  *   - bumping a version number
  *   - re-signing with GPG
  *   - applying formatter output
  *
- * Conservative by design: any captured conversation, OR any delta beyond the
- * line threshold (regardless of whitespace), forces the full pipeline. False
- * positives here would silently drop new amend information.
+ * Transcript entries no longer block the short-circuit: even if the user
+ * was chatting with an AI assistant during the amend, the transcript artifact
+ * is persisted by the short-circuit path, so the conversation is not lost.
+ * Topics/recap on the new root are Copy-Hoisted from the old summary —
+ * acceptable because the diff itself is the source of truth for tiny changes.
  */
-function isTrivialAmendDelta(deltaStats: DiffStats, transcriptEntries: number): boolean {
-	if (transcriptEntries > 0) return false;
+function isTrivialAmendDelta(deltaStats: DiffStats): boolean {
 	const totalLines = deltaStats.insertions + deltaStats.deletions;
 	return totalLines <= TRIVIAL_AMEND_DELTA_LINES;
 }
 
 /**
  * Hoisted-fields bundle for buildHoistedAmendRoot. The v4 amend root carries
- * topics + recap + ticketId either Copy-Hoisted from the old summary (short
- * circuit A/B) or LLM-consolidated from [old, delta] (full path).
+ * topics + recap + ticketId either Copy-Hoisted from the old summary (pre-LLM
+ * or post-LLM short-circuit) or LLM-consolidated from [old, delta] (full path).
  *
  * `llm` is only set when the topics/recap actually came from this call (i.e.
- * the consolidate step ran). Short-circuit A/B leave it undefined so the
- * field's "produced this node's data" semantics stay accurate.
+ * the consolidate step ran). Both short-circuit paths leave it undefined so
+ * the field's "produced this node's data" semantics stay accurate.
  */
 interface AmendHoistedFields {
 	readonly topics: ReadonlyArray<TopicSummary>;
@@ -1478,9 +1489,9 @@ interface AmendHoistedFields {
 /**
  * Builds the v4 amend root with all 8 Hoist fields populated and the old
  * summary attached as a stripped child. Used by all three amend paths
- * (short-circuit A, short-circuit B, full path); the only differences are
- * which `hoisted` values the caller passes in and whether they pass a
- * transcript artifact to storeSummary.
+ * (pre-LLM short-circuit, post-LLM short-circuit, full path); the only
+ * differences are which `hoisted` values the caller passes in and whether
+ * they pass a transcript artifact to storeSummary.
  *
  * `oldSummary` is undefined when there's no recorded prior summary (rare:
  * the user amended a commit that was never summarised). In that case the
@@ -1527,19 +1538,75 @@ function buildHoistedAmendRoot(
 }
 
 /**
- * Handles amend queue entries via three-tier dispatch:
+ * Short-circuit writer: Copy-Hoists topics/recap/ticketId from oldSummary to a
+ * new amend root, and persists the transcript artifact if any sessions exist.
+ * Shared by both short-circuit callers in handleAmendPipeline:
+ *   - **Pre-LLM**: delta ≤ TRIVIAL_AMEND_DELTA_LINES (no LLM ran)
+ *   - **Post-LLM**: step 1 summarize(delta) returned empty topics (step 2 skipped)
  *
- *   - **Short-circuit A** (0 LLM): trivial delta (empty transcript + small or
- *     mechanical diff) -> Copy-Hoist topics/recap from old, no transcript artifact.
- *   - **Short-circuit B** (1 LLM): summarize(delta) returned no topics + no
- *     recap -> Copy-Hoist topics/recap from old, BUT write the transcript
- *     artifact (the LLM read the conversation -- those bytes are valuable for
- *     audit even though the topics/recap weren't substantive).
+ * `label` is only used for logging — it distinguishes the two call sites in the
+ * debug.log so a triage can tell which short-circuit fired.
+ *
+ * The transcript artifact is written unconditionally when sessions are present:
+ * "All Conversations" view walks children recursively, so even though topics/recap
+ * are Copy-Hoisted (frozen at the old commit's state), the per-commit transcript
+ * file ensures the actual conversation is still aggregated into the view.
+ */
+async function applyAmendShortCircuit(
+	oldSummary: CommitSummary,
+	commitInfo: CommitInfo,
+	metadata: { readonly commitType?: CommitType; readonly commitSource?: CommitSource } | undefined,
+	amendFullDiffStats: DiffStats,
+	sessionTranscripts: ReadonlyArray<SessionTranscript>,
+	totalEntries: number,
+	humanEntries: number,
+	cwd: string,
+	pipelineStart: number,
+	oldHash: string,
+	label: string,
+): Promise<void> {
+	const storedTranscript = buildStoredTranscript(sessionTranscripts);
+	const transcriptArtifact = storedTranscript.sessions.length > 0 ? storedTranscript : undefined;
+
+	const root = buildHoistedAmendRoot(
+		oldSummary,
+		commitInfo,
+		{
+			topics: resolveEffectiveTopics(oldSummary),
+			/* v8 ignore start -- optional-field spreads (see buildHoistedAmendRoot) */
+			...(oldSummary.recap !== undefined && { recap: oldSummary.recap }),
+			...(oldSummary.ticketId !== undefined && { ticketId: oldSummary.ticketId }),
+			/* v8 ignore stop */
+		},
+		metadata ?? {},
+		amendFullDiffStats,
+		{ transcriptEntries: totalEntries, conversationTurns: humanEntries },
+	);
+
+	await storeSummary(root, cwd, false, transcriptArtifact ? { transcript: transcriptArtifact } : undefined);
+	await reassociateMetadata([oldSummary], commitInfo.hash, cwd);
+	log.info(
+		"Amend short-circuit (%s) complete: %s -> %s (%s)",
+		label,
+		oldHash.substring(0, 8),
+		commitInfo.hash.substring(0, 8),
+		formatElapsed(pipelineStart),
+	);
+}
+
+/**
+ * Handles amend queue entries via two-tier dispatch:
+ *
+ *   - **Short-circuit** (0 or 1 LLM): either delta ≤ TRIVIAL_AMEND_DELTA_LINES
+ *     (skip both LLM calls) OR step 1 returned empty topics (skip step 2).
+ *     Topics/recap/ticketId are Copy-Hoisted from oldSummary; the transcript
+ *     artifact is written if any sessions exist. Implemented by
+ *     applyAmendShortCircuit.
  *   - **Full path** (2 LLM): summarize(delta) + consolidate([old, delta]) ->
  *     LLM-produced topics/recap (or mechanicalConsolidate fallback), with
  *     transcript artifact.
  *
- * All three paths converge on buildHoistedAmendRoot + storeSummary, so the
+ * Both paths converge on buildHoistedAmendRoot + storeSummary, so the
  * Hoist invariant always completes regardless of which dispatch tier ran.
  *
  * Called by both scenarios:
@@ -1580,6 +1647,7 @@ async function handleAmendPipeline(
 	let stepStart = now();
 	let deltaDiff: string;
 	let deltaDiffStats: DiffStats;
+	let diffFetchFailed = false;
 	const fromRef = diffOverride?.fromRef ?? "HEAD~1";
 	const toRef = diffOverride?.toRef ?? "HEAD";
 	try {
@@ -1589,6 +1657,7 @@ async function handleAmendPipeline(
 		log.warn("Could not diff %s..%s, using empty diff", fromRef, toRef);
 		deltaDiff = "(Could not compute diff)";
 		deltaDiffStats = { filesChanged: 0, insertions: 0, deletions: 0 };
+		diffFetchFailed = true;
 	}
 	log.info(
 		"Amend delta diff (%s..%s): %d files changed, +%d -%d (%s)",
@@ -1610,40 +1679,50 @@ async function handleAmendPipeline(
 			)
 		: deltaDiffStats;
 
-	// ── Short-circuit A: trivial delta (0 LLM) ────────────────────────────────
-	if (oldSummary && isTrivialAmendDelta(deltaDiffStats, totalEntries)) {
-		log.info("Amend short-circuit A: trivial delta -- 0 LLM, Copy-Hoist topics/recap from old");
-		const root = buildHoistedAmendRoot(
+	// ── Pre-LLM short-circuit: delta ≤ TRIVIAL_AMEND_DELTA_LINES (0 LLM) ──────
+	// When diff fetch failed, the fallback `deltaDiffStats = {0, 0, 0}` would
+	// otherwise spuriously trigger the short-circuit and silently drop the
+	// LLM-via-conversation fallback. Require a successful diff fetch.
+	if (oldSummary && !diffFetchFailed && isTrivialAmendDelta(deltaDiffStats)) {
+		log.info(
+			"Amend short-circuit (pre-LLM): trivial delta ≤ %d -- skipping both LLM calls",
+			TRIVIAL_AMEND_DELTA_LINES,
+		);
+		await applyAmendShortCircuit(
 			oldSummary,
 			commitInfo,
-			{
-				topics: resolveEffectiveTopics(oldSummary),
-				/* v8 ignore start -- optional-field spreads (see buildHoistedAmendRoot) */
-				...(oldSummary.recap !== undefined && { recap: oldSummary.recap }),
-				...(oldSummary.ticketId !== undefined && { ticketId: oldSummary.ticketId }),
-				/* v8 ignore stop */
-			},
-			metadata ?? {},
+			metadata,
 			amendFullDiffStats,
-		);
-		await storeSummary(root, cwd);
-		await reassociateMetadata([oldSummary], commitInfo.hash, cwd);
-		log.info(
-			"Amend short-circuit A complete: %s -> %s (%s)",
-			oldHash.substring(0, 8),
-			commitInfo.hash.substring(0, 8),
-			formatElapsed(pipelineStart),
+			sessionTranscripts,
+			totalEntries,
+			humanEntries,
+			cwd,
+			pipelineStart,
+			oldHash,
+			"pre-LLM trivial delta",
 		);
 		return;
 	}
 
-	// No old summary AND trivial delta -- nothing useful to record.
-	/* v8 ignore start -- defensive: covered indirectly when both inputs are absent */
-	if (!oldSummary && isTrivialAmendDelta(deltaDiffStats, totalEntries)) {
-		log.info("Amend with no old summary AND trivial delta -- skipping");
+	// No old summary AND trivial delta AND no conversation -- nothing useful to record.
+	// The `totalEntries === 0` guard is critical: without it, an amend that has a small
+	// diff but recorded an AI conversation would silently drop the transcript, because
+	// applyAmendShortCircuit requires an oldSummary for Copy-Hoist and isn't reachable
+	// here. When transcript entries exist we fall through to step1 LLM and the
+	// "no old summary -> fresh leaf" branch below, which persists the transcript artifact.
+	if (!oldSummary && !diffFetchFailed && totalEntries === 0 && isTrivialAmendDelta(deltaDiffStats)) {
+		log.info("Amend with no old summary AND no sessions AND trivial delta -- skipping");
 		return;
 	}
-	/* v8 ignore stop */
+
+	// No old summary AND diff fetch failed -- feeding "(Could not compute diff)" to
+	// the LLM produces low-quality topics, and the fresh leaf's diffStats may also
+	// have fallen back to {0,0,0}. No parent context, no real diff: nothing useful
+	// to summarise. Skip rather than persist a misleading summary.
+	if (!oldSummary && diffFetchFailed) {
+		log.info("Amend with no old summary AND diff fetch failed -- skipping (no meaningful summary possible)");
+		return;
+	}
 
 	// ── Step 1 LLM: summarize the delta ───────────────────────────────────────
 	const conversation = buildMultiSessionContext(sessionTranscripts);
@@ -1708,39 +1787,23 @@ async function handleAmendPipeline(
 	const amendStoredTranscript = buildStoredTranscript(sessionTranscripts);
 	const transcriptArtifact = amendStoredTranscript.sessions.length > 0 ? amendStoredTranscript : undefined;
 
-	// ── Short-circuit B: 1 LLM, delta produced no substantive content ─────────
-	if (oldSummary && (delta.topics?.length ?? 0) === 0 && !delta.recap) {
-		log.info("Amend short-circuit B: 1 LLM, delta empty -- Copy-Hoist topics/recap from old, write transcript");
-		const root = buildHoistedAmendRoot(
+	// ── Post-LLM short-circuit: step1 returned empty topics → skip step2 ──────
+	// delta.recap is discarded even if present: a recap without topics is just a
+	// restatement of the diff, and the diff is the source of truth.
+	if (oldSummary && (delta.topics?.length ?? 0) === 0) {
+		log.info("Amend short-circuit (post-LLM): step1 returned empty topics -- skipping step2 consolidate");
+		await applyAmendShortCircuit(
 			oldSummary,
 			commitInfo,
-			{
-				topics: resolveEffectiveTopics(oldSummary),
-				/* v8 ignore start -- optional-field spreads (see buildHoistedAmendRoot) */
-				...(oldSummary.recap !== undefined && { recap: oldSummary.recap }),
-				...(oldSummary.ticketId !== undefined && { ticketId: oldSummary.ticketId }),
-				/* v8 ignore stop */
-				// llm: undefined -- topics/recap came from old, not from delta
-			},
-			/* v8 ignore next -- `metadata ?? {}` defensive default; the queue dispatch always supplies a populated metadata object. */
-			metadata ?? {},
+			metadata,
 			amendFullDiffStats,
-			{ transcriptEntries: totalEntries, conversationTurns: humanEntries },
-		);
-		await storeSummary(
-			root,
+			sessionTranscripts,
+			totalEntries,
+			humanEntries,
 			cwd,
-			false,
-			/* v8 ignore next -- defensive: transcriptArtifact is set when sessions exist; falsy arm only fires when there are no sessions, which the empty-transcript guard upstream already short-circuits. */ transcriptArtifact
-				? { transcript: transcriptArtifact }
-				: undefined,
-		);
-		await reassociateMetadata([oldSummary], commitInfo.hash, cwd);
-		log.info(
-			"Amend short-circuit B complete: %s -> %s (%s)",
-			oldHash.substring(0, 8),
-			commitInfo.hash.substring(0, 8),
-			formatElapsed(pipelineStart),
+			pipelineStart,
+			oldHash,
+			"post-LLM empty topics",
 		);
 		return;
 	}
@@ -1826,6 +1889,30 @@ async function handleAmendPipeline(
 
 	// ── No old summary AND non-trivial delta -> store delta as a fresh leaf ────
 	const branch = await getCurrentBranch(cwd);
+
+	// Associate plans/notes/linearIssues on the branch with this amend commit,
+	// mirroring executePipeline. Without this the fresh leaf silently drops
+	// references for plans/notes authored before the previous (un-summarised)
+	// commit — the user wouldn't see them in plan-progress aggregation or
+	// reverse-lookups. The oldSummary path handles this via reassociateMetadata;
+	// fresh leaves have no oldSummary to migrate from, so we associate fresh.
+	const freshLeafPlanSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
+	for (const excludedSlug of amendExclusions.plans) freshLeafPlanSlugs.delete(excludedSlug);
+	const freshLeafPlanAssoc = await associatePlansWithCommit(freshLeafPlanSlugs, commitInfo.hash, cwd, branch);
+	const freshLeafPlanRefs = freshLeafPlanAssoc.refs;
+
+	const freshLeafNoteIds = await detectUncommittedNoteIds(cwd, branch);
+	for (const excludedId of amendExclusions.notes) freshLeafNoteIds.delete(excludedId);
+	const freshLeafNoteRefs = await associateNotesWithCommit(freshLeafNoteIds, commitInfo.hash, cwd, branch);
+
+	const freshLeafLinearTicketIds = await detectUncommittedLinearIssueIds(cwd, branch);
+	const freshLeafLinearRefs = await associateLinearIssuesWithCommit(
+		freshLeafLinearTicketIds,
+		commitInfo.hash,
+		cwd,
+		branch,
+	);
+
 	const freshLeaf: CommitSummary = {
 		version: 4,
 		commitHash: commitInfo.hash,
@@ -1838,6 +1925,9 @@ async function handleAmendPipeline(
 		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
 		...delta,
 		diffStats: amendFullDiffStats,
+		...(freshLeafPlanRefs.length > 0 ? { plans: freshLeafPlanRefs } : {}),
+		...(freshLeafNoteRefs.length > 0 ? { notes: freshLeafNoteRefs } : {}),
+		...(freshLeafLinearRefs.length > 0 ? { linearIssues: freshLeafLinearRefs } : {}),
 	};
 	await storeSummary(
 		freshLeaf,
