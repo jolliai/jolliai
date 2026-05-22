@@ -211,7 +211,7 @@ function setupSuccessfulRun(
 	mockRunNpmInstall.mockResolvedValue({ success: true, output: "" });
 	mockRunNpmBuild.mockResolvedValue({ success: true, output: "" });
 	mockRunNpmDev.mockResolvedValue({ success: true, output: "" });
-	mockRunPagefind.mockReturnValue({ success: true, output: "Indexed 5 pages", pagesIndexed: 5 });
+	mockRunPagefind.mockResolvedValue({ success: true, output: "Indexed 5 pages", pagesIndexed: 5 });
 	mockRunServe.mockResolvedValue({ success: true, output: "" });
 	mockRunNpmStart.mockResolvedValue({ success: true, output: "" });
 	mockStartSourceWatcher.mockReturnValue({ close: vi.fn().mockResolvedValue(undefined) });
@@ -530,15 +530,43 @@ describe("jolli dev", () => {
 		consoleErrorSpy.mockRestore();
 	});
 
-	it("runs next dev, not build/pagefind/serve", async () => {
+	it("runs next dev and builds the initial search index, but never serve", async () => {
 		setupSuccessfulRun();
 		const program = await makeProgram();
 		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
 
+		// Dev pipeline does ONE one-shot build + pagefind on startup to seed
+		// `public/_pagefind/` so the search box works the moment the page loads.
 		expect(mockRunNpmDev).toHaveBeenCalledOnce();
-		expect(mockRunNpmBuild).not.toHaveBeenCalled();
-		expect(mockRunPagefind).not.toHaveBeenCalled();
+		expect(mockRunNpmBuild).toHaveBeenCalledOnce();
+		expect(mockRunPagefind).toHaveBeenCalledOnce();
 		expect(mockRunServe).not.toHaveBeenCalled();
+	});
+
+	it("seeds the initial search index with JOLLI_PAGEFIND_BUILD=1 and the isolated distDir", async () => {
+		setupSuccessfulRun();
+		const program = await makeProgram();
+		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
+
+		// build runs with the env flag so next.config.mjs redirects output to .next-pagefind/
+		const [, env] = mockRunNpmBuild.mock.calls[0] as [string, Record<string, string> | undefined];
+		expect(env).toEqual({ JOLLI_PAGEFIND_BUILD: "1" });
+
+		// pagefind reads from the isolated distDir, not the default .next/
+		const [, site, outputPath] = mockRunPagefind.mock.calls[0] as [string, string, string];
+		expect(site).toBe(".next-pagefind/server/app");
+		expect(outputPath).toBe("public/_pagefind");
+	});
+
+	it("still starts the dev server when the initial index build fails", async () => {
+		setupSuccessfulRun();
+		mockRunNpmBuild.mockResolvedValue({ success: false, output: "build broken" });
+		const program = await makeProgram();
+		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
+
+		// Build failure must not stop the dev server — search is degraded, dev still works.
+		expect(mockRunNpmDev).toHaveBeenCalledOnce();
+		expect(process.exitCode).toBe(0);
 	});
 
 	it("passes staticExport: false to initNextraProject", async () => {
@@ -648,6 +676,26 @@ describe("jolli dev", () => {
 
 		const output = consoleSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
 		expect(output).toMatch(/↻ Synced \d+ files/);
+	});
+
+	it("triggers a background search-index rebuild after each onChange", async () => {
+		setupSuccessfulRun();
+		const program = await makeProgram();
+		await program.parseAsync(["dev", "/my-docs"], { from: "user" });
+
+		// Initial seed already ran once during startup.
+		expect(mockRunNpmBuild).toHaveBeenCalledTimes(1);
+		expect(mockRunPagefind).toHaveBeenCalledTimes(1);
+
+		const [, options] = mockStartSourceWatcher.mock.calls[0] as [string, { onChange: () => Promise<void> }];
+		await options.onChange();
+
+		// Indexer is fire-and-forget; let its drain microtask + awaits settle.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(mockRunNpmBuild).toHaveBeenCalledTimes(2);
+		expect(mockRunPagefind).toHaveBeenCalledTimes(2);
 	});
 
 	it("watcher onChange swallows a site.json read error and does NOT crash", async () => {

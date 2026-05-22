@@ -178,7 +178,13 @@ describe("NextraRenderer", () => {
 	it("runBuild delegates to runNpmBuild", async () => {
 		const { runNpmBuild } = await import("../NpmRunner.js");
 		await new NextraRenderer().runBuild("/build");
-		expect(runNpmBuild).toHaveBeenCalledWith("/build");
+		expect(runNpmBuild).toHaveBeenCalledWith("/build", undefined);
+	});
+
+	it("runBuild forwards env overrides to runNpmBuild", async () => {
+		const { runNpmBuild } = await import("../NpmRunner.js");
+		await new NextraRenderer().runBuild("/build", { JOLLI_PAGEFIND_BUILD: "1" });
+		expect(runNpmBuild).toHaveBeenCalledWith("/build", { JOLLI_PAGEFIND_BUILD: "1" });
 	});
 
 	it("runDev delegates to runNpmDev", async () => {

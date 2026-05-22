@@ -106,9 +106,11 @@ export interface SiteRenderer {
 	getContentRules(): ContentRules;
 
 	/**
-	 * Run the production build command.
+	 * Run the production build command. `env` overrides are merged onto
+	 * `process.env` for the spawned process — used to flip per-run flags
+	 * like `JOLLI_PAGEFIND_BUILD=1` for the dev-mode search-index build.
 	 */
-	runBuild(buildDir: string): Promise<NpmRunResult>;
+	runBuild(buildDir: string, env?: Record<string, string>): Promise<NpmRunResult>;
 
 	/**
 	 * Run the dev server command.

@@ -54,13 +54,16 @@ export async function runNpmInstall(buildDir: string): Promise<NpmRunResult> {
 }
 
 /**
- * Runs `npm run build` inside `buildDir`.
+ * Runs `npm run build` inside `buildDir`. `env` is merged on top of
+ * `process.env` so callers can flip flags like `JOLLI_PAGEFIND_BUILD=1`
+ * without leaking them into the parent process.
  */
-export async function runNpmBuild(buildDir: string): Promise<NpmRunResult> {
+export async function runNpmBuild(buildDir: string, env?: Record<string, string>): Promise<NpmRunResult> {
 	const [cmd, args] = shellCmd("npm", ["run", "build"]);
 	const result = spawnSyncHidden(cmd, args, {
 		cwd: buildDir,
 		stdio: "pipe",
+		env: env ? { ...process.env, ...env } : process.env,
 		...SHELL_OPTS,
 	});
 
@@ -73,6 +76,41 @@ export async function runNpmBuild(buildDir: string): Promise<NpmRunResult> {
 	}
 
 	return { success: false, output };
+}
+
+/**
+ * Async variant of `runNpmBuild` — uses `spawn` instead of `spawnSync` so the
+ * caller's event loop keeps running. Used by the dev-mode background
+ * search-indexer so a rebuild doesn't freeze the SourceWatcher / dev server.
+ */
+export function runNpmBuildAsync(buildDir: string, env?: Record<string, string>): Promise<NpmRunResult> {
+	return new Promise((resolve) => {
+		const [cmd, args] = shellCmd("npm", ["run", "build"]);
+		const child = spawnHidden(cmd, args, {
+			cwd: buildDir,
+			stdio: "pipe",
+			env: env ? { ...process.env, ...env } : process.env,
+			...SHELL_OPTS,
+		});
+
+		let stdout = "";
+		let stderr = "";
+		child.stdout?.on("data", (data: Buffer) => {
+			stdout += data.toString();
+		});
+		child.stderr?.on("data", (data: Buffer) => {
+			stderr += data.toString();
+		});
+
+		child.on("close", (code) => {
+			const output = [stdout, stderr].filter(Boolean).join("\n");
+			resolve({ success: code === 0, output });
+		});
+
+		child.on("error", (err) => {
+			resolve({ success: false, output: err.message });
+		});
+	});
 }
 
 /** Result from a long-running server process. */

@@ -1,15 +1,14 @@
 /**
  * PagefindRunner — runs the Pagefind indexer against the built site output.
  *
- * Runs `npx pagefind --site out/` inside `buildDir` using `child_process.spawnSync`
- * with `stdio: 'pipe'` to capture output. Parses the output to extract the number
- * of pages indexed.
+ * Runs `npx pagefind --site <site>` inside `buildDir` and parses the output
+ * to extract the number of pages indexed.
  *
  * Returns `{ success: false, output }` on non-zero exit codes rather than
  * throwing, so the caller can print the error and set the exit code.
  */
 
-import { spawnSyncHidden } from "../util/Subprocess.js";
+import { spawnHidden } from "../util/Subprocess.js";
 import type { PagefindResult } from "./Types.js";
 
 /**
@@ -23,30 +22,46 @@ const SHELL_OPTS = IS_WIN ? /* v8 ignore next */ ({ shell: true } as const) : {}
 export type { PagefindResult };
 
 /**
- * Runs `npx pagefind --site out/` inside `buildDir`.
+ * Runs `npx pagefind --site <site> --output-path <outputPath>` inside `buildDir`.
  *
- * Captures stdout and stderr. Parses the output to extract the number of pages
- * indexed (e.g. "Indexed 42 pages"). Returns `{ success: true, output, pagesIndexed }`
- * on exit code 0, or `{ success: false, output }` on any non-zero exit code.
+ * Async via `spawn` (not `spawnSync`) so the dev-mode background indexer can
+ * keep the event loop free while a rebuild is in flight. Captures stdout and
+ * stderr. Parses the output to extract the number of pages indexed (e.g.
+ * "Indexed 42 pages"). Returns `{ success: true, output, pagesIndexed }` on
+ * exit code 0, or `{ success: false, output }` on any non-zero exit code.
  */
-export function runPagefind(buildDir: string, site = "out", outputPath = "out/_pagefind"): PagefindResult {
-	const rawArgs = ["pagefind", "--site", site, "--output-path", outputPath];
-	const [cmd, args] = IS_WIN ? /* v8 ignore next */ [`npx ${rawArgs.join(" ")}`, []] : ["npx", rawArgs];
-	const result = spawnSyncHidden(cmd, args, {
-		cwd: buildDir,
-		stdio: "pipe",
-		...SHELL_OPTS,
+export function runPagefind(buildDir: string, site = "out", outputPath = "out/_pagefind"): Promise<PagefindResult> {
+	return new Promise((resolve) => {
+		const rawArgs = ["pagefind", "--site", site, "--output-path", outputPath];
+		const [cmd, args] = IS_WIN ? /* v8 ignore next */ [`npx ${rawArgs.join(" ")}`, []] : ["npx", rawArgs];
+		const child = spawnHidden(cmd, args, {
+			cwd: buildDir,
+			stdio: "pipe",
+			...SHELL_OPTS,
+		});
+
+		let stdout = "";
+		let stderr = "";
+		child.stdout?.on("data", (data: Buffer) => {
+			stdout += data.toString();
+		});
+		child.stderr?.on("data", (data: Buffer) => {
+			stderr += data.toString();
+		});
+
+		child.on("close", (code) => {
+			const output = [stdout, stderr].filter(Boolean).join("\n");
+			if (code === 0) {
+				const match = output.match(/(\d+)\s+pages?/i);
+				const pagesIndexed = match ? parseInt(match[1], 10) : undefined;
+				resolve({ success: true, output, pagesIndexed });
+				return;
+			}
+			resolve({ success: false, output });
+		});
+
+		child.on("error", (err) => {
+			resolve({ success: false, output: err.message });
+		});
 	});
-
-	const stdout = result.stdout ? result.stdout.toString() : "";
-	const stderr = result.stderr ? result.stderr.toString() : "";
-	const output = [stdout, stderr].filter(Boolean).join("\n");
-
-	if (result.status === 0) {
-		const match = output.match(/(\d+)\s+pages?/i);
-		const pagesIndexed = match ? parseInt(match[1], 10) : undefined;
-		return { success: true, output, pagesIndexed };
-	}
-
-	return { success: false, output };
 }

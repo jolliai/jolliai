@@ -128,8 +128,8 @@ export class NextraRenderer implements SiteRenderer {
 		};
 	}
 
-	async runBuild(buildDir: string): Promise<NpmRunResult> {
-		return runNpmBuild(buildDir);
+	async runBuild(buildDir: string, env?: Record<string, string>): Promise<NpmRunResult> {
+		return runNpmBuild(buildDir, env);
 	}
 
 	async runDev(buildDir: string, verbose?: boolean): Promise<ServerResult> {

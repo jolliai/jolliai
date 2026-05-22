@@ -419,7 +419,7 @@ async function buildAndIndex(
 	// for production server mode it indexes `.next/server/app/` (pre-rendered).
 	const pagefindSite = staticExport ? "out" : ".next/server/app";
 	const pagefindOutput = staticExport ? "out/_pagefind" : "public/_pagefind";
-	const pagefindResult = runPagefind(buildDir, pagefindSite, pagefindOutput);
+	const pagefindResult = await runPagefind(buildDir, pagefindSite, pagefindOutput);
 	if (!pagefindResult.success) {
 		console.error(v ? pagefindResult.output : "  Error: Search indexing failed");
 		process.exitCode = 1;
@@ -430,6 +430,101 @@ async function buildAndIndex(
 	console.log(`  ✓ Indexed ${pagesIndexed} pages for search`);
 
 	return { success: true, pagesBuilt };
+}
+
+// ─── Dev-mode search index ──────────────────────────────────────────────────
+
+/**
+ * Site path (relative to `buildDir`) that pagefind reads in dev mode. The
+ * dev-mode build redirects Next's output to `.next-pagefind/` via the
+ * `JOLLI_PAGEFIND_BUILD=1` env flag in `generateNextConfig`, so the rendered
+ * pages live one level deeper than the default `.next/server/app`.
+ */
+const DEV_PAGEFIND_SITE = ".next-pagefind/server/app";
+
+/**
+ * Output path (relative to `buildDir`) where pagefind writes the index in dev
+ * mode. `next dev` serves the `public/` directory as-is, so writing the index
+ * here makes `/_pagefind/pagefind.js` resolve at request time without any
+ * webpack involvement.
+ */
+const DEV_PAGEFIND_OUTPUT = "public/_pagefind";
+
+/**
+ * Env passed to the dev-mode `next build` invocation. Read by the generated
+ * `next.config.mjs` to redirect the build to `.next-pagefind/` so we never
+ * collide with the running dev compiler's `.next/`.
+ */
+const DEV_PAGEFIND_ENV = { JOLLI_PAGEFIND_BUILD: "1" } as const;
+
+/**
+ * Builds the dev-mode search index. Runs a one-shot `next build` into the
+ * isolated `.next-pagefind/` directory, then runs pagefind against the
+ * resulting HTML and writes the index into `public/_pagefind/`.
+ *
+ * Both stages can fail without taking the dev server down — search is a
+ * nice-to-have in dev, so this function logs and returns a status, never
+ * throws.
+ */
+async function buildDevSearchIndex(
+	buildDir: string,
+	renderer: SiteRenderer,
+	verbose: boolean,
+): Promise<{ success: boolean; pagesIndexed?: number; output?: string }> {
+	const buildResult = await renderer.runBuild(buildDir, DEV_PAGEFIND_ENV);
+	if (!buildResult.success) {
+		return { success: false, output: verbose ? buildResult.output : undefined };
+	}
+
+	const pagefindResult = await runPagefind(buildDir, DEV_PAGEFIND_SITE, DEV_PAGEFIND_OUTPUT);
+	if (!pagefindResult.success) {
+		return { success: false, output: verbose ? pagefindResult.output : undefined };
+	}
+
+	return { success: true, pagesIndexed: pagefindResult.pagesIndexed ?? 0 };
+}
+
+/**
+ * Background search-index rebuilder. Mirrors `SourceWatcher`'s drain pattern
+ * (`running`/`dirty` flags) so concurrent triggers coalesce into a single
+ * follow-up rebuild instead of stacking. The rebuild is fire-and-forget —
+ * callers do not await it, which keeps the watcher's `onChange` snappy and
+ * stops a stalled build from blocking the next sync.
+ */
+function createDevIndexer(buildDir: string, renderer: SiteRenderer, verbose: boolean): { trigger(): void } {
+	let running = false;
+	let dirty = false;
+
+	const drain = async (): Promise<void> => {
+		while (dirty) {
+			dirty = false;
+			try {
+				const result = await buildDevSearchIndex(buildDir, renderer, verbose);
+				if (result.success) {
+					console.log(`  ↻ Rebuilt search index (${result.pagesIndexed ?? 0} pages)`);
+				} else {
+					console.warn("  ⚠ Search index rebuild failed; existing index is still served");
+					if (verbose && result.output) console.error(result.output);
+				}
+			} catch (err) {
+				console.warn(`  ⚠ Search index rebuild error: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
+		running = false;
+	};
+
+	return {
+		trigger(): void {
+			dirty = true;
+			if (running) return;
+			running = true;
+			// Fire-and-forget — errors are swallowed inside `drain`. Surfacing
+			// rejection here would propagate to an unhandled promise rejection
+			// and kill the dev process; we'd rather have a stale index than a
+			// dead server.
+			void drain();
+		},
+	};
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -506,6 +601,26 @@ export async function runDevServer(
 	const result = await prepareContent(sourceRoot, buildDir, contentDir, publicDir, false, opts);
 	if (!result.success) return;
 
+	const verbose = opts.verbose === true;
+
+	// Build the initial search index synchronously — the dev server starts a
+	// few seconds later, but the search box works the moment the page loads.
+	// Failures only print a warning so the dev server still comes up; the
+	// `/_pagefind/pagefind.js` 404 is recoverable.
+	console.log("  Building search index…");
+	const initialIndex = await buildDevSearchIndex(buildDir, result.renderer, verbose);
+	if (initialIndex.success) {
+		console.log(`  ✓ Indexed ${initialIndex.pagesIndexed ?? 0} pages for search`);
+	} else {
+		console.warn("  ⚠ Search index build failed; search will be unavailable until the next successful rebuild");
+		if (verbose && initialIndex.output) console.error(initialIndex.output);
+	}
+
+	// Background rebuilder — content changes trigger a rebuild without
+	// blocking the watcher's sync, so the dev page reload stays snappy and
+	// the index just catches up a few seconds behind.
+	const indexer = createDevIndexer(buildDir, result.renderer, verbose);
+
 	console.log("  Watching source folder for changes…");
 	const watcher = startSourceWatcher(sourceRoot, {
 		onChange: async () => {
@@ -518,6 +633,7 @@ export async function runDevServer(
 				const ignored = sync.mirrorResult.ignoredFiles.length;
 				const suffix = ignored > 0 ? ` (${ignored} ignored)` : "";
 				console.log(`  ↻ Synced ${total} files${suffix}`);
+				indexer.trigger();
 			}
 		},
 	});

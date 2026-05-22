@@ -272,6 +272,100 @@ describe("NpmRunner.runNpmBuild", () => {
 		expect(result.success).toBe(true);
 		expect(result.output).toBe("");
 	});
+
+	it("merges env overrides on top of process.env", async () => {
+		const { runNpmBuild } = await import("./NpmRunner.js");
+		mockSpawnSync.mockReturnValue(makeSpawnResult(0));
+
+		await runNpmBuild("/build/dir", { JOLLI_PAGEFIND_BUILD: "1" });
+
+		const opts = mockSpawnSync.mock.calls[0][2];
+		expect(opts.env.JOLLI_PAGEFIND_BUILD).toBe("1");
+		// PATH is a process.env key on every CI runner — it should survive the merge.
+		expect(opts.env.PATH).toBe(process.env.PATH);
+	});
+
+	it("passes process.env directly when no env override is given", async () => {
+		const { runNpmBuild } = await import("./NpmRunner.js");
+		mockSpawnSync.mockReturnValue(makeSpawnResult(0));
+
+		await runNpmBuild("/build/dir");
+
+		const opts = mockSpawnSync.mock.calls[0][2];
+		expect(opts.env).toBe(process.env);
+	});
+});
+
+// ─── runNpmBuildAsync ───────────────────────────────────────────────────────
+
+describe("NpmRunner.runNpmBuildAsync", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it("returns { success: true } when the build exits with code 0", async () => {
+		const { runNpmBuildAsync } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runNpmBuildAsync("/build/dir");
+		child.emit("close", 0);
+
+		const result = await promise;
+		expect(result.success).toBe(true);
+	});
+
+	it("returns { success: false } when the build exits with non-zero code", async () => {
+		const { runNpmBuildAsync } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runNpmBuildAsync("/build/dir");
+		child.emit("close", 1);
+
+		const result = await promise;
+		expect(result.success).toBe(false);
+	});
+
+	it("returns { success: false } with the error message on spawn error", async () => {
+		const { runNpmBuildAsync } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runNpmBuildAsync("/build/dir");
+		child.emit("error", new Error("spawn ENOENT"));
+
+		const result = await promise;
+		expect(result.success).toBe(false);
+		expect(result.output).toContain("spawn ENOENT");
+	});
+
+	it("merges env overrides on top of process.env", async () => {
+		const { runNpmBuildAsync } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runNpmBuildAsync("/build/dir", { JOLLI_PAGEFIND_BUILD: "1" });
+		child.emit("close", 0);
+		await promise;
+
+		const opts = mockSpawn.mock.calls[0][2];
+		expect(opts.env.JOLLI_PAGEFIND_BUILD).toBe("1");
+		expect(opts.env.PATH).toBe(process.env.PATH);
+	});
+
+	it("passes process.env directly when no env override is given", async () => {
+		const { runNpmBuildAsync } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runNpmBuildAsync("/build/dir");
+		child.emit("close", 0);
+		await promise;
+
+		const opts = mockSpawn.mock.calls[0][2];
+		expect(opts.env).toBe(process.env);
+	});
 });
 
 // ─── runNpmDev ───────────────────────────────────────────────────────────────

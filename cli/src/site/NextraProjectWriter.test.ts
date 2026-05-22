@@ -166,6 +166,14 @@ describe("NextraProjectWriter.generateNextConfig", () => {
 		const config = generateNextConfig(false);
 		expect(config).not.toContain("output: 'export'");
 	});
+
+	it("wires JOLLI_PAGEFIND_BUILD to an isolated distDir", async () => {
+		const { generateNextConfig } = await import("./NextraProjectWriter.js");
+		const config = generateNextConfig();
+		// The runtime branch reads the env at config-load time and flips distDir.
+		expect(config).toContain("JOLLI_PAGEFIND_BUILD");
+		expect(config).toContain(".next-pagefind");
+	});
 });
 
 // ─── generateLayout unit tests ───────────────────────────────────────────────

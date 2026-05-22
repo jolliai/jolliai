@@ -430,7 +430,12 @@ export function generatePackageJson(): string {
 export function generateNextConfig(staticExport?: boolean): string {
 	const exportLines = staticExport ? `\n  output: 'export',\n  images: { unoptimized: true },` : "";
 
+	// `JOLLI_PAGEFIND_BUILD=1` redirects build output to `.next-pagefind/` so the
+	// dev-mode search-index pipeline (which runs `next build` while `next dev` is
+	// also writing `.next/`) doesn't collide with the live dev compiler.
 	return `import nextra from 'nextra'
+
+const isPagefindBuild = process.env.JOLLI_PAGEFIND_BUILD === '1'
 
 const withNextra = nextra({
   contentDirBasePath: '/'
@@ -438,6 +443,7 @@ const withNextra = nextra({
 
 export default withNextra({${exportLines}
   reactStrictMode: true,
+  ...(isPagefindBuild ? { distDir: '.next-pagefind' } : {}),
   webpack(config) {
     // See JSDoc above for why this is here.
     config.infrastructureLogging = { ...(config.infrastructureLogging ?? {}), level: 'error' }
