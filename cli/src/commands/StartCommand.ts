@@ -6,6 +6,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Command } from "commander";
@@ -23,6 +24,7 @@ import { deriveSpecName } from "../site/openapi/SpecName.js";
 import { runPagefind } from "../site/PagefindRunner.js";
 import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
 import type { OpenApiSpecInput } from "../site/renderer/SiteRenderer.js";
+import { escapeHtml, sanitizeUrl } from "../site/Sanitize.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
 import { startSourceWatcher } from "../site/SourceWatcher.js";
 import { parseNavigation } from "../site/StructureParser.js";
@@ -220,6 +222,19 @@ async function syncContent(
 		specInputs,
 	);
 
+	// When the site is in page mode and no page is rooted at `/`, the auto-
+	// mirrored root `index.md` is dead weight — `SidebarTabs.tsx` ends up
+	// client-side redirecting from `/` to the first tab, which produces a
+	// visible flash of the index page before the JS runs. Replace the root
+	// index with an inline `<script>` redirect so the browser navigates away
+	// before React even hydrates. We do this *before* `generateNavigation` so
+	// the `_meta.js` writer picks up the rewritten file and emits the standard
+	// `{ "index": { display: "hidden" } }` entry to keep it out of the sidebar.
+	const redirectHref = pickRootRedirectHref(parsedNavigation);
+	if (redirectHref) {
+		await writeRootRedirectIndex(contentDir, redirectHref);
+	}
+
 	if (parsedNavigation) {
 		if (parsedNavigation.rootPages?.length) {
 			rootInjection.structurePages = parsedNavigation.rootPages;
@@ -241,6 +256,78 @@ async function syncContent(
 	}
 
 	return { success: true, mirrorResult };
+}
+
+/**
+ * Returns the href to redirect `/` to, or `undefined` when no redirect is
+ * needed. We redirect only when:
+ *   - The site is in page mode (navigation has `pages`)
+ *   - No page is rooted at `/` (the user didn't claim the root)
+ *   - The first navigable (non-`menu`) page resolves to a real href
+ *
+ * The selected href is then routed through `sanitizeUrl` so a hostile
+ * `site.json` entry like `{ root: "javascript:alert(1)" }` cannot reach the
+ * `window.location.replace(...)` call in the inline-script stub. A clamped
+ * value (`"#"`) collapses back to `undefined` so the original index renders.
+ *
+ * Exported for unit testing — call site is in `syncContent`.
+ */
+export function pickRootRedirectHref(
+	parsedNavigation: ReturnType<typeof parseNavigation> | undefined,
+): string | undefined {
+	if (!parsedNavigation?.pages?.length) return undefined;
+	const claimsRoot = parsedNavigation.pages.some((p) => p.href === "/");
+	if (claimsRoot) return undefined;
+	const firstNavigable = parsedNavigation.pages.find((p) => p.type !== "menu" && p.href && p.href !== "#");
+	if (!firstNavigable?.href) return undefined;
+	const safe = sanitizeUrl(firstNavigable.href);
+	return safe === "#" ? undefined : safe;
+}
+
+/**
+ * Overwrites `<contentDir>/index.{md,mdx}` with a tiny stub that redirects
+ * `/` to `href` via an inline `<script>`. The script runs before React
+ * hydration, so the user never sees the original index content flash. The
+ * `<noscript>` fallback covers JS-disabled browsers and crawlers.
+ *
+ * Exported for unit testing — call site is in `syncContent`.
+ */
+export async function writeRootRedirectIndex(contentDir: string, href: string): Promise<void> {
+	// `jsHref` is for the inline JS string. JSON.stringify handles backslash,
+	// quote, and unicode escapes — but three sequences survive that still
+	// matter at MDX/HTML render time:
+	//   - `</script>` inside the JS string terminates the surrounding
+	//     `<script>` tag at HTML parse time.
+	//   - Backtick (`` ` ``) inside the JS string closes the outer template
+	//     literal that the MDX expression `{`window.location.replace(${jsHref})`}`
+	//     uses to splice `jsHref` in. A trailing backtick causes a syntax
+	//     error (DoS); a properly placed one followed by `${...}` lets the
+	//     attacker append arbitrary JS as a template-literal head expression.
+	//   - `${` inside the JS string introduces a template-literal
+	//     substitution that evaluates the contents as JS at render time
+	//     (e.g. `/x${alert(1)}` → `alert(1)` runs on every visit to `/`).
+	const jsHref = JSON.stringify(href).replace(/</g, "\\u003c").replace(/`/g, "\\u0060").replace(/\$\{/g, "\\u0024{");
+	// `htmlHref` is for the noscript `<a>` href attribute and MDX text. The
+	// shared `escapeHtml` helper escapes `& < > " ' { }` — the curly-brace
+	// escape matters here because the noscript fallback splices `htmlHref`
+	// into MDX text content, and MDX parses `{...}` in text as a JSX
+	// expression (so `/foo{alert(1)}` would execute at render time without
+	// the `{` / `}` escape).
+	const htmlHref = escapeHtml(href);
+	const mdx = `---
+title: Redirecting…
+sidebarTitle: ' '
+---
+
+<script dangerouslySetInnerHTML={{ __html: \`window.location.replace(${jsHref})\` }} />
+
+<noscript>
+  Redirecting to <a href="${htmlHref}">${htmlHref}</a>…
+</noscript>
+`;
+	await mkdir(contentDir, { recursive: true });
+	await rm(join(contentDir, "index.md"), { force: true });
+	await writeFile(join(contentDir, "index.mdx"), mdx, "utf-8");
 }
 
 /**

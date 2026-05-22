@@ -261,10 +261,19 @@ function addArticle(
 	}
 
 	const hrefSegments = article.href.split("/").filter(Boolean);
+	// When the article has nested children and `expanded` is set explicitly,
+	// emit the _meta.js entry as an object with `theme.collapsed` so Nextra
+	// honors the customer's open/closed intent regardless of
+	// `defaultMenuCollapseLevel`. When `expanded` is omitted, fall through to
+	// the plain string entry so Nextra's per-depth default applies.
+	const entryValue: SidebarItemValue =
+		article.articles?.length && article.expanded !== undefined
+			? { title: article.article, theme: { collapsed: !article.expanded } }
+			: article.article;
 
 	if (hrefSegments.length === 1) {
 		// Single segment — goes directly into the current entries
-		entries[hrefSegments[0]] = article.article;
+		entries[hrefSegments[0]] = entryValue;
 	} else {
 		// Multi-segment href (e.g. "real-time-apps/part1") — the first segment
 		// is a directory reference in the current _meta.js, and the last segment
@@ -278,7 +287,7 @@ function addArticle(
 				sidebar[intermediatePath] = {};
 			}
 			(sidebar[intermediatePath] as Record<string, SidebarItemValue>)[seg] = isLast
-				? article.article
+				? entryValue
 				: ((sidebar[intermediatePath] as Record<string, SidebarItemValue>)[seg] ?? seg);
 			if (!isLast) {
 				intermediatePath = joinPath(intermediatePath, seg);
