@@ -24,6 +24,7 @@ import { deriveSpecName } from "../site/openapi/SpecName.js";
 import { runPagefind } from "../site/PagefindRunner.js";
 import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
 import type { OpenApiSpecInput } from "../site/renderer/SiteRenderer.js";
+import { escapeHtml, sanitizeUrl } from "../site/Sanitize.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
 import { startSourceWatcher } from "../site/SourceWatcher.js";
 import { parseNavigation } from "../site/StructureParser.js";
@@ -264,6 +265,11 @@ async function syncContent(
  *   - No page is rooted at `/` (the user didn't claim the root)
  *   - The first navigable (non-`menu`) page resolves to a real href
  *
+ * The selected href is then routed through `sanitizeUrl` so a hostile
+ * `site.json` entry like `{ root: "javascript:alert(1)" }` cannot reach the
+ * `window.location.replace(...)` call in the inline-script stub. A clamped
+ * value (`"#"`) collapses back to `undefined` so the original index renders.
+ *
  * Exported for unit testing — call site is in `syncContent`.
  */
 export function pickRootRedirectHref(
@@ -273,7 +279,9 @@ export function pickRootRedirectHref(
 	const claimsRoot = parsedNavigation.pages.some((p) => p.href === "/");
 	if (claimsRoot) return undefined;
 	const firstNavigable = parsedNavigation.pages.find((p) => p.type !== "menu" && p.href && p.href !== "#");
-	return firstNavigable?.href;
+	if (!firstNavigable?.href) return undefined;
+	const safe = sanitizeUrl(firstNavigable.href);
+	return safe === "#" ? undefined : safe;
 }
 
 /**
@@ -286,15 +294,25 @@ export function pickRootRedirectHref(
  */
 export async function writeRootRedirectIndex(contentDir: string, href: string): Promise<void> {
 	// `jsHref` is for the inline JS string. JSON.stringify handles backslash,
-	// quote, and unicode escapes — but a literal `</script>` inside the JS
-	// string still terminates the surrounding `<script>` tag at HTML parse
-	// time. Replace `<` with its `<` JS-string escape so the rendered
-	// HTML never contains `</script>` inside the inline script body.
-	const jsHref = JSON.stringify(href).replace(/</g, "\\u003c");
-	// `htmlHref` is for the noscript `<a>` href attribute. HTML attribute
-	// escaping is different from JS string escaping — a JSON-encoded value
-	// dropped into an HTML attribute could still let a `</script>` etc. land
-	// in the document as raw markup once a hostile href passes through.
+	// quote, and unicode escapes — but three sequences survive that still
+	// matter at MDX/HTML render time:
+	//   - `</script>` inside the JS string terminates the surrounding
+	//     `<script>` tag at HTML parse time.
+	//   - Backtick (`` ` ``) inside the JS string closes the outer template
+	//     literal that the MDX expression `{`window.location.replace(${jsHref})`}`
+	//     uses to splice `jsHref` in. A trailing backtick causes a syntax
+	//     error (DoS); a properly placed one followed by `${...}` lets the
+	//     attacker append arbitrary JS as a template-literal head expression.
+	//   - `${` inside the JS string introduces a template-literal
+	//     substitution that evaluates the contents as JS at render time
+	//     (e.g. `/x${alert(1)}` → `alert(1)` runs on every visit to `/`).
+	const jsHref = JSON.stringify(href).replace(/</g, "\\u003c").replace(/`/g, "\\u0060").replace(/\$\{/g, "\\u0024{");
+	// `htmlHref` is for the noscript `<a>` href attribute and MDX text. The
+	// shared `escapeHtml` helper escapes `& < > " ' { }` — the curly-brace
+	// escape matters here because the noscript fallback splices `htmlHref`
+	// into MDX text content, and MDX parses `{...}` in text as a JSX
+	// expression (so `/foo{alert(1)}` would execute at render time without
+	// the `{` / `}` escape).
 	const htmlHref = escapeHtml(href);
 	const mdx = `---
 title: Redirecting…
@@ -310,10 +328,6 @@ sidebarTitle: ' '
 	await mkdir(contentDir, { recursive: true });
 	await rm(join(contentDir, "index.md"), { force: true });
 	await writeFile(join(contentDir, "index.mdx"), mdx, "utf-8");
-}
-
-function escapeHtml(s: string): string {
-	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 /**

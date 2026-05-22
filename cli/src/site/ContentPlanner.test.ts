@@ -329,4 +329,33 @@ describe("applyNavigationContentPlan", () => {
 		const home = await readFile(join(contentDir, "home.mdx"), "utf-8");
 		expect(home).not.toContain("asIndexPage");
 	});
+
+	it("injects a top-level asIndexPage flag even when the frontmatter has a nested asIndexPage key", async () => {
+		// Regression: the "already declared" check used to match
+		// `^\s*asIndexPage\s*:` on any indentation, so a nested YAML key
+		// (e.g. `things:\n  asIndexPage: true`) falsely registered as a
+		// top-level declaration and the function skipped injection — the
+		// resulting file then had no top-level flag, and Nextra v4 fell
+		// back to its layout-conflict behaviour.
+		sourceRoot = await makeTempDir();
+		contentDir = await makeTempDir();
+
+		await writeFile(
+			join(sourceRoot, "deployment.mdx"),
+			"---\ntitle: Deployment\nthings:\n  asIndexPage: true\n---\n# Deployment\n",
+			"utf-8",
+		);
+
+		await applyNavigationContentPlan(sourceRoot, contentDir, ["deployment.mdx"], {
+			pages: [
+				{ sourceRelPath: "deployment.mdx", targetRelPath: "guides/deployment/index.mdx", title: "Deployment" },
+			],
+		});
+
+		const written = await readFile(join(contentDir, "guides/deployment/index.mdx"), "utf-8");
+		// Top-level flag is present.
+		expect(written).toMatch(/^---\n[\s\S]*^asIndexPage: true$/m);
+		// And the original nested key was preserved.
+		expect(written).toContain("things:\n  asIndexPage: true");
+	});
 });

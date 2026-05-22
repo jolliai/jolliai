@@ -266,6 +266,52 @@ describe("MetaGenerator.generateMetaFiles", () => {
 		expect(content).toContain('"docker"');
 	});
 
+	it("does NOT promote an index when asIndexPage appears as a nested YAML key", async () => {
+		// Regression: the detector used to match `^\s*asIndexPage\s*: true` on
+		// any indentation, so a nested key (e.g. `things:\n  asIndexPage: true`)
+		// falsely registered as a top-level declaration. With the fix, the
+		// index stays hidden (the standard `display: "hidden"` shape) so Nextra
+		// keeps treating the folder as a regular grouping.
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await writeFile(
+			join(contentDir, "index.md"),
+			"---\ntitle: Home\nthings:\n  asIndexPage: true\n---\n# Home",
+			"utf-8",
+		);
+		await writeFile(join(contentDir, "docker.md"), "# Docker", "utf-8");
+
+		await generateMetaFiles(contentDir);
+
+		const content = await readFile(join(contentDir, "_meta.js"), "utf-8");
+		expect(content).toContain('"index"');
+		expect(content).toContain('"hidden"');
+		expect(content).toContain('"docker"');
+	});
+
+	it("prefers index.mdx over index.md when both are present and asIndexPage is declared on the .mdx", async () => {
+		// Regression: Nextra resolves to `index.mdx` when both files exist, but
+		// the detector used to pick whichever readdir returned first (typically
+		// alphabetical → `index.md` wins). With both files present and only the
+		// `.mdx` declaring `asIndexPage: true`, the detector must agree with
+		// what Nextra actually compiles.
+		const { generateMetaFiles } = await import("./MetaGenerator.js");
+		await writeFile(
+			join(contentDir, "index.mdx"),
+			"---\ntitle: Deployment\nasIndexPage: true\n---\n# Deployment",
+			"utf-8",
+		);
+		// Stale .md from a previous mirror without the flag.
+		await writeFile(join(contentDir, "index.md"), "---\ntitle: Old\n---\n# Old", "utf-8");
+		await writeFile(join(contentDir, "docker.md"), "# Docker", "utf-8");
+
+		await generateMetaFiles(contentDir);
+
+		const content = await readFile(join(contentDir, "_meta.js"), "utf-8");
+		// The `.mdx` flag wins → index key is omitted entirely.
+		expect(content).not.toContain('"index"');
+		expect(content).toContain('"docker"');
+	});
+
 	it("_meta.js entries are sorted alphabetically", async () => {
 		const { generateMetaFiles } = await import("./MetaGenerator.js");
 		await writeFile(join(contentDir, "zebra.md"), "# Zebra", "utf-8");

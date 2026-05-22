@@ -202,9 +202,22 @@ function buildOverriddenEntries(
  * whether its frontmatter sets `asIndexPage: true`. Nextra v4 uses this flag
  * to promote the index to the folder's representative page; the folder's
  * `_meta.js` must omit the `"index"` key in that case.
+ *
+ * When both `index.mdx` and `index.md` are present, prefers `.mdx` to match
+ * Nextra's own resolution order — otherwise the detector could disagree with
+ * the file Nextra actually compiles and we'd emit the wrong `_meta.js` shape.
+ *
+ * The truthy match is anchored to column 0 (top-level YAML keys only) so a
+ * nested key like `things:\n  asIndexPage: true` doesn't falsely register;
+ * it also accepts the YAML 1.1 truthy variants Nextra's gray-matter parser
+ * recognises (`true` / `True` / `TRUE` / `yes` / `Yes` / `YES`).
  */
 async function detectAsIndexPage(dir: string, contentItems: string[]): Promise<boolean> {
-	const indexFile = contentItems.find((f) => f === "index.mdx" || f === "index.md");
+	const indexFile = contentItems.includes("index.mdx")
+		? "index.mdx"
+		: contentItems.includes("index.md")
+			? "index.md"
+			: undefined;
 	if (!indexFile) return false;
 	let raw: string;
 	try {
@@ -214,7 +227,7 @@ async function detectAsIndexPage(dir: string, contentItems: string[]): Promise<b
 	}
 	const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
 	if (!fm) return false;
-	return /^\s*asIndexPage\s*:\s*true\s*$/m.test(fm[1]);
+	return /^asIndexPage\s*:\s*(true|True|TRUE|yes|Yes|YES)\s*$/m.test(fm[1]);
 }
 
 // ─── generateMetaFiles ────────────────────────────────────────────────────────

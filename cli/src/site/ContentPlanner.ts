@@ -413,7 +413,12 @@ async function rewritePlannedPage(
 /**
  * Adds `asIndexPage: true` to the YAML frontmatter of a markdown/MDX file. If
  * the file has no frontmatter, prepends a new block. If the frontmatter
- * already declares `asIndexPage`, leaves it as authored.
+ * already declares `asIndexPage` at the top level, leaves it as authored.
+ *
+ * The "already declared" check is anchored to column 0 so a nested YAML key
+ * (e.g. `things:\n  asIndexPage: true`) doesn't falsely register as a
+ * top-level declaration — in that case Nextra would never see the flag and
+ * fall back to its layout-conflict behaviour.
  */
 function injectAsIndexPageFrontmatter(content: string): string {
 	const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
@@ -421,7 +426,7 @@ function injectAsIndexPageFrontmatter(content: string): string {
 		return `---\nasIndexPage: true\n---\n${content}`;
 	}
 	const body = fmMatch[1];
-	if (/^\s*asIndexPage\s*:/m.test(body)) {
+	if (/^asIndexPage\s*:/m.test(body)) {
 		return content;
 	}
 	const newFm = `---\n${body}\nasIndexPage: true\n---\n`;
