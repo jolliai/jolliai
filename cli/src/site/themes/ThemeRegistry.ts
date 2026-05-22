@@ -204,7 +204,7 @@ export async function discoverPack(
  */
 async function checkAndUpdateCachedTheme(name: string, _cachedPath: string): Promise<void> {
 	try {
-		const { downloadTheme } = await import("../../commands/ThemeCommand.js");
+		const { downloadTheme, githubAuthHeaders } = await import("../../commands/ThemeCommand.js");
 
 		// Read cached version from manifest.mjs
 		const manifestPath = join(_cachedPath, "manifest.mjs");
@@ -221,7 +221,7 @@ async function checkAndUpdateCachedTheme(name: string, _cachedPath: string): Pro
 
 		// Fetch registry to get latest version
 		const registryUrl = `https://raw.githubusercontent.com/jolliai/themes/main/registry.json`;
-		const res = await fetch(registryUrl);
+		const res = await fetch(registryUrl, { headers: githubAuthHeaders() });
 		if (!res.ok) return;
 		const registry = (await res.json()) as { themes: Array<{ name: string; version: string }> };
 		const entry = registry.themes.find((t) => t.name === name);
