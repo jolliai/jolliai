@@ -19,17 +19,37 @@ const { extractRepoName, getRemoteUrl, resolveKbParent } = vi.hoisted(() => ({
 	resolveKbParent: vi.fn().mockReturnValue("/mock/home/Documents/jolli"),
 }));
 
-const { MockFolderStorage, MockMetadataManager } = vi.hoisted(() => ({
-	MockFolderStorage: class {
-		constructor(
-			public readonly rootPath: string,
-			public readonly mm: unknown,
-		) {}
-	},
-	MockMetadataManager: class {
-		constructor(public readonly dir: string) {}
-	},
-}));
+const {
+	MockFolderStorage,
+	MockMetadataManager,
+	mockIsUserEditedOnDisk,
+	mockFindByPath,
+} = vi.hoisted(() => {
+	const isUserEditedOnDisk = vi.fn();
+	const findByPath = vi.fn();
+	return {
+		MockFolderStorage: class {
+			constructor(
+				public readonly rootPath: string,
+				public readonly mm: unknown,
+			) {}
+			isUserEditedOnDisk(
+				absPath: string,
+				manifestFingerprint: string | undefined,
+			): boolean {
+				return isUserEditedOnDisk(absPath, manifestFingerprint);
+			}
+		},
+		MockMetadataManager: class {
+			constructor(public readonly dir: string) {}
+			findByPath(relPath: string): unknown {
+				return findByPath(relPath);
+			}
+		},
+		mockIsUserEditedOnDisk: isUserEditedOnDisk,
+		mockFindByPath: findByPath,
+	};
+});
 
 const { loadGlobalConfig } = vi.hoisted(() => ({
 	loadGlobalConfig: vi.fn(),
@@ -45,7 +65,12 @@ const {
 	deletePlanVisibleArtifact,
 	getIndexEntryMap,
 	getSummary,
+	getTranscriptHashes,
+	indexNeedsMigration,
 	listSummaries,
+	migrateIndexToV3,
+	readTranscript,
+	readTranscriptsForCommits,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
 	storeLinearIssues,
@@ -57,7 +82,12 @@ const {
 	deletePlanVisibleArtifact: vi.fn(),
 	getIndexEntryMap: vi.fn(),
 	getSummary: vi.fn(),
+	getTranscriptHashes: vi.fn(),
+	indexNeedsMigration: vi.fn(),
 	listSummaries: vi.fn(),
+	migrateIndexToV3: vi.fn(),
+	readTranscript: vi.fn(),
+	readTranscriptsForCommits: vi.fn(),
 	saveTranscriptsBatch: vi.fn(),
 	scanTreeHashAliases: vi.fn(),
 	storeLinearIssues: vi.fn(),
@@ -203,7 +233,12 @@ vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 	deletePlanVisibleArtifact,
 	getIndexEntryMap,
 	getSummary,
+	getTranscriptHashes,
+	indexNeedsMigration,
 	listSummaries,
+	migrateIndexToV3,
+	readTranscript,
+	readTranscriptsForCommits,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
 	storeLinearIssues,
@@ -748,7 +783,7 @@ describe("JolliMemoryBridge", () => {
 			expect(status.enabled).toBe(true);
 			expect(status.activeSessions).toBe(2);
 			expect(status.summaryCount).toBe(5);
-			expect(installerGetStatus).toHaveBeenCalledWith(TEST_CWD);
+			expect(installerGetStatus).toHaveBeenCalledWith(TEST_CWD, expect.anything());
 		});
 
 		it("returns safe default when Installer.getStatus throws", async () => {
@@ -2448,6 +2483,252 @@ describe("JolliMemoryBridge", () => {
 			expect(result.summary).toEqual(foreign);
 			expect(result.sourceRepoName).toBe("good");
 		});
+
+		it("formats non-Error per-repo throws via String(err) (covers inner catch's String branch)", async () => {
+			// Pin the bare-string-reject arm in the per-repo catch — same shape
+			// as the Error variant above but exercises the String(err) fallback.
+			const foreign = { commitHash: "yyy", topics: [] };
+			getSummary
+				.mockResolvedValueOnce(null)
+				.mockRejectedValueOnce("bare-string-shadow")
+				.mockResolvedValueOnce(foreign);
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/broken",
+					repoName: "broken",
+					dirName: "broken",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/good",
+					repoName: "good",
+					dirName: "good",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepoWithSource("yyy");
+
+			expect(result.summary).toEqual(foreign);
+		});
+
+		it("formats non-Error outer-discovery throws via String(err) (covers outer catch's String branch)", async () => {
+			getSummary.mockResolvedValueOnce(null);
+			discoverRepos.mockImplementationOnce(() => {
+				// eslint-disable-next-line @typescript-eslint/no-throw-literal
+				throw "bare-string outer";
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryAnyRepoWithSource("zzz");
+
+			expect(result.summary).toBeNull();
+		});
+	});
+
+	describe("createStorageForRepo()", () => {
+		// Foreign-mode read-path enabler: SummaryWebviewPanel.show passes
+		// `sourceRepoName` + `sourceRemoteUrl` back through this factory to
+		// obtain a FolderStorage rooted at the foreign repo's `.jolli/`
+		// directory. Without this every read in the panel (transcripts,
+		// plans, notes) goes through `this.cwd`'s storage and returns empty
+		// for cross-repo summaries — the symptom reported as "All
+		// Conversations is empty when viewing another repo".
+
+		it("returns FolderStorage + kbRoot for a foreign DiscoveredRepo matched by repoName", async () => {
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/cur",
+					repoName: "cur",
+					dirName: "cur",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/other",
+					repoName: "other",
+					dirName: "other",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.createStorageForRepo("other", null);
+
+			expect(result).not.toBeNull();
+			expect(result?.kbRoot).toBe("/mock/home/Documents/jolli/other");
+			// MockFolderStorage records the rootPath it was constructed with —
+			// proves the panel's reads will hit the foreign kbRoot, not cwd.
+			expect((result?.storage as { rootPath: string }).rootPath).toBe(
+				"/mock/home/Documents/jolli/other",
+			);
+		});
+
+		it("prefers remoteUrl match over repoName when both have a remote", async () => {
+			// Two foreign repos with the same repoName but different remotes —
+			// folder renames can produce this; remoteUrl is the stable identity.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/a",
+					repoName: "shared",
+					dirName: "a",
+					remoteUrl: "https://github.com/owner-a/shared.git",
+					isCurrentRepo: false,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/b",
+					repoName: "shared",
+					dirName: "b",
+					remoteUrl: "https://github.com/owner-b/shared.git",
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.createStorageForRepo(
+				"shared",
+				"https://github.com/owner-b/shared.git",
+			);
+
+			expect(result?.kbRoot).toBe("/mock/home/Documents/jolli/b");
+		});
+
+		it("returns null when no DiscoveredRepo matches (foreign entry has neither matching name nor remote)", async () => {
+			// Two-repo scan covering both early-skip branches of the loop:
+			// (1) the currentRepo continue and (2) the `!urlMatches &&
+			// !nameMatches` continue for a foreign whose identity doesn't
+			// match the requested target. Without the second entry the loop
+			// short-circuits on `isCurrentRepo` and never exercises the
+			// identity-comparison branch.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/cur",
+					repoName: "cur",
+					dirName: "cur",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/elsewhere",
+					repoName: "elsewhere",
+					dirName: "elsewhere",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.createStorageForRepo("missing", null);
+
+			expect(result).toBeNull();
+		});
+
+		it("skips the currentRepo entry (factory is foreign-only)", async () => {
+			// The factory exists to enable foreign-mode reads. Returning the
+			// current repo's storage here would be a silent no-op against the
+			// caller's intent (and could shadow a real foreign match later).
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/cur",
+					repoName: "cur",
+					dirName: "cur",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.createStorageForRepo("cur", null);
+
+			expect(result).toBeNull();
+		});
+
+		it("returns null and does not throw when discovery itself errors", async () => {
+			discoverRepos.mockImplementationOnce(() => {
+				throw new Error("kb parent unreadable");
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.createStorageForRepo("anything", null);
+
+			expect(result).toBeNull();
+		});
+	});
+
+	describe("createReadStorageForCurrentRepo()", () => {
+		// Same FolderStorage factory as createStorageForRepo, but routes to
+		// the CURRENT workspace's KB folder instead of a foreign one. The
+		// SummaryWebviewPanel passes the result as `readStorage` for ALL
+		// detail panels (local + foreign) so the visible "All Conversations
+		// / plans / notes" data uniformly reads from the Memory Bank folder
+		// layer rather than the dual-write primary (orphan branch). Without
+		// this, local commits' detail panels would still read from the
+		// orphan branch (DualWriteStorage.readFile delegates to primary),
+		// diverging from how foreign-repo panels render.
+
+		it("returns FolderStorage + kbRoot for the matching currentRepo entry", async () => {
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/cur",
+					repoName: "cur",
+					dirName: "cur",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+				{
+					kbRoot: "/mock/home/Documents/jolli/other",
+					repoName: "other",
+					dirName: "other",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.createReadStorageForCurrentRepo();
+
+			expect(result).not.toBeNull();
+			expect(result?.kbRoot).toBe("/mock/home/Documents/jolli/cur");
+			expect((result?.storage as { rootPath: string }).rootPath).toBe(
+				"/mock/home/Documents/jolli/cur",
+			);
+		});
+
+		it("returns null when no DiscoveredRepo is flagged isCurrentRepo", async () => {
+			// Happens on a fresh repo whose KB folder hasn't been created
+			// yet (no `.jolli/config.json` under any kbParent subfolder).
+			// Caller must fall back to a null-storage code path rather than
+			// silently reading from a foreign repo's storage.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/other",
+					repoName: "other",
+					dirName: "other",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.createReadStorageForCurrentRepo();
+
+			expect(result).toBeNull();
+		});
+
+		it("returns null and does not throw when discovery itself errors", async () => {
+			discoverRepos.mockImplementationOnce(() => {
+				throw new Error("kb parent unreadable");
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.createReadStorageForCurrentRepo();
+
+			expect(result).toBeNull();
+		});
 	});
 
 	// ── Git utility methods ──────────────────────────────────────────────
@@ -2816,6 +3097,89 @@ describe("JolliMemoryBridge", () => {
 				TEST_CWD,
 				storageShape,
 			);
+		});
+	});
+
+	describe("getSummaryIndexEntryMap()", () => {
+		it("forwards the Bridge's storage to SummaryStore.getIndexEntryMap", async () => {
+			const fakeMap = new Map();
+			getIndexEntryMap.mockResolvedValue(fakeMap);
+			const bridge = makeBridge();
+
+			const result = await bridge.getSummaryIndexEntryMap();
+
+			expect(result).toBe(fakeMap);
+			expect(getIndexEntryMap).toHaveBeenCalledWith(TEST_CWD, storageShape);
+		});
+	});
+
+	describe("getTranscriptHashes()", () => {
+		it("forwards the Bridge's storage to SummaryStore.getTranscriptHashes", async () => {
+			const fakeSet = new Set(["hash1", "hash2"]);
+			getTranscriptHashes.mockResolvedValue(fakeSet);
+			const bridge = makeBridge();
+
+			const result = await bridge.getTranscriptHashes();
+
+			expect(result).toBe(fakeSet);
+			expect(getTranscriptHashes).toHaveBeenCalledWith(TEST_CWD, storageShape);
+		});
+	});
+
+	describe("readTranscript()", () => {
+		it("forwards the Bridge's storage to SummaryStore.readTranscript", async () => {
+			readTranscript.mockResolvedValue(null);
+			const bridge = makeBridge();
+
+			const result = await bridge.readTranscript("deadbeef");
+
+			expect(result).toBeNull();
+			expect(readTranscript).toHaveBeenCalledWith(
+				"deadbeef",
+				TEST_CWD,
+				storageShape,
+			);
+		});
+	});
+
+	describe("readTranscriptsForCommits()", () => {
+		it("forwards the Bridge's storage to SummaryStore.readTranscriptsForCommits", async () => {
+			const fakeMap = new Map();
+			readTranscriptsForCommits.mockResolvedValue(fakeMap);
+			const bridge = makeBridge();
+
+			const result = await bridge.readTranscriptsForCommits(["a", "b"]);
+
+			expect(result).toBe(fakeMap);
+			expect(readTranscriptsForCommits).toHaveBeenCalledWith(
+				["a", "b"],
+				TEST_CWD,
+				storageShape,
+			);
+		});
+	});
+
+	describe("indexNeedsMigration()", () => {
+		it("forwards the Bridge's storage to SummaryStore.indexNeedsMigration", async () => {
+			indexNeedsMigration.mockResolvedValue(true);
+			const bridge = makeBridge();
+
+			const result = await bridge.indexNeedsMigration();
+
+			expect(result).toBe(true);
+			expect(indexNeedsMigration).toHaveBeenCalledWith(TEST_CWD, storageShape);
+		});
+	});
+
+	describe("migrateIndexToV3()", () => {
+		it("forwards the Bridge's storage to SummaryStore.migrateIndexToV3", async () => {
+			migrateIndexToV3.mockResolvedValue({ migrated: 2, skipped: 1 });
+			const bridge = makeBridge();
+
+			const result = await bridge.migrateIndexToV3();
+
+			expect(result).toEqual({ migrated: 2, skipped: 1 });
+			expect(migrateIndexToV3).toHaveBeenCalledWith(TEST_CWD, storageShape);
 		});
 	});
 
@@ -3424,6 +3788,17 @@ describe("JolliMemoryBridge", () => {
 			expect(result).toEqual([]);
 		});
 
+		it("formats non-Error getIndexEntryMap rejections via String(err) (covers entries catch's String branch)", async () => {
+			// IO libs occasionally reject with bare strings or response objects;
+			// the catch must still log and downgrade to [] instead of crashing.
+			getIndexEntryMap.mockRejectedValueOnce("raw-string-error");
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchMemories("test-repo", "main");
+
+			expect(result).toEqual([]);
+		});
+
 		it("returns [] when foreign repo resolution throws (covers foreign-discovery catch)", async () => {
 			// Foreign-routed listBranchMemories has its own pre-storage try block
 			// (loadConfig → discoverRepos). A discoverRepos failure must not bubble
@@ -3436,6 +3811,55 @@ describe("JolliMemoryBridge", () => {
 			const result = await bridge.listBranchMemories("foreign-repo", "main");
 
 			expect(result).toEqual([]);
+		});
+
+		it("formats non-Error foreign-discovery throws via String(err) (covers foreign catch's String branch)", async () => {
+			discoverRepos.mockImplementationOnce(() => {
+				// eslint-disable-next-line @typescript-eslint/no-throw-literal
+				throw "bare-string foreign error";
+			});
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchMemories("foreign-repo", "main");
+
+			expect(result).toEqual([]);
+		});
+
+		it("resolves foreign repo storage and returns its branch heads (covers foreign-storage construction)", async () => {
+			// Foreign-routed listBranchMemories must instantiate a fresh
+			// FolderStorage pointed at the discovered repo's kbRoot — without
+			// this, multi-repo Memory Bank installs can never list heads from
+			// a non-workspace repo. Pins the success-path lines that construct
+			// MetadataManager + FolderStorage and zero out cwd.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/foreign-repo",
+					repoName: "foreign-repo",
+					dirName: "foreign-repo",
+					remoteUrl: null,
+					isCurrentRepo: false,
+				},
+			]);
+			const head = makeEntry(
+				"foreignhead",
+				"2025-04-01T00:00:00Z",
+				"foreign head",
+				"main",
+			);
+			getIndexEntryMap.mockResolvedValueOnce(
+				new Map([["foreignhead", head]]),
+			);
+
+			const bridge = makeBridge();
+			const result = await bridge.listBranchMemories("foreign-repo", "main");
+
+			expect(result.map((e) => e.commitHash)).toEqual(["foreignhead"]);
+			// cwd must be cleared so getIndexEntryMap reads via the foreign
+			// FolderStorage rather than the workspace's active storage.
+			expect(getIndexEntryMap).toHaveBeenCalledWith(
+				undefined,
+				expect.any(MockFolderStorage),
+			);
 		});
 	});
 
@@ -4180,6 +4604,382 @@ describe("JolliMemoryBridge", () => {
 			bridge.invalidateEntriesCache();
 			await bridge.listSummaryEntries(10);
 			expect(getIndexEntryMap).toHaveBeenCalledTimes(2);
+		});
+	});
+
+	// ── isMemoryFileDivergedOnDisk ──────────────────────────────────────────
+
+	describe("isMemoryFileDivergedOnDisk()", () => {
+		// Drives the divergence banner, decoration provider, and revert command.
+		// The bridge owns the cross-repo discovery walk (mirrors
+		// getSummaryAnyRepoWithSource) and delegates the actual fingerprint
+		// compare to FolderStorage.isUserEditedOnDisk on the matching kbRoot.
+
+		it("returns true when the on-disk file diverges from the manifest fingerprint", async () => {
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			mockFindByPath.mockReturnValueOnce({
+				fileId: "f1",
+				path: "main/edited-abc12345.md",
+				fingerprint: "old-fp",
+			});
+			// Storage's helper says "yes, sha256 differs" — bridge must forward.
+			mockIsUserEditedOnDisk.mockReturnValueOnce(true);
+			const bridge = makeBridge();
+
+			const result = await bridge.isMemoryFileDivergedOnDisk(
+				"/mock/home/Documents/jolli/test-repo/main/edited-abc12345.md",
+			);
+
+			expect(result).toBe(true);
+			// relPath must be the kbRoot-relative portion; passing the absolute
+			// path here would silently miss every manifest entry and flip the
+			// whole subsystem to "never diverged".
+			expect(mockFindByPath).toHaveBeenCalledWith("main/edited-abc12345.md");
+			// The bridge MUST hand the manifest's fingerprint to the storage
+			// helper — using `undefined` would short-circuit to false and the
+			// divergence banner would never fire.
+			expect(mockIsUserEditedOnDisk).toHaveBeenCalledWith(
+				"/mock/home/Documents/jolli/test-repo/main/edited-abc12345.md",
+				"old-fp",
+			);
+		});
+
+		it("returns false when the on-disk file matches the manifest fingerprint", async () => {
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			mockFindByPath.mockReturnValueOnce({
+				fileId: "f1",
+				path: "main/clean-abc12345.md",
+				fingerprint: "same-fp",
+			});
+			mockIsUserEditedOnDisk.mockReturnValueOnce(false);
+			const bridge = makeBridge();
+
+			const result = await bridge.isMemoryFileDivergedOnDisk(
+				"/mock/home/Documents/jolli/test-repo/main/clean-abc12345.md",
+			);
+
+			expect(result).toBe(false);
+		});
+
+		it("returns false when absPath is not under any known kbRoot", async () => {
+			// Decoration provider asks about every VS Code file URI it sees;
+			// files outside the Memory Bank must never be flagged as diverged.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.isMemoryFileDivergedOnDisk(
+				"/some/random/path/elsewhere.md",
+			);
+
+			expect(result).toBe(false);
+			// Critical guard: we must never even attempt a manifest lookup
+			// when the path falls outside every discovered kbRoot — doing so
+			// would risk a relPath that begins with `..` slipping into the
+			// manifest and matching the wrong entry.
+			expect(mockFindByPath).not.toHaveBeenCalled();
+			expect(mockIsUserEditedOnDisk).not.toHaveBeenCalled();
+		});
+
+		it("returns false when the manifest has no entry for the relative path (legacy / unknown file)", async () => {
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			mockFindByPath.mockReturnValueOnce(undefined);
+			const bridge = makeBridge();
+
+			const result = await bridge.isMemoryFileDivergedOnDisk(
+				"/mock/home/Documents/jolli/test-repo/main/unknown-aaaaaaaa.md",
+			);
+
+			expect(result).toBe(false);
+			expect(mockIsUserEditedOnDisk).not.toHaveBeenCalled();
+		});
+
+		it("swallows discovery errors and returns false (covers outer-catch)", async () => {
+			// Decoration provider invokes this on every file URI it sees; a
+			// thrown error would crash the VS Code window's file-decoration
+			// pipeline. Force the outer-catch via discoverRepos throwing.
+			discoverRepos.mockImplementationOnce(() => {
+				throw new Error("kb parent unreadable");
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.isMemoryFileDivergedOnDisk(
+				"/mock/home/Documents/jolli/test-repo/main/edited-abc12345.md",
+			);
+
+			expect(result).toBe(false);
+		});
+
+		it("handles a kbRoot that already ends with the path separator", async () => {
+			// Exercises the truthy branch of the `endsWith("/")` ternary so
+			// neither half of the prefix-construction is dead code.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo/",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			mockFindByPath.mockReturnValueOnce({
+				fileId: "f1",
+				path: "main/edited-abc12345.md",
+				fingerprint: "old-fp",
+			});
+			mockIsUserEditedOnDisk.mockReturnValueOnce(true);
+			const bridge = makeBridge();
+
+			const result = await bridge.isMemoryFileDivergedOnDisk(
+				"/mock/home/Documents/jolli/test-repo/main/edited-abc12345.md",
+			);
+
+			expect(result).toBe(true);
+		});
+
+		it("converts Windows backslash absPaths to forward-slash relPaths for the manifest lookup", async () => {
+			// Regression: on Windows, `vscode.TextEditor.document.uri.fsPath` is
+			// backslash-separated, but FolderStorage writes manifest entries with
+			// literal forward slashes (`${branchFolder}/${fileName}`). The bridge
+			// must normalize separators before handing `relPath` to MetadataManager
+			// or every Memory Bank file silently fails to flag as diverged — the
+			// decoration badge, divergence toast, and revert menu all no-op.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "C:\\Users\\flyer\\Documents\\jolli\\test-repo",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			mockFindByPath.mockReturnValueOnce({
+				fileId: "f1",
+				path: "main/edited-abc12345.md",
+				fingerprint: "old-fp",
+			});
+			mockIsUserEditedOnDisk.mockReturnValueOnce(true);
+			const bridge = makeBridge();
+
+			const result = await bridge.isMemoryFileDivergedOnDisk(
+				"C:\\Users\\flyer\\Documents\\jolli\\test-repo\\main\\edited-abc12345.md",
+			);
+
+			expect(result).toBe(true);
+			expect(mockFindByPath).toHaveBeenCalledWith("main/edited-abc12345.md");
+		});
+
+		it("preserves original casing in relPath so manifest entries with uppercase branch names still match", async () => {
+			// Regression: deriving relPath from `normalizePathForCompare(absPath)`
+			// would lowercase the branch name on darwin/win32 (both flagged
+			// case-insensitive in PathUtils.normalizePathForCompare) and miss
+			// manifest entries for branches like `Fix-Badge-Count`.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			mockFindByPath.mockReturnValueOnce({
+				fileId: "f1",
+				path: "Fix-Badge-Count/edited-abc12345.md",
+				fingerprint: "old-fp",
+			});
+			mockIsUserEditedOnDisk.mockReturnValueOnce(true);
+			const bridge = makeBridge();
+
+			const result = await bridge.isMemoryFileDivergedOnDisk(
+				"/mock/home/Documents/jolli/test-repo/Fix-Badge-Count/edited-abc12345.md",
+			);
+
+			expect(result).toBe(true);
+			expect(mockFindByPath).toHaveBeenCalledWith(
+				"Fix-Badge-Count/edited-abc12345.md",
+			);
+		});
+
+		it("formats non-Error discovery throws via String(err) in the warning log", async () => {
+			// `err instanceof Error ? err.message : String(err)` — the
+			// String(err) branch is only hit when something non-Error is
+			// thrown (e.g. a bare string in legacy code paths).
+			discoverRepos.mockImplementationOnce(() => {
+				// eslint-disable-next-line @typescript-eslint/no-throw-literal
+				throw "bare string error";
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.isMemoryFileDivergedOnDisk(
+				"/mock/home/Documents/jolli/test-repo/main/edited-abc12345.md",
+			);
+
+			expect(result).toBe(false);
+		});
+	});
+
+	// ── resolveMemoryFile ───────────────────────────────────────────────────
+
+	describe("resolveMemoryFile()", () => {
+		// Used by the revert command to dispatch to the right regenerate helper
+		// based on the manifest entry's `type`. Returns { folderStorage,
+		// manifestEntry } on hit, null on any miss / error.
+
+		it("returns the FolderStorage and manifest entry when the file is under a known kbRoot", async () => {
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			const entry = {
+				fileId: "f1",
+				path: "main/edited-abc12345.md",
+				type: "commit",
+				fingerprint: "old-fp",
+				title: "Edited",
+			};
+			mockFindByPath.mockReturnValueOnce(entry);
+			const bridge = makeBridge();
+
+			const result = await bridge.resolveMemoryFile(
+				"/mock/home/Documents/jolli/test-repo/main/edited-abc12345.md",
+			);
+
+			expect(result).not.toBeNull();
+			expect(result?.manifestEntry).toBe(entry);
+			expect(result?.folderStorage).toBeDefined();
+			expect(mockFindByPath).toHaveBeenCalledWith("main/edited-abc12345.md");
+		});
+
+		it("returns null when absPath is not under any known kbRoot", async () => {
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.resolveMemoryFile(
+				"/some/random/path/elsewhere.md",
+			);
+
+			expect(result).toBeNull();
+			expect(mockFindByPath).not.toHaveBeenCalled();
+		});
+
+		it("returns null when the manifest has no entry for the relative path", async () => {
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			mockFindByPath.mockReturnValueOnce(undefined);
+			const bridge = makeBridge();
+
+			const result = await bridge.resolveMemoryFile(
+				"/mock/home/Documents/jolli/test-repo/main/unknown-aaaaaaaa.md",
+			);
+
+			expect(result).toBeNull();
+		});
+
+		it("swallows discovery errors and returns null (covers outer-catch)", async () => {
+			discoverRepos.mockImplementationOnce(() => {
+				throw new Error("kb parent unreadable");
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.resolveMemoryFile(
+				"/mock/home/Documents/jolli/test-repo/main/edited-abc12345.md",
+			);
+
+			expect(result).toBeNull();
+		});
+
+		it("formats non-Error discovery throws via String(err) in the warning log", async () => {
+			discoverRepos.mockImplementationOnce(() => {
+				// eslint-disable-next-line @typescript-eslint/no-throw-literal
+				throw "bare string error";
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.resolveMemoryFile(
+				"/mock/home/Documents/jolli/test-repo/main/edited-abc12345.md",
+			);
+
+			expect(result).toBeNull();
+		});
+
+		it("handles a kbRoot that already ends with the path separator", async () => {
+			// The bridge appends `sep` only when missing; this test exercises the
+			// "already ends with sep" branch of the ternary at the top of the
+			// repos loop.
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/test-repo/",
+					repoName: "test-repo",
+					dirName: "test-repo",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			mockFindByPath.mockReturnValueOnce({
+				fileId: "f1",
+				path: "main/edited-abc12345.md",
+				type: "commit",
+				fingerprint: "old-fp",
+			});
+			const bridge = makeBridge();
+
+			const result = await bridge.resolveMemoryFile(
+				"/mock/home/Documents/jolli/test-repo/main/edited-abc12345.md",
+			);
+
+			expect(result).not.toBeNull();
 		});
 	});
 });

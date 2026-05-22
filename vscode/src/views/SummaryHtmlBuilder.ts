@@ -129,7 +129,7 @@ ${csp}
 <body>
 <div class="${pageClass}">
 ${staleBannerHtml}
-${buildAllConversationsSection(transcriptHashSet)}
+${buildAllConversationsSection(transcriptHashSet, !!opts.foreignRepoName)}
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
 <hr class="separator" />
 ${buildRecapSection(summary.recap)}
@@ -610,24 +610,50 @@ export function renderE2eScenario(s: E2eTestScenario, index: number): string {
 
 // ─── All Conversations ───────────────────────────────────────────────────────
 
-/** Builds the All Conversations section with an Open button and the transcript Modal skeleton. */
+/**
+ * Builds the All Conversations section with an Open button and the transcript
+ * Modal skeleton.
+ *
+ * `isForeign` swaps the action chip from the workspace-side "Manage" (opens
+ * the editable transcript modal) to a read-only "View" affordance:
+ *  - The Regenerate button is dropped entirely (the foreign-readonly CSS
+ *    rule already hides it, but emitting the markup would leave a
+ *    misleading affordance in the DOM tree the user can spot via DevTools).
+ *  - The Manage→View button stays under the same `openTranscriptsBtn` id —
+ *    the modal-open click handler is unchanged. It receives the
+ *    `data-foreign-safe` attribute so the .foreign-readonly CSS rule
+ *    keeps it visible (the rule hides every button without that marker).
+ *  - The modal's close-button is also marked foreign-safe so users can
+ *    actually exit the modal after browsing transcripts; the modal's
+ *    Save/Delete/Cancel buttons stay hidden by the same CSS rule so
+ *    nothing destructive is reachable.
+ */
 function buildAllConversationsSection(
 	transcriptHashSet?: ReadonlySet<string>,
+	isForeign: boolean = false,
 ): string {
 	const count = transcriptHashSet?.size ?? 0;
 	if (count === 0) {
+		const emptyActions = isForeign
+			? ""
+			: `      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>`;
 		return `
 <div class="private-zone">
   <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
     <div class="section-title">&#x1F4AC; All Conversations</div>
     <span class="conversations-actions">
-      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>
+${emptyActions}
     </span>
   </div>
   <p class="empty">No conversation transcripts saved for this commit.</p>
 </div>`;
 	}
+
+	const headerActions = isForeign
+		? `      <button class="action-btn" id="openTranscriptsBtn" data-foreign-safe title="Browse transcripts (read-only)">View</button>`
+		: `      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>
+      <button class="action-btn" id="openTranscriptsBtn">Manage</button>`;
 
 	return `
 <div class="private-zone">
@@ -635,8 +661,7 @@ function buildAllConversationsSection(
   <div class="section-header">
     <div class="section-title">&#x1F4AC; All Conversations</div>
     <span class="conversations-actions">
-      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>
-      <button class="action-btn" id="openTranscriptsBtn">Manage</button>
+${headerActions}
     </span>
   </div>
   <p class="conversations-description">Raw AI conversation transcripts captured during development.</p>
@@ -645,11 +670,21 @@ function buildAllConversationsSection(
   </p>
   <p class="conversations-privacy">&#x1F512; Your private data — stored on your machine only. Nothing is uploaded unless you choose to.</p>
 </div>
-${buildTranscriptModal()}`;
+${buildTranscriptModal(isForeign)}`;
 }
 
-/** Builds the transcript Modal overlay (hidden by default, shown via JS). */
-function buildTranscriptModal(): string {
+/**
+ * Builds the transcript Modal overlay (hidden by default, shown via JS).
+ *
+ * In foreign-readonly mode the close-button is marked `data-foreign-safe`
+ * so the `.page.foreign-readonly button:not([data-foreign-safe])` rule
+ * keeps it visible; without this the user would enter the modal and have
+ * no clickable exit (ESC and overlay-click still work but are not
+ * discoverable). The footer's Save/Delete/Cancel stay un-tagged so the
+ * same rule hides them — the modal is browse-only.
+ */
+function buildTranscriptModal(isForeign: boolean = false): string {
+	const closeForeignSafe = isForeign ? " data-foreign-safe" : "";
 	return `
 <div class="modal-overlay" id="transcriptModal">
   <div class="modal-container">
@@ -658,7 +693,7 @@ function buildTranscriptModal(): string {
         <span>&#x1F4AC; All Conversations</span>
         <span class="modal-subtitle" id="modalSubtitle"></span>
       </div>
-      <button class="modal-close-btn" id="modalCloseBtn" title="Close">&times;</button>
+      <button class="modal-close-btn" id="modalCloseBtn" title="Close"${closeForeignSafe}>&times;</button>
     </div>
     <div class="modal-tabs" id="modalTabs"></div>
     <div class="modal-body" id="modalBody">

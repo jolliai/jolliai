@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MetadataManager } from "../../../cli/src/core/MetadataManager";
 import { KbFoldersService, parseMdTitle } from "./KbFoldersService";
 
@@ -286,6 +286,84 @@ describe("KbFoldersService — single repo (under multi-repo parent)", () => {
 		);
 		expect(dropped?.fileKind).toBe("other");
 		expect(dropped?.fileKey).toBeUndefined();
+	});
+
+	it("flags isDiverged on tracked files whose on-disk sha256 differs from manifest fingerprint", async () => {
+		// Drives the ✎ marker in the KB folders tree, symmetric with
+		// MemoryFileDecorationProvider's badge on the native explorer.
+		// Pin three observable cases together so a future refactor of
+		// computeIsDiverged can't silently flip the contract for any one
+		// of them: matching fingerprint, mismatched fingerprint, and
+		// untracked file (no manifest entry → no ✎).
+		const cleanContent = "# clean\n";
+		const dirtyContent = "# clean\n\nedited!\n";
+		mkdirSync(join(repoDir, "main"), { recursive: true });
+		writeFileSync(join(repoDir, "main", "clean.md"), cleanContent);
+		writeFileSync(join(repoDir, "main", "dirty.md"), dirtyContent);
+		writeFileSync(join(repoDir, "main", "untracked.md"), "stranger");
+		const cleanFingerprint = MetadataManager.sha256(cleanContent);
+		writeFileSync(
+			join(repoDir, ".jolli", "manifest.json"),
+			JSON.stringify({
+				version: 1,
+				files: [
+					{
+						path: "main/clean.md",
+						type: "commit",
+						fileId: "cleanid",
+						fingerprint: cleanFingerprint,
+						source: { commitHash: "cleanid", branch: "main" },
+					},
+					{
+						// Fingerprint deliberately does NOT match dirtyContent on disk —
+						// simulates the user editing the .md after the system last wrote it.
+						path: "main/dirty.md",
+						type: "commit",
+						fileId: "dirtyid",
+						fingerprint: "sha256:stale",
+						source: { commitHash: "dirtyid", branch: "main" },
+					},
+				],
+			}),
+		);
+
+		const main = await svc.listChildren("myrepo/main");
+		const clean = (main.children ?? []).find((c) => c.name === "clean.md");
+		const dirty = (main.children ?? []).find((c) => c.name === "dirty.md");
+		const untracked = (main.children ?? []).find(
+			(c) => c.name === "untracked.md",
+		);
+		expect(clean?.isDiverged).toBe(false);
+		expect(dirty?.isDiverged).toBe(true);
+		// Untracked files have no fingerprint → can't be "diverged" semantically.
+		expect(untracked?.isDiverged).toBe(false);
+	});
+
+	it("returns isDiverged=false for manifest entries with no fingerprint (legacy rows)", async () => {
+		// Pre-fingerprint manifest rows could legitimately exist in upgraded
+		// installs. Treat absent fingerprint as "no source of truth to compare
+		// against" → no ✎ marker, mirroring FolderStorage.isUserEditedOnDisk.
+		mkdirSync(join(repoDir, "main"), { recursive: true });
+		writeFileSync(join(repoDir, "main", "legacy.md"), "anything");
+		writeFileSync(
+			join(repoDir, ".jolli", "manifest.json"),
+			JSON.stringify({
+				version: 1,
+				files: [
+					{
+						path: "main/legacy.md",
+						type: "commit",
+						fileId: "legacyid",
+						// fingerprint intentionally absent
+						source: { commitHash: "legacyid", branch: "main" },
+					},
+				],
+			}),
+		);
+
+		const main = await svc.listChildren("myrepo/main");
+		const legacy = (main.children ?? []).find((c) => c.name === "legacy.md");
+		expect(legacy?.isDiverged).toBe(false);
 	});
 
 	it("treats a manifest.json with no `files` field as an empty lookup", async () => {
@@ -594,6 +672,131 @@ describe("KbFoldersService — single repo (under multi-repo parent)", () => {
 		expect(existsSync(join(repoDir, visibleRel))).toBe(true);
 	});
 
+	// notifyDirty() with an explicit kbRoot scopes invalidation to one repo
+	// without nuking the whole memo. Pinned because callers like
+	// SidebarWebviewProvider's per-repo "memory deleted" path rely on this
+	// scoped form to avoid re-running reconcile + heal on every other repo
+	// in the parent.
+	// Heal can fail with a "loud" category error (ENOSPC / EROFS / EACCES /
+	// EPERM) — these mean disk-level or permission problems the user can
+	// actually fix, so the service logs them with a different prefix
+	// (`heal blocked` vs `heal failed`). chmod 0 on a real manifest.json
+	// gives a deterministic EACCES on POSIX.
+	it("logs `heal blocked` when heal throws a loud-category error (EACCES)", async () => {
+		// Force the loud-category branch in listInRepo's heal catch:
+		// `code in {ENOSPC,EROFS,EACCES,EPERM}` is a distinct log + (per the
+		// "caller should consider toasting" comment) potentially a different
+		// user-visible signal. Hard to reproduce naturally because most heal
+		// failures throw plain Errors; cleanest path is to monkey-patch
+		// FolderStorage.healMissingVisibleMarkdown to reject with an
+		// errno-shaped EACCES.
+		const { FolderStorage } = await import(
+			"../../../cli/src/core/FolderStorage.js"
+		);
+		const heal = vi
+			.spyOn(FolderStorage.prototype, "healMissingVisibleMarkdown")
+			.mockRejectedValue(
+				Object.assign(new Error("EACCES: permission denied"), {
+					code: "EACCES",
+				}),
+			);
+		const warnSpy = vi
+			.spyOn(console, "warn")
+			.mockImplementation(() => undefined);
+		try {
+			await svc.listChildren("myrepo");
+			const loudCalls = warnSpy.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0].includes("heal blocked") : false,
+			);
+			expect(loudCalls.length).toBeGreaterThan(0);
+		} finally {
+			warnSpy.mockRestore();
+			heal.mockRestore();
+		}
+	});
+
+	it("logs `heal failed` with `?` placeholder when err is a non-Error value", async () => {
+		// Same catch block, the other branch: `err instanceof Error` is
+		// false, so `message` falls through to `String(err)` and the log
+		// prefix is `heal failed` (not `heal blocked`) because the err has
+		// no `.code` property.
+		const { FolderStorage } = await import(
+			"../../../cli/src/core/FolderStorage.js"
+		);
+		const heal = vi
+			.spyOn(FolderStorage.prototype, "healMissingVisibleMarkdown")
+			.mockRejectedValue("not-an-error-instance");
+		const warnSpy = vi
+			.spyOn(console, "warn")
+			.mockImplementation(() => undefined);
+		try {
+			await svc.listChildren("myrepo");
+			const failedCalls = warnSpy.mock.calls.filter((c) =>
+				typeof c[0] === "string"
+					? c[0].includes("heal failed") &&
+						c[0].includes("[?]") &&
+						c[0].includes("not-an-error-instance")
+					: false,
+			);
+			expect(failedCalls.length).toBeGreaterThan(0);
+		} finally {
+			warnSpy.mockRestore();
+			heal.mockRestore();
+		}
+	});
+
+	it("notifyDirty(kbRoot) drops only the named repo from the clean memo", async () => {
+		// Seed manifest + visible md so the first listChildren marks the
+		// repo as clean (heal returns healed=0, failed=0). Notifying
+		// dirty(kbRoot) must then re-run heal — observable by deleting
+		// the visible md and watching it come back.
+		const summaryJson = JSON.stringify({
+			version: 3,
+			commitHash: "scopedirty0000aa",
+			commitMessage: "feat: scoped dirty",
+			commitAuthor: "Author",
+			commitDate: "2026-05-21T00:00:00Z",
+			branch: "main",
+			generatedAt: "2026-05-21T00:00:00Z",
+		});
+		mkdirSync(join(repoDir, ".jolli", "summaries"), { recursive: true });
+		writeFileSync(
+			join(repoDir, ".jolli", "summaries", "scopedirty0000aa.json"),
+			summaryJson,
+		);
+		const visibleRel = "main/feat-scoped-dirty-scopedir.md";
+		mkdirSync(join(repoDir, "main"), { recursive: true });
+		writeFileSync(join(repoDir, visibleRel), "# existing\n");
+		writeFileSync(
+			join(repoDir, ".jolli", "manifest.json"),
+			JSON.stringify({
+				version: 1,
+				files: [
+					{
+						path: visibleRel,
+						type: "commit",
+						fileId: "scopedirty0000aa",
+						fingerprint: "fp",
+						source: {
+							commitHash: "scopedirty0000aa",
+							branch: "main",
+							generatedAt: "2026-05-21T00:00:00Z",
+						},
+						title: "feat: scoped dirty",
+					},
+				],
+			}),
+		);
+
+		await svc.listChildren("myrepo");
+		rmSync(join(repoDir, visibleRel));
+		expect(existsSync(join(repoDir, visibleRel))).toBe(false);
+
+		svc.notifyDirty(repoDir);
+		await svc.listChildren("myrepo");
+		expect(existsSync(join(repoDir, visibleRel))).toBe(true);
+	});
+
 	it("does NOT leak the clean memo across kbParent roots that share a repo basename", async () => {
 		// Regression: cleanRepos was keyed by `firstSeg` (repo dirName) rather
 		// than the absolute kbRoot path. When the user changed "Local Folder"
@@ -848,6 +1051,104 @@ describe("KbFoldersService — multi-repo & parent listing", () => {
 		expect(root.relPath).toBe("");
 		expect(root.isDirectory).toBe(true);
 		expect(root.children).toEqual([]);
+	});
+
+	// kbParent is the user-configured Memory Bank folder. If it was set to a
+	// path that hasn't been created yet (or has just been deleted), every
+	// readdir against it throws ENOENT. The user-top-level listing must
+	// degrade to [] (mirrors discoverRepos's behaviour for the same condition)
+	// so the sidebar shows an empty root rather than blowing up the listing.
+	it("returns an empty parent listing when kbParent does not exist on disk", async () => {
+		const missing = join(tmpParent, "never-created");
+		const svc = new KbFoldersService(() => ({
+			kbParent: missing,
+			currentRepoName: null,
+			currentRemoteUrl: null,
+		}));
+		const root = await svc.listChildren("");
+		expect(root.relPath).toBe("");
+		expect(root.isDirectory).toBe(true);
+		expect(root.children).toEqual([]);
+	});
+
+	// User-created sibling directories at the parent root must sort
+	// alphabetically among themselves (after the repo-first ordering).
+	// Hits the `ad === bd` branch of the sort comparator that the
+	// existing 1-dir-1-file test can never reach.
+	it("sorts user-created sibling directories alphabetically at the parent root", async () => {
+		mkdirSync(join(tmpParent, "z-dir"));
+		mkdirSync(join(tmpParent, "a-dir"));
+		mkdirSync(join(tmpParent, "m-dir"));
+
+		const svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: null,
+			currentRemoteUrl: null,
+		}));
+		const root = await svc.listChildren("");
+		const names = (root.children ?? []).map((c) => c.name);
+		expect(names).toEqual(["a-dir", "m-dir", "z-dir"]);
+	});
+
+	// Same as above but for files only — covers the same `ad === bd → localeCompare`
+	// branch on the file side, plus the .md title-derivation for top-level files
+	// preserves order.
+	it("sorts user-created sibling files alphabetically at the parent root", async () => {
+		writeFileSync(join(tmpParent, "z.md"), "# z");
+		writeFileSync(join(tmpParent, "a.md"), "# a");
+		writeFileSync(join(tmpParent, "m.md"), "# m");
+
+		const svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: null,
+			currentRemoteUrl: null,
+		}));
+		const root = await svc.listChildren("");
+		const names = (root.children ?? []).map((c) => c.name);
+		expect(names).toEqual(["a.md", "m.md", "z.md"]);
+	});
+
+	// Symlinks (and other non-file non-dir Dirents like sockets / FIFOs) at
+	// the parent root must be silently skipped — Dirent.isFile() and
+	// Dirent.isDirectory() both return false for them, so the listUserTopLevelEntries
+	// mapper hits the `return null` branch and the .filter() drops the entry.
+	// Without this guard a dangling symlink would surface in the sidebar with
+	// undefined fileKind / title and trip later assumptions in the renderer.
+	skipIfWin32("skips symlink entries at the parent root", async () => {
+		const { symlinkSync } = require("node:fs") as typeof import("node:fs");
+		writeFileSync(join(tmpParent, "real.md"), "# real");
+		symlinkSync(join(tmpParent, "real.md"), join(tmpParent, "link.md"));
+
+		const svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: null,
+			currentRemoteUrl: null,
+		}));
+		const root = await svc.listChildren("");
+		const names = (root.children ?? []).map((c) => c.name);
+		expect(names).toEqual(["real.md"]);
+	});
+
+	// Mix of multiple sibling dirs AND files at the parent root. The single
+	// dir+file existing test exercises only one direction of the `ad ? -1 : 1`
+	// dir-first ternary (one comparator call). Multiple cross-type entries
+	// force the comparator to be called both with (dir,file) and (file,dir),
+	// covering both arms of the ternary.
+	it("groups dirs ahead of files when both kinds appear at the parent root", async () => {
+		mkdirSync(join(tmpParent, "z-dir"));
+		mkdirSync(join(tmpParent, "a-dir"));
+		writeFileSync(join(tmpParent, "z.md"), "# z");
+		writeFileSync(join(tmpParent, "a.md"), "# a");
+
+		const svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: null,
+			currentRemoteUrl: null,
+		}));
+		const root = await svc.listChildren("");
+		const names = (root.children ?? []).map((c) => c.name);
+		// Dirs first (alpha-sorted), then files (alpha-sorted).
+		expect(names).toEqual(["a-dir", "z-dir", "a.md", "z.md"]);
 	});
 
 	it("lists all discovered repos with current-repo sorted first", async () => {
@@ -1171,6 +1472,140 @@ describe("KbFoldersService — breadcrumb selection helpers", () => {
 		}));
 		expect(svc.listBranches("alpha")).toEqual([]);
 	});
+
+	it("listBranches falls back to mapping-only when index.json is missing (fresh repo, pre-write)", () => {
+		// Fresh repo: a mapping may exist via resolveFolderForBranch before
+		// any commit has produced an index.json. Filter must NOT hide such
+		// branches — without an index there's no evidence they're ghosts.
+		const repoDir = seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		const mm = new MetadataManager(join(repoDir, ".jolli"));
+		mm.resolveFolderForBranch("freshly-created");
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "alpha",
+			currentRemoteUrl: null,
+		}));
+		expect(svc.listBranches("alpha")).toEqual(["freshly-created"]);
+	});
+
+	// readBranchIndexSummary tolerates legacy / hand-edited indices that omit
+	// the `entries` field. Without the `?? []` fallback the projection would
+	// throw on `parsed.entries[...]` and listBranches would degrade to the
+	// catch-side mapping-only fallback — losing the discrimination between
+	// "no head" (ghost) and "fresh repo".
+	it("listBranches treats an index.json with no `entries` field as empty (mapping-only)", () => {
+		const repoDir = seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		const mm = new MetadataManager(join(repoDir, ".jolli"));
+		mm.resolveFolderForBranch("main");
+		writeFileSync(
+			join(repoDir, ".jolli", "index.json"),
+			JSON.stringify({ version: 3 }),
+			"utf-8",
+		);
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "alpha",
+			currentRemoteUrl: null,
+		}));
+		// Index parses but has no entries → no head invariants → fresh-repo
+		// fallback keeps mapping-only branches.
+		expect(svc.listBranches("alpha")).toEqual(["main"]);
+	});
+
+	it("listBranches falls back to mapping-only when index.json is unparseable", () => {
+		const repoDir = seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		const mm = new MetadataManager(join(repoDir, ".jolli"));
+		mm.resolveFolderForBranch("main");
+		// Corrupted JSON — never narrows visibility. Sidebar surfaces both
+		// mappings rather than silently hiding everything on parse failure.
+		writeFileSync(join(repoDir, ".jolli", "index.json"), "{not json", "utf-8");
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "alpha",
+			currentRemoteUrl: null,
+		}));
+		expect(svc.listBranches("alpha")).toEqual(["main"]);
+	});
+
+	it("listBranches keeps mappings whose branch never appears in the index (fresh-repo branch)", () => {
+		// Index has a real head on 'main', and a separately-registered
+		// 'never-committed' mapping that has no index entry at all. The
+		// 'never-committed' branch must NOT be hidden — its mapping pre-dates
+		// any commit on it, the filter only hides branches that appear in
+		// the index but have no head.
+		const repoDir = seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		const mm = new MetadataManager(join(repoDir, ".jolli"));
+		mm.resolveFolderForBranch("main");
+		mm.resolveFolderForBranch("never-committed");
+		writeFileSync(
+			join(repoDir, ".jolli", "index.json"),
+			JSON.stringify({
+				version: 3,
+				entries: [
+					{
+						commitHash: "a".repeat(40),
+						parentCommitHash: null,
+						branch: "main",
+						commitMessage: "first",
+						commitDate: "2026-05-21T00:00:00Z",
+						generatedAt: "2026-05-21T00:00:00Z",
+					},
+				],
+			}),
+			"utf-8",
+		);
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "alpha",
+			currentRemoteUrl: null,
+		}));
+		expect(svc.listBranches("alpha")).toEqual(["main", "never-committed"]);
+	});
+
+	// Regression for the "ghost branch" sidebar bug: after StaleChildMarkdownCleanup
+	// deletes the visible .md files for every entry with parentCommitHash != null
+	// (under v4 Hoist), a branch whose only index entries are hoisted children is
+	// left with a registered mapping in branches.json but zero visible content on
+	// disk. listBranches must NOT surface such a branch — expanding it shows an
+	// empty folder, which is the observed bug. See HeadEntryFilter for the
+	// parent==null head invariant.
+	it("listBranches omits branches whose only index entries are hoisted children (no head)", () => {
+		const repoDir = seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		const mm = new MetadataManager(join(repoDir, ".jolli"));
+		mm.resolveFolderForBranch("real-branch");
+		mm.resolveFolderForBranch("ghost-branch");
+		writeFileSync(
+			join(repoDir, ".jolli", "index.json"),
+			JSON.stringify({
+				version: 3,
+				entries: [
+					{
+						commitHash: "a".repeat(40),
+						parentCommitHash: null,
+						branch: "real-branch",
+						commitMessage: "head on real-branch",
+						commitDate: "2026-05-21T00:00:00Z",
+						generatedAt: "2026-05-21T00:00:00Z",
+					},
+					{
+						commitHash: "b".repeat(40),
+						parentCommitHash: "a".repeat(40),
+						branch: "ghost-branch",
+						commitMessage: "hoisted child whose head moved to real-branch",
+						commitDate: "2026-05-20T00:00:00Z",
+						generatedAt: "2026-05-21T00:00:00Z",
+					},
+				],
+			}),
+			"utf-8",
+		);
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "alpha",
+			currentRemoteUrl: null,
+		}));
+		expect(svc.listBranches("alpha")).toEqual(["real-branch"]);
+	});
 });
 
 describe("parseMdTitle", () => {
@@ -1236,5 +1671,24 @@ describe("parseMdTitle", () => {
 		// folder view would show `'hello'` instead of `hello` for any
 		// YAML-quoted title using single quotes.
 		expect(parseMdTitle("---\ntitle: 'hello'\n---\n")).toBe("hello");
+	});
+
+	// stripQuotes early-outs on strings shorter than 2 chars (no possible
+	// matched pair). Pinned via a single-character frontmatter title so the
+	// length-guard's `else` path is exercised — a regression that dropped
+	// the guard would attempt `s[0] === s[s.length - 1]` on a 1-char string,
+	// match trivially, and lop off the only character returning "".
+	it("returns a single-character frontmatter title (skipping the quote-strip)", () => {
+		expect(parseMdTitle("---\ntitle: a\n---\n")).toBe("a");
+	});
+
+	// Frontmatter title with empty-quoted value (`title: ""`) — the regex
+	// matches and capture is `""`, stripQuotes returns "" (length 0), v.trim()
+	// is "" → `if (v)` is falsy and the fallback path scans the body for
+	// an H1. Covers the missing-else branch on the `if (v)` early-return.
+	it("falls through to H1 scan when frontmatter title is an empty quoted string", () => {
+		expect(parseMdTitle('---\ntitle: ""\n---\n# Fallback Heading\n')).toBe(
+			"Fallback Heading",
+		);
 	});
 });

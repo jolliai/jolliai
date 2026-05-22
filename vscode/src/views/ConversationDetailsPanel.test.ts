@@ -5,6 +5,8 @@ interface MockWebviewPanel {
 		html: string;
 		onDidReceiveMessage: ReturnType<typeof vi.fn>;
 		postMessage: ReturnType<typeof vi.fn>;
+		cspSource: string;
+		asWebviewUri: ReturnType<typeof vi.fn>;
 	};
 	onDidDispose: ReturnType<typeof vi.fn>;
 	reveal: ReturnType<typeof vi.fn>;
@@ -29,6 +31,15 @@ vi.mock("vscode", () => {
 				html: "",
 				onDidReceiveMessage: vi.fn(),
 				postMessage: vi.fn(),
+				// Stable-but-fake values used by the panel constructor to
+				// allowlist + reference the bundled codicon stylesheet from
+				// the strict-CSP webview. The HTML builder is exercised by
+				// its own suite; here we just need both to be defined so the
+				// constructor doesn't reach into undefined.
+				cspSource: "vscode-webview://test",
+				asWebviewUri: vi.fn((uri: { fsPath: string }) => ({
+					toString: () => `https://example/asset${uri.fsPath}`,
+				})),
 			},
 			onDidDispose: vi.fn(),
 			reveal: vi.fn(),
@@ -57,7 +68,19 @@ vi.mock("vscode", () => {
 	return {
 		ViewColumn: { Active: 1, One: 1 },
 		window: { createWebviewPanel, createOutputChannel },
-		Uri: { file: (p: string) => ({ fsPath: p }) },
+		Uri: {
+			file: (p: string) => ({ fsPath: p }),
+			// joinPath is used by the panel constructor to resolve the bundled
+			// codicon.css asset relative to extensionUri before handing it to
+			// asWebviewUri. Mirror the real semantics with a simple POSIX join
+			// so the mocked asWebviewUri sees a sensible fsPath.
+			joinPath: (
+				base: { fsPath: string },
+				...segments: string[]
+			): { fsPath: string } => ({
+				fsPath: [base.fsPath, ...segments].join("/"),
+			}),
+		},
 		__panels: panels,
 		__createWebviewPanel: createWebviewPanel,
 	};
@@ -70,6 +93,7 @@ const applyDeletesMock = vi.fn();
 const mergeOverlayMock = vi.fn();
 const saveOverlayMock = vi.fn();
 const hideConversationMock = vi.fn();
+const hasOverlayChangesMock = vi.fn();
 
 // The panel deliberately reads via TranscriptMessageCounter.loadUnreadTranscript
 // (cursor-aware) rather than the full-transcript TranscriptLoader, so the
@@ -88,6 +112,7 @@ vi.mock("../../../cli/src/core/ConversationOverlayStore.js", () => ({
 	applyDeletes: (...args: unknown[]) => applyDeletesMock(...args),
 	mergeOverlay: (...args: unknown[]) => mergeOverlayMock(...args),
 	saveOverlay: (...args: unknown[]) => saveOverlayMock(...args),
+	hasOverlayChanges: (...args: unknown[]) => hasOverlayChangesMock(...args),
 }));
 
 vi.mock("../../../cli/src/core/HiddenConversationsStore.js", () => ({
@@ -136,6 +161,7 @@ describe("ConversationDetailsPanel", () => {
 		mergeOverlayMock.mockReset();
 		saveOverlayMock.mockReset();
 		hideConversationMock.mockReset().mockResolvedValue(undefined);
+		hasOverlayChangesMock.mockReset().mockReturnValue(false);
 		ConversationDetailsPanel.disposeAll();
 	});
 
@@ -345,6 +371,27 @@ describe("ConversationDetailsPanel", () => {
 						displayIndex: 1,
 					},
 				],
+				isEdited: false,
+			});
+		});
+
+		it("marks transcriptLoaded as edited when the saved overlay has changes", async () => {
+			loadUnreadTranscriptMock.mockResolvedValue([{ role: "human", content: "hi" }]);
+			loadOverlayMock.mockResolvedValue({
+				deletes: [{ role: "human", content: "hi" }],
+				edits: [],
+			});
+			applyOverlayMock.mockReturnValue([{ role: "human", content: "hi" }]);
+			hasOverlayChangesMock.mockReturnValue(true);
+
+			ConversationDetailsPanel.show(baseShowArgs);
+			const handler = lastMessageHandler();
+			await handler({ type: "requestTranscript" });
+
+			expect(mockVsCode.__panels[0].webview.postMessage).toHaveBeenCalledWith({
+				type: "transcriptLoaded",
+				entries: [{ role: "human", content: "hi", displayIndex: 0 }],
+				isEdited: true,
 			});
 		});
 
@@ -396,6 +443,7 @@ describe("ConversationDetailsPanel", () => {
 				],
 			});
 			saveOverlayMock.mockResolvedValue(undefined);
+			hasOverlayChangesMock.mockReturnValue(true);
 
 			ConversationDetailsPanel.show(baseShowArgs);
 			const handler = lastMessageHandler();
@@ -582,6 +630,45 @@ describe("ConversationDetailsPanel", () => {
 			expect(onSessionHidden).toHaveBeenCalledWith("s1");
 		});
 
+		// Same hide-and-dispose path as above, but the caller also wires
+		// onSessionChanged. After the panel disposes, both callbacks must fire
+		// with the sessionId so the sidebar can drop the row AND emit a final
+		// changed notification — the order the hide path captures the callbacks
+		// matters (panel.dispose() runs before the callbacks).
+		it("fires both onSessionChanged and onSessionHidden after hide-on-empty", async () => {
+			loadUnreadTranscriptMock.mockResolvedValue([
+				{ role: "human", content: "bye", timestamp: "t0" },
+			]);
+			loadOverlayMock.mockResolvedValue(null);
+			applyOverlayMock
+				.mockImplementationOnce((entries: unknown) => entries)
+				.mockImplementationOnce(() => []);
+			mergeOverlayMock.mockReturnValue({
+				deletes: [{ role: "human", content: "bye", timestamp: "t0" }],
+				edits: [],
+			});
+			saveOverlayMock.mockResolvedValue(undefined);
+			const onSessionHidden = vi.fn();
+			const onSessionChanged = vi.fn();
+
+			ConversationDetailsPanel.show({
+				...baseShowArgs,
+				onSessionHidden,
+				onSessionChanged,
+			});
+			const handler = lastMessageHandler();
+			await handler({ type: "saveOverrides", deletedIndices: [0], edits: {} });
+
+			expect(hideConversationMock).toHaveBeenCalledWith(
+				"/proj",
+				"claude",
+				"s1",
+			);
+			expect(mockVsCode.__panels[0].dispose).toHaveBeenCalled();
+			expect(onSessionChanged).toHaveBeenCalledWith("s1");
+			expect(onSessionHidden).toHaveBeenCalledWith("s1");
+		});
+
 		it("does not hide the session when entries remain after save", async () => {
 			loadUnreadTranscriptMock.mockResolvedValue([
 				{ role: "human", content: "a" },
@@ -595,14 +682,20 @@ describe("ConversationDetailsPanel", () => {
 			});
 			saveOverlayMock.mockResolvedValue(undefined);
 			const onSessionHidden = vi.fn();
+			const onSessionChanged = vi.fn();
 
-			ConversationDetailsPanel.show({ ...baseShowArgs, onSessionHidden });
+			ConversationDetailsPanel.show({
+				...baseShowArgs,
+				onSessionHidden,
+				onSessionChanged,
+			});
 			const handler = lastMessageHandler();
 			await handler({ type: "saveOverrides", deletedIndices: [0], edits: {} });
 
 			expect(hideConversationMock).not.toHaveBeenCalled();
 			expect(mockVsCode.__panels[0].dispose).not.toHaveBeenCalled();
 			expect(onSessionHidden).not.toHaveBeenCalled();
+			expect(onSessionChanged).toHaveBeenCalledWith("s1");
 		});
 
 		it("posts overridesSaveError when saveOverlay throws", async () => {

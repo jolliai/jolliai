@@ -301,6 +301,74 @@ describe("SummaryHtmlBuilder", () => {
 				const html = buildHtml(makeSummary());
 				expect(html).not.toContain("foreign-readonly");
 			});
+
+			// In foreign-readonly mode the All Conversations action chip
+			// switches from the workspace-side "Manage" (editable modal) to
+			// a read-only "View" affordance. The button stays under the same
+			// id (`openTranscriptsBtn`) so the existing modal-open handler is
+			// reused, but it picks up `data-foreign-safe` so the
+			// `.page.foreign-readonly button:not([data-foreign-safe])` rule
+			// keeps it visible. The Regenerate chip is dropped entirely to
+			// avoid leaving an inaccessible DOM affordance.
+			it("foreign mode swaps the 'Manage' chip for a 'View' chip marked data-foreign-safe", () => {
+				const transcriptHashSet = new Set(["t1"]);
+				const html = buildHtml(makeSummary(), {
+					foreignRepoName: "other-repo",
+					transcriptHashSet,
+				});
+				expect(html).toMatch(
+					/id="openTranscriptsBtn"\s+data-foreign-safe[^>]*>View</,
+				);
+				// Manage label must not leak through in foreign mode — otherwise
+				// the user would see a misleading chip that promises edits.
+				expect(html).not.toContain(">Manage<");
+				// Regenerate is unavailable cross-repo (writes the orphan
+				// branch of the wrong repo) — drop it from the DOM rather
+				// than relying solely on CSS to hide it.
+				expect(html).not.toContain('id="regenerateSummaryBtn"');
+			});
+
+			it("non-foreign mode keeps the original 'Manage' + 'Regenerate' chips", () => {
+				const transcriptHashSet = new Set(["t1"]);
+				const html = buildHtml(makeSummary(), { transcriptHashSet });
+				expect(html).toContain(">Manage<");
+				expect(html).toContain('id="regenerateSummaryBtn"');
+				// And the Manage chip stays UN-marked foreign-safe — that
+				// attribute is only meaningful inside .foreign-readonly and
+				// would be dead weight on the workspace path.
+				expect(html).toMatch(/id="openTranscriptsBtn"[^>]*>Manage</);
+				expect(html).not.toMatch(
+					/id="openTranscriptsBtn"\s+data-foreign-safe/,
+				);
+			});
+
+			it("foreign mode drops the empty-state Regenerate chip (no transcripts case)", () => {
+				const html = buildHtml(makeSummary(), {
+					foreignRepoName: "other-repo",
+					// transcriptHashSet omitted → empty branch
+				});
+				expect(html).toContain(
+					"No conversation transcripts saved for this commit.",
+				);
+				expect(html).not.toContain('id="regenerateSummaryBtn"');
+			});
+
+			it("foreign mode marks the modal close button foreign-safe so the user can exit the read-only modal", () => {
+				// Without this the user could open the modal via the View chip
+				// but find the X close button removed by the foreign-readonly
+				// CSS, leaving ESC / overlay-click as the only (non-obvious)
+				// exits. Save / Cancel / Delete intentionally stay un-marked
+				// — they're write paths and must remain hidden.
+				const html = buildHtml(makeSummary(), {
+					foreignRepoName: "other-repo",
+					transcriptHashSet: new Set(["t1"]),
+				});
+				expect(html).toMatch(/id="modalCloseBtn"[^>]*data-foreign-safe/);
+				expect(html).not.toMatch(/id="modalSaveBtn"[^>]*data-foreign-safe/);
+				expect(html).not.toMatch(
+					/id="deleteTranscriptsBtn"[^>]*data-foreign-safe/,
+				);
+			});
 		});
 
 		it('shows "No topics available" message when topics are empty', () => {

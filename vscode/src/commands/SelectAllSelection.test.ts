@@ -69,6 +69,7 @@ function makeConversationCtx(
 					messageCount: 0,
 					updatedAt: new Date().toISOString(),
 					transcriptPath: "/tmp/fake",
+					isEdited: false,
 					isSelected: !ex.conversations.has(
 						conversationKey(c.source, c.sessionId),
 					),

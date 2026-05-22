@@ -227,6 +227,13 @@ describe("FileItem", () => {
 			arguments: [item],
 		});
 	});
+
+	it("sets checkboxState to Unchecked (0) when the file is not selected", () => {
+		// Covers the false branch of the `fileStatus.isSelected ? Checked : Unchecked`
+		// ternary in FileItem's constructor.
+		const item = new FileItem(makeFile("src/Off.ts", false));
+		expect(item.checkboxState).toBe(0);
+	});
 });
 
 describe("FilesTreeProvider", () => {

@@ -297,6 +297,77 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("showTextTip(el.dataset.tip || text");
 	});
 
+	it("dismisses the text tooltip on mousedown so VSCode modal overlays don't pin it visible", () => {
+		const js = buildSidebarScript();
+		// VSCode native modals (force-push confirm via showWarningMessage,
+		// command palettes, etc.) overlay the webview without dispatching
+		// mouseleave. Without a mousedown dismissal the tooltip outlives the
+		// click and stays pinned until the user wiggles the mouse off and back.
+		expect(js).toMatch(
+			/el\.addEventListener\('mousedown', function\(\) \{\s*hideTextTip\(\);\s*\}\);/,
+		);
+	});
+
+	it("routes every row/button tooltip through attachTextTip — no leftover native title= on interactive elements", () => {
+		const js = buildSidebarScript();
+		// Native title= is unreliable in VSCode webviews (focus transitions
+		// suppress it, modal overlays pin it, hover-rest timers reset per node).
+		// Every clickable element and row wrapper should go through the
+		// attachTextTip helper instead. Whitelist: the kb-search-input (form
+		// input following the standard placeholder + title pattern) and the
+		// explicit `title: null` suppression on plan/note/linear rows that drive
+		// the .hover-card popover are the only DOM-attribute title:s that may
+		// remain.
+		const offenders = [
+			"title: 'Discard Changes'",
+			"title: 'Discard'",
+			"title: 'View Memory'",
+			"title: 'Copy commit hash'",
+			"title: 'Open plan'",
+			"title: 'Open note'",
+			"title: 'Open in Linear'",
+			"title: 'Edit'",
+			"title: 'Remove'",
+			"title: 'Ignore'",
+			"title: 'Conversation content has been modified'",
+			"title: item.tooltip || ''",
+			"title: expanded ? 'Collapse' : 'Expand'",
+			"title: fileKind === 'plan' ? 'Plan' : 'Note'",
+		];
+		for (const o of offenders) {
+			expect(js).not.toContain(o);
+		}
+		// `title: displayTitle,` survives intentionally — that one is the
+		// vscode.postMessage payload field on branch:openConversation, not a
+		// DOM attribute. The DOM-attribute conversation-row title was rewritten
+		// to attachTextTip(root, displayTitle).
+	});
+
+	it("guards section re-renders with hideTextTip so a row teardown can't orphan a visible tip", () => {
+		const js = buildSidebarScript();
+		// Each top-level renderer mounts a fresh subtree via mountIn — the
+		// outgoing rows lose their mouseleave listeners with no chance to fire,
+		// so any tip currently pinned to one of them would survive past the
+		// re-render. Mirror the renderStatus / renderToolbar pattern. The regex
+		// allows line comments between `function foo() {` and `hideTextTip();`
+		// so explanatory blocks above the guard don't break the assertion.
+		const guardRe = (name: string) =>
+			new RegExp(
+				`function ${name}\\(\\) \\{(?:\\s*//[^\\n]*\\n)*\\s*hideTextTip\\(\\);`,
+			);
+		expect(js).toMatch(guardRe("renderBranch"));
+		expect(js).toMatch(guardRe("renderMemories"));
+		expect(js).toMatch(guardRe("renderFolders"));
+	});
+
+	it("changes-row discard button uses attachTextTip instead of native title", () => {
+		const js = buildSidebarScript();
+		// Specific regression check for the original bug report: the discard
+		// icon on Changes rows lost its tooltip intermittently and pinned
+		// across the force-push native modal.
+		expect(js).toMatch(/attachTextTip\(\s*el\('button',\s*\{[^}]*'data-inline':\s*'discard',[^}]*\},\s*\[el\('i',\s*\{\s*className:\s*'codicon codicon-discard'\s*\}\)\]\),\s*'Discard Changes',\s*\)/);
+	});
+
 	it("re-requests root listing when switching into KB folders mode with empty cache", () => {
 		const js = buildSidebarScript();
 		// Without this, init-time fetch is the only kb:expandFolder trigger and
@@ -323,15 +394,41 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("data-key");
 	});
 
-	it("right-click on a folder tree-node preventDefaults but shows no menu unless it's a memory file", () => {
+	it("emits data-diverged='1' on file tree nodes when isDiverged is true", () => {
 		const js = buildSidebarScript();
-		// The contextmenu handler must check data-file-kind === 'memory' before
-		// opening a custom menu — directories and non-memory files are silent.
+		// The renderer must add the attribute conditional on child.isDiverged,
+		// not unconditionally — the contextmenu handler uses its presence as
+		// the gating signal for the Revert entry. Boolean-attr convention
+		// (presence = true) matches the surrounding data-current-repo pattern.
+		expect(js).toContain("child.isDiverged");
+		expect(js).toContain("data-diverged");
+		expect(js).toContain("'1'");
+	});
+
+	it("right-click on a folder tree-node opens menu for memory/plan/note files, silent on dirs / other", () => {
+		const js = buildSidebarScript();
+		// Memory rows still get the legacy 3-action menu, keyed off manifest hash.
 		expect(js).toContain("data-file-kind");
 		expect(js).toContain("'memory'");
 		expect(js).toContain("jollimemory.copyRecallPrompt");
 		expect(js).toContain("jollimemory.openInClaudeCode");
 		expect(js).toContain("jollimemory.viewMemorySummary");
+		// Plan and note rows now also enter the menu-building path so they can
+		// receive the conditional Revert entry. The renderer recognises all
+		// three manifest-tracked kinds as menu-eligible.
+		expect(js).toContain("'plan'");
+		expect(js).toContain("'note'");
+	});
+
+	it("contextmenu appends Revert entry only when data-diverged='1'", () => {
+		const js = buildSidebarScript();
+		// The Revert entry is gated on the attribute set by the renderer; without
+		// it the menu is unchanged for non-edited files. Wrapper command is the
+		// relPath-aware variant — the abs-path form revertMemoryFileEdits is
+		// invoked indirectly from the extension side.
+		expect(js).toContain("data-diverged");
+		expect(js).toContain("Revert to System Version");
+		expect(js).toContain("jollimemory.revertMemoryFileByRelPath");
 	});
 
 	it("declares renderMemories function", () => {
@@ -434,6 +531,19 @@ describe("SidebarScriptBuilder", () => {
 		// property writes — this matches the existing context-menu pattern.
 		expect(js).toContain("hoverCardEl.style.left");
 		expect(js).toContain("hoverCardEl.style.top");
+	});
+
+	it("caps hover-card height + scrolls when neither side of the cursor fits the natural height", () => {
+		const js = buildSidebarScript();
+		// Regression: when a memory row is near the panel bottom, flipping the
+		// card above the cursor could still overflow if the card's natural
+		// height exceeds the space above. The fit-or-clamp branch must pick
+		// the larger side and cap maxHeight + enable overflowY so the card
+		// never bleeds past the viewport edge.
+		expect(js).toContain("spaceBelow");
+		expect(js).toContain("spaceAbove");
+		expect(js).toContain("hoverCardEl.style.maxHeight");
+		expect(js).toContain("hoverCardEl.style.overflowY");
 	});
 
 	it("renders a copy-recall-prompt button on each memory row", () => {
@@ -1201,6 +1311,74 @@ describe("SidebarScriptBuilder", () => {
 			);
 		});
 
+		it("renders a 'Viewing memories from <repo> / <branch>' banner in foreign mode with conditional (read-only) suffix", () => {
+			// Visual companion to the foreign-readonly CSS hook class: in
+			// foreign mode the workspace-bound sections (plans / changes /
+			// conversations) all drop out, leaving the Memories list alone.
+			// Without an explicit label users have no in-panel signal that
+			// they are viewing another repo. IntelliJ's CommitsPanel renders
+			// the same banner (CommitsPanel.kt:722) — pinning the wording so
+			// the two surfaces stay aligned. The text builder lives in
+			// SidebarScriptBuilder so the message wording is searchable from
+			// the same place the foreign-mode branching logic lives.
+			//
+			// The "(read-only)" suffix is gated on `repoForeign` (selectedRepo
+			// != currentRepo). Browsing another branch in the workspace repo
+			// drops the suffix because that branch is not actually read-only —
+			// the user could check it out. Both flavors keep the banner element
+			// + the trailing reset affordance.
+			const js = buildSidebarScript();
+			// Banner text fragment — kept as a single literal so renames are
+			// loud (greppable). Wording stays in lockstep with IntelliJ's.
+			expect(js).toContain("Viewing memories from");
+			// Suffix is conditional on repoForeign — the ternary is the
+			// single source of truth, so renaming "(read-only)" without
+			// touching both sides will not regress silently.
+			expect(js).toMatch(/repoForeign\s*\?\s*' \(read-only\)'\s*:\s*''/);
+			// Banner element carries its own CSS class so SidebarCssBuilder
+			// can style it independently of the existing
+			// `conversations-warning` partial-data banner.
+			expect(js).toContain("'foreign-banner'");
+		});
+
+		it("foreign-banner trails a 'Switch back to current workspace' reset button (CSP-safe <button data-action=...>)", () => {
+			// CSP forbids inline onclick / javascript: hrefs in the sidebar
+			// webview, so the reset affordance must be a <button> wired
+			// through tabContents.branch's click delegation block. This
+			// test pins three things: button label, data-action key, and
+			// CSS class so the styling/dispatch contract stays intact.
+			const js = buildSidebarScript();
+			expect(js).toContain("Switch back to current workspace");
+			expect(js).toContain("'reset-to-workspace'");
+			expect(js).toContain("'foreign-banner-reset'");
+		});
+
+		it("reset-to-workspace click posts two selection:request messages (repo first, then branch) so workspace identity collapses cleanly", () => {
+			// Host-side handleSelectionRequest is single-field if/else — a
+			// combined { repoName, branchName } payload would silently drop
+			// the branch. The fix is two messages: repo first (host auto-picks
+			// branches[0]), then branch (overrides the auto-pick with the real
+			// workspace branch). If a future change merges these into one
+			// payload, that handler must learn to handle both fields together
+			// — this test catches the regression.
+			const js = buildSidebarScript();
+			const branchClickIdx = js.indexOf(
+				"tabContents.branch.addEventListener('click'",
+			);
+			expect(branchClickIdx).toBeGreaterThan(-1);
+			// Slice generously — the reset block is at the top of the handler
+			// but later branches (commitMemoryBtn, section actions) are also
+			// captured, which is fine for a containment assertion.
+			const handler = js.slice(branchClickIdx, branchClickIdx + 4000);
+			expect(handler).toContain('data-action="reset-to-workspace"');
+			expect(handler).toMatch(
+				/selection:request[\s\S]{0,200}repoName:\s*state\.currentRepoName/,
+			);
+			expect(handler).toMatch(
+				/selection:request[\s\S]{0,200}branchName:\s*state\.branchName/,
+			);
+		});
+
 		it("Changes section is dropped entirely in foreign-readonly mode (renderBranch only pushes plans/changes when !foreign)", () => {
 			const js = buildSidebarScript();
 			// The two non-Memories sections must be guarded by the foreign check
@@ -1260,6 +1438,80 @@ describe("SidebarScriptBuilder", () => {
 			expect(window).toContain("isViewingForeign()");
 			expect(window).toContain("'jollimemory.viewMemorySummary'");
 			expect(window).toContain("'jollimemory.viewSummary'");
+		});
+
+		it("foreign-mode commitWithMemory inline button is a copy-recall iconbtn (codicon-copy), not eye", () => {
+			// Cross-repo browsing is dominated by "pull this memory into the
+			// AI" — the primary inline tap-target switches to Copy Recall
+			// Prompt to match the KB-tab timeline view. The eye affordance
+			// still exists in the hover-card and contextmenu, so View Memory
+			// is not lost.
+			const js = buildSidebarScript();
+			// Locate renderCommitRow's hasMem branch (where the inline button
+			// lives) — we slice from the function header through the !hasMem
+			// fallback so the assertions are contained.
+			const fnIdx = js.indexOf("function renderCommitRow(");
+			expect(fnIdx).toBeGreaterThan(-1);
+			const fnEnd = js.indexOf("function ", fnIdx + 1);
+			const body = js.slice(fnIdx, fnEnd > 0 ? fnEnd : fnIdx + 6000);
+			// The branch must be gated on isViewingForeign() — non-foreign
+			// rows must still render the eye/viewSummary affordance.
+			expect(body).toContain("isViewingForeign()");
+			expect(body).toMatch(/'data-inline':\s*'copy-recall'/);
+			expect(body).toMatch(/codicon-copy/);
+			// And the non-foreign branch must still be present so workspace
+			// muscle memory is unchanged.
+			expect(body).toMatch(/'data-inline':\s*'viewSummary'/);
+			expect(body).toMatch(/codicon-eye/);
+		});
+
+		it("inline copy-recall dispatch posts jollimemory.copyRecallPrompt with the row id", () => {
+			// The click delegation block on tabContents.branch must learn
+			// about the new copy-recall action; otherwise the foreign-mode
+			// icon click would no-op. id (= commitHash) flows through args[]
+			// so copyRecallPrompt can resolve via the multi-repo index.
+			//
+			// Anchor the search at the Branch tab click handler — there's an
+			// earlier copy-recall block on tabContents.kb that uses data-hash
+			// instead of data-id, and a naive js.indexOf would land on that
+			// (and pass the args:[hash] form on the wrong surface).
+			const js = buildSidebarScript();
+			const branchClickIdx = js.indexOf(
+				"tabContents.branch.addEventListener('click'",
+			);
+			expect(branchClickIdx).toBeGreaterThan(-1);
+			const idx = js.indexOf("action === 'copy-recall'", branchClickIdx);
+			expect(idx).toBeGreaterThan(-1);
+			const window = js.slice(idx, idx + 600);
+			expect(window).toContain("'jollimemory.copyRecallPrompt'");
+			expect(window).toMatch(/args:\s*\[id\]/);
+		});
+
+		it("foreign-mode commitWithMemory contextmenu mirrors the KB-tab timeline view (Copy Recall Prompt / Open in Claude Code / sep / View Memory)", () => {
+			// Pins the cross-surface alignment — the KB tab's memory-row
+			// contextmenu and the Branch tab's foreign Memories contextmenu
+			// must share the same 3-action set so users get one mental model
+			// for "right-click a memory". View Memory routes through
+			// viewMemorySummary (cross-repo storage), NOT viewSummary
+			// (workspace-only), or the click silently misses.
+			const js = buildSidebarScript();
+			const ctxIdx = js.indexOf(
+				"tabContents.branch.addEventListener('contextmenu'",
+			);
+			expect(ctxIdx).toBeGreaterThan(-1);
+			const window = js.slice(ctxIdx, ctxIdx + 2400);
+			// Foreign branch of the commit/commitWithMemory predicate must
+			// be gated explicitly (otherwise workspace-view would also flip).
+			expect(window).toMatch(
+				/isViewingForeign\(\)\s*&&\s*ctx\s*===\s*'commitWithMemory'/,
+			);
+			expect(window).toContain("'jollimemory.copyRecallPrompt'");
+			expect(window).toContain("'jollimemory.openInClaudeCode'");
+			expect(window).toContain("'jollimemory.viewMemorySummary'");
+			// And the workspace path must still ship its original two-item
+			// menu — View Memory (single-repo viewSummary) + Copy Commit Hash.
+			expect(window).toContain("'jollimemory.viewSummary'");
+			expect(window).toContain("'jollimemory.copyCommitHash'");
 		});
 	});
 
@@ -1597,6 +1849,50 @@ describe("SidebarScriptBuilder", () => {
 			// is a checkbox, so clicking 'jm-conv-check' does not also open
 			// the conversation panel.
 			expect(fn).toMatch(/\[data-checkbox="1"\]/);
+		});
+
+		it("renderConversationRow emits a codicon-edit marker when item.isEdited is true", () => {
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderConversationRow");
+			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
+			const fn =
+				fnEnd > fnStart
+					? js.slice(fnStart, fnEnd)
+					: js.slice(fnStart, fnStart + 3000);
+			expect(fn).toContain("if (item.isEdited)");
+			// The marker is a codicon glyph (not a pill) so it reads as a status
+			// modifier on the title rather than a second badge competing with the
+			// AI agent badge for visual weight.
+			expect(fn).toContain("'codicon codicon-edit edited-icon'");
+			expect(fn).toContain("'aria-label': 'Edited'");
+			// Tooltip is driven by attachTextTip (custom popover) instead of
+			// native title= — the title attribute is unreliable across webview
+			// focus transitions, see the attachTextTip helper docstring.
+			expect(fn).toContain("'Conversation content has been modified'");
+			expect(fn).toMatch(/attachTextTip\(\s*el\('i',/);
+		});
+
+		it("renderFolderChildren emits a codicon-edit marker on file rows when child.isDiverged is true", () => {
+			// Mirrors the conversation-row edit indicator (above): same glyph,
+			// same .edited-icon class, same color token via SidebarCssBuilder,
+			// so a user familiar with the conversations 'edited' affordance
+			// reads the KB tree's on-disk-divergence marker the same way.
+			// Tooltip phrasing matches MemoryFileDecorationProvider so the
+			// webview tree and the explorer badge speak with one voice.
+			const js = buildSidebarScript();
+			const fnStart = js.indexOf("function renderFolderChildren");
+			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
+			const fn =
+				fnEnd > fnStart
+					? js.slice(fnStart, fnEnd)
+					: js.slice(fnStart, fnStart + 3000);
+			// Guard is on the file row only (directories cannot diverge);
+			// the !isDir prefix gates the push.
+			expect(fn).toContain("if (!isDir && child.isDiverged)");
+			expect(fn).toContain("'codicon codicon-edit edited-icon'");
+			expect(fn).toContain("'aria-label': 'Edited'");
+			expect(fn).toContain("'Edited on disk — system view unavailable'");
+			expect(fn).toMatch(/attachTextTip\(\s*el\('i',/);
 		});
 
 		it("renderPlanRow emits a jm-plan-check checkbox with data-plan-id for plan rows", () => {

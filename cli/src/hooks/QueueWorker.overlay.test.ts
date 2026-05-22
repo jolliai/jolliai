@@ -14,7 +14,7 @@
  * else (session discovery, transcript readers) is stubbed minimally.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -131,12 +131,17 @@ vi.mock("../core/GeminiTranscriptReader.js", () => ({
 // HiddenConversationsStore IS exercised — loadHiddenConversations runs against
 // the real store reading from the tmp project dir.
 
-// IMPORTANT: ConversationOverlayStore is NOT mocked here. The real implementation
-// reads the on-disk overlay JSON we write below, and that's the whole point.
+// ConversationOverlayStore runs unmocked: saveOverlay / applyOverlaysToSessions /
+// loadOverlay / overlayPath / pruneConsumedOverlayRules all hit the real
+// implementation against on-disk JSON. The pipeline order in
+// loadSessionTranscripts is apply-then-prune (see QueueWorker.ts), so by the
+// time GC runs the planted overlay rules have already been observed by apply
+// and reflected in `result.*`. GC then unlinks fully-consumed overlay files —
+// which is exactly what the two trailing GC tests assert.
 
 // We need a separate import for saveOverlay so the test fixture can plant
 // real overlay JSON without going through the panel.
-import { saveOverlay } from "../core/ConversationOverlayStore.js";
+import { loadOverlay, overlayPath, saveOverlay } from "../core/ConversationOverlayStore.js";
 import { readCopilotChatTranscript } from "../core/CopilotChatTranscriptReader.js";
 import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
@@ -205,7 +210,6 @@ describe("QueueWorker overlay path", () => {
 				edits: [],
 			},
 		);
-
 		const result = await loadSessionTranscripts(projectDir, { codexEnabled: false } as never);
 
 		expect(result.totalEntries).toBe(3); // 5 - 2 deletes
@@ -222,7 +226,6 @@ describe("QueueWorker overlay path", () => {
 				edits: [{ role: "assistant", content: "msg-2", timestamp: "t1", newContent: "EDITED-msg-2" }],
 			},
 		);
-
 		const result = await loadSessionTranscripts(projectDir, { codexEnabled: false } as never);
 
 		expect(result.totalEntries).toBe(5); // edit, not delete
@@ -248,7 +251,6 @@ describe("QueueWorker overlay path", () => {
 				edits: [],
 			},
 		);
-
 		const result = await loadSessionTranscripts(projectDir, { codexEnabled: false } as never);
 		// `applyOverlaysToSessions` still returns the session object; only
 		// `entries` is empty. The "skip when nothing to summarize" guard
@@ -287,4 +289,42 @@ describe("QueueWorker overlay path", () => {
 			expect(result.sessionTranscripts).toHaveLength(0);
 		});
 	}
+
+	it("loadSessionTranscripts unlinks overlays whose rules all match entries in the cursor-trimmed slice", async () => {
+		const { sessionInfo } = stubSession();
+		// Both rule identities match entries returned by stubSession (msg-2 at t1, msg-4 at t3).
+		await saveOverlay(
+			{ projectDir, source: "claude", sessionId: sessionInfo.sessionId },
+			{
+				deletes: [{ role: "assistant", content: "msg-2", timestamp: "t1" }],
+				edits: [{ role: "assistant", content: "msg-4", timestamp: "t3", newContent: "EDITED" }],
+			},
+		);
+		const file = overlayPath({ projectDir, source: "claude", sessionId: sessionInfo.sessionId });
+		expect(existsSync(file)).toBe(true);
+
+		await loadSessionTranscripts(projectDir, { codexEnabled: false } as never);
+
+		expect(existsSync(file)).toBe(false);
+	});
+
+	it("loadSessionTranscripts keeps the overlay when a rule's identity is outside the cursor-trimmed slice", async () => {
+		const { sessionInfo } = stubSession();
+		// "future-msg" / "t99" is NOT in stubSession's entries — rule must survive.
+		await saveOverlay(
+			{ projectDir, source: "claude", sessionId: sessionInfo.sessionId },
+			{
+				deletes: [{ role: "assistant", content: "future-msg", timestamp: "t99" }],
+				edits: [],
+			},
+		);
+		const file = overlayPath({ projectDir, source: "claude", sessionId: sessionInfo.sessionId });
+
+		await loadSessionTranscripts(projectDir, { codexEnabled: false } as never);
+
+		expect(existsSync(file)).toBe(true);
+		const remaining = await loadOverlay({ projectDir, source: "claude", sessionId: sessionInfo.sessionId });
+		expect(remaining?.deletes).toEqual([{ role: "assistant", content: "future-msg", timestamp: "t99" }]);
+		expect(remaining?.edits).toEqual([]);
+	});
 });

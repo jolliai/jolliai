@@ -155,6 +155,30 @@ export class MetadataManager {
 		return removed;
 	}
 
+	/**
+	 * Removes the `branches.json` mapping for every branch in `branches` without
+	 * touching the manifest. Used by `StaleChildMarkdownCleanup` to prune the
+	 * "ghost branch" mappings left behind when cross-branch hoist relocates the
+	 * head to a different branch and all surviving entries on the original
+	 * branch are children with `parentCommitHash != null`. Manifest rows are
+	 * NOT removed here — by the time cleanup invokes this method the hoisted
+	 * children's visible `.md` is already gone, and the matching manifest rows
+	 * (if any) are independently policed by `reconcile` / heal. Returns the
+	 * number of mappings actually removed (input may contain duplicates or
+	 * branches that were never registered; both are no-ops).
+	 */
+	unregisterBranches(branches: Iterable<string>): number {
+		const drop = new Set(branches);
+		if (drop.size === 0) return 0;
+		const current = this.readBranches();
+		const kept = current.mappings.filter((m) => !drop.has(m.branch));
+		const removed = current.mappings.length - kept.length;
+		if (removed === 0) return 0;
+		this.atomicWrite(this.branchesPath, JSON.stringify({ ...current, mappings: kept }, null, "\t"));
+		log.info("Branch mappings unregistered: %d", removed);
+		return removed;
+	}
+
 	readBranches(): BranchesJson {
 		return this.readJson<BranchesJson>(this.branchesPath) ?? { version: 1, mappings: [] };
 	}

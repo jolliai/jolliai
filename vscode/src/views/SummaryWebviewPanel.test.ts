@@ -106,7 +106,7 @@ vi.mock("vscode", () => ({
 			toString: () => String(args.join("/")),
 		})),
 	},
-	ViewColumn: { Beside: 2 },
+	ViewColumn: { One: 1, Beside: 2 },
 	workspace: {
 		getConfiguration,
 		fs: { writeFile: fsWriteFile },
@@ -585,6 +585,15 @@ const stubBridge = {
 		(writes: ReadonlyArray<unknown>, deletes: ReadonlyArray<string>) =>
 			mockSaveTranscriptsBatch(writes, deletes, workspaceRoot) as Promise<void>,
 	),
+	getTranscriptHashes: vi.fn(
+		(): Promise<Set<string>> =>
+			mockGetTranscriptHashes(workspaceRoot) as Promise<Set<string>>,
+	),
+	readTranscriptsForCommits: vi.fn((commitHashes: ReadonlyArray<string>) =>
+		mockReadTranscriptsForCommits(commitHashes, workspaceRoot) as Promise<
+			Map<string, unknown>
+		>,
+	),
 	archivePlanForCommit: vi.fn((slug: string, commitHash: string) =>
 		mockArchivePlanForCommit(slug, commitHash, workspaceRoot),
 	),
@@ -707,6 +716,34 @@ describe("SummaryWebviewPanel", () => {
 			);
 		});
 
+		// The KB-folder browser opens a summary tab against an explicit ViewColumn
+		// instead of "Beside" so it lands in column One (the main editor area)
+		// rather than floating next to whatever happens to be focused. The
+		// commit-source default uses Beside; switching source to "kb" must flip
+		// the column the panel is created in.
+		it("opens the KB source in ViewColumn.One instead of Beside", async () => {
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"kb",
+			);
+
+			// Third positional arg is the ViewColumn — 1 for One, 2 for Beside.
+			expect(createWebviewPanel).toHaveBeenCalledWith(
+				"jollimemory.summary.commit",
+				"Commit Memory",
+				1,
+				expect.objectContaining({
+					enableScripts: true,
+					retainContextWhenHidden: true,
+				}),
+			);
+		});
+
 		it("memory and commit slots are independent — opening one does not dispose the other", async () => {
 			const summary1 = makeSummary({ commitHash: "aaa" });
 			const summary2 = makeSummary({ commitHash: "bbb" });
@@ -771,6 +808,138 @@ describe("SummaryWebviewPanel", () => {
 					noteTranslateSet: expect.any(Set),
 					nonce: "mocknonce1234567=",
 				}),
+			);
+		});
+
+		// ── Foreign storage threading ────────────────────────────────────────
+		// When show() receives a non-null foreignStorage (built by Extension via
+		// `bridge.createStorageForRepo`), every read path inside the panel must
+		// thread that storage through instead of falling back to the current
+		// workspace's storage. Without this, viewing a foreign-repo summary
+		// shows "All Conversations" / plans / notes as empty because the cwd
+		// storage has no transcript/plan/note files for the foreign commit.
+
+		it("refreshTranscriptHashes passes foreignStorage to the core getTranscriptHashes call", async () => {
+			const foreignStorage = {
+				kind: "foreign-storage-stub",
+			} as unknown as import(
+				"../../../cli/src/core/StorageProvider.js"
+			).StorageProvider;
+			const summary = makeSummary({ commitHash: "fff" });
+			mockGetTranscriptHashes.mockResolvedValue(new Set(["fff"]));
+
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+				"https://github.com/x/foreign.git",
+				foreignStorage,
+			);
+
+			// Core helper invoked directly (not through stubBridge.getTranscriptHashes
+			// which would drop the storage arg). The foreignStorage instance is
+			// the load-bearing signal — without it the call would hit cwd storage.
+			expect(mockGetTranscriptHashes).toHaveBeenCalledWith(
+				workspaceRoot,
+				foreignStorage,
+			);
+		});
+
+		it("refreshPlanTranslateSet passes foreignStorage to readPlanFromBranch", async () => {
+			const foreignStorage = {
+				kind: "foreign-storage-stub",
+			} as unknown as import(
+				"../../../cli/src/core/StorageProvider.js"
+			).StorageProvider;
+			const summary = makeSummary({
+				plans: [
+					{
+						slug: "plan-1",
+						title: "p",
+						status: "active",
+						commitHash: "aaa",
+					},
+				],
+			});
+
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+				"https://github.com/x/foreign.git",
+				foreignStorage,
+			);
+
+			expect(mockReadPlanFromBranch).toHaveBeenCalledWith(
+				"plan-1",
+				workspaceRoot,
+				foreignStorage,
+			);
+		});
+
+		it("refreshNoteTranslateSet passes foreignStorage to readNoteFromBranch", async () => {
+			const foreignStorage = {
+				kind: "foreign-storage-stub",
+			} as unknown as import(
+				"../../../cli/src/core/StorageProvider.js"
+			).StorageProvider;
+			const summary = makeSummary({
+				notes: [
+					{
+						id: "note-1",
+						title: "n",
+						format: "markdown",
+						commitHash: "aaa",
+					},
+				],
+			});
+
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+				"https://github.com/x/foreign.git",
+				foreignStorage,
+			);
+
+			expect(mockReadNoteFromBranch).toHaveBeenCalledWith(
+				"note-1",
+				workspaceRoot,
+				foreignStorage,
+			);
+		});
+
+		it("non-foreign panels keep using bridge.getTranscriptHashes (no storage override)", async () => {
+			// Regression guard: passing foreignStorage=null must NOT change the
+			// existing non-foreign read path. The bridge wrapper carries the
+			// cwd+config-derived storage already.
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+
+			// stubBridge.getTranscriptHashes() forwards to mockGetTranscriptHashes
+			// with workspaceRoot only — no second storage argument.
+			expect(mockGetTranscriptHashes).toHaveBeenCalledWith(workspaceRoot);
+			expect(mockGetTranscriptHashes).not.toHaveBeenCalledWith(
+				workspaceRoot,
+				expect.anything(),
 			);
 		});
 
@@ -1967,6 +2136,27 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({ command: "recapUpdateError" }),
 				);
 			});
+
+			// Defensive: if the webview drops the recap field (older client, or
+			// a malformed message), the handler should still clear the recap
+			// rather than throw on the missing string. Covers the
+			// `message.recap ?? ""` fallback in the editRecap case.
+			it("treats a missing recap field as the empty string (clears the recap)", async () => {
+				mockBuildRecapSection.mockReturnValue("");
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "editRecap" });
+				await flushPromises();
+
+				const stored = mockStoreSummary.mock.calls[0][0] as {
+					recap?: string;
+				};
+				expect(stored.recap).toBeUndefined();
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "recapUpdated",
+					html: "",
+				});
+			});
 		});
 
 		// ── regenerateSummary ───────────────────────────────────────────────
@@ -2906,11 +3096,16 @@ describe("SummaryWebviewPanel", () => {
 				});
 				await flushPromises();
 
+				// Local (non-foreign) panel: foreignRepoName + foreignRepoUrl
+				// trail as null so jollimemory.editPlan stays on its default
+				// workspace-storage read path.
 				expect(executeCommand).toHaveBeenCalledWith(
 					"jollimemory.editPlan",
 					"my-plan",
 					true,
 					"Plan Title",
+					null,
+					null,
 				);
 			});
 		});
@@ -6189,10 +6384,15 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "previewNote", id: "note-1", title: "Note Title" });
 				await flushPromises();
 
+				// Local panel: null/null trail keeps the command on its
+				// default workspace-storage read path (mirrors previewPlan
+				// above).
 				expect(executeCommand).toHaveBeenCalledWith(
 					"jollimemory.previewNote",
 					"note-1",
 					"Note Title",
+					null,
+					null,
 				);
 			});
 		});
@@ -7817,6 +8017,166 @@ describe("SummaryWebviewPanel", () => {
 			);
 		});
 
+		it("allows read-only display commands (transcript stats/all, plan/note preview) on a foreign panel", async () => {
+			// foreignStorage threading is useless if the dispatch guard
+			// denies these commands before they reach the handler. The
+			// foreign mode is read-only-view: transcripts (stats + Manage
+			// modal) and the rendered Markdown previews for plans / notes
+			// are the four display paths a foreign-panel user can reach.
+			// `loadPlanContent` / `loadNoteContent` are intentionally NOT
+			// pinned here — those drive the inline edit form, which is
+			// CSS-hidden in `.foreign-readonly`.
+			const foreignStorage = {
+				kind: "foreign-storage-stub",
+			} as unknown as import(
+				"../../../cli/src/core/StorageProvider.js"
+			).StorageProvider;
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+				"https://github.com/x/foreign.git",
+				foreignStorage,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "loadTranscriptStats" });
+			dispatch({ command: "loadAllTranscripts" });
+			dispatch({ command: "previewPlan", slug: "plan-x", title: "Plan X" });
+			dispatch({ command: "previewNote", id: "note-x", title: "Note X" });
+			await flushPromises();
+
+			const denialCalls = showInformationMessage.mock.calls.filter((c) =>
+				typeof c[0] === "string" ? c[0].includes("disabled") : false,
+			);
+			expect(denialCalls).toHaveLength(0);
+		});
+
+		it("handleLoadTranscriptStats and handleLoadAllTranscripts read transcripts through foreignStorage when set", async () => {
+			// Pins the non-bridge branch of the read ternary in both
+			// transcript-load handlers — without this, foreign-mode "All
+			// Conversations" stats and the Manage modal would silently call
+			// `this.bridge.readTranscriptsForCommits` (cwd storage) and
+			// surface 0 sessions for every cross-repo summary. Setting
+			// transcriptHashSet via a matched commitHash + non-empty
+			// transcript file map drives the handler past the early-return
+			// `transcriptHashSet.size === 0` guard.
+			const foreignStorage = {
+				kind: "foreign-storage-stub",
+			} as unknown as import(
+				"../../../cli/src/core/StorageProvider.js"
+			).StorageProvider;
+			const summary = makeSummary({ commitHash: "fff" });
+			mockGetTranscriptHashes.mockResolvedValue(new Set(["fff"]));
+			mockReadTranscriptsForCommits.mockResolvedValue(
+				new Map([["fff", { sessions: [] }]]),
+			);
+
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+				"https://github.com/x/foreign.git",
+				foreignStorage,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "loadTranscriptStats" });
+			dispatch({ command: "loadAllTranscripts" });
+			await flushPromises();
+
+			// Both reads went through the direct core helper (3-arg form)
+			// rather than the stub bridge wrapper (1-arg form). The
+			// foreignStorage instance is the load-bearing signal.
+			expect(mockReadTranscriptsForCommits).toHaveBeenCalledWith(
+				["fff"],
+				workspaceRoot,
+				foreignStorage,
+			);
+		});
+
+		it("previewPlan dispatch threads foreignRepoName / foreignRepoUrl to jollimemory.editPlan", async () => {
+			// The external `jollimemory.editPlan` command reads plan content
+			// via `readPlanFromBranch(slug, workspaceRoot, storage)`. For a
+			// foreign panel the storage must be the foreign repo's
+			// FolderStorage — Extension.ts derives it from the
+			// foreignRepoName / foreignRepoUrl hint that this dispatch
+			// passes. Without these positional args, the command would
+			// silently fall back to reading the current workspace's plan
+			// file, producing either an empty body or the wrong plan.
+			const foreignStorage = {
+				kind: "foreign-storage-stub",
+			} as unknown as import(
+				"../../../cli/src/core/StorageProvider.js"
+			).StorageProvider;
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+				"https://github.com/x/foreign.git",
+				foreignStorage,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "previewPlan", slug: "my-plan", title: "My Plan" });
+			await flushPromises();
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.editPlan",
+				"my-plan",
+				true,
+				"My Plan",
+				"other-repo",
+				"https://github.com/x/foreign.git",
+			);
+		});
+
+		it("previewNote dispatch threads foreignRepoName / foreignRepoUrl to jollimemory.previewNote", async () => {
+			const foreignStorage = {
+				kind: "foreign-storage-stub",
+			} as unknown as import(
+				"../../../cli/src/core/StorageProvider.js"
+			).StorageProvider;
+			const summary = makeSummary();
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+				"other-repo",
+				"https://github.com/x/foreign.git",
+				foreignStorage,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "previewNote", id: "my-note", title: "My Note" });
+			await flushPromises();
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.previewNote",
+				"my-note",
+				"My Note",
+				"other-repo",
+				"https://github.com/x/foreign.git",
+			);
+		});
+
 		it("still allows the read-only whitelist (copyMarkdown, downloadMarkdown) on a foreign panel", async () => {
 			const summary = makeSummary();
 			await SummaryWebviewPanel.show(
@@ -8214,6 +8574,172 @@ describe("SummaryWebviewPanel", () => {
 			await flushPromises();
 
 			expectStaleModalShown("generate recap");
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		// handleEditRecap's entry-point guard mirrors the push / edit-memory
+		// handlers above. Editing a recap on a commit that has been folded into
+		// a new root must surface the same modal and skip storeSummary.
+		it("blocks edit recap with the correct operation label", async () => {
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(
+				buildChainEntryMap([
+					{ hash: "abc123", parent: "rootnew0" },
+					{ hash: "rootnew0", parent: null },
+				]),
+			);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "editRecap", recap: "blocked recap" });
+			await flushPromises();
+
+			expectStaleModalShown("edit recap");
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		// Race-window pattern: the entry guard sees a clean root, the user
+		// clicks the confirm in the modal, then the second guard re-fetches
+		// the index and detects the rewrite that landed during the dialog —
+		// storeSummary must NOT fire. Repeated below for note / Linear /
+		// translateNote to keep each handler's second guard exercised; without
+		// this they appear "covered" only by the entry path and a regression
+		// in the second call would slip through.
+		it("blocks remove plan via the race-window re-check after confirm", async () => {
+			(stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>)
+				.mockResolvedValueOnce(new Map()) // entry guard: not stale
+				.mockResolvedValueOnce(
+					buildChainEntryMap([
+						{ hash: "abc123", parent: "rootnew0" },
+						{ hash: "rootnew0", parent: null },
+					]),
+				);
+			showWarningMessage.mockResolvedValueOnce("Remove");
+
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					plans: [{ slug: "p1", title: "Plan 1", commitHash: "abc123" }],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "removePlan", slug: "p1", title: "Plan 1" });
+			await flushPromises();
+
+			expectStaleModalShown("remove plan");
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks remove note via the race-window re-check after confirm", async () => {
+			(stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>)
+				.mockResolvedValueOnce(new Map())
+				.mockResolvedValueOnce(
+					buildChainEntryMap([
+						{ hash: "abc123", parent: "rootnew0" },
+						{ hash: "rootnew0", parent: null },
+					]),
+				);
+			showWarningMessage.mockResolvedValueOnce("Remove");
+
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					notes: [{ id: "n1", title: "Note 1", format: "markdown" }],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "removeNote", id: "n1", title: "Note 1" });
+			await flushPromises();
+
+			expectStaleModalShown("remove note");
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks remove Linear issue via the race-window re-check after confirm", async () => {
+			(stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>)
+				.mockResolvedValueOnce(new Map())
+				.mockResolvedValueOnce(
+					buildChainEntryMap([
+						{ hash: "abc123", parent: "rootnew0" },
+						{ hash: "rootnew0", parent: null },
+					]),
+				);
+			showWarningMessage.mockResolvedValueOnce("Remove");
+
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					linearIssues: [
+						{
+							archivedKey: "linear-issues/ENG-123.md",
+							ticketId: "ENG-123",
+							title: "Issue 1",
+							url: "https://linear.app/team/issue/ENG-123",
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+			dispatch({
+				command: "removeLinearIssue",
+				archivedKey: "linear-issues/ENG-123.md",
+				ticketId: "ENG-123",
+			});
+			await flushPromises();
+
+			expectStaleModalShown("remove Linear issue");
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("blocks delete E2E scenario via the race-window re-check after confirm", async () => {
+			(stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>)
+				.mockResolvedValueOnce(new Map())
+				.mockResolvedValueOnce(
+					buildChainEntryMap([
+						{ hash: "abc123", parent: "rootnew0" },
+						{ hash: "rootnew0", parent: null },
+					]),
+				);
+			showWarningMessage.mockResolvedValueOnce("Delete");
+
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					e2eTestGuide: [
+						{
+							title: "Scenario 1",
+							preconditions: "",
+							steps: ["step"],
+							expectedResults: ["ok"],
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+			dispatch({
+				command: "deleteE2eScenario",
+				index: 0,
+				title: "Scenario 1",
+			});
+			await flushPromises();
+
+			expectStaleModalShown("delete E2E scenario");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 

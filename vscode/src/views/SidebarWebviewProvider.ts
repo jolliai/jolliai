@@ -304,10 +304,23 @@ export class SidebarWebviewProvider
 	 * purpose: filesStore.onChange may not fire again for a while, so silently
 	 * dropping the very first badge would leave the icon unbadged for the rest
 	 * of the session.
+	 *
+	 * When clearing a previously-set badge, we first assign a `value: 0`
+	 * sentinel (which VS Code suppresses visually, equivalent to "no badge")
+	 * before assigning `undefined`. WebviewView.badge's setter does not always
+	 * repaint the activity-bar counter when assigned `undefined` after a
+	 * non-undefined ViewBadge — observed as a stuck count after the user
+	 * reverted the last change (visibleCount 1 → 0, but the icon kept "1").
+	 * The intermediate concrete value forces a repaint; the trailing
+	 * `undefined` restores the documented API state for any reader.
 	 */
 	setBadge(badge: vscode.WebviewView["badge"]): void {
 		this.pendingBadge = badge;
-		if (this.view) this.view.badge = badge;
+		if (!this.view) return;
+		if (badge === undefined && this.view.badge !== undefined) {
+			this.view.badge = { value: 0, tooltip: "" };
+		}
+		this.view.badge = badge;
 	}
 
 	/**
@@ -507,11 +520,10 @@ export class SidebarWebviewProvider
 					transcriptPath: msg.transcriptPath,
 					title: msg.title,
 					projectDir: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
-					onSessionHidden: () => {
-						// The panel just wrote HiddenConversationsStore; re-pull
-						// the list so the now-hidden row stops rendering. No need
-						// to scope by sessionId — the aggregator filter is the
-						// source of truth and re-derives the visible set.
+					onSessionChanged: () => {
+						// Any persisted edit/delete changes the row-level state
+						// (edited badge, count, or visibility after new overlay
+						// rules), so re-pull the list immediately after save.
 						void this.pushConversations();
 					},
 				});

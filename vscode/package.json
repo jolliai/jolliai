@@ -218,6 +218,10 @@
 				"command": "jollimemory.ignoreLinearIssue",
 				"title": "Ignore Linear Issue",
 				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.revertMemoryFileEdits",
+				"title": "Memory Bank: Revert Edits to System Version"
 			}
 		],
 		"menus": {
@@ -233,6 +237,13 @@
 				{
 					"command": "jollimemory.addTextSnippet",
 					"group": "1_add@3"
+				}
+			],
+			"explorer/context": [
+				{
+					"command": "jollimemory.revertMemoryFileEdits",
+					"when": "resourceFilename =~ /\\.md$/ && jollimemory.isMemoryBankFile",
+					"group": "jollimemory@1"
 				}
 			]
 		}

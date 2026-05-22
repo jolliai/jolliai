@@ -47,6 +47,7 @@ describe("ActiveSessionsProvider", () => {
 				messageCount: 1,
 				updatedAt: "2026-05-15T00:00:00Z",
 				transcriptPath: "/x",
+				isEdited: false,
 				isSelected: true,
 			},
 		];
@@ -145,6 +146,7 @@ describe("ActiveSessionsProvider", () => {
 				messageCount: 5,
 				updatedAt: "2026-05-18T12:00:00Z",
 				transcriptPath: "/tmp/transcript.json",
+				isEdited: true,
 				isSelected: false,
 			},
 		];
@@ -168,6 +170,7 @@ describe("ActiveSessionsProvider", () => {
 				messageCount: 3,
 				updatedAt: "2026-05-19T10:30:00Z",
 				transcriptPath: "/tmp/transcript2.json",
+				isEdited: false,
 				isSelected: true,
 			},
 		];
@@ -191,6 +194,7 @@ describe("ActiveSessionsProvider", () => {
 				messageCount: 10,
 				updatedAt: "2026-05-19T08:00:00Z",
 				transcriptPath: "/tmp/t1.json",
+				isEdited: true,
 				isSelected: true,
 			},
 			{
@@ -200,6 +204,7 @@ describe("ActiveSessionsProvider", () => {
 				messageCount: 4,
 				updatedAt: "2026-05-18T14:00:00Z",
 				transcriptPath: "/tmp/t2.json",
+				isEdited: false,
 				isSelected: false,
 			},
 		];

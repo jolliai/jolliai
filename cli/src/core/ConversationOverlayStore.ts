@@ -60,6 +60,11 @@ export interface ConversationOverlay {
 	readonly edits: ReadonlyArray<OverlayEditRule>;
 }
 
+/** True when an overlay carries any persisted user modification. */
+export function hasOverlayChanges(overlay: ConversationOverlay | null | undefined): boolean {
+	return !!overlay && (overlay.deletes.length > 0 || overlay.edits.length > 0);
+}
+
 export interface OverlayKey {
 	readonly projectDir: string;
 	readonly source: TranscriptSource;
@@ -290,6 +295,67 @@ export async function applyOverlaysToSessions<T extends OverlayableSession>(
 			return { ...s, entries: applyOverlay(s.entries, overlay) };
 		}),
 	);
+}
+
+/**
+ * Garbage-collects overlay rules whose identity matches an entry in the
+ * QueueWorker's consumed slice. Called from QueueWorker immediately after
+ * `loadSessionTranscripts` returns — by that point, cursor has already
+ * advanced inside `readAllTranscripts` past every entry in the slice, so
+ * any rule whose identity matches one of those entries can no longer
+ * affect future summaries. Such rules are dead state: keep dropping them
+ * here so overlay files don't accumulate.
+ *
+ * Per session:
+ *   - Drops delete/edit rules whose `(role, content, timestamp)` identity
+ *     matches one of `s.entries`. For edits, the matched identity is the
+ *     source entry's *original* content, not the `newContent` replacement
+ *     — see [[OverlayEditRule]] for why identity anchors to the raw entry.
+ *   - If all rules end up gone, unlinks the overlay file entirely so
+ *     [[hasOverlayChanges]] (which drives the sidebar 'edited' badge)
+ *     also flips to false. Leaving a present-but-empty overlay would
+ *     cost a `loadOverlay` round-trip on every panel open and every
+ *     active-sessions refresh; unlinking lets the ENOENT short-circuit
+ *     handle those cases.
+ *
+ * Failure isolation: per-session try/catch — a malformed overlay
+ * (`loadOverlay` returns null → silent skip) or a write failure on one
+ * session never aborts the sweep for the rest of the batch. Errors are
+ * warn-logged.
+ *
+ * Safe to call when `sessions` includes entries with no overlay file on
+ * disk — that is the common case, since most sessions are never edited.
+ */
+export async function pruneConsumedOverlayRules(
+	sessions: ReadonlyArray<OverlayableSession>,
+	projectDir: string,
+): Promise<void> {
+	await Promise.all(sessions.map((s) => pruneOneSession(s, projectDir)));
+}
+
+async function pruneOneSession(s: OverlayableSession, projectDir: string): Promise<void> {
+	const source = (s.source ?? "claude") as TranscriptSource;
+	const key: OverlayKey = { projectDir, source, sessionId: s.sessionId };
+	try {
+		const overlay = await loadOverlay(key);
+		if (!overlay) return;
+		const remainingDeletes = overlay.deletes.filter((r) => !s.entries.some((e) => sameIdentity(e, r)));
+		const remainingEdits = overlay.edits.filter((r) => !s.entries.some((e) => sameIdentity(e, r)));
+		const unchanged =
+			remainingDeletes.length === overlay.deletes.length && remainingEdits.length === overlay.edits.length;
+		if (unchanged) return;
+		if (remainingDeletes.length === 0 && remainingEdits.length === 0) {
+			try {
+				await unlink(overlayPath(key));
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+			}
+			return;
+		}
+		await saveOverlay(key, { deletes: remainingDeletes, edits: remainingEdits });
+	} catch (err) {
+		log.warn("pruneConsumedOverlayRules failed for %s/%s: %s", source, s.sessionId, errMsg(err));
+	}
 }
 
 // ─── Identity matching ───────────────────────────────────────────────────────

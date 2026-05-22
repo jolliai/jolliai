@@ -32,4 +32,12 @@ describe("ConversationDetailsScriptBuilder", () => {
 		const reshownBlock = js.slice(js.indexOf("'panelReshown'"));
 		expect(reshownBlock).toContain("type: 'requestTranscript'");
 	});
+
+	it("toggles the edited notice from transcriptLoaded.isEdited", () => {
+		const js = buildConversationDetailsScript();
+		expect(js).toContain("const editedNoticeEl = document.getElementById('editedNotice');");
+		expect(js).toContain("function setEditedNoticeVisible(isEdited)");
+		expect(js).toContain("editedNoticeEl.classList.toggle('hidden', !isEdited);");
+		expect(js).toContain("setEditedNoticeVisible(msg.isEdited === true);");
+	});
 });

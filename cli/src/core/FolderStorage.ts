@@ -152,6 +152,28 @@ export class FolderStorage implements StorageProvider {
 	}
 
 	/**
+	 * See StorageProvider.pruneBranchMappings for the contract. Forwards to
+	 * `MetadataManager.unregisterBranches`, which performs an atomic
+	 * `branches.json` rewrite and leaves the manifest untouched.
+	 */
+	async pruneBranchMappings(branches: readonly string[]): Promise<number> {
+		return this.metadataManager.unregisterBranches(branches);
+	}
+
+	/**
+	 * Reverse-lookup a registered branch name from its transcoded folder name.
+	 * Returns null when no `branches.json` mapping matches. Used by the revert
+	 * command's fallback path when a plan/note manifest entry is missing its
+	 * `source.branch` (legacy entries written before this field was persisted),
+	 * to route the regenerate back to the branchFolder embedded in the
+	 * manifest entry's `path` instead of silently defaulting to "main".
+	 */
+	resolveBranchForFolder(folder: string): string | null {
+		const mapping = this.metadataManager.listBranchMappings().find((m) => m.folder === folder);
+		return mapping?.branch ?? null;
+	}
+
+	/**
 	 * Shared body for `deleteVisibleMarkdown` (summary), `deletePlanVisible`,
 	 * and `deleteNoteVisible`. Looks up the manifest entry by `fileId`, falls
 	 * back to a convention-based `<branchFolder>/<fallbackFileName>` path when
@@ -171,23 +193,9 @@ export class FolderStorage implements StorageProvider {
 			return;
 		}
 
-		if (manifestEntry?.fingerprint) {
-			let onDiskFingerprint: string;
-			try {
-				onDiskFingerprint = MetadataManager.sha256(readFileSync(absPath, "utf-8"));
-				/* v8 ignore start -- defensive: readFileSync only fails after existsSync passed if the file is replaced by a directory or the fs throws EACCES mid-flow. Not reachable from a single-process unit test without mocking node:fs. */
-			} catch (err) {
-				log.warn("Cannot read %s for fingerprint check: %s — keeping file", relativePath, String(err));
-				return;
-			}
-			/* v8 ignore stop */
-			if (onDiskFingerprint !== manifestEntry.fingerprint) {
-				log.warn(
-					"Skipping cleanup of %s — file modified since manifest record (likely hand-edited)",
-					relativePath,
-				);
-				return;
-			}
+		if (manifestEntry?.fingerprint && this.isUserEditedOnDisk(absPath, manifestEntry.fingerprint)) {
+			log.warn("Skipping cleanup of %s — file modified since manifest record (likely hand-edited)", relativePath);
+			return;
 		}
 
 		try {
@@ -204,6 +212,37 @@ export class FolderStorage implements StorageProvider {
 			throw err;
 		}
 		/* v8 ignore stop */
+	}
+
+	/**
+	 * Like {@link regenerateVisibleMarkdown} but actively overwrites any
+	 * existing on-disk `.md`. Used by the revert command: when the user has
+	 * edited the visible markdown and wants to discard those edits, we
+	 * unlink the diverged file and let `regenerateVisibleMarkdown` write a
+	 * fresh copy from the hidden JSON.
+	 *
+	 * Returns true when the regenerate succeeded, false when the hidden
+	 * source was missing.
+	 */
+	async forceRegenerateVisibleMarkdown(entry: SummaryIndexEntry): Promise<boolean> {
+		const branchFolder = this.metadataManager.resolveFolderForBranch(entry.branch);
+		const slug = FolderStorage.slugify(entry.commitMessage);
+		const hash8 = entry.commitHash.substring(0, 8);
+		const relativePath = `${branchFolder}/${slug}-${hash8}.md`;
+		const absPath = join(this.rootPath, relativePath);
+
+		if (existsSync(absPath)) {
+			try {
+				unlinkSync(absPath);
+				/* v8 ignore start -- defensive: unlinkSync only fails after existsSync if a concurrent process removed the file or the fs throws EACCES mid-flow. */
+			} catch (err) {
+				log.warn("forceRegenerateVisibleMarkdown: cannot unlink %s [%s]", relativePath, String(err));
+				return false;
+			}
+			/* v8 ignore stop */
+		}
+
+		return this.regenerateVisibleMarkdown(entry);
 	}
 
 	/**
@@ -342,6 +381,7 @@ export class FolderStorage implements StorageProvider {
 				log.warn(
 					"healMissingVisibleMarkdown: hidden JSON read failed for %s [%s]: %s — keeping manifest entry",
 					entry.fileId.substring(0, 8),
+					/* v8 ignore next -- defensive: node:fs throws always carry a `code`; the `?? "?"` is a fallback for non-fs error shapes */
 					code ?? "?",
 					errMsg(err),
 				);
@@ -441,6 +481,7 @@ export class FolderStorage implements StorageProvider {
 	}
 
 	private dropManifestEntries(fileIds: readonly string[]): string[] {
+		/* v8 ignore next -- defensive: caller (healMissingVisibleMarkdown) guards `dropCandidates.length > 0` before invoking this method */
 		if (fileIds.length === 0) return [];
 		const drop = new Set(fileIds);
 		const before = this.metadataManager.readManifest();
@@ -450,10 +491,46 @@ export class FolderStorage implements StorageProvider {
 		// removed some rows in between. Reporting candidate IDs would tell the
 		// user we dropped rows that were already gone.
 		const actuallyDropped = before.files.filter((f) => drop.has(f.fileId)).map((f) => f.fileId);
+		/* v8 ignore next -- defensive: TOCTOU between heal's earlier read and this write; requires multi-process scheduling to reproduce */
 		if (actuallyDropped.length === 0) return [];
 		const kept = before.files.filter((f) => !drop.has(f.fileId));
 		this.metadataManager.replaceFiles(kept);
 		return actuallyDropped;
+	}
+
+	/**
+	 * Returns true when `absPath` exists on disk AND its sha256 differs from
+	 * `manifestFingerprint`. Used by every write/delete path that must not
+	 * clobber files a user has hand-edited.
+	 *
+	 * Public (no `private` modifier): the VS Code extension's bridge calls
+	 * this directly to drive divergence-aware UI. Not part of the
+	 * StorageProvider interface because only the folder backend has visible
+	 * markdown to be edited.
+	 *
+	 * Returns false when the file is missing OR when no baseline fingerprint
+	 * is available (legacy manifest entries written before fingerprint
+	 * tracking). Legacy entries will be brought under protection on their
+	 * next system-side write, which populates the fingerprint.
+	 *
+	 * On a readFileSync failure we return true ("treat as edited"). The
+	 * two pre-existing inline implementations of this check both kept the
+	 * file on read errors; preserving that behaviour means callers stay
+	 * conservative without needing exception-handling boilerplate.
+	 */
+	isUserEditedOnDisk(absPath: string, manifestFingerprint: string | undefined): boolean {
+		if (!existsSync(absPath)) return false;
+		if (!manifestFingerprint) return false;
+		let diskFingerprint: string;
+		try {
+			diskFingerprint = MetadataManager.sha256(readFileSync(absPath, "utf-8"));
+			/* v8 ignore start -- defensive: readFileSync only fails after existsSync passed if the file is replaced by a directory or the fs throws EACCES mid-flow. Not reachable from a single-process unit test without mocking node:fs. */
+		} catch (err) {
+			log.warn("isUserEditedOnDisk: cannot read %s [%s] — treating as edited", absPath, String(err));
+			return true;
+		}
+		/* v8 ignore stop */
+		return diskFingerprint !== manifestFingerprint;
 	}
 
 	// ── Markdown generation ────────────────────────────────────────────────
@@ -477,6 +554,13 @@ export class FolderStorage implements StorageProvider {
 		const markdown = `${frontmatter}\n${body}`;
 
 		const targetPath = join(this.rootPath, relativePath);
+
+		const existingEntry = this.metadataManager.findByPath(relativePath);
+		if (this.isUserEditedOnDisk(targetPath, existingEntry?.fingerprint)) {
+			log.info("FolderStorage: skip overwrite of user-edited %s", relativePath);
+			return;
+		}
+
 		this.atomicWrite(targetPath, markdown);
 
 		const fingerprint = MetadataManager.sha256(markdown);
@@ -525,15 +609,14 @@ export class FolderStorage implements StorageProvider {
 				continue;
 			}
 
-			let onDiskFingerprint: string;
-			try {
-				onDiskFingerprint = MetadataManager.sha256(readFileSync(absPath, "utf-8"));
-			} catch (err) {
-				log.warn("Cannot read %s for fingerprint check: %s — keeping file", entry.path, String(err));
+			if (!entry.fingerprint) {
+				// Legacy entry without fingerprint baseline — preserve the previous
+				// inline-check behavior of skipping cleanup so we don't delete a file
+				// we cannot prove the system wrote.
+				log.warn("Skipping cleanup of %s — legacy entry has no fingerprint baseline", entry.path);
 				continue;
 			}
-
-			if (onDiskFingerprint !== entry.fingerprint) {
+			if (this.isUserEditedOnDisk(absPath, entry.fingerprint)) {
 				log.warn(
 					"Skipping cleanup of %s — file modified since manifest record (likely hand-edited)",
 					entry.path,
@@ -578,6 +661,40 @@ export class FolderStorage implements StorageProvider {
 	}
 
 	/**
+	 * Read the hidden `.jolli/plans/<slug>.md` source and rewrite the
+	 * visible `<branchFolder>/plan--<slug>.md`. Used by the revert command
+	 * when a user wants to discard hand-edits to the visible plan.
+	 *
+	 * Unlinks any existing visible file first so the underlying
+	 * generatePlanMarkdown write succeeds.
+	 *
+	 * Returns true on success, false when the hidden source is missing.
+	 */
+	async regenerateVisiblePlan(slug: string, branch: string): Promise<boolean> {
+		const hiddenContent = await this.readFile(`plans/${slug}.md`);
+		if (!hiddenContent) {
+			log.warn("regenerateVisiblePlan: hidden plans/%s.md missing", slug);
+			return false;
+		}
+
+		const branchFolder = this.metadataManager.resolveFolderForBranch(branch);
+		const visiblePath = join(this.rootPath, branchFolder, `plan--${slug}.md`);
+		if (existsSync(visiblePath)) {
+			try {
+				unlinkSync(visiblePath);
+				/* v8 ignore start -- defensive: see forceRegenerateVisibleMarkdown */
+			} catch (err) {
+				log.warn("regenerateVisiblePlan: cannot unlink %s [%s]", visiblePath, String(err));
+				return false;
+			}
+			/* v8 ignore stop */
+		}
+
+		this.generatePlanMarkdown(`plans/${slug}.md`, hiddenContent, branch);
+		return true;
+	}
+
+	/**
 	 * Generates a visible markdown copy of a plan file.
 	 * Resolves the branch folder from the commit hash embedded in the slug.
 	 */
@@ -592,7 +709,15 @@ export class FolderStorage implements StorageProvider {
 		const frontmatter = ["---", `type: plan`, `slug: ${slug}`, "---"].join("\n");
 		const markdown = `${frontmatter}\n\n${content}`;
 
-		this.atomicWrite(join(this.rootPath, relativePath), markdown);
+		const targetPath = join(this.rootPath, relativePath);
+
+		const existingEntry = this.metadataManager.findByPath(relativePath);
+		if (this.isUserEditedOnDisk(targetPath, existingEntry?.fingerprint)) {
+			log.info("FolderStorage: skip overwrite of user-edited %s", relativePath);
+			return;
+		}
+
+		this.atomicWrite(targetPath, markdown);
 
 		const fingerprint = MetadataManager.sha256(markdown);
 		this.metadataManager.updateManifest({
@@ -600,11 +725,50 @@ export class FolderStorage implements StorageProvider {
 			fileId: `plan:${slug}`,
 			type: "plan",
 			fingerprint,
-			source: {},
+			// Persist branch so the revert command can route the regenerate
+			// back to the correct branchFolder. Without this, Extension.ts
+			// falls back to "main" for any plan written from a feature branch
+			// and overwrites the wrong file. When the explicit branch arg is
+			// absent, leave source empty — the revert command has a path-
+			// based reverse-lookup fallback for that case.
+			source: branch ? { branch } : {},
 			title: this.extractTitle(content) ?? slug,
 		});
 
 		log.info("Plan markdown generated: %s", relativePath);
+	}
+
+	/**
+	 * Read the hidden `.jolli/notes/<id>.md` source and rewrite the visible
+	 * `<branchFolder>/note--<id>.md`. Used by the revert command.
+	 *
+	 * Unlinks any existing visible file first so the underlying
+	 * generateNoteMarkdown write succeeds.
+	 *
+	 * Returns true on success, false when the hidden source is missing.
+	 */
+	async regenerateVisibleNote(id: string, branch: string): Promise<boolean> {
+		const hiddenContent = await this.readFile(`notes/${id}.md`);
+		if (!hiddenContent) {
+			log.warn("regenerateVisibleNote: hidden notes/%s.md missing", id);
+			return false;
+		}
+
+		const branchFolder = this.metadataManager.resolveFolderForBranch(branch);
+		const visiblePath = join(this.rootPath, branchFolder, `note--${id}.md`);
+		if (existsSync(visiblePath)) {
+			try {
+				unlinkSync(visiblePath);
+				/* v8 ignore start -- defensive: see forceRegenerateVisibleMarkdown */
+			} catch (err) {
+				log.warn("regenerateVisibleNote: cannot unlink %s [%s]", visiblePath, String(err));
+				return false;
+			}
+			/* v8 ignore stop */
+		}
+
+		this.generateNoteMarkdown(`notes/${id}.md`, hiddenContent, branch);
+		return true;
 	}
 
 	/**
@@ -622,7 +786,15 @@ export class FolderStorage implements StorageProvider {
 		const frontmatter = ["---", `type: note`, `id: ${id}`, "---"].join("\n");
 		const markdown = `${frontmatter}\n\n${content}`;
 
-		this.atomicWrite(join(this.rootPath, relativePath), markdown);
+		const targetPath = join(this.rootPath, relativePath);
+
+		const existingEntry = this.metadataManager.findByPath(relativePath);
+		if (this.isUserEditedOnDisk(targetPath, existingEntry?.fingerprint)) {
+			log.info("FolderStorage: skip overwrite of user-edited %s", relativePath);
+			return;
+		}
+
+		this.atomicWrite(targetPath, markdown);
 
 		const fingerprint = MetadataManager.sha256(markdown);
 		this.metadataManager.updateManifest({
@@ -630,7 +802,8 @@ export class FolderStorage implements StorageProvider {
 			fileId: `note:${id}`,
 			type: "note",
 			fingerprint,
-			source: {},
+			// See generatePlanMarkdown for the source-branch rationale.
+			source: branch ? { branch } : {},
 			title: this.extractTitle(content) ?? id,
 		});
 

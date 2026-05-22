@@ -116,6 +116,32 @@ describe("registerHealFolderCommand", () => {
 		expect(stdout).not.toContain("Re-run `jolli enable`");
 	});
 
+	it("truncates the dropped-id preview with ', ...' when more than 5 IDs were dropped", async () => {
+		// The preview joins the first 5 short-hashes; with >5 entries it
+		// appends ", ..." so operators see there's more. Pins the truthy arm
+		// of the `dropped.length > 5` ternary that produces the ellipsis.
+		mockCreateStorage.mockResolvedValue(
+			makeStorageWith({
+				healed: 0,
+				skipped: 0,
+				failed: 6,
+				droppedIds: [
+					"aabbccdd00112233",
+					"eeff445566778899",
+					"1111222233334444",
+					"5555666677778888",
+					"99990000aaaabbbb",
+					"ccccddddeeeeffff",
+				],
+			}),
+		);
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-many"]);
+		expect(stdout).toContain("Dropped from manifest: 6");
+		// First 5 hashes shown, then a trailing ellipsis marker.
+		expect(stdout).toContain("aabbccdd, eeff4455, 11112222, 55556666, 99990000, ...");
+		expect(stdout).not.toContain("ccccdddd");
+	});
+
 	it("reports failed entries with dropped IDs when manifest rows were dropped", async () => {
 		mockCreateStorage.mockResolvedValue(
 			makeStorageWith({
@@ -199,6 +225,29 @@ describe("registerHealFolderCommand", () => {
 		expect(stderr).toContain("Heal errored");
 		expect(stderr).toContain("manifest.json is unreadable");
 		expect(process.exitCode).toBe(1);
+	});
+
+	it("falls back to 'dual-write' when loadConfig itself throws (corrupt config path)", async () => {
+		// readStorageMode's catch must coerce the failure to the default mode so
+		// `jolli heal-folder` never aborts at config-read time — operators can
+		// still run heal on a repo whose ~/.jolli/config.json is unreadable.
+		mockLoadConfig.mockRejectedValue(new Error("EACCES reading config"));
+		mockCreateStorage.mockResolvedValue(makeStorageWith(null));
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-config-throw"]);
+		expect(stdout).toContain("storageMode=dual-write");
+	});
+
+	it("prints 'transient read error' note when dual-write mode has failed rows but no droppedIds", async () => {
+		// Failed-but-not-dropped on dual-write is the "transient" case: heal saw a
+		// fail per-entry (e.g. EBUSY mid-read) but didn't ask the manifest to drop
+		// the row. The CLI must hint at re-running rather than telling the user to
+		// touch the manifest manually (that's the folder-only branch).
+		mockCreateStorage.mockResolvedValue(makeStorageWith({ healed: 0, skipped: 4, failed: 2 }));
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-transient"]);
+		expect(stdout).toContain("Failed:   2");
+		expect(stdout).not.toContain("Dropped from manifest");
+		expect(stdout).toContain("transient read error");
+		expect(stdout).not.toContain("Re-run `jolli enable`");
 	});
 
 	// When the underlying error carries an errno code (EACCES / ENOSPC / ...)

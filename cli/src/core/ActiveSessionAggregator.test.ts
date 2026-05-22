@@ -337,6 +337,37 @@ describe("listActiveConversations", () => {
 		);
 	});
 
+	it("marks sessions with a persisted overlay as edited", async () => {
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { saveOverlay } = await import("./ConversationOverlayStore.js");
+		const projectDir = mkdtempSync(join(tmpdir(), "agg-edited-"));
+		try {
+			vi.mocked(scanCursorSessions).mockResolvedValueOnce(
+				scan([
+					{ sessionId: "edited", transcriptPath: "/edited", updatedAt: iso(-HOUR), source: "cursor" },
+					{ sessionId: "plain", transcriptPath: "/plain", updatedAt: iso(-2 * HOUR), source: "cursor" },
+				]),
+			);
+			await saveOverlay(
+				{ projectDir, source: "cursor", sessionId: "edited" },
+				{
+					deletes: [{ role: "human", content: "remove me" }],
+					edits: [],
+				},
+			);
+
+			const items = await listActiveConversations({ cwd: projectDir, windowMs: 2 * DAY });
+			expect(items).toEqual([
+				expect.objectContaining({ sessionId: "edited", isEdited: true }),
+				expect.objectContaining({ sessionId: "plain", isEdited: false }),
+			]);
+		} finally {
+			rmSync(projectDir, { recursive: true, force: true });
+		}
+	});
+
 	it("excludes sessions marked hidden in HiddenConversationsStore", async () => {
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");

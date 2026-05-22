@@ -21,11 +21,15 @@ function e(commitHash: string, branch: string, parent: string | null): SummaryIn
 	};
 }
 
-function makeStorage(): StorageProvider & {
+interface RecordingStorage extends StorageProvider {
 	readonly deletions: SummaryIndexEntry[];
-} {
+	readonly pruneCalls: string[][];
+}
+
+function makeStorage(opts: { withPrune?: boolean; pruneThrows?: boolean } = {}): RecordingStorage {
 	const deletions: SummaryIndexEntry[] = [];
-	return {
+	const pruneCalls: string[][] = [];
+	const base: RecordingStorage = {
 		readFile: vi.fn(),
 		writeFiles: vi.fn(),
 		listFiles: vi.fn(),
@@ -35,7 +39,16 @@ function makeStorage(): StorageProvider & {
 			deletions.push(entry);
 		},
 		deletions,
+		pruneCalls,
 	};
+	if (opts.withPrune !== false) {
+		base.pruneBranchMappings = async (branches) => {
+			pruneCalls.push([...branches]);
+			if (opts.pruneThrows) throw new Error("prune-fail");
+			return branches.length;
+		};
+	}
+	return base;
 }
 
 describe("StaleChildMarkdownCleanup", () => {
@@ -162,6 +175,155 @@ describe("StaleChildMarkdownCleanup", () => {
 			} satisfies StorageProvider;
 			const result = await cleanupAllBranchesStaleChildMarkdown("/cwd", storage);
 			expect(result.deleted).toBe(0);
+		});
+	});
+
+	describe("ghost-branch mapping pruning", () => {
+		it("cleanupBranchStaleChildMarkdown prunes the branch when it has only hoisted children (cross-branch hoist)", async () => {
+			// Cross-branch hoist: head landed on 'bug/main' as 'a'; 'b' is a
+			// hoisted child whose .branch field retains its origin name
+			// 'feature/ghost'. After cleanup deletes b.md, 'feature/ghost' is
+			// left in the index with zero heads → prune.
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "bug/main", null)],
+					["b", e("b", "feature/ghost", "a")],
+				]),
+			);
+			const storage = makeStorage();
+			await cleanupBranchStaleChildMarkdown("/cwd", "feature/ghost", storage);
+			expect(storage.pruneCalls).toEqual([["feature/ghost"]]);
+		});
+
+		it("cleanupBranchStaleChildMarkdown does NOT prune when the branch still has a head", async () => {
+			// Same-branch amend: 'a' is the new head on 'main', 'b' is the
+			// hoisted prior version, also on 'main'. After cleanup 'main' still
+			// has a head → no prune.
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "main", null)],
+					["b", e("b", "main", "a")],
+				]),
+			);
+			const storage = makeStorage();
+			await cleanupBranchStaleChildMarkdown("/cwd", "main", storage);
+			expect(storage.pruneCalls).toEqual([]);
+		});
+
+		it("cleanupBranchStaleChildMarkdown does NOT prune when the branch is absent from the index (fresh-repo mapping)", async () => {
+			// Mapping was created via resolveFolderForBranch before any commit
+			// landed; index has zero entries for this branch. Must not prune,
+			// else fresh-repo branches vanish from the sidebar before they
+			// ever produced a summary.
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([["a", e("a", "main", null)]]),
+			);
+			const storage = makeStorage();
+			await cleanupBranchStaleChildMarkdown("/cwd", "freshly-checked-out", storage);
+			expect(storage.pruneCalls).toEqual([]);
+		});
+
+		it("cleanupBranchStaleChildMarkdown is a no-op when storage lacks pruneBranchMappings (orphan-only)", async () => {
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "bug/main", null)],
+					["b", e("b", "feature/ghost", "a")],
+				]),
+			);
+			const storage = makeStorage({ withPrune: false });
+			const result = await cleanupBranchStaleChildMarkdown("/cwd", "feature/ghost", storage);
+			expect(result.deleted).toBe(1);
+			expect(storage.pruneCalls).toEqual([]);
+		});
+
+		it("cleanupBranchStaleChildMarkdown does NOT prune the mapping when a stale-child delete failed", async () => {
+			// Cross-branch hoist where the visible .md unlink fails (e.g. EACCES /
+			// EBUSY on a user-edited or VS-Code-locked file). The branch index
+			// snapshot still shows zero heads, but the orphaned .md is still on
+			// disk — pruning the mapping would hide the branch from the sidebar
+			// while leaving the orphan file invisible-but-present. The guard
+			// keeps the mapping until a later cleanup pass succeeds.
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "bug/main", null)],
+					["b", e("b", "feature/ghost", "a")],
+				]),
+			);
+			const storage: RecordingStorage = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn(),
+				ensure: vi.fn(),
+				deleteVisibleMarkdown: async () => {
+					throw new Error("EACCES");
+				},
+				pruneBranchMappings: async (branches) => {
+					storage.pruneCalls.push([...branches]);
+					return branches.length;
+				},
+				deletions: [],
+				pruneCalls: [],
+			};
+			const result = await cleanupBranchStaleChildMarkdown("/cwd", "feature/ghost", storage);
+			expect(result.failed).toBe(1);
+			expect(storage.pruneCalls).toEqual([]);
+		});
+
+		it("cleanupBranchStaleChildMarkdown swallows pruneBranchMappings failures and still reports the .md deletion result", async () => {
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "bug/main", null)],
+					["b", e("b", "feature/ghost", "a")],
+				]),
+			);
+			const storage = makeStorage({ pruneThrows: true });
+			const result = await cleanupBranchStaleChildMarkdown("/cwd", "feature/ghost", storage);
+			// Delete tally still reflects the visible .md deletion; prune
+			// failure is a side-channel that must never demote the op result.
+			expect(result.deleted).toBe(1);
+			expect(result.failed).toBe(0);
+		});
+
+		it("cleanupAllBranchesStaleChildMarkdown prunes every ghost branch in one batch", async () => {
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "bug/main", null)],
+					["b", e("b", "feature/ghost-1", "a")],
+					["c", e("c", "feature/ghost-2", "a")],
+					["d", e("d", "live-branch", null)],
+				]),
+			);
+			const storage = makeStorage();
+			await cleanupAllBranchesStaleChildMarkdown("/cwd", storage);
+			expect(storage.pruneCalls).toHaveLength(1);
+			expect([...storage.pruneCalls[0]].sort()).toEqual(["feature/ghost-1", "feature/ghost-2"]);
+		});
+
+		it("cleanupAllBranchesStaleChildMarkdown does NOT call pruneBranchMappings when there is nothing to prune", async () => {
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "main", null)],
+					["b", e("b", "main", "a")],
+					["x", e("x", "feature", null)],
+				]),
+			);
+			const storage = makeStorage();
+			await cleanupAllBranchesStaleChildMarkdown("/cwd", storage);
+			expect(storage.pruneCalls).toEqual([]);
+		});
+
+		it("cleanupAllBranchesStaleChildMarkdown swallows pruneBranchMappings failures", async () => {
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "bug/main", null)],
+					["b", e("b", "feature/ghost", "a")],
+				]),
+			);
+			const storage = makeStorage({ pruneThrows: true });
+			const result = await cleanupAllBranchesStaleChildMarkdown("/cwd", storage);
+			expect(result.deleted).toBe(1);
+			expect(result.failed).toBe(0);
 		});
 	});
 

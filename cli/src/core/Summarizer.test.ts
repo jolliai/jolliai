@@ -434,6 +434,35 @@ Using \`===TOPIC===\` as the topic separator avoids JSON encoding issues.`);
 
 			expect(result.topics[0].filesAffected).toBeUndefined();
 		});
+
+		// Pins the `content.length > 0 && TOP_LEVEL_FIELD_NAMES.has(fieldName)`
+		// false arm — a top-level marker with NO content between it and the
+		// next marker must not overwrite an earlier field. Catches a regression
+		// where empty markers stomped a previously-captured TICKETID.
+		it("ignores top-level markers with empty content (does not overwrite previously-set fields)", () => {
+			const result = parseSummaryResponse(
+				[
+					"---TICKETID---",
+					"PROJ-FIRST",
+					"---TICKETID---",
+					// Empty content between this marker and the next.
+					"---RECAP---",
+					"A recap line",
+					"===TOPIC===",
+					"---TITLE---",
+					"A",
+					"---TRIGGER---",
+					"t",
+					"---RESPONSE---",
+					"r",
+					"---DECISIONS---",
+					"d",
+				].join("\n"),
+			);
+
+			expect(result.ticketId).toBe("PROJ-FIRST");
+			expect(result.recap).toBe("A recap line");
+		});
 	});
 
 	describe("generateSummary", () => {
@@ -930,6 +959,91 @@ ${delimited({
 				});
 
 				expect(mockCallLlm).toHaveBeenCalledTimes(2);
+				expect(record.topics).toHaveLength(0);
+			});
+
+			it('treats null retry text as empty (covers `retryResult.text ?? ""` fallback)', async () => {
+				// callLlm's text can be null when the proxy returns a truncated
+				// response; the strict-retry path must coerce to "" rather than
+				// throw — non-compliant empty means we keep the first response.
+				mockCallLlm
+					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown))
+					.mockResolvedValueOnce(summaryLlmResult("", { text: null as unknown as string }));
+
+				const record = await generateSummary({
+					conversation: "x",
+					diff: "y",
+					commitInfo: mockCommitInfo,
+					diffStats: mockDiffStats,
+					transcriptEntries: 1,
+					config: mockConfig,
+				});
+
+				expect(mockCallLlm).toHaveBeenCalledTimes(2);
+				// First-response result kept; topics are 0 because malformedMarkdown parses to none.
+				expect(record.topics).toHaveLength(0);
+			});
+
+			it("falls back to resolveModelId when retry model is null (covers `retryResult.model ?? resolveModelId`)", async () => {
+				mockCallLlm
+					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown))
+					.mockResolvedValueOnce(
+						summaryLlmResult(
+							delimited({ title: "Recovered topic", trigger: "t", response: "r", decisions: "d" }),
+							{ model: null as unknown as string },
+						),
+					);
+
+				const record = await generateSummary({
+					conversation: "x",
+					diff: "y",
+					commitInfo: mockCommitInfo,
+					diffStats: mockDiffStats,
+					transcriptEntries: 1,
+					config: mockConfig,
+				});
+
+				expect(record.llm.model).toBeTruthy();
+			});
+
+			it("uses null stopReason when retry omits it (covers `retryResult.stopReason ?? null`)", async () => {
+				mockCallLlm
+					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown))
+					.mockResolvedValueOnce(
+						summaryLlmResult(
+							delimited({ title: "Recovered topic", trigger: "t", response: "r", decisions: "d" }),
+							{ stopReason: null as unknown as string },
+						),
+					);
+
+				const record = await generateSummary({
+					conversation: "x",
+					diff: "y",
+					commitInfo: mockCommitInfo,
+					diffStats: mockDiffStats,
+					transcriptEntries: 1,
+					config: mockConfig,
+				});
+
+				expect(record.llm.stopReason).toBeNull();
+			});
+
+			it("formats non-Error strict-retry throws via String(err) (covers retry-catch String branch)", async () => {
+				mockCallLlm
+					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown))
+					.mockRejectedValueOnce("bare-string retry failure");
+
+				const record = await generateSummary({
+					conversation: "x",
+					diff: "y",
+					commitInfo: mockCommitInfo,
+					diffStats: mockDiffStats,
+					transcriptEntries: 1,
+					config: mockConfig,
+				});
+
+				// Retry-catch swallows the error and accepts the first-response
+				// parse (zero topics from malformedMarkdown).
 				expect(record.topics).toHaveLength(0);
 			});
 
@@ -2222,6 +2336,84 @@ Test reordering
 				);
 				expect(mockCallLlm).toHaveBeenCalledTimes(2);
 				expect(result).toBeNull();
+			});
+
+			it("formats non-Error strict-retry throws via String(err) on the warn line", async () => {
+				// Pins the `err instanceof Error ? err.message : String(err)`
+				// fallback inside the strict-retry catch — exercises the second
+				// arm with a bare-string reject.
+				mockCallLlm
+					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown))
+					.mockRejectedValueOnce("bare-string strict failure");
+				const result = await generateSquashConsolidation(
+					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
+				);
+				expect(mockCallLlm).toHaveBeenCalledTimes(2);
+				expect(result).toBeNull();
+			});
+
+			it("accepts strict-retry result with recap-only (zero topics)", async () => {
+				// The success gate is `topics.length > 0 || recap` — a strict retry
+				// that recovers only a recap (no topics) must still be used instead
+				// of falling through to mechanical fallback.
+				const recapOnly = [
+					"---RECAP---",
+					"Recovered consolidation recap from the strict retry — no topics needed because the changes were stylistic.",
+				].join("\n");
+				mockCallLlm
+					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown))
+					.mockResolvedValueOnce(summaryLlmResult(recapOnly));
+				const result = await generateSquashConsolidation(
+					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
+				);
+				expect(mockCallLlm).toHaveBeenCalledTimes(2);
+				expect(result?.topics).toHaveLength(0);
+				expect(result?.recap).toContain("Recovered consolidation recap");
+			});
+
+			it('treats a null `text` field as empty string in the strict-retry assembly site (covers `?? ""`)', async () => {
+				// callLlm's text can be null when the response stream was cut
+				// short; the strict-retry path must still parse to "" rather
+				// than throw on null.
+				mockCallLlm.mockResolvedValueOnce(summaryLlmResult("", { text: null as unknown as string }));
+				const result = await generateSquashConsolidation(
+					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
+				);
+				// Empty text → format-compliant + no topics + no recap → fall through to null
+				expect(result).toBeNull();
+			});
+
+			it("falls back to resolveModelId when the LLM result omits model (covers `?? resolveModelId`)", async () => {
+				// model is normally set by callLlm but the proxy occasionally
+				// returns it as null/undefined. The fallback must derive a real
+				// model id from the request config so persisted metadata never
+				// carries a null model.
+				mockCallLlm.mockResolvedValueOnce(
+					summaryLlmResult(
+						"===TOPIC===\n---TITLE---\nT\n---TRIGGER---\nt\n---RESPONSE---\nr\n---DECISIONS---\nReal decision\n",
+						{ model: null as unknown as string },
+					),
+				);
+				const result = await generateSquashConsolidation(
+					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
+				);
+				expect(result?.llm?.model).toBeTruthy();
+			});
+
+			it("uses null stopReason when the LLM result omits it (covers `?? null` fallback)", async () => {
+				// summaryLlmResult defaults stopReason to "end_turn"; passing
+				// `stopReason: null` exercises the nullish-coalescing arm at the
+				// LlmCallMetadata assembly site.
+				mockCallLlm.mockResolvedValueOnce(
+					summaryLlmResult(
+						"===TOPIC===\n---TITLE---\nT\n---TRIGGER---\nt\n---RESPONSE---\nr\n---DECISIONS---\nReal decision\n",
+						{ stopReason: null as unknown as string },
+					),
+				);
+				const result = await generateSquashConsolidation(
+					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
+				);
+				expect(result?.llm?.stopReason).toBeNull();
 			});
 		});
 	});

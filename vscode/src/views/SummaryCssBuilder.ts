@@ -1077,6 +1077,16 @@ export function buildCss(): string {
     opacity: 1;
     color: var(--vscode-textLink-foreground);
   }
+  /* In every readonly mode (foreign / stale / regenerating) the modal-tab
+     itself stays clickable (it is just session navigation) but the
+     destructive trash affordance must not be reachable. The catch-all
+     button:not([data-foreign-safe]) rule cannot help here — session-delete-btn
+     is a <span> nested inside the tab button, so we hide it explicitly. */
+  .page.foreign-readonly .modal-tab .session-delete-btn,
+  .page.stale-readonly .modal-tab .session-delete-btn,
+  .page.regenerating-readonly .modal-tab .session-delete-btn {
+    display: none !important;
+  }
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
 

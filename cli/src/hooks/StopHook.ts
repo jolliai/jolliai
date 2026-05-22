@@ -195,7 +195,11 @@ const EXTERNAL_EXCLUDE_BASENAMES = new Set([
  */
 function isExternalPlanCandidate(absPath: string): boolean {
 	if (EXTERNAL_EXCLUDE_SEGMENTS.some((re) => re.test(absPath))) return false;
-	const base = (absPath.split(/[/\\]/).pop() ?? "").toLowerCase();
+	// `split` on a non-empty string always returns ≥1 element, so `pop()` is
+	// never undefined here. The non-null assertion drops the dead `?? ""`
+	// fallback that v8 otherwise counts as an uncovered branch arm.
+	// biome-ignore lint/style/noNonNullAssertion: split-then-pop is provably non-null
+	const base = absPath.split(/[/\\]/).pop()!.toLowerCase();
 	return !EXTERNAL_EXCLUDE_BASENAMES.has(base);
 }
 
@@ -207,7 +211,11 @@ function isExternalPlanCandidate(absPath: string): boolean {
  * separators avoids that.
  */
 function basenameNoExt(absPath: string, ext: string): string {
-	const last = absPath.split(/[/\\]/).pop() ?? "";
+	// split-then-pop never yields undefined on a non-empty string; the
+	// non-null assertion removes the dead `?? ""` branch.
+	// biome-ignore lint/style/noNonNullAssertion: split-then-pop is provably non-null
+	const last = absPath.split(/[/\\]/).pop()!;
+	/* v8 ignore next -- defensive: only callers pass paths matching `ext` (currently `.md`); the false arm exists for future general-purpose use */
 	return last.endsWith(ext) ? last.slice(0, -ext.length) : last;
 }
 
@@ -605,8 +613,11 @@ async function discoverLinearIssuesFromTranscript(sessionInfo: SessionInfo, cwd:
 function extractPlanTitle(filePath: string): string {
 	// Use a platform-agnostic basename for the fallback: node:path.basename
 	// only recognizes the current platform's separator, so a Windows path
-	// processed on POSIX would degrade into the entire path string.
-	const fallback = filePath.split(/[/\\]/).pop() ?? filePath;
+	// processed on POSIX would degrade into the entire path string. split-
+	// then-pop never returns undefined on a non-empty string, so the non-null
+	// assertion replaces the dead `?? filePath` branch v8 would otherwise count.
+	// biome-ignore lint/style/noNonNullAssertion: split-then-pop is provably non-null
+	const fallback = filePath.split(/[/\\]/).pop()!;
 	try {
 		const content = readFileSync(filePath, "utf-8");
 		const match = /^#\s+(.+)/m.exec(content);

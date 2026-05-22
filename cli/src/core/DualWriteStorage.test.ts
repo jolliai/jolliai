@@ -567,6 +567,63 @@ describe("DualWriteStorage", () => {
 		});
 	});
 
+	describe("pruneBranchMappings delegation", () => {
+		const orphanStub = () =>
+			({
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			}) as unknown as StorageProvider;
+
+		it("delegates to the folder-side provider and propagates the count", async () => {
+			const folderPrune = vi.fn().mockResolvedValue(3);
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				pruneBranchMappings: folderPrune,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphanStub(), folder);
+			const removed = await dual.pruneBranchMappings(["stale1", "stale2", "stale3"]);
+			expect(folderPrune).toHaveBeenCalledWith(["stale1", "stale2", "stale3"]);
+			expect(removed).toBe(3);
+		});
+
+		it("returns 0 when the folder side lacks the method (orphan-only fallback)", async () => {
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphanStub(), folder);
+			await expect(dual.pruneBranchMappings(["x"])).resolves.toBe(0);
+		});
+
+		it("marks dirty and returns 0 when the folder side throws", async () => {
+			const folderPrune = vi.fn().mockRejectedValue(new Error("manifest write failed"));
+			const markDirty = vi.fn();
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				pruneBranchMappings: folderPrune,
+				markDirty,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphanStub(), folder);
+			const removed = await dual.pruneBranchMappings(["a", "b"]);
+			expect(removed).toBe(0);
+			expect(markDirty).toHaveBeenCalledWith("pruneBranchMappings 2");
+		});
+	});
+
 	describe("healMissingVisibleMarkdown delegation", () => {
 		it("delegates to the folder-side provider and propagates the result", async () => {
 			const folderHeal = vi.fn().mockResolvedValue({ healed: 3, skipped: 5, failed: 1 });
@@ -712,6 +769,32 @@ describe("DualWriteStorage", () => {
 			// throw — the CLI / sidebar use this to avoid lying to the user.
 			expect(result.error).toBe("manifest read failed");
 			expect(markDirty).toHaveBeenCalledWith("healMissingVisibleMarkdown");
+		});
+
+		it("returns the zero-counts default when the folder side resolves to undefined (covers `?? {…}` fallback)", async () => {
+			// Defensive `result ?? { healed: 0, skipped: 0, failed: 0 }`:
+			// a folder backend that exists but explicitly resolves to undefined
+			// must NOT make the bridge return `undefined`. The fallback shape is
+			// what downstream callers expect from HealResult.
+			const folderHeal = vi.fn().mockResolvedValue(undefined);
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				healMissingVisibleMarkdown: folderHeal,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+
+			await expect(dual.healMissingVisibleMarkdown()).resolves.toEqual({ healed: 0, skipped: 0, failed: 0 });
 		});
 
 		// When the swallowed throw carries an errno (EACCES on a permission

@@ -246,6 +246,29 @@ describe("CLI", () => {
 			expect(helpOutput).not.toContain("export-prompt");
 			exitSpy.mockRestore();
 		});
+
+		it("delegates subcommand --help to Commander's default formatter (covers `cmd.parent !== null` branch)", async () => {
+			// formatGroupedHelp only groups commands at the root program; for
+			// any subcommand (e.g. `jolli auth --help`) it falls through to
+			// the default formatter so option lists render identically to
+			// Commander's stock output without the Memory/Site grouping.
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["auth", "--help"]);
+			} catch {
+				// Commander calls process.exit after --help
+			}
+			const writes = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
+			const helpOutput = writes.join("");
+			expect(helpOutput).toContain("auth");
+			// Default formatter does NOT render the Memory/Site section headers
+			// that formatGroupedHelp prepends for the root program.
+			expect(helpOutput).not.toContain("Jolli Memory — Auto-document");
+			expect(helpOutput).not.toContain("Jolli Site — Generate");
+			exitSpy.mockRestore();
+		});
 	});
 
 	describe("enable command", () => {

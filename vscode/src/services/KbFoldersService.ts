@@ -47,8 +47,9 @@
  *   3. Bare filename — final fallback in the renderer.
  */
 
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs, readFileSync } from "node:fs";
 import { isAbsolute, join, normalize } from "node:path";
+import type { SummaryIndex } from "../../../cli/src/Types.js";
 import { FolderStorage } from "../../../cli/src/core/FolderStorage.js";
 import {
 	type DiscoveredRepo,
@@ -143,13 +144,38 @@ export class KbFoldersService {
 	 * unknown repo returns `[]`; a fresh repo with no `branches.json` yet
 	 * also returns `[]` because `MetadataManager` defaults to an empty
 	 * mapping registry (readJson swallows missing-file / parse errors).
+	 *
+	 * Index-based head filter (v4 Hoist): a branch is hidden when it appears
+	 * in `branches.json` AND in `index.json`, but every one of its index
+	 * entries is a hoisted child (`parentCommitHash != null`). Under cross-
+	 * branch amend / cherry-pick / rebase the head moves to the destination
+	 * branch while hoisted children retain their original `branch` field;
+	 * `StaleChildMarkdownCleanup` then deletes their visible `.md`, leaving
+	 * the original branch with a registered mapping but no on-disk content
+	 * (the "ghost branch" sidebar bug). Cross-checking against the index
+	 * here is defence-in-depth: the cleanup path also prunes orphaned
+	 * mappings now, but this filter survives partial cleanup, pre-migration
+	 * upgrades, and any future writer that forgets to prune.
+	 *
+	 * Fresh-repo safety: a mapping that was created via
+	 * `resolveFolderForBranch` before any commit landed has zero matching
+	 * entries in the index — that's NOT a ghost. The check requires the
+	 * branch to actually appear in the index before it can be hidden.
+	 *
+	 * `index.json` missing or unparseable falls back to mapping-only output.
 	 */
 	listBranches(repoName: string): readonly string[] {
 		const repo = this.listRepos().find((r) => r.repoName === repoName);
 		if (!repo) return [];
 		const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
-		const names = mm.listBranchMappings().map((m) => m.branch);
-		return Array.from(new Set(names)).sort();
+		const mapped = mm.listBranchMappings().map((m) => m.branch);
+		if (mapped.length === 0) return [];
+
+		const indexSummary = readBranchIndexSummary(join(repo.kbRoot, ".jolli", "index.json"));
+		const visible = indexSummary
+			? mapped.filter((b) => indexSummary.withHead.has(b) || !indexSummary.inIndex.has(b))
+			: mapped;
+		return Array.from(new Set(visible)).sort();
 	}
 
 	async listChildren(relPath: string): Promise<FolderNode> {
@@ -445,6 +471,7 @@ export class KbFoldersService {
 				fileKey: entry?.fileId,
 				fileTitle: title,
 				fileBranch: entry?.source?.branch,
+				isDiverged: computeIsDiverged(abs, entry?.fingerprint),
 			};
 		}
 
@@ -480,8 +507,9 @@ export class KbFoldersService {
 					};
 				}
 				const entry = lookup.get(childRelPath);
+				const childAbs = join(abs, e.name);
 				const title =
-					entry?.title ?? (await deriveMdTitle(join(abs, e.name), e.name));
+					entry?.title ?? (await deriveMdTitle(childAbs, e.name));
 				return {
 					name: e.name,
 					relPath: childRelPath,
@@ -491,6 +519,7 @@ export class KbFoldersService {
 					fileKey: entry?.fileId,
 					fileTitle: title,
 					fileBranch: entry?.source?.branch,
+					isDiverged: computeIsDiverged(childAbs, entry?.fingerprint),
 				};
 			}),
 		);
@@ -579,10 +608,36 @@ function classify(entry: ManifestEntry | undefined): FolderFileKind {
 	return entry.type;
 }
 
+/**
+ * Returns true when the on-disk `.md` differs from the manifest fingerprint —
+ * i.e. the user edited the visible copy outside the system. Mirrors
+ * `FolderStorage.isUserEditedOnDisk` semantics so the KB folders tree's ✎
+ * marker reads consistently with `MemoryFileDecorationProvider`'s explorer
+ * badge:
+ *   - no fingerprint (untracked, or pre-fingerprint legacy row) → false
+ *   - file missing → false (the cleanup pipeline owns that case)
+ *   - read error → true (be conservative: surface the ✎ rather than hide it)
+ * Synchronous + cheap: a single `readFileSync` + `sha256` per manifest-tracked
+ * file. KbFoldersService callers pay this once per listing, batched with the
+ * already-existing `deriveMdTitle` IO.
+ */
+function computeIsDiverged(
+	absPath: string,
+	fingerprint: string | undefined,
+): boolean {
+	if (!fingerprint) return false;
+	if (!existsSync(absPath)) return false;
+	try {
+		return MetadataManager.sha256(readFileSync(absPath, "utf-8")) !== fingerprint;
+	} catch {
+		return true;
+	}
+}
+
 function relPathName(rel: string): string {
 	if (rel === "") return "";
 	const parts = rel.split("/");
-	return parts[parts.length - 1] ?? "";
+	return parts[parts.length - 1];
 }
 
 /**
@@ -622,11 +677,11 @@ export function parseMdTitle(text: string): string | undefined {
 	// frontmatter line beginning with `#` (a YAML comment) for a heading.
 	const fmMatch = s.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
 	if (fmMatch) {
-		const titleLine = (fmMatch[1] ?? "").match(
+		const titleLine = fmMatch[1].match(
 			/^[ \t]*title[ \t]*:[ \t]*(.+?)[ \t]*$/im,
 		);
 		if (titleLine) {
-			const v = stripQuotes(titleLine[1] ?? "").trim();
+			const v = stripQuotes(titleLine[1]).trim();
 			if (v) return v;
 		}
 		s = s.slice(fmMatch[0].length);
@@ -636,13 +691,44 @@ export function parseMdTitle(text: string): string | undefined {
 		if (line === "") continue;
 		const h1 = line.match(/^#[ \t]+(.+?)[ \t]*#*[ \t]*$/);
 		if (h1) {
-			const v = (h1[1] ?? "").trim();
-			return v || undefined;
+			return h1[1].trim();
 		}
 		// First non-blank line isn't an H1 → no title; keep filename.
 		return undefined;
 	}
 	return undefined;
+}
+
+/**
+ * Reads `<kbRoot>/.jolli/index.json` and projects it into two branch sets used
+ * by `listBranches`:
+ *  - `withHead`: branches that have at least one entry with
+ *    `parentCommitHash == null` — the v4 Hoist live-head invariant
+ *    ([HeadEntryFilter](../../../cli/src/core/HeadEntryFilter.ts) is the
+ *    canonical definition).
+ *  - `inIndex`:  branches that appear in any entry, head or hoisted child.
+ *
+ * Returns `null` when the index is missing or unparseable so the caller
+ * falls back to mapping-only output (fresh repo, pre-write, or transient
+ * corruption — none should cause the sidebar to silently hide branches).
+ */
+function readBranchIndexSummary(
+	indexPath: string,
+): { withHead: Set<string>; inIndex: Set<string> } | null {
+	if (!existsSync(indexPath)) return null;
+	let parsed: SummaryIndex;
+	try {
+		parsed = JSON.parse(readFileSync(indexPath, "utf-8")) as SummaryIndex;
+	} catch {
+		return null;
+	}
+	const withHead = new Set<string>();
+	const inIndex = new Set<string>();
+	for (const e of parsed.entries ?? []) {
+		inIndex.add(e.branch);
+		if (e.parentCommitHash == null) withHead.add(e.branch);
+	}
+	return { withHead, inIndex };
 }
 
 function stripQuotes(s: string): string {

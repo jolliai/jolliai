@@ -27,6 +27,7 @@
  */
 
 import { createLogger, errMsg } from "../Logger.js";
+import type { SummaryIndexEntry } from "../Types.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { getIndexEntryMap } from "./SummaryStore.js";
 
@@ -65,6 +66,24 @@ export async function cleanupBranchStaleChildMarkdown(
 			);
 		}
 	}
+
+	// Ghost-branch sweep: if the op was a cross-branch hoist (cherry-pick /
+	// rebase / amend across branches), the head landed on a different branch
+	// and `branch` now has only hoisted children in the index — we just deleted
+	// the last visible .md it had. Drop its `branches.json` mapping so the
+	// sidebar's Folders tab does not list an empty directory. The check
+	// requires the branch to appear in the index at all, so fresh-repo
+	// mappings registered before any commit landed are NOT pruned.
+	//
+	// Guard on `failed === 0`: a delete failure (EACCES / EBUSY on a
+	// user-edited or editor-locked .md) leaves the orphan file on disk while
+	// the index snapshot still reads "no heads". Pruning the mapping anyway
+	// would hide the branch from the sidebar but keep the orphan invisible-
+	// but-present — the next cleanup pass (when the lock clears) can prune.
+	if (failed === 0) {
+		await pruneIfGhostBranch(branch, map, storage);
+	}
+
 	return { deleted, failed };
 }
 
@@ -95,5 +114,72 @@ export async function cleanupAllBranchesStaleChildMarkdown(
 			);
 		}
 	}
+
+	// Ghost-branch sweep (whole-index variant): drop branches.json mappings
+	// for every branch that appears in the index but has zero head entries
+	// (`parentCommitHash == null`). Migration runs this once on activate, so
+	// pre-existing ghosts from a 0.99.x cross-branch hoist are cleaned up
+	// without the user having to issue a fresh amend on the affected branch.
+	await pruneAllGhostBranches(map, storage);
+
 	return { deleted, failed };
+}
+
+/**
+ * Drop `branch`'s `branches.json` mapping iff the index has at least one
+ * entry on it AND none of those entries is a head (`parentCommitHash == null`).
+ * No-op when the storage backend has no `pruneBranchMappings` (e.g. pure
+ * OrphanBranchStorage — no `branches.json` exists there).
+ *
+ * Failures are logged at WARN but never propagated: the cleanup tail step
+ * MUST NOT roll back the op that produced the hoist.
+ */
+async function pruneIfGhostBranch(
+	branch: string,
+	map: ReadonlyMap<string, SummaryIndexEntry>,
+	storage: StorageProvider,
+): Promise<void> {
+	if (!storage.pruneBranchMappings) return;
+	let hasEntry = false;
+	let hasHead = false;
+	for (const e of map.values()) {
+		if (e.branch !== branch) continue;
+		hasEntry = true;
+		if (e.parentCommitHash == null) {
+			hasHead = true;
+			break;
+		}
+	}
+	if (!hasEntry || hasHead) return;
+	try {
+		const pruned = await storage.pruneBranchMappings([branch]);
+		if (pruned > 0) {
+			log.info("Pruned ghost-branch mapping after hoist on %s", branch);
+		}
+	} catch (err) {
+		log.warn("pruneBranchMappings failed for %s: %s", branch, errMsg(err));
+	}
+}
+
+async function pruneAllGhostBranches(
+	map: ReadonlyMap<string, SummaryIndexEntry>,
+	storage: StorageProvider,
+): Promise<void> {
+	if (!storage.pruneBranchMappings) return;
+	const branchesInIndex = new Set<string>();
+	const branchesWithHead = new Set<string>();
+	for (const e of map.values()) {
+		branchesInIndex.add(e.branch);
+		if (e.parentCommitHash == null) branchesWithHead.add(e.branch);
+	}
+	const ghosts = [...branchesInIndex].filter((b) => !branchesWithHead.has(b));
+	if (ghosts.length === 0) return;
+	try {
+		const pruned = await storage.pruneBranchMappings(ghosts);
+		if (pruned > 0) {
+			log.info("Pruned %d ghost-branch mapping(s) across all branches", pruned);
+		}
+	} catch (err) {
+		log.warn("pruneBranchMappings failed during all-branches sweep: %s", errMsg(err));
+	}
 }

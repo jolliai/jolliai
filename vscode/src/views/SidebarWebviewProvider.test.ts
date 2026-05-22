@@ -996,10 +996,10 @@ describe("SidebarWebviewProvider", () => {
 
 	// Happy-path: a well-formed `branch:openConversation` reaches
 	// ConversationDetailsPanel.show with the workspace folder threaded through
-	// as `projectDir`. The onSessionHidden callback the host hands the panel
-	// must, when invoked, kick a re-pull of conversations so the now-hidden
-	// row disappears.
-	it("dispatches branch:openConversation to ConversationDetailsPanel.show with projectDir threaded and onSessionHidden re-pulls", () => {
+	// as `projectDir`. The onSessionChanged callback the host hands the panel
+	// must, when invoked, kick a re-pull of conversations so edited badges /
+	// counts and hidden-state removals show up immediately after save.
+	it("dispatches branch:openConversation to ConversationDetailsPanel.show with projectDir threaded and onSessionChanged re-pulls", () => {
 		showMock.mockReset();
 		mockWorkspaceFolders.length = 0;
 		mockWorkspaceFolders.push({ uri: { fsPath: "/abs/proj" } });
@@ -1037,7 +1037,7 @@ describe("SidebarWebviewProvider", () => {
 				transcriptPath: string;
 				title: string;
 				projectDir: string;
-				onSessionHidden: () => void;
+				onSessionChanged: () => void;
 			};
 			expect(call.sessionId).toBe("claude-sess-1");
 			expect(call.source).toBe("claude");
@@ -1049,13 +1049,14 @@ describe("SidebarWebviewProvider", () => {
 			// undefined; the mock pushes a folder so the happy branch runs.
 			expect(call.projectDir).toBe("/abs/proj");
 
-			// Invoking the captured onSessionHidden simulates the panel
-			// finishing a "Mark All as Deleted" save. The arrow is what
-			// re-pulls conversations so the now-hidden row disappears from
-			// the CONVERSATIONS list. Without this assertion the closure
-			// stays uncovered by v8 (the arrow counts as its own function).
+			// Invoking the captured onSessionChanged simulates the panel
+			// finishing a save. The arrow is what re-pulls conversations so
+			// the sidebar immediately reflects edited badges, counts, or a
+			// hidden row disappearing from the CONVERSATIONS list. Without
+			// this assertion the closure stays uncovered by v8 (the arrow
+			// counts as its own function).
 			listWithDiagnostics.mockClear();
-			call.onSessionHidden();
+			call.onSessionChanged();
 			expect(listWithDiagnostics).toHaveBeenCalled();
 		} finally {
 			mockWorkspaceFolders.length = 0;
@@ -2120,6 +2121,70 @@ describe("SidebarWebviewProvider", () => {
 		const view = makeMockView();
 		provider.resolveWebviewView(view as unknown as never);
 		expect(view.badge).toEqual({ value: 9, tooltip: "fresh" });
+	});
+
+	it("setBadge cycles through value:0 before clearing a previously-set badge", () => {
+		// WebviewView.badge's setter does not always repaint the activity-bar
+		// counter when assigned `undefined` after a non-undefined ViewBadge —
+		// observed as a stuck count (e.g. user reverts the only changed file:
+		// visibleCount 1 → 0 but the icon kept "1"). The fix is a value:0
+		// sentinel between the two states, which VS Code suppresses visually
+		// but is guaranteed to trigger the setter. This test instruments the
+		// mock view with a property accessor to capture every assignment so
+		// the workaround stays observable — `view.badge` alone only retains
+		// the final value.
+		const assignments: Array<typeof view._stored> = [];
+		const view = makeMockView() as MockWebviewView & {
+			_stored: { value: number; tooltip: string } | undefined;
+		};
+		view._stored = undefined;
+		Object.defineProperty(view, "badge", {
+			configurable: true,
+			get() {
+				return view._stored;
+			},
+			set(v: { value: number; tooltip: string } | undefined) {
+				view._stored = v;
+				assignments.push(v);
+			},
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		provider.setBadge({ value: 5, tooltip: "5 changed, 0 selected" });
+		provider.setBadge(undefined);
+		// resolve writes the cached (undefined) badge once, then setBadge({…})
+		// writes once, then the clearing call writes value:0 then undefined.
+		expect(assignments).toEqual([
+			undefined,
+			{ value: 5, tooltip: "5 changed, 0 selected" },
+			{ value: 0, tooltip: "" },
+			undefined,
+		]);
+	});
+
+	it("setBadge does not cycle when clearing an already-empty badge", () => {
+		// Avoid an unnecessary repaint when the badge is already unset — the
+		// value:0 sentinel is only needed to dislodge a stuck count.
+		const assignments: Array<typeof view._stored> = [];
+		const view = makeMockView() as MockWebviewView & {
+			_stored: { value: number; tooltip: string } | undefined;
+		};
+		view._stored = undefined;
+		Object.defineProperty(view, "badge", {
+			configurable: true,
+			get() {
+				return view._stored;
+			},
+			set(v: { value: number; tooltip: string } | undefined) {
+				view._stored = v;
+				assignments.push(v);
+			},
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		provider.setBadge(undefined);
+		provider.setBadge(undefined);
+		// resolve writes the cached (undefined) badge once; both setBadge
+		// calls then assign undefined directly without the sentinel cycle.
+		expect(assignments).toEqual([undefined, undefined, undefined]);
 	});
 
 	// ── Breadcrumb selection (selection:repos / selection:branches / selection:request) ──

@@ -40,7 +40,7 @@ function buildDescription(entry: SummaryIndexEntry): string {
 // Structured-fields variant used by the webview's custom hover popup. The
 // popup renders codicons and command links itself, so we only need to ship
 // the display-ready strings here.
-function buildHoverFields(
+export function buildHoverFields(
 	entry: SummaryIndexEntry,
 ): MemoryItemMessage["hover"] {
 	const stats: Array<string> = [];
@@ -240,10 +240,10 @@ export class MemoriesTreeProvider
 		// Fall back to the current workspace basename only when the entry came
 		// from a code path that didn't set repoName (orphan-only single-repo
 		// users, mostly).
-		const fallbackRepoName =
-			(this.store as unknown as { bridge: { cwd: string } }).bridge.cwd
-				.split(/[/\\]/)
-				.pop() ?? "";
+		const cwd = (this.store as unknown as { bridge: { cwd: string } }).bridge
+			.cwd;
+		const segments = cwd.split(/[/\\]/);
+		const fallbackRepoName = segments[segments.length - 1];
 		const items: MemoryItemMessage[] = snap.entries.map((e) => ({
 			id: `memory-${e.commitHash}`,
 			title: e.commitMessage,
