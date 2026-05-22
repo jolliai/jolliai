@@ -25,6 +25,7 @@ const {
 	mockReadTranscript,
 	mockBuildMultiSessionContext,
 	mockGenerateSummary,
+	mockGenerateSquashConsolidation,
 	mockGetHeadCommitInfo,
 	mockGetCurrentBranch,
 	mockGetDiffContent,
@@ -58,6 +59,7 @@ const {
 	mockReadTranscript: vi.fn(),
 	mockBuildMultiSessionContext: vi.fn(),
 	mockGenerateSummary: vi.fn(),
+	mockGenerateSquashConsolidation: vi.fn(),
 	mockGetHeadCommitInfo: vi.fn(),
 	mockGetCurrentBranch: vi.fn(),
 	mockGetDiffContent: vi.fn(),
@@ -193,9 +195,10 @@ vi.mock("../core/Summarizer.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/Summarizer.js")>();
 	return {
 		generateSummary: mockGenerateSummary,
-		// Mock LLM-touching squash consolidation; default null forces the
-		// caller into the (real) mechanicalConsolidate fallback.
-		generateSquashConsolidation: vi.fn().mockResolvedValue(null),
+		// Mock LLM-touching squash consolidation; default null (set in beforeEach)
+		// forces the caller into the (real) mechanicalConsolidate fallback. Exposed
+		// as a hoisted mock so tests can assert call counts per amend path.
+		generateSquashConsolidation: mockGenerateSquashConsolidation,
 		mechanicalConsolidate: actual.mechanicalConsolidate,
 		extractTicketIdFromMessage: actual.extractTicketIdFromMessage,
 		formatSourceCommitsForSquash: actual.formatSourceCommitsForSquash,
@@ -290,6 +293,9 @@ describe("PostCommitHook helpers", () => {
 			stats: { filesChanged: 1, insertions: 1, deletions: 0 },
 			topics: [{ title: "Topic", trigger: "Trigger", response: "Response", decisions: "Decision" }],
 		});
+		// Default to null so Full-path tests exercise the mechanicalConsolidate fallback,
+		// matching the previous inline-mock behavior. Individual tests can override.
+		mockGenerateSquashConsolidation.mockResolvedValue(null);
 		mockGetHeadCommitInfo.mockResolvedValue({
 			hash: "deadbeefcafebabe",
 			message: "Test commit",
@@ -951,7 +957,11 @@ describe("PostCommitHook helpers", () => {
 				0,
 			);
 
-			expect(mockStoreSummary).toHaveBeenCalledWith(
+			// Helper now passes (root, cwd, false, transcriptArtifact?) — match prefix only.
+			expect(mockStoreSummary.mock.calls.length).toBeGreaterThanOrEqual(1);
+			const [hoistedRoot, hoistedCwd] = mockStoreSummary.mock.calls[0];
+			expect(hoistedCwd).toBe("/repo");
+			expect(hoistedRoot).toEqual(
 				expect.objectContaining({
 					jolliDocId: 42,
 					jolliDocUrl: "https://jolli.app/articles/42",
@@ -959,7 +969,6 @@ describe("PostCommitHook helpers", () => {
 					plans: [expect.objectContaining({ slug: "plan-1" })],
 					e2eTestGuide: [expect.objectContaining({ title: "Scenario" })],
 				}),
-				"/repo",
 			);
 		});
 
@@ -991,9 +1000,9 @@ describe("PostCommitHook helpers", () => {
 			});
 			mockLoadAllSessions.mockResolvedValue([]);
 			mockLoadConfig.mockResolvedValue({});
-			// Short-circuit A fires when transcript is empty AND diff is small.
-			// To exercise the LLM path here we need a non-trivial delta (>10 lines).
-			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 50, deletions: 0 });
+			// Pre-LLM short-circuit fires when diff is small (≤ TRIVIAL_AMEND_DELTA_LINES = 50).
+			// To exercise the LLM path here we need a non-trivial delta (> 50 lines).
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
 			mockGetDiffContent.mockResolvedValue("diff");
 
 			await __test__.handleAmendPipeline(
@@ -1019,6 +1028,300 @@ describe("PostCommitHook helpers", () => {
 					e2eTestGuide: [expect.objectContaining({ title: "Scenario 2" })],
 				}),
 			);
+		});
+
+		// ── Two-tier amend dispatch coverage ──────────────────────────────────────
+		// These tests pin the LLM call count of each branch so a regression that
+		// silently demotes the pre-LLM / post-LLM short-circuit into the Full
+		// path (and burns LLM tokens on a trivial amend) is caught at test time.
+		// The 15/16-line boundary and the "transcript entries still short-circuits"
+		// case are both exercised.
+
+		const oldSummaryFixture = {
+			version: 4 as const,
+			commitHash: "oldhash",
+			commitMessage: "Old commit",
+			commitAuthor: "Test",
+			commitDate: "2026-02-18T00:00:00Z",
+			branch: "main",
+			generatedAt: "2026-02-18T00:00:00Z",
+			topics: [{ title: "Old topic", trigger: "T", response: "R", decisions: "D" }],
+			recap: "old recap",
+		};
+
+		it("Pre-LLM short-circuit (0 LLM): trivial delta with no sessions skips both LLM steps", async () => {
+			mockGetSummary.mockResolvedValue(oldSummaryFixture);
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 3 });
+			mockGetDiffContent.mockResolvedValue("diff");
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).not.toHaveBeenCalled();
+			expect(mockGenerateSquashConsolidation).not.toHaveBeenCalled();
+
+			expect(mockStoreSummary.mock.calls.length).toBeGreaterThanOrEqual(1);
+			const root = mockStoreSummary.mock.calls[0][0] as {
+				topics: ReadonlyArray<{ title: string }>;
+				recap?: string;
+				llm?: unknown;
+			};
+			expect(root.topics).toEqual([{ title: "Old topic", trigger: "T", response: "R", decisions: "D" }]);
+			expect(root.recap).toBe("old recap");
+			expect(root.llm).toBeUndefined();
+		});
+
+		it("Pre-LLM short-circuit boundary: exactly 50 insertions+deletions still short-circuits", async () => {
+			mockGetSummary.mockResolvedValue(oldSummaryFixture);
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 25, deletions: 25 });
+			mockGetDiffContent.mockResolvedValue("diff");
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).not.toHaveBeenCalled();
+			expect(mockGenerateSquashConsolidation).not.toHaveBeenCalled();
+		});
+
+		it("Pre-LLM escape: 51 insertions+deletions falls through to LLM pipeline", async () => {
+			mockGetSummary.mockResolvedValue(oldSummaryFixture);
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 26, deletions: 25 });
+			mockGetDiffContent.mockResolvedValue("diff");
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).toHaveBeenCalledTimes(1);
+		});
+
+		it("Pre-LLM short-circuit triggers even WITH transcript entries when delta ≤ 50 lines", async () => {
+			mockGetSummary.mockResolvedValue(oldSummaryFixture);
+			// 有 1 个 session 带 2 条 entries —— 旧逻辑会强制走 Full path，新逻辑应仍短路
+			mockLoadAllSessions.mockResolvedValue([
+				{
+					sessionId: "sess-1",
+					transcriptPath: "/tmp/s.jsonl",
+					source: "claude",
+					updatedAt: "2026-02-19T00:00:00Z",
+				},
+			]);
+			mockReadTranscript.mockResolvedValue({
+				entries: [
+					{ role: "human", content: "hi" },
+					{ role: "assistant", content: "hello" },
+				],
+				newCursor: { transcriptPath: "/tmp/s.jsonl", lineNumber: 2, updatedAt: "2026-02-19T00:00:00Z" },
+				totalLinesRead: 2,
+			});
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 3 });
+			mockGetDiffContent.mockResolvedValue("diff");
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).not.toHaveBeenCalled();
+			expect(mockGenerateSquashConsolidation).not.toHaveBeenCalled();
+
+			// 短路路径也必须把 transcript artifact 传给 storeSummary
+			expect(mockStoreSummary.mock.calls.length).toBeGreaterThanOrEqual(1);
+			const storeArgs = mockStoreSummary.mock.calls[0];
+			// Pin the force flag at position 2 — short-circuit must never overwrite
+			// existing summaries (that's a Full-pipeline force semantic, not amend).
+			expect(storeArgs[2]).toBe(false);
+			const artifacts = storeArgs[3] as { transcript?: { sessions: ReadonlyArray<unknown> } } | undefined;
+			expect(artifacts?.transcript).toBeDefined();
+			expect(artifacts?.transcript?.sessions.length).toBeGreaterThanOrEqual(1);
+		});
+
+		it("Post-LLM short-circuit (1 LLM): non-trivial delta with empty topics skips step 2", async () => {
+			mockGetSummary.mockResolvedValue(oldSummaryFixture);
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			// Step 1 returns no topics → triggers post-LLM short-circuit
+			mockGenerateSummary.mockResolvedValueOnce({
+				transcriptEntries: 0,
+				llm: { model: "test", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
+				stats: { filesChanged: 1, insertions: 100, deletions: 0 },
+				topics: [],
+			});
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).toHaveBeenCalledTimes(1);
+			expect(mockGenerateSquashConsolidation).not.toHaveBeenCalled();
+
+			expect(mockStoreSummary.mock.calls.length).toBeGreaterThanOrEqual(1);
+			const root = mockStoreSummary.mock.calls[0][0] as {
+				topics: ReadonlyArray<{ title: string }>;
+				recap?: string;
+				llm?: unknown;
+			};
+			expect(root.topics).toEqual([{ title: "Old topic", trigger: "T", response: "R", decisions: "D" }]);
+			expect(root.recap).toBe("old recap");
+			expect(root.llm).toBeUndefined();
+		});
+
+		it("No old summary + small diff + transcript entries: still writes fresh leaf with transcript artifact", async () => {
+			// Edge case: user amends a commit that was never summarised (e.g. pre-install
+			// commit, or summary not yet generated by the previous worker) AND has a small
+			// diff (≤50 lines) AND had an active AI conversation during the amend.
+			// The early return at "if (!oldSummary && ...)" must NOT fire when there are
+			// transcript entries — otherwise the conversation bytes are lost. The fix is
+			// to require `totalEntries === 0` in that early-return guard, so this case
+			// falls through to step1 LLM and the fresh-leaf branch (which writes the
+			// transcript artifact).
+			mockGetSummary.mockResolvedValue(null);
+			mockLoadAllSessions.mockResolvedValue([
+				{
+					sessionId: "sess-1",
+					transcriptPath: "/tmp/s.jsonl",
+					source: "claude",
+					updatedAt: "2026-02-19T00:00:00Z",
+				},
+			]);
+			mockReadTranscript.mockResolvedValue({
+				entries: [
+					{ role: "human", content: "explain this code" },
+					{ role: "assistant", content: "here's an explanation" },
+				],
+				newCursor: { transcriptPath: "/tmp/s.jsonl", lineNumber: 2, updatedAt: "2026-02-19T00:00:00Z" },
+				totalLinesRead: 2,
+			});
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 3 });
+			mockGetDiffContent.mockResolvedValue("diff");
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			// step1 LLM ran (fresh leaf path needs delta topics/recap)
+			expect(mockGenerateSummary).toHaveBeenCalledTimes(1);
+			// Fresh leaf was written WITH the transcript artifact — the conversation
+			// must not be silently dropped.
+			expect(mockStoreSummary.mock.calls.length).toBeGreaterThanOrEqual(1);
+			const storeArgs = mockStoreSummary.mock.calls[0];
+			const artifacts = storeArgs[3] as { transcript?: { sessions: ReadonlyArray<unknown> } } | undefined;
+			expect(artifacts?.transcript).toBeDefined();
+			expect(artifacts?.transcript?.sessions.length).toBeGreaterThanOrEqual(1);
+		});
+
+		it("No old summary + diff fetch failure: skips entirely, no LLM call, no garbage summary", async () => {
+			// Edge case: getDiffContent / getDiffStats throw (shallow clone where HEAD~1
+			// doesn't resolve, corrupted repo, etc.) AND there's no oldSummary to fall
+			// back on. The previous code would fall through to step1 LLM with the literal
+			// "(Could not compute diff)" string and persist a low-quality fresh leaf.
+			// Better: skip — we have no diff and no parent context, nothing useful to
+			// summarise. The conversation transcript is also not persisted in this case
+			// because there's nowhere meaningful to attach it.
+			mockGetSummary.mockResolvedValue(null);
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockGetDiffStats.mockRejectedValue(new Error("git diff failed"));
+			mockGetDiffContent.mockRejectedValue(new Error("git diff failed"));
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).not.toHaveBeenCalled();
+			expect(mockGenerateSquashConsolidation).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("Post-LLM short-circuit: step1 returns empty topics but non-empty recap → still skip step2", async () => {
+			mockGetSummary.mockResolvedValue(oldSummaryFixture);
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			// step1: topics 空 但 recap 非空 —— 旧逻辑进 Full path，新逻辑直接短路、丢弃 delta.recap
+			mockGenerateSummary.mockResolvedValueOnce({
+				transcriptEntries: 0,
+				llm: { model: "test", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
+				stats: { filesChanged: 1, insertions: 100, deletions: 0 },
+				topics: [],
+				recap: "delta 复述了 diff —— 应被丢弃",
+			});
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).toHaveBeenCalledTimes(1);
+			expect(mockGenerateSquashConsolidation).not.toHaveBeenCalled();
+
+			const root = mockStoreSummary.mock.calls[0][0] as {
+				topics: ReadonlyArray<{ title: string }>;
+				recap?: string;
+			};
+			// recap 应是 oldSummaryFixture.recap，不是 delta 的 recap
+			expect(root.recap).toBe("old recap");
+		});
+
+		it("Full path (2 LLM): non-trivial delta with substantive content runs step 1 + step 2", async () => {
+			mockGetSummary.mockResolvedValue(oldSummaryFixture);
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			// Step 1 default (from beforeEach) returns a topic → bypasses post-LLM short-circuit.
+			// Step 2 returns consolidated content with LLM metadata.
+			mockGenerateSquashConsolidation.mockResolvedValueOnce({
+				topics: [{ title: "Consolidated", trigger: "T", response: "R", decisions: "D" }],
+				recap: "consolidated recap",
+				llm: { model: "test", inputTokens: 10, outputTokens: 10, apiLatencyMs: 50, stopReason: "end_turn" },
+			});
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).toHaveBeenCalledTimes(1);
+			expect(mockGenerateSquashConsolidation).toHaveBeenCalledTimes(1);
+
+			expect(mockStoreSummary.mock.calls.length).toBeGreaterThanOrEqual(1);
+			const root = mockStoreSummary.mock.calls[0][0] as {
+				topics: ReadonlyArray<{ title: string }>;
+				recap?: string;
+				llm?: unknown;
+			};
+			expect(root.topics).toEqual([{ title: "Consolidated", trigger: "T", response: "R", decisions: "D" }]);
+			expect(root.recap).toBe("consolidated recap");
+			expect(root.llm).toBeDefined();
 		});
 	});
 
