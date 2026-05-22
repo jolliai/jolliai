@@ -135,6 +135,43 @@ function isRootEntry(e: SummaryIndexEntry): boolean {
 	return e.parentCommitHash == null;
 }
 
+/**
+ * Merges two index snapshots into a single base view used by `storeSummary`'s
+ * upcoming dual-write. Used when a write path has both a write-side index
+ * (e.g. orphan branch primary) and a read-side index (e.g. FolderStorage
+ * shadow) that may legitimately diverge — most commonly when peer-synced rows
+ * land in the folder before the orphan branch catches up. Write-side wins on
+ * collision (orphan is system-of-record) and contributes the `commitAliases`
+ * defaults; read-side-only entries and aliases are appended so the rebuilt
+ * index that gets persisted to both backends doesn't drop any rows that the
+ * user can currently see.
+ */
+function unionIndexes(writeIndex: SummaryIndex | null, readIndex: SummaryIndex | null): SummaryIndex | null {
+	if (!writeIndex && !readIndex) return null;
+	if (!readIndex) return writeIndex;
+	if (!writeIndex) return readIndex;
+	const merged = new Map<string, SummaryIndexEntry>();
+	for (const e of readIndex.entries) merged.set(e.commitHash, e);
+	for (const e of writeIndex.entries) merged.set(e.commitHash, e);
+	const aliases = { ...(readIndex.commitAliases ?? {}), ...(writeIndex.commitAliases ?? {}) };
+	return {
+		version: writeIndex.version,
+		entries: [...merged.values()],
+		...(Object.keys(aliases).length > 0 && { commitAliases: aliases }),
+	};
+}
+
+/** Catalog counterpart of {@link unionIndexes}; same write-wins semantics. */
+function unionCatalogs(writeCatalog: CommitCatalog | null, readCatalog: CommitCatalog | null): CommitCatalog | null {
+	if (!writeCatalog && !readCatalog) return null;
+	if (!readCatalog) return writeCatalog;
+	if (!writeCatalog) return readCatalog;
+	const merged = new Map<string, CatalogEntry>();
+	for (const e of readCatalog.entries) merged.set(e.commitHash, e);
+	for (const e of writeCatalog.entries) merged.set(e.commitHash, e);
+	return { version: writeCatalog.version, entries: [...merged.values()] };
+}
+
 // ─── Public write API ─────────────────────────────────────────────────────────
 
 /**
@@ -146,12 +183,24 @@ function isRootEntry(e: SummaryIndexEntry): boolean {
  * the old root entry naturally becomes a child entry when the new amended
  * summary is stored — no separate `removeFromIndex` call needed.
  *
- * @param summary   - The commit summary to store (root of the tree)
- * @param cwd       - Optional working directory (git repo root)
- * @param force     - When true, overwrites an existing summary for the same commit hash
- *                    instead of skipping (used by the manual `summarize` CLI command)
- * @param artifacts - Optional artifacts to store atomically alongside the summary
- *                    (e.g., transcript data saved as `transcripts/{commitHash}.json`)
+ * @param summary     - The commit summary to store (root of the tree)
+ * @param cwd         - Optional working directory (git repo root)
+ * @param force       - When true, overwrites an existing summary for the same commit hash
+ *                      instead of skipping (used by the manual `summarize` CLI command)
+ * @param artifacts   - Optional artifacts to store atomically alongside the summary
+ *                      (e.g., transcript data saved as `transcripts/{commitHash}.json`)
+ * @param storage     - Write storage. Drives the actual writeFiles call.
+ * @param readStorage - Optional secondary read storage whose index/catalog rows
+ *                      must be preserved in the upcoming dual-write. When passed
+ *                      and distinct from `storage`, the existing index/catalog
+ *                      base is union'd across both backends (write-side wins on
+ *                      collision since orphan is system-of-record) so rows that
+ *                      live only on the read side — e.g. peer-synced FolderStorage
+ *                      entries the orphan branch hasn't caught up to yet —
+ *                      survive the dual-write that follows. Without this, the
+ *                      newly built index would replace the shadow's index.json
+ *                      with one derived from primary-only rows and silently
+ *                      drop the read-only-side entries.
  */
 export async function storeSummary(
 	summary: CommitSummary,
@@ -162,12 +211,41 @@ export async function storeSummary(
 		readonly planProgress?: ReadonlyArray<PlanProgressArtifact>;
 	},
 	storage?: StorageProvider,
+	readStorage?: StorageProvider,
 ): Promise<void> {
 	await withRequiredOrphanWriteLock(cwd, "storeSummary", async () => {
-		const existingIndex = await loadIndex(cwd);
-		const existingCatalog = await loadCatalog(cwd);
+		const writeIndex = await loadIndex(cwd, storage);
+		const writeCatalog = await loadCatalog(cwd, storage);
+		// Union the read-side (folder shadow) snapshot into the base so
+		// peer-synced rows survive the dual-write rewrite. See
+		// `unionIndexes` for merge semantics; the matching payload-lift
+		// below uses `folderOnlyHashes` to keep the writeStorage backing
+		// files in sync with the rebuilt index.
+		const hasDistinctReadStorage = readStorage !== undefined && readStorage !== storage;
+		const readIndex = hasDistinctReadStorage ? await loadIndex(cwd, readStorage) : null;
+		const readCatalog = hasDistinctReadStorage ? await loadCatalog(cwd, readStorage) : null;
+		const existingIndex = hasDistinctReadStorage ? unionIndexes(writeIndex, readIndex) : writeIndex;
+		const existingCatalog = hasDistinctReadStorage ? unionCatalogs(writeCatalog, readCatalog) : writeCatalog;
 		const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
 		const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
+
+		// Hashes whose index row was contributed by readStorage but whose
+		// backing `summaries/<hash>.json` payload hasn't reached writeStorage
+		// yet. Without lifting these files into the same write batch, the
+		// orphan branch ends up with index entries that point at payloads
+		// only the folder side actually has — and every orphan-routed
+		// reader (`getSummary`/`readSummaryFile` via the active storage,
+		// `QueueWorker.loadSourceSummaries`, `SummaryExporter`) returns
+		// null on those rows. `DualWriteStorage.readFile` is primary-only,
+		// so even in dual-write mode we cannot lean on the folder for
+		// payload resolution at read time — orphan must be self-complete.
+		const folderOnlyHashes = new Set<string>();
+		if (hasDistinctReadStorage && readIndex) {
+			const writeHashes = new Set(writeIndex?.entries.map((e) => e.commitHash) ?? []);
+			for (const entry of readIndex.entries) {
+				if (!writeHashes.has(entry.commitHash)) folderOnlyHashes.add(entry.commitHash);
+			}
+		}
 
 		// Duplicate guard: skip if root already indexed and force=false
 		if (!force && entryMap.has(summary.commitHash)) {
@@ -212,6 +290,31 @@ export async function storeSummary(
 					path: `plan-progress/${progress.planSlug}.json`,
 					content: JSON.stringify(progress, null, "\t"),
 				});
+			}
+		}
+
+		// Backfill the payloads behind every folder-only index row so the
+		// orphan branch ends this commit with index → file integrity.
+		// Missing files (embedded squash children that never had their
+		// own `summaries/<hash>.json`) are silently skipped — leaving
+		// the index row alone is the right behavior there since the
+		// child resolves through its parent root's blob via
+		// `flattenSummaryTree` / `getSummary`'s prefix scan. The headline
+		// summary's own hash is skipped because its payload is already in
+		// the batch above (avoids a duplicate path inside one `writeFiles`).
+		if (folderOnlyHashes.size > 0 && readStorage) {
+			for (const hash of folderOnlyHashes) {
+				if (hash === summary.commitHash) continue;
+				const summaryPath = `summaries/${hash}.json`;
+				const transcriptPath = `transcripts/${hash}.json`;
+				const summaryPayload = await readStorage.readFile(summaryPath);
+				if (summaryPayload !== null) {
+					files.push({ path: summaryPath, content: summaryPayload });
+				}
+				const transcriptPayload = await readStorage.readFile(transcriptPath);
+				if (transcriptPayload !== null) {
+					files.push({ path: transcriptPath, content: transcriptPayload });
+				}
 			}
 		}
 
@@ -1347,16 +1450,16 @@ export async function getIndexEntryMap(
  *
  * Designed to run as a background fire-and-forget scan from `listBranchCommits`.
  *
- * @param storage      — write path. Determines where the alias gets
- *   persisted; callers in dual-write mode pass a `DualWriteStorage` so the
- *   alias lands on both backends.
- * @param readStorage  — optional read path for the preflight + lock-held
- *   re-load. When provided, candidate determination and freshness re-check
- *   read from this storage instead of `storage`. Used by the VS Code bridge
- *   to point the preflight at the FolderStorage shadow (which sees
- *   sync-pulled peer commits) while keeping alias writes flowing through
- *   `storage` (so orphan-branch readers still get the alias). Falls back to
- *   `storage` when omitted to preserve the original single-storage callers.
+ * @param storage      — write path. Drives the inside-lock re-read AND the
+ *   alias write, so the persisted blob's `entries` matches what's already on
+ *   the write storage's primary backend (no clobbering rows the read storage
+ *   lacks).
+ * @param readStorage  — optional candidate-discovery storage. When the
+ *   caller's write storage doesn't see the same rows as its read storage
+ *   (e.g. a FolderStorage shadow has rows the orphan-branch primary doesn't,
+ *   or vice versa), pass the read side here so preflight candidate
+ *   computation reflects what the UI is showing. Defaults to `storage` when
+ *   omitted (single-storage callers behave identically to before).
  *
  * @returns `true` if any new aliases were written, `false` otherwise
  */
@@ -1420,13 +1523,46 @@ export async function scanTreeHashAliases(
 		return false;
 	}
 	try {
-		// Re-load via the SAME source as the preflight so the candidate
-		// freshness check sees the same dataset. If the bridge passed a
-		// FolderStorage read-side, post-sync rows that arrived since
-		// preflight (rare; e.g. a sync round finishing mid-scan) are
-		// still observable here, keeping the candidate filter coherent.
-		const freshIndex = await loadIndex(cwd, effectiveReadStorage);
+		// Re-anchor the inside-lock re-read on the WRITE storage, not the
+		// read side. The `newIndex` blob below carries `freshIndex.entries`
+		// verbatim and gets persisted via dual-write to BOTH backends — so
+		// the entries array we write must already match what the write
+		// storage's primary holds. Using the read side here would let the
+		// write payload's entries diverge from the primary (e.g. when the
+		// read storage is a FolderStorage shadow that lacks rows the
+		// primary still has), and the dual-write would then clobber those
+		// rows on the primary. Candidate freshness for `freshAliases` and
+		// `freshEntryHashSet` is intentionally a write-storage check.
+		const freshIndex = await loadIndex(cwd, storage);
 		if (!freshIndex || freshIndex.version !== 3) return false;
+
+		// Symmetric protection: anchoring on writeStorage protects the
+		// primary's rows, but the same dual-write that lands the alias
+		// also overwrites the shadow's index.json with freshIndex.entries.
+		// If the read storage (typically the FolderStorage shadow) holds
+		// rows the write storage doesn't (e.g. cross-machine cloud sync
+		// landed rows in the folder before the orphan branch caught up),
+		// that write deletes them on the shadow. Defer the alias scan in
+		// that case — aliases are a cross-branch tree-hash optimization,
+		// not load-bearing, and the next refresh retries once both sides
+		// reconcile (heal, push/pull of orphan, etc.).
+		if (effectiveReadStorage !== storage) {
+			const readSideIndex = await loadIndex(cwd, effectiveReadStorage);
+			if (readSideIndex && readSideIndex.version === 3) {
+				const writeHashes = new Set(freshIndex.entries.map((e) => e.commitHash));
+				const readOnlyCount = readSideIndex.entries.reduce(
+					(n, e) => (writeHashes.has(e.commitHash) ? n : n + 1),
+					0,
+				);
+				if (readOnlyCount > 0) {
+					log.warn(
+						"scanTreeHashAliases: read side has %d row(s) write side lacks — deferring alias write to avoid shadow clobber",
+						readOnlyCount,
+					);
+					return false;
+				}
+			}
+		}
 
 		const freshAliases = freshIndex.commitAliases ?? {};
 		const freshEntryHashSet = new Set(freshIndex.entries.map((e) => e.commitHash));

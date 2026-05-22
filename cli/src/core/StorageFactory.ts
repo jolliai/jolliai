@@ -54,7 +54,14 @@ export async function createStorage(projectPath: string, cwd?: string): Promise<
 	}
 }
 
-function createFolderStorage(projectPath: string, customKBPath?: string): FolderStorage {
+/**
+ * Builds a FolderStorage rooted at `<localFolder>/<repoName>/` for the given
+ * project. Single source of truth for the kbRoot derivation so `createStorage`
+ * (write path) and any caller that needs a read-only FolderStorage instance
+ * (e.g. the VS Code bridge's `getReadStorage`) stay in lockstep — picking the
+ * same `extractRepoName` / `getRemoteUrl` / `resolveKBPath` chain.
+ */
+export function createFolderStorage(projectPath: string, customKBPath?: string): FolderStorage {
 	const repoName = extractRepoName(projectPath);
 	const remoteUrl = getRemoteUrl(projectPath);
 	const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);

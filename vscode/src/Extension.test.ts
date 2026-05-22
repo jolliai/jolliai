@@ -268,6 +268,7 @@ const {
 		invalidateEntriesCache: vi.fn(),
 		getCurrentBranch: vi.fn().mockResolvedValue("main"),
 		reloadStorage: vi.fn(),
+		reloadReadStorage: vi.fn(),
 		// Bridge wrappers added when storage threading replaced direct
 		// SummaryStore calls in `migrateIndexIfNeeded`. Delegate to the
 		// hoisted SummaryStore mocks so existing assertions on
@@ -1599,6 +1600,47 @@ describe("Extension", () => {
 			expect(
 				mockMigrationEngineInstance.runStaleChildCleanup,
 			).not.toHaveBeenCalled();
+		});
+
+		it("busts bridge read-storage cache after runMigration completes", async () => {
+			// Without this, the C2 fallback inside createReadStorage (which
+			// returns OrphanBranchStorage when the folder lacks index.json)
+			// can be cached BEFORE migration finishes. The cache survives
+			// migration completion and the session stays stuck on orphan
+			// reads — any folder-only (e.g. cross-machine cloud-synced)
+			// rows stay invisible until window reload.
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMetadataManagerInstance.readMigrationState.mockReturnValue(null);
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(mockMigrationEngineInstance.runMigration).toHaveBeenCalledTimes(
+					1,
+				);
+			});
+			expect(mockBridge.reloadStorage).toHaveBeenCalled();
+		});
+
+		it("busts bridge read-storage cache after runStaleChildCleanup completes", async () => {
+			// Symmetric pin for the staleChildCleanup branch. Cleanup
+			// mutates the folder's index.json; any bridge cache that
+			// snapshotted pre-cleanup state would keep serving stale rows.
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
+				status: "completed",
+				totalEntries: 5,
+				migratedEntries: 5,
+			});
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(
+					mockMigrationEngineInstance.runStaleChildCleanup,
+				).toHaveBeenCalledTimes(1);
+			});
+			expect(mockBridge.reloadStorage).toHaveBeenCalled();
 		});
 	});
 
@@ -3060,11 +3102,17 @@ describe("Extension", () => {
 		// ── refreshMemories command ─────────────────────────────────────────
 
 		describe("refreshMemories", () => {
-			it("calls memoriesProvider.refresh", () => {
+			it("calls memoriesProvider.refresh and re-probes both caches so peer-synced folder rows surface", () => {
 				const handler = getRegisteredCommand("jollimemory.refreshMemories");
 				handler();
 
 				expect(mockMemoriesStore.refresh).toHaveBeenCalled();
+				// Both bridge caches must be dropped: the aggregated entries
+				// cache so cross-repo discovery re-runs, and the read-storage
+				// cache so the dual-write folder-empty fallback gets re-probed
+				// after iCloud (or similar) repopulates the folder.
+				expect(mockBridge.invalidateEntriesCache).toHaveBeenCalled();
+				expect(mockBridge.reloadReadStorage).toHaveBeenCalled();
 			});
 		});
 

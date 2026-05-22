@@ -24,11 +24,22 @@ const {
 	MockMetadataManager,
 	mockIsUserEditedOnDisk,
 	mockFindByPath,
+	mockFolderReadFile,
+	mockFolderIsDirty,
 } = vi.hoisted(() => {
 	const isUserEditedOnDisk = vi.fn();
 	const findByPath = vi.fn();
+	// Shared across every MockFolderStorage instance so a single test
+	// override (`mockFolderReadFile.mockResolvedValueOnce(null)` /
+	// `mockFolderIsDirty.mockReturnValueOnce(true)`) flips the C2
+	// folder-empty fallback or the shadow-dirty fallback for all
+	// instances created during that test.
+	const mockFolderReadFile = vi.fn();
+	const mockFolderIsDirty = vi.fn().mockReturnValue(false);
 	return {
 		MockFolderStorage: class {
+			readonly readFile = mockFolderReadFile;
+			readonly isDirty = mockFolderIsDirty;
 			constructor(
 				public readonly rootPath: string,
 				public readonly mm: unknown,
@@ -48,6 +59,8 @@ const {
 		},
 		mockIsUserEditedOnDisk: isUserEditedOnDisk,
 		mockFindByPath: findByPath,
+		mockFolderReadFile,
+		mockFolderIsDirty,
 	};
 });
 
@@ -94,6 +107,11 @@ const {
 	storeNotes: vi.fn(),
 	storePlans: vi.fn(),
 	storeSummary: vi.fn(),
+}));
+
+const { loadRegenerateContext, regenerateSummary } = vi.hoisted(() => ({
+	loadRegenerateContext: vi.fn(),
+	regenerateSummary: vi.fn(),
 }));
 
 const { getDiffStats } = vi.hoisted(() => ({
@@ -245,6 +263,14 @@ vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 	storeNotes,
 	storePlans,
 	storeSummary,
+}));
+
+vi.mock("../../cli/src/core/RegenerateContext.js", () => ({
+	loadRegenerateContext,
+}));
+
+vi.mock("../../cli/src/core/Regenerator.js", () => ({
+	regenerateSummary,
 }));
 
 vi.mock("../../cli/src/core/GitOps.js", () => ({
@@ -445,6 +471,14 @@ describe("JolliMemoryBridge", () => {
 		mkdir.mockResolvedValue(undefined);
 		writeFile.mockResolvedValue(undefined);
 		scanTreeHashAliases.mockResolvedValue(false);
+		// Default: folder has an index — every test that doesn't care
+		// about the C2 fallback gets a non-null result and createReadStorage
+		// returns FolderStorage. Tests pinning the fallback override with
+		// `mockFolderReadFile.mockResolvedValueOnce(null)`.
+		mockFolderReadFile.mockResolvedValue("{}");
+		// Default: folder shadow is clean. Tests pinning the shadow-dirty
+		// fallback override with `mockFolderIsDirty.mockReturnValueOnce(true)`.
+		mockFolderIsDirty.mockReturnValue(false);
 	});
 
 	// ── Constructor ──────────────────────────────────────────────────────
@@ -2195,6 +2229,60 @@ describe("JolliMemoryBridge", () => {
 
 	// ── listSummaries / getSummary ───────────────────────────────────────
 
+	describe("createReadStorage (mode selection)", () => {
+		// The bridge's read-storage selector picks FolderStorage in
+		// dual-write mode only when the folder is BOTH initialized
+		// (index.json exists) AND clean (`shadow-status.json` absent).
+		// `DualWriteStorage.writeFiles` marks the folder dirty on any
+		// shadow write failure, so a dirty marker indicates the folder
+		// view is stale relative to the orphan branch. Falling back to
+		// orphan in that state mirrors the existing folder-empty fallback
+		// (C2 in {@link createReadStorage}'s doc): trust orphan whenever
+		// the folder isn't a complete, current picture.
+
+		it("returns FolderStorage when folder has index AND is clean (baseline)", async () => {
+			listSummaries.mockResolvedValue([]);
+			const bridge = makeBridge();
+
+			await bridge.listSummaries(10);
+
+			expect(listSummaries).toHaveBeenCalledTimes(1);
+			const storageArg = listSummaries.mock.calls[0][2];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("falls back to OrphanBranchStorage when folder is dirty (shadow write failed)", async () => {
+			// Without this fallback the bridge would still hand FolderStorage
+			// to getSummary / listSummaries / regenerate context after a
+			// shadow write failure — surfacing stale or missing memories
+			// while the orphan branch holds the fresh authoritative copy.
+			mockFolderIsDirty.mockReturnValue(true);
+			listSummaries.mockResolvedValue([]);
+			const bridge = makeBridge();
+
+			await bridge.listSummaries(10);
+
+			const storageArg = listSummaries.mock.calls[0][2];
+			expect(storageArg).not.toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("still falls back to orphan when folder lacks index, regardless of dirty marker", async () => {
+			// The two fallback signals are independent and either is
+			// sufficient. Lock the C2 (no-index) path's existing behavior
+			// in place so future refactors that move the isDirty check
+			// don't accidentally make the no-index path depend on cleanliness.
+			mockFolderReadFile.mockResolvedValueOnce(null);
+			mockFolderIsDirty.mockReturnValue(false);
+			listSummaries.mockResolvedValue([]);
+			const bridge = makeBridge();
+
+			await bridge.listSummaries(10);
+
+			const storageArg = listSummaries.mock.calls[0][2];
+			expect(storageArg).not.toBeInstanceOf(MockFolderStorage);
+		});
+	});
+
 	describe("listSummaries()", () => {
 		it("fetches summary list entries then loads full summaries", async () => {
 			listSummaries.mockResolvedValue([
@@ -3002,7 +3090,13 @@ describe("JolliMemoryBridge", () => {
 	});
 
 	describe("storeSummary()", () => {
-		it("forwards the Bridge's storage to SummaryStore.storeSummary", async () => {
+		it("forwards the Bridge's storage to SummaryStore.storeSummary and threads a FolderStorage readStorage in dual-write mode", async () => {
+			// readStorage is the load-bearing protection against folder-only
+			// peer-synced rows being silently dropped: SummaryStore.storeSummary
+			// uses it to union the existing index/catalog base across both
+			// backends before the dual-write rewrites them. Mock the call to
+			// land both arguments so a regression that drops the 6th param
+			// (or aliases it to the write storage) surfaces here.
 			storeSummary.mockResolvedValue(undefined);
 			const bridge = makeBridge();
 			const summary = {
@@ -3022,7 +3116,72 @@ describe("JolliMemoryBridge", () => {
 				true,
 				undefined,
 				storageShape,
+				expect.any(MockFolderStorage),
 			);
+		});
+
+		it("does not pass a FolderStorage readStorage in orphan-only mode", async () => {
+			// Orphan-only users have no folder shadow to protect — readStorage
+			// must be an OrphanBranchStorage (not a FolderStorage) so the union
+			// path inside SummaryStore.storeSummary is a no-op against the same
+			// backend. Pinning this protects the legacy mode from accidentally
+			// reading the (empty) folder layout.
+			loadConfig.mockResolvedValue({ storageMode: "orphan" });
+			storeSummary.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			await bridge.storeSummary({ commitHash: "abc1" } as never, true);
+
+			const lastCall = storeSummary.mock.calls.at(-1);
+			expect(lastCall?.[5]).toBeDefined();
+			expect(lastCall?.[5]).not.toBeInstanceOf(MockFolderStorage);
+		});
+	});
+
+	describe("regenerate methods route through read storage", () => {
+		it("loadRegenerateContext hands a FolderStorage to RegenerateContext.loadRegenerateContext in dual-write mode", async () => {
+			// `loadRegenerateContext` aggregates transcript / plan / note /
+			// linear-issue counts that drive the confirm dialog. In dual-write
+			// mode it must read via the folder shadow so that peer-synced
+			// artifacts (e.g. transcripts persisted on another machine) surface
+			// in the dialog. The previous wiring used `getStorage()` which is
+			// a `DualWriteStorage` whose `readFile` is pinned to the orphan
+			// primary, masking those rows.
+			loadRegenerateContext.mockResolvedValue({
+				entryCount: 0,
+				sessionCount: 0,
+				sources: [],
+				humanTurns: 0,
+				plansCount: 0,
+				notesCount: 0,
+				linearCount: 0,
+			});
+			const bridge = makeBridge();
+
+			await bridge.loadRegenerateContext({ commitHash: "abc" } as never);
+
+			expect(loadRegenerateContext).toHaveBeenCalledTimes(1);
+			const [, , storageArg] = loadRegenerateContext.mock.calls[0];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("regenerateSummary hands a FolderStorage to Regenerator.regenerateSummary in dual-write mode", async () => {
+			// Same rationale as `loadRegenerateContext`: the LLM input needs
+			// transcripts/plans/notes/linear archives from the folder shadow
+			// when those rows haven't reached the orphan branch yet — pulling
+			// them via `getStorage()` (DualWriteStorage → primary) would feed
+			// the LLM an empty or stale conversation.
+			regenerateSummary.mockResolvedValue({ updated: {}, result: {} });
+			const bridge = makeBridge();
+
+			await bridge.regenerateSummary(
+				{ commitHash: "abc" } as never,
+				{} as never,
+			);
+
+			expect(regenerateSummary).toHaveBeenCalledTimes(1);
+			const [, , , storageArg] = regenerateSummary.mock.calls[0];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
 		});
 	});
 
@@ -3604,9 +3763,9 @@ describe("JolliMemoryBridge", () => {
 
 			// Wait for the fire-and-forget promise to resolve
 			await vi.waitFor(() => {
-				// (hashes, cwd, writeStorage, readStorage). The 4-arg shape
-				// is the contract for sync-aware reads — see the dedicated
-				// regression block at the bottom of this file for the why.
+				// (hashes, cwd, writeStorage, readStorage). 4-arg shape:
+				// preflight reads via readStorage, lock-held re-read + alias
+				// write use writeStorage. See JolliMemoryBridge.readStoragePromise.
 				expect(scanTreeHashAliases).toHaveBeenCalledWith(
 					["commitHash1"],
 					TEST_CWD,
@@ -4989,23 +5148,23 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
-	// ── Current-repo read path (sync-pulled visibility regression) ──────────
+	// ── Current-repo read path (workspace-repo storage routing) ────────────
 	//
-	// Pre-fix: every read for the workspace repo (Memories, Timeline,
-	// branch-memories, single-summary, branch-history index lookup) went
-	// through `getStorage()` → `DualWriteStorage` → `primary` =
-	// `OrphanBranchStorage`. Memory Bank sync writes peer commits only to
-	// `<localFolder>/<repo>/.jolli/` (the FolderStorage shadow), so the
-	// orphan branch on the workspace repo never sees them; the Memories /
-	// Timeline panel showed empty while the Memory Bank tree (walks the
-	// folder) and other (foreign) repos (already use FolderStorage in
-	// step 2 of listSummaryEntries) both showed the new data.
+	// Invariant: for `dual-write` (default) and `folder` storageMode, every
+	// workspace-repo READ (Memories, Timeline, branch-memories, single-
+	// summary, branch-history index lookup) flows through a FolderStorage
+	// rooted at `<localFolder>/<repo>/`. Reading via `DualWriteStorage`
+	// would silently miss any row written to the folder by anything other
+	// than this device's local commits (Memory Bank sync, external
+	// migration, sibling IDE on the same folder) because its `readFile`
+	// is pinned to the orphan-branch primary.
 	//
-	// Fix contract pinned by these tests: for `dual-write` (default) and
-	// `folder` storageMode, the workspace-repo READ surface is a
-	// FolderStorage rooted at the same `<localFolder>/<repo>/` that the
-	// Memory Bank tree walks. For `orphan` mode (no folder data exists)
-	// the legacy path is preserved.
+	// For `orphan` mode (no folder data on disk) reads stay on the orphan
+	// branch — same path as 0.98 and earlier.
+	//
+	// For `dual-write` mode when folder has no index yet (fresh install
+	// before migration, or folder wiped), reads fall back to orphan so
+	// the panel keeps showing data instead of "no memories yet".
 	describe("current-repo reads use FolderStorage (sync-visibility regression)", () => {
 		it("listSummaryEntries hands a FolderStorage to getIndexEntryMap in dual-write mode (default)", async () => {
 			getIndexEntryMap.mockResolvedValue(new Map());
@@ -5171,26 +5330,126 @@ describe("JolliMemoryBridge", () => {
 			expect(readStorageArg).toBeInstanceOf(MockFolderStorage);
 		});
 
-		it("falls back to the write storage when loadConfig throws (defensive catch)", async () => {
-			// Config corruption / FS error / EACCES on the global config
-			// file: createReadStorage cannot pick a mode, so it routes
-			// through getStorage() rather than crash the panel. The bridge
-			// stays functional — reads just lose the sync-visibility
-			// benefit until the next reload that succeeds.
-			loadConfig.mockRejectedValueOnce(new Error("EACCES: config locked"));
+		it("falls back to OrphanBranchStorage in dual-write mode when folder lacks an index", async () => {
+			// Folder has no index.json on disk: fresh install before
+			// migration ran, or the user wiped the Memory Bank folder.
+			// Routing reads through FolderStorage would render "no
+			// memories" while the orphan branch still holds the user's
+			// data. The fallback keeps the panel showing real data.
+			mockFolderReadFile.mockResolvedValueOnce(null);
 			getIndexEntryMap.mockResolvedValue(new Map());
 			const bridge = makeBridge();
 
 			await bridge.listSummaryEntries(10);
 
 			const [, storageArg] = getIndexEntryMap.mock.calls[0];
-			// Fallback hits the dual-write composite (write storage), not
-			// a fresh FolderStorage. The negative assertion captures the
-			// contract without naming the exact composite class.
 			expect(storageArg).not.toBeInstanceOf(MockFolderStorage);
 		});
 
-		it("reloadStorage() clears the read-storage cache (next read re-resolves under new config)", async () => {
+		it("listSummaries hands a FolderStorage to SummaryStore.listSummaries in dual-write mode", async () => {
+			listSummaries.mockResolvedValue([]);
+			const bridge = makeBridge();
+
+			await bridge.listSummaries(10);
+
+			const [, , storageArg] = listSummaries.mock.calls[0];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("listBranchMemories hands a FolderStorage to getIndexEntryMap for the current repo", async () => {
+			getIndexEntryMap.mockResolvedValue(new Map());
+			const bridge = makeBridge();
+
+			await bridge.listBranchMemories("test-repo", "main");
+
+			const [, storageArg] = getIndexEntryMap.mock.calls[0];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("generateSquashMessageWithLLM reads summaries via FolderStorage in dual-write mode", async () => {
+			// git log for hash1
+			mockExecFileSuccess("fix: x\n");
+			getSummary.mockResolvedValueOnce({ topics: [] });
+			// rev-list --count
+			mockExecFileSuccess("1\n");
+			generateSquashMessage.mockResolvedValue("squashed");
+			const bridge = makeBridge();
+
+			await bridge.generateSquashMessageWithLLM(["hash1"]);
+
+			// Without folder-routed reads, a row only present in the folder
+			// (e.g. peer-synced) would surface here as `null` from getSummary
+			// and silently lose its topics in the merged prompt.
+			const [, , storageArg] = getSummary.mock.calls[0];
+			expect(storageArg).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("createReadStorage defaults unknown storageMode values to OrphanBranchStorage (matches StorageFactory)", async () => {
+			// A config typo or future-mode value (e.g. `duallwrite`) used to
+			// land write on orphan (StorageFactory.default) but read on folder
+			// (createReadStorage's `if mode==="orphan"` else folder). That
+			// asymmetry made the panel show "no memories" while the orphan
+			// branch silently received writes — a baffling failure mode. The
+			// switch now matches StorageFactory's default → orphan, so both
+			// sides agree on unknown modes.
+			loadConfig.mockResolvedValue({ storageMode: "duallwrite-typo" });
+			getIndexEntryMap.mockResolvedValue(new Map());
+			const bridge = makeBridge();
+
+			await bridge.listSummaryEntries(10);
+
+			const [, storageArg] = getIndexEntryMap.mock.calls[0];
+			expect(storageArg).not.toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("reloadReadStorage() re-probes the dual-write folder-empty fallback so peer-synced rows become visible after refresh", async () => {
+			// First read finds the folder empty (e.g. fresh install before
+			// migration completed) and caches an OrphanBranchStorage fallback.
+			// The user then triggers a peer sync that populates the folder,
+			// and clicks the Memories refresh action — which calls both
+			// `invalidateEntriesCache()` and `reloadReadStorage()`. The next
+			// read must re-probe and switch to FolderStorage instead of
+			// serving the cached fallback forever. The pairing mirrors
+			// Extension.ts's `jollimemory.refreshMemories` handler.
+			mockFolderReadFile.mockResolvedValueOnce(null);
+			getIndexEntryMap.mockResolvedValue(new Map());
+			const bridge = makeBridge();
+
+			await bridge.listSummaryEntries(10);
+			const [, firstStorageArg] = getIndexEntryMap.mock.calls[0];
+			expect(firstStorageArg).not.toBeInstanceOf(MockFolderStorage);
+
+			// Peer sync drops index.json into the folder; refresh button drops
+			// both the aggregated entries cache and the readStorage cache so
+			// the next read re-probes the fallback decision.
+			mockFolderReadFile.mockResolvedValue('{"version":3,"entries":[]}');
+			bridge.invalidateEntriesCache();
+			bridge.reloadReadStorage();
+
+			await bridge.listSummaryEntries(10);
+			const lastCall = getIndexEntryMap.mock.calls.at(-1);
+			expect(lastCall?.[1]).toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("reloadReadStorage() keeps the write-storage cache hot (only readStorage is dropped)", async () => {
+			// Refresh button should not churn the write-storage pipeline — only
+			// the read-storage cache. Verifies the asymmetry between
+			// `reloadStorage()` (drops both) and `reloadReadStorage()` (drops
+			// only the read side) so a future bug that conflates them surfaces.
+			storeSummary.mockResolvedValue(undefined);
+			const bridge = makeBridge();
+
+			await bridge.storeSummary({ commitHash: "a" } as never, true);
+			const firstWriteStorage = storeSummary.mock.calls[0][4];
+
+			bridge.reloadReadStorage();
+
+			await bridge.storeSummary({ commitHash: "b" } as never, true);
+			const secondWriteStorage = storeSummary.mock.calls[1][4];
+			expect(secondWriteStorage).toBe(firstWriteStorage);
+		});
+
+		it("reloadStorage() alone clears the entries cache so the next read re-resolves storage", async () => {
 			// First read under dual-write picks FolderStorage.
 			getIndexEntryMap.mockResolvedValue(new Map());
 			const bridge = makeBridge();
@@ -5198,19 +5457,45 @@ describe("JolliMemoryBridge", () => {
 			const [, firstStorageArg] = getIndexEntryMap.mock.calls[0];
 			expect(firstStorageArg).toBeInstanceOf(MockFolderStorage);
 
-			// Settings flips storageMode to orphan and calls reloadStorage().
+			// Settings flips storageMode to orphan and calls reloadStorage()
+			// only — NO manual invalidateEntriesCache(). That call alone
+			// must be enough to make the next read re-resolve, otherwise
+			// the entries-cache short-circuit silently keeps the old data
+			// alive after a mode flip.
 			loadConfig.mockResolvedValue({ storageMode: "orphan" });
 			bridge.reloadStorage();
-			bridge.invalidateEntriesCache();
 
 			await bridge.listSummaryEntries(10);
 			const [, secondStorageArg] =
 				getIndexEntryMap.mock.calls[getIndexEntryMap.mock.calls.length - 1];
-			// Without clearing the read-storage cache, the orphan-mode flip
-			// would silently stay on FolderStorage until window reload —
-			// exactly the kind of stale-state surprise reloadStorage exists
-			// to prevent for its write counterpart.
 			expect(secondStorageArg).not.toBeInstanceOf(MockFolderStorage);
+		});
+
+		it("rejected createReadStorage promise resets so the next read retries", async () => {
+			// loadConfig itself never rejects in production (SessionTracker
+			// swallows internally) — but the cache-reset guarantee matters
+			// for any future helper that can throw mid-init (e.g. a
+			// migration probe). Pin it now via a transient loadConfig
+			// rejection so a regression in `.catch(() => { ... = null })`
+			// would surface here as "second call also fails".
+			//
+			// Routed through getSummary (no internal catch) so the rejection
+			// surfaces; listSummaryEntries swallows step-1 errors and would
+			// mask whatever the cache state was.
+			loadConfig.mockRejectedValueOnce(new Error("transient"));
+			getSummary.mockResolvedValue({ commitHash: "abc", topics: [] });
+			const bridge = makeBridge();
+
+			await expect(bridge.getSummary("abc")).rejects.toThrow("transient");
+
+			// Without the cache reset, this second call would await the
+			// cached rejected promise and throw "transient" again — the
+			// user would be permanently stuck on the transient error until
+			// reloadStorage().
+			await expect(bridge.getSummary("abc")).resolves.toEqual({
+				commitHash: "abc",
+				topics: [],
+			});
 		});
 	});
 });
