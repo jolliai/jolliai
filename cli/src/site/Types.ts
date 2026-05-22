@@ -89,6 +89,14 @@ export type SidebarItemValue =
 			 * icon field.
 			 */
 			icon?: string;
+			/**
+			 * Nextra v4 theme overrides for this sidebar entry. The only field
+			 * we currently emit is `collapsed`, used to honor `expanded: true` /
+			 * `expanded: false` on a navigation article so its folder defaults
+			 * to the customer-specified state instead of Nextra's per-level
+			 * collapse default.
+			 */
+			theme?: { collapsed?: boolean };
 	  };
 
 /**

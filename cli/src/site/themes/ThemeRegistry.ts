@@ -17,6 +17,7 @@
  */
 
 import { existsSync, statSync } from "node:fs";
+import { stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -171,14 +172,25 @@ export async function discoverPack(
 	}
 
 	// 7) GitHub registry: github.com/jolliai/themes/<name>/
+	//
+	// On any failure here (network unreachable, theme not in repo, …) the
+	// cached copy under ~/.jolli/themes/<name>/ would have been picked up by
+	// step 4 above. So if we got here, neither GitHub nor the cache had the
+	// theme — log a clear error and let the caller (`generateLayout`) fall
+	// back to the vanilla Nextra layout.
 	try {
 		const { downloadTheme } = await import("../../commands/ThemeCommand.js");
 		console.log(`  Downloading theme "${name}" from GitHub...`);
 		const destDir = await downloadTheme(name);
 		console.log(`  ✓ Theme "${name}" installed to ${destDir}`);
 		return loadFromPath(destDir);
-	} catch {
-		// not found on GitHub
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		console.error(
+			`  Error: Could not load theme "${name}" — ${detail}.\n` +
+				`         No cached copy at ${join(USER_THEMES_DIR, name)} either. ` +
+				`Falling back to the default Nextra layout.`,
+		);
 	}
 
 	return undefined;
@@ -187,13 +199,57 @@ export async function discoverPack(
 // ─── Cache version check ────────────────────────────────────────────────
 
 /**
+ * How long a cached theme is considered "fresh" before we re-check the
+ * registry. 24 h is enough to pick up a published theme update within a day
+ * while reducing GitHub traffic from "every build" to "once per day per
+ * machine per theme".
+ */
+const VERSION_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Sentinel file whose mtime records the last successful version-check attempt. */
+const LAST_CHECKED_FILE = ".last-checked";
+
+/**
+ * Returns `true` when the cached theme has never been version-checked or the
+ * last check was longer ago than the TTL. Missing / unreadable sentinel
+ * counts as "never checked" so a fresh install always probes once.
+ */
+async function isVersionCheckDue(cachedPath: string): Promise<boolean> {
+	try {
+		const info = await stat(join(cachedPath, LAST_CHECKED_FILE));
+		return Date.now() - info.mtimeMs >= VERSION_CHECK_TTL_MS;
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * Marks the cached theme as version-checked at the start of the check so a
+ * transient GitHub outage during the network call doesn't cause every
+ * subsequent build to retry — we wait out the TTL and try again later.
+ */
+async function markVersionChecked(cachedPath: string): Promise<void> {
+	try {
+		await writeFile(join(cachedPath, LAST_CHECKED_FILE), new Date().toISOString(), "utf-8");
+	} catch {
+		// Best-effort; failing to write just means the next build re-checks early.
+	}
+}
+
+/**
  * Checks the cached theme's version against the GitHub registry.
  * If a newer version is available, re-downloads the theme in-place.
  * Fails silently (keeps cached version) on network errors.
+ *
+ * Skips the network call entirely when the previous check was within
+ * `VERSION_CHECK_TTL_MS` — see `isVersionCheckDue`.
  */
 async function checkAndUpdateCachedTheme(name: string, _cachedPath: string): Promise<void> {
+	if (!(await isVersionCheckDue(_cachedPath))) return;
+	await markVersionChecked(_cachedPath);
+
 	try {
-		const { downloadTheme } = await import("../../commands/ThemeCommand.js");
+		const { downloadTheme, githubAuthHeaders } = await import("../../commands/ThemeCommand.js");
 
 		// Read cached version from manifest.mjs
 		const manifestPath = join(_cachedPath, "manifest.mjs");
@@ -210,7 +266,7 @@ async function checkAndUpdateCachedTheme(name: string, _cachedPath: string): Pro
 
 		// Fetch registry to get latest version
 		const registryUrl = `https://raw.githubusercontent.com/jolliai/themes/main/registry.json`;
-		const res = await fetch(registryUrl);
+		const res = await fetch(registryUrl, { headers: githubAuthHeaders() });
 		if (!res.ok) return;
 		const registry = (await res.json()) as { themes: Array<{ name: string; version: string }> };
 		const entry = registry.themes.find((t) => t.name === name);

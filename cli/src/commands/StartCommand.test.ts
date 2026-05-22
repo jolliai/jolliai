@@ -1110,3 +1110,184 @@ describe("buildRootInjectionInput", () => {
 		expect(result.apiSpecs).toEqual([{ specName: "public-api", title: "Public API" }]);
 	});
 });
+
+// ─── pickRootRedirectHref / writeRootRedirectIndex unit tests ─────────────────
+
+describe("pickRootRedirectHref", () => {
+	it("returns the first navigable page href when no page is rooted at /", async () => {
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		const parsed = {
+			sidebar: {},
+			pages: [
+				{ key: "docs", title: "Get Started", href: "/docs" },
+				{ key: "api", title: "API", href: "/api" },
+			],
+			defaultPageHref: "/docs",
+		};
+		expect(pickRootRedirectHref(parsed)).toBe("/docs");
+	});
+
+	it("returns undefined when one of the pages claims the root", async () => {
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		const parsed = {
+			sidebar: {},
+			pages: [
+				{ key: "home", title: "Home", href: "/" },
+				{ key: "docs", title: "Docs", href: "/docs" },
+			],
+			defaultPageHref: "/",
+		};
+		expect(pickRootRedirectHref(parsed)).toBeUndefined();
+	});
+
+	it("skips menu pages (href:#) when picking the first navigable target", async () => {
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		const parsed = {
+			sidebar: {},
+			pages: [
+				{ key: "community", title: "Community", href: "#", type: "menu" as const },
+				{ key: "docs", title: "Docs", href: "/docs" },
+			],
+			defaultPageHref: "#",
+		};
+		expect(pickRootRedirectHref(parsed)).toBe("/docs");
+	});
+
+	it("returns undefined when parsedNavigation is missing or in simple mode", async () => {
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		expect(pickRootRedirectHref(undefined)).toBeUndefined();
+		expect(pickRootRedirectHref({ sidebar: {} })).toBeUndefined();
+	});
+
+	it("returns undefined when the first navigable href has an unsafe scheme", async () => {
+		// Defense in depth: the href reaches `window.location.replace(...)` in
+		// the inline-script stub. A `javascript:`/`data:` URL in `site.json`
+		// must not be propagated — sanitizeUrl clamps it to "#", and the
+		// caller maps that back to "no redirect" so the original index renders.
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		const parsed = {
+			sidebar: {},
+			pages: [{ key: "evil", title: "Evil", href: "javascript:alert(1)" }],
+			defaultPageHref: "javascript:alert(1)",
+		};
+		expect(pickRootRedirectHref(parsed)).toBeUndefined();
+	});
+
+	it("returns undefined when the first navigable href is a scheme-relative URL", async () => {
+		const { pickRootRedirectHref } = await import("./StartCommand.js");
+		const parsed = {
+			sidebar: {},
+			pages: [{ key: "evil", title: "Evil", href: "//evil.com/x" }],
+			defaultPageHref: "//evil.com/x",
+		};
+		expect(pickRootRedirectHref(parsed)).toBeUndefined();
+	});
+});
+
+describe("writeRootRedirectIndex", () => {
+	let contentDir: string;
+
+	beforeEach(async () => {
+		const { mkdtemp } = await import("node:fs/promises");
+		const { tmpdir } = await import("node:os");
+		contentDir = await mkdtemp(join(tmpdir(), "jolli-redirect-test-"));
+	});
+
+	afterEach(async () => {
+		const { rm } = await import("node:fs/promises");
+		await rm(contentDir, { recursive: true, force: true });
+	});
+
+	it("replaces index.md with an index.mdx redirect stub", async () => {
+		const { writeFile, readFile, stat } = await import("node:fs/promises");
+		await writeFile(join(contentDir, "index.md"), "# Old home\n", "utf-8");
+
+		const { writeRootRedirectIndex } = await import("./StartCommand.js");
+		await writeRootRedirectIndex(contentDir, "/docs");
+
+		const mdx = await readFile(join(contentDir, "index.mdx"), "utf-8");
+		expect(mdx).toContain(`window.location.replace("/docs")`);
+		expect(mdx).toContain("Redirecting…");
+		expect(mdx).toContain("<noscript>");
+
+		// Old index.md is gone — Nextra picks up index.mdx as the route.
+		await expect(stat(join(contentDir, "index.md"))).rejects.toBeDefined();
+	});
+
+	it("escapes the redirect href to defuse JS-string injection", async () => {
+		const { readFile } = await import("node:fs/promises");
+		const { writeRootRedirectIndex } = await import("./StartCommand.js");
+
+		await writeRootRedirectIndex(contentDir, `/docs"</script><script>alert(1)//`);
+
+		const mdx = await readFile(join(contentDir, "index.mdx"), "utf-8");
+		// The href is round-tripped through JSON.stringify, so the quote and
+		// closing tag are escaped — no raw </script> in the inline JS.
+		expect(mdx).not.toMatch(/<\/script>.*alert/);
+		expect(mdx).toContain('\\"');
+	});
+
+	it("escapes dollar-curly so a hostile href cannot execute via the outer template literal", async () => {
+		// Regression: the inline-script body is built as a template literal
+		// `\`window.location.replace(${jsHref})\``. JSON.stringify does not
+		// escape the `$` + `{` sequence, so a value like `/x` + `${alert(1)}`
+		// would otherwise survive JSON encoding, land inside the template
+		// literal at MDX render time, and run `alert(1)` as a template
+		// substitution. Build the hostile input by concatenation so the
+		// test source itself doesn't trip Biome's no-template-curly rule.
+		const { readFile } = await import("node:fs/promises");
+		const { writeRootRedirectIndex } = await import("./StartCommand.js");
+
+		const hostile = `/x${"$"}{alert(1)}`;
+		await writeRootRedirectIndex(contentDir, hostile);
+
+		const mdx = await readFile(join(contentDir, "index.mdx"), "utf-8");
+		// The dollar-curly sequence must NOT survive into the inline script
+		// body as a literal `$` + `{` substitution head.
+		expect(mdx).not.toContain(`${"$"}{alert`);
+		// And the escaped form must be present so the JSON.stringify output
+		// is actually neutralised.
+		expect(mdx).toContain("\\u0024{alert(1)}");
+	});
+
+	it("escapes backticks so a hostile href cannot close the outer template literal", async () => {
+		// Regression: a backtick in the href closes the template-literal that
+		// wraps `${jsHref}` in the inline-script body. A trailing backtick
+		// causes a syntax error (DoS crash); a well-placed one followed by
+		// `${...}` lets the attacker append arbitrary JS as a template head.
+		const { readFile } = await import("node:fs/promises");
+		const { writeRootRedirectIndex } = await import("./StartCommand.js");
+
+		await writeRootRedirectIndex(contentDir, "/x`alert(1)`");
+
+		const mdx = await readFile(join(contentDir, "index.mdx"), "utf-8");
+		// No raw backtick survives inside the JS-string portion of the redirect.
+		// Extract the inline script line and check it contains no literal `.
+		const scriptLine = mdx.split("\n").find((l) => l.includes("window.location.replace")) ?? "";
+		// The outer template-literal delimiters (the two backticks that wrap
+		// the call expression) are the only acceptable backticks on that line.
+		const backtickCount = (scriptLine.match(/`/g) ?? []).length;
+		expect(backtickCount).toBe(2);
+		expect(scriptLine).toContain("\\u0060alert(1)\\u0060");
+	});
+
+	it("escapes { and } in the noscript text so MDX does not evaluate them as JSX expressions", async () => {
+		// Regression: the noscript fallback splices `htmlHref` into MDX text
+		// content as `Redirecting to <a href="...">${htmlHref}</a>…`. MDX
+		// parses `{...}` in text as a JSX expression, so a href like
+		// `/foo{alert(1)}` would otherwise execute at render time. The shared
+		// `escapeHtml` helper from Sanitize.ts escapes `{` and `}` for exactly
+		// this reason (the previous local copy only handled `& < > "`).
+		const { readFile } = await import("node:fs/promises");
+		const { writeRootRedirectIndex } = await import("./StartCommand.js");
+
+		await writeRootRedirectIndex(contentDir, "/foo{alert(1)}");
+
+		const mdx = await readFile(join(contentDir, "index.mdx"), "utf-8");
+		// The noscript line(s) must not contain a literal `{alert(1)}` JSX
+		// expression — `{` and `}` must be HTML-entity-encoded.
+		const noscriptBlock = mdx.slice(mdx.indexOf("<noscript>"), mdx.indexOf("</noscript>"));
+		expect(noscriptBlock).not.toContain("{alert(1)}");
+		expect(noscriptBlock).toContain("&#123;alert(1)&#125;");
+	});
+});
