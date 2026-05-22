@@ -1,0 +1,135 @@
+# Verifies the Developer Certificate of Origin (DCO) sign-off on every
+# commit a pull request introduces.
+#
+# CONTRIBUTING.md and CLAUDE.md both state that PRs without a valid
+# `Signed-off-by:` trailer are rejected — this workflow is the
+# mechanical enforcement of that rule.
+#
+# Why a hand-rolled bash check instead of a marketplace action:
+#   - Keeps the supply chain narrow. OpenSSF Scorecard (scorecard.yaml)
+#     scores us on pinned + minimal third-party action surface, and the
+#     DCO rule is one line of logic — not worth importing for.
+#   - Lets the failure message point straight at the project's existing
+#     CONTRIBUTING.md remediation steps instead of a generic action's.
+#
+# Why only `pull_request`:
+#   - DCO is a PR-time gate. Push events to main only land via PRs that
+#     have already passed this check; re-running on push would also red
+#     the workflow for any pre-DCO commit still reachable on a long-lived
+#     branch, which has no useful corrective action.
+#
+# Every commit is checked, including merge commits authored by the
+# contributor (e.g. "Merge branch 'main' into feature"). GitHub's own
+# synthetic merge ref is never reached because the verification range
+# is `base.sha..head.sha` — the synthetic merge is not an ancestor of
+# head.sha and falls outside the range by construction.
+#
+# Each commit must carry at least one Signed-off-by trailer whose
+# email matches the commit author's email (case-insensitive). This
+# mirrors GitHub's official DCO App default and the DCO semantics on
+# developercertificate.org — the contributor signs for their own work.
+#
+# Workflow injection hygiene (per CLAUDE.md): every user-controlled
+# `${{ … }}` context — including `github.event.pull_request.*.sha` —
+# is funnelled through `env:` before the `run:` block, never inlined
+# into the shell.
+
+name: CI - Verify DCO
+
+on:
+    pull_request:
+        branches: [main, "release/**"]
+
+permissions:
+    contents: read
+
+jobs:
+    verify-dco:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 5
+        steps:
+            -   uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+                with:
+                    # Need history back to the PR's merge base so we can
+                    # enumerate every commit the PR introduces.
+                    fetch-depth: 0
+                    persist-credentials: false
+
+            -   name: Verify Signed-off-by trailer on every PR commit
+                env:
+                    BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                    HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                run: |
+                    set -euo pipefail
+
+                    # Include merge commits — see CONTRIBUTING.md.
+                    # The PR branch range itself excludes GitHub's
+                    # synthetic merge ref (not an ancestor of head.sha).
+                    mapfile -t commits < <(git rev-list "$BASE_SHA".."$HEAD_SHA")
+
+                    if [ "${#commits[@]}" -eq 0 ]; then
+                        echo "No commits to verify."
+                        exit 0
+                    fi
+
+                    failed=0
+                    for sha in "${commits[@]}"; do
+                        short=$(git log -1 --pretty='%h %s' "$sha")
+                        # Lowercase both sides; email comparison is case-
+                        # insensitive per RFC 5321 (the local part is
+                        # technically case-sensitive, but in practice no
+                        # mail provider relies on that, and git config
+                        # round-trips emails verbatim — matching exactly
+                        # what `git commit -s` would produce).
+                        author_email=$(git show -s --format='%ae' "$sha" \
+                            | tr '[:upper:]' '[:lower:]')
+
+                        # Parse trailers rigorously — grepping the raw
+                        # message would let a commit body that mentions
+                        # the string "Signed-off-by:" pass without an
+                        # actual trailer block. Multiple Signed-off-by
+                        # trailers are allowed (e.g. patch-relay flows);
+                        # one matching the author is enough.
+                        sob_emails=$(git show -s --format=%B "$sha" \
+                            | git interpret-trailers --parse \
+                            | grep -iE '^Signed-off-by:[[:space:]]+.+[[:space:]]+<.+@.+>[[:space:]]*$' \
+                            | sed -E 's/.*<([^>]+)>.*/\1/' \
+                            | tr '[:upper:]' '[:lower:]' \
+                            || true)
+
+                        if [ -z "$sob_emails" ]; then
+                            echo "::error::Missing or malformed Signed-off-by trailer on commit: $short"
+                            failed=$((failed + 1))
+                            continue
+                        fi
+
+                        if ! printf '%s\n' "$sob_emails" | grep -qxF "$author_email"; then
+                            found=$(printf '%s ' $sob_emails)
+                            echo "::error::Signed-off-by does not match author <$author_email> on commit: $short (found: ${found% })"
+                            failed=$((failed + 1))
+                        fi
+                    done
+
+                    if [ "$failed" -gt 0 ]; then
+                        {
+                            echo
+                            echo "DCO check failed for $failed commit(s)."
+                            echo
+                            echo "Every commit must end with a trailer of the form:"
+                            echo "    Signed-off-by: Your Name <your.email@example.com>"
+                            echo "and the email must match the commit author's email."
+                            echo
+                            echo "Amend the most recent commit:"
+                            echo "    git commit --amend -s --no-edit"
+                            echo "    git push --force-with-lease"
+                            echo
+                            echo "Sign off multiple commits at once:"
+                            echo "    git rebase --signoff HEAD~<number-of-commits>"
+                            echo "    git push --force-with-lease"
+                            echo
+                            echo "See CONTRIBUTING.md for the full policy."
+                        } >&2
+                        exit 1
+                    fi
+
+                    echo "All ${#commits[@]} commit(s) carry a matching Signed-off-by trailer."
