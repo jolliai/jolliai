@@ -127,12 +127,44 @@ describe("parseNavigation (simple mode)", () => {
 						href: "quickstart",
 						expanded: true,
 					} as NavigationArticle,
+					// expanded:false but no children → still plain string
+					{
+						article: "Reference",
+						href: "reference",
+						expanded: false,
+					} as NavigationArticle,
 				],
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
 		expect(result.sidebar["/guides"].deployment).toBe("Deployment");
 		expect(result.sidebar["/guides"].quickstart).toBe("Quickstart");
+		expect(result.sidebar["/guides"].reference).toBe("Reference");
+	});
+
+	it("emits theme.collapsed:true for nested articles when expanded:false is set", () => {
+		const nav = [
+			{
+				group: "Guides",
+				root: "guides",
+				content: [
+					{
+						article: "Deployment",
+						href: "deployment",
+						expanded: false,
+						articles: [
+							{ article: "Docker", href: "deployment/docker" } as NavigationArticle,
+							{ article: "Kubernetes", href: "deployment/kubernetes" } as NavigationArticle,
+						],
+					} as NavigationArticle,
+				],
+			} as NavigationGroup,
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/guides"].deployment).toEqual({
+			title: "Deployment",
+			theme: { collapsed: true },
+		});
 	});
 });
 

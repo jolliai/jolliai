@@ -261,13 +261,14 @@ function addArticle(
 	}
 
 	const hrefSegments = article.href.split("/").filter(Boolean);
-	// When the article has nested children and `expanded: true`, emit the
-	// _meta.js entry as an object with `theme.collapsed: false` so Nextra
-	// defaults the folder to open. Plain string entries fall back to Nextra's
-	// `defaultMenuCollapseLevel` behavior (folders collapsed past a depth).
+	// When the article has nested children and `expanded` is set explicitly,
+	// emit the _meta.js entry as an object with `theme.collapsed` so Nextra
+	// honors the customer's open/closed intent regardless of
+	// `defaultMenuCollapseLevel`. When `expanded` is omitted, fall through to
+	// the plain string entry so Nextra's per-depth default applies.
 	const entryValue: SidebarItemValue =
-		article.articles?.length && article.expanded === true
-			? { title: article.article, theme: { collapsed: false } }
+		article.articles?.length && article.expanded !== undefined
+			? { title: article.article, theme: { collapsed: !article.expanded } }
 			: article.article;
 
 	if (hrefSegments.length === 1) {
