@@ -56,6 +56,16 @@ const {
 			findByPath(relPath: string): unknown {
 				return findByPath(relPath);
 			}
+			// `resolveKBPath` now claims identity in-place by calling
+			// `MetadataManager.ensure()` + `readConfig()` + `saveConfig()` (the work
+			// that used to live in `initializeKBFolder`). The tests in this file
+			// don't exercise that side-effect; provide no-op shims so the real
+			// `resolveKBPath` doesn't throw when it hits this mocked class.
+			ensure(): void {}
+			readConfig(): Record<string, unknown> {
+				return { version: 1, sortOrder: "date" };
+			}
+			saveConfig(): void {}
 		},
 		mockIsUserEditedOnDisk: isUserEditedOnDisk,
 		mockFindByPath: findByPath,
@@ -226,6 +236,14 @@ vi.mock("../../cli/src/core/KBPathResolver.js", async (importOriginal) => {
 		extractRepoName,
 		getRemoteUrl,
 		resolveKbParent,
+		// Stub: identity-claiming side-effects of `resolveKBPath` /
+		// `initializeKBFolder` reach into MetadataManager, which is mocked
+		// to a class with no-op methods (see `MockMetadataManager`). The
+		// stub here keeps `initializeKBFolder` a no-op for any callers that
+		// still invoke it directly (Migrate / Repoint paths); `resolveKBPath`
+		// itself uses the original implementation so the path-computation
+		// logic exercised by these tests is real.
+		initializeKBFolder: () => {},
 	};
 });
 
@@ -4224,6 +4242,39 @@ describe("JolliMemoryBridge", () => {
 			const bridge = makeBridge();
 			const sha = await bridge.saveIndexTree();
 			expect(sha).toBe("def789");
+		});
+	});
+
+	// ── getSummaryIndexEntryMap ─────────────────────────────────────────────
+
+	describe("getSummaryIndexEntryMap()", () => {
+		it("delegates to the SummaryStore primitive with the bridge's cwd + storage", async () => {
+			// The Bridge guarantees this read is routed through its own
+			// `DualWriteStorage`, so a re-mounted KB folder doesn't surface a
+			// stale OrphanBranchStorage view to the SummaryWebviewPanel's
+			// stale-commit guard. Verify the delegation goes through the
+			// mocked primitive with both args.
+			const sample = new Map([
+				[
+					"abc123",
+					{
+						commitHash: "abc123",
+						commitDate: "2026-01-01T00:00:00Z",
+						commitMessage: "m",
+						parentCommitHash: null,
+						branch: "main",
+						topicCount: 1,
+					},
+				],
+			]);
+			getIndexEntryMap.mockResolvedValue(sample);
+			const bridge = makeBridge();
+			const result = await bridge.getSummaryIndexEntryMap();
+			expect(result).toBe(sample);
+			expect(getIndexEntryMap).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.any(Object),
+			);
 		});
 	});
 

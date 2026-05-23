@@ -37,6 +37,11 @@ export default defineConfig({
 		ssr: true,
 	},
 	test: {
+		// Acceptance suites live under `test/sync-acceptance/` and use real
+		// `git init --bare` + mock backend. They run via the separate
+		// `vitest.acceptance.config.ts` (npm run test:acceptance), so the
+		// regular unit-test pass excludes them.
+		exclude: ["test/sync-acceptance/**", "**/node_modules/**", "**/dist/**"],
 		// Auto-reset framework state between every `it()` so tests can't lean on
 		// pollution left behind by an earlier test in the same file. Surfaces
 		// hidden order dependencies instead of letting them stay green by luck.
@@ -55,7 +60,7 @@ export default defineConfig({
 		coverage: {
 			provider: "v8",
 			reporter: ["text", "json-summary"],
-			exclude: ["src/Types.ts", "src/commands/StartCommand.ts", "src/commands/ReverseCommand.ts", "src/commands/ThemeCommand.ts", "src/site/ContentPlanner.ts", "src/site/themes/ThemeRegistry.ts", "vite.config.ts"],
+			exclude: ["src/Types.ts", "src/commands/StartCommand.ts", "src/commands/ReverseCommand.ts", "src/commands/ThemeCommand.ts", "src/site/ContentPlanner.ts", "src/site/themes/ThemeRegistry.ts", "vite.config.ts", "test/**"],
 			thresholds: {
 				statements: 97,
 				branches: 96,

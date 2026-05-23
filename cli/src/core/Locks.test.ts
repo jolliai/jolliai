@@ -108,6 +108,30 @@ describe("Locks", () => {
 			await releaseWorkerLock(tempDir);
 		});
 
+		it("reclaims an orphaned lock whose owner PID is dead, even if mtime is fresh", async () => {
+			// Simulate a crashed-without-release: write a PID that definitely
+			// doesn't exist (huge number, virtually never reused) without
+			// advancing mtime. Previously the next acquirer had to wait the
+			// full LOCK_TIMEOUT_MS; with the PID liveness check it reclaims
+			// immediately.
+			const fsPromises = await import("node:fs/promises");
+			await fsPromises.writeFile(workerLockPath(tempDir), "9999999", "utf-8");
+			expect(await acquireWorkerLock(tempDir)).toBe(true);
+			await releaseWorkerLock(tempDir);
+		});
+
+		it("does NOT reclaim a lock whose owner PID is alive (us), regardless of fresh mtime", async () => {
+			// Write our own PID; acquireWorkerLock should fail because we
+			// (the current process) are alive, even though the lock is
+			// "owned" by the same process. This guards against reentrant
+			// double-acquire by the same worker.
+			const fsPromises = await import("node:fs/promises");
+			await fsPromises.writeFile(workerLockPath(tempDir), String(process.pid), "utf-8");
+			expect(await acquireWorkerLock(tempDir)).toBe(false);
+			// Cleanup so afterEach doesn't see a leftover file.
+			await fsPromises.rm(workerLockPath(tempDir), { force: true });
+		});
+
 		it("returns false when writeFile fails (race condition)", async () => {
 			const fsPromises = await import("node:fs/promises");
 			const writeSpy = vi.spyOn(fsPromises, "writeFile").mockRejectedValueOnce(new Error("EEXIST"));

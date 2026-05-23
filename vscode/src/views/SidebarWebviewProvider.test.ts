@@ -2079,6 +2079,67 @@ describe("SidebarWebviewProvider", () => {
 		expect(notifyDirty).toHaveBeenCalledTimes(1);
 	});
 
+	it("refreshKnowledgeBaseFolders re-pushes selection:repos and selection:branches for the current repo", async () => {
+		// Regression for the post-sync tree-view bug: a sync round pulls
+		// new branch directories onto disk, but the breadcrumb's branch
+		// dropdown is populated via `selection:branches` which is only
+		// sent at init / repo-switch time. Pre-fix the dropdown stayed
+		// frozen until the user manually switched repos. The fix re-pushes
+		// both `selection:repos` and `selection:branches` on every
+		// refresh, since both `listRepos()` and `listBranches()` read
+		// fresh from disk.
+		const view = makeMockView();
+		const tree = { name: "", relPath: "", isDirectory: true, children: [] };
+		const kbFolders = {
+			listChildren: vi.fn().mockResolvedValue(tree),
+			notifyDirty: vi.fn(),
+		};
+		const selection = {
+			listRepos: vi.fn(() => [
+				{ repoName: "alpha", remoteUrl: undefined, isCurrent: false },
+				{ repoName: "beta", remoteUrl: undefined, isCurrent: true },
+			]),
+			listBranches: vi.fn(() => ["main", "feat/x"]),
+			listBranchMemories: vi.fn(),
+		};
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			kbFolders,
+			selection,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		selection.listRepos.mockClear();
+		selection.listBranches.mockClear();
+
+		provider.refreshKnowledgeBaseFolders();
+		await new Promise((r) => setTimeout(r, 0));
+
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		const reposMsg = sent.find(
+			(m) => typeof m === "object" && m !== null && (m as { type?: unknown }).type === "selection:repos",
+		);
+		const branchesMsg = sent.find(
+			(m) => typeof m === "object" && m !== null && (m as { type?: unknown }).type === "selection:branches",
+		);
+		expect(reposMsg).toBeDefined();
+		expect(branchesMsg).toBeDefined();
+		// Picks the current repo for branch fetch.
+		expect((branchesMsg as { repoName: string }).repoName).toBe("beta");
+		expect((branchesMsg as { branches: string[] }).branches).toEqual(["main", "feat/x"]);
+		expect(selection.listBranches).toHaveBeenCalledWith("beta");
+	});
+
 	// setBadge re-attaches the activity-bar badge surface that the legacy
 	// TreeView-based sidebar provided. WebviewView shares the `.badge` API
 	// with TreeView — these tests pin the contract that (a) badges set

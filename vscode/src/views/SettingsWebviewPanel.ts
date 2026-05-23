@@ -55,6 +55,10 @@ interface SettingsPayload {
 	readonly localFolder: string;
 	readonly excludePatterns: string;
 	readonly dcoSignoff: boolean;
+	readonly syncEnabled?: boolean;
+	readonly syncTranscripts?: boolean;
+	/** Null → "leave blank, use default"; number → clamped seconds (5400..86400). */
+	readonly syncPollIntervalSec?: number | null;
 }
 
 interface HookSyncFailure {
@@ -71,6 +75,7 @@ type SettingsMessage =
 	| { command: "confirmDirtyMigrate" }
 	| { command: "signIn" }
 	| { command: "signOut" }
+	| { command: "syncNow" }
 	| {
 			command: "applySettings";
 			settings: SettingsPayload;
@@ -221,6 +226,20 @@ export class SettingsWebviewPanel {
 					this.postError("Failed to save settings");
 				});
 				break;
+			case "syncNow":
+				// Delegates to the orchestrator if one is wired; otherwise the
+				// command shows a "not enabled" toast.
+				log.info(
+					"SettingsPanel",
+					"syncNow received from webview → executing jollimemory.syncNow",
+				);
+				void vscode.commands.executeCommand("jollimemory.syncNow").then(
+					() =>
+						log.info("SettingsPanel", "jollimemory.syncNow command resolved"),
+					(err: unknown) =>
+						log.error("SettingsPanel", `jollimemory.syncNow rejected: ${err}`),
+				);
+				break;
 			case "rebuildKnowledgeBase":
 				this.handleRebuildKnowledgeBase().catch((err: unknown) => {
 					log.error("SettingsPanel", `Rebuild failed: ${err}`);
@@ -370,6 +389,12 @@ export class SettingsWebviewPanel {
 				? config.excludePatterns.join(", ")
 				: "",
 			dcoSignoff: config.dcoSignoff === true,
+			syncEnabled: Boolean(config.syncEnabled),
+			syncTranscripts: Boolean(config.syncTranscripts),
+			syncPollIntervalSec:
+				typeof config.syncPollIntervalSec === "number"
+					? config.syncPollIntervalSec
+					: null,
 		};
 
 		const signedIn = this.authService?.isSignedIn(config) ?? false;
@@ -472,6 +497,19 @@ export class SettingsWebviewPanel {
 					: undefined,
 			excludePatterns: excludePatterns.length > 0 ? excludePatterns : undefined,
 			dcoSignoff: settings.dcoSignoff ? true : undefined,
+			syncEnabled: settings.syncEnabled === true ? true : undefined,
+			syncTranscripts: settings.syncTranscripts === true ? true : undefined,
+			// `null` from the webview → user cleared the field → reset to default
+			// (write `undefined` so config falls back to the engine's 90-min default).
+			// Number → clamp to [5400, 86400] before persisting; the webview already
+			// pre-clamps but we re-clamp defensively against direct postMessage.
+			syncPollIntervalSec:
+				typeof settings.syncPollIntervalSec === "number"
+					? Math.min(
+							86400,
+							Math.max(5400, Math.floor(settings.syncPollIntervalSec)),
+						)
+					: undefined,
 		};
 
 		const repoRoot = await getProjectRootDir(this.workspaceRoot);

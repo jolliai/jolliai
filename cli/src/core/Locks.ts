@@ -59,10 +59,22 @@
  * release path.
  */
 
-import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
 import * as Subprocess from "../util/Subprocess.js";
+import {
+	acquireWithPoll,
+	isLockStale,
+	LOCK_TIMEOUT_MS,
+	refreshLockMtime,
+	releaseIfOwned,
+	tryAcquireOnce,
+} from "./LockPrimitives.js";
+
+// Re-export so existing callers (Locks.test.ts, QueueWorker.ts, etc.) that
+// imported it from this module keep compiling.
+export { LOCK_TIMEOUT_MS };
 
 const log = createLogger("Locks");
 
@@ -77,17 +89,7 @@ function gitRevParseCommonDir(cwd: string): Promise<{ stdout: string; stderr: st
 
 export const WORKER_LOCK_FILE = "worker.lock";
 export const ORPHAN_WRITE_LOCK_FILE = "orphan-write.lock";
-
-/**
- * Lock timeout: a lock older than this is considered stale and reclaimable.
- *
- * Invariant: must be greater than 2 × `WORKER_LOCK_REFRESH_INTERVAL_MS` (the
- * worker's heartbeat cadence, 60 s in `QueueWorker.ts`). A live worker bumps
- * mtime on that cadence, so as long as TIMEOUT > 2 × INTERVAL a single missed
- * bump (GC pause, slow scheduler tick) cannot push the lock across the stale
- * boundary. Currently 5 min vs 60 s — ample margin.
- */
-export const LOCK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+export const SYNC_LOCK_FILE = "sync.lock";
 
 /** Default wait budget for `acquireOrphanWriteLock` (background callers). */
 export const DEFAULT_ORPHAN_WRITE_TIMEOUT_MS = 1000;
@@ -184,83 +186,6 @@ async function ensureSharedLockDir(cwd?: string): Promise<string> {
 }
 
 /**
- * Best-effort single attempt at creating `lockPath` exclusively.
- * Returns true on success. Returns false if another process already holds it
- * (and the existing lock is fresh) or if a filesystem error blocked us.
- *
- * Stale locks (older than `LOCK_TIMEOUT_MS`) are removed and the caller will
- * succeed on the retry / next call.
- */
-async function tryAcquireOnce(lockPath: string): Promise<boolean> {
-	try {
-		const lockStat = await stat(lockPath);
-		const age = Date.now() - lockStat.mtimeMs;
-		if (age < LOCK_TIMEOUT_MS) {
-			return false;
-		}
-		log.warn("Removing stale lock file %s (age: %dms)", lockPath, age);
-		await rm(lockPath, { force: true });
-	} catch (error: unknown) {
-		const err = error as { code?: string };
-		/* v8 ignore start -- defensive: non-ENOENT errors from stat are rare filesystem issues */
-		if (err.code !== "ENOENT") {
-			log.error("Failed to check lock file %s: %s", lockPath, (error as Error).message);
-			return false;
-		}
-		/* v8 ignore stop */
-	}
-
-	try {
-		await writeFile(lockPath, String(process.pid), { flag: "wx" });
-		return true;
-		/* v8 ignore start -- race condition: another process grabbed the lock between check and write */
-	} catch {
-		return false;
-	}
-	/* v8 ignore stop */
-}
-
-/**
- * Reads the PID currently written into `lockPath`. Returns null when the file
- * is missing or unreadable — callers treat that as "not ours".
- */
-async function readLockOwnerPid(lockPath: string): Promise<string | null> {
-	try {
-		const content = await readFile(lockPath, "utf-8");
-		const pid = content.trim();
-		return pid.length > 0 ? pid : null;
-		/* v8 ignore next 3 -- ENOENT / unreadable: caller treats null as "not ours" */
-	} catch {
-		return null;
-	}
-}
-
-/**
- * Removes `lockPath` only if its written PID matches the current process.
- * No-op when the file is missing OR owned by another PID — protects against
- * the stale-reclaim race where this process's release would otherwise delete
- * a different process's freshly-acquired lock.
- */
-async function releaseIfOwned(lockPath: string, label: string): Promise<void> {
-	const ownerPid = await readLockOwnerPid(lockPath);
-	if (ownerPid !== null && ownerPid !== String(process.pid)) {
-		log.warn(
-			"Skipping release of %s: held by pid %s, not us (pid %s) — stale-reclaim race",
-			label,
-			ownerPid,
-			process.pid,
-		);
-		return;
-	}
-	try {
-		await rm(lockPath, { force: true });
-		/* v8 ignore next 3 -- filesystem permission error during lock release */
-	} catch (error: unknown) {
-		log.error("Failed to release %s: %s", label, (error as Error).message);
-	}
-}
-
-/**
  * Acquires the worker lock. Fail-fast: returns false immediately when another
  * worker already holds it.
  */
@@ -302,13 +227,7 @@ export async function isWorkerLockHeld(cwd?: string): Promise<boolean> {
  */
 export async function isWorkerLockStale(cwd?: string): Promise<boolean> {
 	const dir = getJolliMemoryDir(cwd);
-	const lockPath = join(dir, WORKER_LOCK_FILE);
-	try {
-		const lockStat = await stat(lockPath);
-		return Date.now() - lockStat.mtimeMs >= LOCK_TIMEOUT_MS;
-	} catch {
-		return false;
-	}
+	return isLockStale(join(dir, WORKER_LOCK_FILE));
 }
 
 /**
@@ -323,23 +242,7 @@ export async function isWorkerLockStale(cwd?: string): Promise<boolean> {
  */
 export async function refreshWorkerLockMtime(cwd?: string): Promise<void> {
 	const dir = getJolliMemoryDir(cwd);
-	const lockPath = join(dir, WORKER_LOCK_FILE);
-	const ownerPid = await readLockOwnerPid(lockPath);
-	if (ownerPid !== null && ownerPid !== String(process.pid)) {
-		// Lock was reclaimed by another process — stop refreshing.
-		return;
-	}
-	try {
-		const now = new Date();
-		await utimes(lockPath, now, now);
-		/* v8 ignore next 3 -- transient utimes failure on a lock file is intentionally swallowed */
-	} catch {
-		// Lock file gone or filesystem hiccup — refresh is best-effort.
-	}
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+	await refreshLockMtime(join(dir, WORKER_LOCK_FILE));
 }
 
 /**
@@ -355,14 +258,7 @@ export async function acquireOrphanWriteLock(cwd?: string, opts: OrphanWriteLock
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_ORPHAN_WRITE_TIMEOUT_MS;
 	const pollMs = opts.pollMs ?? DEFAULT_ORPHAN_WRITE_POLL_MS;
 	const dir = await ensureSharedLockDir(cwd);
-	const lockPath = join(dir, ORPHAN_WRITE_LOCK_FILE);
-	const deadline = Date.now() + timeoutMs;
-
-	while (true) {
-		if (await tryAcquireOnce(lockPath)) return true;
-		if (Date.now() >= deadline) return false;
-		await sleep(pollMs);
-	}
+	return acquireWithPoll(join(dir, ORPHAN_WRITE_LOCK_FILE), { timeoutMs, pollMs });
 }
 
 /**

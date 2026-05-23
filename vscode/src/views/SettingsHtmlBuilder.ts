@@ -178,6 +178,48 @@ export function buildSettingsHtml(nonce: string): string {
         <div class="hint rebuild-hint">Re-migrate this repo from the orphan branch into a fresh Memory Bank folder. The existing folder is preserved (a new <code>-2</code>-suffixed folder is created and the repo registry is repointed).</div>
         <div class="hint" id="rebuildKbStatus"></div>
       </div>
+
+      <!-- ── Cloud sync to Personal Space ───────────────────────────────── -->
+      <hr class="settings-divider" />
+
+      <div class="settings-row column">
+        <button type="button" class="browse-btn rebuild-btn" id="syncNowBtn">Sync to Personal Space Now</button>
+        <span class="hint">Push this Memory Bank to your <strong>private</strong> Personal Space. Requires Jolli sign-in.</span>
+      </div>
+
+      <div class="settings-row column" id="syncAutoGroup">
+        <label class="settings-toggle">
+          <input type="checkbox" id="syncEnabled" />
+          Auto-sync to Personal Space
+        </label>
+        <div id="syncAutoIntervalGroup">
+          <label class="settings-label" for="syncPollIntervalMin">Every (minutes)</label>
+          <input
+            type="number"
+            id="syncPollIntervalMin"
+            min="90"
+            max="1440"
+            step="1"
+            inputmode="numeric"
+            placeholder="90"
+          />
+          <span class="hint">90–1440 minutes (default 90). Lower values clamp to 90.</span>
+        </div>
+      </div>
+
+      <div class="settings-row column">
+        <label class="settings-toggle">
+          <input type="checkbox" id="syncTranscripts" />
+          Include transcripts (raw AI conversation logs)
+        </label>
+        <span class="hint">Off by default. Transcripts may include pasted code, tokens, or sensitive snippets. Applies to both manual and auto-sync.</span>
+      </div>
+
+      <div class="settings-row column">
+        <div class="warning-banner" role="note">
+          ⚠ If <code>localFolder</code> is also synced by iCloud / Dropbox / Syncthing, turn Jolli sync off — pick one sync channel per device.
+        </div>
+      </div>
     </section>
 
     <!-- ── Tab 5: Others ── -->

@@ -3,7 +3,17 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "n
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { extractRepoName, findFreshKBPath, getRemoteUrl, initializeKBFolder, resolveKBPath } from "./KBPathResolver.js";
+import {
+	assertValidLocalFolder,
+	extractRepoName,
+	findFreshKBPath,
+	getRemoteUrl,
+	InvalidLocalFolderError,
+	initializeKBFolder,
+	isValidLocalFolder,
+	peekKBPath,
+	resolveKBPath,
+} from "./KBPathResolver.js";
 
 function git(cwd: string, args: string[]): void {
 	execFileSync("git", args, { cwd, stdio: "ignore" });
@@ -382,12 +392,231 @@ esac
 
 	describe("default parent dir (no customPath)", () => {
 		// Hitting `resolveParentDir` without a customPath. Use a unique repo name
-		// that's unlikely to exist in the user's real ~/Documents/jolli/ — since
-		// the basePath does not exist, resolveKBPath returns it without writing.
+		// that's unlikely to exist in the user's real ~/Documents/jolli/ —
+		// resolveKBPath now claims the path (writes config), so we clean up
+		// after ourselves to avoid polluting the user's home dir.
 		it("uses ~/Documents/jolli/{repoName} when customPath is omitted", () => {
 			const uniq = `__test_kbpr_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-			const result = resolveKBPath(uniq, null);
-			expect(result).toBe(join(homedir(), "Documents", "jolli", uniq));
+			const expected = join(homedir(), "Documents", "jolli", uniq);
+			try {
+				const result = resolveKBPath(uniq, null);
+				expect(result).toBe(expected);
+			} finally {
+				rmrf(expected);
+			}
+		});
+	});
+
+	describe("stub adoption (regression: phantom -2 spawn)", () => {
+		// MetadataManager.ensure() writes a schema-default `{version, sortOrder}`
+		// config when nobody has written identity yet. Historically, the next
+		// resolveKBPath would see that stub, fail isSameRepo (config.remoteUrl is
+		// undefined ≠ real remoteUrl), and allocate `repo-2`. The next call would
+		// see two stubs, fail again, allocate `repo-3`, ad infinitum until -99.
+		// This block pins the fix: stubs get adopted in place.
+
+		function seedStub(dir: string): void {
+			mkdirSync(join(dir, ".jolli"), { recursive: true });
+			writeFileSync(
+				join(dir, ".jolli", "config.json"),
+				JSON.stringify({ version: 1, sortOrder: "date" }),
+				"utf-8",
+			);
+		}
+
+		it("adopts an unclaimed stub at basePath instead of allocating -N", () => {
+			seedStub(join(tempDir, "repo"));
+
+			const result = resolveKBPath("repo", "https://github.com/u/repo.git", tempDir);
+
+			expect(result).toBe(join(tempDir, "repo"));
+			const config = JSON.parse(readFileSync(join(result, ".jolli", "config.json"), "utf-8"));
+			expect(config.remoteUrl).toBe("https://github.com/u/repo.git");
+			expect(config.repoName).toBe("repo");
+		});
+
+		it("adopts a stub with real summaries content — that's the regression's signature", () => {
+			// User had data accumulating in `repo/` from prior usage but the
+			// buggy code path (SyncBootstrap / old StorageFactory) never wrote
+			// identity. The data is theirs; rescue it by adopting in place
+			// rather than orphaning it under a phantom `-2` sibling.
+			seedStub(join(tempDir, "repo"));
+			mkdirSync(join(tempDir, "repo", ".jolli", "summaries"), { recursive: true });
+			writeFileSync(
+				join(tempDir, "repo", ".jolli", "summaries", "abc.json"),
+				JSON.stringify({ commitHash: "abc" }),
+				"utf-8",
+			);
+
+			const result = resolveKBPath("repo", "https://github.com/u/repo.git", tempDir);
+			expect(result).toBe(join(tempDir, "repo"));
+			const config = JSON.parse(readFileSync(join(result, ".jolli", "config.json"), "utf-8"));
+			expect(config.remoteUrl).toBe("https://github.com/u/repo.git");
+		});
+
+		it("adopts a stub whose index.json has entries", () => {
+			seedStub(join(tempDir, "repo"));
+			writeFileSync(
+				join(tempDir, "repo", ".jolli", "index.json"),
+				JSON.stringify({ version: 3, entries: [{ commitHash: "abc" }] }),
+				"utf-8",
+			);
+
+			const result = resolveKBPath("repo", "https://github.com/u/repo.git", tempDir);
+			expect(result).toBe(join(tempDir, "repo"));
+		});
+
+		it("adopts an unclaimed stub at a -N candidate when basePath belongs to another repo", () => {
+			// basePath taken by a different repo, so we fall into findAvailablePathAndClaim;
+			// the first -N candidate exists but holds an unclaimed stub → adopt it.
+			initializeKBFolder(join(tempDir, "repo"), "repo", "https://github.com/u/other.git");
+			seedStub(join(tempDir, "repo-2"));
+
+			const result = resolveKBPath("repo", "https://github.com/u/canonical.git", tempDir);
+
+			expect(result).toBe(join(tempDir, "repo-2"));
+			const config = JSON.parse(readFileSync(join(result, ".jolli", "config.json"), "utf-8"));
+			expect(config.remoteUrl).toBe("https://github.com/u/canonical.git");
+		});
+
+		it("repeated calls converge on basePath — no -N death spiral", () => {
+			// Pre-fix: each call would allocate the next -N up to -99 then fall
+			// back to a timestamp suffix. Post-fix: the first call adopts
+			// basePath and every later call reuses it.
+			seedStub(join(tempDir, "repo"));
+
+			for (let i = 0; i < 5; i++) {
+				expect(resolveKBPath("repo", "https://github.com/u/repo.git", tempDir)).toBe(join(tempDir, "repo"));
+			}
+			expect(existsSync(join(tempDir, "repo-2"))).toBe(false);
+			expect(existsSync(join(tempDir, "repo-3"))).toBe(false);
+		});
+	});
+
+	describe("resolveKBPath claims allocated paths", () => {
+		// resolveKBPath now always returns a path with identity written.
+		// Callers no longer need to pair it with initializeKBFolder.
+
+		it("writes identity when basePath did not exist", () => {
+			const result = resolveKBPath("fresh", "https://github.com/u/fresh.git", tempDir);
+			expect(result).toBe(join(tempDir, "fresh"));
+
+			const config = JSON.parse(readFileSync(join(result, ".jolli", "config.json"), "utf-8"));
+			expect(config.remoteUrl).toBe("https://github.com/u/fresh.git");
+			expect(config.repoName).toBe("fresh");
+		});
+
+		it("writes identity when allocating a -N suffix on collision", () => {
+			initializeKBFolder(join(tempDir, "repo"), "repo", "https://github.com/u/a.git");
+
+			const result = resolveKBPath("repo", "https://github.com/u/b.git", tempDir);
+			expect(result).toBe(join(tempDir, "repo-2"));
+
+			const config = JSON.parse(readFileSync(join(result, ".jolli", "config.json"), "utf-8"));
+			expect(config.remoteUrl).toBe("https://github.com/u/b.git");
+			expect(config.repoName).toBe("repo");
+		});
+	});
+
+	describe("peekKBPath (pure-read sibling)", () => {
+		// peekKBPath returns the same path resolveKBPath would, but without
+		// any disk side-effects. Used by Migrate / Rebuild to look up "where
+		// would my old folder be?" without inadvertently creating one.
+
+		it("returns the basePath without creating it when the path does not exist", () => {
+			const result = peekKBPath("ghost", "https://github.com/u/ghost.git", tempDir);
+			expect(result).toBe(join(tempDir, "ghost"));
+			expect(existsSync(join(tempDir, "ghost"))).toBe(false);
+			expect(existsSync(join(tempDir, "ghost", ".jolli"))).toBe(false);
+		});
+
+		it("returns the existing basePath when identity matches", () => {
+			initializeKBFolder(join(tempDir, "repo"), "repo", "https://github.com/u/repo.git");
+			const result = peekKBPath("repo", "https://github.com/u/repo.git", tempDir);
+			expect(result).toBe(join(tempDir, "repo"));
+		});
+
+		it("returns the -N candidate without writing identity on collision", () => {
+			initializeKBFolder(join(tempDir, "repo"), "repo", "https://github.com/u/a.git");
+			const result = peekKBPath("repo", "https://github.com/u/b.git", tempDir);
+			expect(result).toBe(join(tempDir, "repo-2"));
+			// -2 must NOT have been created
+			expect(existsSync(join(tempDir, "repo-2"))).toBe(false);
+		});
+
+		it("returns basePath when stub config is present, without writing identity", () => {
+			mkdirSync(join(tempDir, "repo", ".jolli"), { recursive: true });
+			writeFileSync(
+				join(tempDir, "repo", ".jolli", "config.json"),
+				JSON.stringify({ version: 1, sortOrder: "date" }),
+				"utf-8",
+			);
+
+			const result = peekKBPath("repo", "https://github.com/u/repo.git", tempDir);
+			expect(result).toBe(join(tempDir, "repo"));
+			// Config must still be a stub (peek does not write)
+			const cfg = JSON.parse(readFileSync(join(result, ".jolli", "config.json"), "utf-8"));
+			expect(cfg.remoteUrl).toBeUndefined();
+			expect(cfg.repoName).toBeUndefined();
+		});
+
+		it("walks -N candidates and returns a matching -N when the base path is claimed by a different repo", () => {
+			// base `repo` belongs to repo-a, base `repo-2` belongs to repo-b
+			// (the one we want). peekKBPath must walk to -2 and recognize it
+			// as same-repo (line 111 branch).
+			initializeKBFolder(join(tempDir, "repo"), "repo", "https://github.com/u/a.git");
+			initializeKBFolder(join(tempDir, "repo-2"), "repo", "https://github.com/u/b.git");
+			const result = peekKBPath("repo", "https://github.com/u/b.git", tempDir);
+			expect(result).toBe(join(tempDir, "repo-2"));
+		});
+
+		it("walks -N candidates and adopts an unclaimed stub at -N", () => {
+			// base `repo` is a different repo; `repo-2` exists as a stub
+			// (config has no remoteUrl/repoName). peekKBPath should return
+			// `repo-2` via the stub-adoption branch (line 112).
+			initializeKBFolder(join(tempDir, "repo"), "repo", "https://github.com/u/a.git");
+			mkdirSync(join(tempDir, "repo-2", ".jolli"), { recursive: true });
+			writeFileSync(
+				join(tempDir, "repo-2", ".jolli", "config.json"),
+				JSON.stringify({ version: 1, sortOrder: "date" }),
+				"utf-8",
+			);
+			const result = peekKBPath("repo", "https://github.com/u/b.git", tempDir);
+			expect(result).toBe(join(tempDir, "repo-2"));
+		});
+
+		it("isValidLocalFolder / assertValidLocalFolder agree on the validity boundary", () => {
+			// Empty/undefined is "no override" — both predicates treat it as valid
+			// (callers will substitute the default ~/Documents/jolli/).
+			expect(isValidLocalFolder(undefined)).toBe(true);
+			expect(isValidLocalFolder("")).toBe(true);
+			expect(() => assertValidLocalFolder(undefined)).not.toThrow();
+			expect(() => assertValidLocalFolder("")).not.toThrow();
+
+			// Absolute, no `..` — valid.
+			expect(isValidLocalFolder("/abs/path")).toBe(true);
+			expect(() => assertValidLocalFolder("/abs/path")).not.toThrow();
+
+			// Relative paths — invalid (would silently land somewhere unexpected
+			// relative to cwd if accepted).
+			expect(isValidLocalFolder("relative/path")).toBe(false);
+			expect(() => assertValidLocalFolder("relative/path")).toThrow(InvalidLocalFolderError);
+
+			// `..`-containing paths — invalid even when absolute (path traversal
+			// could escape the intended parent on disk).
+			expect(isValidLocalFolder("/abs/with/../traversal")).toBe(false);
+			expect(() => assertValidLocalFolder("/abs/with/../traversal")).toThrow(/Invalid Memory Bank folder/);
+		});
+
+		it("matches resolveKBPath's choice on a pristine system — Migrate parity", () => {
+			// The Migrate handler relies on peekKBPath returning the same path
+			// resolveKBPath would, so the `oldKbRoot === newKbRoot` archive
+			// gate behaves correctly on a pristine system (no archive needed).
+			const peeked = peekKBPath("brand-new", "https://github.com/u/x.git", tempDir);
+			const fresh = findFreshKBPath("brand-new", tempDir);
+			expect(peeked).toBe(fresh);
+			expect(peeked).toBe(join(tempDir, "brand-new"));
+			expect(existsSync(peeked)).toBe(false);
 		});
 	});
 });

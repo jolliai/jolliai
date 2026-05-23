@@ -1342,6 +1342,53 @@ describe("FolderStorage", () => {
 
 			expect(removed).toBe(0);
 		});
+
+		it("rmdirs the on-disk branch folder when it is empty after unregister", async () => {
+			await storage.ensure();
+			metadataManager.resolveFolderForBranch("ghost/branch");
+			const folder = join(rootPath, "ghost-branch");
+			mkdirSync(folder, { recursive: true });
+			expect(existsSync(folder)).toBe(true);
+
+			const removed = await storage.pruneBranchMappings(["ghost/branch"]);
+
+			expect(removed).toBe(1);
+			expect(existsSync(folder)).toBe(false);
+		});
+
+		it("preserves a branch folder that still contains user files (ENOTEMPTY)", async () => {
+			await storage.ensure();
+			metadataManager.resolveFolderForBranch("ghost/branch");
+			const folder = join(rootPath, "ghost-branch");
+			mkdirSync(folder, { recursive: true });
+			writeFileSync(join(folder, "user-note.md"), "kept");
+
+			const removed = await storage.pruneBranchMappings(["ghost/branch"]);
+
+			expect(removed).toBe(1);
+			expect(existsSync(join(folder, "user-note.md"))).toBe(true);
+		});
+
+		it("is a no-op for the folder when it never existed on disk (ENOENT)", async () => {
+			await storage.ensure();
+			metadataManager.resolveFolderForBranch("ghost/branch");
+			// Never `mkdirSync` — the mapping exists but the folder doesn't.
+
+			const removed = await storage.pruneBranchMappings(["ghost/branch"]);
+			expect(removed).toBe(1);
+		});
+
+		it("warns but does not throw when rmdir hits an unexpected error (ENOTDIR)", async () => {
+			await storage.ensure();
+			metadataManager.resolveFolderForBranch("ghost/branch");
+			// Place a regular file at the expected folder path so `rmdir` throws ENOTDIR.
+			writeFileSync(join(rootPath, "ghost-branch"), "not a dir");
+
+			const removed = await storage.pruneBranchMappings(["ghost/branch"]);
+			expect(removed).toBe(1);
+			// The bogus file is untouched (warn path only logs).
+			expect(existsSync(join(rootPath, "ghost-branch"))).toBe(true);
+		});
 	});
 
 	describe("regenerateVisibleMarkdown — malformed hidden JSON", () => {

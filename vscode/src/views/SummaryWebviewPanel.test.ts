@@ -9303,6 +9303,282 @@ describe("SummaryWebviewPanel", () => {
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
+		it("race-window: blocks delete E2E scenario if amend lands while confirm modal is open", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			showWarningMessage.mockResolvedValueOnce("Delete");
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					e2eTestGuide: [
+						{
+							title: "Scenario 1",
+							preconditions: "",
+							steps: ["step"],
+							expectedResults: ["ok"],
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "deleteE2eScenario", index: 0, title: "Scenario 1" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/^Delete scenario/),
+				expect.any(Object),
+				"Delete",
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("race-window: blocks delete E2E test guide if amend lands while confirm modal is open", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			showWarningMessage.mockResolvedValueOnce("Delete");
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					e2eTestGuide: [
+						{ title: "T", preconditions: "", steps: [], expectedResults: [] },
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "deleteE2eTest" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/^Delete E2E Test Guide/),
+				expect.any(Object),
+				"Delete",
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("race-window: blocks remove plan if amend lands while confirm modal is open", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			showWarningMessage.mockResolvedValueOnce("Remove");
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					plans: [
+						{
+							slug: "plan-a",
+							title: "Plan A",
+							editCount: 0,
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "removePlan", slug: "plan-a", title: "Plan A" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/^Remove/),
+				expect.any(Object),
+				"Remove",
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("race-window: blocks add markdown note if amend lands while file picker is open", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			// File picker returns a chosen file URI; the post-pick guard blocks storeSummary.
+			showOpenDialog.mockResolvedValueOnce([{ fsPath: "/tmp/picked.md" }]);
+			const dispatch = await setupCommit("abc123");
+
+			dispatch({ command: "addMarkdownNote" });
+			await flushPromises();
+
+			expect(showOpenDialog).toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("race-window: blocks remove note if amend lands while confirm modal is open", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			showWarningMessage.mockResolvedValueOnce("Remove");
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					notes: [
+						{
+							id: "note-a",
+							title: "Note A",
+							kind: "snippet",
+							snippet: "x",
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "removeNote", id: "note-a", title: "Note A" });
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/^Remove/),
+				expect.any(Object),
+				"Remove",
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("race-window: blocks remove Linear issue if amend lands while confirm modal is open", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			showWarningMessage.mockResolvedValueOnce("Remove");
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					linearIssues: [
+						{
+							ticketId: "ENG-1",
+							url: "https://linear.app/x/issue/ENG-1",
+							title: "Test issue",
+							addedAt: "2026-01-01T00:00:00Z",
+							archivedKey: "k",
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({
+				command: "removeLinearIssue",
+				archivedKey: "k",
+				ticketId: "ENG-1",
+			});
+			await flushPromises();
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringMatching(/^Remove/),
+				expect.any(Object),
+				"Remove",
+			);
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
+		it("race-window: blocks translate note if amend lands during the LLM call", async () => {
+			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
+			const rewrittenMap = buildChainEntryMap([
+				{ hash: "abc123", parent: "rootnew0" },
+				{ hash: "rootnew0", parent: null },
+			]);
+			(
+				stubBridge as unknown as {
+					getSummaryIndexEntryMap: ReturnType<typeof vi.fn>;
+				}
+			).getSummaryIndexEntryMap = makeRacingEntryMapMock(rootMap, rewrittenMap);
+			mockReadNoteFromBranch.mockResolvedValue("# 中文笔记\n\n内容");
+			mockTranslateToEnglish.mockResolvedValue("# English Note\n\nbody");
+			await SummaryWebviewPanel.show(
+				makeSummary({
+					commitHash: "abc123",
+					notes: [
+						{
+							id: "cn-note",
+							title: "中文笔记",
+							kind: "markdown",
+							addedAt: "2026-01-01T00:00:00Z",
+							updatedAt: "2026-01-01T00:00:00Z",
+						},
+					],
+				}),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "translateNote", id: "cn-note" });
+			await flushPromises();
+
+			expect(mockTranslateToEnglish).toHaveBeenCalled();
+			expect(mockStoreNotes).not.toHaveBeenCalled();
+			expect(mockStoreSummary).not.toHaveBeenCalled();
+		});
+
 		it("race-window: blocks translate plan if amend lands during the LLM call", async () => {
 			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
 			const rewrittenMap = buildChainEntryMap([

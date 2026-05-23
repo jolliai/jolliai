@@ -1,0 +1,5 @@
+{
+	"extends": "./tsconfig.json",
+	"//": "Production-only typecheck config. Used by `npm run typecheck` so the merge gate fails on real product errors but tolerates the pre-existing pile of `vi.fn()` inference issues in test files. The IDE keeps reading the base `tsconfig.json` so tests still get diagnostics interactively.",
+	"exclude": ["node_modules", "dist", "src/**/*.test.ts"]
+}

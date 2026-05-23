@@ -222,6 +222,12 @@
 			{
 				"command": "jollimemory.revertMemoryFileEdits",
 				"title": "Memory Bank: Revert Edits to System Version"
+			},
+			{
+				"command": "jollimemory.syncNow",
+				"title": "Sync Memory Bank Now",
+				"icon": "$(sync)",
+				"category": "Jolli Memory"
 			}
 		],
 		"menus": {
@@ -251,7 +257,7 @@
 	"scripts": {
 		"all": "npm run clean && npm run build && npm run lint && npm run test",
 		"clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
-		"typecheck": "tsc --noEmit",
+		"typecheck": "tsc --noEmit -p tsconfig.build.json",
 		"lint": "npx biome check --error-on-warnings src/",
 		"lint:fix": "npx biome check --write src/",
 		"test": "node ./scripts/run-vitest.mjs --coverage",

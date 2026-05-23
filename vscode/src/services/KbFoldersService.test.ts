@@ -1408,6 +1408,42 @@ describe("KbFoldersService — multi-repo & parent listing", () => {
 			/non-directory/,
 		);
 	});
+
+	it("returns an empty parent listing when kbParent itself is missing on disk", async () => {
+		// Exercises the `readdir(kbParent)` catch branch in
+		// `listUserTopLevelEntries`. If a user reconfigures their Local
+		// Folder to a path that no longer exists, the service must NOT
+		// throw — it returns an empty listing, mirroring `discoverRepos`'s
+		// ENOENT-tolerant behaviour. Without this guard the sidebar would
+		// crash on a stale config pointing at a deleted directory.
+		rmSync(tmpParent, { recursive: true, force: true });
+		const svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: null,
+			currentRemoteUrl: null,
+		}));
+		const root = await svc.listChildren("");
+		expect(root.children).toEqual([]);
+	});
+
+	it("sorts same-kind top-level entries alphabetically (comparator fallback)", async () => {
+		// Two regular files at kbParent root → both fall into the same
+		// `isDirectory() === false` bucket so the kind-comparator's `if`
+		// short-circuit doesn't fire; the `localeCompare` tail path runs
+		// and decides order. Without this branch covered, a future
+		// refactor that drops the comparator would surface as
+		// non-deterministic sidebar ordering.
+		writeFileSync(join(tmpParent, "zebra.md"), "# zebra");
+		writeFileSync(join(tmpParent, "alpha.md"), "# alpha");
+		const svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: null,
+			currentRemoteUrl: null,
+		}));
+		const root = await svc.listChildren("");
+		const names = (root.children ?? []).map((c) => c.name);
+		expect(names).toEqual(["alpha.md", "zebra.md"]);
+	});
 });
 
 describe("KbFoldersService — breadcrumb selection helpers", () => {
@@ -1437,7 +1473,7 @@ describe("KbFoldersService — breadcrumb selection helpers", () => {
 		expect(alpha?.isCurrentRepo).toBe(false);
 	});
 
-	it("listBranches returns branches.json mappings (canonical names, not folder names) for the named repo", () => {
+	it("listBranches returns branches.json mappings (canonical names) for branches that have a head in index.json", () => {
 		const repoDir = seedRepo(tmpParent, "alpha", { repoName: "alpha" });
 		// Drive the registry via resolveFolderForBranch so the sanitization
 		// transcode (e.g. `feature/x` → `feature-x`) is exercised — listBranches
@@ -1445,12 +1481,58 @@ describe("KbFoldersService — breadcrumb selection helpers", () => {
 		const mm = new MetadataManager(join(repoDir, ".jolli"));
 		mm.resolveFolderForBranch("main");
 		mm.resolveFolderForBranch("feature/x");
+		// Seed index.json with one head per branch — the new filter requires
+		// ≥1 entry with `parentCommitHash === null` for a branch to surface,
+		// guarding against the v4-Hoist orphan-mapping bug where every entry
+		// on a branch got hoisted into another head's children[] leaving
+		// the mapping with no live content.
+		writeFileSync(
+			join(repoDir, ".jolli", "index.json"),
+			JSON.stringify({
+				version: 3,
+				entries: [
+					{ commitHash: "a".repeat(40), branch: "main", parentCommitHash: null },
+					{ commitHash: "b".repeat(40), branch: "feature/x", parentCommitHash: null },
+				],
+			}),
+		);
 		svc = new KbFoldersService(() => ({
 			kbParent: tmpParent,
 			currentRepoName: "alpha",
 			currentRemoteUrl: null,
 		}));
 		expect(svc.listBranches("alpha")).toEqual(["feature/x", "main"]);
+	});
+
+	it("listBranches hides branches whose only entries are hoisted children (no head in index.json)", () => {
+		// Regression for the v4-Hoist orphan-mapping bug: a branch can end
+		// up in `branches.json` while every entry on it has been hoisted
+		// into another head's `children[]` (parentCommitHash != null).
+		// `StaleChildMarkdownCleanup` prunes such mappings, but the read-
+		// side filter is defense in depth for any disk state that hasn't
+		// run cleanup yet (e.g. fresh device sync).
+		const repoDir = seedRepo(tmpParent, "alpha", { repoName: "alpha" });
+		const mm = new MetadataManager(join(repoDir, ".jolli"));
+		mm.resolveFolderForBranch("ghost");
+		mm.resolveFolderForBranch("real");
+		writeFileSync(
+			join(repoDir, ".jolli", "index.json"),
+			JSON.stringify({
+				version: 3,
+				entries: [
+					// ghost has only hoisted children — should be filtered out.
+					{ commitHash: "c".repeat(40), branch: "ghost", parentCommitHash: "p".repeat(40) },
+					// real has a head — should surface.
+					{ commitHash: "d".repeat(40), branch: "real", parentCommitHash: null },
+				],
+			}),
+		);
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: "alpha",
+			currentRemoteUrl: null,
+		}));
+		expect(svc.listBranches("alpha")).toEqual(["real"]);
 	});
 
 	it("listBranches returns [] for an unknown repo without throwing", () => {
