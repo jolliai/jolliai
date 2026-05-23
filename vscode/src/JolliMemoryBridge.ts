@@ -231,11 +231,52 @@ export class JolliMemoryBridge {
 	 */
 	private readStoragePromise: Promise<StorageProvider> | null = null;
 
+	/**
+	 * Short-lived cache for the {@link loadConfig} + {@link discoverRepos}
+	 * pair that {@link findRepoForAbsPath} hits per `.md` URI shown by the
+	 * file-decoration provider. Without this, VS Code's per-URI
+	 * `provideFileDecoration` polling fires a config read + filesystem
+	 * scan for every visible markdown file on every explorer scroll —
+	 * O(N) FS hits per redraw on Memory-Bank-heavy workspaces.
+	 *
+	 * The TTL is intentionally short (a few seconds) so users don't
+	 * notice staleness after editing settings; {@link reloadStorage} also
+	 * invalidates the cache explicitly on settings-save.
+	 */
+	private discoveryCache: {
+		cfg: Record<string, unknown>;
+		repos: DiscoveredRepo[];
+		expiresAt: number;
+	} | null = null;
+	private static readonly DISCOVERY_CACHE_TTL_MS = 3000;
+
 	constructor(
 		/** Absolute path to the workspace root (git repo) */
 		cwd: string,
 	) {
 		this.cwd = cwd;
+	}
+
+	private async getDiscoveryCached(): Promise<{
+		cfg: Record<string, unknown>;
+		repos: DiscoveredRepo[];
+	}> {
+		const now = Date.now();
+		if (this.discoveryCache && this.discoveryCache.expiresAt > now) {
+			return { cfg: this.discoveryCache.cfg, repos: this.discoveryCache.repos };
+		}
+		const cfg = (await loadConfig()) as Record<string, unknown>;
+		const customKBPath = cfg.localFolder as string | undefined;
+		const kbParent = resolveKbParent(customKBPath);
+		const currentRepoName = extractRepoName(this.cwd);
+		const currentRemoteUrl = getRemoteUrl(this.cwd);
+		const repos = discoverRepos(currentRepoName, currentRemoteUrl, kbParent);
+		this.discoveryCache = {
+			cfg,
+			repos,
+			expiresAt: now + JolliMemoryBridge.DISCOVERY_CACHE_TTL_MS,
+		};
+		return { cfg, repos };
 	}
 
 	/** Lazy-resolved write storage. See {@link storagePromise}. */
@@ -356,6 +397,7 @@ export class JolliMemoryBridge {
 		this.storagePromise = null;
 		this.readStoragePromise = null;
 		this.cachedRootEntries = null;
+		this.discoveryCache = null;
 	}
 
 	/**
@@ -1828,21 +1870,24 @@ export class JolliMemoryBridge {
 	 * The SummaryWebviewPanel passes the result as `readStorage` for every
 	 * detail panel (local + foreign) so all detail-panel reads
 	 * (transcripts, plans, notes) uniformly hit the Memory Bank folder
-	 * layer instead of the dual-write primary (orphan branch). Returns
-	 * null on fresh repos whose KB folder hasn't been created yet —
-	 * callers should fall back to bridge-default reads in that case.
+	 * layer instead of the dual-write primary (orphan branch).
+	 *
+	 * Returns null when:
+	 *   - `storageMode === "orphan"`: orphan-only users have no folder
+	 *     shadow, so reading from one would surface stale leftovers or
+	 *     blanks. Callers fall back to bridge-default reads (orphan
+	 *     branch via the active StorageProvider), preserving the source-
+	 *     of-truth contract for users who opted out of dual-write.
+	 *   - No matching kbRoot is discoverable yet (fresh repo whose KB
+	 *     folder hasn't been created).
 	 */
 	async createReadStorageForCurrentRepo(): Promise<{
 		storage: StorageProvider;
 		kbRoot: string;
 	} | null> {
 		try {
-			const cfg = (await loadConfig()) as Record<string, unknown>;
-			const customKBPath = cfg.localFolder as string | undefined;
-			const kbParent = resolveKbParent(customKBPath);
-			const currentRepoName = extractRepoName(this.cwd);
-			const currentRemoteUrl = getRemoteUrl(this.cwd);
-			const repos = discoverRepos(currentRepoName, currentRemoteUrl, kbParent);
+			const { cfg, repos } = await this.getDiscoveryCached();
+			if (cfg.storageMode === "orphan") return null;
 			for (const repo of repos) {
 				if (!repo.isCurrentRepo) continue;
 				const mm = new MetadataManager(join(repo.kbRoot, ".jolli"));
@@ -1931,12 +1976,7 @@ export class JolliMemoryBridge {
 		relPath: string;
 	} | null> {
 		try {
-			const cfg = (await loadConfig()) as Record<string, unknown>;
-			const customKBPath = cfg.localFolder as string | undefined;
-			const kbParent = resolveKbParent(customKBPath);
-			const currentRepoName = extractRepoName(this.cwd);
-			const currentRemoteUrl = getRemoteUrl(this.cwd);
-			const repos = discoverRepos(currentRepoName, currentRemoteUrl, kbParent);
+			const { repos } = await this.getDiscoveryCached();
 			const absNormalized = normalizePathForCompare(absPath);
 			const absSlashed = absPath.replace(/\\/g, "/");
 			for (const repo of repos) {

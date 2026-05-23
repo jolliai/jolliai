@@ -23,6 +23,14 @@ import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 
 const log = createLogger("FolderStorage");
 
+/**
+ * Outcome of {@link FolderStorage.forceRegenerateVisibleMarkdown}. The
+ * three failure modes are distinct user-recoverable states — collapsing
+ * them into a boolean costs the UI its ability to point the user at the
+ * right next step.
+ */
+export type ForceRegenerateResult = { ok: true } | { ok: false; reason: "missing" | "malformed" | "unlinkFailed" };
+
 export class FolderStorage implements StorageProvider {
 	constructor(
 		private readonly rootPath: string,
@@ -249,10 +257,41 @@ export class FolderStorage implements StorageProvider {
 	 * unlink the diverged file and let `regenerateVisibleMarkdown` write a
 	 * fresh copy from the hidden JSON.
 	 *
-	 * Returns true when the regenerate succeeded, false when the hidden
-	 * source was missing.
+	 * Validates the hidden source BEFORE unlinking. The revert path is the
+	 * one place where the visible `.md` is the user's only copy of their
+	 * edits — destroying it before we know the hidden JSON can produce a
+	 * replacement turns the safety command into a data-loss path for
+	 * exactly the corrupted-manifest / missing-source cases it should
+	 * handle most defensively.
+	 *
+	 * Returns `{ ok: true }` when the regenerate succeeded. On failure the
+	 * `reason` distinguishes three recoverable states the UI surfaces with
+	 * distinct hints:
+	 *   - `"missing"`: hidden `summaries/<hash>.json` is absent.
+	 *   - `"malformed"`: hidden JSON exists but does not parse.
+	 *   - `"unlinkFailed"`: cannot remove the existing diverged visible file.
+	 * In every failure mode the visible file is left untouched.
 	 */
-	async forceRegenerateVisibleMarkdown(entry: SummaryIndexEntry): Promise<boolean> {
+	async forceRegenerateVisibleMarkdown(entry: SummaryIndexEntry): Promise<ForceRegenerateResult> {
+		const summaryJson = await this.readFile(`summaries/${entry.commitHash}.json`);
+		if (!summaryJson) {
+			log.warn(
+				"forceRegenerateVisibleMarkdown: hidden summaries/%s.json missing — leaving visible file intact",
+				entry.commitHash.substring(0, 8),
+			);
+			return { ok: false, reason: "missing" };
+		}
+		try {
+			JSON.parse(summaryJson);
+		} catch (err) {
+			log.warn(
+				"forceRegenerateVisibleMarkdown: malformed summaries/%s.json (%s) — leaving visible file intact",
+				entry.commitHash.substring(0, 8),
+				errMsg(err),
+			);
+			return { ok: false, reason: "malformed" };
+		}
+
 		const branchFolder = this.metadataManager.resolveFolderForBranch(entry.branch);
 		const slug = FolderStorage.slugify(entry.commitMessage);
 		const hash8 = entry.commitHash.substring(0, 8);
@@ -265,12 +304,18 @@ export class FolderStorage implements StorageProvider {
 				/* v8 ignore start -- defensive: unlinkSync only fails after existsSync if a concurrent process removed the file or the fs throws EACCES mid-flow. */
 			} catch (err) {
 				log.warn("forceRegenerateVisibleMarkdown: cannot unlink %s [%s]", relativePath, String(err));
-				return false;
+				return { ok: false, reason: "unlinkFailed" };
 			}
 			/* v8 ignore stop */
 		}
 
-		return this.regenerateVisibleMarkdown(entry);
+		// The hidden JSON validated successfully above, so a false return
+		// from regenerateVisibleMarkdown here can only mean a TOCTOU race
+		// where the JSON vanished between our checks and the inner read.
+		// Report it as "missing" so the user gets the same recovery hint
+		// they would for the up-front missing case.
+		const ok = await this.regenerateVisibleMarkdown(entry);
+		return ok ? { ok: true } : { ok: false, reason: "missing" };
 	}
 
 	/**

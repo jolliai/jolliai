@@ -299,12 +299,22 @@ export async function applyOverlaysToSessions<T extends OverlayableSession>(
 
 /**
  * Garbage-collects overlay rules whose identity matches an entry in the
- * QueueWorker's consumed slice. Called from QueueWorker immediately after
- * `loadSessionTranscripts` returns — by that point, cursor has already
- * advanced inside `readAllTranscripts` past every entry in the slice, so
- * any rule whose identity matches one of those entries can no longer
- * affect future summaries. Such rules are dead state: keep dropping them
- * here so overlay files don't accumulate.
+ * QueueWorker's consumed slice. Called inside `loadSessionTranscripts`
+ * after `applyOverlaysToSessions` has folded the rules into the in-memory
+ * `sessionTranscripts`, just before the function returns — by that point,
+ * `readAllTranscripts` has already `saveCursor`'d past every entry in the
+ * slice, so any rule whose identity matches one of those entries can no
+ * longer affect future summaries. Such rules are dead state: keep
+ * dropping them here so overlay files don't accumulate.
+ *
+ * Trade-off worth flagging: prune (and the cursor advance it tracks) run
+ * unconditionally — they are NOT gated on a successful `storeSummary`
+ * downstream. If the LLM call fails after this, both the cursor and the
+ * overlay file have moved past the consumed entries, so those edits are
+ * effectively lost. A transactional "advance cursor + drop overlays only
+ * on storeSummary success" refactor would fix that, but the prune call
+ * placement is downstream of the same trade-off — moving it alone would
+ * just produce a stale "edited" badge without recovering the data.
  *
  * Per session:
  *   - Drops delete/edit rules whose `(role, content, timestamp)` identity

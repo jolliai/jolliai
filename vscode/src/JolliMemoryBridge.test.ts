@@ -2835,6 +2835,28 @@ describe("JolliMemoryBridge", () => {
 
 			expect(result).toBeNull();
 		});
+
+		// orphan-only users have no folder shadow — reading from one would
+		// surface stale leftovers or blanks. The webview must fall back to
+		// the active StorageProvider (orphan branch) so transcripts / plans
+		// / notes stay coherent with the system of record.
+		it("returns null when storageMode is 'orphan' (no folder shadow)", async () => {
+			loadConfig.mockResolvedValueOnce({ storageMode: "orphan" });
+			discoverRepos.mockReturnValue([
+				{
+					kbRoot: "/mock/home/Documents/jolli/cur",
+					repoName: "cur",
+					dirName: "cur",
+					remoteUrl: null,
+					isCurrentRepo: true,
+				},
+			]);
+			const bridge = makeBridge();
+
+			const result = await bridge.createReadStorageForCurrentRepo();
+
+			expect(result).toBeNull();
+		});
 	});
 
 	// ── Git utility methods ──────────────────────────────────────────────
