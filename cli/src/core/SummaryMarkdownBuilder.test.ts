@@ -341,6 +341,17 @@ describe("buildMarkdown", () => {
 		expect(md).toContain("Day 5 topic");
 	});
 
+	it("renders Quick recap section when recap is present", () => {
+		const md = buildMarkdown(leaf({ recap: "  Shipped feature X with tests.  " }));
+		expect(md).toContain("## Quick recap");
+		expect(md).toContain("Shipped feature X with tests.");
+	});
+
+	it("omits Quick recap section when recap is whitespace-only", () => {
+		const md = buildMarkdown(leaf({ recap: "   " }));
+		expect(md).not.toContain("## Quick recap");
+	});
+
 	it("renders topic without todo or files", () => {
 		const md = buildMarkdown(
 			leaf({

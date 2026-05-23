@@ -130,7 +130,9 @@ export async function extractLinearIssuesFromTranscript(
 
 		if (role === "assistant") {
 			collectToolUses(blocks, timestamp, opts.beforeTimestamp, pending);
+			/* v8 ignore start -- readRole returns only "assistant" | "user" | undefined; undefined is filtered above, so the else-if's false branch is unreachable. */
 		} else if (role === "user") {
+			/* v8 ignore stop */
 			collectToolResults(blocks, timestamp, opts.beforeTimestamp, pending, collected);
 		}
 	}
@@ -265,10 +267,10 @@ function walkPayload(value: unknown, toolName: string, referencedAt: string, out
 	const ref = tryBuildRef(obj, toolName, referencedAt);
 	if (ref !== undefined) {
 		out.push(ref);
-		return; // 不再下钻 — 已识别为 issue
+		return; // identified as an issue — stop descending
 	}
 
-	// 未识别为 issue → 尝试常见 wrapper 字段
+	// not an issue itself → try common wrapper fields
 	for (const key of ["items", "issues", "nodes", "results"]) {
 		const inner = obj[key];
 		if (Array.isArray(inner)) {

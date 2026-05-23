@@ -39,6 +39,12 @@ describe("hexToHsl", () => {
 		expect(result).toEqual({ h: 0, s: 0, l: 0 });
 	});
 
+	it("wraps hue past 360 when max is red and green < blue", () => {
+		// #FF0080: r=255 (max), g=0, b=128, g<b → triggers the wraparound branch
+		const result = hexToHsl("#FF0080");
+		expect(result?.h).toBeGreaterThan(300);
+	});
+
 	it("converts indigo (Forge default hue ~228)", () => {
 		// #4F46E5 → roughly h=243, s=75, l=58 (actual values)
 		const result = hexToHsl("#4F46E5");
@@ -110,5 +116,19 @@ describe("resolveAccent", () => {
 	it("colors.primary takes precedence over primaryHue", () => {
 		const result = resolveAccent({ colors: { primary: "#00FF00" }, primaryHue: 300 }, 228, 84, 61);
 		expect(result.hue).toBe(120); // green hue
+	});
+
+	it("uses primaryColor hex when colors.primary is not set", () => {
+		const result = resolveAccent({ primaryColor: "#0000FF" }, 228, 84, 61);
+		expect(result.hue).toBe(240);
+		expect(result.saturation).toBe(100);
+		expect(result.lightness).toBe(50);
+	});
+
+	it("ignores invalid primaryColor and falls through to primaryHue", () => {
+		const result = resolveAccent({ primaryColor: "not-a-color", primaryHue: 200 }, 228, 84, 61);
+		expect(result.hue).toBe(200);
+		expect(result.saturation).toBe(84);
+		expect(result.lightness).toBe(61);
 	});
 });

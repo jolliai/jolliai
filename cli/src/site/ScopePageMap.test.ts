@@ -241,6 +241,40 @@ describe("scopePageMap — edge cases", () => {
 		const result = scopePageMap(pageMap, "/getting-started");
 		expect(getData(result)["some-page"]).toBe("api-something-in-label");
 	});
+
+	it("passes a non-object active-spec data entry through unhideActiveSpec unchanged", () => {
+		// String / null data values for an api-* key skip the href/display strip
+		// and survive verbatim — exercises the early-return guard.
+		const pageMap = buildPageMap({
+			dataEntries: {
+				"api-petstore": "Petstore Label",
+				"api-nullish": null,
+			},
+			folderNames: ["api-petstore"],
+		});
+		const result = scopePageMap(pageMap, "/api-petstore");
+		const data = getData(result);
+		expect(data["api-petstore"]).toBe("Petstore Label");
+		expect(data["api-nullish"]).toBeUndefined();
+	});
+
+	it("strips href on the active non-api section so Nextra folder-binds it for sidebar scoping", () => {
+		// When the URL is under a non-api section (e.g. /docs/intro) and that
+		// section's data entry is a type:"page" link, the wrapper strips the
+		// href so Nextra binds the folder instead of routing to the link target.
+		const pageMap = buildPageMap({
+			dataEntries: {
+				docs: { title: "Docs", type: "page", href: "/docs" },
+				other: { title: "Other", type: "page", href: "/other" },
+			},
+			folderNames: ["docs", "other"],
+		});
+		const result = scopePageMap(pageMap, "/docs/intro");
+		const data = getData(result);
+		expect(data.docs).toEqual({ title: "Docs", type: "page" });
+		// Non-active sections pass through with href intact.
+		expect(data.other).toEqual({ title: "Other", type: "page", href: "/other" });
+	});
 });
 
 // ─── Parity: SCOPE_PAGE_MAP_RUNTIME_SOURCE matches the typed function ───────

@@ -230,7 +230,10 @@ async function syncContent(
 	// before React even hydrates. We do this *before* `generateNavigation` so
 	// the `_meta.js` writer picks up the rewritten file and emits the standard
 	// `{ "index": { display: "hidden" } }` entry to keep it out of the sidebar.
-	const redirectHref = pickRootRedirectHref(parsedNavigation);
+	//
+	// Skip the rewrite when the user authored a real root index — see
+	// `hasUserAuthoredRootIndex` for the detection rule and rationale.
+	const redirectHref = hasUserAuthoredRootIndex(mirrorResult) ? undefined : pickRootRedirectHref(parsedNavigation);
 	if (redirectHref) {
 		await writeRootRedirectIndex(contentDir, redirectHref);
 	}
@@ -256,6 +259,21 @@ async function syncContent(
 	}
 
 	return { success: true, mirrorResult };
+}
+
+/**
+ * Returns `true` when `mirrorResult` already contains a user-authored root
+ * `index.md`/`index.mdx` — i.e. the source had a literal `index.{md,mdx}`,
+ * or `ContentMirror.ensureIndexPage` promoted a file with `slug: /` to
+ * `index.md` during mirroring. In either case `/` is meant to render that
+ * page, and `writeRootRedirectIndex` must not silently overwrite it with a
+ * redirect stub. Only the *root* index counts — a nested `docs/index.md`
+ * doesn't claim `/`.
+ *
+ * Exported for unit testing — call site is in `syncContent`.
+ */
+export function hasUserAuthoredRootIndex(mirrorResult: { markdownFiles: string[] }): boolean {
+	return mirrorResult.markdownFiles.some((f) => f === "index.md" || f === "index.mdx");
 }
 
 /**

@@ -26,8 +26,9 @@ import { getDeviceLabel } from "./DeviceLabel.js";
  * version in the standalone CLI bundle and falls back to `"dev"` under
  * tsx / tests, matching the convention in `core/LlmClient.ts`.
  */
-/* v8 ignore next -- compile-time ternary: always "dev" in tests, always __PKG_VERSION__ in build */
+/* v8 ignore start -- compile-time ternary: __PKG_VERSION__ is always defined in bundled builds */
 const CLIENT_VERSION = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
+/* v8 ignore stop */
 
 /**
  * Opens the browser to `${jolliUrl}/login` with a CLI callback URL, waits for

@@ -42,9 +42,11 @@ export function emitOverviewPage(specName: string, parsed: ParsedSpec): Template
 	lines.push("## Endpoints");
 	lines.push("");
 	for (const { tag, operations } of operationsByTag) {
+		/* v8 ignore start -- defensive: groupByTag filters out empty groups before returning */
 		if (operations.length === 0) {
 			continue;
 		}
+		/* v8 ignore stop */
 		lines.push(`### ${escapeMdxText(tag.name)}`);
 		lines.push("");
 		if (tag.description) {
