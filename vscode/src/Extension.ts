@@ -13,7 +13,7 @@ import {
 	conversationKey,
 	setExcluded,
 } from "../../cli/src/core/CommitSelectionStore.js";
-import type { FolderStorage } from "../../cli/src/core/FolderStorage.js";
+import type { FolderStorage, ForceRegenerateResult } from "../../cli/src/core/FolderStorage.js";
 import {
 	extractRepoName,
 	getRemoteUrl,
@@ -237,6 +237,25 @@ function resolveBranch(folderStorage: FolderStorage, manifestEntry: ManifestEntr
 	return folderStorage.resolveBranchForFolder(folder);
 }
 
+/**
+ * Human-readable hint for each `ForceRegenerateResult` failure reason —
+ * the visible warning's trailing clause. Distinct strings let the user
+ * tell whether the hidden source vanished, was corrupted, or whether the
+ * edited visible file is held open by another process. Pre-fix the UI
+ * unconditionally claimed "hidden source missing", which was misleading
+ * for malformed-JSON and unlink-failure modes.
+ */
+function revertFailureHint(reason: "missing" | "malformed" | "unlinkFailed"): string {
+	switch (reason) {
+		case "missing":
+			return "hidden source missing";
+		case "malformed":
+			return "hidden source is corrupt (JSON is unparseable)";
+		case "unlinkFailed":
+			return "could not overwrite the existing file (it may be locked by another process)";
+	}
+}
+
 // Tracks Memory Bank summary `.md` files for which the divergence info
 // message has already been shown in this session, so re-opening a
 // known-diverged file does not re-pop the toast. Module-scoped — lifetime
@@ -419,38 +438,16 @@ export function activate(context: vscode.ExtensionContext): void {
 	// immediately after a system write. Today the badge updates on the next
 	// VS Code re-poll of decorations.
 
-	// `jollimemory.isMemoryBankFile` context key — drives the visibility of
-	// the right-click "Revert Edits to System Version" explorer menu
-	// (declared in `package.json` contributes.menus.explorer/context).
-	//
-	// Trade-off: VS Code's `when` clause for the explorer context menu can
-	// only read context keys, not synchronously inspect each row. We update
-	// the key whenever the active editor changes and base its value on
-	// whether the editor's file resolves to a Memory Bank manifest entry.
-	// This makes the menu appear in the most common revert scenario — the
-	// diverged file is open in an editor — at the cost of not appearing for
-	// a pure right-click on a closed file in the explorer tree. The
-	// `revertMemoryFileEdits` command body still works defensively if
-	// invoked by URI directly (e.g. via the divergence info-message button).
-	const updateMemoryBankContext = async (
-		editor: vscode.TextEditor | undefined,
-	): Promise<void> => {
-		const fsPath = editor?.document.uri.fsPath;
-		const isMemoryBankFile = fsPath
-			? (await bridge.resolveMemoryFile(fsPath)) !== null
-			: false;
-		await vscode.commands.executeCommand(
-			"setContext",
-			"jollimemory.isMemoryBankFile",
-			isMemoryBankFile,
-		);
-	};
-	context.subscriptions.push(
-		vscode.window.onDidChangeActiveTextEditor(updateMemoryBankContext),
-	);
-	// Initial set so reopening a window already focused on a Memory Bank
-	// file picks up the right context immediately.
-	void updateMemoryBankContext(vscode.window.activeTextEditor);
+	// The "Revert Edits to System Version" explorer right-click menu
+	// (declared in `package.json` contributes.menus.explorer/context) is
+	// only gated by the `.md` filename. VS Code's `when` clause cannot
+	// run an async per-row "is this in our manifest?" query, so any
+	// context-key based gate ends up tracking `activeTextEditor` instead
+	// of the right-clicked resource — which silently hides the menu when
+	// users right-click a closed Memory Bank file in the explorer (the
+	// main advertised workflow). We accept the inverse trade-off: the
+	// menu may briefly appear on non-Memory-Bank `.md` files; the
+	// `revertMemoryFileEdits` handler silently no-ops in that case.
 
 	// ── Auth service ─────────────────────────────────────────────────────────
 	const authService = new AuthService();
@@ -2491,25 +2488,49 @@ export function activate(context: vscode.ExtensionContext): void {
 		// 1. The "[Revert]" button on the on-disk-divergence info message
 		//    surfaced by `openMemoryFile`.
 		// 2. The right-click "Revert Edits to System Version" explorer menu
-		//    (declared in package.json contributes.menus.explorer/context).
-		// The handler is intentionally tolerant of bad inputs — non-string
-		// / empty / unresolved paths surface a warning toast rather than
-		// throwing, so even if the `jollimemory.isMemoryBankFile` context
-		// key briefly shows the right-click entry on a non-kbRoot path
-		// (e.g. between editor switches), invoking it is harmless.
+		//    (declared in package.json contributes.menus.explorer/context),
+		//    which is gated only on the `.md` filename — the handler has to
+		//    silently no-op when invoked on a non-Memory-Bank `.md` so the
+		//    menu's broader gate doesn't produce noisy toasts on every
+		//    misclick. Real failure modes (no branch / unrecognized entry
+		//    type) still surface a warning.
+		//
+		// First arg is either:
+		//   - a string absolute path (programmatic callers, [Revert] button,
+		//     `jollimemory.revertMemoryFileByRelPath` wrapper);
+		//   - a `vscode.Uri` (explorer/context menus always pass a Uri, not
+		//     a string — see https://code.visualstudio.com/api/references/contribution-points#contributes.menus).
+		// `instanceof vscode.Uri` is not portable across the test mock
+		// (mocked as a plain object factory, not a class), so this duck-
+		// types on `.fsPath` + `.scheme === "file"`. Non-file schemes
+		// (virtual / remote) are rejected — a Memory Bank file always lives
+		// on the local filesystem.
 		vscode.commands.registerCommand(
 			"jollimemory.revertMemoryFileEdits",
-			async (absPath: unknown) => {
-				if (typeof absPath !== "string" || absPath.length === 0) return;
-				const resolved = await bridge.resolveMemoryFile(absPath);
-				if (!resolved) {
-					vscode.window.showWarningMessage(
-						"Memory Bank: cannot revert — file is not under a known kbRoot.",
-					);
-					return;
+			async (arg: unknown) => {
+				let absPath: string | undefined;
+				if (typeof arg === "string") {
+					if (arg.length > 0) absPath = arg;
+				} else if (typeof arg === "object" && arg !== null && "fsPath" in arg && "scheme" in arg) {
+					const uri = arg as { fsPath: unknown; scheme: unknown };
+					if (uri.scheme === "file" && typeof uri.fsPath === "string" && uri.fsPath.length > 0) {
+						absPath = uri.fsPath;
+					}
 				}
+				if (!absPath) return;
+				const resolved = await bridge.resolveMemoryFile(absPath);
+				if (!resolved) return;
 				const { folderStorage, manifestEntry } = resolved;
-				let ok = false;
+				// Outcome is normalised to FolderStorage's discriminated
+				// `ForceRegenerateResult` so the failure branch below can
+				// give the user a recovery hint matched to the actual
+				// failure mode. Plan/note still return a plain boolean (no
+				// equivalent malformed/unlink-failed split yet) so the
+				// wrapper here promotes their false to `reason: "missing"`
+				// — preserving today's user-facing message for those types
+				// without claiming richer information than they actually
+				// report.
+				let result: ForceRegenerateResult;
 				if (manifestEntry.type === "commit") {
 					const branch = resolveBranch(folderStorage, manifestEntry);
 					if (!branch) {
@@ -2532,7 +2553,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						);
 						return;
 					}
-					ok = await folderStorage.forceRegenerateVisibleMarkdown({
+					result = await folderStorage.forceRegenerateVisibleMarkdown({
 						commitHash: manifestEntry.fileId,
 						commitMessage: manifestEntry.title ?? manifestEntry.fileId,
 						commitDate: generatedAt,
@@ -2549,7 +2570,8 @@ export function activate(context: vscode.ExtensionContext): void {
 						);
 						return;
 					}
-					ok = await folderStorage.regenerateVisiblePlan(slug, branch);
+					const ok = await folderStorage.regenerateVisiblePlan(slug, branch);
+					result = ok ? { ok: true } : { ok: false, reason: "missing" };
 				} else if (manifestEntry.type === "note") {
 					const id = manifestEntry.fileId.replace(/^note:/, "");
 					const branch = resolveBranch(folderStorage, manifestEntry);
@@ -2559,7 +2581,8 @@ export function activate(context: vscode.ExtensionContext): void {
 						);
 						return;
 					}
-					ok = await folderStorage.regenerateVisibleNote(id, branch);
+					const ok = await folderStorage.regenerateVisibleNote(id, branch);
+					result = ok ? { ok: true } : { ok: false, reason: "missing" };
 				} else {
 					// Unknown manifest entry type — surface a distinct warning
 					// instead of falling through to the misleading
@@ -2571,7 +2594,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					);
 					return;
 				}
-				if (ok) {
+				if (result.ok) {
 					// Successful revert clears the "we already showed the
 					// divergence info-message for this path" guard so the
 					// next divergence on the same path can re-prompt. Also
@@ -2594,7 +2617,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					);
 				} else {
 					vscode.window.showWarningMessage(
-						`Memory Bank: revert failed for ${absPath} — hidden source missing.`,
+						`Memory Bank: revert failed for ${absPath} — ${revertFailureHint(result.reason)}.`,
 					);
 				}
 			},

@@ -104,7 +104,8 @@ function getExistingHashes(outputDir: string): Set<string> {
 /** Builds a single markdown table row for the index. */
 function buildIndexRow(summary: CommitSummary, hashPrefix: string, fileName: string): string {
 	const date = getDisplayDate(summary).substring(0, 10);
-	const safeMessage = summary.commitMessage.replace(/\|/g, "\\|");
+	// Backslash first — see escapeCell in ViewCommand.ts for the round-trip rationale.
+	const safeMessage = summary.commitMessage.replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
 	return `| ${date} | \`${hashPrefix}\` | [${safeMessage}](./${fileName}) |`;
 }
 

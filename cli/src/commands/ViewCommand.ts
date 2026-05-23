@@ -91,7 +91,9 @@ function printCompactList(entries: ReadonlyArray<SummaryIndexEntry>, total: numb
 
 /** Escapes a value for safe inclusion in a GFM table cell: `|` must be escaped and newlines collapsed. */
 function escapeCell(value: string): string {
-	return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+	// Backslash first — GFM decodes `\\` → `\` and `\|` → literal pipe, so without
+	// this step an input `\|` would emerge as `\\|`, decoded as `\` + cell separator.
+	return value.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 
 /** Builds a GFM-compatible markdown table from compact-list entries. */

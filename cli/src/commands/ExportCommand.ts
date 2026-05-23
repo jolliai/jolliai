@@ -120,7 +120,10 @@ function formatPromptMarkdown(entry: ManifestEntry): string {
 		entry.placeholders.length > 0
 			? `placeholders:\n${entry.placeholders.map((p) => `  - ${p}`).join("\n")}`
 			: "placeholders: []";
-	const escapedAction = entry.action.replace(/"/g, '\\"');
+	// Escape backslash FIRST so `\` itself round-trips through YAML's quoted-string
+	// decoder (where `\\` → `\` and `\"` → `"`). Reversing the order leaves bare
+	// `\` in the output, which would then be decoded as the start of an escape.
+	const escapedAction = entry.action.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 	return `---
 action: "${escapedAction}"
 version: ${entry.version}

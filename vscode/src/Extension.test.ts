@@ -531,12 +531,6 @@ vi.mock("vscode", () => ({
 		})),
 		registerFileDecorationProvider: vi.fn(() => ({ dispose: vi.fn() })),
 		registerUriHandler: vi.fn(() => ({ dispose: vi.fn() })),
-		// Memory Bank context-key wiring subscribes to active-editor changes
-		// to set `jollimemory.isMemoryBankFile` for the explorer right-click
-		// menu. Initial-call branch is exercised via `activeTextEditor =
-		// undefined`; tests that need the truthy `(await resolveMemoryFile)
-		// !== null` branch read the callback off `mock.calls[0][0]` and
-		// invoke it with a stub editor.
 		onDidChangeActiveTextEditor,
 		activeTextEditor: undefined,
 		// Pass-through Progress mock — runs the user's callback so commands that
@@ -3704,7 +3698,7 @@ describe("Extension", () => {
 
 			it("calls forceRegenerateVisibleMarkdown for a commit-type file", async () => {
 				const folderStorage = {
-					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue(true),
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue({ ok: true }),
 					regenerateVisiblePlan: vi.fn(),
 					regenerateVisibleNote: vi.fn(),
 				};
@@ -3748,14 +3742,15 @@ describe("Extension", () => {
 				expect(mockRefreshKnowledgeBaseFolders).toHaveBeenCalled();
 			});
 
-			it("does NOT call refreshKnowledgeBaseFolders when the regenerate helper returns false", async () => {
+			it("does NOT call refreshKnowledgeBaseFolders when the regenerate helper returns a failure", async () => {
 				// Failure path: the post-revert refresh trigger should only fire
-				// on a successful regenerate. A false return means the hidden
-				// source was missing, so the ✎ state on disk hasn't actually
-				// changed — re-rendering the tree would be wasted work and
-				// could even surprise the user with collapsing expanded folders.
+				// on a successful regenerate. A non-ok result means the hidden
+				// source was missing or corrupt, so the ✎ state on disk hasn't
+				// actually changed — re-rendering the tree would be wasted work
+				// and could even surprise the user with collapsing expanded
+				// folders.
 				const folderStorage = {
-					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue(false),
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue({ ok: false, reason: "missing" }),
 					regenerateVisiblePlan: vi.fn(),
 					regenerateVisibleNote: vi.fn(),
 				};
@@ -3857,7 +3852,14 @@ describe("Extension", () => {
 				);
 			});
 
-			it("warns when the file is not under any known kbRoot", async () => {
+			it("silently no-ops when the file is not under any known kbRoot", async () => {
+				// The explorer right-click menu is gated only by `.md`
+				// filename (the `jollimemory.isMemoryBankFile` context-key
+				// gate was removed so the menu covers closed-file
+				// right-clicks). The handler must silently no-op on non-
+				// Memory-Bank `.md` invocations rather than toast — every
+				// stray right-click on an unrelated `.md` would otherwise
+				// flash a warning.
 				mockBridge.resolveMemoryFile.mockResolvedValueOnce(null);
 
 				const handler = getRegisteredCommand(
@@ -3865,9 +3867,7 @@ describe("Extension", () => {
 				);
 				await handler("/random/elsewhere.md");
 
-				expect(showWarningMessage).toHaveBeenCalledWith(
-					"Memory Bank: cannot revert — file is not under a known kbRoot.",
-				);
+				expect(showWarningMessage).not.toHaveBeenCalled();
 				expect(showInformationMessage).not.toHaveBeenCalled();
 			});
 
@@ -3884,9 +3884,9 @@ describe("Extension", () => {
 				expect(showWarningMessage).not.toHaveBeenCalled();
 			});
 
-			it("warns when the regenerate helper returns false (hidden source missing)", async () => {
+			it("warns 'hidden source missing' when the regenerate helper reports reason 'missing'", async () => {
 				const folderStorage = {
-					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue(false),
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue({ ok: false, reason: "missing" }),
 					regenerateVisiblePlan: vi.fn(),
 					regenerateVisibleNote: vi.fn(),
 				};
@@ -3917,6 +3917,131 @@ describe("Extension", () => {
 				expect(showInformationMessage).not.toHaveBeenCalled();
 			});
 
+			it("warns 'hidden source is corrupt' when the regenerate helper reports reason 'malformed'", async () => {
+				// Distinct from the 'missing' branch above — pre-fix both
+				// returned a plain `false` and the UI always blamed a missing
+				// hidden source, hiding the JSON-parse failure from the user.
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue({ ok: false, reason: "malformed" }),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "main/foo-abcdef12.md",
+						fileId: "abcdef1234567890abcdef1234567890abcdef12",
+						type: "commit",
+						fingerprint: "old",
+						source: {
+							commitHash: "abcdef1234567890abcdef1234567890abcdef12",
+							branch: "main",
+							generatedAt: "2026-01-15T10:00:00Z",
+						},
+						title: "Add foo",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler(absPath);
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					`Memory Bank: revert failed for ${absPath} — hidden source is corrupt (JSON is unparseable).`,
+				);
+				expect(showInformationMessage).not.toHaveBeenCalled();
+			});
+
+			it("warns 'could not overwrite the existing file' when the regenerate helper reports reason 'unlinkFailed'", async () => {
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue({ ok: false, reason: "unlinkFailed" }),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "main/foo-abcdef12.md",
+						fileId: "abcdef1234567890abcdef1234567890abcdef12",
+						type: "commit",
+						fingerprint: "old",
+						source: {
+							commitHash: "abcdef1234567890abcdef1234567890abcdef12",
+							branch: "main",
+							generatedAt: "2026-01-15T10:00:00Z",
+						},
+						title: "Add foo",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler(absPath);
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					`Memory Bank: revert failed for ${absPath} — could not overwrite the existing file (it may be locked by another process).`,
+				);
+				expect(showInformationMessage).not.toHaveBeenCalled();
+			});
+
+			it("accepts a vscode.Uri argument and reverts via its fsPath (explorer/context menu path)", async () => {
+				// The explorer right-click menu invokes commands with a
+				// `vscode.Uri`, not a string. Pre-fix the handler short-
+				// circuited on `typeof !== "string"`, so the advertised
+				// "right-click a closed Memory Bank file" path silently no-
+				// op'd. Duck-type acceptance keeps the test mock (a plain
+				// object factory) interoperable with the real class.
+				const uriArg = { fsPath: absPath, scheme: "file" };
+				const folderStorage = {
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue({ ok: true }),
+					regenerateVisiblePlan: vi.fn(),
+					regenerateVisibleNote: vi.fn(),
+				};
+				mockBridge.resolveMemoryFile.mockResolvedValueOnce({
+					folderStorage,
+					manifestEntry: {
+						path: "main/foo-abcdef12.md",
+						fileId: "abcdef1234567890abcdef1234567890abcdef12",
+						type: "commit",
+						fingerprint: "old",
+						source: {
+							commitHash: "abcdef1234567890abcdef1234567890abcdef12",
+							branch: "main",
+							generatedAt: "2026-01-15T10:00:00Z",
+						},
+						title: "Add foo",
+					},
+				});
+
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler(uriArg);
+
+				expect(mockBridge.resolveMemoryFile).toHaveBeenCalledWith(absPath);
+				expect(folderStorage.forceRegenerateVisibleMarkdown).toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					`Reverted to system version: ${absPath}`,
+				);
+			});
+
+			it("silently no-ops on a vscode.Uri whose scheme is not 'file' (virtual/remote)", async () => {
+				// Defensive: a Memory Bank file always lives on the local
+				// filesystem, so non-file schemes are not Memory Bank files
+				// and must not produce a toast.
+				const handler = getRegisteredCommand(
+					"jollimemory.revertMemoryFileEdits",
+				);
+				await handler({ fsPath: "/whatever", scheme: "untitled" });
+				await handler({ fsPath: "/whatever", scheme: "git" });
+
+				expect(mockBridge.resolveMemoryFile).not.toHaveBeenCalled();
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				expect(showInformationMessage).not.toHaveBeenCalled();
+			});
+
 			it("falls back to path-based reverse lookup when a legacy commit manifestEntry.source.branch is missing", async () => {
 				// Symmetric with the plan/note legacy reverse-lookup tests.
 				// Legacy commit entry has no source.branch but DOES carry
@@ -3926,7 +4051,7 @@ describe("Extension", () => {
 				// branch's hidden JSON when the commit lives on a feature
 				// branch.
 				const folderStorage = {
-					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue(true),
+					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue({ ok: true }),
 					regenerateVisiblePlan: vi.fn(),
 					regenerateVisibleNote: vi.fn(),
 					resolveBranchForFolder: vi.fn().mockReturnValue("feature/login"),
@@ -4506,40 +4631,6 @@ describe("Extension", () => {
 			await vi.waitFor(() => {
 				expect(mockMemoriesStore.refresh).toHaveBeenCalled();
 			});
-		});
-
-		// updateMemoryBankContext (the active-editor callback) sets the
-		// `jollimemory.isMemoryBankFile` context key to true when the focused
-		// file resolves to a Memory Bank manifest entry. The default flow
-		// (bridge.resolveMemoryFile → null) covers the false branch via the
-		// initial call with `activeTextEditor=undefined`; this test invokes
-		// the captured callback with a stub editor and a non-null
-		// resolveMemoryFile to cover the truthy ternary arm.
-		it("sets the isMemoryBankFile context to true when the active editor resolves to a manifest entry", async () => {
-			mockBridge.resolveMemoryFile.mockResolvedValue({
-				path: "main/feat-abc.md",
-				kind: "memory",
-			});
-			executeCommand.mockClear();
-
-			const lastCall =
-				onDidChangeActiveTextEditor.mock.calls[
-					onDidChangeActiveTextEditor.mock.calls.length - 1
-				];
-			const cb = lastCall?.[0] as
-				| ((editor: { document: { uri: { fsPath: string } } }) => Promise<void>)
-				| undefined;
-			expect(cb).toBeDefined();
-
-			await cb?.({
-				document: { uri: { fsPath: "/test/workspace/main/feat-abc.md" } },
-			});
-
-			expect(executeCommand).toHaveBeenCalledWith(
-				"setContext",
-				"jollimemory.isMemoryBankFile",
-				true,
-			);
 		});
 
 		it("refreshes memories on orphan-ref change when hasFirstLoaded is true", async () => {

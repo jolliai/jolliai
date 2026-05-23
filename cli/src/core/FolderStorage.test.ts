@@ -2126,11 +2126,11 @@ describe("FolderStorage", () => {
 				parentCommitHash: null,
 			});
 
-			expect(result).toBe(true);
+			expect(result).toEqual({ ok: true });
 			expect(readFileSync(visiblePath, "utf-8")).toBe(original);
 		});
 
-		it("returns false when the hidden JSON source is missing", async () => {
+		it("returns reason 'missing' when the hidden JSON source is absent", async () => {
 			const result = await storage.forceRegenerateVisibleMarkdown({
 				commitHash: "9999000011112222",
 				commitMessage: "Phantom",
@@ -2139,7 +2139,65 @@ describe("FolderStorage", () => {
 				generatedAt: "2026-01-15T10:00:00Z",
 				parentCommitHash: null,
 			});
-			expect(result).toBe(false);
+			expect(result).toEqual({ ok: false, reason: "missing" });
+		});
+
+		// Revert path is the user's only copy of their edits. If the hidden
+		// JSON is missing, the visible (potentially user-edited) `.md` must
+		// stay on disk — otherwise revert turns into silent data loss.
+		it("leaves the visible file intact when the hidden JSON source is missing", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "aaaa1111bbbb2222",
+				commitMessage: "Add tests",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/aaaa1111bbbb2222.json", content: summaryJson }], "seed");
+
+			const visiblePath = join(rootPath, "main", "add-tests-aaaa1111.md");
+			writeFileSync(visiblePath, "# User edits", "utf-8");
+
+			// Trash the hidden JSON so the revert prerequisite fails.
+			unlinkSync(join(rootPath, ".jolli", "summaries", "aaaa1111bbbb2222.json"));
+
+			const result = await storage.forceRegenerateVisibleMarkdown({
+				commitHash: "aaaa1111bbbb2222",
+				commitMessage: "Add tests",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(result).toEqual({ ok: false, reason: "missing" });
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(readFileSync(visiblePath, "utf-8")).toBe("# User edits");
+		});
+
+		it("leaves the visible file intact and reports 'malformed' when the hidden JSON is unparseable", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "cccc3333dddd4444",
+				commitMessage: "Add tests",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/cccc3333dddd4444.json", content: summaryJson }], "seed");
+
+			const visiblePath = join(rootPath, "main", "add-tests-cccc3333.md");
+			writeFileSync(visiblePath, "# User edits", "utf-8");
+
+			writeFileSync(join(rootPath, ".jolli", "summaries", "cccc3333dddd4444.json"), "{ not valid json", "utf-8");
+
+			const result = await storage.forceRegenerateVisibleMarkdown({
+				commitHash: "cccc3333dddd4444",
+				commitMessage: "Add tests",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(result).toEqual({ ok: false, reason: "malformed" });
+			expect(existsSync(visiblePath)).toBe(true);
+			expect(readFileSync(visiblePath, "utf-8")).toBe("# User edits");
 		});
 	});
 

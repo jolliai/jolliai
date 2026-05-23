@@ -248,7 +248,7 @@
 			"explorer/context": [
 				{
 					"command": "jollimemory.revertMemoryFileEdits",
-					"when": "resourceFilename =~ /\\.md$/ && jollimemory.isMemoryBankFile",
+					"when": "resourceFilename =~ /\\.md$/",
 					"group": "jollimemory@1"
 				}
 			]
