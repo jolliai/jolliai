@@ -198,6 +198,23 @@ describe("readLinearIssueMarkdown", () => {
 		expect(got).toBeNull();
 	});
 
+	it("returns null when the closing frontmatter delimiter is missing", async () => {
+		// Opens with `---` but never closes — closingIdx stays -1 in parseMarkdown.
+		mockReadFile.mockResolvedValue('---\nticketId: "PROJ-1"\nno closing delimiter\n');
+		const got = await readLinearIssueMarkdown("/x.md");
+		expect(got).toBeNull();
+	});
+
+	it("treats non-string JSON literal field values as missing (parseField undefined branch)", async () => {
+		// ticketId is a JSON number — JSON.parse succeeds but typeof v !== "string",
+		// so parseField returns undefined and the required-field guard returns null.
+		mockReadFile.mockResolvedValue(
+			'---\nticketId: 123\ntitle: "t"\nurl: "https://x/PROJ-1"\nreferencedAt: "2026-01-01T00:00:00Z"\nsourceToolName: "mcp__linear__get_issue"\n---\nbody\n',
+		);
+		const got = await readLinearIssueMarkdown("/x.md");
+		expect(got).toBeNull();
+	});
+
 	it("returns null when the file is missing the required ticketId field", async () => {
 		mockReadFile.mockResolvedValue(
 			'---\ntitle: "x"\nurl: "https://x"\nreferencedAt: "2026-01-01T00:00:00Z"\nsourceToolName: "mcp__linear__get_issue"\n---\nbody\n',

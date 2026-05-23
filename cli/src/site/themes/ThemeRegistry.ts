@@ -11,13 +11,11 @@
  *   2. Registry (packs registered at runtime)
  *   3. Explicit file path in site.json (starts with `./` or `/`)
  *   4. User theme directory → ~/.jolli/themes/<name>/index.mjs
- *   5. npm package → jolli-theme-<name>
- *   6. npm scoped package → @jolli/theme-<name>
- *   7. GitHub registry → github.com/jolliai/themes/<name>/
+ *   5. GitHub registry → github.com/jolliai/themes/<name>/
  */
 
 import { existsSync, statSync } from "node:fs";
-import { stat, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -122,9 +120,7 @@ const USER_THEMES_DIR = join(homedir(), ".jolli", "themes");
  *   2. Registry (packs registered at runtime)
  *   3. Explicit file path in site.json (starts with `./` or `/`)
  *   4. User theme directory (`~/.jolli/themes/<name>/index.mjs`)
- *   5. npm package (`jolli-theme-<name>`)
- *   6. npm scoped package (`@jolli/theme-<name>`)
- *   7. GitHub registry (`github.com/jolliai/themes/<name>/`)
+ *   5. GitHub registry (`github.com/jolliai/themes/<name>/`)
  *
  * Returns the provider (now also registered) or `undefined` if not found.
  */
@@ -157,21 +153,7 @@ export async function discoverPack(
 		return loadFromPath(userThemePath);
 	}
 
-	// 5) npm package: jolli-theme-<name>
-	try {
-		return await loadFromModule(`jolli-theme-${name}`);
-	} catch {
-		// not found as npm package
-	}
-
-	// 6) npm scoped package: @jolli/theme-<name>
-	try {
-		return await loadFromModule(`@jolli/theme-${name}`);
-	} catch {
-		// not found
-	}
-
-	// 7) GitHub registry: github.com/jolliai/themes/<name>/
+	// 5) GitHub registry: github.com/jolliai/themes/<name>/
 	//
 	// On any failure here (network unreachable, theme not in repo, …) the
 	// cached copy under ~/.jolli/themes/<name>/ would have been picked up by
@@ -251,18 +233,16 @@ async function checkAndUpdateCachedTheme(name: string, _cachedPath: string): Pro
 	try {
 		const { downloadTheme, githubAuthHeaders } = await import("../../commands/ThemeCommand.js");
 
-		// Read cached version from manifest.mjs
+		// Read cached version from manifest.mjs via text parse — do NOT use
+		// `await import(manifestPath)` here. Node ESM caches modules by URL, and
+		// the relative `import "./manifest.mjs"` inside the theme's index.mjs
+		// resolves to the same file URL. If we imported it now and `downloadTheme`
+		// then overwrote the file, the freshly-loaded index.mjs would still bind
+		// to the cached stale manifest module — leaving the in-process theme
+		// advertising the new buildCss/generateLayout next to old manifest
+		// fields (name, version, supports, defaults).
 		const manifestPath = join(_cachedPath, "manifest.mjs");
-		let cachedVersion: string | undefined;
-		if (existsSync(manifestPath)) {
-			try {
-				const mod = (await import(pathToFileURL(manifestPath).href)) as Record<string, unknown>;
-				const manifest = mod.default as Record<string, unknown> | undefined;
-				cachedVersion = manifest?.version as string | undefined;
-			} catch {
-				// Can't read manifest — treat as outdated
-			}
-		}
+		const cachedVersion = await readManifestVersion(manifestPath);
 
 		// Fetch registry to get latest version
 		const registryUrl = `https://raw.githubusercontent.com/jolliai/themes/main/registry.json`;
@@ -277,8 +257,35 @@ async function checkAndUpdateCachedTheme(name: string, _cachedPath: string): Pro
 		console.log(`  Updating theme "${name}" (${cachedVersion ?? "unknown"} → ${entry.version})...`);
 		await downloadTheme(name, entry.version);
 		console.log(`  ✓ Theme "${name}" updated to ${entry.version}`);
+		// If the theme's index.mjs / css.mjs / layout.mjs were imported earlier
+		// in this process (long-running `jolli dev`), Node's ESM cache keeps
+		// serving the previously-loaded copies — the disk update can't take
+		// effect until the process restarts. Tell the user explicitly so a
+		// successful "Updated to X.Y.Z" message isn't misleading.
+		console.log(`  ↻ Restart the current process to apply the updated theme.`);
 	} catch {
 		// Network error or download failure — keep cached version
+	}
+}
+
+/**
+ * Reads the `version` field from a theme's `manifest.mjs` via a text scan.
+ * Intentionally avoids `import()` so the file URL stays out of Node's ESM
+ * module cache — see the comment in `checkAndUpdateCachedTheme` for why.
+ *
+ * Returns `undefined` when the file is missing, unreadable, or has no
+ * `version: "..."` literal. The caller treats `undefined` as "outdated" and
+ * triggers a fresh download.
+ *
+ * Exported for unit testing — call site is in `checkAndUpdateCachedTheme`.
+ */
+export async function readManifestVersion(manifestPath: string): Promise<string | undefined> {
+	try {
+		const text = await readFile(manifestPath, "utf-8");
+		const match = text.match(/version\s*:\s*["']([^"']+)["']/);
+		return match?.[1];
+	} catch {
+		return undefined;
 	}
 }
 
@@ -306,7 +313,7 @@ async function loadFromPath(themePath: string): Promise<ThemePackProvider> {
 }
 
 /**
- * Dynamically imports a theme module (file URL or npm package name),
+ * Dynamically imports a theme module from a file URL,
  * validates the default export, and registers it.
  */
 async function loadFromModule(moduleSpecifier: string): Promise<ThemePackProvider> {

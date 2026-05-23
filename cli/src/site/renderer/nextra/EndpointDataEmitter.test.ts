@@ -224,4 +224,23 @@ describe("emitEndpointData", () => {
 		expect(data.responses[0].schema).toEqual({ type: "object" });
 		expect(data.responses[1].status).toBe("404");
 	});
+
+	it("omits description / contentType / schema on a response that doesn't define them", () => {
+		const op = makeOp({ responses: [{ status: "204" }] });
+		const data = decode(emitEndpointData("petstore", op, makeSpec()).content) as {
+			responses: Array<Record<string, unknown>>;
+		};
+		expect(data.responses[0]).toEqual({ status: "204" });
+	});
+
+	it("omits the request body example when neither a literal example nor a synthesisable schema is supplied", () => {
+		const op = makeOp({
+			requestBody: { required: false, contentType: "application/octet-stream" },
+		});
+		const data = decode(emitEndpointData("petstore", op, makeSpec()).content) as {
+			requestBody: Record<string, unknown>;
+		};
+		expect(data.requestBody).toEqual({ contentType: "application/octet-stream", required: false });
+		expect("example" in data.requestBody).toBe(false);
+	});
 });

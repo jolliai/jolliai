@@ -13,7 +13,7 @@
  */
 
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Mocks ────────────────────────────────────────────────────────────────────
 
@@ -279,17 +279,18 @@ describe("NpmRunner.runNpmBuild", () => {
 /** Creates a mock ChildProcess with stdout/stderr streams for pipe mode. */
 function makeMockChild() {
 	const handlers: Record<string, ((...args: unknown[]) => void)[]> = {};
-	const streamHandlers: Record<string, ((...args: unknown[]) => void)[]> = {};
-	const mockStream = {
+	const stdoutHandlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+	const stderrHandlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+	const makeStream = (store: Record<string, ((...args: unknown[]) => void)[]>) => ({
 		on(event: string, handler: (...args: unknown[]) => void) {
-			if (!streamHandlers[event]) streamHandlers[event] = [];
-			streamHandlers[event].push(handler);
+			if (!store[event]) store[event] = [];
+			store[event].push(handler);
 			return this;
 		},
-	};
+	});
 	return {
-		stdout: mockStream,
-		stderr: { on: vi.fn() },
+		stdout: makeStream(stdoutHandlers),
+		stderr: makeStream(stderrHandlers),
 		on(event: string, handler: (...args: unknown[]) => void) {
 			if (!handlers[event]) handlers[event] = [];
 			handlers[event].push(handler);
@@ -297,6 +298,12 @@ function makeMockChild() {
 		},
 		emit(event: string, ...args: unknown[]) {
 			for (const h of handlers[event] ?? []) h(...args);
+		},
+		emitStdout(event: string, ...args: unknown[]) {
+			for (const h of stdoutHandlers[event] ?? []) h(...args);
+		},
+		emitStderr(event: string, ...args: unknown[]) {
+			for (const h of stderrHandlers[event] ?? []) h(...args);
 		},
 	};
 }
@@ -369,5 +376,133 @@ describe("NpmRunner.runNpmDev", () => {
 		expect(invocation).toContain("npm");
 		expect(invocation).toContain("dev");
 		expect(call[2]).toEqual(expect.objectContaining({ cwd: "/my/build/dir", stdio: "pipe" }));
+	});
+
+	// Trigger stdout/stderr data events to cover the child.stdout?.on / child.stderr?.on callback bodies.
+	it("forwards stdout data chunks to the output filter", async () => {
+		const { runNpmDev } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runNpmDev("/build/dir");
+		child.emitStdout("data", Buffer.from("ready - started server"));
+		child.emit("close", 0);
+
+		const result = await promise;
+		expect(result.url).toBe("http://localhost:3000");
+	});
+
+	it("forwards stderr data chunks to the output filter", async () => {
+		const { runNpmDev } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runNpmDev("/build/dir");
+		child.emitStderr("data", Buffer.from("warning: something"));
+		child.emit("close", 0);
+
+		const result = await promise;
+		expect(result.success).toBe(true);
+	});
+});
+
+// ─── runServe ─────────────────────────────────────────────────────────────────
+
+describe("NpmRunner.runServe", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it("spawns npx serve out inside buildDir", async () => {
+		const { runServe } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runServe("/my/build/dir");
+		child.emit("close", 0);
+
+		const result = await promise;
+		expect(result.success).toBe(true);
+
+		const call = mockSpawn.mock.calls[0];
+		const invocation = `${call[0]} ${(call[1] ?? []).join(" ")}`;
+		expect(invocation).toContain("npx");
+		expect(invocation).toContain("serve");
+		expect(invocation).toContain("out");
+		expect(call[2]).toEqual(expect.objectContaining({ cwd: "/my/build/dir", stdio: "pipe" }));
+	});
+});
+
+// ─── runNpmStart ──────────────────────────────────────────────────────────────
+
+describe("NpmRunner.runNpmStart", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it("spawns npm start inside buildDir", async () => {
+		const { runNpmStart } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runNpmStart("/my/build/dir");
+		child.emit("close", 0);
+
+		const result = await promise;
+		expect(result.success).toBe(true);
+
+		const call = mockSpawn.mock.calls[0];
+		const invocation = `${call[0]} ${(call[1] ?? []).join(" ")}`;
+		expect(invocation).toContain("npm");
+		expect(invocation).toContain("start");
+		expect(call[2]).toEqual(expect.objectContaining({ cwd: "/my/build/dir", stdio: "pipe" }));
+	});
+});
+
+// ─── Windows platform branch ──────────────────────────────────────────────────
+//
+// The module-level `IS_WIN = process.platform === "win32"` and the ternary in
+// `shellCmd` are constants evaluated once at module load. To cover the
+// IS_WIN === true branch we stub `process.platform` and then force a fresh
+// module load via `vi.resetModules()`.
+describe("NpmRunner on Windows", () => {
+	const originalPlatform = process.platform;
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		vi.resetModules();
+		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+	});
+
+	afterEach(() => {
+		Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+	});
+
+	it("joins cmd and args into a single string with shell: true for runNpmBuild", async () => {
+		const { runNpmBuild } = await import("./NpmRunner.js");
+		mockSpawnSync.mockReturnValue(makeSpawnResult(0));
+
+		await runNpmBuild("/my/build/dir");
+
+		const call = mockSpawnSync.mock.calls[0];
+		// On Windows it should be the single string "npm run build" with empty args.
+		expect(call[0]).toBe("npm run build");
+		expect(call[1]).toEqual([]);
+		expect(call[2]).toEqual(expect.objectContaining({ shell: true }));
+	});
+
+	it("joins cmd and args into a single string with shell: true for runNpmDev", async () => {
+		const { runNpmDev } = await import("./NpmRunner.js");
+		const child = makeMockChild();
+		mockSpawn.mockReturnValue(child);
+
+		const promise = runNpmDev("/build/dir");
+		child.emit("close", 0);
+		await promise;
+
+		const call = mockSpawn.mock.calls[0];
+		expect(call[0]).toBe("npm run dev");
+		expect(call[1]).toEqual([]);
+		expect(call[2]).toEqual(expect.objectContaining({ shell: true }));
 	});
 });

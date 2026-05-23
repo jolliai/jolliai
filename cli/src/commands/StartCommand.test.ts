@@ -1111,7 +1111,43 @@ describe("buildRootInjectionInput", () => {
 	});
 });
 
-// ─── pickRootRedirectHref / writeRootRedirectIndex unit tests ─────────────────
+// ─── hasUserAuthoredRootIndex / pickRootRedirectHref / writeRootRedirectIndex unit tests ────
+
+describe("hasUserAuthoredRootIndex", () => {
+	it("returns true when the mirror has a root index.md", async () => {
+		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
+		expect(hasUserAuthoredRootIndex({ markdownFiles: ["index.md", "foo.md"] })).toBe(true);
+	});
+
+	it("returns true when the mirror has a root index.mdx", async () => {
+		// Covers user-authored MDX landing pages.
+		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
+		expect(hasUserAuthoredRootIndex({ markdownFiles: ["index.mdx", "foo.md"] })).toBe(true);
+	});
+
+	it("returns false when no index file is present", async () => {
+		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
+		expect(hasUserAuthoredRootIndex({ markdownFiles: ["docs/getting-started.md", "api.md"] })).toBe(false);
+	});
+
+	it("returns false when only a nested index exists — only the root index claims `/`", async () => {
+		// Regression guard: `docs/index.md` is the index of the `/docs` folder,
+		// not the site root. Treating it as a user-authored root index would
+		// suppress the page-mode redirect for sites that legitimately need it.
+		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
+		expect(hasUserAuthoredRootIndex({ markdownFiles: ["docs/index.md", "api/index.mdx"] })).toBe(false);
+	});
+
+	it("returns true when both a root and a nested index exist", async () => {
+		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
+		expect(hasUserAuthoredRootIndex({ markdownFiles: ["index.md", "docs/index.md"] })).toBe(true);
+	});
+
+	it("returns false for an empty markdown list", async () => {
+		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
+		expect(hasUserAuthoredRootIndex({ markdownFiles: [] })).toBe(false);
+	});
+});
 
 describe("pickRootRedirectHref", () => {
 	it("returns the first navigable page href when no page is rooted at /", async () => {

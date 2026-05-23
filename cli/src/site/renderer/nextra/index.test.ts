@@ -98,6 +98,15 @@ describe("emitNextraOpenApiForSpec", () => {
 		expect(mdx?.content).not.toContain("curl -X GET");
 	});
 
+	it("falls back to https://api.example.com when the spec has no servers", () => {
+		// servers: [] forces the `?? "https://api.example.com"` branch.
+		const op = makeOp();
+		const spec = makeSpec({ servers: [], operations: [op] });
+		const files = emitNextraOpenApiForSpec("petstore", { spec, dossiers: [] });
+		const mdx = files.find((f) => f.path === "content/api-petstore/pets/listpets.mdx");
+		expect(mdx?.content).toContain("https://api.example.com");
+	});
+
 	it("returns an empty array if the spec has no operations (just overview, refs, top-level _meta)", () => {
 		const input = makeInput({
 			pipeline: { spec: makeSpec({ operations: [], tags: [] }), dossiers: [] },

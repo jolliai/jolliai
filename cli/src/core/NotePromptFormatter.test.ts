@@ -89,4 +89,10 @@ describe("formatNotesBlock", () => {
 		const out = await formatNotesBlock([makeNote({ format: "markdown" })]);
 		expect(out).toContain('format="markdown"');
 	});
+
+	it("returns empty string when the first note alone already exceeds maxTotalChars", async () => {
+		mockReadFile.mockResolvedValue("body");
+		const out = await formatNotesBlock([makeNote()], { maxTotalChars: 1 });
+		expect(out).toBe("");
+	});
 });

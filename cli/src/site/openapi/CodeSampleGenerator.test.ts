@@ -70,6 +70,10 @@ describe("toPythonLiteral", () => {
 	it("escapes string special characters via JSON.stringify", () => {
 		expect(toPythonLiteral('quote "inside"')).toBe('"quote \\"inside\\""');
 	});
+
+	it("falls back to JSON.stringify for values not handled by the typed branches (symbol)", () => {
+		expect(toPythonLiteral(Symbol("x") as unknown)).toBe(undefined as unknown as string);
+	});
 });
 
 // ─── goStringLiteral ─────────────────────────────────────────────────────────
@@ -164,6 +168,18 @@ describe("generateCodeSamples — body handling", () => {
 		expect(samples.curl).toContain("https://api.example.com/widgets");
 		expect(samples.curl).not.toContain("//widgets");
 	});
+
+	it("falls back to an empty `{}` body across all languages when requestBody is present but example/schema yield no value", () => {
+		const op = makeOp({
+			requestBody: { required: true, contentType: "application/json", example: null },
+		});
+		const samples = generateCodeSamples(op, "https://api.example.com", NO_SCHEMES);
+		expect(samples.curl).toContain("-d '{}'");
+		expect(samples.js).toContain("JSON.stringify({})");
+		expect(samples.ts).toContain("JSON.stringify({})");
+		expect(samples.python).toContain("payload = {}");
+		expect(samples.go).toContain("strings.NewReader(`{}`)");
+	});
 });
 
 // ─── generateCodeSamples — parameters & auth ─────────────────────────────────
@@ -249,6 +265,24 @@ describe("generateCodeSamples — parameters and auth", () => {
 		const op = makeOp({ method: "get", path: "/me", security: [{ ghost: [] }] });
 		const samples = generateCodeSamples(op, "https://api.example.com", NO_SCHEMES);
 		expect(samples.curl).not.toContain("Authorization");
+	});
+
+	it("emits no auth placeholder for an apiKey scheme whose `in` is neither header nor query", () => {
+		const op = makeOp({ method: "get", path: "/me", security: [{ apiKey: [] }] });
+		const samples = generateCodeSamples(op, "https://api.example.com", {
+			apiKey: { type: "apiKey", name: "session", in: "cookie" } as OpenApiSecurityScheme,
+		});
+		expect(samples.curl).not.toContain("YOUR_API_KEY");
+		expect(samples.curl).not.toContain("session");
+	});
+
+	it("ignores unrecognised security scheme types (e.g. mutualTLS)", () => {
+		const op = makeOp({ method: "get", path: "/me", security: [{ mtls: [] }] });
+		const samples = generateCodeSamples(op, "https://api.example.com", {
+			mtls: { type: "mutualTLS" } as unknown as OpenApiSecurityScheme,
+		});
+		expect(samples.curl).not.toContain("Authorization");
+		expect(samples.curl).not.toContain("YOUR_");
 	});
 });
 

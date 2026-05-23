@@ -417,5 +417,58 @@ describe("Locks", () => {
 
 			execSpy.mockRestore();
 		});
+
+		// `acquireOrphanWriteLock()` with no `cwd` argument is the production
+		// call shape for callers that don't track the project root explicitly.
+		// Exercises the `cwd ?? process.cwd()` right-hand branch.
+		it("uses process.cwd() when cwd argument is omitted", async () => {
+			__resetSharedLockDirCache();
+			const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(tempDir);
+
+			expect(await acquireOrphanWriteLock()).toBe(true);
+			const expected = join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE);
+			expect((await stat(expected)).isFile()).toBe(true);
+			await releaseOrphanWriteLock();
+
+			cwdSpy.mockRestore();
+			__resetSharedLockDirCache();
+		});
+
+		// `git rev-parse --git-common-dir` returns an absolute path for linked
+		// worktrees. Exercises the `isAbsolute(commonDir) ? commonDir : …`
+		// true branch — local macOS/Linux `git init` returns ".git" so this is
+		// only reachable through a mock.
+		it("uses the absolute common dir directly when git returns one", async () => {
+			__resetSharedLockDirCache();
+			const absoluteCommonDir = join(tempDir, ".git");
+			const Subprocess = await import("../util/Subprocess.js");
+			const execSpy = vi
+				.spyOn(Subprocess, "execFileAsyncHidden")
+				.mockResolvedValue({ stdout: `${absoluteCommonDir}\n`, stderr: "" });
+
+			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
+			const expected = join(absoluteCommonDir, "jollimemory", ORPHAN_WRITE_LOCK_FILE);
+			expect((await stat(expected)).isFile()).toBe(true);
+			await releaseOrphanWriteLock(tempDir);
+
+			execSpy.mockRestore();
+			__resetSharedLockDirCache();
+		});
+	});
+
+	describe("readLockOwnerPid edge cases", () => {
+		// `pid.length > 0 ? pid : null` — exercises the empty-PID branch where
+		// readLockOwnerPid returns null even though the lock file exists. The
+		// release path then falls through to rm (treating "unowned" as "ours").
+		it("treats an empty lock file as unowned and removes it on release", async () => {
+			const fsPromises = await import("node:fs/promises");
+			await fsPromises.mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
+			const lockPath = workerLockPath(tempDir);
+			await writeFile(lockPath, "   \n", "utf-8");
+
+			await releaseWorkerLock(tempDir);
+
+			await expect(stat(lockPath)).rejects.toThrow();
+		});
 	});
 });

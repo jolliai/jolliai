@@ -12,7 +12,21 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Hoisted mock — defaults to the real mkdir, individual tests can override.
+const { mockMkdir } = vi.hoisted(() => ({
+	mockMkdir: vi.fn(),
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	mockMkdir.mockImplementation(actual.mkdir);
+	return {
+		...actual,
+		mkdir: mockMkdir,
+	};
+});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -260,5 +274,19 @@ describe("StarterKit.scaffoldProject", () => {
 
 		expect(result.success).toBe(false);
 		expect(result.message).toBeTruthy();
+	});
+
+	it("stringifies non-Error throwables when a filesystem operation rejects with a primitive", async () => {
+		// Force mkdir to reject with a plain string so the catch block walks the
+		// `String(err)` branch instead of `err.message`.
+		mockMkdir.mockRejectedValueOnce("plain-string-failure");
+
+		const { scaffoldProject } = await import("./StarterKit.js");
+		const targetDir = join(tempBase, "non-error-throw");
+
+		const result = await scaffoldProject(targetDir);
+
+		expect(result.success).toBe(false);
+		expect(result.message).toBe("plain-string-failure");
 	});
 });

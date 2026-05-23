@@ -77,6 +77,12 @@ describe("emitOverviewPage", () => {
 		expect(file.content).toContain("— Prod");
 	});
 
+	it("omits the description suffix for servers without a description", () => {
+		const file = emitOverviewPage("petstore", makeSpec({ servers: [{ url: "https://api.example.com" }] }));
+		expect(file.content).toContain("- `https://api.example.com`\n");
+		expect(file.content).not.toContain("—");
+	});
+
 	it("groups operations by tag and renders one table per tag (declaration order)", () => {
 		const spec = makeSpec({
 			tags: [{ name: "users", description: "User ops" }, { name: "pets" }],

@@ -817,7 +817,7 @@ describe("Login", () => {
 		});
 
 		it("omits device_name when getDeviceLabel returns undefined (sanitized to empty)", async () => {
-			// Hostname like "中文" sanitizes to undefined — we must not send the
+			// A non-Latin hostname sanitizes to undefined — we must not send the
 			// param so the server falls back to its legacy keyName path.
 			mockLoadConfig.mockResolvedValue({});
 			mockGetDeviceLabel.mockReturnValue(undefined);

@@ -250,6 +250,15 @@ describe("registerHealFolderCommand", () => {
 		expect(stdout).not.toContain("Re-run `jolli enable`");
 	});
 
+	// failed > 0 with skipped === 0: covers the "Skipped:" line being omitted
+	// alongside the failed line.
+	it("omits the Skipped line when only failed entries exist", async () => {
+		mockCreateStorage.mockResolvedValue(makeStorageWith({ healed: 0, skipped: 0, failed: 2 }));
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-only-failed"]);
+		expect(stdout).toContain("Failed:   2");
+		expect(stdout).not.toMatch(/Skipped:\s+\d/);
+	});
+
 	// When the underlying error carries an errno code (EACCES / ENOSPC / ...)
 	// the CLI must surface it so operators see the failure category, not just
 	// a bare message.

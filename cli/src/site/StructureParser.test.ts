@@ -518,3 +518,139 @@ describe("multi-segment hrefs", () => {
 		expect(root.intro).toBe("Intro");
 	});
 });
+
+// ─── Edge cases ─────────────────────────────────────────────────────────────
+
+describe("edge cases", () => {
+	it("parsePages returns defaultPageHref '/' for empty pages array", () => {
+		const result = parsePages([]);
+		expect(result.defaultPageHref).toBe("/");
+		expect(result.pages).toEqual([]);
+		expect(result.rootPages).toEqual([]);
+		expect(result.openapiPages).toEqual([]);
+	});
+
+	it("parseNavigation skips validation body for pages without content (menu, openapi)", () => {
+		const pages: NavigationPage[] = [
+			{ page: "Menu", type: "menu", items: [{ label: "Slack", url: "https://slack.example.com" }] },
+			{ page: "API", openapi: "./api.yaml" },
+		];
+		const result = parseNavigation(pages);
+		expect(result.pages).toHaveLength(2);
+		expect(result.openapiPages).toHaveLength(1);
+	});
+
+	it("page.root='/' is preserved as the root href", () => {
+		const pages: NavigationPage[] = [{ page: "Home", root: "/", content: [] }];
+		const result = parsePages(pages);
+		expect(result.pages?.[0].href).toBe("/");
+		expect(result.pages?.[0].key).toBe("/");
+		expect(result.defaultPageHref).toBe("/");
+	});
+
+	it("page.root without leading slash is normalized", () => {
+		const pages: NavigationPage[] = [{ page: "Docs", root: "docs-no-slash", content: [] }];
+		const result = parsePages(pages);
+		expect(result.pages?.[0].href).toBe("/docs-no-slash");
+	});
+
+	it("openapi page with non-'api-' root keeps the full key as specName", () => {
+		const pages: NavigationPage[] = [{ page: "Spec", root: "/openapi-direct", openapi: "./spec.yaml" }];
+		const result = parsePages(pages);
+		expect(result.openapiPages?.[0]).toEqual({
+			key: "openapi-direct",
+			title: "Spec",
+			href: "/openapi-direct",
+			specPath: "./spec.yaml",
+			specName: "openapi-direct",
+		});
+	});
+
+	it("group with root and empty content writes no sidebar entry for the group path", () => {
+		const nav = [{ group: "Empty Group", root: "empty", content: [] } as NavigationGroup];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/"].empty).toBe("Empty Group");
+		expect(result.sidebar["/empty"]).toBeUndefined();
+	});
+
+	it("group root with leading slash is joined correctly with the path prefix", () => {
+		const nav = [
+			{
+				group: "API",
+				root: "/api",
+				content: [{ article: "Users", href: "users" } as NavigationArticle],
+			} as NavigationGroup,
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/"].api).toBe("API");
+		expect(result.sidebar["/api"].users).toBe("Users");
+	});
+
+	it("three-segment group root populates intermediate _meta entries", () => {
+		const nav = [
+			{
+				group: "Deep",
+				root: "a/b/c",
+				content: [{ article: "Leaf", href: "leaf" } as NavigationArticle],
+			} as NavigationGroup,
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/"].a).toBe("a");
+		expect(result.sidebar["/a"].b).toBe("b");
+		expect(result.sidebar["/a/b"].c).toBe("Deep");
+		expect(result.sidebar["/a/b/c"].leaf).toBe("Leaf");
+	});
+
+	it("two groups sharing the same multi-segment root reuse intermediate dirs", () => {
+		const nav = [
+			{
+				group: "First",
+				root: "shared/one",
+				content: [{ article: "A", href: "a" } as NavigationArticle],
+			} as NavigationGroup,
+			{
+				group: "Second",
+				root: "shared/two",
+				content: [{ article: "B", href: "b" } as NavigationArticle],
+			} as NavigationGroup,
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/shared"].one).toBe("First");
+		expect(result.sidebar["/shared"].two).toBe("Second");
+		expect(result.sidebar["/shared/one"].a).toBe("A");
+		expect(result.sidebar["/shared/two"].b).toBe("B");
+	});
+
+	it("article with absolute href and nested children resolves parentDir from href", () => {
+		const nav = [
+			{
+				article: "Guide",
+				href: "/guide",
+				articles: [{ article: "Step", href: "step" } as NavigationArticle],
+			} as NavigationArticle,
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/"].guide).toBe("Guide");
+		expect(result.sidebar["/guide"].step).toBe("Step");
+	});
+
+	it("article with multi-segment relative href and nested children resolves parentDir via joinPath", () => {
+		const nav = [
+			{
+				group: "Guides",
+				root: "guides",
+				content: [
+					{
+						article: "Multi",
+						href: "a/b",
+						articles: [{ article: "Child", href: "child" } as NavigationArticle],
+					} as NavigationArticle,
+				],
+			} as NavigationGroup,
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/guides"].a).toBe("a");
+		expect(result.sidebar["/guides/a"].b).toBe("Multi");
+		expect(result.sidebar["/guides/a"].child).toBe("Child");
+	});
+});

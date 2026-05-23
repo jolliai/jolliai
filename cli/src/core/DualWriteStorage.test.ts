@@ -741,6 +741,31 @@ describe("DualWriteStorage", () => {
 			expect(result.healed).toBe(2);
 		});
 
+		// Defensive: a misbehaving provider might resolve to undefined despite
+		// the StorageProvider contract. The nullish-coalesce fallback in
+		// DualWriteStorage must turn that into the standard zero-counts shape
+		// so callers can rely on a non-null HealResult.
+		it("returns zero counts when the folder side resolves to undefined", async () => {
+			const folderHeal = vi.fn().mockResolvedValue(undefined);
+			const orphan = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const folder = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+				healMissingVisibleMarkdown: folderHeal,
+			} as unknown as StorageProvider;
+			const dual = new DualWriteStorage(orphan, folder);
+			await expect(dual.healMissingVisibleMarkdown()).resolves.toEqual({ healed: 0, skipped: 0, failed: 0 });
+		});
+
 		it("marks dirty and returns error-tagged result when the folder side throws", async () => {
 			const folderHeal = vi.fn().mockRejectedValue(new Error("manifest read failed"));
 			const markDirty = vi.fn();

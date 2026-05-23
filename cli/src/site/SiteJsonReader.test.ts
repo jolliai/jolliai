@@ -633,4 +633,97 @@ describe("SiteJsonReader.readSiteJson", () => {
 		expect(result.config.footer?.socialLinks?.twitter).toBe("https://twitter.com/acme");
 		expect(result.config.footer?.socialLinks?.x).toBeUndefined();
 	});
+
+	// ── branding.logo present but all fields undefined ──────────────────────
+
+	it("leaves theme.logo* unchanged when branding.logo has no defined fields", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "T",
+			description: "D",
+			nav: [],
+			branding: { logo: {} },
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson), "utf-8");
+		const result = await readSiteJson(tempDir);
+		expect(result.config.theme?.logoUrl).toBeUndefined();
+		expect(result.config.theme?.logoUrlDark).toBeUndefined();
+		expect(result.config.theme?.logoText).toBeUndefined();
+		expect(result.config.theme?.logoDisplay).toBeUndefined();
+	});
+
+	// ── docusaurus favicon extraction ───────────────────────────────────────
+
+	it("copies favicon from docusaurus config into site.json", async () => {
+		mockPromptSequence("y", "Docs With Favicon");
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		await writeFile(join(tempDir, "sidebars.js"), `module.exports = { docsSidebar: ['intro'] }`, "utf-8");
+		await writeFile(
+			join(tempDir, "docusaurus.config.js"),
+			`module.exports = { favicon: "img/favicon.ico" }`,
+			"utf-8",
+		);
+
+		const result = await readSiteJson(tempDir);
+
+		expect(result.config.favicon).toBeDefined();
+		expect(result.config.favicon).toContain("favicon.ico");
+	});
+
+	// ── catch block when convertDocusaurusSidebar throws ────────────────────
+
+	it("warns and continues when docusaurus sidebar conversion throws an Error", async () => {
+		mockPromptSequence("y", "Title");
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		// A "link" item with no label triggers slugify(undefined) → TypeError inside the converter.
+		await writeFile(
+			join(tempDir, "sidebars.js"),
+			`module.exports = { docsSidebar: [{ type: 'link', href: '/x' }] }`,
+			"utf-8",
+		);
+
+		const result = await readSiteJson(tempDir);
+
+		expect(result.usedDefault).toBe(true);
+		expect(result.config.sidebar).toBeUndefined();
+		const output = warnSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+		expect(output).toContain("Failed to convert sidebar");
+	});
+
+	it("warns when docusaurus sidebar conversion throws a non-Error value", async () => {
+		mockPromptSequence("y", "Title");
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		vi.resetModules();
+		vi.doMock("./DocusaurusConverter.js", async () => {
+			const actual = await vi.importActual<typeof import("./DocusaurusConverter.js")>("./DocusaurusConverter.js");
+			return {
+				...actual,
+				convertDocusaurusSidebar: vi.fn(async () => {
+					throw "string-error";
+				}),
+			};
+		});
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		await writeFile(join(tempDir, "sidebars.js"), `module.exports = { docsSidebar: ['intro'] }`, "utf-8");
+
+		const result = await readSiteJson(tempDir);
+
+		expect(result.usedDefault).toBe(true);
+		const output = warnSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+		expect(output).toContain("string-error");
+		vi.doUnmock("./DocusaurusConverter.js");
+	});
+
+	// ── JSON.parse throws a non-Error value ─────────────────────────────────
+
+	it("formats the parse error when JSON.parse throws a non-Error value", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		await writeFile(join(tempDir, "site.json"), "{}", "utf-8");
+		vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
+			throw "boom";
+		});
+
+		await expect(readSiteJson(tempDir)).rejects.toThrow("boom");
+	});
 });

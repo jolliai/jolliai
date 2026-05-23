@@ -268,6 +268,41 @@ describe("AssetResolver", () => {
 			expect(result.isPlaceholder).toBe(true);
 			expect(result.publicPath).toContain("placeholder-");
 		});
+
+		it("handles extensionless asset located outside the projectRoot", async () => {
+			const { resolveExternalImage } = await import("./AssetResolver.js");
+			// projectRoot anchors to projectDir via package.json marker; asset lives
+			// in tempDir (outside projectRoot) and has no file extension. This
+			// exercises generateUniqueName's basename fallback and empty-ext branch.
+			const projectDir = join(tempDir, "project");
+			const docsDir = join(projectDir, "docs");
+			await mkdir(docsDir, { recursive: true });
+			await writeFile(join(projectDir, "package.json"), "{}", "utf-8");
+			await writeFile(join(tempDir, "extless-file"), "binary", "utf-8");
+
+			const result = resolveExternalImage("../../extless-file", docsDir, docsDir);
+
+			expect(result.isPlaceholder).toBe(false);
+			expect(result.publicPath).toBe("images/extless-file");
+		});
+
+		it("breaks the findProjectRoot search loop when the path bottoms out at the filesystem root", async () => {
+			const { resolveExternalImage } = await import("./AssetResolver.js");
+			// A shallow sourceRoot under /tmp/ lets findProjectRoot reach `/`
+			// within its 5-iteration budget, exercising the `parent === dir`
+			// early-break branch. Use a unique, guaranteed-missing image name so
+			// all candidates fail and the result is a placeholder.
+			const shallowRoot = await mkdtemp("/tmp/jolli-assetresolver-shallow-");
+			try {
+				const uniqueName = `nope-${Date.now()}-${Math.random().toString(36).slice(2)}.png`;
+				const result = resolveExternalImage(uniqueName, shallowRoot, shallowRoot);
+
+				expect(result.isPlaceholder).toBe(true);
+				expect(result.publicPath).toContain("placeholder-");
+			} finally {
+				await rm(shallowRoot, { recursive: true, force: true });
+			}
+		});
 	});
 
 	// ── copyExternalAsset — placeholder content ─────────────────────────────

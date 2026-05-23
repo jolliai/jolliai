@@ -515,3 +515,162 @@ describe("parseFullSpec — robustness", () => {
 		expect(spec.tags.map((t) => t.name)).toEqual(["good"]);
 	});
 });
+
+// ─── Optional field passthrough (schema / example / description) ─────────────
+
+describe("parseFullSpec — optional field passthrough", () => {
+	it("returns undefined when a $ref walks through a non-object segment", () => {
+		// `info.title` is a string, so descending into `info/title/anything`
+		// hits the non-object guard inside resolveRef and bails out.
+		const doc = makeDoc({
+			info: { title: "T", version: "1" },
+			paths: {
+				"/x": { get: { parameters: [{ $ref: "#/info/title/nope" }] } },
+			},
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].parameters).toEqual([]);
+	});
+
+	it("carries schema and example through on parameter entries", () => {
+		const schema = { type: "integer", minimum: 1 };
+		const doc = makeDoc({
+			paths: {
+				"/x": {
+					get: {
+						parameters: [{ name: "limit", in: "query", schema, example: 25 }],
+					},
+				},
+			},
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].parameters[0].schema).toBe(schema);
+		expect(spec.operations[0].parameters[0].example).toBe(25);
+	});
+
+	it("carries description and media-type example through on the request body", () => {
+		const example = { name: "ada" };
+		const doc = makeDoc({
+			paths: {
+				"/x": {
+					post: {
+						requestBody: {
+							description: "the payload",
+							content: { "application/json": { schema: { type: "object" }, example } },
+						},
+					},
+				},
+			},
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].requestBody?.description).toBe("the payload");
+		expect(spec.operations[0].requestBody?.example).toBe(example);
+	});
+
+	it("carries the media-type example through on responses", () => {
+		const example = { ok: true };
+		const doc = makeDoc({
+			paths: {
+				"/x": {
+					get: {
+						responses: {
+							"200": {
+								description: "ok",
+								content: { "application/json": { schema: { type: "object" }, example } },
+							},
+						},
+					},
+				},
+			},
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].responses[0].example).toBe(example);
+	});
+
+	it("skips responses whose $ref can't be resolved", () => {
+		const doc = makeDoc({
+			paths: {
+				"/x": {
+					get: {
+						responses: {
+							"200": { description: "ok" },
+							"404": { $ref: "#/components/responses/Missing" },
+						},
+					},
+				},
+			},
+			components: { responses: {} },
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].responses.map((r) => r.status)).toEqual(["200"]);
+	});
+
+	it("preserves the operation-level summary and description when supplied", () => {
+		const doc = makeDoc({
+			paths: { "/x": { get: { summary: "list things", description: "the long form" } } },
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].summary).toBe("list things");
+		expect(spec.operations[0].description).toBe("the long form");
+	});
+
+	it("preserves the description on an operation-level servers override entry", () => {
+		const doc = makeDoc({
+			paths: {
+				"/x": {
+					get: {
+						servers: [{ url: "https://override.example.com", description: "ovr" }],
+					},
+				},
+			},
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].servers).toEqual([{ url: "https://override.example.com", description: "ovr" }]);
+	});
+
+	it("supplies sensible defaults when the spec has no info object at all", () => {
+		const doc = { openapi: "3.1.0" } as unknown as OpenApiDocument;
+		const spec = parseFullSpec(doc);
+		expect(spec.info).toEqual({ title: "API Reference", version: "1.0.0", description: "" });
+	});
+
+	it("drops parameter entries whose `in` is not a string", () => {
+		const doc = makeDoc({
+			paths: {
+				"/x": { get: { parameters: [{ name: "broken", in: 42 as unknown as string }] } },
+			},
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].parameters).toEqual([]);
+	});
+
+	it("returns a request body with no schema when the media entry omits it", () => {
+		const doc = makeDoc({
+			paths: {
+				"/x": { post: { requestBody: { content: { "application/json": {} } } } },
+			},
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].requestBody?.contentType).toBe("application/json");
+		expect(spec.operations[0].requestBody?.schema).toBeUndefined();
+	});
+
+	it("returns a response with no description and no schema when both are absent", () => {
+		const doc = makeDoc({
+			paths: {
+				"/x": {
+					get: {
+						responses: {
+							"204": { content: { "application/json": {} } },
+						},
+					},
+				},
+			},
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].responses[0].status).toBe("204");
+		expect(spec.operations[0].responses[0].description).toBeUndefined();
+		expect(spec.operations[0].responses[0].schema).toBeUndefined();
+		expect(spec.operations[0].responses[0].contentType).toBe("application/json");
+	});
+});

@@ -174,7 +174,8 @@ export async function linkEngineModules(buildDir: string): Promise<void> {
 	}
 
 	await mkdir(buildDir, { recursive: true });
-	await symlink(target, linkPath, process.platform === "win32" ? "junction" : "dir");
+	const symlinkType = process.platform === "win32" ? /* v8 ignore next */ "junction" : "dir";
+	await symlink(target, linkPath, symlinkType);
 }
 
 // ─── Lock helpers ───────────────────────────────────────────────────────────

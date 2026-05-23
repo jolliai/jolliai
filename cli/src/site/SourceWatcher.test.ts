@@ -9,6 +9,13 @@ import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { startSourceWatcher, type WatchFactory } from "./SourceWatcher.js";
 
+// Mock `chokidar` so the default-factory branch (`opts.watchFactory ?? chokidarWatch`)
+// can be exercised without touching the real filesystem.
+const { mockChokidarWatch } = vi.hoisted(() => ({
+	mockChokidarWatch: vi.fn(),
+}));
+vi.mock("chokidar", () => ({ watch: mockChokidarWatch }));
+
 // ─── Stub factory ──────────────────────────────────────────────────────────
 
 interface StubWatcher extends EventEmitter {
@@ -247,6 +254,21 @@ describe("startSourceWatcher", () => {
 
 		expect(onChange).not.toHaveBeenCalled();
 		expect(stub.closeMock).toHaveBeenCalled();
+	});
+
+	it("falls back to the default chokidar.watch factory when none is supplied", async () => {
+		const { factory, getWatcher } = makeStubFactory();
+		// Route the default `chokidar.watch` through our stub factory so we don't
+		// touch the real filesystem.
+		mockChokidarWatch.mockImplementationOnce(factory);
+
+		const onChange = vi.fn().mockResolvedValue(undefined);
+		const watcher = startSourceWatcher("/src", { onChange });
+
+		expect(mockChokidarWatch).toHaveBeenCalledWith("/src", expect.objectContaining({ ignoreInitial: true }));
+
+		await watcher.close();
+		expect(getWatcher().closeMock).toHaveBeenCalled();
 	});
 
 	it("ignores events that fire after close()", async () => {

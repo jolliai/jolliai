@@ -248,6 +248,11 @@ describe("SummaryTree", () => {
 			expect(topics[0].commitDate).toBe(v4Root.commitDate);
 			expect(topics[0].generatedAt).toBe(v4Root.generatedAt);
 		});
+
+		it("returns empty array for v4 root with undefined topics (covers `?? []` fallback)", () => {
+			const noTopics: CommitSummary = { ...A, version: 4, topics: undefined };
+			expect(collectDisplayTopics(noTopics)).toEqual([]);
+		});
 	});
 
 	describe("collectAllTranscriptHashes", () => {

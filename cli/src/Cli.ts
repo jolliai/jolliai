@@ -125,16 +125,12 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 		const lines: string[] = [];
 		lines.push(`Usage: ${helper.commandUsage(cmd)}`, "");
 
-		// All five conditionals below have unreachable empty arms when invoked
-		// on the root program (description is always set, --version/--help are
-		// always present, every registered command falls into Memory or Site).
-		// The empty arms exist for defensive parity with Commander's default
-		// formatter; they are wrapped in v8 ignore blocks so the dead branches
-		// don't drag down the file's branch coverage.
 		const description = helper.commandDescription(cmd);
-		/* v8 ignore start -- defensive empty arms; see comment above */
+		/* v8 ignore start -- root program always has a description (set via .description() above) */
 		if (description) lines.push(description, "");
+		/* v8 ignore stop */
 
+		/* v8 ignore start -- root program always has visible options (--help, --version) */
 		if (visibleOpts.length > 0) {
 			/* v8 ignore stop */
 			lines.push("Options:");
@@ -144,7 +140,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
-		/* v8 ignore start -- defensive empty arm */
+		/* v8 ignore start -- root program always registers Jolli Memory commands */
 		if (memoryCmds.length > 0) {
 			/* v8 ignore stop */
 			lines.push("Jolli Memory — Auto-document AI development sessions");
@@ -156,7 +152,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
-		/* v8 ignore start -- defensive empty arm */
+		/* v8 ignore start -- root program always registers Jolli Site commands */
 		if (siteCmds.length > 0) {
 			/* v8 ignore stop */
 			lines.push("Jolli Site — Generate a docs site from your content folder");
@@ -168,7 +164,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push("");
 		}
 
-		/* v8 ignore start -- defensive empty arm: every registered command is Memory or Site today */
+		/* v8 ignore start -- root program always registers other commands (search, heal-folder, …) */
 		if (otherCmds.length > 0) {
 			/* v8 ignore stop */
 			lines.push("Other commands:");
