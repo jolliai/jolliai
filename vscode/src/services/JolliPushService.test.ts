@@ -977,4 +977,31 @@ describe("deleteFromJolli", () => {
 		expect(callArgs[0].path).toBe("/api/push/jollimemory/99");
 		expect(callArgs[0].method).toBe("DELETE");
 	});
+
+	it("uses http.request for HTTP URL (mirrors pushToJolli http branch)", async () => {
+		// The DELETE path also has to support the http://localhost dev
+		// scenario — `pushToJolli` does this above, but `deleteFromJolli`
+		// constructs its own request options and was tested only against
+		// https. Without this case the `isHttps ? httpsRequest : httpRequest`
+		// tail (and the `port || 80` fallback) would silently regress to
+		// always-https on a future refactor.
+		const mockReq = createMockRequest();
+		const mockRes: MockIncomingMessage = {
+			statusCode: 204,
+			on: vi.fn(),
+			resume: vi.fn(),
+		};
+
+		mockHttpRequest.mockImplementation(
+			(_opts: unknown, cb: (res: MockIncomingMessage) => void) => {
+				cb(mockRes);
+				return mockReq;
+			},
+		);
+
+		await deleteFromJolli("http://localhost:7034", OLD_KEY, 42);
+
+		expect(mockHttpRequest).toHaveBeenCalledOnce();
+		expect(mockHttpsRequest).not.toHaveBeenCalled();
+	});
 });

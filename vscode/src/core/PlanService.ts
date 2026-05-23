@@ -502,6 +502,7 @@ export function getCurrentBranch(cwd: string): string {
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "ignore"],
 		}).trim();
+		/* v8 ignore next 3 -- defensive: rev-parse fails only when cwd is not a git repo, which the caller already filters out before reaching here; "unknown" is the safe sentinel for an impossible state */
 	} catch {
 		return "unknown";
 	}

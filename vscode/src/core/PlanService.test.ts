@@ -963,6 +963,57 @@ describe("PlanService", () => {
 			expect(plans[0].lastModified).toBe("2025-06-01T00:00:00.000Z");
 		});
 
+		it("filters out plans whose branch differs from the current git branch", async () => {
+			// Regression guard for the per-branch plan visibility filter.
+			// Default mock returns "main" as currentBranch; the entry's branch
+			// is "feature-x" — toPlanInfo returns null and the plan is hidden.
+			// Without this filter, switching branches would surface plans from
+			// every other branch in the sidebar, drowning the active branch's
+			// plans in noise.
+			const entry = makeEntry({
+				slug: "feature-plan",
+				branch: "feature-x",
+				sourcePath: `${PLANS_DIR}/feature-plan.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "feature-plan": entry },
+			});
+			stubSessions([]);
+			mockReadFile.mockResolvedValue(
+				JSON.stringify({ version: 1, sessions: {} }),
+			);
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Feature Plan");
+
+			const plans = await detectPlans(CWD);
+			expect(plans.find((p) => p.slug === "feature-plan")).toBeUndefined();
+		});
+
+		it("filters out uncommitted plans whose source file has been deleted", async () => {
+			// Uncommitted plan (commitHash === null) + sourcePath missing on
+			// disk = the user deleted the file outside the registry. Without
+			// this filter the sidebar would show a row that 404s on click.
+			const entry = makeEntry({
+				slug: "deleted-plan",
+				commitHash: null,
+				sourcePath: `${PLANS_DIR}/deleted-plan.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "deleted-plan": entry },
+			});
+			stubSessions([]);
+			mockReadFile.mockResolvedValue(
+				JSON.stringify({ version: 1, sessions: {} }),
+			);
+			// The plan file does NOT exist anywhere.
+			mockExistsSync.mockReturnValue(false);
+
+			const plans = await detectPlans(CWD);
+			expect(plans.find((p) => p.slug === "deleted-plan")).toBeUndefined();
+		});
+
 		it("uses updatedAt as fallback when statSync throws in toPlanInfo", async () => {
 			const entry = makeEntry({
 				slug: "stat-fail",

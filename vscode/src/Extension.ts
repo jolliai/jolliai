@@ -7,6 +7,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { clearTimeout, setTimeout } from "node:timers";
 import * as vscode from "vscode";
 import {
 	conversationKey,
@@ -83,6 +84,8 @@ import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
 import { PlansStore } from "./stores/PlansStore.js";
 import { StatusStore } from "./stores/StatusStore.js";
+import { SymlinkPopupGate } from "./sync/SymlinkPopupGate.js";
+import { activateSync } from "./sync/VsCodeSyncBootstrap.js";
 import { ExcludeFilterManager } from "./util/ExcludeFilterManager.js";
 import { formatShortRelativeDate } from "./util/FormatUtils.js";
 import { isWorkerBusy } from "./util/LockUtils.js";
@@ -319,8 +322,8 @@ function registerDegradedSidebar(
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-	const workspaceRoot = getWorkspaceRoot();
-	if (!workspaceRoot) {
+	const rawRoot = getWorkspaceRoot();
+	if (!rawRoot) {
 		const noFolder = () =>
 			vscode.window.showInformationMessage(
 				"Please open a folder to use Jolli Memory.",
@@ -336,6 +339,13 @@ export function activate(context: vscode.ExtensionContext): void {
 		registerDegradedSidebar(context, "no-workspace");
 		return;
 	}
+	// Re-bind to a non-null typed const so closures defined below
+	// inherit `string` (not `string | null`). `getWorkspaceRoot()`
+	// returns `string | null`; the early-return narrows the outer
+	// binding, but TS doesn't carry that narrowing into nested
+	// functions, which is what caused the run of TS2345 errors before
+	// this fix (P2 — restore typecheck).
+	const workspaceRoot: string = rawRoot;
 
 	// Check if git is initialized — if not, offer to init
 	if (!existsSync(join(workspaceRoot, ".git"))) {
@@ -605,6 +615,31 @@ export function activate(context: vscode.ExtensionContext): void {
 	// ── Status bar ───────────────────────────────────────────────────────────
 	const statusBar = new StatusBarManager();
 	context.subscriptions.push({ dispose: () => statusBar.dispose() });
+
+	// ── Memory Bank sync (manual always-on; auto gated by config.syncEnabled — plan §0.7) ──
+	// Activate eagerly but don't block extension activation on the result —
+	// `activateSync` no-ops when sync is dormant (no Jolli sign-in). The
+	// returned Promise<SyncRuntime> is captured so the Settings save
+	// callback can call `reconcileAutoSync()` to start polling after a
+	// mid-session `syncEnabled` flip ON (plan §P2 fix).
+	//
+	// `kbInitPromise` is the gate that holds back the first sync round
+	// until `initializeKBFolder()` has written `<localFolder>/<repo>/
+	// .jolli/config.json`. Pre-fix the two ran concurrently — sync could
+	// pull from a peer device first, then KBPathResolver would see the
+	// pulled `<repo>/` dir without identity (config.json denied per
+	// AllowList §1) and allocate `<repo>-2/`, splitting content. The
+	// promise is constructed below alongside `initializeKB()`.
+	let resolveKbInit!: () => void;
+	const kbInitPromise = new Promise<void>((resolve) => {
+		resolveKbInit = resolve;
+	});
+	const syncActivation = activateSync(context, statusBar, kbInitPromise).catch(
+		(e) => {
+			log.warn("Memory Bank sync activation failed: %s", (e as Error).message);
+			return null;
+		},
+	);
 
 	// ── Stores (host-side state controllers) ────────────────────────────────
 	// Stores own mutable state, watchers, and bridge calls. Providers /
@@ -903,6 +938,54 @@ export function activate(context: vscode.ExtensionContext): void {
 		branchChangeEmitter,
 	);
 
+	// Wire the post-sync UI refresh now that `kbFoldersService` + `sidebarProvider`
+	// exist. Sync rounds finish without VS Code's file watchers picking up the
+	// `git pull` writes (the working tree mutation is invisible to webview
+	// observers), so the Memory Bank tree view stays on its pre-sync listing
+	// until something invalidates the cache and asks the webview to re-list.
+	// `activateSync` ran earlier; the runtime stashes the callback and reuses
+	// it for any orchestrator built later (eager or lazy).
+	// Edge-triggered popup for `symlink_quarantine_failed` (plan §P2 / I6).
+	// Status-bar tooltip is invisible until hover, so a security-gate stall
+	// must surface a one-shot notification. The gate re-arms on the next
+	// non-failed round, so transient EBUSY/AV cases self-recover.
+	const symlinkPopupGate = new SymlinkPopupGate();
+	void syncActivation.then((activation) => {
+		if (!activation) return; // Sync activation failed; nothing to wire.
+		activation.runtime.setOnRoundFinished((state, result) => {
+			// `refreshKnowledgeBaseFolders` covers both halves: it invalidates
+			// `KbFoldersService`'s `cleanRepos` cache AND posts `kb:foldersReset`
+			// to the webview so it re-lists from scratch. Fires for every
+			// outcome — even `offline` rounds may have landed a partial pull
+			// before failing.
+			sidebarProvider.refreshKnowledgeBaseFolders();
+			// Timeline / Memories views read `bridge.cachedRootEntries` —
+			// without invalidating, a successful sync (which pulled new
+			// summaries onto disk) keeps showing pre-sync data until the
+			// next post-commit hook clears the cache. Refresh memoriesStore
+			// too so the multi-repo aggregate picks up newly-pulled entries
+			// from sibling repos.
+			bridge.invalidateEntriesCache();
+			if (memoriesStore.hasFirstLoaded()) {
+				memoriesStore.refresh().catch(handleError("post-sync.memories"));
+			}
+			log.info("post-sync UI refresh fired (state=%s)", state);
+
+			const popup = symlinkPopupGate.consume(result);
+			if (popup !== null) {
+				vscode.window
+					.showErrorMessage(popup.message, ...popup.actions)
+					.then((picked) => {
+						if (picked === "Open Memory Bank Folder") {
+							void revealMemoryBankFolder(workspaceRoot).catch(
+								handleError("symlink-popup.reveal"),
+							);
+						}
+					});
+			}
+		});
+	});
+
 	void loadConfig().then((cfg) => {
 		currentAuthenticated = !!cfg?.authToken;
 		sidebarProvider.notifyAuthChanged(currentAuthenticated);
@@ -1004,7 +1087,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			const {
 				extractRepoName,
 				getRemoteUrl,
-				initializeKBFolder,
 				resolveKBPath,
 			} = await import("../../cli/src/core/KBPathResolver.js");
 			const { MetadataManager } = await import(
@@ -1027,7 +1109,14 @@ export function activate(context: vscode.ExtensionContext): void {
 				| string
 				| undefined;
 			const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
-			initializeKBFolder(kbRoot, repoName, remoteUrl);
+			// NOTE: do NOT release the sync gate here. `.jolli/config.json`
+			// is now on disk so the per-repo identity question is settled,
+			// but the orphan→folder migration block below still writes
+			// summaries/transcripts/plans/notes into `<kbRoot>` for
+			// minutes on first install. Releasing here would let sync
+			// `git add --all` half-written migration output. The gate is
+			// released by the outer `finally` once the whole
+			// `initializeKB()` body returns (including migration).
 
 			// Auto-migrate if orphan branch has data but migration not completed.
 			// Three entry points:
@@ -1096,7 +1185,29 @@ export function activate(context: vscode.ExtensionContext): void {
 		}
 	}
 
-	void initializeKB();
+	// Always release the sync gate when `initializeKB()` exits, even via
+	// error. Without this, a migration crash BEFORE `initializeKBFolder()`
+	// would leave `kbInitPromise` pending forever and sync rounds would
+	// hang indefinitely.
+	//
+	// Defense-in-depth watchdog: if `initializeKB()` ever returns a
+	// Promise that never settles (or a future refactor breaks the
+	// `.finally()` wiring), release the gate anyway after 60s. Promise
+	// resolve is idempotent so calling `resolveKbInit()` from both arms
+	// when both fire is safe. The cost of releasing early is one possibly
+	// premature sync round; the cost of NOT releasing is sync hangs
+	// forever — strict ordering.
+	const kbInitWatchdog = setTimeout(() => {
+		log.warn(
+			"activate",
+			"kbInitPromise watchdog fired after 60s — releasing sync gate; check initializeKB() for hangs",
+		);
+		resolveKbInit();
+	}, 60_000);
+	initializeKB().finally(() => {
+		clearTimeout(kbInitWatchdog);
+		resolveKbInit();
+	});
 
 	// ── sessions.json watcher ─────────────────────────────────────────────────
 	// When sessions.json is created or updated (e.g. a new Claude Code session
@@ -1355,7 +1466,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						extractRepoName,
 						getRemoteUrl,
 						initializeKBFolder,
-						resolveKBPath,
+						peekKBPath,
 						findFreshKBPath,
 					} = await import("../../cli/src/core/KBPathResolver.js");
 					const { MetadataManager } = await import(
@@ -1386,7 +1497,12 @@ export function activate(context: vscode.ExtensionContext): void {
 						};
 					}
 
-					const oldKbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
+					// Use the read-only `peekKBPath` for the "where would my old
+					// folder be?" lookup — `resolveKBPath` would *claim* basePath
+					// as a side effect on a pristine system, fooling the
+					// `oldKbRoot !== newKbRoot` archive gate into archiving a
+					// folder we just created (and writing data to `-2` instead).
+					const oldKbRoot = peekKBPath(repoName, remoteUrl, customKBPath);
 					const newKbRoot = findFreshKBPath(repoName, customKBPath);
 					initializeKBFolder(newKbRoot, repoName, remoteUrl);
 
@@ -1591,6 +1707,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			filesStore.toggleSelectAll();
 		}),
 
+		/* v8 ignore start -- command-bus glue: only the registered callback's body is uncovered (selectAllConversationsCommand / selectAllPlansAndNotesCommand have their own unit tests). Driving the registerCommand callback through unit tests needs a real vscode command bus */
 		vscode.commands.registerCommand("jollimemory.selectAllConversations", () =>
 			selectAllConversationsCommand({
 				cwd: workspaceRoot,
@@ -1608,6 +1725,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				onChanged: () => sidebarProvider.refreshPlansPanel(),
 			}),
 		),
+		/* v8 ignore stop */
 
 		vscode.commands.registerCommand("jollimemory.commitAI", () => {
 			log.info("cmd", "commitAI invoked");
@@ -2112,6 +2230,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		// originated mapKey is resolved through `resolveLinearIssueForCommand`
 		// above so a stale cache hit becomes a warning toast, not a silent no-op.
 
+		/* v8 ignore start -- Linear-issue command-bus glue: each registerCommand callback resolves a stale-mapKey-safe info and delegates to a bridge method that has its own unit tests. Exercising the registerCommand wrappers themselves needs a real vscode command bus */
 		vscode.commands.registerCommand(
 			"jollimemory.openLinearIssue",
 			async (itemOrKey: LinearIssueItem | string) => {
@@ -2158,6 +2277,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				await plansStore.refresh();
 			},
 		),
+		/* v8 ignore stop */
 
 		// History panel
 		vscode.commands.registerCommand("jollimemory.refreshHistory", () => {
@@ -2622,6 +2742,19 @@ export function activate(context: vscode.ExtensionContext): void {
 						// so the next listing reads from the new path.
 						const moved = await refreshSidebarKbRoot();
 						if (moved) sidebarProvider.refreshKnowledgeBaseFolders();
+						// If the user just turned auto-sync ON, start the polling
+						// loop without requiring a Reload Window (plan §P2 fix).
+						// `reconcileAutoSync` is idempotent — repeated calls after
+						// the first start are no-ops.
+						const activation = await syncActivation;
+						await activation?.runtime.reconcileAutoSync().catch((e) => {
+							/* v8 ignore start -- defensive log-and-continue: reconcileAutoSync handles its own errors internally; this catch only fires for unforeseen runtime exceptions (e.g. vscode API surface change), which the test fixture can't reproduce */
+							log.warn(
+								"reconcileAutoSync after settings save failed: %s",
+								(e as Error).message,
+							);
+							/* v8 ignore stop */
+						});
 					} catch (err) {
 						handleError("openSettings.save")(err as Error);
 					}
@@ -2693,6 +2826,20 @@ export function activate(context: vscode.ExtensionContext): void {
 			}
 			await authService.signOut();
 			currentAuthenticated = false;
+			// Stop any active auto-sync polling loop now that credentials are
+			// gone. `clearAuthCredentials` leaves `syncEnabled` intact (so the
+			// preference auto-resumes on next sign-in), and `reconcileAutoSync`
+			// reads jolliApiKey alongside it — with the key missing, it routes
+			// into the stop branch.
+			const activation = await syncActivation;
+			await activation?.runtime.reconcileAutoSync().catch((e) => {
+				/* v8 ignore start -- defensive log-and-continue on signOut */
+				log.warn(
+					"reconcileAutoSync after signOut failed: %s",
+					(e as Error).message,
+				);
+				/* v8 ignore stop */
+			});
 			sidebarProvider.notifyAuthChanged(false);
 			statusStore.refresh().catch(handleError("signOut.refresh"));
 			SettingsWebviewPanel.notifyAuthChanged().catch(
@@ -2747,6 +2894,15 @@ export function activate(context: vscode.ExtensionContext): void {
 						SettingsWebviewPanel.notifyAuthChanged().catch(
 							handleError("uriHandler.notifySettings"),
 						);
+						// Start auto-sync polling if the user already had
+						// `syncEnabled=true` from a prior session. Without this,
+						// the orchestrator stays dormant until the next settings
+						// save or window reload — mirroring the symmetric call
+						// in the signOut handler above (line 2452).
+						const activation = await syncActivation;
+						await activation?.runtime
+							.reconcileAutoSync()
+							.catch(handleError("uriHandler.reconcileAutoSync"));
 					} else {
 						vscode.window.showErrorMessage(
 							`Jolli sign-in failed: ${result.error}`,
@@ -2898,9 +3054,11 @@ export function activate(context: vscode.ExtensionContext): void {
 				);
 				const enableResult = await bridge.enable();
 				if (!enableResult.success) {
+					/* v8 ignore start -- defensive: bridge.enable() failure during activate auto-enable; logs and continues so vscode never marks the extension unloadable */
 					log.warn("activate", "Auto-enable failed", {
 						message: enableResult.message,
 					});
+					/* v8 ignore stop */
 				} else {
 					await statusStore.refresh();
 					const refreshed = await refreshStatusBar(
@@ -3019,6 +3177,33 @@ async function refreshStatusBar(
 /**
  * Returns an error handler that shows a VSCode error message.
  */
+/**
+ * Resolves the user's Memory Bank folder for the current workspace and
+ * reveals it in the OS file manager via `revealFileInOS`. Used by the
+ * `symlink_quarantine_failed` popup so the user can inspect / remove the
+ * offending symlink without hunting through Settings.
+ *
+ * Resolves the folder lazily (re-reads config + repo identity at popup time)
+ * so a settings change between activation and the popup is respected.
+ */
+async function revealMemoryBankFolder(workspaceRoot: string): Promise<void> {
+	const { extractRepoName, getRemoteUrl, resolveKBPath } = await import(
+		"../../cli/src/core/KBPathResolver.js"
+	);
+	const { loadConfig } = await import("../../cli/src/core/SessionTracker.js");
+	const repoName = extractRepoName(workspaceRoot);
+	const remoteUrl = getRemoteUrl(workspaceRoot);
+	const cfg = await loadConfig();
+	const customKBPath = (cfg as Record<string, unknown>).localFolder as
+		| string
+		| undefined;
+	const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
+	await vscode.commands.executeCommand(
+		"revealFileInOS",
+		vscode.Uri.file(kbRoot),
+	);
+}
+
 function handleError(commandName: string): (err: unknown) => void {
 	return (err: unknown) => {
 		const message = err instanceof Error ? err.message : String(err);

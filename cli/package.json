@@ -38,6 +38,7 @@
 		"cli:build": "npm run build && node dist/Cli.js",
 		"test": "vitest run --coverage",
 		"test:watch": "vitest",
+		"test:acceptance": "vitest run --config vitest.acceptance.config.ts",
 		"postinstall": "node -e \"require('fs').existsSync('dist/PostInstall.js') && require('child_process').spawnSync(process.execPath,['dist/PostInstall.js'],{stdio:'inherit'})\""
 	},
 	"keywords": [

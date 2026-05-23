@@ -745,6 +745,58 @@ export interface JolliMemoryConfig {
 	 * the trailer if an identical line already exists in the message.
 	 */
 	readonly dcoSignoff?: boolean;
+	/**
+	 * Whether to **auto-sync** Memory Bank to the user's private Personal
+	 * Space vault on a recurring schedule. Plan §0.7 made manual sync the
+	 * always-available default (the "Sync to Personal Space Now" button +
+	 * `jolli sync-memory-bank`), so this flag now scopes purely to the
+	 * background polling tick — undefined / false means the plugin's poll
+	 * loop never schedules itself, but a manual one-shot sync still works
+	 * as long as `jolliApiKey` is configured.
+	 *
+	 * Off by default in v1; opt-in via the Settings UI "Auto-sync to
+	 * Personal Space" toggle or `jolli configure --sync-enable`.
+	 */
+	readonly syncEnabled?: boolean;
+	/**
+	 * Include raw AI conversation transcripts (`.transcripts/<id>.txt`) when
+	 * syncing. Off by default — transcripts can contain pasted credentials,
+	 * proprietary code, or sensitive snippets, so the user must opt in.
+	 */
+	readonly syncTranscripts?: boolean;
+	/**
+	 * Plugin polling cadence for background sync rounds (seconds). Default
+	 * 5400 (90 min) when unset; clamp to [60, 86400] in the consumer. Slow
+	 * by design — the "Sync now" button covers urgency, and the post-commit
+	 * auto-trigger was dropped in Phase 4 to keep `git commit` UX clean.
+	 */
+	readonly syncPollIntervalSec?: number;
+	/**
+	 * What the sync engine should do when conflict resolution exhausts
+	 * Tier 1.5 (deterministic aggregate merge), Tier 2 (LLM merge), and
+	 * Tier 2.7 (safe heuristics — empty-side / identical-after-normalize /
+	 * base-aware delete-vs-modify / Memory Bank summary union).
+	 *
+	 * The upper tiers absorb the overwhelming majority of real conflicts
+	 * losslessly; this field controls only the residual tail.
+	 *
+	 *   - `"prompt"` *(default)*: ask the UI's `promptBinaryPick` and
+	 *     block on the user. Safe — never silently picks. In CLI / hook
+	 *     contexts where no TTY is attached, `CliConflictUi` returns
+	 *     `"skip"` and the conflict surfaces on the next round.
+	 *   - `"mine"`: always keep the local side. Use when the source repo
+	 *     is the canonical place to author memories and the personal-space
+	 *     vault is purely a backup of THIS device.
+	 *   - `"theirs"`: always accept the peer side. Use when another device
+	 *     is the canonical author (e.g. the laptop is just a viewer).
+	 *
+	 * Earlier drafts shipped a `"newest"` policy that compared committer
+	 * timestamps of `ORIG_HEAD` vs `HEAD`. It was removed because the
+	 * engine's pre-pull-rebase reconcile commit always makes the local
+	 * timestamp ≈ `Date.now()`, so `"newest"` degenerated to "mine
+	 * always wins" while sounding semantically different to users.
+	 */
+	readonly syncConflictPolicy?: "prompt" | "mine" | "theirs";
 }
 
 /** Result of enable/disable operations */

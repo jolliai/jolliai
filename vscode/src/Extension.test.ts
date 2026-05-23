@@ -606,6 +606,7 @@ vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
 	getRemoteUrl: vi.fn(() => null),
 	resolveKBPath: vi.fn(() => "/test/kb"),
 	resolveKbParent: vi.fn(() => "/test/kb-parent"),
+	peekKBPath: vi.fn(() => "/test/kb"),
 	findFreshKBPath: vi.fn(() => "/test/kb-2"),
 	initializeKBFolder: vi.fn(),
 }));

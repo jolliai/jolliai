@@ -2029,6 +2029,35 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(mockExecuteCommand).toHaveBeenCalledWith("jollimemory.signOut");
 		});
+
+		it("dispatches the jollimemory.syncNow command on a syncNow message", async () => {
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "syncNow" });
+			await flushPromises();
+
+			expect(mockExecuteCommand).toHaveBeenCalledWith("jollimemory.syncNow");
+		});
+
+		it("logs the rejection (no banner) when jollimemory.syncNow rejects", async () => {
+			// Unlike signIn, syncNow's rejection path is log-only — the
+			// orchestrator owns user-facing status surface, so a webview
+			// banner would double-up. Verifies the catch arm executes.
+			mockExecuteCommand.mockImplementation(async (cmd: string) => {
+				if (cmd === "jollimemory.syncNow") throw new Error("sync blew up");
+				return undefined;
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "syncNow" });
+			await flushPromises();
+
+			expect(logError).toHaveBeenCalledWith(
+				"SettingsPanel",
+				expect.stringContaining("sync blew up"),
+			);
+		});
 	});
 
 	describe("notifyAuthChanged", () => {

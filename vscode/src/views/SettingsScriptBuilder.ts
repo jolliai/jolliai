@@ -50,6 +50,10 @@ export function buildSettingsScript(): string {
   const summaryReLoginBtn = document.getElementById('summaryReLoginBtn');
   const syncSignInBtn = document.getElementById('syncSignInBtn');
   const syncSignOutBtn = document.getElementById('syncSignOutBtn');
+  const syncEnabledInput = document.getElementById('syncEnabled');
+  const syncTranscriptsInput = document.getElementById('syncTranscripts');
+  const syncPollIntervalMinInput = document.getElementById('syncPollIntervalMin');
+  const syncNowBtn = document.getElementById('syncNowBtn');
 
   // ── State ──
   let maskedApiKey = '';
@@ -65,6 +69,11 @@ export function buildSettingsScript(): string {
   // on settingsSaved (and abort the chain on settingsError so the migrate
   // never runs against unsaved/invalid state).
   let pendingMigrateAfterApply = false;
+  // Same pattern as pendingMigrateAfterApply, but for Sync now: when the user
+  // clicks while form is dirty we chain Apply -> syncNow on settingsSaved,
+  // and abort on settingsError so a rejected save never silently triggers
+  // a round against stale config.
+  let pendingSyncAfterApply = false;
 
   // ── Tab switching ──
   // Match by data-tab on the button to data-panel on the section. Use the
@@ -313,6 +322,9 @@ export function buildSettingsScript(): string {
       localFolder: localFolderInput.value,
       excludePatterns: excludePatternsInput.value,
       dcoSignoff: dcoSignoffInput.checked,
+      syncEnabled: syncEnabledInput ? syncEnabledInput.checked : false,
+      syncTranscripts: syncTranscriptsInput ? syncTranscriptsInput.checked : false,
+      syncPollIntervalMin: syncPollIntervalMinInput ? syncPollIntervalMinInput.value : '',
     };
     checkDirty();
   }
@@ -332,7 +344,10 @@ export function buildSettingsScript(): string {
       copilotEnabledInput.checked !== initialState.copilotEnabled ||
       localFolderInput.value !== initialState.localFolder ||
       excludePatternsInput.value !== initialState.excludePatterns ||
-      dcoSignoffInput.checked !== initialState.dcoSignoff
+      dcoSignoffInput.checked !== initialState.dcoSignoff ||
+      (syncEnabledInput && syncEnabledInput.checked !== initialState.syncEnabled) ||
+      (syncTranscriptsInput && syncTranscriptsInput.checked !== initialState.syncTranscripts) ||
+      (syncPollIntervalMinInput && syncPollIntervalMinInput.value !== initialState.syncPollIntervalMin)
     );
     updateApplyBtn();
   }
@@ -425,12 +440,70 @@ export function buildSettingsScript(): string {
         localFolder: localFolderInput.value.trim(),
         excludePatterns: excludePatternsInput.value,
         dcoSignoff: dcoSignoffInput.checked,
+        syncEnabled: syncEnabledInput ? syncEnabledInput.checked : false,
+        syncTranscripts: syncTranscriptsInput ? syncTranscriptsInput.checked : false,
+        // Parse minutes → seconds and clamp on the way out so the host gets a
+        // value it can write straight into config.json. The number input's
+        // min=90 attribute handles most user mistakes; we clamp defensively
+        // for blank / non-numeric edge cases.
+        syncPollIntervalSec: (function () {
+          if (!syncPollIntervalMinInput) return null;
+          const raw = syncPollIntervalMinInput.value.trim();
+          if (raw.length === 0) return null;
+          const n = Number(raw);
+          if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
+          const clampedMin = Math.max(90, Math.min(1440, n));
+          return clampedMin * 60;
+        })(),
       },
       maskedApiKey: maskedApiKey,
       maskedJolliApiKey: maskedJolliApiKey,
     });
     return true;
   }
+
+  if (syncNowBtn) {
+    syncNowBtn.addEventListener('click', function() {
+      // Pressing "Sync now" implies the user wants the toggle state they're
+      // looking at — not whatever was last saved. If the form is dirty,
+      // chain Apply -> syncNow via pendingSyncAfterApply so we (a) wait
+      // for the host to actually persist before triggering the round and
+      // (b) abort cleanly if the save is rejected (settingsError). Same
+      // pattern as confirmDirtyMigrateResult -> migrate.
+      if (isDirty) {
+        pendingSyncAfterApply = true;
+        if (!submitApplySettings()) {
+          pendingSyncAfterApply = false;
+        }
+        return;
+      }
+      vscode.postMessage({ command: 'syncNow' });
+    });
+  }
+  // The interval input is meaningful only when the auto-sync toggle is on
+  // (plan §0.7). We don't hide it (avoids layout shift) but disable it so the
+  // grayed-out state communicates "this number won't take effect right now".
+  function applyAutoIntervalEnabledState() {
+    if (!syncPollIntervalMinInput) return;
+    const on = !!(syncEnabledInput && syncEnabledInput.checked);
+    syncPollIntervalMinInput.disabled = !on;
+  }
+  if (syncEnabledInput) {
+    syncEnabledInput.addEventListener('change', function () {
+      applyAutoIntervalEnabledState();
+      checkDirty();
+    });
+  }
+  if (syncTranscriptsInput) {
+    syncTranscriptsInput.addEventListener('change', checkDirty);
+  }
+  if (syncPollIntervalMinInput) {
+    syncPollIntervalMinInput.addEventListener('input', checkDirty);
+    syncPollIntervalMinInput.addEventListener('change', checkDirty);
+  }
+  // Initial state: keep input disabled until we receive the first settings
+  // message (so the user can't twiddle a number that isn't loaded yet).
+  applyAutoIntervalEnabledState();
 
   applyBtn.addEventListener('click', function() {
     if (applyBtn.disabled) return;
@@ -478,6 +551,18 @@ export function buildSettingsScript(): string {
         localFolderInput.value = msg.settings.localFolder || '';
         excludePatternsInput.value = msg.settings.excludePatterns;
         dcoSignoffInput.checked = !!msg.settings.dcoSignoff;
+        if (syncEnabledInput) syncEnabledInput.checked = !!msg.settings.syncEnabled;
+        if (syncTranscriptsInput) syncTranscriptsInput.checked = !!msg.settings.syncTranscripts;
+        if (syncPollIntervalMinInput) {
+          // Host stores seconds; UI shows minutes. Empty → leave blank so the
+          // input placeholder ('90') signals the default without forcing a
+          // dirty form on every reload.
+          const sec = msg.settings.syncPollIntervalSec;
+          syncPollIntervalMinInput.value = typeof sec === 'number' && sec > 0 ? String(Math.round(sec / 60)) : '';
+        }
+        // Sync the interval input's enabled state with the auto toggle after
+        // loading settings (so a fresh load with auto=off lands disabled).
+        applyAutoIntervalEnabledState();
         maskedApiKey = msg.maskedApiKey;
         maskedJolliApiKey = msg.maskedJolliApiKey;
         // Clear all validation errors on fresh load
@@ -528,6 +613,10 @@ export function buildSettingsScript(): string {
           pendingMigrateAfterApply = false;
           startRebuild();
         }
+        if (pendingSyncAfterApply) {
+          pendingSyncAfterApply = false;
+          vscode.postMessage({ command: 'syncNow' });
+        }
         break;
       case 'settingsError':
         // Persistent red banner — stays until the user edits a field (handled
@@ -540,6 +629,11 @@ export function buildSettingsScript(): string {
           // Abort the chain so we don't migrate against unsaved state.
           pendingMigrateAfterApply = false;
           rebuildKbStatus.textContent = '';
+        }
+        if (pendingSyncAfterApply) {
+          // Same reason: don't run a sync round against config the host just
+          // refused to persist.
+          pendingSyncAfterApply = false;
         }
         break;
     }

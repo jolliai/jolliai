@@ -24,6 +24,7 @@ import { registerReverseCommand } from "./commands/ReverseCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
 import { registerBuildCommand, registerDevCommand, registerStartCommand } from "./commands/StartCommand.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
+import { registerSyncCommand } from "./commands/SyncCommand.js";
 import { registerThemeCommand } from "./commands/ThemeCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
 // _parseJolliApiKey / _parseBaseUrl: re-exposed at the bottom of this file.
@@ -152,6 +153,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"export",
 	"auth",
 	"heal-folder",
+	"sync-memory-bank",
 ]);
 
 /** Commands grouped under "Jolli Site" in `--help`. */
@@ -308,6 +310,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerExportPromptCommand(program);
 	registerExportCommand(program);
 	registerAuthCommands(program);
+	registerSyncCommand(program);
 	registerNewCommand(program);
 	registerConvertCommand(program);
 	registerDevCommand(program);

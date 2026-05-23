@@ -9,6 +9,7 @@ vi.mock("./KBPathResolver.js", () => ({
 	extractRepoName: vi.fn().mockReturnValue("test-repo"),
 	getRemoteUrl: vi.fn().mockReturnValue("https://github.com/test/repo.git"),
 	resolveKBPath: vi.fn().mockReturnValue("/tmp/kb-test"),
+	initializeKBFolder: vi.fn(),
 }));
 
 vi.mock("./MetadataManager.js", () => {
@@ -82,6 +83,27 @@ describe("StorageFactory", () => {
 
 		expect(FolderStorage).toHaveBeenCalledOnce();
 		expect((storage as unknown as Record<string, unknown>).type).toBe("folder");
+	});
+
+	it("resolves the KB path via resolveKBPath (which claims identity internally)", async () => {
+		// Regression for the phantom-`<repo>-2` bug: `resolveKBPath` is now
+		// atomic — it both picks the path AND writes identity to
+		// `.jolli/config.json`. StorageFactory no longer needs an explicit
+		// follow-up `initializeKBFolder` call; verifying `resolveKBPath` is
+		// invoked with the repo identity is what pins this contract.
+		mockLoadConfig.mockResolvedValue({ storageMode: "folder" } as unknown as Awaited<
+			ReturnType<typeof loadConfig>
+		>);
+		const kbResolver = await import("./KBPathResolver.js");
+		(kbResolver.resolveKBPath as ReturnType<typeof vi.fn>).mockClear();
+
+		await createStorage("/project/path");
+
+		expect(kbResolver.resolveKBPath).toHaveBeenCalledWith(
+			"test-repo",
+			"https://github.com/test/repo.git",
+			undefined,
+		);
 	});
 
 	it("falls back to DualWriteStorage with warning when loadConfig fails", async () => {

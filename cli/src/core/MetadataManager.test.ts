@@ -257,6 +257,36 @@ describe("MetadataManager", () => {
 		});
 	});
 
+	describe("listIndexHeads", () => {
+		beforeEach(() => manager.ensure());
+
+		it("returns only entries with parentCommitHash === null", () => {
+			const indexPath = join(jolliDir, "index.json");
+			writeFileSync(
+				indexPath,
+				JSON.stringify({
+					version: 1,
+					entries: [
+						{ commitHash: "aaa", branch: "main", parentCommitHash: null },
+						{ commitHash: "bbb", branch: "main", parentCommitHash: "aaa" },
+						{ commitHash: "ccc", branch: "feature/x", parentCommitHash: null },
+					],
+				}),
+			);
+			const heads = manager.listIndexHeads();
+			expect(heads.map((h) => h.commitHash).sort()).toEqual(["aaa", "ccc"]);
+		});
+
+		it("returns [] when index.json is missing", () => {
+			expect(manager.listIndexHeads()).toEqual([]);
+		});
+
+		it("returns [] when index.json is malformed", () => {
+			writeFileSync(join(jolliDir, "index.json"), "not json");
+			expect(manager.listIndexHeads()).toEqual([]);
+		});
+	});
+
 	describe("transcodeBranchName", () => {
 		it("replaces forward slash", () => {
 			expect(MetadataManager.transcodeBranchName("feature/login")).toBe("feature-login");

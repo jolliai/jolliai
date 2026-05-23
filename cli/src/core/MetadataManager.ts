@@ -17,17 +17,31 @@ import type { BranchesJson, BranchMapping, KBConfig, Manifest, ManifestEntry, Mi
 
 const log = createLogger("MetadataManager");
 
+/** Single index.json row — head iff `parentCommitHash === null`. */
+export interface IndexHeadEntry {
+	readonly commitHash: string;
+	readonly branch: string;
+	readonly parentCommitHash: string | null;
+}
+
+interface IndexFile {
+	readonly version: number;
+	readonly entries: ReadonlyArray<IndexHeadEntry>;
+}
+
 export class MetadataManager {
 	private readonly manifestPath: string;
 	private readonly branchesPath: string;
 	private readonly configPath: string;
 	private readonly migrationPath: string;
+	private readonly indexPath: string;
 
 	constructor(private readonly jolliDir: string) {
 		this.manifestPath = join(jolliDir, "manifest.json");
 		this.branchesPath = join(jolliDir, "branches.json");
 		this.configPath = join(jolliDir, "config.json");
 		this.migrationPath = join(jolliDir, "migration.json");
+		this.indexPath = join(jolliDir, "index.json");
 	}
 
 	/** Ensures the .jolli/ directory and default files exist. */
@@ -117,6 +131,28 @@ export class MetadataManager {
 		return folder;
 	}
 
+	/**
+	 * Removes the mapping for `branchName` from `branches.json`.
+	 *
+	 * Used by `StaleChildMarkdownCleanup` once a branch has lost its last
+	 * head (e.g. every entry was hoisted into another head's `children[]`
+	 * during squash / amend, leaving no `parentCommitHash == null` row for
+	 * that branch). Leaving the mapping in place would surface the branch
+	 * in the UI even though it has zero visible content.
+	 *
+	 * Idempotent — no-op when the branch isn't currently mapped. Returns
+	 * true if a row was actually removed, false otherwise (lets callers
+	 * skip logging on the no-op path).
+	 */
+	removeBranchMapping(branchName: string): boolean {
+		const branches = this.readBranches();
+		const filtered = branches.mappings.filter((m) => m.branch !== branchName);
+		if (filtered.length === branches.mappings.length) return false;
+		this.atomicWrite(this.branchesPath, JSON.stringify({ ...branches, mappings: filtered }, null, "\t"));
+		log.info("Branch mapping removed: %s (no remaining head)", branchName);
+		return true;
+	}
+
 	renameBranchFolder(oldFolder: string, newFolder: string): number {
 		const branches = this.readBranches();
 		const updatedMappings = branches.mappings.map((m) =>
@@ -185,6 +221,25 @@ export class MetadataManager {
 
 	listBranchMappings(): BranchMapping[] {
 		return this.readBranches().mappings;
+	}
+
+	/**
+	 * Returns every "head" entry (`parentCommitHash === null`) from
+	 * `index.json` — used by the UI to filter `branches.json` mappings
+	 * down to branches that actually have visible content. Returns an
+	 * empty array when `index.json` is missing or unparseable; callers
+	 * treat that as "no heads → suppress every mapping" defensively.
+	 */
+	listIndexHeads(): IndexHeadEntry[] {
+		const file = this.readJson<IndexFile>(this.indexPath);
+		if (!file || !Array.isArray(file.entries)) return [];
+		return file.entries.filter(
+			(e): e is IndexHeadEntry =>
+				typeof e?.commitHash === "string" &&
+				typeof e.branch === "string" &&
+				(e.parentCommitHash === null || typeof e.parentCommitHash === "string") &&
+				e.parentCommitHash === null,
+		);
 	}
 
 	// ── Config ─────────────────────────────────────────────────────────────

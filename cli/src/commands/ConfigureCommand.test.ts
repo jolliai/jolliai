@@ -148,4 +148,149 @@ describe("ConfigureCommand — settable keys", () => {
 		expect(help).toContain("localFolder");
 		expect(help).toContain("aiProvider");
 	});
+
+	describe("maxTokens validation (positive integer only)", () => {
+		async function expectMaxTokensRejected(value: string): Promise<void> {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prev = process.exitCode;
+			try {
+				await runConfigure(["--set", `maxTokens=${value}`]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/positive integer/));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prev;
+			}
+		}
+
+		it("accepts a positive integer value", async () => {
+			await runConfigure(["--set", "maxTokens=8192"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ maxTokens: 8192 }));
+		});
+
+		it("rejects a fractional value", async () => {
+			await expectMaxTokensRejected("4096.5");
+		});
+
+		it("rejects non-numeric input (no silent parseInt-style truncation)", async () => {
+			// `Number("8192abc")` is NaN, NOT 8192 — guarding against the
+			// classic parseInt pitfall.
+			await expectMaxTokensRejected("8192abc");
+		});
+
+		it("rejects zero / negative values", async () => {
+			await expectMaxTokensRejected("0");
+			await expectMaxTokensRejected("-1");
+		});
+	});
+
+	describe("syncEnabled / syncTranscripts boolean coercion via --set", () => {
+		it("accepts true/false/yes/no/1/0 forms for syncEnabled", async () => {
+			for (const truthy of ["true", "yes", "1"]) {
+				mockSaveConfig.mockClear();
+				await runConfigure(["--set", `syncEnabled=${truthy}`]);
+				expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncEnabled: true }));
+			}
+			for (const falsy of ["false", "no", "0"]) {
+				mockSaveConfig.mockClear();
+				await runConfigure(["--set", `syncEnabled=${falsy}`]);
+				expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncEnabled: false }));
+			}
+		});
+
+		it("rejects garbage boolean values", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prev = process.exitCode;
+			try {
+				await runConfigure(["--set", "syncEnabled=maybe"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/true\/false/));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prev;
+			}
+		});
+
+		it("accepts a string-coerced boolean for syncTranscripts as well", async () => {
+			await runConfigure(["--set", "syncTranscripts=true"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncTranscripts: true }));
+		});
+	});
+
+	describe("syncPollIntervalSec validation", () => {
+		// `--set syncPollIntervalSec=N` accepts only positive integers in
+		// [5400, 86400] (90 min – 24 h). Anything outside that window would
+		// either hammer the backend or park the engine.
+		async function expectSetRejected(value: string, errMatch: RegExp | string): Promise<void> {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prev = process.exitCode;
+			try {
+				await runConfigure(["--set", `syncPollIntervalSec=${value}`]);
+				const calls = errorSpy.mock.calls.map((c) => String(c[0]));
+				const joined = calls.join("\n");
+				expect(joined).toMatch(errMatch);
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prev;
+			}
+		}
+
+		it("accepts a value in the [5400, 86400] window", async () => {
+			await runConfigure(["--set", "syncPollIntervalSec=5400"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncPollIntervalSec: 5400 }));
+		});
+
+		it("rejects non-integer values", async () => {
+			await expectSetRejected("60.5", /positive integer/);
+		});
+
+		it("rejects non-numeric input", async () => {
+			await expectSetRejected("ninety-min", /positive integer/);
+		});
+
+		it("rejects values below the 5400 floor (would push too often)", async () => {
+			await expectSetRejected("60", /at least 5400/);
+		});
+
+		it("rejects values above the 86400 ceiling (would park sync for too long)", async () => {
+			await expectSetRejected("99999", /at most 86400/);
+		});
+
+		it("rejects zero / negative values (must be positive)", async () => {
+			await expectSetRejected("0", /positive integer/);
+			await expectSetRejected("-30", /positive integer/);
+		});
+	});
+
+	describe("--sync-enable / --sync-disable shortcuts", () => {
+		it("--sync-enable sets syncEnabled=true and prints the reload hint", async () => {
+			const out = await runConfigure(["--sync-enable"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncEnabled: true }));
+			expect(out).toContain("ENABLED");
+		});
+
+		it("--sync-disable sets syncEnabled=undefined and notes manual sync still works", async () => {
+			const out = await runConfigure(["--sync-disable"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncEnabled: undefined }));
+			expect(out).toContain("DISABLED");
+		});
+
+		it("rejects --sync-enable AND --sync-disable together (mutually exclusive)", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prevExitCode = process.exitCode;
+			try {
+				await runConfigure(["--sync-enable", "--sync-disable"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("mutually exclusive"));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prevExitCode;
+			}
+		});
+	});
 });

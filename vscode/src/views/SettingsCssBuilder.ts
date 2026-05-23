@@ -99,6 +99,11 @@ export function buildSettingsCss(): string {
   .rebuild-btn {
     align-self: flex-start;
   }
+  .settings-divider {
+    border: none;
+    border-top: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+    margin: 24px 0 18px;
+  }
   .rebuild-hint {
     display: block;
     width: 100%;

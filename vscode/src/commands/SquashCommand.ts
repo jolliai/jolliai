@@ -249,8 +249,9 @@ export class SquashCommand {
 			qp.items = [ITEM_SQUASH, ITEM_SQUASH_PUSH];
 
 			// Disable filtering so the input text is used as a free-form message,
-			// not as a filter query. Same fix as CommitCommand.
-			qp.matchOnLabel = false;
+			// not as a filter query. Same fix as CommitCommand — `matchOnLabel`
+			// is runtime-only, missing from `@types/vscode` < 1.93.
+			(qp as { matchOnLabel?: boolean }).matchOnLabel = false;
 			qp.matchOnDescription = false;
 			qp.matchOnDetail = false;
 

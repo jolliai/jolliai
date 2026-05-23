@@ -47,6 +47,7 @@
  *   3. Bare filename — final fallback in the renderer.
  */
 
+import type { Dirent } from "node:fs";
 import { existsSync, promises as fs, readFileSync } from "node:fs";
 import { isAbsolute, join, normalize } from "node:path";
 import type { SummaryIndex } from "../../../cli/src/Types.js";
@@ -385,9 +386,15 @@ export class KbFoldersService {
 		kbParent: string,
 		repoDirNames: Set<string>,
 	): Promise<FolderNode[]> {
-		let entries: Awaited<ReturnType<typeof fs.readdir>>;
+		// Explicit `Dirent<string>[]` — without it, recent `@types/node`
+		// resolves the `withFileTypes` overload to `Dirent<Buffer>[]`
+		// because of overload precedence rules, then every `e.name`
+		// access becomes `NonSharedBuffer` instead of `string`.
+		let entries: Dirent<string>[];
 		try {
-			entries = await fs.readdir(kbParent, { withFileTypes: true });
+			entries = (await fs.readdir(kbParent, {
+				withFileTypes: true,
+			})) as Dirent<string>[];
 		} catch {
 			return [];
 		}

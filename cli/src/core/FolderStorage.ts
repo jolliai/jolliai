@@ -13,6 +13,7 @@
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { rmdir } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "../Types.js";
@@ -155,9 +156,36 @@ export class FolderStorage implements StorageProvider {
 	 * See StorageProvider.pruneBranchMappings for the contract. Forwards to
 	 * `MetadataManager.unregisterBranches`, which performs an atomic
 	 * `branches.json` rewrite and leaves the manifest untouched.
+	 *
+	 * Disk-side cleanup: after the metadata row is gone, attempt to remove
+	 * the on-disk `<rootPath>/<folder>` directory if it is empty. Without
+	 * this, the Folders sidebar tree (which enumerates via `fs.readdir`)
+	 * would keep showing the orphaned branch directory even though the
+	 * mapping is gone. ENOTEMPTY is a no-op so user-dropped files and other
+	 * non-tracked content keep the folder alive.
 	 */
 	async pruneBranchMappings(branches: readonly string[]): Promise<number> {
-		return this.metadataManager.unregisterBranches(branches);
+		// Snapshot mappings BEFORE unregister so we still know each branch's
+		// transcoded folder name after the row is dropped.
+		const folderByBranch = new Map<string, string>();
+		const drop = new Set(branches);
+		for (const m of this.metadataManager.listBranchMappings()) {
+			if (drop.has(m.branch)) folderByBranch.set(m.branch, m.folder);
+		}
+		const removed = this.metadataManager.unregisterBranches(branches);
+		if (removed === 0) return 0;
+		await Promise.all([...folderByBranch.values()].map((folder) => this.rmdirIfEmpty(join(this.rootPath, folder))));
+		return removed;
+	}
+
+	private async rmdirIfEmpty(dir: string): Promise<void> {
+		try {
+			await rmdir(dir);
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException).code;
+			if (code === "ENOENT" || code === "ENOTEMPTY" || code === "EEXIST") return;
+			log.warn("rmdir(%s) failed (non-fatal): %s", dir, errMsg(err));
+		}
 	}
 
 	/**

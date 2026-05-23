@@ -363,6 +363,13 @@ export function buildSidebarScript(): string {
       if (memoryToggled) items.push(buildKbSearchBox());
       items.push(iconButton('kb-mode-folders', 'Tree', 'list-tree', { toggled: folderToggled }));
       items.push(iconButton('kb-mode-memories', 'Timeline', 'history', { toggled: memoryToggled }));
+      // Sync to Personal Space: fires the same jollimemory.syncNow command as
+      // the Settings webview Sync button. The manual sync button is
+      // deliberately independent of the auto-sync toggle (plan §0.7) — we
+      // always render it, and the command handler only toasts when the
+      // user isn't authenticated. (NB: avoid backticks in comments; file
+      // header explains why.)
+      items.push(iconButton('sync-now', 'Sync to Personal Space', 'cloud-upload'));
       items.push(iconButton('refresh', 'Refresh', 'refresh'));
       mountIn(tabToolbar, items);
     } else if (state.activeTab === 'status') {
@@ -432,6 +439,8 @@ export function buildSidebarScript(): string {
       vscode.postMessage({ type: 'kb:setMode', mode: state.kbMode });
     } else if (action === 'open-settings') {
       vscode.postMessage({ type: 'command', command: 'jollimemory.openSettings' });
+    } else if (action === 'sync-now') {
+      vscode.postMessage({ type: 'command', command: 'jollimemory.syncNow' });
     } else if (action === 'sign-in') {
       vscode.postMessage({ type: 'command', command: 'jollimemory.signIn' });
     } else if (action === 'sign-out') {

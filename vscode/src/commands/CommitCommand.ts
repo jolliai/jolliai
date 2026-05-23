@@ -254,7 +254,9 @@ export class CommitCommand {
 			// message, not as a filter query. Without this, the commit message
 			// text would filter items by label — leaving no active items and
 			// causing Enter (onDidAccept) to never fire.
-			qp.matchOnLabel = false;
+			// `matchOnLabel` exists at runtime on VS Code's QuickPick but is
+			// missing from `@types/vscode` < 1.93; cast to bypass the gap.
+			(qp as { matchOnLabel?: boolean }).matchOnLabel = false;
 			qp.matchOnDescription = false;
 			qp.matchOnDetail = false;
 

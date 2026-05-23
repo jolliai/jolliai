@@ -10,6 +10,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { createLogger } from "../Logger.js";
 import type { LlmCredentialSource } from "../Types.js";
+import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
 import { parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
 import { fillTemplate, findUnfilledPlaceholders, TEMPLATES } from "./PromptTemplates.js";
 import { resolveModelId } from "./Summarizer.js";
@@ -73,30 +74,11 @@ const LLM_PROXY_PATH = "/api/push/llm/complete";
  */
 const PROXY_FETCH_TIMEOUT_MS = 120_000;
 
-/**
- * Value sent on every Jolli backend request as the `x-jolli-client` header so
- * the server can identify the caller and gate on min version per surface.
- *
- * The (kind, version) pair is resolved at build time:
- *  - kind comes from `__JOLLI_CLIENT_KIND__`, defined as `"cli"` by vite (CLI
- *    build) and `"vscode-plugin"` by esbuild (VSCode build).
- *  - version comes from `__PKG_VERSION__`, which each bundler already defines
- *    as the surface's own version — under VSCode that's the extension version
- *    (the surface the user installed and would upgrade), not the inlined CLI
- *    package version, which is what we want.
- *
- * This module is inlined into both the native CLI bundle and the VSCode
- * plugin's `dist/` (Cli.js + hook scripts), so reading the kind from a
- * build-time token is what lets a hook installed by the VSCode plugin
- * correctly self-identify as `vscode-plugin/<vscode-version>` instead of
- * `cli/...`. Tests stub these globals via `vi.stubGlobal`.
- */
-/* v8 ignore start -- compile-time ternary: both globals are always defined in bundled builds */
-const CLI_CLIENT_HEADER =
-	typeof __JOLLI_CLIENT_KIND__ !== "undefined" && typeof __PKG_VERSION__ !== "undefined"
-		? `${__JOLLI_CLIENT_KIND__}/${__PKG_VERSION__}`
-		: "cli/dev";
-/* v8 ignore stop */
+// `x-jolli-client` header value lives in `./ClientHeader.ts` so both this
+// module and `cli/src/sync/BackendClient.ts` share one source of truth.
+// Build-time `__JOLLI_CLIENT_KIND__` + `__PKG_VERSION__` resolution happens
+// there. Tests stub those globals via `vi.stubGlobal` + `vi.resetModules`,
+// and `JOLLI_CLIENT_HEADER` re-evaluates on re-import accordingly.
 
 /**
  * LLM provider credentials and model selection.
@@ -378,7 +360,7 @@ async function callProxy(
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${jolliApiKey}`,
-				"x-jolli-client": CLI_CLIENT_HEADER,
+				"x-jolli-client": JOLLI_CLIENT_HEADER,
 				...(tenantSlug ? { "x-tenant-slug": tenantSlug } : {}),
 				...(orgSlug ? { "x-org-slug": orgSlug } : {}),
 			},

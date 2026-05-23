@@ -153,6 +153,29 @@ From the Summary Webview, you can:
 
 Text snippets display their content inline in the Summary Webview; Markdown notes show the filename.
 
+### Memory Bank sync (cross-device)
+
+Memory Bank **cloud sync** keeps your personal Memory Bank consistent across every device you sign in to. Turn it on from **Settings → Memory Bank → Enable Memory Bank cloud sync** (off by default for existing users; you can flip it any time).
+
+How it works:
+
+1. The plugin holds a long-lived sync engine that wakes up every 90 minutes (configurable via `syncPollIntervalSec`) **or** when you click **Sync to Personal Space Now** in Settings.
+2. Each round mints a short-lived credential from Jolli, clones (first time) or fetches your private vault repo, mirrors the local Memory Bank folder into the vault tree, commits, and pushes. The vault repo is **private** and visible only to you.
+3. On the very first sync of a personal space that has Web-UI-only history, the plugin imports that legacy content into a `legacy/` subtree, pushes it, and tells Jolli to flip the space to git-backed. After that, every device sees the same git history.
+4. If two devices push concurrently and conflict, the engine resolves the four `.jolli/<aggregate>.json` files deterministically (no prompts); other content conflicts go through an AI merge (if you've configured an Anthropic key) and finally a manual binary pick.
+
+The status bar reflects the engine's state:
+
+| Icon / text | Meaning |
+| -- | -- |
+| `$(check) Jolli Memory` | Synced — last round succeeded. |
+| `$(sync~spin) Syncing…` | A round is in flight. |
+| `$(warning) N conflicts` | One or more files are awaiting your manual choice; click the icon to open them. |
+| `Jolli Memory` (neutral) | Last round hit a transient failure (network blip, backend hiccup); the next poll tick will retry. |
+| `$(circle-slash) Offline` etc. | A persistent terminal failure (auth, repo missing, vault mismatch, …) exhausted retries — click for details. |
+
+UI does not expose any GitHub-specific terminology — the vault repo is treated as an implementation detail. If your Memory Bank folder (`localFolder`) is **also** synced by iCloud / Dropbox / Syncthing, **turn one of them off** — overlapping syncs corrupt each other.
+
 ### Memory Bank tab
 
 The **MEMORY BANK** tab is a cross-branch / cross-repo file tree of every stored memory. It reads from the dual-written Memory Bank folder on disk, so the same view works whether you're inside the current repo or browsing memories from a sibling repo whose memories have been migrated into the same root folder.

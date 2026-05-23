@@ -36,6 +36,9 @@ describe("DistPathResolver", () => {
 	let tempDir: string;
 
 	beforeEach(async () => {
+		// Restored after §I13: `unstubGlobals: true` resets stubs between
+		// tests, so re-stub here instead of once at module scope.
+		vi.stubGlobal("__PKG_VERSION__", "1.0.0");
 		tempDir = await mkdtemp(join(tmpdir(), "jm-resolver-test-"));
 	});
 

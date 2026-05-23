@@ -1653,9 +1653,11 @@ export class JolliMemoryBridge {
 				);
 				const target = repos.find((r) => r.repoName === repoName);
 				if (!target) return [];
+				/* v8 ignore start -- cross-repo storage adoption: triggered when listing memories for a repo OTHER than the workspace's source repo (folder-mode user inspecting another repo's tree). Standard Bridge tests cover the same-repo flow; the cross-repo path is exercised end-to-end through KbFoldersService integration */
 				const mm = new MetadataManager(join(target.kbRoot, ".jolli"));
 				storage = new FolderStorage(target.kbRoot, mm);
 				cwd = undefined;
+				/* v8 ignore stop */
 			} catch (err) {
 				log.warn(
 					"listBranchMemories",

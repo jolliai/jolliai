@@ -753,6 +753,21 @@ export class SidebarWebviewProvider
 		this.deps.kbFolders?.notifyDirty?.();
 		this.postMessage({ type: "kb:foldersReset" });
 		void this.handleExpandFolder("");
+		// Also re-push the breadcrumb's repo list AND the active repo's
+		// branches: those use the `selection:*` messages which are
+		// otherwise only sent at init / repo-switch time. Pre-fix, a sync
+		// round (or any external write that added a new branch directory)
+		// would leave the breadcrumb's branch dropdown frozen on the
+		// pre-sync set until the user manually switched repos. `listRepos`
+		// and `listBranches` both read fresh from disk on every call, so
+		// this re-push immediately reflects whatever the latest
+		// `branches.json` says.
+		if (this.deps.selection) {
+			this.pushRepos();
+			const repos = this.deps.selection.listRepos();
+			const current = repos.find((r) => r.isCurrent) ?? repos[0];
+			if (current) this.pushBranches(current.repoName);
+		}
 	}
 
 	/** Pushed from refreshStatusBar after enable/disable so the sidebar can show
