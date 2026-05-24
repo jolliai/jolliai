@@ -90,7 +90,7 @@ class FolderStorage(
         return Files.walk(dir).use { stream ->
             stream
                 .filter { it.isRegularFile() }
-                .map { jolliDir.relativize(it).toString() }
+                .map { jolliDir.relativize(it).toString().replace('\\', '/') }
                 .sorted()
                 .toList()
         }

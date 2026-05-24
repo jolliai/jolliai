@@ -55,7 +55,11 @@ object CursorSupport {
 			osName.contains("mac") ->
 				home + File.separator + "Library" + File.separator + "Application Support" + File.separator + "Cursor"
 			osName.contains("win") ->
-				(System.getenv("APPDATA") ?: (home + File.separator + "AppData" + File.separator + "Roaming")) +
+				// `cursor.appdata.override` is a test hook: Java cannot unset env vars, so tests
+				// that need to redirect away from the real %APPDATA% set this system property instead.
+				(System.getProperty("cursor.appdata.override")
+					?: System.getenv("APPDATA")
+					?: (home + File.separator + "AppData" + File.separator + "Roaming")) +
 					File.separator + "Cursor"
 			else ->
 				home + File.separator + ".config" + File.separator + "Cursor"

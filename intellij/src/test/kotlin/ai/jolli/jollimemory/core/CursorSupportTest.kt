@@ -19,15 +19,24 @@ import java.time.Instant
 class CursorSupportTest {
 
     private var originalHome: String? = null
+    private var originalCursorOverride: String? = null
 
     @BeforeEach
     fun setup() {
         originalHome = System.getProperty("user.home")
+        originalCursorOverride = System.getProperty("cursor.appdata.override")
     }
 
     @AfterEach
     fun teardown() {
         originalHome?.let { System.setProperty("user.home", it) }
+        // On Windows the production code reads %APPDATA% (env var); we redirect it via the
+        // `cursor.appdata.override` system property in helpers below. Clear it between tests.
+        if (originalCursorOverride != null) {
+            System.setProperty("cursor.appdata.override", originalCursorOverride!!)
+        } else {
+            System.clearProperty("cursor.appdata.override")
+        }
     }
 
     /** Returns the platform-correct Cursor user-data dir under the given home. */
@@ -35,7 +44,12 @@ class CursorSupportTest {
         val osName = System.getProperty("os.name").lowercase()
         return when {
             osName.contains("mac") -> File(home, "Library/Application Support/Cursor")
-            osName.contains("win") -> File(home, "AppData/Roaming/Cursor")
+            osName.contains("win") -> {
+                // On Windows the production code uses %APPDATA% (env var) which we cannot unset
+                // from Java; redirect it via the `cursor.appdata.override` system property hook.
+                System.setProperty("cursor.appdata.override", File(home, "AppData/Roaming").absolutePath)
+                File(home, "AppData/Roaming/Cursor")
+            }
             else -> File(home, ".config/Cursor")
         }
     }
@@ -112,7 +126,12 @@ class CursorSupportTest {
         // Use absolutePath (not canonicalPath) so the URI matches what callers pass to
         // discoverSessions; canonicalPath would resolve macOS's /var → /private/var
         // symlink and mismatch.
-        return "file://" + f.absolutePath
+        //
+        // Build the URI manually (not via File.toURI()) so we control the exact form:
+        // unix → "file:///abs/path", windows → "file:///C:/abs/path". Real Cursor writes
+        // its workspace.json URIs in this same form on every platform.
+        val abs = f.absolutePath.replace('\\', '/')
+        return if (abs.startsWith("/")) "file://$abs" else "file:///$abs"
     }
 
     @Nested
@@ -120,6 +139,10 @@ class CursorSupportTest {
         @Test
         fun `false when global DB does not exist`(@TempDir tempDir: File) {
             System.setProperty("user.home", tempDir.absolutePath)
+            // On Windows the production resolver uses %APPDATA% (which points at a real path
+            // on dev machines that may have Cursor installed). Redirect via the override so
+            // the resolver lands in the empty tempDir.
+            System.setProperty("cursor.appdata.override", File(tempDir, "AppData/Roaming").absolutePath)
             CursorSupport.isCursorInstalled() shouldBe false
         }
 

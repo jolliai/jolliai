@@ -42,7 +42,10 @@ class GeminiAfterAgentHookTest {
 
     @Test
     fun `saves gemini session from valid stdin`() {
-        val json = """{"session_id":"gem-456","transcript_path":"/tmp/gemini.json","cwd":"${tempDir.absolutePath}"}"""
+        // Escape backslashes for JSON — tempDir.absolutePath on Windows contains \\ which
+        // would otherwise produce illegal JSON escape sequences (\U, \A, \L, ...).
+        val cwdJson = tempDir.absolutePath.replace("\\", "\\\\")
+        val json = """{"session_id":"gem-456","transcript_path":"/tmp/gemini.json","cwd":"$cwdJson"}"""
         every { readStdin() } returns json
 
         GeminiAfterAgentHook.run()

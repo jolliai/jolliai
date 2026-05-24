@@ -49,7 +49,8 @@ class KBPathResolverTest {
         fun `uses custom path as parent with repoName appended`() {
             val custom = tempDir.resolve("custom-kb").toString()
             val result = KBPathResolver.resolve("myrepo", "https://github.com/user/myrepo.git", custom)
-            result.toString() shouldBe "$custom/myrepo"
+            // Compare via Path so the separator matches the platform (backslash on Windows).
+            result.toString() shouldBe Path.of(custom, "myrepo").toString()
         }
 
         @Test
