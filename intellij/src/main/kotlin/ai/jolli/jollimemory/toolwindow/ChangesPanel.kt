@@ -220,14 +220,7 @@ class ChangesPanel(
                 }
                 addActionListener {
                     val action = ActionManager.getInstance().getAction("JolliMemory.CommitAI") ?: return@addActionListener
-                    val dataContext = DataContext { key ->
-                        when (key) {
-                            com.intellij.openapi.actionSystem.CommonDataKeys.PROJECT.name -> project
-                            else -> null
-                        }
-                    }
-                    val event = AnActionEvent.createFromAnAction(action, null, "JolliMemoryChangesPanel", dataContext)
-                    action.actionPerformed(event)
+                    ActionManager.getInstance().tryToExecute(action, null, this, "JolliMemoryChangesPanel", true)
                 }
             }
             val btnPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 4))
