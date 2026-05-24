@@ -224,7 +224,7 @@ class MetadataManager(private val jolliDir: Path) {
                         try {
                             val content = java.nio.file.Files.readString(file, java.nio.charset.StandardCharsets.UTF_8)
                             val fp = FolderStorage.sha256(content)
-                            currentFiles[fp] = kbRoot.relativize(file).toString()
+                            currentFiles[fp] = kbRoot.relativize(file).toString().replace('\\', '/')
                         } catch (_: Exception) {}
                     }
             }

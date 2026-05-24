@@ -35,7 +35,10 @@ class StopHookTest {
 
     @Test
     fun `saves session from valid stdin JSON`() {
-        val json = """{"session_id":"sess-123","transcript_path":"/tmp/transcript.jsonl","cwd":"${tempDir.absolutePath}"}"""
+        // Escape backslashes for JSON — tempDir.absolutePath on Windows contains \\ which
+        // would otherwise produce illegal JSON escape sequences (\U, \A, \L, ...).
+        val cwdJson = tempDir.absolutePath.replace("\\", "\\\\")
+        val json = """{"session_id":"sess-123","transcript_path":"/tmp/transcript.jsonl","cwd":"$cwdJson"}"""
         every { readStdin() } returns json
 
         StopHook.run()
