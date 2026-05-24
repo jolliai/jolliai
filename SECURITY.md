@@ -48,6 +48,16 @@ We follow coordinated disclosure. Once a fix is available we will:
 
 Reporters are credited in the advisory by default. Let us know if you prefer to remain anonymous.
 
+## Operational guidance
+
+`@jolli.ai/cli` discovers plugins by walking `node_modules/` upward from the current working directory, bounded by the nearest `.git` ancestor (the project root) or — if no `.git` is found — the user's home directory. It also consults the npm global root. The walk never crosses out of those boundaries, so a `jolli` invocation from outside any project (and outside `$HOME`) skips the local walk entirely and only the npm global root is consulted. A small built-in allow-list (`@jolli.ai/cli-pro` today) gates which package names are loaded, so an unrelated package cannot register commands — but any package matching the allow-listed name inside the discovered roots will be loaded.
+
+For the strongest isolation:
+
+- Run `jolli` from inside your project directory. The boundary check above already prevents the local walk from picking up packages outside `$HOME`, but invoking from the project root is the cleanest configuration.
+- Avoid running it as root, or in a session where another user controls your `$HOME` or your npm global prefix.
+- If you need to disable plugin discovery entirely (e.g. on a hardened CI runner), set `JOLLI_NO_PLUGINS=1`.
+
 ## Out of scope
 
 The following are **not** considered security vulnerabilities under this policy:

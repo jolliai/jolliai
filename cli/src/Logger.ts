@@ -165,8 +165,19 @@ let writeQueue: Promise<void> = Promise.resolve();
 /** Maximum log file size in bytes before rotation (500KB). */
 const MAX_LOG_SIZE = 512 * 1024;
 
+/**
+ * Stable contract for callers that want to use Logger without producing
+ * any on-disk artifacts. `VITEST` covers the Vitest-driven test runs; the
+ * dedicated `JOLLI_DISABLE_LOG_FILE` is for non-Vitest contexts that still
+ * need this behaviour (e.g. the `Api.bundle.test.ts` subprocess, where the
+ * built bundle is imported by a fresh Node process and we don't want a
+ * stray debug.log from that probe).
+ *
+ * Either being set short-circuits the write queue. Both are checked here
+ * so test scaffolds don't need to know which the harness uses today.
+ */
 function enqueueLogWrite(line: string): void {
-	if (process.env.VITEST) return;
+	if (process.env.VITEST || process.env.JOLLI_DISABLE_LOG_FILE) return;
 
 	writeQueue = writeQueue.then(async () => {
 		try {

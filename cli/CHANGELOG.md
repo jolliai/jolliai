@@ -4,6 +4,9 @@
 
 ## 0.99.2
 
+- **Plugin mode.** The CLI now discovers and loads allow-listed plugin packages (`@jolli.ai/cli-pro` today) from the project's `node_modules` and the global npm root. Plugins register their own subcommands via a small public API (`PluginContext`, `PluginRegister`, re-exported `parseJolliApiKey` / `parseBaseUrl`). Discovery is bounded to the current git project or HOME — `jolli` invoked from outside any project doesn't scan ancestor `node_modules`. Set `JOLLI_NO_PLUGINS=1` to disable. See [SECURITY.md](../SECURITY.md#operational-guidance) for the operational guidance.
+- **Public API surface narrowed.** `@jolli.ai/cli` and `@jolli.ai/cli/api` are now the only supported entry points; deep imports via `@jolli.ai/cli/dist/*` no longer resolve (the package added an `exports` field).
+- **`jolli --help` grouping fix.** `search` and `heal-folder` now appear under the **Jolli Memory** section instead of falling through to "Other commands:".
 - Bug fixes
 
 ## 0.99.1

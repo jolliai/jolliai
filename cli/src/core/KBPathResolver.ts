@@ -131,6 +131,13 @@ function tryGitCommand(cwd: string, args: string[]): string | null {
 			cwd,
 			encoding: "utf-8",
 			timeout: 5000,
+			// Capture git's stderr instead of inheriting the parent process's
+			// stderr (Node's default for execFileSync). Without this, running
+			// `jolli` in a non-git directory leaks a "fatal: not a git
+			// repository …" line to the user's terminal before any of jolli's
+			// own output — even though the JS catches the non-zero exit and
+			// returns null cleanly.
+			stdio: ["ignore", "pipe", "pipe"],
 		}).trim();
 		return out || null;
 	} catch {

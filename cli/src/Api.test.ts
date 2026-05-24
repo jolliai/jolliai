@@ -1,4 +1,24 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Plugin discovery is covered by PluginLoader.test.ts. Disable it here so the
+// CLI command tests don't depend on the real ~/.jolli/jollimemory cache file
+// or invoke the npm subprocess that PluginLoader would otherwise spawn.
+//
+// Save/restore the prior value rather than unconditionally deleting in afterAll —
+// vitest's default pool isolates files, but a future config flip to a shared
+// worker would otherwise leak JOLLI_NO_PLUGINS=1 into PluginLoader.test.ts and
+// silently short-circuit the loader's own tests at PluginLoader.ts L98.
+const PRIOR_JOLLI_NO_PLUGINS = process.env.JOLLI_NO_PLUGINS;
+beforeAll(() => {
+	process.env.JOLLI_NO_PLUGINS = "1";
+});
+afterAll(() => {
+	if (PRIOR_JOLLI_NO_PLUGINS === undefined) {
+		delete process.env.JOLLI_NO_PLUGINS;
+	} else {
+		process.env.JOLLI_NO_PLUGINS = PRIOR_JOLLI_NO_PLUGINS;
+	}
+});
 
 const { mockExecFileSync, mockExistsSync, mockReadFileSync, mockCreateInterface } = vi.hoisted(() => ({
 	mockExecFileSync: vi.fn(),
@@ -46,6 +66,12 @@ vi.mock("./core/SessionTracker.js", () => ({
 vi.mock("./core/Locks.js", () => ({
 	isWorkerLockStale: vi.fn().mockResolvedValue(false),
 	releaseWorkerLock: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Default no-op; individual tests use `mockImplementationOnce` to inject
+// plugin commands (e.g. to exercise the `_hidden` filter in visibleCommands).
+vi.mock("./PluginLoader.js", () => ({
+	loadPlugins: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("./core/JolliApiUtils.js", async () => {
@@ -205,13 +231,14 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
-import { main } from "./Cli.js";
+import { main } from "./Api.js";
 import { compileTaskContext, listBranchCatalog, renderContextMarkdown } from "./core/ContextCompiler.js";
 import { loadConfigFromDir } from "./core/SessionTracker.js";
 import { exportSummaries } from "./core/SummaryExporter.js";
 import { hasMigrationMeta, migrateV1toV3 } from "./core/SummaryMigration.js";
 import { getIndex, getSummary, indexNeedsMigration, listSummaries, migrateIndexToV3 } from "./core/SummaryStore.js";
 import { getStatus, install, uninstall } from "./install/Installer.js";
+import { loadPlugins } from "./PluginLoader.js";
 
 describe("CLI", () => {
 	beforeEach(() => {
@@ -268,6 +295,107 @@ describe("CLI", () => {
 			// that formatGroupedHelp prepends for the root program.
 			expect(helpOutput).not.toContain("Jolli Memory — Auto-document");
 			expect(helpOutput).not.toContain("Jolli Site — Generate");
+			exitSpy.mockRestore();
+		});
+
+		it("should group `search` under Jolli Memory (not Other commands)", async () => {
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["--help"]);
+			} catch {
+				// Commander calls process.exit after --help
+			}
+			const writes = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
+			const helpOutput = writes.join("");
+
+			const memoryHeader = helpOutput.indexOf("Jolli Memory — Auto-document");
+			const siteHeader = helpOutput.indexOf("Jolli Site — Generate");
+			const otherHeader = helpOutput.indexOf("Other commands:");
+			const searchIdx = helpOutput.indexOf("search ");
+
+			expect(memoryHeader).toBeGreaterThanOrEqual(0);
+			expect(siteHeader).toBeGreaterThan(memoryHeader);
+			// `search` must appear inside the Memory section — i.e. after the Memory
+			// header and before the Site / Other section that follows it.
+			expect(searchIdx).toBeGreaterThan(memoryHeader);
+			expect(searchIdx).toBeLessThan(siteHeader);
+			if (otherHeader >= 0) expect(searchIdx).toBeLessThan(otherHeader);
+			exitSpy.mockRestore();
+		});
+
+		it("should hide plugin commands registered with { hidden: true }", async () => {
+			// Use Commander's public `{ hidden: true }` option — the same path
+			// plugin authors are documented to use in PluginContext.program.
+			// The host's visibleCommands filter reads the resulting internal
+			// `_hidden` flag, so this exercises the full hidden-command path
+			// without any private-state access in the test or the plugin.
+			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
+				program.command("plugin-hidden-secret", { hidden: true }).description("hidden by plugin");
+				program.command("plugin-visible-cmd").description("visible plugin cmd");
+			});
+
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["--help"]);
+			} catch {
+				// Commander calls process.exit after --help
+			}
+			const writes = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
+			const helpOutput = writes.join("");
+			expect(helpOutput).toContain("plugin-visible-cmd");
+			expect(helpOutput).not.toContain("plugin-hidden-secret");
+			exitSpy.mockRestore();
+		});
+
+		it("classifies every builtin command into Memory or Site (no 'Other commands:' fall-through)", async () => {
+			// Invariant: every builtin command name must appear in either
+			// MEMORY_COMMAND_NAMES, SITE_COMMAND_NAMES, or HIDDEN_COMMANDS in
+			// Api.ts. Anything uncategorised would land in "Other commands:".
+			// This test fails loudly if a new builtin is registered without
+			// being categorised. (Plugin commands legitimately land in
+			// "Other commands:" — see the next test for that branch.)
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["--help"]);
+			} catch {
+				// Commander calls process.exit after --help
+			}
+			const writes = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
+			const helpOutput = writes.join("");
+			expect(helpOutput).not.toContain("Other commands:");
+			exitSpy.mockRestore();
+		});
+
+		it("renders plugin-registered commands under 'Other commands:'", async () => {
+			// A plugin command name that isn't in MEMORY_COMMAND_NAMES or
+			// SITE_COMMAND_NAMES legitimately falls through to the "Other
+			// commands:" section. Exercises the previously-v8-ignored branch
+			// in formatGroupedHelp so coverage reflects production reality
+			// once plugins are loaded.
+			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
+				program.command("plugin-extra-cmd").description("third-party plugin command");
+			});
+
+			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit");
+			}) as never);
+			try {
+				await main(["--help"]);
+			} catch {
+				// Commander calls process.exit after --help
+			}
+			const writes = vi.mocked(process.stdout.write).mock.calls.map((c) => String(c[0]));
+			const helpOutput = writes.join("");
+			const otherHeader = helpOutput.indexOf("Other commands:");
+			const pluginIdx = helpOutput.indexOf("plugin-extra-cmd");
+			expect(otherHeader).toBeGreaterThanOrEqual(0);
+			expect(pluginIdx).toBeGreaterThan(otherHeader);
 			exitSpy.mockRestore();
 		});
 	});
@@ -2691,7 +2819,7 @@ describe("CLI", () => {
 			mockExecFileSync.mockImplementation(() => {
 				throw new Error("not a git repo");
 			});
-			const { main: freshMain } = await import("./Cli.js");
+			const { main: freshMain } = await import("./Api.js");
 
 			await freshMain(["status"]);
 			expect(getStatus).toHaveBeenCalledWith(process.cwd());
@@ -2748,7 +2876,7 @@ describe("CLI", () => {
 				vi.mocked(traverseDistPaths).mockReturnValue([]);
 			}
 
-			const { main: freshMain } = await import("./Cli.js");
+			const { main: freshMain } = await import("./Api.js");
 			await freshMain(["status"]);
 		}
 
@@ -2803,7 +2931,7 @@ describe("CLI", () => {
 				throw new Error("EACCES");
 			});
 
-			const { main: freshMain } = await import("./Cli.js");
+			const { main: freshMain } = await import("./Api.js");
 			// Should not throw — error is silently caught
 			await expect(freshMain(["status"])).resolves.not.toThrow();
 		});
@@ -3195,7 +3323,7 @@ describe("CLI", () => {
 				vi.mocked(traverseDistPaths).mockReturnValue([]);
 			}
 
-			const { main: freshMain } = await import("./Cli.js");
+			const { main: freshMain } = await import("./Api.js");
 			await freshMain(["status"]);
 		}
 
@@ -3221,7 +3349,7 @@ describe("CLI", () => {
 			]);
 
 			vi.mocked(process.stderr.write).mockClear();
-			const { main: freshMain } = await import("./Cli.js");
+			const { main: freshMain } = await import("./Api.js");
 			await freshMain(["status"]);
 
 			const stderrOutput = vi

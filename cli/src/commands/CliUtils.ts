@@ -121,6 +121,11 @@ export function resolveProjectDir(): string {
 	try {
 		_cachedProjectDir = execFileSyncHidden("git", ["rev-parse", "--show-toplevel"], {
 			encoding: "utf-8",
+			// Capture git's stderr so a non-git cwd doesn't leak
+			// "fatal: not a git repository …" to the user's terminal before
+			// any of jolli's own output. The non-zero exit is already handled
+			// below — we just don't need git's complaint to escape with it.
+			stdio: ["ignore", "pipe", "pipe"],
 		}).trim();
 	} catch {
 		_cachedProjectDir = process.cwd();

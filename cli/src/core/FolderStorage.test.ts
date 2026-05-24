@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FolderStorage } from "./FolderStorage.js";
+import type { ManifestEntry } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
 
 // Mock SummaryMarkdownBuilder
@@ -539,11 +540,17 @@ describe("FolderStorage", () => {
 			const visiblePath = join(rootPath, "main", "legacy-12345678.md");
 			expect(existsSync(visiblePath)).toBe(true);
 			// Clobber the manifest entry's fingerprint to simulate a legacy
-			// entry that predates fingerprint tracking.
+			// entry that predates fingerprint tracking. The ManifestEntry type
+			// declares fingerprint as required, but FolderStorage.ts guards
+			// every read with `entry.fingerprint &&` (lines 196, 559, 612, 715,
+			// 792) so legacy on-disk manifests written before fingerprint
+			// tracking still load. The cast documents that we are intentionally
+			// constructing the legacy shape to exercise the falsy-fingerprint
+			// arm of deleteVisibleMarkdown.
 			const entry = metadataManager.findById("1234567812345678");
 			if (!entry) throw new Error("seeded entry vanished");
 			const { fingerprint: _omit, ...withoutFp } = entry;
-			metadataManager.updateManifest(withoutFp);
+			metadataManager.updateManifest(withoutFp as ManifestEntry);
 
 			await storage.deleteVisibleMarkdown({
 				commitHash: "1234567812345678",
