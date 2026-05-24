@@ -1,4 +1,9 @@
 import org.jetbrains.intellij.platform.gradle.IntelliJPlatformType
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
+import java.util.zip.ZipEntry
+import java.io.ByteArrayOutputStream
+import java.io.FileOutputStream
 
 plugins {
     id("java")
@@ -136,152 +141,50 @@ intellijPlatform {
         """.trimIndent()
         changeNotes = """
             <h3>0.99.0</h3>
+
+            <h4>Memory Bank</h4>
             <ul>
-                <li><b>Simplified setup flow</b> &mdash; removed the separate Enable/Disable step;
-                    hooks are now auto-installed when you save credentials and auto-removed when
-                    credentials are cleared. No more &ldquo;configured but not enabled&rdquo; limbo state</li>
-                <li><b>Onboarding screen</b> &mdash; first-run wizard detects existing API keys
-                    (config or <code>ANTHROPIC_API_KEY</code> env var) and skips onboarding automatically</li>
+                <li><b>Memory Bank</b> &mdash; a new local storage layer that keeps human-readable
+                    Markdown summaries, plans, and notes alongside canonical JSON in a user-configurable
+                    folder. Dual-written to both the git orphan branch and the Memory Bank folder by default</li>
+                <li><b>Memory Bank explorer</b> &mdash; browse your Memory Bank as a tree view with
+                    commit/plan/note badges. Supports file operations (New Folder, File, Import, Rename,
+                    Move, Delete) and drag-and-drop</li>
+                <li><b>Auto-migration</b> &mdash; existing orphan branch data is automatically migrated
+                    to the Memory Bank folder on plugin startup</li>
+            </ul>
+
+            <h4>AI Agent Support</h4>
+            <ul>
+                <li><b>Claude Code</b> &mdash; StopHook after each response, SessionStartHook briefing at startup</li>
+                <li><b>Gemini CLI</b> &mdash; AfterAgent hook after each agent completion</li>
+                <li><b>Codex CLI</b> &mdash; automatic filesystem discovery, no hook needed</li>
+                <li><b>OpenCode</b> &mdash; session discovery via SQLite database scan</li>
+                <li><b>Cursor IDE</b> &mdash; Composer session discovery via SQLite database scan</li>
+                <li><b>GitHub Copilot CLI &amp; Copilot Chat</b> &mdash; session discovery via filesystem scan</li>
+            </ul>
+
+            <h4>Settings &amp; Setup</h4>
+            <ul>
+                <li><b>Simplified setup flow</b> &mdash; hooks auto-install on credential save and
+                    auto-remove on credential clear; no separate Enable/Disable step</li>
+                <li><b>Onboarding screen</b> &mdash; detects existing API keys (config or
+                    <code>ANTHROPIC_API_KEY</code> env var) and skips onboarding automatically</li>
                 <li><b>Tabbed Settings dialog</b> &mdash; reorganized into five tabs: General,
-                    AI Agents, AI Summary, Sync to Jolli, and Memory Bank. Remembers last
-                    selected tab within the IDE session</li>
-                <li><b>AI Summary tab</b> &mdash; provider dropdown (Anthropic / Jolli) with
-                    contextual UI: Anthropic shows key + model + max tokens; Jolli shows site
-                    name and Advanced panel to view/edit Jolli API Key</li>
-                <li><b>Provider credential warnings</b> &mdash; status indicator turns yellow when
-                    the selected provider&rsquo;s API key is missing; hover popup shows which key is needed</li>
-                <li><b>Sync to Jolli tab</b> &mdash; shows sign-in/sign-out state with clear
-                    messaging when Jolli API key is missing</li>
-                <li><b>Memory Bank</b> &mdash; renamed from Knowledge Base; tab title and all
-                    UI references updated</li>
-                <li><b>Pause toggle</b> &mdash; temporarily disable hooks without losing configuration,
-                    available in the General tab</li>
-                <li><b>Auto-disable on sign-out</b> &mdash; signing out or clearing all credentials
-                    automatically uninstalls hooks and returns to the onboarding screen</li>
-                <li><b>Refined icons</b> &mdash; new key icon for Anthropic option, cleaner cloud
-                    sync and git-merge icons</li>
-                <li><b>Settings always accessible</b> &mdash; gear icon now in the tool window
-                    title bar, visible regardless of which panels are open</li>
+                    AI Agents, AI Summary, Sync to Jolli, and Memory Bank</li>
+                <li><b>AI Summary provider selection</b> &mdash; choose between Anthropic and Jolli
+                    as the summarization provider</li>
+                <li><b>Pause toggle</b> &mdash; temporarily disable hooks without losing configuration</li>
             </ul>
 
-            <h3>0.98.1</h3>
+            <h4>Plugin Distribution</h4>
             <ul>
-                <li><b>Full migration</b> &mdash; migration now includes all child summaries,
-                    notes, and transcripts from the orphan branch, not just root entries</li>
-                <li><b>Visible plan &amp; note copies</b> &mdash; plans and notes now generate
-                    human-readable Markdown files in branch directories with YAML frontmatter</li>
-                <li><b>Default dual-write mode</b> &mdash; all users automatically get folder
-                    storage after upgrade without manual configuration</li>
-                <li><b>Performance</b> &mdash; replaced 3-second polling timer with VirtualFileManager
-                    listener for KB tree updates</li>
-                <li><b>Cross-platform Reveal</b> &mdash; Reveal in Finder/Explorer now works on
-                    macOS, Windows, and Linux</li>
-                <li><b>DnD safety</b> &mdash; drag-and-drop file moves now prompt for confirmation
-                    before overwriting existing files</li>
-                <li><b>Error handling</b> &mdash; silent exception swallowing replaced with proper
-                    logging; HTML-escaped error messages in UI</li>
-                <li><b>Selection restore</b> &mdash; KB tree selection is correctly preserved
-                    after refresh</li>
-            </ul>
-
-            <h3>0.98.0</h3>
-            <ul>
-                <li><b>Knowledge Base explorer</b> &mdash; browse your local Knowledge Base folder
-                    as a tree view in the JOLLI tool window, with C/P/N badges and readable titles.
-                    Double-click commit files to open the formatted summary viewer</li>
-                <li><b>Folder-based storage</b> &mdash; new dual-write mode stores summaries as
-                    human-readable Markdown files alongside hidden JSON data in a local folder
-                    (<code>~/Documents/jolli/{project}/</code>)</li>
-                <li><b>Auto-migration</b> &mdash; existing orphan branch data is automatically
-                    migrated to the Knowledge Base folder on plugin startup. Manual migration
-                    available via Settings</li>
-                <li><b>File operations</b> &mdash; right-click context menu for New Folder,
-                    New File, Import, Rename, Move, Delete. Drag and drop support for
-                    files and folders with metadata sync</li>
-                <li><b>Create &amp; Update PR</b> &mdash; automatically detects existing PRs
-                    and updates them instead of failing</li>
-                <li><b>Fix CommitsPanel after Enable</b> &mdash; resolve race condition where
-                    CommitsPanel showed &ldquo;disabled&rdquo; on empty branches after Enable</li>
-                <li><b>Fix panel refresh on branch switch</b> &mdash; add VCS listener and
-                    periodic polling for reliable branch detection</li>
-            </ul>
-
-            <h3>0.97.9</h3>
-            <ul>
-                <li><b>Privacy consent notice</b> &mdash; display a privacy notice with link to
-                    privacy policy at the top of the Settings page, satisfying JetBrains Marketplace
-                    guideline 2.2 for explicit user consent before data processing</li>
-            </ul>
-
-            <h3>0.97.8</h3>
-            <ul>
-                <li><b>Fix scheduled-for-removal API</b> &mdash; replace <code>PluginId.findId()</code>
-                    with <code>PluginId.getId()</code> to resolve Plugin Verifier warnings</li>
-                <li><b>Add Plugin Verifier to CI</b> &mdash; verify binary compatibility against
-                    IntelliJ 2024.3, 2025.1, and 2026.1 on every build</li>
-            </ul>
-
-            <h3>0.97.7</h3>
-            <ul>
-                <li><b>Bump version</b> &mdash; version bump for standalone repository migration</li>
-            </ul>
-
-            <h3>0.97.6</h3>
-            <ul>
-                <li><b>Marketplace readiness</b> &mdash; add plugin icons (<code>pluginIcon.svg</code>
-                    with dark variant), configure Gradle plugin signing and publishing,
-                    add Apache 2.0 LICENSE</li>
-            </ul>
-
-            <h3>0.97.5</h3>
-            <ul>
-                <li><b>Install Gemini CLI hooks</b> &mdash; the Enable button now writes the AfterAgent hook
-                    to <code>.gemini/settings.json</code>, matching the VS Code extension</li>
-                <li><b>Auto-refresh panels after commit</b> &mdash; COMMITS and CHANGES panels now subscribe
-                    to <code>GIT_REPO_CHANGE</code> events directly, so they update automatically after
-                    IntelliJ UI commits instead of requiring manual refresh</li>
-                <li><b>Fix stale &ldquo;disabled&rdquo; state after enable</b> &mdash; prevent a slow initial
-                    background refresh from overwriting the correct UI state</li>
-                <li><b>Fix VFS listener bus scope</b> &mdash; CHANGES panel now subscribes to
-                    <code>VFS_CHANGES</code> on the application-level message bus</li>
-                <li><b>Fix TypesJVMKt binary incompatibility</b> &mdash; exclude <code>TypesJVMKt</code>
-                    from hooks fat JAR in addition to <code>TypeVariableImpl</code> to resolve
-                    Plugin Verifier <code>NoSuchClassError</code> on IntelliJ 2026.1+</li>
-                <li><b>Fix tool window icon</b> &mdash; correct SVG icon rendering in the sidebar</li>
-                <li><b>Refactor panel layout</b> &mdash; panels now use JPanel rows for better alignment and consistency</li>
-                <li><b>Harden hook installation</b> &mdash; fix CLI file permissions and scope the package name</li>
-                <li><b>Update export path</b> &mdash; SummaryExporter now writes to <code>~/Documents/jollimemory/</code></li>
-            </ul>
-
-            <h3>0.97.4</h3>
-            <ul>
-                <li><b>Fix TypeVariable binary incompatibility</b> &mdash; exclude <code>TypeVariableImpl</code> from hooks fat JAR
-                    to resolve IntelliJ 2026.1+ (build 261) compatibility where <code>getAnnotatedBounds()</code> was missing</li>
-                <li><b>kotlin-stdlib as compileOnly</b> &mdash; the plugin no longer bundles kotlin-stdlib (IntelliJ provides
-                    it at runtime); only the standalone hooks JAR bundles its own copy via a separate <code>hooksRuntime</code>
-                    Gradle configuration</li>
-            </ul>
-
-            <h3>0.97.3</h3>
-            <ul>
-                <li>Bump plugin version for distribution</li>
-            </ul>
-
-            <h3>0.97.2</h3>
-            <ul>
-                <li><b>Fix UTF-8 bridge corruption</b> &mdash; resolve encoding issues in git command output parsing
-                    that could corrupt non-ASCII characters (emojis, CJK) in commit messages and file paths.
-                    Webview messages now use Base64 encoding for safe IPC</li>
-                <li><b>Improved UI layout</b> &mdash; collapsible panels with AccordionLayout, ResizeDivider for
-                    manual panel resizing, and inline action toolbars per panel</li>
-                <li><b>Panel management</b> &mdash; configurable panel visibility via gear menu, PanelRegistry
-                    for state persistence across IDE sessions</li>
-            </ul>
-
-            <h3>0.97.1</h3>
-            <ul>
-                <li><b>Refined panel headers</b> &mdash; improved collapsible panel headers, expand/collapse
-                    animations, and panel toolbar layout</li>
+                <li><b>Reduced plugin size</b> &mdash; stripped unused platform natives from sqlite-jdbc
+                    and deduplicated the dependency between the plugin and hooks JAR.
+                    Plugin zip reduced from 31 MB to 7 MB</li>
+                <li><b>Quality improvements</b> &mdash; resolved JetBrains Marketplace API warnings,
+                    fixed binary compatibility across IntelliJ versions, improved UI layout and
+                    panel management, and added Plugin Verifier to CI</li>
             </ul>
 
             <h3>0.97.0 &mdash; Initial Release</h3>
@@ -296,8 +199,6 @@ intellijPlatform {
                 <li><b>Hook installation</b> &mdash; pure Kotlin file I/O for git hooks and Claude Code stop hook</li>
                 <li><b>Standalone hooks JAR</b> &mdash; git hooks run as <code>jollimemory-hooks.jar</code> fat JAR
                     outside the IDE</li>
-                <li><b>Multi-agent support</b> &mdash; session tracking for Claude Code (StopHook), Gemini CLI
-                    (AfterAgent hook), and Codex CLI (filesystem discovery)</li>
                 <li><b>Orphan branch storage</b> &mdash; summaries stored in <code>jollimemory/summaries/v3</code>
                     with tree-hash aliases for cross-branch matching</li>
                 <li><b>Push to Jolli Space</b> &mdash; publish summaries to team knowledge base via API</li>
@@ -341,12 +242,24 @@ intellijPlatform {
     }
 }
 
+// Resolve the sqlite-jdbc JAR filename from the dependency so the Class-Path
+// manifest stays correct when the version is bumped.
+val sqliteJdbcFileName: String by lazy {
+    hooksRuntime.resolvedConfiguration.resolvedArtifacts
+        .map { it.file.name }
+        .first { it.startsWith("sqlite-jdbc") }
+}
+
 // Fat JAR for hooks (standalone executable without IntelliJ dependencies)
 tasks.register<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("hookJar") {
     archiveBaseName.set("jollimemory-hooks")
     archiveClassifier.set("")
     manifest {
         attributes["Main-Class"] = "ai.jolli.jollimemory.hooks.HookRunner"
+        // JVM resolves Class-Path entries relative to the JAR's own directory.
+        // Two entries: (1) when installed to ~/.jolli/bin/ alongside sqlite-jdbc.jar,
+        // (2) when running from plugin's bin/ directory, resolve from sibling lib/.
+        attributes["Class-Path"] = "sqlite-jdbc.jar ../lib/$sqliteJdbcFileName"
     }
     from(sourceSets.main.get().output)
     // runtimeClasspath no longer includes Gson/kotlin-stdlib (both compileOnly);
@@ -366,6 +279,12 @@ tasks.register<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("hook
     exclude("kotlin/reflect/TypesJVMKt\$*.class")
     // Exclude the plugin descriptor so IntelliJ doesn't see two plugin.xml files
     exclude("META-INF/plugin.xml")
+    // Exclude sqlite-jdbc entirely — it ships as a separate JAR in bin/ and is loaded
+    // via Class-Path manifest at runtime. This avoids duplicating the 3.8 MB library.
+    exclude("org/sqlite/**")
+    exclude("META-INF/maven/org.xerial/**")
+    exclude("META-INF/native-image/org.xerial/**")
+    exclude("META-INF/versions/9/org/sqlite/**")
     mergeServiceFiles()
 }
 
@@ -374,9 +293,9 @@ tasks.named("prepareSandbox") {
     dependsOn("hookJar")
 }
 
-// After prepareSandbox completes, copy hooks JAR into the sandbox bin dir.
-// Using bin/ instead of lib/ keeps the standalone hooks JAR off the plugin
-// classloader path, so Plugin Verifier doesn't flag its bundled dependencies.
+// After prepareSandbox completes, copy hooks JAR and a stripped sqlite-jdbc.jar into bin/.
+// Using bin/ instead of lib/ keeps them off the plugin classloader path, so Plugin
+// Verifier doesn't flag the bundled dependencies.
 tasks.register("copyHookJarToSandbox") {
     dependsOn("prepareSandbox", "hookJar")
     doLast {
@@ -385,6 +304,48 @@ tasks.register("copyHookJarToSandbox") {
         pluginBin.mkdirs()
         hookJar.copyTo(File(pluginBin, "jollimemory-hooks.jar"), overwrite = true)
         logger.lifecycle("Copied hooks JAR to: ${pluginBin}/jollimemory-hooks.jar")
+
+        // Produce a platform-stripped sqlite-jdbc.jar for the hooks JAR's Class-Path.
+        // The plugin's lib/ has the full upstream JAR; we strip it down to desktop platforms only.
+        val keepNativePrefixes = listOf(
+            "org/sqlite/native/Mac/",
+            "org/sqlite/native/Linux/aarch64/",
+            "org/sqlite/native/Linux/x86_64/",
+            "org/sqlite/native/Windows/aarch64/",
+            "org/sqlite/native/Windows/x86_64/",
+        )
+        val sqliteSrc = hooksRuntime.resolvedConfiguration.resolvedArtifacts
+            .map { it.file }
+            .first { it.name.startsWith("sqlite-jdbc") }
+        val sqliteDst = File(pluginBin, "sqlite-jdbc.jar")
+        val zipIn = ZipFile(sqliteSrc)
+        val zipOut = ZipOutputStream(FileOutputStream(sqliteDst))
+        try {
+            val entries = zipIn.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                val name = entry.name
+                if (name.startsWith("org/sqlite/native/") &&
+                    keepNativePrefixes.none { prefix -> name.startsWith(prefix) }
+                ) continue
+                zipOut.putNextEntry(ZipEntry(name))
+                if (!entry.isDirectory) {
+                    val buf = ByteArray(8192)
+                    val stream = zipIn.getInputStream(entry)
+                    var len = stream.read(buf)
+                    while (len >= 0) {
+                        zipOut.write(buf, 0, len)
+                        len = stream.read(buf)
+                    }
+                    stream.close()
+                }
+                zipOut.closeEntry()
+            }
+        } finally {
+            zipOut.close()
+            zipIn.close()
+        }
+        logger.lifecycle("Stripped sqlite-jdbc.jar to: ${pluginBin}/sqlite-jdbc.jar (${sqliteSrc.length() / 1024}K -> ${sqliteDst.length() / 1024}K)")
     }
 }
 
@@ -393,23 +354,105 @@ tasks.named("buildSearchableOptions") {
     dependsOn("copyHookJarToSandbox")
 }
 
-// After buildPlugin creates the zip, inject the hooks JAR into bin/ (not lib/)
+// After buildPlugin creates the zip, inject bin/ JARs and strip unused sqlite-jdbc natives from lib/.
 tasks.named("buildPlugin") {
     dependsOn("copyHookJarToSandbox")
     doLast {
-        val hookJar = layout.buildDirectory.file("idea-sandbox/plugins/jollimemory-intellij/bin/jollimemory-hooks.jar").get().asFile
         val zipFile = layout.buildDirectory.dir("distributions").get().asFile
             .listFiles()?.firstOrNull { it.name.endsWith(".zip") } ?: return@doLast
+        val pluginBin = layout.buildDirectory.dir("idea-sandbox/plugins/jollimemory-intellij/bin").get().asFile
 
-        // Add hooks JAR to bin/ in the existing zip (outside lib/ so Plugin Verifier skips it)
+        // 1. Add hooks JAR to bin/ (outside lib/ so Plugin Verifier skips it).
+        //    sqlite-jdbc.jar is NOT duplicated here — the hooks JAR's Class-Path manifest
+        //    references ../lib/sqlite-jdbc-*.jar when running from the plugin directory.
+        //    A separate copy is only made to ~/.jolli/bin/ by HookInstaller at install time.
         ant.withGroovyBuilder {
             "zip"("destfile" to zipFile.absolutePath, "update" to true) {
-                "zipfileset"("dir" to hookJar.parentFile.absolutePath, "prefix" to "jollimemory-intellij/bin") {
+                "zipfileset"("dir" to pluginBin.absolutePath, "prefix" to "jollimemory-intellij/bin") {
                     "include"("name" to "jollimemory-hooks.jar")
                 }
             }
         }
         logger.lifecycle("Injected hooks JAR into: ${zipFile.name}")
+
+        // 2. Strip sqlite-jdbc native libraries in lib/ for platforms IntelliJ never runs on.
+        //    The lib/ copy is used by the IDE plugin classloader; bin/sqlite-jdbc.jar is for hooks.
+        val keepNativePrefixes = listOf(
+            "org/sqlite/native/Mac/",
+            "org/sqlite/native/Linux/aarch64/",
+            "org/sqlite/native/Linux/x86_64/",
+            "org/sqlite/native/Windows/aarch64/",
+            "org/sqlite/native/Windows/x86_64/",
+        )
+        val sizeBefore = zipFile.length() / 1024
+        val tmpZip = File(zipFile.parentFile, "${zipFile.name}.tmp")
+        val zipIn = ZipFile(zipFile)
+        val zipOut = ZipOutputStream(FileOutputStream(tmpZip))
+        try {
+            val entries = zipIn.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                val name = entry.name
+                // Repack the lib/sqlite-jdbc JAR inline, stripping unused natives
+                if (name.matches(Regex("jollimemory-intellij/lib/sqlite-jdbc-.*\\.jar"))) {
+                    val originalBytes = zipIn.getInputStream(entry).readBytes()
+                    val tmpSqlite = File.createTempFile("sqlite-jdbc", ".jar")
+                    tmpSqlite.writeBytes(originalBytes)
+                    val strippedBytes = ByteArrayOutputStream()
+                    val sqliteIn = ZipFile(tmpSqlite)
+                    val sqliteOut = ZipOutputStream(strippedBytes)
+                    try {
+                        val sqliteEntries = sqliteIn.entries()
+                        while (sqliteEntries.hasMoreElements()) {
+                            val se = sqliteEntries.nextElement()
+                            val sn = se.name
+                            if (sn.startsWith("org/sqlite/native/") &&
+                                keepNativePrefixes.none { prefix -> sn.startsWith(prefix) }
+                            ) continue
+                            sqliteOut.putNextEntry(ZipEntry(sn))
+                            if (!se.isDirectory) {
+                                val buf = ByteArray(8192)
+                                val stream = sqliteIn.getInputStream(se)
+                                var len = stream.read(buf)
+                                while (len >= 0) {
+                                    sqliteOut.write(buf, 0, len)
+                                    len = stream.read(buf)
+                                }
+                                stream.close()
+                            }
+                            sqliteOut.closeEntry()
+                        }
+                    } finally {
+                        sqliteOut.close()
+                        sqliteIn.close()
+                        tmpSqlite.delete()
+                    }
+                    zipOut.putNextEntry(ZipEntry(name))
+                    zipOut.write(strippedBytes.toByteArray())
+                    zipOut.closeEntry()
+                    continue
+                }
+                zipOut.putNextEntry(ZipEntry(name))
+                if (!entry.isDirectory) {
+                    val buf = ByteArray(8192)
+                    val stream = zipIn.getInputStream(entry)
+                    var len = stream.read(buf)
+                    while (len >= 0) {
+                        zipOut.write(buf, 0, len)
+                        len = stream.read(buf)
+                    }
+                    stream.close()
+                }
+                zipOut.closeEntry()
+            }
+        } finally {
+            zipOut.close()
+            zipIn.close()
+        }
+        zipFile.delete()
+        tmpZip.renameTo(zipFile)
+        val sizeAfter = zipFile.length() / 1024
+        logger.lifecycle("Stripped sqlite-jdbc natives in zip: ${sizeBefore}K -> ${sizeAfter}K")
     }
 }
 

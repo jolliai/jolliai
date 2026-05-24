@@ -2,80 +2,37 @@
 
 ## 0.99.0
 
-- **Simplified setup flow** — removed separate Enable/Disable step; hooks auto-install on credential save and auto-remove on credential clear
+### Memory Bank
+
+- **Memory Bank** — a new local storage layer that keeps human-readable Markdown summaries, plans, and notes alongside canonical JSON in a user-configurable folder. Summaries are dual-written to both the git orphan branch (system of record) and the Memory Bank folder by default
+- **Memory Bank explorer** — browse your Memory Bank as a tree view in the tool window with commit/plan/note badges, double-click to open the formatted summary viewer. Supports file operations (New Folder, File, Import, Rename, Move, Delete) and drag-and-drop
+- **Auto-migration** — existing orphan branch data is automatically migrated to the Memory Bank folder on plugin startup
+
+### AI Agent Support
+
+- **Claude Code** — StopHook after each response, SessionStartHook briefing at startup
+- **Gemini CLI** — AfterAgent hook after each agent completion
+- **Codex CLI** — automatic filesystem discovery, no hook needed
+- **OpenCode** — session discovery via SQLite database scan
+- **Cursor IDE** — Composer session discovery via SQLite database scan
+- **GitHub Copilot CLI & Copilot Chat** — session discovery via filesystem scan
+
+### Settings & Setup
+
+- **Simplified setup flow** — hooks auto-install on credential save and auto-remove on credential clear; no separate Enable/Disable step
 - **Onboarding screen** — detects existing API keys (config or `ANTHROPIC_API_KEY` env var) and skips onboarding automatically
-- **Tabbed Settings dialog** — reorganized into five tabs: General, AI Agents, AI Summary, Sync to Jolli, and Memory Bank. Remembers last selected tab
-- **AI Summary tab** — provider dropdown (Anthropic / Jolli) with contextual UI and credential warnings
-- **Provider credential warnings** — status indicator turns yellow when selected provider's API key is missing
-- **Sync to Jolli tab** — shows sign-in/sign-out state with messaging when Jolli API key is missing
-- **Memory Bank** — renamed from Knowledge Base throughout the UI
-- **Pause toggle** — temporarily disable hooks without losing configuration (General tab)
-- **Auto-disable on sign-out** — signing out or clearing credentials auto-uninstalls hooks and returns to onboarding
-- **Refined icons** — new key icon for Anthropic, cleaner cloud sync and git-merge icons
-- **Settings always accessible** — gear icon in tool window title bar, visible regardless of panel state
+- **Tabbed Settings dialog** — reorganized into five tabs: General, AI Agents, AI Summary, Sync to Jolli, and Memory Bank
+- **AI Summary provider selection** — choose between Anthropic and Jolli as the summarization provider
+- **Pause toggle** — temporarily disable hooks without losing configuration
 
-## 0.98.1
+### Plugin Distribution
 
-- **Full migration** — migration now includes all child summaries, notes, and transcripts from the orphan branch
-- **Visible plan & note copies** — plans and notes generate human-readable Markdown files with YAML frontmatter
-- **Default dual-write mode** — all users automatically get folder storage after upgrade
-- **Performance** — replaced 3-second polling timer with VirtualFileManager listener for KB tree updates
-- **Cross-platform Reveal** — Reveal in Finder/Explorer now works on macOS, Windows, and Linux
-- **DnD safety** — drag-and-drop file moves prompt for confirmation before overwriting
-- **Error handling** — silent exception swallowing replaced with proper logging
-- **Selection restore** — KB tree selection preserved after refresh
+- **Reduced plugin size** — stripped unused platform natives from sqlite-jdbc (FreeBSD, Android, ARM32, RISC-V, ppc64) and deduplicated the sqlite-jdbc dependency between the plugin and hooks JAR. Plugin zip reduced from 31 MB to 7 MB
+- **Quality improvements** — resolved JetBrains Marketplace internal API warnings, fixed binary compatibility issues across IntelliJ versions, improved UI layout and panel management, fixed encoding issues, and added Plugin Verifier to CI
 
-## 0.98.0
+## 0.97.9
 
-- **Knowledge Base explorer** — browse local Knowledge Base folder as tree view with C/P/N badges
-- **Folder-based storage** — dual-write mode stores summaries as Markdown alongside JSON
-- **Auto-migration** — orphan branch data auto-migrated on startup
-- **File operations** — context menu for New Folder, File, Import, Rename, Move, Delete with DnD support
-- **Create & Update PR** — detects existing PRs and updates instead of failing
-
-## 0.97.8
-
-- **Fix scheduled-for-removal API** — replace `PluginId.findId()` with `PluginId.getId()` to resolve Plugin Verifier warnings
-- **Add Plugin Verifier to CI** — verify binary compatibility against IntelliJ 2024.3, 2025.1, and 2026.1 on every build
-
-## 0.97.7
-
-- **Bump version** — version bump for standalone repository migration
-
-## 0.97.6
-
-- **Marketplace readiness** — add plugin icons (`pluginIcon.svg` with dark variant), configure Gradle plugin signing and publishing, add Apache 2.0 LICENSE
-
-## 0.97.5
-
-- **Install Gemini CLI hooks** — the Enable button now writes the AfterAgent hook to `.gemini/settings.json`, matching the VS Code extension
-- **Auto-refresh panels after commit** — COMMITS and CHANGES panels now subscribe to `GIT_REPO_CHANGE` events directly, so they update automatically after IntelliJ UI commits
-- **Fix stale "disabled" state after enable** — prevent a slow initial background refresh from overwriting the correct UI state
-- **Fix VFS listener bus scope** — CHANGES panel now subscribes to `VFS_CHANGES` on the application-level message bus
-- **Fix TypesJVMKt binary incompatibility** — exclude `TypesJVMKt` from hooks fat JAR in addition to `TypeVariableImpl` to resolve Plugin Verifier `NoSuchClassError` on IntelliJ 2026.1+
-- **Fix tool window icon** — correct SVG icon rendering in the sidebar
-- **Refactor panel layout** — panels now use JPanel rows for better alignment and consistency
-- **Harden hook installation** — fix CLI file permissions and scope the package name
-- **Update export path** — SummaryExporter now writes to `~/Documents/jollimemory/`
-
-## 0.97.4
-
-- **Fix TypeVariable binary incompatibility** — exclude `kotlin/reflect/**` from hooks fat JAR to resolve IntelliJ 2026.1+ (build 261) compatibility; `TypeVariableImpl` was missing `getAnnotatedBounds()`, causing Plugin Verifier to flag an `AbstractMethodError`
-- **kotlin-stdlib as compileOnly** — the plugin no longer bundles kotlin-stdlib (IntelliJ provides it at runtime); only the hooks JAR bundles its own copy via a separate `hooksRuntime` Gradle configuration
-
-## 0.97.3
-
-- Bump plugin version for distribution
-
-## 0.97.2
-
-- **Fix UTF-8 bridge corruption** — resolve encoding issues in git command output parsing that could corrupt non-ASCII characters in commit messages and file paths
-- **Improved UI layout** — collapsible panels with AccordionLayout, ResizeDivider for manual panel resizing, and inline action toolbars per panel
-- **Panel management** — configurable panel visibility via gear menu, PanelRegistry for state persistence
-
-## 0.97.1
-
-- **Improved panel management** — refined collapsible panel headers, expand/collapse animations, and panel toolbar layout
+- **Privacy consent notice** — display a privacy notice with link to privacy policy at the top of the Settings page, satisfying JetBrains Marketplace guideline 2.2 for explicit user consent before data processing
 
 ## 0.97.0
 
@@ -88,7 +45,6 @@
 - **Plans & Notes** — auto-detect Claude Code plans, add custom notes (Markdown files or text snippets)
 - **Hook installation** — pure Kotlin file I/O, no Node.js; installs git hooks and Claude Code stop hook
 - **Standalone hooks JAR** — git hooks run as `jollimemory-hooks.jar` fat JAR outside the IDE
-- **Multi-agent support** — session tracking for Claude Code (StopHook), Gemini CLI (AfterAgent hook), and Codex CLI (filesystem discovery)
 - **Orphan branch storage** — summaries stored in `jollimemory/summaries/v3` with tree-hash aliases
 - **Push to Jolli Space** — publish summaries to team knowledge base via API
 - **Create & Update PR** — GitHub PR management via `gh` CLI with summary markers

@@ -414,12 +414,22 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
         val binDir = File("$home/.jolli/bin")
         val installed = File(binDir, "jollimemory-hooks.jar")
 
-        // 1. Find in plugin's lib directory and always copy to ~/.jolli/bin/ (keeps it up to date)
+        // 1. Find in plugin's bin/ directory and always copy to ~/.jolli/bin/ (keeps it up to date)
         val pluginJar = findPluginLibJar()
         if (pluginJar != null) {
             try {
                 binDir.mkdirs()
                 pluginJar.copyTo(installed, overwrite = true)
+                // Copy sqlite-jdbc.jar — the hooks JAR's MANIFEST Class-Path references it.
+                // In the plugin directory layout it lives in lib/ (sibling of bin/).
+                val libDir = pluginJar.parentFile?.parentFile?.let { File(it, "lib") }
+                val sqliteJar = libDir?.listFiles()?.firstOrNull {
+                    it.name.startsWith("sqlite-jdbc") && it.name.endsWith(".jar")
+                }
+                if (sqliteJar != null) {
+                    sqliteJar.copyTo(File(binDir, "sqlite-jdbc.jar"), overwrite = true)
+                    log.info("Copied sqlite-jdbc.jar to: %s", binDir.absolutePath)
+                }
                 log.info("Copied hooks JAR from plugin lib to: %s", installed.absolutePath)
                 return installed.absolutePath
             } catch (e: Exception) {
@@ -459,7 +469,7 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             val pluginId = com.intellij.openapi.extensions.PluginId.getId("ai.jolli.jollimemory")
             searchLog.appendLine("pluginId=$pluginId")
 
-            val plugin = com.intellij.ide.plugins.PluginManagerCore.getPlugin(pluginId)
+            val plugin = com.intellij.ide.plugins.PluginManager.getInstance().findEnabledPlugin(pluginId)
             searchLog.appendLine("plugin=${plugin?.name} version=${plugin?.version}")
 
             val pluginPath = plugin?.pluginPath
