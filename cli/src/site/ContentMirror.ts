@@ -293,7 +293,7 @@ export function stripIncompatibleContent(content: string, rules?: ContentRules):
 					.pop()
 					?.trim(),
 			)
-			.filter(Boolean);
+			.filter((n): n is string => Boolean(n));
 		if (isSafeSpecifier(specifier, safePrefixes)) {
 			for (const name of names) safeComponents.add(name);
 		} else {

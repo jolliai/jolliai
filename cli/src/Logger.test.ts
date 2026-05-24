@@ -245,5 +245,27 @@ describe("Logger", () => {
 			expect(fsMocks.stat).toHaveBeenCalledOnce();
 			expect(fsMocks.appendFile).not.toHaveBeenCalled();
 		});
+
+		it("should short-circuit the write queue when JOLLI_DISABLE_LOG_FILE is set, even outside vitest", async () => {
+			// JOLLI_DISABLE_LOG_FILE is the stable contract for non-Vitest
+			// contexts that still need to skip file I/O (e.g. the bundle
+			// regression test in Api.bundle.test.ts, which imports the built
+			// CLI in a clean Node subprocess and must not leave a stray
+			// debug.log behind). Setting it must short-circuit BEFORE any fs
+			// call — neither stat nor appendFile should run.
+			const envSpy = vi.spyOn(process, "env", "get");
+			fsMocks.stat.mockResolvedValue({});
+			fsMocks.appendFile.mockResolvedValue(undefined);
+			envSpy.mockReturnValue({ ...process.env, VITEST: "", JOLLI_DISABLE_LOG_FILE: "1" });
+			setLogDir("/tmp/project");
+
+			const logger = createLogger("TestMod");
+			logger.error("should not be written");
+
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(fsMocks.stat).not.toHaveBeenCalled();
+			expect(fsMocks.appendFile).not.toHaveBeenCalled();
+		});
 	});
 });

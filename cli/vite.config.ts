@@ -14,6 +14,7 @@ export default defineConfig({
 		lib: {
 			entry: {
 				Cli: resolve(__dirname, "src/Cli.ts"),
+				Api: resolve(__dirname, "src/Api.ts"),
 				PostInstall: resolve(__dirname, "src/PostInstall.ts"),
 				StopHook: resolve(__dirname, "src/hooks/StopHook.ts"),
 				PostCommitHook: resolve(__dirname, "src/hooks/PostCommitHook.ts"),
@@ -25,7 +26,7 @@ export default defineConfig({
 			formats: ["es"],
 		},
 		rollupOptions: {
-			external: ["@anthropic-ai/sdk", "@mdx-js/mdx", "chokidar", "commander", "open", "yaml", /^node:.*/],
+			external: ["@anthropic-ai/sdk", "@mdx-js/mdx", "chokidar", "commander", "open", "semver", "yaml", /^node:.*/],
 			output: {
 				chunkFileNames: "[name].js",
 			},

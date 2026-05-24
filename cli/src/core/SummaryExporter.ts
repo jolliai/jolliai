@@ -51,6 +51,11 @@ function resolveProjectName(cwd?: string): string {
 		const repoRoot = execFileSyncHidden("git", ["rev-parse", "--show-toplevel"], {
 			encoding: "utf-8",
 			cwd,
+			// Same rationale as CliUtils.resolveProjectDir — `cwd` may not
+			// be inside a git repo, in which case git prints a fatal line
+			// to its (otherwise inherited) stderr before we can ignore the
+			// non-zero exit. Capture and discard.
+			stdio: ["ignore", "pipe", "pipe"],
 		}).trim();
 		return basename(repoRoot);
 	} catch {
