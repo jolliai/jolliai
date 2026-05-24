@@ -10,7 +10,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, normalize } from "node:path";
+import { join, normalize, sep } from "node:path";
 import { gunzipSync } from "node:zlib";
 import type { Command } from "commander";
 import { scaffoldProject } from "../site/StarterKit.js";
@@ -109,6 +109,12 @@ async function fetchRegistry(): Promise<RegistryData> {
 // tar format: each entry = 512-byte header + ceil(size/512)*512 bytes of data.
 // Header fields are NUL-terminated octal ASCII strings at fixed offsets.
 // We only need: name (0, 100), size (124, 12), typeflag (156, 1), prefix (345, 155).
+//
+// Limitations (intentional for a theme installer):
+//   - UStar prefix(155) + name(100) covers paths up to 255 bytes.
+//   - PAX ('x','g') and GNU LongName ('L','K') extended headers are not supported;
+//     entries with paths > 255 bytes will cause an error.
+//   - Hardlinks ('1') and symlinks ('2') are rejected for safety.
 
 interface TarEntry {
 	path: string;
@@ -132,20 +138,24 @@ function parseString(buf: Buffer, offset: number, length: number): string {
 
 /**
  * Extracts all entries from a .tar.gz buffer using only `node:zlib`.
- * Returns entries whose path starts with `prefix/` (if given), with
- * the prefix stripped so callers get repo-relative paths.
+ * Decompresses once and returns all file/directory entries.
  */
-function extractTarGz(gzBuf: Buffer, filterPrefix?: string): TarEntry[] {
-	// Decompress gzip → raw tar bytes
+export function extractTarGz(gzBuf: Buffer): TarEntry[] {
 	const tar = gunzipSync(gzBuf);
 
 	const entries: TarEntry[] = [];
 	let offset = 0;
 
-	while (offset + 512 <= tar.length) {
+	while (offset + 1024 <= tar.length) {
 		const header = tar.subarray(offset, offset + 512);
-		// Two consecutive zero blocks = end of archive
-		if (header.every((b) => b === 0)) break;
+		// Two consecutive 512-byte zero blocks = end of archive (POSIX)
+		const nextBlock = tar.subarray(offset + 512, offset + 1024);
+		if (header.every((b) => b === 0) && nextBlock.every((b) => b === 0)) break;
+		// Single zero block mid-archive: skip it
+		if (header.every((b) => b === 0)) {
+			offset += 512;
+			continue;
+		}
 
 		const prefix = parseString(header, 345, 155);
 		const rawName = parseString(header, 0, 100);
@@ -155,23 +165,28 @@ function extractTarGz(gzBuf: Buffer, filterPrefix?: string): TarEntry[] {
 
 		offset += 512; // move past header
 
-		// typeflag: 0 or ASCII '0' = file, '5' = directory, others skipped
 		const isFile = typeflag === 0 || typeflag === 0x30; // 0x30 = '0'
 		const isDir = typeflag === 0x35; // '5'
 
-		if ((isFile || isDir) && fullPath.length > 0) {
+		// Reject unsupported entry types that carry semantic meaning.
+		// PAX/GNU long-name headers would silently lose the real filename;
+		// symlinks/hardlinks could escape the destination directory.
+		if (!isFile && !isDir) {
+			const flag = String.fromCharCode(typeflag);
+			if ("LKxg12".includes(flag)) {
+				throw new Error(
+					`Unsupported tar entry type '${flag}' for "${fullPath}". ` +
+						"This tar parser only supports regular files and directories.",
+				);
+			}
+			// Skip other benign typeflags (e.g. vendor extensions)
+			offset += Math.ceil(size / 512) * 512;
+			continue;
+		}
+
+		if (fullPath.length > 0) {
 			const data = isFile ? Buffer.from(tar.subarray(offset, offset + size)) : Buffer.alloc(0);
-			let entryPath = fullPath;
-			if (filterPrefix) {
-				if (!entryPath.startsWith(filterPrefix)) {
-					offset += Math.ceil(size / 512) * 512;
-					continue;
-				}
-				entryPath = entryPath.slice(filterPrefix.length);
-			}
-			if (entryPath.length > 0) {
-				entries.push({ path: entryPath, type: isFile ? "file" : "dir", data });
-			}
+			entries.push({ path: fullPath, type: isFile ? "file" : "dir", data });
 		}
 
 		// Advance past data blocks (rounded up to 512-byte boundary)
@@ -210,14 +225,17 @@ export async function downloadTheme(name: string, version?: string): Promise<str
 
 	const gzBuf = Buffer.from(await res.arrayBuffer());
 
-	// codeload tarballs have a single root dir like `themes-main/`. Detect it
-	// by reading the first entry, then filter for `<root>/<name>/`.
+	// Single-pass: decompress once, detect root dir, filter for `<root>/<name>/`.
 	const allEntries = extractTarGz(gzBuf);
 	if (allEntries.length === 0) throw new Error("Empty tarball");
 	const rootDir = allEntries[0].path.split("/")[0];
 	const prefix = `${rootDir}/${name}/`;
 
-	const themeEntries = extractTarGz(gzBuf, prefix);
+	const themeEntries = allEntries.flatMap((e) => {
+		if (!e.path.startsWith(prefix)) return [];
+		const relPath = e.path.slice(prefix.length);
+		return relPath.length === 0 ? [] : [{ ...e, path: relPath }];
+	});
 	if (themeEntries.length === 0) {
 		throw new Error(`Theme "${name}" not found in ${THEMES_REPO}`);
 	}
@@ -225,10 +243,13 @@ export async function downloadTheme(name: string, version?: string): Promise<str
 	// Replace the destination so stale files don't linger.
 	await rm(destDir, { recursive: true, force: true });
 
+	// Ensure destDir uses a trailing separator for the path-traversal check
+	// so that a sibling directory sharing the same prefix (e.g. "foobar" vs "foo")
+	// is correctly rejected.
+	const destDirWithSep = destDir.endsWith(sep) ? destDir : destDir + sep;
 	for (const entry of themeEntries) {
-		// Guard against path traversal (e.g. `../../etc/passwd`)
 		const dest = normalize(join(destDir, entry.path));
-		if (!dest.startsWith(destDir)) continue;
+		if (dest !== destDir && !dest.startsWith(destDirWithSep)) continue;
 
 		if (entry.type === "dir") {
 			await mkdir(dest, { recursive: true });
