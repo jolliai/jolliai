@@ -257,7 +257,7 @@ export default function ScopedNextraLayout({ pageMap, children, ...layoutProps }
  *
  * Uses Nextra's own data — no need to hardcode tab lists.
  */
-async function writeSidebarTabsComponent(buildDir: string): Promise<void> {
+export async function writeSidebarTabsComponent(buildDir: string): Promise<void> {
 	await mkdir(join(buildDir, "components"), { recursive: true });
 	const content = `// @ts-nocheck
 "use client";
@@ -277,8 +277,14 @@ export default function SidebarTabs({ className }) {
     pathname === item.route || pathname === item.route + "/" || pathname.startsWith(item.route + "/")
   );
 
-  // If no tab matches the current URL, redirect to the first tab
-  if (!anyActive && routeItems.length > 0 && typeof window !== "undefined") {
+  // If no tab matches the current URL, redirect to the first tab — except on
+  // "/": StartCommand only skips writeRootRedirectIndex when the user has
+  // authored a real root index, so reaching this branch on "/" means the page
+  // content is real and must NOT be replaced by a client-side jump. (When
+  // there is no root index, "/" is a redirect stub whose inline <script>
+  // navigates away before SidebarTabs ever hydrates, so this branch never
+  // runs on "/" in that case.)
+  if (!anyActive && pathname !== "/" && routeItems.length > 0 && typeof window !== "undefined") {
     window.location.href = routeItems[0].route;
     return null;
   }

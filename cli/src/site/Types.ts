@@ -120,8 +120,12 @@ export type PathMappings = Record<string, string>;
  *   - `"default"` — vanilla `nextra-theme-docs` (no pack CSS)
  *   - `"./my-theme.js"` — local file path (resolved relative to source root)
  *
- * The `(string & {})` intersection keeps TypeScript's autocomplete for
- * well-known names while accepting any arbitrary string.
+ * npm package references (e.g. `"@acme/docs-theme"` or `"acme/docs-theme"`)
+ * were once supported but were removed in commit d55ec46. They are now
+ * rejected at discovery time with a migration error pointing at the three
+ * forms above. The `(string & {})` intersection still accepts arbitrary
+ * strings for TypeScript's autocomplete on well-known names; runtime
+ * resolution is what enforces the supported forms.
  */
 export type ThemePack = "default" | "forge" | "atlas" | (string & {});
 

@@ -12,6 +12,12 @@
  *   3. Explicit file path in site.json (starts with `./` or `/`)
  *   4. User theme directory → ~/.jolli/themes/<name>/index.mjs
  *   5. GitHub registry → github.com/jolliai/themes/<name>/
+ *
+ * npm package references (e.g. `@acme/docs-theme`) were once a supported
+ * resolution mode but were removed in commit d55ec46. They are now
+ * intercepted between step 4 and step 5 with a migration error instead of
+ * being passed to the GitHub registry, which only handles single-segment
+ * names.
  */
 
 import { existsSync, statSync } from "node:fs";
@@ -115,12 +121,24 @@ export function resolvePack(config: NextraProjectConfig): ThemePackProvider | un
 const USER_THEMES_DIR = join(homedir(), ".jolli", "themes");
 
 /**
+ * Stable phrase that the npm-package guard emits in its `console.error`.
+ * Exported so tests can assert on it without hard-coding the surrounding
+ * sentence — change the wording around it freely, but keep this tag intact
+ * (or update its tests when intentionally changing the contract).
+ */
+export const NPM_PACKAGE_GUARD_TAG = "looks like an npm package reference";
+
+/**
  * Discovers and loads a theme pack by name, searching in order:
  *   1. `--theme` CLI path (passed as `themePath`) — always wins
  *   2. Registry (packs registered at runtime)
  *   3. Explicit file path in site.json (starts with `./` or `/`)
  *   4. User theme directory (`~/.jolli/themes/<name>/index.mjs`)
  *   5. GitHub registry (`github.com/jolliai/themes/<name>/`)
+ *
+ * Between step 4 and step 5, names that look like npm package references
+ * (start with `@` or contain `/`) short-circuit with a migration error
+ * instead of being handed to the GitHub registry.
  *
  * Returns the provider (now also registered) or `undefined` if not found.
  */
@@ -153,6 +171,32 @@ export async function discoverPack(
 		return loadFromPath(userThemePath);
 	}
 
+	// Guard: npm package references (e.g. `@acme/docs-theme` or
+	// `acme/docs-theme`) used to be a supported resolution mode but were
+	// removed in commit d55ec46. `ThemePack` is still `(string & {})` so
+	// existing site.json values type-check; without this guard they would
+	// fall through to the GitHub registry, which expects single-segment
+	// names like "forge" and would fail with an opaque
+	// "could not load theme" message. Surface the migration path
+	// explicitly and bail before the network call.
+	//
+	// IMPORTANT: this guard MUST stay above the GitHub registry call below.
+	// Moving it down (e.g. when refactoring `downloadTheme` to a static
+	// import) would let npm-style names hit the network and produce the
+	// opaque error this guard was added to prevent.
+	if (looksLikeNpmPackage(name)) {
+		console.error(
+			`  Error: theme.pack "${name}" ${NPM_PACKAGE_GUARD_TAG}, but npm package theme packs ` +
+				`are no longer supported.\n` +
+				`         Migrate to one of:\n` +
+				`           • A theme name published to github.com/jolliai/themes (e.g. "forge", "atlas")\n` +
+				`           • A local file or folder path (starts with "./" or "/")\n` +
+				`           • The built-in "default" theme (vanilla nextra-theme-docs)\n` +
+				`         Falling back to the default Nextra layout.`,
+		);
+		return undefined;
+	}
+
 	// 5) GitHub registry: github.com/jolliai/themes/<name>/
 	//
 	// On any failure here (network unreachable, theme not in repo, …) the
@@ -176,6 +220,26 @@ export async function discoverPack(
 	}
 
 	return undefined;
+}
+
+/**
+ * Returns `true` when `name` looks like an npm package reference rather than
+ * a GitHub theme registry name. By the time `discoverPack` calls this, the
+ * `./` and `/` path forms have already been resolved by step 3, so any
+ * remaining string containing `/` or starting with `@` is a strong signal
+ * of an npm-style reference (scoped or unscoped).
+ *
+ * Path forms in `site.json` are expected to use forward slashes. Windows-
+ * style absolute paths like `C:\\Users\\foo\\theme` are not detected by
+ * step 3 (which checks `./` / `/` prefixes) and will also slip past this
+ * guard (no `/`, no leading `@`), falling through to the GitHub registry.
+ * Users on Windows should write `C:/Users/foo/theme` or use a `./` relative
+ * path instead.
+ *
+ * Exported for unit testing — call site is in `discoverPack`.
+ */
+export function looksLikeNpmPackage(name: string): boolean {
+	return name.startsWith("@") || name.includes("/");
 }
 
 // ─── Cache version check ────────────────────────────────────────────────

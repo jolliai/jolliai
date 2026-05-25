@@ -1,10 +1,19 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NextraProjectConfig } from "../NextraProjectWriter.js";
 import type { ThemePackProvider } from "./ThemeRegistry.js";
-import { discoverPack, getPack, listPacks, readManifestVersion, registerPack, resolvePack } from "./ThemeRegistry.js";
+import {
+	discoverPack,
+	getPack,
+	listPacks,
+	looksLikeNpmPackage,
+	NPM_PACKAGE_GUARD_TAG,
+	readManifestVersion,
+	registerPack,
+	resolvePack,
+} from "./ThemeRegistry.js";
 
 const MINIMAL_CONFIG: NextraProjectConfig = {
 	title: "Test",
@@ -134,6 +143,93 @@ export default theme;
 			{ themePath: testThemeDir },
 		);
 		expect(pack?.manifest.name).toBe("discover-test");
+	});
+});
+
+// ─── npm-package-reference guard tests ─────────────────────────────────────
+//
+// Why this guard exists: npm package theme resolution was removed in commit
+// d55ec46, but the `ThemePack` type still accepts arbitrary strings via
+// `(string & {})`. Without an explicit guard, a site.json carrying a
+// historical value like `theme.pack: "@acme/docs-theme"` would fall through
+// to the GitHub registry and fail with an opaque "could not load theme"
+// network error. The guard short-circuits with a migration-pointing error
+// before the network call so users see an actionable message.
+
+describe("looksLikeNpmPackage", () => {
+	it("identifies scoped npm package names (start with @)", () => {
+		expect(looksLikeNpmPackage("@acme/docs-theme")).toBe(true);
+		expect(looksLikeNpmPackage("@scope/pkg")).toBe(true);
+	});
+
+	it("identifies unscoped slash-separated names (likely npm or repo refs)", () => {
+		expect(looksLikeNpmPackage("acme/docs-theme")).toBe(true);
+		expect(looksLikeNpmPackage("foo/bar/baz")).toBe(true);
+	});
+
+	it("does not flag single-segment names (GitHub registry style)", () => {
+		expect(looksLikeNpmPackage("forge")).toBe(false);
+		expect(looksLikeNpmPackage("atlas")).toBe(false);
+		expect(looksLikeNpmPackage("default")).toBe(false);
+		expect(looksLikeNpmPackage("jolli-theme-something")).toBe(false);
+	});
+});
+
+describe("discoverPack — npm package reference migration error", () => {
+	let errorSpy: ReturnType<typeof vi.spyOn>;
+
+	beforeEach(() => {
+		errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+	});
+
+	afterEach(() => {
+		errorSpy.mockRestore();
+	});
+
+	it("returns undefined and logs a migration error for scoped npm package names", async () => {
+		const pack = await discoverPack({
+			...MINIMAL_CONFIG,
+			theme: { pack: "@acme/docs-theme" as string },
+		});
+
+		expect(pack).toBeUndefined();
+		expect(errorSpy).toHaveBeenCalledTimes(1);
+		const msg = errorSpy.mock.calls[0]?.[0] as string;
+		// Migration messaging the user can act on. The guard tag is the
+		// stable contract; surrounding wording can change freely.
+		expect(msg).toContain("@acme/docs-theme");
+		expect(msg).toContain(NPM_PACKAGE_GUARD_TAG);
+		expect(msg).toContain("no longer supported");
+		expect(msg).toContain("github.com/jolliai/themes");
+	});
+
+	it("returns undefined and logs a migration error for unscoped slash-separated names", async () => {
+		const pack = await discoverPack({
+			...MINIMAL_CONFIG,
+			theme: { pack: "acme/docs-theme" as string },
+		});
+
+		expect(pack).toBeUndefined();
+		expect(errorSpy).toHaveBeenCalledTimes(1);
+		const msg = errorSpy.mock.calls[0]?.[0] as string;
+		expect(msg).toContain("acme/docs-theme");
+		expect(msg).toContain(NPM_PACKAGE_GUARD_TAG);
+	});
+
+	it("does NOT short-circuit single-segment names (those still go to the GitHub registry)", async () => {
+		// We can't assert what GitHub returns from a unit test, but we *can*
+		// assert that the npm-package guard did not fire — its `console.error`
+		// carries `NPM_PACKAGE_GUARD_TAG` as a stable marker, which the
+		// GitHub-fallback error ("Could not load theme …") does not share.
+		await discoverPack({
+			...MINIMAL_CONFIG,
+			theme: { pack: "does-not-exist-anywhere-12345" as string },
+		});
+
+		const npmGuardCall = errorSpy.mock.calls.find((call: unknown[]) =>
+			typeof call[0] === "string" ? (call[0] as string).includes(NPM_PACKAGE_GUARD_TAG) : false,
+		);
+		expect(npmGuardCall).toBeUndefined();
 	});
 });
 
