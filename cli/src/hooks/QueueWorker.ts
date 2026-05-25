@@ -90,6 +90,8 @@ import {
 	storeSummary,
 	stripFunctionalMetadata,
 } from "../core/SummaryStore.js";
+import { getTranscriptIds } from "../core/SummaryTree.js";
+import { generateTranscriptId } from "../core/TranscriptId.js";
 import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
@@ -117,6 +119,7 @@ import type {
 	TranscriptReadResult,
 	TranscriptSource,
 } from "../Types.js";
+import { CURRENT_SCHEMA_VERSION } from "../Types.js";
 import { spawnHidden } from "../util/Subprocess.js";
 
 const log = createLogger("QueueWorker");
@@ -1227,12 +1230,23 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		log.info("Plan progress: evaluated %d/%d plan(s)", planProgressArtifacts.length, planRefs.length);
 	}
 
+	// Step 8c (early): Build the StoredTranscript so we can allocate a v5
+	// transcript ID for it and stamp it onto the summary in one go. Overlays
+	// are already applied inside loadSessionTranscripts so the summary input,
+	// the empty-transcript guard, and the stored snapshot all see the same view.
+	const storedTranscript = buildStoredTranscript(sessionTranscripts);
+	const hasTranscriptContent = storedTranscript.sessions.length > 0;
+	const transcriptId = hasTranscriptContent ? generateTranscriptId() : undefined;
+
 	// Build the CommitSummary leaf node with top-level fields from the API result.
 	// For a leaf, diffStats === stats (both are `git diff {hash}^..{hash}`).
-	// Schema v4: unified Hoist -- topics + recap are part of the Hoist family
-	// so root is always authoritative. Leaves are the source-of-truth for v4
-	// children; later squash/amend operations strip the Hoist fields off this
-	// node when it becomes a child of a v4 root.
+	// Schema v5: unified Hoist + stable transcript IDs. Topics + recap are
+	// part of the Hoist family so root is always authoritative. Leaves are
+	// the source-of-truth for v5 children; later squash/amend operations strip
+	// the Hoist fields off this node when it becomes a child of a v5 root.
+	// `transcripts: [transcriptId]` (when set below) is the v5 stable-ID
+	// reference into `transcripts/{transcriptId}.json` on the orphan branch.
+	//
 	// LLM failure marker: if generateSummary fell through to the retry-fail
 	// catch block above, `summaryResult.llm.stopReason === "error"` is the
 	// trip-wire — surface it explicitly on the root via summaryError so
@@ -1241,7 +1255,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	const llmFailed = summaryResult.llm?.stopReason === "error";
 
 	const summary: CommitSummary = {
-		version: 4,
+		version: CURRENT_SCHEMA_VERSION,
 		commitHash: commitInfo.hash,
 		commitMessage: commitInfo.message,
 		commitAuthor: commitInfo.author,
@@ -1256,6 +1270,12 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
 		...(noteRefs.length > 0 ? { notes: noteRefs } : {}),
 		...(linearIssueRefs.length > 0 ? { linearIssues: linearIssueRefs } : {}),
+		// v5 contract: `transcripts` is always present on a v5 root (empty array
+		// when no AI sessions were captured). Omitting the field would route the
+		// `getTranscriptIds` fast-path back through `collectAllTranscriptHashes`,
+		// which both costs an extra git read and confuses the "v5 means field
+		// populated" invariant for future maintainers.
+		transcripts: transcriptId !== undefined ? [transcriptId] : [],
 	};
 
 	/* v8 ignore start -- log formatting ternaries (recap/topics/plans/notes presence) — each is a display variant, not a logical branch. */
@@ -1272,16 +1292,15 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	);
 	/* v8 ignore stop */
 
-	// Step 8c: Build the StoredTranscript. Overlays are already applied
-	// inside loadSessionTranscripts so the summary input, the empty-
-	// transcript guard, and the stored snapshot all see the same view.
-	const storedTranscript = buildStoredTranscript(sessionTranscripts);
-
 	// Step 8d: Store summary (+ transcript + plan progress) in orphan branch
 	// Pass `force` so manual re-summarize can overwrite a previously failed entry.
+	// `storedTranscript` and `transcriptId` were built earlier so the ID could be
+	// stamped onto `summary.transcripts`.
 	stepStart = now();
 	await storeSummary(summary, cwd, force, {
-		transcript: storedTranscript,
+		...(transcriptId !== undefined && hasTranscriptContent
+			? { transcript: { id: transcriptId, data: storedTranscript } }
+			: {}),
 		...(planProgressArtifacts.length > 0 ? { planProgress: planProgressArtifacts } : {}),
 	});
 	log.info(
@@ -1600,6 +1619,11 @@ function isTrivialAmendDelta(deltaStats: DiffStats): boolean {
  * `llm` is only set when the topics/recap actually came from this call (i.e.
  * the consolidate step ran). Both short-circuit paths leave it undefined so
  * the field's "produced this node's data" semantics stay accurate.
+ *
+ * `transcripts` is the v5 transcript-ID array for the new amend root. Each
+ * call site computes it as `[...getTranscriptIds(oldSummary), ...maybeDelta]`
+ * — inherited IDs plus the newly written delta's ID if amend captured new
+ * sessions. Short-circuit paths that don't write a delta pass only inherited.
  */
 interface AmendHoistedFields {
 	readonly topics: ReadonlyArray<TopicSummary>;
@@ -1612,6 +1636,7 @@ interface AmendHoistedFields {
 	 * with marker). Surfaces the webview banner on the new amend root.
 	 */
 	readonly summaryError?: import("../Types.js").SummaryErrorKind;
+	readonly transcripts: ReadonlyArray<string>;
 }
 
 /**
@@ -1638,7 +1663,7 @@ function buildHoistedAmendRoot(
 	stats?: { readonly transcriptEntries?: number; readonly conversationTurns?: number },
 ): CommitSummary {
 	return {
-		version: 4,
+		version: CURRENT_SCHEMA_VERSION,
 		commitHash: newInfo.hash,
 		commitMessage: newInfo.message,
 		commitAuthor: newInfo.author,
@@ -1661,6 +1686,8 @@ function buildHoistedAmendRoot(
 		topics: hoisted.topics,
 		/* v8 ignore next */
 		...(hoisted.recap && { recap: hoisted.recap }),
+		// v5 contract: always present, even if empty (see executePipeline note).
+		transcripts: hoisted.transcripts,
 		diffStats: fullDiffStats,
 		children: [stripFunctionalMetadata(oldSummary)],
 	};
@@ -1686,7 +1713,13 @@ async function applyAmendShortCircuit(
 	commitInfo: CommitInfo,
 	metadata: { readonly commitType?: CommitType; readonly commitSource?: CommitSource } | undefined,
 	amendFullDiffStats: DiffStats,
-	sessionTranscripts: ReadonlyArray<SessionTranscript>,
+	// v5: the caller hoists transcript-artifact construction so the same delta
+	// ID can be stamped on both the stored artifact and the new root's
+	// `transcripts` field. `amendTranscripts` already contains the inherited
+	// IDs plus the new delta's ID when one exists — see the call sites where
+	// they're computed once and shared across the short-circuit + full path.
+	transcriptArtifact: { readonly id: string; readonly data: StoredTranscript } | undefined,
+	amendTranscripts: ReadonlyArray<string>,
 	totalEntries: number,
 	humanEntries: number,
 	cwd: string,
@@ -1695,9 +1728,6 @@ async function applyAmendShortCircuit(
 	label: string,
 	markError: boolean,
 ): Promise<void> {
-	const storedTranscript = buildStoredTranscript(sessionTranscripts);
-	const transcriptArtifact = storedTranscript.sessions.length > 0 ? storedTranscript : undefined;
-
 	const root = buildHoistedAmendRoot(
 		oldSummary,
 		commitInfo,
@@ -1707,7 +1737,9 @@ async function applyAmendShortCircuit(
 			...(oldSummary.recap !== undefined && { recap: oldSummary.recap }),
 			...(oldSummary.ticketId !== undefined && { ticketId: oldSummary.ticketId }),
 			/* v8 ignore stop */
+			// llm: undefined -- topics/recap came from old, not from delta
 			...(markError && { summaryError: LLM_FAILED }),
+			transcripts: amendTranscripts,
 		},
 		metadata ?? {},
 		amendFullDiffStats,
@@ -1810,6 +1842,22 @@ async function handleAmendPipeline(
 			)
 		: deltaDiffStats;
 
+	// Persist the conversation regardless of which path we take from here.
+	// Overlays are applied inside loadSessionTranscripts so this just packages
+	// them for storage. Allocate a v5 transcript ID for the delta upfront so
+	// every short-circuit can stamp it onto `summary.transcripts` consistently.
+	const amendStoredTranscript = buildStoredTranscript(sessionTranscripts);
+	const amendDeltaTranscriptId = amendStoredTranscript.sessions.length > 0 ? generateTranscriptId() : undefined;
+	const transcriptArtifact =
+		amendDeltaTranscriptId !== undefined ? { id: amendDeltaTranscriptId, data: amendStoredTranscript } : undefined;
+	// IDs that survive into the new amend root: inherited from old + new delta
+	// when one exists. `getTranscriptIds(oldSummary)` returns [] when oldSummary
+	// is undefined (we always check above before reading), so this is just the
+	// delta when there's no prior summary (fresh-leaf branch below).
+	const inheritedAmendIds = oldSummary ? getTranscriptIds(oldSummary) : [];
+	const amendTranscripts: ReadonlyArray<string> =
+		amendDeltaTranscriptId !== undefined ? [...inheritedAmendIds, amendDeltaTranscriptId] : inheritedAmendIds;
+
 	// ── Pre-LLM short-circuit: delta ≤ TRIVIAL_AMEND_DELTA_LINES (0 LLM) ──────
 	// When diff fetch failed, the fallback `deltaDiffStats = {0, 0, 0}` would
 	// otherwise spuriously trigger the short-circuit and silently drop the
@@ -1828,7 +1876,8 @@ async function handleAmendPipeline(
 			commitInfo,
 			metadata,
 			amendFullDiffStats,
-			sessionTranscripts,
+			transcriptArtifact,
+			amendTranscripts,
 			totalEntries,
 			humanEntries,
 			cwd,
@@ -1934,12 +1983,6 @@ async function handleAmendPipeline(
 	}
 	log.info("Amend step 1 (delta summary) generated (%s)", formatElapsed(stepStart));
 
-	// Persist the conversation regardless of which path we take from here.
-	// Overlays are applied inside loadSessionTranscripts so this just packages
-	// them for storage.
-	const amendStoredTranscript = buildStoredTranscript(sessionTranscripts);
-	const transcriptArtifact = amendStoredTranscript.sessions.length > 0 ? amendStoredTranscript : undefined;
-
 	// ── Post-LLM short-circuit: step1 returned empty topics → skip step2 ──────
 	// delta.recap is discarded even if present: a recap without topics is just a
 	// restatement of the diff, and the diff is the source of truth.
@@ -1959,7 +2002,8 @@ async function handleAmendPipeline(
 			commitInfo,
 			metadata,
 			amendFullDiffStats,
-			sessionTranscripts,
+			transcriptArtifact,
+			amendTranscripts,
 			totalEntries,
 			humanEntries,
 			cwd,
@@ -2055,6 +2099,7 @@ async function handleAmendPipeline(
 				// old", not "regenerated". Only a true Regenerate clears the marker.
 				...((consolidateLlmFailed || isSummaryError(oldSummary)) && { summaryError: LLM_FAILED }),
 				/* v8 ignore stop */
+				transcripts: amendTranscripts,
 			},
 			metadata ?? {},
 			amendFullDiffStats,
@@ -2104,7 +2149,7 @@ async function handleAmendPipeline(
 	);
 
 	const freshLeaf: CommitSummary = {
-		version: 4,
+		version: CURRENT_SCHEMA_VERSION,
 		commitHash: commitInfo.hash,
 		commitMessage: commitInfo.message,
 		commitAuthor: commitInfo.author,
@@ -2119,6 +2164,9 @@ async function handleAmendPipeline(
 		...(freshLeafPlanRefs.length > 0 ? { plans: freshLeafPlanRefs } : {}),
 		...(freshLeafNoteRefs.length > 0 ? { notes: freshLeafNoteRefs } : {}),
 		...(freshLeafLinearRefs.length > 0 ? { linearIssues: freshLeafLinearRefs } : {}),
+		// v5 contract: always present, even if empty. Fresh leaf has no
+		// inherited IDs; only the new delta (if any).
+		transcripts: amendDeltaTranscriptId !== undefined ? [amendDeltaTranscriptId] : [],
 	};
 	await storeSummary(
 		freshLeaf,

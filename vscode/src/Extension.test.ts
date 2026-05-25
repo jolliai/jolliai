@@ -584,6 +584,21 @@ vi.mock("../../cli/src/core/SummaryMigration.js", () => ({
 	writeMigrationMeta,
 }));
 
+// Stub the v5 schema migration so activate's auto-trigger is a fast no-op
+// in tests. Real-git operations inside `migrateSchemaToV5` (listFilesInBranch /
+// orphan-write-lock acquisition with 30s timeout) would otherwise block
+// `initializeKB` past the assertion windows below. Tests that need to
+// exercise the migration directly should mock SchemaV5Migration.test.ts.
+vi.mock("../../cli/src/core/SchemaV5Migration.js", () => ({
+	migrateSchemaToV5: vi.fn(async () => ({
+		migrated: 0,
+		skipped: 0,
+		fresh: true,
+		alreadyDone: false,
+	})),
+	readSchemaV5State: vi.fn(async () => null),
+}));
+
 vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 	indexNeedsMigration,
 	migrateIndexToV3,

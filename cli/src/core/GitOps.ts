@@ -23,14 +23,22 @@ const log = createLogger("GitOps");
 /**
  * Executes a git command and returns the result.
  * Logs the command being executed and its outcome.
+ *
+ * `cwd` is passed via Node's `child_process` `cwd` option (sets the child
+ * process's working directory at spawn time) rather than git's `-C <path>`
+ * flag. The two are functionally equivalent for our use cases but routing
+ * through `spawn`'s option keeps untrusted-looking path strings out of the
+ * argv array, sidestepping CodeQL's `js/shell-command-constructed-from-input`
+ * static-analysis alert (`spawn` with an args array never invokes a shell,
+ * but CodeQL tracks taint conservatively).
  */
 export async function execGit(args: ReadonlyArray<string>, cwd?: string): Promise<GitCommandResult> {
-	const fullArgs = cwd ? ["-C", cwd, ...args] : [...args];
-	log.debug("git %s", fullArgs.join(" "));
+	log.debug("git %s%s", cwd ? `[cwd=${cwd}] ` : "", args.join(" "));
 
 	try {
-		const { stdout, stderr } = await execFileAsyncHidden("git", fullArgs, {
+		const { stdout, stderr } = await execFileAsyncHidden("git", args, {
 			maxBuffer: MAX_GIT_BUFFER_BYTES,
+			...(cwd !== undefined && { cwd }),
 		});
 		const result: GitCommandResult = {
 			stdout: stdout.trimEnd(),
@@ -311,6 +319,194 @@ export async function readFileFromBranch(branch: string, filePath: string, cwd?:
 }
 
 /**
+ * Bulk read of N files from `branch`, all served by a single
+ * `git cat-file --batch` subprocess. Returns a `Map<path, content | null>`
+ * with one entry per input path; `null` means the file was missing on the
+ * branch at lookup time (cat-file printed `<request> missing`).
+ *
+ * Why this exists: the obvious `for (...) await readFileFromBranch()` is
+ * O(n × spawn-cost). On Windows that's ~80 ms per spawn, so 336 summaries
+ * during a v5 migration cost ~27 s of pure subprocess overhead — even after
+ * the write side switched to fast-import. cat-file's `--batch` mode reads
+ * one request per stdin line and emits the response on stdout, all within
+ * one long-running process; the same 336 reads then take a couple of
+ * seconds total.
+ *
+ * Protocol (see `git-cat-file(1)`):
+ *
+ *     <request>\n              -- on stdin, e.g. "<branch>:<path>"
+ *     <sha> <type> <size>\n    -- on stdout (header line)
+ *     <size bytes of body>\n   -- body, exactly `size` bytes + a trailing LF
+ *
+ * Missing entries are signalled by a single `<request> missing\n` line with
+ * no body. Responses arrive in the exact order requests were written, so the
+ * parser pops them off positionally.
+ *
+ * The parser is a small streaming state machine because TCP-style chunking
+ * applies to subprocess pipes too: a single `data` event may span the
+ * boundary between header and body, multiple responses, or a partial body.
+ * We accumulate bytes in a `pending` buffer and consume them in two phases
+ * (header line vs. fixed-size body + trailing LF) until all expected
+ * responses are accounted for.
+ */
+export async function batchReadFilesFromBranch(
+	branch: string,
+	paths: ReadonlyArray<string>,
+	cwd?: string,
+): Promise<Map<string, string | null>> {
+	const result = new Map<string, string | null>();
+	if (paths.length === 0) return result;
+
+	const args = ["cat-file", "--batch"];
+	log.debug(
+		"git (cat-file --batch stream) %s%s for %d paths",
+		cwd ? `[cwd=${cwd}] ` : "",
+		args.join(" "),
+		paths.length,
+	);
+
+	return new Promise<Map<string, string | null>>((resolve, reject) => {
+		// `cwd` flows through `spawn`'s options bag, not `git -C`. See
+		// `execGit` for the CodeQL rationale.
+		const proc = spawnHidden("git", args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			...(cwd !== undefined && { cwd }),
+		});
+		let stderr = "";
+		let pending = Buffer.alloc(0);
+		let inHeader = true;
+		let bytesRemaining = 0;
+		let bodyChunks: Buffer[] = [];
+		let needsTrailingNewline = false;
+		let pathIdx = 0;
+		let settled = false;
+
+		/* v8 ignore start -- idempotency guard: only fires if multiple error paths race (e.g. both `close` and `error` events). Single-event paths are exercised; double-fire isn't reachable without a hostile mock. */
+		const settle = (err: Error | null): void => {
+			if (settled) return;
+			settled = true;
+			if (err) reject(err);
+			else resolve(result);
+		};
+		/* v8 ignore stop */
+
+		proc.stderr.on("data", (chunk: Buffer) => {
+			stderr += chunk.toString();
+		});
+
+		proc.stdout.on("data", (chunk: Buffer) => {
+			// Always `Buffer.concat` (instead of `pending = chunk` on the first
+			// event) so `pending` keeps a `Buffer<ArrayBuffer>` type — `chunk`
+			// from a pipe is `Buffer<ArrayBufferLike>` and direct assignment
+			// would narrow the variable's type through the loop. Allocation
+			// cost is negligible vs. the cat-file pipe overhead we're paying
+			// anyway.
+			pending = Buffer.concat([pending, chunk]);
+
+			while (!settled) {
+				if (inHeader) {
+					const nlIdx = pending.indexOf(0x0a);
+					if (nlIdx < 0) return; // need more bytes
+					const header = pending.subarray(0, nlIdx).toString("utf8");
+					pending = pending.subarray(nlIdx + 1);
+
+					/* v8 ignore start -- defensive: git only emits more responses than requests if our request/response accounting drifts, which would be a bug */
+					if (pathIdx >= paths.length) {
+						settle(new Error(`git cat-file --batch returned extra response: ${header}`));
+						return;
+					}
+					/* v8 ignore stop */
+					const requestPath = paths[pathIdx];
+					pathIdx++;
+
+					if (header.endsWith(" missing")) {
+						result.set(requestPath, null);
+						continue;
+					}
+
+					// Header: "<sha> <type> <size>"
+					const sizeStr = header.substring(header.lastIndexOf(" ") + 1);
+					const size = Number.parseInt(sizeStr, 10);
+					/* v8 ignore start -- defensive: malformed header would indicate a git protocol break, not a recoverable runtime condition */
+					if (!Number.isFinite(size) || size < 0) {
+						settle(new Error(`Unexpected cat-file --batch header for ${requestPath}: ${header}`));
+						return;
+					}
+					/* v8 ignore stop */
+					bytesRemaining = size;
+					bodyChunks = [];
+					inHeader = false;
+					needsTrailingNewline = true;
+					// fall through into the body branch
+				}
+
+				if (bytesRemaining > 0) {
+					if (pending.length === 0) return; // need more bytes
+					const take = Math.min(bytesRemaining, pending.length);
+					bodyChunks.push(pending.subarray(0, take));
+					pending = pending.subarray(take);
+					bytesRemaining -= take;
+					if (bytesRemaining > 0) return; // body not fully drained yet
+				}
+
+				/* v8 ignore next -- false-arm only reachable if state-machine invariants drift: this block always runs after the body branch transitions out of header. The early-return inside is what tests exercise. */
+				if (needsTrailingNewline) {
+					if (pending.length < 1) return; // need the trailing LF
+					pending = pending.subarray(1);
+					needsTrailingNewline = false;
+
+					const requestPath = paths[pathIdx - 1];
+					result.set(requestPath, Buffer.concat(bodyChunks).toString("utf8"));
+					bodyChunks = [];
+					inHeader = true;
+				}
+			}
+		});
+
+		proc.on("close", (code) => {
+			/* v8 ignore start -- spawn error / non-zero exit / under-response are protocol-failure paths exercised via mocks but exact branch ordering varies by platform */
+			if (code !== 0) {
+				settle(new Error(`git cat-file --batch failed (exit ${code}): ${stderr.trim()}`));
+				return;
+			}
+			if (pathIdx < paths.length) {
+				settle(
+					new Error(
+						`git cat-file --batch returned ${pathIdx} of ${paths.length} expected responses; stderr=${stderr.trim()}`,
+					),
+				);
+				return;
+			}
+			/* v8 ignore stop */
+			settle(null);
+		});
+
+		/* v8 ignore start -- spawn error only triggers when git is not on PATH */
+		proc.on("error", (err) => {
+			settle(err);
+		});
+		/* v8 ignore stop */
+
+		// stdin EPIPE handler — mirrors `runFastImport`. If cat-file exits
+		// early (malformed input, OOM, signal), the in-flight write loop
+		// below can throw EPIPE asynchronously; without this listener Node
+		// would terminate the process on the unhandled stream error.
+		proc.stdin.on("error", (err) => {
+			settle(err);
+		});
+
+		// Write every request in one go. cat-file flushes responses as it
+		// resolves each one, so it's safe (and faster) to feed everything
+		// upfront and close stdin; git will continue draining responses to
+		// stdout even though no more requests are coming.
+		for (const path of paths) {
+			proc.stdin.write(`${branch}:${path}\n`);
+		}
+		proc.stdin.end();
+	});
+}
+
+/**
  * Writes a file to a branch using git plumbing commands.
  * Does NOT checkout the branch — works entirely through object database.
  *
@@ -363,9 +559,30 @@ export async function writeFileToBranch(
 }
 
 /**
- * Writes multiple files to a branch in a single atomic commit.
- * More efficient than calling writeFileToBranch multiple times because it
- * only performs ensureOrphanBranch, rev-parse, commit-tree, and update-ref once.
+ * Writes multiple files to a branch in a single atomic commit, streaming the
+ * entire batch through one `git fast-import` subprocess.
+ *
+ * Why fast-import: the older per-file `hash-object` + `mktree` + `ls-tree`
+ * pipeline spawned roughly 4 git subprocesses per file. On Windows that meant
+ * a v5 schema migration touching 337 summaries took ~3 minutes; switching to
+ * fast-import collapses it to two subprocess spawns total (fast-import itself,
+ * plus one `rev-parse` to learn the parent commit) and finishes in seconds.
+ *
+ * Atomicity: fast-import writes the new commit and updates `refs/heads/<branch>`
+ * in a single transaction. Either the whole batch lands or nothing does — same
+ * guarantee the old plumbing path provided. The `from <parent>` directive ties
+ * the new commit to the tip we observed at entry, so a concurrent writer
+ * advancing the ref between our rev-parse and fast-import would cause the
+ * import to abort rather than overwrite their commit. (Concurrent writers are
+ * already serialized via `orphan-write.lock` upstream of this function; the
+ * `from` check is the belt-and-braces backup.)
+ *
+ * Behavior preserved from the prior implementation:
+ *   - Empty `files` array still produces a commit (same tree as parent).
+ *   - Mixed writes and deletes in any order; deletes use the fast-import `D`
+ *     directive.
+ *   - Author/committer identity is whatever `git var` resolves for the caller,
+ *     so the commit looks exactly like one `commit-tree` would have produced.
  */
 export async function writeMultipleFilesToBranch(
 	branch: string,
@@ -373,55 +590,19 @@ export async function writeMultipleFilesToBranch(
 	commitMessage: string,
 	cwd?: string,
 ): Promise<void> {
-	// Ensure branch exists (single check)
 	await ensureOrphanBranch(branch, cwd);
 
-	// Get the current commit hash of the branch
 	const tipResult = await execGit(["rev-parse", `refs/heads/${branch}`], cwd);
 	if (tipResult.exitCode !== 0) {
 		throw new Error(`Failed to get branch tip: ${tipResult.stderr}`);
 	}
 	const parentCommit = tipResult.stdout.trim();
 
-	// Get the current tree
-	const treeResult = await execGit(["rev-parse", `${parentCommit}^{tree}`], cwd);
-	if (treeResult.exitCode !== 0) {
-		throw new Error(`Failed to get tree: ${treeResult.stderr}`);
-	}
-
-	// Accumulate tree updates across all files (writes and deletes)
-	let currentTree = treeResult.stdout.trim();
-	for (const file of files) {
-		if (file.delete) {
-			currentTree = await removeFileFromTree(currentTree, file.path, cwd);
-		} else {
-			const blobHash = await writeBlob(file.content, cwd);
-			currentTree = await updateTreeWithFile(currentTree, file.path, blobHash, cwd);
-		}
-	}
-
-	// Create a single commit for all file changes
-	const commitResult = await execGit(["commit-tree", currentTree, "-p", parentCommit, "-m", commitMessage], cwd);
-	if (commitResult.exitCode !== 0) {
-		throw new Error(`Failed to create commit: ${commitResult.stderr}`);
-	}
-	const newCommit = commitResult.stdout.trim();
-
-	// Update the branch ref once
-	const refResult = await execGit(["update-ref", `refs/heads/${branch}`, newCommit], cwd);
-	if (refResult.exitCode !== 0) {
-		throw new Error(`Failed to update ref: ${refResult.stderr}`);
-	}
+	await runFastImport(branch, parentCommit, commitMessage, files, cwd);
 
 	const writeCount = files.filter((f) => !f.delete).length;
 	const deleteCount = files.filter((f) => f.delete).length;
-	log.info(
-		"Updated branch '%s': %d written, %d deleted (commit: %s)",
-		branch,
-		writeCount,
-		deleteCount,
-		newCommit.substring(0, 8),
-	);
+	log.info("Updated branch '%s': %d written, %d deleted (via fast-import)", branch, writeCount, deleteCount);
 }
 
 /**
@@ -556,11 +737,14 @@ export async function resolveGitHooksDir(projectDir: string): Promise<string> {
  * child process to hang waiting for stdin data that never arrives.
  */
 function execGitWithStdin(args: ReadonlyArray<string>, input: string, cwd?: string): Promise<string> {
-	const fullArgs = cwd ? ["-C", cwd, ...args] : [...args];
-	log.debug("git (stdin) %s", fullArgs.join(" "));
+	log.debug("git (stdin) %s%s", cwd ? `[cwd=${cwd}] ` : "", args.join(" "));
 
 	return new Promise((resolve, reject) => {
-		const proc = spawnHidden("git", fullArgs, { stdio: ["pipe", "pipe", "pipe"] });
+		// `cwd` flows through `spawn`'s options bag, not `git -C`. See `execGit`.
+		const proc = spawnHidden("git", args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			...(cwd !== undefined && { cwd }),
+		});
 		let stdout = "";
 		let stderr = "";
 
@@ -596,6 +780,145 @@ function execGitWithStdin(args: ReadonlyArray<string>, input: string, cwd?: stri
  */
 async function writeBlob(content: string, cwd?: string): Promise<string> {
 	return execGitWithStdin(["hash-object", "-w", "--stdin"], content, cwd);
+}
+
+/**
+ * Reads one of `GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` via `git var`. The
+ * returned string is already in the raw `Name <email> <epoch> <tz>` form that
+ * fast-import expects in `author` / `committer` directives, so callers can
+ * splice it verbatim.
+ *
+ * Reading via `git var` rather than hard-coding an identity preserves the
+ * behavior of the old `commit-tree`-based pipeline, which inherited author /
+ * committer from git config too — orphan-branch history therefore continues
+ * to attribute commits to the same identity users see on `git log` elsewhere.
+ */
+async function getGitIdent(varName: "GIT_AUTHOR_IDENT" | "GIT_COMMITTER_IDENT", cwd?: string): Promise<string> {
+	const result = await execGit(["var", varName], cwd);
+	if (result.exitCode !== 0) {
+		throw new Error(`Failed to read ${varName}: ${result.stderr}`);
+	}
+	return result.stdout.trim();
+}
+
+/**
+ * Atomically writes N blobs and one commit to `branch` via a single
+ * `git fast-import` subprocess. Replaces the per-file hash-object + tree-
+ * walk pipeline that previously made bulk writes O(n × spawn-cost).
+ *
+ * fast-import stream layout (see git-fast-import(1) for the full grammar):
+ *
+ *     blob
+ *     mark :1
+ *     data <byte-length-of-content>
+ *     <raw bytes>
+ *     ... (more blob records, one per write) ...
+ *     commit refs/heads/<branch>
+ *     author <name> <email> <epoch> <tz>
+ *     committer <name> <email> <epoch> <tz>
+ *     data <byte-length-of-msg>
+ *     <message bytes>
+ *     from <parent-sha>
+ *     M 100644 :<mark> <path>      -- one per write, referencing the mark above
+ *     D <path>                     -- one per delete
+ *     done
+ *
+ * `--done` makes fast-import treat a truncated stream as an error rather than
+ * silently committing a partial batch; we always emit the matching `done`
+ * directive at the end of the stream so a clean shutdown is unambiguous.
+ *
+ * The `from <parent-sha>` directive is the concurrency guard: fast-import
+ * refuses to advance the ref unless its current value matches `<parent-sha>`.
+ * The caller passes the SHA observed at entry, so if another writer slips in
+ * a commit before fast-import runs, this call fails fast instead of silently
+ * clobbering them. (Upstream serialization via `orphan-write.lock` is the
+ * primary defense; this is the secondary one.)
+ */
+async function runFastImport(
+	branch: string,
+	parent: string,
+	commitMessage: string,
+	files: ReadonlyArray<FileWrite>,
+	cwd?: string,
+): Promise<void> {
+	const authorIdent = await getGitIdent("GIT_AUTHOR_IDENT", cwd);
+	const committerIdent = await getGitIdent("GIT_COMMITTER_IDENT", cwd);
+
+	const args = ["fast-import", "--quiet", "--done"];
+	log.debug("git (fast-import stream) %s%s", cwd ? `[cwd=${cwd}] ` : "", args.join(" "));
+
+	const writes = files.filter((f) => !f.delete);
+	const deletes = files.filter((f) => f.delete);
+
+	return new Promise<void>((resolve, reject) => {
+		// `cwd` flows through `spawn`'s options bag, not `git -C`. See `execGit`.
+		const proc = spawnHidden("git", args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			...(cwd !== undefined && { cwd }),
+		});
+		let stderr = "";
+
+		proc.stderr.on("data", (chunk: Buffer) => {
+			stderr += chunk.toString();
+		});
+		proc.on("close", (code) => {
+			if (code !== 0) {
+				reject(new Error(`git fast-import failed (exit ${code}): ${stderr.trim()}`));
+			} else {
+				resolve();
+			}
+		});
+		/* v8 ignore start -- spawn error only triggers when git is not on PATH */
+		proc.on("error", (err) => {
+			reject(err);
+		});
+		/* v8 ignore stop */
+
+		const stdin = proc.stdin;
+
+		// stdin can emit async errors (EPIPE) if fast-import exits early —
+		// e.g. malformed `from <parent>` or OOM. Without this handler the
+		// EPIPE becomes an unhandled stream-error event and Node terminates
+		// the process. The `close` handler's reject is idempotent vs this
+		// one (whichever fires first wins; Promises swallow the second).
+		stdin.on("error", (err) => {
+			reject(err);
+		});
+
+		// Stream every blob first. Marks are sequential integers — only need
+		// to be unique within this stream, so 1..N is the simplest scheme.
+		// Buffer.from(... , "utf8") + buf.length gives the BYTE count fast-
+		// import requires (using string.length would undercount any multi-
+		// byte UTF-8 sequence and produce a malformed `data` directive).
+		writes.forEach((f, idx) => {
+			const mark = idx + 1;
+			const body = Buffer.from(f.content, "utf8");
+			stdin.write(`blob\nmark :${mark}\ndata ${body.length}\n`);
+			stdin.write(body);
+			stdin.write("\n");
+		});
+
+		// Now emit the single commit record that references the marks above.
+		const msg = Buffer.from(commitMessage, "utf8");
+		stdin.write(`commit refs/heads/${branch}\n`);
+		stdin.write(`author ${authorIdent}\n`);
+		stdin.write(`committer ${committerIdent}\n`);
+		stdin.write(`data ${msg.length}\n`);
+		stdin.write(msg);
+		stdin.write("\n");
+		stdin.write(`from ${parent}\n`);
+
+		writes.forEach((f, idx) => {
+			const mark = idx + 1;
+			stdin.write(`M 100644 :${mark} ${f.path}\n`);
+		});
+		for (const f of deletes) {
+			stdin.write(`D ${f.path}\n`);
+		}
+
+		stdin.write("done\n");
+		stdin.end();
+	});
 }
 
 /**
@@ -687,69 +1010,5 @@ async function replaceInTree(
 	// mktree accepts entries in any order and produces a deterministic tree hash,
 	// so no explicit sorting is needed.
 	const treeInput = `${existingEntries.join("\n")}\n`;
-	return await writeTree(treeInput, cwd);
-}
-
-/**
- * Removes a file from a tree at the given path.
- * Handles nested directories (e.g., "transcripts/abc123.json").
- * If a subdirectory becomes empty after removal, it is also removed from its parent.
- * Returns the original tree unchanged if the file does not exist.
- */
-async function removeFileFromTree(currentTree: string, filePath: string, cwd?: string): Promise<string> {
-	const parts = filePath.split("/");
-
-	if (parts.length === 1) {
-		return await removeFromTree(currentTree, parts[0], cwd);
-	}
-
-	// Nested case: recurse into subdirectory
-	const dirName = parts[0];
-	const remainingPath = parts.slice(1).join("/");
-
-	const lsResult = await execGit(["ls-tree", currentTree, dirName], cwd);
-	if (lsResult.exitCode !== 0 || !lsResult.stdout.trim()) {
-		// Directory doesn't exist — nothing to remove
-		return currentTree;
-	}
-
-	const match = lsResult.stdout.match(/^(\d+)\s+tree\s+([a-f0-9]+)\t/);
-	if (!match) return currentTree;
-	const subTreeHash = match[2];
-
-	const newSubTree = await removeFileFromTree(subTreeHash, remainingPath, cwd);
-
-	// If the subtree is now empty, remove the directory entry from the parent
-	const subEntries = await execGit(["ls-tree", newSubTree], cwd);
-	if (subEntries.exitCode === 0 && !subEntries.stdout.trim()) {
-		return await removeFromTree(currentTree, dirName, cwd);
-	}
-
-	return await replaceInTree(currentTree, dirName, "040000", "tree", newSubTree, cwd);
-}
-
-/**
- * Removes an entry from a tree object by name.
- * Returns the original tree unchanged if the entry does not exist.
- */
-async function removeFromTree(treeHash: string, name: string, cwd?: string): Promise<string> {
-	// Use -z so git outputs raw filenames (no quoting/escaping for non-ASCII names)
-	const lsResult = await execGit(["ls-tree", "-z", treeHash], cwd);
-	const entries = lsResult.stdout.split(NUL).filter((line) => line.length > 0);
-
-	const filtered = entries.filter((line) => {
-		const entryName = line.split("\t")[1];
-		return entryName !== name;
-	});
-
-	// Nothing was removed — return original tree
-	if (filtered.length === entries.length) return treeHash;
-
-	if (filtered.length === 0) {
-		// All entries removed — return an empty tree
-		return await writeTree("", cwd);
-	}
-
-	const treeInput = `${filtered.join("\n")}\n`;
 	return await writeTree(treeInput, cwd);
 }

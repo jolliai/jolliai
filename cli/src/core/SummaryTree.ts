@@ -180,8 +180,14 @@ export function collectDisplayTopics(node: CommitSummary): ReadonlyArray<TopicWi
  * files for all commits whose work is embedded in this summary tree.
  *
  * Companion to readTranscript(hash) in SummaryStore — together they implement
- * the "transcripts are by-hash, not Hoisted" model: physical files stay at
- * `transcripts/{originalHash}.json`, display walks the tree to discover hashes.
+ * the legacy "transcripts are by-hash, not Hoisted" model: physical files
+ * stay at `transcripts/{originalHash}.json`, display walks the tree to
+ * discover hashes.
+ *
+ * In v5 this role is taken over by `summary.transcripts` + `getTranscriptIds`.
+ * This function is kept as the fallback path for v3/v4 data during the
+ * deprecation window; once telemetry confirms ≥95% projects have migrated
+ * to v5 it can be removed alongside the other v3/v4 compatibility code.
  */
 export function collectAllTranscriptHashes(node: CommitSummary): ReadonlyArray<string> {
 	const hashes: string[] = [node.commitHash];
@@ -189,6 +195,28 @@ export function collectAllTranscriptHashes(node: CommitSummary): ReadonlyArray<s
 		hashes.push(...collectAllTranscriptHashes(child));
 	}
 	return hashes;
+}
+
+/**
+ * Returns the list of transcript IDs for a summary, tolerating v3/v4/v5 data.
+ *
+ * This is THE Release N compatibility entry point — every caller that needs
+ * "which transcript files does this summary reference" funnels through here:
+ *   - v5 fast path (the common case after migration completes): the summary
+ *     carries an authoritative `transcripts: string[]` field; return it.
+ *   - v3/v4 fallback (legacy data, or v5 migration not yet completed for
+ *     this project): walk the children tree via `collectAllTranscriptHashes`
+ *     and treat each commit hash as an opaque transcript ID — this is how
+ *     transcript files are physically stored on disk in the pre-v5 world,
+ *     and the v5 migration deliberately keeps those filenames so the v5
+ *     `transcripts` array can reuse the same strings as IDs without a rename.
+ *
+ * Release N+M cleanup: drop the fallback branch and reduce to
+ * `return summary.transcripts ?? []` once all read paths can trust v5 schema.
+ */
+export function getTranscriptIds(summary: CommitSummary): ReadonlyArray<string> {
+	if (summary.transcripts !== undefined) return summary.transcripts;
+	return collectAllTranscriptHashes(summary);
 }
 
 /**

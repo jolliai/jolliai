@@ -209,10 +209,19 @@ const { mockDeleteTopicInTree, mockUpdateTopicInTree } = vi.hoisted(() => ({
 	mockUpdateTopicInTree: vi.fn(),
 }));
 
-vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
-	deleteTopicInTree: mockDeleteTopicInTree,
-	updateTopicInTree: mockUpdateTopicInTree,
-}));
+vi.mock("../../../cli/src/core/SummaryTree.js", async () => {
+	// Pull real impls for everything not explicitly stubbed (notably
+	// `getTranscriptIds`, used by the panel's refreshTranscriptHashes flow
+	// after the v5 schema migration to a stable transcript-ID set).
+	const actual = await vi.importActual<typeof import("../../../cli/src/core/SummaryTree.js")>(
+		"../../../cli/src/core/SummaryTree.js",
+	);
+	return {
+		...actual,
+		deleteTopicInTree: mockDeleteTopicInTree,
+		updateTopicInTree: mockUpdateTopicInTree,
+	};
+});
 
 const { mockCorePushSummaryToLocal } = vi.hoisted(() => ({
 	mockCorePushSummaryToLocal: vi.fn().mockResolvedValue({
@@ -4763,6 +4772,96 @@ describe("SummaryWebviewPanel", () => {
 					workspaceRoot,
 				);
 			});
+
+			// ── Failure paths (v5 summary-first ordering) ─────────────────────
+
+			it("posts transcriptsSaveFailed when storeSummary rejects — files NOT touched", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123", "def456"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+				mockStoreSummary.mockClear();
+				mockStoreSummary.mockRejectedValueOnce(new Error("orphan lock contention"));
+				mockSaveTranscriptsBatch.mockClear();
+
+				// Trigger save with one commit having no entries → goes to deletes,
+				// which forces persistTranscriptIdRemoval to run and fail.
+				dispatch({
+					command: "saveAllTranscripts",
+					entries: [
+						{
+							commitHash: "abc123",
+							sessionId: "s1",
+							source: "claude",
+							originalIndex: 0,
+							role: "human",
+							content: "x",
+						},
+					],
+				});
+				await flushPromises();
+
+				// File batch must NOT run after summary failure
+				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "transcriptsSaveFailed" }),
+				);
+				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsSaved" });
+			});
+
+			it("posts transcriptsSaveFailed when file batch rejects after summary updated", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123", "def456"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+				mockStoreSummary.mockClear();
+				mockSaveTranscriptsBatch.mockClear();
+				mockSaveTranscriptsBatch.mockRejectedValueOnce(new Error("io error"));
+
+				dispatch({
+					command: "saveAllTranscripts",
+					entries: [
+						{
+							commitHash: "abc123",
+							sessionId: "s1",
+							source: "claude",
+							originalIndex: 0,
+							role: "human",
+							content: "edited",
+						},
+					],
+				});
+				await flushPromises();
+
+				// Summary was updated; file batch was attempted and failed.
+				expect(mockStoreSummary).toHaveBeenCalled();
+				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
+				// Failed message posted, NOT success
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "transcriptsSaveFailed" }),
+				);
+				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsSaved" });
+			});
 		});
 
 		// ── deleteAllTranscripts ─────────────────────────────────────────────
@@ -4831,6 +4930,72 @@ describe("SummaryWebviewPanel", () => {
 				expect(postMessage).toHaveBeenCalledWith({
 					command: "transcriptsDeleted",
 				});
+			});
+
+			// ── Failure paths (v5 summary-first ordering) ─────────────────────
+
+			it("posts transcriptsDeleteFailed when storeSummary rejects — files NOT touched", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				mockStoreSummary.mockClear();
+				mockStoreSummary.mockRejectedValueOnce(new Error("disk full"));
+				mockSaveTranscriptsBatch.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "deleteAllTranscripts" });
+				await flushPromises();
+
+				// File batch must NOT run when summary update failed first.
+				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
+				// Failure message reaches the user; no Success message is sent.
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "transcriptsDeleteFailed" }),
+				);
+				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsDeleted" });
+			});
+
+			it("posts transcriptsDeleteFailed when saveTranscriptsBatch rejects after summary already updated", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				mockStoreSummary.mockClear();
+				mockSaveTranscriptsBatch.mockClear();
+				mockSaveTranscriptsBatch.mockRejectedValueOnce(new Error("git push timeout"));
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "deleteAllTranscripts" });
+				await flushPromises();
+
+				// summary write was attempted (summary-first ordering)
+				expect(mockStoreSummary).toHaveBeenCalled();
+				// file delete was attempted and failed
+				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
+				// FailureMessage is posted instead of success
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "transcriptsDeleteFailed" }),
+				);
+				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsDeleted" });
 			});
 		});
 

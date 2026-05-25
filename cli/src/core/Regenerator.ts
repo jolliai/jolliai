@@ -12,7 +12,7 @@ import {
 	readPlanFromBranch,
 	readTranscriptsForCommits,
 } from "./SummaryStore.js";
-import { collectAllTranscriptHashes } from "./SummaryTree.js";
+import { getTranscriptIds } from "./SummaryTree.js";
 import { buildMultiSessionContext, type SessionTranscript } from "./TranscriptReader.js";
 
 const log = createLogger("Regenerator");
@@ -84,8 +84,12 @@ export async function regenerateSummary(
 	// Bank users read from FolderStorage instead of the OrphanBranchStorage
 	// fallback in resolveStorage — without it the LLM would see an empty
 	// conversation on every regenerate in folder-only mode.
-	const treeHashes = collectAllTranscriptHashes(normalized);
-	const transcriptMap = await readTranscriptsForCommits(treeHashes, cwd, storage);
+	//
+	// v5 schema: `getTranscriptIds` returns `summary.transcripts` (the v5
+	// authoritative ID array) when present, else falls back to walking
+	// children for v3/v4 data — both forms read correctly.
+	const transcriptIds = getTranscriptIds(normalized);
+	const transcriptMap = await readTranscriptsForCommits(transcriptIds, cwd, storage);
 	const sessions: SessionTranscript[] = [];
 	for (const stored of transcriptMap.values()) {
 		for (const s of stored.sessions) {

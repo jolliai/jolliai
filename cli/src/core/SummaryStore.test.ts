@@ -162,26 +162,29 @@ describe("SummaryStore", () => {
 			expect(indexContent.entries[0].topicCount).toBe(1);
 		});
 
-		it("should append a transcript artifact when transcript sessions are present", async () => {
+		it("should append a transcript artifact at the v5 transcript-id path when sessions are present", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
 			const summary = createMockSummary();
 			await storeSummary(summary, undefined, false, {
 				transcript: {
-					sessions: [
-						{
-							sessionId: "claude/session-1",
-							source: "claude",
-							entries: [],
-						},
-					],
+					id: "transcript-uuid-1",
+					data: {
+						sessions: [
+							{
+								sessionId: "claude/session-1",
+								source: "claude",
+								entries: [],
+							},
+						],
+					},
 				},
 			});
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			// 3 base (summary + index + catalog) + 1 transcript appended after.
 			expect(files).toHaveLength(4);
-			expect(files[3]).toMatchObject({ path: "transcripts/abc123def456.json" });
+			expect(files[3]).toMatchObject({ path: "transcripts/transcript-uuid-1.json" });
 		});
 
 		it("should append plan progress artifacts when provided", async () => {
@@ -777,8 +780,9 @@ describe("SummaryStore", () => {
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
 			expect(newSummaryContent.commitHash).toBe(newHash);
 			expect(newSummaryContent.commitMessage).toBe("New message");
-			// v4 root: commitType = "rebase"; topics + recap are now Copy-Hoisted from old.
-			expect(newSummaryContent.version).toBe(4);
+			// v5 root: commitType = "rebase"; topics + recap are Copy-Hoisted from
+			// old; the migrated summary inherits the source's transcripts array.
+			expect(newSummaryContent.version).toBe(5);
 			expect(newSummaryContent.commitType).toBe("rebase");
 			expect(newSummaryContent.topics).toEqual(oldSummary.topics);
 			expect(newSummaryContent.stats).toBeUndefined();
@@ -1107,8 +1111,8 @@ describe("SummaryStore", () => {
 			const mergedContent = JSON.parse(files[0].content) as CommitSummary;
 			expect(mergedContent.commitHash).toBe(newHash);
 			expect(mergedContent.commitMessage).toBe("Squashed commit");
-			// Root is v4 with consolidated topics/recap on root.
-			expect(mergedContent.version).toBe(4);
+			// Root is v5 with consolidated topics/recap on root + unioned transcripts.
+			expect(mergedContent.version).toBe(5);
 
 			// Children: sorted by commitDate desc -> summary2 (Feb 19) first, then summary1 (Feb 18).
 			// Topics are now stripped from children under the unified Hoist contract.
@@ -2156,6 +2160,30 @@ describe("SummaryStore", () => {
 			} finally {
 				rmSync(root, { recursive: true, force: true });
 			}
+		});
+
+		it("should accept v5 UUID filenames (with hyphens) alongside legacy hex hashes", async () => {
+			// The pre-fix regex required `[a-f0-9]+` which silently rejected v5
+			// UUIDs (`8-4-4-4-12` shape). With UUIDs missing from the file-list
+			// intersection, `SummaryWebviewPanel.refreshTranscriptHashes` would
+			// treat them as "not on disk" and drop them from the panel — hiding
+			// every conversation for v5-written summaries. Guard with mixed-
+			// namespace fixture so a future tightening of the pattern reverts.
+			vi.mocked(listFilesInBranch).mockResolvedValueOnce([
+				"transcripts/abc123def456.json", // legacy commit-hash style
+				"transcripts/01234567-89ab-cdef-0123-456789abcdef.json", // v5 UUID
+				"transcripts/AAAAAAAA-1234-5678-9ABC-DEFFFFFFFFFF.json", // upper-case UUID
+				"transcripts/skip-not-json.txt", // wrong extension
+				"other-dir/abc123.json", // wrong prefix
+			]);
+			const hashes = await getTranscriptHashes();
+			expect(hashes).toEqual(
+				new Set([
+					"abc123def456",
+					"01234567-89ab-cdef-0123-456789abcdef",
+					"AAAAAAAA-1234-5678-9ABC-DEFFFFFFFFFF",
+				]),
+			);
 		});
 	});
 

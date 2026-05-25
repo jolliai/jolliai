@@ -10,6 +10,7 @@
  */
 
 import * as vscode from "vscode";
+import { describeSchemaV5Status } from "../../../cli/src/commands/StatusCommand.js";
 import { resolveLlmCredentialSource } from "../../../cli/src/core/LlmClient.js";
 import type { JolliMemoryConfig, StatusInfo } from "../../../cli/src/Types.js";
 import { parseJolliApiKey } from "../services/JolliPushService.js";
@@ -140,6 +141,7 @@ function buildFullStatusItems(
 	if (hookRuntime) {
 		hooksTooltipLines.push(`Hook runtime: ${hookRuntime}`);
 	}
+	hooksTooltipLines.push(`Data migration: ${describeSchemaV5Status(s.schemaV5)}`);
 	const hooksTooltip = hooksTooltipLines.join("\n");
 
 	const sessionsTooltip = `${s.activeSessions} active session${s.activeSessions !== 1 ? "s" : ""} across all integrations`;

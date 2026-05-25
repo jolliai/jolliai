@@ -1072,6 +1072,48 @@ export function activate(context: vscode.ExtensionContext): void {
 		// for 48 hours as a safety net. Check if the retention period has expired.
 		await cleanupV1IfExpired(workspaceRoot);
 
+		// 2.5. v3 → v4 → v5 unified schema migration. Idempotent — reads its own
+		// state file on the orphan branch and skips when already completed; also
+		// skips when no orphan branch exists yet (the first post-commit creates
+		// it, and the next activate() picks the migration up). Runs in the
+		// `initializeKB` sequence so the v1 → v3 conversion completes before v5
+		// inspects summaries. Failure is non-fatal: next activate() retries.
+		//
+		// Wrapped in setMigrating(true/false) across all three stores so the
+		// sidebar surfaces the existing "Migrating memories..." affordance
+		// (StatusTreeProvider spinner, FilesTreeProvider / HistoryTreeProvider
+		// hide-children) while v5 work is in flight. Mirrors the v1→v3 and
+		// index-migration patterns above; user gets a unified "data being
+		// upgraded" signal across panels without us inventing a new banner.
+		statusStore.setMigrating(true);
+		commitsStore.setMigrating(true);
+		filesStore.setMigrating(true);
+		try {
+			const { migrateSchemaToV5 } = await import(
+				"../../cli/src/core/SchemaV5Migration.js"
+			);
+			// `?? undefined` because workspaceRoot is `string | null` here; the
+			// value is non-null (we returned earlier when it was), the coercion
+			// just satisfies tsc.
+			const v5Result = await migrateSchemaToV5(workspaceRoot ?? undefined);
+			log.info(
+				"activate",
+				`Schema v5 migration: alreadyDone=${v5Result.alreadyDone} fresh=${v5Result.fresh} migrated=${v5Result.migrated} skipped=${v5Result.skipped}`,
+			);
+		} catch (err) {
+			log.warn(
+				"activate",
+				`Schema v5 migration failed (non-fatal): ${(err as Error).message}`,
+			);
+		} finally {
+			// Always clear migration state — including on failure — so the
+			// sidebar comes back to a usable state and the user can read the
+			// "Not migrated" status / re-run via `jolli migrate`.
+			statusStore.setMigrating(false);
+			commitsStore.setMigrating(false);
+			filesStore.setMigrating(false);
+		}
+
 		// 3. KB folder auto-initialization + migration
 		// Creates the KB folder (~/Documents/jolli/{repoName}/) and auto-migrates
 		// orphan branch data if migration hasn't been completed yet.

@@ -36,6 +36,7 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import {
+	batchReadFilesFromBranch,
 	ensureOrphanBranch,
 	execGit,
 	getCommitInfo,
@@ -85,8 +86,11 @@ function mockFailure(code: number | string, stderr: string, stdout = ""): void {
  */
 function mockSpawnSuccess(stdout: string): void {
 	mockSpawn.mockImplementationOnce(() => {
+		// stdin is itself an EventEmitter so production code that attaches
+		// `proc.stdin.on('error', ...)` doesn't blow up on these mocks.
+		const stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
 		const proc = Object.assign(new EventEmitter(), {
-			stdin: { write: vi.fn(), end: vi.fn() },
+			stdin,
 			stdout: new EventEmitter(),
 			stderr: new EventEmitter(),
 		});
@@ -105,14 +109,43 @@ function mockSpawnSuccess(stdout: string): void {
  */
 function mockSpawnFailure(exitCode: number, stderr: string): void {
 	mockSpawn.mockImplementationOnce(() => {
+		// stdin is itself an EventEmitter so production code that attaches
+		// `proc.stdin.on('error', ...)` doesn't blow up on these mocks.
+		const stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
 		const proc = Object.assign(new EventEmitter(), {
-			stdin: { write: vi.fn(), end: vi.fn() },
+			stdin,
 			stdout: new EventEmitter(),
 			stderr: new EventEmitter(),
 		});
 		queueMicrotask(() => {
 			proc.stderr.emit("data", Buffer.from(stderr));
 			proc.emit("close", exitCode);
+		});
+		return proc;
+	});
+}
+
+/**
+ * Queue a successful spawn that emits stdout in caller-controlled chunks.
+ * Used by `batchReadFilesFromBranch` tests where the parser's correctness
+ * depends on handling chunk boundaries (header / body split across `data`
+ * events). Chunks are emitted in order on the same tick.
+ */
+function mockSpawnStreamingSuccess(chunks: ReadonlyArray<Buffer | string>): void {
+	mockSpawn.mockImplementationOnce(() => {
+		// stdin is itself an EventEmitter so production code that attaches
+		// `proc.stdin.on('error', ...)` doesn't blow up on these mocks.
+		const stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
+		const proc = Object.assign(new EventEmitter(), {
+			stdin,
+			stdout: new EventEmitter(),
+			stderr: new EventEmitter(),
+		});
+		queueMicrotask(() => {
+			for (const chunk of chunks) {
+				proc.stdout.emit("data", Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+			}
+			proc.emit("close", 0);
 		});
 		return proc;
 	});
@@ -135,13 +168,17 @@ describe("GitOps", () => {
 			expect(result.stdout).toBe("abc123");
 		});
 
-		it("should pass cwd via -C flag", async () => {
+		it("should pass cwd via the spawn options bag (not the git -C flag)", async () => {
+			// Originally `execGit` injected `-C <cwd>` into argv. After PR #149
+			// it routes `cwd` through `child_process`'s options bag instead —
+			// equivalent behavior on disk, but keeps the path string out of
+			// argv and silences CodeQL's `js/shell-command-constructed-from-input`.
 			mockSuccess("main\n");
 			await execGit(["branch"], "/my/project");
 			expect(mockExecFileAsync).toHaveBeenCalledWith(
 				"git",
-				["-C", "/my/project", "branch"],
-				expect.objectContaining({ maxBuffer: expect.any(Number) }),
+				["branch"],
+				expect.objectContaining({ maxBuffer: expect.any(Number), cwd: "/my/project" }),
 			);
 		});
 
@@ -366,11 +403,12 @@ describe("GitOps", () => {
 
 			await ensureOrphanBranch("new-branch", "/my/project");
 
-			// Verify spawn was called with -C flag for cwd
+			// `cwd` now rides the spawn options bag, not argv. The git command
+			// itself (`hash-object -w --stdin`) lives in argv unchanged.
 			expect(mockSpawn).toHaveBeenCalledWith(
 				"git",
-				expect.arrayContaining(["-C", "/my/project"]),
-				expect.any(Object),
+				expect.any(Array),
+				expect.objectContaining({ cwd: "/my/project" }),
 			);
 		});
 
@@ -567,43 +605,253 @@ describe("GitOps", () => {
 		});
 	});
 
-	describe("writeMultipleFilesToBranch", () => {
-		it("should write multiple files in a single commit", async () => {
-			// ensureOrphanBranch: branch already exists (execGit)
-			mockSuccess("abc\n"); // orphanBranchExists → rev-parse
-			// Get branch tip (execGit)
-			mockSuccess("parent_hash\n");
-			// Get current tree (execGit)
-			mockSuccess("root_tree\n");
+	describe("batchReadFilesFromBranch", () => {
+		// The cat-file --batch protocol per response:
+		//     "<sha> blob <byte-len>\n" + <byte-len bytes of body> + "\n"
+		// or for a missing entry:
+		//     "<request> missing\n"   (no body, no trailing LF beyond the header)
+		// These helpers assemble those byte sequences so individual tests stay
+		// focused on the parsing behavior under test instead of protocol
+		// boilerplate.
+		function buildHeader(sha: string, size: number): string {
+			return `${sha} blob ${size}\n`;
+		}
+		function buildResponse(sha: string, body: string): Buffer {
+			const bodyBuf = Buffer.from(body, "utf8");
+			return Buffer.concat([
+				Buffer.from(buildHeader(sha, bodyBuf.length), "utf8"),
+				bodyBuf,
+				Buffer.from("\n", "utf8"),
+			]);
+		}
 
-			// --- File 1: nested path "summaries/abc123.json" ---
-			// writeBlob (spawn)
-			mockSpawnSuccess("blob_summary\n");
-			// updateTreeWithFile → ls-tree root_tree summaries → not found (execGit)
-			mockSuccess("");
-			// writeTree("") → empty subtree (spawn)
-			mockSpawnSuccess("empty_sub\n");
-			// replaceInTree(empty_sub, "abc123.json") → ls-tree -z (execGit)
-			mockSuccess("");
-			// writeTree → new subtree (spawn)
-			mockSpawnSuccess("new_sub\n");
-			// replaceInTree(root_tree, "summaries") → ls-tree -z (execGit)
-			mockSuccess(`100644 blob idx\tindex.json${NUL}`);
-			// writeTree → intermediate root (spawn)
-			mockSpawnSuccess("mid_root\n");
+		function getSpawnStdinWrites(callIndex = 0): ReadonlyArray<string> {
+			const proc = mockSpawn.mock.results[callIndex].value;
+			return (proc.stdin.write.mock.calls as ReadonlyArray<[unknown]>).map((call) => String(call[0]));
+		}
 
-			// --- File 2: flat path "index.json" ---
-			// writeBlob (spawn)
-			mockSpawnSuccess("blob_index\n");
-			// replaceInTree(mid_root, "index.json") → ls-tree -z (execGit)
-			mockSuccess(`100644 blob idx\tindex.json${NUL}040000 tree sub\tsummaries${NUL}`);
-			// writeTree → final root (spawn)
-			mockSpawnSuccess("final_root\n");
+		it("returns an empty map and does not spawn when the path list is empty", async () => {
+			const result = await batchReadFilesFromBranch("branch", []);
+			expect(result.size).toBe(0);
+			expect(mockSpawn).not.toHaveBeenCalled();
+		});
 
-			// commit-tree (execGit)
-			mockSuccess("new_commit\n");
-			// update-ref (execGit)
-			mockSuccess("\n");
+		it("reads a single file via cat-file --batch and returns its content", async () => {
+			mockSpawnStreamingSuccess([buildResponse("aaaaaaaa", "hello world")]);
+
+			const result = await batchReadFilesFromBranch("branch", ["summaries/a.json"]);
+
+			expect(result.get("summaries/a.json")).toBe("hello world");
+			expect(mockSpawn).toHaveBeenCalledWith(
+				"git",
+				expect.arrayContaining(["cat-file", "--batch"]),
+				expect.any(Object),
+			);
+			// Verify that the request was written using the <branch>:<path> form.
+			expect(getSpawnStdinWrites()).toEqual(["branch:summaries/a.json\n"]);
+		});
+
+		it("preserves request ordering across multiple files in one batch", async () => {
+			mockSpawnStreamingSuccess([
+				buildResponse("aaa", "first"),
+				buildResponse("bbb", "second"),
+				buildResponse("ccc", "third"),
+			]);
+
+			const result = await batchReadFilesFromBranch("branch", ["p/1", "p/2", "p/3"]);
+
+			expect(result.get("p/1")).toBe("first");
+			expect(result.get("p/2")).toBe("second");
+			expect(result.get("p/3")).toBe("third");
+		});
+
+		it("maps missing entries to null while keeping found entries in the same call", async () => {
+			mockSpawnStreamingSuccess([
+				buildResponse("aaa", "exists"),
+				Buffer.from("branch:missing/file.json missing\n", "utf8"),
+				buildResponse("ccc", "also exists"),
+			]);
+
+			const result = await batchReadFilesFromBranch("branch", ["found/a", "missing/file.json", "found/b"]);
+
+			expect(result.get("found/a")).toBe("exists");
+			expect(result.get("missing/file.json")).toBeNull();
+			expect(result.get("found/b")).toBe("also exists");
+		});
+
+		it("parses correctly when stdout chunks split header from body", async () => {
+			// The parser's state machine has to ride out a `data` event that ends
+			// mid-record. Split one full response into two arbitrary halves: the
+			// header + first byte of body in chunk 1, the rest of the body and
+			// trailing LF in chunk 2.
+			const full = buildResponse("aaa", "split across chunks");
+			const split = Math.floor(full.length / 3);
+			mockSpawnStreamingSuccess([full.subarray(0, split), full.subarray(split)]);
+
+			const result = await batchReadFilesFromBranch("branch", ["p"]);
+
+			expect(result.get("p")).toBe("split across chunks");
+		});
+
+		it("parses correctly when a chunk ends exactly at the header's terminating LF", async () => {
+			// Edge case: the OS pipe write boundary lands exactly after the
+			// header's LF and before the first body byte. Hits the
+			// `bytesRemaining > 0 && pending.length === 0` early-return inside
+			// the body branch — without that guard the parser would call
+			// `pending.subarray(0, take)` with `take=0` and emit an empty body.
+			const body = "01234567";
+			const header = Buffer.from(`aaa blob ${body.length}\n`, "utf8");
+			mockSpawnStreamingSuccess([header, Buffer.from(`${body}\n`, "utf8")]);
+
+			const result = await batchReadFilesFromBranch("branch", ["p"]);
+
+			expect(result.get("p")).toBe(body);
+		});
+
+		it("parses correctly when the body is split across multiple chunks", async () => {
+			// Header arrives in full, then body comes in two halves. Exercises
+			// the `bytesRemaining > 0; return` early-exit that keeps the parser
+			// waiting for more body bytes without re-entering the header phase.
+			const body = "0123456789ABCDEFGHIJ"; // 20 bytes
+			const header = Buffer.from(`aaa blob ${body.length}\n`, "utf8");
+			const halfPoint = 8;
+			mockSpawnStreamingSuccess([
+				Buffer.concat([header, Buffer.from(body.substring(0, halfPoint), "utf8")]),
+				Buffer.from(body.substring(halfPoint), "utf8"),
+				Buffer.from("\n", "utf8"), // trailing LF alone in its own chunk
+			]);
+
+			const result = await batchReadFilesFromBranch("branch", ["p"]);
+
+			expect(result.get("p")).toBe(body);
+		});
+
+		it("ignores stderr emissions while still resolving on a zero exit code", async () => {
+			// git can print informational messages to stderr (e.g. warnings)
+			// without failing. The accumulator captures them so that a later
+			// non-zero exit can surface them, but a successful close path must
+			// still resolve normally regardless of stderr content.
+			mockSpawn.mockImplementationOnce(() => {
+				const stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
+				const proc = Object.assign(new EventEmitter(), {
+					stdin,
+					stdout: new EventEmitter(),
+					stderr: new EventEmitter(),
+				});
+				queueMicrotask(() => {
+					proc.stderr.emit("data", Buffer.from("warning: harmless\n"));
+					proc.stdout.emit("data", buildResponse("aaa", "ok"));
+					proc.emit("close", 0);
+				});
+				return proc;
+			});
+
+			const result = await batchReadFilesFromBranch("branch", ["p"]);
+			expect(result.get("p")).toBe("ok");
+		});
+
+		it("parses correctly when one stdout chunk packs multiple responses", async () => {
+			// Concatenate three responses into one buffer to simulate the case
+			// where cat-file flushes several entries in a single OS-level pipe write.
+			mockSpawnStreamingSuccess([
+				Buffer.concat([buildResponse("a", "one"), buildResponse("b", "two"), buildResponse("c", "three")]),
+			]);
+
+			const result = await batchReadFilesFromBranch("branch", ["p1", "p2", "p3"]);
+
+			expect(result.get("p1")).toBe("one");
+			expect(result.get("p2")).toBe("two");
+			expect(result.get("p3")).toBe("three");
+		});
+
+		it("uses byte length (not character length) when consuming UTF-8 bodies", async () => {
+			// "é" is two UTF-8 bytes; if the parser used string-length it would
+			// truncate the body or mis-frame the next response.
+			mockSpawnStreamingSuccess([buildResponse("aaa", "café")]);
+
+			const result = await batchReadFilesFromBranch("branch", ["p"]);
+
+			expect(result.get("p")).toBe("café");
+		});
+
+		it("handles zero-byte bodies correctly", async () => {
+			// Empty blob: header says size 0, no body bytes, single trailing LF.
+			mockSpawnStreamingSuccess([Buffer.from("aaa blob 0\n\n", "utf8")]);
+
+			const result = await batchReadFilesFromBranch("branch", ["p"]);
+
+			expect(result.get("p")).toBe("");
+		});
+
+		it("propagates cwd via spawn's options bag (not as `git -C` in argv)", async () => {
+			mockSpawnStreamingSuccess([buildResponse("a", "x")]);
+
+			await batchReadFilesFromBranch("branch", ["p"], "/some/repo");
+
+			expect(mockSpawn).toHaveBeenCalledWith(
+				"git",
+				expect.arrayContaining(["cat-file", "--batch"]),
+				expect.objectContaining({ cwd: "/some/repo" }),
+			);
+		});
+
+		it("rejects (not crash) when stdin emits EPIPE because cat-file exited early", async () => {
+			// Regression guard: without the `proc.stdin.on('error', ...)` handler,
+			// EPIPE from an early subprocess exit becomes an unhandled stream
+			// error and Node 22 terminates the process. We stand up a stdin that
+			// emits "error" instead of accepting writes, and assert the helper's
+			// promise rejects with that exact error.
+			const epipeError = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+			mockSpawn.mockImplementationOnce(() => {
+				const stdin = new EventEmitter() as EventEmitter & { write: typeof vi.fn; end: typeof vi.fn };
+				stdin.write = vi.fn();
+				stdin.end = vi.fn();
+				const proc = Object.assign(new EventEmitter(), {
+					stdin,
+					stdout: new EventEmitter(),
+					stderr: new EventEmitter(),
+				});
+				queueMicrotask(() => {
+					stdin.emit("error", epipeError);
+				});
+				return proc;
+			});
+
+			await expect(batchReadFilesFromBranch("branch", ["p"])).rejects.toThrow("write EPIPE");
+		});
+	});
+
+	describe("writeMultipleFilesToBranch (fast-import path)", () => {
+		// The fast-import-based implementation always issues exactly one spawn
+		// (the import itself); the four execFile calls are the branch-existence
+		// probe inside ensureOrphanBranch, the parent rev-parse, and the two
+		// `git var` lookups for author/committer identity. This helper joins all
+		// stdin chunks written to that single spawn so the assertions below can
+		// pattern-match against the actual fast-import protocol text.
+		function captureFastImportStdin(spawnCallIndex = 0): string {
+			const proc = mockSpawn.mock.results[spawnCallIndex].value;
+			const chunks = proc.stdin.write.mock.calls as ReadonlyArray<[unknown]>;
+			const buffers = chunks.map((call) => {
+				const arg = call[0];
+				if (Buffer.isBuffer(arg)) return arg;
+				return Buffer.from(String(arg), "utf8");
+			});
+			return Buffer.concat(buffers).toString("utf8");
+		}
+
+		// Convenience: queue the four execGit responses every successful call
+		// resolves (orphan probe → tip rev-parse → author ident → committer
+		// ident) and queue a successful spawn for fast-import.
+		function mockHappyPathPreamble(parent: string): void {
+			mockSuccess("abc\n"); // ensureOrphanBranch → orphanBranchExists rev-parse
+			mockSuccess(`${parent}\n`); // tip rev-parse
+			mockSuccess("Alice <alice@example.com> 1700000000 +0000\n"); // GIT_AUTHOR_IDENT
+			mockSuccess("Alice <alice@example.com> 1700000000 +0000\n"); // GIT_COMMITTER_IDENT
+		}
+
+		it("streams blob + commit records for multiple writes in a single spawn", async () => {
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnSuccess("");
 
 			await writeMultipleFilesToBranch(
 				"branch",
@@ -614,221 +862,199 @@ describe("GitOps", () => {
 				"Add summary and update index",
 			);
 
-			// Single commit-tree and single update-ref
-			expect(mockExecFileAsync).toHaveBeenCalledTimes(9);
-			expect(mockSpawn).toHaveBeenCalledTimes(6);
+			// fast-import + the four read-only execGit calls listed in
+			// mockHappyPathPreamble. The historical pipeline issued 9 execGits
+			// and 6 spawns for the same input — see commit history of this file.
+			expect(mockSpawn).toHaveBeenCalledTimes(1);
+			expect(mockExecFileAsync).toHaveBeenCalledTimes(4);
+			expect(mockSpawn).toHaveBeenCalledWith(
+				"git",
+				expect.arrayContaining(["fast-import", "--quiet", "--done"]),
+				expect.any(Object),
+			);
+
+			const stream = captureFastImportStdin();
+			// Two blobs, each with its own mark, in declaration order.
+			expect(stream).toContain("blob\nmark :1\ndata 17\n"); // '{"summary": true}'
+			expect(stream).toContain('{"summary": true}');
+			expect(stream).toContain("blob\nmark :2\ndata 14\n"); // '{"version": 1}'
+			expect(stream).toContain('{"version": 1}');
+			// Commit record targets the right ref, chains onto our observed parent,
+			// and references the marks above by index in declaration order.
+			expect(stream).toContain("commit refs/heads/branch\n");
+			expect(stream).toContain("author Alice <alice@example.com> 1700000000 +0000\n");
+			expect(stream).toContain("committer Alice <alice@example.com> 1700000000 +0000\n");
+			expect(stream).toContain("from parent_hash\n");
+			expect(stream).toContain("M 100644 :1 summaries/abc123.json\n");
+			expect(stream).toContain("M 100644 :2 index.json\n");
+			expect(stream).toMatch(/done\n$/);
 		});
 
-		it("should throw on tip failure", async () => {
-			mockSuccess("abc\n"); // orphanBranchExists
-			mockFailure(128, "fatal: bad ref"); // tip rev-parse fails
+		it("emits a single blob and one M directive for the simplest single-file write", async () => {
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnSuccess("");
+
+			await writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg");
+
+			const stream = captureFastImportStdin();
+			expect(stream).toContain("blob\nmark :1\ndata 2\n");
+			expect(stream).toContain("M 100644 :1 test.json\n");
+			expect(stream).not.toContain("\nD ");
+		});
+
+		it("emits only D directives (no blob records) when the batch is delete-only", async () => {
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnSuccess("");
+
+			await writeMultipleFilesToBranch(
+				"branch",
+				[
+					{ path: "transcripts/hash.json", content: "", delete: true },
+					{ path: "summaries/old.json", content: "", delete: true },
+				],
+				"Delete two files",
+			);
+
+			const stream = captureFastImportStdin();
+			expect(stream).not.toContain("blob\n");
+			expect(stream).not.toContain("\nM ");
+			expect(stream).toContain("D transcripts/hash.json\n");
+			expect(stream).toContain("D summaries/old.json\n");
+		});
+
+		it("interleaves write and delete entries in a single commit record", async () => {
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnSuccess("");
+
+			await writeMultipleFilesToBranch(
+				"branch",
+				[
+					{ path: "summaries/new.json", content: '{"v": 5}' },
+					{ path: "transcripts/old.json", content: "", delete: true },
+				],
+				"Mixed batch",
+			);
+
+			const stream = captureFastImportStdin();
+			// One blob for the write, no blob for the delete.
+			expect(stream).toContain("blob\nmark :1\n");
+			// Commit body has both M and D directives.
+			expect(stream).toContain("M 100644 :1 summaries/new.json\n");
+			expect(stream).toContain("D transcripts/old.json\n");
+		});
+
+		it("produces an empty-tree commit when the file list is empty", async () => {
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnSuccess("");
+
+			await writeMultipleFilesToBranch("branch", [], "Empty batch");
+
+			const stream = captureFastImportStdin();
+			expect(stream).not.toContain("blob\n");
+			expect(stream).not.toContain("\nM ");
+			expect(stream).not.toContain("\nD ");
+			// Commit + parent are still emitted, so the resulting commit replays
+			// the parent tree unchanged — same as the historical behavior.
+			expect(stream).toContain("commit refs/heads/branch\n");
+			expect(stream).toContain("from parent_hash\n");
+			expect(stream).toMatch(/done\n$/);
+		});
+
+		it("uses Buffer.byteLength when computing data sizes so multi-byte UTF-8 is preserved", async () => {
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnSuccess("");
+
+			// 'é' is two UTF-8 bytes; using string.length would emit `data 1`
+			// and corrupt the blob. We assert on the byte count via the protocol.
+			await writeMultipleFilesToBranch("branch", [{ path: "x.txt", content: "é" }], "utf-8");
+
+			const stream = captureFastImportStdin();
+			expect(stream).toContain("data 2\n");
+		});
+
+		it("propagates cwd via spawn's options bag for both execGit and the fast-import spawn", async () => {
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnSuccess("");
+
+			await writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg", "/some/repo");
+
+			expect(mockSpawn).toHaveBeenCalledWith(
+				"git",
+				expect.arrayContaining(["fast-import", "--quiet", "--done"]),
+				expect.objectContaining({ cwd: "/some/repo" }),
+			);
+		});
+
+		it("throws when the parent rev-parse fails before fast-import is spawned", async () => {
+			mockSuccess("abc\n"); // ensureOrphanBranch
+			mockFailure(128, "fatal: bad ref"); // tip rev-parse
 
 			await expect(
 				writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg"),
 			).rejects.toThrow("Failed to get branch tip");
-		});
-
-		it("should throw on tree failure", async () => {
-			mockSuccess("abc\n"); // orphanBranchExists
-			mockSuccess("parent\n"); // tip
-			mockFailure(128, "fatal: bad tree"); // tree rev-parse fails
-
-			await expect(
-				writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg"),
-			).rejects.toThrow("Failed to get tree");
-		});
-
-		it("should throw on commit-tree failure", async () => {
-			mockSuccess("abc\n"); // orphanBranchExists
-			mockSuccess("parent\n"); // tip
-			mockSuccess("root_tree\n"); // tree
-			mockSpawnSuccess("blob\n"); // writeBlob
-			mockSuccess(""); // ls-tree -z
-			mockSpawnSuccess("new_tree\n"); // writeTree
-			mockFailure(128, "commit-tree error"); // commit-tree fails
-
-			await expect(
-				writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg"),
-			).rejects.toThrow("Failed to create commit");
-		});
-
-		it("should throw on update-ref failure", async () => {
-			mockSuccess("abc\n"); // orphanBranchExists
-			mockSuccess("parent\n"); // tip
-			mockSuccess("root_tree\n"); // tree
-			mockSpawnSuccess("blob\n"); // writeBlob
-			mockSuccess(""); // ls-tree -z
-			mockSpawnSuccess("new_tree\n"); // writeTree
-			mockSuccess("new_commit\n"); // commit-tree
-			mockFailure(128, "update-ref error"); // update-ref fails
-
-			await expect(
-				writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg"),
-			).rejects.toThrow("Failed to update ref");
-		});
-
-		it("should delete files and collapse empty subdirectories in a single commit", async () => {
-			mockSuccess("abc\n"); // orphanBranchExists
-			mockSuccess("parent\n"); // tip
-			mockSuccess("root_tree\n"); // tree
-			// removeFileFromTree(root_tree, "transcripts/hash.json")
-			mockSuccess(
-				"040000 tree aabbccddeeff00112233445566778899aabbccdd\ttranscripts\n100644 blob a1b2c3d4\tindex.json\n",
-			); // ls-tree root_tree transcripts (no -z, used by removeFileFromTree regex)
-			mockSuccess(`100644 blob 11223344556677889900aabbccddeeff00112233\thash.json${NUL}`); // removeFromTree ls-tree -z sub_tree
-			mockSpawnSuccess("\n"); // writeTree("") => empty tree
-			mockSuccess(""); // ls-tree newSubTree empty (no -z, used by removeFileFromTree)
-			mockSuccess(
-				`040000 tree aabbccddeeff00112233445566778899aabbccdd\ttranscripts${NUL}100644 blob a1b2c3d4\tindex.json${NUL}`,
-			); // removeFromTree(root_tree, "transcripts") ls-tree -z
-			mockSpawnSuccess("pruned_root\n"); // writeTree(pruned root)
-			mockSuccess("new_commit\n"); // commit-tree
-			mockSuccess("\n"); // update-ref
-
-			await writeMultipleFilesToBranch(
-				"branch",
-				[{ path: "transcripts/hash.json", content: "", delete: true }],
-				"Delete transcript",
-			);
-
-			expect(mockExecFileAsync).toHaveBeenCalledWith(
-				"git",
-				expect.arrayContaining(["commit-tree", "pruned_root", "-p", "parent", "-m", "Delete transcript"]),
-				expect.any(Object),
-			);
-			expect(mockSpawn).toHaveBeenCalledTimes(2);
-		});
-
-		it("should ignore deletion when the target subdirectory does not exist", async () => {
-			mockSuccess("abc\n"); // orphanBranchExists
-			mockSuccess("parent\n"); // tip
-			mockSuccess("root_tree\n"); // tree
-			mockSuccess(""); // ls-tree root_tree missingDir
-			mockSuccess("new_commit\n"); // commit-tree
-			mockSuccess("\n"); // update-ref
-
-			await writeMultipleFilesToBranch(
-				"branch",
-				[{ path: "missing/file.json", content: "", delete: true }],
-				"Delete missing file",
-			);
-
 			expect(mockSpawn).not.toHaveBeenCalled();
 		});
 
-		it("should ignore deletion when the subdirectory tree entry is malformed", async () => {
-			mockSuccess("abc\n"); // orphanBranchExists
+		it("throws when GIT_AUTHOR_IDENT cannot be resolved", async () => {
+			mockSuccess("abc\n"); // ensureOrphanBranch
 			mockSuccess("parent\n"); // tip
-			mockSuccess("root_tree\n"); // tree
-			mockSuccess("100644 blob not-a-tree\ttranscripts\n"); // ls-tree root_tree transcripts
-			mockSuccess("new_commit\n"); // commit-tree
-			mockSuccess("\n"); // update-ref
+			mockFailure(128, "fatal: empty ident name"); // git var GIT_AUTHOR_IDENT
 
-			await writeMultipleFilesToBranch(
-				"branch",
-				[{ path: "transcripts/hash.json", content: "", delete: true }],
-				"Delete malformed nested file",
-			);
-
+			await expect(
+				writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg"),
+			).rejects.toThrow("Failed to read GIT_AUTHOR_IDENT");
 			expect(mockSpawn).not.toHaveBeenCalled();
-			expect(mockExecFileAsync).toHaveBeenCalledWith(
-				"git",
-				expect.arrayContaining([
-					"commit-tree",
-					"root_tree",
-					"-p",
-					"parent",
-					"-m",
-					"Delete malformed nested file",
-				]),
-				expect.any(Object),
-			);
 		});
 
-		it("should delete a nested file while keeping the parent subtree when entries remain", async () => {
-			mockSuccess("abc\n"); // orphanBranchExists
+		it("throws when GIT_COMMITTER_IDENT cannot be resolved", async () => {
+			mockSuccess("abc\n"); // ensureOrphanBranch
 			mockSuccess("parent\n"); // tip
-			mockSuccess("root_tree\n"); // tree
-			// removeFileFromTree(root_tree, "transcripts/hash.json"):
-			// 1. ls-tree root_tree transcripts (no -z, regex match)
-			mockSuccess(
-				"040000 tree aabbccddeeff00112233445566778899aabbccdd\ttranscripts\n100644 blob rootblob\tindex.json\n",
-			);
-			// 2. removeFromTree(subtree, "hash.json") → ls-tree -z subtree
-			mockSuccess(
-				`100644 blob 1111111111111111111111111111111111111111\thash.json${NUL}100644 blob 2222222222222222222222222222222222222222\tkeep.json${NUL}`,
-			);
-			// 3. writeTree(filtered entries)
-			mockSpawnSuccess("trimmed_subtree\n");
-			// 4. ls-tree trimmed_subtree (no -z, check if empty)
-			mockSuccess("100644 blob 2222222222222222222222222222222222222222\tkeep.json\n");
-			// 5. replaceInTree(root, "transcripts", tree) → ls-tree -z root
-			mockSuccess(
-				`040000 tree aabbccddeeff00112233445566778899aabbccdd\ttranscripts${NUL}100644 blob rootblob\tindex.json${NUL}`,
-			);
-			mockSpawnSuccess("updated_root\n"); // writeTree(updated root)
-			mockSuccess("new_commit\n"); // commit-tree
-			mockSuccess("\n"); // update-ref
+			mockSuccess("Alice <alice@example.com> 1700000000 +0000\n"); // GIT_AUTHOR_IDENT
+			mockFailure(128, "fatal: empty ident email"); // GIT_COMMITTER_IDENT
 
-			await writeMultipleFilesToBranch(
-				"branch",
-				[{ path: "transcripts/hash.json", content: "", delete: true }],
-				"Delete nested transcript only",
-			);
-
-			expect(mockExecFileAsync).toHaveBeenCalledWith(
-				"git",
-				expect.arrayContaining([
-					"commit-tree",
-					"updated_root",
-					"-p",
-					"parent",
-					"-m",
-					"Delete nested transcript only",
-				]),
-				expect.any(Object),
-			);
+			await expect(
+				writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg"),
+			).rejects.toThrow("Failed to read GIT_COMMITTER_IDENT");
+			expect(mockSpawn).not.toHaveBeenCalled();
 		});
 
-		it("should ignore deletion when the target file is missing from an existing subdirectory", async () => {
-			mockSuccess("abc\n"); // orphanBranchExists
-			mockSuccess("parent\n"); // tip
-			mockSuccess("root_tree\n"); // tree
-			// removeFileFromTree(root_tree, "transcripts/hash.json"):
-			// 1. ls-tree root_tree transcripts (no -z, regex)
-			mockSuccess(
-				"040000 tree aabbccddeeff00112233445566778899aabbccdd\ttranscripts\n100644 blob rootblob\tindex.json\n",
-			);
-			// 2. removeFromTree(subtree, "hash.json") → ls-tree -z — hash.json not found, no-op
-			mockSuccess(`100644 blob 2222222222222222222222222222222222222222\tkeep.json${NUL}`);
-			// 3. ls-tree newSubTree (no -z, check if empty) — unchanged, still non-empty
-			mockSuccess("100644 blob 2222222222222222222222222222222222222222\tkeep.json\n");
-			// 4. replaceInTree(root, "transcripts") → ls-tree -z root
-			mockSuccess(
-				`040000 tree aabbccddeeff00112233445566778899aabbccdd\ttranscripts${NUL}100644 blob rootblob\tindex.json${NUL}`,
-			);
-			mockSpawnSuccess("updated_root\n"); // writeTree(updated root)
-			mockSuccess("new_commit\n"); // commit-tree
-			mockSuccess("\n"); // update-ref
+		it("surfaces fast-import's exit code and stderr when the subprocess fails", async () => {
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnFailure(128, "fatal: Unsupported command: gibberish");
 
-			await writeMultipleFilesToBranch(
-				"branch",
-				[{ path: "transcripts/hash.json", content: "", delete: true }],
-				"Delete already-missing nested file",
-			);
+			await expect(
+				writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg"),
+			).rejects.toThrow(/git fast-import failed.*Unsupported command/);
+		});
 
-			expect(mockExecFileAsync).toHaveBeenCalledWith(
-				"git",
-				expect.arrayContaining([
-					"commit-tree",
-					"updated_root",
-					"-p",
-					"parent",
-					"-m",
-					"Delete already-missing nested file",
-				]),
-				expect.any(Object),
-			);
+		it("rejects (not crash) when stdin emits EPIPE during the streaming writes", async () => {
+			// Same regression guard as `batchReadFilesFromBranch` — the
+			// streaming-write helper must attach `proc.stdin.on('error', ...)`
+			// or async EPIPEs (fast-import OOM / bad `from <parent>` /
+			// signal during the body write) become unhandled stream errors
+			// that crash the Node process. We swap in a stdin that emits
+			// "error" instead of accepting writes and assert the promise
+			// rejects cleanly.
+			mockHappyPathPreamble("parent_hash");
+			const epipeError = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+			mockSpawn.mockImplementationOnce(() => {
+				const stdin = new EventEmitter() as EventEmitter & { write: typeof vi.fn; end: typeof vi.fn };
+				stdin.write = vi.fn();
+				stdin.end = vi.fn();
+				const proc = Object.assign(new EventEmitter(), {
+					stdin,
+					stdout: new EventEmitter(),
+					stderr: new EventEmitter(),
+				});
+				queueMicrotask(() => {
+					stdin.emit("error", epipeError);
+				});
+				return proc;
+			});
+
+			await expect(
+				writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg"),
+			).rejects.toThrow("write EPIPE");
 		});
 	});
 
