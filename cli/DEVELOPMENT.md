@@ -117,7 +117,9 @@ jolli status
 
 | Module | Build Output | Purpose |
 |--------|-------------|---------|
-| [Cli.ts](src/Cli.ts) | `dist/Cli.js` | CLI commands — Memory: `enable` / `disable` / `status` / `doctor` / `clean` / `view` / `export` / `recall` / `search` / `configure` / `migrate`; Auth: `auth login` / `logout` / `status`; Site: `new` / `convert` / `dev` / `build` / `start` |
+| [Cli.ts](src/Cli.ts) | `dist/Cli.js` | CLI commands — Memory: `enable` / `disable` / `status` / `doctor` / `clean` / `heal-folder` / `view` / `export` / `recall` / `search` / `configure` / `migrate`; Auth: `auth login` / `logout` / `status`; Site: `new` / `convert` / `dev` / `build` / `start`. Delegates command registration to per-command modules under `src/commands/` and to `Api.registerCli` so the same registration pipeline is reusable by plugins and the test harness. |
+| [Api.ts](src/Api.ts) | `dist/Api.js` | Public API entry (`@jolli.ai/cli/api`). Exports `PluginContext`, `PluginRegister`, `parseJolliApiKey`, `parseBaseUrl`; runs `loadPlugins` after built-in command registration so plugins can append subcommands without touching `Cli.ts`. Backed by an `exports` field in `package.json` that explicitly blocks deep `@jolli.ai/cli/dist/*` imports. |
+| [PluginLoader.ts](src/PluginLoader.ts) | inlined in `dist/Api.js` | Plugin discovery — scans the current git project's `node_modules` and the global npm root for entries on the `KNOWN_PLUGINS` allow-list, validates the plugin's `peerDependencies['@jolli.ai/cli']` range against the host's `VERSION`, and invokes the plugin's `register(ctx)` once. Non-throwing — a broken plugin logs and is skipped, never blocks the CLI. Disabled entirely by `JOLLI_NO_PLUGINS=1`. |
 | [StopHook.ts](src/hooks/StopHook.ts) | `dist/StopHook.js` | Claude Code Stop event handler |
 | [SessionStartHook.ts](src/hooks/SessionStartHook.ts) | `dist/SessionStartHook.js` | Claude Code SessionStart hook (injects mini-briefing) |
 | [PostCommitHook.ts](src/hooks/PostCommitHook.ts) | `dist/PostCommitHook.js` | Git post-commit hook (operation detection + queue enqueue + worker spawn) |
@@ -157,6 +159,15 @@ jolli status
 | [SummaryMigration.ts](src/core/SummaryMigration.ts) | v1→v3 migration logic for legacy orphan branch data |
 | [GitOperationDetector.ts](src/hooks/GitOperationDetector.ts) | Detects git operation type (commit, amend, squash, rebase, cherry-pick, revert) |
 | [Installer.ts](src/install/Installer.ts) | Installs/removes hooks in Claude Code, Gemini, and git |
+| [LinearIssueExtractor.ts](src/core/LinearIssueExtractor.ts) / [LinearIssueStore.ts](src/core/LinearIssueStore.ts) | Linear issue extraction (MCP tool-call scanner) + per-commit issue store. Extractor walks transcripts for `mcp__claude_ai_Linear__*` calls and normalises them into `LinearIssue[]`. Store persists issues to the orphan branch with the same hoist-on-rebase / merge-on-squash semantics as Plans and Notes (see `QueueWorker.runSquashPipeline` for the integration). |
+| [ActiveSessionAggregator.ts](src/core/ActiveSessionAggregator.ts) | Aggregates active sessions across every source (Claude / Codex / Gemini / OpenCode / Cursor / Copilot CLI / Copilot Chat) into a single `ActiveSession[]` snapshot. Powers the VS Code **Conversations** sidebar section; safe to poll because every per-source detector + reader is feature-gated and cheap. |
+| [ConversationOverlayStore.ts](src/core/ConversationOverlayStore.ts) | Persists per-session **transcript edit overlays** — the curated turn list a user produced in the Conversation Details panel. Stored locally per-project; consulted by the summarization pipeline so the LLM sees the user's curated version, not the raw transcript. |
+| [CommitSelectionStore.ts](src/core/CommitSelectionStore.ts) | Per-project on-disk store for the **per-item commit selection** state (plans / notes / conversations / files unchecked from the next commit's memory). Selections persist across commits and restarts; the worker consults this store when assembling the LLM context. |
+| [Regenerator.ts](src/core/Regenerator.ts) / [RegenerateContext.ts](src/core/RegenerateContext.ts) | The "Regenerate Summary" backend. `RegenerateContext` rebuilds the full v4 tree context (transcripts + diff + plans/notes + Linear) for a given commit hash; `Regenerator` drives the LLM call with explicit stale-write guards so an amend / squash mid-regenerate cannot clobber the new history. |
+| [TranscriptSourceLabel.ts](src/core/TranscriptSourceLabel.ts) | Maps a transcript's source (`anthropic-config` / `anthropic-env` / `jolli-proxy` / per-agent labels) to the human-readable provider label rendered in the Summary Webview footer. |
+| [HealFolderCommand.ts](src/commands/HealFolderCommand.ts) | `jolli heal-folder` — re-renders missing visible Markdown files under the Memory Bank folder from the canonical hidden JSON. Driven by `FolderStorage.healMissingVisibleMarkdown`; safe to re-run, never touches the orphan branch or the canonical JSON. |
+| [DeviceLabel.ts](src/auth/DeviceLabel.ts) | Computes a server-accepted `device_label` (hostname + OS, length-clamped) for the OAuth login URL so the Jolli web UI can name authorized sessions. Mirrored in IntelliJ's `JolliAuthService`. |
+| [Subprocess.ts](src/util/Subprocess.ts) | The single allowed wrapper around `node:child_process`. Sets `windowsHide` consistently to suppress the brief console-window flicker that bare `spawn`/`execFile` calls produced on Windows. Biome bans direct `child_process` imports across both `cli/` and `vscode/` to keep this from regressing. |
 
 ## Display-Layer Conventions
 
@@ -325,6 +336,7 @@ If an existing hook file exists, Jolli Memory's section is appended. On uninstal
 ## Concurrency and Safety
 
 - **File lock**: `.jolli/jollimemory/lock` prevents concurrent worker runs. Uses `writeFile` with `wx` flag (exclusive create). Stale locks (>5 min) are auto-removed.
+- **Per-vault write lock**: `~/.jolli/jollimemory/locks/vault-<sha256>.lock` (separate from the per-worktree worker lock) serialises Memory Bank writes between a `QueueWorker` drain and a sync round that share one vault. See [Memory Bank Cloud Sync → Vault-write lock](#vault-write-lock-sync--worker).
 - **Operation queue**: Each git operation gets its own queue file — no single-slot overwriting.
 - **Detached worker**: The post-commit hook spawns a detached child process so `git commit` returns instantly.
 - **Chain spawn**: After draining the queue, the worker checks for new entries and spawns a successor if needed.
@@ -358,12 +370,184 @@ All errors are logged to `.jolli/jollimemory/debug.log`. The tool is designed to
 | `config.json` | Configuration (API keys, model, integrations) |
 | `plans.json` | Plans and notes registry (association with commits) |
 | `scope.json` | Installation scope (project or global) |
-| `lock` | Concurrency lock file |
+| `lock` | Per-worktree worker concurrency lock file |
+| `locks/vault-<sha256>.lock` | Global (`~/.jolli/jollimemory/`) per-vault write lock; `locks/vault-<sha256>-pending/` holds the cross-repo `PendingWorkers` wakeup registry |
 | `dist-path` | Global file (`~/.jolli/jollimemory/`) pointing to the active dist/ directory |
 | `resolve-dist-path` | Global shell script (`~/.jolli/jollimemory/`) that reads the global dist-path |
 | `debug.log` | Debug/error log |
 | `git-op-queue/*.json` | Pending git operation queue entries |
 | `squash-pending.json` | Temporary cross-hook file for squash detection |
+
+## Plugin Loader
+
+Starting in 0.99.2, `@jolli.ai/cli` discovers and loads allow-listed plugin packages that register additional subcommands. Discovery and registration live in [PluginLoader.ts](src/PluginLoader.ts); the public API surface they consume lives in [Api.ts](src/Api.ts).
+
+### Discovery shape
+
+```
+Api.registerCli(program, version)
+    │
+    ├── built-in commands registered (Cli.ts route)
+    │
+    └── loadPlugins(program, version)
+            │
+            ├── if process.env.JOLLI_NO_PLUGINS === "1" → return early
+            │
+            ├── boundary = nearest .git ancestor of cwd, else $HOME
+            │   roots     = walk(cwd → boundary).map(d => d/node_modules)
+            │            ++ [npm root -g]
+            │   (Each node_modules between cwd and boundary is included,
+            │    so hoisted packages in pnpm / Yarn-workspaces monorepos
+            │    are discovered. If cwd sits outside any .git project and
+            │    outside $HOME, the local walk is skipped and only the
+            │    global root is scanned.)
+            │
+            ├── for name in KNOWN_PLUGINS:
+            │     for each root that contains node_modules/<name>:
+            │       1. read plugin package.json
+            │       2. verify peerDependencies["@jolli.ai/cli"] semver
+            │          range matches host VERSION
+            │       3. dynamic import + plugin.register(ctx)
+            │
+            └── any plugin error → log + skip (never throws upward)
+```
+
+### Why an allow-list
+
+`KNOWN_PLUGINS` is a fixed array baked into the CLI build, not a config flag. A malicious package on disk cannot register itself by being installed — its name has to also appear on the allow-list, which requires a CLI release. This pairs with the bounded discovery roots: even with a hostile `node_modules`, the worst case is that an allow-listed package is loaded from a path it shouldn't have been installed to, not arbitrary code execution.
+
+### Plugin contract (`Api.ts`)
+
+| Export | Purpose |
+| --- | --- |
+| `PluginContext` | Carried into the plugin's `register(ctx)` — exposes the host's `commander` program, the resolved CLI version, the user config, and a small set of factory helpers. |
+| `PluginRegister` | The `(ctx: PluginContext) => void \| Promise<void>` shape every plugin's default export must satisfy. |
+| `parseJolliApiKey`, `parseBaseUrl` | Canonical key/URL parsers re-exported so plugins don't have to bundle their own copy (they would drift from the CLI's allow-list). |
+
+The `exports` field in `cli/package.json` is what enforces this: `@jolli.ai/cli` and `@jolli.ai/cli/api` are the only resolvable specifiers. Deep imports like `@jolli.ai/cli/dist/core/Foo.js` no longer resolve — plugins that relied on them must move to the public API.
+
+## Memory Bank Cloud Sync
+
+`cli/src/sync/` holds the engine that keeps the user's Memory Bank folder mirrored to a private Jolli vault. The engine is shipped in `dist/Cli.js` and inlined into the VS Code extension, but `@jolli.ai/cli` itself does **not** auto-trigger sync rounds today — the long-lived plugin process (currently VS Code only) is what drives the cadence. The CLI side exposes config (`syncEnabled`, `syncTranscripts`, `syncPollIntervalSec`) and the `configure --sync-enable / --sync-disable` shortcuts.
+
+### Engine shape
+
+```
+SyncBootstrap.runRound()
+    │
+    ├── SyncLock.acquire()                  ← machine-wide `sync.lock`, serialises
+    │                                          sync-vs-sync only (10 s timeout)
+    │
+    ├── BackendClient.mintCredential()      ← short-lived per-round token
+    │
+    ├── GitClient.cloneOrFetch(vaultRepo)   ← first time: clone (binds vault
+    │                                          to space via VaultMarker);
+    │                                          subsequent: fetch
+    │
+    ├── self-heal (idempotent, before pull):
+    │     2b. abort a stale `.git/rebase-merge|apply` left by a killed round
+    │     2c. sweep stale `.git/*.lock` corpses (TTL 5 min)
+    │
+    ├── withPullLock(memoryBankRoot):       ← VaultWriteLock — per-vault writer
+    │     │                                    lock; the ONLY window sync holds it
+    │     ├── GitClient.pullRebase()
+    │     └── ConflictResolver.resolveAll()  ← three-tier:
+    │           1. AggregateMerge: deterministic merge of the four
+    │              .jolli/<aggregate>.json files (manifest / index /
+    │              branches / catalog) — never prompts
+    │           2. LocalAiMergeProvider: AI merge (uses apiKey when set)
+    │              for other-file conflicts
+    │           3. Manual binary pick (last resort, surfaced to UI)
+    │
+    ├── auto-reconcile user edits → stageVault → `[jolli-mb] reconcile: …` commit
+    │
+    ├── MemoryBankBootstrap.mirror()        ← rsync-shaped diff:
+    │                                          fs ←→ vault working tree
+    │
+    ├── stageVault()                        ← ALLOWLIST staging (not `git add --all`):
+    │                                          classifyVaultPath gates every entry;
+    │                                          symlinked / unowned paths refused
+    │
+    ├── GitClient.commit + push → `[jolli-mb] sync: …`
+    │
+    ├── SyncStateStore.recordRound()        ← updates four-state status
+    │                                          (synced / syncing / conflicts /
+    │                                          offline)
+    │
+    └── PendingWorkers.drain()              ← wake cross-repo QueueWorkers that
+                                              timed out on the vault-write lock
+```
+
+### Space binding (the 412 path)
+
+`VaultMarker` writes a small file inside the vault that binds the clone to a specific Jolli space. If the backend returns **412** on a round (the vault was rebound to a different space, or the user signed into a different account), the engine does NOT silently clobber — `SyncEngine` raises a binding-required failure and surfaces a UI dialog that lets the user re-bind explicitly. This is what stopped the prior "two users on one machine quietly overwrite each other" failure mode.
+
+### `GitAskpass` and credentials
+
+`GitAskpass.ts` writes a one-shot helper script that `GitClient` points `GIT_ASKPASS` at, so each `git push` reads the freshly minted credential from a per-round env var instead of either persisting it to `~/.git-credentials` or echoing it onto the command line. Combined with `AllowList.ts` (which restricts the vault to a fixed set of hostnames), this keeps long-lived secrets off disk.
+
+### Allowlist staging (`stageVault`)
+
+Every staging site in the engine goes through `stageVault` instead of `git add --all`. The vault at `<localFolder>/` hosts many source repos as sibling `<repoFolder>/` subtrees, so a blanket `git add` would happily commit anything a foreign tool — or a hostile placement — dropped into the folder. `stageVault` snapshots `git status --porcelain -z` (parsed by the shared `PorcelainParser`, which also decomposes renames into discrete add/delete ops so each classifies independently), runs every path through `classifyVaultPath`, and stages with `git add -f` **only** paths that classify to a non-null `OwnedPathKind`. The `-f` is deliberate: the classifier — not `.gitignore` — is the staging authority.
+
+`OwnedPathKind` is a **closed** tagged union of the FolderStorage / RepoMapping write families (`repo-config`, `summary`, `transcript`, `plan`, `visible-summary`, …). Adding a new FolderStorage write type requires adding a kind here, and a round-trip integration test enforces "every FolderStorage write path classifies to non-null" so a write that bypasses the catalogue is caught immediately. Two kinds are pointedly excluded: `shadow-status.json` (per-device recovery state, meaningless to peers) and the quarantine subtrees (locally gitignored).
+
+`stageVault` returns a `StageReport` whose `unowned` and `symlinked` arrays are the **canary signals**: non-empty means either FolderStorage grew a write site the classifier doesn't recognise (drift) or a foreign writer touched the vault. SyncEngine folds these into a per-round `canary` accumulator and warn-logs them — they are what dogfood watchers grep for. `transcript` entries are dropped (counted as `skipped`) when `syncTranscripts: false`.
+
+### Vault-write lock (sync ↔ worker)
+
+`VaultWriteLock` is a **per-vault** writer lock distinct from the two existing locks: `sync.lock` is machine-wide and serialises sync-vs-sync; `worker.lock` is per-worktree. Neither closes the sync-vs-worker race, where a `QueueWorker` for repo B writes into `<localFolder>/<repoB>/.jolli/…` while a sync round reads `git status` against the same vault — tearing the worker's multi-file write across the status snapshot. The lock file lives **outside** the vault at `~/.jolli/jollimemory/locks/vault-<sha256(canonical)>.lock` (derived by `VaultLockPath`, because the vault's `.git/` may not exist yet when a worker needs the lock before any storage construction).
+
+The two acquirers hold it for **asymmetric** windows by design:
+
+- **QueueWorker** holds it for the entire drain (a summary is N files: canonical JSON + visible Markdown + aggregate index updates) — it can't release between files without re-opening the tear window.
+- **SyncEngine** holds it only across `withPullLock` (pullRebase + conflict resolution). Pre/post-pull phases run unlocked because holding it for the whole 30–90 s round would make a user's `git commit` in the source repo wait the full round before its summary appears. This accepts a benign, eventually-consistent tradeoff (a concurrent worker write may land partially in one git commit and finish in the next round) in exchange for the UX; the race it *definitively* closes is "worker writes land in the paused-rebase window," which is fully inside `withPullLock`.
+
+When repo B's worker times out (60 s) waiting on the lock, it records its cwd in `PendingWorkers` — a per-vault registry sibling to the lock file. Whoever releases the lock (sync round complete, or another worker's drain finishing) drains the registry and re-spawns those workers, so a cross-repo worker that gave up isn't stranded until repo B's next commit.
+
+### Symlink safety
+
+`VaultSymlinkGuard.assertNoSymlinksInPath` checks the **whole directory chain** from `vaultRoot` to a target before any `mkdir`/`write`/`rename`, refusing the write if any segment is a symlink — closing the intermediate-segment escape (`<repoFolder>/.jolli → /etc`) that a leaf-level `O_NOFOLLOW` can't catch. It replaces the deleted `SymlinkSweep` quarantine pass, which tree-walked and *moved* user files every round (the UX complaint that retired it); the guard instead refuses unsafe writes at write time and names the rogue path in a warn log. Paired with `core.symlinks=false` (forced on every `GitClient` invocation), the two layers cover both inbound (hostile mode-120000 tree entries materialise as plain files) and outbound (no traversal through a planted link) directions. `stageVault` also refuses to stage any path with a symlink in its chain, routing it to the `symlinked` canary.
+
+### Self-healing a killed round
+
+A round killed mid-flight (VSIX reinstall SIGTERM, laptop sleep, crash) can leave the vault's git state wedged in a way that makes every subsequent round fail with a sticky, unactionable error. Before pulling, the engine self-heals two such states (both idempotent, both no-ops on the cold-clone path):
+
+- **Stale rebase** (`.git/rebase-merge|apply`) → `rebase --abort`. Safe to abort unconditionally because the vault working tree is exclusively SyncEngine-driven; the user's real edits live in a separate `[jolli-mb] reconcile: …` commit already on the default branch, which survives the abort.
+- **Stale `.git/*.lock` corpses** (`index.lock`, `HEAD.lock`, `refs/**.lock`, …) → swept if older than a 5-minute TTL (engine ops finish in milliseconds, so a 5-min lock is definitively a corpse, while an out-of-band manual `git` op the user ran in the folder isn't ripped out from under them).
+
+### What lives where
+
+| Module | Purpose |
+| --- | --- |
+| [SyncEngine.ts](src/sync/SyncEngine.ts) | High-level round driver — wires every other module together. Test surface is via injectable factories rather than monkey-patching globals. |
+| [SyncBootstrap.ts](src/sync/SyncBootstrap.ts) | Per-round bootstrap (lock acquire → mint credential → clone-or-fetch → mirror → resolve → commit-push → record state). |
+| [SyncLock.ts](src/sync/SyncLock.ts) | Per-machine file lock (`pending` + ttl), `DEFAULT_SYNC_LOCK_TIMEOUT_MS = 10_000`, poll = 100 ms. |
+| [BackendClient.ts](src/sync/BackendClient.ts) | Jolli backend HTTP client — mints credentials, reports state, handles the 412 binding case. |
+| [GitClient.ts](src/sync/GitClient.ts) + [GitAskpass.ts](src/sync/GitAskpass.ts) | Git invocations against the vault; askpass shim so credentials never persist. |
+| [MemoryBankBootstrap.ts](src/sync/MemoryBankBootstrap.ts) | Diffs the local Memory Bank folder against the vault working tree and stages changes. |
+| [StageVault.ts](src/sync/StageVault.ts) | Allowlist staging — replaces `git add --all` at every staging site; classifies each `git status` entry and stages only owned paths, returning the canary `StageReport`. |
+| [VaultPathClassifier.ts](src/sync/VaultPathClassifier.ts) + [OwnedPathKind.ts](src/sync/OwnedPathKind.ts) | Pure `classifyVaultPath(relPath)` → `OwnedPathKind \| null`; the closed catalogue of vault-owned write families. Instance-free on purpose (constructing `FolderStorage` claims a KB path too early). |
+| [PorcelainParser.ts](src/sync/PorcelainParser.ts) | NUL-record-aware `git status --porcelain -z` parser shared by `listDirtyPaths` and `stageVault` (handles rename source-path trailers). |
+| [VaultSymlinkGuard.ts](src/sync/VaultSymlinkGuard.ts) | Refuses any write whose vault→target path chain contains a symlink; replaces the deleted `SymlinkSweep` quarantine pass. |
+| [VaultWriteLock.ts](src/sync/VaultWriteLock.ts) + [VaultLockPath.ts](src/sync/VaultLockPath.ts) | Per-vault writer lock serialising sync-vs-worker (and worker-vs-worker across repos sharing a vault); lock file lives outside the vault, path derived from a canonicalised `localFolder`. |
+| [PendingWorkers.ts](src/sync/PendingWorkers.ts) | Cross-repo wakeup registry — workers that time out on the vault-write lock record their cwd; lock releasers re-spawn them. |
+| [ConflictResolver.ts](src/sync/ConflictResolver.ts) | Three-tier resolution (`AggregateMerge` → `LocalAiMergeProvider` → manual). |
+| [AggregateMerge.ts](src/sync/AggregateMerge.ts) | Deterministic merge for the four `.jolli/<aggregate>.json` files. |
+| [LocalAiMergeProvider.ts](src/sync/LocalAiMergeProvider.ts) | AI-driven merge for content files (gated on `apiKey`). |
+| [LegacyMigration.ts](src/sync/LegacyMigration.ts) | One-shot import of Web-UI-only personal-space content into a `legacy/` subtree on the first sync of an unbacked space. |
+| [VaultMarker.ts](src/sync/VaultMarker.ts) + [AllowList.ts](src/sync/AllowList.ts) | Space binding marker file + hostname allow-list. |
+| [RepoIdentity.ts](src/sync/RepoIdentity.ts) + [RepoMapping.ts](src/sync/RepoMapping.ts) | Stable repo identity (origin URL + bootstrap hash) → vault-subfolder mapping. |
+| [SyncStateStore.ts](src/sync/SyncStateStore.ts) | Persists the four-state status used by the status-bar indicator. |
+| [CorruptJsonQuarantine.ts](src/sync/CorruptJsonQuarantine.ts) | Quarantines unreadable `.jolli/<aggregate>.json` files into a side directory so a single corrupt file never blocks the whole round. |
+| [CliConflictUi.ts](src/sync/CliConflictUi.ts) | CLI-side conflict prompt (kept thin — most conflict UI lives in the editor plugins). |
+
+Architecture rules:
+
+- **No backend coupling outside `BackendClient`.** Other modules only see typed result objects.
+- **Every git invocation goes through `GitClient`.** Never call `git` directly from a sync module — `GitAskpass` + `windowsHide` go missing otherwise.
+- **`AggregateMerge` is the only deterministic merge.** Anything else routes through `LocalAiMergeProvider` first; only after that fails does the UI get a manual prompt.
+- **`classifyVaultPath` is the staging authority, not `.gitignore`.** Never reintroduce `git add --all` in the engine — a new FolderStorage write type means a new `OwnedPathKind`, not a wildcard add. The `unowned` / `symlinked` canary buckets are a feature; don't suppress them.
 
 ## Site Generation: OpenAPI Reference Pipeline
 

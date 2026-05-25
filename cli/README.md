@@ -259,7 +259,7 @@ jolli configure --set excludePatterns=docs/**,*.log,node_modules
 jolli configure --remove jolliApiKey
 ```
 
-Supported keys: `apiKey`, `aiProvider`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `localFolder`, `logLevel`, `excludePatterns`, `syncEnabled`, `syncTranscripts`, `syncPollIntervalSec`. `aiProvider` pins the summarization backend (`"anthropic"` or `"jolli"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. `localFolder` is the Memory Bank root on disk where every memory is dual-written. `syncEnabled` opts the Memory Bank into cloud sync (VS Code plugin only — the CLI has no auto-sync trigger). Convenience flags: `--sync-enable` / `--sync-disable` toggle `syncEnabled` without writing the long key form. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
+Supported keys: `apiKey`, `aiProvider`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `localFolder`, `logLevel`, `excludePatterns`, `syncEnabled`, `syncTranscripts`, `syncPollIntervalSec`. `aiProvider` pins the summarization backend (`"anthropic"` or `"jolli"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch. `localFolder` is the Memory Bank root on disk where every memory is dual-written. The `sync*` keys drive cloud sync (plugin-driven — see [Memory Bank cloud sync](#memory-bank-cloud-sync-plugin-driven) below); `--sync-enable` / `--sync-disable` are shortcuts for toggling `syncEnabled` without the long key form. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
 
 ### Memory Bank cloud sync (plugin-driven)
 
@@ -304,6 +304,20 @@ jolli clean --yes
 
 **Safety**: in a non-TTY environment (CI, pipes, redirected stdin), `clean` refuses to delete without `--yes` and exits with code 1. This prevents scripts from silently wiping data.
 
+### `jolli heal-folder`
+
+Restores missing Markdown files in the Memory Bank folder by re-rendering them from the canonical hidden JSON (`<localFolder>/<repo>/.jolli/summaries/<hash>.json`). Useful when you (or another tool) accidentally deleted a `.md` file you wanted to keep — the orphan-branch entry and the hidden JSON remain authoritative, so re-rendering brings the visible Markdown back without re-running the LLM.
+
+```bash
+# Heal the current repo's Memory Bank folder
+jolli heal-folder
+
+# Heal a specific project directory
+jolli heal-folder --cwd /path/to/repo
+```
+
+Healing is also exposed by the editor extensions; running the CLI form is equivalent.
+
 ## Session Context Recall
 
 Jolli Memory feeds prior development context back into your AI agent so it can pick up where you (or a teammate) left off.
@@ -337,6 +351,7 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 | `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |
 | `localFolder` | string | — | Memory Bank root on disk — every memory is dual-written here as Markdown alongside the orphan-branch copy. Set via the editor extensions' Memory Bank Settings tab. |
 | `excludePatterns` | string[] | — | Glob patterns for file exclusion (set via `jolli configure --set excludePatterns=glob1,glob2`) |
+| `syncTranscripts` | boolean | `false` | When the editor plugin's sync is enabled, also mirror raw conversation transcripts (not just summaries) into the personal vault. Off by default so transcripts stay local unless you opt in. |
 
 **Authentication setup** — three options:
 
@@ -395,6 +410,22 @@ Each summary uses a **v3 tree structure**. A single commit can cover multiple in
 ## VSCode Extension
 
 The [Jolli Memory VS Code Extension](https://marketplace.visualstudio.com/items?itemName=jolli.jollimemory-vscode) adds a sidebar with three tabs (Branch / Memory Bank / Status) and a per-commit Summary Webview, plus a 5-tab Settings page. If you have both the CLI and the extension installed, they share the same data — the extension bundles the CLI inline so it works whether or not a global CLI install is also present.
+
+## Plugins
+
+Starting in 0.99.2, `@jolli.ai/cli` can discover and load allow-listed plugin packages and let them register additional subcommands. Discovery is bounded: the CLI walks `node_modules/` directories upward from the current working directory, stopping at the nearest `.git` ancestor (or your home directory if none is found), and also consults the global npm root. The allow-list is fixed at the CLI level, so a malicious package cannot register itself merely by being on disk.
+
+```bash
+# Install (your existing jolli install is unchanged)
+# Replace <plugin> with an allow-listed package name — see KNOWN_PLUGINS
+# in cli/src/PluginLoader.ts for the current list.
+npm install -g <plugin>
+
+# Disable plugin loading entirely
+JOLLI_NO_PLUGINS=1 jolli <command>
+```
+
+Plugins use a small public API exported from `@jolli.ai/cli/api` (`PluginContext`, `PluginRegister`, `parseJolliApiKey`, `parseBaseUrl`). See [SECURITY.md](https://github.com/jolliai/jolliai/blob/main/SECURITY.md#operational-guidance) for the operational guidance and trust model.
 
 ## Error Handling
 

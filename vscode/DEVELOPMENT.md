@@ -110,7 +110,8 @@ src/
 │   └── CommitsStore.ts           # Branch commits + range selection
 │
 ├── services/                     # Stateless services
-│   ├── AuthService.ts            # OAuth callback URI handling (code-exchange flow + CSRF state validation per RFC 6749), sign-in / sign-out, jollimemory.signedIn context key
+│   ├── AuthService.ts            # OAuth callback URI handling (code-exchange flow + CSRF state validation per RFC 6749), sign-in / sign-out, jollimemory.signedIn context key. Carries `device_label` (hostname + OS) and `client_version` into the OAuth URL so the Jolli web UI can name authorized sessions, and preserves the per-flow nonce across the `openExternal=false` Copy URL path so the manual fallback still completes a sign-in.
+│   ├── ActiveSessionsProvider.ts # Background poller over the seven per-source session aggregators. Powers the Branch tab's CONVERSATIONS section — emits `ActiveSession[]` snapshots that the sidebar webview renders without manual refresh.
 │   ├── ManualDisableFlag.ts      # Durable per-repo opt-out for auto-enable (set when user clicks Disable; respected on every activation)
 │   ├── JolliPushService.ts       # HTTP client for pushing summaries to a Jolli Space
 │   ├── PrCommentService.ts       # GitHub PR creation/update via gh CLI; PR section markers
@@ -146,10 +147,15 @@ src/
 │   ├── BranchSummaryLoader.ts            # Walks the branch and loads every commit's stored summary for the aggregate PR builder
 │   ├── SummaryUtils.ts                   # Shared helpers (HTML escaping, date formatting, topic sorting)
 │   │
-│   ├── SettingsWebviewPanel.ts           # Singleton 5-tab settings form (AI Agents / AI Summary / Sync to Jolli / Memory Bank / Others)
+│   ├── SettingsWebviewPanel.ts           # Singleton 5-tab settings form (AI Agents / AI Summary / Sync to Jolli / Memory Bank / Others). Others tab adds the `dcoSignoff` toggle.
 │   ├── SettingsHtmlBuilder.ts
 │   ├── SettingsCssBuilder.ts
 │   ├── SettingsScriptBuilder.ts
+│   │
+│   ├── ConversationDetailsPanel.ts        # Per-session transcript editor opened from the CONVERSATIONS section. Browse, edit, restore, or delete individual turns; on save, writes a `ConversationOverlay` to disk that the summarization pipeline consults at commit time so the LLM sees the curated version, not the raw transcript.
+│   ├── ConversationDetailsHtmlBuilder.ts  # HTML for the transcript editor (turn list, per-turn actions, restore-all)
+│   ├── ConversationDetailsScriptBuilder.ts  # Embedded JS — turn selection, edit/restore/delete actions, message bus to the panel host
+│   ├── TranscriptEntryRenderer.ts         # Shared per-turn renderer used by both the Summary Webview "All Conversations" section and the Conversation Details panel
 │   │
 │   └── NoteEditorWebviewPanel.ts         # Singleton "Add Text Snippet" editor
 │       NoteEditorHtmlBuilder.ts / NoteEditorCssBuilder.ts / NoteEditorScriptBuilder.ts
@@ -268,7 +274,23 @@ Both panels are singletons (one instance at a time, focused if reopened) and use
 
 **Aggregate PR descriptions for multi-commit branches** — `BranchSummaryLoader` walks every commit between the branch's fork point and HEAD and loads each commit's stored summary; `SummaryPrAggregateMarkdownBuilder` then composes a single PR description with one collapsible `<details>` block per topic across all commits, preceded by Plans and the E2E Test Guide. The single-commit code path is unchanged (`SummaryPrMarkdownBuilder`); `PrCommentService` picks the right builder based on commit count.
 
-**Memory Bank folder mode** — Memory Bank is on by default. `StorageFactory.createStorage` defaults to `"dual-write"`, so every commit's hooks write the memory to **both** the orphan branch and the configured Memory Bank folder; no `setActiveStorage()` toggle is involved at runtime. The orphan branch stays the system of record (reads come from there); the folder mirror is derivable from it. The Memory Bank sidebar tab renders a branch-aware folder view via `KnowledgeBaseTreeProvider` (the class name still uses the legacy "KnowledgeBase" identifier; the user-facing label is "Memory Bank").
+**Regenerate Summary + stale-write guards** — Every Summary Webview has a **Regenerate** action backed by the CLI's `Regenerator` + `RegenerateContext` modules. While a regenerate call is in flight, `SummaryWebviewPanel` switches the page into a `regenerating-readonly` state (CSS class on the root element dims topics + recap, disables every write action, and shows an inline banner explaining the wait). Every write path on the panel (push, edit, regenerate, plan/note add-remove, …) re-checks the commit hash inside the race window via `JolliMemoryBridge.assertCommitStillCurrent()` before writing — if the hash has changed on disk between the user's click and the LLM call completing, the write is rejected with a clear "commit has been rewritten" error rather than silently clobbering. The same hash re-check guards the regenerate response handler itself, so an amend / squash that lands mid-regenerate cannot clobber the new history.
+
+**Stale-rewritten-commit read-only mode** — When a commit shown in a Summary Webview is rewritten (amend / squash / rebase / branch-switch) while the panel is open, the panel is **not** disposed. Instead `SummaryWebviewPanel` flips into a persistent stale-read-only mode: the warning banner explains that the commit has been rewritten and that the panel will not accept new writes; the same body content remains readable so the user can copy out anything they were drafting. This replaces the prior "dispose mid-edit" behaviour that caused users to lose in-progress edits during squash. See `SummaryCssBuilder` (`stale-readonly` + `regenerating-readonly` classes) and the corresponding `SummaryScriptBuilder` handlers.
+
+**Linear issues in the Summary Webview** — When the AI conversation calls the Linear MCP server, the issues are extracted at commit time on the CLI side (`LinearIssueExtractor` → `LinearIssueStore`). The extension renders them as their own panel section between Plans & Notes and E2E Test Guide (`SummaryHtmlBuilder.renderLinearIssues`), embeds them into the Markdown export (`SummaryMarkdownBuilder`), and into the PR description (`SummaryPrMarkdownBuilder` / `SummaryPrAggregateMarkdownBuilder`). Linear issues are hoisted onto the consolidated root on squash / rebase by `QueueWorker.runSquashPipeline` exactly the same way Plans and Notes are, so the link follows the commit through history rewrites.
+
+**Active Conversations sidebar + per-turn editing** — `ActiveSessionsProvider` polls every per-source aggregator on a short cadence and emits `ActiveSession[]` to the sidebar webview, which renders the CONVERSATIONS section in the Branch tab. Clicking a session opens `ConversationDetailsPanel` — a dedicated webview that shows every turn with edit / delete / restore actions. Edits are persisted as a `ConversationOverlay` (per-session JSON under the project's `.jolli/jollimemory/`) and the summarization pipeline consults the overlay at commit time, so the next memory is generated from the curated version. `TranscriptEntryRenderer` is shared between the Conversation Details panel and the Summary Webview's "All Conversations" section to keep the per-turn rendering identical.
+
+**Per-item commit selection** — Plans, notes, conversations, and files can each be unchecked from the next commit's memory via per-row checkboxes in the Branch tab. Selections are persisted by the CLI's `CommitSelectionStore` (per-project file) so they survive commits and restarts; `SidebarScriptBuilder` and `SidebarMessages` carry the toggle events to the host. The post-commit pipeline consults the same store when assembling the LLM context — anything the user excluded is omitted from the prompt, not just the UI.
+
+**Rich hover cards on Plans panel** — The Plans & Notes section in the Branch tab uses `vscode.MarkdownString`-backed hover cards built by `FormatUtils` + `PlansTreeProvider`, showing the title, source path, last-updated time, and a snippet of the body. The card is built lazily on first hover; the regression that lost the panel's scroll position on refresh is fixed by reusing the existing TreeItem identity instead of recreating items.
+
+**Opt-in DCO sign-off on AI Commit** — Settings → Others adds the **DCO sign-off** toggle, backed by the new CLI `dcoSignoff` config. When on, `CommitCommand` appends `Signed-off-by: <user.name> <user.email>` to the LLM-generated commit message before the actual `git commit`. Off by default; the toggle is per-machine (global config) so it lights up for every repo on the machine.
+
+**PR lookup uses `gh pr list` with history; fork PRs are excluded** — `PrCommentService.fetchBranchPrs` switched from `gh pr view` (which only returns the single open PR on the branch) to `gh pr list --state all --head <branch>` so historical closed / merged PRs on the same branch can be found. Fork PRs (where the head repo doesn't match the base repo) are filtered out before the panel offers an edit action — the foreign-denial assertion is pinned in `PrCommentService.test.ts` so the filter cannot regress. The `--arg-stdin` bridging that the extension uses to pass long arguments through the CLI also gained length / content guards so a stray block of `--help` output cannot be piped through as input.
+
+**Memory Bank folder mode** — Memory Bank is on by default. `StorageFactory.createStorage` defaults to `"dual-write"`, so every commit's hooks write the memory to **both** the orphan branch and the configured Memory Bank folder; no `setActiveStorage()` toggle is involved at runtime. The orphan branch stays the system of record (reads come from there); the folder mirror is derivable from it. Cross-repo reads from the MEMORY BANK tab go through `FolderStorage` instead of git plumbing so opening a memory from a sibling repo's subfolder never invokes `git show` in the wrong working tree. The Memory Bank sidebar tab renders a branch-aware folder view via `KnowledgeBaseTreeProvider` (the class name still uses the legacy "KnowledgeBase" identifier; the user-facing label is "Memory Bank").
 
 Two migration paths populate the folder:
 

@@ -1,12 +1,18 @@
 # Changelog
 
-<!-- Last synced commit: d53654bc | 2026-05-13 -->
+<!-- Last synced commit: 8ce5671f | 2026-05-28 -->
 
 ## 0.99.2
 
-- **Plugin mode.** The CLI now discovers and loads allow-listed plugin packages from the project's `node_modules` and the global npm root. Plugins register their own subcommands via a small public API (`PluginContext`, `PluginRegister`, re-exported `parseJolliApiKey` / `parseBaseUrl`). Discovery is gated by an opaque plugin ID each plugin declares in its `package.json` (`jolliPluginId`), is restricted to a small set of trusted npm scopes, and is bounded to the current git project or HOME — `jolli` invoked from outside any project doesn't scan ancestor `node_modules`. Set `JOLLI_NO_PLUGINS=1` to disable. See [SECURITY.md](../SECURITY.md#operational-guidance) for the operational guidance.
-- **Public API surface narrowed.** `@jolli.ai/cli` and `@jolli.ai/cli/api` are now the only supported entry points; deep imports via `@jolli.ai/cli/dist/*` no longer resolve (the package added an `exports` field).
-- **`jolli --help` grouping fix.** `search` and `heal-folder` now appear under the **Jolli Memory** section instead of falling through to "Other commands:".
+- **New `jolli heal-folder` command** — Accidentally deleted Memory Bank Markdown files? This rebuilds them from the source of truth. No AI call, no cost.
+- **Cleaner `jolli recall` output** — Long branches no longer get cut off mid-thought. (The unused `--verbose` flag is gone.)
+- **Linear issues in your memories** — When an AI session mentions a Linear issue, it's saved and shown alongside your plans and notes, and follows the commit through squashes and rebases.
+- **Faster, smaller site generator** — Sites build more reliably (config is checked up front, themes are cached, `jolli start` now supports React Server Components), and the install is smaller — the `tar` dependency is gone.
+- **`jolli auth login` names your device** — Sign-in now labels each session with your hostname and OS, so you can tell them apart in the Jolli web UI instead of seeing anonymous entries.
+- **`--arg-stdin` for agent skills** — `jolli recall` / `search` can read long arguments from stdin, so skills can pass multi-line input without quoting headaches.
+- **CLI plugins (experimental)** — `@jolli.ai/cli` can now load trusted plugin packages (from the `@jolli.ai/` npm scope) that add their own commands. Set `JOLLI_NO_PLUGINS=1` to turn it off. See [SECURITY.md](../SECURITY.md#operational-guidance).
+- **Narrower public API** — `@jolli.ai/cli` and `@jolli.ai/cli/api` are the only supported imports now; deep `dist/*` imports no longer resolve.
+- **More reliable cloud sync (behind the editor plugins)** — The bundled sync engine recovers on its own after an interrupted sync, only ever commits recognized Memory Bank files, and won't let a commit-time write collide with a sync in progress. The CLI doesn't run sync itself — see [`vscode/CHANGELOG.md`](../vscode/CHANGELOG.md).
 - Bug fixes
 
 ## 0.99.1
