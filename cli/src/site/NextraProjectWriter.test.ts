@@ -23,7 +23,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as fc from "fast-check";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -593,6 +593,39 @@ describe("NextraProjectWriter.generateTsConfig", () => {
 describe("NextraProjectWriter.initNextraProject", () => {
 	let tempDir: string;
 
+	// Register a "default" theme pack stub so `discoverPack` step 2 hits the
+	// in-process registry and skips steps 4 (~/.jolli/themes lookup) and 5
+	// (GitHub registry network fetch). Without this, every `initNextraProject`
+	// call here races a real GitHub roundtrip on cold-cache or slow-network
+	// environments, and tests that call it twice (the isNew:false case)
+	// regularly blow vitest's 15s timeout.
+	//
+	// The stub's `generateLayout` delegates to the real `generateDefaultLayout`,
+	// so the bytes written to `app/layout.tsx` match the prior "no pack
+	// registered → fallback" path — existing title/description/nav assertions
+	// keep passing unchanged.
+	//
+	// Scoped to this describe via `beforeAll` (not file-level) so the earlier
+	// `NextraProjectWriter.generateLayout` block's "uses the default layout
+	// when theme.pack is 'default'" assertion — which depends on the registry
+	// NOT having a `default` pack — keeps passing. Vitest runs describes
+	// top-down within a file, so this fires after generateLayout's
+	// expectations have already been verified.
+	beforeAll(async () => {
+		const { registerPack } = await import("./themes/ThemeRegistry.js");
+		const { generateDefaultLayout } = await import("./NextraProjectWriter.js");
+		registerPack({
+			manifest: {
+				name: "default",
+				displayName: "Default (test stub)",
+				tagline: "test stub",
+				defaults: { primaryHue: 220, defaultTheme: "system", fontFamily: "inter" },
+			},
+			buildCss: () => undefined,
+			generateLayout: (config) => generateDefaultLayout(config),
+		});
+	});
+
 	beforeEach(async () => {
 		tempDir = await makeTempDir();
 	});
@@ -776,6 +809,47 @@ describe("NextraProjectWriter.initNextraProject", () => {
 		expect(helperIdx).toBeGreaterThan(-1);
 		expect(exportIdx).toBeGreaterThan(-1);
 		expect(helperIdx).toBeLessThan(exportIdx);
+	});
+
+	it("writeSidebarTabsComponent emits a client-component SidebarTabs.tsx using Nextra's useConfig + usePathname", async () => {
+		// Call writeSidebarTabsComponent directly instead of going through
+		// initNextraProject — the latter calls discoverPack, which hits the
+		// GitHub registry on cold-cache test environments and can time out on
+		// network / tar-parse failures unrelated to this test.
+		const { writeSidebarTabsComponent } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+
+		await writeSidebarTabsComponent(buildDir);
+
+		expect(existsSync(join(buildDir, "components", "SidebarTabs.tsx"))).toBe(true);
+		const content = await readFile(join(buildDir, "components", "SidebarTabs.tsx"), "utf-8");
+		expect(content).toContain('"use client"');
+		expect(content).toContain("useConfig");
+		expect(content).toContain("usePathname");
+	});
+
+	it("SidebarTabs.tsx skips the no-active-tab redirect on '/' so a user-authored root index is not jumped away from", async () => {
+		// Why this test exists: when a customer keeps a real root index.md/.mdx,
+		// StartCommand.syncContent skips writeRootRedirectIndex so "/" renders
+		// that user content. If SidebarTabs still force-redirected when no tab
+		// matched the URL, the saved root page would flash and then disappear
+		// — re-introducing the very flicker the redirect-stub removal was
+		// supposed to eliminate.
+		const { writeSidebarTabsComponent } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+
+		await writeSidebarTabsComponent(buildDir);
+
+		const content = await readFile(join(buildDir, "components", "SidebarTabs.tsx"), "utf-8");
+		// The redirect branch must be gated on `pathname !== "/"` AND
+		// `!anyActive`. We assert the conjunction is present in the same
+		// `if` statement rather than just substring-matching individual
+		// fragments so a future refactor that splits them apart still fails
+		// this test.
+		const redirectStmtMatch = content.match(/if\s*\([^)]*!anyActive[^)]*\)\s*{[^}]*window\.location\.href/);
+		expect(redirectStmtMatch, "expected an `if (!anyActive ...) { window.location.href }` block").not.toBeNull();
+		const redirectStmt = redirectStmtMatch?.[0] ?? "";
+		expect(redirectStmt).toContain('pathname !== "/"');
 	});
 
 	it("written package.json is valid JSON with required dependencies", async () => {
