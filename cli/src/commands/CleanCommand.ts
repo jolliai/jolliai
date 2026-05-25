@@ -9,14 +9,20 @@
  * 2. Stale queue entries — `.jolli/jollimemory/git-op-queue/*.json` older than 7 days.
  * 3. Stale squash-pending.json — older than 48h.
  *
- * NOTE: orphan `summaries/{childHash}.json` and `transcripts/{childHash}.json`
+ * NOTE: orphan `summaries/{childHash}.json` and `transcripts/{transcriptId}.json`
  * files are intentionally NOT deleted. Under the unified Hoist model (schema
- * v4), `stripFunctionalMetadata` removes topics + recap from embedded children
+ * v4+), `stripFunctionalMetadata` removes topics + recap from embedded children
  * so the independent `summaries/{childHash}.json` file is the ONLY surviving
- * source of the child's original topics/recap. Transcripts have always been
- * by-hash artifacts that the display layer reads via
- * `collectAllTranscriptHashes`. Both files are tiny (KB) so disk savings would
- * be negligible; the audit / read-by-hash benefit of keeping them dominates.
+ * source of the child's original topics/recap.
+ *
+ * Transcripts have stable opaque IDs under v5 — either legacy commit-hash
+ * filenames preserved through migration, or fresh UUIDs from new writes —
+ * referenced from `summary.transcripts: string[]`. Display + edit/delete
+ * paths funnel through `getTranscriptIds(summary)`, so a transcript file is
+ * "live" as long as ANY summary on the orphan branch lists its ID. A future
+ * GC step could prune transcripts not referenced by any summary; today we
+ * keep them all because the files are tiny (KB) and the audit benefit of
+ * keeping them dominates.
  */
 
 import type { Command } from "commander";

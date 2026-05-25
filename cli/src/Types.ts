@@ -253,6 +253,31 @@ export type CommitSource = "cli" | "plugin";
 export type SummaryErrorKind = "llm-failed";
 
 /**
+ * Schema version stamped on newly written CommitSummary roots.
+ *
+ * Bumped when the schema introduces a breaking change that requires a
+ * migration step (v3→v4 introduced unified-Hoist root topics; v4→v5 introduced
+ * the stable `transcripts: string[]` ID array). Future v6 etc. follow the
+ * same pattern: define a new migration module under `core/SchemaV{N}Migration`,
+ * then bump this constant — every write path automatically stamps the new
+ * version.
+ *
+ * Use this constant when WRITING a new summary root (executePipeline,
+ * buildHoistedAmendRoot, migrateOneToOne, mergeManyToOne, ...).
+ *
+ * Do NOT use this constant for:
+ *   - Migration target versions — e.g. `SchemaV5Migration` always targets 5,
+ *     not "whatever the latest is". The number is part of the migration's
+ *     identity, not a moving target.
+ *   - Read-time format thresholds — e.g. `isUnifiedHoistFormat` returns
+ *     `version >= 4` (the version that introduced unified Hoist), and that
+ *     "4" stays 4 regardless of how high `CURRENT_SCHEMA_VERSION` climbs.
+ *   - Test fixtures — they deliberately pin specific versions to exercise
+ *     v3/v4/v5 read paths.
+ */
+export const CURRENT_SCHEMA_VERSION = 5;
+
+/**
  * Complete summary for a single git commit (v3 tree format).
  *
  * Tree structure: each node may have its own topics/stats/llm data, plus optional
@@ -369,6 +394,23 @@ export interface CommitSummary {
 	readonly notes?: ReadonlyArray<NoteReference>;
 	/** Linear issues referenced via MCP and associated with this commit */
 	readonly linearIssues?: ReadonlyArray<LinearIssueCommitRef>;
+	/**
+	 * v5 schema: stable transcript IDs referenced by this summary. Each ID
+	 * corresponds to a file at `transcripts/{id}.json` on the orphan branch.
+	 *
+	 * Decoupled from commit hash so history rewrites (rebase / amend / squash /
+	 * cherry-pick) move references around without touching transcript files.
+	 *
+	 * For freshly written v5 data: each ID is a UUID v4 (from `generateTranscriptId`).
+	 * For data migrated from v3/v4: legacy IDs reuse the original commit hash
+	 * string verbatim (no file rename during migration) — both ID formats are
+	 * opaque to readers.
+	 *
+	 * Absent on pre-v5 data (the read path falls back to `collectAllTranscriptHashes`
+	 * via the `getTranscriptIds` compatibility helper). Optional in the type so
+	 * Release N keeps reading legacy data; Release N+M will make it required.
+	 */
+	readonly transcripts?: ReadonlyArray<string>;
 }
 
 /** A single E2E test scenario for one feature or bug fix */
@@ -969,6 +1011,19 @@ export interface StatusInfo {
 	readonly copilotChatDetected?: boolean;
 	/** Copilot Chat scan failed with a real (non-ENOENT) error: parse / fs / schema. */
 	readonly copilotChatScanError?: CopilotChatScanError;
+	/**
+	 * v5 schema migration state — surfaced in `jolli status` and the VSCode
+	 * Hooks tooltip so users can see whether their on-disk data has been
+	 * migrated. Absent state is the implicit "pending" — the migration will
+	 * run on next opportunity (worker startup or explicit `jolli migrate`).
+	 */
+	readonly schemaV5?: "in-progress" | "completed" | "failed";
+	/**
+	 * True when migration completed but no pre-v5 data was present — i.e. a
+	 * fresh install. Used to choose between "complete (v5)" and "not needed"
+	 * wording in the status display.
+	 */
+	readonly schemaV5Fresh?: boolean;
 }
 
 /**

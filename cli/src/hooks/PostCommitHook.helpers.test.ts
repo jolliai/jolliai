@@ -1147,9 +1147,15 @@ describe("PostCommitHook helpers", () => {
 			// Pin the force flag at position 2 — short-circuit must never overwrite
 			// existing summaries (that's a Full-pipeline force semantic, not amend).
 			expect(storeArgs[2]).toBe(false);
-			const artifacts = storeArgs[3] as { transcript?: { sessions: ReadonlyArray<unknown> } } | undefined;
+			// v5 artifact shape: `{ transcript: { id, data: { sessions: [...] } } }`.
+			// `id` is the new transcript-ID minted by generateTranscriptId() that
+			// also lands in `summary.transcripts`.
+			const artifacts = storeArgs[3] as
+				| { transcript?: { id: string; data: { sessions: ReadonlyArray<unknown> } } }
+				| undefined;
 			expect(artifacts?.transcript).toBeDefined();
-			expect(artifacts?.transcript?.sessions.length).toBeGreaterThanOrEqual(1);
+			expect(typeof artifacts?.transcript?.id).toBe("string");
+			expect(artifacts?.transcript?.data.sessions.length).toBeGreaterThanOrEqual(1);
 		});
 
 		it("Post-LLM short-circuit (1 LLM): non-trivial delta with empty topics skips step 2", async () => {
@@ -1228,9 +1234,13 @@ describe("PostCommitHook helpers", () => {
 			// must not be silently dropped.
 			expect(mockStoreSummary.mock.calls.length).toBeGreaterThanOrEqual(1);
 			const storeArgs = mockStoreSummary.mock.calls[0];
-			const artifacts = storeArgs[3] as { transcript?: { sessions: ReadonlyArray<unknown> } } | undefined;
+			// v5 artifact shape: `{ transcript: { id, data: { sessions: [...] } } }`.
+			const artifacts = storeArgs[3] as
+				| { transcript?: { id: string; data: { sessions: ReadonlyArray<unknown> } } }
+				| undefined;
 			expect(artifacts?.transcript).toBeDefined();
-			expect(artifacts?.transcript?.sessions.length).toBeGreaterThanOrEqual(1);
+			expect(typeof artifacts?.transcript?.id).toBe("string");
+			expect(artifacts?.transcript?.data.sessions.length).toBeGreaterThanOrEqual(1);
 		});
 
 		it("No old summary + diff fetch failure: skips entirely, no LLM call, no garbage summary", async () => {

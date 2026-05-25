@@ -728,6 +728,13 @@ function buildTranscriptModal(isForeign: boolean = false): string {
     <div class="modal-body" id="modalBody">
       <div class="modal-loading" id="modalLoading">Loading transcripts...</div>
     </div>
+    <!--
+      Hidden by default. Shown when the backend posts
+      transcriptsSaveFailed / transcriptsDeleteFailed so the user has a
+      visible recovery hint without leaving the modal. See message handlers
+      in SummaryScriptBuilder.ts.
+    -->
+    <div class="modal-error-banner" id="modalErrorBanner" style="display: none;"></div>
     <div class="modal-footer">
       <button class="action-btn danger" id="deleteTranscriptsBtn">Mark All as Deleted</button>
       <div class="modal-footer-right">

@@ -1278,6 +1278,10 @@ ${buildPrMessageScript()}
     if (!transcriptModal) return;
     transcriptModal.classList.add('visible');
     if (modalLoading) modalLoading.style.display = 'block';
+    // Clear any error banner from a previous failed save/delete attempt so
+    // the new session starts clean.
+    var prevErr = document.getElementById('modalErrorBanner');
+    if (prevErr) prevErr.style.display = 'none';
     modifiedCount = 0;
     deletedCount = 0;
     updateChangeCounter();
@@ -1614,6 +1618,23 @@ ${buildTranscriptEntriesScript()}
     }
     if (msg.command === 'transcriptsDeleted') {
       // Modal already closed by deleteTranscriptsBtn handler
+    }
+    // Failure paths (added 2026-05-22 for v5): backend posts these when summary
+    // update or transcript file batch failed. Without handling them, the Save
+    // button would stay stuck in "Saving..." disabled state forever (the user
+    // would have to reload the webview to continue). Re-enable the button and
+    // surface a non-blocking notification with the backend-provided detail.
+    if (msg.command === 'transcriptsSaveFailed' || msg.command === 'transcriptsDeleteFailed') {
+      if (modalSaveBtn) {
+        modalSaveBtn.disabled = false;
+        modalSaveBtn.textContent = 'Save All';
+      }
+      var errBanner = document.getElementById('modalErrorBanner');
+      if (errBanner) {
+        var defaultMsg = msg.command === 'transcriptsSaveFailed' ? 'Save failed. See logs.' : 'Delete failed. See logs.';
+        errBanner.textContent = msg.message || defaultMsg;
+        errBanner.style.display = 'block';
+      }
     }
     if (msg.command === 'transcriptsLoading') {
       if (modalLoading) modalLoading.style.display = 'block';

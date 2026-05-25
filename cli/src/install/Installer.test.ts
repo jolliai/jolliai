@@ -84,6 +84,21 @@ vi.mock("../core/CopilotChatSessionDiscoverer.js", () => ({
 	discoverCopilotChatSessions: vi.fn().mockResolvedValue([]),
 }));
 
+// Mock SchemaV5Migration so install() doesn't spawn real git fast-import on
+// every test. `install()` both statically imports `readSchemaV5State` (for
+// status) and dynamically imports `migrateSchemaToV5` (for the auto-upgrade
+// step), so the mock has to export both. The `migrateSchemaToV5` spy is the
+// load-bearing assertion target for the source-discriminator tests below.
+vi.mock("../core/SchemaV5Migration.js", () => ({
+	migrateSchemaToV5: vi.fn().mockResolvedValue({
+		migrated: 0,
+		skipped: 0,
+		fresh: true,
+		alreadyDone: false,
+	}),
+	readSchemaV5State: vi.fn().mockResolvedValue(null),
+}));
+
 // Partially mock DistPathResolver so resolveDistPath doesn't depend on global npm state.
 // By default, resolveDistPath returns the caller's own dist dir with "cli" source.
 vi.mock("./DistPathResolver.js", async (importOriginal) => {
@@ -800,6 +815,57 @@ describe("Installer", () => {
 			const result = await install(tempDir);
 			expect(result.success).toBe(false);
 			expect(result.message).toMatch(/Unexpected .git file content|ENOTDIR|not a directory/i);
+		});
+
+		describe("v5 migration source discriminator", () => {
+			// When VSCode calls install() via bridge.enable(), Extension.ts
+			// separately runs migrateSchemaToV5 wrapped in setMigrating(true/
+			// false) so the sidebar shows progress. If install() also ran it,
+			// the two calls would race for `orphan-write.lock` and one would
+			// time out after 30 s. The discriminator is the `source` option
+			// — only `"vscode-extension"` skips; CLI (or omitted source, the
+			// test-fixture pattern) keeps the auto-upgrade behavior.
+			it("skips the v5 migration call when source is vscode-extension", async () => {
+				const { migrateSchemaToV5 } = await import("../core/SchemaV5Migration.js");
+				vi.mocked(migrateSchemaToV5).mockClear();
+
+				const result = await install(tempDir, { source: "vscode-extension" });
+
+				expect(result.success).toBe(true);
+				expect(vi.mocked(migrateSchemaToV5)).not.toHaveBeenCalled();
+			});
+
+			it("runs the v5 migration call when source is cli", async () => {
+				const { migrateSchemaToV5 } = await import("../core/SchemaV5Migration.js");
+				vi.mocked(migrateSchemaToV5).mockClear();
+
+				const result = await install(tempDir, { source: "cli" });
+
+				expect(result.success).toBe(true);
+				expect(vi.mocked(migrateSchemaToV5)).toHaveBeenCalledTimes(1);
+				expect(vi.mocked(migrateSchemaToV5)).toHaveBeenCalledWith(tempDir);
+			});
+
+			it("runs the v5 migration call when source is omitted (default behavior)", async () => {
+				const { migrateSchemaToV5 } = await import("../core/SchemaV5Migration.js");
+				vi.mocked(migrateSchemaToV5).mockClear();
+
+				const result = await install(tempDir);
+
+				expect(result.success).toBe(true);
+				expect(vi.mocked(migrateSchemaToV5)).toHaveBeenCalledTimes(1);
+			});
+
+			it("treats migrateSchemaToV5 throws as non-fatal", async () => {
+				const { migrateSchemaToV5 } = await import("../core/SchemaV5Migration.js");
+				vi.mocked(migrateSchemaToV5).mockClear();
+				vi.mocked(migrateSchemaToV5).mockRejectedValueOnce(new Error("boom"));
+
+				const result = await install(tempDir, { source: "cli" });
+
+				expect(result.success).toBe(true);
+				expect(vi.mocked(migrateSchemaToV5)).toHaveBeenCalledTimes(1);
+			});
 		});
 	});
 

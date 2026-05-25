@@ -15,6 +15,31 @@ import { resolveProjectDir, VERSION } from "./CliUtils.js";
 
 const log = createLogger("StatusCommand");
 
+/**
+ * Maps the v5 migration state to the user-facing one-line description shown
+ * under `Data migration:` in `jolli status`. Mirrors the VSCode Hooks tooltip
+ * line wording so users see the same language across both surfaces.
+ *
+ * Deliberately binary: "Up to date (v5)" vs "Not migrated — run jolli migrate".
+ * Earlier drafts surfaced five sub-states (completed-fresh, completed-not-fresh,
+ * in-progress, failed, pending) but only three are reachable from the current
+ * code path, and the distinction between them isn't actionable for users —
+ * everything that isn't `completed` reduces to "run `jolli migrate` and check
+ * the log".
+ *
+ * The structured `StatusInfo` mirror of this is `schemaV5` + `schemaV5Fresh`
+ * (see `Types.ts`). `migratedCount` / `errorMessage` / `startedAt` /
+ * `completedAt` live on the persisted `SchemaV5MigrationState` (read by
+ * `readSchemaV5State`) but are NOT projected onto `StatusInfo` today — there's
+ * no consumer and `errorMessage` is dead per the design choice not to persist
+ * `failed` (see `SchemaV5Migration.ts` doc comment). When Release N+M lands
+ * the persisted-`failed` + UI-degrade changes, add the diagnostic fields to
+ * `StatusInfo` then so `--json` consumers can drive their own UI.
+ */
+export function describeSchemaV5Status(state: StatusInfo["schemaV5"]): string {
+	return state === "completed" ? "Up to date (v5)" : "Not migrated — run jolli migrate";
+}
+
 /** Inputs to describeIntegrationStatus — one row in the CLI integration block. */
 interface IntegrationStatusInputs {
 	readonly enabled: boolean;
@@ -101,6 +126,7 @@ export function registerStatusCommand(program: Command): void {
 			if (hookRuntime) {
 				console.log(`  Hook runtime:     ${hookRuntime}`);
 			}
+			console.log(`  Data migration:   ${describeSchemaV5Status(status.schemaV5)}`);
 			/* v8 ignore next -- ternary: auth token presence depends on external config/env */
 			console.log(`  Jolli Account:    ${authToken ? "Signed in" : "Not signed in"}`);
 			console.log(`  Jolli API Key:    ${config?.jolliApiKey ? "Configured" : "Not configured"}`);

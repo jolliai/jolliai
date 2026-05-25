@@ -11,6 +11,7 @@ import {
 	countTopics,
 	deleteTopicInTree,
 	formatDurationLabel,
+	getTranscriptIds,
 	isLeafNode,
 	isUnifiedHoistFormat,
 	resolveDiffStats,
@@ -252,6 +253,26 @@ describe("SummaryTree", () => {
 		it("returns empty array for v4 root with undefined topics (covers `?? []` fallback)", () => {
 			const noTopics: CommitSummary = { ...A, version: 4, topics: undefined };
 			expect(collectDisplayTopics(noTopics)).toEqual([]);
+		});
+	});
+
+	describe("getTranscriptIds", () => {
+		it("returns the v5 transcripts field verbatim when present", () => {
+			const v5 = { ...A, version: 5, transcripts: ["uuid-1", "uuid-2"] } as CommitSummary;
+			expect(getTranscriptIds(v5)).toEqual(["uuid-1", "uuid-2"]);
+		});
+
+		it("returns an empty v5 transcripts array verbatim (not a fallback)", () => {
+			// The empty-array case is meaningfully distinct from the undefined
+			// case: v5 explicitly states "no AI sessions captured", while
+			// undefined means "v3/v4 schema, fall back to children walk".
+			const v5Empty = { ...A, version: 5, transcripts: [] } as CommitSummary;
+			expect(getTranscriptIds(v5Empty)).toEqual([]);
+		});
+
+		it("falls back to collectAllTranscriptHashes when transcripts is undefined (v3/v4 schema)", () => {
+			// transcripts field absent → v3/v4 schema → derive from the tree.
+			expect(getTranscriptIds(A)).toEqual(["aaa"]);
 		});
 	});
 

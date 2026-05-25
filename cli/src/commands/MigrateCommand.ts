@@ -1,11 +1,17 @@
 /**
- * MigrateCommand — Migrate summaries to v3 format.
+ * MigrateCommand — Migrate summaries to the latest schema.
  *
- * Provides the `migrate` CLI command that converts orphan branch data
- * from v1 to v3 tree format and upgrades the index to v3 flat format.
+ * Provides the `migrate` CLI command that:
+ *   1. Converts v1 orphan branch data to v3 tree format
+ *   2. Upgrades the index to v3 flat format
+ *   3. Runs the unified v3 → v4 → v5 schema migration
+ *
+ * Steps 1 and 2 are no-ops after the first run; step 3 reads its own
+ * state file on the orphan branch and is idempotent across runs.
  */
 
 import type { Command } from "commander";
+import { migrateSchemaToV5 } from "../core/SchemaV5Migration.js";
 import { hasMigrationMeta, migrateV1toV3, writeMigrationMeta } from "../core/SummaryMigration.js";
 import { indexNeedsMigration, migrateIndexToV3 } from "../core/SummaryStore.js";
 import { createLogger, setLogDir } from "../Logger.js";
@@ -67,6 +73,34 @@ export function registerMigrateCommand(program: Command): void {
 				if (indexMigrated === 0 && indexSkipped === 0) {
 					console.log("  No index entries found.");
 				}
+			}
+
+			// Step 3: unified v3 → v4 → v5 schema migration. Idempotent; reads
+			// its own `schema-v5-migration.json` state file on the orphan branch
+			// to skip on subsequent runs.
+			console.log("\n  Step 3: Migrating schema to v5 (transcripts stable IDs + lossless hoist)...");
+			try {
+				const v5Result = await migrateSchemaToV5(options.cwd);
+				if (v5Result.alreadyDone) {
+					console.log(`  Already migrated (${v5Result.migrated} summaries previously upgraded).`);
+				} else if (v5Result.fresh) {
+					// `migrateSchemaToV5` deliberately does NOT write a state file
+					// when the orphan branch hasn't been created yet — that would
+					// require creating an empty branch as a side effect. So we
+					// can't honestly say "marked as complete"; the first commit
+					// will create the branch and the next startup picks the
+					// migration up automatically.
+					console.log("  No orphan branch yet — migration will run automatically after the first commit.");
+				} else {
+					console.log(`  Migrated: ${v5Result.migrated} summaries upgraded to v5`);
+					if (v5Result.skipped > 0) {
+						console.log(`  Skipped:  ${v5Result.skipped} summaries (already v5 or unparseable)`);
+					}
+				}
+			} catch (err) {
+				console.error(`  v5 migration failed: ${(err as Error).message}`);
+				console.error("  Re-run `jolli migrate` to retry; data is unchanged on failure.");
+				log.error("v5 migration failed: %s", (err as Error).message);
 			}
 
 			console.log("");

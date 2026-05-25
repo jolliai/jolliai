@@ -423,7 +423,15 @@ export class JolliMemoryBridge {
 
 	// ── Enable / Disable ──────────────────────────────────────────────────
 
-	/** Enables JolliMemory hooks by calling Installer.install() directly. */
+	/**
+	 * Enables JolliMemory hooks by calling Installer.install() directly.
+	 *
+	 * `source: "vscode-extension"` is load-bearing: it tells the Installer to
+	 * skip its own v5 schema migration because Extension.ts runs that step
+	 * with `setMigrating(true/false)` to drive the sidebar spinner. Without
+	 * this flag both call sites race for `orphan-write.lock` and one of them
+	 * times out after 30 s. If a future caller is added here, copy the flag.
+	 */
 	async enable(): Promise<{ success: boolean; message: string }> {
 		log.info("bridge", "enable() called");
 		const result = await installerInstall(this.cwd, {
@@ -434,6 +442,9 @@ export class JolliMemoryBridge {
 
 	/**
 	 * Auto-installs hooks for the current worktree when the project is already enabled.
+	 *
+	 * Same `source: "vscode-extension"` contract as `enable()` — see that
+	 * doc-comment for the v5 migration / lock-contention rationale.
 	 */
 	async autoInstallForWorktree(): Promise<void> {
 		log.info("bridge", "Auto-installing hooks for new worktree");
@@ -2080,12 +2091,17 @@ export class JolliMemoryBridge {
 	 * orphan branch hasn't caught up to yet. Without this, a force-write
 	 * rewrites the index from orphan-only rows and the dual-write below
 	 * silently drops those folder-only rows on the shadow.
+	 *
+	 * `artifacts.transcript.id` is the v5 transcript ID under which the data
+	 * lands on the orphan branch (`transcripts/{id}.json`). The caller MUST
+	 * also include that ID in `summary.transcripts` for the migration / read
+	 * paths to find it later — `storeSummary` does not stamp it on automatically.
 	 */
 	async storeSummary(
 		summary: CommitSummary,
 		force = false,
 		artifacts?: {
-			readonly transcript?: StoredTranscript;
+			readonly transcript?: { readonly id: string; readonly data: StoredTranscript };
 			readonly planProgress?: ReadonlyArray<PlanProgressArtifact>;
 		},
 	): Promise<void> {

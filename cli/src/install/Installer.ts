@@ -33,6 +33,7 @@ import {
 	type OpenCodeScanError,
 	scanOpenCodeSessions,
 } from "../core/OpenCodeSessionDiscoverer.js";
+import { readSchemaV5State } from "../core/SchemaV5Migration.js";
 import {
 	ensureJolliMemoryDir,
 	filterSessionsByEnabledIntegrations,
@@ -301,6 +302,38 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 		// The worktrees list always includes the main repo root as its first entry.
 		for (const wt of worktrees) {
 			await migrateWorktreeConfig(wt);
+		}
+
+		// v3 → v4 → v5 unified schema migration. Idempotent: `migrateSchemaToV5`
+		// reads its own state file, skips when already completed, and also
+		// skips when no orphan branch exists yet (fresh install with no commits
+		// to migrate). Failure is non-fatal so an LLM-quota-exhausted or
+		// lock-contended install still succeeds; user can re-run via
+		// `jolli migrate`.
+		//
+		// Skipped on the VSCode path because Extension.ts owns the migration
+		// call there — it wraps the work in `setMigrating(true/false)` across
+		// the three sidebar stores so the user sees a "Migrating memories..."
+		// affordance, which we cannot reproduce from inside the CLI. Running
+		// here as well would have both callers race for `orphan-write.lock`
+		// and time one of them out after 30 s (the symptom that originally
+		// surfaced this bug — see git history of this block).
+		if (options?.source === "vscode-extension") {
+			log.info("Skipping v5 migration on vscode-extension source — Extension.ts owns it with UI");
+		} else {
+			try {
+				const { migrateSchemaToV5 } = await import("../core/SchemaV5Migration.js");
+				const v5Result = await migrateSchemaToV5(projectDir);
+				log.info(
+					"Schema v5 migration: alreadyDone=%s fresh=%s migrated=%d skipped=%d",
+					v5Result.alreadyDone,
+					v5Result.fresh,
+					v5Result.migrated,
+					v5Result.skipped,
+				);
+			} catch (err: unknown) {
+				log.warn("Schema v5 migration failed (non-fatal): %s", (err as Error).message);
+			}
 		}
 
 		log.info("Installation complete");
@@ -652,6 +685,24 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		? { source: winning.source, version: winning.version }
 		: undefined;
 
+	// v5 schema migration state — only meaningful when an orphan branch
+	// exists (a project that's never had jollimemory data has no state to
+	// report). Reads the state file on the orphan branch; null = pending.
+	let schemaV5: StatusInfo["schemaV5"];
+	let schemaV5Fresh: StatusInfo["schemaV5Fresh"];
+	if (branchExists) {
+		try {
+			const state = await readSchemaV5State(projectDir);
+			if (state) {
+				schemaV5 = state.status;
+				schemaV5Fresh = state.fresh;
+			}
+		} catch {
+			// Read errors are non-fatal — leave schemaV5 undefined ("unknown") so
+			// the status display can prompt the user to check / re-run migrate.
+		}
+	}
+
 	const status: StatusInfo = {
 		// The extension is "enabled" when the git hook is installed.
 		// Individual integration hooks (Claude, Codex, Gemini) have their own
@@ -689,6 +740,8 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		allSources,
 		sessionsBySource,
 		openCodeScanError,
+		...(schemaV5 !== undefined && { schemaV5 }),
+		...(schemaV5Fresh !== undefined && { schemaV5Fresh }),
 	};
 
 	log.info(

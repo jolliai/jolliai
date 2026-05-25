@@ -37,6 +37,7 @@ import type {
 	SummaryIndexEntry,
 	TopicSummary,
 } from "../Types.js";
+import { CURRENT_SCHEMA_VERSION } from "../Types.js";
 import { getDiffStats, getTreeHash } from "./GitOps.js";
 import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
@@ -44,7 +45,13 @@ import type { StorageProvider } from "./StorageProvider.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
 import { isSummaryError, LLM_FAILED } from "./SummaryErrorMarker.js";
 import { getDisplayDate } from "./SummaryFormat.js";
-import { collectAllTopics, collectDisplayTopics, countTopics, isUnifiedHoistFormat } from "./SummaryTree.js";
+import {
+	collectAllTopics,
+	collectDisplayTopics,
+	countTopics,
+	getTranscriptIds,
+	isUnifiedHoistFormat,
+} from "./SummaryTree.js";
 
 let activeStorageOverride: StorageProvider | undefined;
 
@@ -188,8 +195,13 @@ function unionCatalogs(writeCatalog: CommitCatalog | null, readCatalog: CommitCa
  * @param cwd         - Optional working directory (git repo root)
  * @param force       - When true, overwrites an existing summary for the same commit hash
  *                      instead of skipping (used by the manual `summarize` CLI command)
- * @param artifacts   - Optional artifacts to store atomically alongside the summary
- *                      (e.g., transcript data saved as `transcripts/{commitHash}.json`)
+ * @param artifacts   - Optional artifacts to store atomically alongside the summary.
+ *                      `transcript.id` is the v5 transcript ID under which the data
+ *                      is persisted (`transcripts/{id}.json`). Callers MUST also set
+ *                      `summary.transcripts` to include this ID — `storeSummary` does
+ *                      not stamp it on automatically. Generate the ID via
+ *                      `generateTranscriptId()` for new content; for migration paths
+ *                      that reuse a legacy commit-hash filename, pass that hash here.
  * @param storage     - Write storage. Drives the actual writeFiles call.
  * @param readStorage - Optional secondary read storage whose index/catalog rows
  *                      must be preserved in the upcoming dual-write. When passed
@@ -208,7 +220,7 @@ export async function storeSummary(
 	cwd?: string,
 	force = false,
 	artifacts?: {
-		readonly transcript?: StoredTranscript;
+		readonly transcript?: { readonly id: string; readonly data: StoredTranscript };
 		readonly planProgress?: ReadonlyArray<PlanProgressArtifact>;
 	},
 	storage?: StorageProvider,
@@ -276,11 +288,13 @@ export async function storeSummary(
 			buildCatalogFileWrite(existingCatalog, entryMap, summary),
 		];
 
-		// Append transcript file if provided
-		if (artifacts?.transcript && artifacts.transcript.sessions.length > 0) {
+		// Append transcript file if provided. Path is keyed by the v5 transcript
+		// ID, not the commit hash — caller is responsible for matching the ID to
+		// the IDs listed in `summary.transcripts`.
+		if (artifacts?.transcript && artifacts.transcript.data.sessions.length > 0) {
 			files.push({
-				path: `transcripts/${summary.commitHash}.json`,
-				content: JSON.stringify(artifacts.transcript, null, "\t"),
+				path: `transcripts/${artifacts.transcript.id}.json`,
+				content: JSON.stringify(artifacts.transcript.data, null, "\t"),
 			});
 		}
 
@@ -386,8 +400,14 @@ async function migrateOneToOneLocked(
 	// squash / legacy amend) flattens via collectAllTopics so no data drops.
 	const hoistedTopics = resolveEffectiveTopics(oldSummary);
 
+	// Carry transcript IDs through 1:1 — rebase-pick doesn't change content,
+	// only commit hash. v5 data has them on root; v3/v4 data falls back to the
+	// children-tree walk via `getTranscriptIds`, keeping the same legacy
+	// commit-hash strings as opaque IDs (the files at those paths still exist).
+	const inheritedTranscriptIds = getTranscriptIds(oldSummary);
+
 	const newSummary: CommitSummary = {
-		version: 4,
+		version: CURRENT_SCHEMA_VERSION,
 		commitHash: newCommitInfo.hash,
 		commitMessage: newCommitInfo.message,
 		commitAuthor: newCommitInfo.author,
@@ -419,6 +439,11 @@ async function migrateOneToOneLocked(
 		...(isSummaryError(oldSummary) && { summaryError: LLM_FAILED }),
 		topics: hoistedTopics,
 		...(oldSummary.recap && { recap: oldSummary.recap }),
+		// v5 contract: always present, even if empty. Length-0 is the right
+		// signal for "no AI sessions captured for this commit" so the read path
+		// hits the fast `summary.transcripts` lookup instead of the v3/v4
+		// children-walk fallback.
+		transcripts: inheritedTranscriptIds,
 		diffStats: migratedDiffStats,
 		children: [strippedOld],
 	};
@@ -663,16 +688,30 @@ function collectDescendantOrphanedDocIds(children: ReadonlyArray<CommitSummary> 
  *     linearIssues / e2eTestGuide / jolliDocId / jolliDocUrl /
  *     orphanedDocIds), unioned across the whole tree via the same
  *     `collectChild*` helpers
+ *   - root holds authoritative `topics` and `recap` collected from the
+ *     entire tree via `resolveEffectiveTopics` / `resolveEffectiveRecap`
+ *     (added 2026-05-22 so v5 migration and any other lossless caller can
+ *     trust the helper without external rescue logic)
+ *   - root holds `diffStats` (migrated from legacy `stats` when needed)
  *   - every descendant is stripped of own-hoist fields
  *
- * Deliberately leaves `topics`, `recap`, `ticketId` on the root untouched.
- * Regenerate (the primary caller) overwrites topics + recap from a fresh
- * LLM call afterwards; ticketId is preserved per the same rule that lives
- * in Regenerator.ts. A no-op for v4 input (returns the same reference).
+ * The earlier draft of this helper left topics/recap on the root untouched
+ * because the only caller (Regenerator) was about to overwrite them with a
+ * fresh LLM call. That made the helper lossy for v3 squash roots (whose
+ * topics live in children, not on root). Now lossless: callers that want
+ * fresh topics/recap (Regenerator) overwrite the returned object explicitly;
+ * callers that want preservation (v5 migration) just use the result as-is.
  *
- * Used by Regenerator and RegenerateContext to collapse all v3-special-
- * casing in their hot paths — once normalized, downstream code can assume
- * a clean v4 tree.
+ * Leaves `ticketId` on the root untouched — for v3 data ticketId already
+ * lives on the root by construction.
+ *
+ * A no-op for v4 input (returns the same reference). The version gate is
+ * `>= 4`, not `=== 4`, so v5+ input is also a no-op — see the test fixture
+ * pinning this behavior in normalizeToV4.test.ts.
+ *
+ * Used by Regenerator, RegenerateContext, and the v5 schema migration to
+ * collapse all v3-special-casing — once normalized, downstream code can
+ * assume a clean v4 tree (topics/recap/diffStats all populated on root).
  */
 export function normalizeToV4(summary: CommitSummary): CommitSummary {
 	if (summary.version >= 4) return summary;
@@ -693,9 +732,28 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 		]),
 	);
 
+	// Hoist topics + recap from anywhere in the tree. Without this, v3 squash
+	// roots (whose topics live in children) would normalize into a root with
+	// empty topics, and stripFunctionalMetadata would then drop the children
+	// topics too — data loss. resolveEffectiveTopics already exists for the
+	// same reason in the rebase/squash migration paths; resolveEffectiveRecap
+	// is its newly-added recap counterpart.
+	const hoistedTopics = resolveEffectiveTopics(summary);
+	const hoistedRecap = resolveEffectiveRecap(summary);
+
+	// Migrate v3 `stats` → v4 `diffStats` when only the legacy field is set.
+	// Display code's resolveDiffStats already does this fallback at read time,
+	// but normalizing here means persisted v5 data carries the canonical field
+	// and the fallback can eventually go away.
+	const migratedDiffStats =
+		summary.diffStats === undefined && summary.stats !== undefined ? summary.stats : undefined;
+
 	return {
 		...summary,
 		version: 4,
+		topics: hoistedTopics,
+		...(hoistedRecap !== undefined ? { recap: hoistedRecap } : {}),
+		...(migratedDiffStats !== undefined ? { diffStats: migratedDiffStats } : {}),
 		...(hoistedE2e.length > 0 ? { e2eTestGuide: hoistedE2e } : {}),
 		...(hoistedPlans.length > 0 ? { plans: hoistedPlans } : {}),
 		...(hoistedNotes.length > 0 ? { notes: hoistedNotes } : {}),
@@ -747,6 +805,56 @@ function stripRecap(node: CommitSummary): CommitSummary {
 export function resolveEffectiveTopics(oldSummary: CommitSummary): ReadonlyArray<TopicSummary> {
 	if (isUnifiedHoistFormat(oldSummary)) return oldSummary.topics ?? [];
 	return collectAllTopics(oldSummary).map(({ commitDate: _cd, generatedAt: _ga, treeIndex: _ti, ...topic }) => topic);
+}
+
+/**
+ * Returns the recap string to use as Copy-Hoist source when normalizing v3
+ * legacy data to v4. Companion to `resolveEffectiveTopics`.
+ *
+ * Priority:
+ *   - v4+ (unified Hoist): root.recap is authoritative — return it directly.
+ *     May legitimately be undefined for topic-only commits.
+ *   - v3 with root.recap set: root wins. Both legacy squash and legacy amend
+ *     pipelines historically wrote recap to root, so this is the common case.
+ *   - v3 with no root.recap but children carry one: pick the newest child's
+ *     recap by display date (commitDate ?? generatedAt). Picks a single
+ *     representative rather than concatenating because recap is semantically
+ *     singular (one paragraph for this commit's work).
+ *
+ * Returns undefined when no node in the tree has a non-empty recap.
+ */
+export function resolveEffectiveRecap(oldSummary: CommitSummary): string | undefined {
+	if (isUnifiedHoistFormat(oldSummary)) return oldSummary.recap;
+	if (oldSummary.recap) return oldSummary.recap;
+	return pickNewestDescendantRecap(oldSummary.children);
+}
+
+/**
+ * Walks descendants depth-first collecting (recap, displayDate) pairs, then
+ * returns the newest one. Stable secondary order falls out of traversal order
+ * when display dates tie.
+ */
+function pickNewestDescendantRecap(children: ReadonlyArray<CommitSummary> | undefined): string | undefined {
+	if (!children || children.length === 0) return undefined;
+	const candidates: Array<{ readonly recap: string; readonly date: string }> = [];
+	collectRecapCandidates(children, candidates);
+	if (candidates.length === 0) return undefined;
+	candidates.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+	return candidates[0]?.recap;
+}
+
+function collectRecapCandidates(
+	nodes: ReadonlyArray<CommitSummary>,
+	out: Array<{ readonly recap: string; readonly date: string }>,
+): void {
+	for (const node of nodes) {
+		if (node.recap) {
+			out.push({ recap: node.recap, date: getDisplayDate(node) });
+		}
+		if (node.children) {
+			collectRecapCandidates(node.children, out);
+		}
+	}
 }
 
 /**
@@ -922,8 +1030,17 @@ async function mergeManyToOneLocked(
 	const consolidatedLlm = consolidated?.llm;
 	const consolidatedSummaryError = consolidated?.summaryError;
 
+	// Union the transcript IDs from every source commit into the merged root.
+	// Squash kills the source commits in git history, so the merged root is
+	// the only "live" referrer to their transcript files — listing every ID
+	// at root is exactly what `getTranscriptIds(mergedRoot)` needs to find
+	// the full conversation set. Dedup via Set in case two sources share an
+	// ID (legitimate when a project has mixed migrated-from-v3 hashes that
+	// happen to collide — vanishingly rare but cheap to guard against).
+	const mergedTranscriptIds = Array.from(new Set<string>(children.flatMap((child) => getTranscriptIds(child))));
+
 	const mergedSummary: CommitSummary = {
-		version: 4,
+		version: CURRENT_SCHEMA_VERSION,
 		commitHash: newCommitInfo.hash,
 		commitMessage: newCommitInfo.message,
 		commitAuthor: newCommitInfo.author,
@@ -943,6 +1060,8 @@ async function mergeManyToOneLocked(
 		...(allOrphanedDocIds.length > 0 && { orphanedDocIds: allOrphanedDocIds }),
 		topics: consolidatedTopics,
 		...(consolidatedRecap && { recap: consolidatedRecap }),
+		// v5 contract: always present, even if empty (see migrateOneToOne note).
+		transcripts: mergedTranscriptIds,
 		diffStats: mergedDiffStats,
 		children: strippedChildren,
 	};
@@ -1144,17 +1263,28 @@ export async function deleteTranscript(commitHash: string, cwd?: string, storage
 }
 
 /**
- * Returns the set of commit hashes that have transcript files in the orphan branch.
+ * Returns the set of transcript IDs whose files exist in the orphan branch.
  * Scans the `transcripts/` prefix via the active storage provider.
+ *
+ * Filename grammar: `transcripts/{transcriptId}.json` where `transcriptId` is
+ * an opaque string. Pre-v5 ("legacy") IDs reuse commit-hash text — all lower-
+ * case hex; v5+ IDs are UUID v4 with hyphens (e.g.
+ * `01234567-89ab-cdef-0123-456789abcdef`). The match accepts BOTH by extracting
+ * everything before `.json` without assuming a format — earlier versions of
+ * this helper used `[a-f0-9]+` and silently dropped v5 UUID files from the
+ * intersection in `SummaryWebviewPanel.refreshTranscriptHashes`, hiding all
+ * conversations for v5-written summaries.
  */
 export async function getTranscriptHashes(cwd?: string, storage?: StorageProvider): Promise<Set<string>> {
 	const store = resolveStorage(storage, cwd);
 	const files = await store.listFiles("transcripts/");
 	const hashes = new Set<string>();
 	for (const filePath of files) {
-		// filePath = "transcripts/abc123.json" → extract "abc123"
-		const match = filePath.match(/^transcripts\/([a-f0-9]+)\.json$/);
-		if (match) {
+		// filePath = "transcripts/{id}.json" → extract "{id}". Tolerates any
+		// non-empty opaque-string ID, including legacy hex-only commit hashes
+		// and v5 UUIDs with hyphens.
+		const match = filePath.match(/^transcripts\/(.+)\.json$/);
+		if (match?.[1]) {
 			hashes.add(match[1]);
 		}
 	}

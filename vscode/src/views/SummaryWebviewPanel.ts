@@ -104,6 +104,7 @@ import {
 } from "./SummaryUtils.js";
 import type { RegenerateContext } from "../../../cli/src/core/RegenerateContext.js";
 import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
+import { getTranscriptIds } from "../../../cli/src/core/SummaryTree.js";
 import type { LlmConfig } from "../../../cli/src/Types.js";
 
 /** Memory field updates sent from the webview edit form. */
@@ -1085,32 +1086,33 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
-	 * Refreshes the cached `transcriptHashSet` by intersecting the summary tree's
-	 * commit hashes with the transcript files that exist in the orphan branch.
+	 * Refreshes the cached `transcriptHashSet` (logically a transcript-ID set
+	 * after v5: the entries may be UUIDs or legacy commit hashes — both are
+	 * opaque IDs to read/write/delete paths). Pulled via `getTranscriptIds`
+	 * which prefers `summary.transcripts` (v5) and falls back to walking
+	 * children for v3/v4 data; intersected with the files actually present
+	 * on the orphan branch so a missing-on-disk ID isn't kept in the set.
 	 */
 	private async refreshTranscriptHashes(summary: CommitSummary): Promise<void> {
 		try {
-			const treeHashes = collectTreeHashes(summary);
+			// `getTranscriptIds` returns the v5 `summary.transcripts` field
+			// verbatim when present and falls back to walking children for
+			// v3/v4 data — see SummaryTree.getTranscriptIds. Then intersect
+			// with the IDs actually on disk so a stale entry (file deleted
+			// out from under us) doesn't render in the panel.
+			const transcriptIds = getTranscriptIds(summary);
 			// Foreign mode: read the transcript file listing from the foreign
 			// repo's `.jolli/transcripts/` via the supplied StorageProvider.
 			// Going through `this.bridge.getTranscriptHashes()` here would hit
 			// `this.cwd`'s storage and return hashes disjoint from the foreign
 			// commit — which is what made "All Conversations" render empty for
 			// every cross-repo summary.
-			const allFileHashes = this.foreignStorage
-				? await coreGetTranscriptHashes(
-						this.workspaceRoot,
-						this.foreignStorage,
-					)
+			const allFileIds = this.foreignStorage
+				? await coreGetTranscriptHashes(this.workspaceRoot, this.foreignStorage)
 				: await this.bridge.getTranscriptHashes();
-			this.transcriptHashSet = new Set(
-				[...treeHashes].filter((h) => allFileHashes.has(h)),
-			);
+			this.transcriptHashSet = new Set(transcriptIds.filter((id) => allFileIds.has(id)));
 		} catch (err: unknown) {
-			log.warn(
-				"Failed to load transcript hashes: %s",
-				err instanceof Error ? err.message : String(err),
-			);
+			log.warn("Failed to load transcript hashes: %s", err instanceof Error ? err.message : String(err));
 			this.transcriptHashSet = new Set();
 		}
 	}
@@ -3202,8 +3204,56 @@ export class SummaryWebviewPanel {
 			writes.push({ hash: commitHash, data: storedTranscript });
 		}
 
+		// Summary-first ordering: if any deletes are in scope, persist the
+		// updated `summary.transcripts` BEFORE touching transcript files.
+		// Earlier code ran the file batch first, then the summary update; a
+		// failure in the second step left the half-migrated state "files
+		// gone but summary still references them", letting future
+		// amend/squash/rebase inherit stale IDs. Now the worst case after a
+		// summary-write failure is "no files touched yet" — clean abort.
+		if (deletes.length > 0 && this.currentSummary) {
+			try {
+				this.currentSummary = await this.persistTranscriptIdRemoval(
+					this.currentSummary,
+					new Set(deletes),
+				);
+			} catch (err) {
+				log.warn(
+					"Save aborted — could not persist summary.transcripts: %s",
+					err instanceof Error ? err.message : String(err),
+				);
+				this.panel.webview.postMessage({
+					command: "transcriptsSaveFailed",
+					message: "Could not update summary. Transcript files were NOT modified.",
+				});
+				return;
+			}
+		}
+
 		if (writes.length > 0 || deletes.length > 0) {
-			await this.bridge.saveTranscriptsBatch(writes, deletes);
+			try {
+				await this.bridge.saveTranscriptsBatch(writes, deletes);
+			} catch (err) {
+				// File batch failed AFTER summary already updated. Outcomes:
+				//   - `writes` items: user's edits never reached disk →
+				//     they'll see old content on next read; this is a real
+				//     data-fidelity miss the user must know about.
+				//   - `deletes` items: files still on disk but no longer
+				//     referenced by summary (orphan); from the summary's view
+				//     it's "deleted" but the bytes are still there.
+				// We post Failed (not Saved) so the modal's save button can
+				// reset out of its disabled "Saving..." state and the user
+				// can retry. Better to over-alert than silently lose edits.
+				log.warn(
+					"Summary updated but transcript file batch failed: %s",
+					err instanceof Error ? err.message : String(err),
+				);
+				this.panel.webview.postMessage({
+					command: "transcriptsSaveFailed",
+					message: "Some transcript files failed to write. See logs.",
+				});
+				return;
+			}
 		}
 
 		// Refresh cache and webview
@@ -3229,7 +3279,59 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		await this.bridge.saveTranscriptsBatch([], hashes);
+		// Summary-first: clear `summary.transcripts` BEFORE the file delete.
+		// Earlier code deleted files first, then updated the summary; a
+		// failure in the second step left the half-migrated state "files
+		// gone but summary still references them", letting future
+		// amend/squash/rebase inherit stale IDs.
+		if (this.currentSummary) {
+			try {
+				this.currentSummary = await this.persistTranscriptIdRemoval(
+					this.currentSummary,
+					new Set(hashes),
+				);
+			} catch (err) {
+				log.warn(
+					"Delete aborted — could not persist summary.transcripts: %s",
+					err instanceof Error ? err.message : String(err),
+				);
+				this.panel.webview.postMessage({
+					command: "transcriptsDeleteFailed",
+					message: "Could not update summary. Transcript files were NOT deleted.",
+				});
+				return;
+			}
+		}
+
+		try {
+			await this.bridge.saveTranscriptsBatch([], hashes);
+		} catch (err) {
+			// Summary already cleared but the orphan files weren't removed.
+			// From `getTranscriptIds(summary)` the user can no longer SEE the
+			// transcripts, but the bytes remain on the orphan branch and could
+			// resurface via direct branch inspection or future `git push`.
+			// For privacy-sensitive "delete my AI conversations" use cases that
+			// is NOT what the user asked for. Surface the partial failure so
+			// the user can retry / inspect logs rather than silently treating
+			// it as success.
+			log.warn(
+				"Summary cleared but transcript file delete failed: %s",
+				err instanceof Error ? err.message : String(err),
+			);
+			// Reset webview UI consistency: summary has been refreshed already,
+			// but the modal still believes the operation is in-flight. The
+			// failure message lets the script-side handler unstick the buttons
+			// and inform the user.
+			if (this.currentSummary) {
+				await this.refreshTranscriptHashes(this.currentSummary);
+				this.update(this.currentSummary);
+			}
+			this.panel.webview.postMessage({
+				command: "transcriptsDeleteFailed",
+				message: "Some transcript files failed to delete. See logs.",
+			});
+			return;
+		}
 
 		// Refresh cache and webview
 		if (this.currentSummary) {
@@ -3238,6 +3340,53 @@ export class SummaryWebviewPanel {
 		}
 
 		this.panel.webview.postMessage({ command: "transcriptsDeleted" });
+	}
+
+	/**
+	 * Removes the given transcript IDs from `summary.transcripts` and persists
+	 * the updated summary via `storeSummary(force=true)`. Returns the new
+	 * summary on success; **throws** on `storeSummary` failure so callers can
+	 * surface the abort decision (e.g. skip the file delete that would otherwise
+	 * leave a half-migration state).
+	 *
+	 * Handles both v5 and pre-v5 (legacy v3/v4) inputs:
+	 *   - v5 (`summary.transcripts !== undefined`): filter the existing array.
+	 *   - Legacy: derive the effective ID list via `getTranscriptIds` (which
+	 *     walks `children` and returns commit-hash IDs). Filter, then write
+	 *     back as a v5-shaped summary — the delete operation **lazily upgrades**
+	 *     the on-disk summary to v5. Without this, a delete that runs before
+	 *     the background v5 migration completes would leave the legacy summary
+	 *     intact; the next amend/squash/rebase would then re-inherit the
+	 *     just-deleted IDs via the `getTranscriptIds` fallback and stamp them
+	 *     onto the new v5 root.
+	 *
+	 * No-op (returns same reference) when nothing references any of the
+	 * removal IDs — both for empty v5 arrays and for legacy summaries whose
+	 * tree walk yielded no matches.
+	 */
+	private async persistTranscriptIdRemoval(
+		summary: CommitSummary,
+		idsToRemove: ReadonlySet<string>,
+	): Promise<CommitSummary> {
+		const isLegacy = summary.transcripts === undefined;
+		const current = isLegacy ? getTranscriptIds(summary) : (summary.transcripts ?? []);
+		if (current.length === 0) {
+			return summary;
+		}
+		const filtered = current.filter((id) => !idsToRemove.has(id));
+		// Fast-path: nothing removed AND already v5-shaped → return as-is.
+		// Legacy summaries still need a write even when `filtered.length ===
+		// current.length` would normally short-circuit, because the legacy
+		// summary itself doesn't have a `transcripts` field — writing it as
+		// `{ ...summary, transcripts: filtered }` is the lazy-upgrade.
+		if (!isLegacy && filtered.length === current.length) {
+			return summary;
+		}
+		// v5 contract: always present, even when empty. Filtered down to []
+		// means "this commit no longer references any transcripts".
+		const updated: CommitSummary = { ...summary, transcripts: filtered };
+		await this.bridge.storeSummary(updated, true);
+		return updated;
 	}
 }
 
@@ -3269,21 +3418,6 @@ function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
 		}
 	}
 	return true;
-}
-
-/** Recursively collects all commit hashes from a summary tree (root + all children). */
-function collectTreeHashes(summary: CommitSummary): Set<string> {
-	const hashes = new Set<string>();
-	function walk(node: CommitSummary): void {
-		hashes.add(node.commitHash);
-		if (node.children) {
-			for (const child of node.children) {
-				walk(child);
-			}
-		}
-	}
-	walk(summary);
-	return hashes;
 }
 
 /** Merges published plan URLs/docIds into plan references. */

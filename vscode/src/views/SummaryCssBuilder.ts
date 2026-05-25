@@ -1010,6 +1010,16 @@ export function buildCss(): string {
     display: flex;
     gap: 8px;
   }
+  /* Failure banner above the modal footer — shown when v5 save/delete posts
+     transcriptsSaveFailed / transcriptsDeleteFailed. Uses VS Code's standard
+     error tokens so the visual matches notifications. */
+  .modal-error-banner {
+    padding: 8px 20px;
+    color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground, #f48771));
+    background-color: var(--vscode-inputValidation-errorBackground, rgba(244,135,113,0.12));
+    border-top: 1px solid var(--vscode-inputValidation-errorBorder, rgba(244,135,113,0.4));
+    font-size: 0.9em;
+  }
 
   /* ── Conversations description, stats & privacy ── */
   .conversations-description {
