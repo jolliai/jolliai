@@ -137,6 +137,24 @@ export default theme;
 		expect(pack).toBeUndefined();
 	});
 
+	it("short-circuits to undefined for the 'default' pack name without any network or filesystem lookup", async () => {
+		// "default" means "use the vanilla Nextra layout, no pack". Every step
+		// of the discovery chain (registry, user themes dir, npm package,
+		// GitHub repo) is guaranteed to miss for this name, so discoverPack
+		// must return undefined immediately and must NOT issue a network call.
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		try {
+			const pack = await discoverPack({
+				...MINIMAL_CONFIG,
+				theme: { pack: "default" as string },
+			});
+			expect(pack).toBeUndefined();
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
 	it("--theme flag loads external theme when pack name is not built-in", async () => {
 		const pack = await discoverPack(
 			{ ...MINIMAL_CONFIG, theme: { pack: "unknown" as string } },
