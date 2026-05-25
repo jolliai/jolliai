@@ -138,10 +138,11 @@ export default theme;
 	});
 
 	it("short-circuits to undefined for the 'default' pack name without any network or filesystem lookup", async () => {
-		// "default" means "use the vanilla Nextra layout, no pack". Every step
-		// of the discovery chain (registry, user themes dir, npm package,
-		// GitHub repo) is guaranteed to miss for this name, so discoverPack
-		// must return undefined immediately and must NOT issue a network call.
+		// "default" means "use the vanilla Nextra layout, no pack". When no
+		// pack with this name is registered, every step of the discovery
+		// chain (user themes dir, npm package, GitHub repo) is guaranteed to
+		// miss for this name, so discoverPack must return undefined
+		// immediately and must NOT issue a network call.
 		const fetchSpy = vi.spyOn(globalThis, "fetch");
 		try {
 			const pack = await discoverPack({
@@ -153,6 +154,36 @@ export default theme;
 		} finally {
 			fetchSpy.mockRestore();
 		}
+	});
+
+	it("a registered 'default' pack wins over the sentinel short-circuit", async () => {
+		// The "default" sentinel only short-circuits when nothing is
+		// registered under that name. If the caller has registered a pack
+		// named "default", the registry must win — otherwise discoverPack()
+		// would silently disagree with resolvePack() / getPack() for the
+		// same config, leaving initNextraProject() unable to load a pack
+		// that resolvePack() returns.
+		//
+		// This test registers a "default" pack last so it doesn't perturb
+		// the preceding short-circuit test (the module-level pack map has
+		// no public unregister API). The "--theme flag loads external
+		// theme…" test that follows uses themePath and is unaffected.
+		const defaultPack: ThemePackProvider = {
+			manifest: {
+				name: "default",
+				displayName: "Default override",
+				tagline: "test",
+				defaults: { primaryHue: 1, defaultTheme: "light", fontFamily: "inter" },
+			},
+			buildCss: () => "/* default override */",
+			generateLayout: () => "<div>default override</div>",
+		};
+		registerPack(defaultPack);
+		const pack = await discoverPack({
+			...MINIMAL_CONFIG,
+			theme: { pack: "default" as string },
+		});
+		expect(pack).toBe(defaultPack);
 	});
 
 	it("--theme flag loads external theme when pack name is not built-in", async () => {

@@ -106,11 +106,13 @@ describe("extractTarGz", () => {
 		expect(() => extractTarGz(gz)).toThrow(/Unsupported tar entry type 'x'/);
 	});
 
-	it("skips PAX global header typeflag 'g' and keeps parsing later entries", () => {
+	it("skips PAX global header typeflag 'g' carrying only comment= and keeps parsing later entries", () => {
 		// GitHub's codeload.github.com prepends a `pax_global_header` entry
-		// (typeflag 'g') to every tarball. Treating it as fatal would break
-		// every theme download — it must be silently skipped.
-		const paxPayload = Buffer.from("52 comment=abc1234567890\n", "ascii");
+		// (typeflag 'g') with a single `comment=<sha>` record to every
+		// tarball. `comment` is in the allowlist, so this must extract the
+		// real entries that follow. The record length "25" includes the
+		// length digits, the separator, the key=value pair, and the LF.
+		const paxPayload = Buffer.from("25 comment=abc1234567890\n", "ascii");
 		const fileData = Buffer.from("hello world", "utf-8");
 		const tar = buildTar([
 			buildTarEntry("pax_global_header", 0x67, paxPayload), // 'g' = 0x67
@@ -123,6 +125,81 @@ describe("extractTarGz", () => {
 		expect(entries).toHaveLength(2);
 		expect(entries[0]).toEqual({ path: "repo-main/", type: "dir", data: Buffer.alloc(0) });
 		expect(entries[1]).toEqual({ path: "repo-main/readme.txt", type: "file", data: fileData });
+	});
+
+	it("skips PAX global header carrying multiple allowlisted records", () => {
+		// Two records back-to-back inside one global header data block.
+		// `comment` and `mtime` are both safe to ignore; the extractor must
+		// parse the length prefixes correctly and continue with the rest of
+		// the archive.
+		const recordA = "15 comment=abc\n"; // 15 bytes total
+		const recordB = "30 mtime=1234567890.000000000\n"; // 30 bytes total
+		const paxPayload = Buffer.from(recordA + recordB, "ascii");
+		const fileData = Buffer.from("payload", "utf-8");
+		const tar = buildTar([
+			buildTarEntry("pax_global_header", 0x67, paxPayload),
+			buildTarEntry("repo-main/file.txt", 0x30, fileData),
+		]);
+		const gz = gzipSync(tar);
+
+		const entries = extractTarGz(gz);
+		expect(entries).toHaveLength(1);
+		expect(entries[0].path).toBe("repo-main/file.txt");
+		expect(entries[0].data).toEqual(fileData);
+	});
+
+	it("throws when a PAX global header record uses path=", () => {
+		// `path=` in a global header would silently rewrite every later
+		// entry's path. Ignoring it (the previous behaviour) could let a
+		// malicious tarball redirect every file into an attacker-controlled
+		// directory while the parser thought it was just skipping metadata.
+		const paxPayload = Buffer.from("17 path=evil/dir\n", "ascii");
+		const tar = buildTar([
+			buildTarEntry("pax_global_header", 0x67, paxPayload),
+			buildTarEntry("repo-main/readme.txt", 0x30, Buffer.from("ok")),
+		]);
+		const gz = gzipSync(tar);
+
+		expect(() => extractTarGz(gz)).toThrow(/PAX global header key "path"/);
+	});
+
+	it("throws when a PAX global header record uses linkpath=", () => {
+		const paxPayload = Buffer.from("18 linkpath=other\n", "ascii");
+		const tar = buildTar([
+			buildTarEntry("pax_global_header", 0x67, paxPayload),
+			buildTarEntry("repo-main/readme.txt", 0x30, Buffer.from("ok")),
+		]);
+		const gz = gzipSync(tar);
+
+		expect(() => extractTarGz(gz)).toThrow(/PAX global header key "linkpath"/);
+	});
+
+	it("throws when a PAX global header record uses size=", () => {
+		// `size=` in a global header overrides the ustar header size of
+		// every later entry — ignoring it lets the archive misrepresent
+		// file lengths.
+		const paxPayload = Buffer.from("12 size=999\n", "ascii");
+		const tar = buildTar([
+			buildTarEntry("pax_global_header", 0x67, paxPayload),
+			buildTarEntry("repo-main/readme.txt", 0x30, Buffer.from("ok")),
+		]);
+		const gz = gzipSync(tar);
+
+		expect(() => extractTarGz(gz)).toThrow(/PAX global header key "size"/);
+	});
+
+	it("throws on an unknown PAX global header key (fail loud rather than guess)", () => {
+		// Anything outside the allowlist is rejected so unfamiliar tarball
+		// sources can't slip past the allowlist with a key we haven't
+		// reasoned about.
+		const paxPayload = Buffer.from("11 foo=bar\n", "ascii");
+		const tar = buildTar([
+			buildTarEntry("pax_global_header", 0x67, paxPayload),
+			buildTarEntry("repo-main/readme.txt", 0x30, Buffer.from("ok")),
+		]);
+		const gz = gzipSync(tar);
+
+		expect(() => extractTarGz(gz)).toThrow(/PAX global header key "foo"/);
 	});
 
 	it("throws on symlink typeflag '2'", () => {
