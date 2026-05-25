@@ -114,10 +114,73 @@ async function fetchRegistry(): Promise<RegistryData> {
 //   - UStar prefix(155) + name(100) covers paths up to 255 bytes.
 //   - PAX extended ('x') and GNU LongName ('L','K') headers are rejected;
 //     entries with paths > 255 bytes will cause an error.
-//   - PAX global header ('g') is skipped — it carries archive-wide metadata
-//     (e.g. the git commit hash GitHub prepends to every tarball) and has no
-//     effect on later entries, so ignoring it is safe.
+//   - PAX global header ('g') is parsed and skipped only when every record's
+//     key is in `SAFE_PAX_GLOBAL_KEYS`. Per POSIX pax(1p), global records
+//     such as `path=`, `linkpath=`, or `size=` apply to every subsequent
+//     entry — silently ignoring them would let an archive rewrite later
+//     entries' paths or sizes behind the parser's back. GitHub codeload
+//     tarballs only contain `comment=<sha>` and stay on the allowlist.
 //   - Hardlinks ('1') and symlinks ('2') are rejected for safety.
+
+/**
+ * PAX header keys that are safe to ignore when they appear in a global
+ * extended header. Each key here either carries pure annotation
+ * (`comment`, `charset`, `hdrcharset`) or only affects metadata fields the
+ * extractor never reads (timestamps, ownership). Anything outside this set
+ * — most importantly `path`, `linkpath`, and `size` — can silently rewrite
+ * subsequent entries, so we refuse to skip it. Reference: POSIX pax(1p).
+ */
+const SAFE_PAX_GLOBAL_KEYS = new Set([
+	"comment",
+	"charset",
+	"hdrcharset",
+	"mtime",
+	"atime",
+	"ctime",
+	"uname",
+	"gname",
+	"uid",
+	"gid",
+]);
+
+/**
+ * Walks every record inside a PAX global header (`g`) data block and throws
+ * when a record names a key that could affect later entries. The PAX record
+ * format is `<length> <key>=<value>\n`, where `<length>` is the decimal byte
+ * length of the entire record (including the length digits, separator,
+ * key=value, and trailing LF). The same parser handles archives with
+ * multiple records (length-prefixed records pack back-to-back inside one
+ * data block).
+ */
+function assertSafePaxGlobalHeader(payload: Buffer, entryName: string): void {
+	let cursor = 0;
+	while (cursor < payload.length) {
+		const spaceIdx = payload.indexOf(0x20, cursor);
+		if (spaceIdx < 0) {
+			throw new Error(`Malformed PAX global header in "${entryName}": missing length separator before key`);
+		}
+		const lengthStr = payload.subarray(cursor, spaceIdx).toString("ascii");
+		const recordLen = Number.parseInt(lengthStr, 10);
+		const minLen = spaceIdx - cursor + 1 + 1 + 1; // digits + space + at-least-1-char k=v + LF
+		if (!Number.isFinite(recordLen) || recordLen < minLen || cursor + recordLen > payload.length) {
+			throw new Error(`Malformed PAX global header in "${entryName}": invalid record length "${lengthStr}"`);
+		}
+		const record = payload.subarray(spaceIdx + 1, cursor + recordLen);
+		const eqIdx = record.indexOf(0x3d); // '='
+		if (eqIdx < 0) {
+			throw new Error(`Malformed PAX global header in "${entryName}": record has no "="`);
+		}
+		const key = record.subarray(0, eqIdx).toString("ascii");
+		if (!SAFE_PAX_GLOBAL_KEYS.has(key)) {
+			throw new Error(
+				`Refusing to skip PAX global header key "${key}" in "${entryName}". ` +
+					`Per POSIX pax(1p), this key can rewrite the path/size/identity of later entries, ` +
+					`so ignoring it could silently corrupt the extracted tree.`,
+			);
+		}
+		cursor += recordLen;
+	}
+}
 
 interface TarEntry {
 	path: string;
@@ -174,10 +237,10 @@ export function extractTarGz(gzBuf: Buffer): TarEntry[] {
 		// Reject unsupported entry types that would corrupt the extraction:
 		//   'L','K','x' — long-name/extended headers that rename the NEXT entry
 		//   '1','2'     — hard/soft links that could escape the destination dir
-		// 'g' (PAX global header) is intentionally excluded — it carries
-		// archive-wide metadata (e.g. the git commit hash that GitHub prepends
-		// to every codeload tarball) and has no effect on later entries, so the
-		// safe behavior is to skip it like any other benign extension.
+		// 'g' (PAX global header) is allowed only when every record's key is
+		// in `SAFE_PAX_GLOBAL_KEYS` — a record like `path=` or `size=` would
+		// silently rewrite later entries, so we fail loud rather than
+		// pretending the header is purely informational.
 		if (!isFile && !isDir) {
 			const flag = String.fromCharCode(typeflag);
 			if ("LKx12".includes(flag)) {
@@ -186,7 +249,10 @@ export function extractTarGz(gzBuf: Buffer): TarEntry[] {
 						"This tar parser only supports regular files and directories.",
 				);
 			}
-			// Skip other benign typeflags (PAX global header 'g', vendor extensions, …)
+			if (flag === "g") {
+				assertSafePaxGlobalHeader(tar.subarray(offset, offset + size), fullPath);
+			}
+			// Skip the data block (PAX 'g' or vendor extensions, …)
 			offset += Math.ceil(size / 512) * 512;
 			continue;
 		}

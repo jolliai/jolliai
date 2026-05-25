@@ -153,18 +153,22 @@ export async function discoverPack(
 
 	const name = config.theme?.pack ?? "forge";
 
-	// "default" is a sentinel meaning "vanilla Nextra layout, no pack" — none
-	// of the discovery steps below can ever find a pack with this name (the
-	// registry stays empty for it, the user themes dir is not auto-created,
-	// no `jolli-theme-default` / `@jolli/theme-default` package exists, and
-	// the GitHub themes repo has no `default/` subfolder). Short-circuiting
-	// here saves a guaranteed-failing GitHub round-trip per call and lets
-	// `initNextraProject` fall straight through to the built-in layout.
-	if (name === "default") return undefined;
-
 	// 2) Registry (packs registered at runtime)
 	const builtin = packs.get(name);
 	if (builtin) return builtin;
+
+	// "default" is a sentinel meaning "vanilla Nextra layout, no pack" — when
+	// no pack with this name has been registered, every step below is
+	// guaranteed to miss (the user themes dir is not auto-created, no
+	// `jolli-theme-default` / `@jolli/theme-default` package exists, and the
+	// GitHub themes repo has no `default/` subfolder). Short-circuiting here
+	// saves a guaranteed-failing GitHub round-trip per call and lets
+	// `initNextraProject` fall straight through to the built-in layout.
+	//
+	// Placed AFTER the registry lookup so that a user-registered pack named
+	// "default" still wins — the registry stays the source of truth, and
+	// `discoverPack` / `resolvePack` agree on the resolved provider.
+	if (name === "default") return undefined;
 
 	// 3) Explicit file path in site.json (starts with ./ or /)
 	if (name.startsWith("./") || name.startsWith("/")) {

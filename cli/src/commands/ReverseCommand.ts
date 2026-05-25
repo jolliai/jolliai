@@ -36,10 +36,11 @@ function parseMetaFile(filePath: string): ParsedMeta | null {
 	if (!match) return null;
 	try {
 		let obj = match[1];
-		// Remove trailing commas for eval compatibility
+		// Remove trailing commas
 		obj = obj.replace(/,(\s*[}\]])/g, "$1");
-		// biome-ignore lint/security/noGlobalEval: _meta files are trusted build output
-		return eval(`(${obj})`) as ParsedMeta;
+		// _meta files are trusted build output. Function constructor (not direct
+		// eval) so a bundler can statically analyze the call without scope-capture warnings.
+		return new Function(`return (${obj})`)() as ParsedMeta;
 	} catch {
 		return null;
 	}
@@ -316,8 +317,9 @@ function extractFooter(buildDir: string): Record<string, unknown> {
 		const colsMatch = content.match(/FOOTER_COLUMNS\s*=\s*(\[[\s\S]*?\])\s*\n\n/);
 		if (colsMatch) {
 			try {
-				// biome-ignore lint/security/noGlobalEval: trusted build output
-				const cols = eval(colsMatch[1]) as Array<{
+				// Trusted build output. Function constructor (not direct eval) so
+				// a bundler can statically analyze the call without scope-capture warnings.
+				const cols = new Function(`return (${colsMatch[1]})`)() as Array<{
 					title: string;
 					links: Array<{ label: string; url: string }>;
 				}>;
@@ -336,8 +338,9 @@ function extractFooter(buildDir: string): Record<string, unknown> {
 		const socialMatch = content.match(/FOOTER_SOCIAL_LINKS\s*=\s*(\{[\s\S]*?\})\s*\n/);
 		if (socialMatch) {
 			try {
-				// biome-ignore lint/security/noGlobalEval: trusted build output
-				const social = eval(`(${socialMatch[1]})`) as Record<string, string>;
+				// Trusted build output. Function constructor (not direct eval) so
+				// a bundler can statically analyze the call without scope-capture warnings.
+				const social = new Function(`return (${socialMatch[1]})`)() as Record<string, string>;
 				const socialLinks: Record<string, string> = {};
 				for (const [key, value] of Object.entries(social)) {
 					if (value) socialLinks[key] = value;
