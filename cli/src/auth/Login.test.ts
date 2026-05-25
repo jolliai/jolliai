@@ -5,10 +5,19 @@ const mockSaveAuthCredentials = vi.fn();
 const mockLoadConfig = vi.fn();
 const mockExchangeCliCode = vi.fn();
 const mockGetDeviceLabel = vi.fn();
+const mockShouldRequestFreshApiKey = vi.fn();
 
-vi.mock("./AuthConfig.js", () => ({
-	saveAuthCredentials: (...args: unknown[]) => mockSaveAuthCredentials(...args),
-}));
+vi.mock("./AuthConfig.js", async (importActual) => {
+	// `resolveSignInJolliUrl` is a pure helper (no config I/O) that derives the
+	// tenant to persist from the minted key — keep the real implementation so
+	// the tests exercise the actual key→tenant resolution rather than a stub.
+	const actual = await importActual<typeof import("./AuthConfig.js")>();
+	return {
+		saveAuthCredentials: (...args: unknown[]) => mockSaveAuthCredentials(...args),
+		shouldRequestFreshApiKey: (...args: unknown[]) => mockShouldRequestFreshApiKey(...args),
+		resolveSignInJolliUrl: actual.resolveSignInJolliUrl,
+	};
+});
 
 vi.mock("../core/SessionTracker.js", () => ({
 	loadConfig: (...args: unknown[]) => mockLoadConfig(...args),
@@ -47,6 +56,10 @@ describe("Login", () => {
 		// Default: no device label so URL-construction tests that don't care
 		// about the param stay unchanged. Multi-device tests override per-call.
 		mockGetDeviceLabel.mockReturnValue(undefined);
+		// Default: ask for a fresh key. Mirrors the production behavior on a
+		// clean install (no jolliApiKey on disk). Cross-tenant / same-tenant
+		// re-auth tests override per-case.
+		mockShouldRequestFreshApiKey.mockReturnValue(true);
 	});
 
 	afterEach(() => {
@@ -78,7 +91,7 @@ describe("Login", () => {
 		});
 
 		expect(mockExchangeCliCode).toHaveBeenCalledWith(TEST_JOLLI_URL, "code-abc");
-		expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "tk-abc" });
+		expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "tk-abc", jolliUrl: TEST_JOLLI_URL });
 	});
 
 	it("forwards a jolliApiKey from the exchange to saveAuthCredentials", async () => {
@@ -103,7 +116,47 @@ describe("Login", () => {
 		});
 
 		expect(mockSaveAuthCredentials).toHaveBeenCalledTimes(1);
-		expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "tk-1", jolliApiKey: "sk-jol-xyz" });
+		expect(mockSaveAuthCredentials).toHaveBeenCalledWith({
+			token: "tk-1",
+			jolliUrl: TEST_JOLLI_URL,
+			jolliApiKey: "sk-jol-xyz",
+		});
+	});
+
+	it("persists the minted key's tenant as jolliUrl, not the sign-in origin", async () => {
+		// Regression guard for the default-login break: signing in at the auth
+		// hub (`auth.jolli.ai`) mints a key whose `meta.u` is the user's real
+		// tenant. Persisting the hub as `jolliUrl` would make
+		// `saveAuthCredentials`'s same-tenant symmetry check reject the key.
+		const HUB_URL = "https://auth.jolli.ai";
+		const tenantKey = `sk-jol-${Buffer.from(
+			JSON.stringify({ t: "tenant1", u: "https://tenant1.jolli.ai" }),
+		).toString("base64url")}.secret`;
+		mockExchangeCliCode.mockResolvedValueOnce({ token: "tk-hub", jolliApiKey: tenantKey });
+
+		await new Promise<void>((resolve, reject) => {
+			server = createLoginServer({
+				port: 0,
+				jolliUrl: HUB_URL,
+				expectedState: TEST_STATE,
+				onListen() {
+					const addr = server?.address();
+					if (!addr || typeof addr === "string") {
+						reject(new Error("No address"));
+						return;
+					}
+					fetch(`http://127.0.0.1:${addr.port}/callback?code=code-hub&state=${TEST_STATE}`);
+				},
+				onSuccess: resolve,
+				onError: reject,
+			});
+		});
+
+		expect(mockSaveAuthCredentials).toHaveBeenCalledWith({
+			token: "tk-hub",
+			jolliUrl: "https://tenant1.jolli.ai",
+			jolliApiKey: tenantKey,
+		});
 	});
 
 	it("omits jolliApiKey from the save call when the exchange did not return one", async () => {
@@ -127,7 +180,7 @@ describe("Login", () => {
 			});
 		});
 
-		expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "tk-bare" });
+		expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "tk-bare", jolliUrl: TEST_JOLLI_URL });
 	});
 
 	it("surfaces a server-reported error code as a friendly message", async () => {
@@ -261,6 +314,7 @@ describe("Login", () => {
 			expect(mockExchangeCliCode).not.toHaveBeenCalled();
 			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({
 				token: "legacy-tk",
+				jolliUrl: TEST_JOLLI_URL,
 				jolliApiKey: "sk-jol-legacy",
 			});
 		});
@@ -284,7 +338,7 @@ describe("Login", () => {
 				});
 			});
 
-			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "legacy-tk-2" });
+			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "legacy-tk-2", jolliUrl: TEST_JOLLI_URL });
 		});
 
 		it("emits a warn log so residual old-server traffic is observable", async () => {
@@ -336,7 +390,7 @@ describe("Login", () => {
 			});
 
 			expect(mockExchangeCliCode).toHaveBeenCalledWith(TEST_JOLLI_URL, "abc");
-			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "exchanged-tk" });
+			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "exchanged-tk", jolliUrl: TEST_JOLLI_URL });
 		});
 
 		it("propagates a save failure from the legacy path", async () => {
@@ -511,7 +565,10 @@ describe("Login", () => {
 					});
 				});
 
-				expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "legacy-tk-no-state" });
+				expect(mockSaveAuthCredentials).toHaveBeenCalledWith({
+					token: "legacy-tk-no-state",
+					jolliUrl: TEST_JOLLI_URL,
+				});
 			} finally {
 				warnSpy.mockRestore();
 			}
@@ -747,7 +804,7 @@ describe("Login", () => {
 			// what matters is that the param is populated.
 			expect(openedUrl).toMatch(/[?&]client_version=[^&]+/);
 			expect(mockExchangeCliCode).toHaveBeenCalledWith(TEST_JOLLI_URL, "browser-code");
-			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "browser-token" });
+			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "browser-token", jolliUrl: TEST_JOLLI_URL });
 		});
 
 		it("includes a 256-bit hex state nonce on the login URL (RFC 6749 §10.12)", async () => {
@@ -765,8 +822,9 @@ describe("Login", () => {
 			expect(state).toMatch(/^[0-9a-f]{64}$/);
 		});
 
-		it("omits generate_api_key when a jolliApiKey is already configured", async () => {
+		it("omits generate_api_key when a jolliApiKey is already configured and targets the same tenant", async () => {
 			mockLoadConfig.mockResolvedValue({ jolliApiKey: "jk_existing" });
+			mockShouldRequestFreshApiKey.mockReturnValue(false);
 			mockExchangeCliCode.mockResolvedValue({ token: "browser-token-2" });
 			mockOpen.mockImplementation(simulateBrowserCallback("browser-code-2"));
 
@@ -777,7 +835,30 @@ describe("Login", () => {
 			// client=cli identifies the originating surface; unrelated to whether
 			// a new key is being minted, so it must be present even when one exists.
 			expect(openUrl).toContain("client=cli");
-			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({ token: "browser-token-2" });
+			expect(mockShouldRequestFreshApiKey).toHaveBeenCalledWith("jk_existing", TEST_JOLLI_URL);
+			expect(mockSaveAuthCredentials).toHaveBeenCalledWith({
+				token: "browser-token-2",
+				jolliUrl: TEST_JOLLI_URL,
+			});
+		});
+
+		it("appends generate_api_key when an existing key targets a different tenant (cross-tenant rekey)", async () => {
+			// Cross-tenant re-login: a key for tenant-A is on disk, the user
+			// is signing into tenant-B. `shouldRequestFreshApiKey` returns
+			// true so the server mints a fresh key in the same sign-in
+			// instead of forcing the user to log in twice.
+			mockLoadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-tenant-a-key" });
+			mockShouldRequestFreshApiKey.mockReturnValue(true);
+			mockGetDeviceLabel.mockReturnValue("Foster-MBP");
+			mockExchangeCliCode.mockResolvedValue({ token: "browser-token-x" });
+			mockOpen.mockImplementation(simulateBrowserCallback("browser-code-x"));
+
+			await browserLogin(TEST_JOLLI_URL);
+
+			const openUrl = mockOpen.mock.calls[0][0] as string;
+			expect(openUrl).toContain("generate_api_key=true");
+			expect(openUrl).toContain("device_name=Foster-MBP");
+			expect(mockShouldRequestFreshApiKey).toHaveBeenCalledWith("sk-jol-tenant-a-key", TEST_JOLLI_URL);
 		});
 
 		// ── device_name (per-device API-key scoping) ──────────────────────
@@ -832,10 +913,11 @@ describe("Login", () => {
 		});
 
 		it("omits device_name when generate_api_key is not being requested", async () => {
-			// Pre-existing jolliApiKey → no generate_api_key. device_name is
-			// only meaningful at key-creation time, so it must not appear here
-			// even if the machine has a perfectly valid hostname.
+			// Pre-existing jolliApiKey for the same tenant → no generate_api_key.
+			// device_name is only meaningful at key-creation time, so it must
+			// not appear here even if the machine has a perfectly valid hostname.
 			mockLoadConfig.mockResolvedValue({ jolliApiKey: "jk_existing" });
+			mockShouldRequestFreshApiKey.mockReturnValue(false);
 			mockGetDeviceLabel.mockReturnValue("Foster-MBP");
 			mockExchangeCliCode.mockResolvedValue({ token: "no-gen-tk" });
 			mockOpen.mockImplementation(simulateBrowserCallback("no-gen-code"));

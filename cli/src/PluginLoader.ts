@@ -2,10 +2,18 @@
 /**
  * PluginLoader — discovery and dynamic loading of CLI plugins.
  *
- * A plugin is an npm package whose name appears in the {@link KNOWN_PLUGINS}
- * allow-list. The loader walks the local `node_modules` (including hoisted
- * parents, for pnpm/Yarn-workspaces-style monorepos) and the cached global
- * npm root looking for matching packages; for each found, it:
+ * A plugin is an npm package that declares a stable, opaque random string in
+ * its `package.json` under `jolliPluginId`. The loader scans well-known scope
+ * directories ({@link PLUGIN_SCOPES}) inside each `node_modules` root and only
+ * loads packages whose declared ID is in {@link KNOWN_PLUGIN_IDS}. Package
+ * names are intentionally **not** used for gating — names can change as the
+ * plugin ecosystem evolves, and binding the host CLI to a specific name would
+ * also leak that name (and any commercial-product hint it carries) into the
+ * open-source codebase.
+ *
+ * For each matching candidate the loader walks the local `node_modules`
+ * (including hoisted parents, for pnpm/Yarn-workspaces-style monorepos) and
+ * the cached global npm root; the first match per ID wins:
  *
  *   1. Reads `package.json` and checks `peerDependencies["@jolli.ai/cli"]`
  *      against the host CLI version using the `semver` library — any range
@@ -28,7 +36,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse as parsePath, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -41,14 +49,29 @@ import { execFileAsyncHidden } from "./util/Subprocess.js";
 
 const log = createLogger("PluginLoader");
 
-/** Allow-list of plugin package names. Pattern matching is intentionally avoided. */
-const KNOWN_PLUGINS: ReadonlyArray<string> = ["@jolli.ai/cli-pro"];
+/**
+ * Allow-list of plugin IDs. Each entry is an opaque random string that the
+ * matching plugin embeds in its own `package.json` as `jolliPluginId`. IDs are
+ * stable for the lifetime of a plugin: a plugin author can rename, re-scope,
+ * or re-publish their package without touching this list.
+ *
+ * IDs are not secrets — they are bundled in the plugin's package.json and
+ * visible to anyone who installs it. The security boundary is still the scope
+ * restriction in {@link PLUGIN_SCOPES} plus npm's own ownership controls on
+ * the scopes we trust. Random IDs just make the allow-list flexible across
+ * package renames.
+ */
+const KNOWN_PLUGIN_IDS: ReadonlyArray<string> = ["c56530c4-3f2f-467f-a4a4-db4d44c79c1c"];
 
 /**
- * Path to the `npm root -g` cache file. Lazy-resolved on each call so a
- * future change to `getGlobalConfigDir()` (e.g. reading an env var at call
- * time instead of process start) is not frozen by module-load order.
+ * Scope directories the loader scans under each `node_modules` root. Bounding
+ * discovery to known scopes keeps the per-invocation I/O cost predictable
+ * (one `readdir` per scope per root) and limits the surface area to scopes
+ * whose npm ownership we control.
  */
+const PLUGIN_SCOPES: ReadonlyArray<string> = ["@jolli.ai"];
+
+/** Path to the `npm root -g` cache file under the global config dir. */
 function getNpmRootCacheFile(): string {
 	return join(getGlobalConfigDir(), "global-root");
 }
@@ -67,8 +90,10 @@ const NPM_ROOT_TIMEOUT_MS = 5000;
 export interface LoadPluginsOptions {
 	/** Replace the discovered roots with these. Used by tests to point at fixtures. */
 	rootsOverride?: ReadonlyArray<string>;
-	/** Replace the {@link KNOWN_PLUGINS} allow-list. Used by tests with fake package names. */
+	/** Replace the {@link KNOWN_PLUGIN_IDS} allow-list. Used by tests with fake IDs. */
 	allowlistOverride?: ReadonlyArray<string>;
+	/** Replace the {@link PLUGIN_SCOPES} scan set. Used by tests that fixture under a different scope. */
+	scopesOverride?: ReadonlyArray<string>;
 	/** Custom resolver for the global npm root. Returning `null` means "not available". */
 	getGlobalRoot?: () => Promise<string | null>;
 	/**
@@ -104,18 +129,35 @@ export async function loadPlugins(program: Command, cliVersion: string, opts?: L
 		return;
 	}
 
-	const allowlist = opts?.allowlistOverride ?? KNOWN_PLUGINS;
+	const allowlist = opts?.allowlistOverride ?? KNOWN_PLUGIN_IDS;
+	const scopes = opts?.scopesOverride ?? PLUGIN_SCOPES;
 	const roots = await resolveRoots(opts);
-	const found = discoverPlugins(roots, allowlist);
+	const found = await discoverPlugins(roots, scopes, allowlist);
 
 	for (const plugin of found) {
 		await loadOnePlugin(program, cliVersion, plugin);
 	}
 }
 
+/**
+ * Subset of a plugin's `package.json` that the loader consumes after discovery.
+ * Typed loosely (`main` as `unknown`) because `JSON.parse` will hand us
+ * whatever the file contained — `loadOnePlugin` does its own runtime check
+ * before passing the value to `node:path` APIs that throw on non-string input.
+ */
+interface PluginPackageJson {
+	main?: unknown;
+	peerDependencies?: Record<string, string>;
+}
+
 interface FoundPlugin {
+	/** Full package name (e.g. `@scope/name`) — used in diagnostics, not for gating. */
 	name: string;
 	dir: string;
+	/** The `jolliPluginId` declared by the plugin; already verified to be in the allow-list. */
+	pluginId: string;
+	/** The plugin's parsed `package.json`. Carried from discovery so the loader does not re-read it. */
+	pkg: PluginPackageJson;
 }
 
 /**
@@ -188,19 +230,181 @@ async function resolveRoots(opts?: LoadPluginsOptions): Promise<ReadonlyArray<st
 }
 
 /**
- * Walk the given roots and return the first matching directory per allow-listed name.
+ * Walk the given roots, scan each known scope directory, and return the first
+ * matching package directory per allow-listed plugin ID.
+ *
+ * A package matches when its `package.json` declares a string `jolliPluginId`
+ * field whose value appears in `allowlist`. Packages without the field, with a
+ * non-string value, or with an ID not on the list are silently skipped — at
+ * discovery time we deliberately stay quiet because we are iterating over
+ * arbitrary user-installed packages and a missing field is the normal case.
+ * Loader-level diagnostics (peerDep mismatch, malformed main, register-throws,
+ * etc.) still fire in {@link loadOnePlugin} once an allow-listed candidate is
+ * identified.
+ *
+ * Ordering: roots are walked in priority order (earlier wins); within a root,
+ * scopes are walked in the order supplied; within a scope, entries are sorted
+ * lexicographically so the "first match wins" rule is deterministic across
+ * filesystems (`readdir`'s native order is inode-allocation on ext4,
+ * undefined on APFS, and varies per FS — relying on it would make duplicate-
+ * ID outcomes flap between machines and CI runners).
+ *
+ * Duplicate-ID handling: a plugin hoisted to the project root takes precedence
+ * over the same ID present in the global npm root (normal hoisting — silent).
+ * But two packages declaring the same ID inside the same scope+root is a
+ * misconfiguration we warn about (most often: a rename mid-migration where
+ * both old and new package names ended up installed). The lexicographically
+ * first one wins, the rest are skipped with a warning so the user can clean
+ * up.
  */
-function discoverPlugins(roots: ReadonlyArray<string>, allowlist: ReadonlyArray<string>): FoundPlugin[] {
+async function discoverPlugins(
+	roots: ReadonlyArray<string>,
+	scopes: ReadonlyArray<string>,
+	allowlist: ReadonlyArray<string>,
+): Promise<FoundPlugin[]> {
 	const found: FoundPlugin[] = [];
-	for (const name of allowlist) {
-		for (const root of roots) {
-			const dir = join(root, name);
-			if (existsSync(join(dir, "package.json"))) {
-				found.push({ name, dir });
-				break;
+	const seenAcrossRoots = new Set<string>();
+
+	for (const root of roots) {
+		for (const scope of scopes) {
+			const scopeDir = join(root, scope);
+			if (!existsSync(scopeDir)) continue;
+
+			let entries: import("node:fs").Dirent[];
+			try {
+				entries = await readdir(scopeDir, { withFileTypes: true });
+			} catch {
+				// Scope directory exists but is unreadable (permissions, race, …).
+				// Treat as if absent — silently skip so a single broken root does
+				// not block discovery in the other roots.
+				continue;
+			}
+
+			// Sort for deterministic "first match wins". Without this, two packages
+			// declaring the same ID would race on the underlying filesystem order.
+			// Plain `<`/`>` is a byte-order comparison (not locale-sensitive), so
+			// the winner is the same regardless of the runner's `LC_COLLATE` —
+			// `localeCompare(b.name)` without a fixed locale would otherwise
+			// reorder names containing case or punctuation between machines.
+			entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+
+			// Per-scope+root dedupe. Used to detect two packages claiming the same
+			// ID at the same depth (the unstable-migration case the comment above
+			// describes); cross-root duplicates are handled silently by
+			// `seenAcrossRoots` because that's normal hoisting.
+			const seenInThisScope = new Map<string, string>();
+
+			for (const entry of entries) {
+				// Accept real directories and symlinks (npm link, yarn workspaces,
+				// pnpm's non-isolated layouts all surface plugins as symlinks; the
+				// downstream `existsSync(pkgPath)` follows them and broken links
+				// fall out there). Anything else — stray files, sockets — is
+				// filtered cheaply here so we don't spend a stat on existsSync.
+				if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+				const dir = join(scopeDir, entry.name);
+				const pkgPath = join(dir, "package.json");
+				if (!existsSync(pkgPath)) continue;
+
+				let pluginId: string | undefined;
+				let pkg: PluginPackageJson = {};
+				try {
+					const pkgRaw = await readFile(pkgPath, "utf-8");
+					const parsed: unknown = JSON.parse(pkgRaw);
+					// `JSON.parse` can return null, primitives, or arrays — none
+					// of which can legitimately be a `package.json`. Reject these
+					// before reading fields so a later refactor that drops the
+					// `!pluginId` short-circuit can't accidentally read `.main`
+					// off a string or array.
+					if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+						continue;
+					}
+					const pkgObj = parsed as PluginPackageJson & { jolliPluginId?: unknown };
+					if (typeof pkgObj.jolliPluginId === "string") {
+						pluginId = pkgObj.jolliPluginId;
+					}
+					pkg = pkgObj;
+				} catch (err) {
+					// Malformed package.json. We can't tell from a manifest we
+					// failed to read/parse whether this is the allow-listed plugin
+					// (the `jolliPluginId` check below is what decides that, and we
+					// never got that far), so a user-facing WARNING would be noisy —
+					// it'd fire for any unrelated package sharing the scope with a
+					// broken manifest. But staying entirely silent means a real
+					// plugin shipping a corrupt manifest vanishes with zero trace,
+					// which is harder to diagnose than the old by-name loading.
+					// Compromise: leave a debug breadcrumb (only surfaced with
+					// debug logging on) recording the path + parse error, matching
+					// the symlink-forensics `log.debug` pattern below. Then skip.
+					log.debug(
+						`skipping ${scope}/${entry.name}: unreadable/invalid package.json (${
+							err instanceof Error ? err.message : String(err)
+						})`,
+					);
+					continue;
+				}
+
+				if (!pluginId || !allowlist.includes(pluginId)) continue;
+
+				// Symlink forensics: when an allow-listed plugin is mounted via a
+				// symlink that resolves outside the originally-walked roots
+				// (npm link to a sibling checkout, ad-hoc `ln -s`, …), record
+				// a debug breadcrumb so the indirection shows up in debug.log.
+				// We do NOT refuse to load — a user who can place a symlink
+				// under their own `@jolli.ai/` scope already has the write
+				// privilege required to drop a real package there, and a
+				// blanket refusal would break `npm link` / yarn workspaces.
+				// `realpath` is async + can throw on broken links; both
+				// outcomes are benign — fall back to `dir` silently.
+				if (entry.isSymbolicLink()) {
+					try {
+						const real = await realpath(dir);
+						const insideAnyRoot = roots.some((r) => {
+							const rel = relative(r, real);
+							return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+						});
+						if (!insideAnyRoot) {
+							log.debug(
+								`plugin symlink ${scope}/${entry.name} resolves to ${real}, outside walked roots — loading anyway (see SECURITY.md)`,
+							);
+						}
+					} catch (err) {
+						// realpath threw (broken link, permission-denied parent, …).
+						// Downstream existsSync already followed the link to verify
+						// the package.json exists, so loading proceeds. Record the
+						// audit gap so the indirection still leaves a breadcrumb
+						// in debug.log even when the resolved target is unknown.
+						//
+						// Coverage-ignored: reaching this requires a symlink whose
+						// `package.json` is reachable via `existsSync` yet whose
+						// `realpath` rejects (EACCES on a parent, mid-walk ELOOP).
+						// That can't be constructed on a real filesystem without
+						// mocking `node:fs`, and the handler is a non-behavioral
+						// debug breadcrumb — same rationale as `runNpmRootGlobal`.
+						/* v8 ignore start */
+						log.debug(
+							`plugin symlink ${scope}/${entry.name} realpath failed (${errMessage(err)}) — loading without audit trail`,
+						);
+						/* v8 ignore stop */
+					}
+				}
+
+				const earlierName = seenInThisScope.get(pluginId);
+				if (earlierName !== undefined) {
+					warn(
+						`${scope}/${entry.name} declares jolliPluginId ${pluginId}, already claimed by ${scope}/${earlierName} in ${root} — skipping`,
+					);
+					continue;
+				}
+				seenInThisScope.set(pluginId, entry.name);
+
+				if (seenAcrossRoots.has(pluginId)) continue;
+				seenAcrossRoots.add(pluginId);
+
+				found.push({ name: `${scope}/${entry.name}`, dir, pluginId, pkg });
 			}
 		}
 	}
+
 	return found;
 }
 
@@ -216,26 +420,17 @@ function discoverPlugins(roots: ReadonlyArray<string>, allowlist: ReadonlyArray<
  * the surprises.
  */
 async function loadOnePlugin(program: Command, cliVersion: string, plugin: FoundPlugin): Promise<void> {
-	const { name, dir } = plugin;
+	const { name, dir, pkg } = plugin;
 
 	try {
-		let pkg: { main?: string; peerDependencies?: Record<string, string> };
-		try {
-			const pkgRaw = await readFile(join(dir, "package.json"), "utf-8");
-			pkg = JSON.parse(pkgRaw);
-		} catch (err) {
-			warn(`failed to read ${name}/package.json: ${(err as Error).message}`);
-			return;
-		}
-
 		const peerRange = pkg.peerDependencies?.["@jolli.ai/cli"];
 		if (peerRange && !satisfies(cliVersion, peerRange, { includePrerelease: true })) {
 			warn(`${name} requires @jolli.ai/cli ${peerRange}, but ${cliVersion} is installed — skipping`);
 			return;
 		}
 
-		// `pkg.main` is typed as `string | undefined` but JSON.parse can hand
-		// us anything (number, array, object, …). Validate before passing to
+		// `pkg.main` is typed as `unknown` because `JSON.parse` can hand us
+		// anything (number, array, object, …). Validate before passing to
 		// node:path APIs that throw TypeError on non-string input.
 		const rawMain = pkg.main;
 		if (rawMain !== undefined && typeof rawMain !== "string") {
@@ -261,11 +456,11 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 
 		// Note: there is a TOCTOU window between this `existsSync` and the
 		// `import()` below — a sufficiently fast attacker could swap the entry
-		// file in that window. The same race applies to the `package.json`
-		// read above (line ~220) and to every other file check the loader
-		// performs: anyone who can write to the plugin directory already
-		// controls what the loader executes, so the races add no incremental
-		// privilege. We accept all of them.
+		// file in that window. The same race applies to every file check the
+		// loader performs (discovery's `package.json` read, this `existsSync`,
+		// etc.): anyone who can write to the plugin directory already controls
+		// what the loader executes, so the races add no incremental privilege.
+		// We accept all of them.
 		//
 		// Do NOT replace this with a stat+open pattern (it doesn't close the
 		// race for ESM `import()`) or remove the existsSync (the warning's
@@ -274,7 +469,7 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 		try {
 			mod = await import(pathToFileURL(entryAbs).href);
 		} catch (err) {
-			warn(`${name} failed to load: ${(err as Error).message}`);
+			warn(`${name} failed to load: ${errMessage(err)}`);
 			return;
 		}
 
@@ -307,7 +502,7 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 		try {
 			await mod.register(ctx);
 		} catch (err) {
-			warn(`${name} register() threw: ${(err as Error).message}`);
+			warn(`${name} register() threw: ${errMessage(err)}`);
 		} finally {
 			restoreCommand();
 		}
@@ -326,8 +521,18 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 		// (e.g. malformed JSON yielding pkg.main as an array, a buggy fs
 		// implementation throwing on existsSync) lands here so loadPlugins
 		// keeps iterating and the CLI keeps running.
-		warn(`${name} unexpected loader error: ${(err as Error).message}`);
+		warn(`${name} unexpected loader error: ${errMessage(err)}`);
 	}
+}
+
+/**
+ * Stringify an unknown thrown value for diagnostic warnings. Plugins are
+ * untrusted code — `throw "boom"` and `throw null` would otherwise render as
+ * `(err as Error).message === undefined`, losing the only signal the operator
+ * has for tracking down a misbehaving plugin.
+ */
+function errMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
 }
 
 /**
@@ -363,13 +568,26 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
  * Returns a `restore` thunk; callers must invoke it (in a `finally`) so the
  * builtin behavior comes back after the plugin's registration completes.
  *
- * Scope: this patch only protects the **top-level** command namespace
- * (children of `program`). A plugin can still reach into an existing
- * builtin and attach sub-subcommands via e.g.
- * `ctx.program.commands[0].addCommand(...)`. That is deliberately not
- * intercepted — sub-subcommands cannot collide with another builtin's
- * top-level name, and recursively patching every Command instance would
- * add complexity without protecting anything that matters in practice.
+ * Scope: this patch covers exactly the four collision throws Commander
+ * raises when a plugin registers a NEW top-level command — `.command(...)`,
+ * `.addCommand(...)`, and the returned command's `.alias(...)` / `.aliases(...)`.
+ * Anything else a plugin reaches for through `ctx.program.commands[]` is
+ * deliberately not intercepted, including:
+ *
+ *   - attaching sub-subcommands under an existing builtin
+ *     (`ctx.program.commands[0].addCommand(...)`);
+ *   - replacing or wrapping a builtin's action handler
+ *     (`ctx.program.commands.find(c => c.name() === "enable").action(...)`);
+ *   - adding aliases to an already-registered builtin
+ *     (`ctx.program.commands[i].alias("...")`).
+ *
+ * Allow-listed plugins live inside the same `node_modules/@jolli.ai/` trust
+ * boundary as the host CLI — see SECURITY.md "Operational guidance". They
+ * are treated as co-maintainers of the program namespace, not as a sandbox.
+ * The collision interception above is purely an ergonomics gate so a NEW
+ * command that happens to overlap a builtin name doesn't tear down the
+ * rest of the plugin's registration; it is **not** a privilege boundary
+ * against arbitrary mutation of program-attached commands.
  */
 function patchProgramCommand(program: Command, occupiedNames: Set<string>, blockedNames: Set<string>): () => void {
 	type CommandMethod = Command["command"];
@@ -413,6 +631,18 @@ function patchProgramCommand(program: Command, occupiedNames: Set<string>, block
 		}
 		const newCmd = (origCommand as (this: Command, ...args: unknown[]) => Command).call(this, nameAndArgs, ...rest);
 		if (baseName) occupiedNames.add(baseName);
+		// Commander's `.command(name, description)` (the executable-subcommand
+		// form) returns `this` instead of a freshly-created sub-command — see
+		// `if (desc) return this;` in commander/lib/command.js. If we ran
+		// `patchCommandAliasMethods(this, …)` we'd install own-properties for
+		// `alias` and `aliases` directly on `program`, and `restoreCommand`
+		// below only restores `command` / `addCommand`, so those alias patches
+		// would leak past `register()` (holding stale `occupiedNames` /
+		// `blockedNames` closures forever). Skip the alias patch when Commander
+		// returned `this`; chained `.alias()` on the executable form would call
+		// into program-level methods anyway, where collisions are Commander's
+		// own job to surface.
+		if (newCmd === this) return newCmd;
 		return patchCommandAliasMethods(newCmd, occupiedNames, blockedNames);
 	} as CommandMethod;
 

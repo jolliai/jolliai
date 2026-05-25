@@ -730,6 +730,19 @@ export interface JolliMemoryConfig {
 	/** OAuth auth token from browser login (stored by `jolli auth login`) */
 	readonly authToken?: string;
 	/**
+	 * The Jolli server origin the user logged into via `jolli auth login`,
+	 * persisted so cli-pro can recover the tenant URL when `jolliApiKey` is
+	 * missing or stale. Pure URL — no secret material. Trailing slash stripped
+	 * on write to match `getJolliUrl`.
+	 *
+	 * Surface-local: written only by the CLI / VS Code login paths and read
+	 * only by consumers running in the CLI process. IntelliJ keeps its own
+	 * auth state in `config-intellij.json` and is intentionally not covered
+	 * here — if a closed-source IntelliJ consumer ever needs the same
+	 * fallback, mirror this persistence in the Kotlin auth flow.
+	 */
+	readonly jolliUrl?: string;
+	/**
 	 * Which AI summarization provider to use.
 	 *  - "anthropic": call Anthropic directly using `apiKey`.
 	 *  - "jolli":     call Jolli's proxy using `jolliApiKey`.

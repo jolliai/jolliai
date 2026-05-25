@@ -1909,6 +1909,75 @@ describe("SettingsWebviewPanel", () => {
 			);
 		});
 
+		it("falls back to config.jolliUrl when jolliApiKey is absent (post-cross-tenant clear)", async () => {
+			// Mirrors `jolli status`: when `saveAuthCredentials` cleared a
+			// stale per-tenant key but kept the persisted sign-in origin,
+			// the panel still has enough info to show the user which site
+			// they're signed into. Without the fallback the panel would
+			// show the generic "Using Jolli to generate summaries" line
+			// while the CLI's `jolli status` displayed the real site.
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				jolliUrl: "https://tenant.jolli.ai",
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					jolliSiteLabel:
+						"Signed in to tenant.jolli.ai — using Jolli to generate summaries",
+				}),
+			);
+		});
+
+		it("falls back to config.jolliUrl when jolliApiKey is undecodable (legacy/hand-typed)", async () => {
+			// Mirrors the CLI's `StatusCommand` test of the same case. A user
+			// who pasted a hand-typed `sk-jol-` key without an embedded `meta.u`
+			// (`parseJolliApiKey` returns null) must still see the persisted
+			// `jolliUrl` in the panel — otherwise the panel reverts to the
+			// generic "Using Jolli to generate summaries" while the CLI shows
+			// the real tenant. The nullish-coalesce in `buildJolliSiteLabel`
+			// pins this branch; a regression that swapped it for a truthy
+			// check would still pass the absent-key test above.
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: "sk-jol-legacy",
+				jolliUrl: "https://tenant.jolli.ai",
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					hasJolliKey: true,
+					jolliSiteLabel:
+						"Signed in to tenant.jolli.ai — using Jolli to generate summaries",
+				}),
+			);
+		});
+
 		it("settingsLoaded.settings.aiProvider defaults to 'anthropic' when unset and not signed in", async () => {
 			mockLoadConfigFromDir.mockResolvedValue({
 				apiKey: undefined,

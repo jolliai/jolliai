@@ -448,6 +448,48 @@ describe("StatusTreeProvider", () => {
 		expect(items.find((item) => item.label === "Jolli Site")).toBeUndefined();
 	});
 
+	it("shows Jolli Site from persisted jolliUrl when signed in but no key was issued", async () => {
+		// Regression guard for P2b: the Settings panel and `jolli status` fall
+		// back to config.jolliUrl in the "signed in, key not issued / cleared"
+		// state. The STATUS tree must agree instead of showing nothing.
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "key",
+			authToken: "tok",
+			jolliApiKey: undefined,
+			jolliUrl: "https://tenant1.jolli.ai",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const siteRow = items.find((item) => item.label === "Jolli Site");
+		expect(siteRow?.description).toBe("tenant1.jolli.ai");
+		// The "not issued — pushes disabled" warning is still shown alongside it.
+		expect(items.find((item) => item.label === "Jolli API Key")?.description).toBe(
+			"not issued — pushes disabled",
+		);
+	});
+
+	it("falls back to jolliUrl for the Jolli Site row when the key is undecodable", async () => {
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "key",
+			authToken: "tok",
+			jolliApiKey: "legacy-hand-typed",
+			jolliUrl: "https://tenant1.jolli.ai",
+		});
+		// Undecodable / legacy key — no embedded tenant.
+		parseJolliApiKey.mockReturnValue(null);
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		expect(items.find((item) => item.label === "Jolli Site")?.description).toBe("tenant1.jolli.ai");
+	});
+
 	it("loads config even when disabled, but renders no rows", async () => {
 		// Auth state (authToken / apiKey) is independent of whether hooks are
 		// installed — keeping config loaded while disabled lets the Sidebar's

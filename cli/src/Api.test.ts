@@ -3259,14 +3259,15 @@ describe("CLI", () => {
 
 	describe("status command — Jolli Site display", () => {
 		it("should display Jolli Site when jolliApiKey is configured", async () => {
-			const { loadConfigFromDir } = await import("./core/SessionTracker.js");
-			const { parseJolliApiKey } = await import("./core/JolliApiUtils.js");
-			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({ jolliApiKey: "jk_test_key" });
-			vi.mocked(parseJolliApiKey).mockReturnValueOnce({
-				u: "https://mysite.jolli.app",
-				o: "my-org",
-				t: "my-tenant",
-			} as ReturnType<typeof parseJolliApiKey>);
+			const { loadConfigFromDir, loadConfig } = await import("./core/SessionTracker.js");
+			vi.mocked(loadConfigFromDir).mockResolvedValueOnce({
+				jolliApiKey: "jk_test_key",
+				jolliUrl: "https://mysite.jolli.app",
+			});
+			// loadAuthToken() reads via loadConfig() when JOLLI_AUTH_TOKEN is unset;
+			// `Jolli Site:` (vs `Last signed-in site:`) requires the user to be
+			// signed in.
+			vi.mocked(loadConfig).mockResolvedValueOnce({ authToken: "tk-active" });
 
 			await main(["status"]);
 

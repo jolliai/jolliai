@@ -2,11 +2,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Hoisted mocks ────────────────────────────────────────────────────────
 
-const { saveAuthCredentials, clearAuthCredentials, getJolliUrl } = vi.hoisted(
+const { saveAuthCredentials, clearAuthCredentials, getJolliUrl, shouldRequestFreshApiKey } = vi.hoisted(
 	() => ({
 		saveAuthCredentials: vi.fn().mockResolvedValue(undefined),
 		clearAuthCredentials: vi.fn().mockResolvedValue(undefined),
 		getJolliUrl: vi.fn(() => "https://app.jolli.ai"),
+		// Default: ask for a fresh key (clean install / no on-disk key).
+		// Cross-tenant / same-tenant re-auth tests override per-case.
+		shouldRequestFreshApiKey: vi.fn(() => true),
 	}),
 );
 
@@ -99,11 +102,20 @@ vi.mock("vscode", () => ({
 	Uri,
 }));
 
-vi.mock("../../../cli/src/auth/AuthConfig.js", () => ({
-	saveAuthCredentials,
-	clearAuthCredentials,
-	getJolliUrl,
-}));
+vi.mock("../../../cli/src/auth/AuthConfig.js", async (importActual) => {
+	// `resolveSignInJolliUrl` is a pure key→tenant helper with no config I/O —
+	// keep the real implementation so the callback path exercises the actual
+	// tenant resolution (a decodable key's `meta.u` wins over the sign-in
+	// origin), matching the CLI's Login.test wiring.
+	const actual = await importActual<typeof import("../../../cli/src/auth/AuthConfig.js")>();
+	return {
+		saveAuthCredentials,
+		clearAuthCredentials,
+		getJolliUrl,
+		shouldRequestFreshApiKey,
+		resolveSignInJolliUrl: actual.resolveSignInJolliUrl,
+	};
+});
 
 vi.mock("../../../cli/src/auth/CliExchange.js", () => ({
 	exchangeCliCode,
@@ -190,6 +202,7 @@ describe("AuthService", () => {
 			);
 			expect(saveAuthCredentials).toHaveBeenCalledWith({
 				token: "test-token",
+				jolliUrl: "https://app.jolli.ai",
 				jolliApiKey: "sk-jol-test",
 			});
 			expect(saveAuthCredentials).toHaveBeenCalledTimes(1);
@@ -200,6 +213,30 @@ describe("AuthService", () => {
 			);
 		});
 
+		it("persists the minted key's tenant as jolliUrl, not the sign-in origin", async () => {
+			// Regression guard for the default-login break: getJolliUrl() is the
+			// auth hub by default, but the minted key targets the user's real
+			// tenant. Persisting the hub would trip saveAuthCredentials's
+			// same-tenant symmetry check and reject every normal key.
+			// Sign-in origin defaults to https://app.jolli.ai (the mock); the key
+			// targets a different tenant, so the persisted jolliUrl must follow the
+			// key, not the origin.
+			const tenantKey = `sk-jol-${Buffer.from(
+				JSON.stringify({ t: "tenant1", u: "https://tenant1.jolli.ai" }),
+			).toString("base64url")}.secret`;
+			exchangeCliCode.mockResolvedValueOnce({ token: "hub-tk", jolliApiKey: tenantKey });
+			const state = await primeStateViaSignIn(service);
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
+
+			await service.handleAuthCallback(uri as never);
+
+			expect(saveAuthCredentials).toHaveBeenCalledWith({
+				token: "hub-tk",
+				jolliUrl: "https://tenant1.jolli.ai",
+				jolliApiKey: tenantKey,
+			});
+		});
+
 		it("should save only the token when the exchange omits an API key", async () => {
 			exchangeCliCode.mockResolvedValueOnce({ token: "test-token" });
 			const state = await primeStateViaSignIn(service);
@@ -208,12 +245,22 @@ describe("AuthService", () => {
 			const result = await service.handleAuthCallback(uri as never);
 
 			expect(result).toEqual({ success: true });
-			expect(saveAuthCredentials).toHaveBeenCalledWith({ token: "test-token" });
+			expect(saveAuthCredentials).toHaveBeenCalledWith({
+				token: "test-token",
+				jolliUrl: "https://app.jolli.ai",
+			});
 		});
 
-		it("should pass the configured JOLLI_URL through to the exchange", async () => {
+		it("should pass the configured JOLLI_URL through to the exchange and into the saved credentials", async () => {
 			const state = await primeStateViaSignIn(service);
+			// `mockReturnValueOnce` (not mockReturnValue) — the default
+			// `clearAllMocks` in beforeEach only clears call history, not
+			// implementations, so a permanent override would leak into every
+			// later test in the suite. AuthService captures `getJolliUrl()`
+			// once at the top of handleAuthCallback, so a single Once is
+			// enough to cover both the exchange call and the saved credential.
 			getJolliUrl.mockReturnValueOnce("https://custom.jolli.ai");
+			exchangeCliCode.mockResolvedValueOnce({ token: "custom-tk" });
 			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
 
 			await service.handleAuthCallback(uri as never);
@@ -222,6 +269,10 @@ describe("AuthService", () => {
 				"https://custom.jolli.ai",
 				"abc123",
 			);
+			expect(saveAuthCredentials).toHaveBeenCalledWith({
+				token: "custom-tk",
+				jolliUrl: "https://custom.jolli.ai",
+			});
 		});
 
 		it("should return error for server-reported error codes", async () => {
@@ -311,6 +362,7 @@ describe("AuthService", () => {
 			expect(exchangeCliCode).not.toHaveBeenCalled();
 			expect(saveAuthCredentials).toHaveBeenCalledWith({
 				token: "legacy-token",
+				jolliUrl: "https://app.jolli.ai",
 				jolliApiKey: "sk-jol-legacy",
 			});
 			expect(executeCommand).toHaveBeenCalledWith(
@@ -328,6 +380,7 @@ describe("AuthService", () => {
 			expect(result).toEqual({ success: true });
 			expect(saveAuthCredentials).toHaveBeenCalledWith({
 				token: "legacy-token",
+				jolliUrl: "https://app.jolli.ai",
 			});
 		});
 
@@ -368,6 +421,7 @@ describe("AuthService", () => {
 			);
 			expect(saveAuthCredentials).toHaveBeenCalledWith({
 				token: "exchanged-token",
+				jolliUrl: "https://app.jolli.ai",
 				jolliApiKey: "sk-jol-exchanged",
 			});
 		});
@@ -527,6 +581,7 @@ describe("AuthService", () => {
 				expect(result).toEqual({ success: true });
 				expect(saveAuthCredentials).toHaveBeenCalledWith({
 					token: "legacy-tk",
+					jolliUrl: "https://app.jolli.ai",
 				});
 			});
 		});
@@ -600,6 +655,53 @@ describe("AuthService", () => {
 			expect(result.success).toBe(false);
 			if (!result.success) {
 				expect(result.error).toContain("bare string rejection");
+			}
+		});
+
+		it("returns a structured error (not a rejected Promise) when getJolliUrl throws after the callback arrives", async () => {
+			// `getJolliUrl()` is captured once inside handleAuthCallback after
+			// the openSignInPage call already succeeded. If `JOLLI_URL` is
+			// mutated to an off-allowlist value between sign-in launch and
+			// callback arrival, `assertJolliOriginAllowed` throws there — that
+			// must surface as `{ success: false, error }` per the
+			// AuthCallbackResult contract, not as an unhandled rejection that
+			// crashes the URI handler.
+			const state = await primeStateViaSignIn(service);
+			getJolliUrl.mockImplementationOnce(() => {
+				throw new Error("Rejected Jolli origin \"https://evil.com\".");
+			});
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("Rejected Jolli origin");
+			}
+			expect(exchangeCliCode).not.toHaveBeenCalled();
+			expect(saveAuthCredentials).not.toHaveBeenCalled();
+			expect(logError).toHaveBeenCalledWith(
+				"AuthService",
+				expect.stringContaining("getJolliUrl rejected mid-callback"),
+				expect.any(String),
+			);
+		});
+
+		it("stringifies a non-Error throw from getJolliUrl mid-callback", async () => {
+			// Covers the `err instanceof Error ? err.message : String(err)`
+			// right branch of the mid-callback `getJolliUrl` guard above.
+			const state = await primeStateViaSignIn(service);
+			getJolliUrl.mockImplementationOnce(() => {
+				// eslint-disable-next-line @typescript-eslint/no-throw-literal
+				throw "bare-string allowlist rejection";
+			});
+			const uri = makeUri("/auth-callback", `code=abc123&state=${state}`);
+
+			const result = await service.handleAuthCallback(uri as never);
+
+			expect(result.success).toBe(false);
+			if (!result.success) {
+				expect(result.error).toContain("bare-string allowlist rejection");
 			}
 		});
 
@@ -839,11 +941,12 @@ describe("AuthService", () => {
 			);
 		});
 
-		it("should omit generate_api_key when a jolliApiKey already exists", async () => {
-			// Preserves manually configured keys: if we always asked for
-			// generation, the server-issued key would overwrite the manual one
-			// via handleAuthCallback().
+		it("should omit generate_api_key when a jolliApiKey already exists and targets the same tenant", async () => {
+			// Preserves manually configured keys / same-tenant re-auth: if we
+			// always asked for generation, the server-issued key would
+			// overwrite the existing one via handleAuthCallback().
 			loadConfig.mockResolvedValueOnce({ jolliApiKey: "sk-jol-existing" });
+			shouldRequestFreshApiKey.mockReturnValueOnce(false);
 
 			await service.openSignInPage();
 
@@ -851,6 +954,23 @@ describe("AuthService", () => {
 			const parsed = uriParse.mock.calls[0]?.[0] ?? "";
 			expect(parsed).not.toContain("generate_api_key");
 			expect(parsed).toContain("client=vscode");
+			expect(shouldRequestFreshApiKey).toHaveBeenCalledWith("sk-jol-existing", "https://app.jolli.ai");
+		});
+
+		it("appends generate_api_key when an existing key targets a different tenant (cross-tenant rekey)", async () => {
+			// Cross-tenant: existing key for tenant-A, signing into tenant-B.
+			// shouldRequestFreshApiKey returns true so the server mints a fresh
+			// key in this sign-in instead of forcing a second login.
+			loadConfig.mockResolvedValueOnce({ jolliApiKey: "sk-jol-tenant-a" });
+			shouldRequestFreshApiKey.mockReturnValueOnce(true);
+			getDeviceLabel.mockReturnValue("Foster-MBP");
+
+			await service.openSignInPage();
+
+			const parsed = uriParse.mock.calls[0]?.[0] ?? "";
+			expect(parsed).toContain("generate_api_key=true");
+			expect(parsed).toContain("device_name=Foster-MBP");
+			expect(shouldRequestFreshApiKey).toHaveBeenCalledWith("sk-jol-tenant-a", "https://app.jolli.ai");
 		});
 
 		// ── device_name (per-device API-key scoping) ──────────────────────
@@ -899,10 +1019,11 @@ describe("AuthService", () => {
 		});
 
 		it("omits device_name when generate_api_key is not being requested", async () => {
-			// Pre-existing jolliApiKey → no generate_api_key. device_name is
-			// only meaningful at key-creation time, so it must not appear here
-			// even if the machine has a perfectly valid hostname.
+			// Pre-existing jolliApiKey for the same tenant → no generate_api_key.
+			// device_name is only meaningful at key-creation time, so it must
+			// not appear here even if the machine has a perfectly valid hostname.
 			loadConfig.mockResolvedValueOnce({ jolliApiKey: "sk-jol-existing" });
+			shouldRequestFreshApiKey.mockReturnValueOnce(false);
 			getDeviceLabel.mockReturnValue("Foster-MBP");
 
 			await service.openSignInPage();
