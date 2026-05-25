@@ -1,11 +1,20 @@
 # Changelog
 
-<!-- Last synced commit: d53654bc | 2026-05-13 -->
+<!-- Last synced commit: 8ce5671f | 2026-05-28 -->
 
 ## 0.99.2
 
-- **Active AI Conversations panel** — a new **CONVERSATIONS** section in the Branch tab lists your recent AI coding sessions across every supported tool, with the title, agent, and message count at a glance. Click a row to open the full transcript and edit or delete messages — the next commit's memory is generated from your curated version, not the raw conversation.
-- **Per-item commit selection** — uncheck any conversation, plan, note, or file in the Branch tab to keep it out of the next commit's memory. Your choice sticks across commits and restarts until you put it back, and each section has a `Select / Deselect All` shortcut at the top.
+- **See your active AI conversations** — A new **Conversations** section in the Branch tab lists your recent AI coding sessions and keeps itself up to date. Open one to read the full transcript and tidy it up — edit or delete individual turns — before it turns into a memory.
+- **Choose what goes into each memory** — Uncheck any conversation, plan, note, or file to leave it out of the next commit's memory. Your choices stick, and each section has a **Select / Deselect All** shortcut.
+- **Regenerate a summary** — Every memory now has a **Regenerate** button that rewrites it from scratch. Amending or squashing the commit while it runs no longer loses your edits.
+- **No more disappearing panels** — If you amend, squash, or rebase a commit while its memory panel is open, the panel stays open with a warning instead of vanishing mid-edit.
+- **Linear issues in your memories** — When a conversation mentions a Linear issue, it shows up as its own section in the memory, in PR descriptions, and in exports.
+- **See which AI wrote each summary** — Every memory shows where it came from: **Anthropic** (your key), **Anthropic (env)**, or **Jolli**.
+- **Open memories from other repos** — Viewing a memory from another repo's folder in the **Memory Bank** tab now works just like a local one.
+- **More reliable cloud sync** — Your Memory Bank stays in sync across devices more dependably: a sync interrupted by a reload or crash recovers on its own, your vault is tied to one account so a different sign-in can't overwrite it, and conflicts resolve automatically when it's safe. The status bar shows synced / syncing / conflicts / offline.
+- **Quick plan previews** — Hover a plan in **Plans & Notes** to see its title, source, last-updated time, and a snippet.
+- **Opt-in DCO sign-off on AI commits** — A new toggle in **Settings → Others** adds a `Signed-off-by` line to AI-generated commit messages so they pass projects that require it. Off by default.
+- Bug fixes
 
 ## 0.99.1
 

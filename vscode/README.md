@@ -44,8 +44,8 @@ After each commit, Jolli Memory reads your selected AI session transcripts and t
 
 | Tab | What it shows |
 | -- | -- |
-| **Branch tab** *(labeled with the current branch name, e.g. `feature/auth`)* | Three collapsible sections for the current branch: **Plans & Notes** (auto-detected Claude Code plans plus your own text/Markdown notes), **Changes** (all changed files with checkboxes to stage/unstage, plus an exclude filter), and **Commits** (every commit on the current branch not yet in main; click the eye icon (`$(eye)`) to open the full AI summary). |
-| **MEMORY BANK tab** | A cross-branch / cross-repo view of every stored memory on disk. Toggle between **Tree** (folder structure by repo / branch) and **Timeline** (chronological by date) modes from the toolbar, and search across everything. The same data is mirrored on the orphan branch — this tab reads from the dual-written Memory Bank folder. |
+| **Branch tab** *(labeled with the current branch name, e.g. `feature/auth`)* | Four collapsible sections for the current branch: **Conversations** (recent AI coding sessions across every supported tool, with title / agent / message count; the list polls in the background so it stays current), **Plans & Notes** (auto-detected Claude Code plans plus your own text/Markdown notes), **Changes** (all changed files with checkboxes to stage/unstage, plus an exclude filter), and **Commits** (every commit on the current branch not yet in main; click the eye icon (`$(eye)`) to open the full AI summary). Every section has a **Select / Deselect All** toggle, and per-item checkboxes — unchecked items are excluded from the next commit's memory and the exclusion sticks across commits and restarts. |
+| **MEMORY BANK tab** | A cross-branch / cross-repo view of every stored memory on disk. Toggle between **Tree** (folder structure by repo / branch) and **Timeline** (chronological by date) modes from the toolbar, and search across everything. The same data is mirrored on the orphan branch — this tab reads from the dual-written Memory Bank folder, and cross-repo browsing routes reads through the folder layer so opening a memory from a sibling repo never invokes git plumbing in the wrong working tree. |
 | **Status tab** *(icon button on the right)* | Whether Jolli Memory is enabled, active AI agent sessions (Claude, Codex, Gemini, OpenCode, Cursor, Copilot CLI, Copilot Chat), the **AI Summary Provider** row showing what the next commit will actually use (Anthropic / Anthropic (env) / Jolli — clicking it opens Settings), the API-key warning when neither provider has credentials, and per-integration "detected but disabled" rows. The toolbar holds **Settings** (`$(gear)`), either **Sign In to Jolli** or **Sign Out of Jolli** (mutually exclusive based on auth state), **Disable Jolli Memory** (`$(circle-slash)`), and **Refresh** (`$(refresh)`). When the extension is currently disabled, the Status tab is replaced by a single **Enable Jolli Memory** (`$(circle-filled)`) button. A small busy indicator appears while a queue worker is running. |
 
 ---
@@ -105,18 +105,23 @@ Click the eye icon (`$(eye)`) on any commit to open a full memory panel. It show
 * **All Conversations** (Private Zone): raw AI conversation transcripts stored locally on your machine. Browse by session tab, edit, delete, or restore entries. Your private data, nothing is uploaded unless you choose to.
 * **Properties**: commit hash, branch, author, date, duration (working days), conversation count, and code change stats
 * **Plans & Notes**: associated plans and notes with edit, remove, and add actions (plans, Markdown files, or inline text snippets)
+* **Linear Issues**: any Linear issues referenced in the AI conversation (via the Linear MCP server) are extracted at commit time and rendered as first-class items — title, status, identifier, and a deep link back to Linear. They follow the commit through squash / rebase the same way Plans and Notes do.
 * **E2E Test Guide**: AI-generated test scenarios with preconditions, steps, and expected results. Click "Generate" to create them on demand.
 * **Source Commits** (for squash/amend): all contributing commits with diff stats and conversation counts
 * **Topics**: each topic structured as:
   * ⚡ **Why This Change**: the trigger from the AI conversation
   * 💡 **Decisions Behind the Code**: key technical trade-offs and choices
   * ✅ **What Was Implemented**: what was actually built
+* **Footer**: shows the **LLM provider** that produced this memory (Anthropic / Anthropic (env) / Jolli), so a glance tells you which credential the call went through.
 
 Action buttons:
 
 * **Copy Markdown**: copies the full summary to clipboard
 * **Push to Jolli**: publishes the summary (and associated plans and notes) to your Jolli Space. The Memory Bank folder on disk already holds a Markdown copy of every memory automatically — Push to Jolli is purely about cloud publishing.
+* **Regenerate**: re-runs the LLM against the current commit's transcripts + diff, normalizes the result to the v4 tree, and replaces the previous summary in place. While the call is in flight, the panel enters a **regenerating-read-only** state (topics + recap dim, write actions disable, an inline banner explains the wait) and a final stale-write guard re-checks the commit hash inside the race window — so an amend / squash that lands mid-regenerate cannot clobber the new history.
 * **Create & Update PR**: manages a GitHub PR for this commit
+
+**Stale-commit read-only mode** — if the commit shown in the webview is rewritten by an amend / squash / rebase / branch switch while the panel is open, the panel stays open in a persistent **stale read-only** mode with an inline warning banner instead of silently disappearing mid-edit. All write paths (push, edit, regenerate, plan / note add-remove, …) re-check the commit hash inside the race window and bail out cleanly if the hash has moved on disk.
 
 ### Push to Jolli Space
 
@@ -151,7 +156,7 @@ From the Summary Webview, you can:
 * **Remove** a plan or note association from a commit
 * **Associate** additional plans or notes with a commit
 
-Text snippets display their content inline in the Summary Webview; Markdown notes show the filename.
+Text snippets display their content inline in the Summary Webview; Markdown notes show the filename. Hovering any plan in the Branch tab's Plans & Notes section shows a card with the title, source path, last-updated time, and a snippet of the plan body, so you can scan plans without opening each one.
 
 ### Memory Bank sync (cross-device)
 
@@ -218,7 +223,7 @@ Click the gear icon (`$(gear)`) in the Status tab toolbar (or any **Open Setting
 | **AI Summary** | **Provider** dropdown (**Anthropic** vs **Jolli**). The Anthropic card holds `apiKey`, `model`, and `maxTokens`. The Jolli card shows your sign-in state — *Signed-in & ready*, *Signed-in but missing key*, or *Signed-out* — and exposes `jolliApiKey` under an **Advanced** disclosure for power users. |
 | **Sync to Jolli** | Sign-in / sign-out for pushing memories to your Jolli Space. |
 | **Memory Bank** | The on-disk Markdown copy of your memories: pick a folder via **Browse…**, then optionally click **Migrate to Memory Bank** to re-migrate the current repo into a fresh `-N`-suffixed folder (the previous folder is left untouched). |
-| **Others** | `excludePatterns` for the Changes section in the Branch tab. |
+| **Others** | `excludePatterns` for the Changes section in the Branch tab, plus the **DCO sign-off** toggle — when on, **AI Commit** appends `Signed-off-by: <user.name> <user.email>` to its generated commit messages so they pass a DCO-gated CI without manual editing. Off by default. |
 
 Changes are validated on save and persisted to `~/.jolli/jollimemory/config.json`. Click **Apply Changes** in the action bar to commit them.
 
@@ -295,6 +300,10 @@ Most settings live behind the gear icon on the **Status tab** toolbar. `authToke
 | `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |
 | `localFolder` | string | — | Memory Bank folder root — every memory is dual-written here as Markdown alongside the orphan-branch copy. Set via Settings → Memory Bank → Browse…. |
 | `excludePatterns` | string[] | — | Glob patterns for hiding files from the Changes section in the Branch tab |
+| `syncEnabled` | boolean | `false` | Opt the Memory Bank into cloud sync to your Jolli Personal Space. Drives the long-lived sync engine and the status-bar indicator. Toggle via Settings → Memory Bank → **Enable Memory Bank cloud sync**. |
+| `syncTranscripts` | boolean | `false` | When sync is enabled, also mirror raw conversation transcripts (not just summaries) into the personal vault. Off by default so transcripts stay local unless you opt in. |
+| `syncPollIntervalSec` | integer | `5400` | Sync engine wake-up cadence in seconds. Floor is 5400 (90 min) — sync is heavy, and the **Sync to Personal Space Now** button covers urgent updates. |
+| `dcoSignoff` | boolean | `false` | Append `Signed-off-by: <user.name> <user.email>` to commits created by **AI Commit**. Off by default; turn on if your project's CI gates merges on a DCO sign-off. Set via Settings → Others. |
 
 ---
 
