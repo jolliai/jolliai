@@ -48,3 +48,6 @@ Thumbs.db
 
 # Generated codicon assets (copied from node_modules at build time)
 vscode/assets/codicons/
+
+# Local pre-PR review state (per-developer scratch)
+.claude/review-findings/

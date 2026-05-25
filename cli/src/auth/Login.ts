@@ -14,7 +14,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import open from "open";
 import { loadConfig } from "../core/SessionTracker.js";
-import { saveAuthCredentials } from "./AuthConfig.js";
+import { resolveSignInJolliUrl, saveAuthCredentials, shouldRequestFreshApiKey } from "./AuthConfig.js";
 import { exchangeCliCode } from "./CliExchange.js";
 import { getDeviceLabel } from "./DeviceLabel.js";
 
@@ -65,10 +65,13 @@ export function browserLogin(jolliUrl: string): Promise<void> {
 					// server (telemetry, surface-aware behavior). `client_version`
 					// pairs with it so server-side min-version gating can run at
 					// sign-in, not only on later API calls. `generate_api_key=true`
-					// is independent: only asked for when there's no existing key.
+					// is gated by `shouldRequestFreshApiKey` — asked for when no
+					// key is on disk, or the on-disk key targets a different
+					// tenant than `jolliUrl` (so cross-tenant switch completes
+					// in one sign-in instead of two).
 					const config = await loadConfig();
 					let loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUrl)}&state=${expectedState}&client=cli&client_version=${encodeURIComponent(CLIENT_VERSION)}`;
-					if (!config.jolliApiKey) {
+					if (shouldRequestFreshApiKey(config.jolliApiKey, jolliUrl)) {
 						loginUrl += "&generate_api_key=true";
 						// `device_name` scopes the server's per-user idempotency key so
 						// signing in from a second machine doesn't invalidate the first
@@ -175,11 +178,19 @@ export function createLoginServer(options: LoginServerOptions): Server {
 		}
 
 		try {
-			let credentials: { token: string; jolliApiKey?: string };
+			let credentials: { token: string; jolliApiKey?: string; jolliUrl: string };
 			if (code) {
 				const exchanged = await exchangeCliCode(jolliUrl, code);
 				credentials = {
 					token: exchanged.token,
+					// Persist the tenant the minted key actually targets, not the
+					// sign-in origin `jolliUrl`. With no `JOLLI_URL` set the latter
+					// is the auth hub (`auth.jolli.ai`), while the key's `meta.u` is
+					// the user's real tenant — persisting the hub would (a) make
+					// `saveAuthCredentials`'s same-tenant symmetry check reject every
+					// normal key and (b) leave the routing fallback pointing at the
+					// hub instead of the tenant. See `resolveSignInJolliUrl`.
+					jolliUrl: resolveSignInJolliUrl(exchanged.jolliApiKey, jolliUrl),
 					...(exchanged.jolliApiKey ? { jolliApiKey: exchanged.jolliApiKey } : {}),
 				};
 			} else if (legacyToken) {
@@ -191,6 +202,7 @@ export function createLoginServer(options: LoginServerOptions): Server {
 				const legacyApiKey = url.searchParams.get("jolli_api_key");
 				credentials = {
 					token: legacyToken,
+					jolliUrl: resolveSignInJolliUrl(legacyApiKey ?? undefined, jolliUrl),
 					...(legacyApiKey ? { jolliApiKey: legacyApiKey } : {}),
 				};
 			} else {

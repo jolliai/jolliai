@@ -3,24 +3,34 @@
  * Tests for {@link PluginLoader}.
  *
  * Fixtures are written to a per-test temp directory and torn down after each
- * test. Fixture package names use the generic `@test-fixtures/example-plugin`
- * scope — never `@jolli.ai/cli-pro` — so test code reads cleanly without
- * implying anything about the real plugin packages.
+ * test. Fixture packages live under the generic `@test-fixtures` scope and
+ * declare a fixture-only `jolliPluginId` — never any production-scope name or
+ * the real plugin's ID — so test code reads cleanly without implying anything
+ * about the real plugin packages.
  */
 
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setSilentConsole } from "./Logger.js";
 import { getNpmRootGlobal, loadPlugins } from "./PluginLoader.js";
 
 const FIXTURE_NAME = "@test-fixtures/example-plugin";
+const FIXTURE_SCOPE = "@test-fixtures";
+/** Opaque random string used as the fixture's `jolliPluginId`. Has no relation to any production ID. */
+const FIXTURE_ID = "00000000-test-4f1d-9000-fixtureplgnid";
 
 /**
  * Write a fixture plugin package into `<tempDir>/node_modules/<name>/`.
  * Returns the `node_modules` root that can be passed as `rootsOverride`.
+ *
+ * By default the fixture declares {@link FIXTURE_ID} as its `jolliPluginId`.
+ * Pass `pluginId: null` to omit the field entirely (used to verify discovery
+ * skips packages without an ID) or `pluginId: <value>` to declare a specific
+ * (possibly non-string) value.
  */
 async function writeFixture(
 	tempDir: string,
@@ -30,6 +40,7 @@ async function writeFixture(
 		pluginSource?: string;
 		mainPath?: string;
 		brokenPackageJson?: boolean;
+		pluginId?: string | number | null;
 	},
 ): Promise<string> {
 	const name = opts.name ?? FIXTURE_NAME;
@@ -47,6 +58,11 @@ async function writeFixture(
 			type: "module",
 			main: opts.mainPath ?? "./dist/Plugin.js",
 		};
+		if (opts.pluginId === undefined) {
+			pkg.jolliPluginId = FIXTURE_ID;
+		} else if (opts.pluginId !== null) {
+			pkg.jolliPluginId = opts.pluginId;
+		}
 		if (opts.peerVersion) {
 			pkg.peerDependencies = { "@jolli.ai/cli": opts.peerVersion };
 		}
@@ -93,7 +109,8 @@ describe("loadPlugins peer-range matching", () => {
 		const program = new Command();
 		await loadPlugins(program, cliVersion, {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		return program.commands.some((c) => c.name() === "plugin-loaded");
 	}
@@ -172,7 +189,8 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands.find((c) => c.name() === "plugin-hello")).toBeDefined();
 	});
@@ -181,7 +199,8 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [join(tempDir, "node_modules")],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands).toHaveLength(0);
 	});
@@ -194,7 +213,8 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands).toHaveLength(0);
 	});
@@ -207,7 +227,8 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands.find((c) => c.name() === "plugin-no-peer")).toBeDefined();
 	});
@@ -220,7 +241,8 @@ describe("loadPlugins", () => {
 		program.command("enable").action(() => {});
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands).toHaveLength(1);
 		expect(program.commands[0].name()).toBe("enable");
@@ -233,9 +255,34 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands).toHaveLength(0);
+	});
+
+	it("stringifies a non-Error throw from register() without losing the diagnostic", async () => {
+		// Plugins are untrusted code. `throw "boom"` and `throw null` would
+		// otherwise render as `(err as Error).message === undefined`, leaving
+		// the operator with no signal for why the plugin was skipped.
+		const root = await writeFixture(tempDir, {
+			pluginSource: "export const register = () => { throw 'bare-string register failure'; };",
+		});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const program = new Command();
+			await loadPlugins(program, "0.100.0", {
+				rootsOverride: [root],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+			});
+			expect(program.commands).toHaveLength(0);
+			const calls = warnSpy.mock.calls.flat().join(" ");
+			expect(calls).toContain("bare-string register failure");
+			expect(calls).not.toContain("undefined");
+		} finally {
+			warnSpy.mockRestore();
+		}
 	});
 
 	it("skips plugin missing the register export", async () => {
@@ -245,7 +292,8 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands).toHaveLength(0);
 	});
@@ -261,7 +309,8 @@ describe("loadPlugins", () => {
 		program.command("enable").action(() => {});
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		const names = program.commands.map((c) => c.name());
 		expect(names.filter((n) => n === "enable")).toHaveLength(1);
@@ -285,7 +334,8 @@ describe("loadPlugins", () => {
 		program.command("enable").action(() => {});
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		const names = program.commands.map((c) => c.name());
 		expect(names.filter((n) => n === "enable")).toHaveLength(1);
@@ -311,7 +361,8 @@ describe("loadPlugins", () => {
 			.action(() => {});
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		const names = program.commands.map((c) => c.name());
 		expect(names).toContain("recall");
@@ -331,7 +382,8 @@ describe("loadPlugins", () => {
 		program.command("enable").action(() => {});
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		const names = program.commands.map((c) => c.name());
 		expect(names).toContain("plugin-foo");
@@ -354,7 +406,8 @@ describe("loadPlugins", () => {
 			.action(() => {});
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		const names = program.commands.map((c) => c.name());
 		expect(names).toContain("plugin-foo");
@@ -374,7 +427,8 @@ describe("loadPlugins", () => {
 		program.command("enable").action(() => {});
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		const names = program.commands.map((c) => c.name());
 		expect(names).toContain("plugin-foo");
@@ -402,7 +456,8 @@ describe("loadPlugins", () => {
 		program.command("enable").action(() => {});
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		const names = program.commands.map((c) => c.name());
 		expect(names).toContain("enable");
@@ -427,7 +482,8 @@ describe("loadPlugins", () => {
 		program.command("enable").action(() => {});
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		const names = program.commands.map((c) => c.name());
 		expect(names.filter((n) => n === "enable")).toHaveLength(1);
@@ -450,7 +506,8 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		const names = program.commands.map((c) => c.name());
 		expect(names).toContain("plugin-first");
@@ -476,9 +533,40 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands.find((c) => c.name() === "plugin-getter-check")).toBeDefined();
+	});
+
+	it("does not leak alias/aliases patches onto program when a plugin uses the executable-subcommand form", async () => {
+		// Commander's `.command(name, "description")` (executable subcommand
+		// form) returns `this` (the program), not a new sub-command — see
+		// commander/lib/command.js `if (desc) return this`. Without the
+		// `newCmd === this` guard in patchedCommand, loadPlugins would call
+		// patchCommandAliasMethods(program, …), permanently overwriting
+		// program.alias / program.aliases with patched versions whose closures
+		// hold per-register Sets — the restoreCommand thunk only restores
+		// program.command / program.addCommand, not alias/aliases.
+		const program = new Command();
+		const origAliasDescriptor = Object.getOwnPropertyDescriptor(program, "alias");
+		const origAliasesDescriptor = Object.getOwnPropertyDescriptor(program, "aliases");
+		const root = await writeFixture(tempDir, {
+			pluginSource: `export const register = (ctx) => {
+				// Two-arg form triggers Commander's "executable subcommand" return-this path.
+				ctx.program.command('plugin-executable-form', 'an executable plugin sub-command');
+			};`,
+		});
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		// After loadPlugins returns, program.alias and program.aliases must be
+		// exactly what Commander gave us — neither patched into own-properties
+		// nor changed by the loader.
+		expect(Object.getOwnPropertyDescriptor(program, "alias")).toEqual(origAliasDescriptor);
+		expect(Object.getOwnPropertyDescriptor(program, "aliases")).toEqual(origAliasesDescriptor);
 	});
 
 	it("preserves partially registered commands when register throws", async () => {
@@ -491,19 +579,64 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		// register() partially completed before throwing; the early command stays
 		expect(program.commands.find((c) => c.name() === "plugin-first")).toBeDefined();
 	});
 
-	it("skips a plugin with malformed package.json", async () => {
+	it("skips a plugin with malformed package.json and leaves a debug breadcrumb", async () => {
 		const root = await writeFixture(tempDir, { brokenPackageJson: true });
+		// The loader can't tell from an unparseable manifest whether this is the
+		// allow-listed plugin, so it must NOT warn (noisy for unrelated broken
+		// packages in the scope) — but it must leave a debug breadcrumb so a real
+		// plugin shipping a corrupt manifest doesn't vanish without trace.
+		// `log.debug` routes through `console.error` (Logger.ts), and a warn
+		// would route through `console.warn`. Debug is suppressed from the
+		// console by default (`_silentConsole`), so flip it off for this test to
+		// observe the breadcrumb.
+		setSilentConsole(false);
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const program = new Command();
+			await loadPlugins(program, "0.100.0", {
+				rootsOverride: [root],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+			});
+			expect(program.commands).toHaveLength(0);
+
+			const debugCalls = errSpy.mock.calls.map((c) => String(c[0])).join("\n");
+			expect(debugCalls).toContain("invalid package.json");
+			expect(debugCalls).toContain(`${FIXTURE_SCOPE}/example-plugin`);
+			// Not surfaced as a user-facing warning.
+			expect(warnSpy.mock.calls.map((c) => String(c[0])).join("\n")).not.toContain("package.json");
+		} finally {
+			errSpy.mockRestore();
+			warnSpy.mockRestore();
+			setSilentConsole(true);
+		}
+	});
+
+	it("skips a scope entry whose package.json parses to a non-object", async () => {
+		// Valid JSON that is NOT an object — `[]`, `null`, `42` — is a distinct
+		// path from the malformed-JSON case above (which throws inside
+		// JSON.parse). The explicit non-object guard must reject it before any
+		// field access, so a future refactor can't accidentally read `.main`
+		// off an array. JSON.parse("[]") yields an array, hitting Array.isArray.
+		const pkgDir = join(tempDir, "node_modules", FIXTURE_SCOPE, "array-pkg");
+		await mkdir(pkgDir, { recursive: true });
+		await writeFile(join(pkgDir, "package.json"), "[]", "utf-8");
 		const program = new Command();
-		await loadPlugins(program, "0.100.0", {
-			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
-		});
+		await expect(
+			loadPlugins(program, "0.100.0", {
+				rootsOverride: [join(tempDir, "node_modules")],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+			}),
+		).resolves.toBeUndefined();
 		expect(program.commands).toHaveLength(0);
 	});
 
@@ -513,7 +646,8 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands).toHaveLength(0);
 	});
@@ -527,14 +661,21 @@ describe("loadPlugins", () => {
 		await mkdir(pkgDir, { recursive: true });
 		await writeFile(
 			join(pkgDir, "package.json"),
-			JSON.stringify({ name: FIXTURE_NAME, version: "0.1.0", type: "module", main: 12345 }),
+			JSON.stringify({
+				name: FIXTURE_NAME,
+				version: "0.1.0",
+				type: "module",
+				main: 12345,
+				jolliPluginId: FIXTURE_ID,
+			}),
 			"utf-8",
 		);
 		const program = new Command();
 		await expect(
 			loadPlugins(program, "0.100.0", {
 				rootsOverride: [join(tempDir, "node_modules")],
-				allowlistOverride: [FIXTURE_NAME],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
 			}),
 		).resolves.toBeUndefined();
 		expect(program.commands).toHaveLength(0);
@@ -552,13 +693,20 @@ describe("loadPlugins", () => {
 		await mkdir(pkgDir, { recursive: true });
 		await writeFile(
 			join(pkgDir, "package.json"),
-			JSON.stringify({ name: FIXTURE_NAME, version: "0.1.0", type: "module", main: escapingMain }),
+			JSON.stringify({
+				name: FIXTURE_NAME,
+				version: "0.1.0",
+				type: "module",
+				main: escapingMain,
+				jolliPluginId: FIXTURE_ID,
+			}),
 			"utf-8",
 		);
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [join(tempDir, "node_modules")],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands).toHaveLength(0);
 	});
@@ -572,7 +720,8 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands).toHaveLength(0);
 	});
@@ -587,7 +736,8 @@ describe("loadPlugins", () => {
 		// Should not throw; suppression branch is exercised
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands).toHaveLength(0);
 	});
@@ -605,7 +755,8 @@ describe("loadPlugins", () => {
 		try {
 			const program = new Command();
 			await loadPlugins(program, "0.100.0", {
-				allowlistOverride: [FIXTURE_NAME],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
 				getGlobalRoot: async () => root,
 			});
 			expect(program.commands.find((c) => c.name() === "plugin-via-global")).toBeDefined();
@@ -622,7 +773,8 @@ describe("loadPlugins", () => {
 		try {
 			const program = new Command();
 			await loadPlugins(program, "0.100.0", {
-				allowlistOverride: [FIXTURE_NAME],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
 				getGlobalRoot: async () => null,
 			});
 			expect(program.commands).toHaveLength(0);
@@ -641,7 +793,8 @@ describe("loadPlugins", () => {
 		try {
 			const program = new Command();
 			await loadPlugins(program, "0.100.0", {
-				allowlistOverride: [FIXTURE_NAME],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
 				getGlobalRoot: async () => root,
 			});
 			expect(program.commands.filter((c) => c.name() === "plugin-once")).toHaveLength(1);
@@ -672,7 +825,8 @@ describe("loadPlugins", () => {
 		try {
 			const program = new Command();
 			await loadPlugins(program, "0.100.0", {
-				allowlistOverride: [FIXTURE_NAME],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
 				getGlobalRoot: async () => null,
 			});
 			expect(program.commands.find((c) => c.name() === "plugin-hoisted")).toBeDefined();
@@ -706,7 +860,8 @@ describe("loadPlugins", () => {
 		try {
 			const program = new Command();
 			await loadPlugins(program, "0.100.0", {
-				allowlistOverride: [FIXTURE_NAME],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
 				getGlobalRoot: async () => null,
 			});
 			expect(program.commands.find((c) => c.name() === "plugin-above-git")).toBeUndefined();
@@ -736,7 +891,8 @@ describe("loadPlugins", () => {
 			// so isWithinBoundary returns false for the cwd from the start
 			// and the loop body never runs.
 			await loadPlugins(program, "0.100.0", {
-				allowlistOverride: [FIXTURE_NAME],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
 				getGlobalRoot: async () => null,
 				homedirOverride: "/nonexistent/home/path",
 			});
@@ -772,7 +928,8 @@ describe("loadPlugins", () => {
 		try {
 			const program = new Command();
 			await loadPlugins(program, "0.100.0", {
-				allowlistOverride: [FIXTURE_NAME],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
 				getGlobalRoot: async () => null,
 				homedirOverride: realTempDir,
 			});
@@ -783,8 +940,260 @@ describe("loadPlugins", () => {
 		}
 	});
 
-	it("uses the default allowlist when no override is provided", async () => {
-		// FIXTURE_NAME is not in the production allowlist, so it must be ignored.
+	it("skips a plugin whose package.json omits jolliPluginId", async () => {
+		const root = await writeFixture(tempDir, {
+			pluginId: null,
+			pluginSource: "export const register = (ctx) => { ctx.program.command('plugin-no-id').action(() => {}); };",
+		});
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(program.commands.find((c) => c.name() === "plugin-no-id")).toBeUndefined();
+	});
+
+	it("skips a plugin whose jolliPluginId is not in the allowlist", async () => {
+		const root = await writeFixture(tempDir, {
+			pluginId: "some-other-id-not-on-the-allowlist",
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-wrong-id').action(() => {}); };",
+		});
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(program.commands.find((c) => c.name() === "plugin-wrong-id")).toBeUndefined();
+	});
+
+	it("skips a plugin whose jolliPluginId is not a string", async () => {
+		// JSON.parse can hand us any type — number, array, object — for the field.
+		// The loader must reject non-string IDs rather than coerce or crash.
+		const root = await writeFixture(tempDir, {
+			pluginId: 12345,
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-numeric-id').action(() => {}); };",
+		});
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(program.commands.find((c) => c.name() === "plugin-numeric-id")).toBeUndefined();
+	});
+
+	it("ignores non-directory entries inside a scope folder", async () => {
+		// Stray files (.DS_Store, .package-lock.json, etc.) sometimes live next
+		// to scoped package directories. The discovery loop must skip them
+		// rather than try to read a package.json inside them.
+		const root = await writeFixture(tempDir, {
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-with-stray-file').action(() => {}); };",
+		});
+		await writeFile(join(root, FIXTURE_SCOPE, ".DS_Store"), "junk", "utf-8");
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(program.commands.find((c) => c.name() === "plugin-with-stray-file")).toBeDefined();
+	});
+
+	it("ignores a scope entry that lacks a package.json", async () => {
+		// A directory under the scope without a package.json is not a package —
+		// silently skip it so the loop doesn't crash on the missing file.
+		const root = await writeFixture(tempDir, {
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-near-empty-dir').action(() => {}); };",
+		});
+		await mkdir(join(root, FIXTURE_SCOPE, "incomplete-package"), { recursive: true });
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(program.commands.find((c) => c.name() === "plugin-near-empty-dir")).toBeDefined();
+	});
+
+	it("survives a scope path that exists but is not a directory", async () => {
+		// existsSync(scopeDir) is true but readdir throws ENOTDIR. The discovery
+		// loop must catch and move on to the next scope/root rather than letting
+		// the error escape.
+		const nodeModules = join(tempDir, "node_modules");
+		await mkdir(nodeModules, { recursive: true });
+		await writeFile(join(nodeModules, FIXTURE_SCOPE), "this is a file, not a scope dir", "utf-8");
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [nodeModules],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(program.commands).toHaveLength(0);
+	});
+
+	it("discovers a plugin installed as a symlink (npm link / workspace layout)", async () => {
+		// Dirent.isDirectory() returns false for a symlink-to-directory under
+		// `withFileTypes: true`, so without the isSymbolicLink() fallback the
+		// loader would silently miss `npm link`, yarn workspaces, and pnpm's
+		// non-isolated installs.
+		const realPkgRoot = join(tempDir, "real-source", "example-plugin");
+		await mkdir(join(realPkgRoot, "dist"), { recursive: true });
+		await writeFile(
+			join(realPkgRoot, "package.json"),
+			JSON.stringify({
+				name: "@test-fixtures/example-plugin",
+				version: "0.1.0",
+				type: "module",
+				main: "./dist/Plugin.js",
+				jolliPluginId: FIXTURE_ID,
+			}),
+			"utf-8",
+		);
+		await writeFile(
+			join(realPkgRoot, "dist", "Plugin.js"),
+			"export const register = (ctx) => { ctx.program.command('plugin-via-symlink').action(() => {}); };",
+			"utf-8",
+		);
+
+		const nodeModules = join(tempDir, "node_modules");
+		await mkdir(join(nodeModules, FIXTURE_SCOPE), { recursive: true });
+		await symlink(realPkgRoot, join(nodeModules, FIXTURE_SCOPE, "example-plugin"), "dir");
+
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [nodeModules],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(program.commands.find((c) => c.name() === "plugin-via-symlink")).toBeDefined();
+	});
+
+	it("picks deterministically and warns when two packages in the same scope claim the same ID", async () => {
+		// Two packages in the same scope+root declaring the same jolliPluginId
+		// is the rename-mid-migration scenario the design accepts. The loader
+		// must (a) deterministically pick the lexicographically first name,
+		// regardless of readdir's filesystem-dependent order, and (b) emit a
+		// warn so the user notices the collision and can clean up.
+		const root = await writeFixture(tempDir, {
+			name: `${FIXTURE_SCOPE}/a-plugin`,
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-from-a').action(() => {}); };",
+		});
+		// Second package with the same ID, lexicographically later.
+		const zDir = join(root, FIXTURE_SCOPE, "z-plugin");
+		await mkdir(join(zDir, "dist"), { recursive: true });
+		await writeFile(
+			join(zDir, "package.json"),
+			JSON.stringify({
+				name: `${FIXTURE_SCOPE}/z-plugin`,
+				version: "0.1.0",
+				type: "module",
+				main: "./dist/Plugin.js",
+				jolliPluginId: FIXTURE_ID,
+			}),
+			"utf-8",
+		);
+		await writeFile(
+			join(zDir, "dist", "Plugin.js"),
+			"export const register = (ctx) => { ctx.program.command('plugin-from-z').action(() => {}); };",
+			"utf-8",
+		);
+
+		// Capture console.warn to assert the collision warn. The loader's
+		// `warn()` helper routes through createLogger("PluginLoader").warn,
+		// which calls console.warn (see Logger.ts:229) unless
+		// JOLLI_NO_PLUGIN_WARNINGS is set.
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		try {
+			const program = new Command();
+			await loadPlugins(program, "0.100.0", {
+				rootsOverride: [root],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+			});
+			expect(program.commands.find((c) => c.name() === "plugin-from-a")).toBeDefined();
+			expect(program.commands.find((c) => c.name() === "plugin-from-z")).toBeUndefined();
+
+			// Assert both the loser's name and the winner's name appear in the
+			// warning — without those names, a user looking at debug.log can't
+			// tell which package to uninstall.
+			const calls = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+			expect(calls).toContain("z-plugin");
+			expect(calls).toContain("a-plugin");
+			expect(calls).toContain(FIXTURE_ID);
+			// And the warning names the exact root, not just "the same scope" —
+			// a user with one `node_modules` per workspace package needs to know
+			// which root to clean up.
+			expect(calls).toContain(root);
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("skips a duplicate plugin ID found in a later root (first root wins, silently)", async () => {
+		// The same jolliPluginId present in two GENUINELY DISTINCT roots is
+		// normal hoisting — a project-local copy shadowing the global npm root.
+		// `seenAcrossRoots` makes the first root in priority order win and the
+		// second is skipped silently (no warn — unlike the same-scope collision
+		// above). Without the cross-root dedupe the loader would re-run the same
+		// plugin's register() and the second pass would collide on its own
+		// command names.
+		const rootOne = join(tempDir, "root-one", "node_modules");
+		const rootTwo = join(tempDir, "root-two", "node_modules");
+		for (const [root, cmd] of [
+			[rootOne, "plugin-root-one"],
+			[rootTwo, "plugin-root-two"],
+		] as const) {
+			const pkgDir = join(root, FIXTURE_SCOPE, "example-plugin");
+			await mkdir(join(pkgDir, "dist"), { recursive: true });
+			await writeFile(
+				join(pkgDir, "package.json"),
+				JSON.stringify({
+					name: FIXTURE_NAME,
+					version: "0.1.0",
+					type: "module",
+					main: "./dist/Plugin.js",
+					jolliPluginId: FIXTURE_ID,
+				}),
+				"utf-8",
+			);
+			await writeFile(
+				join(pkgDir, "dist", "Plugin.js"),
+				`export const register = (ctx) => { ctx.program.command('${cmd}').action(() => {}); };`,
+				"utf-8",
+			);
+		}
+
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const program = new Command();
+			await loadPlugins(program, "0.100.0", {
+				rootsOverride: [rootOne, rootTwo],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+			});
+			// First root wins; the second root's copy is skipped.
+			expect(program.commands.find((c) => c.name() === "plugin-root-one")).toBeDefined();
+			expect(program.commands.find((c) => c.name() === "plugin-root-two")).toBeUndefined();
+			// Cross-root hoisting is the expected case — no collision warning.
+			const calls = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+			expect(calls).not.toContain(FIXTURE_ID);
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("uses the default allowlist and scopes when no override is provided", async () => {
+		// Without overrides the loader uses the production allowlist and scopes.
+		// The fixture lives under @test-fixtures with a fixture-only ID, so it
+		// matches neither — the loader must ignore it.
 		const root = await writeFixture(tempDir, {
 			pluginSource:
 				"export const register = (ctx) => { ctx.program.command('should-not-load').action(() => {}); };",
@@ -811,7 +1220,8 @@ describe("loadPlugins", () => {
 		const program = new Command();
 		await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
-			allowlistOverride: [FIXTURE_NAME],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
 		});
 		expect(program.commands.find((c) => c.name() === "plugin-default-main")).toBeDefined();
 	});
@@ -823,7 +1233,8 @@ describe("loadPlugins", () => {
 		try {
 			const program = new Command();
 			await loadPlugins(program, "0.100.0", {
-				allowlistOverride: [FIXTURE_NAME],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
 				getGlobalRoot: async () => "/definitely/not/a/real/path/anywhere",
 			});
 			expect(program.commands).toHaveLength(0);

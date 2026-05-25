@@ -594,7 +594,15 @@ export class GitClient {
 		for (const path of candidates) {
 			try {
 				const s = await stat(path);
-				if (s.isFile() && s.mtimeMs < cutoff) {
+				// `Date.now()` (hence `cutoff`) is integer-ms, but `stat().mtimeMs`
+				// carries sub-ms precision on APFS/ext4. A lock written in the same
+				// integer millisecond as `cutoff` then reads as e.g. `…276.76`, which
+				// a strict `mtimeMs < cutoff` would spare as "not yet stale" even
+				// though the file was written before this sweep ran. Floor to integer
+				// ms and compare with `<=` so a lock that is at least `ttlMs` old is
+				// swept regardless of that fractional remainder. (No effect at the
+				// 5-min production TTL; only the ttl=0 fast path is precision-sensitive.)
+				if (s.isFile() && Math.floor(s.mtimeMs) <= cutoff) {
 					await rm(path, { force: true });
 					removed.push(path);
 				}

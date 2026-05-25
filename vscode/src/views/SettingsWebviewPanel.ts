@@ -103,12 +103,20 @@ function maskApiKey(key: string | undefined): string {
 
 /**
  * Builds the human-friendly site label shown on the AI Summary > Jolli card.
- * Mirrors the Kotlin port in `intellij/.../SettingsDialog.kt::refreshJolliFields`.
+ * Mirrors the Kotlin port in `intellij/.../SettingsDialog.kt::refreshJolliFields`
+ * (the IntelliJ side persists no `jolliUrl` of its own — config-intellij.json
+ * has no such field — so the Kotlin port can ignore the fallback argument).
+ *
+ * Falls back to `jolliUrl` when `jolliApiKey` is absent OR present but
+ * undecodable. This matches `cli/src/commands/StatusCommand.ts` so the
+ * Settings panel and `jolli status` agree on the displayed site after a
+ * cross-tenant clear has emptied the key but the persisted sign-in origin
+ * is still known, and also for legacy / hand-typed keys whose
+ * `parseJolliApiKey` returns null.
  */
-function buildJolliSiteLabel(jolliApiKey: string | undefined): string {
-	if (!jolliApiKey) return "Using Jolli to generate summaries";
-	const meta = parseJolliApiKey(jolliApiKey);
-	const siteDisplay = meta?.u.replace(/^https?:\/\//, "") ?? "";
+function buildJolliSiteLabel(jolliApiKey: string | undefined, jolliUrl: string | undefined): string {
+	const siteOrigin = parseJolliApiKey(jolliApiKey ?? "")?.u ?? jolliUrl;
+	const siteDisplay = siteOrigin?.replace(/^https?:\/\//, "") ?? "";
 	return siteDisplay
 		? `Signed in to ${siteDisplay} — using Jolli to generate summaries`
 		: "Using Jolli to generate summaries";
@@ -407,7 +415,7 @@ export class SettingsWebviewPanel {
 			maskedJolliApiKey,
 			signedIn,
 			hasJolliKey,
-			jolliSiteLabel: buildJolliSiteLabel(config.jolliApiKey),
+			jolliSiteLabel: buildJolliSiteLabel(config.jolliApiKey, config.jolliUrl),
 		});
 
 		if (this.fullJolliApiKey.length > 0) {
@@ -444,7 +452,7 @@ export class SettingsWebviewPanel {
 			signedIn,
 			hasJolliKey,
 			aiProvider: this.resolveProvider(config),
-			jolliSiteLabel: buildJolliSiteLabel(config.jolliApiKey),
+			jolliSiteLabel: buildJolliSiteLabel(config.jolliApiKey, config.jolliUrl),
 		});
 	}
 

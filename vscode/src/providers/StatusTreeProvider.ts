@@ -202,20 +202,15 @@ function buildFullStatusItems(
 		);
 		items.push(accountItem);
 
-		if (config.jolliApiKey) {
-			const meta = parseJolliApiKey(config.jolliApiKey);
-			if (meta?.u) {
-				const siteTooltip = `Resolved from Jolli API Key (tenant: ${meta.t})`;
-				items.push(
-					new StatusItem(
-						"Jolli Site",
-						meta.u.replace(/^https?:\/\//, ""),
-						ICON_GLOBE,
-						siteTooltip,
-					),
-				);
-			}
-		} else {
+		// Show the resolved site. `buildJolliSiteItem` falls back to the
+		// persisted `jolliUrl` when no decodable key is on file, so the panel
+		// keeps showing the tenant in the "signed in but key not yet issued /
+		// stale key cleared" state — matching the Settings panel and `jolli
+		// status`, which both gained the same fallback.
+		const siteItem = buildJolliSiteItem(config);
+		if (siteItem) items.push(siteItem);
+
+		if (!config.jolliApiKey) {
 			const keyWarn = new StatusItem(
 				"Jolli API Key",
 				"not issued — pushes disabled",
@@ -229,18 +224,8 @@ function buildFullStatusItems(
 			items.push(keyWarn);
 		}
 	} else if (config?.jolliApiKey) {
-		const meta = parseJolliApiKey(config.jolliApiKey);
-		if (meta?.u) {
-			const siteTooltip = `Resolved from Jolli API Key (tenant: ${meta.t})`;
-			items.push(
-				new StatusItem(
-					"Jolli Site",
-					meta.u.replace(/^https?:\/\//, ""),
-					ICON_GLOBE,
-					siteTooltip,
-				),
-			);
-		}
+		const siteItem = buildJolliSiteItem(config);
+		if (siteItem) items.push(siteItem);
 	} else {
 		const accountItem = new StatusItem(
 			"Jolli Account",
@@ -388,6 +373,27 @@ function buildFullStatusItems(
 	}
 
 	return items;
+}
+
+/**
+ * Builds the "Jolli Site" tree row, or `undefined` when no site is resolvable.
+ *
+ * The site origin is the minted key's embedded `meta.u` when a decodable key is
+ * on file, otherwise the persisted sign-in origin `config.jolliUrl`. This
+ * mirrors `buildJolliSiteLabel` in `SettingsWebviewPanel.ts` and the
+ * `config.jolliUrl` fallback in `cli/src/commands/StatusCommand.ts`, so all
+ * three surfaces agree on the displayed site — including the "signed in but no
+ * Jolli API Key (yet) on file" state where the key-only derivation would show
+ * nothing. The tooltip records which source was used so the row is auditable.
+ */
+function buildJolliSiteItem(config: JolliMemoryConfig): StatusItem | undefined {
+	const meta = config.jolliApiKey ? parseJolliApiKey(config.jolliApiKey) : null;
+	const origin = meta?.u ?? config.jolliUrl;
+	if (!origin) return undefined;
+	const tooltip = meta?.u
+		? `Resolved from Jolli API Key (tenant: ${meta.t})`
+		: "Persisted sign-in origin (no decodable Jolli API Key on file)";
+	return new StatusItem("Jolli Site", origin.replace(/^https?:\/\//, ""), ICON_GLOBE, tooltip);
 }
 
 /**

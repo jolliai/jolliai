@@ -7,7 +7,6 @@
 
 import type { Command } from "commander";
 import { loadAuthToken } from "../auth/AuthConfig.js";
-import { parseJolliApiKey } from "../core/JolliApiUtils.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { getStatus } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
@@ -81,10 +80,18 @@ export function registerStatusCommand(program: Command): void {
 				? `${status.hookSource}${status.hookVersion && status.hookVersion !== "unknown" ? `@${status.hookVersion}` : ""}`
 				: undefined;
 
-			// Load config for Jolli Site display (same layered logic as enable)
+			// Load config for Jolli Site display (same layered logic as enable).
+			// `jolliUrl` is the persisted public site origin, written on every
+			// sign-in since 0.99.2. We deliberately do NOT fall back to the tenant
+			// URL embedded in `jolliApiKey`: although `meta.u` is a public origin
+			// (not secret material), deriving a *logged* value from the key trips
+			// CodeQL's clear-text-logging taint analysis (jolliApiKey ->
+			// parseJolliApiKey -> console.log). A pre-0.99.2 install that carries
+			// only `jolliApiKey` simply omits this row until the next sign-in
+			// persists `jolliUrl`.
 			const configDir = getGlobalConfigDir();
 			const config = await loadConfigFromDir(configDir);
-			const jolliSite = config?.jolliApiKey ? parseJolliApiKey(config.jolliApiKey)?.u : undefined;
+			const jolliSite = config?.jolliUrl;
 			// Use loadAuthToken() so JOLLI_AUTH_TOKEN env var is honored, matching `jolli auth status`.
 			const authToken = await loadAuthToken();
 
@@ -188,7 +195,19 @@ export function registerStatusCommand(program: Command): void {
 
 			console.log(`  Stored memories:  ${status.summaryCount}`);
 			if (jolliSite) {
-				console.log(`  Jolli Site:       ${jolliSite.replace(/^https?:\/\//, "")}`);
+				// `jolliSite` is the on-disk `jolliUrl`. Label it the live "Jolli
+				// Site" only when an on-disk credential actually backs it. We
+				// deliberately gate on the DISK auth token (`config?.authToken`),
+				// not the env-first `authToken` above: a `JOLLI_AUTH_TOKEN` injected
+				// purely via the environment carries no tenant of its own, so
+				// pairing it with a stale on-disk `jolliUrl` from a prior web login
+				// would render "Signed in" beside an unrelated tenant. In that
+				// env-only case (and after `jolli auth logout`, where `jolliUrl` is
+				// intentionally retained), fall back to "Last signed-in site" so the
+				// row can't be misread as the currently-connected tenant.
+				const diskBacked = !!(config?.authToken || config?.jolliApiKey);
+				const siteLabel = diskBacked ? "Jolli Site:      " : "Last signed-in site:";
+				console.log(`  ${siteLabel} ${jolliSite.replace(/^https?:\/\//, "")}`);
 			}
 			console.log(`  Orphan branch:    ${status.orphanBranch}`);
 			console.log("");

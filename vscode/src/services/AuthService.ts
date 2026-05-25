@@ -18,7 +18,9 @@ import * as vscode from "vscode";
 import {
 	clearAuthCredentials,
 	getJolliUrl,
+	resolveSignInJolliUrl,
 	saveAuthCredentials,
+	shouldRequestFreshApiKey,
 } from "../../../cli/src/auth/AuthConfig.js";
 import { exchangeCliCode } from "../../../cli/src/auth/CliExchange.js";
 import { getDeviceLabel } from "../../../cli/src/auth/DeviceLabel.js";
@@ -185,12 +187,43 @@ export class AuthService {
 			}
 		}
 
-		let credentials: { token: string; jolliApiKey?: string };
+		// Captured once so both branches (and any later retry logic) agree on
+		// which origin the save records — calling `getJolliUrl()` again later
+		// would otherwise read a freshly-mutated `JOLLI_URL` env var.
+		// Wrapped because `getJolliUrl()` throws when `JOLLI_URL` was mutated
+		// to an off-allowlist value mid-flight; the AuthCallbackResult
+		// contract requires we surface that as a structured error instead of
+		// letting the promise reject.
+		//
+		// This is a deliberate RE-READ at callback time, NOT a reuse of the
+		// value openSignInPage opened the browser with. Re-validating here
+		// makes an off-allowlist `JOLLI_URL` mutation between launch and
+		// callback fail closed (the throw above). The CLI instead threads the
+		// open-time value (`AuthCommand.ts` -> `browserLogin`), so the two
+		// surfaces make opposite trade-offs: the residual edge where
+		// `JOLLI_URL` is switched between two *allowlisted* tenants mid-flight
+		// (near-nil — requires process-env write) is accepted here in exchange
+		// for the off-allowlist fail-closed guarantee. Don't "align" this to
+		// the CLI without also moving the off-allowlist guard + its tests.
+		let jolliUrl: string;
+		try {
+			jolliUrl = getJolliUrl();
+		} catch (err: unknown) {
+			const message = err instanceof Error ? err.message : String(err);
+			log.error("AuthService", "getJolliUrl rejected mid-callback: %s", message);
+			return { success: false, error: message };
+		}
+		let credentials: { token: string; jolliApiKey?: string; jolliUrl: string };
 		if (code) {
 			try {
-				const exchanged = await exchangeCliCode(getJolliUrl(), code);
+				const exchanged = await exchangeCliCode(jolliUrl, code);
 				credentials = {
 					token: exchanged.token,
+					// Persist the minted key's tenant (`meta.u`), not the sign-in
+					// origin — with no `JOLLI_URL` set the latter is the auth hub,
+					// which would fail `saveAuthCredentials`'s symmetry check and
+					// misdirect the routing fallback. See `resolveSignInJolliUrl`.
+					jolliUrl: resolveSignInJolliUrl(exchanged.jolliApiKey, jolliUrl),
 					...(exchanged.jolliApiKey
 						? { jolliApiKey: exchanged.jolliApiKey }
 						: {}),
@@ -210,6 +243,7 @@ export class AuthService {
 			const legacyApiKey = params.get("jolli_api_key");
 			credentials = {
 				token,
+				jolliUrl: resolveSignInJolliUrl(legacyApiKey ?? undefined, jolliUrl),
 				...(legacyApiKey ? { jolliApiKey: legacyApiKey } : {}),
 			};
 		} else {
@@ -274,33 +308,17 @@ export class AuthService {
 		// titles and About dialogs), so it's the stable signal — see
 		// resolveUriScheme() at the bottom of this file.
 		const callbackUri = `${resolveUriScheme()}://${EXTENSION_ID}${AUTH_CALLBACK_PATH}`;
-		// Only ask the server to issue a fresh Jolli API key when the user has
-		// none configured — otherwise sign-in would overwrite a manually
-		// configured key (and a subsequent sign-out would then delete it).
-		// Mirrors the CLI's browserLogin() behaviour in Login.ts.
-		const { jolliApiKey } = await loadConfig();
-		const generateKeyParam = jolliApiKey ? "" : "&generate_api_key=true";
-		// `device_name` scopes the server's per-user idempotency key so signing
-		// in from a second machine doesn't invalidate the first machine's
-		// auto-generated API key. Only meaningful when we're asking the server
-		// to mint a new key — paired with generate_api_key.
-		const deviceLabel = jolliApiKey ? undefined : getDeviceLabel();
-		const deviceLabelParam = deviceLabel
-			? `&device_name=${encodeURIComponent(deviceLabel)}`
-			: "";
 		// 256-bit CSRF nonce per RFC 6749 §10.12. Sent on the login URL and
 		// validated on the matching handleAuthCallback().
 		const state = randomBytes(32).toString("hex");
-		// `getJolliUrl()` throws if `JOLLI_URL` env var points off the
-		// allowlist — catch it here so an attacker-pointed env var surfaces as
-		// a friendly error dialog instead of an unhandled command exception.
-		let loginUrl: string;
+		// Resolve the target URL up front so the `generate_api_key` decision
+		// below sees the same value the rest of the flow signs into. Wrapped
+		// because `getJolliUrl()` throws when `JOLLI_URL` points off the
+		// allowlist — surface that as a friendly error dialog instead of an
+		// unhandled command exception.
+		let jolliUrl: string;
 		try {
-			// Param order matches CLI / IntelliJ:
-			// cli_callback → state → client → client_version → generate_api_key → device_name.
-			// A pinned ordering keeps the three surfaces visually comparable in
-			// captures / logs and protects against silent drift on isolated edits.
-			loginUrl = `${getJolliUrl()}/login?cli_callback=${encodeURIComponent(callbackUri)}&state=${state}&client=vscode&client_version=${encodeURIComponent(CLIENT_VERSION)}${generateKeyParam}${deviceLabelParam}`;
+			jolliUrl = getJolliUrl();
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			log.error("AuthService", "getJolliUrl rejected: %s", message);
@@ -309,6 +327,29 @@ export class AuthService {
 			);
 			return;
 		}
+		// Ask the server for a fresh Jolli API key when (a) no key is on disk,
+		// or (b) the on-disk key targets a different tenant than `jolliUrl`.
+		// (b) makes cross-tenant switch complete in a single sign-in instead
+		// of two; without it the callback returns no new key, the stale-key
+		// clear in `saveAuthCredentials` empties the slot, and the user has
+		// to sign in again to actually provision. Same-tenant re-auth still
+		// preserves an existing key (manually configured or otherwise).
+		const { jolliApiKey } = await loadConfig();
+		const wantsFreshKey = shouldRequestFreshApiKey(jolliApiKey, jolliUrl);
+		const generateKeyParam = wantsFreshKey ? "&generate_api_key=true" : "";
+		// `device_name` scopes the server's per-user idempotency key so signing
+		// in from a second machine doesn't invalidate the first machine's
+		// auto-generated API key. Only meaningful when we're asking the server
+		// to mint a new key — paired with generate_api_key.
+		const deviceLabel = wantsFreshKey ? getDeviceLabel() : undefined;
+		const deviceLabelParam = deviceLabel
+			? `&device_name=${encodeURIComponent(deviceLabel)}`
+			: "";
+		// Param order matches CLI / IntelliJ:
+		// cli_callback → state → client → client_version → generate_api_key → device_name.
+		// A pinned ordering keeps the three surfaces visually comparable in
+		// captures / logs and protects against silent drift on isolated edits.
+		const loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUri)}&state=${state}&client=vscode&client_version=${encodeURIComponent(CLIENT_VERSION)}${generateKeyParam}${deviceLabelParam}`;
 		// Commit pendingState only after the URL builds — otherwise a thrown
 		// getJolliUrl() would leave behind a state that pairs with no
 		// outgoing nonce. Clear any prior deferred-expiry timer so a rapid
