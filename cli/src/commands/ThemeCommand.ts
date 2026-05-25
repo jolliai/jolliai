@@ -112,8 +112,11 @@ async function fetchRegistry(): Promise<RegistryData> {
 //
 // Limitations (intentional for a theme installer):
 //   - UStar prefix(155) + name(100) covers paths up to 255 bytes.
-//   - PAX ('x','g') and GNU LongName ('L','K') extended headers are not supported;
+//   - PAX extended ('x') and GNU LongName ('L','K') headers are rejected;
 //     entries with paths > 255 bytes will cause an error.
+//   - PAX global header ('g') is skipped — it carries archive-wide metadata
+//     (e.g. the git commit hash GitHub prepends to every tarball) and has no
+//     effect on later entries, so ignoring it is safe.
 //   - Hardlinks ('1') and symlinks ('2') are rejected for safety.
 
 interface TarEntry {
@@ -168,18 +171,22 @@ export function extractTarGz(gzBuf: Buffer): TarEntry[] {
 		const isFile = typeflag === 0 || typeflag === 0x30; // 0x30 = '0'
 		const isDir = typeflag === 0x35; // '5'
 
-		// Reject unsupported entry types that carry semantic meaning.
-		// PAX/GNU long-name headers would silently lose the real filename;
-		// symlinks/hardlinks could escape the destination directory.
+		// Reject unsupported entry types that would corrupt the extraction:
+		//   'L','K','x' — long-name/extended headers that rename the NEXT entry
+		//   '1','2'     — hard/soft links that could escape the destination dir
+		// 'g' (PAX global header) is intentionally excluded — it carries
+		// archive-wide metadata (e.g. the git commit hash that GitHub prepends
+		// to every codeload tarball) and has no effect on later entries, so the
+		// safe behavior is to skip it like any other benign extension.
 		if (!isFile && !isDir) {
 			const flag = String.fromCharCode(typeflag);
-			if ("LKxg12".includes(flag)) {
+			if ("LKx12".includes(flag)) {
 				throw new Error(
 					`Unsupported tar entry type '${flag}' for "${fullPath}". ` +
 						"This tar parser only supports regular files and directories.",
 				);
 			}
-			// Skip other benign typeflags (e.g. vendor extensions)
+			// Skip other benign typeflags (PAX global header 'g', vendor extensions, …)
 			offset += Math.ceil(size / 512) * 512;
 			continue;
 		}

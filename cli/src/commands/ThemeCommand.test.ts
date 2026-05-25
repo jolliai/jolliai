@@ -106,6 +106,25 @@ describe("extractTarGz", () => {
 		expect(() => extractTarGz(gz)).toThrow(/Unsupported tar entry type 'x'/);
 	});
 
+	it("skips PAX global header typeflag 'g' and keeps parsing later entries", () => {
+		// GitHub's codeload.github.com prepends a `pax_global_header` entry
+		// (typeflag 'g') to every tarball. Treating it as fatal would break
+		// every theme download — it must be silently skipped.
+		const paxPayload = Buffer.from("52 comment=abc1234567890\n", "ascii");
+		const fileData = Buffer.from("hello world", "utf-8");
+		const tar = buildTar([
+			buildTarEntry("pax_global_header", 0x67, paxPayload), // 'g' = 0x67
+			buildTarEntry("repo-main/", 0x35),
+			buildTarEntry("repo-main/readme.txt", 0x30, fileData),
+		]);
+		const gz = gzipSync(tar);
+
+		const entries = extractTarGz(gz);
+		expect(entries).toHaveLength(2);
+		expect(entries[0]).toEqual({ path: "repo-main/", type: "dir", data: Buffer.alloc(0) });
+		expect(entries[1]).toEqual({ path: "repo-main/readme.txt", type: "file", data: fileData });
+	});
+
 	it("throws on symlink typeflag '2'", () => {
 		const tar = buildTar([
 			buildTarEntry("link.txt", 0x32), // '2' = 0x32
