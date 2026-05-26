@@ -229,14 +229,17 @@ async function syncContent(
 		specInputs,
 	);
 
-	// When the site is in page mode and no page is rooted at `/`, the auto-
-	// mirrored root `index.md` is dead weight — `SidebarTabs.tsx` ends up
-	// client-side redirecting from `/` to the first tab, which produces a
-	// visible flash of the index page before the JS runs. Replace the root
-	// index with an inline `<script>` redirect so the browser navigates away
-	// before React even hydrates. We do this *before* `generateNavigation` so
-	// the `_meta.js` writer picks up the rewritten file and emits the standard
+	// In page mode, when no page is rooted at `/`, the auto-mirrored root
+	// `index.md` is dead weight — `SidebarTabs.tsx` ends up client-side
+	// redirecting from `/` to the first tab, which produces a visible flash
+	// of the index page before the JS runs. Replace the root index with an
+	// inline `<script>` redirect so the browser navigates away before React
+	// even hydrates. We do this *before* `generateNavigation` so the
+	// `_meta.js` writer picks up the rewritten file and emits the standard
 	// `{ "index": { display: "hidden" } }` entry to keep it out of the sidebar.
+	// In simple mode `pickRootRedirectHref` returns `undefined`, so this
+	// block is equivalently a no-op there — the `navigationClaimsRootIndex`
+	// check still runs but its result doesn't matter.
 	//
 	// Skip the rewrite only when `site.json`'s navigation explicitly claims
 	// `/` — either a page rooted at `/`, or an article with `href: "/"` /
@@ -331,7 +334,15 @@ function articleClaimsRoot(article: NavigationArticle): boolean {
 function isRootHref(href: string): boolean {
 	if (!href) return false;
 	const trimmed = href.trim();
-	return trimmed === "/" || trimmed === "/index" || trimmed === "/index.md" || trimmed === "/index.mdx";
+	return (
+		trimmed === "/" ||
+		trimmed === "/index" ||
+		trimmed === "/index.md" ||
+		trimmed === "/index.mdx" ||
+		trimmed === "index" ||
+		trimmed === "index.md" ||
+		trimmed === "index.mdx"
+	);
 }
 
 function normalizeRoot(root: string | undefined): string | undefined {
