@@ -189,14 +189,23 @@ describe("SummaryScriptBuilder", () => {
 			);
 		});
 
-		it("does NOT re-attach attachRegenerateSummaryHandler in the success path (button lives outside topicsSection / recapSection)", () => {
-			// The regenerate button is in the Conversations card, which
-			// replaceSection never touches; re-attaching would double-bind
+		it("does NOT re-attach attachRegenerateSummaryDelegate in the success path (delegate bound once on .page survives banner DOM replacement)", () => {
+			// The regenerate buttons (#regenerateSummaryBtn in the Conversations
+			// card, #summaryErrorRegenerateBtn in the top banner) are reached
+			// via an event delegate on .page bound once at script init.
+			// Re-attaching in the regenerate success branch would double-bind
 			// the listener and post N messages on the Nth click after N
 			// regenerates.
 			const summaryRegeneratedBranch = script.split("summaryRegenerated")[1] ?? "";
 			const cancelBranch = summaryRegeneratedBranch.split("summaryRegenerateError")[0] ?? "";
-			expect(cancelBranch).not.toContain("attachRegenerateSummaryHandler(");
+			expect(cancelBranch).not.toContain("attachRegenerateSummaryDelegate(");
+			// Defensive: assert the delegate is wired exactly once across the
+			// whole script (at top-level init). A future regression that adds
+			// a second call anywhere would break this. We count "call sites"
+			// (call expression with trailing `;`), not the function declaration
+			// (which has `() {`).
+			const delegateCallMatches = script.match(/attachRegenerateSummaryDelegate\(\);/g) ?? [];
+			expect(delegateCallMatches.length).toBe(1);
 		});
 
 		it("enters regenerating-readonly mode on summaryRegenerating (banner + page class)", () => {

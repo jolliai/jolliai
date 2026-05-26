@@ -1200,6 +1200,32 @@ export interface SquashConsolidationResult {
 }
 
 /**
+ * Tagged outcome from generateSquashConsolidation. Distinguishes the three
+ * reasons the caller might end up running `mechanicalConsolidate`:
+ *
+ *   - "ok": LLM produced usable topics / recap; caller should use the
+ *     embedded SquashConsolidationResult fields directly (no mechanical
+ *     fallback needed).
+ *   - "no-content": no sources / all-empty sources / LLM returned
+ *     format-compliant empty content / strict-retry also produced no
+ *     content. The mechanical fallback is still the right answer here, but
+ *     this is NOT a failure — no `summaryError` marker should be set on
+ *     the merged root.
+ *   - "llm-error": both LLM call attempts (including the strict retry)
+ *     threw. Mechanical fallback runs, AND the merged root carries
+ *     `summaryError: "llm-failed"` so the webview surfaces the
+ *     Regenerate banner.
+ *
+ * Replaces the prior `Promise<SquashConsolidationResult | null>` shape —
+ * the old `null` had five distinct origins that callers couldn't tell
+ * apart.
+ */
+export type SquashConsolidationOutcome =
+	| ({ readonly status: "ok" } & SquashConsolidationResult)
+	| { readonly status: "no-content" }
+	| { readonly status: "llm-error" };
+
+/**
  * Sorts sources by commitDate ascending (oldest first). Internal contract of
  * generateSquashConsolidation and mechanicalConsolidate -- callers MAY pass
  * any order, the prompt always renders oldest-first per "Source Commits
@@ -1290,31 +1316,34 @@ export function mechanicalConsolidate(
  * source commits. Caller MAY pass sources in any order; the function sorts
  * internally and emits an oldest-first {{sourceCommitsBlock}} into the prompt.
  *
- * Returns null when:
- *   - There are no sources at all.
- *   - All sources have empty topics AND empty recap (nothing to consolidate).
- *   - Both LLM call attempts (1 retry) fail.
- *
- * On null, the caller (runSquashPipeline / handleAmendPipeline) falls back to
- * mechanicalConsolidate so the Hoist invariant always completes.
+ * Returns a discriminated union (`SquashConsolidationOutcome`):
+ *   - { status: "ok", topics, recap?, ticketId?, llm }: LLM produced usable
+ *     output. Caller uses these fields directly.
+ *   - { status: "no-content" }: no sources / all-empty sources / LLM
+ *     returned format-compliant empty content / strict-retry also empty.
+ *     Caller falls back to mechanicalConsolidate; **no failure marker**
+ *     should be set — these are healthy "nothing-to-merge" cases.
+ *   - { status: "llm-error" }: both call attempts (including the strict
+ *     retry) threw. Caller falls back to mechanicalConsolidate AND sets
+ *     `summaryError: "llm-failed"` on the merged root.
  *
  * ticketId resolution priority on success: params.ticketId (squash message)
  *   > earliest source's ticketId > LLM-extracted ticketId from response.
  */
 export async function generateSquashConsolidation(
 	params: SquashConsolidationParams,
-): Promise<SquashConsolidationResult | null> {
+): Promise<SquashConsolidationOutcome> {
 	const { sources, squashCommitMessage, ticketId: outerTicketId, config } = params;
 
 	if (sources.length === 0) {
-		log.info("generateSquashConsolidation: no sources -- returning null");
-		return null;
+		log.info("generateSquashConsolidation: no sources -- returning no-content");
+		return { status: "no-content" };
 	}
 
 	const allEmpty = sources.every((s) => s.topics.length === 0 && !s.recap);
 	if (allEmpty) {
-		log.info("generateSquashConsolidation: all sources have no topics or recap -- returning null");
-		return null;
+		log.info("generateSquashConsolidation: all sources have no topics or recap -- returning no-content");
+		return { status: "no-content" };
 	}
 
 	const sourceCommitsBlock = formatSourceCommitsForSquash(sources);
@@ -1387,12 +1416,12 @@ export async function generateSquashConsolidation(
 			first = await callOnce("squash-consolidate");
 		} catch (err2) {
 			log.error("generateSquashConsolidation retry failed: %s", (err2 as Error).message);
-			return null;
+			return { status: "llm-error" };
 		}
 	}
 
 	if (first.parsed.topics.length > 0 || first.parsed.recap) {
-		return buildResult(first.parsed, first.llm);
+		return { status: "ok", ...buildResult(first.parsed, first.llm) };
 	}
 
 	// First call extracted no usable content (no topics, no recap). Two cases:
@@ -1425,7 +1454,7 @@ export async function generateSquashConsolidation(
 					// equal to first.llm.source by construction (callOnce → callLlm).
 					source: strict.llm.source,
 				};
-				return buildResult(strict.parsed, mergedLlm);
+				return { status: "ok", ...buildResult(strict.parsed, mergedLlm) };
 			}
 			log.warn(
 				"squash-consolidate-strict also produced no usable output -- falling through to mechanical fallback",
@@ -1435,11 +1464,12 @@ export async function generateSquashConsolidation(
 				"squash-consolidate-strict call failed: %s -- falling through to mechanical fallback",
 				err instanceof Error ? err.message : String(err),
 			);
+			return { status: "llm-error" };
 		}
 	} else {
 		log.warn(
 			"generateSquashConsolidation: LLM produced format-compliant but empty consolidation -- falling through to mechanical fallback",
 		);
 	}
-	return null;
+	return { status: "no-content" };
 }

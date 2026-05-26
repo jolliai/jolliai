@@ -338,8 +338,8 @@ If an existing hook file exists, Jolli Memory's section is appended. On uninstal
 | No active session | Skip summary, infer topics from diff alone if possible |
 | Transcript file missing | Log error, skip that session |
 | No new transcript entries + no file changes | Skip summary generation |
-| API key missing | Throw with setup instructions |
-| API call fails | Retry once (2s delay), then save minimal record (empty topics, `stopReason: "error"`) |
+| LLM call fails (any cause: network, 5xx, credential, quota) | Retry once (2s), then persist a placeholder summary with `summaryError: "llm-failed"`. Amend and squash paths preserve their existing fallback content (Copy-Hoist or mechanical merge); normal commit lands empty `topics`. Webview surfaces a Regenerate banner; Push to Jolli refuses summaries with this marker. |
+| LLM consolidate has nothing to merge (no sources / all empty / LLM self-reported empty) | Mechanical fallback **without** `summaryError` — healthy "nothing to consolidate" case. |
 | API returns non-JSON | Attempt JSON extraction from markdown fences, fallback to raw text |
 | Orphan branch doesn't exist | Auto-create (idempotent) |
 | Existing git hook | Append Jolli Memory section with markers |

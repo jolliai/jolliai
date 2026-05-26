@@ -1298,6 +1298,7 @@ describe("PostCommitHook helpers", () => {
 			// Step 1 default (from beforeEach) returns a topic → bypasses post-LLM short-circuit.
 			// Step 2 returns consolidated content with LLM metadata.
 			mockGenerateSquashConsolidation.mockResolvedValueOnce({
+				status: "ok",
 				topics: [{ title: "Consolidated", trigger: "T", response: "R", decisions: "D" }],
 				recap: "consolidated recap",
 				llm: { model: "test", inputTokens: 10, outputTokens: 10, apiLatencyMs: 50, stopReason: "end_turn" },
@@ -1322,6 +1323,320 @@ describe("PostCommitHook helpers", () => {
 			expect(root.topics).toEqual([{ title: "Consolidated", trigger: "T", response: "R", decisions: "D" }]);
 			expect(root.recap).toBe("consolidated recap");
 			expect(root.llm).toBeDefined();
+		});
+
+		it("step-1 LLM failure with oldSummary Copy-Hoists topics and marks summaryError", async () => {
+			mockGetSummary.mockResolvedValue({
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Old commit",
+				commitAuthor: "Test",
+				commitDate: "2026-02-18T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-02-18T00:00:00Z",
+				transcriptEntries: 1,
+				stats: { filesChanged: 1, insertions: 1, deletions: 0 },
+				topics: [{ title: "Old kept", trigger: "T", response: "R", decisions: "D" }],
+				recap: "old recap",
+			});
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockLoadConfig.mockResolvedValue({});
+			// Non-trivial delta so the pre-LLM short-circuit doesn't fire.
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			mockGenerateSummary
+				.mockRejectedValueOnce(new Error("403 boom"))
+				.mockRejectedValueOnce(new Error("403 boom again"));
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).toHaveBeenCalledTimes(2);
+			expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			const stored = mockStoreSummary.mock.calls[0][0] as {
+				topics: ReadonlyArray<{ title: string }>;
+				summaryError?: string;
+			};
+			expect(stored.topics).toEqual([{ title: "Old kept", trigger: "T", response: "R", decisions: "D" }]);
+			expect(stored.summaryError).toBe("llm-failed");
+		});
+
+		it("step-1 LLM failure without oldSummary stores fresh leaf with empty topics + summaryError", async () => {
+			mockGetSummary.mockResolvedValue(null);
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockLoadConfig.mockResolvedValue({});
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			mockGenerateSummary
+				.mockRejectedValueOnce(new Error("network boom"))
+				.mockRejectedValueOnce(new Error("network boom again"));
+
+			await __test__.handleAmendPipeline(
+				{ hash: "freshhash", message: "First amend", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).toHaveBeenCalledTimes(2);
+			expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			const stored = mockStoreSummary.mock.calls[0][0] as {
+				topics: ReadonlyArray<unknown>;
+				summaryError?: string;
+			};
+			expect(stored.topics).toEqual([]);
+			expect(stored.summaryError).toBe("llm-failed");
+		});
+
+		it("step-2 (consolidate) llm-error marks the amend root with summaryError", async () => {
+			mockGetSummary.mockResolvedValue({
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Old commit",
+				commitAuthor: "Test",
+				commitDate: "2026-02-18T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-02-18T00:00:00Z",
+				transcriptEntries: 1,
+				stats: { filesChanged: 1, insertions: 1, deletions: 0 },
+				topics: [{ title: "Old", trigger: "T", response: "R", decisions: "D" }],
+			});
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockLoadConfig.mockResolvedValue({});
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			// Step 1 default (from beforeEach) returns a topic → bypasses post-LLM short-circuit.
+			// Step 2 returns llm-error → mechanical fallback + summaryError marker.
+			mockGenerateSquashConsolidation.mockResolvedValueOnce({ status: "llm-error" });
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSquashConsolidation).toHaveBeenCalledTimes(1);
+			expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			const stored = mockStoreSummary.mock.calls[0][0] as {
+				topics: ReadonlyArray<unknown>;
+				summaryError?: string;
+			};
+			expect(stored.topics.length).toBeGreaterThan(0); // mechanical preserved content
+			expect(stored.summaryError).toBe("llm-failed");
+		});
+
+		it("step-2 (consolidate) no-content falls back to mechanical WITHOUT summaryError marker", async () => {
+			mockGetSummary.mockResolvedValue({
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Old commit",
+				commitAuthor: "Test",
+				commitDate: "2026-02-18T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-02-18T00:00:00Z",
+				transcriptEntries: 1,
+				stats: { filesChanged: 1, insertions: 1, deletions: 0 },
+				topics: [{ title: "Old", trigger: "T", response: "R", decisions: "D" }],
+			});
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockLoadConfig.mockResolvedValue({});
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			mockGenerateSquashConsolidation.mockResolvedValueOnce({ status: "no-content" });
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			const stored = mockStoreSummary.mock.calls[0][0] as {
+				summaryError?: string;
+			};
+			expect(stored.summaryError).toBeUndefined();
+		});
+
+		it("full-path consolidate success inherits summaryError when oldSummary was degraded", async () => {
+			// Source-state inheritance: step-2 consolidate merges existing topic
+			// structures, it does NOT re-derive from raw diff + transcript like
+			// Regenerator does. If oldSummary was a placeholder / Copy-Hoist /
+			// mechanical merge from a prior failure, the consolidated output is
+			// "delta + degraded old", not "regenerated". Only Regenerator should
+			// clear the marker.
+			mockGetSummary.mockResolvedValue({
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Old commit (previously failed)",
+				commitAuthor: "Test",
+				commitDate: "2026-02-18T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-02-18T00:00:00Z",
+				transcriptEntries: 1,
+				stats: { filesChanged: 1, insertions: 1, deletions: 0 },
+				topics: [{ title: "Placeholder", trigger: "T", response: "R", decisions: "D" }],
+				summaryError: "llm-failed",
+			});
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockLoadConfig.mockResolvedValue({});
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			// step-2 succeeds → would clear marker WITHOUT the inheritance fix.
+			mockGenerateSquashConsolidation.mockResolvedValueOnce({
+				status: "ok",
+				topics: [{ title: "Consolidated", trigger: "T", response: "R", decisions: "D" }],
+				recap: "consolidated recap",
+				llm: { model: "x", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
+			});
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			const stored = mockStoreSummary.mock.calls[0][0] as {
+				topics: ReadonlyArray<{ title: string }>;
+				summaryError?: string;
+			};
+			expect(stored.topics).toEqual([{ title: "Consolidated", trigger: "T", response: "R", decisions: "D" }]);
+			expect(stored.summaryError).toBe("llm-failed");
+		});
+
+		it("full-path consolidate success leaves no marker when oldSummary was healthy", async () => {
+			// Regression guard for the inherited-marker fix above — a clean
+			// amend on a clean parent must stay clean.
+			mockGetSummary.mockResolvedValue({
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Healthy old",
+				commitAuthor: "Test",
+				commitDate: "2026-02-18T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-02-18T00:00:00Z",
+				transcriptEntries: 1,
+				stats: { filesChanged: 1, insertions: 1, deletions: 0 },
+				topics: [{ title: "Old", trigger: "T", response: "R", decisions: "D" }],
+			});
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockLoadConfig.mockResolvedValue({});
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			mockGenerateSquashConsolidation.mockResolvedValueOnce({
+				status: "ok",
+				topics: [{ title: "Consolidated", trigger: "T", response: "R", decisions: "D" }],
+				llm: { model: "x", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
+			});
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "New commit", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			const stored = mockStoreSummary.mock.calls[0][0] as {
+				summaryError?: string;
+			};
+			expect(stored.summaryError).toBeUndefined();
+		});
+
+		it("pre-LLM trivial delta inherits summaryError from oldSummary (no Regenerate yet)", async () => {
+			// A previously-failed amend wrote summaryError="llm-failed". A subsequent
+			// trivial-delta amend (≤ TRIVIAL_AMEND_DELTA_LINES) short-circuits without
+			// calling the LLM — the marker must persist so the banner stays visible.
+			// Only a successful Regenerate should clear it.
+			mockGetSummary.mockResolvedValue({
+				version: 4,
+				commitHash: "oldhash",
+				commitMessage: "Old commit (previously failed)",
+				commitAuthor: "Test",
+				commitDate: "2026-02-18T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-02-18T00:00:00Z",
+				transcriptEntries: 0,
+				diffStats: { filesChanged: 1, insertions: 1, deletions: 0 },
+				topics: [{ title: "Old", trigger: "T", response: "R", decisions: "D" }],
+				summaryError: "llm-failed",
+			});
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockLoadConfig.mockResolvedValue({});
+			// Trivial delta (1 line) triggers the pre-LLM short-circuit.
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 1, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("trivial diff");
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "Typo fix", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			// LLM must NOT have been called (pre-LLM short-circuit).
+			expect(mockGenerateSummary).not.toHaveBeenCalled();
+			expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			const stored = mockStoreSummary.mock.calls[0][0] as {
+				summaryError?: string;
+			};
+			expect(stored.summaryError).toBe("llm-failed");
+		});
+
+		it("post-LLM empty-topics short-circuit inherits summaryError from oldSummary", async () => {
+			// step-1 LLM succeeded but returned no topics (genuine "nothing new" case);
+			// step-2 is skipped. If oldSummary carried a marker from an earlier failure,
+			// the new root must keep it — step-2 was not run, so the failure is still
+			// unresolved.
+			mockGetSummary.mockResolvedValue({
+				version: 4,
+				commitHash: "oldhash",
+				commitMessage: "Old commit (previously failed)",
+				commitAuthor: "Test",
+				commitDate: "2026-02-18T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-02-18T00:00:00Z",
+				transcriptEntries: 0,
+				diffStats: { filesChanged: 1, insertions: 1, deletions: 0 },
+				topics: [{ title: "Old", trigger: "T", response: "R", decisions: "D" }],
+				summaryError: "llm-failed",
+			});
+			mockLoadAllSessions.mockResolvedValue([]);
+			mockLoadConfig.mockResolvedValue({});
+			// Non-trivial delta so pre-LLM short-circuit doesn't fire.
+			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
+			mockGetDiffContent.mockResolvedValue("diff");
+			// step-1 succeeds with empty topics → post-LLM short-circuit, deltaLlmFailed=false.
+			mockGenerateSummary.mockResolvedValueOnce({
+				transcriptEntries: 0,
+				conversationTurns: 0,
+				llm: { model: "test", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
+				stats: { filesChanged: 1, insertions: 100, deletions: 0 },
+				topics: [],
+			});
+
+			await __test__.handleAmendPipeline(
+				{ hash: "newhash", message: "Refactor", author: "Test", date: "2026-02-19T00:00:00Z" },
+				"oldhash",
+				"/repo",
+				0,
+			);
+
+			expect(mockGenerateSummary).toHaveBeenCalledTimes(1);
+			// step-2 (generateSquashConsolidation) NOT called — short-circuit fired.
+			expect(mockGenerateSquashConsolidation).not.toHaveBeenCalled();
+			expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			const stored = mockStoreSummary.mock.calls[0][0] as {
+				summaryError?: string;
+			};
+			expect(stored.summaryError).toBe("llm-failed");
 		});
 	});
 

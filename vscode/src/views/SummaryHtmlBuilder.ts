@@ -6,6 +6,7 @@
  * source commits, footer, and interactive script into a single HTML string.
  */
 
+import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
 import {
 	aggregateTurns,
 	formatDurationLabel,
@@ -22,6 +23,7 @@ import type {
 import { buildPrSectionHtml } from "../services/PrCommentService.js";
 import { buildCss } from "./SummaryCssBuilder.js";
 import { buildScript } from "./SummaryScriptBuilder.js";
+import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
 import {
 	collectSortedTopics,
 	escAttr,
@@ -92,6 +94,11 @@ export function buildHtml(
 	if (opts.foreignRepoName) pageClasses.push("foreign-readonly");
 	if (opts.staleRewrittenInto) pageClasses.push("stale-readonly");
 	const pageClass = pageClasses.join(" ");
+	// Either readonly mode hides the per-section Regenerate buttons. Thread
+	// `readOnly` into the failure-banner + topics-section builders so their
+	// CTA text adapts (no "Click Regenerate" promise when the button is
+	// hidden by CSS).
+	const readOnly = !!opts.foreignRepoName || !!opts.staleRewrittenInto;
 	const { sourceNodes } = collectSortedTopics(summary);
 	const stats = resolveDiffStats(summary);
 	const totalInsertions = stats.insertions;
@@ -128,6 +135,7 @@ ${csp}
 </head>
 <body>
 <div class="${pageClass}">
+${buildSummaryErrorBanner(summary, { readOnly })}
 ${staleBannerHtml}
 ${buildAllConversationsSection(transcriptHashSet, !!opts.foreignRepoName)}
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
@@ -137,7 +145,7 @@ ${buildPrSectionHtml()}
 ${buildPlansAndNotesSection(summary.plans, summary.notes, summary.linearIssues, planTranslateSet, noteTranslateSet)}
 ${buildE2eTestSection(summary)}
 ${buildSourceCommits(sourceNodes)}
-${buildTopicsSection(summary)}
+${buildTopicsSection(summary, { readOnly })}
 ${buildFooter(summary)}
 </div>
 <script${nonceAttr}>${buildScript()}</script>
@@ -351,6 +359,17 @@ export function buildRecapSection(recap: string | undefined): string {
 
 // ─── Topics Section ──────────────────────────────────────────────────────────
 
+/** Options for buildTopicsSection. */
+export interface BuildTopicsSectionOptions {
+	/**
+	 * True when the panel is showing a foreign-repo or stale-rewritten
+	 * summary. CSS hides the Regenerate button in both cases, so the
+	 * empty-state CTA text drops the "Click Regenerate above" instruction
+	 * to avoid pointing at a hidden affordance.
+	 */
+	readonly readOnly?: boolean;
+}
+
 /**
  * Renders the topic grid as a self-contained section.
  *
@@ -360,12 +379,22 @@ export function buildRecapSection(recap: string | undefined): string {
  * region inside `buildHtml`, so embedding `${buildTopicsSection(summary)}`
  * there is the canonical way to keep the two render paths in sync.
  */
-export function buildTopicsSection(summary: CommitSummary): string {
+export function buildTopicsSection(
+	summary: CommitSummary,
+	options: BuildTopicsSectionOptions = {},
+): string {
 	const { topics: allTopics } = collectSortedTopics(summary);
-	const topicsHtml =
-		allTopics.length === 0
-			? '<p class="empty">No topics available for this commit.</p>'
-			: allTopics.map((t, i) => renderTopic(t, i)).join("\n");
+	// Failure path: empty topics + isSummaryError → point the user at the
+	// banner above. The banner carries the Regenerate button; the empty-
+	// state itself stays text-only to avoid two competing affordances.
+	// In read-only modes the Regenerate button is hidden, so we drop the
+	// "Click Regenerate above" instruction — the banner already explains
+	// the degraded state without promising an unreachable action.
+	const failureEmpty = options.readOnly
+		? '<p class="empty empty-error">Summary generation failed during the last attempt.</p>'
+		: '<p class="empty empty-error">Summary generation failed during the last attempt. Click Regenerate above to try again.</p>';
+	const emptyHtml = isSummaryError(summary) ? failureEmpty : '<p class="empty">No topics available for this commit.</p>';
+	const topicsHtml = allTopics.length === 0 ? emptyHtml : allTopics.map((t, i) => renderTopic(t, i)).join("\n");
 	const topicsLabel = `${allTopics.length} topic${allTopics.length !== 1 ? "s" : ""} extracted from this commit`;
 	return `<div class="section" id="topicsSection">
   <div class="section-header">

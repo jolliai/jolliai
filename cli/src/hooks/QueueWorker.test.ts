@@ -101,9 +101,11 @@ vi.mock("../core/Summarizer.js", async (importOriginal) => {
 			stats: { filesChanged: 1, insertions: 5, deletions: 2 },
 			topics: [{ title: "Test topic", trigger: "test", response: "done", decisions: "none" }],
 		}),
-		// Mock the LLM-touching path; default behaviour returns null so the
-		// caller falls through to the (real) mechanicalConsolidate.
-		generateSquashConsolidation: vi.fn().mockResolvedValue(null),
+		// Mock the LLM-touching path; default behaviour returns "no-content"
+		// so the caller falls through to the (real) mechanicalConsolidate
+		// WITHOUT setting a summaryError marker — healthy "nothing to merge"
+		// path is what most tests exercise by default.
+		generateSquashConsolidation: vi.fn().mockResolvedValue({ status: "no-content" }),
 		// Real implementations for the pure helpers -- runSquashPipeline /
 		// handleAmendPipeline rely on their actual behaviour.
 		mechanicalConsolidate: actual.mechanicalConsolidate,
@@ -564,27 +566,36 @@ describe("QueueWorker", () => {
 			expect(releaseWorkerLock).toHaveBeenCalled();
 		});
 
-		// The dispatcher's "fail loudly" promise (PR #93) is undermined if the
-		// queue swallows the credential error into an empty-topic placeholder
-		// summary — the user would see no toast, no Status row change, and
-		// orphan-branch junk would accumulate. Pin both attempts: first call
-		// throws → no retry, no placeholder; retry-path same.
-		it("rethrows credential errors on first attempt without retry or placeholder write", async () => {
+		// As of the summaryError-marker unification, credential errors flow
+		// through the same retry-then-placeholder path as any other LLM
+		// failure. The "loud" signal is the webview banner driven by
+		// `summaryError: "llm-failed"` — visible on every affected commit
+		// until the user fixes credentials and clicks Regenerate. These two
+		// tests pin BOTH retry slots (first-attempt and retry-attempt
+		// credential failures) to the placeholder path.
+		it("writes a placeholder + summaryError marker when first attempt throws LlmCredentialError", async () => {
 			const op = makeCommitOp();
 			vi.mocked(dequeueAllGitOperations)
 				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/cred.json" }])
 				.mockResolvedValueOnce([])
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks();
-			vi.mocked(generateSummary).mockRejectedValueOnce(new LlmCredentialError());
+			vi.mocked(generateSummary)
+				.mockRejectedValueOnce(new LlmCredentialError())
+				.mockRejectedValueOnce(new LlmCredentialError());
 
 			await runWorker("/test/cwd");
 
-			expect(generateSummary).toHaveBeenCalledTimes(1);
-			expect(storeSummary).not.toHaveBeenCalled();
+			// Retry attempt happens; both fail; placeholder lands.
+			expect(generateSummary).toHaveBeenCalledTimes(2);
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const stored = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(stored.topics).toEqual([]);
+			expect(stored.llm?.stopReason).toBe("error");
+			expect(stored.summaryError).toBe("llm-failed");
 		});
 
-		it("rethrows credential errors that surface only on the retry attempt", async () => {
+		it("writes a placeholder + summaryError marker when only the retry throws LlmCredentialError", async () => {
 			const op = makeCommitOp();
 			vi.mocked(dequeueAllGitOperations)
 				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/cred-retry.json" }])
@@ -598,7 +609,9 @@ describe("QueueWorker", () => {
 			await runWorker("/test/cwd");
 
 			expect(generateSummary).toHaveBeenCalledTimes(2);
-			expect(storeSummary).not.toHaveBeenCalled();
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const stored = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(stored.summaryError).toBe("llm-failed");
 		});
 	});
 
@@ -1244,6 +1257,180 @@ describe("QueueWorker", () => {
 				expect.objectContaining({ commitSource: "cli", commitType: "squash" }),
 				expect.objectContaining({ topics: expect.any(Array) }),
 			);
+		});
+
+		it("squash llm-error: passes summaryError marker on the consolidated arg into mergeManyToOne", async () => {
+			const { getSummary, mergeManyToOne } = await import("../core/SummaryStore.js");
+			const { generateSquashConsolidation } = await import("../core/Summarizer.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 3,
+				commitHash: "src1",
+				commitMessage: "Src",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Src topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			vi.mocked(generateSquashConsolidation).mockResolvedValueOnce({ status: "llm-error" });
+			setupPipelineMocks("sq-new");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sq-new", sourceHashes: ["src1"] }),
+				"/test/cwd",
+			);
+
+			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			expect(consolidatedArg?.summaryError).toBe("llm-failed");
+			expect((consolidatedArg?.topics ?? []).length).toBeGreaterThan(0); // mechanical preserved content
+		});
+
+		it("squash no-content: mechanical fallback WITHOUT summaryError marker", async () => {
+			const { getSummary, mergeManyToOne } = await import("../core/SummaryStore.js");
+			const { generateSquashConsolidation } = await import("../core/Summarizer.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 3,
+				commitHash: "src2",
+				commitMessage: "Src2",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Src topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			vi.mocked(generateSquashConsolidation).mockResolvedValueOnce({ status: "no-content" });
+			setupPipelineMocks("sq-nc");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sq-nc", sourceHashes: ["src2"] }),
+				"/test/cwd",
+			);
+
+			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			expect(consolidatedArg?.summaryError).toBeUndefined();
+		});
+
+		it("squash ok: inherits summaryError when any source was already degraded", async () => {
+			// Source-state inheritance: even if THIS squash succeeded, if any
+			// source was a prior placeholder / mechanical / Copy-Hoist result
+			// (signalled by summaryError or legacy stopReason="error"), the
+			// merged root is "consolidated from compromised inputs" and must
+			// carry the marker forward. Otherwise handlePush would let the
+			// degraded content land on Jolli unannounced.
+			const { getSummary, mergeManyToOne } = await import("../core/SummaryStore.js");
+			const { generateSquashConsolidation } = await import("../core/Summarizer.js");
+			vi.mocked(getSummary)
+				.mockResolvedValueOnce({
+					version: 3,
+					commitHash: "src-bad",
+					commitMessage: "Previously failed",
+					commitAuthor: "Jane",
+					commitDate: "2026-04-01T10:00:00.000Z",
+					branch: "feature/test",
+					generatedAt: "2026-04-01T10:00:00.000Z",
+					topics: [{ title: "Placeholder", trigger: "t", response: "r", decisions: "d" }],
+					summaryError: "llm-failed",
+				} as Awaited<ReturnType<typeof getSummary>>)
+				.mockResolvedValueOnce({
+					version: 3,
+					commitHash: "src-good",
+					commitMessage: "Healthy",
+					commitAuthor: "Jane",
+					commitDate: "2026-04-02T10:00:00.000Z",
+					branch: "feature/test",
+					generatedAt: "2026-04-02T10:00:00.000Z",
+					topics: [{ title: "Good", trigger: "t", response: "r", decisions: "d" }],
+				} as Awaited<ReturnType<typeof getSummary>>);
+			vi.mocked(generateSquashConsolidation).mockResolvedValueOnce({
+				status: "ok",
+				topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }],
+				llm: { model: "x", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
+			});
+			setupPipelineMocks("sq-inh");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sq-inh", sourceHashes: ["src-bad", "src-good"] }),
+				"/test/cwd",
+			);
+
+			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			expect(consolidatedArg?.summaryError).toBe("llm-failed");
+		});
+
+		it("squash ok: does NOT set summaryError when all sources are healthy", async () => {
+			// Regression guard for the inherited-marker fix above — healthy
+			// squash must stay healthy.
+			const { getSummary, mergeManyToOne } = await import("../core/SummaryStore.js");
+			const { generateSquashConsolidation } = await import("../core/Summarizer.js");
+			vi.mocked(getSummary)
+				.mockResolvedValueOnce({
+					version: 3,
+					commitHash: "src-a",
+					commitMessage: "A",
+					commitAuthor: "Jane",
+					commitDate: "2026-04-01T10:00:00.000Z",
+					branch: "feature/test",
+					generatedAt: "2026-04-01T10:00:00.000Z",
+					topics: [{ title: "A", trigger: "t", response: "r", decisions: "d" }],
+				} as Awaited<ReturnType<typeof getSummary>>)
+				.mockResolvedValueOnce({
+					version: 3,
+					commitHash: "src-b",
+					commitMessage: "B",
+					commitAuthor: "Jane",
+					commitDate: "2026-04-02T10:00:00.000Z",
+					branch: "feature/test",
+					generatedAt: "2026-04-02T10:00:00.000Z",
+					topics: [{ title: "B", trigger: "t", response: "r", decisions: "d" }],
+				} as Awaited<ReturnType<typeof getSummary>>);
+			vi.mocked(generateSquashConsolidation).mockResolvedValueOnce({
+				status: "ok",
+				topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }],
+				llm: { model: "x", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
+			});
+			setupPipelineMocks("sq-ok");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sq-ok", sourceHashes: ["src-a", "src-b"] }),
+				"/test/cwd",
+			);
+
+			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			expect(consolidatedArg?.summaryError).toBeUndefined();
+		});
+
+		it("squash no-content with degraded source: inherits summaryError", async () => {
+			// no-content is "nothing meaningful to merge" — normally healthy.
+			// But if a source was already degraded, the mechanical-fallback
+			// merge is built on compromised input, so the marker must carry.
+			const { getSummary, mergeManyToOne } = await import("../core/SummaryStore.js");
+			const { generateSquashConsolidation } = await import("../core/Summarizer.js");
+			vi.mocked(getSummary).mockResolvedValueOnce({
+				version: 3,
+				commitHash: "src-bad",
+				commitMessage: "Previously failed",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Placeholder", trigger: "t", response: "r", decisions: "d" }],
+				summaryError: "llm-failed",
+			} as Awaited<ReturnType<typeof getSummary>>);
+			vi.mocked(generateSquashConsolidation).mockResolvedValueOnce({ status: "no-content" });
+			setupPipelineMocks("sq-nc-inh");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sq-nc-inh", sourceHashes: ["src-bad"] }),
+				"/test/cwd",
+			);
+
+			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			expect(consolidatedArg?.summaryError).toBe("llm-failed");
 		});
 	});
 

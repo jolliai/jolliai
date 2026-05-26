@@ -41,7 +41,6 @@ import {
 	readLinearIssueMarkdown,
 	renameLinearIssueMarkdown,
 } from "../core/LinearIssueStore.js";
-import { isLlmCredentialError } from "../core/LlmClient.js";
 import { acquireWorkerLock, refreshWorkerLockMtime, releaseWorkerLock } from "../core/Locks.js";
 import { formatNotesBlock } from "../core/NotePromptFormatter.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
@@ -76,6 +75,7 @@ import {
 	mechanicalConsolidate,
 	type SquashConsolidationSource,
 } from "../core/Summarizer.js";
+import { isSummaryError, LLM_FAILED } from "../core/SummaryErrorMarker.js";
 import {
 	type ConsolidatedTopics,
 	expandSourcesForConsolidation,
@@ -1127,36 +1127,32 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	try {
 		summaryResult = await generateSummary(summaryParams);
 	} catch (error: unknown) {
-		// Credential-config errors (no provider, missing key for the chosen
-		// provider) won't recover on retry, and writing an empty-topic
-		// placeholder would mask the user's loud-failure expectation set by
-		// the Settings dispatcher fix. Rethrow so the worker logs the
-		// offending commit hash and skips placeholder writes — no junk
-		// summary lands on the orphan branch, debug.log carries the cause.
-		if (isLlmCredentialError(error)) {
-			throw error;
-		}
+		// All LLM failures (network, 5xx, credential, quota) flow through the
+		// same retry-then-placeholder path. The webview banner driven by
+		// `summaryError: "llm-failed"` is the loud-failure signal — visible on
+		// every affected commit until the user fixes the underlying issue and
+		// clicks Regenerate. See cli/DEVELOPMENT.md for the unified contract.
 		log.warn("First API attempt failed: %s. Retrying in %dms...", (error as Error).message, RETRY_DELAY_MS);
 		await delay(RETRY_DELAY_MS);
 
 		try {
 			summaryResult = await generateSummary(summaryParams);
 		} catch (retryError: unknown) {
-			if (isLlmCredentialError(retryError)) {
-				throw retryError;
-			}
 			// LLM completely unavailable — save a summary with empty topics so the commit
 			// still has a record (metadata, diff stats, transcript). This prevents missing
 			// source summaries during squash/rebase merges. Topics can be back-filled later
-			// via a re-summarize command.
+			// via Regenerate.
 			//
 			// Marker fields to distinguish LLM failure from genuinely empty LLM response:
+			//   - `summaryError: "llm-failed"` written onto the root by the assembler below
+			//   - `llm.stopReason: "error"` kept for backward compat with pre-summaryError readers
 			//   - model: config.model → the model we tried to call (not "none")
-			//   - stopReason: "error" → topics are empty due to API failure, not because
-			//                           the LLM returned no topics
 			// A genuine empty response would have stopReason: "end_turn" and a real model ID.
 			log.error("API call failed after retry: %s", (retryError as Error).message);
-			log.warn("Saving summary with empty topics for commit %s", commitInfo.hash.substring(0, 8));
+			log.warn(
+				"Saving summary with empty topics + summaryError marker for commit %s",
+				commitInfo.hash.substring(0, 8),
+			);
 			summaryResult = {
 				transcriptEntries: totalEntries,
 				conversationTurns: humanEntries,
@@ -1237,6 +1233,13 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	// so root is always authoritative. Leaves are the source-of-truth for v4
 	// children; later squash/amend operations strip the Hoist fields off this
 	// node when it becomes a child of a v4 root.
+	// LLM failure marker: if generateSummary fell through to the retry-fail
+	// catch block above, `summaryResult.llm.stopReason === "error"` is the
+	// trip-wire — surface it explicitly on the root via summaryError so
+	// isSummaryError catches it without relying on the legacy stopReason
+	// fallback alone.
+	const llmFailed = summaryResult.llm?.stopReason === "error";
+
 	const summary: CommitSummary = {
 		version: 4,
 		commitHash: commitInfo.hash,
@@ -1249,6 +1252,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		commitSource,
 		...summaryResult,
 		diffStats,
+		...(llmFailed ? { summaryError: LLM_FAILED } : {}),
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
 		...(noteRefs.length > 0 ? { notes: noteRefs } : {}),
 		...(linearIssueRefs.length > 0 ? { linearIssues: linearIssueRefs } : {}),
@@ -1348,28 +1352,64 @@ async function runSquashPipeline(
 	// (earliest source -> LLM-extracted) to fill in.
 	const outerTicketId = extractTicketIdFromMessage(commitInfo.message);
 
+	// Source-state inheritance: if any source summary is already in a degraded
+	// state, the squash result is "merged from compromised inputs" — consolidate
+	// only mergers existing topic structures, it does NOT re-derive from raw
+	// diff + transcript like Regenerator does. expandSourcesForConsolidation
+	// drops summaryError from the source contract (only carries topics/recap/
+	// ticketId/commitMessage), so the LLM never sees the failure history; we
+	// have to OR it in at the caller level.
+	const anySourceFailed = oldSummaries.some(isSummaryError);
+
 	let consolidated: ConsolidatedTopics & { status: "llm" | "mechanical" };
 
 	try {
 		const config = await loadConfig();
-		const result = await generateSquashConsolidation({
+		const outcome = await generateSquashConsolidation({
 			squashCommitMessage: commitInfo.message,
 			/* v8 ignore next */
 			...(outerTicketId !== undefined && { ticketId: outerTicketId }),
 			sources,
 			config,
 		});
-		/* v8 ignore start -- LLM "no content" + LLM-throws fallback: covered at integration level by Summarizer's own tests; each arm just re-routes to mechanicalConsolidate. */
-		if (result) {
-			consolidated = { ...result, status: "llm" };
+		/* v8 ignore start -- mechanical fallback arms: "no-content" and "llm-error" both re-route to mechanicalConsolidate; covered at integration level by Summarizer's own tests. */
+		if (outcome.status === "ok") {
+			consolidated = {
+				topics: outcome.topics,
+				...(outcome.recap !== undefined && { recap: outcome.recap }),
+				...(outcome.ticketId !== undefined && { ticketId: outcome.ticketId }),
+				llm: outcome.llm,
+				status: "llm",
+				...(anySourceFailed && { summaryError: LLM_FAILED }),
+			};
+		} else if (outcome.status === "llm-error") {
+			// Real LLM failure (both attempts threw). Mechanical fallback preserves
+			// source content; mark the root with summaryError so the webview
+			// banner fires.
+			consolidated = {
+				...mechanicalConsolidate(sources, outerTicketId),
+				status: "mechanical",
+				summaryError: LLM_FAILED,
+			};
 		} else {
-			// No content / repeated LLM failure: mechanical fallback preserves source
-			// content so the Hoist root is never hollow.
-			consolidated = { ...mechanicalConsolidate(sources, outerTicketId), status: "mechanical" };
+			// "no-content": no sources / all-empty sources / LLM self-reported
+			// nothing to merge. Healthy case — mechanical fallback. Marker only
+			// if a source was already degraded (input-contamination inheritance).
+			consolidated = {
+				...mechanicalConsolidate(sources, outerTicketId),
+				status: "mechanical",
+				...(anySourceFailed && { summaryError: LLM_FAILED }),
+			};
 		}
 	} catch (err) {
-		log.warn("Squash consolidation LLM failed, using mechanical merge: %s", errMsg(err));
-		consolidated = { ...mechanicalConsolidate(sources, outerTicketId), status: "mechanical" };
+		// Defensive: unexpected runtime error outside generateSquashConsolidation
+		// (e.g. loadConfig throws). Treat as llm-error so the user sees a banner.
+		log.warn("Squash consolidation failed (runtime), using mechanical merge: %s", errMsg(err));
+		consolidated = {
+			...mechanicalConsolidate(sources, outerTicketId),
+			status: "mechanical",
+			summaryError: LLM_FAILED,
+		};
 	}
 	/* v8 ignore stop */
 
@@ -1566,6 +1606,12 @@ interface AmendHoistedFields {
 	readonly recap?: string;
 	readonly ticketId?: string;
 	readonly llm?: import("../Types.js").LlmCallMetadata;
+	/**
+	 * Set when the amend pipeline took a degraded path (step 1 LLM failure
+	 * → Copy-Hoist with marker, or step 2 consolidate llm-error → mechanical
+	 * with marker). Surfaces the webview banner on the new amend root.
+	 */
+	readonly summaryError?: import("../Types.js").SummaryErrorKind;
 }
 
 /**
@@ -1609,6 +1655,7 @@ function buildHoistedAmendRoot(
 		...(hoisted.llm && { llm: hoisted.llm }),
 		...(stats?.transcriptEntries !== undefined && { transcriptEntries: stats.transcriptEntries }),
 		...(stats?.conversationTurns !== undefined && { conversationTurns: stats.conversationTurns }),
+		...(hoisted.summaryError && { summaryError: hoisted.summaryError }),
 		/* v8 ignore stop */
 		...hoistMetadataFromOldSummary(oldSummary),
 		topics: hoisted.topics,
@@ -1646,6 +1693,7 @@ async function applyAmendShortCircuit(
 	pipelineStart: number,
 	oldHash: string,
 	label: string,
+	markError: boolean,
 ): Promise<void> {
 	const storedTranscript = buildStoredTranscript(sessionTranscripts);
 	const transcriptArtifact = storedTranscript.sessions.length > 0 ? storedTranscript : undefined;
@@ -1659,6 +1707,7 @@ async function applyAmendShortCircuit(
 			...(oldSummary.recap !== undefined && { recap: oldSummary.recap }),
 			...(oldSummary.ticketId !== undefined && { ticketId: oldSummary.ticketId }),
 			/* v8 ignore stop */
+			...(markError && { summaryError: LLM_FAILED }),
 		},
 		metadata ?? {},
 		amendFullDiffStats,
@@ -1770,6 +1819,10 @@ async function handleAmendPipeline(
 			"Amend short-circuit (pre-LLM): trivial delta ≤ %d -- skipping both LLM calls",
 			TRIVIAL_AMEND_DELTA_LINES,
 		);
+		// Inherit oldSummary's marker so a trivial amend on top of a previously-
+		// failed commit doesn't silently heal the banner: this short-circuit
+		// didn't run the LLM at all, so any prior failure is still unresolved.
+		// A successful Regenerate is the only legitimate way to clear the marker.
 		await applyAmendShortCircuit(
 			oldSummary,
 			commitInfo,
@@ -1782,6 +1835,7 @@ async function handleAmendPipeline(
 			pipelineStart,
 			oldHash,
 			"pre-LLM trivial delta",
+			isSummaryError(oldSummary),
 		);
 		return;
 	}
@@ -1844,6 +1898,11 @@ async function handleAmendPipeline(
 	};
 
 	let delta: Awaited<ReturnType<typeof generateSummary>>;
+	// `deltaLlmFailed` flips to true when both step-1 attempts threw. The pipeline
+	// continues with an empty-delta placeholder so the commit gets a summary on
+	// the orphan branch (Copy-Hoist via short-circuit when an old summary exists,
+	// fresh leaf otherwise); the marker drives the webview banner.
+	let deltaLlmFailed = false;
 	try {
 		delta = await generateSummary(summaryParams);
 	} catch (error: unknown) {
@@ -1853,12 +1912,24 @@ async function handleAmendPipeline(
 			delta = await generateSummary(summaryParams);
 		} catch (retryError: unknown) {
 			log.error("API call failed after retry: %s", (retryError as Error).message);
-			log.error(
-				"Amend summary generation skipped for commit %s. A new commit will trigger summary generation automatically.",
+			log.warn(
+				"Persisting amend summary for %s with summaryError marker so the commit is not silently dropped",
 				commitInfo.hash.substring(0, 8),
-				commitInfo.hash,
 			);
-			return;
+			deltaLlmFailed = true;
+			delta = {
+				transcriptEntries: totalEntries,
+				conversationTurns: humanEntries,
+				llm: {
+					model: amendConfig.model ?? "unknown",
+					inputTokens: 0,
+					outputTokens: 0,
+					apiLatencyMs: 0,
+					stopReason: "error",
+				},
+				stats: deltaDiffStats,
+				topics: [],
+			};
 		}
 	}
 	log.info("Amend step 1 (delta summary) generated (%s)", formatElapsed(stepStart));
@@ -1872,8 +1943,17 @@ async function handleAmendPipeline(
 	// ── Post-LLM short-circuit: step1 returned empty topics → skip step2 ──────
 	// delta.recap is discarded even if present: a recap without topics is just a
 	// restatement of the diff, and the diff is the source of truth.
+	// Also taken when step-1 LLM failed (deltaLlmFailed=true) so the failure
+	// surfaces with Copy-Hoisted topics + marker, never as a missing summary.
 	if (oldSummary && (delta.topics?.length ?? 0) === 0) {
-		log.info("Amend short-circuit (post-LLM): step1 returned empty topics -- skipping step2 consolidate");
+		log.info(
+			"Amend short-circuit (post-LLM): step1 %s -- skipping step2 consolidate",
+			deltaLlmFailed ? "LLM failed" : "returned empty topics",
+		);
+		// Inherit oldSummary's marker when step-1 succeeded but produced no topics:
+		// we Copy-Hoist the old root and step-2 never ran, so a previously-
+		// unresolved failure is still unresolved. `deltaLlmFailed` covers the
+		// other case (step-1 itself failed) explicitly.
 		await applyAmendShortCircuit(
 			oldSummary,
 			commitInfo,
@@ -1885,7 +1965,8 @@ async function handleAmendPipeline(
 			cwd,
 			pipelineStart,
 			oldHash,
-			"post-LLM empty topics",
+			deltaLlmFailed ? "post-LLM error fallback" : "post-LLM empty topics",
+			deltaLlmFailed || isSummaryError(oldSummary),
 		);
 		return;
 	}
@@ -1913,18 +1994,38 @@ async function handleAmendPipeline(
 
 		stepStart = now();
 		let consolidated: ConsolidatedTopics | null;
+		let consolidateLlmFailed = false;
 		try {
-			consolidated = await generateSquashConsolidation({
+			const outcome = await generateSquashConsolidation({
 				squashCommitMessage: commitInfo.message,
 				/* v8 ignore next */
 				...(outerTicketId !== undefined && { ticketId: outerTicketId }),
 				sources,
 				config: amendConfig,
 			});
-			/* v8 ignore start -- LLM-failure fallback: covered at integration level by Summarizer's own tests; the catch here is a thin re-route to mechanical merge. */
+			if (outcome.status === "ok") {
+				consolidated = {
+					topics: outcome.topics,
+					/* v8 ignore start -- optional-field spreads */
+					...(outcome.recap !== undefined && { recap: outcome.recap }),
+					...(outcome.ticketId !== undefined && { ticketId: outcome.ticketId }),
+					/* v8 ignore stop */
+					llm: outcome.llm,
+				};
+			} else {
+				consolidated = null;
+				/* v8 ignore start -- "no-content" leaves marker unset; "llm-error" trips it. */
+				if (outcome.status === "llm-error") consolidateLlmFailed = true;
+				/* v8 ignore stop */
+			}
+			/* v8 ignore start -- defensive: generateSquashConsolidation handles its own LLM throws internally, so this catch only fires on unexpected runtime errors (e.g. loadConfig threw before the call). Treat as llm-error so banner surfaces. */
 		} catch (err) {
-			log.warn("Amend step 2 (consolidate) LLM failed: %s -- falling back to mechanical merge", errMsg(err));
+			log.warn(
+				"Amend step 2 (consolidate) failed (runtime): %s -- falling back to mechanical merge",
+				errMsg(err),
+			);
 			consolidated = null;
+			consolidateLlmFailed = true;
 		}
 		/* v8 ignore stop */
 		const finalConsolidated: ConsolidatedTopics = consolidated ?? mechanicalConsolidate(sources, outerTicketId);
@@ -1946,6 +2047,13 @@ async function handleAmendPipeline(
 				...(finalConsolidated.ticketId !== undefined && { ticketId: finalConsolidated.ticketId }),
 				// Only include llm metadata when consolidation actually called the LLM.
 				...(consolidated?.llm && { llm: consolidated.llm }),
+				// Inherit oldSummary's degraded state even when step-2 consolidate
+				// succeeded: consolidate merges existing topic structures, it does
+				// NOT re-derive from raw diff + transcript like Regenerator does.
+				// If oldSummary was a placeholder / Copy-Hoist / mechanical merge
+				// from a prior failure, the consolidated output is "delta + degraded
+				// old", not "regenerated". Only a true Regenerate clears the marker.
+				...((consolidateLlmFailed || isSummaryError(oldSummary)) && { summaryError: LLM_FAILED }),
 				/* v8 ignore stop */
 			},
 			metadata ?? {},
@@ -2007,6 +2115,7 @@ async function handleAmendPipeline(
 		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
 		...delta,
 		diffStats: amendFullDiffStats,
+		...(deltaLlmFailed && { summaryError: LLM_FAILED }),
 		...(freshLeafPlanRefs.length > 0 ? { plans: freshLeafPlanRefs } : {}),
 		...(freshLeafNoteRefs.length > 0 ? { notes: freshLeafNoteRefs } : {}),
 		...(freshLeafLinearRefs.length > 0 ? { linearIssues: freshLeafLinearRefs } : {}),

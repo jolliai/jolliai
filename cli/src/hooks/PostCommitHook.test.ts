@@ -672,12 +672,14 @@ describe("PostCommitHook", () => {
 
 		expect(generateSummary).toHaveBeenCalledTimes(2);
 		// After double failure, a metadata-only summary is stored so squash/rebase
-		// merges never hit missing source summaries. Topics are empty and
-		// stopReason is "error" to distinguish from a genuine LLM response.
+		// merges never hit missing source summaries. Topics are empty,
+		// stopReason is "error" (legacy marker for pre-summaryError readers),
+		// and summaryError = "llm-failed" drives the webview banner.
 		expect(storeSummary).toHaveBeenCalledTimes(1);
 		const storedSummary = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
 		expect(storedSummary.topics).toEqual([]);
 		expect(storedSummary.llm?.stopReason).toBe("error");
+		expect(storedSummary.summaryError).toBe("llm-failed");
 	});
 
 	it("should handle first commit (diff failure fallback)", async () => {
@@ -1893,7 +1895,7 @@ describe("queue-driven Worker", () => {
 			vi.mocked(isCodexInstalled).mockResolvedValue(true);
 		}
 
-		it("skips amend summary on double API failure", async () => {
+		it("persists amend summary with summaryError marker on double API failure", async () => {
 			setupAmendWithLLM();
 			vi.mocked(generateSummary)
 				.mockRejectedValueOnce(new Error("API error 1"))
@@ -1904,8 +1906,13 @@ describe("queue-driven Worker", () => {
 			await workerPromise;
 
 			expect(generateSummary).toHaveBeenCalledTimes(2);
-			// On double failure in amend, storeSummary should NOT be called (early return)
-			expect(storeSummary).not.toHaveBeenCalled();
+			// New behavior: amend no longer skips silently on double failure.
+			// Either Copy-Hoist via short-circuit (oldSummary present) or
+			// fresh-leaf (no oldSummary); both paths land a summary with
+			// summaryError = "llm-failed" so the webview banner surfaces.
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const stored = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(stored.summaryError).toBe("llm-failed");
 		});
 
 		it("logs todo field when amend topic includes a todo item", async () => {
