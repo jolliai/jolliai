@@ -18,6 +18,7 @@ import { dirname, join, relative } from "node:path";
 import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "../Types.js";
 import { MetadataManager } from "./MetadataManager.js";
+import { toForwardSlash } from "./PathUtils.js";
 import type { HealOptions, HealResult, StorageProvider } from "./StorageProvider.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 
@@ -951,7 +952,13 @@ export class FolderStorage implements StorageProvider {
 			if (entry.isDirectory()) {
 				this.walkDir(fullPath, baseDir, result);
 			} else {
-				result.push(relative(baseDir, fullPath));
+				// Forward-slash form — matches OrphanBranchStorage.listFiles (git
+				// emits POSIX paths regardless of host) so downstream regex /
+				// prefix consumers (e.g. SummaryStore.getTranscriptHashes) work
+				// uniformly across both storage backends. Without this, Windows
+				// produced `transcripts\<hash>.json` and every consumer regex that
+				// hard-coded `transcripts/` silently returned an empty set.
+				result.push(toForwardSlash(relative(baseDir, fullPath)));
 			}
 		}
 	}

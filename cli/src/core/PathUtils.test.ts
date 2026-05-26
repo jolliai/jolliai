@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { withPlatform } from "../testUtils/withPlatform.js";
-import { normalizePathForCompare } from "./PathUtils.js";
+import { normalizePathForCompare, toForwardSlash } from "./PathUtils.js";
 
 describe("normalizePathForCompare", () => {
 	it("unifies backslashes to forward slashes regardless of platform", () => {
@@ -59,5 +59,47 @@ describe("normalizePathForCompare", () => {
 			// Single root slash gets stripped — fine because all production callers pass absolute file paths
 			expect(normalizePathForCompare("/")).toBe("");
 		});
+	});
+});
+
+// Platform-agnostic tests for toForwardSlash. The FolderStorage and
+// SummaryStore integration tests that exercise this helper through walkDir
+// are no-ops on Linux CI (node:path emits forward slashes there natively),
+// so the regression net for the 2026-05-26 Windows path bug needs at least
+// one host-OS-independent assertion. These tests are it.
+describe("toForwardSlash", () => {
+	it("returns an empty string unchanged", () => {
+		expect(toForwardSlash("")).toBe("");
+	});
+
+	it("returns a forward-slash path unchanged (idempotent on POSIX form)", () => {
+		expect(toForwardSlash("transcripts/abc.json")).toBe("transcripts/abc.json");
+		expect(toForwardSlash("a/b/c/d.txt")).toBe("a/b/c/d.txt");
+	});
+
+	it("converts a Windows-style backslash path to forward slashes", () => {
+		expect(toForwardSlash("transcripts\\abc.json")).toBe("transcripts/abc.json");
+		expect(toForwardSlash("a\\b\\c\\d.txt")).toBe("a/b/c/d.txt");
+	});
+
+	it("converts mixed separators to forward slashes", () => {
+		expect(toForwardSlash("a\\b/c\\d")).toBe("a/b/c/d");
+	});
+
+	it("does not strip trailing or leading separators (unlike normalizePathForCompare)", () => {
+		expect(toForwardSlash("\\a\\b\\")).toBe("/a/b/");
+		expect(toForwardSlash("/a/b/")).toBe("/a/b/");
+	});
+
+	it("does not change case (unlike normalizePathForCompare)", () => {
+		expect(toForwardSlash("C:\\Users\\Sanshi\\AppData")).toBe("C:/Users/Sanshi/AppData");
+	});
+
+	it("handles a single backslash", () => {
+		expect(toForwardSlash("\\")).toBe("/");
+	});
+
+	it("handles a path with no separators", () => {
+		expect(toForwardSlash("file.txt")).toBe("file.txt");
 	});
 });

@@ -16,6 +16,7 @@ import { readFile, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
+import { toForwardSlash } from "./PathUtils.js";
 
 type PathSegment = string | number;
 
@@ -324,7 +325,7 @@ export async function readCopilotChatTranscript(
 	cursor?: TranscriptCursor,
 	beforeTimestamp?: string,
 ): Promise<TranscriptReadResult> {
-	const norm = transcriptPath.replace(/\\/g, "/");
+	const norm = toForwardSlash(transcriptPath);
 	if (/\/\.copilot\/session-state\/[^/]+\/events\.jsonl$/.test(norm)) {
 		return readEventsJsonl(transcriptPath, cursor, beforeTimestamp);
 	}

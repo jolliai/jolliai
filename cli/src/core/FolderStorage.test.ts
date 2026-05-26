@@ -1527,6 +1527,28 @@ describe("FolderStorage", () => {
 			expect(result.some((p) => p.includes("sub-a"))).toBe(true);
 			expect(result.some((p) => p.includes("sub-b"))).toBe(true);
 		});
+
+		// Regression test for the 2026-05-26 Windows path bug — listFiles must
+		// emit forward-slash paths regardless of host OS so downstream regex
+		// consumers (SummaryStore.getTranscriptHashes etc.) match uniformly.
+		// On non-Windows runners the assertion is trivially true; on Windows
+		// it would fail before the toForwardSlash fix.
+		it("listFiles emits forward-slash separators on all platforms", async () => {
+			await storage.writeFiles(
+				[
+					{ path: "summaries/a.json", content: makeSummaryJson({ commitHash: "aaaaaaaaaaaaaaaa" }) },
+					{ path: "transcripts/aaaaaaaaaaaaaaaa.json", content: "{}" },
+					{ path: "summaries/sub/b.json", content: makeSummaryJson({ commitHash: "bbbbbbbbbbbbbbbb" }) },
+				],
+				"slash-form",
+			);
+			const summaries = await storage.listFiles("summaries");
+			const transcripts = await storage.listFiles("transcripts");
+			const all = [...summaries, ...transcripts];
+			expect(all.length).toBeGreaterThan(0);
+			expect(all.every((p) => !p.includes("\\"))).toBe(true);
+			expect(summaries.some((p) => p.startsWith("summaries/sub/"))).toBe(true);
+		});
 	});
 
 	describe("frontmatter commitType", () => {

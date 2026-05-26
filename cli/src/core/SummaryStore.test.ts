@@ -21,6 +21,9 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
+import { mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
 import type {
 	CommitInfo,
 	CommitSummary,
@@ -29,6 +32,7 @@ import type {
 	SummaryIndex,
 	SummaryIndexEntry,
 } from "../Types.js";
+import { FolderStorage } from "./FolderStorage.js";
 import {
 	getDiffStats,
 	getTreeHash,
@@ -37,6 +41,7 @@ import {
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
 import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
+import { MetadataManager } from "./MetadataManager.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import {
 	AmbiguousHashError,
@@ -2029,6 +2034,44 @@ describe("SummaryStore", () => {
 
 			const hashes = await getTranscriptHashes();
 			expect(hashes).toEqual(new Set(["abc123", "def456"]));
+		});
+
+		// End-to-end integration test for the 2026-05-26 Windows path bug:
+		// drive a REAL FolderStorage (not a mock) and verify getTranscriptHashes
+		// finds the hash. Before the toForwardSlash fix, FolderStorage.walkDir
+		// on Windows returned `transcripts\<hash>.json`, the regex never
+		// matched, and the set came back empty.
+		it("extracts hashes from a real FolderStorage backend (Windows regression)", async () => {
+			const root = joinPath(
+				tmpdir(),
+				`getTranscriptHashes-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+			);
+			mkdirSync(root, { recursive: true });
+			try {
+				const mm = new MetadataManager(joinPath(root, ".jolli"));
+				const storage: StorageProvider = new FolderStorage(root, mm);
+				await storage.ensure();
+				await storage.writeFiles(
+					[
+						{
+							path: "transcripts/8af39d0716602b52396ae1cc7ee08420d6dddfc3.json",
+							content: '{"sessions":[]}',
+						},
+						{
+							path: "transcripts/0123456789abcdef0123456789abcdef01234567.json",
+							content: '{"sessions":[]}',
+						},
+					],
+					"seed",
+				);
+
+				const hashes = await getTranscriptHashes(undefined, storage);
+				expect(hashes.has("8af39d0716602b52396ae1cc7ee08420d6dddfc3")).toBe(true);
+				expect(hashes.has("0123456789abcdef0123456789abcdef01234567")).toBe(true);
+				expect(hashes.size).toBe(2);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
 		});
 	});
 
