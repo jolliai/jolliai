@@ -151,6 +151,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 
         // Create the panels (Memories + Commits are merged into CommitsPanel)
         val statusPanel = StatusPanel(project, service)
+        val conversationsPanel = ActiveConversationsPanel(project, service)
         val plansPanel = PlansPanel(project, service)
         val changesPanel = ChangesPanel(project, service)
         val commitsPanel = CommitsPanel(project, service)
@@ -158,6 +159,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // Register panels for action lookup
         val registry = PanelRegistry().apply {
             this.statusPanel = statusPanel
+            this.activeConversationsPanel = conversationsPanel
             this.plansPanel = plansPanel
             this.changesPanel = changesPanel
             this.commitsPanel = commitsPanel
@@ -170,6 +172,9 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // STATUS is no longer a collapsible — it takes the full content area as
         // a dedicated card when the breadcrumb status button is toggled on,
         // matching VS Code's full-pane status view.
+        val conversationsCollapsible = CollapsiblePanel(
+            "CONVERSATIONS", "JolliMemory.ConversationsActions", conversationsPanel,
+        )
         val plansCollapsible = CollapsiblePanel("PLANS & NOTES", "JolliMemory.PlansActions", plansPanel)
         val changesCollapsible = CollapsiblePanel("CHANGES", "JolliMemory.ChangesActions", changesPanel)
         val memoriesCollapsible = CollapsiblePanel(
@@ -180,6 +185,8 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // and expanded panels share the remaining vertical space proportionally.
         // Resize dividers between panels allow users to drag and adjust panel heights.
         val accordionPanel = JPanel(AccordionLayout()).apply {
+            add(conversationsCollapsible)
+            add(ResizeDivider())
             add(plansCollapsible)
             add(ResizeDivider())
             add(changesCollapsible)
@@ -190,6 +197,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // Add gear menu toggle actions to the tool window title bar,
         // allowing users to show/hide individual panels — like VS Code's "..." menu.
         val gearActions = DefaultActionGroup().apply {
+            add(TogglePanelAction(conversationsCollapsible))
             add(TogglePanelAction(memoriesCollapsible))
             add(TogglePanelAction(plansCollapsible))
             add(TogglePanelAction(changesCollapsible))

@@ -101,11 +101,13 @@ class CollapsiblePanel(
         add(headerPanel, BorderLayout.NORTH)
 
         // Content: add a thin top border for visual separation
-        contentPanel.border = JBUI.Borders.merge(
-            JBUI.Borders.customLineTop(UIManager.getColor("Separator.separatorColor") ?: java.awt.Color.GRAY),
-            contentPanel.border,
-            true,
-        )
+        val separatorBorder = JBUI.Borders.customLineTop(UIManager.getColor("Separator.separatorColor") ?: java.awt.Color.GRAY)
+        val existingBorder = contentPanel.border
+        contentPanel.border = if (existingBorder != null) {
+            JBUI.Borders.merge(separatorBorder, existingBorder, true)
+        } else {
+            separatorBorder
+        }
 
         if (expanded) {
             add(contentPanel, BorderLayout.CENTER)

@@ -36,6 +36,10 @@
         <fileEditorProvider
             implementation="ai.jolli.jollimemory.toolwindow.SummaryEditorProvider"/>
 
+        <!-- Editor tab provider for conversation transcript detail view -->
+        <fileEditorProvider
+            implementation="ai.jolli.jollimemory.toolwindow.ConversationEditorProvider"/>
+
         <!-- Notification group for balloon notifications (e.g., no-Git warning) -->
         <notificationGroup
             id="JolliMemory"
@@ -98,6 +102,15 @@
                     class="ai.jolli.jollimemory.actions.RefreshChangesAction"
                     text="Refresh Changes"
                     description="Refresh changed files"
+                    icon="AllIcons.Actions.Refresh"/>
+        </group>
+
+        <!-- Conversations panel actions -->
+        <group id="JolliMemory.ConversationsActions" text="JolliMemory Conversations">
+            <action id="JolliMemory.RefreshConversations"
+                    class="ai.jolli.jollimemory.actions.RefreshConversationsAction"
+                    text="Refresh Conversations"
+                    description="Refresh active conversations"
                     icon="AllIcons.Actions.Refresh"/>
         </group>
 
