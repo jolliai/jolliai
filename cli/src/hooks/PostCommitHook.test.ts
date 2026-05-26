@@ -78,6 +78,19 @@ vi.mock("../core/Locks.js", () => ({
 	isWorkerLockHeld: vi.fn(),
 }));
 
+vi.mock("../sync/VaultWriteLock.js", () => ({
+	acquireVaultWriteLock: vi.fn().mockResolvedValue({
+		release: vi.fn().mockResolvedValue(undefined),
+		refresh: vi.fn().mockResolvedValue(undefined),
+	}),
+	DEFAULT_VAULT_WRITE_WAIT_MS: 60_000,
+	isVaultWriteLockHeld: vi.fn(),
+}));
+
+vi.mock("../sync/SyncBootstrap.js", () => ({
+	deriveMemoryBankRoot: vi.fn((localFolder?: string) => localFolder ?? "/tmp/jolli-test-vault"),
+}));
+
 vi.mock("../core/TranscriptReader.js", () => ({
 	readTranscript: vi.fn(),
 	buildMultiSessionContext: vi.fn(),

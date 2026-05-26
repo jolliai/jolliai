@@ -443,6 +443,36 @@ describe("SessionTracker", () => {
 			const config = await loadConfigFromDir(dir);
 			expect(config).toEqual({});
 		});
+
+		it("coalesces legacy `syncEnabled` to `autoSyncEnabled` on read", async () => {
+			// Existing installs (pre-rename) have `syncEnabled` on disk. The
+			// loader must surface it under the new name, drop the old key, so
+			// downstream code that only knows `autoSyncEnabled` keeps working
+			// without forcing every user to re-toggle the setting.
+			const dir = await ensureJolliMemoryDir(tempDir);
+			await writeFile(
+				join(dir, "config.json"),
+				JSON.stringify({ syncEnabled: true, jolliApiKey: "sk-jol-test" }),
+				"utf-8",
+			);
+			const config = await loadConfigFromDir(dir);
+			expect(config.autoSyncEnabled).toBe(true);
+			// Legacy key dropped from the in-memory shape so callers don't
+			// accidentally read it.
+			expect(config.syncEnabled).toBeUndefined();
+		});
+
+		it("prefers a present `autoSyncEnabled` over legacy `syncEnabled`", async () => {
+			const dir = await ensureJolliMemoryDir(tempDir);
+			await writeFile(
+				join(dir, "config.json"),
+				JSON.stringify({ syncEnabled: true, autoSyncEnabled: false }),
+				"utf-8",
+			);
+			const config = await loadConfigFromDir(dir);
+			expect(config.autoSyncEnabled).toBe(false);
+			expect(config.syncEnabled).toBeUndefined();
+		});
 	});
 
 	describe("squash-pending helpers", () => {

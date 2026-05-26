@@ -225,11 +225,32 @@ export async function loadConfigFromDir(dir: string): Promise<JolliMemoryConfig>
 	const filePath = join(dir, CONFIG_FILE);
 	try {
 		const content = await readFile(filePath, "utf-8");
-		return JSON.parse(content) as JolliMemoryConfig;
+		const raw = JSON.parse(content) as JolliMemoryConfig;
+		return coalesceLegacyKeys(raw);
 	} catch {
 		log.debug("No config file found in %s, using defaults", dir);
 		return {};
 	}
+}
+
+/**
+ * Read-time back-compat for renamed config keys. Maps old names onto their
+ * new counterparts when the new key is absent, then drops the old key from
+ * the returned object so downstream code only sees the new shape. The
+ * on-disk file is left untouched here — the next `saveConfigScoped` call
+ * will naturally write the new key and omit the old one (omit because
+ * `coalesceLegacyKeys` deletes it from the in-memory object that
+ * `saveConfigScoped` then spreads).
+ *
+ * Currently handles:
+ *   - `syncEnabled` → `autoSyncEnabled` (UI label always was "Auto-sync to
+ *     Personal Space"; the old name suggested a sync master switch but
+ *     only ever controlled the background poll — see `JolliMemoryConfig`).
+ */
+function coalesceLegacyKeys(raw: JolliMemoryConfig): JolliMemoryConfig {
+	if (raw.syncEnabled === undefined) return raw;
+	const { syncEnabled, ...rest } = raw;
+	return rest.autoSyncEnabled === undefined ? { ...rest, autoSyncEnabled: syncEnabled } : rest;
 }
 
 /**

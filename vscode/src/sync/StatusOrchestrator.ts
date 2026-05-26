@@ -34,14 +34,55 @@ import { isTerminalSyncError } from "../../../cli/src/sync/SyncTypes.js";
 
 const log = createLogger("Sync:StatusOrchestrator");
 import type {
+	SyncPhase,
 	SyncRoundOptions,
 	SyncRoundResult,
 	SyncState,
 } from "../../../cli/src/sync/SyncTypes.js";
+import type { StatusStore } from "../stores/StatusStore.js";
 import type {
 	StatusBarManager,
 	SyncStatusDetail,
 } from "../util/StatusBarManager.js";
+
+/**
+ * User-facing labels for the sync engine's `SyncPhase` events. Deliberately
+ * conversational — not 1:1 with git commands — so the sidebar reads as
+ * product copy rather than ops output.
+ */
+const PHASE_LABELS: Record<SyncPhase, string> = {
+	downloading: "Sync: Getting latest memories…",
+	merging: "Sync: Bringing it together…",
+	resolving: "Sync: Sorting out conflicts…",
+	uploading: "Sync: Sharing your changes…",
+	waiting: "Sync: Another device is syncing — waiting…",
+};
+
+/**
+ * Initial label set at round start, before the first `onPhase` callback
+ * fires. Plain — at this point we haven't yet picked a phase. Also used
+ * after a transient (`network`) failure: the activity is kept visible
+ * because the next poll usually recovers, but reset to this neutral label
+ * so the user isn't left looking at a stale phase string.
+ */
+const SYNC_START_LABEL = "Syncing memory bank…";
+
+/**
+ * Titles for the bottom-right VS Code error notification raised when a round
+ * ends in terminal failure. The phase key picks the copy so the user sees
+ * *where* the round broke. Surfaced via `notifyError` (vscode.window.show-
+ * ErrorMessage) rather than the toolbar phase indicator — the toolbar is
+ * reserved for *transient* in-flight progress; persistent failures belong on
+ * the notification surface so the user can dismiss them explicitly.
+ */
+const FAILURE_LABELS: Record<SyncPhase | "starting", string> = {
+	starting: "Sync: Couldn't start",
+	downloading: "Sync: Couldn't fetch latest memories",
+	merging: "Sync: Couldn't merge changes",
+	resolving: "Sync: Couldn't resolve conflicts",
+	uploading: "Sync: Couldn't share your changes",
+	waiting: "Sync: Personal Space is still locked",
+};
 
 const MIN_POLL_SEC = 90 * 60; // 90 min floor — matches CLI configure floor; sync is heavy, manual button covers urgency
 const MAX_POLL_SEC = 86400; // 24h ceiling so a confused config can't park the engine for weeks
@@ -50,6 +91,14 @@ const DEFAULT_POLL_SEC = 90 * 60; // 90 min — slow background cadence, Sync-no
 export interface StatusOrchestratorOpts {
 	readonly engine: SyncEngine;
 	readonly statusBar: StatusBarManager;
+	/**
+	 * Unified activity registry — the orchestrator pushes a `"sync"` activity
+	 * at round start and relabels it as the engine progresses through phases.
+	 * Terminal failures keep the activity alive with `severity: "error"` so
+	 * the sidebar shows *where* the last round broke until the next round
+	 * succeeds. Optional: tests that don't drive the sidebar can omit it.
+	 */
+	readonly statusStore?: StatusStore;
 	readonly workspaceFolder: vscode.WorkspaceFolder;
 	readonly pollIntervalSec?: number;
 	/**
@@ -77,29 +126,86 @@ export interface StatusOrchestratorOpts {
 	 * files on disk before the failure.
 	 */
 	readonly onRoundFinished?: (state: SyncState, result: SyncRoundResult) => void;
+	/**
+	 * Raises a persistent failure notification (bottom-right toast) when a
+	 * round ends in terminal failure. The toolbar phase indicator is for
+	 * transient in-flight progress only — persistent errors belong on the
+	 * notification surface so the user can dismiss them explicitly. Wired
+	 * to `vscode.window.showErrorMessage` in production; tests substitute a
+	 * spy. Optional: paths that don't surface a UI (tests with no statusStore)
+	 * can omit it and the orchestrator skips the call silently.
+	 */
+	readonly notifyError?: (title: string, message: string) => void;
 	/** Test seam — substitute setInterval/clearInterval. */
 	readonly timer?: {
 		setInterval: (handler: () => void, ms: number) => unknown;
 		clearInterval: (handle: unknown) => void;
 	};
+	/**
+	 * Persistent "last successful round started" timestamp (ms since epoch).
+	 * Gates the eager `tick()` on `start()`: if we've recently synced
+	 * (within `EAGER_TICK_MIN_ELAPSED_MS`), `start()` waits for the next
+	 * poll boundary instead of burning another round.
+	 *
+	 * Production wires this to `vscode.ExtensionContext.globalState` so the
+	 * value survives Reload Window (the case the pre-fix removal was trying
+	 * to avoid — every reload burned a round). Tests pass an in-memory
+	 * shim. Omitting the seam disables the eager-tick path, identical to
+	 * the pre-fix "no eager tick ever" behaviour.
+	 */
+	readonly lastSuccessAt?: {
+		get(): number | undefined;
+		set(ms: number): void;
+	};
+	/**
+	 * Override for the eager-tick freshness threshold. Defaults to 30 min.
+	 * Lower than the default poll interval (90 min) so a normal user open
+	 * after lunch / overnight gets an eager refresh; higher than any
+	 * realistic Reload Window cycle so dev iteration doesn't burn rounds.
+	 */
+	readonly eagerTickMinElapsedMs?: number;
 }
+
+/** Default freshness window — see `eagerTickMinElapsedMs`. */
+const DEFAULT_EAGER_TICK_MIN_ELAPSED_MS = 30 * 60_000;
 
 export class StatusOrchestrator implements vscode.Disposable {
 	private readonly engine: SyncEngine;
 	private readonly statusBar: StatusBarManager;
+	private readonly statusStore: StatusStore | undefined;
 	private readonly cwd: string;
 	private readonly pollMs: number;
 	private readonly timer: NonNullable<StatusOrchestratorOpts["timer"]>;
 	private readonly readyPromise: Promise<void>;
 	/**
+	 * Most-recent phase the engine emitted during the in-flight round.
+	 * Used to label a sticky error visual when the round ends in failure.
+	 * Reset to `null` at the start of each round.
+	 */
+	private currentPhase: SyncPhase | null = null;
+	/**
 	 * Late-bound: Extension.ts wires this after `KbFoldersService` and
-	 * `SidebarWebviewProvider` are constructed (which is AFTER `activateSync`
-	 * has already run an eager first round). A `setter` rather than a
-	 * constructor arg keeps the dependency graph manageable.
+	 * `SidebarWebviewProvider` are constructed, which happens after
+	 * `activateSync` returns. The first round (poll or manual) always
+	 * fires after that wiring is in place, so the setter exists purely
+	 * for ergonomics — keeping the dependency graph linear instead of
+	 * threading the callback through the constructor.
 	 */
 	private onRoundFinished?: (state: SyncState, result: SyncRoundResult) => void;
+	private readonly notifyError?: (title: string, message: string) => void;
 	private pollHandle: unknown = null;
 	private currentRoundPromise: Promise<unknown> | null = null;
+	/**
+	 * P3-A — followup latch. Set by `requestManualSync()` when a manual
+	 * `syncNow` arrives during an in-flight round. The current round may
+	 * bail (generation mismatch in `tick`) without actually executing the
+	 * engine, in which case the manual intent would otherwise be lost.
+	 * After the current round settles (in `tick`'s finally), the latch is
+	 * checked and an unconditional manual tick is scheduled. Cleared by
+	 * the followup tick before it starts so subsequent manual clicks
+	 * during THAT tick can re-arm.
+	 */
+	private pendingManualFollowup = false;
 	private lastState: SyncState = "synced";
 	private disposed = false;
 	/**
@@ -113,13 +219,19 @@ export class StatusOrchestrator implements vscode.Disposable {
 	 * already-queued tick run a round when ready settled.
 	 */
 	private pollGeneration = 0;
+	private readonly lastSuccessAt: StatusOrchestratorOpts["lastSuccessAt"];
+	private readonly eagerTickMinElapsedMs: number;
 
 	constructor(opts: StatusOrchestratorOpts) {
 		this.engine = opts.engine;
 		this.statusBar = opts.statusBar;
+		this.statusStore = opts.statusStore;
 		this.cwd = opts.workspaceFolder.uri.fsPath;
 		this.readyPromise = opts.readyPromise ?? Promise.resolve();
 		this.onRoundFinished = opts.onRoundFinished;
+		this.notifyError = opts.notifyError;
+		this.lastSuccessAt = opts.lastSuccessAt;
+		this.eagerTickMinElapsedMs = opts.eagerTickMinElapsedMs ?? DEFAULT_EAGER_TICK_MIN_ELAPSED_MS;
 		const clamped = clampPoll(opts.pollIntervalSec);
 		this.pollMs = clamped * 1000;
 		this.timer = opts.timer ?? {
@@ -129,7 +241,24 @@ export class StatusOrchestrator implements vscode.Disposable {
 		};
 	}
 
-	/** Starts the polling loop. Idempotent. */
+	/**
+	 * Starts the polling loop. Idempotent.
+	 *
+	 * **Conditional eager round on `start()`.** Pre-§P2-fix: always fired
+	 * an immediate `tick()`, which burned a round on every `Developer:
+	 * Reload Window` during extension development. Then the eager tick
+	 * was removed entirely, which fixed dev iteration but made auto-sync
+	 * silent for up to the full poll interval (90 min default) after
+	 * VS Code restart — including the "open laptop in the morning, want
+	 * overnight remote changes" case.
+	 *
+	 * Current: fire eager tick iff `lastSuccessAt.get()` is undefined
+	 * (cold start) OR older than `eagerTickMinElapsedMs` (default 30 min).
+	 * Reload Window with a fresh successful round (seconds ago) → no eager
+	 * tick. Re-open after lunch / overnight → eager tick. Persistence
+	 * survives Reload Window via `globalState` so the dev-iteration
+	 * "burn a round on every reload" regression doesn't return.
+	 */
 	start(): void {
 		if (this.disposed) return;
 		if (this.pollHandle !== null) return;
@@ -138,12 +267,38 @@ export class StatusOrchestrator implements vscode.Disposable {
 		// accidentally fire when the user re-enables auto-sync.
 		this.pollGeneration++;
 		const gen = this.pollGeneration;
+		// Eager tick uses `reason: "poll"` — semantically this IS auto-sync
+		// firing its first poll early, just on the startup boundary instead
+		// of waiting for the interval. Avoids adding a new reason variant
+		// (which would force every consumer of `SyncRoundOptions["reason"]`
+		// to learn it).
+		if (this.shouldFireEagerTick()) {
+			void this.tick("poll", gen);
+		}
 		this.pollHandle = this.timer.setInterval(() => {
 			void this.tick("poll", gen);
 		}, this.pollMs);
-		// Kick off an immediate round so opt-in users see status update right
-		// away rather than waiting for the first poll boundary.
-		void this.tick("poll", gen);
+	}
+
+	/**
+	 * Decides whether `start()` should fire an immediate tick before the
+	 * first poll interval elapses. `true` when:
+	 *   - No persistence seam was wired (test default — preserves the
+	 *     pre-fix "no eager tick" baseline so existing tests that count
+	 *     ticks don't observe a new one).
+	 *
+	 * Wait, that's backwards: callers without the seam wired probably DO
+	 * want the eager behaviour. Actually the safer default is the
+	 * opposite — without persistence we can't distinguish reload-burn from
+	 * a real restart, so skip eager to err on "don't burn a round". Tests
+	 * that want the eager-tick path through here pass an in-memory shim
+	 * with `get()` returning a stale timestamp.
+	 */
+	private shouldFireEagerTick(): boolean {
+		if (this.lastSuccessAt === undefined) return false;
+		const last = this.lastSuccessAt.get();
+		if (last === undefined) return true; // cold start — never synced
+		return Date.now() - last >= this.eagerTickMinElapsedMs;
 	}
 
 	/**
@@ -174,6 +329,7 @@ export class StatusOrchestrator implements vscode.Disposable {
 	dispose(): void {
 		this.disposed = true;
 		this.stop();
+		this.statusStore?.setSyncPhase(null);
 	}
 
 	/**
@@ -184,6 +340,59 @@ export class StatusOrchestrator implements vscode.Disposable {
 	 */
 	async syncNow(): Promise<void> {
 		await this.tick("manual", undefined);
+	}
+
+	/**
+	 * P3-A entry point for `jollimemory.syncNow` (replaces the previous
+	 * "early-return if in-flight" pattern in `SyncCommands`).
+	 *
+	 * Why a separate method rather than just calling `syncNow()`:
+	 *
+	 *   - If no round is in flight, this is equivalent to `syncNow()` —
+	 *     fires a manual tick and awaits it.
+	 *   - If a round IS in flight, the old code path silently no-op'd. But
+	 *     the in-flight round may bail before executing the engine (the
+	 *     `queuedAtGeneration !== pollGeneration` check at the top of
+	 *     `tick()`'s IIFE fires when the user toggled auto-sync OFF mid-
+	 *     await). In that window, the manual click is dropped: SyncCommands
+	 *     declines to fire because the flag is set, and the in-flight
+	 *     promise resolves having done no work.
+	 *
+	 * Fix: when a round is already in flight, set the followup latch
+	 * (`pendingManualFollowup`) and await the in-flight promise. After it
+	 * settles, `tick`'s finally schedules a fresh manual tick. Awaiting
+	 * here preserves the existing semantics that the command's
+	 * `await orch.syncNow()` resolves only after work has been attempted.
+	 *
+	 * The followup tick uses `reason: "manual"` and `pollGeneration:
+	 * undefined`, so it is exempt from the generation-mismatch bail — a
+	 * manual click is the user's explicit ask, not subject to auto-sync
+	 * toggling.
+	 */
+	async requestManualSync(): Promise<void> {
+		if (this.currentRoundPromise === null) {
+			await this.tick("manual", undefined);
+			return;
+		}
+		this.pendingManualFollowup = true;
+		const inFlight = this.currentRoundPromise;
+		try {
+			await inFlight;
+		} catch {
+			// Errors are already surfaced via tick's own catch + status
+			// bar; we only awaited to coalesce timing. Don't re-throw.
+		}
+		// The in-flight round's finally has either already fired the
+		// followup tick (and cleared the latch) or set up the scheduling
+		// to do so. Await the orchestrator becoming idle so the caller's
+		// "command completed" message corresponds to real work.
+		if (this.currentRoundPromise !== null) {
+			try {
+				await this.currentRoundPromise;
+			} catch {
+				// Same rationale as above.
+			}
+		}
 	}
 
 	/** Visible for tests. */
@@ -232,6 +441,15 @@ export class StatusOrchestrator implements vscode.Disposable {
 		// on "syncing" forever.
 		const preTickState = this.lastState;
 		this.setState("syncing");
+		// Reset phase tracker + reset the sidebar indicator. If the previous
+		// round left a sticky-error phase up, this overwrites it with the
+		// neutral "Syncing memory bank…" so the user sees the new attempt
+		// rather than stale failure copy.
+		this.currentPhase = null;
+		this.statusStore?.setSyncPhase({
+			label: SYNC_START_LABEL,
+			severity: "info",
+		});
 		this.currentRoundPromise = (async () => {
 			try {
 				// Wait for the workspace's KB init step
@@ -259,6 +477,9 @@ export class StatusOrchestrator implements vscode.Disposable {
 					queuedAtGeneration !== this.pollGeneration
 				) {
 					this.setState(preTickState);
+					// Generation mismatch (user disabled auto-sync mid-await).
+					// Drop the sidebar indicator too — the round will not run.
+					this.statusStore?.setSyncPhase(null);
 					return;
 				}
 				// Read `syncTranscripts` from the CLI config (where the
@@ -276,7 +497,20 @@ export class StatusOrchestrator implements vscode.Disposable {
 					transcripts,
 				});
 				this.setState(result.newState, buildDetail(result));
+				this.applyRoundOutcomeToSyncPhase(result);
 				this.fireRoundFinished(result.newState, result);
+				// Persist the successful-round timestamp so the next `start()`
+				// (after Reload Window or restart) can decide whether to fire
+				// an eager tick. Only counts genuine `synced` outcomes —
+				// `conflicts` / `offline` / `syncing` don't reset the staleness
+				// clock since the user's vault is still drifting from remote.
+				if (result.newState === "synced" && this.lastSuccessAt !== undefined) {
+					try {
+						this.lastSuccessAt.set(Date.now());
+					} catch (e) {
+						log.debug("lastSuccessAt.set threw (swallowed): %s", (e as Error).message);
+					}
+				}
 			} catch (e) {
 				// I6: prior version silently set offline + zero log. Combined
 				// with the engine's own outer catch (also formerly silent,
@@ -307,12 +541,22 @@ export class StatusOrchestrator implements vscode.Disposable {
 					lastError: { code: "sync_failed_after_retries", message },
 				};
 				this.setState("offline", buildDetail(result));
+				this.applyRoundOutcomeToSyncPhase(result);
 				this.fireRoundFinished("offline", result);
 			} finally {
 				this.currentRoundPromise = null;
 			}
 		})();
 		await this.currentRoundPromise;
+		// P3-A followup. If a manual `requestManualSync()` arrived during
+		// the above round (or during a bail BEFORE the engine actually
+		// ran), honour it now with an unconditional manual tick. Clear the
+		// latch BEFORE firing so the followup tick itself can re-arm if
+		// yet another manual click lands while it runs.
+		if (this.pendingManualFollowup && !this.disposed) {
+			this.pendingManualFollowup = false;
+			await this.tick("manual", undefined);
+		}
 	}
 
 	private setState(state: SyncState, detail?: SyncStatusDetail): void {
@@ -321,10 +565,86 @@ export class StatusOrchestrator implements vscode.Disposable {
 	}
 
 	/**
+	 * Engine `onPhase` delegate. Records the most-recent phase and pushes
+	 * the conversational label to the sidebar. Safe to call without a
+	 * StatusStore (test path / dormant sync) — falls through silently.
+	 */
+	handlePhase(phase: SyncPhase): void {
+		// Engine rounds can outlive `dispose()` — `currentRoundPromise` is
+		// not cancellable from here. Without this gate, a phase event from
+		// an in-flight round would re-set `syncPhase` to a non-null label
+		// AFTER `dispose()` already cleared it, leaving a stale indicator
+		// in the about-to-be-destroyed StatusStore.
+		if (this.disposed) return;
+		this.currentPhase = phase;
+		this.statusStore?.setSyncPhase({
+			label: PHASE_LABELS[phase],
+			severity: "info",
+		});
+	}
+
+	/**
+	 * Final-state handler for the sidebar sync-phase indicator.
+	 *
+	 *   - `synced`              → clear (sidebar idle).
+	 *   - `conflicts`           → keep visible with a "N conflicts need your
+	 *                             attention" label (info severity — the
+	 *                             status bar's `$(warning)` carries the
+	 *                             alarm visual).
+	 *   - `offline` + terminal  → clear the toolbar indicator and raise a
+	 *                             VS Code error notification (bottom-right
+	 *                             toast) naming the failed phase. The toolbar
+	 *                             reflects only transient in-flight progress;
+	 *                             persistent failure copy lives on the
+	 *                             notification surface where the user can
+	 *                             dismiss it explicitly.
+	 *   - `offline` + network   → reset to the neutral "Syncing memory bank…"
+	 *                             label; the next poll usually recovers.
+	 */
+	private applyRoundOutcomeToSyncPhase(result: SyncRoundResult): void {
+		if (!this.statusStore) return;
+		if (result.newState === "synced") {
+			this.statusStore.setSyncPhase(null);
+			return;
+		}
+		if (result.newState === "conflicts") {
+			const n = result.conflicts.length;
+			this.statusStore.setSyncPhase({
+				label:
+					n > 0
+						? `Sync: ${n} ${n === 1 ? "conflict needs" : "conflicts need"} your attention`
+						: "Sync: Conflicts need your attention",
+				severity: "info",
+			});
+			return;
+		}
+		if (result.newState === "offline" && result.lastError) {
+			// Terminal errors raise a persistent VS Code notification (toast)
+			// naming the phase that broke; the toolbar clears to idle since
+			// the round is no longer in flight. Transient `network` failures
+			// also clear — leaving "Syncing memory bank…" on the toolbar
+			// would imply in-flight work when in reality the round bailed and
+			// the next poll won't fire for up to 90 minutes.
+			this.statusStore.setSyncPhase(null);
+			if (isTerminalSyncError(result.lastError.code)) {
+				const phaseKey: SyncPhase | "starting" =
+					this.currentPhase ?? "starting";
+				this.notifyError?.(FAILURE_LABELS[phaseKey], result.lastError.message);
+			}
+			return;
+		}
+		// `newState === "syncing"` (sync.lock held by another process — could
+		// be a stale lock from a previous crashed round or a genuine
+		// concurrent VS Code window). The current round didn't actually run,
+		// so showing an in-flight "Syncing…" indicator is a lie. Clear to
+		// idle; the next poll will retry.
+		this.statusStore.setSyncPhase(null);
+	}
+
+	/**
 	 * Late-binding setter for the post-round listener. Used by Extension.ts
-	 * after `KbFoldersService` and `SidebarWebviewProvider` are constructed
-	 * (which happens after `activateSync` has already fired the eager first
-	 * round). Passing `undefined` clears the listener.
+	 * after `KbFoldersService` and `SidebarWebviewProvider` are constructed.
+	 * Passing `undefined` clears the listener.
 	 */
 	setOnRoundFinished(cb: ((state: SyncState, result: SyncRoundResult) => void) | undefined): void {
 		this.onRoundFinished = cb;
@@ -379,6 +699,23 @@ export function buildDetail(
 		// `=== true` keeps the implicit `undefined` reading as "not self".
 		if (result.lastError.selfLocked === true) {
 			detail.selfLocked = true;
+		}
+	}
+	// P2 #2 — surface stageVault's canary buckets. Without this the
+	// `symlinked` paths (strong hostile-placement signal) only land in
+	// the engine log; the status bar shows a green check even though the
+	// round refused to stage potentially malicious content. See
+	// `SyncRoundResult.canary` doc — UI consumers SHOULD surface these
+	// even when `newState === "synced"`.
+	const canary = result.canary;
+	if (canary !== undefined) {
+		if (canary.symlinked.length > 0) {
+			detail.canarySymlinkedCount = canary.symlinked.length;
+			detail.canarySymlinkedSample = canary.symlinked;
+		}
+		if (canary.unowned.length > 0) {
+			detail.canaryUnownedCount = canary.unowned.length;
+			detail.canaryUnownedSample = canary.unowned;
 		}
 	}
 	return Object.keys(detail).length === 0 ? undefined : detail;

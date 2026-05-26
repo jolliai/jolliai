@@ -8,7 +8,7 @@
  *   - scripted environments (CI, devcontainer setup)
  *   - debugging a sync issue without bouncing the IDE
  *
- * Plan §0.7: the only precondition is a valid `jolliApiKey`; `syncEnabled`
+ * Plan §0.7: the only precondition is a valid `jolliApiKey`; `autoSyncEnabled`
  * gates the polling tick, not manual rounds. `buildSyncEngine` returns null
  * when the user isn't signed in — we surface that as an actionable hint
  * pointing at `jolli auth login`, mirroring the IDE's "open Settings" toast.

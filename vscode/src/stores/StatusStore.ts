@@ -1,9 +1,18 @@
 /**
  * StatusStore — host-side state controller for the "Status" panel.
  *
- * Owns: StatusInfo + JolliMemoryConfig, workerBusy / extensionOutdated /
- * migrating flags. Sessions/HEAD/lock watchers are cross-panel and invoke
- * `refresh()` / `setWorkerBusy()` from Extension.ts.
+ * Owns: StatusInfo + JolliMemoryConfig, workerBusy / syncPhase /
+ * extensionOutdated / migrating flags. Sessions/HEAD/lock watchers are
+ * cross-panel and invoke `refresh()` / `setWorkerBusy()` from Extension.ts.
+ *
+ * `syncPhase` is the user-facing label the `StatusOrchestrator` pushes as the
+ * Memory Bank sync engine moves through its phases (downloading, merging,
+ * uploading, …). When non-null, the sidebar Branch-tab toolbar renders it
+ * with either a spinning loading icon (`severity: "info"`) or a red error
+ * icon (`severity: "error"`, used for sticky terminal failures). `null` is
+ * idle. Independent of `workerBusy` so the post-commit Worker's "AI summary
+ * in progress…" indicator and the sync indicator can coexist without
+ * either one clobbering the other.
  */
 
 import {
@@ -24,14 +33,33 @@ export type StatusChangeReason =
 	| "refresh"
 	| "setStatus"
 	| "workerBusy"
+	| "syncPhase"
 	| "extensionOutdated"
 	| "migrating";
+
+/**
+ * Pushed by `StatusOrchestrator` once per phase entry, plus once on
+ * terminal failure (sticky) and once on success (set to `null`).
+ *
+ *   - `label`     — short, conversational; rendered verbatim in the sidebar
+ *                   toolbar. Source: `PHASE_LABELS` / `FAILURE_LABELS` in
+ *                   `StatusOrchestrator`.
+ *   - `severity`  — `"info"` while a round is progressing or has just
+ *                   succeeded with conflicts; `"error"` for sticky terminal
+ *                   failures so the user keeps seeing *where* the round
+ *                   broke until the next round.
+ */
+export interface SyncPhaseState {
+	readonly label: string;
+	readonly severity: "info" | "error";
+}
 
 export interface StatusSnapshot extends Snapshot<StatusChangeReason> {
 	readonly status: StatusInfo | null;
 	readonly config: JolliMemoryConfig | null;
 	readonly derived: StatusDerived;
 	readonly workerBusy: boolean;
+	readonly syncPhase: SyncPhaseState | null;
 	readonly extensionOutdated: boolean;
 	readonly migrating: boolean;
 }
@@ -48,6 +76,7 @@ const EMPTY: StatusSnapshot = {
 	config: null,
 	derived: INITIAL_DERIVED,
 	workerBusy: false,
+	syncPhase: null,
 	extensionOutdated: false,
 	migrating: false,
 	changeReason: "init",
@@ -58,6 +87,7 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 	private status: StatusInfo | null = null;
 	private config: JolliMemoryConfig | null = null;
 	private workerBusy = false;
+	private syncPhase: SyncPhaseState | null = null;
 	private extensionOutdated = false;
 	private migrating = false;
 
@@ -99,6 +129,19 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 		this.rebuildSnapshot("workerBusy");
 	}
 
+	/**
+	 * Push (or clear) the sidebar's sync-phase indicator. Pass `null` to
+	 * return to idle. Equality-checked so a redundant call with the same
+	 * label + severity is a no-op (no extra snapshot emit).
+	 */
+	setSyncPhase(phase: SyncPhaseState | null): void {
+		if (samePhase(this.syncPhase, phase)) {
+			return;
+		}
+		this.syncPhase = phase;
+		this.rebuildSnapshot("syncPhase");
+	}
+
 	setExtensionOutdated(outdated: boolean): void {
 		if (this.extensionOutdated === outdated) {
 			return;
@@ -121,10 +164,20 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 			config: this.config,
 			derived: StatusDataService.derive(this.status, this.config),
 			workerBusy: this.workerBusy,
+			syncPhase: this.syncPhase,
 			extensionOutdated: this.extensionOutdated,
 			migrating: this.migrating,
 			changeReason: reason,
 		};
 		this.emit();
 	}
+}
+
+function samePhase(
+	a: SyncPhaseState | null,
+	b: SyncPhaseState | null,
+): boolean {
+	if (a === b) return true;
+	if (a === null || b === null) return false;
+	return a.label === b.label && a.severity === b.severity;
 }

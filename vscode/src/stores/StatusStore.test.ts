@@ -106,4 +106,64 @@ describe("StatusStore", () => {
 		store.setMigrating(false); // default
 		expect(listener).not.toHaveBeenCalled();
 	});
+
+	// ── setSyncPhase — sidebar Branch toolbar indicator ────────────────────
+	describe("setSyncPhase", () => {
+		it("sets the phase on the snapshot and emits 'syncPhase'", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			const listener = vi.fn();
+			store.onChange(listener);
+			store.setSyncPhase({ label: "Getting latest memories…", severity: "info" });
+			expect(listener).toHaveBeenCalledTimes(1);
+			expect(store.getSnapshot().changeReason).toBe("syncPhase");
+			expect(store.getSnapshot().syncPhase).toEqual({
+				label: "Getting latest memories…",
+				severity: "info",
+			});
+		});
+
+		it("clearing with null returns the snapshot to idle", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			store.setSyncPhase({ label: "Syncing…", severity: "info" });
+			store.setSyncPhase(null);
+			expect(store.getSnapshot().syncPhase).toBeNull();
+		});
+
+		it("setSyncPhase is idempotent (no emit for identical label+severity)", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			store.setSyncPhase({ label: "Syncing…", severity: "info" });
+			const listener = vi.fn();
+			store.onChange(listener);
+			store.setSyncPhase({ label: "Syncing…", severity: "info" });
+			expect(listener).not.toHaveBeenCalled();
+		});
+
+		it("severity flip from info→error re-emits (sticky failure transition)", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			store.setSyncPhase({ label: "Sharing your changes…", severity: "info" });
+			const listener = vi.fn();
+			store.onChange(listener);
+			store.setSyncPhase({
+				label: "Couldn't share your changes",
+				severity: "error",
+			});
+			expect(listener).toHaveBeenCalledTimes(1);
+		});
+
+		it("setSyncPhase(null) is idempotent when already idle", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			const listener = vi.fn();
+			store.onChange(listener);
+			store.setSyncPhase(null);
+			expect(listener).not.toHaveBeenCalled();
+		});
+
+		it("syncPhase is independent of workerBusy (both can coexist on the snapshot)", () => {
+			const store = new StatusStore({ getStatus: vi.fn() } as never);
+			store.setWorkerBusy(true);
+			store.setSyncPhase({ label: "Syncing…", severity: "info" });
+			expect(store.getSnapshot().workerBusy).toBe(true);
+			expect(store.getSnapshot().syncPhase).not.toBeNull();
+		});
+	});
 });

@@ -74,6 +74,18 @@ const LLM_PROXY_PATH = "/api/push/llm/complete";
  */
 const PROXY_FETCH_TIMEOUT_MS = 120_000;
 
+/**
+ * End-to-end timeout for direct Anthropic API calls. The SDK's `fetch` has
+ * no default deadline, so a half-open TCP connection (firewall blackhole,
+ * silently-dropped packets on a flaky network, suspended cloud-edge) would
+ * hold the in-flight LLM call indefinitely — observed in production
+ * holding a SyncEngine `ConflictResolver.resolveAll` for 2+ hours and
+ * leaving the sidebar's "Sorting out conflicts…" label up the whole time.
+ * 60 s is generous for the largest commit-summary / merge prompts the
+ * engine sends while still failing fast when the connection is wedged.
+ */
+const DIRECT_FETCH_TIMEOUT_MS = 60_000;
+
 // `x-jolli-client` header value lives in `./ClientHeader.ts` so both this
 // module and `cli/src/sync/BackendClient.ts` share one source of truth.
 // Build-time `__JOLLI_CLIENT_KIND__` + `__PKG_VERSION__` resolution happens
@@ -267,12 +279,21 @@ async function callDirect(
 
 	let response: Anthropic.Message;
 	try {
-		response = await client.messages.create({
-			model,
-			max_tokens: maxTokens,
-			temperature: 0,
-			messages: [{ role: "user", content: prompt }],
-		});
+		response = await client.messages.create(
+			{
+				model,
+				max_tokens: maxTokens,
+				temperature: 0,
+				messages: [{ role: "user", content: prompt }],
+			},
+			// Hard cap on the in-flight HTTP request — see `DIRECT_FETCH_TIMEOUT_MS`.
+			// AbortSignal.timeout fires once after the given delay; the SDK
+			// surfaces it as an AbortError that the outer `catch` already
+			// logs with `cause`, so a wedged socket fails fast instead of
+			// holding the caller (e.g. `ConflictResolver.resolveAll`)
+			// indefinitely.
+			{ signal: AbortSignal.timeout(DIRECT_FETCH_TIMEOUT_MS) },
+		);
 	} catch (err) {
 		// Surface the effective baseURL so users can tell whether a 3rd-party relay
 		// (e.g. an ANTHROPIC_BASE_URL override) returned the error versus Anthropic itself.

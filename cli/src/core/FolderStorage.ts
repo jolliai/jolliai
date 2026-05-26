@@ -12,10 +12,11 @@
  * 4. Updates manifest to track the AI-generated file
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { rmdir } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { createLogger, errMsg } from "../Logger.js";
+import { safeAtomicWriteSync } from "../sync/VaultSymlinkGuard.js";
 import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "../Types.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { toForwardSlash } from "./PathUtils.js";
@@ -37,6 +38,18 @@ export class FolderStorage implements StorageProvider {
 		private readonly rootPath: string,
 		private readonly metadataManager: MetadataManager,
 	) {}
+
+	/**
+	 * The vault root that contains this FolderStorage's per-repo dir.
+	 * Computed once: `<vaultRoot>/<repoFolder>` is `rootPath`, so vault
+	 * root is `dirname(rootPath)`. Used by the symlink-safe write helper
+	 * to walk the chain from the vault root down to each target path
+	 * and refuse the write if any intermediate segment is a symlink
+	 * (replaces the deleted SymlinkSweep tree-walk guard).
+	 */
+	private get vaultRoot(): string {
+		return dirname(this.rootPath);
+	}
 
 	async readFile(path: string): Promise<string | null> {
 		const file = join(this.rootPath, ".jolli", path);
@@ -101,10 +114,18 @@ export class FolderStorage implements StorageProvider {
 		const statusPath = join(this.rootPath, ".jolli", "shadow-status.json");
 		const status = { dirty: true, lastFailedAt: new Date().toISOString(), message };
 		try {
-			mkdirSync(dirname(statusPath), { recursive: true });
-			writeFileSync(statusPath, JSON.stringify(status, null, "\t"), "utf-8");
-		} catch {
-			/* best effort */
+			// Path-chain symlink check + O_NOFOLLOW on the tmp leaf is the
+			// per-write defence that replaces the deleted SymlinkSweep.
+			// `markDirty` is best-effort historically (catch-and-swallow);
+			// keep that — if the vault root contains a hostile symlink we
+			// log via the guard but don't fail the caller.
+			safeAtomicWriteSync(this.vaultRoot, statusPath, JSON.stringify(status, null, "\t"));
+		} catch (e) {
+			// Surface the suppressed failure so operators can spot a hostile
+			// symlink in the vault root (the guard's own warn fires before
+			// the throw, but a second line tied to `markDirty` makes the
+			// suppressed shadow-status update visible in log triage).
+			log.warn("markDirty suppressed: %s", errMsg(e));
 		}
 	}
 
@@ -964,10 +985,15 @@ export class FolderStorage implements StorageProvider {
 	}
 
 	private atomicWrite(targetPath: string, content: string): void {
-		mkdirSync(dirname(targetPath), { recursive: true });
-		const tmp = `${targetPath}.tmp`;
-		writeFileSync(tmp, content, "utf-8");
-		renameSync(tmp, targetPath);
+		// Routes through `safeAtomicWriteSync` so every FolderStorage write
+		// gets the path-chain symlink check + leaf-level O_NOFOLLOW. This
+		// is the per-write defence that replaces the deleted SymlinkSweep
+		// quarantine pass. Throws if any intermediate path segment under
+		// `vaultRoot` is a symlink — callers should surface that error;
+		// silently swallowing it would risk a follow-up writeFileSync
+		// against the same path (e.g. a retry loop) actually traversing
+		// the link.
+		safeAtomicWriteSync(this.vaultRoot, targetPath, content);
 	}
 
 	static slugify(text: string): string {

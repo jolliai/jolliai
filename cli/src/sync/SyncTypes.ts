@@ -222,16 +222,13 @@ export type TerminalSyncErrorCode =
 	| "fetch_failed"
 	| "pull_failed"
 	| "migration_failed"
-	/**
-	 * `sweepSymlinks` (plan §P2) was unable to quarantine one or more
-	 * symlinks found in the Memory Bank working tree. The round is dropped
-	 * to offline rather than continuing to `stageAll` — staging would leak
-	 * the hostile link to peers and `MemoryBankBootstrap.writeFile` would
-	 * follow it. The next round retries from scratch (idempotent), so a
-	 * transient EBUSY/AV lock self-recovers; persistent failures require
-	 * the user to inspect the Memory Bank folder.
-	 */
-	| "symlink_quarantine_failed"
+	/* `symlink_quarantine_failed` REMOVED in Phase 1 alongside SymlinkSweep.
+	 * Symlink defence is now per-write (FolderStorage.safeAtomicWriteSync)
+	 * and per-stage (stageVault's symlinked canary bucket), neither of which
+	 * terminates the round — sync continues with the rogue entries excluded
+	 * and the warn log surfaces the offending path. No SyncErrorCode is
+	 * needed because symlink-related skips no longer escalate to a terminal
+	 * round result. */
 	| "sync_failed_after_retries";
 
 export type SyncErrorCode = TransientSyncErrorCode | TerminalSyncErrorCode;
@@ -283,7 +280,47 @@ export interface SyncRoundResult {
 		readonly message: string;
 		readonly selfLocked?: boolean;
 	};
+	/**
+	 * Non-fatal canary surface populated by `stageVault` when the staging
+	 * allowlist filter encountered paths that should not have been there:
+	 *
+	 *   - `symlinked` — leaf or path-chain symlink at a classifier-matching
+	 *     location (`<repoFolder>/.jolli/...` etc.). Strong hostile-placement
+	 *     signal. Round still completes; the symlinked path is excluded from
+	 *     the commit. Status bar / UI consumers should surface these even
+	 *     when `newState === "synced"`.
+	 *   - `unowned` — path that classifier didn't recognise (foreign writer,
+	 *     classifier-drift candidate, or a manual file the user dropped in
+	 *     the vault). Weak signal — typically benign but worth logging.
+	 *
+	 * Both fields are capped at the first 10 paths per round to keep
+	 * structured logs small; the warn-log inside `stageVault` carries the
+	 * complete count. Undefined when no canary entries were observed across
+	 * any of the round's `stageVault` invocations.
+	 */
+	readonly canary?: {
+		readonly symlinked: ReadonlyArray<string>;
+		readonly unowned: ReadonlyArray<string>;
+	};
 }
+
+/**
+ * Coarse, user-facing phases the sync engine emits via `SyncEngineOpts.onPhase`
+ * so the VS Code sidebar toolbar can show progress like "Getting latest
+ * memories… → Bringing it together… → Sharing your changes…".
+ *
+ * Deliberately narrower than the engine's actual step list — only the slow
+ * (user-perceived wait) or failure-prone phases are in the union. Fast and
+ * reliable steps (credential mint, `git --version`, symlink sweep, `git add`,
+ * `git commit`) are *not* signalled; whichever phase last emitted stays
+ * visible while they run.
+ *
+ * Multiple engine steps may collapse onto the same phase (e.g. `autoReconcile`
+ * + `pullRebase` both emit `"merging"`; first-bind migration push and the
+ * steady-state push both emit `"uploading"`). That collapse is intentional —
+ * the UI doesn't benefit from distinguishing them.
+ */
+export type SyncPhase = "downloading" | "merging" | "resolving" | "uploading" | "waiting";
 
 /** Caller-supplied options for `SyncEngine.runRound()`. */
 export interface SyncRoundOptions {

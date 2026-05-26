@@ -16,10 +16,11 @@
  * once all v1 users have migrated; bootstrap is permanent).
  */
 
-import { lstat, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rename } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { GitClient } from "./GitClient.js";
+import { safeAtomicWriteSync } from "./VaultSymlinkGuard.js";
 
 /**
  * `<hash>.json` filename pattern AllowList.ts requires for entries
@@ -84,9 +85,10 @@ async function intermediateContainsSymlink(root: string, segments: ReadonlyArray
 	return false;
 }
 
-// Glob matching per-repo transcripts at any nesting level. Used in both
-// the .gitignore deny line and the untrack `git rm --cached` glob.
-const TRANSCRIPTS_GLOB = "**/.jolli/transcripts/";
+/* `TRANSCRIPTS_GLOB` + `GITIGNORE_TRANSCRIPTS_*` constants REMOVED — the
+ * transcripts gating moved out of `.gitignore` and into `stageVault`'s
+ * classifier filter. The post-refactor `.gitignore` denies everything by
+ * default; the classifier is the authoritative staging allowlist. */
 
 /**
  * Per-device JSON inside `<repo>/.jolli/` that must never be synced.
@@ -103,6 +105,40 @@ const TRANSCRIPTS_GLOB = "**/.jolli/transcripts/";
 // remains genuinely per-device (records FolderStorage's dirty-write recovery
 // state, meaningless to peers).
 const PER_DEVICE_JSON_GLOBS: ReadonlyArray<string> = ["**/.jolli/shadow-status.json"];
+
+/**
+ * Path suffixes equivalent to `PER_DEVICE_JSON_GLOBS` for direct
+ * matching (no glob library required). Used by `SyncEngine`'s
+ * `hasOwnedDirtyPaths` idle check (P2#2): bootstrap's per-round
+ * `untrackPathGlob` produces a staged D for these paths on repos with
+ * legacy committed copies; the classifier returns null for them, so
+ * without this list `hasOwnedDirtyPaths` would treat the staged D as
+ * "idle" and the cleanup deletion would never reach a commit.
+ *
+ * Single source of truth: keep this in lockstep with
+ * `PER_DEVICE_JSON_GLOBS` above — both lists describe the same set of
+ * paths in different shapes (glob for `git rm --cached`, suffix for
+ * vault-relative path matching).
+ */
+export const PER_DEVICE_JSON_PATH_SUFFIXES: ReadonlyArray<string> = ["/.jolli/shadow-status.json"];
+
+/**
+ * Returns true iff `vaultRelativePath` (forward-slash separated, no
+ * leading `/`) matches one of the per-device JSON paths the bootstrap
+ * keeps in lockstep with `PER_DEVICE_JSON_GLOBS`. Caller does not need
+ * to know the suffix list shape.
+ */
+export function isPerDeviceJsonPath(vaultRelativePath: string): boolean {
+	for (const suffix of PER_DEVICE_JSON_PATH_SUFFIXES) {
+		// Path joins with a `/` so `<repo>/.jolli/shadow-status.json`
+		// matches but a hypothetical root-level `.jolli/shadow-status.json`
+		// does not. The classifier already rejects the root-level case
+		// (the engine never writes there), so the `<repo>/` requirement
+		// is the realistic shape.
+		if (vaultRelativePath.endsWith(suffix) && vaultRelativePath.length > suffix.length) return true;
+	}
+	return false;
+}
 
 // `.gitignore` for the Memory Bank working tree. The previous version
 // allowed `!*.md` / `!*.json` at every depth, which let `repo/.env.json`,
@@ -121,75 +157,41 @@ const PER_DEVICE_JSON_GLOBS: ReadonlyArray<string> = ["**/.jolli/shadow-status.j
 // The format leans on the fact that `.gitignore` evaluates rules in
 // order: later patterns override earlier ones, and a deeper-path negation
 // can re-include something a broader rule excluded.
-const GITIGNORE_BASE = `# Jolli Memory Bank — auto-managed allow-list. Do not edit by hand;
-# the next sync round will overwrite changes.
+const GITIGNORE_BASE = `# Jolli Memory Bank — engine-managed.
 #
-# Mirrors \`cli/src/sync/AllowList.ts\` semantics directly. Rules are
-# applied in order; the LAST match wins. The previous version used a
-# shorter \`!*.md\`/\`!*.json\` pattern which re-allowed files inside
-# hidden dirs — verified empirically that this leaked \`.env.json\`,
-# \`.hidden/secret.md\`, and unknown \`.jolli/*.json\` files. The form
-# below was tested with \`git add -A\` against a fixture covering each
-# AllowList rule.
+# Staging is now driven by the path classifier in
+# \`cli/src/sync/VaultPathClassifier.ts\`, not by this file. The classifier
+# is the authoritative allowlist; \`stageVault\` uses \`git add -f\` so this
+# template's catch-all deny only matters as defence-in-depth — anything
+# that bypasses \`stageVault\` and calls \`git add --all\` (a future bug,
+# external tool, a user running \`git\` by hand inside the vault) will
+# still skip non-allowlist paths.
+#
+# Do not edit by hand; the next sync round will overwrite changes whose
+# checksum matches a known prior template (Phase 0.5 audit). User-edited
+# unknown content is preserved with a one-time warn so accidental
+# customisation isn't clobbered.
 
-# 0. Deny everything.
+# Deny everything by default.
 *
 
-# 1. Allow this file + recurse into all directories. Children are
-#    re-filtered by the later rules.
+# Allow this file itself — the only file outside the classifier's
+# owned-path catalogue that the engine still tracks (it's classified as
+# \`root-gitignore\` so it flows through \`stageVault\` like any other
+# owned path).
 !.gitignore
+
+# Re-include directories so git descends into them.
+#
+# Without this rule, the deny-all \`*\` matches directories too and git
+# stops descending — \`git status --ignored=matching\` collapses the
+# entire ignored tree into a single \`!! <repo>/\` row instead of listing
+# individual files. \`stageVault\` and \`hasOwnedDirtyPaths\` then see a
+# directory-level entry the classifier rejects (no recognisable filename
+# segment), so brand-new \`<repo>/.jolli/summaries/<hash>.json\` writes
+# never get \`git add -f\`'d. \`!*/\` un-ignores all directories without
+# un-ignoring their contents, restoring per-file \`!!\` output.
 !*/
-
-# 2. Re-allow content-area markdown / JSON broadly.
-!*.md
-!*.json
-
-# 3. Deny anything starting with a dot at any depth (overrides §2 for
-#    hidden paths). Covers \`.env*\`, \`.vscode/\`, \`.DS_Store\`,
-#    \`.hidden/\`, and the entire \`.jolli/\` tree before §4 re-opens
-#    selected children.
-.*
-**/.*
-
-# 4. Re-allow \`.jolli/\` directories, then deny every child broadly so
-#    that the §5 whitelist is the only way content under \`.jolli/\`
-#    gets staged.
-!**/.jolli/
-**/.jolli/*
-
-# 5. Re-allow exactly the aggregate files AllowList.ts allows.
-!**/.jolli/manifest.json
-!**/.jolli/index.json
-!**/.jolli/branches.json
-!**/.jolli/catalog.json
-!**/.jolli/repos.json
-!**/.jolli/config.json
-
-# 6. Summaries directory — re-allow the dir, deny its children broadly,
-#    then re-allow only \`.json\`. \`<hash>.json\` constraint is enforced
-#    by AllowList at write time; the gitignore only filters extension
-#    so a malformed \`abc.txt\` can't sneak in via the dir negation.
-!**/.jolli/summaries/
-**/.jolli/summaries/*
-!**/.jolli/summaries/*.json
-
-# 7. Plans / plan-progress / notes — user-authored cross-device artifacts.
-#    Same shape as §6: re-allow the dir, broadly deny children, then
-#    re-allow the expected extension. Slug-shape enforcement (no
-#    \`..\`, no leading-dot, length cap) lives in AllowList.ts at write
-#    time — the gitignore only filters extension so a stray
-#    \`<slug>.exe\` can't sneak in via the dir negation.
-!**/.jolli/plans/
-**/.jolli/plans/*
-!**/.jolli/plans/*.md
-
-!**/.jolli/plan-progress/
-**/.jolli/plan-progress/*
-!**/.jolli/plan-progress/*.json
-
-!**/.jolli/notes/
-**/.jolli/notes/*
-!**/.jolli/notes/*.md
 `;
 
 // Transcripts trailer.
@@ -197,8 +199,6 @@ const GITIGNORE_BASE = `# Jolli Memory Bank — auto-managed allow-list. Do not 
 //      and §5 doesn't re-allow it — no extra rule needed. The
 //      commented marker keeps the toggle state human-greppable.
 // ON:  re-include the directory + its JSON children so they get staged.
-const GITIGNORE_TRANSCRIPTS_DENY = `\n# AI session transcripts — Settings.syncTranscripts is OFF (denied by §4)\n# ${TRANSCRIPTS_GLOB}\n`;
-const GITIGNORE_TRANSCRIPTS_ALLOW = `\n# AI session transcripts — Settings.syncTranscripts is ON\n!${TRANSCRIPTS_GLOB}\n!${TRANSCRIPTS_GLOB}*.json\n`;
 
 export interface MemoryBankBootstrapOpts {
 	readonly vaultClient: GitClient;
@@ -228,7 +228,7 @@ export class MemoryBankBootstrap {
 	 * commit records deletions and pushes them to the remote.
 	 */
 	async ensureBootstrap(): Promise<void> {
-		const desired = buildGitignore(this.transcripts);
+		const desired = buildGitignore();
 		const gitignorePath = join(this.memoryBankRoot, ".gitignore");
 		await mkdir(this.memoryBankRoot, { recursive: true });
 
@@ -240,7 +240,12 @@ export class MemoryBankBootstrap {
 		}
 
 		if (existing !== desired) {
-			await writeFile(gitignorePath, desired);
+			// `safeAtomicWriteSync` checks the path chain AND opens the leaf
+			// `.tmp` with `O_NOFOLLOW`, so a pre-placed `<vault>/.gitignore`
+			// symlink (or `.gitignore.tmp` symlink) cannot redirect the
+			// write. Replaces the previous `assertNoSymlinksInPath` +
+			// `writeFile` pattern, which left the leaf unchecked.
+			safeAtomicWriteSync(this.memoryBankRoot, gitignorePath, desired);
 			log.info("Wrote .gitignore (transcripts=%s)", this.transcripts ? "on" : "off");
 		}
 
@@ -476,8 +481,13 @@ export class MemoryBankBootstrap {
 
 		if (sentinelChanged) {
 			try {
+				// `safeAtomicWriteSync` covers BOTH path-chain symlinks and
+				// the leaf (`O_NOFOLLOW` on the `.tmp`). Sentinel is
+				// best-effort (catch-and-warn) so the guard throwing here
+				// just degrades to "didn't persist sentinel" rather than
+				// failing the round.
 				const next: BootstrapState = { version: BOOTSTRAP_STATE_VERSION, scannedDirs };
-				await writeFile(sentinelPath, JSON.stringify(next));
+				safeAtomicWriteSync(this.memoryBankRoot, sentinelPath, JSON.stringify(next));
 			} catch (e) {
 				log.warn("Failed to persist bootstrap state (non-fatal): %s", (e as Error).message);
 			}
@@ -500,12 +510,15 @@ export class MemoryBankBootstrap {
 }
 
 /**
- * Builds the expected `.gitignore` body for the given `syncTranscripts`
- * toggle. Exported for testing.
+ * Builds the expected `.gitignore` body. Exported for testing.
+ *
+ * The template denies everything by default; the `stageVault` classifier
+ * (`VaultPathClassifier`) is the authoritative allowlist and also enforces
+ * the `syncTranscripts` toggle by filtering the `"transcript"` kind.
+ * `.gitignore` is no longer the toggle's enforcement point.
  */
-export function buildGitignore(syncTranscripts: boolean): string {
-	const trailer = syncTranscripts ? GITIGNORE_TRANSCRIPTS_ALLOW : GITIGNORE_TRANSCRIPTS_DENY;
-	return GITIGNORE_BASE + trailer;
+export function buildGitignore(): string {
+	return GITIGNORE_BASE;
 }
 
 /**

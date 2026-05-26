@@ -67,9 +67,14 @@ function makeRuntime(): SyncRuntime {
 	// stub orchestrator via prototype override below in the relevant
 	// tests). The two constructor args are stashed on `this` but not
 	// touched by the paths we exercise here.
+	//
+	// `disposeOrchestrator` does call `statusBar.releaseSyncOwnership()`
+	// (P2 #3) so the statusBar stub provides a no-op for that method;
+	// other methods stay absent so an accidental call fails loudly rather
+	// than silently no-op-ing.
 	return new SyncRuntime(
 		{ subscriptions: { push: () => {} } } as never,
-		{} as never,
+		{ releaseSyncOwnership: () => {} } as never,
 	);
 }
 
@@ -215,7 +220,7 @@ describe("SyncRuntime.ensureBuilt — early-return branches", () => {
 });
 
 describe("SyncRuntime.reconcileAutoSync", () => {
-	it("returns early when syncEnabled is undefined (auto-sync off)", async () => {
+	it("returns early when autoSyncEnabled is undefined (auto-sync off)", async () => {
 		const runtime = makeRuntime();
 		loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
 		const ensureBuiltSpy = vi
@@ -226,11 +231,11 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 		expect(ensureBuiltSpy).not.toHaveBeenCalled();
 	});
 
-	it("returns early when syncEnabled is explicitly false", async () => {
+	it("returns early when autoSyncEnabled is explicitly false", async () => {
 		const runtime = makeRuntime();
 		loadConfig.mockResolvedValue({
 			jolliApiKey: "sk-jol-test",
-			syncEnabled: false,
+			autoSyncEnabled: false,
 		});
 		const ensureBuiltSpy = vi
 			.spyOn(runtime, "ensureBuilt")
@@ -240,24 +245,24 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 		expect(ensureBuiltSpy).not.toHaveBeenCalled();
 	});
 
-	it("returns early when syncEnabled=true but jolliApiKey is missing (dormant — sign-in not yet completed)", async () => {
+	it("returns early when autoSyncEnabled=true but jolliApiKey is missing (dormant — sign-in not yet completed)", async () => {
 		const runtime = makeRuntime();
-		loadConfig.mockResolvedValue({ syncEnabled: true });
+		loadConfig.mockResolvedValue({ autoSyncEnabled: true });
 		const ensureBuiltSpy = vi
 			.spyOn(runtime, "ensureBuilt")
 			.mockResolvedValue(null);
 
 		// Must NOT call ensureBuilt: gating on jolliApiKey here is what makes
 		// the sign-out path tear down a previously-polling orchestrator
-		// without also flipping `syncEnabled` to false.
+		// without also flipping `autoSyncEnabled` to false.
 		await expect(runtime.reconcileAutoSync()).resolves.toBeUndefined();
 		expect(ensureBuiltSpy).not.toHaveBeenCalled();
 	});
 
-	it("calls orch.start() when syncEnabled=true and orch is not yet polling", async () => {
+	it("calls orch.start() when autoSyncEnabled=true and orch is not yet polling", async () => {
 		const runtime = makeRuntime();
 		loadConfig.mockResolvedValue({
-			syncEnabled: true,
+			autoSyncEnabled: true,
 			jolliApiKey: "sk-jol-test",
 		});
 		const start = vi.fn();
@@ -292,7 +297,7 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 	it("calls orch.stop() on ON→OFF transition", async () => {
 		const runtime = makeRuntime();
 		loadConfig.mockResolvedValue({
-			syncEnabled: true,
+			autoSyncEnabled: true,
 			jolliApiKey: "sk-jol-test",
 		});
 		const start = vi.fn();
@@ -324,7 +329,7 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 
 		// Flip off.
 		loadConfig.mockResolvedValue({
-			syncEnabled: false,
+			autoSyncEnabled: false,
 			jolliApiKey: "sk-jol-test",
 		});
 		await runtime.reconcileAutoSync();
@@ -337,7 +342,7 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 
 	it("OFF transition before orchestrator was ever built is a no-op", async () => {
 		const runtime = makeRuntime();
-		loadConfig.mockResolvedValue({ syncEnabled: false });
+		loadConfig.mockResolvedValue({ autoSyncEnabled: false });
 		const ensureBuiltSpy = vi
 			.spyOn(runtime, "ensureBuilt")
 			.mockResolvedValue(null);
@@ -352,7 +357,7 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 		// reload the window for the new interval to take effect.
 		const runtime = makeRuntime();
 		loadConfig.mockResolvedValue({
-			syncEnabled: true,
+			autoSyncEnabled: true,
 			jolliApiKey: "sk-jol-test",
 			syncPollIntervalSec: 60,
 		});
@@ -399,7 +404,7 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 		// Change the interval and reconcile again — the cached orch1 must be
 		// disposed and orch2 built with the new value.
 		loadConfig.mockResolvedValue({
-			syncEnabled: true,
+			autoSyncEnabled: true,
 			jolliApiKey: "sk-jol-test",
 			syncPollIntervalSec: 600,
 		});
@@ -417,7 +422,7 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 	it("does not rebuild when syncPollIntervalSec is unchanged", async () => {
 		const runtime = makeRuntime();
 		loadConfig.mockResolvedValue({
-			syncEnabled: true,
+			autoSyncEnabled: true,
 			jolliApiKey: "sk-jol-test",
 			syncPollIntervalSec: 60,
 		});
@@ -451,7 +456,7 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 		const runtime = makeRuntime();
 		// Round 1: signed in + auto-sync ON → orch built and polling.
 		loadConfig.mockResolvedValue({
-			syncEnabled: true,
+			autoSyncEnabled: true,
 			jolliApiKey: "sk-jol-test",
 		});
 		const dispose = vi.fn();
@@ -479,10 +484,10 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 		expect(orch.start).toHaveBeenCalledTimes(1);
 
 		// Round 2: sign-out cleared jolliApiKey but `clearAuthCredentials`
-		// deliberately preserves syncEnabled so the preference auto-resumes
+		// deliberately preserves autoSyncEnabled so the preference auto-resumes
 		// on the next sign-in. Reconcile must dispose the cached orchestrator
 		// so a later re-sign-in re-builds it instead of reusing a stale one.
-		loadConfig.mockResolvedValue({ syncEnabled: true });
+		loadConfig.mockResolvedValue({ autoSyncEnabled: true });
 		await runtime.reconcileAutoSync();
 		expect(dispose).toHaveBeenCalledTimes(1);
 		expect(internals(runtime).orchestrator).toBeNull();
@@ -517,7 +522,7 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 
 		// Round 1: first sign-in mints orch1.
 		loadConfig.mockResolvedValue({
-			syncEnabled: true,
+			autoSyncEnabled: true,
 			jolliApiKey: "sk-jol-userA",
 		});
 		const ensureBuiltSpy = vi.spyOn(runtime, "ensureBuilt");
@@ -530,10 +535,10 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 		await runtime.reconcileAutoSync();
 		expect(orch1.start).toHaveBeenCalledTimes(1);
 
-		// Round 2: same syncEnabled, different jolliApiKey. The cached orch1
+		// Round 2: same autoSyncEnabled, different jolliApiKey. The cached orch1
 		// must be disposed; ensureBuilt is invoked again and produces orch2.
 		loadConfig.mockResolvedValue({
-			syncEnabled: true,
+			autoSyncEnabled: true,
 			jolliApiKey: "sk-jol-userB",
 		});
 		ensureBuiltSpy.mockImplementationOnce(async () => {

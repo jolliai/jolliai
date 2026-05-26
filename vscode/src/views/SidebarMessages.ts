@@ -587,6 +587,23 @@ export type SidebarInboundMsg =
 	| { readonly type: "worker:busy"; readonly busy: boolean }
 	| {
 			/**
+			 * Sync-phase indicator for the Branch-tab toolbar. `phase: null`
+			 * → idle (sidebar hides the indicator). Non-null → render the
+			 * label with a spinning loading icon (`severity: "info"`) or a
+			 * red error icon (`severity: "error"`, used for sticky terminal
+			 * failures that name the phase that broke).
+			 *
+			 * Independent of `worker:busy`; both signals can be active at
+			 * the same time without one clobbering the other.
+			 */
+			readonly type: "sync:phase";
+			readonly phase: {
+				readonly label: string;
+				readonly severity: "info" | "error";
+			} | null;
+	  }
+	| {
+			/**
 			 * Push the list of repos discoverable under the Memory Bank parent.
 			 * Drives the breadcrumb repo dropdown. When `repos.length <= 1`, the
 			 * webview hides the dropdown affordance entirely (no point offering

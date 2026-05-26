@@ -155,6 +155,80 @@ describe("ConflictResolver — Tier 2 happy path", () => {
 	});
 });
 
+describe("ConflictResolver — Tier 2.7 runs BEFORE Tier 2 (avoids wasted LLM calls)", () => {
+	// Pre-fix the order was Tier 2 (AI merge) → 2.7 (heuristics). On a
+	// 5-conflict vault where every divergence was whitespace-only, that
+	// burned ~15 minutes of Sonnet time generating output the parser then
+	// threw away (markers drift on long inputs) — then Tier 2.7 resolved
+	// each in <30 ms. Running 2.7 first kills the waste.
+
+	it("identical-after-normalize never calls the AI merge provider", async () => {
+		// Both sides differ ONLY in line endings — Tier 2.7 rule 2 must
+		// catch this before the AI provider is even invoked.
+		const ours = "line one\nline two\n";
+		const theirs = "line one\r\nline two\r\n";
+		const stub = makeStubVault(new Map([["notes/lf-crlf.md", { 1: "line one\nline two\n", 2: ours, 3: theirs }]]));
+		const aiMerge = vi.fn();
+		const ai: AiMergeProvider = { merge: aiMerge };
+		const resolver = new ConflictResolver({
+			client: stub.client,
+			ai,
+			ui: makeStubUi([]).ui,
+			writeFile: async () => {},
+		});
+
+		const report = await resolver.resolveAll(["notes/lf-crlf.md"]);
+		expect(aiMerge).not.toHaveBeenCalled();
+		expect(report.aiMerged).toEqual([]);
+		expect(report.resolved).toEqual(["notes/lf-crlf.md"]);
+		expect(report.rebaseAdvanced).toBe(true);
+	});
+
+	it("empty-side cases never call the AI merge provider (Tier 2.7 rule 1)", async () => {
+		// One device wrote real content, the other left the file empty —
+		// non-empty side is strictly more information. No reason to ask
+		// Sonnet to choose.
+		const stub = makeStubVault(new Map([["notes/half-empty.md", { 1: "", 2: "real content\n", 3: "" }]]));
+		const aiMerge = vi.fn();
+		const ai: AiMergeProvider = { merge: aiMerge };
+		const resolver = new ConflictResolver({
+			client: stub.client,
+			ai,
+			ui: makeStubUi([]).ui,
+			writeFile: async () => {},
+		});
+
+		const report = await resolver.resolveAll(["notes/half-empty.md"]);
+		expect(aiMerge).not.toHaveBeenCalled();
+		expect(report.resolved).toEqual(["notes/half-empty.md"]);
+	});
+
+	it("falls through to Tier 2 (AI merge) when 2.7 returns null (genuinely divergent content)", async () => {
+		// Ensures the reorder didn't accidentally drop the Tier 2 path —
+		// content that's truly different on both sides must still reach
+		// the AI provider.
+		const stub = makeStubVault(
+			new Map([["notes/real-conflict.md", { 1: "base", 2: "alpha edit", 3: "beta edit" }]]),
+		);
+		const aiMerge = vi.fn(async () => ({
+			merged: "alpha + beta merged",
+			confidence: 0.9,
+			model: "claude-sonnet-4-6",
+		}));
+		const ai: AiMergeProvider = { merge: aiMerge };
+		const resolver = new ConflictResolver({
+			client: stub.client,
+			ai,
+			ui: makeStubUi([]).ui,
+			writeFile: async () => {},
+		});
+
+		const report = await resolver.resolveAll(["notes/real-conflict.md"]);
+		expect(aiMerge).toHaveBeenCalledTimes(1);
+		expect(report.aiMerged).toEqual([{ path: "notes/real-conflict.md", model: "claude-sonnet-4-6" }]);
+	});
+});
+
 describe("ConflictResolver — Tier 2 guards", () => {
 	const setupGuardScenario = (guardOverride: Partial<AiMergeResponse>, fileKind: "md" | "json" = "md") => {
 		const path = fileKind === "json" ? "f.json" : "f.md";

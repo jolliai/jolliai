@@ -40,7 +40,6 @@ const VALID_CONFIG_KEYS = [
 	"excludePatterns",
 	"localFolder",
 	"aiProvider",
-	"syncEnabled",
 	"syncTranscripts",
 	"syncPollIntervalSec",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig>;
@@ -101,7 +100,6 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "openCodeEnabled" ||
 		key === "cursorEnabled" ||
 		key === "copilotEnabled" ||
-		key === "syncEnabled" ||
 		key === "syncTranscripts"
 	) {
 		const lower = raw.toLowerCase();
@@ -171,11 +169,6 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		description: "AI summary provider: anthropic | jolli (auto-set on `jolli auth login`)",
 	},
 	{
-		key: "syncEnabled",
-		type: "boolean",
-		description: "Enable Memory Bank cloud sync (opt-in; reload IDE / restart hooks to take effect)",
-	},
-	{
 		key: "syncTranscripts",
 		type: "boolean",
 		description: "Include raw AI conversation transcripts in cloud sync (default: false)",
@@ -205,127 +198,94 @@ export function registerConfigureCommand(program: Command): void {
 		.option("--set <key=value>", "Set a config value (repeatable)", collectSetOption, [] as string[])
 		.option("--remove <key>", "Remove a config value (repeatable)", collectRepeatable, [] as string[])
 		.option("--list-keys", "List all available config keys with descriptions")
-		.option(
-			"--sync-enable",
-			"Turn on auto-sync to Personal Space (shortcut for --set syncEnabled=true). Manual sync works without this flag whenever a Jolli sign-in is configured.",
-		)
-		.option("--sync-disable", "Turn off auto-sync to Personal Space (shortcut for --remove syncEnabled)")
-		.action(
-			async (options: {
-				set: string[];
-				remove: string[];
-				listKeys?: boolean;
-				syncEnable?: boolean;
-				syncDisable?: boolean;
-			}) => {
-				log.info("Running 'configure' command");
+		.action(async (options: { set: string[]; remove: string[]; listKeys?: boolean }) => {
+			log.info("Running 'configure' command");
 
-				if (options.syncEnable && options.syncDisable) {
-					console.error("\n  Error: --sync-enable and --sync-disable are mutually exclusive\n");
-					process.exitCode = 1;
-					return;
+			if (options.listKeys) {
+				console.log("\n  Available config keys:\n");
+				for (const info of CONFIG_KEY_INFO) {
+					console.log(`  ${info.key.padEnd(20)} (${info.type.padEnd(9)}) ${info.description}`);
 				}
-				if (options.syncEnable) {
-					await saveConfig({ syncEnabled: true });
-					console.log(
-						"\n  Auto-sync to Personal Space ENABLED. Reload your IDE window or restart hooks for the new schedule to take effect.\n",
-					);
-					return;
-				}
-				if (options.syncDisable) {
-					await saveConfig({ syncEnabled: undefined });
-					console.log(
-						"\n  Auto-sync to Personal Space DISABLED. Manual sync (`jolli sync-memory-bank` / Sync to Personal Space button) still works.\n",
-					);
-					return;
-				}
+				console.log(`\n  Set:    jolli configure --set key=value`);
+				console.log(`  Remove: jolli configure --remove key\n`);
+				return;
+			}
 
-				if (options.listKeys) {
-					console.log("\n  Available config keys:\n");
-					for (const info of CONFIG_KEY_INFO) {
-						console.log(`  ${info.key.padEnd(20)} (${info.type.padEnd(9)}) ${info.description}`);
+			// Apply --set and --remove mutations
+			if (options.set.length > 0 || options.remove.length > 0) {
+				const update: Record<string, unknown> = {};
+
+				for (const entry of options.set) {
+					const eq = entry.indexOf("=");
+					if (eq < 0) {
+						console.error(`\n  Error: --set expects key=value, got: ${entry}\n`);
+						process.exitCode = 1;
+						return;
 					}
-					console.log(`\n  Set:    jolli configure --set key=value`);
-					console.log(`  Remove: jolli configure --remove key\n`);
-					return;
-				}
-
-				// Apply --set and --remove mutations
-				if (options.set.length > 0 || options.remove.length > 0) {
-					const update: Record<string, unknown> = {};
-
-					for (const entry of options.set) {
-						const eq = entry.indexOf("=");
-						if (eq < 0) {
-							console.error(`\n  Error: --set expects key=value, got: ${entry}\n`);
-							process.exitCode = 1;
-							return;
-						}
-						const key = entry.slice(0, eq).trim();
-						const rawValue = entry.slice(eq + 1);
-						if (!isValidConfigKey(key)) {
-							console.error(
-								`\n  Error: unknown config key: ${key}\n  Valid keys: ${VALID_CONFIG_KEYS.join(", ")}\n`,
-							);
-							process.exitCode = 1;
-							return;
-						}
+					const key = entry.slice(0, eq).trim();
+					const rawValue = entry.slice(eq + 1);
+					if (!isValidConfigKey(key)) {
+						console.error(
+							`\n  Error: unknown config key: ${key}\n  Valid keys: ${VALID_CONFIG_KEYS.join(", ")}\n`,
+						);
+						process.exitCode = 1;
+						return;
+					}
+					try {
+						update[key] = coerceConfigValue(key, rawValue);
+					} catch (err) {
+						console.error(`\n  Error: ${(err as Error).message}\n`);
+						process.exitCode = 1;
+						return;
+					}
+					// Reject unrecognized shapes and keys whose embedded `.u` points off
+					// the allowlist before we touch disk. Matches saveAuthCredentials.
+					if (key === "jolliApiKey" && typeof update[key] === "string") {
 						try {
-							update[key] = coerceConfigValue(key, rawValue);
+							validateJolliApiKey(update[key] as string);
 						} catch (err) {
 							console.error(`\n  Error: ${(err as Error).message}\n`);
 							process.exitCode = 1;
 							return;
 						}
-						// Reject unrecognized shapes and keys whose embedded `.u` points off
-						// the allowlist before we touch disk. Matches saveAuthCredentials.
-						if (key === "jolliApiKey" && typeof update[key] === "string") {
-							try {
-								validateJolliApiKey(update[key] as string);
-							} catch (err) {
-								console.error(`\n  Error: ${(err as Error).message}\n`);
-								process.exitCode = 1;
-								return;
-							}
-						}
 					}
+				}
 
-					for (const key of options.remove) {
-						if (!isValidConfigKey(key)) {
-							console.error(
-								`\n  Error: unknown config key: ${key}\n  Valid keys: ${VALID_CONFIG_KEYS.join(", ")}\n`,
-							);
-							process.exitCode = 1;
-							return;
-						}
-						update[key] = undefined;
+				for (const key of options.remove) {
+					if (!isValidConfigKey(key)) {
+						console.error(
+							`\n  Error: unknown config key: ${key}\n  Valid keys: ${VALID_CONFIG_KEYS.join(", ")}\n`,
+						);
+						process.exitCode = 1;
+						return;
 					}
-
-					await saveConfig(update as Partial<JolliMemoryConfig>);
-					console.log(`\n  Config updated: ${join(getGlobalConfigDir(), "config.json")}\n`);
-					return;
+					update[key] = undefined;
 				}
 
-				// Default: show current config with sensitive values masked
-				const config = await loadConfig();
-				console.log("\n  Jolli Memory Configuration");
-				console.log("  ──────────────────────────────────────");
-				console.log(`  Location: ${join(getGlobalConfigDir(), "config.json")}`);
-				const entries = Object.entries(config);
-				if (entries.length === 0) {
-					console.log("  (empty — no configuration set)\n");
-					return;
-				}
-				for (const [key, raw] of entries) {
-					const value =
-						SENSITIVE_KEYS.has(key) && typeof raw === "string"
-							? maskSecret(raw)
-							: Array.isArray(raw)
-								? raw.join(", ")
-								: String(raw);
-					console.log(`  ${key.padEnd(20)} ${value}`);
-				}
-				console.log("");
-			},
-		);
+				await saveConfig(update as Partial<JolliMemoryConfig>);
+				console.log(`\n  Config updated: ${join(getGlobalConfigDir(), "config.json")}\n`);
+				return;
+			}
+
+			// Default: show current config with sensitive values masked
+			const config = await loadConfig();
+			console.log("\n  Jolli Memory Configuration");
+			console.log("  ──────────────────────────────────────");
+			console.log(`  Location: ${join(getGlobalConfigDir(), "config.json")}`);
+			const entries = Object.entries(config);
+			if (entries.length === 0) {
+				console.log("  (empty — no configuration set)\n");
+				return;
+			}
+			for (const [key, raw] of entries) {
+				const value =
+					SENSITIVE_KEYS.has(key) && typeof raw === "string"
+						? maskSecret(raw)
+						: Array.isArray(raw)
+							? raw.join(", ")
+							: String(raw);
+				console.log(`  ${key.padEnd(20)} ${value}`);
+			}
+			console.log("");
+		});
 }

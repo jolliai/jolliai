@@ -130,7 +130,13 @@ describe("clampPoll", () => {
 });
 
 describe("StatusOrchestrator", () => {
-	it("start() kicks off an immediate round and schedules polling", async () => {
+	it("start() schedules polling WITHOUT running an immediate round", async () => {
+		// Behavioural fix: pre-fix `start()` kicked off an eager tick so the
+		// status updated without waiting for the first poll boundary. That
+		// made every `Developer: Reload Window` burn a full sync round for
+		// no user-initiated reason. Now `start()` only arms the interval;
+		// the first round fires on the first poll tick (or when the user
+		// clicks `Sync Now`).
 		const engine = makeStubEngine();
 		const statusBar = makeStubStatusBar();
 		const timer = makeTimer();
@@ -141,12 +147,71 @@ describe("StatusOrchestrator", () => {
 			timer,
 		});
 		orch.start();
-		// Drain microtasks until the round completes.
+		// Drain microtasks — any eager work would surface here.
+		for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+		expect(engine.runRound).not.toHaveBeenCalled();
+		expect(timer.setInterval).toHaveBeenCalledTimes(1);
+		expect(orch.isPolling).toBe(true);
+		orch.dispose();
+	});
+
+	it("start() fires an eager round when `lastSuccessAt` is stale (>30 min old)", async () => {
+		// VS Code restart / Reload Window after a long break: lastSuccessAt
+		// is older than the freshness window, so we want auto-sync to
+		// catch up immediately rather than wait the full poll interval.
+		const engine = makeStubEngine();
+		const statusBar = makeStubStatusBar();
+		const timer = makeTimer();
+		const staleTs = Date.now() - 60 * 60_000; // 1 hour ago
+		const orch = new StatusOrchestrator({
+			engine,
+			statusBar,
+			workspaceFolder: FAKE_WORKSPACE_FOLDER,
+			timer,
+			lastSuccessAt: { get: () => staleTs, set: () => {} },
+		});
+		orch.start();
+		for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+		// Eager tick fired with `reason: "poll"` (auto-sync first poll).
+		expect(engine.runRound).toHaveBeenCalledWith(expect.objectContaining({ reason: "poll" }));
+		orch.dispose();
+	});
+
+	it("start() fires an eager round when `lastSuccessAt` is undefined (cold start / never synced)", async () => {
+		const engine = makeStubEngine();
+		const statusBar = makeStubStatusBar();
+		const timer = makeTimer();
+		const orch = new StatusOrchestrator({
+			engine,
+			statusBar,
+			workspaceFolder: FAKE_WORKSPACE_FOLDER,
+			timer,
+			lastSuccessAt: { get: () => undefined, set: () => {} },
+		});
+		orch.start();
 		for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
 		expect(engine.runRound).toHaveBeenCalledTimes(1);
-		expect(timer.setInterval).toHaveBeenCalledTimes(1);
-		expect(statusBar.setSyncState).toHaveBeenCalledWith("syncing", undefined);
-		expect(statusBar.setSyncState).toHaveBeenCalledWith("synced", undefined);
+		orch.dispose();
+	});
+
+	it("start() does NOT fire an eager round when `lastSuccessAt` is fresh (<30 min — Reload Window guard)", async () => {
+		// The motivating case: extension dev iteration reloads the host
+		// every few seconds. Without this gate, every reload would burn a
+		// real sync round.
+		const engine = makeStubEngine();
+		const statusBar = makeStubStatusBar();
+		const timer = makeTimer();
+		const freshTs = Date.now() - 5 * 60_000; // 5 min ago
+		const orch = new StatusOrchestrator({
+			engine,
+			statusBar,
+			workspaceFolder: FAKE_WORKSPACE_FOLDER,
+			timer,
+			lastSuccessAt: { get: () => freshTs, set: () => {} },
+		});
+		orch.start();
+		for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+		expect(engine.runRound).not.toHaveBeenCalled();
 		orch.dispose();
 	});
 
@@ -161,17 +226,11 @@ describe("StatusOrchestrator", () => {
 			timer,
 		});
 		orch.start();
-		await Promise.resolve();
-		await Promise.resolve();
-		engine.runRound.mockClear();
-
-		// Wait for the immediate-round promise to finish so the next tick
-		// isn't coalesced.
-		await new Promise((r) => setImmediate(r));
-
+		// First scheduled tick — no eager round any more, so this is the
+		// first runRound call.
 		timer.fire();
-		await Promise.resolve();
-		await Promise.resolve();
+		// Drain microtasks until the tick reaches engine.runRound.
+		for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
 		expect(engine.runRound).toHaveBeenCalledWith(
 			expect.objectContaining({ reason: "poll" }),
 		);
@@ -339,10 +398,12 @@ describe("StatusOrchestrator", () => {
 	});
 
 	it("stop() cancels a poll tick queued during readyPromise wait — no engine round runs (P2#2)", async () => {
-		// Reproduce the original bug: `start()` queues an immediate
-		// `tick("poll")`. Inside the tick body it awaits `readyPromise`.
-		// User toggles auto-sync OFF via `stop()` before ready settles.
-		// Pre-fix, the queued tick still ran a round when ready settled.
+		// Reproduce the original bug shape with the new "no eager tick"
+		// behaviour: a poll tick fires, the tick body awaits
+		// `readyPromise`, the user toggles auto-sync OFF via `stop()`
+		// before ready settles. Pre-fix, the queued tick still ran a
+		// round when ready settled. The generation-mismatch guard must
+		// still bail.
 		let releaseReady!: () => void;
 		const readyPromise = new Promise<void>((r) => {
 			releaseReady = r;
@@ -358,8 +419,9 @@ describe("StatusOrchestrator", () => {
 			readyPromise,
 		});
 		orch.start();
-		// At this point a tick is queued inside the orchestrator awaiting
-		// readyPromise. Tell it to stop BEFORE ready settles.
+		// Fire the interval to queue a tick whose body is now awaiting
+		// `readyPromise`. Tell it to stop BEFORE ready settles.
+		timer.fire();
 		orch.stop();
 		releaseReady();
 		// Drain microtasks for the queued tick body to reach the
@@ -503,6 +565,297 @@ describe("StatusOrchestrator", () => {
 		// Must not throw out of syncNow even though the listener did.
 		await expect(orch.syncNow()).resolves.toBeUndefined();
 	});
+
+	// ── Sidebar sync-phase indicator (setSyncPhase wiring) ─────────────────
+	describe("statusStore.setSyncPhase integration", () => {
+		function makeStubStatusStore() {
+			return { setSyncPhase: vi.fn() } as const;
+		}
+
+		it("seeds the indicator with 'Syncing memory bank…' at round start", async () => {
+			const engine = makeStubEngine({ newState: "synced" });
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			await orch.syncNow();
+			expect(statusStore.setSyncPhase).toHaveBeenCalledWith({
+				label: "Syncing memory bank…",
+				severity: "info",
+			});
+			// Cleared on success.
+			expect(statusStore.setSyncPhase).toHaveBeenLastCalledWith(null);
+		});
+
+		it("handlePhase pushes the conversational phase label", async () => {
+			const engine = makeStubEngine();
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			const round = orch.syncNow();
+			orch.handlePhase("downloading");
+			orch.handlePhase("merging");
+			orch.handlePhase("uploading");
+			await round;
+			expect(statusStore.setSyncPhase).toHaveBeenCalledWith({
+				label: "Sync: Getting latest memories…",
+				severity: "info",
+			});
+			expect(statusStore.setSyncPhase).toHaveBeenCalledWith({
+				label: "Sync: Bringing it together…",
+				severity: "info",
+			});
+			expect(statusStore.setSyncPhase).toHaveBeenCalledWith({
+				label: "Sync: Sharing your changes…",
+				severity: "info",
+			});
+		});
+
+		it("raises a VS Code notification naming the failed phase on terminal failure", async () => {
+			const engine = makeStubEngine({
+				newState: "offline",
+				// biome-ignore lint/suspicious/noExplicitAny: stub shape mirrors SyncRoundResult.lastError
+				lastError: { code: "pull_failed", message: "merge conflict" } as any,
+			});
+			const statusStore = makeStubStatusStore();
+			const notifyError = vi.fn();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+				notifyError,
+			});
+			const round = orch.syncNow();
+			orch.handlePhase("merging");
+			await round;
+			// Failure copy goes to the bottom-right VS Code toast, not the
+			// toolbar — the indicator is for transient in-flight progress.
+			expect(notifyError).toHaveBeenCalledWith(
+				"Sync: Couldn't merge changes",
+				"merge conflict",
+			);
+			// Toolbar clears: round is no longer in flight.
+			expect(statusStore.setSyncPhase).toHaveBeenLastCalledWith(null);
+			// And no severity=error label was ever pushed to the toolbar.
+			expect(statusStore.setSyncPhase).not.toHaveBeenCalledWith(
+				expect.objectContaining({ severity: "error" }),
+			);
+		});
+
+		it("uses FAILURE_LABELS.starting when the round fails before any phase fires", async () => {
+			const engine = makeStubEngine({
+				newState: "offline",
+				// biome-ignore lint/suspicious/noExplicitAny: stub shape
+				lastError: { code: "mint_failed", message: "auth" } as any,
+			});
+			const statusStore = makeStubStatusStore();
+			const notifyError = vi.fn();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+				notifyError,
+			});
+			await orch.syncNow();
+			expect(notifyError).toHaveBeenCalledWith("Sync: Couldn't start", "auth");
+			expect(statusStore.setSyncPhase).toHaveBeenLastCalledWith(null);
+		});
+
+		it("transient network failures do NOT raise a notification (next poll usually recovers)", async () => {
+			const engine = makeStubEngine({
+				newState: "offline",
+				// biome-ignore lint/suspicious/noExplicitAny: stub shape
+				lastError: { code: "network", message: "dns" } as any,
+			});
+			const notifyError = vi.fn();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: makeStubStatusStore() as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+				notifyError,
+			});
+			await orch.syncNow();
+			expect(notifyError).not.toHaveBeenCalled();
+		});
+
+		it("transient network failures clear the indicator (no lingering Syncing… label)", async () => {
+			// Leaving "Syncing memory bank…" up on a network blip means the
+			// toolbar lies about in-flight work for up to 90 min until the
+			// next poll. Clear to idle instead — the next poll re-pushes.
+			const engine = makeStubEngine({
+				newState: "offline",
+				// biome-ignore lint/suspicious/noExplicitAny: stub shape
+				lastError: { code: "network", message: "dns" } as any,
+			});
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			await orch.syncNow();
+			expect(statusStore.setSyncPhase).toHaveBeenLastCalledWith(null);
+		});
+
+		it("clears the indicator when the round is skipped due to sync.lock held by another process", async () => {
+			// `runRound` returns `newState: "syncing"` immediately when it
+			// can't acquire `sync.lock`. The round didn't actually run, so
+			// the "Syncing memory bank…" label seeded at tick start would
+			// linger forever — clear to idle instead.
+			const engine = makeStubEngine({ newState: "syncing" });
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			await orch.syncNow();
+			expect(statusStore.setSyncPhase).toHaveBeenLastCalledWith(null);
+		});
+
+		it("conflict outcomes set a 'needs your attention' info label (not error)", async () => {
+			const engine = makeStubEngine({
+				newState: "conflicts",
+				conflicts: [
+					{ path: "a.md", tier: 3, detectedAt: "t" },
+					{ path: "b.md", tier: 3, detectedAt: "t" },
+				],
+			});
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			await orch.syncNow();
+			expect(statusStore.setSyncPhase).toHaveBeenLastCalledWith({
+				label: "Sync: 2 conflicts need your attention",
+				severity: "info",
+			});
+		});
+
+		it("singular conflict label is grammatically correct", async () => {
+			const engine = makeStubEngine({
+				newState: "conflicts",
+				conflicts: [{ path: "a.md", tier: 3, detectedAt: "t" }],
+			});
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			await orch.syncNow();
+			expect(statusStore.setSyncPhase).toHaveBeenLastCalledWith({
+				label: "Sync: 1 conflict needs your attention",
+				severity: "info",
+			});
+		});
+
+		it("handlePhase outside a round still pushes the label (StatusStore is idempotent)", () => {
+			const engine = makeStubEngine();
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			orch.handlePhase("downloading");
+			expect(statusStore.setSyncPhase).toHaveBeenCalledWith({
+				label: "Sync: Getting latest memories…",
+				severity: "info",
+			});
+		});
+
+		it("a fresh round seeds the neutral start label and ends idle on success", async () => {
+			let engineResult: Partial<SyncResult> = {
+				newState: "offline",
+				// biome-ignore lint/suspicious/noExplicitAny: stub shape
+				lastError: { code: "pull_failed", message: "x" } as any,
+			};
+			const runRound = vi.fn(
+				async (): Promise<SyncResult> => ({
+					fetched: true,
+					pulled: true,
+					pushed: true,
+					conflicts: [],
+					newState: "synced",
+					...engineResult,
+				}),
+			);
+			const engine = {
+				runRound,
+			} as unknown as import("../../../cli/src/sync/SyncEngine.js").SyncEngine;
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			// Round 1: terminal failure (raises a toast via notifyError;
+			// toolbar indicator clears).
+			const r1 = orch.syncNow();
+			orch.handlePhase("merging");
+			await r1;
+			// Round 2: succeed. At round start we push the neutral label,
+			// then on success we clear to null.
+			engineResult = { newState: "synced" };
+			statusStore.setSyncPhase.mockClear();
+			await orch.syncNow();
+			expect(statusStore.setSyncPhase).toHaveBeenCalledWith({
+				label: "Syncing memory bank…",
+				severity: "info",
+			});
+			expect(statusStore.setSyncPhase).toHaveBeenLastCalledWith(null);
+		});
+
+		it("dispose() clears the sync-phase indicator", async () => {
+			const engine = makeStubEngine({
+				newState: "offline",
+				// biome-ignore lint/suspicious/noExplicitAny: stub shape
+				lastError: { code: "pull_failed", message: "x" } as any,
+			});
+			const statusStore = makeStubStatusStore();
+			const orch = new StatusOrchestrator({
+				engine,
+				statusBar: makeStubStatusBar(),
+				statusStore: statusStore as never,
+				workspaceFolder: FAKE_WORKSPACE_FOLDER,
+				timer: makeTimer(),
+			});
+			await orch.syncNow();
+			statusStore.setSyncPhase.mockClear();
+			orch.dispose();
+			expect(statusStore.setSyncPhase).toHaveBeenCalledWith(null);
+		});
+	});
 });
 
 describe("buildDetail — SyncRoundResult → SyncStatusDetail (§0.6 UI mapping)", () => {
@@ -557,15 +910,26 @@ describe("buildDetail — SyncRoundResult → SyncStatusDetail (§0.6 UI mapping
 		expect(detail?.failedCode).toBe("vault_locked");
 	});
 
-	it.each([
+	// `symlink_quarantine_failed` was removed from `TerminalSyncErrorCode`
+	// in Phase 1 (alongside SymlinkSweep) — symlink defence is now per-write
+	// (safeAtomicWriteSync) and per-stage (stageVault's `symlinked` canary),
+	// neither of which produces a terminal round result. The cases below
+	// are derived from the live `TerminalSyncErrorCode` union via
+	// `satisfies` so removing another member from the union here without
+	// also removing it from the test will trip a type error rather than
+	// silently drift like the pre-fix string-literal list did.
+	const TERMINAL_CODES = [
 		"mint_failed",
 		"git_missing",
 		"clone_failed",
 		"fetch_failed",
 		"pull_failed",
 		"migration_failed",
-		"symlink_quarantine_failed",
-	] as const)("%s sets failed=true (terminal)", (code) => {
+	] as const satisfies ReadonlyArray<
+		import("../../../cli/src/sync/SyncTypes.js").TerminalSyncErrorCode
+	>;
+
+	it.each(TERMINAL_CODES)("%s sets failed=true (terminal)", (code) => {
 		const detail = buildDetail({
 			...baseResult(),
 			newState: "offline",
@@ -616,5 +980,39 @@ describe("buildDetail — SyncRoundResult → SyncStatusDetail (§0.6 UI mapping
 			lastError: { code: "vault_locked", message: "busy", selfLocked: false },
 		});
 		expect(explicitFalse?.selfLocked).toBeUndefined();
+	});
+
+	it("canary.symlinked surfaces to canarySymlinkedCount + sample (P2 #2 — visible on synced)", () => {
+		const detail = buildDetail({
+			...baseResult(),
+			canary: {
+				symlinked: ["myrepo/.jolli/index.json", "myrepo/.jolli/summaries/abc.json"],
+				unowned: [],
+			},
+		});
+		expect(detail?.canarySymlinkedCount).toBe(2);
+		expect(detail?.canarySymlinkedSample).toEqual([
+			"myrepo/.jolli/index.json",
+			"myrepo/.jolli/summaries/abc.json",
+		]);
+		expect(detail?.canaryUnownedCount).toBeUndefined();
+	});
+
+	it("canary.unowned surfaces to canaryUnownedCount + sample (tooltip only, no badge)", () => {
+		const detail = buildDetail({
+			...baseResult(),
+			canary: { symlinked: [], unowned: [".memorybank-state.json"] },
+		});
+		expect(detail?.canaryUnownedCount).toBe(1);
+		expect(detail?.canaryUnownedSample).toEqual([".memorybank-state.json"]);
+		expect(detail?.canarySymlinkedCount).toBeUndefined();
+	});
+
+	it("returns undefined when canary buckets are both empty (no detail noise on a clean round)", () => {
+		const detail = buildDetail({
+			...baseResult(),
+			canary: { symlinked: [], unowned: [] },
+		});
+		expect(detail).toBeUndefined();
 	});
 });

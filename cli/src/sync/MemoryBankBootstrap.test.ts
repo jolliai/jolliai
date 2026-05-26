@@ -41,59 +41,27 @@ function makeBootstrap(opts: { transcripts: boolean; client?: GitClient } = { tr
 	});
 }
 
-describe("buildGitignore", () => {
-	it("includes the auto-managed header + allow-list rules", () => {
-		const body = buildGitignore(false);
-		expect(body).toContain("Jolli Memory Bank — auto-managed allow-list");
-		expect(body).toContain("!*.md");
-		expect(body).toContain("!*.json");
-		expect(body).toContain("!.gitignore");
-		expect(body).toContain("!*/");
-	});
+describe("buildGitignore (Phase 1 — minimal engine-managed template)", () => {
+	// The 7-section template was REMOVED in Phase 1. `.gitignore` is no
+	// longer the staging allowlist; `stageVault`'s `classifyVaultPath` is.
+	// The minimal template denies everything by default + re-allows
+	// `.gitignore` itself (classifier kind `root-gitignore` stages it as
+	// a regular owned path). Transcripts gating moved out of gitignore and
+	// into the classifier.
 
-	it("denies transcripts via §4 (no extra active rule) when syncTranscripts=false", () => {
-		// Under the new strict gitignore shape, §4 `**/.jolli/*` already
-		// denies the `transcripts/` directory; the trailer is a marker
-		// comment only. The active negation form `!**/.jolli/transcripts/`
-		// must NOT appear in the OFF body.
-		const body = buildGitignore(false);
-		const lines = body.split("\n");
-		const activeAllow = lines.find((l) => l === `!${"**/.jolli/transcripts/"}`);
-		expect(activeAllow).toBeUndefined();
-		// And a comment marker should be present so the state is greppable.
-		expect(body).toContain("# **/.jolli/transcripts/");
-	});
-
-	it("re-allows transcripts via `!` negation when syncTranscripts=true", () => {
-		const body = buildGitignore(true);
-		// Active negation re-allows the directory + its JSON children.
-		expect(body).toContain("\n!**/.jolli/transcripts/\n");
-		expect(body).toContain("\n!**/.jolli/transcripts/*.json\n");
-	});
-
-	it("re-allows plans/plan-progress/notes regardless of transcripts toggle (cross-device user artifacts)", () => {
-		// `.gitignore` and `AllowList.ts` must stay in lockstep — these
-		// three directories carry user-authored cross-device data that
-		// pre-fix was silently dropped because the gitignore §5
-		// whitelist didn't include them.
-		for (const transcripts of [true, false]) {
-			const body = buildGitignore(transcripts);
-			expect(body).toContain("!**/.jolli/plans/");
-			expect(body).toContain("**/.jolli/plans/*");
-			expect(body).toContain("!**/.jolli/plans/*.md");
-			expect(body).toContain("!**/.jolli/plan-progress/");
-			expect(body).toContain("**/.jolli/plan-progress/*");
-			expect(body).toContain("!**/.jolli/plan-progress/*.json");
-			expect(body).toContain("!**/.jolli/notes/");
-			expect(body).toContain("**/.jolli/notes/*");
-			expect(body).toContain("!**/.jolli/notes/*.md");
-		}
+	it("emits the minimal deny-all + allow-self template", () => {
+		const body = buildGitignore();
+		expect(body).toContain("engine-managed");
+		expect(body).toMatch(/^\*\s*$/m); // catch-all deny line
+		expect(body).toContain("!.gitignore"); // allow-self
+		// And the dead 7-section markers must NOT be present.
+		expect(body).not.toContain("!*.md");
+		expect(body).not.toContain("!*.json");
+		expect(body).not.toContain("!**/.jolli/");
 	});
 
 	it("produces stable output across calls (idempotency)", () => {
-		expect(buildGitignore(false)).toBe(buildGitignore(false));
-		expect(buildGitignore(true)).toBe(buildGitignore(true));
-		expect(buildGitignore(false)).not.toBe(buildGitignore(true));
+		expect(buildGitignore()).toBe(buildGitignore());
 	});
 });
 
@@ -102,7 +70,7 @@ describe("ensureBootstrap", () => {
 		const bootstrap = makeBootstrap({ transcripts: false });
 		await bootstrap.ensureBootstrap();
 		const written = await readFile(join(memoryBankRoot, ".gitignore"), "utf-8");
-		expect(written).toBe(buildGitignore(false));
+		expect(written).toBe(buildGitignore());
 	});
 
 	it("is idempotent — no rewrite when on-disk body matches expected", async () => {
@@ -114,26 +82,26 @@ describe("ensureBootstrap", () => {
 		expect(first).toBe(second);
 	});
 
-	it("rewrites .gitignore when transcripts toggle changes — and does NOT touch the index (Model 2 §2.5)", async () => {
+	it("does NOT rewrite .gitignore when transcripts toggle changes (gating moved to stageVault)", async () => {
+		// Pre-Phase-1 the toggle flipped the gitignore's trailer between
+		// allow and deny forms, so the file rewrote on every transition.
+		// Post-Phase-1 the template is constant — toggle ON / OFF produce
+		// the same minimal body — and transcripts filtering happens at
+		// stage time via the classifier. So the second `ensureBootstrap`
+		// here is a no-op (idempotent write); the body before and after
+		// toggle changes is identical.
 		const client = makeStubClient();
-		// Round 1: transcripts ON — body must include the active `!` negation.
 		await makeBootstrap({ transcripts: true, client }).ensureBootstrap();
 		const onBody = await readFile(join(memoryBankRoot, ".gitignore"), "utf-8");
-		expect(onBody).toContain("\n!**/.jolli/transcripts/\n");
 
-		// Round 2: transcripts OFF — should rewrite `.gitignore` to deny.
 		await makeBootstrap({ transcripts: false, client }).ensureBootstrap();
 		const offBody = await readFile(join(memoryBankRoot, ".gitignore"), "utf-8");
-		expect(offBody).not.toBe(onBody);
-		expect(offBody).not.toContain("\n!**/.jolli/transcripts/\n");
+		expect(offBody).toBe(onBody);
 
-		// Model 2 contract: toggle OFF is a PASSIVE switch — this device
-		// stops uploading new transcripts via `.gitignore` deny, but does
-		// NOT mutate the index. Previous code ran `git rm --cached -r
-		// '*/.jolli/transcripts/'`, which (a) silently destroyed peer
-		// data without consent, (b) caused cross-device ping-pong with
-		// ON peers, and (c) masked a privacy under-protection (I8) when
-		// the untrack itself failed.
+		// Model 2 contract is preserved: the toggle never touches the
+		// index, regardless of value. That's now structurally guaranteed
+		// (the toggle doesn't reach the index path at all) rather than
+		// guarded by a separate "untrackPathGlob is not called" assertion.
 		const recordedClient = client as unknown as { untrackPathGlob: ReturnType<typeof vi.fn> };
 		const transcriptsCalls = recordedClient.untrackPathGlob.mock.calls.filter(
 			(c) => c[0] === "**/.jolli/transcripts/",
@@ -223,14 +191,55 @@ describe("ensureBootstrap", () => {
 
 	it("preserves user edits when the body matches expected (no thrash)", async () => {
 		// Pre-write the EXACT expected body.
-		await writeFile(join(memoryBankRoot, ".gitignore"), buildGitignore(false));
+		await writeFile(join(memoryBankRoot, ".gitignore"), buildGitignore());
 		const bootstrap = makeBootstrap({ transcripts: false });
 		await bootstrap.ensureBootstrap();
 		// No way to assert "didn't write" without spying fs, but we can assert
 		// content is still the canonical one — passes either way.
 		const after = await readFile(join(memoryBankRoot, ".gitignore"), "utf-8");
-		expect(after).toBe(buildGitignore(false));
+		expect(after).toBe(buildGitignore());
 	});
+
+	// Skipped on Windows because `symlink()` requires special privileges
+	// there; the production guard's `O_NOFOLLOW` is a no-op on Windows
+	// anyway (per VaultSymlinkGuard's docstring).
+	const itPosix = platform() === "win32" ? it.skip : it;
+
+	itPosix(
+		"refuses to follow a leaf symlink at <vault>/.gitignore (hostile pre-placement → no overwrite of link target)",
+		async () => {
+			// Pre-place a symlink at the `.gitignore` path pointing at a
+			// sibling target. If the write follows the link, the target's
+			// content would be replaced with the gitignore body — a real
+			// CVE-shaped path-traversal exploit. `safeAtomicWriteSync`
+			// opens the leaf `.tmp` with `O_NOFOLLOW`, so even if a
+			// `.gitignore.tmp` is also pre-placed as a symlink the write
+			// throws ELOOP before any rename. Here we just pre-place the
+			// `.gitignore` itself as a symlink and assert the body never
+			// landed on the link target.
+			const linkTarget = join(tempDir, "victim.txt");
+			await writeFile(linkTarget, "ORIGINAL");
+			await symlink(linkTarget, join(memoryBankRoot, ".gitignore"));
+
+			const bootstrap = makeBootstrap({ transcripts: false });
+			// Symlink at `.gitignore` itself means the path-chain check
+			// passes (chain to PARENT is clean) but the leaf O_NOFOLLOW on
+			// `.gitignore.tmp` — wait, the tmp would be a NEW path next to
+			// the symlink. The rename(tmp, target) IS the dangerous step:
+			// rename onto a symlink replaces the symlink itself, NOT its
+			// target. So actually the write SUCCEEDS but the link target
+			// is preserved — which is what we want to assert.
+			await bootstrap.ensureBootstrap();
+
+			// Link target must NEVER have been overwritten.
+			const targetAfter = await readFile(linkTarget, "utf-8");
+			expect(targetAfter).toBe("ORIGINAL");
+			// And `.gitignore` is now a real file (rename replaced the
+			// symlink) holding the canonical body.
+			const gitignoreStat = await stat(join(memoryBankRoot, ".gitignore"));
+			expect(gitignoreStat.isFile()).toBe(true);
+		},
+	);
 });
 
 describe("untrackNonHashSummaries (quarantine + mtime sentinel)", () => {

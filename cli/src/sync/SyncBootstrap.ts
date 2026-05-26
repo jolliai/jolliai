@@ -3,11 +3,11 @@
  * config + cwd, or returns `null` when sync is dormant (no auth token).
  *
  * Plan §0.7: the only prerequisite for the engine to exist is a valid
- * `jolliApiKey`. The `syncEnabled` flag controls whether the orchestrator
+ * `jolliApiKey`. The `autoSyncEnabled` flag controls whether the orchestrator
  * schedules a polling tick — not whether the engine can be built. Manual
  * "Sync to Personal Space" must work whenever the user is signed in,
  * regardless of the auto-sync toggle, so this builder does NOT gate on
- * `syncEnabled`.
+ * `autoSyncEnabled`.
  *
  * Called by the VS Code `StatusOrchestrator` (one engine per workspace
  * activate; long-lived plugin process). The CLI side only invokes sync
@@ -19,11 +19,13 @@
 import { basename } from "node:path";
 import { extractRepoName, getRemoteUrl, peekKBPath, resolveKbParent } from "../core/KBPathResolver.js";
 import { loadConfig } from "../core/SessionTracker.js";
+import { launchWorker } from "../hooks/QueueWorker.js";
 import { createLogger } from "../Logger.js";
 import { BackendClient } from "./BackendClient.js";
 import type { ConflictUi } from "./ConflictResolver.js";
 import { GitClient } from "./GitClient.js";
 import { LocalAiMergeProvider } from "./LocalAiMergeProvider.js";
+import { consumePendingWorkers } from "./PendingWorkers.js";
 import { computeRepoIdentity } from "./RepoIdentity.js";
 import { type RoundContext, SyncEngine, type SyncEngineOpts } from "./SyncEngine.js";
 import type { SyncRoundOptions, SyncState } from "./SyncTypes.js";
@@ -42,6 +44,14 @@ export interface BootstrapOpts {
 	 * at a silent "Syncing…" spinner.
 	 */
 	readonly onLockedWait?: SyncEngineOpts["onLockedWait"];
+	/**
+	 * Per-phase progress signal — fired at the entry of each user-facing
+	 * phase (download / merge / resolve / upload / wait). Wired by
+	 * `VsCodeSyncBootstrap` to the sidebar Branch-tab toolbar so the user
+	 * sees granular labels like "Getting latest memories…" instead of a
+	 * silent "Syncing…" spinner.
+	 */
+	readonly onPhase?: SyncEngineOpts["onPhase"];
 	/**
 	 * Plan §P2#3 — fired when `repos.json` has 2+ identities claiming
 	 * the same folder. VS Code surfaces this as a warning notification;
@@ -101,7 +111,43 @@ export async function buildSyncEngine(opts: BootstrapOpts): Promise<SyncEngine |
 		ui: opts.ui,
 		onStateChange: opts.onStateChange,
 		onLockedWait: opts.onLockedWait,
+		onPhase: opts.onPhase,
 		onRepoMappingConflict: opts.onRepoMappingConflict,
+		// P2 #1 — chain-spawn a QueueWorker after every sync release so a
+		// worker that previously hit the 60 s `vault-write.lock` timeout
+		// gets a retry without waiting for the next post-commit hook. The
+		// worker's own startup quickly exits if the queue is empty (cheap
+		// no-op), so spawning unconditionally is fine. `launchWorker` is
+		// fire-and-forget — it spawns a detached child process.
+		//
+		// Cross-repo wakeup (P2): also drain the per-vault pending-worker
+		// registry — any worker that timed out waiting on `vault-write.lock`
+		// while sync held it recorded its cwd there. Without this, only the
+		// round's own cwd would get a worker spawn; workers from OTHER
+		// source repos sharing this vault would sit until their next
+		// post-commit hook.
+		onRoundComplete: (cwd) => {
+			launchWorker(cwd);
+			void (async () => {
+				try {
+					const fresh = await loadConfig();
+					// Resolve via `deriveMemoryBankRoot` so default-config
+					// users (no `localFolder` set → `~/Documents/jolli/`)
+					// also get the cross-repo wakeup. Passing raw
+					// `fresh.localFolder` would no-op for them.
+					const memoryBankRoot = deriveMemoryBankRoot(fresh.localFolder);
+					const pending = await consumePendingWorkers(memoryBankRoot);
+					for (const pendingCwd of pending) {
+						if (pendingCwd !== cwd) {
+							log.info("Waking pending worker after sync release: cwd=%s", pendingCwd);
+							launchWorker(pendingCwd);
+						}
+					}
+				} catch (e) {
+					log.warn("onRoundComplete pending-worker drain failed (non-fatal): %s", (e as Error).message);
+				}
+			})();
+		},
 		// Tier 3 strategy: user-saved config wins; otherwise default to
 		// `"prompt"`. The earlier `"newest"` default was misleading — the
 		// engine always makes a reconcile commit a few ms before

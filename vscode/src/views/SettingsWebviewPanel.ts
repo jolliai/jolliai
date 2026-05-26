@@ -55,7 +55,7 @@ interface SettingsPayload {
 	readonly localFolder: string;
 	readonly excludePatterns: string;
 	readonly dcoSignoff: boolean;
-	readonly syncEnabled?: boolean;
+	readonly autoSyncEnabled?: boolean;
 	readonly syncTranscripts?: boolean;
 	/** Null → "leave blank, use default"; number → clamped seconds (5400..86400). */
 	readonly syncPollIntervalSec?: number | null;
@@ -389,7 +389,7 @@ export class SettingsWebviewPanel {
 				? config.excludePatterns.join(", ")
 				: "",
 			dcoSignoff: config.dcoSignoff === true,
-			syncEnabled: Boolean(config.syncEnabled),
+			autoSyncEnabled: Boolean(config.autoSyncEnabled),
 			syncTranscripts: Boolean(config.syncTranscripts),
 			syncPollIntervalSec:
 				typeof config.syncPollIntervalSec === "number"
@@ -497,7 +497,7 @@ export class SettingsWebviewPanel {
 					: undefined,
 			excludePatterns: excludePatterns.length > 0 ? excludePatterns : undefined,
 			dcoSignoff: settings.dcoSignoff ? true : undefined,
-			syncEnabled: settings.syncEnabled === true ? true : undefined,
+			autoSyncEnabled: settings.autoSyncEnabled === true ? true : undefined,
 			syncTranscripts: settings.syncTranscripts === true ? true : undefined,
 			// `null` from the webview → user cleared the field → reset to default
 			// (write `undefined` so config falls back to the engine's 90-min default).

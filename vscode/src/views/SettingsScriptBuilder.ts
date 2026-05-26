@@ -50,7 +50,7 @@ export function buildSettingsScript(): string {
   const summaryReLoginBtn = document.getElementById('summaryReLoginBtn');
   const syncSignInBtn = document.getElementById('syncSignInBtn');
   const syncSignOutBtn = document.getElementById('syncSignOutBtn');
-  const syncEnabledInput = document.getElementById('syncEnabled');
+  const autoSyncEnabledInput = document.getElementById('autoSyncEnabled');
   const syncTranscriptsInput = document.getElementById('syncTranscripts');
   const syncPollIntervalMinInput = document.getElementById('syncPollIntervalMin');
   const syncNowBtn = document.getElementById('syncNowBtn');
@@ -322,7 +322,7 @@ export function buildSettingsScript(): string {
       localFolder: localFolderInput.value,
       excludePatterns: excludePatternsInput.value,
       dcoSignoff: dcoSignoffInput.checked,
-      syncEnabled: syncEnabledInput ? syncEnabledInput.checked : false,
+      autoSyncEnabled: autoSyncEnabledInput ? autoSyncEnabledInput.checked : false,
       syncTranscripts: syncTranscriptsInput ? syncTranscriptsInput.checked : false,
       syncPollIntervalMin: syncPollIntervalMinInput ? syncPollIntervalMinInput.value : '',
     };
@@ -345,7 +345,7 @@ export function buildSettingsScript(): string {
       localFolderInput.value !== initialState.localFolder ||
       excludePatternsInput.value !== initialState.excludePatterns ||
       dcoSignoffInput.checked !== initialState.dcoSignoff ||
-      (syncEnabledInput && syncEnabledInput.checked !== initialState.syncEnabled) ||
+      (autoSyncEnabledInput && autoSyncEnabledInput.checked !== initialState.autoSyncEnabled) ||
       (syncTranscriptsInput && syncTranscriptsInput.checked !== initialState.syncTranscripts) ||
       (syncPollIntervalMinInput && syncPollIntervalMinInput.value !== initialState.syncPollIntervalMin)
     );
@@ -440,7 +440,7 @@ export function buildSettingsScript(): string {
         localFolder: localFolderInput.value.trim(),
         excludePatterns: excludePatternsInput.value,
         dcoSignoff: dcoSignoffInput.checked,
-        syncEnabled: syncEnabledInput ? syncEnabledInput.checked : false,
+        autoSyncEnabled: autoSyncEnabledInput ? autoSyncEnabledInput.checked : false,
         syncTranscripts: syncTranscriptsInput ? syncTranscriptsInput.checked : false,
         // Parse minutes → seconds and clamp on the way out so the host gets a
         // value it can write straight into config.json. The number input's
@@ -485,11 +485,11 @@ export function buildSettingsScript(): string {
   // grayed-out state communicates "this number won't take effect right now".
   function applyAutoIntervalEnabledState() {
     if (!syncPollIntervalMinInput) return;
-    const on = !!(syncEnabledInput && syncEnabledInput.checked);
+    const on = !!(autoSyncEnabledInput && autoSyncEnabledInput.checked);
     syncPollIntervalMinInput.disabled = !on;
   }
-  if (syncEnabledInput) {
-    syncEnabledInput.addEventListener('change', function () {
+  if (autoSyncEnabledInput) {
+    autoSyncEnabledInput.addEventListener('change', function () {
       applyAutoIntervalEnabledState();
       checkDirty();
     });
@@ -551,7 +551,7 @@ export function buildSettingsScript(): string {
         localFolderInput.value = msg.settings.localFolder || '';
         excludePatternsInput.value = msg.settings.excludePatterns;
         dcoSignoffInput.checked = !!msg.settings.dcoSignoff;
-        if (syncEnabledInput) syncEnabledInput.checked = !!msg.settings.syncEnabled;
+        if (autoSyncEnabledInput) autoSyncEnabledInput.checked = !!msg.settings.autoSyncEnabled;
         if (syncTranscriptsInput) syncTranscriptsInput.checked = !!msg.settings.syncTranscripts;
         if (syncPollIntervalMinInput) {
           // Host stores seconds; UI shows minutes. Empty → leave blank so the

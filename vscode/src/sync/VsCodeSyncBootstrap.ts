@@ -13,7 +13,7 @@
  *   - **Manual sync** — the "Sync to Personal Space Now" button. Available
  *     whenever `jolliApiKey` is configured; no extra opt-in toggle.
  *   - **Auto sync** — the `Auto-sync to Personal Space` toggle, which maps
- *     to `config.syncEnabled`. Controls whether the orchestrator's polling
+ *     to `config.autoSyncEnabled`. Controls whether the orchestrator's polling
  *     tick is scheduled. With auto off, the orchestrator still exists for
  *     manual triggers but never polls on its own.
  *
@@ -28,6 +28,7 @@ import * as vscode from "vscode";
 import { loadConfig } from "../../../cli/src/core/SessionTracker.js";
 import { createLogger } from "../../../cli/src/Logger.js";
 import { buildSyncEngine } from "../../../cli/src/sync/SyncBootstrap.js";
+import type { StatusStore } from "../stores/StatusStore.js";
 import type { StatusBarManager } from "../util/StatusBarManager.js";
 import { StatusOrchestrator } from "./StatusOrchestrator.js";
 import { registerSyncCommands } from "./SyncCommands.js";
@@ -100,6 +101,12 @@ export class SyncRuntime {
 		 * `.jolli/config.json` is on disk before any `git pull` (P1#2 fix).
 		 */
 		private readonly readyPromise: Promise<void> = Promise.resolve(),
+		/**
+		 * Unified activity registry — forwarded to the orchestrator so per-
+		 * phase sync labels surface on the sidebar Branch-tab toolbar.
+		 * Optional so older callers / tests don't need to inject one.
+		 */
+		private readonly statusStore?: StatusStore,
 	) {}
 
 	/**
@@ -132,6 +139,22 @@ export class SyncRuntime {
 		this.currentLockedWaitDispose = null;
 		this.lastBuiltJolliApiKey = undefined;
 		this.lastBuiltPollIntervalSec = undefined;
+		// P2 #3 — release the bar's sync ownership so any subsequent
+		// `update(enabled)` from `refreshStatusBar` / sign-out handlers /
+		// disable command can actually change the visual. Without this the
+		// bar stayed permanently on the last sync state (e.g. red "Sync
+		// failed") after sign-out, masking that sync was actually off.
+		//
+		// We deliberately do NOT push a "disabled" visual here: this method
+		// runs on FOUR paths (sign-out, sign-in account swap, poll interval
+		// change, deactivate) and only the first really means "sync is off
+		// from the user's perspective". The other three are immediately
+		// followed by a rebuilt orchestrator's `setSyncState`, which would
+		// flash a "disabled" visual in between for no reason. Letting the
+		// next `refreshStatusBar` (which Extension.ts wires into all the
+		// post-action paths — sign-out, enable/disable, etc.) pick the
+		// right visual keeps the bar correct without flicker.
+		this.statusBar.releaseSyncOwnership();
 	}
 
 	/**
@@ -160,7 +183,7 @@ export class SyncRuntime {
 	}
 
 	/**
-	 * Reacts to a settings save OR a sign-out: re-reads `syncEnabled` and
+	 * Reacts to a settings save OR a sign-out: re-reads `autoSyncEnabled` and
 	 * `jolliApiKey` from CLI config and starts OR stops the orchestrator's
 	 * polling loop to match. Two directions:
 	 *
@@ -172,10 +195,10 @@ export class SyncRuntime {
 	 *     Settings would NOT stop the running poll loop until the window
 	 *     was reloaded (P2#2).
 	 *
-	 * `wantPoll` requires BOTH the user-facing `syncEnabled` toggle AND a
+	 * `wantPoll` requires BOTH the user-facing `autoSyncEnabled` toggle AND a
 	 * present `jolliApiKey`. Gating on creds here is what makes sign-out
 	 * tear down an already-polling orchestrator: `clearAuthCredentials`
-	 * drops `jolliApiKey` but leaves `syncEnabled` intact (so it auto-
+	 * drops `jolliApiKey` but leaves `autoSyncEnabled` intact (so it auto-
 	 * resumes on next sign-in), and this method then notices the missing
 	 * creds and stops the loop.
 	 *
@@ -184,7 +207,7 @@ export class SyncRuntime {
 	 */
 	async reconcileAutoSync(): Promise<void> {
 		const config = await loadConfig();
-		const wantPoll = config.syncEnabled === true && Boolean(config.jolliApiKey);
+		const wantPoll = config.autoSyncEnabled === true && Boolean(config.jolliApiKey);
 		// `syncPollIntervalSec` is captured at orchestrator construction
 		// (StatusOrchestrator turns it into a fixed `pollMs`). If the user
 		// changed it in Settings, the existing orchestrator still ticks at
@@ -212,7 +235,7 @@ export class SyncRuntime {
 		}
 		// wantPoll === false. Two sub-cases:
 		//
-		//   1. `syncEnabled` toggled off but the user is still signed in →
+		//   1. `autoSyncEnabled` toggled off but the user is still signed in →
 		//      keep the orchestrator alive so manual `syncNow` still works;
 		//      just stop the polling tick.
 		//   2. `jolliApiKey` is gone (sign-out) → dispose + null so a later
@@ -239,7 +262,7 @@ export class SyncRuntime {
 	 * builder bails). Subsequent calls return the same instance — once
 	 * built, it stays built for the session.
 	 *
-	 * Plan §0.7: this no longer gates on `config.syncEnabled`. That flag
+	 * Plan §0.7: this no longer gates on `config.autoSyncEnabled`. That flag
 	 * only controls whether the polling tick gets scheduled (see the
 	 * `orch.start()` branch below). Manual `Sync Now` works whenever
 	 * `jolliApiKey` is set, regardless of the auto-sync toggle.
@@ -317,10 +340,20 @@ export class SyncRuntime {
 				this.context.subscriptions.push({
 					dispose: () => this.currentLockedWaitDispose?.(),
 				});
+				// Forward-declared reference for the engine's `onPhase` callback
+				// to route into the orchestrator's `handlePhase`. We have to
+				// construct the engine first (StatusOrchestrator requires the
+				// engine in its constructor), so onPhase fires through this
+				// late-binding reference. Until the orchestrator is assigned,
+				// phase events are dropped — that window is the synchronous
+				// path between the two `new` calls, so no real round can hit
+				// it.
+				let orchRef: StatusOrchestrator | null = null;
 				const engine = await buildSyncEngine({
 					cwd: folder.uri.fsPath,
 					ui: new VsCodeConflictUi(),
 					onLockedWait: onLockedWait.handler,
+					onPhase: (phase) => orchRef?.handlePhase(phase),
 					// Plan §P2#3 — extracted so we can unit-test it
 					// independently of the full `ensureBuilt` IIFE which
 					// requires a real workspace folder + engine wiring.
@@ -331,24 +364,51 @@ export class SyncRuntime {
 					log.debug("ensureBuilt: buildSyncEngine returned null");
 					return null;
 				}
+				// `lastSuccessAt` is keyed per workspace folder so multi-root
+				// users don't have one folder's successful round suppress
+				// another's eager tick. `globalState` (vs `workspaceState`)
+				// because the Memory Bank vault is global — the same vault
+				// is shared by every worktree of this repo, so the freshness
+				// signal should be repo-scoped, not workspace-scoped. We use
+				// the workspace folder fsPath as a stable key — colliding
+				// keys across distinct repos just means more eager ticks
+				// (harmless), while distinct keys per repo keeps the
+				// staleness signal accurate.
+				const lastSuccessKey = `sync.lastSuccessAt:${folder.uri.fsPath}`;
 				const orch = new StatusOrchestrator({
 					engine,
 					statusBar: this.statusBar,
+					statusStore: this.statusStore,
 					workspaceFolder: folder,
 					pollIntervalSec: config.syncPollIntervalSec,
 					readyPromise: this.readyPromise,
 					onRoundFinished: this.onRoundFinished,
+					lastSuccessAt: {
+						get: () => this.context.globalState.get<number>(lastSuccessKey),
+						set: (ms) => {
+							void this.context.globalState.update(lastSuccessKey, ms);
+						},
+					},
+					// Persistent failure copy goes to the VS Code notification
+					// surface (bottom-right toast) so the user dismisses it
+					// explicitly; the sidebar toolbar is reserved for the
+					// transient in-flight phase indicator. `void` because we
+					// don't care about the dismissal Thenable.
+					notifyError: (title, message) => {
+						void vscode.window.showErrorMessage(`${title} — ${message}`);
+					},
 				});
+				orchRef = orch;
 				this.lastBuiltPollIntervalSec = config.syncPollIntervalSec;
 				this.lastBuiltJolliApiKey = config.jolliApiKey;
 				this.context.subscriptions.push(orch);
-				// Auto polling is gated by `syncEnabled` (§0.7). When off, the
+				// Auto polling is gated by `autoSyncEnabled` (§0.7). When off, the
 				// orchestrator exists for manual `syncNow()` calls but never
 				// schedules a poll tick on its own. `orch.isPolling` (rather
 				// than a separate flag) is the truth source for whether
 				// polling is live, so toggling off later via
 				// `reconcileAutoSync` can read it back consistently (P2#2).
-				if (config.syncEnabled === true) {
+				if (config.autoSyncEnabled === true) {
 					orch.start();
 					log.info("Memory Bank auto-sync polling started");
 				} else {
@@ -447,7 +507,7 @@ export function makeLockedWaitHandler(
 
 /**
  * Registers the sync commands and eagerly tries to build the orchestrator.
- * On a cold start with `syncEnabled` already true, this is the only
+ * On a cold start with `autoSyncEnabled` already true, this is the only
  * bootstrap path. On a fresh enable mid-session, `runtime.ensureBuilt()`
  * is called from the command handlers (via `registerSyncCommands`'s
  * `runtime` argument).
@@ -461,8 +521,14 @@ export async function activateSync(
 	 * `initializeKB()` Promise here.
 	 */
 	readyPromise: Promise<void> = Promise.resolve(),
+	/**
+	 * Unified activity registry — drives the sidebar Branch-tab toolbar's
+	 * per-phase sync labels. Optional so existing tests (which don't depend
+	 * on the sidebar) keep working unchanged.
+	 */
+	statusStore?: StatusStore,
 ): Promise<SyncActivationResult> {
-	const runtime = new SyncRuntime(context, statusBar, readyPromise);
+	const runtime = new SyncRuntime(context, statusBar, readyPromise, statusStore);
 
 	// Eager build for the common case where sync was already enabled when
 	// the window opened. Errors are swallowed — activation must never fail.

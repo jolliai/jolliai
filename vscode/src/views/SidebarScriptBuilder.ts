@@ -97,11 +97,17 @@ export function buildSidebarScript(): string {
     // the lock. Drives the "AI summary in progress…" indicator on the Branch
     // toolbar. Not persisted — start from false on every load and let the next
     // worker:busy or status push correct it.
-    workerBusy: false
+    workerBusy: false,
+    // Live sync-phase indicator pushed by the host as the sync engine
+    // advances through phases (downloading / merging / uploading) or ends
+    // in a sticky terminal failure. Shape: { label, severity } | null. Not
+    // persisted — host re-pushes on reload.
+    syncPhase: null
   }, vscode.getState() || {});
   // workerBusy is intentionally reset on load (above), even if persisted state
   // had it set — the lock is process-bound and cannot survive a reload.
   state.workerBusy = false;
+  state.syncPhase = null;
   function persist() { vscode.setState(state); }
 
   // ---- DOM refs ----
@@ -358,9 +364,21 @@ export function buildSidebarScript(): string {
       const folderToggled = state.kbMode === 'folders';
       const memoryToggled = state.kbMode === 'memories';
       const items = [];
-      // Search input goes first (left). Folders mode has no search backend,
-      // so we only render it in memories mode.
-      if (memoryToggled) items.push(buildKbSearchBox());
+      // Sync-phase indicator (StatusOrchestrator's per-phase label). Anchored
+      // to the leftmost slot so the activity copy sits where the eye lands
+      // first, ahead of the mode toggles and actions. Container collapses
+      // (hidden class) when syncPhase is null, so the rest of the toolbar
+      // closes up tightly in the idle case. Sync moves memories to/from the
+      // Personal Space, so the indicator lives on the Memory Bank toolbar.
+      items.push(buildToolbarIndicator(state.syncPhase));
+      // Search input next. Folders mode has no search backend, so we only
+      // render it in memories mode. While a sync round is in flight we also
+      // suppress the search box in memories mode: the indicator and the
+      // search input both want flex:1 1 auto, and at sidebar widths the
+      // split squeezes both down to unreadable widths. The search affordance
+      // returns the moment the round ends (indicator clears, renderToolbar
+      // re-runs from the sync:phase handler).
+      if (memoryToggled && !state.syncPhase) items.push(buildKbSearchBox());
       items.push(iconButton('kb-mode-folders', 'Tree', 'list-tree', { toggled: folderToggled }));
       items.push(iconButton('kb-mode-memories', 'Timeline', 'history', { toggled: memoryToggled }));
       // Sync to Personal Space: fires the same jollimemory.syncNow command as
@@ -390,29 +408,44 @@ export function buildSidebarScript(): string {
       ];
       mountIn(tabToolbar, items);
     } else {
-      // Branch tab: optional left-side worker-busy indicator + refresh.
-      // The indicator container is always mounted so the right-edge refresh
-      // button stays in a stable position; its inner content is only filled
-      // when state.workerBusy is true.
+      // Branch tab: optional left-side AI-summary worker indicator + refresh.
+      // The container is always mounted so the right-edge refresh button
+      // stays in a stable position. Sync-phase lives on the Memory Bank tab
+      // toolbar — it's about moving memories to/from the Personal Space, not
+      // about the working-tree branch.
       const items = [];
-      const busyEl = el('div', {
-        className: 'toolbar-worker-status' + (state.workerBusy ? '' : ' hidden'),
-        id: 'toolbar-worker-status'
-      });
-      if (state.workerBusy) {
-        busyEl.appendChild(el('i', {
-          className: 'codicon codicon-loading codicon-modifier-spin',
-          'aria-hidden': 'true'
-        }));
-        busyEl.appendChild(el('span', {
-          className: 'toolbar-worker-status-text',
-          text: 'AI summary in progress…'
-        }));
-      }
-      items.push(busyEl);
+      const indicator = state.workerBusy
+        ? { label: 'AI summary in progress…', severity: 'info' }
+        : null;
+      items.push(buildToolbarIndicator(indicator));
       items.push(iconButton('refresh', 'Refresh', 'refresh'));
       mountIn(tabToolbar, items);
     }
+  }
+
+  // Shared chrome for the toolbar's left-side status indicator. Used by both
+  // the Memory Bank tab (sync-phase) and the Branch tab (AI-summary worker).
+  // Always returns a mounted container so the right-edge refresh button keeps
+  // a stable position; the hidden class collapses it when indicator is null.
+  function buildToolbarIndicator(indicator) {
+    const busyEl = el('div', {
+      className: 'toolbar-worker-status' + (indicator ? '' : ' hidden'),
+      id: 'toolbar-worker-status'
+    });
+    if (indicator) {
+      const isError = indicator.severity === 'error';
+      busyEl.appendChild(el('i', {
+        className: isError
+          ? 'codicon codicon-error toolbar-worker-icon-error'
+          : 'codicon codicon-loading codicon-modifier-spin',
+        'aria-hidden': 'true'
+      }));
+      busyEl.appendChild(el('span', {
+        className: 'toolbar-worker-status-text',
+        text: indicator.label
+      }));
+    }
+    return busyEl;
   }
 
   tabToolbar.addEventListener('click', function(e) {
@@ -652,6 +685,18 @@ export function buildSidebarScript(): string {
         if (state.activeTab === 'branch') {
           renderToolbar();
           renderBranch();
+        }
+        break;
+      }
+      case 'sync:phase': {
+        // Per-phase sync indicator from StatusOrchestrator. Independent of
+        // worker:busy (the post-commit Worker channel). Only the Memory Bank
+        // tab toolbar consumes it — sync moves memories to/from the Personal
+        // Space, so the indicator sits next to the Sync-now action it
+        // describes; other tabs ignore the field.
+        state.syncPhase = msg.phase || null;
+        if (state.activeTab === 'kb') {
+          renderToolbar();
         }
         break;
       }

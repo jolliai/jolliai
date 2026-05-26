@@ -38,7 +38,11 @@ import { registerSyncCommands } from "./SyncCommands.js";
 import type { SyncRuntime } from "./VsCodeSyncBootstrap.js";
 
 function makeRuntime(
-	orch: { syncNow?: () => Promise<void>; isRoundInFlight?: () => boolean } | null,
+	orch: {
+		syncNow?: () => Promise<void>;
+		requestManualSync?: () => Promise<void>;
+		isRoundInFlight?: () => boolean;
+	} | null,
 ): SyncRuntime {
 	const wrapped = orch
 		? {
@@ -79,28 +83,31 @@ describe("registerSyncCommands", () => {
 		);
 	});
 
-	it("syncNow delegates to the orchestrator returned by ensureBuilt", async () => {
-		const syncNow = vi.fn(async () => undefined);
-		registerSyncCommands({ runtime: makeRuntime({ syncNow }) });
+	it("syncNow delegates to requestManualSync on the orchestrator returned by ensureBuilt", async () => {
+		const requestManualSync = vi.fn(async () => undefined);
+		registerSyncCommands({ runtime: makeRuntime({ requestManualSync }) });
 		await registeredHandlers.get("jollimemory.syncNow")?.();
-		expect(syncNow).toHaveBeenCalled();
+		expect(requestManualSync).toHaveBeenCalled();
 		expect(showInformationMessage).not.toHaveBeenCalled();
 	});
 
-	it("syncNow silently no-ops when a round is already in flight (no second syncNow, no toast)", async () => {
-		const syncNow = vi.fn(async () => undefined);
+	it("syncNow ALWAYS calls requestManualSync even when a round is already in flight (P3-A — orchestrator coalesces + queues followup)", async () => {
+		// Pre-P3-A behaviour was an early-return in SyncCommands when
+		// `isRoundInFlight()` was true. That dropped the manual click on
+		// the floor if the in-flight round subsequently bailed at the
+		// generation-mismatch check (user toggled auto-sync OFF during
+		// a `readyPromise` wait). The orchestrator now owns the
+		// in-flight coalescing via `requestManualSync` — which sets
+		// `pendingManualFollowup`, awaits the current round, then fires
+		// a fresh manual tick. The command layer just delegates.
+		const requestManualSync = vi.fn(async () => undefined);
 		const isRoundInFlight = vi.fn(() => true);
 		registerSyncCommands({
-			runtime: makeRuntime({ syncNow, isRoundInFlight }),
+			runtime: makeRuntime({ requestManualSync, isRoundInFlight }),
 		});
 		await registeredHandlers.get("jollimemory.syncNow")?.();
-		expect(isRoundInFlight).toHaveBeenCalled();
-		// Critical: a second sync MUST NOT be queued — the engine would
-		// coalesce via sync.lock anyway, but issuing a redundant call would
-		// double the work the next round driver sees.
-		expect(syncNow).not.toHaveBeenCalled();
-		// Status bar already shows "Syncing…" — no extra toast on repeat
-		// clicks (would just be noise).
+		expect(requestManualSync).toHaveBeenCalled();
+		// Status bar already shows "Syncing…"; no extra toast.
 		expect(showInformationMessage).not.toHaveBeenCalled();
 	});
 

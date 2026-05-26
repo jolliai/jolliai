@@ -7,14 +7,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockHomeDir } = vi.hoisted(() => ({
+const { mockHomeDir, launchWorkerMock } = vi.hoisted(() => ({
 	mockHomeDir: { value: "" },
+	launchWorkerMock: vi.fn<(cwd: string) => void>(),
 }));
 
 vi.mock("node:os", async () => {
 	const actual = await vi.importActual<typeof import("node:os")>("node:os");
 	return { ...actual, homedir: () => mockHomeDir.value };
 });
+
+vi.mock("../hooks/QueueWorker.js", () => ({
+	launchWorker: (cwd: string) => launchWorkerMock(cwd),
+}));
 
 import { buildSyncEngine, narrowConflictPolicy } from "./SyncBootstrap.js";
 
@@ -29,6 +34,7 @@ async function writeConfig(config: Record<string, unknown>): Promise<void> {
 beforeEach(async () => {
 	tempDir = await mkdtemp(join(tmpdir(), "syncbootstrap-"));
 	mockHomeDir.value = tempDir;
+	launchWorkerMock.mockReset();
 });
 
 afterEach(async () => {
@@ -38,12 +44,12 @@ afterEach(async () => {
 const STUB_UI = { promptBinaryPick: async () => "skip" as const };
 
 describe("buildSyncEngine returns null when prerequisites are missing", () => {
-	// Plan §0.7: the engine builds whenever `jolliApiKey` is set. `syncEnabled`
+	// Plan §0.7: the engine builds whenever `jolliApiKey` is set. `autoSyncEnabled`
 	// only gates the polling tick (in `VsCodeSyncBootstrap.ts`); manual sync
 	// must work without the auto-sync toggle.
 
 	it("returns null when jolliApiKey is missing", async () => {
-		await writeConfig({ syncEnabled: true });
+		await writeConfig({ autoSyncEnabled: true });
 		const engine = await buildSyncEngine({ cwd: tempDir, ui: STUB_UI });
 		expect(engine).toBeNull();
 	});
@@ -54,16 +60,16 @@ describe("buildSyncEngine returns null when prerequisites are missing", () => {
 		expect(engine).toBeNull();
 	});
 
-	it("returns an engine when jolliApiKey is set even if syncEnabled is absent", async () => {
+	it("returns an engine when jolliApiKey is set even if autoSyncEnabled is absent", async () => {
 		// Manual sync path — clicking "Sync to Personal Space" with auto-sync off.
 		await writeConfig({ jolliApiKey: "sk-jol-test" });
 		const engine = await buildSyncEngine({ cwd: tempDir, ui: STUB_UI });
 		expect(engine).not.toBeNull();
 	});
 
-	it("returns an engine when jolliApiKey is set and syncEnabled is false", async () => {
+	it("returns an engine when jolliApiKey is set and autoSyncEnabled is false", async () => {
 		// Same path, explicit `false`.
-		await writeConfig({ syncEnabled: false, jolliApiKey: "sk-jol-test" });
+		await writeConfig({ autoSyncEnabled: false, jolliApiKey: "sk-jol-test" });
 		const engine = await buildSyncEngine({ cwd: tempDir, ui: STUB_UI });
 		expect(engine).not.toBeNull();
 	});
@@ -122,8 +128,8 @@ describe("defaultResolveContext / deriveMemoryBankRoot", () => {
 });
 
 describe("buildSyncEngine returns a configured engine when prerequisites are met", () => {
-	it("returns an engine when syncEnabled + jolliApiKey are set", async () => {
-		await writeConfig({ syncEnabled: true, jolliApiKey: "sk-jol-test" });
+	it("returns an engine when autoSyncEnabled + jolliApiKey are set", async () => {
+		await writeConfig({ autoSyncEnabled: true, jolliApiKey: "sk-jol-test" });
 		const engine = await buildSyncEngine({ cwd: tempDir, ui: STUB_UI });
 		expect(engine).not.toBeNull();
 		// Exposed as a class instance — confirm via method presence.
@@ -136,7 +142,7 @@ describe("buildSyncEngine returns a configured engine when prerequisites are met
 		// the resolveContext seam — if the engine is built, the prerequisites
 		// pass.
 		await writeConfig({
-			syncEnabled: true,
+			autoSyncEnabled: true,
 			jolliApiKey: "sk-jol-test",
 			apiKey: "sk-anth-test",
 			model: "claude-sonnet-4-6",
@@ -155,7 +161,7 @@ describe("buildSyncEngine returns a configured engine when prerequisites are met
 	});
 
 	it("uses the supplied test seams (backend + makeGitClient + resolveContext)", async () => {
-		await writeConfig({ syncEnabled: true, jolliApiKey: "sk-jol-test" });
+		await writeConfig({ autoSyncEnabled: true, jolliApiKey: "sk-jol-test" });
 		const backend = {
 			mintGitCredentials: vi.fn(),
 			notifyPush: vi.fn(),
@@ -176,7 +182,7 @@ describe("buildSyncEngine returns a configured engine when prerequisites are met
 	});
 
 	it("relays onStateChange to the engine", async () => {
-		await writeConfig({ syncEnabled: true, jolliApiKey: "sk-jol-test" });
+		await writeConfig({ autoSyncEnabled: true, jolliApiKey: "sk-jol-test" });
 		const onState = vi.fn();
 		const engine = await buildSyncEngine({ cwd: tempDir, ui: STUB_UI, onStateChange: onState });
 		expect(engine).not.toBeNull();
@@ -211,6 +217,70 @@ describe("buildSyncEngine returns a configured engine when prerequisites are met
 		await writeConfig({ jolliApiKey: "sk-jol-test", localFolder: folderB });
 		const ctxAfter = await resolver({ cwd: tempDir, reason: "manual", transcripts: false });
 		expect(ctxAfter.memoryBankRoot).toBe(folderB);
+	});
+});
+
+describe("onRoundComplete wiring (cross-repo pending-worker wakeup)", () => {
+	async function getWiredOnRoundComplete(localFolder: string): Promise<(cwd: string) => void> {
+		await writeConfig({ jolliApiKey: "sk-jol-test", localFolder });
+		const engine = await buildSyncEngine({ cwd: tempDir, ui: STUB_UI });
+		expect(engine).not.toBeNull();
+		const cb = (engine as unknown as { opts: { onRoundComplete: (cwd: string) => void } }).opts.onRoundComplete;
+		expect(cb).toBeTypeOf("function");
+		return cb;
+	}
+
+	it("spawns a worker for the round's own cwd synchronously", async () => {
+		const localFolder = join(tempDir, "vault");
+		const cb = await getWiredOnRoundComplete(localFolder);
+		cb("/repo/a");
+		expect(launchWorkerMock).toHaveBeenCalledWith("/repo/a");
+	});
+
+	it("drains the pending-worker registry and spawns workers for OTHER cwds", async () => {
+		const localFolder = join(tempDir, "vault");
+		const { recordPendingWorker } = await import("./PendingWorkers.js");
+		const { deriveMemoryBankRoot } = await import("./SyncBootstrap.js");
+		// Producer + consumer must agree on the registry key — both go
+		// through `deriveMemoryBankRoot` now (covers the default-config
+		// case where `localFolder` is undefined → falls back to
+		// `~/Documents/jolli/`). Passing raw `localFolder` here would
+		// hash to a different bucket than the onRoundComplete consumer,
+		// and the drain would see an empty registry.
+		const memoryBankRoot = deriveMemoryBankRoot(localFolder);
+		// Two timeout victims from a previous round; one is the round's own
+		// cwd (should not be double-spawned), one is a sibling repo.
+		await recordPendingWorker(memoryBankRoot, "/repo/a");
+		await recordPendingWorker(memoryBankRoot, "/repo/b");
+
+		const cb = await getWiredOnRoundComplete(localFolder);
+		cb("/repo/a");
+
+		// The drain runs in a void-async block off the synchronous callback;
+		// give libuv enough turns for loadConfig + readdir + per-entry
+		// readFile/rm to resolve before assertions.
+		await new Promise((r) => setTimeout(r, 100));
+
+		// /repo/a spawned synchronously; /repo/b spawned from the drain.
+		// /repo/a from the registry was filtered out by the `!== cwd` guard.
+		const calls = launchWorkerMock.mock.calls.map((c) => c[0]).sort();
+		expect(calls).toEqual(["/repo/a", "/repo/b"]);
+	});
+
+	it("swallows pending-worker drain errors (non-fatal)", async () => {
+		const localFolder = join(tempDir, "vault");
+		const cb = await getWiredOnRoundComplete(localFolder);
+		// Point the override at a regular file so consumePendingWorkers's
+		// readdir branch silently returns []; meanwhile recording into that
+		// path also fails. Drain still completes without throwing.
+		process.env.JOLLI_VAULT_LOCK_DIR = join(tempDir, "syncbootstrap-config.json"); // a file
+		try {
+			cb("/repo/a");
+			await new Promise((r) => setTimeout(r, 100));
+			expect(launchWorkerMock).toHaveBeenCalledWith("/repo/a");
+		} finally {
+			delete process.env.JOLLI_VAULT_LOCK_DIR;
+		}
 	});
 });
 

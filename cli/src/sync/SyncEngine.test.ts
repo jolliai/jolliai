@@ -4,7 +4,7 @@
  * lock/retry behaviour without touching git or backend.
  */
 
-import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -47,6 +47,14 @@ interface VaultClientStub {
 	fetch?: ReturnType<typeof vi.fn>;
 	pullRebase?: ReturnType<typeof vi.fn>;
 	stageAll?: ReturnType<typeof vi.fn>;
+	// Allowlist-staging additions (Phase 1). Default stubs return empty
+	// `statusPorcelainZ` output so `stageVault` becomes a no-op in the
+	// existing fixture path — tests that exercise the allowlist directly
+	// override these.
+	statusPorcelainZ?: ReturnType<typeof vi.fn>;
+	stageAddPaths?: ReturnType<typeof vi.fn>;
+	stageRemovePaths?: ReturnType<typeof vi.fn>;
+	unstagePaths?: ReturnType<typeof vi.fn>;
 	commit?: ReturnType<typeof vi.fn>;
 	push?: ReturnType<typeof vi.fn>;
 	currentHead?: ReturnType<typeof vi.fn>;
@@ -58,6 +66,8 @@ function makeGitClient(
 		hasUncommittedChanges?: ReturnType<typeof vi.fn>;
 		listDirtyPaths?: ReturnType<typeof vi.fn>;
 		rebaseAbort?: ReturnType<typeof vi.fn>;
+		isRebaseInProgress?: ReturnType<typeof vi.fn>;
+		sweepStaleLockFiles?: ReturnType<typeof vi.fn>;
 		initRemote?: ReturnType<typeof vi.fn>;
 		untrackPathGlob?: ReturnType<typeof vi.fn>;
 		getOriginUrl?: ReturnType<typeof vi.fn>;
@@ -66,6 +76,7 @@ function makeGitClient(
 		checkoutTrackingBranch?: ReturnType<typeof vi.fn>;
 		recreateBranchAt?: ReturnType<typeof vi.fn>;
 		refExists?: ReturnType<typeof vi.fn>;
+		revParse?: ReturnType<typeof vi.fn>;
 		isAncestor?: ReturnType<typeof vi.fn>;
 	} = {},
 ): GitClient {
@@ -77,6 +88,15 @@ function makeGitClient(
 		untrackPathGlob: overrides.untrackPathGlob ?? vi.fn(async () => undefined),
 		pullRebase: overrides.pullRebase ?? vi.fn(async () => ({ fastForwarded: false, conflicted: [] })),
 		stageAll: overrides.stageAll ?? vi.fn(async () => undefined),
+		// Default empty porcelain → `stageVault` is a no-op (no entries to
+		// classify, nothing to add/remove). Existing tests that mock the
+		// staging step don't need to know about porcelain; the few tests
+		// that DO exercise the allowlist path override `statusPorcelainZ`.
+		statusPorcelainZ: overrides.statusPorcelainZ ?? vi.fn(async () => []),
+		stageAddPaths: overrides.stageAddPaths ?? vi.fn(async () => undefined),
+		stageRemovePaths: overrides.stageRemovePaths ?? vi.fn(async () => undefined),
+		unstagePaths: overrides.unstagePaths ?? vi.fn(async () => undefined),
+		resetPathsToHead: vi.fn(async () => undefined),
 		commit: overrides.commit ?? vi.fn(async () => "deadbeef"),
 		push: overrides.push ?? vi.fn(async () => ({ ok: true as const, transmitted: true })),
 		currentHead: overrides.currentHead ?? vi.fn(async () => "deadbeef"),
@@ -97,6 +117,12 @@ function makeGitClient(
 		// Tests that exercise the side-branch paths override these.
 		recreateBranchAt: overrides.recreateBranchAt ?? vi.fn(async () => undefined),
 		refExists: overrides.refExists ?? vi.fn(async () => true),
+		// Default to a remote head that DIFFERS from the stubbed local
+		// HEAD ("deadbeef") so the idle-round short-circuit doesn't fire
+		// by default and existing tests keep exercising the full
+		// commit+push path. The short-circuit suite below overrides this
+		// to match.
+		revParse: overrides.revParse ?? vi.fn(async () => "remoteoid"),
 		isAncestor: overrides.isAncestor ?? vi.fn(async () => false),
 		// Methods we don't drive in these tests but the interface requires.
 		hasUncommittedChanges: overrides.hasUncommittedChanges ?? vi.fn(async () => false),
@@ -106,6 +132,10 @@ function makeGitClient(
 		checkoutTheirs: async () => undefined,
 		rebaseContinue: async () => undefined,
 		rebaseAbort: overrides.rebaseAbort ?? vi.fn(async () => undefined),
+		// Self-heal probes — default to clean state. Tests exercising the
+		// recovery paths override these.
+		isRebaseInProgress: overrides.isRebaseInProgress ?? vi.fn(async () => false),
+		sweepStaleLockFiles: overrides.sweepStaleLockFiles ?? vi.fn(async () => ({ removed: [] })),
 		hasUnmergedPaths: async () => [],
 		addPath: async () => undefined,
 	} as unknown as GitClient;
@@ -651,6 +681,101 @@ describe("SyncEngine.runRound — conflicts surface", () => {
 		const result = await engine.runRound(ROUND);
 		expect(result.newState).toBe("synced");
 		expect(client.push).toHaveBeenCalled();
+	});
+});
+
+describe("SyncEngine.runRound — onRoundComplete (P2 #1 chain-spawn hook)", () => {
+	it("fires onRoundComplete with the round cwd after a successful round", async () => {
+		const onRoundComplete = vi.fn();
+		const { engine } = makeEngine();
+		(engine as unknown as { opts: { onRoundComplete: typeof onRoundComplete } }).opts.onRoundComplete =
+			onRoundComplete;
+		await engine.runRound(ROUND);
+		expect(onRoundComplete).toHaveBeenCalledTimes(1);
+		expect(onRoundComplete).toHaveBeenCalledWith(ROUND.cwd);
+	});
+
+	it("fires onRoundComplete even when the round goes offline (worker still needs the wake-up)", async () => {
+		// The chain-spawn promise is "after sync releases its locks, try
+		// the queue again" — outcome-independent. A round that failed for
+		// network reasons released the same locks; the worker that was
+		// blocked behind them must still be re-spawned.
+		const onRoundComplete = vi.fn();
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				pullRebase: vi.fn(async () => {
+					throw new Error("simulated transient network failure");
+				}),
+			}),
+		});
+		(engine as unknown as { opts: { onRoundComplete: typeof onRoundComplete } }).opts.onRoundComplete =
+			onRoundComplete;
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(onRoundComplete).toHaveBeenCalledTimes(1);
+		expect(onRoundComplete).toHaveBeenCalledWith(ROUND.cwd);
+	});
+
+	it("swallows onRoundComplete throws — a buggy hook must not poison the round result", async () => {
+		// The hook IS best-effort (launchWorker spawns a detached child).
+		// Errors thrown by the callback would otherwise surface as a
+		// round-level offline result, masking the actual state from the user.
+		const onRoundComplete = vi.fn(() => {
+			throw new Error("callback boom");
+		});
+		const { engine } = makeEngine();
+		(engine as unknown as { opts: { onRoundComplete: typeof onRoundComplete } }).opts.onRoundComplete =
+			onRoundComplete;
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(onRoundComplete).toHaveBeenCalled();
+	});
+});
+
+describe("SyncEngine.runRound — vault-write.lock refresh during long pullRebase", () => {
+	it("refreshes `vault-write.lock` mtime while `withPullLock` holds it across a long resolver", async () => {
+		// Regression guard: a Tier-2-heavy or Tier-3-prompt conflict round
+		// can exceed `LOCK_TIMEOUT_MS` (5 min). Without an in-flight refresh
+		// the lock's mtime falls behind and a peer `acquireWithPoll` would
+		// reclaim it — reopening R9. The refresher inside `withPullLock`
+		// must drive `lock.refresh()` on the configured interval so the
+		// mtime keeps advancing for as long as `pullRebase` + the resolver
+		// are running.
+		const { getVaultWriteLockPath } = await import("./VaultLockPath.js");
+		const memoryBankRoot = join(tempDir, "vault");
+		const lockPath = getVaultWriteLockPath(memoryBankRoot);
+
+		// Sample the lock's mtime at multiple points during a deliberately
+		// slow `pullRebase`. With `refreshIntervalMs: 20 ms` and the
+		// pullRebase paused for ~120 ms, we expect at least one tick of the
+		// refresher to fire — mtime[end] > mtime[start].
+		let mtimeAtStart = 0;
+		let mtimeAtEnd = 0;
+		const client = makeGitClient({
+			pullRebase: vi.fn(async () => {
+				mtimeAtStart = (await stat(lockPath)).mtimeMs;
+				// Hold the lock window open long enough for the 20 ms
+				// refresher to tick at least once. Two refreshes would be
+				// ideal, but FS mtime resolution on some platforms is 10 ms
+				// — a single confirmed bump is enough to prove the wiring.
+				await new Promise((r) => setTimeout(r, 120));
+				mtimeAtEnd = (await stat(lockPath)).mtimeMs;
+				return { fastForwarded: false, conflicted: [] };
+			}),
+		});
+		const { engine } = makeEngine({ client });
+		// `refreshIntervalMs` is shared with the `sync.lock` refresher
+		// (both run from the same option) — 20 ms is well below any
+		// pullRebase duration, including the artificial 120 ms above.
+		(engine as unknown as { opts: { refreshIntervalMs: number } }).opts.refreshIntervalMs = 20;
+
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(mtimeAtStart).toBeGreaterThan(0);
+		// Strict-greater asserts the refresher fired at least once during
+		// the held window. If this fails, the `setInterval` wiring inside
+		// `withPullLock` is gone and long conflict rounds can lose the lock.
+		expect(mtimeAtEnd).toBeGreaterThan(mtimeAtStart);
 	});
 });
 
@@ -1971,14 +2096,18 @@ describe("SyncEngine.runRound — extra coverage (commit summary, migration file
 
 describe("SyncEngine.runRound — auto-reconcile dirty vault (§0.9)", () => {
 	it("auto-stages + commits dirty vault before pullRebase", async () => {
-		const hasUncommittedChanges = vi
-			.fn<() => Promise<boolean>>()
-			.mockResolvedValueOnce(true) // pre-pullRebase: dirty
-			.mockResolvedValue(false); // later checks: clean
-		const stageAll = vi.fn(async () => undefined);
+		// Post-R9: the auto-reconcile gate uses `hasOwnedDirtyPaths`
+		// (statusPorcelainZ + classifier) instead of plain
+		// `hasUncommittedChanges`. Drive the dirty signal via porcelain
+		// — a brand-new owned summary under `<repoFolder>/.jolli/...`
+		// classifies as owned and trips the reconcile path.
+		const summaryPath = `myrepo/.jolli/summaries/${"d".repeat(40)}.json`;
+		const statusPorcelainZ = vi.fn(async () => [
+			{ path: summaryPath, indexStatus: "!", worktreeStatus: "!", oldPath: undefined },
+		]);
 		const commit = vi.fn(async (_msg: string, _author: { name: string; email: string }) => "deadbeef");
 		const pullRebase = vi.fn(async () => ({ fastForwarded: false, conflicted: [] }));
-		const client = makeGitClient({ hasUncommittedChanges, stageAll, commit, pullRebase });
+		const client = makeGitClient({ statusPorcelainZ, commit, pullRebase });
 		const { engine } = makeEngine({ client });
 		const result = await engine.runRound(ROUND);
 		expect(result.newState).toBe("synced");
@@ -1986,7 +2115,7 @@ describe("SyncEngine.runRound — auto-reconcile dirty vault (§0.9)", () => {
 		// happened, pullRebase happened after.
 		const commitFirstMsg = commit.mock.calls[0]?.[0];
 		expect(typeof commitFirstMsg === "string" && commitFirstMsg).toMatch(/reconcile|user-modified/);
-		expect(stageAll).toHaveBeenCalled();
+		expect(statusPorcelainZ).toHaveBeenCalled();
 		expect(pullRebase).toHaveBeenCalled();
 	});
 
@@ -2009,23 +2138,28 @@ describe("SyncEngine.runRound — auto-reconcile dirty vault (§0.9)", () => {
 		// commit. Without this, the truncated/half-written aggregate
 		// would land on the orphan history and peers would crash on
 		// parse.
+		// Post-R9: gate is classifier-aware, so the corrupt JSON must live
+		// under a repo folder (`myrepo/.jolli/summaries/...`) to classify
+		// as owned. Root `.jolli/summaries/...` would classify as null
+		// (only `repos.json` is recognized at the vault root) and the
+		// gate would idle-skip.
 		const vault = join(tempDir, "vault");
-		await mkdir(join(vault, ".jolli", "summaries"), { recursive: true });
-		const corruptRel = ".jolli/summaries/half.json";
-		const cleanRel = ".jolli/summaries/whole.json";
+		await mkdir(join(vault, "myrepo", ".jolli", "summaries"), { recursive: true });
+		const corruptRel = `myrepo/.jolli/summaries/${"a".repeat(40)}.json`;
+		const cleanRel = `myrepo/.jolli/summaries/${"b".repeat(40)}.json`;
 		await writeFile(join(vault, corruptRel), '{"truncated":');
 		await writeFile(join(vault, cleanRel), JSON.stringify({ ok: true }));
 
-		const hasUncommittedChanges = vi
-			.fn<() => Promise<boolean>>()
-			.mockResolvedValueOnce(true)
-			.mockResolvedValue(false);
+		const statusPorcelainZ = vi.fn(async () => [
+			{ path: corruptRel, indexStatus: "!", worktreeStatus: "!", oldPath: undefined },
+			{ path: cleanRel, indexStatus: "!", worktreeStatus: "!", oldPath: undefined },
+		]);
 		const listDirtyPaths = vi.fn(async () => [corruptRel, cleanRel] as ReadonlyArray<string>);
 		const stageAll = vi.fn(async () => undefined);
 		const commit = vi.fn(async () => "deadbeef");
 		const pullRebase = vi.fn(async () => ({ fastForwarded: false, conflicted: [] }));
 		const client = makeGitClient({
-			hasUncommittedChanges,
+			statusPorcelainZ,
 			listDirtyPaths,
 			stageAll,
 			commit,
@@ -2041,8 +2175,10 @@ describe("SyncEngine.runRound — auto-reconcile dirty vault (§0.9)", () => {
 		// quarantined.
 		await expect(stat(join(vault, cleanRel))).resolves.toBeDefined();
 		// Quarantined file landed under `.jolli-quarantine-corrupt/` with
-		// the slash-encoded safe name.
-		const qStat = await stat(join(vault, ".jolli-quarantine-corrupt", ".jolli-summaries-half.json"));
+		// the slash-encoded safe name (`/` → `-`).
+		const qStat = await stat(
+			join(vault, ".jolli-quarantine-corrupt", `myrepo-.jolli-summaries-${"a".repeat(40)}.json`),
+		);
 		expect(qStat.isFile()).toBe(true);
 	});
 
@@ -2211,60 +2347,21 @@ describe("SyncEngine.runRound — first-bind migration push surfaces classified 
 	});
 });
 
-// §P2 / I6 — sweepSymlinks-failure must now drop the round to offline
-// with a `symlink_quarantine_failed` terminal code. Pre-fix the failure was
-// WARN-and-continue, so a hostile symlink would survive into `git add --all`.
-// We trigger a real `failed > 0` by placing a regular file at the quarantine
-// path (`ensureQuarantineDir` refuses) AND a real symlink in the vault
-// (`found.length > 0`). The sweep then reports every found symlink as
-// failed.
-import { platform } from "node:os";
-
-const skipSymlinkOnWindows = platform() === "win32";
-describe.skipIf(skipSymlinkOnWindows)("SyncEngine.runRound — symlink sweep terminal (plan §P2 / I6)", () => {
-	async function plantHostileSweepState(vault: string): Promise<void> {
-		// `.jolli-quarantine-symlinks` is the quarantine dir name
-		// (`QUARANTINE_SYMLINKS_DIR`). Placing a regular file there forces
-		// `ensureQuarantineDir` down its "neither directory nor symlink"
-		// branch, which returns false and marks every found symlink as
-		// failed.
-		await writeFile(join(vault, ".jolli-quarantine-symlinks"), "blocker");
-		// Need at least one symlink under the vault so `found.length > 0`,
-		// otherwise the sweep returns `failed: 0` regardless of the
-		// quarantine state. Target need not exist — `lstat` is enough.
-		await symlink("/tmp/does-not-exist", join(vault, "hostile-link"));
-	}
-
-	it("pre-round sweep failure terminates the round before fetch/pull/push", async () => {
-		await plantHostileSweepState(join(tempDir, "vault"));
-		const { engine, client } = makeEngine();
-		const result = await engine.runRound(ROUND);
-		expect(result.newState).toBe("offline");
-		expect(result.lastError?.code).toBe("symlink_quarantine_failed");
-		expect(result.lastError?.message).toContain("pre-round");
-		expect(result.lastError?.message).toContain("hostile-link");
-		// Pre-round sweep blocks BEFORE stage/commit/push.
-		expect(client.stageAll).not.toHaveBeenCalled();
-		expect(client.commit).not.toHaveBeenCalled();
-		expect(client.push).not.toHaveBeenCalled();
-		// `fetched: true` per the engine contract (mint + fetch succeeded
-		// before sweep), `pulled: false` because pullRebase runs later.
-		expect(result.fetched).toBe(true);
-		expect(result.pulled).toBe(false);
-		expect(result.pushed).toBe(false);
-	});
-
-	it("happy path is unaffected when no symlinks exist", async () => {
-		// Sanity: the vault fixture has no symlinks, no hostile
-		// quarantine blocker, so sweep returns clean and the round
-		// continues to `synced`. Guards against the new branch
-		// accidentally short-circuiting clean rounds.
-		const { engine } = makeEngine();
-		const result = await engine.runRound(ROUND);
-		expect(result.newState).toBe("synced");
-		expect(result.lastError).toBeUndefined();
-	});
-});
+// §P2 / I6 — the old `sweepSymlinks` round-terminal path was REMOVED in
+// Phase 1 along with the SymlinkSweep module. The replacement defences
+// (stageVault's per-entry `symlinked` canary bucket + FolderStorage's
+// `safeAtomicWriteSync` refusing to traverse a hostile intermediate
+// symlink) are exercised in their own unit tests:
+//   - StageVault.test.ts  → "refuses to stage a path whose LEAF is a symlink"
+//                         + "refuses to stage when an INTERMEDIATE path
+//                            segment is a symlink"
+//   - VaultSymlinkGuard.test.ts → full chain-walk and ENOENT cases
+//
+// Keeping a SyncEngine-level integration test for this would re-test
+// the same code path through three layers; the unit-level coverage is
+// the load-bearing surface. If a sweep-style regression ever surfaces,
+// the StageVault canary's `symlinked` warn log will flag it on the
+// first round.
 
 describe("SyncEngine.runRound — state change callback is robust", () => {
 	it("swallows a throwing onStateChange so the round result still propagates", async () => {
@@ -2275,5 +2372,379 @@ describe("SyncEngine.runRound — state change callback is robust", () => {
 		});
 		const result = await engine.runRound(ROUND);
 		expect(result.newState).toBe("synced");
+	});
+});
+
+describe("SyncEngine.runRound — stale rebase self-heal (Layer 1)", () => {
+	// The vault working tree is exclusively driven by SyncEngine, so a
+	// rebase paused at round start is unambiguous evidence that a previous
+	// round was killed mid-flight (VSIX reinstall, laptop sleep, crash).
+	// The engine self-heals via `rebaseAbort` so the customer doesn't have
+	// to `cd` into the vault and run git commands by hand.
+
+	it("aborts a stale rebase and proceeds to synced when the probe returns true", async () => {
+		const rebaseAbort = vi.fn(async () => undefined);
+		const isRebaseInProgress = vi.fn(async () => true);
+		const { engine, client } = makeEngine({
+			client: makeGitClient({ isRebaseInProgress, rebaseAbort }),
+		});
+		const result = await engine.runRound(ROUND);
+		expect(client.isRebaseInProgress).toHaveBeenCalled();
+		expect(rebaseAbort).toHaveBeenCalledTimes(1);
+		expect(result.newState).toBe("synced");
+	});
+
+	it("does NOT call rebaseAbort on a clean vault (no probe false-positive)", async () => {
+		const rebaseAbort = vi.fn(async () => undefined);
+		const { engine } = makeEngine({
+			client: makeGitClient({ rebaseAbort }), // default probe returns false
+		});
+		const result = await engine.runRound(ROUND);
+		expect(rebaseAbort).not.toHaveBeenCalled();
+		expect(result.newState).toBe("synced");
+	});
+
+	it("continues the round when rebaseAbort itself fails (real error surfaces downstream)", async () => {
+		// Last-resort safety net: if `git rebase --abort` somehow fails
+		// (corrupt state files, disk full, etc.), the round must not bail
+		// in the self-heal step — fetch / pullRebase below will surface a
+		// real, actionable error code instead of swallowing this one.
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				isRebaseInProgress: vi.fn(async () => true),
+				rebaseAbort: vi.fn(async () => {
+					throw new Error("rebase --abort: corrupt state");
+				}),
+			}),
+		});
+		const result = await engine.runRound(ROUND);
+		// Stub `pullRebase` is happy → round completes; the point is that
+		// rebaseAbort throwing did not short-circuit the round.
+		expect(result.newState).toBe("synced");
+	});
+
+	it("survives a throwing probe (e.g. stat() permission error) and continues", async () => {
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				isRebaseInProgress: vi.fn(async () => {
+					throw new Error("EACCES");
+				}),
+			}),
+		});
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+	});
+
+	it("calls sweepStaleLockFiles on every round (default no-op when nothing to remove)", async () => {
+		const sweepStaleLockFiles = vi.fn(async () => ({ removed: [] }));
+		const { engine } = makeEngine({
+			client: makeGitClient({ sweepStaleLockFiles }),
+		});
+		await engine.runRound(ROUND);
+		expect(sweepStaleLockFiles).toHaveBeenCalledTimes(1);
+	});
+
+	it("logs and proceeds when sweepStaleLockFiles removes stale .git/*.lock files", async () => {
+		// Realistic shape: previous round was SIGKILL'd while writing the
+		// index, leaving `.git/index.lock`. The sweep removes it and the
+		// round continues normally — without the sweep the next `git add`
+		// would fail with a sticky terminal error.
+		const sweepStaleLockFiles = vi.fn(async () => ({
+			removed: ["/vault/.git/index.lock"],
+		}));
+		const { engine } = makeEngine({
+			client: makeGitClient({ sweepStaleLockFiles }),
+		});
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+	});
+
+	it("continues the round when sweepStaleLockFiles itself throws", async () => {
+		const sweepStaleLockFiles = vi.fn(async () => {
+			throw new Error("EACCES on .git/");
+		});
+		const { engine } = makeEngine({
+			client: makeGitClient({ sweepStaleLockFiles }),
+		});
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+	});
+});
+
+describe("SyncEngine.runRound — idle-round short-circuit (perf)", () => {
+	// When local HEAD already matches origin/<branch> AND the working tree
+	// is clean, stageAll/commit/push/notify-push are guaranteed no-ops. The
+	// engine should skip them to avoid ~2-3s of process spawns + network
+	// round-trips on every idle poll tick.
+
+	const ALIGNED_OID = "abcd1234abcd1234abcd1234abcd1234abcd1234";
+
+	it("skips stageAll/commit/push when local HEAD === origin/<branch> and tree is clean", async () => {
+		const stageAll = vi.fn(async () => undefined);
+		const commit = vi.fn(async () => ALIGNED_OID);
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: true }));
+		const { engine, backend } = makeEngine({
+			client: makeGitClient({
+				stageAll,
+				commit,
+				push,
+				currentHead: vi.fn(async () => ALIGNED_OID),
+				revParse: vi.fn(async () => ALIGNED_OID),
+				hasUncommittedChanges: vi.fn(async () => false),
+			}),
+		});
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(stageAll).not.toHaveBeenCalled();
+		expect(commit).not.toHaveBeenCalled();
+		expect(push).not.toHaveBeenCalled();
+		// notify-push is downstream of push — also must not fire.
+		expect(backend.notifyPush).not.toHaveBeenCalled();
+	});
+
+	it("does NOT short-circuit when the working tree has uncommitted changes", async () => {
+		// e.g. `bootstrap.ensureBootstrap` just wrote a fresh `.gitignore`
+		// that needs committing + pushing so peers see the new ignores.
+		// Post-P1 #1: the idle gate is `statusPorcelainZ` + classifier
+		// rather than the old plain-status `hasUncommittedChanges`, so
+		// the fixture surfaces the `.gitignore` write via porcelain (with
+		// status `M` for modified — `.gitignore` is the one path the
+		// deny-all template explicitly re-allows, so it appears as
+		// modified, not ignored). The classifier maps it to
+		// `root-gitignore` → dirty-owned → round proceeds to stage/commit/push.
+		const statusPorcelainZ = vi.fn(async () => [
+			{
+				path: ".gitignore",
+				indexStatus: " ",
+				worktreeStatus: "M",
+				oldPath: undefined,
+			},
+		]);
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: true }));
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				statusPorcelainZ,
+				push,
+				currentHead: vi.fn(async () => ALIGNED_OID),
+				revParse: vi.fn(async () => ALIGNED_OID),
+				hasUncommittedChanges: vi.fn(async () => true),
+			}),
+		});
+		await engine.runRound(ROUND);
+		expect(statusPorcelainZ).toHaveBeenCalled();
+		expect(push).toHaveBeenCalled();
+	});
+
+	it("does NOT short-circuit when a brand-new owned file is gitignored-but-dirty (deny-all .gitignore)", async () => {
+		// Regression guard for P1 #1.
+		//
+		// The engine-managed `.gitignore` is `*` + `!.gitignore`, so every
+		// FolderStorage-produced summary / aggregate / Markdown is IGNORED
+		// (not UNTRACKED) by git. Plain `git status --porcelain` (no
+		// `--ignored`) omits ignored files entirely, so the previous gate
+		// `hasUncommittedChanges()` returned false on a freshly-onboarded
+		// repo folder whose only local change was a brand-new owned summary.
+		// Combined with `localHead === remoteHead` (HEAD hasn't moved
+		// locally because nothing has been committed yet), the idle
+		// short-circuit fired and the round reported `synced` without ever
+		// staging or pushing the file. The user saw a green checkmark; the
+		// remote never received the data.
+		//
+		// The new gate uses `statusPorcelainZ` (which includes ignored
+		// files via `--ignored=matching`) + `classifyVaultPath` so any
+		// owned-but-ignored entry forces the round through stage / commit /
+		// push.
+		const summaryPath = `myrepo/.jolli/summaries/${"a".repeat(40)}.json`;
+		const statusPorcelainZ = vi.fn(async () => [
+			// A brand-new summary written by FolderStorage. Status `!` =
+			// ignored (deny-all `.gitignore`); classifier maps it to
+			// `summary` so it must NOT be treated as idle.
+			{
+				path: summaryPath,
+				indexStatus: "!",
+				worktreeStatus: "!",
+				oldPath: undefined,
+			},
+		]);
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: true }));
+		const commit = vi.fn(async () => ALIGNED_OID);
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				statusPorcelainZ,
+				push,
+				commit,
+				currentHead: vi.fn(async () => ALIGNED_OID),
+				revParse: vi.fn(async () => ALIGNED_OID),
+				// The legacy gate would return false here (gitignored ⇒
+				// invisible to plain porcelain). The new gate ignores
+				// this return value entirely — only `statusPorcelainZ`
+				// + classifier decides idleness.
+				hasUncommittedChanges: vi.fn(async () => false),
+			}),
+		});
+		await engine.runRound(ROUND);
+		// The short-circuit MUST have been bypassed — both commit and push
+		// are downstream of the gate, so seeing either fire proves the
+		// gate let the round through. (We don't assert on `stageAddPaths`
+		// because `stageVault`'s symlink-guard lstat would reject a path
+		// the test fixture never wrote to disk, and that's stageVault's
+		// own concern — not the gate's.)
+		expect(push).toHaveBeenCalled();
+		expect(commit).toHaveBeenCalled();
+	});
+
+	it("does NOT short-circuit when a rename moves an owned path to an unowned location (R2)", async () => {
+		// Regression for R2.
+		//
+		// Porcelain emits a rename as a single entry with `path = newPath`
+		// + `oldPath = oldPath`. `stageVault.decomposeOps` decomposes it
+		// into `del(old) + add(new)` and classifies each side
+		// independently — so a rename FROM `<repo>/.jolli/notes/x.md`
+		// (owned) TO `<repo>/random/x.md` (unowned) emits a real
+		// `git rm --cached` for the owned old side. The idle gate must
+		// mirror that bifurcation: classifying only the new side would
+		// see `null` (unowned), trip the short-circuit, and leave the
+		// del-of-owned uncommitted until the next non-idle round
+		// happened to bundle it in.
+		const statusPorcelainZ = vi.fn(async () => [
+			{
+				path: "myrepo/random/moved-note.md", // new (unowned)
+				indexStatus: "R",
+				worktreeStatus: " ",
+				oldPath: "myrepo/.jolli/notes/moved-note.md", // old (owned)
+			},
+		]);
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: true }));
+		const commit = vi.fn(async () => ALIGNED_OID);
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				statusPorcelainZ,
+				push,
+				commit,
+				currentHead: vi.fn(async () => ALIGNED_OID),
+				revParse: vi.fn(async () => ALIGNED_OID),
+				hasUncommittedChanges: vi.fn(async () => false),
+			}),
+		});
+		await engine.runRound(ROUND);
+		// Round must NOT idle-skip — both commit and push fire so the
+		// del-of-owned makes it onto the remote in this round, not the
+		// next one.
+		expect(push).toHaveBeenCalled();
+		expect(commit).toHaveBeenCalled();
+	});
+
+	it("STILL short-circuits when the only dirty entry is unowned (sentinel / OS noise)", async () => {
+		// Counterpart to the regression test above. The `.memorybank-state.json`
+		// sentinel sits at vault root and is `--ignored=matching` visible, but
+		// the classifier returns `null` for it (P3 #1). The idle gate must
+		// ignore unowned noise — otherwise every round would spin up a
+		// no-op stage/commit/push cycle just because the sentinel was on
+		// disk.
+		const statusPorcelainZ = vi.fn(async () => [
+			{
+				path: ".memorybank-state.json",
+				indexStatus: "!",
+				worktreeStatus: "!",
+				oldPath: undefined,
+			},
+		]);
+		const stageAddPaths = vi.fn(async () => undefined);
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: true }));
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				statusPorcelainZ,
+				stageAddPaths,
+				push,
+				currentHead: vi.fn(async () => ALIGNED_OID),
+				revParse: vi.fn(async () => ALIGNED_OID),
+				hasUncommittedChanges: vi.fn(async () => false),
+			}),
+		});
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(push).not.toHaveBeenCalled();
+		expect(stageAddPaths).not.toHaveBeenCalled();
+	});
+
+	it("does NOT short-circuit when local HEAD is ahead of origin (unpushed historical commit)", async () => {
+		// Simulates a previous round that committed but failed to push.
+		// We must push the lingering local commit on the next round.
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: true }));
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				push,
+				currentHead: vi.fn(async () => "local0000local0000local0000local0000aaaa"),
+				revParse: vi.fn(async () => "remote00remote00remote00remote00bbbb"),
+				hasUncommittedChanges: vi.fn(async () => false),
+			}),
+		});
+		await engine.runRound(ROUND);
+		expect(push).toHaveBeenCalled();
+	});
+
+	it("does NOT short-circuit when origin/<branch> doesn't exist (empty-remote first-bind)", async () => {
+		// `refExists` returns false → `remoteHasDefault` is false → the
+		// short-circuit guard skips its block, and we proceed to push the
+		// initial state.
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: true }));
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				push,
+				refExists: vi.fn(async () => false),
+				currentHead: vi.fn(async () => ALIGNED_OID),
+				hasUncommittedChanges: vi.fn(async () => false),
+			}),
+		});
+		await engine.runRound(ROUND);
+		expect(push).toHaveBeenCalled();
+	});
+
+	it("does NOT short-circuit when pullRebase fast-forwarded a peer commit (keep step-6 symlink sweep)", async () => {
+		// Defence-in-depth: peer-pushed content landed in the working tree
+		// via pullRebase. The step-6 pre-stage symlink sweep is the
+		// designed wall against a peer-pushed symlink reaching the working
+		// tree post-pull; skipping the rest of the round here would defer
+		// that quarantine to the next poll (default 90 min). Even with
+		// local HEAD now matching origin/<branch>, we must continue
+		// through step 6 → stageVault → commit (no-op) → push (no-op).
+		// Post-Phase-1: assert statusPorcelainZ (stageVault's entry call).
+		const statusPorcelainZ = vi.fn(async () => []);
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: true }));
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				statusPorcelainZ,
+				push,
+				pullRebase: vi.fn(async () => ({ fastForwarded: true, conflicted: [] })),
+				currentHead: vi.fn(async () => ALIGNED_OID),
+				revParse: vi.fn(async () => ALIGNED_OID),
+				hasUncommittedChanges: vi.fn(async () => false),
+			}),
+		});
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		// stageVault must run so step 6's sweep + the no-op stage path
+		// executes; push is allowed to fire (idempotent on "Everything
+		// up-to-date").
+		expect(statusPorcelainZ).toHaveBeenCalled();
+	});
+
+	it("falls through to normal commit/push when the short-circuit probe throws", async () => {
+		// Defensive: a probe failure (e.g. revParse threw) must NOT block
+		// the round — fall through to stageAll → commit → push, whose own
+		// no-op branches preserve correctness.
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: true }));
+		const { engine } = makeEngine({
+			client: makeGitClient({
+				push,
+				revParse: vi.fn(async () => {
+					throw new Error("rev-parse exploded");
+				}),
+				hasUncommittedChanges: vi.fn(async () => false),
+			}),
+		});
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(push).toHaveBeenCalled();
 	});
 });
