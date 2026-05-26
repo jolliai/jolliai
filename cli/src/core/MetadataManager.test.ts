@@ -377,10 +377,7 @@ describe("MetadataManager", () => {
 
 			const fixed = manager.reconcile(kbRoot);
 			expect(fixed).toBe(1);
-			// Normalize path separators — reconcile uses platform-native separators
-			// (backslash on Windows, slash on POSIX). The stored value is the
-			// platform-correct one; tests run on both.
-			expect(manager.findById("abc")?.path.replace(/\\/g, "/")).toBe("other/test.md");
+			expect(manager.findById("abc")?.path).toBe("other/test.md");
 		});
 
 		it("no changes when files are in place", () => {
@@ -415,8 +412,8 @@ describe("MetadataManager", () => {
 			const fixed = manager.reconcile(kbRoot);
 			// No fingerprint match for B; A stays unchanged.
 			expect(fixed).toBe(0);
-			expect(manager.findById("A")?.path.replace(/\\/g, "/")).toBe("main/present.md");
-			expect(manager.findById("B")?.path.replace(/\\/g, "/")).toBe("main/gone.md");
+			expect(manager.findById("A")?.path).toBe("main/present.md");
+			expect(manager.findById("B")?.path).toBe("main/gone.md");
 		});
 
 		it("walkDir skips dot-prefixed dirs and non-md files while scanning fingerprints", () => {
@@ -434,8 +431,7 @@ describe("MetadataManager", () => {
 
 			const fixed = manager.reconcile(kbRoot);
 			expect(fixed).toBe(1);
-			// Normalize path separators — same rationale as the move-by-fingerprint test above.
-			expect(manager.findById("abc")?.path.replace(/\\/g, "/")).toBe("main/moved.md");
+			expect(manager.findById("abc")?.path).toBe("main/moved.md");
 		});
 	});
 

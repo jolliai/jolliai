@@ -14,7 +14,20 @@ export interface StorageProvider {
 	 */
 	writeFiles(files: FileWrite[], message: string): Promise<void>;
 
-	/** List files under a prefix path. */
+	/**
+	 * List files under a prefix path.
+	 *
+	 * Returned paths use forward-slash separators (`/`) regardless of host OS.
+	 * This mirrors `git ls-tree`'s output (the format the orphan-branch backend
+	 * inherits) and lets downstream consumers (e.g. `SummaryStore.getTranscriptHashes`'s
+	 * `transcripts/<hash>.json` regex) match without per-platform branching.
+	 *
+	 * Implementations that walk a filesystem (FolderStorage) MUST normalize via
+	 * `toForwardSlash` before returning — `node:path.relative` emits backslashes
+	 * on Windows, and an un-normalized return value silently fails every
+	 * forward-slash regex on the consumer side. See the FolderStorage Windows
+	 * path bug (2026-05-26) for the cautionary tale.
+	 */
 	listFiles(prefix: string): Promise<string[]>;
 
 	/** Check if the storage backend is initialized. */

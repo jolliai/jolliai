@@ -29,7 +29,7 @@ import {
 import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
 import { MetadataManager } from "../../cli/src/core/MetadataManager.js";
 import { OrphanBranchStorage } from "../../cli/src/core/OrphanBranchStorage.js";
-import { normalizePathForCompare } from "../../cli/src/core/PathUtils.js";
+import { normalizePathForCompare, toForwardSlash } from "../../cli/src/core/PathUtils.js";
 import {
 	loadConfig,
 	savePluginSource,
@@ -1978,9 +1978,9 @@ export class JolliMemoryBridge {
 		try {
 			const { repos } = await this.getDiscoveryCached();
 			const absNormalized = normalizePathForCompare(absPath);
-			const absSlashed = absPath.replace(/\\/g, "/");
+			const absSlashed = toForwardSlash(absPath);
 			for (const repo of repos) {
-				const kbRootSlashed = repo.kbRoot.replace(/\\/g, "/");
+				const kbRootSlashed = toForwardSlash(repo.kbRoot);
 				const prefixSlashed = kbRootSlashed.endsWith("/")
 					? kbRootSlashed
 					: `${kbRootSlashed}/`;

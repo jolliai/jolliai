@@ -33,3 +33,29 @@ export function normalizePathForCompare(p: string): string {
 	if (end !== unified.length) unified = unified.slice(0, end);
 	return process.platform === "win32" || process.platform === "darwin" ? unified.toLowerCase() : unified;
 }
+
+/**
+ * Converts a filesystem path to forward-slash form (POSIX-style).
+ *
+ * Single-purpose helper: replaces `\` with `/`, does NOT touch case, does NOT
+ * strip trailing slashes, does NOT resolve `..`. Use this when the path will
+ * be matched against a forward-slash literal (regex, string prefix, sidebar
+ * key, manifest entry), so the matcher does not have to know the host OS.
+ *
+ * Why a dedicated helper instead of inlining `.replace(/\\/g, "/")`:
+ *   - The repo accumulated 15+ private copies of that one-liner; a shared
+ *     name makes the intent ("normalize for forward-slash matching") explicit
+ *     and gives a single grep target if the contract ever needs to change.
+ *   - {@link normalizePathForCompare} also strips trailing slashes AND lower-
+ *     cases on case-insensitive platforms, so it must NOT be used here — both
+ *     side-effects would corrupt the path before downstream consumers (e.g.
+ *     `getTranscriptHashes`, manifest map values) see it.
+ *
+ * Real-world bug this prevents: `FolderStorage.walkDir` once returned
+ * `transcripts\<hash>.json` on Windows, which broke every downstream regex
+ * that hard-coded `transcripts/`. Forcing all path emitters through this
+ * helper turns the contract into a single grep + a single function body.
+ */
+export function toForwardSlash(p: string): string {
+	return p.replace(/\\/g, "/");
+}

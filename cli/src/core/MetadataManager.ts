@@ -14,6 +14,7 @@ import { dirname, join, relative } from "node:path";
 import { createLogger } from "../Logger.js";
 import { tryMarkHiddenOnWindows } from "../util/WindowsHidden.js";
 import type { BranchesJson, BranchMapping, KBConfig, Manifest, ManifestEntry, MigrationState } from "./KBTypes.js";
+import { toForwardSlash } from "./PathUtils.js";
 
 const log = createLogger("MetadataManager");
 
@@ -322,7 +323,7 @@ export class MetadataManager {
 				try {
 					const content = readFileSync(fullPath, "utf-8");
 					const fp = MetadataManager.sha256(content);
-					map.set(fp, relative(kbRoot, fullPath).replace(/\\/g, "/"));
+					map.set(fp, toForwardSlash(relative(kbRoot, fullPath)));
 				} catch {
 					/* ignore */
 				}

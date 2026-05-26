@@ -14,7 +14,8 @@
  */
 
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join, relative, sep } from "node:path";
+import { basename, extname, join, relative } from "node:path";
+import { toForwardSlash } from "../core/PathUtils.js";
 import { sanitizeUrl } from "./Sanitize.js";
 import type { HeaderItem, SidebarItemValue, SidebarOverrides } from "./Types.js";
 
@@ -301,7 +302,7 @@ async function processDir(
 
 	// Compute the path key for sidebar override lookup (e.g. "/", "/get-started")
 	const relPath = relative(contentDir, dir);
-	const pathKey = `/${relPath.split(sep).join("/")}`.replace(/\/$/, "") || "/";
+	const pathKey = `/${toForwardSlash(relPath)}`.replace(/\/$/, "") || "/";
 
 	const override = sidebarOverrides?.[pathKey];
 	const indexHasAsIndexPage = await detectAsIndexPage(dir, contentItems);
