@@ -224,13 +224,29 @@ ${buildPrMessageScript()}
     if (msg.command === 'summaryRegenerated') {
       if (msg.topicsHtml) replaceSection('topicsSection', msg.topicsHtml);
       if (msg.recapHtml) replaceSection('recapSection', msg.recapHtml);
+      // Banner replace/remove: empty string → remove existing banner;
+      // non-empty → replace existing (outerHTML) or insert at top of .page.
+      // The click delegate (attachRegenerateSummaryDelegate) is bound on
+      // .page so any newly-inserted #summaryErrorRegenerateBtn is picked
+      // up without re-binding.
+      if (typeof msg.summaryErrorBannerHtml === 'string') {
+        var existingBanner = document.querySelector('.summary-error-banner');
+        if (msg.summaryErrorBannerHtml === '') {
+          if (existingBanner) existingBanner.remove();
+        } else if (existingBanner) {
+          existingBanner.outerHTML = msg.summaryErrorBannerHtml;
+        } else {
+          var pageRoot = document.querySelector('.page');
+          if (pageRoot) pageRoot.insertAdjacentHTML('afterbegin', msg.summaryErrorBannerHtml);
+        }
+      }
       leaveRegeneratingReadonly();
       // Re-attach handlers on the NEW DOM nodes inside topics + recap.
-      // NOTE: do NOT re-attach attachRegenerateSummaryHandler — the
-      // Regenerate button lives in the Conversations card, OUTSIDE
-      // topicsSection / recapSection, so replaceSection never touched it
-      // and its original listener is still bound. Re-attaching would add
-      // a duplicate listener each regenerate.
+      // NOTE: the Regenerate buttons (#regenerateSummaryBtn in the
+      // Conversations card AND #summaryErrorRegenerateBtn in the banner)
+      // are reached via an event delegate on .page (see
+      // attachRegenerateSummaryDelegate), so they keep working through
+      // DOM replacement without any re-binding.
       attachEditRecapHandler();
       attachGenerateRecapHandler();
       var newTopicsRoot = document.getElementById('topicsSection');
@@ -639,31 +655,45 @@ ${buildPrMessageScript()}
   }
   attachGenerateRecapHandler();
 
-  // ── Regenerate-summary click handler + DOM helpers ─────────────────────
-  // Drives the end-to-end re-run from the Conversations card. The actual
-  // confirm dialog + LLM call lives on the extension host; this side only
-  // gates the click and renders progress state.
-  function attachRegenerateSummaryHandler() {
-    var btn = document.getElementById('regenerateSummaryBtn');
-    if (!btn) return;
-    btn.addEventListener('click', function(e) {
+  // ── Regenerate-summary shared request + delegated click handlers ────────
+  // Drives the end-to-end re-run from either entry point:
+  //   - The Conversations card's #regenerateSummaryBtn (in the initial DOM)
+  //   - The top-of-page #summaryErrorRegenerateBtn (banner; may be inserted
+  //     dynamically by the summaryRegenerated handler — event delegation
+  //     means we don't need to re-bind after DOM replacement)
+  // Both go through the same guards (unsaved edits + in-flight LLM) so the
+  // banner button can't bypass them. The actual confirm dialog + LLM call
+  // lives on the extension host; this side only gates the click and
+  // renders progress state.
+  function requestRegenerateSummary(btn) {
+    if (btn && btn.disabled) return;
+    // Block when user has unsaved edits in topics or recap — otherwise a
+    // 30-second LLM call would silently overwrite in-progress work.
+    if (document.querySelector('#topicsSection .toggle.editing, #recapSection.recap-editing')) {
+      alert('You have unsaved edits in topics or recap. Save or cancel them before regenerating.');
+      return;
+    }
+    // Block when another LLM action is already in flight.
+    if (document.querySelector('.generating')) {
+      alert('Another action is in progress. Please wait for it to finish.');
+      return;
+    }
+    vscode.postMessage({ command: 'regenerateSummary' });
+  }
+
+  function attachRegenerateSummaryDelegate() {
+    var page = document.querySelector('.page');
+    if (!page) return;
+    page.addEventListener('click', function(e) {
+      var target = e.target;
+      if (!target || typeof target.closest !== 'function') return;
+      var btn = target.closest('#regenerateSummaryBtn, #summaryErrorRegenerateBtn');
+      if (!btn) return;
       e.stopPropagation();
-      if (btn.disabled) return;
-      // Block when user has unsaved edits in topics or recap — otherwise a
-      // 30-second LLM call would silently overwrite in-progress work.
-      if (document.querySelector('#topicsSection .toggle.editing, #recapSection.recap-editing')) {
-        alert('You have unsaved edits in topics or recap. Save or cancel them before regenerating.');
-        return;
-      }
-      // Block when another LLM action is already in flight.
-      if (document.querySelector('.generating')) {
-        alert('Another action is in progress. Please wait for it to finish.');
-        return;
-      }
-      vscode.postMessage({ command: 'regenerateSummary' });
+      requestRegenerateSummary(btn);
     });
   }
-  attachRegenerateSummaryHandler();
+  attachRegenerateSummaryDelegate();
 
   // Toggle the page into / out of regenerating-readonly mode. CSS
   // (.page.regenerating-readonly button:not([data-foreign-safe])) takes

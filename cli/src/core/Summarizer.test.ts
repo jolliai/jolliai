@@ -27,6 +27,7 @@ import {
 	parseSummaryResponse,
 	parseTopLevelFields,
 	resolveModelId,
+	type SquashConsolidationResult,
 	type SquashConsolidationSource,
 	TOP_LEVEL_MARKERS,
 	translateToEnglish,
@@ -2088,13 +2089,23 @@ Test reordering
 			config: mockConfig,
 		});
 
-		it("returns null when there are no sources", async () => {
+		// Type narrowing helper: lets the rest of the test body access the
+		// success-payload fields without `as` casts everywhere.
+		function assertOk(
+			outcome: Awaited<ReturnType<typeof generateSquashConsolidation>>,
+		): asserts outcome is { status: "ok" } & SquashConsolidationResult {
+			if (outcome.status !== "ok") {
+				throw new Error(`expected status="ok", got status="${outcome.status}"`);
+			}
+		}
+
+		it("returns no-content when there are no sources", async () => {
 			const result = await generateSquashConsolidation(params([]));
-			expect(result).toBeNull();
+			expect(result).toEqual({ status: "no-content" });
 			expect(mockCallLlm).not.toHaveBeenCalled();
 		});
 
-		it("returns null when every source has empty topics and no recap", async () => {
+		it("returns no-content when every source has empty topics and no recap", async () => {
 			const empty: SquashConsolidationSource = {
 				commitHash: "a",
 				commitDate: "2026-03-10T00:00:00Z",
@@ -2102,7 +2113,7 @@ Test reordering
 				topics: [],
 			};
 			const result = await generateSquashConsolidation(params([empty]));
-			expect(result).toBeNull();
+			expect(result).toEqual({ status: "no-content" });
 			expect(mockCallLlm).not.toHaveBeenCalled();
 		});
 
@@ -2113,10 +2124,10 @@ Test reordering
 				),
 			);
 			const result = await generateSquashConsolidation(params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]));
-			expect(result).not.toBeNull();
-			expect(result?.topics[0].title).toBe("Merged topic");
-			expect(result?.recap).toBe("A recap.");
-			expect(result?.ticketId).toBe("PROJ-1");
+			assertOk(result);
+			expect(result.topics[0].title).toBe("Merged topic");
+			expect(result.recap).toBe("A recap.");
+			expect(result.ticketId).toBe("PROJ-1");
 			expect(mockCallLlm).toHaveBeenCalledWith(
 				expect.objectContaining({
 					action: "squash-consolidate",
@@ -2167,12 +2178,12 @@ Test reordering
 
 			const result = await generateSquashConsolidation(params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]));
 
-			expect(result).not.toBeNull();
-			expect(result?.topics).toHaveLength(2);
-			expect(result?.recap).toBe("Consolidated recap that arrived after the last topic.");
+			assertOk(result);
+			expect(result.topics).toHaveLength(2);
+			expect(result.recap).toBe("Consolidated recap that arrived after the last topic.");
 			// Last topic's importance survived intact (no recap content glued onto it).
-			expect(result?.topics[1].title).toBe("Last merged topic");
-			expect(result?.topics[1].importance).toBe("minor");
+			expect(result.topics[1].title).toBe("Last merged topic");
+			expect(result.topics[1].importance).toBe("minor");
 		});
 
 		it("prefers the outer ticketId over the LLM-extracted one (priority chain)", async () => {
@@ -2184,7 +2195,8 @@ Test reordering
 			const result = await generateSquashConsolidation(
 				params([sourceWithTopic("a", "2026-03-10T00:00:00Z", "PER-A")], "OUTER-99"),
 			);
-			expect(result?.ticketId).toBe("OUTER-99");
+			assertOk(result);
+			expect(result.ticketId).toBe("OUTER-99");
 		});
 
 		it("falls back to the earliest source's ticketId when no outer ticketId and the LLM omits one", async () => {
@@ -2199,13 +2211,14 @@ Test reordering
 					sourceWithTopic("b", "2026-03-20T00:00:00Z", "FROM-B"),
 				]),
 			);
-			expect(result?.ticketId).toBe("FROM-A");
+			assertOk(result);
+			expect(result.ticketId).toBe("FROM-A");
 		});
 
-		it("returns null when the LLM produces no topics and no recap", async () => {
+		it("returns no-content when the LLM produces no topics and no recap", async () => {
 			mockCallLlm.mockResolvedValueOnce(summaryLlmResult(""));
 			const result = await generateSquashConsolidation(params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]));
-			expect(result).toBeNull();
+			expect(result).toEqual({ status: "no-content" });
 		});
 
 		it("retries once on transient API failure and returns the second attempt's result", async () => {
@@ -2216,14 +2229,15 @@ Test reordering
 				),
 			);
 			const result = await generateSquashConsolidation(params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]));
-			expect(result?.topics[0].title).toBe("Retried");
+			assertOk(result);
+			expect(result.topics[0].title).toBe("Retried");
 			expect(mockCallLlm).toHaveBeenCalledTimes(2);
 		});
 
-		it("returns null when both attempts fail", async () => {
+		it("returns llm-error when both attempts fail", async () => {
 			mockCallLlm.mockRejectedValueOnce(new Error("first")).mockRejectedValueOnce(new Error("second"));
 			const result = await generateSquashConsolidation(params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]));
-			expect(result).toBeNull();
+			expect(result).toEqual({ status: "llm-error" });
 			expect(mockCallLlm).toHaveBeenCalledTimes(2);
 		});
 
@@ -2249,7 +2263,8 @@ Test reordering
 				expect(calls[0][0].action).toBe("squash-consolidate");
 				expect(calls[1][0].action).toBe("squash-consolidate-strict");
 				expect(calls[1][0].params.previousResponse).toContain("## Consolidated Summary");
-				expect(result?.topics[0].title).toBe("Recovered");
+				assertOk(result);
+				expect(result.topics[0].title).toBe("Recovered");
 			});
 
 			it("sums LLM tokens across the two calls when squash strict-retry succeeds", async () => {
@@ -2270,9 +2285,10 @@ Test reordering
 				const result = await generateSquashConsolidation(
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
-				expect(result?.llm?.inputTokens).toBe(250);
-				expect(result?.llm?.outputTokens).toBe(180);
-				expect(result?.llm?.apiLatencyMs).toBe(2700);
+				assertOk(result);
+				expect(result.llm.inputTokens).toBe(250);
+				expect(result.llm.outputTokens).toBe(180);
+				expect(result.llm.apiLatencyMs).toBe(2700);
 			});
 
 			it("propagates source from the strict-retry result onto squash llm metadata", async () => {
@@ -2287,10 +2303,11 @@ Test reordering
 				const result = await generateSquashConsolidation(
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
-				expect(result?.llm?.source).toBe("jolli-proxy");
+				assertOk(result);
+				expect(result.llm.source).toBe("jolli-proxy");
 			});
 
-			it("falls through to null when both squash-consolidate and squash-consolidate-strict fail format check", async () => {
+			it("returns no-content when both squash-consolidate and squash-consolidate-strict fail format check", async () => {
 				mockCallLlm
 					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown))
 					.mockResolvedValueOnce(summaryLlmResult("more markdown ## still no delimiters"));
@@ -2298,18 +2315,18 @@ Test reordering
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
 				expect(mockCallLlm).toHaveBeenCalledTimes(2);
-				expect(result).toBeNull();
+				expect(result).toEqual({ status: "no-content" });
 			});
 
 			it("does NOT retry strict when first response is empty (format-compliant but no consolidation)", async () => {
 				// Empty response is format-compliant. Squash needs SOMETHING to consolidate, so
-				// we fall through to null (caller does mechanicalConsolidate) without burning a retry.
+				// we fall through to no-content (caller does mechanicalConsolidate) without burning a retry.
 				mockCallLlm.mockResolvedValueOnce(summaryLlmResult(""));
 				const result = await generateSquashConsolidation(
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
 				expect(mockCallLlm).toHaveBeenCalledTimes(1);
-				expect(result).toBeNull();
+				expect(result).toEqual({ status: "no-content" });
 			});
 
 			it("DOES retry strict on short non-compliant first response (length is no longer the gate)", async () => {
@@ -2324,10 +2341,11 @@ Test reordering
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
 				expect(mockCallLlm).toHaveBeenCalledTimes(2);
-				expect(result?.topics[0].title).toBe("Recovered");
+				assertOk(result);
+				expect(result.topics[0].title).toBe("Recovered");
 			});
 
-			it("falls through to null when squash-consolidate-strict throws", async () => {
+			it("returns llm-error when squash-consolidate-strict throws", async () => {
 				mockCallLlm
 					.mockResolvedValueOnce(summaryLlmResult(malformedMarkdown))
 					.mockRejectedValueOnce(new Error("strict retry transient error"));
@@ -2335,7 +2353,7 @@ Test reordering
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
 				expect(mockCallLlm).toHaveBeenCalledTimes(2);
-				expect(result).toBeNull();
+				expect(result).toEqual({ status: "llm-error" });
 			});
 
 			it("formats non-Error strict-retry throws via String(err) on the warn line", async () => {
@@ -2349,7 +2367,7 @@ Test reordering
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
 				expect(mockCallLlm).toHaveBeenCalledTimes(2);
-				expect(result).toBeNull();
+				expect(result).toEqual({ status: "llm-error" });
 			});
 
 			it("accepts strict-retry result with recap-only (zero topics)", async () => {
@@ -2367,8 +2385,9 @@ Test reordering
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
 				expect(mockCallLlm).toHaveBeenCalledTimes(2);
-				expect(result?.topics).toHaveLength(0);
-				expect(result?.recap).toContain("Recovered consolidation recap");
+				assertOk(result);
+				expect(result.topics).toHaveLength(0);
+				expect(result.recap).toContain("Recovered consolidation recap");
 			});
 
 			it('treats a null `text` field as empty string in the strict-retry assembly site (covers `?? ""`)', async () => {
@@ -2379,8 +2398,8 @@ Test reordering
 				const result = await generateSquashConsolidation(
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
-				// Empty text → format-compliant + no topics + no recap → fall through to null
-				expect(result).toBeNull();
+				// Empty text → format-compliant + no topics + no recap → fall through to no-content
+				expect(result).toEqual({ status: "no-content" });
 			});
 
 			it("falls back to resolveModelId when the LLM result omits model (covers `?? resolveModelId`)", async () => {
@@ -2397,7 +2416,8 @@ Test reordering
 				const result = await generateSquashConsolidation(
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
-				expect(result?.llm?.model).toBeTruthy();
+				assertOk(result);
+				expect(result.llm.model).toBeTruthy();
 			});
 
 			it("uses null stopReason when the LLM result omits it (covers `?? null` fallback)", async () => {
@@ -2413,7 +2433,8 @@ Test reordering
 				const result = await generateSquashConsolidation(
 					params([sourceWithTopic("a", "2026-03-10T00:00:00Z")]),
 				);
-				expect(result?.llm?.stopReason).toBeNull();
+				assertOk(result);
+				expect(result.llm.stopReason).toBeNull();
 			});
 		});
 	});

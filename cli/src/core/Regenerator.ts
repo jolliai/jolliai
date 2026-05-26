@@ -144,6 +144,11 @@ export async function regenerateSummary(
 		...(result.conversationTurns !== undefined ? { conversationTurns: result.conversationTurns } : {}),
 		diffStats: result.stats,
 		generatedAt: new Date().toISOString(),
+		// Successful regenerate clears any stale failure marker so the
+		// webview banner disappears on the next render. Explicit undefined
+		// instead of leaving the spread-in value alone: JSON.stringify
+		// drops undefined keys, so storeSummary persists a healthy summary.
+		summaryError: undefined,
 	};
 
 	return { updated, result };

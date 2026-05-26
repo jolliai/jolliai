@@ -125,6 +125,34 @@ describe("regenerateSummary", () => {
 		);
 	});
 
+	it("clears summaryError marker on successful regenerate", async () => {
+		const stale: CommitSummary = {
+			...baseSummary,
+			summaryError: "llm-failed",
+			topics: [],
+		};
+		const { updated } = await regenerateSummary(stale, "/repo", config);
+		expect(updated.summaryError).toBeUndefined();
+		expect(updated.topics).toEqual(successResult.topics);
+	});
+
+	it("also clears summaryError when the regenerate input had legacy stopReason='error' but no marker", async () => {
+		// Legacy summaries written before the summaryError field existed
+		// still surface in the banner via isSummaryError(stopReason==="error").
+		// Regenerate replaces `llm` wholesale with the new successResult,
+		// which has stopReason=null, so isSummaryError naturally returns
+		// false on the updated summary even though summaryError was never
+		// set on the input. This test pins that observable behavior.
+		const legacy: CommitSummary = {
+			...baseSummary,
+			llm: { model: "x", inputTokens: 0, outputTokens: 0, apiLatencyMs: 0, stopReason: "error" },
+			topics: [],
+		};
+		const { updated } = await regenerateSummary(legacy, "/repo", config);
+		expect(updated.summaryError).toBeUndefined();
+		expect(updated.llm?.stopReason).not.toBe("error");
+	});
+
 	it("replaces topics + recap; preserves ticketId, e2eTestGuide, and other fields", async () => {
 		const baseWithTicket: CommitSummary = {
 			...baseSummary,

@@ -1353,6 +1353,53 @@ export function buildCss(): string {
     background: var(--vscode-button-hoverBackground);
   }
 
+  /* Summary-error banner — shown at the top of the page when the last
+     LLM call failed (network, 5xx, credential, quota). Same chrome family
+     as .stale-banner but with a distinct visual weight so users with both
+     conditions active can tell them apart. Click delegate in
+     SummaryScriptBuilder routes #summaryErrorRegenerateBtn through the
+     shared requestRegenerateSummary() with the same unsaved-edits +
+     in-flight guards as #regenerateSummaryBtn. */
+  .summary-error-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 0 0 16px 0;
+    padding: 12px 16px;
+    background: var(--vscode-inputValidation-warningBackground, #5a4a1a);
+    border: 1px solid var(--vscode-inputValidation-warningBorder, #cca700);
+    border-radius: 6px;
+    color: var(--vscode-foreground);
+  }
+  .summary-error-banner-icon {
+    font-size: 18px;
+    line-height: 1;
+  }
+  .summary-error-banner-text {
+    flex: 1;
+    line-height: 1.5;
+  }
+  .summary-error-banner-action {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: none;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .summary-error-banner-action:hover {
+    background: var(--vscode-button-hoverBackground);
+  }
+  /* Read-only modes (foreign / stale-rewritten) hide the regenerate
+     affordance — same rationale as #regenerateSummaryBtn in the topics
+     section. The banner text still renders so the user knows why. */
+  .foreign-readonly .summary-error-banner-action,
+  .stale-readonly .summary-error-banner-action {
+    display: none;
+  }
+
 ${buildPrSectionCss()}
 `;
 }

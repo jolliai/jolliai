@@ -1017,6 +1017,56 @@ describe("SummaryStore", () => {
 			const migrated = JSON.parse(files[0].content) as CommitSummary;
 			expect(migrated.diffStats).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
 		});
+
+		it("Copy-Hoists summaryError from old summary onto the rebased root", async () => {
+			// Rebase-pick doesn't run the LLM, so a degraded old summary stays
+			// degraded on the new hash. Without this propagation the webview
+			// banner would silently disappear after rebase even though the
+			// underlying LLM failure was never resolved.
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			const oldSummary: CommitSummary = {
+				...createMockSummary("oldhash"),
+				summaryError: "llm-failed",
+			};
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const migrated = JSON.parse(files[0].content) as CommitSummary;
+			expect(migrated.summaryError).toBe("llm-failed");
+		});
+
+		it("upgrades legacy stopReason='error' on old summary to summaryError on the rebased root", async () => {
+			// Legacy summaries (pre-summaryError field) signal failure via
+			// llm.stopReason === "error". isSummaryError() honors both so the
+			// new field gets set on migration; without this, post-rebase
+			// banners would only fire for summaries written by the new code.
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			const oldSummary: CommitSummary = {
+				...createMockSummary("oldhash"),
+				llm: { model: "x", inputTokens: 0, outputTokens: 0, apiLatencyMs: 0, stopReason: "error" },
+			};
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const migrated = JSON.parse(files[0].content) as CommitSummary;
+			expect(migrated.summaryError).toBe("llm-failed");
+		});
+
+		it("does NOT set summaryError on the rebased root when the old summary is healthy", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			const oldSummary: CommitSummary = {
+				...createMockSummary("oldhash"),
+				llm: { model: "x", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
+			};
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const migrated = JSON.parse(files[0].content) as CommitSummary;
+			expect(migrated.summaryError).toBeUndefined();
+		});
 	});
 
 	describe("mergeManyToOne", () => {
@@ -1777,6 +1827,40 @@ describe("SummaryStore", () => {
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
 			expect(merged.diffStats).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
+		});
+
+		it("propagates summaryError from ConsolidatedTopics onto the merged root", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			const newHash = "newhash0000000000000099";
+
+			await mergeManyToOne(
+				[createMockSummary("old1"), createMockSummary("old2")],
+				createMockCommitInfo(newHash),
+				undefined,
+				undefined,
+				{
+					topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }],
+					summaryError: "llm-failed",
+				},
+			);
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.summaryError).toBe("llm-failed");
+			expect(merged.topics).toEqual([{ title: "Merged", trigger: "t", response: "r", decisions: "d" }]);
+		});
+
+		it("does NOT set summaryError on the merged root when ConsolidatedTopics omits it", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			const newHash = "newhash0000000000000098";
+
+			await mergeManyToOne([createMockSummary("old1")], createMockCommitInfo(newHash), undefined, undefined, {
+				topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }],
+			});
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.summaryError).toBeUndefined();
 		});
 	});
 

@@ -141,6 +141,9 @@ URL/HTML escaping is consolidated in `cli/src/site/Sanitize.ts` — every layout
 ## Project conventions worth knowing
 
 - **Biome** is the formatter and linter (config: [`cli/biome.json`](cli/biome.json)). Tabs, 4-wide, 120 column limit. Rules of note: `noExplicitAny: error`, `noUnusedImports/Variables: error`, `useImportType: warn`. CI runs `biome check --error-on-warnings` — warnings fail.
+
+- **Use `toForwardSlash` for `\` → `/` path normalization** ([`cli/src/core/PathUtils.ts`](cli/src/core/PathUtils.ts)); never inline `path.replace(/\\/g, "/")` or `path.split(sep).join("/")`. Forward-slash form is the [`StorageProvider.listFiles`](cli/src/core/StorageProvider.ts) contract and the input every downstream regex / prefix consumer expects — one forgotten inline normalization on Windows silently broke webview transcripts in production. The helper does **only** `\` → `/`: if you also need lowercasing or trailing-slash strip, use `normalizePathForCompare` instead. Biome cannot lint this pattern, so the rule is enforced socially — inline reintroduction is a review-blocker. Exempt: code already inside a domain helper that wraps the conversion (`normalizePathForCompare`, `normalizePathForMatch`, `toFileUrl`, `validateRelPath`); tests asserting on a specific separator; regexes whose `\\/g` is matching a literal backslash for non-path reasons.
+
 - **Never include AI/Claude co-author information in commit messages.** No `Co-Authored-By: Claude …` trailers, no "🤖 Generated with …" footers — for either commits or PR descriptions. The repo is going open-source and history should read as human-authored work; only `Signed-off-by:` is required.
 
 (The DCO sign-off, `npm run all` gate, CLI coverage floor, and worktree-aware requirement are stated as critical rules at the top of this file; they are not repeated here to keep this file as a single source of truth.)

@@ -1407,6 +1407,45 @@ describe("buildTopicsSection", () => {
 		expect(html).toContain('id="topicsSection"');
 		expect(html).toContain("No topics available for this commit.");
 	});
+
+	it("renders failure empty-state when topics are empty due to LLM failure (summaryError)", () => {
+		const html = buildTopicsSection(makeSummary({ topics: [], summaryError: "llm-failed" }));
+		expect(html).toContain("Summary generation failed");
+		expect(html).toContain("Click Regenerate above");
+		expect(html).not.toContain("No topics available for this commit.");
+	});
+
+	it("renders failure empty-state for legacy summaries with stopReason='error'", () => {
+		const html = buildTopicsSection(
+			makeSummary({
+				topics: [],
+				llm: { model: "claude", inputTokens: 0, outputTokens: 0, apiLatencyMs: 0, stopReason: "error" },
+			}),
+		);
+		expect(html).toContain("Summary generation failed");
+	});
+
+	it("keeps the healthy empty-state when topics are empty without a failure marker", () => {
+		const html = buildTopicsSection(makeSummary({ topics: [] }));
+		expect(html).toContain("No topics available for this commit.");
+		expect(html).not.toContain("Summary generation failed");
+	});
+
+	it("readOnly failure empty-state drops the 'Click Regenerate above' CTA", () => {
+		// In foreign-readonly / stale-readonly the Regenerate button is hidden;
+		// the empty-state shouldn't promise a click action it can't deliver.
+		const html = buildTopicsSection(
+			makeSummary({ topics: [], summaryError: "llm-failed" }),
+			{ readOnly: true },
+		);
+		expect(html).toContain("Summary generation failed");
+		expect(html).not.toContain("Click Regenerate above");
+	});
+
+	it("non-readOnly failure empty-state keeps the 'Click Regenerate above' CTA", () => {
+		const html = buildTopicsSection(makeSummary({ topics: [], summaryError: "llm-failed" }), { readOnly: false });
+		expect(html).toContain("Click Regenerate above");
+	});
 });
 
 describe("buildAllConversationsSection — Regenerate button", () => {

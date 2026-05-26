@@ -42,6 +42,7 @@ import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
+import { isSummaryError, LLM_FAILED } from "./SummaryErrorMarker.js";
 import { getDisplayDate } from "./SummaryFormat.js";
 import { collectAllTopics, collectDisplayTopics, countTopics, isUnifiedHoistFormat } from "./SummaryTree.js";
 
@@ -410,6 +411,12 @@ async function migrateOneToOneLocked(
 		// PR markdown stopped showing the Linear issue associations.
 		...(oldSummary.linearIssues && { linearIssues: oldSummary.linearIssues }),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
+		// summaryError marker — rebase-pick doesn't run the LLM, so a degraded
+		// old summary stays degraded on the new hash. Use isSummaryError() so
+		// legacy summaries (only `llm.stopReason: "error"`, no summaryError
+		// field) get upgraded to the new marker on migration. Without this,
+		// the rebased commit's webview would lose its Regenerate banner.
+		...(isSummaryError(oldSummary) && { summaryError: LLM_FAILED }),
 		topics: hoistedTopics,
 		...(oldSummary.recap && { recap: oldSummary.recap }),
 		diffStats: migratedDiffStats,
@@ -830,6 +837,15 @@ export interface ConsolidatedTopics {
 	readonly recap?: string;
 	readonly ticketId?: string;
 	readonly llm?: import("../Types.js").LlmCallMetadata;
+	/**
+	 * Set when the consolidation outcome was `"llm-error"` (real failure
+	 * after retry exhaustion) or when a runtime error tripped the caller's
+	 * defensive catch. Distinguishes it from `"no-content"` which also
+	 * lands in mechanical fallback but is healthy (no marker).
+	 * mergeManyToOne mirrors this onto the merged root so isSummaryError
+	 * catches it on read.
+	 */
+	readonly summaryError?: import("../Types.js").SummaryErrorKind;
 }
 
 /**
@@ -904,6 +920,7 @@ async function mergeManyToOneLocked(
 	const consolidatedRecap = consolidated?.recap;
 	const consolidatedTicketId = consolidated?.ticketId;
 	const consolidatedLlm = consolidated?.llm;
+	const consolidatedSummaryError = consolidated?.summaryError;
 
 	const mergedSummary: CommitSummary = {
 		version: 4,
@@ -917,6 +934,7 @@ async function mergeManyToOneLocked(
 		...(metadata?.commitSource && { commitSource: metadata.commitSource }),
 		...(consolidatedTicketId && { ticketId: consolidatedTicketId }),
 		...(consolidatedLlm && { llm: consolidatedLlm }),
+		...(consolidatedSummaryError && { summaryError: consolidatedSummaryError }),
 		...(hoistedE2e.length > 0 && { e2eTestGuide: hoistedE2e }),
 		...(hoistedPlans.length > 0 && { plans: hoistedPlans }),
 		...(hoistedNotes.length > 0 && { notes: hoistedNotes }),

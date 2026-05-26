@@ -1602,6 +1602,50 @@ describe("SummaryWebviewPanel", () => {
 				expect(mockPushToJolli).not.toHaveBeenCalled();
 			});
 
+			it("refuses to push a summary with summaryError marker and prompts user to Regenerate", async () => {
+				// A degraded summary (LLM failed → placeholder/Copy-Hoist/mechanical
+				// fallback with summaryError marker) must NOT be published to Jolli:
+				// if the commit already has a jolliDocId from an earlier successful
+				// push, the new push would silently overwrite the cloud article with
+				// placeholder content. The user must Regenerate first.
+				mockLoadConfig.mockResolvedValue({
+					apiKey: "test",
+					jolliApiKey: "jk_valid",
+				});
+				const dispatch = await setupPanel({ summaryError: "llm-failed" });
+
+				dispatch({ command: "push" });
+				await flushPromises();
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					"This summary's last LLM generation failed. Click Regenerate above and try again before pushing to Jolli.",
+				);
+				expect(mockPushToJolli).not.toHaveBeenCalled();
+				expect(mockLoadConfig).not.toHaveBeenCalled();
+			});
+
+			it("refuses to push legacy summaries with llm.stopReason === 'error'", async () => {
+				// Pre-`summaryError` summaries (written before this field existed)
+				// signal failure via `llm.stopReason === "error"`. The push gate
+				// uses isSummaryError() which honors both new field and legacy
+				// fallback, so legacy degraded summaries are also refused.
+				mockLoadConfig.mockResolvedValue({
+					apiKey: "test",
+					jolliApiKey: "jk_valid",
+				});
+				const dispatch = await setupPanel({
+					llm: { model: "claude", inputTokens: 0, outputTokens: 0, apiLatencyMs: 0, stopReason: "error" },
+				});
+
+				dispatch({ command: "push" });
+				await flushPromises();
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Regenerate above"),
+				);
+				expect(mockPushToJolli).not.toHaveBeenCalled();
+			});
+
 			it("warns and skips snippet notes missing content (schema-drift guard)", async () => {
 				// Legacy/corrupt entry: snippet without `content` must not silently drop —
 				// it should log.warn and skip the push, while other valid notes still go through.
@@ -2220,8 +2264,36 @@ describe("SummaryWebviewPanel", () => {
 						command: "summaryRegenerated",
 						topicsHtml: '<div id="topicsSection">t</div>',
 						recapHtml: '<div id="recapSection">r</div>',
+						// Healthy regenerate → empty banner so the script removes any
+						// stale .summary-error-banner from the DOM.
+						summaryErrorBannerHtml: "",
 					}),
 				);
+			});
+
+			it("includes a non-empty summaryErrorBannerHtml when regenerate still produces a degraded summary", async () => {
+				// Defensive: if the regenerate result itself somehow carries
+				// summaryError (e.g. user clicks Regenerate while creds are still
+				// broken — though in practice the regenerate path would have
+				// thrown earlier), the post-message should reflect that with a
+				// non-empty banner HTML so the DOM keeps showing it.
+				mockLoadRegenerateContext.mockResolvedValue(stubCtx());
+				showWarningMessage.mockResolvedValueOnce("Regenerate");
+				mockRegenerateSummary.mockResolvedValue({
+					updated: { ...stubUpdated(), summaryError: "llm-failed" } as never,
+					result: {} as never,
+				});
+				const dispatch = await setupPanel();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				const lastCalls = postMessage.mock.calls;
+				const regenMsg = lastCalls.find(
+					(call) => (call[0] as { command?: string }).command === "summaryRegenerated",
+				)?.[0] as { summaryErrorBannerHtml?: string } | undefined;
+				expect(regenMsg).toBeDefined();
+				expect(regenMsg?.summaryErrorBannerHtml).toContain('class="summary-error-banner"');
 			});
 
 			it("does NOT pass artifacts to bridge.storeSummary on success", async () => {

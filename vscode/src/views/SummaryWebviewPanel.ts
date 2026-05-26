@@ -81,6 +81,7 @@ import { log } from "../util/Logger.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
+import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
 import {
 	buildE2eTestSection,
 	buildHtml,
@@ -102,6 +103,7 @@ import {
 	formatActiveProviderLabel,
 } from "./SummaryUtils.js";
 import type { RegenerateContext } from "../../../cli/src/core/RegenerateContext.js";
+import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
 import type { LlmConfig } from "../../../cli/src/Types.js";
 
 /** Memory field updates sent from the webview edit form. */
@@ -1361,6 +1363,19 @@ export class SummaryWebviewPanel {
 		if (this.pushInProgress) {
 			return;
 		}
+		// Refuse to publish a degraded summary (LLM failed, persisted placeholder
+		// or Copy-Hoist / mechanical fallback with summaryError marker). If we let
+		// the push through and this commit already has a jolliDocId from an
+		// earlier successful push, Jolli would silently update the cloud article
+		// in place — overwriting good content with placeholder topics. The user
+		// must Regenerate first; the in-page banner already tells them how.
+		// biome-ignore lint/style/noNonNullAssertion: dispatch guard ensures currentSummary is set
+		if (isSummaryError(this.currentSummary!)) {
+			vscode.window.showWarningMessage(
+				"This summary's last LLM generation failed. Click Regenerate above and try again before pushing to Jolli.",
+			);
+			return;
+		}
 		// Check BEFORE setting pushInProgress so that a stale-commit early exit
 		// doesn't leave the flag stuck (the panel is about to be disposed anyway,
 		// but defensive against future code paths that survive the guard).
@@ -1915,6 +1930,12 @@ export class SummaryWebviewPanel {
 						command: "summaryRegenerated",
 						topicsHtml: buildTopicsSection(outcome.updated),
 						recapHtml: buildRecapSection(outcome.updated.recap),
+						// Empty string on success → script removes any existing
+						// banner from the DOM. Non-empty (unlikely on success
+						// but defensible — e.g. regenerate produced a partial
+						// result that re-tripped the marker) replaces the
+						// banner in place.
+						summaryErrorBannerHtml: buildSummaryErrorBanner(outcome.updated),
 					});
 					vscode.window.showInformationMessage("Summary regenerated.");
 				},

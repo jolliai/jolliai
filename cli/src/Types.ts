@@ -238,6 +238,21 @@ export type CommitType = "commit" | "amend" | "squash" | "rebase" | "cherry-pick
 export type CommitSource = "cli" | "plugin";
 
 /**
+ * Closed enumeration of summary-error markers. Extend by adding a new
+ * literal here and updating `isSummaryError` in `core/SummaryErrorMarker.ts`.
+ *
+ * Values:
+ *   - "llm-failed": the SUMMARIZE / CONSOLIDATE LLM call failed after one
+ *     retry (network error, 5xx, credential failure, quota, etc.). The
+ *     summary still landed (with empty topics for fresh commits,
+ *     Copy-Hoisted topics for amend short-circuit, or mechanically-merged
+ *     topics for amend step-2 / squash fallback) so downstream pipelines
+ *     never face missing source summaries, but the user is prompted to
+ *     regenerate via the webview banner.
+ */
+export type SummaryErrorKind = "llm-failed";
+
+/**
  * Complete summary for a single git commit (v3 tree format).
  *
  * Tree structure: each node may have its own topics/stats/llm data, plus optional
@@ -314,6 +329,19 @@ export interface CommitSummary {
 	 * authoritative consolidated value).
 	 */
 	readonly recap?: string;
+	/**
+	 * Marker indicating the summary was produced under a degraded LLM path.
+	 * Set by all four LLM-call sites in QueueWorker (normal commit, amend
+	 * step-1, amend step-2 consolidate, squash consolidate) when the LLM
+	 * call fails after one retry. Absent on healthy summaries. Cleared
+	 * explicitly by Regenerator on a successful re-run.
+	 *
+	 * Legacy summaries written before this field existed signal the same
+	 * condition via `llm?.stopReason === "error"`; readers MUST consult both
+	 * fields via the shared `isSummaryError` helper in
+	 * `core/SummaryErrorMarker.ts`.
+	 */
+	readonly summaryError?: SummaryErrorKind;
 	/**
 	 * Child summaries forming a tree. Ordered by commitDate descending (newest first).
 	 * - Amend: children = [original summary before amend]
