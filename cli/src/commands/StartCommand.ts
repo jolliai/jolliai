@@ -28,7 +28,14 @@ import { escapeHtml, sanitizeUrl } from "../site/Sanitize.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
 import { startSourceWatcher } from "../site/SourceWatcher.js";
 import { parseNavigation } from "../site/StructureParser.js";
-import type { HeaderItem, NavLink, PathMappings } from "../site/Types.js";
+import type {
+	HeaderItem,
+	Navigation,
+	NavigationArticle,
+	NavigationGroup,
+	NavLink,
+	PathMappings,
+} from "../site/Types.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -231,9 +238,14 @@ async function syncContent(
 	// the `_meta.js` writer picks up the rewritten file and emits the standard
 	// `{ "index": { display: "hidden" } }` entry to keep it out of the sidebar.
 	//
-	// Skip the rewrite when the user authored a real root index — see
-	// `hasUserAuthoredRootIndex` for the detection rule and rationale.
-	const redirectHref = hasUserAuthoredRootIndex(mirrorResult) ? undefined : pickRootRedirectHref(parsedNavigation);
+	// Skip the rewrite only when `site.json`'s navigation explicitly claims
+	// `/` — either a page rooted at `/`, or an article with `href: "/"` /
+	// `"/index"`. The mere presence of a root `index.md` on disk no longer
+	// suppresses the redirect: under the schema-intent rule, an unreferenced
+	// `index.md` is orphan content and the page-mode redirect owns the slot.
+	const redirectHref = navigationClaimsRootIndex(siteJsonResult.config.navigation)
+		? undefined
+		: pickRootRedirectHref(parsedNavigation);
 	if (redirectHref) {
 		await writeRootRedirectIndex(contentDir, redirectHref);
 	}
@@ -262,18 +274,71 @@ async function syncContent(
 }
 
 /**
- * Returns `true` when `mirrorResult` already contains a user-authored root
- * `index.md`/`index.mdx` — i.e. the source had a literal `index.{md,mdx}`,
- * or `ContentMirror.ensureIndexPage` promoted a file with `slug: /` to
- * `index.md` during mirroring. In either case `/` is meant to render that
- * page, and `writeRootRedirectIndex` must not silently overwrite it with a
- * redirect stub. Only the *root* index counts — a nested `docs/index.md`
- * doesn't claim `/`.
+ * Returns `true` when `site.json`'s navigation explicitly claims the site
+ * root URL `/`. Two ways navigation can claim root:
+ *   - A page with `root: "/"` — the page itself owns `/`.
+ *   - An article anywhere in the tree (page content, group content, nested
+ *     `articles[]`) with `href: "/"` or `href: "/index"` (or its extension
+ *     variants). The article is the home.
+ *
+ * Filesystem state is intentionally not consulted: the schema is the source
+ * of truth, so a stray `index.md` that isn't referenced anywhere in the
+ * navigation is treated as orphan content and does not suppress the
+ * page-mode redirect stub. Users who want their `index.md` as the home page
+ * must wire it into `site.json` explicitly.
  *
  * Exported for unit testing — call site is in `syncContent`.
  */
-export function hasUserAuthoredRootIndex(mirrorResult: { markdownFiles: string[] }): boolean {
-	return mirrorResult.markdownFiles.some((f) => f === "index.md" || f === "index.mdx");
+export function navigationClaimsRootIndex(navigation: Navigation | undefined): boolean {
+	if (!navigation || navigation.length === 0) return false;
+	for (const node of navigation) {
+		if ("page" in node) {
+			if (normalizeRoot(node.root) === "/") return true;
+			if (node.content && nodesClaimRoot(node.content)) return true;
+			continue;
+		}
+		if ("group" in node) {
+			if (nodesClaimRoot(node.content)) return true;
+			continue;
+		}
+		if (articleClaimsRoot(node)) return true;
+	}
+	return false;
+}
+
+function nodesClaimRoot(nodes: ReadonlyArray<NavigationGroup | NavigationArticle>): boolean {
+	for (const node of nodes) {
+		if ("group" in node) {
+			if (nodesClaimRoot(node.content)) return true;
+			continue;
+		}
+		if (articleClaimsRoot(node)) return true;
+	}
+	return false;
+}
+
+function articleClaimsRoot(article: NavigationArticle): boolean {
+	if (article.type === "external") return false;
+	if (isRootHref(article.href)) return true;
+	if (article.articles) {
+		for (const child of article.articles) {
+			if (articleClaimsRoot(child)) return true;
+		}
+	}
+	return false;
+}
+
+function isRootHref(href: string): boolean {
+	if (!href) return false;
+	const trimmed = href.trim();
+	return trimmed === "/" || trimmed === "/index" || trimmed === "/index.md" || trimmed === "/index.mdx";
+}
+
+function normalizeRoot(root: string | undefined): string | undefined {
+	if (root === undefined) return undefined;
+	const trimmed = root.trim();
+	if (trimmed === "" || trimmed === "/") return "/";
+	return trimmed;
 }
 
 /**

@@ -1111,41 +1111,131 @@ describe("buildRootInjectionInput", () => {
 	});
 });
 
-// ─── hasUserAuthoredRootIndex / pickRootRedirectHref / writeRootRedirectIndex unit tests ────
+// ─── navigationClaimsRootIndex / pickRootRedirectHref / writeRootRedirectIndex unit tests ────
 
-describe("hasUserAuthoredRootIndex", () => {
-	it("returns true when the mirror has a root index.md", async () => {
-		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
-		expect(hasUserAuthoredRootIndex({ markdownFiles: ["index.md", "foo.md"] })).toBe(true);
+describe("navigationClaimsRootIndex", () => {
+	it("returns false when navigation is undefined", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(navigationClaimsRootIndex(undefined)).toBe(false);
 	});
 
-	it("returns true when the mirror has a root index.mdx", async () => {
-		// Covers user-authored MDX landing pages.
-		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
-		expect(hasUserAuthoredRootIndex({ markdownFiles: ["index.mdx", "foo.md"] })).toBe(true);
+	it("returns false when navigation is empty", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(navigationClaimsRootIndex([])).toBe(false);
 	});
 
-	it("returns false when no index file is present", async () => {
-		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
-		expect(hasUserAuthoredRootIndex({ markdownFiles: ["docs/getting-started.md", "api.md"] })).toBe(false);
+	it("returns true when a page is rooted at /", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(
+			navigationClaimsRootIndex([
+				{ page: "Home", root: "/", content: [{ article: "Welcome", href: "welcome" }] },
+				{ page: "Docs", root: "/docs", content: [] },
+			]),
+		).toBe(true);
 	});
 
-	it("returns false when only a nested index exists — only the root index claims `/`", async () => {
-		// Regression guard: `docs/index.md` is the index of the `/docs` folder,
-		// not the site root. Treating it as a user-authored root index would
-		// suppress the page-mode redirect for sites that legitimately need it.
-		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
-		expect(hasUserAuthoredRootIndex({ markdownFiles: ["docs/index.md", "api/index.mdx"] })).toBe(false);
+	it("returns false when no page is rooted at /, even if a root index.md exists on disk", async () => {
+		// Schema-intent rule: a root index.md that isn't referenced by any
+		// page or article is orphan content — navigation is the authority.
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(
+			navigationClaimsRootIndex([
+				{ page: "Docs", root: "/docs", content: [{ article: "Intro", href: "intro" }] },
+				{ page: "API", openapi: "./api.yaml" },
+			]),
+		).toBe(false);
 	});
 
-	it("returns true when both a root and a nested index exist", async () => {
-		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
-		expect(hasUserAuthoredRootIndex({ markdownFiles: ["index.md", "docs/index.md"] })).toBe(true);
+	it("returns true when an article inside a page has href: '/'", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(
+			navigationClaimsRootIndex([{ page: "Docs", root: "/docs", content: [{ article: "Home", href: "/" }] }]),
+		).toBe(true);
 	});
 
-	it("returns false for an empty markdown list", async () => {
-		const { hasUserAuthoredRootIndex } = await import("./StartCommand.js");
-		expect(hasUserAuthoredRootIndex({ markdownFiles: [] })).toBe(false);
+	it("returns true when an article inside a page has href: '/index'", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(
+			navigationClaimsRootIndex([
+				{ page: "Docs", root: "/docs", content: [{ article: "Home", href: "/index" }] },
+			]),
+		).toBe(true);
+	});
+
+	it("recognises /index.md and /index.mdx variants as root-claiming", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(
+			navigationClaimsRootIndex([
+				{ page: "Docs", root: "/docs", content: [{ article: "Home", href: "/index.md" }] },
+			]),
+		).toBe(true);
+		expect(
+			navigationClaimsRootIndex([
+				{ page: "Docs", root: "/docs", content: [{ article: "Home", href: "/index.mdx" }] },
+			]),
+		).toBe(true);
+	});
+
+	it("returns true when a nested article (inside articles[]) claims root", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(
+			navigationClaimsRootIndex([
+				{
+					page: "Docs",
+					root: "/docs",
+					content: [
+						{
+							article: "Top",
+							href: "top",
+							articles: [{ article: "Home", href: "/" }],
+						},
+					],
+				},
+			]),
+		).toBe(true);
+	});
+
+	it("returns true when an article inside a group claims root", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(
+			navigationClaimsRootIndex([
+				{
+					page: "Docs",
+					root: "/docs",
+					content: [{ group: "Section", content: [{ article: "Home", href: "/" }] }],
+				},
+			]),
+		).toBe(true);
+	});
+
+	it("returns true in simple mode when a top-level article has href: '/'", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(navigationClaimsRootIndex([{ article: "Home", href: "/" }])).toBe(true);
+	});
+
+	it("returns false when an external link uses '/'-like href (external never claims root)", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(
+			navigationClaimsRootIndex([
+				{ page: "Docs", root: "/docs", content: [{ article: "Home", href: "/", type: "external" }] },
+			]),
+		).toBe(false);
+	});
+
+	it("returns false when only nested folder hrefs (no root claim) exist", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		expect(
+			navigationClaimsRootIndex([
+				{
+					page: "Docs",
+					root: "/docs",
+					content: [
+						{ article: "Intro", href: "intro" },
+						{ group: "Guides", content: [{ article: "Setup", href: "setup" }] },
+					],
+				},
+			]),
+		).toBe(false);
 	});
 });
 

@@ -31,7 +31,10 @@ describe("parseNavigation (simple mode)", () => {
 		expect(result.pages).toBeUndefined();
 	});
 
-	it("group with root creates separate directory sidebar", () => {
+	it("group with root emits the same separator + flat filesystem-bound entries as without root", () => {
+		// `group.root` is a source-location hint only — it tells ContentPlanner
+		// where to read source files from, but does NOT affect the sidebar
+		// tree or the article URLs. The schema intent (group = separator) wins.
 		const nav = [
 			{
 				group: "Getting Started",
@@ -43,9 +46,11 @@ describe("parseNavigation (simple mode)", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/"]["getting-started"]).toBe("Getting Started");
-		expect(result.sidebar["/getting-started"].quickstart).toBe("Quickstart");
-		expect(result.sidebar["/getting-started"].install).toBe("Install");
+		const root = result.sidebar["/"];
+		expect(root["__group-getting-started"]).toEqual({ type: "separator", title: "Getting Started" });
+		expect(root.quickstart).toBe("Quickstart");
+		expect(root.install).toBe("Install");
+		expect(result.sidebar["/getting-started"]).toBeUndefined();
 	});
 
 	it("handles external links", () => {
@@ -61,7 +66,10 @@ describe("parseNavigation (simple mode)", () => {
 		expect(result.sidebar["/"].github).toEqual({ title: "GitHub", href: "https://github.com/example" });
 	});
 
-	it("handles nested articles", () => {
+	it("preserves Nextra collapsible hierarchy for nested articles inside a rooted group", () => {
+		// Articles with children remain real filesystem-bound folders even
+		// inside a rooted group — the group.root only flattens the build tree
+		// at planning time; the sidebar still nests `articles: [...]` children.
 		const nav = [
 			{
 				group: "SQL",
@@ -71,24 +79,51 @@ describe("parseNavigation (simple mode)", () => {
 						article: "Operations",
 						href: "operations",
 						articles: [
-							{ article: "Aggregate", href: "aggregate" } as NavigationArticle,
-							{ article: "Window", href: "window" } as NavigationArticle,
+							{ article: "Aggregate", href: "operations/aggregate" } as NavigationArticle,
+							{ article: "Window", href: "operations/window" } as NavigationArticle,
 						],
 					} as NavigationArticle,
 				],
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/sql"].operations).toBe("Operations");
-		expect(result.sidebar["/sql/operations"].aggregate).toBe("Aggregate");
-		expect(result.sidebar["/sql/operations"].window).toBe("Window");
+		expect(result.sidebar["/"]["__group-sql"]).toEqual({ type: "separator", title: "SQL" });
+		expect(result.sidebar["/"].operations).toBe("Operations");
+		expect(result.sidebar["/operations"].aggregate).toBe("Aggregate");
+		expect(result.sidebar["/operations"].window).toBe("Window");
+		expect(result.sidebar["/sql"]).toBeUndefined();
+	});
+
+	it("preserves collapsible hierarchy for nested articles when the group has no root", () => {
+		const nav = [
+			{
+				group: "SQL",
+				content: [
+					{
+						article: "Operations",
+						href: "operations",
+						articles: [
+							{ article: "Aggregate", href: "operations/aggregate" } as NavigationArticle,
+							{ article: "Window", href: "operations/window" } as NavigationArticle,
+						],
+					} as NavigationArticle,
+				],
+			} as NavigationGroup,
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/"]["__group-sql"]).toEqual({ type: "separator", title: "SQL" });
+		expect(result.sidebar["/"].operations).toBe("Operations");
+		expect(result.sidebar["/operations"].aggregate).toBe("Aggregate");
+		expect(result.sidebar["/operations"].window).toBe("Window");
 	});
 
 	it("emits theme.collapsed:false for nested articles when expanded:true is set", () => {
+		// `expanded` only applies to collapsible filesystem-bound entries, so
+		// scope the test to a non-rooted group where articles preserve their
+		// Nextra folder mechanism.
 		const nav = [
 			{
 				group: "Guides",
-				root: "guides",
 				content: [
 					{
 						article: "Deployment",
@@ -103,7 +138,7 @@ describe("parseNavigation (simple mode)", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/guides"].deployment).toEqual({
+		expect(result.sidebar["/"].deployment).toEqual({
 			title: "Deployment",
 			theme: { collapsed: false },
 		});
@@ -113,7 +148,6 @@ describe("parseNavigation (simple mode)", () => {
 		const nav = [
 			{
 				group: "Guides",
-				root: "guides",
 				content: [
 					// Has children but expanded omitted → plain string (default-collapsed)
 					{
@@ -137,16 +171,15 @@ describe("parseNavigation (simple mode)", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/guides"].deployment).toBe("Deployment");
-		expect(result.sidebar["/guides"].quickstart).toBe("Quickstart");
-		expect(result.sidebar["/guides"].reference).toBe("Reference");
+		expect(result.sidebar["/"].deployment).toBe("Deployment");
+		expect(result.sidebar["/"].quickstart).toBe("Quickstart");
+		expect(result.sidebar["/"].reference).toBe("Reference");
 	});
 
 	it("emits theme.collapsed:true for nested articles when expanded:false is set", () => {
 		const nav = [
 			{
 				group: "Guides",
-				root: "guides",
 				content: [
 					{
 						article: "Deployment",
@@ -161,7 +194,7 @@ describe("parseNavigation (simple mode)", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/guides"].deployment).toEqual({
+		expect(result.sidebar["/"].deployment).toEqual({
 			title: "Deployment",
 			theme: { collapsed: true },
 		});
@@ -364,7 +397,7 @@ describe("validation limits", () => {
 // ─── Multi-segment hrefs ────────────────────────────────────────────────────
 
 describe("multi-segment hrefs", () => {
-	it("multi-segment group root creates intermediate _meta.js entries", () => {
+	it("group.root does not leak into the sidebar tree even when multi-segment", () => {
 		const nav = [
 			{
 				group: "Guides",
@@ -373,15 +406,19 @@ describe("multi-segment hrefs", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		// First segment in root _meta.js
-		expect(result.sidebar["/"].docs).toBe("docs");
-		// Group label in intermediate _meta.js
-		expect(result.sidebar["/docs"].guides).toBe("Guides");
-		// Article in group's own _meta.js
-		expect(result.sidebar["/docs/guides"].intro).toBe("Intro");
+		const root = result.sidebar["/"];
+		expect(root["__group-guides"]).toEqual({ type: "separator", title: "Guides" });
+		// `root` is a source-location hint; it doesn't appear in the sidebar.
+		expect(root.docs).toBeUndefined();
+		expect(root.intro).toBe("Intro");
+		expect(result.sidebar["/docs"]).toBeUndefined();
+		expect(result.sidebar["/docs/guides"]).toBeUndefined();
 	});
 
-	it("multi-segment article href writes to correct subdirectory _meta.js", () => {
+	it("multi-segment article href inside a rooted group still creates intermediate sidebar entries", () => {
+		// `group.root` is irrelevant to the sidebar; multi-segment article
+		// hrefs still drive the intermediate directory structure as if the
+		// group were not rooted at all.
 		const nav = [
 			{
 				group: "Guides",
@@ -395,14 +432,17 @@ describe("multi-segment hrefs", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/"].guides).toBe("Guides");
-		// First segment of href in group _meta.js
-		expect(result.sidebar["/guides"]["real-time-apps"]).toBe("real-time-apps");
-		// Last segment in subdirectory _meta.js
-		expect(result.sidebar["/guides/real-time-apps"].part1).toBe("Real-time Apps");
+		const root = result.sidebar["/"];
+		expect(root["__group-guides"]).toEqual({ type: "separator", title: "Guides" });
+		expect(root["real-time-apps"]).toBe("real-time-apps");
+		expect(result.sidebar["/real-time-apps"].part1).toBe("Real-time Apps");
 	});
 
-	it("nested articles with multi-segment children resolve correctly", () => {
+	it("nested children inside a rooted group keep their Nextra-bound collapsible structure", () => {
+		// Articles with `articles: [...]` children inside a rooted group still
+		// render as collapsible Nextra folders — `group.root` does not flatten
+		// them. ContentPlanner is responsible for placing the source files so
+		// the filesystem matches the sidebar.
 		const nav = [
 			{
 				group: "Get Started",
@@ -420,33 +460,41 @@ describe("multi-segment hrefs", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/get-started"].enterprise).toBe("Enterprise");
-		// Children write to the enterprise subdirectory
-		expect(result.sidebar["/get-started/enterprise"].quickstart).toBe("Quickstart");
-		expect(result.sidebar["/get-started/enterprise"].helm).toBe("Helm");
+		const root = result.sidebar["/"];
+		expect(root["__group-get-started"]).toEqual({ type: "separator", title: "Get Started" });
+		expect(root.enterprise).toBe("Enterprise");
+		expect(result.sidebar["/enterprise"].quickstart).toBe("Quickstart");
+		expect(result.sidebar["/enterprise"].helm).toBe("Helm");
+		expect(result.sidebar["/get-started"]).toBeUndefined();
 	});
 
-	it("nested articles with single-segment children write to parent dir", () => {
+	it("expanded:true on a nested article inside a rooted group still emits theme.collapsed:false", () => {
+		// Now that rooted groups use filesystem-bound articles, `expanded`
+		// works again — same behavior as without root.
 		const nav = [
 			{
-				group: "SQL",
-				root: "sql",
+				group: "Guides",
+				root: "guides",
 				content: [
 					{
-						article: "Ops",
-						href: "ops",
+						article: "Deployment",
+						href: "deployment",
+						expanded: true,
 						articles: [
-							{ article: "Agg", href: "agg" } as NavigationArticle,
-							{ article: "Win", href: "win" } as NavigationArticle,
+							{ article: "Docker", href: "deployment/docker" } as NavigationArticle,
+							{ article: "Kubernetes", href: "deployment/kubernetes" } as NavigationArticle,
 						],
 					} as NavigationArticle,
 				],
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/sql"].ops).toBe("Ops");
-		expect(result.sidebar["/sql/ops"].agg).toBe("Agg");
-		expect(result.sidebar["/sql/ops"].win).toBe("Win");
+		expect(result.sidebar["/"].deployment).toEqual({
+			title: "Deployment",
+			theme: { collapsed: false },
+		});
+		expect(result.sidebar["/deployment"].docker).toBe("Docker");
+		expect(result.sidebar["/deployment"].kubernetes).toBe("Kubernetes");
 	});
 
 	it("absolute href article goes directly into entries", () => {
@@ -467,7 +515,7 @@ describe("multi-segment hrefs", () => {
 		expect(result.sidebar["/get-started"]?.install).toBe("Install");
 	});
 
-	it("three-segment article href writes through two intermediate directories", () => {
+	it("three-segment article href inside a rooted group writes through intermediate directories", () => {
 		const nav = [
 			{
 				group: "Docs",
@@ -476,9 +524,12 @@ describe("multi-segment hrefs", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/docs"].a).toBe("a");
-		expect(result.sidebar["/docs/a"].b).toBe("b");
-		expect(result.sidebar["/docs/a/b"].c).toBe("Deep Page");
+		const root = result.sidebar["/"];
+		expect(root["__group-docs"]).toEqual({ type: "separator", title: "Docs" });
+		expect(root.a).toBe("a");
+		expect(result.sidebar["/a"].b).toBe("b");
+		expect(result.sidebar["/a/b"].c).toBe("Deep Page");
+		expect(result.sidebar["/docs"]).toBeUndefined();
 	});
 
 	it("absolute href with nested children resolves parentDir correctly", () => {
@@ -566,14 +617,16 @@ describe("edge cases", () => {
 		});
 	});
 
-	it("group with root and empty content writes no sidebar entry for the group path", () => {
+	it("group with root and empty content emits a separator and no other entries", () => {
 		const nav = [{ group: "Empty Group", root: "empty", content: [] } as NavigationGroup];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/"].empty).toBe("Empty Group");
+		const root = result.sidebar["/"];
+		expect(root["__group-empty-group"]).toEqual({ type: "separator", title: "Empty Group" });
+		expect(root.empty).toBeUndefined();
 		expect(result.sidebar["/empty"]).toBeUndefined();
 	});
 
-	it("group root with leading slash is joined correctly with the path prefix", () => {
+	it("group.root with a leading slash is still inert for the sidebar tree", () => {
 		const nav = [
 			{
 				group: "API",
@@ -582,11 +635,14 @@ describe("edge cases", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/"].api).toBe("API");
-		expect(result.sidebar["/api"].users).toBe("Users");
+		const root = result.sidebar["/"];
+		expect(root["__group-api"]).toEqual({ type: "separator", title: "API" });
+		expect(root.users).toBe("Users");
+		expect(root.api).toBeUndefined();
+		expect(result.sidebar["/api"]).toBeUndefined();
 	});
 
-	it("three-segment group root populates intermediate _meta entries", () => {
+	it("multi-segment group.root is inert; articles render at the parent level", () => {
 		const nav = [
 			{
 				group: "Deep",
@@ -595,13 +651,14 @@ describe("edge cases", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/"].a).toBe("a");
-		expect(result.sidebar["/a"].b).toBe("b");
-		expect(result.sidebar["/a/b"].c).toBe("Deep");
-		expect(result.sidebar["/a/b/c"].leaf).toBe("Leaf");
+		const root = result.sidebar["/"];
+		expect(root["__group-deep"]).toEqual({ type: "separator", title: "Deep" });
+		expect(root.leaf).toBe("Leaf");
+		expect(root.a).toBeUndefined();
+		expect(result.sidebar["/a"]).toBeUndefined();
 	});
 
-	it("two groups sharing the same multi-segment root reuse intermediate dirs", () => {
+	it("two groups sharing the same root prefix coexist without colliding", () => {
 		const nav = [
 			{
 				group: "First",
@@ -615,10 +672,12 @@ describe("edge cases", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/shared"].one).toBe("First");
-		expect(result.sidebar["/shared"].two).toBe("Second");
-		expect(result.sidebar["/shared/one"].a).toBe("A");
-		expect(result.sidebar["/shared/two"].b).toBe("B");
+		const root = result.sidebar["/"];
+		expect(root["__group-first"]).toEqual({ type: "separator", title: "First" });
+		expect(root["__group-second"]).toEqual({ type: "separator", title: "Second" });
+		expect(root.a).toBe("A");
+		expect(root.b).toBe("B");
+		expect(root.shared).toBeUndefined();
 	});
 
 	it("article with absolute href and nested children resolves parentDir from href", () => {
@@ -634,7 +693,26 @@ describe("edge cases", () => {
 		expect(result.sidebar["/guide"].step).toBe("Step");
 	});
 
-	it("article with multi-segment relative href and nested children resolves parentDir via joinPath", () => {
+	it("external link inside a rooted group keeps its absolute href and title-based slug", () => {
+		const nav = [
+			{
+				group: "Resources",
+				root: "resources",
+				content: [
+					{ article: "GitHub", href: "https://github.com/example", type: "external" } as NavigationArticle,
+					{ article: "Local", href: "local" } as NavigationArticle,
+				],
+			} as NavigationGroup,
+		];
+		const result = parseNavigation(nav);
+		const root = result.sidebar["/"];
+		expect(root["__group-resources"]).toEqual({ type: "separator", title: "Resources" });
+		expect(root.github).toEqual({ title: "GitHub", href: "https://github.com/example" });
+		expect(root.local).toBe("Local");
+		expect(root.resources).toBeUndefined();
+	});
+
+	it("multi-segment article href with nested children writes through intermediate dirs", () => {
 		const nav = [
 			{
 				group: "Guides",
@@ -649,8 +727,12 @@ describe("edge cases", () => {
 			} as NavigationGroup,
 		];
 		const result = parseNavigation(nav);
-		expect(result.sidebar["/guides"].a).toBe("a");
-		expect(result.sidebar["/guides/a"].b).toBe("Multi");
-		expect(result.sidebar["/guides/a"].child).toBe("Child");
+		const root = result.sidebar["/"];
+		expect(root["__group-guides"]).toEqual({ type: "separator", title: "Guides" });
+		expect(root.a).toBe("a");
+		expect(result.sidebar["/a"].b).toBe("Multi");
+		expect(result.sidebar["/a"].child).toBe("Child");
+		expect(result.sidebar["/guides"]).toBeUndefined();
+		expect(result.sidebar["/guides/a"]).toBeUndefined();
 	});
 });

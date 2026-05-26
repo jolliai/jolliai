@@ -10,7 +10,11 @@ async function makeTempDir(): Promise<string> {
 }
 
 describe("buildNavigationContentPlan", () => {
-	it("maps navigation pages and groups onto target markdown paths", () => {
+	it("maps navigation pages and groups onto target markdown paths (group.root is source-only)", () => {
+		// `group.root: "guides"` tells the planner where to FIND `intro.mdx`
+		// (under docs/guides/) but does NOT contribute to the target path:
+		// the article lands at docs/intro.mdx because the schema treats the
+		// group as a sidebar separator, not a URL prefix.
 		const plan = buildNavigationContentPlan(
 			[
 				{
@@ -37,7 +41,7 @@ describe("buildNavigationContentPlan", () => {
 			},
 			{
 				sourceRelPath: "docs/guides/intro.mdx",
-				targetRelPath: "docs/guides/intro.mdx",
+				targetRelPath: "docs/intro.mdx",
 				title: "Intro",
 			},
 		]);
@@ -140,7 +144,7 @@ describe("buildNavigationContentPlan", () => {
 		]);
 	});
 
-	it("uses group sourceRoot when the physical source subtree differs from the logical group root", () => {
+	it("uses group sourceRoot to locate source files; target path stays flat under the page root", () => {
 		const plan = buildNavigationContentPlan(
 			[
 				{
@@ -162,18 +166,18 @@ describe("buildNavigationContentPlan", () => {
 		expect(plan.pages).toEqual([
 			{
 				sourceRelPath: "manuals/deploy.md",
-				targetRelPath: "docs/guides/deploy.md",
+				targetRelPath: "docs/deploy.md",
 				title: "Deploy",
 			},
 		]);
 	});
 
 	it("writes parent article as index.<ext> inside its folder when it has nested children", () => {
-		// Regression: when an article has both an `href` matching a source file
-		// AND nested `articles`, the parent must be written as
-		// `<href>/index.<ext>` — not `<href>.<ext>` next to the children's
-		// `<href>/` folder, which Nextra v4 sees as a layout conflict (sidebar
-		// entry collapses to a non-clickable expandable folder; children 404).
+		// When an article has both an `href` matching a source file AND nested
+		// `articles`, the parent must be written as `<href>/index.<ext>` so the
+		// children can live alongside it — Nextra v4 treats `<href>.<ext>` next
+		// to `<href>/` as a layout conflict. With group.root inert for targets,
+		// the deployment folder lands directly under the page root.
 		const plan = buildNavigationContentPlan(
 			[
 				{
@@ -207,17 +211,17 @@ describe("buildNavigationContentPlan", () => {
 		expect(plan.pages).toEqual([
 			{
 				sourceRelPath: "docs/guides/deployment.mdx",
-				targetRelPath: "docs/guides/deployment/index.mdx",
+				targetRelPath: "docs/deployment/index.mdx",
 				title: "Deployment",
 			},
 			{
 				sourceRelPath: "docs/guides/deployment/docker.mdx",
-				targetRelPath: "docs/guides/deployment/docker.mdx",
+				targetRelPath: "docs/deployment/docker.mdx",
 				title: "Docker",
 			},
 			{
 				sourceRelPath: "docs/guides/deployment/kubernetes.mdx",
-				targetRelPath: "docs/guides/deployment/kubernetes.mdx",
+				targetRelPath: "docs/deployment/kubernetes.mdx",
 				title: "Kubernetes",
 			},
 		]);

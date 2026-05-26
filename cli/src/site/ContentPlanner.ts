@@ -161,13 +161,17 @@ function addNodesPlan(
 ): void {
 	for (const node of nodes) {
 		if (isGroup(node)) {
+			// `group.root` (or `group.sourceRoot`) tells the planner where to
+			// FIND the article sources. It does NOT contribute to the target
+			// path: the schema treats a group as a sidebar separator, and the
+			// generated build tree is flattened so Nextra renders the articles
+			// at the parent level without a stray `<group.root>` folder.
 			const childSourceDir = node.sourceRoot
 				? node.sourceRoot.replace(/^\/+|\/+$/g, "")
 				: node.root
 					? joinSegments(sourceDir, node.root)
 					: sourceDir;
-			const childTargetDir = node.root ? joinSegments(targetDir, node.root) : targetDir;
-			addNodesPlan(node.content, childSourceDir, childTargetDir, availableMarkdownFiles, pages);
+			addNodesPlan(node.content, childSourceDir, targetDir, availableMarkdownFiles, pages);
 			continue;
 		}
 		addArticlePlan(node, sourceDir, targetDir, availableMarkdownFiles, pages);
