@@ -1,8 +1,7 @@
 /**
  * Tests for `appendLocalExclude` — per-clone exclude shim used by
- * `SymlinkSweep` and `CorruptJsonQuarantine` to keep their quarantine
- * directories off `git add --all` on the first round before
- * `MemoryBankBootstrap` writes `.gitignore`.
+ * `CorruptJsonQuarantine` to keep its quarantine directories off staging
+ * during the first round before `MemoryBankBootstrap` writes `.gitignore`.
  */
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -26,18 +25,18 @@ describe("appendLocalExclude", () => {
 	});
 
 	it("creates `.git/info/exclude` with a Jolli header and the pattern on first call", async () => {
-		const ok = await appendLocalExclude(vault, ".jolli-quarantine-symlinks/");
+		const ok = await appendLocalExclude(vault, ".jolli-quarantine-corrupt/");
 		expect(ok).toBe(true);
 		const content = await readFile(join(vault, ".git", "info", "exclude"), "utf-8");
 		expect(content).toContain("# Jolli Memory engine-owned exclusions");
-		expect(content.split("\n")).toContain(".jolli-quarantine-symlinks/");
+		expect(content.split("\n")).toContain(".jolli-quarantine-corrupt/");
 	});
 
 	it("is idempotent — a second call with the same pattern does NOT duplicate the line", async () => {
-		await appendLocalExclude(vault, ".jolli-quarantine-symlinks/");
-		await appendLocalExclude(vault, ".jolli-quarantine-symlinks/");
+		await appendLocalExclude(vault, ".jolli-quarantine-corrupt/");
+		await appendLocalExclude(vault, ".jolli-quarantine-corrupt/");
 		const content = await readFile(join(vault, ".git", "info", "exclude"), "utf-8");
-		const occurrences = content.split("\n").filter((l) => l === ".jolli-quarantine-symlinks/");
+		const occurrences = content.split("\n").filter((l) => l === ".jolli-quarantine-corrupt/");
 		expect(occurrences).toHaveLength(1);
 	});
 

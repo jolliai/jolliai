@@ -246,13 +246,34 @@ describe("SidebarScriptBuilder", () => {
 		expect(js.slice(handlerStart, handlerEnd)).toContain("renderToolbar()");
 	});
 
-	it("renders an AI summary indicator on the Branch tab toolbar when workerBusy", () => {
+	it("renders shared indicator chrome (worker on Branch, sync-phase on Memory Bank)", () => {
 		const js = buildSidebarScript();
-		// The indicator container + spinning loading codicon + label live in
-		// renderToolbar's branch (else) branch.
+		// Shared indicator chrome: spinner for info, error icon for sticky
+		// sync failures. The post-commit "AI summary in progress…" label is
+		// still emitted (used by the Branch tab worker indicator); the
+		// sync-phase variant reuses the same chrome on the Memory Bank tab.
 		expect(js).toContain("toolbar-worker-status");
 		expect(js).toContain("codicon-loading codicon-modifier-spin");
+		expect(js).toContain("codicon-error");
 		expect(js).toContain("AI summary in progress…");
+		// Sync-phase indicator is wired into the Memory Bank tab toolbar so
+		// it sits next to the Sync-now action that drives it.
+		expect(js).toContain("buildToolbarIndicator(state.syncPhase)");
+	});
+
+	it("handles sync:phase by re-rendering the Memory Bank toolbar", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("'sync:phase'");
+		const handlerStart = js.indexOf("'sync:phase'");
+		const handlerEnd = js.indexOf("case ", handlerStart + 1);
+		expect(handlerStart).toBeGreaterThan(-1);
+		const body = js.slice(handlerStart, handlerEnd);
+		expect(body).toContain("state.syncPhase");
+		// Sync moves memories to/from the Personal Space — indicator lives
+		// on the Memory Bank tab toolbar, not the Branch toolbar.
+		expect(body).toContain("state.activeTab === 'kb'");
+		expect(body).not.toContain("state.activeTab === 'branch'");
+		expect(body).toContain("renderToolbar()");
 	});
 
 	it("handles worker:busy by re-rendering toolbar AND branch on the Branch tab", () => {

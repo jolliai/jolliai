@@ -84,7 +84,6 @@ import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
 import { PlansStore } from "./stores/PlansStore.js";
 import { StatusStore } from "./stores/StatusStore.js";
-import { SymlinkPopupGate } from "./sync/SymlinkPopupGate.js";
 import { activateSync } from "./sync/VsCodeSyncBootstrap.js";
 import { ExcludeFilterManager } from "./util/ExcludeFilterManager.js";
 import { formatShortRelativeDate } from "./util/FormatUtils.js";
@@ -613,12 +612,19 @@ export function activate(context: vscode.ExtensionContext): void {
 	const statusBar = new StatusBarManager();
 	context.subscriptions.push({ dispose: () => statusBar.dispose() });
 
-	// ── Memory Bank sync (manual always-on; auto gated by config.syncEnabled — plan §0.7) ──
+	// ── Stores (host-side state controllers) ────────────────────────────────
+	// Stores own mutable state, watchers, and bridge calls. Providers /
+	// commands / (future) WebView adapters are thin subscribers.
+	// Constructed BEFORE `activateSync` because the orchestrator forwards
+	// per-phase sync labels into the StatusStore (see `setSyncPhase`).
+	const statusStore = new StatusStore(bridge, authService);
+
+	// ── Memory Bank sync (manual always-on; auto gated by config.autoSyncEnabled — plan §0.7) ──
 	// Activate eagerly but don't block extension activation on the result —
 	// `activateSync` no-ops when sync is dormant (no Jolli sign-in). The
 	// returned Promise<SyncRuntime> is captured so the Settings save
 	// callback can call `reconcileAutoSync()` to start polling after a
-	// mid-session `syncEnabled` flip ON (plan §P2 fix).
+	// mid-session `autoSyncEnabled` flip ON (plan §P2 fix).
 	//
 	// `kbInitPromise` is the gate that holds back the first sync round
 	// until `initializeKBFolder()` has written `<localFolder>/<repo>/
@@ -631,17 +637,15 @@ export function activate(context: vscode.ExtensionContext): void {
 	const kbInitPromise = new Promise<void>((resolve) => {
 		resolveKbInit = resolve;
 	});
-	const syncActivation = activateSync(context, statusBar, kbInitPromise).catch(
-		(e) => {
-			log.warn("Memory Bank sync activation failed: %s", (e as Error).message);
-			return null;
-		},
-	);
-
-	// ── Stores (host-side state controllers) ────────────────────────────────
-	// Stores own mutable state, watchers, and bridge calls. Providers /
-	// commands / (future) WebView adapters are thin subscribers.
-	const statusStore = new StatusStore(bridge, authService);
+	const syncActivation = activateSync(
+		context,
+		statusBar,
+		kbInitPromise,
+		statusStore,
+	).catch((e) => {
+		log.warn("Memory Bank sync activation failed: %s", (e as Error).message);
+		return null;
+	});
 	const memoriesStore = new MemoriesStore(bridge);
 	const plansStore = new PlansStore(bridge, {
 		workspaceRoot,
@@ -825,6 +829,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			onDidChangeTreeData:
 				statusProvider.onDidChangeTreeData.bind(statusProvider),
 			getWorkerBusy: () => statusProvider.getWorkerBusy(),
+			getSyncPhase: () => statusStore.getSnapshot().syncPhase,
 		},
 		memoriesProvider: {
 			serialize: () => memoriesProvider.serialize(),
@@ -942,14 +947,17 @@ export function activate(context: vscode.ExtensionContext): void {
 	// until something invalidates the cache and asks the webview to re-list.
 	// `activateSync` ran earlier; the runtime stashes the callback and reuses
 	// it for any orchestrator built later (eager or lazy).
-	// Edge-triggered popup for `symlink_quarantine_failed` (plan §P2 / I6).
-	// Status-bar tooltip is invisible until hover, so a security-gate stall
-	// must surface a one-shot notification. The gate re-arms on the next
-	// non-failed round, so transient EBUSY/AV cases self-recover.
-	const symlinkPopupGate = new SymlinkPopupGate();
+	// Symlink popup gate REMOVED — the upstream `symlink_quarantine_failed`
+	// round-terminal code was deleted in Phase 1 alongside `SymlinkSweep`.
+	// Symlink defence now lives in stageVault's per-entry `symlinked`
+	// canary (warn-logged with the offending path) and FolderStorage's
+	// `safeAtomicWriteSync` (refuses to traverse a hostile intermediate
+	// segment at write time). Neither path needs a one-shot user popup
+	// because they don't terminate the round — sync continues with the
+	// rogue entries excluded.
 	void syncActivation.then((activation) => {
 		if (!activation) return; // Sync activation failed; nothing to wire.
-		activation.runtime.setOnRoundFinished((state, result) => {
+		activation.runtime.setOnRoundFinished((state, _result) => {
 			// `refreshKnowledgeBaseFolders` covers both halves: it invalidates
 			// `KbFoldersService`'s `cleanRepos` cache AND posts `kb:foldersReset`
 			// to the webview so it re-lists from scratch. Fires for every
@@ -967,19 +975,6 @@ export function activate(context: vscode.ExtensionContext): void {
 				memoriesStore.refresh().catch(handleError("post-sync.memories"));
 			}
 			log.info("post-sync UI refresh fired (state=%s)", state);
-
-			const popup = symlinkPopupGate.consume(result);
-			if (popup !== null) {
-				vscode.window
-					.showErrorMessage(popup.message, ...popup.actions)
-					.then((picked) => {
-						if (picked === "Open Memory Bank Folder") {
-							void revealMemoryBankFolder(workspaceRoot).catch(
-								handleError("symlink-popup.reveal"),
-							);
-						}
-					});
-			}
 		});
 	});
 
@@ -2850,7 +2845,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			await authService.signOut();
 			currentAuthenticated = false;
 			// Stop any active auto-sync polling loop now that credentials are
-			// gone. `clearAuthCredentials` leaves `syncEnabled` intact (so the
+			// gone. `clearAuthCredentials` leaves `autoSyncEnabled` intact (so the
 			// preference auto-resumes on next sign-in), and `reconcileAutoSync`
 			// reads jolliApiKey alongside it — with the key missing, it routes
 			// into the stop branch.
@@ -2918,7 +2913,7 @@ export function activate(context: vscode.ExtensionContext): void {
 							handleError("uriHandler.notifySettings"),
 						);
 						// Start auto-sync polling if the user already had
-						// `syncEnabled=true` from a prior session. Without this,
+						// `autoSyncEnabled=true` from a prior session. Without this,
 						// the orchestrator stays dormant until the next settings
 						// save or window reload — mirroring the symmetric call
 						// in the signOut handler above (line 2452).
@@ -3202,30 +3197,11 @@ async function refreshStatusBar(
  */
 /**
  * Resolves the user's Memory Bank folder for the current workspace and
- * reveals it in the OS file manager via `revealFileInOS`. Used by the
- * `symlink_quarantine_failed` popup so the user can inspect / remove the
- * offending symlink without hunting through Settings.
- *
- * Resolves the folder lazily (re-reads config + repo identity at popup time)
- * so a settings change between activation and the popup is respected.
- */
-async function revealMemoryBankFolder(workspaceRoot: string): Promise<void> {
-	const { extractRepoName, getRemoteUrl, resolveKBPath } = await import(
-		"../../cli/src/core/KBPathResolver.js"
-	);
-	const { loadConfig } = await import("../../cli/src/core/SessionTracker.js");
-	const repoName = extractRepoName(workspaceRoot);
-	const remoteUrl = getRemoteUrl(workspaceRoot);
-	const cfg = await loadConfig();
-	const customKBPath = (cfg as Record<string, unknown>).localFolder as
-		| string
-		| undefined;
-	const kbRoot = resolveKBPath(repoName, remoteUrl, customKBPath);
-	await vscode.commands.executeCommand(
-		"revealFileInOS",
-		vscode.Uri.file(kbRoot),
-	);
-}
+/* `revealMemoryBankFolder` REMOVED — its only caller was the deleted
+ * `symlink_quarantine_failed` popup (SymlinkPopupGate). The new symlink
+ * defences in stageVault / safeAtomicWriteSync don't surface a one-shot
+ * popup, so the helper has no consumer. If a future feature needs an
+ * "open vault in file manager" action, it can be re-added then. */
 
 function handleError(commandName: string): (err: unknown) => void {
 	return (err: unknown) => {

@@ -64,7 +64,7 @@ import {
 import { quarantineCorruptJson } from "./CorruptJsonQuarantine.js";
 import { type GitClient, isNetworkErrorMessage, isRepoMissingMessage, isServerRejectionMessage } from "./GitClient.js";
 import { LegacyMigration } from "./LegacyMigration.js";
-import { MemoryBankBootstrap } from "./MemoryBankBootstrap.js";
+import { isPerDeviceJsonPath, MemoryBankBootstrap } from "./MemoryBankBootstrap.js";
 import { clearPendingLock, readPendingLock, writePendingLock } from "./PendingLockStore.js";
 import {
 	findRepoMappingConflicts,
@@ -73,20 +73,36 @@ import {
 	resolveOrAssignFolder,
 	saveRepoMapping,
 } from "./RepoMapping.js";
-import { type SweepReport, sweepSymlinks } from "./SymlinkSweep.js";
+import { stageVault } from "./StageVault.js";
 import { acquireSyncLock, refreshSyncLockMtime, releaseSyncLock } from "./SyncLock.js";
 import type {
 	ConflictRecord,
 	GitCredentials,
 	SyncErrorCode,
+	SyncPhase,
 	SyncRoundOptions,
 	SyncRoundResult,
 	SyncState,
 	VaultLockedWaitInfo,
 } from "./SyncTypes.js";
 import { normalizeGitUrl, verifyVaultMarker, writeVaultMarker } from "./VaultMarker.js";
+import { classifyVaultPath } from "./VaultPathClassifier.js";
+import { acquireVaultWriteLock, DEFAULT_PULL_LOCK_WAIT_MS } from "./VaultWriteLock.js";
 
 const log = createLogger("Sync:Engine");
+
+/**
+ * Sentinel thrown by `pullRebaseLocked` when `vault-write.lock` is held by
+ * a concurrent QueueWorker longer than `DEFAULT_PULL_LOCK_WAIT_MS` allows.
+ * Caught in `runRound` and routed to the transient `network` outcome so
+ * the next round retries; not a terminal red "Sync failed".
+ */
+class VaultLockBusyError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "VaultLockBusyError";
+	}
+}
 
 /**
  * One factory per round so a single `SyncEngine` instance can drive
@@ -157,6 +173,29 @@ export interface SyncEngineOpts {
 	readonly ai: () => Promise<AiMergeProvider | null>;
 	readonly ui: ConflictUi;
 	readonly onStateChange?: (state: SyncState, ctx: SyncRoundResult) => void;
+	/**
+	 * Fired AFTER `sync.lock` (and any per-round `vault-write.lock` held by
+	 * `withPullLock`) have been released, regardless of round outcome.
+	 *
+	 * Closes the "chain-spawn from sync release" promise documented at
+	 * `QueueWorker.ts` (~line 264). A worker that hit the 60 s
+	 * `vault-write.lock` wait and exited leaves its queue entries undrained;
+	 * historically the only thing that woke them was the next `post-commit`
+	 * hook on the source repo. If the user stopped committing right after
+	 * the timeout, summaries sat in the queue indefinitely.
+	 *
+	 * The wireup point (`SyncBootstrap` for CLI, `VsCodeSyncBootstrap` for
+	 * the extension) passes `launchWorker(cwd)` here. The engine itself does
+	 * NOT import `QueueWorker` — that would couple `cli/src/sync/` to
+	 * `cli/src/hooks/` and create a layering cycle. Errors thrown from the
+	 * callback are caught + logged (same convention as `onStateChange` /
+	 * `onLockedWait`).
+	 *
+	 * `cwd` is the source-repo cwd from the `SyncRoundOptions`, which is
+	 * what `launchWorker` expects (the queue lives under
+	 * `<cwd>/.jolli/jollimemory/git-op-queue/`).
+	 */
+	readonly onRoundComplete?: (cwd: string) => void;
 	readonly lockTimeoutMs?: number;
 	readonly refreshIntervalMs?: number;
 	readonly maxPushRetries?: number;
@@ -178,6 +217,16 @@ export interface SyncEngineOpts {
 	 * the callback are caught + logged (don't break the round).
 	 */
 	readonly onLockedWait?: (info: VaultLockedWaitInfo) => void;
+	/**
+	 * Mid-round phase progress fired at the entry of each user-facing phase
+	 * (download / merge / resolve / upload / wait). Drives the sidebar
+	 * toolbar's per-phase label so the user can tell *where* a round is —
+	 * and, on failure, which phase broke. See `SyncPhase` doc for which
+	 * engine steps map to which phase. Best-effort: errors thrown by the
+	 * callback are caught + logged (don't break the round), same semantics
+	 * as `onStateChange` and `onLockedWait`.
+	 */
+	readonly onPhase?: (phase: SyncPhase) => void;
 	/**
 	 * Fired when `repos.json` is observed with 2+ `repoIdentity` values
 	 * claiming the same folder (plan §P2#3). The merge layer no longer
@@ -287,15 +336,126 @@ interface RoundState {
 /** Recovery cause passed to `tryRemint` purely for log/telemetry clarity. */
 type RemintCause = "unauthorized" | "repoMissing";
 
+/** Cap on per-round canary path lists to keep structured logs small. */
+const CANARY_PATH_CAP = 10;
+
 export class SyncEngine {
 	private readonly opts: SyncEngineOpts;
+	/**
+	 * Per-round accumulator for `stageVault` canary buckets. Reset at the
+	 * start of each `runRound` and folded into the returned `SyncRoundResult`
+	 * before the lock is released. `runRound` is serialised by `sync.lock`,
+	 * so this field is never observed by two rounds concurrently.
+	 */
+	private canary: { symlinked: string[]; unowned: string[] } = { symlinked: [], unowned: [] };
 
 	constructor(opts: SyncEngineOpts) {
 		this.opts = opts;
 	}
 
+	/**
+	 * Stages via `stageVault` and folds the report's `symlinked` / `unowned`
+	 * arrays into `this.canary`. Replaces every direct `stageVault` call so
+	 * a synced-but-rogue round can still surface the canary on
+	 * `SyncRoundResult.canary` — without this, `symlinked` paths would only
+	 * appear in StageVault's own warn log and the round would show green
+	 * with no UI affordance.
+	 */
+	private async stageVaultTracked(
+		client: GitClient,
+		memoryBankRoot: string,
+		opts: { syncTranscripts: boolean },
+	): Promise<void> {
+		const report = await stageVault(client, memoryBankRoot, opts);
+		if (report.symlinked.length > 0) {
+			const room = CANARY_PATH_CAP - this.canary.symlinked.length;
+			if (room > 0) this.canary.symlinked.push(...report.symlinked.slice(0, room));
+		}
+		if (report.unowned.length > 0) {
+			const room = CANARY_PATH_CAP - this.canary.unowned.length;
+			if (room > 0) this.canary.unowned.push(...report.unowned.slice(0, room));
+		}
+	}
+
+	/**
+	 * Classifier-aware "is there anything owned that needs to be committed?"
+	 * probe. Used as the idle short-circuit gate in `doRound` — see the doc
+	 * comment at the call site for why `GitClient.hasUncommittedChanges`
+	 * (plain `git status --porcelain`, no `--ignored`) is the wrong gate
+	 * under the deny-all `.gitignore` regime.
+	 *
+	 * Mirrors `stageVault`'s entry-by-entry classification:
+	 *
+	 *   - Unmerged (`U`) → counted as dirty. The conflict resolver should have
+	 *     handled these earlier, but if one slipped through we must NOT
+	 *     idle-skip — staging them later will at least surface the issue.
+	 *   - `classifyVaultPath(path) === null` → unowned. Skipped here; the
+	 *     canary surface (via `stageVaultTracked`) is the right reporting
+	 *     channel and forcing a stage round just for unowned noise (e.g. the
+	 *     `.memorybank-state.json` sentinel, P3 #1) wastes a network push.
+	 *   - `kind === "transcript"` + `syncTranscripts: false` → skipped (same
+	 *     rule `stageVault` applies — transcripts gated by config).
+	 *   - Renames contribute their `path` (new side) for classification; the
+	 *     old side's del is captured by the same entry implicitly.
+	 *   - Anything else with a non-null `kind` → DIRTY → returns true
+	 *     immediately (no need to inspect the rest).
+	 *
+	 * The classifier knows nothing about leaf-symlink hostile placement
+	 * (that's `stageVault`'s domain). For an idle-gate probe a symlink at
+	 * a classifier-matching location is still "dirty" — we want the round
+	 * to continue into `stageVaultTracked`, where the symlink gets routed
+	 * into the canary instead of the commit. So we DON'T lstat here.
+	 */
+	private async hasOwnedDirtyPaths(client: GitClient, syncTranscripts: boolean): Promise<boolean> {
+		const entries = await client.statusPorcelainZ();
+		// R2: a rename entry has `path = newPath` and `oldPath = oldPath`.
+		// `stageVault.decomposeOps` splits it into `del(old) + add(new)` and
+		// classifies each side independently — so a rename FROM an owned
+		// path TO an unowned path emits a real `git rm --cached` for the
+		// owned old side, even though the new side classifies to `null`.
+		// This probe must mirror that: classify BOTH sides for rename
+		// entries, otherwise an "owned → unowned" rename looks idle here
+		// and the del never reaches a commit until the next non-idle round
+		// happens to bundle it in. Window is small (next owned write fixes
+		// it via step 7's stageVault), but it's an avoidable
+		// time-of-eventual-consistency gap.
+		const isOwnedDirty = (path: string): boolean => {
+			const kind = classifyVaultPath(path);
+			if (kind === null) return false;
+			if (kind === "transcript" && !syncTranscripts) return false;
+			return true;
+		};
+		for (const e of entries) {
+			if (e.indexStatus === "U" || e.worktreeStatus === "U") return true;
+			if (isOwnedDirty(e.path)) return true;
+			if (e.oldPath !== undefined && isOwnedDirty(e.oldPath)) return true;
+			// P2#2 — engine-driven per-device JSON cleanup. `ensureBootstrap`
+			// runs `git rm --cached` against `PER_DEVICE_JSON_GLOBS`
+			// (currently just `**/.jolli/shadow-status.json`) every round so
+			// legacy committed copies get untracked. On repos that actually
+			// have such a legacy entry, this produces a staged `D` against
+			// HEAD. The classifier returns null for the path (it's
+			// per-device, not owned in the sync sense), so without this
+			// case the round would idle-short-circuit and the deletion
+			// would never reach `commit` + `push` — it would re-stage
+			// every round in perpetuity. Treat staged deletions of these
+			// engine-owned cleanup targets as dirty so the round runs
+			// through to commit.
+			if (e.indexStatus === "D" && isPerDeviceJsonPath(e.path)) return true;
+		}
+		return false;
+	}
+
+	/** Returns the per-round canary if either bucket is non-empty, else undefined. */
+	private takeCanary(): SyncRoundResult["canary"] {
+		const { symlinked, unowned } = this.canary;
+		if (symlinked.length === 0 && unowned.length === 0) return undefined;
+		return { symlinked: [...symlinked], unowned: [...unowned] };
+	}
+
 	async runRound(round: SyncRoundOptions): Promise<SyncRoundResult> {
 		log.info("runRound start reason=%s cwd=%s", round.reason, round.cwd);
+		this.canary = { symlinked: [], unowned: [] };
 		const lockAcquired = await acquireSyncLock({
 			timeoutMs: this.opts.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
 		});
@@ -304,24 +464,52 @@ export class SyncEngine {
 			return this.report("syncing", { fetched: false, pulled: false, pushed: false, conflicts: [] });
 		}
 
+		// `vault-write.lock` is NOT acquired around the whole round any more
+		// — per UX feedback, a user committing during a 30-90 s sync round
+		// would otherwise wait the full round before their summary appears.
+		// Instead, the lock is held only inside `pullRebase` (a few seconds),
+		// which is the actual window where a concurrent worker could corrupt
+		// the working tree (R9). The non-pull phases (stage / commit / push
+		// for sync; LLM + writeFiles for worker) can run concurrently — at
+		// worst they produce a partial commit that next round captures
+		// cleanly (R8, benign / eventually consistent).
+		//
+		// `doRound` calls the wrapped `pullRebase` directly via this engine's
+		// `pullRebaseLocked` helper (defined below), so all pull sites get
+		// the same lock treatment without runRound caring.
+
 		const refresher = setInterval(() => {
 			void refreshSyncLockMtime();
 		}, this.opts.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS);
 
 		try {
-			const result = await this.doRound(round);
+			// Resolve round context once, up front, and thread into doRound so
+			// we don't double-call `resolveContext` per round.
+			const ctx = await this.opts.resolveContext(round);
+			const result = await this.doRound(round, ctx);
 			log.info("runRound end state=%s pushed=%s pulled=%s", result.newState, result.pushed, result.pulled);
 			return result;
 		} catch (e) {
-			// Catch any uncaught error (e.g. SyncBackendError 4xx/5xx that isn't
-			// network/auth, a bogus `localFolder`, or a programming bug). Logging
-			// here is the only way the user sees what went wrong — the
-			// orchestrator's IIFE swallows the throw and only marks status=offline.
+			// Catch any uncaught error (e.g. SyncBackendError 4xx/5xx that
+			// isn't network/auth, a bogus `localFolder`, a `resolveContext`
+			// throw, or a programming bug). Logging here is the only way the
+			// user sees what went wrong — the orchestrator's IIFE swallows
+			// the throw and only marks status=offline.
 			log.error(
 				"runRound threw — going offline: %s\n%s",
 				(e as Error).message,
 				(e as Error).stack ?? "(no stack)",
 			);
+			// `VaultLockBusyError` is the polite "worker is busy" surface from
+			// `pullRebaseLocked` — retry semantics are transient (next round
+			// succeeds), so route to `network` rather than the terminal red
+			// "Sync failed" branch.
+			if (e instanceof VaultLockBusyError) {
+				return this.reportOffline(
+					{ fetched: false, pulled: false, pushed: false, conflicts: [] },
+					{ code: "network", message: e.message },
+				);
+			}
 			// Map to a terminal failure code so StatusOrchestrator renders the
 			// red "Sync failed" branch with the exception message in the tooltip,
 			// rather than a bare "Offline" that's indistinguishable from a
@@ -333,11 +521,95 @@ export class SyncEngine {
 		} finally {
 			clearInterval(refresher);
 			await releaseSyncLock();
+			// Chain-spawn hook (P2 #1). Fire AFTER the lock release so the
+			// worker we spawn won't immediately re-collide with our own
+			// `sync.lock`. `vault-write.lock` held by `withPullLock` is
+			// already released by its own finally inside `doRound`. Errors
+			// from the callback are best-effort — logged, not propagated;
+			// the worker spawn is recovery, not correctness.
+			if (this.opts.onRoundComplete !== undefined) {
+				try {
+					this.opts.onRoundComplete(round.cwd);
+				} catch (e) {
+					log.debug("onRoundComplete callback threw (swallowed): %s", (e as Error).message);
+				}
+			}
 		}
 	}
 
-	private async doRound(round: SyncRoundOptions): Promise<SyncRoundResult> {
-		const ctx = await this.opts.resolveContext(round);
+	/**
+	 * Wraps `client.pullRebase` in a brief `vault-write.lock` so a concurrent
+	 * QueueWorker's writes don't tear the working tree mid-merge (R9). Lock
+	 * is held only for the pull duration (typically 2-5 s, not the whole
+	 * round). On timeout, the lock is treated as held by a long-running worker
+	 * and the caller decides what to do — same surface as the underlying
+	 * `pullRebase` call would have on a network error.
+	 *
+	 * Wait budget: `DEFAULT_PULL_LOCK_WAIT_MS` (10 s). A worker's
+	 * `vault-write.lock` can be held for its whole drain (~30 s with LLM),
+	 * so 10 s is intentionally below worst-case worker time — we *want*
+	 * sync to yield rather than wait through a long worker drain. On
+	 * timeout we throw `VaultLockBusyError`, `runRound` maps it to
+	 * `network` (transient), and the next 90-min poll retries.
+	 */
+	private async pullRebaseLocked(
+		client: GitClient,
+		memoryBankRoot: string,
+		author: { readonly name: string; readonly email: string },
+	): Promise<Awaited<ReturnType<GitClient["pullRebase"]>>> {
+		return this.withPullLock(memoryBankRoot, async () => client.pullRebase(author));
+	}
+
+	/**
+	 * Acquires `vault-write.lock`, runs `fn`, releases the lock on every
+	 * exit path. Extracted from `pullRebaseLocked` so the main doRound pull
+	 * site can extend the lock window across conflict resolution — when
+	 * `pullRebase` returns `{ conflicted: [...] }`, the rebase is PAUSED
+	 * on disk and `ConflictResolver.resolveAll` writes files + eventually
+	 * calls `rebase --continue`. Releasing the lock between the two halves
+	 * lets a concurrent QueueWorker write into the paused-rebase window,
+	 * which is exactly the corruption surface the lock was meant to close.
+	 *
+	 * The push-retry site uses the shorter pullRebase-only form (no
+	 * resolver involvement — it aborts on conflict and returns).
+	 *
+	 * On timeout, throws `VaultLockBusyError` so `runRound`'s outer catch
+	 * routes the round to transient `network`.
+	 */
+	private async withPullLock<T>(memoryBankRoot: string, fn: () => Promise<T>): Promise<T> {
+		const lock = await acquireVaultWriteLock(memoryBankRoot, {
+			wait: DEFAULT_PULL_LOCK_WAIT_MS,
+		});
+		if (lock === null) {
+			throw new VaultLockBusyError(
+				"vault-write.lock unavailable for pullRebase (a QueueWorker is busy writing to this vault). Will retry on next sync round.",
+			);
+		}
+		// Refresh `vault-write.lock`'s mtime while `fn` runs. The lock can be
+		// held across `ConflictResolver.resolveAll`, which may invoke N Tier 2
+		// AI merges (~30 s each) and/or open-ended Tier 3 user prompts. If the
+		// total exceeds `LOCK_TIMEOUT_MS` (5 min), a peer `acquireWithPoll`
+		// would mtime-reclaim the lock and a concurrent QueueWorker write could
+		// land in the paused-rebase window — exactly the R9 race this lock was
+		// added to close. The 60 s interval matches the `sync.lock` refresher
+		// (well below the 5 min reclaim threshold).
+		const refresher = setInterval(() => {
+			void lock.refresh();
+		}, this.opts.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS);
+		try {
+			return await fn();
+		} finally {
+			clearInterval(refresher);
+			await lock.release();
+		}
+	}
+
+	private async doRound(round: SyncRoundOptions, ctx: RoundContext): Promise<SyncRoundResult> {
+		// `ctx` is resolved once in `runRound` (before vault-write.lock
+		// acquisition) and threaded in here so we don't double-call
+		// `resolveContext` per round. Pre-fix `doRound` called it again;
+		// safe because `defaultResolveContext` is pure, but two `loadConfig()`
+		// reads per round is wasteful.
 
 		// 1. Mint fresh credentials at round start. No cross-round cache (§0.6).
 		const initialMint = await this.mintFresh();
@@ -364,11 +636,74 @@ export class SyncEngine {
 			);
 		}
 
+		// 2b. Self-heal stale `rebase` state from a previous round that was
+		// killed mid-flight (SIGTERM on VSIX reinstall, laptop sleep, crash).
+		// `.git/rebase-merge/` or `.git/rebase-apply/` left behind blocks
+		// every subsequent `pull --rebase` and surfaces as a sticky
+		// "Couldn't merge changes" with no actionable UI path forward — the
+		// customer would otherwise have to `cd` into the vault and run
+		// `git rebase --abort` by hand.
+		//
+		// Safe to abort unconditionally: the vault working tree is exclusively
+		// driven by SyncEngine, so any in-progress rebase there is one we
+		// started ourselves; the temporary "preserve work from HEAD" commit
+		// `ensureOnDefaultBranch` makes pre-rebase is dropped, but the user's
+		// actual edits live in a separate `[jolli-mb] reconcile: …` commit
+		// that's already on `<defaultBranch>` and survives the abort.
+		//
+		// `isRebaseInProgress` swallows ENOENT (no `.git/` yet → first-bind),
+		// so this is a no-op on the cold-clone path.
+		try {
+			if (await state.client.isRebaseInProgress()) {
+				log.warn("Stale rebase state detected at round start — aborting (previous round was interrupted)");
+				try {
+					await state.client.rebaseAbort();
+				} catch (e) {
+					// Last-resort: if `git rebase --abort` itself fails (e.g.
+					// corrupt state files), continue anyway — fetch / pullRebase
+					// below will report a real error with a useful code that
+					// the toolbar can surface, rather than hiding it behind a
+					// "couldn't self-heal" message that the customer can't act
+					// on.
+					log.warn("rebase --abort during self-heal failed (continuing): %s", (e as Error).message);
+				}
+			}
+		} catch (e) {
+			// Probe itself failed (very rare; means stat() threw something
+			// other than ENOENT). Log + continue — round may still succeed.
+			log.debug("isRebaseInProgress probe threw (continuing): %s", (e as Error).message);
+		}
+
+		// 2c. Self-heal stale `.git/*.lock` files from a SIGKILL'd previous
+		// git op (`index.lock`, `HEAD.lock`, `refs/**.lock`, `packed-refs.lock`,
+		// `config.lock`). Leaving them would make the next `git add` /
+		// `git commit` / `git fetch` fail with "File exists" and surface as a
+		// sticky terminal error with no actionable UI path.
+		//
+		// TTL is 5 minutes (set in `sweepStaleLockFiles`). Long enough that
+		// an out-of-band manual `git fetch` / `git gc` / `git rebase` the
+		// user might run in the vault folder isn't ripped out from under
+		// them — engine ops finish in milliseconds, so a 5 min lock is
+		// definitively a corpse.
+		try {
+			const sweep = await state.client.sweepStaleLockFiles();
+			if (sweep.removed.length > 0) {
+				log.warn(
+					"Removed %d stale .git/*.lock file(s) from previous interrupted round: %s",
+					sweep.removed.length,
+					sweep.removed.join(", "),
+				);
+			}
+		} catch (e) {
+			log.debug("sweepStaleLockFiles threw (continuing): %s", (e as Error).message);
+		}
+
 		// 3. Clone-or-fetch with step-level retry + at-most-one re-mint
 		// recovery on 401 / 404. "Needs clone" is detected by probing
 		// `<memoryBankRoot>/.git` rather than parsing git's stderr — git can
 		// return non-zero with empty stderr, and parsing error strings
 		// broke once in the field already.
+		this.emitPhase("downloading");
 		const fetched = await this.fetchOrCloneWithRetry(state);
 		if (!fetched.ok) {
 			log.warn("Clone/fetch failed: %s — going offline", fetched.message);
@@ -381,34 +716,19 @@ export class SyncEngine {
 		// `[jolli-mb] migrate: …` on the very first push (source plan §4.1).
 		const isFirstBind = fetched.cloned;
 
-		// 3a. Sweep symlinks BEFORE any git stage/commit, file write, or
-		// branch-switch commit happens (plan §P2 revised). Any symlink
-		// that survives this point would be staged by the next `git add
-		// --all` — including the pre-pull auto-reconcile commit, the
-		// `ensureOnDefaultBranch` preserve-side-work commit, the migration
-		// push, and `MemoryBankBootstrap.writeFile(.gitignore)` (which
-		// would FOLLOW a hostile `.gitignore` symlink and overwrite the
-		// target file).
+		// Pre-round symlink sweep — REMOVED in Phase 1. Replacement is
+		// INCOMPLETE by design (single-user multi-device threat model, not
+		// team-shared vaults):
 		//
-		// A second sweep runs right before the steady-state stageAll as
-		// defence-in-depth against any symlink created mid-round by a
-		// racing process or by a tool we invoked (none today, but cheap
-		// insurance).
-		{
-			const sweep = await runSweep(state.ctx.memoryBankRoot, "pre-round");
-			if (sweep.failed !== 0) {
-				return this.reportOffline(
-					{ fetched: true, pulled: false, pushed: false, conflicts: [] },
-					{
-						code: "symlink_quarantine_failed",
-						message: formatSweepError("pre-round", sweep),
-					},
-				);
-			}
-			if (sweep.quarantined > 0) {
-				log.info("Pre-round symlink sweep quarantined=%d (plan §P2)", sweep.quarantined);
-			}
-		}
+		//   - `stageVault` blocks staging of symlinked paths (canary +
+		//     refuse-to-add). Only catches staging, not earlier writes.
+		//   - `safeAtomicWriteSync` guards `FolderStorage.atomicWrite` and
+		//     `MemoryBankBootstrap`.
+		//   - NOT guarded: `MetadataManager`, `RepoMapping`,
+		//     `LegacyMigration`, `ConflictResolver`'s default writer.
+		//     Deferred — engine-generated content (no peer payload
+		//     control) except `ConflictResolver`, which is the one to
+		//     revisit if team-shared vaults are introduced.
 
 		// 3b. Ensure HEAD is on the backend-declared default branch before
 		// any further git activity (plan §P1#2). The vault working tree is
@@ -431,7 +751,7 @@ export class SyncEngine {
 		// Pending work on the side branch is preserved by committing it
 		// FIRST (so reflog can recover it later) — the assumption is the
 		// content belongs to a Memory Bank state, not random work.
-		const branchSwitch = await this.ensureOnDefaultBranch(state, ctx);
+		const branchSwitch = await this.ensureOnDefaultBranch(state, ctx, round.transcripts);
 		if (!branchSwitch.ok) {
 			return this.reportOffline(
 				{ fetched: true, pulled: false, pushed: false, conflicts: [] },
@@ -472,8 +792,19 @@ export class SyncEngine {
 		//
 		// Failure here is logged but NOT fatal — pullRebase will hit the
 		// same dirty state and surface a clear error in that case.
+		this.emitPhase("merging");
 		try {
-			if (await state.client.hasUncommittedChanges()) {
+			// R9 — use the classifier-aware probe (same gate as the idle
+			// short-circuit). Plain `hasUncommittedChanges` is blind to
+			// gitignored-but-owned files (the deny-all `.gitignore` regime
+			// marks every FolderStorage write as ignored), so it would
+			// route a brand-new owned file through the no-reconcile path
+			// — the commit message would then label that round
+			// `[jolli-mb] sync: …` instead of `[jolli-mb] reconcile: …`.
+			// Data-wise step 7's unconditional `stageVaultTracked` covers
+			// it; this fix only restores the message label so `git log`
+			// reads as designed.
+			if (await this.hasOwnedDirtyPaths(state.client, round.transcripts)) {
 				log.info("Vault has uncommitted changes — auto-staging before pullRebase");
 				// §I9 — quarantine corrupt aggregate JSON BEFORE stageAll so
 				// a mid-write / truncated `.jolli/**/*.json` never reaches
@@ -490,7 +821,16 @@ export class SyncEngine {
 						corrupt.paths.join(", "),
 					);
 				}
-				await state.client.stageAll();
+				// Auto-reconcile path: stage classifier-owned paths only.
+				// `stageAll` would have happily committed any user-dropped
+				// file (OS junk, IDE swap files, hostile symlinks) that
+				// happens to be in the working tree post-pull-rebase. The
+				// allowlist staging keeps reconcile commits scoped to
+				// FolderStorage's own write surface; canary surfaces
+				// anything unowned.
+				await this.stageVaultTracked(state.client, ctx.memoryBankRoot, {
+					syncTranscripts: round.transcripts,
+				});
 				await state.client.commit("[jolli-mb] reconcile: user-modified vault entries", ctx.author);
 			}
 		} catch (e) {
@@ -512,6 +852,14 @@ export class SyncEngine {
 		const remoteHasDefault = await state.client.refExists(`refs/remotes/origin/${defaultBranch}`);
 		const allConflicts: ConflictRecord[] = [];
 		let pulled = false;
+		// `pull.fastForwarded === true` means pullRebase actually moved HEAD
+		// forward (i.e. integrated a peer commit). Tracked separately from
+		// `pulled` (which only means "pullRebase was called successfully")
+		// because the idle short-circuit downstream needs to know whether
+		// the working tree changed — when it did, we MUST run step 6's
+		// pre-stage symlink sweep against the peer-pushed content. See the
+		// short-circuit doc comment at step 5b for the full rationale.
+		let workingTreeChangedByPull = false;
 		if (!remoteHasDefault) {
 			log.info(
 				"pullRebase skipped — origin/%s not present (empty-remote first-bind); the round's commit + push will create it",
@@ -520,11 +868,37 @@ export class SyncEngine {
 		}
 		try {
 			if (remoteHasDefault) {
-				const pull = await state.client.pullRebase(ctx.author);
+				// Hold `vault-write.lock` across BOTH `pullRebase` AND any
+				// follow-up `ConflictResolver.resolveAll`. The resolver
+				// writes merged content + eventually calls `rebase
+				// --continue`; releasing the lock between the two halves
+				// would let a concurrent QueueWorker write into the
+				// paused-rebase window. `withPullLock` throws
+				// `VaultLockBusyError` on acquire timeout — `runRound`'s
+				// outer catch routes that to transient `network`.
+				const lockResult = await this.withPullLock(ctx.memoryBankRoot, async () => {
+					const pull = await state.client.pullRebase(ctx.author);
+					let resolverReport: { rebaseAdvanced: boolean; skipped: ReadonlyArray<string> } | null = null;
+					if (pull.conflicted.length > 0) {
+						this.emitPhase("resolving");
+						const resolver = await this.buildResolver(state.client, ctx);
+						resolverReport = await resolver.resolveAll(pull.conflicted);
+					}
+					return { pull, resolverReport };
+				});
+				const pull = lockResult.pull;
 				pulled = true;
-				if (pull.conflicted.length > 0) {
-					const resolver = await this.buildResolver(state.client, ctx);
-					const report = await resolver.resolveAll(pull.conflicted);
+				if (pull.fastForwarded) {
+					workingTreeChangedByPull = true;
+				}
+				if (lockResult.resolverReport !== null) {
+					const report = lockResult.resolverReport;
+					// Conflicted paths that resolved successfully wrote peer
+					// content into the working tree — same defence concern
+					// as fast-forward (sweep symlinks before staging).
+					if (report.rebaseAdvanced) {
+						workingTreeChangedByPull = true;
+					}
 					const detectedAt = new Date().toISOString();
 					for (const path of report.skipped) {
 						allConflicts.push({ path, tier: 3, detectedAt });
@@ -540,6 +914,12 @@ export class SyncEngine {
 				}
 			}
 		} catch (e) {
+			// `VaultLockBusyError` is the polite "worker is busy" surface
+			// from `pullRebaseLocked`. Re-throw so `runRound`'s outer catch
+			// routes it to transient `network` — mapping to `pull_failed`
+			// here would obscure a benign retry-soon condition as a
+			// "Sync failed" red flag.
+			if (e instanceof VaultLockBusyError) throw e;
 			const msg = (e as Error).message;
 			// Same classifier as clone/fetch so a TLS / DNS / connection
 			// failure on `git pull --rebase` rolls up to `code: "network"`
@@ -612,37 +992,101 @@ export class SyncEngine {
 		});
 		await bootstrap.ensureBootstrap();
 
-		// 6. Second symlink sweep — defence-in-depth (plan §P2 revised).
-		//    The PRIMARY sweep ran at step 3a, before any commit or file
-		//    write. This second pass catches anything created during the
-		//    round: a racing user/process drop, a Tier-2 merge that
-		//    materialised a symlink (none today, but cheap insurance),
-		//    or — critically — a fresh symlink dropped between pullRebase
-		//    pulling in a peer's commit and our final stageAll. Without
-		//    this pass, a remote symlink that just landed via pull would
-		//    immediately re-stage in our push.
-		{
-			const sweep = await runSweep(effectiveCtx.memoryBankRoot, "pre-stage");
-			if (sweep.failed !== 0) {
-				return this.reportOffline(
-					{ fetched: true, pulled: true, pushed: false, conflicts: [] },
-					{
-						code: "symlink_quarantine_failed",
-						message: formatSweepError("pre-stage", sweep),
-					},
+		// 5b. Idle-round short-circuit (perf). When local HEAD already
+		// equals `origin/<defaultBranch>` AND the working tree is clean,
+		// every remaining step in this round (pre-stage sweep, stageAll,
+		// commit, push, notify-push) is a guaranteed no-op — but each one
+		// still costs a child-process spawn or a network round-trip. On a
+		// fully idle poll tick (no local edits, no remote pushes) this
+		// trims ~2-3 s off the round.
+		//
+		// Conditions:
+		//   - `remoteHasDefault` (skip on empty-remote first-bind; we MUST
+		//     create + push the initial branch in that path).
+		//   - `!workingTreeChangedByPull` — pullRebase neither fast-forwarded
+		//     nor resolved any conflicts. When peer content landed in the
+		//     working tree, step 6's pre-stage symlink sweep is the
+		//     designed defence (see the step-6 doc comment); gating the
+		//     short-circuit on this flag keeps that defence in position
+		//     for exactly the rounds it matters in. The cost is one extra
+		//     sweep + commit cycle on the poll that just absorbed peer
+		//     changes — ~50 ms, dwarfed by the network round-trip we
+		//     already paid for the pull. A pullRebase that was called but
+		//     returned `fastForwarded: false` (the no-op case) leaves this
+		//     flag false and the short-circuit still fires.
+		//   - local and remote HEAD resolve to the same OID. Covers the
+		//     "no new local commits" case (no auto-reconcile, no historical
+		//     un-pushed commits). Together with the flag above, this means
+		//     "nothing on either side changed since the last successful
+		//     round" — the genuine idle case the optimisation targets.
+		//   - working tree clean. `bootstrap.ensureBootstrap` may have just
+		//     written / rewrote `.gitignore`; if so we MUST commit + push
+		//     so peers see the change.
+		//
+		// Probe failures fall through to the normal stageAll → commit →
+		// push path. That path is its own self-check (commit's "nothing
+		// to commit" branch + push's "Everything up-to-date" branch) so
+		// correctness is preserved if we guess wrong.
+		if (remoteHasDefault && !workingTreeChangedByPull) {
+			try {
+				const localHead = await state.client.currentHead();
+				const remoteHead = await state.client.revParse(`refs/remotes/origin/${defaultBranch}`);
+				// `hasUncommittedChanges` (plain `git status --porcelain` with
+				// no `--ignored`) cannot see brand-new owned files: the
+				// engine-managed `.gitignore` is `*` + `!.gitignore`, so every
+				// FolderStorage-produced summary / aggregate / Markdown lands
+				// as IGNORED, not UNTRACKED, and is omitted from plain status.
+				// Using it as the idle gate would let a freshly-onboarded
+				// repo folder (or any round where the only local change is a
+				// new owned file) flip to `synced` without ever staging or
+				// pushing — the user sees the green checkmark, the remote
+				// never receives the data. The classifier-aware probe below
+				// runs `statusPorcelainZ` (which DOES include ignored files
+				// via `--ignored=matching`) and checks whether any entry
+				// classifies as owned; only then is the round genuinely idle.
+				const hasDirtyOwned = await this.hasOwnedDirtyPaths(state.client, round.transcripts);
+				if (remoteHead !== null && localHead === remoteHead && !hasDirtyOwned) {
+					log.info(
+						"Idle round — local %s matches origin/%s and no owned paths dirty; skipping commit/push",
+						localHead.slice(0, 12),
+						defaultBranch,
+					);
+					return this.report("synced", {
+						fetched: true,
+						pulled,
+						pushed: false,
+						conflicts: allConflicts,
+					});
+				}
+			} catch (e) {
+				log.debug(
+					"Idle short-circuit probe failed (continuing through normal commit/push path): %s",
+					(e as Error).message,
 				);
-			}
-			if (sweep.quarantined > 0) {
-				log.info("Pre-stage symlink sweep quarantined=%d (defence-in-depth, plan §P2)", sweep.quarantined);
 			}
 		}
 
-		// 7. Commit + push. `stageAll` followed by `commit` is a no-op when
-		//    the working tree matches HEAD; the unconditional push below is
-		//    idempotent in that case too.
+		// 6. Second symlink sweep — defence-in-depth (plan §P2 revised).
+		//    The PRIMARY sweep ran at step 3a, before any commit or file
+		//    write. This second pass catches anything created during the
+		//    round. Pre-stage `runSweep` REMOVED in Phase 1 — same
+		//    rationale as the pre-round site above. `stageVault`'s
+		//    per-entry `symlinked` check is the new defence point for
+		//    "a peer-pushed symlink landed via pullRebase and we're
+		//    about to stage it" — the path goes into the canary bucket
+		//    instead of the commit. See the comment block at the
+		//    pre-round site for the full migration story.
+
+		// 7. Commit + push. `stageVault` followed by `commit` is a no-op
+		//    when the working tree matches HEAD AFTER classifier filtering;
+		//    the unconditional push below is idempotent in that case too.
+		//    `stageVault` (vs the pre-refactor `stageAll`) is the staging
+		//    allowlist enforcement point — only paths the classifier
+		//    recognises get into the commit.
 		const summary = makeCommitSummary(isFirstBind);
-		await state.client.stageAll();
+		await this.stageVaultTracked(state.client, ctx.memoryBankRoot, { syncTranscripts: round.transcripts });
 		await state.client.commit(summary, ctx.author);
+		this.emitPhase("uploading");
 		const pushed = await this.pushWithRetry(state);
 		if (!pushed.ok) {
 			log.warn("Push failed permanently: %s — going offline", pushed.message);
@@ -810,8 +1254,16 @@ export class SyncEngine {
 				op: "migrate",
 				summary: `${legacyReport.filesWritten} items from legacy space`,
 			});
-			await state.client.stageAll();
+			// Migration path: legacy content has already been written
+			// through FolderStorage so it lands on owned-path locations.
+			// `stageVault` enforces that boundary — if `LegacyMigration`
+			// ever writes a path outside the classifier's catalogue, the
+			// canary fires loudly here.
+			await this.stageVaultTracked(state.client, state.ctx.memoryBankRoot, {
+				syncTranscripts: round.transcripts,
+			});
 			await state.client.commit(commitMessage, state.ctx.author);
+			this.emitPhase("uploading");
 			const pushed = await this.pushWithRetry(state);
 			if (!pushed.ok) {
 				return {
@@ -986,6 +1438,7 @@ export class SyncEngine {
 						} catch (cbErr) {
 							log.debug("onLockedWait callback threw (swallowed): %s", (cbErr as Error).message);
 						}
+						this.emitPhase("waiting");
 						await sleep(delayMs);
 						continue;
 					}
@@ -1096,6 +1549,7 @@ export class SyncEngine {
 	private async ensureOnDefaultBranch(
 		state: RoundState,
 		ctx: RoundContext,
+		syncTranscripts: boolean,
 	): Promise<{ readonly ok: true } | { readonly ok: false; readonly code: SyncErrorCode; readonly message: string }> {
 		const defaultBranch = state.creds.defaultBranch;
 		try {
@@ -1128,7 +1582,17 @@ export class SyncEngine {
 						// onto `origin/<default>`. For aggregate files the
 						// resulting conflict goes through the conflict
 						// resolver's Tier 1.5 deterministic merge.
-						if (await state.client.hasUncommittedChanges()) {
+						// `includeIgnored: true` is critical here. The deny-all
+						// `.gitignore` template (MemoryBankBootstrap.ts) makes
+						// every FolderStorage-written summary / repos.json /
+						// markdown match `*` → ignored. Plain `--porcelain`
+						// returns empty, the check falls through, and
+						// `checkoutTrackingBranch` silently overwrites the
+						// ignored files when `origin/<default>` carries tracked
+						// files at the same paths. Widening to `--ignored=matching`
+						// surfaces them so we defer to the auto-reconcile path
+						// instead.
+						if (await state.client.hasUncommittedChanges({ includeIgnored: true })) {
 							log.warn(
 								"Unborn HEAD on '%s' with local working-tree content — deferring branch adoption to auto-reconcile + pullRebase (Tier 1.5)",
 								defaultBranch,
@@ -1156,8 +1620,24 @@ export class SyncEngine {
 			// pre-§P1#2 stranded-commits case recoverable: the commit lands
 			// on `head`, then if `head` is strictly ahead of `default`, we
 			// fast-forward default to include it.
-			if (await state.client.hasUncommittedChanges()) {
-				await state.client.stageAll();
+			//
+			// `includeIgnored: true` for the same reason as the unborn-HEAD
+			// branch above: the deny-all `.gitignore` makes every
+			// FolderStorage-written file ignored by default, so a plain
+			// `--porcelain` check returns empty even when there's real
+			// owned content to preserve. The subsequent `checkoutBranch` /
+			// `checkoutTrackingBranch` (lines 1643 / 1637) would then
+			// silently overwrite those ignored files when `origin/<default>`
+			// carries tracked files at the same paths.
+			if (await state.client.hasUncommittedChanges({ includeIgnored: true })) {
+				// Branch-switch preservation: stage classifier-owned work
+				// before checking out the default branch. The pre-§P1#2
+				// rationale (commit pending work so it's reachable via
+				// reflog after the checkout) is unchanged; the allowlist
+				// filter just adds the property that any non-owned file
+				// dropped into the working tree won't ride along into
+				// the preservation commit.
+				await this.stageVaultTracked(state.client, ctx.memoryBankRoot, { syncTranscripts });
 				await state.client.commit(
 					`[jolli-mb] reconcile: preserve work from ${head} before switching to ${defaultBranch}`,
 					ctx.author,
@@ -1437,7 +1917,7 @@ export class SyncEngine {
 			// to be an opaque, user-untouched directory, so leaking that
 			// state is a permanent wedge.
 			try {
-				const pull = await state.client.pullRebase(state.ctx.author);
+				const pull = await this.pullRebaseLocked(state.client, state.ctx.memoryBankRoot, state.ctx.author);
 				if (pull.conflicted.length > 0) {
 					await this.safeRebaseAbort(state, "non-FF retry hit unresolved conflicts");
 					return {
@@ -1453,6 +1933,15 @@ export class SyncEngine {
 				// future GitClient path leaves state behind; the helper
 				// swallows its own errors so it can't shadow `e`.
 				await this.safeRebaseAbort(state, "non-FF retry pullRebase threw");
+				// `VaultLockBusyError` is the "worker is busy" surface —
+				// transient, retry-soon. Map to `network` so the round
+				// downgrades to offline rather than the terminal red
+				// `sync_failed_after_retries`. Outer `runRound` catch only
+				// fires if pushWithRetry re-throws; pushWithRetry returns
+				// a Result, so we have to map here.
+				if (e instanceof VaultLockBusyError) {
+					return { ok: false, code: "network", message: (e as Error).message };
+				}
 				const msg = (e as Error).message;
 				const code: SyncErrorCode = isServerRejectionMessage(msg)
 					? "push_rejected"
@@ -1511,8 +2000,23 @@ export class SyncEngine {
 		});
 	}
 
+	private emitPhase(phase: SyncPhase): void {
+		try {
+			this.opts.onPhase?.(phase);
+		} catch (e) {
+			log.debug("onPhase threw (swallowed): %s", (e as Error).message);
+		}
+	}
+
 	private report(state: SyncState, partial: Omit<SyncRoundResult, "newState">): SyncRoundResult {
-		const result: SyncRoundResult = { ...partial, newState: state };
+		// Fold per-round `stageVault` canary into every round result so a
+		// `synced` outcome with a `symlinked` finding still surfaces to the
+		// status bar. Caller-supplied `canary` (rare — only when a path
+		// builds a SyncRoundResult by hand) wins so we don't silently
+		// overwrite an explicit value.
+		const canary = "canary" in partial && partial.canary !== undefined ? partial.canary : this.takeCanary();
+		const result: SyncRoundResult =
+			canary !== undefined ? { ...partial, canary, newState: state } : { ...partial, newState: state };
 		try {
 			this.opts.onStateChange?.(state, result);
 		} catch (e) {
@@ -1659,36 +2163,9 @@ function defaultLegacyMigrationFactory(opts: { memoryBankRoot: string; transcrip
 
 /** Promise-based timeout. Used by `mintFresh` for 423 retry backoff (§0.8). */
 /**
- * Wraps `sweepSymlinks` so an unforeseen throw (the function itself catches
- * per-entry I/O failures and returns counts; this is belt-and-suspenders for
- * unexpected runtime errors like OOM or a corrupted Dirent type) becomes a
- * `failed=-1` report the caller can treat the same as any other failure.
- * Synthesising rather than re-throwing keeps the round termination on a
- * single code path: `reportOffline(symlink_quarantine_failed, …)`.
- */
-async function runSweep(root: string, label: "pre-round" | "pre-stage"): Promise<SweepReport> {
-	try {
-		return await sweepSymlinks(root);
-	} catch (e) {
-		/* v8 ignore start -- sweepSymlinks itself catches and counts per-entry failures, so this branch only fires on truly unexpected runtime errors (OOM, corrupt Dirent type bits on niche kernels) that the test fixture can't reproduce deterministically */
-		log.warn("Symlink sweep (%s) threw: %s — treating as failed=-1", label, (e as Error).message);
-		return { quarantined: 0, failed: -1, paths: [] };
-		/* v8 ignore stop */
-	}
-}
-
-/**
- * Formats a `SweepReport` failure for the `lastError.message` shown in the
- * status bar tooltip. Caps the path list at 3 entries to keep the tooltip
- * readable on small screens; paths are already relative to `memoryBankRoot`
- * so no absolute-path information leaks.
- */
-function formatSweepError(label: "pre-round" | "pre-stage", sweep: SweepReport): string {
-	const head = sweep.paths.slice(0, 3).join(", ");
-	const more = sweep.paths.length > 3 ? `, +${sweep.paths.length - 3} more` : "";
-	const paths = sweep.paths.length > 0 ? ` (paths: ${head}${more})` : "";
-	return `${label} symlink sweep: failed=${sweep.failed}${paths}`;
-}
+/* `runSweep` / `formatSweepError` helpers REMOVED in Phase 1 along with
+ * the `SymlinkSweep` module — see the comment at the deleted pre-round
+ * sweep site in `doRound` for the migration story. */
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));

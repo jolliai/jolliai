@@ -68,6 +68,24 @@ vi.mock("../core/Locks.js", () => ({
 	isWorkerLockHeld: vi.fn(),
 }));
 
+// `vault-write.lock` integration: the Standalone Hotfix now wraps the worker
+// in `acquireVaultWriteLock`. Tests mock it to always succeed so the
+// drain-queue test path stays focused on per-entry behaviour. A separate
+// QueueWorker.vaultLock test file exercises the lock acquisition / release
+// contract directly.
+vi.mock("../sync/VaultWriteLock.js", () => ({
+	acquireVaultWriteLock: vi.fn().mockResolvedValue({
+		release: vi.fn().mockResolvedValue(undefined),
+		refresh: vi.fn().mockResolvedValue(undefined),
+	}),
+	DEFAULT_VAULT_WRITE_WAIT_MS: 60_000,
+	isVaultWriteLockHeld: vi.fn(),
+}));
+
+vi.mock("../sync/SyncBootstrap.js", () => ({
+	deriveMemoryBankRoot: vi.fn((localFolder?: string) => localFolder ?? "/tmp/jolli-test-vault"),
+}));
+
 vi.mock("../core/TranscriptReader.js", () => ({
 	readTranscript: vi.fn(),
 	buildMultiSessionContext: vi.fn().mockReturnValue(""),
@@ -264,6 +282,7 @@ import { cleanupBranchStaleChildMarkdown } from "../core/StaleChildMarkdownClean
 import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary } from "../core/SummaryStore.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
+import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
 import type { GitOperation } from "../Types.js";
 import { __test__, runWorker } from "./QueueWorker.js";
 
@@ -297,6 +316,14 @@ describe("QueueWorker", () => {
 		vi.resetAllMocks();
 		vi.mocked(acquireWorkerLock).mockResolvedValue(true);
 		vi.mocked(releaseWorkerLock).mockResolvedValue(undefined);
+		// vault-write.lock: re-establish the always-succeed implementation
+		// after `resetAllMocks` wipes the factory default. The handle's
+		// `release` / `refresh` are themselves `vi.fn()` so per-test
+		// assertions can spy on them if needed.
+		vi.mocked(acquireVaultWriteLock).mockResolvedValue({
+			release: vi.fn().mockResolvedValue(undefined),
+			refresh: vi.fn().mockResolvedValue(undefined),
+		});
 		vi.mocked(dequeueAllGitOperations).mockResolvedValue([]);
 		vi.mocked(loadConfig).mockResolvedValue(
 			{} as ReturnType<typeof loadConfig> extends Promise<infer T> ? T : never,

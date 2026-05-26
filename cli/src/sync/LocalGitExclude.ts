@@ -1,18 +1,14 @@
 /**
  * Per-clone exclude file shim for `.git/info/exclude`.
  *
- * **Why this exists.** Engine-owned quarantine directories
- * (`.jolli-quarantine-symlinks/`, `.jolli-quarantine-corrupt/`) must
- * never reach the orphan history. The `.gitignore` file written by
- * `MemoryBankBootstrap.ensureBootstrap` *does* exclude them (via its
- * `**\/.*` dotfile rule), but the bootstrap step runs AFTER the
- * pre-pullRebase auto-reconcile in `SyncEngine.runSteadyState`. On the
- * very first round of an init-in-place vault that has dirty content,
- * the quarantine directories are created at step 3a / 3d and `stageAll`
- * runs at step 3d — both before bootstrap has written `.gitignore`.
- * Without this helper, that first commit would stage the quarantine
- * directories' contents (or, when the dir is dot-prefixed, at least its
- * `.gitignore` placeholder) and replicate them to peers.
+ * **Why this exists.** The engine-owned quarantine directory
+ * (`.jolli-quarantine-corrupt/`) must never reach the orphan history.
+ * `MemoryBankBootstrap.ensureBootstrap`'s `.gitignore` template denies
+ * everything by default (`*` + `!.gitignore`), so post-bootstrap nothing
+ * sneaks in — but bootstrap runs AFTER the pre-pullRebase auto-reconcile,
+ * and the auto-reconcile path can create quarantine dirs that need to be
+ * excluded before bootstrap touches `.gitignore`. Pre-bootstrap, also,
+ * the working tree may have no `.gitignore` at all.
  *
  * `.git/info/exclude` solves it cleanly: same syntax as `.gitignore`,
  * applied as if it were a top-level project gitignore, but **per-clone

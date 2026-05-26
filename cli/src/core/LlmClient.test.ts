@@ -70,17 +70,22 @@ describe("LlmClient", () => {
 				model: "claude-sonnet-4-6",
 			});
 
-			expect(mockCreate).toHaveBeenCalledWith({
-				model: "claude-sonnet-4-6",
-				max_tokens: 8192,
-				temperature: 0,
-				messages: [
-					{
-						role: "user",
-						content: expect.stringContaining("# Test"),
-					},
-				],
-			});
+			expect(mockCreate).toHaveBeenCalledWith(
+				{
+					model: "claude-sonnet-4-6",
+					max_tokens: 8192,
+					temperature: 0,
+					messages: [
+						{
+							role: "user",
+							content: expect.stringContaining("# Test"),
+						},
+					],
+				},
+				// Second arg carries the wall-clock timeout — see the
+				// dedicated "AbortSignal" test below for the verification.
+				expect.objectContaining({ signal: expect.any(AbortSignal) }),
+			);
 			expect(result.text).toBe("response text");
 			expect(result.model).toBe("claude-sonnet-4-6");
 			expect(result.inputTokens).toBe(50);
@@ -107,6 +112,7 @@ describe("LlmClient", () => {
 				expect.objectContaining({
 					messages: [{ role: "user", content: expect.stringContaining("{{content}}") }],
 				}),
+				expect.objectContaining({ signal: expect.any(AbortSignal) }),
 			);
 		});
 
@@ -133,7 +139,10 @@ describe("LlmClient", () => {
 				maxTokens: 256,
 			});
 
-			expect(mockCreate).toHaveBeenCalledWith(expect.objectContaining({ max_tokens: 256 }));
+			expect(mockCreate).toHaveBeenCalledWith(
+				expect.objectContaining({ max_tokens: 256 }),
+				expect.objectContaining({ signal: expect.any(AbortSignal) }),
+			);
 		});
 
 		it("throws when the action has no known template", async () => {
@@ -238,6 +247,25 @@ describe("LlmClient", () => {
 					apiKey: "sk-ant-test",
 				}),
 			).rejects.toThrow("No text content");
+		});
+
+		it("attaches an AbortSignal to bound the direct-call wall time", async () => {
+			// Regression: pre-fix `callDirect` invoked the SDK without any
+			// signal. A wedged TCP socket (firewall blackhole, suspended
+			// cloud edge, half-open after suspend/resume) would hold the
+			// in-flight call indefinitely — observed holding
+			// `ConflictResolver.resolveAll` for 2+ hours and leaving the
+			// sidebar "Sorting out conflicts…" label stuck.
+			await callLlm({
+				action: "translate",
+				params: { content: "test" },
+				apiKey: "sk-ant-test",
+			});
+			const call = mockCreate.mock.calls.at(-1);
+			expect(call).toBeDefined();
+			// Second positional arg is the SDK's per-request options bag.
+			const requestOptions = call?.[1] as { signal?: unknown } | undefined;
+			expect(requestOptions?.signal).toBeInstanceOf(AbortSignal);
 		});
 	});
 

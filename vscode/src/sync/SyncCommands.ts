@@ -36,23 +36,24 @@ export function registerSyncCommands(
 				);
 				return;
 			}
-			// A round may already be running from a previous click or from
-			// the polling timer. We **don't queue another round** — silently
-			// ignore the click. No toast: the status bar already shows
-			// "Syncing…" so the user has visible feedback; a popup would be
-			// noise ("yes, I know, I'm the one who clicked") and could even
-			// be confusing if the round finished between the click and the
-			// toast render.
-			if (orch.isRoundInFlight()) {
-				log.info(
-					"SyncCommands",
-					"syncNow ignored — a round is already in flight (silent no-op)",
-				);
-				return;
-			}
-			log.info("SyncCommands", "orchestrator available → calling syncNow()");
-			await orch.syncNow();
-			log.info("SyncCommands", "syncNow() completed");
+			// P3-A — always route through `requestManualSync`, which
+			// coalesces in-flight rounds correctly:
+			//
+			//   - No round in flight → fires a manual tick (old `syncNow()`
+			//     behaviour).
+			//   - Round in flight → arms `pendingManualFollowup`, awaits the
+			//     in-flight promise, then a followup manual tick runs in
+			//     `tick`'s finally. Required because the in-flight round may
+			//     bail at the generation-mismatch check without executing
+			//     the engine (e.g. user toggled auto-sync OFF during a
+			//     `readyPromise` wait). Pre-fix: SyncCommands early-returned
+			//     and the user's click was silently lost.
+			//
+			// Status bar still shows "Syncing…" throughout, so the user has
+			// visible feedback without an extra toast.
+			log.info("SyncCommands", "orchestrator available → calling requestManualSync()");
+			await orch.requestManualSync();
+			log.info("SyncCommands", "requestManualSync() completed");
 		}),
 	];
 }

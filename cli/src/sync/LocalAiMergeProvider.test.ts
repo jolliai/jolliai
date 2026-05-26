@@ -270,7 +270,32 @@ describe("LocalAiMergeProvider.merge", () => {
 				temperature: 0,
 				messages: [expect.objectContaining({ role: "user" })],
 			}),
+			// Per-call deadline (30 s) — see TIER2_TIMEOUT_MS doc comment.
+			// Applied via AbortSignal.timeout to match LlmClient's direct path.
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
+	});
+
+	it("passes an AbortSignal deadline to the Anthropic SDK on every call (Tier 2 end-to-end timeout)", async () => {
+		// Pre-fix the SDK had no per-call deadline, so a slow Sonnet
+		// generation could strand a sync round indefinitely. The 30 s
+		// ceiling makes Tier 2 fall through cleanly to Tier 2.7 / Tier 3
+		// on timeout instead. Applied via `AbortSignal.timeout` to match
+		// `LlmClient`'s direct path — one mechanism across the codebase
+		// and a true end-to-end deadline (the SDK's `timeout` option
+		// historically applied per retry).
+		const client = makeStubClient(`CONFIDENCE=0.9\n${BEGIN}\nbody\n${END}`);
+		const provider = new LocalAiMergeProvider({
+			apiKey: "sk-test",
+			clientFactory: () => client as never,
+			tokenFactory: () => TOK,
+		});
+		await provider.merge({ path: "f.md", base: null, ours: "x", theirs: "y", fileKind: "md" });
+		// Mock signature is `vi.fn(async () => …)` so the inferred call
+		// tuple is `[]`. Cast to `unknown[]` to access positional args
+		// (Anthropic SDK: `(body, options?)`).
+		const callArgs = client.messages.create.mock.calls[0] as unknown as unknown[];
+		expect(callArgs[1]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }));
 	});
 
 	it("respects custom maxTokens", async () => {
@@ -282,7 +307,10 @@ describe("LocalAiMergeProvider.merge", () => {
 			tokenFactory: () => TOK,
 		});
 		await provider.merge({ path: "x.md", base: null, ours: "x", theirs: "y", fileKind: "md" });
-		expect(client.messages.create).toHaveBeenCalledWith(expect.objectContaining({ max_tokens: 2048 }));
+		expect(client.messages.create).toHaveBeenCalledWith(
+			expect.objectContaining({ max_tokens: 2048 }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
+		);
 	});
 
 	it("contains the legitimate body, not the attacker extension, when LLM response has a trailing forged marker (S6)", async () => {

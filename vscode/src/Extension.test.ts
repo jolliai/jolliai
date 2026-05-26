@@ -762,6 +762,7 @@ const {
 				totalCount: 0,
 				isMigrating: false,
 				isEnabled: true,
+				syncPhase: { state: "idle" },
 			})),
 			onChange: vi.fn(() => () => {
 				/* unsubscribe */
@@ -893,6 +894,25 @@ vi.mock("./views/SummaryMarkdownBuilder.js", () => ({
 
 vi.mock("./services/AuthService.js", () => ({
 	AuthService: MockAuthService,
+}));
+
+// Captures `activateSync(...)` invocations so tests can assert that the
+// StatusStore constructed in activate() is forwarded as the 4th argument
+// (the per-phase sync-state wiring depends on the orchestrator receiving a
+// real store, not undefined).
+const { activateSyncMock } = vi.hoisted(() => {
+	const mockSyncRuntime_ = {
+		setOnRoundFinished: vi.fn(),
+		reconcileAutoSync: vi.fn().mockResolvedValue(undefined),
+	};
+	return {
+		activateSyncMock: vi
+			.fn()
+			.mockResolvedValue({ runtime: mockSyncRuntime_ }),
+	};
+});
+vi.mock("./sync/VsCodeSyncBootstrap.js", () => ({
+	activateSync: activateSyncMock,
 }));
 
 const { readManualDisableFlag, writeManualDisableFlag } = vi.hoisted(() => ({
@@ -1224,6 +1244,38 @@ describe("Extension", () => {
 				"jollimemory.mainView",
 				expect.any(Object),
 			);
+		});
+
+		// Regression for the sync-phase wiring. Two failure modes that have
+		// been false-flagged in review and would silently disable the
+		// "per-phase sync state in the Branch toolbar" feature:
+		//   1) activateSync() running before statusStore is constructed (so
+		//      the orchestrator would see `undefined` and setSyncPhase()
+		//      paths become no-ops);
+		//   2) the sidebar bridge omitting `getSyncPhase`, so the webview
+		//      never receives `sync:phase`.
+		// The asserts below pin both wires.
+		it("forwards the constructed StatusStore to activateSync as the 4th arg", () => {
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			expect(activateSyncMock).toHaveBeenCalled();
+			const args = activateSyncMock.mock.calls[0];
+			// activateSync(context, statusBar, kbInitPromise, statusStore)
+			expect(args[3]).toBe(mockStatusStore);
+		});
+
+		it("exposes getSyncPhase on the sidebar statusProvider bridge", () => {
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			const deps = sidebarDepsCaptured as {
+				statusProvider: { getSyncPhase: () => unknown };
+			};
+			expect(typeof deps.statusProvider.getSyncPhase).toBe("function");
+			expect(deps.statusProvider.getSyncPhase()).toEqual({ state: "idle" });
 		});
 
 		it("wires applyFileCheckbox to filesStore.applyCheckboxBatch", () => {

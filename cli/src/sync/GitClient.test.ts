@@ -9,12 +9,20 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GitClient, injectGithubAppUsername, isNetworkErrorMessage, isRepoMissingMessage } from "./GitClient.js";
 import type { GitCredentials } from "./SyncTypes.js";
+
+// Isolate every `git` subprocess in this file from the developer's ~/.gitconfig
+// and /etc/gitconfig. Without this, a global `commit.gpgsign=true`, gitsign
+// signer, or `core.hooksPath` pointing at husky/lefthook will hang `git commit`
+// in beforeAll — surfaces as a vitest hookTimeout, not a real failure.
+process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+process.env.GIT_TERMINAL_PROMPT = "0";
 
 const NOOP_ASKPASS = async (): Promise<{
 	scriptPath: string;
@@ -566,6 +574,191 @@ describe("GitClient", () => {
 
 			await clientB.rebaseAbort();
 			expect(await clientB.hasUnmergedPaths()).toEqual([]);
+		});
+	});
+
+	describe("isRebaseInProgress", () => {
+		// The vault is exclusively driven by SyncEngine — no human runs git
+		// in there — so `isRebaseInProgress` returning true at round start
+		// always means the previous round was killed mid-rebase, and the
+		// engine's self-heal step (`SyncEngine.doRound`) can safely abort.
+		it("returns false on a clean clone (no rebase ever started)", async () => {
+			const client = makeClient();
+			await client.clone(bareRepoUrl);
+			expect(await client.isRebaseInProgress()).toBe(false);
+		});
+
+		it("returns false when `.git/` itself is missing (first-bind / cold path)", async () => {
+			// `memoryBankRoot` from `beforeEach` is a freshly-mkdtemp'd + rm'd
+			// path; `.git/` cannot exist yet. The probe must swallow ENOENT
+			// rather than throwing — otherwise the engine's self-heal step
+			// would crash the cold-clone path.
+			const client = makeClient();
+			expect(await client.isRebaseInProgress()).toBe(false);
+		});
+
+		it("returns true while a rebase is paused on conflicts, false after abort", async () => {
+			const vaultA = await mkdtemp(join(rootTempDir, "rebprobeA-"));
+			const vaultB = await mkdtemp(join(rootTempDir, "rebprobeB-"));
+			await rm(vaultA, { recursive: true, force: true });
+			await rm(vaultB, { recursive: true, force: true });
+			const clientA = new GitClient({ memoryBankRoot: vaultA, credentials: FAKE_CREDS, askpass: NOOP_ASKPASS });
+			const clientB = new GitClient({ memoryBankRoot: vaultB, credentials: FAKE_CREDS, askpass: NOOP_ASKPASS });
+			await clientA.clone(bareRepoUrl);
+			await clientB.clone(bareRepoUrl);
+
+			// Force a conflicting concurrent edit so `pullRebase` pauses
+			// without throwing — mirrors the in-progress state that our
+			// production self-heal step is supposed to detect.
+			await mkdir(join(vaultA, "notes"), { recursive: true });
+			await mkdir(join(vaultB, "notes"), { recursive: true });
+			await writeFile(join(vaultA, "notes", "probe.md"), "from A\n");
+			await writeFile(join(vaultB, "notes", "probe.md"), "from B\n");
+			await clientA.stageAll();
+			await clientA.commit("[jolli-mb] add: probe A", { name: "A", email: "a@x" });
+			await clientA.push();
+			await clientB.stageAll();
+			await clientB.commit("[jolli-mb] add: probe B", { name: "B", email: "b@x" });
+			await clientB.pullRebase();
+
+			expect(await clientB.isRebaseInProgress()).toBe(true);
+			await clientB.rebaseAbort();
+			expect(await clientB.isRebaseInProgress()).toBe(false);
+		});
+	});
+
+	describe("revParse", () => {
+		// Used by `SyncEngine`'s idle-round short-circuit to compare local
+		// HEAD against `refs/remotes/origin/<branch>`. Must return the OID
+		// when the ref resolves and `null` when it doesn't (rather than
+		// throwing or returning a partial string) — the caller treats
+		// `null` as "ref absent → don't short-circuit".
+		it("returns the 40-char OID for a resolvable ref (HEAD)", async () => {
+			const client = makeClient();
+			await client.clone(bareRepoUrl);
+			const head = await client.revParse("HEAD");
+			expect(head).not.toBeNull();
+			expect(head).toHaveLength(40);
+		});
+
+		it("returns null for a ref that doesn't exist", async () => {
+			const client = makeClient();
+			await client.clone(bareRepoUrl);
+			const missing = await client.revParse("refs/heads/does-not-exist");
+			expect(missing).toBeNull();
+		});
+
+		it("returns null when there is no repository (no `.git/`)", async () => {
+			// Fresh `memoryBankRoot` from beforeEach — no `.git/` directory
+			// yet. `git rev-parse` exits non-zero; the helper must surface
+			// that as `null` rather than throwing.
+			const client = makeClient();
+			const head = await client.revParse("HEAD");
+			expect(head).toBeNull();
+		});
+	});
+
+	describe("sweepStaleLockFiles", () => {
+		// SIGKILL on a running git op leaves `<name>.lock` siblings behind
+		// (`.git/index.lock`, `.git/HEAD.lock`, `refs/heads/<b>.lock`,
+		// `packed-refs.lock`, `config.lock`). The next op fails with
+		// "Unable to create '….lock': File exists" — sticky terminal error
+		// with no actionable customer UI. The sweep removes them by mtime.
+		it("removes `.git/index.lock` older than the TTL", async () => {
+			const client = makeClient();
+			await client.clone(bareRepoUrl);
+			const indexLock = join(memoryBankRoot, ".git", "index.lock");
+			await writeFile(indexLock, "");
+			// Backdate the lock so it's clearly older than the 30 s TTL the
+			// engine uses in production (TTL=0 here makes the assertion
+			// timing-independent regardless of FS clock resolution).
+			const result = await client.sweepStaleLockFiles(0);
+			expect(result.removed).toContain(indexLock);
+			// Sanity: lock actually gone from disk.
+			await expect(stat(indexLock)).rejects.toThrow();
+		});
+
+		it("removes recursive `refs/**/*.lock` (per-branch ref locks)", async () => {
+			const client = makeClient();
+			await client.clone(bareRepoUrl);
+			const refsHeads = join(memoryBankRoot, ".git", "refs", "heads");
+			const branchLock = join(refsHeads, "main.lock");
+			// `refs/heads/main` already exists (set by clone); the .lock
+			// sibling is the artifact a killed `git update-ref` leaves.
+			await writeFile(branchLock, "");
+			const result = await client.sweepStaleLockFiles(0);
+			expect(result.removed).toContain(branchLock);
+		});
+
+		it("leaves fresh locks (younger than TTL) alone — concurrent in-flight ops are not touched", async () => {
+			const client = makeClient();
+			await client.clone(bareRepoUrl);
+			const indexLock = join(memoryBankRoot, ".git", "index.lock");
+			await writeFile(indexLock, "");
+			// 60 s TTL > the lock's age (just written) → must NOT be removed.
+			const result = await client.sweepStaleLockFiles(60_000);
+			expect(result.removed).toEqual([]);
+			// Sanity: lock still there.
+			await stat(indexLock); // throws if missing
+		});
+
+		it("default TTL is ≥ 5 min so out-of-band manual `git gc` / `git fetch` aren't disrupted", async () => {
+			// Regression guard: prior version defaulted to 30 s, which would
+			// rip out the live lock under a slow user-initiated git op in the
+			// vault. Default must stay long enough that a multi-minute manual
+			// op survives a sync round running concurrently. Tightening this
+			// back below 5 min requires re-justifying the safety story.
+			const client = makeClient();
+			await client.clone(bareRepoUrl);
+			const indexLock = join(memoryBankRoot, ".git", "index.lock");
+			await writeFile(indexLock, "");
+			// Call with the default TTL (no argument). A just-created lock
+			// must NOT be swept.
+			const result = await client.sweepStaleLockFiles();
+			expect(result.removed).toEqual([]);
+			await stat(indexLock); // still there
+		});
+
+		it("is a no-op on a fresh checkout with no `.git/` directory", async () => {
+			// Fresh-from-mkdtemp `memoryBankRoot` from beforeEach — no
+			// `.git/` yet. Sweep must not throw and must return an empty
+			// removed list, otherwise the engine's self-heal step would
+			// crash the cold-clone path.
+			const client = makeClient();
+			const result = await client.sweepStaleLockFiles(0);
+			expect(result.removed).toEqual([]);
+		});
+
+		it("never descends into `.git/objects/` — pack-file `*.lock` siblings have their own semantics", async () => {
+			// `git pack-objects` / `git gc` use `.pack.lock` and similar
+			// transitorily; removing them under a live `git gc` would corrupt
+			// the repack. The sweep candidate list explicitly avoids
+			// `.git/objects/` (only walks `.git/refs/` recursively + four
+			// top-level singletons). Regression guard: future broadening of
+			// the candidate set must not start traversing objects/.
+			const client = makeClient();
+			await client.clone(bareRepoUrl);
+			const packDir = join(memoryBankRoot, ".git", "objects", "pack");
+			await mkdir(packDir, { recursive: true });
+			const packLock = join(packDir, "pack-deadbeef.lock");
+			await writeFile(packLock, "");
+			// TTL=0 would otherwise match anything; the only thing keeping
+			// this lock alive is the sweep refusing to descend into objects/.
+			const result = await client.sweepStaleLockFiles(0);
+			expect(result.removed).not.toContain(packLock);
+			// Sanity: pack lock untouched.
+			await stat(packLock);
+		});
+
+		it("does not sweep names that aren't `*.lock`", async () => {
+			const client = makeClient();
+			await client.clone(bareRepoUrl);
+			const fakeName = join(memoryBankRoot, ".git", "index");
+			// `.git/index` is the real index file — must NEVER be touched.
+			const result = await client.sweepStaleLockFiles(0);
+			expect(result.removed).not.toContain(fakeName);
+			// Sanity: real index is still there.
+			await stat(fakeName);
 		});
 	});
 

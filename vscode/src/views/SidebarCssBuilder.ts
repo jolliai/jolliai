@@ -292,9 +292,12 @@ export function buildSidebarCss(): string {
     outline: 1px solid var(--vscode-focusBorder, #007acc);
     outline-offset: -1px;
   }
-  /* Worker-busy indicator on the Branch tab toolbar. flex:1 1 auto pushes the
-     refresh button to the right edge — same packing trick as .kb-search-box.
-     min-width:0 lets the label truncate gracefully on narrow sidebars. */
+  /* Shared chrome for the toolbar's left-side status indicator. Used by the
+     Branch tab (post-commit "AI summary in progress…" worker signal) and the
+     Memory Bank tab (per-phase sync indicator pushed by StatusOrchestrator).
+     flex:1 1 auto pushes the refresh button to the right edge — same packing
+     trick as .kb-search-box. min-width:0 lets the label truncate gracefully
+     on narrow sidebars. */
   .toolbar-worker-status {
     flex: 1 1 auto;
     min-width: 0;
@@ -309,6 +312,13 @@ export function buildSidebarCss(): string {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* Sticky-error variant: shown when a sync round ends in terminal failure
+     so the user keeps seeing *where* it broke until the next round. The
+     icon picks up VS Code's errorForeground so it reads as a problem
+     rather than ongoing work. */
+  .toolbar-worker-icon-error {
+    color: var(--vscode-errorForeground, var(--vscode-editorError-foreground, #f48771));
   }
   .iconbtn {
     width: 24px;

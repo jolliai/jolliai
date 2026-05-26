@@ -43,6 +43,24 @@ export interface LocalAiMergeOpts {
 }
 
 const DEFAULT_MAX_TOKENS = 8192;
+/**
+ * Hard ceiling on the Tier 2 Anthropic call. Pre-fix the SDK had no per-call
+ * deadline, so a slow Sonnet generation (1–3 min is normal for an 8 K-token
+ * output) blocked the entire sync round — and when the response missed the
+ * `BEGIN_MERGED_<token>` markers and got thrown away, the full cost was
+ * wasted before Tier 2.7 / Tier 3 fall-through could run.
+ *
+ * 30 s is a deliberate compromise: long enough for short-to-medium files
+ * (most user plan / note diffs finish in 5–15 s), short enough to bound the
+ * worst-case sync-round latency. Hitting the timeout falls cleanly through
+ * to Tier 2.7 / Tier 3 — same path as a network failure.
+ *
+ * Applied via `AbortSignal.timeout` (not the SDK's `{ timeout }` option) so
+ * the deadline is truly end-to-end and consistent with `LlmClient`'s direct
+ * path — the SDK's own `timeout` historically applied per retry rather than
+ * to the whole call.
+ */
+const TIER2_TIMEOUT_MS = 30_000;
 
 export class LocalAiMergeProvider implements AiMergeProvider {
 	private readonly client: Pick<Anthropic, "messages">;
@@ -60,12 +78,23 @@ export class LocalAiMergeProvider implements AiMergeProvider {
 	async merge(req: AiMergeRequest): Promise<AiMergeResponse> {
 		const token = this.tokenFactory();
 		const prompt = buildPrompt(req, token);
-		const response = await this.client.messages.create({
-			model: this.model,
-			max_tokens: this.maxTokens,
-			temperature: 0,
-			messages: [{ role: "user", content: prompt }],
-		});
+		const response = await this.client.messages.create(
+			{
+				model: this.model,
+				max_tokens: this.maxTokens,
+				temperature: 0,
+				messages: [{ role: "user", content: prompt }],
+			},
+			// End-to-end deadline via `AbortSignal.timeout` (matches
+			// `LlmClient`'s direct-mode path — one timeout mechanism across
+			// the codebase). `AbortSignal.timeout` aborts the underlying
+			// fetch on expiry regardless of which retry the SDK is on, so
+			// the worst-case wall-clock is bounded at `TIER2_TIMEOUT_MS`
+			// (the SDK's own `timeout` option historically applied per
+			// retry, not end-to-end). `tryAiMerge` catches the resulting
+			// AbortError and falls through to Tier 2.7 / Tier 3.
+			{ signal: AbortSignal.timeout(TIER2_TIMEOUT_MS) },
+		);
 		const textBlock = response.content.find((b) => b.type === "text");
 		if (!textBlock || textBlock.type !== "text") {
 			throw new Error("LocalAiMergeProvider: no text content in LLM response");

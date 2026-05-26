@@ -20,7 +20,7 @@
  *      folder. If absent → record the caller-supplied `desiredFolder`
  *      (which is the basename of `KBPathResolver.resolveKBPath()`).
  *   3. If `repos.json` changed, the engine writes it into the working tree
- *      so it ships in the round's `stageAll` + commit.
+ *      so it ships in the round's `stageVault` + commit.
  *   4. Concurrent edits across devices are reconciled by `mergeRepoMapping`
  *      (dedupe by `repoIdentity`). Folder collisions across different
  *      identities are detected and reported via `findRepoMappingConflicts`,

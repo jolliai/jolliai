@@ -749,13 +749,29 @@ export interface JolliMemoryConfig {
 	 * Whether to **auto-sync** Memory Bank to the user's private Personal
 	 * Space vault on a recurring schedule. Plan §0.7 made manual sync the
 	 * always-available default (the "Sync to Personal Space Now" button +
-	 * `jolli sync-memory-bank`), so this flag now scopes purely to the
+	 * `jolli sync-memory-bank`), so this flag scopes purely to the
 	 * background polling tick — undefined / false means the plugin's poll
 	 * loop never schedules itself, but a manual one-shot sync still works
 	 * as long as `jolliApiKey` is configured.
 	 *
 	 * Off by default in v1; opt-in via the Settings UI "Auto-sync to
-	 * Personal Space" toggle or `jolli configure --sync-enable`.
+	 * Personal Space" toggle. The CLI explicitly rejects setting this via
+	 * `jolli configure --set autoSyncEnabled=…` (auto-sync requires a
+	 * polling tick that only the IDE plugin runs — the CLI is not a
+	 * daemon), so this flag is plugin-only on the write side. See
+	 * `ConfigureCommand`'s rejection branch and its test
+	 * "rejects autoSyncEnabled — auto-sync is plugin-only".
+	 *
+	 * Renamed from `syncEnabled` (kept readable for back-compat — see
+	 * `loadConfigFromDir`). New writes use this name only.
+	 */
+	readonly autoSyncEnabled?: boolean;
+	/**
+	 * @deprecated Legacy name for `autoSyncEnabled`. Still read by
+	 * `loadConfigFromDir` for back-compat so users who toggled auto-sync
+	 * on under the old name keep their setting after upgrading; the
+	 * loader coalesces it into `autoSyncEnabled` and never writes this
+	 * field again. Will be removed once existing installs roll over.
 	 */
 	readonly syncEnabled?: boolean;
 	/**

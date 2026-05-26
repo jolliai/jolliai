@@ -240,6 +240,8 @@ describe("kb-search-box (always-visible toolbar search input)", () => {
 		expect(css).toMatch(/\.toolbar-worker-status\s*{[\s\S]*?min-width:\s*0/);
 		expect(css).toContain(".toolbar-worker-status-text");
 		expect(css).toContain("text-overflow: ellipsis");
+		// Sticky-error variant for sync terminal failures.
+		expect(css).toContain(".toolbar-worker-icon-error");
 	});
 });
 

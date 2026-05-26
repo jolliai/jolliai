@@ -189,7 +189,7 @@ export function buildSettingsHtml(nonce: string): string {
 
       <div class="settings-row column" id="syncAutoGroup">
         <label class="settings-toggle">
-          <input type="checkbox" id="syncEnabled" />
+          <input type="checkbox" id="autoSyncEnabled" />
           Auto-sync to Personal Space
         </label>
         <div id="syncAutoIntervalGroup">

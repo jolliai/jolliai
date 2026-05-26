@@ -28,10 +28,44 @@
  *   - **checkGitInstalled()** — `git --version` probe for first-run hint.
  */
 
+import { readdir, rm, stat } from "node:fs/promises";
+import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import { execFileAsyncHidden } from "../util/Subprocess.js";
 import { type AskpassHandle, prepareAskpass } from "./GitAskpass.js";
+import { type PorcelainEntry, parsePorcelainZ } from "./PorcelainParser.js";
 import type { GitCredentials } from "./SyncTypes.js";
+
+/**
+ * Per-batch character budget for `stageAddPaths` / `stageRemovePaths`.
+ * Picked to stay under the Windows `cmd.exe` ARG_MAX floor (~32 KB) with
+ * margin — Linux (~131 KB) and macOS (~256 KB) are higher so 16 KB is
+ * conservatively portable. Per-round add lists rarely approach this in
+ * practice (≤ 10 paths) but a migration / backfill round could.
+ */
+const ARG_BUDGET_CHARS = 16_384;
+
+/**
+ * Splits `paths` into batches whose joined character length stays under
+ * `budget`. Each batch is non-empty (a single path longer than `budget`
+ * still ships as its own batch — the OS will reject it but with a clearer
+ * error than us silently dropping the entry).
+ */
+function* chunkByBudget(paths: ReadonlyArray<string>, budget: number): Generator<string[]> {
+	let batch: string[] = [];
+	let used = 0;
+	for (const p of paths) {
+		const cost = p.length + 1; // +1 for the argv separator
+		if (batch.length > 0 && used + cost > budget) {
+			yield batch;
+			batch = [];
+			used = 0;
+		}
+		batch.push(p);
+		used += cost;
+	}
+	if (batch.length > 0) yield batch;
+}
 
 const log = createLogger("Sync:Git");
 const MAX_BUFFER = 10 * 1024 * 1024;
@@ -297,9 +331,17 @@ export class GitClient {
 		await this.runExpectOk(["add", "--all"]);
 	}
 
-	/** `git add -- <path>`. Used by `ConflictResolver` after writing a resolved blob. */
+	/**
+	 * `git add -f -- <path>`. Used by `ConflictResolver` after writing a
+	 * resolved blob. `-f` is REQUIRED because the post-allowlist `.gitignore`
+	 * template denies everything by default (`*` + `!.gitignore`) — without
+	 * `-f`, this fails with "paths are ignored by one of your .gitignore
+	 * files". The path is already classifier-owned at this point (conflict
+	 * paths come from `pullRebase` against engine-tracked files), so
+	 * forcing the add is the correct semantic.
+	 */
 	async addPath(path: string): Promise<void> {
-		await this.runExpectOk(["add", "--", path]);
+		await this.runExpectOk(["add", "-f", "--", path]);
 	}
 
 	/**
@@ -410,13 +452,15 @@ export class GitClient {
 	 */
 	async checkoutOurs(path: string): Promise<void> {
 		await this.runExpectOk(["checkout", "--theirs", "--", path]);
-		await this.runExpectOk(["add", "--", path]);
+		// `-f` for the same reason as `addPath` — deny-all `.gitignore`
+		// template requires forced staging on every classifier-owned write.
+		await this.runExpectOk(["add", "-f", "--", path]);
 	}
 
 	/** "Use the remote's version" — see `checkoutOurs` for the rebase gotcha. */
 	async checkoutTheirs(path: string): Promise<void> {
 		await this.runExpectOk(["checkout", "--ours", "--", path]);
-		await this.runExpectOk(["add", "--", path]);
+		await this.runExpectOk(["add", "-f", "--", path]);
 	}
 
 	/**
@@ -464,6 +508,101 @@ export class GitClient {
 			extraEnv: NO_EDITOR_ENV,
 			timeoutMs: REBASE_TIMEOUT_MS,
 		});
+	}
+
+	/**
+	 * Returns `true` when a previous `git rebase` paused mid-flight and left
+	 * its state files behind. Git writes one of two directories during a
+	 * rebase: `.git/rebase-merge/` (merge backend, the default) or
+	 * `.git/rebase-apply/` (apply backend, used by some older configs); both
+	 * vanish on `rebase --continue`'s final tick or `rebase --abort`.
+	 *
+	 * The vault working tree is *exclusively* driven by `SyncEngine` — no
+	 * human runs git in there — so finding either dir at round start is
+	 * unambiguous evidence that a previous engine round was killed
+	 * (SIGTERM on VSIX reinstall, laptop sleep, process crash). Used by
+	 * `SyncEngine.doRound` to self-heal before any other git op, so the
+	 * customer doesn't have to `cd` in and run `git rebase --abort` by hand.
+	 *
+	 * Returns `false` (rather than throwing) when `.git/` itself is missing
+	 * — that case is "no clone yet" which the first-bind path handles
+	 * separately.
+	 */
+	async isRebaseInProgress(): Promise<boolean> {
+		for (const dir of ["rebase-merge", "rebase-apply"]) {
+			try {
+				const s = await stat(join(this.memoryBankRoot, ".git", dir));
+				if (s.isDirectory()) return true;
+			} catch {
+				// ENOENT (or any stat failure) — directory not present.
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Sweeps stale `*.lock` files under `.git/` left behind when a previous
+	 * git invocation was SIGKILL'd. Returns the list of paths removed (for
+	 * logging by the caller).
+	 *
+	 * Git takes a `<name>.lock` sibling-file for any ref/index/config write
+	 * (`index.lock`, `HEAD.lock`, `refs/heads/<branch>.lock`,
+	 * `packed-refs.lock`, `config.lock`) and removes it once the write
+	 * commits. Normal termination always cleans up; SIGKILL (laptop sleep,
+	 * VSIX reinstall mid-op, OOM killer) leaves the lock orphaned and the
+	 * next git op fails with "Unable to create '….lock': File exists",
+	 * which surfaces as a sticky terminal error with no actionable UI path
+	 * for the customer.
+	 *
+	 * The vault is *primarily* driven by `SyncEngine`, but the engine
+	 * documents (and persists `core.symlinks=false` for) out-of-band manual
+	 * `git` from the user or their IDE — so we can't assume engine-only
+	 * ownership. `ttlMs` defaults to **5 minutes** (300_000 ms), chosen so:
+	 *
+	 *   - SIGKILL-orphaned locks from a killed previous round (the original
+	 *     motivation for this sweep) are reliably caught — engine git ops
+	 *     here finish in milliseconds, never minutes.
+	 *   - A user running a manual `git fetch` / `git gc` / `git rebase`
+	 *     in the vault for under 5 minutes never has their live lock
+	 *     ripped out from under them. Above that window we'd still be
+	 *     wrong, but a multi-minute manual op in an engine-managed folder
+	 *     is rare enough that we accept the trade-off vs. perma-stuck
+	 *     locks from SIGKILL recovery.
+	 *
+	 * Recursive over `.git/refs/` so per-branch locks (`refs/heads/<b>.lock`,
+	 * `refs/remotes/origin/<b>.lock`) are caught. Top-level singletons
+	 * (`index.lock`, `HEAD.lock`, `packed-refs.lock`, `config.lock`) are
+	 * checked explicitly. Never descends into `.git/objects/` — pack-files
+	 * have their own `.lock` semantics we shouldn't touch.
+	 *
+	 * Silent ENOENT on every step so a missing `.git/` (fresh first-bind)
+	 * is a clean no-op.
+	 */
+	async sweepStaleLockFiles(ttlMs = 5 * 60_000): Promise<{ readonly removed: ReadonlyArray<string> }> {
+		const gitDir = join(this.memoryBankRoot, ".git");
+		const cutoff = Date.now() - ttlMs;
+		const removed: string[] = [];
+
+		const candidates = [
+			join(gitDir, "index.lock"),
+			join(gitDir, "HEAD.lock"),
+			join(gitDir, "packed-refs.lock"),
+			join(gitDir, "config.lock"),
+			...(await collectLockFiles(join(gitDir, "refs"))),
+		];
+
+		for (const path of candidates) {
+			try {
+				const s = await stat(path);
+				if (s.isFile() && s.mtimeMs < cutoff) {
+					await rm(path, { force: true });
+					removed.push(path);
+				}
+			} catch {
+				// ENOENT — already gone, fine.
+			}
+		}
+		return { removed };
 	}
 
 	/**
@@ -522,9 +661,28 @@ export class GitClient {
 	 * round goes offline. Memory Bank is meant to be user-editable, so the
 	 * engine auto-reconciles by staging + committing whatever's dirty
 	 * before pulling.
+	 *
+	 * `includeIgnored` widens the check to also flag ignored files. The
+	 * default `false` matches the legacy semantics (plain `--porcelain`).
+	 * Callers that decide whether it's safe to `git checkout` a different
+	 * branch must opt in: the deny-all `.gitignore` template makes every
+	 * FolderStorage-written file ignored by default, so the plain check
+	 * cannot see them — and `git checkout` does NOT protect ignored
+	 * working-tree files. When the remote branch carries tracked files at
+	 * the same paths, the checkout silently overwrites local Memory Bank
+	 * content. Passing `includeIgnored: true` surfaces those files so the
+	 * caller can defer the checkout to the auto-reconcile path.
 	 */
-	async hasUncommittedChanges(): Promise<boolean> {
-		const result = await this.runExpectOk(["status", "--porcelain"]);
+	async hasUncommittedChanges(opts?: { readonly includeIgnored?: boolean }): Promise<boolean> {
+		const args = ["status", "--porcelain"];
+		if (opts?.includeIgnored === true) {
+			// `--untracked-files=all` so directories don't collapse to a single
+			// `?? dir/` (matches `statusPorcelainZ`); `--ignored=matching` so
+			// per-file `!!` rows surface under the deny-all template (which
+			// pairs `*` + `!.gitignore` + `!*/`).
+			args.push("--untracked-files=all", "--ignored=matching");
+		}
+		const result = await this.runExpectOk(args);
 		return result.stdout.trim().length > 0;
 	}
 
@@ -543,41 +701,142 @@ export class GitClient {
 	 * where peers would pull a corrupt summary / index / transcript.
 	 */
 	async listDirtyPaths(): Promise<ReadonlyArray<string>> {
-		const result = await this.runExpectOk(["status", "--porcelain", "-z"]);
-		const out = result.stdout;
-		if (out.length === 0) return [];
-		// `-z` emits NUL-terminated records. Standard entries look like
-		// `XY pathspec` (2 status chars + space + path). Rename / copy
-		// entries (`R` or `C` in either X or Y) span TWO records: the
-		// first carries the destination path with the `XY ` prefix, the
-		// second carries the source path with NO prefix (raw path bytes).
-		//
-		// A heuristic like "third char is a space ⇒ standard prefix"
-		// misparses a rename-source path whose third byte happens to be
-		// a space (e.g. `ab cdef.json`). We track the rename/copy state
-		// explicitly so the source path is always taken verbatim.
-		const records = out.split("\0").filter((r) => r.length > 0);
+		// Implementation delegates to `statusPorcelainZ` so the rename-aware
+		// parser quirks live in ONE place (`PorcelainParser.parsePorcelainZ`).
+		// Keeps the flat-paths contract used by `quarantineCorruptJson` and
+		// other pre-existing callers while letting `stageVault` consume the
+		// structured per-entry form via `statusPorcelainZ` directly.
+		const entries = await this.statusPorcelainZ();
 		const paths: string[] = [];
-		let renameSourcePending = false;
-		for (const rec of records) {
-			if (renameSourcePending) {
-				// Whole record is the source path of the prior R/C entry.
-				paths.push(rec);
-				renameSourcePending = false;
-				continue;
-			}
-			if (rec.length < 3) continue;
-			const xy = rec.substring(0, 2);
-			paths.push(rec.substring(3));
-			// Either index- or worktree-side rename/copy flags the next
-			// record as a source-path trailer (`git status` docs: "rename
-			// in index" = `R `, "renamed in work tree" = ` R`, copies
-			// analogous with `C`).
-			if (xy.includes("R") || xy.includes("C")) {
-				renameSourcePending = true;
-			}
+		for (const e of entries) {
+			paths.push(e.path);
+			if (e.oldPath !== undefined) paths.push(e.oldPath);
 		}
 		return paths;
+	}
+
+	/**
+	 * Structured `git status --porcelain -z` output — one entry per file,
+	 * with the index/worktree status codes and rename source path
+	 * preserved. Consumers that need the rename pairing or per-entry
+	 * status (e.g. `stageVault` deciding `git add` vs `git rm` based on
+	 * `isDeletion(entry)`) use this directly; the legacy `listDirtyPaths`
+	 * caller maps over the result for backward compatibility.
+	 *
+	 * `--untracked-files=all` so directories don't collapse to a single
+	 * `?? dir/` record — `stageVault` needs every file individually to
+	 * filter through the classifier.
+	 *
+	 * `--ignored=matching` is REQUIRED for the post-allowlist `.gitignore`
+	 * template (`*` + `!.gitignore`): every owned path is ignored-by-default
+	 * (since `*` matches), and without `--ignored` git status would hide
+	 * them, leaving `stageVault` blind to brand-new summaries / repos /
+	 * markdown. `matching` mode lists every ignored file individually
+	 * (instead of collapsing to a `!! dir/` entry), giving the classifier
+	 * one record per file. The parser surfaces these with `!` status; the
+	 * decomposer treats them as plain adds.
+	 */
+	async statusPorcelainZ(): Promise<ReadonlyArray<PorcelainEntry>> {
+		const result = await this.runExpectOk([
+			"status",
+			"--porcelain",
+			"-z",
+			"--untracked-files=all",
+			"--ignored=matching",
+		]);
+		return parsePorcelainZ(result.stdout);
+	}
+
+	/**
+	 * Stages an explicit list of paths via `git add -f`. The `-f` flag is
+	 * REQUIRED for the post-allowlist `.gitignore` template (`*` +
+	 * `!.gitignore`) — every owned path is denied by default and only
+	 * `stageVault`'s pre-classified add list overrides the deny.
+	 *
+	 * Chunked at `ARG_BUDGET_CHARS` (16 KB) to stay under the Windows
+	 * `cmd.exe` ARG_MAX floor (~32 KB). Per-round add lists are tiny in
+	 * practice (≤ 10 paths) but a backfill / migration round could push
+	 * into thousands of paths — chunking keeps the call safe under any
+	 * realistic batch.
+	 *
+	 * ENOENT on add propagates: if `stageVault` reports a path that
+	 * doesn't exist on disk, that's a classifier-vs-fs disagreement (FolderStorage
+	 * said it wrote, but the file isn't there) and we want the round to
+	 * fail loudly rather than silently drop the entry.
+	 */
+	async stageAddPaths(paths: ReadonlyArray<string>): Promise<void> {
+		for (const batch of chunkByBudget(paths, ARG_BUDGET_CHARS)) {
+			await this.runExpectOk(["add", "-f", "--", ...batch]);
+		}
+	}
+
+	/**
+	 * Removes explicit paths from the index via `git rm --ignore-unmatch
+	 * --quiet`. The `--ignore-unmatch` tolerance is required because a
+	 * deletion entry from `git status` can race with the rm itself —
+	 * concurrent operations on the vault between the status snapshot and
+	 * the rm call might already have removed the entry from the index.
+	 * `--quiet` suppresses the rm summary lines (we have our own
+	 * telemetry).
+	 */
+	async stageRemovePaths(paths: ReadonlyArray<string>): Promise<void> {
+		for (const batch of chunkByBudget(paths, ARG_BUDGET_CHARS)) {
+			await this.runExpectOk(["rm", "--ignore-unmatch", "--quiet", "--", ...batch]);
+		}
+	}
+
+	/**
+	 * Unstages `paths` from the index WITHOUT touching the working tree —
+	 * `git rm --cached -f --ignore-unmatch -- <paths>`. Used by
+	 * `stageVault` to clear classifier-rejected entries that were already
+	 * staged (e.g. by a foreign writer or a prior round before classifier
+	 * drift) so the upcoming `commit` won't include them. The working
+	 * tree copy is preserved — the user can still inspect / move the
+	 * file. `--ignore-unmatch` keeps the call idempotent under races.
+	 */
+	async unstagePaths(paths: ReadonlyArray<string>): Promise<void> {
+		for (const batch of chunkByBudget(paths, ARG_BUDGET_CHARS)) {
+			await this.runExpectOk(["rm", "--cached", "-f", "--ignore-unmatch", "--quiet", "--", ...batch]);
+		}
+	}
+
+	/**
+	 * Restores the index entry for each path to its HEAD blob, without
+	 * touching the working tree. Implemented as
+	 * `git reset HEAD -- <paths>`.
+	 *
+	 * **Difference from `unstagePaths` (`git rm --cached`).** Both leave
+	 * the working-tree copy intact, but `git rm --cached` on a HEAD-tracked
+	 * file STAGES A DELETION (HEAD has the blob, index now has nothing →
+	 * the delta is "delete"), which the next `commit` will propagate to the
+	 * remote and every other device. `git reset HEAD --` is non-destructive:
+	 * for HEAD-tracked paths it restores the original blob in the index
+	 * (no diff to commit); for paths that were only-in-index (`A` staged
+	 * adds with no HEAD blob) it removes the index entry (HEAD had nothing,
+	 * so still no deletion). Either way the commit doesn't carry an
+	 * unintended push.
+	 *
+	 * Used by `stageVault` for two cases where we want to **prevent local
+	 * staged changes from reaching the remote** without staging deletions:
+	 *
+	 *   - `syncTranscripts=false` + already-staged transcript modification
+	 *     (Model 2: OFF is passive — don't upload locally; don't delete
+	 *     what peers already uploaded).
+	 *   - Owned path whose leaf or parent chain is a symlink (refuse to
+	 *     stage the symlink, but a `git rm --cached` for a HEAD-tracked
+	 *     blob would push a deletion peers would see).
+	 *
+	 * Idempotent under races and missing paths.
+	 */
+	async resetPathsToHead(paths: ReadonlyArray<string>): Promise<void> {
+		for (const batch of chunkByBudget(paths, ARG_BUDGET_CHARS)) {
+			// `git reset HEAD -- <paths>` is the documented spelling; on an
+			// unborn HEAD it errors, but callers reach this path only with
+			// staged porcelain entries which presuppose a born HEAD. The
+			// `--quiet` suppresses the per-path summary git would otherwise
+			// emit.
+			await this.runExpectOk(["reset", "--quiet", "HEAD", "--", ...batch]);
+		}
 	}
 
 	/**
@@ -741,6 +1000,23 @@ export class GitClient {
 	async refExists(fullRef: string): Promise<boolean> {
 		const result = await this.run(["show-ref", "--verify", "--quiet", fullRef]);
 		return result.exitCode === 0;
+	}
+
+	/**
+	 * `git rev-parse --verify --quiet <ref>` — returns the 40-char OID `<ref>`
+	 * resolves to, or `null` when the ref doesn't exist (or any other
+	 * resolution failure). Used by `SyncEngine` to compare local HEAD against
+	 * `refs/remotes/origin/<branch>` for the idle-round short-circuit: when
+	 * they're equal AND the working tree is clean, the upcoming
+	 * stageAll/commit/push/notify-push sequence is a guaranteed no-op and
+	 * skipping it trims ~2-3s off every poll tick that doesn't need to do
+	 * any real work.
+	 */
+	async revParse(ref: string): Promise<string | null> {
+		const result = await this.run(["rev-parse", "--verify", "--quiet", ref]);
+		if (result.exitCode !== 0) return null;
+		const oid = result.stdout.trim();
+		return oid.length === 0 ? null : oid;
 	}
 
 	/**
@@ -978,4 +1254,32 @@ export function injectGithubAppUsername(url: string): string {
 	if (!match) return url;
 	if (match[2]) return url; // Already has a username; respect it.
 	return `${match[1]}x-access-token@${match[3]}`;
+}
+
+/**
+ * Recursively collects every `*.lock` file path under `root`. Returns an
+ * empty list when `root` doesn't exist (fresh first-bind, missing `.git/refs`,
+ * etc.). Used by `sweepStaleLockFiles` to find per-branch ref locks like
+ * `.git/refs/heads/main.lock`. Bounded depth-first walk; symlinks are not
+ * followed (`readdir` with `withFileTypes` returns symlinks as their own
+ * dirent type, which we skip implicitly because we only recurse on dirs and
+ * only collect files).
+ */
+async function collectLockFiles(root: string): Promise<string[]> {
+	const out: string[] = [];
+	let entries: import("node:fs").Dirent[];
+	try {
+		entries = await readdir(root, { withFileTypes: true });
+	} catch {
+		return out; // ENOENT or perm error — nothing to sweep here.
+	}
+	for (const entry of entries) {
+		const full = join(root, entry.name);
+		if (entry.isDirectory()) {
+			out.push(...(await collectLockFiles(full)));
+		} else if (entry.isFile() && entry.name.endsWith(".lock")) {
+			out.push(full);
+		}
+	}
+	return out;
 }

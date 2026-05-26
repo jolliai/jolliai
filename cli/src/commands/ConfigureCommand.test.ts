@@ -185,17 +185,17 @@ describe("ConfigureCommand — settable keys", () => {
 		});
 	});
 
-	describe("syncEnabled / syncTranscripts boolean coercion via --set", () => {
-		it("accepts true/false/yes/no/1/0 forms for syncEnabled", async () => {
+	describe("syncTranscripts boolean coercion via --set", () => {
+		it("accepts true/false/yes/no/1/0 forms for syncTranscripts", async () => {
 			for (const truthy of ["true", "yes", "1"]) {
 				mockSaveConfig.mockClear();
-				await runConfigure(["--set", `syncEnabled=${truthy}`]);
-				expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncEnabled: true }));
+				await runConfigure(["--set", `syncTranscripts=${truthy}`]);
+				expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncTranscripts: true }));
 			}
 			for (const falsy of ["false", "no", "0"]) {
 				mockSaveConfig.mockClear();
-				await runConfigure(["--set", `syncEnabled=${falsy}`]);
-				expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncEnabled: false }));
+				await runConfigure(["--set", `syncTranscripts=${falsy}`]);
+				expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncTranscripts: false }));
 			}
 		});
 
@@ -203,7 +203,7 @@ describe("ConfigureCommand — settable keys", () => {
 			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 			const prev = process.exitCode;
 			try {
-				await runConfigure(["--set", "syncEnabled=maybe"]);
+				await runConfigure(["--set", "syncTranscripts=maybe"]);
 				expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/true\/false/));
 				expect(process.exitCode).toBe(1);
 				expect(mockSaveConfig).not.toHaveBeenCalled();
@@ -213,9 +213,21 @@ describe("ConfigureCommand — settable keys", () => {
 			}
 		});
 
-		it("accepts a string-coerced boolean for syncTranscripts as well", async () => {
-			await runConfigure(["--set", "syncTranscripts=true"]);
-			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncTranscripts: true }));
+		it("rejects autoSyncEnabled — auto-sync is plugin-only (CLI is not a daemon)", async () => {
+			// CLI can't run a polling loop, so the toggle has nothing to act
+			// on at the CLI level. Users set it through the IDE plugin
+			// Settings UI; the loader still migrates legacy `syncEnabled`
+			// values written by older builds.
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prev = process.exitCode;
+			try {
+				await runConfigure(["--set", "autoSyncEnabled=true"]);
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prev;
+			}
 		});
 	});
 
@@ -263,34 +275,6 @@ describe("ConfigureCommand — settable keys", () => {
 		it("rejects zero / negative values (must be positive)", async () => {
 			await expectSetRejected("0", /positive integer/);
 			await expectSetRejected("-30", /positive integer/);
-		});
-	});
-
-	describe("--sync-enable / --sync-disable shortcuts", () => {
-		it("--sync-enable sets syncEnabled=true and prints the reload hint", async () => {
-			const out = await runConfigure(["--sync-enable"]);
-			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncEnabled: true }));
-			expect(out).toContain("ENABLED");
-		});
-
-		it("--sync-disable sets syncEnabled=undefined and notes manual sync still works", async () => {
-			const out = await runConfigure(["--sync-disable"]);
-			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ syncEnabled: undefined }));
-			expect(out).toContain("DISABLED");
-		});
-
-		it("rejects --sync-enable AND --sync-disable together (mutually exclusive)", async () => {
-			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-			const prevExitCode = process.exitCode;
-			try {
-				await runConfigure(["--sync-enable", "--sync-disable"]);
-				expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("mutually exclusive"));
-				expect(process.exitCode).toBe(1);
-				expect(mockSaveConfig).not.toHaveBeenCalled();
-			} finally {
-				errorSpy.mockRestore();
-				process.exitCode = prevExitCode;
-			}
 		});
 	});
 });

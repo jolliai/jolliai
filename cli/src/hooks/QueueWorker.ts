@@ -94,6 +94,9 @@ import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import { createLogger, errMsg, setLogDir, setLogLevel } from "../Logger.js";
+import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
+import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
+import { acquireVaultWriteLock, DEFAULT_VAULT_WRITE_WAIT_MS } from "../sync/VaultWriteLock.js";
 import type {
 	CommitInfo,
 	CommitSource,
@@ -238,85 +241,164 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 
 	log.info("=== Queue worker started ===");
 
-	// Create storage provider based on config (orphan/dual-write/folder)
-	// Sets module-level override in SummaryStore so all write operations use this provider.
-	const storage = await createStorage(cwd, cwd);
-	setActiveStorage(storage);
-
-	// Acquire worker.lock to prevent concurrent runs (a second worker exits immediately)
-	const lockAcquired = await acquireWorkerLock(cwd);
-	if (!lockAcquired) {
-		log.warn("Could not acquire worker lock, another worker may be running. Exiting.");
+	// Acquire `vault-write.lock` BEFORE constructing storage. Reason:
+	// `createStorage` → `createFolderStorage` → `resolveKBPath` has side
+	// effects (creates `<localFolder>/<repoFolder>/.jolli/` and writes a
+	// stub `config.json`) — two workers entering that path concurrently
+	// would race on KB-path identity and produce phantom `<repo>-N` folders
+	// (the same bug `SyncBootstrap` already documents at line 175 for the
+	// pre-clone case). The lock keys off `localFolder` (read directly from
+	// config — no storage instance yet), so this is safe to do before
+	// touching the vault at all.
+	//
+	// Wait-mode with the standard 60 s budget: when sync is running, the
+	// hook-spawned worker waits for sync to finish rather than dropping its
+	// queue entry. Matches the chain-spawn-on-release decision in
+	// sync-allowlist-staging.md (Option (a) — wait-mode, not registry).
+	const vaultLockConfig = await loadConfig();
+	const memoryBankRoot = deriveMemoryBankRoot(vaultLockConfig.localFolder);
+	const vaultLock = await acquireVaultWriteLock(memoryBankRoot, {
+		wait: DEFAULT_VAULT_WRITE_WAIT_MS,
+	});
+	if (vaultLock === null) {
+		// Cross-repo wakeup (P2). Record this cwd in the per-vault pending
+		// registry so whoever next releases `vault-write.lock` (sync round
+		// complete, or another worker's drain finishing) re-spawns us.
+		// Without this, our queue entry would sit on disk until this repo's
+		// NEXT post-commit hook — potentially hours, since the previous
+		// chain-spawn comments ("chain-spawn from sync release or next
+		// post-commit hook will retry") were aspirational: sync only chained
+		// for its own cwd, and the worker chain only re-checked the same
+		// cwd. The registry closes the cross-repo gap.
+		// Use `memoryBankRoot` (already `deriveMemoryBankRoot`-resolved
+		// from `vaultLockConfig.localFolder`) so default-config users —
+		// the majority — also get the cross-repo wakeup. Passing raw
+		// `vaultLockConfig.localFolder` would no-op when it's undefined.
+		await recordPendingWorker(memoryBankRoot, cwd);
+		log.warn(
+			"Could not acquire vault-write.lock within %d ms; another writer is busy. Exiting — recorded pending-worker entry so the next lock release re-spawns us.",
+			DEFAULT_VAULT_WRITE_WAIT_MS,
+		);
 		return;
 	}
 
-	// Periodically bump the lock's mtime so a long-running LLM call (rare, but
-	// possible when an upstream is slow) cannot be reaped by the stale-lock
-	// reclaimer at LOCK_TIMEOUT_MS. Refresh interval is comfortably below the
-	// timeout so a missed tick still leaves plenty of margin.
+	// Periodically bump vault-write.lock's mtime so a long-running LLM call
+	// (rare, but possible when an upstream is slow) cannot be reaped by the
+	// stale-lock reclaimer at LOCK_TIMEOUT_MS. Same refresh cadence as
+	// worker.lock's timer further below.
 	/* v8 ignore start -- setInterval's lambda only fires on a real timer tick; unit tests finish in milliseconds and never observe the callback. */
-	const refreshTimer = setInterval(() => {
-		void refreshWorkerLockMtime(cwd);
+	const vaultRefreshTimer = setInterval(() => {
+		void vaultLock.refresh();
 	}, WORKER_LOCK_REFRESH_INTERVAL_MS);
 	/* v8 ignore stop */
 
 	try {
-		// Drain the queue: process all entries, then check for new ones (added during processing)
-		let processedCount = 0;
-		const MAX_ENTRIES_PER_RUN = 20; // Safety limit to prevent infinite loops
+		// Create storage provider based on config (orphan/dual-write/folder).
+		// Now safe — we hold `vault-write.lock` so no concurrent writer can race
+		// on `resolveKBPath`'s side effects.
+		const storage = await createStorage(cwd, cwd);
+		setActiveStorage(storage);
 
-		while (processedCount < MAX_ENTRIES_PER_RUN) {
-			const entries = await dequeueAllGitOperations(cwd);
-			if (entries.length === 0) break;
-
-			for (const { op, filePath } of entries) {
-				// Hard cap: if a single dequeue batch returns more than MAX_ENTRIES_PER_RUN,
-				// stop inside the inner loop so the outer while condition can re-check and
-				// exit cleanly. The subsequent chain-spawn (line below) picks up leftovers.
-				if (processedCount >= MAX_ENTRIES_PER_RUN) break;
-				try {
-					await processQueueEntry(op, cwd, storage, force);
-				} catch (error: unknown) {
-					// Queue entries are deleted regardless of success or failure (fire-and-forget).
-					// Retry is intentionally not implemented: pipeline steps (transcript cursor
-					// advancement, summary writes) are not idempotent, so naive retry could cause
-					// duplicate summaries or corrupted metadata.
-					// TODO: Support re-summarize for specific commits (e.g., after LLM quota
-					// replenishment). Requires persisting transcripts to the orphan branch BEFORE
-					// the LLM call so re-summarize can read them back without cursor dependency.
-					log.error(
-						"Failed to process queue entry type=%s hash=%s: %s",
-						op.type,
-						op.commitHash.substring(0, 8),
-						(error as Error).message,
-					);
-				}
-				await deleteQueueEntry(filePath);
-				processedCount++;
-			}
+		// Acquire worker.lock — the per-source-repo lock that serialises two
+		// workers for the SAME source repo (queue entry ordering). It's
+		// narrower than vault-write.lock, which serialises across ALL repos in
+		// the vault. Both locks are needed: vault-write.lock prevents
+		// cross-repo torn writes inside one vault; worker.lock prevents
+		// same-repo concurrent queue drains.
+		const lockAcquired = await acquireWorkerLock(cwd);
+		if (!lockAcquired) {
+			log.warn("Could not acquire worker lock, another worker may be running. Exiting.");
+			return;
 		}
 
-		if (processedCount > 0) {
-			log.info("Processed %d queue entries", processedCount);
-		}
-		/* v8 ignore start -- catch block only reached if dequeueAllGitOperations throws unexpectedly */
-	} catch (error: unknown) {
-		log.error("Worker failed: %s", (error as Error).message);
-	} finally {
+		// Periodically bump the worker.lock mtime — same rationale as
+		// vault-write.lock above.
+		/* v8 ignore start -- setInterval's lambda only fires on a real timer tick; unit tests finish in milliseconds and never observe the callback. */
+		const refreshTimer = setInterval(() => {
+			void refreshWorkerLockMtime(cwd);
+		}, WORKER_LOCK_REFRESH_INTERVAL_MS);
 		/* v8 ignore stop */
-		clearInterval(refreshTimer);
-		await releaseWorkerLock(cwd);
-		log.info("=== Queue worker finished ===");
-	}
 
-	// Chain spawn: if new entries appeared while we were processing, spawn another Worker
-	const remaining = await dequeueAllGitOperations(cwd);
-	/* v8 ignore start -- chain spawn only occurs when new entries arrive during worker processing */
-	if (remaining.length > 0) {
-		log.info("Queue has %d remaining entries — spawning chain worker", remaining.length);
-		launchWorker(cwd);
+		try {
+			// Drain the queue: process all entries, then check for new ones (added during processing)
+			let processedCount = 0;
+			const MAX_ENTRIES_PER_RUN = 20; // Safety limit to prevent infinite loops
+
+			while (processedCount < MAX_ENTRIES_PER_RUN) {
+				const entries = await dequeueAllGitOperations(cwd);
+				if (entries.length === 0) break;
+
+				for (const { op, filePath } of entries) {
+					// Hard cap: if a single dequeue batch returns more than MAX_ENTRIES_PER_RUN,
+					// stop inside the inner loop so the outer while condition can re-check and
+					// exit cleanly. The subsequent chain-spawn (line below) picks up leftovers.
+					if (processedCount >= MAX_ENTRIES_PER_RUN) break;
+					try {
+						await processQueueEntry(op, cwd, storage, force);
+					} catch (error: unknown) {
+						// Queue entries are deleted regardless of success or failure (fire-and-forget).
+						// Retry is intentionally not implemented: pipeline steps (transcript cursor
+						// advancement, summary writes) are not idempotent, so naive retry could cause
+						// duplicate summaries or corrupted metadata.
+						// TODO: Support re-summarize for specific commits (e.g., after LLM quota
+						// replenishment). Requires persisting transcripts to the orphan branch BEFORE
+						// the LLM call so re-summarize can read them back without cursor dependency.
+						log.error(
+							"Failed to process queue entry type=%s hash=%s: %s",
+							op.type,
+							op.commitHash.substring(0, 8),
+							(error as Error).message,
+						);
+					}
+					await deleteQueueEntry(filePath);
+					processedCount++;
+				}
+			}
+
+			if (processedCount > 0) {
+				log.info("Processed %d queue entries", processedCount);
+			}
+			/* v8 ignore start -- catch block only reached if dequeueAllGitOperations throws unexpectedly */
+		} catch (error: unknown) {
+			log.error("Worker failed: %s", (error as Error).message);
+		} finally {
+			/* v8 ignore stop */
+			clearInterval(refreshTimer);
+			await releaseWorkerLock(cwd);
+			log.info("=== Queue worker finished ===");
+		}
+
+		// Chain spawn: if new entries appeared while we were processing, spawn another Worker
+		const remaining = await dequeueAllGitOperations(cwd);
+		/* v8 ignore start -- chain spawn only occurs when new entries arrive during worker processing */
+		if (remaining.length > 0) {
+			log.info("Queue has %d remaining entries — spawning chain worker", remaining.length);
+			launchWorker(cwd);
+		}
+		/* v8 ignore stop */
+	} finally {
+		// Outer finally — vault-write.lock release. Runs AFTER worker.lock
+		// release and AFTER the chain-spawn check, so a chain-spawned successor
+		// can re-acquire vault-write.lock immediately on its own spawn.
+		clearInterval(vaultRefreshTimer);
+		await vaultLock.release();
+		// Cross-repo wakeup (P2). Any worker that timed out waiting for
+		// vault-write.lock while WE held it recorded its cwd; spawn a
+		// successor for each so the queue entry isn't stranded until that
+		// repo's next post-commit hook. Idempotent: `launchWorker` against
+		// an empty queue is a cheap no-op.
+		try {
+			const pending = await consumePendingWorkers(memoryBankRoot);
+			for (const pendingCwd of pending) {
+				if (pendingCwd !== cwd) {
+					log.info("Waking pending worker for cwd=%s", pendingCwd);
+					launchWorker(pendingCwd);
+				}
+			}
+		} catch (e) {
+			log.warn("consumePendingWorkers on release failed (non-fatal): %s", (e as Error).message);
+		}
 	}
-	/* v8 ignore stop */
 }
 
 /**

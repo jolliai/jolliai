@@ -179,18 +179,12 @@ describe("StatusBarManager", () => {
 			expect(item.tooltip).toContain("Server refused the push");
 		});
 
-		it("offline + failedCode=symlink_quarantine_failed → 'Sync paused' with §P2 headline", () => {
-			// I6: sweep failure terminates the round; the bar must show a
-			// distinct "Sync paused" visual (not generic "Sync failed") so
-			// the user understands the failure is recoverable and what
-			// needs inspecting.
-			const manager = new StatusBarManager();
-			manager.setSyncState("offline", { failed: true, failedCode: "symlink_quarantine_failed" });
-			expect(item.text).toBe("$(error) Sync paused");
-			expect((item.backgroundColor as { id: string }).id).toBe("statusBarItem.errorBackground");
-			expect(item.tooltip).toContain("Symlink quarantine failed");
-			expect(item.tooltip).toContain("Memory Bank folder");
-		});
+		// `symlink_quarantine_failed` case REMOVED — Phase 1 deleted the
+		// SymlinkSweep round-terminal path. The new symlink defences
+		// (stageVault canary + safeAtomicWriteSync) don't surface as
+		// a terminal SyncErrorCode, so there's no status-bar visual to
+		// test. Coverage for the defences themselves is in
+		// StageVault.test.ts and VaultSymlinkGuard.test.ts.
 
 		it("offline + an unrecognized failedCode falls back to generic 'Sync failed' (exhaustive-never runtime safety)", () => {
 			// The terminal-code switch has a compile-time `const _exhaustive:
@@ -270,6 +264,101 @@ describe("StatusBarManager", () => {
 			manager.setSyncState("syncing");
 			manager.setSyncState("synced");
 			expect(item.text).toBe("$(check) Jolli Memory");
+		});
+
+		it("releaseSyncOwnership() lets update(false) flip back to the disabled visual (P2 #3)", () => {
+			// Regression for P2 #3: previously `syncOwned` was a one-way flag.
+			// Once sync had taken over, sign-out / disable could not change the
+			// visual; the bar stayed on the last sync state until the window
+			// was reloaded. The new release path (called from
+			// `VsCodeSyncBootstrap.disposeOrchestrator`) must unblock the
+			// legacy `update(enabled)` channel.
+			const manager = new StatusBarManager();
+			manager.setSyncState("offline", { failed: true, failedCode: "sync_failed_after_retries" });
+			expect(item.text).toBe("$(error) Sync failed");
+			// Pre-release: update is a no-op.
+			manager.update(false);
+			expect(item.text).toBe("$(error) Sync failed");
+			// Post-release: update lands.
+			manager.releaseSyncOwnership();
+			manager.update(false);
+			expect(item.text).toBe("$(circle-outline) Jolli Memory (disabled)");
+			expect((item.backgroundColor as { id: string }).id).toBe("statusBarItem.warningBackground");
+		});
+
+		it("releaseSyncOwnership() also unblocks update(true) for the re-enable path", () => {
+			// Sign-out then sign-in WITHOUT the user toggling auto-sync OFF.
+			// dispose path runs releaseSyncOwnership(); next refreshStatusBar
+			// should flip to the neutral enabled visual.
+			const manager = new StatusBarManager();
+			manager.setSyncState("conflicts", { conflictCount: 2 });
+			manager.releaseSyncOwnership();
+			manager.update(true);
+			expect(item.text).toBe("Jolli Memory");
+			expect(item.backgroundColor).toBeUndefined();
+		});
+	});
+
+	describe("setSyncState — canary surface (P2 #2)", () => {
+		it("synced + canarySymlinkedCount > 0 shows warning visual instead of green check", () => {
+			// `stageVault`'s `symlinked` bucket is a strong hostile-placement
+			// signal — a peer or foreign writer dropped a symlink at a path
+			// the classifier would otherwise stage. Even though the round
+			// completed (the symlink was excluded from the commit), the user
+			// must see this. Pre-P2 #2 the bar showed a green check and the
+			// signal lived in logs only.
+			const manager = new StatusBarManager();
+			manager.setSyncState("synced", {
+				canarySymlinkedCount: 1,
+				canarySymlinkedSample: ["myrepo/.jolli/index.json"],
+			});
+			expect(item.text).toBe("$(warning) Memory Bank: symlink blocked");
+			expect((item.backgroundColor as { id: string }).id).toBe("statusBarItem.warningBackground");
+			expect(item.tooltip).toContain("1 symlinked path blocked");
+			expect(item.tooltip).toContain("myrepo/.jolli/index.json");
+		});
+
+		it("synced + canarySymlinkedCount > 1 uses plural copy", () => {
+			const manager = new StatusBarManager();
+			manager.setSyncState("synced", {
+				canarySymlinkedCount: 3,
+				canarySymlinkedSample: ["a", "b", "c"],
+			});
+			expect(item.tooltip).toContain("3 symlinked paths blocked");
+		});
+
+		it("synced + only canaryUnowned (no symlinked) stays green check (weak signal)", () => {
+			// `unowned` covers benign drift like the `.memorybank-state.json`
+			// sentinel (P3 #1). Showing a yellow badge for that would train
+			// the user to ignore the warning entirely.
+			const manager = new StatusBarManager();
+			manager.setSyncState("synced", {
+				canaryUnownedCount: 2,
+				canaryUnownedSample: [".memorybank-state.json", "myrepo/random.txt"],
+			});
+			expect(item.text).toBe("$(check) Jolli Memory");
+			expect(item.backgroundColor).toBeUndefined();
+			// But the tooltip still mentions them so an operator
+			// investigating can see what's flagged.
+			expect(item.tooltip).toContain("Unowned paths");
+			expect(item.tooltip).toContain(".memorybank-state.json");
+		});
+
+		it("tooltip caps the path sample at 3 even when more were collected", () => {
+			const manager = new StatusBarManager();
+			manager.setSyncState("synced", {
+				canarySymlinkedCount: 7,
+				canarySymlinkedSample: ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+			});
+			const tip = item.tooltip ?? "";
+			expect(tip).toContain("p1");
+			expect(tip).toContain("p3");
+			// p4..p7 must not appear — keeps the tooltip readable.
+			expect(tip).not.toContain("p4");
+			expect(tip).not.toContain("p7");
+			// But the count surfaces the full total so the user knows
+			// there's more than what's shown.
+			expect(tip).toContain("(3/7)");
 		});
 	});
 });

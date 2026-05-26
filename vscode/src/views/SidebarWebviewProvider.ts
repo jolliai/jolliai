@@ -46,6 +46,17 @@ export interface SidebarWebviewDeps {
 		 * the unstable `status:data` entries list.
 		 */
 		getWorkerBusy(): boolean;
+		/**
+		 * Returns the current sync-phase indicator from StatusStore. Pushed to
+		 * the webview as `sync:phase` so the Branch tab toolbar can render the
+		 * orchestrator's per-phase label (downloading / merging / uploading /
+		 * sticky failure). Optional so existing tests (which only stub
+		 * `getWorkerBusy`) keep compiling.
+		 */
+		getSyncPhase?: () => {
+			readonly label: string;
+			readonly severity: "info" | "error";
+		} | null;
 	};
 	kbFolders?: {
 		listChildren(relPath: string): Promise<FolderNode>;
@@ -814,6 +825,15 @@ export class SidebarWebviewProvider
 			type: "worker:busy",
 			busy: this.deps.statusProvider.getWorkerBusy(),
 		});
+		// Sync-phase indicator. Optional on the provider interface so existing
+		// tests that don't stub `getSyncPhase` keep working unchanged.
+		const getSyncPhase = this.deps.statusProvider.getSyncPhase;
+		if (getSyncPhase) {
+			this.postMessage({
+				type: "sync:phase",
+				phase: getSyncPhase(),
+			});
+		}
 	}
 
 	private pushMemories(): void {

@@ -3,7 +3,7 @@
  *
  * Owns the bottom status bar item for Jolli Memory. Two distinct surfaces:
  *
- *   - **Legacy** (default, used when `config.syncEnabled !== true`):
+ *   - **Legacy** (default, used when `config.autoSyncEnabled !== true`):
  *     `Jolli Memory` when enabled, `$(circle-outline) Jolli Memory (disabled)`
  *     when disabled. Drive via `update(enabled: boolean)` — the existing API
  *     that command modules (`CommitCommand`, `PushCommand`, etc.) already call.
@@ -58,6 +58,31 @@ export interface SyncStatusDetail {
 	 * cause and wait the (shorter than they think) TTL.
 	 */
 	readonly selfLocked?: boolean;
+	/**
+	 * P2 #2 — non-fatal canary surface populated by `stageVault` (see
+	 * `SyncRoundResult.canary`). Round still completes successfully; these
+	 * paths were excluded from the commit and the user should be told even
+	 * when the overall state is `synced`. Without surfacing them, the
+	 * symlink-defence story is silent ("hostile placement was blocked but
+	 * UI shows green check") which is exactly the failure mode the
+	 * `SyncTypes.canary` doc warns against.
+	 *
+	 *   - `canarySymlinkedCount` — count of symlinked-at-classifier-location
+	 *     entries the round refused to stage. Strong hostile-placement
+	 *     signal; renders a warning visual even on `synced`.
+	 *   - `canaryUnownedCount` — count of paths the classifier didn't
+	 *     recognise. Weak signal; surfaced in tooltip only (no badge), so
+	 *     legitimate edge cases like the `.memorybank-state.json` sentinel
+	 *     don't perpetually flag the bar warning-yellow.
+	 *   - `canarySymlinkedSample` / `canaryUnownedSample` — first few
+	 *     paths from each bucket, for the tooltip line. Capped upstream by
+	 *     `CANARY_PATH_CAP`; we only render the first 3 to keep the tooltip
+	 *     readable.
+	 */
+	readonly canarySymlinkedCount?: number;
+	readonly canaryUnownedCount?: number;
+	readonly canarySymlinkedSample?: ReadonlyArray<string>;
+	readonly canaryUnownedSample?: ReadonlyArray<string>;
 }
 
 export class StatusBarManager {
@@ -88,7 +113,7 @@ export class StatusBarManager {
 
 	/**
 	 * Legacy visual. Used by existing command modules and by activate() when
-	 * `config.syncEnabled` is false. Preserves 0.99.x pixel output exactly.
+	 * `config.autoSyncEnabled` is false. Preserves 0.99.x pixel output exactly.
 	 *
 	 * No-op once sync has taken over the bar — see `syncOwned`.
 	 */
@@ -111,13 +136,38 @@ export class StatusBarManager {
 	}
 
 	/**
-	 * Sync visual. Used by the StatusOrchestrator when `config.syncEnabled` is
+	 * Sync visual. Used by the StatusOrchestrator when `config.autoSyncEnabled` is
 	 * true and a `SyncEngine` is driving rounds.
 	 */
 	setSyncState(state: SyncState, detail?: SyncStatusDetail): void {
 		this.syncOwned = true;
 		switch (state) {
 			case "synced":
+				// P2 #2 — symlinked canary entries are a strong hostile-
+				// placement signal (a peer or a foreign writer dropped a
+				// symlink at a path the classifier would otherwise have
+				// staged, e.g. `<repo>/.jolli/index.json` → `~/.aws/credentials`).
+				// Even though the round completed and the symlink was
+				// excluded from the commit, the user has to see this —
+				// otherwise stageVault's defence is silent and the security
+				// signal sits in logs only. `unowned` is a weak signal
+				// (classifier drift / OS noise) and stays in the tooltip
+				// only, no badge.
+				if ((detail?.canarySymlinkedCount ?? 0) > 0) {
+					const n = detail?.canarySymlinkedCount ?? 0;
+					this.item.text = `$(warning) Memory Bank: symlink blocked`;
+					this.item.backgroundColor = new vscode.ThemeColor(
+						"statusBarItem.warningBackground",
+					);
+					this.item.color = undefined;
+					this.item.tooltip = buildTooltip(
+						n === 1
+							? "Memory Bank in sync — 1 symlinked path blocked (inspect)"
+							: `Memory Bank in sync — ${n} symlinked paths blocked (inspect)`,
+						detail,
+					);
+					return;
+				}
 				this.item.text = "$(check) Jolli Memory";
 				this.item.backgroundColor = undefined;
 				this.item.color = undefined;
@@ -175,6 +225,30 @@ export class StatusBarManager {
 		}
 	}
 
+	/**
+	 * Releases sync's exclusive ownership of the bar so subsequent legacy
+	 * `update(enabled)` calls (from `refreshStatusBar` and the sign-out /
+	 * disable command handlers) can change the visual again. Called from
+	 * `VsCodeSyncBootstrap.disposeOrchestrator` — i.e. whenever the sync
+	 * orchestrator is torn down (sign-out, auto-sync OFF, poll-interval
+	 * rebuild, deactivate).
+	 *
+	 * Why this exists (P2 #3): `syncOwned` was previously a one-way flag
+	 * — once `setSyncState` had been called, the bar was permanently
+	 * locked to sync's visuals. After sign-out the bar stayed on the last
+	 * sync state ("Sync failed" / "Conflicts" / green check) until the
+	 * extension was reloaded, even though sync was definitively off.
+	 *
+	 * The release path is intentionally one-shot: the caller must follow
+	 * up with `update(enabled)` (or wait for the rebuilt orchestrator to
+	 * call `setSyncState`) to set the next visual. This file doesn't
+	 * `loadConfig` directly — the caller knows the current sign-in / enabled
+	 * state and is the right authority for the post-release visual.
+	 */
+	releaseSyncOwnership(): void {
+		this.syncOwned = false;
+	}
+
 	/** Disposes the status bar item. */
 	dispose(): void {
 		this.item.dispose();
@@ -186,6 +260,23 @@ function buildTooltip(headline: string, detail?: SyncStatusDetail): string {
 	const parts = [headline];
 	if (detail.lastError) parts.push(`Error: ${detail.lastError}`);
 	if (detail.lastFetchAt) parts.push(`Last fetch: ${detail.lastFetchAt}`);
+	// P2 #2 — canary surface. Show first 3 of each bucket; the engine
+	// already capped at CANARY_PATH_CAP so we're under that, but trimming
+	// to 3 keeps the tooltip readable across long paths. `symlinked` first
+	// because it's the actionable signal (hostile-placement); `unowned`
+	// trails because it's usually benign drift.
+	const symSample = detail.canarySymlinkedSample;
+	if (symSample !== undefined && symSample.length > 0) {
+		const shown = symSample.slice(0, 3);
+		parts.push(`Blocked symlinks (${shown.length}/${detail.canarySymlinkedCount ?? shown.length}):`);
+		for (const p of shown) parts.push(`  • ${p}`);
+	}
+	const unownedSample = detail.canaryUnownedSample;
+	if (unownedSample !== undefined && unownedSample.length > 0) {
+		const shown = unownedSample.slice(0, 3);
+		parts.push(`Unowned paths (${shown.length}/${detail.canaryUnownedCount ?? shown.length}):`);
+		for (const p of shown) parts.push(`  • ${p}`);
+	}
 	parts.push("Click to open sidebar");
 	return parts.join("\n");
 }
@@ -230,17 +321,10 @@ function terminalCodeVisual(code: TerminalSyncErrorCode, detail: SyncStatusDetai
 				headline: "Server refused the push — see Memory Bank log for details",
 				backgroundThemeKey: "statusBarItem.errorBackground",
 			};
-		case "symlink_quarantine_failed":
-			// §P2 sweep refused to let the round continue because one or more
-			// symlinks could not be moved into the quarantine directory. The
-			// next round retries (idempotent), so transient EBUSY/AV cases
-			// self-recover; the headline tells the user where to look if it
-			// persists.
-			return {
-				text: "$(error) Sync paused",
-				headline: "Symlink quarantine failed — inspect Memory Bank folder, then retry",
-				backgroundThemeKey: "statusBarItem.errorBackground",
-			};
+		/* `symlink_quarantine_failed` case REMOVED — Phase 1 deleted the
+		 * SymlinkSweep round-terminal path. Symlink defences (stageVault
+		 * canary + safeAtomicWriteSync) skip rogue entries without
+		 * dropping the round to offline, so no status-bar case is needed. */
 		case "vault_mismatch":
 		case "mint_failed":
 		case "git_missing":

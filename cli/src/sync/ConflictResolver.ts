@@ -200,25 +200,22 @@ export class ConflictResolver {
 				// the right signal.
 			}
 
-			// Tier 2 — AI merge (only when a provider is wired AND we have at
-			// least the two sides; if either is missing, drop straight to Tier 3
-			// since the guards below would all fail anyway).
-			if (this.ai !== null && ours !== null && theirs !== null) {
-				const aiResult = await this.tryAiMerge(path, base, ours, theirs);
-				if (aiResult !== null) {
-					await this.writeFile(this.resolveVaultPath(path), aiResult.merged);
-					await this.client.addPath(path);
-					resolved.push(path);
-					aiMerged.push({ path, model: aiResult.model });
-					continue;
-				}
-			}
-
 			// Tier 2.7 — safe deterministic heuristics. All rules are lossless
 			// (when both sides have content) or base-aware (when one side is
-			// missing — respect deletes, not just modifications). Run BEFORE
-			// Tier 3 so even `policy: "prompt"` users skip the dialog on
-			// obvious cases.
+			// missing — respect deletes, not just modifications).
+			//
+			// Runs BEFORE Tier 2 (AI merge) on purpose: the heuristic rules
+			// are O(file-size) string compares (~100 ms even on big files),
+			// while Tier 2 is a Sonnet call that takes 1–3 minutes per file
+			// and produces output the parser then often rejects (the
+			// `BEGIN_MERGED_<token>` markers drift on long inputs). Empirically
+			// (see plan §… in the sidebar-sync PR) a vault with 5 whitespace-
+			// only divergences spent ~15 minutes on Tier 2 calls that were
+			// thrown away, then Tier 2.7 resolved each in <30 ms. Putting 2.7
+			// first kills that waste outright.
+			//
+			// Also runs BEFORE Tier 3 so even `policy: "prompt"` users skip
+			// the dialog on obvious cases.
 			const safeMerge = this.trySafeHeuristics(path, base, ours, theirs);
 			if (safeMerge !== null) {
 				if (safeMerge.kind === "merged") {
@@ -231,6 +228,20 @@ export class ConflictResolver {
 				resolved.push(path);
 				log.info("Tier 2.7 resolved %s via %s", path, safeMerge.via);
 				continue;
+			}
+
+			// Tier 2 — AI merge (only when a provider is wired AND we have at
+			// least the two sides; if either is missing, drop straight to Tier 3
+			// since the guards below would all fail anyway).
+			if (this.ai !== null && ours !== null && theirs !== null) {
+				const aiResult = await this.tryAiMerge(path, base, ours, theirs);
+				if (aiResult !== null) {
+					await this.writeFile(this.resolveVaultPath(path), aiResult.merged);
+					await this.client.addPath(path);
+					resolved.push(path);
+					aiMerged.push({ path, model: aiResult.model });
+					continue;
+				}
 			}
 
 			// Tier 3 — fallback: policy-driven auto-pick OR human prompt.
