@@ -72,6 +72,25 @@ jobs:
                         exit 0
                     fi
 
+                    # Author emails that are accepted as a synonym for a
+                    # fixed Signed-off-by address — used for bots whose
+                    # commit author email (a `users.noreply.github.com`
+                    # routing address) intentionally differs from the
+                    # mailbox they sign off with. Mirrors GitHub's
+                    # official DCO App behaviour for Dependabot.
+                    is_bot_equivalent() {
+                        local author=$1
+                        local sob=$2
+                        case "$author" in
+                            *+dependabot\[bot\]@users.noreply.github.com)
+                                [ "$sob" = "support@github.com" ]
+                                ;;
+                            *)
+                                return 1
+                                ;;
+                        esac
+                    }
+
                     failed=0
                     for sha in "${commits[@]}"; do
                         short=$(git log -1 --pretty='%h %s' "$sha")
@@ -84,15 +103,25 @@ jobs:
                         author_email=$(git show -s --format='%ae' "$sha" \
                             | tr '[:upper:]' '[:lower:]')
 
-                        # Parse trailers rigorously — grepping the raw
-                        # message would let a commit body that mentions
-                        # the string "Signed-off-by:" pass without an
-                        # actual trailer block. Multiple Signed-off-by
-                        # trailers are allowed (e.g. patch-relay flows);
-                        # one matching the author is enough.
+                        # Extract Signed-off-by emails by scanning the
+                        # raw commit message directly — not via
+                        # `git interpret-trailers --parse`. The trailer
+                        # parser uses a heuristic that requires the
+                        # trailer block to be a contiguous run of
+                        # trailer-shaped lines at the end of the
+                        # message; Dependabot defeats that heuristic
+                        # by embedding a YAML metadata block (delimited
+                        # by `---` / `...`) above the sign-off, which
+                        # makes the parser drop the Signed-off-by line
+                        # entirely. A direct line-level scan matches
+                        # GitHub's own DCO App and the Linux kernel's
+                        # `checkpatch.pl` policy: a real
+                        # `Signed-off-by:` line anywhere in the message
+                        # counts. Multiple sign-offs are allowed (patch
+                        # relay flows, co-authors); one matching the
+                        # author is enough.
                         sob_emails=$(git show -s --format=%B "$sha" \
-                            | git interpret-trailers --parse \
-                            | grep -iE '^Signed-off-by:[[:space:]]+.+[[:space:]]+<.+@.+>[[:space:]]*$' \
+                            | grep -iE '^Signed-off-by:[[:space:]]+.+[[:space:]]+<[^>]+@[^>]+>[[:space:]]*$' \
                             | sed -E 's/.*<([^>]+)>.*/\1/' \
                             | tr '[:upper:]' '[:lower:]' \
                             || true)
@@ -103,7 +132,15 @@ jobs:
                             continue
                         fi
 
-                        if ! printf '%s\n' "$sob_emails" | grep -qxF "$author_email"; then
+                        matched=0
+                        while IFS= read -r sob; do
+                            if [ "$sob" = "$author_email" ] || is_bot_equivalent "$author_email" "$sob"; then
+                                matched=1
+                                break
+                            fi
+                        done <<< "$sob_emails"
+
+                        if [ "$matched" -eq 0 ]; then
                             found=$(printf '%s ' $sob_emails)
                             echo "::error::Signed-off-by does not match author <$author_email> on commit: $short (found: ${found% })"
                             failed=$((failed + 1))
