@@ -1213,6 +1213,17 @@ describe("navigationClaimsRootIndex", () => {
 		expect(navigationClaimsRootIndex([{ article: "Home", href: "/" }])).toBe(true);
 	});
 
+	it("returns true for relative index hrefs ('index', 'index.md', 'index.mdx')", async () => {
+		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
+		// Article hrefs are conventionally relative, so a bare `index` should
+		// also count as claiming root. Today no observable issue because
+		// `pickRootRedirectHref` returns undefined in simple mode, but pinning
+		// this prevents a future tweak from re-introducing a flash.
+		expect(navigationClaimsRootIndex([{ article: "Home", href: "index" }])).toBe(true);
+		expect(navigationClaimsRootIndex([{ article: "Home", href: "index.md" }])).toBe(true);
+		expect(navigationClaimsRootIndex([{ article: "Home", href: "index.mdx" }])).toBe(true);
+	});
+
 	it("returns false when an external link uses '/'-like href (external never claims root)", async () => {
 		const { navigationClaimsRootIndex } = await import("./StartCommand.js");
 		expect(
