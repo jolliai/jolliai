@@ -439,7 +439,7 @@
 		},
 		"NavigationGroup": {
 			"type": "object",
-			"description": "A non-clickable section heading that clusters articles.",
+			"description": "A non-clickable section heading that clusters articles. Always renders as a sidebar separator.",
 			"required": ["group", "content"],
 			"additionalProperties": false,
 			"properties": {
@@ -449,11 +449,11 @@
 				},
 				"root": {
 					"type": "string",
-					"description": "Optional sub-path. Article href values in this group are resolved relative to this."
+					"description": "Source-location hint. Source files for this group's articles live under <page.root>/<group.root>/. Does NOT affect generated URLs or the sidebar tree."
 				},
 				"sourceRoot": {
 					"type": "string",
-					"description": "Physical source directory for this group."
+					"description": "Physical source directory for this group. Takes precedence over `root` for source lookup; does not affect URLs."
 				},
 				"content": {
 					"type": "array",

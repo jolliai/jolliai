@@ -97,6 +97,15 @@ export type SidebarItemValue =
 			 * collapse default.
 			 */
 			theme?: { collapsed?: boolean };
+			/**
+			 * Nextra v4 visibility override. `"hidden"` keeps the entry routable
+			 * (so URLs under it still resolve) while suppressing it from the
+			 * sidebar tree. `MetaGenerator` emits it for the folder's own
+			 * `index.{md,mdx}` so Nextra doesn't list the index as a duplicate
+			 * child entry, and for non-active OpenAPI spec page-tabs (the
+			 * scoped layout un-hides the active one for sidebar binding).
+			 */
+			display?: "hidden";
 	  };
 
 /**
@@ -296,14 +305,30 @@ export interface NavigationArticle {
 /**
  * A group is a non-clickable section heading that clusters articles.
  * Groups cannot nest inside other groups.
+ *
+ * Sidebar rendering: a group always emits a `type: "separator"` entry at the
+ * parent meta level — never a clickable folder. The articles inside render
+ * directly under the separator at the same level as the rest of the page's
+ * content; ContentPlanner flattens the generated build tree so Nextra renders
+ * them naturally without a stray group-named folder.
  */
 export interface NavigationGroup {
 	group: string;
+	/**
+	 * Optional source-location hint. Tells ContentPlanner that the source
+	 * files for this group's articles live under `<page.root>/<group.root>/`
+	 * in the source tree. **Does not affect the generated URLs or the sidebar
+	 * tree** — the schema treats the group as a separator, and the build
+	 * output is flattened to the page's root so Nextra renders accordingly.
+	 *
+	 * To organise sources under a different directory than the schema's
+	 * page root, use `sourceRoot` (it overrides `root` for source lookup).
+	 */
 	root?: string;
 	/**
 	 * Optional physical source directory for this logical group, relative to
-	 * the source root. Lets a group render under one logical target folder
-	 * while sourcing its child pages from a different directory tree.
+	 * the source root. When set, takes precedence over `root` for source
+	 * lookup. Like `root`, it does not affect generated URLs.
 	 */
 	sourceRoot?: string;
 	content: NavigationArticle[];

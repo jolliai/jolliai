@@ -189,50 +189,17 @@ function parseContent(
 
 	for (const node of nodes) {
 		if (isGroup(node)) {
-			if (node.root) {
-				// Group has its own root → articles go into a separate directory _meta.js
-				const groupPath = joinPath(pathPrefix, node.root);
-				const groupEntries: Record<string, SidebarItemValue> = {};
+			// A group is always rendered as a non-clickable separator at the
+			// parent meta level. `node.root` is a source-location hint for
+			// ContentPlanner — it does NOT contribute to the sidebar tree or
+			// the URL path. The schema intent (group = separator) wins; the
+			// generated build tree is flattened so articles inside the group
+			// live at the parent level and Nextra renders them naturally.
+			const groupSlug = slugify(node.group);
+			entries[`__group-${groupSlug}`] = { type: "separator" as const, title: node.group };
 
-				// Add the group folder key to the parent _meta.js as a labelled entry.
-				// When root has multiple segments (e.g. "docs/guides"), only the first
-				// segment goes into the current _meta.js — intermediate directories
-				// get their own entries in the appropriate _meta.js files.
-				const rootSegments = node.root.split("/").filter(Boolean);
-				if (rootSegments.length === 1) {
-					entries[rootSegments[0]] = node.group;
-				} else {
-					// First segment in current _meta.js
-					entries[rootSegments[0]] = rootSegments[0];
-					// Group label in the intermediate directory's _meta.js
-					let intermediatePath = joinPath(pathPrefix, rootSegments[0]);
-					for (let i = 1; i < rootSegments.length; i++) {
-						const seg = rootSegments[i];
-						const isLast = i === rootSegments.length - 1;
-						if (!sidebar[intermediatePath]) {
-							sidebar[intermediatePath] = {};
-						}
-						(sidebar[intermediatePath] as Record<string, SidebarItemValue>)[seg] = isLast
-							? node.group
-							: seg;
-						intermediatePath = joinPath(intermediatePath, seg);
-					}
-				}
-
-				for (const article of node.content) {
-					addArticle(article, groupPath, groupEntries, sidebar);
-				}
-				if (Object.keys(groupEntries).length > 0) {
-					sidebar[groupPath] = groupEntries;
-				}
-			} else {
-				// No root → articles stay in the parent directory, group is a separator
-				const groupSlug = slugify(node.group);
-				entries[`__group-${groupSlug}`] = { type: "separator" as const, title: node.group };
-
-				for (const article of node.content) {
-					addArticle(article, pathPrefix, entries, sidebar);
-				}
+			for (const article of node.content) {
+				addArticle(article, pathPrefix, entries, sidebar);
 			}
 		} else {
 			addArticle(node, pathPrefix, entries, sidebar);
