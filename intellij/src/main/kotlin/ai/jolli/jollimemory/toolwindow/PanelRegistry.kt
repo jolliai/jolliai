@@ -15,4 +15,5 @@ class PanelRegistry {
 	var plansPanel: PlansPanel? = null
 	var changesPanel: ChangesPanel? = null
 	var commitsPanel: CommitsPanel? = null
+	var activeConversationsPanel: ActiveConversationsPanel? = null
 }
