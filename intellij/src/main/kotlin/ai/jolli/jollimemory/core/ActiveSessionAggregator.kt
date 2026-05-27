@@ -139,7 +139,7 @@ object ActiveSessionAggregator {
 			loadCodex(cwd),
 			loadOpenCode(cwd),
 			loadCursor(cwd),
-			// TODO: plug in when Copilot branches land
+			// TODO: plug in when Copilot branches land.
 			// loadCopilot(cwd),
 			// loadCopilotChat(cwd),
 		)
