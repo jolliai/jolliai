@@ -1512,6 +1512,29 @@ describe("GitClient", () => {
 			expect(await client.refExists("refs/heads/no-such-branch")).toBe(false);
 		});
 
+		it("listLocalBranches enumerates local branch refs (empty post-init, non-empty post-clone-and-checkout)", async () => {
+			const client = makeClient();
+			await mkdir(memoryBankRoot, { recursive: true });
+			// `initRemote` sets HEAD to symbolic-ref but never creates `refs/heads/<default>`
+			// until the first commit. So `listLocalBranches` returns empty —
+			// this is exactly the "fresh local" signal bootstrap-merge depends on.
+			await client.initRemote(bareRepoUrl);
+			expect(await client.listLocalBranches()).toEqual([]);
+
+			// After clone we have `main` locally.
+			await rm(memoryBankRoot, { recursive: true, force: true });
+			await mkdir(memoryBankRoot, { recursive: true });
+			await client.clone(bareRepoUrl);
+			const branches = await client.listLocalBranches();
+			expect(branches).toContain("main");
+
+			// Make a side branch; both names should now appear.
+			execFileSync("git", ["checkout", "-b", "feature/x"], { cwd: memoryBankRoot });
+			const branches2 = await client.listLocalBranches();
+			expect(branches2).toContain("main");
+			expect(branches2).toContain("feature/x");
+		});
+
 		it("isAncestor returns true for ancestor relationships and false for divergent ones", async () => {
 			const client = makeClient();
 			await client.clone(bareRepoUrl);

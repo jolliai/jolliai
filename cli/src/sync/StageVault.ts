@@ -103,31 +103,34 @@ export async function stageVault(client: GitClient, vaultRoot: string, opts: Sta
 	const byKind = new Map<OwnedPathKind | "unowned" | "skipped" | "symlink-blocked", number>();
 	const toAdd: string[] = [];
 	const toRm: string[] = [];
-	// `toUnstage` — paths the classifier rejects (UNOWNED) that are
-	// CURRENTLY in the git index. Issued via `git rm --cached` (no
-	// working-tree removal). For an unowned path with no HEAD blob (e.g.
-	// a foreign writer's `git add foreign.txt`), this just drops the
-	// index entry; for one that HAS a HEAD blob (legacy committed foreign
-	// content), this stages a deletion that the next commit will push.
-	// The latter is intentional under the current contract — the
-	// classifier is authoritative; anything outside the catalogue is
-	// either drift to clean up or junk to evict.
-	const toUnstage: string[] = [];
-	// `toReset` — paths we want to REMOVE FROM THE PENDING COMMIT without
-	// staging a deletion against HEAD. Issued via `git reset HEAD --`.
-	// Distinct from `toUnstage` because the path is recognised as
-	// engine-owned but should not propagate this round:
+	// `toReset` — paths that classify as either unowned, transcript-off,
+	// or symlink-blocked AND already have a staged change against HEAD.
+	// We do NOT want the upcoming `commit()` (no pathspec; commits the
+	// whole index) to pick them up, but we ALSO do not want to stage a
+	// deletion of the HEAD blob — that would push to the remote and
+	// erase the file on every peer.
 	//
+	// `git reset HEAD --` reverts the index entry to its HEAD blob (or
+	// drops the entry if HEAD has none, for an `A`-only staged add) so
+	// the commit carries nothing for this path. `git rm --cached` is
+	// NOT used here because for HEAD-tracked paths it stages a deletion;
+	// the data-loss regression that this comment documents was caused by
+	// the previous `unowned` branch routing into `git rm --cached`,
+	// which silently deleted from the remote any legacy-tracked file the
+	// new classifier doesn't recognise (older engine layouts, leading-
+	// dot config dirs, root-level files, etc.).
+	//
+	// Three branches share `toReset`:
+	//
+	//   - `unowned` (classifier returned `null`): may be foreign-written,
+	//     pre-allowlist legacy, or simply outside the catalogue. We
+	//     can't tell which; the safe default is "don't commit, don't
+	//     delete". An eventual explicit eviction command can use a
+	//     different code path.
 	//   - `transcript` + `syncTranscripts=false`: Model 2 says OFF is
-	//     passive — don't upload local edits, don't delete peers'.
-	//     Continuing without resetting leaves a staged A/M/D in the
-	//     index from a prior ON-state, external `git add`, or interrupted
-	//     round, which `commit()` would then push (P1#4).
-	//   - symlink-blocked owned path: leaf or parent chain is a symlink,
-	//     so we refuse to stage the symlink content. Pre-fix this routed
-	//     into `toUnstage` → `git rm --cached` → staged deletion of the
-	//     HEAD blob → peers lose the file. `git reset HEAD --` restores
-	//     the HEAD blob into the index instead (P1#3).
+	//     passive — don't upload local edits, don't delete peers' (P1#4).
+	//   - symlink-blocked owned path: leaf or parent chain is a symlink;
+	//     refuse to stage but preserve the HEAD blob in the index (P1#3).
 	const toReset: string[] = [];
 	const unowned: string[] = [];
 	const symlinked: string[] = [];
@@ -138,7 +141,16 @@ export async function stageVault(client: GitClient, vaultRoot: string, opts: Sta
 		if (kind === null) {
 			unowned.push(op.path);
 			bump(byKind, "unowned");
-			if (op.staged) toUnstage.push(op.path);
+			// `toReset` (not `toUnstage`/`git rm --cached`). If the path has
+			// a HEAD blob (legacy-tracked content the new classifier no
+			// longer recognises — older engine layouts, leading-dot config
+			// dirs, root-level files), `git rm --cached` would stage a
+			// deletion and push it, silently erasing the file from every
+			// peer's vault. `git reset HEAD --` preserves the HEAD blob
+			// and just removes any local staged change. The data-loss
+			// regression that this comment documents was caused by the
+			// pre-fix routing into `toUnstage`.
+			if (op.staged) toReset.push(op.path);
 			continue;
 		}
 		if (kind === "transcript" && !opts.syncTranscripts) {
@@ -176,16 +188,13 @@ export async function stageVault(client: GitClient, vaultRoot: string, opts: Sta
 		if (!isOk) {
 			symlinked.push(op.path);
 			bump(byKind, "symlink-blocked");
-			// `toReset` (not `toUnstage`) so a HEAD-tracked path now
-			// shadowed by a hostile symlink doesn't get its HEAD blob
-			// staged-as-deleted (which `git rm --cached` would do and
-			// `commit` would push, deleting the file from every peer's
-			// vault). `git reset HEAD --` instead restores the HEAD blob
-			// in the index — the working-tree symlink is preserved for the
-			// operator to inspect, but the round commits nothing for this
-			// path. Unowned still uses `git rm --cached` (above) because
-			// for those the classifier asserts the path is foreign content
-			// to evict.
+			// `toReset` so a HEAD-tracked path now shadowed by a hostile
+			// symlink doesn't get its HEAD blob staged-as-deleted (which
+			// `git rm --cached` would do, and `commit` would push,
+			// deleting the file from every peer's vault). `git reset
+			// HEAD --` restores the HEAD blob in the index — the
+			// working-tree symlink is preserved for the operator to
+			// inspect, but the round commits nothing for this path (P1#3).
 			if (op.staged) toReset.push(op.path);
 			continue;
 		}
@@ -195,8 +204,13 @@ export async function stageVault(client: GitClient, vaultRoot: string, opts: Sta
 
 	if (toAdd.length > 0) await client.stageAddPaths(toAdd);
 	if (toRm.length > 0) await client.stageRemovePaths(toRm);
-	if (toUnstage.length > 0) await client.unstagePaths(toUnstage);
 	if (toReset.length > 0) await client.resetPathsToHead(toReset);
+	// `client.unstagePaths` (`git rm --cached`) is intentionally NOT
+	// called from stageVault any more. For HEAD-tracked paths it stages
+	// a deletion that commit + push would propagate to peers — the
+	// data-loss regression mode this whole branch documents. Future
+	// explicit "evict legacy committed content" features should call
+	// `unstagePaths` directly from their own callers, not via stageVault.
 
 	if (unowned.length > 0) {
 		log.warn(
@@ -214,10 +228,9 @@ export async function stageVault(client: GitClient, vaultRoot: string, opts: Sta
 		);
 	}
 	log.info(
-		"stageVault: added=%d removed=%d unstaged=%d reset=%d skipped=%d unowned=%d symlinked=%d",
+		"stageVault: added=%d removed=%d reset=%d skipped=%d unowned=%d symlinked=%d",
 		toAdd.length,
 		toRm.length,
-		toUnstage.length,
 		toReset.length,
 		skipped,
 		unowned.length,

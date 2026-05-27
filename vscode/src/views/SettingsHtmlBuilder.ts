@@ -217,7 +217,7 @@ export function buildSettingsHtml(nonce: string): string {
 
       <div class="settings-row column">
         <div class="warning-banner" role="note">
-          ⚠ If <code>localFolder</code> is also synced by iCloud / Dropbox / Syncthing, turn Jolli sync off — pick one sync channel per device.
+          ⚠ Pick a <code>localFolder</code> only Jolli writes to. Sharing it with iCloud / Dropbox / Syncthing races on the same files — and turning off auto-sync isn't enough, since manual sync still writes.
         </div>
       </div>
     </section>

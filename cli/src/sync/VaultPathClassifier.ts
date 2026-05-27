@@ -37,6 +37,7 @@
  *       │   ├── manifest.json                   ← repo-manifest
  *       │   ├── branches.json                   ← repo-branches
  *       │   ├── catalog.json                    ← repo-catalog
+ *       │   ├── migration.json                  ← repo-migration (MigrationEngine state)
  *       │   ├── shadow-status.json              ← REJECTED (per-device, never synced)
  *       │   ├── summaries/<hash>.json           ← summary
  *       │   ├── transcripts/<hash>.json         ← transcript (gated by syncTranscripts)
@@ -200,6 +201,8 @@ function classifyStrict(relPath: string): OwnedPathKind | null {
 					return "repo-branches";
 				case "catalog.json":
 					return "repo-catalog";
+				case "migration.json":
+					return "repo-migration";
 				// `shadow-status.json` is per-device dirty-write recovery
 				// state — NEVER synced. Returning null funnels it through
 				// the `unowned` bucket → `stageVault` will `git rm --cached`

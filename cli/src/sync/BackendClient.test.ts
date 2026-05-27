@@ -341,6 +341,61 @@ describe("BackendClient.notifyPush", () => {
 	});
 });
 
+describe("BackendClient.releaseLock (JOLLI-1577)", () => {
+	const LOCK_OWNER = "0123456789abcdef0123456789abcdef";
+
+	it("posts { lockOwnerToken } to /api/mb-sync/release-lock", async () => {
+		let capturedUrl: string | undefined;
+		let capturedBody: string | undefined;
+		const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+			capturedUrl = String(url);
+			capturedBody = init?.body as string;
+			return emptyResponse(202);
+		}) as unknown as typeof fetch;
+		const client = makeClient({ fetchImpl });
+
+		await client.releaseLock({ lockOwnerToken: LOCK_OWNER });
+		expect(capturedUrl).toBe("https://app.jolli.ai/api/mb-sync/release-lock");
+		// Body shape is exactly `{ lockOwnerToken }` — no commitSha, no
+		// branch. The backend's `ReleaseLockSchema` rejects extras with
+		// 400 `invalid_request`.
+		expect(capturedBody).toBe(JSON.stringify({ lockOwnerToken: LOCK_OWNER }));
+	});
+
+	it("tolerates a 202 success (returns void)", async () => {
+		// Backend returns `202 { released: true }`. Client doesn't care
+		// about the response body — runRound's finally just needs the
+		// HTTP call to succeed.
+		const fetchImpl = vi.fn(async () => jsonResponse(202, { released: true })) as unknown as typeof fetch;
+		const client = makeClient({ fetchImpl });
+		await expect(client.releaseLock({ lockOwnerToken: LOCK_OWNER })).resolves.toBeUndefined();
+	});
+
+	it("surfaces 400 invalid_request as SyncBackendError (client bug — token malformed)", async () => {
+		const fetchImpl = vi.fn(async () => jsonResponse(400, { error: "invalid_request" })) as unknown as typeof fetch;
+		const client = makeClient({ fetchImpl });
+		await expect(client.releaseLock({ lockOwnerToken: LOCK_OWNER })).rejects.toMatchObject({ status: 400 });
+	});
+
+	it("surfaces 404 personal_space_not_found as SyncBackendError (caller swallows in finally)", async () => {
+		// 404 happens when the token was never held (e.g. mint happened
+		// before account-switch) or backend TTL already released it.
+		// `runRound`'s finally catches the throw and logs warn — the round
+		// outcome is unaffected.
+		const fetchImpl = vi.fn(async () =>
+			jsonResponse(404, { error: "personal_space_not_found" }),
+		) as unknown as typeof fetch;
+		const client = makeClient({ fetchImpl });
+		await expect(client.releaseLock({ lockOwnerToken: LOCK_OWNER })).rejects.toMatchObject({ status: 404 });
+	});
+
+	it("surfaces 5xx as SyncBackendError so the engine can log it", async () => {
+		const fetchImpl = vi.fn(async () => jsonResponse(503, { error: "busy" })) as unknown as typeof fetch;
+		const client = makeClient({ fetchImpl });
+		await expect(client.releaseLock({ lockOwnerToken: LOCK_OWNER })).rejects.toMatchObject({ status: 503 });
+	});
+});
+
 describe("BackendClient — 423 vault_locked (§0.8)", () => {
 	it("mintGitCredentials throws VaultLockedError on 423", async () => {
 		const { VaultLockedError } = await import("./BackendClient.js");
@@ -350,6 +405,46 @@ describe("BackendClient — 423 vault_locked (§0.8)", () => {
 		expect(err).toBeInstanceOf(VaultLockedError);
 		expect(err.status).toBe(423);
 		expect(err.message).toContain("Personal Space");
+	});
+});
+
+describe("BackendClient — 503 pending_flush_failed", () => {
+	it("mintGitCredentials throws WebFlushPendingError on 503 pending_flush_failed with retryAfterSeconds", async () => {
+		const { WebFlushPendingError } = await import("./BackendClient.js");
+		const fetchImpl = vi.fn(async () =>
+			jsonResponse(503, {
+				error: "pending_flush_failed",
+				message: "Some recent edits from your web session have not made it to GitHub yet.",
+				retryAfterSeconds: 45,
+			}),
+		) as unknown as typeof fetch;
+		const client = makeClient({ fetchImpl });
+		const err = await client.mintGitCredentials().catch((e) => e);
+		expect(err).toBeInstanceOf(WebFlushPendingError);
+		expect(err.status).toBe(503);
+		expect(err.retryAfterSeconds).toBe(45);
+		expect(err.message).toContain("web");
+	});
+
+	it("defaults retryAfterSeconds to 30 when the field is missing or invalid", async () => {
+		const { WebFlushPendingError } = await import("./BackendClient.js");
+		const fetchImpl = vi.fn(async () =>
+			jsonResponse(503, { error: "pending_flush_failed", message: "wait" }),
+		) as unknown as typeof fetch;
+		const client = makeClient({ fetchImpl });
+		const err = await client.mintGitCredentials().catch((e) => e);
+		expect(err).toBeInstanceOf(WebFlushPendingError);
+		expect(err.retryAfterSeconds).toBe(30);
+	});
+
+	it("503 with a different error code falls through to generic SyncBackendError (not WebFlushPendingError)", async () => {
+		const { WebFlushPendingError, SyncBackendError } = await import("./BackendClient.js");
+		const fetchImpl = vi.fn(async () => jsonResponse(503, { error: "flip_failed" })) as unknown as typeof fetch;
+		const client = makeClient({ fetchImpl });
+		const err = await client.mintGitCredentials().catch((e) => e);
+		expect(err).not.toBeInstanceOf(WebFlushPendingError);
+		expect(err).toBeInstanceOf(SyncBackendError);
+		expect(err.status).toBe(503);
 	});
 });
 
