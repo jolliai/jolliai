@@ -15,6 +15,7 @@ import java.time.Instant
  *   can surface a "partial result" indicator.
  * - Sort: updatedAt DESC, tie-break by sessionId ASC (stable order).
  */
+
 object ActiveSessionAggregator {
 
 	private val log = JmLogger.create("ActiveSessionAggregator")
@@ -193,4 +194,5 @@ object ActiveSessionAggregator {
 	//     log.warn("scanCopilotChatSessions threw: %s", e.message)
 	//     LoaderResult(emptyList(), listOf(TranscriptSource.`copilot-chat`))
 	// }
+	// test comment
 }
