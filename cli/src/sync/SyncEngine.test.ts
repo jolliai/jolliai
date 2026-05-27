@@ -165,6 +165,12 @@ function makeBackend(overrides: Partial<BackendClient> = {}): BackendClient {
 				docs: [],
 			})),
 		completeMigration: overrides.completeMigration ?? vi.fn(async () => ({ alreadyMigrated: false })),
+		// JOLLI-1577 — every backend mock must wire `releaseLock` because
+		// `runRound`'s finally now calls it on every outcome where the
+		// holder still considers the backend lock held. Default to a
+		// resolving stub; individual tests override to assert call shape
+		// or to simulate failure (best-effort swallow path).
+		releaseLock: overrides.releaseLock ?? vi.fn(async () => undefined),
 		// Default to a stable test api key so `PendingLockStore` lookups
 		// scope to this fixture (mocked `homedir` already isolates the
 		// underlying file to the per-test tempDir). Tests that want to
@@ -1339,6 +1345,30 @@ describe("SyncEngine.runRound — per-round mint (§0.6, supersedes credential c
 		expect(result.lastError?.code).toBe("network");
 	});
 
+	it("retries 503 pending_flush_failed → eventually mints → synced (cooperative back-off)", async () => {
+		const { WebFlushPendingError } = await import("./BackendClient.js");
+		const mintFn = vi
+			.fn()
+			.mockRejectedValueOnce(new WebFlushPendingError('{"error":"pending_flush_failed"}', 0))
+			.mockRejectedValueOnce(new WebFlushPendingError('{"error":"pending_flush_failed"}', 0))
+			.mockResolvedValueOnce({
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				token: "ghs_test",
+				expiresAt: Date.now() + 3600_000,
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+				githubRepoCreated: false,
+				alreadyVaultBound: true as const,
+				lockOwnerToken: "test-lock-owner-token" as const,
+			});
+		const backend = makeBackend({ mintGitCredentials: mintFn });
+		// Reuse the 423 budget — same retry budget covers both transient back-offs.
+		const { engine } = makeEngine({ backend, vaultLockedRetrySchedule: [0, 0, 0] });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(mintFn).toHaveBeenCalledTimes(3);
+	});
+
 	it("retries 423 vault_locked → eventually mints → synced (§0.8 happy path)", async () => {
 		const { VaultLockedError } = await import("./BackendClient.js");
 		const mintFn = vi
@@ -1514,17 +1544,45 @@ describe("SyncEngine.runRound — per-round mint (§0.6, supersedes credential c
 		expect(after).toBeNull();
 	});
 
-	it("leaves the persisted lockOwnerToken in place when notify-push throws", async () => {
+	it("leaves the persisted lockOwnerToken in place ONLY when BOTH notify-push AND the finally releaseLock throw (JOLLI-1577)", async () => {
+		// Pre-JOLLI-1577 invariant: "notify-push throws → token stays for
+		// selfLocked attribution". With the finally releaseLock fallback,
+		// that's no longer true — notify-push failure cascades into
+		// releaseLock which clears the token. The legitimate invariant
+		// now: token only persists when BOTH paths fail (the only case
+		// where the next round's selfLocked attribution should hold).
 		const { readPendingLock } = await import("./PendingLockStore.js");
 		const backend = makeBackend({
 			notifyPush: vi.fn(async () => {
 				throw new Error("notify-push transient");
+			}),
+			releaseLock: vi.fn(async () => {
+				throw new Error("release-lock transient");
 			}),
 		});
 		const { engine } = makeEngine({ backend });
 		await engine.runRound(ROUND);
 		const after = await readPendingLock("sk-jol-test-fixture");
 		expect(after?.lockOwnerToken).toBe("test-lock-owner-token");
+	});
+
+	it("CLEARS the persisted lockOwnerToken when notify-push throws but finally releaseLock succeeds (JOLLI-1577)", async () => {
+		// New invariant: the finally-stage releaseLock is the failure-path
+		// counterpart to notify-push. When it succeeds, pending-lock.json
+		// is cleared just like a successful notify-push would clear it.
+		const { readPendingLock } = await import("./PendingLockStore.js");
+		const releaseLock = vi.fn(async () => undefined);
+		const backend = makeBackend({
+			notifyPush: vi.fn(async () => {
+				throw new Error("notify-push transient");
+			}),
+			releaseLock,
+		});
+		const { engine } = makeEngine({ backend });
+		await engine.runRound(ROUND);
+		expect(releaseLock).toHaveBeenCalledWith({ lockOwnerToken: "test-lock-owner-token" });
+		const after = await readPendingLock("sk-jol-test-fixture");
+		expect(after).toBeNull();
 	});
 
 	it("onLockedWait callback throwing does NOT abort the retry loop", async () => {
@@ -2746,5 +2804,484 @@ describe("SyncEngine.runRound — idle-round short-circuit (perf)", () => {
 		const result = await engine.runRound(ROUND);
 		expect(result.newState).toBe("synced");
 		expect(push).toHaveBeenCalled();
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// JOLLI-1577 — Release Personal Space write-lock on every round outcome.
+// Each test in this matrix targets a specific leak path from the plan;
+// the row numbers reference the test matrix in
+// /home/foste/.claude/plans/eager-forging-bonbon.md §4.
+// ─────────────────────────────────────────────────────────────────────
+describe("SyncEngine.runRound — JOLLI-1577 release-lock matrix", () => {
+	const LOCK_TOKEN = "test-lock-owner-token";
+
+	// Row 1: push fails after successful mint → releaseLock fires.
+	it("(row 1) push fail-after-mint → finally calls releaseLock once with the minted token", async () => {
+		const releaseLock = vi.fn(async () => undefined);
+		const backend = makeBackend({ releaseLock });
+		const client = makeGitClient({
+			push: vi.fn(async () => ({
+				ok: false as const,
+				transmitted: false,
+				code: "push_rejected" as const,
+				message: "rejected",
+			})),
+		});
+		const { engine } = makeEngine({ backend, client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(releaseLock).toHaveBeenCalledTimes(1);
+		expect(releaseLock).toHaveBeenCalledWith({ lockOwnerToken: LOCK_TOKEN });
+		const { readPendingLock } = await import("./PendingLockStore.js");
+		expect(await readPendingLock("sk-jol-test-fixture")).toBeNull();
+	});
+
+	// Row 2: clone/fetch fails after successful mint → releaseLock fires.
+	it("(row 2) clone/fetch fail-after-mint → finally calls releaseLock once", async () => {
+		const releaseLock = vi.fn(async () => undefined);
+		const backend = makeBackend({ releaseLock });
+		// Make fetch throw with a non-classified message so
+		// `fetchOrCloneWithRetry` returns `fetch_failed` (terminal). The
+		// default test fixture has `.git` pre-created, so the engine takes
+		// the fetch branch.
+		const client = makeGitClient({
+			fetch: vi.fn(async () => {
+				throw new Error("server unreachable: fatal fetch failure");
+			}),
+		});
+		const { engine } = makeEngine({ backend, client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(releaseLock).toHaveBeenCalledTimes(1);
+		expect(releaseLock).toHaveBeenCalledWith({ lockOwnerToken: LOCK_TOKEN });
+		const { readPendingLock } = await import("./PendingLockStore.js");
+		expect(await readPendingLock("sk-jol-test-fixture")).toBeNull();
+	});
+
+	// Row 3: an uncaught exception inside doRound (caught by runRound's
+	// outer try/catch) still releases via finally.
+	it("(row 3) uncaught throw after mint → finally calls releaseLock once", async () => {
+		const releaseLock = vi.fn(async () => undefined);
+		const backend = makeBackend({ releaseLock });
+		const client = makeGitClient({
+			// `commit` throws an uncaught error → bubbles past doRound into
+			// runRound's outer catch. Finally still runs.
+			commit: vi.fn(async () => {
+				throw new Error("commit blew up");
+			}),
+		});
+		const { engine } = makeEngine({ backend, client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(releaseLock).toHaveBeenCalledTimes(1);
+		expect(releaseLock).toHaveBeenCalledWith({ lockOwnerToken: LOCK_TOKEN });
+	});
+
+	// Row 4: persistMintedLock throws AFTER mint succeeded → holder must
+	// have been set BEFORE the awaited persistence, so finally still
+	// releases. This is the structural High #1 assertion.
+	it("(row 4) persistMintedLock throws after mint → finally still calls releaseLock (holder set before disk persistence)", async () => {
+		// Use `vi.spyOn` on the `PendingLockStore.writePendingLock` export
+		// so just THIS test sees a throwing write. Chmod-based approaches
+		// don't work cleanly because `sync.lock` lives in the same dir as
+		// `pending-lock.json` and chmodding the dir 0o555 blocks both —
+		// `acquireSyncLock` then fails too, the round returns "syncing"
+		// before mint is even attempted, and the test asserts the wrong
+		// thing.
+		const PendingLockStore = await import("./PendingLockStore.js");
+		const writeSpy = vi
+			.spyOn(PendingLockStore, "writePendingLock")
+			.mockRejectedValue(new Error("EACCES: simulated disk failure"));
+		try {
+			const releaseLock = vi.fn(async () => undefined);
+			const backend = makeBackend({ releaseLock });
+			const { engine } = makeEngine({ backend });
+			const result = await engine.runRound(ROUND);
+			// mintFresh's catch returns mint_failed, doRound exits offline.
+			expect(result.newState).toBe("offline");
+			// Critical: holder was updated BEFORE persistMintedLock's
+			// await, so finally still has the token to release. Pre-High#1,
+			// the holder mutation was AFTER persistMintedLock and the
+			// EACCES throw left `token === null`, leaking the lock.
+			expect(writeSpy).toHaveBeenCalled();
+			expect(releaseLock).toHaveBeenCalledTimes(1);
+			expect(releaseLock).toHaveBeenCalledWith({ lockOwnerToken: LOCK_TOKEN });
+		} finally {
+			writeSpy.mockRestore();
+		}
+	});
+
+	// Row 5: notifyPush success path does NOT call releaseLock.
+	it("(row 5) notifyPush succeeds → releaseLock NOT called (no double-release)", async () => {
+		const releaseLock = vi.fn(async () => undefined);
+		const notifyPush = vi.fn(async () => undefined);
+		const backend = makeBackend({ releaseLock, notifyPush });
+		const { engine } = makeEngine({ backend });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(notifyPush).toHaveBeenCalledTimes(1);
+		expect(releaseLock).not.toHaveBeenCalled();
+	});
+
+	// Row 6: completeMigration success path does NOT call releaseLock.
+	it("(row 6) completeMigration succeeds → releaseLock NOT called", async () => {
+		const releaseLock = vi.fn(async () => undefined);
+		const completeMigration = vi.fn(async () => ({ alreadyMigrated: false }));
+		const backend = makeBackend({
+			releaseLock,
+			completeMigration,
+			// Force the first-bind path by reporting `alreadyVaultBound: false`.
+			mintGitCredentials: vi.fn(async () => ({
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				token: "ghs_test",
+				expiresAt: Date.now() + 3600_000,
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+				githubRepoCreated: false,
+				alreadyVaultBound: false as const,
+				lockOwnerToken: LOCK_TOKEN,
+			})),
+			getLegacyContent: vi.fn(async () => ({
+				spaceId: 1,
+				spaceSlug: "personal",
+				alreadyMigrated: true,
+				docs: [],
+			})),
+		});
+		const { engine } = makeEngine({ backend });
+		await engine.runRound(ROUND);
+		expect(completeMigration).toHaveBeenCalled();
+		expect(releaseLock).not.toHaveBeenCalled();
+	});
+
+	// Row 7: completionDeferred = true established, then downstream throws
+	// BEFORE the deferred-retry block → releaseLock STILL not called.
+	// Confirms the Medium #4 fix: clear at the moment defer is established.
+	it("(row 7) completionDeferred set, then downstream throws → releaseLock NOT called (defer wins over uncaught throw)", async () => {
+		const releaseLock = vi.fn(async () => undefined);
+		const backend = makeBackend({
+			releaseLock,
+			mintGitCredentials: vi.fn(async () => ({
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				token: "ghs_test",
+				expiresAt: Date.now() + 3600_000,
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+				githubRepoCreated: false,
+				alreadyVaultBound: false as const,
+				lockOwnerToken: LOCK_TOKEN,
+			})),
+			getLegacyContent: vi.fn(async () => ({
+				spaceId: 1,
+				spaceSlug: "personal",
+				alreadyMigrated: true,
+				docs: [],
+			})),
+		});
+		// Force `tryCompleteMigration` into the `{ ok: true, deferred: true }`
+		// branch by reporting an unborn HEAD when it's checked. THEN make
+		// `commit` throw so doRound exits via uncaught throw before the
+		// deferred-retry block runs.
+		const client = makeGitClient({
+			hasHead: vi.fn(async () => false),
+			commit: vi.fn(async () => {
+				throw new Error("commit blew up after defer");
+			}),
+		});
+		const { engine } = makeEngine({ backend, client });
+		await engine.runRound(ROUND);
+		// Pre-Medium#4 fix, the holder would only have been cleared on the
+		// deferred-retry FAILURE branch, never reached here. Releasing would
+		// have leaked the lock release to the next round's completeMigration.
+		expect(releaseLock).not.toHaveBeenCalled();
+	});
+
+	// Row 8: completionDeferred = true, retry succeeds in same round → no
+	// release (retry's success branch already cleared via tryCompleteMigration).
+	it("(row 8) completionDeferred set, deferred retry succeeds → releaseLock NOT called", async () => {
+		const releaseLock = vi.fn(async () => undefined);
+		const completeMigration = vi.fn(async () => ({ alreadyMigrated: false }));
+		// First `hasHead` check (inside tryCompleteMigration during
+		// migration body) returns false → defer; subsequent checks return
+		// true so the deferred retry's `tryCompleteMigration` proceeds to
+		// completeMigration.
+		let hasHeadCalls = 0;
+		const hasHead = vi.fn(async () => {
+			hasHeadCalls += 1;
+			return hasHeadCalls > 1;
+		});
+		const backend = makeBackend({
+			releaseLock,
+			completeMigration,
+			mintGitCredentials: vi.fn(async () => ({
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				token: "ghs_test",
+				expiresAt: Date.now() + 3600_000,
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+				githubRepoCreated: false,
+				alreadyVaultBound: false as const,
+				lockOwnerToken: LOCK_TOKEN,
+			})),
+			getLegacyContent: vi.fn(async () => ({
+				spaceId: 1,
+				spaceSlug: "personal",
+				alreadyMigrated: true,
+				docs: [],
+			})),
+		});
+		const client = makeGitClient({ hasHead });
+		const { engine } = makeEngine({ backend, client });
+		await engine.runRound(ROUND);
+		expect(completeMigration).toHaveBeenCalled();
+		expect(releaseLock).not.toHaveBeenCalled();
+	});
+
+	// Row 9: releaseLock itself throws → warn logged, round unchanged,
+	// pending-lock.json NOT cleared (drives next round's selfLocked).
+	it("(row 9) releaseLock throws → swallowed, round result unchanged, pending-lock preserved", async () => {
+		const releaseLock = vi.fn(async () => {
+			throw new Error("release-lock transient");
+		});
+		const backend = makeBackend({
+			releaseLock,
+			// Combine with notifyPush throwing so the round actually takes
+			// the finally-releaseLock branch.
+			notifyPush: vi.fn(async () => {
+				throw new Error("notify-push transient");
+			}),
+		});
+		const { engine } = makeEngine({ backend });
+		// Round still completes (synced) — push succeeded, notify-push
+		// failed (swallowed), releaseLock failed (swallowed).
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(releaseLock).toHaveBeenCalledTimes(1);
+		// pending-lock.json must survive: next round's mint 423-attribution
+		// uses it to render "Personal Space busy — last round failed".
+		const { readPendingLock } = await import("./PendingLockStore.js");
+		expect((await readPendingLock("sk-jol-test-fixture"))?.lockOwnerToken).toBe(LOCK_TOKEN);
+	});
+
+	// Row 10: mid-round re-mint via tryRemint (pushWithRetry's 401/404
+	// recovery) → releaseLock fires with the LATEST token.
+	it("(row 10) re-mint via tryRemint → releaseLock fires with the LATEST token", async () => {
+		const RECOVERY_TOKEN = "recovery-token-after-remint";
+		let mintCalls = 0;
+		const mintGitCredentials = vi.fn(async () => {
+			mintCalls += 1;
+			return {
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				token: "ghs_test",
+				expiresAt: Date.now() + 3600_000,
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+				githubRepoCreated: false,
+				alreadyVaultBound: true as const,
+				lockOwnerToken: mintCalls === 1 ? LOCK_TOKEN : RECOVERY_TOKEN,
+			};
+		});
+		// Push 1st attempt: 401 → triggers re-mint. Push 2nd attempt:
+		// permanent failure to make the round fail (so finally releases).
+		let pushCalls = 0;
+		const push = vi.fn(async () => {
+			pushCalls += 1;
+			if (pushCalls === 1)
+				return {
+					ok: false as const,
+					transmitted: false,
+					unauthorized: true as const,
+					repoMissing: false as const,
+					code: "mint_failed" as const,
+					message: "401",
+				};
+			return { ok: false as const, transmitted: false, code: "push_rejected" as const, message: "rejected" };
+		});
+		const releaseLock = vi.fn(async () => undefined);
+		const backend = makeBackend({ releaseLock, mintGitCredentials });
+		const client = makeGitClient({ push });
+		const { engine } = makeEngine({ backend, client });
+		await engine.runRound(ROUND);
+		expect(mintCalls).toBeGreaterThanOrEqual(2);
+		// Finally released the RECOVERY token, not the original — the
+		// original is left to backend TTL by design (stale-tokens-from-
+		// re-mint user choice).
+		expect(releaseLock).toHaveBeenCalledTimes(1);
+		expect(releaseLock).toHaveBeenCalledWith({ lockOwnerToken: RECOVERY_TOKEN });
+	});
+
+	// Row 11: re-mint via fetchOrCloneWithRetry's 401/404 recovery →
+	// releaseLock fires with the LATEST token. Confirms Medium #3
+	// (`fetchOrCloneWithRetry` threaded with lockHolder).
+	it("(row 11) re-mint via fetchOrCloneWithRetry → releaseLock fires with the LATEST token", async () => {
+		const RECOVERY_TOKEN = "recovery-token-from-fetch-recovery";
+		let mintCalls = 0;
+		const mintGitCredentials = vi.fn(async () => {
+			mintCalls += 1;
+			return {
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				token: "ghs_test",
+				expiresAt: Date.now() + 3600_000,
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+				githubRepoCreated: false,
+				alreadyVaultBound: true as const,
+				lockOwnerToken: mintCalls === 1 ? LOCK_TOKEN : RECOVERY_TOKEN,
+			};
+		});
+		// Fetch throws a 401-classified error on attempt 1 to trigger
+		// `tryRemint` (engine routes via `classifyGitError(message)`), then
+		// throws a non-classified error permanently on subsequent attempts
+		// so the round fails (without bothering to thread through a usable
+		// post-recovery flow).
+		let fetchCalls = 0;
+		const fetch = vi.fn(async () => {
+			fetchCalls += 1;
+			if (fetchCalls === 1) {
+				throw new Error("requested url returned error: 401 Unauthorized");
+			}
+			throw new Error("permanent fetch fail (fatal)");
+		});
+		const releaseLock = vi.fn(async () => undefined);
+		const backend = makeBackend({ releaseLock, mintGitCredentials });
+		const client = makeGitClient({ fetch });
+		const { engine } = makeEngine({ backend, client });
+		await engine.runRound(ROUND);
+		expect(mintCalls).toBeGreaterThanOrEqual(2);
+		expect(releaseLock).toHaveBeenCalledTimes(1);
+		expect(releaseLock).toHaveBeenCalledWith({ lockOwnerToken: RECOVERY_TOKEN });
+	});
+
+	// Row 12: sync.lock miss before mint → releaseLock NOT called.
+	it("(row 12) sync.lock acquisition miss → releaseLock NOT called (token is null)", async () => {
+		// Acquire sync.lock externally, then run the engine — it'll skip
+		// (return "syncing") before reaching mint.
+		const { acquireSyncLock } = await import("./SyncLock.js");
+		const acquired = await acquireSyncLock({ timeoutMs: 1 });
+		expect(acquired).toBe(true);
+		try {
+			const releaseLock = vi.fn(async () => undefined);
+			const backend = makeBackend({ releaseLock });
+			const { engine } = makeEngine({ backend, lockTimeoutMs: 10 });
+			const result = await engine.runRound(ROUND);
+			expect(result.newState).toBe("syncing");
+			expect(releaseLock).not.toHaveBeenCalled();
+		} finally {
+			const { releaseSyncLock } = await import("./SyncLock.js");
+			await releaseSyncLock();
+		}
+	});
+
+	// Row 13: ordering invariant — releaseLock fires BEFORE releaseSyncLock.
+	// Spy on the SyncLock module's `releaseSyncLock` export to record the
+	// call order deterministically instead of racing on Date.now()
+	// timestamps.
+	it("(row 13) finally ordering: releaseLock fires before releaseSyncLock (Medium #5)", async () => {
+		const callOrder: string[] = [];
+		const releaseLock = vi.fn(async () => {
+			callOrder.push("releaseLock");
+		});
+		const backend = makeBackend({
+			releaseLock,
+			// Force the finally branch by making notifyPush throw, so the
+			// round actually exercises releaseLock in finally.
+			notifyPush: vi.fn(async () => {
+				throw new Error("notify-push transient");
+			}),
+		});
+		const SyncLock = await import("./SyncLock.js");
+		const releaseSyncLockSpy = vi.spyOn(SyncLock, "releaseSyncLock").mockImplementation(async () => {
+			callOrder.push("releaseSyncLock");
+		});
+		try {
+			const { engine } = makeEngine({ backend });
+			await engine.runRound(ROUND);
+			expect(releaseLock).toHaveBeenCalledTimes(1);
+			expect(releaseSyncLockSpy).toHaveBeenCalledTimes(1);
+			// Critical invariant: backend lock release MUST come before
+			// `sync.lock` release. Pre-fix (release AFTER sync.lock), a
+			// concurrent next round's mint could race the in-flight
+			// release HTTP call and 423 → 60 s retry-schedule wait.
+			expect(callOrder).toEqual(["releaseLock", "releaseSyncLock"]);
+		} finally {
+			releaseSyncLockSpy.mockRestore();
+		}
+	});
+
+	// Row 14: completionDeferred sticks across a recovery re-mint.
+	// Pre-fix, `mintFresh`'s unconditional `releaseInFinally = true` would
+	// undo the defer-clear when push hit 401/404 and tryRemint kicked in;
+	// the round then exited with finally calling releaseLock, violating the
+	// user's explicit "delay-path doesn't release lock" choice.
+	it("(row 14) completionDeferred + push 401 + re-mint + final fail → releaseLock NOT called (defer survives re-mint)", async () => {
+		const releaseLock = vi.fn(async () => undefined);
+		let mintCalls = 0;
+		const mintGitCredentials = vi.fn(async () => {
+			mintCalls += 1;
+			return {
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				token: "ghs_test",
+				expiresAt: Date.now() + 3600_000,
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+				githubRepoCreated: false,
+				// Force first-bind migration path so the deferred-completion
+				// branch can be reached.
+				alreadyVaultBound: false as const,
+				lockOwnerToken: mintCalls === 1 ? LOCK_TOKEN : `remint-token-${mintCalls}`,
+			};
+		});
+		const backend = makeBackend({
+			releaseLock,
+			mintGitCredentials,
+			// Empty legacy + unborn HEAD on first try → tryCompleteMigration
+			// returns `{ ok: true, deferred: true }`, runFirstBindMigration
+			// returns `{ ok: true, completionDeferred: true }`.
+			getLegacyContent: vi.fn(async () => ({
+				spaceId: 1,
+				spaceSlug: "personal",
+				alreadyMigrated: true,
+				docs: [],
+			})),
+		});
+		// `hasHead` always false so `tryCompleteMigration` enters the
+		// deferred branch. Push then fails 401 → tryRemint → mintFresh
+		// re-arms `releaseInFinally`, but `deferredCompletion` (set at
+		// both the defer boundary AND inside tryCompleteMigration's
+		// `deferred:true` branch) stays true and gates finally release off.
+		const hasHead = vi.fn(async () => false);
+		let pushCalls = 0;
+		const push = vi.fn(async () => {
+			pushCalls += 1;
+			if (pushCalls === 1) {
+				return {
+					ok: false as const,
+					transmitted: false,
+					unauthorized: true as const,
+					repoMissing: false as const,
+					code: "mint_failed" as const,
+					message: "401 unauthorized",
+				};
+			}
+			return {
+				ok: false as const,
+				transmitted: false,
+				code: "push_rejected" as const,
+				message: "rejected after re-mint",
+			};
+		});
+		const client = makeGitClient({ hasHead, push });
+		const { engine } = makeEngine({ backend, client });
+		await engine.runRound(ROUND);
+		// At least two mints happened (initial + at least one re-mint).
+		expect(mintCalls).toBeGreaterThanOrEqual(2);
+		// Critical: even though `mintFresh` re-armed `releaseInFinally` on
+		// the recovery mint, `deferredCompletion` (set at the defer
+		// boundary AND inside `tryCompleteMigration`'s `deferred: true`
+		// branch — neither touched by `mintFresh`) gates finally's release
+		// off. Pre-fix this assertion failed: finally released the
+		// recovery token, contradicting the user's defer choice.
+		expect(releaseLock).not.toHaveBeenCalled();
 	});
 });

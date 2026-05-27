@@ -794,13 +794,27 @@ export class GitClient {
 	}
 
 	/**
-	 * Unstages `paths` from the index WITHOUT touching the working tree —
-	 * `git rm --cached -f --ignore-unmatch -- <paths>`. Used by
-	 * `stageVault` to clear classifier-rejected entries that were already
-	 * staged (e.g. by a foreign writer or a prior round before classifier
-	 * drift) so the upcoming `commit` won't include them. The working
-	 * tree copy is preserved — the user can still inspect / move the
-	 * file. `--ignore-unmatch` keeps the call idempotent under races.
+	 * **DANGER: data-loss vector.** Issues
+	 * `git rm --cached -f --ignore-unmatch -- <paths>`. For paths with NO
+	 * HEAD blob this drops the index entry (safe). For paths WITH a HEAD
+	 * blob, it STAGES A DELETION against HEAD — the next `commit + push`
+	 * will propagate that deletion to every peer pulling from the same
+	 * remote. Past data-loss incident: stageVault routed classifier-
+	 * rejected (`unowned`) paths through this method, which silently
+	 * deleted legacy-tracked content (older engine layouts, leading-dot
+	 * config dirs, root-level files) from the shared vault on every push.
+	 *
+	 * **DO NOT call this from `stageVault` or any per-round stage-flush
+	 * code path.** Per-round paths must use `resetPathsToHead` instead,
+	 * which preserves the HEAD blob in the index and only drops local
+	 * staged changes — no peer-visible side effects.
+	 *
+	 * Legitimate callers: explicit one-shot eviction logic
+	 * (`MemoryBankBootstrap.untrackPathGlob` for the engine's own
+	 * per-device JSON cleanup, similar named-target cleanup flows). New
+	 * callers MUST justify in code review why their path has no HEAD
+	 * blob, OR why a HEAD-blob deletion is the intended outcome for
+	 * every peer.
 	 */
 	async unstagePaths(paths: ReadonlyArray<string>): Promise<void> {
 		for (const batch of chunkByBudget(paths, ARG_BUDGET_CHARS)) {
@@ -838,11 +852,15 @@ export class GitClient {
 	 */
 	async resetPathsToHead(paths: ReadonlyArray<string>): Promise<void> {
 		for (const batch of chunkByBudget(paths, ARG_BUDGET_CHARS)) {
-			// `git reset HEAD -- <paths>` is the documented spelling; on an
-			// unborn HEAD it errors, but callers reach this path only with
-			// staged porcelain entries which presuppose a born HEAD. The
-			// `--quiet` suppresses the per-path summary git would otherwise
-			// emit.
+			// `git reset HEAD -- <paths>` is the documented spelling. On an
+			// unborn HEAD this still succeeds (empirically verified): the
+			// `A`-only index entries that are the only possible staged
+			// shape pre-first-commit get silently dropped from the index,
+			// which is equivalent to `git rm --cached` for them and is the
+			// outcome we want.
+			//
+			// (`--quiet` suppresses the per-path summary git would
+			// otherwise emit.)
 			await this.runExpectOk(["reset", "--quiet", "HEAD", "--", ...batch]);
 		}
 	}
@@ -1042,6 +1060,22 @@ export class GitClient {
 	async isAncestor(maybeAncestor: string, descendant: string): Promise<boolean> {
 		const result = await this.run(["merge-base", "--is-ancestor", maybeAncestor, descendant]);
 		return result.exitCode === 0;
+	}
+
+	/**
+	 * `git for-each-ref refs/heads/` — returns every local branch ref's short
+	 * name. Used by the bootstrap-merge trigger to reject the "fresh local"
+	 * path when ANY local branch exists. A stranded-commits scenario (default
+	 * unborn but a feature branch carries unpushed real work) MUST stay out
+	 * of bootstrap merge or that work gets wiped by the destructive checkout.
+	 */
+	async listLocalBranches(): Promise<ReadonlyArray<string>> {
+		const result = await this.run(["for-each-ref", "--format=%(refname:short)", "refs/heads/"]);
+		if (result.exitCode !== 0) return [];
+		return result.stdout
+			.split("\n")
+			.map((s) => s.trim())
+			.filter((s) => s.length > 0);
 	}
 
 	// ── internals ─────────────────────────────────────────────────────────

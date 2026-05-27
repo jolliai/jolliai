@@ -20,6 +20,7 @@ describe("classifyVaultPath — positive cases", () => {
 		["myrepo/.jolli/manifest.json", "repo-manifest"],
 		["myrepo/.jolli/branches.json", "repo-branches"],
 		["myrepo/.jolli/catalog.json", "repo-catalog"],
+		["myrepo/.jolli/migration.json", "repo-migration"],
 		[`myrepo/.jolli/summaries/${HASH40}.json`, "summary"],
 		[`myrepo/.jolli/transcripts/${HASH40}.json`, "transcript"],
 		["myrepo/.jolli/plans/my-feature.md", "plan"],
@@ -131,6 +132,16 @@ describe("classifyVaultPath — negative cases", () => {
 		expect(classifyVaultPath(".jolli/catalog.json")).toBeNull();
 		expect(classifyVaultPath(".jolli/branches.json")).toBeNull();
 		expect(classifyVaultPath(".jolli/config.json")).toBeNull();
+		expect(classifyVaultPath(".jolli/migration.json")).toBeNull();
+	});
+
+	it("rejects migration.json at wrong locations", () => {
+		// `<repo>/.jolli/migration.json` is the only valid shape. A root-level
+		// `migration.json` falls through to `user-content` (safe-but-unknown);
+		// deeper nesting or wrong extension is null.
+		expect(classifyVaultPath("myrepo/migration.json")).toBe("user-content");
+		expect(classifyVaultPath("myrepo/.jolli/migration.txt")).toBeNull();
+		expect(classifyVaultPath("myrepo/.jolli/sub/migration.json")).toBeNull();
 	});
 
 	it("rejects shadow-status.json (per-device dirty-write recovery state — never synced)", () => {

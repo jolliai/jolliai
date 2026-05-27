@@ -27,6 +27,7 @@ export type OwnedPathKind =
 	| "repo-manifest" // <repoFolder>/.jolli/manifest.json
 	| "repo-branches" // <repoFolder>/.jolli/branches.json
 	| "repo-catalog" // <repoFolder>/.jolli/catalog.json
+	| "repo-migration" // <repoFolder>/.jolli/migration.json — MigrationEngine state
 	// `shadow-status.json` is INTENTIONALLY absent — it's per-device dirty-
 	// write recovery state, meaningless to peers. Classifier rejects it →
 	// `stageVault` unstages any stray index entry → `MemoryBankBootstrap`'s

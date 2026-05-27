@@ -103,6 +103,23 @@ export class SyncBackendNetworkError extends Error {
 }
 
 /**
+ * Specific 503 case — the backend's web-side flusher has not yet flushed
+ * pending Web UI edits to GitHub. Minting credentials right now would let
+ * the CLI clone a stale tree and then overwrite the pending web edits, so
+ * the backend deliberately refuses with `pending_flush_failed` + a
+ * `retryAfterSeconds` hint. Engine mirrors the 423 retry path: emit
+ * `waiting`, sleep `retryAfterSeconds`, retry within the mint budget.
+ */
+export class WebFlushPendingError extends SyncBackendError {
+	readonly retryAfterSeconds: number;
+	constructor(body: string, retryAfterSeconds: number) {
+		super(503, "Waiting for web edits to upload to GitHub", body);
+		this.name = "WebFlushPendingError";
+		this.retryAfterSeconds = retryAfterSeconds;
+	}
+}
+
+/**
  * Raw shape of the JSON response from `POST /api/mb-sync/credentials`. All
  * fields optional at the type level because we validate them at parse time
  * and produce a typed `SyncBackendError(502)` for any missing required field.
@@ -227,13 +244,22 @@ export class BackendClient {
 	 * tests / logs.
 	 *
 	 * Plan §0.8: the personal-space write lock is acquired by the matching
-	 * `/credentials` call and released by this call. The backend verifies
-	 * ownership via `lockOwnerToken`, which must be the value the matching
-	 * `/credentials` response returned. If the round crashed before
-	 * reaching this point, backend's lock TTL releases the lock without
-	 * client action. A missing or malformed `lockOwnerToken` is rejected
-	 * with 400 `invalid_request` — that signals a client bug (token not
-	 * threaded through the round), never a recoverable runtime condition.
+	 * `/credentials` call and released by this call on the steady-state
+	 * push success path. The backend verifies ownership via
+	 * `lockOwnerToken`, which must be the value the matching `/credentials`
+	 * response returned.
+	 *
+	 * Failure-path release: a round that mints but never reaches a
+	 * successful `notifyPush` / `completeMigration` (push rejected, pull-
+	 * rebase abort, idle short-circuit, network drop, exception inside
+	 * `doRound`) goes through `SyncEngine.runRound`'s finally and calls
+	 * `releaseLock` against the same token — see `releaseLock` below.
+	 * Backend's 5–9 min TTL is only the backstop for cases where neither
+	 * client-side release path can run (SIGKILL, power loss, etc.).
+	 *
+	 * A missing or malformed `lockOwnerToken` is rejected with 400
+	 * `invalid_request` — that signals a client bug (token not threaded
+	 * through the round), never a recoverable runtime condition.
 	 */
 	async notifyPush(args: {
 		readonly commitSha: string;
@@ -243,6 +269,36 @@ export class BackendClient {
 		await this.request<unknown>("POST", "/api/mb-sync/notify-push", {
 			commitSha: args.commitSha,
 			branch: args.branch,
+			lockOwnerToken: args.lockOwnerToken,
+		});
+	}
+
+	/**
+	 * JOLLI-1577 — per-round teardown safety net. Releases the backend
+	 * Personal Space write-lock identified by `lockOwnerToken`. Called from
+	 * `SyncEngine.runRound`'s finally on every round outcome that did NOT
+	 * already release via `notifyPush` (steady-state push success) or
+	 * `completeMigration` (first-bind success).
+	 *
+	 * Without this call, every failure-path mint would leave the lock
+	 * held until the backend's 5–9 min TTL expired, during which every
+	 * other device the same user owns would see "Personal Space is being
+	 * synced by another device" with no possible action.
+	 *
+	 * Backend returns `202 { released: true }`. Idempotent: 404 from a
+	 * never-held / TTL-expired token is recoverable (the finally caller
+	 * swallows it); 400 `invalid_request` indicates a client bug
+	 * (malformed token) and should surface in logs.
+	 *
+	 * Rate-limited backend-side (`vault_release_lock`) so the plugin MUST
+	 * call at most once per round teardown.
+	 *
+	 * Callers MUST swallow errors — the backend's TTL is the backstop,
+	 * and propagating release failure into the round result would mask
+	 * the original outcome the user cares about.
+	 */
+	async releaseLock(args: { readonly lockOwnerToken: string }): Promise<void> {
+		await this.request<unknown>("POST", "/api/mb-sync/release-lock", {
 			lockOwnerToken: args.lockOwnerToken,
 		});
 	}
@@ -351,6 +407,18 @@ export class BackendClient {
 			// same so they fail fast instead of being mis-classified as generic.
 			throw new VaultLockedError(text);
 		}
+		if (response.status === 503) {
+			// `pending_flush_failed` is the backend's "web has unsent edits"
+			// signal — see `WebFlushPendingError`. Parse the structured body
+			// and surface it as a typed error so the engine can route it to
+			// the same waiting-retry path as 423. Any other 503 falls through
+			// to the generic `SyncBackendError` below — those are real backend
+			// availability issues, not the cooperative back-off.
+			const parsed = tryParsePendingFlush(text);
+			if (parsed !== null) {
+				throw new WebFlushPendingError(text, parsed.retryAfterSeconds);
+			}
+		}
 		if (!response.ok) {
 			throw new SyncBackendError(response.status, `Sync backend returned ${response.status}`, text);
 		}
@@ -383,4 +451,30 @@ function missingMintFields(body: MintResponseBody): string[] {
 	}
 	if (!body.lockOwnerToken) missing.push("lockOwnerToken");
 	return missing;
+}
+
+/**
+ * Recognize the backend's `pending_flush_failed` 503 body. Backend shape:
+ *
+ *   { "error": "pending_flush_failed", "message": "...", "retryAfterSeconds": 30 }
+ *
+ * Returns `null` for any 503 that doesn't match — those flow through to the
+ * generic `SyncBackendError` path (real backend availability problems should
+ * not get re-cast as "wait for web flush"). Defaults `retryAfterSeconds` to
+ * 30 s if the field is missing or non-numeric so the engine still has
+ * something sensible to sleep on.
+ */
+function tryParsePendingFlush(text: string): { readonly retryAfterSeconds: number } | null {
+	let body: unknown;
+	try {
+		body = JSON.parse(text);
+	} catch {
+		return null;
+	}
+	if (typeof body !== "object" || body === null) return null;
+	const errField = (body as { error?: unknown }).error;
+	if (errField !== "pending_flush_failed") return null;
+	const raw = (body as { retryAfterSeconds?: unknown }).retryAfterSeconds;
+	const retryAfterSeconds = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : 30;
+	return { retryAfterSeconds };
 }

@@ -268,18 +268,37 @@ esac
 	});
 
 	describe("customPath validation", () => {
+		// Both cases exercise the fallback-to-default branch, which means
+		// `resolveKBPath` CLAIMS a real path under ~/Documents/jolli/ (writes
+		// config). Mirror the "default parent dir" block: use a unique repo
+		// name and `rmrf` in `finally` so the test never leaves a permanent
+		// dir in — or clobbers a real repo inside — the user's home Memory
+		// Bank folder. (The earlier fixed names `rel-test` / `dotdot-test`
+		// leaked permanent dirs into ~/Documents/jolli/.)
 		it("falls back to default when customPath is relative", () => {
-			const result = resolveKBPath("rel-test", null, "relative/path");
-			expect(result).toContain("Documents");
-			expect(result.endsWith("rel-test")).toBe(true);
-			expect(result).not.toContain("relative/path");
+			const uniq = `__test_kbpr_rel_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+			let result: string | undefined;
+			try {
+				result = resolveKBPath(uniq, null, "relative/path");
+				expect(result).toContain("Documents");
+				expect(result.endsWith(uniq)).toBe(true);
+				expect(result).not.toContain("relative/path");
+			} finally {
+				if (result) rmrf(result);
+			}
 		});
 
 		it("falls back to default when customPath contains '..'", () => {
+			const uniq = `__test_kbpr_dotdot_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 			const evil = `${tempDir}/../escape`;
-			const result = resolveKBPath("dotdot-test", null, evil);
-			expect(result).toContain("Documents");
-			expect(result).not.toContain("escape");
+			let result: string | undefined;
+			try {
+				result = resolveKBPath(uniq, null, evil);
+				expect(result).toContain("Documents");
+				expect(result).not.toContain("escape");
+			} finally {
+				if (result) rmrf(result);
+			}
 		});
 	});
 

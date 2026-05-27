@@ -52,7 +52,9 @@ import {
 	SyncBackendNetworkError,
 	SyncBackendUnauthorizedError,
 	VaultLockedError,
+	WebFlushPendingError,
 } from "./BackendClient.js";
+import { runBootstrapMerge, shouldRunBootstrapMerge } from "./BootstrapMerge.js";
 import { buildCommitMessage } from "./CommitMessage.js";
 import {
 	type AiMergeProvider,
@@ -336,6 +338,63 @@ interface RoundState {
 /** Recovery cause passed to `tryRemint` purely for log/telemetry clarity. */
 type RemintCause = "unauthorized" | "repoMissing";
 
+/**
+ * JOLLI-1577 — per-round backend-lock disposition tracker.
+ *
+ * Created fresh in `runRound`, threaded into every helper that touches a
+ * mint or release transition, and consulted in `runRound`'s finally to
+ * decide whether to call `backend.releaseLock`.
+ *
+ * Why an external mutable holder (not a field on `RoundState`):
+ * `RoundState` lives entirely inside `doRound`; this holder must outlive
+ * it so `runRound`'s `finally` block (one level up the call stack) can
+ * still inspect it after `doRound` returns / throws.
+ *
+ * Mutation rules — kept in lockstep with the wrappers that update them:
+ *   - `mintFresh` success → set `token` + `releaseInFinally = true`.
+ *   - `notifyPush` success (call sites at lines 1140, 1290) → clear
+ *     `releaseInFinally` (backend already released).
+ *   - `tryCompleteMigration` success (`deferred: false` branch) → clear
+ *     `releaseInFinally` (backend already released).
+ *   - `tryCompleteMigration` success (`deferred: true` branch — HEAD
+ *     unborn) → clear `releaseInFinally` (defer to next round; explicit
+ *     user choice — see plan §"Deferred-completion sites").
+ *   - `runFirstBindMigration` sets `completionDeferred = true` → caller
+ *     clears `releaseInFinally` at the same moment (defer rationale as
+ *     above).
+ */
+interface RoundLockHolder {
+	/** Latest minted lockOwnerToken this round, or null if mint never succeeded. */
+	token: string | null;
+	/**
+	 * True iff `runRound`'s finally should call `backend.releaseLock`.
+	 * Cleared on every success path that already released via
+	 * `notifyPush` / `completeMigration`. Does NOT alone govern the
+	 * deferred-completion case — see `deferredCompletion` below.
+	 *
+	 * Re-mint mid-round sets this back to `true` (the new token is now
+	 * the candidate for finally release). This is correct in the
+	 * non-deferred case but would override the deferred-completion
+	 * choice if used alone — which is why finally also checks
+	 * `!deferredCompletion`.
+	 */
+	releaseInFinally: boolean;
+	/**
+	 * True iff the round has established a `completeMigration` defer
+	 * (either via `runFirstBindMigration` returning
+	 * `completionDeferred: true`, or `tryCompleteMigration` returning
+	 * `{ ok: true, deferred: true }`). Set once and ONLY cleared by a
+	 * successful `completeMigration` against the backend. Crucially,
+	 * `mintFresh` does NOT touch this — so a recovery re-mint after the
+	 * defer boundary cannot accidentally re-arm finally release and
+	 * violate the user's "delay-path doesn't release lock" choice.
+	 *
+	 * Finally consults this in addition to `releaseInFinally`: release
+	 * only iff `token !== null && releaseInFinally && !deferredCompletion`.
+	 */
+	deferredCompletion: boolean;
+}
+
 /** Cap on per-round canary path lists to keep structured logs small. */
 const CANARY_PATH_CAP = 10;
 
@@ -482,11 +541,20 @@ export class SyncEngine {
 			void refreshSyncLockMtime();
 		}, this.opts.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS);
 
+		// JOLLI-1577 — per-round backend-lock disposition tracker. Threaded
+		// into `doRound` and the mint/release wrappers so the finally below
+		// can decide whether to call `backend.releaseLock` for failure paths.
+		const lockHolder: RoundLockHolder = {
+			token: null,
+			releaseInFinally: false,
+			deferredCompletion: false,
+		};
+
 		try {
 			// Resolve round context once, up front, and thread into doRound so
 			// we don't double-call `resolveContext` per round.
 			const ctx = await this.opts.resolveContext(round);
-			const result = await this.doRound(round, ctx);
+			const result = await this.doRound(round, ctx, lockHolder);
 			log.info("runRound end state=%s pushed=%s pulled=%s", result.newState, result.pushed, result.pulled);
 			return result;
 		} catch (e) {
@@ -520,6 +588,44 @@ export class SyncEngine {
 			);
 		} finally {
 			clearInterval(refresher);
+			// JOLLI-1577 — release backend Personal Space write-lock on
+			// every round outcome (success + failure). Placed BEFORE
+			// `releaseSyncLock`: the next `runRound` is gated by `sync.lock`,
+			// and if we released `sync.lock` first, the next round's mint
+			// would race our in-flight `releaseLock` HTTP call and likely
+			// 423 → backend retry schedule kicks in with a 60 s first delay
+			// (see `vaultLockedRetrySchedule` default), pushing user-visible
+			// "Personal Space busy" for the worst part of a minute.
+			// Holding `sync.lock` for the extra ~100-500 ms of the release
+			// POST is the cheaper trade.
+			//
+			// Signal / hard-crash caveat: there is no SIGINT handler
+			// installed (`SyncCommand.ts` just awaits `engine.runRound`), so
+			// Ctrl-C / SIGKILL / power loss bypass this path; backend's
+			// 5–9 min TTL is the only release mechanism for those.
+			// `!deferredCompletion` is the third gate: even if a recovery
+			// re-mint after the defer boundary re-armed `releaseInFinally`,
+			// the deferred-completion choice ("don't release this round —
+			// next round's `completeMigration` is the chosen release path")
+			// must still hold. `mintFresh` deliberately does NOT touch
+			// `deferredCompletion`, so this check is the single point that
+			// honours the defer choice across re-mints.
+			if (lockHolder.token !== null && lockHolder.releaseInFinally && !lockHolder.deferredCompletion) {
+				try {
+					await this.opts.backend.releaseLock({ lockOwnerToken: lockHolder.token });
+					// `pending-lock.json` self-lock evidence — same posture
+					// as the `notifyPush` / `completeMigration` success
+					// paths.
+					await this.clearPersistedLock();
+				} catch (e) {
+					// `pending-lock.json` is intentionally NOT cleared on
+					// release failure: the persisted entry then drives the
+					// next round's 423-attribution toward `selfLocked=true`,
+					// surfacing "Personal Space busy — last round failed"
+					// instead of attributing the lock to a peer.
+					log.warn("release-lock failed (swallowed; backend TTL will release): %s", (e as Error).message);
+				}
+			}
 			await releaseSyncLock();
 			// Chain-spawn hook (P2 #1). Fire AFTER the lock release so the
 			// worker we spawn won't immediately re-collide with our own
@@ -604,7 +710,11 @@ export class SyncEngine {
 		}
 	}
 
-	private async doRound(round: SyncRoundOptions, ctx: RoundContext): Promise<SyncRoundResult> {
+	private async doRound(
+		round: SyncRoundOptions,
+		ctx: RoundContext,
+		lockHolder: RoundLockHolder,
+	): Promise<SyncRoundResult> {
 		// `ctx` is resolved once in `runRound` (before vault-write.lock
 		// acquisition) and threaded in here so we don't double-call
 		// `resolveContext` per round. Pre-fix `doRound` called it again;
@@ -612,7 +722,7 @@ export class SyncEngine {
 		// reads per round is wasteful.
 
 		// 1. Mint fresh credentials at round start. No cross-round cache (§0.6).
-		const initialMint = await this.mintFresh();
+		const initialMint = await this.mintFresh(lockHolder);
 		if (!initialMint.ok) {
 			return this.reportOffline(
 				{ fetched: false, pulled: false, pushed: false, conflicts: [] },
@@ -704,7 +814,7 @@ export class SyncEngine {
 		// return non-zero with empty stderr, and parsing error strings
 		// broke once in the field already.
 		this.emitPhase("downloading");
-		const fetched = await this.fetchOrCloneWithRetry(state);
+		const fetched = await this.fetchOrCloneWithRetry(state, lockHolder);
 		if (!fetched.ok) {
 			log.warn("Clone/fetch failed: %s — going offline", fetched.message);
 			return this.reportOffline(
@@ -766,7 +876,7 @@ export class SyncEngine {
 		// `alreadyVaultBound === true` (steady-state).
 		let completionDeferred = false;
 		if (!state.creds.alreadyVaultBound) {
-			const migrationResult = await this.runFirstBindMigration(state, round);
+			const migrationResult = await this.runFirstBindMigration(state, round, lockHolder);
 			if (!migrationResult.ok) {
 				log.warn("Legacy migration failed: %s — going offline", migrationResult.message);
 				return this.reportOffline(
@@ -780,6 +890,25 @@ export class SyncEngine {
 				);
 			}
 			completionDeferred = migrationResult.completionDeferred;
+			// JOLLI-1577 — once defer is established, finally must NOT
+			// release. Setting this at the boundary (not inside the retry
+			// block below) protects EVERY exit between here and the retry
+			// — auto-reconcile failure, pull-rebase abort, push failure,
+			// uncaught throw — which would otherwise leak the lock-release
+			// to the round teardown and force the next round into a re-mint
+			// cycle, losing `complete-migration`'s idempotency benefit.
+			// Backend TTL holds the gap on the off chance the deferred
+			// retry below (and the next round) don't reach completion.
+			//
+			// `deferredCompletion = true` is the sticky version: a recovery
+			// re-mint via `pushWithRetry`'s 401/404 path would otherwise
+			// re-arm `releaseInFinally` and undo this clear. `mintFresh`
+			// deliberately doesn't touch `deferredCompletion`; finally
+			// gates release on `!deferredCompletion`.
+			if (completionDeferred) {
+				lockHolder.releaseInFinally = false;
+				lockHolder.deferredCompletion = true;
+			}
 		}
 
 		// 3d. Auto-reconcile user-edited vault state (plan §0.9). Memory
@@ -1087,7 +1216,7 @@ export class SyncEngine {
 		await this.stageVaultTracked(state.client, ctx.memoryBankRoot, { syncTranscripts: round.transcripts });
 		await state.client.commit(summary, ctx.author);
 		this.emitPhase("uploading");
-		const pushed = await this.pushWithRetry(state);
+		const pushed = await this.pushWithRetry(state, lockHolder);
 		if (!pushed.ok) {
 			log.warn("Push failed permanently: %s — going offline", pushed.message);
 			return this.reportOffline(
@@ -1106,8 +1235,18 @@ export class SyncEngine {
 		// shouldn't see this round go red over a transient RPC blip — the
 		// data is already safe on the remote. Same fire-and-forget posture
 		// as the migration / steady-state notify-push paths below.
+		//
+		// JOLLI-1577 — `lockHolder.releaseInFinally` was already cleared
+		// upstream at the moment defer was established (see the
+		// `if (completionDeferred)` block right after
+		// `runFirstBindMigration`), so neither this retry's success nor
+		// its failure can re-arm finally's `releaseLock`. Retry-success
+		// flows through `tryCompleteMigration`'s normal "lock released by
+		// backend" path; retry-failure leaves the lock to the next round
+		// or to backend TTL — explicit per-plan decision to avoid racing
+		// the backend with two release attempts.
 		if (completionDeferred) {
-			const retry = await this.tryCompleteMigration(state);
+			const retry = await this.tryCompleteMigration(state, lockHolder);
 			if (!retry.ok) {
 				log.warn(
 					"Deferred completeMigration retry failed (%s): %s — leaving for next round",
@@ -1119,9 +1258,16 @@ export class SyncEngine {
 
 		// 7. notify-push (fire-and-forget; errors are logged but don't fail the round).
 		//    Plan §0.8: backend releases the per-user personal-space write
-		//    lock here. Ownership is verified via `lockOwnerToken` — the
-		//    same token returned by the matching `/credentials` call that
-		//    opened this round.
+		//    lock here on the steady-state push success path. Ownership is
+		//    verified via `lockOwnerToken` — the same token returned by
+		//    the matching `/credentials` call that opened this round.
+		//
+		//    JOLLI-1577 — this is one of TWO canonical client-side release
+		//    paths (the other is `completeMigration` for first-bind).
+		//    Every other round outcome (push failed, pull-rebase aborted,
+		//    exception inside `doRound`, idle short-circuit, …) is now
+		//    covered by `releaseLock` in `runRound`'s finally — TTL is no
+		//    longer the only failure-path fallback.
 		//
 		//    Skip the call when the push was idempotent ("Everything up-to-date"):
 		//    the backend already knows about every commit currently on the
@@ -1146,6 +1292,10 @@ export class SyncEngine {
 				// persisted self-lock evidence so the next round's mint
 				// retries can correctly attribute any 423 to a peer.
 				await this.clearPersistedLock();
+				// JOLLI-1577 — notify-push is one of the two canonical
+				// release paths. Tell `runRound`'s finally not to call
+				// `releaseLock` again.
+				lockHolder.releaseInFinally = false;
 			} catch (e) {
 				log.debug("notify-push failed (swallowed): %s", (e as Error).message);
 			}
@@ -1180,6 +1330,7 @@ export class SyncEngine {
 	private async runFirstBindMigration(
 		state: RoundState,
 		round: SyncRoundOptions,
+		lockHolder: RoundLockHolder,
 	): Promise<
 		| { readonly ok: true; readonly completionDeferred: boolean }
 		| { readonly ok: false; readonly code: SyncErrorCode; readonly message: string; readonly pushed: boolean }
@@ -1205,7 +1356,7 @@ export class SyncEngine {
 				legacyResponse.alreadyMigrated,
 				legacyResponse.docs.length,
 			);
-			const completion = await this.tryCompleteMigration(state);
+			const completion = await this.tryCompleteMigration(state, lockHolder);
 			if (!completion.ok) return completion;
 			// `deferred === true` means HEAD is unborn so completeMigration
 			// could not be called yet. Bubble the flag up so `doRound` can
@@ -1264,7 +1415,7 @@ export class SyncEngine {
 			});
 			await state.client.commit(commitMessage, state.ctx.author);
 			this.emitPhase("uploading");
-			const pushed = await this.pushWithRetry(state);
+			const pushed = await this.pushWithRetry(state, lockHolder);
 			if (!pushed.ok) {
 				return {
 					ok: false,
@@ -1284,6 +1435,11 @@ export class SyncEngine {
 			// retry-with-backoff for the up-to-9-minute window. Fire-and-
 			// forget; the GitHub webhook + reconciler cover the rare
 			// notify-push failure.
+			//
+			// JOLLI-1577 — when notify-push throws here, `releaseInFinally`
+			// stays true, and `runRound`'s finally calls `releaseLock`
+			// against the same `lockOwnerToken`. Backend TTL is no longer
+			// the only fallback for notify-push failure.
 			if (pushed.transmitted) {
 				try {
 					const pushedHead = await state.client.currentHead();
@@ -1296,13 +1452,16 @@ export class SyncEngine {
 					// clear evidence so the steady-state push downstream
 					// can't be mislabelled as self-locked if it 423s.
 					await this.clearPersistedLock();
+					// JOLLI-1577 — backend released the lock; finally must
+					// not call `releaseLock` again.
+					lockHolder.releaseInFinally = false;
 				} catch (e) {
 					log.debug("migration notify-push failed (swallowed): %s", (e as Error).message);
 				}
 			}
 		}
 
-		const completion = await this.tryCompleteMigration(state);
+		const completion = await this.tryCompleteMigration(state, lockHolder);
 		if (!completion.ok) return completion;
 		// Phase boundary: migration push (if any) succeeded, completeMigration
 		// succeeded, GitHub repo is provably writable. Reset the re-mint
@@ -1320,6 +1479,7 @@ export class SyncEngine {
 
 	private async tryCompleteMigration(
 		state: RoundState,
+		lockHolder: RoundLockHolder,
 	): Promise<
 		| { readonly ok: true; readonly deferred: boolean }
 		| { readonly ok: false; readonly code: SyncErrorCode; readonly message: string; readonly pushed: false }
@@ -1343,6 +1503,19 @@ export class SyncEngine {
 				log.info(
 					"completeMigration: deferred — HEAD is unborn (empty vault, no docs to migrate yet); doRound will retry after steady-state push",
 				);
+				// JOLLI-1577 — defer release alongside completion. The
+				// next round's `completeMigration` is the chosen release
+				// path; calling `releaseLock` in finally would force the
+				// next round into a re-mint cycle and lose
+				// `complete-migration`'s idempotency benefit. Backend TTL
+				// holds the gap on the off chance the next round doesn't
+				// run.
+				//
+				// `deferredCompletion = true` makes this sticky across a
+				// later recovery re-mint that would otherwise re-arm
+				// `releaseInFinally`. See holder docstring for the gate.
+				lockHolder.releaseInFinally = false;
+				lockHolder.deferredCompletion = true;
 				return { ok: true, deferred: true };
 			}
 			/* v8 ignore stop */
@@ -1355,6 +1528,13 @@ export class SyncEngine {
 			// path (the first is `notify-push`). Clear evidence on success
 			// so the next round's mint retries attribute any 423 correctly.
 			await this.clearPersistedLock();
+			// JOLLI-1577 — backend already released the lock; finally must
+			// not call `releaseLock` a second time. Also clear
+			// `deferredCompletion` so a prior defer in this same round
+			// (deferred → push HEAD-born → retry succeeds) doesn't keep
+			// suppressing future releases.
+			lockHolder.releaseInFinally = false;
+			lockHolder.deferredCompletion = false;
 			log.info("completeMigration: alreadyMigrated=%s", res.alreadyMigrated);
 			return { ok: true, deferred: false };
 		} catch (e) {
@@ -1384,7 +1564,9 @@ export class SyncEngine {
 	 * message so backend `error` codes like `vault_sync_disabled` /
 	 * `github_api_error` show up without needing a curl repro.
 	 */
-	private async mintFresh(): Promise<
+	private async mintFresh(
+		lockHolder: RoundLockHolder,
+	): Promise<
 		| { readonly ok: true; readonly creds: GitCredentials }
 		| { readonly ok: false; readonly code: SyncErrorCode; readonly message: string; readonly selfLocked?: boolean }
 	> {
@@ -1406,6 +1588,18 @@ export class SyncEngine {
 		for (let attempt = 1; attempt <= totalAttempts; attempt++) {
 			try {
 				const creds = await this.opts.backend.mintGitCredentials();
+				// JOLLI-1577 — backend lock is now held. Update the holder
+				// IMMEDIATELY, BEFORE any awaited local persistence. If
+				// `persistMintedLock` throws (disk full, permission error,
+				// concurrent unlink), the catch below returns
+				// `{ ok: false, code: "mint_failed" }` and the round unwinds
+				// with the backend lock still held; `runRound`'s finally
+				// needs the token already in the holder to release it.
+				// Re-mint overwriting an earlier token is correct: the
+				// earlier token is left to backend TTL by design (per the
+				// "stale tokens from mid-round re-mint" decision).
+				lockHolder.token = creds.lockOwnerToken;
+				lockHolder.releaseInFinally = true;
 				// Persist BEFORE returning so even a crash between this line
 				// and the round's notify-push leaves correct self-lock
 				// evidence on disk for the next round.
@@ -1458,6 +1652,44 @@ export class SyncEngine {
 						selfLocked: startSelfLock.selfLocked,
 					};
 				}
+				if (e instanceof WebFlushPendingError) {
+					// Cooperative back-off — backend's web flusher hasn't sent
+					// its pending edits to GitHub yet. Treat exactly like 423
+					// vault_locked: emit `waiting`, sleep the server-suggested
+					// delay, retry within the mint budget. Refusing to retry
+					// would force the user to manually re-trigger sync 30 s
+					// later — and most of the time the next attempt succeeds.
+					if (attempt < totalAttempts) {
+						const delayMs = Math.max(1000, e.retryAfterSeconds * 1000);
+						log.warn(
+							"Mint got 503 pending_flush_failed (attempt %d/%d) — waiting %d ms (server-suggested %ds) then retrying",
+							attempt,
+							totalAttempts,
+							delayMs,
+							e.retryAfterSeconds,
+						);
+						try {
+							this.opts.onLockedWait?.({
+								attempt,
+								totalAttempts,
+								nextRetryInMs: delayMs,
+								message: e.message,
+								selfLocked: startSelfLock.selfLocked,
+							});
+						} catch (cbErr) {
+							log.debug("onLockedWait callback threw (swallowed): %s", (cbErr as Error).message);
+						}
+						this.emitPhase("waiting");
+						await sleep(delayMs);
+						continue;
+					}
+					log.warn(
+						"Mint got 503 pending_flush_failed on final attempt %d/%d — giving up",
+						attempt,
+						totalAttempts,
+					);
+					return { ok: false, code: "network", message: e.message };
+				}
 				if (e instanceof SyncBackendNetworkError) {
 					log.warn("Mint failed (network): %s", (e as Error).message);
 					return { ok: false, code: "network", message: (e as Error).message };
@@ -1499,6 +1731,7 @@ export class SyncEngine {
 	private async tryRemint(
 		state: RoundState,
 		cause: RemintCause,
+		lockHolder: RoundLockHolder,
 	): Promise<{ readonly ok: true } | { readonly ok: false; readonly code: SyncErrorCode; readonly message: string }> {
 		if (state.remintsUsed >= MAX_REMINTS_PER_PHASE) {
 			const msg = `recovery exhausted (${cause}): already re-minted ${state.remintsUsed} time(s) this round`;
@@ -1506,7 +1739,10 @@ export class SyncEngine {
 			return { ok: false, code: "sync_failed_after_retries", message: msg };
 		}
 		log.warn("Triggering recovery re-mint (cause=%s, remintsUsed=%d)", cause, state.remintsUsed);
-		const fresh = await this.mintFresh();
+		// `mintFresh` itself updates `lockHolder.token` to the new credentials
+		// — the prior token is left to backend TTL (per "stale tokens from
+		// mid-round re-mint" decision in JOLLI-1577 plan).
+		const fresh = await this.mintFresh(lockHolder);
 		if (!fresh.ok) {
 			return { ok: false, code: fresh.code, message: `re-mint after ${cause}: ${fresh.message}` };
 		}
@@ -1593,10 +1829,43 @@ export class SyncEngine {
 						// surfaces them so we defer to the auto-reconcile path
 						// instead.
 						if (await state.client.hasUncommittedChanges({ includeIgnored: true })) {
-							log.warn(
-								"Unborn HEAD on '%s' with local working-tree content — deferring branch adoption to auto-reconcile + pullRebase (Tier 1.5)",
-								defaultBranch,
-							);
+							// Strict trigger check for bootstrap merge. C1+C2+C3
+							// already hold by virtue of this code path; the
+							// remaining gates (no local branches, no stash) make
+							// sure we're not in a stranded-commits / user-stash
+							// scenario where adopting origin would lose work.
+							const verdict = await shouldRunBootstrapMerge(state.client, defaultBranch);
+							if (verdict.ok) {
+								log.warn(
+									"Unborn HEAD on '%s' with local working-tree content — running bootstrap merge",
+									defaultBranch,
+								);
+								const result = await runBootstrapMerge({
+									client: state.client,
+									vaultRoot: ctx.memoryBankRoot,
+									defaultBranch,
+									author: ctx.author,
+									log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+								});
+								if (!result.ok) {
+									log.warn(
+										"bootstrap merge failed (%s): %s — falling back to defer",
+										result.code,
+										result.message,
+									);
+								} else if (result.stashedSurvivors.length > 0) {
+									const room = CANARY_PATH_CAP - this.canary.unowned.length;
+									if (room > 0) {
+										this.canary.unowned.push(...result.stashedSurvivors.slice(0, room));
+									}
+								}
+							} else {
+								log.warn(
+									"Unborn HEAD on '%s' with local content but bootstrap merge skipped (%s) — deferring to auto-reconcile + pullRebase (Tier 1.5)",
+									defaultBranch,
+									verdict.reason,
+								);
+							}
 						} else {
 							log.warn(
 								"Local '%s' is on an unborn HEAD — adopting origin/%s",
@@ -1760,6 +2029,7 @@ export class SyncEngine {
 	 */
 	private async fetchOrCloneWithRetry(
 		state: RoundState,
+		lockHolder: RoundLockHolder,
 	): Promise<
 		| { readonly ok: true; readonly cloned: boolean }
 		| { readonly ok: false; readonly code: SyncErrorCode; readonly message: string }
@@ -1824,7 +2094,7 @@ export class SyncEngine {
 						maxAttempts,
 						cause,
 					);
-					const remintResult = await this.tryRemint(state, cause);
+					const remintResult = await this.tryRemint(state, cause, lockHolder);
 					if (!remintResult.ok) return remintResult;
 					continue;
 				}
@@ -1865,6 +2135,7 @@ export class SyncEngine {
 	 */
 	private async pushWithRetry(
 		state: RoundState,
+		lockHolder: RoundLockHolder,
 	): Promise<
 		| { readonly ok: true; readonly transmitted: boolean }
 		| { readonly ok: false; readonly code: SyncErrorCode; readonly message: string }
@@ -1878,7 +2149,7 @@ export class SyncEngine {
 			if (result.unauthorized || result.repoMissing) {
 				const cause: RemintCause = result.unauthorized ? "unauthorized" : "repoMissing";
 				log.warn("push attempt %d/%d failed (%s) — attempting recovery re-mint", attempt, maxAttempts, cause);
-				const remintResult = await this.tryRemint(state, cause);
+				const remintResult = await this.tryRemint(state, cause, lockHolder);
 				if (!remintResult.ok) return remintResult;
 				continue;
 			}

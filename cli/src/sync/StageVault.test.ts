@@ -91,14 +91,17 @@ describe("stageVault — basic flow", () => {
 		expect(stageRm).not.toHaveBeenCalled();
 	});
 
-	it("unstages already-staged paths that classifier now rejects (`git rm --cached`)", async () => {
+	it("resets already-staged paths that classifier now rejects (`git reset HEAD --`, NOT `git rm --cached`)", async () => {
 		// Scenario: a path the classifier doesn't recognise is somehow
 		// already in the index — could be classifier drift, a foreign
-		// writer, or a prior round before the deny-all `.gitignore`
-		// landed. Without `git rm --cached`, the subsequent `commit()`
-		// would include the rejected content; with it, the index entry
-		// is dropped (worktree copy preserved). Verifies for all three
-		// rejection reasons: unowned, symlinked, transcripts-off.
+		// writer, a prior round before the deny-all `.gitignore` landed,
+		// or legacy-tracked content from an older engine layout.
+		// `git reset HEAD --` reverts the index entry to its HEAD blob
+		// (or drops it, if HEAD has none for an `A`-only staged add) so
+		// the upcoming `commit()` carries nothing for this path. NOT
+		// `git rm --cached`: that would stage a deletion against any
+		// HEAD blob and the round's push would propagate the deletion to
+		// peers, silently erasing the file from the shared vault.
 		mkdirSync(join(vault, "myrepo", ".jolli", "transcripts"), { recursive: true });
 		mkdirSync(join(vault, "myrepo", ".hidden"), { recursive: true });
 		writeFileSync(join(vault, "myrepo", ".hidden", "junk.txt"), "x"); // unowned (leading-dot segment)
@@ -119,19 +122,16 @@ describe("stageVault — basic flow", () => {
 			}),
 		]);
 		const report = await stageVault(client as GitClient, vault, { syncTranscripts: false });
-		// Unowned junk: unstaged via `git rm --cached`.
-		expect(unstage).toHaveBeenCalledTimes(1);
-		expect(unstage.mock.calls[0]?.[0]).toEqual(["myrepo/.hidden/junk.txt"]);
-		// Tracked transcript with syncTranscripts=false: routed through
-		// `git reset HEAD --`, NOT `git rm --cached`. Model 2
-		// (MemoryBankBootstrap.ts §"transcripts=OFF semantics"): OFF means
-		// "this device does not upload NEW transcripts", NOT "delete what
-		// other devices already uploaded". `git rm --cached` would commit
-		// a deletion that propagates to peers; `git reset HEAD --` reverts
-		// the index entry to its HEAD blob without staging a deletion, so
-		// the upcoming commit carries nothing for this path (P1#4).
+		// `git rm --cached` MUST NOT be called from stageVault — see the
+		// dedicated regression-guard test below.
+		expect(unstage).not.toHaveBeenCalled();
+		// Both rejected paths went through `git reset HEAD --` (a single
+		// batched call for the two paths).
 		expect(reset).toHaveBeenCalledTimes(1);
-		expect(reset.mock.calls[0]?.[0]).toEqual([`myrepo/.jolli/transcripts/${HASH40}.json`]);
+		expect(reset.mock.calls[0]?.[0]).toEqual([
+			"myrepo/.hidden/junk.txt",
+			`myrepo/.jolli/transcripts/${HASH40}.json`,
+		]);
 		expect(report.unowned).toEqual(["myrepo/.hidden/junk.txt"]);
 		expect(report.skipped).toBe(1);
 	});
@@ -191,6 +191,50 @@ describe("stageVault — basic flow", () => {
 		expect(reset).toHaveBeenCalledTimes(1);
 		expect(reset.mock.calls[0]?.[0]).toEqual([`myrepo/.jolli/transcripts/${HASH40}.json`]);
 		expect(report.skipped).toBe(1);
+	});
+
+	it("NEVER calls `unstagePaths` (`git rm --cached`) from stageVault — regression guard for the push-deletion data-loss path", async () => {
+		// Historical bug: stageVault routed any classifier-rejected
+		// (`unowned`) path with a staged index entry through
+		// `client.unstagePaths`. For HEAD-tracked content the new
+		// classifier didn't recognise (older engine layouts, leading-dot
+		// config dirs, root-level files, legacy summaries without the
+		// strict `<slug>-<hex8>.md` shape), `git rm --cached` staged a
+		// deletion that the round's commit + push propagated to every
+		// peer — silently erasing files from the shared vault.
+		//
+		// Invariant going forward: `stageVault` MUST use
+		// `resetPathsToHead` (`git reset HEAD --`) for ALL classifier-
+		// reject branches (unowned / transcript-off / symlink-blocked),
+		// because `resetPathsToHead` preserves the HEAD blob and only
+		// drops the local staged change. Any future code that
+		// reintroduces `unstagePaths` in stageVault must explicitly
+		// rewrite this test.
+		mkdirSync(join(vault, "myrepo", ".jolli", "transcripts"), { recursive: true });
+		mkdirSync(join(vault, "myrepo", ".legacy"), { recursive: true });
+		writeFileSync(join(vault, "myrepo", ".legacy", "config.json"), "{}");
+		writeFileSync(join(vault, "myrepo", ".jolli", "transcripts", `${HASH40}.json`), "{}");
+		const { client, unstage, reset } = makeClient([
+			// Unowned HEAD-tracked path with a staged modification — the
+			// exact shape that triggered the regression. Leading-dot
+			// segment defeats `SAFE_SEGMENT_RE`, so the fallthrough
+			// classifier returns null.
+			entry({ indexStatus: "M", worktreeStatus: " ", path: "myrepo/.legacy/config.json" }),
+			// Transcript-off staged path.
+			entry({
+				indexStatus: "M",
+				worktreeStatus: " ",
+				path: `myrepo/.jolli/transcripts/${HASH40}.json`,
+			}),
+		]);
+		await stageVault(client as GitClient, vault, { syncTranscripts: false });
+		expect(unstage).not.toHaveBeenCalled();
+		// Both rejected paths went through reset instead.
+		expect(reset).toHaveBeenCalledTimes(1);
+		expect(reset.mock.calls[0]?.[0]).toEqual([
+			"myrepo/.legacy/config.json",
+			`myrepo/.jolli/transcripts/${HASH40}.json`,
+		]);
 	});
 
 	it("does NOT unstage untracked/ignored entries (`??` / `!!` — nothing in the index to remove)", async () => {
