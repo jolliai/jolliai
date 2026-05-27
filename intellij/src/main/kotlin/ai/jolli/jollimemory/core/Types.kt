@@ -392,6 +392,44 @@ enum class LogLevel(val priority: Int) {
 
 // ── Active Conversations types ─────────────────────────────────────────────
 
+/** A single bullet point from a conversation's BP summary. */
+data class BulletPointItem(
+	val text: String,
+	val addedAt: String,
+	val commitHash: String,
+)
+
+/** Branch tags assigned to a conversation session. */
+data class ConversationBranchTags(
+	val source: String,
+	val sessionId: String,
+	val branches: List<String>,
+	val updatedAt: String,
+)
+
+/** Persisted registry of branch tags for all sessions. */
+data class BranchTagsRegistry(
+	val version: Int = 1,
+	val entries: Map<String, ConversationBranchTags> = emptyMap(),
+)
+
+/** Accumulated BP summary for a session. */
+data class ConversationBPSummary(
+	val source: String,
+	val sessionId: String,
+	val bullets: List<BulletPointItem>,
+	val updatedAt: String,
+)
+
+/** Persisted registry of BP summaries for all sessions. */
+data class BPSummaryRegistry(
+	val version: Int = 1,
+	val entries: Map<String, ConversationBPSummary> = emptyMap(),
+)
+
+/** Which panel view is active in the conversations panel. */
+enum class ConversationViewMode { ACTIVE, ALL, BRANCH }
+
 /** A session enriched with display data for the active conversations panel. */
 data class ActiveConversationItem(
     val sessionId: String,
@@ -406,6 +444,8 @@ data class ActiveConversationItem(
      * summary. Default `true` for any row absent from commit-selection state.
      */
     val isSelected: Boolean = true,
+    val branchTags: List<String> = emptyList(),
+    val bpSummary: List<BulletPointItem> = emptyList(),
 )
 
 /** Result envelope from the active session aggregator. */

@@ -123,7 +123,33 @@ class ConversationFileEditor(
 		footer.add(cancelButton)
 		footer.add(saveButton)
 
-		rootPanel.add(header, BorderLayout.NORTH)
+		// BP summary section (between header and transcript)
+		val bpPanel = JPanel().apply {
+			layout = BoxLayout(this, BoxLayout.Y_AXIS)
+			border = JBUI.Borders.empty(0, 16, 8, 16)
+			isOpaque = true
+			background = JBColor(java.awt.Color(245, 247, 250), java.awt.Color(40, 44, 52))
+			isVisible = item.bpSummary.isNotEmpty()
+		}
+		if (item.bpSummary.isNotEmpty()) {
+			bpPanel.add(JBLabel("Key Points").apply {
+				font = font.deriveFont(Font.BOLD)
+				border = JBUI.Borders.emptyBottom(4)
+			})
+			for (bullet in item.bpSummary) {
+				bpPanel.add(JBLabel("  \u2022  ${bullet.text}").apply {
+					border = JBUI.Borders.emptyBottom(2)
+				})
+			}
+		}
+
+		val topContainer = JPanel().apply {
+			layout = BoxLayout(this, BoxLayout.Y_AXIS)
+			add(header)
+			add(bpPanel)
+		}
+
+		rootPanel.add(topContainer, BorderLayout.NORTH)
 		rootPanel.add(scrollPane, BorderLayout.CENTER)
 		rootPanel.add(footer, BorderLayout.SOUTH)
 	}

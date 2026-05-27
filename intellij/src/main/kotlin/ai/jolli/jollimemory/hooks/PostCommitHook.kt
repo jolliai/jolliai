@@ -278,6 +278,26 @@ object PostCommitHook {
             ))
             log.info("Step 8: LLM call completed, topics=%d, recap=%s", summaryResult.topics?.size ?: 0, if (summaryResult.recap != null) "${summaryResult.recap!!.length} chars" else "null")
 
+            // 8a. Generate bullet point summaries for each session
+            for (st in sessionTranscripts) {
+                try {
+                    val sourceName = (st.source ?: TranscriptSource.claude).name
+                    val existing = BPSummaryStore.getSummary(cwd, sourceName, st.sessionId)
+                    val newBullets = BPSummaryGenerator.generate(
+                        transcript = st.entries,
+                        existingBullets = existing,
+                        commitHash = commitInfo.hash,
+                        apiKey = apiKey,
+                    )
+                    if (newBullets.isNotEmpty()) {
+                        BPSummaryStore.appendBullets(cwd, sourceName, st.sessionId, newBullets)
+                        log.info("BP summary: added %d bullet(s) for session %s", newBullets.size, st.sessionId.take(8))
+                    }
+                } catch (e: Exception) {
+                    log.warn("BP summary generation failed for %s: %s", st.sessionId.take(8), e.message)
+                }
+            }
+
             // 8b. Detect uncommitted plans, archive, and evaluate progress
             val planRefs = mutableListOf<PlanReference>()
             val planProgressArtifacts = mutableListOf<PlanProgressArtifact>()

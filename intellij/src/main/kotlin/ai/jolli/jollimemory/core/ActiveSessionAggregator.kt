@@ -65,6 +65,10 @@ object ActiveSessionAggregator {
 			)
 		}
 
+		// Load branch tags and BP summaries registries
+		val branchTagsRegistry = try { BranchTagsStore.loadRegistry(cwd) } catch (_: Exception) { BranchTagsRegistry() }
+		val bpSummaryRegistry = try { BPSummaryStore.loadRegistry(cwd) } catch (_: Exception) { BPSummaryRegistry() }
+
 		// Load transcripts, resolve titles, build items
 		val items = visible.mapNotNull { s ->
 			val unread = safeLoadUnreadMerged(s, cwd)
@@ -72,6 +76,8 @@ object ActiveSessionAggregator {
 
 			val titleEntries = safeLoadMerged(s, cwd)
 			val source = s.source ?: TranscriptSource.claude
+			val key = BranchTagsStore.tagKey(source, s.sessionId)
+			val bpKey = BPSummaryStore.bpKey(source.name, s.sessionId)
 
 			ActiveConversationItem(
 				sessionId = s.sessionId,
@@ -80,6 +86,8 @@ object ActiveSessionAggregator {
 				messageCount = unread.size,
 				updatedAt = s.updatedAt,
 				transcriptPath = s.transcriptPath,
+				branchTags = branchTagsRegistry.entries[key]?.branches ?: emptyList(),
+				bpSummary = bpSummaryRegistry.entries[bpKey]?.bullets ?: emptyList(),
 			)
 		}
 
