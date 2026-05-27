@@ -1,6 +1,7 @@
 # Jolli Memory
 
 > *Every commit deserves a Memory. Every memory deserves a Recall.*
+test
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort.
 
