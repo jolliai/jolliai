@@ -439,6 +439,87 @@ describe("parseFullSpec — top-level extraction", () => {
 		expect(spec.operations[0].servers).toBeUndefined();
 	});
 
+	it("carries server variables (default/enum/description) through on root servers", () => {
+		const doc = makeDoc({
+			servers: [
+				{
+					url: "https://{defaultHost}",
+					description: "default",
+					variables: {
+						defaultHost: {
+							default: "discourse.example.com",
+							enum: ["discourse.example.com", "try.discourse.org"],
+							description: "the host",
+						},
+					},
+				},
+			],
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.servers).toEqual([
+			{
+				url: "https://{defaultHost}",
+				description: "default",
+				variables: {
+					defaultHost: {
+						default: "discourse.example.com",
+						enum: ["discourse.example.com", "try.discourse.org"],
+						description: "the host",
+					},
+				},
+			},
+		]);
+	});
+
+	it("drops malformed server-variable fields and an empty variables map", () => {
+		const doc = makeDoc({
+			servers: [
+				{
+					url: "https://{host}",
+					variables: {
+						host: { default: 42, enum: [1, "ok"], description: 7 },
+						bogus: "not-an-object",
+					},
+				},
+			],
+		});
+		const spec = parseFullSpec(doc);
+		// `host.default`/`description` are non-strings (dropped); enum keeps only
+		// the string member; `bogus` is not an object (dropped) — leaving just a
+		// single-key enum.
+		expect(spec.servers).toEqual([{ url: "https://{host}", variables: { host: { enum: ["ok"] } } }]);
+	});
+
+	it("omits variables entirely when none survive filtering", () => {
+		const doc = makeDoc({
+			servers: [{ url: "https://x", variables: { a: "nope" } }],
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.servers).toEqual([{ url: "https://x" }]);
+	});
+
+	it("drops an enum that contains no string members", () => {
+		const doc = makeDoc({
+			servers: [{ url: "https://{host}", variables: { host: { default: "h", enum: [1, 2, true] } } }],
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.servers).toEqual([{ url: "https://{host}", variables: { host: { default: "h" } } }]);
+	});
+
+	it("carries server variables through on an operation-level override", () => {
+		const doc = makeDoc({
+			paths: {
+				"/x": {
+					get: { servers: [{ url: "https://{region}", variables: { region: { default: "us" } } }] },
+				},
+			},
+		});
+		const spec = parseFullSpec(doc);
+		expect(spec.operations[0].servers).toEqual([
+			{ url: "https://{region}", variables: { region: { default: "us" } } },
+		]);
+	});
+
 	it("extracts security schemes verbatim, dropping schemes without a type", () => {
 		const doc = makeDoc({
 			components: {

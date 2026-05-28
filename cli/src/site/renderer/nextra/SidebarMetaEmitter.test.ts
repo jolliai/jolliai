@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { OpenApiOperation, ParsedSpec } from "../../openapi/Types.js";
-import { emitSidebarMetas } from "./SidebarMetaEmitter.js";
+import type { OpenApiOperation, OpenApiPipelineResult, ParsedSpec } from "../../openapi/Types.js";
+import { buildApiSidebarOverrides } from "./SidebarMetaEmitter.js";
 
 function makeSpec(overrides: Partial<ParsedSpec> = {}): ParsedSpec {
 	return {
@@ -21,7 +21,7 @@ function makeOp(overrides: Partial<OpenApiOperation> = {}): OpenApiOperation {
 		method: "get",
 		path: "/pets",
 		tag: "pets",
-		summary: "",
+		summary: "List pets",
 		description: "",
 		deprecated: false,
 		parameters: [],
@@ -31,53 +31,73 @@ function makeOp(overrides: Partial<OpenApiOperation> = {}): OpenApiOperation {
 	};
 }
 
-describe("emitSidebarMetas", () => {
-	it("emits the spec-folder _meta.ts plus one per tag", () => {
+function makeInput(specName: string, spec: ParsedSpec): { specName: string; pipeline: OpenApiPipelineResult } {
+	return { specName, pipeline: { spec, dossiers: [] } };
+}
+
+describe("buildApiSidebarOverrides", () => {
+	it("keys overrides by per-tag folder path and labels each operation by summary", () => {
 		const spec = makeSpec({
 			tags: [{ name: "pets" }, { name: "users" }],
+			operations: [
+				makeOp({ tag: "pets", operationId: "listpets", summary: "List pets" }),
+				makeOp({ tag: "users", operationId: "listusers", path: "/users", summary: "List users" }),
+			],
+		});
+		const overrides = buildApiSidebarOverrides([makeInput("petstore", spec)]);
+		expect(overrides["/api-petstore/pets"]).toEqual({ listpets: "List pets" });
+		expect(overrides["/api-petstore/users"]).toEqual({ listusers: "List users" });
+	});
+
+	it("emits a top-level /api-{spec} override listing tag groups in spec declaration order", () => {
+		const spec = makeSpec({
+			// Declared order is users, then pets — the reverse of alphabetical.
+			tags: [{ name: "users" }, { name: "pets" }],
 			operations: [
 				makeOp({ tag: "pets", operationId: "listpets" }),
 				makeOp({ tag: "users", operationId: "listusers", path: "/users" }),
 			],
 		});
-		const files = emitSidebarMetas("petstore", spec);
-		const paths = files.map((f) => f.path);
-		expect(paths).toContain("content/api-petstore/_meta.ts");
-		expect(paths).toContain("content/api-petstore/pets/_meta.ts");
-		expect(paths).toContain("content/api-petstore/users/_meta.ts");
+		const overrides = buildApiSidebarOverrides([makeInput("petstore", spec)]);
+		// Spec order (users, pets), not alphabetical (pets, users).
+		expect(Object.keys(overrides["/api-petstore"])).toEqual(["users", "pets"]);
 	});
 
-	it("places `index: 'Overview'` first in the spec-folder _meta.ts", () => {
+	it("title-cases tag-group labels so only the order changes, not the displayed label", () => {
 		const spec = makeSpec({
-			tags: [{ name: "pets" }],
-			operations: [makeOp({ tag: "pets" })],
+			tags: [{ name: "user management" }],
+			operations: [makeOp({ tag: "user management" })],
 		});
-		const files = emitSidebarMetas("petstore", spec);
-		const top = files.find((f) => f.path === "content/api-petstore/_meta.ts");
-		expect(top).toBeDefined();
-		const idxOverview = top?.content.indexOf("index: 'Overview'") ?? -1;
-		const idxPets = top?.content.indexOf("'pets': 'pets'") ?? -1;
-		expect(idxOverview).toBeGreaterThan(-1);
-		expect(idxPets).toBeGreaterThan(idxOverview);
+		const overrides = buildApiSidebarOverrides([makeInput("petstore", spec)]);
+		expect(overrides["/api-petstore"]).toEqual({ "user-management": "User Management" });
 	});
 
-	it("emits per-tag entries labelled `METHOD path` in operation declaration order", () => {
+	it("omits `index` from the top-level override (Overview stays MetaGenerator-managed)", () => {
+		const spec = makeSpec({ tags: [{ name: "pets" }], operations: [makeOp({ tag: "pets" })] });
+		const overrides = buildApiSidebarOverrides([makeInput("petstore", spec)]);
+		expect(overrides["/api-petstore"].index).toBeUndefined();
+	});
+
+	it("preserves operation declaration order within a tag", () => {
 		const spec = makeSpec({
 			tags: [{ name: "pets" }],
 			operations: [
-				makeOp({ tag: "pets", operationId: "listpets", method: "get", path: "/pets" }),
-				makeOp({ tag: "pets", operationId: "createpet", method: "post", path: "/pets" }),
+				makeOp({ tag: "pets", operationId: "listpets", summary: "List pets" }),
+				makeOp({ tag: "pets", operationId: "createpet", method: "post", summary: "Create a pet" }),
 			],
 		});
-		const files = emitSidebarMetas("petstore", spec);
-		const tag = files.find((f) => f.path === "content/api-petstore/pets/_meta.ts");
-		expect(tag).toBeDefined();
-		expect(tag?.content).toContain("'listpets': 'GET /pets'");
-		expect(tag?.content).toContain("'createpet': 'POST /pets'");
-		const idxList = tag?.content.indexOf("'listpets'") ?? -1;
-		const idxCreate = tag?.content.indexOf("'createpet'") ?? -1;
-		expect(idxList).toBeGreaterThan(-1);
-		expect(idxCreate).toBeGreaterThan(idxList);
+		const overrides = buildApiSidebarOverrides([makeInput("petstore", spec)]);
+		expect(Object.keys(overrides["/api-petstore/pets"])).toEqual(["listpets", "createpet"]);
+	});
+
+	it("uses the synthesised METHOD-path summary when the spec omits a summary", () => {
+		// SpecParser sets `summary` to `METHOD /path` when the spec has none.
+		const spec = makeSpec({
+			tags: [{ name: "pets" }],
+			operations: [makeOp({ tag: "pets", operationId: "createpet", method: "post", summary: "POST /pets" })],
+		});
+		const overrides = buildApiSidebarOverrides([makeInput("petstore", spec)]);
+		expect(overrides["/api-petstore/pets"].createpet).toBe("POST /pets");
 	});
 
 	it("skips a tag whose operations array is empty", () => {
@@ -85,38 +105,28 @@ describe("emitSidebarMetas", () => {
 			tags: [{ name: "lonely" }, { name: "pets" }],
 			operations: [makeOp({ tag: "pets" })],
 		});
-		const files = emitSidebarMetas("petstore", spec);
-		const paths = files.map((f) => f.path);
-		expect(paths).toContain("content/api-petstore/pets/_meta.ts");
-		expect(paths).not.toContain("content/api-petstore/lonely/_meta.ts");
-		// Top-level _meta.ts also omits the empty tag.
-		const top = files.find((f) => f.path === "content/api-petstore/_meta.ts");
-		expect(top?.content).not.toContain("lonely");
+		const overrides = buildApiSidebarOverrides([makeInput("petstore", spec)]);
+		expect(overrides["/api-petstore/pets"]).toBeDefined();
+		expect(overrides["/api-petstore/lonely"]).toBeUndefined();
 	});
 
-	it("appends an untagged operation under a synthetic group when no matching tag is declared", () => {
-		// `default` is a JS reserved word, so its slug becomes `default-doc`.
-		// The label keeps the original tag string for sidebar display.
-		const spec = makeSpec({
-			tags: [],
-			operations: [makeOp({ tag: "default", operationId: "ping" })],
-		});
-		const files = emitSidebarMetas("petstore", spec);
-		const top = files.find((f) => f.path === "content/api-petstore/_meta.ts");
-		expect(top?.content).toContain("'default-doc': 'default'");
-		expect(files.some((f) => f.path === "content/api-petstore/default-doc/_meta.ts")).toBe(true);
+	it("slugifies the tag in the path key (e.g. reserved 'default' → 'default-doc')", () => {
+		const spec = makeSpec({ tags: [], operations: [makeOp({ tag: "default", operationId: "ping" })] });
+		const overrides = buildApiSidebarOverrides([makeInput("petstore", spec)]);
+		expect(overrides["/api-petstore/default-doc"]).toEqual({ ping: "List pets" });
 	});
 
-	it("escapes JS-significant characters in tag and operationId labels", () => {
-		const spec = makeSpec({
-			tags: [{ name: "tag's" }],
-			operations: [makeOp({ tag: "tag's", operationId: "op'name" })],
+	it("merges multiple specs under their own folder slugs", () => {
+		const a = makeSpec({
+			tags: [{ name: "pets" }],
+			operations: [makeOp({ tag: "pets", operationId: "listpets" })],
 		});
-		const files = emitSidebarMetas("petstore", spec);
-		const top = files.find((f) => f.path === "content/api-petstore/_meta.ts");
-		// The slug doesn't keep the apostrophe (slugify strips it), but the
-		// label literal does — and that label MUST round-trip through single
-		// quotes safely.
-		expect(top?.content).toContain("'tag\\'s'");
+		const b = makeSpec({
+			tags: [{ name: "cars" }],
+			operations: [makeOp({ tag: "cars", operationId: "listcars" })],
+		});
+		const overrides = buildApiSidebarOverrides([makeInput("petstore", a), makeInput("garage", b)]);
+		expect(overrides["/api-petstore/pets"]).toBeDefined();
+		expect(overrides["/api-garage/cars"]).toBeDefined();
 	});
 });

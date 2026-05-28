@@ -38,10 +38,23 @@ export interface OpenApiDocument {
 /** HTTP methods we walk. Lowercase to match OpenAPI keys. */
 export type OpenApiHttpMethod = "get" | "post" | "put" | "patch" | "delete" | "head" | "options";
 
+/**
+ * A single `server.variables` entry. A server `url` may contain `{name}`
+ * templated segments whose allowed/default values come from here — the
+ * renderer-side try-it widget renders an input (or a `<select>` when `enum`
+ * is present) per variable and substitutes them into the request URL.
+ */
+export interface OpenApiServerVariable {
+	default?: string;
+	enum?: string[];
+	description?: string;
+}
+
 /** A `servers[]` entry, on either the spec root or a single operation. */
 export interface OpenApiServerEntry {
 	url: string;
 	description?: string;
+	variables?: Record<string, OpenApiServerVariable>;
 }
 
 /**

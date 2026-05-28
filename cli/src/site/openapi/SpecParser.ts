@@ -20,6 +20,7 @@ import type {
 	OpenApiResponse,
 	OpenApiSecurityScheme,
 	OpenApiServerEntry,
+	OpenApiServerVariable,
 	OpenApiTagEntry,
 	ParsedSpec,
 } from "./Types.js";
@@ -256,6 +257,49 @@ function resolveParameters(root: Record<string, unknown>, raw: unknown): OpenApi
 
 // ─── Top-level extractors ────────────────────────────────────────────────────
 
+/**
+ * Reads a server's `variables` map, keeping only the fields the renderer-side
+ * try-it widget consumes (`default` / `enum` / `description`). Returns
+ * undefined when absent or malformed so it can be spread conditionally.
+ */
+function extractServerVariables(raw: unknown): Record<string, OpenApiServerVariable> | undefined {
+	if (!raw || typeof raw !== "object") {
+		return undefined;
+	}
+	const out: Record<string, OpenApiServerVariable> = {};
+	for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (!value || typeof value !== "object") {
+			continue;
+		}
+		const v = value as { default?: unknown; enum?: unknown; description?: unknown };
+		const variable: OpenApiServerVariable = {};
+		if (typeof v.default === "string") {
+			variable.default = v.default;
+		}
+		if (Array.isArray(v.enum)) {
+			const values = v.enum.filter((e): e is string => typeof e === "string");
+			if (values.length > 0) {
+				variable.enum = values;
+			}
+		}
+		if (typeof v.description === "string") {
+			variable.description = v.description;
+		}
+		out[name] = variable;
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Normalizes one raw `servers[]` entry, carrying `description` + `variables` when present. */
+function toServerEntry(s: OpenApiServerEntry & { variables?: unknown }): OpenApiServerEntry {
+	const variables = extractServerVariables(s.variables);
+	return {
+		url: s.url,
+		...(s.description !== undefined ? { description: s.description } : {}),
+		...(variables ? { variables } : {}),
+	};
+}
+
 /** Reads the spec's top-level `servers` array, dropping malformed entries. */
 function extractServers(spec: OpenApiDocument): OpenApiServerEntry[] {
 	const raw = spec.servers;
@@ -264,10 +308,7 @@ function extractServers(spec: OpenApiDocument): OpenApiServerEntry[] {
 	}
 	return raw
 		.filter((s): s is OpenApiServerEntry => typeof (s as OpenApiServerEntry)?.url === "string")
-		.map((s) => ({
-			url: s.url,
-			...(s.description !== undefined ? { description: s.description } : {}),
-		}));
+		.map(toServerEntry);
 }
 
 /**
@@ -314,12 +355,9 @@ function extractOperationServers(operation: Record<string, unknown>): OpenApiSer
 	if (!Array.isArray(operation.servers)) {
 		return;
 	}
-	const result = (operation.servers as OpenApiServerEntry[])
+	const result = (operation.servers as Array<OpenApiServerEntry & { variables?: unknown }>)
 		.filter((s) => typeof s?.url === "string")
-		.map((s) => ({
-			url: s.url,
-			...(s.description !== undefined ? { description: s.description } : {}),
-		}));
+		.map(toServerEntry);
 	return result.length > 0 ? result : undefined;
 }
 

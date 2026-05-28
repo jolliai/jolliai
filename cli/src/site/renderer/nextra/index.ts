@@ -14,17 +14,18 @@
 import { generateCodeSamples } from "../../openapi/CodeSampleGenerator.js";
 import type { OpenApiPipelineResult } from "../../openapi/Types.js";
 import type { OpenApiSpecInput } from "../SiteRenderer.js";
+import { emitApiNavMethods } from "./ApiNavMethods.js";
 import { emitEndpointData } from "./EndpointDataEmitter.js";
 import { emitEndpointPage, emitRefsFile } from "./EndpointPageEmitter.js";
 import { emitOverviewPage } from "./OverviewPageEmitter.js";
-import { emitSidebarMetas } from "./SidebarMetaEmitter.js";
 import type { TemplateFile } from "./Types.js";
 
+export { EMPTY_API_NAV_METHODS, emitApiNavMethods } from "./ApiNavMethods.js";
 export { generateApiComponents } from "./Components.js";
 export { emitEndpointData } from "./EndpointDataEmitter.js";
 export { emitEndpointPage, emitRefsFile } from "./EndpointPageEmitter.js";
 export { emitOverviewPage } from "./OverviewPageEmitter.js";
-export { emitSidebarMetas } from "./SidebarMetaEmitter.js";
+export { buildApiSidebarOverrides } from "./SidebarMetaEmitter.js";
 export type { TemplateFile } from "./Types.js";
 
 // ─── Per-spec emission ───────────────────────────────────────────────────────
@@ -68,7 +69,6 @@ export function emitNextraOpenApiForSpec(specName: string, pipeline: OpenApiPipe
 		files.push(emitEndpointPage(specName, operation, samples));
 	}
 
-	files.push(...emitSidebarMetas(specName, pipeline.spec));
 	return files;
 }
 
@@ -83,6 +83,12 @@ export function emitNextraOpenApiFiles(specs: OpenApiSpecInput[]): TemplateFile[
 	const files: TemplateFile[] = [];
 	for (const spec of specs) {
 		files.push(...emitNextraOpenApiForSpec(spec.specName, spec.pipeline));
+	}
+	// Route → HTTP-method lookup consumed by the sidebar badge client component.
+	// Only when there are specs — `initProject` writes the empty map otherwise,
+	// so the layout import always resolves.
+	if (specs.length > 0) {
+		files.push(emitApiNavMethods(specs));
 	}
 	return files;
 }

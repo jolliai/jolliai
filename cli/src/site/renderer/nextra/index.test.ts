@@ -51,16 +51,18 @@ function makeInput(overrides: Partial<OpenApiSpecInput> = {}): OpenApiSpecInput 
 // ─── emitNextraOpenApiForSpec ──────────────────────────────────────────────
 
 describe("emitNextraOpenApiForSpec", () => {
-	it("emits overview, _refs, per-operation MDX + JSON, and sidebar metas", () => {
+	it("emits overview, _refs, per-operation MDX + JSON (sidebar labels now come from overrides)", () => {
 		const input = makeInput();
 		const files = emitNextraOpenApiForSpec(input.specName, input.pipeline);
 		const paths = new Set(files.map((f) => f.path));
 		expect(paths.has("content/api-petstore/index.mdx")).toBe(true);
 		expect(paths.has("content/api-petstore/_refs.ts")).toBe(true);
-		expect(paths.has("content/api-petstore/_meta.ts")).toBe(true);
-		expect(paths.has("content/api-petstore/pets/_meta.ts")).toBe(true);
 		expect(paths.has("content/api-petstore/pets/listpets.mdx")).toBe(true);
 		expect(paths.has("content/api-petstore/_data/listpets.json")).toBe(true);
+		// `_meta.ts` is no longer emitted here — sidebar labels are supplied to
+		// MetaGenerator via `buildApiSidebarOverrides` instead.
+		expect(paths.has("content/api-petstore/_meta.ts")).toBe(false);
+		expect(paths.has("content/api-petstore/pets/_meta.ts")).toBe(false);
 	});
 
 	it("synthesises per-operation code samples when the pipeline has no dossiers", () => {
@@ -107,7 +109,7 @@ describe("emitNextraOpenApiForSpec", () => {
 		expect(mdx?.content).toContain("https://api.example.com");
 	});
 
-	it("returns an empty array if the spec has no operations (just overview, refs, top-level _meta)", () => {
+	it("returns only overview + refs when the spec has no operations", () => {
 		const input = makeInput({
 			pipeline: { spec: makeSpec({ operations: [], tags: [] }), dossiers: [] },
 		});
@@ -135,7 +137,14 @@ describe("emitNextraOpenApiFiles", () => {
 		expect(files.some((f) => f.path === "content/api-users/index.mdx")).toBe(true);
 	});
 
-	it("returns an empty array when no specs are provided", () => {
+	it("emits the route→method nav map keyed by endpoint route", () => {
+		const files = emitNextraOpenApiFiles([makeInput()]);
+		const navMap = files.find((f) => f.path === "components/apiNavMethods.ts");
+		expect(navMap).toBeDefined();
+		expect(navMap?.content).toContain('"/api-petstore/pets/listpets": "GET"');
+	});
+
+	it("returns an empty array when no specs are provided (empty map comes from initProject)", () => {
 		expect(emitNextraOpenApiFiles([])).toEqual([]);
 	});
 });

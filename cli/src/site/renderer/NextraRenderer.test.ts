@@ -93,6 +93,8 @@ describe("NextraRenderer", () => {
 				expect(existsSync(join(buildDir, "components", "api", file))).toBe(true);
 			}
 			expect(existsSync(join(buildDir, "styles", "api.css"))).toBe(true);
+			// The empty route→method map is scaffolded so the layout import resolves.
+			expect(existsSync(join(buildDir, "components", "apiNavMethods.ts"))).toBe(true);
 		} finally {
 			await rm(buildDir, { recursive: true, force: true });
 		}
@@ -314,20 +316,19 @@ describe("NextraRenderer.renderOpenApiSpecs", () => {
 		expect(existsSync(join(contentDir, "api-petstore", "_data", "listpets.json"))).toBe(true);
 	});
 
-	it("writes the spec-folder _meta.ts and one _meta.ts per tag folder", async () => {
+	it("writes the route→method nav map keyed by endpoint route", async () => {
 		await new NextraRenderer().renderOpenApiSpecs(contentDir, publicDir, [makeSpecInput()]);
 
-		const topMeta = await readFile(join(contentDir, "api-petstore", "_meta.ts"), "utf-8");
-		expect(topMeta).toContain("index: 'Overview'");
-		expect(topMeta).toContain("'pets': 'pets'");
-
-		const tagMeta = await readFile(join(contentDir, "api-petstore", "pets", "_meta.ts"), "utf-8");
-		expect(tagMeta).toContain("'listpets':");
+		const navMap = await readFile(join(buildDir, "components", "apiNavMethods.ts"), "utf-8");
+		expect(navMap).toContain('"/api-petstore/pets/listpets": "GET"');
 	});
 
-	it("does not write components/api/ — those are scaffold written by initProject", async () => {
+	it("does not write components/api/ scaffold — only the nav-methods map", async () => {
 		await new NextraRenderer().renderOpenApiSpecs(contentDir, publicDir, [makeSpecInput()]);
-		expect(existsSync(join(buildDir, "components"))).toBe(false);
+		// The scaffold components are written by initProject, not by rendering.
+		expect(existsSync(join(buildDir, "components", "api"))).toBe(false);
+		// …but the render does refresh the route→method map.
+		expect(existsSync(join(buildDir, "components", "apiNavMethods.ts"))).toBe(true);
 	});
 
 	it("writes per-spec output for each input when given multiple specs", async () => {

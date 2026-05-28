@@ -49,7 +49,13 @@ interface OperationData {
 	tags: string[];
 	deprecated: boolean;
 	servers: ParsedSpec["servers"];
-	tryItParameters: Array<{ name: string; in: OpenApiParameterLocation; required: boolean; description?: string }>;
+	tryItParameters: Array<{
+		name: string;
+		in: OpenApiParameterLocation;
+		required: boolean;
+		description?: string;
+		schema?: unknown;
+	}>;
 	parameters: {
 		path: OperationParameter[];
 		query: OperationParameter[];
@@ -85,6 +91,12 @@ function buildOperationData(specName: string, operation: OpenApiOperation, parse
 		};
 		if (p.description !== undefined) {
 			entry.description = p.description;
+		}
+		// Carry the value schema so the Try-it form can render a type-appropriate
+		// input (enum select, number spinner, date picker, …) without having to
+		// reconstruct it from the grouped `parameters.{in}` lists at render time.
+		if (p.schema !== undefined) {
+			entry.schema = p.schema;
 		}
 		return entry;
 	});

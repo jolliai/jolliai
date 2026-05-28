@@ -210,6 +210,7 @@ export async function writeScopedNextraLayoutComponent(buildDir: string): Promis
 import { Layout } from "nextra-theme-docs";
 import { useEffect, useMemo, type ComponentProps, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
+import { API_NAV_METHODS } from "./apiNavMethods";
 
 // Pure pageMap-filtering logic — pasted verbatim from
 // SCOPE_PAGE_MAP_RUNTIME_SOURCE in ScopePageMap.ts (a hand-maintained string
@@ -237,6 +238,33 @@ export default function ScopedNextraLayout({ pageMap, children, ...layoutProps }
   useEffect(() => {
     document.documentElement.dataset.jolliMultiSpec = isMultiSpec ? "true" : "false";
   }, [isMultiSpec]);
+
+  // Stamp \`data-api-method\` onto each API endpoint's sidebar link so the theme
+  // can render an HTTP-method chip (Nextra v4 has no sidebar titleComponent and
+  // page-map titles are plain strings, so the badge can't ride the nav data).
+  // Re-runs on navigation and on sidebar DOM changes (collapse/expand). Setting
+  // an attribute doesn't emit childList records, so the observer can't loop.
+  useEffect(() => {
+    if (Object.keys(API_NAV_METHODS).length === 0) return;
+    const stamp = () => {
+      document.querySelectorAll("nav a[href], aside a[href]").forEach((a) => {
+        let path;
+        try {
+          path = new URL(a.href, window.location.origin).pathname.replace(/\\/$/, "");
+        } catch {
+          return;
+        }
+        const method = API_NAV_METHODS[path];
+        if (method && a.getAttribute("data-api-method") !== method) {
+          a.setAttribute("data-api-method", method);
+        }
+      });
+    };
+    stamp();
+    const observer = new MutationObserver(stamp);
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [pathname]);
 
   return (
     <Layout pageMap={scopedPageMap as PageMap} {...layoutProps}>
