@@ -85,6 +85,22 @@ describe("emitEndpointData", () => {
 		expect(data.tryItParameters).toEqual([{ name: "id", in: "path", required: true, description: "ID" }]);
 	});
 
+	it("carries the value schema onto each tryItParameters entry when present", () => {
+		const op = makeOp({
+			parameters: [
+				{ name: "status", in: "query", required: false, schema: { type: "string", enum: ["open", "closed"] } },
+				{ name: "id", in: "path", required: true },
+			],
+		});
+		const data = decode(emitEndpointData("petstore", op, makeSpec()).content) as {
+			tryItParameters: Array<Record<string, unknown>>;
+		};
+		expect(data.tryItParameters).toEqual([
+			{ name: "status", in: "query", required: false, schema: { type: "string", enum: ["open", "closed"] } },
+			{ name: "id", in: "path", required: true },
+		]);
+	});
+
 	it("inlines the request body's example when present", () => {
 		const op = makeOp({
 			requestBody: { required: true, contentType: "application/json", example: { name: "Rex" } },
@@ -158,6 +174,26 @@ describe("emitEndpointData", () => {
 			servers: Array<{ url: string }>;
 		};
 		expect(data.servers).toEqual([{ url: "https://override.example.com" }]);
+	});
+
+	it("carries server variables through into the data sidecar", () => {
+		const spec = makeSpec({
+			servers: [
+				{
+					url: "https://{defaultHost}",
+					variables: { defaultHost: { default: "discourse.example.com", enum: ["a", "b"] } },
+				},
+			],
+		});
+		const data = decode(emitEndpointData("petstore", makeOp(), spec).content) as {
+			servers: Array<{ url: string; variables?: Record<string, unknown> }>;
+		};
+		expect(data.servers).toEqual([
+			{
+				url: "https://{defaultHost}",
+				variables: { defaultHost: { default: "discourse.example.com", enum: ["a", "b"] } },
+			},
+		]);
 	});
 
 	it("preserves apiKey scheme `in` / `name` / `description` when resolving auth schemes", () => {

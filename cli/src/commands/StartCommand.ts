@@ -23,6 +23,7 @@ import { buildPipeline } from "../site/openapi/OpenApiPipeline.js";
 import { deriveSpecName } from "../site/openapi/SpecName.js";
 import { runPagefind } from "../site/PagefindRunner.js";
 import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
+import { buildApiSidebarOverrides } from "../site/renderer/nextra/index.js";
 import type { OpenApiSpecInput } from "../site/renderer/SiteRenderer.js";
 import { escapeHtml, sanitizeUrl } from "../site/Sanitize.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
@@ -253,6 +254,12 @@ async function syncContent(
 		await writeRootRedirectIndex(contentDir, redirectHref);
 	}
 
+	// API endpoint folders get summary labels from their OpenAPI operations.
+	// Merged into whichever sidebar overrides the navigation mode supplies —
+	// `/api-{spec}/{tag}` path keys never collide with doc paths, so API wins
+	// for its own folders and doc overrides are untouched.
+	const apiSidebar = specInputs ? buildApiSidebarOverrides(specInputs) : {};
+
 	if (parsedNavigation) {
 		if (parsedNavigation.rootPages?.length) {
 			rootInjection.structurePages = parsedNavigation.rootPages;
@@ -263,10 +270,10 @@ async function syncContent(
 		if (parsedNavigation.defaultPageHref) {
 			rootInjection.defaultPageHref = parsedNavigation.defaultPageHref;
 		}
-		await renderer.generateNavigation(contentDir, parsedNavigation.sidebar, rootInjection);
-	} else if (sidebar && Object.keys(sidebar).length > 0) {
-		// Legacy sidebar overrides
-		await renderer.generateNavigation(contentDir, sidebar, rootInjection);
+		await renderer.generateNavigation(contentDir, { ...parsedNavigation.sidebar, ...apiSidebar }, rootInjection);
+	} else if ((sidebar && Object.keys(sidebar).length > 0) || Object.keys(apiSidebar).length > 0) {
+		// Legacy sidebar overrides and/or API endpoint labels
+		await renderer.generateNavigation(contentDir, { ...sidebar, ...apiSidebar }, rootInjection);
 	} else {
 		// No navigation, no sidebar — empty sidebar (no filesystem auto-discovery)
 		rootInjection.simpleMode = true;

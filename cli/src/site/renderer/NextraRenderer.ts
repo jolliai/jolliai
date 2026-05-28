@@ -18,7 +18,7 @@ import type { OutputFilter } from "../OutputFilter.js";
 import { createOutputFilter as createFilter } from "../OutputFilter.js";
 import type { NpmRunResult, SidebarOverrides, SiteJson } from "../Types.js";
 import { generateApiCss } from "./nextra/ApiCss.js";
-import { emitNextraOpenApiFiles, generateApiComponents } from "./nextra/index.js";
+import { EMPTY_API_NAV_METHODS, emitNextraOpenApiFiles, generateApiComponents } from "./nextra/index.js";
 import type { TemplateFile } from "./nextra/Types.js";
 import type { ContentRules, OpenApiSpecInput, SiteRenderer } from "./SiteRenderer.js";
 
@@ -71,7 +71,15 @@ export class NextraRenderer implements SiteRenderer {
 		// (228) so the API surface inherits the pack's identity instead of
 		// the unrelated `generateApiCss` fallback (220).
 		const accentHue = resolveApiAccentHue(config);
-		await this.writeFiles(buildDir, [...generateApiComponents(), generateApiCss({ accentHue })]);
+		// `EMPTY_API_NAV_METHODS` is the route→method map the layout imports for
+		// the sidebar method badges. Written empty here so the import always
+		// resolves; `renderOpenApiSpecs` overwrites it with the populated map
+		// when the site has specs.
+		await this.writeFiles(buildDir, [
+			...generateApiComponents(),
+			generateApiCss({ accentHue }),
+			EMPTY_API_NAV_METHODS,
+		]);
 
 		return result;
 	}
