@@ -9,7 +9,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -669,9 +669,13 @@ describe("GitClient", () => {
 			await client.clone(bareRepoUrl);
 			const indexLock = join(memoryBankRoot, ".git", "index.lock");
 			await writeFile(indexLock, "");
-			// Backdate the lock so it's clearly older than the 30 s TTL the
-			// engine uses in production (TTL=0 here makes the assertion
-			// timing-independent regardless of FS clock resolution).
+			// Backdate the lock a minute so its mtime is unambiguously older
+			// than the sweep cutoff. `Date.now()` floors to integer ms while
+			// `mtimeMs` carries sub-ms precision, so a just-written lock can
+			// read as *newer* than a TTL=0 cutoff — backdating removes that
+			// race and makes the assertion truly clock-resolution-independent.
+			const past = new Date(Date.now() - 60_000);
+			await utimes(indexLock, past, past);
 			const result = await client.sweepStaleLockFiles(0);
 			expect(result.removed).toContain(indexLock);
 			// Sanity: lock actually gone from disk.
@@ -686,6 +690,11 @@ describe("GitClient", () => {
 			// `refs/heads/main` already exists (set by clone); the .lock
 			// sibling is the artifact a killed `git update-ref` leaves.
 			await writeFile(branchLock, "");
+			// Backdate so the mtime is unambiguously older than the cutoff —
+			// see the index.lock case above for why a TTL=0 sweep otherwise
+			// races sub-ms `mtimeMs` against floored `Date.now()`.
+			const past = new Date(Date.now() - 60_000);
+			await utimes(branchLock, past, past);
 			const result = await client.sweepStaleLockFiles(0);
 			expect(result.removed).toContain(branchLock);
 		});
