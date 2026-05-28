@@ -73,18 +73,69 @@ $bulletList
 """
 		} else ""
 
-		return """You are analyzing a development conversation to extract important discussion points.
+		return """You are extracting bullet points from a development session to help the user quickly recall what they did.
 $existingSection
 ## Conversation Transcript
 $transcriptText
 
-## Instructions
-Identify any NEW important discussion topics from this conversation that are worth recording as bullet points. Each bullet should be a concise one-line summary capturing a key decision, insight, architectural choice, or action item.
+## Purpose
+These bullets are a personal memory aid. The user should be able to skim them weeks later and think "oh right, that's what I worked on" within about 30 seconds. They are NOT a record of everything noteworthy that came up — they are the handful of things the user themselves would most want to remember.
 
-Return ONLY a JSON array of strings. If nothing noteworthy or new, return an empty array [].
+## Objective
+1. Primary goal: remind the user what they did in this session. They should be able to skim the bullets and immediately recall the session.
+2. Secondary goal: surface the most important information from the session — key decisions, blockers, or context worth remembering later.
 
-Example output:
-["Decided to use WebSocket instead of SSE for real-time updates", "Found root cause of memory leak in connection pool"]
+## Perspective: what the user wanted and how the session felt
+
+These bullets answer "what did I do in this session?" from the user's point of view. The most valuable bullets are high-level statements of the user's intent and the shape of the work — not specific decisions inside it. Think: "what would the user say if a friend asked what they worked on?"
+
+Examples of well-framed bullets:
+- "Designed an MVP for tagging conversations to git branches"
+- "Debugged an OAuth flow that was rejecting valid tokens"
+- "Reviewed and approved Claude's plan for the data-layer rewrite"
+- "Explored whether to use Mem0 or build memory from scratch"
+- "Wrote and iterated on a prompt for generating session summaries"
+
+Match the verb to what the user was actually doing:
+- If the user drove the session by articulating choices in their own words → "decided", "chose", "switched"
+- If Claude proposed most things and the user mostly reviewed/accepted → "reviewed", "approved", "worked through"
+- If the user was debugging or stuck → "debugged", "got stuck on"
+- If the user was designing or planning → "designed", "planned", "specced"
+
+Do NOT fabricate decisive language for a session where the user was mostly riding along — that misrepresents the experience. Saying "Decided to switch to Postgres" when the user only replied "sure" to Claude's proposal is wrong; "Approved Claude's plan to switch to Postgres" is right.
+
+Almost always wrong for a substantive working session: zero bullets. If real work happened, capture it. (Zero is only correct when the session was truly inert, or when the existing bullets already cover everything that occurred.)
+
+## How many bullets
+For a typical multi-hour Claude Code session, aim for 3–4 bullets. Floor is 2, hard ceiling is 5. Fewer than 2 means you're under-capturing the session. More than 5 means you're enumerating micro-decisions instead of summarizing.
+
+Shorter or lower-density sessions can go below the floor (down to 0 if nothing happened), but a multi-hour working session should essentially always produce at least 2.
+
+## What to skip
+- Things Claude explained or taught
+- Individual debugging steps, syntax fixes, or troubleshooting moves (these belong inside a higher-level bullet like "Debugged X", not as their own bullets)
+- Background context or framing discussion
+- Anything already captured in the existing bullets, even if you'd phrase it differently
+
+## Example: high-level vs laundry-list
+
+For a session where the user designed a new feature with Claude:
+
+Right (high-level, 3 bullets):
+["Designed an MVP for tagging conversations to git branches with auto-generated summaries",
+ "Worked through the feature spec — multi-branch tagging via right-click menu, three panel views, summaries generated at commit time",
+ "Iterated on the LLM prompt for those summaries, anchoring it on user intent over micro-decisions"]
+
+Wrong (laundry list of micro-decisions):
+["Decided summaries would be generated at commit time",
+ "Decided summaries would accumulate rather than regenerate",
+ "Decided to use a separate LLM call",
+ "Decided tags would use branch name strings",
+ "Decided to warn when a branch is missing",
+ "Decided the conversations panel would have three views"]
+
+## Output format
+Return ONLY a JSON array of strings. No markdown, no code fences, no commentary. If nothing new is worth adding, return [].
 
 Return the JSON array now:"""
 	}

@@ -31,6 +31,7 @@ object ActiveSessionAggregator {
 	fun listActiveConversationsWithDiagnostics(
 		cwd: String,
 		windowMs: Long = DEFAULT_WINDOW_MS,
+		requireUnread: Boolean = true,
 	): ActiveConversationsResult {
 		val cutoff = System.currentTimeMillis() - windowMs
 
@@ -73,7 +74,7 @@ object ActiveSessionAggregator {
 		// Load transcripts, resolve titles, build items
 		val items = visible.mapNotNull { s ->
 			val unread = safeLoadUnreadMerged(s, cwd)
-			if (unread.isEmpty()) return@mapNotNull null
+			if (requireUnread && unread.isEmpty()) return@mapNotNull null
 
 			val titleEntries = safeLoadMerged(s, cwd)
 			val source = s.source ?: TranscriptSource.claude

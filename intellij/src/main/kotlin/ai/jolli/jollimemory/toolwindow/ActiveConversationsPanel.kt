@@ -127,8 +127,9 @@ class ActiveConversationsPanel(
 			ConversationViewMode.ALL -> WINDOW_7D
 			ConversationViewMode.BRANCH -> WINDOW_7D
 		}
+		val requireUnread = viewMode == ConversationViewMode.ACTIVE
 		val result: ActiveConversationsResult = try {
-			ActiveSessionAggregator.listActiveConversationsWithDiagnostics(cwd, windowMs)
+			ActiveSessionAggregator.listActiveConversationsWithDiagnostics(cwd, windowMs, requireUnread)
 		} catch (e: Exception) {
 			ActiveConversationsResult(emptyList(), emptyList())
 		}

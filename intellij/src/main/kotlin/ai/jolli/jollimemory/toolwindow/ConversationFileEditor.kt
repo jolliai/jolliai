@@ -37,6 +37,9 @@ class ConversationFileEditor(
 	private val item = file.item
 	private val cwd = file.cwd
 
+	/** Max entries to load when falling back to full transcript for consumed sessions. */
+	private val MAX_FULL_TRANSCRIPT_ENTRIES = 50
+
 	/** Raw entries from the source transcript (pre-overlay). Used for identity derivation. */
 	private var rawEntries: List<TranscriptEntry> = emptyList()
 
@@ -126,27 +129,34 @@ class ConversationFileEditor(
 		// BP summary section (between header and transcript)
 		val bpPanel = JPanel().apply {
 			layout = BoxLayout(this, BoxLayout.Y_AXIS)
-			border = JBUI.Borders.empty(0, 16, 8, 16)
+			border = JBUI.Borders.empty(4, 16, 8, 16)
 			isOpaque = true
 			background = JBColor(java.awt.Color(245, 247, 250), java.awt.Color(40, 44, 52))
 			isVisible = item.bpSummary.isNotEmpty()
+			alignmentX = Component.LEFT_ALIGNMENT
 		}
 		if (item.bpSummary.isNotEmpty()) {
 			bpPanel.add(JBLabel("Key Points").apply {
 				font = font.deriveFont(Font.BOLD)
 				border = JBUI.Borders.emptyBottom(4)
+				alignmentX = Component.LEFT_ALIGNMENT
 			})
 			for (bullet in item.bpSummary) {
-				bpPanel.add(JBLabel("  \u2022  ${bullet.text}").apply {
-					border = JBUI.Borders.emptyBottom(2)
+				bpPanel.add(JTextArea("\u2022  ${bullet.text}").apply {
+					isEditable = false
+					lineWrap = true
+					wrapStyleWord = true
+					isOpaque = false
+					border = JBUI.Borders.empty(0, 4, 4, 0)
+					font = UIManager.getFont("Label.font")
+					alignmentX = Component.LEFT_ALIGNMENT
 				})
 			}
 		}
 
-		val topContainer = JPanel().apply {
-			layout = BoxLayout(this, BoxLayout.Y_AXIS)
-			add(header)
-			add(bpPanel)
+		val topContainer = JPanel(BorderLayout()).apply {
+			add(header, BorderLayout.NORTH)
+			add(bpPanel, BorderLayout.CENTER)
 		}
 
 		rootPanel.add(topContainer, BorderLayout.NORTH)
@@ -165,7 +175,11 @@ class ConversationFileEditor(
 				updatedAt = item.updatedAt,
 				source = source,
 			)
-			val raw = TranscriptMessageCounter.loadUnreadTranscript(source, item.transcriptPath, cwd)
+			var raw = TranscriptMessageCounter.loadUnreadTranscript(source, item.transcriptPath, cwd)
+			// If unread is empty (cursor past EOF), fall back to full transcript tail
+			if (raw.isEmpty()) {
+				raw = TranscriptMessageCounter.loadMergedTranscript(session, cwd).takeLast(MAX_FULL_TRANSCRIPT_ENTRIES)
+			}
 			val overlay = ConversationOverlayStore.loadOverlay(
 				OverlayKey(cwd, source, item.sessionId),
 			)
