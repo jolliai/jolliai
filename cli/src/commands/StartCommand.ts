@@ -17,6 +17,7 @@ import {
 	buildNavigationContentPlan,
 	validateNavigationPaths,
 } from "../site/ContentPlanner.js";
+import { discoverCustomScripts } from "../site/CustomScripts.js";
 import type { RootApiSpec, RootInjectionInput } from "../site/MetaGenerator.js";
 import { needsInstall, runNpmInstall, runNpmStart } from "../site/NpmRunner.js";
 import { buildPipeline } from "../site/openapi/OpenApiPipeline.js";
@@ -527,12 +528,21 @@ async function prepareContent(
 		}
 	}
 
+	// Discover the content root's `.jolli/scripts/` assets before scaffolding so
+	// the layout emits the `CustomScripts` component referencing them. The bytes
+	// are bundled into `public/scripts/` separately during `mirrorContent` (both
+	// use the same `discoverCustomScripts` helper, so they stay in sync). Custom
+	// scripts are layout-level: adding/removing a file needs a restart, like the
+	// theme — `mirrorContent` still re-copies edited contents on every dev sync.
+	const customScriptAssets = (await discoverCustomScripts(sourceRoot)).map((s) => s.asset);
+
 	// Initialize build directory
 	verbose(`Initializing build directory… (${buildDir})`, v);
 	await renderer.initProject(buildDir, siteJsonResult.config, {
 		staticExport,
 		sourceRoot,
 		themePath: opts.theme,
+		customScriptAssets,
 	});
 
 	// Clear caches

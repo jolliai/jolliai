@@ -82,6 +82,8 @@ describe("startSourceWatcher", () => {
 		expect(stub.options?.ignored).toContain("**/.git/**");
 		expect(stub.options?.ignored).toContain("**/node_modules/**");
 		expect(stub.options?.ignored).toContain("**/.jolli-site/**");
+		// Jolli Memory churn must not trigger rebuilds; .jolli/scripts/ stays watched.
+		expect(stub.options?.ignored).toContain("**/.jolli/jollimemory/**");
 		expect(stub.options?.ignored).toContain("**/.next/**");
 
 		void watcher.close();

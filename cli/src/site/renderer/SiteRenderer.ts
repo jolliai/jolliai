@@ -12,7 +12,7 @@ import type { RootInjectionInput } from "../MetaGenerator.js";
 import type { ServerResult } from "../NpmRunner.js";
 import type { OutputFilter } from "../OutputFilter.js";
 import type { OpenApiPipelineResult } from "../openapi/Types.js";
-import type { NpmRunResult, SidebarOverrides, SiteJson } from "../Types.js";
+import type { CustomScriptAsset, NpmRunResult, SidebarOverrides, SiteJson } from "../Types.js";
 
 // ─── ContentRules ───────────────────────────────────────────────────────────
 
@@ -61,11 +61,20 @@ export interface SiteRenderer {
 	/**
 	 * Initialize (or update) the build project scaffold in `buildDir`.
 	 * Creates package.json, config files, layout files, etc.
+	 *
+	 * `customScriptAssets` are the inject descriptors for the content root's
+	 * `.jolli/scripts/` files; the renderer emits a `CustomScripts` component
+	 * wired into the universal layout so they load on every page.
 	 */
 	initProject(
 		buildDir: string,
 		config: SiteJson,
-		options: { staticExport?: boolean; sourceRoot?: string; themePath?: string },
+		options: {
+			staticExport?: boolean;
+			sourceRoot?: string;
+			themePath?: string;
+			customScriptAssets?: CustomScriptAsset[];
+		},
 	): Promise<{ isNew: boolean }>;
 
 	/**

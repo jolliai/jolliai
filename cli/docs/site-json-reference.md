@@ -31,6 +31,8 @@ Run `jolli dev .` in the folder containing this file to start a dev server.
 | `theme` | `ThemeConfig` | No | Visual theme pack and branding options. |
 | `branding` | `BrandingConfig` | No | Deprecated nested-shape alias for `theme`. Coerced at load time; `theme.*` wins on conflict. New site.json files should use `theme` directly. |
 
+> **Custom scripts** (analytics, chat widgets, custom CSS) are **not** a `site.json` field — they use a file convention: drop `.js`/`.css` files into a `.jolli/scripts/` folder at your Content_Folder root. See [Custom Scripts](#custom-scripts-jolliscripts) below.
+
 ### How navbar entries reach the browser
 
 `header.items` and `nav` are NOT spliced into the layout JSX as `<a>` / `<details>` tags. The CLI writes them into the **root `content/_meta.js`** so Nextra's `<Navbar>` renders them as native page tabs — the chevron on dropdowns, the hover styling, and the mobile-drawer integration come from Nextra and not from custom JSX.
@@ -296,6 +298,65 @@ Remaps source folder paths to different locations in the generated site. Useful 
 ```
 
 This maps `sql/` in your source folder to `pipelines/sql/` in the site content.
+
+---
+
+## Custom Scripts (`.jolli/scripts/`)
+
+A raw escape-hatch for injecting third-party scripts and styles — Google Analytics, Google Tag Manager, Intercom/Crisp/Drift chat widgets, custom CSS — into every page of your site. This is a **file convention**, not a `site.json` field.
+
+Commit `.js` / `.css` files into a `.jolli/scripts/` folder at the root of your Content_Folder:
+
+```
+my-docs/
+├── site.json
+├── index.md
+└── .jolli/
+    └── scripts/
+        ├── analytics.js     → loaded on every page via <Script> (afterInteractive)
+        └── theme.css        → injected on every page as <link rel="stylesheet">
+```
+
+- `*.js` files are bundled to `public/scripts/` and loaded on every page with Next.js `<Script strategy="afterInteractive">`.
+- `*.css` files are bundled to `public/scripts/` and rendered as a hoistable `<link rel="stylesheet">`.
+- Sub-folders are preserved: `.jolli/scripts/vendor/widget.js` is served at `/scripts/vendor/widget.js`.
+
+Injection is theme-independent — it works for the `forge`, `atlas`, and `default` packs and any custom theme pack with no theme cooperation required.
+
+### Why `.jolli/scripts/` and not a bare `scripts/`?
+
+The folder is namespaced under `.jolli/` (Jolli's reserved directory) so it can't collide with a `scripts/` folder you already use for build tooling — only files explicitly placed under `.jolli/scripts/` are injected. The rest of `.jolli/` is reserved too: markdown or OpenAPI files placed anywhere under `.jolli/` are never published as doc pages or API references.
+
+### Hygiene limits
+
+| Limit | Value |
+|-------|-------|
+| Max file size | 64 KB per file (larger files are skipped with a warning) |
+| Max files | 20 (sorted by name; extras beyond 20 are skipped) |
+
+### Compatibility
+
+- ✅ **Inline bootstraps work directly** (Intercom, Crisp, Drift, HubSpot, GTM, GA4) — the account ID is a value inside the snippet, so paste the snippet body into `.jolli/scripts/<name>.js`.
+- ⚠️ **Single `<script src=… data-*=…>` tags** (e.g. Plausible's `data-domain`, Fathom's `data-site`) need a tiny JS loader instead — create the element and set its attributes in a `.js` file:
+
+  ```js
+  // .jolli/scripts/plausible.js
+  const s = document.createElement("script");
+  s.src = "https://plausible.io/js/script.js";
+  s.defer = true;
+  s.setAttribute("data-domain", "example.com");
+  document.head.appendChild(s);
+  ```
+
+### Security
+
+There is **no server-side sanitization** — the files live in your own repository (the same trust boundary as the rest of your content and config). Only the size/count hygiene limits above are enforced.
+
+> ⚠️ Scripts injected on a password-protected site run in the authenticated visitor's context and can read their session. Only commit scripts you trust, the same as any first-party code on your site.
+
+### Applying changes
+
+Custom scripts are resolved when the build directory is scaffolded. Under `jolli dev`, **adding or removing** a script file requires a dev-server restart (the same as changing your theme), while **editing the contents** of an existing script hot-reloads on the next change.
 
 ---
 

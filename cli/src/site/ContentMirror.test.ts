@@ -1192,6 +1192,88 @@ describe("ContentMirror.mirrorContent ensureIndexPage", () => {
 
 // ─── mirrorContent with publicDir (missing image resolution) ─────────────────
 
+describe("ContentMirror.mirrorContent reserved .jolli/ namespace (JOLLI-1505)", () => {
+	let sourceRoot: string;
+	let contentDir: string;
+	let publicDir: string;
+
+	beforeEach(async () => {
+		sourceRoot = await makeTempDir();
+		contentDir = await makeTempDir();
+		publicDir = await makeTempDir();
+	});
+
+	afterEach(async () => {
+		await rm(sourceRoot, { recursive: true, force: true });
+		await rm(contentDir, { recursive: true, force: true });
+		await rm(publicDir, { recursive: true, force: true });
+	});
+
+	it("never mirrors markdown / images / OpenAPI specs under .jolli/", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await mkdir(join(sourceRoot, ".jolli", "jollimemory"), { recursive: true });
+		await writeFile(join(sourceRoot, ".jolli", "jollimemory", "notes.md"), "# secret notes", "utf-8");
+		await writeFile(join(sourceRoot, ".jolli", "api.yaml"), OPENAPI_YAML, "utf-8");
+		await writeFile(join(sourceRoot, ".jolli", "logo.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+		// A real doc at root must still be mirrored.
+		await writeFile(join(sourceRoot, "real.md"), "# Real", "utf-8");
+
+		const result = await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		const allClassified = [
+			...result.markdownFiles,
+			...result.imageFiles,
+			...result.openapiFiles,
+			...result.ignoredFiles,
+		];
+		expect(allClassified.some((f) => f.includes(".jolli/"))).toBe(false);
+		expect(Object.keys(result.openapiDocs).some((k) => k.includes(".jolli/"))).toBe(false);
+		expect(result.markdownFiles).toContain("real.md");
+	});
+
+	it("does NOT reserve a bare scripts/ folder at the content root", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		// A customer's own build `scripts/` folder is ordinary content — a .md there
+		// is still mirrored; only `.jolli/scripts/` is the injection escape-hatch.
+		await mkdir(join(sourceRoot, "scripts"), { recursive: true });
+		await writeFile(join(sourceRoot, "scripts", "guide.md"), "# Build", "utf-8");
+
+		const result = await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		expect(result.markdownFiles).toContain("scripts/guide.md");
+	});
+
+	it("bundles .jolli/scripts/*.{js,css} into public/scripts/ and reports them in customScriptAssets", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await mkdir(join(sourceRoot, ".jolli", "scripts"), { recursive: true });
+		await writeFile(join(sourceRoot, ".jolli", "scripts", "analytics.js"), "console.log('a')", "utf-8");
+		await writeFile(join(sourceRoot, ".jolli", "scripts", "theme.css"), "body{}", "utf-8");
+		// A bare scripts/ build file must NOT be bundled.
+		await mkdir(join(sourceRoot, "scripts"), { recursive: true });
+		await writeFile(join(sourceRoot, "scripts", "build.js"), "x", "utf-8");
+
+		const result = await mirrorContent(sourceRoot, contentDir, undefined, publicDir);
+
+		expect(result.customScriptAssets).toEqual([
+			{ url: "/scripts/analytics.js", type: "js" },
+			{ url: "/scripts/theme.css", type: "css" },
+		]);
+		expect(existsSync(join(publicDir, "scripts", "analytics.js"))).toBe(true);
+		expect(existsSync(join(publicDir, "scripts", "theme.css"))).toBe(true);
+		expect(existsSync(join(publicDir, "scripts", "build.js"))).toBe(false);
+	});
+
+	it("leaves customScriptAssets empty when no publicDir is provided", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await mkdir(join(sourceRoot, ".jolli", "scripts"), { recursive: true });
+		await writeFile(join(sourceRoot, ".jolli", "scripts", "analytics.js"), "x", "utf-8");
+
+		const result = await mirrorContent(sourceRoot, contentDir);
+
+		expect(result.customScriptAssets).toEqual([]);
+	});
+});
+
 describe("ContentMirror.mirrorContent with publicDir", () => {
 	let sourceRoot: string;
 	let contentDir: string;

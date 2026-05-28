@@ -994,6 +994,27 @@ describe("StartCommand additional branches", () => {
 		const output = consoleSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
 		expect(output).toContain("Indexed 0 pages");
 	});
+
+	it("threads the content root's .jolli/scripts/ assets into initProject (JOLLI-1505)", async () => {
+		// `CustomScripts.js` is not mocked, so `discoverCustomScripts` reads the
+		// real temp source folder; everything downstream (mirror/init) is mocked.
+		setupSuccessfulRun();
+		const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+		const { tmpdir } = await import("node:os");
+		const srcRoot = await mkdtemp(join(tmpdir(), "jolli-startcmd-scripts-"));
+		try {
+			await mkdir(join(srcRoot, ".jolli", "scripts"), { recursive: true });
+			await writeFile(join(srcRoot, ".jolli", "scripts", "analytics.js"), "console.log('a')", "utf-8");
+
+			const program = await makeProgram();
+			await program.parseAsync(["build", srcRoot], { from: "user" });
+
+			const options = mockInitNextraProject.mock.calls.at(-1)?.[2] as { customScriptAssets?: unknown };
+			expect(options?.customScriptAssets).toEqual([{ url: "/scripts/analytics.js", type: "js" }]);
+		} finally {
+			await rm(srcRoot, { recursive: true, force: true });
+		}
+	});
 });
 
 // ─── buildRootInjectionInput unit tests ──────────────────────────────────────
@@ -1014,6 +1035,7 @@ describe("buildRootInjectionInput", () => {
 		imageFiles: [],
 		ignoredFiles: [],
 		downgradedCount: 0,
+		customScriptAssets: [],
 	};
 
 	it("returns headerItems unchanged when populated, ignoring legacy nav", async () => {
