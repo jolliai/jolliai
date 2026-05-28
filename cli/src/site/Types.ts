@@ -448,6 +448,21 @@ export interface ScaffoldResult {
 	message?: string;
 }
 
+/**
+ * A customer-provided custom script/style asset to inject on every page.
+ *
+ * Sourced from `.js`/`.css` files in the content root's `.jolli/scripts/` folder —
+ * a raw escape-hatch for analytics, chat widgets, custom CSS, etc. The asset
+ * bytes are bundled into `public/scripts/` (see `ContentMirror`); the generated
+ * `CustomScripts` component only references them via this descriptor.
+ */
+export interface CustomScriptAsset {
+	/** Absolute site path the asset is served at, e.g. `"/scripts/analytics.js"`. */
+	url: string;
+	/** Inject as an executable `<Script>` (`js`) or a stylesheet `<link>` (`css`). */
+	type: "js" | "css";
+}
+
 /** Returned by ContentMirror.mirrorContent */
 export interface MirrorResult {
 	/** Relative paths of mirrored markdown files */
@@ -468,6 +483,16 @@ export interface MirrorResult {
 	downgradedCount: number;
 	/** If a file with `slug: /` was renamed to index.md, this is the old key (e.g. "what-is-feldera") */
 	renamedToIndex?: string;
+	/**
+	 * Report of the custom-script assets bundled into `public/scripts/` from the
+	 * content root's `.jolli/scripts/` folder. Empty when the folder is absent (or
+	 * when `mirrorContent` is called without a `publicDir`). The generated
+	 * `CustomScripts` component injects the same set on every page — it's wired
+	 * from a sibling `discoverCustomScripts` pass at scaffold time (see
+	 * `StartCommand`), not from this field, but both derive deterministically from
+	 * the same folder so they stay in lockstep.
+	 */
+	customScriptAssets: CustomScriptAsset[];
 }
 
 /** Returned by NpmRunner functions */

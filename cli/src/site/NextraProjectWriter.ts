@@ -19,6 +19,7 @@ import { sanitizeUrl } from "./Sanitize.js";
 import { SCOPE_PAGE_MAP_RUNTIME_SOURCE } from "./ScopePageMap.js";
 import type {
 	AnchorItem,
+	CustomScriptAsset,
 	FooterConfig,
 	HeaderConfig,
 	LogoDisplay,
@@ -76,7 +77,12 @@ export interface NextraProjectConfig {
 export async function initNextraProject(
 	buildDir: string,
 	config: NextraProjectConfig,
-	options: { staticExport?: boolean; sourceRoot?: string; themePath?: string } = {},
+	options: {
+		staticExport?: boolean;
+		sourceRoot?: string;
+		themePath?: string;
+		customScriptAssets?: CustomScriptAsset[];
+	} = {},
 ): Promise<{ isNew: boolean }> {
 	const isNew = !existsSync(buildDir);
 
@@ -104,7 +110,15 @@ export async function initNextraProject(
 	await writeFile(join(buildDir, "app", "[[...mdxPath]]", "page.tsx"), generateCatchAllPage(), "utf-8");
 	await writeFile(join(buildDir, "mdx-components.tsx"), generateMdxComponents(), "utf-8");
 	await writeFile(join(buildDir, "tsconfig.json"), generateTsConfig(), "utf-8");
-	await writeScopedNextraLayoutComponent(buildDir);
+	const customScriptAssets = options.customScriptAssets ?? [];
+	await writeScopedNextraLayoutComponent(buildDir, customScriptAssets);
+	// Custom-scripts escape-hatch (JOLLI-1505): emit the `CustomScripts`
+	// component only when the content root's `.jolli/scripts/` folder has assets.
+	// It's rendered exclusively by `<ScopedNextraLayout>` (above), so injection
+	// is theme-pack-independent.
+	if (customScriptAssets.length > 0) {
+		await writeCustomScriptsComponent(buildDir, customScriptAssets);
+	}
 	// SidebarTabs component for the sidebar tab switcher.
 	// Uses Nextra's useConfig() hook — always written since the component
 	// self-hides when fewer than 2 top-level page items exist.
@@ -188,9 +202,29 @@ function validateThemeCapabilities(provider: ThemePackProvider, navigation: Navi
  * filter function + helpers into one ready-to-inline string. The same
  * helpers are unit-tested in `ScopePageMap.test.ts` so behaviour changes
  * propagate to both the tests and the emitted client.
+ *
+ * When `customScriptAssets` is non-empty, the wrapper also imports and renders
+ * `<CustomScripts />` (JOLLI-1505) so the customer's `.jolli/scripts/` assets
+ * load on every page regardless of the active theme pack. The import + render
+ * slot are only emitted when scripts exist, so sites without custom scripts are
+ * byte-for-byte identical to before.
  */
-export async function writeScopedNextraLayoutComponent(buildDir: string): Promise<void> {
+export async function writeScopedNextraLayoutComponent(
+	buildDir: string,
+	customScriptAssets: ReadonlyArray<CustomScriptAsset> = [],
+): Promise<void> {
 	await mkdir(join(buildDir, "components"), { recursive: true });
+	const hasCustomScripts = customScriptAssets.length > 0;
+	const customScriptsImport = hasCustomScripts ? '\nimport CustomScripts from "./CustomScripts";' : "";
+	const layoutJsx = `<Layout pageMap={scopedPageMap as PageMap} {...layoutProps}>
+      {children}
+    </Layout>`;
+	const renderedLayout = hasCustomScripts
+		? `<>
+      <CustomScripts />
+      ${layoutJsx}
+    </>`
+		: layoutJsx;
 	// `// @ts-nocheck` disables type-checking for the whole file because the
 	// embedded helpers (above the React component) are pasted from a plain JS
 	// string (`SCOPE_PAGE_MAP_RUNTIME_SOURCE` in `ScopePageMap.ts`) that carries
@@ -209,7 +243,7 @@ export async function writeScopedNextraLayoutComponent(buildDir: string): Promis
 
 import { Layout } from "nextra-theme-docs";
 import { useEffect, useMemo, type ComponentProps, type ReactNode } from "react";
-import { usePathname } from "next/navigation";
+import { usePathname } from "next/navigation";${customScriptsImport}
 import { API_NAV_METHODS } from "./apiNavMethods";
 
 // Pure pageMap-filtering logic — pasted verbatim from
@@ -267,13 +301,55 @@ export default function ScopedNextraLayout({ pageMap, children, ...layoutProps }
   }, [pathname]);
 
   return (
-    <Layout pageMap={scopedPageMap as PageMap} {...layoutProps}>
-      {children}
-    </Layout>
+    ${renderedLayout}
   );
 }
 `;
 	await writeFile(join(buildDir, "components", "ScopedNextraLayout.tsx"), content, "utf-8");
+}
+
+// ─── writeCustomScriptsComponent ─────────────────────────────────────────────
+
+/**
+ * Emits `<buildDir>/components/CustomScripts.tsx` — renders the customer's
+ * `.jolli/scripts/`-folder assets on every page (JOLLI-1505). `.js` files load
+ * via `next/script` (`afterInteractive`, which guarantees execution + dedupe and
+ * works from a non-root component); `.css` files render as hoistable stylesheet
+ * `<link>`s (React hoists them into `<head>`).
+ *
+ * Rendered exclusively by the universal `<ScopedNextraLayout>` so injection is
+ * theme-pack-independent. The asset list is embedded via `JSON.stringify` — that
+ * escaping (not any sanitization) is what guarantees a filename-derived URL can
+ * never break out of the generated module's string literal.
+ */
+export async function writeCustomScriptsComponent(
+	buildDir: string,
+	assets: ReadonlyArray<CustomScriptAsset>,
+): Promise<void> {
+	await mkdir(join(buildDir, "components"), { recursive: true });
+	const content = `"use client";
+
+import Script from "next/script";
+
+type CustomScriptAsset = { url: string; type: "js" | "css" };
+
+const ASSETS: CustomScriptAsset[] = ${JSON.stringify(assets)};
+
+export default function CustomScripts() {
+  return (
+    <>
+      {ASSETS.map(asset =>
+        asset.type === "css" ? (
+          <link key={asset.url} rel="stylesheet" href={asset.url} precedence="default" />
+        ) : (
+          <Script key={asset.url} src={asset.url} strategy="afterInteractive" />
+        ),
+      )}
+    </>
+  );
+}
+`;
+	await writeFile(join(buildDir, "components", "CustomScripts.tsx"), content, "utf-8");
 }
 
 // ─── writeSidebarTabsComponent ──────────────────────────────────────────────

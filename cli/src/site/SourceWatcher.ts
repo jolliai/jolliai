@@ -26,8 +26,8 @@ export interface SourceWatcherOptions {
 	debounceMs?: number;
 	/**
 	 * Glob patterns to ignore in addition to the built-in defaults
-	 * (`.git/`, `node_modules/`, `.jolli-site/`, `.next/`, `dist/`,
-	 * `build/`, `out/`).
+	 * (`.git/`, `node_modules/`, `.jolli-site/`, `.jolli/jollimemory/`,
+	 * `.next/`, `dist/`, `build/`, `out/`).
 	 */
 	ignored?: string[];
 	/**
@@ -51,6 +51,10 @@ const BUILTIN_IGNORED = [
 	"**/.git/**",
 	"**/node_modules/**",
 	"**/.jolli-site/**",
+	// Jolli Memory writes here on every commit; ignore it so memory churn doesn't
+	// trigger rebuild loops. The sibling `.jolli/scripts/` folder stays watched so
+	// editing a custom script re-bundles it.
+	"**/.jolli/jollimemory/**",
 	"**/.next/**",
 	"**/dist/**",
 	"**/build/**",

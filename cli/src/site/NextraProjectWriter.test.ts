@@ -1032,3 +1032,77 @@ describe("Property 5: site.json fields are preserved in generated Nextra config"
 		);
 	});
 });
+
+// ─── Custom scripts (JOLLI-1505) ──────────────────────────────────────────────
+
+/**
+ * These call `writeScopedNextraLayoutComponent` / `writeCustomScriptsComponent`
+ * directly (not via `initNextraProject`) so they don't race `discoverPack`'s
+ * GitHub registry roundtrip — same rationale as the SidebarTabs tests above.
+ */
+describe("NextraProjectWriter custom scripts (JOLLI-1505)", () => {
+	let buildDir: string;
+
+	beforeEach(async () => {
+		buildDir = await makeTempDir();
+	});
+
+	afterEach(async () => {
+		await rm(buildDir, { recursive: true, force: true });
+	});
+
+	const ASSETS = [
+		{ url: "/scripts/analytics.js", type: "js" as const },
+		{ url: "/scripts/theme.css", type: "css" as const },
+	];
+
+	it("writeCustomScriptsComponent emits a <Script> per js and a stylesheet <link> per css", async () => {
+		const { writeCustomScriptsComponent } = await import("./NextraProjectWriter.js");
+
+		await writeCustomScriptsComponent(buildDir, ASSETS);
+
+		const content = await readFile(join(buildDir, "components", "CustomScripts.tsx"), "utf-8");
+		expect(content).toContain('"use client"');
+		expect(content).toContain('import Script from "next/script"');
+		expect(content).toContain('"/scripts/analytics.js"');
+		expect(content).toContain('"/scripts/theme.css"');
+		expect(content).toContain('strategy="afterInteractive"');
+		expect(content).toContain('rel="stylesheet"');
+	});
+
+	it("embeds asset URLs via JSON so a hostile filename cannot break out of the module", async () => {
+		const { writeCustomScriptsComponent } = await import("./NextraProjectWriter.js");
+		const evil = [{ url: '/scripts/"; evil()//.js', type: "js" as const }];
+
+		await writeCustomScriptsComponent(buildDir, evil);
+
+		const content = await readFile(join(buildDir, "components", "CustomScripts.tsx"), "utf-8");
+		// JSON.stringify escapes the embedded quote rather than terminating the literal.
+		expect(content).toContain(JSON.stringify(evil));
+	});
+
+	it("writeScopedNextraLayoutComponent imports + renders <CustomScripts /> only when assets are present", async () => {
+		const { writeScopedNextraLayoutComponent } = await import("./NextraProjectWriter.js");
+
+		await writeScopedNextraLayoutComponent(buildDir, ASSETS);
+
+		const content = await readFile(join(buildDir, "components", "ScopedNextraLayout.tsx"), "utf-8");
+		expect(content).toContain('import CustomScripts from "./CustomScripts"');
+		expect(content).toContain("<CustomScripts />");
+	});
+
+	it("leaves ScopedNextraLayout free of CustomScripts when there are no assets (byte-identical to before)", async () => {
+		const { writeScopedNextraLayoutComponent } = await import("./NextraProjectWriter.js");
+
+		const withScripts = join(buildDir, "with");
+		const without = join(buildDir, "without");
+		await writeScopedNextraLayoutComponent(withScripts, []);
+		await writeScopedNextraLayoutComponent(without);
+
+		const a = await readFile(join(withScripts, "components", "ScopedNextraLayout.tsx"), "utf-8");
+		const b = await readFile(join(without, "components", "ScopedNextraLayout.tsx"), "utf-8");
+		expect(a).not.toContain("CustomScripts");
+		// Default arg and explicit [] produce identical output.
+		expect(a).toBe(b);
+	});
+});

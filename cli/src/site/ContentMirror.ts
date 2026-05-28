@@ -3,13 +3,17 @@
  *
  * Classifies files by extension (and content for OpenAPI), then copies
  * markdown and image files to the corresponding paths inside the content directory.
- * Skips the `.jolli-site/` directory to avoid infinite recursion.
+ * Skips the `.jolli-site/` directory to avoid infinite recursion and the reserved
+ * `.jolli/` namespace (tool-owned — custom scripts, Jolli Memory). Files under
+ * `.jolli/scripts/` are bundled into `public/scripts/` separately (see
+ * `bundleCustomScripts`), not mirrored as docs.
  */
 
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { copyExternalAsset, resolveExternalImage } from "./AssetResolver.js";
+import { bundleCustomScripts, isReservedJolliPath } from "./CustomScripts.js";
 import { tryParseOpenApi } from "./openapi/SpecLoader.js";
 import type { ContentRules } from "./renderer/SiteRenderer.js";
 import type { FileType, MirrorResult, PathMappings } from "./Types.js";
@@ -445,7 +449,9 @@ export async function clearDir(dir: string): Promise<void> {
  * classifies every file, and copies markdown and image files to the
  * corresponding relative path inside the content directory.
  *
- * Skips the `.jolli-site/` directory to avoid infinite recursion (4.7).
+ * Skips the `.jolli-site/` directory to avoid infinite recursion (4.7) and the
+ * reserved `.jolli/` namespace. When `publicDir` is provided, bundles any
+ * `.jolli/scripts/*.{js,css}` into `public/scripts/` (see `bundleCustomScripts`).
  *
  * Returns a `MirrorResult` with the relative paths of all classified files.
  */
@@ -466,9 +472,18 @@ export async function mirrorContent(
 		imageFiles: [],
 		ignoredFiles: [],
 		downgradedCount: 0,
+		customScriptAssets: [],
 	};
 
 	await walkDir(sourceRoot, sourceRoot, contentDir, result, pathMappings, contentRules, publicDir);
+
+	// Custom-scripts escape-hatch: bundle the content root's `.jolli/scripts/`
+	// `.js`/`.css` files into `public/scripts/`. Runs after the walk (which skips
+	// the reserved `.jolli/` namespace) so editing a script re-copies it on every
+	// dev sync. The derived inject list drives the `CustomScripts` component.
+	if (publicDir) {
+		result.customScriptAssets = await bundleCustomScripts(sourceRoot, publicDir);
+	}
 
 	// If no index.md exists at root, look for a file with `slug: /` frontmatter
 	// (common in Docusaurus projects) and rename it to index.md
@@ -621,6 +636,14 @@ async function walkDir(
 
 		// 4.7 — Skip .jolli-site/ to avoid infinite recursion
 		if (entry === ".jolli-site") {
+			continue;
+		}
+
+		// Reserved Jolli namespace (.jolli/) is tool-owned — custom scripts
+		// (.jolli/scripts/), Jolli Memory, etc. Never mirror it as docs or scan
+		// it for OpenAPI specs. Bundling of .jolli/scripts/ happens separately in
+		// `mirrorContent`. A bare `scripts/` folder is unaffected.
+		if (isReservedJolliPath(relative(sourceRoot, fullPath).replace(/\\/g, "/"))) {
 			continue;
 		}
 
