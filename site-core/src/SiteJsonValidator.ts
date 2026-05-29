@@ -72,22 +72,27 @@ export function validateSiteJsonShape(parsed: unknown): ValidationIssue[] {
 // ─── Top-level rules ─────────────────────────────────────────────────────────
 
 function validateTitle(root: Record<string, unknown>, issues: ValidationIssue[]): void {
+	// `title` issues are warnings, not errors: `readSiteJson` falls back to
+	// `DEFAULT_SITE_JSON.title` so the build can still proceed. We still
+	// want the user to know about the malformed field — silent fallback
+	// is exactly what produces the "my site has the wrong title and I
+	// can't tell why" support tickets we're trying to head off.
 	if (root.title === undefined) {
 		issues.push({
-			severity: "error",
+			severity: "warning",
 			code: "missing-title",
 			path: ["title"],
-			message: "site.json is missing the required `title` field.",
-			hint: 'Add `"title": "Your Site Name"` at the top of site.json.',
+			message: "site.json is missing the `title` field. Falling back to the default site title.",
+			hint: 'Add `"title": "Your Site Name"` at the top of site.json to suppress this warning.',
 		});
 		return;
 	}
 	if (typeof root.title !== "string") {
 		issues.push({
-			severity: "error",
+			severity: "warning",
 			code: "title-not-string",
 			path: ["title"],
-			message: `\`title\` must be a string, got ${describeType(root.title)}.`,
+			message: `\`title\` must be a string, got ${describeType(root.title)}. Falling back to the default site title.`,
 		});
 	}
 }
