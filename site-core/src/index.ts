@@ -23,7 +23,10 @@ export const VERSION = "0.0.0";
 
 // ─── Color utilities ──────────────────────────────────────────────────────
 export * from "./ColorUtils.js";
-
+// ─── Content planning (pure half — produce the source→target plan) ─────────
+export * from "./ContentPlanner.js";
+// ─── Meta generation (pure half — build _meta.js entry lists) ──────────────
+export * from "./MetaGenerator.js";
 // ─── OpenAPI: helpers ──────────────────────────────────────────────────────
 export { generateCodeSamples, goStringLiteral, toPythonLiteral } from "./openapi/CodeSampleGenerator.js";
 export {
@@ -45,5 +48,9 @@ export { parseFullSpec } from "./openapi/SpecParser.js";
 export * from "./openapi/Types.js";
 // ─── Sanitization ──────────────────────────────────────────────────────────
 export { escapeHtml, sanitizeUrl } from "./Sanitize.js";
+// ─── Scope page-map (Nextra sidebar scoping helper) ────────────────────────
+export * from "./ScopePageMap.js";
+// ─── Navigation structure parsing (sidebar tree from site.json) ────────────
+export * from "./StructureParser.js";
 // ─── Site-level types (sidebar, footer, navigation, themes, …) ─────────────
 export * from "./Types.js";

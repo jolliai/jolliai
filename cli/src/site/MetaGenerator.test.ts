@@ -1,26 +1,14 @@
 /**
- * Tests for MetaGenerator — generates `_meta.js` files for Nextra v4 navigation.
- *
- * Covers all acceptance criteria from Task 5:
- *   - toTitleCase replaces hyphens/underscores with spaces and title-cases words
- *   - buildMetaEntries sorts alphabetically and title-cases labels
- *   - buildMetaEntries treats index.md / index.mdx as "Home"
- *   - generateMetaFiles writes _meta.js for folders with content
- *   - generateMetaFiles skips empty folders
- *   - generateMetaFiles recurses into subdirectories
- *
- * Property-based tests (fast-check):
- *   - Property 3: _meta.js entries are alphabetically ordered
- *     **Validates: Requirements 5.3**
- *   - Property 4: Title-case transformation is correct
- *     **Validates: Requirements 5.6**
+ * Tests for the I/O half of MetaGenerator: `generateMetaFiles`,
+ * sidebar-overrides integration, and root-injection integration. The pure
+ * half (`toTitleCase`, `buildMetaEntries`, property-based tests) lives in
+ * `site-core/src/MetaGenerator.test.ts`.
  */
 
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as fc from "fast-check";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -28,175 +16,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 async function makeTempDir(): Promise<string> {
 	return mkdtemp(join(tmpdir(), "jolli-metagenerator-test-"));
 }
-
-// ─── toTitleCase unit tests ───────────────────────────────────────────────────
-
-describe("MetaGenerator.toTitleCase", () => {
-	it("title-cases a single word", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-		expect(toTitleCase("index")).toBe("Index");
-	});
-
-	it("replaces hyphens with spaces and title-cases each word", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-		expect(toTitleCase("getting-started")).toBe("Getting Started");
-	});
-
-	it("replaces underscores with spaces and title-cases each word", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-		expect(toTitleCase("api_reference")).toBe("Api Reference");
-	});
-
-	it("handles mixed hyphens and underscores", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-		expect(toTitleCase("my-api_guide")).toBe("My Api Guide");
-	});
-
-	it("handles an already-capitalised word", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-		expect(toTitleCase("API")).toBe("API");
-	});
-
-	it("handles an empty string", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-		expect(toTitleCase("")).toBe("");
-	});
-
-	it("handles multiple consecutive hyphens", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-		// Each hyphen becomes a space; word boundary capitalises the next letter
-		expect(toTitleCase("a--b")).toBe("A  B");
-	});
-
-	it("handles a filename with numbers", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-		expect(toTitleCase("chapter-1")).toBe("Chapter 1");
-	});
-});
-
-// ─── buildMetaEntries unit tests ──────────────────────────────────────────────
-
-describe("MetaGenerator.buildMetaEntries", () => {
-	it("returns an empty array for an empty input", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		expect(buildMetaEntries([])).toEqual([]);
-	});
-
-	it("strips the extension from a markdown filename", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["getting-started.md"]);
-		expect(entries[0].key).toBe("getting-started");
-	});
-
-	it("title-cases the label", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["getting-started.md"]);
-		expect(entries[0].value).toBe("Getting Started");
-	});
-
-	it("hides index.md in entries with display: hidden", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["index.md"]);
-		expect(entries).toHaveLength(1);
-		expect(entries[0].key).toBe("index");
-		expect(entries[0].value).toEqual({ display: "hidden" });
-	});
-
-	it("hides index.mdx in entries with display: hidden", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["index.mdx"]);
-		expect(entries).toHaveLength(1);
-		expect(entries[0].key).toBe("index");
-		expect(entries[0].value).toEqual({ display: "hidden" });
-	});
-
-	it("sorts entries alphabetically by key", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["zebra.md", "apple.md", "mango.md"]);
-		expect(entries.map((e) => e.key)).toEqual(["apple", "mango", "zebra"]);
-	});
-
-	it("handles directory names (no extension) as entries", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["api"]);
-		expect(entries[0]).toEqual({ key: "api", value: "Api" });
-	});
-
-	it("deduplicates entries with the same key", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		// foo.md and foo.mdx would both produce key "foo"
-		const entries = buildMetaEntries(["foo.md", "foo.mdx"]);
-		expect(entries).toHaveLength(1);
-		expect(entries[0].key).toBe("foo");
-	});
-
-	it("mixes files and directories, hides index, and sorts them together", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["guides", "index.md", "getting-started.md", "api"]);
-		const visible = entries.filter((e) => typeof e.value === "string");
-		expect(visible.map((e) => e.key)).toEqual(["api", "getting-started", "guides"]);
-		expect(entries.find((e) => e.key === "index")?.value).toEqual({ display: "hidden" });
-	});
-
-	// ── Sidebar overrides ────────────────────────────────────────────────────
-
-	it("uses override order when sidebar override is provided", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["apple.md", "banana.md", "cherry.md"], {
-			cherry: "Cherry First",
-			banana: "Banana Second",
-		});
-		expect(entries.map((e) => e.key)).toEqual(["cherry", "banana"]);
-		expect(entries[0].value).toBe("Cherry First");
-		expect(entries[1].value).toBe("Banana Second");
-	});
-
-	it("includes override items not on filesystem (external links)", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["index.md"], {
-			index: "Home",
-			github: { title: "GitHub", href: "https://github.com" },
-		});
-		expect(entries).toHaveLength(2);
-		expect(entries[1].key).toBe("github");
-		expect(entries[1].value).toEqual({ title: "GitHub", href: "https://github.com" });
-	});
-
-	it("uses default alphabetical order when no override is provided", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["zebra.md", "apple.md"]);
-		expect(entries.map((e) => e.key)).toEqual(["apple", "zebra"]);
-	});
-
-	it("composes icon into title for sidebar items with icon field", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["index.md"], {
-			"get-started": { title: "Get Started", icon: "📖" },
-		});
-		const entry = entries.find((e) => e.key === "get-started");
-		expect(entry).toBeDefined();
-		expect((entry?.value as Record<string, unknown>).title).toBe("📖 Get Started");
-		expect((entry?.value as Record<string, unknown>).icon).toBeUndefined();
-	});
-
-	it("uses key as fallback title when icon is set but title is missing", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["index.md"], {
-			tutorials: { icon: "🔧" },
-		});
-		const entry = entries.find((e) => e.key === "tutorials");
-		expect((entry?.value as Record<string, unknown>).title).toBe("🔧 tutorials");
-	});
-
-	it("ignores icon field when it is empty", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-		const entries = buildMetaEntries(["index.md"], {
-			"get-started": { title: "Get Started", icon: "" },
-		});
-		const entry = entries.find((e) => e.key === "get-started");
-		expect((entry?.value as Record<string, unknown>).title).toBe("Get Started");
-	});
-});
 
 // ─── generateMetaFiles unit tests ────────────────────────────────────────────
 
@@ -513,159 +332,7 @@ describe("MetaGenerator.generateMetaFiles", () => {
 	});
 });
 
-// ─── Property-based tests ─────────────────────────────────────────────────────
-
-/**
- * Property 3: _meta.js entries are alphabetically ordered
- * **Validates: Requirements 5.3**
- */
-describe("Property 3: _meta.js entries are alphabetically ordered", () => {
-	// Generate safe filename segments: lowercase letters, digits, hyphens
-	const safeSegment = fc.stringMatching(/^[a-z][a-z0-9-]{0,15}$/).filter((s) => s.length > 0 && s !== "index");
-
-	it("buildMetaEntries always returns entries sorted alphabetically by key", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-
-		fc.assert(
-			fc.property(fc.array(safeSegment, { minLength: 1, maxLength: 20 }), (names) => {
-				// Add .md extension to simulate filenames
-				const filenames = names.map((n) => `${n}.md`);
-				const entries = buildMetaEntries(filenames);
-				const keys = entries.map((e) => e.key);
-
-				// Verify sorted order
-				for (let i = 1; i < keys.length; i++) {
-					if (keys[i - 1].localeCompare(keys[i]) > 0) {
-						return false;
-					}
-				}
-				return true;
-			}),
-			{ numRuns: 100 },
-		);
-	});
-
-	it("buildMetaEntries sorts mixed files and directories alphabetically", async () => {
-		const { buildMetaEntries } = await import("./MetaGenerator.js");
-
-		// Mix of filenames (with extension) and directory names (without extension)
-		const filenameArb = fc.oneof(
-			safeSegment.map((n) => `${n}.md`),
-			safeSegment.map((n) => `${n}.mdx`),
-			safeSegment, // directory name
-		);
-
-		fc.assert(
-			fc.property(fc.array(filenameArb, { minLength: 1, maxLength: 20 }), (items) => {
-				const entries = buildMetaEntries(items);
-				const keys = entries.map((e) => e.key);
-
-				for (let i = 1; i < keys.length; i++) {
-					if (keys[i - 1].localeCompare(keys[i]) > 0) {
-						return false;
-					}
-				}
-				return true;
-			}),
-			{ numRuns: 100 },
-		);
-	});
-});
-
-/**
- * Property 4: Title-case transformation is correct
- * **Validates: Requirements 5.6**
- */
-describe("Property 4: Title-case transformation is correct", () => {
-	// Generate strings composed of lowercase words separated by hyphens/underscores
-	const wordChar = fc.stringMatching(/^[a-z0-9]{1,10}$/);
-	const separator = fc.constantFrom("-", "_");
-
-	// Build a filename-like string: word (sep word)*
-	const filenameArb = fc.array(wordChar, { minLength: 1, maxLength: 5 }).chain((words) =>
-		fc.array(separator, { minLength: words.length - 1, maxLength: words.length - 1 }).map((seps) => {
-			let result = words[0];
-			for (let i = 0; i < seps.length; i++) {
-				result += seps[i] + words[i + 1];
-			}
-			return result;
-		}),
-	);
-
-	it("toTitleCase never contains hyphens in the output", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-
-		fc.assert(
-			fc.property(filenameArb, (filename) => {
-				const result = toTitleCase(filename);
-				return !result.includes("-");
-			}),
-			{ numRuns: 100 },
-		);
-	});
-
-	it("toTitleCase never contains underscores in the output", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-
-		fc.assert(
-			fc.property(filenameArb, (filename) => {
-				const result = toTitleCase(filename);
-				return !result.includes("_");
-			}),
-			{ numRuns: 100 },
-		);
-	});
-
-	it("toTitleCase capitalises the first letter of every word", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-
-		fc.assert(
-			fc.property(filenameArb, (filename) => {
-				const result = toTitleCase(filename);
-				// Split on spaces and check each non-empty word starts with uppercase
-				const words = result.split(" ").filter((w) => w.length > 0);
-				return words.every((word) => {
-					const firstChar = word[0];
-					// A letter should be uppercase; digits are fine as-is
-					return /[^a-z]/.test(firstChar) || firstChar === firstChar.toUpperCase();
-				});
-			}),
-			{ numRuns: 100 },
-		);
-	});
-
-	it("toTitleCase replaces every hyphen with a space", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-
-		// Generate strings that definitely contain hyphens
-		const withHyphen = fc.tuple(wordChar, wordChar).map(([a, b]) => `${a}-${b}`);
-
-		fc.assert(
-			fc.property(withHyphen, (filename) => {
-				const result = toTitleCase(filename);
-				return result.includes(" ") && !result.includes("-");
-			}),
-			{ numRuns: 100 },
-		);
-	});
-
-	it("toTitleCase replaces every underscore with a space", async () => {
-		const { toTitleCase } = await import("./MetaGenerator.js");
-
-		// Generate strings that definitely contain underscores
-		const withUnderscore = fc.tuple(wordChar, wordChar).map(([a, b]) => `${a}_${b}`);
-
-		fc.assert(
-			fc.property(withUnderscore, (filename) => {
-				const result = toTitleCase(filename);
-				return result.includes(" ") && !result.includes("_");
-			}),
-			{ numRuns: 100 },
-		);
-	});
-});
-
-// ─── generateMetaFiles with sidebar overrides (index hiding branch) ──────
+// ─── generateMetaFiles with sidebar overrides ────────────────────────────────
 
 describe("MetaGenerator.generateMetaFiles with sidebar overrides", () => {
 	let pagesDir: string;
@@ -705,7 +372,7 @@ describe("MetaGenerator.generateMetaFiles with sidebar overrides", () => {
 	});
 });
 
-// ─── injectRootNavEntries (root-only auto-injection) ─────────────────────────
+// ─── generateMetaFiles with rootInjection ────────────────────────────────────
 
 describe("MetaGenerator.generateMetaFiles with rootInjection", () => {
 	let tempDir: string;
