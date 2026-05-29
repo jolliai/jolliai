@@ -67,3 +67,5 @@ export { getStarterFiles } from "./StarterKit.js";
 export * from "./StructureParser.js";
 // ─── Site-level types (sidebar, footer, navigation, themes, …) ─────────────
 export * from "./Types.js";
+// ─── Theme helpers (footer JSX-string builders shared across packs) ────────
+export * from "./themes/Footer.js";
