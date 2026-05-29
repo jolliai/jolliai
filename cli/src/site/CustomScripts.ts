@@ -18,43 +18,25 @@
 import type { Dirent } from "node:fs";
 import { copyFile, mkdir, readdir, stat } from "node:fs/promises";
 import { dirname, extname, join, relative } from "node:path";
-import type { CustomScriptAsset } from "@jolli.ai/site-core";
+import {
+	CUSTOM_SCRIPT_EXTENSIONS,
+	CUSTOM_SCRIPT_FOLDER,
+	CUSTOM_SCRIPT_PUBLIC_DIR,
+	type CustomScriptAsset,
+	MAX_CUSTOM_SCRIPT_BYTES,
+	MAX_CUSTOM_SCRIPT_FILES,
+} from "@jolli.ai/site-core";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-/**
- * Jolli's reserved repo namespace (relative to the content root) — tool-owned:
- * custom scripts (`.jolli/scripts/`), Jolli Memory (`.jolli/jollimemory/`), etc.
- * Files here are never mirrored as documentation content or scanned as OpenAPI
- * specs, so a customer (or our own tooling) dropping a `.md`/`.yaml` under
- * `.jolli/` can't leak into their docs.
- */
-export const JOLLI_RESERVED_DIR = ".jolli";
-
-/** Source folder (content-root-relative) holding the custom scripts/styles. */
-export const CUSTOM_SCRIPT_FOLDER = ".jolli/scripts";
-
-/** Only these extensions are bundled and injected. */
-const CUSTOM_SCRIPT_EXTENSIONS: ReadonlySet<string> = new Set([".js", ".css"]);
-
-/** Output location under the build's `public/` dir; Next.js serves it at `/scripts/`. */
-export const CUSTOM_SCRIPT_PUBLIC_DIR = "scripts";
-
-/** Per-file size cap — skip anything larger so a stray bundle can't bloat the build. */
-export const MAX_CUSTOM_SCRIPT_BYTES = 64 * 1024;
-
-/** Max custom-script files bundled per build (sorted, deterministic). */
-export const MAX_CUSTOM_SCRIPT_FILES = 20;
-
-// ─── isReservedJolliPath ──────────────────────────────────────────────────────
-
-/**
- * True when a content-root-relative (posix) path lives under the reserved
- * `.jolli/` namespace. Lookalike prefixes (`.jolligotcha/…`) are not reserved.
- */
-export function isReservedJolliPath(relativePath: string): boolean {
-	return relativePath === JOLLI_RESERVED_DIR || relativePath.startsWith(`${JOLLI_RESERVED_DIR}/`);
-}
+// Re-export the shared constants + predicate so CLI consumers that import
+// from `./CustomScripts.js` keep working without changes.
+export {
+	CUSTOM_SCRIPT_FOLDER,
+	CUSTOM_SCRIPT_PUBLIC_DIR,
+	isReservedJolliPath,
+	JOLLI_RESERVED_DIR,
+	MAX_CUSTOM_SCRIPT_BYTES,
+	MAX_CUSTOM_SCRIPT_FILES,
+} from "@jolli.ai/site-core";
 
 // ─── discoverCustomScripts ────────────────────────────────────────────────────
 
