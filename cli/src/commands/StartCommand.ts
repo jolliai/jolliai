@@ -16,18 +16,23 @@ import type {
 	NavigationGroup,
 	NavLink,
 	PathMappings,
+	RootApiSpec,
+	RootInjectionInput,
 } from "@jolli.ai/site-core";
-import { buildPipeline, deriveSpecName, escapeHtml, sanitizeUrl } from "@jolli.ai/site-core";
+import {
+	buildNavigationContentPlan,
+	buildPipeline,
+	deriveSpecName,
+	escapeHtml,
+	parseNavigation,
+	sanitizeUrl,
+	validateNavigationPaths,
+} from "@jolli.ai/site-core";
 import type { Command } from "commander";
 import { resolveFavicon } from "../site/AssetResolver.js";
 import { applyPathMapping, clearDir, mirrorContent } from "../site/ContentMirror.js";
-import {
-	applyNavigationContentPlan,
-	buildNavigationContentPlan,
-	validateNavigationPaths,
-} from "../site/ContentPlanner.js";
+import { applyNavigationContentPlan } from "../site/ContentPlanWriter.js";
 import { discoverCustomScripts } from "../site/CustomScripts.js";
-import type { RootApiSpec, RootInjectionInput } from "../site/MetaGenerator.js";
 import { needsInstall, runNpmInstall, runNpmStart } from "../site/NpmRunner.js";
 import { runPagefind } from "../site/PagefindRunner.js";
 import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
@@ -35,7 +40,6 @@ import { buildApiSidebarOverrides } from "../site/renderer/nextra/index.js";
 import type { OpenApiSpecInput } from "../site/renderer/SiteRenderer.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
 import { startSourceWatcher } from "../site/SourceWatcher.js";
-import { parseNavigation } from "../site/StructureParser.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

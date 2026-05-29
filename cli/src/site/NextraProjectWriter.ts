@@ -25,8 +25,7 @@ import type {
 	NavigationPage,
 	ThemeConfig,
 } from "@jolli.ai/site-core";
-import { sanitizeUrl } from "@jolli.ai/site-core";
-import { SCOPE_PAGE_MAP_RUNTIME_SOURCE } from "./ScopePageMap.js";
+import { SCOPE_PAGE_MAP_RUNTIME_SOURCE, sanitizeUrl } from "@jolli.ai/site-core";
 import { SOCIAL_PLATFORMS } from "./themes/Footer.js";
 import type { ThemePackProvider } from "./themes/ThemeRegistry.js";
 import { discoverPack, resolvePack } from "./themes/ThemeRegistry.js";

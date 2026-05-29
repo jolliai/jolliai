@@ -18,7 +18,7 @@ import type {
 	NavigationPage,
 	SidebarItemValue,
 	SidebarOverrides,
-} from "@jolli.ai/site-core";
+} from "./Types.js";
 
 // ─── Type guards ────────────────────────────────────────────────────────────
 

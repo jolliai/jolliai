@@ -12,10 +12,10 @@ import type {
 	CustomScriptAsset,
 	NpmRunResult,
 	OpenApiPipelineResult,
+	RootInjectionInput,
 	SidebarOverrides,
 	SiteJson,
 } from "@jolli.ai/site-core";
-import type { RootInjectionInput } from "../MetaGenerator.js";
 import type { ServerResult } from "../NpmRunner.js";
 import type { OutputFilter } from "../OutputFilter.js";
 

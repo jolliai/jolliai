@@ -10,9 +10,15 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { CustomScriptAsset, NpmRunResult, SidebarOverrides, SiteJson } from "@jolli.ai/site-core";
+import type {
+	CustomScriptAsset,
+	NpmRunResult,
+	RootInjectionInput,
+	SidebarOverrides,
+	SiteJson,
+} from "@jolli.ai/site-core";
 import { hexToHsl } from "@jolli.ai/site-core";
-import { generateMetaFiles, type RootInjectionInput } from "../MetaGenerator.js";
+import { generateMetaFiles } from "../MetaGenerator.js";
 import { initNextraProject } from "../NextraProjectWriter.js";
 import { runNpmBuild, runNpmDev, type ServerResult } from "../NpmRunner.js";
 import type { OutputFilter } from "../OutputFilter.js";
