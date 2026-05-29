@@ -17,7 +17,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as fc from "fast-check";
@@ -232,6 +232,26 @@ describe("ContentMirror.mirrorContent", () => {
 		const result = await mirrorContent(sourceRoot, contentDir);
 
 		expect(result.markdownFiles).toContain("guides/intro.md");
+	});
+
+	it("normalizes legacy Docusaurus admonition titles in mirrored .md files", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "page.md"), ":::warning Mind the gap\nBe careful.\n:::\n", "utf-8");
+
+		await mirrorContent(sourceRoot, contentDir);
+
+		const output = await readFile(join(contentDir, "page.md"), "utf-8");
+		expect(output).toContain(":::warning[Mind the gap]");
+	});
+
+	it("preserves modern :::tip[Title] bracket form in mirrored .md files", async () => {
+		const { mirrorContent } = await import("./ContentMirror.js");
+		await writeFile(join(sourceRoot, "page.md"), ":::tip[Already bracketed]\nBody.\n:::\n", "utf-8");
+
+		await mirrorContent(sourceRoot, contentDir);
+
+		const output = await readFile(join(contentDir, "page.md"), "utf-8");
+		expect(output).toContain(":::tip[Already bracketed]");
 	});
 
 	// ── Image files are copied (Requirement 3.4) ────────────────────────────
@@ -855,24 +875,27 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		expect(result).not.toContain("noColon");
 	});
 
-	it("removes Docusaurus admonition fences", async () => {
+	it("preserves Docusaurus admonition fences for the downstream remark plugin", async () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = "# Title\n\n:::tip\nThis is a tip.\n:::\n\nMore text.\n";
 
 		const result = stripIncompatibleContent(input).content;
 
-		expect(result).not.toContain(":::");
+		// Admonition syntax is no longer stripped — the Nextra remark plugin
+		// `remark-admonitions-to-callout` converts it to `<Callout>` at render
+		// time, so the fences must reach the build output verbatim.
+		expect(result).toContain(":::tip");
 		expect(result).toContain("This is a tip.");
 		expect(result).toContain("More text.");
 	});
 
-	it("removes :::warning admonition", async () => {
+	it("preserves :::warning admonition body and fences", async () => {
 		const { stripIncompatibleContent } = await import("./ContentMirror.js");
 		const input = ":::warning\nBe careful!\n:::\n";
 
 		const result = stripIncompatibleContent(input).content;
 
-		expect(result).not.toContain(":::warning");
+		expect(result).toContain(":::warning");
 		expect(result).toContain("Be careful!");
 	});
 
@@ -904,6 +927,213 @@ describe("ContentMirror.stripIncompatibleContent", () => {
 		expect(result).not.toContain("<Outer");
 		expect(result).not.toContain("<Inner");
 		expect(result).toContain("Deep content");
+	});
+});
+
+// ─── normalizeLegacyAdmonitionTitles tests ───────────────────────────────────
+
+describe("ContentMirror.normalizeLegacyAdmonitionTitles", () => {
+	it("rewrites :::warning Title to :::warning[Title]", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = ":::warning Mind the gap\nBody\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain(":::warning[Mind the gap]");
+		expect(result).not.toContain(":::warning Mind the gap");
+	});
+
+	it("rewrites indented legacy admonition titles while preserving indentation", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "1. Step\n\n   :::warning Mind the gap\n   Body\n   :::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain("   :::warning[Mind the gap]");
+		expect(result).not.toContain("   :::warning Mind the gap");
+	});
+
+	it("rewrites 4-space indented legacy admonitions when they continue a list item", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "10. Step\n\n    :::warning Mind the gap\n    Body\n    :::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain("    :::warning[Mind the gap]");
+		expect(result).not.toContain("    :::warning Mind the gap");
+	});
+
+	it("does NOT rewrite legacy admonition-looking text in 4-space indented code blocks", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "    :::warning literal code\n    Body\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toBe(input);
+		expect(result).not.toContain(":::warning[literal code]");
+	});
+
+	it("does NOT rewrite legacy admonition-looking text in tab-indented code blocks", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "\t:::warning literal code\n\tBody\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toBe(input);
+		expect(result).not.toContain(":::warning[literal code]");
+	});
+
+	it("preserves longer fences (::::tip Long title → ::::tip[Long title])", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "::::tip Recovery from fatal errors\nInner body\n::::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain("::::tip[Recovery from fatal errors]");
+	});
+
+	it("leaves :::warning[Title] (modern bracket form) unchanged", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = ":::warning[Already bracketed]\nBody\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toBe(input);
+	});
+
+	it("leaves :::warning (no title) unchanged", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = ":::warning\nBody\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toBe(input);
+	});
+
+	it("does NOT rewrite :::details Title (unknown directive type)", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = ":::details More options\nBody\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toBe(input);
+		expect(result).not.toContain(":::details[More options]");
+	});
+
+	it("does NOT rewrite :::code-group Title (unknown directive type)", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = ":::code-group Examples\nBody\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toBe(input);
+	});
+
+	it("skips :::warning Title inside fenced code blocks (backticks)", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "Outside.\n\n```md\n:::warning Inside\nBody\n:::\n```\n\nAfter.\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain(":::warning Inside");
+		expect(result).not.toContain(":::warning[Inside]");
+	});
+
+	it("does not close a longer backtick fence on a shorter nested fence", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "````md\n```js\n:::warning Inside sample\n```\n````\n\n:::tip Outside\nBody\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain(":::warning Inside sample");
+		expect(result).not.toContain(":::warning[Inside sample]");
+		expect(result).toContain(":::tip[Outside]");
+	});
+
+	it("does not close a fenced code block on a 4-space indented fence-looking line", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "```md\n    ```\n:::warning Still in code\n```\n\n:::tip Outside\nBody\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain(":::warning Still in code");
+		expect(result).not.toContain(":::warning[Still in code]");
+		expect(result).toContain(":::tip[Outside]");
+	});
+
+	it("skips :::warning Title inside fenced code blocks (tildes)", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "Outside.\n\n~~~md\n:::warning Inside\nBody\n:::\n~~~\n\nAfter.\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain(":::warning Inside");
+	});
+
+	it("still normalizes legacy headers after a closed code block", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "```sh\necho hi\n```\n\n:::tip After code\nBody\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain(":::tip[After code]");
+	});
+
+	it("rewrites multiple legacy headers in one document", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = ":::info First\nA\n:::\n\n:::tip Second\nB\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain(":::info[First]");
+		expect(result).toContain(":::tip[Second]");
+	});
+
+	it("returns the same string when nothing matched (no churn)", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "# Title\n\nJust prose, no admonitions.\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toBe(input);
+	});
+
+	it("is case-insensitive on the admonition type lookup", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = ":::WARNING Caps\nBody\n:::\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain(":::WARNING[Caps]");
+	});
+
+	it("does not rewrite lines where ::: appears mid-line", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = "Text with ::: in the middle.\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toBe(input);
+	});
+
+	it("preserves CRLF line endings on rewritten lines", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const input = ":::warning Win line\r\nBody\r\n:::\r\n";
+
+		const result = normalizeLegacyAdmonitionTitles(input);
+
+		expect(result).toContain(":::warning[Win line]\r");
+	});
+
+	it("covers all known admonition types (info / note / tip / warning / caution / danger / important)", async () => {
+		const { normalizeLegacyAdmonitionTitles } = await import("./ContentMirror.js");
+		const types = ["info", "note", "tip", "warning", "caution", "danger", "important"];
+
+		for (const type of types) {
+			const input = `:::${type} Title\nBody\n:::\n`;
+			const result = normalizeLegacyAdmonitionTitles(input);
+			expect(result).toContain(`:::${type}[Title]`);
+		}
 	});
 });
 

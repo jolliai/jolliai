@@ -266,7 +266,7 @@ describe("ConvertCommand", () => {
 		const sourceDir = join(tempDir, "docs");
 		await mkdir(sourceDir, { recursive: true });
 		await writeFile(join(sourceDir, "index.md"), "# Home\n", "utf-8");
-		const mdxContent = "import Tabs from '@theme/Tabs'\n\n# Page\n\nContent here.\n";
+		const mdxContent = "import Tabs from '@theme/Tabs'\n\n# Page\n\n:::warning Mind the gap\nContent here.\n:::\n";
 		await writeFile(join(sourceDir, "page.mdx"), mdxContent, "utf-8");
 		const outDir = join(tempDir, "output");
 
@@ -278,7 +278,25 @@ describe("ConvertCommand", () => {
 		expect(existsSync(join(outDir, "page.mdx"))).toBe(false);
 		const output = await readFile(join(outDir, "page.md"), "utf-8");
 		expect(output).not.toContain("import");
+		expect(output).toContain(":::warning[Mind the gap]");
 		expect(output).toContain("Content here.");
+	});
+
+	it("normalizes legacy admonition titles when copying markdown to an output folder", async () => {
+		const { registerConvertCommand } = await import("./ConvertCommand.js");
+		const sourceDir = join(tempDir, "docs");
+		await mkdir(sourceDir, { recursive: true });
+		await writeFile(join(sourceDir, "index.md"), "# Home\n", "utf-8");
+		await writeFile(join(sourceDir, "guide.md"), ":::tip Read this\nBody.\n:::\n", "utf-8");
+		const outDir = join(tempDir, "output");
+
+		const program = new Command();
+		registerConvertCommand(program);
+		await program.parseAsync(["node", "test", "convert", sourceDir, "--output", outDir]);
+
+		const output = await readFile(join(outDir, "guide.md"), "utf-8");
+		expect(output).toContain(":::tip[Read this]");
+		expect(output).not.toContain(":::tip Read this");
 	});
 
 	// ── slug: / handling ────────────────────────────────────────────────────

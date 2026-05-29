@@ -16,7 +16,12 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { NavigationContentPlan, PlannedMarkdownPage } from "@jolli.ai/site-core";
-import { hasIncompatibleImports, rewriteRelativeImagePaths, stripIncompatibleContent } from "./ContentMirror.js";
+import {
+	hasIncompatibleImports,
+	normalizeLegacyAdmonitionTitles,
+	rewriteRelativeImagePaths,
+	stripIncompatibleContent,
+} from "./ContentMirror.js";
 import type { ContentRules } from "./renderer/SiteRenderer.js";
 
 async function canCompileMdx(content: string): Promise<boolean> {
@@ -76,7 +81,9 @@ async function rewritePlannedPage(
 		}
 	}
 
-	const rewritten = rewriteRelativeImagePaths(content, page.sourceRelPath, finalTargetRelPath);
+	const rewritten = normalizeLegacyAdmonitionTitles(
+		rewriteRelativeImagePaths(content, page.sourceRelPath, finalTargetRelPath),
+	);
 	// When the planner re-homed a non-index source (e.g. `guides/deployment.mdx`)
 	// to `<folder>/index.<ext>` because the article has nested children, mark the
 	// rewritten file with `asIndexPage: true`. Nextra v4 reads this frontmatter

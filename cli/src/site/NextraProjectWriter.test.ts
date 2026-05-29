@@ -19,9 +19,10 @@
  */
 
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import * as fc from "fast-check";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
@@ -29,6 +30,40 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 async function makeTempDir(): Promise<string> {
 	return mkdtemp(join(tmpdir(), "jolli-nextrawriter-test-"));
+}
+
+async function makeModuleTempDir(): Promise<string> {
+	return mkdtemp(join(process.cwd(), ".jolli-nextrawriter-test-"));
+}
+
+type RemarkTree = {
+	type: string;
+	children: MdxNode[];
+};
+
+type MdxNode = {
+	type?: string;
+	name?: string;
+	attributes?: unknown;
+	children?: unknown[];
+};
+
+type RemarkTransform = (tree: RemarkTree) => void;
+
+async function runGeneratedRemarkPlugin(tree: RemarkTree): Promise<RemarkTree> {
+	const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+	const tempDir = await makeModuleTempDir();
+	try {
+		const pluginPath = join(tempDir, "remark-admonitions-to-callout.mjs");
+		await writeFile(pluginPath, generateRemarkAdmonitionsPlugin(), "utf-8");
+		const pluginModule = (await import(`${pathToFileURL(pluginPath).href}?v=${Date.now()}-${Math.random()}`)) as {
+			default: () => RemarkTransform;
+		};
+		pluginModule.default()(tree);
+		return tree;
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
 }
 
 /**
@@ -122,6 +157,18 @@ describe("NextraProjectWriter.generatePackageJson", () => {
 		const pkg = JSON.parse(generatePackageJson());
 		expect(pkg.devDependencies).toHaveProperty("typescript");
 	});
+
+	it("includes 'remark-directive' dependency (required by the admonitions plugin)", async () => {
+		const { generatePackageJson } = await import("./NextraProjectWriter.js");
+		const pkg = JSON.parse(generatePackageJson());
+		expect(pkg.dependencies).toHaveProperty("remark-directive");
+	});
+
+	it("includes 'unist-util-visit' dependency (used by the admonitions plugin)", async () => {
+		const { generatePackageJson } = await import("./NextraProjectWriter.js");
+		const pkg = JSON.parse(generatePackageJson());
+		expect(pkg.dependencies).toHaveProperty("unist-util-visit");
+	});
 });
 
 // ─── generateNextConfig unit tests ───────────────────────────────────────────
@@ -165,6 +212,40 @@ describe("NextraProjectWriter.generateNextConfig", () => {
 		const { generateNextConfig } = await import("./NextraProjectWriter.js");
 		const config = generateNextConfig(false);
 		expect(config).not.toContain("output: 'export'");
+	});
+
+	it("imports remark-directive", async () => {
+		const { generateNextConfig } = await import("./NextraProjectWriter.js");
+		expect(generateNextConfig()).toContain("import remarkDirective from 'remark-directive'");
+	});
+
+	it("imports the generated admonitions plugin from plugins/", async () => {
+		const { generateNextConfig } = await import("./NextraProjectWriter.js");
+		expect(generateNextConfig()).toContain(
+			"import remarkAdmonitionsToCallout from './plugins/remark-admonitions-to-callout.mjs'",
+		);
+	});
+
+	it("wires mdxOptions.remarkPlugins on the nextra() call", async () => {
+		const { generateNextConfig } = await import("./NextraProjectWriter.js");
+		const config = generateNextConfig();
+		expect(config).toContain("mdxOptions:");
+		expect(config).toContain("remarkPlugins:");
+	});
+
+	it("registers remark-directive before the admonitions plugin (ordering matters)", async () => {
+		const { generateNextConfig } = await import("./NextraProjectWriter.js");
+		const config = generateNextConfig();
+		// In the remarkPlugins array, directive must come first so the next
+		// plugin can see containerDirective nodes.
+		const arrayMatch = config.match(/remarkPlugins:\s*\[([^\]]*)\]/);
+		expect(arrayMatch).not.toBeNull();
+		const arr = arrayMatch?.[1] ?? "";
+		const dirIdx = arr.indexOf("remarkDirective");
+		const calloutIdx = arr.indexOf("remarkAdmonitionsToCallout");
+		expect(dirIdx).toBeGreaterThanOrEqual(0);
+		expect(calloutIdx).toBeGreaterThanOrEqual(0);
+		expect(dirIdx).toBeLessThan(calloutIdx);
 	});
 });
 
@@ -525,6 +606,146 @@ describe("NextraProjectWriter.generateMdxComponents", () => {
 		const { generateMdxComponents } = await import("./NextraProjectWriter.js");
 		expect(generateMdxComponents()).toContain("useMDXComponents");
 	});
+
+	it("imports Callout from nextra/components", async () => {
+		const { generateMdxComponents } = await import("./NextraProjectWriter.js");
+		expect(generateMdxComponents()).toContain("import { Callout } from 'nextra/components'");
+	});
+
+	it("provides Callout in the MDX components map", async () => {
+		const { generateMdxComponents } = await import("./NextraProjectWriter.js");
+		const result = generateMdxComponents();
+		// The returned object must list `Callout` so the runtime has a
+		// component to render `<Callout type="...">` JSX into.
+		expect(result).toMatch(/return\s*\{[\s\S]*\bCallout\b[\s\S]*\}/);
+	});
+});
+
+// ─── generateRemarkAdmonitionsPlugin unit tests ──────────────────────────────
+
+describe("NextraProjectWriter.generateRemarkAdmonitionsPlugin", () => {
+	it("returns a non-empty string", async () => {
+		const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		expect(generateRemarkAdmonitionsPlugin().length).toBeGreaterThan(0);
+	});
+
+	it("imports visit from unist-util-visit", async () => {
+		const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		expect(generateRemarkAdmonitionsPlugin()).toContain("import { visit } from 'unist-util-visit'");
+	});
+
+	it("exports the plugin as default", async () => {
+		const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		expect(generateRemarkAdmonitionsPlugin()).toContain("export default function remarkAdmonitionsToCallout");
+	});
+
+	it("includes the full admonition TYPE_MAP", async () => {
+		const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		const plugin = generateRemarkAdmonitionsPlugin();
+		expect(plugin).toContain("info: 'info'");
+		expect(plugin).toContain("note: 'default'");
+		expect(plugin).toContain("tip: 'default'");
+		expect(plugin).toContain("warning: 'warning'");
+		expect(plugin).toContain("caution: 'warning'");
+		expect(plugin).toContain("danger: 'error'");
+		expect(plugin).toContain("important: 'info'");
+	});
+
+	it("visits containerDirective nodes only (leaf / text directives untouched)", async () => {
+		const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		const plugin = generateRemarkAdmonitionsPlugin();
+		expect(plugin).toContain("'containerDirective'");
+		expect(plugin).not.toContain("'leafDirective'");
+		expect(plugin).not.toContain("'textDirective'");
+	});
+
+	it("replaces matched nodes with mdxJsxFlowElement <Callout>", async () => {
+		const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		const plugin = generateRemarkAdmonitionsPlugin();
+		expect(plugin).toContain("'mdxJsxFlowElement'");
+		expect(plugin).toContain("name: 'Callout'");
+		expect(plugin).toContain("type: 'mdxJsxAttribute'");
+	});
+
+	it("leaves unknown directive names untouched for later remark plugins", async () => {
+		const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		const plugin = generateRemarkAdmonitionsPlugin();
+		expect(plugin).toMatch(/if\s*\(!calloutType\)\s*return/);
+		expect(plugin).not.toContain("makeUnknownDirectiveNode");
+	});
+
+	it("promotes :::info[Title] label children into a bold heading paragraph", async () => {
+		const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		const plugin = generateRemarkAdmonitionsPlugin();
+		expect(plugin).toContain("directiveLabel");
+		expect(plugin).toContain("'strong'");
+	});
+
+	it("lower-cases directive names before lookup (case-insensitive matching)", async () => {
+		const { generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		const plugin = generateRemarkAdmonitionsPlugin();
+		expect(plugin).toContain("toLowerCase()");
+	});
+
+	it("preserves Docusaurus id and class attributes around converted admonitions", async () => {
+		const body = { type: "paragraph", children: [{ type: "text", value: "Body" }] };
+		const tree: RemarkTree = {
+			type: "root",
+			children: [
+				{
+					type: "containerDirective",
+					name: "note",
+					attributes: { id: "admonition-id", class: "padding--lg text--italic" },
+					children: [body],
+				},
+			],
+		};
+
+		await runGeneratedRemarkPlugin(tree);
+
+		const wrapper = tree.children[0];
+		expect(wrapper).toMatchObject({ type: "mdxJsxFlowElement", name: "div" });
+		expect(wrapper.attributes).toEqual([
+			{ type: "mdxJsxAttribute", name: "id", value: "admonition-id" },
+			{ type: "mdxJsxAttribute", name: "className", value: "padding--lg text--italic" },
+		]);
+
+		const callout = wrapper.children?.[0] as MdxNode;
+		expect(callout).toMatchObject({ type: "mdxJsxFlowElement", name: "Callout" });
+		expect(callout.attributes).toEqual([{ type: "mdxJsxAttribute", name: "type", value: "default" }]);
+		expect(callout.children).toEqual([body]);
+	});
+
+	it("does not consume unknown container directive nodes or their attributes", async () => {
+		const title = {
+			type: "paragraph",
+			data: { directiveLabel: true },
+			children: [{ type: "text", value: "More info" }],
+		};
+		const body = { type: "paragraph", children: [{ type: "text", value: "Body" }] };
+		const tree: RemarkTree = {
+			type: "root",
+			children: [
+				{
+					type: "containerDirective",
+					name: "details",
+					attributes: { id: "faq", class: "shadow" },
+					children: [title, body],
+				},
+			],
+		};
+		const originalDirective = tree.children[0];
+
+		await runGeneratedRemarkPlugin(tree);
+
+		expect(tree.children[0]).toBe(originalDirective);
+		expect(tree.children[0]).toMatchObject({
+			type: "containerDirective",
+			name: "details",
+			attributes: { id: "faq", class: "shadow" },
+		});
+		expect(tree.children[0].children).toEqual([title, body]);
+	});
 });
 
 // ─── generateCatchAllPage unit tests ─────────────────────────────────────────
@@ -688,6 +909,25 @@ describe("NextraProjectWriter.initNextraProject", () => {
 		await initNextraProject(buildDir, SAMPLE_CONFIG);
 
 		expect(existsSync(join(buildDir, "next.config.mjs"))).toBe(true);
+	});
+
+	it("writes plugins/remark-admonitions-to-callout.mjs on first run", async () => {
+		const { initNextraProject } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+
+		await initNextraProject(buildDir, SAMPLE_CONFIG);
+
+		expect(existsSync(join(buildDir, "plugins", "remark-admonitions-to-callout.mjs"))).toBe(true);
+	});
+
+	it("plugin file matches generateRemarkAdmonitionsPlugin() output byte-for-byte", async () => {
+		const { initNextraProject, generateRemarkAdmonitionsPlugin } = await import("./NextraProjectWriter.js");
+		const buildDir = join(tempDir, ".jolli-site");
+
+		await initNextraProject(buildDir, SAMPLE_CONFIG);
+
+		const written = await readFile(join(buildDir, "plugins", "remark-admonitions-to-callout.mjs"), "utf-8");
+		expect(written).toBe(generateRemarkAdmonitionsPlugin());
 	});
 
 	it("writes app/layout.tsx on first run", async () => {

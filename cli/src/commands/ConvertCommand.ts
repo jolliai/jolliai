@@ -22,6 +22,7 @@ import {
 	hasIncompatibleImports,
 	rewriteRelativeImagePaths,
 	stripIncompatibleContent,
+	writeNormalizedMarkdown,
 } from "../site/ContentMirror.js";
 import {
 	type ConversionResult,
@@ -258,7 +259,7 @@ async function processFile(
 						originalRelPath !== mdMappedRelPath
 							? rewriteRelativeImagePaths(cleaned, originalRelPath, mdMappedRelPath, pathMappings)
 							: cleaned;
-					await writeFile(mdDestPath, rewritten, "utf-8");
+					await writeNormalizedMarkdown(mdDestPath, rewritten);
 					if (downgraded) {
 						stats.downgraded++;
 					}
@@ -271,7 +272,8 @@ async function processFile(
 				}
 			}
 
-			// Normal copy/move
+			// Normal copy/move. Markdown content that we write gets the same
+			// legacy admonition normalization as the site mirror path.
 			if (originalRelPath !== mappedRelPath) {
 				let mdContent: string;
 				try {
@@ -282,12 +284,26 @@ async function processFile(
 					return;
 				}
 				const rewritten = rewriteRelativeImagePaths(mdContent, originalRelPath, mappedRelPath, pathMappings);
-				await writeFile(destPath, rewritten, "utf-8");
+				await writeNormalizedMarkdown(destPath, rewritten);
 				if (inPlace && fullPath !== destPath) await safeRemove(fullPath);
-			} else if (!inPlace) {
-				await copyFile(fullPath, destPath);
+			} else {
+				let mdContent: string;
+				try {
+					mdContent = await readFile(fullPath, "utf-8");
+					/* v8 ignore next 5 -- defensive: stat just succeeded as a file; when outputting to a separate folder, fall back to a byte-for-byte copy if normalization can't read the file */
+				} catch {
+					if (!inPlace) await copyFile(fullPath, destPath);
+					break;
+				}
+				// In-place runs skip the write when normalization is a no-op so
+				// an untouched file keeps its mtime; folder-output runs always
+				// write the normalized content.
+				await writeNormalizedMarkdown(destPath, mdContent, { skipIfUnchanged: inPlace });
 			}
-			// If in-place and path unchanged, file stays where it is
+			// Path unchanged: an in-place run only rewrites legacy admonition
+			// syntax (and skips the write entirely when nothing changed); a run
+			// that outputs to a separate folder writes the normalized content
+			// there.
 			break;
 		}
 		case "image":
