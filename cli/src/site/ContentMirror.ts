@@ -182,6 +182,194 @@ export function classifyFile(filePath: string, content?: string): FileType {
 	return "ignored";
 }
 
+// ─── normalizeLegacyAdmonitionTitles ─────────────────────────────────────────
+
+/**
+ * Known Docusaurus admonition types. Only these are normalized — `:::details`,
+ * `:::code-group`, and user-defined directives are left alone so that the
+ * downstream remark plugin can decide what to do with them.
+ */
+const KNOWN_ADMONITION_TYPES = new Set(["info", "note", "tip", "warning", "caution", "danger", "important"]);
+
+/**
+ * Matches a fenced code block opener: at least 3 backticks or 3 tildes, with
+ * optional leading whitespace and an optional info string. Capture group 1 is
+ * the fence marker sequence.
+ */
+const CODE_FENCE_OPEN_PATTERN = /^\s*(`{3,}|~{3,}).*$/;
+
+/**
+ * Matches a fenced code block closer: same marker character as the opener,
+ * at least as long as the opener, and only trailing whitespace. Capture group
+ * 1 is the fence marker sequence.
+ */
+const CODE_FENCE_CLOSE_PATTERN = /^\s*(`{3,}|~{3,})[ \t]*$/;
+
+/**
+ * Matches a Docusaurus admonition opener with a legacy v2 title (space-
+ * separated label after the type). Captures: (1) leading indentation,
+ * (2) fence colons, (3) type name, (4) title text.
+ *
+ *   :::warning Title              → captured
+ *      :::warning Title           → captured (up to 3 spaces preserved)
+ *   ::::tip Long title            → captured (longer fences are valid)
+ *   :::warning[Title]             → not captured (modern bracket form)
+ *   :::warning                    → not captured (no title)
+ */
+const LEGACY_ADMONITION_TITLE_PATTERN = /^(\s*)(:{3,})([A-Za-z][A-Za-z0-9-]*)\s+(\S.*?)\s*$/;
+
+interface CodeFenceState {
+	marker: string;
+	length: number;
+	indent: number;
+}
+
+interface ListIndent {
+	contentIndent: number;
+}
+
+function leadingIndentWidth(line: string): number {
+	let width = 0;
+	for (const char of line) {
+		if (char === " ") {
+			width++;
+		} else if (char === "\t") {
+			width += 4 - (width % 4);
+		} else {
+			break;
+		}
+	}
+	return width;
+}
+
+function prefixWidth(prefix: string, initialWidth = 0): number {
+	let width = initialWidth;
+	for (const char of prefix) {
+		if (char === " ") {
+			width++;
+		} else if (char === "\t") {
+			width += 4 - (width % 4);
+		}
+	}
+	return width;
+}
+
+function listIndent(line: string): ListIndent | null {
+	const match = line.match(/^([ \t]*)((?:[-+*])|(?:\d{1,9}[.)]))([ \t]+)\S/);
+	if (!match) return null;
+
+	const markerIndent = leadingIndentWidth(match[1]);
+	const markerWidth = match[2].length;
+	const gapWidth = prefixWidth(match[3], markerIndent + markerWidth) - markerIndent - markerWidth;
+	const contentGap = gapWidth > 0 && gapWidth <= 4 ? gapWidth : 1;
+	return { contentIndent: markerIndent + markerWidth + contentGap };
+}
+
+function isListContinuation(lines: string[], currentIndex: number, indentWidth: number): boolean {
+	for (let i = currentIndex - 1; i >= 0; i--) {
+		const line = lines[i].endsWith("\r") ? lines[i].slice(0, -1) : lines[i];
+		if (/^\s*$/.test(line)) continue;
+
+		const list = listIndent(line);
+		if (list) {
+			return indentWidth >= list.contentIndent && indentWidth < list.contentIndent + 4;
+		}
+
+		if (leadingIndentWidth(line) === 0) {
+			return false;
+		}
+	}
+
+	return false;
+}
+
+/**
+ * Rewrites Docusaurus v2 admonition headers like `:::tip Recovery from fatal
+ * errors` into the standard Markdown Directive label form
+ * `:::tip[Recovery from fatal errors]`. `remark-directive` only recognises
+ * the bracket form, so without this pass the legacy spec wouldn't be picked
+ * up as a directive at all.
+ *
+ * Only known admonition types (info / note / tip / warning / caution / danger
+ * / important) are rewritten. Other container directives (`:::details`,
+ * `:::code-group`) are preserved verbatim so the downstream AST plugin can
+ * leave them alone too.
+ *
+ * Lines inside fenced code blocks (``` ``` ``` or `~~~`) and CommonMark
+ * indented code blocks are skipped: an example `:::tip` printed in a code
+ * sample must stay untouched.
+ *
+ * The original line endings (LF vs CRLF) and indentation are preserved.
+ */
+export function normalizeLegacyAdmonitionTitles(content: string): string {
+	const lines = content.split("\n");
+	let fence: CodeFenceState | null = null;
+	let mutated = false;
+
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const cr = line.endsWith("\r") ? "\r" : "";
+		const normalizedLine = cr ? line.slice(0, -1) : line;
+
+		if (fence === null) {
+			const indentWidth = leadingIndentWidth(normalizedLine);
+			if (indentWidth >= 4 && !isListContinuation(lines, i, indentWidth)) {
+				continue;
+			}
+			const fenceOpen = normalizedLine.match(CODE_FENCE_OPEN_PATTERN);
+			if (fenceOpen) {
+				const marker = fenceOpen[1];
+				fence = { marker: marker[0], length: marker.length, indent: indentWidth };
+				continue;
+			}
+			const directive = normalizedLine.match(LEGACY_ADMONITION_TITLE_PATTERN);
+			if (directive) {
+				const [, indent, colons, type, title] = directive;
+				if (KNOWN_ADMONITION_TYPES.has(type.toLowerCase())) {
+					lines[i] = `${indent}${colons}${type}[${title}]${cr}`;
+					mutated = true;
+				}
+			}
+		} else {
+			// A closing fence may be indented up to 3 spaces relative to its
+			// opener (CommonMark). Measuring against the opener's indent rather
+			// than an absolute 3 lets a fence opened inside a list item
+			// (indent >= 4) close on its matching indented ```, while a more
+			// deeply indented ``` inside a top-level block still counts as code.
+			const fenceClose =
+				leadingIndentWidth(normalizedLine) <= fence.indent + 3
+					? normalizedLine.match(CODE_FENCE_CLOSE_PATTERN)
+					: null;
+			if (fenceClose && fenceClose[1][0] === fence.marker && fenceClose[1].length >= fence.length) {
+				fence = null;
+			}
+		}
+	}
+
+	return mutated ? lines.join("\n") : content;
+}
+
+// ─── writeNormalizedMarkdown ─────────────────────────────────────────────────
+
+/**
+ * Writes `content` to `destPath` after running `normalizeLegacyAdmonitionTitles`
+ * over it. Every markdown write in the convert/mirror pipeline funnels through
+ * here so a new write site can't silently skip the admonition normalization —
+ * the "normalize at the write site" guarantee, enforced in one place.
+ *
+ * When `skipIfUnchanged` is set and normalization is a no-op, the write is
+ * skipped entirely so an untouched in-place file keeps its original mtime.
+ */
+export async function writeNormalizedMarkdown(
+	destPath: string,
+	content: string,
+	options?: { skipIfUnchanged?: boolean },
+): Promise<void> {
+	const normalized = normalizeLegacyAdmonitionTitles(content);
+	if (options?.skipIfUnchanged && normalized === content) return;
+	await writeFile(destPath, normalized, "utf-8");
+}
+
 // ─── hasIncompatibleImports (internal helper) ────────────────────────────────
 
 /**
@@ -270,10 +458,14 @@ export function hasIncompatibleImports(content: string, rules?: ContentRules): b
  *   1. Imports from unknown packages (not in safe prefixes)
  *   2. JSX components that came from unsafe imports or are unknown
  *   3. `export` statements
- *   4. Docusaurus admonition syntax (`:::tip`, `:::warning`, etc.)
  *
  * Safe imports (e.g. `nextra/components`) and their components (e.g.
  * `<Callout>`, `<Tabs>`) are preserved so the file can stay `.mdx`.
+ *
+ * Docusaurus admonition syntax (`:::tip`, `:::warning`, etc.) is intentionally
+ * left intact — it's handled at runtime by the Nextra remark plugin
+ * `remark-admonitions-to-callout.mjs` (see `generateRemarkAdmonitionsPlugin`
+ * in `NextraProjectWriter.ts`).
  *
  * Returns `{ content, hasSafeJsx }` — when `hasSafeJsx` is `true`, the
  * caller should keep the `.mdx` extension instead of downgrading to `.md`.
@@ -359,9 +551,6 @@ export function stripIncompatibleContent(content: string, rules?: ContentRules):
 		return `style="${css}"`;
 	});
 
-	// Remove Docusaurus admonition fences (:::tip, :::warning, etc.)
-	result = result.replace(/^:::.*$/gm, "");
-
 	// Clean up excessive blank lines left by removals
 	result = result.replace(/\n{3,}/g, "\n\n");
 
@@ -419,7 +608,7 @@ async function downgradeMdx(
 	const outRelPath = stripped.hasSafeJsx ? relPath : relPath.replace(/\.mdx$/, ".md");
 	const destPath = join(contentDir, outRelPath);
 	await ensureDir(destPath);
-	await writeFile(destPath, stripped.content, "utf-8");
+	await writeNormalizedMarkdown(destPath, stripped.content);
 	result.markdownFiles.push(outRelPath);
 	if (!stripped.hasSafeJsx) {
 		result.downgradedCount++;
@@ -704,27 +893,34 @@ async function processFile(
 
 	switch (fileType) {
 		case "markdown": {
+			let rawContent: string | null;
+			try {
+				rawContent = await readFile(fullPath, "utf-8");
+			} catch {
+				rawContent = null;
+			}
+
 			if (ext === ".mdx") {
-				let mdxContent: string;
-				try {
-					mdxContent = await readFile(fullPath, "utf-8");
-				} catch {
+				// `.mdx` readFile failure: drop the file silently. The MDX
+				// compatibility checks below need the source content, and
+				// we'd rather skip a single unreadable page than ship a
+				// broken one.
+				if (rawContent === null) {
 					result.ignoredFiles.push(relPath);
 					return;
 				}
-
 				// Layer 1: fast regex check for incompatible imports / unknown JSX
 				// Catches missing modules that webpack would fail on.
-				if (hasIncompatibleImports(mdxContent, contentRules)) {
-					await downgradeMdx(relPath, mdxContent, contentDir, result);
+				if (hasIncompatibleImports(rawContent, contentRules)) {
+					await downgradeMdx(relPath, rawContent, contentDir, result);
 					return;
 				}
 
 				// Layer 2: MDX compiler check for syntax errors the regex can't detect
 				// (e.g. malformed JSX, invalid expressions). Only runs on files
 				// that passed the regex check.
-				if (!(await canCompileMdx(mdxContent))) {
-					await downgradeMdx(relPath, mdxContent, contentDir, result);
+				if (!(await canCompileMdx(rawContent))) {
+					await downgradeMdx(relPath, rawContent, contentDir, result);
 					return;
 				}
 			}
@@ -732,21 +928,23 @@ async function processFile(
 			const destPath = join(contentDir, relPath);
 			await ensureDir(destPath);
 
-			// If the file was remapped, rewrite relative image paths
-			// to account for the new directory location.
-			if (originalRelPath !== relPath) {
-				let mdContent: string;
-				try {
-					mdContent = await readFile(fullPath, "utf-8");
-				} catch {
-					await copyFile(fullPath, destPath);
-					break;
-				}
-				const rewritten = rewriteRelativeImagePaths(mdContent, originalRelPath, relPath, pathMappings);
-				await writeFile(destPath, rewritten, "utf-8");
-			} else {
+			// `.md` readFile failure: fall back to a raw `copyFile` so the
+			// page still reaches the build output. Normalization is
+			// necessarily skipped because there's no content to transform.
+			if (rawContent === null) {
 				await copyFile(fullPath, destPath);
+				break;
 			}
+
+			// Rewrite relative image paths if the file was remapped, then write
+			// through writeNormalizedMarkdown so legacy Docusaurus admonition
+			// titles (`:::tip Title` → `:::tip[Title]`) are normalized into the
+			// standard Markdown Directive labels the Nextra remark plugin reads.
+			let processed = rawContent;
+			if (originalRelPath !== relPath) {
+				processed = rewriteRelativeImagePaths(processed, originalRelPath, relPath, pathMappings);
+			}
+			await writeNormalizedMarkdown(destPath, processed);
 			break;
 		}
 		case "image": {

@@ -45,6 +45,11 @@ const FAKE_CREDS: GitCredentials = {
 	lockOwnerToken: "test-lock-owner-token",
 };
 
+async function backdateFile(path: string, ageMs: number): Promise<void> {
+	const seconds = (Date.now() - ageMs) / 1000;
+	await utimes(path, seconds, seconds);
+}
+
 let rootTempDir: string;
 let bareRepo: string;
 let bareRepoUrl: string;
@@ -674,8 +679,7 @@ describe("GitClient", () => {
 			// `mtimeMs` carries sub-ms precision, so a just-written lock can
 			// read as *newer* than a TTL=0 cutoff — backdating removes that
 			// race and makes the assertion truly clock-resolution-independent.
-			const past = new Date(Date.now() - 60_000);
-			await utimes(indexLock, past, past);
+			await backdateFile(indexLock, 60_000);
 			const result = await client.sweepStaleLockFiles(0);
 			expect(result.removed).toContain(indexLock);
 			// Sanity: lock actually gone from disk.
@@ -693,8 +697,7 @@ describe("GitClient", () => {
 			// Backdate so the mtime is unambiguously older than the cutoff —
 			// see the index.lock case above for why a TTL=0 sweep otherwise
 			// races sub-ms `mtimeMs` against floored `Date.now()`.
-			const past = new Date(Date.now() - 60_000);
-			await utimes(branchLock, past, past);
+			await backdateFile(branchLock, 60_000);
 			const result = await client.sweepStaleLockFiles(0);
 			expect(result.removed).toContain(branchLock);
 		});
