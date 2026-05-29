@@ -61,7 +61,7 @@ export interface NavigationParseResult {
 // ─── Limits (aligned with web tool SiteConfig.ts) ──────────────────────────
 
 /** Maximum number of top-level pages in page mode. */
-export const MAX_PAGES = 10;
+export const MAX_PAGES = 100;
 /** Maximum nesting depth for article.articles children. */
 export const MAX_ARTICLE_DEPTH = 4;
 
