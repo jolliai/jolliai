@@ -20,6 +20,7 @@ import type {
 	RootInjectionInput,
 } from "@jolli.ai/site-core";
 import {
+	buildApiSidebarOverrides,
 	buildNavigationContentPlan,
 	buildPipeline,
 	deriveSpecName,
@@ -36,7 +37,6 @@ import { discoverCustomScripts } from "../site/CustomScripts.js";
 import { needsInstall, runNpmInstall, runNpmStart } from "../site/NpmRunner.js";
 import { runPagefind } from "../site/PagefindRunner.js";
 import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
-import { buildApiSidebarOverrides } from "../site/renderer/nextra/index.js";
 import type { OpenApiSpecInput } from "../site/renderer/SiteRenderer.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
 import { startSourceWatcher } from "../site/SourceWatcher.js";

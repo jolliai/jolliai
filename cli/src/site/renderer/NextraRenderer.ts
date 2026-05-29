@@ -17,15 +17,19 @@ import type {
 	SidebarOverrides,
 	SiteJson,
 } from "@jolli.ai/site-core";
-import { hexToHsl } from "@jolli.ai/site-core";
+import {
+	EMPTY_API_NAV_METHODS,
+	emitNextraOpenApiFiles,
+	generateApiComponents,
+	generateApiCss,
+	hexToHsl,
+	type TemplateFile,
+} from "@jolli.ai/site-core";
 import { generateMetaFiles } from "../MetaGenerator.js";
 import { initNextraProject } from "../NextraProjectWriter.js";
 import { runNpmBuild, runNpmDev, type ServerResult } from "../NpmRunner.js";
 import type { OutputFilter } from "../OutputFilter.js";
 import { createOutputFilter as createFilter } from "../OutputFilter.js";
-import { generateApiCss } from "./nextra/ApiCss.js";
-import { EMPTY_API_NAV_METHODS, emitNextraOpenApiFiles, generateApiComponents } from "./nextra/index.js";
-import type { TemplateFile } from "./nextra/Types.js";
 import type { ContentRules, OpenApiSpecInput, SiteRenderer } from "./SiteRenderer.js";
 
 // ─── Nextra-specific constants ──────────────────────────────────────────────

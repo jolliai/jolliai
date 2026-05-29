@@ -13,7 +13,7 @@
 
 import type { OpenApiPipelineResult } from "@jolli.ai/site-core";
 import { generateCodeSamples } from "@jolli.ai/site-core";
-import type { OpenApiSpecInput } from "../SiteRenderer.js";
+import type { OpenApiSpecInput } from "../../openapi/Types.js";
 import { emitApiNavMethods } from "./ApiNavMethods.js";
 import { emitEndpointData } from "./EndpointDataEmitter.js";
 import { emitEndpointPage, emitRefsFile } from "./EndpointPageEmitter.js";

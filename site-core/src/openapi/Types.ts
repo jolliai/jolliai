@@ -181,3 +181,29 @@ export interface OpenApiPipelineResult {
 	spec: ParsedSpec;
 	dossiers: EndpointDossier[];
 }
+
+// ─── Emission input (consumer-built handoff to the renderer) ─────────────────
+
+/**
+ * One OpenAPI spec ready for emission. Built once by the consumer (CLI's
+ * `StartCommand` from the raw documents `ContentMirror` cached) so
+ * renderers receive a parsed, walked, sample-augmented IR and never
+ * re-parse the source file.
+ */
+export interface OpenApiSpecInput {
+	/**
+	 * URL slug used in `/api-{specName}/...` routes and in folder names
+	 * under `content/`. Derived from the source file's basename via
+	 * `deriveSpecName`.
+	 */
+	specName: string;
+	/**
+	 * Source-folder relative path (e.g. `api/petstore.yaml`). Useful for
+	 * diagnostics; emitters do not need to read the source file again.
+	 */
+	sourceRelPath: string;
+	/** Optional UI-facing title when the spec is explicitly declared in site.json navigation. */
+	displayTitle?: string;
+	/** Pre-built parser + per-operation code samples. */
+	pipeline: OpenApiPipelineResult;
+}
