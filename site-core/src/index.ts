@@ -3,12 +3,10 @@
  * site generation.
  *
  * Pure-logic portion of the site pipeline (navigation parsing, content
- * planning, OpenAPI IR, Nextra emitter). File I/O and subprocess work
- * stay in the consumer (CLI or web tool); biome lint enforces this at
- * the package boundary.
- *
- * Migration in progress — additional exports land as files migrate
- * from `cli/src/site/` in subsequent phases.
+ * planning, OpenAPI IR, Nextra emitter, schema coercions, framework
+ * detection, starter templates, Docusaurus import). File I/O and
+ * subprocess work stay in the consumer (CLI or web tool); biome
+ * `noRestrictedImports` enforces this at the package boundary.
  *
  * Note on naming: Sanitize.ts and openapi/Escape.ts both define an
  * `escapeHtml` function (Sanitize.ts is the canonical/general one;
@@ -19,7 +17,7 @@
  */
 
 /** Current package version. Bumped per release; read by consumers for diagnostics. */
-export const VERSION = "0.0.0";
+export const VERSION = "0.1.0";
 
 // ─── Color utilities ──────────────────────────────────────────────────────
 export * from "./ColorUtils.js";

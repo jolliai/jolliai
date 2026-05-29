@@ -1,11 +1,12 @@
 # Release process
 
-This document describes the release process for **the CLI and VS Code extension** — two artifacts that share one flow:
+This document describes the release process for **the CLI, VS Code extension, and site-core library** — three artifacts that share one flow:
 
 - **CLI** — `@jolli.ai/cli` on npm. Tag prefix: `release-cli-v<version>`. Workflow: [`publish-cli.yaml`](.github/workflows/publish-cli.yaml).
 - **VS Code extension** — `jolli.jollimemory-vscode` on the VS Code Marketplace and Open VSX. Tag prefix: `release-vscode-v<version>`. Workflow: [`publish-vscode.yaml`](.github/workflows/publish-vscode.yaml).
+- **site-core library** — `@jolli.ai/site-core` on npm. Tag prefix: `release-site-core-v<version>`. Workflow: [`publish-site-core.yaml`](.github/workflows/publish-site-core.yaml). The framework-agnostic core for site generation, consumed by `@jolli.ai/cli` and the Jolli web tool.
 
-Each artifact has its own workflow but they share the branch model, signing requirements, and procedural shape below. The two artifacts can release at independent versions and on independent cadences.
+Each artifact has its own workflow but they share the branch model, signing requirements, and procedural shape below. The three artifacts can release at independent versions and on independent cadences. When CLI consumes a new site-core version, publish site-core first, then bump CLI's `@jolli.ai/site-core` dependency on `release/<minor>.x`, then publish CLI.
 
 > **Out of scope: IntelliJ plugin.** The `intellij/` deliverable currently uses its own legacy [`publish-intellij.yaml`](.github/workflows/publish-intellij.yaml) workflow (Gradle-based JetBrains Marketplace publish, no maintenance branches, no sigstore tag signing). It is **not** covered by this document. Migrating it to the same model is a separate piece of work.
 
@@ -37,10 +38,11 @@ release/1.6.x                ●─●─●  every release-cli-v* AND release-v
 
     Your first `git tag -s` opens a browser for GitHub OAuth — authorize once. Subsequent tags reuse the cached OIDC session until it expires.
 
-- Membership in the `Production` GitHub Environment (manual approval gate; both workflows use the same environment).
+- Membership in the `Production` GitHub Environment (manual approval gate; all three workflows use the same environment).
 - For CLI: npm trusted publishing is configured for `@jolli.ai/cli` against `jolliai/jolliai` + `publish-cli.yaml` + the `Production` environment. No `NPM_TOKEN` is required.
+- For site-core: npm trusted publishing is configured for `@jolli.ai/site-core` against `jolliai/jolliai` + `publish-site-core.yaml` + the `Production` environment. No `NPM_TOKEN` is required.
 - For VS Code: long-lived PATs in repo secrets (`JOLLIMEMORY_VSCE_PAT` for VS Code Marketplace, `JOLLIMEMORY_OVSX_PAT` for Open VSX). Neither marketplace currently supports OIDC trusted publishing.
-- Permission to push tags matching `release-cli-v*` and/or `release-vscode-v*`.
+- Permission to push tags matching `release-cli-v*`, `release-vscode-v*`, and/or `release-site-core-v*`.
 
 ## Trigger
 
@@ -50,9 +52,9 @@ This keeps "tag exists in git" and "release has been requested" as two distinct 
 
 ## Procedures
 
-> The procedures below use `<artifact>` as a placeholder for `cli` or `vscode`. Substitute the appropriate one — `<artifact>/package.json`, tag prefix `release-<artifact>-v`, and the corresponding workflow ("Publish CLI to NPM" or "Publish VS Code Extension to Marketplaces") — for the artifact you are releasing.
+> The procedures below use `<artifact>` as a placeholder for `cli`, `vscode`, or `site-core`. Substitute the appropriate one — `<artifact>/package.json`, tag prefix `release-<artifact>-v`, and the corresponding workflow ("Publish CLI to NPM", "Publish VS Code Extension to Marketplaces", or "Publish site-core to NPM") — for the artifact you are releasing.
 >
-> Both artifacts can be released independently from the same `release/<minor>.x` branch using their respective tags. To release both at once, do step 1 for both `cli/` and `vscode/` in one PR (or two PRs), then sign and push both tags and trigger both workflows.
+> All three artifacts can be released independently from the same `release/<minor>.x` branch using their respective tags. To release multiple at once, do step 1 for each in one PR (or one PR each), then sign and push each tag and trigger each workflow.
 
 ### A. Regular minor or major (e.g. 1.5.x → 1.6.0)
 
