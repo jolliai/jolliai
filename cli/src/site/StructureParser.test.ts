@@ -1,6 +1,6 @@
+import type { NavigationArticle, NavigationGroup, NavigationPage } from "@jolli.ai/site-core";
 import { describe, expect, it } from "vitest";
 import { MAX_ARTICLE_DEPTH, MAX_PAGES, parseNavigation, parsePages } from "./StructureParser.js";
-import type { NavigationArticle, NavigationGroup, NavigationPage } from "./Types.js";
 
 // ─── parseNavigation: simple mode (no pages) ─────────────────────────────────
 

@@ -8,11 +8,16 @@
  * framework-specific functions directly.
  */
 
+import type {
+	CustomScriptAsset,
+	NpmRunResult,
+	OpenApiPipelineResult,
+	SidebarOverrides,
+	SiteJson,
+} from "@jolli.ai/site-core";
 import type { RootInjectionInput } from "../MetaGenerator.js";
 import type { ServerResult } from "../NpmRunner.js";
 import type { OutputFilter } from "../OutputFilter.js";
-import type { OpenApiPipelineResult } from "../openapi/Types.js";
-import type { CustomScriptAsset, NpmRunResult, SidebarOverrides, SiteJson } from "../Types.js";
 
 // ─── ContentRules ───────────────────────────────────────────────────────────
 

@@ -14,8 +14,8 @@ import { existsSync, lstatSync, readFileSync, unlinkSync } from "node:fs";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { NpmRunResult } from "@jolli.ai/site-core";
 import { NEXTRA_DEPENDENCIES, NEXTRA_DEV_DEPENDENCIES, NEXTRA_OVERRIDES } from "./NextraProjectWriter.js";
-import type { NpmRunResult } from "./Types.js";
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 

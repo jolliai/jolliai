@@ -15,8 +15,6 @@
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { sanitizeUrl } from "@jolli.ai/site-core";
-import { SCOPE_PAGE_MAP_RUNTIME_SOURCE } from "./ScopePageMap.js";
 import type {
 	AnchorItem,
 	CustomScriptAsset,
@@ -26,7 +24,9 @@ import type {
 	Navigation,
 	NavigationPage,
 	ThemeConfig,
-} from "./Types.js";
+} from "@jolli.ai/site-core";
+import { sanitizeUrl } from "@jolli.ai/site-core";
+import { SCOPE_PAGE_MAP_RUNTIME_SOURCE } from "./ScopePageMap.js";
 import { SOCIAL_PLATFORMS } from "./themes/Footer.js";
 import type { ThemePackProvider } from "./themes/ThemeRegistry.js";
 import { discoverPack, resolvePack } from "./themes/ThemeRegistry.js";

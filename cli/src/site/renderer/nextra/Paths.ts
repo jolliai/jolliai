@@ -11,8 +11,8 @@
  * Vercel builds with "Module not found" outside the project root.
  */
 
+import type { OpenApiOperation } from "@jolli.ai/site-core";
 import { slugify } from "@jolli.ai/site-core";
-import type { OpenApiOperation } from "../../openapi/Types.js";
 
 // ─── apiSpecFolderSlug ───────────────────────────────────────────────────────
 

@@ -9,8 +9,8 @@
  * throwing, so the caller can print the error and set the exit code.
  */
 
+import type { PagefindResult } from "@jolli.ai/site-core";
 import { spawnSyncHidden } from "../util/Subprocess.js";
-import type { PagefindResult } from "./Types.js";
 
 /**
  * On Windows, npx is a .cmd script that requires shell: true since

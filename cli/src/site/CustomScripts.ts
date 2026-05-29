@@ -18,7 +18,7 @@
 import type { Dirent } from "node:fs";
 import { copyFile, mkdir, readdir, stat } from "node:fs/promises";
 import { dirname, extname, join, relative } from "node:path";
-import type { CustomScriptAsset } from "./Types.js";
+import type { CustomScriptAsset } from "@jolli.ai/site-core";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 

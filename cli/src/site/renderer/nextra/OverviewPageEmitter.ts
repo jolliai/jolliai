@@ -5,8 +5,8 @@
  * mirrors the sidebar.
  */
 
+import type { OpenApiOperation, ParsedSpec } from "@jolli.ai/site-core";
 import { escapeInlineCode, escapeMdxText, escapeYaml } from "@jolli.ai/site-core";
-import type { OpenApiOperation, ParsedSpec } from "../../openapi/Types.js";
 import { apiSpecFolderSlug, endpointRoutePath } from "./Paths.js";
 import type { TemplateFile } from "./Types.js";
 

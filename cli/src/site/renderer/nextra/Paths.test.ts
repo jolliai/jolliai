@@ -1,5 +1,5 @@
+import type { OpenApiOperation } from "@jolli.ai/site-core";
 import { describe, expect, it } from "vitest";
-import type { OpenApiOperation } from "../../openapi/Types.js";
 import {
 	apiSpecFolderSlug,
 	endpointDataImportSpecifier,

@@ -9,7 +9,15 @@ import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { escapeHtml, sanitizeUrl } from "@jolli.ai/site-core";
+import type {
+	HeaderItem,
+	Navigation,
+	NavigationArticle,
+	NavigationGroup,
+	NavLink,
+	PathMappings,
+} from "@jolli.ai/site-core";
+import { buildPipeline, deriveSpecName, escapeHtml, sanitizeUrl } from "@jolli.ai/site-core";
 import type { Command } from "commander";
 import { resolveFavicon } from "../site/AssetResolver.js";
 import { applyPathMapping, clearDir, mirrorContent } from "../site/ContentMirror.js";
@@ -21,8 +29,6 @@ import {
 import { discoverCustomScripts } from "../site/CustomScripts.js";
 import type { RootApiSpec, RootInjectionInput } from "../site/MetaGenerator.js";
 import { needsInstall, runNpmInstall, runNpmStart } from "../site/NpmRunner.js";
-import { buildPipeline } from "../site/openapi/OpenApiPipeline.js";
-import { deriveSpecName } from "../site/openapi/SpecName.js";
 import { runPagefind } from "../site/PagefindRunner.js";
 import { resolveRenderer, type SiteRenderer } from "../site/renderer/index.js";
 import { buildApiSidebarOverrides } from "../site/renderer/nextra/index.js";
@@ -30,14 +36,6 @@ import type { OpenApiSpecInput } from "../site/renderer/SiteRenderer.js";
 import { readSiteJson } from "../site/SiteJsonReader.js";
 import { startSourceWatcher } from "../site/SourceWatcher.js";
 import { parseNavigation } from "../site/StructureParser.js";
-import type {
-	HeaderItem,
-	Navigation,
-	NavigationArticle,
-	NavigationGroup,
-	NavLink,
-	PathMappings,
-} from "../site/Types.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

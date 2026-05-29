@@ -1,5 +1,5 @@
+import type { OpenApiOperation, ParsedSpec } from "@jolli.ai/site-core";
 import { describe, expect, it } from "vitest";
-import type { OpenApiOperation, ParsedSpec } from "../../openapi/Types.js";
 import { emitEndpointData } from "./EndpointDataEmitter.js";
 
 function makeSpec(overrides: Partial<ParsedSpec> = {}): ParsedSpec {

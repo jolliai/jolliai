@@ -4,8 +4,8 @@
  * of TemplateFile paths is produced.
  */
 
+import type { OpenApiOperation, OpenApiPipelineResult, ParsedSpec } from "@jolli.ai/site-core";
 import { describe, expect, it } from "vitest";
-import type { OpenApiOperation, OpenApiPipelineResult, ParsedSpec } from "../../openapi/Types.js";
 import type { OpenApiSpecInput } from "../SiteRenderer.js";
 import { emitNextraOpenApiFiles, emitNextraOpenApiForSpec } from "./index.js";
 

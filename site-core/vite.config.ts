@@ -9,7 +9,11 @@ export default defineConfig({
 		coverage: {
 			provider: "v8",
 			reporter: ["text", "json-summary"],
-			exclude: ["src/index.ts", "vite.config.ts", "**/*.test.ts"],
+			// Only instrument source files. Default v8 instruments anything
+			// loaded by Node, which sweeps in the workspace's own `dist/` as a
+			// side effect of `npm run all` rebuilding right before testing.
+			include: ["src/**/*.ts"],
+			exclude: ["src/index.ts", "vite.config.ts", "**/*.test.ts", "**/dist/**"],
 			thresholds: {
 				statements: 97,
 				branches: 96,

@@ -1,11 +1,11 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import type { Navigation, NavigationArticle, NavigationGroup, NavigationPage } from "@jolli.ai/site-core";
 import { slugify } from "@jolli.ai/site-core";
 import { hasIncompatibleImports, rewriteRelativeImagePaths, stripIncompatibleContent } from "./ContentMirror.js";
 import type { ContentRules } from "./renderer/SiteRenderer.js";
 import { normalizeHrefSegments } from "./StructureParser.js";
-import type { Navigation, NavigationArticle, NavigationGroup, NavigationPage } from "./Types.js";
 
 export interface PlannedMarkdownPage {
 	sourceRelPath: string;

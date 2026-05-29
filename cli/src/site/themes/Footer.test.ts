@@ -13,8 +13,8 @@
  * even though the tree still emits "something".
  */
 
+import type { FooterConfig } from "@jolli.ai/site-core";
 import { describe, expect, it } from "vitest";
-import type { FooterConfig } from "../Types.js";
 import {
 	buildAtlasFooterBody,
 	buildFooterScaffold,
