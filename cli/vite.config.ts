@@ -60,7 +60,7 @@ export default defineConfig({
 		coverage: {
 			provider: "v8",
 			reporter: ["text", "json-summary"],
-			exclude: ["src/Types.ts", "src/commands/StartCommand.ts", "src/commands/ReverseCommand.ts", "src/commands/ThemeCommand.ts", "src/site/ContentPlanner.ts", "src/site/themes/ThemeRegistry.ts", "vite.config.ts", "test/**"],
+			exclude: ["src/Types.ts", "src/commands/StartCommand.ts", "src/commands/ReverseCommand.ts", "src/commands/ThemeCommand.ts", "src/site/themes/ThemeRegistry.ts", "vite.config.ts", "test/**"],
 			thresholds: {
 				statements: 97,
 				branches: 96,
