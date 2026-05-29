@@ -57,9 +57,10 @@ export * from "./renderer/nextra/index.js";
 export { escapeHtml, sanitizeUrl } from "./Sanitize.js";
 // ─── Scope page-map (Nextra sidebar scoping helper) ────────────────────────
 export * from "./ScopePageMap.js";
+// ─── site.json shape validation (friendly diagnostics) ─────────────────────
+export * from "./SiteJsonFormatter.js";
 // ─── site.json schema coercions (deprecated-alias migration) ───────────────
 export * from "./SiteJsonSchema.js";
-// ─── site.json shape validation (friendly diagnostics) ─────────────────────
 export * from "./SiteJsonValidator.js";
 // ─── Starter kit (templates for `jolli new` / web "new site" flow) ─────────
 export { getStarterFiles } from "./StarterKit.js";
