@@ -291,3 +291,176 @@ describe("validateSiteJsonShape — issue ordering + composition", () => {
 		).toEqual([]);
 	});
 });
+
+// ─── locateIssues ────────────────────────────────────────────────────────────
+
+describe("locateIssues — root anchors", () => {
+	it("anchors a root-not-object issue at line 1 column 1 (whole-doc fallback)", async () => {
+		const { locateIssues, validateSiteJsonShape } = await import("./SiteJsonValidator.js");
+		const raw = `"just a string"`;
+		const located = locateIssues(raw, validateSiteJsonShape(JSON.parse(raw)));
+		expect(located).toHaveLength(1);
+		expect(located[0].code).toBe("root-not-object");
+		expect(located[0].line).toBe(1);
+		expect(located[0].column).toBe(1);
+	});
+
+	it("anchors a missing-title issue at the document root when title is absent", async () => {
+		const { locateIssues, validateSiteJsonShape } = await import("./SiteJsonValidator.js");
+		const raw = `{\n  "description": "x"\n}\n`;
+		const issues = validateSiteJsonShape(JSON.parse(raw));
+		const located = locateIssues(raw, issues);
+		const missingTitle = located.find((i) => i.code === "missing-title");
+		// The path is ["title"], which doesn't exist in source — falls back
+		// to the document root (line 1).
+		expect(missingTitle?.line).toBe(1);
+	});
+});
+
+describe("locateIssues — direct path resolution", () => {
+	it("points at the value of a wrong-type title", async () => {
+		const { locateIssues, validateSiteJsonShape } = await import("./SiteJsonValidator.js");
+		// Source has title on line 2.
+		const raw = `{\n  "title": 42\n}\n`;
+		const located = locateIssues(raw, validateSiteJsonShape(JSON.parse(raw)));
+		expect(located[0].code).toBe("title-not-string");
+		expect(located[0].line).toBe(2);
+		// `findNodeAtLocation` for ["title"] returns the value node (42),
+		// so the column points at the value, not the key.
+		expect(located[0].column).toBeGreaterThan(1);
+	});
+
+	it("points at the array element for an unrecognized nav-entry", async () => {
+		const { locateIssues, validateSiteJsonShape } = await import("./SiteJsonValidator.js");
+		const raw = `{
+  "title": "x",
+  "navigation": [
+    { "label": "broken" }
+  ]
+}
+`;
+		const located = locateIssues(raw, validateSiteJsonShape(JSON.parse(raw)));
+		const issue = located.find((i) => i.code === "unrecognized-nav-entry");
+		expect(issue?.line).toBe(4);
+	});
+});
+
+describe("locateIssues — ancestor fallback", () => {
+	it("falls back to the parent object when the offending field doesn't exist in source", async () => {
+		// article-without-href produces path ["navigation", 0, "href"], but
+		// `href` isn't in the source. The resolver should fall back to
+		// ["navigation", 0] — the article object itself.
+		const { locateIssues, validateSiteJsonShape } = await import("./SiteJsonValidator.js");
+		const raw = `{
+  "title": "x",
+  "navigation": [
+    { "article": "Missing href" }
+  ]
+}
+`;
+		const located = locateIssues(raw, validateSiteJsonShape(JSON.parse(raw)));
+		const issue = located.find((i) => i.code === "article-without-href");
+		// Anchors on the article object (line 4), not buried at the root.
+		expect(issue?.line).toBe(4);
+	});
+
+	it("anchors article-with-openapi on the article object even though the path doesn't include 'openapi'", async () => {
+		const { locateIssues, validateSiteJsonShape } = await import("./SiteJsonValidator.js");
+		const raw = `{
+  "title": "x",
+  "navigation": [
+    { "article": "REST API", "openapi": "/api/openapi.yaml" }
+  ]
+}
+`;
+		const located = locateIssues(raw, validateSiteJsonShape(JSON.parse(raw)));
+		const issue = located.find((i) => i.code === "article-with-openapi");
+		expect(issue?.line).toBe(4);
+	});
+});
+
+describe("locateIssues — deep paths", () => {
+	it("resolves a deeply nested path (group.content[i].articles[j]) correctly", async () => {
+		const { locateIssues, validateSiteJsonShape } = await import("./SiteJsonValidator.js");
+		const raw = `{
+  "title": "x",
+  "navigation": [
+    {
+      "group": "Get Started",
+      "root": "guides",
+      "content": [
+        { "article": "OK", "href": "ok" },
+        {
+          "article": "Parent",
+          "href": "parent",
+          "articles": [
+            { "article": "Bad" }
+          ]
+        }
+      ]
+    }
+  ]
+}
+`;
+		const located = locateIssues(raw, validateSiteJsonShape(JSON.parse(raw)));
+		const issue = located.find((i) => i.code === "article-without-href");
+		// The "Bad" article is on line 13.
+		expect(issue?.line).toBe(13);
+	});
+
+	it("computes endLine / endColumn for multi-line nodes", async () => {
+		const { locateIssues, validateSiteJsonShape } = await import("./SiteJsonValidator.js");
+		const raw = `{
+  "title": "x",
+  "navigation": [
+    {
+      "article": "broken"
+    }
+  ]
+}
+`;
+		const located = locateIssues(raw, validateSiteJsonShape(JSON.parse(raw)));
+		const issue = located.find((i) => i.code === "article-without-href");
+		// The article spans multiple lines (the `{` on line 4, `}` on line 6).
+		expect(issue?.line).toBe(4);
+		expect(issue?.endLine).toBeGreaterThanOrEqual(issue?.line ?? 0);
+	});
+});
+
+describe("locateIssues — pathological inputs", () => {
+	it("never throws on completely empty input", async () => {
+		const { locateIssues } = await import("./SiteJsonValidator.js");
+		expect(() => locateIssues("", [])).not.toThrow();
+	});
+
+	it("returns the issues unchanged (with default position) when paths cannot resolve", async () => {
+		const { locateIssues } = await import("./SiteJsonValidator.js");
+		const raw = `{"title":"x"}`;
+		const located = locateIssues(raw, [
+			{
+				severity: "error",
+				code: "fake",
+				path: ["does", "not", "exist"],
+				message: "synthetic",
+			},
+		]);
+		// Falls back to root (or 1,1 in the worst case).
+		expect(located[0].line).toBeGreaterThanOrEqual(1);
+		expect(located[0].column).toBeGreaterThanOrEqual(1);
+		expect(located[0].code).toBe("fake");
+	});
+
+	it("returns a sensible position when rawText is malformed JSON (parseTree returns undefined)", async () => {
+		const { locateIssues } = await import("./SiteJsonValidator.js");
+		const located = locateIssues("totally bogus", [
+			{
+				severity: "error",
+				code: "fake",
+				path: [],
+				message: "synthetic",
+			},
+		]);
+		expect(located[0].line).toBe(1);
+		expect(located[0].column).toBe(1);
+	});
+});
