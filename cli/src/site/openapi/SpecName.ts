@@ -10,7 +10,7 @@
  */
 
 import { basename, extname } from "node:path";
-import { slugify } from "./Slug.js";
+import { slugify } from "@jolli.ai/site-core";
 
 export function deriveSpecName(relPath: string): string {
 	const ext = extname(relPath);

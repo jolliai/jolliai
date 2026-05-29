@@ -28,7 +28,7 @@
 		"test:vscode": "npm run test -w vscode",
 		"test:acceptance": "npm run test:acceptance -w @jolli.ai/cli",
 		"clean": "npm run clean -w @jolli.ai/site-core && npm run clean -w @jolli.ai/cli && npm run clean -w vscode",
-		"all": "npm run clean && npm run typecheck && npm run build && npm run lint && npm run test",
+		"all": "npm run clean && npm run build && npm run typecheck && npm run lint && npm run test",
 		"cli": "npm run cli -w @jolli.ai/cli",
 		"cli:build": "npm run cli:build -w @jolli.ai/cli"
 	},

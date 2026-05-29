@@ -10,7 +10,7 @@
  * them up at render time via `ParsedSpec.componentSchemas`.
  */
 
-import { slugify } from "./Slug.js";
+import { slugify } from "@jolli.ai/site-core";
 import type {
 	OpenApiDocument,
 	OpenApiHttpMethod,
