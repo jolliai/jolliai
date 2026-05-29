@@ -59,6 +59,8 @@ export { escapeHtml, sanitizeUrl } from "./Sanitize.js";
 export * from "./ScopePageMap.js";
 // ─── site.json schema coercions (deprecated-alias migration) ───────────────
 export * from "./SiteJsonSchema.js";
+// ─── site.json shape validation (friendly diagnostics) ─────────────────────
+export * from "./SiteJsonValidator.js";
 // ─── Starter kit (templates for `jolli new` / web "new site" flow) ─────────
 export { getStarterFiles } from "./StarterKit.js";
 // ─── Navigation structure parsing (sidebar tree from site.json) ────────────
