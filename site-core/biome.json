@@ -1,0 +1,72 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.2.6/schema.json",
+	"files": {
+		"includes": ["src/**"]
+	},
+	"assist": {
+		"enabled": true,
+		"actions": {
+			"source": {
+				"organizeImports": "on"
+			}
+		}
+	},
+	"formatter": {
+		"enabled": true,
+		"indentStyle": "tab",
+		"indentWidth": 4,
+		"lineWidth": 120
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"correctness": {
+				"noUnusedImports": "error",
+				"noUnusedVariables": "error"
+			},
+			"performance": {
+				"noDelete": "off"
+			},
+			"style": {
+				"useConst": "warn",
+				"useImportType": "warn",
+				"useNodejsImportProtocol": "warn",
+				"noRestrictedImports": {
+					"level": "error",
+					"options": {
+						"paths": {
+							"node:fs": "site-core is framework-agnostic and must not touch the filesystem. File I/O belongs in CLI or web-tool consumer code.",
+							"node:fs/promises": "site-core is framework-agnostic and must not touch the filesystem. File I/O belongs in CLI or web-tool consumer code.",
+							"node:child_process": "site-core is framework-agnostic and must not spawn processes. Subprocess work belongs in CLI consumer code.",
+							"child_process": "site-core is framework-agnostic and must not spawn processes. Subprocess work belongs in CLI consumer code.",
+							"fs": "site-core is framework-agnostic and must not touch the filesystem. File I/O belongs in CLI or web-tool consumer code.",
+							"fs/promises": "site-core is framework-agnostic and must not touch the filesystem. File I/O belongs in CLI or web-tool consumer code."
+						}
+					}
+				}
+			},
+			"suspicious": {
+				"noExplicitAny": "error"
+			}
+		}
+	},
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "double",
+			"semicolons": "always"
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["**/*.test.ts"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": "off"
+					}
+				}
+			}
+		}
+	]
+}
