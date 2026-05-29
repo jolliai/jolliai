@@ -15,8 +15,8 @@
 
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join, relative } from "node:path";
+import { sanitizeUrl } from "@jolli.ai/site-core";
 import { toForwardSlash } from "../core/PathUtils.js";
-import { sanitizeUrl } from "./Sanitize.js";
 import type { HeaderItem, SidebarItemValue, SidebarOverrides } from "./Types.js";
 
 // ─── Root-injection types ────────────────────────────────────────────────────

@@ -5,7 +5,7 @@
  * mirrors the sidebar.
  */
 
-import { escapeInlineCode, escapeMdxText, escapeYaml } from "../../openapi/Escape.js";
+import { escapeInlineCode, escapeMdxText, escapeYaml } from "@jolli.ai/site-core";
 import type { OpenApiOperation, ParsedSpec } from "../../openapi/Types.js";
 import { apiSpecFolderSlug, endpointRoutePath } from "./Paths.js";
 import type { TemplateFile } from "./Types.js";

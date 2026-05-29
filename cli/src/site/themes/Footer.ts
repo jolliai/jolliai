@@ -17,7 +17,7 @@
  * Next.js build is what eventually compiles them.
  */
 
-import { escapeHtml, sanitizeUrl } from "../Sanitize.js";
+import { escapeHtml, sanitizeUrl } from "@jolli.ai/site-core";
 import type { FooterConfig, SocialLinks } from "../Types.js";
 
 /** Social platforms recognised by the footer renderer (in display order). */

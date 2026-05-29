@@ -15,7 +15,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { sanitizeUrl } from "./Sanitize.js";
+import { sanitizeUrl } from "@jolli.ai/site-core";
 import { SCOPE_PAGE_MAP_RUNTIME_SOURCE } from "./ScopePageMap.js";
 import type {
 	AnchorItem,
