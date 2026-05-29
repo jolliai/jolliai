@@ -1,0 +1,51 @@
+{
+	"name": "@jolli.ai/site-core",
+	"version": "0.0.0",
+	"description": "Framework-agnostic core for Jolli documentation site generation — navigation parsing, content planning, OpenAPI IR, and Nextra emitter. Shared between @jolli.ai/cli and the Jolli web tool.",
+	"private": true,
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist/",
+		"README.md"
+	],
+	"scripts": {
+		"all": "npm run clean && npm run typecheck && npm run build && npm run lint && npm run test",
+		"build": "tsc --project tsconfig.build.json",
+		"clean": "rimraf dist/",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check --error-on-warnings",
+		"lint:fix": "biome check --write",
+		"test": "vitest run --coverage",
+		"test:watch": "vitest"
+	},
+	"author": "Jolli",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/jolliai/jolliai"
+	},
+	"homepage": "https://github.com/jolliai/jolliai",
+	"bugs": {
+		"url": "https://github.com/jolliai/jolliai/issues"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.2.6",
+		"@vitest/coverage-v8": "^4.1.4",
+		"rimraf": "^6.0.1",
+		"typescript": "^5.7.2",
+		"vitest": "^4.1.4"
+	},
+	"engines": {
+		"node": ">=22.5.0"
+	}
+}
