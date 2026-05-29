@@ -283,6 +283,22 @@ export interface AnchorItem {
 /**
  * An article is a navigable sidebar item. Can nest child articles as a
  * collapsible dropdown.
+ *
+ * `href` semantics — two normalization rules apply before the path is used
+ * anywhere downstream (sidebar tree, source lookup, target write, validation):
+ *
+ *   1. **Leading slash is equivalent to no leading slash.** `/intro` and
+ *      `intro` mean the same thing — both are interpreted as relative to
+ *      the inherited root, never the OS filesystem root.
+ *   2. **Prefix dedup against the inherited root.** The inherited root at
+ *      any point is the concatenation of all ancestor `root` fields —
+ *      `page.root` plus the enclosing `group.root` if any. If the start of
+ *      `href` duplicates the end of that root (e.g. `href: "guides/intro"`
+ *      inside `group{root:"guides"}` under `page{root:"/docs"}`), the
+ *      duplicated segments are stripped. This stops the duplicated prefix
+ *      from creating a phantom intermediate folder in the sidebar.
+ *
+ * See `normalizeHrefSegments` in `StructureParser.ts` for the exact rule.
  */
 export interface NavigationArticle {
 	article: string;
