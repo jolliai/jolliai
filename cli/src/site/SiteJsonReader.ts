@@ -16,7 +16,14 @@ import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { createInterface } from "node:readline";
-import { applyDeprecatedSchemaAliases, DEFAULT_SITE_JSON, type SiteJson } from "@jolli.ai/site-core";
+import {
+	applyDeprecatedSchemaAliases,
+	DEFAULT_SITE_JSON,
+	formatIssues,
+	locateIssues,
+	type SiteJson,
+	validateSiteJsonShape,
+} from "@jolli.ai/site-core";
 import { type ConversionResult, convertDocusaurusSidebar, extractFaviconFromConfig } from "./DocusaurusConverter.js";
 import { detectFramework, promptMigration } from "./FrameworkDetector.js";
 
@@ -79,6 +86,27 @@ async function readExistingSiteJson(filePath: string): Promise<SiteJsonResult> {
 	} catch (err) {
 		const detail = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to parse ${filePath}: ${detail}`);
+	}
+
+	// Shape validation. Warnings print to stderr but build continues with
+	// the lenient field-fallback below; errors print to stderr AND throw
+	// a short summary so the calling command can surface a one-line
+	// rejection without burying the code-frame block under a stack trace.
+	const issues = validateSiteJsonShape(parsed);
+	if (issues.length > 0) {
+		const located = locateIssues(raw, issues);
+		const errors = located.filter((i) => i.severity === "error");
+		const warnings = located.filter((i) => i.severity === "warning");
+		const color = process.stderr.isTTY === true && process.env.NO_COLOR === undefined;
+
+		if (warnings.length > 0) {
+			console.error(formatIssues(raw, warnings, { filename: filePath, color }));
+		}
+		if (errors.length > 0) {
+			console.error(formatIssues(raw, errors, { filename: filePath, color }));
+			const noun = errors.length === 1 ? "error" : "errors";
+			throw new Error(`site.json validation failed with ${errors.length} ${noun}. See above for details.`);
+		}
 	}
 
 	const obj = parsed as Record<string, unknown>;

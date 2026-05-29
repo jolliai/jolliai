@@ -727,3 +727,118 @@ describe("SiteJsonReader.readSiteJson", () => {
 		await expect(readSiteJson(tempDir)).rejects.toThrow("boom");
 	});
 });
+
+// ─── Validator integration (commit 4) ────────────────────────────────────────
+
+describe("readSiteJson — validator integration", () => {
+	let tempDir: string;
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "jolli-sitejson-validator-"));
+	});
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("throws a short summary error with count when shape validation finds errors", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		// Article missing `href` AND carrying the page-only `openapi` field —
+		// two errors on the same entry. The validator surfaces both at once.
+		const siteJson = {
+			title: "x",
+			navigation: [{ article: "REST API", openapi: "/api/openapi.yaml" }],
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson, null, 2), "utf-8");
+
+		await expect(readSiteJson(tempDir)).rejects.toThrow(/validation failed with 2 errors/);
+	});
+
+	it("uses 'error' singular when there's exactly one error", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		// Group without `content` is a single shape error.
+		const siteJson = {
+			title: "x",
+			navigation: [{ group: "Section" }],
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson, null, 2), "utf-8");
+
+		await expect(readSiteJson(tempDir)).rejects.toThrow(/validation failed with 1 error\b/);
+	});
+
+	it("prints the formatted code-frame block to stderr before throwing", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "x",
+			navigation: [{ article: "Missing href" }],
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson, null, 2), "utf-8");
+
+		const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		await expect(readSiteJson(tempDir)).rejects.toThrow(/validation failed/);
+
+		expect(stderrSpy).toHaveBeenCalled();
+		const printed = stderrSpy.mock.calls.map((c) => String(c[0])).join("\n");
+		expect(printed).toContain("article-without-href");
+		expect(printed).toContain(" | "); // code-frame gutter separator
+		stderrSpy.mockRestore();
+	});
+
+	it("prints warnings to stderr but continues parsing when there are no errors", async () => {
+		const { readSiteJson, DEFAULT_SITE_JSON } = await import("./SiteJsonReader.js");
+		// `title: 123` is a warning (validator) + lenient default fallback
+		// (reader). Build must still succeed.
+		const siteJson = { title: 123, description: "D", nav: [] };
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson, null, 2), "utf-8");
+
+		const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const result = await readSiteJson(tempDir);
+
+		expect(stderrSpy).toHaveBeenCalled();
+		const printed = stderrSpy.mock.calls.map((c) => String(c[0])).join("\n");
+		expect(printed).toContain("title-not-string");
+		expect(result.config.title).toBe(DEFAULT_SITE_JSON.title);
+		stderrSpy.mockRestore();
+	});
+
+	it("emits no stderr output when site.json is structurally valid", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		const siteJson = {
+			title: "Acme Cloud Docs",
+			description: "…",
+			navigation: [
+				{ page: "Documentation", root: "/docs", content: [{ article: "Intro", href: "intro" }] },
+				{ page: "API", openapi: "/api/openapi.yaml" },
+			],
+		};
+		await writeFile(join(tempDir, "site.json"), JSON.stringify(siteJson, null, 2), "utf-8");
+
+		const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const result = await readSiteJson(tempDir);
+
+		expect(stderrSpy).not.toHaveBeenCalled();
+		expect(result.config.title).toBe("Acme Cloud Docs");
+		stderrSpy.mockRestore();
+	});
+
+	it("anchors the error block on the actual offending line of site.json", async () => {
+		const { readSiteJson } = await import("./SiteJsonReader.js");
+		// Pretty-printed JSON so the offending object lives on a specific line.
+		const text = `{
+  "title": "x",
+  "navigation": [
+    { "article": "OK", "href": "ok" },
+    { "article": "REST API", "openapi": "/api/openapi.yaml" }
+  ]
+}
+`;
+		await writeFile(join(tempDir, "site.json"), text, "utf-8");
+
+		const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		await expect(readSiteJson(tempDir)).rejects.toThrow(/validation failed/);
+
+		const printed = stderrSpy.mock.calls.map((c) => String(c[0])).join("\n");
+		// Header line includes :5: (the line where the broken entry sits in
+		// the pretty-printed JSON above).
+		expect(printed).toMatch(/:5:\d+ — error\[article-with-openapi\]/);
+		stderrSpy.mockRestore();
+	});
+});
