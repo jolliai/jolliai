@@ -11,7 +11,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { PathMappings, SidebarItemValue, SidebarOverrides } from "./Types.js";
+import type { PathMappings, SidebarItemValue, SidebarOverrides } from "@jolli.ai/site-core";
 
 // ─── Docusaurus sidebar types (subset) ───────────────────────────────────────
 

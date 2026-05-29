@@ -2,7 +2,7 @@
  * Renderer registry — resolves a SiteRenderer from site.json config.
  */
 
-import type { SiteJson } from "../Types.js";
+import type { SiteJson } from "@jolli.ai/site-core";
 import { NextraRenderer } from "./NextraRenderer.js";
 import type { SiteRenderer } from "./SiteRenderer.js";
 

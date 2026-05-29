@@ -17,8 +17,13 @@
  * cleanly and the Overview index stays hidden, matching prior behaviour.
  */
 
-import type { OpenApiOperation, OpenApiPipelineResult, ParsedSpec } from "../../openapi/Types.js";
-import type { SidebarItemValue, SidebarOverrides } from "../../Types.js";
+import type {
+	OpenApiOperation,
+	OpenApiPipelineResult,
+	ParsedSpec,
+	SidebarItemValue,
+	SidebarOverrides,
+} from "@jolli.ai/site-core";
 import { apiSpecFolderSlug, tagSlug } from "./Paths.js";
 
 /**

@@ -25,8 +25,8 @@ import { readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import type { DefaultThemeMode, FontFamily } from "@jolli.ai/site-core";
 import type { NextraProjectConfig } from "../NextraProjectWriter.js";
-import type { DefaultThemeMode, FontFamily } from "../Types.js";
 
 // ─── ThemePackManifest ──────────────────────────────────────────────────────
 

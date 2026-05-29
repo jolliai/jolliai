@@ -13,8 +13,8 @@
  * small and the build scales much better with operation count.
  */
 
-import { exampleFromSchema } from "../../openapi/SchemaExample.js";
-import type { OpenApiOperation, OpenApiParameterLocation, ParsedSpec } from "../../openapi/Types.js";
+import type { OpenApiOperation, OpenApiParameterLocation, ParsedSpec } from "@jolli.ai/site-core";
+import { exampleFromSchema } from "@jolli.ai/site-core";
 import { endpointDataPath } from "./Paths.js";
 import type { TemplateFile } from "./Types.js";
 

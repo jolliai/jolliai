@@ -1,5 +1,5 @@
+import type { OpenApiOperation, OpenApiPipelineResult, ParsedSpec } from "@jolli.ai/site-core";
 import { describe, expect, it } from "vitest";
-import type { OpenApiOperation, OpenApiPipelineResult, ParsedSpec } from "../../openapi/Types.js";
 import { buildApiSidebarOverrides } from "./SidebarMetaEmitter.js";
 
 function makeSpec(overrides: Partial<ParsedSpec> = {}): ParsedSpec {

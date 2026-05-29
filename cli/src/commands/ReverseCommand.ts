@@ -17,8 +17,8 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
+import type { SidebarItemValue, SidebarOverrides } from "@jolli.ai/site-core";
 import type { Command } from "commander";
-import type { SidebarItemValue, SidebarOverrides } from "../site/Types.js";
 
 // ─── Meta file parser (reverse of MetaGenerator.writeMetaFile) ─────────────
 

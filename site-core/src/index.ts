@@ -21,6 +21,11 @@
 /** Current package version. Bumped per release; read by consumers for diagnostics. */
 export const VERSION = "0.0.0";
 
+// ─── Color utilities ──────────────────────────────────────────────────────
+export * from "./ColorUtils.js";
+
+// ─── OpenAPI: helpers ──────────────────────────────────────────────────────
+export { generateCodeSamples, goStringLiteral, toPythonLiteral } from "./openapi/CodeSampleGenerator.js";
 export {
 	escapeHtml as escapeOpenApiHtml,
 	escapeInlineCode,
@@ -28,6 +33,17 @@ export {
 	escapeMdxText,
 	escapeYaml,
 } from "./openapi/Escape.js";
+// ─── OpenAPI: IR + pipeline ────────────────────────────────────────────────
+export { buildPipeline } from "./openapi/OpenApiPipeline.js";
 export { isReservedSlug } from "./openapi/ReservedWords.js";
+export { exampleFromSchema } from "./openapi/SchemaExample.js";
 export { slugify } from "./openapi/Slug.js";
+export { isOpenApiExtension, tryParseOpenApi } from "./openapi/SpecLoader.js";
+export { deriveSpecName } from "./openapi/SpecName.js";
+export { parseFullSpec } from "./openapi/SpecParser.js";
+// ─── OpenAPI: types ────────────────────────────────────────────────────────
+export * from "./openapi/Types.js";
+// ─── Sanitization ──────────────────────────────────────────────────────────
 export { escapeHtml, sanitizeUrl } from "./Sanitize.js";
+// ─── Site-level types (sidebar, footer, navigation, themes, …) ─────────────
+export * from "./Types.js";

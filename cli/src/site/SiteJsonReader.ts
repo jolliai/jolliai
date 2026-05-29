@@ -16,9 +16,9 @@ import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { createInterface } from "node:readline";
+import type { SiteJson } from "@jolli.ai/site-core";
 import { type ConversionResult, convertDocusaurusSidebar, extractFaviconFromConfig } from "./DocusaurusConverter.js";
 import { detectFramework, promptMigration } from "./FrameworkDetector.js";
-import type { SiteJson } from "./Types.js";
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 

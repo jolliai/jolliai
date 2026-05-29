@@ -11,8 +11,8 @@
  * a single spec at a time.
  */
 
-import { generateCodeSamples } from "../../openapi/CodeSampleGenerator.js";
-import type { OpenApiPipelineResult } from "../../openapi/Types.js";
+import type { OpenApiPipelineResult } from "@jolli.ai/site-core";
+import { generateCodeSamples } from "@jolli.ai/site-core";
 import type { OpenApiSpecInput } from "../SiteRenderer.js";
 import { emitApiNavMethods } from "./ApiNavMethods.js";
 import { emitEndpointData } from "./EndpointDataEmitter.js";

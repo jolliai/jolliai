@@ -12,11 +12,11 @@
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve } from "node:path";
+import type { FileType, MirrorResult, PathMappings } from "@jolli.ai/site-core";
+import { tryParseOpenApi } from "@jolli.ai/site-core";
 import { copyExternalAsset, resolveExternalImage } from "./AssetResolver.js";
 import { bundleCustomScripts, isReservedJolliPath } from "./CustomScripts.js";
-import { tryParseOpenApi } from "./openapi/SpecLoader.js";
 import type { ContentRules } from "./renderer/SiteRenderer.js";
-import type { FileType, MirrorResult, PathMappings } from "./Types.js";
 
 // ─── rewriteRelativeImagePaths ────────────────────────────────────────────────
 

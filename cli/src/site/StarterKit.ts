@@ -12,7 +12,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ScaffoldResult } from "./Types.js";
+import type { ScaffoldResult } from "@jolli.ai/site-core";
 
 // ─── Starter file contents ────────────────────────────────────────────────────
 

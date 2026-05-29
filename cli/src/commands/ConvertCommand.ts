@@ -13,6 +13,7 @@ import { existsSync } from "node:fs";
 import { copyFile, cp, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import type { PathMappings, SiteJson } from "@jolli.ai/site-core";
 import type { Command } from "commander";
 // AssetResolver used for favicon handling
 import {
@@ -28,7 +29,6 @@ import {
 	extractFaviconFromConfig,
 } from "../site/DocusaurusConverter.js";
 import { detectFramework, promptMigration } from "../site/FrameworkDetector.js";
-import type { PathMappings, SiteJson } from "../site/Types.js";
 
 // ─── registerConvertCommand ──────────────────────────────────────────────────
 

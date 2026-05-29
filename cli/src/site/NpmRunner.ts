@@ -8,10 +8,10 @@
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import type { NpmRunResult } from "@jolli.ai/site-core";
 import { spawnHidden, spawnSyncHidden } from "../util/Subprocess.js";
 import { engineNeedsInstall, ensureEngine, linkEngineModules } from "./EngineManager.js";
 import { createOutputFilter } from "./OutputFilter.js";
-import type { NpmRunResult } from "./Types.js";
 
 /**
  * On Windows, npm/npx are batch scripts (.cmd) that require `shell: true`

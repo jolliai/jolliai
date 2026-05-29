@@ -21,9 +21,8 @@
  * Layout (`api-endpoint-grid`) and section ordering live inside `<Endpoint>`.
  */
 
-import { escapeOpenApiHtml as escapeHtml, escapeMdxText, escapeYaml } from "@jolli.ai/site-core";
-import { exampleFromSchema } from "../../openapi/SchemaExample.js";
-import type { OpenApiCodeSamples, OpenApiOperation, ParsedSpec } from "../../openapi/Types.js";
+import type { OpenApiCodeSamples, OpenApiOperation, ParsedSpec } from "@jolli.ai/site-core";
+import { escapeOpenApiHtml as escapeHtml, escapeMdxText, escapeYaml, exampleFromSchema } from "@jolli.ai/site-core";
 import { endpointDataImportSpecifier, endpointPagePath } from "./Paths.js";
 import type { TemplateFile } from "./Types.js";
 
