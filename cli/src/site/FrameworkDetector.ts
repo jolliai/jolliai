@@ -9,54 +9,11 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { type DetectedFramework, FRAMEWORK_RULES, type FrameworkRule } from "@jolli.ai/site-core";
 
-// ─── DetectedFramework ───────────────────────────────────────────────────────
-
-export interface DetectedFramework {
-	name: "docusaurus" | "mintlify" | "vitepress" | "mkdocs" | "gitbook";
-	configPath: string;
-	sidebarPath?: string;
-}
-
-// ─── Framework detection rules ───────────────────────────────────────────────
-
-interface FrameworkRule {
-	name: DetectedFramework["name"];
-	/** Files to check in the source root */
-	files: string[];
-	/** Files to check in the parent directory */
-	parentFiles?: string[];
-	/** Which file contains sidebar config (if different from main config) */
-	sidebarFiles?: string[];
-	/** Sidebar files to check in parent directory */
-	parentSidebarFiles?: string[];
-}
-
-const FRAMEWORK_RULES: FrameworkRule[] = [
-	{
-		name: "docusaurus",
-		files: ["docusaurus.config.js", "docusaurus.config.ts", "sidebars.js", "sidebars.ts"],
-		parentFiles: ["docusaurus.config.js", "docusaurus.config.ts"],
-		sidebarFiles: ["sidebars.js", "sidebars.ts"],
-		parentSidebarFiles: ["sidebars.js", "sidebars.ts"],
-	},
-	{
-		name: "mintlify",
-		files: ["mint.json"],
-	},
-	{
-		name: "vitepress",
-		files: [".vitepress/config.js", ".vitepress/config.ts"],
-	},
-	{
-		name: "mkdocs",
-		files: ["mkdocs.yml", "mkdocs.yaml"],
-	},
-	{
-		name: "gitbook",
-		files: ["SUMMARY.md", ".gitbook.yaml"],
-	},
-];
+// Re-export the shared types so CLI consumers that import from this module
+// (e.g. `./FrameworkDetector.js`) keep working without a path change.
+export type { DetectedFramework } from "@jolli.ai/site-core";
 
 // ─── detectFramework ─────────────────────────────────────────────────────────
 

@@ -25,6 +25,12 @@ export const VERSION = "0.0.0";
 export * from "./ColorUtils.js";
 // ─── Content planning (pure half — produce the source→target plan) ─────────
 export * from "./ContentPlanner.js";
+// ─── Custom scripts (.jolli/scripts/) — constants + path predicate ──────────
+export * from "./CustomScripts.js";
+// ─── Docusaurus → Jolli converter (pure transform half) ─────────────────────
+export * from "./DocusaurusConverter.js";
+// ─── Framework detection (rules + types; CLI provides the filesystem scan) ─
+export * from "./FrameworkDetector.js";
 // ─── Meta generation (pure half — build _meta.js entry lists) ──────────────
 export * from "./MetaGenerator.js";
 // ─── OpenAPI: helpers ──────────────────────────────────────────────────────
@@ -53,6 +59,10 @@ export * from "./renderer/nextra/index.js";
 export { escapeHtml, sanitizeUrl } from "./Sanitize.js";
 // ─── Scope page-map (Nextra sidebar scoping helper) ────────────────────────
 export * from "./ScopePageMap.js";
+// ─── site.json schema coercions (deprecated-alias migration) ───────────────
+export * from "./SiteJsonSchema.js";
+// ─── Starter kit (templates for `jolli new` / web "new site" flow) ─────────
+export { getStarterFiles } from "./StarterKit.js";
 // ─── Navigation structure parsing (sidebar tree from site.json) ────────────
 export * from "./StructureParser.js";
 // ─── Site-level types (sidebar, footer, navigation, themes, …) ─────────────
