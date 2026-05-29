@@ -11,7 +11,7 @@
 import type {
 	CustomScriptAsset,
 	NpmRunResult,
-	OpenApiPipelineResult,
+	OpenApiSpecInput,
 	RootInjectionInput,
 	SidebarOverrides,
 	SiteJson,
@@ -32,30 +32,9 @@ export interface ContentRules {
 	providedComponents: Set<string>;
 }
 
-// ─── OpenApiSpecInput ───────────────────────────────────────────────────────
-
-/**
- * One OpenAPI spec ready for emission. Built once by StartCommand from the
- * raw documents `ContentMirror` cached, so renderers receive a parsed,
- * walked, sample-augmented IR and never re-parse the source file.
- */
-export interface OpenApiSpecInput {
-	/**
-	 * URL slug used in `/api-{specName}/...` routes and in folder names
-	 * under `content/`. Derived from the source file's basename via
-	 * `deriveSpecName`.
-	 */
-	specName: string;
-	/**
-	 * Source-folder relative path (e.g. `api/petstore.yaml`). Useful for
-	 * diagnostics; emitters do not need to read the source file again.
-	 */
-	sourceRelPath: string;
-	/** Optional UI-facing title when the spec is explicitly declared in site.json navigation. */
-	displayTitle?: string;
-	/** Pre-built parser + per-operation code samples. */
-	pipeline: OpenApiPipelineResult;
-}
+// `OpenApiSpecInput` lives in `@jolli.ai/site-core` (re-exported here for
+// backward-compat with CLI consumers that still import it from this module).
+export type { OpenApiSpecInput };
 
 // ─── SiteRenderer ───────────────────────────────────────────────────────────
 

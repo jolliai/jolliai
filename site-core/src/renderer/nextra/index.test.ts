@@ -6,7 +6,7 @@
 
 import type { OpenApiOperation, OpenApiPipelineResult, ParsedSpec } from "@jolli.ai/site-core";
 import { describe, expect, it } from "vitest";
-import type { OpenApiSpecInput } from "../SiteRenderer.js";
+import type { OpenApiSpecInput } from "../../openapi/Types.js";
 import { emitNextraOpenApiFiles, emitNextraOpenApiForSpec } from "./index.js";
 
 function makeOp(overrides: Partial<OpenApiOperation> = {}): OpenApiOperation {

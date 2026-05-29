@@ -46,6 +46,9 @@ export { deriveSpecName } from "./openapi/SpecName.js";
 export { parseFullSpec } from "./openapi/SpecParser.js";
 // ─── OpenAPI: types ────────────────────────────────────────────────────────
 export * from "./openapi/Types.js";
+// ─── Nextra renderer: API CSS + emitter surface ────────────────────────────
+export { buildApiCss, generateApiCss } from "./renderer/nextra/ApiCss.js";
+export * from "./renderer/nextra/index.js";
 // ─── Sanitization ──────────────────────────────────────────────────────────
 export { escapeHtml, sanitizeUrl } from "./Sanitize.js";
 // ─── Scope page-map (Nextra sidebar scoping helper) ────────────────────────

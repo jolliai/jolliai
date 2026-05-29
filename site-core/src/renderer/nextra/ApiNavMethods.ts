@@ -13,7 +13,7 @@
  * overwrites it with the populated map.
  */
 
-import type { OpenApiSpecInput } from "../SiteRenderer.js";
+import type { OpenApiSpecInput } from "../../openapi/Types.js";
 import { endpointRoutePath } from "./Paths.js";
 import type { TemplateFile } from "./Types.js";
 
