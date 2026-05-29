@@ -17,7 +17,6 @@
  * entry lists produced here.
  */
 
-import { sanitizeUrl } from "./Sanitize.js";
 import type { HeaderItem, SidebarItemValue } from "./Types.js";
 
 // ─── Root-injection types ────────────────────────────────────────────────────
@@ -41,9 +40,12 @@ export interface RootInjectionInput {
 	/** Detected OpenAPI specs — drives the auto-injected `Documentation` + `API Reference` entries. */
 	apiSpecs?: RootApiSpec[];
 	/**
-	 * `site.json`'s `header.items`. Each entry is materialised as a root
-	 * `_meta.js` key so Nextra renders it as a native page-tab (with chevron
-	 * for `items`-bearing dropdowns) instead of custom JSX.
+	 * `site.json`'s `header.items`. Used **only** for override detection —
+	 * a customer-declared "Documentation" / "API Reference" label suppresses
+	 * the matching auto-injection. Items are **not** materialised into
+	 * `_meta.js`; themes render header items inline in their own `<Navbar>`
+	 * JSX, and emitting them here as well would surface every link twice
+	 * (theme row + Nextra's auto page-tabs strip).
 	 */
 	headerItems?: HeaderItem[];
 	/**
@@ -219,32 +221,8 @@ const DOCUMENTATION_LABELS = new Set(["documentation"]);
 const API_REFERENCE_LABELS = new Set(["api reference", "api"]);
 
 /**
- * Slugifies a header-item label into a stable `_meta.js` key. Uses a
- * `nav-` prefix to namespace customer-supplied entries so they cannot
- * collide with auto-injected `__documentation` / `__api-reference` /
- * `api-{slug}` keys, even via crafted labels.
- *
- * Falls back to `nav-${idx}` when slugification yields an empty string —
- * e.g. a label that was all punctuation.
- */
-function navKeyFromLabel(label: string, idx: number): string {
-	// The third replace collapses any run of hyphens to a single `-`, so the
-	// final trim can use `/^-|-$/g` (single char) rather than `/^-+|-+$/g`.
-	// Dropping the `+` quantifier defuses CodeQL's `js/polynomial-redos`
-	// finding: the previous pattern paired greedy `-+` against arbitrary
-	// label input, which scaled quadratically on adversarial repetition.
-	const slug = label
-		.toLowerCase()
-		.replace(/[^\w\s-]/g, "")
-		.replace(/\s+/g, "-")
-		.replace(/-+/g, "-")
-		.replace(/^-|-$/g, "");
-	return slug ? `nav-${slug}` : `nav-${idx}`;
-}
-
-/**
  * Returns a new entry list with auto-injected `Documentation` / `API Reference`
- * tabs and materialised `header.items` entries:
+ * tabs:
  *
  *   - `__documentation` page-tab linking to `/` whenever the customer has any
  *     specs and hasn't already declared a header item labelled "Documentation".
@@ -257,17 +235,17 @@ function navKeyFromLabel(label: string, idx: number): string {
  *     each spec is recorded as a hidden page-tab + a visible
  *     `__api-reference` dropdown (`type: "menu"`) whose `items` map is one
  *     sub-entry per spec.
- *   - User-supplied `header.items` are appended after the auto entries with
- *     `nav-{slug}` keys derived from the label so customer reordering is a
- *     no-op on the generated keys. URLs flow through `sanitizeUrl` —
- *     `javascript:` / `data:` URLs are clamped to `"#"`.
- *     A header item with a clashing label (Documentation / API / API
- *     Reference, case-insensitive) suppresses the matching auto injection —
- *     customer overrides win.
+ *
+ * Customer `header.items` are **not** materialised into `_meta.js` — each
+ * theme renders them inline in its own `<Navbar>` JSX. If both surfaces
+ * emitted them, every header link would appear twice (once in the theme
+ * navbar row, once in Nextra's auto page-links strip). Themes own header
+ * presentation end-to-end; `injectRootNavEntries` only consults
+ * `header.items` here for override detection (a customer-declared
+ * "Documentation" suppresses `__documentation`, etc.).
  *
  * Order matters: Nextra renders root tabs in `_meta.js` declaration order,
- * and we want `Documentation` first (primary anchor), `API Reference` next,
- * then user-supplied pages.
+ * and we want `Documentation` first (primary anchor), `API Reference` next.
  */
 export function injectRootNavEntries(existing: MetaEntry[], input: RootInjectionInput): MetaEntry[] {
 	const apiSpecs = input.apiSpecs ?? [];
@@ -351,84 +329,26 @@ export function injectRootNavEntries(existing: MetaEntry[], input: RootInjection
 		}
 	}
 
-	// User-supplied header items — coerced into Nextra page-tab shape with
-	// sanitised URLs and slug-derived keys (stable across reordering).
-	const usedNavKeys = new Set<string>();
-	headerItems.forEach((item, idx) => {
-		let key = navKeyFromLabel(item.label, idx);
-		// Defuse two `header.items` entries with the same label collapsing onto
-		// one key (Nextra reads the last definition wins; we'd rather keep all
-		// entries by appending an index suffix on collision).
-		if (usedNavKeys.has(key)) {
-			key = `${key}-${idx}`;
-		}
-		usedNavKeys.add(key);
-
-		if (item.items && item.items.length > 0) {
-			const items: Record<string, { title: string; href?: string }> = {};
-			const usedSubKeys = new Set<string>();
-			// Same defensive filter as the outer loop — `ExternalLink.label: string`
-			// is required at the type level but site.json shape isn't validated.
-			const validSubItems = item.items.filter((sub) => {
-				if (typeof sub?.label !== "string" || sub.label.trim() === "") {
-					console.warn(
-						`[jolli] Skipping header.items[].items entry with missing/empty 'label': ${JSON.stringify(sub)}`,
-					);
-					return false;
-				}
-				return true;
-			});
-			validSubItems.forEach((sub, subIdx) => {
-				// `navKeyFromLabel` always returns `nav-{slug}` or `nav-{idx}`, so
-				// after stripping the prefix we always have at least one character.
-				let subKey = navKeyFromLabel(sub.label, subIdx).replace(/^nav-/, "");
-				// Same dedup discipline as the outer header-items loop: two sub-items
-				// with the same label otherwise collapse to one entry (last wins).
-				if (usedSubKeys.has(subKey)) {
-					subKey = `${subKey}-${subIdx}`;
-				}
-				usedSubKeys.add(subKey);
-				// Mirror the outer-item url-defensive pattern: `ExternalLink.url` is
-				// required at the type level but site.json shape isn't validated, so a
-				// sub-item with a missing `url` would otherwise crash `sanitizeUrl`'s
-				// `url.trim()` call. Emit the entry without href when url is missing
-				// so the build doesn't blow up on a malformed config.
-				const subValue: { title: string; href?: string } = { title: sub.label };
-				if (sub.url) {
-					subValue.href = sanitizeUrl(sub.url);
-				}
-				items[subKey] = subValue;
-			});
-			injected.push({ key, value: { title: item.label, type: "menu", items } });
-		} else {
-			const value: Record<string, unknown> = { title: item.label, type: "page" };
-			if (item.url) {
-				value.href = sanitizeUrl(item.url);
-			}
-			injected.push({ key, value });
-		}
-	});
-
 	// Navigation pages — `type: "page"` for Nextra sidebar scoping, or
 	// `type: "menu"` for navbar dropdown pages.
 	// Nextra renders these as navbar links; pack CSS repositions them
 	// as a second-row tab bar with active underline via aria-current.
 	if (input.structurePages) {
+		const usedKeys = new Set<string>();
 		for (const sp of input.structurePages) {
-			if (!usedNavKeys.has(sp.key)) {
-				if (sp.type === "menu" && sp.menuItems) {
-					injected.push({
-						key: sp.key,
-						value: { title: sp.title, type: "menu", items: sp.menuItems },
-					});
-				} else {
-					injected.push({
-						key: sp.key,
-						value: { title: sp.title, type: "page", href: sp.href },
-					});
-				}
-				usedNavKeys.add(sp.key);
+			if (usedKeys.has(sp.key)) continue;
+			if (sp.type === "menu" && sp.menuItems) {
+				injected.push({
+					key: sp.key,
+					value: { title: sp.title, type: "menu", items: sp.menuItems },
+				});
+			} else {
+				injected.push({
+					key: sp.key,
+					value: { title: sp.title, type: "page", href: sp.href },
+				});
 			}
+			usedKeys.add(sp.key);
 		}
 	}
 
@@ -453,8 +373,8 @@ export function injectRootNavEntries(existing: MetaEntry[], input: RootInjection
 		return true;
 	});
 
-	// Non-structure injected entries (API specs, header items) should not
-	// duplicate existing keys.
+	// Non-structure injected entries (API specs, auto-Documentation) should
+	// not duplicate existing keys.
 	const existingKeys = new Set(filteredExisting.map((e) => e.key));
 	const filtered = injected.filter((e) => structureKeys.has(e.key) || !existingKeys.has(e.key));
 	return [...filtered, ...filteredExisting];
