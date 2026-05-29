@@ -228,12 +228,17 @@ const API_REFERENCE_LABELS = new Set(["api reference", "api"]);
  * e.g. a label that was all punctuation.
  */
 function navKeyFromLabel(label: string, idx: number): string {
+	// The third replace collapses any run of hyphens to a single `-`, so the
+	// final trim can use `/^-|-$/g` (single char) rather than `/^-+|-+$/g`.
+	// Dropping the `+` quantifier defuses CodeQL's `js/polynomial-redos`
+	// finding: the previous pattern paired greedy `-+` against arbitrary
+	// label input, which scaled quadratically on adversarial repetition.
 	const slug = label
 		.toLowerCase()
 		.replace(/[^\w\s-]/g, "")
 		.replace(/\s+/g, "-")
 		.replace(/-+/g, "-")
-		.replace(/^-+|-+$/g, "");
+		.replace(/^-|-$/g, "");
 	return slug ? `nav-${slug}` : `nav-${idx}`;
 }
 
