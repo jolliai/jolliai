@@ -1,5 +1,5 @@
 /**
- * SiteJsonValidator (commit 1: shape rules, no position mapping yet).
+ * SiteJsonValidator (commits 1+2: shape rules + line/column resolution).
  *
  * Walks a parsed `site.json` object and returns a list of `ValidationIssue`s
  * describing every shape mistake found. Does not throw — caller decides
@@ -7,14 +7,17 @@
  * tool overlays inline diagnostics in the editor; CI surfaces them as
  * GitHub annotations).
  *
- * Position mapping (turning each `path` into a `{line, column}` against
- * the raw text via `jsonc-parser`) lands in commit 2; pretty formatting
- * with code-frame snippets in commit 3.
+ * `locateIssues(rawText, issues)` turns each JSONPath into a
+ * `{line, column, endLine, endColumn}` against the raw source via
+ * `jsonc-parser`'s AST; pretty formatting with code-frame snippets
+ * lands in commit 3.
  *
- * No I/O. Operates entirely on the JSON.parse output, treated as
+ * No I/O. Operates entirely on the JSON.parse output (treated as
  * `unknown` so a malformed site.json can't crash the validator before
- * the validator reports it.
+ * the validator reports it) and the raw source text (a `string`).
  */
+
+import { findNodeAtLocation, type Node, parseTree } from "jsonc-parser";
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
@@ -267,4 +270,103 @@ function describeType(v: unknown): string {
 	if (v === null) return "null";
 	if (Array.isArray(v)) return "array";
 	return typeof v;
+}
+
+// ─── Location mapping ────────────────────────────────────────────────────────
+
+/**
+ * A `ValidationIssue` annotated with the line/column span of the offending
+ * node in the original source text. Lines and columns are 1-indexed (matches
+ * editor + CI conventions). `endLine` / `endColumn` cover the end of the
+ * span so a downstream code-frame formatter can underline the full range.
+ */
+export interface ValidationIssueLocated extends ValidationIssue {
+	line: number;
+	column: number;
+	endLine: number;
+	endColumn: number;
+}
+
+/**
+ * Annotates each issue's `path` with the line/column it points at in
+ * `rawText`. Useful for consumers that have the original site.json source
+ * and want to show users exactly where the problem is.
+ *
+ * When a path doesn't resolve to a node in the source (e.g. an
+ * `article-without-href` issue whose `path` includes a key that doesn't
+ * exist), the function walks UP the path until it finds a parent that
+ * does exist, and anchors there. Worst case (no part of the path is
+ * found) anchors at the document root. Never throws.
+ */
+export function locateIssues(rawText: string, issues: ValidationIssue[]): ValidationIssueLocated[] {
+	const root = parseTree(rawText);
+	const lineStarts = buildLineStartIndex(rawText);
+	return issues.map((issue) => ({
+		...issue,
+		...resolveIssuePosition(root, lineStarts, issue.path),
+	}));
+}
+
+// ─── Location helpers ────────────────────────────────────────────────────────
+
+interface Position {
+	line: number;
+	column: number;
+	endLine: number;
+	endColumn: number;
+}
+
+const DEFAULT_POSITION: Position = { line: 1, column: 1, endLine: 1, endColumn: 1 };
+
+function resolveIssuePosition(
+	root: Node | undefined,
+	lineStarts: readonly number[],
+	path: (string | number)[],
+): Position {
+	if (!root) return DEFAULT_POSITION;
+
+	// Walk the path. If the full path doesn't resolve (e.g. the missing
+	// field the validator is complaining about), trim one segment at a
+	// time until we hit a node that exists. That node — the deepest valid
+	// ancestor — anchors the diagnostic.
+	for (let len = path.length; len >= 0; len--) {
+		const candidate = path.slice(0, len);
+		const node = candidate.length === 0 ? root : findNodeAtLocation(root, candidate);
+		if (node) return nodeSpan(node, lineStarts);
+	}
+	return DEFAULT_POSITION;
+}
+
+function nodeSpan(node: Node, lineStarts: readonly number[]): Position {
+	const start = offsetToPosition(lineStarts, node.offset);
+	const end = offsetToPosition(lineStarts, node.offset + node.length);
+	return { line: start.line, column: start.column, endLine: end.line, endColumn: end.column };
+}
+
+function buildLineStartIndex(text: string): number[] {
+	const starts: number[] = [0];
+	for (let i = 0; i < text.length; i++) {
+		if (text.charCodeAt(i) === 10 /* \n */) {
+			starts.push(i + 1);
+		}
+	}
+	return starts;
+}
+
+/**
+ * Converts a byte offset into a 1-indexed {line, column}. Uses the
+ * pre-built line-start index so each call is O(log L) — the index lives
+ * for the duration of one `locateIssues` call and is reused across all
+ * issues in that batch.
+ */
+function offsetToPosition(starts: readonly number[], offset: number): { line: number; column: number } {
+	// Binary search for the largest start <= offset.
+	let lo = 0;
+	let hi = starts.length - 1;
+	while (lo < hi) {
+		const mid = (lo + hi + 1) >> 1;
+		if (starts[mid] <= offset) lo = mid;
+		else hi = mid - 1;
+	}
+	return { line: lo + 1, column: offset - starts[lo] + 1 };
 }

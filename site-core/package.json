@@ -40,6 +40,9 @@
 	"bugs": {
 		"url": "https://github.com/jolliai/jolliai/issues"
 	},
+	"dependencies": {
+		"jsonc-parser": "^3.3.1"
+	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.2.6",
 		"@vitest/coverage-v8": "^4.1.4",
