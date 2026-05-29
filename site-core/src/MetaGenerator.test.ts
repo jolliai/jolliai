@@ -6,7 +6,7 @@
  */
 
 import * as fc from "fast-check";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 // ─── toTitleCase unit tests ───────────────────────────────────────────────────
 
@@ -382,7 +382,7 @@ describe("injectRootNavEntries", () => {
 		expect(result.find((e) => e.key === DOC_HOME_NAV_KEY)).toBeUndefined();
 	});
 
-	it("materializes header.items as nav-{slug} keyed page-tab entries with sanitized urls", async () => {
+	it("does not materialize header.items into _meta.js (themes render them inline)", async () => {
 		const { injectRootNavEntries } = await import("./MetaGenerator.js");
 		const result = injectRootNavEntries([], {
 			headerItems: [
@@ -390,25 +390,28 @@ describe("injectRootNavEntries", () => {
 				{ label: "Blog", url: "javascript:alert(1)" },
 			],
 		});
-		const changelog = result.find((e) => e.key === "nav-changelog");
-		expect(changelog?.value).toEqual({ title: "Changelog", type: "page", href: "/changelog" });
-		const blog = result.find((e) => e.key === "nav-blog");
-		// javascript: URLs collapse to "#" via sanitizeUrl
-		expect((blog?.value as { href: string }).href).toBe("#");
+		// No nav-* entries should appear — themes own header presentation.
+		expect(result.find((e) => e.key.startsWith("nav-"))).toBeUndefined();
+		expect(result.find((e) => e.key === "nav-changelog")).toBeUndefined();
+		expect(result.find((e) => e.key === "nav-blog")).toBeUndefined();
 	});
 
-	it("skips header.items entries with missing or empty label", async () => {
-		const { injectRootNavEntries } = await import("./MetaGenerator.js");
+	it("warns on malformed header.items but does not crash override detection", async () => {
+		const { DOC_HOME_NAV_KEY, injectRootNavEntries } = await import("./MetaGenerator.js");
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 		const result = injectRootNavEntries([], {
+			apiSpecs: [{ specName: "petstore" }],
 			headerItems: [
 				{ label: "", url: "/empty" },
 				// biome-ignore lint/suspicious/noExplicitAny: forcing the malformed shape on purpose
 				{ url: "/missing" } as any,
-				{ label: "Real", url: "/real" },
+				{ label: "Documentation", url: "/docs" },
 			],
 		});
-		expect(result.find((e) => e.key === "nav-real")).toBeDefined();
-		expect(result.find((e) => e.key === "nav-empty")).toBeUndefined();
+		// Valid override entry still suppresses the auto-injected Documentation tab.
+		expect(result.find((e) => e.key === DOC_HOME_NAV_KEY)).toBeUndefined();
+		expect(warnSpy).toHaveBeenCalled();
+		warnSpy.mockRestore();
 	});
 });
 
@@ -465,7 +468,7 @@ describe("hasVisibleEntries", () => {
 // ─── injectRootNavEntries — header.items dropdowns and structurePages ──────────
 
 describe("injectRootNavEntries (dropdown + structure pages)", () => {
-	it("materializes a header.items entry with subitems as a type:menu dropdown", async () => {
+	it("does not materialize a header.items dropdown into _meta.js (themes render it inline)", async () => {
 		const { injectRootNavEntries } = await import("./MetaGenerator.js");
 		const result = injectRootNavEntries([], {
 			headerItems: [
@@ -478,32 +481,8 @@ describe("injectRootNavEntries (dropdown + structure pages)", () => {
 				},
 			],
 		});
-		const community = result.find((e) => e.key === "nav-community");
-		expect((community?.value as { type: string }).type).toBe("menu");
-		expect((community?.value as { items: Record<string, unknown> }).items).toEqual({
-			discord: { title: "Discord", href: "https://discord.example" },
-			github: { title: "GitHub", href: "https://github.example" },
-		});
-	});
-
-	it("skips dropdown sub-items with missing/empty label", async () => {
-		const { injectRootNavEntries } = await import("./MetaGenerator.js");
-		const result = injectRootNavEntries([], {
-			headerItems: [
-				{
-					label: "Community",
-					items: [
-						// biome-ignore lint/suspicious/noExplicitAny: forcing the malformed shape on purpose
-						{ url: "/missing-label" } as any,
-						{ label: "", url: "/empty-label" },
-						{ label: "Slack", url: "/slack" },
-					],
-				},
-			],
-		});
-		const community = result.find((e) => e.key === "nav-community");
-		const items = (community?.value as { items: Record<string, unknown> }).items;
-		expect(Object.keys(items)).toEqual(["slack"]);
+		expect(result.find((e) => e.key === "nav-community")).toBeUndefined();
+		expect(result.find((e) => e.key.startsWith("nav-"))).toBeUndefined();
 	});
 
 	it("emits structurePages as type:page entries when not labelled like a reserved injection", async () => {

@@ -471,9 +471,8 @@ describe("MetaGenerator.generateMetaFiles with rootInjection", () => {
 		});
 		const meta = await readRootMeta();
 		expect(meta).not.toContain("__documentation");
-		// User entry survives, slug-keyed.
-		expect(meta).toContain('"nav-documentation":');
-		expect(meta).toContain('"href":"/docs"');
+		// Header items are not emitted into _meta.js — themes render them inline.
+		expect(meta).not.toContain('"nav-documentation":');
 	});
 
 	it("skips __api-reference when the user declares an 'API Reference' header item", async () => {
@@ -486,8 +485,8 @@ describe("MetaGenerator.generateMetaFiles with rootInjection", () => {
 		expect(meta).not.toContain('"__api-reference":');
 		// Per-spec hidden entries are still emitted (they're folder-bindings).
 		expect(meta).toContain('"api-petstore":');
-		// User entry survives.
-		expect(meta).toContain('"nav-api-reference":');
+		// Header items are not emitted into _meta.js.
+		expect(meta).not.toContain('"nav-api-reference":');
 	});
 
 	it("matches override labels case-insensitively", async () => {
@@ -512,20 +511,24 @@ describe("MetaGenerator.generateMetaFiles with rootInjection", () => {
 		expect(meta).not.toContain('"title":"API Reference"');
 	});
 
-	// ── header.items materialisation ─────────────────────────────────────────
+	// ── header.items are NOT materialised into _meta.js ──────────────────────
+	//
+	// Themes render header items inline via their own <Navbar> JSX. Emitting
+	// them into _meta.js too would produce duplicate links (theme row +
+	// Nextra's auto page-tabs strip). The CLI only uses `header.items` for
+	// override detection — see the override-wins tests above.
 
-	it("materialises a flat header item as type:'page' with the configured href", async () => {
+	it("does not emit a flat header item into _meta.js", async () => {
 		const { generateMetaFiles } = await import("./MetaGenerator.js");
 		await generateMetaFiles(tempDir, undefined, {
 			headerItems: [{ label: "Pricing", url: "/pricing" }],
 		});
 		const meta = await readRootMeta();
-		expect(meta).toContain('"nav-pricing":');
-		expect(meta).toContain('"type":"page"');
-		expect(meta).toContain('"href":"/pricing"');
+		expect(meta).not.toContain('"nav-pricing":');
+		expect(meta).not.toContain('"href":"/pricing"');
 	});
 
-	it("materialises a header item with sub-items as type:'menu' with sub-entries", async () => {
+	it("does not emit a header item with sub-items into _meta.js", async () => {
 		const { generateMetaFiles } = await import("./MetaGenerator.js");
 		await generateMetaFiles(tempDir, undefined, {
 			headerItems: [
@@ -539,70 +542,9 @@ describe("MetaGenerator.generateMetaFiles with rootInjection", () => {
 			],
 		});
 		const meta = await readRootMeta();
-		expect(meta).toContain('"nav-resources":');
-		expect(meta).toContain('"type":"menu"');
-		expect(meta).toContain('"blog":{"title":"Blog","href":"/blog"}');
-		expect(meta).toContain('"changelog":{"title":"Changelog","href":"/changelog"}');
-	});
-
-	// ── Security: URL sanitisation ───────────────────────────────────────────
-
-	it("sanitises javascript: URLs in flat header.items[].url to '#'", async () => {
-		const { generateMetaFiles } = await import("./MetaGenerator.js");
-		await generateMetaFiles(tempDir, undefined, {
-			headerItems: [{ label: "Bad", url: "javascript:alert(1)" }],
-		});
-		const meta = await readRootMeta();
-		expect(meta).not.toMatch(/javascript:alert/i);
-		expect(meta).toContain('"href":"#"');
-	});
-
-	it("sanitises javascript: URLs in dropdown sub-items to '#'", async () => {
-		const { generateMetaFiles } = await import("./MetaGenerator.js");
-		await generateMetaFiles(tempDir, undefined, {
-			headerItems: [
-				{
-					label: "Menu",
-					items: [{ label: "Bad", url: "JAVASCRIPT:alert(1)" }],
-				},
-			],
-		});
-		const meta = await readRootMeta();
-		expect(meta).not.toMatch(/javascript:alert/i);
-		expect(meta).toContain('"href":"#"');
-	});
-
-	it("sanitises data: and vbscript: URLs to '#'", async () => {
-		const { generateMetaFiles } = await import("./MetaGenerator.js");
-		await generateMetaFiles(tempDir, undefined, {
-			headerItems: [
-				{ label: "DataUrl", url: "data:text/html,<script>alert(1)</script>" },
-				{ label: "VbsUrl", url: "vbscript:msgbox(1)" },
-			],
-		});
-		const meta = await readRootMeta();
-		expect(meta).not.toContain("data:text/html");
-		expect(meta).not.toContain("vbscript:");
-		expect(meta).not.toContain("<script>");
-	});
-
-	it("preserves http(s), mailto, tel, fragment, and relative hrefs unchanged", async () => {
-		const { generateMetaFiles } = await import("./MetaGenerator.js");
-		await generateMetaFiles(tempDir, undefined, {
-			headerItems: [
-				{ label: "Site", url: "https://example.com/path" },
-				{ label: "Email", url: "mailto:hi@example.com" },
-				{ label: "Phone", url: "tel:+15551234567" },
-				{ label: "Fragment", url: "#section" },
-				{ label: "Relative", url: "/path/to/page" },
-			],
-		});
-		const meta = await readRootMeta();
-		expect(meta).toContain("https://example.com/path");
-		expect(meta).toContain("mailto:hi@example.com");
-		expect(meta).toContain("tel:+15551234567");
-		expect(meta).toContain("#section");
-		expect(meta).toContain("/path/to/page");
+		expect(meta).not.toContain('"nav-resources":');
+		expect(meta).not.toContain("/blog");
+		expect(meta).not.toContain("/changelog");
 	});
 
 	// ── Key collision handling ───────────────────────────────────────────────
@@ -623,89 +565,26 @@ describe("MetaGenerator.generateMetaFiles with rootInjection", () => {
 		expect(occurrences.length).toBe(1);
 	});
 
-	it("disambiguates two header.items with identical labels by appending an index", async () => {
-		const { generateMetaFiles } = await import("./MetaGenerator.js");
-		await generateMetaFiles(tempDir, undefined, {
-			headerItems: [
-				{ label: "Docs", url: "/a" },
-				{ label: "Docs", url: "/b" },
-			],
-		});
-		const meta = await readRootMeta();
-		// First gets `nav-docs`, second gets a suffixed key so both survive.
-		expect(meta).toContain('"nav-docs":');
-		expect(meta).toMatch(/"nav-docs-1":/);
-		expect(meta).toContain("/a");
-		expect(meta).toContain("/b");
-	});
-
-	it("disambiguates dropdown sub-items with identical labels so neither is silently overwritten", async () => {
-		const { generateMetaFiles } = await import("./MetaGenerator.js");
-		await generateMetaFiles(tempDir, undefined, {
-			headerItems: [
-				{
-					label: "Resources",
-					items: [
-						{ label: "Blog", url: "/a" },
-						{ label: "Blog", url: "/b" },
-					],
-				},
-			],
-		});
-		const meta = await readRootMeta();
-		// Both sub-items survive — first as `blog`, second with an index suffix.
-		expect(meta).toContain('"blog":{"title":"Blog","href":"/a"}');
-		expect(meta).toMatch(/"blog-1":\{"title":"Blog","href":"\/b"\}/);
-	});
-
-	it("falls back to nav-{idx} for header items whose label slugs to empty", async () => {
-		const { generateMetaFiles } = await import("./MetaGenerator.js");
-		await generateMetaFiles(tempDir, undefined, {
-			headerItems: [{ label: "!!!", url: "/symbol" }],
-		});
-		const meta = await readRootMeta();
-		expect(meta).toContain('"nav-0":');
-		expect(meta).toContain('"href":"/symbol"');
-	});
-
 	// ── Defensive: malformed header items ────────────────────────────────────
+	//
+	// site.json is parsed without shape validation, so malformed entries can
+	// reach injectRootNavEntries. They must not crash the build, even though
+	// header items no longer flow into _meta.js (the label-based override
+	// detection still iterates them).
 
-	it("skips malformed header items missing 'label' instead of crashing the build", async () => {
+	it("skips malformed header items missing 'label' without crashing the build", async () => {
 		const { generateMetaFiles } = await import("./MetaGenerator.js");
 		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-		// Cast to bypass type check — site.json is parsed without shape validation
-		// in production, so missing-label objects can reach injectRootNavEntries.
 		await generateMetaFiles(tempDir, undefined, {
+			apiSpecs: [{ specName: "petstore" }],
 			headerItems: [
 				{ url: "/no-label" } as unknown as { label: string; url: string },
-				{ label: "Valid", url: "/ok" },
+				{ label: "Documentation", url: "/docs" },
 			],
 		});
 		const meta = await readRootMeta();
-		expect(meta).toContain('"nav-valid":');
-		expect(meta).toContain("/ok");
-		expect(meta).not.toContain("/no-label");
-		expect(warnSpy).toHaveBeenCalled();
-		warnSpy.mockRestore();
-	});
-
-	it("skips malformed dropdown sub-items missing 'label' instead of crashing", async () => {
-		const { generateMetaFiles } = await import("./MetaGenerator.js");
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-		await generateMetaFiles(tempDir, undefined, {
-			headerItems: [
-				{
-					label: "Resources",
-					items: [
-						{ url: "/no-label" } as unknown as { label: string; url: string },
-						{ label: "Blog", url: "/blog" },
-					],
-				},
-			],
-		});
-		const meta = await readRootMeta();
-		expect(meta).toContain('"nav-resources":');
-		expect(meta).toContain('"blog":{"title":"Blog","href":"/blog"}');
+		// Valid override still suppresses __documentation.
+		expect(meta).not.toContain("__documentation");
 		expect(meta).not.toContain("/no-label");
 		expect(warnSpy).toHaveBeenCalled();
 		warnSpy.mockRestore();
@@ -715,13 +594,14 @@ describe("MetaGenerator.generateMetaFiles with rootInjection", () => {
 		const { generateMetaFiles } = await import("./MetaGenerator.js");
 		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 		await generateMetaFiles(tempDir, undefined, {
+			apiSpecs: [{ specName: "petstore" }],
 			headerItems: [
 				{ label: "   ", url: "/whitespace" },
-				{ label: "Real", url: "/real" },
+				{ label: "Documentation", url: "/docs" },
 			],
 		});
 		const meta = await readRootMeta();
-		expect(meta).toContain('"nav-real":');
+		expect(meta).not.toContain("__documentation");
 		expect(meta).not.toContain("/whitespace");
 		expect(warnSpy).toHaveBeenCalled();
 		warnSpy.mockRestore();
