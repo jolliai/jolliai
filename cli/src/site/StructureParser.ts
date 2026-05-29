@@ -186,6 +186,7 @@ function parseContent(
 	sidebar: SidebarOverrides,
 ): void {
 	const entries: Record<string, SidebarItemValue> = {};
+	const pathPrefixSegs = pathPrefix.split("/").filter(Boolean);
 
 	for (const node of nodes) {
 		if (isGroup(node)) {
@@ -195,14 +196,22 @@ function parseContent(
 			// the URL path. The schema intent (group = separator) wins; the
 			// generated build tree is flattened so articles inside the group
 			// live at the parent level and Nextra renders them naturally.
+			//
+			// `node.root` IS used here, however, to extend the "inherited
+			// root" passed into href normalization, so an author who repeats
+			// the group's root inside `href` (e.g. `href: "guides/intro"`
+			// inside `group{root: "guides"}`) gets the redundant prefix
+			// stripped instead of producing a phantom intermediate folder.
 			const groupSlug = slugify(node.group);
 			entries[`__group-${groupSlug}`] = { type: "separator" as const, title: node.group };
 
+			const groupRootSegs = (node.root ?? "").split("/").filter(Boolean);
+			const inheritedRootSegs = [...pathPrefixSegs, ...groupRootSegs];
 			for (const article of node.content) {
-				addArticle(article, pathPrefix, entries, sidebar);
+				addArticle(article, pathPrefix, inheritedRootSegs, entries, sidebar);
 			}
 		} else {
-			addArticle(node, pathPrefix, entries, sidebar);
+			addArticle(node, pathPrefix, pathPrefixSegs, entries, sidebar);
 		}
 	}
 
@@ -216,6 +225,7 @@ function parseContent(
 function addArticle(
 	article: NavigationArticle,
 	resolveRoot: string,
+	inheritedRootSegs: string[],
 	entries: Record<string, SidebarItemValue>,
 	sidebar: SidebarOverrides,
 ): void {
@@ -227,7 +237,7 @@ function addArticle(
 		return;
 	}
 
-	const hrefSegments = article.href.split("/").filter(Boolean);
+	const hrefSegments = normalizeHrefSegments(article.href, inheritedRootSegs);
 	// When the article has nested children and `expanded` is set explicitly,
 	// emit the _meta.js entry as an object with `theme.collapsed` so Nextra
 	// honors the customer's open/closed intent regardless of
@@ -241,7 +251,7 @@ function addArticle(
 	if (hrefSegments.length === 1) {
 		// Single segment — goes directly into the current entries
 		entries[hrefSegments[0]] = entryValue;
-	} else {
+	} else if (hrefSegments.length > 1) {
 		// Multi-segment href (e.g. "real-time-apps/part1") — the first segment
 		// is a directory reference in the current _meta.js, and the last segment
 		// goes into that directory's _meta.js.
@@ -267,11 +277,15 @@ function addArticle(
 	// Multi-segment children write directly to sidebar via the multi-segment
 	// logic above, so they bypass subEntries.
 	if (article.articles?.length) {
-		const parentDir = article.href.startsWith("/")
-			? article.href
-			: joinPath(resolveRoot, hrefSegments.length === 1 ? hrefSegments[0] : hrefSegments.slice(0, -1).join("/"));
+		const parentDir =
+			hrefSegments.length === 0
+				? resolveRoot
+				: joinPath(
+						resolveRoot,
+						hrefSegments.length === 1 ? hrefSegments[0] : hrefSegments.slice(0, -1).join("/"),
+					);
 		for (const child of article.articles) {
-			const childSegments = child.href.split("/").filter(Boolean);
+			const childSegments = normalizeHrefSegments(child.href, inheritedRootSegs);
 			if (childSegments.length === 1) {
 				// Single-segment child → goes into the parent's directory _meta.js
 				if (!sidebar[parentDir]) {
@@ -281,18 +295,68 @@ function addArticle(
 				// Recurse for children of children
 				if (child.articles?.length) {
 					for (const grandchild of child.articles) {
-						addArticle(grandchild, resolveRoot, {} as Record<string, SidebarItemValue>, sidebar);
+						addArticle(
+							grandchild,
+							resolveRoot,
+							inheritedRootSegs,
+							{} as Record<string, SidebarItemValue>,
+							sidebar,
+						);
 					}
 				}
 			} else {
 				// Multi-segment child → writes directly to sidebar via addArticle
-				addArticle(child, resolveRoot, entries, sidebar);
+				addArticle(child, resolveRoot, inheritedRootSegs, entries, sidebar);
 			}
 		}
 	}
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Normalizes an article's `href` into a list of path segments, relative
+ * to the **inherited root** (the path stack built from all ancestor `root`
+ * fields — i.e. the page's `root` plus the enclosing group's `root`).
+ *
+ * Two rules:
+ *
+ * 1. **Leading slash is equivalent to no leading slash.** `/foo` ≡ `foo`.
+ *    Both mean "relative to the inherited root", never the OS filesystem
+ *    root. This falls out of `split("/").filter(Boolean)` automatically.
+ *
+ * 2. **Prefix dedup.** If the start of `href` duplicates the end of the
+ *    inherited root, strip the duplicated segments. For example, inside
+ *    a group with `root: "guides"` under a page with `root: "/docs"`,
+ *    the inherited root is `["docs", "guides"]`. An href of
+ *    `"guides/introduction"` has its leading `guides` segment stripped
+ *    (the trailing `guides` of the inherited root matches the leading
+ *    `guides` of the href), yielding `["introduction"]`. Without this
+ *    rule the duplicated segment would create a phantom intermediate
+ *    folder in the sidebar tree.
+ *
+ * The algorithm: find the largest `k` such that the first `k` segments
+ * of `href` equal the last `k` segments of the inherited root, and slice
+ * those off. Only one matching prefix is stripped — duplicates beyond
+ * the inherited root (e.g. `"guides/guides/intro"`) are left alone.
+ *
+ * Exported for unit testing.
+ */
+export function normalizeHrefSegments(href: string, inheritedRootSegs: ReadonlyArray<string>): string[] {
+	const segs = href.split("/").filter(Boolean);
+	const maxK = Math.min(segs.length, inheritedRootSegs.length);
+	for (let k = maxK; k >= 1; k--) {
+		let match = true;
+		for (let i = 0; i < k; i++) {
+			if (segs[i] !== inheritedRootSegs[inheritedRootSegs.length - k + i]) {
+				match = false;
+				break;
+			}
+		}
+		if (match) return segs.slice(k);
+	}
+	return segs;
+}
 
 function slugify(title: string): string {
 	return title

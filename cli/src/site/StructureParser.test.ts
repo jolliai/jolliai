@@ -736,3 +736,162 @@ describe("edge cases", () => {
 		expect(result.sidebar["/guides/a"]).toBeUndefined();
 	});
 });
+
+// ─── Href normalization (dedup + leading-slash equivalence) ──────────────────
+
+describe("href normalization", () => {
+	it("dedups article href that duplicates the enclosing group root (page mode)", () => {
+		// The classic "phantom folder" case. Author put `guides/` inside the
+		// href even though the group already declares `root: "guides"`. Without
+		// dedup, this used to emit a `guides` folder entry in /docs/_meta.js
+		// AND a nested sidebar["/docs/guides"] map — producing a visible
+		// phantom collapsible folder next to the group's separator.
+		const nav: NavigationPage[] = [
+			{
+				page: "Get Started",
+				root: "/docs",
+				content: [
+					{
+						group: "Guides",
+						root: "guides",
+						content: [
+							{ article: "Introduction", href: "guides/introduction" } as NavigationArticle,
+							{ article: "Authentication", href: "guides/authentication" } as NavigationArticle,
+						],
+					} as NavigationGroup,
+				],
+			},
+		];
+		const result = parseNavigation(nav);
+		const docs = result.sidebar["/docs"];
+		expect(docs["__group-guides"]).toEqual({ type: "separator", title: "Guides" });
+		expect(docs.introduction).toBe("Introduction");
+		expect(docs.authentication).toBe("Authentication");
+		expect(docs.guides).toBeUndefined();
+		expect(result.sidebar["/docs/guides"]).toBeUndefined();
+	});
+
+	it("treats leading-slash href as equivalent to no leading slash within the inherited root", () => {
+		// `/intro` and `intro` should mean the same thing — both relative to
+		// the inherited root, never the OS filesystem root.
+		const navWithSlash: NavigationPage[] = [
+			{ page: "Docs", root: "/docs", content: [{ article: "Intro", href: "/intro" } as NavigationArticle] },
+		];
+		const navWithoutSlash: NavigationPage[] = [
+			{ page: "Docs", root: "/docs", content: [{ article: "Intro", href: "intro" } as NavigationArticle] },
+		];
+		const a = parseNavigation(navWithSlash);
+		const b = parseNavigation(navWithoutSlash);
+		expect(a.sidebar).toEqual(b.sidebar);
+		expect(a.sidebar["/docs"].intro).toBe("Intro");
+	});
+
+	it("dedups full page+group root from the start of an article href", () => {
+		// Author redundantly spelled out the entire inherited path. Strip the
+		// whole prefix and the article becomes a single-segment entry.
+		const nav: NavigationPage[] = [
+			{
+				page: "Get Started",
+				root: "/docs",
+				content: [
+					{
+						group: "Guides",
+						root: "guides",
+						content: [{ article: "Introduction", href: "docs/guides/introduction" } as NavigationArticle],
+					} as NavigationGroup,
+				],
+			},
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/docs"].introduction).toBe("Introduction");
+		expect(result.sidebar["/docs"].docs).toBeUndefined();
+		expect(result.sidebar["/docs/guides"]).toBeUndefined();
+		expect(result.sidebar["/docs/docs"]).toBeUndefined();
+	});
+
+	it("does NOT dedup when the href prefix doesn't match the inherited root", () => {
+		// `deployment/docker` inside a group with root "guides" should still
+		// produce a `deployment` intermediate folder — the author genuinely
+		// wants nested structure here, not accidental duplication.
+		const nav: NavigationPage[] = [
+			{
+				page: "Get Started",
+				root: "/docs",
+				content: [
+					{
+						group: "Guides",
+						root: "guides",
+						content: [
+							{ article: "Docker", href: "deployment/docker" } as NavigationArticle,
+							{ article: "Kubernetes", href: "deployment/kubernetes" } as NavigationArticle,
+						],
+					} as NavigationGroup,
+				],
+			},
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/docs"].deployment).toBe("deployment");
+		expect(result.sidebar["/docs/deployment"].docker).toBe("Docker");
+		expect(result.sidebar["/docs/deployment"].kubernetes).toBe("Kubernetes");
+	});
+
+	it("strips only one dedup pass even when href intentionally repeats a segment", () => {
+		// `guides/guides/intro` inside group{root:"guides"} strips ONE leading
+		// `guides`; the remaining `guides/intro` is treated as authored. The
+		// rule stays conservative: only one duplication is assumed.
+		const nav: NavigationPage[] = [
+			{
+				page: "Docs",
+				root: "/docs",
+				content: [
+					{
+						group: "Guides",
+						root: "guides",
+						content: [{ article: "Intro", href: "guides/guides/intro" } as NavigationArticle],
+					} as NavigationGroup,
+				],
+			},
+		];
+		const result = parseNavigation(nav);
+		expect(result.sidebar["/docs"].guides).toBe("guides");
+		expect(result.sidebar["/docs/guides"].intro).toBe("Intro");
+	});
+});
+
+describe("normalizeHrefSegments", () => {
+	it("returns the href as-is when the inherited root is empty", async () => {
+		const { normalizeHrefSegments } = await import("./StructureParser.js");
+		expect(normalizeHrefSegments("intro", [])).toEqual(["intro"]);
+		expect(normalizeHrefSegments("/intro", [])).toEqual(["intro"]);
+		expect(normalizeHrefSegments("a/b/c", [])).toEqual(["a", "b", "c"]);
+	});
+
+	it("strips a leading slash regardless of inherited root", async () => {
+		const { normalizeHrefSegments } = await import("./StructureParser.js");
+		expect(normalizeHrefSegments("/intro", ["docs"])).toEqual(["intro"]);
+		expect(normalizeHrefSegments("/a/b", ["docs", "guides"])).toEqual(["a", "b"]);
+	});
+
+	it("strips a matching trailing segment of inherited root from the start of href", async () => {
+		const { normalizeHrefSegments } = await import("./StructureParser.js");
+		expect(normalizeHrefSegments("guides/intro", ["docs", "guides"])).toEqual(["intro"]);
+		expect(normalizeHrefSegments("docs/intro", ["docs"])).toEqual(["intro"]);
+	});
+
+	it("strips the full inherited root when the href spells it out completely", async () => {
+		const { normalizeHrefSegments } = await import("./StructureParser.js");
+		expect(normalizeHrefSegments("docs/guides/intro", ["docs", "guides"])).toEqual(["intro"]);
+	});
+
+	it("does not strip when no leading segment of href matches the inherited root tail", async () => {
+		const { normalizeHrefSegments } = await import("./StructureParser.js");
+		expect(normalizeHrefSegments("deployment/docker", ["docs", "guides"])).toEqual(["deployment", "docker"]);
+		expect(normalizeHrefSegments("intro", ["docs", "guides"])).toEqual(["intro"]);
+	});
+
+	it("returns an empty array when href is exactly the inherited root", async () => {
+		const { normalizeHrefSegments } = await import("./StructureParser.js");
+		expect(normalizeHrefSegments("docs/guides", ["docs", "guides"])).toEqual([]);
+		expect(normalizeHrefSegments("/docs", ["docs"])).toEqual([]);
+	});
+});

@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { hasIncompatibleImports, rewriteRelativeImagePaths, stripIncompatibleContent } from "./ContentMirror.js";
 import { slugify } from "./openapi/Slug.js";
 import type { ContentRules } from "./renderer/SiteRenderer.js";
+import { normalizeHrefSegments } from "./StructureParser.js";
 import type { Navigation, NavigationArticle, NavigationGroup, NavigationPage } from "./Types.js";
 
 export interface PlannedMarkdownPage {
@@ -99,6 +100,7 @@ function addArticlePlan(
 	article: NavigationArticle,
 	sourceDir: string,
 	targetDir: string,
+	inheritedRootSegs: ReadonlyArray<string>,
 	availableMarkdownFiles: string[],
 	pages: PlannedMarkdownPage[],
 ): void {
@@ -106,13 +108,14 @@ function addArticlePlan(
 		return;
 	}
 
-	const href = article.href.replace(/^\/+/, "");
-	const sourceBase = article.source
-		? article.source
-		: article.href.startsWith("/")
-			? href
-			: joinSegments(sourceDir, href);
-	const targetBase = article.href.startsWith("/") ? href : joinSegments(targetDir, href);
+	// Normalize the href against the inherited root: leading-slash is
+	// equivalent to no slash, and any prefix duplicating the end of the
+	// inherited root is stripped. Removes the source/target double-pathing
+	// that occurred when an author repeated the group's root inside `href`.
+	const hrefSegs = normalizeHrefSegments(article.href, inheritedRootSegs);
+	const href = hrefSegs.join("/");
+	const sourceBase = article.source ? article.source : joinSegments(sourceDir, href);
+	const targetBase = joinSegments(targetDir, href);
 
 	// Articles with children but no corresponding source file are folder-only
 	// entries (collapsible sidebar groups). Skip source resolution for these —
@@ -147,7 +150,7 @@ function addArticlePlan(
 	// Per the spec, href resolution walks up to the nearest ancestor `root`.
 	if (article.articles?.length) {
 		for (const child of article.articles) {
-			addArticlePlan(child, sourceDir, targetDir, availableMarkdownFiles, pages);
+			addArticlePlan(child, sourceDir, targetDir, inheritedRootSegs, availableMarkdownFiles, pages);
 		}
 	}
 }
@@ -156,6 +159,7 @@ function addNodesPlan(
 	nodes: Array<NavigationGroup | NavigationArticle>,
 	sourceDir: string,
 	targetDir: string,
+	inheritedRootSegs: ReadonlyArray<string>,
 	availableMarkdownFiles: string[],
 	pages: PlannedMarkdownPage[],
 ): void {
@@ -166,15 +170,30 @@ function addNodesPlan(
 			// path: the schema treats a group as a sidebar separator, and the
 			// generated build tree is flattened so Nextra renders the articles
 			// at the parent level without a stray `<group.root>` folder.
+			//
+			// `node.root` IS however extended onto `inheritedRootSegs` so an
+			// author who repeats it inside an article's `href`
+			// (e.g. `href: "guides/intro"` inside `group{root: "guides"}`)
+			// gets the redundant prefix stripped instead of producing a
+			// double-pathed source lookup.
 			const childSourceDir = node.sourceRoot
 				? node.sourceRoot.replace(/^\/+|\/+$/g, "")
 				: node.root
 					? joinSegments(sourceDir, node.root)
 					: sourceDir;
-			addNodesPlan(node.content, childSourceDir, targetDir, availableMarkdownFiles, pages);
+			const groupRootSegs = (node.root ?? "").split("/").filter(Boolean);
+			const childInheritedRootSegs = [...inheritedRootSegs, ...groupRootSegs];
+			addNodesPlan(
+				node.content,
+				childSourceDir,
+				targetDir,
+				childInheritedRootSegs,
+				availableMarkdownFiles,
+				pages,
+			);
 			continue;
 		}
-		addArticlePlan(node, sourceDir, targetDir, availableMarkdownFiles, pages);
+		addArticlePlan(node, sourceDir, targetDir, inheritedRootSegs, availableMarkdownFiles, pages);
 	}
 }
 
@@ -230,11 +249,12 @@ export function validateNavigationPaths(
 			if (page.type === "menu" || page.openapi) continue;
 			const root = (page.root ?? `/${slugify(page.page)}`).replace(/^\/+/, "");
 			if (page.content) {
-				checkNodes(page.content, root, availableMarkdownFiles, mismatches);
+				const pageRootSegs = root.split("/").filter(Boolean);
+				checkNodes(page.content, root, pageRootSegs, availableMarkdownFiles, mismatches);
 			}
 		}
 	} else {
-		checkNodes(navigation as (NavigationGroup | NavigationArticle)[], "", availableMarkdownFiles, mismatches);
+		checkNodes(navigation as (NavigationGroup | NavigationArticle)[], "", [], availableMarkdownFiles, mismatches);
 	}
 
 	return mismatches;
@@ -243,17 +263,20 @@ export function validateNavigationPaths(
 function checkNodes(
 	nodes: (NavigationGroup | NavigationArticle)[],
 	parentRoot: string,
+	inheritedRootSegs: ReadonlyArray<string>,
 	files: string[],
 	mismatches: NavigationMismatch[],
 ): void {
 	for (const node of nodes) {
 		if ("group" in node) {
 			const groupRoot = node.root ? joinSegments(parentRoot, node.root) : parentRoot;
+			const groupRootSegs = (node.root ?? "").split("/").filter(Boolean);
+			const childInheritedRootSegs = [...inheritedRootSegs, ...groupRootSegs];
 			for (const article of node.content) {
-				checkArticle(article, groupRoot, files, mismatches);
+				checkArticle(article, groupRoot, childInheritedRootSegs, files, mismatches);
 			}
 		} else {
-			checkArticle(node, parentRoot, files, mismatches);
+			checkArticle(node, parentRoot, inheritedRootSegs, files, mismatches);
 		}
 	}
 }
@@ -261,19 +284,21 @@ function checkNodes(
 function checkArticle(
 	article: NavigationArticle,
 	root: string,
+	inheritedRootSegs: ReadonlyArray<string>,
 	files: string[],
 	mismatches: NavigationMismatch[],
 ): void {
 	if (article.type === "external") return;
 
-	const href = article.href.replace(/^\/+/, "");
-	const resolved = article.href.startsWith("/") ? href : joinSegments(root, href);
+	const hrefSegs = normalizeHrefSegments(article.href, inheritedRootSegs);
+	const href = hrefSegs.join("/");
+	const resolved = joinSegments(root, href);
 
 	// Skip if it has children but no file (folder-only entry)
 	if (article.articles?.length && !hasSourceMarkdown(resolved, files)) {
 		// Still check children
 		for (const child of article.articles) {
-			checkArticle(child, root, files, mismatches);
+			checkArticle(child, root, inheritedRootSegs, files, mismatches);
 		}
 		return;
 	}
@@ -282,7 +307,7 @@ function checkArticle(
 	if (hasSourceMarkdown(resolved, files)) {
 		if (article.articles) {
 			for (const child of article.articles) {
-				checkArticle(child, root, files, mismatches);
+				checkArticle(child, root, inheritedRootSegs, files, mismatches);
 			}
 		}
 		return;
@@ -323,7 +348,7 @@ export function buildNavigationContentPlan(
 
 	const isPageMode = "page" in navigation[0];
 	if (!isPageMode) {
-		addNodesPlan(navigation as (NavigationGroup | NavigationArticle)[], "", "", availableMarkdownFiles, pages);
+		addNodesPlan(navigation as (NavigationGroup | NavigationArticle)[], "", "", [], availableMarkdownFiles, pages);
 		validatePlanConflicts(pages);
 		return { pages };
 	}
@@ -334,7 +359,8 @@ export function buildNavigationContentPlan(
 		}
 		const pageRoot = (pg.root ?? `/${slugify(pg.page)}`).replace(/^\/+/, "");
 		const sourceRoot = pg.sourceRoot ? pg.sourceRoot.replace(/^\/+|\/+$/g, "") : pageRoot;
-		addNodesPlan(pg.content, sourceRoot, pageRoot, availableMarkdownFiles, pages);
+		const pageRootSegs = pageRoot.split("/").filter(Boolean);
+		addNodesPlan(pg.content, sourceRoot, pageRoot, pageRootSegs, availableMarkdownFiles, pages);
 	}
 
 	validatePlanConflicts(pages);

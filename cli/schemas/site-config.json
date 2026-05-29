@@ -476,7 +476,7 @@
 				},
 				"href": {
 					"type": "string",
-					"description": "Path to the content. Resolved relative to the nearest ancestor root."
+					"description": "Path to the content, relative to the inherited root (page.root + enclosing group.root). Two normalization rules: (1) a leading '/' is equivalent to no leading slash — both mean 'relative to the inherited root', never the OS filesystem root, so '/intro' and 'intro' are the same. (2) If the href starts with segments that duplicate the end of the inherited root (e.g. href: 'guides/intro' inside group{root:'guides'} under page{root:'/docs'}), the duplicated prefix is stripped — preventing a phantom intermediate folder in the sidebar."
 				},
 				"source": {
 					"type": "string",
