@@ -14,8 +14,6 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import * as vscode from "vscode";
 import { execFileSyncHidden } from "../../../cli/src/util/Subprocess.js";
 import {
@@ -29,9 +27,9 @@ import {
 } from "../../../cli/src/core/Summarizer.js";
 import {
 	getTranscriptHashes as coreGetTranscriptHashes,
-	readLinearIssueFromBranch,
 	readNoteFromBranch,
 	readPlanFromBranch,
+	readReferenceFromBranch,
 	readTranscriptsForCommits as coreReadTranscriptsForCommits,
 } from "../../../cli/src/core/SummaryStore.js";
 import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
@@ -44,10 +42,12 @@ import type {
 	E2eTestScenario,
 	NoteReference,
 	PlanReference,
+	ReferenceCommitRef,
+	SourceId,
 	StoredTranscript,
 } from "../../../cli/src/Types.js";
 import { CURRENT_SCHEMA_VERSION } from "../../../cli/src/Types.js";
-import { setLinearIssueIgnored } from "../core/LinearIssueService.js";
+import { setReferenceIgnored } from "../core/ReferenceService.js";
 import {
 	ignoreNote,
 	saveNote,
@@ -82,6 +82,7 @@ import { log } from "../util/Logger.js";
 import { loadGlobalConfig } from "../util/WorkspaceUtils.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
+import { SOURCE_TITLES } from "./SourceLabels.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
 import {
 	buildE2eTestSection,
@@ -147,12 +148,37 @@ type WebviewMessage =
 	| { command: "previewNote"; id: string; title: string }
 	| { command: "translateNote"; id: string }
 	| { command: "removeNote"; id: string; title: string }
-	| { command: "openLinearIssue"; archivedKey: string; url: string }
-	| { command: "openLinearIssueMarkdown"; archivedKey: string }
 	| {
-			command: "removeLinearIssue";
+			command: "previewReference";
 			archivedKey: string;
-			ticketId: string;
+			source: SourceId;
+			nativeId: string;
+			title: string;
+	  }
+	| { command: "openReferenceExternal"; url: string }
+	| {
+			command: "loadReferenceContent";
+			archivedKey: string;
+			source: SourceId;
+	  }
+	| {
+			command: "saveReferenceEdit";
+			archivedKey: string;
+			source: SourceId;
+			content: string;
+	  }
+	| { command: "cancelReferenceEdit"; archivedKey: string }
+	| {
+			command: "removeReference";
+			archivedKey: string;
+			source: SourceId;
+			nativeId: string;
+			title: string;
+	  }
+	| {
+			command: "translateReference";
+			archivedKey: string;
+			source: SourceId;
 	  }
 	| { command: "checkPrStatus" }
 	| { command: "prepareCreatePr" }
@@ -218,6 +244,13 @@ const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
 	"loadAllTranscripts",
 	"previewPlan",
 	"previewNote",
+	// Reference previews / open-in-browser are read-only against the foreign
+	// repo's storage. The destructive reference actions (loadReferenceContent /
+	// saveReferenceEdit / removeReference / translateReference) are NOT here because
+	// they write back to the orphan branch via `this.bridge` / `this.cwd`,
+	// which is bound to the *current* workspace and would corrupt it.
+	"previewReference",
+	"openReferenceExternal",
 ]);
 
 function isForeignSafeCommand(command: WebviewMessage["command"]): boolean {
@@ -248,8 +281,13 @@ const REGENERATE_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set
 	"loadNoteContent",
 	"previewPlan",
 	"previewNote",
-	"openLinearIssue",
-	"openLinearIssueMarkdown",
+	// Reference previews & open-in-browser are read-only — safe to keep
+	// reachable while regenerate is in flight. Write-side reference actions
+	// (loadReferenceContent / saveReferenceEdit / removeReference / translateReference)
+	// are NOT here for the same race reason that excludes savePlan /
+	// removePlan / translatePlan.
+	"previewReference",
+	"openReferenceExternal",
 	// regenerateSummary itself is denied while one is in flight; the
 	// handler's own `regenerateInProgress` guard short-circuits a re-entry.
 ]);
@@ -337,6 +375,8 @@ export class SummaryWebviewPanel {
 	private planTranslateSet: Set<string> = new Set();
 	/** Cached set of note IDs whose content contains non-ASCII characters (need translation). */
 	private noteTranslateSet: Set<string> = new Set();
+	/** Cached set of reference `archivedKey`s whose snapshot contains CJK characters (need translation). */
+	private referenceTranslateSet: Set<string> = new Set();
 	/** Guards against concurrent push invocations (re-click during active push). */
 	private pushInProgress = false;
 	/**
@@ -699,24 +739,66 @@ export class SummaryWebviewPanel {
 					"Remove note failed",
 				);
 				break;
-			case "openLinearIssue":
+			case "previewReference":
+				this.catchAndShow(
+					this.handlePreviewReference(
+						message.archivedKey,
+						message.source,
+						message.nativeId,
+						message.title,
+					),
+					"Open reference preview failed",
+				);
+				break;
+			case "openReferenceExternal":
 				// `url` is round-tripped from the rendered row so we don't have
 				// to re-load the orphan branch summary to find the link target.
 				this.catchAndShow(
-					this.handleOpenLinearIssue(message.archivedKey, message.url),
-					"Open Linear issue failed",
+					this.handleOpenReferenceExternal(message.url),
+					"Open reference external failed",
 				);
 				break;
-			case "openLinearIssueMarkdown":
+			case "loadReferenceContent":
 				this.catchAndShow(
-					this.handleOpenLinearIssueMarkdown(message.archivedKey),
-					"Open Linear issue markdown failed",
+					this.handleLoadReferenceContent(message.archivedKey, message.source),
+					"Load reference failed",
 				);
 				break;
-			case "removeLinearIssue":
+			case "saveReferenceEdit":
 				this.catchAndShow(
-					this.handleRemoveLinearIssue(message.archivedKey, message.ticketId),
-					"Remove Linear issue failed",
+					this.handleSaveReferenceEdit(
+						message.archivedKey,
+						message.source,
+						message.content,
+					),
+					"Save reference failed",
+				);
+				break;
+			case "cancelReferenceEdit":
+				// No host action — the webview owns the textarea toggle. This
+				// case exists so dispatchWebviewMessage's exhaustive switch
+				// covers every command in the union (TypeScript will error if
+				// we drop it).
+				break;
+			case "removeReference":
+				this.catchAndShow(
+					this.handleRemoveReference(
+						message.archivedKey,
+						message.source,
+						message.nativeId,
+						message.title,
+					),
+					"Remove reference failed",
+				);
+				break;
+			case "translateReference":
+				this.catchAndShow(
+					this.handleTranslateReference(message.archivedKey, message.source),
+					"Translation failed",
+					{
+						command: "referenceTranslateError",
+						archivedKey: message.archivedKey,
+					},
 				);
 				break;
 			case "checkPrStatus":
@@ -1009,14 +1091,17 @@ export class SummaryWebviewPanel {
 				const prevTranscriptHashSet = existing.transcriptHashSet;
 				const prevPlanTranslateSet = existing.planTranslateSet;
 				const prevNoteTranslateSet = existing.noteTranslateSet;
+				const prevReferenceTranslateSet = existing.referenceTranslateSet;
 				await existing.refreshTranscriptHashes(summary);
 				await existing.refreshPlanTranslateSet(summary);
 				await existing.refreshNoteTranslateSet(summary);
+				await existing.refreshReferenceTranslateSet(summary);
 				const inputsChanged =
 					!summariesEqual(existing.currentSummary, summary) ||
 					!setsEqual(prevTranscriptHashSet, existing.transcriptHashSet) ||
 					!setsEqual(prevPlanTranslateSet, existing.planTranslateSet) ||
-					!setsEqual(prevNoteTranslateSet, existing.noteTranslateSet);
+					!setsEqual(prevNoteTranslateSet, existing.noteTranslateSet) ||
+					!setsEqual(prevReferenceTranslateSet, existing.referenceTranslateSet);
 				if (inputsChanged) {
 					existing.update(summary);
 				}
@@ -1053,6 +1138,7 @@ export class SummaryWebviewPanel {
 		await instance.refreshTranscriptHashes(summary);
 		await instance.refreshPlanTranslateSet(summary);
 		await instance.refreshNoteTranslateSet(summary);
+		await instance.refreshReferenceTranslateSet(summary);
 		instance.update(summary);
 	}
 
@@ -1080,6 +1166,7 @@ export class SummaryWebviewPanel {
 			transcriptHashSet: this.transcriptHashSet,
 			planTranslateSet: this.planTranslateSet,
 			noteTranslateSet: this.noteTranslateSet,
+			referenceTranslateSet: this.referenceTranslateSet,
 			nonce,
 			foreignRepoName: this.foreignRepoName,
 			staleRewrittenInto: this.staleRewrittenInto ?? null,
@@ -1149,6 +1236,39 @@ export class SummaryWebviewPanel {
 			}
 		}
 		this.planTranslateSet = result;
+	}
+
+	/**
+	 * Refreshes `referenceTranslateSet` by reading each reference's archived
+	 * markdown from the orphan branch and checking whether its title (from
+	 * the `ReferenceCommitRef`) or body contains CJK characters. Mirrors
+	 * `refreshPlanTranslateSet` / `refreshNoteTranslateSet`.
+	 */
+	private async refreshReferenceTranslateSet(
+		summary: CommitSummary,
+	): Promise<void> {
+		const result = new Set<string>();
+		const references: ReadonlyArray<ReferenceCommitRef> = summary.references ?? [];
+		for (const reference of references) {
+			if (SummaryWebviewPanel.CJK_RE.test(reference.title)) {
+				result.add(reference.archivedKey);
+				continue;
+			}
+			try {
+				const content = await readReferenceFromBranch(
+					reference.source,
+					reference.archivedKey,
+					this.workspaceRoot,
+					this.foreignStorage ?? undefined,
+				);
+				if (content && SummaryWebviewPanel.CJK_RE.test(content)) {
+					result.add(reference.archivedKey);
+				}
+			} catch {
+				/* skip — no translate button when read fails */
+			}
+		}
+		this.referenceTranslateSet = result;
 	}
 
 	/**
@@ -1821,7 +1941,7 @@ export class SummaryWebviewPanel {
 	/**
 	 * End-to-end re-run of the summary LLM. Replaces topics + recap (plus
 	 * supporting fields like diffStats, transcriptEntries, llm); preserves
-	 * ticketId, e2eTestGuide, plans, notes, linearIssues, children, and all
+	 * ticketId, e2eTestGuide, plans, notes, references, children, and all
 	 * push metadata. See cli/src/core/Regenerator.ts for the isolation
 	 * contract (no cursor advance, no archive re-write, no queue side
 	 * effects).
@@ -1970,12 +2090,22 @@ export class SummaryWebviewPanel {
 			);
 		}
 		lines.push(`  • The commit diff (reconstructed via \`git show ${shortHash}\`)`);
-		if (ctx.plansCount + ctx.notesCount + ctx.linearCount > 0) {
+		const referenceTotal = Object.values(ctx.referenceCountsBySource).reduce(
+			(acc: number, n) => acc + (n ?? 0),
+			0,
+		);
+		if (ctx.plansCount + ctx.notesCount + referenceTotal > 0) {
 			const parts: string[] = [];
 			if (ctx.plansCount > 0) parts.push(`${ctx.plansCount} plan${s(ctx.plansCount)}`);
 			if (ctx.notesCount > 0) parts.push(`${ctx.notesCount} note${s(ctx.notesCount)}`);
-			if (ctx.linearCount > 0) {
-				parts.push(`${ctx.linearCount} Linear issue${s(ctx.linearCount)}`);
+			// Render one segment per source with a positive count, using the
+			// canonical label (e.g. "2 Linear issues", "1 Jira issue"). Order
+			// follows the SOURCE_TITLES key order so the dialog is stable.
+			for (const source of Object.keys(SOURCE_TITLES) as Array<keyof typeof SOURCE_TITLES>) {
+				const n = ctx.referenceCountsBySource[source] ?? 0;
+				if (n > 0) {
+					parts.push(`${n} ${SOURCE_TITLES[source]} issue${s(n)}`);
+				}
 			}
 			lines.push(`  • Archived ${parts.join(", ")} attached to this commit`);
 		}
@@ -2706,65 +2836,69 @@ export class SummaryWebviewPanel {
 		this.update(updatedSummary);
 	}
 
-	// ── Linear issue actions ─────────────────────────────────────────────────
+	// ── Reference actions (multi-source: Linear / Jira / GitHub / Notion) ───
+	//
+	// All reference rows share the same `*Reference` data-action names. Once a
+	// reference is associated with a commit, the orphan branch is the system
+	// of record — the local `.jolli/jollimemory/` directory is never
+	// consulted by these handlers.
 
 	/**
-	 * Opens the upstream Linear issue URL in the user's default browser.
-	 * The row already carries the URL as a data attribute, so we don't have
-	 * to re-resolve it from the orphan-branch summary.
+	 * Opens the reference's URL in the default browser. Defense-in-depth: each
+	 * SourceAdapter.extractRef already gates incoming URLs through
+	 * `^https?://`, but the URL flows through `data-reference-url` on the
+	 * rendered row (a sink the user can't taint directly but a bug upstream
+	 * could). Re-validate at the sink so `javascript:` / `data:` / `file:`
+	 * can't smuggle through `openExternal`. Mirrors ReferenceService.open-
+	 * ReferenceInBrowser verbatim.
 	 */
-	private async handleOpenLinearIssue(
-		_archivedKey: string,
-		url: string,
-	): Promise<void> {
+	private async handleOpenReferenceExternal(url: string): Promise<void> {
 		if (!url) return;
-		await vscode.env.openExternal(vscode.Uri.parse(url));
-	}
-
-	/**
-	 * Opens the captured-at-commit markdown snapshot for a Linear issue.
-	 *
-	 * Lookup order (matches plan/note preview's branch-then-local pattern):
-	 *   1. Local `.jolli/jollimemory/linear-issues/<key>.md` — the same
-	 *      on-disk path QueueWorker renamed to during commit association
-	 *      (`<ticketId>.md` → `<ticketId>-<shortHash>.md`).
-	 *   2. Orphan branch `linear-issues/<key>.md` — the durable copy. Falls
-	 *      back here when the local file is missing (fresh checkout, user
-	 *      cleaned .jolli, working from a different machine).
-	 *
-	 * Without the orphan fallback this handler would `showTextDocument` on a
-	 * nonexistent path → VSCode error toast → user thinks the snapshot is
-	 * lost, even though the archived content is durable on the orphan branch.
-	 */
-	private async handleOpenLinearIssueMarkdown(
-		archivedKey: string,
-	): Promise<void> {
-		if (!archivedKey) return;
-		const filePath = join(
-			this.workspaceRoot,
-			".jolli",
-			"jollimemory",
-			"linear-issues",
-			`${archivedKey}.md`,
-		);
-		if (existsSync(filePath)) {
-			await vscode.window.showTextDocument(vscode.Uri.file(filePath));
-			return;
-		}
-		const content = await readLinearIssueFromBranch(
-			archivedKey,
-			this.workspaceRoot,
-		);
-		if (!content) {
-			vscode.window.showErrorMessage(
-				`Linear issue snapshot "${archivedKey}" not found locally or on the orphan branch.`,
+		const uri = vscode.Uri.parse(url);
+		if (uri.scheme !== "http" && uri.scheme !== "https") {
+			log.warn(
+				"SummaryPanel",
+				`refusing non-http(s) URL for openReferenceExternal: scheme=${uri.scheme}`,
+			);
+			vscode.window.showWarningMessage(
+				`Refused to open non-http(s) URL: ${url}`,
 			);
 			return;
 		}
-		// Untitled doc — we don't re-materialize the local file. Avoids
-		// silently re-creating files the user (or .jolli cleanup) chose to
-		// remove, and keeps the orphan branch as the single source of truth
-		// for archived snapshots.
+		await vscode.env.openExternal(uri);
+	}
+
+	/**
+	 * Opens the captured-at-commit markdown snapshot for a reference in a
+	 * read-only editor.
+	 *
+	 * Source: orphan branch `references/<source>/<sanitized>.md`. Once a
+	 * reference is associated with a commit, the local `.jolli/jollimemory/`
+	 * directory is no longer authoritative — the orphan branch is the system
+	 * of record. Linear is treated identically to Jira / GitHub / Notion.
+	 */
+	private async handlePreviewReference(
+		archivedKey: string,
+		source: SourceId,
+		_nativeId: string,
+		_title: string,
+	): Promise<void> {
+		if (!archivedKey) return;
+		const content = await readReferenceFromBranch(
+			source,
+			archivedKey,
+			this.workspaceRoot,
+			this.foreignStorage ?? undefined,
+		);
+		if (!content) {
+			vscode.window.showErrorMessage(
+				`Reference snapshot "${archivedKey}" not found on the orphan branch.`,
+			);
+			return;
+		}
+		// Untitled doc — same rationale as plan / note preview: never re-
+		// materialize on the user's disk. The orphan branch is the source of
+		// truth for archived snapshots.
 		const doc = await vscode.workspace.openTextDocument({
 			language: "markdown",
 			content,
@@ -2773,31 +2907,95 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
-	 * Dissociates a Linear issue from this commit's summary. Mirrors
-	 * `handleRemovePlan` / `handleRemoveNote`: prompts for confirmation,
-	 * filters the issue out of `summary.linearIssues[]`, persists, then
-	 * marks both the guard and snapshot entries ignored so the issue stays
-	 * hidden from the sidebar panel even if the live file is touched again.
+	 * Loads the archived reference markdown body into the webview for inline
+	 * editing. Mirrors `handleLoadPlanContent`.
 	 */
-	private async handleRemoveLinearIssue(
+	private async handleLoadReferenceContent(
 		archivedKey: string,
-		ticketId: string,
+		source: SourceId,
 	): Promise<void> {
-		const summary = this.currentSummary;
-		if (!summary?.linearIssues) {
+		const content = await readReferenceFromBranch(
+			source,
+			archivedKey,
+			this.workspaceRoot,
+			this.foreignStorage ?? undefined,
+		);
+		if (content === null) {
+			vscode.window.showErrorMessage(
+				`Could not read reference "${archivedKey}" from the orphan branch.`,
+			);
+			return; // Do NOT open edit with empty content — would silently overwrite on save.
+		}
+		this.panel.webview.postMessage({
+			command: "referenceContentLoaded",
+			archivedKey,
+			source,
+			content,
+		});
+	}
+
+	/**
+	 * Writes edited reference content back to the orphan branch. Mirrors
+	 * `handleSavePlan` — the file lives at
+	 * `references/<source>/<sanitized-bareKey>.md`. We do NOT sync the title
+	 * back into `summary.references[].title` because the reference title is
+	 * sourced from the upstream system (Jira/Linear/Notion/GitHub) and
+	 * silently overwriting it with the markdown's first heading would drift
+	 * from upstream on every save.
+	 */
+	private async handleSaveReferenceEdit(
+		archivedKey: string,
+		source: SourceId,
+		content: string,
+	): Promise<void> {
+		if (!(await this.ensureCommitNotRewritten("save reference"))) {
 			return;
 		}
+		await this.bridge.storeReferences(
+			[{ archivedKey, source, content }],
+			`Edit ${source} reference ${archivedKey}`,
+		);
+		this.panel.webview.postMessage({
+			command: "referenceSaved",
+			archivedKey,
+			source,
+		});
+		log.info(
+			"SummaryPanel",
+			`Reference ${source}:${archivedKey} saved to orphan branch`,
+		);
+	}
+
+	/**
+	 * Dissociates a reference from this commit's summary. Mirrors
+	 * `handleRemovePlan` / `handleRemoveNote`. Splices from `references`. The
+	 * archived markdown file on the orphan branch is preserved (don't delete
+	 * history).
+	 */
+	private async handleRemoveReference(
+		archivedKey: string,
+		source: SourceId,
+		nativeId: string,
+		title: string,
+	): Promise<void> {
+		const summary = this.currentSummary;
+		if (!summary) return;
+		const hasReference = summary.references?.some((e) => e.archivedKey === archivedKey) ?? false;
+		if (!hasReference) return;
+
 		// Check BEFORE the confirm dialog (same rationale as handleDeleteTopic).
-		if (!(await this.ensureCommitNotRewritten("remove Linear issue"))) {
+		if (!(await this.ensureCommitNotRewritten("remove reference"))) {
 			return;
 		}
 
+		const sourceLabel = SOURCE_TITLES[source];
+		const dialogTitle = title || nativeId || archivedKey;
 		const choice = await vscode.window.showWarningMessage(
-			`Remove Linear issue "${ticketId}" from this commit?`,
+			`Remove ${sourceLabel} reference "${dialogTitle}" from this commit?`,
 			{
 				modal: true,
 				detail:
-					"The issue will no longer be linked to this commit's summary. The captured markdown snapshot is preserved on the orphan branch.",
+					"The reference will no longer be linked to this commit's summary. The captured markdown snapshot is preserved on the orphan branch.",
 			},
 			"Remove",
 		);
@@ -2806,30 +3004,123 @@ export class SummaryWebviewPanel {
 		}
 
 		// Race-window re-check: amend can land while the confirm modal is open.
-		if (!(await this.ensureCommitNotRewritten("remove Linear issue"))) {
+		if (!(await this.ensureCommitNotRewritten("remove reference"))) {
 			return;
 		}
 
-		const updatedLinearIssues = summary.linearIssues.filter(
-			(l) => l.archivedKey !== archivedKey,
+		const updatedReferences = (summary.references ?? []).filter(
+			(e) => e.archivedKey !== archivedKey,
 		);
 		const updatedSummary: CommitSummary = {
 			...summary,
-			linearIssues:
-				updatedLinearIssues.length > 0 ? updatedLinearIssues : undefined,
+			references: updatedReferences.length > 0 ? updatedReferences : undefined,
 		};
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
-		// Hide both entries from the panel: the snapshot key and the ticketId
-		// guard entry. `setLinearIssueIgnored` accepts either, mirroring the
-		// dual-key archive layout in plans.json (see LinearIssueStore).
-		await setLinearIssueIgnored(this.workspaceRoot, archivedKey, true);
-		if (ticketId && ticketId !== archivedKey) {
-			await setLinearIssueIgnored(this.workspaceRoot, ticketId, true);
-		}
+		// Hide from the sidebar panel: mark the archived map key ignored.
+		// Intentionally single-key. The old Linear-only path also ignored the bare
+		// ticketId guard entry, so a removed reference stayed hidden forever even
+		// if re-referenced. We deliberately diverge: only the archived snapshot key
+		// is ignored, NOT the bare `<source>:<nativeId>` guard. A later re-reference
+		// whose content changed (guard-hash mismatch) is allowed to re-surface as a
+		// fresh uncommitted reference — removal hides the current snapshot, it does
+		// not permanently blacklist the ticket.
+		await setReferenceIgnored(this.workspaceRoot, archivedKey, true);
 
 		this.update(updatedSummary);
+	}
+
+	/**
+	 * Translates a reference's archived markdown to English via LLM. Mirrors
+	 * `handleTranslatePlan` — same translation pipeline, same cache shape
+	 * (keyed on archivedKey). Writes the translated content back to the
+	 * orphan branch via `storeReferences`.
+	 */
+	private async handleTranslateReference(
+		archivedKey: string,
+		source: SourceId,
+	): Promise<void> {
+		if (!(await this.ensureCommitNotRewritten("translate reference"))) {
+			return;
+		}
+		const content = await readReferenceFromBranch(
+			source,
+			archivedKey,
+			this.workspaceRoot,
+			this.foreignStorage ?? undefined,
+		);
+		if (content === null) {
+			vscode.window.showErrorMessage(
+				`Could not read reference "${archivedKey}" from the orphan branch.`,
+			);
+			return;
+		}
+
+		// Check both title and body — title is part of the ReferenceCommitRef
+		// snapshot, body is on the orphan branch.
+		const reference = this.findReferenceInSummary(archivedKey);
+		const titleHasNonAscii = reference
+			? SummaryWebviewPanel.CJK_RE.test(reference.title)
+			: false;
+		if (!titleHasNonAscii && !SummaryWebviewPanel.CJK_RE.test(content)) {
+			vscode.window.showInformationMessage("Reference is already in English.");
+			return;
+		}
+
+		this.panel.webview.postMessage({
+			command: "referenceTranslating",
+			archivedKey,
+		});
+
+		const translateConfig = await loadGlobalConfig();
+		const translated = await translateToEnglish({
+			content,
+			config: translateConfig,
+		});
+
+		// Race-window re-check: amend can land during the LLM call (10–60s).
+		// `storeReferences` is content-only (no per-commit metadata sync), so
+		// we let it land regardless — losing translated bodies would discard
+		// real user work.
+		if (!(await this.ensureCommitNotRewritten("translate reference"))) {
+			return;
+		}
+
+		await this.bridge.storeReferences(
+			[{ archivedKey, source, content: translated }],
+			`Translate ${source} reference ${archivedKey} to English`,
+		);
+
+		// Drop from translate set immediately — user explicitly translated.
+		this.referenceTranslateSet.delete(archivedKey);
+		if (this.currentSummary) {
+			this.update(this.currentSummary);
+		}
+
+		this.panel.webview.postMessage({
+			command: "referenceTranslated",
+			archivedKey,
+		});
+		vscode.window.showInformationMessage(
+			`Reference "${archivedKey}" has been translated to English.`,
+		);
+		log.info(
+			"SummaryPanel",
+			`Reference ${source}:${archivedKey} translated to English`,
+		);
+	}
+
+	/**
+	 * Finds a reference in the current summary by archivedKey. Used by
+	 * handleTranslateReference for the cheap title-CJK check.
+	 */
+	private findReferenceInSummary(
+		archivedKey: string,
+	): ReferenceCommitRef | undefined {
+		const s = this.currentSummary;
+		if (!s) return undefined;
+		return s.references?.find((e) => e.archivedKey === archivedKey);
 	}
 
 	/** Translates a plan from its current language to English via LLM. */

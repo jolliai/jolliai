@@ -35,6 +35,7 @@ describe("CommitSelectionStore", () => {
 		expect(ex.conversations.size).toBe(0);
 		expect(ex.plans.size).toBe(0);
 		expect(ex.notes.size).toBe(0);
+		expect(ex.references.size).toBe(0);
 	});
 
 	it("returns empty exclusions when the file is malformed", async () => {
@@ -77,16 +78,78 @@ describe("CommitSelectionStore", () => {
 		await writeFile(filePath(), JSON.stringify({ version: 99, conversations: ["x"] }), "utf8");
 		const ex: CommitExclusions = await readExclusions(cwd);
 		expect(ex.conversations.size).toBe(0);
+		expect(ex.references.size).toBe(0);
+	});
+
+	it("readExclusions transparently migrates a legacy v1 file (no entities field)", async () => {
+		// v1 files predate the entities panel-level exclusion. They must read
+		// back cleanly with an empty entities set so existing users don't lose
+		// their plan/note/conversation exclusions on first upgrade.
+		await writeFile(
+			filePath(),
+			JSON.stringify({
+				version: 1,
+				conversations: ["claude:c1"],
+				plans: ["p1"],
+				notes: ["n1"],
+			}),
+			"utf8",
+		);
+		const ex = await readExclusions(cwd);
+		expect(ex.conversations.has("claude:c1")).toBe(true);
+		expect(ex.plans.has("p1")).toBe(true);
+		expect(ex.notes.has("n1")).toBe(true);
+		expect(ex.references.size).toBe(0);
+	});
+
+	it("setExcluded upgrades a v1 file to v2 on next write (entities round-trip)", async () => {
+		// Plant a v1 file, then add a single entity exclusion. The next read
+		// must surface entities and the on-disk version must be 2.
+		await writeFile(
+			filePath(),
+			JSON.stringify({ version: 1, conversations: [], plans: ["p1"], notes: [] }),
+			"utf8",
+		);
+		await setExcluded(cwd, "references", "jira:PROJ-1", true);
+		const ex = await readExclusions(cwd);
+		expect(ex.plans.has("p1")).toBe(true);
+		expect(ex.references.has("jira:PROJ-1")).toBe(true);
+		const raw = JSON.parse(await (await import("node:fs/promises")).readFile(filePath(), "utf8"));
+		expect(raw.version).toBe(2);
+	});
+
+	it("setExcluded round-trips entities independently of plans/notes/conversations", async () => {
+		await setExcluded(cwd, "references", "jira:PROJ-1", true);
+		await setExcluded(cwd, "references", "github:owner/repo#42", true);
+		await setExcluded(cwd, "plans", "p1", true);
+		const ex = await readExclusions(cwd);
+		expect([...ex.references].sort()).toEqual(["github:owner/repo#42", "jira:PROJ-1"]);
+		expect(ex.plans.has("p1")).toBe(true);
+		expect(ex.notes.size).toBe(0);
+	});
+
+	it("setExcluded(false) removes an entity key", async () => {
+		await setExcluded(cwd, "references", "linear:LIN-1", true);
+		await setExcluded(cwd, "references", "linear:LIN-1", false);
+		const ex = await readExclusions(cwd);
+		expect(ex.references.has("linear:LIN-1")).toBe(false);
+	});
+
+	it("setAllExcluded bulk-adds entity keys", async () => {
+		await setAllExcluded(cwd, "references", ["linear:A", "jira:B", "github:C", "notion:D"], true);
+		const ex = await readExclusions(cwd);
+		expect([...ex.references].sort()).toEqual(["github:C", "jira:B", "linear:A", "notion:D"]);
 	});
 
 	it("readExclusions coerces non-array fields to empty sets and filters out non-string entries", async () => {
 		await writeFile(
 			filePath(),
 			JSON.stringify({
-				version: 1,
+				version: 2,
 				conversations: "not-an-array",
 				plans: [42, "p1", null, "p2"],
 				notes: null,
+				references: [7, "jira:X", false, "github:Y"],
 			}),
 			"utf8",
 		);
@@ -94,6 +157,7 @@ describe("CommitSelectionStore", () => {
 		expect(ex.conversations.size).toBe(0);
 		expect(ex.notes.size).toBe(0);
 		expect([...ex.plans].sort()).toEqual(["p1", "p2"]);
+		expect([...ex.references].sort()).toEqual(["github:Y", "jira:X"]);
 	});
 
 	it("tolerates a stale conversation key that no longer exists", async () => {

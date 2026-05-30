@@ -503,7 +503,7 @@ ${delimited({
 						commitDate: mockCommitInfo.date,
 						conversation: "User: Fix login bug\nAssistant: Done",
 						diff: "diff --git a/src/login.ts",
-						linearIssues: "",
+						references: "",
 						plans: "",
 						notes: "",
 					},
@@ -512,6 +512,30 @@ ${delimited({
 			expect(record.ticketId).toBe("PROJ-123");
 			expect(record.conversationTurns).toBe(5);
 			expect(record.topics).toHaveLength(1);
+		});
+
+		it("routes referenceBlocks into the references prompt placeholder (multi-source)", async () => {
+			mockCallLlm.mockResolvedValueOnce(
+				summaryLlmResult(delimited({ title: "T", trigger: "t", response: "r", decisions: "d" })),
+			);
+			const block = "<linear-issues>...</linear-issues>\n<jira-issues>...</jira-issues>";
+
+			await generateSummary({
+				conversation: "",
+				diff: "",
+				commitInfo: mockCommitInfo,
+				diffStats: mockDiffStats,
+				transcriptEntries: 0,
+				referenceBlocks: block,
+				config: mockConfig,
+			});
+
+			expect(mockCallLlm).toHaveBeenCalledWith(
+				expect.objectContaining({
+					action: "summarize",
+					params: expect.objectContaining({ references: block }),
+				}),
+			);
 		});
 
 		it("does not pass any size-derived hint regardless of diff size", async () => {

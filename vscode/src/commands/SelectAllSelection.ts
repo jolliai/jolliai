@@ -6,16 +6,16 @@
  * `jollimemory.selectAllFiles` command: if every visible row is currently
  * selected, the command deselects all; otherwise it selects all.
  *
- * Discriminating plan rows from note rows
- * ──────────────────────────────────────
+ * Discriminating plan / note / reference rows
+ * ───────────────────────────────────────────
  * `PlansTreeProvider.serialize()` returns `SerializedTreeItem[]` where the
- * `contextValue` field is `"plan"`, `"note"`, or `"linearissue"` (set by the
+ * `contextValue` field is `"plan"`, `"note"`, or `"reference"` (set by the
  * corresponding Item constructor in PlansTreeProvider). The `id` field carries
- * the raw plan slug (for plans) or note id (for notes) — no prefix. We switch
- * on `contextValue` to split the two groups. Linear-issue rows have no
- * exclusion key and are skipped. This is **Option B-variant (contextValue)**:
- * the discriminator already existed on SerializedTreeItem; no schema changes
- * were needed.
+ * the raw plan slug (for plans), note id (for notes), or reference mapKey
+ * `<source>:<nativeId>` (for references) — no prefix. We switch on
+ * `contextValue` to split the three groups. This is
+ * **Option B-variant (contextValue)**: the discriminator already existed on
+ * SerializedTreeItem; no schema changes were needed.
  */
 
 import {
@@ -56,23 +56,26 @@ export async function selectAllConversationsCommand(
 }
 
 /**
- * Flip selection state for all visible plans AND notes in one shot.
- * Linear-issue rows have no exclusion key and are ignored.
- * The "all selected" check spans both groups together (matching FilesStore
- * behaviour which considers the combined visible set).
+ * Flip selection state for all visible plans, notes AND references in one shot.
+ * The "all selected" check spans all three groups together (matching FilesStore
+ * behaviour which considers the combined visible set). Name kept as
+ * `selectAllPlansAndNotesCommand` for callsite stability — the panel header
+ * label is "Plans & Notes" and renaming would ripple through command IDs.
  */
 export async function selectAllPlansAndNotesCommand(
 	ctx: SelectAllCtx,
 ): Promise<void> {
-	// serialize() output: contextValue is "plan" | "note" | "linearissue";
-	// id is the raw plan slug (for plans) or note id (for notes).
+	// serialize() output: contextValue is "plan" | "note" | "reference";
+	// id is the raw plan slug (plans), note id (notes), or mapKey (references).
 	const rows = ctx.plansProvider.serialize();
 	const planRows = rows.filter((r) => r.contextValue === "plan");
 	const noteRows = rows.filter((r) => r.contextValue === "note");
+	const referenceRows = rows.filter((r) => r.contextValue === "reference");
 	const planKeys = planRows.map((r) => r.id);
 	const noteKeys = noteRows.map((r) => r.id);
+	const referenceKeys = referenceRows.map((r) => r.id);
 
-	const visibleSelectable = [...planRows, ...noteRows];
+	const visibleSelectable = [...planRows, ...noteRows, ...referenceRows];
 	// `isSelected !== false` because "absence of a record means included".
 	const allCurrentlySelected =
 		visibleSelectable.length > 0 &&
@@ -81,6 +84,7 @@ export async function selectAllPlansAndNotesCommand(
 
 	await setAllExcluded(ctx.cwd, "plans", planKeys, target);
 	await setAllExcluded(ctx.cwd, "notes", noteKeys, target);
+	await setAllExcluded(ctx.cwd, "references", referenceKeys, target);
 	await ctx.plansProvider.refreshExclusions();
 	await ctx.onChanged();
 }

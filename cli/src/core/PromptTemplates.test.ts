@@ -39,16 +39,16 @@ describe("PromptTemplates", () => {
 		]);
 	});
 
-	it("summarize is at version 2", () => {
-		expect(TEMPLATES.get("summarize")?.version).toBe(2);
+	it("summarize is at version 3", () => {
+		expect(TEMPLATES.get("summarize")?.version).toBe(3);
 	});
 
 	it("squash-consolidate is at version 2", () => {
 		expect(TEMPLATES.get("squash-consolidate")?.version).toBe(2);
 	});
 
-	it("strict-retry templates are registered at version 2", () => {
-		expect(TEMPLATES.get("summarize-strict")?.version).toBe(2);
+	it("strict-retry templates: summarize-strict at 3 (mirrors summarize); squash-consolidate-strict at 2", () => {
+		expect(TEMPLATES.get("summarize-strict")?.version).toBe(3);
 		expect(TEMPLATES.get("squash-consolidate-strict")?.version).toBe(2);
 	});
 
@@ -201,7 +201,7 @@ describe("PromptTemplates", () => {
 				"commitDate",
 				"conversation",
 				"diff",
-				"linearIssues",
+				"references",
 				"plans",
 				"notes",
 				"previousResponse",
@@ -249,7 +249,7 @@ describe("PromptTemplates", () => {
 				"commitDate",
 				"conversation",
 				"diff",
-				"linearIssues",
+				"references",
 				"plans",
 				"notes",
 			]),
@@ -413,7 +413,7 @@ describe("PromptTemplates", () => {
 				placeholders.add(match[1]);
 			}
 			// Caller still must pass commit info + conversation + diff plus the
-			// three Stage 2 structured-context blocks (linearIssues / plans / notes).
+			// three Stage 2 structured-context blocks (references / plans / notes).
 			// No more topicGuidance or workSize-derived field.
 			expect(placeholders).toEqual(
 				new Set([
@@ -423,7 +423,7 @@ describe("PromptTemplates", () => {
 					"commitDate",
 					"conversation",
 					"diff",
-					"linearIssues",
+					"references",
 					"plans",
 					"notes",
 				]),
@@ -439,7 +439,7 @@ describe("PromptTemplates", () => {
 				commitDate: "2026-01-01",
 				conversation: "conv",
 				diff: "diff",
-				linearIssues: "",
+				references: "",
 				plans: "",
 				notes: "",
 			});

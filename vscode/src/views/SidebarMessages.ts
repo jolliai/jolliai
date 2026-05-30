@@ -9,7 +9,7 @@
  */
 
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
-import type { TranscriptSource } from "../../../cli/src/Types.js";
+import type { SourceId, TranscriptSource } from "../../../cli/src/Types.js";
 
 export type SidebarTab = "kb" | "branch" | "status";
 export type KbMode = "folders" | "memories";
@@ -135,14 +135,15 @@ export interface SerializedTreeItem {
 	 */
 	readonly noteHover?: NoteHover;
 	/**
-	 * Plans & Notes panel only (Linear issue rows): structured hover-card data
-	 * driven through the same popover infrastructure as `hover`/MemoryHover.
-	 * Lets Linear rows display a rich tooltip (codicons, status / priority /
-	 * labels / link) instead of the markdown-source plain text that would show
-	 * if we routed `tooltip` through the webview's textContent fallback. Set
-	 * by SidebarSerialize when the source TreeItem is a LinearIssueItem.
+	 * Plans & Notes panel only (multi-source reference rows): structured hover-card
+	 * data driven through the same popover infrastructure as `hover`/MemoryHover.
+	 * Lets reference rows (Linear / Jira / GitHub / Notion) display a rich tooltip
+	 * (codicons, status / priority / labels / link) instead of the markdown-source
+	 * plain text that would show if we routed `tooltip` through the webview's
+	 * textContent fallback. Set by SidebarSerialize when the source TreeItem is
+	 * a ReferenceItem.
 	 */
-	readonly linearHover?: LinearIssueHover;
+	readonly referenceHover?: ReferenceHover;
 	/**
 	 * Commits panel only: the four fields needed to dispatch
 	 * jollimemory.openCommitFileChange from the webview. Set by
@@ -329,23 +330,36 @@ export interface NoteHover {
 }
 
 /**
- * Structured hover-card data for Linear issue rows in the Plans & Notes
- * section. Mirrors `MemoryHover` so the webview can drive Linear hover-cards
+ * Structured hover-card data for multi-source reference rows in the Plans & Notes
+ * section. Mirrors `MemoryHover` so the webview can drive reference hover-cards
  * through the same `.hover-card` popover infrastructure (positioning, show
  * delay, hide grace) — only the content renderer differs. Plain-text
  * `tooltip` on the SerializedTreeItem stays as the activity-bar TreeView
  * fallback; this richer field is webview-only.
+ *
+ * Source-specific fields (`assignees` / `milestone` / `entityType`) are
+ * optional and reserved for a future frontmatter-parser pass that extracts
+ * them. The Linear-only ancestor of this shape only carried status / priority
+ * / labels — those are the fields the current ReferenceService parses today.
  */
-export interface LinearIssueHover {
-	/** "PROJ-1234 — Issue title..." — bold at the top. */
+export interface ReferenceHover {
+	/** "PROJ-1234 — Issue title..." (or just title for Notion) — bold at the top. */
 	readonly title: string;
-	/** Linear status (e.g. "In Progress") — paired with a circle-large-filled icon. */
+	/** Source provider — drives badge / icon-tint and Open-in-<X> link label. */
+	readonly source: SourceId;
+	/** Workflow status (e.g. "In Progress") — paired with a circle-large-filled icon. */
 	readonly status?: string;
-	/** Linear priority (e.g. "Urgent" / "No priority") — paired with a flame icon. */
+	/** Priority (e.g. "Urgent" / "No priority") — paired with a flame icon. */
 	readonly priority?: string;
-	/** Joined labels, e.g. "JolliMemory, Feature" — paired with a tag icon. */
+	/** Joined labels, e.g. "Feature, frontend" — paired with a tag icon. */
 	readonly labels?: string;
-	/** Upstream Linear URL — used by the Open-in-Linear action link. */
+	/** Joined assignee names (GitHub) — reserved; not yet populated by ReferenceService. */
+	readonly assignees?: string;
+	/** Milestone title (GitHub) — reserved; not yet populated by ReferenceService. */
+	readonly milestone?: string;
+	/** Notion entityType (e.g. "page") — reserved; not yet populated by ReferenceService. */
+	readonly entityType?: string;
+	/** Upstream URL — used by the Open-in-<Source> action link. */
 	readonly url: string;
 }
 
@@ -422,9 +436,9 @@ export type SidebarOutboundMsg =
 	| { readonly type: "kb:clearSearch" }
 	| { readonly type: "branch:openPlan"; readonly planId: string }
 	| { readonly type: "branch:openNote"; readonly noteId: string }
-	| { readonly type: "branch:openLinearIssue"; readonly mapKey: string }
-	| { readonly type: "branch:openLinearIssueMarkdown"; readonly mapKey: string }
-	| { readonly type: "branch:ignoreLinearIssue"; readonly mapKey: string }
+	| { readonly type: "branch:openReference"; readonly mapKey: string }
+	| { readonly type: "branch:openReferenceMarkdown"; readonly mapKey: string }
+	| { readonly type: "branch:ignoreReference"; readonly mapKey: string }
 	| {
 			readonly type: "branch:openChange";
 			/** Absolute path (FileItem.resourceUri.fsPath in the native tree). */
@@ -504,6 +518,16 @@ export type SidebarOutboundMsg =
 	| {
 			readonly type: "branch:togglePlanSelection";
 			readonly planId: string;
+			readonly selected: boolean;
+	  }
+	| {
+			/**
+			 * Multi-source reference row checkbox toggle. `mapKey` is `<source>:<nativeId>`
+			 * — identical to the plans.json.references map key and the
+			 * `commit-selection.json` references exclusion key.
+			 */
+			readonly type: "branch:toggleReferenceSelection";
+			readonly mapKey: string;
 			readonly selected: boolean;
 	  }
 	| {

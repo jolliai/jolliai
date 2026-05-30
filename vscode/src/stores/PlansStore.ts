@@ -25,7 +25,7 @@ import {
 	PlansDataService,
 	type PlansOrNote,
 } from "../services/data/PlansDataService.js";
-import type { LinearIssueInfo, NoteInfo, PlanInfo } from "../Types.js";
+import type { NoteInfo, PlanInfo, ReferenceInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
 import { BaseStore, type Snapshot } from "./BaseStore.js";
 
@@ -34,7 +34,12 @@ export type PlansChangeReason = "init" | "refresh" | "enabled";
 export interface PlansSnapshot extends Snapshot<PlansChangeReason> {
 	readonly plans: ReadonlyArray<PlanInfo>;
 	readonly notes: ReadonlyArray<NoteInfo>;
-	readonly linearIssues: ReadonlyArray<LinearIssueInfo>;
+	/**
+	 * Multi-source references cache (Linear / Jira / GitHub / Notion). Read from
+	 * `bridge.listReferences()` which proxies the CLI-side `getReferenceEntriesForBranch`.
+	 * This is the only reference-row source the panel tree consumes.
+	 */
+	readonly references: ReadonlyArray<ReferenceInfo>;
 	readonly merged: ReadonlyArray<PlansOrNote>;
 	readonly isEmpty: boolean;
 	readonly isEnabled: boolean;
@@ -43,7 +48,7 @@ export interface PlansSnapshot extends Snapshot<PlansChangeReason> {
 const EMPTY: PlansSnapshot = {
 	plans: [],
 	notes: [],
-	linearIssues: [],
+	references: [],
 	merged: [],
 	isEmpty: true,
 	isEnabled: true,
@@ -62,7 +67,7 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 	private snapshot: PlansSnapshot = EMPTY;
 	private plans: Array<PlanInfo> = [];
 	private notes: Array<NoteInfo> = [];
-	private linearIssues: Array<LinearIssueInfo> = [];
+	private references: Array<ReferenceInfo> = [];
 	private enabled = true;
 	private debounceTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -123,9 +128,9 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 		notesWatcher.onDidDelete(debouncedPlansRefresh);
 		this.disposables.push(notesWatcher);
 
-		// Linear issue file changes flow through the plans.json watcher above —
+		// Reference file changes flow through the plans.json watcher above —
 		// StopHook upserts go to plans.json, associate/ignore writes go to
-		// plans.json. A dedicated linear-issues/*.md watcher is redundant.
+		// plans.json. A dedicated references/*.md watcher is redundant.
 	}
 
 	protected getCurrentSnapshot(): PlansSnapshot {
@@ -146,18 +151,22 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 		if (!this.enabled) {
 			this.plans = [];
 			this.notes = [];
-			this.linearIssues = [];
+			this.references = [];
 			this.rebuildSnapshot("refresh");
 			return;
 		}
-		const [plans, notes, linearIssues] = await Promise.all([
+		const [plans, notes, references] = await Promise.all([
 			this.bridge.listPlans(),
 			this.bridge.listNotes(),
-			this.bridge.listLinearIssues(),
+			// Multi-source references (Linear / Jira / GitHub / Notion). Defaults
+			// to [] when the bridge doesn't expose listReferences() (older host
+			// or test fixture) so the panel still renders plans + notes.
+			this.bridge.listReferences?.() ??
+				Promise.resolve([] as ReadonlyArray<ReferenceInfo>),
 		]);
 		this.plans = plans;
 		this.notes = notes;
-		this.linearIssues = [...linearIssues];
+		this.references = [...references];
 		this.rebuildSnapshot("refresh");
 	}
 
@@ -169,7 +178,7 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 		if (!e) {
 			this.plans = [];
 			this.notes = [];
-			this.linearIssues = [];
+			this.references = [];
 		}
 		this.rebuildSnapshot("enabled");
 	}
@@ -230,17 +239,17 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 		const merged = PlansDataService.mergeByLastModified(
 			this.plans,
 			this.notes,
-			this.linearIssues,
+			this.references,
 		);
 		this.snapshot = {
 			plans: this.plans,
 			notes: this.notes,
-			linearIssues: this.linearIssues,
+			references: this.references,
 			merged,
 			isEmpty: PlansDataService.isEmpty(
 				this.plans,
 				this.notes,
-				this.linearIssues,
+				this.references,
 			),
 			isEnabled: this.enabled,
 			changeReason: reason,

@@ -274,11 +274,58 @@ describe("GitOps", () => {
 			expect(diff).toContain("added line");
 		});
 
-		it("should truncate diff to maxChars", async () => {
-			const longDiff = "x".repeat(50000);
-			mockSuccess(longDiff);
-			const diff = await getDiffContent("HEAD~1", "HEAD", undefined, 100);
-			expect(diff.length).toBe(100);
+		it("returns the full diff when it fits the default budget", async () => {
+			// Default budget is 150_000 chars; a 50K diff must come back intact,
+			// not truncated to the old 30K cap that silently dropped most files.
+			const diff = "x".repeat(50000);
+			mockSuccess(diff);
+			const result = await getDiffContent("HEAD~1", "HEAD");
+			expect(result).toBe(diff);
+		});
+
+		it("truncates a diff that exceeds the lowered 150K default budget", async () => {
+			// No explicit maxChars → the default applies. At 160K the diff must come
+			// back truncated with the --stat header; if the default were still the
+			// old 200K this 160K body would pass through intact, failing this test.
+			// Lowering the default keeps a whole-tree squash regenerate's prompt
+			// inside the LLM wall-clock budget instead of aborting mid-flight.
+			const body = "z".repeat(160000);
+			const stat = " a.ts | 9 +++\n 1 file changed, 9 insertions(+)\n";
+			mockSuccess(body); // git diff <range>
+			mockSuccess(stat); // git diff --stat <range>
+			const result = await getDiffContent("HEAD~1", "HEAD");
+			expect(result.length).toBeLessThanOrEqual(150000);
+			expect(result).toContain("1 file changed");
+			expect(result).toContain("truncated");
+		});
+
+		it("prepends the full --stat file list and stays within budget when the diff exceeds maxChars", async () => {
+			// A naive substring would drop the tail — for a large commit the LLM
+			// would only see the first few alphabetical files and summarise them as
+			// if they were the whole change. Prepend the complete file list so every
+			// file stays visible, then fill the remaining budget with the head of
+			// the body.
+			const body = "x".repeat(50000);
+			const stat =
+				" cli/src/Types.ts | 50 +++---\n vscode/src/Foo.ts | 30 ++--\n 82 files changed, 2931 insertions(+), 6279 deletions(-)\n";
+			mockSuccess(body); // git diff <range>
+			mockSuccess(stat); // git diff --stat <range>
+			const result = await getDiffContent("HEAD~1", "HEAD", undefined, 10000);
+			expect(result).toContain("82 files changed"); // stat summary present
+			expect(result).toContain("cli/src/Types.ts"); // every file still listed
+			expect(result).toContain("vscode/src/Foo.ts");
+			expect(result.length).toBeLessThanOrEqual(10000); // stays within budget
+			expect(result).toContain("x"); // some body still included
+		});
+
+		it("still returns the truncated body head with a marker when the --stat call fails", async () => {
+			const body = "y".repeat(50000);
+			mockSuccess(body); // git diff <range>
+			mockFailure(1, "stat boom"); // git diff --stat fails
+			const result = await getDiffContent("HEAD~1", "HEAD", undefined, 10000);
+			expect(result.length).toBeLessThanOrEqual(10000);
+			expect(result).toContain("y"); // body head still present
+			expect(result).toContain("truncated"); // truncation marker still present
 		});
 
 		it("should fallback to empty tree diff when main diff fails", async () => {

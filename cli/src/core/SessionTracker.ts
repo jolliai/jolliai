@@ -20,16 +20,18 @@ import type {
 	CursorsRegistry,
 	GitOperation,
 	JolliMemoryConfig,
-	LinearIssueEntry,
-	LinearIssueRef,
 	NoteEntry,
 	PlanEntry,
 	PlansRegistry,
+	Reference,
+	ReferenceEntry,
 	SessionInfo,
 	SessionsRegistry,
+	SourceId,
 	SquashPendingState,
 	TranscriptCursor,
 } from "../Types.js";
+import { referencePath as canonicalReferencePath, writeReferenceMarkdown } from "./references/ReferenceStore.js";
 
 const log = createLogger("SessionTracker");
 
@@ -733,7 +735,10 @@ async function atomicWrite(filePath: string, content: string): Promise<void> {
 
 /**
  * Loads the plans registry from plans.json.
- * Returns an empty registry if the file doesn't exist or is corrupt.
+ *
+ * Returns an empty registry (`{ version: 2, plans: {} }`) if the file doesn't
+ * exist or contains invalid JSON. Normalises missing required fields so
+ * downstream `registry.plans[...]` reads never throw on a hand-edited file.
  */
 export async function loadPlansRegistry(cwd?: string): Promise<PlansRegistry> {
 	const dir = getJolliMemoryDir(cwd);
@@ -741,13 +746,9 @@ export async function loadPlansRegistry(cwd?: string): Promise<PlansRegistry> {
 	try {
 		const content = await readFile(filePath, "utf-8");
 		const parsed = JSON.parse(content) as Partial<PlansRegistry>;
-		// Normalize partial/malformed content (e.g. a manual edit leaving `{}`
-		// without the `plans` key) so callers can always assume the canonical
-		// shape — prevents `registry.plans[slug]` from throwing on undefined.
-		// Spread first to preserve optional fields like `notes`.
-		return { ...parsed, version: parsed.version ?? 1, plans: parsed.plans ?? {} };
+		return { ...parsed, version: 2, plans: parsed.plans ?? {} };
 	} catch {
-		return { version: 1, plans: {} };
+		return { version: 2, plans: {} };
 	}
 }
 
@@ -864,107 +865,108 @@ export async function loadPlanEntry(slug: string, cwd?: string): Promise<PlanEnt
 	return registry.plans[slug] ?? null;
 }
 
-// ─── Linear issue registry helpers ──────────────────────────────────────────
+// ─── Multi-source reference registry helpers ────────────────────────────────
 
-/**
- * Returns the ticketIds of Linear issues that are "active" for the given branch:
- *   - commitHash === null (uncommitted)
- *   - !ignored
- *   - !contentHashAtCommit (not a guard from a prior commit)
- *   - branch matches
- *
- * Used by:
- *   - QueueWorker post-commit (to archive these into LinearIssueCommitRef[])
- *   - Stage 2 prompt assembly (to inject as <linear-issues> block)
- *   - VS Code panel (visible entries)
- */
-export async function detectUncommittedLinearIssueIds(cwd: string, branch: string): Promise<ReadonlyArray<string>> {
-	const registry = await loadPlansRegistry(cwd);
-	const ids: string[] = [];
-	for (const [key, entry] of Object.entries(registry.linearIssues ?? {})) {
-		if (entry.branch !== branch) continue;
-		if (entry.commitHash !== null) continue;
-		if (entry.ignored) continue;
-		if (entry.contentHashAtCommit !== undefined) continue;
-		ids.push(key);
-	}
-	log.debug("Linear issue registry scan: %d uncommitted on %s: [%s]", ids.length, branch, ids.join(", "));
-	return ids;
+/** Read `references` from the registry, defaulting to an empty map when absent. */
+function referencesOf(reg: PlansRegistry): Readonly<Record<string, ReferenceEntry>> {
+	return reg.references ?? {};
 }
 
 /**
- * Returns the entries (not just keys) of Linear issues active for the given branch.
- * Same filter as detectUncommittedLinearIssueIds — used by the VS Code service
- * and Stage 2 prompt assembly.
+ * Returns the entries (not just keys) of references active for the given branch.
+ *
+ * "Active" matches the same filter Plans / Notes / legacy Linear use:
+ *   - branch matches
+ *   - commitHash === null (uncommitted)
+ *   - !contentHashAtCommit (not a guard from a prior commit)
+ *   - !ignored
+ *
+ * Used by QueueWorker post-commit Step 6b and Stage 2 prompt assembly.
  */
-export async function getLinearIssueEntriesForBranch(
+export async function getReferenceEntriesForBranch(
 	cwd: string,
 	branch: string,
-): Promise<ReadonlyArray<LinearIssueEntry>> {
+): Promise<ReadonlyArray<ReferenceEntry>> {
 	const registry = await loadPlansRegistry(cwd);
-	const entries: LinearIssueEntry[] = [];
-	for (const entry of Object.values(registry.linearIssues ?? {})) {
+	const entries: ReferenceEntry[] = [];
+	for (const entry of Object.values(referencesOf(registry))) {
 		if (entry.branch !== branch) continue;
 		if (entry.commitHash !== null) continue;
-		if (entry.ignored) continue;
 		if (entry.contentHashAtCommit !== undefined) continue;
+		if (entry.ignored) continue;
 		entries.push(entry);
 	}
 	return entries;
 }
 
 /**
- * Upsert a Linear issue entry into plans.json.linearIssues.
+ * Returns the {mapKey, source, sourcePath} triples for active references on the
+ * branch — projection of `getReferenceEntriesForBranch` shaped for QueueWorker
+ * Step 8a3, which only needs these three fields to dispatch the archive.
+ */
+export async function detectUncommittedReferenceIds(
+	cwd: string,
+	branch: string,
+): Promise<ReadonlyArray<{ mapKey: string; source: SourceId; sourcePath: string }>> {
+	const registry = await loadPlansRegistry(cwd);
+	const out: Array<{ mapKey: string; source: SourceId; sourcePath: string }> = [];
+	for (const [mapKey, entry] of Object.entries(referencesOf(registry))) {
+		if (entry.branch !== branch) continue;
+		if (entry.commitHash !== null) continue;
+		if (entry.contentHashAtCommit !== undefined) continue;
+		if (entry.ignored) continue;
+		out.push({ mapKey, source: entry.source, sourcePath: entry.sourcePath });
+	}
+	return out;
+}
+
+/**
+ * Upsert a reference entry into plans.json.references.
  *
- * Field preservation contract (mirrors Plans semantics — see the plan-discovery
- * block inside StopHook's `main()`):
+ * Field semantics:
  *
  * Case A: entry exists with `contentHashAtCommit` (guard from prior commit)
- *   - If `ignored` → return unchanged (user permanently dismissed; never resurrect)
- *   - If contentHash matches the stored guard → return unchanged (guard intact)
- *   - If contentHash differs → REPLACE with a fresh uncommitted entry (clears ignored,
- *     contentHashAtCommit, commitHash, addedAt). Linear payload changed → re-surface.
+ *   - If `ignored` → return unchanged.
+ *   - If contentHash matches the stored guard → return unchanged.
+ *   - If contentHash differs → replace with a fresh uncommitted entry.
  *
- * Case B: entry exists without `contentHashAtCommit` (currently uncommitted)
- *   - If `ignored` → return unchanged
- *   - Else: refresh `title` / `url` / `sourcePath` / `sourceToolName` / `updatedAt`;
- *     PRESERVE `addedAt`, `branch`, `commitHash` (still null), `ignored`.
+ * Case B: entry exists without `contentHashAtCommit` (uncommitted)
+ *   - If `ignored` → return unchanged.
+ *   - Else: refresh title / url / sourcePath / sourceToolName / updatedAt;
+ *     preserve addedAt / branch / commitHash / ignored.
  *
  * Case C: entry does not exist → insert fresh.
  *
- * Concurrency: uses near-write reread + commitHash diff merge (mirrors the
- * plan-discovery near-write reread inside StopHook's `main()`). This avoids
- * overwriting a commitHash that PostCommitHook wrote between our read and write.
+ * Routes to {@link writeReferenceMarkdown} for the on-disk markdown (sanitization
+ * happens there) and applies the guard-hash short-circuit so unchanged
+ * Linear/Jira/GitHub/Notion payloads don't churn a fresh entry over a
+ * still-valid guard.
+ *
+ * Concurrency: near-write reread + commitHash diff merge to tolerate a
+ * concurrent PostCommitHook writing a commitHash between our two
+ * loadPlansRegistry calls.
  */
-export async function upsertLinearIssueEntry(
-	ref: LinearIssueRef,
-	sourcePath: string,
-	contentHash: string,
-	branch: string,
-	cwd?: string,
-): Promise<void> {
-	const beforeRegistry = await loadPlansRegistry(cwd);
-	const existing = beforeRegistry.linearIssues?.[ref.ticketId];
+export async function upsertReferenceEntry(ref: Reference, cwd: string, branch: string): Promise<void> {
+	const { sourcePath, contentHash } = await writeReferenceMarkdown(ref, cwd);
+	const mapKey = `${ref.source}:${ref.nativeId}`;
 	const now = new Date().toISOString();
+
+	const beforeRegistry = await loadPlansRegistry(cwd);
+	const beforeReferences = referencesOf(beforeRegistry);
+	const existing = beforeReferences[mapKey];
 
 	if (existing && existing.contentHashAtCommit !== undefined) {
 		if (existing.ignored) return;
 		if (existing.contentHashAtCommit === contentHash) return;
-		// fall through to replacement
+		// fall through to replacement — guard hash mismatched, content changed
 	} else if (existing?.ignored) {
 		return;
 	}
 
-	// Branch-mismatch refresh: if the existing entry was created on a different
-	// branch, treat as a fresh entry on the current branch (don't smuggle the
-	// foreign branch through a refresh). Caller already filters by branch in
-	// `detectUncommittedLinearIssueIds`, but the upsert path runs for ANY ref
-	// from the extractor — defensive isolation.
 	const canRefreshUncommitted = existing && existing.contentHashAtCommit === undefined && existing.branch === branch;
 
-	const next: LinearIssueEntry = canRefreshUncommitted
+	const next: ReferenceEntry = canRefreshUncommitted
 		? {
-				// Refresh uncommitted entry on the same branch
 				...existing,
 				title: ref.title,
 				url: ref.url,
@@ -973,9 +975,8 @@ export async function upsertLinearIssueEntry(
 				updatedAt: now,
 			}
 		: {
-				// Fresh entry (new OR replacing a guard that no longer matches OR
-				// existing-on-foreign-branch)
-				ticketId: ref.ticketId,
+				source: ref.source,
+				nativeId: ref.nativeId,
 				title: ref.title,
 				url: ref.url,
 				sourcePath,
@@ -986,13 +987,13 @@ export async function upsertLinearIssueEntry(
 				sourceToolName: ref.toolName,
 			};
 
-	// Near-write reread: PostCommitHook may have written a commitHash between
-	// our beforeRegistry read and now. Merge that delta into our write so we
-	// don't clobber it.
+	// Near-write reread merge — tolerates a concurrent PostCommitHook write
+	// landing a commitHash between our two loadPlansRegistry calls.
 	const freshRegistry = await loadPlansRegistry(cwd);
-	const freshEntry = freshRegistry.linearIssues?.[ref.ticketId];
-	/* v8 ignore start -- near-write reread merge: only fires when PostCommitHook writes a new commitHash between our loadPlansRegistry calls. Race-window guard mirrored from StopHook plan-discovery (StopHook.ts:249-257); not deterministically reachable in unit tests without a concurrent process. */
-	const merged: LinearIssueEntry =
+	const freshReferences = referencesOf(freshRegistry);
+	const freshEntry = freshReferences[mapKey];
+	/* v8 ignore start -- near-write reread merge: only fires under concurrent commitHash writes (PostCommitHook racing the StopHook upsert); not deterministically reachable in unit tests without a concurrent process. */
+	const merged: ReferenceEntry =
 		freshEntry !== undefined &&
 		freshEntry.commitHash !== null &&
 		freshEntry.commitHash !== (existing?.commitHash ?? null)
@@ -1000,41 +1001,91 @@ export async function upsertLinearIssueEntry(
 			: next;
 	/* v8 ignore stop */
 
-	const linearIssues = { ...(freshRegistry.linearIssues ?? {}), [ref.ticketId]: merged };
-	await savePlansRegistry({ ...freshRegistry, linearIssues }, cwd);
-	log.info("upsertLinearIssueEntry: %s on %s (%s)", ref.ticketId, branch, existing === undefined ? "new" : "updated");
+	const references = { ...freshReferences, [mapKey]: merged };
+	const v2Out: PlansRegistry = {
+		version: 2,
+		plans: freshRegistry.plans,
+		...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
+		references,
+	};
+	await savePlansRegistry(v2Out, cwd);
+	log.info("upsertReferenceEntry: %s on %s (%s)", mapKey, branch, existing === undefined ? "new" : "updated");
+}
+
+/** Set or clear the ignored flag on a reference entry. */
+export async function setReferenceIgnored(cwd: string, mapKey: string, ignored: boolean): Promise<void> {
+	const registry = await loadPlansRegistry(cwd);
+	const existingReferences = referencesOf(registry);
+	const entry = existingReferences[mapKey];
+	if (!entry) return;
+	const references = { ...existingReferences, [mapKey]: { ...entry, ignored: ignored || undefined } };
+	const v2Out: PlansRegistry = {
+		version: 2,
+		plans: registry.plans,
+		...(registry.notes !== undefined ? { notes: registry.notes } : {}),
+		references,
+	};
+	await savePlansRegistry(v2Out, cwd);
 }
 
 /**
- * Update commitHash on a specific Linear issue snapshot entry (keyed by `archivedKey`).
- * Used by reassociateMetadata when squash/amend/rebase rewrites the commit hash —
- * the archivedKey from CommitSummary.linearIssues uniquely identifies the snapshot.
+ * Update commitHash on a specific reference snapshot entry (keyed by `archivedKey`).
+ * Mirrors {@link associatePlanWithCommit} / {@link associateNoteWithCommit} —
+ * also migrates the guard entry's commitHash when `archivedKey` is the
+ * `<source>:<nativeId>-<shortHash>` archive form and the guard's recorded
+ * commitHash starts with the old short hash.
  *
- * NOTE: This does NOT rename the map key. The `archivedKey` records the original
- * archival commit (a historical artifact); commitHash tracks the latest commit
- * that owns this snapshot. Mirrors associatePlanWithCommit semantics.
+ * Used by QueueWorker.reassociateMetadata for the per-source single-row update;
+ * the plural / batch flow lives in QueueWorker (Task 2.7).
  */
-export async function associateLinearIssueWithCommit(
-	archivedKey: string,
-	newHash: string,
-	cwd?: string,
-): Promise<void> {
+export async function associateReferenceWithCommit(archivedKey: string, newHash: string, cwd?: string): Promise<void> {
 	const registry = await loadPlansRegistry(cwd);
-	const entry = registry.linearIssues?.[archivedKey];
+	const references = referencesOf(registry);
+	const entry = references[archivedKey];
 	if (!entry) {
-		log.debug("associateLinearIssueWithCommit: key %s not in registry, skipping", archivedKey);
+		log.debug("associateReferenceWithCommit: key %s not in registry, skipping", archivedKey);
 		return;
 	}
-	const linearIssues = registry.linearIssues as NonNullable<PlansRegistry["linearIssues"]>;
-	const updated: PlansRegistry = {
-		...registry,
-		linearIssues: {
-			...linearIssues,
-			[archivedKey]: { ...entry, commitHash: newHash, updatedAt: new Date().toISOString() },
-		},
+	const now = new Date().toISOString();
+	const nextReferences: Record<string, ReferenceEntry> = {
+		...references,
+		[archivedKey]: { ...entry, commitHash: newHash, updatedAt: now },
 	};
-	await savePlansRegistry(updated, cwd);
-	log.info("associateLinearIssueWithCommit: %s → %s", archivedKey, newHash.substring(0, 8));
+
+	// Guard migration mirrors associatePlanWithCommit: when archivedKey has
+	// `<source>:<nativeId>-<shortHash>` shape and the matching guard entry
+	// records a commitHash that starts with that old short hash, sweep its
+	// commitHash forward to the new commit too. contentHashAtCommit stays
+	// untouched — the markdown content didn't change.
+	const split = splitArchivedKey(archivedKey);
+	if (split) {
+		const guard = references[split.baseKey];
+		if (guard?.contentHashAtCommit && guard.commitHash?.startsWith(split.oldShortHash)) {
+			nextReferences[split.baseKey] = { ...guard, commitHash: newHash, updatedAt: now };
+			log.info(
+				"associateReferenceWithCommit: also migrated guard %s → %s",
+				split.baseKey,
+				newHash.substring(0, 8),
+			);
+		}
+	}
+
+	const v2Out: PlansRegistry = {
+		version: 2,
+		plans: registry.plans,
+		...(registry.notes !== undefined ? { notes: registry.notes } : {}),
+		references: nextReferences,
+	};
+	await savePlansRegistry(v2Out, cwd);
+	log.info("associateReferenceWithCommit: %s → %s", archivedKey, newHash.substring(0, 8));
+}
+
+/**
+ * Helper exposed for callers that need the canonical reference path without
+ * importing ReferenceStore directly (avoids growing the cross-module surface).
+ */
+export function referencePath(cwd: string, source: SourceId, key: string): string {
+	return canonicalReferencePath(cwd, source, key);
 }
 
 // ─── Active-entry queries for Stage 2 prompt assembly ───────────────────────

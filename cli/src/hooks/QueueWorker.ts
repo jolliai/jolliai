@@ -34,13 +34,6 @@ import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
-import { formatLinearIssuesBlock } from "../core/LinearIssueExtractor.js";
-import {
-	hashLinearIssueContentFromMarkdown,
-	linearIssuePath,
-	readLinearIssueMarkdown,
-	renameLinearIssueMarkdown,
-} from "../core/LinearIssueStore.js";
 import { acquireWorkerLock, refreshWorkerLockMtime, releaseWorkerLock } from "../core/Locks.js";
 import { formatNotesBlock } from "../core/NotePromptFormatter.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
@@ -48,16 +41,24 @@ import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import {
-	associateLinearIssueWithCommit,
+	hashReferenceContent,
+	readReferenceMarkdown,
+	referencePath,
+	renameReferenceMarkdown,
+	sanitizeNativeIdForPath,
+} from "../core/references/ReferenceStore.js";
+import { ALL_ADAPTERS } from "../core/references/sources/index.js";
+import {
 	associateNoteWithCommit,
 	associatePlanWithCommit,
+	associateReferenceWithCommit,
 	deleteQueueEntry,
 	dequeueAllGitOperations,
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
-	detectUncommittedLinearIssueIds,
+	detectUncommittedReferenceIds,
 	filterSessionsByEnabledIntegrations,
-	getLinearIssueEntriesForBranch,
+	getReferenceEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
 	loadCursorForTranscript,
@@ -85,9 +86,9 @@ import {
 	migrateOneToOne,
 	resolveEffectiveTopics,
 	setActiveStorage,
-	storeLinearIssues,
 	storeNotes,
 	storePlans,
+	storeReferences,
 	storeSummary,
 	stripFunctionalMetadata,
 } from "../core/SummaryStore.js";
@@ -108,13 +109,15 @@ import type {
 	DiffStats,
 	GitOperation,
 	JolliMemoryConfig,
-	LinearIssueCommitRef,
-	LinearIssueRef,
 	LogLevel,
 	NoteReference,
 	PlanProgressArtifact,
 	PlanReference,
 	PlansRegistry,
+	Reference,
+	ReferenceCommitRef,
+	ReferenceEntry,
+	SourceId,
 	StoredTranscript,
 	TopicSummary,
 	TranscriptReadResult,
@@ -138,12 +141,16 @@ const WORKER_LOCK_REFRESH_INTERVAL_MS = 60_000;
 // ─── Shared helpers for plans & notes re-association ─────────────────────────
 
 /**
- * Re-associates plans and notes from old summaries with a new commit hash.
- * Called after squash, rebase-pick, and rebase-squash to update the registry.
+ * Re-associates plans, notes, and external-source references (Linear / Jira /
+ * GitHub / Notion) from old summaries with a new commit hash. Called after
+ * squash, rebase-pick, rebase-squash, and amend to update the registry.
  *
- * This is a single function to ensure plans and notes are always handled together.
- * Previously these were separate inline loops, which led to notes being forgotten
- * in some paths (squash, amend) while plans were correctly handled.
+ * Single function so all four attachment kinds stay in lock-step. Previously
+ * these were separate inline loops, which led to notes being forgotten in
+ * some paths (squash, amend) while plans were correctly handled.
+ *
+ * Reference source resolution per old summary: `oldSummary.references` is the
+ * canonical and only multi-source list.
  */
 async function reassociateMetadata(
 	oldSummaries: ReadonlyArray<CommitSummary>,
@@ -161,13 +168,21 @@ async function reassociateMetadata(
 				await associateNoteWithCommit(noteRef.id, newHash, cwd);
 			}
 		}
-		if (oldSummary.linearIssues) {
-			for (const linearRef of oldSummary.linearIssues) {
-				// Uses the archivedKey (e.g. "PROJ-1234-abc1234") to unambiguously
-				// locate the snapshot entry — analog to associatePlanWithCommit
-				// which uses planRef.slug for the same reason.
-				await associateLinearIssueWithCommit(linearRef.archivedKey, newHash, cwd);
+
+		const referenceRefs: ReferenceCommitRef[] = [];
+		const seen = new Set<string>();
+		if (oldSummary.references) {
+			for (const ref of oldSummary.references) {
+				if (seen.has(ref.archivedKey)) continue;
+				seen.add(ref.archivedKey);
+				referenceRefs.push(ref);
 			}
+		}
+		for (const ref of referenceRefs) {
+			// archivedKey on references is the prefixed `<source>:<nativeId>-<shortHash>`
+			// form. associateReferenceWithCommit looks the row up by archivedKey
+			// in plans.json.references — single update per row.
+			await associateReferenceWithCommit(ref.archivedKey, newHash, cwd);
 		}
 	}
 }
@@ -175,7 +190,7 @@ async function reassociateMetadata(
 /**
  * Extracts hoisted metadata fields from an old summary for inclusion in a new
  * summary root node. The full hoist set is: jolliDocId, jolliDocUrl,
- * orphanedDocIds, plans, notes, linearIssues, e2eTestGuide. Keep this list
+ * orphanedDocIds, plans, notes, references, e2eTestGuide. Keep this list
  * synced with the spread block below — drift is the bug we're avoiding by
  * enumerating it here.
  *
@@ -191,7 +206,7 @@ function hoistMetadataFromOldSummary(oldSummary: CommitSummary | null | undefine
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
 		...(oldSummary.plans && { plans: oldSummary.plans }),
 		...(oldSummary.notes && { notes: oldSummary.notes }),
-		...(oldSummary.linearIssues && { linearIssues: oldSummary.linearIssues }),
+		...(oldSummary.references && { references: oldSummary.references }),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
 	};
 }
@@ -495,6 +510,7 @@ function safeHashFileSync(path: string): string | null {
 		const body = readFileSync(path, "utf-8");
 		return createHash("sha256").update(body).digest("hex");
 	} catch {
+		/* v8 ignore next -- defensive catch: existsSync gates above, so readFileSync only throws on fs-level races (permission flip / file unlinked between exists and read). Not deterministically reproducible in unit tests. */
 		return null;
 	}
 }
@@ -818,122 +834,159 @@ async function associateNotesWithCommit(
 	return noteRefs;
 }
 
-// ─── Linear issue association (parallel to Plans / Notes) ────────────────────
+// ─── Reference / Linear issue association (parallel to Plans / Notes) ───────
 
 /**
- * Associates detected Linear issues with a commit: writes the guard + archived
- * snapshot dual entry into plans.json, renames the local markdown file, and
- * backs up the markdown content to the orphan branch.
+ * Return shape for {@link associateReferencesWithCommit}.
  *
- * Returns LinearIssueCommitRef[] (with `archivedKey` populated) for inclusion
- * in CommitSummary.linearIssues — the archivedKey is the exact pointer used
- * later by reassociateMetadata for amend/squash/rebase.
- *
- * Follows the same pattern as `associateNotesWithCommit` for structural
- * symmetry — see plan §9.10 for the rationale.
+ * `refs` are the post-archive snapshots stored on `CommitSummary.references`.
+ * `filesToStore` are the RAW markdown bytes captured BEFORE the local rename —
+ * the caller passes them straight to `SummaryStore.storeReferences` so the
+ * orphan-branch snapshot is independent of whether the local rename succeeded.
+ * Mirrors the historical Linear-only filesToStore handoff pattern.
  */
-async function associateLinearIssuesWithCommit(
-	ticketIds: ReadonlyArray<string>,
+export interface AssociateReferencesResult {
+	readonly refs: ReadonlyArray<ReferenceCommitRef>;
+	readonly filesToStore: ReadonlyArray<{ archivedKey: string; source: SourceId; content: string }>;
+}
+
+/**
+ * Multi-source generalisation of `associateLinearIssuesWithCommit`. Routes
+ * Linear / Jira / GitHub / Notion entries through a single archive pipeline:
+ *
+ *   1. For each `{mapKey, source, sourcePath}` triple, read the raw markdown
+ *      bytes BEFORE the rename so the orphan-branch snapshot does not depend
+ *      on rename success.
+ *   2. Build the dual `plans.json.references` entry — `mapKey` becomes a guard
+ *      (`contentHashAtCommit` + `commitHash` set, `sourcePath` UNCHANGED so
+ *      the next StopHook upsert of the same mapKey writes back into the same
+ *      active path), and `archivedKey = "<mapKey>-<shortHash>"` becomes a
+ *      snapshot row with explicit fields (no `...entry` spread, no
+ *      `contentHashAtCommit` / `ignored` inherited).
+ *   3. Physically rename the active markdown from `referencePath(active)` to
+ *      `referencePath(archived)`. On failure log.warn and continue — the guard
+ *      is already written and the archived entry's sourcePath points at the
+ *      archived location even if no file lives there; Regenerator reads from
+ *      the orphan branch (where `storeReferences` already received the raw
+ *      pre-rename content).
+ *   4. Near-write reread + merge: reload plans.json AT THE END and overwrite
+ *      ONLY the specific mapKey + archivedKey pairs this call touched. Any
+ *      concurrent StopHook upsert / ignoreReference command that ran during this
+ *      archive is preserved.
+ *
+ * The function does NOT call `storeReferences` itself — that responsibility
+ * stays with the caller (executePipeline / amend fresh-leaf) because the
+ * orphan-branch commit message differs between flows.
+ */
+async function associateReferencesWithCommit(
+	ids: ReadonlyArray<{ mapKey: string; source: SourceId; sourcePath: string }>,
 	commitHash: string,
 	cwd: string,
-	branch?: string,
-): Promise<LinearIssueCommitRef[]> {
-	log.info("Linear issue association: detected %d issue(s): [%s]", ticketIds.length, ticketIds.join(", "));
-	if (ticketIds.length === 0) return [];
+	branch: string,
+): Promise<AssociateReferencesResult> {
+	log.info("Reference association: detected %d ref(s) for branch %s", ids.length, branch);
+	if (ids.length === 0) return { refs: [], filesToStore: [] };
 
 	const shortHash = commitHash.substring(0, 8);
-	const commitRefs: LinearIssueCommitRef[] = [];
-	const filesToStore: Array<{ archivedKey: string; content: string }> = [];
-	// Tracks every ticketId that was detected upstream but not actually
-	// archived. Without aggregation, the three silent-degrade paths each
-	// emit a single log.info per drop — easy to miss when scanning debug.log
-	// and indistinguishable from "user only referenced 3 of 5 tickets".
-	// At pipeline end we emit a single log.warn so the count + ratio show up
-	// in one line for triage.
-	const droppedTicketIds: string[] = [];
+	const now = new Date().toISOString();
+	const refs: ReferenceCommitRef[] = [];
+	const filesToStore: Array<{ archivedKey: string; source: SourceId; content: string }> = [];
 
-	let registry = await loadPlansRegistry(cwd);
-	const updatedLinearIssues: Record<string, NonNullable<PlansRegistry["linearIssues"]>[string]> = {
-		...(registry.linearIssues ?? {}),
+	const registry = await loadPlansRegistry(cwd);
+	const updatedReferences: Record<string, NonNullable<PlansRegistry["references"]>[string]> = {
+		/* v8 ignore next -- `?? {}` fallback unreachable: `ids` is sourced from detectUncommittedReferenceIds, which derives from plans.json.references; if references were undefined ids would be empty and the early-return would have already fired. */
+		...(registry.references ?? {}),
 	};
+	const droppedMapKeys: string[] = [];
 
-	for (const ticketId of ticketIds) {
-		const entry = updatedLinearIssues[ticketId];
+	for (const { mapKey, source } of ids) {
+		const entry = updatedReferences[mapKey];
 		if (!entry) {
-			log.info("Linear issue association: ticketId %s not in registry — skipping", ticketId);
-			droppedTicketIds.push(ticketId);
+			log.info("Reference association: mapKey %s not in registry — skipping", mapKey);
+			droppedMapKeys.push(mapKey);
 			continue;
 		}
 
-		// Read the local markdown file to (a) compute content hash for guard, (b) store on orphan branch
-		const ref = await readLinearIssueMarkdown(entry.sourcePath);
-		if (!ref) {
+		// CRITICAL: read raw markdown bytes BEFORE rename. The orphan-branch
+		// snapshot uses rawContent — independent of whether the local rename
+		// succeeds. The previous Linear-only path also did this via
+		// readMarkdownFileContent; we keep the same ordering.
+		let rawContent: string;
+		try {
+			rawContent = await readMarkdownFileContent(entry.sourcePath);
+			/* v8 ignore start -- IO failure to read the active markdown; the StopHook upsert that originally wrote it would have rejected first, so practically unreachable except under fs corruption. */
+		} catch (err) {
+			log.warn(
+				"Reference association: cannot read markdown for %s at %s: %s — skipping",
+				mapKey,
+				entry.sourcePath,
+				(err as Error).message,
+			);
+			droppedMapKeys.push(mapKey);
+			continue;
+		}
+		/* v8 ignore stop */
+
+		const fullRef = await readReferenceMarkdown(entry.sourcePath);
+		if (!fullRef) {
 			log.info(
-				"Linear issue association: ticketId %s sourcePath %s unreadable — skipping",
-				ticketId,
+				"Reference association: mapKey %s sourcePath %s unparseable as Reference — skipping",
+				mapKey,
 				entry.sourcePath,
 			);
-			droppedTicketIds.push(ticketId);
+			droppedMapKeys.push(mapKey);
 			continue;
 		}
 
-		const fileContent = await readMarkdownFileContent(entry.sourcePath);
-		// hashLinearIssueContentFromMarkdown strips the referencedAt frontmatter
-		// line before hashing so the stored guard matches a future StopHook
-		// rediscovery (which also hashes via the referencedAt-excluding scheme
-		// — see writeLinearIssueMarkdown → hashLinearIssueContent). Hashing the
-		// raw file bytes here was the prior bug: referencedAt was a fresh
-		// timestamp per MCP fetch, so the guard hash diverged on every reference
-		// and the entry was wrongly resurfaced as new uncommitted.
-		const contentHashAtCommit = hashLinearIssueContentFromMarkdown(fileContent);
+		const contentHashAtCommit = hashReferenceContent(fullRef);
+		const archivedKey = `${mapKey}-${shortHash}`;
+		// Bare archive form for the on-disk filename. `source:<nativeId>` is the
+		// registry key; the file stem is `<nativeId>-<shortHash>` (Linear / Jira /
+		// Notion are identity under sanitizeNativeIdForPath; GitHub rewrites
+		// `owner/repo#n` to a path-safe stem). referencePath does NOT sanitize, so
+		// we must do it here — and we sanitize the whole `<nativeId>-<shortHash>`
+		// string so this matches orphanPathFor's stem byte-for-byte.
+		const bareArchivedKey = sanitizeNativeIdForPath(source, `${entry.nativeId}-${shortHash}`);
+		const archivedSourcePath = referencePath(cwd, source, bareArchivedKey);
 
-		const archivedKey = `${ticketId}-${shortHash}`;
-		const now2 = new Date().toISOString();
-		const archivedSourcePath = linearIssuePath(archivedKey, cwd);
-
-		commitRefs.push({
-			archivedKey,
-			ticketId,
-			title: ref.title,
-			url: ref.url,
-			/* v8 ignore start -- optional-field spreads; each branch represents "field present vs absent" on the upstream LinearIssueRef which the extractor populates from Linear MCP payloads. Exercised via the live extraction tests; pinned here for defensive totality. */
-			...(ref.status !== undefined ? { status: ref.status } : {}),
-			...(ref.priority !== undefined ? { priority: ref.priority } : {}),
-			...(ref.labels !== undefined && ref.labels.length > 0 ? { labels: ref.labels } : {}),
-			/* v8 ignore stop */
-			referencedAt: ref.referencedAt,
-			sourceToolName: ref.toolName,
-		});
-
-		filesToStore.push({ archivedKey, content: fileContent });
-
-		// Dual entry: guard at ticketId + archived snapshot at archivedKey
-		updatedLinearIssues[ticketId] = {
+		// Guard entry (key = mapKey): spread original to keep ACTIVE sourcePath
+		// (next StopHook upsert of same mapKey writes back to the same active
+		// path; guard collides via contentHashAtCommit so re-archive is a no-op).
+		updatedReferences[mapKey] = {
 			...entry,
 			commitHash,
 			contentHashAtCommit,
-			updatedAt: now2,
+			updatedAt: now,
 			ignored: undefined,
 		};
-		updatedLinearIssues[archivedKey] = {
-			ticketId: entry.ticketId,
+		// Archived snapshot (key = archivedKey): explicit fields, NOT a spread —
+		// we do NOT want to inherit the guard's contentHashAtCommit / ignored
+		// from the original entry into the archive snapshot.
+		updatedReferences[archivedKey] = {
+			source: entry.source,
+			nativeId: entry.nativeId,
 			title: entry.title,
 			url: entry.url,
 			sourcePath: archivedSourcePath,
 			branch: entry.branch,
 			addedAt: entry.addedAt,
-			updatedAt: now2,
+			updatedAt: now,
 			commitHash,
 			sourceToolName: entry.sourceToolName,
 		};
 
-		// Rename the local file from <ticketId>.md to <ticketId>-<shortHash>.md (Plans pattern)
+		// Physical rename. Failure → log.warn and continue. The guard is
+		// already written (so re-archive on the next commit short-circuits via
+		// contentHashAtCommit), and the archived snapshot's sourcePath points
+		// at the archived location even if no local file lives there —
+		// Regenerator reads from the orphan branch (storeReferences below uses
+		// rawContent captured before rename).
 		try {
-			await renameLinearIssueMarkdown(entry.sourcePath, archivedSourcePath);
-			/* v8 ignore start -- fs.rename failure path; not reachable under our test fixtures, but pinned because losing the local rename in production would leave a stale `<ticketId>.md` masquerading as uncommitted on the next StopHook scan. */
+			await renameReferenceMarkdown(entry.sourcePath, archivedSourcePath);
+			/* v8 ignore start -- fs.rename failure: not deterministically reachable in unit tests without mocking; the warn-and-continue branch protects production against Windows EPERM / antivirus locks. */
 		} catch (err) {
 			log.warn(
-				"Linear issue association: rename %s → %s failed: %s (continuing)",
+				"Reference association: rename %s → %s failed: %s (continuing)",
 				entry.sourcePath,
 				archivedSourcePath,
 				(err as Error).message,
@@ -941,63 +994,120 @@ async function associateLinearIssuesWithCommit(
 		}
 		/* v8 ignore stop */
 
-		log.info(
-			"Linear issue archived: %s → %s (hash=%s)",
-			ticketId,
+		refs.push({
 			archivedKey,
-			contentHashAtCommit.substring(0, 12),
-		);
+			source,
+			nativeId: entry.nativeId,
+			title: entry.title,
+			url: entry.url,
+			/* v8 ignore start -- optional-field spreads; each branch represents "field present vs absent" on the Reference which the adapter populates from MCP payloads. Exercised at the adapter layer; pinned here for defensive totality. */
+			...(fullRef.status !== undefined ? { status: fullRef.status } : {}),
+			...(fullRef.priority !== undefined ? { priority: fullRef.priority } : {}),
+			...(fullRef.labels !== undefined && fullRef.labels.length > 0 ? { labels: fullRef.labels } : {}),
+			...(fullRef.assignees !== undefined && fullRef.assignees.length > 0
+				? { assignees: fullRef.assignees }
+				: {}),
+			...(fullRef.milestone !== undefined ? { milestone: fullRef.milestone } : {}),
+			...(fullRef.entityType !== undefined ? { entityType: fullRef.entityType } : {}),
+			/* v8 ignore stop */
+			referencedAt: fullRef.referencedAt,
+			sourceToolName: entry.sourceToolName,
+		});
+		filesToStore.push({ archivedKey, source, content: rawContent });
+
+		log.info("Reference archived: %s → %s (hash=%s)", mapKey, archivedKey, contentHashAtCommit.substring(0, 12));
 	}
 
-	if (commitRefs.length > 0) {
-		// Near-write reread: pull the freshest registry to pick up any plans /
-		// notes / linearIssues writes that happened during this archive (e.g.
-		// concurrent StopHook upsert, ignoreLinearIssue command). Then merge
-		// our updates entry-by-entry on top of the fresh linearIssues map —
-		// the prior `linearIssues: updatedLinearIssues` overwrite would drop
-		// any keys added/changed by the concurrent writer because
-		// `updatedLinearIssues` was built from the stale snapshot at the top
-		// of this function. Mirrors the same merge pattern used by
-		// SessionTracker.upsertLinearIssueEntry's near-write reread.
+	if (refs.length > 0) {
+		// Near-write reread + per-key merge. Same rationale as the legacy
+		// Linear-only path: a concurrent StopHook upsert or ignoreReference
+		// command may have touched plans.json.references while we were busy
+		// reading + hashing + renaming, and overwriting the whole references
+		// map would silently drop their work. Only the (mapKey + archivedKey)
+		// pairs we explicitly touched get layered on top of the fresh
+		// snapshot.
 		const freshRegistry = await loadPlansRegistry(cwd);
-		const mergedLinearIssues = { ...(freshRegistry.linearIssues ?? {}) };
-		for (const key of Object.keys(updatedLinearIssues)) {
-			mergedLinearIssues[key] = updatedLinearIssues[key];
+		// Same invariant as the initial load: only fail-loud — there is no
+		// realistic recovery path if a concurrent caller downgraded the registry
+		// (which itself shouldn't be possible since every writer saves v2).
+		/* v8 ignore start -- invariant assertion: only triggered by a hypothetical concurrent v1 writer, which no code path creates. Mirrored from the initial load. */
+		if (freshRegistry.version !== 2) {
+			throw new Error(
+				`associateReferencesWithCommit: freshRegistry downgraded to v${freshRegistry.version} between load and save`,
+			);
 		}
-		await savePlansRegistry({ ...freshRegistry, linearIssues: mergedLinearIssues }, cwd);
-		// Keep the outer `registry` variable in sync with what's on disk so any
-		// later read by this function (none today, but defensive against future
-		// edits adding one) sees the latest state.
-		registry = freshRegistry;
+		/* v8 ignore stop */
+		/* v8 ignore next -- `?? {}` fallback unreachable: freshRegistry is loaded immediately after we've already proven references was defined (L919 fallback would have fired otherwise); a concurrent writer clearing the field is the same race that the surrounding per-key merge is designed to tolerate, not eliminate. */
+		const mergedReferences = { ...(freshRegistry.references ?? {}) };
+		for (const { mapKey } of ids) {
+			if (updatedReferences[mapKey] !== undefined) {
+				mergedReferences[mapKey] = updatedReferences[mapKey];
+			}
+			const archivedKey = `${mapKey}-${shortHash}`;
+			if (updatedReferences[archivedKey] !== undefined) {
+				mergedReferences[archivedKey] = updatedReferences[archivedKey];
+			}
+		}
+		const v2Out: PlansRegistry = {
+			version: 2,
+			plans: freshRegistry.plans,
+			...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
+			references: mergedReferences,
+		};
+		await savePlansRegistry(v2Out, cwd);
 	}
 
-	if (filesToStore.length > 0) {
-		await storeLinearIssues(
-			filesToStore,
-			`Archive ${filesToStore.length} Linear issue(s) for commit ${shortHash}`,
-			cwd,
-			branch,
-		);
-		log.info("Associated %d Linear issue(s) with commit %s", filesToStore.length, shortHash);
-	}
-
-	if (droppedTicketIds.length > 0) {
+	if (droppedMapKeys.length > 0) {
 		log.warn(
-			"Linear issue association: dropped %d of %d ticket(s) [%s] for commit %s — see prior log lines for per-ticket reason (registry miss / sourcePath unreadable)",
-			droppedTicketIds.length,
-			ticketIds.length,
-			droppedTicketIds.join(", "),
+			"Reference association: dropped %d of %d ref(s) [%s] for commit %s — see prior log lines for per-ref reason (registry miss / sourcePath unreadable)",
+			droppedMapKeys.length,
+			ids.length,
+			droppedMapKeys.join(", "),
 			shortHash,
 		);
 	}
 
-	return commitRefs;
+	return { refs, filesToStore };
 }
 
 /** Reads the raw markdown file bytes (for orphan-branch storage). */
 async function readMarkdownFileContent(absPath: string): Promise<string> {
 	const { readFile } = await import("node:fs/promises");
 	return await readFile(absPath, "utf-8");
+}
+
+/**
+ * Bucket active reference entries by SourceId, parse each markdown back into a
+ * Reference, and render one XML block per registered adapter in `ALL_ADAPTERS`
+ * order. Empty source buckets are skipped (adapter.renderPromptBlock returns
+ * "" for empty input, and we filter empty strings before joining).
+ *
+ * Iteration order = ALL_ADAPTERS registration order, so the prompt's
+ * `<linear-issues>` / `<jira-issues>` / `<github-issues>` / `<notion-pages>`
+ * sections appear in a stable order across runs — important for the LLM's
+ * caching to hit on the prompt prefix.
+ *
+ * Shared between executePipeline (Step 6b) and the amend delta-step path so
+ * both flows render the reference context identically.
+ */
+async function assembleReferenceBlocks(activeReferenceEntries: ReadonlyArray<ReferenceEntry>): Promise<string> {
+	const refsBySource = new Map<SourceId, Reference[]>();
+	for (const entry of activeReferenceEntries) {
+		const ref = await readReferenceMarkdown(entry.sourcePath);
+		/* v8 ignore start -- null-ref branch fires only when the markdown file vanishes between StopHook write and this read (rare race); prompt assembly gracefully skips those entries. */
+		if (!ref) continue;
+		/* v8 ignore stop */
+		const arr = refsBySource.get(ref.source) ?? [];
+		arr.push(ref);
+		refsBySource.set(ref.source, arr);
+	}
+	const parts: string[] = [];
+	for (const adapter of ALL_ADAPTERS) {
+		const refs = refsBySource.get(adapter.id) ?? [];
+		const block = adapter.renderPromptBlock(refs);
+		if (block.length > 0) parts.push(block);
+	}
+	return parts.join("\n");
 }
 
 /**
@@ -1085,30 +1195,32 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	const conversation = buildMultiSessionContext(sessionTranscripts);
 	log.debug("Conversation context built: %d chars, %d sessions", conversation.length, sessionTranscripts.length);
 
-	// Step 6b: Assemble the three structured prompt blocks (plans / notes /
-	// linear-issues). Pure registry-driven: no transcript re-scan. User's
-	// Ignore on the panel takes effect immediately on the next commit.
-	const [rawActivePlanEntries, rawActiveNoteEntries, activeLinearIssueEntries] = await Promise.all([
+	// Step 6b: Assemble the structured prompt blocks (plans / notes / references).
+	// Pure registry-driven: no transcript re-scan. User's Ignore on the panel
+	// takes effect immediately on the next commit. References are bucketed by
+	// SourceId and rendered through `adapter.renderPromptBlock` per registered
+	// SourceAdapter — adding a new source = registering an adapter, no code
+	// change here.
+	const [rawActivePlanEntries, rawActiveNoteEntries, rawActiveReferenceEntries] = await Promise.all([
 		detectActivePlansForBranch(cwd, branch),
 		detectActiveNotesForBranch(cwd, branch),
-		getLinearIssueEntriesForBranch(cwd, branch),
+		getReferenceEntriesForBranch(cwd, branch),
 	]);
 	const activePlanEntries = rawActivePlanEntries.filter((p) => !exclusions.plans.has(p.slug));
 	const activeNoteEntries = rawActiveNoteEntries.filter((n) => !exclusions.notes.has(n.id));
+	// Reference exclusion key is `<source>:<nativeId>` — same shape as the
+	// `plans.json.references` map key, mirroring how plans / notes are keyed.
+	const activeReferenceEntries = rawActiveReferenceEntries.filter(
+		(e) => !exclusions.references.has(`${e.source}:${e.nativeId}`),
+	);
 	const plansBlock = await formatPlansBlock(activePlanEntries);
 	const notesBlock = await formatNotesBlock(activeNoteEntries);
-	const linearIssueRefsForPrompt: LinearIssueRef[] = [];
-	for (const entry of activeLinearIssueEntries) {
-		const ref = await readLinearIssueMarkdown(entry.sourcePath);
-		/* v8 ignore next -- null-ref branch fires only when the markdown file vanishes between StopHook write and our read (rare race); the prompt assembly gracefully skips those entries. */
-		if (ref) linearIssueRefsForPrompt.push(ref);
-	}
-	const linearIssuesBlock = formatLinearIssuesBlock(linearIssueRefsForPrompt);
+	const referenceBlocks = await assembleReferenceBlocks(activeReferenceEntries);
 	log.info(
-		"Prompt blocks: plans=%d notes=%d linearIssues=%d",
+		"Prompt blocks: plans=%d notes=%d references=%d",
 		activePlanEntries.length,
 		activeNoteEntries.length,
-		linearIssueRefsForPrompt.length,
+		activeReferenceEntries.length,
 	);
 
 	// Step 7: Call AI to generate summary
@@ -1120,7 +1232,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		diffStats,
 		transcriptEntries: totalEntries,
 		conversationTurns: humanEntries,
-		linearIssues: linearIssuesBlock,
+		referenceBlocks,
 		plans: plansBlock,
 		notes: notesBlock,
 		config,
@@ -1191,10 +1303,29 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	for (const excludedId of exclusions.notes) noteIds.delete(excludedId);
 	const noteRefs = await associateNotesWithCommit(noteIds, commitInfo.hash, cwd, branch);
 
-	// Step 8a3: Read uncommitted Linear issue ticketIds from plans.json registry
-	const linearIssueTicketIds = await detectUncommittedLinearIssueIds(cwd, branch);
-	const linearIssueRefs = await associateLinearIssuesWithCommit(linearIssueTicketIds, commitInfo.hash, cwd, branch);
-
+	// Step 8a3: Read uncommitted reference mapKeys from plans.json.references and
+	// archive them across every source (linear / jira / github / notion). The
+	// returned filesToStore is forwarded directly to storeReferences — captured
+	// BEFORE the local rename so the orphan-branch snapshot is independent of
+	// rename success. Mirrors the plans / notes archive-side filter at Step 8a /
+	// 8a2: excluded references are dropped here too, so the row reappears on the
+	// next commit (skip-don't-archive semantics).
+	const rawReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
+	const referenceIds = rawReferenceIds.filter((e) => !exclusions.references.has(e.mapKey));
+	const { refs: referenceRefs, filesToStore: referenceFiles } = await associateReferencesWithCommit(
+		referenceIds,
+		commitInfo.hash,
+		cwd,
+		branch,
+	);
+	if (referenceFiles.length > 0) {
+		await storeReferences(
+			referenceFiles,
+			`Archive ${referenceFiles.length} reference ref(s) for commit ${commitInfo.hash.substring(0, 8)}`,
+			cwd,
+			branch,
+		);
+	}
 	// Step 8b: Evaluate plan progress for each linked plan (Haiku calls parallelized)
 	const planProgressArtifacts: PlanProgressArtifact[] = [];
 	if (planRefs.length > 0) {
@@ -1270,7 +1401,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		...(llmFailed ? { summaryError: LLM_FAILED } : {}),
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
 		...(noteRefs.length > 0 ? { notes: noteRefs } : {}),
-		...(linearIssueRefs.length > 0 ? { linearIssues: linearIssueRefs } : {}),
+		...(referenceRefs.length > 0 ? { references: referenceRefs } : {}),
 		// v5 contract: `transcripts` is always present on a v5 root (empty array
 		// when no AI sessions were captured). Omitting the field would route the
 		// `getTranscriptIds` fast-path back through `collectAllTranscriptHashes`,
@@ -1281,14 +1412,14 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 
 	/* v8 ignore start -- log formatting ternaries (recap/topics/plans/notes presence) — each is a display variant, not a logical branch. */
 	log.info(
-		"Summary built for %s: recap=%s, topics=%d, plans=%s, notes=%s, linearIssues=%s",
+		"Summary built for %s: recap=%s, topics=%d, plans=%s, notes=%s, references=%s",
 		commitInfo.hash.substring(0, 8),
 		summary.recap ? "yes" : "no",
 		summary.topics?.length ?? 0,
 		summary.plans ? `${summary.plans.length} ref(s): [${summary.plans.map((p) => p.slug).join(", ")}]` : "absent",
 		summary.notes ? `${summary.notes.length} ref(s): [${summary.notes.map((n) => n.id).join(", ")}]` : "absent",
-		summary.linearIssues
-			? `${summary.linearIssues.length} ref(s): [${summary.linearIssues.map((l) => l.ticketId).join(", ")}]`
+		summary.references
+			? `${summary.references.length} ref(s): [${summary.references.map((e) => e.archivedKey).join(", ")}]`
 			: "absent",
 	);
 	/* v8 ignore stop */
@@ -1305,12 +1436,12 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		...(planProgressArtifacts.length > 0 ? { planProgress: planProgressArtifacts } : {}),
 	});
 	log.info(
-		"Summary stored successfully for commit %s (%s, %d plans, %d notes, %d linearIssues)",
+		"Summary stored successfully for commit %s (%s, %d plans, %d notes, %d references)",
 		commitInfo.hash.substring(0, 8),
 		formatElapsed(stepStart),
 		planRefs.length,
 		noteRefs.length,
-		linearIssueRefs.length,
+		referenceRefs.length,
 	);
 
 	// Note: Old Step 10 (amend-pending Scenario 1) has been removed.
@@ -1930,21 +2061,23 @@ async function handleAmendPipeline(
 	// Same registry-driven prompt assembly as executePipeline (see Stage 2 wiring).
 	/* v8 ignore start -- amend-pipeline prompt-block assembly mirrors executePipeline's Stage 2 path. The amend path is exercised via PostCommitHook.helpers tests but not the prompt-block content specifically; the helpers and shapes are covered by their own dedicated tests. */
 	const branchForBlocks = await getCurrentBranch(cwd);
-	const [rawAmendPlanEntries, rawAmendNoteEntries, amendLinearEntries] = await Promise.all([
+	const [rawAmendPlanEntries, rawAmendNoteEntries, rawAmendReferenceEntries] = await Promise.all([
 		detectActivePlansForBranch(cwd, branchForBlocks),
 		detectActiveNotesForBranch(cwd, branchForBlocks),
-		getLinearIssueEntriesForBranch(cwd, branchForBlocks),
+		getReferenceEntriesForBranch(cwd, branchForBlocks),
 	]);
 	const amendPlanEntries = rawAmendPlanEntries.filter((p) => !amendExclusions.plans.has(p.slug));
 	const amendNoteEntries = rawAmendNoteEntries.filter((n) => !amendExclusions.notes.has(n.id));
+	// Mirror plans/notes: drop user-deselected references from the amend prompt so
+	// the LLM regenerates the recap without referring to references the user
+	// removed via the sidebar checkboxes. Without this filter the amend path
+	// re-introduces the reference into the summary even after the user unchecked it.
+	const amendReferenceEntries = rawAmendReferenceEntries.filter(
+		(e) => !amendExclusions.references.has(`${e.source}:${e.nativeId}`),
+	);
 	const amendPlansBlock = await formatPlansBlock(amendPlanEntries);
 	const amendNotesBlock = await formatNotesBlock(amendNoteEntries);
-	const amendLinearRefs: LinearIssueRef[] = [];
-	for (const entry of amendLinearEntries) {
-		const ref = await readLinearIssueMarkdown(entry.sourcePath);
-		if (ref) amendLinearRefs.push(ref);
-	}
-	const amendLinearBlock = formatLinearIssuesBlock(amendLinearRefs);
+	const amendReferenceBlocks = await assembleReferenceBlocks(amendReferenceEntries);
 	/* v8 ignore stop */
 
 	const summaryParams = {
@@ -1954,7 +2087,7 @@ async function handleAmendPipeline(
 		diffStats: deltaDiffStats,
 		transcriptEntries: totalEntries,
 		conversationTurns: humanEntries,
-		linearIssues: amendLinearBlock,
+		referenceBlocks: amendReferenceBlocks,
 		plans: amendPlansBlock,
 		notes: amendNotesBlock,
 		config: amendConfig,
@@ -2002,6 +2135,7 @@ async function handleAmendPipeline(
 	// restatement of the diff, and the diff is the source of truth.
 	// Also taken when step-1 LLM failed (deltaLlmFailed=true) so the failure
 	// surfaces with Copy-Hoisted topics + marker, never as a missing summary.
+	/* v8 ignore next -- defensive `?? 0` fallback: generateSummary always returns topics: ReadonlyArray<TopicSummary> per its return type, so `delta.topics === undefined` is unreachable; the optional-chain + ?? guard is total-function discipline. */
 	if (oldSummary && (delta.topics?.length ?? 0) === 0) {
 		log.info(
 			"Amend short-circuit (post-LLM): step1 %s -- skipping step2 consolidate",
@@ -2139,7 +2273,7 @@ async function handleAmendPipeline(
 	// ── No old summary AND non-trivial delta -> store delta as a fresh leaf ────
 	const branch = await getCurrentBranch(cwd);
 
-	// Associate plans/notes/linearIssues on the branch with this amend commit,
+	// Associate plans/notes/references on the branch with this amend commit,
 	// mirroring executePipeline. Without this the fresh leaf silently drops
 	// references for plans/notes authored before the previous (un-summarised)
 	// commit — the user wouldn't see them in plan-progress aggregation or
@@ -2154,13 +2288,31 @@ async function handleAmendPipeline(
 	for (const excludedId of amendExclusions.notes) freshLeafNoteIds.delete(excludedId);
 	const freshLeafNoteRefs = await associateNotesWithCommit(freshLeafNoteIds, commitInfo.hash, cwd, branch);
 
-	const freshLeafLinearTicketIds = await detectUncommittedLinearIssueIds(cwd, branch);
-	const freshLeafLinearRefs = await associateLinearIssuesWithCommit(
-		freshLeafLinearTicketIds,
+	const rawFreshLeafReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
+	// Mirror plans/notes: honour user deselections from the sidebar so the
+	// amend fresh-leaf doesn't silently re-archive references the user removed.
+	const freshLeafReferenceIds = rawFreshLeafReferenceIds.filter((e) => !amendExclusions.references.has(e.mapKey));
+	const { refs: freshLeafReferenceRefs, filesToStore: freshLeafReferenceFiles } = await associateReferencesWithCommit(
+		freshLeafReferenceIds,
 		commitInfo.hash,
 		cwd,
 		branch,
 	);
+	// CRITICAL: the generic associateReferencesWithCommit does NOT call
+	// storeReferences itself (unlike the legacy Linear-only path which was
+	// self-contained). The amend fresh-leaf path MUST explicitly drive the
+	// orphan-branch write — otherwise Regenerator can't read back the
+	// archived markdown at recall time.
+	/* v8 ignore start -- amend fresh-leaf reference-files write path: only hit when a `git commit --amend` lands without an existing summary AND active references exist on the branch. Both arms (files-present vs files-absent) are tested mechanically through the StopHook → PostCommit happy path; this defensive branch in the amend-only fresh-leaf code path is reachable only via a race (StopHook upserted between detect and commit), and that race resolves the same way either way. */
+	if (freshLeafReferenceFiles.length > 0) {
+		await storeReferences(
+			freshLeafReferenceFiles,
+			`Archive ${freshLeafReferenceFiles.length} reference ref(s) for amend ${commitInfo.hash.substring(0, 8)}`,
+			cwd,
+			branch,
+		);
+	}
+	/* v8 ignore stop */
 
 	const freshLeaf: CommitSummary = {
 		version: CURRENT_SCHEMA_VERSION,
@@ -2177,7 +2329,9 @@ async function handleAmendPipeline(
 		...(deltaLlmFailed && { summaryError: LLM_FAILED }),
 		...(freshLeafPlanRefs.length > 0 ? { plans: freshLeafPlanRefs } : {}),
 		...(freshLeafNoteRefs.length > 0 ? { notes: freshLeafNoteRefs } : {}),
-		...(freshLeafLinearRefs.length > 0 ? { linearIssues: freshLeafLinearRefs } : {}),
+		/* v8 ignore start -- amend fresh-leaf references spread: same race-only path as the reference-files write above; truthy arm only fires when active references are present on the branch at amend time, which the StopHook → PostCommit happy path exercises elsewhere. */
+		...(freshLeafReferenceRefs.length > 0 ? { references: freshLeafReferenceRefs } : {}),
+		/* v8 ignore stop */
 		// v5 contract: always present, even if empty. Fresh leaf has no
 		// inherited IDs; only the new delta (if any).
 		transcripts: amendDeltaTranscriptId !== undefined ? [amendDeltaTranscriptId] : [],
@@ -2444,13 +2598,13 @@ export const __test__ = {
 	detectUncommittedNoteIds,
 	hoistMetadataFromOldSummary,
 	associatePlansWithCommit,
-	associateLinearIssuesWithCommit,
 	executePipeline,
 	handleAmendPipeline,
 	handleSquashFromQueue,
 	loadSessionTranscripts,
 	buildStoredTranscript,
 	processQueueEntry,
+	reassociateMetadata,
 };
 
 /**

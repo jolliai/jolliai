@@ -68,11 +68,13 @@ const LLM_PROXY_PATH = "/api/push/llm/complete";
 
 /**
  * End-to-end timeout for proxy LLM calls (covers connect + headers + body).
- * The backend invokes Anthropic non-streaming inside this request, so 120s is
+ * The backend invokes Anthropic non-streaming inside this request, so 180s is
  * generous for a full LLM round-trip while bounding how long a stuck request
- * can hold the QueueWorker file lock.
+ * can hold the QueueWorker file lock. Moved in lockstep with
+ * `DIRECT_FETCH_TIMEOUT_MS` so both paths share one wall-clock budget.
+ * Exported so a regression test can pin the value.
  */
-const PROXY_FETCH_TIMEOUT_MS = 120_000;
+export const PROXY_FETCH_TIMEOUT_MS = 180_000;
 
 /**
  * End-to-end timeout for direct Anthropic API calls. The SDK's `fetch` has
@@ -81,10 +83,15 @@ const PROXY_FETCH_TIMEOUT_MS = 120_000;
  * hold the in-flight LLM call indefinitely — observed in production
  * holding a SyncEngine `ConflictResolver.resolveAll` for 2+ hours and
  * leaving the sidebar's "Sorting out conflicts…" label up the whole time.
- * 60 s is generous for the largest commit-summary / merge prompts the
- * engine sends while still failing fast when the connection is wedged.
+ * 180 s matches the proxy path and is sized for the largest prompts the engine
+ * sends — notably a regenerate of a large squash commit, which aggregates the
+ * whole tree's transcripts + diff into one non-streaming request and was being
+ * aborted mid-flight at the previous 120 s ceiling ("Request was aborted.").
+ * The extra headroom still fails fast when the connection is genuinely wedged.
+ * The QueueWorker refreshes its file lock every 60 s, so a call running this
+ * long never loses the lock. Exported so a regression test can pin the value.
  */
-const DIRECT_FETCH_TIMEOUT_MS = 60_000;
+export const DIRECT_FETCH_TIMEOUT_MS = 180_000;
 
 // `x-jolli-client` header value lives in `./ClientHeader.ts` so both this
 // module and `cli/src/sync/BackendClient.ts` share one source of truth.
@@ -303,9 +310,19 @@ async function callDirect(
 		const baseUrl = client.baseURL;
 		const message = err instanceof Error ? err.message : String(err);
 		const cause = err instanceof Error ? formatCause((err as { cause?: unknown }).cause) : "(non-error)";
+		// model / maxTokens / promptChars / elapsedMs turn a wall-clock-timeout
+		// abort ("Request was aborted." with cause=(none)) into something
+		// actionable: they show how large the prompt was and how long the call
+		// ran before aborting, so "prompt too big for the 180s budget" is
+		// distinguishable from a genuinely wedged connection without re-running.
+		const elapsedMs = Date.now() - startTime;
 		log.error(
-			"Direct LLM call failed: action=%s baseUrl=%s error=%s cause=%s",
+			"Direct LLM call failed: action=%s model=%s maxTokens=%d promptChars=%d elapsedMs=%d baseUrl=%s error=%s cause=%s",
 			options.action,
+			model,
+			maxTokens,
+			prompt.length,
+			elapsedMs,
 			baseUrl,
 			message,
 			cause,

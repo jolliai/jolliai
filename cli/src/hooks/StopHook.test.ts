@@ -8,20 +8,14 @@ vi.mock("../core/SessionTracker.js", () => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
 	loadCursorForTranscript: vi.fn().mockResolvedValue(null),
 	saveCursor: vi.fn().mockResolvedValue(undefined),
-	loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
+	loadPlansRegistry: vi.fn().mockResolvedValue({ version: 2, plans: {} }),
 	savePlansRegistry: vi.fn().mockResolvedValue(undefined),
-	upsertLinearIssueEntry: vi.fn().mockResolvedValue(undefined),
+	upsertReferenceEntry: vi.fn().mockResolvedValue(undefined),
 }));
 
-// Mock LinearIssueExtractor — pure-function module called from StopHook
-vi.mock("../core/LinearIssueExtractor.js", () => ({
-	extractLinearIssuesFromTranscript: vi.fn().mockResolvedValue({ issues: [], lastLineNumberScanned: 0 }),
-}));
-
-// Mock LinearIssueStore — fs IO module called from StopHook
-vi.mock("../core/LinearIssueStore.js", () => ({
-	writeLinearIssueMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/abs/PROJ-1.md", contentHash: "fake-hash" }),
-	hashLinearIssueContent: vi.fn().mockReturnValue("fake-hash"),
+// Mock ReferenceExtractor — pure-function module called from StopHook.
+vi.mock("../core/references/ReferenceExtractor.js", () => ({
+	extractReferencesFromTranscript: vi.fn().mockResolvedValue({ references: [], lastLineNumberScanned: 0 }),
 }));
 
 // Mock node:fs so we can control existsSync / readFileSync / createReadStream
@@ -63,8 +57,7 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { extractLinearIssuesFromTranscript } from "../core/LinearIssueExtractor.js";
-import { writeLinearIssueMarkdown } from "../core/LinearIssueStore.js";
+import { extractReferencesFromTranscript } from "../core/references/ReferenceExtractor.js";
 import {
 	loadConfig,
 	loadCursorForTranscript,
@@ -72,7 +65,7 @@ import {
 	saveCursor,
 	savePlansRegistry,
 	saveSession,
-	upsertLinearIssueEntry,
+	upsertReferenceEntry,
 } from "../core/SessionTracker.js";
 import type { PlanEntry } from "../Types.js";
 import { withPlatform } from "../testUtils/withPlatform.js";
@@ -196,7 +189,7 @@ describe("StopHook", () => {
 		// Default: transcript file does not exist → plan discovery exits early
 		vi.mocked(existsSync).mockReturnValue(false);
 		// Default: loadPlansRegistry returns empty registry
-		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {} });
 		// Default: loadCursorForTranscript returns null (no prior scan)
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
 	});
@@ -339,7 +332,7 @@ describe("StopHook — plan discovery", () => {
 		vi.clearAllMocks();
 		process.env.CLAUDE_PROJECT_DIR = PROJECT_DIR;
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
-		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {} });
 		// Default: files don't exist
 		vi.mocked(existsSync).mockReturnValue(false);
 		vi.mocked(readFileSync).mockReturnValue(
@@ -582,7 +575,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // plan file exists
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				"existing-plan": {
 					slug: "existing-plan",
@@ -622,7 +615,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				"committed-plan": {
 					slug: "committed-plan",
@@ -653,7 +646,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				"ignored-plan": {
 					slug: "ignored-plan",
@@ -700,7 +693,7 @@ describe("StopHook — plan discovery", () => {
 		// readFileSync mock returns "# Plan Title\n\nContent" — SHA-256 of that value is the real hash below
 		// (sha256("# Plan Title\n\nContent") = 1ab12ceb7fdd12641cbcefc8a5b7816c447423966a5b9976a4e004b6ae49fe6d)
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				"archived-plan": {
 					slug: "archived-plan",
@@ -735,7 +728,7 @@ describe("StopHook — plan discovery", () => {
 
 		// hash mock returns "current-file-hash" — differs from contentHashAtCommit
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				"reused-plan": {
 					slug: "reused-plan",
@@ -779,7 +772,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				"removed-plan": {
 					slug: "removed-plan",
@@ -894,7 +887,7 @@ describe("StopHook — plan discovery", () => {
 		// First load: plan is still uncommitted
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"race-plan": {
 						slug: "race-plan",
@@ -912,7 +905,7 @@ describe("StopHook — plan discovery", () => {
 			// contentHashAtCommit are present (this is what associatePlansWithCommit
 			// actually writes in production).
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"race-plan": {
 						slug: "race-plan",
@@ -955,7 +948,7 @@ describe("StopHook — plan discovery", () => {
 
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"current-plan": {
 						slug: "current-plan",
@@ -970,7 +963,7 @@ describe("StopHook — plan discovery", () => {
 				},
 			})
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"current-plan": {
 						slug: "current-plan",
@@ -1017,7 +1010,7 @@ describe("StopHook — plan discovery", () => {
 		// First load: uncommitted state (before QueueWorker's writes)
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"refactor-api": {
 						slug: "refactor-api",
@@ -1033,7 +1026,7 @@ describe("StopHook — plan discovery", () => {
 			})
 			// Second load (freshRegistry): QueueWorker has run, guard installed + archive added
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"refactor-api": {
 						slug: "refactor-api",
@@ -1095,7 +1088,7 @@ describe("StopHook — plan discovery", () => {
 		vi.mocked(existsSync).mockReturnValue(true);
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"refactor-api": {
 						slug: "refactor-api",
@@ -1110,7 +1103,7 @@ describe("StopHook — plan discovery", () => {
 				},
 			})
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"refactor-api": {
 						slug: "refactor-api",
@@ -1141,7 +1134,7 @@ describe("StopHook — plan discovery", () => {
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
 		vi.mocked(loadPlansRegistry).mockReset();
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: { "refactor-api": afterEvent1?.plans["refactor-api"] as PlanEntry },
 		});
 		vi.mocked(savePlansRegistry).mockClear();
@@ -1165,7 +1158,7 @@ describe("StopHook — plan discovery", () => {
 
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"our-plan": {
 						slug: "our-plan",
@@ -1190,7 +1183,7 @@ describe("StopHook — plan discovery", () => {
 				},
 			})
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"our-plan": {
 						slug: "our-plan",
@@ -1232,9 +1225,9 @@ describe("StopHook — plan discovery", () => {
 		vi.mocked(existsSync).mockReturnValueOnce(true).mockReturnValueOnce(true);
 
 		vi.mocked(loadPlansRegistry)
-			.mockResolvedValueOnce({ version: 1, plans: {} })
+			.mockResolvedValueOnce({ version: 2, plans: {} })
 			.mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {
 					"plan-b": {
 						slug: "plan-b",
@@ -1375,7 +1368,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // external plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				foo: {
 					slug: "foo",
@@ -1412,7 +1405,7 @@ describe("StopHook — plan discovery", () => {
 		// Reverse-lookup by sourcePath must still find this entry and reuse its slug,
 		// rather than naively registering a fresh `foo` entry.
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				"foo-a3b7c2d1": {
 					slug: "foo-a3b7c2d1",
@@ -1498,7 +1491,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // .md file on disk
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {},
 			notes: {
 				"n-abc123": {
@@ -1532,7 +1525,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // .md file on disk
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {},
 			notes: {
 				"n-snippet": {
@@ -1567,7 +1560,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // .md file on disk
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {},
 			notes: {
 				"n-legacy": {
@@ -1604,7 +1597,7 @@ describe("StopHook — plan discovery", () => {
 				.mockReturnValueOnce(true); // .md file on disk
 
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 1,
+				version: 2,
 				plans: {},
 				notes: {
 					"n-abc": {
@@ -1643,7 +1636,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // .md file on disk
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {},
 			notes: {
 				"n-other": {
@@ -1687,7 +1680,7 @@ describe("StopHook — plan discovery", () => {
 
 		const canonicalPath = join("/home/user", ".claude", "plans", "shared.md");
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {},
 			notes: {
 				"n-shared": {
@@ -1724,7 +1717,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // external plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {},
 			notes: {
 				"n-keep": {
@@ -1738,12 +1731,13 @@ describe("StopHook — plan discovery", () => {
 					commitHash: null,
 				},
 			},
-			linearIssues: {
-				"PROJ-1": {
-					ticketId: "PROJ-1",
+			references: {
+				"linear:PROJ-1": {
+					source: "linear",
+					nativeId: "PROJ-1",
 					title: "Keep me too",
 					url: "https://linear.app/x/PROJ-1",
-					sourcePath: "/repo/.jolli/jollimemory/linear-issues/PROJ-1.md",
+					sourcePath: "/repo/.jolli/jollimemory/references/linear/PROJ-1.md",
 					branch: "main",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
@@ -1761,8 +1755,9 @@ describe("StopHook — plan discovery", () => {
 		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
 		expect(saved?.notes).toBeDefined();
 		expect(saved?.notes?.["n-keep"]).toBeDefined();
-		expect(saved?.linearIssues).toBeDefined();
-		expect(saved?.linearIssues?.["PROJ-1"]).toBeDefined();
+		const savedRefs = saved?.references;
+		expect(savedRefs).toBeDefined();
+		expect(savedRefs?.["linear:PROJ-1"]).toBeDefined();
 	});
 
 	it("should skip external .md when source file no longer exists at upsert time", async () => {
@@ -1813,7 +1808,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // canonical plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				foo: {
 					slug: "foo",
@@ -1849,11 +1844,13 @@ describe("StopHook — plan discovery", () => {
 	});
 });
 
-describe("StopHook — Linear issue discovery", () => {
+describe("StopHook — entity discovery (multi-source)", () => {
 	const TRANSCRIPT_PATH = "/path/to/session.jsonl";
 	const PROJECT_DIR = "/my/project";
 	const REF = {
-		ticketId: "PROJ-1528",
+		mapKey: "linear:PROJ-1528",
+		source: "linear" as const,
+		nativeId: "PROJ-1528",
 		title: "Treat referenced Linear issues",
 		url: "https://linear.app/x/PROJ-1528",
 		toolName: "mcp__linear__get_issue",
@@ -1866,10 +1863,10 @@ describe("StopHook — Linear issue discovery", () => {
 		process.env.CLAUDE_PROJECT_DIR = PROJECT_DIR;
 		vi.mocked(loadConfig).mockResolvedValue({});
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
-		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {} });
 		vi.mocked(existsSync).mockReturnValue(false);
-		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
-			issues: [],
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({
+			references: [],
 			lastLineNumberScanned: 0,
 		});
 	});
@@ -1882,32 +1879,25 @@ describe("StopHook — Linear issue discovery", () => {
 		vi.mocked(existsSync).mockReturnValue(false);
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
-		expect(extractLinearIssuesFromTranscript).not.toHaveBeenCalled();
-		expect(upsertLinearIssueEntry).not.toHaveBeenCalled();
+		expect(extractReferencesFromTranscript).not.toHaveBeenCalled();
+		expect(upsertReferenceEntry).not.toHaveBeenCalled();
 	});
 
-	it("writes markdown + upserts entry when an issue is extracted", async () => {
-		// existsSync called twice: once for plan discovery (false), once for linear (true).
-		// Use mockImplementation to return true only for the linear path.
+	it("upserts entity entry when a ref is extracted", async () => {
+		// existsSync called twice: once for plan discovery (false), once for entity (true).
+		// Use mockImplementation to return true only for the entity path.
 		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
 		// Plan discovery emits no slugs (transcript stream returns no lines).
 		mockTranscriptWithLines([]);
-		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
-			issues: [REF],
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({
+			references: [REF],
 			lastLineNumberScanned: 42,
 		});
 
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
 
-		expect(writeLinearIssueMarkdown).toHaveBeenCalledWith(REF, PROJECT_DIR);
-		expect(upsertLinearIssueEntry).toHaveBeenCalledWith(
-			REF,
-			"/abs/PROJ-1.md",
-			"fake-hash",
-			expect.any(String),
-			PROJECT_DIR,
-		);
+		expect(upsertReferenceEntry).toHaveBeenCalledWith(REF, PROJECT_DIR, expect.any(String));
 		expect(saveCursor).toHaveBeenCalledWith(
 			expect.objectContaining({
 				transcriptPath: `linear:${TRANSCRIPT_PATH}`,
@@ -1917,18 +1907,18 @@ describe("StopHook — Linear issue discovery", () => {
 		);
 	});
 
-	it("advances cursor even when no issues found, as long as new lines were scanned", async () => {
+	it("advances cursor even when no entities found, as long as new lines were scanned", async () => {
 		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
 		mockTranscriptWithLines([]);
-		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
-			issues: [],
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({
+			references: [],
 			lastLineNumberScanned: 10,
 		});
 
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
 
-		expect(upsertLinearIssueEntry).not.toHaveBeenCalled();
+		expect(upsertReferenceEntry).not.toHaveBeenCalled();
 		expect(saveCursor).toHaveBeenCalledWith(
 			expect.objectContaining({
 				transcriptPath: `linear:${TRANSCRIPT_PATH}`,
@@ -1946,8 +1936,8 @@ describe("StopHook — Linear issue discovery", () => {
 			lineNumber: 5,
 			updatedAt: new Date().toISOString(),
 		});
-		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
-			issues: [],
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({
+			references: [],
 			lastLineNumberScanned: 5,
 		});
 
@@ -1966,38 +1956,41 @@ describe("StopHook — Linear issue discovery", () => {
 	it("logs the error and continues when extractor throws", async () => {
 		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
 		mockTranscriptWithLines([]);
-		vi.mocked(extractLinearIssuesFromTranscript).mockRejectedValue(new Error("boom"));
+		vi.mocked(extractReferencesFromTranscript).mockRejectedValue(new Error("boom"));
 
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		// Should not throw; handleStopHook swallows the error
 		await expect(handleStopHook()).resolves.toBeUndefined();
-		expect(upsertLinearIssueEntry).not.toHaveBeenCalled();
+		expect(upsertReferenceEntry).not.toHaveBeenCalled();
 	});
 
-	it("continues with the rest of the batch when one issue's persistence fails", async () => {
-		// Per-issue persistence failures (writeLinearIssueMarkdown / upsert)
-		// must NOT abort the loop — skipping cursor save on the first failure
-		// would put the StopHook in a re-process loop hammering the same ref.
+	it("continues with the rest of the batch when one ref's upsert fails (cursor still advances)", async () => {
+		// Per-ref persistence failures (upsertReferenceEntry throwing) must NOT
+		// abort the loop — skipping cursor save on the first failure would put
+		// the StopHook in a re-process loop hammering the same ref. The
+		// cursor advance covers all three terminal paths: full success,
+		// partial failure, and total failure.
 		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
 		mockTranscriptWithLines([]);
-		const okRef = { ...REF, ticketId: "PROJ-OK" };
-		const badRef = { ...REF, ticketId: "PROJ-BAD" };
-		vi.mocked(extractLinearIssuesFromTranscript).mockResolvedValue({
-			issues: [badRef, okRef],
+		const okRef = { ...REF, mapKey: "linear:PROJ-OK", nativeId: "PROJ-OK" };
+		const badRef = { ...REF, mapKey: "linear:PROJ-BAD", nativeId: "PROJ-BAD" };
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({
+			references: [badRef, okRef],
 			lastLineNumberScanned: 7,
 		});
-		// First write throws (per-batch failure path), second succeeds.
-		vi.mocked(writeLinearIssueMarkdown)
+		// First upsert throws (per-batch failure path), second succeeds.
+		vi.mocked(upsertReferenceEntry)
 			.mockRejectedValueOnce(new Error("EACCES — write blocked"))
-			.mockResolvedValueOnce({ sourcePath: "/abs/PROJ-OK.md", contentHash: "fake-hash" });
+			.mockResolvedValueOnce(undefined);
 
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
 
-		// Only the surviving ref reaches upsert.
-		const upsertCalls = vi.mocked(upsertLinearIssueEntry).mock.calls;
-		expect(upsertCalls).toHaveLength(1);
-		expect(upsertCalls[0]?.[0]).toMatchObject({ ticketId: "PROJ-OK" });
+		// Both refs reached upsert (the bad one threw, but the loop continued).
+		const upsertCalls = vi.mocked(upsertReferenceEntry).mock.calls;
+		expect(upsertCalls).toHaveLength(2);
+		expect(upsertCalls[0]?.[0]).toMatchObject({ mapKey: "linear:PROJ-BAD" });
+		expect(upsertCalls[1]?.[0]).toMatchObject({ mapKey: "linear:PROJ-OK" });
 		// Cursor still advances — preventing the StopHook from re-processing
 		// the same window on the next invocation.
 		expect(saveCursor).toHaveBeenCalledWith(

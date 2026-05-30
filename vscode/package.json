@@ -193,6 +193,21 @@
 				"category": "Jolli Memory"
 			},
 			{
+				"command": "jollimemory.openReferenceInBrowser",
+				"title": "Open Reference in Browser",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openReferenceMarkdown",
+				"title": "Open Reference Markdown",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.ignoreReference",
+				"title": "Ignore Reference",
+				"category": "Jolli Memory"
+			},
+			{
 				"command": "jollimemory.signIn",
 				"title": "Sign In to Jolli",
 				"icon": "$(sign-in)",
@@ -202,21 +217,6 @@
 				"command": "jollimemory.signOut",
 				"title": "Sign Out of Jolli",
 				"icon": "$(sign-out)",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.openLinearIssue",
-				"title": "Open Linear Issue in Browser",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.openLinearIssueMarkdown",
-				"title": "Open Linear Issue Markdown",
-				"category": "Jolli Memory"
-			},
-			{
-				"command": "jollimemory.ignoreLinearIssue",
-				"title": "Ignore Linear Issue",
 				"category": "Jolli Memory"
 			},
 			{

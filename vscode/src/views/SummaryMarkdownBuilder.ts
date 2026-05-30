@@ -16,9 +16,16 @@ import {
 	formatDurationLabel,
 	resolveDiffStats,
 } from "../../../cli/src/core/SummaryTree.js";
-import type { CommitSummary, E2eTestScenario } from "../../../cli/src/Types.js";
+import type {
+	CommitSummary,
+	E2eTestScenario,
+	ReferenceCommitRef,
+	SourceId,
+} from "../../../cli/src/Types.js";
 import {
 	collectSortedTopics,
+	escMdLinkText,
+	escMdUrl,
 	formatDate,
 	formatFullDate,
 	formatProviderLabel,
@@ -118,8 +125,9 @@ export function pushPlansAndNotesSection(
 ): void {
 	const plans = summary.plans ?? [];
 	const notes = summary.notes ?? [];
-	const linearIssues = summary.linearIssues ?? [];
-	const totalCount = plans.length + notes.length + linearIssues.length;
+	// Multi-source reference rendering — `summary.references` is canonical.
+	const references: ReadonlyArray<ReferenceCommitRef> = summary.references ?? [];
+	const totalCount = plans.length + notes.length + references.length;
 	if (totalCount === 0) {
 		return;
 	}
@@ -128,21 +136,55 @@ export function pushPlansAndNotesSection(
 
 	for (const plan of plans) {
 		const planUrl = plan.jolliPlanDocUrl;
-		lines.push(planUrl ? `- [${plan.title}](${planUrl})` : `- ${plan.title}`);
+		lines.push(
+			planUrl ? `- [${escMdLinkText(plan.title)}](${escMdUrl(planUrl)})` : `- ${escMdLinkText(plan.title)}`,
+		);
 	}
 
 	for (const note of notes) {
 		const noteUrl = note.jolliNoteDocUrl;
-		lines.push(noteUrl ? `- [${note.title}](${noteUrl})` : `- ${note.title}`);
+		lines.push(
+			noteUrl ? `- [${escMdLinkText(note.title)}](${escMdUrl(noteUrl)})` : `- ${escMdLinkText(note.title)}`,
+		);
 	}
 
-	// Linear issues render with the ticketId prefix so reviewers can grep
-	// the PR description for a specific ticket without parsing titles.
-	// We prefer the upstream Linear URL over any internal Jolli doc URL,
-	// since Linear is the authoritative tracker.
-	for (const issue of linearIssues) {
-		lines.push(`- [${issue.ticketId} — ${issue.title}](${issue.url})`);
+	// External references (Linear / Jira / GitHub / Notion) render with the
+	// stable nativeId prefix (Linear ticket id, Jira key, owner/repo#number,
+	// Notion page id) so reviewers can grep the PR body without parsing
+	// titles. Upstream URL is preferred over any internal Jolli doc URL —
+	// the source tracker is authoritative. Order is deterministic by
+	// source (linear → jira → github → notion) so multi-source PRs read
+	// the same across regenerations.
+	for (const e of referencesBySourceOrder(references)) {
+		// title/url are untrusted (external tracker content) — escape so a crafted
+		// title/url cannot inject a phishing link into the PR body / clipboard.
+		lines.push(`- [${escMdLinkText(e.nativeId)} — ${escMdLinkText(e.title)}](${escMdUrl(e.url)})`);
 	}
+}
+
+const REFERENCE_SOURCE_ORDER: ReadonlyArray<SourceId> = ["linear", "jira", "github", "notion"];
+
+/**
+ * Returns references ordered by source (linear → jira → github → notion) and
+ * preserves the original within-source order. Used by the clipboard /
+ * webview / PR renderers so the section reads deterministically across
+ * regenerations.
+ */
+export function referencesBySourceOrder(
+	references: ReadonlyArray<ReferenceCommitRef>,
+): ReadonlyArray<ReferenceCommitRef> {
+	const bySource = new Map<SourceId, Array<ReferenceCommitRef>>();
+	for (const e of references) {
+		const arr = bySource.get(e.source) ?? [];
+		arr.push(e);
+		bySource.set(e.source, arr);
+	}
+	const out: Array<ReferenceCommitRef> = [];
+	for (const source of REFERENCE_SOURCE_ORDER) {
+		const arr = bySource.get(source);
+		if (arr) out.push(...arr);
+	}
+	return out;
 }
 
 /**

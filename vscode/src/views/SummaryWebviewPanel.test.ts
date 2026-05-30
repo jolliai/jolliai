@@ -100,7 +100,14 @@ vi.mock("vscode", () => ({
 		openExternal,
 	},
 	Uri: {
-		parse: vi.fn((s: string) => ({ toString: () => s })),
+		// Lightweight URL parser — extracts the scheme so `openEntityExternal`'s
+		// http(s) defense-in-depth check has something to read; the real
+		// vscode.Uri has many more fields but tests only exercise these.
+		parse: vi.fn((s: string) => {
+			const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(s);
+			const scheme = match ? match[1].toLowerCase() : "";
+			return { scheme, toString: () => s };
+		}),
 		file: vi.fn((s: string) => ({ fsPath: s, toString: () => s })),
 		joinPath: vi.fn((...args: Array<unknown>) => ({
 			toString: () => String(args.join("/")),
@@ -172,21 +179,25 @@ vi.mock("../../../cli/src/core/RegenerateContext.js", () => ({
 
 const {
 	mockGetTranscriptHashes,
-	mockReadLinearIssueFromBranch,
+	mockReadReferenceFromBranch,
 	mockReadNoteFromBranch,
 	mockReadPlanFromBranch,
 	mockReadTranscriptsForCommits,
 	mockSaveTranscriptsBatch,
+	mockStoreReferences,
 	mockStoreNotes,
 	mockStorePlans,
 	mockStoreSummary,
 } = vi.hoisted(() => ({
 	mockGetTranscriptHashes: vi.fn().mockResolvedValue(new Set<string>()),
-	mockReadLinearIssueFromBranch: vi.fn().mockResolvedValue(null),
+	// Default: every read returns null so the inline-edit / preview "snapshot
+	// not found" branch is hit; tests that exercise the happy path override.
+	mockReadReferenceFromBranch: vi.fn().mockResolvedValue(null),
 	mockReadNoteFromBranch: vi.fn().mockResolvedValue(null),
 	mockReadPlanFromBranch: vi.fn().mockResolvedValue(null),
 	mockReadTranscriptsForCommits: vi.fn().mockResolvedValue(new Map()),
 	mockSaveTranscriptsBatch: vi.fn().mockResolvedValue(undefined),
+	mockStoreReferences: vi.fn().mockResolvedValue(undefined),
 	mockStoreNotes: vi.fn().mockResolvedValue(undefined),
 	mockStorePlans: vi.fn().mockResolvedValue(undefined),
 	mockStoreSummary: vi.fn().mockResolvedValue(undefined),
@@ -194,11 +205,12 @@ const {
 
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	getTranscriptHashes: mockGetTranscriptHashes,
-	readLinearIssueFromBranch: mockReadLinearIssueFromBranch,
+	readReferenceFromBranch: mockReadReferenceFromBranch,
 	readNoteFromBranch: mockReadNoteFromBranch,
 	readPlanFromBranch: mockReadPlanFromBranch,
 	readTranscriptsForCommits: mockReadTranscriptsForCommits,
 	saveTranscriptsBatch: mockSaveTranscriptsBatch,
+	storeReferences: mockStoreReferences,
 	storeNotes: mockStoreNotes,
 	storePlans: mockStorePlans,
 	storeSummary: mockStoreSummary,
@@ -233,14 +245,6 @@ const { mockCorePushSummaryToLocal } = vi.hoisted(() => ({
 
 vi.mock("../../../cli/src/core/LocalPusher.js", () => ({
 	pushSummaryToLocal: mockCorePushSummaryToLocal,
-}));
-
-const { mockExistsSync } = vi.hoisted(() => ({
-	mockExistsSync: vi.fn().mockReturnValue(true),
-}));
-
-vi.mock("node:fs", () => ({
-	existsSync: mockExistsSync,
 }));
 
 vi.mock("../../package.json", () => ({ version: "0.90.0" }));
@@ -287,12 +291,12 @@ vi.mock("../core/NoteService.js", () => ({
 	ignoreNote: mockIgnoreNote,
 }));
 
-const { mockSetLinearIssueIgnored } = vi.hoisted(() => ({
-	mockSetLinearIssueIgnored: vi.fn().mockResolvedValue(undefined),
+const { mockSetReferenceIgnored } = vi.hoisted(() => ({
+	mockSetReferenceIgnored: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock("../core/LinearIssueService.js", () => ({
-	setLinearIssueIgnored: mockSetLinearIssueIgnored,
+vi.mock("../core/ReferenceService.js", () => ({
+	setReferenceIgnored: mockSetReferenceIgnored,
 }));
 
 const {
@@ -585,6 +589,29 @@ const stubBridge = {
 				? (mockStoreNotes(noteFiles, message, workspaceRoot) as Promise<void>)
 				: (mockStoreNotes(
 						noteFiles,
+						message,
+						workspaceRoot,
+						branch,
+					) as Promise<void>),
+	),
+	storeReferences: vi.fn(
+		(
+			entityFiles: ReadonlyArray<{
+				archivedKey: string;
+				source: string;
+				content: string;
+			}>,
+			message: string,
+			branch?: string,
+		): Promise<void> =>
+			branch === undefined
+				? (mockStoreReferences(
+						entityFiles,
+						message,
+						workspaceRoot,
+					) as Promise<void>)
+				: (mockStoreReferences(
+						entityFiles,
 						message,
 						workspaceRoot,
 						branch,
@@ -2222,7 +2249,7 @@ describe("SummaryWebviewPanel", () => {
 				humanTurns: 3,
 				plansCount: 0,
 				notesCount: 0,
-				linearCount: 0,
+				referenceCountsBySource: {} as const,
 			});
 			const stubUpdated = () =>
 				makeSummary({
@@ -2335,7 +2362,7 @@ describe("SummaryWebviewPanel", () => {
 					humanTurns: 3,
 					plansCount: 0,
 					notesCount: 0,
-					linearCount: 0,
+					referenceCountsBySource: {},
 				});
 				mockLoadConfig.mockResolvedValueOnce({ apiKey: "k", model: "haiku" });
 				showWarningMessage.mockResolvedValueOnce(undefined);
@@ -2361,7 +2388,7 @@ describe("SummaryWebviewPanel", () => {
 					humanTurns: 0,
 					plansCount: 0,
 					notesCount: 0,
-					linearCount: 0,
+					referenceCountsBySource: {},
 				});
 				mockLoadConfig.mockResolvedValueOnce({ apiKey: "k", model: "haiku" });
 				showWarningMessage.mockResolvedValueOnce(undefined);
@@ -2423,7 +2450,7 @@ describe("SummaryWebviewPanel", () => {
 					humanTurns: 1,
 					plansCount: 0,
 					notesCount: 0,
-					linearCount: 0,
+					referenceCountsBySource: {},
 				});
 				showWarningMessage.mockResolvedValueOnce(undefined);
 				const dispatch = await setupPanel();
@@ -2439,7 +2466,7 @@ describe("SummaryWebviewPanel", () => {
 			});
 
 			it("includes only the plans line when plans is the sole attached artifact", async () => {
-				// Covers the false branches of the notesCount / linearCount
+				// Covers the false branches of the notesCount / referenceCountsBySource
 				// conditionals inside buildRegenerateConfirmDetail.
 				mockLoadRegenerateContext.mockResolvedValue({
 					entryCount: 5,
@@ -2448,7 +2475,7 @@ describe("SummaryWebviewPanel", () => {
 					humanTurns: 2,
 					plansCount: 1,
 					notesCount: 0,
-					linearCount: 0,
+					referenceCountsBySource: {},
 				});
 				showWarningMessage.mockResolvedValueOnce(undefined);
 				const dispatch = await setupPanel();
@@ -2470,7 +2497,7 @@ describe("SummaryWebviewPanel", () => {
 					humanTurns: 2,
 					plansCount: 2,
 					notesCount: 1,
-					linearCount: 3,
+					referenceCountsBySource: { linear: 3 },
 				});
 				showWarningMessage.mockResolvedValueOnce(undefined);
 				const dispatch = await setupPanel();
@@ -2528,7 +2555,7 @@ describe("SummaryWebviewPanel", () => {
 					humanTurns: 1,
 					plansCount: 0,
 					notesCount: 0,
-					linearCount: 0,
+					referenceCountsBySource: {},
 				});
 				showWarningMessage.mockResolvedValueOnce(undefined);
 				const dispatch = await setupPanel();
@@ -7025,32 +7052,22 @@ describe("SummaryWebviewPanel", () => {
 			});
 		});
 
-		// ── Linear issue handlers ────────────────────────────────────────────
+		// ── Entity handlers (multi-source: Linear / Jira / GitHub / Notion) ──
 		//
 		// Mirrors the removePlan / removeNote test shape but exercises the
-		// three new commands wired in the message-type union (openLinearIssue,
-		// openLinearIssueMarkdown, removeLinearIssue). The captured-at-commit
-		// markdown lives at `.jolli/jollimemory/linear-issues/<archivedKey>.md`
-		// — see QueueWorker.associateLinearIssuesWithCommit.
+		// source-agnostic *Entity commands. Choice A: every source — including
+		// Linear — flows through the same handler set (previewEntity /
+		// openEntityExternal / loadEntityContent / saveEntityEdit /
+		// removeEntity / translateEntity). The host dispatches by `source`
+		// where behaviour genuinely differs (Linear keeps a legacy local-disk
+		// fast-path under `.jolli/jollimemory/linear-issues/`).
 
-		describe("openLinearIssue", () => {
+		describe("openReferenceExternal", () => {
 			it("opens the upstream URL via vscode.env.openExternal", async () => {
-				const dispatch = await setupPanel({
-					linearIssues: [
-						{
-							archivedKey: "PROJ-1-aaaaaaaa",
-							ticketId: "PROJ-1",
-							title: "T",
-							url: "https://linear.app/x/issue/PROJ-1/test",
-							referencedAt: "x",
-							sourceToolName: "mcp__linear__get_issue",
-						},
-					],
-				});
+				const dispatch = await setupPanel();
 
 				dispatch({
-					command: "openLinearIssue",
-					archivedKey: "PROJ-1-aaaaaaaa",
+					command: "openReferenceExternal",
 					url: "https://linear.app/x/issue/PROJ-1/test",
 				});
 				await flushPromises();
@@ -7063,91 +7080,114 @@ describe("SummaryWebviewPanel", () => {
 			it("no-ops when url is empty (defensive against missing data-attr)", async () => {
 				const dispatch = await setupPanel();
 
-				dispatch({
-					command: "openLinearIssue",
-					archivedKey: "PROJ-1-aaaaaaaa",
-					url: "",
-				});
+				dispatch({ command: "openReferenceExternal", url: "" });
 				await flushPromises();
 
 				expect(openExternal).not.toHaveBeenCalled();
 			});
-		});
 
-		describe("openLinearIssueMarkdown", () => {
-			it("opens the local archived markdown file when it exists at .jolli/jollimemory/linear-issues", async () => {
-				// Local file exists → fast path: open it directly via showTextDocument,
-				// no orphan-branch read needed.
-				mockExistsSync.mockReturnValue(true);
+			it("refuses to open non-http(s) URLs (defense-in-depth against tainted data-reference-url)", async () => {
+				// The row's data-reference-url is bounded by ^https?:// at the
+				// SourceAdapter, but flows through plans.json (a user-editable
+				// file). Re-validate at the sink — `javascript:` / `data:` /
+				// `file:` must never reach openExternal.
 				const dispatch = await setupPanel();
 
 				dispatch({
-					command: "openLinearIssueMarkdown",
-					archivedKey: "PROJ-1-aaaaaaaa",
+					command: "openReferenceExternal",
+					url: "javascript:alert(1)",
 				});
 				await flushPromises();
 
-				expect(showTextDocument).toHaveBeenCalledTimes(1);
-				const uriArg = showTextDocument.mock.calls[0][0] as {
-					fsPath: string;
-				};
-				// Path layout follows QueueWorker.associateLinearIssuesWithCommit
-				// (rename to <ticketId>-<shortHash>.md inside the linear-issues dir).
-				expect(uriArg.fsPath).toContain("linear-issues");
-				expect(uriArg.fsPath).toContain("PROJ-1-aaaaaaaa.md");
-				// Fast path must not touch the orphan branch.
-				expect(mockReadLinearIssueFromBranch).not.toHaveBeenCalled();
+				expect(openExternal).not.toHaveBeenCalled();
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("javascript:alert(1)"),
+				);
 			});
+		});
 
-			it("falls back to the orphan-branch snapshot when the local file is missing (clean checkout / cleanup scenario)", async () => {
-				// Regression: pre-fix the handler called showTextDocument on a
-				// nonexistent path → user got a VSCode error toast and thought
-				// the snapshot was lost, even though the archived content
-				// lives durably on the orphan branch (and in Memory Bank).
-				mockExistsSync.mockReturnValue(false);
-				mockReadLinearIssueFromBranch.mockResolvedValueOnce(
+		describe("previewReference", () => {
+			// Core principle: once an entity is associated with a commit, the
+			// orphan branch is the system of record. `.jolli/jollimemory/` is
+			// never consulted by previewEntity for any source. Linear is
+			// treated identically to Jira / GitHub / Notion; legacy
+			// `linear-issues/<bare>.md` fallback lives inside
+			// `SummaryStore.readReferenceFromBranch`, not in the panel handler.
+
+			it("Linear: reads the snapshot from the orphan branch", async () => {
+				mockReadReferenceFromBranch.mockResolvedValueOnce(
 					'---\nticketId: "PROJ-1"\n---\nbody from orphan branch',
 				);
 				openTextDocument.mockClear();
 				const dispatch = await setupPanel();
 
 				dispatch({
-					command: "openLinearIssueMarkdown",
-					archivedKey: "PROJ-1-aaaaaaaa",
+					command: "previewReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+					nativeId: "PROJ-1",
+					title: "T",
 				});
 				await flushPromises();
 
-				expect(mockReadLinearIssueFromBranch).toHaveBeenCalledWith(
-					"PROJ-1-aaaaaaaa",
+				expect(mockReadReferenceFromBranch).toHaveBeenCalledWith(
+					"linear",
+					"linear:PROJ-1-aaaaaaaa",
 					workspaceRoot,
+					undefined,
 				);
 				// Opens an untitled markdown doc with the orphan-branch content
-				// — does NOT re-materialize the local file (user / cleanup may
-				// have deleted it intentionally; orphan branch stays the
-				// source of truth for archived snapshots).
+				// — does NOT re-materialize the local file. Orphan branch is
+				// the source of truth for archived snapshots.
 				expect(openTextDocument).toHaveBeenCalledWith({
 					language: "markdown",
 					content: '---\nticketId: "PROJ-1"\n---\nbody from orphan branch',
 				});
 			});
 
-			it("shows an error when both local and orphan-branch lookups miss", async () => {
-				// Defensive: archivedKey was passed in but no snapshot anywhere.
-				// User gets an explicit error instead of a silent no-op so
-				// they understand "this snapshot is genuinely gone, not just
-				// not-yet-loaded".
-				mockExistsSync.mockReturnValue(false);
-				mockReadLinearIssueFromBranch.mockResolvedValueOnce(null);
+			it("Jira: reads the snapshot from the orphan branch", async () => {
+				mockReadReferenceFromBranch.mockResolvedValueOnce(
+					"# KAN-5\n\nJira ticket body",
+				);
+				openTextDocument.mockClear();
 				const dispatch = await setupPanel();
 
 				dispatch({
-					command: "openLinearIssueMarkdown",
-					archivedKey: "PROJ-MISSING-12345678",
+					command: "previewReference",
+					archivedKey: "jira:KAN-5-aaaa1111",
+					source: "jira",
+					nativeId: "KAN-5",
+					title: "Jira ticket",
+				});
+				await flushPromises();
+
+				expect(mockReadReferenceFromBranch).toHaveBeenCalledWith(
+					"jira",
+					"jira:KAN-5-aaaa1111",
+					workspaceRoot,
+					undefined,
+				);
+				expect(openTextDocument).toHaveBeenCalledWith({
+					language: "markdown",
+					content: "# KAN-5\n\nJira ticket body",
+				});
+			});
+
+			it("shows an error when the orphan-branch lookup misses", async () => {
+				mockReadReferenceFromBranch.mockResolvedValueOnce(null);
+				const dispatch = await setupPanel();
+
+				dispatch({
+					command: "previewReference",
+					archivedKey: "linear:PROJ-MISSING-12345678",
+					source: "linear",
+					nativeId: "PROJ-MISSING",
+					title: "Missing",
 				});
 				await flushPromises();
 
 				expect(showErrorMessage).toHaveBeenCalledWith(
-					expect.stringContaining("PROJ-MISSING-12345678"),
+					expect.stringContaining("PROJ-MISSING"),
 				);
 				expect(showTextDocument).not.toHaveBeenCalled();
 			});
@@ -7155,30 +7195,123 @@ describe("SummaryWebviewPanel", () => {
 			it("no-ops when archivedKey is empty", async () => {
 				const dispatch = await setupPanel();
 
-				dispatch({ command: "openLinearIssueMarkdown", archivedKey: "" });
+				dispatch({
+					command: "previewReference",
+					archivedKey: "",
+					source: "linear",
+					nativeId: "",
+					title: "",
+				});
 				await flushPromises();
 
 				expect(showTextDocument).not.toHaveBeenCalled();
-				expect(mockReadLinearIssueFromBranch).not.toHaveBeenCalled();
+				expect(mockReadReferenceFromBranch).not.toHaveBeenCalled();
 			});
 		});
 
-		describe("removeLinearIssue", () => {
-			it("confirms and dissociates the issue from this commit", async () => {
+		describe("loadEntityContent (inline-edit loader, mirrors loadPlanContent)", () => {
+			it("reads from orphan branch and posts referenceContentLoaded back to the webview", async () => {
+				mockReadReferenceFromBranch.mockResolvedValueOnce(
+					"# Edited body\n\nEntity content.",
+				);
+				const dispatch = await setupPanel();
+
+				dispatch({
+					command: "loadReferenceContent",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+				});
+				await flushPromises();
+
+				expect(mockReadReferenceFromBranch).toHaveBeenCalledWith(
+					"linear",
+					"linear:PROJ-1-aaaaaaaa",
+					workspaceRoot,
+					undefined,
+				);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "referenceContentLoaded",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+					content: "# Edited body\n\nEntity content.",
+				});
+			});
+
+			it("does NOT open the inline editor when orphan-branch read returns null (avoids overwriting on Save)", async () => {
+				mockReadReferenceFromBranch.mockResolvedValueOnce(null);
+				const dispatch = await setupPanel();
+				postMessage.mockClear();
+
+				dispatch({
+					command: "loadReferenceContent",
+					archivedKey: "linear:PROJ-MISSING",
+					source: "linear",
+				});
+				await flushPromises();
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("PROJ-MISSING"),
+				);
+				// Must not surface a `referenceContentLoaded` message — otherwise
+				// the webview opens the textarea empty, and a Save would
+				// silently overwrite the orphan-branch snapshot with "".
+				const loadedCalls = postMessage.mock.calls.filter(
+					(c) =>
+						(c[0] as { command?: string })?.command === "referenceContentLoaded",
+				);
+				expect(loadedCalls).toHaveLength(0);
+			});
+		});
+
+		describe("saveReferenceEdit", () => {
+			it("writes back to the orphan branch via bridge.storeReferences", async () => {
+				const dispatch = await setupPanel();
+
+				dispatch({
+					command: "saveReferenceEdit",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+					content: "# Updated\n\nNew body.",
+				});
+				await flushPromises();
+
+				expect(mockStoreReferences).toHaveBeenCalledWith(
+					[
+						{
+							archivedKey: "linear:PROJ-1-aaaaaaaa",
+							source: "linear",
+							content: "# Updated\n\nNew body.",
+						},
+					],
+					expect.stringContaining("Edit linear reference"),
+					workspaceRoot,
+				);
+				expect(postMessage).toHaveBeenCalledWith({
+					command: "referenceSaved",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+				});
+			});
+		});
+
+		describe("removeReference", () => {
+			it("confirms and dissociates the reference from this commit", async () => {
 				showWarningMessage.mockResolvedValue("Remove");
 				const dispatch = await setupPanel({
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "PROJ-1-aaaaaaaa",
-							ticketId: "PROJ-1",
+							archivedKey: "linear:PROJ-1-aaaaaaaa",
+							source: "linear",
+							nativeId: "PROJ-1",
 							title: "T1",
 							url: "https://linear.app/x/issue/PROJ-1/test",
 							referencedAt: "x",
 							sourceToolName: "mcp__linear__get_issue",
 						},
 						{
-							archivedKey: "PROJ-2-aaaaaaaa",
-							ticketId: "PROJ-2",
+							archivedKey: "linear:PROJ-2-aaaaaaaa",
+							source: "linear",
+							nativeId: "PROJ-2",
 							title: "T2",
 							url: "https://linear.app/x/issue/PROJ-2/test",
 							referencedAt: "x",
@@ -7188,33 +7321,28 @@ describe("SummaryWebviewPanel", () => {
 				});
 
 				dispatch({
-					command: "removeLinearIssue",
-					archivedKey: "PROJ-1-aaaaaaaa",
-					ticketId: "PROJ-1",
+					command: "removeReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+					nativeId: "PROJ-1",
+					title: "T1",
 				});
 				await flushPromises();
 
 				expect(showWarningMessage).toHaveBeenCalledWith(
-					'Remove Linear issue "PROJ-1" from this commit?',
+					'Remove Linear reference "T1" from this commit?',
 					expect.objectContaining({ modal: true }),
 					"Remove",
 				);
-				// Both snapshot key and ticketId guard key get marked ignored so
-				// the issue stays hidden from the sidebar panel after dissociate.
-				expect(mockSetLinearIssueIgnored).toHaveBeenCalledWith(
+				expect(mockSetReferenceIgnored).toHaveBeenCalledWith(
 					workspaceRoot,
-					"PROJ-1-aaaaaaaa",
-					true,
-				);
-				expect(mockSetLinearIssueIgnored).toHaveBeenCalledWith(
-					workspaceRoot,
-					"PROJ-1",
+					"linear:PROJ-1-aaaaaaaa",
 					true,
 				);
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({
-						linearIssues: [
-							expect.objectContaining({ archivedKey: "PROJ-2-aaaaaaaa" }),
+						references: [
+							expect.objectContaining({ archivedKey: "linear:PROJ-2-aaaaaaaa" }),
 						],
 					}),
 					workspaceRoot,
@@ -7222,13 +7350,14 @@ describe("SummaryWebviewPanel", () => {
 				);
 			});
 
-			it("clears linearIssues field when last issue is removed", async () => {
+			it("clears the references field when the last reference is removed", async () => {
 				showWarningMessage.mockResolvedValue("Remove");
 				const dispatch = await setupPanel({
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "PROJ-9-bbbbbbbb",
-							ticketId: "PROJ-9",
+							archivedKey: "linear:PROJ-9-bbbbbbbb",
+							source: "linear",
+							nativeId: "PROJ-9",
 							title: "Only",
 							url: "https://linear.app/x/issue/PROJ-9/test",
 							referencedAt: "x",
@@ -7238,14 +7367,16 @@ describe("SummaryWebviewPanel", () => {
 				});
 
 				dispatch({
-					command: "removeLinearIssue",
-					archivedKey: "PROJ-9-bbbbbbbb",
-					ticketId: "PROJ-9",
+					command: "removeReference",
+					archivedKey: "linear:PROJ-9-bbbbbbbb",
+					source: "linear",
+					nativeId: "PROJ-9",
+					title: "Only",
 				});
 				await flushPromises();
 
 				expect(mockStoreSummary).toHaveBeenCalledWith(
-					expect.objectContaining({ linearIssues: undefined }),
+					expect.objectContaining({ references: undefined }),
 					workspaceRoot,
 					true,
 				);
@@ -7254,10 +7385,11 @@ describe("SummaryWebviewPanel", () => {
 			it("does nothing when user cancels the confirmation", async () => {
 				showWarningMessage.mockResolvedValue(undefined);
 				const dispatch = await setupPanel({
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "PROJ-1-aaaaaaaa",
-							ticketId: "PROJ-1",
+							archivedKey: "linear:PROJ-1-aaaaaaaa",
+							source: "linear",
+							nativeId: "PROJ-1",
 							title: "T",
 							url: "https://linear.app/x/issue/PROJ-1/test",
 							referencedAt: "x",
@@ -7267,42 +7399,43 @@ describe("SummaryWebviewPanel", () => {
 				});
 
 				dispatch({
-					command: "removeLinearIssue",
-					archivedKey: "PROJ-1-aaaaaaaa",
-					ticketId: "PROJ-1",
+					command: "removeReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+					nativeId: "PROJ-1",
+					title: "T",
 				});
 				await flushPromises();
 
-				expect(mockSetLinearIssueIgnored).not.toHaveBeenCalled();
+				expect(mockSetReferenceIgnored).not.toHaveBeenCalled();
 				expect(mockStoreSummary).not.toHaveBeenCalled();
 			});
 
-			it("returns early when summary has no linear issues", async () => {
-				const dispatch = await setupPanel(); // no linearIssues
+			it("returns early when summary has no references", async () => {
+				const dispatch = await setupPanel(); // no references
 				vi.clearAllMocks();
 
 				dispatch({
-					command: "removeLinearIssue",
-					archivedKey: "PROJ-1-aaaaaaaa",
-					ticketId: "PROJ-1",
+					command: "removeReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+					nativeId: "PROJ-1",
+					title: "T",
 				});
 				await flushPromises();
 
 				expect(showWarningMessage).not.toHaveBeenCalled();
-				expect(mockSetLinearIssueIgnored).not.toHaveBeenCalled();
+				expect(mockSetReferenceIgnored).not.toHaveBeenCalled();
 			});
 
-			it("skips the duplicate-key ignore call when ticketId equals archivedKey", async () => {
-				// Defensive guard: if ticketId happens to equal archivedKey (would
-				// be an invariant violation, but we don't crash on it), the second
-				// setLinearIssueIgnored call must be suppressed to avoid an
-				// extra no-op write.
+			it("returns early when archivedKey not in summary.references", async () => {
 				showWarningMessage.mockResolvedValue("Remove");
 				const dispatch = await setupPanel({
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "PROJ-1",
-							ticketId: "PROJ-1",
+							archivedKey: "linear:PROJ-1",
+							source: "linear",
+							nativeId: "PROJ-1",
 							title: "T",
 							url: "https://linear.app/x/issue/PROJ-1/test",
 							referencedAt: "x",
@@ -7312,13 +7445,140 @@ describe("SummaryWebviewPanel", () => {
 				});
 
 				dispatch({
-					command: "removeLinearIssue",
-					archivedKey: "PROJ-1",
-					ticketId: "PROJ-1",
+					command: "removeReference",
+					archivedKey: "linear:NOT-IN-LIST",
+					source: "linear",
+					nativeId: "NOT-IN-LIST",
+					title: "X",
 				});
 				await flushPromises();
 
-				expect(mockSetLinearIssueIgnored).toHaveBeenCalledTimes(1);
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				expect(mockSetReferenceIgnored).not.toHaveBeenCalled();
+			});
+
+			it("non-Linear source: dissociates a Jira reference uniformly via the same handler", async () => {
+				showWarningMessage.mockResolvedValue("Remove");
+				const dispatch = await setupPanel({
+					references: [
+						{
+							archivedKey: "jira:KAN-5-aaaa1111",
+							source: "jira",
+							nativeId: "KAN-5",
+							title: "Jira ticket",
+							url: "https://example.atlassian.net/browse/KAN-5",
+							referencedAt: "x",
+							sourceToolName: "mcp__claude_ai_Atlassian__getJiraIssue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "removeReference",
+					archivedKey: "jira:KAN-5-aaaa1111",
+					source: "jira",
+					nativeId: "KAN-5",
+					title: "Jira ticket",
+				});
+				await flushPromises();
+
+				expect(mockSetReferenceIgnored).toHaveBeenCalledWith(
+					workspaceRoot,
+					"jira:KAN-5-aaaa1111",
+					true,
+				);
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ references: undefined }),
+					workspaceRoot,
+					true,
+				);
+			});
+		});
+
+		describe("translateReference", () => {
+			it("translates the archived markdown and writes the result back via storeReferences", async () => {
+				mockReadReferenceFromBranch.mockResolvedValueOnce(
+					"# 中文标题\n\n中文内容",
+				);
+				mockTranslateToEnglish.mockResolvedValueOnce(
+					"# English Title\n\nEnglish body",
+				);
+				const dispatch = await setupPanel({
+					references: [
+						{
+							archivedKey: "linear:PROJ-1-aaaaaaaa",
+							source: "linear",
+							nativeId: "PROJ-1",
+							title: "中文标题",
+							url: "https://linear.app/x/issue/PROJ-1",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "translateReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+				});
+				await flushPromises();
+
+				expect(mockTranslateToEnglish).toHaveBeenCalledTimes(1);
+				expect(mockStoreReferences).toHaveBeenCalledWith(
+					[
+						{
+							archivedKey: "linear:PROJ-1-aaaaaaaa",
+							source: "linear",
+							content: "# English Title\n\nEnglish body",
+						},
+					],
+					expect.stringContaining("Translate linear reference"),
+					workspaceRoot,
+				);
+				// Webview gets a translating-on / translated-off message pair so
+				// the 🌐 button reflects the in-flight LLM state.
+				const messages = postMessage.mock.calls.map(
+					(c) => (c[0] as { command: string }).command,
+				);
+				expect(messages).toContain("referenceTranslating");
+				expect(messages).toContain("referenceTranslated");
+			});
+
+			it("short-circuits with a toast when the entity is already in English (no LLM call, no write)", async () => {
+				mockReadReferenceFromBranch.mockResolvedValueOnce(
+					"# English Title\n\nAll English here.",
+				);
+				const dispatch = await setupPanel({
+					references: [
+						{
+							archivedKey: "linear:PROJ-1-aaaaaaaa",
+							source: "linear",
+							nativeId: "PROJ-1",
+							title: "English Title",
+							url: "https://linear.app/x/issue/PROJ-1",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+				vi.clearAllMocks();
+				mockReadReferenceFromBranch.mockResolvedValueOnce(
+					"# English Title\n\nAll English here.",
+				);
+
+				dispatch({
+					command: "translateReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+				});
+				await flushPromises();
+
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("already in English"),
+				);
+				expect(mockTranslateToEnglish).not.toHaveBeenCalled();
+				expect(mockStoreReferences).not.toHaveBeenCalled();
 			});
 		});
 
@@ -8931,7 +9191,7 @@ describe("SummaryWebviewPanel", () => {
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
-		it("blocks remove Linear issue via the race-window re-check after confirm", async () => {
+		it("blocks remove entity (Linear-archived) via the race-window re-check after confirm", async () => {
 			(stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>)
 				.mockResolvedValueOnce(new Map())
 				.mockResolvedValueOnce(
@@ -8945,12 +9205,15 @@ describe("SummaryWebviewPanel", () => {
 			await SummaryWebviewPanel.show(
 				makeSummary({
 					commitHash: "abc123",
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "linear-issues/ENG-123.md",
-							ticketId: "ENG-123",
+							archivedKey: "linear:ENG-123-aaaa1111",
+							source: "linear",
+							nativeId: "ENG-123",
 							title: "Issue 1",
 							url: "https://linear.app/team/issue/ENG-123",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
 						},
 					],
 				}),
@@ -8961,13 +9224,15 @@ describe("SummaryWebviewPanel", () => {
 			);
 			const dispatch = captureMessageHandler();
 			dispatch({
-				command: "removeLinearIssue",
-				archivedKey: "linear-issues/ENG-123.md",
-				ticketId: "ENG-123",
+				command: "removeReference",
+				archivedKey: "linear:ENG-123-aaaa1111",
+				source: "linear",
+				nativeId: "ENG-123",
+				title: "Issue 1",
 			});
 			await flushPromises();
 
-			expectStaleModalShown("remove Linear issue");
+			expectStaleModalShown("remove reference");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -9054,7 +9319,7 @@ describe("SummaryWebviewPanel", () => {
 				humanTurns: 1,
 				plansCount: 0,
 				notesCount: 0,
-				linearCount: 0,
+				referenceCountsBySource: {},
 			});
 			showWarningMessage.mockResolvedValueOnce("Regenerate");
 			mockRegenerateSummary.mockResolvedValue({
@@ -9093,7 +9358,7 @@ describe("SummaryWebviewPanel", () => {
 				humanTurns: 1,
 				plansCount: 0,
 				notesCount: 0,
-				linearCount: 0,
+				referenceCountsBySource: {},
 			});
 			showWarningMessage.mockResolvedValueOnce("Regenerate");
 			const dispatch = await setupCommit("abc123");
@@ -9229,7 +9494,7 @@ describe("SummaryWebviewPanel", () => {
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
-		it("blocks remove Linear issue BEFORE confirm + storeSummary", async () => {
+		it("blocks remove entity (Linear-archived) BEFORE confirm + storeSummary", async () => {
 			(
 				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
 			).mockResolvedValue(
@@ -9241,10 +9506,11 @@ describe("SummaryWebviewPanel", () => {
 			await SummaryWebviewPanel.show(
 				makeSummary({
 					commitHash: "abc123",
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "JOLLI-1-abc",
-							ticketId: "JOLLI-1",
+							archivedKey: "linear:JOLLI-1-abc",
+							source: "linear",
+							nativeId: "JOLLI-1",
 							title: "T",
 							url: "https://linear.app/x",
 							referencedAt: "2026-01-01T00:00:00Z",
@@ -9260,13 +9526,15 @@ describe("SummaryWebviewPanel", () => {
 			const dispatch = captureMessageHandler();
 
 			dispatch({
-				command: "removeLinearIssue",
-				archivedKey: "JOLLI-1-abc",
-				ticketId: "JOLLI-1",
+				command: "removeReference",
+				archivedKey: "linear:JOLLI-1-abc",
+				source: "linear",
+				nativeId: "JOLLI-1",
+				title: "T",
 			});
 			await flushPromises();
 
-			expectStaleModalShown("remove Linear issue");
+			expectStaleModalShown("remove reference");
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
@@ -9759,7 +10027,7 @@ describe("SummaryWebviewPanel", () => {
 			expect(mockStoreSummary).not.toHaveBeenCalled();
 		});
 
-		it("race-window: blocks remove Linear issue if amend lands while confirm modal is open", async () => {
+		it("race-window: blocks remove entity (Linear-archived) if amend lands while confirm modal is open", async () => {
 			const rootMap = buildChainEntryMap([{ hash: "abc123", parent: null }]);
 			const rewrittenMap = buildChainEntryMap([
 				{ hash: "abc123", parent: "rootnew0" },
@@ -9774,7 +10042,7 @@ describe("SummaryWebviewPanel", () => {
 			await SummaryWebviewPanel.show(
 				makeSummary({
 					commitHash: "abc123",
-					linearIssues: [
+					references: [
 						{
 							ticketId: "ENG-1",
 							url: "https://linear.app/x/issue/ENG-1",
@@ -9792,9 +10060,11 @@ describe("SummaryWebviewPanel", () => {
 			const dispatch = captureMessageHandler();
 
 			dispatch({
-				command: "removeLinearIssue",
+				command: "removeReference",
 				archivedKey: "k",
-				ticketId: "ENG-1",
+				source: "linear",
+				nativeId: "ENG-1",
+				title: "Test issue",
 			});
 			await flushPromises();
 

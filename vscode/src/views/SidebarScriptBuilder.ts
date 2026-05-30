@@ -20,12 +20,18 @@
  */
 
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
+import { SOURCE_TITLES } from "./SourceLabels.js";
 
 export function buildSidebarScript(): string {
 	return `
   ${buildContextMenuGuardScript()}
 
   const vscode = acquireVsCodeApi();
+
+  // Source display labels (Linear / Jira / GitHub / Notion) — injected from host
+  // so webview JS doesn't hardcode the source list. Keep in lockstep with
+  // ./SourceLabels.ts SOURCE_TITLES.
+  const SOURCE_TITLES = ${JSON.stringify(SOURCE_TITLES)};
 
   // Empty-state strings — populated from a JSON <script> tag injected by HtmlBuilder
   // (Task 35 will fully wire this; for now we read it tolerantly with fallbacks).
@@ -1897,15 +1903,25 @@ export function buildSidebarScript(): string {
     return kids;
   }
 
-  // Renders the .hover-card body for a Linear issue row. Mirrors
-  // renderHoverCard's shape (hc-title + hc-row stack + hc-actions) so the
-  // shared popover element (#memory-hover) and its CSS work unchanged. The
-  // Linear card swaps the commit-specific fields (date / commitType / branch
-  // / statsLine / hash) for ticket-specific fields (status / priority /
-  // labels / description preview / Open-in-Linear link).
-  function renderLinearHoverCard(mapKey, h) {
+  // Renders the .hover-card body for a multi-source reference row (Linear /
+  // Jira / GitHub / Notion). Mirrors renderHoverCard's shape (hc-title +
+  // hc-row stack + hc-actions) so the shared popover element (#memory-hover)
+  // and its CSS work unchanged. The card swaps the commit-specific fields
+  // (date / commitType / branch / statsLine / hash) for reference-specific
+  // fields (source badge, status / priority / labels / Open-in-<Source> link).
+  function renderReferenceHoverCard(mapKey, h) {
     if (!h) return null;
-    const kids = [el('div', { className: 'hc-title', text: h.title })];
+    // Title row: bold title plus a tiny source badge so the user can tell
+    // at a glance which provider the reference came from (L / J / GH / N).
+    // Per-source colour is intentionally NOT applied — the Linear-only
+    // ancestor of this card explicitly rejected brand tints to keep rows
+    // visually uniform; the badge alone is the minimum-viable surfacing.
+    const sourceLabel = ({ linear: 'L', jira: 'J', github: 'GH', notion: 'N' })[h.source] || (h.source || '').slice(0, 2).toUpperCase();
+    const titleRow = el('div', { className: 'hc-title' }, [
+      el('span', { className: 'hc-source-badge', text: sourceLabel }),
+      el('span', { text: h.title }),
+    ]);
+    const kids = [titleRow];
     if (h.status) {
       kids.push(el('div', { className: 'hc-row' }, [
         el('i', { className: 'codicon codicon-circle-large-filled' }),
@@ -1924,26 +1940,28 @@ export function buildSidebarScript(): string {
         el('span', { text: h.labels }),
       ]));
     }
-    // Description preview removed — see LinearIssueItem comment for why.
-    // The Open-in-Linear action below is the way to see the full body.
+    // assignees / milestone / entityType are reserved on ReferenceHover but
+    // not populated by the current ReferenceService frontmatter parser. When a
+    // follow-up enrichment pass populates them, render rows here.
+    // Description preview is intentionally not surfaced — see PlansTreeProvider
+    // ReferenceItem comment for the rationale.
     kids.push(el('hr'));
-    // Single action row: Open in Linear. The trash / open-markdown actions
+    // Single action row: Open in <Source>. The trash / open-markdown actions
     // already live as inline buttons on the row itself (see renderPlanRow),
-    // so the card stays focused on jumping to the upstream ticket. Reuse
-    // the data-cmd / data-hash dispatch the memory card already uses
-    // (the hoverCardEl click handler routes [data-cmd][data-hash] to
-    // vscode.postMessage{ command, args: [hash] }); the registered
-    // jollimemory.openLinearIssue command accepts a mapKey string.
+    // so the card stays focused on jumping to the upstream record.
+    const openLabel = SOURCE_TITLES[h.source]
+      ? 'Open in ' + SOURCE_TITLES[h.source]
+      : 'Open in browser';
     const openLink = attachTextTip(
       el('span', {
         className: 'hc-link',
-        'data-cmd': 'jollimemory.openLinearIssue',
+        'data-cmd': 'jollimemory.openReferenceInBrowser',
         'data-hash': mapKey,
       }, [
         el('i', { className: 'codicon codicon-link-external' }),
-        el('span', { text: 'Open in Linear' }),
+        el('span', { text: openLabel }),
       ]),
-      'Open in Linear',
+      openLabel,
     );
     kids.push(el('div', { className: 'hc-actions' }, [openLink]));
     return kids;
@@ -2148,10 +2166,10 @@ export function buildSidebarScript(): string {
     cancelHoverShow();
     scheduleHideHoverCard();
   });
-  // Plans & Notes panel (branch tab): wire plan / note / linearissue rows
-  // into the same hover-card popover that the Memories section uses. Each
-  // row type carries its own structured hover field (planHover / noteHover /
-  // linearHover) on the serialized item — the lookup returns the matching
+  // Plans & Notes panel (branch tab): wire plan / note / reference rows into
+  // the same hover-card popover that the Memories section uses. Each row
+  // type carries its own structured hover field (planHover / noteHover /
+  // referenceHover) on the serialized item — the lookup returns the matching
   // entry along with its context so the mouseover handler can pick the right
   // renderer. Plain-text tooltip on the SerializedTreeItem remains the
   // activity-bar TreeView fallback.
@@ -2161,7 +2179,7 @@ export function buildSidebarScript(): string {
       if (items[i].id !== rowId) continue;
       if (items[i].planHover) return { kind: 'plan', hover: items[i].planHover };
       if (items[i].noteHover) return { kind: 'note', hover: items[i].noteHover };
-      if (items[i].linearHover) return { kind: 'linearissue', hover: items[i].linearHover };
+      if (items[i].referenceHover) return { kind: 'reference', hover: items[i].referenceHover };
       return null;
     }
     return null;
@@ -2191,10 +2209,10 @@ export function buildSidebarScript(): string {
     const row = e.target.closest('.tree-node[data-id]');
     if (!row) return;
     const ctx = row.getAttribute('data-context');
-    // Only plan / note / linearissue rows opt into the hover card — commit
+    // Only plan / note / reference rows opt into the hover card — commit
     // rows have their own dedicated hover (see renderCommitRow + lookupHoverEntry),
     // and change rows are too dense for one.
-    if (ctx !== 'plan' && ctx !== 'note' && ctx !== 'linearissue') return;
+    if (ctx !== 'plan' && ctx !== 'note' && ctx !== 'reference') return;
     // Inline action buttons own their own visual feedback; dismiss the row
     // hover card to avoid stacking a popover on top of a button tooltip.
     if (e.target.closest('.inline-actions')) {
@@ -2207,7 +2225,7 @@ export function buildSidebarScript(): string {
     let content;
     if (found.kind === 'plan') content = renderPlanHoverCard(rowId, found.hover);
     else if (found.kind === 'note') content = renderNoteHoverCard(rowId, found.hover);
-    else content = renderLinearHoverCard(rowId, found.hover);
+    else content = renderReferenceHoverCard(rowId, found.hover);
     if (!content) return;
     scheduleShowBranchHoverCard(rowId, content, e.clientX, e.clientY);
   });
@@ -2215,7 +2233,7 @@ export function buildSidebarScript(): string {
     const row = e.target.closest('.tree-node[data-id]');
     if (!row) return;
     const ctx = row.getAttribute('data-context');
-    if (ctx !== 'plan' && ctx !== 'note' && ctx !== 'linearissue') return;
+    if (ctx !== 'plan' && ctx !== 'note' && ctx !== 'reference') return;
     const to = e.relatedTarget;
     // Stay open if mouse moved onto the card itself or stayed on the row
     // (transitioning between child spans — label / desc / icon).
@@ -2638,32 +2656,33 @@ export function buildSidebarScript(): string {
 
   function renderPlanRow(item, depth) {
     const isNote = item.contextValue === 'note';
-    // isLinearIssue is read below for the title= suppression. It was
-    // accidentally removed when the icon-color refactor went through, but
-    // the title= reference stayed — every renderPlanRow call threw
-    // ReferenceError and the Plans & Notes section rendered as empty even
-    // when plans.json had entries. Regression-tested by the "renderPlanRow
-    // suppresses native title= on linearissue rows" test in
-    // SidebarScriptBuilder.test.ts.
-    const isLinearIssue = item.contextValue === 'linearissue';
+    // isReference gates the title= suppression and the checkbox-omission guard
+    // below. The legacy isLinearIssue field was renamed alongside the
+    // ReferenceItem refactor — reference rows now cover Linear / Jira / GitHub /
+    // Notion uniformly. Regression-tested by the "renderPlanRow suppresses
+    // native title= on reference rows" test in SidebarScriptBuilder.test.ts.
+    const isReference = item.contextValue === 'reference';
     // Icon comes from the SerializedTreeItem.iconKey set by
     // PlansTreeProvider — committed entries get "lock" with charts.green,
     // uncommitted plans get "file-text", notes get "note", snippets get
-    // "comment", linear issues get "issue-opened". No row-icon recolour
-    // for Linear issues — the default text colour matches every other row
-    // and avoids a brand-specific tint that the user explicitly rejected.
+    // "comment", Linear/Jira/GitHub references get "issues", Notion
+    // pages get "file-text". No row-icon recolour for references — the
+    // default text colour matches every other row and avoids brand-specific
+    // tints that the user explicitly rejected.
     const iconKey = item.iconKey || (isNote ? 'note' : 'file-text');
     const colorClass = pickIconColorClass(item.iconColor, iconKey);
     const iconEl = el('i', {
       className: 'codicon codicon-' + iconKey + (colorClass ? ' ' + colorClass : ''),
     });
-    // Selection checkbox — only for plan and note rows; Linear-issue rows
-    // are not user-selectable (no exclusion key applies) and get no checkbox.
-    // 'data-checkbox="1"' opts into the delegated click guard so clicking
-    // the checkbox does not also open the plan or note editor.
+    // Selection checkbox — plan / note / reference rows all carry one (since
+    // panel-level reference exclusion landed). 'data-checkbox="1"' opts into the
+    // delegated click guard so clicking the checkbox does not also open the
+    // underlying editor / browser.
     // For plans: 'data-plan-id' carries the plan slug (item.id = slug from
     // PlansTreeProvider.serialize). For notes: 'data-note-id' carries the
-    // note id (item.id = note.id from the same serialize path).
+    // note id. For references: 'data-reference-key' carries the
+    // source:nativeId mapKey (item.id = reference.mapKey from the same
+    // serialize path).
     let rowCheck = null;
     if (isNote) {
       const noteCb = el('input', {
@@ -2674,7 +2693,16 @@ export function buildSidebarScript(): string {
       });
       noteCb.checked = !!item.isSelected;
       rowCheck = noteCb;
-    } else if (!isLinearIssue) {
+    } else if (isReference) {
+      const referenceCb = el('input', {
+        type: 'checkbox',
+        className: 'jm-reference-check',
+        'data-checkbox': '1',
+        'data-reference-key': item.id,
+      });
+      referenceCb.checked = !!item.isSelected;
+      rowCheck = referenceCb;
+    } else {
       const planCb = el('input', {
         type: 'checkbox',
         className: 'jm-plan-check',
@@ -2684,10 +2712,9 @@ export function buildSidebarScript(): string {
       planCb.checked = !!item.isSelected;
       rowCheck = planCb;
     }
-    // Wrap checkbox in .row-leading so plan/note rows share the same fixed
-    // 18px leading slot as Changes rows — column-aligns across sections.
-    // Linear-issue rows have no checkbox but still get an empty slot so they
-    // stay column-aligned with their sibling plan/note rows in the same list.
+    // Wrap checkbox in .row-leading so plan / note / reference rows share the
+    // same fixed 18px leading slot as Changes rows — column-aligns across
+    // sections.
     const kids = [
       el('span', { className: 'twirl' }),
       el('span', { className: 'row-leading' }, rowCheck ? [rowCheck] : []),
@@ -2716,7 +2743,7 @@ export function buildSidebarScript(): string {
       ]),
     );
     // Suppress the native title= on every row type that drives the .hover-card
-    // popover (plan / note / linearissue — see the tabContents.branch mouseover
+    // popover (plan / note / reference — see the tabContents.branch mouseover
     // handler). A title= would surface a duplicate native tooltip showing the
     // MarkdownString-source plain text, and worse it would trigger on a
     // different timer than the card so the two tooltips would compete.
@@ -3124,17 +3151,17 @@ export function buildSidebarScript(): string {
     // If real contextValue differs, this just returns null and falls through to plain row.
     const isPlanLike = ctx === 'plan' || ctx === 'note' || ctx === 'plansItem';
     const isFile = ctx === 'file' || ctx === 'fileChange';
-    const isLinearIssue = ctx === 'linearissue';
+    const isReference = ctx === 'reference';
     if (isPlanLike) {
       return el('span', { className: 'inline-actions' }, [
         attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'edit', 'data-id': item.id, text: '✎' }), 'Edit'),
         attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'remove', 'data-id': item.id, text: '🗑' }), 'Remove'),
       ]);
     }
-    if (isLinearIssue) {
+    if (isReference) {
       return el('span', { className: 'inline-actions' }, [
-        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'open-linear', 'data-id': item.id, text: '↗' }), 'Open in Linear'),
-        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'ignore-linear', 'data-id': item.id, text: '🗑' }), 'Ignore'),
+        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'open-reference', 'data-id': item.id, text: '↗' }), 'Open in browser'),
+        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'ignore-reference', 'data-id': item.id, text: '🗑' }), 'Ignore'),
       ]);
     }
     if (isFile) {
@@ -3310,15 +3337,15 @@ export function buildSidebarScript(): string {
         vscode.postMessage({ type: 'command', command: cmd, args: [id] });
       }
       if (action === 'remove') {
-        // Plan / Note / Linear-issue rows all share the trash button rendered
-        // by renderPlanRow, so the click handler has to route by contextValue.
-        // Before this branch existed, Linear rows dispatched jollimemory.removePlan
-        // — which doesn't know about Linear mapKeys, so the trash button
-        // silently no-op'd on Linear issues while working fine on plans/notes.
+        // Plan / Note / Reference rows all share the trash button rendered by
+        // renderPlanRow, so the click handler has to route by contextValue.
+        // Before this branch existed, reference rows dispatched jollimemory.removePlan
+        // — which doesn't know about reference mapKeys, so the trash button
+        // silently no-op'd on those rows while working fine on plans/notes.
         const cmd =
-          ctx === 'note'         ? 'jollimemory.removeNote' :
-          ctx === 'linearissue'  ? 'jollimemory.ignoreLinearIssue' :
-                                   'jollimemory.removePlan';
+          ctx === 'note'      ? 'jollimemory.removeNote' :
+          ctx === 'reference' ? 'jollimemory.ignoreReference' :
+                                'jollimemory.removePlan';
         vscode.postMessage({ type: 'command', command: cmd, args: [id] });
       }
       if (action === 'discard') {
@@ -3355,11 +3382,11 @@ export function buildSidebarScript(): string {
         // for both workspace and foreign hashes.
         vscode.postMessage({ type: 'command', command: 'jollimemory.copyRecallPrompt', args: [id] });
       }
-      if (action === 'open-linear') {
-        vscode.postMessage({ type: 'branch:openLinearIssue', mapKey: id });
+      if (action === 'open-reference') {
+        vscode.postMessage({ type: 'branch:openReference', mapKey: id });
       }
-      if (action === 'ignore-linear') {
-        vscode.postMessage({ type: 'branch:ignoreLinearIssue', mapKey: id });
+      if (action === 'ignore-reference') {
+        vscode.postMessage({ type: 'branch:ignoreReference', mapKey: id });
       }
       e.stopPropagation();
       return;
@@ -3386,8 +3413,8 @@ export function buildSidebarScript(): string {
       if (ctx === 'note') {
         vscode.postMessage({ type: 'branch:openNote', noteId: id });
       }
-      if (ctx === 'linearissue') {
-        vscode.postMessage({ type: 'branch:openLinearIssueMarkdown', mapKey: id });
+      if (ctx === 'reference') {
+        vscode.postMessage({ type: 'branch:openReferenceMarkdown', mapKey: id });
       }
       if (ctx === 'file' || ctx === 'fileChange') {
         // Forward all three fields the openFileChange command needs.
@@ -3430,7 +3457,7 @@ export function buildSidebarScript(): string {
     }
   });
 
-  // Checkbox toggle — routed by class name for conversation/plan/note rows,
+  // Checkbox toggle — routed by class name for conversation/plan/note/reference rows,
   // then by data-checkbox-kind for commit rows, and finally the default-to-file
   // fallback for renderChangeRow (which does not set 'data-checkbox-kind').
   //
@@ -3440,6 +3467,8 @@ export function buildSidebarScript(): string {
   //   data-plan-id carries the plan slug (same key as 'setExcluded' uses).
   // Note rows: 'jm-note-check' class → branch:toggleNoteSelection
   //   data-note-id carries the note id (same key as 'setExcluded' uses).
+  // Reference rows: 'jm-reference-check' class → branch:toggleReferenceSelection
+  //   data-reference-key carries the source:nativeId mapKey.
   // Commit rows: data-checkbox-kind='commit' → branch:toggleCommitSelection
   // File rows: everything else → branch:toggleFileSelection (default fallback)
   tabContents.branch.addEventListener('change', function(e) {
@@ -3470,6 +3499,15 @@ export function buildSidebarScript(): string {
       vscode.postMessage({
         type: 'branch:toggleNoteSelection',
         noteId: cb.getAttribute('data-note-id'),
+        selected: !!cb.checked,
+      });
+      return;
+    }
+    // Reference checkbox — class 'jm-reference-check'
+    if (cb.classList.contains('jm-reference-check')) {
+      vscode.postMessage({
+        type: 'branch:toggleReferenceSelection',
+        mapKey: cb.getAttribute('data-reference-key'),
         selected: !!cb.checked,
       });
       return;
@@ -3584,12 +3622,12 @@ export function buildSidebarScript(): string {
       ]);
       return;
     }
-    if (ctx === 'linearissue') {
+    if (ctx === 'reference') {
       showContextMenu(e.clientX, e.clientY, [
-        { label: 'Open in Linear',  rawMessage: { type: 'branch:openLinearIssue',         mapKey: id } },
-        { label: 'Open Markdown',   rawMessage: { type: 'branch:openLinearIssueMarkdown', mapKey: id } },
+        { label: 'Open in browser', rawMessage: { type: 'branch:openReference',         mapKey: id } },
+        { label: 'Open Markdown',   rawMessage: { type: 'branch:openReferenceMarkdown', mapKey: id } },
         { separator: true },
-        { label: 'Ignore',          rawMessage: { type: 'branch:ignoreLinearIssue',       mapKey: id } },
+        { label: 'Ignore',          rawMessage: { type: 'branch:ignoreReference',       mapKey: id } },
       ]);
       return;
     }

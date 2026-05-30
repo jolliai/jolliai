@@ -17,7 +17,7 @@ vi.mock("./SummaryStore.js", async () => {
 	const actual = await vi.importActual<typeof import("./SummaryStore.js")>("./SummaryStore.js");
 	return {
 		readTranscriptsForCommits: vi.fn(),
-		readLinearIssueFromBranch: vi.fn(),
+		readReferenceFromBranch: vi.fn(),
 		readPlanFromBranch: vi.fn(),
 		readNoteFromBranch: vi.fn(),
 		// Use the real normalizeToV4 — these tests exercise the full
@@ -81,7 +81,7 @@ describe("regenerateSummary", () => {
 		);
 		vi.mocked(GitOps.getDiffContent).mockResolvedValue("DIFF");
 		vi.mocked(TranscriptReader.buildMultiSessionContext).mockReturnValue("CONV");
-		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValue(null);
+		vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValue(null);
 		vi.mocked(SummaryStore.readPlanFromBranch).mockResolvedValue(null);
 		vi.mocked(SummaryStore.readNoteFromBranch).mockResolvedValue(null);
 		vi.mocked(Summarizer.generateSummary).mockResolvedValue(successResult);
@@ -269,16 +269,28 @@ describe("regenerateSummary", () => {
 			...baseSummary,
 			plans: [{ slug: "p-1", title: "Plan 1" } as never, { slug: "p-2", title: "Plan 2" } as never],
 			notes: [{ id: "n-1", title: "Note 1", format: "markdown" } as never],
-			linearIssues: [
-				{ archivedKey: "JOLLI-1-abc", ticketId: "JOLLI-1", title: "T", url: "https://linear.app/x" } as never,
+			references: [
+				{
+					archivedKey: "linear:JOLLI-1-abc",
+					source: "linear",
+					nativeId: "JOLLI-1",
+					title: "T",
+					url: "https://linear.app/x",
+					referencedAt: "2026-05-21T00:00:00Z",
+					sourceToolName: "mcp__linear__get_issue",
+				} as never,
 			],
 		} as CommitSummary;
 		vi.mocked(SummaryStore.readPlanFromBranch)
 			.mockResolvedValueOnce("# Plan 1\n\nplan body 1")
 			.mockResolvedValueOnce("# Plan 2\n\nplan body 2");
 		vi.mocked(SummaryStore.readNoteFromBranch).mockResolvedValueOnce("note body");
-		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValueOnce(
-			'---\nticketId: "JOLLI-1"\n---\nissue body',
+		// v3 legacy linearIssues fall through legacyLinearIssuesToEntityCommitRefs,
+		// which adds the `linear:` prefix; readReferenceFromBranch is called with the
+		// prefixed form. The mocked content is v1 legacy frontmatter (ticketId
+		// only) so the ReferenceStore parser synthesises source: "linear".
+		vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(
+			'---\nticketId: "JOLLI-1"\ntitle: "T"\nurl: "https://linear.app/x"\nreferencedAt: "2026-05-21T00:00:00Z"\nsourceToolName: "mcp__linear__get_issue"\n---\nissue body',
 		);
 
 		await regenerateSummary(withRefs, "/repo", config);
@@ -288,13 +300,19 @@ describe("regenerateSummary", () => {
 		expect(SummaryStore.readPlanFromBranch).toHaveBeenCalledWith("p-1", "/repo", undefined);
 		expect(SummaryStore.readPlanFromBranch).toHaveBeenCalledWith("p-2", "/repo", undefined);
 		expect(SummaryStore.readNoteFromBranch).toHaveBeenCalledWith("n-1", "/repo", undefined);
-		expect(SummaryStore.readLinearIssueFromBranch).toHaveBeenCalledWith("JOLLI-1-abc", "/repo", undefined);
+		expect(SummaryStore.readReferenceFromBranch).toHaveBeenCalledWith(
+			"linear",
+			"linear:JOLLI-1-abc",
+			"/repo",
+			undefined,
+		);
 
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
 		expect(params.plans).toContain("plan body 1");
 		expect(params.plans).toContain("plan body 2");
 		expect(params.notes).toContain("note body");
-		expect(params.linearIssues).toContain("issue body");
+		expect(params.referenceBlocks).toContain("issue body");
+		expect(params.referenceBlocks).toContain("<linear-issues>");
 	});
 
 	it("emits empty prompt blocks when no plans / notes / linear-issues are attached", async () => {
@@ -302,10 +320,10 @@ describe("regenerateSummary", () => {
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
 		expect(params.plans).toBe("");
 		expect(params.notes).toBe("");
-		expect(params.linearIssues).toBe("");
+		expect(params.referenceBlocks).toBe("");
 		expect(SummaryStore.readPlanFromBranch).not.toHaveBeenCalled();
 		expect(SummaryStore.readNoteFromBranch).not.toHaveBeenCalled();
-		expect(SummaryStore.readLinearIssueFromBranch).not.toHaveBeenCalled();
+		expect(SummaryStore.readReferenceFromBranch).not.toHaveBeenCalled();
 	});
 
 	it("skips refs whose archive content is missing from the orphan branch", async () => {
@@ -333,19 +351,22 @@ describe("regenerateSummary", () => {
 	it("skips missing-archive linear issues the same way as missing-archive plans", async () => {
 		const withRefs: CommitSummary = {
 			...baseSummary,
-			linearIssues: [
+			references: [
 				{
-					archivedKey: "PROJ-1-deadbeef",
-					ticketId: "PROJ-1",
+					archivedKey: "linear:PROJ-1-deadbeef",
+					source: "linear",
+					nativeId: "PROJ-1",
 					title: "T",
 					url: "https://linear.app/x",
+					referencedAt: "2026-05-21T00:00:00Z",
+					sourceToolName: "mcp__linear__get_issue",
 				} as never,
 			],
 		} as CommitSummary;
-		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValueOnce(null);
+		vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(null);
 		await regenerateSummary(withRefs, "/repo", config);
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
-		expect(params.linearIssues).toBe("");
+		expect(params.referenceBlocks).toBe("");
 	});
 
 	it("preserves conversationTurns when generateSummary omits it from the result", async () => {
@@ -486,7 +507,7 @@ describe("regenerateSummary", () => {
 			// root has none of these — they live only on the child below.
 			plans: undefined,
 			notes: undefined,
-			linearIssues: undefined,
+			references: undefined,
 			e2eTestGuide: undefined,
 			jolliDocId: undefined,
 			jolliDocUrl: undefined,
@@ -513,10 +534,11 @@ describe("regenerateSummary", () => {
 							updatedAt: "2026-05-20T00:00:00Z",
 						},
 					],
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "JOLLI-1-leaf",
-							ticketId: "JOLLI-1",
+							archivedKey: "linear:JOLLI-1-leafhash",
+							source: "linear",
+							nativeId: "JOLLI-1",
 							title: "Ticket 1",
 							url: "https://linear.app/x",
 							referencedAt: "2026-05-20T00:00:00Z",
@@ -548,7 +570,7 @@ describe("regenerateSummary", () => {
 		// AND child-only metadata is hoisted to root — the rescue this test guards.
 		expect(updated.plans?.[0]?.slug).toBe("feature-x");
 		expect(updated.notes?.[0]?.id).toBe("note-1");
-		expect(updated.linearIssues?.[0]?.archivedKey).toBe("JOLLI-1-leaf");
+		expect(updated.references?.[0]?.archivedKey).toBe("linear:JOLLI-1-leafhash");
 		expect(updated.e2eTestGuide?.[0]?.title).toBe("Scenario 1");
 		expect(updated.jolliDocId).toBe(42);
 		expect(updated.jolliDocUrl).toBe("https://jolli.ai/d/42");
@@ -566,7 +588,7 @@ describe("regenerateSummary", () => {
 			version: 3,
 			plans: undefined,
 			notes: undefined,
-			linearIssues: undefined,
+			references: undefined,
 			children: [
 				{
 					...baseSummary,
@@ -590,10 +612,11 @@ describe("regenerateSummary", () => {
 							updatedAt: "2026-05-20T00:00:00Z",
 						},
 					],
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "JOLLI-7-leaf",
-							ticketId: "JOLLI-7",
+							archivedKey: "linear:JOLLI-7-leafhash",
+							source: "linear",
+							nativeId: "JOLLI-7",
 							title: "T",
 							url: "https://linear.app/y",
 							referencedAt: "2026-05-20T00:00:00Z",
@@ -605,20 +628,32 @@ describe("regenerateSummary", () => {
 		} as CommitSummary;
 		vi.mocked(SummaryStore.readPlanFromBranch).mockResolvedValueOnce("plan body for p-child");
 		vi.mocked(SummaryStore.readNoteFromBranch).mockResolvedValueOnce("note body for n-child");
-		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValueOnce("linear body for JOLLI-7");
+		// Raw legacy markdown — readEntityMarkdownFromString returns null (no
+		// frontmatter), so the renderer falls back to embedding the raw body
+		// in the synthesised Reference.description.
+		vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce("linear body for JOLLI-7");
 
 		await regenerateSummary(v3ChildOnlyRefs, "/repo", config);
 
 		// The reads went through under the hoisted slug / id / archivedKey.
 		expect(SummaryStore.readPlanFromBranch).toHaveBeenCalledWith("p-child", "/repo", undefined);
 		expect(SummaryStore.readNoteFromBranch).toHaveBeenCalledWith("n-child", "/repo", undefined);
-		expect(SummaryStore.readLinearIssueFromBranch).toHaveBeenCalledWith("JOLLI-7-leaf", "/repo", undefined);
+		// legacyLinearIssuesToEntityCommitRefs prepends `linear:` to the
+		// archivedKey before dispatch, so readReferenceFromBranch sees the
+		// prefixed form. readReferenceFromBranch's own fallback path strips
+		// `linear:` and reads the legacy on-disk path.
+		expect(SummaryStore.readReferenceFromBranch).toHaveBeenCalledWith(
+			"linear",
+			"linear:JOLLI-7-leafhash",
+			"/repo",
+			undefined,
+		);
 
 		// And the bodies landed in the prompt.
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
 		expect(params.plans).toContain("plan body for p-child");
 		expect(params.notes).toContain("note body for n-child");
-		expect(params.linearIssues).toContain("linear body for JOLLI-7");
+		expect(params.referenceBlocks).toContain("linear body for JOLLI-7");
 	});
 
 	it("rescues child-only orphanedDocIds before stripping descendants", async () => {
@@ -712,10 +747,11 @@ describe("regenerateSummary", () => {
 	it("truncates oversized linear-issue bodies at LINEAR_MAX_CHARS (4000)", async () => {
 		const withBigLinear: CommitSummary = {
 			...baseSummary,
-			linearIssues: [
+			references: [
 				{
-					archivedKey: "JOLLI-1-abc",
-					ticketId: "JOLLI-1",
+					archivedKey: "linear:JOLLI-1-abc",
+					source: "linear",
+					nativeId: "JOLLI-1",
 					title: "T",
 					url: "https://linear.app/x",
 					referencedAt: "2026-05-21T00:00:00Z",
@@ -724,19 +760,20 @@ describe("regenerateSummary", () => {
 			],
 		} as CommitSummary;
 		const big = "y".repeat(10000);
-		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValueOnce(big);
+		vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(big);
 
 		await regenerateSummary(withBigLinear, "/repo", config);
 
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
-		expect(params.linearIssues).toContain("[truncated,");
+		expect(params.referenceBlocks).toContain("[truncated,");
 	});
 
 	it("caps the total <linear-issues> block at LINEAR_TOTAL_CHARS (30000) by dropping the oldest", async () => {
 		const mkRef = (key: string, referencedAt: string) =>
 			({
-				archivedKey: key,
-				ticketId: key,
+				archivedKey: `linear:${key}`,
+				source: "linear",
+				nativeId: key,
 				title: key,
 				url: "https://linear.app/x",
 				referencedAt,
@@ -744,7 +781,7 @@ describe("regenerateSummary", () => {
 			}) as never;
 		const withMany: CommitSummary = {
 			...baseSummary,
-			linearIssues: [
+			references: [
 				mkRef("oldest", "2026-05-18T00:00:00Z"),
 				mkRef("middle", "2026-05-19T00:00:00Z"),
 				mkRef("newer", "2026-05-20T00:00:00Z"),
@@ -757,14 +794,14 @@ describe("regenerateSummary", () => {
 			],
 		} as CommitSummary;
 		const big = "y".repeat(4000);
-		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValue(big);
+		vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValue(big);
 
 		await regenerateSummary(withMany, "/repo", config);
 
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
 		// Newest selected; oldest dropped under greedy newest-first.
-		expect(params.linearIssues).toContain('id="beyond"');
-		expect(params.linearIssues).not.toContain('id="oldest"');
+		expect(params.referenceBlocks).toContain('id="beyond"');
+		expect(params.referenceBlocks).not.toContain('id="oldest"');
 	});
 
 	it("truncates oversized note bodies at NOTE_MAX_CHARS (4000) and caps total at NOTE_TOTAL_CHARS (12000)", async () => {
@@ -897,26 +934,30 @@ describe("regenerateSummary", () => {
 
 	it("does not crash when linearIssues / notes refs lack their timestamp fields (legacy v3)", async () => {
 		// Defensive `?? ""` against legacy data with no referencedAt /
-		// updatedAt. Two refs each so the Array.sort comparator actually
-		// runs (a single-element array short-circuits the comparator).
+		// updatedAt / title / sourceToolName. Two refs each so the Array.sort
+		// comparator actually runs (a single-element array short-circuits the
+		// comparator). All four optional ref fields are set undefined so every
+		// `?? ""` falsy branch in rebuildReferenceBlocks fires.
 		const legacyTimestamps: CommitSummary = {
 			...baseSummary,
-			linearIssues: [
+			references: [
 				{
-					archivedKey: "L-1",
-					ticketId: "T1",
-					title: "t1",
-					url: "u1",
+					archivedKey: "linear:L-1",
+					source: "linear",
+					nativeId: "T1",
+					title: undefined,
+					url: undefined,
 					referencedAt: undefined,
-					sourceToolName: "x",
+					sourceToolName: undefined,
 				} as never,
 				{
-					archivedKey: "L-2",
-					ticketId: "T2",
-					title: "t2",
-					url: "u2",
+					archivedKey: "linear:L-2",
+					source: "linear",
+					nativeId: "T2",
+					title: undefined,
+					url: undefined,
 					referencedAt: undefined,
-					sourceToolName: "x",
+					sourceToolName: undefined,
 				} as never,
 			],
 			notes: [
@@ -924,25 +965,27 @@ describe("regenerateSummary", () => {
 				{ id: "n-2", title: "n2", format: "snippet", updatedAt: undefined } as never,
 			],
 		} as CommitSummary;
-		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValue("LB");
+		vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValue("LB");
 		vi.mocked(SummaryStore.readNoteFromBranch).mockResolvedValue("NB");
 
 		await expect(regenerateSummary(legacyTimestamps, "/repo", config)).resolves.toBeDefined();
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
-		expect(params.linearIssues).toContain("LB");
+		expect(params.referenceBlocks).toContain("LB");
 		expect(params.notes).toContain("NB");
 	});
 
-	it("uses empty string for ref.url when LinearIssueCommitRef.url is missing", async () => {
-		// Legacy/corrupt LinearIssueCommitRef may lack the url field — the
-		// `ref.url ?? ""` fallback ensures escapeForText doesn't choke on
-		// undefined. Output renders `<url></url>` (empty inner text).
+	it("uses empty string for ref.url when ReferenceCommitRef.url is missing", async () => {
+		// Legacy/corrupt ReferenceCommitRef may lack the url field — the
+		// adapter's renderPromptBlock receives an Reference whose url is "" so
+		// escapeForText doesn't choke. Output renders `<url></url>` (empty
+		// inner text) the same as the first-run LinearAdapter path.
 		const noUrl: CommitSummary = {
 			...baseSummary,
-			linearIssues: [
+			references: [
 				{
-					archivedKey: "JOLLI-9-abc",
-					ticketId: "JOLLI-9",
+					archivedKey: "linear:JOLLI-9-abc",
+					source: "linear",
+					nativeId: "JOLLI-9",
 					title: "T",
 					url: undefined,
 					referencedAt: "2026-05-21T00:00:00Z",
@@ -950,12 +993,12 @@ describe("regenerateSummary", () => {
 				} as never,
 			],
 		} as CommitSummary;
-		vi.mocked(SummaryStore.readLinearIssueFromBranch).mockResolvedValueOnce("body");
+		vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce("body");
 
 		await regenerateSummary(noUrl, "/repo", config);
 
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
-		expect(params.linearIssues).toContain("<url></url>");
+		expect(params.referenceBlocks).toContain("<url></url>");
 	});
 
 	it("caps the total <plans> block at PLAN_TOTAL_CHARS (60000) and drops the oldest plan when exceeded", async () => {
@@ -1064,5 +1107,380 @@ describe("regenerateSummary", () => {
 		await regenerateSummary(legacy, "/repo", config);
 		const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
 		expect(params.diffStats).toEqual({ filesChanged: 7, insertions: 70, deletions: 7 });
+	});
+
+	describe("rebuildReferenceBlocks — multi-source v5+", () => {
+		it("rebuilds blocks for v5+ summary with entities[] field (Linear only) via readReferenceFromBranch", async () => {
+			// v5+ summaries carry an `entities` field with the `<source>:<bareKey>`
+			// archive form. Regenerator dispatches via readReferenceFromBranch and
+			// the LinearAdapter renders the <linear-issues> block exactly like
+			// the first-run extractor path would.
+			const v5Linear: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:PROJ-1-abc12345",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "Linear ticket",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-21T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "PROJ-1"',
+					'title: "Linear ticket"',
+					'url: "https://linear.app/x"',
+					'referencedAt: "2026-05-21T00:00:00Z"',
+					'sourceToolName: "mcp__linear__get_issue"',
+					"---",
+					"linear description body",
+				].join("\n"),
+			);
+
+			await regenerateSummary(v5Linear, "/repo", config);
+
+			expect(SummaryStore.readReferenceFromBranch).toHaveBeenCalledWith(
+				"linear",
+				"linear:PROJ-1-abc12345",
+				"/repo",
+				undefined,
+			);
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain("<linear-issues>");
+			expect(params.referenceBlocks).toContain('id="PROJ-1"');
+			expect(params.referenceBlocks).toContain("linear description body");
+		});
+
+		it("falls back to legacy linearIssues projection when entities is absent (v3/v4)", async () => {
+			// archivedKey on legacy is bare (no `linear:` prefix); the projection
+			// helper adds it before calling readReferenceFromBranch. The fallback
+			// inside readReferenceFromBranch strips it back to read the legacy
+			// `linear-issues/<bareKey>.md` path on disk — verified by the call
+			// argument including the `linear:` prefix exactly as plan §Task 2.10
+			// specifies.
+			const v3Legacy: CommitSummary = {
+				...baseSummary,
+				version: 4,
+				references: [
+					{
+						archivedKey: "linear:PROJ-1-abc12345",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "Legacy ticket",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-21T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(
+				[
+					"---",
+					'ticketId: "PROJ-1"',
+					'title: "Legacy ticket"',
+					'url: "https://linear.app/x"',
+					'referencedAt: "2026-05-21T00:00:00Z"',
+					'sourceToolName: "mcp__linear__get_issue"',
+					"---",
+					"legacy body",
+				].join("\n"),
+			);
+
+			await regenerateSummary(v3Legacy, "/repo", config);
+
+			expect(SummaryStore.readReferenceFromBranch).toHaveBeenCalledWith(
+				"linear",
+				"linear:PROJ-1-abc12345",
+				"/repo",
+				undefined,
+			);
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain("<linear-issues>");
+			expect(params.referenceBlocks).toContain("legacy body");
+		});
+
+		it("returns empty string when references is absent / empty", async () => {
+			const empty: CommitSummary = {
+				...baseSummary,
+				references: [],
+			} as CommitSummary;
+			await regenerateSummary(empty, "/repo", config);
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toBe("");
+			expect(SummaryStore.readReferenceFromBranch).not.toHaveBeenCalled();
+		});
+
+		it("skips entities whose orphan-branch markdown is missing but still completes (warn-and-continue)", async () => {
+			// Mix of present + missing — the present one still renders, the
+			// missing one is silently dropped (warn-only). Mirrors the first-run
+			// extractor behavior where a deleted MCP entity doesn't break the
+			// commit pipeline.
+			const mixed: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:PROJ-1-abc12345",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "Present",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+					{
+						archivedKey: "linear:PROJ-2-deadbeef",
+						source: "linear",
+						nativeId: "PROJ-2",
+						title: "Missing",
+						url: "https://linear.app/y",
+						referencedAt: "2026-05-21T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch)
+				.mockResolvedValueOnce(
+					[
+						"---",
+						'source: "linear"',
+						'nativeId: "PROJ-1"',
+						'title: "Present"',
+						'url: "https://linear.app/x"',
+						'referencedAt: "2026-05-22T00:00:00Z"',
+						'sourceToolName: "mcp__linear__get_issue"',
+						"---",
+						"present body",
+					].join("\n"),
+				)
+				.mockResolvedValueOnce(null);
+
+			await regenerateSummary(mixed, "/repo", config);
+
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain('id="PROJ-1"');
+			expect(params.referenceBlocks).toContain("present body");
+			expect(params.referenceBlocks).not.toContain('id="PROJ-2"');
+		});
+
+		it("forwards optional status / priority / labels from the ReferenceCommitRef into the rendered block", async () => {
+			// These optional fields are conditionally spread into the synthesised
+			// Reference passed to the adapter; the adapter then renders them as
+			// XML attrs on the issue tag. Drift here would silently strip them
+			// from regenerate-time prompts, leading to LLM output that differs
+			// from the first-run path on the same commit.
+			const withMeta: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:PROJ-9-feedabcd",
+						source: "linear",
+						nativeId: "PROJ-9",
+						title: "Meta ticket",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+						status: "In Review",
+						priority: "High",
+						labels: ["backend", "auth"],
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "PROJ-9"',
+					'title: "Meta ticket"',
+					'url: "https://linear.app/x"',
+					'referencedAt: "2026-05-22T00:00:00Z"',
+					'sourceToolName: "mcp__linear__get_issue"',
+					"---",
+					"meta body",
+				].join("\n"),
+			);
+
+			await regenerateSummary(withMeta, "/repo", config);
+
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain('status="In Review"');
+			expect(params.referenceBlocks).toContain('priority="High"');
+			expect(params.referenceBlocks).toContain('labels="backend, auth"');
+		});
+
+		it("groups two entities of the same source into a single block (existing-bucket push path)", async () => {
+			// Two linear refs in one summary must share a single <linear-issues>
+			// wrapper — the `if (bucket) bucket.push(...)` branch (existing
+			// bucket, append) is otherwise unhit when every test feeds one entity
+			// per source.
+			const twoLinear: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:A-1-aaa11111",
+						source: "linear",
+						nativeId: "A-1",
+						title: "A1",
+						url: "https://linear.app/a",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+					{
+						archivedKey: "linear:A-2-bbb22222",
+						source: "linear",
+						nativeId: "A-2",
+						title: "A2",
+						url: "https://linear.app/b",
+						referencedAt: "2026-05-21T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as CommitSummary;
+			const md = (id: string, body: string) =>
+				[
+					"---",
+					'source: "linear"',
+					`nativeId: "${id}"`,
+					`title: "${id}"`,
+					`url: "https://linear.app/${id}"`,
+					'referencedAt: "2026-05-22T00:00:00Z"',
+					'sourceToolName: "mcp__linear__get_issue"',
+					"---",
+					body,
+				].join("\n");
+			vi.mocked(SummaryStore.readReferenceFromBranch)
+				.mockResolvedValueOnce(md("A-1", "body-A1"))
+				.mockResolvedValueOnce(md("A-2", "body-A2"));
+
+			await regenerateSummary(twoLinear, "/repo", config);
+
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			// Single <linear-issues> wrapper holds both <issue> entries.
+			const opens = (params.referenceBlocks?.match(/<linear-issues>/g) ?? []).length;
+			expect(opens).toBe(1);
+			expect(params.referenceBlocks).toContain('id="A-1"');
+			expect(params.referenceBlocks).toContain('id="A-2"');
+		});
+
+		it("synthesises a minimal Reference when the orphan-branch markdown is unparseable, including optional status/priority/labels", async () => {
+			// Markdown without `---` frontmatter falls through readEntityMarkdownFromString
+			// (returns null) — the renderer then builds a minimal Reference using
+			// the commit-time ref metadata and embeds the raw body as description.
+			// Optional status/priority/labels on the ReferenceCommitRef must still
+			// flow into the synthesised ref so the adapter renders them.
+			const v5Unparseable: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:PROJ-42-deadbeef",
+						source: "linear",
+						nativeId: "PROJ-42",
+						title: "Bare",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+						status: "Done",
+						priority: "Low",
+						labels: ["chore"],
+					},
+				],
+			} as CommitSummary;
+			// Raw body — no `---` frontmatter, parser returns null.
+			vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(
+				"raw legacy body without frontmatter",
+			);
+
+			await regenerateSummary(v5Unparseable, "/repo", config);
+
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain('status="Done"');
+			expect(params.referenceBlocks).toContain('priority="Low"');
+			expect(params.referenceBlocks).toContain('labels="chore"');
+			expect(params.referenceBlocks).toContain("raw legacy body without frontmatter");
+		});
+
+		it("omits the description block when parsed markdown body is empty (parsed.description undefined branch)", async () => {
+			// Frontmatter-only markdown (no body): ReferenceStore.parseMarkdown
+			// returns a Reference without `description`. Regenerator's
+			// description-truncate ternary must skip — otherwise the adapter
+			// receives `description: undefined` which would crash truncate().
+			const v5NoDesc: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:PROJ-100-feedface",
+						source: "linear",
+						nativeId: "PROJ-100",
+						title: "NoBody",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "PROJ-100"',
+					'title: "NoBody"',
+					'url: "https://linear.app/x"',
+					'referencedAt: "2026-05-22T00:00:00Z"',
+					'sourceToolName: "mcp__linear__get_issue"',
+					"---",
+				].join("\n"),
+			);
+
+			await regenerateSummary(v5NoDesc, "/repo", config);
+
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain('id="PROJ-100"');
+			expect(params.referenceBlocks).not.toContain("<description>");
+		});
+
+		it("renders one block per source in ALL_ADAPTERS order (currently linear-only registered)", async () => {
+			// The ALL_ADAPTERS loop is order-stable; until Jira/GitHub/Notion
+			// adapters land, only the linear block is produced. This test
+			// pins the iteration shape so a future jira entity in the same
+			// summary won't change the linear block's byte position.
+			const linearOnly: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:PROJ-1-abc12345",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "L1",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "PROJ-1"',
+					'title: "L1"',
+					'url: "https://linear.app/x"',
+					'referencedAt: "2026-05-22T00:00:00Z"',
+					'sourceToolName: "mcp__linear__get_issue"',
+					"---",
+					"L1 body",
+				].join("\n"),
+			);
+
+			await regenerateSummary(linearOnly, "/repo", config);
+
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			// Only one block, leading with `<linear-issues>`.
+			expect(params.referenceBlocks?.startsWith("<linear-issues>")).toBe(true);
+		});
 	});
 });

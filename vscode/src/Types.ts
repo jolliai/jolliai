@@ -113,33 +113,26 @@ export interface PlanEntry {
 	readonly ignored?: boolean;
 }
 
-/** plans.json registry structure */
-export interface PlansRegistry {
-	readonly version: 1;
-	readonly plans: Readonly<Record<string, PlanEntry>>;
-	readonly notes?: Readonly<Record<string, NoteEntry>>;
-	readonly linearIssues?: Readonly<Record<string, LinearIssueEntry>>;
-}
-
 // ─── Note types ─────────────────────────────────────────────────────────────
 
 // Re-export core note types to avoid duplication
 export type { NoteEntry, NoteFormat } from "../../cli/src/Types.js";
 
-// ─── Linear issue types ─────────────────────────────────────────────────────
+// ─── Multi-source reference types ───────────────────────────────────────────
 
-// Re-export core Linear types to avoid duplication
+// Re-export core reference types to avoid duplication
 export type {
-	LinearIssueCommitRef,
-	LinearIssueEntry,
-	LinearIssueRef,
+	PlansRegistry,
+	Reference,
+	ReferenceCommitRef,
+	ReferenceEntry,
+	SourceId,
 } from "../../cli/src/Types.js";
 
-// Import for use in PlansRegistry / NoteInfo / LinearIssueInfo
+// Import for use in NoteInfo / ReferenceInfo
 import type {
-	LinearIssueEntry,
-	NoteEntry,
 	NoteFormat,
+	SourceId,
 } from "../../cli/src/Types.js";
 
 /** Display-level note metadata for the VSCode tree view */
@@ -159,12 +152,22 @@ export interface NoteInfo {
 	readonly filePath?: string;
 }
 
-/** Display-level Linear issue metadata for the VSCode panel */
-export interface LinearIssueInfo {
-	readonly kind: "linearissue";
-	/** Stable Linear ticket id (e.g. "PROJ-1234") */
-	readonly ticketId: string;
-	/** Current map key in plans.json (= ticketId when uncommitted, = ticketId-shortHash after archive) */
+/**
+ * Display-level multi-source reference metadata for the VSCode panel.
+ *
+ * Extends `ReferenceEntry` (the persisted registry row) with panel-display
+ * fields read from the on-disk markdown frontmatter (status / priority /
+ * labels / description preview) plus `mapKey` (the registry key,
+ * `<source>:<nativeId>` or `<source>:<nativeId>-<shortHash>` for archived
+ * snapshots) and a stable `lastModified` field (= updatedAt) for sort
+ * consistency with PlanInfo / NoteInfo.
+ */
+export interface ReferenceInfo {
+	readonly kind: "reference";
+	readonly source: SourceId;
+	/** Stable native id (Linear ticket id, Jira key, owner/repo#number, 32-hex Notion page id). */
+	readonly nativeId: string;
+	/** plans.json.references map key — `<source>:<nativeId>` while uncommitted, or `<source>:<nativeId>-<shortHash>` after archive. */
 	readonly mapKey: string;
 	readonly title: string;
 	readonly url: string;
@@ -176,9 +179,10 @@ export interface LinearIssueInfo {
 	readonly branch: string;
 	readonly addedAt: string;
 	readonly updatedAt: string;
-	/** ISO 8601 — same as updatedAt for sort consistency with PlanInfo / NoteInfo */
+	/** ISO 8601 — same as updatedAt for sort consistency with PlanInfo / NoteInfo. */
 	readonly lastModified: string;
 	readonly commitHash: string | null;
+	readonly contentHashAtCommit?: string;
 	readonly ignored: boolean;
 	readonly sourceToolName: string;
 }

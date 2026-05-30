@@ -200,22 +200,63 @@ export async function getCommitInfo(hash: string, cwd?: string): Promise<CommitI
 }
 
 /**
- * Gets the diff content between two refs.
- * Truncates to maxChars to stay within API limits.
+ * Gets the diff content between two refs for prompt assembly.
+ *
+ * The budget defaults to 150_000 chars — sized for the summarizer's model
+ * (sonnet-class, ~200K-token window) while leaving room for the conversation +
+ * plans and keeping the assembled prompt inside the LLM wall-clock budget. It
+ * was lowered from 200_000 because a whole-tree squash regenerate (200K diff +
+ * 200K conversation) was overrunning the timeout and aborting mid-flight. When
+ * the raw diff still exceeds `maxChars` it is NOT silently cut to the first few
+ * (alphabetically-ordered) files — that let a large commit be summarised as if
+ * only its first files had changed. Instead the complete `git diff --stat` file
+ * list is prepended (so every changed file stays visible) and the remaining
+ * budget is filled with the head of the diff body. Truncation is logged so it
+ * is visible in debug.log.
  */
-export async function getDiffContent(fromRef: string, toRef: string, cwd?: string, maxChars = 30000): Promise<string> {
+export async function getDiffContent(fromRef: string, toRef: string, cwd?: string, maxChars = 150000): Promise<string> {
 	const result = await execGit(["diff", `${fromRef}..${toRef}`], cwd);
 	if (result.exitCode !== 0) {
-		// For first commit, there's no parent — get the full diff
+		// For first commit, there's no parent — diff against the empty tree.
 		log.warn("Diff failed, trying diff of HEAD against empty tree");
 		const emptyTree = await execGit(["hash-object", "-t", "tree", "/dev/null"], cwd);
-		const fallback = await execGit(["diff", emptyTree.stdout.trim(), toRef], cwd);
-		const content = fallback.stdout.substring(0, maxChars);
-		return content;
+		const tree = emptyTree.stdout.trim();
+		const fallback = await execGit(["diff", tree, toRef], cwd);
+		return capDiffToBudget(fallback.stdout, ["diff", "--stat", tree, toRef], cwd, maxChars);
 	}
 
-	const content = result.stdout.substring(0, maxChars);
-	return content;
+	return capDiffToBudget(result.stdout, ["diff", "--stat", `${fromRef}..${toRef}`], cwd, maxChars);
+}
+
+/**
+ * Caps a raw diff body to `maxChars`. Under budget → returned as-is (no extra
+ * git call). Over budget → fetch the full `--stat` file list via `statArgs`,
+ * prepend it plus a truncation marker, then fill the remaining budget with the
+ * head of the body. This keeps every changed file visible to the model even
+ * when the per-file bodies don't all fit. Total output stays within `maxChars`
+ * (unless the file list alone exceeds it, in which case the full list wins —
+ * the file list is the more valuable signal).
+ */
+async function capDiffToBudget(
+	body: string,
+	statArgs: ReadonlyArray<string>,
+	cwd: string | undefined,
+	maxChars: number,
+): Promise<string> {
+	if (body.length <= maxChars) {
+		return body;
+	}
+	const statResult = await execGit([...statArgs], cwd);
+	const stat = statResult.exitCode === 0 ? statResult.stdout.trimEnd() : "";
+	const marker = `\n--- diff body truncated (${body.length} chars total); full file list above, head of diff within the ${maxChars}-char budget below ---\n`;
+	const header = `${stat}${marker}`;
+	log.warn(
+		"Diff exceeds %d-char budget (%d chars) — prepending --stat file list and truncating body",
+		maxChars,
+		body.length,
+	);
+	const bodyBudget = Math.max(0, maxChars - header.length);
+	return `${header}${body.substring(0, bodyBudget)}`;
 }
 
 /**

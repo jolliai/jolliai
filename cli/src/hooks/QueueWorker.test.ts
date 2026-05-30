@@ -25,11 +25,11 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 		associatePlanWithCommit: vi.fn(),
 		associateNoteWithCommit: vi.fn(),
-		associateLinearIssueWithCommit: vi.fn().mockResolvedValue(undefined),
-		detectUncommittedLinearIssueIds: vi.fn().mockResolvedValue([]),
+		associateReferenceWithCommit: vi.fn().mockResolvedValue(undefined),
+		detectUncommittedReferenceIds: vi.fn().mockResolvedValue([]),
 		detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
 		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
-		getLinearIssueEntriesForBranch: vi.fn().mockResolvedValue([]),
+		getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
 		filterSessionsByEnabledIntegrations: actual.filterSessionsByEnabledIntegrations,
 		dequeueAllGitOperations: vi.fn().mockResolvedValue([]),
 		deleteQueueEntry: vi.fn(),
@@ -37,20 +37,18 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 	};
 });
 
-// LinearIssueStore is fs-bound; mock it so QueueWorker tests don't touch disk
-vi.mock("../core/LinearIssueStore.js", () => ({
-	linearIssuePath: vi.fn((key: string, cwd: string) => `${cwd}/.jolli/jollimemory/linear-issues/${key}.md`),
-	readLinearIssueMarkdown: vi.fn().mockResolvedValue(null),
-	renameLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
-	// QueueWorker.associateLinearIssuesWithCommit hashes raw markdown via this
-	// helper (referencedAt-excluding scheme) instead of sha256ing file bytes
-	// directly. Mock returns a stable hex hash so existing test assertions on
-	// the persisted contentHashAtCommit field stay deterministic.
-	hashLinearIssueContentFromMarkdown: vi.fn(() => "fake-content-hash"),
-}));
-
-vi.mock("../core/LinearIssueExtractor.js", () => ({
-	formatLinearIssuesBlock: vi.fn().mockReturnValue(""),
+// ReferenceStore is fs-bound; mock it so QueueWorker tests don't touch disk
+vi.mock("../core/references/ReferenceStore.js", () => ({
+	referencePath: vi.fn(
+		(cwd: string, source: string, key: string) => `${cwd}/.jolli/jollimemory/references/${source}/${key}.md`,
+	),
+	referenceDir: vi.fn((cwd: string, source: string) => `${cwd}/.jolli/jollimemory/references/${source}`),
+	sanitizeNativeIdForPath: vi.fn((_source: string, id: string) => id),
+	readReferenceMarkdown: vi.fn().mockResolvedValue(null),
+	readReferenceMarkdownFromString: vi.fn().mockReturnValue(null),
+	writeReferenceMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/x", contentHash: "fake-content-hash" }),
+	renameReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
+	hashReferenceContent: vi.fn(() => "fake-content-hash"),
 }));
 
 vi.mock("../core/PlanPromptFormatter.js", () => ({
@@ -80,6 +78,14 @@ vi.mock("../sync/VaultWriteLock.js", () => ({
 	}),
 	DEFAULT_VAULT_WRITE_WAIT_MS: 60_000,
 	isVaultWriteLockHeld: vi.fn(),
+}));
+
+// PendingWorkers cross-repo wakeup helpers. Mocked so tests can verify
+// QueueWorker records its cwd on lock acquisition failure (L295/309-314)
+// and skips itself when consuming on release (L425).
+vi.mock("../sync/PendingWorkers.js", () => ({
+	recordPendingWorker: vi.fn().mockResolvedValue(undefined),
+	consumePendingWorkers: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("../sync/SyncBootstrap.js", () => ({
@@ -124,6 +130,66 @@ vi.mock("../core/StorageFactory.js", () => ({
 	}),
 }));
 
+// Linear-legacy elimination preflight (Phase A). The preflight gates on
+// MigrationState + the orphan branch's exists() — both mocked away here so
+// the existing run-worker tests do NOT exercise the migration path. The
+// dedicated "linear-legacy elimination preflight" describe-block below
+// re-mocks `readMigrationState` per case to drive the gate explicitly.
+const mockOrphanLinearMigration = vi.hoisted(() =>
+	vi.fn().mockResolvedValue({ status: "noop", movedFiles: 0, rewroteSummaries: 0 }),
+);
+
+vi.mock("../core/OrphanBranchLinearMigration.js", () => ({
+	migrateOrphanBranchLinearLegacy: mockOrphanLinearMigration,
+}));
+
+const mockMetadataManagerInstance = vi.hoisted(() => ({
+	readMigrationState: vi.fn(() => null as ReturnType<typeof Object> | null),
+	saveMigrationState: vi.fn(),
+}));
+
+vi.mock("../core/MetadataManager.js", () => ({
+	MetadataManager: vi.fn(function MockMetadataManager() {
+		return mockMetadataManagerInstance;
+	}),
+}));
+
+vi.mock("../core/KBPathResolver.js", () => ({
+	extractRepoName: vi.fn(() => "test-repo"),
+	getRemoteUrl: vi.fn(() => null),
+	resolveKBPath: vi.fn(() => "/tmp/jolli-test-kb"),
+}));
+
+// Stateful mock controls whether the OrphanBranchStorage stub returned by the
+// constructor reports exists()==true. Tests that exercise the preflight set
+// this to true; default false so the preflight short-circuits in unrelated
+// tests.
+const orphanExistsForPreflight = vi.hoisted(() => ({ value: false }));
+
+vi.mock("../core/OrphanBranchStorage.js", () => ({
+	OrphanBranchStorage: vi.fn(function MockOrphanBranchStorage() {
+		return {
+			exists: vi.fn(async () => orphanExistsForPreflight.value),
+			ensure: vi.fn().mockResolvedValue(undefined),
+			readFile: vi.fn().mockResolvedValue(null),
+			writeFiles: vi.fn().mockResolvedValue(undefined),
+			listFiles: vi.fn().mockResolvedValue([]),
+		};
+	}),
+}));
+
+vi.mock("../core/FolderStorage.js", () => ({
+	FolderStorage: vi.fn(function MockFolderStorage() {
+		return {
+			exists: vi.fn().mockResolvedValue(true),
+			ensure: vi.fn().mockResolvedValue(undefined),
+			readFile: vi.fn().mockResolvedValue(null),
+			writeFiles: vi.fn().mockResolvedValue(undefined),
+			listFiles: vi.fn().mockResolvedValue([]),
+		};
+	}),
+}));
+
 vi.mock("../core/StaleChildMarkdownCleanup.js", () => ({
 	cleanupBranchStaleChildMarkdown: vi.fn().mockResolvedValue({ deleted: 0, failed: 0 }),
 	cleanupAllBranchesStaleChildMarkdown: vi.fn().mockResolvedValue({ deleted: 0, failed: 0 }),
@@ -138,7 +204,7 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		migrateOneToOne: vi.fn(),
 		storePlans: vi.fn(),
 		storeNotes: vi.fn(),
-		storeLinearIssues: vi.fn().mockResolvedValue(undefined),
+		storeReferences: vi.fn().mockResolvedValue(undefined),
 		setActiveStorage: vi.fn(),
 		// Real implementations -- runSquashPipeline / handleAmendPipeline call
 		// these to expand source commits and copy-hoist topics. The mocks above
@@ -267,12 +333,14 @@ import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
-	associateLinearIssueWithCommit,
+	associateNoteWithCommit,
+	associatePlanWithCommit,
+	associateReferenceWithCommit,
 	dequeueAllGitOperations,
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
-	detectUncommittedLinearIssueIds,
-	getLinearIssueEntriesForBranch,
+	detectUncommittedReferenceIds,
+	getReferenceEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
 	loadCursorForTranscript,
@@ -284,6 +352,7 @@ import { cleanupBranchStaleChildMarkdown } from "../core/StaleChildMarkdownClean
 import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary } from "../core/SummaryStore.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
+import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
 import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
 import type { GitOperation } from "../Types.js";
 import { __test__, runWorker } from "./QueueWorker.js";
@@ -333,13 +402,15 @@ describe("QueueWorker", () => {
 		vi.mocked(loadAllSessions).mockResolvedValue([]);
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
 		vi.mocked(saveCursor).mockResolvedValue(undefined);
-		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {} });
 		vi.mocked(savePlansRegistry).mockResolvedValue(undefined);
-		vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue([]);
-		vi.mocked(associateLinearIssueWithCommit).mockResolvedValue(undefined);
+		vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([]);
+		vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([]);
+		vi.mocked(associateReferenceWithCommit).mockResolvedValue(undefined);
 		vi.mocked(detectActivePlansForBranch).mockResolvedValue([]);
 		vi.mocked(detectActiveNotesForBranch).mockResolvedValue([]);
-		vi.mocked(getLinearIssueEntriesForBranch).mockResolvedValue([]);
+		vi.mocked(getReferenceEntriesForBranch).mockResolvedValue([]);
+		vi.mocked(getReferenceEntriesForBranch).mockResolvedValue([]);
 		vi.mocked(isCodexInstalled).mockResolvedValue(false);
 		vi.mocked(isOpenCodeInstalled).mockResolvedValue(false);
 		vi.mocked(isCursorInstalled).mockResolvedValue(false);
@@ -391,6 +462,44 @@ describe("QueueWorker", () => {
 		});
 	});
 
+	describe("runWorker — vault-write.lock failure path", () => {
+		it("records pendingWorker and returns early when vault lock acquisition fails", async () => {
+			// Pins QueueWorker.ts L295 (vaultLock === null branch) and
+			// L309-314 (recordPendingWorker call + early return). When the
+			// vault-write.lock is held by another writer, the worker must
+			// record its cwd so the next release re-spawns it, then exit
+			// without touching the queue.
+			vi.mocked(acquireVaultWriteLock).mockResolvedValueOnce(null);
+
+			await runWorker("/test/cwd-locked");
+
+			// The pending-worker entry must be recorded so a cross-repo
+			// release can wake us up.
+			expect(recordPendingWorker).toHaveBeenCalledTimes(1);
+			expect(recordPendingWorker).toHaveBeenCalledWith(expect.any(String), "/test/cwd-locked");
+			// And we MUST NOT have done any queue work.
+			expect(dequeueAllGitOperations).not.toHaveBeenCalled();
+			expect(acquireWorkerLock).not.toHaveBeenCalled();
+		});
+
+		it("consumePendingWorkers wakes other pending cwds but skips self on release", async () => {
+			// Pins the `pendingCwd !== cwd` guard on QueueWorker.ts L425 —
+			// when our own cwd is recorded as pending (e.g. we raced with
+			// ourselves), we must not infinitely re-spawn. Other cwds get
+			// `launchWorker` invoked.
+			vi.mocked(consumePendingWorkers).mockResolvedValueOnce(["/test/cwd", "/other/cwd"]);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(consumePendingWorkers).toHaveBeenCalledTimes(1);
+			// `launchWorker` is `v8 ignore`d (calls `spawn`), so we verify the
+			// observable side: `spawn` was invoked exactly once (for /other/cwd,
+			// not /test/cwd).
+			expect(vi.mocked(spawn)).toHaveBeenCalledTimes(1);
+		});
+	});
+
 	describe("runWorker — chain spawn", () => {
 		it("should detect remaining entries after processing and log chain spawn intent", async () => {
 			const op = makeCommitOp();
@@ -433,9 +542,9 @@ describe("QueueWorker", () => {
 			//   3. associateNotesWithCommit — re-loads registry but "ghost-note" is gone
 			// (associatePlansWithCommit skips loadPlansRegistry when slugs.size === 0)
 			vi.mocked(loadPlansRegistry)
-				.mockResolvedValueOnce({ version: 1, plans: {} })
+				.mockResolvedValueOnce({ version: 2, plans: {} })
 				.mockResolvedValueOnce({
-					version: 1,
+					version: 2,
 					plans: {},
 					notes: {
 						"ghost-note": {
@@ -450,7 +559,7 @@ describe("QueueWorker", () => {
 						},
 					},
 				})
-				.mockResolvedValueOnce({ version: 1, plans: {}, notes: {} });
+				.mockResolvedValueOnce({ version: 2, plans: {}, notes: {} });
 
 			await runWorker("/test/cwd");
 
@@ -462,8 +571,8 @@ describe("QueueWorker", () => {
 		});
 	});
 
-	describe("runWorker — Linear issue association", () => {
-		it("archives Linear issues into the summary with archivedKey populated", async () => {
+	describe("runWorker — entity association (multi-source)", () => {
+		it("archives entities into the summary with archivedKey populated (Linear projected to linearIssues)", async () => {
 			const op = makeCommitOp({ commitHash: "abc12345def67890" });
 			vi.mocked(dequeueAllGitOperations)
 				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
@@ -471,16 +580,25 @@ describe("QueueWorker", () => {
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks("abc12345def67890");
 
-			vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue(["PROJ-1528"]);
+			// Multi-source path: detectUncommittedReferenceIds returns the
+			// (mapKey, source, sourcePath) triple list that drives the archive.
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{
+					mapKey: "linear:PROJ-1528",
+					source: "linear",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
+				},
+			]);
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 1,
+				version: 2,
 				plans: {},
-				linearIssues: {
-					"PROJ-1528": {
-						ticketId: "PROJ-1528",
+				references: {
+					"linear:PROJ-1528": {
+						source: "linear",
+						nativeId: "PROJ-1528",
 						title: "Treat referenced Linear issues",
 						url: "https://linear.app/jolliai/issue/PROJ-1528/",
-						sourcePath: "/test/cwd/.jolli/jollimemory/linear-issues/PROJ-1528.md",
+						sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
 						branch: "feature/test",
 						addedAt: "2026-04-01T00:00:00Z",
 						updatedAt: "2026-04-01T00:00:00Z",
@@ -489,9 +607,13 @@ describe("QueueWorker", () => {
 					},
 				},
 			});
-			const { readLinearIssueMarkdown, renameLinearIssueMarkdown } = await import("../core/LinearIssueStore.js");
-			vi.mocked(readLinearIssueMarkdown).mockResolvedValue({
-				ticketId: "PROJ-1528",
+			const { readReferenceMarkdown, renameReferenceMarkdown } = await import(
+				"../core/references/ReferenceStore.js"
+			);
+			vi.mocked(readReferenceMarkdown).mockResolvedValue({
+				mapKey: "linear:PROJ-1528",
+				source: "linear",
+				nativeId: "PROJ-1528",
 				title: "Treat referenced Linear issues",
 				url: "https://linear.app/jolliai/issue/PROJ-1528/",
 				status: "In Progress",
@@ -509,17 +631,21 @@ describe("QueueWorker", () => {
 
 			expect(storeSummary).toHaveBeenCalledTimes(1);
 			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
-			expect(savedSummary.linearIssues).toBeDefined();
-			expect(savedSummary.linearIssues?.[0].archivedKey).toBe("PROJ-1528-abc12345");
-			expect(savedSummary.linearIssues?.[0].ticketId).toBe("PROJ-1528");
-			expect(savedSummary.linearIssues?.[0].title).toBe("Treat referenced Linear issues");
-			expect(renameLinearIssueMarkdown).toHaveBeenCalledWith(
-				"/test/cwd/.jolli/jollimemory/linear-issues/PROJ-1528.md",
-				"/test/cwd/.jolli/jollimemory/linear-issues/PROJ-1528-abc12345.md",
+			// Multi-source field: entities[] is the canonical post-Phase-2 shape.
+			expect(savedSummary.references).toBeDefined();
+			expect(savedSummary.references?.[0].archivedKey).toBe("linear:PROJ-1528-abc12345");
+			expect(savedSummary.references?.[0].source).toBe("linear");
+			expect(savedSummary.references?.[0].nativeId).toBe("PROJ-1528");
+			expect(savedSummary.references?.[0].title).toBe("Treat referenced Linear issues");
+			// Physical rename through ReferenceStore (referencePath stub returns the
+			// canonical references/<source>/<key>.md location).
+			expect(renameReferenceMarkdown).toHaveBeenCalledWith(
+				"/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
+				"/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528-abc12345.md",
 			);
 		});
 
-		it("skips Linear issues whose source markdown is unreadable but still completes the pipeline", async () => {
+		it("skips entities whose source markdown is unreadable but still completes the pipeline", async () => {
 			const op = makeCommitOp({ commitHash: "abc12345def67890" });
 			vi.mocked(dequeueAllGitOperations)
 				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
@@ -527,13 +653,20 @@ describe("QueueWorker", () => {
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks("abc12345def67890");
 
-			vi.mocked(detectUncommittedLinearIssueIds).mockResolvedValue(["PROJ-1528"]);
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{
+					mapKey: "linear:PROJ-1528",
+					source: "linear",
+					sourcePath: "/missing.md",
+				},
+			]);
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 1,
+				version: 2,
 				plans: {},
-				linearIssues: {
-					"PROJ-1528": {
-						ticketId: "PROJ-1528",
+				references: {
+					"linear:PROJ-1528": {
+						source: "linear",
+						nativeId: "PROJ-1528",
 						title: "t",
 						url: "u",
 						sourcePath: "/missing.md",
@@ -545,14 +678,341 @@ describe("QueueWorker", () => {
 					},
 				},
 			});
-			const { readLinearIssueMarkdown } = await import("../core/LinearIssueStore.js");
-			vi.mocked(readLinearIssueMarkdown).mockResolvedValue(null);
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockResolvedValue(null);
 
 			await runWorker("/test/cwd");
 
 			expect(storeSummary).toHaveBeenCalledTimes(1);
 			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
-			expect(savedSummary.linearIssues).toBeUndefined();
+			expect(savedSummary.references).toBeUndefined();
+		});
+
+		it("archives multiple sources (linear + jira)", async () => {
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{
+					mapKey: "linear:PROJ-1528",
+					source: "linear",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
+				},
+				{
+					mapKey: "jira:KAN-7",
+					source: "jira",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/jira/KAN-7.md",
+				},
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 2,
+				plans: {},
+				references: {
+					"linear:PROJ-1528": {
+						source: "linear",
+						nativeId: "PROJ-1528",
+						title: "Linear issue",
+						url: "https://linear.app/x/PROJ-1528",
+						sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
+						branch: "feature/test",
+						addedAt: "x",
+						updatedAt: "x",
+						commitHash: null,
+						sourceToolName: "mcp__linear__get_issue",
+					},
+					"jira:KAN-7": {
+						source: "jira",
+						nativeId: "KAN-7",
+						title: "Jira ticket",
+						url: "https://example.atlassian.net/browse/KAN-7",
+						sourcePath: "/test/cwd/.jolli/jollimemory/references/jira/KAN-7.md",
+						branch: "feature/test",
+						addedAt: "x",
+						updatedAt: "x",
+						commitHash: null,
+						sourceToolName: "mcp__jira__get_issue",
+					},
+				},
+			});
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockImplementation(async (path: string) => {
+				if (path.includes("PROJ-1528")) {
+					return {
+						mapKey: "linear:PROJ-1528",
+						source: "linear",
+						nativeId: "PROJ-1528",
+						title: "Linear issue",
+						url: "https://linear.app/x/PROJ-1528",
+						toolName: "mcp__linear__get_issue",
+						referencedAt: "2026-05-14T06:06:01.123Z",
+					};
+				}
+				if (path.includes("KAN-7")) {
+					return {
+						mapKey: "jira:KAN-7",
+						source: "jira",
+						nativeId: "KAN-7",
+						title: "Jira ticket",
+						url: "https://example.atlassian.net/browse/KAN-7",
+						toolName: "mcp__jira__get_issue",
+						referencedAt: "2026-05-14T06:06:02.123Z",
+					};
+				}
+				return null;
+			});
+
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("file content");
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(savedSummary.references).toHaveLength(2);
+			const sources = savedSummary.references?.map((r) => r.source).sort();
+			expect(sources).toEqual(["jira", "linear"]);
+			// References include both linear and jira entries.
+			const linearRef = savedSummary.references?.find((r) => r.source === "linear");
+			expect(linearRef?.nativeId).toBe("PROJ-1528");
+		});
+
+		it("skips ids whose mapKey is not present in plans.json.references (registry miss)", async () => {
+			// Regression guard: associateReferencesWithCommit must tolerate
+			// detectUncommittedReferenceIds returning a mapKey that's been removed
+			// from plans.json between detect and archive — log + skip, do not
+			// throw. Without this guard the whole pipeline would explode on
+			// concurrent ignoreEntity + commit.
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{
+					mapKey: "linear:GHOST-1",
+					source: "linear",
+					sourcePath: "/tmp/ghost.md",
+				},
+			]);
+			// Registry contains no matching entry — the dropped path fires.
+			vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {}, references: {} });
+
+			await runWorker("/test/cwd");
+
+			// Pipeline still completes; summary contains no entities.
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(savedSummary.references).toBeUndefined();
+		});
+
+		it("preserves notes on save and tolerates a mix of present + dropped ids during merge (L1061/1065/1072)", async () => {
+			// Pins three sibling branches in `associateReferencesWithCommit`'s
+			// near-write reread path (QueueWorker.ts L1059-1073):
+			//
+			//   • L1061: `updatedEntities[mapKey] !== undefined` falsy arm —
+			//     iterates the ghost id whose mapKey was dropped earlier.
+			//   • L1065: `updatedEntities[archivedKey] !== undefined` falsy arm
+			//     — same dropped id has no archivedKey either.
+			//   • L1072: `freshRegistry.notes !== undefined` truthy spread —
+			//     when notes are present they must survive the rewrite.
+			//
+			// Without the falsy arms an unrecognised id would crash the merge;
+			// without the notes spread, concurrent NoteService work would be
+			// silently nuked on save.
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{
+					mapKey: "linear:PROJ-1528",
+					source: "linear",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
+				},
+				{
+					mapKey: "linear:GHOST-1",
+					source: "linear",
+					sourcePath: "/tmp/ghost.md",
+				},
+			]);
+			// Registry: one match, one miss, plus a notes section that must
+			// survive the rewrite (L1072 truthy spread).
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 2,
+				plans: {},
+				notes: {
+					"note-1": {
+						id: "note-1",
+						title: "keep me",
+						format: "snippet",
+						branch: "feature/test",
+						commitHash: null,
+						sourcePath: "/repo/.jolli/jollimemory/notes/note-1.md",
+						addedAt: "y",
+						updatedAt: "y",
+					},
+				},
+				references: {
+					"linear:PROJ-1528": {
+						source: "linear",
+						nativeId: "PROJ-1528",
+						title: "Real entry",
+						url: "https://linear.app/x/PROJ-1528",
+						sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
+						branch: "feature/test",
+						addedAt: "x",
+						updatedAt: "x",
+						commitHash: null,
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockResolvedValue({
+				mapKey: "linear:PROJ-1528",
+				source: "linear",
+				nativeId: "PROJ-1528",
+				title: "Real entry",
+				url: "https://linear.app/x/PROJ-1528",
+				toolName: "mcp__linear__get_issue",
+				referencedAt: "2026-05-14T06:06:01.123Z",
+			});
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("file content");
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			// Real entry archived; ghost dropped.
+			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(savedSummary.references).toHaveLength(1);
+			expect(savedSummary.references?.[0].nativeId).toBe("PROJ-1528");
+			// Registry save was called with the notes section preserved
+			// (L1072 truthy arm) and the dropped id absent (L1061/1065 falsy).
+			const saveCalls = vi.mocked(savePlansRegistry).mock.calls;
+			const lastSave = saveCalls[saveCalls.length - 1][0] as Extract<
+				(typeof saveCalls)[number][0],
+				{ version: 2 }
+			>;
+			expect(lastSave.version).toBe(2);
+			expect(lastSave.notes).toEqual({
+				"note-1": {
+					id: "note-1",
+					title: "keep me",
+					format: "snippet",
+					branch: "feature/test",
+					commitHash: null,
+					sourcePath: "/repo/.jolli/jollimemory/notes/note-1.md",
+					addedAt: "y",
+					updatedAt: "y",
+				},
+			});
+			expect(lastSave.references?.["linear:GHOST-1"]).toBeUndefined();
+		});
+	});
+
+	describe("runWorker — Step 6b prompt assembly (multi-source)", () => {
+		it("pulls active entities from getReferenceEntriesForBranch and renders one block per source", async () => {
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			// Provide active entries for two sources — Linear and Jira. Step 6b
+			// must call getReferenceEntriesForBranch (NOT getReferenceEntriesForBranch).
+			vi.mocked(getReferenceEntriesForBranch).mockResolvedValue([
+				{
+					source: "linear",
+					nativeId: "PROJ-9",
+					title: "Linear active",
+					url: "https://linear.app/x/PROJ-9",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-9.md",
+					branch: "feature/test",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: null,
+					sourceToolName: "mcp__linear__get_issue",
+				},
+				{
+					source: "jira",
+					nativeId: "KAN-9",
+					title: "Jira active",
+					url: "https://example.atlassian.net/browse/KAN-9",
+					sourcePath: "/test/cwd/.jolli/jollimemory/references/jira/KAN-9.md",
+					branch: "feature/test",
+					addedAt: "x",
+					updatedAt: "x",
+					commitHash: null,
+					sourceToolName: "mcp__jira__get_issue",
+				},
+			]);
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockImplementation(async (path: string) => {
+				if (path.includes("PROJ-9")) {
+					return {
+						mapKey: "linear:PROJ-9",
+						source: "linear",
+						nativeId: "PROJ-9",
+						title: "Linear active",
+						url: "https://linear.app/x/PROJ-9",
+						toolName: "mcp__linear__get_issue",
+						referencedAt: "2026-05-14T06:06:01.123Z",
+					};
+				}
+				if (path.includes("KAN-9")) {
+					return {
+						mapKey: "jira:KAN-9",
+						source: "jira",
+						nativeId: "KAN-9",
+						title: "Jira active",
+						url: "https://example.atlassian.net/browse/KAN-9",
+						toolName: "mcp__jira__get_issue",
+						referencedAt: "2026-05-14T06:06:02.123Z",
+					};
+				}
+				return null;
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(getReferenceEntriesForBranch).toHaveBeenCalledWith("/test/cwd", "feature/test");
+			// generateSummary receives the rendered block. Today the only
+			// registered adapter is Linear, so only Linear refs appear in the
+			// block; once Jira adapter lands the second adapter will append its
+			// own XML section. Either way readReferenceMarkdown is called for
+			// EVERY active entity (not just Linear).
+			expect(readReferenceMarkdown).toHaveBeenCalledWith(
+				"/test/cwd/.jolli/jollimemory/references/linear/PROJ-9.md",
+			);
+			expect(readReferenceMarkdown).toHaveBeenCalledWith("/test/cwd/.jolli/jollimemory/references/jira/KAN-9.md");
+		});
+
+		it("calls generateSummary with empty referenceBlocks when no active entities exist", async () => {
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+			vi.mocked(getReferenceEntriesForBranch).mockResolvedValue([]);
+
+			await runWorker("/test/cwd");
+
+			expect(generateSummary).toHaveBeenCalledTimes(1);
+			const call = vi.mocked(generateSummary).mock.calls[0][0];
+			// Empty-source path: no adapter has refs → join("") → "".
+			expect(call.referenceBlocks).toBe("");
 		});
 	});
 
@@ -802,7 +1262,7 @@ describe("QueueWorker", () => {
 	describe("detectUncommittedNoteIds", () => {
 		it("returns only notes with null commitHash and no ignored/contentHashAtCommit", async () => {
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {},
 				notes: {
 					fresh: {
@@ -858,7 +1318,7 @@ describe("QueueWorker", () => {
 		});
 
 		it("returns empty set when registry has no notes field", async () => {
-			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({ version: 1, plans: {} });
+			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({ version: 2, plans: {} });
 			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "main");
 			expect(ids.size).toBe(0);
 		});
@@ -869,7 +1329,7 @@ describe("QueueWorker", () => {
 			// Without the branch filter, notes from `feature/idle` would be
 			// associated with a commit on `feature/active`.
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {},
 				notes: {
 					"current-note": {
@@ -906,7 +1366,7 @@ describe("QueueWorker", () => {
 			const { createHash } = await import("node:crypto");
 			const oldHash = createHash("sha256").update("v1\n").digest("hex");
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {},
 				notes: {
 					"revived-note": {
@@ -934,7 +1394,7 @@ describe("QueueWorker", () => {
 			const body = "v1\n";
 			const hash = createHash("sha256").update(body).digest("hex");
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {},
 				notes: {
 					"stable-note": {
@@ -959,7 +1419,7 @@ describe("QueueWorker", () => {
 
 		it("excludes guard notes whose source file is missing on disk", async () => {
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 1,
+				version: 2,
 				plans: {},
 				notes: {
 					"gone-note": {
@@ -1539,6 +1999,202 @@ describe("QueueWorker", () => {
 			);
 
 			expect(cleanupBranchStaleChildMarkdown).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("reassociateMetadata — multi-source entities", () => {
+		// Direct invocations of the private helper via __test__. These exercise
+		// every code path of the post-2.11 refactor (plans + notes + multi-source
+		// entities + legacy linearIssues fallback + both-fields-present dedupe)
+		// without going through the squash / amend / rebase-pick wrappers — each
+		// wrapper already has its own coverage tests above; here we focus on the
+		// behaviour change isolated.
+
+		beforeEach(() => {
+			vi.mocked(associatePlanWithCommit).mockResolvedValue(undefined);
+			vi.mocked(associateNoteWithCommit).mockResolvedValue(undefined);
+			vi.mocked(associateReferenceWithCommit).mockResolvedValue(undefined);
+		});
+
+		it("dispatches multi-source references[] through associateReferenceWithCommit", async () => {
+			const oldSummary = {
+				version: 5,
+				commitHash: "oldhash",
+				commitMessage: "x",
+				commitAuthor: "x",
+				commitDate: "x",
+				branch: "main",
+				generatedAt: "x",
+				references: [
+					{
+						archivedKey: "linear:PROJ-1-abc12345",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "L1",
+						url: "u",
+						referencedAt: "x",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+					{
+						archivedKey: "jira:KAN-5-def67890",
+						source: "jira",
+						nativeId: "KAN-5",
+						title: "J1",
+						url: "u",
+						referencedAt: "x",
+						sourceToolName: "mcp__atlassian__getJiraIssue",
+					},
+				],
+			} as never;
+
+			await __test__.reassociateMetadata([oldSummary], "newhash", "/cwd");
+
+			expect(associateReferenceWithCommit).toHaveBeenCalledTimes(2);
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith("linear:PROJ-1-abc12345", "newhash", "/cwd");
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith("jira:KAN-5-def67890", "newhash", "/cwd");
+		});
+
+		it("dedupes within entities[] itself when the same archivedKey appears twice (defensive)", async () => {
+			// Same archivedKey duplicated on `entities` — should still associate
+			// only once. Belt-and-braces against a future writer bug.
+			const oldSummary = {
+				version: 5,
+				commitHash: "oldhash",
+				commitMessage: "x",
+				commitAuthor: "x",
+				commitDate: "x",
+				branch: "main",
+				generatedAt: "x",
+				references: [
+					{
+						archivedKey: "linear:PROJ-1-abc12345",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "L1",
+						url: "u",
+						referencedAt: "x",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+					{
+						archivedKey: "linear:PROJ-1-abc12345",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "L1-dupe",
+						url: "u",
+						referencedAt: "x",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as never;
+
+			await __test__.reassociateMetadata([oldSummary], "newhash", "/cwd");
+
+			expect(associateReferenceWithCommit).toHaveBeenCalledTimes(1);
+		});
+
+		it("still associates plans and notes alongside entities (lock-step contract)", async () => {
+			// Regression for the original "notes forgotten in some paths" bug
+			// the helper exists to prevent. plans + notes + entities all flow
+			// through one helper invocation.
+			const oldSummary = {
+				version: 5,
+				commitHash: "oldhash",
+				commitMessage: "x",
+				commitAuthor: "x",
+				commitDate: "x",
+				branch: "main",
+				generatedAt: "x",
+				plans: [{ slug: "p-1" } as never],
+				notes: [{ id: "n-1" } as never],
+				references: [
+					{
+						archivedKey: "linear:PROJ-1-abc12345",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "L1",
+						url: "u",
+						referencedAt: "x",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as never;
+
+			await __test__.reassociateMetadata([oldSummary], "newhash", "/cwd");
+
+			expect(associatePlanWithCommit).toHaveBeenCalledWith("p-1", "newhash", "/cwd");
+			expect(associateNoteWithCommit).toHaveBeenCalledWith("n-1", "newhash", "/cwd");
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith("linear:PROJ-1-abc12345", "newhash", "/cwd");
+		});
+
+		it("no-ops when neither entities nor linearIssues are present", async () => {
+			const oldSummary = {
+				version: 5,
+				commitHash: "oldhash",
+				commitMessage: "x",
+				commitAuthor: "x",
+				commitDate: "x",
+				branch: "main",
+				generatedAt: "x",
+			} as never;
+
+			await __test__.reassociateMetadata([oldSummary], "newhash", "/cwd");
+
+			expect(associateReferenceWithCommit).not.toHaveBeenCalled();
+			expect(associateReferenceWithCommit).not.toHaveBeenCalled();
+		});
+
+		it("handles multiple oldSummaries in one call (squash N:1 path)", async () => {
+			// Squash pipeline passes the full source-summary array. Each summary
+			// contributes its own entities; cross-summary archivedKey dedupe is
+			// NOT enforced (each commit's row is independent in the registry —
+			// but in practice the same archivedKey across summaries would imply
+			// the same registry row, and the second associate is a no-op write).
+			const a = {
+				version: 5,
+				commitHash: "a",
+				commitMessage: "x",
+				commitAuthor: "x",
+				commitDate: "x",
+				branch: "main",
+				generatedAt: "x",
+				references: [
+					{
+						archivedKey: "linear:A-1-aaa11111",
+						source: "linear",
+						nativeId: "A-1",
+						title: "A",
+						url: "u",
+						referencedAt: "x",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as never;
+			const b = {
+				version: 5,
+				commitHash: "b",
+				commitMessage: "x",
+				commitAuthor: "x",
+				commitDate: "x",
+				branch: "main",
+				generatedAt: "x",
+				references: [
+					{
+						archivedKey: "jira:B-1-bbb22222",
+						source: "jira",
+						nativeId: "B-1",
+						title: "B",
+						url: "u",
+						referencedAt: "x",
+						sourceToolName: "mcp__atlassian__getJiraIssue",
+					},
+				],
+			} as never;
+
+			await __test__.reassociateMetadata([a, b], "newhash", "/cwd");
+
+			expect(associateReferenceWithCommit).toHaveBeenCalledTimes(2);
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith("linear:A-1-aaa11111", "newhash", "/cwd");
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith("jira:B-1-bbb22222", "newhash", "/cwd");
 		});
 	});
 });

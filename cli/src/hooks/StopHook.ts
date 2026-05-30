@@ -15,11 +15,12 @@
  *   2. Incrementally scans the transcript for plan file references and updates
  *      .jolli/jollimemory/plans.json — so the VSCode PLANS panel can display them
  *      without expensive full-transcript scans.
- *   3. Incrementally scans the transcript for Linear MCP issue references
- *      (mcp__linear__* tool_use → tool_result pairs), writes per-issue
- *      markdown to .jolli/jollimemory/linear-issues/, and upserts the
- *      linearIssues registry inside plans.json so the same PLANS panel can
- *      show them alongside plans and notes.
+ *   3. Incrementally scans the transcript for reference refs across every
+ *      registered SourceAdapter (Linear / Jira / GitHub / Notion / …) via the
+ *      generic `extractReferencesFromTranscript` loop. Each ref is persisted via
+ *      `upsertReferenceEntry` into the v2 `plans.json.references` map and rendered
+ *      to per-reference markdown by `ReferenceStore`, so the VSCode panel surfaces
+ *      them alongside plans and notes.
  *
  * This hook runs with { "async": true } so it doesn't block Claude Code.
  */
@@ -30,9 +31,9 @@ import { homedir } from "node:os";
 import { join, resolve as pathResolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { extractLinearIssuesFromTranscript } from "../core/LinearIssueExtractor.js";
-import { writeLinearIssueMarkdown } from "../core/LinearIssueStore.js";
 import { normalizePathForCompare } from "../core/PathUtils.js";
+import { extractReferencesFromTranscript } from "../core/references/ReferenceExtractor.js";
+import { ALL_ADAPTERS } from "../core/references/sources/index.js";
 import {
 	loadConfig,
 	loadCursorForTranscript,
@@ -40,7 +41,7 @@ import {
 	saveCursor,
 	savePlansRegistry,
 	saveSession,
-	upsertLinearIssueEntry,
+	upsertReferenceEntry,
 } from "../core/SessionTracker.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ClaudeHookInput, PlanEntry, SessionInfo } from "../Types.js";
@@ -135,12 +136,13 @@ export async function handleStopHook(): Promise<void> {
 		log.error("Plan discovery failed: %s", (error as Error).message);
 	}
 
-	// Incrementally scan transcript for Linear MCP issue references → write
-	// markdown files + plans.json.linearIssues
+	// Incrementally scan transcript for reference refs (Linear / Jira / GitHub /
+	// Notion / …). Routes through every registered SourceAdapter and writes
+	// markdown files + plans.json.references.
 	try {
-		await discoverLinearIssuesFromTranscript(sessionInfo, projectDir);
+		await discoverReferencesFromTranscript(sessionInfo, projectDir);
 	} catch (error: unknown) {
-		log.error("Linear issue discovery failed: %s", (error as Error).message);
+		log.error("Reference discovery failed: %s", (error as Error).message);
 	}
 }
 
@@ -443,11 +445,11 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 				merged[slug] = ours;
 			}
 		}
-		// Spread freshRegistry first to preserve notes / linearIssues — otherwise
+		// Spread freshRegistry first to preserve notes / references — otherwise
 		// any sibling pipeline that wrote them between our load and save (e.g.
 		// the note service from the extension, the Linear discovery loop below)
 		// loses its work.
-		await savePlansRegistry({ ...freshRegistry, version: 1, plans: merged }, cwd);
+		await savePlansRegistry({ ...freshRegistry, version: 2, plans: merged }, cwd);
 		log.info(
 			"Plan discovery: upserted %d slug(s) + %d external path(s) into plans.json",
 			slugs.size,
@@ -533,24 +535,31 @@ function scanTranscriptForPlans(
 	});
 }
 
-// ─── Linear Issue Discovery ─────────────────────────────────────────────────
+// ─── Reference Discovery (multi-source) ─────────────────────────────────────
 
-/** Cursor key prefix for Linear issue scan position, parallel to PLAN_CURSOR_PREFIX. */
+/**
+ * Cursor key prefix for reference scan position, parallel to PLAN_CURSOR_PREFIX.
+ *
+ * Kept as `linear:` for one release so already-on-disk cursors from the
+ * Linear-only era remain valid — the scan window only advances forward.
+ * Phase 3 can migrate this to `reference:` alongside a one-time cursor key rewrite.
+ */
 const LINEAR_CURSOR_PREFIX = "linear:";
 
 /**
- * Incrementally scans the transcript for Linear MCP tool_use/tool_result pairs
- * and persists discovered issues:
- *   1. extractLinearIssuesFromTranscript with cursor → LinearIssueRef[]
- *   2. For each ref:
- *        - writeLinearIssueMarkdown → .jolli/jollimemory/linear-issues/<ticketId>.md
- *        - upsertLinearIssueEntry → plans.json.linearIssues
- *   3. Persist cursor advance.
+ * Incrementally scans the transcript for ALL registered source adapters
+ * (Linear / Jira / GitHub / Notion / …) and persists discovered references:
+ *   1. extractReferencesFromTranscript(transcriptPath, ALL_ADAPTERS, …) → Reference[]
+ *   2. For each ref: upsertReferenceEntry routes the row into plans.json.references
+ *      and writes per-reference markdown via ReferenceStore.writeReferenceMarkdown.
+ *   3. Persist cursor advance on all three terminal paths (zero references,
+ *      partial upsert failure, full success) so we never re-scan the same
+ *      transcript window.
  *
  * Each StopHook invocation only reads newly appended JSONL lines. The cursor
  * for this scan is independent of plan-discovery's cursor (different prefix).
  */
-async function discoverLinearIssuesFromTranscript(sessionInfo: SessionInfo, cwd: string): Promise<void> {
+async function discoverReferencesFromTranscript(sessionInfo: SessionInfo, cwd: string): Promise<void> {
 	const transcriptPath = sessionInfo.transcriptPath;
 	if (!existsSync(transcriptPath)) return;
 
@@ -558,12 +567,13 @@ async function discoverLinearIssuesFromTranscript(sessionInfo: SessionInfo, cwd:
 	const cursor = await loadCursorForTranscript(cursorKey, cwd);
 	const fromLineNumber = cursor?.lineNumber ?? 0;
 
-	const { issues, lastLineNumberScanned } = await extractLinearIssuesFromTranscript(transcriptPath, {
+	const { references, lastLineNumberScanned } = await extractReferencesFromTranscript(transcriptPath, ALL_ADAPTERS, {
 		fromLineNumber,
 	});
 
-	if (issues.length === 0) {
-		// Even with no issues, advance the cursor so we don't re-scan the same lines next time.
+	// Zero-reference path: even with no references, advance the cursor so we
+	// don't re-scan the same lines next time.
+	if (references.length === 0) {
 		if (lastLineNumberScanned > fromLineNumber) {
 			await saveCursor(
 				{ transcriptPath: cursorKey, lineNumber: lastLineNumberScanned, updatedAt: new Date().toISOString() },
@@ -576,33 +586,37 @@ async function discoverLinearIssuesFromTranscript(sessionInfo: SessionInfo, cwd:
 	const branch = getCurrentBranch(cwd);
 	const upserted: string[] = [];
 	const failed: string[] = [];
-	for (const ref of issues) {
-		// Per-iteration try/catch: a single bad ticket (e.g. permission error
+	for (const ref of references) {
+		// Per-iteration try/catch: a single bad ref (e.g. permission error
 		// writing markdown, or a transient plans.json write contention) must
 		// not abort the batch — otherwise subsequent refs are lost AND the
 		// cursor save below is skipped, so the next StopHook re-processes the
 		// same refs and hits the same failure in a loop.
 		try {
-			const { sourcePath, contentHash } = await writeLinearIssueMarkdown(ref, cwd);
-			await upsertLinearIssueEntry(ref, sourcePath, contentHash, branch, cwd);
-			upserted.push(ref.ticketId);
+			await upsertReferenceEntry(ref, cwd, branch);
+			upserted.push(ref.mapKey);
 		} catch (err) {
-			log.error(
-				"Linear issue discovery: failed to persist %s: %s — continuing with rest of batch",
-				ref.ticketId,
+			log.warn(
+				"Reference discovery: failed to persist %s: %s — continuing with rest of batch",
+				ref.mapKey,
 				(err as Error).message,
 			);
-			failed.push(ref.ticketId);
+			failed.push(ref.mapKey);
 		}
 	}
 	log.info(
-		"Linear issue discovery: upserted %d of %d ref(s): [%s]%s",
+		"Reference discovery: upserted %d of %d ref(s)%s",
 		upserted.length,
-		issues.length,
-		upserted.join(", "),
+		references.length,
 		failed.length > 0 ? ` (failed: [${failed.join(", ")}])` : "",
 	);
 
+	// Cursor advance on success / partial failure / total failure paths.
+	// upsertReferenceEntry is idempotent (same contentHash → skip write) and
+	// returns early for already-ignored entries, so re-scanning the same window
+	// can neither corrupt state nor resurrect an ignored entry. Advancing the
+	// cursor is purely an optimisation — it avoids re-scanning the same
+	// tool_results (wasted CPU + redundant idempotent writes) on the next pass.
 	await saveCursor(
 		{ transcriptPath: cursorKey, lineNumber: lastLineNumberScanned, updatedAt: new Date().toISOString() },
 		cwd,

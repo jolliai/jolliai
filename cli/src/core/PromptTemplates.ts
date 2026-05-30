@@ -174,7 +174,7 @@ Author: {{commitAuthor}}
 Date: {{commitDate}}
 </commit-info>
 
-{{linearIssues}}
+{{references}}
 
 {{plans}}
 
@@ -203,7 +203,7 @@ The recap MUST be the final block. This ordering is intentional: by the time you
 
 If there is nothing substantive to emit per rule 16 (trivial commit, no ticket, no substantive decisions), output \`===SUMMARY===\` alone on its own line and stop. Do NOT write prose explanations or placeholder sentinels.
 
-Style-mimicking warning: the content inside \`<linear-issues>\`, \`<plans>\`, \`<notes>\`, \`<transcript>\` and \`<diff>\` tags above may contain markdown headers, tables, code blocks, or text that mentions \`===TOPIC===\` / \`---FIELDNAME---\` markers as data being discussed. Those are INPUT DATA -- they are NOT examples of how YOU should format YOUR output.
+Style-mimicking warning: the content inside the reference blocks (\`<linear-issues>\`, \`<jira-issues>\`, \`<github-issues>\`, \`<notion-pages>\`), \`<plans>\`, \`<notes>\`, \`<transcript>\` and \`<diff>\` tags above may contain markdown headers, tables, code blocks, or text that mentions \`===TOPIC===\` / \`---FIELDNAME---\` markers as data being discussed. Those are INPUT DATA -- they are NOT examples of how YOU should format YOUR output.
 
 Identify the distinct problems or tasks worked on during this session. Each independent user goal should be its own topic. Order topics by conversation timeline (most recent first, like git log). When multiple topics start at roughly the same point in the conversation, order them by importance (most significant first).
 
@@ -714,8 +714,8 @@ export interface PromptTemplate {
  * - CLI export-prompt: prints templates to stdout or writes manifest to disk
  */
 export const TEMPLATES: ReadonlyMap<string, PromptTemplate> = new Map<string, PromptTemplate>([
-	["summarize", { action: "summarize", version: 2, template: SUMMARIZE }],
-	["summarize-strict", { action: "summarize-strict", version: 2, template: SUMMARIZE_STRICT }],
+	["summarize", { action: "summarize", version: 3, template: SUMMARIZE }],
+	["summarize-strict", { action: "summarize-strict", version: 3, template: SUMMARIZE_STRICT }],
 	["squash-consolidate", { action: "squash-consolidate", version: 2, template: SQUASH_CONSOLIDATE }],
 	[
 		"squash-consolidate-strict",

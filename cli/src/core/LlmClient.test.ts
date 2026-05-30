@@ -1,16 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	callLlm,
+	DIRECT_FETCH_TIMEOUT_MS,
 	isLlmCredentialError,
 	LlmCredentialError,
 	NO_LLM_PROVIDER_MESSAGE,
+	PROXY_FETCH_TIMEOUT_MS,
 	resolveLlmCredentialSource,
 } from "./LlmClient.js";
 
-const { mockCreate, mockLogInfo, mockLogWarn } = vi.hoisted(() => ({
+const { mockCreate, mockLogInfo, mockLogWarn, mockLogError } = vi.hoisted(() => ({
 	mockCreate: vi.fn(),
 	mockLogInfo: vi.fn(),
 	mockLogWarn: vi.fn(),
+	mockLogError: vi.fn(),
 }));
 
 // Mock Anthropic SDK — must use `function` (not arrow) so `new Anthropic()` works in Vitest 4.x
@@ -27,7 +30,7 @@ vi.mock("../Logger.js", () => ({
 		info: mockLogInfo,
 		warn: mockLogWarn,
 		debug: vi.fn(),
-		error: vi.fn(),
+		error: mockLogError,
 	}),
 }));
 
@@ -45,6 +48,7 @@ describe("LlmClient", () => {
 		mockCreate.mockReset();
 		mockLogInfo.mockReset();
 		mockLogWarn.mockReset();
+		mockLogError.mockReset();
 		mockCreate.mockResolvedValue({
 			content: [{ type: "text", text: "response text" }],
 			model: "claude-sonnet-4-6",
@@ -266,6 +270,37 @@ describe("LlmClient", () => {
 			// Second positional arg is the SDK's per-request options bag.
 			const requestOptions = call?.[1] as { signal?: unknown } | undefined;
 			expect(requestOptions?.signal).toBeInstanceOf(AbortSignal);
+		});
+
+		it("logs model, maxTokens, promptChars and elapsedMs on failure so timeout-vs-size is diagnosable", async () => {
+			// The pre-fix failure log only carried action/baseUrl/message/cause —
+			// when a large squash/regenerate prompt hit the wall-clock timeout the
+			// log gave no way to tell HOW big the prompt was or HOW long it ran
+			// before aborting. These fields make "Request was aborted." actionable
+			// in debug.log without re-running the failing call.
+			mockCreate.mockRejectedValueOnce(new Error("Request was aborted."));
+
+			await expect(
+				callLlm({
+					action: "translate",
+					params: { content: "test" },
+					apiKey: "sk-ant-test",
+					model: "claude-sonnet-4-6",
+					maxTokens: 8192,
+				}),
+			).rejects.toThrow("LLM direct request to https://api.anthropic.com failed: Request was aborted.");
+
+			expect(mockLogError).toHaveBeenCalledWith(
+				expect.stringMatching(/model=%s.*maxTokens=%d.*promptChars=%d.*elapsedMs=%d/),
+				"translate", // action
+				expect.any(String), // resolved model id
+				8192, // maxTokens
+				expect.any(Number), // promptChars
+				expect.any(Number), // elapsedMs
+				"https://api.anthropic.com", // baseUrl
+				"Request was aborted.", // message
+				expect.any(String), // cause
+			);
 		});
 	});
 
@@ -779,6 +814,19 @@ describe("LlmClient", () => {
 			expect(isLlmCredentialError(undefined)).toBe(false);
 			expect(isLlmCredentialError("string error")).toBe(false);
 			expect(isLlmCredentialError({ message: NO_LLM_PROVIDER_MESSAGE })).toBe(false);
+		});
+	});
+
+	describe("fetch timeout budgets", () => {
+		it("caps direct and proxy LLM calls at 180s (raised from 120s for large squash/regenerate prompts)", () => {
+			// Regenerate of a large squash commit aggregates the whole tree's
+			// transcripts + diff into one prompt; at the previous 120s ceiling the
+			// non-streaming Anthropic call was aborted mid-flight ("Request was
+			// aborted."). 180s gives the largest prompts headroom. Both paths move
+			// together so the proxy backend's own Anthropic round-trip — which the
+			// proxy fetch wraps — gets the same budget.
+			expect(DIRECT_FETCH_TIMEOUT_MS).toBe(180_000);
+			expect(PROXY_FETCH_TIMEOUT_MS).toBe(180_000);
 		});
 	});
 });

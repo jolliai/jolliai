@@ -9,8 +9,9 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 	return { ...actual, readFile: mockReadFile };
 });
 
-import type { LinearIssueRef } from "../Types.js";
-import { extractLinearIssuesFromTranscript, formatLinearIssuesBlock } from "./LinearIssueExtractor.js";
+import type { Reference } from "../../Types.js";
+import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
+import { LinearAdapter } from "./sources/LinearAdapter.js";
 
 // ─── Fixture builders ────────────────────────────────────────────────────────
 
@@ -86,9 +87,9 @@ beforeEach(() => {
 	mockReadFile.mockReset();
 });
 
-// ─── extractLinearIssuesFromTranscript ───────────────────────────────────────
+// ─── extractReferencesFromTranscript ───────────────────────────────────────
 
-describe("extractLinearIssuesFromTranscript", () => {
+describe("extractReferencesFromTranscript", () => {
 	it("extracts a single get_issue payload as one ref with full description", async () => {
 		const jsonl = makeJsonl(
 			toolUseLine({
@@ -104,11 +105,13 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues, lastLineNumberScanned } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript("/fake.jsonl", [
+			LinearAdapter,
+		]);
 
-		expect(issues).toHaveLength(1);
-		expect(issues[0]).toMatchObject({
-			ticketId: "PROJ-1528",
+		expect(references).toHaveLength(1);
+		expect(references[0]).toMatchObject({
+			nativeId: "PROJ-1528",
 			title: SAMPLE_ISSUE_PAYLOAD.title,
 			url: SAMPLE_ISSUE_PAYLOAD.url,
 			status: "In Progress",
@@ -117,7 +120,7 @@ describe("extractLinearIssuesFromTranscript", () => {
 			toolName: "mcp__linear__get_issue",
 			referencedAt: "2026-05-14T06:06:01.123Z",
 		});
-		expect(issues[0].description).toContain("Linear issues are high-density");
+		expect(references[0].description).toContain("Linear issues are high-density");
 		expect(lastLineNumberScanned).toBe(2);
 	});
 
@@ -137,13 +140,13 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues.map((i) => i.ticketId)).toEqual(["PROJ-1528", "PROJ-1404"]);
-		expect(issues.every((i) => i.toolName === "mcp__linear__list_issues")).toBe(true);
+		expect(references.map((i) => i.nativeId)).toEqual(["PROJ-1528", "PROJ-1404"]);
+		expect(references.every((i) => i.toolName === "mcp__linear__list_issues")).toBe(true);
 	});
 
-	it("dedupes same ticketId across multiple references, keeping the latest referencedAt", async () => {
+	it("dedupes same nativeId across multiple references, keeping the latest referencedAt", async () => {
 		const jsonl = makeJsonl(
 			// First: list result (no description)
 			toolUseLine({
@@ -170,12 +173,12 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
-		expect(issues[0].title).toBe(SAMPLE_ISSUE_PAYLOAD.title);
-		expect(issues[0].referencedAt).toBe("2026-05-14T07:00:01.000Z");
-		expect(issues[0].description).toContain("Linear issues are high-density");
+		expect(references).toHaveLength(1);
+		expect(references[0].title).toBe(SAMPLE_ISSUE_PAYLOAD.title);
+		expect(references[0].referencedAt).toBe("2026-05-14T07:00:01.000Z");
+		expect(references[0].description).toContain("Linear issues are high-density");
 	});
 
 	it("silently drops a tool_use that has no matching tool_result", async () => {
@@ -189,9 +192,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(0);
+		expect(references).toHaveLength(0);
 	});
 
 	it("skips tool_result whose text is not valid JSON without throwing", async () => {
@@ -219,10 +222,10 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("PROJ-1528");
+		expect(references).toHaveLength(1);
+		expect(references[0].nativeId).toBe("PROJ-1528");
 	});
 
 	it("filters out payloads whose shape does not match an issue (e.g. list_teams)", async () => {
@@ -243,9 +246,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(0);
+		expect(references).toHaveLength(0);
 	});
 
 	it("ignores non-Linear MCP tools via the mcp__linear__ prefix gate", async () => {
@@ -264,9 +267,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(0);
+		expect(references).toHaveLength(0);
 	});
 
 	it("respects beforeTimestamp cutoff, dropping tool_results after the cutoff", async () => {
@@ -294,12 +297,12 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl", {
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter], {
 			beforeTimestamp: "2026-05-14T06:30:00.000Z",
 		});
 
-		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("PROJ-1528");
+		expect(references).toHaveLength(1);
+		expect(references[0].nativeId).toBe("PROJ-1528");
 	});
 
 	it("starts scanning from fromLineNumber and reports lastLineNumberScanned", async () => {
@@ -321,11 +324,15 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues, lastLineNumberScanned } = await extractLinearIssuesFromTranscript("/fake.jsonl", {
-			fromLineNumber: 90,
-		});
+		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript(
+			"/fake.jsonl",
+			[LinearAdapter],
+			{
+				fromLineNumber: 90,
+			},
+		);
 
-		expect(issues).toHaveLength(1);
+		expect(references).toHaveLength(1);
 		expect(lastLineNumberScanned).toBe(92);
 	});
 
@@ -345,9 +352,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
+		expect(references).toHaveLength(1);
 	});
 
 	it("handles edge case: tool_result payload contains literal 'name:mcp__linear__list_issues' string", async () => {
@@ -374,10 +381,10 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
-		expect(issues[0].description).toContain("mcp__linear__list_issues");
+		expect(references).toHaveLength(1);
+		expect(references[0].description).toContain("mcp__linear__list_issues");
 	});
 
 	it("rejects payloads whose id does not match the Linear ticket format", async () => {
@@ -396,9 +403,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(0);
+		expect(references).toHaveLength(0);
 	});
 
 	it("rejects payloads whose title is the empty string", async () => {
@@ -415,8 +422,8 @@ describe("extractLinearIssuesFromTranscript", () => {
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
-		expect(issues).toHaveLength(0);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		expect(references).toHaveLength(0);
 	});
 
 	it("rejects payloads whose url does not start with http:// or https://", async () => {
@@ -434,9 +441,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(0);
+		expect(references).toHaveLength(0);
 	});
 
 	it("handles payloads wrapped in {items: [...]} or {issues: [...]} forms", async () => {
@@ -454,10 +461,36 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("PROJ-1528");
+		expect(references).toHaveLength(1);
+		expect(references[0].nativeId).toBe("PROJ-1528");
+	});
+
+	it("descends into object wrappers (e.g. {issues: {totalCount, nodes:[…]}})", async () => {
+		// Jira's getJiraIssue returns `{issues: {totalCount, nodes:[…]}}` — the outer
+		// `issues` key is an OBJECT, not an array. Linear's adapter has the same
+		// wrapperKey `issues`, so the walker must descend into the inner object and
+		// then find the `nodes` array below it. This exercises the object-wrapper
+		// branch added in Phase 3 Task 3.1.
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_obj",
+				toolName: "mcp__linear__list_issues",
+				timestamp: "2026-05-14T06:00:00.000Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_obj",
+				timestamp: "2026-05-14T06:00:01.000Z",
+				payload: { issues: { totalCount: 2, nodes: [SAMPLE_ISSUE_PAYLOAD, SAMPLE_ISSUE_PAYLOAD_2] } },
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+
+		expect(references).toHaveLength(2);
+		expect(references.map((i) => i.nativeId).sort()).toEqual(["PROJ-1404", "PROJ-1528"]);
 	});
 
 	it("skips entries that aren't valid JSON without breaking the rest", async () => {
@@ -476,9 +509,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
+		expect(references).toHaveLength(1);
 	});
 
 	it("silently skips lines that look Linear-like but fail JSON.parse on the outer envelope", async () => {
@@ -498,9 +531,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
+		expect(references).toHaveLength(1);
 	});
 
 	it("ignores entries whose role is neither assistant nor user even if they match the prefix", async () => {
@@ -526,17 +559,19 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
+		expect(references).toHaveLength(1);
 	});
 
 	it("returns empty when transcript file is missing or unreadable", async () => {
 		mockReadFile.mockRejectedValue(new Error("ENOENT"));
 
-		const { issues, lastLineNumberScanned } = await extractLinearIssuesFromTranscript("/missing.jsonl");
+		const { references, lastLineNumberScanned } = await extractReferencesFromTranscript("/missing.jsonl", [
+			LinearAdapter,
+		]);
 
-		expect(issues).toHaveLength(0);
+		expect(references).toHaveLength(0);
 		expect(lastLineNumberScanned).toBe(0);
 	});
 
@@ -555,9 +590,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues[0].priority).toBe("Urgent");
+		expect(references[0].priority).toBe("Urgent");
 	});
 
 	it("treats priority object whose name is empty string as no-priority", async () => {
@@ -574,8 +609,8 @@ describe("extractLinearIssuesFromTranscript", () => {
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
-		expect(issues[0].priority).toBeUndefined();
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		expect(references[0].priority).toBeUndefined();
 	});
 
 	it("drops labels array of non-strings, leaving labels undefined on the ref", async () => {
@@ -593,11 +628,11 @@ describe("extractLinearIssuesFromTranscript", () => {
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
-		expect(issues[0].labels).toBeUndefined();
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		expect(references[0].labels).toBeUndefined();
 	});
 
-	it("dedup keeps the FIRST ref when same ticketId appears with an older referencedAt second", async () => {
+	it("dedup keeps the FIRST ref when same nativeId appears with an older referencedAt second", async () => {
 		// Exercises the !== branch of the dedup keep-latest check
 		const jsonl = makeJsonl(
 			toolUseLine({
@@ -622,9 +657,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 			}),
 		);
 		mockReadFile.mockResolvedValue(jsonl);
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
-		expect(issues).toHaveLength(1);
-		expect(issues[0].title).toBe("newer");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		expect(references).toHaveLength(1);
+		expect(references[0].title).toBe("newer");
 	});
 
 	it("accepts a tool_result whose content is a direct string (not an array of text blocks)", async () => {
@@ -652,9 +687,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(toolUseLineStr, toolResultStringContent));
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
-		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("PROJ-1528");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		expect(references).toHaveLength(1);
+		expect(references[0].nativeId).toBe("PROJ-1528");
 	});
 
 	it("handles a tool_use entry that has no timestamp field", async () => {
@@ -681,8 +716,8 @@ describe("extractLinearIssuesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(toolUseWithoutTs, toolResultLineStr));
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
-		expect(issues).toHaveLength(1);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		expect(references).toHaveLength(1);
 	});
 
 	it("skips an orphan tool_result whose tool_use_id does not match any pending Linear use", async () => {
@@ -716,8 +751,8 @@ describe("extractLinearIssuesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(linearUse, unrelatedToolResult, linearResult));
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
-		expect(issues).toHaveLength(1);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		expect(references).toHaveLength(1);
 	});
 
 	it("drops a tool_result whose payload text is not valid JSON without leaving the pending entry orphaned", async () => {
@@ -750,9 +785,9 @@ describe("extractLinearIssuesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(linearUse, malformedPayload, linearUse2, goodPayload));
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
-		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("PROJ-1528");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		expect(references).toHaveLength(1);
+		expect(references[0].nativeId).toBe("PROJ-1528");
 	});
 
 	it("ignores a tool_use line whose role is reported as something other than assistant or user", async () => {
@@ -764,8 +799,8 @@ describe("extractLinearIssuesFromTranscript", () => {
 			timestamp: "2026-05-14T06:00:00.000Z",
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(systemLine));
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
-		expect(issues).toHaveLength(0);
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
+		expect(references).toHaveLength(0);
 	});
 
 	it("treats missing priority/labels/status/description gracefully", async () => {
@@ -783,13 +818,13 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
-		expect(issues[0].description).toBeUndefined();
-		expect(issues[0].status).toBeUndefined();
-		expect(issues[0].priority).toBeUndefined();
-		expect(issues[0].labels).toBeUndefined();
+		expect(references).toHaveLength(1);
+		expect(references[0].description).toBeUndefined();
+		expect(references[0].status).toBeUndefined();
+		expect(references[0].priority).toBeUndefined();
+		expect(references[0].labels).toBeUndefined();
 	});
 
 	it("skips a Linear-like line whose message.content is not an array", async () => {
@@ -819,10 +854,10 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
-		expect(issues[0].ticketId).toBe("PROJ-1528");
+		expect(references).toHaveLength(1);
+		expect(references[0].nativeId).toBe("PROJ-1528");
 	});
 
 	it("drops a tool_result whose timestamp is after the beforeTimestamp cutoff even though its tool_use was inside the window", async () => {
@@ -842,11 +877,11 @@ describe("extractLinearIssuesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl", {
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter], {
 			beforeTimestamp: "2026-05-14T06:30:00.000Z",
 		});
 
-		expect(issues).toHaveLength(0);
+		expect(references).toHaveLength(0);
 	});
 
 	it("accepts a tool_result without a timestamp field, falling back to empty referencedAt", async () => {
@@ -873,18 +908,32 @@ describe("extractLinearIssuesFromTranscript", () => {
 		});
 		mockReadFile.mockResolvedValue(makeJsonl(toolUseLineStr, toolResultNoTs));
 
-		const { issues } = await extractLinearIssuesFromTranscript("/fake.jsonl");
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(issues).toHaveLength(1);
-		expect(issues[0].referencedAt).toBe("");
+		expect(references).toHaveLength(1);
+		expect(references[0].referencedAt).toBe("");
 	});
 });
 
-// ─── formatLinearIssuesBlock ─────────────────────────────────────────────────
+// Local shim for the old formatLinearIssuesBlock surface — now delegates to
+// LinearAdapter.renderPromptBlock so existing test assertions keep working.
+function formatReferencesBlock(
+	refs: ReadonlyArray<Reference>,
+	opts: { maxCharsPerIssue?: number; maxTotalChars?: number } = {},
+): string {
+	const renderOpts: { maxCharsPerReference?: number; maxTotalChars?: number } = {};
+	if (opts.maxCharsPerIssue !== undefined) renderOpts.maxCharsPerReference = opts.maxCharsPerIssue;
+	if (opts.maxTotalChars !== undefined) renderOpts.maxTotalChars = opts.maxTotalChars;
+	return LinearAdapter.renderPromptBlock(refs, renderOpts);
+}
 
-function makeRef(overrides: Partial<LinearIssueRef> = {}): LinearIssueRef {
-	return {
-		ticketId: "PROJ-1528",
+// ─── formatReferencesBlock ─────────────────────────────────────────────────
+
+function makeRef(overrides: Partial<Reference> = {}): Reference {
+	const base = {
+		mapKey: "linear:PROJ-1528",
+		source: "linear" as const,
+		nativeId: "PROJ-1528",
 		title: "Treat referenced Linear issues",
 		url: "https://linear.app/jolliai/issue/PROJ-1528/",
 		status: "In Progress",
@@ -893,17 +942,17 @@ function makeRef(overrides: Partial<LinearIssueRef> = {}): LinearIssueRef {
 		description: "## Problem\n\nLinear issues are high-density context.",
 		toolName: "mcp__linear__get_issue",
 		referencedAt: "2026-05-14T06:00:01.000Z",
-		...overrides,
 	};
+	return { ...base, ...overrides };
 }
 
-describe("formatLinearIssuesBlock", () => {
+describe("formatReferencesBlock", () => {
 	it("returns empty string when given empty array", () => {
-		expect(formatLinearIssuesBlock([])).toBe("");
+		expect(formatReferencesBlock([])).toBe("");
 	});
 
 	it("renders one issue with full XML structure", () => {
-		const out = formatLinearIssuesBlock([makeRef()]);
+		const out = formatReferencesBlock([makeRef()]);
 
 		expect(out).toContain("<linear-issues>");
 		expect(out).toContain("</linear-issues>");
@@ -924,7 +973,7 @@ describe("formatLinearIssuesBlock", () => {
 			description: "Body with </description> and <script>alert(1)</script>",
 		});
 
-		const out = formatLinearIssuesBlock([ref]);
+		const out = formatReferencesBlock([ref]);
 
 		expect(out).toContain('Title with &lt;tag&gt; &amp; "quote"');
 		expect(out).toContain("&lt;/description&gt;");
@@ -936,7 +985,7 @@ describe("formatLinearIssuesBlock", () => {
 			description: "Reviewer wants ===SUMMARY=== and ---TICKETID--- discussed inline.",
 		});
 
-		const out = formatLinearIssuesBlock([ref]);
+		const out = formatReferencesBlock([ref]);
 
 		expect(out).toContain("===SUMMARY===");
 		expect(out).toContain("---TICKETID---");
@@ -946,7 +995,7 @@ describe("formatLinearIssuesBlock", () => {
 		const longBody = "x".repeat(5000);
 		const ref = makeRef({ description: longBody });
 
-		const out = formatLinearIssuesBlock([ref], { maxCharsPerIssue: 1000 });
+		const out = formatReferencesBlock([ref], { maxCharsPerIssue: 1000 });
 
 		expect(out).toContain("…[truncated, ");
 		expect(out.length).toBeLessThan(longBody.length + 1000); // truncation happened
@@ -955,23 +1004,23 @@ describe("formatLinearIssuesBlock", () => {
 	it("enforces maxTotalChars by dropping oldest-referenced issues first", () => {
 		const refs = [
 			makeRef({
-				ticketId: "PROJ-1",
+				nativeId: "PROJ-1",
 				description: "x".repeat(2500),
 				referencedAt: "2026-05-14T01:00:00.000Z",
 			}),
 			makeRef({
-				ticketId: "PROJ-2",
+				nativeId: "PROJ-2",
 				description: "y".repeat(2500),
 				referencedAt: "2026-05-14T02:00:00.000Z",
 			}),
 			makeRef({
-				ticketId: "PROJ-3",
+				nativeId: "PROJ-3",
 				description: "z".repeat(2500),
 				referencedAt: "2026-05-14T03:00:00.000Z",
 			}),
 		];
 
-		const out = formatLinearIssuesBlock(refs, {
+		const out = formatReferencesBlock(refs, {
 			maxCharsPerIssue: 3000,
 			maxTotalChars: 6000,
 		});
@@ -982,18 +1031,18 @@ describe("formatLinearIssuesBlock", () => {
 	});
 
 	it("returns empty when the budget is too small to fit even one issue", () => {
-		const out = formatLinearIssuesBlock([makeRef()], { maxCharsPerIssue: 100, maxTotalChars: 10 });
+		const out = formatReferencesBlock([makeRef()], { maxCharsPerIssue: 100, maxTotalChars: 10 });
 		expect(out).toBe("");
 	});
 
 	it("renders refs in ascending referencedAt order", () => {
 		const refs = [
-			makeRef({ ticketId: "PROJ-3", referencedAt: "2026-05-14T03:00:00.000Z" }),
-			makeRef({ ticketId: "PROJ-1", referencedAt: "2026-05-14T01:00:00.000Z" }),
-			makeRef({ ticketId: "PROJ-2", referencedAt: "2026-05-14T02:00:00.000Z" }),
+			makeRef({ nativeId: "PROJ-3", referencedAt: "2026-05-14T03:00:00.000Z" }),
+			makeRef({ nativeId: "PROJ-1", referencedAt: "2026-05-14T01:00:00.000Z" }),
+			makeRef({ nativeId: "PROJ-2", referencedAt: "2026-05-14T02:00:00.000Z" }),
 		];
 
-		const out = formatLinearIssuesBlock(refs);
+		const out = formatReferencesBlock(refs);
 
 		const idx1 = out.indexOf('id="PROJ-1"');
 		const idx2 = out.indexOf('id="PROJ-2"');
@@ -1010,7 +1059,7 @@ describe("formatLinearIssuesBlock", () => {
 			description: undefined,
 		});
 
-		const out = formatLinearIssuesBlock([minimal]);
+		const out = formatReferencesBlock([minimal]);
 
 		expect(out).toContain('id="PROJ-1528"');
 		expect(out).not.toContain("status=");

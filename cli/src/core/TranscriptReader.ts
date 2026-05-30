@@ -26,8 +26,18 @@ import type { TranscriptParser } from "./TranscriptParser.js";
 
 const log = createLogger("TranscriptReader");
 
-/** Maximum characters for the conversation context sent to the AI */
-const DEFAULT_MAX_CHARS = 50000;
+/**
+ * Maximum characters for the conversation context sent to the AI. Sized for the
+ * summarizer's model (sonnet-class, ~200K-token window): at ~50K the older
+ * sessions of a large multi-session squash were dropped entirely (only the
+ * newest session's recent turns survived). 150K lets the full conversation of
+ * almost any commit through while leaving headroom for the diff + plans AND
+ * keeping the assembled prompt inside the direct-call wall-clock budget — a
+ * whole-tree squash regenerate at the old 200K conversation + 200K diff was
+ * overrunning the timeout and aborting. Exported so a regression test can pin
+ * the value.
+ */
+export const DEFAULT_MAX_CHARS = 150000;
 
 /**
  * User messages whose content starts with any of these prefixes are
@@ -293,47 +303,56 @@ export interface SessionTranscript {
 /**
  * Builds conversation context from multiple sessions.
  *
- * Strategy (greedy by timestamp):
- *   1. Flatten all entries from all sessions into a single pool with session metadata
- *   2. Sort by timestamp descending (newest first); entries without timestamps go last
- *   3. Greedily select entries from newest to oldest until the budget is filled
- *   4. Group selected entries back by session, format each group chronologically
- *   5. Wrap each session group in <session> XML tags
+ * Strategy (fair round-robin within a shared budget):
+ *   1. Sort each session's entries newest-first.
+ *   2. Round-robin across sessions: each round takes the next-newest unused
+ *      entry from every session in turn, within `maxChars`, so every session
+ *      contributes its most recent turns before any session's older turns —
+ *      a single large recent session can't fill the budget and starve the rest
+ *      (see {@link selectFairlyAcrossSessions}).
+ *   3. Group selected entries back by session and format each group
+ *      chronologically inside `<session>` XML tags.
  *
- * If only one session has entries, the output still uses <session> tags for consistency.
+ * The result is NOT wrapped in `<transcript>` tags — the summarize prompt
+ * template wraps `{{conversation}}` itself; wrapping here too double-wrapped it.
+ * If only one session has entries, the output still uses `<session>` tags.
  *
  * @param sessions - Array of session transcripts to merge
- * @param maxChars - Maximum character budget (default: 50000)
- * @returns Formatted multi-session conversation string
+ * @param maxChars - Maximum character budget (default: {@link DEFAULT_MAX_CHARS})
+ * @returns Formatted multi-session conversation string (bare `<session>` blocks)
  */
 export function buildMultiSessionContext(
 	sessions: ReadonlyArray<SessionTranscript>,
 	maxChars = DEFAULT_MAX_CHARS,
 ): string {
-	// Count total entries across all sessions
 	const totalEntries = sessions.reduce((sum, s) => sum + s.entries.length, 0);
-
 	if (totalEntries === 0) return "";
 
-	// Step 1: Flatten all entries with session metadata
-	const pool = flattenSessionEntries(sessions);
-
-	// Step 2: Sort by timestamp descending (newest first, no-timestamp last)
-	pool.sort(compareByTimestampDesc);
-
-	// Step 3: Greedy selection within budget
-	const selected = greedySelect(pool, maxChars);
-
+	// Select entries fairly across sessions (round-robin, newest-first per
+	// session) so a single large recent session cannot consume the whole budget
+	// and starve the others — every session contributes its newest turns first.
+	const selected = selectFairlyAcrossSessions(sessions, maxChars);
 	if (selected.length === 0) return "";
 
-	// Step 4-5: Group by session and format as <session> blocks
-	const inner = formatSessionBlocks(selected, sessions);
+	// Visibility for the "conversation too big for the model budget" failure
+	// mode: a large squash-commit regenerate aggregates the whole tree's
+	// transcripts, and silently dropping the oldest turns here used to leave no
+	// trace in debug.log. Logged only when entries were actually dropped.
+	if (selected.length < totalEntries) {
+		const usedChars = selected.reduce((sum, t) => sum + formatEntry(t.entry).length + 2, 0);
+		log.info(
+			"Conversation budget reached: kept %d/%d transcript entries (~%d/%d chars); older turns dropped",
+			selected.length,
+			totalEntries,
+			usedChars,
+			maxChars,
+		);
+	}
 
-	// Wrap the full context in <transcript> tags here — this function owns the
-	// content boundary, so it should also own the outer XML wrapper. The caller
-	// (buildSummarizationPrompt) receives an already-wrapped string and embeds it
-	// directly into the prompt without adding extra markup.
-	return `<transcript>\n${inner}\n</transcript>`;
+	// Group selected entries into <session> blocks. The <transcript> wrapper is
+	// NOT added here: the summarize prompt template already wraps {{conversation}}
+	// in <transcript> tags, so wrapping here too produced a double wrapper.
+	return formatSessionBlocks(selected, sessions);
 }
 
 // --- Multi-session internal helpers ---
@@ -345,25 +364,12 @@ interface TaggedEntry {
 }
 
 /**
- * Flattens all session entries into a single array tagged with session IDs.
+ * Comparator: sorts transcript entries by timestamp descending (newest first).
+ * Entries without timestamps are placed last (treated as oldest).
  */
-function flattenSessionEntries(sessions: ReadonlyArray<SessionTranscript>): TaggedEntry[] {
-	const pool: TaggedEntry[] = [];
-	for (const session of sessions) {
-		for (const entry of session.entries) {
-			pool.push({ sessionId: session.sessionId, entry });
-		}
-	}
-	return pool;
-}
-
-/**
- * Comparator: sorts entries by timestamp descending (newest first).
- * Entries without timestamps are placed last.
- */
-function compareByTimestampDesc(a: TaggedEntry, b: TaggedEntry): number {
-	const tsA = a.entry.timestamp;
-	const tsB = b.entry.timestamp;
+function compareEntryByTimestampDesc(a: TranscriptEntry, b: TranscriptEntry): number {
+	const tsA = a.timestamp;
+	const tsB = b.timestamp;
 
 	// Both have timestamps: compare descending
 	if (tsA && tsB) return tsB.localeCompare(tsA);
@@ -376,22 +382,41 @@ function compareByTimestampDesc(a: TaggedEntry, b: TaggedEntry): number {
 }
 
 /**
- * Greedily selects entries from the sorted pool until the budget is exhausted.
- * Each entry's cost is its formatted length + separator overhead.
+ * Selects entries across sessions in round-robin, newest-first order within a
+ * shared character budget. Each round pulls the next-newest unused entry from
+ * every session in turn, so every session contributes its most recent turns
+ * before any session's older turns are considered — a single large recent
+ * session can no longer fill the whole budget and starve the others. Once a
+ * session's next-newest entry no longer fits the remaining budget, that session
+ * stops contributing (its remaining entries are older, and we keep each
+ * session's slice contiguous-newest). For a single session this is identical to
+ * plain newest-first selection. `formatSessionBlocks` regroups + re-orders the
+ * result, so the round-robin interleaving here does not affect output ordering.
  */
-function greedySelect(pool: ReadonlyArray<TaggedEntry>, maxChars: number): TaggedEntry[] {
+function selectFairlyAcrossSessions(sessions: ReadonlyArray<SessionTranscript>, maxChars: number): TaggedEntry[] {
+	const queues = sessions
+		.map((s) => ({ sessionId: s.sessionId, entries: [...s.entries].sort(compareEntryByTimestampDesc), cursor: 0 }))
+		.filter((q) => q.entries.length > 0);
+
 	const selected: TaggedEntry[] = [];
 	let totalChars = 0;
-
-	for (const tagged of pool) {
-		const formatted = formatEntry(tagged.entry);
-		// Cost: entry text + "\n\n" separator + <session> tag overhead (amortized)
-		const entryLen = formatted.length + 2;
-		if (totalChars + entryLen > maxChars) {
-			break;
+	let madeProgress = true;
+	while (madeProgress) {
+		madeProgress = false;
+		for (const q of queues) {
+			if (q.cursor >= q.entries.length) continue;
+			const entry = q.entries[q.cursor];
+			const entryLen = formatEntry(entry).length + 2; // +2 for the "\n\n" separator
+			if (totalChars + entryLen > maxChars) {
+				// Next-newest entry no longer fits — stop pulling from this session.
+				q.cursor = q.entries.length;
+				continue;
+			}
+			selected.push({ sessionId: q.sessionId, entry });
+			totalChars += entryLen;
+			q.cursor++;
+			madeProgress = true;
 		}
-		selected.push(tagged);
-		totalChars += entryLen;
 	}
 
 	return selected;

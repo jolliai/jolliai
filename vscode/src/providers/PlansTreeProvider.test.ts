@@ -79,9 +79,9 @@ vi.mock("vscode", () => ({
 }));
 
 import { PlansStore } from "../stores/PlansStore.js";
-import type { LinearIssueInfo } from "../Types.js";
+import type { ReferenceInfo } from "../Types.js";
 import {
-	LinearIssueItem,
+	ReferenceItem,
 	NoteItem,
 	PlanItem,
 	PlansTreeProvider,
@@ -232,21 +232,18 @@ describe("NoteItem", () => {
 	});
 });
 
-function makeLinearIssue(
-	overrides: Partial<LinearIssueInfo> = {},
-): LinearIssueInfo {
-	// Field names taken from Types.ts LinearIssueInfo — uses sourcePath
-	// (not filename / filePath like PlanInfo / NoteInfo) and requires
-	// `ignored` and `sourceToolName`. Earlier versions of this fixture
-	// copy-pasted the plan/note field names and silently failed tsc
-	// (npm run all doesn't run tsc; only npx tsc --noEmit catches it).
+function makeReference(overrides: Partial<ReferenceInfo> = {}): ReferenceInfo {
+	// Field names taken from Types.ts ReferenceInfo — uses sourcePath (not
+	// filename / filePath like PlanInfo / NoteInfo) and requires `ignored`,
+	// `sourceToolName`, `source`, `nativeId`, and `mapKey`.
 	return {
-		kind: "linearissue",
-		mapKey: "PROJ-1528",
-		ticketId: "PROJ-1528",
+		kind: "reference",
+		source: "linear",
+		nativeId: "PROJ-1528",
+		mapKey: "linear:PROJ-1528",
 		title: "Sample Issue",
 		url: "https://linear.app/test/issue/PROJ-1528",
-		sourcePath: "/repo/.jolli/jollimemory/linear-issues/PROJ-1528.md",
+		sourcePath: "/repo/.jolli/jollimemory/references/linear/PROJ-1528.md",
 		lastModified: "2026-03-30T11:00:00.000Z",
 		addedAt: "2026-03-30T09:00:00.000Z",
 		updatedAt: "2026-03-30T11:00:00.000Z",
@@ -258,35 +255,74 @@ function makeLinearIssue(
 	};
 }
 
-describe("LinearIssueItem", () => {
-	it("renders ticketId · title with date-only description (status intentionally omitted)", () => {
-		// `buildLinearIssueDescription` now ALWAYS returns the relative date
-		// alone — the captured status field was dropped from the row text
-		// because it can drift from the live Linear value (we don't poll), so
+describe("ReferenceItem", () => {
+	it("renders nativeId · title with date-only description (status intentionally omitted)", () => {
+		// buildEntityDescription returns the relative date alone — the
+		// captured status field is dropped from the row text because it
+		// can drift from the live upstream value (we don't poll), so
 		// surfacing it risked misleading users with stale labels. Tooltip
 		// retains the status for hover-inspection of captured state.
-		const item = new LinearIssueItem(makeLinearIssue({ status: undefined }));
+		const item = new ReferenceItem(makeReference({ status: undefined }));
 
 		expect(item.label).toBe("PROJ-1528 — Sample Issue");
-		expect(item.contextValue).toBe("linearissue");
+		expect(item.contextValue).toBe("reference");
 		expect(item.description).not.toContain("undefined");
-		// Icon is the GitHub-style "issue-opened" codicon tinted with the
-		// Linear brand purple (linearIssue.iconColor). Earlier iterations
-		// used `circle-large-filled` (semantically meaningless dot) and an
-		// inlined SVG of the Linear logo (failed to render legibly at 16x16).
-		expect((item.iconPath as { id: string }).id).toBe("issue-opened");
+		// Linear / Jira / GitHub use the codicon "issues" glyph. The
+		// brand-specific tint was rejected in earlier iterations to keep
+		// rows visually uniform.
+		expect((item.iconPath as { id: string }).id).toBe("issues");
 		expect(item.command).toEqual({
-			command: "jollimemory.openLinearIssueMarkdown",
-			title: "Open Linear Issue Markdown",
+			command: "jollimemory.openReferenceMarkdown",
+			title: "Open Reference Markdown",
 			arguments: [item],
 		});
 	});
 
+	it("Notion entities render title-only label and file-text icon", () => {
+		// Notion page ids are 32-hex blobs — meaningless to users — so the
+		// label drops the nativeId prefix. The icon is `file-text` (matches
+		// the "Notion page" mental model) instead of the issue glyph used
+		// for Linear / Jira / GitHub.
+		const item = new ReferenceItem(
+			makeReference({
+				source: "notion",
+				nativeId: "abc123def4567890",
+				title: "Design Spec",
+				mapKey: "notion:abc123def4567890",
+				url: "https://www.notion.so/abc123def4567890",
+			}),
+		);
+		expect(item.label).toBe("Design Spec");
+		expect((item.iconPath as { id: string }).id).toBe("file-text");
+		expect(item.contextValue).toBe("reference");
+	});
+
+	it("Jira and GitHub entities use the issues icon with prefixed labels", () => {
+		const jira = new ReferenceItem(
+			makeReference({
+				source: "jira",
+				nativeId: "KAN-5",
+				title: "Plan auto-discovery",
+				mapKey: "jira:KAN-5",
+			}),
+		);
+		const github = new ReferenceItem(
+			makeReference({
+				source: "github",
+				nativeId: "owner/repo#42",
+				title: "Track regressions",
+				mapKey: "github:owner/repo#42",
+			}),
+		);
+		expect(jira.label).toBe("KAN-5 — Plan auto-discovery");
+		expect((jira.iconPath as { id: string }).id).toBe("issues");
+		expect(github.label).toBe("owner/repo#42 — Track regressions");
+		expect((github.iconPath as { id: string }).id).toBe("issues");
+	});
+
 	it("never includes status in the row description even when status is present", () => {
-		// Regression guard: prior to the stale-data fix this row read
-		// `In Progress · 2 days ago`. Status now lives only in the tooltip.
-		const item = new LinearIssueItem(
-			makeLinearIssue({
+		const item = new ReferenceItem(
+			makeReference({
 				status: "In Progress",
 				priority: "High",
 				labels: ["bug", "frontend"],
@@ -298,8 +334,7 @@ describe("LinearIssueItem", () => {
 		expect(item.description).not.toContain("·");
 		// Plain-text tooltip (not MarkdownString) — the panel webview renders
 		// TreeItem tooltips via textContent, which would surface markdown
-		// source verbatim if we used a MarkdownString here. See the
-		// buildLinearIssueTooltip docstring for the full reasoning.
+		// source verbatim if we used a MarkdownString here.
 		const tooltip = item.tooltip as string;
 		expect(typeof tooltip).toBe("string");
 		expect(tooltip).toContain("Status: In Progress");
@@ -307,24 +342,65 @@ describe("LinearIssueItem", () => {
 		expect(tooltip).toContain("Labels: bug, frontend");
 		expect(tooltip).toContain("https://linear.app/test/issue/PROJ-1528");
 		expect(tooltip).toContain("A short description");
-		// No backslash escapes and no markdown markers — the previous
-		// MarkdownString version emitted `**JOLLI\-1528**` etc. that the
-		// webview rendered as literal text.
 		expect(tooltip).not.toContain("\\-");
 		expect(tooltip).not.toContain("\\#");
 		expect(tooltip).not.toContain("**");
 		expect(tooltip).not.toContain("$(link-external)");
 	});
 
+	it("tooltip emits the metadata separator when ONLY labels are set (covers the labels-only short-circuit)", () => {
+		// Triple-OR short-circuit: status / priority / labels-length. The
+		// previous tests hit the status-true and status-undefined paths; this
+		// one pins the labels-only branch so the comparator's third operand
+		// is exercised in isolation.
+		const item = new ReferenceItem(
+			makeReference({
+				status: undefined,
+				priority: undefined,
+				labels: ["bug"],
+			}),
+		);
+		const tooltip = item.tooltip as string;
+		expect(tooltip).toContain("Labels: bug");
+		expect(tooltip).not.toContain("Status:");
+		expect(tooltip).not.toContain("Priority:");
+	});
+
+	it("Notion-source tooltip omits the nativeId prefix and the metadata block when no status/priority/labels are set", () => {
+		// Pins the buildEntityTooltip Notion branch + the hasMeta short-circuit.
+		// Notion entities have no native id worth surfacing — the first line is
+		// just the title. With no status / priority / labels, the metadata
+		// separator line is suppressed so the tooltip stays tight.
+		const item = new ReferenceItem(
+			makeReference({
+				source: "notion",
+				nativeId: "abcdef0123456789",
+				title: "Roadmap",
+				mapKey: "notion:abcdef0123456789",
+				url: "https://www.notion.so/abcdef0123456789",
+				status: undefined,
+				priority: undefined,
+				labels: undefined,
+				description: undefined,
+			}),
+		);
+		const tooltip = item.tooltip as string;
+		expect(tooltip.split("\n")[0]).toBe("Roadmap");
+		expect(tooltip).not.toContain("abcdef0123456789 —");
+		expect(tooltip).not.toContain("Status:");
+		expect(tooltip).not.toContain("Priority:");
+		expect(tooltip).not.toContain("Labels:");
+		expect(tooltip).toContain("https://www.notion.so/abcdef0123456789");
+	});
+
 	it("truncates descriptions longer than 200 chars with an ellipsis in the plain-text tooltip", () => {
-		// Pins the description-length branch in `buildLinearIssueTooltip`
-		// (the activity-bar TreeView fallback). The webview hover-card no
-		// longer surfaces the description preview at all — see the
-		// LinearIssueItem comment for why; users open the upstream Linear
+		// Pins the description-length branch in buildEntityTooltip (the
+		// activity-bar TreeView fallback). The webview hover-card no longer
+		// surfaces the description preview at all — users open the upstream
 		// link if they want the full body.
 		const longDescription = "X".repeat(250);
-		const item = new LinearIssueItem(
-			makeLinearIssue({ description: longDescription }),
+		const item = new ReferenceItem(
+			makeReference({ description: longDescription }),
 		);
 
 		const tooltip = item.tooltip as string;
@@ -332,14 +408,14 @@ describe("LinearIssueItem", () => {
 		expect(tooltip).not.toContain("X".repeat(201));
 	});
 
-	it("exposes structured linearHover data for the webview hover-card renderer", () => {
-		// The activity-bar TreeView ignores `linearHover` (it reads tooltip),
+	it("exposes structured referenceHover data for the webview hover-card renderer", () => {
+		// The activity-bar TreeView ignores `referenceHover` (it reads tooltip),
 		// but the webview's SidebarSerialize picks this field off the item and
-		// forwards it on the wire so renderLinearHoverCard can produce the
-		// codicon-rich popover. No descriptionPreview — the field was dropped
-		// to keep the hover card concise.
-		const item = new LinearIssueItem(
-			makeLinearIssue({
+		// forwards it on the wire so renderEntityHoverCard can produce the
+		// codicon-rich popover. `source` is the new field driving per-provider
+		// badges / Open-in-<X> link labels.
+		const item = new ReferenceItem(
+			makeReference({
 				status: "In Progress",
 				priority: "High",
 				labels: ["bug", "frontend"],
@@ -347,32 +423,33 @@ describe("LinearIssueItem", () => {
 			}),
 		);
 
-		const hover = (item as unknown as { linearHover: Record<string, unknown> })
-			.linearHover;
+		const hover = (item as unknown as { referenceHover: Record<string, unknown> })
+			.referenceHover;
 		expect(hover.title).toBe("PROJ-1528 — Sample Issue");
+		expect(hover.source).toBe("linear");
 		expect(hover.status).toBe("In Progress");
 		expect(hover.priority).toBe("High");
 		expect(hover.labels).toBe("bug, frontend");
 		expect(hover.url).toBe("https://linear.app/test/issue/PROJ-1528");
-		// descriptionPreview was removed from LinearIssueHover — even when
-		// the source issue has a description, the field must NOT appear
-		// on the wire payload.
+		// descriptionPreview was removed — even when the source has a
+		// description, the field must NOT appear on the wire payload.
 		expect("descriptionPreview" in hover).toBe(false);
 	});
 
-	it("omits optional fields in linearHover when the source LinearIssueInfo lacks them", () => {
+	it("omits optional fields in referenceHover when the source ReferenceInfo lacks them", () => {
 		// Pins the conditional spread shape: missing status / priority / labels
 		// must NOT appear as undefined keys on the wire (the JSON would still
 		// serialize them, but consumers would have to null-check).
-		const item = new LinearIssueItem(makeLinearIssue({ status: undefined }));
+		const item = new ReferenceItem(makeReference({ status: undefined }));
 
-		const hover = (item as unknown as { linearHover: Record<string, unknown> })
-			.linearHover;
+		const hover = (item as unknown as { referenceHover: Record<string, unknown> })
+			.referenceHover;
 		expect("status" in hover).toBe(false);
 		expect("priority" in hover).toBe(false);
 		expect("labels" in hover).toBe(false);
 		expect(hover.title).toBeDefined();
 		expect(hover.url).toBeDefined();
+		expect(hover.source).toBe("linear");
 	});
 });
 
@@ -389,7 +466,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => plans),
 			listNotes: vi.fn(async () => []),
-			listLinearIssues: vi.fn(async () => []),
+			listReferences: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -413,7 +490,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => [makePlan()]),
 			listNotes: vi.fn(async () => []),
-			listLinearIssues: vi.fn(async () => []),
+			listReferences: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -428,7 +505,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => []),
 			listNotes: vi.fn(async () => []),
-			listLinearIssues: vi.fn(async () => []),
+			listReferences: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -455,7 +532,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => plans),
 			listNotes: vi.fn(async () => notes),
-			listLinearIssues: vi.fn(async () => []),
+			listReferences: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -472,7 +549,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => [makePlan()]),
 			listNotes: vi.fn(async () => [makeNote()]),
-			listLinearIssues: vi.fn(async () => []),
+			listReferences: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 		provider.setEnabled(false);
@@ -484,7 +561,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => []),
 			listNotes: vi.fn(async () => []),
-			listLinearIssues: vi.fn(async () => []),
+			listReferences: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 		const emitter = (
@@ -533,7 +610,7 @@ describe("PlansTreeProvider", () => {
 		const bridge = {
 			listPlans: vi.fn(async () => plans),
 			listNotes: vi.fn(async () => notes),
-			listLinearIssues: vi.fn(async () => []),
+			listReferences: vi.fn(async () => []),
 		};
 		const provider = makePlansProvider(bridge as never);
 
@@ -563,7 +640,7 @@ describe("PlansTreeProvider", () => {
 			const bridge = {
 				listPlans: vi.fn(async () => plans),
 				listNotes: vi.fn(async () => []),
-				listLinearIssues: vi.fn(async () => []),
+				listReferences: vi.fn(async () => []),
 			};
 			const provider = makePlansProvider(bridge as never);
 
@@ -578,7 +655,7 @@ describe("PlansTreeProvider", () => {
 			const bridge = {
 				listPlans: vi.fn(async () => []),
 				listNotes: vi.fn(async () => notes),
-				listLinearIssues: vi.fn(async () => []),
+				listReferences: vi.fn(async () => []),
 			};
 			const provider = makePlansProvider(bridge as never);
 
@@ -586,6 +663,47 @@ describe("PlansTreeProvider", () => {
 
 			const items = provider.serialize?.();
 			expect(items?.[0]?.id).toBe("note-abc");
+		});
+	});
+
+	describe("entity rows", () => {
+		// Entity rendering exercises the third arm of getChildren() + serialize()
+		// (lines 235 / 250 in PlansTreeProvider.ts). Before the ReferenceItem
+		// refactor these were `linearIssue` paths with their own LinearIssueItem
+		// tests; the merge is now uniform across providers, so a single test
+		// covering the entity arm is enough.
+		it("getChildren() yields an ReferenceItem for each entity in the store snapshot", async () => {
+			const entity: ReferenceInfo = makeReference();
+			const bridge = {
+				listPlans: vi.fn(async () => []),
+				listNotes: vi.fn(async () => []),
+				listReferences: vi.fn(async () => [entity]),
+			};
+			const provider = makePlansProvider(bridge as never);
+			await provider.refresh();
+
+			const children = provider.getChildren();
+			expect(children).toHaveLength(1);
+			expect(children[0]).toBeInstanceOf(ReferenceItem);
+		});
+
+		it("serialize() uses entity.mapKey as id and defaults isSelected=true with no exclusion present", async () => {
+			const entity: ReferenceInfo = makeReference({ mapKey: "jira:KAN-7" });
+			const bridge = {
+				listPlans: vi.fn(async () => []),
+				listNotes: vi.fn(async () => []),
+				listReferences: vi.fn(async () => [entity]),
+			};
+			const provider = makePlansProvider(bridge as never);
+			await provider.refresh();
+
+			const items = provider.serialize?.();
+			expect(items).toHaveLength(1);
+			expect(items?.[0].id).toBe("jira:KAN-7");
+			// Without an entry in `exclusions.entities`, the row reads as selected.
+			expect(
+				(items?.[0] as { isSelected?: boolean }).isSelected,
+			).toBe(true);
 		});
 	});
 
@@ -602,7 +720,7 @@ describe("PlansTreeProvider", () => {
 			const bridge = {
 				listPlans: vi.fn(async () => plans),
 				listNotes: vi.fn(async () => []),
-				listLinearIssues: vi.fn(async () => []),
+				listReferences: vi.fn(async () => []),
 			};
 			const store = new PlansStore(bridge as never);
 			const provider = new PlansTreeProvider(store, cwd);
@@ -646,6 +764,35 @@ describe("PlansTreeProvider", () => {
 				for (const item of items) {
 					expect(item.isSelected).toBe(true);
 				}
+			} finally {
+				fs.rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+
+		it("stamps isSelected=false on an entity row whose mapKey is in the exclusion set", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "jolli-test-"));
+			try {
+				await setExcluded(cwd, "references", "jira:KAN-7", true);
+
+				// Build a PlansStore with one Linear and one Jira entity; only
+				// the Jira mapKey is excluded.
+				const keepEntity: ReferenceInfo = makeReference({ mapKey: "linear:LIN-1" });
+				const skipEntity: ReferenceInfo = makeReference({ mapKey: "jira:KAN-7" });
+				const bridge = {
+					listPlans: vi.fn(async () => []),
+					listNotes: vi.fn(async () => []),
+					listReferences: vi.fn(async () => [keepEntity, skipEntity]),
+				};
+				const store = new PlansStore(bridge as never);
+				const provider = new PlansTreeProvider(store, cwd);
+				await store.refresh();
+				await provider.refreshExclusions();
+
+				const items = provider.serialize();
+				const skip = items.find((i) => i.id === "jira:KAN-7");
+				const keep = items.find((i) => i.id === "linear:LIN-1");
+				expect(skip?.isSelected).toBe(false);
+				expect(keep?.isSelected).toBe(true);
 			} finally {
 				fs.rmSync(cwd, { recursive: true, force: true });
 			}

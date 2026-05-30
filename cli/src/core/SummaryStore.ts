@@ -28,10 +28,11 @@ import type {
 	DiffStats,
 	E2eTestScenario,
 	FileWrite,
-	LinearIssueCommitRef,
 	NoteReference,
 	PlanProgressArtifact,
 	PlanReference,
+	ReferenceCommitRef,
+	SourceId,
 	StoredTranscript,
 	SummaryIndex,
 	SummaryIndexEntry,
@@ -41,6 +42,7 @@ import { CURRENT_SCHEMA_VERSION } from "../Types.js";
 import { getDiffStats, getTreeHash } from "./GitOps.js";
 import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
+import { sanitizeNativeIdForPath } from "./references/ReferenceStore.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
 import { isSummaryError, LLM_FAILED } from "./SummaryErrorMarker.js";
@@ -431,14 +433,11 @@ async function migrateOneToOneLocked(
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
 		...(oldSummary.plans && { plans: oldSummary.plans }),
 		...(oldSummary.notes && { notes: oldSummary.notes }),
-		// Linear issues — same Copy-Hoist treatment as plans / notes. Without
-		// this line, rebase-pick / migrate-1-to-1 paths would silently drop
-		// linearIssues refs from the new root summary even though the registry
-		// still pointed at correctly-archived snapshot files. Observed bug:
-		// after rebasing this branch onto origin/main, the 3 feature commits'
-		// summaries on the orphan branch had linearIssues:[] and the panel /
-		// PR markdown stopped showing the Linear issue associations.
-		...(oldSummary.linearIssues && { linearIssues: oldSummary.linearIssues }),
+		// References — same Copy-Hoist treatment as plans / notes. Without this
+		// line, rebase-pick / migrate-1-to-1 paths would silently drop reference
+		// refs from the new root summary even though the registry still pointed
+		// at correctly-archived snapshot files. Root-only Copy, no merge needed.
+		...(oldSummary.references && { references: oldSummary.references }),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
 		// summaryError marker — rebase-pick doesn't run the LLM, so a degraded
 		// old summary stays degraded on the new hash. Use isSummaryError() so
@@ -574,34 +573,39 @@ function stripNotes(node: CommitSummary): CommitSummary {
 	return { ...rest, children: rest.children.map(stripNotes) } as CommitSummary;
 }
 
-/** Returns a deep copy of the summary tree with linearIssues stripped from all nodes. */
-function stripLinearIssues(node: CommitSummary): CommitSummary {
-	const { linearIssues: _, ...rest } = node;
+/**
+ * Returns a deep copy of the summary tree with `references` stripped from every
+ * node. Hoist invariant requires the field gone from descendants whenever a
+ * higher root carries the consolidated value.
+ */
+function stripReferences(node: CommitSummary): CommitSummary {
+	const { references: _e, ...rest } = node;
 	if (!rest.children) return rest as CommitSummary;
-	return { ...rest, children: rest.children.map(stripLinearIssues) } as CommitSummary;
+	return { ...rest, children: rest.children.map(stripReferences) } as CommitSummary;
 }
 
 /**
- * Recursively collects all LinearIssueCommitRefs from a list of summaries,
- * deduped by `archivedKey`. Parallel to collectChildPlans / collectChildNotes:
- * on squash / rebase-pick the root must inherit referenced Linear issues from
- * every source commit, otherwise stripLinearIssues (called below) drops them.
+ * Recursively collects all ReferenceCommitRefs from a list of summaries, deduped
+ * by `archivedKey`. Walks `node.references`. Parallel to collectChildPlans /
+ * collectChildNotes — on squash / rebase-pick the root must inherit every
+ * referenced reference from every source commit, otherwise stripReferences (called
+ * below) drops them.
  */
-export function collectChildLinearIssues(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<LinearIssueCommitRef> {
-	const refMap = new Map<string, LinearIssueCommitRef>();
+export function collectChildReferences(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<ReferenceCommitRef> {
+	const refMap = new Map<string, ReferenceCommitRef>();
 	for (const node of nodes) {
-		if (node.linearIssues) {
-			for (const ref of node.linearIssues) {
-				const existing = refMap.get(ref.archivedKey);
-				/* v8 ignore next -- "existing+older" tie-breaker fires only when the same archivedKey appears twice at the same tree depth with diff referencedAt; uncommon in real commit trees. */
-				if (!existing || ref.referencedAt > existing.referencedAt) {
-					refMap.set(ref.archivedKey, ref);
-				}
+		const own = node.references ?? [];
+		for (const ref of own) {
+			const existing = refMap.get(ref.archivedKey);
+			/* v8 ignore start -- "existing+older" tie-breaker fires only when the same archivedKey appears twice at the same tree depth with diff referencedAt; uncommon in real commit trees. */
+			if (!existing || ref.referencedAt > existing.referencedAt) {
+				refMap.set(ref.archivedKey, ref);
 			}
+			/* v8 ignore stop */
 		}
 		/* v8 ignore start -- recursive child descent + tie-breaker for cross-depth duplicate archivedKey; the merge-hoist test covers shallow dedupe, but cross-depth same-key with diff referencedAt is a rare squash-of-merge case. */
 		if (node.children) {
-			for (const child of collectChildLinearIssues(node.children)) {
+			for (const child of collectChildReferences(node.children)) {
 				const existing = refMap.get(child.archivedKey);
 				if (!existing || child.referencedAt > existing.referencedAt) {
 					refMap.set(child.archivedKey, child);
@@ -694,7 +698,7 @@ function collectDescendantOrphanedDocIds(children: ReadonlyArray<CommitSummary> 
  * `buildHoistedAmendRoot` / `mergeManyToOne`:
  *   - version: 4
  *   - root holds the authoritative Copy-Hoist fields (plans / notes /
- *     linearIssues / e2eTestGuide / jolliDocId / jolliDocUrl /
+ *     references / e2eTestGuide / jolliDocId / jolliDocUrl /
  *     orphanedDocIds), unioned across the whole tree via the same
  *     `collectChild*` helpers
  *   - root holds authoritative `topics` and `recap` collected from the
@@ -711,9 +715,6 @@ function collectDescendantOrphanedDocIds(children: ReadonlyArray<CommitSummary> 
  * fresh topics/recap (Regenerator) overwrite the returned object explicitly;
  * callers that want preservation (v5 migration) just use the result as-is.
  *
- * Leaves `ticketId` on the root untouched — for v3 data ticketId already
- * lives on the root by construction.
- *
  * A no-op for v4 input (returns the same reference). The version gate is
  * `>= 4`, not `=== 4`, so v5+ input is also a no-op — see the test fixture
  * pinning this behavior in normalizeToV4.test.ts.
@@ -721,6 +722,8 @@ function collectDescendantOrphanedDocIds(children: ReadonlyArray<CommitSummary> 
  * Used by Regenerator, RegenerateContext, and the v5 schema migration to
  * collapse all v3-special-casing — once normalized, downstream code can
  * assume a clean v4 tree (topics/recap/diffStats all populated on root).
+ *
+ * Only the canonical `references[]` field is hoisted.
  */
 export function normalizeToV4(summary: CommitSummary): CommitSummary {
 	if (summary.version >= 4) return summary;
@@ -728,7 +731,7 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 	const hoistedE2e = collectChildE2eScenarios([summary]);
 	const hoistedPlans = collectChildPlans([summary]);
 	const hoistedNotes = collectChildNotes([summary]);
-	const hoistedLinear = collectChildLinearIssues([summary]);
+	const hoistedReferences = collectChildReferences([summary]);
 	const jolliMeta = collectChildJolliMeta([summary]);
 	// Dedup orphanedDocIds across the tree: jolliMeta surfaces orphans from
 	// this normalize step's loser candidates; root + descendants may already
@@ -779,7 +782,7 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 		...(hoistedE2e.length > 0 ? { e2eTestGuide: hoistedE2e } : {}),
 		...(hoistedPlans.length > 0 ? { plans: hoistedPlans } : {}),
 		...(hoistedNotes.length > 0 ? { notes: hoistedNotes } : {}),
-		...(hoistedLinear.length > 0 ? { linearIssues: hoistedLinear } : {}),
+		...(hoistedReferences.length > 0 ? { references: hoistedReferences } : {}),
 		...(jolliMeta.winner
 			? {
 					jolliDocId: jolliMeta.winner.jolliDocId,
@@ -941,7 +944,7 @@ export function expandSourcesForConsolidation(oldSummary: CommitSummary): Readon
  *
  * Hoist family (9 fields):
  *   - Copy-Hoist (7): jolliDocId, jolliDocUrl, orphanedDocIds, plans, notes,
- *                    linearIssues, e2eTestGuide
+ *                    references, e2eTestGuide
  *   - Consolidate-Hoist (2): topics, recap
  *
  * `version` is intentionally NOT stripped -- it's an identity field, like
@@ -950,7 +953,7 @@ export function expandSourcesForConsolidation(oldSummary: CommitSummary): Readon
  */
 export function stripFunctionalMetadata(node: CommitSummary): CommitSummary {
 	return stripJolliMetadata(
-		stripLinearIssues(stripNotes(stripPlans(stripE2eTestGuide(stripTopics(stripRecap(node)))))),
+		stripReferences(stripNotes(stripPlans(stripE2eTestGuide(stripTopics(stripRecap(node)))))),
 	);
 }
 
@@ -1028,7 +1031,7 @@ async function mergeManyToOneLocked(
 	const hoistedE2e = collectChildE2eScenarios(children);
 	const hoistedPlans = collectChildPlans(children);
 	const hoistedNotes = collectChildNotes(children);
-	const hoistedLinearIssues = collectChildLinearIssues(children);
+	const hoistedReferences = collectChildReferences(children);
 	const jolliMeta = collectChildJolliMeta(children);
 	const inheritedOrphanIds = children.flatMap((c) => c.orphanedDocIds ?? []);
 	const allOrphanedDocIds = [...jolliMeta.orphanedDocIds, ...inheritedOrphanIds];
@@ -1082,7 +1085,7 @@ async function mergeManyToOneLocked(
 		...(hoistedE2e.length > 0 && { e2eTestGuide: hoistedE2e }),
 		...(hoistedPlans.length > 0 && { plans: hoistedPlans }),
 		...(hoistedNotes.length > 0 && { notes: hoistedNotes }),
-		...(hoistedLinearIssues.length > 0 && { linearIssues: hoistedLinearIssues }),
+		...(hoistedReferences.length > 0 && { references: hoistedReferences }),
 		...(jolliMeta.winner && { jolliDocId: jolliMeta.winner.jolliDocId, jolliDocUrl: jolliMeta.winner.jolliDocUrl }),
 		...(allOrphanedDocIds.length > 0 && { orphanedDocIds: allOrphanedDocIds }),
 		topics: consolidatedTopics,
@@ -2408,49 +2411,71 @@ export async function readNoteFromBranch(id: string, cwd?: string, storage?: Sto
 	}
 }
 
-// ─── Linear issue storage (parallel to plans / notes) ───────────────────────
+// ─── Reference storage (multi-source generalisation of Linear) ──────────────
 
 /**
- * Stores Linear issue markdown files in the orphan branch under `linear-issues/<archivedKey>.md`.
- * Atomic write — all linear issues are committed in a single orphan-branch commit.
+ * Orphan-branch path for an archived reference markdown:
+ * `references/<source>/<sanitized-bareKey>.md`.
  *
- * `archivedKey` is `<ticketId>-<shortHash>` (the post-archive registry key,
- * mirrors the slug-rename pattern from storePlans).
+ * `archivedKey` is the post-archive plans.json map key (e.g.
+ * `"jira:KAN-4-abc12345"`). We strip the leading `<source>:` prefix then run
+ * the same {@link sanitizeNativeIdForPath} ReferenceStore uses for on-disk
+ * filenames — keeps GitHub's `<owner>/<repo>#<n>` collisions impossible.
  */
-export async function storeLinearIssues(
-	linearFiles: ReadonlyArray<{ archivedKey: string; content: string }>,
+function orphanPathFor(source: SourceId, archivedKey: string): string {
+	const prefix = `${source}:`;
+	/* v8 ignore next -- defensive: archivedKey is always `${source}:<bareKey>` for entries flowing through storeReferences / ReferenceCommitRef; the bare-key fallback is for hand-passed inputs that don't appear in production data. */
+	const bareKey = archivedKey.startsWith(prefix) ? archivedKey.slice(prefix.length) : archivedKey;
+	const sanitized = sanitizeNativeIdForPath(source, bareKey);
+	return `references/${source}/${sanitized}.md`;
+}
+
+/**
+ * Stores reference markdown files in the orphan branch under
+ * `references/<source>/<sanitized-bareKey>.md`. Atomic write — all files
+ * are committed in a single orphan-branch commit.
+ *
+ * `archivedKey` is `<source>:<nativeId>-<shortHash>` (the post-archive
+ * plans.json.references map key, mirrors the slug-rename pattern from
+ * storePlans). Generalised across every {@link SourceId}.
+ */
+export async function storeReferences(
+	referenceFiles: ReadonlyArray<{ archivedKey: string; source: SourceId; content: string }>,
 	commitMessage: string,
 	cwd?: string,
 	branch?: string,
 	storage?: StorageProvider,
 ): Promise<void> {
-	if (linearFiles.length === 0) return;
+	if (referenceFiles.length === 0) return;
 
-	const files: FileWrite[] = linearFiles.map((l) => ({
-		path: `linear-issues/${l.archivedKey}.md`,
-		content: l.content,
+	const files: FileWrite[] = referenceFiles.map((e) => ({
+		path: orphanPathFor(e.source, e.archivedKey),
+		content: e.content,
 		branch,
 	}));
 
-	await withRequiredOrphanWriteLock(cwd, "storeLinearIssues", async () => {
+	await withRequiredOrphanWriteLock(cwd, "storeReferences", async () => {
 		const store = resolveStorage(storage, cwd);
 		await store.writeFiles(files, commitMessage);
-		log.info("Stored %d Linear issue file(s)", linearFiles.length);
+		log.info("Stored %d reference file(s) across sources", referenceFiles.length);
 	});
 }
 
 /**
- * Reads a Linear issue archived markdown from the orphan branch.
- * Returns the markdown content, or null if the file doesn't exist.
+ * Reads a reference's archived markdown from the orphan branch.
+ *
+ * Looks up the multi-source path `references/<source>/<sanitized-bareKey>.md`.
+ * Returns `null` when the file is absent.
  */
-export async function readLinearIssueFromBranch(
+export async function readReferenceFromBranch(
+	source: SourceId,
 	archivedKey: string,
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<string | null> {
+	const store = resolveStorage(storage, cwd);
 	try {
-		const store = resolveStorage(storage, cwd);
-		return await store.readFile(`linear-issues/${archivedKey}.md`);
+		return await store.readFile(orphanPathFor(source, archivedKey));
 	} catch {
 		return null;
 	}
