@@ -26,7 +26,7 @@ export default defineConfig({
 			formats: ["es"],
 		},
 		rollupOptions: {
-			external: ["@anthropic-ai/sdk", "@mdx-js/mdx", "chokidar", "commander", "open", "semver", "yaml", /^node:.*/],
+			external: ["@anthropic-ai/sdk", "@jolli.ai/site-core", "@mdx-js/mdx", "chokidar", "commander", "open", "semver", "yaml", /^node:.*/],
 			output: {
 				chunkFileNames: "[name].js",
 			},

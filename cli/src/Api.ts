@@ -12,20 +12,22 @@ import { registerAuthCommands } from "./commands/AuthCommand.js";
 import { registerCleanCommand } from "./commands/CleanCommand.js";
 import { checkVersionMismatch, VERSION } from "./commands/CliUtils.js";
 import { registerConfigureCommand } from "./commands/ConfigureCommand.js";
-import { registerConvertCommand } from "./commands/ConvertCommand.js";
 import { registerDoctorCommand } from "./commands/DoctorCommand.js";
 import { registerDisableCommand, registerEnableCommand } from "./commands/EnableCommand.js";
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
-import { registerNewCommand } from "./commands/NewCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
-import { registerReverseCommand } from "./commands/ReverseCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
-import { registerBuildCommand, registerDevCommand, registerStartCommand } from "./commands/StartCommand.js";
+// Site command registrators are NOT statically imported. They transitively
+// load `@jolli.ai/site-core` at module evaluation time, which crashes the
+// whole CLI if site-core is not installed (it's an optionalDependencies
+// entry, so a failing npm fetch is silent). Instead, `main()` probes
+// site-core availability and either dynamic-imports the real registrators
+// or registers the lightweight stubs from `SiteCommandStubs`.
+import { registerSiteCommandStubs } from "./commands/SiteCommandStubs.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerSyncCommand } from "./commands/SyncCommand.js";
-import { registerThemeCommand } from "./commands/ThemeCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
 // _parseJolliApiKey / _parseBaseUrl: re-exposed at the bottom of this file.
 // See the `parseJolliApiKey` export for the rationale (Vite tree-shaker drops
@@ -34,6 +36,7 @@ import { registerViewCommand } from "./commands/ViewCommand.js";
 import { parseBaseUrl as _parseBaseUrl, parseJolliApiKey as _parseJolliApiKey } from "./core/JolliApiUtils.js";
 import type { Logger } from "./Logger.js";
 import { loadPlugins } from "./PluginLoader.js";
+import { isSiteCoreInstalled } from "./site/EnsureSiteCore.js";
 
 /**
  * Runtime context handed to a plugin's `register()` function.
@@ -311,13 +314,37 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerExportCommand(program);
 	registerAuthCommands(program);
 	registerSyncCommand(program);
-	registerNewCommand(program);
-	registerConvertCommand(program);
-	registerDevCommand(program);
-	registerBuildCommand(program);
-	registerStartCommand(program);
-	registerReverseCommand(program);
-	registerThemeCommand(program);
+
+	// Site commands: dynamic-load only when site-core is available, since
+	// each of these modules transitively imports `@jolli.ai/site-core` at
+	// the top of its file. If site-core isn't installed (optionalDependencies
+	// fetch failed, pre-publish window, etc.), fall back to lightweight stubs
+	// so the rest of the CLI still works and the user gets a clear prompt
+	// to install site-core when they invoke a site command.
+	if (isSiteCoreInstalled()) {
+		const [
+			{ registerNewCommand },
+			{ registerConvertCommand },
+			{ registerBuildCommand, registerDevCommand, registerStartCommand },
+			{ registerReverseCommand },
+			{ registerThemeCommand },
+		] = await Promise.all([
+			import("./commands/NewCommand.js"),
+			import("./commands/ConvertCommand.js"),
+			import("./commands/StartCommand.js"),
+			import("./commands/ReverseCommand.js"),
+			import("./commands/ThemeCommand.js"),
+		]);
+		registerNewCommand(program);
+		registerConvertCommand(program);
+		registerDevCommand(program);
+		registerBuildCommand(program);
+		registerStartCommand(program);
+		registerReverseCommand(program);
+		registerThemeCommand(program);
+	} else {
+		registerSiteCommandStubs(program);
+	}
 
 	// Plugins extend the program after all builtins are in place.
 	// loadPlugins is non-throwing — a broken plugin never blocks the CLI.
