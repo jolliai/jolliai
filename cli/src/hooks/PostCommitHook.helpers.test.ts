@@ -132,11 +132,11 @@ vi.mock("../core/GitOps.js", () => ({
 vi.mock("../core/SessionTracker.js", () => ({
 	associatePlanWithCommit: mockAssociatePlanWithCommit,
 	associateNoteWithCommit: vi.fn(),
-	associateLinearIssueWithCommit: vi.fn(),
-	detectUncommittedLinearIssueIds: vi.fn().mockResolvedValue([]),
+	associateReferenceWithCommit: vi.fn(),
+	detectUncommittedReferenceIds: vi.fn().mockResolvedValue([]),
 	detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
 	detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
-	getLinearIssueEntriesForBranch: vi.fn().mockResolvedValue([]),
+	getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
 	deleteAmendPending: vi.fn(),
 	deletePluginSource: mockDeletePluginSource,
 	deleteSquashPending: vi.fn(),
@@ -152,15 +152,17 @@ vi.mock("../core/SessionTracker.js", () => ({
 	savePlansRegistry: mockSavePlansRegistry,
 }));
 
-vi.mock("../core/LinearIssueStore.js", () => ({
-	linearIssuePath: vi.fn((k: string, c: string) => `${c}/.jolli/jollimemory/linear-issues/${k}.md`),
-	readLinearIssueMarkdown: vi.fn().mockResolvedValue(null),
-	renameLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
-	// QueueWorker.associateLinearIssuesWithCommit now hashes raw markdown
-	// via this helper (referencedAt-excluding scheme) instead of sha256ing
-	// the file bytes directly. Mock returns a stable hash so tests can
-	// assert on it without depending on the canonical scheme's exact bytes.
-	hashLinearIssueContentFromMarkdown: vi.fn(() => "fake-content-hash"),
+vi.mock("../core/references/ReferenceStore.js", () => ({
+	referencePath: vi.fn(
+		(c: string, source: string, key: string) => `${c}/.jolli/jollimemory/references/${source}/${key}.md`,
+	),
+	referenceDir: vi.fn((c: string, source: string) => `${c}/.jolli/jollimemory/references/${source}`),
+	sanitizeNativeIdForPath: vi.fn((_source: string, id: string) => id),
+	readReferenceMarkdown: vi.fn().mockResolvedValue(null),
+	readReferenceMarkdownFromString: vi.fn().mockReturnValue(null),
+	writeReferenceMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/x", contentHash: "fake-content-hash" }),
+	renameReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
+	hashReferenceContent: vi.fn(() => "fake-content-hash"),
 }));
 
 vi.mock("../core/PlanPromptFormatter.js", () => ({
@@ -186,6 +188,7 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		mergeManyToOne: vi.fn(),
 		storePlans: mockStorePlans,
 		storeSummary: mockStoreSummary,
+		storeReferences: vi.fn().mockResolvedValue(undefined),
 		setActiveStorage: vi.fn(),
 	};
 });
@@ -731,7 +734,7 @@ describe("PostCommitHook helpers", () => {
 		// linearIssues map instead. Code: ~line 795.
 		//
 		// Unit-testing this branch in isolation requires standing up the full
-		// storeLinearIssues → ensureOrphanBranch → GitOps mock stack which
+		// storeReferences → ensureOrphanBranch → GitOps mock stack which
 		// isn't worth the test surface area today. The behavior is covered by
 		// the live integration path (the rebase data-loss we just witnessed
 		// is the symptom and is reproducible by replaying any

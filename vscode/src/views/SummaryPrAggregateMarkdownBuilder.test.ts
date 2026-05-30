@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
 	CommitSummary,
 	E2eTestScenario,
-	LinearIssueCommitRef,
+	ReferenceCommitRef,
 	NoteReference,
 	PlanReference,
 	TopicSummary,
@@ -60,7 +60,7 @@ interface SummaryOpts {
 	jolliDocUrl?: string;
 	plans?: ReadonlyArray<PlanReference>;
 	notes?: ReadonlyArray<NoteReference>;
-	linearIssues?: ReadonlyArray<LinearIssueCommitRef>;
+	references?: ReadonlyArray<ReferenceCommitRef>;
 	e2eTestGuide?: ReadonlyArray<E2eTestScenario>;
 	topics?: ReadonlyArray<TopicSummary>;
 }
@@ -79,7 +79,7 @@ function makeSummary(opts: SummaryOpts): CommitSummary {
 		jolliDocUrl: opts.jolliDocUrl,
 		plans: opts.plans,
 		notes: opts.notes,
-		linearIssues: opts.linearIssues,
+		references: opts.references,
 		e2eTestGuide: opts.e2eTestGuide,
 		topics: opts.topics,
 	} as unknown as CommitSummary;
@@ -255,29 +255,31 @@ describe("buildAggregatedPrMarkdown", () => {
 		// archivedKeys ("PROJ-1-aaaa1111", "PROJ-1-bbbb2222") — both pointing
 		// at the same logical Linear issue. Without ticketId-based dedup,
 		// the PR description would render two bullets for one ticket.
-		const issueAt1: LinearIssueCommitRef = {
-			archivedKey: "PROJ-1-aaaa1111",
-			ticketId: "PROJ-1",
+		const issueAt1: ReferenceCommitRef = {
+			archivedKey: "linear:PROJ-1-aaaa1111",
+			source: "linear",
+			nativeId: "PROJ-1",
 			title: "Linear issue title",
 			url: "https://linear.app/x/issue/PROJ-1/test",
 			referencedAt: "2026-05-06T00:00:00Z",
 			sourceToolName: "mcp__linear__get_issue",
 		};
-		const issueAt2: LinearIssueCommitRef = {
+		const issueAt2: ReferenceCommitRef = {
 			...issueAt1,
-			archivedKey: "PROJ-1-bbbb2222",
+			archivedKey: "linear:PROJ-1-bbbb2222",
 		};
-		const issueOther: LinearIssueCommitRef = {
-			archivedKey: "PROJ-2-aaaa1111",
-			ticketId: "PROJ-2",
+		const issueOther: ReferenceCommitRef = {
+			archivedKey: "linear:PROJ-2-aaaa1111",
+			source: "linear",
+			nativeId: "PROJ-2",
 			title: "Linear issue B",
 			url: "https://linear.app/x/issue/PROJ-2/test",
 			referencedAt: "2026-05-06T00:00:00Z",
 			sourceToolName: "mcp__linear__get_issue",
 		};
 		const summaries = [
-			makeSummary({ hash: "AAAA1234", linearIssues: [issueAt1, issueOther] }),
-			makeSummary({ hash: "BBBB5678", linearIssues: [issueAt2] }),
+			makeSummary({ hash: "AAAA1234", references: [issueAt1, issueOther] }),
+			makeSummary({ hash: "BBBB5678", references: [issueAt2] }),
 		];
 
 		const md = buildAggregatedPrMarkdown(summaries, 0);
@@ -287,21 +289,62 @@ describe("buildAggregatedPrMarkdown", () => {
 		expect(md).toContain("## Plans & Notes (2)");
 	});
 
+	it("dedupes multi-source entities across commits by <source>:<nativeId>", () => {
+		// Same logical Jira ticket referenced from two commits with different
+		// per-commit archivedKey suffixes — must collapse to one bullet.
+		// Linear ticket on first commit only — keeps its own bullet.
+		const jiraAt1: ReferenceCommitRef = {
+			archivedKey: "jira:KAN-5-aaaa1111",
+			source: "jira",
+			nativeId: "KAN-5",
+			title: "Jira entity",
+			url: "https://example.atlassian.net/browse/KAN-5",
+			referencedAt: "2026-05-06T00:00:00Z",
+			sourceToolName: "mcp__claude_ai_Atlassian__getJiraIssue",
+		};
+		const jiraAt2: ReferenceCommitRef = {
+			...jiraAt1,
+			archivedKey: "jira:KAN-5-bbbb2222",
+		};
+		const linearOnly: ReferenceCommitRef = {
+			archivedKey: "linear:PROJ-1-aaaa1111",
+			source: "linear",
+			nativeId: "PROJ-1",
+			title: "Linear entity",
+			url: "https://linear.app/x/issue/PROJ-1/linear",
+			referencedAt: "2026-05-06T00:00:00Z",
+			sourceToolName: "mcp__linear__get_issue",
+		};
+		const summaries = [
+			makeSummary({ hash: "AAAA1234", references: [linearOnly, jiraAt1] }),
+			makeSummary({ hash: "BBBB5678", references: [jiraAt2] }),
+		];
+
+		const md = buildAggregatedPrMarkdown(summaries, 0);
+
+		expect(md.match(/Jira entity/g)?.length).toBe(1);
+		expect(md.match(/Linear entity/g)?.length).toBe(1);
+		// Linear renders first per REFERENCE_SOURCE_ORDER even though it was
+		// second in summary 1.
+		expect(md.indexOf("Linear entity")).toBeLessThan(md.indexOf("Jira entity"));
+	});
+
 	it("renders linear issues even when plans and notes are both empty", () => {
 		// Pre-fix the merge function bailed out when plans+notes were both
 		// empty, dropping linear issues entirely. The fixed bail-out also
 		// considers mergedLinear.length.
-		const issue: LinearIssueCommitRef = {
-			archivedKey: "PROJ-9-cccc3333",
-			ticketId: "PROJ-9",
+		const issue: ReferenceCommitRef = {
+			archivedKey: "linear:PROJ-9-cccc3333",
+			source: "linear",
+			nativeId: "PROJ-9",
 			title: "Solo Linear",
 			url: "https://linear.app/x/issue/PROJ-9/test",
 			referencedAt: "2026-05-06T00:00:00Z",
 			sourceToolName: "mcp__linear__get_issue",
 		};
 		const summaries = [
-			makeSummary({ hash: "AAAA1234", linearIssues: [issue] }),
-			makeSummary({ hash: "BBBB5678", linearIssues: [issue] }), // dedup target
+			makeSummary({ hash: "AAAA1234", references: [issue] }),
+			makeSummary({ hash: "BBBB5678", references: [issue] }), // dedup target
 		];
 
 		const md = buildAggregatedPrMarkdown(summaries, 0);

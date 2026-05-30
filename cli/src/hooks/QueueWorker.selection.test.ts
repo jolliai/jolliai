@@ -59,15 +59,15 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		deleteSquashPending: vi.fn(),
 		loadPluginSource: vi.fn(),
 		deletePluginSource: vi.fn(),
-		loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
+		loadPlansRegistry: vi.fn().mockResolvedValue({ version: 2, plans: {} }),
 		savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 		associatePlanWithCommit: vi.fn().mockResolvedValue(undefined),
 		associateNoteWithCommit: vi.fn().mockResolvedValue(undefined),
-		associateLinearIssueWithCommit: vi.fn().mockResolvedValue(undefined),
-		detectUncommittedLinearIssueIds: vi.fn().mockResolvedValue([]),
+		associateReferenceWithCommit: vi.fn().mockResolvedValue(undefined),
+		detectUncommittedReferenceIds: vi.fn().mockResolvedValue([]),
 		detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
 		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
-		getLinearIssueEntriesForBranch: vi.fn().mockResolvedValue([]),
+		getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
 		filterSessionsByEnabledIntegrations: actual.filterSessionsByEnabledIntegrations,
 		dequeueAllGitOperations: vi.fn().mockResolvedValue([]),
 		deleteQueueEntry: vi.fn().mockResolvedValue(undefined),
@@ -75,11 +75,17 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 	};
 });
 
-vi.mock("../core/LinearIssueStore.js", () => ({
-	linearIssuePath: vi.fn((key: string, cwd: string) => `${cwd}/.jolli/jollimemory/linear-issues/${key}.md`),
-	readLinearIssueMarkdown: vi.fn().mockResolvedValue(null),
-	renameLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
-	hashLinearIssueContentFromMarkdown: vi.fn().mockReturnValue("fakehash"),
+vi.mock("../core/references/ReferenceStore.js", () => ({
+	referencePath: vi.fn(
+		(cwd: string, source: string, key: string) => `${cwd}/.jolli/jollimemory/references/${source}/${key}.md`,
+	),
+	referenceDir: vi.fn((cwd: string, source: string) => `${cwd}/.jolli/jollimemory/references/${source}`),
+	sanitizeNativeIdForPath: vi.fn((_source: string, id: string) => id),
+	readReferenceMarkdown: vi.fn().mockResolvedValue(null),
+	readReferenceMarkdownFromString: vi.fn().mockReturnValue(null),
+	writeReferenceMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/x", contentHash: "fakehash" }),
+	renameReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
+	hashReferenceContent: vi.fn().mockReturnValue("fakehash"),
 }));
 
 vi.mock("../core/PlanPromptFormatter.js", () => ({
@@ -126,7 +132,7 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		migrateOneToOne: vi.fn().mockResolvedValue(undefined),
 		storePlans: vi.fn().mockResolvedValue(undefined),
 		storeNotes: vi.fn().mockResolvedValue(undefined),
-		storeLinearIssues: vi.fn().mockResolvedValue(undefined),
+		storeReferences: vi.fn().mockResolvedValue(undefined),
 		setActiveStorage: vi.fn(),
 		resolveStorage: vi.fn(),
 		stripFunctionalMetadata: actual.stripFunctionalMetadata,
@@ -259,6 +265,8 @@ import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import {
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
+	detectUncommittedReferenceIds,
+	getReferenceEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
 	loadCursorForTranscript,
@@ -269,7 +277,7 @@ import type { SummaryResult } from "../core/Summarizer.js";
 import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary } from "../core/SummaryStore.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
-import type { GitOperation, NoteEntry, PlanEntry } from "../Types.js";
+import type { GitOperation, NoteEntry, PlanEntry, ReferenceEntry } from "../Types.js";
 import { __test__ } from "./QueueWorker.js";
 
 const { executePipeline, processQueueEntry } = __test__;
@@ -631,7 +639,7 @@ describe("QueueWorker selection filter", () => {
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {
 				"plan-keep": {
 					slug: "plan-keep",
@@ -686,7 +694,7 @@ describe("QueueWorker selection filter", () => {
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
+			version: 2,
 			plans: {},
 			notes: {
 				"note-keep": {
@@ -733,5 +741,135 @@ describe("QueueWorker selection filter", () => {
 		const archivedNoteIds = (summaryArg.notes ?? []).map((n) => n.id);
 		expect(archivedNoteIds).toContain("note-keep-abc12345");
 		expect(archivedNoteIds).not.toContain("note-skip-abc12345");
+	});
+
+	// ─── Entity exclusion (panel-level skip-don't-archive) ──────────────────
+	// Mirrors the plan / note archive-side filter tests above: an excluded
+	// entity must be dropped from BOTH the Step 6b prompt block AND the
+	// Step 8a3 archive call. Without the archive-side filter the entity row
+	// would still be committed and disappear from the panel — defeating the
+	// "uncheck = skip on this commit, reappear next time" semantics.
+
+	it("filters excluded entities out of the prompt-block input (Step 6b)", async () => {
+		seedGitMocks(projectDir);
+		vi.mocked(loadAllSessions).mockResolvedValue([]);
+		vi.mocked(buildMultiSessionContext).mockReturnValue("");
+
+		const keepEntity: ReferenceEntry = {
+			source: "jira",
+			nativeId: "PROJ-1",
+			title: "Keep Entity",
+			url: "https://example.atlassian.net/browse/PROJ-1",
+			sourcePath: "/fake/jira/PROJ-1.md",
+			branch: "main",
+			addedAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-01T00:00:00Z",
+			commitHash: null,
+			sourceToolName: "atlassian-mcp",
+		};
+		const skipEntity: ReferenceEntry = {
+			source: "github",
+			nativeId: "owner/repo#42",
+			title: "Skip Entity",
+			url: "https://github.com/owner/repo/issues/42",
+			sourcePath: "/fake/github/owner-repo-42.md",
+			branch: "main",
+			addedAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-01T00:00:00Z",
+			commitHash: null,
+			sourceToolName: "github-mcp",
+		};
+		vi.mocked(getReferenceEntriesForBranch).mockImplementation(async () => {
+			return [keepEntity, skipEntity];
+		});
+
+		// Stub readReferenceMarkdown to capture which sourcePaths flow through.
+		const referenceStore = await import("../core/references/ReferenceStore.js");
+		const readCalls: string[] = [];
+		vi.mocked(referenceStore.readReferenceMarkdown).mockImplementation(async (p) => {
+			readCalls.push(String(p));
+			return null;
+		});
+
+		await setExcluded(projectDir, "references", "github:owner/repo#42", true);
+
+		await executePipeline(projectDir, makeCommitOp());
+
+		// The Step-6b loop reads sourcePath via readReferenceMarkdown. Excluded
+		// entity must not be read (no disk read for the excluded entity).
+		expect(readCalls).toContain("/fake/jira/PROJ-1.md");
+		expect(readCalls).not.toContain("/fake/github/owner-repo-42.md");
+	});
+
+	it("filters excluded entities out of the Step 8a3 archive call", async () => {
+		seedGitMocks(projectDir);
+		vi.mocked(loadAllSessions).mockResolvedValue([]);
+		vi.mocked(buildMultiSessionContext).mockReturnValue("");
+
+		// detectUncommittedReferenceIds returns the {mapKey, source, sourcePath}
+		// triples that drive the archive step. The filter at Step 8a3 must
+		// drop the excluded mapKey before passing to associateReferencesWithCommit
+		// — which we observe indirectly through loadPlansRegistry not being
+		// asked to upgrade the entity (we keep the v1-shaped registry mock so
+		// associateReferencesWithCommit would throw if called with the excluded id).
+		vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+			{ mapKey: "jira:PROJ-KEEP", source: "jira", sourcePath: "/fake/jira/PROJ-KEEP.md" },
+			{ mapKey: "jira:PROJ-SKIP", source: "jira", sourcePath: "/fake/jira/PROJ-SKIP.md" },
+		]);
+		// Provide a v2 registry shape so associateReferencesWithCommit doesn't
+		// throw on the kept entry. The kept entry has the full panel-row
+		// shape; the excluded entry is intentionally absent (would be
+		// "dropped by mapKey not in registry" path otherwise).
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 2,
+			plans: {},
+			references: {
+				"jira:PROJ-KEEP": {
+					source: "jira",
+					nativeId: "PROJ-KEEP",
+					title: "Keep",
+					url: "https://x/PROJ-KEEP",
+					sourcePath: "/fake/jira/PROJ-KEEP.md",
+					branch: "main",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					commitHash: null,
+					sourceToolName: "atlassian-mcp",
+				},
+				"jira:PROJ-SKIP": {
+					source: "jira",
+					nativeId: "PROJ-SKIP",
+					title: "Skip",
+					url: "https://x/PROJ-SKIP",
+					sourcePath: "/fake/jira/PROJ-SKIP.md",
+					branch: "main",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					commitHash: null,
+					sourceToolName: "atlassian-mcp",
+				},
+			},
+		} as never);
+
+		const referenceStore = await import("../core/references/ReferenceStore.js");
+		// readReferenceMarkdown is called inside associateReferencesWithCommit
+		// during archive (via the loop reading `entry.sourcePath`). Track
+		// which sourcePaths were touched to confirm the excluded entity
+		// never reached that loop.
+		const archivePaths: string[] = [];
+		vi.mocked(referenceStore.readReferenceMarkdown).mockImplementation(async (p) => {
+			archivePaths.push(String(p));
+			return null;
+		});
+
+		await setExcluded(projectDir, "references", "jira:PROJ-SKIP", true);
+
+		await executePipeline(projectDir, makeCommitOp());
+
+		// The kept entity's sourcePath shows up in readReferenceMarkdown (both at
+		// Step 6b and Step 8a3 — same helper). The skipped one must NOT appear
+		// at all. The Step-6b filter already drops it from the prompt path,
+		// and the Step-8a3 filter drops it from the archive path.
+		expect(archivePaths.every((p) => !p.includes("PROJ-SKIP"))).toBe(true);
 	});
 });

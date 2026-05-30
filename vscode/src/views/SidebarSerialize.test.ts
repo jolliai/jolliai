@@ -178,23 +178,25 @@ describe("treeItemToSerialized", () => {
 		expect(out.id).toBe("hello:world");
 	});
 
-	// linearHover is one of three optional rich-popover fields (plan/note/linear).
-	// Default serialization drops it, but Linear-issue tree items attach it
+	// referenceHover is one of three optional rich-popover fields (plan/note/entity).
+	// Default serialization drops it, but ReferenceItem instances attach it
 	// directly on the TreeItem instance — the serializer must forward it
 	// through to the webview verbatim. This also covers the truthy branch of
-	// the `linearHover ? { linearHover } : {}` spread in the serializer.
-	it("forwards linearHover when present on the tree item", () => {
+	// the `referenceHover ? { referenceHover } : {}` spread in the serializer.
+	it("forwards referenceHover when present on the tree item", () => {
 		const item = new TreeItem("Issue title") as unknown as Parameters<
 			typeof treeItemToSerialized
-		>[0] & { linearHover?: unknown };
-		(item as { linearHover?: unknown }).linearHover = {
-			identifier: "ENG-123",
-			title: "Issue title",
+		>[0] & { referenceHover?: unknown };
+		(item as { referenceHover?: unknown }).referenceHover = {
+			source: "jira",
+			title: "KAN-5 — Plan auto-discovery",
+			url: "https://example.atlassian.net/browse/KAN-5",
 		};
 		const out = treeItemToSerialized(item as never);
-		expect((out as { linearHover?: unknown }).linearHover).toEqual({
-			identifier: "ENG-123",
-			title: "Issue title",
+		expect((out as { referenceHover?: unknown }).referenceHover).toEqual({
+			source: "jira",
+			title: "KAN-5 — Plan auto-discovery",
+			url: "https://example.atlassian.net/browse/KAN-5",
 		});
 	});
 });

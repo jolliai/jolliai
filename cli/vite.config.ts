@@ -37,6 +37,13 @@ export default defineConfig({
 		ssr: true,
 	},
 	test: {
+		// Pin the pool explicitly. vitest 4.x's implicit default-pool resolution
+		// fails to inject the worker context on this toolchain (node 24.10 /
+		// Windows) — every `describe()` then throws "Cannot read properties of
+		// undefined (reading 'config')" at collection time. Naming any pool
+		// restores worker init; `forks` matches vitest's historical default and
+		// suits this suite's real `git init` / file-lock / fs tests.
+		pool: "forks",
 		// Acceptance suites live under `test/sync-acceptance/` and use real
 		// `git init --bare` + mock backend. They run via the separate
 		// `vitest.acceptance.config.ts` (npm run test:acceptance), so the

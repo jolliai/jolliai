@@ -352,10 +352,11 @@ describe("SummaryMarkdownBuilder", () => {
 				// able to grep "PROJ-1528" out of the description, so ticketId
 				// must lead the bullet (not just the title).
 				const summary = makeSummary({
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "PROJ-1528-786c5330",
-							ticketId: "PROJ-1528",
+							archivedKey: "linear:PROJ-1528-786c5330",
+							source: "linear",
+							nativeId: "PROJ-1528",
 							title:
 								"Treat referenced Linear issues as a first-class panel item",
 							url: "https://linear.app/jolliai/issue/PROJ-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
@@ -374,6 +375,37 @@ describe("SummaryMarkdownBuilder", () => {
 				);
 			});
 
+			it("escapes untrusted reference title/url so a crafted entry cannot inject a markdown link into the PR body", () => {
+				// title/url come from external trackers (attacker-controlled). A
+				// title with `](…)` must not break out of the link text, and a url
+				// with `)` / spaces must not close the link early or be reparsed
+				// as a link title.
+				const summary = makeSummary({
+					references: [
+						{
+							archivedKey: "jira:KAN-9-bbbb2222",
+							source: "jira",
+							nativeId: "KAN-9",
+							title: "Fix login](https://phish.example) click [here",
+							url: "https://evil.example/x)/path with space",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__claude_ai_Atlassian__getJiraIssue",
+						},
+					],
+				});
+				setupDefaults(summary);
+
+				const md = buildMarkdown(summary);
+
+				// `[` / `]` in the title are backslash-escaped — no link break-out.
+				expect(md).toContain("Fix login\\]");
+				expect(md).toContain("click \\[here");
+				expect(md).not.toContain("login](https://phish.example)");
+				// `)` and space in the url are percent-encoded — target stays intact.
+				expect(md).toContain("https://evil.example/x%29/path%20with%20space");
+				expect(md).not.toContain("x)/path with space");
+			});
+
 			it("includes linear-issue count in the section header alongside plans/notes", () => {
 				const summary = makeSummary({
 					plans: [
@@ -385,18 +417,20 @@ describe("SummaryMarkdownBuilder", () => {
 							updatedAt: "2026-03-30T09:30:00Z",
 						},
 					],
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "PROJ-1-aaaa1111",
-							ticketId: "PROJ-1",
+							archivedKey: "linear:PROJ-1-aaaa1111",
+							source: "linear",
+							nativeId: "PROJ-1",
 							title: "Linear A",
 							url: "https://linear.app/x/issue/PROJ-1/a",
 							referencedAt: "2026-05-14T09:11:43.708Z",
 							sourceToolName: "mcp__linear__get_issue",
 						},
 						{
-							archivedKey: "PROJ-2-aaaa1111",
-							ticketId: "PROJ-2",
+							archivedKey: "linear:PROJ-2-aaaa1111",
+							source: "linear",
+							nativeId: "PROJ-2",
 							title: "Linear B",
 							url: "https://linear.app/x/issue/PROJ-2/b",
 							referencedAt: "2026-05-14T09:11:43.708Z",
@@ -417,10 +451,11 @@ describe("SummaryMarkdownBuilder", () => {
 				// plans/notes were both empty; now linear issues alone are
 				// enough to surface the section.
 				const summary = makeSummary({
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "PROJ-1-aaaa1111",
-							ticketId: "PROJ-1",
+							archivedKey: "linear:PROJ-1-aaaa1111",
+							source: "linear",
+							nativeId: "PROJ-1",
 							title: "Solo",
 							url: "https://linear.app/x/issue/PROJ-1/solo",
 							referencedAt: "2026-05-14T09:11:43.708Z",
@@ -478,6 +513,86 @@ describe("SummaryMarkdownBuilder", () => {
 					nextSection > -1 ? nextSection : undefined,
 				);
 				expect(between).not.toContain("---");
+			});
+
+			it("renders summary.entities (v5+) across multiple sources in deterministic order", () => {
+				// Order in input: jira, notion, linear, github — must come out as
+				// linear → jira → github → notion per REFERENCE_SOURCE_ORDER. Each
+				// bullet uses `nativeId — title` (URL = upstream).
+				const summary = makeSummary({
+					references: [
+						{
+							archivedKey: "jira:KAN-5-aaaa1111",
+							source: "jira",
+							nativeId: "KAN-5",
+							title: "Jira ticket",
+							url: "https://example.atlassian.net/browse/KAN-5",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__claude_ai_Atlassian__getJiraIssue",
+						},
+						{
+							archivedKey: "notion:abcdef12-aaaa1111",
+							source: "notion",
+							nativeId: "abcdef12",
+							title: "Notion page",
+							url: "https://notion.so/abcdef12",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__claude_ai_Notion__notion-fetch",
+						},
+						{
+							archivedKey: "linear:PROJ-1-aaaa1111",
+							source: "linear",
+							nativeId: "PROJ-1",
+							title: "Linear ticket",
+							url: "https://linear.app/x/issue/PROJ-1/linear-ticket",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+						{
+							archivedKey: "github:owner/repo#42-aaaa1111",
+							source: "github",
+							nativeId: "owner/repo#42",
+							title: "GitHub issue",
+							url: "https://github.com/owner/repo/issues/42",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__github__issue_read",
+						},
+					],
+				});
+				setupDefaults(summary);
+
+				const md = buildMarkdown(summary);
+
+				const idxLinear = md.indexOf("PROJ-1 — Linear ticket");
+				const idxJira = md.indexOf("KAN-5 — Jira ticket");
+				const idxGithub = md.indexOf("owner/repo#42 — GitHub issue");
+				const idxNotion = md.indexOf("abcdef12 — Notion page");
+				expect(idxLinear).toBeGreaterThan(-1);
+				expect(idxJira).toBeGreaterThan(idxLinear);
+				expect(idxGithub).toBeGreaterThan(idxJira);
+				expect(idxNotion).toBeGreaterThan(idxGithub);
+				expect(md).toContain("## Plans & Notes (4)");
+			});
+
+			it("renders source-prefixed references with archivedKey using the canonical layout", () => {
+				const summary = makeSummary({
+					references: [
+						{
+							archivedKey: "linear:PROJ-1-aaaa1111",
+							source: "linear",
+							nativeId: "PROJ-1",
+							title: "From references",
+							url: "https://linear.app/x/issue/PROJ-1/from-references",
+							referencedAt: "2026-05-14T09:11:43.708Z",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+				setupDefaults(summary);
+
+				const md = buildMarkdown(summary);
+
+				expect(md).toContain("PROJ-1 — From references");
 			});
 		});
 

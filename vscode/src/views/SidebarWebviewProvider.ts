@@ -146,6 +146,15 @@ export interface SidebarWebviewDeps {
 		planId: string,
 		selected: boolean,
 	) => void | Promise<void>;
+	/**
+	 * Toggle a single multi-source reference's exclusion state. The `mapKey`
+	 * matches the `plans.json.references` map key (`<source>:<nativeId>`) and is
+	 * forwarded verbatim to `setExcluded(.., "references", mapKey, ..)`.
+	 */
+	applyReferenceCheckbox?: (
+		mapKey: string,
+		selected: boolean,
+	) => void | Promise<void>;
 	/** Toggle a single note's selection state in NotesStore. */
 	applyNoteCheckbox?: (
 		noteId: string,
@@ -443,21 +452,21 @@ export class SidebarWebviewProvider
 					msg.noteId,
 				);
 				return;
-			case "branch:openLinearIssue":
+			case "branch:openReference":
 				void this.deps.executeCommand(
-					"jollimemory.openLinearIssue",
+					"jollimemory.openReferenceInBrowser",
 					msg.mapKey,
 				);
 				return;
-			case "branch:openLinearIssueMarkdown":
+			case "branch:openReferenceMarkdown":
 				void this.deps.executeCommand(
-					"jollimemory.openLinearIssueMarkdown",
+					"jollimemory.openReferenceMarkdown",
 					msg.mapKey,
 				);
 				return;
-			case "branch:ignoreLinearIssue":
+			case "branch:ignoreReference":
 				void this.deps.executeCommand(
-					"jollimemory.ignoreLinearIssue",
+					"jollimemory.ignoreReference",
 					msg.mapKey,
 				);
 				return;
@@ -587,6 +596,9 @@ export class SidebarWebviewProvider
 				return;
 			case "branch:togglePlanSelection":
 				void this.deps.applyPlanCheckbox?.(msg.planId, msg.selected);
+				return;
+			case "branch:toggleReferenceSelection":
+				void this.deps.applyReferenceCheckbox?.(msg.mapKey, msg.selected);
 				return;
 			case "branch:toggleNoteSelection":
 				void this.deps.applyNoteCheckbox?.(msg.noteId, msg.selected);

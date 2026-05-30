@@ -60,7 +60,7 @@ describe("loadRegenerateContext", () => {
 				...baseSummary,
 				plans: [{ slug: "p1" } as never],
 				notes: [],
-				linearIssues: [{ archivedKey: "li-1" } as never],
+				references: [{ archivedKey: "linear:LI-1", source: "linear" } as never],
 			} as CommitSummary,
 			"/repo",
 		);
@@ -72,7 +72,7 @@ describe("loadRegenerateContext", () => {
 			humanTurns: 2,
 			plansCount: 1,
 			notesCount: 0,
-			linearCount: 1,
+			referenceCountsBySource: { linear: 1 },
 		});
 	});
 
@@ -86,7 +86,7 @@ describe("loadRegenerateContext", () => {
 			humanTurns: 0,
 			plansCount: 0,
 			notesCount: 0,
-			linearCount: 0,
+			referenceCountsBySource: {},
 		});
 	});
 
@@ -173,7 +173,7 @@ describe("loadRegenerateContext", () => {
 
 	it("counts v3 child-only attachments via the normalizeToV4 step", async () => {
 		// Before the normalize-then-operate refactor, plansCount/notesCount/
-		// linearCount only saw root.fields — for legacy v3 summaries where the
+		// referenceCount only saw root.fields — for legacy v3 summaries where the
 		// attachments lived on a child, the confirm dialog reported 0 even
 		// when the LLM was about to be re-run on those very attachments.
 		// Now they're hoisted to root by normalizeToV4 before counting.
@@ -182,7 +182,6 @@ describe("loadRegenerateContext", () => {
 			version: 3,
 			plans: undefined,
 			notes: undefined,
-			linearIssues: undefined,
 			children: [
 				{
 					...baseSummary,
@@ -206,10 +205,11 @@ describe("loadRegenerateContext", () => {
 							updatedAt: "2026-05-20T00:00:00Z",
 						},
 					],
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "JOLLI-1-abc",
-							ticketId: "JOLLI-1",
+							archivedKey: "linear:JOLLI-1-abc12345",
+							source: "linear",
+							nativeId: "JOLLI-1",
 							title: "T",
 							url: "https://linear.app/x",
 							referencedAt: "2026-05-20T00:00:00Z",
@@ -225,7 +225,7 @@ describe("loadRegenerateContext", () => {
 		const ctx = await loadRegenerateContext(v3WithChildAttachments, "/repo");
 		expect(ctx.plansCount).toBe(1);
 		expect(ctx.notesCount).toBe(1);
-		expect(ctx.linearCount).toBe(1);
+		expect(ctx.referenceCountsBySource).toEqual({ linear: 1 });
 	});
 
 	it("aggregates counts + sources across the whole summary tree (squash / amend case)", async () => {

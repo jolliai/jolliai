@@ -1654,49 +1654,50 @@ describe("SidebarScriptBuilder", () => {
 		});
 	});
 
-	describe("Linear issue row icon", () => {
-		// Final shape after several iterations: the row uses the codicon
-		// `issue-opened` glyph (provider-supplied via iconKey) with NO
-		// brand-specific tint. Prior attempts — inlining Linear's SVG, then
-		// routing through a `linearIssue.iconColor` ThemeColor, then a
-		// context-driven `.icon-color-linear` class — were all dropped at
-		// the user's request to keep rows visually uniform.
-		it("does not apply a Linear-specific colour class on linearissue rows", () => {
+	describe("Entity row icon", () => {
+		// Final shape after the multi-source refactor: the row uses the codicon
+		// `issues` glyph for Linear / Jira / GitHub (provider-supplied
+		// via iconKey on the SerializedTreeItem) and `file-text` for Notion.
+		// No brand-specific colour class — the user explicitly rejected brand
+		// tints to keep rows visually uniform.
+		it("does not apply any brand-specific colour class on entity rows", () => {
 			const js = buildSidebarScript();
-			// Webview-side: no .icon-color-linear class is emitted, nor any
-			// `linearIssue.iconColor` ThemeColor mapping.
+			// Webview-side: no per-brand icon-color class is emitted, nor any
+			// per-source ThemeColor mapping leaking into the JS.
 			expect(js).not.toContain("icon-color-linear");
-			expect(js).not.toContain("linearIssue.iconColor");
+			expect(js).not.toContain("icon-color-jira");
+			expect(js).not.toContain("icon-color-github");
+			expect(js).not.toContain("icon-color-notion");
 		});
 	});
 
-	describe("Linear issue hover card", () => {
+	describe("Entity hover card", () => {
 		// The plain-text tooltip routed through textContent (the prior plan/note
-		// fallback) showed markdown source verbatim for Linear issues — backslash
-		// escapes from escMd plus literal ** / $() markers. Linear-issue rows now
-		// drive the same .hover-card popover used by the Memories section so they
-		// get the rich codicon layout (status circle, priority flame, label tag,
-		// description preview, Open-in-Linear link).
-		it("declares renderLinearHoverCard for the Linear-issue card body", () => {
+		// fallback) showed markdown source verbatim for entity rows — backslash
+		// escapes from escMd plus literal ** / $() markers. Entity rows now
+		// drive the same .hover-card popover used by the Memories section so
+		// they get the rich codicon layout (source badge, status circle,
+		// priority flame, label tag, Open-in-<Source> link).
+		it("declares renderReferenceHoverCard for the multi-source entity card body", () => {
 			// The earlier per-kind show / schedule functions were collapsed
 			// into a single scheduleShowBranchHoverCard once plans and notes
 			// also went through the hover card — only the renderer is
-			// kind-specific now. See the "Plan / Note / Linear hover card"
+			// kind-specific now. See the "Plan / Note / Entity hover card"
 			// describe block for the unified-dispatch tests.
 			const js = buildSidebarScript();
-			expect(js).toContain("function renderLinearHoverCard");
+			expect(js).toContain("function renderReferenceHoverCard");
 		});
 
-		it("Open-in-Linear hover-card link uses data-cmd + data-hash so the shared dispatch works", () => {
+		it("Open-in-<Source> hover-card link uses data-cmd + data-hash so the shared dispatch works", () => {
 			const js = buildSidebarScript();
 			// The hoverCardEl click handler routes [data-cmd][data-hash] →
 			// vscode.postMessage({command, args:[hash]}). Reusing those attribute
 			// names means we don't duplicate the dispatch code.
-			expect(js).toContain("'data-cmd': 'jollimemory.openLinearIssue'");
+			expect(js).toContain("'data-cmd': 'jollimemory.openReferenceInBrowser'");
 			expect(js).toMatch(/'data-hash':\s*mapKey/);
 		});
 
-		it("renders the codicon row stack (status / priority / labels) + Open-in-Linear action", () => {
+		it("renders the codicon row stack (status / priority / labels) + Open-in-<Source> action", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("codicon-circle-large-filled");
 			expect(js).toContain("codicon-flame");
@@ -1709,25 +1710,38 @@ describe("SidebarScriptBuilder", () => {
 			const fnStart = js.indexOf("function renderPlanRow");
 			const fnEnd = js.indexOf("function gitStatusToCodicon", fnStart);
 			const body = js.slice(fnStart, fnEnd);
-			// Plan / note / linear-issue rows all route through the shared
-			// hover-card mouseover handler now, so the native title attribute
-			// is universally nulled — keeping it would surface a duplicate
+			// Plan / note / entity rows all route through the shared hover-card
+			// mouseover handler now, so the native title attribute is
+			// universally nulled — keeping it would surface a duplicate
 			// tooltip on an independent timer.
 			expect(body).toContain("title: null");
 			expect(body).not.toContain("title: item.tooltip");
 		});
+
+		it("includes a per-source badge in the title row so users can disambiguate Linear / Jira / GitHub / Notion at a glance", () => {
+			// The badge is the minimum-viable source-surfacing — single
+			// letter (L / J / GH / N) rather than a full brand icon. Source
+			// label lookup is a literal object so a regression that drops
+			// a source key would also trip this test.
+			const js = buildSidebarScript();
+			expect(js).toContain("hc-source-badge");
+			expect(js).toContain("linear: 'L'");
+			expect(js).toContain("jira: 'J'");
+			expect(js).toContain("github: 'GH'");
+			expect(js).toContain("notion: 'N'");
+		});
 	});
 
-	describe("Plan / Note / Linear hover card", () => {
+	describe("Plan / Note / Entity hover card", () => {
 		// The three Plans & Notes section row types share one popover element
 		// (#memory-hover) and one set of show / hide timers — only the content
 		// renderer differs. mouseover dispatches on data-context to pick the
-		// right renderPlan/Note/LinearHoverCard.
-		it("declares renderPlanHoverCard + renderNoteHoverCard alongside Linear's", () => {
+		// right renderPlan/Note/EntityHoverCard.
+		it("declares renderPlanHoverCard + renderNoteHoverCard alongside Entity's", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("function renderPlanHoverCard");
 			expect(js).toContain("function renderNoteHoverCard");
-			expect(js).toContain("function renderLinearHoverCard");
+			expect(js).toContain("function renderReferenceHoverCard");
 		});
 
 		it("plan hover card includes clock + filename rows + Open-Plan action (no edit-count row)", () => {
@@ -1750,52 +1764,52 @@ describe("SidebarScriptBuilder", () => {
 		it("note hover card swaps file icon by format and exposes Open-Note action", () => {
 			const js = buildSidebarScript();
 			const fnStart = js.indexOf("function renderNoteHoverCard");
-			const fnEnd = js.indexOf("function renderLinearHoverCard", fnStart);
+			const fnEnd = js.indexOf("function renderReferenceHoverCard", fnStart);
 			const body = js.slice(fnStart, fnEnd);
 			expect(body).toContain("'codicon-comment'");
 			expect(body).toContain("'codicon-note'");
 			expect(body).toContain("'jollimemory.openNoteForPreview'");
 		});
 
-		it("mouseover dispatches by data-context to plan / note / linear renderers", () => {
+		it("mouseover dispatches by data-context to plan / note / entity renderers", () => {
 			const js = buildSidebarScript();
 			// Single selector + branch on ctx — three separate listeners would
 			// invite race conditions on the show / hide timers.
 			expect(js).toContain("'.tree-node[data-id]'");
 			expect(js).toMatch(
-				/ctx\s*!==\s*'plan'\s*&&\s*ctx\s*!==\s*'note'\s*&&\s*ctx\s*!==\s*'linearissue'/,
+				/ctx\s*!==\s*'plan'\s*&&\s*ctx\s*!==\s*'note'\s*&&\s*ctx\s*!==\s*'reference'/,
 			);
 			expect(js).toContain("renderPlanHoverCard(rowId");
 			expect(js).toContain("renderNoteHoverCard(rowId");
-			expect(js).toContain("renderLinearHoverCard(rowId");
+			expect(js).toContain("renderReferenceHoverCard(rowId");
 		});
 
-		it("unified lookup reads planHover / noteHover / linearHover off the matching serialized item", () => {
+		it("unified lookup reads planHover / noteHover / referenceHover off the matching serialized item", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("function lookupBranchHoverById");
 			expect(js).toContain("items[i].planHover");
 			expect(js).toContain("items[i].noteHover");
-			expect(js).toContain("items[i].linearHover");
+			expect(js).toContain("items[i].referenceHover");
 		});
 
 		it("trash button (data-inline='remove') routes by row contextValue to the right command", () => {
 			// Regression: renderPlanRow shared one inline-actions block across
-			// plan / note / linearissue rows (all hardcoded data-inline="remove").
+			// plan / note / entity rows (all hardcoded data-inline="remove").
 			// The click delegation initially branched only plan-vs-note, so
-			// Linear rows fell into the else and dispatched jollimemory.removePlan
-			// with a Linear mapKey — which removePlan doesn't recognize, so the
-			// trash button silently no-op'd on Linear rows while working on
+			// entity rows fell into the else and dispatched jollimemory.removePlan
+			// with an entity mapKey — which removePlan doesn't recognize, so the
+			// trash button silently no-op'd on entity rows while working on
 			// plan/note rows. The three-way ternary in the dispatch ensures
 			// each row type's trash routes to its own host-side handler.
 			const js = buildSidebarScript();
 			expect(js).toContain("'jollimemory.removeNote'");
 			expect(js).toContain("'jollimemory.removePlan'");
-			expect(js).toContain("'jollimemory.ignoreLinearIssue'");
+			expect(js).toContain("'jollimemory.ignoreReference'");
 			// The three branches must coexist in the same dispatch — a future
 			// regression that dropped any of them would re-introduce the
 			// silent-no-op symptom on the corresponding row type.
 			expect(js).toMatch(
-				/ctx\s*===\s*'note'[\s\S]{0,150}ctx\s*===\s*'linearissue'/,
+				/ctx\s*===\s*'note'[\s\S]{0,150}ctx\s*===\s*'reference'/,
 			);
 		});
 	});
@@ -1944,7 +1958,7 @@ describe("SidebarScriptBuilder", () => {
 			expect(fn).toMatch(/data-note-id.*item\.id/);
 		});
 
-		it("renderPlanRow does not emit a checkbox for linearissue rows (not user-selectable)", () => {
+		it("renderPlanRow emits a jm-reference-check checkbox with data-reference-key for entity rows", () => {
 			const js = buildSidebarScript();
 			const fnStart = js.indexOf("function renderPlanRow");
 			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
@@ -1952,9 +1966,13 @@ describe("SidebarScriptBuilder", () => {
 				fnEnd > fnStart
 					? js.slice(fnStart, fnEnd)
 					: js.slice(fnStart, fnStart + 3000);
-			// The checkbox is gated on '!isLinearIssue', so 'isLinearIssue' must
-			// appear in the function as the exclusion guard.
-			expect(fn).toMatch(/isLinearIssue/);
+			expect(fn).toContain("'jm-reference-check'");
+			expect(fn).toContain("'data-reference-key'");
+			// The mapKey is stored in item.id (entity.mapKey from PlansTreeProvider.serialize)
+			// and carried into 'data-reference-key'.
+			expect(fn).toMatch(/data-reference-key.*item\.id/);
+			// The isReference branch still discriminates which checkbox class is emitted.
+			expect(fn).toMatch(/isReference/);
 		});
 
 		it("change listener posts branch:toggleConversationSelection for jm-conv-check", () => {
@@ -1973,6 +1991,15 @@ describe("SidebarScriptBuilder", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("type: 'branch:toggleNoteSelection'");
 			expect(js).toContain("'jm-note-check'");
+		});
+
+		it("change listener posts branch:toggleReferenceSelection for jm-reference-check with mapKey from data-reference-key", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("type: 'branch:toggleReferenceSelection'");
+			expect(js).toContain("'jm-reference-check'");
+			// Confirm the mapKey is read from data-reference-key rather than
+			// being conflated with data-plan-id / data-note-id.
+			expect(js).toMatch(/mapKey:\s*cb\.getAttribute\(['"]data-reference-key['"]\)/);
 		});
 
 		it("change listener sends planId from data-plan-id and noteId from data-note-id", () => {

@@ -58,9 +58,9 @@ import {
 	readTranscriptsForCommits,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
-	storeLinearIssues,
 	storeNotes,
 	storePlans,
+	storeReferences,
 	storeSummary,
 } from "../../cli/src/core/SummaryStore.js";
 import {
@@ -80,17 +80,18 @@ import type {
 	NoteReference,
 	PlanProgressArtifact,
 	PlanReference,
+	SourceId,
 	StatusInfo,
 	StoredTranscript,
 	SummaryIndexEntry,
 } from "../../cli/src/Types.js";
 import { execFileAsyncHidden } from "../../cli/src/util/Subprocess.js";
 import {
-	detectLinearIssues,
-	openLinearIssueInBrowser as openLinearIssueInBrowserImpl,
-	openLinearIssueMarkdown as openLinearIssueMarkdownImpl,
-	setLinearIssueIgnored,
-} from "./core/LinearIssueService.js";
+	detectReferences,
+	openReferenceInBrowser as openReferenceInBrowserImpl,
+	openReferenceMarkdown as openReferenceMarkdownImpl,
+	setReferenceIgnored,
+} from "./core/ReferenceService.js";
 import {
 	archiveNoteForCommit,
 	detectNotes,
@@ -107,9 +108,9 @@ import type {
 	BranchCommitsResult,
 	CommitFileInfo,
 	FileStatus,
-	LinearIssueInfo,
 	NoteInfo,
 	PlanInfo,
+	ReferenceInfo,
 } from "./Types.js";
 import { mergeCommitMessages } from "./util/CommitMessageUtils.js";
 import { log } from "./util/Logger.js";
@@ -1615,6 +1616,7 @@ export class JolliMemoryBridge {
 						);
 					}
 				}
+				/* v8 ignore start -- defensive logger coercion: `err instanceof Error` is the standard JS rejection shape; the `: String(err)` arm only fires if a non-Error value is thrown (rare in practice, exercised at the PlansStore layer for the same ternary pattern). */
 			} catch (err) {
 				log.warn(
 					"listSummaryEntries",
@@ -1623,6 +1625,7 @@ export class JolliMemoryBridge {
 					}`,
 				);
 			}
+			/* v8 ignore stop */
 
 			// Head filter is the headline behavior: keeps only v4 Hoist roots
 			// (`parentCommitHash == null` — the live commit version), hiding
@@ -1905,12 +1908,14 @@ export class JolliMemoryBridge {
 				const storage = new FolderStorage(repo.kbRoot, mm);
 				return { storage, kbRoot: repo.kbRoot };
 			}
+			/* v8 ignore start -- defensive logger coercion: same pattern as listSummaryEntries above; non-Error rejections are rare. */
 		} catch (err) {
 			log.warn(
 				"createReadStorageForCurrentRepo",
 				`Discovery failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
+		/* v8 ignore stop */
 		return null;
 	}
 
@@ -1948,12 +1953,14 @@ export class JolliMemoryBridge {
 				const storage = new FolderStorage(repo.kbRoot, mm);
 				return { storage, kbRoot: repo.kbRoot };
 			}
+			/* v8 ignore start -- defensive logger coercion: same pattern as createReadStorageForCurrentRepo above; non-Error rejections are rare. */
 		} catch (err) {
 			log.warn(
 				"createStorageForRepo",
 				`Discovery failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
+		/* v8 ignore stop */
 		return null;
 	}
 
@@ -2165,15 +2172,24 @@ export class JolliMemoryBridge {
 		await storeNotes(noteFiles, commitMessage, this.cwd, branch, storage);
 	}
 
-	/** Writes Linear-issue archived snapshots. */
-	async storeLinearIssues(
-		linearFiles: ReadonlyArray<{ archivedKey: string; content: string }>,
+	/**
+	 * Writes multi-source reference archived snapshots (Linear / Jira / GitHub /
+	 * Notion). The `references/<source>/<sanitized-bareKey>.md` path layout is
+	 * applied inside SummaryStore.storeReferences. Used by the Summary panel's
+	 * inline edit Save handler.
+	 */
+	async storeReferences(
+		referenceFiles: ReadonlyArray<{
+			archivedKey: string;
+			source: SourceId;
+			content: string;
+		}>,
 		commitMessage: string,
 		branch?: string,
 	): Promise<void> {
 		const storage = await this.getStorage();
-		await storeLinearIssues(
-			linearFiles,
+		await storeReferences(
+			referenceFiles,
 			commitMessage,
 			this.cwd,
 			branch,
@@ -2401,26 +2417,30 @@ export class JolliMemoryBridge {
 		await deleteNoteVisibleArtifact(id, branch, this.cwd, storage);
 	}
 
-	// ── Linear issues ────────────────────────────────────────────────────
+	// ── Multi-source references ──────────────────────────────────────────
 
-	/** Lists Linear issues discovered from Claude Code MCP transcripts. */
-	listLinearIssues(): Promise<ReadonlyArray<LinearIssueInfo>> {
-		return detectLinearIssues(this.cwd);
+	/**
+	 * Lists multi-source external references (Linear / Jira / GitHub / Notion)
+	 * discovered from MCP transcripts. The panel tree consumes this list
+	 * directly through the ReferenceItem renderer.
+	 */
+	listReferences(): Promise<ReadonlyArray<ReferenceInfo>> {
+		return detectReferences(this.cwd);
 	}
 
-	/** Marks a Linear issue as ignored (hidden from the panel). */
-	async ignoreLinearIssue(mapKey: string): Promise<void> {
-		await setLinearIssueIgnored(this.cwd, mapKey, true);
+	/** Marks a reference as ignored (hidden from the panel) by mapKey. */
+	async ignoreReference(mapKey: string): Promise<void> {
+		await setReferenceIgnored(this.cwd, mapKey, true);
 	}
 
-	/** Opens the Linear issue's URL in the user's default browser. */
-	openLinearIssue(info: LinearIssueInfo): Promise<boolean> {
-		return openLinearIssueInBrowserImpl(info);
+	/** Opens the reference's upstream URL in the user's default browser. */
+	openReferenceInBrowser(info: ReferenceInfo): Promise<boolean> {
+		return openReferenceInBrowserImpl(info);
 	}
 
-	/** Opens the per-issue markdown file in a VS Code editor tab. */
-	openLinearIssueMarkdown(info: LinearIssueInfo): Promise<void> {
-		return openLinearIssueMarkdownImpl(info);
+	/** Opens the per-reference markdown file in a VS Code editor tab. */
+	openReferenceMarkdown(info: ReferenceInfo): Promise<void> {
+		return openReferenceMarkdownImpl(info);
 	}
 }
 

@@ -2,8 +2,8 @@
  * CommitSelectionStore
  *
  * Persists the set of sidebar items the user wants EXCLUDED from the next
- * summary pipeline run. Three kinds (conversations / plans / notes) live
- * in a single JSON file under
+ * summary pipeline run. Four kinds (conversations / plans / notes / references)
+ * live in a single JSON file under
  * `<projectDir>/.jolli/jollimemory/commit-selection.json`.
  *
  * Sticky semantics: an entry stays in this file until the user explicitly
@@ -15,6 +15,13 @@
  * from sidebar) and from `PlanEntry.ignored` / `NoteEntry.ignored`
  * (permanent ignore at the plans-registry layer). Exclusions are visible
  * in the sidebar with an unchecked box; the row still renders.
+ *
+ * Schema versions:
+ *   - v1: { conversations, plans, notes }
+ *   - v2: + references (panel-level skip for multi-source reference rows;
+ *         key is `<source>:<nativeId>`, identical to the plans.json.references
+ *         map key). v1 files are transparently migrated on read — references
+ *         defaults to empty and the next write upgrades the file to v2.
  */
 
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
@@ -25,14 +32,20 @@ import type { TranscriptSource } from "../Types.js";
 const log = createLogger("CommitSelection");
 
 const SELECTION_FILE = "commit-selection.json";
-const SELECTION_VERSION = 1 as const;
+const SELECTION_VERSION = 2 as const;
 
-export type ExclusionKind = "conversations" | "plans" | "notes";
+export type ExclusionKind = "conversations" | "plans" | "notes" | "references";
 
 export interface CommitExclusions {
 	readonly conversations: ReadonlySet<string>;
 	readonly plans: ReadonlySet<string>;
 	readonly notes: ReadonlySet<string>;
+	/**
+	 * Per-source reference exclusions. Key is `<source>:<nativeId>` (same shape as
+	 * the `plans.json.references` map key). Added in v2; v1 files migrate
+	 * transparently with an empty references set.
+	 */
+	readonly references: ReadonlySet<string>;
 }
 
 interface PersistedShape {
@@ -40,6 +53,7 @@ interface PersistedShape {
 	readonly conversations: readonly string[];
 	readonly plans: readonly string[];
 	readonly notes: readonly string[];
+	readonly references: readonly string[];
 }
 
 function selectionPath(projectDir: string): string {
@@ -60,6 +74,7 @@ function emptyExclusions(): CommitExclusions {
 		conversations: new Set<string>(),
 		plans: new Set<string>(),
 		notes: new Set<string>(),
+		references: new Set<string>(),
 	};
 }
 
@@ -80,7 +95,10 @@ export async function readExclusions(projectDir: string): Promise<CommitExclusio
 		log.warn("readExclusions JSON parse failed: %s", errMsg(err));
 		return emptyExclusions();
 	}
-	if (parsed.version !== SELECTION_VERSION) {
+	// v1 (legacy) files are transparently migrated: read the three legacy fields
+	// and default `references` to empty. Anything other than 1 or 2 is treated as
+	// an unrecognized schema and ignored — same loud-but-safe behavior as before.
+	if (parsed.version !== SELECTION_VERSION && parsed.version !== 1) {
 		log.warn("readExclusions version mismatch (got %s) — ignoring file", String(parsed.version));
 		return emptyExclusions();
 	}
@@ -88,6 +106,7 @@ export async function readExclusions(projectDir: string): Promise<CommitExclusio
 		conversations: new Set(asStringArray(parsed.conversations)),
 		plans: new Set(asStringArray(parsed.plans)),
 		notes: new Set(asStringArray(parsed.notes)),
+		references: new Set(asStringArray(parsed.references)),
 	};
 }
 
@@ -104,6 +123,7 @@ async function writeExclusions(projectDir: string, next: CommitExclusions): Prom
 		conversations: [...next.conversations],
 		plans: [...next.plans],
 		notes: [...next.notes],
+		references: [...next.references],
 	};
 	const tmp = `${selectionPath(projectDir)}.tmp-${process.pid}-${Date.now()}`;
 	await writeFile(tmp, JSON.stringify(payload, null, "\t"), "utf8");
@@ -125,11 +145,13 @@ function mutableClone(ex: CommitExclusions): {
 	conversations: Set<string>;
 	plans: Set<string>;
 	notes: Set<string>;
+	references: Set<string>;
 } {
 	return {
 		conversations: new Set(ex.conversations),
 		plans: new Set(ex.plans),
 		notes: new Set(ex.notes),
+		references: new Set(ex.references),
 	};
 }
 

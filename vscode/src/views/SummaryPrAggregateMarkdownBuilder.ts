@@ -7,9 +7,9 @@
 import type {
 	CommitSummary,
 	E2eTestScenario,
-	LinearIssueCommitRef,
 	NoteReference,
 	PlanReference,
+	ReferenceCommitRef,
 } from "../../../cli/src/Types.js";
 import {
 	pushFooter,
@@ -101,10 +101,10 @@ function pushMergedPlansAndNotes(
 ): void {
 	const planSeen = new Set<string>();
 	const noteSeen = new Set<string>();
-	const linearSeen = new Set<string>();
+	const referenceSeen = new Set<string>();
 	const mergedPlans: Array<PlanReference> = [];
 	const mergedNotes: Array<NoteReference> = [];
-	const mergedLinear: Array<LinearIssueCommitRef> = [];
+	const mergedReferences: Array<ReferenceCommitRef> = [];
 
 	for (const s of summaries) {
 		for (const p of s.plans ?? []) {
@@ -121,15 +121,18 @@ function pushMergedPlansAndNotes(
 				mergedNotes.push(n);
 			}
 		}
-		// Dedupe Linear issues by stable ticketId — the archivedKey varies
+		// Dedupe references by `<source>:<nativeId>` — the archivedKey varies
 		// across commits (each archive appends a different shortHash), so
-		// using ticketId means the same Linear ticket referenced across
-		// multiple commits in the PR collapses to a single bullet.
-		for (const l of s.linearIssues ?? []) {
-			const key = `ticket:${l.ticketId}`;
-			if (!linearSeen.has(key)) {
-				linearSeen.add(key);
-				mergedLinear.push(l);
+		// using the source+nativeId pair means the same external reference
+		// (Linear ticket / Jira issue / GitHub issue / Notion page)
+		// referenced across multiple commits in the PR collapses to a
+		// single bullet. `s.references` is canonical post-Phase-B.
+		const own = s.references ?? [];
+		for (const e of own) {
+			const key = `${e.source}:${e.nativeId}`;
+			if (!referenceSeen.has(key)) {
+				referenceSeen.add(key);
+				mergedReferences.push(e);
 			}
 		}
 	}
@@ -137,7 +140,7 @@ function pushMergedPlansAndNotes(
 	if (
 		mergedPlans.length === 0 &&
 		mergedNotes.length === 0 &&
-		mergedLinear.length === 0
+		mergedReferences.length === 0
 	) {
 		return;
 	}
@@ -145,7 +148,7 @@ function pushMergedPlansAndNotes(
 	pushPlansAndNotesSection(lines, {
 		plans: mergedPlans,
 		notes: mergedNotes,
-		linearIssues: mergedLinear,
+		references: mergedReferences,
 	} as unknown as CommitSummary);
 }
 

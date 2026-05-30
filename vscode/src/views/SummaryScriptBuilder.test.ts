@@ -247,28 +247,63 @@ describe("SummaryScriptBuilder", () => {
 		});
 	});
 
-	describe("Linear issue actions", () => {
-		it("routes the 3 Linear actions through their own data-action cases", () => {
-			// Each case must read the data-linear-key attribute and post a
-			// message back to the host with that key. The host-side handlers
-			// in SummaryWebviewPanel rely on this exact case-name spelling.
-			expect(script).toContain("case 'openLinearIssue'");
-			expect(script).toContain("case 'openLinearIssueMarkdown'");
-			expect(script).toContain("case 'removeLinearIssue'");
+	describe("Reference actions (Plan-parity, Choice A — no Linear-specific message names)", () => {
+		it("routes all 7 *Reference actions through dedicated data-action cases", () => {
+			// Each case must read the data-reference-* attributes and post a
+			// message back to the host with that payload. The host-side
+			// handlers in SummaryWebviewPanel rely on this exact case-name
+			// spelling.
+			expect(script).toContain("case 'previewReference'");
+			expect(script).toContain("case 'openReferenceExternal'");
+			expect(script).toContain("case 'translateReference'");
+			expect(script).toContain("case 'loadReferenceContent'");
+			expect(script).toContain("case 'saveReferenceEdit'");
+			expect(script).toContain("case 'cancelReferenceEdit'");
+			expect(script).toContain("case 'removeReference'");
 		});
 
-		it("openLinearIssue forwards both archivedKey and url so the host doesn't re-query orphan branch", () => {
-			expect(script).toContain("'data-linear-url'");
+		it("drops the 3 legacy Linear-specific data-action cases (Choice A)", () => {
+			// Choice A in the design: delete openLinearIssue / openLinear-
+			// IssueMarkdown / removeLinearIssue entirely from the dispatch
+			// layer. Linear rows go through the same *Entity actions as
+			// every other source.
+			expect(script).not.toContain("case 'openLinearIssue'");
+			expect(script).not.toContain("case 'openLinearIssueMarkdown'");
+			expect(script).not.toContain("case 'removeLinearIssue'");
+		});
+
+		it("previewEntity forwards archivedKey + source + nativeId + title so the host can dispatch by source and confirm without a re-query", () => {
+			expect(script).toContain("'data-reference-key'");
+			expect(script).toContain("'data-reference-source'");
+			expect(script).toContain("'data-reference-native-id'");
+			expect(script).toContain("'data-reference-title'");
 			expect(script).toMatch(
-				/command:\s*'openLinearIssue',\s*archivedKey:[^,]+,\s*url:/,
+				/command:\s*'previewReference',\s*archivedKey:[^,]+,\s*source:[^,]+,\s*nativeId:[^,]+,\s*title:/,
 			);
 		});
 
-		it("removeLinearIssue forwards archivedKey + ticketId so the host can mark both registry keys ignored", () => {
-			expect(script).toContain("'data-linear-ticket'");
+		it("openEntityExternal round-trips the URL via data-reference-url (host re-validates the http(s) scheme at the sink)", () => {
+			expect(script).toContain("'data-reference-url'");
 			expect(script).toMatch(
-				/command:\s*'removeLinearIssue',\s*archivedKey:[^,]+,\s*ticketId:/,
+				/command:\s*'openReferenceExternal',\s*url:/,
 			);
+		});
+
+		it("removeEntity forwards archivedKey + source + nativeId + title (host needs nativeId for both the dialog message and the legacy ticketId guard-key dispatch)", () => {
+			expect(script).toMatch(
+				/command:\s*'removeReference',\s*archivedKey:[^,]+,\s*source:[^,]+,\s*nativeId:[^,]+,\s*title:/,
+			);
+		});
+
+		it("saveReferenceEdit / cancelReferenceEdit strip the per-source prefix generically (mirrors buildReferenceRow's stripSourcePrefix for all sources, not just linear)", () => {
+			// buildReferenceRow's element id strips the "<source>:" prefix for
+			// EVERY source, so the dispatcher must too — otherwise jira/github/
+			// notion rows compute `reference-jira-jira:KEY-…` and the textarea
+			// lookup misses. Guard against regressing to the linear-only form.
+			expect(script).toContain("seKey.indexOf(seSource + ':')");
+			expect(script).toContain("ceKey.indexOf(ceSource + ':')");
+			expect(script).not.toContain("seSource === 'linear'");
+			expect(script).toContain("'.plan-edit-textarea'");
 		});
 	});
 });

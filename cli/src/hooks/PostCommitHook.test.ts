@@ -40,15 +40,15 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		deleteSquashPending: vi.fn(),
 		loadPluginSource: vi.fn(),
 		deletePluginSource: vi.fn(),
-		loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
+		loadPlansRegistry: vi.fn().mockResolvedValue({ version: 2, plans: {} }),
 		savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 		associatePlanWithCommit: vi.fn(),
 		associateNoteWithCommit: vi.fn(),
-		associateLinearIssueWithCommit: vi.fn().mockResolvedValue(undefined),
-		detectUncommittedLinearIssueIds: vi.fn().mockResolvedValue([]),
+		associateReferenceWithCommit: vi.fn().mockResolvedValue(undefined),
+		detectUncommittedReferenceIds: vi.fn().mockResolvedValue([]),
 		detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
 		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
-		getLinearIssueEntriesForBranch: vi.fn().mockResolvedValue([]),
+		getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
 		filterSessionsByEnabledIntegrations: actual.filterSessionsByEnabledIntegrations,
 		// Queue functions
 		dequeueAllGitOperations: vi.fn(),
@@ -57,10 +57,17 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 	};
 });
 
-vi.mock("../core/LinearIssueStore.js", () => ({
-	linearIssuePath: vi.fn((key: string, cwd: string) => `${cwd}/.jolli/jollimemory/linear-issues/${key}.md`),
-	readLinearIssueMarkdown: vi.fn().mockResolvedValue(null),
-	renameLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
+vi.mock("../core/references/ReferenceStore.js", () => ({
+	referencePath: vi.fn(
+		(cwd: string, source: string, key: string) => `${cwd}/.jolli/jollimemory/references/${source}/${key}.md`,
+	),
+	referenceDir: vi.fn((cwd: string, source: string) => `${cwd}/.jolli/jollimemory/references/${source}`),
+	sanitizeNativeIdForPath: vi.fn((_source: string, id: string) => id),
+	readReferenceMarkdown: vi.fn().mockResolvedValue(null),
+	readReferenceMarkdownFromString: vi.fn().mockReturnValue(null),
+	writeReferenceMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/x", contentHash: "fake-content-hash" }),
+	renameReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
+	hashReferenceContent: vi.fn(() => "fake-content-hash"),
 }));
 
 vi.mock("../core/PlanPromptFormatter.js", () => ({
@@ -119,6 +126,7 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		migrateOneToOne: vi.fn(),
 		storePlans: vi.fn(),
 		storeNotes: vi.fn(),
+		storeReferences: vi.fn().mockResolvedValue(undefined),
 		setActiveStorage: vi.fn(),
 		resolveStorage: vi.fn(),
 		// handleAmendPipeline file-filters a legacy oldSummary's transcript IDs
@@ -289,9 +297,9 @@ import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
-	associateLinearIssueWithCommit,
 	associateNoteWithCommit,
 	associatePlanWithCommit,
+	associateReferenceWithCommit,
 	deleteQueueEntry,
 	dequeueAllGitOperations,
 	loadAllSessions,
@@ -1233,10 +1241,11 @@ describe("queue-driven Worker", () => {
 						updatedAt: "2026-02-19T00:00:00Z",
 					},
 				],
-				linearIssues: [
+				references: [
 					{
-						archivedKey: "PROJ-1528-oldHash",
-						ticketId: "PROJ-1528",
+						archivedKey: "linear:PROJ-1528-oldHash",
+						source: "linear",
+						nativeId: "PROJ-1528",
 						title: "Old Linear issue",
 						url: "https://linear.app/x/PROJ-1528",
 						referencedAt: "2026-02-19T00:00:00Z",
@@ -1255,8 +1264,12 @@ describe("queue-driven Worker", () => {
 
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
 			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
-			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
-				"PROJ-1528-oldHash",
+			// Multi-source migration (Task 2.11): legacy linearIssues archivedKey
+			// is projected to `linear:<bareKey>` and dispatched through the
+			// singular associateReferenceWithCommit; associateReferenceWithCommit
+			// is no longer called from reassociateMetadata.
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith(
+				"linear:PROJ-1528-oldHash",
 				"newHash",
 				"/test/project",
 			);
@@ -1539,7 +1552,7 @@ describe("queue-driven Worker", () => {
 			const noteSourcePath = "/test/project/.jolli/jollimemory/notes/leaf-note.md";
 
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 1,
+				version: 2,
 				plans: {
 					"freshly-authored-plan": {
 						slug: "freshly-authored-plan",
@@ -1724,7 +1737,7 @@ describe("queue-driven Worker", () => {
 
 			// Registry has an uncommitted note
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 1,
+				version: 2,
 				plans: {},
 				notes: {
 					"note-1": {
@@ -2002,10 +2015,11 @@ describe("queue-driven Worker", () => {
 						updatedAt: "2026-02-19T00:00:00Z",
 					},
 				],
-				linearIssues: [
+				references: [
 					{
-						archivedKey: "PROJ-1528-oldHash1",
-						ticketId: "PROJ-1528",
+						archivedKey: "linear:PROJ-1528-oldHash1",
+						source: "linear",
+						nativeId: "PROJ-1528",
 						title: "Old Linear issue",
 						url: "https://linear.app/x/PROJ-1528",
 						referencedAt: "2026-02-19T00:00:00Z",
@@ -2019,8 +2033,10 @@ describe("queue-driven Worker", () => {
 
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
 			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
-			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
-				"PROJ-1528-oldHash1",
+			// See "rebase-pick" reassociate note above — squash routes through
+			// associateReferenceWithCommit too post-Task-2.11.
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith(
+				"linear:PROJ-1528-oldHash1",
 				"newHash",
 				"/test/project",
 			);
@@ -2062,10 +2078,11 @@ describe("queue-driven Worker", () => {
 						updatedAt: "2026-02-19T00:00:00Z",
 					},
 				],
-				linearIssues: [
+				references: [
 					{
-						archivedKey: "PROJ-1528-oldHash",
-						ticketId: "PROJ-1528",
+						archivedKey: "linear:PROJ-1528-oldHash",
+						source: "linear",
+						nativeId: "PROJ-1528",
 						title: "Old Linear issue",
 						url: "https://linear.app/x/PROJ-1528",
 						referencedAt: "2026-02-19T00:00:00Z",
@@ -2103,8 +2120,8 @@ describe("queue-driven Worker", () => {
 			expect(storeSummary).toHaveBeenCalled();
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
 			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
-			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
-				"PROJ-1528-oldHash",
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith(
+				"linear:PROJ-1528-oldHash",
 				"newHash",
 				"/test/project",
 			);
@@ -2138,8 +2155,8 @@ describe("queue-driven Worker", () => {
 			expect(storeSummary).toHaveBeenCalled();
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
 			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
-			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
-				"PROJ-1528-oldHash",
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith(
+				"linear:PROJ-1528-oldHash",
 				"newHash",
 				"/test/project",
 			);
@@ -2168,8 +2185,8 @@ describe("queue-driven Worker", () => {
 			expect(storeSummary).toHaveBeenCalled();
 			expect(associatePlanWithCommit).toHaveBeenCalledWith("plan-old", "newHash", "/test/project");
 			expect(associateNoteWithCommit).toHaveBeenCalledWith("note-old", "newHash", "/test/project");
-			expect(associateLinearIssueWithCommit).toHaveBeenCalledWith(
-				"PROJ-1528-oldHash",
+			expect(associateReferenceWithCommit).toHaveBeenCalledWith(
+				"linear:PROJ-1528-oldHash",
 				"newHash",
 				"/test/project",
 			);
@@ -2384,7 +2401,7 @@ describe("queue-driven Worker", () => {
 			setupFullPipeline();
 			// Registry has note IDs that don't match any notes entry
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 1,
+				version: 2,
 				plans: {},
 				notes: {
 					"note-x": {
@@ -2416,7 +2433,7 @@ describe("queue-driven Worker", () => {
 			//   2. detectUncommittedNoteIds → registry WITH ghost note (id added to set)
 			//   3. associateNotesWithCommit → registry WITHOUT that note (id missing → skip)
 			const registryWithNote = {
-				version: 1 as const,
+				version: 2 as const,
 				plans: {},
 				notes: {
 					"ghost-note": {
@@ -2431,7 +2448,7 @@ describe("queue-driven Worker", () => {
 					},
 				},
 			};
-			const emptyRegistry = { version: 1 as const, plans: {}, notes: {} };
+			const emptyRegistry = { version: 2 as const, plans: {}, notes: {} };
 
 			vi.mocked(loadPlansRegistry)
 				.mockResolvedValueOnce(emptyRegistry) // detectPlanSlugsFromRegistry
@@ -2450,7 +2467,7 @@ describe("queue-driven Worker", () => {
 			const snippetPath = "/test/project/.jolli/jollimemory/notes/snip-1.md";
 
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 1,
+				version: 2,
 				plans: {},
 				notes: {
 					"snip-1": {

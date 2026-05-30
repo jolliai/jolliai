@@ -571,9 +571,10 @@ describe("SidebarWebviewProvider", () => {
 		).toBeGreaterThanOrEqual(2);
 	});
 
-	it("forwards branch:openLinearIssue via jollimemory.openLinearIssue", () => {
-		// Sidebar row-click → open Linear issue in browser. Pins the
-		// case-branch added for the panel's Linear Issues row type.
+	it("forwards branch:openReference via jollimemory.openReferenceInBrowser", () => {
+		// Sidebar row-click → open external entity (Linear / Jira / GitHub /
+		// Notion) in browser. Pins the case-branch the panel dispatches when
+		// the row is an entity row.
 		const view = makeMockView();
 		const exec = vi.fn();
 		const provider = new SidebarWebviewProvider({
@@ -590,18 +591,18 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({
-			type: "branch:openLinearIssue",
-			mapKey: "PROJ-1528",
+			type: "branch:openReference",
+			mapKey: "linear:PROJ-1528",
 		});
 		expect(exec).toHaveBeenCalledWith(
-			"jollimemory.openLinearIssue",
-			"PROJ-1528",
+			"jollimemory.openReferenceInBrowser",
+			"linear:PROJ-1528",
 		);
 	});
 
-	it("forwards branch:openLinearIssueMarkdown via jollimemory.openLinearIssueMarkdown", () => {
+	it("forwards branch:openReferenceMarkdown via jollimemory.openReferenceMarkdown", () => {
 		// Context-menu "Open Markdown" path — opens the on-disk markdown copy
-		// rather than the browser URL. Distinct command from openLinearIssue.
+		// rather than the browser URL.
 		const view = makeMockView();
 		const exec = vi.fn();
 		const provider = new SidebarWebviewProvider({
@@ -618,18 +619,18 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({
-			type: "branch:openLinearIssueMarkdown",
-			mapKey: "PROJ-1528",
+			type: "branch:openReferenceMarkdown",
+			mapKey: "jira:KAN-5",
 		});
 		expect(exec).toHaveBeenCalledWith(
-			"jollimemory.openLinearIssueMarkdown",
-			"PROJ-1528",
+			"jollimemory.openReferenceMarkdown",
+			"jira:KAN-5",
 		);
 	});
 
-	it("forwards branch:ignoreLinearIssue via jollimemory.ignoreLinearIssue", () => {
-		// Trash-button path — hides the Linear issue from the panel. Mirrors
-		// the existing Plan/Note ignore wiring.
+	it("forwards branch:ignoreReference via jollimemory.ignoreReference", () => {
+		// Trash-button path — hides the entity from the panel. Mirrors the
+		// existing Plan/Note ignore wiring.
 		const view = makeMockView();
 		const exec = vi.fn();
 		const provider = new SidebarWebviewProvider({
@@ -646,12 +647,12 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		view.webview.triggerMessage({
-			type: "branch:ignoreLinearIssue",
-			mapKey: "PROJ-1528",
+			type: "branch:ignoreReference",
+			mapKey: "github:owner/repo#42",
 		});
 		expect(exec).toHaveBeenCalledWith(
-			"jollimemory.ignoreLinearIssue",
-			"PROJ-1528",
+			"jollimemory.ignoreReference",
+			"github:owner/repo#42",
 		);
 	});
 
@@ -1756,6 +1757,31 @@ describe("SidebarWebviewProvider", () => {
 			selected: false,
 		});
 		expect(applyNoteCheckbox).toHaveBeenCalledWith("note-id", false);
+	});
+
+	it("dispatches branch:toggleReferenceSelection to applyReferenceCheckbox", () => {
+		const view = makeMockView();
+		const applyReferenceCheckbox = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			applyReferenceCheckbox,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "branch:toggleReferenceSelection",
+			mapKey: "jira:PROJ-1",
+			selected: false,
+		});
+		expect(applyReferenceCheckbox).toHaveBeenCalledWith("jira:PROJ-1", false);
 	});
 
 	// switch's `default` arm — message has a string `type` but it isn't one of

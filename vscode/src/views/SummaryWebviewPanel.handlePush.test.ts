@@ -125,19 +125,23 @@ vi.mock("../../../cli/src/core/Summarizer.js", () => ({
 
 const {
 	mockGetTranscriptHashes,
+	mockReadEntityFromBranch,
 	mockReadNoteFromBranch,
 	mockReadPlanFromBranch,
 	mockReadTranscriptsForCommits,
 	mockSaveTranscriptsBatch,
+	mockStoreEntities,
 	mockStoreNotes,
 	mockStorePlans,
 	mockStoreSummary,
 } = vi.hoisted(() => ({
 	mockGetTranscriptHashes: vi.fn().mockResolvedValue(new Set<string>()),
+	mockReadEntityFromBranch: vi.fn().mockResolvedValue(null),
 	mockReadNoteFromBranch: vi.fn().mockResolvedValue(null),
 	mockReadPlanFromBranch: vi.fn().mockResolvedValue(null),
 	mockReadTranscriptsForCommits: vi.fn().mockResolvedValue(new Map()),
 	mockSaveTranscriptsBatch: vi.fn().mockResolvedValue(undefined),
+	mockStoreEntities: vi.fn().mockResolvedValue(undefined),
 	mockStoreNotes: vi.fn().mockResolvedValue(undefined),
 	mockStorePlans: vi.fn().mockResolvedValue(undefined),
 	mockStoreSummary: vi.fn().mockResolvedValue(undefined),
@@ -145,10 +149,12 @@ const {
 
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	getTranscriptHashes: mockGetTranscriptHashes,
+	readReferenceFromBranch: mockReadEntityFromBranch,
 	readNoteFromBranch: mockReadNoteFromBranch,
 	readPlanFromBranch: mockReadPlanFromBranch,
 	readTranscriptsForCommits: mockReadTranscriptsForCommits,
 	saveTranscriptsBatch: mockSaveTranscriptsBatch,
+	storeReferences: mockStoreEntities,
 	storeNotes: mockStoreNotes,
 	storePlans: mockStorePlans,
 	storeSummary: mockStoreSummary,

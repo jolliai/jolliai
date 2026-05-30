@@ -30,18 +30,18 @@ export function treeItemToSerialized(
 		collapsibleState = "collapsed";
 	else if (item.collapsibleState === vscode.TreeItemCollapsibleState.Expanded)
 		collapsibleState = "expanded";
-	// PlanItem / NoteItem / LinearIssueItem each attach structured hover-card
+	// PlanItem / NoteItem / ReferenceItem each attach structured hover-card
 	// data as a public field on the TreeItem. Copy whichever is present onto
 	// the wire payload so the webview can render the rich popover. Other
 	// TreeItem types (memory, commit, file, …) don't carry these fields.
 	const richItem = item as vscode.TreeItem & {
 		planHover?: SerializedTreeItem["planHover"];
 		noteHover?: SerializedTreeItem["noteHover"];
-		linearHover?: SerializedTreeItem["linearHover"];
+		referenceHover?: SerializedTreeItem["referenceHover"];
 	};
 	const planHover = richItem.planHover;
 	const noteHover = richItem.noteHover;
-	const linearHover = richItem.linearHover;
+	const referenceHover = richItem.referenceHover;
 	return {
 		id,
 		label: labelText,
@@ -63,7 +63,7 @@ export function treeItemToSerialized(
 		collapsibleState,
 		...(planHover ? { planHover } : {}),
 		...(noteHover ? { noteHover } : {}),
-		...(linearHover ? { linearHover } : {}),
+		...(referenceHover ? { referenceHover } : {}),
 	};
 }
 

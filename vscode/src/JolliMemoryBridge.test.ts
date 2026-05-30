@@ -96,7 +96,7 @@ const {
 	readTranscriptsForCommits,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
-	storeLinearIssues,
+	storeReferences,
 	storeNotes,
 	storePlans,
 	storeSummary,
@@ -113,7 +113,7 @@ const {
 	readTranscriptsForCommits: vi.fn(),
 	saveTranscriptsBatch: vi.fn(),
 	scanTreeHashAliases: vi.fn(),
-	storeLinearIssues: vi.fn(),
+	storeReferences: vi.fn(),
 	storeNotes: vi.fn(),
 	storePlans: vi.fn(),
 	storeSummary: vi.fn(),
@@ -277,7 +277,7 @@ vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 	readTranscriptsForCommits,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
-	storeLinearIssues,
+	storeReferences,
 	storeNotes,
 	storePlans,
 	storeSummary,
@@ -345,11 +345,13 @@ vi.mock("./core/NoteService.js", () => ({
 	removeNote: removeNoteFn,
 }));
 
-vi.mock("./core/LinearIssueService.js", () => ({
-	detectLinearIssues: vi.fn().mockResolvedValue([]),
-	setLinearIssueIgnored: vi.fn().mockResolvedValue(undefined),
-	openLinearIssueInBrowser: vi.fn().mockResolvedValue(true),
-	openLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
+// ReferenceService imports `vscode` at module top level; mock at the module
+// boundary so the test runner doesn't crash with "Cannot find package vscode".
+vi.mock("./core/ReferenceService.js", () => ({
+	detectReferences: vi.fn().mockResolvedValue([]),
+	setReferenceIgnored: vi.fn().mockResolvedValue(undefined),
+	openReferenceInBrowser: vi.fn().mockResolvedValue(true),
+	openReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("./util/CommitMessageUtils.js", () => ({
@@ -3194,7 +3196,7 @@ describe("JolliMemoryBridge", () => {
 				humanTurns: 0,
 				plansCount: 0,
 				notesCount: 0,
-				linearCount: 0,
+				referenceCountsBySource: {},
 			});
 			const bridge = makeBridge();
 
@@ -3255,26 +3257,6 @@ describe("JolliMemoryBridge", () => {
 
 			expect(storeNotes).toHaveBeenCalledWith(
 				[{ id: "n1", content: "# Note" }],
-				"msg",
-				TEST_CWD,
-				undefined,
-				storageShape,
-			);
-		});
-	});
-
-	describe("storeLinearIssues()", () => {
-		it("forwards the Bridge's storage to SummaryStore.storeLinearIssues", async () => {
-			storeLinearIssues.mockResolvedValue(undefined);
-			const bridge = makeBridge();
-
-			await bridge.storeLinearIssues(
-				[{ archivedKey: "PROJ-1-abcd1234", content: "# Issue" }],
-				"msg",
-			);
-
-			expect(storeLinearIssues).toHaveBeenCalledWith(
-				[{ archivedKey: "PROJ-1-abcd1234", content: "# Issue" }],
 				"msg",
 				TEST_CWD,
 				undefined,
@@ -3416,78 +3398,72 @@ describe("JolliMemoryBridge", () => {
 		});
 	});
 
-	// ── Linear issues ────────────────────────────────────────────────────
+	// ── Multi-source references ──────────────────────────────────────────
 
-	describe("Linear issue bridge methods", () => {
-		it("listLinearIssues() delegates to detectLinearIssues", async () => {
-			const { detectLinearIssues } = await import(
-				"./core/LinearIssueService.js"
-			);
-			const issues = [{ kind: "linearissue", ticketId: "PROJ-1" }];
-			(detectLinearIssues as ReturnType<typeof vi.fn>).mockResolvedValue(
-				issues,
-			);
+	describe("Entity bridge methods", () => {
+		it("listReferences() delegates to detectReferences", async () => {
+			const { detectReferences } = await import("./core/ReferenceService.js");
+			const entities = [
+				{ kind: "reference", source: "jira", nativeId: "KAN-5" },
+			];
+			(detectReferences as ReturnType<typeof vi.fn>).mockResolvedValue(entities);
 			const bridge = makeBridge();
 
-			const result = await bridge.listLinearIssues();
+			const result = await bridge.listReferences();
 
-			expect(detectLinearIssues).toHaveBeenCalledWith(TEST_CWD);
-			expect(result).toEqual(issues);
+			expect(detectReferences).toHaveBeenCalledWith(TEST_CWD);
+			expect(result).toEqual(entities);
 		});
 
-		it("ignoreLinearIssue() delegates to setLinearIssueIgnored with mapKey + true", async () => {
-			const { setLinearIssueIgnored } = await import(
-				"./core/LinearIssueService.js"
-			);
-			(setLinearIssueIgnored as ReturnType<typeof vi.fn>).mockResolvedValue(
+		it("ignoreReference() delegates to setReferenceIgnored with mapKey + true", async () => {
+			const { setReferenceIgnored } = await import("./core/ReferenceService.js");
+			(setReferenceIgnored as ReturnType<typeof vi.fn>).mockResolvedValue(
 				undefined,
 			);
 			const bridge = makeBridge();
 
-			await bridge.ignoreLinearIssue("PROJ-1528");
+			await bridge.ignoreReference("github:owner/repo#42");
 
-			expect(setLinearIssueIgnored).toHaveBeenCalledWith(
+			expect(setReferenceIgnored).toHaveBeenCalledWith(
 				TEST_CWD,
-				"PROJ-1528",
+				"github:owner/repo#42",
 				true,
 			);
 		});
 
-		it("openLinearIssue() delegates to openLinearIssueInBrowser", async () => {
-			const { openLinearIssueInBrowser } = await import(
-				"./core/LinearIssueService.js"
-			);
-			(openLinearIssueInBrowser as ReturnType<typeof vi.fn>).mockResolvedValue(
+		it("openReferenceInBrowser() delegates to openReferenceInBrowser impl", async () => {
+			const { openReferenceInBrowser } = await import("./core/ReferenceService.js");
+			(openReferenceInBrowser as ReturnType<typeof vi.fn>).mockResolvedValue(
 				true,
 			);
 			const info = {
-				kind: "linearissue",
+				kind: "reference",
+				source: "linear",
 				url: "https://linear.app/x/PROJ-1",
-			} as unknown as Parameters<typeof bridge.openLinearIssue>[0];
+			} as unknown as Parameters<typeof bridge.openReferenceInBrowser>[0];
 			const bridge = makeBridge();
 
-			const result = await bridge.openLinearIssue(info);
+			const result = await bridge.openReferenceInBrowser(info);
 
-			expect(openLinearIssueInBrowser).toHaveBeenCalledWith(info);
+			expect(openReferenceInBrowser).toHaveBeenCalledWith(info);
 			expect(result).toBe(true);
 		});
 
-		it("openLinearIssueMarkdown() delegates to openLinearIssueMarkdown impl", async () => {
-			const { openLinearIssueMarkdown } = await import(
-				"./core/LinearIssueService.js"
-			);
-			(openLinearIssueMarkdown as ReturnType<typeof vi.fn>).mockResolvedValue(
+		it("openReferenceMarkdown() delegates to openReferenceMarkdown impl", async () => {
+			const { openReferenceMarkdown } = await import("./core/ReferenceService.js");
+			(openReferenceMarkdown as ReturnType<typeof vi.fn>).mockResolvedValue(
 				undefined,
 			);
 			const info = {
-				kind: "linearissue",
+				kind: "reference",
+				source: "notion",
 				sourcePath: "/x.md",
-			} as unknown as Parameters<typeof bridge.openLinearIssueMarkdown>[0];
+			} as unknown as Parameters<typeof bridge.openReferenceMarkdown>[0];
 			const bridge = makeBridge();
 
-			await bridge.openLinearIssueMarkdown(info);
+			await bridge.openReferenceMarkdown(info);
 
-			expect(openLinearIssueMarkdown).toHaveBeenCalledWith(info);
+			expect(openReferenceMarkdown).toHaveBeenCalledWith(info);
 		});
 	});
 

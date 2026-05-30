@@ -96,11 +96,13 @@ function makePlansCtx(
 	planIds: string[],
 	noteIds: string[],
 	changed: Array<() => void | Promise<void>> = [],
+	entityIds: string[] = [],
 ): SelectAllCtx {
 	let cachedExclusions = {
 		plans: new Set<string>(),
 		notes: new Set<string>(),
 		conversations: new Set<string>(),
+		references: new Set<string>(),
 	};
 	return {
 		cwd,
@@ -123,7 +125,13 @@ function makePlansCtx(
 					contextValue: "note",
 					isSelected: !cachedExclusions.notes.has(id),
 				}));
-				return [...planRows, ...noteRows];
+				const entityRows: SerializedTreeItem[] = entityIds.map((id) => ({
+					id,
+					label: id,
+					contextValue: "reference",
+					isSelected: !cachedExclusions.references.has(id),
+				}));
+				return [...planRows, ...noteRows, ...entityRows];
 			},
 			async refreshExclusions() {
 				// Re-read so the next serialize() sees the new state.
@@ -253,12 +261,15 @@ describe("selectAllPlansAndNotesCommand", () => {
 		expect(ex.notes.has("note-1")).toBe(false);
 	});
 
-	it("ignores linearissue rows", async () => {
-		// Construct a ctx that includes a linearissue row alongside a plan.
-		const linearRow: SerializedTreeItem = {
-			id: "LIN-123",
-			label: "Linear issue",
-			contextValue: "linearissue",
+	it("ignores rows with unknown contextValues", async () => {
+		// Defence-in-depth: a row with a contextValue that isn't plan / note /
+		// entity (e.g. a future row kind, or a legacy 'linearissue' value from a
+		// stale SidebarSerialize) must NOT land in any of the three exclusion
+		// sets we update.
+		const unknownRow: SerializedTreeItem = {
+			id: "MYSTERY-1",
+			label: "Future row",
+			contextValue: "mystery",
 			isSelected: true,
 		};
 		const planRow: SerializedTreeItem = {
@@ -276,7 +287,7 @@ describe("selectAllPlansAndNotesCommand", () => {
 			},
 			plansProvider: {
 				serialize() {
-					return [planRow, linearRow];
+					return [planRow, unknownRow];
 				},
 				async refreshExclusions() {},
 			},
@@ -285,9 +296,46 @@ describe("selectAllPlansAndNotesCommand", () => {
 		await selectAllPlansAndNotesCommand(stubCtx);
 		const ex = await readExclusions(cwd);
 		expect(ex.plans.has("plan-1")).toBe(true);
-		// Linear row must not be added to any exclusion set.
-		expect(ex.plans.has("LIN-123")).toBe(false);
-		expect(ex.notes.has("LIN-123")).toBe(false);
+		expect(ex.plans.has("MYSTERY-1")).toBe(false);
+		expect(ex.notes.has("MYSTERY-1")).toBe(false);
+		expect(ex.references.has("MYSTERY-1")).toBe(false);
+	});
+
+	it("excludes entity rows alongside plans and notes", async () => {
+		const ctx = makePlansCtx(["plan-1"], ["note-1"], [], ["jira:KAN-7", "github:owner/repo#1"]);
+		await selectAllPlansAndNotesCommand(ctx);
+		const ex = await readExclusions(cwd);
+		expect(ex.plans.has("plan-1")).toBe(true);
+		expect(ex.notes.has("note-1")).toBe(true);
+		expect([...ex.references].sort()).toEqual(["github:owner/repo#1", "jira:KAN-7"]);
+	});
+
+	it("clears all three groups when every row is excluded", async () => {
+		await setAllExcluded(cwd, "plans", ["plan-1"], true);
+		await setAllExcluded(cwd, "notes", ["note-1"], true);
+		await setAllExcluded(cwd, "references", ["jira:KAN-7"], true);
+
+		const ctx = makePlansCtx(["plan-1"], ["note-1"], [], ["jira:KAN-7"]);
+		await ctx.plansProvider.refreshExclusions();
+		await selectAllPlansAndNotesCommand(ctx);
+
+		const ex = await readExclusions(cwd);
+		expect(ex.plans.size).toBe(0);
+		expect(ex.notes.size).toBe(0);
+		expect(ex.references.size).toBe(0);
+	});
+
+	it("with mixed entity state, switches to all-selected (clears all visible exclusions)", async () => {
+		await setExcluded(cwd, "references", "jira:KAN-7", true);
+
+		const ctx = makePlansCtx(["plan-1"], [], [], ["jira:KAN-7", "linear:LIN-1"]);
+		await ctx.plansProvider.refreshExclusions();
+		await selectAllPlansAndNotesCommand(ctx);
+
+		const ex = await readExclusions(cwd);
+		expect(ex.plans.has("plan-1")).toBe(false);
+		expect(ex.references.has("jira:KAN-7")).toBe(false);
+		expect(ex.references.has("linear:LIN-1")).toBe(false);
 	});
 
 	it("calls onChanged", async () => {

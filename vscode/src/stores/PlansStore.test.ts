@@ -102,12 +102,12 @@ function makeNote(id: string, lastModified: string): NoteInfo {
 function makeBridge(
 	plans: Array<PlanInfo>,
 	notes: Array<NoteInfo>,
-	linearIssues: ReadonlyArray<unknown> = [],
+	references: ReadonlyArray<unknown> = [],
 ) {
 	return {
 		listPlans: vi.fn(async () => plans),
 		listNotes: vi.fn(async () => notes),
-		listLinearIssues: vi.fn(async () => linearIssues),
+		listReferences: vi.fn(async () => references),
 	};
 }
 
@@ -123,9 +123,46 @@ describe("PlansStore — headless (no options)", () => {
 		const snap = store.getSnapshot();
 		expect(snap.plans).toEqual([]);
 		expect(snap.notes).toEqual([]);
+		expect(snap.references).toEqual([]);
 		expect(snap.merged).toEqual([]);
 		expect(snap.isEmpty).toBe(true);
 		expect(snap.changeReason).toBe("init");
+	});
+
+	it("caches multi-source entities from bridge.listReferences when available", async () => {
+		const sampleEntity = {
+			kind: "reference" as const,
+			source: "jira" as const,
+			nativeId: "KAN-5",
+			mapKey: "jira:KAN-5",
+			title: "t",
+			url: "https://example.atlassian.net/browse/KAN-5",
+			sourcePath: "/x.md",
+			branch: "main",
+			addedAt: "2026-05-13T00:00:00Z",
+			updatedAt: "2026-05-14T00:00:00Z",
+			lastModified: "2026-05-14T00:00:00Z",
+			commitHash: null,
+			ignored: false,
+			sourceToolName: "mcp",
+		};
+		const bridge = {
+			listPlans: vi.fn(async () => []),
+			listNotes: vi.fn(async () => []),
+			listReferences: vi.fn(async () => [sampleEntity]),
+		};
+		const store = new PlansStore(bridge as never);
+		await store.refresh();
+		const snap = store.getSnapshot();
+		expect(snap.references).toHaveLength(1);
+		expect(snap.references[0].source).toBe("jira");
+	});
+
+	it("tolerates a bridge without listReferences (older host) by defaulting entities to []", async () => {
+		const bridge = makeBridge([], []);
+		const store = new PlansStore(bridge as never);
+		await store.refresh();
+		expect(store.getSnapshot().references).toEqual([]);
 	});
 
 	it("refresh loads plans and notes, merged and sorted", async () => {
@@ -391,7 +428,7 @@ describe("PlansStore — with watchers", () => {
 		const bridge = {
 			listPlans: vi.fn().mockRejectedValue(new Error("bridge is down")),
 			listNotes: vi.fn(async () => []),
-			listLinearIssues: vi.fn(async () => []),
+			listReferences: vi.fn(async () => []),
 		};
 		const store = new PlansStore(bridge as never, DEFAULT_OPTIONS);
 		// Calling refresh directly triggers the same bridge.listPlans path;
@@ -401,6 +438,27 @@ describe("PlansStore — with watchers", () => {
 		// scheduleDebouncedRefresh) has its own .catch that only logs.
 		await expect(store.refresh()).rejects.toThrow("bridge is down");
 		expect(bridge.listPlans).toHaveBeenCalled();
+	});
+
+	it("debounced timer catches an Error rejection and logs err.message (L210 instanceof Error TRUE arm)", async () => {
+		// Companion to the string-rejection test below: this one routes a
+		// real Error through watcher → setTimeout → refresh, hitting the
+		// TRUE arm of `err instanceof Error ? err.message : String(err)` at
+		// PlansStore.ts L210. The previous coverage pass routed an Error
+		// only via direct `store.refresh()` (no debounced timer), leaving
+		// the timer's `.catch` chain's TRUE arm unproved.
+		resetGlobals();
+		vi.useFakeTimers();
+		const bridge = makeBridge([], []);
+		const store = new PlansStore(bridge as never, DEFAULT_OPTIONS);
+		vi.spyOn(store, "refresh").mockRejectedValue(new Error("real-error"));
+
+		watchers[0].fireChange({ fsPath: "/home/user/.claude/plans/x.md" });
+		vi.advanceTimersByTime(500);
+		await vi.runAllTicks();
+
+		vi.useRealTimers();
+		store.dispose();
 	});
 
 	it("debounced timer catches a non-Error rejection and stringifies it for the log", async () => {

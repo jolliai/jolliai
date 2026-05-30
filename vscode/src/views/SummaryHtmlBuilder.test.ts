@@ -114,7 +114,7 @@ vi.mock("./SummaryUtils.js", () => ({
 import type {
 	CommitSummary,
 	E2eTestScenario,
-	LinearIssueCommitRef,
+	ReferenceCommitRef,
 	NoteReference,
 	PlanReference,
 } from "../../../cli/src/Types.js";
@@ -177,16 +177,22 @@ function makeNote(overrides?: Partial<NoteReference>): NoteReference {
 }
 
 function makeLinear(
-	overrides?: Partial<LinearIssueCommitRef>,
-): LinearIssueCommitRef {
+	overrides?: Partial<ReferenceCommitRef> & { ticketId?: string },
+): ReferenceCommitRef {
+	const { ticketId, archivedKey: archivedKeyOverride, nativeId: nativeIdOverride, ...rest } = overrides ?? {};
+	const nativeId = ticketId ?? nativeIdOverride ?? "PROJ-1";
+	const archivedKey = archivedKeyOverride
+		? (archivedKeyOverride.startsWith("linear:") ? archivedKeyOverride : `linear:${archivedKeyOverride}`)
+		: `linear:${nativeId}-abcdef12`;
 	return {
-		archivedKey: "PROJ-1-abcdef12",
-		ticketId: "PROJ-1",
+		source: "linear",
 		title: "Test Linear Issue",
 		url: "https://linear.app/jolliai/issue/PROJ-1/test-linear-issue",
 		referencedAt: "2026-01-15T10:00:00Z",
 		sourceToolName: "mcp__linear__get_issue",
-		...overrides,
+		...rest,
+		archivedKey,
+		nativeId,
 	};
 }
 
@@ -368,6 +374,30 @@ describe("SummaryHtmlBuilder", () => {
 				expect(html).not.toMatch(
 					/id="deleteTranscriptsBtn"[^>]*data-foreign-safe/,
 				);
+			});
+
+			it("adds the stale-readonly hook class and stale banner when staleRewrittenInto is set", () => {
+				// Pins SummaryHtmlBuilder.ts L95 (pageClasses push) and L114
+				// (staleBannerHtml ternary TRUE arm). Existing tests cover the
+				// FALSE arm via the default `makeSummary()` call.
+				const newHash = "1234567890abcdef1234567890abcdef12345678";
+				const html = buildHtml(makeSummary(), {
+					staleRewrittenInto: newHash,
+				});
+				expect(html).toMatch(/class="page stale-readonly"/);
+				expect(html).toContain('class="stale-banner"');
+				expect(html).toContain("12345678");
+			});
+
+			it("emits both foreign-readonly and stale-readonly when both options are set", () => {
+				// Cross-product: foreign repo whose source commit was also
+				// rewritten. The class list must include both hooks so the
+				// CSS rules at SummaryCssBuilder pick up either selector.
+				const html = buildHtml(makeSummary(), {
+					foreignRepoName: "other-repo",
+					staleRewrittenInto: "feedface0000000000000000000000000000face",
+				});
+				expect(html).toMatch(/class="page foreign-readonly stale-readonly"/);
 			});
 		});
 
@@ -641,7 +671,7 @@ describe("SummaryHtmlBuilder", () => {
 					url: "https://linear.app/jolliai/issue/PROJ-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
 				}),
 			];
-			const html = buildHtml(makeSummary({ linearIssues }));
+			const html = buildHtml(makeSummary({ references: linearIssues }));
 
 			expect(html).toContain("PROJ-1528");
 			expect(html).toContain(
@@ -650,13 +680,17 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain(
 				"https://linear.app/jolliai/issue/PROJ-1528/treat-referenced-linear-issues-as-a-first-class-panel-item-and",
 			);
-			expect(html).toContain('id="linear-PROJ-1528-786c5330"');
+			// Post-Task-2.13 the row id is namespaced by source so multi-source
+			// rows can coexist without collisions.
+			expect(html).toContain('id="reference-linear-PROJ-1528-786c5330"');
 		});
 
-		it("linear issues section wires Open / Open Markdown / Remove actions", () => {
-			// All three actions must be reachable via data-action attributes so
-			// the CSP-strict event delegation in SummaryScriptBuilder can route
-			// them. Removing any of these would silently disable a button.
+		it("entity rows wire the full Plan-parity action set (Choice A: no Linear-specific message names)", () => {
+			// Every entity row now exposes the source-agnostic *Entity data-
+			// actions so the SummaryScriptBuilder click delegation routes
+			// Linear / Jira / GitHub / Notion through the same code path.
+			// Removing any of these data-action names would silently break
+			// the button it backs.
 			const linearIssues = [
 				makeLinear({
 					archivedKey: "PROJ-9-aaaaaaaa",
@@ -664,16 +698,132 @@ describe("SummaryHtmlBuilder", () => {
 					url: "https://linear.app/x/issue/PROJ-9/test",
 				}),
 			];
-			const html = buildHtml(makeSummary({ linearIssues }));
+			const html = buildHtml(makeSummary({ references: linearIssues }));
 
-			expect(html).toContain('data-action="openLinearIssue"');
-			expect(html).toContain('data-action="openLinearIssueMarkdown"');
-			expect(html).toContain('data-action="removeLinearIssue"');
-			expect(html).toContain('data-linear-key="PROJ-9-aaaaaaaa"');
-			expect(html).toContain('data-linear-ticket="PROJ-9"');
+			// The 6 actions emitted on every row (translate is conditional):
+			// previewReference, openReferenceExternal, loadReferenceContent,
+			// saveReferenceEdit, cancelReferenceEdit, removeReference.
+			expect(html).toContain('data-action="previewReference"');
+			expect(html).toContain('data-action="openReferenceExternal"');
+			expect(html).toContain('data-action="loadReferenceContent"');
+			expect(html).toContain('data-action="saveReferenceEdit"');
+			expect(html).toContain('data-action="cancelReferenceEdit"');
+			expect(html).toContain('data-action="removeReference"');
+
+			// data-reference-* attributes carry the dispatch payload. legacyLinear-
+			// IssuesToReferenceCommitRefs prepends the `linear:` source prefix to
+			// the archivedKey before it reaches the renderer.
+			expect(html).toContain('data-reference-key="linear:PROJ-9-aaaaaaaa"');
+			expect(html).toContain('data-reference-source="linear"');
+			expect(html).toContain('data-reference-native-id="PROJ-9"');
 			expect(html).toContain(
-				'data-linear-url="https://linear.app/x/issue/PROJ-9/test"',
+				'data-reference-url="https://linear.app/x/issue/PROJ-9/test"',
 			);
+
+			// Choice A: the 3 legacy Linear-specific data-actions are gone.
+			expect(html).not.toContain('data-action="openLinearIssue"');
+			expect(html).not.toContain('data-action="openLinearIssueMarkdown"');
+			expect(html).not.toContain('data-action="removeLinearIssue"');
+		});
+
+		it("renders a Linear entity with a legacy bare archivedKey (no `linear:` prefix)", () => {
+			// Pins the bare-key FALSE arm of buildReferenceRow's prefix-strip:
+			// when an old summary stored its archivedKey in the pre-multi-
+			// source bare form (`PROJ-7-aaaa1111` without `linear:`), the
+			// renderer keeps the DOM id keyed off the bare form. The
+			// data-reference-key carries the exact archivedKey as stored so the
+			// host can round-trip it back to readReferenceFromBranch.
+			const entities: ReadonlyArray<ReferenceCommitRef> = [
+				{
+					archivedKey: "PROJ-7-aaaa1111",
+					source: "linear",
+					nativeId: "PROJ-7",
+					title: "Bare-key linear",
+					url: "https://linear.app/x/issue/PROJ-7/bare",
+					referencedAt: "2026-01-15T10:00:00Z",
+					sourceToolName: "mcp__linear__get_issue",
+				},
+			];
+			const html = buildHtml(makeSummary({ references: entities }));
+			expect(html).toContain('id="reference-linear-PROJ-7-aaaa1111"');
+			expect(html).toContain('data-reference-key="PROJ-7-aaaa1111"');
+			// Must NOT introduce the `linear:` prefix where the source data
+			// didn't have one.
+			expect(html).not.toContain("entity-linear-linear:PROJ-7");
+		});
+
+		it("renders multi-source entities (linear → jira → github → notion) with grouped order", () => {
+			// Multi-source replacement for the legacy linearIssues path: the
+			// renderer consumes summary.entities and groups by source so the
+			// row order is deterministic across regenerations.
+			const entities: ReadonlyArray<ReferenceCommitRef> = [
+				{
+					archivedKey: "notion:abcdef12-aaaa1111",
+					source: "notion",
+					nativeId: "abcdef12",
+					title: "Notion page",
+					url: "https://notion.so/abcdef12",
+					referencedAt: "2026-01-15T10:00:00Z",
+					sourceToolName: "mcp__claude_ai_Notion__notion-fetch",
+				},
+				{
+					archivedKey: "jira:KAN-5-aaaa1111",
+					source: "jira",
+					nativeId: "KAN-5",
+					title: "Jira ticket",
+					url: "https://example.atlassian.net/browse/KAN-5",
+					referencedAt: "2026-01-15T10:00:00Z",
+					sourceToolName: "mcp__claude_ai_Atlassian__getJiraIssue",
+				},
+				{
+					archivedKey: "linear:PROJ-7-aaaa1111",
+					source: "linear",
+					nativeId: "PROJ-7",
+					title: "Linear ticket",
+					url: "https://linear.app/x/issue/PROJ-7/linear-ticket",
+					referencedAt: "2026-01-15T10:00:00Z",
+					sourceToolName: "mcp__linear__get_issue",
+				},
+				{
+					archivedKey: "github:owner/repo#42-aaaa1111",
+					source: "github",
+					nativeId: "owner/repo#42",
+					title: "GitHub issue",
+					url: "https://github.com/owner/repo/issues/42",
+					referencedAt: "2026-01-15T10:00:00Z",
+					sourceToolName: "mcp__github__issue_read",
+				},
+			];
+			const html = buildHtml(makeSummary({ references: entities }));
+
+			// DOM id form: the `<source>:` prefix is stripped uniformly across
+			// every source so the id reads `reference-<source>-<bareKey>`.
+			expect(html).toContain('id="reference-linear-PROJ-7-aaaa1111"');
+			expect(html).toContain('id="reference-jira-KAN-5-aaaa1111"');
+			expect(html).toContain('id="reference-github-owner/repo#42-aaaa1111"');
+			expect(html).toContain('id="reference-notion-abcdef12-aaaa1111"');
+
+			// Order: linear < jira < github < notion regardless of input order.
+			const iLinear = html.indexOf("PROJ-7 ");
+			const iJira = html.indexOf("KAN-5 ");
+			const iGithub = html.indexOf("owner/repo#42 ");
+			const iNotion = html.indexOf("abcdef12 ");
+			expect(iLinear).toBeGreaterThan(-1);
+			expect(iJira).toBeGreaterThan(iLinear);
+			expect(iGithub).toBeGreaterThan(iJira);
+			expect(iNotion).toBeGreaterThan(iGithub);
+
+			// Every row now goes through previewEntity (title click) +
+			// openEntityExternal (🌍 button) — the upstream URL flows as
+			// data-reference-url instead of as an anchor href, so the click is
+			// intercepted by the host (which validates the http(s) scheme).
+			expect(html).toContain(
+				'data-reference-url="https://example.atlassian.net/browse/KAN-5"',
+			);
+			expect(html).toContain(
+				'data-reference-url="https://github.com/owner/repo/issues/42"',
+			);
+			expect(html).toContain('data-reference-url="https://notion.so/abcdef12"');
 		});
 
 		it("linear issues count rolls into the section header count badge", () => {
@@ -683,7 +833,7 @@ describe("SummaryHtmlBuilder", () => {
 			const html = buildHtml(
 				makeSummary({
 					plans: [makePlan({ slug: "p1" })],
-					linearIssues: [
+					references: [
 						makeLinear({
 							archivedKey: "PROJ-1-aaaaaaaa",
 							ticketId: "PROJ-1",

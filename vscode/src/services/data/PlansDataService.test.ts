@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { LinearIssueInfo, NoteInfo, PlanInfo } from "../../Types.js";
+import type { NoteInfo, PlanInfo, ReferenceInfo } from "../../Types.js";
 import { PlansDataService } from "./PlansDataService.js";
 
 function makePlan(lastModified: string, slug = "plan"): PlanInfo {
@@ -99,16 +99,16 @@ describe("PlansDataService.mergeByLastModified", () => {
 			makeNote("2026-03-01T00:00:00Z", "n-new"),
 		];
 		const merged = PlansDataService.mergeByLastModified(plans, notes);
-		// PlansOrNote is a 3-way union (plan / note / linearissue) since
-		// PROJ-1528 added linear-issue rows. This test only feeds plans
+		// PlansOrNote is a 3-way union (plan / note / entity) since the
+		// multi-source entity rewrite landed. This test only feeds plans
 		// and notes, but TypeScript still narrows by `kind` rather than
 		// the negation-of-plan implying note. Branch on each kind
-		// explicitly; the linearissue arm is unreachable but required
-		// for total-function narrowing.
+		// explicitly; the entity arm is unreachable but required for
+		// total-function narrowing.
 		const order = merged.map((m) => {
 			if (m.kind === "plan") return m.plan.slug;
 			if (m.kind === "note") return m.note.id;
-			return m.linearIssue.mapKey;
+			return m.reference.mapKey;
 		});
 		expect(order).toEqual(["p-new", "n-new", "n-old", "p-old"]);
 	});
@@ -131,32 +131,34 @@ describe("PlansDataService.isEmpty", () => {
 		).toBe(false);
 	});
 
-	it("returns false when only linear issues exist", () => {
+	it("returns false when only entities exist", () => {
 		expect(
 			PlansDataService.isEmpty(
 				[],
 				[],
-				[makeLinearIssue("2026-01-01T00:00:00Z")],
+				[makeEntity("2026-01-01T00:00:00Z")],
 			),
 		).toBe(false);
 	});
 
-	it("returns true when explicit empty linearIssues array is passed", () => {
+	it("returns true when explicit empty entities array is passed", () => {
 		expect(PlansDataService.isEmpty([], [], [])).toBe(true);
 	});
 });
 
-function makeLinearIssue(
+function makeEntity(
 	lastModified: string,
-	ticketId = "PROJ-1",
-): LinearIssueInfo {
+	nativeId = "PROJ-1",
+	source: ReferenceInfo["source"] = "linear",
+): ReferenceInfo {
 	return {
-		kind: "linearissue",
-		ticketId,
-		mapKey: ticketId,
-		title: `Issue ${ticketId}`,
-		url: `https://linear.app/x/${ticketId}`,
-		sourcePath: `/.jolli/.../${ticketId}.md`,
+		kind: "reference",
+		source,
+		nativeId,
+		mapKey: `${source}:${nativeId}`,
+		title: `Entity ${nativeId}`,
+		url: `https://example.com/${nativeId}`,
+		sourcePath: `/.jolli/.../${nativeId}.md`,
 		branch: "main",
 		addedAt: lastModified,
 		updatedAt: lastModified,
@@ -168,54 +170,76 @@ function makeLinearIssue(
 }
 
 describe("PlansDataService.mergeByLastModified — three-way merge", () => {
-	it("includes linear issues in the merged output", () => {
+	it("includes entities in the merged output", () => {
 		const merged = PlansDataService.mergeByLastModified(
 			[],
 			[],
-			[makeLinearIssue("2026-05-14T06:00:00Z", "PROJ-1")],
+			[makeEntity("2026-05-14T06:00:00Z", "PROJ-1")],
 		);
 		expect(merged).toHaveLength(1);
-		expect(merged[0].kind).toBe("linearissue");
+		expect(merged[0].kind).toBe("reference");
 	});
 
 	it("interleaves all three kinds by lastModified descending", () => {
 		const plans = [makePlan("2026-05-14T03:00:00Z", "plan-mid")];
 		const notes = [makeNote("2026-05-14T05:00:00Z", "note-newest")];
-		const linearIssues = [
-			makeLinearIssue("2026-05-14T01:00:00Z", "PROJ-old"),
-			makeLinearIssue("2026-05-14T04:00:00Z", "PROJ-mid"),
+		const entities = [
+			makeEntity("2026-05-14T01:00:00Z", "PROJ-old"),
+			makeEntity("2026-05-14T04:00:00Z", "PROJ-mid"),
 		];
 
-		const merged = PlansDataService.mergeByLastModified(
-			plans,
-			notes,
-			linearIssues,
-		);
+		const merged = PlansDataService.mergeByLastModified(plans, notes, entities);
 
 		const order = merged.map((m) => {
 			if (m.kind === "plan") return m.plan.slug;
 			if (m.kind === "note") return m.note.id;
-			return m.linearIssue.ticketId;
+			return m.reference.nativeId;
 		});
 		expect(order).toEqual(["note-newest", "PROJ-mid", "plan-mid", "PROJ-old"]);
 	});
 
-	it("uses kind rank for deterministic tie-break (plan < note < linearissue)", () => {
+	it("uses kind rank for deterministic tie-break (plan < note < entity)", () => {
 		const same = "2026-05-14T00:00:00Z";
 		const merged = PlansDataService.mergeByLastModified(
 			[makePlan(same, "p")],
 			[makeNote(same, "n")],
-			[makeLinearIssue(same, "PROJ-1")],
+			[makeEntity(same, "PROJ-1")],
 		);
-		expect(merged.map((m) => m.kind)).toEqual(["plan", "note", "linearissue"]);
+		expect(merged.map((m) => m.kind)).toEqual(["plan", "note", "reference"]);
 	});
 
-	it("defaults linearIssues to [] when omitted (backward compat)", () => {
+	it("defaults entities to [] when omitted (backward compat)", () => {
 		const merged = PlansDataService.mergeByLastModified(
 			[makePlan("2026-01-01T00:00:00Z")],
 			[],
 		);
 		expect(merged).toHaveLength(1);
 		expect(merged[0].kind).toBe("plan");
+	});
+
+	it("interleaves entities from heterogeneous sources (Jira / GitHub / Notion / Linear)", () => {
+		// The merge sort doesn't discriminate by source — every ReferenceInfo
+		// participates uniformly. This regression-tests the multi-source
+		// refactor: before ReferenceItem, only `linear` entities reached the
+		// tree; now Jira / GitHub / Notion rows have to flow through the
+		// same code path and land at the right sort position.
+		const plans: ReadonlyArray<PlanInfo> = [];
+		const notes: ReadonlyArray<NoteInfo> = [];
+		const entities: ReadonlyArray<ReferenceInfo> = [
+			makeEntity("2026-05-14T01:00:00Z", "PROJ-1", "linear"),
+			makeEntity("2026-05-14T04:00:00Z", "KAN-7", "jira"),
+			makeEntity("2026-05-14T03:00:00Z", "owner/repo#42", "github"),
+			makeEntity("2026-05-14T02:00:00Z", "abc123def456", "notion"),
+		];
+		const merged = PlansDataService.mergeByLastModified(plans, notes, entities);
+		const order = merged.map((m) =>
+			m.kind === "reference" ? `${m.reference.source}:${m.reference.nativeId}` : "x",
+		);
+		expect(order).toEqual([
+			"jira:KAN-7",
+			"github:owner/repo#42",
+			"notion:abc123def456",
+			"linear:PROJ-1",
+		]);
 	});
 });

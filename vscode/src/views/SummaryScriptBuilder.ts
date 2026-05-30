@@ -1057,6 +1057,51 @@ ${buildPrMessageScript()}
     }
   }
 
+  // ── Reference inline edit messages (mirrors plan/note) ──
+  if (msg.command === 'referenceContentLoaded' && msg.archivedKey && msg.source && msg.content !== undefined) {
+    // DOM id strips '<source>:' prefix uniformly across all sources so the id
+    // is 'reference-<source>-<bareKey>' — matches SummaryHtmlBuilder.buildReferenceRow.
+    var refLePrefix = msg.source + ':';
+    var refLeKey = msg.archivedKey.indexOf(refLePrefix) === 0 ? msg.archivedKey.slice(refLePrefix.length) : msg.archivedKey;
+    var referenceEl = document.getElementById('reference-' + msg.source + '-' + refLeKey);
+    if (referenceEl) {
+      var referenceEditArea = referenceEl.querySelector('.plan-edit-area');
+      var referenceTextareaIn = referenceEl.querySelector('.plan-edit-textarea');
+      if (referenceEditArea && referenceTextareaIn) {
+        referenceTextareaIn.value = msg.content;
+        referenceEl.classList.add('editing');
+        referenceTextareaIn.focus();
+      }
+    }
+  }
+
+  if (msg.command === 'referenceSaved' && msg.archivedKey && msg.source) {
+    var refSavedPrefix = msg.source + ':';
+    var refSavedDomKey = msg.archivedKey.indexOf(refSavedPrefix) === 0 ? msg.archivedKey.slice(refSavedPrefix.length) : msg.archivedKey;
+    var referenceEl2 = document.getElementById('reference-' + msg.source + '-' + refSavedDomKey);
+    if (referenceEl2) {
+      referenceEl2.classList.remove('editing');
+    }
+  }
+
+  // ── Reference translation status ──
+  if (msg.command === 'referenceTranslating' && msg.archivedKey) {
+    var refTransBtn = document.querySelector('.reference-translate-btn[data-reference-key="' + msg.archivedKey + '"]');
+    if (refTransBtn) {
+      refTransBtn.disabled = true;
+      refTransBtn.classList.add('translating');
+      refTransBtn.setAttribute('title', 'Translating...');
+    }
+  }
+  if (msg.command === 'referenceTranslateError' && msg.archivedKey) {
+    var refTransBtn2 = document.querySelector('.reference-translate-btn[data-reference-key="' + msg.archivedKey + '"]');
+    if (refTransBtn2) {
+      refTransBtn2.disabled = false;
+      refTransBtn2.classList.remove('translating');
+      refTransBtn2.setAttribute('title', 'Translate to English');
+    }
+  }
+
   });
 
   // ── Plan & Note actions: event delegation for data-action attributes ──
@@ -1162,24 +1207,72 @@ ${buildPrMessageScript()}
         vscode.postMessage({ command: 'removeNote', id: noteId, title: noteTitle });
         break;
       }
-      case 'openLinearIssue': {
-        // Hand the upstream URL through so the host doesn't need to re-query
-        // the orphan branch summary — the row already has it as a data attr.
-        var lkOpen = target.getAttribute('data-linear-key') || '';
-        var lUrl = target.getAttribute('data-linear-url') || '';
-        vscode.postMessage({ command: 'openLinearIssue', archivedKey: lkOpen, url: lUrl });
-        break;
-      }
-      case 'openLinearIssueMarkdown': {
-        var lkMd = target.getAttribute('data-linear-key') || '';
+      case 'previewReference': {
+        // Title click -> host opens read-only webview rendering the archived
+        // markdown for this reference. archivedKey carries the source prefix
+        // so the host dispatches without re-parsing the source.
         e.preventDefault();
-        vscode.postMessage({ command: 'openLinearIssueMarkdown', archivedKey: lkMd });
+        var pevKey = target.getAttribute('data-reference-key') || '';
+        var pevSource = target.getAttribute('data-reference-source') || '';
+        var pevNativeId = target.getAttribute('data-reference-native-id') || '';
+        var pevTitle = target.getAttribute('data-reference-title') || '';
+        vscode.postMessage({ command: 'previewReference', archivedKey: pevKey, source: pevSource, nativeId: pevNativeId, title: pevTitle });
         break;
       }
-      case 'removeLinearIssue': {
-        var lkRm = target.getAttribute('data-linear-key') || '';
-        var lTicket = target.getAttribute('data-linear-ticket') || '';
-        vscode.postMessage({ command: 'removeLinearIssue', archivedKey: lkRm, ticketId: lTicket });
+      case 'openReferenceExternal': {
+        // 🌍 → host opens reference.url in the default browser. URL is round-
+        // tripped via data-reference-url so the host doesn't need to re-query
+        // the orphan branch summary — the row already has it.
+        var oeUrl = target.getAttribute('data-reference-url') || '';
+        vscode.postMessage({ command: 'openReferenceExternal', url: oeUrl });
+        break;
+      }
+      case 'translateReference': {
+        // 🌐 → host calls the same translation pipeline plans use; result
+        // stored in the same translation cache keyed by archivedKey.
+        var teKey = target.getAttribute('data-reference-key') || '';
+        var teSource = target.getAttribute('data-reference-source') || '';
+        vscode.postMessage({ command: 'translateReference', archivedKey: teKey, source: teSource });
+        break;
+      }
+      case 'loadReferenceContent': {
+        // ✎ → host reads the archived markdown body and sends it back via
+        // referenceContentLoaded; the webview then opens the inline textarea.
+        var leKey = target.getAttribute('data-reference-key') || '';
+        var leSource = target.getAttribute('data-reference-source') || '';
+        vscode.postMessage({ command: 'loadReferenceContent', archivedKey: leKey, source: leSource });
+        break;
+      }
+      case 'saveReferenceEdit': {
+        // Save -> host writes back to orphan branch under references/source/.
+        var seKey = target.getAttribute('data-reference-key') || '';
+        var seSource = target.getAttribute('data-reference-source') || '';
+        // buildReferenceRow's id strips the "<source>:" prefix for ALL sources
+        // (stripSourcePrefix), so replicate that for every source — not just
+        // Linear — or the textarea lookup misses on jira/github/notion rows.
+        var seDomKey = (seKey.indexOf(seSource + ':') === 0) ? seKey.slice((seSource + ':').length) : seKey;
+        var referenceItem = document.getElementById('reference-' + seSource + '-' + seDomKey);
+        if (!referenceItem) break;
+        var referenceTextarea = referenceItem.querySelector('.plan-edit-textarea');
+        if (!referenceTextarea) break;
+        vscode.postMessage({ command: 'saveReferenceEdit', archivedKey: seKey, source: seSource, content: referenceTextarea.value });
+        break;
+      }
+      case 'cancelReferenceEdit': {
+        var ceKey = target.getAttribute('data-reference-key') || '';
+        var ceSource = target.getAttribute('data-reference-source') || '';
+        var ceDomKey = (ceKey.indexOf(ceSource + ':') === 0) ? ceKey.slice((ceSource + ':').length) : ceKey;
+        var ceReferenceEl = document.getElementById('reference-' + ceSource + '-' + ceDomKey);
+        if (!ceReferenceEl) break;
+        ceReferenceEl.classList.remove('editing');
+        break;
+      }
+      case 'removeReference': {
+        var reKey = target.getAttribute('data-reference-key') || '';
+        var reSource = target.getAttribute('data-reference-source') || '';
+        var reNativeId = target.getAttribute('data-reference-native-id') || '';
+        var reTitle = target.getAttribute('data-reference-title') || '';
+        vscode.postMessage({ command: 'removeReference', archivedKey: reKey, source: reSource, nativeId: reNativeId, title: reTitle });
         break;
       }
     }

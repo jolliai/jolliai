@@ -392,8 +392,12 @@ export interface CommitSummary {
 	readonly plans?: ReadonlyArray<PlanReference>;
 	/** User-created notes associated with this commit */
 	readonly notes?: ReadonlyArray<NoteReference>;
-	/** Linear issues referenced via MCP and associated with this commit */
-	readonly linearIssues?: ReadonlyArray<LinearIssueCommitRef>;
+	/**
+	 * External references (Linear / Jira / GitHub / Notion / …) associated with
+	 * this commit. Single field across every {@link SourceId} — readers walk
+	 * the array and dispatch on `source`.
+	 */
+	readonly references?: ReadonlyArray<ReferenceCommitRef>;
 	/**
 	 * v5 schema: stable transcript IDs referenced by this summary. Each ID
 	 * corresponds to a file at `transcripts/{id}.json` on the orphan branch.
@@ -459,12 +463,18 @@ export interface PlanEntry {
 	readonly ignored?: boolean;
 }
 
-/** plans.json registry structure */
+/**
+ * plans.json registry structure.
+ *
+ * Multi-source: holds plans / notes / references (keyed by `<source>:<nativeId>`
+ * pre-archive and `<source>:<nativeId>-<shortHash>` post-archive). The
+ * `version: 2` field is retained as a future-migration anchor.
+ */
 export interface PlansRegistry {
-	readonly version: 1;
+	readonly version: 2;
 	readonly plans: Readonly<Record<string, PlanEntry>>;
 	readonly notes?: Readonly<Record<string, NoteEntry>>;
-	readonly linearIssues?: Readonly<Record<string, LinearIssueEntry>>;
+	readonly references?: Readonly<Record<string, ReferenceEntry>>;
 }
 
 // ─── Note types ─────────────────────────────────────────────────────────────
@@ -543,92 +553,95 @@ export interface NoteReference {
 	readonly jolliNoteDocId?: number;
 }
 
-// ─── Linear issue types ─────────────────────────────────────────────────────
+// ─── Generic external-reference types (multi-source) ────────────────────────
 
 /**
- * Linear issue payload as extracted from a single MCP tool_result in the transcript.
- * Ephemeral — produced by LinearIssueExtractor, consumed by markdown writer + prompt formatter.
- * Not persisted as-is (description goes into markdown body, metadata into LinearIssueEntry).
+ * SourceId — stable id naming each external-reference provider.
+ *
+ * Add a new id only by registering a corresponding `SourceAdapter` in
+ * `cli/src/core/references/sources/index.ts`. Persistence layers (plans.json v2 references,
+ * orphan-branch `references/<source>/…`) key off this string directly.
  */
-export interface LinearIssueRef {
-	/** Stable Linear ticket id, e.g. "PROJ-1234" — matches /^[A-Z][A-Z0-9_]*-\d+$/ */
-	readonly ticketId: string;
+export type SourceId = "linear" | "jira" | "github" | "notion";
+
+/**
+ * Reference — ephemeral, in-memory shape produced by a `SourceAdapter.extractRef`
+ * call. Superset of `LinearIssueRef` with a `source` discriminator + optional
+ * GitHub-/Notion-specific fields. Persisted as markdown frontmatter by
+ * `ReferenceStore.writeReferenceMarkdown`; metadata is split into `ReferenceEntry`
+ * (registry) and the markdown body (description).
+ */
+export interface Reference {
+	/** `<source>:<nativeId>` — registry map key in plans.json.references. Does NOT include a short-hash suffix. */
+	readonly mapKey: string;
+	readonly source: SourceId;
+	/** Stable id native to the source (Linear ticket id, Jira key, `owner/repo#number`, 32-hex Notion page id). */
+	readonly nativeId: string;
 	readonly title: string;
 	readonly url: string;
+	readonly description?: string;
 	readonly status?: string;
 	readonly priority?: string;
 	readonly labels?: ReadonlyArray<string>;
-	/** Raw markdown body from Linear (may be truncated by Linear MCP upstream) */
-	readonly description?: string;
-	/** MCP tool name that surfaced this issue, e.g. "mcp__linear__get_issue" */
+	/** GitHub-only. */
+	readonly assignees?: ReadonlyArray<string>;
+	/** GitHub-only. */
+	readonly milestone?: string;
+	/** GitHub `issue_type` / Notion `metadata.type`. */
+	readonly entityType?: string;
 	readonly toolName: string;
-	/** ISO 8601 timestamp of the tool_result entry */
 	readonly referencedAt: string;
 }
 
 /**
- * Persisted Linear issue entry in plans.json registry (linearIssues section).
+ * ReferenceEntry — persisted registry row in `plans.json.references` (v2).
  *
- * Map key follows the Plans archive pattern (see `associatePlansWithCommit`
- * in QueueWorker.ts):
- * - Uncommitted: key = ticketId (e.g. "PROJ-1234")
- * - After archive: TWO entries exist:
- *   - key = ticketId       → guard entry (contentHashAtCommit set)
- *   - key = ticketId-<shortHash> → archived snapshot (no contentHashAtCommit)
- *
- * Panel filter (LinearIssueService.toPanelInfo):
- *   - guard entry (contentHashAtCommit set) → always hidden
- *   - snapshot entry (commitHash set)       → always hidden
- *   - ignored entry                         → always hidden
- *   - branch mismatch                       → hidden
- * Note: the guard's contentHashAtCommit hash is consulted by
- * SessionTracker.upsertLinearIssueEntry (to decide whether to re-surface a
- * changed payload), NOT by the panel filter — the filter just sees "guard
- * set, hide". Don't confuse the two.
+ * Generalises {@link ReferenceEntry} across every {@link SourceId}. Map key
+ * follows the same archive pattern as Plans/Notes/Linear: the active row uses
+ * `<source>:<nativeId>` and (after `associateReferencesWithCommit`) a second
+ * snapshot row appears keyed `<source>:<nativeId>-<shortHash>`. The
+ * `contentHashAtCommit` guard pattern, branch-scoping, and ignored semantics
+ * mirror {@link ReferenceEntry} verbatim — see that interface's doc-comment
+ * for the panel-filter rules.
  */
-export interface LinearIssueEntry {
-	/** Stable Linear ticket id, never changes across archive */
-	readonly ticketId: string;
-	/**
-	 * Title cached at upsert/archive time. The panel render still re-reads
-	 * the markdown frontmatter every refresh (for status/priority/labels),
-	 * so this cache only avoids one extra read when title alone is needed.
-	 */
+export interface ReferenceEntry {
+	readonly source: SourceId;
+	readonly nativeId: string;
 	readonly title: string;
-	/** URL cached at upsert/archive time — used by "Open in Linear" without reading markdown. */
 	readonly url: string;
-	/** Absolute path to the markdown file (mirrors Plans/Notes sourcePath convention) */
+	/** Absolute path to `<jolliMemoryDir>/references/<source>/<sanitized-key>.md`. */
 	readonly sourcePath: string;
 	readonly branch: string;
 	readonly addedAt: string;
 	readonly updatedAt: string;
 	readonly commitHash: string | null;
-	/** SHA-256 hash of the markdown content at archive time (guard pattern) */
+	/** SHA-256 of the canonical markdown at archive time (guard pattern). */
 	readonly contentHashAtCommit?: string;
-	/** When true, hidden from panel */
+	/** When true, hidden from the multi-source panel. */
 	readonly ignored?: boolean;
-	/** MCP tool name that originally surfaced this issue (e.g. "mcp__linear__get_issue") */
+	/** MCP tool name that originally surfaced this reference. */
 	readonly sourceToolName: string;
 }
 
 /**
- * Reference to a Linear issue associated with a commit (stored in CommitSummary.linearIssues).
- *
- * `archivedKey` mirrors PlanReference.slug semantics: the POST-archive map key in plans.json
- * (`<ticketId>-<shortHash>`). Used by reassociateMetadata for amend/squash/rebase to
- * unambiguously locate the snapshot entry — storing only ticketId would be ambiguous when
- * the same ticket is referenced across multiple commits.
+ * ReferenceCommitRef — multi-source replacement for {@link ReferenceCommitRef}
+ * stored in `CommitSummary.references`. `archivedKey` is the POST-archive
+ * `plans.json.references` map key (`<source>:<nativeId>-<shortHash>`); other
+ * fields are a value-snapshot at archive time.
  */
-export interface LinearIssueCommitRef {
-	/** Exact pointer into plans.json: "<ticketId>-<shortHash>" */
+export interface ReferenceCommitRef {
+	/** Exact pointer into plans.json.references: `<source>:<nativeId>-<shortHash>`. */
 	readonly archivedKey: string;
-	/** Stable Linear ticket id (e.g. "PROJ-1234") */
-	readonly ticketId: string;
+	readonly source: SourceId;
+	readonly nativeId: string;
 	readonly title: string;
 	readonly url: string;
 	readonly status?: string;
 	readonly priority?: string;
 	readonly labels?: ReadonlyArray<string>;
+	readonly assignees?: ReadonlyArray<string>;
+	readonly milestone?: string;
+	readonly entityType?: string;
 	readonly referencedAt: string;
 	readonly sourceToolName: string;
 }

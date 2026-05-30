@@ -29,6 +29,8 @@ import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
 import type {
+	CatalogEntry,
+	CommitCatalog,
 	CommitInfo,
 	CommitSummary,
 	FileWrite,
@@ -49,6 +51,7 @@ import { MetadataManager } from "./MetadataManager.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import {
 	AmbiguousHashError,
+	collectChildReferences,
 	deleteNoteVisibleArtifact,
 	deletePlanVisibleArtifact,
 	deleteTranscript,
@@ -64,19 +67,19 @@ import {
 	mergeManyToOne,
 	migrateIndexToV3,
 	migrateOneToOne,
-	readLinearIssueFromBranch,
 	readNoteFromBranch,
 	readPlanFromBranch,
 	readPlanProgress,
+	readReferenceFromBranch,
 	readTranscript,
 	readTranscriptsForCommits,
 	removeFromIndex,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
 	setActiveStorage,
-	storeLinearIssues,
 	storeNotes,
 	storePlans,
+	storeReferences,
 	storeSummary,
 	stripFunctionalMetadata,
 } from "./SummaryStore.js";
@@ -970,22 +973,25 @@ describe("SummaryStore", () => {
 			expect(newSummaryContent.children?.[0].e2eTestGuide).toBeUndefined();
 		});
 
-		it("should hoist linearIssues onto the rebase container node (regression: rebase silently dropped Linear refs)", async () => {
+		it("should hoist entities onto the rebase container node (regression: rebase silently dropped Linear refs)", async () => {
 			// Regression: migrateOneToOne carried plans/notes/e2eTestGuide
-			// forward to the new root summary but forgot linearIssues. After
+			// forward to the new root summary but forgot Linear refs. After
 			// rebasing a branch carrying Linear-issue archives, the rebased
-			// commits' summaries had linearIssues:[] on the orphan branch even
+			// commits' summaries had references:[] on the orphan branch even
 			// though the registry still pointed at the (renamed-on-disk)
 			// snapshot files — panel + PR markdown stopped showing the
 			// associations until the next manual commit.
+			// Post-Phase-B: the canonical field is `entities` (legacy
+			// `linearIssues` is no longer written).
 			const oldHash = "oldhash0000000000000001";
 			const newHash = "newhash0000000000000002";
 			const oldSummary: CommitSummary = {
 				...createMockSummary(oldHash, "Old message"),
-				linearIssues: [
+				references: [
 					{
-						archivedKey: "PROJ-1528-oldhash0",
-						ticketId: "PROJ-1528",
+						archivedKey: "linear:PROJ-1528-oldhash0",
+						source: "linear",
+						nativeId: "PROJ-1528",
 						title: "Treat referenced Linear issues as a first-class panel item",
 						url: "https://linear.app/jolliai/issue/PROJ-1528/test",
 						referencedAt: "2026-05-14T09:11:43.708Z",
@@ -1000,19 +1006,22 @@ describe("SummaryStore", () => {
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
-			expect(newSummaryContent.linearIssues).toEqual([
+			expect(newSummaryContent.references).toEqual([
 				{
-					archivedKey: "PROJ-1528-oldhash0",
-					ticketId: "PROJ-1528",
+					archivedKey: "linear:PROJ-1528-oldhash0",
+					source: "linear",
+					nativeId: "PROJ-1528",
 					title: "Treat referenced Linear issues as a first-class panel item",
 					url: "https://linear.app/jolliai/issue/PROJ-1528/test",
 					referencedAt: "2026-05-14T09:11:43.708Z",
 					sourceToolName: "mcp__linear__get_issue",
 				},
 			]);
-			// Wrapped child must have linearIssues stripped (Hoist invariant —
+			// Wrapped child must have entities stripped (Hoist invariant —
 			// root is the only authoritative carrier; same rule as plans/notes).
-			expect(newSummaryContent.children?.[0].linearIssues).toBeUndefined();
+			expect(newSummaryContent.children?.[0].references).toBeUndefined();
+			// Post-Phase-B: legacy linearIssues field is never written.
+			expect((newSummaryContent as unknown as { linearIssues?: unknown }).linearIssues).toBeUndefined();
 		});
 
 		it("should hoist notes onto the rebase container node", async () => {
@@ -1139,6 +1148,51 @@ describe("SummaryStore", () => {
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const migrated = JSON.parse(files[0].content) as CommitSummary;
 			expect(migrated.summaryError).toBeUndefined();
+		});
+
+		it("hoists every present optional field (metadata.commitSource, ticketId, entities, recap) into the new container", async () => {
+			// Pins the four truthy arms of the optional-spread chain in
+			// `migrateOneToOneLocked` (SummaryStore.ts L400, L401, L415, L419):
+			//   - `metadata?.commitSource && {...}`
+			//   - `oldSummary.ticketId && {...}`
+			//   - `oldSummary.references && {...}`
+			//   - `oldSummary.recap && {...}`
+			// Existing migrateOneToOne tests cover the absent (falsy) arm of
+			// each; this one feeds every field at once so the truthy spread
+			// branches fire.
+			const oldHash = "oldhash0000000000000001";
+			const newHash = "newhash0000000000000002";
+			const oldSummary: CommitSummary = {
+				...createMockSummary(oldHash, "Old message"),
+				ticketId: "PROJ-1528",
+				recap: "Old recap text",
+				references: [
+					{
+						archivedKey: "linear:PROJ-1528-oldhash0",
+						source: "linear",
+						nativeId: "PROJ-1528",
+						title: "An entity",
+						url: "https://linear.app/x/PROJ-1528",
+						referencedAt: "2026-05-14T09:11:43.708Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			};
+
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), undefined, {
+				commitType: "rebase",
+				commitSource: "plugin",
+			});
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
+			expect(newSummaryContent.commitSource).toBe("plugin");
+			expect(newSummaryContent.ticketId).toBe("PROJ-1528");
+			expect(newSummaryContent.recap).toBe("Old recap text");
+			expect(newSummaryContent.references).toHaveLength(1);
+			expect(newSummaryContent.references?.[0].nativeId).toBe("PROJ-1528");
 		});
 	});
 
@@ -1733,13 +1787,16 @@ describe("SummaryStore", () => {
 			expect(merged.children?.[1].notes).toBeUndefined();
 		});
 
-		it("should hoist and dedupe linearIssues from children by newest referencedAt", async () => {
+		it("should hoist and dedupe entities from children by newest referencedAt", async () => {
+			// Post-Phase-B: canonical field is `entities`; assertion shape mirrors
+			// the old `linearIssues` test but reads via the new field.
 			const old1: CommitSummary = {
 				...createMockSummary("old1", "Old 1"),
-				linearIssues: [
+				references: [
 					{
-						archivedKey: "PROJ-1-old1",
-						ticketId: "PROJ-1",
+						archivedKey: "linear:PROJ-1-old1",
+						source: "linear",
+						nativeId: "PROJ-1",
 						title: "Old title",
 						url: "https://linear.app/x/PROJ-1",
 						referencedAt: "2026-02-18T00:00:00Z",
@@ -1749,18 +1806,20 @@ describe("SummaryStore", () => {
 				children: [
 					{
 						...createMockSummary("nested-child", "Nested child"),
-						linearIssues: [
+						references: [
 							{
-								archivedKey: "PROJ-1-old1",
-								ticketId: "PROJ-1",
+								archivedKey: "linear:PROJ-1-old1",
+								source: "linear",
+								nativeId: "PROJ-1",
 								title: "Newer title",
 								url: "https://linear.app/x/PROJ-1",
 								referencedAt: "2026-02-20T00:00:00Z",
 								sourceToolName: "mcp__linear__get_issue",
 							},
 							{
-								archivedKey: "PROJ-2-nested",
-								ticketId: "PROJ-2",
+								archivedKey: "linear:PROJ-2-nested",
+								source: "linear",
+								nativeId: "PROJ-2",
 								title: "Nested Only",
 								url: "https://linear.app/x/PROJ-2",
 								referencedAt: "2026-02-19T00:00:00Z",
@@ -1772,10 +1831,11 @@ describe("SummaryStore", () => {
 			};
 			const old2: CommitSummary = {
 				...createMockSummary("old2", "Old 2"),
-				linearIssues: [
+				references: [
 					{
-						archivedKey: "PROJ-3-old2",
-						ticketId: "PROJ-3",
+						archivedKey: "linear:PROJ-3-old2",
+						source: "linear",
+						nativeId: "PROJ-3",
 						title: "Root Only",
 						url: "https://linear.app/x/PROJ-3",
 						referencedAt: "2026-02-19T00:00:00Z",
@@ -1790,15 +1850,67 @@ describe("SummaryStore", () => {
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
 			// 3 refs after dedupe-keep-latest on archivedKey
-			expect(merged.linearIssues).toHaveLength(3);
-			const dup = merged.linearIssues?.find((r) => r.archivedKey === "PROJ-1-old1");
+			expect(merged.references).toHaveLength(3);
+			const dup = merged.references?.find((r) => r.archivedKey === "linear:PROJ-1-old1");
 			expect(dup?.title).toBe("Newer title");
 			expect(dup?.referencedAt).toBe("2026-02-20T00:00:00Z");
-			expect(merged.linearIssues?.find((r) => r.archivedKey === "PROJ-2-nested")).toBeDefined();
-			expect(merged.linearIssues?.find((r) => r.archivedKey === "PROJ-3-old2")).toBeDefined();
-			// Children should have linearIssues stripped
-			expect(merged.children?.[0].linearIssues).toBeUndefined();
-			expect(merged.children?.[1].linearIssues).toBeUndefined();
+			expect(merged.references?.find((r) => r.archivedKey === "linear:PROJ-2-nested")).toBeDefined();
+			expect(merged.references?.find((r) => r.archivedKey === "linear:PROJ-3-old2")).toBeDefined();
+			// Children should have entities stripped (Hoist invariant).
+			expect(merged.children?.[0].references).toBeUndefined();
+			expect(merged.children?.[1].references).toBeUndefined();
+			// Post-Phase-B: no legacy linearIssues field on the merged output.
+			expect((merged as unknown as { linearIssues?: unknown }).linearIssues).toBeUndefined();
+		});
+
+		it("hoists multi-source entities from children to squash root (linear + jira interleaved)", async () => {
+			// Two child summaries each carry entities from a different source —
+			// merging must union them onto the squash root's `entities` field
+			// while stripping the field from descendants (Hoist invariant).
+			const old1: CommitSummary = {
+				...createMockSummary("old1", "Linear child"),
+				references: [
+					{
+						archivedKey: "linear:PROJ-1-old1",
+						source: "linear",
+						nativeId: "PROJ-1",
+						title: "Linear ticket",
+						url: "https://linear.app/x/PROJ-1",
+						referencedAt: "2026-02-18T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			};
+			const old2: CommitSummary = {
+				...createMockSummary("old2", "Jira child"),
+				references: [
+					{
+						archivedKey: "jira:KAN-4-old2hash",
+						source: "jira",
+						nativeId: "KAN-4",
+						title: "Jira ticket",
+						url: "https://jolli.atlassian.net/browse/KAN-4",
+						referencedAt: "2026-02-19T00:00:00Z",
+						sourceToolName: "mcp__claude_ai_Atlassian__getJiraIssue",
+					},
+				],
+			};
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.references).toHaveLength(2);
+			const linearRef = merged.references?.find((e) => e.archivedKey === "linear:PROJ-1-old1");
+			const jiraRef = merged.references?.find((e) => e.archivedKey === "jira:KAN-4-old2hash");
+			expect(linearRef?.source).toBe("linear");
+			expect(jiraRef?.source).toBe("jira");
+			// Post-Phase-B: legacy linearIssues field is never emitted.
+			expect((merged as unknown as { linearIssues?: unknown }).linearIssues).toBeUndefined();
+			// Children must have entities stripped (Hoist invariant).
+			expect(merged.children?.[0].references).toBeUndefined();
+			expect(merged.children?.[1].references).toBeUndefined();
 		});
 
 		it("should not have orphanedDocIds when no summaries have jolliDocId", async () => {
@@ -2707,6 +2819,59 @@ describe("SummaryStore", () => {
 			expect(storage.readFile).toHaveBeenCalledTimes(2);
 			expect(storage.writeFiles).toHaveBeenCalledTimes(1);
 		});
+
+		it("defers alias write when the inside-lock re-read returns a null index (concurrent wipe race)", async () => {
+			// Pins SummaryStore.ts L1625's truthy arm: `!freshIndex || version !== 3`.
+			// The preflight read finds a valid v3 index with a tree-hash candidate,
+			// then the inside-lock re-read returns null (the index file was deleted
+			// or briefly absent between preflight and lock acquire — happens during
+			// a worker-driven dual-write rotation, or a `migrate` operation that
+			// truncated state). The function must defer cleanly rather than crash.
+			const preflightIdx = v3Index([{ ...rootEntry("root1", "Root"), treeHash: "tree-1" }], {});
+			vi.mocked(readFileFromBranch)
+				.mockResolvedValueOnce(JSON.stringify(preflightIdx)) // preflight (no lock)
+				.mockResolvedValueOnce(null); // inside-lock re-read = wiped
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
+
+			const result = await scanTreeHashAliases(["unknown1"]);
+
+			expect(result).toBe(false);
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("defers alias write when the symmetric read-side index is missing (readSide null arm of L1639)", async () => {
+			// Pins SummaryStore.ts L1639's falsy arm: `readSideIndex && readSideIndex.version === 3`.
+			// readStorage !== storage (so the symmetric divergence check enters),
+			// the write-side read returns a valid v3 index (candidates can be aliased),
+			// but the read-side re-read returns null. The code must skip the divergence
+			// check rather than crash, and proceed to write the alias on the write side.
+			const indexJson = JSON.stringify(v3Index([{ ...rootEntry("root1", "Root"), treeHash: "tree-X" }], {}));
+			const readStorage: StorageProvider = {
+				readFile: vi
+					.fn()
+					.mockResolvedValueOnce(indexJson) // preflight: candidate seen on readStorage
+					.mockResolvedValueOnce(null), // inside-lock readSide re-read = null
+				writeFiles: vi.fn(),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			};
+			const writeStorage: StorageProvider = {
+				readFile: vi.fn().mockResolvedValue(indexJson),
+				writeFiles: vi.fn().mockResolvedValue(undefined),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			};
+			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-X");
+
+			const result = await scanTreeHashAliases(["unknown1"], undefined, writeStorage, readStorage);
+
+			// Divergence check skipped (readSideIndex null), but write proceeds
+			// normally because freshIndex on write side is intact.
+			expect(result).toBe(true);
+			expect(writeStorage.writeFiles).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	describe("index migration", () => {
@@ -3443,40 +3608,76 @@ describe("SummaryStore", () => {
 		});
 	});
 
-	describe("storeLinearIssues / readLinearIssueFromBranch", () => {
-		it("should write Linear issue files to the orphan branch under linear-issues/<archivedKey>.md", async () => {
-			await storeLinearIssues(
+	describe("storeReferences / readReferenceFromBranch (multi-source)", () => {
+		it("writes entity markdown to entities/<source>/<sanitized-bareKey>.md across sources", async () => {
+			await storeReferences(
 				[
-					{ archivedKey: "PROJ-1-abc1234", content: "# Issue 1\nbody" },
-					{ archivedKey: "PROJ-2-abc1234", content: "# Issue 2\nbody" },
+					{ archivedKey: "jira:KAN-4-abc12345", source: "jira", content: "---\nbody-jira" },
+					{ archivedKey: "linear:PROJ-1-abc12345", source: "linear", content: "---\nbody-linear" },
 				],
-				"Archive linear issues for commit abc1234",
+				"Archive entities for commit abc12345",
 			);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledWith(
 				expect.any(String),
 				[
-					{ path: "linear-issues/PROJ-1-abc1234.md", content: "# Issue 1\nbody" },
-					{ path: "linear-issues/PROJ-2-abc1234.md", content: "# Issue 2\nbody" },
+					{ path: "references/jira/KAN-4-abc12345.md", content: "---\nbody-jira" },
+					{ path: "references/linear/PROJ-1-abc12345.md", content: "---\nbody-linear" },
 				],
-				"Archive linear issues for commit abc1234",
+				"Archive entities for commit abc12345",
 				undefined,
 			);
 		});
 
-		it("should skip writing when linearFiles array is empty", async () => {
-			await storeLinearIssues([], "Empty commit");
+		it("storeReferences is a no-op when given an empty list", async () => {
+			await storeReferences([], "Empty commit");
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
-		it("readLinearIssueFromBranch reads markdown content from orphan branch by archivedKey", async () => {
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce("# Archived Issue\nContent here");
-			await expect(readLinearIssueFromBranch("PROJ-1-abc1234")).resolves.toBe("# Archived Issue\nContent here");
+		it("storeReferences sanitizes GitHub nativeIds containing / and # in the filename only", async () => {
+			// archivedKey carries the post-archive form `github:owner/repo#7-abc12345`
+			// — slashes / hash are filesystem-unsafe so sanitizeNativeIdForPath
+			// replaces them and appends an 8-hex sha256 suffix for collision-safety.
+			await storeReferences(
+				[{ archivedKey: "github:owner/repo#7-abc12345", source: "github", content: "body" }],
+				"Archive github entity",
+			);
+			const callArgs = vi.mocked(writeMultipleFilesToBranch).mock.calls[0];
+			const files = callArgs[1] as ReadonlyArray<FileWrite>;
+			expect(files).toHaveLength(1);
+			expect(files[0].path).toMatch(/^references\/github\/owner-repo-7-abc12345-[0-9a-f]{8}\.md$/);
+			expect(files[0].content).toBe("body");
 		});
 
-		it("readLinearIssueFromBranch returns null when the orphan branch file is absent", async () => {
+		it("readReferenceFromBranch returns content from entities/<source>/<bareKey>.md for non-linear sources", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce("# Jira KAN-4\nbody");
+			await expect(readReferenceFromBranch("jira", "jira:KAN-4-abc12345")).resolves.toBe("# Jira KAN-4\nbody");
+			expect(readFileFromBranch).toHaveBeenCalledWith(
+				expect.any(String),
+				"references/jira/KAN-4-abc12345.md",
+				undefined,
+			);
+		});
+
+		it("readReferenceFromBranch returns null for missing non-linear sources (no legacy fallback)", async () => {
 			vi.mocked(readFileFromBranch).mockRejectedValueOnce(new Error("ENOENT"));
-			await expect(readLinearIssueFromBranch("PROJ-missing")).resolves.toBeNull();
+			await expect(readReferenceFromBranch("jira", "jira:KAN-99-deadbeef")).resolves.toBeNull();
+			// Exactly one read attempt — non-linear sources never trigger the
+			// legacy `linear-issues/…` fallback.
+			expect(readFileFromBranch).toHaveBeenCalledTimes(1);
+		});
+
+		it("readReferenceFromBranch returns null on local storage when new path is absent (no legacy fallback)", async () => {
+			// Post-Phase-B: local storage has been migrated at activate-time;
+			// any miss on the new path means the entity is gone — no fallback.
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			await expect(readReferenceFromBranch("linear", "linear:PROJ-1-abc1234")).resolves.toBeNull();
+			expect(readFileFromBranch).toHaveBeenCalledTimes(1);
+			expect(readFileFromBranch).toHaveBeenCalledWith(
+				expect.any(String),
+				"references/linear/PROJ-1-abc1234.md",
+				undefined,
+			);
 		});
 	});
 
@@ -3660,6 +3861,237 @@ describe("SummaryStore", () => {
 			const rootSource = sources.find((s) => s.commitHash === "no-topics-root");
 			expect(rootSource?.topics).toEqual([]);
 			expect(rootSource?.recap).toBe("Recap on a topic-less root.");
+		});
+	});
+
+	describe("collectChildReferences", () => {
+		it("hoists multi-source child references onto the parent (preserving source-prefixed archivedKey)", () => {
+			const child: CommitSummary = {
+				...createMockSummary("child-hash", "child"),
+				references: [
+					{
+						archivedKey: "linear:PROJ-9-aa11bb22",
+						source: "linear",
+						nativeId: "PROJ-9",
+						title: "Linear ticket",
+						url: "https://linear.app/x/PROJ-9",
+						referencedAt: "2026-05-14T06:06:01.123Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+					{
+						archivedKey: "jira:KAN-3-aa11bb22",
+						source: "jira",
+						nativeId: "KAN-3",
+						title: "Jira ticket",
+						url: "https://example.atlassian.net/browse/KAN-3",
+						referencedAt: "2026-05-14T06:06:02.123Z",
+						sourceToolName: "mcp__jira__get_issue",
+					},
+				],
+			};
+
+			const result = collectChildReferences([child]);
+
+			expect(result).toHaveLength(2);
+			const linearRef = result.find((r) => r.source === "linear");
+			const jiraRef = result.find((r) => r.source === "jira");
+			expect(linearRef).toMatchObject({
+				archivedKey: "linear:PROJ-9-aa11bb22",
+				source: "linear",
+				nativeId: "PROJ-9",
+				title: "Linear ticket",
+			});
+			expect(jiraRef).toMatchObject({
+				archivedKey: "jira:KAN-3-aa11bb22",
+				source: "jira",
+				nativeId: "KAN-3",
+				title: "Jira ticket",
+			});
+		});
+	});
+
+	describe("storeSummary lock failure", () => {
+		// Covers the `if (!acquired) throw` branch in withRequiredOrphanWriteLock
+		// (SummaryStore.ts L122-123). The same throw shape is shared by every
+		// public write API (storeReferences/storeNotes/storePlans/saveTranscriptsBatch
+		// /migrate*); pinning one caller's path is enough for the helper.
+		it("throws when acquireOrphanWriteLock returns false within timeout", async () => {
+			vi.mocked(acquireOrphanWriteLock).mockResolvedValueOnce(false);
+
+			await expect(storeSummary(createMockSummary())).rejects.toThrow(/could not acquire orphan-write lock/);
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+			expect(releaseOrphanWriteLock).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("storeSummary unionIndexes / unionCatalogs null permutations", () => {
+		// Covers the (writeIndex=null, readIndex=null) and asymmetric branches
+		// at SummaryStore.ts L153-175. Going through the public storeSummary
+		// API rather than exporting the internals.
+
+		function emptyStorage(): StorageProvider {
+			return {
+				readFile: vi.fn(async () => null),
+				writeFiles: vi.fn(async () => undefined),
+				listFiles: vi.fn(async () => []),
+				exists: vi.fn(async () => false),
+				ensure: vi.fn(async () => undefined),
+			} as unknown as StorageProvider;
+		}
+
+		function makeStorageWithIndex(entries: SummaryIndexEntry[]): StorageProvider {
+			const index: SummaryIndex = { version: 3, entries };
+			return {
+				readFile: vi.fn(async (path: string) => {
+					if (path === "index.json") return JSON.stringify(index);
+					return null;
+				}),
+				writeFiles: vi.fn(async () => undefined),
+				listFiles: vi.fn(async () => []),
+				exists: vi.fn(async () => true),
+				ensure: vi.fn(async () => undefined),
+			} as unknown as StorageProvider;
+		}
+
+		it("handles BOTH writeIndex and readIndex being null (fresh dual-write with no shadow yet)", async () => {
+			const writeStorage = emptyStorage();
+			const readStorage = emptyStorage();
+
+			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+
+			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
+			expect(writeFilesMock).toHaveBeenCalledTimes(1);
+			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
+			const indexFile = files.find((f) => f.path === "index.json");
+			const newIndex = JSON.parse(indexFile?.content ?? "{}") as SummaryIndex;
+			// Only the freshly-stored entry — both sides were empty so the
+			// union has nothing to preserve.
+			expect(newIndex.entries.map((e) => e.commitHash)).toEqual(["new"]);
+		});
+
+		it("returns writeIndex when readIndex is null (readStorage exists but has no index yet)", async () => {
+			const writeStorage = makeStorageWithIndex([rootEntry("orphanonly", "Orphan only")]);
+			const readStorage = emptyStorage();
+
+			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+
+			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
+			expect(writeFilesMock).toHaveBeenCalledTimes(1);
+			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
+			const indexFile = files.find((f) => f.path === "index.json");
+			const newIndex = JSON.parse(indexFile?.content ?? "{}") as SummaryIndex;
+			// orphanonly entry must survive; readStorage had no rows to add.
+			expect(newIndex.entries.map((e) => e.commitHash).sort()).toEqual(["new", "orphanonly"]);
+		});
+
+		it("returns readIndex when writeIndex is null (fresh orphan branch with folder-synced shadow)", async () => {
+			const writeStorage = emptyStorage();
+			const readStorage = makeStorageWithIndex([rootEntry("foldersynced", "Folder-synced row")]);
+
+			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+
+			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
+			expect(writeFilesMock).toHaveBeenCalledTimes(1);
+			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
+			const indexFile = files.find((f) => f.path === "index.json");
+			const newIndex = JSON.parse(indexFile?.content ?? "{}") as SummaryIndex;
+			// The folder-only row must be lifted into the orphan write batch
+			// alongside the new commit.
+			expect(newIndex.entries.map((e) => e.commitHash).sort()).toEqual(["foldersynced", "new"]);
+		});
+
+		// unionCatalogs has the same null-permutation branches as unionIndexes
+		// (L168-175). Going through storeSummary again: emit both index.json
+		// AND catalog.json from each mock storage so loadCatalog returns a
+		// non-null value on the appropriate side.
+		function makeStorageWithIndexAndCatalog(
+			entries: SummaryIndexEntry[],
+			catalogEntries: CatalogEntry[],
+		): StorageProvider {
+			const index: SummaryIndex = { version: 3, entries };
+			const catalog: CommitCatalog = { version: 1, entries: catalogEntries };
+			return {
+				readFile: vi.fn(async (path: string) => {
+					if (path === "index.json") return JSON.stringify(index);
+					if (path === "catalog.json") return JSON.stringify(catalog);
+					return null;
+				}),
+				writeFiles: vi.fn(async () => undefined),
+				listFiles: vi.fn(async () => []),
+				exists: vi.fn(async () => true),
+				ensure: vi.fn(async () => undefined),
+			} as unknown as StorageProvider;
+		}
+
+		it("returns writeCatalog when readCatalog is null (catalog only on orphan side)", async () => {
+			const writeStorage = makeStorageWithIndexAndCatalog(
+				[rootEntry("orphanonly", "Orphan only")],
+				[{ commitHash: "orphanonly", recap: "orphan recap" }],
+			);
+			const readStorage = emptyStorage();
+
+			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+
+			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
+			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
+			const catalogFile = files.find((f) => f.path === "catalog.json");
+			const newCatalog = JSON.parse(catalogFile?.content ?? "{}") as CommitCatalog;
+			// Write-side catalog row must survive the union+rewrite.
+			expect(newCatalog.entries.map((e) => e.commitHash)).toContain("orphanonly");
+		});
+
+		it("returns readCatalog when writeCatalog is null (catalog only on folder shadow side)", async () => {
+			const writeStorage = makeStorageWithIndex([rootEntry("orphanrow", "Orphan-only index row")]);
+			const readStorage = makeStorageWithIndexAndCatalog(
+				[rootEntry("foldersynced", "Folder-synced row")],
+				[{ commitHash: "foldersynced", recap: "folder recap" }],
+			);
+
+			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+
+			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
+			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
+			const catalogFile = files.find((f) => f.path === "catalog.json");
+			const newCatalog = JSON.parse(catalogFile?.content ?? "{}") as CommitCatalog;
+			// Read-side catalog row must be lifted into the write batch so the
+			// orphan branch ends up self-complete.
+			expect(newCatalog.entries.map((e) => e.commitHash)).toContain("foldersynced");
+		});
+
+		it("merges entries from both sides when BOTH writeCatalog and readCatalog are populated", async () => {
+			// Pins SummaryStore.ts L172-175 — the actual merge loop in
+			// unionCatalogs. Existing tests cover the early-return null
+			// branches; this one walks the entries from each side into the
+			// merged Map. Write-wins on collision (orphan is system-of-record).
+			const writeStorage = makeStorageWithIndexAndCatalog(
+				[rootEntry("shared", "from orphan"), rootEntry("orphan-only", "Orphan only")],
+				[
+					{ commitHash: "shared", recap: "orphan recap" },
+					{ commitHash: "orphan-only", recap: "orphan-only recap" },
+				],
+			);
+			const readStorage = makeStorageWithIndexAndCatalog(
+				[rootEntry("shared", "from folder"), rootEntry("folder-only", "Folder only")],
+				[
+					{ commitHash: "shared", recap: "folder recap (loses)" },
+					{ commitHash: "folder-only", recap: "folder-only recap" },
+				],
+			);
+
+			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+
+			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
+			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
+			const catalogFile = files.find((f) => f.path === "catalog.json");
+			const newCatalog = JSON.parse(catalogFile?.content ?? "{}") as CommitCatalog;
+			const hashes = newCatalog.entries.map((e) => e.commitHash).sort();
+			// Both sides' unique rows present.
+			expect(hashes).toContain("orphan-only");
+			expect(hashes).toContain("folder-only");
+			expect(hashes).toContain("shared");
+			// Write-wins on the shared row.
+			const shared = newCatalog.entries.find((e) => e.commitHash === "shared");
+			expect(shared?.recap).toBe("orphan recap");
 		});
 	});
 });

@@ -15,12 +15,14 @@ import {
 import type {
 	CommitSummary,
 	E2eTestScenario,
-	LinearIssueCommitRef,
 	NoteReference,
 	PlanReference,
+	ReferenceCommitRef,
+	SourceId,
 	TopicCategory,
 } from "../../../cli/src/Types.js";
 import { buildPrSectionHtml } from "../services/PrCommentService.js";
+import { SOURCE_TITLES } from "./SourceLabels.js";
 import { buildCss } from "./SummaryCssBuilder.js";
 import { buildScript } from "./SummaryScriptBuilder.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
@@ -45,6 +47,12 @@ export interface BuildHtmlOptions {
 	readonly transcriptHashSet?: ReadonlySet<string>;
 	readonly planTranslateSet?: ReadonlySet<string>;
 	readonly noteTranslateSet?: ReadonlySet<string>;
+	/**
+	 * Archived keys of references whose title/body contain CJK characters and
+	 * should get a 🌐 translate button. Keyed on `ReferenceCommitRef.archivedKey`
+	 * (which includes the `<source>:` prefix). Mirrors {@link planTranslateSet}.
+	 */
+	readonly referenceTranslateSet?: ReadonlySet<string>;
 	readonly nonce?: string;
 	/**
 	 * When set, the summary belongs to a non-current repo (Memory Bank
@@ -85,7 +93,13 @@ export function buildHtml(
 	summary: CommitSummary,
 	opts: BuildHtmlOptions = {},
 ): string {
-	const { transcriptHashSet, planTranslateSet, noteTranslateSet, nonce } = opts;
+	const {
+		transcriptHashSet,
+		planTranslateSet,
+		noteTranslateSet,
+		referenceTranslateSet,
+		nonce,
+	} = opts;
 	// Both readonly modes share the same CSS rule that hides destructive
 	// buttons (see SummaryCssBuilder). A panel can in principle be both
 	// foreign AND stale (cross-repo summary whose commit was rewritten in
@@ -142,7 +156,7 @@ ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
 <hr class="separator" />
 ${buildRecapSection(summary.recap)}
 ${buildPrSectionHtml()}
-${buildPlansAndNotesSection(summary.plans, summary.notes, summary.linearIssues, planTranslateSet, noteTranslateSet)}
+${buildPlansAndNotesSection(summary.plans, summary.notes, summary.references ?? [], planTranslateSet, noteTranslateSet, referenceTranslateSet)}
 ${buildE2eTestSection(summary)}
 ${buildSourceCommits(sourceNodes)}
 ${buildTopicsSection(summary, { readOnly })}
@@ -407,18 +421,37 @@ export function buildTopicsSection(
 
 // ─── Plans & Notes Section ───────────────────────────────────────────────────
 
-/** Builds the unified Plans & Notes section with Add dropdown and inline snippet form. */
+/**
+ * Builds the unified Plans & Notes section with Add dropdown and inline
+ * snippet form.
+ *
+ * `references` is the multi-source list of external references. Callers pass
+ * `summary.references ?? []` directly. References are grouped by source (linear
+ * → jira → github → notion) and rendered with the same row layout — every
+ * source goes through the source-agnostic `previewReference` /
+ * `openReferenceExternal` / `loadReference-
+ * Content` / `saveReferenceEdit` / `cancelReferenceEdit` / `removeReference` /
+ * `translateReference` data-action attributes. The five-button-plus-inline-edit
+ * markup mirrors `buildPlanRow` exactly so the CSS classes (`plan-item`,
+ * `plan-header`, `plan-edit-area`, …) are shared.
+ */
 function buildPlansAndNotesSection(
 	plans: ReadonlyArray<PlanReference> | undefined,
 	notes: ReadonlyArray<NoteReference> | undefined,
-	linearIssues: ReadonlyArray<LinearIssueCommitRef> | undefined,
+	references: ReadonlyArray<ReferenceCommitRef> | undefined,
 	planTranslateSet?: ReadonlySet<string>,
 	noteTranslateSet?: ReadonlySet<string>,
+	referenceTranslateSet?: ReadonlySet<string>,
 ): string {
 	const planList = plans ?? [];
 	const noteList = notes ?? [];
-	const linearList = linearIssues ?? [];
-	const totalCount = planList.length + noteList.length + linearList.length;
+	// `references` is always defined when this function is called: buildHtml
+	// passes `summary.references ?? []`. The `?? []` here is kept for
+	// type-safety symmetry with plans/notes; its truthy arm cannot fire in
+	// practice.
+	/* v8 ignore next -- references is always defined by the buildHtml caller (see L139). */
+	const referenceList = references ?? [];
+	const totalCount = planList.length + noteList.length + referenceList.length;
 
 	const planItems = planList
 		.map((p) => {
@@ -475,30 +508,17 @@ function buildPlansAndNotesSection(
 		})
 		.join("\n");
 
-	// Linear issues: mirror the row layout used by plans/notes but with a
-	// distinct action set — open the upstream URL in a browser, open the
-	// captured-at-commit markdown locally, or dissociate from this commit's
-	// summary (data-action "removeLinearIssue"). Linear issues are auto-
-	// detected from MCP tool calls in the transcript and have no inline
-	// editor, so the pencil button is omitted.
-	const linearItems = linearList
-		.map((l) => {
-			const key = l.archivedKey;
-			return `
-  <div class="plan-item" id="linear-${escAttr(key)}">
-    <div class="plan-header">
-      <a class="plan-title plan-title-link" href="#" title="Open Linear issue markdown" data-action="openLinearIssueMarkdown" data-linear-key="${escAttr(key)}" data-linear-ticket="${escAttr(l.ticketId)}">${escHtml(l.ticketId)} &mdash; ${escHtml(l.title)}</a>
-      <span class="plan-header-actions">
-        <button class="topic-action-btn" title="Open in Linear" data-linear-key="${escAttr(key)}" data-linear-url="${escAttr(l.url)}" data-action="openLinearIssue">&#x1F310;</button>
-        <button class="topic-action-btn plan-remove-btn" title="Remove Linear Issue" data-linear-key="${escAttr(key)}" data-linear-ticket="${escAttr(l.ticketId)}" data-action="removeLinearIssue">&#x1F5D1;</button>
-      </span>
-    </div>
-    <div class="plan-meta">${escHtml(key)}.md</div>
-  </div>`;
-		})
+	// External references (Linear / Jira / GitHub / Notion): mirror the
+	// Plan/Note row layout *and* action set — preview the archived markdown,
+	// open the upstream URL in a browser, translate the archived body (if
+	// CJK), inline-edit the archived snapshot, or dissociate from this
+	// commit. All sources share the same `*Reference` data-action names; the
+	// host dispatches by `data-reference-source`.
+	const referenceItems = referencesBySourceOrder(referenceList)
+		.map((e) => buildReferenceRow(e, referenceTranslateSet))
 		.join("\n");
 
-	const allItems = planItems + noteItems + linearItems;
+	const allItems = planItems + noteItems + referenceItems;
 	const countBadge =
 		totalCount > 1 ? ` <span class="section-count">${totalCount}</span>` : "";
 
@@ -533,6 +553,99 @@ function buildPlansAndNotesSection(
 </div>
 <hr class="separator" />
 `;
+}
+
+const HTML_REFERENCE_SOURCE_ORDER: ReadonlyArray<SourceId> = ["linear", "jira", "github", "notion"];
+
+/**
+ * Returns references ordered by source (linear → jira → github → notion),
+ * preserving within-source order. Mirrors `referencesBySourceOrder` in
+ * SummaryMarkdownBuilder so the HTML and Markdown views agree on item order.
+ */
+function referencesBySourceOrder(
+	references: ReadonlyArray<ReferenceCommitRef>,
+): ReadonlyArray<ReferenceCommitRef> {
+	const bySource = new Map<SourceId, Array<ReferenceCommitRef>>();
+	for (const e of references) {
+		const arr = bySource.get(e.source) ?? [];
+		arr.push(e);
+		bySource.set(e.source, arr);
+	}
+	const out: Array<ReferenceCommitRef> = [];
+	for (const source of HTML_REFERENCE_SOURCE_ORDER) {
+		const arr = bySource.get(source);
+		if (arr) out.push(...arr);
+	}
+	return out;
+}
+
+/**
+ * Strips the `<source>:` prefix from `archivedKey` to produce a CSS-friendly
+ * DOM id segment. Applied uniformly across all sources so `reference-<source>-<bare>`
+ * id naming is symmetric — no source-specific carve-out.
+ */
+function stripSourcePrefix(archivedKey: string, source: SourceId): string {
+	const prefix = `${source}:`;
+	return archivedKey.startsWith(prefix) ? archivedKey.slice(prefix.length) : archivedKey;
+}
+
+/**
+ * Renders one reference row. Mirrors the Plan/Note row markup byte-for-byte
+ * (same CSS classes: `plan-item`, `plan-header`, `plan-header-actions`,
+ * `plan-edit-area`, `plan-edit-textarea`, `plan-edit-actions`) so the inline
+ * edit affordances reuse all existing CSS — the row is just "a plan whose
+ * source is external".
+ *
+ * Five buttons on every row (Linear / Jira / GitHub / Notion):
+ *   - Title click → `previewReference` (read-only webview of archived markdown)
+ *   - 🌍 → `openReferenceExternal` (open upstream URL in browser)
+ *   - 🌐 → `translateReference` (conditional; appears only when referenceTranslateSet
+ *     contains the archivedKey)
+ *   - ✎ → `loadReferenceContent` (opens the inline textarea pre-filled with
+ *     the archived markdown body)
+ *   - 🗑 → `removeReference` (splices the reference out of `summary.references[]`)
+ *
+ * `archivedKey` carries the `<source>:` prefix verbatim so the host
+ * dispatches by source without re-parsing. The DOM id is
+ * `reference-<source>-<bareKey>` for every source — the `<source>:` prefix is
+ * stripped uniformly via {@link stripSourcePrefix} so the naming rule is
+ * symmetric and the id stays CSS-selector friendly (no `:` to escape).
+ */
+function buildReferenceRow(
+	e: ReferenceCommitRef,
+	referenceTranslateSet?: ReadonlySet<string>,
+): string {
+	const sourceLabel = SOURCE_TITLES[e.source];
+	// DOM id: strip `<source>:` prefix uniformly across sources so the id
+	// is `reference-<source>-<bareKey>` regardless of source.
+	const domKey = stripSourcePrefix(e.archivedKey, e.source);
+	// DOM/data attributes are the source-agnostic `data-reference-*` set (read
+	// by the dispatcher). The earlier Linear-only `data-linear-*` attributes
+	// were removed alongside the openLinearIssue* / removeLinearIssue
+	// data-actions in favour of the `*Reference` names.
+	const showTranslate = referenceTranslateSet?.has(e.archivedKey) ?? false;
+	const translateBtn = showTranslate
+		? `<button class="topic-action-btn reference-translate-btn" title="Translate to English" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="translateReference">&#x1F310;</button>`
+		: "";
+	return `
+  <div class="plan-item" id="reference-${escAttr(e.source)}-${escAttr(domKey)}">
+    <div class="plan-header">
+      <a class="plan-title plan-title-link" href="#" title="Click to preview" data-action="previewReference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}">${escHtml(e.nativeId)} &mdash; ${escHtml(e.title)}</a>
+      <span class="plan-header-actions">
+        <button class="topic-action-btn" title="Open in ${sourceLabel}" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-url="${escAttr(e.url)}" data-action="openReferenceExternal">&#x1F30D;</button>
+        ${translateBtn}<button class="topic-action-btn plan-edit-btn" title="Edit ${sourceLabel} snapshot" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-action="loadReferenceContent">&#x270E;</button>
+        <button class="topic-action-btn plan-remove-btn" title="Remove ${sourceLabel} Reference" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}" data-reference-native-id="${escAttr(e.nativeId)}" data-reference-title="${escAttr(e.title)}" data-action="removeReference">&#x1F5D1;</button>
+      </span>
+    </div>
+    <div class="plan-meta">${escHtml(e.nativeId)} (${sourceLabel})</div>
+    <div class="plan-edit-area">
+      <textarea class="plan-edit-textarea" data-reference-key="${escAttr(e.archivedKey)}" rows="20"></textarea>
+      <div class="plan-edit-actions">
+        <button class="action-btn" data-action="cancelReferenceEdit" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}">Cancel</button>
+        <button class="action-btn primary" data-action="saveReferenceEdit" data-reference-key="${escAttr(e.archivedKey)}" data-reference-source="${escAttr(e.source)}">Save</button>
+      </div>
+    </div>
+  </div>`;
 }
 
 // ─── E2E Test ──────────────────────────────────────────────────────────

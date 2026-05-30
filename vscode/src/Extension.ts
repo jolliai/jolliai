@@ -65,9 +65,9 @@ import {
 	type MemoryItem,
 } from "./providers/MemoriesTreeProvider.js";
 import type {
-	LinearIssueItem,
 	NoteItem,
 	PlanItem,
+	ReferenceItem,
 } from "./providers/PlansTreeProvider.js";
 import { PlansTreeProvider } from "./providers/PlansTreeProvider.js";
 import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
@@ -921,6 +921,10 @@ export function activate(context: vscode.ExtensionContext): void {
 			await setExcluded(workspaceRoot, "plans", planId, !selected);
 			await plansProvider.refreshExclusions();
 		},
+		applyReferenceCheckbox: async (mapKey, selected) => {
+			await setExcluded(workspaceRoot, "references", mapKey, !selected);
+			await plansProvider.refreshExclusions();
+		},
 		applyNoteCheckbox: async (noteId, selected) => {
 			await setExcluded(workspaceRoot, "notes", noteId, !selected);
 			await plansProvider.refreshExclusions();
@@ -1149,7 +1153,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			const { MigrationEngine } = await import(
 				"../../cli/src/core/MigrationEngine.js"
 			);
-
 			const repoName = extractRepoName(workspaceRoot);
 			const remoteUrl = getRemoteUrl(workspaceRoot);
 			const config = await loadConfig();
@@ -1476,24 +1479,21 @@ export function activate(context: vscode.ExtensionContext): void {
 		workspaceRoot,
 	);
 
-	// Shared resolver for the three Linear-issue webview commands. The webview
+	// Shared resolver for the multi-source reference webview commands. The webview
 	// may dispatch a mapKey that was archived or ignored between render and
-	// click (listLinearIssues applies the branch/ignored/archived filter), so
-	// each command re-reads the list before acting and surfaces a warning
+	// click (bridge.listReferences applies the branch/ignored/archived filter),
+	// so each command re-reads the list before acting and surfaces a warning
 	// toast on miss instead of silently no-op'ing.
-	const resolveLinearIssueForCommand = async (
-		mapKey: string,
-		cmdLabel: string,
-	) => {
-		const issues = await bridge.listLinearIssues();
-		const info = issues.find((i) => i.mapKey === mapKey);
+	const resolveReferenceForCommand = async (mapKey: string, cmdLabel: string) => {
+		const references = await bridge.listReferences();
+		const info = references.find((e) => e.mapKey === mapKey);
 		if (!info) {
 			log.warn(
 				"cmd",
 				`${cmdLabel}: mapKey ${mapKey} not found (likely archived or ignored after webview cached it)`,
 			);
 			vscode.window.showWarningMessage(
-				`Linear issue ${mapKey} is no longer in the active panel — it may have been archived or ignored. Refresh and try again.`,
+				`Reference ${mapKey} is no longer in the active panel — it may have been archived or ignored. Refresh and try again.`,
 			);
 		}
 		return info;
@@ -2271,57 +2271,54 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
-		// ── Linear issue commands ───────────────────────────────────────────────
-		// All three accept either a LinearIssueItem (from native tree) or a bare
-		// mapKey string (from webview). The mapKey is "<ticketId>" pre-archive or
-		// "<ticketId>-<shortHash>" post-archive — see plan §9.10. The webview-
-		// originated mapKey is resolved through `resolveLinearIssueForCommand`
+		// ── Multi-source reference commands ─────────────────────────────────────
+		// All three accept either a ReferenceItem (from native tree) or a bare
+		// mapKey string (from webview). The mapKey is "<source>:<nativeId>"
+		// pre-archive or "<source>:<nativeId>-<shortHash>" post-archive. The
+		// webview-originated mapKey is resolved through `resolveReferenceForCommand`
 		// above so a stale cache hit becomes a warning toast, not a silent no-op.
 
-		/* v8 ignore start -- Linear-issue command-bus glue: each registerCommand callback resolves a stale-mapKey-safe info and delegates to a bridge method that has its own unit tests. Exercising the registerCommand wrappers themselves needs a real vscode command bus */
+		/* v8 ignore start -- reference command-bus glue: each registerCommand callback resolves a stale-mapKey-safe info and delegates to a bridge method that has its own unit tests. Exercising the registerCommand wrappers themselves needs a real vscode command bus */
 		vscode.commands.registerCommand(
-			"jollimemory.openLinearIssue",
-			async (itemOrKey: LinearIssueItem | string) => {
+			"jollimemory.openReferenceInBrowser",
+			async (itemOrKey: ReferenceItem | string) => {
 				const mapKey =
-					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.issue.mapKey;
-				log.info("cmd", `openLinearIssue: ${mapKey}`);
-				const info = await resolveLinearIssueForCommand(
+					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.reference.mapKey;
+				log.info("cmd", `openReferenceInBrowser: ${mapKey}`);
+				const info = await resolveReferenceForCommand(
 					mapKey,
-					"openLinearIssue",
+					"openReferenceInBrowser",
 				);
-				if (info) await bridge.openLinearIssue(info);
+				if (info) await bridge.openReferenceInBrowser(info);
 			},
 		),
 
 		vscode.commands.registerCommand(
-			"jollimemory.openLinearIssueMarkdown",
-			async (itemOrKey: LinearIssueItem | string) => {
+			"jollimemory.openReferenceMarkdown",
+			async (itemOrKey: ReferenceItem | string) => {
 				const mapKey =
-					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.issue.mapKey;
-				log.info("cmd", `openLinearIssueMarkdown: ${mapKey}`);
-				const info = await resolveLinearIssueForCommand(
+					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.reference.mapKey;
+				log.info("cmd", `openReferenceMarkdown: ${mapKey}`);
+				const info = await resolveReferenceForCommand(
 					mapKey,
-					"openLinearIssueMarkdown",
+					"openReferenceMarkdown",
 				);
-				if (info) await bridge.openLinearIssueMarkdown(info);
+				if (info) await bridge.openReferenceMarkdown(info);
 			},
 		),
 
 		vscode.commands.registerCommand(
-			"jollimemory.ignoreLinearIssue",
-			async (itemOrKey: LinearIssueItem | string) => {
+			"jollimemory.ignoreReference",
+			async (itemOrKey: ReferenceItem | string) => {
 				const mapKey =
-					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.issue.mapKey;
-				log.info("cmd", `ignoreLinearIssue: ${mapKey}`);
-				// Same stale-mapKey guard as openLinearIssue / openLinearIssueMarkdown:
-				// without this the LinearIssueService.setLinearIssueIgnored "entry not
-				// found → silent return" path swallowed the click with zero feedback.
-				const info = await resolveLinearIssueForCommand(
-					mapKey,
-					"ignoreLinearIssue",
-				);
+					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.reference.mapKey;
+				log.info("cmd", `ignoreReference: ${mapKey}`);
+				// Same stale-mapKey guard as the open commands: without this the
+				// ReferenceService.setReferenceIgnored "entry not found → silent return"
+				// path would swallow the click with zero feedback.
+				const info = await resolveReferenceForCommand(mapKey, "ignoreReference");
 				if (!info) return;
-				await bridge.ignoreLinearIssue(mapKey);
+				await bridge.ignoreReference(mapKey);
 				await plansStore.refresh();
 			},
 		),

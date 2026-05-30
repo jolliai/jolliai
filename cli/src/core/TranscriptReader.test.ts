@@ -8,11 +8,23 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
+// Capture the module logger so the transcript-budget diagnostic can be asserted.
+const { mockLogInfo } = vi.hoisted(() => ({ mockLogInfo: vi.fn() }));
+vi.mock("../Logger.js", () => ({
+	createLogger: () => ({
+		info: mockLogInfo,
+		warn: vi.fn(),
+		debug: vi.fn(),
+		error: vi.fn(),
+	}),
+}));
+
 import type { TranscriptEntry } from "../Types.js";
 import type { SessionTranscript } from "./TranscriptReader.js";
 import {
 	buildConversationContext,
 	buildMultiSessionContext,
+	DEFAULT_MAX_CHARS,
 	parseTranscriptLine,
 	readTranscript,
 } from "./TranscriptReader.js";
@@ -431,6 +443,57 @@ describe("TranscriptReader", () => {
 	});
 
 	describe("buildMultiSessionContext", () => {
+		it("defaults the conversation budget to 150K chars (sized for the model window)", () => {
+			// Lowered from 200K so a large squash-commit regenerate's prompt
+			// (whole-tree transcripts + diff) stays inside the 180s wall-clock.
+			expect(DEFAULT_MAX_CHARS).toBe(150000);
+		});
+
+		it("logs how many transcript entries were dropped when the conversation exceeds the budget", () => {
+			mockLogInfo.mockClear();
+			const sessions: SessionTranscript[] = [
+				{
+					sessionId: "sess-1",
+					transcriptPath: "/path/1.jsonl",
+					entries: [{ role: "human", content: "A".repeat(200), timestamp: "2026-02-23T09:00:00Z" }],
+				},
+				{
+					sessionId: "sess-2",
+					transcriptPath: "/path/2.jsonl",
+					entries: [{ role: "human", content: "B".repeat(50), timestamp: "2026-02-23T10:00:00Z" }],
+				},
+			];
+			// Budget 100 fits only the shorter, newer sess-2 entry; the 200-char
+			// sess-1 entry is dropped. That drop used to be invisible in debug.log.
+			buildMultiSessionContext(sessions, 100);
+			const budgetLog = mockLogInfo.mock.calls.find(
+				(c) => typeof c[0] === "string" && c[0].includes("budget reached"),
+			);
+			expect(budgetLog).toEqual([
+				expect.stringContaining("budget reached"),
+				1, // kept
+				2, // total
+				expect.any(Number), // used chars
+				100, // budget
+			]);
+		});
+
+		it("does not emit the budget diagnostic when every entry fits", () => {
+			mockLogInfo.mockClear();
+			const sessions: SessionTranscript[] = [
+				{
+					sessionId: "sess-1",
+					transcriptPath: "/path/1.jsonl",
+					entries: [{ role: "human", content: "hi", timestamp: "2026-02-23T10:00:00Z" }],
+				},
+			];
+			buildMultiSessionContext(sessions);
+			const budgetLog = mockLogInfo.mock.calls.find(
+				(c) => typeof c[0] === "string" && c[0].includes("budget reached"),
+			);
+			expect(budgetLog).toBeUndefined();
+		});
+
 		it("should merge two sessions with entries ordered by timestamp", () => {
 			const sessions: SessionTranscript[] = [
 				{
@@ -511,9 +574,10 @@ describe("TranscriptReader", () => {
 			expect(result).toContain("</session>");
 		});
 
-		it("should wrap output in <transcript> tags", () => {
-			// <transcript> tags are added here so the caller (buildSummarizationPrompt)
-			// can embed the result directly without adding extra markup.
+		it("does NOT self-wrap in <transcript> tags — the prompt template owns that wrapper", () => {
+			// The summarize template already wraps {{conversation}} in <transcript>
+			// tags, so wrapping here too produced a double <transcript><transcript>.
+			// This function returns the bare <session> blocks; the template wraps.
 			const sessions: SessionTranscript[] = [
 				{
 					sessionId: "sess-1",
@@ -522,8 +586,9 @@ describe("TranscriptReader", () => {
 				},
 			];
 			const result = buildMultiSessionContext(sessions);
-			expect(result).toMatch(/^<transcript>\n/);
-			expect(result).toMatch(/\n<\/transcript>$/);
+			expect(result).not.toMatch(/^<transcript>/);
+			expect(result).not.toContain("</transcript>");
+			expect(result).toMatch(/^<session id="sess-1"/);
 		});
 
 		it("should return empty string (no tags) when there are no entries", () => {
@@ -662,6 +727,52 @@ describe("TranscriptReader", () => {
 
 			const result = buildMultiSessionContext(sessions, 10_000);
 			expect(result.indexOf("first without timestamp")).toBeLessThan(result.indexOf("second without timestamp"));
+		});
+
+		it("uses a budget far above the old 50K cap so large conversations are not clipped to the newest slice", () => {
+			// 35 turns x ~2018 chars = ~70K. Under the old 50K default only the
+			// newest ~24 turns survived (the oldest, MARKER0.., were dropped). The
+			// raised default keeps the whole conversation.
+			const entries = Array.from({ length: 35 }, (_, i) => ({
+				role: "human" as const,
+				content: `MARKER${i}-${"x".repeat(2000)}`,
+				timestamp: `2026-02-23T10:00:${String(i).padStart(2, "0")}Z`,
+			}));
+			const sessions: SessionTranscript[] = [{ sessionId: "big", transcriptPath: "/p/big.jsonl", entries }];
+			const result = buildMultiSessionContext(sessions);
+			expect(result).toContain("MARKER34-"); // newest — present either way
+			expect(result).toContain("MARKER0-"); // oldest — only survives the raised budget
+		});
+
+		it("distributes the budget fairly across sessions so the newest session does not starve the others", () => {
+			const sessions: SessionTranscript[] = [
+				{
+					sessionId: "newest-big",
+					transcriptPath: "/p/big.jsonl",
+					entries: [
+						{ role: "human", content: `BIG-A-${"x".repeat(2000)}`, timestamp: "2026-02-23T12:00:00Z" },
+						{ role: "human", content: `BIG-B-${"x".repeat(2000)}`, timestamp: "2026-02-23T12:01:00Z" },
+					],
+				},
+				{
+					sessionId: "middle-small",
+					transcriptPath: "/p/mid.jsonl",
+					entries: [{ role: "human", content: "MIDDLE-MARKER", timestamp: "2026-02-23T11:00:00Z" }],
+				},
+				{
+					sessionId: "oldest-small",
+					transcriptPath: "/p/old.jsonl",
+					entries: [{ role: "human", content: "OLDEST-MARKER", timestamp: "2026-02-23T10:00:00Z" }],
+				},
+			];
+			// Budget fits the newest session's newest big entry plus both small
+			// entries, but NOT its second big entry. Old global newest-first greedy
+			// spent the whole budget on the newest session, starving the others.
+			const result = buildMultiSessionContext(sessions, 2500);
+			expect(result).toContain('<session id="newest-big"');
+			expect(result).toContain('<session id="middle-small"');
+			expect(result).toContain('<session id="oldest-small"');
+			expect(result).toContain("OLDEST-MARKER");
 		});
 	});
 

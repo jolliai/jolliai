@@ -143,6 +143,37 @@ export function escAttr(str: string): string {
 		.replace(/>/g, "&gt;");
 }
 
+// ─── Markdown escaping ──────────────────────────────────────────────────────────
+
+/**
+ * Escapes text for safe use as Markdown link text `[…]`. Untrusted reference
+ * titles come from external trackers (Jira/Linear/GitHub/Notion), so a title
+ * like `x](http://evil)` must not break out of the link and inject a phishing
+ * link. Backslash-escapes `\ [ ]` and folds newlines so the line stays intact.
+ */
+export function escMdLinkText(str: string): string {
+	return str.replace(/[\\[\]]/g, "\\$&").replace(/[\r\n]+/g, " ");
+}
+
+/**
+ * Escapes an untrusted URL for safe use inside a Markdown link target `(…)`.
+ * Percent-encodes the structure-breaking characters (parens, whitespace,
+ * angle brackets, quote) so a crafted URL cannot close the link early or be
+ * reinterpreted as a link title. Scheme is already whitelisted upstream
+ * (`^https?://` in the adapters), so this only guards the link structure.
+ */
+export function escMdUrl(str: string): string {
+	return str.replace(/[()\s<>"]/g, (c) => {
+		// encodeURIComponent leaves "(" / ")" unencoded (they are RFC 2396
+		// unreserved marks), so percent-encode the parens explicitly; the rest
+		// (spaces, angle brackets, quote, unicode whitespace) go through
+		// encodeURIComponent for correct UTF-8 byte encoding.
+		if (c === "(") return "%28";
+		if (c === ")") return "%29";
+		return encodeURIComponent(c);
+	});
+}
+
 // ─── Date helpers (UI-specific) ───────────────────────────────────────────────
 
 /** Returns a relative time string like "3 hours ago", "Yesterday", "5 days ago". */

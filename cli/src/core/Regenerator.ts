@@ -1,15 +1,17 @@
 import { createLogger } from "../Logger.js";
-import type { CommitSummary, LlmConfig } from "../Types.js";
+import type { CommitSummary, LlmConfig, Reference, ReferenceCommitRef, SourceId } from "../Types.js";
 import { getDiffContent } from "./GitOps.js";
-import { truncate } from "./LinearIssueExtractor.js";
 import { escapeForAttr, escapeForText } from "./PromptXmlEscape.js";
+import { truncate } from "./references/ReferenceExtractor.js";
+import { readReferenceMarkdownFromString } from "./references/ReferenceStore.js";
+import { ALL_ADAPTERS } from "./references/sources/index.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { generateSummary, type SummaryResult } from "./Summarizer.js";
 import {
 	normalizeToV4,
-	readLinearIssueFromBranch,
 	readNoteFromBranch,
 	readPlanFromBranch,
+	readReferenceFromBranch,
 	readTranscriptsForCommits,
 } from "./SummaryStore.js";
 import { getTranscriptIds } from "./SummaryTree.js";
@@ -34,7 +36,7 @@ export interface RegenerateResult {
  *
  * Fields replaced:        topics, recap, diffStats, transcriptEntries,
  *                         conversationTurns, llm, generatedAt
- * Fields preserved:       ticketId, e2eTestGuide, plans, notes, linearIssues,
+ * Fields preserved:       ticketId, e2eTestGuide, plans, notes, references,
  *                         commitType, commitSource, jolliDocUrl, jolliDocId,
  *                         orphanedDocIds, everything else on root.
  *
@@ -104,8 +106,8 @@ export async function regenerateSummary(
 	const conversation = buildMultiSessionContext(sessions);
 	const diff = await getDiffContent(`${normalized.commitHash}~1`, normalized.commitHash, cwd);
 
-	const [linearIssues, plans, notes] = await Promise.all([
-		rebuildLinearBlock(normalized, cwd, storage),
+	const [referenceBlocks, plans, notes] = await Promise.all([
+		rebuildReferenceBlocks(normalized, cwd, storage),
 		rebuildPlansBlock(normalized, cwd, storage),
 		rebuildNotesBlock(normalized, cwd, storage),
 	]);
@@ -130,7 +132,7 @@ export async function regenerateSummary(
 		diffStats: normalized.diffStats ?? normalized.stats ?? { filesChanged: 0, insertions: 0, deletions: 0 },
 		transcriptEntries: totalEntries,
 		conversationTurns: humanTurns,
-		linearIssues,
+		referenceBlocks,
 		plans,
 		notes,
 		config,
@@ -161,19 +163,18 @@ export async function regenerateSummary(
 // ─── Prompt-block reconstruction from orphan-branch archives ────────────────
 //
 // These helpers intentionally build a SIMPLIFIED XML block rather than reusing
-// `formatPlansBlock` / `formatNotesBlock` / `formatLinearIssuesBlock`. The
-// existing formatters read content via `entry.sourcePath` (disk file paths),
-// but on regenerate we want the orphan-branch archive as the system of record
-// — sourcePath may be stale or missing. The simplified block preserves the
-// tag shape (`<plans>`, `<notes>`, `<linear-issues>`) so the SUMMARIZE prompt
-// template's placeholders collapse the same way.
+// the existing prompt formatters. The formatters read content via
+// `entry.sourcePath` (disk file paths), but on regenerate we want the orphan-
+// branch archive as the system of record — sourcePath may be stale or missing.
+// The simplified block preserves the source-agnostic tag shape so the
+// SUMMARIZE prompt template's placeholders collapse the same way.
 //
-// All three helpers receive a NORMALIZED summary, so root.{plans,notes,
-// linearIssues} are already the authoritative tree-wide union.
+// All helpers receive a NORMALIZED summary, so root.{plans, notes, references}
+// are already the authoritative tree-wide union.
 
 // Budgets — must stay aligned with the first-run formatters byte-for-byte.
 // See PlanPromptFormatter.ts:18-19, NotePromptFormatter.ts:18-19, and
-// LinearIssueExtractor.ts:57-58 for the source-of-truth defaults. Without
+// ReferenceExtractor.ts:57-58 for the source-of-truth defaults. Without
 // these caps a single pathologically large plan / note / linear issue could
 // blow out the SUMMARIZE prompt's token budget and inflate cost. Drifting
 // from first-run also makes summary-quality A/B comparison apples-to-oranges
@@ -182,47 +183,118 @@ const PLAN_MAX_CHARS = 20000;
 const PLAN_TOTAL_CHARS = 60000;
 const NOTE_MAX_CHARS = 4000;
 const NOTE_TOTAL_CHARS = 12000;
-const LINEAR_MAX_CHARS = 4000;
-const LINEAR_TOTAL_CHARS = 30000;
 
-async function rebuildLinearBlock(
+/**
+ * Multi-source reference-block reconstruction for regenerate.
+ *
+ * Reads each `ReferenceCommitRef` archived for this commit straight from the
+ * orphan branch, parses the markdown frontmatter back to a `Reference`,
+ * then groups by source and delegates rendering to the same `SourceAdapter`s
+ * the first-run path uses. The resulting blocks are concatenated in stable
+ * adapter-registration order (`ALL_ADAPTERS`), so the LLM sees byte-identical
+ * output to the first-run path for single-source commits.
+ *
+ * Missing orphan-branch markdown for a single reference is silently skipped
+ * (with a warn log) so a half-migrated archive doesn't fail the whole
+ * regenerate.
+ */
+async function rebuildReferenceBlocks(
 	summary: CommitSummary,
 	cwd: string,
 	storage: StorageProvider | undefined,
 ): Promise<string> {
-	const refs = summary.linearIssues ?? [];
+	const refs: ReadonlyArray<ReferenceCommitRef> = summary.references ?? [];
 	if (refs.length === 0) return "";
-	// Newest reference first; selection is greedy until LINEAR_TOTAL_CHARS,
-	// dropped refs silently omitted (user already saw the count in the
-	// confirm dialog; skipping the oldest is the safer of two over-budget
-	// outcomes vs. arbitrary mid-truncation).
-	// Defensive `?? ""` against legacy fixtures or v3 data missing the
-	// timestamp — the sort doesn't promise stable ordering for those, but
-	// it must not crash.
-	const sorted = [...refs].sort((a, b) => (b.referencedAt ?? "").localeCompare(a.referencedAt ?? ""));
 
-	const rendered: string[] = [];
-	let totalLen = 0;
-	for (const ref of sorted) {
-		const md = await readLinearIssueFromBranch(ref.archivedKey, cwd, storage);
-		if (md === null) continue;
-		const body = truncate(md, LINEAR_MAX_CHARS);
-		const block = [
-			`<issue id="${escapeForAttr(ref.ticketId)}">`,
-			`  <title>${escapeForText(ref.title)}</title>`,
-			`  <url>${escapeForText(ref.url ?? "")}</url>`,
-			"  <archived-markdown>",
-			escapeForText(body),
-			"  </archived-markdown>",
-			"</issue>",
-		].join("\n");
-		if (totalLen + block.length > LINEAR_TOTAL_CHARS) break;
-		rendered.push(block);
-		totalLen += block.length;
+	const bySource = new Map<SourceId, Reference[]>();
+	for (const ref of refs) {
+		const md = await readReferenceFromBranch(ref.source, ref.archivedKey, cwd, storage);
+		if (md === null) {
+			log.warn(
+				"rebuildReferenceBlocks: orphan-branch markdown missing for %s (%s) — skipping",
+				ref.archivedKey,
+				ref.source,
+			);
+			continue;
+		}
+		const parsed = readReferenceMarkdownFromString(md);
+		// Defensive `?? ""` against legacy fixtures missing the field —
+		// adapters call .replace() / .localeCompare() on these values and
+		// would crash on undefined. Behavior matches the pre-refactor
+		// rebuildLinearBlock which used the same `?? ""` defaults.
+		const safeTitle = ref.title ?? "";
+		const safeUrl = ref.url ?? "";
+		const safeReferencedAt = ref.referencedAt ?? "";
+		const safeToolName = ref.sourceToolName ?? "";
+		let reference: Reference;
+		if (parsed !== null) {
+			// Truncate the description so the prompt budget stays aligned with
+			// the adapter's per-reference cap. The adapter's renderPromptBlock
+			// applies its own cap too; truncating up-front keeps the block
+			// total predictable when many references all carry oversized bodies.
+			const maxChars = sourceMaxChars(ref.source);
+			const desc = parsed.description !== undefined ? truncate(parsed.description, maxChars) : undefined;
+			reference = {
+				...parsed,
+				...(desc !== undefined ? { description: desc } : {}),
+				// Override identity / metadata from the commit-time ref so
+				// title / url changes since archival don't leak into the
+				// prompt, mirroring the first-run path which uses the
+				// extractor's snapshot.
+				title: safeTitle,
+				url: safeUrl,
+				referencedAt: safeReferencedAt,
+				toolName: safeToolName,
+				...(ref.status !== undefined ? { status: ref.status } : {}),
+				...(ref.priority !== undefined ? { priority: ref.priority } : {}),
+				...(ref.labels !== undefined ? { labels: ref.labels } : {}),
+			};
+		} else {
+			// Markdown frontmatter unparseable (corrupted or older shape):
+			// synthesise a minimal Reference from the commit-time metadata
+			// and embed the raw body as description so the LLM still sees
+			// something. Mirrors the legacy rebuildLinearBlock fallback that
+			// wrapped raw markdown in `<archived-markdown>`.
+			const maxChars = sourceMaxChars(ref.source);
+			reference = {
+				mapKey: ref.archivedKey,
+				source: ref.source,
+				nativeId: ref.nativeId,
+				title: safeTitle,
+				url: safeUrl,
+				referencedAt: safeReferencedAt,
+				toolName: safeToolName,
+				description: truncate(md, maxChars),
+				...(ref.status !== undefined ? { status: ref.status } : {}),
+				...(ref.priority !== undefined ? { priority: ref.priority } : {}),
+				...(ref.labels !== undefined ? { labels: ref.labels } : {}),
+			};
+		}
+		const bucket = bySource.get(ref.source);
+		if (bucket) bucket.push(reference);
+		else bySource.set(ref.source, [reference]);
 	}
-	if (rendered.length === 0) return "";
-	return `<linear-issues>\n${rendered.join("\n")}\n</linear-issues>`;
+
+	const blocks: string[] = [];
+	for (const adapter of ALL_ADAPTERS) {
+		const sourceRefs = bySource.get(adapter.id);
+		if (!sourceRefs || sourceRefs.length === 0) continue;
+		const block = adapter.renderPromptBlock(sourceRefs);
+		/* v8 ignore start -- adapter.renderPromptBlock returns "" only when refs is empty (we skip that above) or when every ref exceeds the total budget; defensive append-guard for a corner case that never fires in practice. */
+		if (block.length > 0) blocks.push(block);
+		/* v8 ignore stop */
+	}
+	return blocks.join("\n");
 }
+
+/* v8 ignore start -- sourceMaxChars iterates ALL_ADAPTERS to find a matching id. Linear-only adapter registration means the first iteration always matches; the "no match" branch and the final fallback only become reachable when a future SourceId ships without an adapter, which is unreachable today. */
+function sourceMaxChars(source: SourceId): number {
+	for (const adapter of ALL_ADAPTERS) {
+		if (adapter.id === source) return adapter.maxCharsPerReference;
+	}
+	return 4000;
+}
+/* v8 ignore stop */
 
 async function rebuildPlansBlock(
 	summary: CommitSummary,

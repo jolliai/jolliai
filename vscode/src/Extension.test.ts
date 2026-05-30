@@ -294,14 +294,14 @@ const {
 		// that don't care about storage threading.
 		createStorageForRepo: vi.fn().mockResolvedValue(null),
 		createReadStorageForCurrentRepo: vi.fn().mockResolvedValue(null),
-		// Linear-issue surface — used by the three Linear-issue commands and the
-		// shared resolveLinearIssueForCommand helper. Default: empty list so the
-		// "not found" warning branch is the test-driven path; tests that want
-		// the resolve+forward path push entries with mockResolvedValueOnce.
-		listLinearIssues: vi.fn().mockResolvedValue([]),
-		openLinearIssue: vi.fn().mockResolvedValue(undefined),
-		openLinearIssueMarkdown: vi.fn().mockResolvedValue(undefined),
-		ignoreLinearIssue: vi.fn().mockResolvedValue(undefined),
+		// Multi-source reference surface — used by the reference commands
+		// (resolveReferenceForCommand resolves a webview mapKey through
+		// listReferences, then routes to the open/ignore handlers). Default:
+		// empty list so the "not found" warning branch is the test-driven path.
+		listReferences: vi.fn().mockResolvedValue([]),
+		openReferenceInBrowser: vi.fn().mockResolvedValue(undefined),
+		openReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
+		ignoreReference: vi.fn().mockResolvedValue(undefined),
 	};
 
 	const mockCommitCommand_ = { execute: vi.fn().mockResolvedValue(undefined) };
@@ -1731,6 +1731,7 @@ describe("Extension", () => {
 		});
 	});
 
+
 	// ── Command handlers ────────────────────────────────────────────────
 
 	describe("command handlers", () => {
@@ -1939,137 +1940,139 @@ describe("Extension", () => {
 			});
 		});
 
-		// ── Linear-issue commands ──────────────────────────────────────────────
-		// Three thin command wrappers that share `resolveLinearIssueForCommand`.
+		// ── Multi-source entity commands ───────────────────────────────────────
+		// Three thin command wrappers that share `resolveEntityForCommand`.
 		// Pinned together because the wrapping logic is identical: typeof-narrow
 		// the arg into a mapKey, log, resolve, dispatch. A regression in any
 		// branch tends to break all three; the tests exercise both the "resolved"
-		// path (bridge.openLinearIssue is called) and the "missing" path (warning
-		// modal, no dispatch).
+		// path (bridge.openReferenceInBrowser / Markdown / ignoreReference is called)
+		// and the "missing" path (warning modal, no dispatch).
 
-		describe("Linear-issue commands", () => {
+		describe("Entity commands", () => {
 			beforeEach(() => {
-				mockBridge.listLinearIssues.mockReset().mockResolvedValue([]);
-				mockBridge.openLinearIssue.mockClear();
-				mockBridge.openLinearIssueMarkdown.mockClear();
-				mockBridge.ignoreLinearIssue.mockClear();
+				mockBridge.listReferences.mockReset().mockResolvedValue([]);
+				mockBridge.openReferenceInBrowser.mockClear();
+				mockBridge.openReferenceMarkdown.mockClear();
+				mockBridge.ignoreReference.mockClear();
 				showWarningMessage.mockClear();
 			});
 
-			it("openLinearIssue: dispatches to bridge when mapKey resolves", async () => {
+			it("openReferenceInBrowser: dispatches to bridge when mapKey resolves", async () => {
 				const info = {
-					mapKey: "ENG-1",
-					issue: { mapKey: "ENG-1", url: "https://linear.app/x" },
+					mapKey: "linear:ENG-1",
+					source: "linear",
+					url: "https://linear.app/x",
 				};
-				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+				mockBridge.listReferences.mockResolvedValueOnce([info as never]);
 
-				const handler = getRegisteredCommand("jollimemory.openLinearIssue");
-				await handler("ENG-1");
+				const handler = getRegisteredCommand(
+					"jollimemory.openReferenceInBrowser",
+				);
+				await handler("linear:ENG-1");
 
-				expect(mockBridge.openLinearIssue).toHaveBeenCalledWith(info);
+				expect(mockBridge.openReferenceInBrowser).toHaveBeenCalledWith(info);
 				expect(showWarningMessage).not.toHaveBeenCalled();
 			});
 
-			it("openLinearIssue: shows a warning toast when mapKey is no longer in the list", async () => {
-				const handler = getRegisteredCommand("jollimemory.openLinearIssue");
-				await handler("ENG-archived");
+			it("openReferenceInBrowser: shows a warning toast when mapKey is no longer in the list", async () => {
+				const handler = getRegisteredCommand(
+					"jollimemory.openReferenceInBrowser",
+				);
+				await handler("linear:ENG-archived");
 
 				expect(showWarningMessage).toHaveBeenCalledWith(
-					expect.stringContaining("ENG-archived"),
+					expect.stringContaining("linear:ENG-archived"),
 				);
-				expect(mockBridge.openLinearIssue).not.toHaveBeenCalled();
+				expect(mockBridge.openReferenceInBrowser).not.toHaveBeenCalled();
 			});
 
-			it("openLinearIssue: extracts mapKey from a LinearIssueItem object", async () => {
+			it("openReferenceInBrowser: extracts mapKey from an ReferenceItem object", async () => {
 				const info = {
-					mapKey: "ENG-2",
-					issue: { mapKey: "ENG-2", url: "https://linear.app/y" },
+					mapKey: "jira:KAN-5",
+					source: "jira",
+					url: "https://example.atlassian.net/browse/KAN-5",
 				};
-				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
-
-				const handler = getRegisteredCommand("jollimemory.openLinearIssue");
-				await handler({ issue: { mapKey: "ENG-2" } });
-
-				expect(mockBridge.openLinearIssue).toHaveBeenCalledWith(info);
-			});
-
-			it("openLinearIssueMarkdown: dispatches to bridge when mapKey resolves", async () => {
-				const info = {
-					mapKey: "ENG-3",
-					issue: { mapKey: "ENG-3" },
-				};
-				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+				mockBridge.listReferences.mockResolvedValueOnce([info as never]);
 
 				const handler = getRegisteredCommand(
-					"jollimemory.openLinearIssueMarkdown",
+					"jollimemory.openReferenceInBrowser",
 				);
-				await handler("ENG-3");
+				await handler({ reference: { mapKey: "jira:KAN-5" } });
 
-				expect(mockBridge.openLinearIssueMarkdown).toHaveBeenCalledWith(info);
+				expect(mockBridge.openReferenceInBrowser).toHaveBeenCalledWith(info);
 			});
 
-			it("openLinearIssueMarkdown: extracts mapKey from a LinearIssueItem object", async () => {
+			it("openReferenceMarkdown: dispatches to bridge when mapKey resolves", async () => {
 				const info = {
-					mapKey: "ENG-md-2",
-					issue: { mapKey: "ENG-md-2" },
+					mapKey: "github:owner/repo#42",
+					source: "github",
 				};
-				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+				mockBridge.listReferences.mockResolvedValueOnce([info as never]);
 
-				const handler = getRegisteredCommand(
-					"jollimemory.openLinearIssueMarkdown",
-				);
-				await handler({ issue: { mapKey: "ENG-md-2" } });
+				const handler = getRegisteredCommand("jollimemory.openReferenceMarkdown");
+				await handler("github:owner/repo#42");
 
-				expect(mockBridge.openLinearIssueMarkdown).toHaveBeenCalledWith(info);
+				expect(mockBridge.openReferenceMarkdown).toHaveBeenCalledWith(info);
 			});
 
-			it("ignoreLinearIssue: extracts mapKey from a LinearIssueItem object", async () => {
+			it("openReferenceMarkdown: extracts mapKey from an ReferenceItem object", async () => {
 				const info = {
-					mapKey: "ENG-ign-2",
-					issue: { mapKey: "ENG-ign-2" },
+					mapKey: "notion:abc123",
+					source: "notion",
 				};
-				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+				mockBridge.listReferences.mockResolvedValueOnce([info as never]);
+
+				const handler = getRegisteredCommand("jollimemory.openReferenceMarkdown");
+				await handler({ reference: { mapKey: "notion:abc123" } });
+
+				expect(mockBridge.openReferenceMarkdown).toHaveBeenCalledWith(info);
+			});
+
+			it("ignoreReference: extracts mapKey from an ReferenceItem object", async () => {
+				const info = {
+					mapKey: "linear:ENG-ign-2",
+					source: "linear",
+				};
+				mockBridge.listReferences.mockResolvedValueOnce([info as never]);
 				mockPlansStore.refresh.mockClear();
 
-				const handler = getRegisteredCommand("jollimemory.ignoreLinearIssue");
-				await handler({ issue: { mapKey: "ENG-ign-2" } });
+				const handler = getRegisteredCommand("jollimemory.ignoreReference");
+				await handler({ reference: { mapKey: "linear:ENG-ign-2" } });
 
-				expect(mockBridge.ignoreLinearIssue).toHaveBeenCalledWith("ENG-ign-2");
+				expect(mockBridge.ignoreReference).toHaveBeenCalledWith("linear:ENG-ign-2");
 				expect(mockPlansStore.refresh).toHaveBeenCalled();
 			});
 
-			it("openLinearIssueMarkdown: warns on miss without dispatching", async () => {
-				const handler = getRegisteredCommand(
-					"jollimemory.openLinearIssueMarkdown",
-				);
-				await handler("ENG-missing");
+			it("openReferenceMarkdown: warns on miss without dispatching", async () => {
+				const handler = getRegisteredCommand("jollimemory.openReferenceMarkdown");
+				await handler("linear:ENG-missing");
 
 				expect(showWarningMessage).toHaveBeenCalledWith(
-					expect.stringContaining("ENG-missing"),
+					expect.stringContaining("linear:ENG-missing"),
 				);
-				expect(mockBridge.openLinearIssueMarkdown).not.toHaveBeenCalled();
+				expect(mockBridge.openReferenceMarkdown).not.toHaveBeenCalled();
 			});
 
-			it("ignoreLinearIssue: marks the issue ignored and refreshes plans", async () => {
+			it("ignoreReference: marks the entity ignored and refreshes plans", async () => {
 				const info = {
-					mapKey: "ENG-4",
-					issue: { mapKey: "ENG-4" },
+					mapKey: "linear:ENG-4",
+					source: "linear",
 				};
-				mockBridge.listLinearIssues.mockResolvedValueOnce([info as never]);
+				mockBridge.listReferences.mockResolvedValueOnce([info as never]);
 				mockPlansStore.refresh.mockClear();
 
-				const handler = getRegisteredCommand("jollimemory.ignoreLinearIssue");
-				await handler("ENG-4");
+				const handler = getRegisteredCommand("jollimemory.ignoreReference");
+				await handler("linear:ENG-4");
 
-				expect(mockBridge.ignoreLinearIssue).toHaveBeenCalledWith("ENG-4");
+				expect(mockBridge.ignoreReference).toHaveBeenCalledWith("linear:ENG-4");
 				expect(mockPlansStore.refresh).toHaveBeenCalled();
 			});
 
-			it("ignoreLinearIssue: no-op when mapKey is no longer in the list", async () => {
-				const handler = getRegisteredCommand("jollimemory.ignoreLinearIssue");
-				await handler("ENG-gone");
+			it("ignoreReference: no-op when mapKey is no longer in the list", async () => {
+				const handler = getRegisteredCommand("jollimemory.ignoreReference");
+				await handler("linear:ENG-gone");
 
-				expect(mockBridge.ignoreLinearIssue).not.toHaveBeenCalled();
+				expect(mockBridge.ignoreReference).not.toHaveBeenCalled();
 			});
 		});
 

@@ -1,4 +1,4 @@
-import type { CommitSummary } from "../Types.js";
+import type { CommitSummary, SourceId } from "../Types.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { normalizeToV4, readTranscriptsForCommits } from "./SummaryStore.js";
 import { getTranscriptIds } from "./SummaryTree.js";
@@ -17,9 +17,11 @@ import { transcriptSourceLabel } from "./TranscriptSourceLabel.js";
  * Entries are NOT deduped — each commit transcript holds a different slice
  * of the session, and the union equals the full conversation.
  *
- * Attachment counts (plans / notes / linearIssues) read the NORMALIZED root
- * after `normalizeToV4`, so v3 legacy summaries whose attachments lived on
- * a child still report the correct numbers.
+ * Attachment counts (plans / notes / references) read the NORMALIZED root after
+ * `normalizeToV4`, so v3 legacy summaries whose attachments lived on a child
+ * still report the correct numbers. Reference counts are broken down per source
+ * (linear / jira / github / notion) so the confirm dialog can render one line
+ * per non-zero source without hardcoding source identity.
  *
  * Returns zero-valued counts (NOT null) when no transcript was persisted for
  * any commit in the tree — the regenerate path still runs in that case, just
@@ -33,7 +35,12 @@ export interface RegenerateContext {
 	readonly humanTurns: number;
 	readonly plansCount: number;
 	readonly notesCount: number;
-	readonly linearCount: number;
+	/**
+	 * Per-source reference counts. Only sources with a positive count are present;
+	 * sources with zero matches may be omitted. Sum across the map equals the
+	 * total number of references attached to the normalized summary tree.
+	 */
+	readonly referenceCountsBySource: Partial<Record<SourceId, number>>;
 }
 
 export async function loadRegenerateContext(
@@ -67,6 +74,12 @@ export async function loadRegenerateContext(
 		}
 	}
 
+	// Bucket references by source in one pass instead of N filter() scans.
+	const referenceCountsBySource: Partial<Record<SourceId, number>> = {};
+	for (const e of normalized.references ?? []) {
+		referenceCountsBySource[e.source] = (referenceCountsBySource[e.source] ?? 0) + 1;
+	}
+
 	return {
 		entryCount,
 		sessionCount: seenSessions.size,
@@ -74,6 +87,6 @@ export async function loadRegenerateContext(
 		humanTurns,
 		plansCount: normalized.plans?.length ?? 0,
 		notesCount: normalized.notes?.length ?? 0,
-		linearCount: normalized.linearIssues?.length ?? 0,
+		referenceCountsBySource,
 	};
 }

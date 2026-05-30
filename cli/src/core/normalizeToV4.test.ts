@@ -75,10 +75,11 @@ describe("normalizeToV4", () => {
 							updatedAt: "2026-05-20T00:00:00Z",
 						},
 					],
-					linearIssues: [
+					references: [
 						{
-							archivedKey: "PROJ-1-abc",
-							ticketId: "PROJ-1",
+							archivedKey: "linear:PROJ-1-abc12345",
+							source: "linear",
+							nativeId: "PROJ-1",
 							title: "T",
 							url: "https://linear.app/x",
 							referencedAt: "2026-05-20T00:00:00Z",
@@ -104,7 +105,7 @@ describe("normalizeToV4", () => {
 		expect(normalized.version).toBe(4);
 		expect(normalized.plans?.[0]?.slug).toBe("feature-x");
 		expect(normalized.notes?.[0]?.id).toBe("note-1");
-		expect(normalized.linearIssues?.[0]?.archivedKey).toBe("PROJ-1-abc");
+		expect(normalized.references?.[0]?.archivedKey).toBe("linear:PROJ-1-abc12345");
 		expect(normalized.e2eTestGuide?.[0]?.title).toBe("Scenario 1");
 		expect(normalized.jolliDocId).toBe(42);
 		expect(normalized.jolliDocUrl).toBe("https://jolli.ai/d/42");
@@ -240,7 +241,7 @@ describe("normalizeToV4", () => {
 		const normalized = normalizeToV4(v3Bare);
 		expect(normalized.plans).toBeUndefined();
 		expect(normalized.notes).toBeUndefined();
-		expect(normalized.linearIssues).toBeUndefined();
+		expect(normalized.references).toBeUndefined();
 		expect(normalized.e2eTestGuide).toBeUndefined();
 		expect(normalized.jolliDocId).toBeUndefined();
 		expect(normalized.orphanedDocIds).toBeUndefined();

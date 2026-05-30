@@ -11,8 +11,9 @@ import {
 	type CommitExclusions,
 	readExclusions,
 } from "../../../cli/src/core/CommitSelectionStore.js";
+import type { SourceId } from "../../../cli/src/Types.js";
 import type { PlansStore } from "../stores/PlansStore.js";
-import type { LinearIssueInfo, NoteInfo, PlanInfo } from "../Types.js";
+import type { NoteInfo, PlanInfo, ReferenceInfo } from "../Types.js";
 import {
 	escMd,
 	formatRelativeDate,
@@ -23,7 +24,7 @@ import { treeItemToSerialized } from "../views/SidebarSerialize.js";
 
 // ─── Tree item types ────────────────────────────────────────────────────────
 
-type TreeItem = PlanItem | NoteItem | LinearIssueItem;
+type TreeItem = PlanItem | NoteItem | ReferenceItem;
 
 export class PlanItem extends vscode.TreeItem {
 	readonly plan: PlanInfo;
@@ -120,49 +121,63 @@ export class NoteItem extends vscode.TreeItem {
 	}
 }
 
-export class LinearIssueItem extends vscode.TreeItem {
-	readonly issue: LinearIssueInfo;
+export class ReferenceItem extends vscode.TreeItem {
+	readonly reference: ReferenceInfo;
 	/**
 	 * Structured hover data forwarded to the webview's hover-card renderer.
 	 * Activity-bar TreeView ignores this — it reads `tooltip` (a plain string)
 	 * instead. The webview's SidebarSerialize picks this field up off the
 	 * TreeItem instance and copies it onto the serialized payload as
-	 * `linearHover`, so the panel can render the same codicon-rich popover
-	 * the Memories section uses (see SidebarScriptBuilder.renderLinearHoverCard).
+	 * `referenceHover`, so the panel can render the same codicon-rich popover
+	 * the Memories section uses (see SidebarScriptBuilder.renderReferenceHoverCard).
+	 *
+	 * `source` lets the renderer label / icon-tint per provider (Linear /
+	 * Jira / GitHub / Notion). The extra optional fields surface
+	 * source-specific metadata that the on-disk frontmatter parser does NOT
+	 * currently extract (assignees / milestone / entityType) — kept on the
+	 * shape so a follow-up frontmatter pass can populate them without
+	 * another wire-protocol change.
 	 */
-	readonly linearHover: {
+	readonly referenceHover: {
 		readonly title: string;
+		readonly source: SourceId;
 		readonly status?: string;
 		readonly priority?: string;
 		readonly labels?: string;
+		readonly assignees?: string;
+		readonly milestone?: string;
+		readonly entityType?: string;
 		readonly url: string;
 	};
 
-	constructor(issue: LinearIssueInfo) {
-		super(buildLinearIssueLabel(issue), vscode.TreeItemCollapsibleState.None);
-		this.issue = issue;
-		this.description = buildLinearIssueDescription(issue);
-		this.iconPath = new vscode.ThemeIcon("issue-opened");
-		this.contextValue = "linearissue";
-		this.tooltip = buildLinearIssueTooltip(issue);
+	constructor(reference: ReferenceInfo) {
+		super(buildReferenceLabel(reference), vscode.TreeItemCollapsibleState.None);
+		this.reference = reference;
+		this.description = buildReferenceDescription(reference);
+		this.iconPath = new vscode.ThemeIcon(buildReferenceIconKey(reference.source));
+		// Uniform "reference" contextValue. Webview row dispatch reads the wire
+		// `source` field (forwarded via SidebarSerialize) for per-source
+		// browser-open vs markdown-open variants.
+		this.contextValue = "reference";
+		this.tooltip = buildReferenceTooltip(reference);
 		this.command = {
-			command: "jollimemory.openLinearIssueMarkdown",
-			title: "Open Linear Issue Markdown",
+			command: "jollimemory.openReferenceMarkdown",
+			title: "Open Reference Markdown",
 			arguments: [this],
 		};
-		// Description preview was dropped to keep the hover card concise.
-		// Linear descriptions can be long and noisy (multi-paragraph context,
-		// cross-issue HTML refs, markdown formatting). Users who want the
-		// full text can click "Open in Linear" — surface the high-density
-		// fields (status / priority / labels / link) and stop there.
-		this.linearHover = {
-			title: buildLinearIssueLabel(issue),
-			...(issue.status ? { status: issue.status } : {}),
-			...(issue.priority ? { priority: issue.priority } : {}),
-			...(issue.labels && issue.labels.length > 0
-				? { labels: issue.labels.join(", ") }
+		// Description preview was dropped to keep the hover card concise (a
+		// holdover from the Linear-only design — descriptions can be long
+		// multi-paragraph blobs that bloat the popover). Users who want the
+		// full text click "Open in <Source>".
+		this.referenceHover = {
+			title: buildReferenceLabel(reference),
+			source: reference.source,
+			...(reference.status ? { status: reference.status } : {}),
+			...(reference.priority ? { priority: reference.priority } : {}),
+			...(reference.labels && reference.labels.length > 0
+				? { labels: reference.labels.join(", ") }
 				: {}),
-			url: issue.url,
+			url: reference.url,
 		};
 	}
 }
@@ -184,6 +199,7 @@ export class PlansTreeProvider
 		conversations: new Set(),
 		plans: new Set(),
 		notes: new Set(),
+		references: new Set(),
 	};
 
 	constructor(store: PlansStore, cwd = "") {
@@ -217,7 +233,7 @@ export class PlansTreeProvider
 		return snap.merged.map((entry) => {
 			if (entry.kind === "plan") return new PlanItem(entry.plan) as TreeItem;
 			if (entry.kind === "note") return new NoteItem(entry.note) as TreeItem;
-			return new LinearIssueItem(entry.linearIssue) as TreeItem;
+			return new ReferenceItem(entry.reference) as TreeItem;
 		});
 	}
 
@@ -232,8 +248,8 @@ export class PlansTreeProvider
 				idHint = it.note.id;
 				isSelected = !this.exclusions.notes.has(idHint);
 			} else {
-				idHint = it.issue.mapKey;
-				// Linear-issue rows are not user-selectable; default true (no exclusion key applies).
+				idHint = it.reference.mapKey;
+				isSelected = !this.exclusions.references.has(idHint);
 			}
 			const ser = treeItemToSerialized(it, idHint);
 			return { ...ser, isSelected };
@@ -346,50 +362,69 @@ function buildNoteTooltip(note: NoteInfo): vscode.MarkdownString {
 	return md;
 }
 
-// ─── Linear issue label / tooltip helpers ───────────────────────────────────
+// ─── Reference label / tooltip helpers ──────────────────────────────────────
 
-function buildLinearIssueLabel(issue: LinearIssueInfo): string {
-	return `${issue.ticketId} — ${issue.title}`;
+/**
+ * Reference row label. Linear / Jira / GitHub issues all carry a stable native id
+ * (PROJ-1234, KAN-5, owner/repo#42) that users recognize at a glance, so the
+ * label leads with it. Notion pages are nameless beyond their title (the 32-hex
+ * page id is meaningless to the user), so the label drops the prefix and just
+ * shows the title.
+ */
+function buildReferenceLabel(reference: ReferenceInfo): string {
+	if (reference.source === "notion") return reference.title;
+	return `${reference.nativeId} — ${reference.title}`;
 }
 
-function buildLinearIssueDescription(issue: LinearIssueInfo): string {
-	// Intentionally omits the issue.status field. The status captured at
-	// reference time can drift from the live Linear value (we don't poll), so
-	// displaying it in the row description risked misleading users with stale
-	// "In Progress" / "Backlog" labels. The status remains in the tooltip's
-	// markdown body for users who explicitly hover to inspect captured state.
-	return formatShortRelativeDate(issue.lastModified);
+function buildReferenceIconKey(source: SourceId): string {
+	// Notion references are pages, not tickets — `file-text` matches the
+	// product mental model. Linear / Jira / GitHub all surface as issues —
+	// the `issues` stacked-circles glyph reads as "issue" more clearly than
+	// `issue-opened`, which is easily mistaken for an info glyph.
+	if (source === "notion") return "file-text";
+	return "issues";
 }
 
-function buildLinearIssueTooltip(issue: LinearIssueInfo): string {
+function buildReferenceDescription(reference: ReferenceInfo): string {
+	// Same rationale as the Linear-only ancestor: status drifts post-capture
+	// (we don't poll the upstream provider), so the row description sticks
+	// to the relative date. Status lives in the tooltip / hover card for
+	// users who explicitly inspect captured state.
+	return formatShortRelativeDate(reference.lastModified);
+}
+
+function buildReferenceTooltip(reference: ReferenceInfo): string {
 	// Plain text, not MarkdownString. The panel webview renders TreeItem
 	// tooltips via `textContent` on a shared <div> (see SidebarScriptBuilder's
 	// attachTextTip helper — native HTML title= is unreliable inside the
 	// webview iframe). textContent doesn't interpret markdown, so a
-	// MarkdownString here would render its escaped source verbatim:
-	// `**PROJ\-1234**` instead of bold `PROJ-1234`, `\#\# Heading` instead
-	// of a heading, `[$(link-external) ...](url)` instead of a link, etc.
+	// MarkdownString here would render its escaped source verbatim.
 	// Plain text round-trips identically through both surfaces.
 	const lines: Array<string> = [];
-	lines.push(`${issue.ticketId} — ${issue.title}`);
-	if (
-		issue.status ||
-		issue.priority ||
-		(issue.labels && issue.labels.length > 0)
-	) {
+	if (reference.source === "notion") {
+		lines.push(reference.title);
+	} else {
+		lines.push(`${reference.nativeId} — ${reference.title}`);
+	}
+	const hasMeta =
+		!!reference.status ||
+		!!reference.priority ||
+		(reference.labels !== undefined && reference.labels.length > 0);
+	if (hasMeta) {
 		lines.push("");
 	}
-	if (issue.status) lines.push(`Status: ${issue.status}`);
-	if (issue.priority) lines.push(`Priority: ${issue.priority}`);
-	if (issue.labels && issue.labels.length > 0) {
-		lines.push(`Labels: ${issue.labels.join(", ")}`);
+	if (reference.status) lines.push(`Status: ${reference.status}`);
+	if (reference.priority) lines.push(`Priority: ${reference.priority}`);
+	if (reference.labels && reference.labels.length > 0) {
+		lines.push(`Labels: ${reference.labels.join(", ")}`);
 	}
 	lines.push("");
-	lines.push(issue.url);
-	if (issue.description) {
-		const preview = issue.description.slice(0, 200);
+	lines.push(reference.url);
+	if (reference.description) {
+		const preview = reference.description.slice(0, 200);
 		lines.push("");
-		lines.push(preview + (issue.description.length > 200 ? "…" : ""));
+		lines.push(preview + (reference.description.length > 200 ? "…" : ""));
 	}
 	return lines.join("\n");
 }
+

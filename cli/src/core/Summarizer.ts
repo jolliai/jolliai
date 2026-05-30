@@ -86,16 +86,16 @@ export interface SummarizeParams {
 	/** Actual conversation turns (count of human-role entries); computed by caller */
 	readonly conversationTurns?: number;
 	/**
-	 * Pre-rendered <linear-issues> XML block (or "" when none). The caller
-	 * (QueueWorker) reads plans.json + per-issue markdown and calls
-	 * formatLinearIssuesBlock; we just pass it through to the prompt template.
-	 * Optional for backward compat with callers that pre-date Stage 2 wiring;
-	 * defaults to "" so the placeholder collapses cleanly.
+	 * Pre-rendered reference XML blocks (one per registered SourceAdapter, joined
+	 * by "\n"). The caller (QueueWorker) reads plans.json.references + per-reference
+	 * markdown and calls `adapter.renderPromptBlock` per source; the joined
+	 * string is passed through verbatim to the `{{references}}` prompt-template
+	 * placeholder. Optional; defaults to "" so the placeholder collapses cleanly.
 	 */
-	readonly linearIssues?: string;
-	/** Pre-rendered <plans> XML block (or ""). Mirrors linearIssues. */
+	readonly referenceBlocks?: string;
+	/** Pre-rendered <plans> XML block (or ""). Mirrors referenceBlocks. */
 	readonly plans?: string;
-	/** Pre-rendered <notes> XML block (or ""). Mirrors linearIssues. */
+	/** Pre-rendered <notes> XML block (or ""). Mirrors referenceBlocks. */
 	readonly notes?: string;
 	/** LLM credentials and model selection loaded by the caller */
 	readonly config: LlmConfig;
@@ -134,6 +134,8 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 	// caller/backend boundary and risked silent failure if a caller forgot the
 	// associated `topicGuidance` placeholder param. Self-contained prompt =
 	// one less contract to misconfigure.
+	// referenceBlocks fills the `{{references}}` prompt-template placeholder.
+	// When unset, it collapses to "" and the placeholder section disappears.
 	const sharedParams = {
 		commitHash: commitInfo.hash,
 		commitMessage: commitInfo.message,
@@ -141,7 +143,7 @@ export async function generateSummary(params: SummarizeParams): Promise<SummaryR
 		commitDate: commitInfo.date,
 		conversation,
 		diff,
-		linearIssues: params.linearIssues ?? "",
+		references: params.referenceBlocks ?? "",
 		plans: params.plans ?? "",
 		notes: params.notes ?? "",
 	};
