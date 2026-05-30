@@ -106,9 +106,28 @@ describe("sanitizeUrl — scheme-relative URLs", () => {
 		expect(sanitizeUrl("///evil.com")).toBe("#");
 	});
 
+	it("clamps the backslash variant `/\\evil.com` to '#'", () => {
+		// Browsers normalise the leading backslash to a forward slash and resolve
+		// the URL as `//evil.com` — the exact scheme-relative cross-origin
+		// vector this allow-list documents protecting against. Without the
+		// `[/\\]` lookahead, `\/(?!\/)` was satisfied (because the next char is
+		// `\`, not `/`) and the value passed through unchanged.
+		expect(sanitizeUrl("/\\evil.com")).toBe("#");
+		expect(sanitizeUrl("/\\evil.com/track?u=1")).toBe("#");
+	});
+
+	it("clamps the mixed slash/backslash variants `/\\\\foo` and `\\\\foo` to '#'", () => {
+		// Defence-in-depth: any combination of leading slashes/backslashes that
+		// browsers parse as scheme-relative must clamp. We can't trust a
+		// single-character lookahead to catch every variant, but we pin the
+		// common ones here so regressions are caught immediately.
+		expect(sanitizeUrl("/\\\\evil.com")).toBe("#");
+		expect(sanitizeUrl("\\\\evil.com")).toBe("#");
+	});
+
 	it("does NOT block legitimate single-slash root-relative paths", () => {
 		// Pin the negative — `/foo/bar` must still pass through; the rejection
-		// only fires on `//`.
+		// only fires on `//` (or its backslash homoglyph variants above).
 		expect(sanitizeUrl("/foo/bar")).toBe("/foo/bar");
 		expect(sanitizeUrl("/")).toBe("/");
 	});

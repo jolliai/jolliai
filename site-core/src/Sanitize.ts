@@ -15,7 +15,7 @@
 
 // ─── sanitizeUrl ─────────────────────────────────────────────────────────────
 
-const SAFE_URL_PATTERN = /^(?:https?:|mailto:|tel:|[#?]|\/(?!\/)|\.\.?\/)/i;
+const SAFE_URL_PATTERN = /^(?:https?:|mailto:|tel:|[#?]|\/(?![/\\])|\.\.?\/)/i;
 
 /**
  * Allow http(s), mailto, tel, fragments, query strings, root-relative
@@ -24,12 +24,15 @@ const SAFE_URL_PATTERN = /^(?:https?:|mailto:|tel:|[#?]|\/(?!\/)|\.\.?\/)/i;
  * malicious site.json cannot inject a script URL into the generated layout,
  * footer, or `_meta.js`.
  *
- * Scheme-relative URLs (`//evil.com/x`) are explicitly rejected — they look
- * like an absolute path to the leading-`/` check but the browser parses them
- * as same-protocol cross-origin, which would let a malicious `site.json`
- * redirect users (e.g. `header.items: [{ url: "//evil.com" }]`) or exfiltrate
- * referrer context via `<img src="//evil.com">`. The negative lookahead
- * `\/(?!\/)` accepts a single leading slash but not a double.
+ * Scheme-relative URLs (`//evil.com/x`, `/\evil.com/x`) are explicitly
+ * rejected — they look like an absolute path to the leading-`/` check but
+ * the browser parses them as same-protocol cross-origin, which would let a
+ * malicious `site.json` redirect users (e.g. `header.items: [{ url: "//evil.com" }]`)
+ * or exfiltrate referrer context via `<img src="//evil.com">`. The negative
+ * lookahead `\/(?![/\\])` accepts a single leading slash but not a double —
+ * **both** `/X` (where X is `/`) and `/\X` (where X is `\`) are rejected,
+ * because browsers normalise the backslash variant to the slash form and
+ * resolve it as scheme-relative cross-origin all the same.
  *
  * Trims leading / trailing whitespace before testing the scheme so a value
  * like `"  javascript:alert(1)"` cannot bypass the check.
