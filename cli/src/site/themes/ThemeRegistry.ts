@@ -23,7 +23,7 @@
 import { existsSync, statSync } from "node:fs";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { DefaultThemeMode, FontFamily } from "@jolli.ai/site-core";
 import type { NextraProjectConfig } from "../NextraProjectWriter.js";
@@ -170,9 +170,11 @@ export async function discoverPack(
 	// `discoverPack` / `resolvePack` agree on the resolved provider.
 	if (name === "default") return undefined;
 
-	// 3) Explicit file path in site.json (starts with ./ or /)
-	if (name.startsWith("./") || name.startsWith("/")) {
-		const abs = name.startsWith("/") ? name : resolve(options?.sourceRoot ?? process.cwd(), name);
+	// 3) Explicit file path in site.json — accept POSIX-style absolutes
+	// (`/...`), Windows absolutes (`C:\…`, `\\server\share\…`), and the
+	// `./` / `../` relative-prefix conventions that work on both.
+	if (isAbsolute(name) || name.startsWith("./") || name.startsWith("../")) {
+		const abs = isAbsolute(name) ? name : resolve(options?.sourceRoot ?? process.cwd(), name);
 		return loadFromPath(abs);
 	}
 

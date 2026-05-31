@@ -151,7 +151,11 @@ export async function teardownAcceptance(world: AcceptanceWorld): Promise<void> 
 	} else {
 		process.env.JOLLI_SYNC_LOCK_DIR = world.priorSyncLockDir;
 	}
-	await rm(world.tempDir, { recursive: true, force: true });
+	// `force` only suppresses ENOENT; on Windows a git subprocess can still
+	// be releasing pack-file handles inside `<world.tempDir>/memory-bank/
+	// <repo>/.git/` when teardown fires, producing EBUSY on rmdir. The
+	// `maxRetries`/`retryDelay` knobs back off until the handles drain.
+	await rm(world.tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 /**

@@ -751,22 +751,29 @@ describe("ConvertCommand", () => {
 
 	it("skips .mdx files that cannot be read", async () => {
 		const { registerConvertCommand } = await import("./ConvertCommand.js");
-		const { chmod } = await import("node:fs/promises");
 		const sourceDir = join(tempDir, "docs");
 		await mkdir(sourceDir, { recursive: true });
 		await writeFile(join(sourceDir, "index.md"), "# Home\n", "utf-8");
 		const mdxPath = join(sourceDir, "page.mdx");
 		await writeFile(mdxPath, "import X from 'whatever'\n# X\n", "utf-8");
-		// Make the mdx file unreadable so readFile fails
-		await chmod(mdxPath, 0o000);
+		// Drive the unreadable-file branch via the readFile mock — chmod 0o000
+		// is a no-op on Windows so this is the only cross-platform way to
+		// trigger the catch on line 247 of ConvertCommand.ts.
+		const fspActual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+		mockReadFile.mockImplementation(async (path: unknown, ...rest: unknown[]) => {
+			if (typeof path === "string" && path === mdxPath) {
+				throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+			}
+			return fspActual.readFile(path as Parameters<typeof fspActual.readFile>[0], ...(rest as [])) as unknown as
+				| string
+				| Buffer;
+		});
 		const outDir = join(tempDir, "output");
 
 		const program = new Command();
 		registerConvertCommand(program);
 		await program.parseAsync(["node", "test", "convert", sourceDir, "--output", outDir]);
 
-		// Restore permissions so afterEach can clean up
-		await chmod(mdxPath, 0o644);
 		// Normal files should still succeed
 		expect(existsSync(join(outDir, "index.md"))).toBe(true);
 		// readFile failed and returned early, so page.md should not exist

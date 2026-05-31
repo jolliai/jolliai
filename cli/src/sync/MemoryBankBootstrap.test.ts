@@ -289,10 +289,13 @@ describe("untrackNonHashSummaries (quarantine + mtime sentinel)", () => {
 
 		// Each was untracked from the index via its original path.
 		const recorded = client as unknown as { untrackPathGlob: ReturnType<typeof vi.fn> };
+		// `untrackPathGlob` receives paths from `path.relative`, so the
+		// separator is `\` on Windows and `/` elsewhere. Filter with the
+		// host-native separator so the comparison works on both.
+		const summariesFragment = join(".jolli", "summaries");
 		const untrackedSummaryPaths = recorded.untrackPathGlob.mock.calls
 			.map((c) => c[0] as string)
-			.filter((p) => p.includes(".jolli/summaries/"));
-		// Path separator may be `/` or `\` depending on platform — assert via includes.
+			.filter((p) => p.includes(summariesFragment));
 		for (const bad of ["secret.json", "NOT-HEX.json", "abc.txt"]) {
 			expect(untrackedSummaryPaths.some((p) => p.endsWith(bad))).toBe(true);
 		}
