@@ -16,7 +16,6 @@
  * production.
  */
 
-import { homedir } from "node:os";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -35,17 +34,21 @@ const REPO_FOLDER = "test-repo";
 
 let world: AcceptanceWorld;
 let priorHome: string | undefined;
+let priorUserProfile: string | undefined;
 let fakeHome: string;
 
 beforeEach(async () => {
 	world = await setupAcceptance();
 	// `buildSyncEngine` reads `~/.jolli/jollimemory/config.json` via
 	// `loadConfig()` to discover `jolliApiKey`; without a key the factory
-	// returns `null` (= dormant). Redirect HOME at the env layer so the
-	// read hits a tempdir with a seeded config instead of the developer's
-	// real config (which we must not mutate, and which may not even exist
-	// in CI). Restore on teardown.
+	// returns `null` (= dormant). Redirect the homedir at the env layer so
+	// the read hits a tempdir with a seeded config instead of the
+	// developer's real config (which we must not mutate, and which may not
+	// even exist in CI). `os.homedir()` consults `HOME` on POSIX and
+	// `USERPROFILE` on Windows — set both so the override works on either
+	// platform. Restore on teardown.
 	priorHome = process.env.HOME;
+	priorUserProfile = process.env.USERPROFILE;
 	fakeHome = join(world.tempDir, "fake-home");
 	await mkdir(join(fakeHome, ".jolli", "jollimemory"), { recursive: true });
 	await writeFile(
@@ -53,11 +56,14 @@ beforeEach(async () => {
 		JSON.stringify({ jolliApiKey: "sk-jol-acceptance-test" }),
 	);
 	process.env.HOME = fakeHome;
+	process.env.USERPROFILE = fakeHome;
 });
 
 afterEach(async () => {
 	if (priorHome === undefined) delete process.env.HOME;
 	else process.env.HOME = priorHome;
+	if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+	else process.env.USERPROFILE = priorUserProfile;
 	await teardownAcceptance(world);
 });
 

@@ -79,8 +79,11 @@ export async function assertNoSymlinksInPath(vaultRoot: string, absTargetPath: s
 	// the vault — that's the path-escape signature. Also reject the exact
 	// boundary case where `relative` returns "" (target IS the vault root,
 	// which would only happen if a caller asked us to verify the chain to
-	// the vault itself — meaningless and almost certainly a bug).
-	if (rel === "" || rel.startsWith("..")) {
+	// the vault itself — meaningless and almost certainly a bug). On
+	// Windows, `relative` across drives returns the absolute target path
+	// (no `..` prefix is possible across drives), so `isAbsolute(rel)`
+	// catches that escape too.
+	if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
 		throw new Error(`assertNoSymlinksInPath: target ${absTargetPath} is not inside vault ${vaultRoot}`);
 	}
 
@@ -140,7 +143,9 @@ export function assertNoSymlinksInPathSync(vaultRoot: string, absTargetPath: str
 	}
 
 	const rel = relative(vaultRoot, absTargetPath);
-	if (rel === "" || rel.startsWith("..")) {
+	// See the async twin above for why `isAbsolute(rel)` is included —
+	// cross-drive escapes on Windows surface as an absolute `rel`.
+	if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
 		throw new Error(`assertNoSymlinksInPathSync: target ${absTargetPath} is not inside vault ${vaultRoot}`);
 	}
 

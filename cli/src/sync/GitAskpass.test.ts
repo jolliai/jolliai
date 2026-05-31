@@ -61,7 +61,10 @@ describe("prepareAskpass — POSIX", () => {
 		mockPlatform.value = "linux";
 	});
 
-	it("writes the script and sets mode 0700 on first call", async () => {
+	it.skipIf(process.platform === "win32")("writes the script and sets mode 0700 on first call", async () => {
+		// Skipped on Windows: fs.chmod is a documented no-op there (the source
+		// comment at GitAskpass.ts:191-193 acknowledges this), so the on-disk
+		// mode stays at the default 0o666 even though the code path runs.
 		const handle = await prepareAskpass("ghs_abc");
 		const fileStat = await stat(handle.scriptPath);
 		expect(fileStat.isFile()).toBe(true);

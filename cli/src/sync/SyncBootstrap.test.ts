@@ -88,15 +88,18 @@ describe("defaultResolveContext / deriveMemoryBankRoot", () => {
 		expect(ctx.memoryBankRoot).toBe(localFolder);
 
 		expect(deriveMemoryBankRoot("/a/b")).toBe("/a/b");
-		expect(deriveMemoryBankRoot(undefined).endsWith("/Documents/jolli")).toBe(true);
+		// Default lives at `<homedir>/Documents/jolli`; use `path.join` for
+		// the suffix so the separator matches the host (`\` on Windows).
+		const defaultSuffix = join("Documents", "jolli");
+		expect(deriveMemoryBankRoot(undefined).endsWith(defaultSuffix)).toBe(true);
 		// Invalid paths fall back to the default `~/Documents/jolli` (with a
 		// WARN log) so every write path in the system agrees on the same
 		// target — preventing the split-brain where git init aimed at a
 		// bogus path while FolderStorage wrote to the default. Input-
 		// boundary validation (rejecting bad values at `jolli configure` /
 		// Settings UI) is handled in a separate PR.
-		expect(deriveMemoryBankRoot("relative/path").endsWith("/Documents/jolli")).toBe(true);
-		expect(deriveMemoryBankRoot("/abs/with/../traversal").endsWith("/Documents/jolli")).toBe(true);
+		expect(deriveMemoryBankRoot("relative/path").endsWith(defaultSuffix)).toBe(true);
+		expect(deriveMemoryBankRoot("/abs/with/../traversal").endsWith(defaultSuffix)).toBe(true);
 	});
 
 	it("defaultAiFactory returns null when apiKey missing and a provider when present", async () => {

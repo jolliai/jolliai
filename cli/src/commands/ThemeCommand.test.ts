@@ -265,7 +265,10 @@ describe("downloadTheme path-traversal guard", () => {
 
 	it("rejects sibling-prefix paths", () => {
 		const { normalize, join, sep } = require("node:path");
-		const destDir = "/Users/x/.jolli/themes/foo";
+		// Normalize the base so the separators match the host platform —
+		// otherwise `destDir + sep` mixes `/` and `\` on Windows and the
+		// startsWith check below spuriously fails.
+		const destDir = normalize("/Users/x/.jolli/themes/foo");
 		const destDirWithSep = destDir + sep;
 
 		// Sibling "foobar" shares the "foo" prefix but is a different directory
@@ -280,7 +283,7 @@ describe("downloadTheme path-traversal guard", () => {
 
 	it("rejects parent traversal paths", () => {
 		const { normalize, join, sep } = require("node:path");
-		const destDir = "/Users/x/.jolli/themes/foo";
+		const destDir = normalize("/Users/x/.jolli/themes/foo");
 		const destDirWithSep = destDir + sep;
 
 		const traversal = normalize(join(destDir, "../../etc/passwd"));

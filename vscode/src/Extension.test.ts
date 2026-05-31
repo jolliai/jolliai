@@ -1,4 +1,4 @@
-import { normalize } from "node:path";
+import { join, normalize } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Hoisted mocks ─────────────────────────────────────────────────────────
@@ -4373,9 +4373,12 @@ describe("Extension", () => {
 				);
 				executeCommand.mockClear();
 				await handler("repo/main/foo-abcdef12.md");
+				// Source uses `path.join(sidebarKbParent, relPath)`, so the
+				// expected value has to be assembled the same way — on
+				// Windows it ends up `\test\kb-parent\repo\main\…`.
 				expect(executeCommand).toHaveBeenCalledWith(
 					"jollimemory.revertMemoryFileEdits",
-					"/test/kb-parent/repo/main/foo-abcdef12.md",
+					join("/test/kb-parent", "repo/main/foo-abcdef12.md"),
 				);
 			});
 
