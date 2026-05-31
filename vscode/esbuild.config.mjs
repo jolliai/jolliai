@@ -54,7 +54,15 @@ const extensionOptions = {
 	...base,
 	entryPoints: ["src/Extension.ts"],
 	outfile: "dist/Extension.js",
-	external: ["vscode"],
+	// `@jolli.ai/site-core` is externalized to match cli/vite.config.ts. The
+	// VSCode extension never invokes site commands (jolli new / build / dev
+	// etc.) from the extension host — those are terminal-only flows — so the
+	// site-core runtime require inside the bundled CLI is dead code from the
+	// extension's perspective. Externalizing skips the bundler's transitive
+	// resolution into cli/src/site/**, letting jolliai build cleanly even
+	// when site-core/ workspace is absent (Windows fresh checkout, future
+	// Phase 4 deletion, etc.).
+	external: ["vscode", "@jolli.ai/site-core"],
 	banner: {
 		js: `const __jmImportMetaUrl = require("node:url").pathToFileURL(__filename).href;`,
 	},
@@ -76,6 +84,11 @@ const extensionOptions = {
 const jmSrc = "../cli/src";
 const cliOptions = {
 	...base,
+	// `@jolli.ai/site-core` externalized — see the matching comment on
+	// `extensionOptions.external`. The bundled Cli.js's site command
+	// stubs / lazy-load (Phase 3b in cli/src/Api.ts) handle the runtime
+	// path where the package is genuinely needed.
+	external: ["@jolli.ai/site-core"],
 	// Use { in, out } to flatten all hook scripts into dist/ alongside Cli.js.
 	// Installer.ts resolves hook scripts relative to Cli.js, so they must share a directory.
 	entryPoints: [
