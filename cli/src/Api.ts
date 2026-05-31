@@ -19,13 +19,6 @@ import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
-// Site command registrators are NOT statically imported. They transitively
-// load `@jolli.ai/site-core` at module evaluation time, which crashes the
-// whole CLI if site-core is not installed (it's an optionalDependencies
-// entry, so a failing npm fetch is silent). Instead, `main()` probes
-// site-core availability and either dynamic-imports the real registrators
-// or registers the lightweight stubs from `SiteCommandStubs`.
-import { registerSiteCommandStubs } from "./commands/SiteCommandStubs.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerSyncCommand } from "./commands/SyncCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
@@ -35,8 +28,7 @@ import { registerViewCommand } from "./commands/ViewCommand.js";
 // consumes them).
 import { parseBaseUrl as _parseBaseUrl, parseJolliApiKey as _parseJolliApiKey } from "./core/JolliApiUtils.js";
 import type { Logger } from "./Logger.js";
-import { loadPlugins } from "./PluginLoader.js";
-import { isSiteCoreInstalled } from "./site/EnsureSiteCore.js";
+import { loadPlugins, registerMissingStubs } from "./PluginLoader.js";
 
 /**
  * Runtime context handed to a plugin's `register()` function.
@@ -315,40 +307,14 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerAuthCommands(program);
 	registerSyncCommand(program);
 
-	// Site commands: dynamic-load only when site-core is available, since
-	// each of these modules transitively imports `@jolli.ai/site-core` at
-	// the top of its file. If site-core isn't installed (optionalDependencies
-	// fetch failed, pre-publish window, etc.), fall back to lightweight stubs
-	// so the rest of the CLI still works and the user gets a clear prompt
-	// to install site-core when they invoke a site command.
-	if (isSiteCoreInstalled()) {
-		const [
-			{ registerNewCommand },
-			{ registerConvertCommand },
-			{ registerBuildCommand, registerDevCommand, registerStartCommand },
-			{ registerReverseCommand },
-			{ registerThemeCommand },
-		] = await Promise.all([
-			import("./commands/NewCommand.js"),
-			import("./commands/ConvertCommand.js"),
-			import("./commands/StartCommand.js"),
-			import("./commands/ReverseCommand.js"),
-			import("./commands/ThemeCommand.js"),
-		]);
-		registerNewCommand(program);
-		registerConvertCommand(program);
-		registerDevCommand(program);
-		registerBuildCommand(program);
-		registerStartCommand(program);
-		registerReverseCommand(program);
-		registerThemeCommand(program);
-	} else {
-		registerSiteCommandStubs(program);
-	}
-
-	// Plugins extend the program after all builtins are in place.
-	// loadPlugins is non-throwing — a broken plugin never blocks the CLI.
-	await loadPlugins(program, VERSION);
+	// Plugin-provided command surface. `loadPlugins` discovers and registers
+	// installed plugins (returning the set of IDs it loaded); whatever's left
+	// in `KnownPlugins.ts` with a `registerStub` fallback gets its stubs
+	// registered by `registerMissingStubs` so the commands stay visible in
+	// `--help` and emit an install hint when invoked. Both calls are
+	// non-throwing — a broken plugin / stub never blocks the CLI.
+	const loadedPluginIds = await loadPlugins(program, VERSION);
+	registerMissingStubs(program, loadedPluginIds);
 
 	checkVersionMismatch();
 
