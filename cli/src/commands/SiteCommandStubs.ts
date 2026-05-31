@@ -1,35 +1,29 @@
 /**
  * SiteCommandStubs — placeholder commanders for the seven site commands when
- * `@jolli.ai/site-core` is not installed.
+ * the `@jolli.ai/site-cli` plugin is not installed.
  *
  * Why this exists
  * ----------------
  *
- * The CLI bundles `@jolli.ai/site-core` as an `optionalDependencies` entry.
- * On `npm install -g @jolli.ai/cli` the package manager tries to fetch site-core
- * but a failure (private registry, network, pre-publish window) is silent —
- * the CLI installs without it.
+ * Site generation lives in the `@jolli.ai/site-cli` plugin package. The host
+ * CLI discovers it through `PluginLoader` (allow-listed by `jolliPluginId`,
+ * not by name). When the plugin is installed alongside the host CLI, its
+ * `register()` adds the real `new` / `build` / `dev` / `start` / `convert`
+ * / `reverse` / `theme` commands. When it isn't installed, `PluginLoader`
+ * falls back to registering the stubs in this file so:
  *
- * Memory / auth / doctor / etc. don't import site-core, so they keep working.
- * Site commands (new / build / dev / start / convert / reverse / theme), if
- * registered via their real implementations, would crash at module load
- * (Api.ts → NewCommand.ts → StarterKit.ts → `@jolli.ai/site-core` → ERR_MODULE_NOT_FOUND).
+ *   - `jolli --help` still shows the Site commands under the "Jolli Site"
+ *     section, so users discover the feature exists.
+ *   - Running a site command prints a clear install hint instead of an
+ *     "unknown command" error.
  *
- * `Api.ts` checks `isSiteCoreInstalled()` at startup:
- *   - true  → dynamic import + register the real site command modules.
- *   - false → register THIS module's stubs instead.
- *
- * The stubs keep the command names visible in `jolli --help` (grouped under
- * "Jolli Site") so users still discover the feature exists, and on invocation
- * they prompt the user to install site-core. The auto-install path uses
- * `ensureSiteCoreInstalled`, which runs `npm install -g @jolli.ai/site-core`.
- * After a successful install the stub asks the user to re-run their command —
- * the current process's static import graph is already fixed, so a clean
- * second invocation is the simplest path to the real implementation.
+ * No auto-install path here — global npm installs need user consent for
+ * sudo / package-manager UX, and the install command varies by environment
+ * (npm, pnpm, yarn, bun, system package manager wrappers). We print the
+ * canonical npm command and exit; the user can adapt.
  */
 
 import type { Command } from "commander";
-import { ensureSiteCoreInstalled } from "../site/EnsureSiteCore.js";
 
 interface StubSpec {
 	name: string;
@@ -38,9 +32,9 @@ interface StubSpec {
 
 /**
  * Mirrors the real site command descriptions so `jolli --help` shows the
- * same text whether or not site-core is installed. The `(requires
- * @jolli.ai/site-core)` suffix is appended so the user understands why
- * the command might prompt for installation.
+ * same text whether or not site-cli is installed. The `(requires
+ * @jolli.ai/site-cli)` suffix is appended so the user understands why
+ * invoking the command might prompt for installation.
  */
 const SITE_COMMAND_STUBS: ReadonlyArray<StubSpec> = [
 	{ name: "new", description: "Scaffold a new documentation project" },
@@ -52,42 +46,35 @@ const SITE_COMMAND_STUBS: ReadonlyArray<StubSpec> = [
 	{ name: "theme", description: "Manage documentation themes" },
 ];
 
+const INSTALL_COMMAND = "npm install -g @jolli.ai/site-cli";
+
 /**
- * Registers stub commanders for every site command. Each stub:
- *   1. Prints a message explaining the command needs site-core.
- *   2. Invokes `ensureSiteCoreInstalled`, which (on TTY) prompts and runs
- *      `npm install -g @jolli.ai/site-core`. On non-TTY it prints the
- *      manual command and exits 1.
- *   3. On a successful install, prints "please re-run" and exits 0.
- *      Re-running the binary triggers the `isSiteCoreInstalled() === true`
- *      branch in `Api.ts` and the real command module loads.
+ * Registers stub commanders for every site command. Each stub prints a
+ * one-line install hint and exits non-zero so scripts that depended on the
+ * real command fail loudly rather than silently no-op.
  *
- * `.allowUnknownOption()` and `.argument("[args...]")` keep the user's
+ * `.allowUnknownOption()` + `.argument("[args...]")` keep the user's
  * original argv from triggering Commander's "unknown option" rejection,
- * so a user typing `jolli new my-site --some-flag` sees the install
- * prompt instead of a parser error.
+ * so a user typing `jolli new my-site --some-flag` sees the install hint
+ * instead of a parser error.
  */
 export function registerSiteCommandStubs(program: Command): void {
 	for (const { name, description } of SITE_COMMAND_STUBS) {
 		program
 			.command(name)
-			.description(`${description} (requires @jolli.ai/site-core)`)
-			.argument("[args...]", "Arguments forwarded to the real command after install")
+			.description(`${description} (requires @jolli.ai/site-cli)`)
+			.argument("[args...]", "Arguments forwarded to the real command once installed")
 			.allowUnknownOption()
-			.action(async () => {
+			.action(() => {
 				console.error("");
-				console.error(`  Site command \`${name}\` requires \`@jolli.ai/site-core\`.`);
+				console.error(`  Site command \`${name}\` requires the @jolli.ai/site-cli plugin.`);
 				console.error("");
-				await ensureSiteCoreInstalled();
-				// ensureSiteCoreInstalled either succeeded (npm install -g ran
-				// to completion) or threw / called process.exit. If we reach
-				// this line, site-core is now on disk — but the current
-				// process's module graph is locked in. Tell the user to
-				// re-invoke. A fresh process will load the real command.
+				console.error(`  Install it with:`);
+				console.error(`      ${INSTALL_COMMAND}`);
 				console.error("");
-				console.error(`  ✓ Installation complete. Please re-run: jolli ${name} ...`);
+				console.error(`  Then re-run: jolli ${name} ...`);
 				console.error("");
-				process.exit(0);
+				process.exit(1);
 			});
 	}
 }

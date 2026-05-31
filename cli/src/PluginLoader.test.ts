@@ -636,7 +636,7 @@ describe("loadPlugins", () => {
 				allowlistOverride: [FIXTURE_ID],
 				scopesOverride: [FIXTURE_SCOPE],
 			}),
-		).resolves.toBeUndefined();
+		).resolves.toBeInstanceOf(Set);
 		expect(program.commands).toHaveLength(0);
 	});
 
@@ -677,7 +677,7 @@ describe("loadPlugins", () => {
 				allowlistOverride: [FIXTURE_ID],
 				scopesOverride: [FIXTURE_SCOPE],
 			}),
-		).resolves.toBeUndefined();
+		).resolves.toBeInstanceOf(Set);
 		expect(program.commands).toHaveLength(0);
 	});
 

@@ -70,9 +70,16 @@ vi.mock("./core/Locks.js", () => ({
 
 // Default no-op; individual tests use `mockImplementationOnce` to inject
 // plugin commands (e.g. to exercise the `_hidden` filter in visibleCommands).
-vi.mock("./PluginLoader.js", () => ({
-	loadPlugins: vi.fn().mockResolvedValue(undefined),
-}));
+// `loadPlugins` returns the empty set so `registerMissingStubs` sees no
+// loaded plugins and registers the site command stubs — matching the
+// real-world "site-cli plugin not installed" experience in `--help` output.
+vi.mock("./PluginLoader.js", async () => {
+	const actual = await vi.importActual<typeof import("./PluginLoader.js")>("./PluginLoader.js");
+	return {
+		loadPlugins: vi.fn().mockResolvedValue(new Set<string>()),
+		registerMissingStubs: actual.registerMissingStubs,
+	};
+});
 
 vi.mock("./core/JolliApiUtils.js", async () => {
 	const actual = await vi.importActual<typeof import("./core/JolliApiUtils.js")>("./core/JolliApiUtils.js");
@@ -334,6 +341,7 @@ describe("CLI", () => {
 			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
 				program.command("plugin-hidden-secret", { hidden: true }).description("hidden by plugin");
 				program.command("plugin-visible-cmd").description("visible plugin cmd");
+				return new Set<string>();
 			});
 
 			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
@@ -380,6 +388,7 @@ describe("CLI", () => {
 			// once plugins are loaded.
 			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
 				program.command("plugin-extra-cmd").description("third-party plugin command");
+				return new Set<string>();
 			});
 
 			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {

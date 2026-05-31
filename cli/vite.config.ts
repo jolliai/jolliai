@@ -26,7 +26,7 @@ export default defineConfig({
 			formats: ["es"],
 		},
 		rollupOptions: {
-			external: ["@anthropic-ai/sdk", "@jolli.ai/site-core", "@mdx-js/mdx", "chokidar", "commander", "open", "semver", "yaml", /^node:.*/],
+			external: ["@anthropic-ai/sdk", "commander", "open", "semver", /^node:.*/],
 			output: {
 				chunkFileNames: "[name].js",
 			},
@@ -60,7 +60,7 @@ export default defineConfig({
 		coverage: {
 			provider: "v8",
 			reporter: ["text", "json-summary"],
-			exclude: ["src/Types.ts", "src/commands/StartCommand.ts", "src/commands/ReverseCommand.ts", "src/commands/ThemeCommand.ts", "src/site/themes/ThemeRegistry.ts", "vite.config.ts", "test/**"],
+			exclude: ["src/Types.ts", "vite.config.ts", "test/**"],
 			thresholds: {
 				statements: 97,
 				branches: 96,

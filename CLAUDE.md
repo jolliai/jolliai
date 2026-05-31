@@ -110,29 +110,19 @@ Local non-summary state is split across **two** `.jolli/jollimemory/` directorie
 
 Hook installation uses dist-path indirection: hooks call `node "$($HOME/.jolli/jollimemory/resolve-dist-path)/PostCommitHook.js"`, where `resolve-dist-path` reads the `~/.jolli/jollimemory/dist-path` file. CLI vs extension write the same version-tagged dist-path (e.g. `source=cli@1.0.0\n/abs/path/to/dist`), so whichever surface was enabled most recently wins, and version comparisons work across surfaces.
 
-### Site generation: OpenAPI rich pipeline
+### Site generation lives in a separate plugin package
 
-The `jolli new` / `build` / `start` / `dev` commands generate a Nextra v4 docs site from a `Content_Folder`. The OpenAPI surface is split in two so a future Fumadocs / Docusaurus emitter doesn't have to reimplement parsing:
+The `jolli new` / `build` / `dev` / `start` / `convert` / `reverse` / `theme` commands are **not** in this repo. They live in `@jolli.ai/site-cli`, a plugin built and released separately. The host CLI discovers it at runtime through [`PluginLoader`](cli/src/PluginLoader.ts) and [`KnownPlugins.ts`](cli/src/KnownPlugins.ts) (allow-listed by random `jolliPluginId`, never by package name — see the PluginLoader header for the rationale).
 
-1. **Framework-agnostic IR** at `cli/src/site/openapi/` — `SpecLoader` / `SpecParser` / `RefResolver` / `CodeSampleGenerator` / `SchemaExample` / `Slug` / `Escape` / `OpenApiPipeline`. Output is data structures only. `parseFullSpec` walks `paths × HTTP_METHODS` in declaration order, follows `$ref` with RFC 6901 `~1`/`~0` escapes, and **throws** on `(tag, operationId)` collisions (silently dropping an endpoint would be worse).
+When the plugin isn't installed, [`SiteCommandStubs.ts`](cli/src/commands/SiteCommandStubs.ts) is registered as a fallback by `registerMissingStubs(program, loadedPluginIds)` in `Api.ts main()`. The stubs keep the seven Site commands visible in `jolli --help` (grouped under "Jolli Site" by the help formatter) and emit a one-line install hint on invocation. There is no auto-install path — the stub prints `npm install -g @jolli.ai/site-cli` and exits non-zero.
 
-2. **Renderer-specific emitter** at `cli/src/site/renderer/nextra/` — consumes the IR and returns `TemplateFile[]`. Per spec: an overview MDX, a `_refs.ts` schema map, per-endpoint MDX shims, per-operation JSON sidecars, and `_meta.ts` sidebar files. Plus 8 React components (`Endpoint`, `TryIt`, `SchemaBlock`, `CodeSwitcher`, `EndpointMeta`, `ParamTable`, `ResponseBlock`, `AuthRequirements`) and a shared `describeType` utility, all enumerated by `Components.ts generateApiComponents()`, plus a single `styles/api.css`. Components and CSS are written once at `initProject` time and imported via the `@/*` tsconfig alias declared in the generated `tsconfig.json`.
+Things to remember when working on plugin-adjacent code in this repo:
 
-The bridge is `SiteRenderer.renderOpenApiSpecs(contentDir, publicDir, specs)` in `cli/src/site/renderer/SiteRenderer.ts`. `StartCommand` builds the `OpenApiSpecInput[]` from `MirrorResult.openapiDocs` (the parsed-once-cached AST from `ContentMirror`) via `buildPipeline`. The legacy `swagger-ui-react` MDX shim is gone — that dependency is no longer in `NEXTRA_DEPENDENCIES`. See [`cli/DEVELOPMENT.md`](cli/DEVELOPMENT.md) for module-by-module detail and the full file-flow diagram.
-
-### Site generation: layout, navbar, and footer architecture
-
-The CLI's Nextra layouts are deliberately thin — `<Navbar logo={<SiteLogo />}><ThemeSwitch /></Navbar>` for Forge, `<Navbar logo={<SiteLogo />} />` for Atlas / default. **No `<a>` or `<details>` JSX is spliced into the navbar.** Page tabs (Documentation, API Reference, customer-supplied `header.items`) flow through:
-
-1. `MetaGenerator.generateMetaFiles(contentDir, sidebar, rootInjection)` writes the **root `content/_meta.js`** with auto-injected `__documentation` + `__api-reference` keys (single-spec direct link vs multi-spec dropdown shape) plus customer `header.items` materialised as slug-keyed page-tab entries. URLs flow through `Sanitize.sanitizeUrl` so `javascript:` / `data:` / `vbscript:` are clamped to `"#"`.
-2. Nextra's `<Navbar>` reads the page-map and renders the entries natively (chevron, hover, mobile drawer all come for free).
-3. Layouts wrap content in `<ScopedNextraLayout>` (emitted to `<buildDir>/components/ScopedNextraLayout.tsx` from the `scopePageMap` filter in `cli/src/site/ScopePageMap.ts`) so the sidebar scopes cleanly when the user is inside `/api-{slug}/…`.
-
-Pack footers (Forge / Atlas) emit semantic class names targeted by the pack stylesheets — `themes/Footer.ts` builds the JSX with `.{prefix}-footer-columns`, `.{prefix}-footer-col`, `.{prefix}-footer-bottom`, `.{prefix}-footer-copyright`, `.{prefix}-footer-social`, `.{prefix}-footer-powered` so the pack CSS does the layout. The default theme has no pack stylesheet so it keeps the inline-style footer fallback.
-
-Schema aliasing happens at site.json read time — `SiteJsonReader.coerceBrandingToTheme` maps the deprecated nested `branding.*` block into the canonical `theme.*` (and `footer.social` → `footer.socialLinks`). Downstream code only ever reads the canonical shape.
-
-URL/HTML escaping is consolidated in `cli/src/site/Sanitize.ts` — every layout, footer renderer, and `_meta.js` writer imports from there so a future tightening of the allow-list happens in one place.
+- **Adding a new known plugin** = one entry in `KNOWN_PLUGINS` in `KnownPlugins.ts` (id, packageName, installHint, optional `registerStub` callback). PluginLoader derives `KNOWN_PLUGIN_IDS` from this list, so the discovery allowlist updates automatically.
+- **A plugin with no stub** (e.g. cli-pro) is silently absent when missing — the user sees nothing in `--help` for it. Only plugins with a `registerStub` field appear when the package isn't installed.
+- **Don't add `optionalDependencies` for plugins.** The host CLI has zero npm coupling to its plugins. Users `npm install -g` the host and the plugin separately; the plugin declares the host in its own `peerDependencies` (`>=` form, not `^`, so plugins survive host minor bumps).
+- **Don't reintroduce `cli/src/site/`.** Anything site-rendering-related belongs in the plugin's repo, not here.
+- **Three places consume the plugin's `jolliPluginId`** (host CLI in this repo, the plugin's `package.json`, and the plugin's CI release verification). Renaming an ID is fine — it's an opaque UUID, not a public name — but all three must be updated in lockstep.
 
 ### Auth & origin allowlist
 

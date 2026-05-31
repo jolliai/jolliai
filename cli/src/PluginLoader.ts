@@ -44,16 +44,19 @@ import { Command } from "commander";
 import { satisfies } from "semver";
 import type { PluginContext, PluginRegister } from "./Api.js";
 import { getGlobalConfigDir } from "./core/SessionTracker.js";
+import { KNOWN_PLUGINS } from "./KnownPlugins.js";
 import { createLogger } from "./Logger.js";
 import { execFileAsyncHidden } from "./util/Subprocess.js";
 
 const log = createLogger("PluginLoader");
 
 /**
- * Allow-list of plugin IDs. Each entry is an opaque random string that the
- * matching plugin embeds in its own `package.json` as `jolliPluginId`. IDs are
- * stable for the lifetime of a plugin: a plugin author can rename, re-scope,
- * or re-publish their package without touching this list.
+ * Allow-list of plugin IDs derived from the registry in {@link KnownPlugins}.
+ *
+ * Each entry is an opaque random string that the matching plugin embeds in
+ * its own `package.json` as `jolliPluginId`. IDs are stable for the lifetime
+ * of a plugin: a plugin author can rename, re-scope, or re-publish their
+ * package without touching this list.
  *
  * IDs are not secrets — they are bundled in the plugin's package.json and
  * visible to anyone who installs it. The security boundary is still the scope
@@ -61,7 +64,7 @@ const log = createLogger("PluginLoader");
  * the scopes we trust. Random IDs just make the allow-list flexible across
  * package renames.
  */
-const KNOWN_PLUGIN_IDS: ReadonlyArray<string> = ["c56530c4-3f2f-467f-a4a4-db4d44c79c1c"];
+const KNOWN_PLUGIN_IDS: ReadonlyArray<string> = KNOWN_PLUGINS.map((p) => p.id);
 
 /**
  * Scope directories the loader scans under each `node_modules` root. Bounding
@@ -118,15 +121,28 @@ export interface NpmRootGlobalOptions {
 }
 
 /**
- * Discover and load all plugins. Always non-throwing — failures become warnings.
+ * Discover and load all plugins, returning the set of plugin IDs that were
+ * successfully discovered on disk. Always non-throwing — failures become
+ * warnings.
  *
  * Wire-in point in `Api.ts main()`: call this after all builtin command
- * registrations and before `program.parseAsync(...)`.
+ * registrations, then pass the returned set to {@link registerMissingStubs}
+ * before `program.parseAsync(...)`.
+ *
+ * The split between discover-and-load (this function) and stub-fallback
+ * ({@link registerMissingStubs}) exists so test code that mocks `loadPlugins`
+ * to do nothing still gets the stub registration through the second call —
+ * the stubs are part of `jolli --help`'s output contract, not a side-effect
+ * of plugin discovery.
  */
-export async function loadPlugins(program: Command, cliVersion: string, opts?: LoadPluginsOptions): Promise<void> {
+export async function loadPlugins(
+	program: Command,
+	cliVersion: string,
+	opts?: LoadPluginsOptions,
+): Promise<ReadonlySet<string>> {
 	if (process.env.JOLLI_NO_PLUGINS === "1") {
 		log.debug("JOLLI_NO_PLUGINS=1 — skipping plugin discovery");
-		return;
+		return new Set();
 	}
 
 	const allowlist = opts?.allowlistOverride ?? KNOWN_PLUGIN_IDS;
@@ -136,6 +152,30 @@ export async function loadPlugins(program: Command, cliVersion: string, opts?: L
 
 	for (const plugin of found) {
 		await loadOnePlugin(program, cliVersion, plugin);
+	}
+
+	return new Set(found.map((p) => p.pluginId));
+}
+
+/**
+ * Register stub commands for every entry in {@link KNOWN_PLUGINS} that
+ * declares a `registerStub` fallback and wasn't found in `loadedPluginIds`.
+ *
+ * Idempotent isn't a guarantee — call this once per `main()`. Failures inside
+ * a stub registration are caught and warned so a single broken stub doesn't
+ * tear down the host. Plugins without a stub field (e.g. cli-pro) are
+ * silently absent when missing — the user sees nothing in `--help` for them.
+ */
+export function registerMissingStubs(program: Command, loadedPluginIds: ReadonlySet<string>): void {
+	for (const known of KNOWN_PLUGINS) {
+		if (loadedPluginIds.has(known.id) || !known.registerStub) continue;
+		try {
+			known.registerStub(program);
+		} catch (err) {
+			// A throwing stub should never tear down the host — same
+			// non-fatal contract as a throwing plugin `register()`.
+			warn(`${known.packageName} stub registration failed: ${errMessage(err)}`);
+		}
 	}
 }
 
