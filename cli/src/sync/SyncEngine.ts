@@ -1492,16 +1492,38 @@ export class SyncEngine {
 			// required by the backend to verify lock ownership before
 			// flipping `metadata.vault`.
 			//
-			// Truly-empty remote case (post-`git init`, fetched nothing, no
-			// docs to migrate): HEAD is unborn, `currentHead` would throw
-			// "ambiguous argument 'HEAD'", the catch below would swallow it
-			// and the backend would never flip. Skip the call and let the
-			// steady-state push later in the round produce a real HEAD —
-			// the next round's `runFirstBindMigration` retries this.
-			/* v8 ignore start -- truly-empty-remote-and-no-docs case is the §0.13 first-bind degenerate state; reaching it requires synchronously failing every test mint mode, and the next round's runFirstBindMigration retries it cleanly */
-			if (!(await state.client.hasHead())) {
+			// Defer completion whenever there is no commit the backend can
+			// bind to *on the remote* yet. Two cases collapse here:
+			//
+			//   1) HEAD unborn — truly-empty remote (post-`git init`, fetched
+			//      nothing, no docs). `currentHead` would throw "ambiguous
+			//      argument 'HEAD'" and the backend would never flip.
+			//   2) HEAD born locally but NOT yet reachable from
+			//      `origin/<defaultBranch>` — the bootstrap-merge case.
+			//      `ensureOnDefaultBranch` commits the fresh-local vault (e.g.
+			//      172 files) WITHOUT pushing, so HEAD is already born before
+			//      this runs. Calling `complete-migration` with that un-pushed
+			//      `commitSha` makes the backend return 409 — it cannot find
+			//      the commit in the personal-space repo. Because that 409 is
+			//      fatal in `runFirstBindMigration`, the round never reaches
+			//      the step 7 push that would upload the commit: a deadlock
+			//      (push is gated behind migration; migration can only complete
+			//      once the commit is pushed). Pre-fix, the `!hasHead()` guard
+			//      only caught case 1, so the born-but-unpushed bootstrap HEAD
+			//      fell straight through to the 409.
+			//
+			// Deferring routes BOTH cases through the existing defer → step 7
+			// push → step 7a retry machinery: the steady-state push uploads
+			// HEAD, then 7a (or the next round) completes against a commit the
+			// remote actually has.
+			const defaultBranch = state.creds.defaultBranch;
+			const headBorn = await state.client.hasHead();
+			const headOnRemote =
+				headBorn && (await state.client.isAncestor("HEAD", `refs/remotes/origin/${defaultBranch}`));
+			if (!headOnRemote) {
 				log.info(
-					"completeMigration: deferred — HEAD is unborn (empty vault, no docs to migrate yet); doRound will retry after steady-state push",
+					"completeMigration: deferred — HEAD not yet on origin/%s (unborn or not-yet-pushed); doRound will retry after steady-state push",
+					defaultBranch,
 				);
 				// JOLLI-1577 — defer release alongside completion. The
 				// next round's `completeMigration` is the chosen release
@@ -1518,7 +1540,6 @@ export class SyncEngine {
 				lockHolder.deferredCompletion = true;
 				return { ok: true, deferred: true };
 			}
-			/* v8 ignore stop */
 			const commitSha = await state.client.currentHead();
 			const res = await this.opts.backend.completeMigration({
 				commitSha,
