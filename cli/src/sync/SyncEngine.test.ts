@@ -1002,7 +1002,12 @@ describe("SyncEngine.runRound — db→git first-bind migration", () => {
 			getLegacyContent: getLegacy,
 			completeMigration,
 		});
-		const client = makeGitClient({ commit });
+		// `isAncestor: true` — by the time `tryCompleteMigration` runs, the
+		// migration commit has already been pushed (step d), so HEAD IS
+		// reachable from origin/<default>. The fix defers completion only when
+		// HEAD is NOT yet on the remote (the bootstrap-merge 409 deadlock); a
+		// pushed HEAD must proceed straight to complete-migration.
+		const client = makeGitClient({ commit, isAncestor: vi.fn(async () => true) });
 		const { engine } = makeEngine({
 			backend,
 			client,
@@ -1038,6 +1043,11 @@ describe("SyncEngine.runRound — db→git first-bind migration", () => {
 		});
 		const { engine } = makeEngine({
 			backend,
+			// `isAncestor: true` — in the alreadyMigrated race the vault was
+			// cloned, so the resolved HEAD is already on origin/<default>;
+			// completion proceeds (the defer-on-unpushed-HEAD fix only catches
+			// the bootstrap-merge case where HEAD is born locally but unpushed).
+			client: makeGitClient({ isAncestor: vi.fn(async () => true) }),
 			makeLegacyMigration: () =>
 				({ apply: applyLegacy }) as unknown as ReturnType<
 					NonNullable<import("./SyncEngine.js").SyncEngineOpts["makeLegacyMigration"]>
@@ -1182,12 +1192,60 @@ describe("SyncEngine.runRound — db→git first-bind migration", () => {
 			})),
 			completeMigration,
 		});
-		const { engine } = makeEngine({ backend });
+		// `isAncestor: true` so completion actually fires (HEAD on remote) and
+		// its failure can surface — otherwise the defer-on-unpushed-HEAD fix
+		// would short-circuit before calling the backend.
+		const { engine } = makeEngine({ backend, client: makeGitClient({ isAncestor: vi.fn(async () => true) }) });
 		const result = await engine.runRound(ROUND);
 		expect(result.newState).toBe("offline");
 		expect(result.lastError?.code).toBe("migration_failed");
 		expect(result.lastError?.message).toMatch(/completeMigration:.*flip_failed 503/);
 		expect(completeMigration).toHaveBeenCalledTimes(1);
+	});
+
+	it("defers completeMigration when HEAD is born but not yet pushed (bootstrap-merge 409 deadlock fix)", async () => {
+		// Regression: bootstrap merge commits the fresh-local vault in
+		// `ensureOnDefaultBranch` WITHOUT pushing, so HEAD is born before
+		// first-bind migration runs. The pre-fix guard only deferred on an
+		// UNBORN head (`!hasHead()`), so it called `complete-migration` with
+		// the un-pushed commit → backend 409 → fatal → round offline before
+		// the step 7 push → deadlock (push gated behind migration, migration
+		// needs the commit pushed). The fix also defers when HEAD is born but
+		// not reachable from origin/<default>.
+		//
+		// Model that exact state on the empty-legacy (docs=0) path:
+		//   - hasHead() === true               (bootstrap already committed)
+		//   - isAncestor(HEAD, origin/main):
+		//       false on the migration-gate call (not yet pushed) → DEFER,
+		//       true after step 7's steady-state push → 7a retry completes.
+		const isAncestor = vi
+			.fn()
+			.mockResolvedValueOnce(false) // step 3c gate: HEAD not on remote yet → defer
+			.mockResolvedValue(true); //    step 7a retry: pushed now → complete
+		const completeMigration = vi.fn(async () => ({ alreadyMigrated: false }));
+		const backend = makeBackend({
+			mintGitCredentials: dbBackingMint(),
+			getLegacyContent: vi.fn(async () => ({
+				spaceId: 1,
+				spaceSlug: "personal",
+				alreadyMigrated: false,
+				docs: [], // empty legacy space → docs=0 shortcut → tryCompleteMigration
+			})),
+			completeMigration,
+		});
+		const client = makeGitClient({ hasHead: vi.fn(async () => true), isAncestor });
+		const { engine } = makeEngine({ backend, client });
+		const result = await engine.runRound(ROUND);
+
+		// No deadlock: the round must NOT go offline on a 409 — it defers,
+		// pushes, then completes against the now-pushed commit.
+		expect(result.newState).toBe("synced");
+		// The gate call must have deferred (no premature complete-migration on
+		// the un-pushed commit); completion fires once, on the 7a retry.
+		expect(completeMigration).toHaveBeenCalledTimes(1);
+		// The defer condition consulted origin-ancestry (proves we didn't fall
+		// through the old `!hasHead()`-only guard).
+		expect(isAncestor).toHaveBeenCalled();
 	});
 
 	it("goes offline when getLegacyContent errors", async () => {
@@ -2025,6 +2083,10 @@ describe("SyncEngine.runRound — extra coverage (commit summary, migration file
 		});
 		const { engine } = makeEngine({
 			backend,
+			// HEAD already on origin/<default> (cloned/empty-legacy space) →
+			// completion proceeds. The defer-on-unpushed-HEAD fix only short-
+			// circuits when HEAD is born locally but not yet pushed.
+			client: makeGitClient({ isAncestor: vi.fn(async () => true) }),
 			makeLegacyMigration: () =>
 				({ apply: applyLegacy }) as unknown as ReturnType<
 					NonNullable<import("./SyncEngine.js").SyncEngineOpts["makeLegacyMigration"]>
@@ -2062,7 +2124,11 @@ describe("SyncEngine.runRound — extra coverage (commit summary, migration file
 			})),
 			completeMigration,
 		});
-		const client = makeGitClient({ hasHead, push });
+		// `isAncestor: true` models "after the steady-state push the freshly
+		// born HEAD is on origin/<default>". At the gate it's never consulted
+		// (headBorn=false short-circuits the defer condition); on the 7a retry
+		// headBorn=true AND HEAD-on-remote → completion proceeds.
+		const client = makeGitClient({ hasHead, push, isAncestor: vi.fn(async () => true) });
 		const { engine } = makeEngine({ backend, client });
 		const result = await engine.runRound(ROUND);
 		expect(result.newState).toBe("synced");
@@ -2095,7 +2161,10 @@ describe("SyncEngine.runRound — extra coverage (commit summary, migration file
 			})),
 			completeMigration,
 		});
-		const client = makeGitClient({ hasHead, push });
+		// `isAncestor: true` — after the push the born HEAD is on the remote,
+		// so the 7a deferred retry actually calls completeMigration (which
+		// then throws); the round stays green per the lenient posture.
+		const client = makeGitClient({ hasHead, push, isAncestor: vi.fn(async () => true) });
 		const { engine } = makeEngine({ backend, client });
 		const result = await engine.runRound(ROUND);
 		expect(result.newState).toBe("synced");
@@ -2949,7 +3018,9 @@ describe("SyncEngine.runRound — JOLLI-1577 release-lock matrix", () => {
 				docs: [],
 			})),
 		});
-		const { engine } = makeEngine({ backend });
+		// HEAD on origin/<default> (cloned/already-migrated space) so the
+		// defer-on-unpushed-HEAD fix lets completion proceed.
+		const { engine } = makeEngine({ backend, client: makeGitClient({ isAncestor: vi.fn(async () => true) }) });
 		await engine.runRound(ROUND);
 		expect(completeMigration).toHaveBeenCalled();
 		expect(releaseLock).not.toHaveBeenCalled();
@@ -3031,7 +3102,9 @@ describe("SyncEngine.runRound — JOLLI-1577 release-lock matrix", () => {
 				docs: [],
 			})),
 		});
-		const client = makeGitClient({ hasHead });
+		// Gate defers on the first (unborn) hasHead; on the deferred retry
+		// hasHead=true AND HEAD-on-remote (isAncestor=true) → completion fires.
+		const client = makeGitClient({ hasHead, isAncestor: vi.fn(async () => true) });
 		const { engine } = makeEngine({ backend, client });
 		await engine.runRound(ROUND);
 		expect(completeMigration).toHaveBeenCalled();
