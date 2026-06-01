@@ -1907,8 +1907,8 @@ export function buildSidebarScript(): string {
   // Jira / GitHub / Notion). Mirrors renderHoverCard's shape (hc-title +
   // hc-row stack + hc-actions) so the shared popover element (#memory-hover)
   // and its CSS work unchanged. The card swaps the commit-specific fields
-  // (date / commitType / branch / statsLine / hash) for reference-specific
-  // fields (source badge, status / priority / labels / Open-in-<Source> link).
+  // (date / commitType / branch / statsLine / hash) for a source badge, the
+  // opaque per-source fields rows, and an Open-in-<Source> link.
   function renderReferenceHoverCard(mapKey, h) {
     if (!h) return null;
     // Title row: bold title plus a tiny source badge so the user can tell
@@ -1922,27 +1922,14 @@ export function buildSidebarScript(): string {
       el('span', { text: h.title }),
     ]);
     const kids = [titleRow];
-    if (h.status) {
+    // Opaque, source-specific fields: one row each (adapter-chosen icon +
+    // value). The renderer never names a field — a new source just works.
+    for (const f of (h.fields || [])) {
       kids.push(el('div', { className: 'hc-row' }, [
-        el('i', { className: 'codicon codicon-circle-large-filled' }),
-        el('span', { text: h.status }),
+        el('i', { className: 'codicon codicon-' + (f.icon || 'circle-small') }),
+        el('span', { text: f.value }),
       ]));
     }
-    if (h.priority) {
-      kids.push(el('div', { className: 'hc-row' }, [
-        el('i', { className: 'codicon codicon-flame' }),
-        el('span', { text: h.priority }),
-      ]));
-    }
-    if (h.labels) {
-      kids.push(el('div', { className: 'hc-row' }, [
-        el('i', { className: 'codicon codicon-tag' }),
-        el('span', { text: h.labels }),
-      ]));
-    }
-    // assignees / milestone / entityType are reserved on ReferenceHover but
-    // not populated by the current ReferenceService frontmatter parser. When a
-    // follow-up enrichment pass populates them, render rows here.
     // Description preview is intentionally not surfaced — see PlansTreeProvider
     // ReferenceItem comment for the rationale.
     kids.push(el('hr'));

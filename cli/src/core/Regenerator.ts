@@ -228,15 +228,14 @@ async function rebuildReferenceBlocks(
 		const safeToolName = ref.sourceToolName ?? "";
 		let reference: Reference;
 		if (parsed !== null) {
-			// Truncate the description so the prompt budget stays aligned with
-			// the adapter's per-reference cap. The adapter's renderPromptBlock
-			// applies its own cap too; truncating up-front keeps the block
-			// total predictable when many references all carry oversized bodies.
-			const maxChars = sourceMaxChars(ref.source);
-			const desc = parsed.description !== undefined ? truncate(parsed.description, maxChars) : undefined;
+			// Pass the parsed description through untruncated: the adapter's
+			// renderPromptBlock applies the single per-reference truncation, so
+			// regenerate output stays byte-identical to the first-run path (which
+			// also truncates exactly once, inside the adapter). Pre-truncating
+			// here would double-cut an oversized body and emit a wrong
+			// "…[truncated, N more chars]" count.
 			reference = {
 				...parsed,
-				...(desc !== undefined ? { description: desc } : {}),
 				// Override identity / metadata from the commit-time ref so
 				// title / url changes since archival don't leak into the
 				// prompt, mirroring the first-run path which uses the
@@ -245,9 +244,7 @@ async function rebuildReferenceBlocks(
 				url: safeUrl,
 				referencedAt: safeReferencedAt,
 				toolName: safeToolName,
-				...(ref.status !== undefined ? { status: ref.status } : {}),
-				...(ref.priority !== undefined ? { priority: ref.priority } : {}),
-				...(ref.labels !== undefined ? { labels: ref.labels } : {}),
+				...(ref.fields !== undefined && ref.fields.length > 0 ? { fields: ref.fields } : {}),
 			};
 		} else {
 			// Markdown frontmatter unparseable (corrupted or older shape):
@@ -255,7 +252,6 @@ async function rebuildReferenceBlocks(
 			// and embed the raw body as description so the LLM still sees
 			// something. Mirrors the legacy rebuildLinearBlock fallback that
 			// wrapped raw markdown in `<archived-markdown>`.
-			const maxChars = sourceMaxChars(ref.source);
 			reference = {
 				mapKey: ref.archivedKey,
 				source: ref.source,
@@ -264,10 +260,11 @@ async function rebuildReferenceBlocks(
 				url: safeUrl,
 				referencedAt: safeReferencedAt,
 				toolName: safeToolName,
-				description: truncate(md, maxChars),
-				...(ref.status !== undefined ? { status: ref.status } : {}),
-				...(ref.priority !== undefined ? { priority: ref.priority } : {}),
-				...(ref.labels !== undefined ? { labels: ref.labels } : {}),
+				// Raw body passed through untruncated — the adapter applies the
+				// single per-reference truncation, same as the parsed path, so the
+				// "…[truncated, N more chars]" count is correct here too.
+				description: md,
+				...(ref.fields !== undefined && ref.fields.length > 0 ? { fields: ref.fields } : {}),
 			};
 		}
 		const bucket = bySource.get(ref.source);
@@ -286,15 +283,6 @@ async function rebuildReferenceBlocks(
 	}
 	return blocks.join("\n");
 }
-
-/* v8 ignore start -- sourceMaxChars iterates ALL_ADAPTERS to find a matching id. Linear-only adapter registration means the first iteration always matches; the "no match" branch and the final fallback only become reachable when a future SourceId ships without an adapter, which is unreachable today. */
-function sourceMaxChars(source: SourceId): number {
-	for (const adapter of ALL_ADAPTERS) {
-		if (adapter.id === source) return adapter.maxCharsPerReference;
-	}
-	return 4000;
-}
-/* v8 ignore stop */
 
 async function rebuildPlansBlock(
 	summary: CommitSummary,

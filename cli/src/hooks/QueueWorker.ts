@@ -1000,16 +1000,7 @@ async function associateReferencesWithCommit(
 			nativeId: entry.nativeId,
 			title: entry.title,
 			url: entry.url,
-			/* v8 ignore start -- optional-field spreads; each branch represents "field present vs absent" on the Reference which the adapter populates from MCP payloads. Exercised at the adapter layer; pinned here for defensive totality. */
-			...(fullRef.status !== undefined ? { status: fullRef.status } : {}),
-			...(fullRef.priority !== undefined ? { priority: fullRef.priority } : {}),
-			...(fullRef.labels !== undefined && fullRef.labels.length > 0 ? { labels: fullRef.labels } : {}),
-			...(fullRef.assignees !== undefined && fullRef.assignees.length > 0
-				? { assignees: fullRef.assignees }
-				: {}),
-			...(fullRef.milestone !== undefined ? { milestone: fullRef.milestone } : {}),
-			...(fullRef.entityType !== undefined ? { entityType: fullRef.entityType } : {}),
-			/* v8 ignore stop */
+			...(fullRef.fields !== undefined && fullRef.fields.length > 0 ? { fields: fullRef.fields } : {}),
 			referencedAt: fullRef.referencedAt,
 			sourceToolName: entry.sourceToolName,
 		});

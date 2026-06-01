@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { Reference } from "../../../Types.js";
 import { GitHubAdapter } from "./GitHubAdapter.js";
 
+const fieldVal = (r: Reference | null | undefined, key: string): string | undefined =>
+	r?.fields?.find((f) => f.key === key)?.value;
+
 // Real payload shape patterned after jolliai/jolli#959 (mcp__github__issue_read).
 const ISSUE_959_PAYLOAD = {
 	number: 959,
@@ -34,14 +37,14 @@ describe("GitHubAdapter.extractRef", () => {
 			nativeId: "jolliai/jolli#959",
 			title: "Refactor entity discovery pipeline",
 			url: "https://github.com/jolliai/jolli/issues/959",
-			status: "open",
-			labels: ["bug", "p1"],
-			assignees: ["alice", "bob"],
-			milestone: "v1.0",
-			entityType: "Bug",
 			toolName,
 			referencedAt: ts,
 		});
+		expect(fieldVal(ref, "status")).toBe("open");
+		expect(fieldVal(ref, "labels")).toBe("bug, p1");
+		expect(fieldVal(ref, "assignees")).toBe("alice, bob");
+		expect(fieldVal(ref, "milestone")).toBe("v1.0");
+		expect(fieldVal(ref, "entity-type")).toBe("Bug");
 	});
 
 	it("decodes HTML entities in the body into description", () => {
@@ -166,7 +169,7 @@ describe("GitHubAdapter.extractRef", () => {
 			html_url: "https://github.com/o/r/issues/5",
 			milestone: "v2.0",
 		};
-		expect(GitHubAdapter.extractRef(payload, toolName, ts)?.milestone).toBe("v2.0");
+		expect(fieldVal(GitHubAdapter.extractRef(payload, toolName, ts), "milestone")).toBe("v2.0");
 	});
 
 	it("accepts issue_type as a bare string", () => {
@@ -176,7 +179,7 @@ describe("GitHubAdapter.extractRef", () => {
 			html_url: "https://github.com/o/r/issues/6",
 			issue_type: "Feature",
 		};
-		expect(GitHubAdapter.extractRef(payload, toolName, ts)?.entityType).toBe("Feature");
+		expect(fieldVal(GitHubAdapter.extractRef(payload, toolName, ts), "entity-type")).toBe("Feature");
 	});
 
 	it("omits milestone/entityType when present but invalid shape", () => {
@@ -188,8 +191,8 @@ describe("GitHubAdapter.extractRef", () => {
 			issue_type: 42,
 		};
 		const ref = GitHubAdapter.extractRef(payload, toolName, ts);
-		expect(ref?.milestone).toBeUndefined();
-		expect(ref?.entityType).toBeUndefined();
+		expect(fieldVal(ref, "milestone")).toBeUndefined();
+		expect(fieldVal(ref, "entity-type")).toBeUndefined();
 	});
 
 	it("filters non-string labels/assignees and drops the field entirely when empty", () => {
@@ -201,8 +204,8 @@ describe("GitHubAdapter.extractRef", () => {
 			assignees: [null, ""],
 		};
 		const ref = GitHubAdapter.extractRef(payload, toolName, ts);
-		expect(ref?.labels).toEqual(["good"]);
-		expect(ref?.assignees).toBeUndefined();
+		expect(fieldVal(ref, "labels")).toBe("good");
+		expect(fieldVal(ref, "assignees")).toBeUndefined();
 	});
 
 	it("omits status when state is empty/missing", () => {
@@ -212,7 +215,7 @@ describe("GitHubAdapter.extractRef", () => {
 			html_url: "https://github.com/o/r/issues/9",
 			state: "",
 		};
-		expect(GitHubAdapter.extractRef(payload, toolName, ts)?.status).toBeUndefined();
+		expect(fieldVal(GitHubAdapter.extractRef(payload, toolName, ts), "status")).toBeUndefined();
 	});
 
 	it("omits description when body is empty/missing", () => {
@@ -299,19 +302,18 @@ describe("GitHubAdapter.renderPromptBlock", () => {
 		expect(out).not.toContain('id="o/r#100"');
 	});
 
-	it("skips empty labels/assignees attrs (hand-built ref)", () => {
+	it("emits no field attrs when the fields bag is absent (hand-built ref)", () => {
 		const ref: Reference = {
 			mapKey: "github:o/r#1",
 			source: "github",
 			nativeId: "o/r#1",
 			title: "x",
 			url: "https://github.com/o/r/issues/1",
-			labels: [],
-			assignees: [],
 			toolName,
 			referencedAt: ts,
 		};
 		const out = GitHubAdapter.renderPromptBlock([ref]);
+		expect(out).toContain('<issue id="o/r#1">');
 		expect(out).not.toContain("labels=");
 		expect(out).not.toContain("assignees=");
 	});

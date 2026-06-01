@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { Reference } from "../../../Types.js";
 import { NotionAdapter } from "./NotionAdapter.js";
 
+const fieldVal = (r: Reference | null | undefined, key: string): string | undefined =>
+	r?.fields?.find((f) => f.key === key)?.value;
+
 const SAMPLE_TEXT = `<page>
   <title>Adapter spec</title>
   <metadata>type=page</metadata>
@@ -29,10 +32,10 @@ describe("NotionAdapter.extractRef", () => {
 			nativeId: "36c4fc101d34805ab1fdfb3e69144580",
 			title: "Adapter spec",
 			url: REAL_FETCH_PAYLOAD.url,
-			entityType: "page",
 			toolName: fetchTool,
 			referencedAt: ts,
 		});
+		expect(fieldVal(ref, "entity-type")).toBe("page");
 		expect(ref?.description).toContain("Notion Adapter");
 	});
 
@@ -298,7 +301,7 @@ describe("NotionAdapter.renderPromptBlock", () => {
 			nativeId: "36c4fc101d34805ab1fdfb3e69144580",
 			title: "Minimal",
 			url: "https://www.notion.so/36c4fc101d34805ab1fdfb3e69144580",
-			entityType: "page",
+			fields: [{ key: "entity-type", label: "Type", value: "page", icon: "symbol-class" }],
 			toolName: fetchTool,
 			referencedAt: ts,
 		};

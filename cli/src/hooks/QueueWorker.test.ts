@@ -616,9 +616,11 @@ describe("QueueWorker", () => {
 				nativeId: "PROJ-1528",
 				title: "Treat referenced Linear issues",
 				url: "https://linear.app/jolliai/issue/PROJ-1528/",
-				status: "In Progress",
-				priority: "No priority",
-				labels: ["JolliMemory", "Feature"],
+				fields: [
+					{ key: "status", label: "Status", value: "In Progress", icon: "circle-large-filled" },
+					{ key: "priority", label: "Priority", value: "No priority", icon: "flame" },
+					{ key: "labels", label: "Labels", value: "JolliMemory, Feature", icon: "tag" },
+				],
 				description: "## Problem\nbody",
 				toolName: "mcp__linear__get_issue",
 				referencedAt: "2026-05-14T06:06:01.123Z",
@@ -637,6 +639,12 @@ describe("QueueWorker", () => {
 			expect(savedSummary.references?.[0].source).toBe("linear");
 			expect(savedSummary.references?.[0].nativeId).toBe("PROJ-1528");
 			expect(savedSummary.references?.[0].title).toBe("Treat referenced Linear issues");
+			// The opaque fields bag is snapshotted verbatim into the ReferenceCommitRef.
+			expect(savedSummary.references?.[0].fields).toEqual([
+				{ key: "status", label: "Status", value: "In Progress", icon: "circle-large-filled" },
+				{ key: "priority", label: "Priority", value: "No priority", icon: "flame" },
+				{ key: "labels", label: "Labels", value: "JolliMemory, Feature", icon: "tag" },
+			]);
 			// Physical rename through ReferenceStore (referencePath stub returns the
 			// canonical references/<source>/<key>.md location).
 			expect(renameReferenceMarkdown).toHaveBeenCalledWith(

@@ -34,7 +34,7 @@
  * rather than reusing them.
  */
 
-import type { Reference } from "../../../Types.js";
+import type { Reference, ReferenceField } from "../../../Types.js";
 import { escapeForAttr, escapeForText } from "../../PromptXmlEscape.js";
 import type { SourceAdapter } from "./SourceAdapter.js";
 
@@ -88,6 +88,22 @@ function truncate(s: string, max: number): string {
 	return `${s.slice(0, max)}\n…[truncated, ${s.length - max} more chars]`;
 }
 
+/** Build the Jira-specific display fields. Source knowledge lives here only. */
+function buildFields(
+	status: string | undefined,
+	priority: string | undefined,
+	labels: ReadonlyArray<string> | undefined,
+): ReferenceField[] {
+	const fields: ReferenceField[] = [];
+	if (status !== undefined)
+		fields.push({ key: "status", label: "Status", value: status, icon: "circle-large-filled" });
+	if (priority !== undefined) fields.push({ key: "priority", label: "Priority", value: priority, icon: "flame" });
+	if (labels !== undefined && labels.length > 0) {
+		fields.push({ key: "labels", label: "Labels", value: labels.join(", "), icon: "tag" });
+	}
+	return fields;
+}
+
 export const JiraAdapter: SourceAdapter = {
 	id: "jira",
 	mcpPrefix: "mcp__claude_ai_Atlassian__",
@@ -116,15 +132,14 @@ export const JiraAdapter: SourceAdapter = {
 		const labels = readLabels(fields as Record<string, unknown>);
 		const description = readDescription(fields as Record<string, unknown>);
 
+		const refFields = buildFields(status, priority, labels);
 		return {
 			mapKey: `jira:${key}`,
 			source: "jira",
 			nativeId: key,
 			title: summary,
 			url,
-			...(status !== undefined ? { status } : {}),
-			...(priority !== undefined ? { priority } : {}),
-			...(labels !== undefined ? { labels } : {}),
+			...(refFields.length > 0 ? { fields: refFields } : {}),
 			...(description !== undefined ? { description } : {}),
 			toolName,
 			referencedAt,
@@ -153,9 +168,7 @@ export const JiraAdapter: SourceAdapter = {
 
 function renderOne(ref: Reference, maxChars: number): string {
 	const attrs = [`id="${escapeForAttr(ref.nativeId)}"`];
-	if (ref.status) attrs.push(`status="${escapeForAttr(ref.status)}"`);
-	if (ref.priority) attrs.push(`priority="${escapeForAttr(ref.priority)}"`);
-	if (ref.labels && ref.labels.length > 0) attrs.push(`labels="${escapeForAttr(ref.labels.join(", "))}"`);
+	for (const f of ref.fields ?? []) attrs.push(`${f.key}="${escapeForAttr(f.value)}"`);
 	const lines = [`<issue ${attrs.join(" ")}>`];
 	lines.push(`  <title>${escapeForText(ref.title)}</title>`);
 	lines.push(`  <url>${escapeForText(ref.url)}</url>`);

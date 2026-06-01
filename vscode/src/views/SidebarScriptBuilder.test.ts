@@ -1697,11 +1697,15 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toMatch(/'data-hash':\s*mapKey/);
 		});
 
-		it("renders the codicon row stack (status / priority / labels) + Open-in-<Source> action", () => {
+		it("renders one generic codicon row per opaque field + Open-in-<Source> action", () => {
+			// The renderer no longer hardcodes per-field codicons (status / priority
+			// / labels). It iterates the opaque `fields` bag and reads each field's
+			// adapter-chosen icon at runtime, falling back to `circle-small`. The
+			// Open-in-<Source> action keeps its hardcoded link-external icon.
 			const js = buildSidebarScript();
-			expect(js).toContain("codicon-circle-large-filled");
-			expect(js).toContain("codicon-flame");
-			expect(js).toContain("codicon-tag");
+			expect(js).toContain("for (const f of (h.fields || []))");
+			expect(js).toContain("'codicon codicon-' + (f.icon || 'circle-small')");
+			expect(js).toContain("'hc-row'");
 			expect(js).toContain("codicon-link-external");
 		});
 

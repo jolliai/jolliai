@@ -106,7 +106,10 @@ export const NotionAdapter: SourceAdapter = {
 			nativeId: pageId,
 			title,
 			url,
-			entityType: "page",
+			// key "entity-type" matches GitHubAdapter's so the same "Type" concept
+			// uses one persisted key across sources. (Notion never renders fields
+			// into its prompt XML, so this key only affects frontmatter / tooltip.)
+			fields: [{ key: "entity-type", label: "Type", value: "page", icon: "symbol-class" }],
 			...(envelope.content.length > 0 ? { description: envelope.content } : {}),
 			toolName,
 			referencedAt,

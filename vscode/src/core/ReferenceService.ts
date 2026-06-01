@@ -11,9 +11,10 @@
  *
  * Reference contents live on disk at
  * `.jolli/jollimemory/references/<source>/<sanitized-key>.md` with YAML
- * frontmatter (status / priority / labels / referencedAt / sourceToolName /
- * assignees / milestone / entityType / source / nativeId) + markdown body
- * (description). The frontmatter is the machine-parseable face; the body is
+ * frontmatter (source / nativeId / title / url / referencedAt /
+ * sourceToolName core scalars + an opaque `fields:` list of
+ * `{key,label,value,icon?}` objects for all source-specific data) + markdown
+ * body (description). The frontmatter is the machine-parseable face; the body is
  * for human browsing. Defense-in-depth scheme guard at open-in-browser sink:
  * the URL flows through plans.json (a local user-editable file), so re-
  * validate the http(s) scheme at the sink.
@@ -28,6 +29,7 @@ import {
 import type {
 	PlansRegistry,
 	ReferenceEntry,
+	ReferenceField,
 	SourceId,
 } from "../../../cli/src/Types.js";
 import type { ReferenceInfo } from "../Types.js";
@@ -152,11 +154,7 @@ function toReferenceInfo(
 		title: entry.title,
 		url: entry.url,
 		sourcePath: entry.sourcePath,
-		...(frontmatter.status !== undefined ? { status: frontmatter.status } : {}),
-		...(frontmatter.priority !== undefined
-			? { priority: frontmatter.priority }
-			: {}),
-		...(frontmatter.labels !== undefined ? { labels: frontmatter.labels } : {}),
+		...(frontmatter.fields !== undefined ? { fields: frontmatter.fields } : {}),
 		...(frontmatter.description !== undefined
 			? { description: frontmatter.description }
 			: {}),
@@ -177,10 +175,17 @@ function toReferenceInfo(
 }
 
 interface ParsedFrontmatter {
-	readonly status?: string;
-	readonly priority?: string;
-	readonly labels?: ReadonlyArray<string>;
+	readonly fields?: ReadonlyArray<ReferenceField>;
 	readonly description?: string;
+}
+
+/** Structural guard for a persisted {@link ReferenceField} list item. */
+function isReferenceField(v: unknown): v is ReferenceField {
+	if (typeof v !== "object" || v === null) return false;
+	const o = v as Record<string, unknown>;
+	if (typeof o.key !== "string" || typeof o.label !== "string" || typeof o.value !== "string") return false;
+	if (o.icon !== undefined && typeof o.icon !== "string") return false;
+	return true;
 }
 
 /**
@@ -189,10 +194,10 @@ interface ParsedFrontmatter {
  * render id/title/url from the plans.json entry.
  *
  * LOCKSTEP: the authoritative parser lives in `cli/src/core/references/ReferenceStore.ts`
- * and the writer is the same module's render function. Field shapes must
- * agree across both sides. Same precedent as `parseJolliApiKey` (see
- * CLAUDE.md). If the writer format changes, update both readers in the same
- * commit.
+ * and the writer is the same module's render function. The `fields` bag shape
+ * (a list of `{key,label,value,icon?}` JSON objects) must agree across both
+ * sides. Same precedent as `parseJolliApiKey` (see CLAUDE.md). If the writer
+ * format changes, update both readers in the same commit.
  */
 function readFrontmatter(sourcePath: string): ParsedFrontmatter {
 	let content: string;
@@ -222,42 +227,28 @@ function readFrontmatter(sourcePath: string): ParsedFrontmatter {
 	const out: {
 		-readonly [K in keyof ParsedFrontmatter]: ParsedFrontmatter[K];
 	} = {};
-	const labels: string[] = [];
-	let inLabels = false;
+	const refFields: ReferenceField[] = [];
+	let inFields = false;
 	for (const line of fmLines) {
-		if (inLabels) {
+		if (inFields) {
 			const m = /^\s+- (.+)$/.exec(line);
 			if (m) {
 				try {
 					const v = JSON.parse(m[1]) as unknown;
-					if (typeof v === "string") labels.push(v);
+					// Skip a bad-shape item — don't drop already-collected fields.
+					if (isReferenceField(v)) refFields.push(v);
 				} catch {
-					// Skip just this bad label line — don't drop already-collected
-					// fields on one bad line.
+					// Skip just this bad list line.
 				}
 				continue;
 			}
-			inLabels = false;
+			inFields = false;
 		}
-		if (line.trim() === "labels:") {
-			inLabels = true;
-			continue;
+		if (line.trim() === "fields:") {
+			inFields = true;
 		}
-		const kv = /^(status|priority):\s*(.+)$/.exec(line);
-		if (!kv) continue;
-		try {
-			const v = JSON.parse(kv[2]) as unknown;
-			/* v8 ignore start -- non-string JSON literal in a status/priority field is defensive against fuzz; the writer always JSON-stringifies strings. */
-			if (typeof v === "string") {
-				if (kv[1] === "status") out.status = v;
-				else out.priority = v;
-			}
-		} catch {
-			// ignore individual field parse failures
-		}
-		/* v8 ignore stop */
 	}
-	if (labels.length > 0) out.labels = labels;
+	if (refFields.length > 0) out.fields = refFields;
 	if (body.length > 0) out.description = body.slice(0, 200);
 	return out;
 }

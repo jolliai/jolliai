@@ -42,7 +42,7 @@ import { CURRENT_SCHEMA_VERSION } from "../Types.js";
 import { getDiffStats, getTreeHash } from "./GitOps.js";
 import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
-import { sanitizeNativeIdForPath } from "./references/ReferenceStore.js";
+import { isSourceId, sanitizeNativeIdForPath } from "./references/ReferenceStore.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
 import { isSummaryError, LLM_FAILED } from "./SummaryErrorMarker.js";
@@ -2423,6 +2423,16 @@ export async function readNoteFromBranch(id: string, cwd?: string, storage?: Sto
  * filenames — keeps GitHub's `<owner>/<repo>#<n>` collisions impossible.
  */
 function orphanPathFor(source: SourceId, archivedKey: string): string {
+	// Defense-in-depth path-traversal guard. `source` is typed SourceId, but at
+	// runtime it can originate from untrusted data (a webview `data-reference-
+	// source` attribute, a poisoned orphan branch / synced Memory Bank). Since
+	// it is interpolated raw into the filesystem path below, reject anything
+	// that isn't a known SourceId so a `../`-laden value can't escape the
+	// references/ directory. Read callers catch and return null; write callers
+	// surface the error.
+	if (!isSourceId(source)) {
+		throw new Error(`orphanPathFor: refusing unknown reference source ${JSON.stringify(source)}`);
+	}
 	const prefix = `${source}:`;
 	/* v8 ignore next -- defensive: archivedKey is always `${source}:<bareKey>` for entries flowing through storeReferences / ReferenceCommitRef; the bare-key fallback is for hand-passed inputs that don't appear in production data. */
 	const bareKey = archivedKey.startsWith(prefix) ? archivedKey.slice(prefix.length) : archivedKey;

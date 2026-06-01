@@ -78,6 +78,7 @@ vi.mock("vscode", () => ({
 	},
 }));
 
+import type { ReferenceField } from "../../../cli/src/Types.js";
 import { PlansStore } from "../stores/PlansStore.js";
 import type { ReferenceInfo } from "../Types.js";
 import {
@@ -255,6 +256,21 @@ function makeReference(overrides: Partial<ReferenceInfo> = {}): ReferenceInfo {
 	};
 }
 
+/** Builds a Linear-style fields bag (status / priority / labels), omitting empties. */
+function linearFields(opts: { status?: string; priority?: string; labels?: string }): ReferenceField[] {
+	const fields: ReferenceField[] = [];
+	if (opts.status !== undefined) {
+		fields.push({ key: "status", label: "Status", value: opts.status, icon: "circle-large-filled" });
+	}
+	if (opts.priority !== undefined) {
+		fields.push({ key: "priority", label: "Priority", value: opts.priority, icon: "flame" });
+	}
+	if (opts.labels !== undefined) {
+		fields.push({ key: "labels", label: "Labels", value: opts.labels, icon: "tag" });
+	}
+	return fields;
+}
+
 describe("ReferenceItem", () => {
 	it("renders nativeId · title with date-only description (status intentionally omitted)", () => {
 		// buildEntityDescription returns the relative date alone — the
@@ -262,7 +278,7 @@ describe("ReferenceItem", () => {
 		// can drift from the live upstream value (we don't poll), so
 		// surfacing it risked misleading users with stale labels. Tooltip
 		// retains the status for hover-inspection of captured state.
-		const item = new ReferenceItem(makeReference({ status: undefined }));
+		const item = new ReferenceItem(makeReference({ fields: undefined }));
 
 		expect(item.label).toBe("PROJ-1528 — Sample Issue");
 		expect(item.contextValue).toBe("reference");
@@ -323,9 +339,7 @@ describe("ReferenceItem", () => {
 	it("never includes status in the row description even when status is present", () => {
 		const item = new ReferenceItem(
 			makeReference({
-				status: "In Progress",
-				priority: "High",
-				labels: ["bug", "frontend"],
+				fields: linearFields({ status: "In Progress", priority: "High", labels: "bug, frontend" }),
 				description: "A short description of the issue.",
 			}),
 		);
@@ -348,16 +362,12 @@ describe("ReferenceItem", () => {
 		expect(tooltip).not.toContain("$(link-external)");
 	});
 
-	it("tooltip emits the metadata separator when ONLY labels are set (covers the labels-only short-circuit)", () => {
-		// Triple-OR short-circuit: status / priority / labels-length. The
-		// previous tests hit the status-true and status-undefined paths; this
-		// one pins the labels-only branch so the comparator's third operand
-		// is exercised in isolation.
+	it("tooltip emits the metadata separator when ONLY a labels field is set", () => {
+		// A fields bag carrying only a labels entry still produces the metadata
+		// block (one `Label: value` line) without any Status / Priority line.
 		const item = new ReferenceItem(
 			makeReference({
-				status: undefined,
-				priority: undefined,
-				labels: ["bug"],
+				fields: linearFields({ labels: "bug" }),
 			}),
 		);
 		const tooltip = item.tooltip as string;
@@ -378,9 +388,7 @@ describe("ReferenceItem", () => {
 				title: "Roadmap",
 				mapKey: "notion:abcdef0123456789",
 				url: "https://www.notion.so/abcdef0123456789",
-				status: undefined,
-				priority: undefined,
-				labels: undefined,
+				fields: undefined,
 				description: undefined,
 			}),
 		);
@@ -414,11 +422,10 @@ describe("ReferenceItem", () => {
 		// forwards it on the wire so renderEntityHoverCard can produce the
 		// codicon-rich popover. `source` is the new field driving per-provider
 		// badges / Open-in-<X> link labels.
+		const fields = linearFields({ status: "In Progress", priority: "High", labels: "bug, frontend" });
 		const item = new ReferenceItem(
 			makeReference({
-				status: "In Progress",
-				priority: "High",
-				labels: ["bug", "frontend"],
+				fields,
 				description: "A short description of the issue.",
 			}),
 		);
@@ -427,26 +434,22 @@ describe("ReferenceItem", () => {
 			.referenceHover;
 		expect(hover.title).toBe("PROJ-1528 — Sample Issue");
 		expect(hover.source).toBe("linear");
-		expect(hover.status).toBe("In Progress");
-		expect(hover.priority).toBe("High");
-		expect(hover.labels).toBe("bug, frontend");
+		// The opaque fields bag is forwarded verbatim for the renderer to iterate.
+		expect(hover.fields).toEqual(fields);
 		expect(hover.url).toBe("https://linear.app/test/issue/PROJ-1528");
 		// descriptionPreview was removed — even when the source has a
 		// description, the field must NOT appear on the wire payload.
 		expect("descriptionPreview" in hover).toBe(false);
 	});
 
-	it("omits optional fields in referenceHover when the source ReferenceInfo lacks them", () => {
-		// Pins the conditional spread shape: missing status / priority / labels
-		// must NOT appear as undefined keys on the wire (the JSON would still
-		// serialize them, but consumers would have to null-check).
-		const item = new ReferenceItem(makeReference({ status: undefined }));
+	it("omits the fields key in referenceHover when the source ReferenceInfo lacks a fields bag", () => {
+		// Pins the conditional spread shape: an absent fields bag must NOT appear
+		// as an undefined key on the wire (consumers would otherwise null-check).
+		const item = new ReferenceItem(makeReference({ fields: undefined }));
 
 		const hover = (item as unknown as { referenceHover: Record<string, unknown> })
 			.referenceHover;
-		expect("status" in hover).toBe(false);
-		expect("priority" in hover).toBe(false);
-		expect("labels" in hover).toBe(false);
+		expect("fields" in hover).toBe(false);
 		expect(hover.title).toBeDefined();
 		expect(hover.url).toBeDefined();
 		expect(hover.source).toBe("linear");

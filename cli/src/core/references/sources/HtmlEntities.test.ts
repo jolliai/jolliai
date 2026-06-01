@@ -52,4 +52,23 @@ describe("decodeHtmlEntities", () => {
 		// &#x0A; → newline
 		expect(decodeHtmlEntities("a&#x0A;b")).toBe("a\nb");
 	});
+
+	it("passes through lone UTF-16 surrogate code points unchanged (hex)", () => {
+		// U+D800 is a high surrogate. String.fromCodePoint does NOT throw on it —
+		// it would emit a lone surrogate and silently corrupt the text — so the
+		// guard must leave the entity verbatim.
+		expect(decodeHtmlEntities("x&#xD800;y")).toBe("x&#xD800;y");
+		expect(decodeHtmlEntities("x&#xDFFF;y")).toBe("x&#xDFFF;y");
+	});
+
+	it("passes through a lone surrogate code point unchanged (decimal)", () => {
+		// 55296 = 0xD800
+		expect(decodeHtmlEntities("x&#55296;y")).toBe("x&#55296;y");
+	});
+
+	it("still decodes the code points just outside the surrogate block", () => {
+		// U+D7FF (just below) and U+E000 (just above) are valid scalar values.
+		expect(decodeHtmlEntities("&#xD7FF;")).toBe(String.fromCodePoint(0xd7ff));
+		expect(decodeHtmlEntities("&#xE000;")).toBe(String.fromCodePoint(0xe000));
+	});
 });

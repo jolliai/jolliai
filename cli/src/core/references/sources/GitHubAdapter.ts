@@ -24,17 +24,18 @@
  *   - `title` → `title`
  *   - `html_url` → `url`
  *   - `body` → `description` (HTML-entity-decoded via `decodeHtmlEntities`)
+ * Each below becomes one entry in the opaque `fields` bag (key in backticks):
  *   - `state` → `status`
  *   - `labels` → `labels`
- *   - `assignees` → `assignees` (GitHub-specific field on Reference)
+ *   - `assignees` → `assignees`
  *   - `milestone.title` or bare string → `milestone`
- *   - `issue_type.name` or bare string → `entityType`
+ *   - `issue_type.name` or bare string → `entity-type`
  *
  * Adapter modules MUST NOT share helpers across sources (per plan §Constraints).
  * `decodeHtmlEntities` lives in `./HtmlEntities.ts` and is GitHub-only.
  */
 
-import type { Reference } from "../../../Types.js";
+import type { Reference, ReferenceField } from "../../../Types.js";
 import { escapeForAttr, escapeForText } from "../../PromptXmlEscape.js";
 import { decodeHtmlEntities } from "./HtmlEntities.js";
 import type { SourceAdapter } from "./SourceAdapter.js";
@@ -94,6 +95,35 @@ function truncate(s: string, max: number): string {
 	return `${s.slice(0, max)}\n…[truncated, ${s.length - max} more chars]`;
 }
 
+/** Build the GitHub-specific display fields. Source knowledge lives here only. */
+function buildFields(args: {
+	status: string | undefined;
+	labels: ReadonlyArray<string> | undefined;
+	assignees: ReadonlyArray<string> | undefined;
+	milestone: string | undefined;
+	entityType: string | undefined;
+}): ReferenceField[] {
+	const fields: ReferenceField[] = [];
+	if (args.status !== undefined) {
+		fields.push({ key: "status", label: "Status", value: args.status, icon: "circle-large-filled" });
+	}
+	if (args.labels !== undefined && args.labels.length > 0) {
+		fields.push({ key: "labels", label: "Labels", value: args.labels.join(", "), icon: "tag" });
+	}
+	if (args.assignees !== undefined && args.assignees.length > 0) {
+		fields.push({ key: "assignees", label: "Assignees", value: args.assignees.join(", "), icon: "account" });
+	}
+	if (args.milestone !== undefined) {
+		fields.push({ key: "milestone", label: "Milestone", value: args.milestone, icon: "milestone" });
+	}
+	if (args.entityType !== undefined) {
+		// key is "entity-type" (hyphen) to keep the prompt XML attribute name
+		// byte-identical with the pre-bag renderer.
+		fields.push({ key: "entity-type", label: "Type", value: args.entityType, icon: "symbol-class" });
+	}
+	return fields;
+}
+
 export const GitHubAdapter: SourceAdapter = {
 	id: "github",
 	mcpPrefix: "mcp__github__",
@@ -124,17 +154,14 @@ export const GitHubAdapter: SourceAdapter = {
 		const bodyRaw = typeof obj.body === "string" && obj.body.length > 0 ? obj.body : undefined;
 		const description = bodyRaw !== undefined ? decodeHtmlEntities(bodyRaw) : undefined;
 
+		const fields = buildFields({ status: state, labels, assignees, milestone, entityType });
 		return {
 			mapKey: `github:${nativeId}`,
 			source: "github",
 			nativeId,
 			title,
 			url: htmlUrl,
-			...(state !== undefined ? { status: state } : {}),
-			...(labels !== undefined ? { labels } : {}),
-			...(assignees !== undefined ? { assignees } : {}),
-			...(milestone !== undefined ? { milestone } : {}),
-			...(entityType !== undefined ? { entityType } : {}),
+			...(fields.length > 0 ? { fields } : {}),
 			...(description !== undefined ? { description } : {}),
 			toolName,
 			referencedAt,
@@ -163,11 +190,7 @@ export const GitHubAdapter: SourceAdapter = {
 
 function renderOne(ref: Reference, maxChars: number): string {
 	const attrs = [`id="${escapeForAttr(ref.nativeId)}"`];
-	if (ref.status) attrs.push(`status="${escapeForAttr(ref.status)}"`);
-	if (ref.labels && ref.labels.length > 0) attrs.push(`labels="${escapeForAttr(ref.labels.join(", "))}"`);
-	if (ref.assignees && ref.assignees.length > 0) attrs.push(`assignees="${escapeForAttr(ref.assignees.join(", "))}"`);
-	if (ref.milestone) attrs.push(`milestone="${escapeForAttr(ref.milestone)}"`);
-	if (ref.entityType) attrs.push(`entity-type="${escapeForAttr(ref.entityType)}"`);
+	for (const f of ref.fields ?? []) attrs.push(`${f.key}="${escapeForAttr(f.value)}"`);
 	const lines = [`<issue ${attrs.join(" ")}>`];
 	lines.push(`  <title>${escapeForText(ref.title)}</title>`);
 	lines.push(`  <url>${escapeForText(ref.url)}</url>`);
