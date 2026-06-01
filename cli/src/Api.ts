@@ -16,6 +16,7 @@ import { registerDoctorCommand } from "./commands/DoctorCommand.js";
 import { registerDisableCommand, registerEnableCommand } from "./commands/EnableCommand.js";
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
+import { getHelpGroup } from "./commands/HelpGroups.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
@@ -113,12 +114,16 @@ export const parseJolliApiKey = _parseJolliApiKey;
 export const parseBaseUrl = _parseBaseUrl;
 
 // ── Help-grouping configuration ─────────────────────────────────────────────
-// These sets shape `jolli --help`: anything in HIDDEN_COMMANDS is filtered
-// out by `visibleCommands`; the rest is split into Memory / Site product
-// surfaces by name. Commands not in any set fall through to "Other
-// commands:" — `Api.test.ts` has a regression test that fails if a new
-// builtin lands without being categorized, so this list cannot silently
-// drift out of date.
+// These shape `jolli --help`: anything in HIDDEN_COMMANDS is filtered out by
+// `visibleCommands`. The Memory builtins are bucketed by name (MEMORY_COMMAND_NAMES
+// below). The Site / Space sections are bucketed by *provenance* instead — each
+// plugin (or its stub) tags the commands it registers via `setHelpGroup`, and
+// the formatter reads that tag with `getHelpGroup`. Tagging by origin rather
+// than by name keeps a plugin that registers a generic command name (e.g.
+// `init`, `sync`) from being mis-classified into another plugin's section.
+// Commands that are neither a Memory builtin nor tagged fall through to "Other
+// commands:" — `Api.test.ts` has a regression test that fails if a new builtin
+// lands without being categorized, so this list cannot silently drift.
 
 /** Internal commands hidden from `--help` (still callable by name). */
 const HIDDEN_COMMANDS = new Set(["migrate", "export-prompt"]);
@@ -151,9 +156,6 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"sync-memory-bank",
 ]);
 
-/** Commands grouped under "Jolli Site" in `--help`. */
-const SITE_COMMAND_NAMES = new Set(["new", "convert", "dev", "build", "start", "reverse", "theme"]);
-
 const MEMORY_DESCRIPTION = `Auto-documents your AI-assisted development. Lightweight git and AI-agent
 hooks turn each commit into a structured summary (intent, decisions,
 progress) stored on a git orphan branch, so you can recall context across
@@ -162,6 +164,10 @@ branches, machines, and teammates.`;
 const SITE_DESCRIPTION = `Generates a docs site from a content folder of Markdown/MDX and OpenAPI
 specs. Scaffold a new project, build a static site with full-text search,
 or run a hot-reload dev server while you write.`;
+
+const SPACE_DESCRIPTION = `Sync your Markdown docs with a Jolli Space, map source repositories, and
+run documentation impact analysis on your changes — plus an interactive AI
+agent. Provided by the @jolli.ai/space-cli plugin.`;
 
 /**
  * Main CLI entry point.
@@ -205,9 +211,12 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 				.join("\n");
 
 		const memoryCmds = visibleCmds.filter((c) => MEMORY_COMMAND_NAMES.has(c.name()));
-		const siteCmds = visibleCmds.filter((c) => SITE_COMMAND_NAMES.has(c.name()));
+		const siteCmds = visibleCmds.filter((c) => getHelpGroup(c) === "site");
+		const spaceCmds = visibleCmds.filter((c) => getHelpGroup(c) === "space");
+		// Anything that isn't a Memory builtin and carries no plugin group tag —
+		// e.g. a third-party plugin's command — falls through to "Other commands:".
 		const otherCmds = visibleCmds.filter(
-			(c) => !MEMORY_COMMAND_NAMES.has(c.name()) && !SITE_COMMAND_NAMES.has(c.name()),
+			(c) => !MEMORY_COMMAND_NAMES.has(c.name()) && getHelpGroup(c) === undefined,
 		);
 
 		const lines: string[] = [];
@@ -258,6 +267,18 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 			lines.push(renderSectionDescription(SITE_DESCRIPTION), "");
 			lines.push("Commands:");
 			for (const c of siteCmds) {
+				lines.push(formatRow(helper.subcommandTerm(c), helper.subcommandDescription(c)));
+			}
+			lines.push("");
+		}
+
+		/* v8 ignore start -- root program always registers Jolli Space commands (real plugin or stubs) */
+		if (spaceCmds.length > 0) {
+			/* v8 ignore stop */
+			lines.push("Jolli Space — Sync docs, map sources, and analyze documentation impact");
+			lines.push(renderSectionDescription(SPACE_DESCRIPTION), "");
+			lines.push("Commands:");
+			for (const c of spaceCmds) {
 				lines.push(formatRow(helper.subcommandTerm(c), helper.subcommandDescription(c)));
 			}
 			lines.push("");

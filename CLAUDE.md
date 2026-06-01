@@ -119,7 +119,7 @@ When the plugin isn't installed, [`SiteCommandStubs.ts`](cli/src/commands/SiteCo
 Things to remember when working on plugin-adjacent code in this repo:
 
 - **Adding a new known plugin** = one entry in `KNOWN_PLUGINS` in `KnownPlugins.ts` (id, packageName, installHint, optional `registerStub` callback). PluginLoader derives `KNOWN_PLUGIN_IDS` from this list, so the discovery allowlist updates automatically.
-- **A plugin with no stub** (e.g. cli-pro) is silently absent when missing — the user sees nothing in `--help` for it. Only plugins with a `registerStub` field appear when the package isn't installed.
+- **A plugin with no stub** is silently absent when missing — the user sees nothing in `--help` for it. Only plugins with a `registerStub` field appear when the package isn't installed. Both shipping plugins currently register stubs: `@jolli.ai/site-cli` ([`SiteCommandStubs.ts`](cli/src/commands/SiteCommandStubs.ts), grouped under "Jolli Site") and `@jolli.ai/space-cli` ([`SpaceCommandStubs.ts`](cli/src/commands/SpaceCommandStubs.ts), grouped under "Jolli Space").
 - **Don't add `optionalDependencies` for plugins.** The host CLI has zero npm coupling to its plugins. Users `npm install -g` the host and the plugin separately; the plugin declares the host in its own `peerDependencies` (`>=` form, not `^`, so plugins survive host minor bumps).
 - **Don't reintroduce `cli/src/site/`.** Anything site-rendering-related belongs in the plugin's repo, not here.
 - **Three places consume the plugin's `jolliPluginId`** (host CLI in this repo, the plugin's `package.json`, and the plugin's CI release verification). Renaming an ID is fine — it's an opaque UUID, not a public name — but all three must be updated in lockstep.

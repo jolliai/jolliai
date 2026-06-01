@@ -134,7 +134,7 @@ describe("AuthConfig", () => {
 
 		it("does not clear jolliUrl, so the on-disk merge preserves it across logout", async () => {
 			// `jolliUrl` is intentionally retained on logout so closed-source
-			// consumers (cli-pro, IDE plugins) can still resolve the tenant
+			// consumers (space-cli, IDE plugins) can still resolve the tenant
 			// when the user signs in again. Regression-guarding this: the
 			// saveConfig payload must omit `jolliUrl` entirely (not set it to
 			// undefined), so SessionTracker.saveConfigScoped's spread-merge

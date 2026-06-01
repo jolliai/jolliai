@@ -823,7 +823,7 @@ export interface JolliMemoryConfig {
 	readonly authToken?: string;
 	/**
 	 * The Jolli server origin the user logged into via `jolli auth login`,
-	 * persisted so cli-pro can recover the tenant URL when `jolliApiKey` is
+	 * persisted so space-cli can recover the tenant URL when `jolliApiKey` is
 	 * missing or stale. Pure URL — no secret material. Trailing slash stripped
 	 * on write to match `getJolliUrl`.
 	 *

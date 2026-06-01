@@ -43,6 +43,7 @@ import { pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { satisfies } from "semver";
 import type { PluginContext, PluginRegister } from "./Api.js";
+import { setHelpGroup } from "./commands/HelpGroups.js";
 import { getGlobalConfigDir } from "./core/SessionTracker.js";
 import { KNOWN_PLUGINS } from "./KnownPlugins.js";
 import { createLogger } from "./Logger.js";
@@ -121,8 +122,13 @@ export interface NpmRootGlobalOptions {
 }
 
 /**
- * Discover and load all plugins, returning the set of plugin IDs that were
- * successfully discovered on disk. Always non-throwing — failures become
+ * Discover and load all plugins, returning the set of plugin IDs that
+ * actually registered. A plugin discovered on disk but rejected by
+ * {@link loadOnePlugin} (peer mismatch, malformed `main`, missing entry,
+ * import failure, or a throwing `register()`) is **not** in the returned set,
+ * so {@link registerMissingStubs} still installs its stub fallback — an
+ * installed-but-unloadable plugin keeps its `--help` section and install hint
+ * instead of silently vanishing. Always non-throwing — failures become
  * warnings.
  *
  * Wire-in point in `Api.ts main()`: call this after all builtin command
@@ -150,11 +156,14 @@ export async function loadPlugins(
 	const roots = await resolveRoots(opts);
 	const found = await discoverPlugins(roots, scopes, allowlist);
 
+	const loaded = new Set<string>();
 	for (const plugin of found) {
-		await loadOnePlugin(program, cliVersion, plugin);
+		if (await loadOnePlugin(program, cliVersion, plugin)) {
+			loaded.add(plugin.pluginId);
+		}
 	}
 
-	return new Set(found.map((p) => p.pluginId));
+	return loaded;
 }
 
 /**
@@ -163,8 +172,8 @@ export async function loadPlugins(
  *
  * Idempotent isn't a guarantee — call this once per `main()`. Failures inside
  * a stub registration are caught and warned so a single broken stub doesn't
- * tear down the host. Plugins without a stub field (e.g. cli-pro) are
- * silently absent when missing — the user sees nothing in `--help` for them.
+ * tear down the host. A plugin that omits the `registerStub` field is
+ * silently absent when missing — the user sees nothing in `--help` for it.
  */
 export function registerMissingStubs(program: Command, loadedPluginIds: ReadonlySet<string>): void {
 	for (const known of KNOWN_PLUGINS) {
@@ -452,6 +461,14 @@ async function discoverPlugins(
  * Load a single plugin: validate peerDep, dynamic-import, call register, prune conflicts.
  * All errors are caught and warned — never thrown to the caller.
  *
+ * Returns `true` only when the plugin's `register()` ran to completion (peer
+ * range satisfied, entry resolved + imported, `register` present and not
+ * throwing). Every rejection path returns `false` so the caller can fall back
+ * to the plugin's stub — a discovered-but-broken plugin must not suppress its
+ * own `--help` section. A `register()` that throws partway counts as `false`:
+ * the stub registration that follows is collision-tolerant, so any commands it
+ * managed to add before throwing are left in place and the stub fills the rest.
+ *
  * The entire function body is wrapped in a top-level try/catch so that
  * unanticipated throws (e.g. `pkg.main` being a non-string, which would
  * crash `resolve()` / `pathToFileURL()` with `TypeError`) cannot escape and
@@ -459,14 +476,14 @@ async function discoverPlugins(
  * site-specific warning before returning; the outer catch only fires for
  * the surprises.
  */
-async function loadOnePlugin(program: Command, cliVersion: string, plugin: FoundPlugin): Promise<void> {
-	const { name, dir, pkg } = plugin;
+async function loadOnePlugin(program: Command, cliVersion: string, plugin: FoundPlugin): Promise<boolean> {
+	const { name, dir, pkg, pluginId } = plugin;
 
 	try {
 		const peerRange = pkg.peerDependencies?.["@jolli.ai/cli"];
 		if (peerRange && !satisfies(cliVersion, peerRange, { includePrerelease: true })) {
 			warn(`${name} requires @jolli.ai/cli ${peerRange}, but ${cliVersion} is installed — skipping`);
-			return;
+			return false;
 		}
 
 		// `pkg.main` is typed as `unknown` because `JSON.parse` can hand us
@@ -475,7 +492,7 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 		const rawMain = pkg.main;
 		if (rawMain !== undefined && typeof rawMain !== "string") {
 			warn(`${name} package.json "main" is ${typeof rawMain}, expected string — skipping`);
-			return;
+			return false;
 		}
 		const entryRelative = rawMain ?? "./dist/Plugin.js";
 		const entryAbs = resolve(dir, entryRelative);
@@ -487,11 +504,11 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 		const entryRel = relative(dir, entryAbs);
 		if (entryRel.startsWith("..") || isAbsolute(entryRel)) {
 			warn(`${name} entry ${entryRelative} resolves outside plugin directory — skipping`);
-			return;
+			return false;
 		}
 		if (!existsSync(entryAbs)) {
 			warn(`${name} entry ${entryRelative} not found at ${entryAbs} — skipping`);
-			return;
+			return false;
 		}
 
 		// Note: there is a TOCTOU window between this `existsSync` and the
@@ -510,12 +527,12 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 			mod = await import(pathToFileURL(entryAbs).href);
 		} catch (err) {
 			warn(`${name} failed to load: ${errMessage(err)}`);
-			return;
+			return false;
 		}
 
 		if (typeof mod.register !== "function") {
 			warn(`${name} has no exported "register" function — skipping`);
-			return;
+			return false;
 		}
 
 		// Snapshot the full occupied top-level namespace — primary names AND
@@ -537,14 +554,28 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 			logger: createLogger(`plugin:${name}`),
 		};
 
+		// Snapshot the existing command set so we can tag exactly the commands
+		// this plugin adds during register() with its help group (if any). Tagging
+		// by provenance keeps the help formatter from mis-bucketing a plugin's
+		// generic command name (e.g. `init`, `sync`) into another section.
+		const commandsBefore = new Set<Command>(program.commands);
+
 		const blockedNames = new Set<string>();
 		const restoreCommand = patchProgramCommand(program, occupiedNames, blockedNames);
 		try {
 			await mod.register(ctx);
 		} catch (err) {
 			warn(`${name} register() threw: ${errMessage(err)}`);
+			return false;
 		} finally {
 			restoreCommand();
+		}
+
+		const helpGroup = KNOWN_PLUGINS.find((p) => p.id === pluginId)?.helpGroup;
+		if (helpGroup) {
+			for (const c of program.commands) {
+				if (!commandsBefore.has(c)) setHelpGroup(c, helpGroup);
+			}
 		}
 
 		if (blockedNames.size > 0) {
@@ -556,12 +587,15 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 			// without sifting through host-level warnings.
 			ctx.logger.warn(conflictMsg);
 		}
+
+		return true;
 	} catch (err) {
 		// Safety net: anything that wasn't caught at a more specific site
 		// (e.g. malformed JSON yielding pkg.main as an array, a buggy fs
 		// implementation throwing on existsSync) lands here so loadPlugins
 		// keeps iterating and the CLI keeps running.
 		warn(`${name} unexpected loader error: ${errMessage(err)}`);
+		return false;
 	}
 }
 

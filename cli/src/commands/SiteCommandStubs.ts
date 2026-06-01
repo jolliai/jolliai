@@ -24,6 +24,7 @@
  */
 
 import type { Command } from "commander";
+import { setHelpGroup } from "./HelpGroups.js";
 
 interface StubSpec {
 	name: string;
@@ -57,10 +58,21 @@ const INSTALL_COMMAND = "npm install -g @jolli.ai/site-cli";
  * original argv from triggering Commander's "unknown option" rejection,
  * so a user typing `jolli new my-site --some-flag` sees the install hint
  * instead of a parser error.
+ *
+ * Registration is collision-tolerant (see `SpaceCommandStubs` for the
+ * rationale): a stub whose name is already occupied is skipped rather than
+ * letting Commander's duplicate-name throw abort the rest of the batch.
  */
 export function registerSiteCommandStubs(program: Command): void {
+	const occupied = new Set<string>();
+	for (const c of program.commands) {
+		occupied.add(c.name());
+		for (const a of c.aliases()) occupied.add(a);
+	}
+
 	for (const { name, description } of SITE_COMMAND_STUBS) {
-		program
+		if (occupied.has(name)) continue;
+		const cmd = program
 			.command(name)
 			.description(`${description} (requires @jolli.ai/site-cli)`)
 			.argument("[args...]", "Arguments forwarded to the real command once installed")
@@ -76,5 +88,7 @@ export function registerSiteCommandStubs(program: Command): void {
 				console.error("");
 				process.exit(1);
 			});
+		setHelpGroup(cmd, "site");
+		occupied.add(name);
 	}
 }

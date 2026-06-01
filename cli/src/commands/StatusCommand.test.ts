@@ -228,7 +228,7 @@ describe("StatusCommand — Jolli Site display", () => {
 	});
 
 	it("relabels the row as 'Last signed-in site' when the user is signed out but jolliUrl was retained", async () => {
-		// `clearAuthCredentials` intentionally keeps `jolliUrl` so cli-pro can
+		// `clearAuthCredentials` intentionally keeps `jolliUrl` so space-cli can
 		// still resolve the tenant after logout. Without the relabel, the row
 		// reads identically to an active session and a user looking at it
 		// could think they're still connected to the tenant.
