@@ -220,6 +220,28 @@ export function getTranscriptIds(summary: CommitSummary): ReadonlyArray<string> 
 }
 
 /**
+ * Like `getTranscriptIds`, but for the WRITE side: when materializing an
+ * authoritative v5 `transcripts` array from a (possibly legacy) summary, the
+ * legacy tree-walk must be filtered to IDs that actually have a backing
+ * `transcripts/<id>.json` file (`existingFileIds`). v5 input is already
+ * authoritative and passes through unchanged.
+ *
+ * This mirrors the v5 migration's `upgradeOneSummary` filtering, so the live
+ * construction paths (migrateOneToOne / mergeManyToOne / the panel's lazy
+ * upgrade) and the migration agree on which IDs land in the authoritative
+ * array — without it, a squash/rebase/amend of legacy data bakes "dangling"
+ * commit-hash IDs (commits that never had an AI session, so no file) into the
+ * v5 record, violating the "authoritative + file-backed" contract.
+ */
+export function resolveTranscriptIdsFiltered(
+	summary: CommitSummary,
+	existingFileIds: ReadonlySet<string>,
+): ReadonlyArray<string> {
+	if (summary.transcripts !== undefined) return summary.transcripts;
+	return collectAllTranscriptHashes(summary).filter((id) => existingFileIds.has(id));
+}
+
+/**
  * Updates a topic at a global index within the tree, returning a new tree.
  * The global index follows the same chronological order as `collectAllTopics`.
  * Returns null if the index is out of range.

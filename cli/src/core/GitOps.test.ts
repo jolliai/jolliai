@@ -87,8 +87,11 @@ function mockFailure(code: number | string, stderr: string, stdout = ""): void {
 function mockSpawnSuccess(stdout: string): void {
 	mockSpawn.mockImplementationOnce(() => {
 		// stdin is itself an EventEmitter so production code that attaches
-		// `proc.stdin.on('error', ...)` doesn't blow up on these mocks.
-		const stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
+		// `proc.stdin.on('error', ...)` doesn't blow up on these mocks. `write`
+		// returns true (buffer not full) so the backpressure-aware writer in
+		// runFastImport streams straight through without awaiting a `drain`
+		// that these one-shot mocks never emit.
+		const stdin = Object.assign(new EventEmitter(), { write: vi.fn().mockReturnValue(true), end: vi.fn() });
 		const proc = Object.assign(new EventEmitter(), {
 			stdin,
 			stdout: new EventEmitter(),
@@ -110,8 +113,11 @@ function mockSpawnSuccess(stdout: string): void {
 function mockSpawnFailure(exitCode: number, stderr: string): void {
 	mockSpawn.mockImplementationOnce(() => {
 		// stdin is itself an EventEmitter so production code that attaches
-		// `proc.stdin.on('error', ...)` doesn't blow up on these mocks.
-		const stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
+		// `proc.stdin.on('error', ...)` doesn't blow up on these mocks. `write`
+		// returns true (buffer not full) so the backpressure-aware writer in
+		// runFastImport streams straight through without awaiting a `drain`
+		// that these one-shot mocks never emit.
+		const stdin = Object.assign(new EventEmitter(), { write: vi.fn().mockReturnValue(true), end: vi.fn() });
 		const proc = Object.assign(new EventEmitter(), {
 			stdin,
 			stdout: new EventEmitter(),
@@ -134,8 +140,11 @@ function mockSpawnFailure(exitCode: number, stderr: string): void {
 function mockSpawnStreamingSuccess(chunks: ReadonlyArray<Buffer | string>): void {
 	mockSpawn.mockImplementationOnce(() => {
 		// stdin is itself an EventEmitter so production code that attaches
-		// `proc.stdin.on('error', ...)` doesn't blow up on these mocks.
-		const stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
+		// `proc.stdin.on('error', ...)` doesn't blow up on these mocks. `write`
+		// returns true (buffer not full) so the backpressure-aware writer in
+		// runFastImport streams straight through without awaiting a `drain`
+		// that these one-shot mocks never emit.
+		const stdin = Object.assign(new EventEmitter(), { write: vi.fn().mockReturnValue(true), end: vi.fn() });
 		const proc = Object.assign(new EventEmitter(), {
 			stdin,
 			stdout: new EventEmitter(),
@@ -1055,6 +1064,74 @@ describe("GitOps", () => {
 			await expect(
 				writeMultipleFilesToBranch("branch", [{ path: "test.json", content: "{}" }], "msg"),
 			).rejects.toThrow("write EPIPE");
+		});
+
+		it("honors backpressure: waits for 'drain' when stdin.write reports the buffer is full", async () => {
+			// The streaming writer must pause on `write() === false` and resume on
+			// the next `drain` rather than queuing every chunk in memory. Here the
+			// first chunk reports the buffer full; the writer awaits `drain`, then
+			// streams the rest and finishes. If backpressure were mishandled the
+			// promise would hang (write returned false, no further progress).
+			mockHappyPathPreamble("parent_hash");
+			mockSpawn.mockImplementationOnce(() => {
+				const stdin = Object.assign(new EventEmitter(), {
+					// Buffer full on the first chunk, fine for every chunk after.
+					write: vi.fn().mockReturnValueOnce(false).mockReturnValue(true),
+					end: vi.fn(),
+				});
+				const proc = Object.assign(new EventEmitter(), {
+					stdin,
+					stdout: new EventEmitter(),
+					stderr: new EventEmitter(),
+				});
+				queueMicrotask(() => {
+					// Release the awaited `drain`, then let fast-import exit cleanly.
+					stdin.emit("drain");
+					queueMicrotask(() => proc.emit("close", 0));
+				});
+				return proc;
+			});
+
+			await expect(
+				writeMultipleFilesToBranch(
+					"branch",
+					[
+						{ path: "a.json", content: '{"a":1}' },
+						{ path: "b.json", content: '{"b":2}' },
+					],
+					"msg",
+				),
+			).resolves.toBeUndefined();
+
+			// Writing continued past the drain (more than the single full chunk).
+			const proc = mockSpawn.mock.results[0].value;
+			expect(proc.stdin.write.mock.calls.length).toBeGreaterThan(1);
+		});
+
+		it("C-style-quotes an M-directive path containing a double-quote or newline", async () => {
+			// fast-import REQUIRES quoting when a path contains LF or starts with
+			// a quote; an unquoted such path would split the directive / corrupt
+			// the stream. Program-generated paths never hit this, but the writer
+			// must stay correct for arbitrary paths.
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnSuccess("");
+
+			await writeMultipleFilesToBranch("branch", [{ path: 'a"b\nc.json', content: "{}" }], "msg");
+
+			const stream = captureFastImportStdin();
+			// `"` → `\"`, LF → `\n`, wrapped in double-quotes. The directive stays
+			// on one line because the embedded newline is now escaped.
+			expect(stream).toContain('M 100644 :1 "a\\"b\\nc.json"\n');
+		});
+
+		it("leaves an ordinary (quote/newline-free) path unquoted in the M directive", async () => {
+			mockHappyPathPreamble("parent_hash");
+			mockSpawnSuccess("");
+
+			await writeMultipleFilesToBranch("branch", [{ path: "summaries/abc.json", content: "{}" }], "msg");
+
+			const stream = captureFastImportStdin();
+			expect(stream).toContain("M 100644 :1 summaries/abc.json\n");
 		});
 	});
 

@@ -1483,6 +1483,31 @@ describe("Extension", () => {
 			expect(mockCommitsStore.setMigrating).toHaveBeenCalledWith(true);
 			expect(mockCommitsStore.setMigrating).toHaveBeenCalledWith(false);
 		});
+
+		it("skips the v5 migration call (no UI flicker) when already completed", async () => {
+			// Needed-check: when readSchemaV5State reports completed, activate must
+			// NOT call migrateSchemaToV5 (and must not toggle the v5 spinner) — the
+			// common already-migrated path should be a silent no-op.
+			const { readSchemaV5State, migrateSchemaToV5 } = await import("../../cli/src/core/SchemaV5Migration.js");
+			vi.mocked(migrateSchemaToV5).mockClear();
+			vi.mocked(readSchemaV5State).mockResolvedValueOnce({
+				version: 1,
+				status: "completed",
+				startedAt: "2026-06-01T00:00:00Z",
+				completedAt: "2026-06-01T00:00:05Z",
+				migratedCount: 3,
+				skippedCount: 0,
+				fresh: false,
+			});
+
+			const ctx = makeContext();
+			activate(ctx);
+
+			await vi.waitFor(() => {
+				expect(readSchemaV5State).toHaveBeenCalled();
+			});
+			expect(migrateSchemaToV5).not.toHaveBeenCalled();
+		});
 	});
 
 	// ── KB folder auto-init / v3 stale-child cleanup on activate ─────────────

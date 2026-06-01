@@ -685,22 +685,22 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		? { source: winning.source, version: winning.version }
 		: undefined;
 
-	// v5 schema migration state — only meaningful when an orphan branch
-	// exists (a project that's never had jollimemory data has no state to
-	// report). Reads the state file on the orphan branch; null = pending.
+	// v5 schema migration state. `readSchemaV5State` reads through the active
+	// StorageProvider (passed `storage` when the VS Code bridge supplies one,
+	// otherwise constructed from `cwd`), so this reports correctly in
+	// folder-only mode too — NOT gated on `branchExists`, which would leave
+	// folder-only repos (no orphan branch) permanently showing "Not migrated".
+	// `null` = pending → schemaV5 stays undefined, same as a genuinely empty
+	// repo with no data to migrate.
 	let schemaV5: StatusInfo["schemaV5"];
-	let schemaV5Fresh: StatusInfo["schemaV5Fresh"];
-	if (branchExists) {
-		try {
-			const state = await readSchemaV5State(projectDir);
-			if (state) {
-				schemaV5 = state.status;
-				schemaV5Fresh = state.fresh;
-			}
-		} catch {
-			// Read errors are non-fatal — leave schemaV5 undefined ("unknown") so
-			// the status display can prompt the user to check / re-run migrate.
+	try {
+		const state = await readSchemaV5State(projectDir, storage);
+		if (state) {
+			schemaV5 = state.status;
 		}
+	} catch {
+		// Read errors are non-fatal — leave schemaV5 undefined ("unknown") so
+		// the status display can prompt the user to check / re-run migrate.
 	}
 
 	const status: StatusInfo = {
@@ -741,7 +741,6 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		sessionsBySource,
 		openCodeScanError,
 		...(schemaV5 !== undefined && { schemaV5 }),
-		...(schemaV5Fresh !== undefined && { schemaV5Fresh }),
 	};
 
 	log.info(

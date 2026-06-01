@@ -24,3 +24,21 @@ import { randomUUID } from "node:crypto";
 export function generateTranscriptId(): string {
 	return randomUUID();
 }
+
+/** Matches a transcript file path `transcripts/<id>.json`, capturing the ID. */
+const TRANSCRIPT_FILE_PATH = /^transcripts\/(.+)\.json$/;
+
+/**
+ * Extracts the opaque transcript ID from a `transcripts/<id>.json` storage
+ * path, or returns null when the path is not a transcript file. The ID is
+ * format-agnostic (legacy hex commit hashes AND v5 UUIDs with hyphens both
+ * match) — see `SummaryStore.getTranscriptHashes` for the bug that a stricter
+ * `[a-f0-9]+` pattern caused.
+ *
+ * Single source of truth: both `SummaryStore.getTranscriptHashes` and the v5
+ * migration parse transcript filenames, and they patch the same "dropped UUID"
+ * bug — keeping the regex here stops the two copies from drifting apart.
+ */
+export function transcriptIdFromPath(path: string): string | null {
+	return TRANSCRIPT_FILE_PATH.exec(path)?.[1] ?? null;
+}

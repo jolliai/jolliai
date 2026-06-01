@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("./GitOps.js", () => ({
 	readFileFromBranch: vi.fn(),
 	writeMultipleFilesToBranch: vi.fn(),
-	listFilesInBranch: vi.fn(),
+	// Default to an empty listing so `getTranscriptHashes` (now called by
+	// migrateOneToOne / mergeManyToOne to file-filter legacy transcript IDs)
+	// resolves to an iterable instead of `undefined`. Tests that need specific
+	// transcript files present override per-case.
+	listFilesInBranch: vi.fn().mockResolvedValue([]),
 	getTreeHash: vi.fn(),
 	getDiffStats: vi.fn(),
 	ensureOrphanBranch: vi.fn(),
@@ -129,6 +133,12 @@ describe("SummaryStore", () => {
 		vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 5, deletions: 2 });
 		vi.mocked(acquireOrphanWriteLock).mockResolvedValue(true);
 		vi.mocked(releaseOrphanWriteLock).mockResolvedValue(undefined);
+		// Default empty transcript listing so `getTranscriptHashes` (called by
+		// migrateOneToOne / mergeManyToOne to file-filter legacy transcript IDs)
+		// resolves to an iterable. `resetAllMocks` wipes the factory default each
+		// test, so re-establish it here. Tests needing specific transcript files
+		// present override with `mockResolvedValueOnce`.
+		vi.mocked(listFilesInBranch).mockResolvedValue([]);
 	});
 
 	describe("storeSummary", () => {
@@ -760,6 +770,65 @@ describe("SummaryStore", () => {
 	});
 
 	describe("migrateOneToOne", () => {
+		it("hoists recap from a v3 squash root's children (recap not dropped on rebase-pick)", async () => {
+			// A v3 squash root keeps its recap on children, not the root. Reading
+			// oldSummary.recap directly would drop it; resolveEffectiveRecap picks
+			// the newest descendant's recap (mirrors normalizeToV4 + topics).
+			const oldHash = "oldhash0000000000000rec";
+			const newHash = "newhash0000000000000rec";
+			const oldSummary: CommitSummary = {
+				...createMockSummary(oldHash, "Squashed feature"),
+				recap: undefined, // root carries no recap (v3 squash shape)
+				children: [
+					{ ...createMockSummary("child0000000000000001"), recap: "Implemented the dark-mode toggle." },
+				],
+			};
+
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "Rebased"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const newSummary = JSON.parse(files[0].content) as CommitSummary;
+			expect(newSummary.recap).toBe("Implemented the dark-mode toggle.");
+		});
+
+		it("filters legacy-derived transcript IDs to those with a backing file (#4: no dangling IDs)", async () => {
+			// Legacy (v3) input → transcripts derived from the children tree, then
+			// filtered to commit hashes that actually have a transcript file —
+			// mirrors the v5 migration so a rebase-pick doesn't bake a dangling ID
+			// (a session-less commit) into the authoritative v5 array.
+			const oldHash = "oldhash0000000000000abc";
+			const newHash = "newhash0000000000000def";
+			const oldSummary = createMockSummary(oldHash, "Old message"); // v3, no transcripts field
+
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+			// Only the old commit's transcript file exists on disk.
+			vi.mocked(listFilesInBranch).mockResolvedValueOnce([`transcripts/${oldHash}.json`]);
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const newSummary = JSON.parse(files[0].content) as CommitSummary;
+			expect(newSummary.transcripts).toEqual([oldHash]);
+		});
+
+		it("drops a legacy transcript ID with no backing file from the migrated v5 array (#4)", async () => {
+			const oldHash = "oldhash0000000000000abc";
+			const newHash = "newhash0000000000000def";
+			const oldSummary = createMockSummary(oldHash, "Old message"); // session-less: no file
+
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+			// No transcript files on disk → the dangling hash must not be carried.
+			vi.mocked(listFilesInBranch).mockResolvedValueOnce([]);
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const newSummary = JSON.parse(files[0].content) as CommitSummary;
+			expect(newSummary.transcripts).toEqual([]);
+		});
+
 		it("should create a rebase container node wrapping the old summary as a child", async () => {
 			const oldHash = "oldhash0000000000000001";
 			const newHash = "newhash0000000000000002";
@@ -1074,6 +1143,25 @@ describe("SummaryStore", () => {
 	});
 
 	describe("mergeManyToOne", () => {
+		it("unions only file-backed legacy transcript IDs into the merged root (#4: no dangling IDs)", async () => {
+			const oldHash1 = "oldhash00000000000000a1";
+			const oldHash2 = "oldhash00000000000000a2";
+			const newHash = "newhash00000000000000a3";
+			// Two legacy (v3) sources; only the first has a transcript file.
+			const summary1 = createMockSummary(oldHash1, "First");
+			const summary2 = createMockSummary(oldHash2, "Second"); // session-less
+
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+			vi.mocked(listFilesInBranch).mockResolvedValueOnce([`transcripts/${oldHash1}.json`]);
+
+			await mergeManyToOne([summary1, summary2], createMockCommitInfo(newHash, "Squashed"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			// oldHash2 had no transcript file → excluded; oldHash1 survives.
+			expect(merged.transcripts).toEqual([oldHash1]);
+		});
+
 		it("should place all source summaries as children sorted by commitDate descending", async () => {
 			const oldHash1 = "oldhash0000000000000001";
 			const oldHash2 = "oldhash0000000000000002";

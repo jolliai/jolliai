@@ -1290,6 +1290,34 @@ describe("Installer", () => {
 			expect(status.summaryCount).toBe(42);
 		});
 
+		it("projects the v5 migration state onto StatusInfo (not gated on the orphan branch)", async () => {
+			// Reads go through readSchemaV5State, which resolves via the active
+			// StorageProvider — so a folder-only repo (no orphan branch) still
+			// reports its real migration state instead of permanently "Not
+			// migrated". orphanBranchExists stays false (mock default) here.
+			const { readSchemaV5State } = await import("../core/SchemaV5Migration.js");
+			vi.mocked(readSchemaV5State).mockResolvedValueOnce({
+				version: 1,
+				status: "completed",
+				startedAt: "2026-05-22T00:00:00Z",
+				completedAt: "2026-05-22T00:00:05Z",
+				migratedCount: 4,
+				skippedCount: 1,
+				fresh: false,
+			});
+
+			const status = await getStatus(tempDir);
+			expect(status.schemaV5).toBe("completed");
+		});
+
+		it("leaves the v5 migration state unknown when the state read throws", async () => {
+			const { readSchemaV5State } = await import("../core/SchemaV5Migration.js");
+			vi.mocked(readSchemaV5State).mockRejectedValueOnce(new Error("state read boom"));
+
+			const status = await getStatus(tempDir);
+			expect(status.schemaV5).toBeUndefined();
+		});
+
 		it("should report gitHookInstalled=false when post-rewrite hook is missing", async () => {
 			// Install all hooks, then manually remove the post-rewrite hook
 			await install(tempDir);

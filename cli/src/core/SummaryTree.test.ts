@@ -15,6 +15,7 @@ import {
 	isLeafNode,
 	isUnifiedHoistFormat,
 	resolveDiffStats,
+	resolveTranscriptIdsFiltered,
 	updateTopicInTree,
 } from "./SummaryTree.js";
 
@@ -273,6 +274,23 @@ describe("SummaryTree", () => {
 		it("falls back to collectAllTranscriptHashes when transcripts is undefined (v3/v4 schema)", () => {
 			// transcripts field absent → v3/v4 schema → derive from the tree.
 			expect(getTranscriptIds(A)).toEqual(["aaa"]);
+		});
+	});
+
+	describe("resolveTranscriptIdsFiltered", () => {
+		it("returns the v5 transcripts field verbatim, ignoring existingFileIds", () => {
+			// v5 arrays are authoritative — NOT filtered against on-disk files.
+			const v5 = { ...A, version: 5, transcripts: ["uuid-1", "uuid-2"] } as CommitSummary;
+			expect(resolveTranscriptIdsFiltered(v5, new Set())).toEqual(["uuid-1", "uuid-2"]);
+		});
+
+		it("filters legacy tree-walk IDs down to those with a backing file", () => {
+			// D walks to ["ddd","bbb","ccc","aaa"]; only file-backed hashes survive.
+			expect(resolveTranscriptIdsFiltered(D, new Set(["ddd", "aaa"]))).toEqual(["ddd", "aaa"]);
+		});
+
+		it("returns [] for legacy input when no tree hash has a file (no dangling IDs baked in)", () => {
+			expect(resolveTranscriptIdsFiltered(C, new Set())).toEqual([]);
 		});
 	});
 

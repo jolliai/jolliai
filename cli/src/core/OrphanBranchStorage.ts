@@ -1,6 +1,7 @@
 import { ORPHAN_BRANCH } from "../Logger.js";
 import type { FileWrite } from "../Types.js";
 import {
+	batchReadFilesFromBranch,
 	ensureOrphanBranch,
 	listFilesInBranch,
 	orphanBranchExists,
@@ -14,6 +15,10 @@ export class OrphanBranchStorage implements StorageProvider {
 
 	async readFile(path: string): Promise<string | null> {
 		return readFileFromBranch(ORPHAN_BRANCH, path, this.cwd);
+	}
+
+	async batchReadFiles(paths: ReadonlyArray<string>): Promise<Map<string, string | null>> {
+		return batchReadFilesFromBranch(ORPHAN_BRANCH, paths, this.cwd);
 	}
 
 	async writeFiles(files: FileWrite[], message: string): Promise<void> {

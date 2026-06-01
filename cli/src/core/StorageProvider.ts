@@ -5,6 +5,20 @@ export interface StorageProvider {
 	readFile(path: string): Promise<string | null>;
 
 	/**
+	 * Read many files in one logical operation. Returns a Map keyed by the
+	 * requested path; a missing file maps to `null` (same contract as
+	 * `readFile`). The map MUST contain exactly one entry per requested path.
+	 *
+	 * Optional: backends that can batch cheaply implement this to avoid
+	 * per-file overhead (OrphanBranchStorage spawns one `git cat-file --batch`
+	 * instead of N subprocesses — the v5 migration's 336-file read dropped from
+	 * ~27 s to ~2 s on Windows because of this). Callers that need a batch read
+	 * but find the method absent (FolderStorage, where a local `readFile` per
+	 * path is already cheap) must fall back to looping `readFile` themselves.
+	 */
+	batchReadFiles?(paths: ReadonlyArray<string>): Promise<Map<string, string | null>>;
+
+	/**
 	 * Write multiple files in a single logical operation.
 	 *
 	 * Atomicity varies by implementation:

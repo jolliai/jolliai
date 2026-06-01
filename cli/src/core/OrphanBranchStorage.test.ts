@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // OrphanBranchStorage is a thin wrapper; every method just forwards to GitOps.
 vi.mock("./GitOps.js", () => ({
+	batchReadFilesFromBranch: vi.fn(),
 	ensureOrphanBranch: vi.fn(),
 	listFilesInBranch: vi.fn(),
 	orphanBranchExists: vi.fn(),
@@ -11,6 +12,7 @@ vi.mock("./GitOps.js", () => ({
 
 import { ORPHAN_BRANCH } from "../Logger.js";
 import {
+	batchReadFilesFromBranch,
 	ensureOrphanBranch,
 	listFilesInBranch,
 	orphanBranchExists,
@@ -20,6 +22,7 @@ import {
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 
 const mockedReadFile = vi.mocked(readFileFromBranch);
+const mockedBatchReadFiles = vi.mocked(batchReadFilesFromBranch);
 const mockedWriteFiles = vi.mocked(writeMultipleFilesToBranch);
 const mockedListFiles = vi.mocked(listFilesInBranch);
 const mockedExists = vi.mocked(orphanBranchExists);
@@ -48,6 +51,24 @@ describe("OrphanBranchStorage", () => {
 
 		expect(result).toBeNull();
 		expect(mockedReadFile).toHaveBeenCalledWith(ORPHAN_BRANCH, "missing.json", undefined);
+	});
+
+	it("batchReadFiles forwards ORPHAN_BRANCH, paths and cwd to batchReadFilesFromBranch", async () => {
+		const map = new Map<string, string | null>([
+			["summaries/a.json", "A"],
+			["summaries/b.json", null],
+		]);
+		mockedBatchReadFiles.mockResolvedValueOnce(map);
+		const storage = new OrphanBranchStorage("/tmp/repo");
+
+		const result = await storage.batchReadFiles(["summaries/a.json", "summaries/b.json"]);
+
+		expect(result).toBe(map);
+		expect(mockedBatchReadFiles).toHaveBeenCalledWith(
+			ORPHAN_BRANCH,
+			["summaries/a.json", "summaries/b.json"],
+			"/tmp/repo",
+		);
 	});
 
 	it("writeFiles calls ensure before writing", async () => {

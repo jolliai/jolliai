@@ -46,6 +46,7 @@ import type {
 	PlanReference,
 	StoredTranscript,
 } from "../../../cli/src/Types.js";
+import { CURRENT_SCHEMA_VERSION } from "../../../cli/src/Types.js";
 import { setLinearIssueIgnored } from "../core/LinearIssueService.js";
 import {
 	ignoreNote,
@@ -3248,6 +3249,14 @@ export class SummaryWebviewPanel {
 					"Summary updated but transcript file batch failed: %s",
 					err instanceof Error ? err.message : String(err),
 				);
+				// Deliberately do NOT `refreshTranscriptHashes` here. The summary
+				// was already cleared of the deleted IDs above, so refreshing from
+				// it would empty `transcriptHashSet` and erase the still-on-disk
+				// files from the panel — leaving the user no way to retry the very
+				// delete that just failed. Keeping the pre-operation set (which
+				// still matches what's on disk, since the batch failed) keeps those
+				// files visible and the retry path live. The Failed message unsticks
+				// the modal buttons on its own.
 				this.panel.webview.postMessage({
 					command: "transcriptsSaveFailed",
 					message: "Some transcript files failed to write. See logs.",
@@ -3306,26 +3315,25 @@ export class SummaryWebviewPanel {
 		try {
 			await this.bridge.saveTranscriptsBatch([], hashes);
 		} catch (err) {
-			// Summary already cleared but the orphan files weren't removed.
-			// From `getTranscriptIds(summary)` the user can no longer SEE the
-			// transcripts, but the bytes remain on the orphan branch and could
-			// resurface via direct branch inspection or future `git push`.
-			// For privacy-sensitive "delete my AI conversations" use cases that
-			// is NOT what the user asked for. Surface the partial failure so
-			// the user can retry / inspect logs rather than silently treating
-			// it as success.
+			// Summary already cleared but the orphan files weren't removed — the
+			// bytes remain on the orphan branch and could resurface via direct
+			// branch inspection or a future `git push`. For privacy-sensitive
+			// "delete my AI conversations" use cases that is NOT what the user
+			// asked for, so the delete MUST stay retryable.
 			log.warn(
 				"Summary cleared but transcript file delete failed: %s",
 				err instanceof Error ? err.message : String(err),
 			);
-			// Reset webview UI consistency: summary has been refreshed already,
-			// but the modal still believes the operation is in-flight. The
-			// failure message lets the script-side handler unstick the buttons
-			// and inform the user.
-			if (this.currentSummary) {
-				await this.refreshTranscriptHashes(this.currentSummary);
-				this.update(this.currentSummary);
-			}
+			// Deliberately do NOT `refreshTranscriptHashes` here. `currentSummary`
+			// was cleared above, so refreshing from it would empty
+			// `transcriptHashSet` and erase the still-on-disk files from the panel
+			// — the user would see "delete failed" with an empty list and no way
+			// to retry the orphaned bytes. Keeping the pre-delete set (which still
+			// matches disk, since the delete failed) keeps those conversations
+			// visible so a repeat "Delete all transcripts" re-attempts the file
+			// removal (the already-cleared v5 summary makes that a summary no-op,
+			// so only the file delete is retried). The Failed message unsticks the
+			// modal buttons on its own.
 			this.panel.webview.postMessage({
 				command: "transcriptsDeleteFailed",
 				message: "Some transcript files failed to delete. See logs.",
@@ -3350,26 +3358,34 @@ export class SummaryWebviewPanel {
 	 * leave a half-migration state).
 	 *
 	 * Handles both v5 and pre-v5 (legacy v3/v4) inputs:
-	 *   - v5 (`summary.transcripts !== undefined`): filter the existing array.
-	 *   - Legacy: derive the effective ID list via `getTranscriptIds` (which
-	 *     walks `children` and returns commit-hash IDs). Filter, then write
-	 *     back as a v5-shaped summary — the delete operation **lazily upgrades**
-	 *     the on-disk summary to v5. Without this, a delete that runs before
-	 *     the background v5 migration completes would leave the legacy summary
+	 *   - v5 (`summary.transcripts !== undefined`): filter the existing
+	 *     authoritative array.
+	 *   - Legacy: derive the effective ID list from `transcriptHashSet`, which
+	 *     `refreshTranscriptHashes` already filtered to tree IDs that have a
+	 *     `transcripts/<id>.json` file on disk — so the lazy upgrade writes the
+	 *     SAME file-backed set the v5 migration would (no dangling commit-hash
+	 *     IDs baked in). Filter, then write back as a v5 summary — the delete
+	 *     **lazily upgrades** the on-disk record to v5 (`version: 5` + the
+	 *     `transcripts` field). Without this, a delete that runs before the
+	 *     background v5 migration completes would leave the legacy summary
 	 *     intact; the next amend/squash/rebase would then re-inherit the
-	 *     just-deleted IDs via the `getTranscriptIds` fallback and stamp them
-	 *     onto the new v5 root.
+	 *     just-deleted IDs via the legacy fallback and stamp them onto the new
+	 *     v5 root.
 	 *
 	 * No-op (returns same reference) when nothing references any of the
 	 * removal IDs — both for empty v5 arrays and for legacy summaries whose
-	 * tree walk yielded no matches.
+	 * file-backed set is empty.
 	 */
 	private async persistTranscriptIdRemoval(
 		summary: CommitSummary,
 		idsToRemove: ReadonlySet<string>,
 	): Promise<CommitSummary> {
 		const isLegacy = summary.transcripts === undefined;
-		const current = isLegacy ? getTranscriptIds(summary) : (summary.transcripts ?? []);
+		// Legacy: `transcriptHashSet` is the tree's transcript IDs already
+		// intersected with on-disk files (see refreshTranscriptHashes), so it's
+		// the file-backed set the migration would produce — using it avoids
+		// re-baking dangling IDs. v5: the array is authoritative.
+		const current = isLegacy ? [...this.transcriptHashSet] : (summary.transcripts ?? []);
 		if (current.length === 0) {
 			return summary;
 		}
@@ -3377,14 +3393,18 @@ export class SummaryWebviewPanel {
 		// Fast-path: nothing removed AND already v5-shaped → return as-is.
 		// Legacy summaries still need a write even when `filtered.length ===
 		// current.length` would normally short-circuit, because the legacy
-		// summary itself doesn't have a `transcripts` field — writing it as
-		// `{ ...summary, transcripts: filtered }` is the lazy-upgrade.
+		// summary itself doesn't have a `transcripts` field / `version: 5` —
+		// writing it is the lazy-upgrade.
 		if (!isLegacy && filtered.length === current.length) {
 			return summary;
 		}
-		// v5 contract: always present, even when empty. Filtered down to []
-		// means "this commit no longer references any transcripts".
-		const updated: CommitSummary = { ...summary, transcripts: filtered };
+		// Write back as a real v5 record: stamp `version: 5` AND the
+		// `transcripts` field (v5 contract: always present, even when empty —
+		// `[]` means "this commit no longer references any transcripts"). Bumping
+		// the version keeps the on-disk record from being a "version<5 but has
+		// transcripts" hybrid that a future version-routing read path would
+		// misclassify.
+		const updated: CommitSummary = { ...summary, version: CURRENT_SCHEMA_VERSION, transcripts: filtered };
 		await this.bridge.storeSummary(updated, true);
 		return updated;
 	}
