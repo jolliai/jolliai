@@ -1801,7 +1801,31 @@ export function activate(context: vscode.ExtensionContext): void {
 					return;
 				}
 
-				// Modified / renamed files — always diff against the working tree.
+				// Renamed files — at HEAD the content lives under the OLD path, so
+				// the HEAD side of the diff must use `originalPath`. Using the new
+				// path at HEAD reads a nonexistent blob and the editor fails to open.
+				// (Copies aren't handled here: `git status --porcelain` never emits a
+				// `C` status — copy detection only exists in git's diff path, which
+				// the Commits-panel handler uses, not the working-tree `status` call.)
+				if (statusCode === "R") {
+					const { originalPath } = item.fileStatus;
+					if (originalPath === undefined) {
+						// Rename without a recorded source path: no reliable HEAD blob
+						// to diff against, so just open the working-tree file.
+						await vscode.window.showTextDocument(fileUri);
+						return;
+					}
+					const oldFileUri = vscode.Uri.file(join(workspaceRoot, originalPath));
+					await vscode.commands.executeCommand(
+						"vscode.diff",
+						toGitUri(oldFileUri, "HEAD"),
+						fileUri,
+						`${relativePath} (HEAD ↔ Working Tree)`,
+					);
+					return;
+				}
+
+				// Modified files — always diff against the working tree.
 				// Staged vs working-tree content may diverge (edits after staging),
 				// so showing the live file is the most useful default.
 				const headUri = toGitUri(fileUri, "HEAD");
