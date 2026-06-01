@@ -91,6 +91,38 @@ describe("stageVault — basic flow", () => {
 		expect(stageRm).not.toHaveBeenCalled();
 	});
 
+	it("does NOT print the unowned canary to the console (info-level, file-only)", async () => {
+		// Regression guard: `unowned` routinely holds intentionally-unstaged
+		// engine content (e.g. `.jolli-bootstrap-stash/…` survivors), so the
+		// canary must not surface on the CLI as a warning during
+		// `jolli sync-memory-bank`. It is logged at `info`, which the Logger
+		// suppresses from the console under the default silent-console mode.
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			mkdirSync(join(vault, "myrepo", ".jolli-bootstrap-stash", "myrepo", ".jolli"), {
+				recursive: true,
+			});
+			writeFileSync(join(vault, "myrepo", ".jolli-bootstrap-stash", "myrepo", ".jolli", "migration.json"), "{}");
+
+			const { client } = makeClient([
+				// Leading-dot segment → classifier returns null → unowned.
+				entry({ path: "myrepo/.jolli-bootstrap-stash/myrepo/.jolli/migration.json" }),
+			]);
+
+			const report = await stageVault(client as GitClient, vault, { syncTranscripts: true });
+
+			// Still bucketed as unowned for the file log / telemetry…
+			expect(report.unowned).toEqual(["myrepo/.jolli-bootstrap-stash/myrepo/.jolli/migration.json"]);
+			// …but nothing reached the terminal.
+			expect(warnSpy).not.toHaveBeenCalled();
+			expect(errorSpy).not.toHaveBeenCalled();
+		} finally {
+			warnSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
 	it("resets already-staged paths that classifier now rejects (`git reset HEAD --`, NOT `git rm --cached`)", async () => {
 		// Scenario: a path the classifier doesn't recognise is somehow
 		// already in the index — could be classifier drift, a foreign

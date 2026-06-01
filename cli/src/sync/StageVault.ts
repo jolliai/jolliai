@@ -25,9 +25,17 @@
  *
  * Returns a `StageReport` the caller logs as telemetry. The `unowned`
  * and `symlinked` arrays are the **canary signals** dogfood watchers
- * grep for — non-empty means either FolderStorage added a write site
- * the classifier doesn't recognise (drift) or something outside the
- * engine put a file in the vault (foreign writer / hostile placement).
+ * grep for. They differ in severity, and therefore in log channel:
+ *
+ *   - `unowned` (classifier returned `null`) is logged at `info` —
+ *     file-only under the CLI's silent console. It routinely contains
+ *     intentionally-unstaged engine content (`.jolli-bootstrap-stash/…`
+ *     survivors, quarantine dirs, pre-allowlist legacy files) alongside
+ *     genuine drift, so it must not surface to the user's terminal as an
+ *     error during `jolli sync-memory-bank`.
+ *   - `symlinked` is logged at `warn` — it always reaches the terminal,
+ *     because a symlink at a classifier-matching location is a potential
+ *     hostile placement the operator needs to see immediately.
  */
 
 import { lstat } from "node:fs/promises";
@@ -213,8 +221,20 @@ export async function stageVault(client: GitClient, vaultRoot: string, opts: Sta
 	// `unstagePaths` directly from their own callers, not via stageVault.
 
 	if (unowned.length > 0) {
-		log.warn(
-			"stageVault: %d unowned path(s) skipped (classifier drift or foreign writer). First %d: %s",
+		// `info`, not `warn`: this is a dogfood canary, not a user-facing
+		// problem. The `unowned` bucket legitimately fills with engine-internal
+		// content that is intentionally never staged — most commonly the
+		// `.jolli-bootstrap-stash/…` survivors a bootstrap merge leaves for
+		// manual reconciliation (BootstrapMerge.ts), plus quarantine dirs and
+		// pre-allowlist legacy files. Surfacing it at `warn` printed
+		// "classifier drift or foreign writer" straight onto the CLI during
+		// `jolli sync-memory-bank` (warn/error always hit stderr — Logger.ts),
+		// which reads as an error to end users. At `info` the line still lands
+		// in debug.log for grep-based drift watching but stays off the terminal
+		// under the CLI's silent-console default. The genuinely security-
+		// relevant signal — `symlinked` — remains a `warn` below.
+		log.info(
+			"stageVault: %d unowned path(s) skipped (engine-internal / classifier drift / foreign writer). First %d: %s",
 			unowned.length,
 			Math.min(unowned.length, 5),
 			unowned.slice(0, 5).join(", "),

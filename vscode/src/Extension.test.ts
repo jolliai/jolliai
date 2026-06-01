@@ -5259,6 +5259,58 @@ describe("Extension", () => {
 				"mod.ts (HEAD ↔ Working Tree)",
 			);
 		});
+
+		it("diffs the OLD path at HEAD against the working tree for renamed files", async () => {
+			const handler = getRegisteredCommand("jollimemory.openFileChange");
+			await handler({
+				fileStatus: {
+					absolutePath: "/repo/New.ts",
+					statusCode: "R",
+					indexStatus: "R",
+					worktreeStatus: " ",
+					isSelected: false,
+					relativePath: "New.ts",
+					originalPath: "Old.ts",
+				},
+			});
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"vscode.diff",
+				// HEAD side must use the original (pre-rename) path — the new path
+				// does not exist at HEAD, which is the bug this guards against.
+				expect.objectContaining({
+					fsPath: join("/test/workspace", "Old.ts"),
+					scheme: "git",
+				}),
+				expect.objectContaining({ fsPath: "/repo/New.ts", scheme: "file" }), // Working Tree
+				"New.ts (HEAD ↔ Working Tree)",
+			);
+		});
+
+		it("opens the working-tree file directly for a rename with no originalPath", async () => {
+			const handler = getRegisteredCommand("jollimemory.openFileChange");
+			await handler({
+				fileStatus: {
+					absolutePath: "/repo/New.ts",
+					statusCode: "R",
+					indexStatus: "R",
+					worktreeStatus: " ",
+					isSelected: false,
+					relativePath: "New.ts",
+					// no originalPath
+				},
+			});
+
+			expect(showTextDocument).toHaveBeenCalledWith(
+				expect.objectContaining({ fsPath: "/repo/New.ts", scheme: "file" }),
+			);
+			expect(executeCommand).not.toHaveBeenCalledWith(
+				"vscode.diff",
+				expect.anything(),
+				expect.anything(),
+				expect.anything(),
+			);
+		});
 	});
 
 	// ── openCommitFileChange command ─────────────────────────────────
