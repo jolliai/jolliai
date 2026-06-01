@@ -3,6 +3,9 @@ import type { Reference } from "../../../Types.js";
 import { LinearAdapter } from "./LinearAdapter.js";
 import { unwrap } from "./TestHelpers.js";
 
+const fieldVal = (r: Reference | null | undefined, key: string): string | undefined =>
+	r?.fields?.find((f) => f.key === key)?.value;
+
 describe("LinearAdapter", () => {
 	const ts = "2026-05-26T00:00:00.000Z";
 	const toolName = "mcp__linear__get_issue";
@@ -25,11 +28,11 @@ describe("LinearAdapter", () => {
 			mapKey: "linear:PROJ-1234",
 			source: "linear",
 			nativeId: "PROJ-1234",
-			status: "In Progress",
-			priority: "High",
-			labels: ["bug"],
 			description: "Body",
 		});
+		expect(fieldVal(ref, "status")).toBe("In Progress");
+		expect(fieldVal(ref, "priority")).toBe("High");
+		expect(fieldVal(ref, "labels")).toBe("bug");
 	});
 
 	it("accepts priority as an object with name", () => {
@@ -38,7 +41,7 @@ describe("LinearAdapter", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.priority).toBe("Urgent");
+		expect(fieldVal(ref, "priority")).toBe("Urgent");
 	});
 
 	it("filters non-string labels", () => {
@@ -47,7 +50,7 @@ describe("LinearAdapter", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.labels).toEqual(["good"]);
+		expect(fieldVal(ref, "labels")).toBe("good");
 	});
 
 	it("rejects non-ticket id / missing fields / bad url / non-object payload", () => {
@@ -148,7 +151,7 @@ describe("LinearAdapter", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.priority).toBeUndefined();
+		expect(fieldVal(ref, "priority")).toBeUndefined();
 	});
 
 	it("priority object without a name field falls back to undefined", () => {
@@ -157,7 +160,7 @@ describe("LinearAdapter", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.priority).toBeUndefined();
+		expect(fieldVal(ref, "priority")).toBeUndefined();
 	});
 
 	it("labels with no string entries returns undefined", () => {
@@ -166,7 +169,7 @@ describe("LinearAdapter", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.labels).toBeUndefined();
+		expect(fieldVal(ref, "labels")).toBeUndefined();
 	});
 
 	it("renderPromptBlock works for minimal ref (no status/priority/labels/description)", () => {
@@ -184,21 +187,21 @@ describe("LinearAdapter", () => {
 		expect(out).not.toContain("<description>");
 	});
 
-	it("renderPromptBlock skips labels attr when labels array is empty", () => {
-		// Hand-built ref bypasses extractRef's empty-array→undefined normalisation
-		// so we exercise the `labels.length > 0` false branch in renderOne.
+	it("renderPromptBlock emits no field attrs when the fields bag is absent", () => {
+		// Hand-built ref with no fields bag: renderOne emits only the id attr.
 		const ref: Reference = {
 			mapKey: "linear:PROJ-1",
 			source: "linear",
 			nativeId: "PROJ-1",
 			title: "x",
 			url: "https://x.example",
-			labels: [],
 			toolName,
 			referencedAt: ts,
 		};
 		const out = LinearAdapter.renderPromptBlock([ref]);
+		expect(out).toContain('<issue id="PROJ-1">');
 		expect(out).not.toContain("labels=");
+		expect(out).not.toContain("status=");
 	});
 
 	it("renderPromptBlock skips description block when description is empty string", () => {

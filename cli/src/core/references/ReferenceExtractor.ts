@@ -240,12 +240,22 @@ function collectToolResults(
 			pending.delete(b.tool_use_id);
 			continue;
 		}
-		// Delete only after walkPayload completes so a thrown payload walk
-		// leaves the pending entry available for retry on a later line that
-		// references the same tool_use_id (defensive — walkPayload itself is
-		// total today, but the delete-before-walk order silently lost the
-		// reference for any future failure mode).
-		walkPayload(parsedPayload, pendingEntry.adapter, pendingEntry.toolName, timestamp ?? "", collected);
+		// walkPayload is total today, but the module contract promises every
+		// payload walk is wrapped — and a pathologically deep payload
+		// (attacker-influenceable MCP output) would otherwise overflow the
+		// recursion with a RangeError that aborts extraction for the *entire*
+		// transcript. Contain any throw to this one tool_result; drop the
+		// pending entry either way so a bad payload can't grow the map.
+		try {
+			walkPayload(parsedPayload, pendingEntry.adapter, pendingEntry.toolName, timestamp ?? "", collected);
+		} catch (err) {
+			log.warn(
+				"Dropping tool_result for %s (%s): payload walk failed: %s",
+				b.tool_use_id,
+				pendingEntry.toolName,
+				(err as Error).message,
+			);
+		}
 		pending.delete(b.tool_use_id);
 	}
 }

@@ -14,6 +14,9 @@ import {
 	writeReferenceMarkdown,
 } from "./ReferenceStore.js";
 
+const fieldVal = (r: Reference | null | undefined, key: string): string | undefined =>
+	r?.fields?.find((f) => f.key === key)?.value;
+
 function linearRef(overrides: Partial<Reference> = {}): Reference {
 	return {
 		mapKey: "linear:PROJ-1234",
@@ -102,6 +105,16 @@ describe("ReferenceStore", () => {
 			const b = sanitizeNativeIdForPath("github", "owner/repo#42");
 			expect(a).toBe(b);
 		});
+
+		it("rejects an identity-source nativeId containing a traversal sequence", () => {
+			// linear/jira/notion are identity, so the function name's path-safety
+			// promise rests on a guard here — parseMarkdown rehydrates nativeId
+			// from untrusted markdown with no per-source format check.
+			expect(() => sanitizeNativeIdForPath("linear", "../../../etc/passwd")).toThrow(/unsafe/);
+			expect(() => sanitizeNativeIdForPath("jira", "a/b")).toThrow(/unsafe/);
+			expect(() => sanitizeNativeIdForPath("notion", "a\\b")).toThrow(/unsafe/);
+			expect(() => sanitizeNativeIdForPath("notion", "..")).toThrow(/unsafe/);
+		});
 	});
 
 	describe("writeReferenceMarkdown + readReferenceMarkdown round-trip", () => {
@@ -122,30 +135,36 @@ describe("ReferenceStore", () => {
 			});
 		});
 
-		it("round-trips a Linear ref with status/priority/labels", async () => {
+		it("round-trips a Linear ref with a fields bag (status/priority/labels)", async () => {
 			const ref = linearRef({
-				status: "In Progress",
-				priority: "High",
-				labels: ["bug", "frontend"],
+				fields: [
+					{ key: "status", label: "Status", value: "In Progress", icon: "circle-large-filled" },
+					{ key: "priority", label: "Priority", value: "High", icon: "flame" },
+					{ key: "labels", label: "Labels", value: "bug, frontend", icon: "tag" },
+				],
 			});
 			const { sourcePath } = await writeReferenceMarkdown(ref, tempDir);
 			const back = await readReferenceMarkdown(sourcePath);
-			expect(back?.status).toBe("In Progress");
-			expect(back?.priority).toBe("High");
-			expect(back?.labels).toEqual(["bug", "frontend"]);
+			expect(fieldVal(back, "status")).toBe("In Progress");
+			expect(fieldVal(back, "priority")).toBe("High");
+			expect(fieldVal(back, "labels")).toBe("bug, frontend");
+			// Whole bag survives the round-trip, order and icons preserved.
+			expect(back?.fields).toEqual(ref.fields);
 		});
 
-		it("round-trips a GitHub ref with assignees / milestone / entityType", async () => {
+		it("round-trips a GitHub ref with a fields bag (assignees / milestone / entity-type)", async () => {
 			const ref = githubRef({
-				assignees: ["alice", "bob"],
-				milestone: "v1.0",
-				entityType: "issue",
+				fields: [
+					{ key: "assignees", label: "Assignees", value: "alice, bob", icon: "account" },
+					{ key: "milestone", label: "Milestone", value: "v1.0", icon: "milestone" },
+					{ key: "entity-type", label: "Type", value: "issue", icon: "symbol-class" },
+				],
 			});
 			const { sourcePath } = await writeReferenceMarkdown(ref, tempDir);
 			const back = await readReferenceMarkdown(sourcePath);
-			expect(back?.assignees).toEqual(["alice", "bob"]);
-			expect(back?.milestone).toBe("v1.0");
-			expect(back?.entityType).toBe("issue");
+			expect(fieldVal(back, "assignees")).toBe("alice, bob");
+			expect(fieldVal(back, "milestone")).toBe("v1.0");
+			expect(fieldVal(back, "entity-type")).toBe("issue");
 			expect(back?.source).toBe("github");
 		});
 
@@ -262,7 +281,9 @@ describe("ReferenceStore", () => {
 			expect(await readReferenceMarkdown(file)).toBeNull();
 		});
 
-		it("returns null on JSON-malformed frontmatter value (list item)", async () => {
+		it("skips a non-JSON fields list item but still parses the reference", async () => {
+			// A corrupt (non-JSON) `fields:` list item is skipped, not fatal — the
+			// rest of the reference still parses. Exercises the JSON.parse catch arm.
 			const file = join(tempDir, "malformed-list.md");
 			await writeFile(
 				file,
@@ -272,7 +293,7 @@ describe("ReferenceStore", () => {
 					'nativeId: "PROJ-1"',
 					'title: "t"',
 					'url: "u"',
-					"labels:",
+					"fields:",
 					"  - <<<not json>>>",
 					'referencedAt: ""',
 					'sourceToolName: "x"',
@@ -281,23 +302,25 @@ describe("ReferenceStore", () => {
 				].join("\n"),
 				"utf-8",
 			);
-			expect(await readReferenceMarkdown(file)).toBeNull();
+			const ref = await readReferenceMarkdown(file);
+			expect(ref).not.toBeNull();
+			expect(ref?.fields).toBeUndefined();
 		});
 
-		it("returns undefined for an optional string with malformed JSON value", async () => {
-			// JSON.parse failure on status value → status undefined, but the entry
-			// still parses (status is optional).
-			const file = join(tempDir, "bad-status.md");
+		it("skips a bad-shape fields list item (valid JSON, missing key/label/value)", async () => {
+			// Valid JSON but not a {key,label,value} object → skipped by isReferenceField.
+			const file = join(tempDir, "badshape-list.md");
 			await writeFile(
 				file,
 				[
 					"---",
 					'source: "linear"',
-					'nativeId: "PROJ-1"',
+					'nativeId: "PROJ-2"',
 					'title: "t"',
 					'url: "u"',
-					"status: NotQuoted",
-					'referencedAt: "2026-05-26T00:00:00Z"',
+					"fields:",
+					'  - {"label":"Status","value":"open"}',
+					'referencedAt: ""',
 					'sourceToolName: "x"',
 					"---",
 					"",
@@ -306,7 +329,86 @@ describe("ReferenceStore", () => {
 			);
 			const ref = await readReferenceMarkdown(file);
 			expect(ref).not.toBeNull();
-			expect(ref?.status).toBeUndefined();
+			expect(ref?.fields).toBeUndefined();
+		});
+
+		it("skips a fields list item whose key has unsafe characters, keeps valid items", async () => {
+			// `key` is interpolated raw into the prompt's <issue …> attribute name,
+			// which can't be quote-escaped — so a poisoned orphan-branch key like
+			// `x"><inject` must be rejected at parse time. The well-formed item
+			// (whose key matches [\w-]+) survives.
+			const file = join(tempDir, "badkey-list.md");
+			await writeFile(
+				file,
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "PROJ-9"',
+					'title: "t"',
+					'url: "u"',
+					"fields:",
+					'  - {"key":"x\\"><inject","label":"Status","value":"open"}',
+					'  - {"key":"entity-type","label":"Type","value":"page"}',
+					'referencedAt: ""',
+					'sourceToolName: "x"',
+					"---",
+					"",
+				].join("\n"),
+				"utf-8",
+			);
+			const ref = await readReferenceMarkdown(file);
+			expect(ref).not.toBeNull();
+			expect(ref?.fields).toEqual([{ key: "entity-type", label: "Type", value: "page" }]);
+		});
+
+		it("skips a fields list item whose icon is not a string, keeps valid items", async () => {
+			// icon must be a string when present; a numeric icon → item skipped.
+			const file = join(tempDir, "badicon-list.md");
+			await writeFile(
+				file,
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "PROJ-3"',
+					'title: "t"',
+					'url: "u"',
+					"fields:",
+					'  - {"key":"status","label":"Status","value":"open","icon":42}',
+					'  - {"key":"priority","label":"Priority","value":"High"}',
+					'referencedAt: ""',
+					'sourceToolName: "x"',
+					"---",
+					"",
+				].join("\n"),
+				"utf-8",
+			);
+			const ref = await readReferenceMarkdown(file);
+			expect(ref).not.toBeNull();
+			// Bad-icon item dropped; the well-formed (icon-less) item survives.
+			expect(ref?.fields).toEqual([{ key: "priority", label: "Priority", value: "High" }]);
+		});
+
+		it("returns null when a required field has malformed JSON (readString catch)", async () => {
+			// JSON.parse failure on the required `title` value → readString returns
+			// undefined → the !title guard rejects the whole reference. Exercises
+			// the readString catch branch and the required-field guard together.
+			const file = join(tempDir, "bad-title.md");
+			await writeFile(
+				file,
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "PROJ-1"',
+					"title: NotQuoted",
+					'url: "u"',
+					'referencedAt: "2026-05-26T00:00:00Z"',
+					'sourceToolName: "x"',
+					"---",
+					"",
+				].join("\n"),
+				"utf-8",
+			);
+			expect(await readReferenceMarkdown(file)).toBeNull();
 		});
 
 		it("ignores frontmatter lines that aren't key: value or list items", async () => {

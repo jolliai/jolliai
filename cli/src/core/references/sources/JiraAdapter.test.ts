@@ -14,6 +14,9 @@ import { extractReferencesFromTranscript } from "../ReferenceExtractor.js";
 import { JiraAdapter } from "./JiraAdapter.js";
 import { unwrap } from "./TestHelpers.js";
 
+const fieldVal = (r: Reference | null | undefined, key: string): string | undefined =>
+	r?.fields?.find((f) => f.key === key)?.value;
+
 // ─── Fixture builders ────────────────────────────────────────────────────────
 
 function toolUseLine(opts: { toolUseId: string; toolName: string; timestamp: string }): string {
@@ -99,13 +102,13 @@ describe("JiraAdapter.extractRef", () => {
 			nativeId: "KAN-4",
 			title: "Wire up Jira auto-discovery",
 			url: "https://example.atlassian.net/browse/KAN-4",
-			status: "To Do",
-			priority: "Medium",
-			labels: ["JolliMemory", "Feature"],
 			description: "## Body\n\nJira issues from the Atlassian MCP server.",
 			toolName,
 			referencedAt: ts,
 		});
+		expect(fieldVal(ref, "status")).toBe("To Do");
+		expect(fieldVal(ref, "priority")).toBe("Medium");
+		expect(fieldVal(ref, "labels")).toBe("JolliMemory, Feature");
 	});
 
 	it("accepts status/priority as bare string values", () => {
@@ -118,8 +121,8 @@ describe("JiraAdapter.extractRef", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.status).toBe("Done");
-		expect(ref?.priority).toBe("High");
+		expect(fieldVal(ref, "status")).toBe("Done");
+		expect(fieldVal(ref, "priority")).toBe("High");
 	});
 
 	it("filters non-string and empty labels", () => {
@@ -132,7 +135,7 @@ describe("JiraAdapter.extractRef", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.labels).toEqual(["good"]);
+		expect(fieldVal(ref, "labels")).toBe("good");
 	});
 
 	it("drops the labels field entirely when no valid strings remain", () => {
@@ -145,7 +148,7 @@ describe("JiraAdapter.extractRef", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.labels).toBeUndefined();
+		expect(fieldVal(ref, "labels")).toBeUndefined();
 	});
 
 	it("returns null for non-object payloads", () => {
@@ -219,8 +222,8 @@ describe("JiraAdapter.extractRef", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.status).toBeUndefined();
-		expect(ref?.priority).toBeUndefined();
+		expect(fieldVal(ref, "status")).toBeUndefined();
+		expect(fieldVal(ref, "priority")).toBeUndefined();
 		expect(ref?.description).toBeUndefined();
 	});
 
@@ -234,8 +237,8 @@ describe("JiraAdapter.extractRef", () => {
 			toolName,
 			ts,
 		);
-		expect(ref?.status).toBeUndefined();
-		expect(ref?.priority).toBeUndefined();
+		expect(fieldVal(ref, "status")).toBeUndefined();
+		expect(fieldVal(ref, "priority")).toBeUndefined();
 	});
 });
 
@@ -265,8 +268,8 @@ describe("JiraAdapter via extractReferencesFromTranscript", () => {
 			source: "jira",
 			nativeId: "KAN-4",
 			title: "Wire up Jira auto-discovery",
-			status: "To Do",
 		});
+		expect(fieldVal(references[0], "status")).toBe("To Do");
 	});
 
 	it("extracts a bare Jira issue payload (no wrapper)", async () => {
@@ -373,18 +376,18 @@ describe("JiraAdapter.renderPromptBlock", () => {
 		expect(out).not.toContain('id="KAN-100"');
 	});
 
-	it("skips labels attr when labels array is empty (hand-built ref)", () => {
+	it("emits no field attrs when the fields bag is absent (hand-built ref)", () => {
 		const ref: Reference = {
 			mapKey: "jira:KAN-200",
 			source: "jira",
 			nativeId: "KAN-200",
 			title: "x",
 			url: "https://example.atlassian.net/browse/KAN-200",
-			labels: [],
 			toolName,
 			referencedAt: ts,
 		};
 		const out = JiraAdapter.renderPromptBlock([ref]);
+		expect(out).toContain('<issue id="KAN-200">');
 		expect(out).not.toContain("labels=");
 	});
 

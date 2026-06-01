@@ -8,7 +8,7 @@
  * Linear tests pass unchanged.
  */
 
-import type { Reference } from "../../../Types.js";
+import type { Reference, ReferenceField } from "../../../Types.js";
 import { escapeForAttr, escapeForText } from "../../PromptXmlEscape.js";
 import type { SourceAdapter } from "./SourceAdapter.js";
 
@@ -43,6 +43,22 @@ function truncate(s: string, max: number): string {
 	return `${s.slice(0, max)}\n…[truncated, ${s.length - max} more chars]`;
 }
 
+/** Build the Linear-specific display fields. Source knowledge lives here only. */
+function buildFields(
+	status: string | undefined,
+	priority: string | undefined,
+	labels: ReadonlyArray<string> | undefined,
+): ReferenceField[] {
+	const fields: ReferenceField[] = [];
+	if (status !== undefined)
+		fields.push({ key: "status", label: "Status", value: status, icon: "circle-large-filled" });
+	if (priority !== undefined) fields.push({ key: "priority", label: "Priority", value: priority, icon: "flame" });
+	if (labels !== undefined && labels.length > 0) {
+		fields.push({ key: "labels", label: "Labels", value: labels.join(", "), icon: "tag" });
+	}
+	return fields;
+}
+
 export const LinearAdapter: SourceAdapter = {
 	id: "linear",
 	mcpPrefix: "mcp__linear__",
@@ -65,15 +81,14 @@ export const LinearAdapter: SourceAdapter = {
 		const description =
 			typeof obj.description === "string" && obj.description.length > 0 ? obj.description : undefined;
 
+		const fields = buildFields(status, priority, labels);
 		return {
 			mapKey: `linear:${id}`,
 			source: "linear",
 			nativeId: id,
 			title,
 			url,
-			...(status !== undefined ? { status } : {}),
-			...(priority !== undefined ? { priority } : {}),
-			...(labels !== undefined ? { labels } : {}),
+			...(fields.length > 0 ? { fields } : {}),
 			...(description !== undefined ? { description } : {}),
 			toolName,
 			referencedAt,
@@ -102,9 +117,7 @@ export const LinearAdapter: SourceAdapter = {
 
 function renderOne(ref: Reference, maxChars: number): string {
 	const attrs = [`id="${escapeForAttr(ref.nativeId)}"`];
-	if (ref.status) attrs.push(`status="${escapeForAttr(ref.status)}"`);
-	if (ref.priority) attrs.push(`priority="${escapeForAttr(ref.priority)}"`);
-	if (ref.labels && ref.labels.length > 0) attrs.push(`labels="${escapeForAttr(ref.labels.join(", "))}"`);
+	for (const f of ref.fields ?? []) attrs.push(`${f.key}="${escapeForAttr(f.value)}"`);
 	const lines = [`<issue ${attrs.join(" ")}>`];
 	lines.push(`  <title>${escapeForText(ref.title)}</title>`);
 	lines.push(`  <url>${escapeForText(ref.url)}</url>`);

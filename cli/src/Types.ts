@@ -569,9 +569,29 @@ export interface NoteReference {
 export type SourceId = "linear" | "jira" | "github" | "notion";
 
 /**
+ * ReferenceField — one displayable field produced by a `SourceAdapter`.
+ *
+ * The opaque carrier for everything source-specific. The common layer
+ * (persistence, commit snapshot, panel, tooltip) only **passes it through** —
+ * it NEVER interprets `key`. Each adapter owns which fields exist, their
+ * display labels, icons, and order. Adding Slack/Zoom means adding an adapter
+ * that builds these; no common-layer type or code changes.
+ */
+export interface ReferenceField {
+	/** Stable key — doubles as the frontmatter key and the prompt XML attribute name (e.g. "status", "channel"). */
+	readonly key: string;
+	/** Human-readable label for the tooltip (e.g. "Status", "Channel"). */
+	readonly label: string;
+	/** Pre-formatted display value; array-valued fields are joined with ", " by the adapter. */
+	readonly value: string;
+	/** Optional codicon name for the tooltip. Opaque to the common layer — passed straight to the renderer; a neutral default is used when absent. */
+	readonly icon?: string;
+}
+
+/**
  * Reference — ephemeral, in-memory shape produced by a `SourceAdapter.extractRef`
- * call. Carries a `source` discriminator + optional GitHub-/Notion-specific
- * fields. Persisted as markdown frontmatter by
+ * call. Carries the cross-source core fields + an opaque `fields` bag for every
+ * source-specific attribute. Persisted as markdown frontmatter by
  * `ReferenceStore.writeReferenceMarkdown`; metadata is split into `ReferenceEntry`
  * (registry) and the markdown body (description).
  */
@@ -584,15 +604,8 @@ export interface Reference {
 	readonly title: string;
 	readonly url: string;
 	readonly description?: string;
-	readonly status?: string;
-	readonly priority?: string;
-	readonly labels?: ReadonlyArray<string>;
-	/** GitHub-only. */
-	readonly assignees?: ReadonlyArray<string>;
-	/** GitHub-only. */
-	readonly milestone?: string;
-	/** GitHub `issue_type` / Notion `metadata.type`. */
-	readonly entityType?: string;
+	/** Opaque, source-specific display fields. Built and consumed only by the adapter. */
+	readonly fields?: ReadonlyArray<ReferenceField>;
 	readonly toolName: string;
 	readonly referencedAt: string;
 }
@@ -639,12 +652,8 @@ export interface ReferenceCommitRef {
 	readonly nativeId: string;
 	readonly title: string;
 	readonly url: string;
-	readonly status?: string;
-	readonly priority?: string;
-	readonly labels?: ReadonlyArray<string>;
-	readonly assignees?: ReadonlyArray<string>;
-	readonly milestone?: string;
-	readonly entityType?: string;
+	/** Opaque, source-specific display fields — snapshot of the Reference's `fields` at archive time. */
+	readonly fields?: ReadonlyArray<ReferenceField>;
 	readonly referencedAt: string;
 	readonly sourceToolName: string;
 }

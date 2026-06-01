@@ -7,10 +7,11 @@
  * mirrors the SourceId; the file stem is the post-archive map-key without the
  * `<source>:` prefix (caller responsibility — see `sanitizeNativeIdForPath`).
  *
- * Frontmatter format: YAML-style with JSON-encoded values (single-quoted strings
- * render as double-quoted). Multi-source fields (`source`, `nativeId`, `status`,
- * `priority`, `labels`, `assignees`, `milestone`, `entityType`) sit above the
- * markdown body (description).
+ * Frontmatter format: YAML-style with JSON-encoded values. The core scalars
+ * (`source`, `nativeId`, `title`, `url`, `referencedAt`, `sourceToolName`) sit
+ * above the markdown body (description). All source-specific data lives in an
+ * opaque `fields:` list — one `{key,label,value,icon?}` JSON object per item —
+ * which this module reads/writes without interpreting any `key`.
  *
  * Sanitisation per SourceId:
  *   - linear / jira / notion: identity. Their nativeIds (`PROJ-1234`,
@@ -32,7 +33,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../../Logger.js";
-import type { Reference, SourceId } from "../../Types.js";
+import type { Reference, ReferenceField, SourceId } from "../../Types.js";
 
 const log = createLogger("ReferenceStore");
 
@@ -71,6 +72,15 @@ export function sanitizeNativeIdForPath(source: SourceId, nativeId: string): str
 		return `${safe}-${suffix}`;
 	}
 	// linear / jira / notion: identity. See Linear-specific contract above.
+	// The identity is load-bearing for the archive round-trip, but parseMarkdown
+	// rehydrates nativeId from untrusted orphan-branch markdown with *no*
+	// per-source format check — so the path boundary is guarded here rather than
+	// trusting every present and future caller to pre-validate. Valid native ids
+	// (`PROJ-1234`, `KAN-4`, 32-hex Notion ids, and the `-<sha8>` archive form)
+	// contain none of these, so the guard never fires on legitimate input.
+	if (nativeId.includes("..") || /[/\\]/.test(nativeId)) {
+		throw new Error(`Refusing unsafe ${source} nativeId for path: ${JSON.stringify(nativeId)}`);
+	}
 	return nativeId;
 }
 
@@ -167,18 +177,10 @@ function renderMarkdown(ref: Reference): string {
 	lines.push(`nativeId: ${JSON.stringify(ref.nativeId)}`);
 	lines.push(`title: ${JSON.stringify(ref.title)}`);
 	lines.push(`url: ${JSON.stringify(ref.url)}`);
-	if (ref.status !== undefined) lines.push(`status: ${JSON.stringify(ref.status)}`);
-	if (ref.priority !== undefined) lines.push(`priority: ${JSON.stringify(ref.priority)}`);
-	if (ref.labels !== undefined && ref.labels.length > 0) {
-		lines.push("labels:");
-		for (const l of ref.labels) lines.push(`  - ${JSON.stringify(l)}`);
+	if (ref.fields !== undefined && ref.fields.length > 0) {
+		lines.push("fields:");
+		for (const f of ref.fields) lines.push(`  - ${JSON.stringify(f)}`);
 	}
-	if (ref.assignees !== undefined && ref.assignees.length > 0) {
-		lines.push("assignees:");
-		for (const a of ref.assignees) lines.push(`  - ${JSON.stringify(a)}`);
-	}
-	if (ref.milestone !== undefined) lines.push(`milestone: ${JSON.stringify(ref.milestone)}`);
-	if (ref.entityType !== undefined) lines.push(`entityType: ${JSON.stringify(ref.entityType)}`);
 	lines.push(`referencedAt: ${JSON.stringify(ref.referencedAt)}`);
 	lines.push(`sourceToolName: ${JSON.stringify(ref.toolName)}`);
 	lines.push("---");
@@ -214,43 +216,37 @@ function parseMarkdown(content: string): Reference | null {
 	const frontmatter = lines.slice(1, closingIdx);
 	const body = stripBodyEdges(lines.slice(closingIdx + 1).join("\n"));
 
-	const fields: Record<string, string> = {};
-	const labels: string[] = [];
-	const assignees: string[] = [];
-	let activeListKey: "labels" | "assignees" | null = null;
+	const scalars: Record<string, string> = {};
+	const refFields: ReferenceField[] = [];
+	let inFieldsList = false;
 
 	for (const line of frontmatter) {
-		if (activeListKey !== null) {
+		if (inFieldsList) {
 			const m = /^\s+- (.+)$/.exec(line);
 			if (m) {
 				try {
 					const v = JSON.parse(m[1]) as unknown;
-					/* v8 ignore next -- defensive against non-string list items (writer JSON.stringifies strings only). */
-					if (typeof v === "string") {
-						(activeListKey === "labels" ? labels : assignees).push(v);
-					}
+					// Bad-shape items are skipped (not fatal) so one corrupt row
+					// doesn't drop the whole reference.
+					if (isReferenceField(v)) refFields.push(v);
 				} catch {
-					return null;
+					// Non-JSON list item → skip it, keep parsing the rest.
 				}
 				continue;
 			}
-			activeListKey = null;
+			inFieldsList = false;
 		}
-		if (line.trim() === "labels:") {
-			activeListKey = "labels";
-			continue;
-		}
-		if (line.trim() === "assignees:") {
-			activeListKey = "assignees";
+		if (line.trim() === "fields:") {
+			inFieldsList = true;
 			continue;
 		}
 		const kv = /^([a-zA-Z]+):\s*(.+)$/.exec(line);
 		if (!kv) continue;
-		fields[kv[1]] = kv[2];
+		scalars[kv[1]] = kv[2];
 	}
 
 	const readString = (key: string): string | undefined => {
-		const raw = fields[key];
+		const raw = scalars[key];
 		if (raw === undefined) return undefined;
 		try {
 			const v = JSON.parse(raw) as unknown;
@@ -287,25 +283,30 @@ function parseMarkdown(content: string): Reference | null {
 		url,
 		referencedAt,
 		toolName: sourceToolName,
-		...optString("status", readString("status")),
-		...optString("priority", readString("priority")),
-		...(labels.length > 0 ? { labels } : {}),
-		...(assignees.length > 0 ? { assignees } : {}),
-		...optString("milestone", readString("milestone")),
-		...optString("entityType", readString("entityType")),
+		...(refFields.length > 0 ? { fields: refFields } : {}),
 		...(body.length > 0 ? { description: body } : {}),
 	};
 	return ref;
 }
 
-function optString(
-	key: "status" | "priority" | "milestone" | "entityType",
-	value: string | undefined,
-): Partial<Reference> {
-	return value !== undefined ? ({ [key]: value } as Partial<Reference>) : {};
+/** Structural guard for a persisted {@link ReferenceField} list item. */
+function isReferenceField(v: unknown): v is ReferenceField {
+	if (typeof v !== "object" || v === null) return false;
+	const o = v as Record<string, unknown>;
+	if (typeof o.key !== "string" || typeof o.label !== "string" || typeof o.value !== "string") return false;
+	// `key` is interpolated *raw* (un-escaped) into the prompt's <issue …>
+	// attribute name by every adapter's renderPromptBlock — an XML attribute
+	// name can't be quote-escaped, so the only safe defense is to constrain the
+	// charset. First-extraction keys are adapter-hardcoded (`status`, `labels`,
+	// `entity-type`, …) and all match this; rejecting here closes the
+	// round-trip hole where a poisoned orphan-branch field carrying
+	// `key: 'x"><inject'` would break the <issue> structure on regenerate.
+	if (!/^[\w-]+$/.test(o.key)) return false;
+	if (o.icon !== undefined && typeof o.icon !== "string") return false;
+	return true;
 }
 
-function isSourceId(s: string): s is SourceId {
+export function isSourceId(s: string): s is SourceId {
 	return s === "linear" || s === "jira" || s === "github" || s === "notion";
 }
 

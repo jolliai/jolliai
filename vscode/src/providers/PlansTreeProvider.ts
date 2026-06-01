@@ -11,7 +11,7 @@ import {
 	type CommitExclusions,
 	readExclusions,
 } from "../../../cli/src/core/CommitSelectionStore.js";
-import type { SourceId } from "../../../cli/src/Types.js";
+import type { ReferenceField, SourceId } from "../../../cli/src/Types.js";
 import type { PlansStore } from "../stores/PlansStore.js";
 import type { NoteInfo, PlanInfo, ReferenceInfo } from "../Types.js";
 import {
@@ -132,21 +132,14 @@ export class ReferenceItem extends vscode.TreeItem {
 	 * the Memories section uses (see SidebarScriptBuilder.renderReferenceHoverCard).
 	 *
 	 * `source` lets the renderer label / icon-tint per provider (Linear /
-	 * Jira / GitHub / Notion). The extra optional fields surface
-	 * source-specific metadata that the on-disk frontmatter parser does NOT
-	 * currently extract (assignees / milestone / entityType) — kept on the
-	 * shape so a follow-up frontmatter pass can populate them without
-	 * another wire-protocol change.
+	 * Jira / GitHub / Notion). `fields` is the opaque, source-specific display
+	 * bag built by the adapter — the renderer iterates it generically, so a new
+	 * source needs no change here.
 	 */
 	readonly referenceHover: {
 		readonly title: string;
 		readonly source: SourceId;
-		readonly status?: string;
-		readonly priority?: string;
-		readonly labels?: string;
-		readonly assignees?: string;
-		readonly milestone?: string;
-		readonly entityType?: string;
+		readonly fields?: ReadonlyArray<ReferenceField>;
 		readonly url: string;
 	};
 
@@ -172,11 +165,7 @@ export class ReferenceItem extends vscode.TreeItem {
 		this.referenceHover = {
 			title: buildReferenceLabel(reference),
 			source: reference.source,
-			...(reference.status ? { status: reference.status } : {}),
-			...(reference.priority ? { priority: reference.priority } : {}),
-			...(reference.labels && reference.labels.length > 0
-				? { labels: reference.labels.join(", ") }
-				: {}),
+			...(reference.fields && reference.fields.length > 0 ? { fields: reference.fields } : {}),
 			url: reference.url,
 		};
 	}
@@ -406,17 +395,10 @@ function buildReferenceTooltip(reference: ReferenceInfo): string {
 	} else {
 		lines.push(`${reference.nativeId} — ${reference.title}`);
 	}
-	const hasMeta =
-		!!reference.status ||
-		!!reference.priority ||
-		(reference.labels !== undefined && reference.labels.length > 0);
-	if (hasMeta) {
+	const refFields = reference.fields ?? [];
+	if (refFields.length > 0) {
 		lines.push("");
-	}
-	if (reference.status) lines.push(`Status: ${reference.status}`);
-	if (reference.priority) lines.push(`Priority: ${reference.priority}`);
-	if (reference.labels && reference.labels.length > 0) {
-		lines.push(`Labels: ${reference.labels.join(", ")}`);
+		for (const f of refFields) lines.push(`${f.label}: ${f.value}`);
 	}
 	lines.push("");
 	lines.push(reference.url);

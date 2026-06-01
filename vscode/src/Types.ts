@@ -126,12 +126,14 @@ export type {
 	Reference,
 	ReferenceCommitRef,
 	ReferenceEntry,
+	ReferenceField,
 	SourceId,
 } from "../../cli/src/Types.js";
 
 // Import for use in NoteInfo / ReferenceInfo
 import type {
 	NoteFormat,
+	ReferenceField,
 	SourceId,
 } from "../../cli/src/Types.js";
 
@@ -172,9 +174,8 @@ export interface ReferenceInfo {
 	readonly title: string;
 	readonly url: string;
 	readonly sourcePath: string;
-	readonly status?: string;
-	readonly priority?: string;
-	readonly labels?: ReadonlyArray<string>;
+	/** Opaque, source-specific display fields (built by the adapter). */
+	readonly fields?: ReadonlyArray<ReferenceField>;
 	readonly description?: string;
 	readonly branch: string;
 	readonly addedAt: string;

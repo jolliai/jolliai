@@ -35,6 +35,7 @@ import type {
 	CommitSummary,
 	FileWrite,
 	PlanProgressArtifact,
+	SourceId,
 	SummaryIndex,
 	SummaryIndexEntry,
 } from "../Types.js";
@@ -3647,6 +3648,32 @@ describe("SummaryStore", () => {
 			expect(files).toHaveLength(1);
 			expect(files[0].path).toMatch(/^references\/github\/owner-repo-7-abc12345-[0-9a-f]{8}\.md$/);
 			expect(files[0].content).toBe("body");
+		});
+
+		it("storeReferences rejects a path-traversal source (orphanPathFor isSourceId guard)", async () => {
+			// A poisoned `source` (e.g. from a tampered orphan branch / synced
+			// Memory Bank) must not be interpolated raw into the on-disk path.
+			await expect(
+				storeReferences(
+					[
+						{
+							archivedKey: "x:PROJ-1-abc12345",
+							source: "../../../../etc" as unknown as SourceId,
+							content: "b",
+						},
+					],
+					"malicious",
+				),
+			).rejects.toThrow(/unknown reference source/);
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("readReferenceFromBranch returns null for a path-traversal source (guard caught, no read attempted)", async () => {
+			await expect(
+				readReferenceFromBranch("../../../../etc" as unknown as SourceId, "x:PROJ-1-abc12345"),
+			).resolves.toBeNull();
+			// orphanPathFor throws while building the path → before any storage read.
+			expect(readFileFromBranch).not.toHaveBeenCalled();
 		});
 
 		it("readReferenceFromBranch returns content from entities/<source>/<bareKey>.md for non-linear sources", async () => {

@@ -64,6 +64,9 @@ import {
 	setReferenceIgnored,
 } from "./ReferenceService.js";
 
+const fieldVal = (r: ReferenceInfo | undefined, key: string): string | undefined =>
+	r?.fields?.find((f) => f.key === key)?.value;
+
 function makeEntry(overrides: Partial<ReferenceEntry> = {}): ReferenceEntry {
 	return {
 		source: "linear",
@@ -240,21 +243,30 @@ describe("detectReferences", () => {
 		expect(result.map((r) => r.nativeId)).toEqual(["A", "C", "B"]);
 	});
 
-	it("enriches ReferenceInfo with frontmatter status / priority / labels / description preview when readable", async () => {
+	it("enriches ReferenceInfo with the frontmatter fields bag + description preview when readable", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockReturnValue(
-			'---\nstatus: "In Progress"\npriority: "Urgent"\nlabels:\n  - "A"\n  - "B"\n---\n## Problem\n\nbody here\n',
+			[
+				"---",
+				"fields:",
+				'  - {"key":"status","label":"Status","value":"In Progress","icon":"circle-large-filled"}',
+				'  - {"key":"priority","label":"Priority","value":"Urgent","icon":"flame"}',
+				'  - {"key":"labels","label":"Labels","value":"A, B","icon":"tag"}',
+				"---",
+				"## Problem",
+				"",
+				"body here",
+				"",
+			].join("\n"),
 		);
 		const result = await detectReferences("/repo");
-		expect(result[0]).toMatchObject({
-			status: "In Progress",
-			priority: "Urgent",
-			labels: ["A", "B"],
-		});
+		expect(fieldVal(result[0], "status")).toBe("In Progress");
+		expect(fieldVal(result[0], "priority")).toBe("Urgent");
+		expect(fieldVal(result[0], "labels")).toBe("A, B");
 		expect(result[0].description).toContain("Problem");
 	});
 
@@ -269,7 +281,7 @@ describe("detectReferences", () => {
 		});
 		const result = await detectReferences("/repo");
 		expect(result).toHaveLength(1);
-		expect(result[0].status).toBeUndefined();
+		expect(result[0].fields).toBeUndefined();
 	});
 
 	it("gracefully handles malformed frontmatter (no opening ---)", async () => {
@@ -280,7 +292,7 @@ describe("detectReferences", () => {
 		});
 		mockReadFileSync.mockReturnValue("no frontmatter at all");
 		const result = await detectReferences("/repo");
-		expect(result[0].status).toBeUndefined();
+		expect(result[0].fields).toBeUndefined();
 	});
 
 	it("gracefully handles missing closing ---", async () => {
@@ -289,88 +301,166 @@ describe("detectReferences", () => {
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
-		mockReadFileSync.mockReturnValue('---\nstatus: "x"\n(no closing)');
+		mockReadFileSync.mockReturnValue(
+			'---\nfields:\n  - {"key":"status","label":"Status","value":"x"}\n(no closing)',
+		);
 		const result = await detectReferences("/repo");
-		expect(result[0].status).toBeUndefined();
+		expect(result[0].fields).toBeUndefined();
 	});
 
-	it("skips bad label line but preserves status / description", async () => {
+	it("skips a non-JSON fields list item but preserves valid items / description", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockReturnValue(
-			'---\nstatus: "In Progress"\nlabels:\n  - not-json-quoted\n---\nbody\n',
+			[
+				"---",
+				"fields:",
+				'  - {"key":"status","label":"Status","value":"In Progress"}',
+				"  - not-json-quoted",
+				"---",
+				"body",
+				"",
+			].join("\n"),
 		);
 		const result = await detectReferences("/repo");
-		expect(result[0].status).toBe("In Progress");
-		expect(result[0].labels).toBeUndefined();
+		expect(fieldVal(result[0], "status")).toBe("In Progress");
+		expect(result[0].fields).toHaveLength(1);
 		expect(result[0].description).toBe("body");
 	});
 
-	it("frontmatter: labels present but body empty", async () => {
+	it("skips a bad-shape fields list item (valid JSON, missing key/label/value)", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
-		mockReadFileSync.mockReturnValue('---\nstatus: "X"\nlabels:\n  - "A"\n---\n');
+		mockReadFileSync.mockReturnValue(
+			[
+				"---",
+				"fields:",
+				'  - {"label":"Status","value":"open"}',
+				"---",
+				"body",
+				"",
+			].join("\n"),
+		);
 		const result = await detectReferences("/repo");
-		expect(result[0].labels).toEqual(["A"]);
+		expect(result[0].fields).toBeUndefined();
+		expect(result[0].description).toBe("body");
+	});
+
+	it("skips a fields list item that is valid JSON but not an object (bare number)", async () => {
+		mockLoadPlansRegistry.mockResolvedValue({
+			version: 1,
+			plans: {},
+			references: { "linear:PROJ-1528": makeEntry() },
+		});
+		mockReadFileSync.mockReturnValue(
+			[
+				"---",
+				"fields:",
+				"  - 42",
+				'  - {"key":"status","label":"Status","value":"open"}',
+				"---",
+				"body",
+				"",
+			].join("\n"),
+		);
+		const result = await detectReferences("/repo");
+		expect(result[0].fields).toHaveLength(1);
+		expect(fieldVal(result[0], "status")).toBe("open");
+	});
+
+	it("skips a fields list item whose icon is not a string", async () => {
+		mockLoadPlansRegistry.mockResolvedValue({
+			version: 1,
+			plans: {},
+			references: { "linear:PROJ-1528": makeEntry() },
+		});
+		mockReadFileSync.mockReturnValue(
+			[
+				"---",
+				"fields:",
+				'  - {"key":"status","label":"Status","value":"open","icon":42}',
+				'  - {"key":"labels","label":"Labels","value":"bug"}',
+				"---",
+				"body",
+				"",
+			].join("\n"),
+		);
+		const result = await detectReferences("/repo");
+		expect(result[0].fields).toHaveLength(1);
+		expect(fieldVal(result[0], "labels")).toBe("bug");
+	});
+
+	it("frontmatter: fields present but body empty", async () => {
+		mockLoadPlansRegistry.mockResolvedValue({
+			version: 1,
+			plans: {},
+			references: { "linear:PROJ-1528": makeEntry() },
+		});
+		mockReadFileSync.mockReturnValue(
+			'---\nfields:\n  - {"key":"labels","label":"Labels","value":"A"}\n---\n',
+		);
+		const result = await detectReferences("/repo");
+		expect(fieldVal(result[0], "labels")).toBe("A");
 		expect(result[0].description).toBeUndefined();
 	});
 
-	it("frontmatter: no labels but body present", async () => {
+	it("frontmatter: no fields but body present", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
-		mockReadFileSync.mockReturnValue('---\nstatus: "X"\n---\nbody text');
+		mockReadFileSync.mockReturnValue("---\nsource: \"linear\"\n---\nbody text");
 		const result = await detectReferences("/repo");
-		expect(result[0].labels).toBeUndefined();
+		expect(result[0].fields).toBeUndefined();
 		expect(result[0].description).toBe("body text");
 	});
 
-	it("frontmatter: ends labels block when a non-list-item line interrupts (L285 inLabels=false arm)", async () => {
-		// Pins EntityService.ts L285: `inLabels = false` after the
-		// `^\s+- (.+)$` match fails inside the labels block. Without this
-		// the labels block would silently swallow trailing fields.
+	it("frontmatter: ends the fields block when a non-list-item line interrupts (inFields=false arm)", async () => {
+		// Pins the `inFields = false` reset after the `^\s+- (.+)$` match fails
+		// inside the fields block — a trailing scalar line must not be swallowed
+		// by the list parser.
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
-		// labels: starts the labels block, "  - A" is one entry, then
-		// "status: ..." is NOT a list-item — the loop must reset inLabels
-		// to false and parse status: on the same pass.
 		mockReadFileSync.mockReturnValue(
-			'---\nlabels:\n  - "A"\nstatus: "After Labels"\n---\nbody\n',
+			[
+				"---",
+				"fields:",
+				'  - {"key":"status","label":"Status","value":"A"}',
+				'source: "linear"',
+				"---",
+				"body",
+				"",
+			].join("\n"),
 		);
 		const result = await detectReferences("/repo");
-		expect(result[0].labels).toEqual(["A"]);
-		expect(result[0].status).toBe("After Labels");
+		expect(result[0].fields).toHaveLength(1);
+		expect(fieldVal(result[0], "status")).toBe("A");
 	});
 
-	it("frontmatter: skips unrecognized scalar fields without affecting status/priority parsing (L292 !kv continue arm)", async () => {
-		// Pins EntityService.ts L292: `if (!kv) continue` — when a frontmatter
-		// line is neither `labels:` nor a `status:` / `priority:` field, the
-		// regex match returns null and the loop must skip silently. Without
-		// this branch a stray scalar (e.g. `assignees: bob`, which the
-		// frontmatter writer emits but readFrontmatter doesn't yet handle)
-		// would crash or get mis-parsed.
+	it("frontmatter: skips non-fields scalar lines silently", async () => {
+		// A frontmatter line that is neither `fields:` nor a list item under it
+		// is ignored — readFrontmatter only collects the fields bag.
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
 		mockReadFileSync.mockReturnValue(
-			'---\nassignees: "bob"\nstatus: "Done"\n---\nbody\n',
+			'---\nsource: "linear"\nnativeId: "PROJ-1528"\n---\nbody\n',
 		);
 		const result = await detectReferences("/repo");
-		// status still parsed; the unknown `assignees:` line was skipped.
-		expect(result[0].status).toBe("Done");
+		expect(result[0].fields).toBeUndefined();
+		expect(result[0].description).toBe("body");
 	});
 });
 
@@ -406,6 +496,12 @@ describe("setReferenceIgnored", () => {
 			references: {},
 		});
 		await setReferenceIgnored("/repo", "jira:UNKNOWN", true);
+		expect(mockSavePlansRegistry).not.toHaveBeenCalled();
+	});
+
+	it("no-ops when the registry omits the references field entirely (?? {} fallback)", async () => {
+		mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {} });
+		await setReferenceIgnored("/repo", "jira:KAN-5", true);
 		expect(mockSavePlansRegistry).not.toHaveBeenCalled();
 	});
 

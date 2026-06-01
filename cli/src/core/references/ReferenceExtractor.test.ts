@@ -12,6 +12,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 import type { Reference } from "../../Types.js";
 import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
 import { LinearAdapter } from "./sources/LinearAdapter.js";
+import type { SourceAdapter } from "./sources/SourceAdapter.js";
+
+const fieldVal = (r: Reference | null | undefined, key: string): string | undefined =>
+	r?.fields?.find((f) => f.key === key)?.value;
 
 // ─── Fixture builders ────────────────────────────────────────────────────────
 
@@ -114,12 +118,12 @@ describe("extractReferencesFromTranscript", () => {
 			nativeId: "PROJ-1528",
 			title: SAMPLE_ISSUE_PAYLOAD.title,
 			url: SAMPLE_ISSUE_PAYLOAD.url,
-			status: "In Progress",
-			priority: "No priority",
-			labels: ["JolliMemory", "Feature"],
 			toolName: "mcp__linear__get_issue",
 			referencedAt: "2026-05-14T06:06:01.123Z",
 		});
+		expect(fieldVal(references[0], "status")).toBe("In Progress");
+		expect(fieldVal(references[0], "priority")).toBe("No priority");
+		expect(fieldVal(references[0], "labels")).toBe("JolliMemory, Feature");
 		expect(references[0].description).toContain("Linear issues are high-density");
 		expect(lastLineNumberScanned).toBe(2);
 	});
@@ -592,7 +596,7 @@ describe("extractReferencesFromTranscript", () => {
 
 		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
 
-		expect(references[0].priority).toBe("Urgent");
+		expect(fieldVal(references[0], "priority")).toBe("Urgent");
 	});
 
 	it("treats priority object whose name is empty string as no-priority", async () => {
@@ -610,7 +614,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
-		expect(references[0].priority).toBeUndefined();
+		expect(fieldVal(references[0], "priority")).toBeUndefined();
 	});
 
 	it("drops labels array of non-strings, leaving labels undefined on the ref", async () => {
@@ -629,7 +633,7 @@ describe("extractReferencesFromTranscript", () => {
 		);
 		mockReadFile.mockResolvedValue(jsonl);
 		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [LinearAdapter]);
-		expect(references[0].labels).toBeUndefined();
+		expect(fieldVal(references[0], "labels")).toBeUndefined();
 	});
 
 	it("dedup keeps the FIRST ref when same nativeId appears with an older referencedAt second", async () => {
@@ -790,6 +794,48 @@ describe("extractReferencesFromTranscript", () => {
 		expect(references[0].nativeId).toBe("PROJ-1528");
 	});
 
+	it("contains a throw from walkPayload to the offending tool_result and keeps scanning", async () => {
+		// The module contract promises every payload walk is wrapped: a throw
+		// from deep inside the walk (here a deliberately throwing adapter; in
+		// the wild, a RangeError from a pathologically deep payload) must NOT
+		// abort extraction for the whole transcript. The pending entry is
+		// dropped and a later well-formed pair on a sane adapter still resolves.
+		const throwingAdapter: SourceAdapter = {
+			...LinearAdapter,
+			extractRef(payload, toolName, referencedAt) {
+				if ((payload as { id?: unknown }).id === SAMPLE_ISSUE_PAYLOAD.id) {
+					throw new Error("boom from adapter");
+				}
+				return LinearAdapter.extractRef(payload, toolName, referencedAt);
+			},
+		};
+		const badUse = toolUseLine({
+			toolUseId: "toolu_throw",
+			toolName: "mcp__linear__get_issue",
+			timestamp: "2026-05-14T06:00:00.000Z",
+		});
+		const badPayload = toolResultLine({
+			toolUseId: "toolu_throw",
+			timestamp: "2026-05-14T06:00:00.500Z",
+			payload: SAMPLE_ISSUE_PAYLOAD,
+		});
+		const goodUse = toolUseLine({
+			toolUseId: "toolu_ok",
+			toolName: "mcp__linear__get_issue",
+			timestamp: "2026-05-14T06:00:01.000Z",
+		});
+		const goodPayload = toolResultLine({
+			toolUseId: "toolu_ok",
+			timestamp: "2026-05-14T06:00:01.500Z",
+			payload: SAMPLE_ISSUE_PAYLOAD_2,
+		});
+		mockReadFile.mockResolvedValue(makeJsonl(badUse, badPayload, goodUse, goodPayload));
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [throwingAdapter]);
+		expect(references).toHaveLength(1);
+		expect(references[0].nativeId).toBe("PROJ-1404");
+	});
+
 	it("ignores a tool_use line whose role is reported as something other than assistant or user", async () => {
 		const systemLine = JSON.stringify({
 			message: {
@@ -822,9 +868,9 @@ describe("extractReferencesFromTranscript", () => {
 
 		expect(references).toHaveLength(1);
 		expect(references[0].description).toBeUndefined();
-		expect(references[0].status).toBeUndefined();
-		expect(references[0].priority).toBeUndefined();
-		expect(references[0].labels).toBeUndefined();
+		expect(fieldVal(references[0], "status")).toBeUndefined();
+		expect(fieldVal(references[0], "priority")).toBeUndefined();
+		expect(fieldVal(references[0], "labels")).toBeUndefined();
 	});
 
 	it("skips a Linear-like line whose message.content is not an array", async () => {
@@ -930,15 +976,17 @@ function formatReferencesBlock(
 // ─── formatReferencesBlock ─────────────────────────────────────────────────
 
 function makeRef(overrides: Partial<Reference> = {}): Reference {
-	const base = {
+	const base: Reference = {
 		mapKey: "linear:PROJ-1528",
 		source: "linear" as const,
 		nativeId: "PROJ-1528",
 		title: "Treat referenced Linear issues",
 		url: "https://linear.app/jolliai/issue/PROJ-1528/",
-		status: "In Progress",
-		priority: "No priority",
-		labels: ["JolliMemory", "Feature"],
+		fields: [
+			{ key: "status", label: "Status", value: "In Progress", icon: "circle-large-filled" },
+			{ key: "priority", label: "Priority", value: "No priority", icon: "flame" },
+			{ key: "labels", label: "Labels", value: "JolliMemory, Feature", icon: "tag" },
+		],
 		description: "## Problem\n\nLinear issues are high-density context.",
 		toolName: "mcp__linear__get_issue",
 		referencedAt: "2026-05-14T06:00:01.000Z",
@@ -1053,9 +1101,7 @@ describe("formatReferencesBlock", () => {
 
 	it("omits optional fields cleanly when they are undefined", () => {
 		const minimal = makeRef({
-			status: undefined,
-			priority: undefined,
-			labels: undefined,
+			fields: undefined,
 			description: undefined,
 		});
 

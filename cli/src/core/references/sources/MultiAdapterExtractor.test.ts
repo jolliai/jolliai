@@ -21,9 +21,13 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 	return { ...actual, readFile: mockReadFile };
 });
 
+import type { Reference } from "../../../Types.js";
 import { extractReferencesFromTranscript } from "../ReferenceExtractor.js";
 import { ALL_ADAPTERS } from "./index.js";
 import { LinearAdapter } from "./LinearAdapter.js";
+
+const fieldVal = (r: Reference | null | undefined, key: string): string | undefined =>
+	r?.fields?.find((f) => f.key === key)?.value;
 
 function toolUseLine(opts: { toolUseId: string; toolName: string; timestamp: string }): string {
 	return JSON.stringify({
@@ -151,12 +155,12 @@ describe("extractReferencesFromTranscript", () => {
 			nativeId: "PROJ-7",
 			title: SAMPLE_ISSUE.title,
 			url: SAMPLE_ISSUE.url,
-			status: "In Progress",
-			priority: "Medium",
-			labels: ["adapter"],
 			toolName: "mcp__linear__get_issue",
 			referencedAt: "2026-05-26T06:00:01.000Z",
 		});
+		expect(fieldVal(references[0], "status")).toBe("In Progress");
+		expect(fieldVal(references[0], "priority")).toBe("Medium");
+		expect(fieldVal(references[0], "labels")).toBe("adapter");
 		expect(lastLineNumberScanned).toBe(2);
 	});
 

@@ -205,8 +205,9 @@ export async function getCommitInfo(hash: string, cwd?: string): Promise<CommitI
  * The budget defaults to 150_000 chars — sized for the summarizer's model
  * (sonnet-class, ~200K-token window) while leaving room for the conversation +
  * plans and keeping the assembled prompt inside the LLM wall-clock budget. It
- * was lowered from 200_000 because a whole-tree squash regenerate (200K diff +
- * 200K conversation) was overrunning the timeout and aborting mid-flight. When
+ * is deliberately capped below a full ~200K window: a whole-tree squash
+ * regenerate (≈200K diff + ≈200K conversation) overran the timeout and aborted
+ * mid-flight, so the diff share is held to 150K. When
  * the raw diff still exceeds `maxChars` it is NOT silently cut to the first few
  * (alphabetically-ordered) files — that let a large commit be summarised as if
  * only its first files had changed. Instead the complete `git diff --stat` file

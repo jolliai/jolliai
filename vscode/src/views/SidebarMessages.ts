@@ -9,7 +9,7 @@
  */
 
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
-import type { SourceId, TranscriptSource } from "../../../cli/src/Types.js";
+import type { ReferenceField, SourceId, TranscriptSource } from "../../../cli/src/Types.js";
 
 export type SidebarTab = "kb" | "branch" | "status";
 export type KbMode = "folders" | "memories";
@@ -337,28 +337,18 @@ export interface NoteHover {
  * `tooltip` on the SerializedTreeItem stays as the activity-bar TreeView
  * fallback; this richer field is webview-only.
  *
- * Source-specific fields (`assignees` / `milestone` / `entityType`) are
- * optional and reserved for a future frontmatter-parser pass that extracts
- * them. The Linear-only ancestor of this shape only carried status / priority
- * / labels — those are the fields the current ReferenceService parses today.
+ * Source-specific data flows entirely through the opaque `fields` bag (built
+ * by the adapter, carried verbatim through persistence). The hover-card
+ * renderer iterates `fields` generically — it never names a source-specific
+ * field, so a new source (Slack / Zoom / …) needs no change here.
  */
 export interface ReferenceHover {
 	/** "PROJ-1234 — Issue title..." (or just title for Notion) — bold at the top. */
 	readonly title: string;
 	/** Source provider — drives badge / icon-tint and Open-in-<X> link label. */
 	readonly source: SourceId;
-	/** Workflow status (e.g. "In Progress") — paired with a circle-large-filled icon. */
-	readonly status?: string;
-	/** Priority (e.g. "Urgent" / "No priority") — paired with a flame icon. */
-	readonly priority?: string;
-	/** Joined labels, e.g. "Feature, frontend" — paired with a tag icon. */
-	readonly labels?: string;
-	/** Joined assignee names (GitHub) — reserved; not yet populated by ReferenceService. */
-	readonly assignees?: string;
-	/** Milestone title (GitHub) — reserved; not yet populated by ReferenceService. */
-	readonly milestone?: string;
-	/** Notion entityType (e.g. "page") — reserved; not yet populated by ReferenceService. */
-	readonly entityType?: string;
+	/** Opaque, source-specific display fields — rendered as one row each (icon + value). */
+	readonly fields?: ReadonlyArray<ReferenceField>;
 	/** Upstream URL — used by the Open-in-<Source> action link. */
 	readonly url: string;
 }

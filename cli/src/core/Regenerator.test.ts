@@ -1285,9 +1285,11 @@ describe("regenerateSummary", () => {
 						url: "https://linear.app/x",
 						referencedAt: "2026-05-22T00:00:00Z",
 						sourceToolName: "mcp__linear__get_issue",
-						status: "In Review",
-						priority: "High",
-						labels: ["backend", "auth"],
+						fields: [
+							{ key: "status", label: "Status", value: "In Review", icon: "circle-large-filled" },
+							{ key: "priority", label: "Priority", value: "High", icon: "flame" },
+							{ key: "labels", label: "Labels", value: "backend, auth", icon: "tag" },
+						],
 					},
 				],
 			} as CommitSummary;
@@ -1311,6 +1313,122 @@ describe("regenerateSummary", () => {
 			expect(params.referenceBlocks).toContain('status="In Review"');
 			expect(params.referenceBlocks).toContain('priority="High"');
 			expect(params.referenceBlocks).toContain('labels="backend, auth"');
+		});
+
+		it("forwards the full fields bag for GitHub (assignees / milestone / entity-type) — regression guard for the pre-bag drop", async () => {
+			// The pre-bag Regenerator only copied status/priority/labels, silently
+			// dropping GitHub's assignees / milestone / entityType at regenerate
+			// time. The opaque fields bag carries the whole set verbatim; this pins
+			// it so a regression to hardcoded-key copying is caught.
+			const ghSummary: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "github:jolliai/jolli#9-feedabcd",
+						source: "github",
+						nativeId: "jolliai/jolli#9",
+						title: "GH issue",
+						url: "https://github.com/jolliai/jolli/issues/9",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__github__issue_read",
+						fields: [
+							{ key: "status", label: "Status", value: "open", icon: "circle-large-filled" },
+							{ key: "labels", label: "Labels", value: "bug, p1", icon: "tag" },
+							{ key: "assignees", label: "Assignees", value: "alice, bob", icon: "account" },
+							{ key: "milestone", label: "Milestone", value: "v1.0", icon: "milestone" },
+							{ key: "entity-type", label: "Type", value: "Bug", icon: "symbol-class" },
+						],
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(
+				[
+					"---",
+					'source: "github"',
+					'nativeId: "jolliai/jolli#9"',
+					'title: "GH issue"',
+					'url: "https://github.com/jolliai/jolli/issues/9"',
+					'referencedAt: "2026-05-22T00:00:00Z"',
+					'sourceToolName: "mcp__github__issue_read"',
+					"---",
+					"gh body",
+				].join("\n"),
+			);
+
+			await regenerateSummary(ghSummary, "/repo", config);
+
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain('assignees="alice, bob"');
+			expect(params.referenceBlocks).toContain('milestone="v1.0"');
+			expect(params.referenceBlocks).toContain('entity-type="Bug"');
+		});
+
+		it("truncates an oversized description exactly once (regenerate matches first-run, no double-cut)", async () => {
+			// The pre-bag path truncated the description up-front AND again inside
+			// the adapter, double-cutting an oversized body and emitting a wrong
+			// "…[truncated, N more chars]" count. With the single adapter-side
+			// truncation, the count reflects the true overflow (5000 - 4000 = 1000).
+			const bigBody = "A".repeat(5000); // linear per-reference cap is 4000
+			const bigSummary: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:PROJ-7-feedabcd",
+						source: "linear",
+						nativeId: "PROJ-7",
+						title: "Big",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "PROJ-7"',
+					'title: "Big"',
+					'url: "https://linear.app/x"',
+					'referencedAt: "2026-05-22T00:00:00Z"',
+					'sourceToolName: "mcp__linear__get_issue"',
+					"---",
+					bigBody,
+				].join("\n"),
+			);
+
+			await regenerateSummary(bigSummary, "/repo", config);
+
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain("…[truncated, 1000 more chars]");
+		});
+
+		it("fallback (unparseable frontmatter) also truncates exactly once", async () => {
+			// When the orphan markdown can't be parsed as frontmatter, the raw body
+			// is embedded as description. It must flow through untruncated so the
+			// adapter truncates it exactly once — same correct count as the parsed
+			// path (no double-cut on corrupt data either).
+			const bigRaw = "Z".repeat(5000); // not valid frontmatter (no leading ---)
+			const corruptSummary: CommitSummary = {
+				...baseSummary,
+				references: [
+					{
+						archivedKey: "linear:PROJ-8-feedabcd",
+						source: "linear",
+						nativeId: "PROJ-8",
+						title: "Corrupt",
+						url: "https://linear.app/x",
+						referencedAt: "2026-05-22T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				],
+			} as CommitSummary;
+			vi.mocked(SummaryStore.readReferenceFromBranch).mockResolvedValueOnce(bigRaw);
+
+			await regenerateSummary(corruptSummary, "/repo", config);
+
+			const params = vi.mocked(Summarizer.generateSummary).mock.calls[0][0];
+			expect(params.referenceBlocks).toContain("…[truncated, 1000 more chars]");
 		});
 
 		it("groups two entities of the same source into a single block (existing-bucket push path)", async () => {
@@ -1384,9 +1502,11 @@ describe("regenerateSummary", () => {
 						url: "https://linear.app/x",
 						referencedAt: "2026-05-22T00:00:00Z",
 						sourceToolName: "mcp__linear__get_issue",
-						status: "Done",
-						priority: "Low",
-						labels: ["chore"],
+						fields: [
+							{ key: "status", label: "Status", value: "Done", icon: "circle-large-filled" },
+							{ key: "priority", label: "Priority", value: "Low", icon: "flame" },
+							{ key: "labels", label: "Labels", value: "chore", icon: "tag" },
+						],
 					},
 				],
 			} as CommitSummary;
