@@ -824,6 +824,12 @@ export function buildSidebarScript(): string {
       case 'kb:foldersData':
         mergeFolders(msg.tree);
         break;
+      case 'kb:markDiverged':
+        setFileDivergedFlag(msg.path, true);
+        break;
+      case 'kb:clearDiverged':
+        setFileDivergedFlag(msg.path, false);
+        break;
       case 'kb:foldersReset':
         // Drop every cached level — paths deeper than the root may have been
         // renamed/removed by the host operation that triggered this reset
@@ -1553,38 +1559,103 @@ export function buildSidebarScript(): string {
     }
   }
 
-  // Re-attach already-expanded subtrees from folderCache onto a freshly fetched
-  // root listing. KbFoldersService returns lazy directory children (children:
+  // Graft already-expanded subtrees from folderCache onto a freshly fetched
+  // listing. KbFoldersService returns lazy directory children (children:
   // undefined), and renderFolderChildren treats only Array-typed children as
-  // "expanded" — so without this, manual refresh would collapse every folder
-  // the user had open. Cache-miss entries (newly visible folders) keep their
-  // lazy form so they render closed, which is correct.
-  // After a kb:foldersReset the cache is empty, so this is a no-op for rebuild.
-  function reattachExpandedFromCache(node) {
+  // "expanded" — so without this, a refresh would collapse every folder the
+  // user had open. Cache-miss entries (newly visible folders) keep their lazy
+  // form so they render closed, which is correct. PURE: no re-request — the
+  // refresh fan-out is kicked off once by requestExpandedRefresh.
+  //
+  // Applied to EVERY merged reply (see mergeFolders), not just the root, so a
+  // per-folder reply's lazy children can never overwrite a deeper expansion
+  // the user had open: each reply re-grafts whatever is currently expanded in
+  // the cache, making the merge order-independent. After a kb:foldersReset the
+  // cache is empty, so this is a no-op for rebuild.
+  function graftExpandedFromCache(node) {
     if (!node || !node.isDirectory || !Array.isArray(node.children)) return node;
     const newChildren = node.children.map(function(child) {
       if (!child.isDirectory) return child;
       const cached = folderCache[child.relPath];
       if (cached && Array.isArray(cached.children)) {
-        return reattachExpandedFromCache(cached);
+        return graftExpandedFromCache(cached);
       }
       return child;
     });
     return Object.assign({}, node, { children: newChildren });
   }
 
-  // Merge incoming kb:foldersData into the cache, then re-render.
+  // On a manual refresh the root listing arrives with NO preceding
+  // kb:foldersReset, so folderCache still holds every expanded dir. Re-request
+  // each (recursively, all depths) so listInRepo recomputes its files'
+  // isDiverged on the reply — a row edited on disk while the sidebar was open
+  // finally gets its ✎ marker. Fired ONCE, from the root merge only; the
+  // per-folder replies are merged by mergeFolders, which grafts expansion back
+  // in, so they can land in any order without collapsing the tree. Grafting on
+  // the replies (rather than here) is what keeps this from looping — we never
+  // re-post off a reply.
+  function requestExpandedRefresh(node) {
+    if (!node || !node.isDirectory || !Array.isArray(node.children)) return;
+    node.children.forEach(function(child) {
+      if (!child.isDirectory) return;
+      const cached = folderCache[child.relPath];
+      if (cached && Array.isArray(cached.children)) {
+        vscode.postMessage({ type: 'kb:expandFolder', path: child.relPath });
+        requestExpandedRefresh(cached);
+      }
+    });
+  }
+
+  // Merge incoming kb:foldersData into the cache, then re-render. Graft expanded
+  // descendants onto EVERY reply (root and per-folder) so an out-of-order
+  // per-folder reply can't overwrite a deeper expansion with a lazy child. Only
+  // the root merge kicks off the isDiverged refresh fan-out.
   function mergeFolders(tree) {
-    if (tree.relPath === '') tree = reattachExpandedFromCache(tree);
-    folderCache[tree.relPath] = tree;
-    propagateUp(tree.relPath, tree);
+    const grafted = graftExpandedFromCache(tree);
+    if (tree.relPath === '') requestExpandedRefresh(tree);
+    folderCache[grafted.relPath] = grafted;
+    propagateUp(grafted.relPath, grafted);
     if (state.activeTab === 'kb' && state.kbMode === 'folders') renderFolders();
     maybeAutoExpandCurrentRepo();
   }
 
+  // Flip a single already-rendered file row's diverged flag in place. Set true
+  // on kb:markDiverged (the host sends it when the user opens a .md whose
+  // on-disk sha256 no longer matches the manifest fingerprint); set false on
+  // kb:clearDiverged (after the host reverts the file to the system version).
+  // The row is already in the tree, so we just rebuild its parent dir with the
+  // child's new isDiverged (fresh references so render sees the change, matching
+  // mergeFolders' style) — no host round-trip / re-listing.
+  //
+  // The host sends these targeted flips instead of kb:foldersReset precisely so
+  // the surrounding tree keeps its expansion state: a content change touches one
+  // file's bytes, not the tree's shape, so wiping folderCache (which collapses
+  // every open folder) would be the wrong tool. Mark and clear are the same
+  // operation with opposite truth values, so they share one body — a future fix
+  // to the parentPath derivation or the render gate can't drift between them.
+  function setFileDivergedFlag(relPath, diverged) {
+    const idx = relPath.lastIndexOf('/');
+    const parentPath = idx === -1 ? '' : relPath.slice(0, idx);
+    const parent = folderCache[parentPath];
+    if (!parent || !Array.isArray(parent.children)) return;
+    let changed = false;
+    const newChildren = parent.children.map(function(child) {
+      if (child.relPath === relPath && !child.isDirectory && !!child.isDiverged !== diverged) {
+        changed = true;
+        return Object.assign({}, child, { isDiverged: diverged });
+      }
+      return child;
+    });
+    if (!changed) return;
+    const newParent = Object.assign({}, parent, { children: newChildren });
+    folderCache[parentPath] = newParent;
+    propagateUp(parentPath, newParent);
+    if (state.activeTab === 'kb' && state.kbMode === 'folders') renderFolders();
+  }
+
   // Auto-expand the current repo on first delivery so the user lands inside
   // their own memories instead of staring at a single bold row. One-shot: once
-  // we've done it (or seen it already expanded via reattachExpandedFromCache),
+  // we've done it (or seen it already expanded via graftExpandedFromCache),
   // we never auto-expand again so user-driven collapses stick. Triggers off
   // any merge — usually the root listing, but a lazy expand reply that arrives
   // before the root finishes is also fine.
