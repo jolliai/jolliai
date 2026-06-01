@@ -8,7 +8,7 @@ vi.mock("../core/SessionTracker.js", () => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
 	loadCursorForTranscript: vi.fn().mockResolvedValue(null),
 	saveCursor: vi.fn().mockResolvedValue(undefined),
-	loadPlansRegistry: vi.fn().mockResolvedValue({ version: 2, plans: {} }),
+	loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
 	savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 	upsertReferenceEntry: vi.fn().mockResolvedValue(undefined),
 }));
@@ -189,7 +189,7 @@ describe("StopHook", () => {
 		// Default: transcript file does not exist → plan discovery exits early
 		vi.mocked(existsSync).mockReturnValue(false);
 		// Default: loadPlansRegistry returns empty registry
-		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {} });
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
 		// Default: loadCursorForTranscript returns null (no prior scan)
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
 	});
@@ -332,7 +332,7 @@ describe("StopHook — plan discovery", () => {
 		vi.clearAllMocks();
 		process.env.CLAUDE_PROJECT_DIR = PROJECT_DIR;
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
-		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {} });
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
 		// Default: files don't exist
 		vi.mocked(existsSync).mockReturnValue(false);
 		vi.mocked(readFileSync).mockReturnValue(
@@ -575,7 +575,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // plan file exists
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				"existing-plan": {
 					slug: "existing-plan",
@@ -615,7 +615,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				"committed-plan": {
 					slug: "committed-plan",
@@ -646,7 +646,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				"ignored-plan": {
 					slug: "ignored-plan",
@@ -693,7 +693,7 @@ describe("StopHook — plan discovery", () => {
 		// readFileSync mock returns "# Plan Title\n\nContent" — SHA-256 of that value is the real hash below
 		// (sha256("# Plan Title\n\nContent") = 1ab12ceb7fdd12641cbcefc8a5b7816c447423966a5b9976a4e004b6ae49fe6d)
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				"archived-plan": {
 					slug: "archived-plan",
@@ -728,7 +728,7 @@ describe("StopHook — plan discovery", () => {
 
 		// hash mock returns "current-file-hash" — differs from contentHashAtCommit
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				"reused-plan": {
 					slug: "reused-plan",
@@ -772,7 +772,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				"removed-plan": {
 					slug: "removed-plan",
@@ -887,7 +887,7 @@ describe("StopHook — plan discovery", () => {
 		// First load: plan is still uncommitted
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"race-plan": {
 						slug: "race-plan",
@@ -905,7 +905,7 @@ describe("StopHook — plan discovery", () => {
 			// contentHashAtCommit are present (this is what associatePlansWithCommit
 			// actually writes in production).
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"race-plan": {
 						slug: "race-plan",
@@ -948,7 +948,7 @@ describe("StopHook — plan discovery", () => {
 
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"current-plan": {
 						slug: "current-plan",
@@ -963,7 +963,7 @@ describe("StopHook — plan discovery", () => {
 				},
 			})
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"current-plan": {
 						slug: "current-plan",
@@ -1010,7 +1010,7 @@ describe("StopHook — plan discovery", () => {
 		// First load: uncommitted state (before QueueWorker's writes)
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"refactor-api": {
 						slug: "refactor-api",
@@ -1026,7 +1026,7 @@ describe("StopHook — plan discovery", () => {
 			})
 			// Second load (freshRegistry): QueueWorker has run, guard installed + archive added
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"refactor-api": {
 						slug: "refactor-api",
@@ -1088,7 +1088,7 @@ describe("StopHook — plan discovery", () => {
 		vi.mocked(existsSync).mockReturnValue(true);
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"refactor-api": {
 						slug: "refactor-api",
@@ -1103,7 +1103,7 @@ describe("StopHook — plan discovery", () => {
 				},
 			})
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"refactor-api": {
 						slug: "refactor-api",
@@ -1134,7 +1134,7 @@ describe("StopHook — plan discovery", () => {
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
 		vi.mocked(loadPlansRegistry).mockReset();
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: { "refactor-api": afterEvent1?.plans["refactor-api"] as PlanEntry },
 		});
 		vi.mocked(savePlansRegistry).mockClear();
@@ -1158,7 +1158,7 @@ describe("StopHook — plan discovery", () => {
 
 		vi.mocked(loadPlansRegistry)
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"our-plan": {
 						slug: "our-plan",
@@ -1183,7 +1183,7 @@ describe("StopHook — plan discovery", () => {
 				},
 			})
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"our-plan": {
 						slug: "our-plan",
@@ -1225,9 +1225,9 @@ describe("StopHook — plan discovery", () => {
 		vi.mocked(existsSync).mockReturnValueOnce(true).mockReturnValueOnce(true);
 
 		vi.mocked(loadPlansRegistry)
-			.mockResolvedValueOnce({ version: 2, plans: {} })
+			.mockResolvedValueOnce({ version: 1, plans: {} })
 			.mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {
 					"plan-b": {
 						slug: "plan-b",
@@ -1368,7 +1368,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // external plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				foo: {
 					slug: "foo",
@@ -1405,7 +1405,7 @@ describe("StopHook — plan discovery", () => {
 		// Reverse-lookup by sourcePath must still find this entry and reuse its slug,
 		// rather than naively registering a fresh `foo` entry.
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				"foo-a3b7c2d1": {
 					slug: "foo-a3b7c2d1",
@@ -1491,7 +1491,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // .md file on disk
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			notes: {
 				"n-abc123": {
@@ -1525,7 +1525,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // .md file on disk
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			notes: {
 				"n-snippet": {
@@ -1560,7 +1560,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // .md file on disk
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			notes: {
 				"n-legacy": {
@@ -1597,7 +1597,7 @@ describe("StopHook — plan discovery", () => {
 				.mockReturnValueOnce(true); // .md file on disk
 
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					"n-abc": {
@@ -1636,7 +1636,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // .md file on disk
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			notes: {
 				"n-other": {
@@ -1680,7 +1680,7 @@ describe("StopHook — plan discovery", () => {
 
 		const canonicalPath = join("/home/user", ".claude", "plans", "shared.md");
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			notes: {
 				"n-shared": {
@@ -1717,7 +1717,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // external plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			notes: {
 				"n-keep": {
@@ -1808,7 +1808,7 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // canonical plan file
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				foo: {
 					slug: "foo",
@@ -1863,7 +1863,7 @@ describe("StopHook — entity discovery (multi-source)", () => {
 		process.env.CLAUDE_PROJECT_DIR = PROJECT_DIR;
 		vi.mocked(loadConfig).mockResolvedValue({});
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
-		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {} });
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
 		vi.mocked(existsSync).mockReturnValue(false);
 		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({
 			references: [],

@@ -1027,16 +1027,6 @@ async function associateReferencesWithCommit(
 		// pairs we explicitly touched get layered on top of the fresh
 		// snapshot.
 		const freshRegistry = await loadPlansRegistry(cwd);
-		// Same invariant as the initial load: only fail-loud — there is no
-		// realistic recovery path if a concurrent caller downgraded the registry
-		// (which itself shouldn't be possible since every writer saves v2).
-		/* v8 ignore start -- invariant assertion: only triggered by a hypothetical concurrent v1 writer, which no code path creates. Mirrored from the initial load. */
-		if (freshRegistry.version !== 2) {
-			throw new Error(
-				`associateReferencesWithCommit: freshRegistry downgraded to v${freshRegistry.version} between load and save`,
-			);
-		}
-		/* v8 ignore stop */
 		/* v8 ignore next -- `?? {}` fallback unreachable: freshRegistry is loaded immediately after we've already proven references was defined (L919 fallback would have fired otherwise); a concurrent writer clearing the field is the same race that the surrounding per-key merge is designed to tolerate, not eliminate. */
 		const mergedReferences = { ...(freshRegistry.references ?? {}) };
 		for (const { mapKey } of ids) {
@@ -1048,13 +1038,13 @@ async function associateReferencesWithCommit(
 				mergedReferences[archivedKey] = updatedReferences[archivedKey];
 			}
 		}
-		const v2Out: PlansRegistry = {
-			version: 2,
+		const out: PlansRegistry = {
+			version: 1,
 			plans: freshRegistry.plans,
 			...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
 			references: mergedReferences,
 		};
-		await savePlansRegistry(v2Out, cwd);
+		await savePlansRegistry(out, cwd);
 	}
 
 	if (droppedMapKeys.length > 0) {

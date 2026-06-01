@@ -18,7 +18,7 @@
  *   3. Incrementally scans the transcript for reference refs across every
  *      registered SourceAdapter (Linear / Jira / GitHub / Notion / …) via the
  *      generic `extractReferencesFromTranscript` loop. Each ref is persisted via
- *      `upsertReferenceEntry` into the v2 `plans.json.references` map and rendered
+ *      `upsertReferenceEntry` into the `plans.json.references` map and rendered
  *      to per-reference markdown by `ReferenceStore`, so the VSCode panel surfaces
  *      them alongside plans and notes.
  *
@@ -449,7 +449,7 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 		// any sibling pipeline that wrote them between our load and save (e.g.
 		// the note service from the extension, the Linear discovery loop below)
 		// loses its work.
-		await savePlansRegistry({ ...freshRegistry, version: 2, plans: merged }, cwd);
+		await savePlansRegistry({ ...freshRegistry, version: 1, plans: merged }, cwd);
 		log.info(
 			"Plan discovery: upserted %d slug(s) + %d external path(s) into plans.json",
 			slugs.size,

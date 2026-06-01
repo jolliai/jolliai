@@ -468,10 +468,13 @@ export interface PlanEntry {
  *
  * Multi-source: holds plans / notes / references (keyed by `<source>:<nativeId>`
  * pre-archive and `<source>:<nativeId>-<shortHash>` post-archive). The
- * `version: 2` field is retained as a future-migration anchor.
+ * `version` field is vestigial — nothing branches on it. Old and new code
+ * separate by field name (`linearIssues` vs `references`), so no version-gated
+ * migration is needed; it stays at `1` (the pre-references schema) as a plain
+ * future-migration anchor.
  */
 export interface PlansRegistry {
-	readonly version: 2;
+	readonly version: 1;
 	readonly plans: Readonly<Record<string, PlanEntry>>;
 	readonly notes?: Readonly<Record<string, NoteEntry>>;
 	readonly references?: Readonly<Record<string, ReferenceEntry>>;
@@ -559,15 +562,16 @@ export interface NoteReference {
  * SourceId — stable id naming each external-reference provider.
  *
  * Add a new id only by registering a corresponding `SourceAdapter` in
- * `cli/src/core/references/sources/index.ts`. Persistence layers (plans.json v2 references,
- * orphan-branch `references/<source>/…`) key off this string directly.
+ * `cli/src/core/references/sources/index.ts`. Persistence layers (the
+ * `plans.json` `references` map, orphan-branch `references/<source>/…`) key off
+ * this string directly.
  */
 export type SourceId = "linear" | "jira" | "github" | "notion";
 
 /**
  * Reference — ephemeral, in-memory shape produced by a `SourceAdapter.extractRef`
- * call. Superset of `LinearIssueRef` with a `source` discriminator + optional
- * GitHub-/Notion-specific fields. Persisted as markdown frontmatter by
+ * call. Carries a `source` discriminator + optional GitHub-/Notion-specific
+ * fields. Persisted as markdown frontmatter by
  * `ReferenceStore.writeReferenceMarkdown`; metadata is split into `ReferenceEntry`
  * (registry) and the markdown body (description).
  */
@@ -594,15 +598,14 @@ export interface Reference {
 }
 
 /**
- * ReferenceEntry — persisted registry row in `plans.json.references` (v2).
+ * ReferenceEntry — persisted registry row in the `plans.json.references` map.
  *
- * Generalises {@link ReferenceEntry} across every {@link SourceId}. Map key
- * follows the same archive pattern as Plans/Notes/Linear: the active row uses
+ * Holds one row per external reference across every {@link SourceId}. Map key
+ * follows the same archive pattern as Plans/Notes: the active row uses
  * `<source>:<nativeId>` and (after `associateReferencesWithCommit`) a second
  * snapshot row appears keyed `<source>:<nativeId>-<shortHash>`. The
  * `contentHashAtCommit` guard pattern, branch-scoping, and ignored semantics
- * mirror {@link ReferenceEntry} verbatim — see that interface's doc-comment
- * for the panel-filter rules.
+ * mirror the Plan / Note registry rows.
  */
 export interface ReferenceEntry {
 	readonly source: SourceId;
@@ -624,8 +627,8 @@ export interface ReferenceEntry {
 }
 
 /**
- * ReferenceCommitRef — multi-source replacement for {@link ReferenceCommitRef}
- * stored in `CommitSummary.references`. `archivedKey` is the POST-archive
+ * ReferenceCommitRef — multi-source reference snapshot stored in
+ * `CommitSummary.references`. `archivedKey` is the POST-archive
  * `plans.json.references` map key (`<source>:<nativeId>-<shortHash>`); other
  * fields are a value-snapshot at archive time.
  */

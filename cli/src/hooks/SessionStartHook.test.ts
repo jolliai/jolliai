@@ -877,7 +877,7 @@ describe("SessionStartHook", () => {
 			]),
 		);
 		const plansRegistry: PlansRegistry = {
-			version: 2,
+			version: 1,
 			plans: {
 				"oauth-strategy": {
 					slug: "oauth-strategy",

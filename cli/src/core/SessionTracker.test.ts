@@ -96,7 +96,7 @@ import {
 
 /**
  * Test-only narrowing helper: pull Linear-only reference rows out of a loaded
- * v2 PlansRegistry, keyed by bare ticket id (`linear:` prefix stripped). The
+ * PlansRegistry, keyed by bare ticket id (`linear:` prefix stripped). The
  * value is the ReferenceEntry as-is (no shape transformation) — tests that
  * used to read the legacy `linearIssues` map now read this projection instead.
  */
@@ -635,7 +635,7 @@ describe("SessionTracker", () => {
 
 	describe("plans registry", () => {
 		it("should return an empty plans registry when plans.json does not exist", async () => {
-			await expect(loadPlansRegistry(tempDir)).resolves.toEqual({ version: 2, plans: {} });
+			await expect(loadPlansRegistry(tempDir)).resolves.toEqual({ version: 1, plans: {} });
 		});
 
 		it("should normalize a partial plans.json (e.g. manual edit to `{}`) to the canonical shape", async () => {
@@ -645,12 +645,12 @@ describe("SessionTracker", () => {
 			await mkdir(dirname(plansPath), { recursive: true });
 			await writeFile(plansPath, "{}");
 
-			await expect(loadPlansRegistry(tempDir)).resolves.toEqual({ version: 2, plans: {} });
+			await expect(loadPlansRegistry(tempDir)).resolves.toEqual({ version: 1, plans: {} });
 		});
 
 		it("should save and load plans registry", async () => {
 			const registry = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {
 					"feature-auth": {
 						slug: "feature-auth",
@@ -671,7 +671,7 @@ describe("SessionTracker", () => {
 
 		it("should fall back to direct overwrite when atomic rename gets EPERM", async () => {
 			const registry = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {
 					"feature-auth": {
 						slug: "feature-auth",
@@ -694,18 +694,18 @@ describe("SessionTracker", () => {
 		it("should rethrow non-permission rename failures during atomic writes", async () => {
 			mockRename.mockRejectedValueOnce(Object.assign(new Error("disk full"), { code: "ENOSPC" }));
 
-			await expect(savePlansRegistry({ version: 2, plans: {} }, tempDir)).rejects.toThrow("disk full");
+			await expect(savePlansRegistry({ version: 1, plans: {} }, tempDir)).rejects.toThrow("disk full");
 		});
 
 		it("should return an empty registry for corrupt plans.json", async () => {
 			const dir = await ensureJolliMemoryDir(tempDir);
 			await writeFile(join(dir, "plans.json"), "corrupt", "utf-8");
-			await expect(loadPlansRegistry(tempDir)).resolves.toEqual({ version: 2, plans: {} });
+			await expect(loadPlansRegistry(tempDir)).resolves.toEqual({ version: 1, plans: {} });
 		});
 
 		it("should associate a plan with a commit and update updatedAt", async () => {
 			const before = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {
 					"feature-auth": {
 						slug: "feature-auth",
@@ -730,7 +730,7 @@ describe("SessionTracker", () => {
 
 		it("should skip commit association when the plan slug is missing", async () => {
 			const before = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {
 					"feature-auth": {
 						slug: "feature-auth",
@@ -764,7 +764,7 @@ describe("SessionTracker", () => {
 				const fileHash = createHash("sha256").update(planBody).digest("hex");
 
 				const before = {
-					version: 2 as const,
+					version: 1 as const,
 					plans: {
 						"my-plan": {
 							slug: "my-plan",
@@ -816,7 +816,7 @@ describe("SessionTracker", () => {
 				expect(oldHash).not.toBe(newHash);
 
 				const before = {
-					version: 2 as const,
+					version: 1 as const,
 					plans: {
 						"my-plan": {
 							slug: "my-plan",
@@ -852,7 +852,7 @@ describe("SessionTracker", () => {
 
 			it("should preserve the existing contentHashAtCommit when the source file is missing", async () => {
 				const before = {
-					version: 2 as const,
+					version: 1 as const,
 					plans: {
 						"my-plan": {
 							slug: "my-plan",
@@ -896,7 +896,7 @@ describe("SessionTracker", () => {
 				const planFile = join(tempDir, "plan.md");
 				await writeFile(planFile, "# any\n", "utf-8");
 				const before = {
-					version: 2 as const,
+					version: 1 as const,
 					plans: {
 						"my-plan": {
 							slug: "my-plan",
@@ -939,7 +939,7 @@ describe("SessionTracker", () => {
 				// Defensive: a caller could pass a base-slug-shaped id (no suffix). The
 				// function must not invent a guard target out of an unrelated entry.
 				const before = {
-					version: 2 as const,
+					version: 1 as const,
 					plans: {
 						"my-plan": {
 							slug: "my-plan",
@@ -969,7 +969,7 @@ describe("SessionTracker", () => {
 
 		it("should load a single plan entry by slug", async () => {
 			const registry = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {
 					"feature-auth": {
 						slug: "feature-auth",
@@ -993,7 +993,7 @@ describe("SessionTracker", () => {
 	describe("associateNoteWithCommit", () => {
 		it("should associate a note with a commit and update updatedAt", async () => {
 			const before = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {},
 				notes: {
 					"note-1-abc": {
@@ -1019,7 +1019,7 @@ describe("SessionTracker", () => {
 		it("should handle registry with no notes field", async () => {
 			// Registry without a notes field — tests the ?? {} fallback
 			const before = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {},
 			};
 			await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
@@ -1034,7 +1034,7 @@ describe("SessionTracker", () => {
 
 		it("should skip commit association when the note id is missing", async () => {
 			const before = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {},
 				notes: {
 					"note-1-abc": {
@@ -1064,7 +1064,7 @@ describe("SessionTracker", () => {
 				const fileHash = createHash("sha256").update(body).digest("hex");
 
 				const before = {
-					version: 2 as const,
+					version: 1 as const,
 					plans: {},
 					notes: {
 						"note-035b": {
@@ -1121,7 +1121,7 @@ describe("SessionTracker", () => {
 				expect(oldHash).not.toBe(newHash);
 
 				const before = {
-					version: 2 as const,
+					version: 1 as const,
 					plans: {},
 					notes: {
 						"note-035b": {
@@ -1162,7 +1162,7 @@ describe("SessionTracker", () => {
 
 			it("should preserve the existing contentHashAtCommit when the source file is missing", async () => {
 				const before = {
-					version: 2 as const,
+					version: 1 as const,
 					plans: {},
 					notes: {
 						"note-035b": {
@@ -1206,7 +1206,7 @@ describe("SessionTracker", () => {
 				// user manually edited plans.json, or a parallel migration ran first),
 				// don't clobber its commitHash based on a stale archive id.
 				const before = {
-					version: 2 as const,
+					version: 1 as const,
 					plans: {},
 					notes: {
 						"note-035b": {
@@ -1255,7 +1255,7 @@ describe("SessionTracker", () => {
 		// (contentHashAtCommit undefined). Pins the four filter arms.
 		it("returns only active notes on the requested branch (filters branch / commitHash / ignored / guard)", async () => {
 			const registry = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {},
 				notes: {
 					"note-active": {
@@ -1319,7 +1319,7 @@ describe("SessionTracker", () => {
 			// iteration — used by post-commit StopHook when the registry was
 			// freshly initialized.
 			await savePlansRegistry(
-				{ version: 2 as const, plans: {} } as unknown as Parameters<typeof savePlansRegistry>[0],
+				{ version: 1 as const, plans: {} } as unknown as Parameters<typeof savePlansRegistry>[0],
 				tempDir,
 			);
 
@@ -1884,7 +1884,7 @@ describe("SessionTracker", () => {
 
 		async function seed(entries: Record<string, object>) {
 			await savePlansRegistry(
-				{ version: 2, plans: {}, references: entries } as Parameters<typeof savePlansRegistry>[0],
+				{ version: 1, plans: {}, references: entries } as Parameters<typeof savePlansRegistry>[0],
 				tempDir,
 			);
 		}
@@ -1958,7 +1958,7 @@ describe("SessionTracker", () => {
 		});
 
 		it("returns empty for repos with no linearIssues section", async () => {
-			await savePlansRegistry({ version: 2, plans: {} }, tempDir);
+			await savePlansRegistry({ version: 1, plans: {} }, tempDir);
 			expect(await detectUncommittedReferenceIds(tempDir, "main")).toEqual([]);
 			expect(await getReferenceEntriesForBranch(tempDir, "main")).toEqual([]);
 		});
@@ -2074,7 +2074,7 @@ describe("SessionTracker", () => {
 			// Pretend the user ignored it manually
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: first.plans,
 					references: {
 						...first.references,
@@ -2121,7 +2121,7 @@ describe("SessionTracker", () => {
 		it("returns no-op when an existing guard's contentHashAtCommit matches", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"linear:PROJ-1528": {
@@ -2150,7 +2150,7 @@ describe("SessionTracker", () => {
 		it("replaces a guard entry with a fresh uncommitted one when content hash differs", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"linear:PROJ-1528": {
@@ -2181,7 +2181,7 @@ describe("SessionTracker", () => {
 		it("creates a fresh entry when an existing one is on a different branch (defensive isolation)", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"linear:PROJ-1528": {
@@ -2211,7 +2211,7 @@ describe("SessionTracker", () => {
 		it("never resurrects an entry whose guard is ignored", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"linear:PROJ-1528": {
@@ -2243,7 +2243,7 @@ describe("SessionTracker", () => {
 		it("updates commitHash on the entry keyed by archivedKey", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"PROJ-1528-abc1234": {
@@ -2268,7 +2268,7 @@ describe("SessionTracker", () => {
 		});
 
 		it("is a no-op when the archivedKey is not in the registry", async () => {
-			await savePlansRegistry({ version: 2, plans: {}, references: {} }, tempDir);
+			await savePlansRegistry({ version: 1, plans: {}, references: {} }, tempDir);
 			await associateReferenceWithCommit("PROJ-99-zzz", "newhash", tempDir);
 			const after = await loadPlansRegistry(tempDir);
 			expect(linearIssuesOfReg(after)).toEqual({});
@@ -2279,7 +2279,7 @@ describe("SessionTracker", () => {
 		it("returns uncommitted plans for current branch", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {
 						"plan-1": {
 							slug: "plan-1",
@@ -2323,7 +2323,7 @@ describe("SessionTracker", () => {
 		it("detectActivePlansForBranch skips committed and guarded plans (covers commitHash + contentHash filter arms)", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {
 						"plan-active": {
 							slug: "plan-active",
@@ -2369,7 +2369,7 @@ describe("SessionTracker", () => {
 		it("returns uncommitted notes for current branch", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					notes: {
 						"note-1": {
@@ -2399,24 +2399,24 @@ describe("SessionTracker", () => {
 		});
 
 		it("returns empty when registry has no notes section", async () => {
-			await savePlansRegistry({ version: 2, plans: {} }, tempDir);
+			await savePlansRegistry({ version: 1, plans: {} }, tempDir);
 			expect(await detectActiveNotesForBranch(tempDir, "main")).toEqual([]);
 		});
 	});
 
-	describe("entitiesOf / detectUncommittedReferenceIds — v1 registry false branch", () => {
-		// Pins SessionTracker.ts L1013 (`reg.version === 2 ? ... : {}`) and the
-		// downstream L1052 entry-loop, which only reads entries when the
-		// registry is v2. A v1 registry must yield an empty result without
-		// erroring.
-		it("detectUncommittedReferenceIds returns empty array for a v1 registry", async () => {
-			await savePlansRegistry({ version: 2, plans: {} }, tempDir);
+	describe("detectUncommittedReferenceIds / getReferenceEntriesForBranch — registry with no references field", () => {
+		// Pins `referencesOf`'s `reg.references ?? {}` default: a registry that
+		// omits the `references` field entirely (e.g. a released-version file
+		// written before multi-source references existed) must yield an empty
+		// result without erroring.
+		it("detectUncommittedReferenceIds returns empty array when references field is absent", async () => {
+			await savePlansRegistry({ version: 1, plans: {} }, tempDir);
 			const ids = await detectUncommittedReferenceIds(tempDir, "main");
 			expect(ids).toEqual([]);
 		});
 
-		it("getReferenceEntriesForBranch returns empty array for a v1 registry", async () => {
-			await savePlansRegistry({ version: 2, plans: {} }, tempDir);
+		it("getReferenceEntriesForBranch returns empty array when references field is absent", async () => {
+			await savePlansRegistry({ version: 1, plans: {} }, tempDir);
 			const entries = await getReferenceEntriesForBranch(tempDir, "main");
 			expect(entries).toEqual([]);
 		});
@@ -2428,7 +2428,7 @@ describe("SessionTracker", () => {
 			// one, since the two functions duplicate the filter loop.
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-main": {
@@ -2534,7 +2534,7 @@ describe("SessionTracker", () => {
 			// of what `ignored` is supposed to mean.
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-5": {
@@ -2557,7 +2557,7 @@ describe("SessionTracker", () => {
 			);
 			await upsertReferenceEntry(entityRef({ title: "new" }), tempDir, "main");
 			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 2) return;
+			if (after.version !== 1) return;
 			expect(after.references?.["jira:KAN-5"]?.title).toBe("guarded-and-ignored");
 			expect(after.references?.["jira:KAN-5"]?.ignored).toBe(true);
 		});
@@ -2568,7 +2568,7 @@ describe("SessionTracker", () => {
 			// reach because that test only filters by branch.
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-active": {
@@ -2635,7 +2635,7 @@ describe("SessionTracker", () => {
 			// reach because that test only filters by branch.
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-active": {
@@ -2711,7 +2711,7 @@ describe("SessionTracker", () => {
 			// Seed an uncommitted (commitHash:null, no contentHashAtCommit) entry with ignored:true.
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-5": {
@@ -2733,7 +2733,7 @@ describe("SessionTracker", () => {
 			);
 			await upsertReferenceEntry(entityRef({ title: "new" }), tempDir, "main");
 			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 2) return;
+			if (after.version !== 1) return;
 			expect(after.references?.["jira:KAN-5"]?.title).toBe("old"); // unchanged
 			expect(after.references?.["jira:KAN-5"]?.ignored).toBe(true);
 		});
@@ -2744,7 +2744,7 @@ describe("SessionTracker", () => {
 			// path below it.
 			await upsertReferenceEntry(entityRef(), tempDir, "main");
 			const reg = await loadPlansRegistry(tempDir);
-			if (reg.version !== 2) return;
+			if (reg.version !== 1) return;
 			const existing = reg.references?.["jira:KAN-5"];
 			if (!existing) throw new Error("seed missing");
 			await savePlansRegistry(
@@ -2763,7 +2763,7 @@ describe("SessionTracker", () => {
 			);
 			await upsertReferenceEntry(entityRef({ title: "rewritten" }), tempDir, "main");
 			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 2) return;
+			if (after.version !== 1) return;
 			const e = after.references?.["jira:KAN-5"];
 			// Replacement → fresh uncommitted entry: commitHash null, no guard hash.
 			expect(e?.commitHash).toBeNull();
@@ -2781,8 +2781,8 @@ describe("SessionTracker", () => {
 			await upsertReferenceEntry(seedRef, tempDir, "main");
 			// Promote the entry to guard state (simulate post-archive).
 			const reg = await loadPlansRegistry(tempDir);
-			expect(reg.version).toBe(2);
-			if (reg.version !== 2) return;
+			expect(reg.version).toBe(1);
+			if (reg.version !== 1) return;
 			const existing = reg.references?.["jira:KAN-5"];
 			expect(existing).toBeDefined();
 			if (!existing) return;
@@ -2804,7 +2804,7 @@ describe("SessionTracker", () => {
 			// because hashReferenceContent strips referencedAt before hashing.
 			await upsertReferenceEntry(entityRef({ referencedAt: "2027-01-01T00:00:00Z" }), tempDir, "main");
 			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 2) return;
+			if (after.version !== 1) return;
 			expect(after.references?.["jira:KAN-5"]?.commitHash).toBe("deadbeef");
 		});
 	});
@@ -2813,7 +2813,7 @@ describe("SessionTracker", () => {
 		it("updates commitHash on the archived snapshot entry", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-5-abc12345": {
@@ -2834,22 +2834,22 @@ describe("SessionTracker", () => {
 			);
 			await associateReferenceWithCommit("jira:KAN-5-abc12345", "deadbeef1234567890", tempDir);
 			const reg = await loadPlansRegistry(tempDir);
-			if (reg.version !== 2) return;
+			if (reg.version !== 1) return;
 			expect(reg.references?.["jira:KAN-5-abc12345"]?.commitHash).toBe("deadbeef1234567890");
 		});
 
 		it("is a no-op when the archivedKey is unknown", async () => {
-			await savePlansRegistry({ version: 2, plans: {}, references: {} }, tempDir);
+			await savePlansRegistry({ version: 1, plans: {}, references: {} }, tempDir);
 			await associateReferenceWithCommit("jira:NOPE-1-abc12345", "newhash", tempDir);
 			const reg = await loadPlansRegistry(tempDir);
-			if (reg.version !== 2) return;
+			if (reg.version !== 1) return;
 			expect(reg.references).toEqual({});
 		});
 
 		it("also migrates the guard's commitHash when archive form matches the guard's old shortHash", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-5": {
@@ -2883,7 +2883,7 @@ describe("SessionTracker", () => {
 			);
 			await associateReferenceWithCommit("jira:KAN-5-abc12345", "newhash", tempDir);
 			const reg = await loadPlansRegistry(tempDir);
-			if (reg.version !== 2) return;
+			if (reg.version !== 1) return;
 			expect(reg.references?.["jira:KAN-5-abc12345"]?.commitHash).toBe("newhash");
 			// Guard also migrates because guard.commitHash starts with the old shortHash.
 			expect(reg.references?.["jira:KAN-5"]?.commitHash).toBe("newhash");
@@ -2897,29 +2897,28 @@ describe("SessionTracker", () => {
 		});
 	});
 
-	// Coverage: pins the v2-registry-without-entities-field path through the
-	// legacy linear shims. `linearIssuesOf` uses `reg.references ?? {}` —
-	// without a test hitting the `undefined` arm of that nullish coalesce, the
-	// branch counter stalls below the 96% per-file floor.
-	describe("legacy linear shims tolerate a v2 registry with no entities field", () => {
-		it("detectUncommittedReferenceIds returns [] when v2 registry has no entities field", async () => {
-			// Hand-author a v2 plans.json that omits the entities field entirely;
-			// `loadPlansRegistry`'s v2 branch keeps the absence (it normalises plans,
-			// not entities) so `linearIssuesOf` hits the `reg.references ?? {}` undefined
+	// Coverage: pins the registry-without-references-field path. `referencesOf`
+	// uses `reg.references ?? {}` — without a test hitting the `undefined` arm of
+	// that nullish coalesce, the branch counter stalls below the 96% per-file floor.
+	describe("reference helpers tolerate a registry with no references field", () => {
+		it("detectUncommittedReferenceIds returns [] when the references field is absent", async () => {
+			// Hand-author a plans.json that omits the references field entirely;
+			// `loadPlansRegistry` keeps the absence (it normalises plans, not
+			// references) so `referencesOf` hits the `reg.references ?? {}` undefined
 			// arm. Writing through `savePlansRegistry` to keep the JSON serializer in
 			// the loop (matches what users would land via merge / manual edits).
-			await savePlansRegistry({ version: 2, plans: {} } as PlansRegistry, tempDir);
+			await savePlansRegistry({ version: 1, plans: {} } as PlansRegistry, tempDir);
 			expect(await detectUncommittedReferenceIds(tempDir, "main")).toEqual([]);
 			expect(await getReferenceEntriesForBranch(tempDir, "main")).toEqual([]);
 		});
 
-		it("detectUncommittedReferenceIds surfaces non-linear sources (jira) in v2 registry", async () => {
+		it("detectUncommittedReferenceIds surfaces non-linear sources (jira)", async () => {
 			// Multi-source generalisation: detectUncommittedReferenceIds returns
 			// every active reference regardless of source. The "legacy linear-only"
 			// filter was removed when references replaced linearIssues.
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-5": {
@@ -2949,7 +2948,7 @@ describe("SessionTracker", () => {
 			// considered "no longer uncommitted" by the legacy detector.
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"linear:PROJ-guard": {
@@ -2972,13 +2971,12 @@ describe("SessionTracker", () => {
 			expect(await detectUncommittedReferenceIds(tempDir, "main")).toEqual([]);
 		});
 
-		it("linear shim tolerates a v2 entities row with a bare (no `linear:` prefix) map key", async () => {
+		it("tolerates a references row with a bare (no `linear:` prefix) map key", async () => {
 			// Synthetic state: a manually-edited plans.json where the map key is
-			// the bare ticketId. Pins the `mapKey.startsWith("linear:")` false arm
-			// in `linearIssuesOf`.
+			// the bare ticketId.
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"linear:PROJ-bare": {
@@ -3002,11 +3000,11 @@ describe("SessionTracker", () => {
 		});
 	});
 
-	// Coverage: exercise the `notes !== undefined` branch in entity APIs (the
-	// V2-out spread carries notes through). Without these tests the false-only
+	// Coverage: exercise the `notes !== undefined` branch in reference APIs (the
+	// out-object spread carries notes through). Without these tests the false-only
 	// branch on `registry.notes !== undefined` keeps branch coverage below the
 	// 96% per-file floor.
-	describe("entity APIs preserve notes section through V2 rewrites", () => {
+	describe("reference APIs preserve notes section through registry rewrites", () => {
 		const seedNotes = {
 			"note-1": {
 				id: "note-1",
@@ -3020,8 +3018,8 @@ describe("SessionTracker", () => {
 			},
 		};
 
-		it("upsertReferenceEntry carries existing notes through to the V2 write", async () => {
-			await savePlansRegistry({ version: 2, plans: {}, references: {}, notes: seedNotes }, tempDir);
+		it("upsertReferenceEntry carries existing notes through to the registry write", async () => {
+			await savePlansRegistry({ version: 1, plans: {}, references: {}, notes: seedNotes }, tempDir);
 			await upsertReferenceEntry(
 				{
 					mapKey: "jira:KAN-5",
@@ -3036,14 +3034,14 @@ describe("SessionTracker", () => {
 				"main",
 			);
 			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 2) return;
+			if (after.version !== 1) return;
 			expect(after.notes?.["note-1"]).toBeDefined();
 		});
 
 		it("setReferenceIgnored preserves the notes section", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-5": {
@@ -3065,14 +3063,14 @@ describe("SessionTracker", () => {
 			);
 			await setReferenceIgnored(tempDir, "jira:KAN-5", true);
 			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 2) return;
+			if (after.version !== 1) return;
 			expect(after.notes?.["note-1"]).toBeDefined();
 		});
 
 		it("associateReferenceWithCommit preserves the notes section", async () => {
 			await savePlansRegistry(
 				{
-					version: 2,
+					version: 1,
 					plans: {},
 					references: {
 						"jira:KAN-5-abc12345": {
@@ -3094,13 +3092,13 @@ describe("SessionTracker", () => {
 			);
 			await associateReferenceWithCommit("jira:KAN-5-abc12345", "newhash", tempDir);
 			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 2) return;
+			if (after.version !== 1) return;
 			expect(after.notes?.["note-1"]).toBeDefined();
 		});
 
 		it("upsertReferenceEntry preserves the notes section", async () => {
 			await savePlansRegistry(
-				{ version: 2, plans: {}, references: {}, notes: seedNotes } as PlansRegistry,
+				{ version: 1, plans: {}, references: {}, notes: seedNotes } as PlansRegistry,
 				tempDir,
 			);
 			await upsertReferenceEntry(
@@ -3117,7 +3115,7 @@ describe("SessionTracker", () => {
 				"main",
 			);
 			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 2) return;
+			if (after.version !== 1) return;
 			expect(after.notes?.["note-1"]).toBeDefined();
 		});
 	});

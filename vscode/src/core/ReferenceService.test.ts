@@ -100,10 +100,10 @@ beforeEach(() => {
 	});
 });
 
-describe("detectReferences — v2 registry", () => {
+describe("detectReferences", () => {
 	it("returns uncommitted, non-ignored entries on the current branch (all sources)", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: {
 				"linear:PROJ-1528": makeEntry(),
@@ -119,7 +119,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("filters by sourceFilter when provided", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: {
 				"linear:PROJ-1528": makeEntry(),
@@ -141,7 +141,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("populates ReferenceInfo from ReferenceEntry (mapKey passes through)", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "jira:KAN-5": makeJiraEntry() },
 		});
@@ -160,7 +160,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("filters out ignored entries", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry({ ignored: true }) },
 		});
@@ -169,7 +169,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("filters out guard entries (contentHashAtCommit set)", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: {
 				"linear:PROJ-1528": makeEntry({
@@ -183,7 +183,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("filters out archived snapshots (commitHash set, no contentHashAtCommit)", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: {
 				"linear:PROJ-1528-abc1234": makeEntry({ commitHash: "abc1234" }),
@@ -194,7 +194,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("filters out entries on other branches", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry({ branch: "feature-x" }) },
 		});
@@ -204,7 +204,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("does NOT filter by branch when getCurrentBranch returns null", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry({ branch: "feature-x" }) },
 		});
@@ -212,14 +212,14 @@ describe("detectReferences — v2 registry", () => {
 		expect(await detectReferences("/repo")).toHaveLength(1);
 	});
 
-	it("returns empty when entities section is missing", async () => {
-		mockLoadPlansRegistry.mockResolvedValue({ version: 2, plans: {} });
+	it("returns empty when references section is missing", async () => {
+		mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {} });
 		expect(await detectReferences("/repo")).toEqual([]);
 	});
 
 	it("sorts by lastModified descending", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: {
 				"linear:A": makeEntry({
@@ -242,7 +242,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("enriches ReferenceInfo with frontmatter status / priority / labels / description preview when readable", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
@@ -260,7 +260,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("gracefully handles missing markdown file", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
@@ -274,7 +274,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("gracefully handles malformed frontmatter (no opening ---)", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
@@ -285,7 +285,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("gracefully handles missing closing ---", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
@@ -296,7 +296,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("skips bad label line but preserves status / description", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
@@ -311,7 +311,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("frontmatter: labels present but body empty", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
@@ -323,7 +323,7 @@ describe("detectReferences — v2 registry", () => {
 
 	it("frontmatter: no labels but body present", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
@@ -338,7 +338,7 @@ describe("detectReferences — v2 registry", () => {
 		// `^\s+- (.+)$` match fails inside the labels block. Without this
 		// the labels block would silently swallow trailing fields.
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
@@ -361,7 +361,7 @@ describe("detectReferences — v2 registry", () => {
 		// frontmatter writer emits but readFrontmatter doesn't yet handle)
 		// would crash or get mis-parsed.
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "linear:PROJ-1528": makeEntry() },
 		});
@@ -375,22 +375,22 @@ describe("detectReferences — v2 registry", () => {
 });
 
 describe("setReferenceIgnored", () => {
-	it("sets ignored=true on the v2 entry keyed by mapKey", async () => {
+	it("sets ignored=true on the entry keyed by mapKey", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "jira:KAN-5": makeJiraEntry() },
 		});
 		await setReferenceIgnored("/repo", "jira:KAN-5", true);
 		expect(mockSavePlansRegistry).toHaveBeenCalled();
 		const saved = mockSavePlansRegistry.mock.calls[0][0];
-		expect(saved.version).toBe(2);
+		expect(saved.version).toBe(1);
 		expect(saved.references["jira:KAN-5"].ignored).toBe(true);
 	});
 
 	it("clears ignored when set to false", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: { "jira:KAN-5": makeJiraEntry({ ignored: true }) },
 		});
@@ -401,7 +401,7 @@ describe("setReferenceIgnored", () => {
 
 	it("is a no-op when mapKey is not in the registry", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: {},
 		});
@@ -412,7 +412,7 @@ describe("setReferenceIgnored", () => {
 	it("preserves the plans / notes sections on save", async () => {
 		const notes = { "note-1": { foo: "bar" } };
 		mockLoadPlansRegistry.mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: { "plan-1": { slug: "x" } },
 			notes,
 			references: { "jira:KAN-5": makeJiraEntry() },
