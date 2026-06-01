@@ -89,13 +89,13 @@ export async function setReferenceIgnored(
 		...existing,
 		[mapKey]: { ...entry, ignored: ignored || undefined },
 	};
-	const v2: PlansRegistry = {
-		version: 2,
+	const out: PlansRegistry = {
+		version: 1,
 		plans: registry.plans,
 		...(registry.notes !== undefined ? { notes: registry.notes } : {}),
 		references,
 	};
-	await savePlansRegistry(v2, cwd);
+	await savePlansRegistry(out, cwd);
 }
 
 /**

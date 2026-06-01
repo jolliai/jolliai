@@ -202,7 +202,7 @@ describe("ReferenceStore", () => {
 			expect(await readReferenceMarkdown(file)).toBeNull();
 		});
 
-		it("returns null when neither source/nativeId nor ticketId is present", async () => {
+		it("returns null when source/nativeId are absent", async () => {
 			const file = join(tempDir, "no-discriminator.md");
 			await writeFile(
 				file,
@@ -240,8 +240,9 @@ describe("ReferenceStore", () => {
 			expect(await readReferenceMarkdown(file)).toBeNull();
 		});
 
-		it("parses legacy v1 Linear frontmatter (ticketId-only) into source:linear", async () => {
-			// Half-migrated state: file still has v1 shape from LinearIssueStore.
+		it("returns null for legacy ticketId-only frontmatter (no longer supported)", async () => {
+			// The old v1 Linear shape (`ticketId:` without `source` / `nativeId`)
+			// is no longer synthesised — such a file is now treated as malformed.
 			const file = join(tempDir, "PROJ-1234.md");
 			await writeFile(
 				file,
@@ -258,12 +259,7 @@ describe("ReferenceStore", () => {
 				].join("\n"),
 				"utf-8",
 			);
-			const ref = await readReferenceMarkdown(file);
-			expect(ref).not.toBeNull();
-			expect(ref?.source).toBe("linear");
-			expect(ref?.nativeId).toBe("PROJ-1234");
-			expect(ref?.mapKey).toBe("linear:PROJ-1234");
-			expect(ref?.description).toBe("Legacy body");
+			expect(await readReferenceMarkdown(file)).toBeNull();
 		});
 
 		it("returns null on JSON-malformed frontmatter value (list item)", async () => {

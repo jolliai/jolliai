@@ -10,16 +10,14 @@
  * Frontmatter format: YAML-style with JSON-encoded values (single-quoted strings
  * render as double-quoted). Multi-source fields (`source`, `nativeId`, `status`,
  * `priority`, `labels`, `assignees`, `milestone`, `entityType`) sit above the
- * markdown body (description). A legacy parser branch tolerates v1 Linear
- * frontmatter (`ticketId:` instead of `source: / nativeId:`) so half-migrated
- * state still reads cleanly.
+ * markdown body (description).
  *
  * Sanitisation per SourceId:
  *   - linear / jira / notion: identity. Their nativeIds (`PROJ-1234`,
  *     `KAN-5`, 32-hex Notion page ids) are filesystem-safe and stable.
  *     `sanitizeNativeIdForPath("linear", "PROJ-1234")` MUST equal "PROJ-1234"
- *     byte-for-byte so the v1→v2 migration's archive form
- *     "PROJ-1234-abc12345" round-trips through the same identity.
+ *     byte-for-byte so the archive form "PROJ-1234-abc12345" round-trips
+ *     through the same identity.
  *   - github: nativeId is `<owner>/<repo>#<number>` — contains `/` and `#`
  *     which are unsafe / collision-prone across repos. Replace
  *     non-(\w / `.` / `-`) bytes with `-` and append an 8-hex sha256 suffix
@@ -58,7 +56,7 @@ export function referencePath(cwd: string, source: SourceId, key: string): strin
  *
  * Linear / Jira / Notion: identity — their native ids are already
  * filesystem-safe and globally unique within the source. **The Linear identity
- * is load-bearing** — the v1→v2 migration relies on
+ * is load-bearing** — the archive round-trip relies on
  * `sanitizeNativeIdForPath("linear", "PROJ-1234") === "PROJ-1234"` and
  * `"PROJ-1234-abc12345"` (archive form) → identity.
  *
@@ -114,10 +112,6 @@ export async function writeReferenceMarkdown(ref: Reference, cwd: string): Promi
 /**
  * Read and parse a reference markdown file. Returns null if file is missing,
  * frontmatter is malformed, or required fields are absent.
- *
- * Accepts both v2 (`source` / `nativeId`) and legacy v1 Linear frontmatter
- * (`ticketId`) — the latter is synthesised to `source: "linear"` so
- * half-migrated state reads cleanly.
  */
 export async function readReferenceMarkdown(sourcePath: string): Promise<Reference | null> {
 	let content: string;
@@ -199,12 +193,8 @@ function renderMarkdown(ref: Reference): string {
 /**
  * Parse markdown frontmatter into a Reference.
  *
- * Two accepted shapes:
- *  1. v2 native — `source` and `nativeId` present.
- *  2. v1 Linear legacy — `ticketId` present (and `source` / `nativeId` absent).
- *     Synthesised to `source: "linear"`, `nativeId: ticketId`.
- *
- * Returns null on malformed input or missing required fields.
+ * Requires `source` and `nativeId` frontmatter (plus title / url / referencedAt /
+ * sourceToolName). Returns null on malformed input or missing required fields.
  */
 function parseMarkdown(content: string): Reference | null {
 	/* v8 ignore start -- defensive typeof guard: callers (readReferenceMarkdown / parseFrontmatter callers) already pass `string` per the function signature; this branch only triggers if a future caller hands in `undefined`/`null` via an untyped path. */
@@ -277,22 +267,11 @@ function parseMarkdown(content: string): Reference | null {
 
 	const sourceField = readString("source");
 	const nativeIdField = readString("nativeId");
-	const ticketIdField = readString("ticketId");
-
-	// Discriminate shapes: v2 expects (source, nativeId); legacy v1 Linear uses
-	// `ticketId` only and we synthesise the rest.
-	let source: SourceId;
-	let nativeId: string;
-	if (sourceField !== undefined && nativeIdField !== undefined) {
-		if (!isSourceId(sourceField)) return null;
-		source = sourceField;
-		nativeId = nativeIdField;
-	} else if (ticketIdField !== undefined) {
-		source = "linear";
-		nativeId = ticketIdField;
-	} else {
+	if (sourceField === undefined || nativeIdField === undefined || !isSourceId(sourceField)) {
 		return null;
 	}
+	const source: SourceId = sourceField;
+	const nativeId: string = nativeIdField;
 
 	const title = readString("title");
 	const url = readString("url");

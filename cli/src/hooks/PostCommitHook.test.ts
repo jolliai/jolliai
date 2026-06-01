@@ -40,7 +40,7 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		deleteSquashPending: vi.fn(),
 		loadPluginSource: vi.fn(),
 		deletePluginSource: vi.fn(),
-		loadPlansRegistry: vi.fn().mockResolvedValue({ version: 2, plans: {} }),
+		loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
 		savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 		associatePlanWithCommit: vi.fn(),
 		associateNoteWithCommit: vi.fn(),
@@ -1552,7 +1552,7 @@ describe("queue-driven Worker", () => {
 			const noteSourcePath = "/test/project/.jolli/jollimemory/notes/leaf-note.md";
 
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 2,
+				version: 1,
 				plans: {
 					"freshly-authored-plan": {
 						slug: "freshly-authored-plan",
@@ -1737,7 +1737,7 @@ describe("queue-driven Worker", () => {
 
 			// Registry has an uncommitted note
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					"note-1": {
@@ -2401,7 +2401,7 @@ describe("queue-driven Worker", () => {
 			setupFullPipeline();
 			// Registry has note IDs that don't match any notes entry
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					"note-x": {
@@ -2433,7 +2433,7 @@ describe("queue-driven Worker", () => {
 			//   2. detectUncommittedNoteIds → registry WITH ghost note (id added to set)
 			//   3. associateNotesWithCommit → registry WITHOUT that note (id missing → skip)
 			const registryWithNote = {
-				version: 2 as const,
+				version: 1 as const,
 				plans: {},
 				notes: {
 					"ghost-note": {
@@ -2448,7 +2448,7 @@ describe("queue-driven Worker", () => {
 					},
 				},
 			};
-			const emptyRegistry = { version: 2 as const, plans: {}, notes: {} };
+			const emptyRegistry = { version: 1 as const, plans: {}, notes: {} };
 
 			vi.mocked(loadPlansRegistry)
 				.mockResolvedValueOnce(emptyRegistry) // detectPlanSlugsFromRegistry
@@ -2467,7 +2467,7 @@ describe("queue-driven Worker", () => {
 			const snippetPath = "/test/project/.jolli/jollimemory/notes/snip-1.md";
 
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					"snip-1": {

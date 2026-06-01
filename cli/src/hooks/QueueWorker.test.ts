@@ -402,7 +402,7 @@ describe("QueueWorker", () => {
 		vi.mocked(loadAllSessions).mockResolvedValue([]);
 		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
 		vi.mocked(saveCursor).mockResolvedValue(undefined);
-		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {} });
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
 		vi.mocked(savePlansRegistry).mockResolvedValue(undefined);
 		vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([]);
 		vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([]);
@@ -542,9 +542,9 @@ describe("QueueWorker", () => {
 			//   3. associateNotesWithCommit — re-loads registry but "ghost-note" is gone
 			// (associatePlansWithCommit skips loadPlansRegistry when slugs.size === 0)
 			vi.mocked(loadPlansRegistry)
-				.mockResolvedValueOnce({ version: 2, plans: {} })
+				.mockResolvedValueOnce({ version: 1, plans: {} })
 				.mockResolvedValueOnce({
-					version: 2,
+					version: 1,
 					plans: {},
 					notes: {
 						"ghost-note": {
@@ -559,7 +559,7 @@ describe("QueueWorker", () => {
 						},
 					},
 				})
-				.mockResolvedValueOnce({ version: 2, plans: {}, notes: {} });
+				.mockResolvedValueOnce({ version: 1, plans: {}, notes: {} });
 
 			await runWorker("/test/cwd");
 
@@ -590,7 +590,7 @@ describe("QueueWorker", () => {
 				},
 			]);
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 2,
+				version: 1,
 				plans: {},
 				references: {
 					"linear:PROJ-1528": {
@@ -661,7 +661,7 @@ describe("QueueWorker", () => {
 				},
 			]);
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 2,
+				version: 1,
 				plans: {},
 				references: {
 					"linear:PROJ-1528": {
@@ -709,7 +709,7 @@ describe("QueueWorker", () => {
 				},
 			]);
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 2,
+				version: 1,
 				plans: {},
 				references: {
 					"linear:PROJ-1528": {
@@ -801,7 +801,7 @@ describe("QueueWorker", () => {
 				},
 			]);
 			// Registry contains no matching entry — the dropped path fires.
-			vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 2, plans: {}, references: {} });
+			vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {}, references: {} });
 
 			await runWorker("/test/cwd");
 
@@ -847,7 +847,7 @@ describe("QueueWorker", () => {
 			// Registry: one match, one miss, plus a notes section that must
 			// survive the rewrite (L1072 truthy spread).
 			vi.mocked(loadPlansRegistry).mockResolvedValue({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					"note-1": {
@@ -901,9 +901,9 @@ describe("QueueWorker", () => {
 			const saveCalls = vi.mocked(savePlansRegistry).mock.calls;
 			const lastSave = saveCalls[saveCalls.length - 1][0] as Extract<
 				(typeof saveCalls)[number][0],
-				{ version: 2 }
+				{ version: 1 }
 			>;
-			expect(lastSave.version).toBe(2);
+			expect(lastSave.version).toBe(1);
 			expect(lastSave.notes).toEqual({
 				"note-1": {
 					id: "note-1",
@@ -1262,7 +1262,7 @@ describe("QueueWorker", () => {
 	describe("detectUncommittedNoteIds", () => {
 		it("returns only notes with null commitHash and no ignored/contentHashAtCommit", async () => {
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					fresh: {
@@ -1318,7 +1318,7 @@ describe("QueueWorker", () => {
 		});
 
 		it("returns empty set when registry has no notes field", async () => {
-			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({ version: 2, plans: {} });
+			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({ version: 1, plans: {} });
 			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "main");
 			expect(ids.size).toBe(0);
 		});
@@ -1329,7 +1329,7 @@ describe("QueueWorker", () => {
 			// Without the branch filter, notes from `feature/idle` would be
 			// associated with a commit on `feature/active`.
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					"current-note": {
@@ -1366,7 +1366,7 @@ describe("QueueWorker", () => {
 			const { createHash } = await import("node:crypto");
 			const oldHash = createHash("sha256").update("v1\n").digest("hex");
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					"revived-note": {
@@ -1394,7 +1394,7 @@ describe("QueueWorker", () => {
 			const body = "v1\n";
 			const hash = createHash("sha256").update(body).digest("hex");
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					"stable-note": {
@@ -1419,7 +1419,7 @@ describe("QueueWorker", () => {
 
 		it("excludes guard notes whose source file is missing on disk", async () => {
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 2,
+				version: 1,
 				plans: {},
 				notes: {
 					"gone-note": {

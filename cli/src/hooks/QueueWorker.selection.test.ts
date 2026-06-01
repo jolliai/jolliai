@@ -59,7 +59,7 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		deleteSquashPending: vi.fn(),
 		loadPluginSource: vi.fn(),
 		deletePluginSource: vi.fn(),
-		loadPlansRegistry: vi.fn().mockResolvedValue({ version: 2, plans: {} }),
+		loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
 		savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 		associatePlanWithCommit: vi.fn().mockResolvedValue(undefined),
 		associateNoteWithCommit: vi.fn().mockResolvedValue(undefined),
@@ -639,7 +639,7 @@ describe("QueueWorker selection filter", () => {
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {
 				"plan-keep": {
 					slug: "plan-keep",
@@ -694,7 +694,7 @@ describe("QueueWorker selection filter", () => {
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			notes: {
 				"note-keep": {
@@ -816,12 +816,12 @@ describe("QueueWorker selection filter", () => {
 			{ mapKey: "jira:PROJ-KEEP", source: "jira", sourcePath: "/fake/jira/PROJ-KEEP.md" },
 			{ mapKey: "jira:PROJ-SKIP", source: "jira", sourcePath: "/fake/jira/PROJ-SKIP.md" },
 		]);
-		// Provide a v2 registry shape so associateReferencesWithCommit doesn't
+		// Provide a populated registry shape so associateReferencesWithCommit doesn't
 		// throw on the kept entry. The kept entry has the full panel-row
 		// shape; the excluded entry is intentionally absent (would be
 		// "dropped by mapKey not in registry" path otherwise).
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 2,
+			version: 1,
 			plans: {},
 			references: {
 				"jira:PROJ-KEEP": {

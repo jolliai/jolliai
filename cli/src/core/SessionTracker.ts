@@ -736,7 +736,7 @@ async function atomicWrite(filePath: string, content: string): Promise<void> {
 /**
  * Loads the plans registry from plans.json.
  *
- * Returns an empty registry (`{ version: 2, plans: {} }`) if the file doesn't
+ * Returns an empty registry (`{ version: 1, plans: {} }`) if the file doesn't
  * exist or contains invalid JSON. Normalises missing required fields so
  * downstream `registry.plans[...]` reads never throw on a hand-edited file.
  */
@@ -746,9 +746,9 @@ export async function loadPlansRegistry(cwd?: string): Promise<PlansRegistry> {
 	try {
 		const content = await readFile(filePath, "utf-8");
 		const parsed = JSON.parse(content) as Partial<PlansRegistry>;
-		return { ...parsed, version: 2, plans: parsed.plans ?? {} };
+		return { ...parsed, version: 1, plans: parsed.plans ?? {} };
 	} catch {
-		return { version: 2, plans: {} };
+		return { version: 1, plans: {} };
 	}
 }
 
@@ -875,7 +875,7 @@ function referencesOf(reg: PlansRegistry): Readonly<Record<string, ReferenceEntr
 /**
  * Returns the entries (not just keys) of references active for the given branch.
  *
- * "Active" matches the same filter Plans / Notes / legacy Linear use:
+ * "Active" matches the same filter Plans / Notes use:
  *   - branch matches
  *   - commitHash === null (uncommitted)
  *   - !contentHashAtCommit (not a guard from a prior commit)
@@ -1002,13 +1002,13 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string, branch: 
 	/* v8 ignore stop */
 
 	const references = { ...freshReferences, [mapKey]: merged };
-	const v2Out: PlansRegistry = {
-		version: 2,
+	const out: PlansRegistry = {
+		version: 1,
 		plans: freshRegistry.plans,
 		...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
 		references,
 	};
-	await savePlansRegistry(v2Out, cwd);
+	await savePlansRegistry(out, cwd);
 	log.info("upsertReferenceEntry: %s on %s (%s)", mapKey, branch, existing === undefined ? "new" : "updated");
 }
 
@@ -1019,13 +1019,13 @@ export async function setReferenceIgnored(cwd: string, mapKey: string, ignored: 
 	const entry = existingReferences[mapKey];
 	if (!entry) return;
 	const references = { ...existingReferences, [mapKey]: { ...entry, ignored: ignored || undefined } };
-	const v2Out: PlansRegistry = {
-		version: 2,
+	const out: PlansRegistry = {
+		version: 1,
 		plans: registry.plans,
 		...(registry.notes !== undefined ? { notes: registry.notes } : {}),
 		references,
 	};
-	await savePlansRegistry(v2Out, cwd);
+	await savePlansRegistry(out, cwd);
 }
 
 /**
@@ -1070,13 +1070,13 @@ export async function associateReferenceWithCommit(archivedKey: string, newHash:
 		}
 	}
 
-	const v2Out: PlansRegistry = {
-		version: 2,
+	const out: PlansRegistry = {
+		version: 1,
 		plans: registry.plans,
 		...(registry.notes !== undefined ? { notes: registry.notes } : {}),
 		references: nextReferences,
 	};
-	await savePlansRegistry(v2Out, cwd);
+	await savePlansRegistry(out, cwd);
 	log.info("associateReferenceWithCommit: %s → %s", archivedKey, newHash.substring(0, 8));
 }
 
