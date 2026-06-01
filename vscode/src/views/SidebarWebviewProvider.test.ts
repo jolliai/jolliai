@@ -341,6 +341,208 @@ describe("SidebarWebviewProvider", () => {
 		);
 	});
 
+	it("posts kb:markDiverged when an opened .md is diverged on disk", async () => {
+		const view = makeMockView();
+		const exec = vi.fn();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: exec,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			resolveKbAbs: (relPath: string) => `/kbroot/${relPath}`,
+			isMemoryFileDivergedOnDisk: vi.fn().mockResolvedValue(true),
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({
+			type: "kb:openFile",
+			path: "repo/main/memo.md",
+		});
+		await flushReady();
+		expect(view.webview.postMessage).toHaveBeenCalledWith({
+			type: "kb:markDiverged",
+			path: "repo/main/memo.md",
+		});
+	});
+
+	it("posts kb:clearDiverged (not markDiverged) when the opened .md is in sync", async () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			resolveKbAbs: (relPath: string) => `/kbroot/${relPath}`,
+			isMemoryFileDivergedOnDisk: vi.fn().mockResolvedValue(false),
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "kb:openFile", path: "repo/main/memo.md" });
+		await flushReady();
+		// A clean check actively clears the row, so reopening a now-synced file
+		// drops a ✎ left by an earlier open instead of leaving it stuck.
+		expect(view.webview.postMessage).toHaveBeenCalledWith({
+			type: "kb:clearDiverged",
+			path: "repo/main/memo.md",
+		});
+		expect(view.webview.postMessage).not.toHaveBeenCalledWith(
+			expect.objectContaining({ type: "kb:markDiverged" }),
+		);
+	});
+
+	it("lets the latest open win: an older slow diverged check can't re-mark after a newer in-sync check", async () => {
+		const view = makeMockView();
+		// First open's check is slow and reports diverged; second open's check is
+		// immediate and reports in-sync. The stale first result must be dropped.
+		let resolveFirst!: (v: boolean) => void;
+		const firstCheck = new Promise<boolean>((res) => {
+			resolveFirst = res;
+		});
+		const check = vi
+			.fn()
+			.mockReturnValueOnce(firstCheck)
+			.mockReturnValueOnce(Promise.resolve(false));
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			resolveKbAbs: (relPath: string) => `/kbroot/${relPath}`,
+			isMemoryFileDivergedOnDisk: check,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "kb:openFile", path: "repo/main/memo.md" });
+		view.webview.triggerMessage({ type: "kb:openFile", path: "repo/main/memo.md" });
+		await flushReady();
+		// Second (latest) open resolved in-sync → cleared.
+		expect(view.webview.postMessage).toHaveBeenCalledWith({
+			type: "kb:clearDiverged",
+			path: "repo/main/memo.md",
+		});
+		resolveFirst(true);
+		await flushReady();
+		// First (stale) open's diverged result must NOT re-light the marker.
+		expect(view.webview.postMessage).not.toHaveBeenCalledWith(
+			expect.objectContaining({ type: "kb:markDiverged" }),
+		);
+	});
+
+	it("clearKnowledgeBaseFolderDivergence posts a targeted kb:clearDiverged, not a tree-collapsing reset", () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		provider.clearKnowledgeBaseFolderDivergence("repo/main/memo.md");
+		expect(view.webview.postMessage).toHaveBeenCalledWith({
+			type: "kb:clearDiverged",
+			path: "repo/main/memo.md",
+		});
+		// A single-file revert must not wipe the client's folderCache — that's
+		// what collapsed every expanded branch directory before the fix.
+		expect(view.webview.postMessage).not.toHaveBeenCalledWith(
+			expect.objectContaining({ type: "kb:foldersReset" }),
+		);
+	});
+
+	it("drops a stale kb:markDiverged when the row is reverted while the disk check is in flight", async () => {
+		const view = makeMockView();
+		// Hold the divergence check open so we can revert the same row before it
+		// resolves — the bytes we sha'd are now stale, so the mark must be dropped.
+		let resolveCheck!: (v: boolean) => void;
+		const pending = new Promise<boolean>((res) => {
+			resolveCheck = res;
+		});
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			resolveKbAbs: (relPath: string) => `/kbroot/${relPath}`,
+			isMemoryFileDivergedOnDisk: vi.fn().mockReturnValue(pending),
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		// Open the diverged file: kicks off the in-flight check.
+		view.webview.triggerMessage({
+			type: "kb:openFile",
+			path: "repo/main/memo.md",
+		});
+		// User reverts the same row before the check resolves.
+		provider.clearKnowledgeBaseFolderDivergence("repo/main/memo.md");
+		// Now the slow check resolves "diverged" against the pre-revert bytes.
+		resolveCheck(true);
+		await flushReady();
+		expect(view.webview.postMessage).toHaveBeenCalledWith({
+			type: "kb:clearDiverged",
+			path: "repo/main/memo.md",
+		});
+		expect(view.webview.postMessage).not.toHaveBeenCalledWith(
+			expect.objectContaining({ type: "kb:markDiverged" }),
+		);
+	});
+
+	it("does not let an unrelated revert suppress a row's kb:markDiverged", async () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			resolveKbAbs: (relPath: string) => `/kbroot/${relPath}`,
+			isMemoryFileDivergedOnDisk: vi.fn().mockResolvedValue(true),
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		// A different row is reverted; the per-path seq is keyed by relPath, so it
+		// must not gate the opened file's mark.
+		provider.clearKnowledgeBaseFolderDivergence("repo/main/other.md");
+		view.webview.triggerMessage({
+			type: "kb:openFile",
+			path: "repo/main/memo.md",
+		});
+		await flushReady();
+		expect(view.webview.postMessage).toHaveBeenCalledWith({
+			type: "kb:markDiverged",
+			path: "repo/main/memo.md",
+		});
+	});
+
 	it("forwards kb:openFile for non-md to vscode.open", () => {
 		const view = makeMockView();
 		const exec = vi.fn();

@@ -111,12 +111,67 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).not.toContain("kbRepoFolder");
 	});
 
-	it("re-attaches cached subtrees onto root listings so manual refresh keeps folders expanded", () => {
+	it("grafts cached subtrees onto every reply so refresh keeps folders expanded", () => {
 		const js = buildSidebarScript();
-		// Reattach helper exists, runs only for root, and recurses for depth.
-		expect(js).toContain("reattachExpandedFromCache");
-		expect(js).toContain(
-			"if (tree.relPath === '') tree = reattachExpandedFromCache(tree)",
+		// Graft helper exists and is applied to EVERY merged reply (the merge
+		// reads its result into `grafted`), not just the root — so an out-of-order
+		// per-folder reply can't collapse a deeper expansion.
+		expect(js).toContain("graftExpandedFromCache");
+		expect(js).toContain("const grafted = graftExpandedFromCache(tree)");
+	});
+
+	it("handles kb:markDiverged / kb:clearDiverged through one in-place flag flip", () => {
+		const js = buildSidebarScript();
+		// Both inbound cases exist and route to the SAME shared helper with
+		// opposite truth values — mark and clear can't drift apart.
+		expect(js).toContain("'kb:markDiverged'");
+		expect(js).toContain("'kb:clearDiverged'");
+		expect(js).toContain("setFileDivergedFlag(msg.path, true)");
+		expect(js).toContain("setFileDivergedFlag(msg.path, false)");
+		expect(js).toContain("function setFileDivergedFlag");
+		// In-place flip rebuilds the matching child with the new flag value.
+		expect(js).toContain("{ isDiverged: diverged }");
+		// The flip must NOT wipe folderCache — that's foldersReset's job and would
+		// collapse every expanded branch directory. Bound the assertion to the
+		// setFileDivergedFlag body (up to the next top-level function) so it can't
+		// pass vacuously against foldersReset's cache-wipe loop elsewhere.
+		expect(js).not.toMatch(
+			/function setFileDivergedFlag[\s\S]*?delete folderCache\[[\s\S]*?\n {2}function /,
+		);
+	});
+
+	it("re-requests every already-expanded folder on manual refresh so isDiverged is recomputed", () => {
+		const js = buildSidebarScript();
+		// requestExpandedRefresh re-requests fresh data for each expanded dir so a
+		// file edited on disk while the sidebar was open gets its ✎ marker on
+		// refresh (cache-only reuse left nested isDiverged stale). Bounded to the
+		// requestExpandedRefresh body (up to mergeFolders) so it can't pass
+		// vacuously on the unrelated kb:expandFolder in maybeAutoExpandCurrentRepo.
+		expect(js).toMatch(
+			/function requestExpandedRefresh[\s\S]*?type:\s*'kb:expandFolder'[\s\S]*?function mergeFolders/,
+		);
+		// The fan-out fires ONLY from the root merge — gating it on relPath === ''
+		// is what keeps a per-folder reply from re-posting (and looping).
+		expect(js).toMatch(
+			/if\s*\(tree\.relPath === ''\) requestExpandedRefresh\(tree\)/,
+		);
+	});
+
+	it("grafts cached expansion onto every reply without re-requesting (order-independent, no collapse)", () => {
+		const js = buildSidebarScript();
+		// graftExpandedFromCache is the PURE expansion-preserver: it must NOT post
+		// kb:expandFolder (that belongs to requestExpandedRefresh). If it did, each
+		// per-folder reply would re-post for its descendants and amplify. Bounded
+		// to the graft body (up to requestExpandedRefresh).
+		expect(js).toContain("function graftExpandedFromCache");
+		expect(js).not.toMatch(
+			/function graftExpandedFromCache[\s\S]*?type:\s*'kb:expandFolder'[\s\S]*?function requestExpandedRefresh/,
+		);
+		// mergeFolders grafts EVERY reply (not gated on relPath === '') so an
+		// out-of-order per-folder reply can't overwrite a deeper expansion with a
+		// lazy child and collapse it.
+		expect(js).toMatch(
+			/function mergeFolders\(tree\)\s*\{\s*const grafted = graftExpandedFromCache\(tree\)/,
 		);
 	});
 

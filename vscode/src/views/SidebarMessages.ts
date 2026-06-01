@@ -545,6 +545,34 @@ export type SidebarInboundMsg =
 	| { readonly type: "kb:foldersData"; readonly tree: FolderNode }
 	| {
 			/**
+			 * Marks a single already-rendered Folders-tab file row as diverged
+			 * (edited on disk, system view unavailable) so its trailing ✎ marker
+			 * appears without a full re-listing. Sent by the host when the user
+			 * opens a `.md` whose on-disk sha256 no longer matches the manifest
+			 * fingerprint — the open-file path is the one place divergence is
+			 * checked outside of `KbFoldersService.listInRepo`, so this keeps the
+			 * tree's marker in sync with `MemoryFileDecorationProvider`'s badge.
+			 * `path` is the repoDir-prefixed relPath used as the client's
+			 * `folderCache` key / `data-path`, identical to `kb:openFile`'s path.
+			 */
+			readonly type: "kb:markDiverged";
+			readonly path: string;
+	  }
+	| {
+			/**
+			 * Inverse of `kb:markDiverged`: clears a single already-rendered file
+			 * row's ✎ marker in place after the host successfully reverts it to the
+			 * system version. Sent instead of `kb:foldersReset` so the surrounding
+			 * tree keeps its expansion state — a content revert touches one file,
+			 * not the tree's shape, so wiping `folderCache` (collapsing every open
+			 * branch directory) is the wrong tool. `path` is the repoDir-prefixed
+			 * relPath used as the client's `folderCache` key / `data-path`.
+			 */
+			readonly type: "kb:clearDiverged";
+			readonly path: string;
+	  }
+	| {
+			/**
 			 * Tells the client to discard its entire `folderCache` before the next
 			 * root listing arrives. Sent by the host after destructive operations
 			 * (currently: Migrate to Memory Bank) that may rename the repo folder

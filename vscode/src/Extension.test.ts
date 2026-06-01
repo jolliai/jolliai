@@ -32,8 +32,9 @@ const { mockRefreshConversationsPanel } = vi.hoisted(() => ({
 	mockRefreshConversationsPanel: vi.fn(() => Promise.resolve()),
 }));
 
-const { mockRefreshKnowledgeBaseFolders } = vi.hoisted(() => ({
+const { mockRefreshKnowledgeBaseFolders, mockClearKnowledgeBaseFolderDivergence } = vi.hoisted(() => ({
 	mockRefreshKnowledgeBaseFolders: vi.fn(),
+	mockClearKnowledgeBaseFolderDivergence: vi.fn(),
 }));
 
 const { mockNotifyEnabledChanged, mockNotifyAuthChanged } = vi.hoisted(() => ({
@@ -878,6 +879,7 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		resolveWebviewView() {}
 		dispose() {}
 		refreshKnowledgeBaseFolders = mockRefreshKnowledgeBaseFolders;
+		clearKnowledgeBaseFolderDivergence = mockClearKnowledgeBaseFolderDivergence;
 		refreshConversationsPanel = mockRefreshConversationsPanel;
 		refreshPlansPanel() {}
 		notifyEnabledChanged = mockNotifyEnabledChanged;
@@ -3816,6 +3818,11 @@ describe("Extension", () => {
 				const handler = getRegisteredCommand(
 					"jollimemory.revertMemoryFileEdits",
 				);
+				// Drop tree-signal counters seeded by activation's initial KB
+				// load so the assertions below observe only what the revert
+				// command itself triggers (same pattern as enableJolliMemory).
+				mockRefreshKnowledgeBaseFolders.mockClear();
+				mockClearKnowledgeBaseFolderDivergence.mockClear();
 				await handler(absPath);
 
 				expect(folderStorage.forceRegenerateVisibleMarkdown).toHaveBeenCalledWith(
@@ -3830,20 +3837,29 @@ describe("Extension", () => {
 					`Reverted to system version: ${absPath}`,
 				);
 				// The KB folders tree caches `isDiverged` on each FolderNode;
-				// without an explicit refresh signal the ✎ marker would survive
-				// the revert until the next user-initiated refresh. Pin the
-				// refresh trigger so a future refactor that silently drops it
-				// re-introduces the stale-marker bug.
-				expect(mockRefreshKnowledgeBaseFolders).toHaveBeenCalled();
+				// without an explicit signal the ✎ marker would survive the
+				// revert until the next user-initiated refresh. The fix sends a
+				// TARGETED single-row clear (kb:clearDiverged) rather than the
+				// tree-wide refreshKnowledgeBaseFolders reset, which wiped the
+				// client folderCache and collapsed every expanded branch dir.
+				// Pin both: the targeted clear fires with the kbParent-relative
+				// path, and the heavyweight reset does NOT.
+				// Suffix match: the kbParent prefix differs between this test's
+				// fixture and the mocked resolveKbParent, but the forward-slash
+				// normalization (no backslashes) and the target file identity
+				// are what matter for the client folderCache key.
+				expect(mockClearKnowledgeBaseFolderDivergence).toHaveBeenCalledWith(
+					expect.stringMatching(/(^|\/)repo\/main\/foo-abcdef12\.md$/),
+				);
+				expect(mockRefreshKnowledgeBaseFolders).not.toHaveBeenCalled();
 			});
 
-			it("does NOT call refreshKnowledgeBaseFolders when the regenerate helper returns a failure", async () => {
-				// Failure path: the post-revert refresh trigger should only fire
-				// on a successful regenerate. A non-ok result means the hidden
-				// source was missing or corrupt, so the ✎ state on disk hasn't
-				// actually changed — re-rendering the tree would be wasted work
-				// and could even surprise the user with collapsing expanded
-				// folders.
+			it("does NOT signal the KB tree when the regenerate helper returns a failure", async () => {
+				// Failure path: the post-revert tree signal should only fire on a
+				// successful regenerate. A non-ok result means the hidden source
+				// was missing or corrupt, so the ✎ state on disk hasn't actually
+				// changed — touching the tree would be wasted work. (Neither the
+				// targeted clear nor the legacy reset should fire.)
 				const folderStorage = {
 					forceRegenerateVisibleMarkdown: vi.fn().mockResolvedValue({ ok: false, reason: "missing" }),
 					regenerateVisiblePlan: vi.fn(),
@@ -3870,6 +3886,7 @@ describe("Extension", () => {
 				);
 				await handler(absPath);
 
+				expect(mockClearKnowledgeBaseFolderDivergence).not.toHaveBeenCalled();
 				expect(mockRefreshKnowledgeBaseFolders).not.toHaveBeenCalled();
 			});
 

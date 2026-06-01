@@ -92,6 +92,15 @@ export interface SidebarWebviewDeps {
 	};
 	/** Returns absolute path under kbRoot for a relative path. */
 	resolveKbAbs?: (relPath: string) => string;
+	/**
+	 * True when the Memory Bank `.md` at `abs` has been edited on disk and its
+	 * sha256 no longer matches the manifest fingerprint. Consulted from
+	 * `handleOpenFile` so opening a diverged file surfaces the Folders-tab ✎
+	 * marker immediately (the row is already rendered; we just flip its flag)
+	 * instead of waiting for the next full re-listing. Optional so existing
+	 * tests that inject only `resolveKbAbs` keep working; absent → no check.
+	 */
+	isMemoryFileDivergedOnDisk?: (abs: string) => Promise<boolean>;
 	memoriesProvider?: {
 		serialize(): { items: ReadonlyArray<MemoryItem>; hasMore: boolean };
 		onDidChangeTreeData: (cb: () => void) => { dispose: () => void };
@@ -220,6 +229,16 @@ export class SidebarWebviewProvider
 	 */
 	private selectedRepoName: string | undefined;
 	private selectedBranchName: string | undefined;
+	// Per-path "latest divergence signal wins" generation. Bumped on every
+	// open-file divergence check AND on every revert, so whichever fired last
+	// for a given row is authoritative. markDivergedIfNeeded captures the value
+	// before its async disk check and drops its result if anything bumped the
+	// same path meanwhile — a newer open, or a revert. Without this, two opens
+	// of the same file could let an older/slower check overwrite the newer one,
+	// and a revert-in-flight could re-light a ✎ on a now-synced file. Keyed by
+	// the repoDir-prefixed relPath all paths use, so signals for one row never
+	// suppress another's.
+	private readonly divergenceCheckSeq = new Map<string, number>();
 
 	constructor(private readonly deps: SidebarWebviewDeps) {}
 
@@ -793,6 +812,23 @@ export class SidebarWebviewProvider
 		}
 	}
 
+	/**
+	 * Clears one Folders-tab file row's ✎ marker in place after a successful
+	 * single-file revert. Unlike {@link refreshKnowledgeBaseFolders} this does
+	 * NOT wipe `folderCache`, so every expanded branch directory stays open — a
+	 * content revert touches one file's bytes, not the tree's shape, so the
+	 * heavyweight reset (which collapses the whole tree) is the wrong response.
+	 * `relPath` is the repoDir-prefixed forward-slash path used as the client's
+	 * `folderCache` key. A non-Memory-Bank path (revert fired from the explorer
+	 * menu on an unrelated `.md`) simply finds no matching row and no-ops.
+	 */
+	clearKnowledgeBaseFolderDivergence(relPath: string): void {
+		// Claim "latest signal" for this row so any in-flight open-file check
+		// resolves into a no-op — the revert's clear is authoritative.
+		this.bumpDivergenceSeq(relPath);
+		this.postMessage({ type: "kb:clearDiverged", path: relPath });
+	}
+
 	/** Pushed from refreshStatusBar after enable/disable so the sidebar can show
 	 * or hide the disabled banner without an extension reload. */
 	notifyEnabledChanged(enabled: boolean): void {
@@ -963,9 +999,42 @@ export class SidebarWebviewProvider
 		const abs = this.deps.resolveKbAbs(relPath);
 		if (relPath.toLowerCase().endsWith(".md")) {
 			void this.deps.executeCommand("jollimemory.openMemoryFile", abs);
+			// Opening a `.md` is the one place divergence is checked outside the
+			// Folders-tab listing. Mirror that result onto the tree's ✎ marker so
+			// a file edited on disk while the sidebar was already open lights up
+			// the moment the user opens it — no manual refresh required.
+			void this.markDivergedIfNeeded(relPath, abs);
 		} else {
 			void this.deps.executeCommand("vscode.open", vscode.Uri.file(abs));
 		}
+	}
+
+	private bumpDivergenceSeq(relPath: string): number {
+		const next = (this.divergenceCheckSeq.get(relPath) ?? 0) + 1;
+		this.divergenceCheckSeq.set(relPath, next);
+		return next;
+	}
+
+	private async markDivergedIfNeeded(
+		relPath: string,
+		abs: string,
+	): Promise<void> {
+		if (!this.deps.isMemoryFileDivergedOnDisk) return;
+		// Claim "latest signal" for this row, then drop our result if a newer
+		// open or a revert bumped the same path while our async disk check was in
+		// flight — the newer signal is authoritative and posts the correct state.
+		const seq = this.bumpDivergenceSeq(relPath);
+		const diverged = await this.deps.isMemoryFileDivergedOnDisk(abs);
+		if ((this.divergenceCheckSeq.get(relPath) ?? 0) !== seq) return;
+		// Mirror the disk result onto the row BOTH ways: mark when diverged, clear
+		// when in sync. The clear is what lets reopening a now-synced file drop a
+		// ✎ left by an earlier open (or a stale listing) — without it the row
+		// stays marked until an explicit revert or full refresh. A clear for a row
+		// that isn't currently marked is a no-op client-side.
+		this.postMessage({
+			type: diverged ? "kb:markDiverged" : "kb:clearDiverged",
+			path: relPath,
+		});
 	}
 
 	public async refreshConversationsPanel(): Promise<void> {

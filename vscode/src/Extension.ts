@@ -6,7 +6,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { clearTimeout, setTimeout } from "node:timers";
 import * as vscode from "vscode";
 import {
@@ -20,6 +20,7 @@ import {
 	resolveKbParent,
 } from "../../cli/src/core/KBPathResolver.js";
 import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
+import { toForwardSlash } from "../../cli/src/core/PathUtils.js";
 import {
 	getGlobalConfigDir,
 	loadConfig,
@@ -886,6 +887,10 @@ export function activate(context: vscode.ExtensionContext): void {
 		// <kbParent>; join'ing on kbParent gives back the absolute on-disk
 		// path. Same shape as the IntelliJ Memory Bank tree.
 		resolveKbAbs: (relPath) => join(sidebarKbParent, relPath),
+		// Lets handleOpenFile light up the Folders-tab ✎ marker the moment a
+		// user opens a `.md` that's been edited on disk — same sha256-vs-manifest
+		// check the native MemoryFileDecorationProvider badge uses.
+		isMemoryFileDivergedOnDisk: (abs) => bridge.isMemoryFileDivergedOnDisk(abs),
 		// MemoriesStore was previously loaded via memoriesView.onDidChangeVisibility;
 		// the webview replacement has no equivalent built-in event, so we plumb it
 		// through SidebarWebviewProvider's `case "ready"` instead.
@@ -2676,14 +2681,25 @@ export function activate(context: vscode.ExtensionContext): void {
 					memoryFileDecorationProvider.refreshUri(
 						vscode.Uri.file(absPath),
 					);
-					// Force the KB folders tree to drop its cached
-					// `isDiverged` for this path so the ✎ marker disappears
-					// without waiting for the user to hit refresh. The
-					// existing decoration-provider refresh above only covers
-					// VS Code's native file UIs; the webview-rendered KB
-					// tree reads divergence from the cached FolderNode and
-					// needs its own re-fetch signal.
-					sidebarProvider.refreshKnowledgeBaseFolders();
+					// Clear the KB folders tree's cached `isDiverged` for
+					// this one path so the ✎ marker disappears without a
+					// manual refresh. The decoration-provider refresh above
+					// only covers VS Code's native file UIs; the
+					// webview-rendered KB tree reads divergence from the
+					// cached FolderNode and needs its own signal.
+					//
+					// A content revert touches one file's bytes, not the
+					// tree's shape — so we send the targeted `kb:clearDiverged`
+					// (single-row flag flip) rather than the heavyweight
+					// `refreshKnowledgeBaseFolders` reset, which wipes the
+					// client's folderCache and collapses every expanded branch
+					// directory the user had open. relPath is absPath made
+					// relative to the same kbParent `resolveKbAbs` joins from,
+					// normalized to the forward-slash form the client keys
+					// folderCache on; a non-Memory-Bank path no-ops client-side.
+					sidebarProvider.clearKnowledgeBaseFolderDivergence(
+						toForwardSlash(relative(sidebarKbParent, absPath)),
+					);
 					vscode.window.showInformationMessage(
 						`Reverted to system version: ${absPath}`,
 					);
