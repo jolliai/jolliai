@@ -80,6 +80,7 @@ import {
 	type ConsolidatedTopics,
 	expandSourcesForConsolidation,
 	getSummary,
+	getTranscriptHashes,
 	mergeManyToOne,
 	migrateOneToOne,
 	resolveEffectiveTopics,
@@ -90,7 +91,7 @@ import {
 	storeSummary,
 	stripFunctionalMetadata,
 } from "../core/SummaryStore.js";
-import { getTranscriptIds } from "../core/SummaryTree.js";
+import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
 import { generateTranscriptId } from "../core/TranscriptId.js";
 import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
@@ -1851,10 +1852,23 @@ async function handleAmendPipeline(
 	const transcriptArtifact =
 		amendDeltaTranscriptId !== undefined ? { id: amendDeltaTranscriptId, data: amendStoredTranscript } : undefined;
 	// IDs that survive into the new amend root: inherited from old + new delta
-	// when one exists. `getTranscriptIds(oldSummary)` returns [] when oldSummary
-	// is undefined (we always check above before reading), so this is just the
-	// delta when there's no prior summary (fresh-leaf branch below).
-	const inheritedAmendIds = oldSummary ? getTranscriptIds(oldSummary) : [];
+	// when one exists. For legacy (v3/v4) `oldSummary`, derive via the
+	// children-tree walk but FILTER to IDs that actually have a transcript file
+	// — mirrors migrateOneToOne/mergeManyToOne (and the v5 migration) so a
+	// session-less child commit doesn't bake a dangling ID into the new v5
+	// root's authoritative `transcripts` array. v5 input passes through. Empty
+	// when oldSummary is undefined (fresh-leaf branch below).
+	// v5 `oldSummary` carries an authoritative `transcripts` array — pass it
+	// through without a file listing. Only legacy (v3/v4) input needs the
+	// children-tree walk filtered against on-disk transcript files, so we fetch
+	// `getTranscriptHashes` lazily in that branch alone.
+	let inheritedAmendIds: ReadonlyArray<string> = [];
+	if (oldSummary) {
+		inheritedAmendIds =
+			oldSummary.transcripts !== undefined
+				? oldSummary.transcripts
+				: resolveTranscriptIdsFiltered(oldSummary, await getTranscriptHashes(cwd));
+	}
 	const amendTranscripts: ReadonlyArray<string> =
 		amendDeltaTranscriptId !== undefined ? [...inheritedAmendIds, amendDeltaTranscriptId] : inheritedAmendIds;
 

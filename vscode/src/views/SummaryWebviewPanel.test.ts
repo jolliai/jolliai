@@ -4836,6 +4836,10 @@ describe("SummaryWebviewPanel", () => {
 				const dispatch = captureMessageHandler();
 				mockStoreSummary.mockClear();
 				mockSaveTranscriptsBatch.mockClear();
+				// Clear so we can assert the failure path does NOT re-refresh the
+				// cache (P2: refreshing from the already-updated summary would hide
+				// the still-on-disk files and break retry).
+				mockGetTranscriptHashes.mockClear();
 				mockSaveTranscriptsBatch.mockRejectedValueOnce(new Error("io error"));
 
 				dispatch({
@@ -4861,6 +4865,10 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({ command: "transcriptsSaveFailed" }),
 				);
 				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsSaved" });
+				// P2: no refresh-from-updated-summary on failure — the pre-operation
+				// `transcriptHashSet` is kept so the affected transcripts stay
+				// visible and the save/delete stays retryable.
+				expect(mockGetTranscriptHashes).not.toHaveBeenCalled();
 			});
 		});
 
@@ -4890,6 +4898,15 @@ describe("SummaryWebviewPanel", () => {
 				expect(postMessage).toHaveBeenCalledWith({
 					command: "transcriptsDeleted",
 				});
+				// #5 + #4: the legacy (v3) summary is lazily upgraded to a REAL v5
+				// record — version bumped to 5 and `transcripts` written from the
+				// file-backed set (emptied here by the delete), not left as a
+				// "version<5 but has transcripts" hybrid.
+				expect(mockStoreSummary).toHaveBeenCalledWith(
+					expect.objectContaining({ version: 5, transcripts: [] }),
+					workspaceRoot,
+					true,
+				);
 			});
 
 			it("does nothing when no transcripts exist", async () => {
@@ -4996,6 +5013,20 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({ command: "transcriptsDeleteFailed" }),
 				);
 				expect(postMessage).not.toHaveBeenCalledWith({ command: "transcriptsDeleted" });
+
+				// P2: the failed delete stays RETRYABLE. The still-on-disk file is
+				// NOT hidden (we don't refresh from the cleared summary), so a
+				// repeat "Delete all transcripts" re-attempts the file removal and
+				// succeeds this time.
+				mockSaveTranscriptsBatch.mockClear();
+				mockSaveTranscriptsBatch.mockResolvedValueOnce(undefined);
+				postMessage.mockClear();
+
+				dispatch({ command: "deleteAllTranscripts" });
+				await flushPromises();
+
+				expect(mockSaveTranscriptsBatch).toHaveBeenCalledWith([], ["abc123"], workspaceRoot);
+				expect(postMessage).toHaveBeenCalledWith({ command: "transcriptsDeleted" });
 			});
 		});
 

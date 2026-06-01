@@ -1,31 +1,44 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./GitOps.js", () => ({
-	readFileFromBranch: vi.fn(),
-	// Bulk read of summary contents during migration. Tests feed per-path
-	// content via `Map`-shaped return values; the default empty Map is a safe
-	// fallback for tests that mock listFilesInBranch with no summaries.
-	batchReadFilesFromBranch: vi.fn().mockResolvedValue(new Map()),
-	listFilesInBranch: vi.fn(),
-	// Migration entry guard: default to "branch exists" so existing tests
-	// that exercise the happy path don't need to set this. The fresh-install
-	// case (no orphan branch yet) overrides this per-test.
-	orphanBranchExists: vi.fn().mockResolvedValue(true),
-	// Pre-migration SHA capture for debug-log recovery anchor (Feedback 2).
-	// Tests don't assert on this — a benign stub is enough.
+	// Pre-migration SHA capture for debug-log recovery anchor. Tests don't
+	// assert on this — a benign stub is enough. The migration's reads now go
+	// through the StorageProvider (mocked below), not GitOps directly.
 	execGit: vi.fn().mockResolvedValue({ stdout: "deadbeef0000000000000000000000000000beef\n", stderr: "" }),
 }));
 
-// Mock the StorageFactory so migration writes are observed via a single
-// `writeFiles` spy. In production this returns a DualWriteStorage that fans
-// out to both the orphan branch and the Memory Bank folder; here we just
-// capture the call args so tests can assert on what would have been written.
-const { mockStorageWriteFiles } = vi.hoisted(() => ({
+// Mock the StorageFactory so the migration's reads AND writes are observed via
+// a single fake StorageProvider. In production `createStorage` returns the
+// active backend (DualWriteStorage by default); here every primitive is a spy
+// so tests can drive `exists`/`listFiles`/`batchReadFiles`/`readFile` and
+// assert on the captured `writeFiles` args. Defaults are the happy-path
+// values (backend exists, empty listings, null state) so each test only
+// overrides what it exercises.
+const {
+	mockStorageWriteFiles,
+	mockStorageExists,
+	mockStorageListFiles,
+	mockStorageReadFile,
+	mockStorageBatchReadFiles,
+	mockStorageIsDirty,
+} = vi.hoisted(() => ({
 	mockStorageWriteFiles: vi.fn().mockResolvedValue(undefined),
+	mockStorageExists: vi.fn().mockResolvedValue(true),
+	mockStorageListFiles: vi.fn().mockResolvedValue([]),
+	mockStorageReadFile: vi.fn().mockResolvedValue(null),
+	mockStorageBatchReadFiles: vi.fn().mockResolvedValue(new Map()),
+	// Shadow clean by default → migration stamps `completed`. The shadow-failure
+	// test flips this to true to assert the migration stays pending.
+	mockStorageIsDirty: vi.fn().mockReturnValue(false),
 }));
 vi.mock("./StorageFactory.js", () => ({
 	createStorage: vi.fn().mockResolvedValue({
 		writeFiles: mockStorageWriteFiles,
+		exists: mockStorageExists,
+		listFiles: mockStorageListFiles,
+		readFile: mockStorageReadFile,
+		batchReadFiles: mockStorageBatchReadFiles,
+		isDirty: mockStorageIsDirty,
 	}),
 }));
 
@@ -39,7 +52,6 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import type { CommitSummary, FileWrite } from "../Types.js";
-import { batchReadFilesFromBranch, listFilesInBranch, orphanBranchExists, readFileFromBranch } from "./GitOps.js";
 import { __test__, migrateSchemaToV5, readSchemaV5State } from "./SchemaV5Migration.js";
 
 const baseNode = {
@@ -66,6 +78,22 @@ describe("SchemaV5Migration", () => {
 				transcripts: ["uuid-1"],
 			} as CommitSummary;
 			expect(__test__.upgradeOneSummary(v5, new Set(["uuid-1"]))).toBe(v5);
+		});
+
+		it("repairs a version-5 record that is MISSING the transcripts field (not treated as migrated)", () => {
+			// Anomalous record (bug / hand-edit): version 5 but no `transcripts`.
+			// The fast-path must NOT return it as-is — left alone it forces the
+			// read path down the v3/v4 children-walk fallback forever. Falling
+			// through computes the array like any pre-v5 root.
+			const v5NoTranscripts: CommitSummary = {
+				...baseNode,
+				version: 5,
+				topics: [],
+			} as CommitSummary;
+			const upgraded = __test__.upgradeOneSummary(v5NoTranscripts, new Set([baseNode.commitHash]));
+			expect(upgraded).not.toBe(v5NoTranscripts); // repaired, not returned verbatim
+			expect(upgraded.version).toBe(5);
+			expect(upgraded.transcripts).toEqual([baseNode.commitHash]);
 		});
 
 		it("upgrades v4 leaf to v5 with transcripts populated when file exists", () => {
@@ -174,16 +202,44 @@ describe("SchemaV5Migration", () => {
 			} as CommitSummary;
 			const upgraded = __test__.upgradeOneSummary(v3WithStats, new Set([baseNode.commitHash]));
 			expect(upgraded.diffStats).toEqual({ filesChanged: 4, insertions: 8, deletions: 1 });
+			// The legacy `stats` field is STRIPPED, not carried alongside
+			// `diffStats` — otherwise the read-time stats→diffStats fallback could
+			// never be removed (a v5 record carrying both is the anti-pattern).
+			expect(upgraded.stats).toBeUndefined();
+		});
+
+		it("stamps the AGGREGATE diffStats for a v3 container (amend root), not the raw root delta", async () => {
+			// An amend root's own `stats` is just the delta; pre-v5 the display
+			// went through resolveDiffStats → aggregateStats (delta + children).
+			// Migration must stamp that aggregate, else the v5 fast-path returns
+			// the raw delta and the displayed diff silently shrinks.
+			const v3AmendRoot: CommitSummary = {
+				...baseNode,
+				version: 3,
+				// root (amend) delta
+				stats: { filesChanged: 1, insertions: 2, deletions: 0 },
+				children: [
+					{
+						...baseNode,
+						commitHash: "child-pre-amend",
+						version: 3,
+						stats: { filesChanged: 3, insertions: 10, deletions: 4 },
+					} as CommitSummary,
+				],
+			} as CommitSummary;
+			const upgraded = __test__.upgradeOneSummary(v3AmendRoot, new Set([baseNode.commitHash]));
+			// delta (1/2/0) + child (3/10/4) = 4/12/4, NOT the raw 1/2/0.
+			expect(upgraded.diffStats).toEqual({ filesChanged: 4, insertions: 12, deletions: 4 });
+			expect(upgraded.stats).toBeUndefined();
 		});
 	});
 
-	// ─── migrateSchemaToV5 (integration with GitOps mocks) ────────────────────
+	// ─── migrateSchemaToV5 (integration with StorageProvider mocks) ───────────
 	describe("migrateSchemaToV5 (integration)", () => {
-		it("returns a no-op fresh result when the orphan branch does not exist yet", async () => {
-			// Fresh install: no jollimemory data, no orphan branch. Migration
-			// must not create the branch as a side effect.
-			vi.mocked(orphanBranchExists).mockResolvedValueOnce(false);
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null); // state read
+		it("returns a no-op fresh result when the storage backend does not exist yet", async () => {
+			// Fresh install: no jollimemory data, no orphan branch / no Memory
+			// Bank folder. Migration must not create the backend as a side effect.
+			mockStorageExists.mockResolvedValueOnce(false);
 
 			const result = await migrateSchemaToV5();
 
@@ -191,12 +247,51 @@ describe("SchemaV5Migration", () => {
 			expect(result.alreadyDone).toBe(false);
 			expect(result.migrated).toBe(0);
 			expect(mockStorageWriteFiles).not.toHaveBeenCalled();
-			expect(listFilesInBranch).not.toHaveBeenCalled();
+			expect(mockStorageListFiles).not.toHaveBeenCalled();
 		});
 
-		it("writes a fresh-install state when the orphan branch has no summaries", async () => {
-			vi.mocked(readFileFromBranch).mockResolvedValue(null); // state, index reads
-			vi.mocked(listFilesInBranch)
+		it("migrates folder-only data: reads via readFile when batchReadFiles is absent", async () => {
+			// folder-only regression guard: FolderStorage exposes no
+			// `batchReadFiles`, so the migration must fall back to per-file
+			// `readFile`. Previously folder-only repos were skipped entirely
+			// (orphan-branch gate) and never reached v5.
+			const v4: CommitSummary = {
+				...baseNode,
+				commitHash: "folder-hash",
+				version: 4,
+				topics: [],
+			} as CommitSummary;
+			const { createStorage } = await import("./StorageFactory.js");
+			// A folder-style provider: exists/listFiles/readFile/writeFiles but
+			// NO batchReadFiles capability.
+			const folderReadFile = vi.fn(async (path: string) =>
+				path === "summaries/folder-hash.json" ? JSON.stringify(v4) : null,
+			);
+			vi.mocked(createStorage).mockResolvedValueOnce({
+				exists: vi.fn().mockResolvedValue(true),
+				listFiles: vi
+					.fn()
+					.mockResolvedValueOnce(["summaries/folder-hash.json"])
+					.mockResolvedValueOnce(["transcripts/folder-hash.json"]),
+				readFile: folderReadFile,
+				writeFiles: mockStorageWriteFiles,
+				// batchReadFiles intentionally omitted.
+			} as never);
+
+			const result = await migrateSchemaToV5();
+
+			expect(result.migrated).toBe(1);
+			expect(result.fresh).toBe(false);
+			// Per-file fallback was used for the summary read (state reads also
+			// go through readFile, so just assert the summary path was read).
+			expect(folderReadFile).toHaveBeenCalledWith("summaries/folder-hash.json");
+			const files = mockStorageWriteFiles.mock.calls[0]?.[0] as ReadonlyArray<FileWrite>;
+			const summaryFile = files.find((f) => f.path.startsWith("summaries/"));
+			expect(JSON.parse(summaryFile?.content ?? "{}").version).toBe(5);
+		});
+
+		it("writes a fresh-install state when the backend has no summaries", async () => {
+			mockStorageListFiles
 				.mockResolvedValueOnce([]) // summaries/
 				.mockResolvedValueOnce([]); // transcripts/
 
@@ -217,7 +312,7 @@ describe("SchemaV5Migration", () => {
 		});
 
 		it("skips when state already shows completed", async () => {
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(
+			mockStorageReadFile.mockResolvedValueOnce(
 				JSON.stringify({
 					version: 1,
 					status: "completed",
@@ -237,7 +332,37 @@ describe("SchemaV5Migration", () => {
 			expect(mockStorageWriteFiles).not.toHaveBeenCalled();
 		});
 
-		it("upgrades v3 and v4 summaries to v5 in one atomic commit", async () => {
+		it("skips (no rescan) when a concurrent run completed between the outer check and the lock", async () => {
+			// #6 idempotency guard: the state check in migrateSchemaToV5 is
+			// outside the lock. The first readFile (outer check) returns null
+			// (pending), but by the time we hold the lock another process has
+			// written "completed". The in-lock re-check must short-circuit so we
+			// don't rescan and overwrite the state with migratedCount:0.
+			mockStorageReadFile
+				.mockResolvedValueOnce(null) // outer check: still pending
+				.mockResolvedValueOnce(
+					JSON.stringify({
+						version: 1,
+						status: "completed",
+						startedAt: "2026-05-22T00:00:00Z",
+						completedAt: "2026-05-22T00:00:09Z",
+						migratedCount: 7,
+						skippedCount: 2,
+						fresh: false,
+					}),
+				); // in-lock re-check: a concurrent run finished
+
+			const result = await migrateSchemaToV5();
+
+			expect(result.alreadyDone).toBe(true);
+			expect(result.migrated).toBe(7);
+			expect(result.skipped).toBe(2);
+			// No rescan, no overwrite of the completed state.
+			expect(mockStorageListFiles).not.toHaveBeenCalled();
+			expect(mockStorageWriteFiles).not.toHaveBeenCalled();
+		});
+
+		it("upgrades v3 and v4 summaries to v5 in one atomic write", async () => {
 			const v3: CommitSummary = {
 				...baseNode,
 				commitHash: "v3-hash",
@@ -251,14 +376,19 @@ describe("SchemaV5Migration", () => {
 				topics: [{ title: "T2", trigger: "t", response: "r", decisions: "d" }],
 			} as CommitSummary;
 
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null); // state read (readSchemaV5State)
-			vi.mocked(listFilesInBranch)
+			mockStorageListFiles
 				.mockResolvedValueOnce(["summaries/v3-hash.json", "summaries/v4-hash.json"])
-				.mockResolvedValueOnce(["transcripts/v3-hash.json", "transcripts/v4-hash.json"]);
-			// Summary contents now flow through the batched cat-file reader,
-			// not per-file readFileFromBranch. One mock call serves all paths
-			// for the migration's read phase.
-			vi.mocked(batchReadFilesFromBranch).mockResolvedValueOnce(
+				// The stray non-`.json` entry exercises the `match?.[1]` falsy
+				// guard — `listFiles("transcripts/")` can surface paths that don't
+				// match the `transcripts/<id>.json` shape; those must be ignored.
+				.mockResolvedValueOnce([
+					"transcripts/v3-hash.json",
+					"transcripts/v4-hash.json",
+					"transcripts/stray.txt",
+				]);
+			// Summary contents flow through the storage batch reader. One mock
+			// call serves all paths for the migration's read phase.
+			mockStorageBatchReadFiles.mockResolvedValueOnce(
 				new Map([
 					["summaries/v3-hash.json", JSON.stringify(v3)],
 					["summaries/v4-hash.json", JSON.stringify(v4)],
@@ -271,18 +401,30 @@ describe("SchemaV5Migration", () => {
 			expect(result.skipped).toBe(0);
 			expect(result.fresh).toBe(false);
 
-			const files = mockStorageWriteFiles.mock.calls[0]?.[0] as ReadonlyArray<FileWrite>;
-			expect(files.length).toBe(3); // 2 summaries + 1 state file
-			// All summaries are written at version=5.
-			const summaryFiles = files.filter((f) => f.path.startsWith("summaries/"));
-			for (const f of summaryFiles) {
+			// Content first (the 2 summaries), then the completed-state marker as
+			// a SEPARATE write — the marker only lands after the content does, and
+			// only when the shadow is clean.
+			const contentFiles = mockStorageWriteFiles.mock.calls[0]?.[0] as ReadonlyArray<FileWrite>;
+			expect(contentFiles.map((f) => f.path).sort()).toEqual([
+				"summaries/v3-hash.json",
+				"summaries/v4-hash.json",
+			]);
+			for (const f of contentFiles) {
 				const parsed = JSON.parse(f.content);
 				expect(parsed.version).toBe(5);
 				expect(parsed.transcripts).toBeDefined();
 			}
+			const stateFiles = mockStorageWriteFiles.mock.calls[1]?.[0] as ReadonlyArray<FileWrite>;
+			expect(stateFiles).toHaveLength(1);
+			expect(stateFiles[0]?.path).toBe(__test__.SCHEMA_V5_STATE_FILE);
 		});
 
-		it("skips v5 summaries already present without rewriting them", async () => {
+		it("recovery: re-pushes already-v5 summaries to heal a lagging shadow, then completes", async () => {
+			// Reaching the locked migration with everything already v5 (migrated=0)
+			// but no completed marker means a prior attempt upgraded the source of
+			// truth but didn't finish (classic dual-write shadow failure). The
+			// skip-unchanged fast-path would write nothing to the folder; instead
+			// we MUST re-push every v5 summary so the lagging shadow catches up.
 			const v5Already: CommitSummary = {
 				...baseNode,
 				commitHash: "v5-hash",
@@ -291,11 +433,10 @@ describe("SchemaV5Migration", () => {
 				transcripts: ["uuid-existing"],
 			} as CommitSummary;
 
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null); // state read
-			vi.mocked(listFilesInBranch)
+			mockStorageListFiles
 				.mockResolvedValueOnce(["summaries/v5-hash.json"])
 				.mockResolvedValueOnce(["transcripts/uuid-existing.json"]);
-			vi.mocked(batchReadFilesFromBranch).mockResolvedValueOnce(
+			mockStorageBatchReadFiles.mockResolvedValueOnce(
 				new Map([["summaries/v5-hash.json", JSON.stringify(v5Already)]]),
 			);
 
@@ -304,10 +445,40 @@ describe("SchemaV5Migration", () => {
 			expect(result.skipped).toBe(1);
 			expect(result.migrated).toBe(0);
 
-			const files = mockStorageWriteFiles.mock.calls[0]?.[0] as ReadonlyArray<FileWrite>;
-			// Only the state file should be written — the v5 summary is untouched.
-			expect(files.length).toBe(1);
-			expect(files[0]?.path).toBe(__test__.SCHEMA_V5_STATE_FILE);
+			// Content write re-pushes the already-v5 summary (NOT skipped), then the
+			// state marker is written separately.
+			const contentFiles = mockStorageWriteFiles.mock.calls[0]?.[0] as ReadonlyArray<FileWrite>;
+			expect(contentFiles).toHaveLength(1);
+			expect(contentFiles[0]?.path).toBe("summaries/v5-hash.json");
+			const stateFiles = mockStorageWriteFiles.mock.calls[1]?.[0] as ReadonlyArray<FileWrite>;
+			expect(stateFiles[0]?.path).toBe(__test__.SCHEMA_V5_STATE_FILE);
+		});
+
+		it("leaves state PENDING (no completed marker) when the storage shadow write failed", async () => {
+			// dual-write swallows a folder (shadow) write failure + flags dirty.
+			// The migration must NOT stamp `completed` then — otherwise the folder
+			// is stranded at the old schema and the marker locks out any retry.
+			const v4: CommitSummary = {
+				...baseNode,
+				commitHash: "shadow-hash",
+				version: 4,
+				topics: [],
+			} as CommitSummary;
+			mockStorageListFiles.mockResolvedValueOnce(["summaries/shadow-hash.json"]).mockResolvedValueOnce([]);
+			mockStorageBatchReadFiles.mockResolvedValueOnce(
+				new Map([["summaries/shadow-hash.json", JSON.stringify(v4)]]),
+			);
+			// Shadow reported dirty after the content write.
+			mockStorageIsDirty.mockReturnValueOnce(true);
+
+			const result = await migrateSchemaToV5();
+
+			expect(result.alreadyDone).toBe(false);
+			// Content was written, but the state marker was NOT (only one write).
+			expect(mockStorageWriteFiles).toHaveBeenCalledTimes(1);
+			const written = mockStorageWriteFiles.mock.calls[0]?.[0] as ReadonlyArray<FileWrite>;
+			expect(written.some((f) => f.path === __test__.SCHEMA_V5_STATE_FILE)).toBe(false);
+			expect(written[0]?.path).toBe("summaries/shadow-hash.json");
 		});
 
 		it("routes the migration write through createStorage so dual-write fans out to orphan + shadow", async () => {
@@ -318,7 +489,7 @@ describe("SchemaV5Migration", () => {
 			// `"version": 4` until normal post-commit traffic eventually
 			// rewrote each one. Routing through `createStorage()` gives the
 			// active `StorageProvider` (DualWriteStorage in dual-write mode) a
-			// chance to fan the v5 payload out to both backends in one pass.
+			// chance to fan the v5 payload out to both backends.
 			const { createStorage } = await import("./StorageFactory.js");
 
 			const v4: CommitSummary = {
@@ -327,35 +498,27 @@ describe("SchemaV5Migration", () => {
 				version: 4,
 				topics: [],
 			} as CommitSummary;
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null); // state
-			vi.mocked(listFilesInBranch)
-				.mockResolvedValueOnce(["summaries/shadow-hash.json"])
-				.mockResolvedValueOnce([]);
-			vi.mocked(batchReadFilesFromBranch).mockResolvedValueOnce(
+			mockStorageListFiles.mockResolvedValueOnce(["summaries/shadow-hash.json"]).mockResolvedValueOnce([]);
+			mockStorageBatchReadFiles.mockResolvedValueOnce(
 				new Map([["summaries/shadow-hash.json", JSON.stringify(v4)]]),
 			);
 
 			await migrateSchemaToV5();
 
 			expect(createStorage).toHaveBeenCalledTimes(1);
-			expect(mockStorageWriteFiles).toHaveBeenCalledTimes(1);
-			const writtenFiles = mockStorageWriteFiles.mock.calls[0]?.[0] as ReadonlyArray<FileWrite>;
-			// 1 upgraded summary + 1 state file. The summary content is v5 so a
-			// dual-write storage will write `"version": 5` to BOTH backends —
-			// the bug we're guarding against was the shadow being skipped here.
-			expect(writtenFiles).toHaveLength(2);
-			const summaryFile = writtenFiles.find((f) => f.path.startsWith("summaries/"));
+			// Two writes: content (the upgraded summary) then the completed marker.
+			expect(mockStorageWriteFiles).toHaveBeenCalledTimes(2);
+			const contentFiles = mockStorageWriteFiles.mock.calls[0]?.[0] as ReadonlyArray<FileWrite>;
+			const summaryFile = contentFiles.find((f) => f.path.startsWith("summaries/"));
 			expect(summaryFile).toBeDefined();
-			const parsed = JSON.parse(summaryFile?.content ?? "{}");
-			expect(parsed.version).toBe(5);
+			// The summary content is v5 so dual-write fans `"version": 5` to BOTH
+			// backends — the bug we're guarding against was the shadow being skipped.
+			expect(JSON.parse(summaryFile?.content ?? "{}").version).toBe(5);
 		});
 
 		it("tolerates unparseable summary files by skipping them", async () => {
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null); // state read
-			vi.mocked(listFilesInBranch).mockResolvedValueOnce(["summaries/bad.json"]).mockResolvedValueOnce([]);
-			vi.mocked(batchReadFilesFromBranch).mockResolvedValueOnce(
-				new Map([["summaries/bad.json", "not valid json {"]]),
-			);
+			mockStorageListFiles.mockResolvedValueOnce(["summaries/bad.json"]).mockResolvedValueOnce([]);
+			mockStorageBatchReadFiles.mockResolvedValueOnce(new Map([["summaries/bad.json", "not valid json {"]]));
 
 			const result = await migrateSchemaToV5();
 
@@ -372,7 +535,6 @@ describe("SchemaV5Migration", () => {
 			// `Extension.ts activate` and `Installer.install`.
 			const locksMod = await import("./Locks.js");
 			vi.mocked(locksMod.acquireOrphanWriteLock).mockResolvedValueOnce(false);
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null); // state read
 
 			await expect(migrateSchemaToV5()).rejects.toThrow(/orphan-write lock/);
 			expect(mockStorageWriteFiles).not.toHaveBeenCalled();
@@ -385,8 +547,7 @@ describe("SchemaV5Migration", () => {
 			// sandbox where git is unavailable), the migration still completes.
 			const gitops = await import("./GitOps.js");
 			vi.mocked(gitops.execGit).mockRejectedValueOnce(new Error("git not found"));
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null); // state
-			vi.mocked(listFilesInBranch)
+			mockStorageListFiles
 				.mockResolvedValueOnce([]) // summaries
 				.mockResolvedValueOnce([]); // transcripts
 
@@ -395,14 +556,13 @@ describe("SchemaV5Migration", () => {
 			expect(mockStorageWriteFiles).toHaveBeenCalledOnce();
 		});
 
-		it("skips summary files whose batched read returned null (transient git read failure)", async () => {
-			// Covers the `content === null` early-continue branch — cat-file's
-			// batch reader maps an entry to null when the path resolved to
-			// `missing` at read time (e.g. a concurrent orphan-write committed
-			// a deletion between listFilesInBranch and the batch read).
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null); // state
-			vi.mocked(listFilesInBranch).mockResolvedValueOnce(["summaries/vanished.json"]).mockResolvedValueOnce([]);
-			vi.mocked(batchReadFilesFromBranch).mockResolvedValueOnce(new Map([["summaries/vanished.json", null]]));
+		it("skips summary files whose batched read returned null (transient read failure)", async () => {
+			// Covers the `content === null` early-continue branch — the batch
+			// reader maps an entry to null when the path resolved to `missing`
+			// at read time (e.g. a concurrent write committed a deletion between
+			// listFiles and the batch read).
+			mockStorageListFiles.mockResolvedValueOnce(["summaries/vanished.json"]).mockResolvedValueOnce([]);
+			mockStorageBatchReadFiles.mockResolvedValueOnce(new Map([["summaries/vanished.json", null]]));
 
 			const result = await migrateSchemaToV5();
 
@@ -415,14 +575,13 @@ describe("SchemaV5Migration", () => {
 			// `null` and `undefined` look identical to a casual read but have
 			// very different causes: `null` is a benign race (file vanished),
 			// `undefined` is a bug in the batch reader (it must populate one
-			// entry per request). The migration code MUST surface the latter
-			// — without this guard a future regression in
-			// `batchReadFilesFromBranch` that silently drops entries would
-			// be invisible (migrated count would just be lower than expected).
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null); // state
-			vi.mocked(listFilesInBranch).mockResolvedValueOnce(["summaries/dropped.json"]).mockResolvedValueOnce([]);
+			// entry per request). The migration code MUST surface the latter —
+			// without this guard a future regression in `readSummaries` that
+			// silently drops entries would be invisible (migrated count would
+			// just be lower than expected).
+			mockStorageListFiles.mockResolvedValueOnce(["summaries/dropped.json"]).mockResolvedValueOnce([]);
 			// Empty Map → `contents.get("summaries/dropped.json")` returns undefined.
-			vi.mocked(batchReadFilesFromBranch).mockResolvedValueOnce(new Map());
+			mockStorageBatchReadFiles.mockResolvedValueOnce(new Map());
 
 			await expect(migrateSchemaToV5()).rejects.toThrow(/protocol contract violation/);
 			expect(mockStorageWriteFiles).not.toHaveBeenCalled();
@@ -432,7 +591,7 @@ describe("SchemaV5Migration", () => {
 	// ─── readSchemaV5State ────────────────────────────────────────────────────
 	describe("readSchemaV5State", () => {
 		it("returns null when state file is absent", async () => {
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			mockStorageReadFile.mockResolvedValueOnce(null);
 			expect(await readSchemaV5State()).toBeNull();
 		});
 
@@ -446,13 +605,24 @@ describe("SchemaV5Migration", () => {
 				skippedCount: 0,
 				fresh: true,
 			};
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(state));
+			mockStorageReadFile.mockResolvedValueOnce(JSON.stringify(state));
 			expect(await readSchemaV5State()).toEqual(state);
 		});
 
 		it("returns null when state file is unparseable", async () => {
-			vi.mocked(readFileFromBranch).mockResolvedValueOnce("not json");
+			mockStorageReadFile.mockResolvedValueOnce("not json");
 			expect(await readSchemaV5State()).toBeNull();
+		});
+
+		it("uses a caller-provided storage without constructing a new one", async () => {
+			// The migration threads its already-built provider in to avoid the
+			// extra `createStorage` (loadConfig) I/O. Verify the passed storage's
+			// readFile is used and createStorage is NOT called.
+			const { createStorage } = await import("./StorageFactory.js");
+			const passedReadFile = vi.fn().mockResolvedValue(null);
+			await readSchemaV5State(undefined, { readFile: passedReadFile } as never);
+			expect(passedReadFile).toHaveBeenCalledWith(__test__.SCHEMA_V5_STATE_FILE);
+			expect(createStorage).not.toHaveBeenCalled();
 		});
 	});
 });

@@ -170,6 +170,33 @@ describe("DualWriteStorage", () => {
 		expect(shadow.exists).not.toHaveBeenCalled();
 	});
 
+	describe("isDirty", () => {
+		const stub = (over: Partial<StorageProvider> = {}) =>
+			({
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn(),
+				ensure: vi.fn(),
+				...over,
+			}) as unknown as StorageProvider;
+
+		it("reflects the shadow's dirty state", () => {
+			const dual = new DualWriteStorage(stub(), stub({ isDirty: vi.fn().mockReturnValue(true) }));
+			expect(dual.isDirty()).toBe(true);
+		});
+
+		it("returns false when the shadow is clean", () => {
+			const dual = new DualWriteStorage(stub(), stub({ isDirty: vi.fn().mockReturnValue(false) }));
+			expect(dual.isDirty()).toBe(false);
+		});
+
+		it("returns false when the shadow does not implement isDirty", () => {
+			const dual = new DualWriteStorage(stub(), stub());
+			expect(dual.isDirty()).toBe(false);
+		});
+	});
+
 	it("ensure runs both backends when shadow succeeds", async () => {
 		const primaryEnsure = vi.fn();
 		const shadowEnsure = vi.fn();
@@ -286,6 +313,68 @@ describe("DualWriteStorage", () => {
 
 		const dual = new DualWriteStorage(primary, shadow);
 		await expect(dual.writeFiles([{ path: "ok.txt", content: "data" }], "write")).resolves.toBeUndefined();
+	});
+
+	describe("batchReadFiles", () => {
+		it("delegates to the primary's batchReadFiles when present", async () => {
+			const map = new Map<string, string | null>([
+				["summaries/a.json", "A"],
+				["summaries/b.json", null],
+			]);
+			const primaryBatch = vi.fn().mockResolvedValue(map);
+			const primary = {
+				readFile: vi.fn(),
+				batchReadFiles: primaryBatch,
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+			const shadow = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+
+			const dual = new DualWriteStorage(primary, shadow);
+			const result = await dual.batchReadFiles(["summaries/a.json", "summaries/b.json"]);
+
+			expect(result).toBe(map);
+			expect(primaryBatch).toHaveBeenCalledWith(["summaries/a.json", "summaries/b.json"]);
+		});
+
+		it("falls back to per-file primary.readFile when the primary lacks batchReadFiles", async () => {
+			// InMemoryStorage has no batchReadFiles → the fallback loop runs.
+			const primary = new InMemoryStorage();
+			await primary.writeFiles(
+				[
+					{ path: "summaries/a.json", content: "A" },
+					{ path: "summaries/b.json", content: "B" },
+				],
+				"seed",
+			);
+			const shadow = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn(),
+			} as unknown as StorageProvider;
+
+			const dual = new DualWriteStorage(primary, shadow);
+			const result = await dual.batchReadFiles([
+				"summaries/a.json",
+				"summaries/b.json",
+				"summaries/missing.json",
+			]);
+
+			expect(result.get("summaries/a.json")).toBe("A");
+			expect(result.get("summaries/b.json")).toBe("B");
+			// Missing file maps to null — same contract as readFile.
+			expect(result.get("summaries/missing.json")).toBeNull();
+		});
 	});
 
 	describe("deleteVisibleMarkdown delegation", () => {

@@ -8,6 +8,7 @@
  * Pattern adapted from: tools/jolliagent/src/tools/tools/git_shared.ts
  */
 
+import { once } from "node:events";
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { createLogger } from "../Logger.js";
@@ -885,40 +886,94 @@ async function runFastImport(
 			reject(err);
 		});
 
-		// Stream every blob first. Marks are sequential integers — only need
-		// to be unique within this stream, so 1..N is the simplest scheme.
-		// Buffer.from(... , "utf8") + buf.length gives the BYTE count fast-
-		// import requires (using string.length would undercount any multi-
-		// byte UTF-8 sequence and produce a malformed `data` directive).
+		// Build the fast-import stream as one ordered list of chunks, then
+		// write it with backpressure handling (see writeChunksWithBackpressure).
+		// Blobs come first; marks are sequential integers — only need to be
+		// unique within this stream, so 1..N is the simplest scheme.
+		// Buffer.from(..., "utf8") + buf.length gives the BYTE count fast-import
+		// requires (string.length would undercount any multi-byte UTF-8 sequence
+		// and produce a malformed `data` directive).
+		const chunks: Array<string | Buffer> = [];
 		writes.forEach((f, idx) => {
 			const mark = idx + 1;
 			const body = Buffer.from(f.content, "utf8");
-			stdin.write(`blob\nmark :${mark}\ndata ${body.length}\n`);
-			stdin.write(body);
-			stdin.write("\n");
+			chunks.push(`blob\nmark :${mark}\ndata ${body.length}\n`, body, "\n");
 		});
 
-		// Now emit the single commit record that references the marks above.
+		// The single commit record that references the marks above.
 		const msg = Buffer.from(commitMessage, "utf8");
-		stdin.write(`commit refs/heads/${branch}\n`);
-		stdin.write(`author ${authorIdent}\n`);
-		stdin.write(`committer ${committerIdent}\n`);
-		stdin.write(`data ${msg.length}\n`);
-		stdin.write(msg);
-		stdin.write("\n");
-		stdin.write(`from ${parent}\n`);
-
+		chunks.push(
+			`commit refs/heads/${branch}\n`,
+			`author ${authorIdent}\n`,
+			`committer ${committerIdent}\n`,
+			`data ${msg.length}\n`,
+			msg,
+			"\n",
+			`from ${parent}\n`,
+		);
 		writes.forEach((f, idx) => {
-			const mark = idx + 1;
-			stdin.write(`M 100644 :${mark} ${f.path}\n`);
+			chunks.push(`M 100644 :${idx + 1} ${quoteFastImportPath(f.path)}\n`);
 		});
 		for (const f of deletes) {
-			stdin.write(`D ${f.path}\n`);
+			chunks.push(`D ${quoteFastImportPath(f.path)}\n`);
 		}
+		chunks.push("done\n");
 
-		stdin.write("done\n");
-		stdin.end();
+		// Stream the chunks honoring backpressure: when `write()` returns false
+		// the kernel buffer is full, so wait for `drain` before the next chunk
+		// rather than letting every blob body queue in Node's memory at once —
+		// the 336-file migration this path optimizes is exactly where an
+		// ignore-the-return-value loop would balloon. A write failure mid-stream
+		// (EPIPE) rejects via `once`'s error handling, mirroring the persistent
+		// `stdin.on("error")` above; either path's reject is idempotent.
+		writeChunksWithBackpressure(stdin, chunks).then(
+			() => {
+				stdin.end();
+			},
+			(err) => {
+				reject(err);
+			},
+		);
 	});
+}
+
+/**
+ * Writes `chunks` to `stream` in order, pausing on backpressure: when
+ * `stream.write()` returns false (the internal/kernel buffer is full) it awaits
+ * the next `drain` event before continuing, so a large batch can't pile every
+ * chunk into memory at once. Rejects if the stream errors while draining
+ * (`once` rejects on an `error` event), letting the caller surface an EPIPE
+ * from an early fast-import exit instead of hanging.
+ */
+async function writeChunksWithBackpressure(
+	stream: NodeJS.WritableStream,
+	chunks: ReadonlyArray<string | Buffer>,
+): Promise<void> {
+	for (const chunk of chunks) {
+		if (!stream.write(chunk)) {
+			await once(stream, "drain");
+		}
+	}
+}
+
+/**
+ * Renders a path for a fast-import `M`/`D` directive. fast-import accepts a
+ * C-style-quoted path in all cases and REQUIRES it when the path contains a
+ * newline or begins with a double-quote (an unquoted such path corrupts the
+ * stream or splits the directive). Today every orphan-branch path is a
+ * program-generated hash / UUID / fixed name that never needs quoting, so this
+ * is a hardening / no-regression guard versus the byte-safe `mktree` path it
+ * replaced — but it makes the writer correct for arbitrary paths.
+ *
+ * Quotes whenever the path contains a backslash, double-quote, CR, or LF, and
+ * C-escapes those characters. (The `\\` replacement here escapes a literal
+ * backslash for fast-import quoting — it is NOT path separator normalization,
+ * so the `toForwardSlash` rule does not apply.)
+ */
+function quoteFastImportPath(path: string): string {
+	if (!/["\\\n\r]/.test(path)) return path;
+	const escaped = path.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+	return `"${escaped}"`;
 }
 
 /**

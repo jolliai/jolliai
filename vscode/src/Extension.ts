@@ -1085,21 +1085,33 @@ export function activate(context: vscode.ExtensionContext): void {
 		// hide-children) while v5 work is in flight. Mirrors the v1→v3 and
 		// index-migration patterns above; user gets a unified "data being
 		// upgraded" signal across panels without us inventing a new banner.
-		statusStore.setMigrating(true);
-		commitsStore.setMigrating(true);
-		filesStore.setMigrating(true);
+		const { migrateSchemaToV5, readSchemaV5State } = await import(
+			"../../cli/src/core/SchemaV5Migration.js"
+		);
+		// Needed-check FIRST so the common already-migrated path doesn't flash the
+		// "Migrating memories..." affordance every activate() (mirrors the v1→v3 /
+		// index migrations, which gate their UI toggle on a check). A read error →
+		// treat as unknown and let migrateSchemaToV5 (re-checks + short-circuits) decide.
+		const v5State = await readSchemaV5State(workspaceRoot ?? undefined).catch(() => null);
+		const v5Pending = v5State?.status !== "completed";
+		if (v5Pending) {
+			statusStore.setMigrating(true);
+			commitsStore.setMigrating(true);
+			filesStore.setMigrating(true);
+		}
 		try {
-			const { migrateSchemaToV5 } = await import(
-				"../../cli/src/core/SchemaV5Migration.js"
-			);
 			// `?? undefined` because workspaceRoot is `string | null` here; the
 			// value is non-null (we returned earlier when it was), the coercion
 			// just satisfies tsc.
-			const v5Result = await migrateSchemaToV5(workspaceRoot ?? undefined);
-			log.info(
-				"activate",
-				`Schema v5 migration: alreadyDone=${v5Result.alreadyDone} fresh=${v5Result.fresh} migrated=${v5Result.migrated} skipped=${v5Result.skipped}`,
-			);
+			if (!v5Pending) {
+				log.info("activate", "Schema v5 migration already complete — skipping (no UI toggle)");
+			} else {
+				const v5Result = await migrateSchemaToV5(workspaceRoot ?? undefined);
+				log.info(
+					"activate",
+					`Schema v5 migration: alreadyDone=${v5Result.alreadyDone} fresh=${v5Result.fresh} migrated=${v5Result.migrated} skipped=${v5Result.skipped}`,
+				);
+			}
 		} catch (err) {
 			log.warn(
 				"activate",
@@ -1109,9 +1121,11 @@ export function activate(context: vscode.ExtensionContext): void {
 			// Always clear migration state — including on failure — so the
 			// sidebar comes back to a usable state and the user can read the
 			// "Not migrated" status / re-run via `jolli migrate`.
-			statusStore.setMigrating(false);
-			commitsStore.setMigrating(false);
-			filesStore.setMigrating(false);
+			if (v5Pending) {
+				statusStore.setMigrating(false);
+				commitsStore.setMigrating(false);
+				filesStore.setMigrating(false);
+			}
 		}
 
 		// 3. KB folder auto-initialization + migration

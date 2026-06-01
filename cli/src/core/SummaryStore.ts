@@ -49,9 +49,11 @@ import {
 	collectAllTopics,
 	collectDisplayTopics,
 	countTopics,
-	getTranscriptIds,
 	isUnifiedHoistFormat,
+	resolveDiffStats,
+	resolveTranscriptIdsFiltered,
 } from "./SummaryTree.js";
+import { transcriptIdFromPath } from "./TranscriptId.js";
 
 let activeStorageOverride: StorageProvider | undefined;
 
@@ -399,12 +401,19 @@ async function migrateOneToOneLocked(
 	// Legacy-aware Copy-Hoist of topics: v4 returns root.topics; v3 (legacy
 	// squash / legacy amend) flattens via collectAllTopics so no data drops.
 	const hoistedTopics = resolveEffectiveTopics(oldSummary);
+	// Same legacy-aware Copy-Hoist for recap. A v3 squash root keeps its recap on
+	// children (not the root), so reading `oldSummary.recap` directly would drop
+	// it on rebase-pick. `resolveEffectiveRecap` picks the root's recap when set,
+	// else the newest descendant's — matching normalizeToV4's behavior.
+	const hoistedRecap = resolveEffectiveRecap(oldSummary);
 
 	// Carry transcript IDs through 1:1 — rebase-pick doesn't change content,
 	// only commit hash. v5 data has them on root; v3/v4 data falls back to the
-	// children-tree walk via `getTranscriptIds`, keeping the same legacy
-	// commit-hash strings as opaque IDs (the files at those paths still exist).
-	const inheritedTranscriptIds = getTranscriptIds(oldSummary);
+	// children-tree walk, filtered to commit hashes that actually have a
+	// transcript file (mirrors the v5 migration's upgradeOneSummary so we don't
+	// bake dangling IDs for session-less commits into the authoritative array).
+	const existingTranscriptFileIds = await getTranscriptHashes(cwd, storage);
+	const inheritedTranscriptIds = resolveTranscriptIdsFiltered(oldSummary, existingTranscriptFileIds);
 
 	const newSummary: CommitSummary = {
 		version: CURRENT_SCHEMA_VERSION,
@@ -438,7 +447,7 @@ async function migrateOneToOneLocked(
 		// the rebased commit's webview would lose its Regenerate banner.
 		...(isSummaryError(oldSummary) && { summaryError: LLM_FAILED }),
 		topics: hoistedTopics,
-		...(oldSummary.recap && { recap: oldSummary.recap }),
+		...(hoistedRecap !== undefined ? { recap: hoistedRecap } : {}),
 		// v5 contract: always present, even if empty. Length-0 is the right
 		// signal for "no AI sessions captured for this commit" so the read path
 		// hits the fast `summary.transcripts` lookup instead of the v3/v4
@@ -742,14 +751,27 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 	const hoistedRecap = resolveEffectiveRecap(summary);
 
 	// Migrate v3 `stats` → v4 `diffStats` when only the legacy field is set.
-	// Display code's resolveDiffStats already does this fallback at read time,
-	// but normalizing here means persisted v5 data carries the canonical field
-	// and the fallback can eventually go away.
+	// Display code's resolveDiffStats does this fallback at read time, but
+	// normalizing here means persisted v5 data carries the canonical field and
+	// the read-time fallback can eventually go away — which it only can if the
+	// migrated record DROPS the legacy `stats`. So strip `stats` from the spread
+	// below (destructure it out); the value survives as `diffStats`.
+	//
+	// Stamp the AGGREGATE (`resolveDiffStats`), NOT the raw `stats`. For a
+	// container — e.g. an amend root whose own `stats` is just the delta — the
+	// pre-v5 display went through `resolveDiffStats` → `aggregateStats` (delta +
+	// children). Once we stamp `diffStats`, the v5 fast-path returns it directly
+	// and never re-aggregates, so stamping the raw delta would silently SHRINK
+	// the displayed files/insertions/deletions. `resolveDiffStats` returns the
+	// aggregate for containers and the node's own stats for leaves, so it stamps
+	// exactly what the old read path would have shown. (Called before the
+	// destructure so it still sees the original `stats` + children.)
 	const migratedDiffStats =
-		summary.diffStats === undefined && summary.stats !== undefined ? summary.stats : undefined;
+		summary.diffStats === undefined && summary.stats !== undefined ? resolveDiffStats(summary) : undefined;
+	const { stats: _, ...summaryWithoutStats } = summary;
 
 	return {
-		...summary,
+		...summaryWithoutStats,
 		version: 4,
 		topics: hoistedTopics,
 		...(hoistedRecap !== undefined ? { recap: hoistedRecap } : {}),
@@ -1034,10 +1056,15 @@ async function mergeManyToOneLocked(
 	// Squash kills the source commits in git history, so the merged root is
 	// the only "live" referrer to their transcript files — listing every ID
 	// at root is exactly what `getTranscriptIds(mergedRoot)` needs to find
-	// the full conversation set. Dedup via Set in case two sources share an
-	// ID (legitimate when a project has mixed migrated-from-v3 hashes that
-	// happen to collide — vanishingly rare but cheap to guard against).
-	const mergedTranscriptIds = Array.from(new Set<string>(children.flatMap((child) => getTranscriptIds(child))));
+	// the full conversation set. Legacy children walk the tree, filtered to
+	// hashes with a real transcript file (mirrors the v5 migration so no
+	// dangling IDs leak in); v5 children's arrays are authoritative. Dedup via
+	// Set in case two sources share an ID (legitimate when a project has mixed
+	// migrated-from-v3 hashes that happen to collide — rare but cheap to guard).
+	const existingTranscriptFileIds = await getTranscriptHashes(cwd, storage);
+	const mergedTranscriptIds = Array.from(
+		new Set<string>(children.flatMap((child) => resolveTranscriptIdsFiltered(child, existingTranscriptFileIds))),
+	);
 
 	const mergedSummary: CommitSummary = {
 		version: CURRENT_SCHEMA_VERSION,
@@ -1282,10 +1309,11 @@ export async function getTranscriptHashes(cwd?: string, storage?: StorageProvide
 	for (const filePath of files) {
 		// filePath = "transcripts/{id}.json" → extract "{id}". Tolerates any
 		// non-empty opaque-string ID, including legacy hex-only commit hashes
-		// and v5 UUIDs with hyphens.
-		const match = filePath.match(/^transcripts\/(.+)\.json$/);
-		if (match?.[1]) {
-			hashes.add(match[1]);
+		// and v5 UUIDs with hyphens. Shared parser keeps this in lockstep with
+		// the v5 migration's filename parsing.
+		const id = transcriptIdFromPath(filePath);
+		if (id) {
+			hashes.add(id);
 		}
 	}
 	return hashes;

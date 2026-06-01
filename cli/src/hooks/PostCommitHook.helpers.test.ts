@@ -123,6 +123,10 @@ vi.mock("../core/GitOps.js", () => ({
 	getDiffStats: mockGetDiffStats,
 	getCurrentBranch: mockGetCurrentBranch,
 	getLastReflogAction: mockGetLastReflogAction,
+	// handleAmendPipeline now file-filters a legacy oldSummary's transcript IDs
+	// via getTranscriptHashes → OrphanBranchStorage.listFiles. Empty listing is
+	// fine here — these tests don't assert on the resulting transcripts array.
+	listFilesInBranch: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({

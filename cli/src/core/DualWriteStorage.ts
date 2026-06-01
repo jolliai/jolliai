@@ -22,6 +22,17 @@ export class DualWriteStorage implements StorageProvider {
 		return this.primary.readFile(path);
 	}
 
+	// Reads come from the primary (orphan branch), so delegate the batch read
+	// there too. Falls back to per-file reads when the primary lacks the
+	// capability — keeps DualWrite honest if its primary is ever a backend
+	// without `batchReadFiles`.
+	async batchReadFiles(paths: ReadonlyArray<string>): Promise<Map<string, string | null>> {
+		if (this.primary.batchReadFiles) return this.primary.batchReadFiles(paths);
+		const result = new Map<string, string | null>();
+		for (const path of paths) result.set(path, await this.primary.readFile(path));
+		return result;
+	}
+
 	// Primary writes first because it's the source of truth (orphan branch).
 	// Shadow (folder KB) is best-effort — failures are swallowed so a flaky
 	// filesystem never blocks the critical git-based write path.
@@ -144,6 +155,14 @@ export class DualWriteStorage implements StorageProvider {
 
 	async exists(): Promise<boolean> {
 		return this.primary.exists();
+	}
+
+	// Reflects the shadow (folder) sync state: true after a swallowed shadow
+	// write failure, until the next successful shadow write clears it. The v5
+	// migration reads this to avoid stamping `completed` when the folder shadow
+	// silently fell behind (see SchemaV5Migration). Primary has no dirty concept.
+	isDirty(): boolean {
+		return this.shadow.isDirty?.() ?? false;
 	}
 
 	async ensure(): Promise<void> {

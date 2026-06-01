@@ -27,14 +27,14 @@ const log = createLogger("StatusCommand");
  * everything that isn't `completed` reduces to "run `jolli migrate` and check
  * the log".
  *
- * The structured `StatusInfo` mirror of this is `schemaV5` + `schemaV5Fresh`
- * (see `Types.ts`). `migratedCount` / `errorMessage` / `startedAt` /
- * `completedAt` live on the persisted `SchemaV5MigrationState` (read by
- * `readSchemaV5State`) but are NOT projected onto `StatusInfo` today — there's
- * no consumer and `errorMessage` is dead per the design choice not to persist
- * `failed` (see `SchemaV5Migration.ts` doc comment). When Release N+M lands
- * the persisted-`failed` + UI-degrade changes, add the diagnostic fields to
- * `StatusInfo` then so `--json` consumers can drive their own UI.
+ * The structured `StatusInfo` mirror of this is the single `schemaV5` field
+ * (see `Types.ts`). The richer `SchemaV5MigrationState` fields (`fresh`,
+ * `migratedCount`, `errorMessage`, `startedAt`, `completedAt`) live only on the
+ * persisted state read by `readSchemaV5State` and are NOT projected onto
+ * `StatusInfo` — there's no consumer, so the binary `schemaV5` is all we
+ * expose. If a future UI needs finer detail (e.g. distinguishing fresh installs
+ * or surfacing a failure reason), add the specific field to `StatusInfo` then,
+ * driven by a real consumer rather than ahead of need.
  */
 export function describeSchemaV5Status(state: StatusInfo["schemaV5"]): string {
 	return state === "completed" ? "Up to date (v5)" : "Not migrated — run jolli migrate";

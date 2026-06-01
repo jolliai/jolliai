@@ -121,6 +121,9 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		storeNotes: vi.fn(),
 		setActiveStorage: vi.fn(),
 		resolveStorage: vi.fn(),
+		// handleAmendPipeline file-filters a legacy oldSummary's transcript IDs
+		// against this set; empty is fine (tests don't assert transcripts).
+		getTranscriptHashes: vi.fn().mockResolvedValue(new Set<string>()),
 		// Keep real implementations for pure tree-transform helpers.
 		stripFunctionalMetadata: actual.stripFunctionalMetadata,
 		resolveEffectiveTopics: actual.resolveEffectiveTopics,

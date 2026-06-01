@@ -1018,12 +1018,6 @@ export interface StatusInfo {
 	 * run on next opportunity (worker startup or explicit `jolli migrate`).
 	 */
 	readonly schemaV5?: "in-progress" | "completed" | "failed";
-	/**
-	 * True when migration completed but no pre-v5 data was present — i.e. a
-	 * fresh install. Used to choose between "complete (v5)" and "not needed"
-	 * wording in the status display.
-	 */
-	readonly schemaV5Fresh?: boolean;
 }
 
 /**
