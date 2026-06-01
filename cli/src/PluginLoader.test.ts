@@ -15,6 +15,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getHelpGroup } from "./commands/HelpGroups.js";
+import { KNOWN_PLUGINS } from "./KnownPlugins.js";
 import { setSilentConsole } from "./Logger.js";
 import { getNpmRootGlobal, loadPlugins } from "./PluginLoader.js";
 
@@ -1242,6 +1244,88 @@ describe("loadPlugins", () => {
 			process.chdir(origCwd);
 			await rm(cleanCwd, { recursive: true, force: true });
 		}
+	});
+
+	it("reports a plugin's ID in the loaded set once its register() runs", async () => {
+		// P1: the returned set must reflect plugins that actually registered —
+		// `registerMissingStubs` keys its stub fallback off this set.
+		const root = await writeFixture(tempDir, {
+			peerVersion: "^0.100.0",
+			pluginSource: "export const register = (ctx) => { ctx.program.command('plugin-ok').action(() => {}); };",
+		});
+		const program = new Command();
+		const loaded = await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(loaded.has(FIXTURE_ID)).toBe(true);
+	});
+
+	it("omits a discovered plugin from the loaded set when its register() throws", async () => {
+		// P1: a discovered-but-broken plugin must drop out of the loaded set so
+		// the caller falls back to its stub instead of treating it as live.
+		const root = await writeFixture(tempDir, {
+			peerVersion: "^0.100.0",
+			pluginSource: "export const register = () => { throw new Error('register boom'); };",
+		});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const program = new Command();
+			const loaded = await loadPlugins(program, "0.100.0", {
+				rootsOverride: [root],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+			});
+			expect(loaded.has(FIXTURE_ID)).toBe(false);
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("omits a discovered plugin from the loaded set when its peer range rejects the CLI", async () => {
+		// P1: peer-mismatch is another not-loaded path that must still surface
+		// the stub fallback rather than masking it.
+		const root = await writeFixture(tempDir, {
+			peerVersion: "^99.0.0",
+			pluginSource: "export const register = (ctx) => { ctx.program.command('plugin-x').action(() => {}); };",
+		});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const program = new Command();
+			const loaded = await loadPlugins(program, "0.100.0", {
+				rootsOverride: [root],
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+			});
+			expect(loaded.has(FIXTURE_ID)).toBe(false);
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+
+	it("tags commands a known plugin registers with its help group", async () => {
+		// P2: help grouping is by provenance, not name. A known plugin that
+		// declares a `helpGroup` has every command it registers tagged so the
+		// formatter buckets them correctly even when the command name is generic.
+		// The ID is resolved from KNOWN_PLUGINS (not hardcoded) because the group
+		// mapping is keyed off the production registry.
+		const known = KNOWN_PLUGINS.find((p) => p.helpGroup);
+		if (!known) throw new Error("expected a known plugin with a helpGroup");
+		const root = await writeFixture(tempDir, {
+			peerVersion: "^0.100.0",
+			pluginId: known.id,
+			pluginSource: "export const register = (ctx) => { ctx.program.command('init').action(() => {}); };",
+		});
+		const program = new Command();
+		await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			allowlistOverride: [known.id],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		const cmd = program.commands.find((c) => c.name() === "init");
+		expect(cmd).toBeDefined();
+		expect(cmd && getHelpGroup(cmd)).toBe(known.helpGroup);
 	});
 });
 

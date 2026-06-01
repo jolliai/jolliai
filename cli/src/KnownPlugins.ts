@@ -22,24 +22,36 @@
  */
 
 import type { Command } from "commander";
+import type { HelpGroup } from "./commands/HelpGroups.js";
 import { registerSiteCommandStubs } from "./commands/SiteCommandStubs.js";
+import { registerSpaceCommandStubs } from "./commands/SpaceCommandStubs.js";
 
 export interface KnownPlugin {
 	id: string;
 	packageName: string;
 	installHint: string;
+	/**
+	 * Which `jolli --help` section this plugin's commands render under. When set,
+	 * `PluginLoader` tags every command the plugin registers with this group so
+	 * the help formatter buckets them by provenance rather than by name (see
+	 * {@link HelpGroup}). Plugins whose commands should fall under "Other
+	 * commands:" simply omit it.
+	 */
+	helpGroup?: HelpGroup;
 	registerStub?: (program: Command) => void;
 }
 
 export const KNOWN_PLUGINS: ReadonlyArray<KnownPlugin> = [
 	{
-		// @jolli.ai/cli-pro — Jolli proprietary plugin (separate repository).
-		// No stub: commands provided by cli-pro do not have a host-side
-		// placeholder; users who do not have cli-pro simply do not see its
-		// commands at all.
+		// @jolli.ai/space-cli — Jolli proprietary plugin (separate repository).
+		// When missing, stubs keep the Space commands (init / space / source /
+		// impact / sync / agent) visible in `--help` and emit a one-line install
+		// hint on invocation — identical UX to site-cli below.
 		id: "c56530c4-3f2f-467f-a4a4-db4d44c79c1c",
-		packageName: "@jolli.ai/cli-pro",
-		installHint: "npm install -g @jolli.ai/cli-pro",
+		packageName: "@jolli.ai/space-cli",
+		installHint: "npm install -g @jolli.ai/space-cli",
+		helpGroup: "space",
+		registerStub: registerSpaceCommandStubs,
 	},
 	{
 		// @jolli.ai/site-cli — documentation site generation. When missing,
@@ -48,6 +60,7 @@ export const KNOWN_PLUGINS: ReadonlyArray<KnownPlugin> = [
 		id: "290e6c2f-d894-446c-9763-94a863f3a2cd",
 		packageName: "@jolli.ai/site-cli",
 		installHint: "npm install -g @jolli.ai/site-cli",
+		helpGroup: "site",
 		registerStub: registerSiteCommandStubs,
 	},
 ];

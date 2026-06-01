@@ -39,7 +39,7 @@ export async function saveAuthToken(token: string): Promise<void> {
  * the config with a token but no API key (or vice versa).
  *
  * `jolliUrl` is required: every successful login knows the origin it signed
- * into, and persisting it lets cli-pro recover the tenant when
+ * into, and persisting it lets space-cli recover the tenant when
  * `jolliApiKey` is missing or stale. Trailing slash is stripped so the
  * persisted value matches `getJolliUrl`. CLI / VS Code only — IntelliJ
  * writes its own auth state to `config-intellij.json`.
@@ -76,9 +76,9 @@ export async function saveAuthCredentials(credentials: {
 	// Validate at the persistence boundary, symmetric with `validateJolliApiKey`
 	// below. Production callers route through `getJolliUrl()`, which already
 	// applies the same allowlist — repeating it here keeps a future caller
-	// (cli-pro, IntelliJ port, refactored VS Code path) from persisting an
+	// (space-cli, IntelliJ port, refactored VS Code path) from persisting an
 	// off-allowlist origin and downstream readers (`apiKeyMatchesTenant`,
-	// cli-pro's tenant resolver) from trusting an attacker-supplied URL.
+	// space-cli's tenant resolver) from trusting an attacker-supplied URL.
 	assertJolliOriginAllowed(normalizedJolliUrl);
 	const update: { authToken: string; jolliUrl: string; jolliApiKey?: string; aiProvider?: "jolli" } = {
 		authToken: credentials.token,
@@ -101,7 +101,7 @@ export async function saveAuthCredentials(credentials: {
 		// comparison is therefore a tautology and never throws. The check is
 		// NOT dead, though: it stays meaningful for any caller that supplies
 		// `jolliUrl` independently of the key (direct `saveAuthCredentials`
-		// use, a future cli-pro / IntelliJ path), where a key whose `meta.u`
+		// use, a future space-cli / IntelliJ path), where a key whose `meta.u`
 		// disagrees with the supplied URL is rejected rather than silently
 		// persisted and routed to a third tenant. `resolveSignInJolliUrl`
 		// already drops an off-allowlist `meta.u`, so the residual case this
@@ -265,7 +265,7 @@ export async function loadAuthToken(): Promise<string | undefined> {
  * warning copy never reaches the user).
  *
  * `jolliUrl` is intentionally **not** cleared. It's not secret material,
- * and cli-pro still needs to resolve the tenant after logout — that's the
+ * and space-cli still needs to resolve the tenant after logout — that's the
  * entire reason `saveAuthCredentials` persists it. The next successful
  * sign-in (potentially against a different tenant) overwrites the value,
  * and the bare URL on its own grants no access.
