@@ -2,7 +2,6 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { hashReferenceContent } from "./references/ReferenceStore.js";
 
 const { mockRename, realRename } = vi.hoisted(() => ({
 	mockRename: vi.fn<typeof import("node:fs/promises").rename>(),
@@ -54,7 +53,6 @@ import type {
 import {
 	associateNoteWithCommit,
 	associatePlanWithCommit,
-	associateReferenceWithCommit,
 	checkStaleSquashPending,
 	countActiveQueueEntries,
 	countStaleQueueEntries,
@@ -82,7 +80,6 @@ import {
 	loadSquashPending,
 	pruneStaleQueueEntries,
 	pruneStaleSessions,
-	referencePath,
 	saveConfig,
 	saveConfigScoped,
 	saveCursor,
@@ -90,7 +87,6 @@ import {
 	savePluginSource,
 	saveSession,
 	saveSquashPending,
-	setReferenceIgnored,
 	upsertReferenceEntry,
 } from "./SessionTracker.js";
 
@@ -289,7 +285,7 @@ describe("SessionTracker", () => {
 			);
 		});
 
-		it("should prune stale plan cursors during save", async () => {
+		it("should prune stale cursors during save", async () => {
 			const dir = await ensureJolliMemoryDir(tempDir);
 			const staleTime = new Date(Date.now() - 49 * 60 * 60 * 1000).toISOString();
 			const staleSession: SessionInfo = {
@@ -305,7 +301,7 @@ describe("SessionTracker", () => {
 
 			await saveCursor(
 				{
-					transcriptPath: "plan:/path/stale-plan.jsonl",
+					transcriptPath: "/path/stale-plan.jsonl",
 					lineNumber: 9,
 					updatedAt: staleTime,
 				},
@@ -321,7 +317,7 @@ describe("SessionTracker", () => {
 				tempDir,
 			);
 
-			await expect(loadCursorForTranscript("plan:/path/stale-plan.jsonl", tempDir)).resolves.toBeNull();
+			await expect(loadCursorForTranscript("/path/stale-plan.jsonl", tempDir)).resolves.toBeNull();
 		});
 	});
 
@@ -701,7 +697,7 @@ describe("SessionTracker", () => {
 			await expect(loadPlansRegistry(tempDir)).resolves.toEqual({ version: 1, plans: {} });
 		});
 
-		it("should associate a plan with a commit and update updatedAt", async () => {
+		it("should migrate the guard's commitHash and updatedAt when given an archive id", async () => {
 			const before = {
 				version: 1 as const,
 				plans: {
@@ -712,16 +708,19 @@ describe("SessionTracker", () => {
 						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
 						branch: "main",
-						commitHash: null,
+						commitHash: "abcdef1234567890",
+						contentHashAtCommit: "guardhash",
 					},
 				},
 			};
 			await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
-			await associatePlanWithCommit("feature-auth", "abcdef1234567890", tempDir);
+			// Only the guard row survives. associate sweeps it forward when the
+			// archive id (`<base>-<oldShortHash>`) matches the guard's current hash.
+			await associatePlanWithCommit("feature-auth-abcdef12", "1111111122222222", tempDir);
 
 			const after = await loadPlansRegistry(tempDir);
-			expect(after.plans["feature-auth"]?.commitHash).toBe("abcdef1234567890");
+			expect(after.plans["feature-auth"]?.commitHash).toBe("1111111122222222");
 			expect(after.plans["feature-auth"]?.updatedAt).not.toBe("2026-03-01T10:00:00Z");
 		});
 
@@ -752,45 +751,33 @@ describe("SessionTracker", () => {
 		// guard entry was left pointing at the soon-to-be-orphan commit — so a user
 		// edit to the source file would "revive" the guard with a stale hash label.
 		describe("guard-entry migration on squash/rebase", () => {
-			it("should migrate the guard entry's commitHash and recompute contentHashAtCommit when the file is unchanged", async () => {
-				const planFile = join(tempDir, "plan.md");
-				const planBody = "# My Plan\n\nstep 1\n";
-				await writeFile(planFile, planBody, "utf-8");
-				const { createHash } = await import("node:crypto");
-				const fileHash = createHash("sha256").update(planBody).digest("hex");
-
+			it("should migrate the guard's commitHash and preserve contentHashAtCommit", async () => {
 				const before = {
 					version: 1 as const,
 					plans: {
 						"my-plan": {
 							slug: "my-plan",
 							title: "My Plan",
-							sourcePath: planFile,
+							sourcePath: join(tempDir, "plan.md"),
 							addedAt: "2026-03-01T10:00:00Z",
 							updatedAt: "2026-03-01T10:00:00Z",
 							branch: "feature/x",
 							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
-							contentHashAtCommit: fileHash,
-						},
-						"my-plan-35080b05": {
-							slug: "my-plan-35080b05",
-							title: "My Plan",
-							sourcePath: planFile,
-							addedAt: "2026-03-01T10:00:00Z",
-							updatedAt: "2026-03-01T10:00:00Z",
-							branch: "feature/x",
-							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+							contentHashAtCommit: "archivehash",
 						},
 					},
 				};
 				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
+				// No archive row exists — associate splits the archive id to find the
+				// guard, sweeps its commitHash forward, and preserves contentHashAtCommit
+				// (squash rewrites commit metadata, not file content, so the archive-time
+				// anchor must survive for revival detection).
 				await associatePlanWithCommit("my-plan-35080b05", "6c66a12e50f0cf1129f8e63b340897832d22ecee", tempDir);
 
 				const after = await loadPlansRegistry(tempDir);
-				expect(after.plans["my-plan-35080b05"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
 				expect(after.plans["my-plan"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
-				expect(after.plans["my-plan"]?.contentHashAtCommit).toBe(fileHash);
+				expect(after.plans["my-plan"]?.contentHashAtCommit).toBe("archivehash");
 			});
 
 			it("should preserve contentHashAtCommit even when the source file has been edited since archive (revival signal must survive squash)", async () => {
@@ -877,38 +864,25 @@ describe("SessionTracker", () => {
 			});
 
 			it("does not migrate the guard when its commitHash no longer matches the archive's oldShortHash", async () => {
-				// Pins SessionTracker.ts L947 false branch: guard exists with
-				// contentHashAtCommit (first arm of &&) but its commitHash does
-				// NOT start with the archive's oldShortHash (second arm). This
-				// happens when the guard was already re-anchored by a prior
-				// squash and the older archive id is now stale — re-applying
-				// would clobber the freshly-correct guard hash.
-				const planFile = join(tempDir, "plan.md");
-				await writeFile(planFile, "# any\n", "utf-8");
+				// Guard exists with contentHashAtCommit (first arm of &&) but its
+				// commitHash does NOT start with the archive id's oldShortHash (second
+				// arm). This happens when the guard was already re-anchored by a prior
+				// squash and the older archive id is now stale — re-applying would
+				// clobber the freshly-correct guard hash, so associate must no-op.
 				const before = {
 					version: 1 as const,
 					plans: {
 						"my-plan": {
 							slug: "my-plan",
 							title: "My Plan",
-							sourcePath: planFile,
+							sourcePath: join(tempDir, "plan.md"),
 							addedAt: "2026-03-01T10:00:00Z",
 							updatedAt: "2026-03-01T10:00:00Z",
 							branch: "feature/x",
-							// Guard's commitHash starts with "99999999", NOT
-							// "35080b05" — so the guard belongs to a different
-							// archive cycle and must not be touched.
+							// Guard's commitHash starts with "99999999", NOT "35080b05" —
+							// so the guard belongs to a different archive cycle.
 							commitHash: "9999999999999999999999999999999999999999",
 							contentHashAtCommit: "guardhash",
-						},
-						"my-plan-35080b05": {
-							slug: "my-plan-35080b05",
-							title: "My Plan",
-							sourcePath: planFile,
-							addedAt: "2026-03-01T10:00:00Z",
-							updatedAt: "2026-03-01T10:00:00Z",
-							branch: "feature/x",
-							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
 						},
 					},
 				};
@@ -917,15 +891,15 @@ describe("SessionTracker", () => {
 				await associatePlanWithCommit("my-plan-35080b05", "6c66a12e50f0cf1129f8e63b340897832d22ecee", tempDir);
 
 				const after = await loadPlansRegistry(tempDir);
-				// Archive migrated; guard left alone (different commit lineage).
-				expect(after.plans["my-plan-35080b05"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
+				// Guard left alone (different commit lineage).
 				expect(after.plans["my-plan"]?.commitHash).toBe("9999999999999999999999999999999999999999");
 				expect(after.plans["my-plan"]?.contentHashAtCommit).toBe("guardhash");
 			});
 
 			it("should not migrate any guard when the archive id has no -<shortHash> suffix", async () => {
-				// Defensive: a caller could pass a base-slug-shaped id (no suffix). The
-				// function must not invent a guard target out of an unrelated entry.
+				// Defensive: a caller could pass a base-slug-shaped id (no suffix).
+				// splitArchivedKey returns null for it, so associate is a complete
+				// no-op — it must not re-anchor the unrelated base entry.
 				const before = {
 					version: 1 as const,
 					plans: {
@@ -946,10 +920,8 @@ describe("SessionTracker", () => {
 				await associatePlanWithCommit("my-plan", "6c66a12e50f0cf1129f8e63b340897832d22ecee", tempDir);
 
 				const after = await loadPlansRegistry(tempDir);
-				// Direct migration of the named entry still happens, but contentHashAtCommit
-				// is left alone — only guard-entry migration triggered through an archive id
-				// recomputes it.
-				expect(after.plans["my-plan"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
+				// No archive id → complete no-op: the base entry is untouched.
+				expect(after.plans["my-plan"]?.commitHash).toBeNull();
 				expect(after.plans["my-plan"]?.contentHashAtCommit).toBe("stalehash");
 			});
 		});
@@ -977,29 +949,32 @@ describe("SessionTracker", () => {
 	});
 
 	describe("associateNoteWithCommit", () => {
-		it("should associate a note with a commit and update updatedAt", async () => {
+		it("should migrate the guard's commitHash and updatedAt when given an archive id", async () => {
 			const before = {
 				version: 1 as const,
 				plans: {},
 				notes: {
-					"note-1-abc": {
-						id: "note-1-abc",
+					"note-1": {
+						id: "note-1",
 						title: "My Note",
 						format: "snippet" as const,
 						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
 						branch: "feature/test",
-						commitHash: null,
+						commitHash: "abcdef1234567890",
+						contentHashAtCommit: "guardhash",
 					},
 				},
 			};
 			await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
-			await associateNoteWithCommit("note-1-abc", "abcdef1234567890", tempDir);
+			// Only the guard row survives; associate sweeps it forward when the
+			// archive id (`<base>-<oldShortHash>`) matches the guard's current hash.
+			await associateNoteWithCommit("note-1-abcdef12", "1111111122222222", tempDir);
 
 			const after = await loadPlansRegistry(tempDir);
-			expect(after.notes?.["note-1-abc"]?.commitHash).toBe("abcdef1234567890");
-			expect(after.notes?.["note-1-abc"]?.updatedAt).not.toBe("2026-03-01T10:00:00Z");
+			expect(after.notes?.["note-1"]?.commitHash).toBe("1111111122222222");
+			expect(after.notes?.["note-1"]?.updatedAt).not.toBe("2026-03-01T10:00:00Z");
 		});
 
 		it("should handle registry with no notes field", async () => {
@@ -1042,13 +1017,7 @@ describe("SessionTracker", () => {
 		});
 
 		describe("guard-entry migration on squash/rebase", () => {
-			it("should migrate the guard entry's commitHash and recompute contentHashAtCommit when the source file is unchanged", async () => {
-				const noteFile = join(tempDir, "note.md");
-				const body = "# Active AI Conversations — Design Document\n\nA note body.\n";
-				await writeFile(noteFile, body, "utf-8");
-				const { createHash } = await import("node:crypto");
-				const fileHash = createHash("sha256").update(body).digest("hex");
-
+			it("should migrate the guard's commitHash and preserve contentHashAtCommit", async () => {
 				const before = {
 					version: 1 as const,
 					plans: {},
@@ -1057,27 +1026,19 @@ describe("SessionTracker", () => {
 							id: "note-035b",
 							title: "Active AI Conversations — Design Document",
 							format: "markdown" as const,
-							sourcePath: noteFile,
+							sourcePath: join(tempDir, "note.md"),
 							addedAt: "2026-03-01T10:00:00Z",
 							updatedAt: "2026-03-01T10:00:00Z",
 							branch: "feature/active-conversations",
 							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
-							contentHashAtCommit: fileHash,
-						},
-						"note-035b-35080b05": {
-							id: "note-035b-35080b05",
-							title: "Active AI Conversations — Design Document",
-							format: "markdown" as const,
-							sourcePath: noteFile,
-							addedAt: "2026-03-01T10:00:00Z",
-							updatedAt: "2026-03-01T10:00:00Z",
-							branch: "feature/active-conversations",
-							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
+							contentHashAtCommit: "archivehash",
 						},
 					},
 				};
 				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
 
+				// No archive row — split the archive id to the guard, sweep its
+				// commitHash forward, preserve contentHashAtCommit for revival detection.
 				await associateNoteWithCommit(
 					"note-035b-35080b05",
 					"6c66a12e50f0cf1129f8e63b340897832d22ecee",
@@ -1085,11 +1046,8 @@ describe("SessionTracker", () => {
 				);
 
 				const after = await loadPlansRegistry(tempDir);
-				expect(after.notes?.["note-035b-35080b05"]?.commitHash).toBe(
-					"6c66a12e50f0cf1129f8e63b340897832d22ecee",
-				);
 				expect(after.notes?.["note-035b"]?.commitHash).toBe("6c66a12e50f0cf1129f8e63b340897832d22ecee");
-				expect(after.notes?.["note-035b"]?.contentHashAtCommit).toBe(fileHash);
+				expect(after.notes?.["note-035b"]?.contentHashAtCommit).toBe("archivehash");
 			});
 
 			it("should preserve contentHashAtCommit even when the source file has been edited since archive (revival signal must survive squash)", async () => {
@@ -1205,15 +1163,6 @@ describe("SessionTracker", () => {
 							commitHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 							contentHashAtCommit: "stalehash",
 						},
-						"note-035b-deadbeef": {
-							id: "note-035b-deadbeef",
-							title: "Note",
-							format: "snippet" as const,
-							addedAt: "2026-03-01T10:00:00Z",
-							updatedAt: "2026-03-01T10:00:00Z",
-							branch: "feature/x",
-							commitHash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-						},
 					},
 				};
 				await savePlansRegistry(before as unknown as Parameters<typeof savePlansRegistry>[0], tempDir);
@@ -1225,9 +1174,6 @@ describe("SessionTracker", () => {
 				);
 
 				const after = await loadPlansRegistry(tempDir);
-				expect(after.notes?.["note-035b-deadbeef"]?.commitHash).toBe(
-					"6c66a12e50f0cf1129f8e63b340897832d22ecee",
-				);
 				// Guard untouched because its commitHash didn't match the archive id's
 				// `deadbeef` suffix — different commit lineage.
 				expect(after.notes?.["note-035b"]?.commitHash).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -1237,9 +1183,9 @@ describe("SessionTracker", () => {
 	});
 
 	describe("detectActiveNotesForBranch", () => {
-		// Active = uncommitted (commitHash null), not ignored, no guard
-		// (contentHashAtCommit undefined). Pins the four filter arms.
-		it("returns only active notes on the requested branch (filters branch / commitHash / ignored / guard)", async () => {
+		// Active = uncommitted (commitHash null) with no guard (contentHashAtCommit
+		// undefined). Branch / ignored scoping was removed, so neither field filters.
+		it("returns only active (uncommitted, un-guarded) notes", async () => {
 			const registry = {
 				version: 1 as const,
 				plans: {},
@@ -1250,16 +1196,6 @@ describe("SessionTracker", () => {
 						format: "snippet" as const,
 						addedAt: "2026-04-01T00:00:00Z",
 						updatedAt: "2026-04-01T00:00:00Z",
-						branch: "feature/x",
-						commitHash: null,
-					},
-					"note-other-branch": {
-						id: "note-other-branch",
-						title: "Other branch note",
-						format: "snippet" as const,
-						addedAt: "2026-04-01T00:00:00Z",
-						updatedAt: "2026-04-01T00:00:00Z",
-						branch: "feature/y",
 						commitHash: null,
 					},
 					"note-committed": {
@@ -1268,18 +1204,7 @@ describe("SessionTracker", () => {
 						format: "snippet" as const,
 						addedAt: "2026-04-01T00:00:00Z",
 						updatedAt: "2026-04-01T00:00:00Z",
-						branch: "feature/x",
 						commitHash: "deadbeefcafebabe",
-					},
-					"note-ignored": {
-						id: "note-ignored",
-						title: "Ignored note",
-						format: "snippet" as const,
-						addedAt: "2026-04-01T00:00:00Z",
-						updatedAt: "2026-04-01T00:00:00Z",
-						branch: "feature/x",
-						commitHash: null,
-						ignored: true,
 					},
 					"note-guarded": {
 						id: "note-guarded",
@@ -1287,7 +1212,6 @@ describe("SessionTracker", () => {
 						format: "snippet" as const,
 						addedAt: "2026-04-01T00:00:00Z",
 						updatedAt: "2026-04-01T00:00:00Z",
-						branch: "feature/x",
 						commitHash: null,
 						contentHashAtCommit: "fakehash",
 					},
@@ -1882,146 +1806,42 @@ describe("SessionTracker", () => {
 			expect((await getReferenceEntriesForBranch(tempDir, "main")).map((e) => e.nativeId)).toEqual(["PROJ-1528"]);
 		});
 
-		it("filters out entries on other branches", async () => {
-			await upsertReferenceEntry(ref(), tempDir, "feature-a");
-			expect(await detectUncommittedReferenceIds(tempDir, "main")).toEqual([]);
-		});
-
-		it("filters out ignored entries", async () => {
-			await seed({
-				"PROJ-1": {
-					source: "linear",
-					nativeId: "PROJ-1",
-					title: "t",
-					url: "u",
-					sourcePath: "p",
-					branch: "main",
-					addedAt: "x",
-					updatedAt: "x",
-					commitHash: null,
-					sourceToolName: "mcp__linear__get_issue",
-					ignored: true,
-				},
-			});
-			expect(await detectUncommittedReferenceIds(tempDir, "main")).toEqual([]);
-		});
-
-		it("filters out guard entries (have contentHashAtCommit)", async () => {
-			await seed({
-				"PROJ-1": {
-					source: "linear",
-					nativeId: "PROJ-1",
-					title: "t",
-					url: "u",
-					sourcePath: "p",
-					branch: "main",
-					addedAt: "x",
-					updatedAt: "x",
-					commitHash: "abc1234",
-					contentHashAtCommit: "hash",
-					sourceToolName: "mcp__linear__get_issue",
-				},
-			});
-			expect(await detectUncommittedReferenceIds(tempDir, "main")).toEqual([]);
-		});
-
-		it("filters out archived snapshot entries (commitHash set)", async () => {
-			await seed({
-				"PROJ-1-abc1234": {
-					source: "linear",
-					nativeId: "PROJ-1",
-					title: "t",
-					url: "u",
-					sourcePath: "p",
-					branch: "main",
-					addedAt: "x",
-					updatedAt: "x",
-					commitHash: "abc1234",
-					sourceToolName: "mcp__linear__get_issue",
-				},
-			});
-			expect(await detectUncommittedReferenceIds(tempDir, "main")).toEqual([]);
-		});
-
 		it("returns empty for repos with no linearIssues section", async () => {
 			await savePlansRegistry({ version: 1, plans: {} }, tempDir);
 			expect(await detectUncommittedReferenceIds(tempDir, "main")).toEqual([]);
 			expect(await getReferenceEntriesForBranch(tempDir, "main")).toEqual([]);
 		});
 
-		// Pins each of the four filter arms (branch / commitHash / ignored /
-		// contentHashAtCommit) for `getReferenceEntriesForBranch` itself —
-		// detectUncommittedReferenceIds covers the same arms separately but
-		// v8 tracks them per function.
-		it("getReferenceEntriesForBranch filters by branch / commitHash / ignored / guard arms", async () => {
+		it("getReferenceEntriesForBranch returns every registry entry regardless of source", async () => {
+			// References are removed from the registry at commit time, so every
+			// surviving row is an active, uncommitted reference — there is no
+			// branch / commitHash / ignored / guard filtering to apply.
 			await seed({
-				"PROJ-active": {
+				"linear:PROJ-1": {
 					source: "linear",
-					nativeId: "PROJ-active",
-					title: "active",
+					nativeId: "PROJ-1",
+					title: "one",
 					url: "u",
 					sourcePath: "p",
-					branch: "main",
 					addedAt: "x",
 					updatedAt: "x",
-					commitHash: null,
 					sourceToolName: "mcp__linear__get_issue",
 				},
-				"PROJ-otherbranch": {
-					source: "linear",
-					nativeId: "PROJ-otherbranch",
-					title: "other",
+				"jira:KAN-2": {
+					source: "jira",
+					nativeId: "KAN-2",
+					title: "two",
 					url: "u",
 					sourcePath: "p",
-					branch: "feature-b",
 					addedAt: "x",
 					updatedAt: "x",
-					commitHash: null,
-					sourceToolName: "mcp__linear__get_issue",
-				},
-				"PROJ-committed": {
-					source: "linear",
-					nativeId: "PROJ-committed",
-					title: "committed",
-					url: "u",
-					sourcePath: "p",
-					branch: "main",
-					addedAt: "x",
-					updatedAt: "x",
-					commitHash: "deadbeef",
-					sourceToolName: "mcp__linear__get_issue",
-				},
-				"PROJ-ignored": {
-					source: "linear",
-					nativeId: "PROJ-ignored",
-					title: "ignored",
-					url: "u",
-					sourcePath: "p",
-					branch: "main",
-					addedAt: "x",
-					updatedAt: "x",
-					commitHash: null,
-					ignored: true,
-					sourceToolName: "mcp__linear__get_issue",
-				},
-				"PROJ-guard": {
-					source: "linear",
-					nativeId: "PROJ-guard",
-					title: "guard",
-					url: "u",
-					sourcePath: "p",
-					branch: "main",
-					addedAt: "x",
-					updatedAt: "x",
-					commitHash: null,
-					contentHashAtCommit: "fakehash",
-					sourceToolName: "mcp__linear__get_issue",
+					sourceToolName: "mcp__atlassian__getJiraIssue",
 				},
 			});
 
 			const result = await getReferenceEntriesForBranch(tempDir, "main");
 
-			expect(result.map((e) => e.nativeId)).toEqual(["PROJ-active"]);
+			expect(result.map((e) => e.nativeId).sort()).toEqual(["KAN-2", "PROJ-1"]);
 		});
 	});
 
@@ -2042,47 +1862,12 @@ describe("SessionTracker", () => {
 			const reg = await loadPlansRegistry(tempDir);
 			const e = linearIssuesOfReg(reg)?.["PROJ-1528"];
 			expect(e).toBeDefined();
-			expect(e?.commitHash).toBeNull();
-			expect(e?.contentHashAtCommit).toBeUndefined();
-			expect(e?.branch).toBe("main");
 			expect(e?.sourcePath).toContain("PROJ-1528.md");
 			expect(e?.sourceToolName).toBe("mcp__linear__get_issue");
+			expect(e?.title).toBe("Treat referenced Linear issues");
 		});
 
-		it("preserves addedAt, branch, ignored on update of existing uncommitted entry", async () => {
-			await upsertReferenceEntry(ref(), tempDir, "main");
-			const first = await loadPlansRegistry(tempDir);
-			const existing = first.references?.["linear:PROJ-1528"];
-			if (!existing) {
-				throw new Error("test setup invariant: upserted entry missing");
-			}
-			const addedAt = existing.addedAt;
-			// Pretend the user ignored it manually
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: first.plans,
-					references: {
-						...first.references,
-						"linear:PROJ-1528": { ...existing, ignored: true },
-					},
-				},
-				tempDir,
-			);
-			// Second upsert (StopHook re-discovers) should NOT clear ignored, but should be a no-op
-			await upsertReferenceEntry(
-				ref({ title: "new title", referencedAt: "2026-05-14T07:00:00Z" }),
-				tempDir,
-				"main",
-			);
-			const after = await loadPlansRegistry(tempDir);
-			const e = linearIssuesOfReg(after)?.["PROJ-1528"];
-			expect(e?.ignored).toBe(true);
-			expect(e?.title).toBe("Treat referenced Linear issues"); // unchanged because ignored
-			expect(e?.addedAt).toBe(addedAt);
-		});
-
-		it("refreshes title/url/sourceToolName on uncommitted entry without ignored", async () => {
+		it("refreshes title/url/sourceToolName on an existing entry, preserving addedAt", async () => {
 			await upsertReferenceEntry(ref(), tempDir, "main");
 			const before = await loadPlansRegistry(tempDir);
 			const addedAt = linearIssuesOfReg(before)?.["PROJ-1528"]?.addedAt;
@@ -2103,166 +1888,10 @@ describe("SessionTracker", () => {
 			expect(e?.sourceToolName).toBe("mcp__linear__list_issues");
 			expect(e?.addedAt).toBe(addedAt); // preserved
 		});
-
-		it("returns no-op when an existing guard's contentHashAtCommit matches", async () => {
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"linear:PROJ-1528": {
-							source: "linear",
-							nativeId: "PROJ-1528",
-							title: "old",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "2026-01-01T00:00:00Z",
-							updatedAt: "2026-01-01T00:00:00Z",
-							commitHash: "abc1234",
-							contentHashAtCommit: hashReferenceContent(ref({ title: "new title" })),
-							sourceToolName: "mcp__linear__get_issue",
-						},
-					},
-				},
-				tempDir,
-			);
-			await upsertReferenceEntry(ref({ title: "new title" }), tempDir, "main");
-			const after = await loadPlansRegistry(tempDir);
-			expect(linearIssuesOfReg(after)?.["PROJ-1528"]?.title).toBe("old"); // unchanged
-			expect(linearIssuesOfReg(after)?.["PROJ-1528"]?.commitHash).toBe("abc1234");
-		});
-
-		it("replaces a guard entry with a fresh uncommitted one when content hash differs", async () => {
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"linear:PROJ-1528": {
-							source: "linear",
-							nativeId: "PROJ-1528",
-							title: "old",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "2026-01-01T00:00:00Z",
-							updatedAt: "2026-01-01T00:00:00Z",
-							commitHash: "abc1234",
-							contentHashAtCommit: "old-hash",
-							sourceToolName: "mcp__linear__get_issue",
-						},
-					},
-				},
-				tempDir,
-			);
-			await upsertReferenceEntry(ref({ title: "new" }), tempDir, "main");
-			const after = await loadPlansRegistry(tempDir);
-			const e = linearIssuesOfReg(after)?.["PROJ-1528"];
-			expect(e?.title).toBe("new");
-			expect(e?.commitHash).toBeNull();
-			expect(e?.contentHashAtCommit).toBeUndefined();
-		});
-
-		it("creates a fresh entry when an existing one is on a different branch (defensive isolation)", async () => {
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"linear:PROJ-1528": {
-							source: "linear",
-							nativeId: "PROJ-1528",
-							title: "old on feature-a",
-							url: "u",
-							sourcePath: "/p",
-							branch: "feature-a",
-							addedAt: "2026-01-01T00:00:00Z",
-							updatedAt: "2026-01-01T00:00:00Z",
-							commitHash: null,
-							sourceToolName: "mcp__linear__get_issue",
-						},
-					},
-				},
-				tempDir,
-			);
-			// Upsert from a different branch — defensive replacement to a fresh entry on "main"
-			await upsertReferenceEntry(ref({ title: "fresh on main" }), tempDir, "main");
-			const after = await loadPlansRegistry(tempDir);
-			const e = linearIssuesOfReg(after)?.["PROJ-1528"];
-			expect(e?.branch).toBe("main");
-			expect(e?.title).toBe("fresh on main");
-		});
-
-		it("never resurrects an entry whose guard is ignored", async () => {
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"linear:PROJ-1528": {
-							source: "linear",
-							nativeId: "PROJ-1528",
-							title: "old",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "2026-01-01T00:00:00Z",
-							updatedAt: "2026-01-01T00:00:00Z",
-							commitHash: "abc1234",
-							contentHashAtCommit: "old-hash",
-							ignored: true,
-							sourceToolName: "mcp__linear__get_issue",
-						},
-					},
-				},
-				tempDir,
-			);
-			await upsertReferenceEntry(ref({ title: "new" }), tempDir, "main");
-			const after = await loadPlansRegistry(tempDir);
-			expect(linearIssuesOfReg(after)?.["PROJ-1528"]?.title).toBe("old"); // unchanged
-			expect(linearIssuesOfReg(after)?.["PROJ-1528"]?.ignored).toBe(true);
-		});
-	});
-
-	describe("associateReferenceWithCommit", () => {
-		it("updates commitHash on the entry keyed by archivedKey", async () => {
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"PROJ-1528-abc1234": {
-							source: "linear",
-							nativeId: "PROJ-1528",
-							title: "t",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: "abc1234",
-							sourceToolName: "mcp__linear__get_issue",
-						},
-					},
-				},
-				tempDir,
-			);
-			await associateReferenceWithCommit("PROJ-1528-abc1234", "def5678abc", tempDir);
-			const after = await loadPlansRegistry(tempDir);
-			expect(linearIssuesOfReg(after)?.["PROJ-1528-abc1234"]?.commitHash).toBe("def5678abc");
-		});
-
-		it("is a no-op when the archivedKey is not in the registry", async () => {
-			await savePlansRegistry({ version: 1, plans: {}, references: {} }, tempDir);
-			await associateReferenceWithCommit("PROJ-99-zzz", "newhash", tempDir);
-			const after = await loadPlansRegistry(tempDir);
-			expect(linearIssuesOfReg(after)).toEqual({});
-		});
 	});
 
 	describe("detectActivePlansForBranch / detectActiveNotesForBranch", () => {
-		it("returns uncommitted plans for current branch", async () => {
+		it("returns all uncommitted plans regardless of branch", async () => {
 			await savePlansRegistry(
 				{
 					version: 1,
@@ -2271,7 +1900,6 @@ describe("SessionTracker", () => {
 							slug: "plan-1",
 							title: "t",
 							sourcePath: "/p",
-							branch: "main",
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
@@ -2280,27 +1908,16 @@ describe("SessionTracker", () => {
 							slug: "plan-2",
 							title: "t",
 							sourcePath: "/p",
-							branch: "feature",
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
-						},
-						"plan-3": {
-							slug: "plan-3",
-							title: "t",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							ignored: true,
 						},
 					},
 				},
 				tempDir,
 			);
 			const plans = await detectActivePlansForBranch(tempDir, "main");
-			expect(plans.map((p) => p.slug)).toEqual(["plan-1"]);
+			expect(plans.map((p) => p.slug).sort()).toEqual(["plan-1", "plan-2"]);
 		});
 
 		it("detectActivePlansForBranch skips committed and guarded plans (covers commitHash + contentHash filter arms)", async () => {
@@ -2312,7 +1929,6 @@ describe("SessionTracker", () => {
 							slug: "plan-active",
 							title: "active",
 							sourcePath: "/p",
-							branch: "main",
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
@@ -2321,7 +1937,6 @@ describe("SessionTracker", () => {
 							slug: "plan-committed",
 							title: "committed",
 							sourcePath: "/p",
-							branch: "main",
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: "abcdef1234567890",
@@ -2330,7 +1945,6 @@ describe("SessionTracker", () => {
 							slug: "plan-guarded",
 							title: "guarded",
 							sourcePath: "/p",
-							branch: "main",
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
@@ -2356,7 +1970,6 @@ describe("SessionTracker", () => {
 							id: "note-1",
 							title: "t",
 							format: "snippet",
-							branch: "main",
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
@@ -2365,7 +1978,6 @@ describe("SessionTracker", () => {
 							id: "note-2",
 							title: "t",
 							format: "snippet",
-							branch: "main",
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: "abc",
@@ -2400,51 +2012,9 @@ describe("SessionTracker", () => {
 			const entries = await getReferenceEntriesForBranch(tempDir, "main");
 			expect(entries).toEqual([]);
 		});
-
-		it("detectUncommittedReferenceIds filters out entries on other branches (L1058 true arm)", async () => {
-			// Pins the `entry.branch !== branch ? continue` branch at L1058
-			// inside detectUncommittedReferenceIds — the existing
-			// `getReferenceEntriesForBranch` test covers its sibling but not this
-			// one, since the two functions duplicate the filter loop.
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"jira:KAN-main": {
-							source: "jira",
-							nativeId: "KAN-main",
-							title: "main-branch entry",
-							url: "u",
-							sourcePath: "/p1",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							sourceToolName: "test",
-						},
-						"jira:KAN-feature": {
-							source: "jira",
-							nativeId: "KAN-feature",
-							title: "feature-branch entry — should be filtered",
-							url: "u",
-							sourcePath: "/p2",
-							branch: "feature",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							sourceToolName: "test",
-						},
-					},
-				},
-				tempDir,
-			);
-			const ids = await detectUncommittedReferenceIds(tempDir, "main");
-			expect(ids.map((i) => i.mapKey)).toEqual(["jira:KAN-main"]);
-		});
 	});
 
-	describe("upsertReferenceEntry / getReferenceEntriesForBranch / detectUncommittedReferenceIds / setReferenceIgnored", () => {
+	describe("upsertReferenceEntry / getReferenceEntriesForBranch / detectUncommittedReferenceIds", () => {
 		function entityRef(overrides: Partial<Reference> = {}): Reference {
 			return {
 				mapKey: "jira:KAN-5",
@@ -2477,13 +2047,6 @@ describe("SessionTracker", () => {
 			expect(entries.map((e) => e.source).sort()).toEqual(["jira", "linear"]);
 		});
 
-		it("filters out entries on other branches", async () => {
-			await upsertReferenceEntry(entityRef(), tempDir, "main");
-			await upsertReferenceEntry(entityRef({ mapKey: "jira:KAN-6", nativeId: "KAN-6" }), tempDir, "feature");
-			const main = await getReferenceEntriesForBranch(tempDir, "main");
-			expect(main.map((e) => e.nativeId)).toEqual(["KAN-5"]);
-		});
-
 		it("detectUncommittedReferenceIds returns {mapKey, source, sourcePath} triples", async () => {
 			await upsertReferenceEntry(entityRef(), tempDir, "main");
 			const ids = await detectUncommittedReferenceIds(tempDir, "main");
@@ -2492,191 +2055,7 @@ describe("SessionTracker", () => {
 			expect(ids[0]?.sourcePath).toContain(join("references", "jira", "KAN-5.md"));
 		});
 
-		it("setReferenceIgnored hides the entry from getReferenceEntriesForBranch and unflag restores it", async () => {
-			await upsertReferenceEntry(entityRef(), tempDir, "main");
-			await setReferenceIgnored(tempDir, "jira:KAN-5", true);
-			expect(await getReferenceEntriesForBranch(tempDir, "main")).toEqual([]);
-			await setReferenceIgnored(tempDir, "jira:KAN-5", false);
-			const back = await getReferenceEntriesForBranch(tempDir, "main");
-			expect(back).toHaveLength(1);
-		});
-
-		it("setReferenceIgnored is a no-op when the mapKey is unknown", async () => {
-			await setReferenceIgnored(tempDir, "jira:nope", true);
-			// Should not throw and should not write a stub entry.
-			expect(await getReferenceEntriesForBranch(tempDir, "main")).toEqual([]);
-		});
-
-		it("upsertReferenceEntry is a no-op when the existing guard entry is also ignored", async () => {
-			// Pins the `if (existing.ignored) return;` arm inside the guard-branch
-			// of upsertReferenceEntry (line 1082). Without this, an ignored guard
-			// silently gets replaced by a fresh uncommitted row — the opposite
-			// of what `ignored` is supposed to mean.
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"jira:KAN-5": {
-							source: "jira",
-							nativeId: "KAN-5",
-							title: "guarded-and-ignored",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: "deadbeef",
-							contentHashAtCommit: "old-hash",
-							ignored: true,
-							sourceToolName: "mcp__atlassian__getJiraIssue",
-						},
-					},
-				},
-				tempDir,
-			);
-			await upsertReferenceEntry(entityRef({ title: "new" }), tempDir, "main");
-			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 1) return;
-			expect(after.references?.["jira:KAN-5"]?.title).toBe("guarded-and-ignored");
-			expect(after.references?.["jira:KAN-5"]?.ignored).toBe(true);
-		});
-
-		it("getReferenceEntriesForBranch skips committed / guard / ignored entries", async () => {
-			// Pins the three true arms inside getReferenceEntriesForBranch (lines
-			// 1032-1034) that "filters out entries on other branches" doesn't
-			// reach because that test only filters by branch.
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"jira:KAN-active": {
-							source: "jira",
-							nativeId: "KAN-active",
-							title: "active",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							sourceToolName: "test",
-						},
-						"jira:KAN-committed": {
-							source: "jira",
-							nativeId: "KAN-committed",
-							title: "committed",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: "deadbeef",
-							sourceToolName: "test",
-						},
-						"jira:KAN-guard": {
-							source: "jira",
-							nativeId: "KAN-guard",
-							title: "guard",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							contentHashAtCommit: "h",
-							sourceToolName: "test",
-						},
-						"jira:KAN-ignored": {
-							source: "jira",
-							nativeId: "KAN-ignored",
-							title: "ignored",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							ignored: true,
-							sourceToolName: "test",
-						},
-					},
-				},
-				tempDir,
-			);
-			const entries = await getReferenceEntriesForBranch(tempDir, "main");
-			expect(entries.map((e) => e.nativeId)).toEqual(["KAN-active"]);
-		});
-
-		it("detectUncommittedReferenceIds skips entries with commitHash / contentHashAtCommit / ignored", async () => {
-			// Pins the three true arms inside detectUncommittedReferenceIds (lines
-			// 1053-1055) that "filters out entries on other branches" doesn't
-			// reach because that test only filters by branch.
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"jira:KAN-active": {
-							source: "jira",
-							nativeId: "KAN-active",
-							title: "active",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							sourceToolName: "test",
-						},
-						"jira:KAN-committed": {
-							source: "jira",
-							nativeId: "KAN-committed",
-							title: "committed",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: "deadbeef",
-							sourceToolName: "test",
-						},
-						"jira:KAN-guard": {
-							source: "jira",
-							nativeId: "KAN-guard",
-							title: "guard",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							contentHashAtCommit: "h",
-							sourceToolName: "test",
-						},
-						"jira:KAN-ignored": {
-							source: "jira",
-							nativeId: "KAN-ignored",
-							title: "ignored",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							ignored: true,
-							sourceToolName: "test",
-						},
-					},
-				},
-				tempDir,
-			);
-			const ids = await detectUncommittedReferenceIds(tempDir, "main");
-			expect(ids.map((x) => x.mapKey)).toEqual(["jira:KAN-active"]);
-		});
-
-		it("upsertReferenceEntry refreshes title/url on an uncommitted same-branch entry (updated log path)", async () => {
+		it("upsertReferenceEntry refreshes title/url on an uncommitted entry (updated log path)", async () => {
 			// Pins the `existing === undefined ? "new" : "updated"` ternary's
 			// "updated" arm in upsertReferenceEntry's log line, plus the
 			// canRefreshUncommitted branch above it.
@@ -2685,195 +2064,6 @@ describe("SessionTracker", () => {
 			const entries = await getReferenceEntriesForBranch(tempDir, "main");
 			expect(entries).toHaveLength(1);
 			expect(entries[0]?.title).toBe("renamed");
-		});
-
-		it("upsertReferenceEntry is a no-op when an existing uncommitted entry is ignored", async () => {
-			// Seed an uncommitted (commitHash:null, no contentHashAtCommit) entry with ignored:true.
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"jira:KAN-5": {
-							source: "jira",
-							nativeId: "KAN-5",
-							title: "old",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							ignored: true,
-							sourceToolName: "mcp__atlassian__getJiraIssue",
-						},
-					},
-				},
-				tempDir,
-			);
-			await upsertReferenceEntry(entityRef({ title: "new" }), tempDir, "main");
-			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 1) return;
-			expect(after.references?.["jira:KAN-5"]?.title).toBe("old"); // unchanged
-			expect(after.references?.["jira:KAN-5"]?.ignored).toBe(true);
-		});
-
-		it("upsertReferenceEntry replaces a guard entry when the content hash differs", async () => {
-			// Pins the `existing.contentHashAtCommit === contentHash` false arm in
-			// upsertReferenceEntry, plus the guard → fresh-uncommitted replacement
-			// path below it.
-			await upsertReferenceEntry(entityRef(), tempDir, "main");
-			const reg = await loadPlansRegistry(tempDir);
-			if (reg.version !== 1) return;
-			const existing = reg.references?.["jira:KAN-5"];
-			if (!existing) throw new Error("seed missing");
-			await savePlansRegistry(
-				{
-					...reg,
-					references: {
-						...(reg.references ?? {}),
-						"jira:KAN-5": {
-							...existing,
-							commitHash: "deadbeef",
-							contentHashAtCommit: "stale-hash-from-old-content",
-						},
-					},
-				},
-				tempDir,
-			);
-			await upsertReferenceEntry(entityRef({ title: "rewritten" }), tempDir, "main");
-			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 1) return;
-			const e = after.references?.["jira:KAN-5"];
-			// Replacement → fresh uncommitted entry: commitHash null, no guard hash.
-			expect(e?.commitHash).toBeNull();
-			expect(e?.contentHashAtCommit).toBeUndefined();
-			expect(e?.title).toBe("rewritten");
-		});
-
-		it("upsertReferenceEntry preserves the guard when the contentHash matches", async () => {
-			// Compute the canonical contentHash for the seed ref so the synthetic
-			// guard we install below actually round-trips against what the next
-			// upsert will compute internally.
-			const seedRef = entityRef();
-			const guardHash = hashReferenceContent(seedRef);
-			// First, write the markdown so the file exists at the canonical path.
-			await upsertReferenceEntry(seedRef, tempDir, "main");
-			// Promote the entry to guard state (simulate post-archive).
-			const reg = await loadPlansRegistry(tempDir);
-			expect(reg.version).toBe(1);
-			if (reg.version !== 1) return;
-			const existing = reg.references?.["jira:KAN-5"];
-			expect(existing).toBeDefined();
-			if (!existing) return;
-			await savePlansRegistry(
-				{
-					...reg,
-					references: {
-						...(reg.references ?? {}),
-						"jira:KAN-5": {
-							...existing,
-							commitHash: "deadbeef",
-							contentHashAtCommit: guardHash,
-						},
-					},
-				},
-				tempDir,
-			);
-			// Upsert with a different MCP timestamp but same content — should be a no-op
-			// because hashReferenceContent strips referencedAt before hashing.
-			await upsertReferenceEntry(entityRef({ referencedAt: "2027-01-01T00:00:00Z" }), tempDir, "main");
-			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 1) return;
-			expect(after.references?.["jira:KAN-5"]?.commitHash).toBe("deadbeef");
-		});
-	});
-
-	describe("associateReferenceWithCommit", () => {
-		it("updates commitHash on the archived snapshot entry", async () => {
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"jira:KAN-5-abc12345": {
-							source: "jira",
-							nativeId: "KAN-5",
-							title: "t",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: "abc12345",
-							sourceToolName: "mcp__atlassian__getJiraIssue",
-						},
-					},
-				},
-				tempDir,
-			);
-			await associateReferenceWithCommit("jira:KAN-5-abc12345", "deadbeef1234567890", tempDir);
-			const reg = await loadPlansRegistry(tempDir);
-			if (reg.version !== 1) return;
-			expect(reg.references?.["jira:KAN-5-abc12345"]?.commitHash).toBe("deadbeef1234567890");
-		});
-
-		it("is a no-op when the archivedKey is unknown", async () => {
-			await savePlansRegistry({ version: 1, plans: {}, references: {} }, tempDir);
-			await associateReferenceWithCommit("jira:NOPE-1-abc12345", "newhash", tempDir);
-			const reg = await loadPlansRegistry(tempDir);
-			if (reg.version !== 1) return;
-			expect(reg.references).toEqual({});
-		});
-
-		it("also migrates the guard's commitHash when archive form matches the guard's old shortHash", async () => {
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"jira:KAN-5": {
-							source: "jira",
-							nativeId: "KAN-5",
-							title: "guard",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: "abc12345",
-							contentHashAtCommit: "guard-hash",
-							sourceToolName: "mcp__atlassian__getJiraIssue",
-						},
-						"jira:KAN-5-abc12345": {
-							source: "jira",
-							nativeId: "KAN-5",
-							title: "snapshot",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: "abc12345",
-							sourceToolName: "mcp__atlassian__getJiraIssue",
-						},
-					},
-				},
-				tempDir,
-			);
-			await associateReferenceWithCommit("jira:KAN-5-abc12345", "newhash", tempDir);
-			const reg = await loadPlansRegistry(tempDir);
-			if (reg.version !== 1) return;
-			expect(reg.references?.["jira:KAN-5-abc12345"]?.commitHash).toBe("newhash");
-			// Guard also migrates because guard.commitHash starts with the old shortHash.
-			expect(reg.references?.["jira:KAN-5"]?.commitHash).toBe("newhash");
-		});
-	});
-
-	describe("referencePath", () => {
-		it("returns the canonical <jolliMemoryDir>/references/<source>/<key>.md path", () => {
-			const p = referencePath(tempDir, "jira", "KAN-5");
-			expect(p).toContain(join(".jolli", "jollimemory", "references", "jira", "KAN-5.md"));
 		});
 	});
 
@@ -2907,10 +2097,8 @@ describe("SessionTracker", () => {
 							title: "active jira",
 							url: "u",
 							sourcePath: "/p",
-							branch: "main",
 							addedAt: "x",
 							updatedAt: "x",
-							commitHash: null,
 							sourceToolName: "test",
 						},
 					},
@@ -2919,36 +2107,6 @@ describe("SessionTracker", () => {
 			);
 			const ids = await detectUncommittedReferenceIds(tempDir, "main");
 			expect(ids.map((i) => i.mapKey)).toEqual(["jira:KAN-5"]);
-		});
-
-		it("detectUncommittedReferenceIds filters out a contentHashAtCommit guard whose commitHash is null", async () => {
-			// Pins the `entry.contentHashAtCommit !== undefined` true arm — a
-			// guard whose commitHash hasn't yet been backfilled by an associate
-			// (commitHash:null + contentHashAtCommit defined) must still be
-			// considered "no longer uncommitted" by the legacy detector.
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"linear:PROJ-guard": {
-							source: "linear",
-							nativeId: "PROJ-guard",
-							title: "g",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							contentHashAtCommit: "synthetic",
-							sourceToolName: "test",
-						},
-					},
-				},
-				tempDir,
-			);
-			expect(await detectUncommittedReferenceIds(tempDir, "main")).toEqual([]);
 		});
 
 		it("tolerates a references row with a bare (no `linear:` prefix) map key", async () => {
@@ -2965,10 +2123,8 @@ describe("SessionTracker", () => {
 							title: "bare",
 							url: "u",
 							sourcePath: "/p",
-							branch: "main",
 							addedAt: "x",
 							updatedAt: "x",
-							commitHash: null,
 							sourceToolName: "mcp__linear__get_issue",
 						},
 					},
@@ -3013,64 +2169,6 @@ describe("SessionTracker", () => {
 				tempDir,
 				"main",
 			);
-			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 1) return;
-			expect(after.notes?.["note-1"]).toBeDefined();
-		});
-
-		it("setReferenceIgnored preserves the notes section", async () => {
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"jira:KAN-5": {
-							source: "jira",
-							nativeId: "KAN-5",
-							title: "t",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: null,
-							sourceToolName: "test",
-						},
-					},
-					notes: seedNotes,
-				},
-				tempDir,
-			);
-			await setReferenceIgnored(tempDir, "jira:KAN-5", true);
-			const after = await loadPlansRegistry(tempDir);
-			if (after.version !== 1) return;
-			expect(after.notes?.["note-1"]).toBeDefined();
-		});
-
-		it("associateReferenceWithCommit preserves the notes section", async () => {
-			await savePlansRegistry(
-				{
-					version: 1,
-					plans: {},
-					references: {
-						"jira:KAN-5-abc12345": {
-							source: "jira",
-							nativeId: "KAN-5",
-							title: "t",
-							url: "u",
-							sourcePath: "/p",
-							branch: "main",
-							addedAt: "x",
-							updatedAt: "x",
-							commitHash: "abc12345",
-							sourceToolName: "test",
-						},
-					},
-					notes: seedNotes,
-				},
-				tempDir,
-			);
-			await associateReferenceWithCommit("jira:KAN-5-abc12345", "newhash", tempDir);
 			const after = await loadPlansRegistry(tempDir);
 			if (after.version !== 1) return;
 			expect(after.notes?.["note-1"]).toBeDefined();

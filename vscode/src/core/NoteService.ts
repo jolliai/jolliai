@@ -18,6 +18,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import { isPathInside } from "../../../cli/src/core/PathUtils.js";
 import {
 	loadPlansRegistry,
 	savePlansRegistry,
@@ -28,7 +29,6 @@ import { getJolliMemoryDir } from "../../../cli/src/Logger.js";
 import type { NoteFormat, NoteReference } from "../../../cli/src/Types.js";
 import type { NoteEntry, NoteInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
-import { getCurrentBranch } from "./PlanService.js";
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -44,10 +44,9 @@ export async function detectNotes(cwd: string): Promise<Array<NoteInfo>> {
 	const registry = await loadPlansRegistry(cwd);
 	const notes = registry.notes ?? {};
 
-	const branch = getCurrentBranch(cwd);
 	const result: Array<NoteInfo> = [];
 	for (const entry of Object.values(notes)) {
-		const info = toNoteInfo(entry, branch);
+		const info = toNoteInfo(entry);
 		if (info) {
 			result.push(info);
 		}
@@ -116,7 +115,6 @@ export async function saveNote(
 		sourcePath,
 		addedAt: existingNotes[noteId]?.addedAt ?? now,
 		updatedAt: now,
-		branch: getCurrentBranch(cwd),
 		commitHash: existingNotes[noteId]?.commitHash ?? null,
 	};
 
@@ -131,24 +129,14 @@ export async function saveNote(
 }
 
 /**
- * Marks a note as ignored in plans.json (hidden from panel).
- */
-export async function ignoreNote(id: string, cwd: string): Promise<void> {
-	const registry = await loadPlansRegistry(cwd);
-	const notes = { ...(registry.notes ?? {}) };
-	const entry = notes[id];
-	if (!entry) {
-		return;
-	}
-
-	notes[id] = { ...entry, ignored: true };
-	await savePlansRegistry({ ...registry, notes }, cwd);
-}
-
-/**
- * Removes a note: deletes the file for uncommitted notes, marks as ignored for committed ones.
- * Uncommitted notes have their source file in .jolli/jollimemory/notes/ — safe to delete.
- * Committed notes keep the file (orphan branch has the archive copy).
+ * Hard-removes a note: deletes the registry entry, and deletes the backing file
+ * ONLY when it lives inside the per-project `.jolli/jollimemory/` directory
+ * (snippet notes). Markdown notes reference the user's external file — never
+ * deleted. Same internal/external rule as `PlanService.removePlan` /
+ * `ReferenceService.removeReference`, expressed via `isPathInside`.
+ *
+ * Idempotent: an unknown id is a no-op. Committed notes whose snippet file was
+ * already cleaned up by `archiveNoteForCommit` simply skip the file delete.
  */
 export async function removeNote(id: string, cwd: string): Promise<void> {
 	const registry = await loadPlansRegistry(cwd);
@@ -158,23 +146,21 @@ export async function removeNote(id: string, cwd: string): Promise<void> {
 		return;
 	}
 
-	// Delete source file only for snippet notes (which we created in the notes dir).
-	// Markdown notes reference the user's original file — never delete it.
+	// Delete the backing file only when it is inside .jolli/jollimemory/ — the
+	// user's external markdown sources are never deleted.
 	if (
-		entry.commitHash === null &&
-		entry.format === "snippet" &&
 		entry.sourcePath &&
+		isPathInside(entry.sourcePath, getJolliMemoryDir(cwd)) &&
 		existsSync(entry.sourcePath)
 	) {
 		try {
 			unlinkSync(entry.sourcePath);
-			log.info("notes", `Deleted snippet file: ${entry.sourcePath}`);
+			log.info("notes", `Deleted note file: ${entry.sourcePath}`);
 		} catch {
 			/* ignore — file deletion is best-effort */
 		}
 	}
 
-	// Remove from registry entirely (not just ignored)
 	delete notes[id];
 	await savePlansRegistry({ ...registry, notes }, cwd);
 	log.info("notes", `Removed note ${id} from registry`);
@@ -216,23 +202,14 @@ export async function archiveNoteForCommit(
 		.update(noteContent)
 		.digest("hex");
 
-	// Update registry: original id becomes guard, new id is the committed entry
+	// Update registry: the original id becomes the guard. No
+	// `<id>-<shortHash>` archive row — the orphan-branch snapshot (stored under
+	// newId below) + the CommitSummary NoteReference are the system of record.
 	notes[id] = {
 		...entry,
 		commitHash,
 		updatedAt: now,
 		contentHashAtCommit,
-		ignored: undefined,
-	};
-	notes[newId] = {
-		id: newId,
-		title: entry.title,
-		format: entry.format,
-		sourcePath: entry.sourcePath,
-		addedAt: entry.addedAt,
-		updatedAt: now,
-		branch: entry.branch,
-		commitHash,
 	};
 	await savePlansRegistry({ ...registry, notes }, cwd);
 
@@ -274,25 +251,6 @@ export async function archiveNoteForCommit(
 }
 
 /**
- * Removes a note's association with a commit.
- */
-export async function unassociateNoteFromCommit(
-	id: string,
-	cwd: string,
-): Promise<void> {
-	const registry = await loadPlansRegistry(cwd);
-	const notes = { ...(registry.notes ?? {}) };
-	const entry = notes[id];
-	if (!entry) {
-		return;
-	}
-
-	notes[id] = { ...entry, commitHash: null };
-	await savePlansRegistry({ ...registry, notes }, cwd);
-	log.info("notes", `Unassociated note ${id} from commit`);
-}
-
-/**
  * Lists unassociated notes for WebView QuickPick.
  */
 export async function listUnassociatedNotes(
@@ -301,7 +259,7 @@ export async function listUnassociatedNotes(
 	const registry = await loadPlansRegistry(cwd);
 	const notes = registry.notes ?? {};
 	return Object.values(notes)
-		.filter((n) => n.commitHash === null && !n.ignored)
+		.filter((n) => n.commitHash === null)
 		.map((n) => ({ id: n.id, title: n.title, format: n.format }));
 }
 
@@ -321,16 +279,7 @@ export function generateNoteSlug(title: string): string {
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
 /** Converts a NoteEntry to NoteInfo, returning null if the entry should be hidden. */
-function toNoteInfo(entry: NoteEntry, currentBranch?: string): NoteInfo | null {
-	if (entry.ignored) {
-		return null;
-	}
-
-	// Skip entries from other branches
-	if (currentBranch && entry.branch && entry.branch !== currentBranch) {
-		return null;
-	}
-
+function toNoteInfo(entry: NoteEntry): NoteInfo | null {
 	// Skip archive guards (content unchanged)
 	if (entry.contentHashAtCommit) {
 		const currentContent = getNoteContent(entry);
@@ -384,7 +333,6 @@ function toNoteInfo(entry: NoteEntry, currentBranch?: string): NoteInfo | null {
 		lastModified,
 		addedAt: entry.addedAt,
 		updatedAt: entry.updatedAt,
-		branch: entry.branch,
 		commitHash: entry.commitHash,
 		filename: entry.sourcePath ? basename(entry.sourcePath) : undefined,
 		filePath: entry.sourcePath,

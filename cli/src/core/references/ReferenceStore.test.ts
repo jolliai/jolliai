@@ -5,11 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { Reference } from "../../Types.js";
 import {
+	deleteReferenceMarkdown,
 	hashReferenceContent,
 	readReferenceMarkdown,
 	referenceDir,
 	referencePath,
-	renameReferenceMarkdown,
 	sanitizeNativeIdForPath,
 	writeReferenceMarkdown,
 } from "./ReferenceStore.js";
@@ -454,19 +454,16 @@ describe("ReferenceStore", () => {
 		});
 	});
 
-	describe("renameReferenceMarkdown", () => {
-		it("renames a file in place", async () => {
-			const a = join(tempDir, "a.md");
-			const b = join(tempDir, "b.md");
-			await writeFile(a, "content", "utf-8");
-			await renameReferenceMarkdown(a, b);
-			expect(await readFile(b, "utf-8")).toBe("content");
+	describe("deleteReferenceMarkdown", () => {
+		it("deletes an existing reference markdown file", async () => {
+			const p = join(tempDir, "del.md");
+			await writeFile(p, "content", "utf-8");
+			await deleteReferenceMarkdown(p);
+			await expect(stat(p)).rejects.toThrow();
 		});
 
-		it("throws when source file does not exist", async () => {
-			await expect(
-				renameReferenceMarkdown(join(tempDir, "missing.md"), join(tempDir, "out.md")),
-			).rejects.toThrow();
+		it("does not throw when the file is already gone (force)", async () => {
+			await expect(deleteReferenceMarkdown(join(tempDir, "never-existed.md"))).resolves.toBeUndefined();
 		});
 	});
 

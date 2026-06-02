@@ -17,7 +17,7 @@
  *
  * `getJiraIssue` may also wrap the payload as `{issues:{totalCount,nodes:[…]}}`
  * — the outer wrapper is an object, the inner `nodes` is an array. The
- * extractor's `walkPayload` (Task 3.1) descends into both shapes, so this
+ * extractor's `walkPayload` descends into both shapes, so this
  * adapter only needs to parse the leaf issue object.
  *
  * Field mapping (Jira → Reference):
@@ -29,7 +29,7 @@
  *   - `fields.labels` (string[]) → `labels` (optional, non-empty filtered)
  *   - `fields.description` → `description` (optional)
  *
- * Adapter modules MUST NOT share helpers across sources (per plan §Constraints).
+ * Adapter modules MUST NOT share helpers across sources.
  * Field readers below intentionally duplicate the shape of LinearAdapter helpers
  * rather than reusing them.
  */

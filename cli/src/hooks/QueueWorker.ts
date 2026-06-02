@@ -40,18 +40,11 @@ import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeS
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
-import {
-	hashReferenceContent,
-	readReferenceMarkdown,
-	referencePath,
-	renameReferenceMarkdown,
-	sanitizeNativeIdForPath,
-} from "../core/references/ReferenceStore.js";
+import { deleteReferenceMarkdown, readReferenceMarkdown } from "../core/references/ReferenceStore.js";
 import { ALL_ADAPTERS } from "../core/references/sources/index.js";
 import {
 	associateNoteWithCommit,
 	associatePlanWithCommit,
-	associateReferenceWithCommit,
 	deleteQueueEntry,
 	dequeueAllGitOperations,
 	detectActiveNotesForBranch,
@@ -168,22 +161,9 @@ async function reassociateMetadata(
 				await associateNoteWithCommit(noteRef.id, newHash, cwd);
 			}
 		}
-
-		const referenceRefs: ReferenceCommitRef[] = [];
-		const seen = new Set<string>();
-		if (oldSummary.references) {
-			for (const ref of oldSummary.references) {
-				if (seen.has(ref.archivedKey)) continue;
-				seen.add(ref.archivedKey);
-				referenceRefs.push(ref);
-			}
-		}
-		for (const ref of referenceRefs) {
-			// archivedKey on references is the prefixed `<source>:<nativeId>-<shortHash>`
-			// form. associateReferenceWithCommit looks the row up by archivedKey
-			// in plans.json.references — single update per row.
-			await associateReferenceWithCommit(ref.archivedKey, newHash, cwd);
-		}
+		// References have no plans.json guard row (commit deletes the entry),
+		// so there's nothing to re-anchor on squash/rebase — the CommitSummary's
+		// ReferenceCommitRef travels with the orphan-branch storeReferences flow.
 	}
 }
 
@@ -532,12 +512,9 @@ async function detectPlanSlugsFromRegistry(cwd: string, branch: string): Promise
 	const registry = await loadPlansRegistry(cwd);
 	const slugs = new Set<string>();
 	for (const [slug, entry] of Object.entries(registry.plans)) {
-		// branch filter is load-bearing: without it, uncommitted plans from OTHER
-		// branches get falsely associated with the current commit (observed bug:
-		// cross-branch plans archived to feature/linear-issues-as-panel-item's
-		// 786c5330 even though their entry.branch said feature/summarize-include-linear-issues).
-		if (entry.branch !== branch) continue;
-		if (entry.ignored) continue;
+		// No branch filter — uncommitted plans bind to the current worktree
+		// (its own plans.json) and commit associates all of them. Cross-worktree
+		// leakage is impossible because each worktree has a separate plans.json.
 		if (entry.commitHash === null && !entry.contentHashAtCommit) {
 			slugs.add(slug);
 			continue;
@@ -605,18 +582,12 @@ async function associatePlansWithCommit(
 			log.info("Plan association: slug %s not in registry — skipping", slug);
 			continue;
 		}
-		// Skip if ignored, or if the entry is a per-commit archive snapshot
-		// (commitHash set but no contentHashAtCommit — these are the
-		// `slug-<shortHash>` artifacts, not user-facing working-area rows).
-		// Guard entries (commitHash + contentHashAtCommit) are deliberately
-		// NOT skipped here: detectPlanSlugsFromRegistry only forwards them
-		// when their source file diverged from the guard hash, which means
-		// the user iterated on the plan and we need to re-archive the new
-		// content under this commit.
-		if (entry.ignored) {
-			log.info("Plan association: slug %s is ignored — skipping", slug);
-			continue;
-		}
+		// Skip per-commit archive snapshots (commitHash set but no
+		// contentHashAtCommit — the `slug-<shortHash>` artifacts, not user-facing
+		// working-area rows). Guard entries (commitHash + contentHashAtCommit) are
+		// deliberately NOT skipped here: detectPlanSlugsFromRegistry only forwards
+		// them when their source file diverged from the guard hash, which means the
+		// user iterated on the plan and we need to re-archive the new content.
 		if (entry.commitHash !== null && !entry.contentHashAtCommit) {
 			log.info(
 				"Plan association: slug %s is an archive snapshot for %s — skipping",
@@ -662,9 +633,12 @@ async function associatePlansWithCommit(
 		markdownBySlug.set(newSlug, content);
 		originalSlugBySlug.set(newSlug, slug);
 
-		// Archive in plans.json:
-		// 1. Original slug entry becomes guard (contentHashAtCommit for detecting file overwrites)
-		// 2. New entry keyed by newSlug (the committed plan)
+		// Archive in plans.json: the original slug entry becomes the guard
+		// (contentHashAtCommit detects later file overwrites → revival).
+		// No per-commit `<slug>-<shortHash>` archive row is written — the
+		// orphan-branch snapshot (stored under newSlug below) + the CommitSummary
+		// PlanReference are the system of record; the archive row was a redundant
+		// plans.json copy the sidebar never showed.
 		const updatedRegistry = await loadPlansRegistry(cwd);
 		const guardEntry = {
 			...entry,
@@ -672,22 +646,12 @@ async function associatePlansWithCommit(
 			contentHashAtCommit: contentHash,
 			updatedAt: nowStr,
 		};
-		const archivedEntry = {
-			slug: newSlug,
-			title,
-			sourcePath: entry.sourcePath,
-			addedAt: entry.addedAt,
-			updatedAt: nowStr,
-			branch: entry.branch,
-			commitHash: commitHash,
-		};
 		await savePlansRegistry(
 			{
 				...updatedRegistry,
 				plans: {
 					...updatedRegistry.plans,
 					[slug]: guardEntry,
-					[newSlug]: archivedEntry,
 				},
 			},
 			cwd,
@@ -717,12 +681,8 @@ async function detectUncommittedNoteIds(cwd: string, branch: string): Promise<Se
 	const registry = await loadPlansRegistry(cwd);
 	const ids = new Set<string>();
 	for (const [id, entry] of Object.entries(registry.notes ?? {})) {
-		// branch filter mirrors detectPlanSlugsFromRegistry / detectUncommittedLinearIssueIds
-		// — without it, notes from another branch would be wrongly associated with
-		// the current commit on commit. See the cross-branch leak documented at
-		// detectPlanSlugsFromRegistry above.
-		if (entry.branch !== branch) continue;
-		if (entry.ignored) continue;
+		// No branch filter — notes bind to the current worktree; commit
+		// associates all uncommitted ones (per-worktree plans.json isolates).
 		if (entry.commitHash === null && !entry.contentHashAtCommit) {
 			ids.add(id);
 			continue;
@@ -794,25 +754,15 @@ async function associateNotesWithCommit(
 		// Store under new id in orphan branch
 		noteFiles.push({ id: newId, content });
 
-		// Archive in accumulated notes:
-		// 1. Original id entry becomes guard (contentHashAtCommit for detecting file overwrites)
-		// 2. New entry keyed by newId (the committed note)
+		// Archive: the original id entry becomes the guard (contentHashAtCommit
+		// detects later overwrites → revival). No `<id>-<shortHash>` archive
+		// row — the orphan-branch snapshot (stored under newId below) + the
+		// CommitSummary NoteReference are the system of record.
 		updatedNotes[id] = {
 			...entry,
 			commitHash,
 			updatedAt: now2,
 			contentHashAtCommit: contentHash,
-			ignored: undefined,
-		};
-		updatedNotes[newId] = {
-			id: newId,
-			title: entry.title,
-			format: entry.format,
-			sourcePath: entry.sourcePath,
-			addedAt: entry.addedAt,
-			updatedAt: now2,
-			branch: entry.branch,
-			commitHash,
 		};
 		log.info("Note archived: %s → %s (hash=%s)", id, newId, contentHash.substring(0, 12));
 	}
@@ -838,10 +788,10 @@ async function associateNotesWithCommit(
  * Return shape for {@link associateReferencesWithCommit}.
  *
  * `refs` are the post-archive snapshots stored on `CommitSummary.references`.
- * `filesToStore` are the RAW markdown bytes captured BEFORE the local rename —
- * the caller passes them straight to `SummaryStore.storeReferences` so the
- * orphan-branch snapshot is independent of whether the local rename succeeded.
- * Mirrors the historical Linear-only filesToStore handoff pattern.
+ * `filesToStore` are the RAW markdown bytes read from the active path — the
+ * caller passes them straight to `SummaryStore.storeReferences` so the
+ * orphan-branch snapshot is the system of record (no local archived
+ * copy). Mirrors the historical Linear-only filesToStore handoff pattern.
  */
 export interface AssociateReferencesResult {
 	readonly refs: ReadonlyArray<ReferenceCommitRef>;
@@ -853,24 +803,20 @@ export interface AssociateReferencesResult {
  * Linear / Jira / GitHub / Notion entries through a single archive pipeline:
  *
  *   1. For each `{mapKey, source, sourcePath}` triple, read the raw markdown
- *      bytes BEFORE the rename so the orphan-branch snapshot does not depend
- *      on rename success.
- *   2. Build the dual `plans.json.references` entry — `mapKey` becomes a guard
- *      (`contentHashAtCommit` + `commitHash` set, `sourcePath` UNCHANGED so
- *      the next StopHook upsert of the same mapKey writes back into the same
- *      active path), and `archivedKey = "<mapKey>-<shortHash>"` becomes a
- *      snapshot row with explicit fields (no `...entry` spread, no
- *      `contentHashAtCommit` / `ignored` inherited).
- *   3. Physically rename the active markdown from `referencePath(active)` to
- *      `referencePath(archived)`. On failure log.warn and continue — the guard
- *      is already written and the archived entry's sourcePath points at the
- *      archived location even if no file lives there; Regenerator reads from
- *      the orphan branch (where `storeReferences` already received the raw
- *      pre-rename content).
- *   4. Near-write reread + merge: reload plans.json AT THE END and overwrite
- *      ONLY the specific mapKey + archivedKey pairs this call touched. Any
- *      concurrent StopHook upsert / ignoreReference command that ran during this
- *      archive is preserved.
+ *      bytes so the orphan-branch snapshot does not depend on the local file.
+ *   2. Promote the `mapKey` entry to a guard in `plans.json.references`:
+ *      `contentHashAtCommit` + `commitHash` are set and `sourcePath` is left
+ *      UNCHANGED so the next StopHook upsert of the same mapKey writes back
+ *      into the same active path. No per-commit snapshot row is created
+ *      and the active markdown is NOT physically renamed — the orphan-branch
+ *      snapshot (filesToStore: raw bytes keyed by `archivedKey =
+ *      "<mapKey>-<shortHash>"`) plus the CommitSummary ReferenceCommitRef are
+ *      the system of record, so no local archived copy is needed and the
+ *      guard's sourcePath never dangles.
+ *   3. Near-write reread + merge: reload plans.json AT THE END and overwrite
+ *      ONLY the specific mapKeys this call touched. Any concurrent StopHook
+ *      upsert / ignoreReference command that ran during this archive is
+ *      preserved.
  *
  * The function does NOT call `storeReferences` itself — that responsibility
  * stays with the caller (executePipeline / amend fresh-leaf) because the
@@ -886,7 +832,6 @@ async function associateReferencesWithCommit(
 	if (ids.length === 0) return { refs: [], filesToStore: [] };
 
 	const shortHash = commitHash.substring(0, 8);
-	const now = new Date().toISOString();
 	const refs: ReferenceCommitRef[] = [];
 	const filesToStore: Array<{ archivedKey: string; source: SourceId; content: string }> = [];
 
@@ -895,6 +840,9 @@ async function associateReferencesWithCommit(
 		/* v8 ignore next -- `?? {}` fallback unreachable: `ids` is sourced from detectUncommittedReferenceIds, which derives from plans.json.references; if references were undefined ids would be empty and the early-return would have already fired. */
 		...(registry.references ?? {}),
 	};
+	// mapKeys successfully archived this run — deleted from plans.json in the
+	// merge-save below (reference commit removes the entry; no guard row survives).
+	const committedMapKeys = new Set<string>();
 	const droppedMapKeys: string[] = [];
 
 	for (const { mapKey, source } of ids) {
@@ -936,61 +884,15 @@ async function associateReferencesWithCommit(
 			continue;
 		}
 
-		const contentHashAtCommit = hashReferenceContent(fullRef);
 		const archivedKey = `${mapKey}-${shortHash}`;
-		// Bare archive form for the on-disk filename. `source:<nativeId>` is the
-		// registry key; the file stem is `<nativeId>-<shortHash>` (Linear / Jira /
-		// Notion are identity under sanitizeNativeIdForPath; GitHub rewrites
-		// `owner/repo#n` to a path-safe stem). referencePath does NOT sanitize, so
-		// we must do it here — and we sanitize the whole `<nativeId>-<shortHash>`
-		// string so this matches orphanPathFor's stem byte-for-byte.
-		const bareArchivedKey = sanitizeNativeIdForPath(source, `${entry.nativeId}-${shortHash}`);
-		const archivedSourcePath = referencePath(cwd, source, bareArchivedKey);
 
-		// Guard entry (key = mapKey): spread original to keep ACTIVE sourcePath
-		// (next StopHook upsert of same mapKey writes back to the same active
-		// path; guard collides via contentHashAtCommit so re-archive is a no-op).
-		updatedReferences[mapKey] = {
-			...entry,
-			commitHash,
-			contentHashAtCommit,
-			updatedAt: now,
-			ignored: undefined,
-		};
-		// Archived snapshot (key = archivedKey): explicit fields, NOT a spread —
-		// we do NOT want to inherit the guard's contentHashAtCommit / ignored
-		// from the original entry into the archive snapshot.
-		updatedReferences[archivedKey] = {
-			source: entry.source,
-			nativeId: entry.nativeId,
-			title: entry.title,
-			url: entry.url,
-			sourcePath: archivedSourcePath,
-			branch: entry.branch,
-			addedAt: entry.addedAt,
-			updatedAt: now,
-			commitHash,
-			sourceToolName: entry.sourceToolName,
-		};
-
-		// Physical rename. Failure → log.warn and continue. The guard is
-		// already written (so re-archive on the next commit short-circuits via
-		// contentHashAtCommit), and the archived snapshot's sourcePath points
-		// at the archived location even if no local file lives there —
-		// Regenerator reads from the orphan branch (storeReferences below uses
-		// rawContent captured before rename).
-		try {
-			await renameReferenceMarkdown(entry.sourcePath, archivedSourcePath);
-			/* v8 ignore start -- fs.rename failure: not deterministically reachable in unit tests without mocking; the warn-and-continue branch protects production against Windows EPERM / antivirus locks. */
-		} catch (err) {
-			log.warn(
-				"Reference association: rename %s → %s failed: %s (continuing)",
-				entry.sourcePath,
-				archivedSourcePath,
-				(err as Error).message,
-			);
-		}
-		/* v8 ignore stop */
+		// Reference commit DELETES the entry (no guard row). reference has no
+		// revival (it's a read-only MCP snapshot), so nothing needs to survive in
+		// plans.json — the orphan-branch snapshot (filesToStore: raw bytes keyed by
+		// archivedKey) + the CommitSummary ReferenceCommitRef are the system of
+		// record. The mapKey is removed in the merge-save below; the local active
+		// markdown is cleaned up here (orphan keeps the snapshot).
+		committedMapKeys.add(mapKey);
 
 		refs.push({
 			archivedKey,
@@ -1004,28 +906,31 @@ async function associateReferencesWithCommit(
 		});
 		filesToStore.push({ archivedKey, source, content: rawContent });
 
-		log.info("Reference archived: %s → %s (hash=%s)", mapKey, archivedKey, contentHashAtCommit.substring(0, 12));
+		// Best-effort: the active markdown's content is now in the orphan branch.
+		try {
+			await deleteReferenceMarkdown(entry.sourcePath);
+		} catch (err) {
+			log.warn(
+				"Reference association: failed to delete local markdown for %s: %s",
+				mapKey,
+				(err as Error).message,
+			);
+		}
+
+		log.info("Reference archived (entry removed): %s → %s", mapKey, archivedKey);
 	}
 
-	if (refs.length > 0) {
-		// Near-write reread + per-key merge. Same rationale as the legacy
-		// Linear-only path: a concurrent StopHook upsert or ignoreReference
-		// command may have touched plans.json.references while we were busy
-		// reading + hashing + renaming, and overwriting the whole references
-		// map would silently drop their work. Only the (mapKey + archivedKey)
-		// pairs we explicitly touched get layered on top of the fresh
-		// snapshot.
+	if (committedMapKeys.size > 0) {
+		// Near-write reread + per-key merge. A concurrent StopHook upsert may have
+		// touched plans.json.references while we were busy reading, and overwriting
+		// the whole references map would silently drop their work. We only
+		// DELETE the mapKeys we archived this run from the fresh snapshot — any
+		// concurrent writer's other keys are preserved.
 		const freshRegistry = await loadPlansRegistry(cwd);
-		/* v8 ignore next -- `?? {}` fallback unreachable: freshRegistry is loaded immediately after we've already proven references was defined (L919 fallback would have fired otherwise); a concurrent writer clearing the field is the same race that the surrounding per-key merge is designed to tolerate, not eliminate. */
+		/* v8 ignore next -- `?? {}` fallback unreachable: freshRegistry is loaded immediately after the loop archived at least one mapKey sourced from plans.json.references. */
 		const mergedReferences = { ...(freshRegistry.references ?? {}) };
-		for (const { mapKey } of ids) {
-			if (updatedReferences[mapKey] !== undefined) {
-				mergedReferences[mapKey] = updatedReferences[mapKey];
-			}
-			const archivedKey = `${mapKey}-${shortHash}`;
-			if (updatedReferences[archivedKey] !== undefined) {
-				mergedReferences[archivedKey] = updatedReferences[archivedKey];
-			}
+		for (const mapKey of committedMapKeys) {
+			delete mergedReferences[mapKey];
 		}
 		const out: PlansRegistry = {
 			version: 1,
@@ -1066,7 +971,7 @@ async function readMarkdownFileContent(absPath: string): Promise<string> {
  * sections appear in a stable order across runs — important for the LLM's
  * caching to hit on the prompt prefix.
  *
- * Shared between executePipeline (Step 6b) and the amend delta-step path so
+ * Shared between executePipeline and the amend delta-step path so
  * both flows render the reference context identically.
  */
 async function assembleReferenceBlocks(activeReferenceEntries: ReadonlyArray<ReferenceEntry>): Promise<string> {
@@ -1174,7 +1079,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	const conversation = buildMultiSessionContext(sessionTranscripts);
 	log.debug("Conversation context built: %d chars, %d sessions", conversation.length, sessionTranscripts.length);
 
-	// Step 6b: Assemble the structured prompt blocks (plans / notes / references).
+	// Assemble the structured prompt blocks (plans / notes / references).
 	// Pure registry-driven: no transcript re-scan. User's Ignore on the panel
 	// takes effect immediately on the next commit. References are bucketed by
 	// SourceId and rendered through `adapter.renderPromptBlock` per registered
@@ -1265,29 +1170,29 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	}
 	log.info("API summary generated (%s)", formatElapsed(stepStart));
 
-	// Step 8a: Read uncommitted plan slugs from plans.json registry.
+	// Read uncommitted plan slugs from plans.json registry.
 	// Apply per-item exclusions BEFORE associate* — these helpers have side effects
 	// (savePlansRegistry archive entry + storePlans to the orphan branch), so a
 	// post-filter on `planAssociation.refs` would still leave the excluded plan
-	// archived on disk. The prompt-block filter at Step 6b only governs LLM input;
+	// archived on disk. The prompt-block filter only governs LLM input;
 	// the archive path is a separate registry scan and must be filtered here.
 	const planSlugs = await detectPlanSlugsFromRegistry(cwd, branch);
 	for (const excludedSlug of exclusions.plans) planSlugs.delete(excludedSlug);
 	const planAssociation = await associatePlansWithCommit(planSlugs, commitInfo.hash, cwd, branch);
 	const planRefs = planAssociation.refs;
 
-	// Step 8a2: Read uncommitted note IDs from plans.json registry.
-	// Same archive-side exclusion as Step 8a — see comment above.
+	// Read uncommitted note IDs from plans.json registry.
+	// Same archive-side exclusion as the plan slugs — see comment above.
 	const noteIds = await detectUncommittedNoteIds(cwd, branch);
 	for (const excludedId of exclusions.notes) noteIds.delete(excludedId);
 	const noteRefs = await associateNotesWithCommit(noteIds, commitInfo.hash, cwd, branch);
 
-	// Step 8a3: Read uncommitted reference mapKeys from plans.json.references and
+	// Read uncommitted reference mapKeys from plans.json.references and
 	// archive them across every source (linear / jira / github / notion). The
 	// returned filesToStore is forwarded directly to storeReferences — captured
 	// BEFORE the local rename so the orphan-branch snapshot is independent of
-	// rename success. Mirrors the plans / notes archive-side filter at Step 8a /
-	// 8a2: excluded references are dropped here too, so the row reappears on the
+	// rename success. Mirrors the plans / notes archive-side filter — excluded
+	// references are dropped here too, so the row reappears on the
 	// next commit (skip-don't-archive semantics).
 	const rawReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
 	const referenceIds = rawReferenceIds.filter((e) => !exclusions.references.has(e.mapKey));
@@ -1341,7 +1246,7 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 		log.info("Plan progress: evaluated %d/%d plan(s)", planProgressArtifacts.length, planRefs.length);
 	}
 
-	// Step 8c (early): Build the StoredTranscript so we can allocate a v5
+	// Build the StoredTranscript (early) so we can allocate a v5
 	// transcript ID for it and stamp it onto the summary in one go. Overlays
 	// are already applied inside loadSessionTranscripts so the summary input,
 	// the empty-transcript guard, and the stored snapshot all see the same view.

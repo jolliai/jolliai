@@ -302,7 +302,7 @@ const {
 		listReferences: vi.fn().mockResolvedValue([]),
 		openReferenceInBrowser: vi.fn().mockResolvedValue(undefined),
 		openReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
-		ignoreReference: vi.fn().mockResolvedValue(undefined),
+		removeReference: vi.fn().mockResolvedValue(undefined),
 	};
 
 	const mockCommitCommand_ = { execute: vi.fn().mockResolvedValue(undefined) };
@@ -1955,7 +1955,7 @@ describe("Extension", () => {
 				mockBridge.listReferences.mockReset().mockResolvedValue([]);
 				mockBridge.openReferenceInBrowser.mockClear();
 				mockBridge.openReferenceMarkdown.mockClear();
-				mockBridge.ignoreReference.mockClear();
+				mockBridge.removeReference.mockClear();
 				showWarningMessage.mockClear();
 			});
 
@@ -2041,7 +2041,7 @@ describe("Extension", () => {
 				const handler = getRegisteredCommand("jollimemory.ignoreReference");
 				await handler({ reference: { mapKey: "linear:ENG-ign-2" } });
 
-				expect(mockBridge.ignoreReference).toHaveBeenCalledWith("linear:ENG-ign-2");
+				expect(mockBridge.removeReference).toHaveBeenCalledWith("linear:ENG-ign-2");
 				expect(mockPlansStore.refresh).toHaveBeenCalled();
 			});
 
@@ -2066,7 +2066,7 @@ describe("Extension", () => {
 				const handler = getRegisteredCommand("jollimemory.ignoreReference");
 				await handler("linear:ENG-4");
 
-				expect(mockBridge.ignoreReference).toHaveBeenCalledWith("linear:ENG-4");
+				expect(mockBridge.removeReference).toHaveBeenCalledWith("linear:ENG-4");
 				expect(mockPlansStore.refresh).toHaveBeenCalled();
 			});
 
@@ -2074,7 +2074,7 @@ describe("Extension", () => {
 				const handler = getRegisteredCommand("jollimemory.ignoreReference");
 				await handler("linear:ENG-gone");
 
-				expect(mockBridge.ignoreReference).not.toHaveBeenCalled();
+				expect(mockBridge.removeReference).not.toHaveBeenCalled();
 			});
 		});
 

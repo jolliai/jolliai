@@ -8,6 +8,7 @@ const {
 	mockShowTextDocument,
 	mockOpenExternal,
 	mockShowWarningMessage,
+	mockDeleteReferenceMarkdown,
 } = vi.hoisted(() => ({
 	mockLoadPlansRegistry: vi.fn(),
 	mockSavePlansRegistry: vi.fn(),
@@ -16,11 +17,16 @@ const {
 	mockShowTextDocument: vi.fn(),
 	mockOpenExternal: vi.fn(),
 	mockShowWarningMessage: vi.fn(),
+	mockDeleteReferenceMarkdown: vi.fn(),
 }));
 
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadPlansRegistry: mockLoadPlansRegistry,
 	savePlansRegistry: mockSavePlansRegistry,
+}));
+
+vi.mock("../../../cli/src/core/references/ReferenceStore.js", () => ({
+	deleteReferenceMarkdown: mockDeleteReferenceMarkdown,
 }));
 
 vi.mock("./PlanService.js", () => ({
@@ -61,7 +67,7 @@ import {
 	detectReferences,
 	openReferenceInBrowser,
 	openReferenceMarkdown,
-	setReferenceIgnored,
+	removeReference,
 } from "./ReferenceService.js";
 
 const fieldVal = (r: ReferenceInfo | undefined, key: string): string | undefined =>
@@ -74,10 +80,8 @@ function makeEntry(overrides: Partial<ReferenceEntry> = {}): ReferenceEntry {
 		title: "Treat referenced Linear issues",
 		url: "https://linear.app/jolliai/issue/PROJ-1528/",
 		sourcePath: "/repo/.jolli/jollimemory/references/linear/PROJ-1528.md",
-		branch: "main",
 		addedAt: "2026-05-13T00:00:00Z",
 		updatedAt: "2026-05-14T06:06:01.123Z",
-		commitHash: null,
 		sourceToolName: "mcp__linear__get_issue",
 		...overrides,
 	};
@@ -104,7 +108,7 @@ beforeEach(() => {
 });
 
 describe("detectReferences", () => {
-	it("returns uncommitted, non-ignored entries on the current branch (all sources)", async () => {
+	it("returns all reference entries across sources", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
@@ -156,63 +160,7 @@ describe("detectReferences", () => {
 			mapKey: "jira:KAN-5",
 			title: "Implement Jira adapter",
 			url: "https://example.atlassian.net/browse/KAN-5",
-			commitHash: null,
-			ignored: false,
 		});
-	});
-
-	it("filters out ignored entries", async () => {
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: {},
-			references: { "linear:PROJ-1528": makeEntry({ ignored: true }) },
-		});
-		expect(await detectReferences("/repo")).toHaveLength(0);
-	});
-
-	it("filters out guard entries (contentHashAtCommit set)", async () => {
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: {},
-			references: {
-				"linear:PROJ-1528": makeEntry({
-					contentHashAtCommit: "h",
-					commitHash: "abc",
-				}),
-			},
-		});
-		expect(await detectReferences("/repo")).toHaveLength(0);
-	});
-
-	it("filters out archived snapshots (commitHash set, no contentHashAtCommit)", async () => {
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: {},
-			references: {
-				"linear:PROJ-1528-abc1234": makeEntry({ commitHash: "abc1234" }),
-			},
-		});
-		expect(await detectReferences("/repo")).toHaveLength(0);
-	});
-
-	it("filters out entries on other branches", async () => {
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: {},
-			references: { "linear:PROJ-1528": makeEntry({ branch: "feature-x" }) },
-		});
-		mockGetCurrentBranch.mockReturnValue("main");
-		expect(await detectReferences("/repo")).toHaveLength(0);
-	});
-
-	it("does NOT filter by branch when getCurrentBranch returns null", async () => {
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: {},
-			references: { "linear:PROJ-1528": makeEntry({ branch: "feature-x" }) },
-		});
-		mockGetCurrentBranch.mockReturnValue(null);
-		expect(await detectReferences("/repo")).toHaveLength(1);
 	});
 
 	it("returns empty when references section is missing", async () => {
@@ -464,29 +412,20 @@ describe("detectReferences", () => {
 	});
 });
 
-describe("setReferenceIgnored", () => {
-	it("sets ignored=true on the entry keyed by mapKey", async () => {
+describe("removeReference", () => {
+	it("removes the registry row and deletes the backing markdown", async () => {
+		const entry = makeJiraEntry();
 		mockLoadPlansRegistry.mockResolvedValue({
 			version: 1,
 			plans: {},
-			references: { "jira:KAN-5": makeJiraEntry() },
+			references: { "jira:KAN-5": entry },
 		});
-		await setReferenceIgnored("/repo", "jira:KAN-5", true);
+		await removeReference("/repo", "jira:KAN-5");
+		expect(mockDeleteReferenceMarkdown).toHaveBeenCalledWith(entry.sourcePath);
 		expect(mockSavePlansRegistry).toHaveBeenCalled();
 		const saved = mockSavePlansRegistry.mock.calls[0][0];
 		expect(saved.version).toBe(1);
-		expect(saved.references["jira:KAN-5"].ignored).toBe(true);
-	});
-
-	it("clears ignored when set to false", async () => {
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: {},
-			references: { "jira:KAN-5": makeJiraEntry({ ignored: true }) },
-		});
-		await setReferenceIgnored("/repo", "jira:KAN-5", false);
-		const saved = mockSavePlansRegistry.mock.calls[0][0];
-		expect(saved.references["jira:KAN-5"].ignored).toBeUndefined();
+		expect(saved.references["jira:KAN-5"]).toBeUndefined();
 	});
 
 	it("is a no-op when mapKey is not in the registry", async () => {
@@ -495,14 +434,16 @@ describe("setReferenceIgnored", () => {
 			plans: {},
 			references: {},
 		});
-		await setReferenceIgnored("/repo", "jira:UNKNOWN", true);
+		await removeReference("/repo", "jira:UNKNOWN");
 		expect(mockSavePlansRegistry).not.toHaveBeenCalled();
+		expect(mockDeleteReferenceMarkdown).not.toHaveBeenCalled();
 	});
 
 	it("no-ops when the registry omits the references field entirely (?? {} fallback)", async () => {
 		mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {} });
-		await setReferenceIgnored("/repo", "jira:KAN-5", true);
+		await removeReference("/repo", "jira:KAN-5");
 		expect(mockSavePlansRegistry).not.toHaveBeenCalled();
+		expect(mockDeleteReferenceMarkdown).not.toHaveBeenCalled();
 	});
 
 	it("preserves the plans / notes sections on save", async () => {
@@ -513,12 +454,26 @@ describe("setReferenceIgnored", () => {
 			notes,
 			references: { "jira:KAN-5": makeJiraEntry() },
 		});
-		await setReferenceIgnored("/repo", "jira:KAN-5", true);
+		await removeReference("/repo", "jira:KAN-5");
 		const saved = mockSavePlansRegistry.mock.calls[0][0];
 		expect(saved.plans).toEqual({ "plan-1": { slug: "x" } });
 		expect(saved.notes).toEqual(notes);
+		expect(saved.references).toEqual({});
 	});
 
+	it("still removes the registry row when the markdown delete throws", async () => {
+		const entry = makeJiraEntry();
+		mockLoadPlansRegistry.mockResolvedValue({
+			version: 1,
+			plans: {},
+			references: { "jira:KAN-5": entry },
+		});
+		mockDeleteReferenceMarkdown.mockRejectedValueOnce(new Error("EACCES"));
+		await removeReference("/repo", "jira:KAN-5");
+		expect(mockSavePlansRegistry).toHaveBeenCalled();
+		const saved = mockSavePlansRegistry.mock.calls[0][0];
+		expect(saved.references["jira:KAN-5"]).toBeUndefined();
+	});
 });
 
 describe("openReferenceInBrowser — http(s) scheme guard", () => {

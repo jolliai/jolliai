@@ -92,7 +92,7 @@ beforeEach(() => {
 });
 
 describe("ALL_ADAPTERS", () => {
-	it("contains LinearAdapter as its first entry (Phase 1)", () => {
+	it("contains LinearAdapter as its first entry", () => {
 		expect(ALL_ADAPTERS).toContain(LinearAdapter);
 		expect(ALL_ADAPTERS[0].id).toBe("linear");
 	});

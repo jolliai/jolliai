@@ -47,16 +47,11 @@ import type {
 	StoredTranscript,
 } from "../../../cli/src/Types.js";
 import { CURRENT_SCHEMA_VERSION } from "../../../cli/src/Types.js";
-import { setReferenceIgnored } from "../core/ReferenceService.js";
+import { removeReference } from "../core/ReferenceService.js";
+import { removeNote, saveNote } from "../core/NoteService.js";
 import {
-	ignoreNote,
-	saveNote,
-	unassociateNoteFromCommit,
-} from "../core/NoteService.js";
-import {
-	ignorePlan,
 	listAvailablePlans,
-	unassociatePlanFromCommit,
+	removePlan,
 } from "../core/PlanService.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import {
@@ -2528,12 +2523,10 @@ export class SummaryWebviewPanel {
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
-		// Clear commitHash in plans.json
-
-		await unassociatePlanFromCommit(slug, this.workspaceRoot);
-		// Mark as ignored so the plan doesn't reappear in the sidebar on next refresh
-		// (unassociate only sets commitHash=null — the entry would still be visible)
-		await ignorePlan(slug, this.workspaceRoot);
+		// Hard-remove the archived plans.json row (the CommitSummary reference was
+		// already dropped above). No `ignored` tombstone — the plan can be
+		// re-discovered / re-associated later.
+		await removePlan(slug, this.workspaceRoot);
 
 		// Remove the visible <branchFolder>/plan--<slug>.md in dual-write/folder
 		// modes so the Memory Bank tree view stops showing a ghost file. Goes
@@ -2645,8 +2638,8 @@ export class SummaryWebviewPanel {
 			summary.commitHash,
 		);
 		if (!noteRef) {
-			// Clean up the orphaned note entry so it doesn't linger in the sidebar
-			await ignoreNote(noteInfo.id, this.workspaceRoot);
+			// Hard-remove the orphaned note entry so it doesn't linger in the sidebar
+			await removeNote(noteInfo.id, this.workspaceRoot);
 			vscode.window.showErrorMessage(
 				"Failed to add markdown note — archive failed.",
 			);
@@ -2691,7 +2684,7 @@ export class SummaryWebviewPanel {
 			summary.commitHash,
 		);
 		if (!noteRef) {
-			await ignoreNote(noteInfo.id, this.workspaceRoot);
+			await removeNote(noteInfo.id, this.workspaceRoot);
 			vscode.window.showErrorMessage(
 				"Failed to save snippet — archive failed.",
 			);
@@ -2822,10 +2815,10 @@ export class SummaryWebviewPanel {
 		};
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
-		await unassociateNoteFromCommit(id, this.workspaceRoot);
-		// Mark as ignored so the note doesn't reappear in the sidebar on next refresh
-		// (unassociate only sets commitHash=null — the entry would still be visible)
-		await ignoreNote(id, this.workspaceRoot);
+		// Hard-remove the archived plans.json row (the CommitSummary reference was
+		// already dropped above). No `ignored` tombstone — the note can be
+		// re-associated later.
+		await removeNote(id, this.workspaceRoot);
 
 		// Remove the visible <branchFolder>/note--<id>.md in dual-write/folder
 		// modes so the Memory Bank tree view stops showing a ghost file. Goes
@@ -3018,15 +3011,13 @@ export class SummaryWebviewPanel {
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
-		// Hide from the sidebar panel: mark the archived map key ignored.
-		// Intentionally single-key. The old Linear-only path also ignored the bare
-		// ticketId guard entry, so a removed reference stayed hidden forever even
-		// if re-referenced. We deliberately diverge: only the archived snapshot key
-		// is ignored, NOT the bare `<source>:<nativeId>` guard. A later re-reference
-		// whose content changed (guard-hash mismatch) is allowed to re-surface as a
-		// fresh uncommitted reference — removal hides the current snapshot, it does
-		// not permanently blacklist the ticket.
-		await setReferenceIgnored(this.workspaceRoot, archivedKey, true);
+		// Hard-remove the archived snapshot row + its backing markdown, keyed by the
+		// archived map key. Intentionally single-key: only the archived snapshot
+		// (`<source>:<nativeId>-<shortHash>`) is removed, NOT the bare
+		// `<source>:<nativeId>` guard. With no `ignored` tombstone, a later
+		// re-reference of the same entity is re-discovered as a fresh uncommitted
+		// reference — removal deletes the current snapshot, it does not blacklist.
+		await removeReference(this.workspaceRoot, archivedKey);
 
 		this.update(updatedSummary);
 	}

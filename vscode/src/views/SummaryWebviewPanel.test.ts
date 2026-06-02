@@ -252,27 +252,23 @@ vi.mock("../../package.json", () => ({ version: "0.90.0" }));
 const {
 	mockListAvailablePlans,
 	mockArchivePlanForCommit,
-	mockUnassociatePlanFromCommit,
-	mockIgnorePlan,
+	mockRemovePlan,
 } = vi.hoisted(() => ({
 	mockListAvailablePlans: vi.fn().mockReturnValue([]),
 	mockArchivePlanForCommit: vi.fn().mockResolvedValue(null),
-	mockUnassociatePlanFromCommit: vi.fn().mockResolvedValue(undefined),
-	mockIgnorePlan: vi.fn().mockResolvedValue(undefined),
+	mockRemovePlan: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/PlanService.js", () => ({
 	listAvailablePlans: mockListAvailablePlans,
 	archivePlanForCommit: mockArchivePlanForCommit,
-	unassociatePlanFromCommit: mockUnassociatePlanFromCommit,
-	ignorePlan: mockIgnorePlan,
+	removePlan: mockRemovePlan,
 }));
 
 const {
 	mockSaveNote,
 	mockArchiveNoteForCommit,
-	mockUnassociateNoteFromCommit,
-	mockIgnoreNote,
+	mockRemoveNote,
 } = vi.hoisted(() => ({
 	mockSaveNote: vi.fn().mockResolvedValue({
 		id: "note-1",
@@ -280,23 +276,21 @@ const {
 		format: "snippet",
 	}),
 	mockArchiveNoteForCommit: vi.fn().mockResolvedValue(null),
-	mockUnassociateNoteFromCommit: vi.fn().mockResolvedValue(undefined),
-	mockIgnoreNote: vi.fn().mockResolvedValue(undefined),
+	mockRemoveNote: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/NoteService.js", () => ({
 	saveNote: mockSaveNote,
 	archiveNoteForCommit: mockArchiveNoteForCommit,
-	unassociateNoteFromCommit: mockUnassociateNoteFromCommit,
-	ignoreNote: mockIgnoreNote,
+	removeNote: mockRemoveNote,
 }));
 
-const { mockSetReferenceIgnored } = vi.hoisted(() => ({
-	mockSetReferenceIgnored: vi.fn().mockResolvedValue(undefined),
+const { mockRemoveReference } = vi.hoisted(() => ({
+	mockRemoveReference: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/ReferenceService.js", () => ({
-	setReferenceIgnored: mockSetReferenceIgnored,
+	removeReference: mockRemoveReference,
 }));
 
 const {
@@ -3235,12 +3229,9 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "removePlan", slug: "plan-a", title: "Plan A" });
 				await flushPromises();
 
-				expect(mockUnassociatePlanFromCommit).toHaveBeenCalledWith(
-					"plan-a",
-					workspaceRoot,
-				);
-				// Must also mark as ignored so the plan doesn't reappear in the sidebar
-				expect(mockIgnorePlan).toHaveBeenCalledWith("plan-a", workspaceRoot);
+				// Hard-removes the archived plans.json row (the CommitSummary
+				// reference was dropped above); no unassociate + ignore steps.
+				expect(mockRemovePlan).toHaveBeenCalledWith("plan-a", workspaceRoot);
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({
 						plans: [expect.objectContaining({ slug: "plan-b" })],
@@ -3298,7 +3289,7 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "removePlan", slug: "plan-a", title: "Plan A" });
 				await flushPromises();
 
-				expect(mockUnassociatePlanFromCommit).not.toHaveBeenCalled();
+				expect(mockRemovePlan).not.toHaveBeenCalled();
 			});
 		});
 
@@ -6194,7 +6185,7 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "saveSnippet", title: "Fail", content: "content" });
 				await flushPromises();
 
-				expect(mockIgnoreNote).toHaveBeenCalledWith("snip-fail", workspaceRoot);
+				expect(mockRemoveNote).toHaveBeenCalledWith("snip-fail", workspaceRoot);
 				expect(showErrorMessage).toHaveBeenCalledWith(
 					"Failed to save snippet — archive failed.",
 				);
@@ -6339,7 +6330,7 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "addMarkdownNote" });
 				await flushPromises();
 
-				expect(mockIgnoreNote).toHaveBeenCalledWith("md-fail", workspaceRoot);
+				expect(mockRemoveNote).toHaveBeenCalledWith("md-fail", workspaceRoot);
 				expect(showErrorMessage).toHaveBeenCalledWith(
 					expect.stringContaining("archive failed"),
 				);
@@ -6945,12 +6936,9 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({ modal: true }),
 					"Remove",
 				);
-				expect(mockUnassociateNoteFromCommit).toHaveBeenCalledWith(
-					"note-a",
-					workspaceRoot,
-				);
-				// Must also mark as ignored so the note doesn't reappear in the sidebar
-				expect(mockIgnoreNote).toHaveBeenCalledWith("note-a", workspaceRoot);
+				// Hard-removes the archived plans.json row (the CommitSummary
+				// reference was dropped above); no unassociate + ignore steps.
+				expect(mockRemoveNote).toHaveBeenCalledWith("note-a", workspaceRoot);
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({
 						notes: [expect.objectContaining({ id: "note-b" })],
@@ -7008,7 +6996,7 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "removeNote", id: "note-a", title: "Note A" });
 				await flushPromises();
 
-				expect(mockUnassociateNoteFromCommit).not.toHaveBeenCalled();
+				expect(mockRemoveNote).not.toHaveBeenCalled();
 				expect(mockStoreSummary).not.toHaveBeenCalled();
 			});
 
@@ -7305,10 +7293,9 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({ modal: true }),
 					"Remove",
 				);
-				expect(mockSetReferenceIgnored).toHaveBeenCalledWith(
+				expect(mockRemoveReference).toHaveBeenCalledWith(
 					workspaceRoot,
 					"linear:PROJ-1-aaaaaaaa",
-					true,
 				);
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({
@@ -7378,7 +7365,7 @@ describe("SummaryWebviewPanel", () => {
 				});
 				await flushPromises();
 
-				expect(mockSetReferenceIgnored).not.toHaveBeenCalled();
+				expect(mockRemoveReference).not.toHaveBeenCalled();
 				expect(mockStoreSummary).not.toHaveBeenCalled();
 			});
 
@@ -7396,7 +7383,7 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				expect(showWarningMessage).not.toHaveBeenCalled();
-				expect(mockSetReferenceIgnored).not.toHaveBeenCalled();
+				expect(mockRemoveReference).not.toHaveBeenCalled();
 			});
 
 			it("returns early when archivedKey not in summary.references", async () => {
@@ -7425,7 +7412,7 @@ describe("SummaryWebviewPanel", () => {
 				await flushPromises();
 
 				expect(showWarningMessage).not.toHaveBeenCalled();
-				expect(mockSetReferenceIgnored).not.toHaveBeenCalled();
+				expect(mockRemoveReference).not.toHaveBeenCalled();
 			});
 
 			it("non-Linear source: dissociates a Jira reference uniformly via the same handler", async () => {
@@ -7453,10 +7440,9 @@ describe("SummaryWebviewPanel", () => {
 				});
 				await flushPromises();
 
-				expect(mockSetReferenceIgnored).toHaveBeenCalledWith(
+				expect(mockRemoveReference).toHaveBeenCalledWith(
 					workspaceRoot,
 					"jira:KAN-5-aaaa1111",
-					true,
 				);
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({ references: undefined }),

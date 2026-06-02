@@ -12,9 +12,9 @@
  * lifecycle event modifies the file — the QueueWorker only ever READS it.
  *
  * Distinct from `HiddenConversationsStore` (permanent hide — row vanishes
- * from sidebar) and from `PlanEntry.ignored` / `NoteEntry.ignored`
- * (permanent ignore at the plans-registry layer). Exclusions are visible
- * in the sidebar with an unchecked box; the row still renders.
+ * from sidebar) and from the plans-registry hard-delete (the row is removed
+ * entirely). Exclusions are visible in the sidebar with an unchecked box; the
+ * row still renders.
  *
  * Schema versions:
  *   - v1: { conversations, plans, notes }

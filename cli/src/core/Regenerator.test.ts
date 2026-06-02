@@ -1156,7 +1156,7 @@ describe("regenerateSummary", () => {
 			// helper adds it before calling readReferenceFromBranch. The fallback
 			// inside readReferenceFromBranch strips it back to read the legacy
 			// `linear-issues/<bareKey>.md` path on disk — verified by the call
-			// argument including the `linear:` prefix exactly as plan §Task 2.10
+			// argument including the `linear:` prefix, exactly as the projection
 			// specifies.
 			const v3Legacy: CommitSummary = {
 				...baseSummary,

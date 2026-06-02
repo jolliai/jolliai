@@ -84,7 +84,6 @@ vi.mock("../core/references/ReferenceStore.js", () => ({
 	readReferenceMarkdown: vi.fn().mockResolvedValue(null),
 	readReferenceMarkdownFromString: vi.fn().mockReturnValue(null),
 	writeReferenceMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/x", contentHash: "fakehash" }),
-	renameReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 	hashReferenceContent: vi.fn().mockReturnValue("fakehash"),
 }));
 
@@ -458,7 +457,6 @@ describe("QueueWorker selection filter", () => {
 			sourcePath: "/fake/plan-keep.md",
 			addedAt: "2026-01-01T00:00:00Z",
 			updatedAt: "2026-01-01T00:00:00Z",
-			branch: "main",
 			commitHash: null,
 		};
 		const skipPlan: PlanEntry = {
@@ -467,7 +465,6 @@ describe("QueueWorker selection filter", () => {
 			sourcePath: "/fake/plan-skip.md",
 			addedAt: "2026-01-01T00:00:00Z",
 			updatedAt: "2026-01-01T00:00:00Z",
-			branch: "main",
 			commitHash: null,
 		};
 		vi.mocked(detectActivePlansForBranch).mockResolvedValue([keepPlan, skipPlan]);
@@ -500,7 +497,6 @@ describe("QueueWorker selection filter", () => {
 			format: "markdown",
 			addedAt: "2026-01-01T00:00:00Z",
 			updatedAt: "2026-01-01T00:00:00Z",
-			branch: "main",
 			commitHash: null,
 		};
 		const skipNote: NoteEntry = {
@@ -509,7 +505,6 @@ describe("QueueWorker selection filter", () => {
 			format: "markdown",
 			addedAt: "2026-01-01T00:00:00Z",
 			updatedAt: "2026-01-01T00:00:00Z",
-			branch: "main",
 			commitHash: null,
 		};
 		vi.mocked(detectActiveNotesForBranch).mockResolvedValue([keepNote, skipNote]);
@@ -645,7 +640,6 @@ describe("QueueWorker selection filter", () => {
 					sourcePath: "/fake/plan-keep.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: null,
 				},
 				"plan-skip": {
@@ -654,7 +648,6 @@ describe("QueueWorker selection filter", () => {
 					sourcePath: "/fake/plan-skip.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: null,
 				},
 			},
@@ -700,7 +693,6 @@ describe("QueueWorker selection filter", () => {
 					sourcePath: "/fake/note-keep.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: null,
 				},
 				"note-skip": {
@@ -710,7 +702,6 @@ describe("QueueWorker selection filter", () => {
 					sourcePath: "/fake/note-skip.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: null,
 				},
 			},
@@ -741,12 +732,12 @@ describe("QueueWorker selection filter", () => {
 
 	// ─── Entity exclusion (panel-level skip-don't-archive) ──────────────────
 	// Mirrors the plan / note archive-side filter tests above: an excluded
-	// entity must be dropped from BOTH the Step 6b prompt block AND the
-	// Step 8a3 archive call. Without the archive-side filter the entity row
+	// entity must be dropped from BOTH the prompt block AND the
+	// archive call. Without the archive-side filter the entity row
 	// would still be committed and disappear from the panel — defeating the
 	// "uncheck = skip on this commit, reappear next time" semantics.
 
-	it("filters excluded entities out of the prompt-block input (Step 6b)", async () => {
+	it("filters excluded entities out of the prompt-block input", async () => {
 		seedGitMocks(projectDir);
 		vi.mocked(loadAllSessions).mockResolvedValue([]);
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
@@ -757,10 +748,8 @@ describe("QueueWorker selection filter", () => {
 			title: "Keep Entity",
 			url: "https://example.atlassian.net/browse/PROJ-1",
 			sourcePath: "/fake/jira/PROJ-1.md",
-			branch: "main",
 			addedAt: "2026-01-01T00:00:00Z",
 			updatedAt: "2026-01-01T00:00:00Z",
-			commitHash: null,
 			sourceToolName: "atlassian-mcp",
 		};
 		const skipEntity: ReferenceEntry = {
@@ -769,10 +758,8 @@ describe("QueueWorker selection filter", () => {
 			title: "Skip Entity",
 			url: "https://github.com/owner/repo/issues/42",
 			sourcePath: "/fake/github/owner-repo-42.md",
-			branch: "main",
 			addedAt: "2026-01-01T00:00:00Z",
 			updatedAt: "2026-01-01T00:00:00Z",
-			commitHash: null,
 			sourceToolName: "github-mcp",
 		};
 		vi.mocked(getReferenceEntriesForBranch).mockImplementation(async () => {
@@ -797,13 +784,13 @@ describe("QueueWorker selection filter", () => {
 		expect(readCalls).not.toContain("/fake/github/owner-repo-42.md");
 	});
 
-	it("filters excluded entities out of the Step 8a3 archive call", async () => {
+	it("filters excluded entities out of the archive call", async () => {
 		seedGitMocks(projectDir);
 		vi.mocked(loadAllSessions).mockResolvedValue([]);
 		vi.mocked(buildMultiSessionContext).mockReturnValue("");
 
 		// detectUncommittedReferenceIds returns the {mapKey, source, sourcePath}
-		// triples that drive the archive step. The filter at Step 8a3 must
+		// triples that drive the archive step. The filter must
 		// drop the excluded mapKey before passing to associateReferencesWithCommit
 		// — which we observe indirectly through loadPlansRegistry not being
 		// asked to upgrade the entity (we keep the v1-shaped registry mock so
@@ -826,10 +813,8 @@ describe("QueueWorker selection filter", () => {
 					title: "Keep",
 					url: "https://x/PROJ-KEEP",
 					sourcePath: "/fake/jira/PROJ-KEEP.md",
-					branch: "main",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					commitHash: null,
 					sourceToolName: "atlassian-mcp",
 				},
 				"jira:PROJ-SKIP": {
@@ -838,10 +823,8 @@ describe("QueueWorker selection filter", () => {
 					title: "Skip",
 					url: "https://x/PROJ-SKIP",
 					sourcePath: "/fake/jira/PROJ-SKIP.md",
-					branch: "main",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					commitHash: null,
 					sourceToolName: "atlassian-mcp",
 				},
 			},
@@ -862,10 +845,10 @@ describe("QueueWorker selection filter", () => {
 
 		await executePipeline(projectDir, makeCommitOp());
 
-		// The kept entity's sourcePath shows up in readReferenceMarkdown (both at
-		// Step 6b and Step 8a3 — same helper). The skipped one must NOT appear
-		// at all. The Step-6b filter already drops it from the prompt path,
-		// and the Step-8a3 filter drops it from the archive path.
+		// The kept entity's sourcePath shows up in readReferenceMarkdown (in both
+		// the prompt block and the archive call — same helper). The skipped one
+		// must NOT appear at all. The prompt-block filter already drops it from
+		// the prompt path, and the archive-side filter drops it from the archive path.
 		expect(archivePaths.every((p) => !p.includes("PROJ-SKIP"))).toBe(true);
 	});
 });

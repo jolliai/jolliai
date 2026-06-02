@@ -19,7 +19,6 @@ function makePlan(overrides: Partial<PlanEntry> = {}): PlanEntry {
 		sourcePath: "/abs/path/my-plan.md",
 		addedAt: "2026-05-13T00:00:00Z",
 		updatedAt: "2026-05-14T00:00:00Z",
-		branch: "main",
 		commitHash: null,
 		...overrides,
 	};

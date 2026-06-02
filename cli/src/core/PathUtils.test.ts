@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { withPlatform } from "../testUtils/withPlatform.js";
-import { normalizePathForCompare, toForwardSlash } from "./PathUtils.js";
+import { isPathInside, normalizePathForCompare, toForwardSlash } from "./PathUtils.js";
 
 describe("normalizePathForCompare", () => {
 	it("unifies backslashes to forward slashes regardless of platform", () => {
@@ -101,5 +101,49 @@ describe("toForwardSlash", () => {
 
 	it("handles a path with no separators", () => {
 		expect(toForwardSlash("file.txt")).toBe("file.txt");
+	});
+});
+
+describe("isPathInside", () => {
+	it("returns true when child equals parent", () => {
+		withPlatform("linux", () => {
+			expect(isPathInside("/repo/.jolli/jollimemory", "/repo/.jolli/jollimemory")).toBe(true);
+		});
+	});
+
+	it("returns true for a nested child", () => {
+		withPlatform("linux", () => {
+			expect(isPathInside("/repo/.jolli/jollimemory/notes/x.md", "/repo/.jolli/jollimemory")).toBe(true);
+		});
+	});
+
+	it("returns false at a directory-name boundary (jollimemoryX is NOT inside jollimemory)", () => {
+		withPlatform("linux", () => {
+			expect(isPathInside("/repo/.jolli/jollimemoryX/y.md", "/repo/.jolli/jollimemory")).toBe(false);
+		});
+	});
+
+	it("returns false for an external path", () => {
+		withPlatform("linux", () => {
+			expect(isPathInside("/home/user/.claude/plans/p.md", "/repo/.jolli/jollimemory")).toBe(false);
+		});
+	});
+
+	it("returns false when the candidate parent is actually deeper than the child", () => {
+		withPlatform("linux", () => {
+			expect(isPathInside("/repo/.jolli", "/repo/.jolli/jollimemory")).toBe(false);
+		});
+	});
+
+	it("folds case and separators on Windows", () => {
+		withPlatform("win32", () => {
+			expect(isPathInside("C:\\Repo\\.jolli\\jollimemory\\Notes\\x.md", "c:/repo/.jolli/jollimemory")).toBe(true);
+		});
+	});
+
+	it("is case-sensitive on Linux (different case is not inside)", () => {
+		withPlatform("linux", () => {
+			expect(isPathInside("/Repo/.jolli/jollimemory/x.md", "/repo/.jolli/jollimemory")).toBe(false);
+		});
 	});
 });

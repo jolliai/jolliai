@@ -36,9 +36,10 @@ import { extractReferencesFromTranscript } from "../core/references/ReferenceExt
 import { ALL_ADAPTERS } from "../core/references/sources/index.js";
 import {
 	loadConfig,
-	loadCursorForTranscript,
+	loadDiscoveryCursor,
 	loadPlansRegistry,
-	saveCursor,
+	migrateDiscoveryCursors,
+	saveDiscoveryCursor,
 	savePlansRegistry,
 	saveSession,
 	upsertReferenceEntry,
@@ -129,27 +130,52 @@ export async function handleStopHook(): Promise<void> {
 		}
 	}
 
-	// Incrementally scan transcript for plan file references → write to plans.json
+	// Single incremental discovery pass — plan + reference scanning share
+	// one discovery-cursors.json line per transcript. Each inner scan swallows
+	// its own errors so one failing discovery never blocks the other or the
+	// cursor advance.
+	await discoverFromTranscript(sessionInfo, projectDir);
+}
+
+// ─── Discovery orchestration ────────────────────────────────────────────────
+
+/**
+ * Single incremental discovery pass for one transcript. Plan + reference
+ * scanning share ONE merged cursor in discovery-cursors.json (keyed by the bare
+ * transcriptPath). Each scan swallows its own errors and the cursor advances to
+ * the furthest line any scan reached, so a transient failure in one discovery
+ * discards that window (no re-scan) without blocking the other.
+ */
+async function discoverFromTranscript(sessionInfo: SessionInfo, cwd: string): Promise<void> {
+	const transcriptPath = sessionInfo.transcriptPath;
+	if (!existsSync(transcriptPath)) return;
+
+	await migrateDiscoveryCursors(cwd); // idempotent fold of legacy plan:/linear: cursors
+	const fromLine = (await loadDiscoveryCursor(transcriptPath, cwd))?.lineNumber ?? 0;
+
+	let lastScanned = fromLine;
 	try {
-		await discoverPlansFromTranscript(sessionInfo, projectDir);
+		lastScanned = await scanPlansFrom(transcriptPath, fromLine, cwd);
 	} catch (error: unknown) {
 		log.error("Plan discovery failed: %s", (error as Error).message);
 	}
-
-	// Incrementally scan transcript for reference refs (Linear / Jira / GitHub /
-	// Notion / …). Routes through every registered SourceAdapter and writes
-	// markdown files + plans.json.references.
 	try {
-		await discoverReferencesFromTranscript(sessionInfo, projectDir);
+		// Both scans start from the same line and read to EOF, so the reference
+		// scan's return value is the authoritative furthest-scanned line.
+		lastScanned = await scanReferencesFrom(transcriptPath, fromLine, cwd);
 	} catch (error: unknown) {
 		log.error("Reference discovery failed: %s", (error as Error).message);
+	}
+
+	if (lastScanned > fromLine) {
+		await saveDiscoveryCursor(
+			{ transcriptPath, lineNumber: lastScanned, updatedAt: new Date().toISOString() },
+			cwd,
+		);
 	}
 }
 
 // ─── Plan Discovery ─────────────────────────────────────────────────────────
-
-/** Cursor key prefix to distinguish plan scan cursors from summarization cursors */
-const PLAN_CURSOR_PREFIX = "plan:";
 
 /** Regex to extract slug from plan-mode transcript lines: "slug":"xxx" */
 const SLUG_REGEX = /"slug":"([^"]+)"/;
@@ -246,11 +272,9 @@ function resolveUniqueSlug(baseSlug: string, absPath: string, plans: Record<stri
 }
 
 /**
- * Incrementally scans the transcript for plan file references and updates plans.json.
- *
- * Uses a dedicated cursor (prefixed with "plan:") in cursors.json to track
- * how far the transcript has been scanned, so each StopHook invocation only
- * reads the newly appended lines.
+ * Scans the transcript for plan file references from `fromLine` and upserts them
+ * into plans.json. Pure scan + upsert — the caller (discoverFromTranscript) owns
+ * the merged discovery cursor. Returns the furthest line scanned (EOF).
  *
  * Detection covers three scenarios:
  *   1. Plan mode: the transcript contains a "slug":"xxx" field
@@ -259,29 +283,12 @@ function resolveUniqueSlug(baseSlug: string, absPath: string, plans: Record<stri
  *      call on any .md path not excluded by isExternalPlanCandidate — slug is
  *      derived from basename via resolveUniqueSlug for cross-path collisions.
  */
-async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string): Promise<void> {
-	const transcriptPath = sessionInfo.transcriptPath;
-	if (!existsSync(transcriptPath)) {
-		return;
-	}
-
-	// Load cursor — lineNumber tracks how many lines we've already scanned
-	const cursorKey = `${PLAN_CURSOR_PREFIX}${transcriptPath}`;
-	const cursor = await loadCursorForTranscript(cursorKey, cwd);
-	const startLine = cursor?.lineNumber ?? 0;
-
-	// Scan transcript from startLine, collecting discovered slugs / external paths
-	const { slugs, externalPlans, totalLines } = await scanTranscriptForPlans(transcriptPath, startLine);
+async function scanPlansFrom(transcriptPath: string, fromLine: number, cwd: string): Promise<number> {
+	// Scan from fromLine, collecting discovered slugs / external paths.
+	const { slugs, externalPlans, totalLines } = await scanTranscriptForPlans(transcriptPath, fromLine);
 
 	if (slugs.size === 0 && externalPlans.size === 0) {
-		// Nothing found, but still update cursor to avoid re-scanning
-		if (totalLines > startLine) {
-			await saveCursor(
-				{ transcriptPath: cursorKey, lineNumber: totalLines, updatedAt: new Date().toISOString() },
-				cwd,
-			);
-		}
-		return;
+		return totalLines;
 	}
 
 	// Upsert into plans.json. Re-read registry right before writing to
@@ -289,7 +296,6 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 	const registry = await loadPlansRegistry(cwd);
 	const plans = { ...registry.plans };
 	const now = new Date().toISOString();
-	let branch: string | undefined;
 	let changed = false;
 	// Tracks slugs we actually modified in this run. Used at writeback time to
 	// merge our changes onto the freshest registry snapshot per-slug rather
@@ -301,20 +307,15 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 	const upsertEntry = (slug: string, planFile: string): void => {
 		const existing = plans[slug];
 		if (existing?.contentHashAtCommit) {
-			// Archived guard — never resurrect if user explicitly removed it
-			if (existing.ignored) {
-				return;
-			}
+			// Archived guard: revive when the source file diverged from the guard hash.
 			const currentHash = createHash("sha256").update(readFileSync(planFile, "utf-8")).digest("hex");
 			if (currentHash !== existing.contentHashAtCommit) {
-				branch ??= getCurrentBranch(cwd);
 				plans[slug] = {
 					slug,
 					title: extractPlanTitle(planFile),
 					sourcePath: planFile,
 					addedAt: now,
 					updatedAt: now,
-					branch,
 					commitHash: null,
 				};
 				changed = true;
@@ -322,20 +323,18 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 				log.info("Plan discovery: archived plan %s file changed — creating new entry", slug);
 			}
 		} else if (existing) {
-			if (existing.commitHash === null && !existing.ignored) {
+			if (existing.commitHash === null) {
 				plans[slug] = { ...existing, updatedAt: now };
 				changed = true;
 				touchedSlugs.add(slug);
 			}
 		} else {
-			branch ??= getCurrentBranch(cwd);
 			plans[slug] = {
 				slug,
 				title: extractPlanTitle(planFile),
 				sourcePath: planFile,
 				addedAt: now,
 				updatedAt: now,
-				branch,
 				commitHash: null,
 			};
 			changed = true;
@@ -343,27 +342,17 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 		}
 	};
 
-	// Build a Set of normalized paths that already belong to a markdown note
-	// on the current branch. Markdown notes added via "Add Markdown File" can
-	// point at arbitrary user .md files (NoteService allows
-	// `sourcePath = <user-picked path>`). If the AI later edits that same file,
-	// we must NOT also register it as a plan — it would shadow the user's
-	// explicit note semantics, double-archive into the orphan branch, and
-	// surface the same file twice in the panel (plans + notes are merged
-	// without sourcePath dedup downstream).
-	//
-	// Branch scoping: notes are branch-filtered in NoteService.toNoteInfo, so a
-	// note on `main` is invisible on `feature/x`. The guard must mirror that
-	// scope, otherwise a hidden cross-branch note silently suppresses plan
-	// auto-registration on the current branch.
+	// Build a Set of normalized paths that already belong to a markdown note.
+	// Markdown notes added via "Add Markdown File" can point at arbitrary user
+	// .md files (NoteService allows `sourcePath = <user-picked path>`). If the AI
+	// later edits that same file, we must NOT also register it as a plan — it
+	// would shadow the user's explicit note semantics, double-archive into the
+	// orphan branch, and surface the same file twice in the panel (plans + notes
+	// are merged without sourcePath dedup downstream). Notes are no longer
+	// branch-scoped, so any note's sourcePath suppresses plan auto-registration.
 	const noteSourcePaths = new Set<string>();
-	const notesArr = Object.values(registry.notes ?? {});
-	if (notesArr.length > 0) {
-		branch ??= getCurrentBranch(cwd);
-		for (const note of notesArr) {
-			if (note.branch && note.branch !== branch) continue;
-			if (note.sourcePath) noteSourcePaths.add(normalizePathForCompare(note.sourcePath));
-		}
+	for (const note of Object.values(registry.notes ?? {})) {
+		if (note.sourcePath) noteSourcePaths.add(normalizePathForCompare(note.sourcePath));
 	}
 
 	// 1. Canonical ~/.claude/plans/ slugs. We still route through
@@ -408,7 +397,7 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 		//   - QueueWorker may have added a `<slug>-<commitHash8>` archive entry
 		//     and upgraded the original slug into an archive guard
 		//   - Another StopHook (parallel session) may have added a new slug
-		//   - The extension may have flipped `ignored` on an entry
+		//   - The extension may have removed an entry (hard delete)
 		//
 		// Strategy: start with freshRegistry.plans as the baseline (preserves
 		// every concurrent write), then layer ONLY the slugs we explicitly
@@ -450,8 +439,7 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 		);
 	}
 
-	// Update cursor so next invocation starts where we left off
-	await saveCursor({ transcriptPath: cursorKey, lineNumber: totalLines, updatedAt: new Date().toISOString() }, cwd);
+	return totalLines;
 }
 
 /**
@@ -527,49 +515,22 @@ function scanTranscriptForPlans(
 // ─── Reference Discovery (multi-source) ─────────────────────────────────────
 
 /**
- * Cursor key prefix for reference scan position, parallel to PLAN_CURSOR_PREFIX.
- *
- * Kept as `linear:` for one release so already-on-disk cursors from the
- * Linear-only era remain valid — the scan window only advances forward.
- * Phase 3 can migrate this to `reference:` alongside a one-time cursor key rewrite.
- */
-const LINEAR_CURSOR_PREFIX = "linear:";
-
-/**
- * Incrementally scans the transcript for ALL registered source adapters
- * (Linear / Jira / GitHub / Notion / …) and persists discovered references:
+ * Scans the transcript for ALL registered source adapters (Linear / Jira /
+ * GitHub / Notion / …) from `fromLine` and persists discovered references:
  *   1. extractReferencesFromTranscript(transcriptPath, ALL_ADAPTERS, …) → Reference[]
  *   2. For each ref: upsertReferenceEntry routes the row into plans.json.references
  *      and writes per-reference markdown via ReferenceStore.writeReferenceMarkdown.
- *   3. Persist cursor advance on all three terminal paths (zero references,
- *      partial upsert failure, full success) so we never re-scan the same
- *      transcript window.
  *
- * Each StopHook invocation only reads newly appended JSONL lines. The cursor
- * for this scan is independent of plan-discovery's cursor (different prefix).
+ * Pure scan + upsert — the caller (discoverFromTranscript) owns the merged
+ * discovery cursor. Returns the furthest line scanned (EOF).
  */
-async function discoverReferencesFromTranscript(sessionInfo: SessionInfo, cwd: string): Promise<void> {
-	const transcriptPath = sessionInfo.transcriptPath;
-	if (!existsSync(transcriptPath)) return;
-
-	const cursorKey = `${LINEAR_CURSOR_PREFIX}${transcriptPath}`;
-	const cursor = await loadCursorForTranscript(cursorKey, cwd);
-	const fromLineNumber = cursor?.lineNumber ?? 0;
-
+async function scanReferencesFrom(transcriptPath: string, fromLine: number, cwd: string): Promise<number> {
 	const { references, lastLineNumberScanned } = await extractReferencesFromTranscript(transcriptPath, ALL_ADAPTERS, {
-		fromLineNumber,
+		fromLineNumber: fromLine,
 	});
 
-	// Zero-reference path: even with no references, advance the cursor so we
-	// don't re-scan the same lines next time.
 	if (references.length === 0) {
-		if (lastLineNumberScanned > fromLineNumber) {
-			await saveCursor(
-				{ transcriptPath: cursorKey, lineNumber: lastLineNumberScanned, updatedAt: new Date().toISOString() },
-				cwd,
-			);
-		}
-		return;
+		return lastLineNumberScanned;
 	}
 
 	const branch = getCurrentBranch(cwd);
@@ -600,16 +561,7 @@ async function discoverReferencesFromTranscript(sessionInfo: SessionInfo, cwd: s
 		failed.length > 0 ? ` (failed: [${failed.join(", ")}])` : "",
 	);
 
-	// Cursor advance on success / partial failure / total failure paths.
-	// upsertReferenceEntry is idempotent (same contentHash → skip write) and
-	// returns early for already-ignored entries, so re-scanning the same window
-	// can neither corrupt state nor resurrect an ignored entry. Advancing the
-	// cursor is purely an optimisation — it avoids re-scanning the same
-	// tool_results (wasted CPU + redundant idempotent writes) on the next pass.
-	await saveCursor(
-		{ transcriptPath: cursorKey, lineNumber: lastLineNumberScanned, updatedAt: new Date().toISOString() },
-		cwd,
-	);
+	return lastLineNumberScanned;
 }
 
 /** Extracts the first # heading from a markdown file. */

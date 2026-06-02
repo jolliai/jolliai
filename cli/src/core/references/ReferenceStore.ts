@@ -30,7 +30,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../../Logger.js";
 import type { Reference, ReferenceField, SourceId } from "../../Types.js";
@@ -151,9 +151,14 @@ export function hashReferenceContent(ref: Reference): string {
 	return sha256(renderMarkdown({ ...ref, referencedAt: "" }));
 }
 
-/** Wrap fs.rename so callers can mock IO uniformly via ReferenceStore. */
-export async function renameReferenceMarkdown(oldPath: string, newPath: string): Promise<void> {
-	await rename(oldPath, newPath);
+/**
+ * Delete a per-reference markdown file. Best-effort: a missing file is not an
+ * error (`force: true`), so callers hard-deleting a reference whose `.md` was
+ * already cleaned up (or never written) stay idempotent. Wrapped here so the
+ * delete path is mockable via ReferenceStore like rename/write.
+ */
+export async function deleteReferenceMarkdown(sourcePath: string): Promise<void> {
+	await rm(sourcePath, { force: true });
 }
 
 // ─── Markdown rendering / parsing ────────────────────────────────────────────

@@ -32,7 +32,7 @@
  * already no-data-loss (stash preserves every local byte) and unblocks the
  * sticky-failure scenario today.
  *
- * **Safety / "宁可漏触发，不能错触发".** Mistriggering on a vault with real
+ * **Safety / "better to under-trigger than mis-trigger".** Mistriggering on a vault with real
  * local history would wipe it via the destructive `checkout -B`. The
  * trigger conditions (`shouldRunBootstrapMerge`) and the in-function
  * pre-flight reassertion are intentionally strict: ANY signal that a
@@ -225,7 +225,7 @@ export async function runBootstrapMerge(
 		// Aggregate JSON paths (`<repo>/.jolli/{manifest,index,branches,catalog}.json`
 		// and root `.jolli/repos.json`) have a deterministic union merger via
 		// `tryAggregateMerge` — the same Tier 1.5 path exercised by acceptance
-		// §12. Use it here so the bootstrap case ends with both peers' entries
+		// tests. Use it here so the bootstrap case ends with both peers' entries
 		// preserved, matching pullRebase's Tier 1.5 behavior on the same
 		// content. If the merger returns `null` (parse failure, unknown
 		// envelope shape), fall through to the conservative remote-wins +

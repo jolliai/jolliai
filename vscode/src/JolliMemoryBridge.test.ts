@@ -148,10 +148,10 @@ const { installerInstall, installerUninstall, installerGetStatus } = vi.hoisted(
 	}),
 );
 
-const { archivePlanForCommit, detectPlans, ignorePlan } = vi.hoisted(() => ({
+const { archivePlanForCommit, detectPlans, removePlan } = vi.hoisted(() => ({
 	archivePlanForCommit: vi.fn(),
 	detectPlans: vi.fn(),
-	ignorePlan: vi.fn(),
+	removePlan: vi.fn(),
 }));
 
 const {
@@ -335,7 +335,7 @@ vi.mock("../../cli/src/Logger.js", () => ({
 vi.mock("./core/PlanService.js", () => ({
 	archivePlanForCommit,
 	detectPlans,
-	ignorePlan,
+	removePlan,
 }));
 
 vi.mock("./core/NoteService.js", () => ({
@@ -349,7 +349,7 @@ vi.mock("./core/NoteService.js", () => ({
 // boundary so the test runner doesn't crash with "Cannot find package vscode".
 vi.mock("./core/ReferenceService.js", () => ({
 	detectReferences: vi.fn().mockResolvedValue([]),
-	setReferenceIgnored: vi.fn().mockResolvedValue(undefined),
+	removeReference: vi.fn().mockResolvedValue(undefined),
 	openReferenceInBrowser: vi.fn().mockResolvedValue(true),
 	openReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 }));
@@ -3018,13 +3018,13 @@ describe("JolliMemoryBridge", () => {
 	});
 
 	describe("removePlan()", () => {
-		it("delegates to ignorePlan", async () => {
-			ignorePlan.mockResolvedValue(undefined);
+		it("delegates to removePlan", async () => {
+			removePlan.mockResolvedValue(undefined);
 			const bridge = makeBridge();
 
 			await bridge.removePlan("test-slug");
 
-			expect(ignorePlan).toHaveBeenCalledWith("test-slug", TEST_CWD);
+			expect(removePlan).toHaveBeenCalledWith("test-slug", TEST_CWD);
 		});
 	});
 
@@ -3415,19 +3415,18 @@ describe("JolliMemoryBridge", () => {
 			expect(result).toEqual(entities);
 		});
 
-		it("ignoreReference() delegates to setReferenceIgnored with mapKey + true", async () => {
-			const { setReferenceIgnored } = await import("./core/ReferenceService.js");
-			(setReferenceIgnored as ReturnType<typeof vi.fn>).mockResolvedValue(
+		it("removeReference() delegates to removeReference with mapKey", async () => {
+			const { removeReference } = await import("./core/ReferenceService.js");
+			(removeReference as ReturnType<typeof vi.fn>).mockResolvedValue(
 				undefined,
 			);
 			const bridge = makeBridge();
 
-			await bridge.ignoreReference("github:owner/repo#42");
+			await bridge.removeReference("github:owner/repo#42");
 
-			expect(setReferenceIgnored).toHaveBeenCalledWith(
+			expect(removeReference).toHaveBeenCalledWith(
 				TEST_CWD,
 				"github:owner/repo#42",
-				true,
 			);
 		});
 
