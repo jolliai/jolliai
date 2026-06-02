@@ -191,7 +191,6 @@ describe("loadRegenerateContext", () => {
 						{
 							slug: "p-c",
 							title: "child plan",
-							editCount: 1,
 							addedAt: "2026-05-20T00:00:00Z",
 							updatedAt: "2026-05-20T00:00:00Z",
 						},

@@ -1807,10 +1807,10 @@ export function buildSidebarScript(): string {
       el('i', { className: 'codicon codicon-markdown' }),
       el('span', { text: h.filename }),
     ]));
-    // No "edited N times" row — the count from PlanInfo.editCount is
-    // populated by transcript scanning, which misses plan touches that
-    // happen outside Claude's tool calls, so the number was misleading
-    // (often showing "0 times" for actively-edited plans).
+    // No "edited N times" row — edit-count tracking was removed because the
+    // transcript scanner misses plan touches outside Claude's tool calls, so
+    // the number was misleading (often showing "0 times" for actively-edited
+    // plans).
     kids.push(el('hr'));
     const actions = [];
     if (h.commitHash) {

@@ -298,7 +298,6 @@ describe("collectAllPlans", () => {
 		const plan: PlanReference = {
 			slug: "plan-one",
 			title: "Plan One",
-			editCount: 2,
 			addedAt: "2026-01-01",
 			updatedAt: "2026-01-15",
 		};
@@ -311,14 +310,12 @@ describe("collectAllPlans", () => {
 		const older: PlanReference = {
 			slug: "plan-x",
 			title: "Plan X v1",
-			editCount: 1,
 			addedAt: "2026-01-01",
 			updatedAt: "2026-01-10",
 		};
 		const newer: PlanReference = {
 			slug: "plan-x",
 			title: "Plan X v2",
-			editCount: 3,
 			addedAt: "2026-01-01",
 			updatedAt: "2026-01-20",
 		};
@@ -335,14 +332,12 @@ describe("collectAllPlans", () => {
 		const newer: PlanReference = {
 			slug: "plan-x",
 			title: "Plan X v2",
-			editCount: 3,
 			addedAt: "2026-01-01",
 			updatedAt: "2026-01-20",
 		};
 		const older: PlanReference = {
 			slug: "plan-x",
 			title: "Plan X v1",
-			editCount: 1,
 			addedAt: "2026-01-01",
 			updatedAt: "2026-01-10",
 		};
@@ -365,7 +360,7 @@ describe("collectAllPlans", () => {
 			children: [
 				leaf({
 					commitHash: "child1",
-					plans: [{ slug: "p1", title: "P1", editCount: 1, addedAt: "2026-01-01", updatedAt: "2026-01-01" }],
+					plans: [{ slug: "p1", title: "P1", addedAt: "2026-01-01", updatedAt: "2026-01-01" }],
 					children: [
 						leaf({
 							commitHash: "grandchild",
@@ -373,7 +368,6 @@ describe("collectAllPlans", () => {
 								{
 									slug: "p2",
 									title: "P2",
-									editCount: 1,
 									addedAt: "2026-01-01",
 									updatedAt: "2026-01-01",
 								},
@@ -458,7 +452,6 @@ describe("collectAllPlansWithHosts", () => {
 		const plan: PlanReference = {
 			slug: "p1",
 			title: "P1",
-			editCount: 1,
 			addedAt: "2026-01-01",
 			updatedAt: "2026-01-01",
 		};
@@ -473,7 +466,6 @@ describe("collectAllPlansWithHosts", () => {
 		const plan: PlanReference = {
 			slug: "p1",
 			title: "P1",
-			editCount: 1,
 			addedAt: "2026-01-01",
 			updatedAt: "2026-01-01",
 		};
@@ -487,14 +479,12 @@ describe("collectAllPlansWithHosts", () => {
 		const older: PlanReference = {
 			slug: "p1",
 			title: "v1",
-			editCount: 1,
 			addedAt: "2026-01-01",
 			updatedAt: "2026-01-10",
 		};
 		const newer: PlanReference = {
 			slug: "p1",
 			title: "v2",
-			editCount: 2,
 			addedAt: "2026-01-01",
 			updatedAt: "2026-01-20",
 		};

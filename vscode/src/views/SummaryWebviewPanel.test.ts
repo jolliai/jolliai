@@ -1318,14 +1318,12 @@ describe("SummaryWebviewPanel", () => {
 					{
 						slug: "plan-1",
 						title: "中文计划",
-						editCount: 0,
 						addedAt: "",
 						updatedAt: "",
 					},
 					{
 						slug: "plan-2",
 						title: "English Plan",
-						editCount: 0,
 						addedAt: "",
 						updatedAt: "",
 					},
@@ -1358,7 +1356,6 @@ describe("SummaryWebviewPanel", () => {
 					{
 						slug: "plan-ascii",
 						title: "ASCII Title",
-						editCount: 0,
 						addedAt: "",
 						updatedAt: "",
 					},
@@ -1847,7 +1844,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "plan-abc",
 							title: "Test Plan",
-							editCount: 1,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -1881,14 +1877,12 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "plan-a",
 							title: "Plan A",
-							editCount: 1,
 							addedAt: "",
 							updatedAt: "",
 						},
 						{
 							slug: "plan-empty",
 							title: "Plan Empty",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -3125,7 +3119,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "my-plan",
 							title: "Old Title",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -3161,7 +3154,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "my-plan",
 							title: "Old",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -3228,14 +3220,12 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "plan-a",
 							title: "Plan A",
-							editCount: 1,
 							addedAt: "",
 							updatedAt: "",
 						},
 						{
 							slug: "plan-b",
 							title: "Plan B",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -3276,7 +3266,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "only-plan",
 							title: "Only",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -3300,7 +3289,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "plan-a",
 							title: "Plan A",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -3328,7 +3316,6 @@ describe("SummaryWebviewPanel", () => {
 				mockArchivePlanForCommit.mockResolvedValue({
 					slug: "avail-plan-abc123",
 					title: "Available Plan",
-					editCount: 0,
 					addedAt: "2025-01-01",
 					updatedAt: "2025-01-01",
 				});
@@ -3357,7 +3344,6 @@ describe("SummaryWebviewPanel", () => {
 				mockArchivePlanForCommit.mockResolvedValue({
 					slug: "new-plan-abc123",
 					title: "New Plan",
-					editCount: 0,
 					addedAt: "2025-01-01",
 					updatedAt: "2025-01-01",
 				});
@@ -3366,7 +3352,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "existing-plan",
 							title: "Existing",
-							editCount: 1,
 							addedAt: "2025-01-01",
 							updatedAt: "2025-01-01",
 						},
@@ -4282,7 +4267,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "race-plan",
 							title: "中文",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -4313,7 +4297,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "cn-plan",
 							title: "中文标题",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -4359,7 +4342,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "en-plan",
 							title: "English Plan",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -4382,7 +4364,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "bad",
 							title: "Bad",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -5292,7 +5273,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "cn",
 							title: "中文计划",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -5387,7 +5367,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "no-heading",
 							title: "Original",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -5414,7 +5393,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "other-plan",
 							title: "Other",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -5443,7 +5421,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "my-plan",
 							title: "Old",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -5479,7 +5456,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "body-cjk",
 							title: "English Title",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -5571,7 +5547,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "err-plan",
 							title: "English Title",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -5657,7 +5632,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "plan-a",
 							title: "Plan A",
-							editCount: 1,
 							addedAt: "",
 							updatedAt: "",
 							jolliPlanDocId: 77,
@@ -5716,7 +5690,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "p1",
 							title: "P1",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -5744,14 +5717,12 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "p1",
 							title: "P1",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
 						{
 							slug: "p2",
 							title: "P2",
-							editCount: 0,
 							addedAt: "",
 							updatedAt: "",
 						},
@@ -9434,7 +9405,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "p",
 							title: "P",
-							editCount: 0,
 							addedAt: "2026-01-01T00:00:00Z",
 							updatedAt: "2026-01-01T00:00:00Z",
 						},
@@ -9937,7 +9907,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "plan-a",
 							title: "Plan A",
-							editCount: 0,
 							addedAt: "2026-01-01T00:00:00Z",
 							updatedAt: "2026-01-01T00:00:00Z",
 						},
@@ -10137,7 +10106,6 @@ describe("SummaryWebviewPanel", () => {
 						{
 							slug: "p",
 							title: "中文标题",
-							editCount: 0,
 							addedAt: "2026-01-01T00:00:00Z",
 							updatedAt: "2026-01-01T00:00:00Z",
 						},

@@ -21,7 +21,6 @@ function planRef(o: Partial<PlanReference> = {}): PlanReference {
 	return {
 		slug: "auth-redesign",
 		title: "Auth Redesign",
-		editCount: 1,
 		addedAt: "2026-01-01",
 		updatedAt: "2026-01-01",
 		...o,

@@ -61,7 +61,6 @@ describe("normalizeToV4", () => {
 						{
 							slug: "feature-x",
 							title: "Feature X",
-							editCount: 1,
 							addedAt: "2026-05-20T00:00:00Z",
 							updatedAt: "2026-05-20T00:00:00Z",
 						},
@@ -128,7 +127,6 @@ describe("normalizeToV4", () => {
 						{
 							slug: "p-c",
 							title: "child plan",
-							editCount: 1,
 							addedAt: "2026-05-20T00:00:00Z",
 							updatedAt: "2026-05-20T00:00:00Z",
 						},
@@ -142,7 +140,6 @@ describe("normalizeToV4", () => {
 								{
 									slug: "p-g",
 									title: "grandchild plan",
-									editCount: 1,
 									addedAt: "2026-05-20T00:00:00Z",
 									updatedAt: "2026-05-20T00:00:00Z",
 								},
@@ -209,7 +206,6 @@ describe("normalizeToV4", () => {
 				{
 					slug: "shared",
 					title: "Old (root)",
-					editCount: 1,
 					addedAt: "2026-05-20T00:00:00Z",
 					updatedAt: "2026-05-20T00:00:00Z",
 				},
@@ -223,7 +219,6 @@ describe("normalizeToV4", () => {
 						{
 							slug: "shared",
 							title: "New (child)",
-							editCount: 2,
 							addedAt: "2026-05-20T00:00:00Z",
 							updatedAt: "2026-05-21T00:00:00Z",
 						},

@@ -1253,7 +1253,7 @@ describe("QueueWorker", () => {
 				jolliDocId: 42,
 				jolliDocUrl: "https://jolli.app/d/42",
 				orphanedDocIds: [1, 2],
-				plans: [{ slug: "p", title: "P", editCount: 1, addedAt: "x", updatedAt: "y" }],
+				plans: [{ slug: "p", title: "P", addedAt: "x", updatedAt: "y" }],
 				notes: [{ id: "n", title: "N", format: "markdown" as const, addedAt: "x", updatedAt: "y" }],
 				e2eTestGuide: [{ title: "T", steps: ["s"], expectedResults: ["r"] }],
 			};

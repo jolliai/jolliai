@@ -460,7 +460,6 @@ describe("QueueWorker selection filter", () => {
 			updatedAt: "2026-01-01T00:00:00Z",
 			branch: "main",
 			commitHash: null,
-			editCount: 0,
 		};
 		const skipPlan: PlanEntry = {
 			slug: "plan-skip",
@@ -470,7 +469,6 @@ describe("QueueWorker selection filter", () => {
 			updatedAt: "2026-01-01T00:00:00Z",
 			branch: "main",
 			commitHash: null,
-			editCount: 0,
 		};
 		vi.mocked(detectActivePlansForBranch).mockResolvedValue([keepPlan, skipPlan]);
 
@@ -649,7 +647,6 @@ describe("QueueWorker selection filter", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: null,
-					editCount: 1,
 				},
 				"plan-skip": {
 					slug: "plan-skip",
@@ -659,7 +656,6 @@ describe("QueueWorker selection filter", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: null,
-					editCount: 1,
 				},
 			},
 		});

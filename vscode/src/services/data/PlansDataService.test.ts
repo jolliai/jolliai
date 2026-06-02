@@ -12,7 +12,6 @@ function makePlan(lastModified: string, slug = "plan"): PlanInfo {
 		addedAt: lastModified,
 		updatedAt: lastModified,
 		branch: "main",
-		editCount: 0,
 		commitHash: null,
 	};
 }

@@ -136,7 +136,6 @@ function makePlan(overrides: Partial<PlanInfo> = {}): PlanInfo {
 		addedAt: "2026-03-30T09:00:00.000Z",
 		updatedAt: "2026-03-30T10:00:00.000Z",
 		branch: "feature/test",
-		editCount: 2,
 		commitHash: null,
 		...overrides,
 	};
@@ -155,14 +154,13 @@ describe("PlanItem", () => {
 		});
 		const tooltip = item.tooltip as { value: string; isTrusted: boolean };
 		expect(tooltip.isTrusted).toBe(true);
-		expect(tooltip.value).toContain("edited 2 times");
 		expect(tooltip.value).toContain("command:jollimemory.editPlan");
 		expect(tooltip.value).not.toContain("copyCommitHash");
 	});
 
 	it("renders committed plans with short hash and copy link", () => {
 		const item = new PlanItem(
-			makePlan({ commitHash: "abcdef1234567890", editCount: 1 }),
+			makePlan({ commitHash: "abcdef1234567890" }),
 		);
 
 		expect(item.label).toBe("abcdef12 · Alpha Plan");
@@ -170,7 +168,6 @@ describe("PlanItem", () => {
 		const tooltip = item.tooltip as { value: string };
 		expect(tooltip.value).toContain("$(git-commit) `abcdef12` $(copy)");
 		expect(tooltip.value).toContain("Preview Plan");
-		expect(tooltip.value).toContain("edited 1 time");
 	});
 });
 

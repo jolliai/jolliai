@@ -435,8 +435,6 @@ export interface PlanReference {
 	readonly slug: string;
 	/** First # heading from the markdown file */
 	readonly title: string;
-	/** Number of Write/Edit tool operations on this plan in transcripts */
-	readonly editCount: number;
 	/** ISO 8601 — when this plan was first discovered */
 	readonly addedAt: string;
 	/** ISO 8601 — when this plan was last modified */
@@ -456,7 +454,6 @@ export interface PlanEntry {
 	readonly updatedAt: string;
 	readonly branch: string;
 	readonly commitHash: string | null;
-	readonly editCount: number;
 	/** SHA-256 hash of the plan file content when associated with a commit. Used as a guard to detect if the file was overwritten with new content. */
 	readonly contentHashAtCommit?: string;
 	/** When true, plan is hidden from PLANS panel (user removed it). Cleared if source file content changes. */

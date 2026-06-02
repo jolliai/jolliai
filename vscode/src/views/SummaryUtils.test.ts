@@ -575,7 +575,6 @@ describe("SummaryUtils", () => {
 			return {
 				slug: "plan-slug",
 				title: "My Plan",
-				editCount: 3,
 				addedAt: "2026-03-10T08:00:00Z",
 				updatedAt: "2026-03-15T08:00:00Z",
 				...overrides,
