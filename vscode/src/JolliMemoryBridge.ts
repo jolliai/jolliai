@@ -90,7 +90,7 @@ import {
 	detectReferences,
 	openReferenceInBrowser as openReferenceInBrowserImpl,
 	openReferenceMarkdown as openReferenceMarkdownImpl,
-	setReferenceIgnored,
+	removeReference,
 } from "./core/ReferenceService.js";
 import {
 	archiveNoteForCommit,
@@ -101,7 +101,7 @@ import {
 import {
 	archivePlanForCommit,
 	detectPlans,
-	ignorePlan,
+	removePlan,
 } from "./core/PlanService.js";
 import type {
 	BranchCommit,
@@ -2364,7 +2364,7 @@ export class JolliMemoryBridge {
 
 	/** Marks a plan as ignored in plans.json (hidden from PLANS panel). */
 	async removePlan(slug: string): Promise<void> {
-		await ignorePlan(slug, this.cwd);
+		await removePlan(slug, this.cwd);
 	}
 
 	/**
@@ -2428,9 +2428,9 @@ export class JolliMemoryBridge {
 		return detectReferences(this.cwd);
 	}
 
-	/** Marks a reference as ignored (hidden from the panel) by mapKey. */
-	async ignoreReference(mapKey: string): Promise<void> {
-		await setReferenceIgnored(this.cwd, mapKey, true);
+	/** Hard-removes a reference (registry row + backing markdown) by mapKey. Allows revival. */
+	async removeReference(mapKey: string): Promise<void> {
+		await removeReference(this.cwd, mapKey);
 	}
 
 	/** Opens the reference's upstream URL in the user's default browser. */

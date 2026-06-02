@@ -103,11 +103,9 @@ import {
 	detectNotes,
 	generateNoteSlug,
 	getNotesDir,
-	ignoreNote,
 	listUnassociatedNotes,
 	removeNote,
 	saveNote,
-	unassociateNoteFromCommit,
 } from "./NoteService.js";
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
@@ -565,7 +563,7 @@ describe("NoteService", () => {
 
 		it("logs the count of found vs registry notes", async () => {
 			const visible = makeNoteEntry({ id: "visible", commitHash: null });
-			const hidden = makeNoteEntry({ id: "hidden", ignored: true });
+			const hidden = makeNoteEntry({ id: "hidden", commitHash: "abc" });
 			mockLoadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: {},
@@ -815,21 +813,6 @@ describe("NoteService", () => {
 			expect(result.commitHash).toBeNull();
 		});
 
-		it("sets a branch value for new notes from getCurrentBranch", async () => {
-			mockLoadPlansRegistry.mockResolvedValue(emptyRegistry());
-			mockExistsSync.mockReturnValue(true);
-			mockReadFileSync.mockReturnValue("content");
-
-			await saveNote(undefined, "New Note", "content", "snippet", CWD);
-
-			// getCurrentBranch uses require("node:child_process") internally;
-			// verify the registry entry gets a branch value
-			const saved = mockSavePlansRegistry.mock.calls[0][0];
-			const noteId = Object.keys(saved.notes)[0];
-			expect(typeof saved.notes[noteId].branch).toBe("string");
-			expect(saved.notes[noteId].branch.length).toBeGreaterThan(0);
-		});
-
 		it("logs 'created' for new notes and 'updated' for existing", async () => {
 			// New note
 			mockLoadPlansRegistry.mockResolvedValue(emptyRegistry());
@@ -901,44 +884,6 @@ describe("NoteService", () => {
 		});
 	});
 
-	// ─── ignoreNote ──────────────────────────────────────────────────────────
-
-	describe("ignoreNote", () => {
-		it("sets ignored flag on existing entry", async () => {
-			const entry = makeNoteEntry();
-			mockLoadPlansRegistry.mockResolvedValue({
-				version: 1,
-				plans: {},
-				notes: { "test-note": entry },
-			});
-
-			await ignoreNote("test-note", CWD);
-
-			expect(mockSavePlansRegistry).toHaveBeenCalledWith(
-				expect.objectContaining({
-					notes: { "test-note": { ...entry, ignored: true } },
-				}),
-				CWD,
-			);
-		});
-
-		it("does nothing when id is not found in registry", async () => {
-			mockLoadPlansRegistry.mockResolvedValue(emptyRegistry());
-
-			await ignoreNote("nonexistent", CWD);
-
-			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
-		});
-
-		it("works with registry that has no notes field", async () => {
-			mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {} });
-
-			await ignoreNote("nonexistent", CWD);
-
-			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
-		});
-	});
-
 	// ─── removeNote ────────────────────────────────────────────────────────────
 
 	describe("removeNote", () => {
@@ -986,13 +931,18 @@ describe("NoteService", () => {
 			);
 		});
 
-		it("removes entry without deleting file for committed notes", async () => {
+		it("removes the entry but skips file deletion when the backing file is already gone", async () => {
+			// New semantics: removeNote deletes the backing file only when it is
+			// inside .jolli/jollimemory/ AND still exists — commitHash no longer
+			// gates it. A committed snippet's file was already cleaned up by
+			// archiveNoteForCommit, so existsSync is false → entry removed, no unlink.
 			const entry = makeNoteEntry({ commitHash: "abc123" });
 			mockLoadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: {},
 				notes: { "my-note": entry },
 			});
+			mockExistsSync.mockReturnValue(false);
 
 			await removeNote("my-note", CWD);
 
@@ -1076,7 +1026,7 @@ describe("NoteService", () => {
 			expect(result?.addedAt).toBe("2025-01-01T00:00:00.000Z");
 		});
 
-		it("sets archive guard on original entry and creates committed snapshot", async () => {
+		it("sets the archive guard on the original entry without creating an archive row", async () => {
 			const entry = makeNoteEntry();
 			mockLoadPlansRegistry.mockResolvedValue({
 				version: 1,
@@ -1089,17 +1039,16 @@ describe("NoteService", () => {
 			await archiveNoteForCommit("test-note", "06d0f729abcdef12", CWD);
 
 			const saved = mockSavePlansRegistry.mock.calls[0][0];
-			// Original entry becomes guard
+			// Only the guard row (original id) survives — it carries the
+			// archive-time contentHashAtCommit and the commit hash.
 			expect(saved.notes["test-note"].commitHash).toBe("06d0f729abcdef12");
 			expect(saved.notes["test-note"].contentHashAtCommit).toBe(
 				"mock-sha256-hash",
 			);
 			expect(saved.notes["test-note"].ignored).toBeUndefined();
-			// New entry is the committed snapshot
-			expect(saved.notes["test-note-06d0f729"].id).toBe("test-note-06d0f729");
-			expect(saved.notes["test-note-06d0f729"].commitHash).toBe(
-				"06d0f729abcdef12",
-			);
+			// No per-commit archive row is created; the new id lives only in the
+			// returned NoteReference / orphan-branch snapshot.
+			expect(saved.notes["test-note-06d0f729"]).toBeUndefined();
 		});
 
 		it("stores note in orphan branch via storeNotes", async () => {
@@ -1293,56 +1242,6 @@ describe("NoteService", () => {
 		});
 	});
 
-	// ─── unassociateNoteFromCommit ───────────────────────────────────────────
-
-	describe("unassociateNoteFromCommit", () => {
-		it("sets commitHash to null", async () => {
-			const entry = makeNoteEntry({ commitHash: "abc123" });
-			mockLoadPlansRegistry.mockResolvedValue({
-				version: 1,
-				plans: {},
-				notes: { "test-note": entry },
-			});
-
-			await unassociateNoteFromCommit("test-note", CWD);
-
-			const saved = mockSavePlansRegistry.mock.calls[0][0];
-			expect(saved.notes["test-note"].commitHash).toBeNull();
-		});
-
-		it("does nothing when id is not in registry", async () => {
-			mockLoadPlansRegistry.mockResolvedValue(emptyRegistry());
-
-			await unassociateNoteFromCommit("nonexistent", CWD);
-
-			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
-		});
-
-		it("works with registry that has no notes field", async () => {
-			mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {} });
-
-			await unassociateNoteFromCommit("nonexistent", CWD);
-
-			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
-		});
-
-		it("logs unassociate operation", async () => {
-			const entry = makeNoteEntry({ commitHash: "abc123" });
-			mockLoadPlansRegistry.mockResolvedValue({
-				version: 1,
-				plans: {},
-				notes: { "test-note": entry },
-			});
-
-			await unassociateNoteFromCommit("test-note", CWD);
-
-			expect(info).toHaveBeenCalledWith(
-				"notes",
-				expect.stringContaining("Unassociated note test-note"),
-			);
-		});
-	});
-
 	// ─── listUnassociatedNotes ───────────────────────────────────────────────
 
 	describe("listUnassociatedNotes", () => {
@@ -1375,33 +1274,6 @@ describe("NoteService", () => {
 			expect(result).toEqual([
 				{ id: "note-a", title: "Note A", format: "snippet" },
 				{ id: "note-c", title: "Note C", format: "snippet" },
-			]);
-		});
-
-		it("excludes ignored notes even if commitHash is null", async () => {
-			const notes = {
-				"note-a": makeNoteEntry({
-					id: "note-a",
-					title: "Note A",
-					commitHash: null,
-					ignored: true,
-				}),
-				"note-b": makeNoteEntry({
-					id: "note-b",
-					title: "Note B",
-					commitHash: null,
-				}),
-			};
-			mockLoadPlansRegistry.mockResolvedValue({
-				version: 1,
-				plans: {},
-				notes,
-			});
-
-			const result = await listUnassociatedNotes(CWD);
-
-			expect(result).toEqual([
-				{ id: "note-b", title: "Note B", format: "snippet" },
 			]);
 		});
 

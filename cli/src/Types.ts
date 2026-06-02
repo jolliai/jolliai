@@ -452,12 +452,9 @@ export interface PlanEntry {
 	readonly sourcePath: string;
 	readonly addedAt: string;
 	readonly updatedAt: string;
-	readonly branch: string;
 	readonly commitHash: string | null;
 	/** SHA-256 hash of the plan file content when associated with a commit. Used as a guard to detect if the file was overwritten with new content. */
 	readonly contentHashAtCommit?: string;
-	/** When true, plan is hidden from PLANS panel (user removed it). Cleared if source file content changes. */
-	readonly ignored?: boolean;
 }
 
 /**
@@ -489,12 +486,9 @@ export interface NoteEntry {
 	readonly format: NoteFormat;
 	readonly addedAt: string;
 	readonly updatedAt: string;
-	readonly branch: string;
 	readonly commitHash: string | null;
 	/** SHA-256 hash of note content when associated with a commit (archive guard) */
 	readonly contentHashAtCommit?: string;
-	/** When true, note is hidden from the panel */
-	readonly ignored?: boolean;
 	/** File path in .jolli/jollimemory/notes/<id>.md (all notes are file-backed) */
 	readonly sourcePath?: string;
 }
@@ -610,12 +604,12 @@ export interface Reference {
 /**
  * ReferenceEntry — persisted registry row in the `plans.json.references` map.
  *
- * Holds one row per external reference across every {@link SourceId}. Map key
- * follows the same archive pattern as Plans/Notes: the active row uses
- * `<source>:<nativeId>` and (after `associateReferencesWithCommit`) a second
- * snapshot row appears keyed `<source>:<nativeId>-<shortHash>`. The
- * `contentHashAtCommit` guard pattern, branch-scoping, and ignored semantics
- * mirror the Plan / Note registry rows.
+ * Holds one row per external reference across every {@link SourceId}, keyed
+ * `<source>:<nativeId>`. Unlike Plan / Note rows, a reference is DELETED from
+ * the registry when its commit lands — its value-snapshot lives on in the
+ * orphan branch's `CommitSummary.references`. So there is no archive row,
+ * `contentHashAtCommit` guard, branch scoping, or ignored flag: every row
+ * here is an active, uncommitted reference.
  */
 export interface ReferenceEntry {
 	readonly source: SourceId;
@@ -624,14 +618,8 @@ export interface ReferenceEntry {
 	readonly url: string;
 	/** Absolute path to `<jolliMemoryDir>/references/<source>/<sanitized-key>.md`. */
 	readonly sourcePath: string;
-	readonly branch: string;
 	readonly addedAt: string;
 	readonly updatedAt: string;
-	readonly commitHash: string | null;
-	/** SHA-256 of the canonical markdown at archive time (guard pattern). */
-	readonly contentHashAtCommit?: string;
-	/** When true, hidden from the multi-source panel. */
-	readonly ignored?: boolean;
 	/** MCP tool name that originally surfaced this reference. */
 	readonly sourceToolName: string;
 }

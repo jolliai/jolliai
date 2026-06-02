@@ -413,7 +413,7 @@ describe("PromptTemplates", () => {
 				placeholders.add(match[1]);
 			}
 			// Caller still must pass commit info + conversation + diff plus the
-			// three Stage 2 structured-context blocks (references / plans / notes).
+			// three structured-context blocks (references / plans / notes).
 			// No more topicGuidance or workSize-derived field.
 			expect(placeholders).toEqual(
 				new Set([

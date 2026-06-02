@@ -16,7 +16,7 @@
  *     lone-surrogate character.
  *   - Decimal numeric: `&#DD…;`, same range guard.
  *
- * This module is owned by GitHubAdapter only — per plan §Constraints, adapter
+ * This module is owned by GitHubAdapter only — adapter
  * modules must not share helpers across sources. NotionAdapter does NOT call
  * into this file (envelope parsing is its own concern).
  */

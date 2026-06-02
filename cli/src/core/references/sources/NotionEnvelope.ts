@@ -22,7 +22,7 @@
  * `<content>` block is read — the notion-fetch shape is a single, non-nested
  * content block, so multiple / nested blocks are not a concern in practice.
  *
- * Adapter modules MUST NOT share helpers across sources (per plan §Constraints).
+ * Adapter modules MUST NOT share helpers across sources.
  * This module is owned by NotionAdapter only.
  */
 

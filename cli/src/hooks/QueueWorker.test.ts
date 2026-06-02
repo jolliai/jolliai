@@ -25,7 +25,6 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 		associatePlanWithCommit: vi.fn(),
 		associateNoteWithCommit: vi.fn(),
-		associateReferenceWithCommit: vi.fn().mockResolvedValue(undefined),
 		detectUncommittedReferenceIds: vi.fn().mockResolvedValue([]),
 		detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
 		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
@@ -47,8 +46,7 @@ vi.mock("../core/references/ReferenceStore.js", () => ({
 	readReferenceMarkdown: vi.fn().mockResolvedValue(null),
 	readReferenceMarkdownFromString: vi.fn().mockReturnValue(null),
 	writeReferenceMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/x", contentHash: "fake-content-hash" }),
-	renameReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
-	hashReferenceContent: vi.fn(() => "fake-content-hash"),
+	deleteReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/PlanPromptFormatter.js", () => ({
@@ -333,9 +331,6 @@ import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import {
-	associateNoteWithCommit,
-	associatePlanWithCommit,
-	associateReferenceWithCommit,
 	dequeueAllGitOperations,
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
@@ -406,7 +401,6 @@ describe("QueueWorker", () => {
 		vi.mocked(savePlansRegistry).mockResolvedValue(undefined);
 		vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([]);
 		vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([]);
-		vi.mocked(associateReferenceWithCommit).mockResolvedValue(undefined);
 		vi.mocked(detectActivePlansForBranch).mockResolvedValue([]);
 		vi.mocked(detectActiveNotesForBranch).mockResolvedValue([]);
 		vi.mocked(getReferenceEntriesForBranch).mockResolvedValue([]);
@@ -554,7 +548,6 @@ describe("QueueWorker", () => {
 							sourcePath: "/tmp/ghost.md",
 							addedAt: "2026-04-01T00:00:00Z",
 							updatedAt: "2026-04-01T00:00:00Z",
-							branch: "main",
 							commitHash: null,
 						},
 					},
@@ -599,17 +592,13 @@ describe("QueueWorker", () => {
 						title: "Treat referenced Linear issues",
 						url: "https://linear.app/jolliai/issue/PROJ-1528/",
 						sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
-						branch: "feature/test",
 						addedAt: "2026-04-01T00:00:00Z",
 						updatedAt: "2026-04-01T00:00:00Z",
-						commitHash: null,
 						sourceToolName: "mcp__linear__get_issue",
 					},
 				},
 			});
-			const { readReferenceMarkdown, renameReferenceMarkdown } = await import(
-				"../core/references/ReferenceStore.js"
-			);
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
 			vi.mocked(readReferenceMarkdown).mockResolvedValue({
 				mapKey: "linear:PROJ-1528",
 				source: "linear",
@@ -645,12 +634,9 @@ describe("QueueWorker", () => {
 				{ key: "priority", label: "Priority", value: "No priority", icon: "flame" },
 				{ key: "labels", label: "Labels", value: "JolliMemory, Feature", icon: "tag" },
 			]);
-			// Physical rename through ReferenceStore (referencePath stub returns the
-			// canonical references/<source>/<key>.md location).
-			expect(renameReferenceMarkdown).toHaveBeenCalledWith(
-				"/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
-				"/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528-abc12345.md",
-			);
+			// The reference markdown is NOT physically renamed — the archivedKey
+			// lives only in the CommitSummary's ReferenceCommitRef (asserted above), while
+			// the guard row keeps the canonical references/<source>/<key>.md file in place.
 		});
 
 		it("skips entities whose source markdown is unreadable but still completes the pipeline", async () => {
@@ -678,10 +664,8 @@ describe("QueueWorker", () => {
 						title: "t",
 						url: "u",
 						sourcePath: "/missing.md",
-						branch: "feature/test",
 						addedAt: "x",
 						updatedAt: "x",
-						commitHash: null,
 						sourceToolName: "mcp__linear__get_issue",
 					},
 				},
@@ -726,10 +710,8 @@ describe("QueueWorker", () => {
 						title: "Linear issue",
 						url: "https://linear.app/x/PROJ-1528",
 						sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
-						branch: "feature/test",
 						addedAt: "x",
 						updatedAt: "x",
-						commitHash: null,
 						sourceToolName: "mcp__linear__get_issue",
 					},
 					"jira:KAN-7": {
@@ -738,10 +720,8 @@ describe("QueueWorker", () => {
 						title: "Jira ticket",
 						url: "https://example.atlassian.net/browse/KAN-7",
 						sourcePath: "/test/cwd/.jolli/jollimemory/references/jira/KAN-7.md",
-						branch: "feature/test",
 						addedAt: "x",
 						updatedAt: "x",
-						commitHash: null,
 						sourceToolName: "mcp__jira__get_issue",
 					},
 				},
@@ -862,7 +842,6 @@ describe("QueueWorker", () => {
 						id: "note-1",
 						title: "keep me",
 						format: "snippet",
-						branch: "feature/test",
 						commitHash: null,
 						sourcePath: "/repo/.jolli/jollimemory/notes/note-1.md",
 						addedAt: "y",
@@ -876,10 +855,8 @@ describe("QueueWorker", () => {
 						title: "Real entry",
 						url: "https://linear.app/x/PROJ-1528",
 						sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-1528.md",
-						branch: "feature/test",
 						addedAt: "x",
 						updatedAt: "x",
-						commitHash: null,
 						sourceToolName: "mcp__linear__get_issue",
 					},
 				},
@@ -917,7 +894,6 @@ describe("QueueWorker", () => {
 					id: "note-1",
 					title: "keep me",
 					format: "snippet",
-					branch: "feature/test",
 					commitHash: null,
 					sourcePath: "/repo/.jolli/jollimemory/notes/note-1.md",
 					addedAt: "y",
@@ -928,7 +904,7 @@ describe("QueueWorker", () => {
 		});
 	});
 
-	describe("runWorker — Step 6b prompt assembly (multi-source)", () => {
+	describe("runWorker — prompt assembly (multi-source)", () => {
 		it("pulls active entities from getReferenceEntriesForBranch and renders one block per source", async () => {
 			const op = makeCommitOp({ commitHash: "abc12345def67890" });
 			vi.mocked(dequeueAllGitOperations)
@@ -937,7 +913,7 @@ describe("QueueWorker", () => {
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks("abc12345def67890");
 
-			// Provide active entries for two sources — Linear and Jira. Step 6b
+			// Provide active entries for two sources — Linear and Jira. The pipeline
 			// must call getReferenceEntriesForBranch (NOT getReferenceEntriesForBranch).
 			vi.mocked(getReferenceEntriesForBranch).mockResolvedValue([
 				{
@@ -946,10 +922,8 @@ describe("QueueWorker", () => {
 					title: "Linear active",
 					url: "https://linear.app/x/PROJ-9",
 					sourcePath: "/test/cwd/.jolli/jollimemory/references/linear/PROJ-9.md",
-					branch: "feature/test",
 					addedAt: "x",
 					updatedAt: "x",
-					commitHash: null,
 					sourceToolName: "mcp__linear__get_issue",
 				},
 				{
@@ -958,10 +932,8 @@ describe("QueueWorker", () => {
 					title: "Jira active",
 					url: "https://example.atlassian.net/browse/KAN-9",
 					sourcePath: "/test/cwd/.jolli/jollimemory/references/jira/KAN-9.md",
-					branch: "feature/test",
 					addedAt: "x",
 					updatedAt: "x",
-					commitHash: null,
 					sourceToolName: "mcp__jira__get_issue",
 				},
 			]);
@@ -1268,7 +1240,7 @@ describe("QueueWorker", () => {
 	});
 
 	describe("detectUncommittedNoteIds", () => {
-		it("returns only notes with null commitHash and no ignored/contentHashAtCommit", async () => {
+		it("returns only notes with null commitHash and no contentHashAtCommit guard", async () => {
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
 				version: 1,
 				plans: {},
@@ -1280,10 +1252,9 @@ describe("QueueWorker", () => {
 						sourcePath: "/p",
 						addedAt: "x",
 						updatedAt: "y",
-						branch: "main",
 						commitHash: null,
 					},
-					// Fails branch: already committed
+					// Excluded: already committed
 					committed: {
 						id: "committed",
 						title: "Committed",
@@ -1291,22 +1262,9 @@ describe("QueueWorker", () => {
 						sourcePath: "/p",
 						addedAt: "x",
 						updatedAt: "y",
-						branch: "main",
 						commitHash: "abc123",
 					},
-					// Fails branch: ignored
-					ignored: {
-						id: "ignored",
-						title: "Ignored",
-						format: "markdown" as const,
-						sourcePath: "/p",
-						addedAt: "x",
-						updatedAt: "y",
-						branch: "main",
-						commitHash: null,
-						ignored: true,
-					},
-					// Fails branch: contentHashAtCommit set (guard entry)
+					// Excluded: archive guard (contentHashAtCommit set, source not revived)
 					guard: {
 						id: "guard",
 						title: "Guard",
@@ -1314,7 +1272,6 @@ describe("QueueWorker", () => {
 						sourcePath: "/p",
 						addedAt: "x",
 						updatedAt: "y",
-						branch: "main",
 						commitHash: null,
 						contentHashAtCommit: "hash",
 					},
@@ -1329,41 +1286,6 @@ describe("QueueWorker", () => {
 			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({ version: 1, plans: {} });
 			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "main");
 			expect(ids.size).toBe(0);
-		});
-
-		it("excludes notes whose branch differs from the target branch", async () => {
-			// Regression guard for the cross-branch leak: parallels the
-			// detectPlanSlugsFromRegistry test in PostCommitHook.helpers.test.ts.
-			// Without the branch filter, notes from `feature/idle` would be
-			// associated with a commit on `feature/active`.
-			vi.mocked(loadPlansRegistry).mockResolvedValueOnce({
-				version: 1,
-				plans: {},
-				notes: {
-					"current-note": {
-						id: "current-note",
-						title: "Current",
-						format: "markdown" as const,
-						sourcePath: "/p",
-						addedAt: "x",
-						updatedAt: "y",
-						branch: "feature/active",
-						commitHash: null,
-					},
-					"other-note": {
-						id: "other-note",
-						title: "Other",
-						format: "markdown" as const,
-						sourcePath: "/p",
-						addedAt: "x",
-						updatedAt: "y",
-						branch: "feature/idle",
-						commitHash: null,
-					},
-				},
-			});
-			const ids = await __test__.detectUncommittedNoteIds("/test/cwd", "feature/active");
-			expect([...ids]).toEqual(["current-note"]);
 		});
 
 		// Iterative-commit revival mirror of detectPlanSlugsFromRegistry: a previously
@@ -1384,7 +1306,6 @@ describe("QueueWorker", () => {
 						sourcePath: "/repo/notes/revived-note.md",
 						addedAt: "x",
 						updatedAt: "y",
-						branch: "main",
 						commitHash: "deadbeefdeadbeef",
 						contentHashAtCommit: oldHash,
 					},
@@ -1412,7 +1333,6 @@ describe("QueueWorker", () => {
 						sourcePath: "/repo/notes/stable-note.md",
 						addedAt: "x",
 						updatedAt: "y",
-						branch: "main",
 						commitHash: "deadbeefdeadbeef",
 						contentHashAtCommit: hash,
 					},
@@ -1437,7 +1357,6 @@ describe("QueueWorker", () => {
 						sourcePath: "/repo/notes/gone-note.md",
 						addedAt: "x",
 						updatedAt: "y",
-						branch: "main",
 						commitHash: "deadbeefdeadbeef",
 						contentHashAtCommit: "anything",
 					},
@@ -2007,202 +1926,6 @@ describe("QueueWorker", () => {
 			);
 
 			expect(cleanupBranchStaleChildMarkdown).not.toHaveBeenCalled();
-		});
-	});
-
-	describe("reassociateMetadata — multi-source entities", () => {
-		// Direct invocations of the private helper via __test__. These exercise
-		// every code path of the post-2.11 refactor (plans + notes + multi-source
-		// entities + legacy linearIssues fallback + both-fields-present dedupe)
-		// without going through the squash / amend / rebase-pick wrappers — each
-		// wrapper already has its own coverage tests above; here we focus on the
-		// behaviour change isolated.
-
-		beforeEach(() => {
-			vi.mocked(associatePlanWithCommit).mockResolvedValue(undefined);
-			vi.mocked(associateNoteWithCommit).mockResolvedValue(undefined);
-			vi.mocked(associateReferenceWithCommit).mockResolvedValue(undefined);
-		});
-
-		it("dispatches multi-source references[] through associateReferenceWithCommit", async () => {
-			const oldSummary = {
-				version: 5,
-				commitHash: "oldhash",
-				commitMessage: "x",
-				commitAuthor: "x",
-				commitDate: "x",
-				branch: "main",
-				generatedAt: "x",
-				references: [
-					{
-						archivedKey: "linear:PROJ-1-abc12345",
-						source: "linear",
-						nativeId: "PROJ-1",
-						title: "L1",
-						url: "u",
-						referencedAt: "x",
-						sourceToolName: "mcp__linear__get_issue",
-					},
-					{
-						archivedKey: "jira:KAN-5-def67890",
-						source: "jira",
-						nativeId: "KAN-5",
-						title: "J1",
-						url: "u",
-						referencedAt: "x",
-						sourceToolName: "mcp__atlassian__getJiraIssue",
-					},
-				],
-			} as never;
-
-			await __test__.reassociateMetadata([oldSummary], "newhash", "/cwd");
-
-			expect(associateReferenceWithCommit).toHaveBeenCalledTimes(2);
-			expect(associateReferenceWithCommit).toHaveBeenCalledWith("linear:PROJ-1-abc12345", "newhash", "/cwd");
-			expect(associateReferenceWithCommit).toHaveBeenCalledWith("jira:KAN-5-def67890", "newhash", "/cwd");
-		});
-
-		it("dedupes within entities[] itself when the same archivedKey appears twice (defensive)", async () => {
-			// Same archivedKey duplicated on `entities` — should still associate
-			// only once. Belt-and-braces against a future writer bug.
-			const oldSummary = {
-				version: 5,
-				commitHash: "oldhash",
-				commitMessage: "x",
-				commitAuthor: "x",
-				commitDate: "x",
-				branch: "main",
-				generatedAt: "x",
-				references: [
-					{
-						archivedKey: "linear:PROJ-1-abc12345",
-						source: "linear",
-						nativeId: "PROJ-1",
-						title: "L1",
-						url: "u",
-						referencedAt: "x",
-						sourceToolName: "mcp__linear__get_issue",
-					},
-					{
-						archivedKey: "linear:PROJ-1-abc12345",
-						source: "linear",
-						nativeId: "PROJ-1",
-						title: "L1-dupe",
-						url: "u",
-						referencedAt: "x",
-						sourceToolName: "mcp__linear__get_issue",
-					},
-				],
-			} as never;
-
-			await __test__.reassociateMetadata([oldSummary], "newhash", "/cwd");
-
-			expect(associateReferenceWithCommit).toHaveBeenCalledTimes(1);
-		});
-
-		it("still associates plans and notes alongside entities (lock-step contract)", async () => {
-			// Regression for the original "notes forgotten in some paths" bug
-			// the helper exists to prevent. plans + notes + entities all flow
-			// through one helper invocation.
-			const oldSummary = {
-				version: 5,
-				commitHash: "oldhash",
-				commitMessage: "x",
-				commitAuthor: "x",
-				commitDate: "x",
-				branch: "main",
-				generatedAt: "x",
-				plans: [{ slug: "p-1" } as never],
-				notes: [{ id: "n-1" } as never],
-				references: [
-					{
-						archivedKey: "linear:PROJ-1-abc12345",
-						source: "linear",
-						nativeId: "PROJ-1",
-						title: "L1",
-						url: "u",
-						referencedAt: "x",
-						sourceToolName: "mcp__linear__get_issue",
-					},
-				],
-			} as never;
-
-			await __test__.reassociateMetadata([oldSummary], "newhash", "/cwd");
-
-			expect(associatePlanWithCommit).toHaveBeenCalledWith("p-1", "newhash", "/cwd");
-			expect(associateNoteWithCommit).toHaveBeenCalledWith("n-1", "newhash", "/cwd");
-			expect(associateReferenceWithCommit).toHaveBeenCalledWith("linear:PROJ-1-abc12345", "newhash", "/cwd");
-		});
-
-		it("no-ops when neither entities nor linearIssues are present", async () => {
-			const oldSummary = {
-				version: 5,
-				commitHash: "oldhash",
-				commitMessage: "x",
-				commitAuthor: "x",
-				commitDate: "x",
-				branch: "main",
-				generatedAt: "x",
-			} as never;
-
-			await __test__.reassociateMetadata([oldSummary], "newhash", "/cwd");
-
-			expect(associateReferenceWithCommit).not.toHaveBeenCalled();
-			expect(associateReferenceWithCommit).not.toHaveBeenCalled();
-		});
-
-		it("handles multiple oldSummaries in one call (squash N:1 path)", async () => {
-			// Squash pipeline passes the full source-summary array. Each summary
-			// contributes its own entities; cross-summary archivedKey dedupe is
-			// NOT enforced (each commit's row is independent in the registry —
-			// but in practice the same archivedKey across summaries would imply
-			// the same registry row, and the second associate is a no-op write).
-			const a = {
-				version: 5,
-				commitHash: "a",
-				commitMessage: "x",
-				commitAuthor: "x",
-				commitDate: "x",
-				branch: "main",
-				generatedAt: "x",
-				references: [
-					{
-						archivedKey: "linear:A-1-aaa11111",
-						source: "linear",
-						nativeId: "A-1",
-						title: "A",
-						url: "u",
-						referencedAt: "x",
-						sourceToolName: "mcp__linear__get_issue",
-					},
-				],
-			} as never;
-			const b = {
-				version: 5,
-				commitHash: "b",
-				commitMessage: "x",
-				commitAuthor: "x",
-				commitDate: "x",
-				branch: "main",
-				generatedAt: "x",
-				references: [
-					{
-						archivedKey: "jira:B-1-bbb22222",
-						source: "jira",
-						nativeId: "B-1",
-						title: "B",
-						url: "u",
-						referencedAt: "x",
-						sourceToolName: "mcp__atlassian__getJiraIssue",
-					},
-				],
-			} as never;
-
-			await __test__.reassociateMetadata([a, b], "newhash", "/cwd");
-
-			expect(associateReferenceWithCommit).toHaveBeenCalledTimes(2);
-			expect(associateReferenceWithCommit).toHaveBeenCalledWith("linear:A-1-aaa11111", "newhash", "/cwd");
-			expect(associateReferenceWithCommit).toHaveBeenCalledWith("jira:B-1-bbb22222", "newhash", "/cwd");
 		});
 	});
 });

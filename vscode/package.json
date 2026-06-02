@@ -204,7 +204,7 @@
 			},
 			{
 				"command": "jollimemory.ignoreReference",
-				"title": "Ignore Reference",
+				"title": "Remove Reference",
 				"category": "Jolli Memory"
 			},
 			{

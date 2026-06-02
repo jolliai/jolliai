@@ -27,8 +27,7 @@
  *      the substring `"name":"mcp__<src>__…"`.
  *   3. Walk the parsed payload (object / array / wrapped under any of the
  *      adapter's `wrapperKeys`) and collect every adapter-recognised reference.
- *      Wrapper descent is **array-only** in Phase 1 — Phase 3 will widen to
- *      object wrappers.
+ *      Wrapper descent handles both array and object wrappers.
  *
  * Dedupe: same `mapKey` (`<source>:<nativeId>`) → keep the entry with the
  * latest `referencedAt`. If timestamps tie, the later-seen entry wins

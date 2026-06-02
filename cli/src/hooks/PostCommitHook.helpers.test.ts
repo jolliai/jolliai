@@ -161,7 +161,6 @@ vi.mock("../core/references/ReferenceStore.js", () => ({
 	readReferenceMarkdown: vi.fn().mockResolvedValue(null),
 	readReferenceMarkdownFromString: vi.fn().mockReturnValue(null),
 	writeReferenceMarkdown: vi.fn().mockResolvedValue({ sourcePath: "/x", contentHash: "fake-content-hash" }),
-	renameReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 	hashReferenceContent: vi.fn(() => "fake-content-hash"),
 }));
 
@@ -361,14 +360,13 @@ describe("PostCommitHook helpers", () => {
 	});
 
 	describe("detectPlanSlugsFromRegistry", () => {
-		it("returns uncommitted, non-ignored plan slugs from the registry", async () => {
+		it("returns uncommitted plan slugs from the registry", async () => {
 			mockLoadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: {
-					"alpha-plan": { slug: "alpha-plan", commitHash: null, ignored: false, branch: "main" },
-					"beta-plan": { slug: "beta-plan", commitHash: null, ignored: false, branch: "main" },
-					"committed-plan": { slug: "committed-plan", commitHash: "abc123", ignored: false, branch: "main" },
-					"ignored-plan": { slug: "ignored-plan", commitHash: null, ignored: true, branch: "main" },
+					"alpha-plan": { slug: "alpha-plan", commitHash: null },
+					"beta-plan": { slug: "beta-plan", commitHash: null },
+					"committed-plan": { slug: "committed-plan", commitHash: "abc123" },
 				},
 			});
 
@@ -376,12 +374,12 @@ describe("PostCommitHook helpers", () => {
 			expect([...slugs].sort()).toEqual(["alpha-plan", "beta-plan"]);
 		});
 
-		it("returns empty set when all plans are committed or ignored", async () => {
+		it("returns empty set when all plans are committed", async () => {
 			mockLoadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: {
-					done: { slug: "done", commitHash: "abc", ignored: false, branch: "main" },
-					skipped: { slug: "skipped", commitHash: null, ignored: true, branch: "main" },
+					done: { slug: "done", commitHash: "abc" },
+					done2: { slug: "done2", commitHash: "def" },
 				},
 			});
 
@@ -496,34 +494,6 @@ describe("PostCommitHook helpers", () => {
 			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo", "main");
 			expect(slugs.size).toBe(0);
 		});
-
-		it("excludes uncommitted plans whose branch differs from the target branch", async () => {
-			// Regression guard for the cross-branch leak: before adding the branch
-			// filter, plans on `feature/summarize-include-linear-issues` were being
-			// associated with a commit on `feature/linear-issues-as-panel-item`,
-			// polluting the orphan branch under the wrong branch directory and
-			// generating phantom plan refs on the wrong commit's summary.
-			mockLoadPlansRegistry.mockResolvedValue({
-				version: 1,
-				plans: {
-					"current-branch": {
-						slug: "current-branch",
-						commitHash: null,
-						ignored: false,
-						branch: "feature/active",
-					},
-					"other-branch": {
-						slug: "other-branch",
-						commitHash: null,
-						ignored: false,
-						branch: "feature/idle",
-					},
-				},
-			});
-
-			const slugs = await __test__.detectPlanSlugsFromRegistry("/repo", "feature/active");
-			expect([...slugs]).toEqual(["current-branch"]);
-		});
 	});
 
 	describe("associatePlansWithCommit", () => {
@@ -569,12 +539,9 @@ describe("PostCommitHook helpers", () => {
 			expect(result.originalSlugBySlug.get("alpha-deadbeef")).toBe("alpha");
 			expect(mockSavePlansRegistry).toHaveBeenCalledTimes(1);
 			expect(mockSavePlansRegistry.mock.calls[0][0].plans.alpha.contentHashAtCommit).toBeTruthy();
-			expect(mockSavePlansRegistry.mock.calls[0][0].plans["alpha-deadbeef"]).toEqual(
-				expect.objectContaining({
-					slug: "alpha-deadbeef",
-					commitHash: "deadbeefcafebabe",
-				}),
-			);
+			expect(mockSavePlansRegistry.mock.calls[0][0].plans.alpha.commitHash).toBe("deadbeefcafebabe");
+			// No per-commit archive row — only the guard row (original slug) is written.
+			expect(mockSavePlansRegistry.mock.calls[0][0].plans["alpha-deadbeef"]).toBeUndefined();
 			expect(mockStorePlans).toHaveBeenCalledWith(
 				[{ slug: "alpha-deadbeef", content: "# Alpha plan\n\nDo the work" }],
 				"Archive 1 plan(s) for commit deadbeef",
@@ -1100,7 +1067,7 @@ describe("PostCommitHook helpers", () => {
 
 		it("Pre-LLM short-circuit triggers even WITH transcript entries when delta ≤ 50 lines", async () => {
 			mockGetSummary.mockResolvedValue(oldSummaryFixture);
-			// 有 1 个 session 带 2 条 entries —— 旧逻辑会强制走 Full path，新逻辑应仍短路
+			// One session with 2 entries — old logic forced the Full path; new logic should still short-circuit
 			mockLoadAllSessions.mockResolvedValue([
 				{
 					sessionId: "sess-1",
@@ -1130,7 +1097,7 @@ describe("PostCommitHook helpers", () => {
 			expect(mockGenerateSummary).not.toHaveBeenCalled();
 			expect(mockGenerateSquashConsolidation).not.toHaveBeenCalled();
 
-			// 短路路径也必须把 transcript artifact 传给 storeSummary
+			// The short-circuit path must also pass the transcript artifact to storeSummary
 			expect(mockStoreSummary.mock.calls.length).toBeGreaterThanOrEqual(1);
 			const storeArgs = mockStoreSummary.mock.calls[0];
 			// Pin the force flag at position 2 — short-circuit must never overwrite
@@ -1262,13 +1229,13 @@ describe("PostCommitHook helpers", () => {
 			mockLoadAllSessions.mockResolvedValue([]);
 			mockGetDiffStats.mockResolvedValue({ filesChanged: 1, insertions: 100, deletions: 0 });
 			mockGetDiffContent.mockResolvedValue("diff");
-			// step1: topics 空 但 recap 非空 —— 旧逻辑进 Full path，新逻辑直接短路、丢弃 delta.recap
+			// step1: topics empty, recap non-empty — old took Full path; new short-circuits and drops delta.recap
 			mockGenerateSummary.mockResolvedValueOnce({
 				transcriptEntries: 0,
 				llm: { model: "test", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
 				stats: { filesChanged: 1, insertions: 100, deletions: 0 },
 				topics: [],
-				recap: "delta 复述了 diff —— 应被丢弃",
+				recap: "delta restated the diff — should be discarded",
 			});
 
 			await __test__.handleAmendPipeline(
@@ -1285,7 +1252,7 @@ describe("PostCommitHook helpers", () => {
 				topics: ReadonlyArray<{ title: string }>;
 				recap?: string;
 			};
-			// recap 应是 oldSummaryFixture.recap，不是 delta 的 recap
+			// recap should be oldSummaryFixture.recap, not delta's recap
 			expect(root.recap).toBe("old recap");
 		});
 

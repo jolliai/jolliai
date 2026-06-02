@@ -2343,11 +2343,11 @@ export function activate(context: vscode.ExtensionContext): void {
 					typeof itemOrKey === "string" ? itemOrKey : itemOrKey.reference.mapKey;
 				log.info("cmd", `ignoreReference: ${mapKey}`);
 				// Same stale-mapKey guard as the open commands: without this the
-				// ReferenceService.setReferenceIgnored "entry not found → silent return"
+				// ReferenceService.removeReference "entry not found → silent return"
 				// path would swallow the click with zero feedback.
 				const info = await resolveReferenceForCommand(mapKey, "ignoreReference");
 				if (!info) return;
-				await bridge.ignoreReference(mapKey);
+				await bridge.removeReference(mapKey);
 				await plansStore.refresh();
 			},
 		),

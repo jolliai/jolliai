@@ -358,7 +358,7 @@ type RemintCause = "unauthorized" | "repoMissing";
  *     `releaseInFinally` (backend already released).
  *   - `tryCompleteMigration` success (`deferred: true` branch — HEAD
  *     unborn) → clear `releaseInFinally` (defer to next round; explicit
- *     user choice — see plan §"Deferred-completion sites").
+ *     user choice).
  *   - `runFirstBindMigration` sets `completionDeferred = true` → caller
  *     clears `releaseInFinally` at the same moment (defer rationale as
  *     above).

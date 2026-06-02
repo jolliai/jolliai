@@ -31,12 +31,14 @@ import type {
 	SquashPendingState,
 	TranscriptCursor,
 } from "../Types.js";
-import { referencePath as canonicalReferencePath, writeReferenceMarkdown } from "./references/ReferenceStore.js";
+import { writeReferenceMarkdown } from "./references/ReferenceStore.js";
 
 const log = createLogger("SessionTracker");
 
 const SESSIONS_FILE = "sessions.json";
 const CURSORS_FILE = "cursors.json";
+/** Merged plan+reference discovery cursors (replaces plan:/linear: prefixed keys in cursors.json). */
+const DISCOVERY_CURSORS_FILE = "discovery-cursors.json";
 const CONFIG_FILE = "config.json";
 const PLANS_FILE = "plans.json";
 
@@ -184,15 +186,30 @@ export function filterSessionsByEnabledIntegrations(
  * @param cursor - The cursor to save
  * @param cwd - Optional working directory
  */
+/** Writes a full cursors registry to `<dir>/<filename>` atomically. */
+async function writeCursorsRegistry(registry: CursorsRegistry, dir: string, filename: string): Promise<void> {
+	await atomicWrite(join(dir, filename), JSON.stringify(registry, null, "\t"));
+}
+
+/** Upserts one cursor (keyed by transcriptPath) into the given cursors file. */
+async function upsertCursorInFile(cursor: TranscriptCursor, dir: string, filename: string): Promise<void> {
+	const registry = await loadCursorsRegistry(dir, filename);
+	const cursors = { ...registry.cursors, [cursor.transcriptPath]: cursor };
+	await writeCursorsRegistry({ version: 1, cursors }, dir, filename);
+}
+
 export async function saveCursor(cursor: TranscriptCursor, cwd?: string): Promise<void> {
 	const dir = await ensureJolliMemoryDir(cwd);
+	await upsertCursorInFile(cursor, dir, CURSORS_FILE);
+}
 
-	const registry = await loadCursorsRegistry(dir);
-	const cursors = { ...registry.cursors };
-	cursors[cursor.transcriptPath] = cursor;
-
-	const newRegistry: CursorsRegistry = { version: 1, cursors };
-	await atomicWrite(join(dir, CURSORS_FILE), JSON.stringify(newRegistry, null, "\t"));
+/**
+ * Saves the merged plan+reference discovery cursor to discovery-cursors.json,
+ * keyed by the bare transcriptPath (no plan:/linear: prefix).
+ */
+export async function saveDiscoveryCursor(cursor: TranscriptCursor, cwd?: string): Promise<void> {
+	const dir = await ensureJolliMemoryDir(cwd);
+	await upsertCursorInFile(cursor, dir, DISCOVERY_CURSORS_FILE);
 }
 
 /**
@@ -206,6 +223,43 @@ export async function loadCursorForTranscript(transcriptPath: string, cwd?: stri
 	const dir = getJolliMemoryDir(cwd);
 	const registry = await loadCursorsRegistry(dir);
 	return registry.cursors[transcriptPath] ?? null;
+}
+
+/** Loads the merged plan+reference discovery cursor from discovery-cursors.json. */
+export async function loadDiscoveryCursor(transcriptPath: string, cwd?: string): Promise<TranscriptCursor | null> {
+	const dir = getJolliMemoryDir(cwd);
+	const registry = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
+	return registry.cursors[transcriptPath] ?? null;
+}
+
+/**
+ * One-shot migration folding legacy `plan:` / `linear:` prefixed cursors
+ * from cursors.json into the merged discovery-cursors.json (keyed by bare path).
+ * Idempotent — a no-op once cursors.json has no prefixed keys. For each path the
+ * plan+linear lines are folded with `min()` so we never skip past either
+ * discovery's prior progress (the tiny re-scan overlap is safe because discovery
+ * is idempotent; `max()` would skip unprocessed lines).
+ */
+export async function migrateDiscoveryCursors(cwd?: string): Promise<void> {
+	const dir = await ensureJolliMemoryDir(cwd);
+	const legacy = await loadCursorsRegistry(dir, CURSORS_FILE);
+	const prefixedKeys = Object.keys(legacy.cursors).filter((k) => k.startsWith("plan:") || k.startsWith("linear:"));
+	if (prefixedKeys.length === 0) return; // already migrated / no legacy keys
+
+	const discovery = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
+	const merged = { ...discovery.cursors };
+	const remaining = { ...legacy.cursors };
+	const now = new Date().toISOString();
+	for (const key of prefixedKeys) {
+		const path = key.startsWith("plan:") ? key.slice("plan:".length) : key.slice("linear:".length);
+		const line = legacy.cursors[key].lineNumber;
+		const existing = merged[path];
+		const folded = existing ? Math.min(existing.lineNumber, line) : line;
+		merged[path] = { transcriptPath: path, lineNumber: folded, updatedAt: now };
+		delete remaining[key];
+	}
+	await writeCursorsRegistry({ version: 1, cursors: merged }, dir, DISCOVERY_CURSORS_FILE);
+	await writeCursorsRegistry({ version: 1, cursors: remaining }, dir, CURSORS_FILE);
 }
 
 /**
@@ -647,8 +701,8 @@ async function loadSessionsRegistry(dir: string): Promise<SessionsRegistry> {
  * Loads the cursors registry from cursors.json.
  * Returns an empty registry if the file doesn't exist or is corrupt.
  */
-async function loadCursorsRegistry(dir: string): Promise<CursorsRegistry> {
-	const filePath = join(dir, CURSORS_FILE);
+async function loadCursorsRegistry(dir: string, filename: string = CURSORS_FILE): Promise<CursorsRegistry> {
+	const filePath = join(dir, filename);
 	try {
 		const content = await readFile(filePath, "utf-8");
 		return JSON.parse(content) as CursorsRegistry;
@@ -683,27 +737,27 @@ function pruneStale(sessions: Readonly<Record<string, SessionInfo>>): {
 }
 
 /**
- * Removes cursor entries whose transcriptPath matches any of the stale paths.
- * Also prunes "plan:" prefixed cursors whose underlying transcript path is stale.
+ * Removes cursor entries whose transcriptPath matches any stale path, across
+ * BOTH cursors.json (QueueWorker summarization line) and discovery-cursors.json
+ * (merged plan+reference discovery line). Both files are keyed by the bare
+ * transcriptPath now (legacy plan:/linear: prefixes are folded away by
+ * migrateDiscoveryCursors), so a direct membership check prunes both.
  */
 async function pruneOrphanedCursors(dir: string, stalePaths: ReadonlyArray<string>): Promise<void> {
-	const registry = await loadCursorsRegistry(dir);
-	const cursors = { ...registry.cursors };
 	const staleSet = new Set(stalePaths);
-	let pruned = 0;
-
-	for (const key of Object.keys(cursors)) {
-		// Strip "plan:" prefix (if present) to match the underlying transcript path
-		const rawPath = key.startsWith("plan:") ? key.slice(5) : key;
-		if (staleSet.has(rawPath)) {
-			delete cursors[key];
-			pruned++;
+	for (const filename of [CURSORS_FILE, DISCOVERY_CURSORS_FILE]) {
+		const registry = await loadCursorsRegistry(dir, filename);
+		const cursors = { ...registry.cursors };
+		let pruned = 0;
+		for (const key of Object.keys(cursors)) {
+			if (staleSet.has(key)) {
+				delete cursors[key];
+				pruned++;
+			}
 		}
-	}
-
-	if (pruned > 0) {
-		const newRegistry: CursorsRegistry = { version: 1, cursors };
-		await atomicWrite(join(dir, CURSORS_FILE), JSON.stringify(newRegistry, null, "\t"));
+		if (pruned > 0) {
+			await writeCursorsRegistry({ version: 1, cursors }, dir, filename);
+		}
 	}
 }
 
@@ -787,35 +841,33 @@ function splitArchivedKey(archivedKey: string): { baseKey: string; oldShortHash:
  * survive so that uncommitted edits to the source still surface as a revived
  * guard on the next post-commit detection.
  */
-export async function associatePlanWithCommit(slug: string, commitHash: string, cwd?: string): Promise<void> {
+export async function associatePlanWithCommit(archivedSlug: string, commitHash: string, cwd?: string): Promise<void> {
+	// Per-commit archive rows are no longer created — only the guard row
+	// (base slug, carrying contentHashAtCommit) survives in plans.json. So this
+	// migration (reassociateMetadata after squash/rebase) just sweeps the matching
+	// guard's commitHash forward. `archivedSlug` is the CommitSummary pointer
+	// `<baseSlug>-<oldShortHash>`; we split it directly rather than looking up a
+	// (now-nonexistent) archive row first. contentHashAtCommit stays untouched —
+	// only commit metadata moved, not file content, so uncommitted edits still
+	// revive the guard on the next post-commit detection.
+	const split = splitArchivedKey(archivedSlug);
+	if (!split) {
+		log.debug("associatePlanWithCommit: %s is not an archived slug, skipping", archivedSlug);
+		return;
+	}
 	const registry = await loadPlansRegistry(cwd);
-	const entry = registry.plans[slug];
-	if (!entry) {
-		log.debug("associatePlanWithCommit: slug %s not in registry, skipping", slug);
+	const guard = registry.plans[split.baseKey];
+	if (!guard?.contentHashAtCommit || !guard.commitHash?.startsWith(split.oldShortHash)) {
+		log.debug("associatePlanWithCommit: no matching guard for %s, skipping", archivedSlug);
 		return;
 	}
 	const now = new Date().toISOString();
-	const nextPlans: Record<string, PlanEntry> = {
-		...registry.plans,
-		[slug]: { ...entry, commitHash, updatedAt: now },
+	const updated: PlansRegistry = {
+		...registry,
+		plans: { ...registry.plans, [split.baseKey]: { ...guard, commitHash, updatedAt: now } },
 	};
-
-	const split = splitArchivedKey(slug);
-	if (split) {
-		const guard = registry.plans[split.baseKey];
-		if (guard?.contentHashAtCommit && guard.commitHash?.startsWith(split.oldShortHash)) {
-			nextPlans[split.baseKey] = {
-				...guard,
-				commitHash,
-				updatedAt: now,
-			};
-			log.info("associatePlanWithCommit: also migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
-		}
-	}
-
-	const updated: PlansRegistry = { ...registry, plans: nextPlans };
 	await savePlansRegistry(updated, cwd);
-	log.info("associatePlanWithCommit: %s → %s", slug, commitHash.substring(0, 8));
+	log.info("associatePlanWithCommit: migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
 }
 
 /**
@@ -825,35 +877,30 @@ export async function associatePlanWithCommit(slug: string, commitHash: string, 
  * function's doc-comment for the rationale.
  */
 export async function associateNoteWithCommit(noteId: string, commitHash: string, cwd?: string): Promise<void> {
+	// Only the guard row survives — sweep its commitHash forward. See
+	// associatePlanWithCommit for the rationale.
+	const split = splitArchivedKey(noteId);
+	if (!split) {
+		log.debug("associateNoteWithCommit: %s is not an archived id, skipping", noteId);
+		return;
+	}
 	const registry = await loadPlansRegistry(cwd);
-	const entry = registry.notes?.[noteId];
-	if (!entry) {
-		log.debug("associateNoteWithCommit: id %s not in registry, skipping", noteId);
+	const notes = registry.notes;
+	const guard = notes?.[split.baseKey];
+	if (!guard?.contentHashAtCommit || !guard.commitHash?.startsWith(split.oldShortHash)) {
+		log.debug("associateNoteWithCommit: no matching guard for %s, skipping", noteId);
 		return;
 	}
 	const now = new Date().toISOString();
-	const notes = registry.notes as NonNullable<PlansRegistry["notes"]>;
-	const nextNotes: Record<string, NoteEntry> = {
-		...notes,
-		[noteId]: { ...entry, commitHash, updatedAt: now },
+	const updated: PlansRegistry = {
+		...registry,
+		notes: {
+			...(notes as NonNullable<PlansRegistry["notes"]>),
+			[split.baseKey]: { ...guard, commitHash, updatedAt: now },
+		},
 	};
-
-	const split = splitArchivedKey(noteId);
-	if (split) {
-		const guard = notes[split.baseKey];
-		if (guard?.contentHashAtCommit && guard.commitHash?.startsWith(split.oldShortHash)) {
-			nextNotes[split.baseKey] = {
-				...guard,
-				commitHash,
-				updatedAt: now,
-			};
-			log.info("associateNoteWithCommit: also migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
-		}
-	}
-
-	const updated: PlansRegistry = { ...registry, notes: nextNotes };
 	await savePlansRegistry(updated, cwd);
-	log.info("associateNoteWithCommit: %s → %s", noteId, commitHash.substring(0, 8));
+	log.info("associateNoteWithCommit: migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
 }
 
 /**
@@ -873,48 +920,36 @@ function referencesOf(reg: PlansRegistry): Readonly<Record<string, ReferenceEntr
 }
 
 /**
- * Returns the entries (not just keys) of references active for the given branch.
+ * Returns the entries (not just keys) of active references in the current worktree.
  *
- * "Active" matches the same filter Plans / Notes use:
- *   - branch matches
- *   - commitHash === null (uncommitted)
- *   - !contentHashAtCommit (not a guard from a prior commit)
- *   - !ignored
- *
- * Used by QueueWorker post-commit Step 6b and Stage 2 prompt assembly.
+ * "Active" = uncommitted (`commitHash === null`) and not a guard from a prior
+ * commit (`!contentHashAtCommit`). No branch filter — the per-worktree
+ * plans.json already isolates. Used by QueueWorker post-commit prompt assembly.
  */
 export async function getReferenceEntriesForBranch(
 	cwd: string,
-	branch: string,
+	_branch: string,
 ): Promise<ReadonlyArray<ReferenceEntry>> {
 	const registry = await loadPlansRegistry(cwd);
 	const entries: ReferenceEntry[] = [];
 	for (const entry of Object.values(referencesOf(registry))) {
-		if (entry.branch !== branch) continue;
-		if (entry.commitHash !== null) continue;
-		if (entry.contentHashAtCommit !== undefined) continue;
-		if (entry.ignored) continue;
 		entries.push(entry);
 	}
 	return entries;
 }
 
 /**
- * Returns the {mapKey, source, sourcePath} triples for active references on the
- * branch — projection of `getReferenceEntriesForBranch` shaped for QueueWorker
- * Step 8a3, which only needs these three fields to dispatch the archive.
+ * Returns the {mapKey, source, sourcePath} triples for active references in the
+ * current worktree — projection of `getReferenceEntriesForBranch` shaped for the
+ * QueueWorker archive dispatch, which only needs these three fields.
  */
 export async function detectUncommittedReferenceIds(
 	cwd: string,
-	branch: string,
+	_branch: string,
 ): Promise<ReadonlyArray<{ mapKey: string; source: SourceId; sourcePath: string }>> {
 	const registry = await loadPlansRegistry(cwd);
 	const out: Array<{ mapKey: string; source: SourceId; sourcePath: string }> = [];
 	for (const [mapKey, entry] of Object.entries(referencesOf(registry))) {
-		if (entry.branch !== branch) continue;
-		if (entry.commitHash !== null) continue;
-		if (entry.contentHashAtCommit !== undefined) continue;
-		if (entry.ignored) continue;
 		out.push({ mapKey, source: entry.source, sourcePath: entry.sourcePath });
 	}
 	return out;
@@ -923,31 +958,18 @@ export async function detectUncommittedReferenceIds(
 /**
  * Upsert a reference entry into plans.json.references.
  *
- * Field semantics:
- *
- * Case A: entry exists with `contentHashAtCommit` (guard from prior commit)
- *   - If `ignored` → return unchanged.
- *   - If contentHash matches the stored guard → return unchanged.
- *   - If contentHash differs → replace with a fresh uncommitted entry.
- *
- * Case B: entry exists without `contentHashAtCommit` (uncommitted)
- *   - If `ignored` → return unchanged.
- *   - Else: refresh title / url / sourcePath / sourceToolName / updatedAt;
- *     preserve addedAt / branch / commitHash / ignored.
- *
- * Case C: entry does not exist → insert fresh.
+ * References have no guard rows (commit deletes the entry), so every row in
+ * the map is an uncommitted active reference. Semantics:
+ *   - entry exists → refresh title / url / sourcePath / sourceToolName / updatedAt
+ *     (preserve addedAt).
+ *   - entry absent → insert fresh.
  *
  * Routes to {@link writeReferenceMarkdown} for the on-disk markdown (sanitization
- * happens there) and applies the guard-hash short-circuit so unchanged
- * Linear/Jira/GitHub/Notion payloads don't churn a fresh entry over a
- * still-valid guard.
- *
- * Concurrency: near-write reread + commitHash diff merge to tolerate a
- * concurrent PostCommitHook writing a commitHash between our two
- * loadPlansRegistry calls.
+ * happens there). The near-write reread only overwrites our own mapKey, so a
+ * concurrent writer touching other mapKeys is preserved.
  */
-export async function upsertReferenceEntry(ref: Reference, cwd: string, branch: string): Promise<void> {
-	const { sourcePath, contentHash } = await writeReferenceMarkdown(ref, cwd);
+export async function upsertReferenceEntry(ref: Reference, cwd: string, _branch: string): Promise<void> {
+	const { sourcePath } = await writeReferenceMarkdown(ref, cwd);
 	const mapKey = `${ref.source}:${ref.nativeId}`;
 	const now = new Date().toISOString();
 
@@ -955,53 +977,32 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string, branch: 
 	const beforeReferences = referencesOf(beforeRegistry);
 	const existing = beforeReferences[mapKey];
 
-	if (existing && existing.contentHashAtCommit !== undefined) {
-		if (existing.ignored) return;
-		if (existing.contentHashAtCommit === contentHash) return;
-		// fall through to replacement — guard hash mismatched, content changed
-	} else if (existing?.ignored) {
-		return;
-	}
+	const next: ReferenceEntry =
+		existing !== undefined
+			? {
+					...existing,
+					title: ref.title,
+					url: ref.url,
+					sourcePath,
+					sourceToolName: ref.toolName,
+					updatedAt: now,
+				}
+			: {
+					source: ref.source,
+					nativeId: ref.nativeId,
+					title: ref.title,
+					url: ref.url,
+					sourcePath,
+					addedAt: now,
+					updatedAt: now,
+					sourceToolName: ref.toolName,
+				};
 
-	const canRefreshUncommitted = existing && existing.contentHashAtCommit === undefined && existing.branch === branch;
-
-	const next: ReferenceEntry = canRefreshUncommitted
-		? {
-				...existing,
-				title: ref.title,
-				url: ref.url,
-				sourcePath,
-				sourceToolName: ref.toolName,
-				updatedAt: now,
-			}
-		: {
-				source: ref.source,
-				nativeId: ref.nativeId,
-				title: ref.title,
-				url: ref.url,
-				sourcePath,
-				branch,
-				addedAt: now,
-				updatedAt: now,
-				commitHash: null,
-				sourceToolName: ref.toolName,
-			};
-
-	// Near-write reread merge — tolerates a concurrent PostCommitHook write
-	// landing a commitHash between our two loadPlansRegistry calls.
+	// Near-write reread — only overwrites our own mapKey, so a concurrent writer
+	// touching other mapKeys between our two loadPlansRegistry calls is preserved.
 	const freshRegistry = await loadPlansRegistry(cwd);
 	const freshReferences = referencesOf(freshRegistry);
-	const freshEntry = freshReferences[mapKey];
-	/* v8 ignore start -- near-write reread merge: only fires under concurrent commitHash writes (PostCommitHook racing the StopHook upsert); not deterministically reachable in unit tests without a concurrent process. */
-	const merged: ReferenceEntry =
-		freshEntry !== undefined &&
-		freshEntry.commitHash !== null &&
-		freshEntry.commitHash !== (existing?.commitHash ?? null)
-			? { ...next, commitHash: freshEntry.commitHash, contentHashAtCommit: freshEntry.contentHashAtCommit }
-			: next;
-	/* v8 ignore stop */
-
-	const references = { ...freshReferences, [mapKey]: merged };
+	const references = { ...freshReferences, [mapKey]: next };
 	const out: PlansRegistry = {
 		version: 1,
 		plans: freshRegistry.plans,
@@ -1009,109 +1010,29 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string, branch: 
 		references,
 	};
 	await savePlansRegistry(out, cwd);
-	log.info("upsertReferenceEntry: %s on %s (%s)", mapKey, branch, existing === undefined ? "new" : "updated");
+	log.info("upsertReferenceEntry: %s (%s)", mapKey, existing === undefined ? "new" : "updated");
 }
 
-/** Set or clear the ignored flag on a reference entry. */
-export async function setReferenceIgnored(cwd: string, mapKey: string, ignored: boolean): Promise<void> {
-	const registry = await loadPlansRegistry(cwd);
-	const existingReferences = referencesOf(registry);
-	const entry = existingReferences[mapKey];
-	if (!entry) return;
-	const references = { ...existingReferences, [mapKey]: { ...entry, ignored: ignored || undefined } };
-	const out: PlansRegistry = {
-		version: 1,
-		plans: registry.plans,
-		...(registry.notes !== undefined ? { notes: registry.notes } : {}),
-		references,
-	};
-	await savePlansRegistry(out, cwd);
-}
+// ─── Active-entry queries for prompt assembly ───────────────────────────────
 
-/**
- * Update commitHash on a specific reference snapshot entry (keyed by `archivedKey`).
- * Mirrors {@link associatePlanWithCommit} / {@link associateNoteWithCommit} —
- * also migrates the guard entry's commitHash when `archivedKey` is the
- * `<source>:<nativeId>-<shortHash>` archive form and the guard's recorded
- * commitHash starts with the old short hash.
- *
- * Used by QueueWorker.reassociateMetadata for the per-source single-row update;
- * the plural / batch flow lives in QueueWorker (Task 2.7).
- */
-export async function associateReferenceWithCommit(archivedKey: string, newHash: string, cwd?: string): Promise<void> {
-	const registry = await loadPlansRegistry(cwd);
-	const references = referencesOf(registry);
-	const entry = references[archivedKey];
-	if (!entry) {
-		log.debug("associateReferenceWithCommit: key %s not in registry, skipping", archivedKey);
-		return;
-	}
-	const now = new Date().toISOString();
-	const nextReferences: Record<string, ReferenceEntry> = {
-		...references,
-		[archivedKey]: { ...entry, commitHash: newHash, updatedAt: now },
-	};
-
-	// Guard migration mirrors associatePlanWithCommit: when archivedKey has
-	// `<source>:<nativeId>-<shortHash>` shape and the matching guard entry
-	// records a commitHash that starts with that old short hash, sweep its
-	// commitHash forward to the new commit too. contentHashAtCommit stays
-	// untouched — the markdown content didn't change.
-	const split = splitArchivedKey(archivedKey);
-	if (split) {
-		const guard = references[split.baseKey];
-		if (guard?.contentHashAtCommit && guard.commitHash?.startsWith(split.oldShortHash)) {
-			nextReferences[split.baseKey] = { ...guard, commitHash: newHash, updatedAt: now };
-			log.info(
-				"associateReferenceWithCommit: also migrated guard %s → %s",
-				split.baseKey,
-				newHash.substring(0, 8),
-			);
-		}
-	}
-
-	const out: PlansRegistry = {
-		version: 1,
-		plans: registry.plans,
-		...(registry.notes !== undefined ? { notes: registry.notes } : {}),
-		references: nextReferences,
-	};
-	await savePlansRegistry(out, cwd);
-	log.info("associateReferenceWithCommit: %s → %s", archivedKey, newHash.substring(0, 8));
-}
-
-/**
- * Helper exposed for callers that need the canonical reference path without
- * importing ReferenceStore directly (avoids growing the cross-module surface).
- */
-export function referencePath(cwd: string, source: SourceId, key: string): string {
-	return canonicalReferencePath(cwd, source, key);
-}
-
-// ─── Active-entry queries for Stage 2 prompt assembly ───────────────────────
-
-/** Active plans on the given branch — uncommitted, not ignored, not guard-archived. */
-export async function detectActivePlansForBranch(cwd: string, branch: string): Promise<ReadonlyArray<PlanEntry>> {
+/** Active plans in the current worktree — uncommitted, not guard-archived. */
+export async function detectActivePlansForBranch(cwd: string, _branch: string): Promise<ReadonlyArray<PlanEntry>> {
 	const registry = await loadPlansRegistry(cwd);
 	const entries: PlanEntry[] = [];
 	for (const entry of Object.values(registry.plans)) {
-		if (entry.branch !== branch) continue;
 		if (entry.commitHash !== null) continue;
-		if (entry.ignored) continue;
 		if (entry.contentHashAtCommit !== undefined) continue;
 		entries.push(entry);
 	}
 	return entries;
 }
 
-/** Active notes on the given branch — uncommitted, not ignored, not guard-archived. */
-export async function detectActiveNotesForBranch(cwd: string, branch: string): Promise<ReadonlyArray<NoteEntry>> {
+/** Active notes in the current worktree — uncommitted, not guard-archived. */
+export async function detectActiveNotesForBranch(cwd: string, _branch: string): Promise<ReadonlyArray<NoteEntry>> {
 	const registry = await loadPlansRegistry(cwd);
 	const entries: NoteEntry[] = [];
 	for (const entry of Object.values(registry.notes ?? {})) {
-		if (entry.branch !== branch) continue;
 		if (entry.commitHash !== null) continue;
-		if (entry.ignored) continue;
 		if (entry.contentHashAtCommit !== undefined) continue;
 		entries.push(entry);
 	}

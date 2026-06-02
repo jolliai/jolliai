@@ -2878,9 +2878,7 @@ describe("SyncEngine.runRound — idle-round short-circuit (perf)", () => {
 
 // ─────────────────────────────────────────────────────────────────────
 // JOLLI-1577 — Release Personal Space write-lock on every round outcome.
-// Each test in this matrix targets a specific leak path from the plan;
-// the row numbers reference the test matrix in
-// /home/foste/.claude/plans/eager-forging-bonbon.md §4.
+// Each test in this matrix targets a specific lock-release leak path.
 // ─────────────────────────────────────────────────────────────────────
 describe("SyncEngine.runRound — JOLLI-1577 release-lock matrix", () => {
 	const LOCK_TOKEN = "test-lock-owner-token";

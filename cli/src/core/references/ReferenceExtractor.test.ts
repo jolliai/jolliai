@@ -476,7 +476,7 @@ describe("extractReferencesFromTranscript", () => {
 		// `issues` key is an OBJECT, not an array. Linear's adapter has the same
 		// wrapperKey `issues`, so the walker must descend into the inner object and
 		// then find the `nodes` array below it. This exercises the object-wrapper
-		// branch added in Phase 3 Task 3.1.
+		// branch in walkPayload.
 		const jsonl = makeJsonl(
 			toolUseLine({
 				toolUseId: "toolu_obj",

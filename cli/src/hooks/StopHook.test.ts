@@ -6,8 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../core/SessionTracker.js", () => ({
 	saveSession: vi.fn(),
 	loadConfig: vi.fn().mockResolvedValue({}),
-	loadCursorForTranscript: vi.fn().mockResolvedValue(null),
-	saveCursor: vi.fn().mockResolvedValue(undefined),
+	loadDiscoveryCursor: vi.fn().mockResolvedValue(null),
+	saveDiscoveryCursor: vi.fn().mockResolvedValue(undefined),
+	migrateDiscoveryCursors: vi.fn().mockResolvedValue(undefined),
 	loadPlansRegistry: vi.fn().mockResolvedValue({ version: 1, plans: {} }),
 	savePlansRegistry: vi.fn().mockResolvedValue(undefined),
 	upsertReferenceEntry: vi.fn().mockResolvedValue(undefined),
@@ -60,9 +61,9 @@ import { createInterface } from "node:readline";
 import { extractReferencesFromTranscript } from "../core/references/ReferenceExtractor.js";
 import {
 	loadConfig,
-	loadCursorForTranscript,
+	loadDiscoveryCursor,
 	loadPlansRegistry,
-	saveCursor,
+	saveDiscoveryCursor,
 	savePlansRegistry,
 	saveSession,
 	upsertReferenceEntry,
@@ -190,8 +191,8 @@ describe("StopHook", () => {
 		vi.mocked(existsSync).mockReturnValue(false);
 		// Default: loadPlansRegistry returns empty registry
 		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
-		// Default: loadCursorForTranscript returns null (no prior scan)
-		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+		// Default: loadDiscoveryCursor returns null (no prior scan)
+		vi.mocked(loadDiscoveryCursor).mockResolvedValue(null);
 	});
 
 	afterEach(() => {
@@ -331,8 +332,12 @@ describe("StopHook — plan discovery", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		process.env.CLAUDE_PROJECT_DIR = PROJECT_DIR;
-		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+		vi.mocked(loadDiscoveryCursor).mockResolvedValue(null);
 		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
+		// Default: reference discovery finds nothing. Each cursor-assertion test
+		// overrides lastLineNumberScanned — the reference scan reads to the same
+		// EOF as the plan scan, so its return value drives the merged cursor.
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({ references: [], lastLineNumberScanned: 0 });
 		// Default: files don't exist
 		vi.mocked(existsSync).mockReturnValue(false);
 		vi.mocked(readFileSync).mockReturnValue(
@@ -363,13 +368,16 @@ describe("StopHook — plan discovery", () => {
 			'{"role":"assistant","content":"Hello world"}',
 			'{"role":"human","content":"Please help me"}',
 		]);
+		// Plan + reference discovery share one cursor; the reference scan reads
+		// to the same EOF, so its lastLineNumberScanned drives the merged cursor.
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({ references: [], lastLineNumberScanned: 2 });
 
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
 
-		expect(saveCursor).toHaveBeenCalledWith(
+		expect(saveDiscoveryCursor).toHaveBeenCalledWith(
 			expect.objectContaining({
-				transcriptPath: `plan:${TRANSCRIPT_PATH}`,
+				transcriptPath: `${TRANSCRIPT_PATH}`,
 				lineNumber: 2,
 			}),
 			PROJECT_DIR,
@@ -379,19 +387,21 @@ describe("StopHook — plan discovery", () => {
 
 	it("should not update cursor when transcript has no new lines since last scan", async () => {
 		// Last scan was at line 5, transcript still only has 5 lines
-		vi.mocked(loadCursorForTranscript).mockResolvedValue({
-			transcriptPath: `plan:${TRANSCRIPT_PATH}`,
+		vi.mocked(loadDiscoveryCursor).mockResolvedValue({
+			transcriptPath: `${TRANSCRIPT_PATH}`,
 			lineNumber: 5,
 			updatedAt: new Date().toISOString(),
 		});
 		vi.mocked(existsSync).mockReturnValue(true);
 		// Emit only 5 lines (same as cursor position)
 		mockTranscriptWithLines(["line1", "line2", "line3", "line4", "line5"]);
+		// Reference scan reaches the same line 5 — no new lines past the cursor.
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({ references: [], lastLineNumberScanned: 5 });
 
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
 
-		expect(saveCursor).not.toHaveBeenCalled();
+		expect(saveDiscoveryCursor).not.toHaveBeenCalled();
 		expect(savePlansRegistry).not.toHaveBeenCalled();
 	});
 
@@ -413,7 +423,6 @@ describe("StopHook — plan discovery", () => {
 						slug: "my-test-plan",
 						title: "Plan Title",
 						commitHash: null,
-						branch: expect.any(String),
 					}),
 				}),
 			}),
@@ -578,7 +587,6 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: "/home/user/.claude/plans/existing-plan.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: null,
 				},
 			},
@@ -617,7 +625,6 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: "/home/user/.claude/plans/committed-plan.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: "abc12345",
 				},
 			},
@@ -625,37 +632,6 @@ describe("StopHook — plan discovery", () => {
 
 		mockTranscriptWithLines([
 			'{"type":"tool_use","name":"Edit","input":{"file_path":"/home/user/.claude/plans/committed-plan.md"}}',
-		]);
-
-		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
-		await handleStopHook();
-
-		expect(savePlansRegistry).not.toHaveBeenCalled();
-	});
-
-	it("should skip ignored plans", async () => {
-		vi.mocked(existsSync)
-			.mockReturnValueOnce(true) // transcript file
-			.mockReturnValueOnce(true); // plan file
-
-		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
-			plans: {
-				"ignored-plan": {
-					slug: "ignored-plan",
-					title: "Ignored Plan",
-					sourcePath: "/home/user/.claude/plans/ignored-plan.md",
-					addedAt: "2026-01-01T00:00:00Z",
-					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
-					commitHash: null,
-					ignored: true,
-				},
-			},
-		});
-
-		mockTranscriptWithLines([
-			'{"type":"tool_use","name":"Edit","input":{"file_path":"/home/user/.claude/plans/ignored-plan.md"}}',
 		]);
 
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
@@ -693,7 +669,6 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: "/home/user/.claude/plans/archived-plan.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: "abc12345",
 					// Real SHA-256 of "# Plan Title\n\nContent" (what readFileSync mock returns)
 					contentHashAtCommit: "1ab12ceb7fdd12641cbcefc8a5b7816c447423966a5b9976a4e004b6ae49fe6d",
@@ -727,7 +702,6 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: "/home/user/.claude/plans/reused-plan.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: "abc12345",
 					contentHashAtCommit: "old-content-hash", // differs from "current-file-hash"
 				},
@@ -755,43 +729,10 @@ describe("StopHook — plan discovery", () => {
 		);
 	});
 
-	it("should not resurrect an ignored archive-guarded plan even when content changed", async () => {
-		vi.mocked(existsSync)
-			.mockReturnValueOnce(true) // transcript file
-			.mockReturnValueOnce(true); // plan file
-
-		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
-			plans: {
-				"removed-plan": {
-					slug: "removed-plan",
-					title: "Removed Plan",
-					sourcePath: "/home/user/.claude/plans/removed-plan.md",
-					addedAt: "2026-01-01T00:00:00Z",
-					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
-					commitHash: "abc12345",
-					contentHashAtCommit: "old-content-hash",
-					ignored: true,
-				},
-			},
-		});
-
-		mockTranscriptWithLines([
-			'{"type":"tool_use","name":"Write","input":{"file_path":"/home/user/.claude/plans/removed-plan.md"}}',
-		]);
-
-		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
-		await handleStopHook();
-
-		// Even though content changed, ignored flag should prevent resurrection
-		expect(savePlansRegistry).not.toHaveBeenCalled();
-	});
-
 	it("should only scan new transcript lines since last cursor position", async () => {
 		// Cursor at line 1 — only line 2 is new
-		vi.mocked(loadCursorForTranscript).mockResolvedValue({
-			transcriptPath: `plan:${TRANSCRIPT_PATH}`,
+		vi.mocked(loadDiscoveryCursor).mockResolvedValue({
+			transcriptPath: `${TRANSCRIPT_PATH}`,
 			lineNumber: 1,
 			updatedAt: new Date().toISOString(),
 		});
@@ -881,7 +822,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "/home/user/.claude/plans/race-plan.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "main",
 						commitHash: null,
 					},
 				},
@@ -898,7 +838,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "/home/user/.claude/plans/race-plan.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "main",
 						commitHash: "abc12345",
 						contentHashAtCommit: "deadbeefhash",
 					},
@@ -940,7 +879,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "/home/user/.claude/plans/current-plan.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "main",
 						commitHash: null,
 					},
 				},
@@ -954,7 +892,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "/home/user/.claude/plans/current-plan.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "main",
 						commitHash: null,
 					},
 					"other-plan": {
@@ -963,7 +900,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "/home/user/.claude/plans/other-plan.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "main",
 						commitHash: "abc12345",
 					},
 				},
@@ -999,7 +935,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "/repo/docs/refactor-api.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
 						commitHash: null,
 					},
 				},
@@ -1014,7 +949,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "/repo/docs/refactor-api.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
 						commitHash: "abc12345cafebabe",
 						contentHashAtCommit: "deadbeefhash",
 					},
@@ -1024,7 +958,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "/repo/docs/refactor-api.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
 						commitHash: "abc12345cafebabe",
 					},
 				},
@@ -1074,7 +1007,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: planPath,
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
 						commitHash: null,
 					},
 				},
@@ -1088,7 +1020,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: planPath,
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
 						commitHash: "abc12345cafebabe",
 						contentHashAtCommit: "snapshot-hash",
 					},
@@ -1107,7 +1038,7 @@ describe("StopHook — plan discovery", () => {
 		// "snapshot-hash". Mock readFileSync to return content whose hash will
 		// definitely not equal "snapshot-hash" (the mock default already does
 		// this — content "# Plan Title\n\nContent" hashes to a different value).
-		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+		vi.mocked(loadDiscoveryCursor).mockResolvedValue(null);
 		vi.mocked(loadPlansRegistry).mockReset();
 		vi.mocked(loadPlansRegistry).mockResolvedValue({
 			version: 1,
@@ -1124,70 +1055,6 @@ describe("StopHook — plan discovery", () => {
 		const afterEvent2 = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
 		expect(afterEvent2?.plans["refactor-api"]?.commitHash).toBeNull();
 		expect(afterEvent2?.plans["refactor-api"]?.contentHashAtCommit).toBeUndefined();
-	});
-
-	it("should preserve an extension-flipped ignored flag on a slug we did not touch", async () => {
-		// Race scenario: while StopHook scans for `our-plan`, the user clicks
-		// Ignore on `unrelated-plan` in the panel. The extension writes
-		// ignored:true. StopHook's writeback must NOT clobber it.
-		vi.mocked(existsSync).mockReturnValueOnce(true).mockReturnValueOnce(true);
-
-		vi.mocked(loadPlansRegistry)
-			.mockResolvedValueOnce({
-				version: 1,
-				plans: {
-					"our-plan": {
-						slug: "our-plan",
-						title: "Ours",
-						sourcePath: "/home/user/.claude/plans/our-plan.md",
-						addedAt: "2026-01-01T00:00:00Z",
-						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
-						commitHash: null,
-					},
-					"unrelated-plan": {
-						slug: "unrelated-plan",
-						title: "Unrelated",
-						sourcePath: "/home/user/.claude/plans/unrelated-plan.md",
-						addedAt: "2026-01-01T00:00:00Z",
-						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
-						commitHash: null,
-					},
-				},
-			})
-			.mockResolvedValueOnce({
-				version: 1,
-				plans: {
-					"our-plan": {
-						slug: "our-plan",
-						title: "Ours",
-						sourcePath: "/home/user/.claude/plans/our-plan.md",
-						addedAt: "2026-01-01T00:00:00Z",
-						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
-						commitHash: null,
-					},
-					"unrelated-plan": {
-						slug: "unrelated-plan",
-						title: "Unrelated",
-						sourcePath: "/home/user/.claude/plans/unrelated-plan.md",
-						addedAt: "2026-01-01T00:00:00Z",
-						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
-						commitHash: null,
-						ignored: true, // extension flipped this between the two reads
-					},
-				},
-			});
-
-		mockTranscriptWithLines(['{"type":"tool_result","slug":"our-plan","content":"..."}']);
-
-		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
-		await handleStopHook();
-
-		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
-		expect(saved?.plans["unrelated-plan"]?.ignored).toBe(true);
 	});
 
 	it("should preserve a slug added by a parallel StopHook between load and save", async () => {
@@ -1207,7 +1074,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "/repo/docs/plan-b.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown",
 						commitHash: null,
 					},
 				},
@@ -1346,7 +1212,6 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: "/home/user/.claude/plans/foo.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: null,
 				},
 			},
@@ -1382,7 +1247,6 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: "/repo/docs/foo.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: null,
 				},
 			},
@@ -1406,14 +1270,16 @@ describe("StopHook — plan discovery", () => {
 			.mockReturnValueOnce(true); // external plan file
 
 		mockTranscriptWithLines(['{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/lonely.md"}}']);
+		// Reference scan reaches the same single line — drives the merged cursor.
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({ references: [], lastLineNumberScanned: 1 });
 
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
 
 		expect(savePlansRegistry).toHaveBeenCalled();
-		expect(saveCursor).toHaveBeenCalledWith(
+		expect(saveDiscoveryCursor).toHaveBeenCalledWith(
 			expect.objectContaining({
-				transcriptPath: `plan:${TRANSCRIPT_PATH}`,
+				transcriptPath: `${TRANSCRIPT_PATH}`,
 				lineNumber: 1,
 			}),
 			PROJECT_DIR,
@@ -1470,7 +1336,6 @@ describe("StopHook — plan discovery", () => {
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
 					// "unknown" matches getCurrentBranch() default in tests (no git repo)
-					branch: "unknown",
 					commitHash: null,
 				},
 			},
@@ -1503,7 +1368,6 @@ describe("StopHook — plan discovery", () => {
 					// no sourcePath — falls through the `if (note.sourcePath)` guard
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "unknown",
 					commitHash: null,
 				} as never,
 			},
@@ -1518,11 +1382,10 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).toHaveBeenCalled();
 	});
 
-	it("should still treat a legacy note WITHOUT a branch field as a shadowing source (covers `note.branch` falsy arm)", async () => {
-		// Legacy notes (created before the branch field landed) omit `branch`.
-		// The `note.branch && note.branch !== branch` short-circuits to false
-		// when `note.branch` is undefined → the note is treated as global
-		// shadow, suppressing the would-be plan registration. Pins that arm.
+	it("should treat any note's sourcePath as a shadowing source regardless of branch", async () => {
+		// Notes are no longer branch-scoped — every note's sourcePath suppresses
+		// plan auto-registration for the same file, regardless of which branch
+		// the note was authored on. Pins that the shadow set ignores branch.
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file
 			.mockReturnValueOnce(true); // .md file on disk
@@ -1531,16 +1394,15 @@ describe("StopHook — plan discovery", () => {
 			version: 1,
 			plans: {},
 			notes: {
-				"n-legacy": {
-					id: "n-legacy",
-					title: "Legacy global note",
+				"n-shadow": {
+					id: "n-shadow",
+					title: "Global note",
 					format: "markdown",
 					sourcePath: "/repo/docs/legacy.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					// no `branch` field — pre-branch-scope legacy entry
 					commitHash: null,
-				} as never,
+				},
 			},
 		});
 
@@ -1575,7 +1437,6 @@ describe("StopHook — plan discovery", () => {
 						sourcePath: "C:\\Repo\\Docs\\Design.md",
 						addedAt: "2026-01-01T00:00:00Z",
 						updatedAt: "2026-01-01T00:00:00Z",
-						branch: "unknown", // matches getCurrentBranch() default in tests
 						commitHash: null,
 					},
 				},
@@ -1591,51 +1452,6 @@ describe("StopHook — plan discovery", () => {
 
 			expect(savePlansRegistry).not.toHaveBeenCalled();
 		});
-	});
-
-	it("should register a plan when a note exists for the same file BUT on a different branch", async () => {
-		// L1 regression: notes are branch-scoped (NoteService.toNoteInfo hides
-		// notes from other branches), so the note guard must also be
-		// branch-scoped. Without this check, a `main` note silently suppresses
-		// plan auto-registration on `feature/x`, even though the user can't see
-		// the note on that branch.
-		vi.mocked(existsSync)
-			.mockReturnValueOnce(true) // transcript file
-			.mockReturnValueOnce(true); // .md file on disk
-
-		vi.mocked(loadPlansRegistry).mockResolvedValue({
-			version: 1,
-			plans: {},
-			notes: {
-				"n-other": {
-					id: "n-other",
-					title: "Design (main)",
-					format: "markdown",
-					sourcePath: "/repo/docs/design.md",
-					addedAt: "2026-01-01T00:00:00Z",
-					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
-					commitHash: null,
-				},
-			},
-		});
-
-		mockTranscriptWithLines(['{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/design.md"}}']);
-
-		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
-		await handleStopHook();
-
-		// getCurrentBranch falls back to "unknown" under test (no git repo),
-		// which differs from the note's "main" → guard does NOT apply →
-		// plan IS registered.
-		expect(savePlansRegistry).toHaveBeenCalledWith(
-			expect.objectContaining({
-				plans: expect.objectContaining({
-					design: expect.objectContaining({ sourcePath: "/repo/docs/design.md" }),
-				}),
-			}),
-			PROJECT_DIR,
-		);
 	});
 
 	it("should NOT register a canonical ~/.claude/plans/ plan when it is already a note (L2)", async () => {
@@ -1658,7 +1474,6 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: canonicalPath,
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "unknown", // matches getCurrentBranch() default in tests
 					commitHash: null,
 				},
 			},
@@ -1675,10 +1490,10 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).not.toHaveBeenCalled();
 	});
 
-	it("should preserve notes and linearIssues fields when writing back to plans.json (C1)", async () => {
-		// C1 regression: discoverPlansFromTranscript previously wrote
+	it("should preserve notes and references fields when writing back to plans.json (C1)", async () => {
+		// C1 regression: an earlier plan-discovery writeback wrote
 		// `{ version: 1, plans }` which silently dropped sibling fields
-		// (notes / linearIssues). loadPlansRegistry's contract is "spread to
+		// (notes / references). loadPlansRegistry's contract is "spread to
 		// preserve optional fields"; the writeback must honor that.
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file
@@ -1695,7 +1510,6 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: "/repo/.jolli/jollimemory/notes/n-keep.md",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "unknown",
 					commitHash: null,
 				},
 			},
@@ -1706,10 +1520,8 @@ describe("StopHook — plan discovery", () => {
 					title: "Keep me too",
 					url: "https://linear.app/x/PROJ-1",
 					sourcePath: "/repo/.jolli/jollimemory/references/linear/PROJ-1.md",
-					branch: "main",
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					commitHash: null,
 					sourceToolName: "mcp__linear__get_issue",
 				},
 			},
@@ -1784,7 +1596,6 @@ describe("StopHook — plan discovery", () => {
 					sourcePath: "/repo/docs/foo.md", // external lives at base slug
 					addedAt: "2026-01-01T00:00:00Z",
 					updatedAt: "2026-01-01T00:00:00Z",
-					branch: "main",
 					commitHash: null,
 				},
 			},
@@ -1829,7 +1640,7 @@ describe("StopHook — entity discovery (multi-source)", () => {
 		vi.clearAllMocks();
 		process.env.CLAUDE_PROJECT_DIR = PROJECT_DIR;
 		vi.mocked(loadConfig).mockResolvedValue({});
-		vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+		vi.mocked(loadDiscoveryCursor).mockResolvedValue(null);
 		vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
 		vi.mocked(existsSync).mockReturnValue(false);
 		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({
@@ -1865,9 +1676,9 @@ describe("StopHook — entity discovery (multi-source)", () => {
 		await handleStopHook();
 
 		expect(upsertReferenceEntry).toHaveBeenCalledWith(REF, PROJECT_DIR, expect.any(String));
-		expect(saveCursor).toHaveBeenCalledWith(
+		expect(saveDiscoveryCursor).toHaveBeenCalledWith(
 			expect.objectContaining({
-				transcriptPath: `linear:${TRANSCRIPT_PATH}`,
+				transcriptPath: `${TRANSCRIPT_PATH}`,
 				lineNumber: 42,
 			}),
 			PROJECT_DIR,
@@ -1886,9 +1697,9 @@ describe("StopHook — entity discovery (multi-source)", () => {
 		await handleStopHook();
 
 		expect(upsertReferenceEntry).not.toHaveBeenCalled();
-		expect(saveCursor).toHaveBeenCalledWith(
+		expect(saveDiscoveryCursor).toHaveBeenCalledWith(
 			expect.objectContaining({
-				transcriptPath: `linear:${TRANSCRIPT_PATH}`,
+				transcriptPath: `${TRANSCRIPT_PATH}`,
 				lineNumber: 10,
 			}),
 			PROJECT_DIR,
@@ -1898,8 +1709,8 @@ describe("StopHook — entity discovery (multi-source)", () => {
 	it("does not save cursor when there are no new lines since last scan", async () => {
 		vi.mocked(existsSync).mockImplementation((p: unknown) => p === TRANSCRIPT_PATH);
 		mockTranscriptWithLines([]);
-		vi.mocked(loadCursorForTranscript).mockResolvedValue({
-			transcriptPath: `linear:${TRANSCRIPT_PATH}`,
+		vi.mocked(loadDiscoveryCursor).mockResolvedValue({
+			transcriptPath: `${TRANSCRIPT_PATH}`,
 			lineNumber: 5,
 			updatedAt: new Date().toISOString(),
 		});
@@ -1911,12 +1722,10 @@ describe("StopHook — entity discovery (multi-source)", () => {
 		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
 		await handleStopHook();
 
-		// saveCursor should not be called for the linear: prefix when lastLine === fromLine
+		// saveDiscoveryCursor should not be called for the linear: prefix when lastLine === fromLine
 		const linearSaves = vi
-			.mocked(saveCursor)
-			.mock.calls.filter(
-				(c) => (c[0] as { transcriptPath: string }).transcriptPath === `linear:${TRANSCRIPT_PATH}`,
-			);
+			.mocked(saveDiscoveryCursor)
+			.mock.calls.filter((c) => (c[0] as { transcriptPath: string }).transcriptPath === `${TRANSCRIPT_PATH}`);
 		expect(linearSaves).toHaveLength(0);
 	});
 
@@ -1960,9 +1769,9 @@ describe("StopHook — entity discovery (multi-source)", () => {
 		expect(upsertCalls[1]?.[0]).toMatchObject({ mapKey: "linear:PROJ-OK" });
 		// Cursor still advances — preventing the StopHook from re-processing
 		// the same window on the next invocation.
-		expect(saveCursor).toHaveBeenCalledWith(
+		expect(saveDiscoveryCursor).toHaveBeenCalledWith(
 			expect.objectContaining({
-				transcriptPath: `linear:${TRANSCRIPT_PATH}`,
+				transcriptPath: `${TRANSCRIPT_PATH}`,
 				lineNumber: 7,
 			}),
 			PROJECT_DIR,

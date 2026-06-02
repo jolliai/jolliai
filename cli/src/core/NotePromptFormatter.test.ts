@@ -19,7 +19,6 @@ function makeNote(overrides: Partial<NoteEntry> = {}): NoteEntry {
 		format: "snippet",
 		addedAt: "2026-05-13T00:00:00Z",
 		updatedAt: "2026-05-14T00:00:00Z",
-		branch: "main",
 		commitHash: null,
 		sourcePath: "/abs/path/my-note.md",
 		...overrides,

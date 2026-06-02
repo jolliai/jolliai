@@ -197,7 +197,7 @@ async function loadLastSummary(commitHash: string, cwd: string): Promise<LastSum
  * Reads local plans.json to find active plan names for the current branch.
  * Pure filesystem read — no git calls.
  */
-function loadAssociatedPlanNames(projectDir: string, branch: string): ReadonlyArray<string> {
+function loadAssociatedPlanNames(projectDir: string, _branch: string): ReadonlyArray<string> {
 	try {
 		const plansPath = join(projectDir, ".jolli", "jollimemory", "plans.json");
 		if (!existsSync(plansPath)) return [];
@@ -205,8 +205,8 @@ function loadAssociatedPlanNames(projectDir: string, branch: string): ReadonlyAr
 		const registry = JSON.parse(readFileSync(plansPath, "utf-8")) as PlansRegistry;
 		const names: string[] = [];
 		for (const entry of Object.values(registry.plans)) {
-			// Include active plans for this branch (not archived, not ignored)
-			if (!entry.commitHash && !entry.ignored && entry.title && entry.branch === branch) {
+			// Include active (uncommitted) plans — worktree-scoped, no branch filter
+			if (!entry.commitHash && entry.title) {
 				names.push(entry.title);
 			}
 		}

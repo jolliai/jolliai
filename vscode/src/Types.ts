@@ -89,8 +89,6 @@ export interface PlanInfo {
 	readonly addedAt: string;
 	/** ISO 8601 — when this plan was last modified */
 	readonly updatedAt: string;
-	/** Git branch name when plan was discovered */
-	readonly branch: string;
 	/** Commit hash if plan is associated with a commit, null if unassociated */
 	readonly commitHash: string | null;
 }
@@ -102,12 +100,9 @@ export interface PlanEntry {
 	readonly sourcePath: string;
 	readonly addedAt: string;
 	readonly updatedAt: string;
-	readonly branch: string;
 	readonly commitHash: string | null;
 	/** SHA-256 hash of the plan file content when associated with a commit. Used as a guard to detect if the file was overwritten with new content. */
 	readonly contentHashAtCommit?: string;
-	/** When true, plan is hidden from PLANS panel (user removed it). Cleared if source file content changes. */
-	readonly ignored?: boolean;
 }
 
 // ─── Note types ─────────────────────────────────────────────────────────────
@@ -143,7 +138,6 @@ export interface NoteInfo {
 	readonly lastModified: string;
 	readonly addedAt: string;
 	readonly updatedAt: string;
-	readonly branch: string;
 	readonly commitHash: string | null;
 	/** Filename (e.g. "my-note.md") */
 	readonly filename?: string;
@@ -157,16 +151,15 @@ export interface NoteInfo {
  * Extends `ReferenceEntry` (the persisted registry row) with panel-display
  * fields read from the on-disk markdown frontmatter (status / priority /
  * labels / description preview) plus `mapKey` (the registry key,
- * `<source>:<nativeId>` or `<source>:<nativeId>-<shortHash>` for archived
- * snapshots) and a stable `lastModified` field (= updatedAt) for sort
- * consistency with PlanInfo / NoteInfo.
+ * `<source>:<nativeId>`) and a stable `lastModified` field (= updatedAt) for
+ * sort consistency with PlanInfo / NoteInfo.
  */
 export interface ReferenceInfo {
 	readonly kind: "reference";
 	readonly source: SourceId;
 	/** Stable native id (Linear ticket id, Jira key, owner/repo#number, 32-hex Notion page id). */
 	readonly nativeId: string;
-	/** plans.json.references map key — `<source>:<nativeId>` while uncommitted, or `<source>:<nativeId>-<shortHash>` after archive. */
+	/** plans.json.references map key — `<source>:<nativeId>`. */
 	readonly mapKey: string;
 	readonly title: string;
 	readonly url: string;
@@ -174,13 +167,9 @@ export interface ReferenceInfo {
 	/** Opaque, source-specific display fields (built by the adapter). */
 	readonly fields?: ReadonlyArray<ReferenceField>;
 	readonly description?: string;
-	readonly branch: string;
 	readonly addedAt: string;
 	readonly updatedAt: string;
 	/** ISO 8601 — same as updatedAt for sort consistency with PlanInfo / NoteInfo. */
 	readonly lastModified: string;
-	readonly commitHash: string | null;
-	readonly contentHashAtCommit?: string;
-	readonly ignored: boolean;
 	readonly sourceToolName: string;
 }

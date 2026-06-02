@@ -1,12 +1,12 @@
 /**
  * NotionAdapter — `SourceAdapter` for the Notion MCP server (notion-fetch only).
  *
- * Scope (Phase 5, deliberately narrow):
+ * Scope (deliberately narrow):
  *   - Only `mcp__claude_ai_Notion__notion-fetch` produces References. Other
  *     notion-* tools (`notion-search`, `notion-update-page`, `notion-create-*`,
  *     …) all return null even though the same MCP prefix matches the line.
  *     `notion-search` requires its own payload-shape investigation and is
- *     deferred to Phase 6.
+ *     deferred.
  *   - Only `metadata.type === "page"` is accepted; database / data_source are
  *     silently rejected.
  *
@@ -27,7 +27,7 @@
  * larger than ticket descriptions, so the budget is widened over Linear/Jira/
  * GitHub's 4 KB/30 KB.
  *
- * Adapter modules MUST NOT share helpers across sources (per plan §Constraints).
+ * Adapter modules MUST NOT share helpers across sources.
  * `parseNotionEnvelope` lives in `./NotionEnvelope.ts` and is Notion-only.
  */
 
@@ -76,9 +76,9 @@ export const NotionAdapter: SourceAdapter = {
 	maxCharsPerReference: MAX_CHARS,
 
 	extractRef(payload, toolName, referencedAt) {
-		// Phase 5 scope: only notion-fetch. Other notion-* tools (search /
+		// Scope: only notion-fetch. Other notion-* tools (search /
 		// update-page / etc.) silently return null even when their MCP prefix
-		// matches. notion-search is deferred to Phase 6 pending payload-shape
+		// matches. notion-search is deferred pending payload-shape
 		// investigation.
 		if (!toolName.endsWith("notion-fetch")) return null;
 

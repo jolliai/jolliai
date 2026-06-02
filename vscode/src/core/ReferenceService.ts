@@ -3,10 +3,11 @@
  *
  * Central service for VS Code-side external-reference operations (parallel to
  * NoteService):
- * - Read: detectReferences filters plans.json.references by branch / ignored /
- *   archive guard. Optional `sourceFilter` narrows to one provider.
- * - Mutate: setReferenceIgnored marks/unmarks the ignored flag (mapKey form is
- *   `<source>:<nativeId>` matching the registry key).
+ * - Read: detectReferences returns every plans.json.references row (references
+ *   are deleted at commit time, so each surviving row is active). Optional
+ *   `sourceFilter` narrows to one provider.
+ * - Mutate: removeReference hard-deletes the registry row + backing markdown
+ *   (mapKey form is `<source>:<nativeId>` matching the registry key).
  * - Open: openReferenceInBrowser / openReferenceMarkdown.
  *
  * Reference contents live on disk at
@@ -26,6 +27,7 @@ import {
 	loadPlansRegistry,
 	savePlansRegistry,
 } from "../../../cli/src/core/SessionTracker.js";
+import { deleteReferenceMarkdown } from "../../../cli/src/core/references/ReferenceStore.js";
 import type {
 	PlansRegistry,
 	ReferenceEntry,
@@ -34,17 +36,14 @@ import type {
 } from "../../../cli/src/Types.js";
 import type { ReferenceInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
-import { getCurrentBranch } from "./PlanService.js";
 
 /**
- * Reads plans.json and returns the filtered, sorted list of ReferenceInfo for
- * the multi-source panel. Optional `sourceFilter` narrows to one provider.
+ * Reads plans.json and returns the sorted list of ReferenceInfo for the
+ * multi-source panel. Optional `sourceFilter` narrows to one provider.
  *
- * Filter (matches detectUncommittedReferenceIds on the CLI side):
- *   - branch matches (or git is unavailable)
- *   - !ignored
- *   - commitHash === null (uncommitted)
- *   - !contentHashAtCommit (not a guard or archived-snapshot copy)
+ * No filtering: a reference is removed from the registry when its commit
+ * lands, so every row in `plans.json.references` is an active, uncommitted
+ * reference (matches `getReferenceEntriesForBranch` on the CLI side).
  */
 export async function detectReferences(
 	cwd: string,
@@ -52,13 +51,11 @@ export async function detectReferences(
 ): Promise<ReadonlyArray<ReferenceInfo>> {
 	const registry = await loadPlansRegistry(cwd);
 	const references = { ...(registry.references ?? {}) };
-	const branch = getCurrentBranch(cwd);
 	const result: ReferenceInfo[] = [];
 
 	for (const [mapKey, entry] of Object.entries(references)) {
 		if (sourceFilter !== undefined && entry.source !== sourceFilter) continue;
-		const info = toReferenceInfo(mapKey, entry, branch);
-		if (info) result.push(info);
+		result.push(toReferenceInfo(mapKey, entry));
 	}
 
 	result.sort(
@@ -73,29 +70,39 @@ export async function detectReferences(
 }
 
 /**
- * Sets or clears the ignored flag on a reference entry, keyed by mapKey
- * (`<source>:<nativeId>` or `<source>:<nativeId>-<shortHash>` archive form).
+ * Hard-removes a reference, keyed by mapKey (`<source>:<nativeId>`): deletes the
+ * registry row AND the backing
+ * `.jolli/jollimemory/references/<source>/<key>.md` file.
  *
- * The registry's plans / notes section is preserved verbatim.
+ * Reference markdown always lives inside the per-project `.jolli/jollimemory/`
+ * directory, so the file is always safe to delete — no internal/external check
+ * needed (contrast `PlanService.removePlan`, whose source files are usually
+ * external). Idempotent: an unknown mapKey is a no-op, and a missing `.md` is
+ * tolerated (`deleteReferenceMarkdown` uses `force`).
+ *
+ * Allows revival: removal leaves no tombstone, so a later re-reference of the
+ * same entity is re-discovered and re-inserted. The registry's plans / notes
+ * section is preserved verbatim.
  */
-export async function setReferenceIgnored(
-	cwd: string,
-	mapKey: string,
-	ignored: boolean,
-): Promise<void> {
+export async function removeReference(cwd: string, mapKey: string): Promise<void> {
 	const registry = await loadPlansRegistry(cwd);
 	const existing = { ...(registry.references ?? {}) };
 	const entry = existing[mapKey];
 	if (!entry) return;
-	const references: Record<string, ReferenceEntry> = {
-		...existing,
-		[mapKey]: { ...entry, ignored: ignored || undefined },
-	};
+	// Best-effort file delete — a permission/lock error (Windows EPERM/EBUSY)
+	// must not strand the registry row; mirrors PlanService.removePlan /
+	// NoteService.removeNote. deleteReferenceMarkdown already tolerates ENOENT.
+	try {
+		await deleteReferenceMarkdown(entry.sourcePath);
+	} catch {
+		/* registry row is still removed below */
+	}
+	delete existing[mapKey];
 	const out: PlansRegistry = {
 		version: 1,
 		plans: registry.plans,
 		...(registry.notes !== undefined ? { notes: registry.notes } : {}),
-		references,
+		references: existing,
 	};
 	await savePlansRegistry(out, cwd);
 }
@@ -132,18 +139,9 @@ export async function openReferenceMarkdown(info: ReferenceInfo): Promise<void> 
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
-function toReferenceInfo(
-	mapKey: string,
-	entry: ReferenceEntry,
-	currentBranch: string | null,
-): ReferenceInfo | null {
-	if (currentBranch && entry.branch !== currentBranch) return null;
-	if (entry.ignored) return null;
-	if (entry.commitHash !== null) return null;
-	/* v8 ignore start -- defensive: commitHash=null with contentHashAtCommit set is an invariant violation (archive always sets both); guard kept for total-function semantics. */
-	if (entry.contentHashAtCommit !== undefined) return null;
-	/* v8 ignore stop */
-
+function toReferenceInfo(mapKey: string, entry: ReferenceEntry): ReferenceInfo {
+	// Every plans.json.references row is an uncommitted active reference
+	// (commit deletes the entry), so there is no committed / guard state to filter.
 	const frontmatter = readFrontmatter(entry.sourcePath);
 
 	return {
@@ -158,18 +156,9 @@ function toReferenceInfo(
 		...(frontmatter.description !== undefined
 			? { description: frontmatter.description }
 			: {}),
-		branch: entry.branch,
 		addedAt: entry.addedAt,
 		updatedAt: entry.updatedAt,
 		lastModified: entry.updatedAt,
-		commitHash: entry.commitHash,
-		// `entry.contentHashAtCommit !== undefined` is unreachable here: the
-		// guard above already returned null for any entry with a defined
-		// contentHashAtCommit. The spread is kept for symmetry with other
-		// optional ReferenceInfo fields, but its truthy arm cannot fire.
-		/* v8 ignore next -- the contentHashAtCommit guard above ensures it is undefined by this point. */
-		...(entry.contentHashAtCommit !== undefined ? { contentHashAtCommit: entry.contentHashAtCommit } : {}),
-		ignored: entry.ignored ?? false,
 		sourceToolName: entry.sourceToolName,
 	};
 }

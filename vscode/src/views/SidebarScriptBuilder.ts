@@ -3219,7 +3219,7 @@ export function buildSidebarScript(): string {
     if (isReference) {
       return el('span', { className: 'inline-actions' }, [
         attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'open-reference', 'data-id': item.id, text: '↗' }), 'Open in browser'),
-        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'ignore-reference', 'data-id': item.id, text: '🗑' }), 'Ignore'),
+        attachTextTip(el('button', { type: 'button', className: 'iconbtn', 'data-inline': 'ignore-reference', 'data-id': item.id, text: '🗑' }), 'Remove'),
       ]);
     }
     if (isFile) {
@@ -3685,7 +3685,7 @@ export function buildSidebarScript(): string {
         { label: 'Open in browser', rawMessage: { type: 'branch:openReference',         mapKey: id } },
         { label: 'Open Markdown',   rawMessage: { type: 'branch:openReferenceMarkdown', mapKey: id } },
         { separator: true },
-        { label: 'Ignore',          rawMessage: { type: 'branch:ignoreReference',       mapKey: id } },
+        { label: 'Remove',          rawMessage: { type: 'branch:ignoreReference',       mapKey: id } },
       ]);
       return;
     }

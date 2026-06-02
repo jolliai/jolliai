@@ -31,7 +31,7 @@
  *   - `milestone.title` or bare string → `milestone`
  *   - `issue_type.name` or bare string → `entity-type`
  *
- * Adapter modules MUST NOT share helpers across sources (per plan §Constraints).
+ * Adapter modules MUST NOT share helpers across sources.
  * `decodeHtmlEntities` lives in `./HtmlEntities.ts` and is GitHub-only.
  */
 

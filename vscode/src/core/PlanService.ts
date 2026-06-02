@@ -17,10 +17,12 @@ import {
 	readFileSync as fsReadFileSync,
 	readdirSync,
 	statSync,
+	unlinkSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isPathInside } from "../../../cli/src/core/PathUtils.js";
 import {
 	loadAllSessions,
 	loadPlansRegistry,
@@ -28,8 +30,8 @@ import {
 } from "../../../cli/src/core/SessionTracker.js";
 import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
 import { storePlans } from "../../../cli/src/core/SummaryStore.js";
+import { getJolliMemoryDir } from "../../../cli/src/Logger.js";
 import type { PlanReference } from "../../../cli/src/Types.js";
-import { execFileSyncHidden } from "../../../cli/src/util/Subprocess.js";
 import type { PlanEntry, PlanInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
 
@@ -63,7 +65,6 @@ export async function detectPlans(cwd: string): Promise<Array<PlanInfo>> {
 		if (
 			entry.commitHash === null &&
 			!entry.contentHashAtCommit &&
-			!entry.ignored &&
 			!existsSync(entry.sourcePath)
 		) {
 			delete registryPlans[slug];
@@ -74,8 +75,7 @@ export async function detectPlans(cwd: string): Promise<Array<PlanInfo>> {
 		await savePlansRegistry({ ...registry, plans: registryPlans }, cwd);
 	}
 
-	const branch = getCurrentBranch(cwd);
-	const plans = buildPlanInfoList(registryPlans, branch);
+	const plans = buildPlanInfoList(registryPlans);
 	log.info(
 		"plans",
 		`detectPlans found ${plans.length} plans (${Object.keys(registryPlans).length} in registry)`,
@@ -84,13 +84,10 @@ export async function detectPlans(cwd: string): Promise<Array<PlanInfo>> {
 }
 
 /** Converts registry entries into a sorted PlanInfo array, filtering out invisible entries. */
-function buildPlanInfoList(
-	registryPlans: Record<string, PlanEntry>,
-	currentBranch?: string,
-): Array<PlanInfo> {
+function buildPlanInfoList(registryPlans: Record<string, PlanEntry>): Array<PlanInfo> {
 	const plans: Array<PlanInfo> = [];
 	for (const entry of Object.values(registryPlans)) {
-		const info = toPlanInfo(entry, currentBranch);
+		const info = toPlanInfo(entry);
 		if (info) {
 			plans.push(info);
 		}
@@ -103,16 +100,7 @@ function buildPlanInfoList(
 }
 
 /** Converts a single PlanEntry to PlanInfo, returning null if the entry should be hidden. */
-function toPlanInfo(entry: PlanEntry, currentBranch?: string): PlanInfo | null {
-	if (entry.ignored) {
-		return null;
-	}
-
-	// Skip entries from other branches
-	if (currentBranch && entry.branch && entry.branch !== currentBranch) {
-		return null;
-	}
-
+function toPlanInfo(entry: PlanEntry): PlanInfo | null {
 	// Skip archive guards (source file unchanged)
 	if (entry.contentHashAtCommit) {
 		const planFile = entry.sourcePath;
@@ -159,28 +147,42 @@ function toPlanInfo(entry: PlanEntry, currentBranch?: string): PlanInfo | null {
 		lastModified,
 		addedAt: entry.addedAt,
 		updatedAt: entry.updatedAt,
-		branch: entry.branch,
 		commitHash: entry.commitHash,
 	};
 }
 
 /**
- * Marks a plan as ignored in plans.json (hidden from PLANS panel).
- * Does not delete the entry — detectPlans() will skip it.
+ * Hard-removes a plan from plans.json: deletes the registry entry, and deletes
+ * the source file ONLY when it lives inside the per-project `.jolli/jollimemory/`
+ * directory. Plan source files are almost always external (`~/.claude/plans/`,
+ * repo `docs/`, external note dirs), so in practice the file is preserved and
+ * only the registry row is removed — matching `NoteService.removeNote`'s
+ * "delete the internal backing file, never touch external user files" rule.
+ *
+ * Idempotent: an unknown slug is a no-op. Allows revival — no `ignored`
+ * tombstone is left, so re-adding the same plan file re-registers it.
  */
-export async function ignorePlan(slug: string, cwd: string): Promise<void> {
+export async function removePlan(slug: string, cwd: string): Promise<void> {
 	const registry = await loadPlansRegistry(cwd);
 	const entry = registry.plans[slug];
 	if (!entry) {
 		return;
 	}
-	await savePlansRegistry(
-		{
-			...registry,
-			plans: { ...registry.plans, [slug]: { ...entry, ignored: true } },
-		},
-		cwd,
-	);
+	// Delete the backing file only when it is inside .jolli/jollimemory/ —
+	// external plan files (the common case) are the user's own, never deleted.
+	if (
+		isPathInside(entry.sourcePath, getJolliMemoryDir(cwd)) &&
+		existsSync(entry.sourcePath)
+	) {
+		try {
+			unlinkSync(entry.sourcePath);
+		} catch {
+			/* best-effort — the registry row is still removed below */
+		}
+	}
+	const plans = { ...registry.plans };
+	delete plans[slug];
+	await savePlansRegistry({ ...registry, plans }, cwd);
 }
 
 /**
@@ -208,7 +210,6 @@ export async function addPlanToRegistry(
 		sourcePath: planFile,
 		addedAt: existing?.addedAt ?? now,
 		updatedAt: now,
-		branch: getCurrentBranch(cwd),
 		commitHash: null,
 	};
 
@@ -350,7 +351,6 @@ export async function archivePlanForCommit(
 			sourcePath: planFile,
 			addedAt: new Date().toISOString(),
 			updatedAt: new Date().toISOString(),
-			branch: getCurrentBranch(cwd),
 			commitHash: null,
 		};
 	}
@@ -365,7 +365,9 @@ export async function archivePlanForCommit(
 		contentHashAtCommit = hashFileContent(entry.sourcePath);
 	}
 
-	// Update plans.json: original slug becomes guard, new slug is the committed entry
+	// Update plans.json: the original slug becomes the guard. No
+	// `<slug>-<shortHash>` archive row — the orphan-branch snapshot (stored under
+	// newSlug below) + the CommitSummary PlanReference are the system of record.
 	await savePlansRegistry(
 		{
 			...registry,
@@ -376,16 +378,6 @@ export async function archivePlanForCommit(
 					commitHash,
 					updatedAt: now,
 					contentHashAtCommit,
-					ignored: undefined,
-				},
-				[newSlug]: {
-					slug: newSlug,
-					title: entry.title,
-					sourcePath: entry.sourcePath,
-					addedAt: entry.addedAt,
-					updatedAt: now,
-					branch: entry.branch,
-					commitHash,
 				},
 			},
 		},
@@ -401,9 +393,7 @@ export async function archivePlanForCommit(
 	// storePlans branch arg (below): intentionally left undefined.
 	// FolderStorage.resolveBranchFromSlug uses the commit hash embedded in
 	// `newSlug` to look up the commit's branch from the manifest / index —
-	// that's the right home for the visible <branch>/plan--<slug>.md. Passing
-	// entry.branch would point at the plan's *home* branch, which can differ
-	// from the commit's branch when editing summaries cross-branch.
+	// that's the right home for the visible <branch>/plan--<slug>.md.
 	const planFile = entry.sourcePath;
 	if (existsSync(planFile)) {
 		const content = fsReadFileSync(planFile, "utf-8");
@@ -427,34 +417,6 @@ export async function archivePlanForCommit(
 		addedAt: entry.addedAt,
 		updatedAt: now,
 	};
-}
-
-/**
- * Removes a plan's association with a commit (called from WebView "Remove" button).
- * Clears commitHash in plans.json so the plan becomes unassociated.
- */
-export async function unassociatePlanFromCommit(
-	slug: string,
-	cwd: string,
-): Promise<void> {
-	const registry = await loadPlansRegistry(cwd);
-	const entry = registry.plans[slug];
-	if (!entry) {
-		return;
-	}
-
-	await savePlansRegistry(
-		{
-			...registry,
-			plans: {
-				...registry.plans,
-				[slug]: { ...entry, commitHash: null },
-			},
-		},
-		cwd,
-	);
-
-	log.info("plans", `Unassociated plan ${slug} from commit`);
 }
 
 /**
@@ -488,17 +450,4 @@ function hashFileContent(filePath: string): string {
 	return createHash("sha256")
 		.update(fsReadFileSync(filePath, "utf-8"))
 		.digest("hex");
-}
-
-export function getCurrentBranch(cwd: string): string {
-	try {
-		return execFileSyncHidden("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-			cwd,
-			encoding: "utf-8",
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim();
-		/* v8 ignore next 3 -- defensive: rev-parse fails only when cwd is not a git repo, which the caller already filters out before reaching here; "unknown" is the safe sentinel for an impossible state */
-	} catch {
-		return "unknown";
-	}
 }

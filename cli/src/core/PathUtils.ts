@@ -35,6 +35,26 @@ export function normalizePathForCompare(p: string): string {
 }
 
 /**
+ * Returns true iff `child` is `parent` itself or a path nested inside it.
+ *
+ * Both endpoints run through {@link normalizePathForCompare} (separator + case
+ * folding on Windows/macOS), then a directory-boundary check so that
+ * `.jolli/jollimemoryX` is NOT treated as inside `.jolli/jollimemory`.
+ *
+ * Used to decide whether a registry entry's `sourcePath` lives inside the
+ * per-project `.jolli/jollimemory/` directory: hard-delete the backing file
+ * only for inside paths; external files (e.g. `~/.claude/plans/foo.md`) keep
+ * their file and lose only the registry row. Like `normalizePathForCompare`
+ * it does NOT call `path.resolve` (WSL POSIX-absolute rationale) — callers
+ * pass absolute paths.
+ */
+export function isPathInside(child: string, parent: string): boolean {
+	const c = normalizePathForCompare(child);
+	const p = normalizePathForCompare(parent);
+	return c === p || c.startsWith(`${p}/`);
+}
+
+/**
  * Converts a filesystem path to forward-slash form (POSIX-style).
  *
  * Single-purpose helper: replaces `\` with `/`, does NOT touch case, does NOT

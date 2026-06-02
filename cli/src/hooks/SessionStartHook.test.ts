@@ -883,16 +883,14 @@ describe("SessionStartHook", () => {
 					slug: "oauth-strategy",
 					title: "OAuth2 Integration Strategy",
 					sourcePath: "plans/oauth-strategy.md",
-					branch: "feature/test-branch",
 					addedAt: "2026-03-28T10:00:00.000Z",
 					updatedAt: "2026-03-29T10:00:00.000Z",
 					commitHash: null,
 				},
-				"other-branch-plan": {
-					slug: "other-branch-plan",
-					title: "Unrelated Plan From Other Branch",
-					sourcePath: "plans/other.md",
-					branch: "feature/other-branch",
+				"second-active-plan": {
+					slug: "second-active-plan",
+					title: "Second Active Plan",
+					sourcePath: "plans/second.md",
 					addedAt: "2026-03-28T10:00:00.000Z",
 					updatedAt: "2026-03-28T10:00:00.000Z",
 					commitHash: null,
@@ -901,20 +899,9 @@ describe("SessionStartHook", () => {
 					slug: "archived-plan",
 					title: "Already Archived Plan",
 					sourcePath: "plans/archived.md",
-					branch: "feature/test-branch",
 					addedAt: "2026-03-27T10:00:00.000Z",
 					updatedAt: "2026-03-28T10:00:00.000Z",
 					commitHash: "abc123",
-				},
-				"ignored-plan": {
-					slug: "ignored-plan",
-					title: "User Dismissed Plan",
-					sourcePath: "plans/ignored.md",
-					branch: "feature/test-branch",
-					addedAt: "2026-03-28T10:00:00.000Z",
-					updatedAt: "2026-03-28T10:00:00.000Z",
-					commitHash: null,
-					ignored: true,
 				},
 			},
 		};
@@ -928,11 +915,11 @@ describe("SessionStartHook", () => {
 
 		const output = writeSpy.mock.calls[0][0] as string;
 		expect(output).toContain("Plans:");
+		// All uncommitted plans are listed regardless of branch (branch/ignored scoping removed)
 		expect(output).toContain("OAuth2 Integration Strategy");
-		// Plans from other branches, archived plans, and ignored plans should be excluded
-		expect(output).not.toContain("Unrelated Plan From Other Branch");
+		expect(output).toContain("Second Active Plan");
+		// Committed (associated) plans are excluded from the active-plan list
 		expect(output).not.toContain("Already Archived Plan");
-		expect(output).not.toContain("User Dismissed Plan");
 		writeSpy.mockRestore();
 	});
 

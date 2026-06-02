@@ -175,27 +175,23 @@ vi.mock("../../package.json", () => ({ version: "0.90.0" }));
 const {
 	mockListAvailablePlans,
 	mockArchivePlanForCommit,
-	mockUnassociatePlanFromCommit,
-	mockIgnorePlan,
+	mockRemovePlan,
 } = vi.hoisted(() => ({
 	mockListAvailablePlans: vi.fn().mockReturnValue([]),
 	mockArchivePlanForCommit: vi.fn().mockResolvedValue(null),
-	mockUnassociatePlanFromCommit: vi.fn().mockResolvedValue(undefined),
-	mockIgnorePlan: vi.fn().mockResolvedValue(undefined),
+	mockRemovePlan: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/PlanService.js", () => ({
 	listAvailablePlans: mockListAvailablePlans,
 	archivePlanForCommit: mockArchivePlanForCommit,
-	unassociatePlanFromCommit: mockUnassociatePlanFromCommit,
-	ignorePlan: mockIgnorePlan,
+	removePlan: mockRemovePlan,
 }));
 
 const {
 	mockSaveNote,
 	mockArchiveNoteForCommit,
-	mockUnassociateNoteFromCommit,
-	mockIgnoreNote,
+	mockRemoveNote,
 } = vi.hoisted(() => ({
 	mockSaveNote: vi.fn().mockResolvedValue({
 		id: "note-1",
@@ -203,15 +199,13 @@ const {
 		format: "snippet",
 	}),
 	mockArchiveNoteForCommit: vi.fn().mockResolvedValue(null),
-	mockUnassociateNoteFromCommit: vi.fn().mockResolvedValue(undefined),
-	mockIgnoreNote: vi.fn().mockResolvedValue(undefined),
+	mockRemoveNote: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/NoteService.js", () => ({
 	saveNote: mockSaveNote,
 	archiveNoteForCommit: mockArchiveNoteForCommit,
-	unassociateNoteFromCommit: mockUnassociateNoteFromCommit,
-	ignoreNote: mockIgnoreNote,
+	removeNote: mockRemoveNote,
 }));
 
 const {
