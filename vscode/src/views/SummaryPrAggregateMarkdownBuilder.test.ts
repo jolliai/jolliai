@@ -179,7 +179,6 @@ describe("buildAggregatedPrMarkdown", () => {
 		const planA1: PlanReference = {
 			slug: "feature-a",
 			title: "Feature A",
-			editCount: 3,
 			addedAt: "2026-05-01T00:00:00Z",
 			updatedAt: "2026-05-02T00:00:00Z",
 			jolliPlanDocUrl: "https://jolli.example/articles?doc=10",
@@ -190,7 +189,6 @@ describe("buildAggregatedPrMarkdown", () => {
 		const planB: PlanReference = {
 			slug: "feature-b",
 			title: "Feature B",
-			editCount: 1,
 			addedAt: "2026-05-03T00:00:00Z",
 			updatedAt: "2026-05-03T00:00:00Z",
 		};
@@ -210,11 +208,10 @@ describe("buildAggregatedPrMarkdown", () => {
 		const draftA1: PlanReference = {
 			slug: "draft-x",
 			title: "Draft X",
-			editCount: 1,
 			addedAt: "2026-05-01T00:00:00Z",
 			updatedAt: "2026-05-01T00:00:00Z",
 		};
-		const draftA2: PlanReference = { ...draftA1, editCount: 2 }; // same slug, no URL
+		const draftA2: PlanReference = { ...draftA1 }; // same slug, no URL
 		const summaries = [
 			makeSummary({ hash: "AAAA1234", plans: [draftA1] }),
 			makeSummary({ hash: "BBBB5678", plans: [draftA2] }),

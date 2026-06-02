@@ -142,7 +142,6 @@ function makeEntry(overrides: Record<string, unknown> = {}) {
 		updatedAt: "2025-01-01T00:00:00.000Z",
 		branch: "main",
 		commitHash: null,
-		editCount: 0,
 		...overrides,
 	};
 }
@@ -315,7 +314,6 @@ describe("PlanService", () => {
 							slug: "fresh-plan",
 							title: "Fresh Plan",
 							commitHash: null,
-							editCount: 0,
 						}),
 					}),
 				}),
@@ -411,7 +409,7 @@ describe("PlanService", () => {
 
 	describe("archivePlanForCommit", () => {
 		it("creates archive entry with new slug and sets archive guard on original", async () => {
-			const entry = makeEntry({ editCount: 3 });
+			const entry = makeEntry({});
 			loadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: { "test-plan": entry },
@@ -429,7 +427,6 @@ describe("PlanService", () => {
 				expect.objectContaining({
 					slug: "test-plan-06d0f729",
 					title: "Test Plan",
-					editCount: 3,
 				}),
 			);
 
@@ -489,7 +486,7 @@ describe("PlanService", () => {
 		});
 
 		it("skips contentHashAtCommit when source file does not exist during archive", async () => {
-			const entry = makeEntry({ editCount: 2 });
+			const entry = makeEntry({});
 			loadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: { "test-plan": entry },
@@ -520,7 +517,6 @@ describe("PlanService", () => {
 			// skip, but the registry update still happens (so the caller can record
 			// the association even if the file vanished between detection and archive).
 			const entry = makeEntry({
-				editCount: 2,
 				sourcePath: "/other/path/test-plan.md",
 			});
 			loadPlansRegistry.mockResolvedValue({
@@ -547,7 +543,6 @@ describe("PlanService", () => {
 			const externalPath = "/repo/docs/foo-plan.md";
 			const entry = makeEntry({
 				slug: "foo-plan",
-				editCount: 1,
 				sourcePath: externalPath,
 			});
 			loadPlansRegistry.mockResolvedValue({
@@ -1110,8 +1105,8 @@ describe("PlanService", () => {
 			expect(plans[0].title).toBe("Fresh Title From File");
 		});
 
-		it("preserves editCount for existing uncommitted entries during detection", async () => {
-			const entry = makeEntry({ editCount: 1 });
+		it("does not mutate existing uncommitted entries during detection", async () => {
+			const entry = makeEntry({});
 			loadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: { "test-plan": entry },
@@ -1126,7 +1121,7 @@ describe("PlanService", () => {
 			const plans = await detectPlans(CWD);
 
 			expect(savePlansRegistry).not.toHaveBeenCalled();
-			expect(plans[0].editCount).toBe(1);
+			expect(plans).toHaveLength(1);
 		});
 
 		it("returns current registry plans without transcript scanning", async () => {
@@ -1151,7 +1146,7 @@ describe("PlanService", () => {
 		});
 
 		it("does not mutate committed entries during detection", async () => {
-			const entry = makeEntry({ editCount: 5, commitHash: "abc123" });
+			const entry = makeEntry({ commitHash: "abc123" });
 			loadPlansRegistry.mockResolvedValue({
 				version: 1,
 				plans: { "test-plan": entry },
@@ -1169,12 +1164,9 @@ describe("PlanService", () => {
 				},
 			);
 
-			const plans = await detectPlans(CWD);
+			await detectPlans(CWD);
 			expect(savePlansRegistry).not.toHaveBeenCalled();
 			expect(loadPlansRegistry).toHaveBeenCalledWith(CWD);
-			if (plans[0]) {
-				expect(plans[0].editCount).toBe(5);
-			}
 		});
 
 		// detectPlans() no longer auto-discovers files — registration is the

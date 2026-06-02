@@ -158,7 +158,6 @@ function makePlan(overrides?: Partial<PlanReference>): PlanReference {
 	return {
 		slug: "test-plan",
 		title: "Test Plan",
-		editCount: 2,
 		addedAt: "2026-01-15T10:00:00Z",
 		updatedAt: "2026-01-15T10:05:00Z",
 		...overrides,
@@ -614,7 +613,7 @@ describe("SummaryHtmlBuilder", () => {
 
 		it("plans section renders plan items", () => {
 			const plans = [
-				makePlan({ slug: "my-plan", title: "My Plan", editCount: 3 }),
+				makePlan({ slug: "my-plan", title: "My Plan" }),
 			];
 			// collectSortedTopics returns empty topics, but the plans appear via buildPlansSection
 			const html = buildHtml(makeSummary({ plans }));

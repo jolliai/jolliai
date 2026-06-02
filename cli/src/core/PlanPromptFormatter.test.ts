@@ -21,7 +21,6 @@ function makePlan(overrides: Partial<PlanEntry> = {}): PlanEntry {
 		updatedAt: "2026-05-14T00:00:00Z",
 		branch: "main",
 		commitHash: null,
-		editCount: 3,
 		...overrides,
 	};
 }

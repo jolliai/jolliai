@@ -413,7 +413,6 @@ describe("StopHook — plan discovery", () => {
 						slug: "my-test-plan",
 						title: "Plan Title",
 						commitHash: null,
-						editCount: 0,
 						branch: expect.any(String),
 					}),
 				}),
@@ -485,7 +484,6 @@ describe("StopHook — plan discovery", () => {
 					"direct-write-plan": expect.objectContaining({
 						slug: "direct-write-plan",
 						commitHash: null,
-						editCount: 1,
 					}),
 				}),
 			}),
@@ -511,7 +509,6 @@ describe("StopHook — plan discovery", () => {
 				plans: expect.objectContaining({
 					"unix-style-plan": expect.objectContaining({
 						slug: "unix-style-plan",
-						editCount: 1,
 					}),
 				}),
 			}),
@@ -550,9 +547,7 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).toHaveBeenCalledWith(
 			expect.objectContaining({
 				plans: expect.objectContaining({
-					"duplicate-plan": expect.objectContaining({
-						editCount: 0,
-					}),
+					"duplicate-plan": expect.objectContaining({}),
 				}),
 			}),
 			PROJECT_DIR,
@@ -569,7 +564,7 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).not.toHaveBeenCalled();
 	});
 
-	it("should increment editCount for existing uncommitted plan", async () => {
+	it("should update existing uncommitted plan", async () => {
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file
 			.mockReturnValueOnce(true); // plan file exists
@@ -585,7 +580,6 @@ describe("StopHook — plan discovery", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: null,
-					editCount: 5,
 				},
 			},
 		});
@@ -601,7 +595,7 @@ describe("StopHook — plan discovery", () => {
 			expect.objectContaining({
 				plans: expect.objectContaining({
 					"existing-plan": expect.objectContaining({
-						editCount: 6, // 5 + 1
+						sourcePath: "/home/user/.claude/plans/existing-plan.md",
 					}),
 				}),
 			}),
@@ -609,7 +603,7 @@ describe("StopHook — plan discovery", () => {
 		);
 	});
 
-	it("should skip updating editCount for committed plans", async () => {
+	it("should skip committed plans", async () => {
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file
 			.mockReturnValueOnce(true); // plan file
@@ -625,7 +619,6 @@ describe("StopHook — plan discovery", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: "abc12345",
-					editCount: 3,
 				},
 			},
 		});
@@ -640,7 +633,7 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).not.toHaveBeenCalled();
 	});
 
-	it("should skip updating editCount for ignored plans", async () => {
+	it("should skip ignored plans", async () => {
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file
 			.mockReturnValueOnce(true); // plan file
@@ -656,7 +649,6 @@ describe("StopHook — plan discovery", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: null,
-					editCount: 2,
 					ignored: true,
 				},
 			},
@@ -703,7 +695,6 @@ describe("StopHook — plan discovery", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: "abc12345",
-					editCount: 2,
 					// Real SHA-256 of "# Plan Title\n\nContent" (what readFileSync mock returns)
 					contentHashAtCommit: "1ab12ceb7fdd12641cbcefc8a5b7816c447423966a5b9976a4e004b6ae49fe6d",
 				},
@@ -738,7 +729,6 @@ describe("StopHook — plan discovery", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: "abc12345",
-					editCount: 5,
 					contentHashAtCommit: "old-content-hash", // differs from "current-file-hash"
 				},
 			},
@@ -758,7 +748,6 @@ describe("StopHook — plan discovery", () => {
 					"reused-plan": expect.objectContaining({
 						slug: "reused-plan",
 						commitHash: null, // fresh uncommitted entry
-						editCount: 1,
 					}),
 				}),
 			}),
@@ -782,7 +771,6 @@ describe("StopHook — plan discovery", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: "abc12345",
-					editCount: 3,
 					contentHashAtCommit: "old-content-hash",
 					ignored: true,
 				},
@@ -847,7 +835,7 @@ describe("StopHook — plan discovery", () => {
 		await expect(handleStopHook()).resolves.toBeUndefined();
 	});
 
-	it("should accumulate editCount when same plan targeted by multiple Write calls", async () => {
+	it("should register a plan once when targeted by multiple Write calls", async () => {
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file
 			.mockReturnValueOnce(true); // plan file
@@ -864,9 +852,7 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).toHaveBeenCalledWith(
 			expect.objectContaining({
 				plans: expect.objectContaining({
-					"multi-edit-plan": expect.objectContaining({
-						editCount: 3,
-					}),
+					"multi-edit-plan": expect.objectContaining({ slug: "multi-edit-plan" }),
 				}),
 			}),
 			PROJECT_DIR,
@@ -897,7 +883,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "main",
 						commitHash: null,
-						editCount: 3,
 					},
 				},
 			})
@@ -916,14 +901,13 @@ describe("StopHook — plan discovery", () => {
 						branch: "main",
 						commitHash: "abc12345",
 						contentHashAtCommit: "deadbeefhash",
-						editCount: 3,
 					},
 				},
 			});
 
-		// StopHook scans the transcript and would increment editCount under
-		// the old per-field overlay; with the wholesale-fresh fix, editCount
-		// stays at 3 (the local +1 is dropped on purpose).
+		// StopHook scans the transcript and, under the old per-field overlay, would
+		// have overwritten just commitHash on its stale local copy; the
+		// wholesale-fresh fix takes the fresh archive-guard entry instead.
 		mockTranscriptWithLines([
 			'{"type":"tool_use","name":"Edit","input":{"file_path":"/home/user/.claude/plans/race-plan.md"}}',
 		]);
@@ -958,7 +942,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "main",
 						commitHash: null,
-						editCount: 0,
 					},
 				},
 			})
@@ -973,7 +956,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "main",
 						commitHash: null,
-						editCount: 0,
 					},
 					"other-plan": {
 						slug: "other-plan",
@@ -983,7 +965,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "main",
 						commitHash: "abc12345",
-						editCount: 2,
 					},
 				},
 			});
@@ -1020,7 +1001,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "unknown",
 						commitHash: null,
-						editCount: 5,
 					},
 				},
 			})
@@ -1037,7 +1017,6 @@ describe("StopHook — plan discovery", () => {
 						branch: "unknown",
 						commitHash: "abc12345cafebabe",
 						contentHashAtCommit: "deadbeefhash",
-						editCount: 5,
 					},
 					"refactor-api-abc12345": {
 						slug: "refactor-api-abc12345",
@@ -1047,7 +1026,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "unknown",
 						commitHash: "abc12345cafebabe",
-						editCount: 5,
 					},
 				},
 			});
@@ -1098,7 +1076,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "unknown",
 						commitHash: null,
-						editCount: 5,
 					},
 				},
 			})
@@ -1114,7 +1091,6 @@ describe("StopHook — plan discovery", () => {
 						branch: "unknown",
 						commitHash: "abc12345cafebabe",
 						contentHashAtCommit: "snapshot-hash",
-						editCount: 5,
 					},
 				},
 			});
@@ -1168,7 +1144,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "unknown",
 						commitHash: null,
-						editCount: 0,
 					},
 					"unrelated-plan": {
 						slug: "unrelated-plan",
@@ -1178,7 +1153,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "unknown",
 						commitHash: null,
-						editCount: 0,
 					},
 				},
 			})
@@ -1193,7 +1167,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "unknown",
 						commitHash: null,
-						editCount: 0,
 					},
 					"unrelated-plan": {
 						slug: "unrelated-plan",
@@ -1203,7 +1176,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "unknown",
 						commitHash: null,
-						editCount: 0,
 						ignored: true, // extension flipped this between the two reads
 					},
 				},
@@ -1237,7 +1209,6 @@ describe("StopHook — plan discovery", () => {
 						updatedAt: "2026-01-01T00:00:00Z",
 						branch: "unknown",
 						commitHash: null,
-						editCount: 1,
 					},
 				},
 			});
@@ -1285,7 +1256,6 @@ describe("StopHook — plan discovery", () => {
 						slug: "foo-plan",
 						sourcePath: "/repo/docs/foo-plan.md",
 						commitHash: null,
-						editCount: 1,
 					}),
 				}),
 			}),
@@ -1338,7 +1308,7 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).not.toHaveBeenCalled();
 	});
 
-	it("should accumulate editCount across multiple Edit calls to the same external .md", async () => {
+	it("should register an external .md edited multiple times as a single plan entry", async () => {
 		vi.mocked(existsSync)
 			.mockReturnValueOnce(true) // transcript file
 			.mockReturnValueOnce(true); // external plan file
@@ -1355,7 +1325,7 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).toHaveBeenCalledWith(
 			expect.objectContaining({
 				plans: expect.objectContaining({
-					multi: expect.objectContaining({ editCount: 3 }),
+					multi: expect.objectContaining({ sourcePath: "/repo/docs/multi.md" }),
 				}),
 			}),
 			PROJECT_DIR,
@@ -1378,7 +1348,6 @@ describe("StopHook — plan discovery", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: null,
-					editCount: 1,
 				},
 			},
 		});
@@ -1415,7 +1384,6 @@ describe("StopHook — plan discovery", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: null,
-					editCount: 1,
 				},
 			},
 		});
@@ -1426,8 +1394,8 @@ describe("StopHook — plan discovery", () => {
 		await handleStopHook();
 
 		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
-		// Same slug reused, editCount incremented; no spurious `foo` entry created
-		expect(saved?.plans["foo-a3b7c2d1"]?.editCount).toBe(2);
+		// Same slug reused (reverse-lookup by sourcePath); no spurious `foo` entry created
+		expect(saved?.plans["foo-a3b7c2d1"]?.sourcePath).toBe("/repo/docs/foo.md");
 		expect(saved?.plans.foo).toBeUndefined();
 	});
 
@@ -1818,7 +1786,6 @@ describe("StopHook — plan discovery", () => {
 					updatedAt: "2026-01-01T00:00:00Z",
 					branch: "main",
 					commitHash: null,
-					editCount: 1,
 				},
 			},
 		});

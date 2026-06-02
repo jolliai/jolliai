@@ -351,7 +351,6 @@ describe("compileTaskContext", () => {
 				{
 					slug: "oauth-strategy-aaa11111",
 					title: "OAuth Strategy",
-					editCount: 1,
 					addedAt: "2026-03-28T10:00:00.000Z",
 					updatedAt: "2026-03-28T10:00:00.000Z",
 				},
@@ -365,7 +364,6 @@ describe("compileTaskContext", () => {
 				{
 					slug: "oauth-strategy-bbb22222",
 					title: "OAuth Strategy v2",
-					editCount: 2,
 					addedAt: "2026-03-28T10:00:00.000Z",
 					updatedAt: "2026-03-29T10:00:00.000Z",
 				},
@@ -835,9 +833,7 @@ describe("compileTaskContext — additional coverage", () => {
 
 	it("should exclude plans when includePlans is false", async () => {
 		const summaryWithPlan = makeSummary({
-			plans: [
-				{ slug: "my-plan", title: "My Plan", editCount: 1, addedAt: "2026-03-28", updatedAt: "2026-03-28" },
-			],
+			plans: [{ slug: "my-plan", title: "My Plan", addedAt: "2026-03-28", updatedAt: "2026-03-28" }],
 		});
 		mockGetIndex.mockResolvedValue(
 			makeIndex([
@@ -864,7 +860,6 @@ describe("compileTaskContext — additional coverage", () => {
 				{
 					slug: "missing-plan",
 					title: "Missing Plan",
-					editCount: 1,
 					addedAt: "2026-03-28",
 					updatedAt: "2026-03-28",
 				},
@@ -898,7 +893,6 @@ describe("compileTaskContext — additional coverage", () => {
 				{
 					slug: "oauth-plan-aaa1111",
 					title: "OAuth Plan v1",
-					editCount: 1,
 					addedAt: "2026-03-28",
 					updatedAt: "2026-03-28",
 				},
@@ -912,7 +906,6 @@ describe("compileTaskContext — additional coverage", () => {
 				{
 					slug: "oauth-plan-bbb22222",
 					title: "OAuth Plan v2",
-					editCount: 2,
 					addedAt: "2026-03-28",
 					updatedAt: "2026-03-29",
 				},
@@ -958,7 +951,6 @@ describe("compileTaskContext — additional coverage", () => {
 				{
 					slug: "my-plan-bbb22222",
 					title: "Plan v2 (newer)",
-					editCount: 2,
 					addedAt: "2026-03-28",
 					updatedAt: "2026-03-29",
 				},
@@ -972,7 +964,6 @@ describe("compileTaskContext — additional coverage", () => {
 				{
 					slug: "my-plan-aaa11111",
 					title: "Plan v1 (older)",
-					editCount: 1,
 					addedAt: "2026-03-28",
 					updatedAt: "2026-03-28",
 				},
@@ -1447,14 +1438,12 @@ describe("buildRecallPayload", () => {
 				{
 					slug: "live-plan",
 					title: "Live",
-					editCount: 1,
 					addedAt: "2026-01-01",
 					updatedAt: "2026-01-01",
 				},
 				{
 					slug: "missing-plan",
 					title: "Missing",
-					editCount: 1,
 					addedAt: "2026-01-01",
 					updatedAt: "2026-01-01",
 				},
@@ -1507,7 +1496,6 @@ describe("buildRecallPayload", () => {
 				{
 					slug: "p1",
 					title: "P1",
-					editCount: 1,
 					addedAt: "2026-01-01",
 					updatedAt: "2026-01-01",
 				},
@@ -1803,7 +1791,6 @@ describe("compileTaskContext — recursive plan/note collection", () => {
 							{
 								slug: "nested-plan",
 								title: "Nested Plan",
-								editCount: 1,
 								addedAt: "2026-03-28",
 								updatedAt: "2026-03-28",
 							},
@@ -1883,7 +1870,6 @@ describe("compileTaskContext — recursive plan/note collection", () => {
 					{
 						slug: "auth-redesign-06d0f729",
 						title: "Auth Redesign",
-						editCount: 1,
 						addedAt: "2026-03-28",
 						updatedAt: "2026-03-28",
 					},
@@ -1929,7 +1915,6 @@ describe("compileTaskContext — recursive plan/note collection", () => {
 						{
 							slug: "auth-redesign",
 							title: "Auth Redesign",
-							editCount: 1,
 							addedAt: "2026-03-26",
 							updatedAt: "2026-03-26",
 						},
@@ -1942,7 +1927,6 @@ describe("compileTaskContext — recursive plan/note collection", () => {
 					{
 						slug: "auth-redesign-06d0f729",
 						title: "Auth Redesign",
-						editCount: 1,
 						addedAt: "2026-03-26",
 						updatedAt: "2026-03-28",
 					},

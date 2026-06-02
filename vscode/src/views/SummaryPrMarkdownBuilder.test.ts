@@ -154,7 +154,6 @@ describe("SummaryPrMarkdownBuilder", () => {
 						{
 							slug: "plan-y",
 							title: "Plan Y",
-							editCount: 2,
 							addedAt: "2026-03-30T09:00:00Z",
 							updatedAt: "2026-03-30T09:30:00Z",
 							jolliPlanDocUrl: "https://jolli.app/plan/y",
@@ -174,7 +173,6 @@ describe("SummaryPrMarkdownBuilder", () => {
 						{
 							slug: "plan-x",
 							title: "Plan X",
-							editCount: 10,
 							addedAt: "2026-03-30T09:00:00Z",
 							updatedAt: "2026-03-30T09:30:00Z",
 						},

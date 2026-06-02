@@ -57,12 +57,6 @@ export class PlanItem extends vscode.TreeItem {
 			title: "Edit Plan",
 			arguments: [this],
 		};
-		// editCount intentionally omitted from the hover card — the count
-		// isn't trustworthy in practice (it's incremented by the transcript
-		// scanner which doesn't see every plan touch), so surfacing "edited
-		// 0 times" gave users a wrong impression. The field still lives on
-		// PlanInfo / plans.json for now in case a future detection pass
-		// rebuilds it correctly.
 		this.planHover = {
 			title: plan.title,
 			filename: plan.filename,
@@ -271,10 +265,6 @@ function buildPlanTooltip(plan: PlanInfo): vscode.MarkdownString {
 	);
 
 	md.appendMarkdown(`${escMd(plan.title)}\n\n`);
-	md.appendMarkdown("---\n\n");
-	md.appendMarkdown(
-		`$(edit) edited ${plan.editCount} time${plan.editCount !== 1 ? "s" : ""}\n\n`,
-	);
 	md.appendMarkdown("---\n\n");
 
 	const committed = !!plan.commitHash;

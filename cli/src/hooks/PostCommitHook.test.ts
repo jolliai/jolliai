@@ -1227,7 +1227,6 @@ describe("queue-driven Worker", () => {
 					{
 						slug: "plan-old",
 						title: "Old plan",
-						editCount: 1,
 						addedAt: "2026-02-19T00:00:00Z",
 						updatedAt: "2026-02-19T00:00:00Z",
 					},
@@ -1557,7 +1556,6 @@ describe("queue-driven Worker", () => {
 					"freshly-authored-plan": {
 						slug: "freshly-authored-plan",
 						title: "Freshly authored plan",
-						editCount: 1,
 						sourcePath: planSourcePath,
 						addedAt: "2026-02-19T00:00:00.000Z",
 						updatedAt: "2026-02-19T00:00:00.000Z",
@@ -2001,7 +1999,6 @@ describe("queue-driven Worker", () => {
 					{
 						slug: "plan-old",
 						title: "Old plan",
-						editCount: 1,
 						addedAt: "2026-02-19T00:00:00Z",
 						updatedAt: "2026-02-19T00:00:00Z",
 					},
@@ -2064,7 +2061,6 @@ describe("queue-driven Worker", () => {
 					{
 						slug: "plan-old",
 						title: "Old plan",
-						editCount: 1,
 						addedAt: "2026-02-19T00:00:00Z",
 						updatedAt: "2026-02-19T00:00:00Z",
 					},

@@ -934,7 +934,6 @@ describe("SummaryStore", () => {
 					{
 						slug: "plan-1",
 						title: "Plan 1",
-						editCount: 1,
 						addedAt: "2026-02-18T00:00:00Z",
 						updatedAt: "2026-02-18T00:00:00Z",
 					},
@@ -958,7 +957,6 @@ describe("SummaryStore", () => {
 				{
 					slug: "plan-1",
 					title: "Plan 1",
-					editCount: 1,
 					addedAt: "2026-02-18T00:00:00Z",
 					updatedAt: "2026-02-18T00:00:00Z",
 				},
@@ -1527,7 +1525,6 @@ describe("SummaryStore", () => {
 					{
 						slug: "shared",
 						title: "Shared plan",
-						editCount: 1,
 						addedAt: "2026-02-18T00:00:00Z",
 						updatedAt: "2026-02-18T00:00:00Z",
 					},
@@ -1539,14 +1536,12 @@ describe("SummaryStore", () => {
 							{
 								slug: "shared",
 								title: "Shared plan",
-								editCount: 2,
 								addedAt: "2026-02-18T00:00:00Z",
 								updatedAt: "2026-02-20T00:00:00Z",
 							},
 							{
 								slug: "nested-only",
 								title: "Nested only",
-								editCount: 1,
 								addedAt: "2026-02-19T00:00:00Z",
 								updatedAt: "2026-02-19T00:00:00Z",
 							},
@@ -1560,7 +1555,6 @@ describe("SummaryStore", () => {
 					{
 						slug: "root-only",
 						title: "Root only",
-						editCount: 1,
 						addedAt: "2026-02-19T00:00:00Z",
 						updatedAt: "2026-02-19T00:00:00Z",
 					},
@@ -1576,21 +1570,18 @@ describe("SummaryStore", () => {
 				{
 					slug: "shared",
 					title: "Shared plan",
-					editCount: 2,
 					addedAt: "2026-02-18T00:00:00Z",
 					updatedAt: "2026-02-20T00:00:00Z",
 				},
 				{
 					slug: "nested-only",
 					title: "Nested only",
-					editCount: 1,
 					addedAt: "2026-02-19T00:00:00Z",
 					updatedAt: "2026-02-19T00:00:00Z",
 				},
 				{
 					slug: "root-only",
 					title: "Root only",
-					editCount: 1,
 					addedAt: "2026-02-19T00:00:00Z",
 					updatedAt: "2026-02-19T00:00:00Z",
 				},
@@ -1639,7 +1630,6 @@ describe("SummaryStore", () => {
 					{
 						slug: "shared",
 						title: "Original",
-						editCount: 1,
 						addedAt: "2026-02-18T00:00:00Z",
 						updatedAt: "2026-02-20T00:00:00Z",
 					},
@@ -1654,7 +1644,6 @@ describe("SummaryStore", () => {
 							{
 								slug: "shared",
 								title: "Replacement",
-								editCount: 9,
 								addedAt: "2026-02-18T00:00:00Z",
 								updatedAt: "2026-02-20T00:00:00Z",
 							},
@@ -1672,7 +1661,6 @@ describe("SummaryStore", () => {
 				{
 					slug: "shared",
 					title: "Original",
-					editCount: 1,
 					addedAt: "2026-02-18T00:00:00Z",
 					updatedAt: "2026-02-20T00:00:00Z",
 				},
@@ -1686,7 +1674,6 @@ describe("SummaryStore", () => {
 					{
 						slug: "shared",
 						title: "Newest",
-						editCount: 3,
 						addedAt: "2026-02-18T00:00:00Z",
 						updatedAt: "2026-02-21T00:00:00Z",
 					},
@@ -1698,7 +1685,6 @@ describe("SummaryStore", () => {
 					{
 						slug: "shared",
 						title: "Older",
-						editCount: 1,
 						addedAt: "2026-02-18T00:00:00Z",
 						updatedAt: "2026-02-19T00:00:00Z",
 					},
@@ -1714,7 +1700,6 @@ describe("SummaryStore", () => {
 				{
 					slug: "shared",
 					title: "Newest",
-					editCount: 3,
 					addedAt: "2026-02-18T00:00:00Z",
 					updatedAt: "2026-02-21T00:00:00Z",
 				},
@@ -3139,7 +3124,6 @@ describe("SummaryStore", () => {
 					{
 						slug: "plan-1",
 						title: "Plan",
-						editCount: 1,
 						addedAt: "2026-02-18T00:00:00Z",
 						updatedAt: "2026-02-18T00:00:00Z",
 					},

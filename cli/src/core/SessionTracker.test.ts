@@ -660,7 +660,6 @@ describe("SessionTracker", () => {
 						updatedAt: "2026-03-01T10:00:00Z",
 						branch: "main",
 						commitHash: null,
-						editCount: 0,
 					},
 				},
 			};
@@ -681,7 +680,6 @@ describe("SessionTracker", () => {
 						updatedAt: "2026-03-01T10:00:00Z",
 						branch: "main",
 						commitHash: null,
-						editCount: 0,
 					},
 				},
 			};
@@ -715,7 +713,6 @@ describe("SessionTracker", () => {
 						updatedAt: "2026-03-01T10:00:00Z",
 						branch: "main",
 						commitHash: null,
-						editCount: 0,
 					},
 				},
 			};
@@ -740,7 +737,6 @@ describe("SessionTracker", () => {
 						updatedAt: "2026-03-01T10:00:00Z",
 						branch: "main",
 						commitHash: null,
-						editCount: 0,
 					},
 				},
 			};
@@ -775,7 +771,6 @@ describe("SessionTracker", () => {
 							branch: "feature/x",
 							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
 							contentHashAtCommit: fileHash,
-							editCount: 1,
 						},
 						"my-plan-35080b05": {
 							slug: "my-plan-35080b05",
@@ -785,7 +780,6 @@ describe("SessionTracker", () => {
 							updatedAt: "2026-03-01T10:00:00Z",
 							branch: "feature/x",
 							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
-							editCount: 1,
 						},
 					},
 				};
@@ -827,7 +821,6 @@ describe("SessionTracker", () => {
 							branch: "feature/x",
 							commitHash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 							contentHashAtCommit: oldHash,
-							editCount: 1,
 						},
 						"my-plan-deadbeef": {
 							slug: "my-plan-deadbeef",
@@ -837,7 +830,6 @@ describe("SessionTracker", () => {
 							updatedAt: "2026-03-01T10:00:00Z",
 							branch: "feature/x",
 							commitHash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-							editCount: 1,
 						},
 					},
 				};
@@ -863,7 +855,6 @@ describe("SessionTracker", () => {
 							branch: "feature/x",
 							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
 							contentHashAtCommit: "stalehash",
-							editCount: 1,
 						},
 						"my-plan-35080b05": {
 							slug: "my-plan-35080b05",
@@ -873,7 +864,6 @@ describe("SessionTracker", () => {
 							updatedAt: "2026-03-01T10:00:00Z",
 							branch: "feature/x",
 							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
-							editCount: 1,
 						},
 					},
 				};
@@ -910,7 +900,6 @@ describe("SessionTracker", () => {
 							// archive cycle and must not be touched.
 							commitHash: "9999999999999999999999999999999999999999",
 							contentHashAtCommit: "guardhash",
-							editCount: 1,
 						},
 						"my-plan-35080b05": {
 							slug: "my-plan-35080b05",
@@ -920,7 +909,6 @@ describe("SessionTracker", () => {
 							updatedAt: "2026-03-01T10:00:00Z",
 							branch: "feature/x",
 							commitHash: "35080b05360866b87dc03dfe9204ec148f263660",
-							editCount: 1,
 						},
 					},
 				};
@@ -950,7 +938,6 @@ describe("SessionTracker", () => {
 							branch: "feature/x",
 							commitHash: null,
 							contentHashAtCommit: "stalehash",
-							editCount: 1,
 						},
 					},
 				};
@@ -978,7 +965,6 @@ describe("SessionTracker", () => {
 						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
 						branch: "main",
-						editCount: 0,
 						commitHash: "abcdef1234567890",
 					},
 				},
@@ -2289,7 +2275,6 @@ describe("SessionTracker", () => {
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
-							editCount: 1,
 						},
 						"plan-2": {
 							slug: "plan-2",
@@ -2299,7 +2284,6 @@ describe("SessionTracker", () => {
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
-							editCount: 1,
 						},
 						"plan-3": {
 							slug: "plan-3",
@@ -2309,7 +2293,6 @@ describe("SessionTracker", () => {
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
-							editCount: 1,
 							ignored: true,
 						},
 					},
@@ -2333,7 +2316,6 @@ describe("SessionTracker", () => {
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
-							editCount: 0,
 						},
 						"plan-committed": {
 							slug: "plan-committed",
@@ -2343,7 +2325,6 @@ describe("SessionTracker", () => {
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: "abcdef1234567890",
-							editCount: 0,
 						},
 						"plan-guarded": {
 							slug: "plan-guarded",
@@ -2354,7 +2335,6 @@ describe("SessionTracker", () => {
 							updatedAt: "x",
 							commitHash: null,
 							contentHashAtCommit: "fakehash",
-							editCount: 0,
 						},
 					},
 				},

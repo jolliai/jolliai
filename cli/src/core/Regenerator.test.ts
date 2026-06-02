@@ -520,7 +520,6 @@ describe("regenerateSummary", () => {
 						{
 							slug: "feature-x",
 							title: "Feature X",
-							editCount: 1,
 							addedAt: "2026-05-20T00:00:00Z",
 							updatedAt: "2026-05-20T00:00:00Z",
 						},
@@ -598,7 +597,6 @@ describe("regenerateSummary", () => {
 						{
 							slug: "p-child",
 							title: "Child plan",
-							editCount: 1,
 							addedAt: "2026-05-20T00:00:00Z",
 							updatedAt: "2026-05-20T00:00:00Z",
 						},
@@ -726,7 +724,6 @@ describe("regenerateSummary", () => {
 				{
 					slug: "huge",
 					title: "Huge",
-					editCount: 1,
 					addedAt: "2026-05-20T00:00:00Z",
 					updatedAt: "2026-05-20T00:00:00Z",
 				} as never,
@@ -1008,7 +1005,6 @@ describe("regenerateSummary", () => {
 			({
 				slug,
 				title: slug,
-				editCount: 1,
 				addedAt: updatedAt,
 				updatedAt,
 			}) as never;
@@ -1045,7 +1041,6 @@ describe("regenerateSummary", () => {
 				{
 					slug: "shared-plan",
 					title: "Shared (root, older)",
-					editCount: 1,
 					addedAt: "2026-05-20T00:00:00Z",
 					updatedAt: "2026-05-20T00:00:00Z",
 				},
@@ -1059,7 +1054,6 @@ describe("regenerateSummary", () => {
 						{
 							slug: "shared-plan",
 							title: "Shared (child, newer)",
-							editCount: 2,
 							addedAt: "2026-05-20T00:00:00Z",
 							updatedAt: "2026-05-21T00:00:00Z",
 						},

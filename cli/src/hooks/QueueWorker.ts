@@ -651,7 +651,6 @@ async function associatePlansWithCommit(
 		planRefs.push({
 			slug: newSlug,
 			title,
-			editCount: entry.editCount,
 			addedAt: entry.addedAt,
 			updatedAt: nowStr,
 		});
@@ -681,7 +680,6 @@ async function associatePlansWithCommit(
 			updatedAt: nowStr,
 			branch: entry.branch,
 			commitHash: commitHash,
-			editCount: entry.editCount,
 		};
 		await savePlansRegistry(
 			{

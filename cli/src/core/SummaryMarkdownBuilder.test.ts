@@ -80,7 +80,6 @@ describe("buildMarkdown", () => {
 					{
 						slug: "p1",
 						title: "Plan One",
-						editCount: 1,
 						addedAt: "2026-01-01",
 						updatedAt: "2026-01-01",
 						jolliPlanDocUrl: "https://jolli.app/plan/1",
@@ -421,7 +420,7 @@ describe("buildPrMarkdown", () => {
 	it("renders plans and E2E sections", () => {
 		const md = buildPrMarkdown(
 			leaf({
-				plans: [{ slug: "p1", title: "My Plan", editCount: 1, addedAt: "", updatedAt: "" }],
+				plans: [{ slug: "p1", title: "My Plan", addedAt: "", updatedAt: "" }],
 				e2eTestGuide: [{ title: "Test", steps: ["step"], expectedResults: ["result"] }],
 			}),
 		);

@@ -160,7 +160,6 @@ function toPlanInfo(entry: PlanEntry, currentBranch?: string): PlanInfo | null {
 		addedAt: entry.addedAt,
 		updatedAt: entry.updatedAt,
 		branch: entry.branch,
-		editCount: entry.editCount,
 		commitHash: entry.commitHash,
 	};
 }
@@ -211,7 +210,6 @@ export async function addPlanToRegistry(
 		updatedAt: now,
 		branch: getCurrentBranch(cwd),
 		commitHash: null,
-		editCount: existing?.editCount ?? 0,
 	};
 
 	await savePlansRegistry(
@@ -354,7 +352,6 @@ export async function archivePlanForCommit(
 			updatedAt: new Date().toISOString(),
 			branch: getCurrentBranch(cwd),
 			commitHash: null,
-			editCount: 0,
 		};
 	}
 
@@ -389,7 +386,6 @@ export async function archivePlanForCommit(
 					updatedAt: now,
 					branch: entry.branch,
 					commitHash,
-					editCount: entry.editCount,
 				},
 			},
 		},
@@ -428,7 +424,6 @@ export async function archivePlanForCommit(
 	return {
 		slug: newSlug,
 		title: entry.title,
-		editCount: entry.editCount,
 		addedAt: entry.addedAt,
 		updatedAt: now,
 	};

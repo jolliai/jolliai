@@ -240,7 +240,6 @@ describe("SummaryMarkdownBuilder", () => {
 						{
 							slug: "plan-a",
 							title: "Plan A",
-							editCount: 3,
 							addedAt: "2026-03-30T09:00:00Z",
 							updatedAt: "2026-03-30T09:30:00Z",
 							jolliPlanDocUrl: "https://jolli.app/plan/a",
@@ -261,7 +260,6 @@ describe("SummaryMarkdownBuilder", () => {
 						{
 							slug: "plan-b",
 							title: "Plan B",
-							editCount: 5,
 							addedAt: "2026-03-30T09:00:00Z",
 							updatedAt: "2026-03-30T09:30:00Z",
 						},
@@ -324,7 +322,6 @@ describe("SummaryMarkdownBuilder", () => {
 						{
 							slug: "p1",
 							title: "P1",
-							editCount: 1,
 							addedAt: "2026-03-30T09:00:00Z",
 							updatedAt: "2026-03-30T09:30:00Z",
 						},
@@ -412,7 +409,6 @@ describe("SummaryMarkdownBuilder", () => {
 						{
 							slug: "p1",
 							title: "P1",
-							editCount: 1,
 							addedAt: "2026-03-30T09:00:00Z",
 							updatedAt: "2026-03-30T09:30:00Z",
 						},
@@ -497,7 +493,6 @@ describe("SummaryMarkdownBuilder", () => {
 						{
 							slug: "p1",
 							title: "P1",
-							editCount: 1,
 							addedAt: "2026-03-30T09:00:00Z",
 							updatedAt: "2026-03-30T09:30:00Z",
 						},

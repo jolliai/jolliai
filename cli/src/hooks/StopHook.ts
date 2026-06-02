@@ -298,7 +298,7 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 	// between our load and save would be silently dropped.
 	const touchedSlugs = new Set<string>();
 
-	const upsertEntry = (slug: string, planFile: string, editCount: number): void => {
+	const upsertEntry = (slug: string, planFile: string): void => {
 		const existing = plans[slug];
 		if (existing?.contentHashAtCommit) {
 			// Archived guard — never resurrect if user explicitly removed it
@@ -316,7 +316,6 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 					updatedAt: now,
 					branch,
 					commitHash: null,
-					editCount,
 				};
 				changed = true;
 				touchedSlugs.add(slug);
@@ -324,7 +323,7 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 			}
 		} else if (existing) {
 			if (existing.commitHash === null && !existing.ignored) {
-				plans[slug] = { ...existing, editCount: existing.editCount + editCount, updatedAt: now };
+				plans[slug] = { ...existing, updatedAt: now };
 				changed = true;
 				touchedSlugs.add(slug);
 			}
@@ -338,7 +337,6 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 				updatedAt: now,
 				branch,
 				commitHash: null,
-				editCount,
 			};
 			changed = true;
 			touchedSlugs.add(slug);
@@ -377,7 +375,7 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 	//    Note guard is applied here too: a user may have added
 	//    `~/.claude/plans/foo.md` as a note via "Add Markdown File" (file
 	//    picker is unrestricted), so the same dedup applies.
-	for (const [rawSlug, editCount] of slugs) {
+	for (const rawSlug of slugs) {
 		const planFile = join(homedir(), ".claude", "plans", `${rawSlug}.md`);
 		if (!existsSync(planFile)) continue;
 		if (noteSourcePaths.has(normalizePathForCompare(planFile))) {
@@ -385,13 +383,13 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 			continue;
 		}
 		const slug = resolveUniqueSlug(rawSlug, planFile, plans);
-		upsertEntry(slug, planFile, editCount);
+		upsertEntry(slug, planFile);
 	}
 
 	// 2. External .md paths — slug resolved against current plans snapshot.
 	//    basenameNoExt is platform-agnostic so a Windows-style path parsed on
 	//    POSIX CI still yields a clean filename slug.
-	for (const [absPath, editCount] of externalPlans) {
+	for (const absPath of externalPlans) {
 		if (!existsSync(absPath)) continue;
 		if (noteSourcePaths.has(normalizePathForCompare(absPath))) {
 			log.info("Plan discovery: %s already a note — skipping plan registration", absPath);
@@ -399,7 +397,7 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 		}
 		const baseSlug = basenameNoExt(absPath, ".md");
 		const slug = resolveUniqueSlug(baseSlug, absPath, plans);
-		upsertEntry(slug, absPath, editCount);
+		upsertEntry(slug, absPath);
 	}
 
 	if (changed) {
@@ -435,11 +433,6 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 				// (vanishes from the panel), and the upsertEntry archive-guard
 				// revive branch can never fire again (because it gates on
 				// `existing.contentHashAtCommit`).
-				//
-				// Our local editCount increment is intentionally dropped: once
-				// archived, editCount is invisible to the panel; the next
-				// Write/Edit will resurrect a fresh uncommitted entry with the
-				// correct count via the archive-guard branch in upsertEntry.
 				merged[slug] = fresh;
 			} else {
 				merged[slug] = ours;
@@ -464,18 +457,18 @@ async function discoverPlansFromTranscript(sessionInfo: SessionInfo, cwd: string
 /**
  * Scans a transcript JSONL file starting from a given line, looking for plan references.
  *
- * Returns two maps:
- *   - `slugs`: slug → editCount for plans in ~/.claude/plans/ (slug-keyed)
- *   - `externalPlans`: absPath → editCount for .md files outside ~/.claude/plans/
+ * Returns two sets:
+ *   - `slugs`: slugs for plans in ~/.claude/plans/ (slug-keyed)
+ *   - `externalPlans`: absPaths for .md files outside ~/.claude/plans/
  *     (slug resolution deferred to the upsert phase, which has the registry snapshot)
  */
 function scanTranscriptForPlans(
 	transcriptPath: string,
 	startLine: number,
-): Promise<{ slugs: Map<string, number>; externalPlans: Map<string, number>; totalLines: number }> {
+): Promise<{ slugs: Set<string>; externalPlans: Set<string>; totalLines: number }> {
 	return new Promise((resolve) => {
-		const slugs = new Map<string, number>();
-		const externalPlans = new Map<string, number>();
+		const slugs = new Set<string>();
+		const externalPlans = new Set<string>();
 		let lineNumber = 0;
 
 		const stream = createReadStream(transcriptPath, { encoding: "utf-8" });
@@ -491,10 +484,7 @@ function scanTranscriptForPlans(
 			if (line.includes('"slug":"')) {
 				const match = SLUG_REGEX.exec(line);
 				if (match?.[1]) {
-					// Ensure slug is in the map (plan-mode discovery, no editCount increment here)
-					if (!slugs.has(match[1])) {
-						slugs.set(match[1], 0);
-					}
+					slugs.add(match[1]);
 				}
 			}
 
@@ -504,8 +494,7 @@ function scanTranscriptForPlans(
 			if (line.includes('"type":"tool_use"') && WRITE_EDIT_REGEX.test(line)) {
 				const pathMatch = PLANS_PATH_SLUG_REGEX.exec(line);
 				if (pathMatch?.[1]) {
-					const slug = pathMatch[1];
-					slugs.set(slug, (slugs.get(slug) ?? 0) + 1);
+					slugs.add(pathMatch[1]);
 				} else {
 					const extMatch = ANY_MD_PATH_REGEX.exec(line);
 					if (extMatch?.[1]) {
@@ -521,7 +510,7 @@ function scanTranscriptForPlans(
 							// Malformed escape sequence — treat as non-candidate.
 						}
 						if (absPath && isExternalPlanCandidate(absPath)) {
-							externalPlans.set(absPath, (externalPlans.get(absPath) ?? 0) + 1);
+							externalPlans.add(absPath);
 						}
 					}
 				}

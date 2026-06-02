@@ -428,7 +428,6 @@ describe("PostCommitHook helpers", () => {
 						commitHash: "deadbeefdeadbeef",
 						contentHashAtCommit: oldHash,
 						branch: "main",
-						editCount: 0,
 						addedAt: "x",
 						updatedAt: "y",
 					},
@@ -458,7 +457,6 @@ describe("PostCommitHook helpers", () => {
 						commitHash: "deadbeefdeadbeef",
 						contentHashAtCommit: hash,
 						branch: "main",
-						editCount: 0,
 						addedAt: "x",
 						updatedAt: "y",
 					},
@@ -488,7 +486,6 @@ describe("PostCommitHook helpers", () => {
 						commitHash: "deadbeefdeadbeef",
 						contentHashAtCommit: "anything",
 						branch: "main",
-						editCount: 0,
 						addedAt: "x",
 						updatedAt: "y",
 					},
@@ -543,7 +540,6 @@ describe("PostCommitHook helpers", () => {
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
 							commitHash: null,
-							editCount: 2,
 						},
 					},
 				})
@@ -558,7 +554,6 @@ describe("PostCommitHook helpers", () => {
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
 							commitHash: null,
-							editCount: 2,
 						},
 					},
 				});
@@ -600,7 +595,6 @@ describe("PostCommitHook helpers", () => {
 						updatedAt: "2026-02-18T00:00:00Z",
 						branch: "feature/test",
 						commitHash: null,
-						editCount: 1,
 						ignored: true,
 					},
 					archived: {
@@ -611,7 +605,6 @@ describe("PostCommitHook helpers", () => {
 						updatedAt: "2026-02-18T00:00:00Z",
 						branch: "feature/test",
 						commitHash: null,
-						editCount: 1,
 						contentHashAtCommit: "abc123",
 					},
 					associated: {
@@ -622,7 +615,6 @@ describe("PostCommitHook helpers", () => {
 						updatedAt: "2026-02-18T00:00:00Z",
 						branch: "feature/test",
 						commitHash: "12345678",
-						editCount: 1,
 					},
 					missing: {
 						slug: "missing",
@@ -632,7 +624,6 @@ describe("PostCommitHook helpers", () => {
 						updatedAt: "2026-02-18T00:00:00Z",
 						branch: "feature/test",
 						commitHash: null,
-						editCount: 1,
 					},
 				},
 			});
@@ -662,7 +653,6 @@ describe("PostCommitHook helpers", () => {
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
 							commitHash: null,
-							editCount: 1,
 						},
 					},
 				})
@@ -677,7 +667,6 @@ describe("PostCommitHook helpers", () => {
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
 							commitHash: null,
-							editCount: 1,
 						},
 					},
 				});
@@ -707,7 +696,6 @@ describe("PostCommitHook helpers", () => {
 						updatedAt: "2026-02-18T00:00:00Z",
 						branch: "feature/test",
 						commitHash: null,
-						editCount: 1,
 					},
 				},
 			});
@@ -780,7 +768,6 @@ describe("PostCommitHook helpers", () => {
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
 							commitHash: null,
-							editCount: 3,
 						},
 					},
 				})
@@ -795,7 +782,6 @@ describe("PostCommitHook helpers", () => {
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
 							commitHash: null,
-							editCount: 3,
 						},
 					},
 				});
@@ -854,7 +840,6 @@ describe("PostCommitHook helpers", () => {
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
 							commitHash: null,
-							editCount: 2,
 						},
 					},
 				})
@@ -869,7 +854,6 @@ describe("PostCommitHook helpers", () => {
 							updatedAt: "2026-02-18T00:00:00Z",
 							branch: "feature/test",
 							commitHash: null,
-							editCount: 2,
 						},
 					},
 				});
@@ -945,7 +929,6 @@ describe("PostCommitHook helpers", () => {
 					{
 						slug: "plan-1",
 						title: "Plan 1",
-						editCount: 1,
 						addedAt: "2026-02-18T00:00:00Z",
 						updatedAt: "2026-02-18T00:00:00Z",
 					},
@@ -998,7 +981,6 @@ describe("PostCommitHook helpers", () => {
 					{
 						slug: "plan-2",
 						title: "Plan 2",
-						editCount: 2,
 						addedAt: "2026-02-18T00:00:00Z",
 						updatedAt: "2026-02-18T00:00:00Z",
 					},

@@ -91,8 +91,6 @@ export interface PlanInfo {
 	readonly updatedAt: string;
 	/** Git branch name when plan was discovered */
 	readonly branch: string;
-	/** Number of Write/Edit tool operations on this plan in transcripts */
-	readonly editCount: number;
 	/** Commit hash if plan is associated with a commit, null if unassociated */
 	readonly commitHash: string | null;
 }
@@ -106,7 +104,6 @@ export interface PlanEntry {
 	readonly updatedAt: string;
 	readonly branch: string;
 	readonly commitHash: string | null;
-	readonly editCount: number;
 	/** SHA-256 hash of the plan file content when associated with a commit. Used as a guard to detect if the file was overwritten with new content. */
 	readonly contentHashAtCommit?: string;
 	/** When true, plan is hidden from PLANS panel (user removed it). Cleared if source file content changes. */
