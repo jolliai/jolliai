@@ -30,6 +30,8 @@ class ActiveConversationsPanel(
 	private val service: JolliMemoryService,
 ) : JPanel(BorderLayout()), Disposable {
 
+	private val log = ai.jolli.jollimemory.core.JmLogger.create("ActiveConversationsPanel")
+
 	private var viewMode = ConversationViewMode.ACTIVE
 
 	private val rowsPanel = JPanel().apply {
@@ -122,25 +124,41 @@ class ActiveConversationsPanel(
 
 	private fun loadData() {
 		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		log.info("[loadData] viewMode=%s cwd=%s", viewMode, cwd)
 		val windowMs = when (viewMode) {
 			ConversationViewMode.ACTIVE -> WINDOW_48H
 			ConversationViewMode.ALL -> WINDOW_7D
 			ConversationViewMode.BRANCH -> WINDOW_7D
 		}
 		val requireUnread = viewMode == ConversationViewMode.ACTIVE
+		log.info("[loadData] windowMs=%d requireUnread=%s", windowMs, requireUnread)
 		val result: ActiveConversationsResult = try {
 			ActiveSessionAggregator.listActiveConversationsWithDiagnostics(cwd, windowMs, requireUnread)
 		} catch (e: Exception) {
+			log.info("[loadData] aggregator threw: %s", e.message)
 			ActiveConversationsResult(emptyList(), emptyList())
+		}
+		log.info("[loadData] aggregator returned %d items, %d failedSources", result.items.size, result.failedSources.size)
+		for (item in result.items) {
+			log.info("[loadData]   item: source=%s id=%s branchTags=%s", item.source.name, item.sessionId, item.branchTags)
 		}
 
 		// For BRANCH mode, filter to sessions tagged to current branch
 		val filtered = if (viewMode == ConversationViewMode.BRANCH) {
 			val currentBranch = try { GitOps(cwd).getCurrentBranch() } catch (_: Exception) { null }
+			log.info("[loadData] BRANCH mode: currentBranch=%s", currentBranch)
 			if (currentBranch != null) {
 				val filteredItems = result.items.filter { currentBranch in it.branchTags }
+				log.info("[loadData] BRANCH filter: %d → %d items (looking for branch '%s')", result.items.size, filteredItems.size, currentBranch)
+				for (item in result.items) {
+					val matched = currentBranch in item.branchTags
+					log.info("[loadData]   %s source=%s id=%s tags=%s", if (matched) "KEEP" else "DROP", item.source.name, item.sessionId, item.branchTags)
+				}
 				ActiveConversationsResult(filteredItems, result.failedSources)
-			} else result
+			} else {
+				log.info("[loadData] BRANCH mode but currentBranch is null — returning unfiltered")
+				result
+			}
 		} else result
 
 		// Precompute existing branches for tag chip rendering

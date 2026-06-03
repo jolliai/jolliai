@@ -34,18 +34,30 @@ object ActiveSessionAggregator {
 		requireUnread: Boolean = true,
 	): ActiveConversationsResult {
 		val cutoff = System.currentTimeMillis() - windowMs
+		log.info("[loadConversations] cwd=%s windowMs=%d requireUnread=%s cutoff=%d", cwd, windowMs, requireUnread, cutoff)
 
 		val collected = collectFromAllSources(cwd)
+		log.info("[loadConversations] collectFromAllSources returned %d sessions, %d failedSources", collected.sessions.size, collected.failedSources.size)
+		for (s in collected.sessions) {
+			log.info("[loadConversations]   session: source=%s id=%s updatedAt=%s path=%s", s.source?.name ?: "null", s.sessionId, s.updatedAt, s.transcriptPath)
+		}
+
 		val hidden = HiddenConversationsStore.loadHiddenConversations(cwd)
+		log.info("[loadConversations] hidden conversations count=%d", hidden.entries.size)
 
 		// Filter by recency
 		val fresh = collected.sessions.filter { s ->
 			try {
-				Instant.parse(s.updatedAt).toEpochMilli() >= cutoff
-			} catch (_: Exception) {
+				val ts = Instant.parse(s.updatedAt).toEpochMilli()
+				val keep = ts >= cutoff
+				if (!keep) log.info("[loadConversations] FILTERED by recency: source=%s id=%s updatedAt=%s (epoch=%d < cutoff=%d)", s.source?.name ?: "null", s.sessionId, s.updatedAt, ts, cutoff)
+				keep
+			} catch (e: Exception) {
+				log.info("[loadConversations] FILTERED by parse error: source=%s id=%s updatedAt=%s err=%s", s.source?.name ?: "null", s.sessionId, s.updatedAt, e.message)
 				false
 			}
 		}
+		log.info("[loadConversations] after recency filter: %d sessions remain (was %d)", fresh.size, collected.sessions.size)
 
 		// Deduplicate by (source, sessionId), keeping most recent
 		val bySourceAndId = mutableMapOf<String, SessionInfo>()
@@ -56,30 +68,40 @@ object ActiveSessionAggregator {
 				bySourceAndId[key] = s
 			}
 		}
+		log.info("[loadConversations] after dedup: %d sessions remain (was %d)", bySourceAndId.size, fresh.size)
 
 		// Filter hidden sessions
 		val visible = bySourceAndId.values.filter { s ->
-			!HiddenConversationsStore.isStillHidden(
+			val isHidden = HiddenConversationsStore.isStillHidden(
 				hidden,
 				s.source ?: TranscriptSource.claude,
 				s.sessionId,
 				s.updatedAt,
 			)
+			if (isHidden) log.info("[loadConversations] FILTERED hidden: source=%s id=%s", s.source?.name ?: "null", s.sessionId)
+			!isHidden
 		}
+		log.info("[loadConversations] after hidden filter: %d sessions remain", visible.size)
 
 		// Load branch tags and BP summaries registries
 		val branchTagsRegistry = try { BranchTagsStore.loadRegistry(cwd) } catch (_: Exception) { BranchTagsRegistry() }
+		log.info("[loadConversations] branchTagsRegistry has %d entries: keys=%s", branchTagsRegistry.entries.size, branchTagsRegistry.entries.keys)
 		val bpSummaryRegistry = try { BPSummaryStore.loadRegistry(cwd) } catch (_: Exception) { BPSummaryRegistry() }
 
 		// Load transcripts, resolve titles, build items
 		val items = visible.mapNotNull { s ->
 			val unread = safeLoadUnreadMerged(s, cwd)
-			if (requireUnread && unread.isEmpty()) return@mapNotNull null
+			if (requireUnread && unread.isEmpty()) {
+				log.info("[loadConversations] FILTERED no unread: source=%s id=%s", s.source?.name ?: "null", s.sessionId)
+				return@mapNotNull null
+			}
 
 			val titleEntries = safeLoadMerged(s, cwd)
 			val source = s.source ?: TranscriptSource.claude
 			val key = BranchTagsStore.tagKey(source, s.sessionId)
 			val bpKey = BPSummaryStore.bpKey(source.name, s.sessionId)
+			val tags = branchTagsRegistry.entries[key]?.branches ?: emptyList()
+			log.info("[loadConversations] item: source=%s id=%s tagKey=%s branchTags=%s unread=%d", source.name, s.sessionId, key, tags, unread.size)
 
 			ActiveConversationItem(
 				sessionId = s.sessionId,
@@ -88,10 +110,11 @@ object ActiveSessionAggregator {
 				messageCount = unread.size,
 				updatedAt = s.updatedAt,
 				transcriptPath = s.transcriptPath,
-				branchTags = branchTagsRegistry.entries[key]?.branches ?: emptyList(),
+				branchTags = tags,
 				bpSummary = bpSummaryRegistry.entries[bpKey]?.bullets ?: emptyList(),
 			)
 		}
+		log.info("[loadConversations] built %d items from %d visible sessions", items.size, visible.size)
 
 		val sorted = items.sortedWith(
 			compareByDescending<ActiveConversationItem> { it.updatedAt }
