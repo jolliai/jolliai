@@ -923,6 +923,58 @@ describe("SessionStartHook", () => {
 		writeSpy.mockRestore();
 	});
 
+	it("excludes legacy soft-deleted (ignored) plans via §14 normalization", async () => {
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "aaa",
+					parentCommitHash: null,
+					commitMessage: "First",
+					commitDate: "2026-03-28T10:00:00.000Z",
+					branch: "feature/test-branch",
+					generatedAt: "2026-03-28T10:01:00.000Z",
+				},
+			]),
+		);
+		// `ghost-plan` carries a legacy `ignored:true` (a field no longer in the
+		// type) — SessionStartHook must route through normalizePlansRegistry so it
+		// is dropped rather than surfaced as an active associated plan.
+		const plansRegistry = {
+			version: 1,
+			plans: {
+				"active-plan": {
+					slug: "active-plan",
+					title: "Active Plan",
+					sourcePath: "plans/active.md",
+					addedAt: "2026-03-28T10:00:00.000Z",
+					updatedAt: "2026-03-28T10:00:00.000Z",
+					commitHash: null,
+				},
+				"ghost-plan": {
+					slug: "ghost-plan",
+					title: "Ghost Plan",
+					sourcePath: "plans/ghost.md",
+					addedAt: "2026-03-28T10:00:00.000Z",
+					updatedAt: "2026-03-28T10:00:00.000Z",
+					commitHash: null,
+					ignored: true,
+				},
+			},
+		} as unknown as PlansRegistry;
+		mockExistsSync.mockImplementation((path) => {
+			return typeof path === "string" && path.endsWith("plans.json");
+		});
+		mockReadFileSync.mockReturnValue(JSON.stringify(plansRegistry));
+
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		await main();
+
+		const output = writeSpy.mock.calls[0][0] as string;
+		expect(output).toContain("Active Plan");
+		expect(output).not.toContain("Ghost Plan");
+		writeSpy.mockRestore();
+	});
+
 	it("should fallback to commit message when summary load fails", async () => {
 		mockGetIndex.mockResolvedValue(
 			makeIndex([

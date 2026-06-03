@@ -796,6 +796,21 @@ async function associateNotesWithCommit(
 export interface AssociateReferencesResult {
 	readonly refs: ReadonlyArray<ReferenceCommitRef>;
 	readonly filesToStore: ReadonlyArray<{ archivedKey: string; source: SourceId; content: string }>;
+	/**
+	 * Local state to delete ONLY AFTER the orphan-branch snapshot
+	 * (`filesToStore`) has been durably written by `storeReferences`. Each item
+	 * is a committed reference whose registry row + local markdown must be
+	 * removed via {@link finalizeReferenceArchive}. Deferring the deletion is
+	 * what makes a `storeReferences` failure recoverable: the active row stays in
+	 * plans.json and is re-archived on the next commit instead of being lost.
+	 *
+	 * `updatedAt` is the captured row fingerprint: finalize deletes only if the
+	 * fresh registry row still carries the SAME `updatedAt`. If a StopHook
+	 * re-upserted the same mapKey (user re-referenced the issue) between
+	 * `storeReferences` and finalize, the fresh row's `updatedAt` differs and the
+	 * deletion is skipped — preserving the new active row + its markdown.
+	 */
+	readonly committed: ReadonlyArray<{ mapKey: string; sourcePath: string; updatedAt: string }>;
 }
 
 /**
@@ -804,23 +819,21 @@ export interface AssociateReferencesResult {
  *
  *   1. For each `{mapKey, source, sourcePath}` triple, read the raw markdown
  *      bytes so the orphan-branch snapshot does not depend on the local file.
- *   2. Promote the `mapKey` entry to a guard in `plans.json.references`:
- *      `contentHashAtCommit` + `commitHash` are set and `sourcePath` is left
- *      UNCHANGED so the next StopHook upsert of the same mapKey writes back
- *      into the same active path. No per-commit snapshot row is created
- *      and the active markdown is NOT physically renamed — the orphan-branch
- *      snapshot (filesToStore: raw bytes keyed by `archivedKey =
- *      "<mapKey>-<shortHash>"`) plus the CommitSummary ReferenceCommitRef are
- *      the system of record, so no local archived copy is needed and the
- *      guard's sourcePath never dangles.
- *   3. Near-write reread + merge: reload plans.json AT THE END and overwrite
- *      ONLY the specific mapKeys this call touched. Any concurrent StopHook
- *      upsert / ignoreReference command that ran during this archive is
- *      preserved.
+ *   2. Build the per-commit snapshot: a `ReferenceCommitRef` (value snapshot)
+ *      for the CommitSummary and a `filesToStore` entry (raw bytes keyed by
+ *      `archivedKey = "<mapKey>-<shortHash>"`) for the orphan branch. Under the
+ *      commit-deletes-entry model (§13) the reference row does NOT survive in
+ *      plans.json — but its deletion is DEFERRED, not done here.
  *
- * The function does NOT call `storeReferences` itself — that responsibility
- * stays with the caller (executePipeline / amend fresh-leaf) because the
- * orphan-branch commit message differs between flows.
+ * This function performs NO deletes and NO `savePlansRegistry` write: it only
+ * COMPUTES the snapshot. The `committed` list it returns names the local state
+ * (registry row + markdown) that must be torn down — but only AFTER the caller
+ * has durably written `filesToStore` via `storeReferences`. The caller then
+ * calls {@link finalizeReferenceArchive}. This write-ahead ordering is what
+ * makes a `storeReferences` failure recoverable: with the active row still in
+ * plans.json, the reference is simply re-archived on the next commit instead of
+ * being lost (queue entries are fire-and-forget with no retry). The caller owns
+ * `storeReferences` because the orphan-branch commit message differs per flow.
  */
 async function associateReferencesWithCommit(
 	ids: ReadonlyArray<{ mapKey: string; source: SourceId; sourcePath: string }>,
@@ -829,7 +842,7 @@ async function associateReferencesWithCommit(
 	branch: string,
 ): Promise<AssociateReferencesResult> {
 	log.info("Reference association: detected %d ref(s) for branch %s", ids.length, branch);
-	if (ids.length === 0) return { refs: [], filesToStore: [] };
+	if (ids.length === 0) return { refs: [], filesToStore: [], committed: [] };
 
 	const shortHash = commitHash.substring(0, 8);
 	const refs: ReferenceCommitRef[] = [];
@@ -840,9 +853,10 @@ async function associateReferencesWithCommit(
 		/* v8 ignore next -- `?? {}` fallback unreachable: `ids` is sourced from detectUncommittedReferenceIds, which derives from plans.json.references; if references were undefined ids would be empty and the early-return would have already fired. */
 		...(registry.references ?? {}),
 	};
-	// mapKeys successfully archived this run — deleted from plans.json in the
-	// merge-save below (reference commit removes the entry; no guard row survives).
-	const committedMapKeys = new Set<string>();
+	// References whose snapshot was captured this run. Their local state (registry
+	// row + markdown) is torn down by the caller via finalizeReferenceArchive,
+	// but ONLY after storeReferences durably writes the orphan-branch snapshot.
+	const committed: Array<{ mapKey: string; sourcePath: string; updatedAt: string }> = [];
 	const droppedMapKeys: string[] = [];
 
 	for (const { mapKey, source } of ids) {
@@ -886,13 +900,14 @@ async function associateReferencesWithCommit(
 
 		const archivedKey = `${mapKey}-${shortHash}`;
 
-		// Reference commit DELETES the entry (no guard row). reference has no
-		// revival (it's a read-only MCP snapshot), so nothing needs to survive in
-		// plans.json — the orphan-branch snapshot (filesToStore: raw bytes keyed by
-		// archivedKey) + the CommitSummary ReferenceCommitRef are the system of
-		// record. The mapKey is removed in the merge-save below; the local active
-		// markdown is cleaned up here (orphan keeps the snapshot).
-		committedMapKeys.add(mapKey);
+		// Reference commit DELETES the entry (no guard row): reference has no
+		// revival (read-only MCP snapshot), so nothing needs to survive in
+		// plans.json — the orphan-branch snapshot (filesToStore) + the
+		// CommitSummary ReferenceCommitRef are the system of record. The registry
+		// row + local markdown are NOT torn down here; the caller does that via
+		// finalizeReferenceArchive AFTER storeReferences confirms the snapshot is
+		// durably written (write-ahead → a storeReferences failure is recoverable).
+		committed.push({ mapKey, sourcePath: entry.sourcePath, updatedAt: entry.updatedAt });
 
 		refs.push({
 			archivedKey,
@@ -906,39 +921,7 @@ async function associateReferencesWithCommit(
 		});
 		filesToStore.push({ archivedKey, source, content: rawContent });
 
-		// Best-effort: the active markdown's content is now in the orphan branch.
-		try {
-			await deleteReferenceMarkdown(entry.sourcePath);
-		} catch (err) {
-			log.warn(
-				"Reference association: failed to delete local markdown for %s: %s",
-				mapKey,
-				(err as Error).message,
-			);
-		}
-
-		log.info("Reference archived (entry removed): %s → %s", mapKey, archivedKey);
-	}
-
-	if (committedMapKeys.size > 0) {
-		// Near-write reread + per-key merge. A concurrent StopHook upsert may have
-		// touched plans.json.references while we were busy reading, and overwriting
-		// the whole references map would silently drop their work. We only
-		// DELETE the mapKeys we archived this run from the fresh snapshot — any
-		// concurrent writer's other keys are preserved.
-		const freshRegistry = await loadPlansRegistry(cwd);
-		/* v8 ignore next -- `?? {}` fallback unreachable: freshRegistry is loaded immediately after the loop archived at least one mapKey sourced from plans.json.references. */
-		const mergedReferences = { ...(freshRegistry.references ?? {}) };
-		for (const mapKey of committedMapKeys) {
-			delete mergedReferences[mapKey];
-		}
-		const out: PlansRegistry = {
-			version: 1,
-			plans: freshRegistry.plans,
-			...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
-			references: mergedReferences,
-		};
-		await savePlansRegistry(out, cwd);
+		log.info("Reference snapshot captured (deletion deferred): %s → %s", mapKey, archivedKey);
 	}
 
 	if (droppedMapKeys.length > 0) {
@@ -951,7 +934,68 @@ async function associateReferencesWithCommit(
 		);
 	}
 
-	return { refs, filesToStore };
+	return { refs, filesToStore, committed };
+}
+
+/**
+ * Tears down the local state of references whose orphan-branch snapshot has now
+ * been durably written (the `committed` list from {@link associateReferencesWithCommit}).
+ * MUST be called only AFTER a successful `storeReferences` — calling it before
+ * (or skipping `storeReferences` on failure) is what would lose data.
+ *
+ * Per committed reference: delete the registry row + local markdown — BUT only
+ * if the fresh row still matches the captured `updatedAt` fingerprint. A
+ * StopHook may have re-upserted the same mapKey (user re-referenced the issue)
+ * between `storeReferences` and this call; the re-upsert bumps `updatedAt`, so a
+ * mismatch means we leave the fresh active row + its markdown intact (deleting
+ * them would lose the re-reference). A near-write reread + per-key merge also
+ * preserves any unrelated keys a concurrent writer touched.
+ */
+async function finalizeReferenceArchive(
+	committed: ReadonlyArray<{ mapKey: string; sourcePath: string; updatedAt: string }>,
+	cwd: string,
+): Promise<void> {
+	if (committed.length === 0) return;
+
+	const freshRegistry = await loadPlansRegistry(cwd);
+	const mergedReferences = { ...(freshRegistry.references ?? {}) };
+	const toDeleteMarkdown: Array<{ mapKey: string; sourcePath: string }> = [];
+	for (const { mapKey, sourcePath, updatedAt } of committed) {
+		const fresh = mergedReferences[mapKey];
+		// `updatedAt` is a sufficient fingerprint here: the captured value was
+		// written by a PRIOR upsert (at discovery / an earlier commit), while a
+		// racing re-upsert stamps `new Date()` during this post-commit window — so
+		// a mismatch reliably means "re-upserted since capture". A same-millisecond
+		// collision is unreachable (the two writes are separated by ≥ the time
+		// since discovery), so no revision/nonce is needed.
+		if (fresh !== undefined && fresh.updatedAt !== updatedAt) {
+			log.info("Reference finalize: %s re-upserted since capture — keeping active row", mapKey);
+			continue;
+		}
+		delete mergedReferences[mapKey];
+		toDeleteMarkdown.push({ mapKey, sourcePath });
+	}
+	// Nothing actually deleted (every key was re-upserted) → skip the write
+	// entirely. Re-saving an unchanged registry would only widen the lost-update
+	// window against a concurrent StopHook for zero benefit.
+	if (toDeleteMarkdown.length === 0) return;
+
+	const out: PlansRegistry = {
+		version: 1,
+		plans: freshRegistry.plans,
+		...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
+		references: mergedReferences,
+	};
+	await savePlansRegistry(out, cwd);
+
+	for (const { mapKey, sourcePath } of toDeleteMarkdown) {
+		try {
+			await deleteReferenceMarkdown(sourcePath);
+		} catch (err) {
+			log.warn("Reference finalize: failed to delete local markdown for %s: %s", mapKey, (err as Error).message);
+		}
+		log.info("Reference entry removed (post-storeReferences): %s", mapKey);
+	}
 }
 
 /** Reads the raw markdown file bytes (for orphan-branch storage). */
@@ -1196,19 +1240,22 @@ async function executePipeline(cwd: string, op: GitOperation, force = false): Pr
 	// next commit (skip-don't-archive semantics).
 	const rawReferenceIds = await detectUncommittedReferenceIds(cwd, branch);
 	const referenceIds = rawReferenceIds.filter((e) => !exclusions.references.has(e.mapKey));
-	const { refs: referenceRefs, filesToStore: referenceFiles } = await associateReferencesWithCommit(
-		referenceIds,
-		commitInfo.hash,
-		cwd,
-		branch,
-	);
+	const {
+		refs: referenceRefs,
+		filesToStore: referenceFiles,
+		committed: referenceCommitted,
+	} = await associateReferencesWithCommit(referenceIds, commitInfo.hash, cwd, branch);
 	if (referenceFiles.length > 0) {
+		// Write-ahead: persist the orphan-branch snapshot FIRST, then tear down
+		// local state. If storeReferences throws, the active rows stay in
+		// plans.json and re-archive on the next commit (no permanent loss).
 		await storeReferences(
 			referenceFiles,
 			`Archive ${referenceFiles.length} reference ref(s) for commit ${commitInfo.hash.substring(0, 8)}`,
 			cwd,
 			branch,
 		);
+		await finalizeReferenceArchive(referenceCommitted, cwd);
 	}
 	// Step 8b: Evaluate plan progress for each linked plan (Haiku calls parallelized)
 	const planProgressArtifacts: PlanProgressArtifact[] = [];
@@ -2176,17 +2223,17 @@ async function handleAmendPipeline(
 	// Mirror plans/notes: honour user deselections from the sidebar so the
 	// amend fresh-leaf doesn't silently re-archive references the user removed.
 	const freshLeafReferenceIds = rawFreshLeafReferenceIds.filter((e) => !amendExclusions.references.has(e.mapKey));
-	const { refs: freshLeafReferenceRefs, filesToStore: freshLeafReferenceFiles } = await associateReferencesWithCommit(
-		freshLeafReferenceIds,
-		commitInfo.hash,
-		cwd,
-		branch,
-	);
+	const {
+		refs: freshLeafReferenceRefs,
+		filesToStore: freshLeafReferenceFiles,
+		committed: freshLeafReferenceCommitted,
+	} = await associateReferencesWithCommit(freshLeafReferenceIds, commitInfo.hash, cwd, branch);
 	// CRITICAL: the generic associateReferencesWithCommit does NOT call
 	// storeReferences itself (unlike the legacy Linear-only path which was
 	// self-contained). The amend fresh-leaf path MUST explicitly drive the
 	// orphan-branch write — otherwise Regenerator can't read back the
-	// archived markdown at recall time.
+	// archived markdown at recall time. Write-ahead: store first, then finalize
+	// the local-state teardown (so a store failure leaves the rows recoverable).
 	/* v8 ignore start -- amend fresh-leaf reference-files write path: only hit when a `git commit --amend` lands without an existing summary AND active references exist on the branch. Both arms (files-present vs files-absent) are tested mechanically through the StopHook → PostCommit happy path; this defensive branch in the amend-only fresh-leaf code path is reachable only via a race (StopHook upserted between detect and commit), and that race resolves the same way either way. */
 	if (freshLeafReferenceFiles.length > 0) {
 		await storeReferences(
@@ -2195,6 +2242,7 @@ async function handleAmendPipeline(
 			cwd,
 			branch,
 		);
+		await finalizeReferenceArchive(freshLeafReferenceCommitted, cwd);
 	}
 	/* v8 ignore stop */
 
@@ -2482,6 +2530,7 @@ export const __test__ = {
 	detectUncommittedNoteIds,
 	hoistMetadataFromOldSummary,
 	associatePlansWithCommit,
+	finalizeReferenceArchive,
 	executePipeline,
 	handleAmendPipeline,
 	handleSquashFromQueue,

@@ -3,8 +3,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Hoisted mocks ──────────────────────────────────────────────────────────
 
-const { mockLoadPlansRegistry, mockSavePlansRegistry } = vi.hoisted(() => ({
+const { mockLoadPlansRegistry, mockLoadPlansRegistryWithStatus, mockSavePlansRegistry } = vi.hoisted(() => ({
 	mockLoadPlansRegistry: vi.fn(),
+	mockLoadPlansRegistryWithStatus: vi.fn(),
 	mockSavePlansRegistry: vi.fn(),
 }));
 
@@ -57,7 +58,13 @@ const { mockCreateHash, mockRandomBytes } = vi.hoisted(() => ({
 
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadPlansRegistry: mockLoadPlansRegistry,
+	loadPlansRegistryWithStatus: mockLoadPlansRegistryWithStatus,
 	savePlansRegistry: mockSavePlansRegistry,
+	// Pure helper — real implementation so removeNote's exact→base-guard works.
+	splitArchivedKey: (k: string) => {
+		const m = k.match(/^(.+)-([0-9a-f]{8})$/);
+		return m ? { baseKey: m[1], oldShortHash: m[2] } : null;
+	},
 }));
 
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
@@ -148,6 +155,13 @@ describe("NoteService", () => {
 	beforeEach(() => {
 		mockLoadPlansRegistry.mockReset();
 		mockSavePlansRegistry.mockReset();
+		// Default: delegate to loadPlansRegistry with changed=false. The migration
+		// writeback test overrides with mockResolvedValueOnce.
+		mockLoadPlansRegistryWithStatus.mockReset();
+		mockLoadPlansRegistryWithStatus.mockImplementation(async (cwd: string) => ({
+			registry: await mockLoadPlansRegistry(cwd),
+			changed: false,
+		}));
 		mockStoreNotes.mockReset();
 		mockGetJolliMemoryDir.mockReset();
 		mockGetJolliMemoryDir.mockReturnValue("/mock-repo/.jolli/jollimemory");
@@ -243,6 +257,25 @@ describe("NoteService", () => {
 			const notes = await detectNotes(CWD);
 
 			expect(notes).toEqual([]);
+		});
+
+		it("persists the normalised registry once when migration purged legacy rows/fields (changed=true)", async () => {
+			mockLoadPlansRegistryWithStatus.mockResolvedValueOnce({
+				registry: { version: 1, plans: {}, notes: {} },
+				changed: true,
+			});
+
+			await detectNotes(CWD);
+
+			expect(mockSavePlansRegistry).toHaveBeenCalledTimes(1);
+		});
+
+		it("does not persist when nothing changed (changed=false)", async () => {
+			mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {}, notes: {} });
+
+			await detectNotes(CWD);
+
+			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
 		});
 
 		it("filters out ignored notes", async () => {
@@ -969,6 +1002,67 @@ describe("NoteService", () => {
 
 			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
 			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("resolves an archived id to the bare-key guard when it still belongs to that commit", async () => {
+			const guard = makeNoteEntry({ commitHash: "abcdef1234567890", contentHashAtCommit: "h" });
+			mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {}, notes: { "my-note": guard } });
+
+			await removeNote("my-note-abcdef12", CWD, "abcdef1234567890");
+
+			expect(mockSavePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ notes: {} }), CWD);
+		});
+
+		it("does NOT delete the base note when it was revived/re-committed since (commitHash mismatch)", async () => {
+			// P1 regression: dissociating an OLD commit must not wipe a live note.
+			const revived = makeNoteEntry({ commitHash: null });
+			mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {}, notes: { "my-note": revived } });
+
+			await removeNote("my-note-abcdef12", CWD, "abcdef1234567890");
+
+			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("deletes the exact id (not the stripped base) when it is this commit's guard", async () => {
+			const foo = makeNoteEntry({ commitHash: "abcdef1234567890" });
+			const real = makeNoteEntry({ commitHash: "abcdef1234567890" });
+			mockLoadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: {},
+				notes: { foo, "foo-deadbeef": real },
+			});
+
+			await removeNote("foo-deadbeef", CWD, "abcdef1234567890");
+
+			const saved = mockSavePlansRegistry.mock.calls.at(-1)?.[0] as { notes: Record<string, unknown> };
+			expect(saved.notes["foo-deadbeef"]).toBeUndefined();
+			expect(saved.notes.foo).toBeDefined(); // base NOT mis-stripped
+		});
+
+		it("does NOT delete a live exact-id row (commitHash mismatch) when dissociating an old commit", async () => {
+			// P1-extended: an archived id `foo-deadbeef` from an old summary can later
+			// become a LIVE note under that exact id (commitHash=null). The exact id
+			// matches, but the commitHash does not — dissociating the old commit must
+			// not wipe the live row. The sidebar (no expectedCommitHash) still deletes it.
+			const live = makeNoteEntry({ commitHash: null });
+			mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {}, notes: { "foo-deadbeef": live } });
+
+			await removeNote("foo-deadbeef", CWD, "abcdef1234567890");
+
+			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("deletes the exact id unconditionally on the sidebar path (no expectedCommitHash)", async () => {
+			// A committed note removed via the sidebar — no expectedCommitHash — is deleted
+			// regardless of its commitHash. The user explicitly asked to remove the live note.
+			const committed = makeNoteEntry({ commitHash: "abcdef1234567890" });
+			mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {}, notes: { "my-note": committed } });
+
+			await removeNote("my-note", CWD);
+
+			expect(mockSavePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ notes: {} }), CWD);
 		});
 
 		it("handles file deletion failure gracefully", async () => {

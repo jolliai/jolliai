@@ -26,6 +26,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readFileFromBranch } from "../core/GitOps.js";
+import { normalizePlansRegistry } from "../core/SessionTracker.js";
 import { getDisplayDate } from "../core/SummaryFormat.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
@@ -202,7 +203,11 @@ function loadAssociatedPlanNames(projectDir: string, _branch: string): ReadonlyA
 		const plansPath = join(projectDir, ".jolli", "jollimemory", "plans.json");
 		if (!existsSync(plansPath)) return [];
 
-		const registry = JSON.parse(readFileSync(plansPath, "utf-8")) as PlansRegistry;
+		// Route through the §14 normalizer (pure/sync) so legacy soft-deleted
+		// (`ignored:true`) and dead-field rows don't leak into the session-start
+		// context before detect* physically rewrites plans.json.
+		const parsed = JSON.parse(readFileSync(plansPath, "utf-8")) as Partial<PlansRegistry>;
+		const registry = normalizePlansRegistry(parsed).registry;
 		const names: string[] = [];
 		for (const entry of Object.values(registry.plans)) {
 			// Include active (uncommitted) plans — worktree-scoped, no branch filter

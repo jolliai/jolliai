@@ -3231,7 +3231,7 @@ describe("SummaryWebviewPanel", () => {
 
 				// Hard-removes the archived plans.json row (the CommitSummary
 				// reference was dropped above); no unassociate + ignore steps.
-				expect(mockRemovePlan).toHaveBeenCalledWith("plan-a", workspaceRoot);
+				expect(mockRemovePlan).toHaveBeenCalledWith("plan-a", workspaceRoot, expect.any(String));
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({
 						plans: [expect.objectContaining({ slug: "plan-b" })],
@@ -3246,6 +3246,27 @@ describe("SummaryWebviewPanel", () => {
 				// would fall back to OrphanBranchStorage and silently no-op).
 				expect(stubBridge.cleanupVisiblePlanArtifact).toHaveBeenCalledWith(
 					"plan-a",
+					expect.any(String),
+				);
+			});
+
+			it("passes the raw archived slug to removePlan + cleanup (base resolution is in the service)", async () => {
+				// The webview forwards the CommitSummary's raw `<base>-<shortHash>` slug
+				// unchanged; removePlan resolves the bare-key guard internally (so
+				// squash/rebase slugs work without mis-stripping). Visible-artifact
+				// cleanup also uses the archived id (the mirror is plan--<slug>.md).
+				showWarningMessage.mockResolvedValue("Remove");
+				const dispatch = await setupPanel({
+					commitHash: "abcdef1234567890",
+					plans: [{ slug: "my-plan-abcdef12", title: "My Plan", addedAt: "", updatedAt: "" }],
+				});
+
+				dispatch({ command: "removePlan", slug: "my-plan-abcdef12", title: "My Plan" });
+				await flushPromises();
+
+				expect(mockRemovePlan).toHaveBeenCalledWith("my-plan-abcdef12", workspaceRoot, "abcdef1234567890");
+				expect(stubBridge.cleanupVisiblePlanArtifact).toHaveBeenCalledWith(
+					"my-plan-abcdef12",
 					expect.any(String),
 				);
 			});
@@ -6907,6 +6928,31 @@ describe("SummaryWebviewPanel", () => {
 		// ── removeNote ───────────────────────────────────────────────────────
 
 		describe("removeNote", () => {
+			it("passes the raw archived id to removeNote + cleanup (base resolution is in the service)", async () => {
+				showWarningMessage.mockResolvedValue("Remove");
+				const dispatch = await setupPanel({
+					commitHash: "abcdef1234567890",
+					notes: [
+						{
+							id: "my-note-abcdef12",
+							title: "My Note",
+							format: "markdown" as const,
+							addedAt: "",
+							updatedAt: "",
+						},
+					],
+				});
+
+				dispatch({ command: "removeNote", id: "my-note-abcdef12", title: "My Note" });
+				await flushPromises();
+
+				expect(mockRemoveNote).toHaveBeenCalledWith("my-note-abcdef12", workspaceRoot, "abcdef1234567890");
+				expect(stubBridge.cleanupVisibleNoteArtifact).toHaveBeenCalledWith(
+					"my-note-abcdef12",
+					expect.any(String),
+				);
+			});
+
 			it("confirms and removes note from commit", async () => {
 				showWarningMessage.mockResolvedValue("Remove");
 				const dispatch = await setupPanel({
@@ -6938,7 +6984,7 @@ describe("SummaryWebviewPanel", () => {
 				);
 				// Hard-removes the archived plans.json row (the CommitSummary
 				// reference was dropped above); no unassociate + ignore steps.
-				expect(mockRemoveNote).toHaveBeenCalledWith("note-a", workspaceRoot);
+				expect(mockRemoveNote).toHaveBeenCalledWith("note-a", workspaceRoot, expect.any(String));
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({
 						notes: [expect.objectContaining({ id: "note-b" })],
@@ -7293,10 +7339,10 @@ describe("SummaryWebviewPanel", () => {
 					expect.objectContaining({ modal: true }),
 					"Remove",
 				);
-				expect(mockRemoveReference).toHaveBeenCalledWith(
-					workspaceRoot,
-					"linear:PROJ-1-aaaaaaaa",
-				);
+				// Dissociation only drops the entry from CommitSummary.references;
+				// under the commit-deletes-entry model there is no plans.json row
+				// or local markdown to hard-remove here.
+				expect(mockRemoveReference).not.toHaveBeenCalled();
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({
 						references: [
@@ -7440,10 +7486,7 @@ describe("SummaryWebviewPanel", () => {
 				});
 				await flushPromises();
 
-				expect(mockRemoveReference).toHaveBeenCalledWith(
-					workspaceRoot,
-					"jira:KAN-5-aaaa1111",
-				);
+				expect(mockRemoveReference).not.toHaveBeenCalled();
 				expect(mockStoreSummary).toHaveBeenCalledWith(
 					expect.objectContaining({ references: undefined }),
 					workspaceRoot,

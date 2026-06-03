@@ -3,10 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Hoisted mocks ──────────────────────────────────────────────────────────
 
-const { loadAllSessions, loadPlansRegistry, savePlansRegistry } = vi.hoisted(
+const { loadAllSessions, loadPlansRegistry, loadPlansRegistryWithStatus, savePlansRegistry } = vi.hoisted(
 	() => ({
 		loadAllSessions: vi.fn(),
 		loadPlansRegistry: vi.fn(),
+		loadPlansRegistryWithStatus: vi.fn(),
 		savePlansRegistry: vi.fn(),
 	}),
 );
@@ -65,7 +66,14 @@ const { mockExecFileSync } = vi.hoisted(() => ({
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadAllSessions,
 	loadPlansRegistry,
+	loadPlansRegistryWithStatus,
 	savePlansRegistry,
+	// Pure helper — provide the real implementation so removePlan's
+	// exact→base-guard resolution works under the mock.
+	splitArchivedKey: (k: string) => {
+		const m = k.match(/^(.+)-([0-9a-f]{8})$/);
+		return m ? { baseKey: m[1], oldShortHash: m[2] } : null;
+	},
 }));
 
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
@@ -204,6 +212,12 @@ function stubTranscript(lines: ReadonlyArray<string>) {
 describe("PlanService", () => {
 	beforeEach(() => {
 		loadPlansRegistry.mockReset();
+		// Default: delegate to loadPlansRegistry with changed=false. Tests that
+		// exercise the migration-writeback path override with mockResolvedValueOnce.
+		loadPlansRegistryWithStatus.mockImplementation(async (cwd: string) => ({
+			registry: await loadPlansRegistry(cwd),
+			changed: false,
+		}));
 		savePlansRegistry.mockReset();
 		loadAllSessions.mockReset();
 		loadAllSessions.mockResolvedValue([]);
@@ -318,6 +332,67 @@ describe("PlanService", () => {
 
 			expect(savePlansRegistry).not.toHaveBeenCalled();
 			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("resolves an archived slug to the bare-key guard when it still belongs to that commit", async () => {
+			// CommitSummary passes `<base>-<8hex>` + expectedCommitHash; the guard
+			// lives at the base key and its commitHash matches → delete the base.
+			const guard = makeEntry({ slug: "my-plan", commitHash: "abcdef1234567890", contentHashAtCommit: "h" });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "my-plan": guard } });
+
+			await removePlan("my-plan-abcdef12", CWD, "abcdef1234567890");
+
+			expect(savePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ plans: {} }), CWD);
+		});
+
+		it("does NOT delete the base row when it was revived/re-committed since (commitHash mismatch)", async () => {
+			// P1 regression: dissociating an OLD commit must not wipe a base row that
+			// is now a live active plan (commitHash=null) or re-committed elsewhere.
+			const revived = makeEntry({ slug: "my-plan", commitHash: null });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "my-plan": revived } });
+
+			await removePlan("my-plan-abcdef12", CWD, "abcdef1234567890");
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("deletes the exact key (not the stripped base) when it is this commit's guard", async () => {
+			// `foo-deadbeef` is this commit's guard; the exact key must win — never strip to `foo`.
+			const foo = makeEntry({ slug: "foo", commitHash: "abcdef1234567890" });
+			const realEntry = makeEntry({ slug: "foo-deadbeef", commitHash: "abcdef1234567890" });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { foo, "foo-deadbeef": realEntry } });
+
+			await removePlan("foo-deadbeef", CWD, "abcdef1234567890");
+
+			const saved = savePlansRegistry.mock.calls.at(-1)?.[0] as { plans: Record<string, unknown> };
+			expect(saved.plans["foo-deadbeef"]).toBeUndefined();
+			expect(saved.plans.foo).toBeDefined(); // base NOT mis-stripped
+		});
+
+		it("does NOT delete a live exact-key row (commitHash mismatch) when dissociating an old commit", async () => {
+			// P1-extended: an archived slug `foo-deadbeef` from an old summary can later
+			// become a LIVE plan created under that exact key (commitHash=null). The exact
+			// key matches, but the commitHash does not — dissociating the old commit must
+			// not wipe the live row. The sidebar (no expectedCommitHash) still deletes it.
+			const live = makeEntry({ slug: "foo-deadbeef", commitHash: null });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "foo-deadbeef": live } });
+
+			await removePlan("foo-deadbeef", CWD, "abcdef1234567890");
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("deletes the exact key unconditionally on the sidebar path (no expectedCommitHash)", async () => {
+			// A committed plan removed via the sidebar — no expectedCommitHash — is deleted
+			// regardless of its commitHash. The user explicitly asked to remove the live plan.
+			const committed = makeEntry({ slug: "test-plan", commitHash: "abcdef1234567890" });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "test-plan": committed } });
+
+			await removePlan("test-plan", CWD);
+
+			expect(savePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ plans: {} }), CWD);
 		});
 
 		it("still removes the entry when internal file deletion throws", async () => {
@@ -667,6 +742,37 @@ describe("PlanService", () => {
 	// ─── detectPlans ─────────────────────────────────────────────────────────
 
 	describe("detectPlans", () => {
+		it("persists the normalised registry when migration purged legacy rows/fields (changed=true)", async () => {
+			const entry = makeEntry();
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "test-plan": entry } });
+			// Simulate loadPlansRegistry having stripped a legacy field/row: changed=true
+			// even though there are no orphaned entries to clean.
+			loadPlansRegistryWithStatus.mockResolvedValueOnce({
+				registry: { version: 1, plans: { "test-plan": entry } },
+				changed: true,
+			});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan");
+			mockStatSync.mockReturnValue({ mtime: new Date("2025-06-01T00:00:00.000Z") });
+
+			await detectPlans(CWD);
+
+			// Deterministic writeback: the cleaned registry is flushed once.
+			expect(savePlansRegistry).toHaveBeenCalledTimes(1);
+		});
+
+		it("does not persist when nothing changed and no orphans (changed=false)", async () => {
+			const entry = makeEntry();
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "test-plan": entry } });
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan");
+			mockStatSync.mockReturnValue({ mtime: new Date("2025-06-01T00:00:00.000Z") });
+
+			await detectPlans(CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+
 		it("returns plans from registry merged with transcript discoveries", async () => {
 			const entry = makeEntry();
 			loadPlansRegistry.mockResolvedValue({
