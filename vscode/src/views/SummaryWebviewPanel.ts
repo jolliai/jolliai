@@ -47,7 +47,6 @@ import type {
 	StoredTranscript,
 } from "../../../cli/src/Types.js";
 import { CURRENT_SCHEMA_VERSION } from "../../../cli/src/Types.js";
-import { removeReference } from "../core/ReferenceService.js";
 import { removeNote, saveNote } from "../core/NoteService.js";
 import {
 	listAvailablePlans,
@@ -290,6 +289,7 @@ const REGENERATE_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set
 function isRegenerateSafeCommand(command: WebviewMessage["command"]): boolean {
 	return REGENERATE_SAFE_COMMANDS.has(command);
 }
+
 
 // Single source of truth for Create/Update PR body assembly. Branch-first
 // three-tier selection:
@@ -2523,10 +2523,12 @@ export class SummaryWebviewPanel {
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
-		// Hard-remove the archived plans.json row (the CommitSummary reference was
-		// already dropped above). No `ignored` tombstone — the plan can be
-		// re-discovered / re-associated later.
-		await removePlan(slug, this.workspaceRoot);
+		// Dissociate from THIS commit: removePlan resolves the archive base
+		// internally, but only deletes the base guard if it still belongs to this
+		// commit (`expectedCommitHash`) — so removing an old summary's reference
+		// never wipes a base row that has since been revived to a live plan or
+		// re-committed elsewhere. No `ignored` tombstone — re-associable later.
+		await removePlan(slug, this.workspaceRoot, summary.commitHash ?? undefined);
 
 		// Remove the visible <branchFolder>/plan--<slug>.md in dual-write/folder
 		// modes so the Memory Bank tree view stops showing a ghost file. Goes
@@ -2815,10 +2817,11 @@ export class SummaryWebviewPanel {
 		};
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
-		// Hard-remove the archived plans.json row (the CommitSummary reference was
-		// already dropped above). No `ignored` tombstone — the note can be
-		// re-associated later.
-		await removeNote(id, this.workspaceRoot);
+		// Dissociate from THIS commit: removeNote resolves the archive base but only
+		// deletes the base guard if it still belongs to this commit
+		// (`expectedCommitHash`), so removing an old summary's reference never wipes
+		// a since-revived/re-committed live note. No `ignored` tombstone.
+		await removeNote(id, this.workspaceRoot, summary.commitHash ?? undefined);
 
 		// Remove the visible <branchFolder>/note--<id>.md in dual-write/folder
 		// modes so the Memory Bank tree view stops showing a ghost file. Goes
@@ -3011,13 +3014,12 @@ export class SummaryWebviewPanel {
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 
-		// Hard-remove the archived snapshot row + its backing markdown, keyed by the
-		// archived map key. Intentionally single-key: only the archived snapshot
-		// (`<source>:<nativeId>-<shortHash>`) is removed, NOT the bare
-		// `<source>:<nativeId>` guard. With no `ignored` tombstone, a later
-		// re-reference of the same entity is re-discovered as a fresh uncommitted
-		// reference — removal deletes the current snapshot, it does not blacklist.
-		await removeReference(this.workspaceRoot, archivedKey);
+		// Dissociation is complete once the entry is dropped from the commit's
+		// CommitSummary.references (above). Under the commit-deletes-entry model
+		// (§13), a committed reference has no plans.json row and no local `.md`
+		// (both removed at association time), so there is nothing else to delete
+		// here. A later re-reference of the same entity is re-discovered as a
+		// fresh uncommitted reference — dissociation does not blacklist.
 
 		this.update(updatedSummary);
 	}

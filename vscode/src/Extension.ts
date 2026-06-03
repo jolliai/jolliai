@@ -1485,10 +1485,10 @@ export function activate(context: vscode.ExtensionContext): void {
 	);
 
 	// Shared resolver for the multi-source reference webview commands. The webview
-	// may dispatch a mapKey that was archived or ignored between render and
-	// click (bridge.listReferences applies the branch/ignored/archived filter),
-	// so each command re-reads the list before acting and surfaces a warning
-	// toast on miss instead of silently no-op'ing.
+	// may dispatch a mapKey that was removed between render and click — committed
+	// away (commit deletes the entry) or hard-removed — and bridge.listReferences
+	// returns only active references, so each command re-reads the list before
+	// acting and surfaces a warning toast on miss instead of silently no-op'ing.
 	const resolveReferenceForCommand = async (mapKey: string, cmdLabel: string) => {
 		const references = await bridge.listReferences();
 		const info = references.find((e) => e.mapKey === mapKey);

@@ -385,6 +385,45 @@ describe("StopHook — plan discovery", () => {
 		expect(savePlansRegistry).not.toHaveBeenCalled();
 	});
 
+	it("does not advance the merged cursor past a window the plan scan failed to process", async () => {
+		// P2 regression: if plan discovery throws (e.g. a transient FS error during
+		// guard revival) while reference discovery reaches EOF, the shared cursor
+		// must NOT jump to EOF — otherwise those lines are never re-scanned for
+		// plans. min(planLine=fromLine, refLine=EOF) = fromLine ⇒ no advance.
+		vi.mocked(existsSync).mockReturnValue(true);
+		vi.mocked(loadDiscoveryCursor).mockResolvedValue(null); // fromLine = 0
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/home/user/.claude/plans/p.md"}}',
+		]);
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {
+				p: {
+					slug: "p",
+					title: "P",
+					sourcePath: "/home/user/.claude/plans/p.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					commitHash: "abc12345",
+					contentHashAtCommit: "guard-hash",
+				},
+			},
+		});
+		// Guard revival reads the plan file to hash it — make that read throw so
+		// scanPlansFrom rejects. (The reference scan uses the mocked
+		// extractReferencesFromTranscript, which does no readFileSync.)
+		vi.mocked(readFileSync).mockImplementation((() => {
+			throw new Error("EBUSY: transient");
+		}) as unknown as typeof readFileSync);
+		// Reference scan succeeds and reaches EOF (line 5).
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({ references: [], lastLineNumberScanned: 5 });
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(saveDiscoveryCursor).not.toHaveBeenCalled();
+	});
+
 	it("should not update cursor when transcript has no new lines since last scan", async () => {
 		// Last scan was at line 5, transcript still only has 5 lines
 		vi.mocked(loadDiscoveryCursor).mockResolvedValue({

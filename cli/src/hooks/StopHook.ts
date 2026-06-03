@@ -142,9 +142,14 @@ export async function handleStopHook(): Promise<void> {
 /**
  * Single incremental discovery pass for one transcript. Plan + reference
  * scanning share ONE merged cursor in discovery-cursors.json (keyed by the bare
- * transcriptPath). Each scan swallows its own errors and the cursor advances to
- * the furthest line any scan reached, so a transient failure in one discovery
- * discards that window (no re-scan) without blocking the other.
+ * transcriptPath). Both scans read the same file to the same EOF, so the
+ * reference scan's `lastLineNumberScanned` is the authoritative cursor target.
+ *
+ * Each scan swallows its own errors. The cursor advances ONLY when the plan
+ * scan also completed — a throwing plan scan (e.g. a transient FS error during
+ * guard revival) holds the cursor at `fromLine` so its window is retried next
+ * time, instead of being skipped forever because the reference scan reached EOF.
+ * Re-scanning on retry is safe: both scans are idempotent.
  */
 async function discoverFromTranscript(sessionInfo: SessionInfo, cwd: string): Promise<void> {
 	const transcriptPath = sessionInfo.transcriptPath;
@@ -153,23 +158,25 @@ async function discoverFromTranscript(sessionInfo: SessionInfo, cwd: string): Pr
 	await migrateDiscoveryCursors(cwd); // idempotent fold of legacy plan:/linear: cursors
 	const fromLine = (await loadDiscoveryCursor(transcriptPath, cwd))?.lineNumber ?? 0;
 
-	let lastScanned = fromLine;
+	let planScanCompleted = false;
+	let referenceLine = fromLine;
 	try {
-		lastScanned = await scanPlansFrom(transcriptPath, fromLine, cwd);
+		await scanPlansFrom(transcriptPath, fromLine, cwd);
+		planScanCompleted = true;
 	} catch (error: unknown) {
 		log.error("Plan discovery failed: %s", (error as Error).message);
 	}
 	try {
-		// Both scans start from the same line and read to EOF, so the reference
-		// scan's return value is the authoritative furthest-scanned line.
-		lastScanned = await scanReferencesFrom(transcriptPath, fromLine, cwd);
+		referenceLine = await scanReferencesFrom(transcriptPath, fromLine, cwd);
 	} catch (error: unknown) {
 		log.error("Reference discovery failed: %s", (error as Error).message);
 	}
 
-	if (lastScanned > fromLine) {
+	// Hold the cursor if the plan scan threw: advancing past its window (the
+	// reference scan reaching EOF) would lose those lines for plan discovery.
+	if (planScanCompleted && referenceLine > fromLine) {
 		await saveDiscoveryCursor(
-			{ transcriptPath, lineNumber: lastScanned, updatedAt: new Date().toISOString() },
+			{ transcriptPath, lineNumber: referenceLine, updatedAt: new Date().toISOString() },
 			cwd,
 		);
 	}

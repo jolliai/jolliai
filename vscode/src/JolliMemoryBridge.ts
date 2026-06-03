@@ -2362,7 +2362,7 @@ export class JolliMemoryBridge {
 		return detectPlans(this.cwd);
 	}
 
-	/** Marks a plan as ignored in plans.json (hidden from PLANS panel). */
+	/** Hard-removes a plan from plans.json (and its internal backing file). */
 	async removePlan(slug: string): Promise<void> {
 		await removePlan(slug, this.cwd);
 	}

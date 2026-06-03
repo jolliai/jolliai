@@ -634,9 +634,64 @@ describe("QueueWorker", () => {
 				{ key: "priority", label: "Priority", value: "No priority", icon: "flame" },
 				{ key: "labels", label: "Labels", value: "JolliMemory, Feature", icon: "tag" },
 			]);
-			// The reference markdown is NOT physically renamed — the archivedKey
-			// lives only in the CommitSummary's ReferenceCommitRef (asserted above), while
-			// the guard row keeps the canonical references/<source>/<key>.md file in place.
+			// The archivedKey lives only in the CommitSummary's ReferenceCommitRef
+			// (asserted above) + the orphan-branch snapshot; under the
+			// commit-deletes-entry model the registry row + local markdown are torn
+			// down by finalizeReferenceArchive after storeReferences succeeds.
+		});
+
+		it("preserves local reference state when the orphan-branch write fails (write-ahead recovery)", async () => {
+			const op = makeCommitOp({ commitHash: "abc12345def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/li.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{ mapKey: "linear:PROJ-1528", source: "linear", sourcePath: "/ref.md" },
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: {
+					"linear:PROJ-1528": {
+						source: "linear",
+						nativeId: "PROJ-1528",
+						title: "t",
+						url: "u",
+						sourcePath: "/ref.md",
+						addedAt: "x",
+						updatedAt: "x",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockResolvedValue({
+				mapKey: "linear:PROJ-1528",
+				source: "linear",
+				nativeId: "PROJ-1528",
+				title: "t",
+				url: "u",
+				toolName: "mcp__linear__get_issue",
+				referencedAt: "2026-05-14T06:06:01.123Z",
+			});
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("file content");
+
+			// Orphan-branch write fails AFTER the snapshot was captured but BEFORE
+			// any local teardown — the whole point of the deferred-delete ordering.
+			const { storeReferences } = await import("../core/SummaryStore.js");
+			vi.mocked(storeReferences).mockRejectedValueOnce(new Error("orphan write failed"));
+
+			// Worker swallows the per-entry error (fire-and-forget) and completes.
+			await runWorker("/test/cwd");
+
+			// finalizeReferenceArchive never ran → local markdown NOT deleted, so the
+			// active row stays in plans.json and re-archives on the next commit.
+			const { deleteReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			expect(vi.mocked(deleteReferenceMarkdown)).not.toHaveBeenCalled();
 		});
 
 		it("skips entities whose source markdown is unreadable but still completes the pipeline", async () => {
@@ -901,6 +956,58 @@ describe("QueueWorker", () => {
 				},
 			});
 			expect(lastSave.references?.["linear:GHOST-1"]).toBeUndefined();
+		});
+	});
+
+	describe("finalizeReferenceArchive — fingerprint guard", () => {
+		const refRow = (updatedAt: string) => ({
+			source: "linear" as const,
+			nativeId: "PROJ-1",
+			title: "t",
+			url: "u",
+			sourcePath: "/ref.md",
+			addedAt: "x",
+			updatedAt,
+			sourceToolName: "mcp__linear__get_issue",
+		});
+
+		it("deletes the row + markdown when the fresh fingerprint matches the captured one", async () => {
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: { "linear:PROJ-1": refRow("2026-04-01T00:00:00Z") },
+			});
+			const { deleteReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+
+			await __test__.finalizeReferenceArchive(
+				[{ mapKey: "linear:PROJ-1", sourcePath: "/ref.md", updatedAt: "2026-04-01T00:00:00Z" }],
+				"/test/cwd",
+			);
+
+			const saved = vi.mocked(savePlansRegistry).mock.calls.at(-1)?.[0];
+			expect(saved?.references?.["linear:PROJ-1"]).toBeUndefined();
+			expect(vi.mocked(deleteReferenceMarkdown)).toHaveBeenCalledWith("/ref.md");
+		});
+
+		it("keeps the row + markdown when a StopHook re-upsert changed updatedAt (race)", async () => {
+			// Fresh registry shows a NEWER updatedAt → the ref was re-upserted between
+			// storeReferences and finalize. Deleting it would lose the re-reference.
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: { "linear:PROJ-1": refRow("2026-04-02T09:00:00Z") },
+			});
+			const { deleteReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+
+			await __test__.finalizeReferenceArchive(
+				[{ mapKey: "linear:PROJ-1", sourcePath: "/ref.md", updatedAt: "2026-04-01T00:00:00Z" }],
+				"/test/cwd",
+			);
+
+			// Nothing was deleted → no write at all (avoids a pointless lost-update
+			// window), and the markdown is left intact.
+			expect(vi.mocked(savePlansRegistry)).not.toHaveBeenCalled();
+			expect(vi.mocked(deleteReferenceMarkdown)).not.toHaveBeenCalled();
 		});
 	});
 

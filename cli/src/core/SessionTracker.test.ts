@@ -73,16 +73,20 @@ import {
 	loadConfig,
 	loadConfigFromDir,
 	loadCursorForTranscript,
+	loadDiscoveryCursor,
 	loadMostRecentSession,
 	loadPlanEntry,
 	loadPlansRegistry,
 	loadPluginSource,
 	loadSquashPending,
+	migrateDiscoveryCursors,
+	normalizePlansRegistry,
 	pruneStaleQueueEntries,
 	pruneStaleSessions,
 	saveConfig,
 	saveConfigScoped,
 	saveCursor,
+	saveDiscoveryCursor,
 	savePlansRegistry,
 	savePluginSource,
 	saveSession,
@@ -318,6 +322,77 @@ describe("SessionTracker", () => {
 			);
 
 			await expect(loadCursorForTranscript("/path/stale-plan.jsonl", tempDir)).resolves.toBeNull();
+		});
+	});
+
+	describe("discovery cursors (discovery-cursors.json)", () => {
+		it("round-trips a discovery cursor in a file separate from cursors.json", async () => {
+			await saveDiscoveryCursor(
+				{ transcriptPath: "/path/t.jsonl", lineNumber: 642, updatedAt: "2026-06-03T00:00:00Z" },
+				tempDir,
+			);
+
+			await expect(loadDiscoveryCursor("/path/t.jsonl", tempDir)).resolves.toEqual(
+				expect.objectContaining({ lineNumber: 642 }),
+			);
+			// Written to discovery-cursors.json, NOT cursors.json (QueueWorker main-line isolation).
+			expect(await loadCursorForTranscript("/path/t.jsonl", tempDir)).toBeNull();
+			const dcj = await readFile(join(tempDir, ".jolli", "jollimemory", "discovery-cursors.json"), "utf-8");
+			expect(JSON.parse(dcj).cursors["/path/t.jsonl"].lineNumber).toBe(642);
+		});
+
+		it("returns null for an unknown transcript path", async () => {
+			await expect(loadDiscoveryCursor("/nope.jsonl", tempDir)).resolves.toBeNull();
+		});
+
+		it("migrate folds plan:/linear: keys with min() and deletes the legacy keys", async () => {
+			// Same path discovered by both plan (line 100) and reference (line 60) scans.
+			await saveCursor({ transcriptPath: "plan:/path/x.jsonl", lineNumber: 100, updatedAt: "t" }, tempDir);
+			await saveCursor({ transcriptPath: "linear:/path/x.jsonl", lineNumber: 60, updatedAt: "t" }, tempDir);
+			// A bare summarization cursor (QueueWorker main line) must be left untouched.
+			await saveCursor({ transcriptPath: "/path/bare.jsonl", lineNumber: 7, updatedAt: "t" }, tempDir);
+
+			await migrateDiscoveryCursors(tempDir);
+
+			// Folded to min(100, 60) = 60 in discovery-cursors.json.
+			await expect(loadDiscoveryCursor("/path/x.jsonl", tempDir)).resolves.toEqual(
+				expect.objectContaining({ lineNumber: 60 }),
+			);
+			// Legacy prefixed keys removed from cursors.json; bare key preserved.
+			expect(await loadCursorForTranscript("plan:/path/x.jsonl", tempDir)).toBeNull();
+			expect(await loadCursorForTranscript("linear:/path/x.jsonl", tempDir)).toBeNull();
+			await expect(loadCursorForTranscript("/path/bare.jsonl", tempDir)).resolves.toEqual(
+				expect.objectContaining({ lineNumber: 7 }),
+			);
+		});
+
+		it("migrate folds against an existing discovery cursor with min() (never advances past prior progress)", async () => {
+			await saveDiscoveryCursor({ transcriptPath: "/path/y.jsonl", lineNumber: 50, updatedAt: "t" }, tempDir);
+			await saveCursor({ transcriptPath: "plan:/path/y.jsonl", lineNumber: 80, updatedAt: "t" }, tempDir);
+
+			await migrateDiscoveryCursors(tempDir);
+
+			await expect(loadDiscoveryCursor("/path/y.jsonl", tempDir)).resolves.toEqual(
+				expect.objectContaining({ lineNumber: 50 }),
+			);
+		});
+
+		it("migrate is an idempotent no-op once no prefixed keys remain", async () => {
+			await saveCursor({ transcriptPath: "plan:/path/z.jsonl", lineNumber: 30, updatedAt: "t" }, tempDir);
+			await migrateDiscoveryCursors(tempDir);
+			const first = await loadDiscoveryCursor("/path/z.jsonl", tempDir);
+
+			// Second run: cursors.json has no prefixed keys → early return, discovery unchanged.
+			await migrateDiscoveryCursors(tempDir);
+			const second = await loadDiscoveryCursor("/path/z.jsonl", tempDir);
+
+			expect(second).toEqual(first);
+			expect(second).toEqual(expect.objectContaining({ lineNumber: 30 }));
+		});
+
+		it("migrate is a no-op when there are no cursors at all", async () => {
+			await expect(migrateDiscoveryCursors(tempDir)).resolves.toBeUndefined();
+			expect(await loadDiscoveryCursor("/path/none.jsonl", tempDir)).toBeNull();
 		});
 	});
 
@@ -654,7 +729,6 @@ describe("SessionTracker", () => {
 						sourcePath: "plans/feature-auth.md",
 						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
-						branch: "main",
 						commitHash: null,
 					},
 				},
@@ -674,7 +748,6 @@ describe("SessionTracker", () => {
 						sourcePath: "plans/feature-auth.md",
 						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
-						branch: "main",
 						commitHash: null,
 					},
 				},
@@ -734,7 +807,6 @@ describe("SessionTracker", () => {
 						sourcePath: "plans/feature-auth.md",
 						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
-						branch: "main",
 						commitHash: null,
 					},
 				},
@@ -936,7 +1008,6 @@ describe("SessionTracker", () => {
 						sourcePath: "plans/feature-auth.md",
 						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
-						branch: "main",
 						commitHash: "abcdef1234567890",
 					},
 				},
@@ -1004,7 +1075,6 @@ describe("SessionTracker", () => {
 						format: "snippet" as const,
 						addedAt: "2026-03-01T10:00:00Z",
 						updatedAt: "2026-03-01T10:00:00Z",
-						branch: "feature/test",
 						commitHash: null,
 					},
 				},
@@ -2196,5 +2266,130 @@ describe("SessionTracker", () => {
 			if (after.version !== 1) return;
 			expect(after.notes?.["note-1"]).toBeDefined();
 		});
+	});
+});
+
+describe("normalizePlansRegistry", () => {
+	const plan = (over: Record<string, unknown>) => ({
+		slug: "s",
+		title: "T",
+		sourcePath: "/p/s.md",
+		addedAt: "t",
+		updatedAt: "t",
+		commitHash: null,
+		...over,
+	});
+	const ref = (over: Record<string, unknown>) => ({
+		source: "linear",
+		nativeId: "X-1",
+		title: "T",
+		url: "https://x/1",
+		sourcePath: "/r/x.md",
+		addedAt: "t",
+		updatedAt: "t",
+		sourceToolName: "mcp__linear__get_issue",
+		...over,
+	});
+
+	it("plans: drops ignored rows, strips ignored/branch/editCount, keeps guard", () => {
+		const raw = {
+			version: 1,
+			plans: {
+				active: plan({ slug: "active", branch: "main", editCount: 3 }),
+				guard: plan({
+					slug: "guard",
+					commitHash: "abc",
+					contentHashAtCommit: "h",
+					branch: "main",
+					editCount: 1,
+				}),
+				gone: plan({ slug: "gone", ignored: true }),
+			},
+		} as unknown as Partial<PlansRegistry>;
+
+		const { registry, changed } = normalizePlansRegistry(raw);
+
+		expect(changed).toBe(true);
+		expect(Object.keys(registry.plans).sort()).toEqual(["active", "guard"]);
+		expect(JSON.stringify(registry.plans)).not.toMatch(/editCount|"branch"|"ignored"/);
+		expect(registry.plans.guard?.commitHash).toBe("abc");
+		expect(registry.plans.guard?.contentHashAtCommit).toBe("h");
+	});
+
+	it("notes: drops ignored rows, strips ignored/branch, keeps guard", () => {
+		const raw = {
+			version: 1,
+			plans: {},
+			notes: {
+				keep: {
+					id: "keep",
+					title: "K",
+					format: "markdown",
+					addedAt: "t",
+					updatedAt: "t",
+					commitHash: null,
+					branch: "main",
+				},
+				drop: {
+					id: "drop",
+					title: "D",
+					format: "markdown",
+					addedAt: "t",
+					updatedAt: "t",
+					commitHash: null,
+					ignored: true,
+				},
+			},
+		} as unknown as Partial<PlansRegistry>;
+
+		const { registry, changed } = normalizePlansRegistry(raw);
+
+		expect(changed).toBe(true);
+		expect(Object.keys(registry.notes ?? {})).toEqual(["keep"]);
+		expect(JSON.stringify(registry.notes)).not.toMatch(/"branch"|"ignored"/);
+	});
+
+	it("references: drops ignored/committed/guard rows, keeps active rows, strips dead fields", () => {
+		const raw = {
+			version: 1,
+			plans: {},
+			references: {
+				"linear:ACTIVE-1": ref({ nativeId: "ACTIVE-1", branch: "main", ignored: false }),
+				// Active ticket whose id ends in 8 digits — must NOT be mistaken for a
+				// `-<8hex>` archive key and dropped (regression guard: digits ⊂ hex).
+				"linear:ENG-12345678": ref({ nativeId: "ENG-12345678" }),
+				"linear:COMMITTED-2": ref({ nativeId: "COMMITTED-2", commitHash: "abc12345" }),
+				"linear:GUARD-3": ref({ nativeId: "GUARD-3", contentHashAtCommit: "h" }),
+				"notion:IGNORED-5": ref({ source: "notion", nativeId: "IGNORED-5", ignored: true }),
+			},
+		} as unknown as Partial<PlansRegistry>;
+
+		const { registry, changed } = normalizePlansRegistry(raw);
+
+		expect(changed).toBe(true);
+		expect(Object.keys(registry.references ?? {}).sort()).toEqual(["linear:ACTIVE-1", "linear:ENG-12345678"]);
+		expect(JSON.stringify(registry.references)).not.toMatch(/"branch"|"ignored"|"commitHash"|contentHashAtCommit/);
+	});
+
+	it("is idempotent: an already-clean registry returns changed=false and equal data", () => {
+		const clean = {
+			version: 1 as const,
+			plans: { a: plan({ slug: "a" }) },
+			notes: {},
+			references: {},
+		} as unknown as PlansRegistry;
+
+		const { registry, changed } = normalizePlansRegistry(clean);
+
+		expect(changed).toBe(false);
+		expect(registry).toEqual(clean);
+	});
+
+	it("missing notes/references sections stay absent (no-op)", () => {
+		const { registry, changed } = normalizePlansRegistry({ version: 1, plans: {} });
+		expect(changed).toBe(false);
+		expect(registry).toEqual({ version: 1, plans: {} });
+		expect(registry.notes).toBeUndefined();
+		expect(registry.references).toBeUndefined();
 	});
 });

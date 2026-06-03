@@ -25,6 +25,7 @@ import { readFileSync } from "node:fs";
 import * as vscode from "vscode";
 import {
 	loadPlansRegistry,
+	loadPlansRegistryWithStatus,
 	savePlansRegistry,
 } from "../../../cli/src/core/SessionTracker.js";
 import { deleteReferenceMarkdown } from "../../../cli/src/core/references/ReferenceStore.js";
@@ -49,7 +50,13 @@ export async function detectReferences(
 	cwd: string,
 	sourceFilter?: SourceId,
 ): Promise<ReadonlyArray<ReferenceInfo>> {
-	const registry = await loadPlansRegistry(cwd);
+	// `changed` is true when loadPlansRegistry purged any legacy row/field;
+	// persist the normalised registry once so plans.json is cleaned on first
+	// panel refresh after upgrade (deterministic-writeback migration).
+	const { registry, changed } = await loadPlansRegistryWithStatus(cwd);
+	if (changed) {
+		await savePlansRegistry(registry, cwd);
+	}
 	const references = { ...(registry.references ?? {}) };
 	const result: ReferenceInfo[] = [];
 

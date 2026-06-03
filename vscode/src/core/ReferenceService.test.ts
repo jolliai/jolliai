@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
 	mockLoadPlansRegistry,
+	mockLoadPlansRegistryWithStatus,
 	mockSavePlansRegistry,
 	mockGetCurrentBranch,
 	mockReadFileSync,
@@ -11,6 +12,7 @@ const {
 	mockDeleteReferenceMarkdown,
 } = vi.hoisted(() => ({
 	mockLoadPlansRegistry: vi.fn(),
+	mockLoadPlansRegistryWithStatus: vi.fn(),
 	mockSavePlansRegistry: vi.fn(),
 	mockGetCurrentBranch: vi.fn(),
 	mockReadFileSync: vi.fn(),
@@ -22,6 +24,7 @@ const {
 
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadPlansRegistry: mockLoadPlansRegistry,
+	loadPlansRegistryWithStatus: mockLoadPlansRegistryWithStatus,
 	savePlansRegistry: mockSavePlansRegistry,
 }));
 
@@ -105,6 +108,12 @@ beforeEach(() => {
 	mockReadFileSync.mockImplementation(() => {
 		throw new Error("ENOENT");
 	});
+	// Default: delegate to loadPlansRegistry with changed=false. The migration
+	// writeback test overrides with mockResolvedValueOnce.
+	mockLoadPlansRegistryWithStatus.mockImplementation(async (cwd: string) => ({
+		registry: await mockLoadPlansRegistry(cwd),
+		changed: false,
+	}));
 });
 
 describe("detectReferences", () => {
@@ -122,6 +131,25 @@ describe("detectReferences", () => {
 
 		expect(result).toHaveLength(2);
 		expect(result.map((r) => r.source).sort()).toEqual(["jira", "linear"]);
+	});
+
+	it("persists the normalised registry once when migration purged legacy rows/fields (changed=true)", async () => {
+		mockLoadPlansRegistryWithStatus.mockResolvedValueOnce({
+			registry: { version: 1, plans: {}, references: {} },
+			changed: true,
+		});
+
+		await detectReferences("/repo");
+
+		expect(mockSavePlansRegistry).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not persist when nothing changed (changed=false)", async () => {
+		mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {}, references: {} });
+
+		await detectReferences("/repo");
+
+		expect(mockSavePlansRegistry).not.toHaveBeenCalled();
 	});
 
 	it("filters by sourceFilter when provided", async () => {

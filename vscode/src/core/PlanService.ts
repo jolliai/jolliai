@@ -5,10 +5,10 @@
  * - Discovery: Plans are discovered by the StopHook (in jollimemory) which
  *   incrementally scans transcripts and writes to plans.json. This service
  *   only reads plans.json — no transcript scanning happens here.
- * - Registry: plans.json CRUD (load, save, ignore, add)
+ * - Registry: plans.json CRUD (load, save, hard-remove, add)
  * - Resolution: Resolving editable file paths for committed/uncommitted plans
  * - Listing: Available plans for QuickPick selection
- * - Filtering: Branch-aware visibility, archive guards, ignored entries
+ * - Filtering: archive guards (content-hash) + committed-snapshot/orphan rows
  */
 
 import { createHash } from "node:crypto";
@@ -26,7 +26,9 @@ import { isPathInside } from "../../../cli/src/core/PathUtils.js";
 import {
 	loadAllSessions,
 	loadPlansRegistry,
+	loadPlansRegistryWithStatus,
 	savePlansRegistry,
+	splitArchivedKey,
 } from "../../../cli/src/core/SessionTracker.js";
 import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
 import { storePlans } from "../../../cli/src/core/SummaryStore.js";
@@ -56,7 +58,11 @@ export function getPlansDir(): string {
  * one-shot convergence: a subsequent call with no orphans performs no writes.
  */
 export async function detectPlans(cwd: string): Promise<Array<PlanInfo>> {
-	const registry = await loadPlansRegistry(cwd);
+	// `changed` is true when loadPlansRegistry purged any legacy row/field
+	// (one-shot schema migration); persisting it here deterministically cleans
+	// plans.json on the first panel refresh after upgrade. `registry` is already
+	// normalised, so this save also persists cleaned notes/references.
+	const { registry, changed } = await loadPlansRegistryWithStatus(cwd);
 	const registryPlans = { ...registry.plans };
 
 	// Clean up orphaned entries (source file deleted, uncommitted, not a guard)
@@ -71,7 +77,7 @@ export async function detectPlans(cwd: string): Promise<Array<PlanInfo>> {
 			cleaned = true;
 		}
 	}
-	if (cleaned) {
+	if (cleaned || changed) {
 		await savePlansRegistry({ ...registry, plans: registryPlans }, cwd);
 	}
 
@@ -161,10 +167,41 @@ function toPlanInfo(entry: PlanEntry): PlanInfo | null {
  *
  * Idempotent: an unknown slug is a no-op. Allows revival — no `ignored`
  * tombstone is left, so re-adding the same plan file re-registers it.
+ *
+ * `expectedCommitHash` (passed by the commit-summary dissociate flow) gates EVERY
+ * delete — both the exact-key match and the archive-base fallback — on the row
+ * still belonging to that commit (`row.commitHash === expectedCommitHash`). A
+ * registry row is a single time-evolving slot: an archived slug like
+ * `plan-x-abcdef12` from an old summary can later become a LIVE plan created
+ * under that very key (commitHash=null), or the base can be revived/re-committed
+ * elsewhere. Gating on commitHash means dissociating an OLD commit never wipes a
+ * row that has moved on. Sidebar removal (no `expectedCommitHash`) deletes the
+ * exact key unconditionally — that's the user explicitly removing the live plan.
  */
-export async function removePlan(slug: string, cwd: string): Promise<void> {
+export async function removePlan(slug: string, cwd: string, expectedCommitHash?: string): Promise<void> {
 	const registry = await loadPlansRegistry(cwd);
-	const entry = registry.plans[slug];
+	// Resolve the registry key to delete.
+	let key: string | undefined;
+	if (expectedCommitHash === undefined) {
+		// Sidebar / cleanup path: exact key only, delete whatever lives there.
+		key = registry.plans[slug] !== undefined ? slug : undefined;
+	} else {
+		// Commit-dissociate path: only delete a row still owned by THIS commit.
+		// Exact key first; then the archive base (`<base>-<8hex>` → `<base>`),
+		// which handles squash/rebase where the summary slug keeps the old hash.
+		if (registry.plans[slug]?.commitHash === expectedCommitHash) {
+			key = slug;
+		} else {
+			const split = splitArchivedKey(slug);
+			if (split && registry.plans[split.baseKey]?.commitHash === expectedCommitHash) {
+				key = split.baseKey;
+			}
+		}
+	}
+	if (key === undefined) {
+		return;
+	}
+	const entry = registry.plans[key];
 	if (!entry) {
 		return;
 	}
@@ -181,13 +218,13 @@ export async function removePlan(slug: string, cwd: string): Promise<void> {
 		}
 	}
 	const plans = { ...registry.plans };
-	delete plans[slug];
+	delete plans[key];
 	await savePlansRegistry({ ...registry, plans }, cwd);
 }
 
 /**
  * Adds a plan from ~/.claude/plans/ to the registry as an uncommitted entry.
- * Clears the `ignored` flag if previously set.
+ * Resets any prior committed/guard state so the plan becomes editable again.
  */
 export async function addPlanToRegistry(
 	slug: string,
@@ -202,7 +239,7 @@ export async function addPlanToRegistry(
 	const existing = registry.plans[slug];
 	const now = new Date().toISOString();
 
-	// Always reset to a fresh uncommitted entry — clears ignored, contentHashAtCommit,
+	// Always reset to a fresh uncommitted entry — clears contentHashAtCommit
 	// and commitHash so the plan becomes visible and editable again.
 	const entry: PlanEntry = {
 		slug,
@@ -225,9 +262,8 @@ export async function addPlanToRegistry(
 /**
  * Registers a plan slug into plans.json iff it isn't already tracked.
  *
- * - If the slug exists (even as an ignored entry), this is a no-op — the
- *   user's explicit Ignore state is preserved. Recreating the same filename
- *   does not resurrect a previously-ignored plan.
+ * - If the slug is already tracked, this is a no-op (it preserves the existing
+ *   entry's committed/guard state rather than resetting it).
  * - Otherwise delegates to `addPlanToRegistry()` to create a fresh
  *   uncommitted entry.
  *
@@ -420,8 +456,7 @@ export async function archivePlanForCommit(
 }
 
 /**
- * Lists unassociated plans from plans.json for WebView QuickPick.
- * Includes ignored plans (so users can restore them via Associate).
+ * Lists unassociated (uncommitted) plans from plans.json for WebView QuickPick.
  */
 export async function listUnassociatedPlans(
 	cwd: string,

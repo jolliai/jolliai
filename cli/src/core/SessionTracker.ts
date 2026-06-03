@@ -787,23 +787,133 @@ async function atomicWrite(filePath: string, content: string): Promise<void> {
 
 // ─── Plans Registry ───────────────────────────────────────────────────────────
 
+/** Legacy fields removed from PlanEntry (`editCount` is plan-only) and NoteEntry. */
+const LEGACY_PLAN_FIELDS = ["ignored", "branch", "editCount"] as const;
+const LEGACY_NOTE_FIELDS = ["ignored", "branch"] as const;
+/** Reference rows are now always active/uncommitted — these all became dead fields. */
+const LEGACY_REFERENCE_FIELDS = ["ignored", "branch", "commitHash", "contentHashAtCommit"] as const;
+
+/** Deletes `fields` from a shallow copy of `entry`; returns the copy + whether anything was dropped. */
+function stripLegacyFields<T>(entry: T, fields: ReadonlyArray<string>): { value: T; changed: boolean } {
+	const out = { ...(entry as unknown as Record<string, unknown>) };
+	let changed = false;
+	for (const f of fields) {
+		if (f in out) {
+			delete out[f];
+			changed = true;
+		}
+	}
+	return { value: out as T, changed };
+}
+
 /**
- * Loads the plans registry from plans.json.
+ * One-shot, in-memory migration of a parsed plans.json into the current schema
+ * (see docs/2026-06-01-discovery-cursor-split-and-editcount-removal.md §14).
  *
- * Returns an empty registry (`{ version: 1, plans: {} }`) if the file doesn't
- * exist or contains invalid JSON. Normalises missing required fields so
- * downstream `registry.plans[...]` reads never throw on a hand-edited file.
+ * Pure + idempotent — clean input returns `changed: false`. Per type:
+ *   - plans / notes: drop rows with `ignored === true`; strip dead fields
+ *     (`ignored` / `branch` / `editCount`); keep the `commitHash` +
+ *     `contentHashAtCommit` guard.
+ *   - references: also drop committed / guard rows — detected ONLY by the
+ *     `commitHash` / `contentHashAtCommit` fields, deliberately NOT by a
+ *     `-<8hex>` key shape (an active ticket id can legitimately end in 8 digits;
+ *     see the predicate below) — a reference row is now always
+ *     active/uncommitted — and strip the four now-dead fields from survivors.
+ *
+ * `JSON.parse` keeps unknown keys and `savePlansRegistry` re-serialises the
+ * whole object, so legacy fields/rows do NOT disappear on their own; this is
+ * the single place that purges them.
  */
-export async function loadPlansRegistry(cwd?: string): Promise<PlansRegistry> {
+export function normalizePlansRegistry(raw: Partial<PlansRegistry>): { registry: PlansRegistry; changed: boolean } {
+	let changed = false;
+
+	const plans: Record<string, PlanEntry> = {};
+	for (const [slug, entry] of Object.entries(raw.plans ?? {})) {
+		if ((entry as unknown as Record<string, unknown>).ignored === true) {
+			changed = true;
+			continue;
+		}
+		const stripped = stripLegacyFields(entry, LEGACY_PLAN_FIELDS);
+		if (stripped.changed) changed = true;
+		plans[slug] = stripped.value;
+	}
+
+	let notes: Record<string, NoteEntry> | undefined;
+	if (raw.notes !== undefined) {
+		notes = {};
+		for (const [id, entry] of Object.entries(raw.notes)) {
+			if ((entry as unknown as Record<string, unknown>).ignored === true) {
+				changed = true;
+				continue;
+			}
+			const stripped = stripLegacyFields(entry, LEGACY_NOTE_FIELDS);
+			if (stripped.changed) changed = true;
+			notes[id] = stripped.value;
+		}
+	}
+
+	let references: Record<string, ReferenceEntry> | undefined;
+	if (raw.references !== undefined) {
+		references = {};
+		for (const [key, entry] of Object.entries(raw.references)) {
+			// A legacy committed/archived reference row always carries `commitHash`
+			// (and usually `contentHashAtCommit`); these field checks catch them all.
+			// We deliberately do NOT match on a `-<8hex>` key shape: an active ticket
+			// id can legitimately end in `-<8 digits>` (e.g. linear:ENG-12345678), and
+			// digits ⊂ hex, so a key-shape heuristic would silently drop a live row.
+			const e = entry as unknown as Record<string, unknown>;
+			if (e.ignored === true || e.commitHash != null || e.contentHashAtCommit !== undefined) {
+				changed = true;
+				continue;
+			}
+			const stripped = stripLegacyFields(entry, LEGACY_REFERENCE_FIELDS);
+			if (stripped.changed) changed = true;
+			references[key] = stripped.value;
+		}
+	}
+
+	const registry: PlansRegistry = {
+		version: 1,
+		plans,
+		...(notes !== undefined ? { notes } : {}),
+		...(references !== undefined ? { references } : {}),
+	};
+	return { registry, changed };
+}
+
+/**
+ * Loads the plans registry from plans.json together with a `changed` flag
+ * indicating whether {@link normalizePlansRegistry} purged any legacy row/field.
+ * Callers that want to persist the cleaned shape (the deterministic-writeback
+ * path) use `changed`; {@link loadPlansRegistry} discards it.
+ *
+ * Returns an empty registry (`{ version: 1, plans: {} }`, `changed: false`) if
+ * the file is missing or contains invalid JSON.
+ */
+export async function loadPlansRegistryWithStatus(
+	cwd?: string,
+): Promise<{ registry: PlansRegistry; changed: boolean }> {
 	const dir = getJolliMemoryDir(cwd);
 	const filePath = join(dir, PLANS_FILE);
 	try {
 		const content = await readFile(filePath, "utf-8");
 		const parsed = JSON.parse(content) as Partial<PlansRegistry>;
-		return { ...parsed, version: 1, plans: parsed.plans ?? {} };
+		return normalizePlansRegistry(parsed);
 	} catch {
-		return { version: 1, plans: {} };
+		return { registry: { version: 1, plans: {} }, changed: false };
 	}
+}
+
+/**
+ * Loads the plans registry from plans.json, normalised to the current schema.
+ *
+ * Returns an empty registry (`{ version: 1, plans: {} }`) if the file doesn't
+ * exist or contains invalid JSON. Legacy rows/fields are purged in-memory via
+ * {@link normalizePlansRegistry} so every reader sees clean data even before
+ * the file is physically rewritten.
+ */
+export async function loadPlansRegistry(cwd?: string): Promise<PlansRegistry> {
+	return (await loadPlansRegistryWithStatus(cwd)).registry;
 }
 
 /**
@@ -823,7 +933,7 @@ export async function savePlansRegistry(registry: PlansRegistry, cwd?: string): 
  * single inflection point that distinguishes "first-time association" from
  * "squash/rebase re-anchoring of an existing archive".
  */
-function splitArchivedKey(archivedKey: string): { baseKey: string; oldShortHash: string } | null {
+export function splitArchivedKey(archivedKey: string): { baseKey: string; oldShortHash: string } | null {
 	const match = archivedKey.match(/^(.+)-([0-9a-f]{8})$/);
 	if (!match) return null;
 	return { baseKey: match[1] as string, oldShortHash: match[2] as string };

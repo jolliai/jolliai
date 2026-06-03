@@ -2,10 +2,10 @@
  * NoteService
  *
  * Central service for note management operations (parallel to PlanService):
- * - CRUD: create, read, update, ignore notes in plans.json registry
+ * - CRUD: create, read, update, hard-remove notes in plans.json registry
  * - Storage: all notes (snippet + markdown) are file-backed in .jolli/jollimemory/notes/
  * - Archive: associate notes with commits via orphan branch storage
- * - Filtering: branch-aware visibility, archive guards, ignored entries
+ * - Filtering: archive guards (content-hash) + committed-snapshot/orphan rows
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -21,7 +21,9 @@ import { basename, join } from "node:path";
 import { isPathInside } from "../../../cli/src/core/PathUtils.js";
 import {
 	loadPlansRegistry,
+	loadPlansRegistryWithStatus,
 	savePlansRegistry,
+	splitArchivedKey,
 } from "../../../cli/src/core/SessionTracker.js";
 import type { StorageProvider } from "../../../cli/src/core/StorageProvider.js";
 import { storeNotes } from "../../../cli/src/core/SummaryStore.js";
@@ -41,7 +43,13 @@ export function getNotesDir(cwd: string): string {
  * Reads plans.json and returns a filtered, sorted list of NoteInfo.
  */
 export async function detectNotes(cwd: string): Promise<Array<NoteInfo>> {
-	const registry = await loadPlansRegistry(cwd);
+	// `changed` is true when loadPlansRegistry purged any legacy row/field;
+	// persist the normalised registry once so plans.json is cleaned on first
+	// panel refresh after upgrade (deterministic-writeback migration).
+	const { registry, changed } = await loadPlansRegistryWithStatus(cwd);
+	if (changed) {
+		await savePlansRegistry(registry, cwd);
+	}
 	const notes = registry.notes ?? {};
 
 	const result: Array<NoteInfo> = [];
@@ -138,10 +146,32 @@ export async function saveNote(
  * Idempotent: an unknown id is a no-op. Committed notes whose snippet file was
  * already cleaned up by `archiveNoteForCommit` simply skip the file delete.
  */
-export async function removeNote(id: string, cwd: string): Promise<void> {
+export async function removeNote(id: string, cwd: string, expectedCommitHash?: string): Promise<void> {
 	const registry = await loadPlansRegistry(cwd);
 	const notes = { ...(registry.notes ?? {}) };
-	const entry = notes[id];
+	// Resolve the key to delete. When `expectedCommitHash` is set (commit-summary
+	// dissociate flow), EVERY delete — exact id and archive base alike — is gated
+	// on the row still belonging to that commit (`row.commitHash === expectedCommitHash`).
+	// A registry row is a single time-evolving slot: an archived id like
+	// `note-x-abcdef12` from an old summary can later become a LIVE note under that
+	// exact id, or the base can be revived/re-committed. The gate stops a dissociation
+	// from an OLD commit from wiping a row that has moved on. Sidebar removal (no
+	// `expectedCommitHash`) deletes the exact id unconditionally.
+	let key: string | undefined;
+	if (expectedCommitHash === undefined) {
+		key = notes[id] !== undefined ? id : undefined;
+	} else if (notes[id]?.commitHash === expectedCommitHash) {
+		key = id;
+	} else {
+		const split = splitArchivedKey(id);
+		if (split && notes[split.baseKey]?.commitHash === expectedCommitHash) {
+			key = split.baseKey;
+		}
+	}
+	if (key === undefined) {
+		return;
+	}
+	const entry = notes[key];
 	if (!entry) {
 		return;
 	}
@@ -161,9 +191,9 @@ export async function removeNote(id: string, cwd: string): Promise<void> {
 		}
 	}
 
-	delete notes[id];
+	delete notes[key];
 	await savePlansRegistry({ ...registry, notes }, cwd);
-	log.info("notes", `Removed note ${id} from registry`);
+	log.info("notes", `Removed note ${key} from registry`);
 }
 
 // ─── Commit association ─────────────────────────────────────────────────────
