@@ -5,8 +5,8 @@
  * A plugin is an npm package that declares a stable, opaque random string in
  * its `package.json` under `jolliPluginId`. The loader scans well-known scope
  * directories ({@link PLUGIN_SCOPES}) inside each `node_modules` root and only
- * loads packages whose declared ID is in {@link KNOWN_PLUGIN_IDS}. Package
- * names are intentionally **not** used for gating — names can change as the
+ * loads packages whose declared ID is in the {@link KnownPlugins} registry.
+ * Package names are intentionally **not** used for gating — names can change as the
  * plugin ecosystem evolves, and binding the host CLI to a specific name would
  * also leak that name (and any commercial-product hint it carries) into the
  * open-source codebase.
@@ -45,27 +45,11 @@ import { satisfies } from "semver";
 import type { PluginContext, PluginRegister } from "./Api.js";
 import { setHelpGroup } from "./commands/HelpGroups.js";
 import { getGlobalConfigDir } from "./core/SessionTracker.js";
-import { KNOWN_PLUGINS } from "./KnownPlugins.js";
+import { KNOWN_PLUGINS, type KnownPlugin } from "./KnownPlugins.js";
 import { createLogger } from "./Logger.js";
-import { execFileAsyncHidden } from "./util/Subprocess.js";
+import { runNpmCommand } from "./util/Subprocess.js";
 
 const log = createLogger("PluginLoader");
-
-/**
- * Allow-list of plugin IDs derived from the registry in {@link KnownPlugins}.
- *
- * Each entry is an opaque random string that the matching plugin embeds in
- * its own `package.json` as `jolliPluginId`. IDs are stable for the lifetime
- * of a plugin: a plugin author can rename, re-scope, or re-publish their
- * package without touching this list.
- *
- * IDs are not secrets — they are bundled in the plugin's package.json and
- * visible to anyone who installs it. The security boundary is still the scope
- * restriction in {@link PLUGIN_SCOPES} plus npm's own ownership controls on
- * the scopes we trust. Random IDs just make the allow-list flexible across
- * package renames.
- */
-const KNOWN_PLUGIN_IDS: ReadonlyArray<string> = KNOWN_PLUGINS.map((p) => p.id);
 
 /**
  * Scope directories the loader scans under each `node_modules` root. Bounding
@@ -94,7 +78,10 @@ const NPM_ROOT_TIMEOUT_MS = 5000;
 export interface LoadPluginsOptions {
 	/** Replace the discovered roots with these. Used by tests to point at fixtures. */
 	rootsOverride?: ReadonlyArray<string>;
-	/** Replace the {@link KNOWN_PLUGIN_IDS} allow-list. Used by tests with fake IDs. */
+	/**
+	 * Replace the default allow-list (the IDs from {@link KnownPlugins}). Used by
+	 * tests with fake IDs. When unset it is derived from {@link knownPluginsOverride}.
+	 */
 	allowlistOverride?: ReadonlyArray<string>;
 	/** Replace the {@link PLUGIN_SCOPES} scan set. Used by tests that fixture under a different scope. */
 	scopesOverride?: ReadonlyArray<string>;
@@ -107,6 +94,12 @@ export interface LoadPluginsOptions {
 	 * loader uses `os.homedir()`.
 	 */
 	homedirOverride?: string;
+	/**
+	 * Replace the {@link KNOWN_PLUGINS} registry. Defaults to the production
+	 * list. When set without {@link allowlistOverride}, the allow-list is derived
+	 * from it so discovery and the diagnostic snapshot stay in lockstep.
+	 */
+	knownPluginsOverride?: ReadonlyArray<KnownPlugin>;
 }
 
 /**
@@ -140,21 +133,62 @@ export interface NpmRootGlobalOptions {
  * to do nothing still gets the stub registration through the second call —
  * the stubs are part of `jolli --help`'s output contract, not a side-effect
  * of plugin discovery.
+ *
+ * Returns both the loaded-ID set **and** a {@link PluginDiagnostic} snapshot of
+ * every known plugin, computed from the one discovery walk this function
+ * already performs. The hot path (`checkVersionMismatch`) consumes the
+ * diagnostics directly instead of calling {@link inspectPlugins} again, so a
+ * single `jolli` invocation discovers plugins exactly once.
  */
+export interface LoadPluginsResult {
+	/** Plugin IDs that registered successfully — pass to {@link registerMissingStubs}. */
+	loaded: ReadonlySet<string>;
+	/** Three-state diagnostic for every {@link KnownPlugin}, in registry order. */
+	diagnostics: PluginDiagnostic[];
+}
+
+/** Outcome of the shared discovery walk consumed by {@link loadPlugins} and {@link inspectPlugins}. */
+interface DiscoveryResult {
+	/** The known-plugin registry in effect (override or {@link KNOWN_PLUGINS}). */
+	known: ReadonlyArray<KnownPlugin>;
+	/** Allow-listed plugins found on disk. Empty when discovery was skipped. */
+	found: ReadonlyArray<FoundPlugin>;
+	/** True when `JOLLI_NO_PLUGINS=1` short-circuited the walk (nothing is loadable). */
+	skipped: boolean;
+}
+
+/**
+ * Resolve the known registry, honor the `JOLLI_NO_PLUGINS` kill-switch, then run
+ * the discovery walk (allow-list / scopes / roots → {@link discoverPlugins}).
+ *
+ * The single source of truth for "which plugins exist", shared verbatim by
+ * {@link loadPlugins} (the load gate) and {@link inspectPlugins} (the diagnostic
+ * view) so a change to discovery defaults (a new scope, kill-switch, or roots
+ * tweak) can never land in one path but not the other — the divergence the
+ * diagnostic view is meant to be immune to.
+ */
+async function discoverKnownPlugins(opts?: LoadPluginsOptions): Promise<DiscoveryResult> {
+	const known = opts?.knownPluginsOverride ?? KNOWN_PLUGINS;
+	if (process.env.JOLLI_NO_PLUGINS === "1") {
+		return { known, found: [], skipped: true };
+	}
+	const allowlist = opts?.allowlistOverride ?? known.map((p) => p.id);
+	const scopes = opts?.scopesOverride ?? PLUGIN_SCOPES;
+	const roots = await resolveRoots(opts);
+	const found = await discoverPlugins(roots, scopes, allowlist);
+	return { known, found, skipped: false };
+}
+
 export async function loadPlugins(
 	program: Command,
 	cliVersion: string,
 	opts?: LoadPluginsOptions,
-): Promise<ReadonlySet<string>> {
-	if (process.env.JOLLI_NO_PLUGINS === "1") {
+): Promise<LoadPluginsResult> {
+	const { known, found, skipped } = await discoverKnownPlugins(opts);
+	if (skipped) {
 		log.debug("JOLLI_NO_PLUGINS=1 — skipping plugin discovery");
-		return new Set();
+		return { loaded: new Set(), diagnostics: allAbsentDiagnostics(known) };
 	}
-
-	const allowlist = opts?.allowlistOverride ?? KNOWN_PLUGIN_IDS;
-	const scopes = opts?.scopesOverride ?? PLUGIN_SCOPES;
-	const roots = await resolveRoots(opts);
-	const found = await discoverPlugins(roots, scopes, allowlist);
 
 	const loaded = new Set<string>();
 	for (const plugin of found) {
@@ -163,7 +197,7 @@ export async function loadPlugins(
 		}
 	}
 
-	return loaded;
+	return { loaded, diagnostics: diagnoseFound(found, known, cliVersion) };
 }
 
 /**
@@ -189,6 +223,130 @@ export function registerMissingStubs(program: Command, loadedPluginIds: Readonly
 }
 
 /**
+ * Whether the host CLI version satisfies a plugin's declared peer range.
+ *
+ * A plugin with no `peerDependencies["@jolli.ai/cli"]` declaration is always
+ * compatible. Otherwise the npm `semver` range grammar applies, with
+ * `includePrerelease` so a host running a prerelease build (e.g. `1.1.0-rc.1`)
+ * is not spuriously rejected by a `^1.1.0` range. An unparseable host version
+ * (`dev`/`unknown`/corrupt) fails the range and is treated as incompatible —
+ * a conservative default: we don't load a peer-constrained plugin against a
+ * host whose version we can't verify.
+ *
+ * Single source of truth shared by {@link loadOnePlugin} (the load gate) and
+ * {@link inspectPlugins} (the diagnostic view) so the two can never disagree on
+ * whether a given plugin is loadable.
+ */
+function isPeerCompatible(cliVersion: string, peerRange: string | undefined): boolean {
+	return !peerRange || satisfies(cliVersion, peerRange, { includePrerelease: true });
+}
+
+/**
+ * Three-state condition of a known plugin, as reported by {@link inspectPlugins}.
+ *
+ * - `ok` — discovered on disk **and** peer-compatible. This is NOT a guarantee
+ *   the plugin's code loaded: a broken `main`, a failed import, or a throwing
+ *   `register()` is still `ok` here because discovery + the peer check both
+ *   pass; the loader rejects such a plugin separately (and warns) at load time.
+ *   These diagnostics are a no-load probe — callers must not present `ok` as
+ *   "working".
+ * - `incompatible` — discovered but the declared peer range excludes this CLI.
+ * - `absent` — not discovered (or discovery was skipped via `JOLLI_NO_PLUGINS`).
+ */
+export type PluginState = "absent" | "incompatible" | "ok";
+
+/**
+ * Diagnostic view of one {@link KnownPlugin}: installed-and-compatible,
+ * installed-but-incompatible, or absent. Carries the data callers (doctor,
+ * update-check) need to render a row and an explicit upgrade exit —
+ * deliberately replacing the old "incompatible → warn → skip" dead signal.
+ * See {@link PluginState} for the `ok`-≠-loaded caveat.
+ */
+export interface PluginDiagnostic {
+	/** The plugin's stable `jolliPluginId`. */
+	id: string;
+	/** npm package name, for display and the install/upgrade hint. */
+	packageName: string;
+	/** Shell command to install/add the plugin (from {@link KnownPlugin}). */
+	installHint: string;
+	state: PluginState;
+	/** Version from the installed plugin's `package.json`. Undefined when absent or unreadable. */
+	installedVersion?: string;
+	/** Declared `peerDependencies["@jolli.ai/cli"]` range, if any. Undefined when absent or unconstrained. */
+	peerRange?: string;
+}
+
+/**
+ * Options for {@link inspectPlugins}. All overrides are test-injection points.
+ * Identical to {@link LoadPluginsOptions} (which now carries
+ * `knownPluginsOverride`); kept as a named alias for call-site readability.
+ */
+export type InspectPluginsOptions = LoadPluginsOptions;
+
+/** Diagnostic snapshot reporting every known plugin as `absent` (in registry order). */
+function allAbsentDiagnostics(known: ReadonlyArray<KnownPlugin>): PluginDiagnostic[] {
+	return known.map((kp) => ({
+		id: kp.id,
+		packageName: kp.packageName,
+		installHint: kp.installHint,
+		state: "absent",
+	}));
+}
+
+/**
+ * Pure mapping from a discovery result to one {@link PluginDiagnostic} per known
+ * plugin (registry order), with no I/O. Shared by {@link inspectPlugins} and
+ * {@link loadPlugins} so the load gate and the diagnostic view are computed from
+ * the exact same `found` set and {@link isPeerCompatible} check — they can never
+ * disagree on whether a plugin is loadable.
+ */
+function diagnoseFound(
+	found: ReadonlyArray<FoundPlugin>,
+	known: ReadonlyArray<KnownPlugin>,
+	cliVersion: string,
+): PluginDiagnostic[] {
+	const foundById = new Map(found.map((f) => [f.pluginId, f]));
+	return known.map((kp) => {
+		const hit = foundById.get(kp.id);
+		if (!hit) {
+			return { id: kp.id, packageName: kp.packageName, installHint: kp.installHint, state: "absent" };
+		}
+		const installedVersion = typeof hit.pkg.version === "string" ? hit.pkg.version : undefined;
+		const peerRange = hit.pkg.peerDependencies?.["@jolli.ai/cli"];
+		return {
+			id: kp.id,
+			packageName: kp.packageName,
+			installHint: kp.installHint,
+			state: isPeerCompatible(cliVersion, peerRange) ? "ok" : "incompatible",
+			installedVersion,
+			peerRange,
+		};
+	});
+}
+
+/**
+ * Inspect every known plugin and report its three-state {@link PluginDiagnostic}
+ * without loading any plugin code. Reuses the same discovery walk and
+ * peer-range check as {@link loadPlugins}, so the diagnostic can never claim a
+ * plugin is loadable when the loader would skip it (or vice versa).
+ *
+ * Honors `JOLLI_NO_PLUGINS=1` exactly as {@link loadPlugins} does: when the
+ * loader short-circuits discovery, nothing is loadable, so every known plugin
+ * is reported `absent` (no on-disk plugin is claimed `ok`). This keeps the
+ * diagnostic from disagreeing with the loader under the kill-switch.
+ *
+ * Returns one entry per {@link KnownPlugin} in registry order — including
+ * `absent` ones — so callers can render a stable, complete view. Always
+ * non-throwing on discovery errors (they surface as `absent`), matching the
+ * loader's "a broken plugin never breaks the host" contract.
+ */
+export async function inspectPlugins(cliVersion: string, opts?: InspectPluginsOptions): Promise<PluginDiagnostic[]> {
+	const { known, found, skipped } = await discoverKnownPlugins(opts);
+	if (skipped) return allAbsentDiagnostics(known);
+	return diagnoseFound(found, known, cliVersion);
+}
+
+/**
  * Subset of a plugin's `package.json` that the loader consumes after discovery.
  * Typed loosely (`main` as `unknown`) because `JSON.parse` will hand us
  * whatever the file contained — `loadOnePlugin` does its own runtime check
@@ -196,6 +354,7 @@ export function registerMissingStubs(program: Command, loadedPluginIds: Readonly
  */
 interface PluginPackageJson {
 	main?: unknown;
+	version?: unknown;
 	peerDependencies?: Record<string, string>;
 }
 
@@ -481,7 +640,7 @@ async function loadOnePlugin(program: Command, cliVersion: string, plugin: Found
 
 	try {
 		const peerRange = pkg.peerDependencies?.["@jolli.ai/cli"];
-		if (peerRange && !satisfies(cliVersion, peerRange, { includePrerelease: true })) {
+		if (!isPeerCompatible(cliVersion, peerRange)) {
 			warn(`${name} requires @jolli.ai/cli ${peerRange}, but ${cliVersion} is installed — skipping`);
 			return false;
 		}
@@ -856,6 +1015,9 @@ export async function getNpmRootGlobal(opts?: NpmRootGlobalOptions): Promise<str
 
 /**
  * Run `npm root -g` with a hard timeout. Returns null on any failure.
+ * Delegates to {@link runNpmCommand} so the cross-platform (win32 shell) npm
+ * invocation lives in one place — a bare `execFile("npm")` silently no-ops on
+ * Windows.
  *
  * Coverage-ignored: the only side-effect is spawning a subprocess, which is
  * impractical to unit-test deterministically without injecting a fake npm
@@ -863,12 +1025,6 @@ export async function getNpmRootGlobal(opts?: NpmRootGlobalOptions): Promise<str
  */
 /* v8 ignore start */
 async function runNpmRootGlobal(): Promise<string | null> {
-	try {
-		const { stdout } = await execFileAsyncHidden("npm", ["root", "-g"], { timeout: NPM_ROOT_TIMEOUT_MS });
-		const trimmed = stdout.trim();
-		return trimmed.length > 0 ? trimmed : null;
-	} catch {
-		return null;
-	}
+	return runNpmCommand(["root", "-g"], { timeout: NPM_ROOT_TIMEOUT_MS });
 }
 /* v8 ignore stop */

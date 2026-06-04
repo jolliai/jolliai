@@ -209,4 +209,32 @@ describe("Subprocess", () => {
 			await expect(execFileAsyncHidden("git", ["bogus"])).rejects.toBe(err);
 		});
 	});
+
+	describe("runNpmCommand", () => {
+		it("rejects a shell-unsafe argument before spawning npm", async () => {
+			const { runNpmCommand } = await import("./Subprocess.js");
+			await expect(runNpmCommand(["view", "evil; rm -rf /", "version"])).rejects.toThrow(/shell-unsafe argument/);
+			expect(mockExecFile).not.toHaveBeenCalled();
+		});
+
+		it("allows allow-list-shaped tokens and returns trimmed stdout", async () => {
+			mockExecFile.mockImplementationOnce(
+				(
+					_file: string,
+					_args: ReadonlyArray<string>,
+					_options: unknown,
+					callback: (err: null, result: { stdout: string; stderr: string }) => void,
+				) => {
+					callback(null, { stdout: "1.2.3\n", stderr: "" });
+				},
+			);
+			const { runNpmCommand } = await import("./Subprocess.js");
+			expect(await runNpmCommand(["view", "@jolli.ai/cli", "version"])).toBe("1.2.3");
+		});
+
+		it("returns null on empty stdout", async () => {
+			const { runNpmCommand } = await import("./Subprocess.js");
+			expect(await runNpmCommand(["root", "-g"])).toBeNull();
+		});
+	});
 });

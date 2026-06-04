@@ -37,6 +37,27 @@ vi.mock("../install/DistPathResolver.js", () => ({
 	traverseDistPaths: vi.fn().mockReturnValue([]),
 }));
 
+// checkVersionMismatch inspects plugins and reads the update-check cache. Stub
+// both out so these tests drive the notice from the cached registry `latest`
+// and never spawn a real npm/detached process. The DistPathResolver mock stays
+// because the real UpdateCheck module (loaded via importActual below) imports
+// `compareSemver` from it. The pure freshness logic is covered by
+// UpdateCheck.test.ts.
+vi.mock("../PluginLoader.js", () => ({
+	inspectPlugins: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/UpdateCheck.js", async () => {
+	const actual = await vi.importActual<typeof import("../core/UpdateCheck.js")>("../core/UpdateCheck.js");
+	return {
+		...actual,
+		readUpdateCache: vi.fn().mockResolvedValue(null),
+		spawnDetachedRefresh: vi.fn(),
+		// Keep the debounce sentinel off disk; always allow the (mocked) spawn.
+		claimRefreshSpawn: vi.fn().mockResolvedValue(true),
+	};
+});
+
 // Suppress stderr output during tests
 vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
@@ -90,95 +111,79 @@ describe("CliUtils", () => {
 			const { checkVersionMismatch } = await import("./CliUtils.js");
 			vi.mocked(process.stderr.write).mockClear();
 
-			checkVersionMismatch();
+			await checkVersionMismatch();
 
 			const stderrCalls = vi.mocked(process.stderr.write).mock.calls;
 			const hasWarning = stderrCalls.some((c) => String(c[0]).includes("newer version"));
 			expect(hasWarning).toBe(false);
 		});
 
-		it("should warn when a registered source has a higher version", async () => {
+		it("should warn when the registry cache reports a newer CLI", async () => {
 			vi.resetModules();
 			vi.stubGlobal("__PKG_VERSION__", "1.0.0");
-			const { traverseDistPaths } = await import("../install/DistPathResolver.js");
-			vi.mocked(traverseDistPaths).mockReturnValue([
-				{ source: "vscode", version: "2.0.0", distDir: "/vscode/dist", available: true },
-			]);
+			const { readUpdateCache } = await import("../core/UpdateCheck.js");
+			vi.mocked(readUpdateCache).mockResolvedValue({
+				checkedAt: new Date().toISOString(),
+				ttlHours: 24,
+				packages: { "@jolli.ai/cli": { latest: "2.0.0" } },
+			});
 
 			vi.mocked(process.stderr.write).mockClear();
 			const { checkVersionMismatch } = await import("./CliUtils.js");
-			checkVersionMismatch();
+			await checkVersionMismatch();
 
 			const stderrOutput = vi
 				.mocked(process.stderr.write)
 				.mock.calls.map((c) => String(c[0]))
 				.join("");
-			expect(stderrOutput).toContain("A newer version of jolli is available");
+			expect(stderrOutput).toContain("A newer version of @jolli.ai/cli is available");
 		});
 
-		it("should not warn when all sources have equal or lower versions", async () => {
+		it("should not warn when the registry cache matches the running version", async () => {
 			vi.resetModules();
 			vi.stubGlobal("__PKG_VERSION__", "2.0.0");
-			const { traverseDistPaths } = await import("../install/DistPathResolver.js");
-			vi.mocked(traverseDistPaths).mockReturnValue([
-				{ source: "cli", version: "1.5.0", distDir: "/cli/dist", available: true },
-				{ source: "vscode", version: "2.0.0", distDir: "/vscode/dist", available: true },
-			]);
-
-			vi.mocked(process.stderr.write).mockClear();
-			const { checkVersionMismatch } = await import("./CliUtils.js");
-			checkVersionMismatch();
-
-			const stderrCalls = vi.mocked(process.stderr.write).mock.calls;
-			const hasWarning = stderrCalls.some((c) => String(c[0]).includes("newer version"));
-			expect(hasWarning).toBe(false);
-		});
-
-		it("should not warn when no sources are registered", async () => {
-			vi.resetModules();
-			vi.stubGlobal("__PKG_VERSION__", "1.0.0");
-			const { traverseDistPaths } = await import("../install/DistPathResolver.js");
-			vi.mocked(traverseDistPaths).mockReturnValue([]);
-
-			vi.mocked(process.stderr.write).mockClear();
-			const { checkVersionMismatch } = await import("./CliUtils.js");
-			checkVersionMismatch();
-
-			const stderrCalls = vi.mocked(process.stderr.write).mock.calls;
-			const hasWarning = stderrCalls.some((c) => String(c[0]).includes("newer version"));
-			expect(hasWarning).toBe(false);
-		});
-
-		it("should skip unavailable entries when finding highest version", async () => {
-			vi.resetModules();
-			vi.stubGlobal("__PKG_VERSION__", "1.0.0");
-			const { traverseDistPaths } = await import("../install/DistPathResolver.js");
-			// The only higher-version entry is unavailable — should NOT warn
-			vi.mocked(traverseDistPaths).mockReturnValue([
-				{ source: "cli", version: "1.0.0", distDir: "/cli/dist", available: true },
-				{ source: "stale", version: "9.9.9", distDir: "/missing/dist", available: false },
-			]);
-
-			vi.mocked(process.stderr.write).mockClear();
-			const { checkVersionMismatch } = await import("./CliUtils.js");
-			checkVersionMismatch();
-
-			const stderrCalls = vi.mocked(process.stderr.write).mock.calls;
-			const hasWarning = stderrCalls.some((c) => String(c[0]).includes("newer version"));
-			expect(hasWarning).toBe(false);
-		});
-
-		it("should not throw when traverseDistPaths throws", async () => {
-			vi.resetModules();
-			vi.stubGlobal("__PKG_VERSION__", "1.0.0");
-			const { traverseDistPaths } = await import("../install/DistPathResolver.js");
-			vi.mocked(traverseDistPaths).mockImplementation(() => {
-				throw new Error("EACCES");
+			const { readUpdateCache } = await import("../core/UpdateCheck.js");
+			vi.mocked(readUpdateCache).mockResolvedValue({
+				checkedAt: new Date().toISOString(),
+				ttlHours: 24,
+				packages: { "@jolli.ai/cli": { latest: "2.0.0" } },
 			});
 
+			vi.mocked(process.stderr.write).mockClear();
 			const { checkVersionMismatch } = await import("./CliUtils.js");
-			// Should not throw — error is silently caught
-			expect(() => checkVersionMismatch()).not.toThrow();
+			await checkVersionMismatch();
+
+			const stderrCalls = vi.mocked(process.stderr.write).mock.calls;
+			const hasWarning = stderrCalls.some((c) => String(c[0]).includes("newer version"));
+			expect(hasWarning).toBe(false);
+		});
+
+		it("should not warn when there is no cached registry data", async () => {
+			vi.resetModules();
+			vi.stubGlobal("__PKG_VERSION__", "1.0.0");
+			// Set null explicitly: a mock implementation from a prior test survives
+			// vi.resetModules(). With no registry data, a higher version in any
+			// dist-paths/<surface> must NOT produce a CLI notice.
+			const { readUpdateCache } = await import("../core/UpdateCheck.js");
+			vi.mocked(readUpdateCache).mockResolvedValue(null);
+			vi.mocked(process.stderr.write).mockClear();
+			const { checkVersionMismatch } = await import("./CliUtils.js");
+			await checkVersionMismatch();
+
+			const stderrCalls = vi.mocked(process.stderr.write).mock.calls;
+			const hasWarning = stderrCalls.some((c) => String(c[0]).includes("newer version"));
+			expect(hasWarning).toBe(false);
+		});
+
+		it("should not throw when readUpdateCache rejects", async () => {
+			vi.resetModules();
+			vi.stubGlobal("__PKG_VERSION__", "1.0.0");
+			const { readUpdateCache } = await import("../core/UpdateCheck.js");
+			vi.mocked(readUpdateCache).mockRejectedValue(new Error("EACCES"));
+
+			const { checkVersionMismatch } = await import("./CliUtils.js");
+			// Should not reject — error is silently caught
+			await expect(checkVersionMismatch()).resolves.not.toThrow();
 		});
 	});
 

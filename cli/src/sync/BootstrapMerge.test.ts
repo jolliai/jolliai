@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BOOTSTRAP_STASH_DIRNAME, runBootstrapMerge, shouldRunBootstrapMerge } from "./BootstrapMerge.js";
 import { GitClient } from "./GitClient.js";
 import type { GitCredentials } from "./SyncTypes.js";
@@ -20,6 +20,11 @@ import type { GitCredentials } from "./SyncTypes.js";
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 process.env.GIT_CONFIG_SYSTEM = "/dev/null";
 process.env.GIT_TERMINAL_PROMPT = "0";
+
+// Every test spawns several real `git` subprocesses; under parallel suite load
+// + `--coverage` the global 15s testTimeout / 10s hookTimeout flake. 30s gives
+// this real-git suite headroom without loosening the global pure-unit budget.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 const NOOP_ASKPASS = async (): Promise<{
 	scriptPath: string;

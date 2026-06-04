@@ -24,6 +24,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { coerce as semverCoerce, compare as semverCompare, valid as semverValid } from "semver";
 import { createLogger } from "../Logger.js";
 import type { DistPathInfo } from "../Types.js";
 import { installDistPath } from "./DistPathWriter.js";
@@ -156,17 +157,54 @@ export function traverseDistPaths(globalDir?: string): DistPathInfo[] {
 // ─── Version comparison ──────────────────────────────────────────────────────
 
 /**
- * Compares two semver version strings. Returns:
+ * Compares two version strings for dist-path selection. Returns:
  *   > 0 if a > b
  *   < 0 if a < b
  *   0   if a === b
  *
- * Non-numeric versions ("unknown", "dev", "") are treated as the lowest possible
- * version, so any valid semver string wins over them. Matches the shell-side
- * `run-hook` behavior (which normalizes dev/unknown to 0.0.0 before
- * `sort -V`).
+ * Three tiers, in order:
+ *   1. **Prerelease / build metadata** (`-rc.1`, `+build.5`): when either side
+ *      carries such a tag, defer to the `semver` library for both-valid pairs
+ *      so a prerelease sorts below its own release (`1.0.0-rc.1` < `1.0.0`) yet
+ *      a newer prerelease still beats an older stable (`1.0.0-rc.1` > `0.99.0`)
+ *      and build metadata is ignored. A valid semver string beats a non-semver
+ *      sentinel (`dev`/`unknown`) on that tagged side.
+ *   2. **Plain numeric** (`1.0`, `1.2.3`): loose dotted comparison, filling
+ *      missing parts with 0 so `1.0` === `1.0.0`.
+ *   3. **Non-numeric sentinels** (`dev`, `unknown`, ``): ranked lowest, two
+ *      sentinels compare equal.
+ *
+ * Divergence from the shell side: `resolve-dist-path` selects with `sort -V`,
+ * which ranks `1.0.0-rc.1` ABOVE `1.0.0` (opposite of semver). Matching that in
+ * POSIX sh would mean hand-rolling semver prerelease rules — not worth the risk
+ * for the rare case of a release and its own prerelease both being registered.
+ * This function is the in-process authority; the shell is a best-effort
+ * approximation that agrees on every non-prerelease comparison.
  */
 export function compareSemver(a: string, b: string): number {
+	// Tier 1: prerelease/build metadata needs semver-aware ordering — the loose
+	// numeric path below cannot order a `-rc.N` suffix.
+	if (a.includes("-") || a.includes("+") || b.includes("-") || b.includes("+")) {
+		// Normalize each side to a comparable semver string. A tagged side uses
+		// its exact valid form (keeping the prerelease/build tag); a loose dotted
+		// numeric like `1.0` is coerced to `1.0.0` so it can be ordered *against*
+		// a tagged version (`1.0` > `1.0.0-rc.1`) instead of being mistaken for a
+		// non-semver sentinel. Non-numeric sentinels (`dev`/`unknown`) stay null.
+		const norm = (v: string): string | null => {
+			const exact = semverValid(v);
+			if (exact) return exact;
+			return /^\d+(\.\d+)*$/.test(v) ? (semverCoerce(v)?.version ?? null) : null;
+		};
+		const aSem = norm(a);
+		const bSem = norm(b);
+		if (aSem && bSem) return semverCompare(aSem, bSem);
+		if (aSem) return 1; // valid (pre)release beats a non-semver sentinel
+		if (bSem) return -1;
+		// Neither parses as semver → fall through to the numeric tier, where both
+		// rank lowest and compare equal.
+	}
+
+	// Tier 2 + 3: loose numeric comparison; non-numeric sentinels rank lowest.
 	const aValid = /^\d+(\.\d+)*$/.test(a);
 	const bValid = /^\d+(\.\d+)*$/.test(b);
 	if (!aValid && !bValid) return 0;

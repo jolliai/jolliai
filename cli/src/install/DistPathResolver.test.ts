@@ -154,6 +154,62 @@ describe("DistPathResolver", () => {
 			expect(compareSemver("1.0.1", "1.0")).toBeGreaterThan(0);
 			expect(compareSemver("1.0", "1.0.1")).toBeLessThan(0);
 		});
+
+		// Prerelease handling. The historical implementation treated any version
+		// carrying a `-rc.N` suffix as non-numeric → ranked LOWEST, so an RC build
+		// (e.g. `1.0.0-rc.1`) would lose dist-path selection even to an ancient
+		// stable like `0.1.0`. compareSemver now follows semver ordering:
+		// prerelease sorts below its own release, but a newer prerelease still
+		// beats an older stable.
+		//
+		// NOTE on the shell: `resolve-dist-path` uses `sort -V`, which ranks
+		// `1.0.0-rc.1` ABOVE `1.0.0` — the opposite of semver. compareSemver is
+		// the in-process authority; the divergence only affects the rare case of a
+		// stable and its own prerelease both being registered. See the JSDoc.
+		describe("prerelease ordering (semver semantics)", () => {
+			it("ranks a prerelease below its own release", () => {
+				expect(compareSemver("1.0.0-rc.1", "1.0.0")).toBeLessThan(0);
+				expect(compareSemver("1.0.0", "1.0.0-rc.1")).toBeGreaterThan(0);
+			});
+
+			it("ranks a newer prerelease above an older stable release", () => {
+				expect(compareSemver("1.0.0-rc.1", "0.99.0")).toBeGreaterThan(0);
+				expect(compareSemver("0.99.0", "1.0.0-rc.1")).toBeLessThan(0);
+			});
+
+			it("orders prereleases among themselves", () => {
+				expect(compareSemver("1.0.0-rc.2", "1.0.0-rc.1")).toBeGreaterThan(0);
+			});
+
+			it("ranks a prerelease above the dev/unknown sentinels", () => {
+				expect(compareSemver("1.0.0-rc.1", "dev")).toBeGreaterThan(0);
+				expect(compareSemver("unknown", "1.0.0-rc.1")).toBeLessThan(0);
+			});
+
+			it("ignores build metadata", () => {
+				expect(compareSemver("1.0.0+build.5", "1.0.0")).toBe(0);
+			});
+
+			it("ranks a loose two-part release above a tagged prerelease", () => {
+				// A loose `1.0` (coerced to 1.0.0) must beat `1.0.0-rc.1`, not be
+				// mistaken for a non-semver sentinel that loses to any prerelease.
+				expect(compareSemver("1.0", "1.0.0-rc.1")).toBeGreaterThan(0);
+				expect(compareSemver("1.0.0-rc.1", "1.0")).toBeLessThan(0);
+			});
+
+			it("orders a loose two-part version against a higher tagged release", () => {
+				expect(compareSemver("1.0", "2.0.0-rc.1")).toBeLessThan(0);
+				expect(compareSemver("2.0.0-rc.1", "1.0")).toBeGreaterThan(0);
+			});
+
+			it("sorts a full canonical ascending sequence consistently", () => {
+				const ascending = ["dev", "0.99.0", "1.0.0-rc.1", "1.0.0-rc.2", "1.0.0"];
+				for (let i = 0; i + 1 < ascending.length; i++) {
+					expect(compareSemver(ascending[i], ascending[i + 1])).toBeLessThan(0);
+					expect(compareSemver(ascending[i + 1], ascending[i])).toBeGreaterThan(0);
+				}
+			});
+		});
 	});
 
 	// ── deriveSourceTag ──────────────────────────────────────────────────

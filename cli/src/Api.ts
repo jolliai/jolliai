@@ -28,6 +28,7 @@ import { registerViewCommand } from "./commands/ViewCommand.js";
 // pure re-exports from the entry bundle when nothing inside the entry
 // consumes them).
 import { parseBaseUrl as _parseBaseUrl, parseJolliApiKey as _parseJolliApiKey } from "./core/JolliApiUtils.js";
+import { CLI_PACKAGE_NAME, REFRESH_COMMAND, refreshUpdateCache } from "./core/UpdateCheck.js";
 import type { Logger } from "./Logger.js";
 import { loadPlugins, registerMissingStubs } from "./PluginLoader.js";
 
@@ -334,10 +335,22 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	// registered by `registerMissingStubs` so the commands stay visible in
 	// `--help` and emit an install hint when invoked. Both calls are
 	// non-throwing — a broken plugin / stub never blocks the CLI.
-	const loadedPluginIds = await loadPlugins(program, VERSION);
+	const { loaded: loadedPluginIds, diagnostics: pluginDiagnostics } = await loadPlugins(program, VERSION);
 	registerMissingStubs(program, loadedPluginIds);
 
-	checkVersionMismatch();
+	// Hidden subcommand spawned by checkVersionMismatch's detached refresh:
+	// queries npm for the latest version of the CLI + the given plugins and
+	// rewrites update-check.json. Never user-invoked directly.
+	program
+		.command(REFRESH_COMMAND, { hidden: true })
+		.argument("[packages...]", "package names to refresh")
+		.action(async (packages: string[]) => {
+			await refreshUpdateCache(packages.length > 0 ? packages : [CLI_PACKAGE_NAME]);
+		});
+
+	// Reuse the plugin diagnostics loadPlugins already computed, so the version
+	// check doesn't trigger a second discovery walk on the startup hot path.
+	await checkVersionMismatch({ pluginDiagnostics });
 
 	/* v8 ignore start - process.argv branch only used when running as script, not in tests */
 	await program.parseAsync(args ? ["node", "jolli", ...args] : process.argv);

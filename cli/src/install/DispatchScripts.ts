@@ -57,6 +57,13 @@ DIR="$HOME/.jolli/jollimemory"
 BEST_PATH=""
 BEST_VER="0.0.0"
 
+# Version selection uses 'sort -V'. It agrees with the in-process compareSemver
+# (cli/src/install/DistPathResolver.ts) on every non-prerelease comparison.
+# Known divergence: sort -V ranks a prerelease (e.g. 1.0.0-rc.1) ABOVE its
+# release (1.0.0), whereas compareSemver follows semver and ranks it below.
+# Matching semver here would mean hand-rolling prerelease rules in POSIX sh;
+# the case (a release and its own prerelease both registered) is too rare to
+# justify the risk. compareSemver is the authority for in-process selection.
 if [ -d "$DIR/dist-paths" ]; then
   for f in "$DIR/dist-paths"/*; do
     [ -f "$f" ] || continue

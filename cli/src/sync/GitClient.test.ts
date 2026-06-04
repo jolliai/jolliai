@@ -12,7 +12,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { GitClient, injectGithubAppUsername, isNetworkErrorMessage, isRepoMissingMessage } from "./GitClient.js";
 import type { GitCredentials } from "./SyncTypes.js";
 
@@ -23,6 +23,12 @@ import type { GitCredentials } from "./SyncTypes.js";
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 process.env.GIT_CONFIG_SYSTEM = "/dev/null";
 process.env.GIT_TERMINAL_PROMPT = "0";
+
+// Every test here spawns several real `git` subprocesses (clone/commit/push/
+// pullRebase). Under parallel suite load + `--coverage` instrumentation the
+// global 15s testTimeout / 10s hookTimeout flake; 30s gives this real-git
+// suite headroom without loosening the global budget for pure-unit tests.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 const NOOP_ASKPASS = async (): Promise<{
 	scriptPath: string;

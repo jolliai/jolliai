@@ -8,9 +8,18 @@
  */
 
 import { createInterface } from "node:readline";
-import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import type { AmbiguousHashError } from "../core/SummaryStore.js";
-import { compareSemver, traverseDistPaths } from "../install/DistPathResolver.js";
+import {
+	CLI_PACKAGE_NAME,
+	claimRefreshSpawn,
+	computeCliUpdateNotice,
+	computePluginUpdateNotices,
+	isCacheStale,
+	REFRESH_COMMAND,
+	readUpdateCache,
+	spawnDetachedRefresh,
+} from "../core/UpdateCheck.js";
+import { inspectPlugins, type PluginDiagnostic } from "../PluginLoader.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 
 /** Package version — injected by Vite at build time, falls back to "dev" when running via tsx. */
@@ -62,39 +71,60 @@ export function isSafeQuery(query: string): boolean {
 }
 
 /**
- * Prints a warning to stderr if any registered source's dist-paths/<source>
- * file references a higher version than this CLI binary. This happens when,
- * for example, a VSCode extension with a newer core has been activated and
- * registered a higher version — hooks would run the newer code, but the
- * standalone `jolli` CLI binary on PATH remains at the old version.
+ * Prints upgrade hints to stderr when a newer version of the CLI — or of an
+ * installed plugin — is published on npm. "Newer" is decided solely from the
+ * cached registry `latest` in `update-check.json`: the cache is read-only here,
+ * and when it is stale a *detached* refresh process is spawned (it re-invokes
+ * this CLI with {@link REFRESH_COMMAND}) and the current invocation continues
+ * without waiting.
  *
- * Reads only `dist-paths/<source>`; the legacy single `dist-path` file is
- * not consulted. Every `install()` migrates and deletes the legacy file, so
- * by the time this CLI runs it's either gone or will be on next
- * `jolli enable`. Never throws — silently returns on any error.
+ * Local `dist-paths/<surface>` versions are intentionally NOT consulted — the
+ * CLI and the IDE extensions are independent release lines, so another surface's
+ * version is not a comparable `@jolli.ai/cli` version (see
+ * {@link computeCliUpdateNotice}).
+ *
+ * The locally-installed versions (CLI = {@link VERSION}, plugins = their
+ * `package.json`) are always read live, never cached. Never throws — every
+ * failure path degrades to "no hint" so the version check cannot block the CLI.
+ *
+ * `pluginDiagnostics` is the snapshot {@link loadPlugins} already produced this
+ * invocation; passing it in avoids a second plugin-discovery walk on the
+ * startup hot path. When omitted (direct callers, tests) it falls back to a
+ * fresh {@link inspectPlugins} scan.
+ *
+ * Skipped entirely in `dev` (tsx) builds and inside the detached refresh process
+ * itself (the {@link REFRESH_COMMAND} re-entrancy guard) to avoid a spawn loop.
  */
-/* v8 ignore start -- VERSION is always "dev" in tests; build-only code path */
-export function checkVersionMismatch(): void {
+/* v8 ignore start -- VERSION is always "dev" in tests; the freshness logic is unit-tested in UpdateCheck.test.ts */
+export async function checkVersionMismatch(opts?: { pluginDiagnostics?: PluginDiagnostic[] }): Promise<void> {
 	try {
 		if (VERSION === "dev") return;
-		const globalDir = getGlobalConfigDir();
+		// Re-entrancy guard: the detached refresh re-invokes this CLI with
+		// REFRESH_COMMAND; it must not trigger yet another refresh spawn.
+		if (process.argv.includes(REFRESH_COMMAND)) return;
 
-		// Find the highest version across all registered sources
-		let highestVersion: string | undefined;
-		const sources = traverseDistPaths(globalDir);
-		for (const entry of sources) {
-			if (!entry.available) continue;
-			if (!highestVersion || compareSemver(entry.version, highestVersion) > 0) {
-				highestVersion = entry.version;
-			}
+		const diagnostics = opts?.pluginDiagnostics ?? (await inspectPlugins(VERSION));
+		const installedPlugins = diagnostics.filter((p) => p.state !== "absent");
+		const cache = await readUpdateCache();
+
+		// Refresh in the background when the cache is stale and no recent refresh
+		// is still within the debounce window; the current command continues
+		// immediately and uses whatever the cache already holds.
+		if (isCacheStale(cache, Date.now()) && (await claimRefreshSpawn())) {
+			spawnDetachedRefresh([CLI_PACKAGE_NAME, ...installedPlugins.map((p) => p.packageName)]);
 		}
 
-		if (!highestVersion || highestVersion === VERSION) return;
-		if (compareSemver(highestVersion, VERSION) <= 0) return;
+		const notices: string[] = [];
+		const cliNotice = computeCliUpdateNotice({
+			currentVersion: VERSION,
+			registryLatest: cache?.packages[CLI_PACKAGE_NAME]?.latest,
+		});
+		if (cliNotice) notices.push(cliNotice);
+		notices.push(...computePluginUpdateNotices(installedPlugins, cache));
 
-		process.stderr.write(
-			"\nWarning:\n" + "  A newer version of jolli is available. Please upgrade: npm update -g @jolli.ai/cli\n\n",
-		);
+		if (notices.length > 0) {
+			process.stderr.write(`\nWarning:\n${notices.map((n) => `  ${n}`).join("\n")}\n\n`);
+		}
 	} catch {
 		// Never block CLI execution
 	}
