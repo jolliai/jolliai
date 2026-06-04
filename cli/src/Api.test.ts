@@ -76,8 +76,29 @@ vi.mock("./core/Locks.js", () => ({
 vi.mock("./PluginLoader.js", async () => {
 	const actual = await vi.importActual<typeof import("./PluginLoader.js")>("./PluginLoader.js");
 	return {
-		loadPlugins: vi.fn().mockResolvedValue(new Set<string>()),
+		loadPlugins: vi.fn().mockResolvedValue({ loaded: new Set<string>(), diagnostics: [] }),
 		registerMissingStubs: actual.registerMissingStubs,
+		// Default: no plugins installed. The `doctor` command calls this; tests
+		// that exercise plugin rows override the resolved value per-test.
+		inspectPlugins: vi.fn().mockResolvedValue([]),
+	};
+});
+
+// Mock only the registry-querying refresh so the hidden `__refresh-update-cache`
+// command never spawns a real `npm view`. The pure cache/notice logic is covered
+// by UpdateCheck.test.ts; here we only assert the command wires through to it.
+vi.mock("./core/UpdateCheck.js", async () => {
+	const actual = await vi.importActual<typeof import("./core/UpdateCheck.js")>("./core/UpdateCheck.js");
+	return {
+		...actual,
+		refreshUpdateCache: vi.fn().mockResolvedValue({ checkedAt: "", ttlHours: 24, packages: {} }),
+		// Keep the registry/cache I/O out of the test process: no real npm-view
+		// cache on disk, no real detached refresh spawn. The local-surface
+		// comparison (the part these tests exercise) is unaffected.
+		readUpdateCache: vi.fn().mockResolvedValue(null),
+		spawnDetachedRefresh: vi.fn(),
+		// Keep the debounce sentinel off disk; always allow the (mocked) spawn.
+		claimRefreshSpawn: vi.fn().mockResolvedValue(true),
 	};
 });
 
@@ -244,6 +265,7 @@ import { loadConfigFromDir } from "./core/SessionTracker.js";
 import { exportSummaries } from "./core/SummaryExporter.js";
 import { hasMigrationMeta, migrateV1toV3 } from "./core/SummaryMigration.js";
 import { getIndex, getSummary, indexNeedsMigration, listSummaries, migrateIndexToV3 } from "./core/SummaryStore.js";
+import { CLI_PACKAGE_NAME, REFRESH_COMMAND, refreshUpdateCache } from "./core/UpdateCheck.js";
 import { getStatus, install, uninstall } from "./install/Installer.js";
 import { loadPlugins } from "./PluginLoader.js";
 
@@ -341,7 +363,7 @@ describe("CLI", () => {
 			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
 				program.command("plugin-hidden-secret", { hidden: true }).description("hidden by plugin");
 				program.command("plugin-visible-cmd").description("visible plugin cmd");
-				return new Set<string>();
+				return { loaded: new Set<string>(), diagnostics: [] };
 			});
 
 			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
@@ -389,7 +411,7 @@ describe("CLI", () => {
 			// once plugins are loaded.
 			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
 				program.command("plugin-extra-cmd").description("third-party plugin command");
-				return new Set<string>();
+				return { loaded: new Set<string>(), diagnostics: [] };
 			});
 
 			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
@@ -487,7 +509,7 @@ describe("CLI", () => {
 			// rendered under the Jolli Space section.
 			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
 				program.command("init").description("unrelated plugin init");
-				return new Set<string>();
+				return { loaded: new Set<string>(), diagnostics: [] };
 			});
 			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
 				throw new Error("process.exit");
@@ -514,7 +536,7 @@ describe("CLI", () => {
 			// the Jolli Space section and a later stub (`agent`) must still render.
 			vi.mocked(loadPlugins).mockImplementationOnce(async (program) => {
 				program.command("init").description("unrelated plugin init");
-				return new Set<string>();
+				return { loaded: new Set<string>(), diagnostics: [] };
 			});
 			const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
 				throw new Error("process.exit");
@@ -2989,48 +3011,44 @@ describe("CLI", () => {
 		 * checkVersionMismatch runs at the top of main(), before commander parses.
 		 * Since __PKG_VERSION__ is undefined in tests (VERSION = "dev"), we need
 		 * vi.resetModules() + vi.stubGlobal() to re-import Cli with a real version.
+		 *
+		 * The notice is driven solely by the npm registry `latest` cached in
+		 * update-check.json (mocked via readUpdateCache); local dist-paths/<surface>
+		 * versions are intentionally not consulted.
 		 */
-		async function runWithVersion(cliVersion: string, distPathContent: string | null): Promise<void> {
+		async function runWithVersion(cliVersion: string, registryLatest: string | null): Promise<void> {
 			vi.resetModules();
 			vi.stubGlobal("__PKG_VERSION__", cliVersion);
 
-			// Parse the legacy-style `source=tag@ver\npath` test fixture into the
-			// new per-source registry mock. checkVersionMismatch only reads
-			// traverseDistPaths() now — legacy single-file fallback was removed
-			// once migrateLegacyDistPath started deleting the old file.
-			const { traverseDistPaths } = await import("./install/DistPathResolver.js");
-			vi.mocked(traverseDistPaths).mockReset();
-
-			if (distPathContent) {
-				const m = distPathContent.match(/^source=([^@\n]+)(?:@([^\n]+))?\n(.+)$/);
-				if (m?.[2]) {
-					vi.mocked(traverseDistPaths).mockReturnValue([
-						{ source: m[1], version: m[2], distDir: m[3], available: true },
-					]);
-				} else {
-					vi.mocked(traverseDistPaths).mockReturnValue([]);
-				}
-			} else {
-				vi.mocked(traverseDistPaths).mockReturnValue([]);
-			}
+			const { readUpdateCache } = await import("./core/UpdateCheck.js");
+			vi.mocked(readUpdateCache).mockReset();
+			vi.mocked(readUpdateCache).mockResolvedValue(
+				registryLatest
+					? {
+							checkedAt: new Date().toISOString(),
+							ttlHours: 24,
+							packages: { [CLI_PACKAGE_NAME]: { latest: registryLatest } },
+						}
+					: null,
+			);
 
 			const { main: freshMain } = await import("./Api.js");
 			await freshMain(["status"]);
 		}
 
-		it("should warn when dist-paths version is higher than CLI version", async () => {
-			await runWithVersion("0.1.0", "source=vscode-extension@0.2.0\n/ext/dist");
+		it("should warn when the registry latest is higher than the CLI version", async () => {
+			await runWithVersion("0.1.0", "0.2.0");
 
 			const output = vi
 				.mocked(process.stderr.write)
 				.mock.calls.map((c) => String(c[0]))
 				.join("");
-			expect(output).toContain("A newer version of jolli is available");
+			expect(output).toContain("A newer version of @jolli.ai/cli is available");
 			expect(output).toContain("npm update -g @jolli.ai/cli");
 		});
 
 		it("should not warn when versions match", async () => {
-			await runWithVersion("1.0.0", "source=cli@1.0.0\n/global/dist");
+			await runWithVersion("1.0.0", "1.0.0");
 
 			const calls = vi.mocked(process.stderr.write).mock.calls;
 			const hasWarning = calls.some((c) => String(c[0]).includes("newer version"));
@@ -3038,23 +3056,15 @@ describe("CLI", () => {
 		});
 
 		it("should not warn when CLI version is higher", async () => {
-			await runWithVersion("2.0.0", "source=vscode-extension@1.5.0\n/ext/dist");
+			await runWithVersion("2.0.0", "1.5.0");
 
 			const calls = vi.mocked(process.stderr.write).mock.calls;
 			const hasWarning = calls.some((c) => String(c[0]).includes("newer version"));
 			expect(hasWarning).toBe(false);
 		});
 
-		it("should not warn when no sources are registered", async () => {
+		it("should not warn when there is no cached registry data", async () => {
 			await runWithVersion("1.0.0", null);
-
-			const calls = vi.mocked(process.stderr.write).mock.calls;
-			const hasWarning = calls.some((c) => String(c[0]).includes("newer version"));
-			expect(hasWarning).toBe(false);
-		});
-
-		it("should not warn for source entry with no version (legacy content ignored)", async () => {
-			await runWithVersion("1.0.0", "source=cli\n/global/dist");
 
 			const calls = vi.mocked(process.stderr.write).mock.calls;
 			const hasWarning = calls.some((c) => String(c[0]).includes("newer version"));
@@ -3438,67 +3448,6 @@ describe("CLI", () => {
 
 	// ── checkVersionMismatch: additional branches ─────────────────────────
 
-	describe("checkVersionMismatch — additional branches", () => {
-		async function runWithVersion(cliVersion: string, distPathContent: string | null): Promise<void> {
-			vi.resetModules();
-			vi.stubGlobal("__PKG_VERSION__", cliVersion);
-
-			// Parse the legacy-style `source=tag@ver\npath` test fixture into the
-			// new per-source registry mock. No readDistPathInfo mock is needed:
-			// checkVersionMismatch no longer reads the legacy single file.
-			const { traverseDistPaths } = await import("./install/DistPathResolver.js");
-			vi.mocked(traverseDistPaths).mockReset();
-
-			if (distPathContent) {
-				const m = distPathContent.match(/^source=([^@\n]+)(?:@([^\n]+))?\n(.+)$/);
-				if (m?.[2]) {
-					vi.mocked(traverseDistPaths).mockReturnValue([
-						{ source: m[1], version: m[2], distDir: m[3], available: true },
-					]);
-				} else {
-					vi.mocked(traverseDistPaths).mockReturnValue([]);
-				}
-			} else {
-				vi.mocked(traverseDistPaths).mockReturnValue([]);
-			}
-
-			const { main: freshMain } = await import("./Api.js");
-			await freshMain(["status"]);
-		}
-
-		it("should not warn when dist-paths entry has no source= prefix", async () => {
-			await runWithVersion("1.0.0", "some-random-content\n/path/to/dist");
-
-			const calls = vi.mocked(process.stderr.write).mock.calls;
-			const hasWarning = calls.some((c) => String(c[0]).includes("newer version"));
-			expect(hasWarning).toBe(false);
-		});
-
-		it("should pick highest version across multiple registered sources", async () => {
-			vi.resetModules();
-			vi.stubGlobal("__PKG_VERSION__", "1.0.0");
-			const { traverseDistPaths } = await import("./install/DistPathResolver.js");
-			vi.mocked(traverseDistPaths).mockReset();
-			// Mix of available + unavailable + sorted out-of-order; highest available is 2.5.0
-			vi.mocked(traverseDistPaths).mockReturnValue([
-				{ source: "cli", version: "1.0.0", distDir: "/cli", available: true },
-				{ source: "cursor", version: "3.0.0", distDir: "/cursor", available: false },
-				{ source: "vscode", version: "2.5.0", distDir: "/vscode", available: true },
-				{ source: "windsurf", version: "0.5.0", distDir: "/ws", available: true },
-			]);
-
-			vi.mocked(process.stderr.write).mockClear();
-			const { main: freshMain } = await import("./Api.js");
-			await freshMain(["status"]);
-
-			const stderrOutput = vi
-				.mocked(process.stderr.write)
-				.mock.calls.map((c) => String(c[0]))
-				.join("");
-			expect(stderrOutput).toContain("A newer version of jolli is available");
-		});
-	});
-
 	// ── configure command ───────────────────────────────────────────────
 	describe("configure command", () => {
 		it("should display empty config when nothing is set", async () => {
@@ -3868,6 +3817,21 @@ describe("CLI", () => {
 		});
 	});
 
+	// ── hidden update-check refresh command ─────────────────────────────
+	describe("__refresh-update-cache command", () => {
+		it("refreshes the given package list via refreshUpdateCache", async () => {
+			vi.mocked(refreshUpdateCache).mockClear();
+			await main([REFRESH_COMMAND, "@jolli.ai/cli", "@jolli.ai/site-cli"]);
+			expect(refreshUpdateCache).toHaveBeenCalledWith(["@jolli.ai/cli", "@jolli.ai/site-cli"]);
+		});
+
+		it("defaults to the CLI package when no packages are passed", async () => {
+			vi.mocked(refreshUpdateCache).mockClear();
+			await main([REFRESH_COMMAND]);
+			expect(refreshUpdateCache).toHaveBeenCalledWith([CLI_PACKAGE_NAME]);
+		});
+	});
+
 	// ── doctor command ──────────────────────────────────────────────────
 	describe("doctor command", () => {
 		async function runDoctor(
@@ -3882,6 +3846,15 @@ describe("CLI", () => {
 				orphanBranch?: boolean;
 				/** Per-source registry entries. Empty array = no sources registered. */
 				distPaths?: Array<{ source: string; version: string; distDir: string; available: boolean }>;
+				/** Plugin diagnostics returned by inspectPlugins. Empty = no plugins installed. */
+				plugins?: Array<{
+					id: string;
+					packageName: string;
+					installHint: string;
+					state: "absent" | "incompatible" | "ok";
+					installedVersion?: string;
+					peerRange?: string;
+				}>;
 			} = {},
 		): Promise<string[]> {
 			const { getStatus } = await import("./install/Installer.js");
@@ -3889,6 +3862,7 @@ describe("CLI", () => {
 			const { isWorkerLockStale } = await import("./core/Locks.js");
 			const { orphanBranchExists } = await import("./core/GitOps.js");
 			const { traverseDistPaths } = await import("./install/DistPathResolver.js");
+			const { inspectPlugins } = await import("./PluginLoader.js");
 
 			// Reset (prevent bleed-over from prior tests' mockResolvedValueOnce)
 			vi.mocked(getStatus).mockReset();
@@ -3898,6 +3872,7 @@ describe("CLI", () => {
 			vi.mocked(loadAllSessions).mockReset();
 			vi.mocked(orphanBranchExists).mockReset();
 			vi.mocked(traverseDistPaths).mockReset();
+			vi.mocked(inspectPlugins).mockReset();
 
 			vi.mocked(getStatus).mockResolvedValue({
 				enabled: true,
@@ -3918,6 +3893,7 @@ describe("CLI", () => {
 			vi.mocked(traverseDistPaths).mockReturnValue(
 				overrides.distPaths ?? [{ source: "cli", version: "0.97.12", distDir: "/mock/dist", available: true }],
 			);
+			vi.mocked(inspectPlugins).mockResolvedValue(overrides.plugins ?? []);
 
 			vi.mocked(console.log).mockClear();
 			await main(args);
@@ -4005,6 +3981,83 @@ describe("CLI", () => {
 			expect(output).toContain("✓ dist-paths/cli");
 			expect(output).toContain("⚠ dist-paths/cursor");
 			expect(output).toContain("MISSING");
+		});
+
+		it("should report a compatible installed plugin as ok", async () => {
+			const output = (
+				await runDoctor(["doctor"], {
+					apiKey: "sk-ant-test",
+					plugins: [
+						{
+							id: "fixture-id",
+							packageName: "@jolli.ai/site-cli",
+							installHint: "npm install -g @jolli.ai/site-cli",
+							state: "ok",
+							installedVersion: "0.4.2",
+							peerRange: ">=0.99.0",
+						},
+					],
+				})
+			).join("\n");
+			expect(output).toContain("✓ plugin @jolli.ai/site-cli");
+			expect(output).toContain("0.4.2");
+		});
+
+		it("should flag an incompatible installed plugin as warn with an upgrade hint", async () => {
+			const output = (
+				await runDoctor(["doctor"], {
+					apiKey: "sk-ant-test",
+					plugins: [
+						{
+							id: "fixture-id",
+							packageName: "@jolli.ai/space-cli",
+							installHint: "npm install -g @jolli.ai/space-cli",
+							state: "incompatible",
+							installedVersion: "0.2.0",
+							peerRange: ">=2.0.0",
+						},
+					],
+				})
+			).join("\n");
+			expect(output).toContain("⚠ plugin @jolli.ai/space-cli");
+			expect(output).toContain(">=2.0.0");
+			expect(output).toContain("npm install -g @jolli.ai/space-cli");
+		});
+
+		it("should render 'unknown' when an installed plugin has no version field", async () => {
+			const output = (
+				await runDoctor(["doctor"], {
+					apiKey: "sk-ant-test",
+					plugins: [
+						{
+							id: "fixture-id",
+							packageName: "@jolli.ai/site-cli",
+							installHint: "npm install -g @jolli.ai/site-cli",
+							state: "ok",
+							// installedVersion omitted — package.json lacked a version field
+						},
+					],
+				})
+			).join("\n");
+			expect(output).toContain("✓ plugin @jolli.ai/site-cli");
+			expect(output).toContain("vunknown");
+		});
+
+		it("should omit absent plugins from the doctor report", async () => {
+			const output = (
+				await runDoctor(["doctor"], {
+					apiKey: "sk-ant-test",
+					plugins: [
+						{
+							id: "fixture-id",
+							packageName: "@jolli.ai/site-cli",
+							installHint: "npm install -g @jolli.ai/site-cli",
+							state: "absent",
+						},
+					],
+				})
+			).join("\n");
+			expect(output).not.toContain("plugin @jolli.ai/site-cli");
 		});
 
 		it("should auto-fix stale dist-paths entry when --fix is passed", async () => {

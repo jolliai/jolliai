@@ -49,6 +49,55 @@ export function execFileAsyncHidden(
 	}>;
 }
 
+/**
+ * Run an `npm` subcommand cross-platform, returning trimmed stdout or null on
+ * any failure (npm missing, non-zero exit, timeout, empty output).
+ *
+ * On Windows the npm launcher is `npm.cmd`, and a bare `npm` cannot be spawned
+ * without a shell: `execFile`/`spawn` don't resolve via `PATHEXT` (→ `ENOENT`),
+ * and since the Node fix for CVE-2024-27980 (18.20.2 / 20.12.2 / 21.7.2 — all
+ * below our `>=22.5` floor) even an explicit `npm.cmd` is rejected without
+ * `shell: true` (→ `EINVAL`). So we opt into a shell on win32 only, where
+ * `cmd.exe` resolves `npm.cmd` through `PATHEXT`. Every caller passes static
+ * tokens plus allow-listed package names — never user-controlled input — and the
+ * `UNSAFE_ARG` guard below enforces that contract in code rather than leaving it
+ * to comment discipline, so the shell carries no injection surface.
+ *
+ * Single source of truth for "how to invoke npm" so a future third call site
+ * can't reintroduce the bare-`execFile("npm")` bug that silently no-ops on
+ * Windows.
+ *
+ * Coverage-ignored: the only effect is spawning npm, which can't be unit-tested
+ * deterministically without a fake npm on PATH — same rationale the two former
+ * inline runners carried.
+ */
+/** A shell-unsafe argument is anything outside the chars npm tokens / package names actually use. */
+const UNSAFE_ARG = /[^\w.@/-]/;
+
+/* v8 ignore start */
+export async function runNpmCommand(args: ReadonlyArray<string>, opts?: { timeout?: number }): Promise<string | null> {
+	// Programmer-error guard, deliberately OUTSIDE the try below: a caller that
+	// passes an arg with shell metacharacters is a bug to surface loudly, not to
+	// swallow into a silent null (which is the very failure mode this helper exists
+	// to prevent). Validated on every platform so the mistake is caught in dev, not
+	// only once it reaches the win32 `shell: true` path.
+	const unsafe = args.find((arg) => UNSAFE_ARG.test(arg));
+	if (unsafe !== undefined) {
+		throw new Error(`runNpmCommand: refusing to invoke npm with shell-unsafe argument: ${JSON.stringify(unsafe)}`);
+	}
+	try {
+		const { stdout } = await execFileAsyncHidden("npm", args, {
+			timeout: opts?.timeout,
+			shell: process.platform === "win32",
+		});
+		const trimmed = stdout.trim();
+		return trimmed.length > 0 ? trimmed : null;
+	} catch {
+		return null;
+	}
+}
+/* v8 ignore stop */
+
 export function execFileSyncHidden(
 	file: string,
 	args: ReadonlyArray<string> | undefined,

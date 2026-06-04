@@ -16,9 +16,10 @@ import { dirname, join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getHelpGroup } from "./commands/HelpGroups.js";
+import type { KnownPlugin } from "./KnownPlugins.js";
 import { KNOWN_PLUGINS } from "./KnownPlugins.js";
 import { setSilentConsole } from "./Logger.js";
-import { getNpmRootGlobal, loadPlugins } from "./PluginLoader.js";
+import { getNpmRootGlobal, inspectPlugins, loadPlugins } from "./PluginLoader.js";
 
 const FIXTURE_NAME = "@test-fixtures/example-plugin";
 const FIXTURE_SCOPE = "@test-fixtures";
@@ -38,6 +39,7 @@ async function writeFixture(
 	tempDir: string,
 	opts: {
 		name?: string;
+		version?: string;
 		peerVersion?: string;
 		pluginSource?: string;
 		mainPath?: string;
@@ -54,7 +56,7 @@ async function writeFixture(
 	} else {
 		const pkg: Record<string, unknown> = {
 			name,
-			version: "0.1.0",
+			version: opts.version ?? "0.1.0",
 			// Critical: dynamic import of `.js` requires ESM resolution, which the
 			// nearest package.json's `"type": "module"` provides.
 			type: "module",
@@ -632,13 +634,12 @@ describe("loadPlugins", () => {
 		await mkdir(pkgDir, { recursive: true });
 		await writeFile(join(pkgDir, "package.json"), "[]", "utf-8");
 		const program = new Command();
-		await expect(
-			loadPlugins(program, "0.100.0", {
-				rootsOverride: [join(tempDir, "node_modules")],
-				allowlistOverride: [FIXTURE_ID],
-				scopesOverride: [FIXTURE_SCOPE],
-			}),
-		).resolves.toBeInstanceOf(Set);
+		const { loaded } = await loadPlugins(program, "0.100.0", {
+			rootsOverride: [join(tempDir, "node_modules")],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(loaded).toBeInstanceOf(Set);
 		expect(program.commands).toHaveLength(0);
 	});
 
@@ -673,13 +674,12 @@ describe("loadPlugins", () => {
 			"utf-8",
 		);
 		const program = new Command();
-		await expect(
-			loadPlugins(program, "0.100.0", {
-				rootsOverride: [join(tempDir, "node_modules")],
-				allowlistOverride: [FIXTURE_ID],
-				scopesOverride: [FIXTURE_SCOPE],
-			}),
-		).resolves.toBeInstanceOf(Set);
+		const { loaded } = await loadPlugins(program, "0.100.0", {
+			rootsOverride: [join(tempDir, "node_modules")],
+			allowlistOverride: [FIXTURE_ID],
+			scopesOverride: [FIXTURE_SCOPE],
+		});
+		expect(loaded).toBeInstanceOf(Set);
 		expect(program.commands).toHaveLength(0);
 	});
 
@@ -1254,7 +1254,7 @@ describe("loadPlugins", () => {
 			pluginSource: "export const register = (ctx) => { ctx.program.command('plugin-ok').action(() => {}); };",
 		});
 		const program = new Command();
-		const loaded = await loadPlugins(program, "0.100.0", {
+		const { loaded } = await loadPlugins(program, "0.100.0", {
 			rootsOverride: [root],
 			allowlistOverride: [FIXTURE_ID],
 			scopesOverride: [FIXTURE_SCOPE],
@@ -1272,7 +1272,7 @@ describe("loadPlugins", () => {
 		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 		try {
 			const program = new Command();
-			const loaded = await loadPlugins(program, "0.100.0", {
+			const { loaded } = await loadPlugins(program, "0.100.0", {
 				rootsOverride: [root],
 				allowlistOverride: [FIXTURE_ID],
 				scopesOverride: [FIXTURE_SCOPE],
@@ -1293,7 +1293,7 @@ describe("loadPlugins", () => {
 		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 		try {
 			const program = new Command();
-			const loaded = await loadPlugins(program, "0.100.0", {
+			const { loaded } = await loadPlugins(program, "0.100.0", {
 				rootsOverride: [root],
 				allowlistOverride: [FIXTURE_ID],
 				scopesOverride: [FIXTURE_SCOPE],
@@ -1412,5 +1412,163 @@ describe("getNpmRootGlobal", () => {
 		});
 		// Still returns the runtime path even if cache write fails
 		expect(result).toBe("/runtime/path");
+	});
+});
+
+describe("inspectPlugins", () => {
+	// inspectPlugins maps each KNOWN_PLUGINS entry to a three-state diagnostic
+	// (absent / incompatible / ok), reusing the same discovery + peer-range
+	// logic as loadPlugins so the visibility layer never disagrees with what
+	// the loader actually does.
+	let tempDir: string;
+
+	const KNOWN: ReadonlyArray<KnownPlugin> = [
+		{
+			id: FIXTURE_ID,
+			packageName: FIXTURE_NAME,
+			installHint: "npm install -g @test-fixtures/example-plugin",
+		},
+	];
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "plugin-inspect-test-"));
+		delete process.env.JOLLI_NO_PLUGINS;
+		delete process.env.JOLLI_NO_PLUGIN_WARNINGS;
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("reports absent for a known plugin not installed on disk", async () => {
+		const diagnostics = await inspectPlugins("1.0.0", {
+			rootsOverride: [join(tempDir, "node_modules")],
+			scopesOverride: [FIXTURE_SCOPE],
+			knownPluginsOverride: KNOWN,
+		});
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({
+			id: FIXTURE_ID,
+			packageName: FIXTURE_NAME,
+			state: "absent",
+		});
+		expect(diagnostics[0].installedVersion).toBeUndefined();
+	});
+
+	it("reports ok with the installed version for a compatible plugin", async () => {
+		const root = await writeFixture(tempDir, { version: "0.4.2", peerVersion: ">=1.0.0" });
+		const diagnostics = await inspectPlugins("1.5.0", {
+			rootsOverride: [root],
+			scopesOverride: [FIXTURE_SCOPE],
+			knownPluginsOverride: KNOWN,
+		});
+		expect(diagnostics[0]).toMatchObject({
+			state: "ok",
+			installedVersion: "0.4.2",
+			peerRange: ">=1.0.0",
+		});
+	});
+
+	it("reports incompatible when the peer range excludes the cli version", async () => {
+		const root = await writeFixture(tempDir, { version: "0.4.2", peerVersion: ">=2.0.0" });
+		const diagnostics = await inspectPlugins("1.0.0", {
+			rootsOverride: [root],
+			scopesOverride: [FIXTURE_SCOPE],
+			knownPluginsOverride: KNOWN,
+		});
+		expect(diagnostics[0]).toMatchObject({
+			state: "incompatible",
+			installedVersion: "0.4.2",
+			peerRange: ">=2.0.0",
+		});
+	});
+
+	it("treats a plugin with no peerDependencies as ok", async () => {
+		const root = await writeFixture(tempDir, { version: "1.2.3" });
+		const diagnostics = await inspectPlugins("0.0.1", {
+			rootsOverride: [root],
+			scopesOverride: [FIXTURE_SCOPE],
+			knownPluginsOverride: KNOWN,
+		});
+		expect(diagnostics[0]).toMatchObject({ state: "ok", installedVersion: "1.2.3" });
+		expect(diagnostics[0].peerRange).toBeUndefined();
+	});
+
+	it("defaults to the production KNOWN_PLUGINS list when none is injected", async () => {
+		// With an empty root and the real allow-list, every known plugin is absent.
+		const diagnostics = await inspectPlugins("1.0.0", {
+			rootsOverride: [join(tempDir, "node_modules")],
+		});
+		expect(diagnostics).toHaveLength(KNOWN_PLUGINS.length);
+		expect(diagnostics.every((d) => d.state === "absent")).toBe(true);
+		expect(diagnostics.map((d) => d.packageName)).toEqual(KNOWN_PLUGINS.map((p) => p.packageName));
+	});
+
+	it("reports every known plugin absent when JOLLI_NO_PLUGINS=1, even if installed", async () => {
+		// The loader short-circuits discovery under the kill-switch, so nothing is
+		// loadable; the diagnostic must agree (never claim an on-disk plugin ok)
+		// or doctor/version-check would disagree with what loadPlugins does.
+		const root = await writeFixture(tempDir, { version: "0.4.2", peerVersion: ">=1.0.0" });
+		process.env.JOLLI_NO_PLUGINS = "1";
+		const diagnostics = await inspectPlugins("1.5.0", {
+			rootsOverride: [root],
+			scopesOverride: [FIXTURE_SCOPE],
+			knownPluginsOverride: KNOWN,
+		});
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({ id: FIXTURE_ID, state: "absent" });
+		expect(diagnostics[0].installedVersion).toBeUndefined();
+	});
+});
+
+describe("loadPlugins diagnostics", () => {
+	// loadPlugins computes its PluginDiagnostic snapshot from the same single
+	// discovery walk it uses to load, so the hot path (checkVersionMismatch) can
+	// reuse it instead of re-scanning the filesystem.
+	let tempDir: string;
+
+	const KNOWN: ReadonlyArray<KnownPlugin> = [
+		{
+			id: FIXTURE_ID,
+			packageName: FIXTURE_NAME,
+			installHint: "npm install -g @test-fixtures/example-plugin",
+		},
+	];
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "plugin-load-diag-test-"));
+		delete process.env.JOLLI_NO_PLUGINS;
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("returns diagnostics alongside the loaded set from one discovery", async () => {
+		const root = await writeFixture(tempDir, {
+			version: "0.4.2",
+			peerVersion: "^0.100.0",
+			pluginSource: "export const register = (ctx) => { ctx.program.command('diag-ok').action(() => {}); };",
+		});
+		const program = new Command();
+		const { loaded, diagnostics } = await loadPlugins(program, "0.100.0", {
+			rootsOverride: [root],
+			scopesOverride: [FIXTURE_SCOPE],
+			knownPluginsOverride: KNOWN,
+		});
+		expect(loaded.has(FIXTURE_ID)).toBe(true);
+		const entry = diagnostics.find((d) => d.id === FIXTURE_ID);
+		expect(entry).toMatchObject({ state: "ok", installedVersion: "0.4.2", peerRange: "^0.100.0" });
+	});
+
+	it("returns an all-absent diagnostic snapshot when JOLLI_NO_PLUGINS=1", async () => {
+		process.env.JOLLI_NO_PLUGINS = "1";
+		const program = new Command();
+		const { loaded, diagnostics } = await loadPlugins(program, "0.100.0", {
+			rootsOverride: [join(tempDir, "node_modules")],
+		});
+		expect(loaded.size).toBe(0);
+		expect(diagnostics).toHaveLength(KNOWN_PLUGINS.length);
+		expect(diagnostics.every((d) => d.state === "absent")).toBe(true);
 	});
 });

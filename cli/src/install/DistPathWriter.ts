@@ -26,22 +26,26 @@ const log = createLogger("DistPathWriter");
  *   <version>
  *   /absolute/path/to/dist
  *
- * The version is the `@jolli.ai/cli` core version (`__PKG_VERSION__`), not the
- * IDE extension's own release version. CLI, VS Code, Cursor, etc. all bundle
- * the same `@jolli.ai/cli` core, so versions are directly comparable.
+ * The version is the `@jolli.ai/cli` core version (`__CLI_PKG_VERSION__`), not
+ * the IDE extension's own release version. CLI, VS Code, Cursor, etc. all bundle
+ * the same `@jolli.ai/cli` core, so versions are directly comparable — runtime
+ * selection picks the surface carrying the newest *core*. `__CLI_PKG_VERSION__`
+ * (rather than `__PKG_VERSION__`) is required because under the VSCode bundle
+ * `__PKG_VERSION__` is the extension's own release number, which diverges from
+ * the bundled core's version (see Globals.d.ts).
  *
  * @param sourceTag - Source identifier ("cli", "vscode", "cursor", ...).
  *   Becomes the filename inside `dist-paths/`.
  * @param distDir - Absolute path to the dist directory. Defaults to the
  *   caller's own dist/.
- * @param version - Core version. Defaults to `__PKG_VERSION__`.
+ * @param version - Core version. Defaults to `__CLI_PKG_VERSION__`.
  *
  * @returns `true` on success, `false` on filesystem failure (logged as warning).
  */
 export async function installDistPath(sourceTag: string, distDir?: string, version?: string): Promise<boolean> {
 	const currentDir = distDir ?? dirname(fileURLToPath(import.meta.url));
-	/* v8 ignore start -- compile-time ternary: __PKG_VERSION__ is always defined in bundled builds */
-	const ver = version ?? (typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev");
+	/* v8 ignore start -- compile-time ternary: __CLI_PKG_VERSION__ is always defined in bundled builds */
+	const ver = version ?? (typeof __CLI_PKG_VERSION__ !== "undefined" ? __CLI_PKG_VERSION__ : "dev");
 	/* v8 ignore stop */
 	const distPathsDir = join(homedir(), ".jolli", "jollimemory", "dist-paths");
 	const distPathFile = join(distPathsDir, sourceTag);

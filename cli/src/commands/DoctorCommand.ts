@@ -19,7 +19,8 @@ import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfi
 import { traverseDistPaths } from "../install/DistPathResolver.js";
 import { getStatus, install } from "../install/Installer.js";
 import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
-import { resolveProjectDir } from "./CliUtils.js";
+import { inspectPlugins } from "../PluginLoader.js";
+import { resolveProjectDir, VERSION } from "./CliUtils.js";
 
 const log = createLogger("doctor");
 
@@ -174,6 +175,39 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 							return "removed stale entry";
 						}
 					: undefined,
+			});
+		}
+	}
+
+	// 8. Known plugins. Only installed plugins are reported — an absent plugin
+	// is the normal state for most users (the commands still surface via stubs
+	// in `jolli --help`), so listing them here would be noise. An `incompatible`
+	// plugin is a warn (not a fail): the CLI keeps working because the stub takes
+	// over, but the user should know to upgrade.
+	//
+	// `inspectPlugins` is a no-load probe: `ok` means "installed and version-
+	// compatible", NOT "loaded successfully". A plugin with a broken `main`,
+	// failed import, or throwing `register()` is still version-compatible and
+	// reads `ok` here — the loader rejects it separately and warns at load time.
+	// The row text says "installed, compatible" (not "working") to avoid
+	// overstating what this check actually verified.
+	for (const p of await inspectPlugins(VERSION)) {
+		if (p.state === "absent") continue;
+		const version = p.installedVersion ?? "unknown";
+		if (p.state === "ok") {
+			checks.push({
+				name: `plugin ${p.packageName}`,
+				status: "ok",
+				message: `v${version} (installed, compatible)`,
+			});
+		} else {
+			// `incompatible` implies a declared peer range — isPeerCompatible only
+			// returns false when peerRange is present and unsatisfied — so peerRange
+			// is always a string here.
+			checks.push({
+				name: `plugin ${p.packageName}`,
+				status: "warn",
+				message: `v${version} requires @jolli.ai/cli ${p.peerRange}, but you have ${VERSION} — upgrade the CLI (npm update -g @jolli.ai/cli) or reinstall a compatible plugin (${p.installHint})`,
 			});
 		}
 	}
