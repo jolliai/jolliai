@@ -79,8 +79,11 @@ import { loadBranchSummaries } from "./BranchSummaryLoader.js";
 import { SOURCE_TITLES } from "./SourceLabels.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
 import {
+	buildAllConversationsSection,
 	buildE2eTestSection,
 	buildHtml,
+	buildJolliRow,
+	buildPlansAndNotesSection,
 	buildRecapSection,
 	buildTopicsSection,
 	renderE2eScenario,
@@ -1169,6 +1172,105 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
+	 * Partial-refresh helpers — used by mutation handlers instead of `update()`
+	 * to re-render just the affected block via `postMessage` (no full-page
+	 * `webview.html` rebuild, so expand/collapse + scroll state survive).
+	 *
+	 * Each helper mirrors `update()`'s two preconditions: bail if the panel was
+	 * disposed mid-await, then adopt the new summary as `currentSummary` so a
+	 * subsequent block render reads fresh data. Render inputs reuse the same
+	 * cached translate/transcript sets as `update()` so partial and full renders
+	 * stay in sync.
+	 *
+	 * They deliberately do NOT skip while `regenerateInProgress`: these blocks
+	 * (plans/notes, topics, conversations) are disjoint from what the regenerate
+	 * completion re-renders (topics+recap+banner only re-render via
+	 * `summaryRegenerated`; plans/notes + conversations do not). An in-flight
+	 * async write (e.g. a translate dispatched before regenerate started, landing
+	 * mid-regenerate) MUST still post its partial refresh — it is the only path
+	 * that clears the block's loading state (there is no `*Translated` /
+	 * `transcriptsSaved` DOM-restore in the webview; the section rebuild is the
+	 * restore). Skipping it would strand the translate button on "translating" or
+	 * the transcript modal on "Saving…". The regenerating-readonly CSS still hides
+	 * the freshly-rendered block's buttons, so no readonly affordance leaks.
+	 */
+	private get isReadOnlyPanel(): boolean {
+		return !!this.foreignRepoName || !!this.staleRewrittenInto;
+	}
+
+	/**
+	 * Re-renders the Plans & Notes block AND the header `#jolliRow`. The two are
+	 * sent together because `#jolliRow` embeds the published Plans & Notes link
+	 * list (see buildJolliRow); refreshing only the section would leave the
+	 * header's link list stale after a published plan/note add/remove.
+	 */
+	private refreshPlansAndNotes(summary: CommitSummary): void {
+		if (this.disposed) {
+			return;
+		}
+		this.currentSummary = summary;
+		this.panel.webview.postMessage({
+			command: "plansAndNotesUpdated",
+			html: buildPlansAndNotesSection(
+				summary.plans,
+				summary.notes,
+				summary.references ?? [],
+				this.planTranslateSet,
+				this.noteTranslateSet,
+				this.referenceTranslateSet,
+			),
+		});
+		this.panel.webview.postMessage({
+			command: "jolliRowUpdated",
+			html: buildJolliRow(
+				summary.jolliDocUrl,
+				summary.commitMessage,
+				summary.plans,
+				summary.notes,
+			),
+		});
+	}
+
+	/**
+	 * Re-renders the whole `#topicsSection`. Topic edit/delete buttons carry a
+	 * positional `treeIndex`; deleting a topic shifts every later index, so the
+	 * whole section is rebuilt (rather than removing one node) to keep indices
+	 * consistent. Nothing outside the topics block depends on topic data, so no
+	 * companion refresh is needed.
+	 */
+	private refreshTopicsSection(summary: CommitSummary): void {
+		if (this.disposed) {
+			return;
+		}
+		this.currentSummary = summary;
+		this.panel.webview.postMessage({
+			command: "topicsUpdated",
+			html: buildTopicsSection(summary, { readOnly: this.isReadOnlyPanel }),
+		});
+	}
+
+	/**
+	 * Re-renders the whole `#allConversationsSection` (private-zone + modal).
+	 * Caller must refresh `this.transcriptHashSet` first (transcript save/delete
+	 * already does). The header "Conversations N turns" row reads the stored
+	 * `conversationTurns` field, not the transcript files, so it is unaffected
+	 * and needs no companion refresh.
+	 */
+	private refreshConversations(summary: CommitSummary): void {
+		if (this.disposed) {
+			return;
+		}
+		this.currentSummary = summary;
+		this.panel.webview.postMessage({
+			command: "conversationsUpdated",
+			html: buildAllConversationsSection(
+				this.transcriptHashSet,
+				!!this.foreignRepoName,
+			),
+		});
+	}
+
+	/**
 	 * Refreshes the cached `transcriptHashSet` (logically a transcript-ID set
 	 * after v5: the entries may be UUIDs or legacy commit hashes — both are
 	 * opaque IDs to read/write/delete paths). Pulled via `getTranscriptIds`
@@ -2159,8 +2261,10 @@ export class SummaryWebviewPanel {
 		}
 
 		await this.bridge.storeSummary(result.result, true);
-		this.update(result.result);
-		this.panel.webview.postMessage({ command: "topicDeleted", topicIndex });
+		// Re-render the whole topics section (not a single-node removal): topic
+		// edit/delete buttons carry positional treeIndex values, and deleting one
+		// shifts every later index, so a full section rebuild keeps them correct.
+		this.refreshTopicsSection(result.result);
 	}
 
 	/** Generates E2E test scenarios from the current summary via AI. */
@@ -2455,7 +2559,12 @@ export class SummaryWebviewPanel {
 	 * Extracts the title from plan markdown content and syncs it to
 	 * CommitSummary.plans, plans.json registry, and the current webview.
 	 */
-	private async syncPlanTitle(slug: string, content: string): Promise<void> {
+	private async syncPlanTitle(
+		slug: string,
+		content: string,
+		opts: { refresh?: boolean } = {},
+	): Promise<void> {
+		const { refresh = true } = opts;
 		const titleMatch = /^#\s+(.+)/m.exec(content);
 		const newTitle = titleMatch?.[1]?.trim();
 		if (!newTitle || !this.currentSummary?.plans) {
@@ -2471,7 +2580,12 @@ export class SummaryWebviewPanel {
 		};
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
-		this.update(updatedSummary);
+		// `refresh: false` lets the translate path batch a single refresh after it
+		// finishes its own state mutation (planTranslateSet.delete), avoiding a
+		// double render where the first one still shows the 🌐 button.
+		if (refresh) {
+			this.refreshPlansAndNotes(updatedSummary);
+		}
 
 		const registry = await loadPlansRegistry(this.workspaceRoot);
 		const entry = registry.plans[slug];
@@ -2538,7 +2652,7 @@ export class SummaryWebviewPanel {
 		// does not install setActiveStorage; only QueueWorker does).
 		await this.bridge.cleanupVisiblePlanArtifact(slug, summary.branch);
 
-		this.update(updatedSummary);
+		this.refreshPlansAndNotes(updatedSummary);
 	}
 
 	private async handleAddPlan(): Promise<void> {
@@ -2598,7 +2712,7 @@ export class SummaryWebviewPanel {
 		};
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
-		this.update(updatedSummary);
+		this.refreshPlansAndNotes(updatedSummary);
 	}
 
 	private async handleAddMarkdownNote(): Promise<void> {
@@ -2656,7 +2770,7 @@ export class SummaryWebviewPanel {
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 		await this.refreshNoteTranslateSet(updatedSummary);
-		this.update(updatedSummary);
+		this.refreshPlansAndNotes(updatedSummary);
 	}
 
 	private async handleSaveSnippet(
@@ -2701,7 +2815,7 @@ export class SummaryWebviewPanel {
 		await this.bridge.storeSummary(updatedSummary, true);
 		this.currentSummary = updatedSummary;
 		await this.refreshNoteTranslateSet(updatedSummary);
-		this.update(updatedSummary);
+		this.refreshPlansAndNotes(updatedSummary);
 		this.panel.webview.postMessage({ command: "snippetSaved" });
 	}
 
@@ -2775,7 +2889,10 @@ export class SummaryWebviewPanel {
 			};
 			await this.bridge.storeSummary(updatedSummary, true);
 			this.currentSummary = updatedSummary;
-			this.update(updatedSummary);
+			// Stays inside the `if (this.currentSummary?.notes)` block: when there
+			// are no notes there is nothing to re-render, but `noteSaved` below is
+			// still posted so the webview exits inline-edit mode.
+			this.refreshPlansAndNotes(updatedSummary);
 		}
 
 		this.panel.webview.postMessage({ command: "noteSaved", id });
@@ -2829,7 +2946,7 @@ export class SummaryWebviewPanel {
 		// instance (see handleRemovePlan for the rationale).
 		await this.bridge.cleanupVisibleNoteArtifact(id, summary.branch);
 
-		this.update(updatedSummary);
+		this.refreshPlansAndNotes(updatedSummary);
 	}
 
 	// ── Reference actions (multi-source: Linear / Jira / GitHub / Notion) ───
@@ -3021,7 +3138,7 @@ export class SummaryWebviewPanel {
 		// here. A later re-reference of the same entity is re-discovered as a
 		// fresh uncommitted reference — dissociation does not blacklist.
 
-		this.update(updatedSummary);
+		this.refreshPlansAndNotes(updatedSummary);
 	}
 
 	/**
@@ -3088,7 +3205,7 @@ export class SummaryWebviewPanel {
 		// Drop from translate set immediately — user explicitly translated.
 		this.referenceTranslateSet.delete(archivedKey);
 		if (this.currentSummary) {
-			this.update(this.currentSummary);
+			this.refreshPlansAndNotes(this.currentSummary);
 		}
 
 		this.panel.webview.postMessage({
@@ -3162,12 +3279,14 @@ export class SummaryWebviewPanel {
 			[{ slug, content: translated }],
 			`Translate plan ${slug} to English`,
 		);
-		await this.syncPlanTitle(slug, translated);
+		// `refresh: false`: syncPlanTitle must not render before the translate set
+		// is updated below, or the first render would still show the 🌐 button.
+		await this.syncPlanTitle(slug, translated, { refresh: false });
 
 		// Remove from translate set immediately — user explicitly requested translation
 		this.planTranslateSet.delete(slug);
 		if (this.currentSummary) {
-			this.update(this.currentSummary);
+			this.refreshPlansAndNotes(this.currentSummary);
 		}
 
 		this.panel.webview.postMessage({ command: "planTranslated", slug });
@@ -3256,7 +3375,7 @@ export class SummaryWebviewPanel {
 		// Remove from translate set immediately — user explicitly requested translation
 		this.noteTranslateSet.delete(id);
 		if (this.currentSummary) {
-			this.update(this.currentSummary);
+			this.refreshPlansAndNotes(this.currentSummary);
 		}
 
 		const translatedTitle =
@@ -3552,7 +3671,7 @@ export class SummaryWebviewPanel {
 		// Refresh cache and webview
 		if (this.currentSummary) {
 			await this.refreshTranscriptHashes(this.currentSummary);
-			this.update(this.currentSummary);
+			this.refreshConversations(this.currentSummary);
 		}
 
 		this.panel.webview.postMessage({ command: "transcriptsSaved" });
@@ -3628,7 +3747,7 @@ export class SummaryWebviewPanel {
 		// Refresh cache and webview
 		if (this.currentSummary) {
 			await this.refreshTranscriptHashes(this.currentSummary);
-			this.update(this.currentSummary);
+			this.refreshConversations(this.currentSummary);
 		}
 
 		this.panel.webview.postMessage({ command: "transcriptsDeleted" });
