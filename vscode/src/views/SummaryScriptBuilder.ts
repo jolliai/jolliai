@@ -131,16 +131,18 @@ ${buildPrMessageScript()}
         if (oldToggle._escHandler) {
           document.removeEventListener('keydown', oldToggle._escHandler);
         }
-        // Check if old toggle was expanded
-        var wasOpen = oldToggle.classList.contains('open');
+        // Preserve the collapsed state across the re-render. Topics collapse via
+        // the "collapsed" class ("open" is for dropdown menus / the snippet form),
+        // so the prior "open" snapshot here was a no-op that silently dropped the
+        // collapse state on every single-topic edit.
+        var wasCollapsed = oldToggle.classList.contains('collapsed');
         // Replace with server-rendered HTML
         var wrapper = document.createElement('div');
         wrapper.innerHTML = msg.html;
         var newToggle = wrapper.firstElementChild;
         if (newToggle) {
           oldToggle.replaceWith(newToggle);
-          // Preserve open/collapsed state
-          if (wasOpen) { newToggle.classList.add('open'); }
+          if (wasCollapsed) { newToggle.classList.add('collapsed'); }
           // Re-attach edit/delete button handlers on the new element
           attachTopicHandlers(newToggle);
         }
@@ -154,6 +156,47 @@ ${buildPrMessageScript()}
         if (saveBtn) { saveBtn.textContent = 'Save'; saveBtn.disabled = false; }
         if (cancelBtn) { cancelBtn.disabled = false; }
       }
+    }
+
+    // ── Topics whole-section replace (after a topic delete) ──
+    // Topic edit/delete buttons carry positional treeIndex values; deleting one
+    // shifts every later index, so we rebuild the whole #topicsSection rather
+    // than removing a single node. But a blind rebuild would re-expand the
+    // topics the user had collapsed, so we snapshot each surviving topic's
+    // collapsed state — keyed by its data-topic payload, which is stable across
+    // the treeIndex renumbering (the topic-<index> id is NOT) — and restore it
+    // after the replace, then recompute allCollapsed so the #toggleAllBtn label
+    // stays accurate. Editing ESC handlers are also cleaned up before the nodes
+    // are discarded (partial replace keeps the JS context, so a leaked global
+    // keydown would accumulate).
+    if (msg.command === 'topicsUpdated' && typeof msg.html === 'string') {
+      var oldTopicsSec = document.getElementById('topicsSection');
+      var collapseByTopic = {};
+      if (oldTopicsSec) {
+        oldTopicsSec.querySelectorAll('.toggle').forEach(function(t) {
+          var key = t.getAttribute('data-topic');
+          if (key) collapseByTopic[key] = t.classList.contains('collapsed');
+          if (t.classList.contains('editing') && t._escHandler) {
+            document.removeEventListener('keydown', t._escHandler);
+          }
+        });
+      }
+      replaceSection('topicsSection', msg.html);
+      var newTopicsSec = document.getElementById('topicsSection');
+      var topicCount = 0;
+      var everyCollapsed = true;
+      if (newTopicsSec) {
+        attachTopicHandlers(newTopicsSec);
+        newTopicsSec.querySelectorAll('.toggle-header').forEach(attachToggleHeader);
+        newTopicsSec.querySelectorAll('.toggle').forEach(function(t) {
+          topicCount++;
+          var key = t.getAttribute('data-topic');
+          if (key && collapseByTopic[key]) t.classList.add('collapsed');
+          if (!t.classList.contains('collapsed')) everyCollapsed = false;
+        });
+      }
+      allCollapsed = topicCount > 0 && everyCollapsed;
+      attachToggleAllBtnHandler();
     }
 
     // ── Recap edit / generate status ──
@@ -732,11 +775,16 @@ ${buildPrMessageScript()}
     if (banner) banner.remove();
   }
 
-  // CONTRACT: this function depends on buildRecapSection in
-  // SummaryHtmlBuilder.ts emitting "<div id='recapSection'>...</div><hr/>"
-  // (two siblings) and buildTopicsSection emitting a single <div>. If either
-  // shape changes, update this function in the same commit — otherwise the
-  // regenerate success path leaves stacked or missing <hr class="separator">.
+  // CONTRACT: callers pass section HTML from SummaryHtmlBuilder.ts. Two shapes
+  // exist and both are handled by the trailing-<hr> logic below:
+  //   - "<div id='…'>…</div><hr class='separator'/>" (two siblings) —
+  //     buildRecapSection, buildE2eTestSection, buildPlansAndNotesSection.
+  //   - "<div id='…'>…</div>" (single node, no trailing <hr>) —
+  //     buildTopicsSection (last content section before the footer).
+  // Used by summaryRegenerated (recap+topics), topicsUpdated, and
+  // plansAndNotesUpdated. If any of those builders' trailing-separator shape
+  // changes, update the logic below in the same commit — otherwise the partial
+  // refresh leaves stacked or missing <hr class="separator">.
   function replaceSection(id, html) {
     var old = document.getElementById(id);
     if (!old) return;
@@ -744,10 +792,15 @@ ${buildPrMessageScript()}
     wrap.innerHTML = html;
     var nodes = Array.prototype.slice.call(wrap.childNodes).filter(function(n) { return n.nodeType === 1; });
     if (nodes.length === 0) return;
-    // Drop the OLD recap's trailing <hr> before splicing in the new node(s),
-    // so we don't end up with two separators stacked.
+    // If the NEW html ends with its own <hr class="separator"> sibling, drop the
+    // OLD node's trailing <hr> first so we don't stack two separators. The
+    // recap / e2e / plansAndNotes sections all emit a "<div>…</div><hr/>" pair;
+    // topicsSection ends in "</div>" (no trailing <hr>), so the guard is a
+    // no-op there. Generalized from the former recap-only special case so the
+    // same helper serves topicsUpdated / plansAndNotesUpdated too.
+    var lastNew = nodes[nodes.length - 1];
     var sep = old.nextElementSibling;
-    if (sep && sep.tagName === 'HR' && id === 'recapSection') sep.remove();
+    if (lastNew && lastNew.tagName === 'HR' && sep && sep.tagName === 'HR') sep.remove();
     old.replaceWith.apply(old, nodes);
   }
 
@@ -1019,6 +1072,36 @@ ${buildPrMessageScript()}
 
   if (msg.command === 'snippetSaved') {
     hideSnippetForm();
+  }
+
+  // ── Plans & Notes whole-section replace ──
+  // After a plan/note/reference add/remove/save/translate the host re-renders
+  // the whole #plansAndNotesSection (keeps the count badge + empty-state in
+  // sync). data-action buttons are document-delegated so they survive the
+  // replace; the snippet form's per-element input listeners do NOT, so
+  // bindPlansAndNotesSection re-binds them.
+  if (msg.command === 'plansAndNotesUpdated' && typeof msg.html === 'string') {
+    replaceSection('plansAndNotesSection', msg.html);
+    bindPlansAndNotesSection();
+  }
+
+  // ── Header Jolli row (published Plans & Notes link list) ──
+  // Sent alongside plansAndNotesUpdated because #jolliRow embeds that link list.
+  // Replace if present; remove if the new html is empty; ignore if absent
+  // (#jolliRow only exists after the commit is pushed, and push takes the
+  // full-rebuild path).
+  if (msg.command === 'jolliRowUpdated' && typeof msg.html === 'string') {
+    var oldJolliRow = document.getElementById('jolliRow');
+    if (oldJolliRow) {
+      if (msg.html.trim().length === 0) {
+        oldJolliRow.remove();
+      } else {
+        var jolliWrap = document.createElement('div');
+        jolliWrap.innerHTML = msg.html;
+        var newJolliRow = jolliWrap.firstElementChild;
+        if (newJolliRow) oldJolliRow.replaceWith(newJolliRow);
+      }
+    }
   }
 
   // ── Plan translation status ──
@@ -1329,22 +1412,29 @@ ${buildPrMessageScript()}
     var hasContent = sContent && sContent.value.trim();
     if (saveBtn) saveBtn.disabled = !(hasTitle && hasContent);
   }
-  // Enable/disable Save button based on title and content
-  var snippetTitleEl = document.getElementById('snippetTitle');
-  var snippetContentEl = document.getElementById('snippetContent');
-  if (snippetTitleEl) {
-    snippetTitleEl.addEventListener('input', updateSaveSnippetBtn);
+  // Enable/disable Save button based on title and content. The snippet form
+  // lives inside #plansAndNotesSection, so these per-element input listeners are
+  // lost when that section is replaced (plansAndNotesUpdated). bindPlansAndNotesSection
+  // re-grabs + re-binds them; it runs at init AND after each section replace.
+  // (The plan/note/reference data-action buttons are document-delegated, so
+  // they need no re-bind.)
+  function bindPlansAndNotesSection() {
+    var snippetTitleEl = document.getElementById('snippetTitle');
+    var snippetContentEl = document.getElementById('snippetContent');
+    if (snippetTitleEl) {
+      snippetTitleEl.addEventListener('input', updateSaveSnippetBtn);
+    }
+    if (snippetContentEl) {
+      snippetContentEl.addEventListener('input', updateSaveSnippetBtn);
+    }
   }
-  if (snippetContentEl) {
-    snippetContentEl.addEventListener('input', updateSaveSnippetBtn);
-  }
+  bindPlansAndNotesSection();
 
   // ── Transcript Stats (async load for section description) ───────────────
-
+  // Reassigned by bindConversationsSection after a section replace; the
+  // transcriptStatsLoaded handler fills whatever it points at. The initial (and
+  // post-refresh) stats load is kicked off from bindConversationsSection().
   var conversationsStats = document.getElementById('conversationsStats');
-  if (conversationsStats) {
-    vscode.postMessage({ command: 'loadTranscriptStats' });
-  }
 
   // ── Transcript Modal ──────────────────────────────────────────────────────
 
@@ -1657,39 +1747,68 @@ ${buildTranscriptEntriesScript()}
     return text;
   }
 
-  // Wire up buttons
-  if (openTranscriptsBtn) openTranscriptsBtn.addEventListener('click', openModal);
-  if (modalCloseBtn) modalCloseBtn.addEventListener('click', function() { closeModal(); });
-  if (modalCancelBtn) modalCancelBtn.addEventListener('click', function() { closeModal(); });
-  if (transcriptModal) {
-    transcriptModal.addEventListener('click', function(e) {
-      if (e.target === transcriptModal) closeModal();
-    });
+  // ── Conversations section binding (init + after conversationsUpdated) ────
+  // After conversationsUpdated replaces #allConversationsSection the old modal +
+  // button nodes are discarded, so we re-grab every ref (reassigning the closure
+  // vars that openModal/closeModal/renderTranscriptEntries/the message listener
+  // all read) and re-wire the per-element button listeners. The GLOBAL keydown +
+  // message listeners are registered ONCE, below, outside this function — they
+  // read the reassignable refs, so they keep working against the new modal
+  // without piling up duplicate registrations on every refresh.
+  function bindConversationsSection() {
+    transcriptModal = document.getElementById('transcriptModal');
+    modalTabs = document.getElementById('modalTabs');
+    modalBody = document.getElementById('modalBody');
+    modalLoading = document.getElementById('modalLoading');
+    modalSubtitle = document.getElementById('modalSubtitle');
+    modalSaveBtn = document.getElementById('modalSaveBtn');
+    modalCancelBtn = document.getElementById('modalCancelBtn');
+    modalCloseBtn = document.getElementById('modalCloseBtn');
+    deleteTranscriptsBtn = document.getElementById('deleteTranscriptsBtn');
+    openTranscriptsBtn = document.getElementById('openTranscriptsBtn');
+    conversationsStats = document.getElementById('conversationsStats');
+
+    if (openTranscriptsBtn) openTranscriptsBtn.addEventListener('click', openModal);
+    if (modalCloseBtn) modalCloseBtn.addEventListener('click', function() { closeModal(); });
+    if (modalCancelBtn) modalCancelBtn.addEventListener('click', function() { closeModal(); });
+    if (transcriptModal) {
+      transcriptModal.addEventListener('click', function(e) {
+        if (e.target === transcriptModal) closeModal();
+      });
+    }
+    if (modalSaveBtn) {
+      modalSaveBtn.addEventListener('click', function() {
+        var data = collectSaveData();
+        vscode.postMessage({ command: 'saveAllTranscripts', entries: data });
+        modalSaveBtn.disabled = true;
+        modalSaveBtn.textContent = 'Saving...';
+      });
+    }
+    if (deleteTranscriptsBtn) {
+      deleteTranscriptsBtn.addEventListener('click', function() {
+        // Mark all entries as deleted across all sessions (same as clicking each tab's delete)
+        if (!modalTabs || !modalBody) return;
+        var allTabs = modalTabs.querySelectorAll('.modal-tab:not(.session-deleted)');
+        for (var t = 0; t < allTabs.length; t++) {
+          var tabDeleteBtn = allTabs[t].querySelector('.session-delete-btn');
+          if (tabDeleteBtn) tabDeleteBtn.click();
+        }
+      });
+    }
+
+    // Kick off / refresh the async stats line for the (possibly new) element.
+    if (conversationsStats) vscode.postMessage({ command: 'loadTranscriptStats' });
   }
+  bindConversationsSection();
+
+  // GLOBAL listener — registered ONCE (NOT inside bindConversationsSection, or
+  // every refresh would stack another). Reads the reassignable transcriptModal
+  // ref + closure closeModal fn, so it stays valid across section rebuilds.
   document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape' && transcriptModal && transcriptModal.classList.contains('visible')) {
       closeModal();
     }
   });
-  if (modalSaveBtn) {
-    modalSaveBtn.addEventListener('click', function() {
-      var data = collectSaveData();
-      vscode.postMessage({ command: 'saveAllTranscripts', entries: data });
-      modalSaveBtn.disabled = true;
-      modalSaveBtn.textContent = 'Saving...';
-    });
-  }
-  if (deleteTranscriptsBtn) {
-    deleteTranscriptsBtn.addEventListener('click', function() {
-      // Mark all entries as deleted across all sessions (same as clicking each tab's delete)
-      if (!modalTabs || !modalBody) return;
-      var allTabs = modalTabs.querySelectorAll('.modal-tab:not(.session-deleted)');
-      for (var t = 0; t < allTabs.length; t++) {
-        var tabDeleteBtn = allTabs[t].querySelector('.session-delete-btn');
-        if (tabDeleteBtn) tabDeleteBtn.click();
-      }
-    });
-  }
 
   // Handle transcript messages from extension
   window.addEventListener('message', function(event) {
@@ -1706,12 +1825,17 @@ ${buildTranscriptEntriesScript()}
       baseSubtitle = totalEntries + ' entries, ' + sessionCount + ' session' + (sessionCount !== 1 ? 's' : '');
       if (modalSubtitle) modalSubtitle.textContent = baseSubtitle;
     }
-    if (msg.command === 'transcriptsSaved') {
-      closeModal();
+    // Success: the host re-renders the whole #allConversationsSection, which
+    // discards the open modal (closing it) and refreshes the stats / empty
+    // state. bindConversationsSection re-grabs refs + re-wires the new buttons.
+    if (msg.command === 'conversationsUpdated' && typeof msg.html === 'string') {
+      replaceSection('allConversationsSection', msg.html);
+      bindConversationsSection();
     }
-    if (msg.command === 'transcriptsDeleted') {
-      // Modal already closed by deleteTranscriptsBtn handler
-    }
+    // transcriptsSaved / transcriptsDeleted are still posted by the host (kept
+    // for existing assertions), but intentionally do NO DOM work here: closing +
+    // refresh is owned by conversationsUpdated above. The former closeModal()
+    // was removed so it doesn't double-handle / race the rebuild.
     // Failure paths (added 2026-05-22 for v5): backend posts these when summary
     // update or transcript file batch failed. Without handling them, the Save
     // button would stay stuck in "Saving..." disabled state forever (the user

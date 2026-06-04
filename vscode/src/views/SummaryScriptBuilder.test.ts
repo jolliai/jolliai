@@ -306,4 +306,83 @@ describe("SummaryScriptBuilder", () => {
 			expect(script).toContain("'.plan-edit-textarea'");
 		});
 	});
+
+	describe("partial refresh (Option B) message handlers", () => {
+		it("topicsUpdated rebuilds the section: ESC cleanup, replace, re-attach, and PRESERVE per-topic collapse", () => {
+			expect(script).toContain("msg.command === 'topicsUpdated'");
+			expect(script).toContain("replaceSection('topicsSection', msg.html)");
+			// Per-topic collapse is snapshotted by the stable data-topic payload
+			// (the topic-<index> id renumbers on delete) and restored after the
+			// rebuild, so deleting one topic does NOT re-expand the others.
+			expect(script).toContain("collapseByTopic");
+			expect(script).toContain("getAttribute('data-topic')");
+			// allCollapsed is recomputed from the restored DOM (NOT forced false),
+			// so the #toggleAllBtn label stays accurate.
+			expect(script).toContain(
+				"allCollapsed = topicCount > 0 && everyCollapsed",
+			);
+			expect(script).toContain("attachToggleAllBtnHandler()");
+			// ESC cleanup on still-editing topics before the nodes are discarded.
+			expect(script).toContain("classList.contains('editing')");
+		});
+
+		it("topicUpdated preserves collapse via the `collapsed` class (not the no-op `open`)", () => {
+			// Slice the single-topic-edit handler so the assertions are specific
+			// to it (the `open` class is still used elsewhere for dropdown menus).
+			const start = script.indexOf("msg.command === 'topicUpdated'");
+			const end = script.indexOf("topicUpdateError");
+			const block = script.slice(start, end);
+			expect(block).toContain("wasCollapsed");
+			expect(block).toContain("classList.contains('collapsed')");
+			// Regression guard: the old no-op `open` snapshot must be gone here.
+			expect(block).not.toContain("'open'");
+		});
+
+		it("plansAndNotesUpdated replaces the section and re-binds the snippet inputs", () => {
+			expect(script).toContain("msg.command === 'plansAndNotesUpdated'");
+			expect(script).toContain(
+				"replaceSection('plansAndNotesSection', msg.html)",
+			);
+			// Snippet form input listeners are per-element (lost on replace) → re-bound.
+			expect(script).toContain("function bindPlansAndNotesSection()");
+			expect(script).toContain("bindPlansAndNotesSection()");
+		});
+
+		it("jolliRowUpdated targets the header row by id", () => {
+			expect(script).toContain("msg.command === 'jolliRowUpdated'");
+			expect(script).toContain("getElementById('jolliRow')");
+		});
+
+		it("conversationsUpdated replaces the section and re-binds refs + buttons", () => {
+			expect(script).toContain("msg.command === 'conversationsUpdated'");
+			expect(script).toContain(
+				"replaceSection('allConversationsSection', msg.html)",
+			);
+			expect(script).toContain("function bindConversationsSection()");
+		});
+
+		it("transcriptsSaved/Deleted no longer closeModal — close is owned by the conversationsUpdated rebuild", () => {
+			// Guard against regressing to the old `transcriptsSaved') { closeModal() }`
+			// shape; the section rebuild closes the modal instead.
+			expect(script).not.toMatch(
+				/transcriptsSaved'\s*\)\s*\{\s*closeModal\(\)/,
+			);
+		});
+
+		it("the modal ESC keydown is registered once OUTSIDE bindConversationsSection (no per-refresh leak)", () => {
+			const bindStart = script.indexOf("function bindConversationsSection()");
+			const bindEnd = script.indexOf("bindConversationsSection();", bindStart);
+			const bindBody = script.slice(bindStart, bindEnd);
+			expect(bindBody).not.toContain("addEventListener('keydown'");
+			// …but the global keydown handler does exist at top level.
+			expect(script).toContain("addEventListener('keydown'");
+		});
+
+		it("replaceSection strips a stale trailing <hr> only when the new html ends in one (generalized beyond recap)", () => {
+			expect(script).toContain("function replaceSection(id, html)");
+			expect(script).toContain("lastNew.tagName === 'HR'");
+			// The old recap-only special-case (id === 'recapSection') is gone.
+			expect(script).not.toContain("id === 'recapSection'");
+		});
+	});
 });

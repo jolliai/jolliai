@@ -119,8 +119,11 @@ import type {
 	PlanReference,
 } from "../../../cli/src/Types.js";
 import {
+	buildAllConversationsSection,
 	buildE2eTestSection,
 	buildHtml,
+	buildJolliRow,
+	buildPlansAndNotesSection,
 	buildRecapSection,
 	buildTopicsSection,
 	renderTopic,
@@ -1613,5 +1616,49 @@ describe("buildAllConversationsSection — Regenerate button", () => {
 		const matches = html.match(/id="regenerateSummaryBtn"/g) ?? [];
 		expect(matches.length).toBe(1);
 		expect(html).not.toMatch(/id="regenerateSummaryBtn"[^>]*disabled/);
+	});
+
+	// ── Partial-refresh support (Option B): exported section builders + the
+	//    stable #allConversationsSection wrapper the webview replaces in place. ──
+	describe("partial-refresh section builders", () => {
+		it("buildPlansAndNotesSection is exported and renders the #plansAndNotesSection container", () => {
+			const html = buildPlansAndNotesSection(
+				undefined,
+				undefined,
+				[],
+				new Set(),
+				new Set(),
+				new Set(),
+			);
+			expect(html).toContain('id="plansAndNotesSection"');
+		});
+
+		it("buildJolliRow is exported: returns '' without a url, renders #jolliRow with one", () => {
+			expect(buildJolliRow(undefined, "msg", undefined, undefined)).toBe("");
+			const withUrl = buildJolliRow(
+				"https://jolli.ai/x",
+				"msg",
+				undefined,
+				undefined,
+			);
+			expect(withUrl).toContain('id="jolliRow"');
+		});
+
+		it("buildAllConversationsSection wraps both branches in #allConversationsSection", () => {
+			// count === 0 (empty) branch
+			const empty = buildAllConversationsSection(new Set(), false);
+			expect(empty).toContain('id="allConversationsSection"');
+			expect(empty).toContain("No conversation transcripts saved");
+			// count > 0 branch (includes the modal)
+			const withData = buildAllConversationsSection(new Set(["h1"]), false);
+			expect(withData).toContain('id="allConversationsSection"');
+			expect(withData).toContain('id="transcriptModal"');
+		});
+
+		it("buildHtml embeds the #allConversationsSection wrapper", () => {
+			expect(buildHtml(makeSummary())).toContain(
+				'id="allConversationsSection"',
+			);
+		});
 	});
 });

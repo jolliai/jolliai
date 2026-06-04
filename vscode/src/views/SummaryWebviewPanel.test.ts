@@ -419,6 +419,9 @@ const {
 	mockBuildTopicsSection,
 	mockRenderTopic,
 	mockRenderE2eScenario,
+	mockBuildPlansAndNotesSection,
+	mockBuildJolliRow,
+	mockBuildAllConversationsSection,
 } = vi.hoisted(() => ({
 	mockBuildHtml: vi.fn().mockReturnValue("<html>mock</html>"),
 	mockBuildE2eTestSection: vi.fn().mockReturnValue("<div>e2e</div>"),
@@ -426,6 +429,13 @@ const {
 	mockBuildTopicsSection: vi.fn().mockReturnValue("<div>topics</div>"),
 	mockRenderTopic: vi.fn().mockReturnValue("<div>topic</div>"),
 	mockRenderE2eScenario: vi.fn().mockReturnValue("<div>scenario</div>"),
+	mockBuildPlansAndNotesSection: vi
+		.fn()
+		.mockReturnValue("<div>plansAndNotes</div>"),
+	mockBuildJolliRow: vi.fn().mockReturnValue("<div>jolliRow</div>"),
+	mockBuildAllConversationsSection: vi
+		.fn()
+		.mockReturnValue("<div>conversations</div>"),
 }));
 
 vi.mock("./SummaryHtmlBuilder.js", () => ({
@@ -435,6 +445,9 @@ vi.mock("./SummaryHtmlBuilder.js", () => ({
 	buildTopicsSection: mockBuildTopicsSection,
 	renderTopic: mockRenderTopic,
 	renderE2eScenario: mockRenderE2eScenario,
+	buildPlansAndNotesSection: mockBuildPlansAndNotesSection,
+	buildJolliRow: mockBuildJolliRow,
+	buildAllConversationsSection: mockBuildAllConversationsSection,
 }));
 
 const { mockBuildMarkdown, mockBuildPrMarkdown } = vi.hoisted(() => ({
@@ -1246,6 +1259,166 @@ describe("SummaryWebviewPanel", () => {
 
 			// webview.html must not have been overwritten — update() short-circuited.
 			expect(firstPanel.webview.html).toBe("<sentinel>");
+		});
+
+		it("refresh* partial helpers are no-ops on a disposed instance (post-await race)", async () => {
+			const summary = makeSummary({ commitHash: "aaa" });
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+			);
+			const instance = (
+				SummaryWebviewPanel as unknown as {
+					currentMemoryPanel: {
+						disposed: boolean;
+						refreshPlansAndNotes: (s: unknown) => void;
+						refreshTopicsSection: (s: unknown) => void;
+						refreshConversations: (s: unknown) => void;
+					};
+				}
+			).currentMemoryPanel;
+			instance.disposed = true;
+			postMessage.mockClear();
+
+			// All three helpers must bail before touching the (disposed) webview,
+			// mirroring update()'s disposed guard.
+			instance.refreshPlansAndNotes(summary);
+			instance.refreshTopicsSection(summary);
+			instance.refreshConversations(summary);
+
+			expect(postMessage).not.toHaveBeenCalled();
+		});
+
+		// Direct unit tests on the private partial-refresh helpers. They exercise
+		// branches (readOnly / foreign / references-present) that are unreachable
+		// through the normal handler flow — e.g. deleteTopic can't run on a
+		// readonly panel (stale → ensureCommitNotRewritten bails; foreign →
+		// dispatch denied), yet refreshTopicsSection still threads the real
+		// readOnly so a future caller renders correctly.
+		type RefreshCallable = {
+			disposed: boolean;
+			foreignRepoName: string | null;
+			staleRewrittenInto: string | null;
+			transcriptHashSet: Set<string>;
+			refreshPlansAndNotes: (s: CommitSummary) => void;
+			refreshTopicsSection: (s: CommitSummary) => void;
+			refreshConversations: (s: CommitSummary) => void;
+		};
+		async function getPanelInstance(
+			summary: CommitSummary,
+		): Promise<RefreshCallable> {
+			await SummaryWebviewPanel.show(
+				summary,
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+				"memory",
+			);
+			return (
+				SummaryWebviewPanel as unknown as {
+					currentMemoryPanel: RefreshCallable;
+				}
+			).currentMemoryPanel;
+		}
+
+		it("refreshPlansAndNotes posts plansAndNotesUpdated + jolliRowUpdated and forwards references", async () => {
+			const reference = {
+				source: "linear" as const,
+				archivedKey: "linear:ENG-1",
+				nativeId: "ENG-1",
+				title: "Ref",
+				url: "https://linear.app/x/ENG-1",
+				referencedAt: "2025-01-01T00:00:00Z",
+				sourceToolName: "Linear",
+			};
+			const summary = makeSummary({ commitHash: "aaa", references: [reference] });
+			const instance = await getPanelInstance(summary);
+			postMessage.mockClear();
+			mockBuildPlansAndNotesSection.mockClear();
+
+			instance.refreshPlansAndNotes(summary);
+
+			const commands = postMessage.mock.calls.map((c) => c[0].command);
+			expect(commands).toContain("plansAndNotesUpdated");
+			expect(commands).toContain("jolliRowUpdated");
+			// references (3rd positional arg) forwarded, not dropped.
+			expect(mockBuildPlansAndNotesSection.mock.calls[0][2]).toEqual([reference]);
+		});
+
+		it("refreshTopicsSection threads readOnly=true on a foreign panel", async () => {
+			const summary = makeSummary({ commitHash: "aaa" });
+			const instance = await getPanelInstance(summary);
+			instance.foreignRepoName = "other-repo";
+			mockBuildTopicsSection.mockClear();
+			postMessage.mockClear();
+
+			instance.refreshTopicsSection(summary);
+
+			expect(mockBuildTopicsSection).toHaveBeenCalledWith(summary, {
+				readOnly: true,
+			});
+			expect(postMessage.mock.calls.map((c) => c[0].command)).toContain(
+				"topicsUpdated",
+			);
+		});
+
+		it("refreshTopicsSection threads readOnly=true on a stale-rewritten panel", async () => {
+			const summary = makeSummary({ commitHash: "aaa" });
+			const instance = await getPanelInstance(summary);
+			instance.foreignRepoName = null;
+			instance.staleRewrittenInto = "bbbbbbbb";
+			mockBuildTopicsSection.mockClear();
+
+			instance.refreshTopicsSection(summary);
+
+			expect(mockBuildTopicsSection).toHaveBeenCalledWith(summary, {
+				readOnly: true,
+			});
+		});
+
+		it("refreshConversations passes isForeign=true on a foreign panel", async () => {
+			const summary = makeSummary({ commitHash: "aaa" });
+			const instance = await getPanelInstance(summary);
+			instance.foreignRepoName = "other-repo";
+			instance.transcriptHashSet = new Set(["h1"]);
+			mockBuildAllConversationsSection.mockClear();
+			postMessage.mockClear();
+
+			instance.refreshConversations(summary);
+
+			expect(mockBuildAllConversationsSection).toHaveBeenCalledWith(
+				instance.transcriptHashSet,
+				true,
+			);
+			expect(postMessage.mock.calls.map((c) => c[0].command)).toContain(
+				"conversationsUpdated",
+			);
+		});
+
+		it("refresh helpers still post their partial update during regenerate (in-flight async write must clear its block's loading state)", async () => {
+			// Regression guard for the removed regenerateInProgress skip: a translate
+			// dispatched before regenerate can land mid-regenerate. Its block
+			// (plans/notes) is disjoint from what regenerate re-renders
+			// (topics/recap/banner), and the section rebuild is the ONLY thing that
+			// clears the translate button's loading state (no *Translated DOM
+			// handler). Skipping it would strand the button on "translating".
+			const summary = makeSummary({ commitHash: "aaa" });
+			const instance = (await getPanelInstance(summary)) as RefreshCallable & {
+				regenerateInProgress: boolean;
+			};
+			instance.regenerateInProgress = true;
+			postMessage.mockClear();
+
+			instance.refreshPlansAndNotes(summary);
+
+			expect(postMessage.mock.calls.map((c) => c[0].command)).toContain(
+				"plansAndNotesUpdated",
+			);
 		});
 
 		it("collects transcript hashes from nested children via collectTreeHashes", async () => {
@@ -2671,6 +2844,18 @@ describe("SummaryWebviewPanel", () => {
 					updatedSummary,
 					workspaceRoot,
 					true,
+				);
+				// Partial refresh: whole topics section re-rendered (indices shift on
+				// delete), NOT a full webview.html rebuild, and the legacy
+				// (webview-ignored) topicDeleted message is gone.
+				const cmds = postMessage.mock.calls.map((c) => c[0].command);
+				expect(cmds).toContain("topicsUpdated");
+				expect(cmds).not.toContain("topicDeleted");
+				// Guards the #1 footgun: the rebuilt topics section must be built from
+				// the POST-delete summary (result.result), not the stale currentSummary.
+				expect(mockBuildTopicsSection).toHaveBeenCalledWith(
+					updatedSummary,
+					expect.anything(),
 				);
 			});
 
@@ -4345,6 +4530,34 @@ describe("SummaryWebviewPanel", () => {
 				);
 			});
 
+			it("refreshes Plans & Notes exactly once, after the slug leaves planTranslateSet", async () => {
+				// Regression: syncPlanTitle({refresh:false}) must NOT render; the single
+				// refresh happens after planTranslateSet.delete, so the 🌐 button is gone.
+				mockReadPlanFromBranch.mockResolvedValue("# 中文标题\n\n内容");
+				mockTranslateToEnglish.mockResolvedValue("# Translated\n\nContent");
+				mockLoadPlansRegistry.mockResolvedValue({
+					plans: { "cn-plan": { slug: "cn-plan", title: "中文标题" } },
+				});
+				const dispatch = await setupPanel({
+					plans: [
+						{ slug: "cn-plan", title: "中文标题", addedAt: "", updatedAt: "" },
+					],
+				});
+				mockBuildPlansAndNotesSection.mockClear();
+
+				dispatch({ command: "translatePlan", slug: "cn-plan" });
+				await flushPromises();
+
+				// Single refresh (not the old double-update from syncPlanTitle + tail).
+				expect(mockBuildPlansAndNotesSection).toHaveBeenCalledTimes(1);
+				const planTranslateSetArg =
+					mockBuildPlansAndNotesSection.mock.calls[0][3];
+				expect(planTranslateSetArg).toBeInstanceOf(Set);
+				expect((planTranslateSetArg as Set<string>).has("cn-plan")).toBe(false);
+				const cmds = postMessage.mock.calls.map((c) => c[0].command);
+				expect(cmds.filter((c) => c === "plansAndNotesUpdated")).toHaveLength(1);
+			});
+
 			it("shows info when plan is already in English", async () => {
 				mockReadPlanFromBranch.mockResolvedValue(
 					"# English Plan\n\nAll ASCII content",
@@ -4655,6 +4868,12 @@ describe("SummaryWebviewPanel", () => {
 				expect(postMessage).toHaveBeenCalledWith({
 					command: "transcriptsSaved",
 				});
+				// Partial refresh: the All Conversations section is re-rendered
+				// (closing the modal + refreshing stats), AND the legacy
+				// transcriptsSaved message is still posted (existing assertion above).
+				expect(postMessage.mock.calls.map((c) => c[0].command)).toContain(
+					"conversationsUpdated",
+				);
 			});
 		});
 
@@ -4918,6 +5137,11 @@ describe("SummaryWebviewPanel", () => {
 				expect(postMessage).toHaveBeenCalledWith({
 					command: "transcriptsDeleted",
 				});
+				// Partial refresh: All Conversations section re-rendered (flips to the
+				// count===0 empty state), alongside the retained transcriptsDeleted message.
+				expect(postMessage.mock.calls.map((c) => c[0].command)).toContain(
+					"conversationsUpdated",
+				);
 				// #5 + #4: the legacy (v3) summary is lazily upgraded to a REAL v5
 				// record — version bumped to 5 and `transcripts` written from the
 				// file-backed set (emptied here by the delete), not left as a
@@ -6185,13 +6409,12 @@ describe("SummaryWebviewPanel", () => {
 				});
 				await flushPromises();
 
-				// buildHtml should be called with noteTranslateSet containing the new CJK note
-				expect(mockBuildHtml).toHaveBeenCalledWith(
-					expect.anything(),
-					expect.objectContaining({
-						noteTranslateSet: new Set(["cn-snip"]),
-					}),
-				);
+				// The Plans & Notes partial re-render must receive the noteTranslateSet
+				// (5th positional arg) already containing the new CJK note, proving
+				// refreshNoteTranslateSet ran before the render.
+				expect(mockBuildPlansAndNotesSection).toHaveBeenCalled();
+				const snippetArgs = mockBuildPlansAndNotesSection.mock.calls[0];
+				expect(snippetArgs[4]).toEqual(new Set(["cn-snip"]));
 			});
 
 			it("shows error when archiveNoteForCommit returns null", async () => {
@@ -6310,12 +6533,11 @@ describe("SummaryWebviewPanel", () => {
 				dispatch({ command: "addMarkdownNote" });
 				await flushPromises();
 
-				expect(mockBuildHtml).toHaveBeenCalledWith(
-					expect.anything(),
-					expect.objectContaining({
-						noteTranslateSet: new Set(["cn-md"]),
-					}),
-				);
+				// The Plans & Notes partial re-render must receive the noteTranslateSet
+				// (5th positional arg) already containing the new CJK note.
+				expect(mockBuildPlansAndNotesSection).toHaveBeenCalled();
+				const mdArgs = mockBuildPlansAndNotesSection.mock.calls[0];
+				expect(mdArgs[4]).toEqual(new Set(["cn-md"]));
 			});
 
 			it("does nothing when user cancels file dialog", async () => {

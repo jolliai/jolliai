@@ -211,8 +211,14 @@ function buildDurationRow(summary: CommitSummary): string {
   </div>`;
 }
 
-/** Builds the optional "Memory" property row with a clickable article link. */
-function buildJolliRow(
+/**
+ * Builds the optional "Memory" property row with a clickable article link.
+ *
+ * Exported so the webview panel can re-render just the `#jolliRow` (which
+ * embeds the published Plans & Notes link list) after a plan/note add/remove,
+ * without a full-page rebuild. See SummaryWebviewPanel.refreshPlansAndNotes.
+ */
+export function buildJolliRow(
 	url?: string,
 	commitMessage?: string,
 	plans?: ReadonlyArray<PlanReference>,
@@ -435,7 +441,17 @@ export function buildTopicsSection(
  * markup mirrors `buildPlanRow` exactly so the CSS classes (`plan-item`,
  * `plan-header`, `plan-edit-area`, …) are shared.
  */
-function buildPlansAndNotesSection(
+/**
+ * Builds the Plans & Notes section (`#plansAndNotesSection`).
+ *
+ * Exported so the webview panel can re-render just this section after a
+ * plan/note/reference add/remove/save/translate, without a full-page rebuild.
+ * Mutations are also paired with a `#jolliRow` refresh (see
+ * SummaryWebviewPanel.refreshPlansAndNotes). Emits a trailing
+ * `<hr class="separator" />` sibling — the webview's `replaceSection` strips
+ * the stale one to avoid stacked separators.
+ */
+export function buildPlansAndNotesSection(
 	plans: ReadonlyArray<PlanReference> | undefined,
 	notes: ReadonlyArray<NoteReference> | undefined,
 	references: ReadonlyArray<ReferenceCommitRef> | undefined,
@@ -770,16 +786,17 @@ export function renderE2eScenario(s: E2eTestScenario, index: number): string {
  *    Save/Delete/Cancel buttons stay hidden by the same CSS rule so
  *    nothing destructive is reachable.
  */
-function buildAllConversationsSection(
+export function buildAllConversationsSection(
 	transcriptHashSet?: ReadonlySet<string>,
 	isForeign: boolean = false,
 ): string {
 	const count = transcriptHashSet?.size ?? 0;
+	let inner: string;
 	if (count === 0) {
 		const emptyActions = isForeign
 			? ""
 			: `      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>`;
-		return `
+		inner = `
 <div class="private-zone">
   <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
@@ -790,14 +807,13 @@ ${emptyActions}
   </div>
   <p class="empty">No conversation transcripts saved for this commit.</p>
 </div>`;
-	}
-
-	const headerActions = isForeign
-		? `      <button class="action-btn" id="openTranscriptsBtn" data-foreign-safe title="Browse transcripts (read-only)">View</button>`
-		: `      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>
+	} else {
+		const headerActions = isForeign
+			? `      <button class="action-btn" id="openTranscriptsBtn" data-foreign-safe title="Browse transcripts (read-only)">View</button>`
+			: `      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>
       <button class="action-btn" id="openTranscriptsBtn">Manage</button>`;
 
-	return `
+		inner = `
 <div class="private-zone">
   <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
@@ -813,6 +829,13 @@ ${headerActions}
   <p class="conversations-privacy">&#x1F512; Your private data — stored on your machine only. Nothing is uploaded unless you choose to.</p>
 </div>
 ${buildTranscriptModal(isForeign)}`;
+	}
+	// Wrap private-zone + modal in a stable #allConversationsSection container so
+	// the webview can replace just this block on transcript save/delete via
+	// replaceSection (no full-page rebuild). See SummaryWebviewPanel.refreshConversations.
+	return `
+<div id="allConversationsSection">${inner}
+</div>`;
 }
 
 /**
