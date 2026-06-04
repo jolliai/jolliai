@@ -90,6 +90,7 @@ import { generateTranscriptId } from "../core/TranscriptId.js";
 import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
+import { deriveSourceTag } from "../install/DistPathResolver.js";
 import { createLogger, errMsg, setLogDir, setLogLevel } from "../Logger.js";
 import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
@@ -208,22 +209,57 @@ export function launchWorker(cwd: string): void {
 	const dir = dirname(fileURLToPath(import.meta.url));
 	const scriptPath = join(dir, "QueueWorker.js");
 
-	const child = spawnHidden(
-		process.execPath,
-		// --disable-warning silences node:sqlite's ExperimentalWarning during OpenCode
-		// scans; it also suppresses any other experimental warnings in this subprocess.
-		["--disable-warning=ExperimentalWarning", scriptPath, "--worker", "--cwd", cwd],
-		{
-			detached: true,
-			stdio: "ignore",
-			cwd,
-		},
-	);
+	// NO Node flags before scriptPath. The git hook is launched as a bare
+	// `exec node <Hook>.js` (no flags), so `process.execPath` here may be a
+	// Node older than the CLI's `engines` floor. A flag the running Node
+	// doesn't recognise (e.g. `--disable-warning`, added in Node 20.11/21.3)
+	// makes the child exit immediately with `bad option` BEFORE running any
+	// code — and with `stdio: "ignore"` that crash is invisible, so the worker
+	// silently never starts and no summaries are generated. Keep the argv
+	// flag-free; suppressing cosmetic warnings is not worth breaking startup.
+	const child = spawnHidden(process.execPath, [scriptPath, "--worker", "--cwd", cwd], {
+		detached: true,
+		stdio: "ignore",
+		cwd,
+	});
 	child.unref();
 
 	log.info("Background worker spawned (PID: %d)", child.pid ?? -1);
 }
 /* v8 ignore stop */
+
+/**
+ * Builds the worker startup-banner string: which Node runtime and which
+ * JolliMemory surface/version is actually running. Logged at the very top of
+ * `runWorker` so a debug.log shows, per worker run, the Node version (the
+ * field that made the `--disable-warning` old-Node crash so hard to diagnose)
+ * plus whether the active dist is the VS Code plugin, the Cursor plugin, the
+ * CLI, etc., and its version.
+ *
+ * The surface tag (vscode / cursor / windsurf / cli) is reconstructed from the
+ * running dist directory via `deriveSourceTag` — the SAME derivation
+ * `installDistPath` used to name the `dist-paths/<source>` file — so vscode vs
+ * cursor is distinguished purely from where the worker runs, with no file I/O
+ * or reverse lookup. `__JOLLI_CLIENT_KIND__` alone can't do this: the same VSIX
+ * installed into VS Code, Cursor, Windsurf, … all self-identify as
+ * "vscode-plugin". `pkgVersion` is the surface's own release version
+ * (`__PKG_VERSION__`); `cliVersion` is the bundled `@jolli.ai/cli` core version
+ * (`__CLI_PKG_VERSION__`) — kept separate because they diverge under the VSCode
+ * bundle.
+ *
+ * Pure function (all inputs injected) so it is fully unit-testable across every
+ * surface; `runWorker` supplies the live globals.
+ */
+export function buildWorkerStartupBanner(info: {
+	nodeVersion: string;
+	kind: string;
+	pkgVersion: string;
+	cliVersion: string;
+	distDir: string;
+}): string {
+	const source = info.kind === "cli" ? "cli" : deriveSourceTag(info.distDir);
+	return `node=${info.nodeVersion} kind=${info.kind} source=${source} pkgVer=${info.pkgVersion} cliVer=${info.cliVersion} dist=${info.distDir}`;
+}
 
 /**
  * Worker: acquires lock, drains the git operation queue, and processes each entry.
@@ -238,7 +274,21 @@ export function launchWorker(cwd: string): void {
 export async function runWorker(cwd: string, force = false): Promise<void> {
 	setLogDir(cwd);
 
-	log.info("=== Queue worker started ===");
+	/* v8 ignore start -- compile-time global fallbacks: vite (tests) and esbuild (builds) always define these three, so the `: "…"` arms are unreachable from unit tests; mirrors ClientHeader.ts */
+	const kind = typeof __JOLLI_CLIENT_KIND__ !== "undefined" ? __JOLLI_CLIENT_KIND__ : "cli";
+	const pkgVersion = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
+	const cliVersion = typeof __CLI_PKG_VERSION__ !== "undefined" ? __CLI_PKG_VERSION__ : "dev";
+	/* v8 ignore stop */
+	log.info(
+		"=== Queue worker started === %s",
+		buildWorkerStartupBanner({
+			nodeVersion: process.versions.node,
+			kind,
+			pkgVersion,
+			cliVersion,
+			distDir: dirname(fileURLToPath(import.meta.url)),
+		}),
+	);
 
 	// Acquire `vault-write.lock` BEFORE constructing storage. Reason:
 	// `createStorage` → `createFolderStorage` → `resolveKBPath` has side

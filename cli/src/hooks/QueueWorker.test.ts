@@ -350,7 +350,7 @@ import { buildMultiSessionContext } from "../core/TranscriptReader.js";
 import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
 import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
 import type { GitOperation } from "../Types.js";
-import { __test__, runWorker } from "./QueueWorker.js";
+import { __test__, buildWorkerStartupBanner, launchWorker, runWorker } from "./QueueWorker.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -2033,6 +2033,72 @@ describe("QueueWorker", () => {
 			);
 
 			expect(cleanupBranchStaleChildMarkdown).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("buildWorkerStartupBanner", () => {
+		it("reports source=cli verbatim for the CLI surface (no path derivation)", () => {
+			expect(
+				buildWorkerStartupBanner({
+					nodeVersion: "24.10.0",
+					kind: "cli",
+					pkgVersion: "1.2.3",
+					cliVersion: "1.2.3",
+					distDir: "/opt/whatever/dist",
+				}),
+			).toBe("node=24.10.0 kind=cli source=cli pkgVer=1.2.3 cliVer=1.2.3 dist=/opt/whatever/dist");
+		});
+
+		it("derives source=cursor from a Cursor extension dist path", () => {
+			expect(
+				buildWorkerStartupBanner({
+					nodeVersion: "22.5.0",
+					kind: "vscode-plugin",
+					pkgVersion: "0.99.1",
+					cliVersion: "1.4.0",
+					distDir: "/Users/luke/.cursor/extensions/jolli.jollimemory-vscode-0.99.1/dist",
+				}),
+			).toBe(
+				"node=22.5.0 kind=vscode-plugin source=cursor pkgVer=0.99.1 cliVer=1.4.0 dist=/Users/luke/.cursor/extensions/jolli.jollimemory-vscode-0.99.1/dist",
+			);
+		});
+
+		it("derives source=vscode from a VS Code extension dist path", () => {
+			expect(
+				buildWorkerStartupBanner({
+					nodeVersion: "20.11.0",
+					kind: "vscode-plugin",
+					pkgVersion: "0.99.1",
+					cliVersion: "1.4.0",
+					distDir: "/home/u/.vscode/extensions/jolli.jollimemory-vscode/dist",
+				}),
+			).toBe(
+				"node=20.11.0 kind=vscode-plugin source=vscode pkgVer=0.99.1 cliVer=1.4.0 dist=/home/u/.vscode/extensions/jolli.jollimemory-vscode/dist",
+			);
+		});
+	});
+
+	describe("launchWorker — argv hygiene (regression for old-Node startup crash)", () => {
+		it("spawns node with NO flags before scriptPath (no --disable-warning*)", () => {
+			vi.mocked(spawn).mockClear();
+
+			launchWorker("/test/cwd");
+
+			expect(spawn).toHaveBeenCalledTimes(1);
+			const args = vi.mocked(spawn).mock.calls[0][1] as string[];
+
+			// scriptPath is the first non-flag arg; everything before it is a
+			// Node flag. The whole point of the fix is that there are NONE.
+			const scriptIdx = args.findIndex((a) => a.endsWith("QueueWorker.js"));
+			expect(scriptIdx).toBe(0);
+			const nodeFlags = args.slice(0, scriptIdx);
+			expect(nodeFlags).toEqual([]);
+
+			// Belt-and-suspenders: the offending flag must not appear anywhere.
+			expect(args.some((a) => a.startsWith("--disable-warning"))).toBe(false);
+
+			// The legitimate script args are still present and ordered.
+			expect(args.slice(scriptIdx + 1)).toEqual(["--worker", "--cwd", "/test/cwd"]);
 		});
 	});
 });
