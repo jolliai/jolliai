@@ -248,6 +248,10 @@ function checkNodes(
 ): void {
 	for (const node of nodes) {
 		if ("group" in node) {
+			// Source path, not URL path — `group.root` is a source-only hint
+			// after the schema-intent refactor, so this matches `addNodesPlan`'s
+			// own source-dir computation but does NOT correspond to the
+			// rendered URL.
 			const groupRoot = node.root ? joinSegments(parentRoot, node.root) : parentRoot;
 			for (const article of node.content) {
 				checkArticle(article, groupRoot, files, mismatches);
