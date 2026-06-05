@@ -47,7 +47,7 @@ const MAX_TOTAL = 60000;
 // consumed) so matchAll can yield every id segment; we take the LAST one, which
 // is the deepest / actually-fetched page in a …/Parent-<id>/Child-<id> URL.
 const PAGE_ID_RE = /[-/]([0-9a-fA-F]{32})(?=[/?#]|$)/g;
-const ALLOWED_HOSTS = new Set(["www.notion.so", "notion.so"]);
+const ALLOWED_HOSTS = new Set(["www.notion.so", "notion.so", "app.notion.com"]);
 
 function isObject(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);

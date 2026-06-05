@@ -134,6 +134,15 @@ export interface SidebarWebviewDeps {
 	 */
 	activeSessionsProvider?: ActiveSessionsProvider;
 	/**
+	 * Polling-path Codex reference extraction. Invoked (fire-and-forget) on every
+	 * Active Conversations refresh — the same 60s tick that discovers Codex
+	 * sessions — so references a Codex session fetched via MCP surface in
+	 * Plans & Notes within ~60s, without any hook. `discover()` resolves the
+	 * workspace cwd itself and MUST never throw/reject (the impl swallows errors),
+	 * so callers `void`-call it. Optional so existing tests can omit it.
+	 */
+	codexReferenceDiscovery?: { discover(): void };
+	/**
 	 * Called once when the sidebar webview first becomes visible. Used to trigger
 	 * lazy-loaded data sources (e.g. MemoriesStore.ensureFirstLoad()) that the
 	 * original tree views populated via onDidChangeVisibility — replaced here
@@ -947,6 +956,19 @@ export class SidebarWebviewProvider
 	 */
 	private async pushConversations(): Promise<void> {
 		if (!this.deps.activeSessionsProvider) return;
+		// Ride this 60s tick to extract Codex references on the polling path.
+		// Fire-and-forget: `discover()` resolves cwd itself and a per-cwd
+		// single-flight inside the impl collapses the multiple callers of
+		// pushConversations (tick / handleReady / refresh / detail-panel save).
+		// It is contractually non-throwing, but this is an opportunistic
+		// background extraction — guard it so even a regressed wrapper can never
+		// take down the user's conversation list, which is what this method exists
+		// to render.
+		try {
+			this.deps.codexReferenceDiscovery?.discover();
+		} catch {
+			// ignore — background discovery must never break the refresh.
+		}
 		try {
 			const { items, failedSources } =
 				await this.deps.activeSessionsProvider.listWithDiagnostics();

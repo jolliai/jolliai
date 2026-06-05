@@ -53,7 +53,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | -- | -- |
 | **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
 | **Gemini CLI** | An `AfterAgent` hook fires after each agent completion |
-| **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem |
+| **Codex CLI** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.5+) |
 | **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's local SQLite stores (`globalStorage/state.vscdb` plus per-workspace `workspaceStorage/` databases under your platform's Cursor user-data directory) |
 | **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning Copilot CLI's session log |

@@ -32,8 +32,7 @@ import { join, resolve as pathResolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { normalizePathForCompare } from "../core/PathUtils.js";
-import { extractReferencesFromTranscript } from "../core/references/ReferenceExtractor.js";
-import { ALL_ADAPTERS } from "../core/references/sources/index.js";
+import { scanReferencesFrom } from "../core/references/TranscriptReferenceDiscovery.js";
 import {
 	loadConfig,
 	loadDiscoveryCursor,
@@ -42,11 +41,9 @@ import {
 	saveDiscoveryCursor,
 	savePlansRegistry,
 	saveSession,
-	upsertReferenceEntry,
 } from "../core/SessionTracker.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ClaudeHookInput, PlanEntry, SessionInfo } from "../Types.js";
-import { execFileSyncHidden } from "../util/Subprocess.js";
 import { readStdin } from "./HookUtils.js";
 
 const log = createLogger("StopHook");
@@ -167,7 +164,7 @@ async function discoverFromTranscript(sessionInfo: SessionInfo, cwd: string): Pr
 		log.error("Plan discovery failed: %s", (error as Error).message);
 	}
 	try {
-		referenceLine = await scanReferencesFrom(transcriptPath, fromLine, cwd);
+		referenceLine = await scanReferencesFrom(transcriptPath, fromLine, cwd, "claude");
 	} catch (error: unknown) {
 		log.error("Reference discovery failed: %s", (error as Error).message);
 	}
@@ -519,58 +516,6 @@ function scanTranscriptForPlans(
 	});
 }
 
-// ─── Reference Discovery (multi-source) ─────────────────────────────────────
-
-/**
- * Scans the transcript for ALL registered source adapters (Linear / Jira /
- * GitHub / Notion / …) from `fromLine` and persists discovered references:
- *   1. extractReferencesFromTranscript(transcriptPath, ALL_ADAPTERS, …) → Reference[]
- *   2. For each ref: upsertReferenceEntry routes the row into plans.json.references
- *      and writes per-reference markdown via ReferenceStore.writeReferenceMarkdown.
- *
- * Pure scan + upsert — the caller (discoverFromTranscript) owns the merged
- * discovery cursor. Returns the furthest line scanned (EOF).
- */
-async function scanReferencesFrom(transcriptPath: string, fromLine: number, cwd: string): Promise<number> {
-	const { references, lastLineNumberScanned } = await extractReferencesFromTranscript(transcriptPath, ALL_ADAPTERS, {
-		fromLineNumber: fromLine,
-	});
-
-	if (references.length === 0) {
-		return lastLineNumberScanned;
-	}
-
-	const branch = getCurrentBranch(cwd);
-	const upserted: string[] = [];
-	const failed: string[] = [];
-	for (const ref of references) {
-		// Per-iteration try/catch: a single bad ref (e.g. permission error
-		// writing markdown, or a transient plans.json write contention) must
-		// not abort the batch — otherwise subsequent refs are lost AND the
-		// cursor save below is skipped, so the next StopHook re-processes the
-		// same refs and hits the same failure in a loop.
-		try {
-			await upsertReferenceEntry(ref, cwd, branch);
-			upserted.push(ref.mapKey);
-		} catch (err) {
-			log.warn(
-				"Reference discovery: failed to persist %s: %s — continuing with rest of batch",
-				ref.mapKey,
-				(err as Error).message,
-			);
-			failed.push(ref.mapKey);
-		}
-	}
-	log.info(
-		"Reference discovery: upserted %d of %d ref(s)%s",
-		upserted.length,
-		references.length,
-		failed.length > 0 ? ` (failed: [${failed.join(", ")}])` : "",
-	);
-
-	return lastLineNumberScanned;
-}
-
 /** Extracts the first # heading from a markdown file. */
 function extractPlanTitle(filePath: string): string {
 	// Use a platform-agnostic basename for the fallback: node:path.basename
@@ -586,19 +531,6 @@ function extractPlanTitle(filePath: string): string {
 		return match?.[1]?.trim() ?? fallback;
 	} catch {
 		return fallback;
-	}
-}
-
-/** Returns the current git branch name. */
-function getCurrentBranch(cwd: string): string {
-	try {
-		return execFileSyncHidden("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-			cwd,
-			encoding: "utf-8",
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim();
-	} catch {
-		return "unknown";
 	}
 }
 

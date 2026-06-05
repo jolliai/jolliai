@@ -2,8 +2,13 @@
  * Codex Session Discoverer
  *
  * On-demand scanner for OpenAI Codex CLI sessions. Since Codex has no
- * lifecycle hooks (unlike Claude Code's Stop event), sessions must be
- * discovered by scanning the filesystem at post-commit time.
+ * lifecycle hook we can use (the Stop hook needs per-user manual trust and is
+ * broken under git worktrees), sessions are discovered by scanning the
+ * filesystem. This runs both at post-commit time (for summaries) and on the
+ * VS Code sidebar's 60s Active Conversations tick — the latter also drives
+ * Codex reference extraction (Linear/Jira/GitHub/Notion) via
+ * `CodexReferenceDiscovery.discoverCodexReferences`, which reuses the shared
+ * `discovery-cursors.json` incremental cursor.
  *
  * Algorithm:
  *   1. Scan ~/.codex/sessions/YYYY/MM/DD/ for recent JSONL files

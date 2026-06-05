@@ -3309,4 +3309,63 @@ describe("SidebarWebviewProvider", () => {
 			vi.useRealTimers();
 		}
 	});
+
+	// A manual toolbar refresh on the Branch tab (scope "branch"/"all") must kick
+	// the Codex polling-path reference discovery — the same hook `pushConversations`
+	// runs on the 60s tick. Locks the wiring so a future handleRefresh refactor
+	// can't silently drop it. (scope "kb"/"status" don't refresh conversations, so
+	// they deliberately don't trigger it.)
+	describe("manual refresh triggers Codex reference discovery", () => {
+		function makeProviderWithCodex(discover: ReturnType<typeof vi.fn>): {
+			provider: SidebarWebviewProvider;
+			view: MockWebviewView;
+		} {
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "branch",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				activeSessionsProvider: {
+					listWithDiagnostics: vi.fn().mockResolvedValue({ items: [], failedSources: [] }),
+				} as unknown as never,
+				codexReferenceDiscovery: { discover },
+			});
+			const view = makeMockView();
+			provider.resolveWebviewView(view as unknown as never);
+			return { provider, view };
+		}
+
+		it.each(["branch", "all"] as const)("invokes discover() on a %s-scope refresh", (scope) => {
+			const discover = vi.fn();
+			const { view } = makeProviderWithCodex(discover);
+			view.webview.triggerMessage({ type: "refresh", scope } as SidebarOutboundMsg);
+			expect(discover).toHaveBeenCalledTimes(1);
+		});
+
+		it.each(["kb", "status"] as const)("does NOT invoke discover() on a %s-scope refresh", (scope) => {
+			const discover = vi.fn();
+			const { view } = makeProviderWithCodex(discover);
+			view.webview.triggerMessage({ type: "refresh", scope } as SidebarOutboundMsg);
+			expect(discover).not.toHaveBeenCalled();
+		});
+
+		it("still pushes the conversation list when discover() throws synchronously", () => {
+			const discover = vi.fn(() => {
+				throw new Error("discovery wrapper regressed");
+			});
+			const { view } = makeProviderWithCodex(discover);
+			// A throwing background discovery must NOT take down the refresh: the
+			// triggerMessage call must not throw and the conversations fetch still runs.
+			expect(() =>
+				view.webview.triggerMessage({ type: "refresh", scope: "branch" } as SidebarOutboundMsg),
+			).not.toThrow();
+			expect(discover).toHaveBeenCalledTimes(1);
+		});
+	});
 });
