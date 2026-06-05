@@ -105,7 +105,7 @@ Click the eye icon (`$(eye)`) on any commit to open a full memory panel. It show
 * **All Conversations** (Private Zone): raw AI conversation transcripts stored locally on your machine. Browse by session tab, edit, delete, or restore entries. Your private data, nothing is uploaded unless you choose to.
 * **Properties**: commit hash, branch, author, date, duration (working days), conversation count, and code change stats
 * **Plans & Notes**: associated plans and notes with edit, remove, and add actions (plans, Markdown files, or inline text snippets)
-* **Linear Issues**: any Linear issues referenced in the AI conversation (via the Linear MCP server) are extracted at commit time and rendered as first-class items — title, status, identifier, and a deep link back to Linear. They follow the commit through squash / rebase the same way Plans and Notes do.
+* **Issue & page references** (Linear / Jira / GitHub / Notion): any issues, tickets, or pages referenced in the AI conversation (via the corresponding MCP server) are extracted and rendered as first-class items — title, status / identifier where available, and a deep link back to the source. They follow the commit through squash / rebase the same way Plans and Notes do. For **Claude Code** these are extracted at commit time; for **Codex** (which has no commit-time hook) they are extracted on the sidebar's 60s polling tick.
 * **E2E Test Guide**: AI-generated test scenarios with preconditions, steps, and expected results. Click "Generate" to create them on demand.
 * **Source Commits** (for squash/amend): all contributing commits with diff stats and conversation counts
 * **Topics**: each topic structured as:

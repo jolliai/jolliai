@@ -140,6 +140,7 @@ jolli status
 | [TranscriptParser.ts](src/core/TranscriptParser.ts) | Source-specific parsers (Claude, Codex, Gemini) |
 | [GeminiTranscriptReader.ts](src/core/GeminiTranscriptReader.ts) | Dedicated JSON reader for Gemini transcript format |
 | [CodexSessionDiscoverer.ts](src/core/CodexSessionDiscoverer.ts) | Discovers Codex CLI sessions by scanning the filesystem |
+| [CodexReferenceDiscovery.ts](src/core/CodexReferenceDiscovery.ts) | Extracts Linear/Jira/GitHub/Notion references from Codex rollout transcripts on the VS Code sidebar's 60s polling tick. Reuses the shared source-agnostic envelope parser ([references/TranscriptEnvelopeParser.ts](src/core/references/TranscriptEnvelopeParser.ts) → `CodexEnvelopeParser`) and the same `discovery-cursors.json` cursor as the Claude Stop path; single-flight + dirty-rerun per cwd, never throws. |
 | [GeminiSessionDetector.ts](src/core/GeminiSessionDetector.ts) | Detects Gemini CLI installation |
 | [OpenCodeSessionDiscoverer.ts](src/core/OpenCodeSessionDiscoverer.ts) | Discovers OpenCode sessions by reading `~/.local/share/opencode/opencode.db` (Node 22.5+ `node:sqlite`, lazy-imported and feature-gated). Surfaces a typed `OpenCodeScanError` when the DB is present but unreadable (corrupt / locked / schema mismatch) so the UI can render a dedicated "unavailable" row. |
 | [OpenCodeTranscriptReader.ts](src/core/OpenCodeTranscriptReader.ts) | Reads OpenCode message rows out of `opencode.db` and converts them into the shared `TranscriptEntry` shape used by the rest of the pipeline |
