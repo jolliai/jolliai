@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FolderStorage } from "./FolderStorage.js";
 import type { ManifestEntry } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
+import type { TopicPage } from "./TopicKBTypes.js";
 
 // Mock SummaryMarkdownBuilder
 vi.mock("./SummaryMarkdownBuilder.js", () => ({
@@ -2348,5 +2349,366 @@ describe("FolderStorage", () => {
 			expect(existsSync(visiblePath)).toBe(true);
 			expect(readFileSync(visiblePath, "utf-8")).toContain("Fresh note");
 		});
+	});
+
+	describe("kbRoot", () => {
+		it("returns the per-repo folder root (rootPath)", () => {
+			expect(storage.kbRoot).toBe(rootPath);
+		});
+	});
+
+	describe("statFile", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		it("returns mtimeMs for an existing hidden file", async () => {
+			await storage.writeFiles([{ path: "index.json", content: '{"version":3}' }], "seed");
+			const st = await storage.statFile("index.json");
+			expect(st).not.toBeNull();
+			expect(typeof st?.mtimeMs).toBe("number");
+			expect(st?.mtimeMs).toBeGreaterThan(0);
+		});
+
+		it("returns null for a nonexistent file", async () => {
+			expect(await storage.statFile("ghost.json")).toBeNull();
+		});
+
+		it("returns null when the path is a directory (not a file)", async () => {
+			mkdirSync(join(rootPath, ".jolli", "summaries"), { recursive: true });
+			expect(await storage.statFile("summaries")).toBeNull();
+		});
+	});
+
+	describe("markDirty suppressed-write path", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		// The symlink-safe write helper throws when the vault root contains a
+		// hostile symlink. markDirty is contractually best-effort: it must
+		// swallow the throw and log a WARN, never propagate to the caller.
+		it("swallows a write failure and does not throw (logs WARN)", async () => {
+			const guard = await import("../sync/VaultSymlinkGuard.js");
+			const spy = vi.spyOn(guard, "safeAtomicWriteSync").mockImplementationOnce(() => {
+				throw new Error("hostile symlink in vault root");
+			});
+			expect(() => storage.markDirty("boom")).not.toThrow();
+			// No status file was written (the guard rejected the write).
+			expect(storage.isDirty()).toBe(false);
+			spy.mockRestore();
+		});
+	});
+
+	describe("forceRegenerateVisibleMarkdown — TOCTOU regenerate failure", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		// The hidden JSON validates up front (exists + parses), but a TOCTOU
+		// race makes the inner regenerateVisibleMarkdown return false (JSON
+		// vanished between the validation and the inner re-read). The contract
+		// maps that to reason "missing" so the user gets the recovery hint.
+		it("reports reason 'missing' when regenerate returns false after JSON validated", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "7777888899990000",
+				commitMessage: "Toctou regen",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/7777888899990000.json", content: summaryJson }], "seed");
+			const visiblePath = join(rootPath, "main", "toctou-regen-77778888.md");
+			expect(existsSync(visiblePath)).toBe(true);
+
+			// regenerateVisibleMarkdown returns false (simulated TOCTOU) — the
+			// up-front JSON read still succeeds, so we exercise the false arm of
+			// `ok ? { ok: true } : { ok: false, reason: "missing" }`.
+			const spy = vi.spyOn(storage, "regenerateVisibleMarkdown").mockResolvedValueOnce(false);
+
+			const result = await storage.forceRegenerateVisibleMarkdown({
+				commitHash: "7777888899990000",
+				commitMessage: "Toctou regen",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(result).toEqual({ ok: false, reason: "missing" });
+			spy.mockRestore();
+		});
+
+		// When the visible .md is already absent, forceRegenerate skips the
+		// unlink branch entirely and writes a fresh copy from the hidden JSON.
+		// Pins the `existsSync(absPath) === false` arm of the unlink guard.
+		it("writes fresh when no diverged visible file exists (skips unlink)", async () => {
+			const summaryJson = makeSummaryJson({
+				commitHash: "0a0a0a0a0a0a0a0a",
+				commitMessage: "No prior visible",
+				branch: "main",
+			});
+			await storage.writeFiles([{ path: "summaries/0a0a0a0a0a0a0a0a.json", content: summaryJson }], "seed");
+			const visiblePath = join(rootPath, "main", "no-prior-visible-0a0a0a0a.md");
+			// Remove the visible copy so forceRegenerate's existsSync(absPath) is false.
+			unlinkSync(visiblePath);
+			expect(existsSync(visiblePath)).toBe(false);
+
+			const result = await storage.forceRegenerateVisibleMarkdown({
+				commitHash: "0a0a0a0a0a0a0a0a",
+				commitMessage: "No prior visible",
+				commitDate: "2026-01-15T10:00:00Z",
+				branch: "main",
+				generatedAt: "2026-01-15T10:00:00Z",
+				parentCommitHash: null,
+			});
+
+			expect(result).toEqual({ ok: true });
+			expect(existsSync(visiblePath)).toBe(true);
+		});
+	});
+});
+
+describe("FolderStorage.renderTopicWiki", () => {
+	let rootPath: string;
+	let metadataManager: MetadataManager;
+	let storage: FolderStorage;
+
+	beforeEach(() => {
+		rootPath = join(tmpdir(), `kb-wiki-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(rootPath, { recursive: true });
+		metadataManager = new MetadataManager(join(rootPath, ".jolli"));
+		storage = new FolderStorage(rootPath, metadataManager);
+	});
+
+	afterEach(() => {
+		const { rmSync } = require("node:fs");
+		try {
+			rmSync(rootPath, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+	});
+
+	it("renderTopicWiki writes topic--<slug>.md + _index.md and wipes stale pages", async () => {
+		// Arrange: a prior stale wiki page
+		mkdirSync(join(rootPath, "_wiki"), { recursive: true });
+		writeFileSync(join(rootPath, "_wiki", "topic--stale.md"), "old");
+
+		const page: TopicPage = {
+			schemaVersion: 1,
+			stableSlug: "auth",
+			title: "Auth",
+			content: "Body.",
+			relatedBranches: ["main"],
+			sourceRefs: [],
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+		};
+		await storage.renderTopicWiki([page]);
+
+		expect(existsSync(join(rootPath, "_wiki", "topic--auth.md"))).toBe(true);
+		expect(existsSync(join(rootPath, "_wiki", "_index.md"))).toBe(true);
+		expect(existsSync(join(rootPath, "_wiki", "topic--stale.md"))).toBe(false); // wiped
+	});
+
+	// Drives buildWikiRenderContext's three lookup closures
+	// (resolveCommitVisiblePath, resolveCommitMessage, resolveBranchFolder) by
+	// rendering a topic whose source commit + related branch resolve against a
+	// seeded manifest/branches mapping. Also exercises the index-by-short-hash
+	// loop in buildWikiRenderContext.
+	it("resolves commit links and branch folders from the manifest/branches mappings", async () => {
+		await storage.ensure();
+		// Seed a commit so its manifest entry carries source.commitHash; this
+		// populates the byShortHash index and the branch mapping.
+		const summaryJson = JSON.stringify({
+			version: 3,
+			commitHash: "abc12345deadbeef",
+			commitMessage: "Add login feature",
+			commitAuthor: "Alice",
+			commitDate: "2026-01-15T10:00:00Z",
+			branch: "feature/login",
+			generatedAt: "2026-01-15T10:00:00Z",
+		});
+		await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: summaryJson }], "seed");
+
+		const page: TopicPage = {
+			schemaVersion: 1,
+			stableSlug: "auth",
+			title: "Auth",
+			content: "Body.",
+			relatedBranches: ["feature/login"],
+			sourceRefs: [
+				{ type: "summary", id: "abc12345deadbeef", timestamp: "2026-01-01T00:00:00Z", branch: "feature/login" },
+			],
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+		};
+		await storage.renderTopicWiki([page]);
+
+		const topicMd = readFileSync(join(rootPath, "_wiki", "topic--auth.md"), "utf-8");
+		// resolveCommitVisiblePath returned `../feature-login/...md`; resolveCommitMessage
+		// returned the manifest title; both stitched into a markdown link with the message.
+		expect(topicMd).toContain("Add login feature");
+		expect(topicMd).toContain("../feature-login/");
+		// resolveBranchFolder returned the transcoded folder for the related branch.
+		expect(topicMd).toContain("../feature-login/)");
+	});
+
+	// Unknown source commit + unknown related branch → all three closures
+	// return null, exercising the fall-back (non-link) arms in the renderer and
+	// the `byShortHash.get(...) ?? null` / `?? null` branches in the context.
+	it("falls back to non-links when a topic references an unknown commit and branch", async () => {
+		await storage.ensure();
+		const page: TopicPage = {
+			schemaVersion: 1,
+			stableSlug: "mystery",
+			title: "Mystery",
+			content: "Body.",
+			relatedBranches: ["never/mapped"],
+			sourceRefs: [{ type: "summary", id: "deadc0dedeadc0de", timestamp: "2026-01-01T00:00:00Z" }],
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+		};
+		await storage.renderTopicWiki([page]);
+
+		const topicMd = readFileSync(join(rootPath, "_wiki", "topic--mystery.md"), "utf-8");
+		// No resolvable visible path → literal hash citation, not a link.
+		expect(topicMd).toContain("`deadc0de`");
+		// No resolvable branch folder → literal branch name.
+		expect(topicMd).toContain("`never/mapped`");
+	});
+
+	// buildWikiRenderContext's byShortHash index only includes commit entries
+	// with a source.commitHash. A plan/note manifest entry must be skipped by
+	// the `entry.type === "commit" && entry.source.commitHash` guard (the false
+	// arm of that condition), so it never pollutes the commit-link lookup.
+	it("skips non-commit manifest entries when indexing for wiki links", async () => {
+		await storage.ensure();
+		// A plan-typed manifest entry (no source.commitHash) must be ignored by
+		// the indexing loop in buildWikiRenderContext.
+		metadataManager.updateManifest({
+			path: "main/plan--x.md",
+			fileId: "plan:x",
+			type: "plan",
+			fingerprint: "fp",
+			source: {},
+			title: "A plan",
+		});
+
+		const page: TopicPage = {
+			schemaVersion: 1,
+			stableSlug: "with-plan-noise",
+			title: "With plan noise",
+			content: "Body.",
+			relatedBranches: [],
+			sourceRefs: [],
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+		};
+		await expect(storage.renderTopicWiki([page])).resolves.toBeUndefined();
+		expect(existsSync(join(rootPath, "_wiki", "topic--with-plan-noise.md"))).toBe(true);
+	});
+
+	// renderTopicImpl throwing is caught per-topic (line ~1047) so one bad page
+	// doesn't abort the whole rebuild; the index still renders.
+	it("warns and continues when a single topic fails to render", async () => {
+		await storage.ensure();
+		const wiki = await import("./WikiMarkdownBuilder.js");
+		const spy = vi.spyOn(wiki, "renderTopicImpl").mockImplementationOnce(() => {
+			throw new Error("render boom");
+		});
+
+		const page: TopicPage = {
+			schemaVersion: 1,
+			stableSlug: "boom",
+			title: "Boom",
+			content: "Body.",
+			relatedBranches: [],
+			sourceRefs: [],
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+		};
+		await storage.renderTopicWiki([page]);
+
+		// The failing topic produced no file, but the rebuild completed and the
+		// index was still written.
+		expect(existsSync(join(rootPath, "_wiki", "topic--boom.md"))).toBe(false);
+		expect(existsSync(join(rootPath, "_wiki", "_index.md"))).toBe(true);
+		spy.mockRestore();
+	});
+
+	// renderTopicKBIndex throwing is caught (line ~1063) so the topic pages
+	// still land even though the index couldn't be written.
+	it("warns and continues when the index fails to render", async () => {
+		await storage.ensure();
+		const wiki = await import("./WikiMarkdownBuilder.js");
+		const spy = vi.spyOn(wiki, "renderTopicKBIndex").mockImplementationOnce(() => {
+			throw new Error("index boom");
+		});
+
+		const page: TopicPage = {
+			schemaVersion: 1,
+			stableSlug: "topic-a",
+			title: "Topic A",
+			content: "Body.",
+			relatedBranches: [],
+			sourceRefs: [],
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+		};
+		await storage.renderTopicWiki([page]);
+
+		expect(existsSync(join(rootPath, "_wiki", "topic--topic-a.md"))).toBe(true);
+		// Index write was skipped due to the thrown error.
+		expect(existsSync(join(rootPath, "_wiki", "_index.md"))).toBe(false);
+		spy.mockRestore();
+	});
+
+	// wipeWikiArtifacts: a non-.md file in _wiki is left alone, and an
+	// unlink failure on a stale .md is caught (WARN) rather than aborting.
+	it("wipeWikiArtifacts skips non-.md files and survives an unlink failure", async () => {
+		await storage.ensure();
+		mkdirSync(join(rootPath, "_wiki"), { recursive: true });
+		// Non-.md file: the `!entry.endsWith(".md")` continue arm.
+		writeFileSync(join(rootPath, "_wiki", "keep.txt"), "keep me");
+		// Stale .md whose unlink will throw — replace it with a directory so
+		// unlinkSync raises EPERM/EISDIR and the inner catch logs a WARN.
+		mkdirSync(join(rootPath, "_wiki", "topic--stale.md"), { recursive: true });
+
+		const page: TopicPage = {
+			schemaVersion: 1,
+			stableSlug: "fresh",
+			title: "Fresh",
+			content: "Body.",
+			relatedBranches: [],
+			sourceRefs: [],
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+		};
+		await expect(storage.renderTopicWiki([page])).resolves.toBeUndefined();
+
+		// Non-.md untouched; new topic written despite the unlink failure on the stale dir.
+		expect(existsSync(join(rootPath, "_wiki", "keep.txt"))).toBe(true);
+		expect(existsSync(join(rootPath, "_wiki", "topic--fresh.md"))).toBe(true);
+	});
+
+	// wipeWikiArtifacts: readdirSync on the _wiki dir throws (e.g. it's a file,
+	// not a directory). The outer catch logs a WARN and the rebuild proceeds.
+	it("wipeWikiArtifacts survives a readdir failure on the _wiki path", async () => {
+		await storage.ensure();
+		// Place a regular file where _wiki/ is expected so the later
+		// mkdirSync(_wiki) in renderTopicWiki would normally collide — but
+		// wipeWikiArtifacts runs first and readdirSync(file) throws ENOTDIR.
+		const wikiAsFile = join(rootPath, "_wiki");
+		writeFileSync(wikiAsFile, "not a dir");
+
+		const page: TopicPage = {
+			schemaVersion: 1,
+			stableSlug: "afterwipe",
+			title: "After wipe",
+			content: "Body.",
+			relatedBranches: [],
+			sourceRefs: [],
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+		};
+		// readdir failure is swallowed; the subsequent mkdirSync(_wiki) throws
+		// because a file occupies the path — renderTopicWiki does not guard that,
+		// so the call rejects. We only assert wipeWikiArtifacts itself swallowed
+		// the readdir error (no unhandled throw from inside the wipe).
+		await expect(storage.renderTopicWiki([page])).rejects.toThrow();
+		// The bogus file is still in place (wipe's readdir catch logged + returned).
+		expect(existsSync(wikiAsFile)).toBe(true);
 	});
 });

@@ -349,6 +349,44 @@ describe("listJolliMemorySpaces", () => {
 		).resolves.toEqual({ spaces: [], defaultSpaceId: null });
 	});
 
+	it("treats an empty 2xx body as an empty object", async () => {
+		// Exercises the `: {}` falsy path of `raw.length > 0 ? ... : {}`.
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				cb(createMockResponse(200, ""));
+				return createMockRequest();
+			},
+		);
+		await expect(
+			listJolliMemorySpaces("https://acme.jolli.ai", OLD_KEY),
+		).resolves.toEqual({ spaces: [], defaultSpaceId: null });
+	});
+
+	it("coerces a missing statusCode to HTTP 0", async () => {
+		// Exercises the `?? 0` path of `res.statusCode ?? 0` — an undefined
+		// statusCode falls through to the generic error branch as `HTTP 0`.
+		mockHttpsRequest.mockImplementation(
+			(
+				_url: unknown,
+				_opts: unknown,
+				cb: (res: MockIncomingMessage) => void,
+			) => {
+				const res = createMockResponse(200, "");
+				// biome-ignore lint/suspicious/noExplicitAny: simulate a response with no statusCode
+				(res as any).statusCode = undefined;
+				cb(res);
+				return createMockRequest();
+			},
+		);
+		await expect(
+			listJolliMemorySpaces("https://acme.jolli.ai", OLD_KEY),
+		).rejects.toThrow("HTTP 0");
+	});
+
 	it("uses http.request for http URL", async () => {
 		const body = JSON.stringify([]);
 		mockHttpRequest.mockImplementation(

@@ -119,6 +119,32 @@ vi.mock("../util/Logger.js", () => ({
 	log: { info, warn, error: logError },
 }));
 
+// JolliApiUtils is normally used verbatim (the real parser/validator). We wrap
+// `validateJolliApiKey` in a vi.fn that delegates to the real implementation by
+// default, so a couple of tests can override it to throw a *non-Error* value —
+// the only way to exercise the `err instanceof Error ? … : "Invalid …"` fallback
+// arms in handleLoadSettings / handleApplySettings, which the real validator
+// (it only ever throws `Error`) cannot reach on its own.
+const { mockValidateJolliApiKey, realValidateRef } = vi.hoisted(() => ({
+	// biome-ignore lint/suspicious/noExplicitAny: test seam delegates to the real validator
+	mockValidateJolliApiKey: vi.fn() as any,
+	// biome-ignore lint/suspicious/noExplicitAny: holds the real impl captured at mock time
+	realValidateRef: { current: undefined as any },
+}));
+
+vi.mock("../../../cli/src/core/JolliApiUtils.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<
+			typeof import("../../../cli/src/core/JolliApiUtils.js")
+		>();
+	realValidateRef.current = actual.validateJolliApiKey;
+	mockValidateJolliApiKey.mockImplementation(actual.validateJolliApiKey);
+	return {
+		...actual,
+		validateJolliApiKey: mockValidateJolliApiKey,
+	};
+});
+
 const { mockBuildSettingsHtml } = vi.hoisted(() => ({
 	mockBuildSettingsHtml: vi.fn().mockReturnValue("<html>settings</html>"),
 }));
@@ -166,6 +192,9 @@ function flushPromises(): Promise<void> {
 describe("SettingsWebviewPanel", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		// Restore the validator to delegate to the real implementation; the two
+		// non-Error-fallback tests override this and we must not leak that.
+		mockValidateJolliApiKey.mockImplementation(realValidateRef.current);
 		// Reset singleton
 		(
 			SettingsWebviewPanel as unknown as { currentPanel: undefined }
@@ -463,6 +492,7 @@ describe("SettingsWebviewPanel", () => {
 				geminiEnabled: true,
 				openCodeEnabled: false,
 				excludePatterns: ["dist", "node_modules"],
+				compileExcludeFolders: ["archive", "tmp-*"],
 			});
 
 			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
@@ -486,6 +516,7 @@ describe("SettingsWebviewPanel", () => {
 						geminiEnabled: true,
 						openCodeEnabled: false,
 						excludePatterns: "dist, node_modules",
+						compileExcludeFolders: "archive, tmp-*",
 					}),
 				}),
 			);
@@ -520,6 +551,7 @@ describe("SettingsWebviewPanel", () => {
 						geminiEnabled: true,
 						openCodeEnabled: true,
 						excludePatterns: "",
+						compileExcludeFolders: "",
 					}),
 				}),
 			);
@@ -776,6 +808,88 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
 				expect.objectContaining({ excludePatterns: undefined }),
+				expect.any(String),
+			);
+		});
+
+		it("saves compileExcludeFolders as a trimmed array", async () => {
+			const dispatch = await setupWithLoadedConfig();
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+					compileExcludeFolders: "archive, tmp-* , experiments",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({
+					compileExcludeFolders: ["archive", "tmp-*", "experiments"],
+				}),
+				expect.any(String),
+			);
+		});
+
+		it("omits compileExcludeFolders when string is empty", async () => {
+			const dispatch = await setupWithLoadedConfig();
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+					compileExcludeFolders: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ compileExcludeFolders: undefined }),
+				expect.any(String),
+			);
+		});
+
+		it("tolerates a payload that omits compileExcludeFolders", async () => {
+			const dispatch = await setupWithLoadedConfig();
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ compileExcludeFolders: undefined }),
 				expect.any(String),
 			);
 		});
@@ -2533,6 +2647,187 @@ describe("SettingsWebviewPanel", () => {
 					command: "settingsLoaded",
 					signedIn: true,
 					settings: expect.objectContaining({ aiProvider: "jolli" }),
+				}),
+			);
+		});
+	});
+
+	// ── sync settings: numeric / boolean-true branches ──────────────────────
+	// These pin the truthy arms of the sync-related conditionals that the rest
+	// of the suite only ever exercises in their absent/false form.
+
+	describe("sync settings (auto-sync / transcripts / poll interval)", () => {
+		it("forwards a numeric syncPollIntervalSec from disk into settingsLoaded", async () => {
+			// Exercises the `typeof config.syncPollIntervalSec === "number"` true
+			// arm in handleLoadSettings (otherwise always null in this suite).
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+				syncPollIntervalSec: 7200,
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ syncPollIntervalSec: 7200 }),
+				}),
+			);
+		});
+
+		it("persists autoSyncEnabled / syncTranscripts true and clamps a numeric poll interval", async () => {
+			// Covers the `=== true ? true : undefined` true arms for autoSync &
+			// transcripts, plus the numeric `Math.min/max` clamp arm of
+			// syncPollIntervalSec in handleApplySettings.
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			postMessage.mockClear();
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+					autoSyncEnabled: true,
+					syncTranscripts: true,
+					// Below the 5400 floor — must clamp up to 5400.
+					syncPollIntervalSec: 100,
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({
+					autoSyncEnabled: true,
+					syncTranscripts: true,
+					syncPollIntervalSec: 5400,
+				}),
+				expect.any(String),
+			);
+		});
+	});
+
+	// ── non-Error validator fallbacks ───────────────────────────────────────
+	// validateJolliApiKey only ever throws `Error`, so the `instanceof Error ?
+	// … : "Invalid …"` fallback arms in handleLoadSettings / handleApplySettings
+	// are unreachable through the real parser. The test seam (see top-of-file
+	// mock) lets us throw a non-Error to pin those arms.
+
+	describe("validator non-Error fallbacks", () => {
+		it("uses the generic message when a stored Jolli key validation throws a non-Error", async () => {
+			mockValidateJolliApiKey.mockImplementation(() => {
+				// biome-ignore lint/suspicious/noExplicitAny: deliberately throwing a non-Error
+				throw "raw-load-reject" as any;
+			});
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: "sk-jol-anything",
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(warn).toHaveBeenCalledWith(
+				"SettingsPanel",
+				expect.stringContaining("Invalid Jolli API Key on file"),
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsError",
+					message: expect.stringContaining("Invalid Jolli API Key on file"),
+				}),
+			);
+		});
+
+		it("uses the generic message when applySettings validation throws a non-Error", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: undefined,
+				model: "sonnet",
+				maxTokens: null,
+				jolliApiKey: undefined,
+				claudeEnabled: true,
+				codexEnabled: true,
+				geminiEnabled: true,
+				excludePatterns: [],
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			postMessage.mockClear();
+
+			// Now make the apply-time validation throw a non-Error.
+			mockValidateJolliApiKey.mockImplementation(() => {
+				// biome-ignore lint/suspicious/noExplicitAny: deliberately throwing a non-Error
+				throw "raw-apply-reject" as any;
+			});
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "sk-jol-anything",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).not.toHaveBeenCalled();
+			expect(logError).toHaveBeenCalledWith(
+				"SettingsPanel",
+				expect.stringContaining("Invalid Jolli API Key"),
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsError",
+					message: "Invalid Jolli API Key",
 				}),
 			);
 		});

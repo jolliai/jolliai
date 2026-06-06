@@ -347,7 +347,7 @@ export class MigrationEngine {
 		existing: {
 			fileId: string;
 			path: string;
-			type: "commit" | "plan" | "note";
+			type: "commit" | "plan" | "note" | "wiki";
 			fingerprint: string;
 			source: { commitHash?: string; branch?: string; generatedAt?: string };
 		},

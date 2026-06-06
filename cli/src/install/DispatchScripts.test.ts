@@ -38,6 +38,31 @@ describe("installHookScripts", () => {
 		const runHook = await readFile(join(globalDir, "run-hook"), "utf-8");
 		expect(runHook).toContain("HOOK_TYPE");
 		expect(runHook).toContain("post-commit");
+	});
+
+	// Regression: every git/agent hook the installer wires up must have a matching
+	// dispatch arm, or `run-hook <type>` falls through to the `*)` error arm and the
+	// hook silently never runs. post-merge was added without its dispatch arm.
+	it("should have a dispatch arm execing the right entry for every hook type", async () => {
+		await installHookScripts();
+		const globalDir = join(tempDir, ".jolli", "jollimemory");
+		const runHook = await readFile(join(globalDir, "run-hook"), "utf-8");
+
+		const expected: Record<string, string> = {
+			"post-commit": "PostCommitHook.js",
+			"post-merge": "PostMergeHook.js",
+			"post-rewrite": "PostRewriteHook.js",
+			"prepare-commit-msg": "PrepareMsgHook.js",
+			stop: "StopHook.js",
+			"session-start": "SessionStartHook.js",
+			"gemini-after-agent": "GeminiAfterAgentHook.js",
+		};
+		for (const [hookType, entry] of Object.entries(expected)) {
+			const arm = new RegExp(
+				`${hookType.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\)\\s+exec node "\\$DIST/${entry}"`,
+			);
+			expect(runHook, `missing dispatch arm for ${hookType} → ${entry}`).toMatch(arm);
+		}
 
 		const runCli = await readFile(join(globalDir, "run-cli"), "utf-8");
 		expect(runCli).toContain("Cli.js");

@@ -29,6 +29,8 @@ import {
 	collectSortedTopics,
 	escAttr,
 	escHtml,
+	escMdLinkText,
+	escMdUrl,
 	formatActiveProviderLabel,
 	formatDate,
 	formatFullDate,
@@ -108,6 +110,59 @@ describe("SummaryUtils", () => {
 
 		it("handles empty string", () => {
 			expect(escAttr("")).toBe("");
+		});
+	});
+
+	// ── escMdLinkText ──────────────────────────────────────────────────────────
+
+	describe("escMdLinkText", () => {
+		it("backslash-escapes backslash, open bracket, and close bracket", () => {
+			expect(escMdLinkText("a\\b[c]d")).toBe("a\\\\b\\[c\\]d");
+		});
+
+		it("prevents link breakout via crafted bracket title", () => {
+			// A title like `x](http://evil)` must not close the link early.
+			expect(escMdLinkText("x](http://evil)")).toBe("x\\](http://evil)");
+		});
+
+		it("folds newlines and carriage returns into a single space", () => {
+			expect(escMdLinkText("line one\nline two")).toBe("line one line two");
+			expect(escMdLinkText("a\r\n\r\nb")).toBe("a b");
+		});
+
+		it("returns plain text unchanged", () => {
+			expect(escMdLinkText("PROJ-100 fix bug")).toBe("PROJ-100 fix bug");
+		});
+
+		it("handles empty string", () => {
+			expect(escMdLinkText("")).toBe("");
+		});
+	});
+
+	// ── escMdUrl ─────────────────────────────────────────────────────────────
+
+	describe("escMdUrl", () => {
+		it("percent-encodes parentheses explicitly", () => {
+			expect(escMdUrl("http://x/(a)")).toBe("http://x/%28a%29");
+		});
+
+		it("percent-encodes whitespace, angle brackets, and double quote", () => {
+			expect(escMdUrl('a b<c>d"e')).toBe("a%20b%3Cc%3Ed%22e");
+		});
+
+		it("prevents link breakout via crafted url", () => {
+			// A `)` in the URL must be encoded so it cannot close the link target.
+			expect(escMdUrl("http://x)evil")).toBe("http://x%29evil");
+		});
+
+		it("leaves a clean url unchanged", () => {
+			expect(escMdUrl("https://example.com/path")).toBe(
+				"https://example.com/path",
+			);
+		});
+
+		it("handles empty string", () => {
+			expect(escMdUrl("")).toBe("");
 		});
 	});
 

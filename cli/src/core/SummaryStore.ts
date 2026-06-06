@@ -63,6 +63,17 @@ export function setActiveStorage(storage: StorageProvider | undefined): void {
 	activeStorageOverride = storage;
 }
 
+/**
+ * Reads the current process-global storage override (or undefined). Callers that
+ * temporarily swap it (e.g. the multi-repo compile sweep) capture this first and
+ * restore it in a finally, so the override never leaks past their own scope into
+ * a long-lived host process (VS Code/IntelliJ) where it would silently redirect
+ * later reads/writes to the wrong repo.
+ */
+export function getActiveStorage(): StorageProvider | undefined {
+	return activeStorageOverride;
+}
+
 export function resolveStorage(storage?: StorageProvider, cwd?: string): StorageProvider {
 	if (storage) return storage;
 	if (activeStorageOverride) return activeStorageOverride;

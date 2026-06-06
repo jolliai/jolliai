@@ -769,6 +769,26 @@ describe("AuthService", () => {
 			expect(parsed).toMatch(/[?&]client_version=[^&]+/);
 		});
 
+		it("embeds the esbuild-injected __PKG_VERSION__ in client_version when defined", async () => {
+			// CLIENT_VERSION is computed once at module load from the build-injected
+			// `__PKG_VERSION__` global; test bundles don't define it (→ "dev"). To
+			// exercise the populated arm of that ternary, stub the global and re-import
+			// the module fresh so its top-level constant is recomputed.
+			vi.resetModules();
+			vi.stubGlobal("__PKG_VERSION__", "9.9.9-test");
+			try {
+				const { AuthService: FreshAuthService } = await import("./AuthService.js");
+				const fresh = new FreshAuthService();
+				const callsBefore = uriParse.mock.calls.length;
+				await fresh.openSignInPage();
+				const parsed = uriParse.mock.calls[callsBefore]?.[0] ?? "";
+				expect(parsed).toContain("client_version=9.9.9-test");
+			} finally {
+				vi.unstubAllGlobals();
+				vi.resetModules();
+			}
+		});
+
 		it("should include a 256-bit hex state nonce on the login URL (RFC 6749 §10.12)", async () => {
 			await service.openSignInPage();
 
@@ -928,6 +948,25 @@ describe("AuthService", () => {
 			if (!result.success) {
 				expect(result.error).toContain("state mismatch");
 			}
+		});
+
+		it("should stringify a non-Error throw from getJolliUrl and surface it (covers String(err) branch)", async () => {
+			// Covers the `err instanceof Error ? err.message : String(err)` right
+			// branch in openSignInPage's getJolliUrl guard (line 323). A non-Error
+			// rejection must still produce a readable error dialog rather than
+			// "[object Object]" / undefined.
+			getJolliUrl.mockImplementationOnce(() => {
+				// eslint-disable-next-line @typescript-eslint/no-throw-literal
+				throw "bare-string allowlist rejection at launch";
+			});
+
+			await service.openSignInPage();
+
+			// No URL was opened — construction never reached openExternal.
+			expect(openExternal).not.toHaveBeenCalled();
+			expect(showErrorMessage).toHaveBeenCalledWith(
+				expect.stringContaining("bare-string allowlist rejection at launch"),
+			);
 		});
 
 		it("should use custom JOLLI_URL when configured", async () => {

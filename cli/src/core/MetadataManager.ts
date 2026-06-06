@@ -86,6 +86,22 @@ export class MetadataManager {
 	}
 
 	/**
+	 * Bulk-remove all manifest entries of a given type. Used by
+	 * `FolderStorage.renderTopicWiki` to clear stale `type: "wiki"`
+	 * entries before re-emitting the new wiki batch. Returns the number
+	 * of entries removed.
+	 */
+	unregisterFilesByType(type: ManifestEntry["type"]): number {
+		const manifest = this.readManifest();
+		const kept = manifest.files.filter((f) => f.type !== type);
+		const removed = manifest.files.length - kept.length;
+		if (removed === 0) return 0;
+		this.atomicWrite(this.manifestPath, JSON.stringify({ ...manifest, files: kept }, null, "\t"));
+		log.info("Manifest unregistered %d entries of type=%s", removed, type);
+		return removed;
+	}
+
+	/**
 	 * Replace the manifest's files array in a single atomic write. Used by
 	 * batch operations (heal-folder, migration cleanup) where touching the
 	 * manifest once per row would be O(N²) and leave half-cleaned state on
@@ -222,6 +238,21 @@ export class MetadataManager {
 
 	listBranchMappings(): BranchMapping[] {
 		return this.readBranches().mappings;
+	}
+
+	/**
+	 * Reverse-maps a visible branch *folder* segment to its branch name, falling
+	 * back to the folder segment itself when no mapping exists (or branches.json
+	 * is missing/unreadable). Single source of truth for the folder→branch
+	 * lookup that MemoryBankScanner and FolderPlanNoteSource both need — keeping
+	 * one implementation avoids the two drifting on fallback behavior.
+	 */
+	folderToBranch(folder: string): string {
+		try {
+			return this.listBranchMappings().find((m) => m.folder === folder)?.branch ?? folder;
+		} catch {
+			return folder;
+		}
 	}
 
 	/**

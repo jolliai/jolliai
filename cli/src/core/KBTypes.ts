@@ -13,10 +13,19 @@ export interface ManifestSource {
 export interface ManifestEntry {
 	readonly path: string;
 	readonly fileId: string;
-	readonly type: "commit" | "plan" | "note";
+	/**
+	 * spec 110 — `"wiki"` added for `<kbRoot>/_wiki/topic--<slug>.md` and
+	 * `<kbRoot>/_wiki/_index.md` pages. MemoryBankScanner (spec 108
+	 * Correction 1) already filters by manifest path membership, so wiki
+	 * entries are automatically excluded from "user-written" classification
+	 * the moment they land here.
+	 */
+	readonly type: "commit" | "plan" | "note" | "wiki";
 	readonly fingerprint: string;
 	readonly source: ManifestSource;
 	readonly title?: string; // human-readable display name
+	/** ISO 8601 last-write time. Ordering key for plan/note in the topic-KB timeline fold. */
+	readonly updatedAt?: string;
 }
 
 /** .jolli/manifest.json — tracks AI-generated files in the KB folder */

@@ -22,6 +22,7 @@ export default defineConfig({
 				PrepareMsgHook: resolve(__dirname, "src/hooks/PrepareMsgHook.ts"),
 				GeminiAfterAgentHook: resolve(__dirname, "src/hooks/GeminiAfterAgentHook.ts"),
 				SessionStartHook: resolve(__dirname, "src/hooks/SessionStartHook.ts"),
+				PostMergeHook: resolve(__dirname, "src/hooks/PostMergeHook.ts"),
 			},
 			formats: ["es"],
 		},
@@ -60,10 +61,15 @@ export default defineConfig({
 		unstubGlobals: true,
 		// A handful of tests really do `git init` / write files / acquire file
 		// locks. Under `--coverage` the v8 instrumentation competes for CPU and
-		// these otherwise-fine tests skim the 5s default — see install/* and
-		// core/{Locks,KBPathResolver}.test.ts. 15s leaves headroom for hot
-		// laptops + CI without hiding a genuinely stuck test for much longer.
-		testTimeout: 15000,
+		// these otherwise-fine tests skim the 15s budget on busy laptops — see
+		// install/*, sync/*, core/{Locks,KBPathResolver}.test.ts. Bumped to
+		// 45s under spec 110 after consistent timeouts on `git init / clone`
+		// when the full test suite + coverage runs hot. `hookTimeout` covers
+		// `beforeAll` blocks (sync/GitClient.test.ts seeds a bare repo there).
+		// Both are still bounded so a genuinely stuck test fails within a
+		// minute, not minutes.
+		testTimeout: 45000,
+		hookTimeout: 45000,
 		coverage: {
 			provider: "v8",
 			reporter: ["text", "json-summary"],

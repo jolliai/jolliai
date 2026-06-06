@@ -394,6 +394,7 @@ export function buildSidebarScript(): string {
       // user isn't authenticated. (NB: avoid backticks in comments; file
       // header explains why.)
       items.push(iconButton('sync-now', 'Sync to Personal Space', 'cloud-upload'));
+      items.push(iconButton('compile-now', 'Build Knowledge Wiki', 'database'));
       items.push(iconButton('refresh', 'Refresh', 'refresh'));
       mountIn(tabToolbar, items);
     } else if (state.activeTab === 'status') {
@@ -480,6 +481,8 @@ export function buildSidebarScript(): string {
       vscode.postMessage({ type: 'command', command: 'jollimemory.openSettings' });
     } else if (action === 'sync-now') {
       vscode.postMessage({ type: 'command', command: 'jollimemory.syncNow' });
+    } else if (action === 'compile-now') {
+      vscode.postMessage({ type: 'command', command: 'jollimemory.compileNow' });
     } else if (action === 'sign-in') {
       vscode.postMessage({ type: 'command', command: 'jollimemory.signIn' });
     } else if (action === 'sign-out') {

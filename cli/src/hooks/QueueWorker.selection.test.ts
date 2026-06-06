@@ -276,7 +276,7 @@ import type { SummaryResult } from "../core/Summarizer.js";
 import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary } from "../core/SummaryStore.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
-import type { GitOperation, NoteEntry, PlanEntry, ReferenceEntry } from "../Types.js";
+import type { CommitGitOperation, NoteEntry, PlanEntry, ReferenceEntry } from "../Types.js";
 import { __test__ } from "./QueueWorker.js";
 
 const { executePipeline, processQueueEntry } = __test__;
@@ -292,7 +292,7 @@ function makeSummaryResult(): SummaryResult {
 	};
 }
 
-function makeCommitOp(overrides?: Partial<GitOperation>): GitOperation {
+function makeCommitOp(overrides?: Partial<CommitGitOperation>): CommitGitOperation {
 	return {
 		type: "commit",
 		commitHash: "abc12345",

@@ -26,7 +26,9 @@ interface RecordingStorage extends StorageProvider {
 	readonly pruneCalls: string[][];
 }
 
-function makeStorage(opts: { withPrune?: boolean; pruneThrows?: boolean } = {}): RecordingStorage {
+function makeStorage(
+	opts: { withPrune?: boolean; pruneThrows?: boolean; pruneReturnsZero?: boolean } = {},
+): RecordingStorage {
 	const deletions: SummaryIndexEntry[] = [];
 	const pruneCalls: string[][] = [];
 	const base: RecordingStorage = {
@@ -46,7 +48,7 @@ function makeStorage(opts: { withPrune?: boolean; pruneThrows?: boolean } = {}):
 		base.pruneBranchMappings = async (branches) => {
 			pruneCalls.push([...branches]);
 			if (opts.pruneThrows) throw new Error("prune-fail");
-			return branches.length;
+			return opts.pruneReturnsZero ? 0 : branches.length;
 		};
 	}
 	return base;
@@ -319,6 +321,41 @@ describe("StaleChildMarkdownCleanup", () => {
 			// failure is a side-channel that must never demote the op result.
 			expect(result.deleted).toBe(1);
 			expect(result.failed).toBe(0);
+		});
+
+		it("cleanupBranchStaleChildMarkdown calls prune but logs nothing when no mapping was actually removed", async () => {
+			// Ghost branch in the index, but its branches.json mapping was already
+			// gone (e.g. a concurrent prune) — pruneBranchMappings reports 0
+			// removed. The call still happens; only the info log is skipped. The
+			// .md deletion tally is unaffected.
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "bug/main", null)],
+					["b", e("b", "feature/ghost", "a")],
+				]),
+			);
+			const storage = makeStorage({ pruneReturnsZero: true });
+			const result = await cleanupBranchStaleChildMarkdown("/cwd", "feature/ghost", storage);
+			expect(result.deleted).toBe(1);
+			expect(result.failed).toBe(0);
+			expect(storage.pruneCalls).toEqual([["feature/ghost"]]);
+		});
+
+		it("cleanupAllBranchesStaleChildMarkdown calls prune but logs nothing when no mappings were actually removed", async () => {
+			// Whole-index sweep finds a ghost branch but pruneBranchMappings
+			// removes 0 (mappings already absent). The call still happens; the
+			// summary info log is skipped.
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "bug/main", null)],
+					["b", e("b", "feature/ghost", "a")],
+				]),
+			);
+			const storage = makeStorage({ pruneReturnsZero: true });
+			const result = await cleanupAllBranchesStaleChildMarkdown("/cwd", storage);
+			expect(result.deleted).toBe(1);
+			expect(result.failed).toBe(0);
+			expect(storage.pruneCalls).toEqual([["feature/ghost"]]);
 		});
 
 		it("cleanupAllBranchesStaleChildMarkdown prunes every ghost branch in one batch", async () => {

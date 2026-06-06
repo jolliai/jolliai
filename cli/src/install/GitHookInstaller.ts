@@ -29,6 +29,9 @@ const POST_REWRITE_MARKER_END = "# <<< JolliMemory post-rewrite hook <<<";
 export const PREPARE_MSG_MARKER_START = "# >>> JolliMemory prepare-commit-msg hook >>>";
 const PREPARE_MSG_MARKER_END = "# <<< JolliMemory prepare-commit-msg hook <<<";
 
+export const POST_MERGE_MARKER_START = "# >>> JolliMemory post-merge hook >>>";
+const POST_MERGE_MARKER_END = "# <<< JolliMemory post-merge hook <<<";
+
 // ─── Install ────────────────────────────────────────────────────────────────
 
 /**
@@ -121,6 +124,18 @@ export async function installPrepareMsgHook(projectDir: string): Promise<HookOpR
 		hookCommandLine,
 		PREPARE_MSG_MARKER_START,
 	);
+}
+
+/**
+ * Installs the git post-merge hook (auto-compiles merged branch summaries
+ * after `git pull`/`git merge` completes).
+ * If a hook already exists, appends Jolli Memory's section.
+ */
+export async function installPostMergeHook(projectDir: string): Promise<HookOpResult> {
+	const hookCommandLine = buildHookCommand("post-merge");
+	const hookSection = [POST_MERGE_MARKER_START, hookCommandLine, POST_MERGE_MARKER_END].join("\n");
+
+	return installGenericGitHook(projectDir, "post-merge", hookSection, hookCommandLine, POST_MERGE_MARKER_START);
 }
 
 /**
@@ -240,6 +255,13 @@ export async function removePostRewriteHook(projectDir: string): Promise<void> {
  */
 export async function removePrepareMsgHook(projectDir: string): Promise<void> {
 	await removeGenericGitHook(projectDir, "prepare-commit-msg", PREPARE_MSG_MARKER_START, PREPARE_MSG_MARKER_END);
+}
+
+/**
+ * Removes the Jolli Memory section from the git post-merge hook.
+ */
+export async function removePostMergeHook(projectDir: string): Promise<void> {
+	await removeGenericGitHook(projectDir, "post-merge", POST_MERGE_MARKER_START, POST_MERGE_MARKER_END);
 }
 
 /**

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCK_TIMEOUT_MS } from "../core/LockPrimitives.js";
 import { getVaultWriteLockPath } from "./VaultLockPath.js";
-import { acquireVaultWriteLock, isVaultWriteLockHeld } from "./VaultWriteLock.js";
+import { acquireVaultWriteLock, isVaultWriteLockHeld, withVaultWriteLock } from "./VaultWriteLock.js";
 
 describe("acquireVaultWriteLock", () => {
 	let lockDir: string;
@@ -153,6 +153,41 @@ describe("acquireVaultWriteLock", () => {
 			const handle = await acquireVaultWriteLock(vault, "fail-fast");
 			expect(await isVaultWriteLockHeld(vault)).toBe(true);
 			await handle?.release();
+			expect(await isVaultWriteLockHeld(vault)).toBe(false);
+		});
+	});
+
+	describe("withVaultWriteLock", () => {
+		it("runs the body and reports ran:true, then frees the lock", async () => {
+			let ran = false;
+			const result = await withVaultWriteLock(vault, "fail-fast", async () => {
+				ran = true;
+				expect(await isVaultWriteLockHeld(vault)).toBe(true); // held during body
+				return 42;
+			});
+			expect(ran).toBe(true);
+			expect(result).toEqual({ ran: true, value: 42 });
+			expect(await isVaultWriteLockHeld(vault)).toBe(false); // released after
+		});
+
+		it("does not run the body and reports ran:false when the lock is held", async () => {
+			const blocker = await acquireVaultWriteLock(vault, "fail-fast");
+			let ran = false;
+			const result = await withVaultWriteLock(vault, "fail-fast", async () => {
+				ran = true;
+				return 1;
+			});
+			expect(ran).toBe(false);
+			expect(result).toEqual({ ran: false });
+			await blocker?.release();
+		});
+
+		it("releases the lock even when the body throws", async () => {
+			await expect(
+				withVaultWriteLock(vault, "fail-fast", async () => {
+					throw new Error("body failed");
+				}),
+			).rejects.toThrow("body failed");
 			expect(await isVaultWriteLockHeld(vault)).toBe(false);
 		});
 	});

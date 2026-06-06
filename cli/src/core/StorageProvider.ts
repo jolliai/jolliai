@@ -1,4 +1,5 @@
 import type { FileWrite, SummaryIndexEntry } from "../Types.js";
+import type { TopicPage } from "./TopicKBTypes.js";
 
 export interface StorageProvider {
 	/** Read a file's content. Returns null if not found. */
@@ -58,6 +59,18 @@ export interface StorageProvider {
 
 	/** Check if storage is marked as out-of-sync. Optional. */
 	isDirty?(): boolean;
+
+	/**
+	 * Optional: return mtime for a stored file, for callers that need recency
+	 * ordering of stored artifacts.
+	 *
+	 * Only meaningful for backends with a real filesystem layer
+	 * (FolderStorage). OrphanBranchStorage does not implement this — its
+	 * callers fall back to JSON-embedded timestamps.
+	 *
+	 * Returns `null` when the file does not exist or stat fails.
+	 */
+	statFile?(path: string): Promise<{ readonly mtimeMs: number } | null>;
 
 	/**
 	 * Remove the user-visible Markdown copy for a single summary entry.
@@ -153,6 +166,20 @@ export interface StorageProvider {
 	 * OrphanBranchStorage does not implement it (no visible layer).
 	 */
 	healMissingVisibleMarkdown?(opts?: HealOptions): Promise<HealResult>;
+
+	/**
+	 * Renders the visible `_wiki/` layer from topic-KB pages (SP3). Folder-backed
+	 * providers implement it; orphan-only leaves it undefined (render no-op).
+	 */
+	renderTopicWiki?(pages: ReadonlyArray<TopicPage>): Promise<void>;
+
+	/**
+	 * Whether the visible `_wiki/` layer is currently present on disk. Folder-backed
+	 * providers implement it so the post-commit ingest can re-render a wiki the user
+	 * deleted even when no new sources were ingested (`ingested === 0`). Orphan-only
+	 * leaves it undefined (no visible layer to recover).
+	 */
+	isTopicWikiPresent?(): boolean;
 }
 
 /** Options for a heal-missing-markdown pass. */

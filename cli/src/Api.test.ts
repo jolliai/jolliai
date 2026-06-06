@@ -165,6 +165,8 @@ vi.mock("./core/SummaryStore.js", () => ({
 	migrateIndexToV3: vi.fn().mockResolvedValue({ migrated: 0, skipped: 0 }),
 	// Used by clean command
 	getIndex: vi.fn().mockResolvedValue(null),
+	// Used by compile command to register the configured storage
+	setActiveStorage: vi.fn(),
 }));
 
 vi.mock("./core/SummaryMigration.js", () => ({
@@ -250,6 +252,44 @@ vi.mock("./core/ContextCompiler.js", () => ({
 		estimatedTokens: 0,
 	}),
 	DEFAULT_TOKEN_BUDGET: 20000,
+}));
+
+vi.mock("./core/KnowledgeCompiler.js", () => ({
+	parseCompileResponse: vi.fn(),
+	extractField: vi.fn(),
+	formatSummaryForCompile: vi.fn(),
+}));
+
+vi.mock("./core/IngestPipeline.js", () => ({
+	drainIngest: vi.fn(async () => ({ batches: 1, ingested: 2 })),
+}));
+
+vi.mock("./core/TopicWikiRenderer.js", () => ({
+	renderTopicKBWiki: vi.fn(async () => {}),
+}));
+
+vi.mock("./core/ProcessedSourceStore.js", () => ({
+	saveProcessedSet: vi.fn(async () => {}),
+	emptyProcessedSet: vi.fn(() => ({ schemaVersion: 1, processed: {} })),
+}));
+
+vi.mock("./core/TopicIndexStore.js", () => ({
+	saveTopicIndex: vi.fn(async () => {}),
+	emptyTopicIndex: vi.fn(() => ({ schemaVersion: 1, topics: [] })),
+	readTopicIndex: vi.fn(async () => ({ schemaVersion: 1, topics: [] })),
+}));
+vi.mock("./core/TopicPageStore.js", () => ({
+	purgeTopicPagesExcept: vi.fn(async () => []),
+}));
+
+vi.mock("./core/StorageFactory.js", () => ({
+	createStorage: vi.fn().mockResolvedValue({
+		readFile: vi.fn().mockResolvedValue(null),
+		writeFiles: vi.fn().mockResolvedValue(undefined),
+		listFiles: vi.fn().mockResolvedValue([]),
+		exists: vi.fn().mockResolvedValue(true),
+		ensure: vi.fn().mockResolvedValue(undefined),
+	}),
 }));
 
 // Suppress console output
@@ -5567,6 +5607,49 @@ describe("CLI", () => {
 				.join("\n");
 			const parsed = JSON.parse(output);
 			expect(parsed.branches).toHaveLength(1);
+		});
+	});
+
+	describe("compile command", () => {
+		beforeEach(() => {
+			vi.clearAllMocks();
+			process.exitCode = undefined;
+			mockExecFileSync.mockReturnValue("/mock/project\n");
+			mockExistsSync.mockReturnValue(false);
+			process.env.ANTHROPIC_API_KEY = "test-key";
+		});
+
+		afterEach(() => {
+			delete process.env.ANTHROPIC_API_KEY;
+		});
+
+		it("should ingest pending sources and render wiki (default)", async () => {
+			const { drainIngest } = await import("./core/IngestPipeline.js");
+			const { renderTopicKBWiki } = await import("./core/TopicWikiRenderer.js");
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 2, outcome: "OK", topicFailures: [] });
+
+			await main(["compile", "--cwd", "/test"]);
+
+			expect(vi.mocked(drainIngest)).toHaveBeenCalledOnce();
+			expect(vi.mocked(renderTopicKBWiki)).toHaveBeenCalledOnce();
+		});
+
+		it("should reset stores before ingest when --rebuild flag is passed", async () => {
+			const { drainIngest } = await import("./core/IngestPipeline.js");
+			const { saveProcessedSet } = await import("./core/ProcessedSourceStore.js");
+			const { saveTopicIndex } = await import("./core/TopicIndexStore.js");
+			vi.mocked(drainIngest).mockResolvedValue({
+				batches: 0,
+				ingested: 0,
+				outcome: "NO_PENDING",
+				topicFailures: [],
+			});
+
+			await main(["compile", "--rebuild", "--cwd", "/test"]);
+
+			expect(vi.mocked(saveProcessedSet)).toHaveBeenCalledOnce();
+			expect(vi.mocked(saveTopicIndex)).toHaveBeenCalledOnce();
+			expect(vi.mocked(drainIngest)).toHaveBeenCalledOnce();
 		});
 	});
 });

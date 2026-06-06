@@ -78,6 +78,26 @@ describe("DualWriteStorage", () => {
 		expect(await dual.readFile("test.txt")).toBe("primary data");
 	});
 
+	// The deleted-`_wiki/` recovery in QueueWorker keys off `storage.isTopicWikiPresent`.
+	// In dual-write (the default mode) the wiki lives in the shadow folder, so the
+	// dual storage must forward the probe to the shadow — otherwise the method is
+	// undefined, `wikiMissing` is permanently false, and a user-deleted wiki never
+	// re-renders through the background path.
+	it("forwards isTopicWikiPresent to the shadow (where the visible wiki lives)", async () => {
+		const primary = new InMemoryStorage();
+		const shadowRoot = join(tempDir, "shadow");
+		const shadow = new FolderStorage(shadowRoot, new MetadataManager(join(shadowRoot, ".jolli")));
+		const dual = new DualWriteStorage(primary, shadow);
+
+		// No `_wiki/_index.md` rendered yet → shadow reports absent → dual must too.
+		expect(dual.isTopicWikiPresent?.()).toBe(false);
+
+		// renderTopicWiki always writes `_wiki/_index.md` (even with no pages).
+		await dual.renderTopicWiki([]);
+
+		expect(dual.isTopicWikiPresent?.()).toBe(true);
+	});
+
 	it("writes to both primary and shadow", async () => {
 		const primary = new InMemoryStorage();
 		const shadowRoot = join(tempDir, "shadow");

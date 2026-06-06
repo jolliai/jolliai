@@ -10612,4 +10612,776 @@ describe("SummaryWebviewPanel", () => {
 			expect(__test__.setsEqual(new Set(["a"]), new Set(["b"]))).toBe(false);
 		});
 	});
+
+	// ── coverage backfill: branches/statements not reached elsewhere ───────────
+	describe("coverage backfill", () => {
+		// `vi.clearAllMocks()` in the top-level beforeEach clears call history but
+		// NOT persistent `.mockResolvedValue` / `.mockRejectedValue` implementations
+		// some earlier tests set (e.g. pushToJolli → network error, storeSummary →
+		// disk full). Reset the mocks these tests depend on back to clean defaults
+		// so the order tests run in doesn't matter.
+		beforeEach(() => {
+			mockPushToJolli.mockReset();
+			mockPushToJolli.mockResolvedValue({ docId: 42 });
+			mockSaveTranscriptsBatch.mockReset();
+			mockSaveTranscriptsBatch.mockResolvedValue(undefined);
+			mockStoreSummary.mockReset();
+			mockStoreSummary.mockResolvedValue(undefined);
+			mockStoreReferences.mockReset();
+			mockStoreReferences.mockResolvedValue(undefined);
+			mockReadReferenceFromBranch.mockReset();
+			mockReadReferenceFromBranch.mockResolvedValue(null);
+			mockTranslateToEnglish.mockReset();
+			mockTranslateToEnglish.mockResolvedValue("English");
+			mockBindingChooserOpen.mockReset();
+			mockBindingChooserOpen.mockResolvedValue(undefined);
+			mockGetTranscriptHashes.mockReset();
+			mockGetTranscriptHashes.mockResolvedValue(new Set<string>());
+			showWarningMessage.mockReset();
+			showWarningMessage.mockResolvedValue(undefined);
+			// Earlier stale-commit tests set this to a rewritten chain for "abc123"
+			// persistently; reset to "clean root / absent" so ensureCommitNotRewritten
+			// lets our writes through (every summary here uses the default abc123 hash).
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockReset();
+			(
+				stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+			).mockResolvedValue(new Map());
+			mockRemovePlan.mockReset();
+			mockRemovePlan.mockResolvedValue(undefined);
+			mockRemoveNote.mockReset();
+			mockRemoveNote.mockResolvedValue(undefined);
+			mockGenerateRecap.mockReset();
+			mockGenerateRecap.mockResolvedValue("");
+			mockLoadRegenerateContext.mockReset();
+			mockReadPlanFromBranch.mockReset();
+			mockReadPlanFromBranch.mockResolvedValue(null);
+			mockReadNoteFromBranch.mockReset();
+			mockReadNoteFromBranch.mockResolvedValue(null);
+		});
+
+		async function openPanel(
+			overrides?: Partial<CommitSummary>,
+		): Promise<(msg: Record<string, unknown>) => void> {
+			await SummaryWebviewPanel.show(
+				makeSummary(overrides),
+				extensionUri,
+				workspaceRoot,
+				stubBridge,
+				mainBranch,
+			);
+			return captureMessageHandler();
+		}
+
+		/** Opens a panel then nulls its currentSummary, returning the dispatcher. */
+		async function openPanelThenClearSummary(
+			overrides?: Partial<CommitSummary>,
+		): Promise<(msg: Record<string, unknown>) => void> {
+			const dispatch = await openPanel(overrides);
+			firstCommitPanel<{ currentSummary: null }>().currentSummary = null;
+			return dispatch;
+		}
+
+		describe("no-summary early returns", () => {
+			it("editRecap returns early when currentSummary is null", async () => {
+				const dispatch = await openPanelThenClearSummary();
+				mockStoreSummary.mockClear();
+
+				dispatch({ command: "editRecap", recap: "ignored" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+
+			it("generateRecap returns early when currentSummary is null", async () => {
+				const dispatch = await openPanelThenClearSummary();
+				mockGenerateRecap.mockClear();
+
+				dispatch({ command: "generateRecap" });
+				await flushPromises();
+
+				expect(mockGenerateRecap).not.toHaveBeenCalled();
+			});
+
+			it("regenerateSummary returns early when currentSummary is null", async () => {
+				const dispatch = await openPanelThenClearSummary();
+				mockLoadRegenerateContext.mockClear();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				expect(mockLoadRegenerateContext).not.toHaveBeenCalled();
+			});
+
+			it("regenerateSummary returns early when one is already in flight", async () => {
+				const dispatch = await openPanel();
+				const panel = firstCommitPanel<{ regenerateInProgress: boolean }>();
+				panel.regenerateInProgress = true;
+				mockLoadRegenerateContext.mockClear();
+
+				dispatch({ command: "regenerateSummary" });
+				await flushPromises();
+
+				expect(mockLoadRegenerateContext).not.toHaveBeenCalled();
+			});
+
+			it("removeReference returns early when currentSummary is null", async () => {
+				const dispatch = await openPanelThenClearSummary({
+					references: [
+						{
+							archivedKey: "linear:PROJ-1-aaaaaaaa",
+							source: "linear",
+							nativeId: "PROJ-1",
+							title: "T",
+							url: "https://linear.app/x/issue/PROJ-1",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+				showWarningMessage.mockClear();
+
+				dispatch({
+					command: "removeReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+					nativeId: "PROJ-1",
+					title: "T",
+				});
+				await flushPromises();
+
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("cancelReferenceEdit", () => {
+			it("is a host-side no-op (webview owns the textarea toggle)", async () => {
+				const dispatch = await openPanel();
+				postMessage.mockClear();
+
+				dispatch({
+					command: "cancelReferenceEdit",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+				});
+				await flushPromises();
+
+				// No storage write, no notification, no message back to the webview —
+				// the case exists only to keep the exhaustive switch total.
+				expect(mockStoreReferences).not.toHaveBeenCalled();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(showErrorMessage).not.toHaveBeenCalled();
+				expect(postMessage).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("handlePush concurrency guard", () => {
+			it("returns early when a push is already in flight", async () => {
+				const dispatch = await openPanel();
+				// Flip the in-flight flag on the live instance, same pattern as the
+				// regenerate-race test above.
+				const panel = firstCommitPanel<{ pushInProgress: boolean }>();
+				panel.pushInProgress = true;
+				mockLoadConfig.mockClear();
+
+				dispatch({ command: "push" });
+				await flushPromises();
+
+				// The guard short-circuits before loadGlobalConfig / pushToJolli.
+				expect(mockLoadConfig).not.toHaveBeenCalled();
+				expect(mockPushToJolli).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("push BindingRequiredError handling", () => {
+			beforeEach(() => {
+				mockLoadConfig.mockResolvedValue({
+					apiKey: "test",
+					jolliApiKey: "jk_valid",
+				});
+				mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			});
+
+			it("retries the push after the user selects a Memory space binding", async () => {
+				// First push attempt throws BindingRequiredError; chooser returns
+				// `selected`; the handler recursively re-pushes with retried=true,
+				// which succeeds.
+				mockPushToJolli
+					.mockRejectedValueOnce(
+						new MockBindingRequiredError("https://github.com/example/repo"),
+					)
+					.mockResolvedValue({ docId: 123 });
+				mockBindingChooserOpen.mockResolvedValueOnce({ kind: "selected" });
+				const dispatch = await openPanel();
+
+				dispatch({ command: "push" });
+				await flushPromises();
+
+				expect(mockBindingChooserOpen).toHaveBeenCalledTimes(1);
+				// Two pushToJolli summary attempts: the failed first + the retry.
+				expect(mockPushToJolli).toHaveBeenCalledTimes(2);
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					"Pushed on Jolli Space.",
+				);
+			});
+
+			it("shows a 'chooser already open' info message when another panel owns the binding decision", async () => {
+				mockPushToJolli.mockRejectedValueOnce(
+					new MockBindingRequiredError("https://github.com/example/repo"),
+				);
+				mockBindingChooserOpen.mockResolvedValueOnce({ kind: "anotherOpen" });
+				const dispatch = await openPanel();
+
+				dispatch({ command: "push" });
+				await flushPromises();
+
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("chooser is already open"),
+				);
+				// No retry — only the single failed attempt.
+				expect(mockPushToJolli).toHaveBeenCalledTimes(1);
+			});
+
+			it("shows a 'cancelled' error when the user dismisses the chooser without selecting", async () => {
+				mockPushToJolli.mockRejectedValueOnce(
+					new MockBindingRequiredError("https://github.com/example/repo"),
+				);
+				mockBindingChooserOpen.mockResolvedValueOnce({ kind: "cancelled" });
+				const dispatch = await openPanel();
+
+				dispatch({ command: "push" });
+				await flushPromises();
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Push cancelled"),
+				);
+				expect(mockPushToJolli).toHaveBeenCalledTimes(1);
+			});
+		});
+
+		describe("refreshReferenceTranslateSet body content", () => {
+			it("adds the archivedKey when the archived markdown body contains CJK (title is ASCII)", async () => {
+				// Title is ASCII so the cheap title check misses; the body read
+				// from the orphan branch supplies the CJK trigger.
+				mockReadReferenceFromBranch.mockResolvedValueOnce("正文中文内容");
+				await SummaryWebviewPanel.show(
+					makeSummary({
+						references: [
+							{
+								archivedKey: "linear:PROJ-7-cccccccc",
+								source: "linear",
+								nativeId: "PROJ-7",
+								title: "ASCII Title",
+								url: "https://linear.app/x/issue/PROJ-7",
+								referencedAt: "x",
+								sourceToolName: "mcp__linear__get_issue",
+							},
+						],
+					}),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+
+				const panel = firstCommitPanel<{
+					referenceTranslateSet: Set<string>;
+				}>();
+				expect(panel.referenceTranslateSet.has("linear:PROJ-7-cccccccc")).toBe(
+					true,
+				);
+			});
+		});
+
+		describe("translateReference edge paths", () => {
+			it("shows an error and aborts when the archived markdown cannot be read", async () => {
+				// readReferenceFromBranch resolves null → the content === null branch.
+				mockReadReferenceFromBranch.mockResolvedValue(null);
+				const dispatch = await openPanel({
+					references: [
+						{
+							archivedKey: "linear:PROJ-3-dddddddd",
+							source: "linear",
+							nativeId: "PROJ-3",
+							title: "中文标题",
+							url: "https://linear.app/x/issue/PROJ-3",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "translateReference",
+					archivedKey: "linear:PROJ-3-dddddddd",
+					source: "linear",
+				});
+				await flushPromises();
+
+				expect(showErrorMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Could not read reference"),
+				);
+				expect(mockTranslateToEnglish).not.toHaveBeenCalled();
+				expect(mockStoreReferences).not.toHaveBeenCalled();
+			});
+
+			it("translates when the title carries CJK even though the body is ASCII (title-CJK branch)", async () => {
+				// Body read returns ASCII, so the early "already in English" guard
+				// must rely on the title CJK check (reference != null branch) to
+				// proceed with the LLM call.
+				mockReadReferenceFromBranch.mockResolvedValue("All ASCII body here.");
+				mockTranslateToEnglish.mockResolvedValueOnce(
+					"# Translated\n\nEnglish.",
+				);
+				const dispatch = await openPanel({
+					references: [
+						{
+							archivedKey: "linear:PROJ-4-eeeeeeee",
+							source: "linear",
+							nativeId: "PROJ-4",
+							title: "中文 title",
+							url: "https://linear.app/x/issue/PROJ-4",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "translateReference",
+					archivedKey: "linear:PROJ-4-eeeeeeee",
+					source: "linear",
+				});
+				await flushPromises();
+
+				expect(mockTranslateToEnglish).toHaveBeenCalledTimes(1);
+				expect(mockStoreReferences).toHaveBeenCalled();
+			});
+
+			it("treats a missing reference as title-ASCII (findReferenceInSummary returns undefined)", async () => {
+				// Body has CJK so translation proceeds even though the archivedKey
+				// is absent from summary.references — exercises the `reference ?
+				// ... : false` falsy branch via findReferenceInSummary returning
+				// undefined.
+				mockReadReferenceFromBranch.mockResolvedValue("正文 CJK body");
+				mockTranslateToEnglish.mockResolvedValueOnce("English body");
+				const dispatch = await openPanel({
+					references: [
+						{
+							archivedKey: "linear:PROJ-5-ffffffff",
+							source: "linear",
+							nativeId: "PROJ-5",
+							title: "Other",
+							url: "https://linear.app/x/issue/PROJ-5",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "translateReference",
+					archivedKey: "linear:NOT-IN-SUMMARY",
+					source: "linear",
+				});
+				await flushPromises();
+
+				expect(mockTranslateToEnglish).toHaveBeenCalledTimes(1);
+			});
+		});
+
+		describe("transcript failure: non-Error rejection (String(err) coercion)", () => {
+			it("saveAllTranscripts logs and posts Failed when persistTranscriptIdRemoval rejects with a non-Error", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123", "def456"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+				mockStoreSummary.mockClear();
+				// Reject with a plain string (non-Error) so the `String(err)` arm runs.
+				mockStoreSummary.mockRejectedValueOnce("string failure");
+				mockSaveTranscriptsBatch.mockClear();
+
+				dispatch({
+					command: "saveAllTranscripts",
+					entries: [
+						{
+							commitHash: "abc123",
+							sessionId: "s1",
+							source: "claude",
+							originalIndex: 0,
+							role: "human",
+							content: "x",
+						},
+					],
+				});
+				await flushPromises();
+
+				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "transcriptsSaveFailed" }),
+				);
+			});
+
+			it("saveAllTranscripts logs and posts Failed when the file batch rejects with a non-Error", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123", "def456"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+				mockStoreSummary.mockClear();
+				mockSaveTranscriptsBatch.mockClear();
+				mockSaveTranscriptsBatch.mockRejectedValueOnce("string io failure");
+
+				dispatch({
+					command: "saveAllTranscripts",
+					entries: [
+						{
+							commitHash: "abc123",
+							sessionId: "s1",
+							source: "claude",
+							originalIndex: 0,
+							role: "human",
+							content: "edited",
+						},
+					],
+				});
+				await flushPromises();
+
+				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "transcriptsSaveFailed" }),
+				);
+			});
+
+			it("deleteAllTranscripts logs and posts Failed when persistTranscriptIdRemoval rejects with a non-Error", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+				mockStoreSummary.mockClear();
+				mockStoreSummary.mockRejectedValueOnce("string delete failure");
+				mockSaveTranscriptsBatch.mockClear();
+
+				dispatch({ command: "deleteAllTranscripts" });
+				await flushPromises();
+
+				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "transcriptsDeleteFailed" }),
+				);
+			});
+
+			it("deleteAllTranscripts logs and posts Failed when the file delete rejects with a non-Error", async () => {
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(
+					summary,
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+				mockStoreSummary.mockClear();
+				mockSaveTranscriptsBatch.mockClear();
+				mockSaveTranscriptsBatch.mockRejectedValueOnce("string file delete failure");
+
+				dispatch({ command: "deleteAllTranscripts" });
+				await flushPromises();
+
+				expect(mockSaveTranscriptsBatch).toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "transcriptsDeleteFailed" }),
+				);
+			});
+		});
+
+		describe("stale-guard early returns in reference handlers", () => {
+			function staleChain(): Map<
+				string,
+				{ commitHash: string; parentCommitHash: string | null }
+			> {
+				return new Map([
+					["abc123", { commitHash: "abc123", parentCommitHash: "rootnew0" }],
+					["rootnew0", { commitHash: "rootnew0", parentCommitHash: null }],
+				]);
+			}
+
+			it("saveReferenceEdit aborts when the commit was rewritten (entry guard)", async () => {
+				(
+					stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+				).mockResolvedValue(staleChain());
+				const dispatch = await openPanel();
+				mockStoreReferences.mockClear();
+
+				dispatch({
+					command: "saveReferenceEdit",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+					content: "# Updated",
+				});
+				await flushPromises();
+
+				expect(mockStoreReferences).not.toHaveBeenCalled();
+			});
+
+			it("translateReference aborts at the entry guard when the commit was rewritten", async () => {
+				(
+					stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>
+				).mockResolvedValue(staleChain());
+				const dispatch = await openPanel({
+					references: [
+						{
+							archivedKey: "linear:PROJ-1-aaaaaaaa",
+							source: "linear",
+							nativeId: "PROJ-1",
+							title: "中文",
+							url: "https://linear.app/x/issue/PROJ-1",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+				mockReadReferenceFromBranch.mockResolvedValue("中文 body");
+
+				dispatch({
+					command: "translateReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+				});
+				await flushPromises();
+
+				// Entry guard short-circuits before reading the archived markdown.
+				expect(mockReadReferenceFromBranch).not.toHaveBeenCalled();
+				expect(mockTranslateToEnglish).not.toHaveBeenCalled();
+			});
+
+			it("translateReference aborts at the post-LLM race-window re-check", async () => {
+				// Entry guard clean, then a rewrite lands during the LLM call so the
+				// second ensureCommitNotRewritten returns false → storeReferences skipped.
+				(stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>)
+					.mockResolvedValueOnce(new Map())
+					.mockResolvedValueOnce(staleChain());
+				mockReadReferenceFromBranch.mockResolvedValue("中文 body");
+				mockTranslateToEnglish.mockResolvedValueOnce("English body");
+				const dispatch = await openPanel({
+					references: [
+						{
+							archivedKey: "linear:PROJ-1-aaaaaaaa",
+							source: "linear",
+							nativeId: "PROJ-1",
+							title: "中文",
+							url: "https://linear.app/x/issue/PROJ-1",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "translateReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+				});
+				await flushPromises();
+
+				expect(mockTranslateToEnglish).toHaveBeenCalledTimes(1);
+				expect(mockStoreReferences).not.toHaveBeenCalled();
+			});
+
+			it("translateReference treats a null currentSummary as title-ASCII (findReferenceInSummary short-circuit)", async () => {
+				// currentSummary nulled before dispatch: ensureCommitNotRewritten
+				// returns true (no summary), the body read supplies CJK, and
+				// findReferenceInSummary returns undefined because there is no
+				// summary to search — the `if (!s) return undefined` branch.
+				const dispatch = await openPanelThenClearSummary();
+				mockReadReferenceFromBranch.mockResolvedValue("中文 body");
+				mockTranslateToEnglish.mockResolvedValueOnce("English body");
+
+				dispatch({
+					command: "translateReference",
+					archivedKey: "linear:PROJ-1-aaaaaaaa",
+					source: "linear",
+				});
+				await flushPromises();
+
+				// Body CJK still drives the LLM call; the title check defaulted to
+				// false because findReferenceInSummary found nothing.
+				expect(mockTranslateToEnglish).toHaveBeenCalledTimes(1);
+			});
+		});
+
+		describe("generateRecap post-LLM race-window re-check", () => {
+			it("aborts the storeSummary when the commit goes stale during the LLM call", async () => {
+				(stubBridge.getSummaryIndexEntryMap as ReturnType<typeof vi.fn>)
+					.mockResolvedValueOnce(new Map())
+					.mockResolvedValueOnce(
+						new Map([
+							[
+								"abc123",
+								{ commitHash: "abc123", parentCommitHash: "rootnew0" },
+							],
+							["rootnew0", { commitHash: "rootnew0", parentCommitHash: null }],
+						]),
+					);
+				mockGenerateRecap.mockResolvedValueOnce("A fresh recap paragraph.");
+				const dispatch = await openPanel();
+				mockStoreSummary.mockClear();
+
+				dispatch({ command: "generateRecap" });
+				await flushPromises();
+
+				expect(mockGenerateRecap).toHaveBeenCalledTimes(1);
+				// Race-window re-check fired → recap NOT persisted.
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("remove plan/note with missing commitHash (?? undefined branch)", () => {
+			it("removePlan passes undefined to removePlan when commitHash is undefined", async () => {
+				showWarningMessage.mockResolvedValueOnce("Remove");
+				await SummaryWebviewPanel.show(
+					makeSummary({
+						// Force the nullish right side of `summary.commitHash ?? undefined`.
+						commitHash: undefined as unknown as string,
+						plans: [{ slug: "p1", title: "Plan 1" }],
+					}),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+				mockRemovePlan.mockClear();
+
+				dispatch({ command: "removePlan", slug: "p1", title: "Plan 1" });
+				await flushPromises();
+
+				expect(mockRemovePlan).toHaveBeenCalledWith("p1", workspaceRoot, undefined);
+			});
+
+			it("removeNote passes undefined to removeNote when commitHash is undefined", async () => {
+				showWarningMessage.mockResolvedValueOnce("Remove");
+				await SummaryWebviewPanel.show(
+					makeSummary({
+						commitHash: undefined as unknown as string,
+						notes: [{ id: "n1", title: "Note 1", format: "markdown" }],
+					}),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+				mockRemoveNote.mockClear();
+
+				dispatch({ command: "removeNote", id: "n1", title: "Note 1" });
+				await flushPromises();
+
+				expect(mockRemoveNote).toHaveBeenCalledWith("n1", workspaceRoot, undefined);
+			});
+		});
+
+		describe("removeReference dialog-title fallback chain", () => {
+			it("falls back to nativeId then archivedKey when title is empty", async () => {
+				showWarningMessage.mockResolvedValueOnce("Remove");
+				const dispatch = await openPanel({
+					references: [
+						{
+							archivedKey: "linear:PROJ-X-aaaaaaaa",
+							source: "linear",
+							nativeId: "PROJ-X",
+							title: "",
+							url: "https://linear.app/x/issue/PROJ-X",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				// Empty title → dialogTitle = nativeId ("PROJ-X").
+				dispatch({
+					command: "removeReference",
+					archivedKey: "linear:PROJ-X-aaaaaaaa",
+					source: "linear",
+					nativeId: "PROJ-X",
+					title: "",
+				});
+				await flushPromises();
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining('"PROJ-X"'),
+					expect.objectContaining({ modal: true }),
+					"Remove",
+				);
+			});
+
+			it("falls back to archivedKey when both title and nativeId are empty", async () => {
+				showWarningMessage.mockResolvedValueOnce("Remove");
+				const dispatch = await openPanel({
+					references: [
+						{
+							archivedKey: "linear:PROJ-Y-bbbbbbbb",
+							source: "linear",
+							nativeId: "",
+							title: "",
+							url: "https://linear.app/x/issue/PROJ-Y",
+							referencedAt: "x",
+							sourceToolName: "mcp__linear__get_issue",
+						},
+					],
+				});
+
+				dispatch({
+					command: "removeReference",
+					archivedKey: "linear:PROJ-Y-bbbbbbbb",
+					source: "linear",
+					nativeId: "",
+					title: "",
+				});
+				await flushPromises();
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining('"linear:PROJ-Y-bbbbbbbb"'),
+					expect.objectContaining({ modal: true }),
+					"Remove",
+				);
+			});
+		});
+
+	});
 });

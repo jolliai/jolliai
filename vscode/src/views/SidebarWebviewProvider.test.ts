@@ -3075,6 +3075,208 @@ describe("SidebarWebviewProvider", () => {
 		}
 	});
 
+	// refreshConversationsPanel is a public re-pull hook (called from
+	// Extension.ts after a conversation save outside the panel's own
+	// onSessionChanged). It just delegates to pushConversations, so a
+	// listWithDiagnostics call is the observable side-effect.
+	it("refreshConversationsPanel() re-pulls via listWithDiagnostics", async () => {
+		const view = makeMockView();
+		const listWithDiagnostics = vi
+			.fn()
+			.mockResolvedValue({ items: [], failedSources: [] });
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			activeSessionsProvider: { listWithDiagnostics } as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		listWithDiagnostics.mockClear();
+		await provider.refreshConversationsPanel();
+		expect(listWithDiagnostics).toHaveBeenCalledTimes(1);
+		const conv = view.webview.postMessage.mock.calls
+			.map((c) => c[0] as SidebarInboundMsg)
+			.find(
+				(m): m is SidebarInboundMsg & { type: "branch:conversationsData" } =>
+					m.type === "branch:conversationsData",
+			);
+		expect(conv).toBeDefined();
+	});
+
+	// refreshPlansPanel is the public counterpart to refreshConversationsPanel
+	// — Extension.ts calls it after an out-of-band plan edit. It delegates to
+	// pushPlans, whose observable side-effect is a branch:plansData post built
+	// from plansProvider.serialize().
+	it("refreshPlansPanel() re-pushes branch:plansData", async () => {
+		const view = makeMockView();
+		const plansProvider = {
+			serialize: vi.fn().mockReturnValue([
+				{ id: "p1", label: "Plan A", contextValue: "plan" },
+			]),
+			onDidChangeTreeData: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+		};
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			plansProvider,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		plansProvider.serialize.mockClear();
+		await provider.refreshPlansPanel();
+		expect(plansProvider.serialize).toHaveBeenCalledTimes(1);
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		expect(sent.some((m) => m.type === "branch:plansData")).toBe(true);
+	});
+
+	// pushStatus also pushes a `sync:phase` message when the (optional)
+	// getSyncPhase provider method is present. Existing status tests stub only
+	// getWorkerBusy, so this case pins the orchestrator per-phase indicator
+	// path and asserts the payload travels verbatim.
+	it("pushStatus posts sync:phase when statusProvider.getSyncPhase is wired", async () => {
+		const view = makeMockView();
+		const phase = { label: "uploading…", severity: "info" as const };
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "branch",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			statusProvider: {
+				serialize: () => [],
+				onDidChangeTreeData: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+				getWorkerBusy: () => false,
+				getSyncPhase: () => phase,
+			},
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		expect(sent).toContainEqual({ type: "sync:phase", phase });
+	});
+
+	// handleReady calls pushBranches(currentRepoName) when the initial state
+	// names a repo. pushBranches still has to no-op gracefully when the
+	// `selection` dep was never wired (a host that surfaces a repo name from
+	// getInitialState but omits the breadcrumb provider). This pins the guard's
+	// early-return so no selection:branches goes out.
+	it("handleReady's pushBranches is a no-op when currentRepoName is set but selection dep is absent", async () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+				currentRepoName: "workspace-repo",
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.triggerMessage({ type: "ready" });
+		await flushReady();
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => (c[0] as SidebarInboundMsg).type,
+		);
+		// No selection:* messages because the dep isn't wired — pushBranches and
+		// pushRepos both hit their `if (!this.deps.selection) return;` guards.
+		expect(sent.filter((t) => t.startsWith("selection:"))).toEqual([]);
+	});
+
+	// selection:request with neither repoName nor branchName falls through both
+	// guarded blocks (repoName branch + branchName branch) to the end of
+	// handleSelectionRequest — a malformed request the host must tolerate as a
+	// silent no-op rather than throwing or posting a half-formed selection:set.
+	it("selection:request with neither repoName nor branchName is a silent no-op", () => {
+		const view = makeMockView();
+		const listRepos = vi
+			.fn()
+			.mockReturnValue([{ repoName: "workspace-repo", isCurrent: true }]);
+		const listBranches = vi.fn().mockReturnValue(["main"]);
+		const provider = makeSelectionProvider({ listRepos, listBranches });
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		view.webview.triggerMessage({ type: "selection:request" });
+		expect(view.webview.postMessage).not.toHaveBeenCalled();
+	});
+
+	// refreshKnowledgeBaseFolders picks the current repo for the branch re-push
+	// via `repos.find(r => r.isCurrent) ?? repos[0]`. When listRepos returns an
+	// empty set, both the find and the repos[0] fallback resolve to undefined,
+	// so the `if (current)` guard short-circuits and no selection:branches is
+	// pushed — the breadcrumb just keeps whatever it had. Pins the empty-Memory
+	// -Bank edge (no repos registered) so pushBranches is never called with an
+	// undefined repo name.
+	it("refreshKnowledgeBaseFolders skips the branch re-push when no repos are registered", async () => {
+		const view = makeMockView();
+		const tree = { name: "", relPath: "", isDirectory: true, children: [] };
+		const kbFolders = {
+			listChildren: vi.fn().mockResolvedValue(tree),
+			notifyDirty: vi.fn(),
+		};
+		const selection = {
+			listRepos: vi.fn(() => []),
+			listBranches: vi.fn(() => ["main"]),
+			listBranchMemories: vi.fn().mockResolvedValue([]),
+		};
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: true,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			kbFolders,
+			selection,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		selection.listBranches.mockClear();
+		provider.refreshKnowledgeBaseFolders();
+		await new Promise((r) => setTimeout(r, 0));
+		// selection:repos still goes out (pushRepos is unconditional), but the
+		// empty repo list means no current repo → no selection:branches.
+		expect(selection.listBranches).not.toHaveBeenCalled();
+		const sent = view.webview.postMessage.mock.calls.map(
+			(c) => (c[0] as SidebarInboundMsg).type,
+		);
+		expect(sent).toContain("selection:repos");
+		expect(sent).not.toContain("selection:branches");
+	});
+
 	it("skips installing the refresh timer when activeSessionsProvider is missing", async () => {
 		vi.useFakeTimers();
 		try {

@@ -67,13 +67,16 @@ import { installGeminiHook, isGeminiHookInstalled, removeGeminiHook } from "./Ge
 import { updateGitExclude } from "./GitExclude.js";
 import {
 	installGitHook,
+	installPostMergeHook,
 	installPostRewriteHook,
 	installPrepareMsgHook,
 	isGitHookInstalled,
 	isHookSectionInstalled,
+	POST_MERGE_MARKER_START,
 	POST_REWRITE_MARKER_START,
 	PREPARE_MSG_MARKER_START,
 	removeGitHook,
+	removePostMergeHook,
 	removePostRewriteHook,
 	removePrepareMsgHook,
 } from "./GitHookInstaller.js";
@@ -240,6 +243,12 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			warnings.push(prepareMsgResult.warning);
 		}
 
+		// Install Git post-merge hook (auto-compiles merged branch summaries after pull/merge)
+		const postMergeResult = await installPostMergeHook(projectDir);
+		if (postMergeResult.warning) {
+			warnings.push(postMergeResult.warning);
+		}
+
 		// Auto-detect Codex CLI and enable session discovery (saved to global config)
 		const codexDetected = await isCodexInstalled();
 		if (codexDetected) {
@@ -345,6 +354,7 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			gitHookPath: gitResult.path,
 			postRewriteHookPath: postRewriteResult.path,
 			prepareMsgHookPath: prepareMsgResult.path,
+			postMergeHookPath: postMergeResult.path,
 			geminiSettingsPath,
 		};
 		/* v8 ignore start -- defensive: internal functions handle their own errors */
@@ -500,6 +510,7 @@ export async function uninstall(cwd?: string): Promise<InstallResult> {
 
 		await removePostRewriteHook(projectDir);
 		await removePrepareMsgHook(projectDir);
+		await removePostMergeHook(projectDir);
 
 		// Conservative skill-cleanup policy: leave the generated SKILL.md files
 		// AND the `.git/info/exclude` block alone. Users sometimes ship their
@@ -552,7 +563,8 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	const gitHookInstalled =
 		(await isGitHookInstalled(projectDir)) &&
 		(await isHookSectionInstalled(projectDir, "post-rewrite", POST_REWRITE_MARKER_START)) &&
-		(await isHookSectionInstalled(projectDir, "prepare-commit-msg", PREPARE_MSG_MARKER_START));
+		(await isHookSectionInstalled(projectDir, "prepare-commit-msg", PREPARE_MSG_MARKER_START)) &&
+		(await isHookSectionInstalled(projectDir, "post-merge", POST_MERGE_MARKER_START));
 	const sessions = await loadAllSessions(projectDir);
 	const branchExists = await orphanBranchExists(ORPHAN_BRANCH, projectDir);
 	const summaryCount = branchExists ? await getSummaryCount(projectDir, storage) : 0;

@@ -127,14 +127,19 @@ export interface SquashPendingState {
 }
 
 /**
- * A queued git operation waiting to be processed by the Worker.
- * Written to `.jolli/jollimemory/git-op-queue/{timestamp}-{hash}.json`.
+ * A queued operation waiting to be processed by the Worker. Written to
+ * `.jolli/jollimemory/git-op-queue/{timestamp}-{tag}.json`.
  *
- * Each git operation (commit, amend, squash, rebase) writes one entry to the queue.
- * The Worker processes entries in timestamp order, ensuring dependency chains are correct
- * (e.g., a rebase-pick entry is always processed after the commit it references).
+ * Two flavors share the queue:
+ *  - {@link CommitGitOperation} — commit / amend / squash / rebase-pick /
+ *    rebase-squash / cherry-pick / revert. Worker runs the LLM summarize
+ *    pipeline (or mechanical merge for rebase-pick).
+ *  - {@link IngestOperation} — topic-KB ingest (SP3). Worker drains all
+ *    pending sources via `drainIngest` and re-renders the wiki.
  */
-export interface GitOperation {
+export type GitOperation = CommitGitOperation | IngestOperation;
+
+export interface CommitGitOperation {
 	/** Operation type — determines how the Worker processes this entry */
 	readonly type: "commit" | "amend" | "squash" | "rebase-pick" | "rebase-squash" | "cherry-pick" | "revert";
 	/** Target commit hash */
@@ -158,6 +163,22 @@ export interface GitOperation {
 	readonly commitSource?: CommitSource;
 	/** Creation time — used for queue ordering and transcript time-based attribution */
 	readonly createdAt: string; // ISO 8601
+}
+
+/**
+ * Topic-KB ingest request (SP3). Repo-wide — no branch field, because the
+ * topic KB is not organized by branch. One queued entry drains all pending
+ * sources via `drainIngest`. `triggeredBy` is telemetry only.
+ */
+export interface IngestOperation {
+	readonly type: "ingest";
+	readonly triggeredBy: "post-commit" | "post-merge" | "recall-miss" | "manual";
+	readonly createdAt: string; // ISO 8601
+}
+
+/** Narrows a {@link GitOperation} to an {@link IngestOperation}. */
+export function isIngestOperation(op: GitOperation): op is IngestOperation {
+	return op.type === "ingest";
 }
 
 /**
@@ -643,6 +664,34 @@ export interface ReferenceCommitRef {
 	readonly sourceToolName: string;
 }
 
+// ─── Knowledge Compilation types ────────────────────────────────────────────
+
+/** A single compiled topic within a branch's knowledge page */
+export interface CompiledTopic {
+	readonly title: string;
+	/**
+	 * spec 110 — stable, lowercase-kebab slug supplied by the LLM that
+	 * encodes the topic's *concept*, not its title. Same topic across
+	 * future re-compiles / re-merges must reuse this slug so the
+	 * derived wiki page (`<kbRoot>/_wiki/topic--<stableSlug>.md`)
+	 * persists across runs and Obsidian backlinks don't break.
+	 *
+	 * Pre-spec110 artifacts may lack this field; `parseCompileResponse`
+	 * falls back to `slugify(title)` and logs a WARN — the field is
+	 * still `readonly string` in the live type so all new code can
+	 * rely on it.
+	 */
+	readonly stableSlug: string;
+	/** Markdown content: ## Background, ## Design Decisions, ## Pitfalls, etc. */
+	readonly content: string;
+	/** Branches that relate to this topic (LLM-inferred) */
+	readonly relatedBranches?: ReadonlyArray<string>;
+	/** Key design decisions distilled from source summaries */
+	readonly keyDecisions?: ReadonlyArray<string>;
+	/** Source commit hashes that contributed to this topic */
+	readonly sourceCommits: ReadonlyArray<string>;
+}
+
 /** Git diff statistics */
 export interface DiffStats {
 	readonly filesChanged: number;
@@ -786,6 +835,8 @@ export interface JolliMemoryConfig {
 	readonly maxTokens?: number;
 	/** Glob patterns for excluding files from the VSCode Files panel */
 	readonly excludePatterns?: ReadonlyArray<string>;
+	/** Folder names (under localFolder) to skip during multi-repo `jolli compile`. Exact name or `*` glob. Default: none. */
+	readonly compileExcludeFolders?: ReadonlyArray<string>;
 	/** Jolli Space API key for pushing summaries and proxy LLM calls (sk-jol-...) */
 	readonly jolliApiKey?: string;
 	/** Enable Codex CLI session discovery at post-commit time (default: auto-detect) */
@@ -921,6 +972,8 @@ export interface InstallResult {
 	readonly postRewriteHookPath?: string;
 	/** Absolute path to the git prepare-commit-msg hook file (set on successful install) */
 	readonly prepareMsgHookPath?: string;
+	/** Absolute path to the git post-merge hook file (set on successful install) */
+	readonly postMergeHookPath?: string;
 	/** Absolute path to the Gemini CLI settings file (set on successful install when Gemini detected) */
 	readonly geminiSettingsPath?: string;
 }

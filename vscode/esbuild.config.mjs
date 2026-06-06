@@ -82,6 +82,7 @@ const cliOptions = {
 		{ in: `${jmSrc}/Cli.ts`,                           out: "Cli" },
 		{ in: `${jmSrc}/hooks/StopHook.ts`,                out: "StopHook" },
 		{ in: `${jmSrc}/hooks/PostCommitHook.ts`,          out: "PostCommitHook" },
+		{ in: `${jmSrc}/hooks/PostMergeHook.ts`,           out: "PostMergeHook" },
 		{ in: `${jmSrc}/hooks/QueueWorker.ts`,             out: "QueueWorker" },
 		{ in: `${jmSrc}/hooks/PostRewriteHook.ts`,         out: "PostRewriteHook" },
 		{ in: `${jmSrc}/hooks/PrepareMsgHook.ts`,          out: "PrepareMsgHook" },

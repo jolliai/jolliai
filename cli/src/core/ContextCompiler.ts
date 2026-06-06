@@ -10,6 +10,7 @@
 import { createLogger } from "../Logger.js";
 import type { CommitSummary, SummaryIndexEntry } from "../Types.js";
 import { filterToBranchHeads } from "./HeadEntryFilter.js";
+import { listUserKnowledge } from "./MemoryBankScanner.js";
 import { extractBaseSlug } from "./PlanSlug.js";
 import type { SearchHit } from "./Search.js";
 import { collectAllNotesWithHosts, collectAllPlansWithHosts, getDisplayDate } from "./SummaryFormat.js";
@@ -35,6 +36,12 @@ export interface ContextOptions {
 	readonly includePlans?: boolean;
 	/** Include notes in the context output. Defaults to the value of `includePlans`. */
 	readonly includeNotes?: boolean;
+	/**
+	 * Include user-written Memory Bank markdown ("## Memory Bank Knowledge").
+	 * Defaults to `true` (current behavior). Token-tight callers can set this
+	 * false to skip the global/repo/branch markdown scan and its output section.
+	 */
+	readonly includeUserKnowledge?: boolean;
 }
 
 export interface ContextStats {
@@ -50,6 +57,20 @@ export interface ContextStats {
 	readonly totalTokens: number;
 }
 
+/**
+ * User-written Memory Bank file surfaced inside the recall context, per spec
+ * 108 Correction 1 (replaces the legacy `ImportContextTopic`). The file is
+ * shipped verbatim — the recall consumer can either render it as-is or
+ * pass it through its own structuring pass.
+ */
+export interface UserKnowledgeContextTopic {
+	readonly title: string;
+	readonly content: string;
+	/** Path relative to the Memory Bank parent (`localFolder`). */
+	readonly source: string;
+	readonly scope: "global" | "repo" | "branch";
+}
+
 export interface CompiledContext {
 	readonly branch: string;
 	readonly period: { readonly start: string; readonly end: string };
@@ -62,6 +83,8 @@ export interface CompiledContext {
 	readonly notes: ReadonlyArray<{ id: string; title: string; content: string }>;
 	readonly keyDecisions: ReadonlyArray<{ text: string; commitHash: string }>;
 	readonly stats: ContextStats;
+	/** User-written Memory Bank files surfaced for this branch (spec 108 Correction 1). */
+	readonly userKnowledgeTopics?: ReadonlyArray<UserKnowledgeContextTopic>;
 }
 
 /**
@@ -325,9 +348,11 @@ export const RECALL_LARGE_BRANCH_THRESHOLD = 8;
 
 /**
  * Compiles task context for a branch from Jolli Memory's orphan branch data.
+ *
+ * Loads all head summaries directly (raw-summary path — no compiled cache).
  */
 export async function compileTaskContext(options: ContextOptions, cwd?: string): Promise<CompiledContext> {
-	const { branch, depth, includePlans = true, includeNotes = includePlans } = options;
+	const { branch, depth, includePlans = true, includeNotes = includePlans, includeUserKnowledge = true } = options;
 
 	const index = await getIndex(cwd);
 	if (!index) {
@@ -356,107 +381,39 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
 		return emptyContext(branch);
 	}
 
-	// Step 4: Load full summaries
-	const summaries: CommitSummary[] = [];
-	for (const entry of headEntries) {
-		const summary = await getSummary(entry.commitHash, cwd);
-		if (summary) {
-			summaries.push(summary);
-		} else {
-			log.warn("Failed to load summary for commit %s, skipping", entry.commitHash.substring(0, 8));
-		}
-	}
+	// Load all head summaries (recall's raw-summary path — no compiled cache).
+	const summaries = await loadSummaries(headEntries, cwd);
 
 	if (summaries.length === 0) {
 		return emptyContext(branch);
 	}
 
-	// Step 5: Collect key decisions from all topics
-	const keyDecisions: { text: string; commitHash: string }[] = [];
-	for (const summary of summaries) {
-		const topics = collectAllTopics(summary);
-		for (const topic of topics) {
-			if (topic.decisions && topic.decisions.trim().length > 0) {
-				keyDecisions.push({
-					text: topic.decisions,
-					commitHash: summary.commitHash,
-				});
-			}
-		}
-	}
+	// Collect key decisions from loaded summaries
+	const keyDecisions = collectKeyDecisions(summaries);
 
-	// Step 6: Load and deduplicate plans.
-	//
-	// Walk each summary tree (root + nested children) so v3-legacy / IntelliJ-
-	// squash data with plans stashed in children doesn't get silently dropped —
-	// matches the recursion in `buildHit`'s plan-stub projection so every stub
-	// resolves to a top-level plan entry. Slug is normalized to its canonical
-	// **base slug** (archive suffix peeled) so pre-archive and post-archive
-	// commits referencing the same plan collapse to one entry.
-	const plans: { slug: string; title: string; content: string }[] = [];
-	if (includePlans) {
-		const planCandidates = collectPlanCandidates(summaries);
-		const deduplicated = deduplicatePlans(planCandidates);
-		for (const plan of deduplicated) {
-			// Read by the **original** slug (the path on disk at archive time);
-			// expose the **base slug** so SearchHit stubs match without knowing
-			// which archived suffix happens to be on disk.
-			const content = await readPlanFromBranch(plan.originalSlug, cwd);
-			if (content) {
-				plans.push({ slug: plan.baseSlug, title: plan.title, content });
-			} else {
-				log.warn("Plan %s referenced but not found in orphan branch", plan.originalSlug);
-			}
-		}
-	}
+	// Load plans and notes from loaded summaries
+	const plans = includePlans ? await loadPlans(summaries, cwd) : [];
+	const notes = includeNotes ? await loadNotes(summaries, cwd) : [];
 
-	// Step 6b: Load and deduplicate notes.
-	// Same recursion rationale as plans (cover v3-legacy nested-child notes).
-	// Notes have no archive-suffix mechanism, so id is the natural canonical key.
-	const notes: { id: string; title: string; content: string }[] = [];
-	if (includeNotes) {
-		const seenIds = new Set<string>();
-		for (const summary of summaries) {
-			for (const { noteRef } of collectAllNotesWithHosts(summary)) {
-				if (seenIds.has(noteRef.id)) continue;
-				seenIds.add(noteRef.id);
-				// Snippets carry their content inline; markdown notes read from orphan branch
-				if (noteRef.format === "snippet" && noteRef.content) {
-					notes.push({ id: noteRef.id, title: noteRef.title, content: noteRef.content });
-				} else {
-					const content = await readNoteFromBranch(noteRef.id, cwd);
-					if (content) {
-						notes.push({ id: noteRef.id, title: noteRef.title, content });
-					} else {
-						log.warn("Note %s referenced but not found in orphan branch", noteRef.id);
-					}
-				}
-			}
-		}
-	}
+	// Aggregate diff stats from loaded summaries.
+	// Uses resolveDiffStats() so each commit's contribution is the persisted real
+	// `git diff` (new data) or the best available fallback (legacy).
+	const { totalFilesChanged, totalInsertions, totalDeletions } = aggregateDiffStats(summaries);
 
-	// Step 7: Aggregate stats.
-	// Horizontal (cross-commit) sum: each summary contributes its own real diff; sum
-	// gives the total work for the branch. Uses resolveDiffStats() so each commit's
-	// contribution is the persisted real `git diff` (new data) or the best available
-	// fallback (legacy). This is different from vertical (tree) recursion, which is
-	// what we eliminated — the outer sum here is the correct semantics.
-	let totalFilesChanged = 0;
-	let totalInsertions = 0;
-	let totalDeletions = 0;
-	for (const summary of summaries) {
-		const stats = resolveDiffStats(summary);
-		totalFilesChanged += stats.filesChanged;
-		totalInsertions += stats.insertions;
-		totalDeletions += stats.deletions;
-	}
+	// Compute period from the LOADED summaries (not the full index) so the range
+	// stays consistent with commitCount: when the orphan branch has holes, some
+	// index entries fail to load and headEntries would report a wider span than
+	// the content actually covers. summaries preserve headEntries' display-date
+	// order (loadSummaries pushes in that order), so [0]/[last] bound the range.
+	// Uses getDisplayDate so amended old commits surface as recent activity.
+	const period = computePeriod(summaries);
 
-	const period = {
-		start: getDisplayDate(summaries[0]),
-		end: getDisplayDate(summaries[summaries.length - 1]),
-	};
+	// Surface user-written Memory Bank files (spec 108 Correction 1). Gated so a
+	// token-tight caller (includeUserKnowledge: false) skips the folder scan and
+	// the "## Memory Bank Knowledge" section entirely.
+	const userKnowledgeTopics = includeUserKnowledge ? await loadUserKnowledgeTopics(branch, cwd) : [];
 
-	// Step 8: Compute token stats
+	// Compute token stats
 	const topicTokens = estimateTokens(summaries.map((s) => renderSummarySection(s)).join("\n"));
 	const planTokens = estimateTokens(plans.map((p) => p.content).join("\n"));
 	const noteTokens = estimateTokens(notes.map((n) => n.content).join("\n"));
@@ -485,7 +442,161 @@ export async function compileTaskContext(options: ContextOptions, cwd?: string):
 			transcriptTokens: 0,
 			totalTokens: topicTokens + planTokens + noteTokens + decisionTokens,
 		},
+		userKnowledgeTopics: userKnowledgeTopics.length > 0 ? userKnowledgeTopics : undefined,
 	};
+}
+
+// ─── compileTaskContext helpers ──────────────────────────────────────────────
+
+/** Loads all summaries from headEntries (raw-summary path — no compiled cache). */
+async function loadSummaries(headEntries: ReadonlyArray<SummaryIndexEntry>, cwd?: string): Promise<CommitSummary[]> {
+	const summaries: CommitSummary[] = [];
+	for (const entry of headEntries) {
+		const summary = await getSummary(entry.commitHash, cwd);
+		if (summary) {
+			summaries.push(summary);
+		} else {
+			log.warn("Failed to load summary for commit %s, skipping", entry.commitHash.substring(0, 8));
+		}
+	}
+	return summaries;
+}
+
+/** Collects key decisions from all summary topics. */
+function collectKeyDecisions(summaries: ReadonlyArray<CommitSummary>): { text: string; commitHash: string }[] {
+	const keyDecisions: { text: string; commitHash: string }[] = [];
+	for (const summary of summaries) {
+		const topics = collectAllTopics(summary);
+		for (const topic of topics) {
+			if (topic.decisions && topic.decisions.trim().length > 0) {
+				keyDecisions.push({
+					text: topic.decisions,
+					commitHash: summary.commitHash,
+				});
+			}
+		}
+	}
+	return keyDecisions;
+}
+
+/**
+ * Loads and deduplicates plans from summaries.
+ *
+ * Walks each summary tree (root + nested children) so v3-legacy / IntelliJ-
+ * squash data with plans stashed in children doesn't get silently dropped —
+ * matches the recursion in `buildHit`'s plan-stub projection so every stub
+ * resolves to a top-level plan entry. Slug is normalized to its canonical
+ * **base slug** (archive suffix peeled) so pre-archive and post-archive
+ * commits referencing the same plan collapse to one entry.
+ */
+async function loadPlans(
+	summaries: ReadonlyArray<CommitSummary>,
+	cwd?: string,
+): Promise<{ slug: string; title: string; content: string }[]> {
+	const plans: { slug: string; title: string; content: string }[] = [];
+	const planCandidates = collectPlanCandidates(summaries);
+	const deduplicated = deduplicatePlans(planCandidates);
+	for (const plan of deduplicated) {
+		// Read by the **original** slug (the path on disk at archive time);
+		// expose the **base slug** so SearchHit stubs match without knowing
+		// which archived suffix happens to be on disk.
+		const content = await readPlanFromBranch(plan.originalSlug, cwd);
+		if (content) {
+			plans.push({ slug: plan.baseSlug, title: plan.title, content });
+		} else {
+			log.warn("Plan %s referenced but not found in orphan branch", plan.originalSlug);
+		}
+	}
+	return plans;
+}
+
+/**
+ * Loads and deduplicates notes from summaries.
+ *
+ * Same recursion rationale as plans (cover v3-legacy nested-child notes).
+ * Notes have no archive-suffix mechanism, so id is the natural canonical key.
+ */
+async function loadNotes(
+	summaries: ReadonlyArray<CommitSummary>,
+	cwd?: string,
+): Promise<{ id: string; title: string; content: string }[]> {
+	const notes: { id: string; title: string; content: string }[] = [];
+	const seenIds = new Set<string>();
+	for (const summary of summaries) {
+		for (const { noteRef } of collectAllNotesWithHosts(summary)) {
+			if (seenIds.has(noteRef.id)) continue;
+			seenIds.add(noteRef.id);
+			// Snippets carry their content inline; markdown notes read from orphan branch
+			if (noteRef.format === "snippet" && noteRef.content) {
+				notes.push({ id: noteRef.id, title: noteRef.title, content: noteRef.content });
+			} else {
+				const content = await readNoteFromBranch(noteRef.id, cwd);
+				if (content) {
+					notes.push({ id: noteRef.id, title: noteRef.title, content });
+				} else {
+					log.warn("Note %s referenced but not found in orphan branch", noteRef.id);
+				}
+			}
+		}
+	}
+	return notes;
+}
+
+/** Aggregates diff stats across all loaded summaries via resolveDiffStats. */
+function aggregateDiffStats(summaries: ReadonlyArray<CommitSummary>): {
+	totalFilesChanged: number;
+	totalInsertions: number;
+	totalDeletions: number;
+} {
+	let totalFilesChanged = 0;
+	let totalInsertions = 0;
+	let totalDeletions = 0;
+	for (const summary of summaries) {
+		const stats = resolveDiffStats(summary);
+		totalFilesChanged += stats.filesChanged;
+		totalInsertions += stats.insertions;
+		totalDeletions += stats.deletions;
+	}
+	return { totalFilesChanged, totalInsertions, totalDeletions };
+}
+
+/**
+ * Computes period from the display-date-sorted entries actually loaded. Callers
+ * pass the loaded summaries (a subset of the index) so the range never claims to
+ * cover commits whose summaries failed to load. Caller guarantees non-empty.
+ */
+function computePeriod(entries: ReadonlyArray<{ generatedAt?: string; commitDate: string }>): {
+	start: string;
+	end: string;
+} {
+	return {
+		start: getDisplayDate(entries[0]),
+		end: getDisplayDate(entries[entries.length - 1]),
+	};
+}
+
+/**
+ * Surfaces user-written markdown from the Memory Bank scanner as recall
+ * context topics. Files are returned as a flat list — global/repo/branch
+ * scoping is already enforced by {@link listUserKnowledge}.
+ */
+async function loadUserKnowledgeTopics(branch: string, cwd?: string): Promise<UserKnowledgeContextTopic[]> {
+	const files = await listUserKnowledge(cwd ?? process.cwd(), branch);
+	return files.map((f) => ({
+		title: deriveUserKnowledgeTitle(f.path, f.content),
+		content: f.content,
+		source: f.path,
+		scope: f.scope,
+	}));
+}
+
+/** Reads a leading `# H1` if present; otherwise falls back to the basename. */
+function deriveUserKnowledgeTitle(path: string, content: string): string {
+	const h1 = /^\s*#\s+(.+)$/m.exec(content);
+	if (h1?.[1]) return h1[1].trim();
+	const idx = path.lastIndexOf("/");
+	const base = idx === -1 ? path : path.substring(idx + 1);
+	return base.replace(/\.md$/, "");
 }
 
 // ─── Markdown rendering ──────────────────────────────────────────────────────
@@ -735,6 +846,20 @@ export function renderContextMarkdown(ctx: CompiledContext, tokenBudget?: number
 			lines.push(`${i + 1}. ${d.text} (${d.commitHash.substring(0, 8)})`);
 		}
 		lines.push("");
+		lines.push("---");
+		lines.push("");
+	}
+
+	// User Memory Bank knowledge (spec 108 Correction 1)
+	if (ctx.userKnowledgeTopics && ctx.userKnowledgeTopics.length > 0) {
+		lines.push("## Memory Bank Knowledge");
+		lines.push("");
+		for (const it of ctx.userKnowledgeTopics) {
+			lines.push(`### ${it.title} [${it.scope}: ${it.source}]`);
+			lines.push("");
+			lines.push(it.content);
+			lines.push("");
+		}
 		lines.push("---");
 		lines.push("");
 	}

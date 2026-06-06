@@ -173,6 +173,14 @@ export function buildSettingsHtml(nonce: string): string {
         </div>
       </div>
 
+      <div class="settings-row column">
+        <label class="settings-label" for="compileExcludeFolders">
+          Compile Exclude Folders
+          <span class="hint">Repo subfolders under the Memory Bank to skip during multi-repo <code>jolli compile</code>. Comma-separated names; exact match or <code>*</code> glob, e.g. <code>archive</code>, <code>tmp-*</code>.</span>
+        </label>
+        <input type="text" id="compileExcludeFolders" placeholder="archive, experiments-*" spellcheck="false" />
+      </div>
+
       <div class="settings-row column rebuild-row">
         <button type="button" class="browse-btn rebuild-btn" id="rebuildKbBtn">Migrate to Memory Bank</button>
         <div class="hint rebuild-hint">Re-migrate this repo from the orphan branch into a fresh Memory Bank folder. The existing folder is preserved (a new <code>-2</code>-suffixed folder is created and the repo registry is repointed).</div>

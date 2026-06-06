@@ -309,6 +309,23 @@ vi.mock("node:child_process", async (importOriginal) => {
 	};
 });
 
+vi.mock("../core/IngestPipeline.js", () => ({
+	drainIngest: vi.fn(async () => ({ batches: 0, ingested: 0, outcome: "NO_PENDING", topicFailures: [] })),
+}));
+
+vi.mock("../core/TopicWikiRenderer.js", () => ({
+	renderTopicKBWiki: vi.fn(async () => {}),
+}));
+
+vi.mock("../core/IngestRunStore.js", () => ({
+	appendCredentialMissingRun: vi.fn(async () => {}),
+	appendIngestRun: vi.fn(async () => {}),
+}));
+
+vi.mock("../core/IngestTrigger.js", () => ({
+	enqueueIngestOperation: vi.fn(async () => true),
+}));
+
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -326,6 +343,9 @@ import { isCursorInstalled } from "../core/CursorDetector.js";
 import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
+import { drainIngest } from "../core/IngestPipeline.js";
+import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
+import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { LlmCredentialError } from "../core/LlmClient.js";
 import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
@@ -344,17 +364,19 @@ import {
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
 import { cleanupBranchStaleChildMarkdown } from "../core/StaleChildMarkdownCleanup.js";
+import { createStorage } from "../core/StorageFactory.js";
 import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary } from "../core/SummaryStore.js";
+import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
 import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
 import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
-import type { GitOperation } from "../Types.js";
+import type { CommitGitOperation, IngestOperation } from "../Types.js";
 import { __test__, buildWorkerStartupBanner, launchWorker, runWorker } from "./QueueWorker.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function makeCommitOp(overrides: Partial<GitOperation> = {}): GitOperation {
+function makeCommitOp(overrides: Partial<CommitGitOperation> = {}): CommitGitOperation {
 	return {
 		type: "commit",
 		commitHash: "abc12345def67890",
@@ -2099,6 +2121,123 @@ describe("QueueWorker", () => {
 
 			// The legitimate script args are still present and ordered.
 			expect(args.slice(scriptIdx + 1)).toEqual(["--worker", "--cwd", "/test/cwd"]);
+		});
+	});
+
+	describe("runWorker — ingest dispatch", () => {
+		function makeIngestOp(triggeredBy: IngestOperation["triggeredBy"] = "post-merge"): IngestOperation {
+			return { type: "ingest", triggeredBy, createdAt: new Date().toISOString() };
+		}
+
+		function storageWithWiki(present: boolean): never {
+			return {
+				readFile: vi.fn().mockResolvedValue(null),
+				writeFiles: vi.fn().mockResolvedValue(undefined),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn().mockResolvedValue(undefined),
+				isTopicWikiPresent: vi.fn().mockReturnValue(present),
+			} as never;
+		}
+
+		// resetAllMocks (outer beforeEach) wipes the StorageFactory default, so
+		// re-establish a folder-like storage whose wiki is present — the common
+		// case. Per-test overrides drive the wiki-missing recovery path.
+		beforeEach(() => {
+			vi.mocked(createStorage).mockResolvedValue(storageWithWiki(true));
+		});
+
+		it("routes an ingest op to drainIngest and renderTopicKBWiki when API key is configured", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 2, outcome: "OK", topicFailures: [] });
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(drainIngest)).toHaveBeenCalledOnce();
+			expect(vi.mocked(renderTopicKBWiki)).toHaveBeenCalledOnce();
+		});
+
+		it("skips drainIngest when no API key is configured", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({} as never);
+			const origKey = process.env.ANTHROPIC_API_KEY;
+			delete process.env.ANTHROPIC_API_KEY;
+
+			const op = makeIngestOp("recall-miss");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(drainIngest)).not.toHaveBeenCalled();
+			expect(vi.mocked(renderTopicKBWiki)).not.toHaveBeenCalled();
+			expect(vi.mocked(appendCredentialMissingRun)).toHaveBeenCalledWith("/test/cwd", "recall-miss");
+
+			if (origKey !== undefined) process.env.ANTHROPIC_API_KEY = origKey;
+		});
+
+		it("skips renderTopicKBWiki when drainIngest reports 0 ingested", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 0, outcome: "OK", topicFailures: [] });
+
+			const op = makeIngestOp("manual");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(drainIngest)).toHaveBeenCalledOnce();
+			expect(vi.mocked(renderTopicKBWiki)).not.toHaveBeenCalled();
+		});
+
+		it("re-renders the wiki when ingested=0 but the visible wiki was deleted", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 0, outcome: "OK", topicFailures: [] });
+			vi.mocked(createStorage).mockResolvedValueOnce(storageWithWiki(false));
+
+			const op = makeIngestOp("manual");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(renderTopicKBWiki)).toHaveBeenCalledOnce();
+		});
+
+		it("does NOT re-render when ingested=0 and the visible wiki is already present", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 0, outcome: "OK", topicFailures: [] });
+			vi.mocked(createStorage).mockResolvedValueOnce(storageWithWiki(true));
+
+			const op = makeIngestOp("manual");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(renderTopicKBWiki)).not.toHaveBeenCalled();
+		});
+
+		it("does NOT re-trigger a post-commit ingest when only an ingest op was processed (no self-perpetuation)", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			vi.mocked(drainIngest).mockResolvedValue({ batches: 1, ingested: 2, outcome: "OK", topicFailures: [] });
+
+			const op = makeIngestOp("post-merge");
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ingest.json" }])
+				.mockResolvedValueOnce([]);
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(enqueueIngestOperation)).not.toHaveBeenCalled();
 		});
 	});
 });
