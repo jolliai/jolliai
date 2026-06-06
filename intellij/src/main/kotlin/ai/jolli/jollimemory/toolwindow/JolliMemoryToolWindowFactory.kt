@@ -366,13 +366,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             VcsListener { updateBreadcrumbBranch() },
         )
 
-        // Path 3: Periodic poll every 2 seconds (catches all edge cases)
-        javax.swing.Timer(2000) { updateBreadcrumbBranch() }.apply {
-            isRepeats = true
-            start()
-        }
-
-        // Path 4: Service status change
+        // Path 3: Service status change
         service.addStatusListener { updateBreadcrumbBranch() }
 
         toolWindow.contentManager.addContent(content)
