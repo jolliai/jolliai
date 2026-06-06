@@ -7,10 +7,12 @@ import {
 	NO_LLM_PROVIDER_MESSAGE,
 	PROXY_FETCH_TIMEOUT_MS,
 	resolveLlmCredentialSource,
+	STREAM_IDLE_TIMEOUT_MS,
 } from "./LlmClient.js";
 
-const { mockCreate, mockLogInfo, mockLogWarn, mockLogError } = vi.hoisted(() => ({
+const { mockCreate, mockStream, mockLogInfo, mockLogWarn, mockLogError } = vi.hoisted(() => ({
 	mockCreate: vi.fn(),
+	mockStream: vi.fn(),
 	mockLogInfo: vi.fn(),
 	mockLogWarn: vi.fn(),
 	mockLogError: vi.fn(),
@@ -20,7 +22,10 @@ const { mockCreate, mockLogInfo, mockLogWarn, mockLogError } = vi.hoisted(() => 
 vi.mock("@anthropic-ai/sdk", () => ({
 	// biome-ignore lint/complexity/useArrowFunction: Vitest 4.x requires `function` for constructor mocks
 	default: vi.fn().mockImplementation(function () {
-		return { messages: { create: mockCreate }, baseURL: "https://api.anthropic.com" };
+		return {
+			messages: { create: mockCreate, stream: mockStream },
+			baseURL: "https://api.anthropic.com",
+		};
 	}),
 }));
 
@@ -46,6 +51,7 @@ describe("LlmClient", () => {
 	beforeEach(() => {
 		delete process.env.ANTHROPIC_API_KEY;
 		mockCreate.mockReset();
+		mockStream.mockReset();
 		mockLogInfo.mockReset();
 		mockLogWarn.mockReset();
 		mockLogError.mockReset();
@@ -54,6 +60,20 @@ describe("LlmClient", () => {
 			model: "claude-sonnet-4-6",
 			usage: { input_tokens: 50, output_tokens: 10 },
 			stop_reason: "end_turn",
+		});
+		// Streaming path: messages.stream(...) returns a MessageStream-like
+		// object whose `finalMessage()` resolves to the same Message shape.
+		// `on` registers stream-event listeners (the inactivity watchdog) and
+		// `abort` cancels the in-flight request.
+		mockStream.mockReturnValue({
+			finalMessage: vi.fn().mockResolvedValue({
+				content: [{ type: "text", text: "streamed response" }],
+				model: "claude-sonnet-4-6",
+				usage: { input_tokens: 1000, output_tokens: 32_000 },
+				stop_reason: "end_turn",
+			}),
+			on: vi.fn(),
+			abort: vi.fn(),
 		});
 	});
 
@@ -301,6 +321,127 @@ describe("LlmClient", () => {
 				"Request was aborted.", // message
 				expect.any(String), // cause
 			);
+		});
+
+		it("uses streaming when maxTokens exceeds the SDK's non-streaming guardrail", async () => {
+			// The Anthropic SDK refuses non-streaming requests whose estimated
+			// duration exceeds 10 minutes. The topic-KB `reconcile` action raises
+			// maxTokens to 64K and triggers this. Verify the high-token call goes
+			// through `messages.stream`, not `create`.
+			const result = await callLlm({
+				action: "reconcile",
+				params: { topicTitle: "Auth", currentPage: "", sources: "src" },
+				apiKey: "sk-ant-test",
+				model: "claude-sonnet-4-6",
+				maxTokens: 64_000,
+			});
+
+			expect(mockStream).toHaveBeenCalledTimes(1);
+			expect(mockCreate).not.toHaveBeenCalled();
+			expect(mockStream.mock.calls[0][0]).toMatchObject({ max_tokens: 64_000 });
+			expect(result.text).toBe("streamed response");
+			expect(result.outputTokens).toBe(32_000);
+		});
+
+		it("uses non-streaming when maxTokens is at or below the threshold", async () => {
+			// Per-branch compile / summarize / translate all use the default
+			// 8192 budget — keep them on the simple non-streaming path so this
+			// change is a no-op for the vast majority of callers.
+			await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				model: "claude-sonnet-4-6",
+				maxTokens: 16_384,
+			});
+
+			expect(mockCreate).toHaveBeenCalledTimes(1);
+			expect(mockStream).not.toHaveBeenCalled();
+		});
+
+		it("aborts a streaming call when no stream events arrive within the idle window", async () => {
+			vi.useFakeTimers();
+			try {
+				// finalMessage hangs (wedged socket) until abort() rejects it — the
+				// SDK surfaces an aborted request as a rejection.
+				let rejectFinal: (err: Error) => void = () => {};
+				const finalMessage = vi.fn(
+					() =>
+						new Promise((_resolve, reject) => {
+							rejectFinal = reject;
+						}),
+				);
+				const abort = vi.fn(() => rejectFinal(new Error("Request was aborted.")));
+				mockStream.mockReturnValue({ finalMessage, on: vi.fn(), abort });
+
+				const promise = callLlm({
+					action: "reconcile",
+					params: { topicTitle: "Auth", currentPage: "", sources: "src" },
+					apiKey: "sk-ant-test",
+					model: "claude-sonnet-4-6",
+					maxTokens: 64_000,
+				});
+				// Catch eagerly so the rejection isn't flagged as unhandled while
+				// fake timers advance.
+				const settled = promise.catch((e: unknown) => e);
+
+				// No stream events fire; the inactivity watchdog must abort once the
+				// idle window elapses.
+				await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS + 10);
+
+				expect(abort).toHaveBeenCalledTimes(1);
+				const err = await settled;
+				expect(String(err)).toContain("aborted");
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("does not abort a streaming call while stream events keep arriving", async () => {
+			vi.useFakeTimers();
+			try {
+				let resolveFinal: (msg: unknown) => void = () => {};
+				const finalMessage = vi.fn(
+					() =>
+						new Promise((resolve) => {
+							resolveFinal = resolve;
+						}),
+				);
+				const abort = vi.fn();
+				let onStreamEvent: (() => void) | undefined;
+				const on = vi.fn((event: string, cb: () => void) => {
+					if (event === "streamEvent") onStreamEvent = cb;
+				});
+				mockStream.mockReturnValue({ finalMessage, on, abort });
+
+				const promise = callLlm({
+					action: "reconcile",
+					params: { topicTitle: "Auth", currentPage: "", sources: "src" },
+					apiKey: "sk-ant-test",
+					model: "claude-sonnet-4-6",
+					maxTokens: 64_000,
+				});
+
+				// A slow stream: an event arrives just before each idle deadline,
+				// resetting the watchdog. Total elapsed far exceeds the idle window
+				// yet abort must never fire.
+				for (let i = 0; i < 5; i++) {
+					await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS - 1_000);
+					onStreamEvent?.();
+				}
+				expect(abort).not.toHaveBeenCalled();
+
+				resolveFinal({
+					content: [{ type: "text", text: "streamed response" }],
+					model: "claude-sonnet-4-6",
+					usage: { input_tokens: 1000, output_tokens: 32_000 },
+					stop_reason: "end_turn",
+				});
+				const result = await promise;
+				expect(result.text).toBe("streamed response");
+			} finally {
+				vi.useRealTimers();
+			}
 		});
 	});
 

@@ -18,8 +18,9 @@ vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadConfig,
 }));
 
-const { showWarningMessage } = vi.hoisted(() => ({
+const { showWarningMessage, showErrorMessage } = vi.hoisted(() => ({
 	showWarningMessage: vi.fn(),
+	showErrorMessage: vi.fn(),
 }));
 
 vi.mock("vscode", () => ({
@@ -31,11 +32,63 @@ vi.mock("vscode", () => ({
 			dispose: () => {},
 		}),
 		showWarningMessage,
+		showErrorMessage,
 	},
 	workspace: {
 		workspaceFolders: [],
 	},
 }));
+
+// `buildSyncEngine` is the CLI-side factory `ensureBuilt` calls once a
+// workspace folder + jolliApiKey are present. Mock it so the build path can
+// be exercised without the full git/sync wiring. Tests reset it per-case to
+// return null (bail) or a sentinel engine. The captured `onPhase` /
+// `onRepoMappingConflict` callbacks are stashed so tests can fire them.
+const { buildSyncEngine } = vi.hoisted(() => ({
+	buildSyncEngine: vi.fn(),
+}));
+vi.mock("../../../cli/src/sync/SyncBootstrap.js", () => ({
+	buildSyncEngine,
+}));
+
+// `StatusOrchestrator` is constructed inside the build path. Mock it as a
+// recorder so tests can inspect the opts passed in and the start/stop/dispose
+// lifecycle without pulling in the real orchestrator + git plumbing.
+const { StatusOrchestrator, orchInstances } = vi.hoisted(() => {
+	// biome-ignore lint/suspicious/noExplicitAny: test recorder for arbitrary orchestrator instances
+	const orchInstances: any[] = [];
+	const StatusOrchestrator = vi.fn(
+		// biome-ignore lint/suspicious/noExplicitAny: orchestrator opts shape is exercised via assertions, not types
+		function (this: any, opts: any) {
+			this.opts = opts;
+			this.isPolling = false;
+			this.start = vi.fn(() => {
+				this.isPolling = true;
+			});
+			this.stop = vi.fn(() => {
+				this.isPolling = false;
+			});
+			this.dispose = vi.fn();
+			this.setOnRoundFinished = vi.fn();
+			this.handlePhase = vi.fn();
+			orchInstances.push(this);
+		},
+	);
+	return { StatusOrchestrator, orchInstances };
+});
+vi.mock("./StatusOrchestrator.js", () => ({ StatusOrchestrator }));
+
+// `VsCodeConflictUi` is `new`'d inside the build path; stub it as an empty class.
+vi.mock("./VsCodeConflictUi.js", () => ({
+	VsCodeConflictUi: class {},
+}));
+
+// `registerSyncCommands` is called by `activateSync`; return an array of fake
+// disposables so the for-loop that pushes them into context.subscriptions runs.
+const { registerSyncCommands } = vi.hoisted(() => ({
+	registerSyncCommands: vi.fn(() => [{ dispose: () => {} }]),
+}));
+vi.mock("./SyncCommands.js", () => ({ registerSyncCommands }));
 
 // Route `node:timers` through the global timers so `vi.useFakeTimers()` —
 // which only patches globalThis — actually controls the countdown in
@@ -55,6 +108,12 @@ import { activateSync, makeLockedWaitHandler, SyncRuntime } from "./VsCodeSyncBo
 
 beforeEach(() => {
 	loadConfig.mockReset();
+	buildSyncEngine.mockReset();
+	StatusOrchestrator.mockClear();
+	registerSyncCommands.mockClear();
+	showWarningMessage.mockClear();
+	showErrorMessage.mockClear();
+	orchInstances.length = 0;
 });
 
 afterEach(() => {
@@ -92,6 +151,62 @@ type RuntimeInternals = {
 };
 function internals(runtime: SyncRuntime): RuntimeInternals {
 	return runtime as unknown as RuntimeInternals;
+}
+
+/** In-memory globalState backing for the lastSuccessAt get/set closures. */
+function makeGlobalState() {
+	const store = new Map<string, unknown>();
+	return {
+		store,
+		// biome-ignore lint/suspicious/noExplicitAny: minimal globalState surface for tests
+		get: (key: string): any => store.get(key),
+		update: vi.fn((key: string, val: unknown) => {
+			store.set(key, val);
+			return Promise.resolve();
+		}),
+	};
+}
+
+/**
+ * Sets `vscode.workspace.workspaceFolders` for the build-path tests, which
+ * need a non-empty folder so `ensureBuilt`'s `!folder` guard passes. Returns
+ * a restore fn for the caller's `finally`.
+ */
+async function withWorkspaceFolder(fsPath: string): Promise<() => void> {
+	const vscodeMock = (await import("vscode")) as unknown as {
+		workspace: { workspaceFolders: unknown };
+	};
+	const before = vscodeMock.workspace.workspaceFolders;
+	vscodeMock.workspace.workspaceFolders = [{ uri: { fsPath } }];
+	return () => {
+		vscodeMock.workspace.workspaceFolders = before;
+	};
+}
+
+/**
+ * Build a SyncRuntime wired with a real-enough context (globalState +
+ * subscriptions recorder) and a statusBar stub, for exercising the full
+ * `ensureBuilt` build IIFE.
+ */
+function makeBuildRuntime() {
+	const subscriptions: Array<{ dispose: () => void }> = [];
+	const globalState = makeGlobalState();
+	const setSyncState = vi.fn();
+	const releaseSyncOwnership = vi.fn();
+	const context = {
+		subscriptions: { push: (d: { dispose: () => void }) => subscriptions.push(d) },
+		globalState,
+	};
+	const statusBar = { setSyncState, releaseSyncOwnership };
+	const statusStore = { sentinel: "store" };
+	const readyPromise = Promise.resolve();
+	const runtime = new SyncRuntime(
+		context as never,
+		statusBar as never,
+		readyPromise,
+		statusStore as never,
+	);
+	return { runtime, subscriptions, globalState, statusBar, statusStore, readyPromise };
 }
 
 describe("SyncRuntime.ensureBuilt — early-return branches", () => {
@@ -257,6 +372,19 @@ describe("SyncRuntime.reconcileAutoSync", () => {
 		// without also flipping `autoSyncEnabled` to false.
 		await expect(runtime.reconcileAutoSync()).resolves.toBeUndefined();
 		expect(ensureBuiltSpy).not.toHaveBeenCalled();
+	});
+
+	it("returns early when wantPoll=true but ensureBuilt yields null (no workspace/engine)", async () => {
+		const runtime = makeRuntime();
+		loadConfig.mockResolvedValue({
+			autoSyncEnabled: true,
+			jolliApiKey: "sk-jol-test",
+		});
+		// ensureBuilt bails (e.g. no workspace folder) → reconcile must return
+		// without trying to call start() on a null orchestrator.
+		const ensureBuiltSpy = vi.spyOn(runtime, "ensureBuilt").mockResolvedValue(null);
+		await expect(runtime.reconcileAutoSync()).resolves.toBeUndefined();
+		expect(ensureBuiltSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("calls orch.start() when autoSyncEnabled=true and orch is not yet polling", async () => {
@@ -707,6 +835,254 @@ describe("makeLockedWaitHandler (plan §0.12 — live countdown + correct attemp
 		// No timer started — advancing should not re-render.
 		vi.advanceTimersByTime(60_000);
 		expect(statusBar.setSyncState.mock.calls.length).toBe(callsAfterRender);
+		dispose();
+	});
+});
+
+describe("SyncRuntime.ensureBuilt — full build path", () => {
+	it("returns the cached orchestrator on a second call with the same key (cache hit)", async () => {
+		const { runtime } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({
+			jolliApiKey: "sk-jol-test",
+			autoSyncEnabled: true,
+			syncPollIntervalSec: 90,
+		});
+		buildSyncEngine.mockResolvedValue({ engine: true });
+		const restore = await withWorkspaceFolder("/repo/cache");
+		try {
+			const first = await runtime.ensureBuilt();
+			// Second call: jolliApiKey unchanged → the `this.orchestrator !== null`
+			// short-circuit returns the same instance without rebuilding.
+			const second = await runtime.ensureBuilt();
+			expect(second).toBe(first);
+			expect(orchInstances.length).toBe(1);
+			expect(buildSyncEngine).toHaveBeenCalledTimes(1);
+		} finally {
+			restore();
+		}
+	});
+
+	it("returns null when buildSyncEngine returns null (engine bailed)", async () => {
+		const { runtime } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test", syncPollIntervalSec: 90 });
+		buildSyncEngine.mockResolvedValue(null);
+		const restore = await withWorkspaceFolder("/repo/a");
+		try {
+			const result = await runtime.ensureBuilt();
+			expect(result).toBeNull();
+			expect(buildSyncEngine).toHaveBeenCalledTimes(1);
+			// No orchestrator constructed when the engine is null.
+			expect(orchInstances.length).toBe(0);
+			expect(runtime.get()).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+
+	it("builds the orchestrator and starts polling when autoSyncEnabled=true", async () => {
+		const { runtime, statusBar } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({
+			jolliApiKey: "sk-jol-test",
+			autoSyncEnabled: true,
+			syncPollIntervalSec: 120,
+		});
+		buildSyncEngine.mockResolvedValue({ engine: true });
+		const restore = await withWorkspaceFolder("/repo/b");
+		try {
+			const result = await runtime.ensureBuilt();
+			expect(orchInstances.length).toBe(1);
+			expect(result).toBe(orchInstances[0]);
+			expect(runtime.get()).toBe(orchInstances[0]);
+			// Auto-sync on → polling started.
+			expect(orchInstances[0].start).toHaveBeenCalledTimes(1);
+			// Opts wired through from config + runtime.
+			expect(orchInstances[0].opts.pollIntervalSec).toBe(120);
+			expect(orchInstances[0].opts.engine).toEqual({ engine: true });
+			expect(orchInstances[0].opts.statusBar).toBe(statusBar);
+		} finally {
+			restore();
+		}
+	});
+
+	it("builds the orchestrator WITHOUT polling when autoSyncEnabled is off (manual-only)", async () => {
+		const { runtime } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({
+			jolliApiKey: "sk-jol-test",
+			// autoSyncEnabled omitted → manual-only
+			syncPollIntervalSec: 90,
+		});
+		buildSyncEngine.mockResolvedValue({ engine: true });
+		const restore = await withWorkspaceFolder("/repo/c");
+		try {
+			const result = await runtime.ensureBuilt();
+			expect(result).toBe(orchInstances[0]);
+			expect(orchInstances[0].start).not.toHaveBeenCalled();
+		} finally {
+			restore();
+		}
+	});
+
+	it("routes engine onPhase events into the orchestrator's handlePhase", async () => {
+		const { runtime } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test", autoSyncEnabled: true });
+		// biome-ignore lint/suspicious/noExplicitAny: capture the bootstrap opts to fire callbacks
+		let capturedOpts: any = null;
+		buildSyncEngine.mockImplementation(async (opts: unknown) => {
+			capturedOpts = opts;
+			return { engine: true };
+		});
+		const restore = await withWorkspaceFolder("/repo/d");
+		try {
+			await runtime.ensureBuilt();
+			// orchRef was assigned after engine build → onPhase now routes through.
+			capturedOpts.onPhase({ kind: "pull" });
+			expect(orchInstances[0].handlePhase).toHaveBeenCalledWith({ kind: "pull" });
+		} finally {
+			restore();
+		}
+	});
+
+	it("wires onRepoMappingConflict to notifyRepoMappingConflicts", async () => {
+		const { runtime } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test", autoSyncEnabled: true });
+		// biome-ignore lint/suspicious/noExplicitAny: capture the bootstrap opts to fire callbacks
+		let capturedOpts: any = null;
+		buildSyncEngine.mockImplementation(async (opts: unknown) => {
+			capturedOpts = opts;
+			return { engine: true };
+		});
+		const restore = await withWorkspaceFolder("/repo/e");
+		try {
+			await runtime.ensureBuilt();
+			capturedOpts.onRepoMappingConflict([{ folder: "x", identities: ["a", "b"] }]);
+			expect(showWarningMessage).toHaveBeenCalledTimes(1);
+			expect(showWarningMessage).toHaveBeenCalledWith(expect.stringContaining('"x"'));
+		} finally {
+			restore();
+		}
+	});
+
+	it("wires lastSuccessAt get/set against globalState keyed by folder path", async () => {
+		const { runtime, globalState } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test", autoSyncEnabled: true });
+		buildSyncEngine.mockResolvedValue({ engine: true });
+		const restore = await withWorkspaceFolder("/repo/f");
+		try {
+			await runtime.ensureBuilt();
+			const { lastSuccessAt } = orchInstances[0].opts;
+			const expectedKey = "sync.lastSuccessAt:/repo/f";
+			// get reads through to globalState
+			globalState.store.set(expectedKey, 12345);
+			expect(lastSuccessAt.get()).toBe(12345);
+			// set writes through to globalState.update
+			lastSuccessAt.set(67890);
+			expect(globalState.update).toHaveBeenCalledWith(expectedKey, 67890);
+			expect(globalState.store.get(expectedKey)).toBe(67890);
+		} finally {
+			restore();
+		}
+	});
+
+	it("wires notifyError to vscode.window.showErrorMessage", async () => {
+		const { runtime } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test", autoSyncEnabled: true });
+		buildSyncEngine.mockResolvedValue({ engine: true });
+		const restore = await withWorkspaceFolder("/repo/g");
+		try {
+			await runtime.ensureBuilt();
+			orchInstances[0].opts.notifyError("Sync failed", "boom");
+			expect(showErrorMessage).toHaveBeenCalledWith("Sync failed — boom");
+		} finally {
+			restore();
+		}
+	});
+
+	it("applies a late-bound onRoundFinished callback to orchestrators built later", async () => {
+		const { runtime } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test", autoSyncEnabled: true });
+		buildSyncEngine.mockResolvedValue({ engine: true });
+		const cb = vi.fn();
+		// Set BEFORE the orchestrator exists — must be passed at construction.
+		runtime.setOnRoundFinished(cb);
+		const restore = await withWorkspaceFolder("/repo/h");
+		try {
+			await runtime.ensureBuilt();
+			expect(orchInstances[0].opts.onRoundFinished).toBe(cb);
+		} finally {
+			restore();
+		}
+	});
+
+	it("disposes the prior locked-wait handler via context.subscriptions on deactivate (live-field read)", async () => {
+		// The build path pushes a subscription whose dispose reads the LIVE
+		// `currentLockedWaitDispose` field. Build once, then invoke that
+		// subscription's dispose to confirm it clears the handler timer.
+		const { runtime, subscriptions } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test", autoSyncEnabled: true });
+		buildSyncEngine.mockResolvedValue({ engine: true });
+		const restore = await withWorkspaceFolder("/repo/i");
+		try {
+			await runtime.ensureBuilt();
+			// Find the locked-wait subscription (the one whose dispose proxies
+			// to currentLockedWaitDispose) and invoke it — must not throw.
+			expect(() => {
+				for (const sub of subscriptions) sub.dispose();
+			}).not.toThrow();
+			expect(internals(runtime).currentLockedWaitDispose).not.toBeNull();
+		} finally {
+			restore();
+		}
+	});
+});
+
+describe("SyncRuntime.setOnRoundFinished — propagates to a live orchestrator", () => {
+	it("forwards the callback to an already-built orchestrator immediately", async () => {
+		const { runtime } = makeBuildRuntime();
+		loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-test", autoSyncEnabled: true });
+		buildSyncEngine.mockResolvedValue({ engine: true });
+		const restore = await withWorkspaceFolder("/repo/j");
+		try {
+			await runtime.ensureBuilt();
+			const cb = vi.fn();
+			runtime.setOnRoundFinished(cb);
+			// orchestrator already exists → forwarded via the live ref.
+			expect(orchInstances[0].setOnRoundFinished).toHaveBeenCalledWith(cb);
+		} finally {
+			restore();
+		}
+	});
+
+	it("is a no-op (no throw) when no orchestrator is built yet", () => {
+		const runtime = makeRuntime();
+		expect(() => runtime.setOnRoundFinished(vi.fn())).not.toThrow();
+	});
+});
+
+describe("makeLockedWaitHandler — selfLocked branch (plan §0.12)", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("renders the self-locked message when info.selfLocked is true", () => {
+		const setSyncState = vi.fn();
+		const { handler, dispose } = makeLockedWaitHandler({ setSyncState });
+		handler({
+			attempt: 2,
+			totalAttempts: 4,
+			nextRetryInMs: 30_000,
+			message: "Personal Space busy",
+			selfLocked: true,
+		});
+		expect(setSyncState).toHaveBeenLastCalledWith("offline", {
+			failed: true,
+			failedCode: "vault_locked",
+			selfLocked: true,
+			lastError:
+				"Your previous sync left the Personal Space lock held; it is still releasing. Attempt 2/4 — next retry in 30s",
+		});
 		dispose();
 	});
 });

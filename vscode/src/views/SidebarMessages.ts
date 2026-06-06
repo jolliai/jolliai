@@ -165,7 +165,7 @@ export interface SerializedTreeItem {
  * KB index). Directories always carry `undefined`. Files that aren't tracked in
  * the manifest (user-dropped notes, etc.) carry `"other"`.
  */
-export type FolderFileKind = "memory" | "plan" | "note" | "other";
+export type FolderFileKind = "memory" | "plan" | "note" | "wiki" | "other";
 
 export interface FolderNode {
 	readonly name: string;

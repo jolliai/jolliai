@@ -120,6 +120,7 @@ fi
 
 case "$HOOK_TYPE" in
   post-commit)        exec node "$DIST/PostCommitHook.js" "$@" ;;
+  post-merge)         exec node "$DIST/PostMergeHook.js" "$@" ;;
   post-rewrite)       exec node "$DIST/PostRewriteHook.js" "$@" ;;
   prepare-commit-msg) exec node "$DIST/PrepareMsgHook.js" "$@" ;;
   stop)               exec node "$DIST/StopHook.js" "$@" ;;

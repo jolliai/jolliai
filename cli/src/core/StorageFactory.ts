@@ -68,3 +68,12 @@ export function createFolderStorage(projectPath: string, customKBPath?: string):
 	const metadataManager = new MetadataManager(join(kbRoot, ".jolli"));
 	return new FolderStorage(kbRoot, metadataManager);
 }
+
+/**
+ * Builds a folder-only FolderStorage at an explicit kbRoot — for the multi-repo
+ * compile sweep, where the target repo has no git working tree (only its
+ * `<localFolder>/<repo>/` folder). No orphan side: swept repos write folder-only.
+ */
+export function createFolderStorageAtRoot(kbRoot: string): FolderStorage {
+	return new FolderStorage(kbRoot, new MetadataManager(join(kbRoot, ".jolli")));
+}

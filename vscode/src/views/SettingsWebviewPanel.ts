@@ -54,6 +54,8 @@ interface SettingsPayload {
 	readonly copilotEnabled: boolean;
 	readonly localFolder: string;
 	readonly excludePatterns: string;
+	/** Comma-separated folder names (exact or `*` glob) skipped by `jolli compile`. */
+	readonly compileExcludeFolders: string;
 	readonly dcoSignoff: boolean;
 	readonly autoSyncEnabled?: boolean;
 	readonly syncTranscripts?: boolean;
@@ -396,6 +398,9 @@ export class SettingsWebviewPanel {
 			excludePatterns: config.excludePatterns
 				? config.excludePatterns.join(", ")
 				: "",
+			compileExcludeFolders: config.compileExcludeFolders
+				? config.compileExcludeFolders.join(", ")
+				: "",
 			dcoSignoff: config.dcoSignoff === true,
 			autoSyncEnabled: Boolean(config.autoSyncEnabled),
 			syncTranscripts: Boolean(config.syncTranscripts),
@@ -486,6 +491,14 @@ export class SettingsWebviewPanel {
 			.map((p) => p.trim())
 			.filter((p) => p.length > 0);
 
+		// `?? ""` tolerates a payload that omits this field — the live webview
+		// always sends it, but a direct postMessage (tests, or a stale cached
+		// bundle from before this field existed) shouldn't crash the save.
+		const compileExcludeFolders = (settings.compileExcludeFolders ?? "")
+			.split(",")
+			.map((p) => p.trim())
+			.filter((p) => p.length > 0);
+
 		const update: Partial<JolliMemoryConfig> = {
 			apiKey: resolvedApiKey.length > 0 ? resolvedApiKey : undefined,
 			model: settings.model === "sonnet" ? undefined : settings.model,
@@ -504,6 +517,8 @@ export class SettingsWebviewPanel {
 					? settings.localFolder
 					: undefined,
 			excludePatterns: excludePatterns.length > 0 ? excludePatterns : undefined,
+			compileExcludeFolders:
+				compileExcludeFolders.length > 0 ? compileExcludeFolders : undefined,
 			dcoSignoff: settings.dcoSignoff ? true : undefined,
 			autoSyncEnabled: settings.autoSyncEnabled === true ? true : undefined,
 			syncTranscripts: settings.syncTranscripts === true ? true : undefined,

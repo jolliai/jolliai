@@ -34,6 +34,7 @@ import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
+import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { acquireWorkerLock, refreshWorkerLockMtime, releaseWorkerLock } from "../core/Locks.js";
 import { formatNotesBlock } from "../core/NotePromptFormatter.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
@@ -95,29 +96,32 @@ import { createLogger, errMsg, setLogDir, setLogLevel } from "../Logger.js";
 import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
 import { acquireVaultWriteLock, DEFAULT_VAULT_WRITE_WAIT_MS } from "../sync/VaultWriteLock.js";
-import type {
-	CommitInfo,
-	CommitSource,
-	CommitSummary,
-	CommitType,
-	DiffStats,
-	GitOperation,
-	JolliMemoryConfig,
-	LogLevel,
-	NoteReference,
-	PlanProgressArtifact,
-	PlanReference,
-	PlansRegistry,
-	Reference,
-	ReferenceCommitRef,
-	ReferenceEntry,
-	SourceId,
-	StoredTranscript,
-	TopicSummary,
-	TranscriptReadResult,
-	TranscriptSource,
+import {
+	type CommitGitOperation,
+	type CommitInfo,
+	type CommitSource,
+	type CommitSummary,
+	type CommitType,
+	CURRENT_SCHEMA_VERSION,
+	type DiffStats,
+	type GitOperation,
+	type IngestOperation,
+	isIngestOperation,
+	type JolliMemoryConfig,
+	type LogLevel,
+	type NoteReference,
+	type PlanProgressArtifact,
+	type PlanReference,
+	type PlansRegistry,
+	type Reference,
+	type ReferenceCommitRef,
+	type ReferenceEntry,
+	type SourceId,
+	type StoredTranscript,
+	type TopicSummary,
+	type TranscriptReadResult,
+	type TranscriptSource,
 } from "../Types.js";
-import { CURRENT_SCHEMA_VERSION } from "../Types.js";
 import { spawnHidden } from "../util/Subprocess.js";
 
 const log = createLogger("QueueWorker");
@@ -371,6 +375,10 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		try {
 			// Drain the queue: process all entries, then check for new ones (added during processing)
 			let processedCount = 0;
+			// Tracks whether any commit-typed op was processed this run, so we can
+			// debounce-trigger a repo-wide topic-KB ingest after the drain (SP3).
+			// Ingest ops do NOT set it — that would self-perpetuate the trigger.
+			let committedThisRun = false;
 			const MAX_ENTRIES_PER_RUN = 20; // Safety limit to prevent infinite loops
 
 			while (processedCount < MAX_ENTRIES_PER_RUN) {
@@ -384,6 +392,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 					if (processedCount >= MAX_ENTRIES_PER_RUN) break;
 					try {
 						await processQueueEntry(op, cwd, storage, force);
+						if (!isIngestOperation(op)) committedThisRun = true;
 					} catch (error: unknown) {
 						// Queue entries are deleted regardless of success or failure (fire-and-forget).
 						// Retry is intentionally not implemented: pipeline steps (transcript cursor
@@ -393,9 +402,9 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 						// replenishment). Requires persisting transcripts to the orphan branch BEFORE
 						// the LLM call so re-summarize can read them back without cursor dependency.
 						log.error(
-							"Failed to process queue entry type=%s hash=%s: %s",
+							"Failed to process queue entry type=%s ref=%s: %s",
 							op.type,
-							op.commitHash.substring(0, 8),
+							isIngestOperation(op) ? "ingest" : (op as CommitGitOperation).commitHash.substring(0, 8),
 							(error as Error).message,
 						);
 					}
@@ -406,6 +415,16 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 
 			if (processedCount > 0) {
 				log.info("Processed %d queue entries", processedCount);
+			}
+
+			// SP3 — a commit just landed, so debounce-trigger a repo-wide topic-KB
+			// ingest. Enqueued (not run inline) so it drains in the chain-spawned
+			// successor under its own lock rather than extending this worker's hold;
+			// IngestTrigger's per-cwd cooldown collapses rapid commit bursts to one
+			// drain. Without this, the topic KB only updated on `git pull` merges or
+			// a manual `jolli compile`, so commit-heavy workflows went stale.
+			if (committedThisRun) {
+				await enqueueIngestOperation(cwd, "post-commit");
 			}
 			/* v8 ignore start -- catch block only reached if dequeueAllGitOperations throws unexpectedly */
 		} catch (error: unknown) {
@@ -460,57 +479,68 @@ async function processQueueEntry(
 	storage: StorageProvider,
 	force: boolean,
 ): Promise<void> {
-	log.info("Processing queue entry: type=%s hash=%s", op.type, op.commitHash.substring(0, 8));
+	// SP3 — topic-KB ingest. Drains all pending sources and renders the wiki.
+	// No commit-hash or branch field; dispatch and return before commit-only code.
+	if (isIngestOperation(op)) {
+		log.info("Processing queue entry: type=ingest triggeredBy=%s", op.triggeredBy);
+		await runIngestFromQueue(op, cwd, storage);
+		return;
+	}
 
-	switch (op.type) {
+	// At this point the only remaining operation is commit-typed (the GitOperation
+	// union is CommitGitOperation | IngestOperation, and ingest returned above).
+	const commitOp = op as CommitGitOperation;
+	log.info("Processing queue entry: type=%s hash=%s", commitOp.type, commitOp.commitHash.substring(0, 8));
+
+	switch (commitOp.type) {
 		case "commit":
 		case "cherry-pick":
 		case "revert":
 		case "amend":
 			// These all go through the LLM pipeline
-			await executePipeline(cwd, op, force);
+			await executePipeline(cwd, commitOp, force);
 			break;
 
 		case "squash":
-			await handleSquashFromQueue(op, cwd);
+			await handleSquashFromQueue(commitOp, cwd);
 			break;
 
 		case "rebase-pick":
-			await handleRebasePickFromQueue(op, cwd);
+			await handleRebasePickFromQueue(commitOp, cwd);
 			break;
 
 		case "rebase-squash":
-			await handleRebaseSquashFromQueue(op, cwd);
+			await handleRebaseSquashFromQueue(commitOp, cwd);
 			break;
 
 		default:
-			log.warn("Unknown queue entry type: %s", (op as GitOperation).type);
+			log.warn("Unknown queue entry type: %s", commitOp.type);
 	}
 
 	// Tail step: prune visible .md files for hoisted older versions
 	// (`parentCommitHash != null`) on the branch the op landed on. Reading
 	// the live branch would point at the wrong tree if the user has `git
-	// checkout`'d away between enqueue and drain, so we use op.branch (set
+	// checkout`'d away between enqueue and drain, so we use commitOp.branch (set
 	// by every hook in this version). Pre-0.99.x queue entries that lack
-	// op.branch are skipped — guessing the live branch is exactly the bug
+	// commitOp.branch are skipped — guessing the live branch is exactly the bug
 	// the captured field is meant to prevent. Failures MUST NOT roll back
 	// the op.
-	if (!op.branch) {
+	if (!commitOp.branch) {
 		log.warn(
 			"Stale-child cleanup skipped for %s: queue entry has no branch field (pre-0.99.x format)",
-			op.commitHash.substring(0, 8),
+			commitOp.commitHash.substring(0, 8),
 		);
 		return;
 	}
 	try {
-		const { deleted, failed } = await cleanupBranchStaleChildMarkdown(cwd, op.branch, storage);
+		const { deleted, failed } = await cleanupBranchStaleChildMarkdown(cwd, commitOp.branch, storage);
 		/* v8 ignore start -- conditional log: cleanup ran but had nothing to do is the common case; non-zero counts fire under real worker churn covered by the cleanup function's own tests. */
 		if (deleted > 0 || failed > 0) {
-			log.info("Stale-child cleanup on %s: deleted=%d failed=%d", op.branch, deleted, failed);
+			log.info("Stale-child cleanup on %s: deleted=%d failed=%d", commitOp.branch, deleted, failed);
 		}
 		/* v8 ignore stop */
 	} catch (err) {
-		log.warn("Stale-child cleanup tail step failed for %s: %s", op.commitHash.substring(0, 8), errMsg(err));
+		log.warn("Stale-child cleanup tail step failed for %s: %s", commitOp.commitHash.substring(0, 8), errMsg(err));
 	}
 }
 
@@ -519,6 +549,33 @@ async function processQueueEntry(
  */
 function now(): number {
 	return performance.now();
+}
+
+/**
+ * SP3 — drains all pending sources into the topic KB and re-renders the
+ * visible `_wiki/` layer. No branch field — the topic KB is repo-wide.
+ * Credential-missing is a silent skip (no API key → skip).
+ */
+async function runIngestFromQueue(op: IngestOperation, cwd: string, storage: StorageProvider): Promise<void> {
+	const { drainIngest } = await import("../core/IngestPipeline.js");
+	const { renderTopicKBWiki } = await import("../core/TopicWikiRenderer.js");
+	const { appendCredentialMissingRun } = await import("../core/IngestRunStore.js");
+	const config = await loadConfig();
+	if (!config.apiKey && !config.jolliApiKey && !process.env.ANTHROPIC_API_KEY) {
+		log.info("No API key configured — skipping ingest (%s)", op.triggeredBy);
+		await appendCredentialMissingRun(cwd, op.triggeredBy);
+		return;
+	}
+	const result = await drainIngest(cwd, config, { triggeredBy: op.triggeredBy });
+	log.info("Ingest drained: %d batches, %d sources (%s)", result.batches, result.ingested, op.triggeredBy);
+	// Re-render when new sources landed, OR when the visible wiki is gone (the user
+	// deleted `_wiki/`): without the second clause a deleted wiki would never come
+	// back through the background path once all sources are already processed
+	// (ingested === 0 every commit), leaving `jolli compile` as the only recovery.
+	const wikiMissing = storage.isTopicWikiPresent ? !storage.isTopicWikiPresent() : false;
+	if (result.ingested > 0 || wikiMissing) {
+		await renderTopicKBWiki(cwd, storage);
+	}
 }
 
 /**
@@ -1094,7 +1151,7 @@ async function assembleReferenceBlocks(activeReferenceEntries: ReadonlyArray<Ref
  * Handles: commit, cherry-pick, revert (full LLM pipeline), and amend (LLM + merge with old summary).
  * Squash and rebase operations are handled by dedicated functions, not this pipeline.
  */
-async function executePipeline(cwd: string, op: GitOperation, force = false): Promise<void> {
+async function executePipeline(cwd: string, op: CommitGitOperation, force = false): Promise<void> {
 	const pipelineStart = now();
 
 	// commitSource and commitType come from the queue entry (set at enqueue time)
@@ -1608,7 +1665,7 @@ async function loadSourceSummaries(
  * Delegates to runSquashPipeline so behaviour is identical to rebase-squash --
  * both routes go through the same LLM consolidation + mechanical fallback.
  */
-async function handleSquashFromQueue(op: GitOperation, cwd: string): Promise<void> {
+async function handleSquashFromQueue(op: CommitGitOperation, cwd: string): Promise<void> {
 	if (!op.sourceHashes || op.sourceHashes.length === 0) {
 		log.warn("Squash queue entry has no sourceHashes — skipping");
 		return;
@@ -1633,7 +1690,7 @@ async function handleSquashFromQueue(op: GitOperation, cwd: string): Promise<voi
  * Handles a rebase pick (1:1 migration) queue entry.
  * No LLM call needed — just migrates the summary to the new hash.
  */
-async function handleRebasePickFromQueue(op: GitOperation, cwd: string): Promise<void> {
+async function handleRebasePickFromQueue(op: CommitGitOperation, cwd: string): Promise<void> {
 	if (!op.sourceHashes?.[0]) {
 		log.warn("Rebase-pick queue entry has no sourceHash — skipping");
 		return;
@@ -1669,7 +1726,7 @@ async function handleRebasePickFromQueue(op: GitOperation, cwd: string): Promise
  * routes share the LLM consolidation + mechanical fallback. The user-visible
  * result is identical regardless of which path triggered the squash.
  */
-async function handleRebaseSquashFromQueue(op: GitOperation, cwd: string): Promise<void> {
+async function handleRebaseSquashFromQueue(op: CommitGitOperation, cwd: string): Promise<void> {
 	if (!op.sourceHashes || op.sourceHashes.length === 0) {
 		log.warn("Rebase-squash queue entry has no sourceHashes — skipping");
 		return;

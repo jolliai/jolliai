@@ -42,6 +42,7 @@ export function buildSettingsScript(): string {
   const rebuildKbBtn = document.getElementById('rebuildKbBtn');
   const rebuildKbStatus = document.getElementById('rebuildKbStatus');
   const excludePatternsInput = document.getElementById('excludePatterns');
+  const compileExcludeFoldersInput = document.getElementById('compileExcludeFolders');
   const dcoSignoffInput = document.getElementById('dcoSignoff');
   const applyBtn = document.getElementById('applyBtn');
   const saveFeedback = document.getElementById('saveFeedback');
@@ -321,6 +322,7 @@ export function buildSettingsScript(): string {
       copilotEnabled: copilotEnabledInput.checked,
       localFolder: localFolderInput.value,
       excludePatterns: excludePatternsInput.value,
+      compileExcludeFolders: compileExcludeFoldersInput.value,
       dcoSignoff: dcoSignoffInput.checked,
       autoSyncEnabled: autoSyncEnabledInput ? autoSyncEnabledInput.checked : false,
       syncTranscripts: syncTranscriptsInput ? syncTranscriptsInput.checked : false,
@@ -344,6 +346,7 @@ export function buildSettingsScript(): string {
       copilotEnabledInput.checked !== initialState.copilotEnabled ||
       localFolderInput.value !== initialState.localFolder ||
       excludePatternsInput.value !== initialState.excludePatterns ||
+      compileExcludeFoldersInput.value !== initialState.compileExcludeFolders ||
       dcoSignoffInput.checked !== initialState.dcoSignoff ||
       (autoSyncEnabledInput && autoSyncEnabledInput.checked !== initialState.autoSyncEnabled) ||
       (syncTranscriptsInput && syncTranscriptsInput.checked !== initialState.syncTranscripts) ||
@@ -386,7 +389,7 @@ export function buildSettingsScript(): string {
     }
     validateAll(); checkDirty(); clearSaveFeedback();
   });
-  [maxTokensInput, excludePatternsInput].forEach(function(input) {
+  [maxTokensInput, excludePatternsInput, compileExcludeFoldersInput].forEach(function(input) {
     input.addEventListener('input', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
   // The Memory Bank folder input shares the same dirty/feedback handling as
@@ -439,6 +442,7 @@ export function buildSettingsScript(): string {
         copilotEnabled: copilotEnabledInput.checked,
         localFolder: localFolderInput.value.trim(),
         excludePatterns: excludePatternsInput.value,
+        compileExcludeFolders: compileExcludeFoldersInput.value,
         dcoSignoff: dcoSignoffInput.checked,
         autoSyncEnabled: autoSyncEnabledInput ? autoSyncEnabledInput.checked : false,
         syncTranscripts: syncTranscriptsInput ? syncTranscriptsInput.checked : false,
@@ -550,6 +554,7 @@ export function buildSettingsScript(): string {
         copilotEnabledInput.checked = msg.settings.copilotEnabled;
         localFolderInput.value = msg.settings.localFolder || '';
         excludePatternsInput.value = msg.settings.excludePatterns;
+        compileExcludeFoldersInput.value = msg.settings.compileExcludeFolders;
         dcoSignoffInput.checked = !!msg.settings.dcoSignoff;
         if (autoSyncEnabledInput) autoSyncEnabledInput.checked = !!msg.settings.autoSyncEnabled;
         if (syncTranscriptsInput) syncTranscriptsInput.checked = !!msg.settings.syncTranscripts;

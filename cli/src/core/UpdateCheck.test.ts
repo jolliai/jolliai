@@ -12,7 +12,47 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// `getGlobalConfigDir` decides the *default* on-disk locations
+// (`update-check.json` / `update-check.refresh`). Pin it to a per-test temp dir
+// so the no-`file` code paths (`getCacheFile` / `getRefreshSentinelFile`) can be
+// exercised without ever touching the real `~/.jolli/jollimemory/`.
+let globalConfigDir = "";
+vi.mock("./SessionTracker.js", () => ({
+	getGlobalConfigDir: () => globalConfigDir,
+}));
+
+// `defaultNpmView` (the fallback when no `runNpmView` is injected) delegates to
+// `runNpmCommand`. Mock it so the default-runner branch never spawns real npm.
+vi.mock("../util/Subprocess.js", () => ({
+	runNpmCommand: vi.fn(async () => "9.9.9"),
+	spawnHidden: vi.fn(),
+}));
+
+// fs/promises is delegated to the real implementation except for `unlink`, which
+// a test can force to reject. That covers the two best-effort `.catch(() =>
+// undefined)` cleanup callbacks (on `unlink(claim)` and `unlink(tmp)`), whose
+// only trigger is the cleanup unlink itself failing — a double-failure path with
+// no deterministic on-disk reproduction.
+let failUnlink = false;
+let failStat = false;
+let failRename = false;
+vi.mock("node:fs/promises", async (importActual) => {
+	const actual = await importActual<typeof import("node:fs/promises")>();
+	return {
+		...actual,
+		default: actual,
+		unlink: (...args: Parameters<typeof actual.unlink>) =>
+			failUnlink ? Promise.reject(new Error("forced unlink failure")) : actual.unlink(...args),
+		stat: (...args: Parameters<typeof actual.stat>) =>
+			failStat ? Promise.reject(new Error("forced stat failure")) : actual.stat(...args),
+		rename: (...args: Parameters<typeof actual.rename>) =>
+			failRename ? Promise.reject(new Error("forced rename failure")) : actual.rename(...args),
+	};
+});
+
+import { runNpmCommand } from "../util/Subprocess.js";
 import {
 	claimRefreshSpawn,
 	computeCliUpdateNotice,
@@ -25,6 +65,8 @@ import {
 	type UpdateCache,
 } from "./UpdateCheck.js";
 
+const mockRunNpmCommand = vi.mocked(runNpmCommand);
+
 describe("UpdateCheck", () => {
 	let tempDir: string;
 	let cacheFile: string;
@@ -32,6 +74,12 @@ describe("UpdateCheck", () => {
 	beforeEach(async () => {
 		tempDir = await mkdtemp(join(tmpdir(), "update-check-test-"));
 		cacheFile = join(tempDir, "update-check.json");
+		globalConfigDir = tempDir;
+		failUnlink = false;
+		failStat = false;
+		failRename = false;
+		mockRunNpmCommand.mockClear();
+		mockRunNpmCommand.mockResolvedValue("9.9.9");
 	});
 
 	afterEach(async () => {
@@ -51,6 +99,34 @@ describe("UpdateCheck", () => {
 		it("returns null when the parsed shape is invalid", async () => {
 			await writeFile(cacheFile, JSON.stringify({ checkedAt: 123, packages: "nope" }), "utf-8");
 			expect(await readUpdateCache(cacheFile)).toBeNull();
+		});
+
+		it("returns null when the top-level JSON is not a plain object", async () => {
+			// A bare array/number parses fine but is not the cache shape.
+			await writeFile(cacheFile, JSON.stringify([1, 2, 3]), "utf-8");
+			expect(await readUpdateCache(cacheFile)).toBeNull();
+		});
+
+		it("returns null when packages is not a plain object", async () => {
+			// Valid checkedAt + ttlHours, but packages is the wrong type — reaches the
+			// dedicated packages-container guard rather than bailing earlier.
+			await writeFile(
+				cacheFile,
+				JSON.stringify({ checkedAt: "2026-06-04T09:00:00.000Z", ttlHours: 24, packages: "nope" }),
+				"utf-8",
+			);
+			expect(await readUpdateCache(cacheFile)).toBeNull();
+		});
+
+		it("reads from the default cache file when no path is given", async () => {
+			// getGlobalConfigDir is mocked to tempDir, so getCacheFile() resolves there.
+			const cache: UpdateCache = {
+				checkedAt: "2026-06-04T09:00:00.000Z",
+				ttlHours: 24,
+				packages: { "@jolli.ai/cli": { latest: "1.5.0" } },
+			};
+			await writeFile(join(tempDir, "update-check.json"), JSON.stringify(cache), "utf-8");
+			expect(await readUpdateCache()).toEqual(cache);
 		});
 
 		it("returns null when a package entry has a non-string latest", async () => {
@@ -161,6 +237,52 @@ describe("UpdateCheck", () => {
 			expect(await claimRefreshSpawn({ file, now: Date.now() + REFRESH_DEBOUNCE_MS + 10_000 })).toBe(true);
 		});
 
+		it("uses the default sentinel path when none is given", async () => {
+			// getGlobalConfigDir is mocked to tempDir, so getRefreshSentinelFile()
+			// resolves to <tempDir>/update-check.refresh.
+			expect(await claimRefreshSpawn()).toBe(true);
+			expect((await readFile(join(tempDir, "update-check.refresh"), "utf-8")).length).toBeGreaterThan(0);
+		});
+
+		it("takes over a stale sentinel and rewrites the stamp", async () => {
+			// First claim writes the sentinel; a far-future `now` makes it stale, so the
+			// second claim renames it away, succeeds, rewrites, and unlinks the claim.
+			const file = join(tempDir, "refresh-sentinel");
+			expect(await claimRefreshSpawn({ file })).toBe(true);
+			const future = Date.now() + REFRESH_DEBOUNCE_MS + 10_000;
+			expect(await claimRefreshSpawn({ file, now: future })).toBe(true);
+			// The rewritten stamp reflects the takeover time, and no `.claim-*` leftover remains.
+			expect(await readFile(file, "utf-8")).toBe(new Date(future).toISOString());
+		});
+
+		it("still claims when cleaning up the takeover claim file fails", async () => {
+			// Same stale-takeover path, but the best-effort `unlink(claim)` rejects.
+			// The failure is swallowed (`.catch(() => undefined)`) so the claim still
+			// succeeds.
+			const file = join(tempDir, "refresh-sentinel");
+			expect(await claimRefreshSpawn({ file })).toBe(true);
+			failUnlink = true;
+			expect(await claimRefreshSpawn({ file, now: Date.now() + REFRESH_DEBOUNCE_MS + 10_000 })).toBe(true);
+		});
+
+		it("backs off when the sentinel is removed between the EEXIST and the stat", async () => {
+			// Concurrent-removal race: open() sees EEXIST, but stat() then fails because
+			// another process deleted the sentinel — back off (return false).
+			const file = join(tempDir, "refresh-sentinel");
+			expect(await claimRefreshSpawn({ file })).toBe(true);
+			failStat = true;
+			expect(await claimRefreshSpawn({ file })).toBe(false);
+		});
+
+		it("backs off when it loses the stale-sentinel takeover rename", async () => {
+			// Stale sentinel, debounce elapsed, but the rename to claim it fails because
+			// another process renamed it first — back off (return false).
+			const file = join(tempDir, "refresh-sentinel");
+			expect(await claimRefreshSpawn({ file })).toBe(true);
+			failRename = true;
+			expect(await claimRefreshSpawn({ file, now: Date.now() + REFRESH_DEBOUNCE_MS + 10_000 })).toBe(false);
+		});
+
 		it("allows the spawn (true) when the sentinel cannot be written", async () => {
 			// Parent is a file, so mkdir/writeFile fail — but a broken sentinel must
 			// never permanently suppress refreshing.
@@ -269,6 +391,23 @@ describe("UpdateCheck", () => {
 			expect(isCacheStale(cache, now + 12 * 3_600_000)).toBe(false);
 		});
 
+		it("falls back to the default npm runner and default cache file", async () => {
+			// No runNpmView and no file injected: refreshUpdateCache must use
+			// defaultNpmView (→ mocked runNpmCommand) and getCacheFile() (→ tempDir).
+			const cache = await refreshUpdateCache(["@jolli.ai/cli"]);
+			expect(mockRunNpmCommand).toHaveBeenCalledWith(["view", "@jolli.ai/cli", "version"], expect.any(Object));
+			expect(cache.packages["@jolli.ai/cli"]).toEqual({ latest: "9.9.9" });
+			// Persisted to the default path resolved via getGlobalConfigDir.
+			const onDisk = await readUpdateCache();
+			expect(onDisk?.packages["@jolli.ai/cli"].latest).toBe("9.9.9");
+		});
+
+		it("leaves a package unset when the default npm runner returns null", async () => {
+			mockRunNpmCommand.mockResolvedValue(null);
+			const cache = await refreshUpdateCache(["@jolli.ai/cli"], { file: cacheFile });
+			expect(cache.packages["@jolli.ai/cli"]).toBeUndefined();
+		});
+
 		it("tolerates a cache-write failure without throwing", async () => {
 			// Point the cache at a path whose parent is a file, so mkdir/writeFile fail.
 			const blocker = join(tempDir, "blocker");
@@ -278,6 +417,44 @@ describe("UpdateCheck", () => {
 				runNpmView: async () => "1.0.0",
 			});
 			// Still returns the computed cache even when persistence fails.
+			expect(cache.packages["@jolli.ai/cli"].latest).toBe("1.0.0");
+		});
+
+		it("cleans up the temp file when the atomic rename fails", async () => {
+			// Make the destination a non-empty directory: mkdir(dirname) and the
+			// per-pid temp write both succeed, but rename(tmp, file) fails (can't
+			// replace a non-empty dir), exercising the unlink-temp + rethrow branch.
+			const { mkdir } = await import("node:fs/promises");
+			const target = join(tempDir, "as-dir");
+			await mkdir(target, { recursive: true });
+			await writeFile(join(target, "child"), "x", "utf-8");
+
+			const cache = await refreshUpdateCache(["@jolli.ai/cli"], {
+				file: target,
+				runNpmView: async () => "1.0.0",
+			});
+			// Returns the computed cache; the rename failure is swallowed and the temp
+			// file is cleaned up (no `.tmp-*` leftover beside the directory).
+			expect(cache.packages["@jolli.ai/cli"].latest).toBe("1.0.0");
+			const { readdir } = await import("node:fs/promises");
+			const leftovers = (await readdir(tempDir)).filter((n) => n.includes(".tmp-"));
+			expect(leftovers).toEqual([]);
+		});
+
+		it("swallows a failed temp-file cleanup when the rename fails", async () => {
+			// Rename fails (destination is a non-empty dir) AND the best-effort
+			// unlink(tmp) cleanup also rejects: both failures are swallowed, the outer
+			// catch logs, and the computed cache is still returned.
+			const { mkdir } = await import("node:fs/promises");
+			const target = join(tempDir, "as-dir-2");
+			await mkdir(target, { recursive: true });
+			await writeFile(join(target, "child"), "x", "utf-8");
+
+			failUnlink = true;
+			const cache = await refreshUpdateCache(["@jolli.ai/cli"], {
+				file: target,
+				runNpmView: async () => "1.0.0",
+			});
 			expect(cache.packages["@jolli.ai/cli"].latest).toBe("1.0.0");
 		});
 	});

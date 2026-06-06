@@ -41,9 +41,10 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 
 import { DualWriteStorage } from "./DualWriteStorage.js";
 import { FolderStorage } from "./FolderStorage.js";
+import { MetadataManager } from "./MetadataManager.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { loadConfig } from "./SessionTracker.js";
-import { createStorage } from "./StorageFactory.js";
+import { createFolderStorageAtRoot, createStorage } from "./StorageFactory.js";
 
 const mockLoadConfig = vi.mocked(loadConfig);
 
@@ -116,5 +117,23 @@ describe("StorageFactory", () => {
 		expect((storage as unknown as Record<string, unknown>).type).toBe("dual-write");
 		// Verify that a warning was logged (our Logger writes to console.warn)
 		expect(warnSpy).toHaveBeenCalled();
+	});
+
+	it("createFolderStorageAtRoot builds a folder-only FolderStorage at the explicit kbRoot", async () => {
+		// Multi-repo compile sweep path: the target repo has no git working tree,
+		// so the kbRoot is passed in directly without going through
+		// extractRepoName / getRemoteUrl / resolveKBPath.
+		const kbResolver = await import("./KBPathResolver.js");
+
+		const storage = createFolderStorageAtRoot("/explicit/kb/root");
+
+		expect(FolderStorage).toHaveBeenCalledOnce();
+		expect((storage as unknown as Record<string, unknown>).type).toBe("folder");
+		// MetadataManager is constructed against the `<kbRoot>/.jolli` subfolder.
+		expect(MetadataManager).toHaveBeenCalledWith("/explicit/kb/root/.jolli");
+		// No git-derived resolution: the explicit-root path skips the resolver chain.
+		expect(kbResolver.extractRepoName).not.toHaveBeenCalled();
+		expect(kbResolver.getRemoteUrl).not.toHaveBeenCalled();
+		expect(kbResolver.resolveKBPath).not.toHaveBeenCalled();
 	});
 });

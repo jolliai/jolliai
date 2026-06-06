@@ -93,6 +93,33 @@ export const PROXY_FETCH_TIMEOUT_MS = 180_000;
  */
 export const DIRECT_FETCH_TIMEOUT_MS = 180_000;
 
+/**
+ * `max_tokens` above which a direct Anthropic call switches from non-streaming
+ * `messages.create` to `messages.stream` (see the call site for the SDK's
+ * "Streaming is strongly recommended" guard). Exported because callers tune
+ * `maxTokens` *relative to this value* to force one path or the other — most
+ * notably the ingest route call (`ROUTE_MAX_TOKENS`), which sits just above it
+ * on purpose. Keeping it a shared constant means changing the threshold can't
+ * silently flip a caller onto the other path's timeout behaviour.
+ */
+export const STREAMING_THRESHOLD_TOKENS = 16_384;
+
+/**
+ * Inactivity budget for the streaming direct path. Streaming is selected for
+ * responses that may legitimately exceed `DIRECT_FETCH_TIMEOUT_MS` (a 64K merge
+ * response can take many minutes), so a fixed wall-clock cap would kill valid
+ * large responses. Instead the stream is aborted only when NO stream event
+ * arrives within this window. Anthropic emits `ping` events throughout
+ * generation, so a healthy-but-slow stream keeps resetting the timer while a
+ * wedged / half-open socket (firewall blackhole, suspended cloud-edge, a
+ * silently-dropped `ANTHROPIC_BASE_URL` relay) produces nothing and trips it.
+ * This restores the fail-fast guarantee the non-streaming path has — a hung
+ * streaming call can no longer hold the QueueWorker lock (or a SyncEngine
+ * conflict resolve) indefinitely, the regression introduced when the streaming
+ * branch dropped its `AbortSignal`. Exported so a regression test can pin it.
+ */
+export const STREAM_IDLE_TIMEOUT_MS = 120_000;
+
 // `x-jolli-client` header value lives in `./ClientHeader.ts` so both this
 // module and `cli/src/sync/BackendClient.ts` share one source of truth.
 // Build-time `__JOLLI_CLIENT_KIND__` + `__PKG_VERSION__` resolution happens
@@ -284,23 +311,59 @@ async function callDirect(
 	const client = getOrCreateClient(apiKey);
 	const startTime = Date.now();
 
+	// Anthropic SDK refuses non-streaming `messages.create` when the request's
+	// estimated duration exceeds 10 minutes (sees `max_tokens` and the model's
+	// output speed and errors out with "Streaming is strongly recommended").
+	// Empirically the threshold lands around `max_tokens > ~20k` for the
+	// current generation; cross it via `messages.stream` instead so any caller
+	// (the merge path raised this to 64k) keeps working without a per-call
+	// switch. `finalMessage()` resolves to the same `Anthropic.Message` shape
+	// `messages.create` returns, so the downstream code is unchanged.
+	const useStreaming = maxTokens > STREAMING_THRESHOLD_TOKENS;
+
 	let response: Anthropic.Message;
 	try {
-		response = await client.messages.create(
-			{
-				model,
-				max_tokens: maxTokens,
-				temperature: 0,
-				messages: [{ role: "user", content: prompt }],
-			},
+		const body = {
+			model,
+			max_tokens: maxTokens,
+			temperature: 0,
+			messages: [{ role: "user" as const, content: prompt }],
+		};
+		if (useStreaming) {
+			// A fixed `AbortSignal.timeout` would kill legitimate large responses
+			// (streaming is selected *because* the call may exceed the non-streaming
+			// budget, e.g. a 64K merge response). Guard with an INACTIVITY watchdog
+			// instead: abort only when no stream event arrives within
+			// STREAM_IDLE_TIMEOUT_MS. Anthropic emits `ping` events throughout
+			// generation, so a healthy-but-slow stream keeps resetting the timer
+			// while a wedged socket produces nothing and is aborted — restoring the
+			// fail-fast guarantee without capping valid long responses.
+			const stream = client.messages.stream(body);
+			let idleTimer: ReturnType<typeof setTimeout> | undefined;
+			const armIdleWatchdog = (): void => {
+				clearTimeout(idleTimer);
+				idleTimer = setTimeout(() => stream.abort(), STREAM_IDLE_TIMEOUT_MS);
+				// Never let the watchdog keep a CLI process alive past its work.
+				idleTimer.unref?.();
+			};
+			armIdleWatchdog();
+			stream.on("streamEvent", armIdleWatchdog);
+			try {
+				response = await stream.finalMessage();
+			} finally {
+				clearTimeout(idleTimer);
+			}
+		} else {
 			// Hard cap on the in-flight HTTP request — see `DIRECT_FETCH_TIMEOUT_MS`.
 			// AbortSignal.timeout fires once after the given delay; the SDK
 			// surfaces it as an AbortError that the outer `catch` already
 			// logs with `cause`, so a wedged socket fails fast instead of
 			// holding the caller (e.g. `ConflictResolver.resolveAll`)
 			// indefinitely.
-			{ signal: AbortSignal.timeout(DIRECT_FETCH_TIMEOUT_MS) },
-		);
+			response = await client.messages.create(body, {
+				signal: AbortSignal.timeout(DIRECT_FETCH_TIMEOUT_MS),
+			});
+		}
 	} catch (err) {
 		// Surface the effective baseURL so users can tell whether a 3rd-party relay
 		// (e.g. an ANTHROPIC_BASE_URL override) returned the error versus Anthropic itself.

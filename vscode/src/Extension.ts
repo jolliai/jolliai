@@ -85,6 +85,7 @@ import { FilesStore } from "./stores/FilesStore.js";
 import { MemoriesStore } from "./stores/MemoriesStore.js";
 import { PlansStore } from "./stores/PlansStore.js";
 import { StatusStore } from "./stores/StatusStore.js";
+import { registerCompileCommand } from "./CompileCommand.js";
 import { activateSync } from "./sync/VsCodeSyncBootstrap.js";
 import { ExcludeFilterManager } from "./util/ExcludeFilterManager.js";
 import { formatShortRelativeDate } from "./util/FormatUtils.js";
@@ -947,6 +948,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			sidebarProvider,
 		),
 		branchChangeEmitter,
+		registerCompileCommand({ sidebarProvider }),
 	);
 
 	// Wire the post-sync UI refresh now that `kbFoldersService` + `sidebarProvider`

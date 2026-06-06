@@ -487,9 +487,10 @@ describe("Installer", () => {
 			// Override the mocks so they return the correct worktree-aware paths
 			const { getGitCommonDir, resolveGitHooksDir } = await import("../core/GitOps.js");
 			vi.mocked(getGitCommonDir).mockResolvedValueOnce(mainGitDir);
-			// install() calls resolveGitHooksDir 3× (post-commit, post-rewrite, prepare-commit-msg)
+			// install() calls resolveGitHooksDir 4× (post-commit, post-rewrite, prepare-commit-msg, post-merge)
 			const mainHooksDir = join(mainGitDir, "hooks");
 			vi.mocked(resolveGitHooksDir)
+				.mockResolvedValueOnce(mainHooksDir)
 				.mockResolvedValueOnce(mainHooksDir)
 				.mockResolvedValueOnce(mainHooksDir)
 				.mockResolvedValueOnce(mainHooksDir);
@@ -520,9 +521,10 @@ describe("Installer", () => {
 			const { getGitCommonDir, getProjectRootDir, resolveGitHooksDir } = await import("../core/GitOps.js");
 			vi.mocked(getGitCommonDir).mockResolvedValueOnce(gitDir);
 			vi.mocked(getProjectRootDir).mockResolvedValueOnce(tempDir);
-			// install() calls resolveGitHooksDir 3× (post-commit, post-rewrite, prepare-commit-msg)
+			// install() calls resolveGitHooksDir 4× (post-commit, post-rewrite, prepare-commit-msg, post-merge)
 			const gitHooksDir = join(gitDir, "hooks");
 			vi.mocked(resolveGitHooksDir)
+				.mockResolvedValueOnce(gitHooksDir)
 				.mockResolvedValueOnce(gitHooksDir)
 				.mockResolvedValueOnce(gitHooksDir)
 				.mockResolvedValueOnce(gitHooksDir);
@@ -1324,7 +1326,7 @@ describe("Installer", () => {
 			await rm(join(tempDir, ".git", "hooks", "post-rewrite"), { force: true });
 
 			const status = await getStatus(tempDir);
-			// gitHookInstalled requires ALL 3 git hooks
+			// gitHookInstalled requires ALL 4 git hooks
 			expect(status.gitHookInstalled).toBe(false);
 			expect(status.enabled).toBe(false);
 		});
@@ -1335,12 +1337,12 @@ describe("Installer", () => {
 			await rm(join(tempDir, ".git", "hooks", "prepare-commit-msg"), { force: true });
 
 			const status = await getStatus(tempDir);
-			// gitHookInstalled requires ALL 3 git hooks
+			// gitHookInstalled requires ALL 4 git hooks
 			expect(status.gitHookInstalled).toBe(false);
 			expect(status.enabled).toBe(false);
 		});
 
-		it("should report gitHookInstalled=true only when all 3 git hooks are installed", async () => {
+		it("should report gitHookInstalled=true only when all 4 git hooks are installed", async () => {
 			await install(tempDir);
 			const status = await getStatus(tempDir);
 			expect(status.gitHookInstalled).toBe(true);

@@ -9,6 +9,7 @@
 import { createLogger, errMsg } from "../Logger.js";
 import type { FileWrite, SummaryIndexEntry } from "../Types.js";
 import type { HealOptions, HealResult, StorageProvider } from "./StorageProvider.js";
+import type { TopicPage } from "./TopicKBTypes.js";
 
 const log = createLogger("DualWriteStorage");
 
@@ -31,6 +32,14 @@ export class DualWriteStorage implements StorageProvider {
 		const result = new Map<string, string | null>();
 		for (const path of paths) result.set(path, await this.primary.readFile(path));
 		return result;
+	}
+
+	async statFile(path: string): Promise<{ mtimeMs: number } | null> {
+		// spec 110 — forward stat to primary (matches readFile routing).
+		// Optional method: undefined on primary → undefined drift here (e.g.
+		// orphan primary lacks real mtime).
+		if (!this.primary.statFile) return null;
+		return this.primary.statFile(path);
 	}
 
 	// Primary writes first because it's the source of truth (orphan branch).
@@ -173,5 +182,16 @@ export class DualWriteStorage implements StorageProvider {
 		} catch (e) {
 			log.warn("Shadow ensure failed: %s", e instanceof Error ? e.message : String(e));
 		}
+	}
+
+	async renderTopicWiki(pages: ReadonlyArray<TopicPage>): Promise<void> {
+		await this.shadow.renderTopicWiki?.(pages);
+	}
+
+	// The visible wiki lives in the shadow (folder) layer, so the presence probe
+	// must consult the shadow — not the primary (orphan), which has no wiki.
+	// Matches the renderTopicWiki routing above.
+	isTopicWikiPresent(): boolean {
+		return this.shadow.isTopicWikiPresent?.() ?? false;
 	}
 }

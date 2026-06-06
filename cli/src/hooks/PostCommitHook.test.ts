@@ -96,6 +96,10 @@ vi.mock("../sync/SyncBootstrap.js", () => ({
 	deriveMemoryBankRoot: vi.fn((localFolder?: string) => localFolder ?? "/tmp/jolli-test-vault"),
 }));
 
+vi.mock("../core/IngestTrigger.js", () => ({
+	enqueueIngestOperation: vi.fn().mockResolvedValue(true),
+}));
+
 vi.mock("../core/TranscriptReader.js", () => ({
 	readTranscript: vi.fn(),
 	buildMultiSessionContext: vi.fn(),
@@ -291,6 +295,7 @@ import {
 	getProjectRootDir,
 	readFileFromBranch,
 } from "../core/GitOps.js";
+import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { acquireWorkerLock, releaseWorkerLock } from "../core/Locks.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
@@ -439,6 +444,14 @@ describe("PostCommitHook", () => {
 
 	// Note: rebase skip is now handled in postCommitEntry(), not runWorker().
 	// See PostRewriteHook.test.ts for rebase enqueue tests.
+
+	it("debounce-enqueues a post-commit ingest after processing a commit", async () => {
+		setupFullPipeline();
+
+		await runWorker("/test/project");
+
+		expect(enqueueIngestOperation).toHaveBeenCalledWith("/test/project", "post-commit");
+	});
 
 	it("should run the full pipeline successfully", async () => {
 		setupFullPipeline();

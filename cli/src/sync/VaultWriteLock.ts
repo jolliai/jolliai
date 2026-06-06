@@ -191,6 +191,49 @@ export async function acquireVaultWriteLock(
 }
 
 /**
+ * How often to bump the lock's mtime while a `withVaultWriteLock` body runs.
+ * Same cadence as QueueWorker / SyncEngine (60 s) vs the 5 min reclaim
+ * threshold, so a long LLM-bearing compile drain can't be reaped mid-flight.
+ */
+export const VAULT_WRITE_LOCK_REFRESH_INTERVAL_MS = 60_000;
+
+/**
+ * Acquire `vault-write.lock`, run `body` while holding it (heartbeating the
+ * mtime so the stale-reclaimer can't steal it during a long drain), then
+ * release — on success, throw, OR early return. The compile paths
+ * (`compileSingleRepo` / `compileAllRepos`) use this so they serialise against
+ * the QueueWorker and SyncEngine on the SAME canonical vault lock, instead of
+ * an ad-hoc lock the worker never sees.
+ *
+ * Returns `{ ran: true, value }` when the lock was acquired and the body ran,
+ * or `{ ran: false }` when the lock was busy (fail-fast miss / wait timeout).
+ * Re-throws whatever `body` throws after releasing the lock.
+ */
+export async function withVaultWriteLock<T>(
+	vaultRoot: string,
+	mode: VaultWriteLockMode,
+	body: () => Promise<T>,
+): Promise<{ ran: true; value: T } | { ran: false }> {
+	const handle = await acquireVaultWriteLock(vaultRoot, mode);
+	if (handle === null) return { ran: false };
+
+	/* v8 ignore start -- the timer lambda only fires on a real 60 s tick; unit tests finish in ms and never observe it. */
+	const refreshTimer = setInterval(() => {
+		void handle.refresh();
+	}, VAULT_WRITE_LOCK_REFRESH_INTERVAL_MS);
+	// Don't let the heartbeat keep a CLI process alive past its real work.
+	refreshTimer.unref?.();
+	/* v8 ignore stop */
+
+	try {
+		return { ran: true, value: await body() };
+	} finally {
+		clearInterval(refreshTimer);
+		await handle.release();
+	}
+}
+
+/**
  * Returns true when `vault-write.lock` exists and is younger than
  * `LOCK_TIMEOUT_MS`. Diagnostic-only — callers that want to act on the
  * outcome should `acquireVaultWriteLock` instead, since this read is

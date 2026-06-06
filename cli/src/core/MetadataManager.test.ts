@@ -255,6 +255,25 @@ describe("MetadataManager", () => {
 			expect(manager.unregisterBranches(["main", "main"])).toBe(1);
 			expect(manager.listBranchMappings()).toEqual([]);
 		});
+
+		describe("folderToBranch", () => {
+			it("reverse-maps a known folder segment to its branch name", () => {
+				const folder = manager.resolveFolderForBranch("feature/login"); // -> "feature-login"
+				expect(manager.folderToBranch(folder)).toBe("feature/login");
+			});
+
+			it("falls back to the folder segment when no mapping exists", () => {
+				expect(manager.folderToBranch("unmapped-folder")).toBe("unmapped-folder");
+			});
+
+			it("falls back to the folder segment when branches.json is unreadable", () => {
+				const boom = vi.spyOn(manager, "listBranchMappings").mockImplementation(() => {
+					throw new Error("branches.json corrupt");
+				});
+				expect(manager.folderToBranch("main")).toBe("main");
+				boom.mockRestore();
+			});
+		});
 	});
 
 	describe("listIndexHeads", () => {

@@ -28,17 +28,14 @@ import {
 } from "../../cli/src/core/KBRepoDiscoverer.js";
 import type { ManifestEntry } from "../../cli/src/core/KBTypes.js";
 import { MetadataManager } from "../../cli/src/core/MetadataManager.js";
-import { OrphanBranchStorage } from "../../cli/src/core/OrphanBranchStorage.js";
 import { normalizePathForCompare, toForwardSlash } from "../../cli/src/core/PathUtils.js";
+import { createReadStorage as resolveReadStorage } from "../../cli/src/core/ReadStorageResolver.js";
 import {
 	loadConfig,
 	savePluginSource,
 	saveSquashPending,
 } from "../../cli/src/core/SessionTracker.js";
-import {
-	createFolderStorage,
-	createStorage,
-} from "../../cli/src/core/StorageFactory.js";
+import { createStorage } from "../../cli/src/core/StorageFactory.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
 import {
 	generateCommitMessage,
@@ -305,81 +302,11 @@ export class JolliMemoryBridge {
 	}
 
 	private async createReadStorage(): Promise<StorageProvider> {
-		// `loadConfig` (SessionTracker.loadConfigFromDir) swallows all
-		// errors internally and resolves to `{}` on a missing/corrupt
-		// file — it never rejects. So no try/catch here. Surfacing a
-		// corrupt config to the user is a separate concern (would mean
-		// changing SessionTracker to propagate parse errors).
-		const config = (await loadConfig()) as Record<string, unknown>;
-		const mode = (config.storageMode as string | undefined) ?? "dual-write";
-		// Mode dispatch mirrors `StorageFactory.createStorage`'s switch so a
-		// config typo (e.g. `duallwrite`) doesn't land write on orphan and
-		// read on folder — both sides would refuse to read each other's
-		// data and the only signal would be a baffled user. Unknown modes
-		// fall back to orphan on both sides; the legitimate folder-mode
-		// reads still flow through the explicit "folder" case.
-		switch (mode) {
-			case "orphan":
-				return new OrphanBranchStorage(this.cwd);
-			case "folder":
-				return createFolderStorage(this.cwd, config.localFolder as string | undefined);
-			case "dual-write": {
-				const folder = createFolderStorage(this.cwd, config.localFolder as string | undefined);
-				if ((await folder.readFile("index.json")) === null) {
-					// Folder has no index yet. Three legitimate paths land here:
-					//   1. Fresh install before MigrationEngine has finished
-					//      copying orphan → folder.
-					//   2. User wiped `<localFolder>/<repo>/.jolli/` while the
-					//      orphan branch on the workspace repo still holds data.
-					//   3. Truly empty repo (no commits with summaries yet) —
-					//      orphan is empty too, so the fallback returns empty
-					//      as well, indistinguishable from reading folder.
-					// In cases (1) and (2) the orphan branch is the only source
-					// of truth that still has the user's data; reading the folder
-					// would render "no memories" while orphan is intact. Fall
-					// back to orphan so the panel shows real data and the user
-					// gets a chance to notice and re-run migration.
-					//
-					// The fallback is also why `refreshMemories` calls
-					// `reloadReadStorage()`: once the user reruns migration or
-					// the folder is repopulated via iCloud/peer sync, the next
-					// manual refresh must re-probe rather than serve a cached
-					// orphan-only instance forever.
-					log.warn(
-						"bridge",
-						"createReadStorage: folder lacks index.json — falling back to orphan branch (migration incomplete, or folder wiped)",
-					);
-					return new OrphanBranchStorage(this.cwd);
-				}
-				// `DualWriteStorage.writeFiles` marks the folder dirty
-				// whenever a shadow write fails (best-effort shadow path
-				// keeps the orphan-primary write atomic). A dirty folder
-				// means its index.json / payloads have diverged from the
-				// authoritative orphan branch: stale entries, missing new
-				// rows, or both. Routing reads through the folder in that
-				// state surfaces silently-wrong memories while the orphan
-				// copy is intact. Same fallback path as the no-index case
-				// — trust orphan whenever the folder isn't a complete,
-				// current picture. The dirty marker is cleared by the
-				// next successful `DualWriteStorage.writeFiles`, after
-				// which `reloadReadStorage()` (settings-save, refresh)
-				// will re-probe and pick FolderStorage again.
-				if (folder.isDirty?.()) {
-					log.warn(
-						"bridge",
-						"createReadStorage: folder shadow is dirty — falling back to orphan branch (last shadow write failed)",
-					);
-					return new OrphanBranchStorage(this.cwd);
-				}
-				return folder;
-			}
-			default:
-				log.warn(
-					"bridge",
-					`createReadStorage: unknown storageMode=${mode} — defaulting to orphan branch`,
-				);
-				return new OrphanBranchStorage(this.cwd);
-		}
+		// Resolution moved to `cli/src/core/ReadStorageResolver.ts` so the
+		// CLI compile pipeline (spec 110) can pick the same backing as the
+		// VSCode UI. The fallback rules (`folder` index missing / shadow
+		// dirty → orphan) live in that module's docstring.
+		return resolveReadStorage(this.cwd);
 	}
 
 	/**

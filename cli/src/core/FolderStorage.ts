@@ -12,16 +12,24 @@
  * 4. Updates manifest to track the AI-generated file
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { rmdir } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { createLogger, errMsg } from "../Logger.js";
 import { safeAtomicWriteSync } from "../sync/VaultSymlinkGuard.js";
 import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "../Types.js";
+import type { ManifestEntry } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { toForwardSlash } from "./PathUtils.js";
 import type { HealOptions, HealResult, StorageProvider } from "./StorageProvider.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
+import type { TopicPage } from "./TopicKBTypes.js";
+import {
+	renderTopicImpl,
+	renderTopicKBIndex,
+	topicPageToCompiledTopic,
+	type WikiRenderContext,
+} from "./WikiMarkdownBuilder.js";
 
 const log = createLogger("FolderStorage");
 
@@ -51,11 +59,31 @@ export class FolderStorage implements StorageProvider {
 		return dirname(this.rootPath);
 	}
 
+	/**
+	 * The per-repo folder root (`<localFolder>/<repo>/`). Lets compile resolve
+	 * the folder from the active storage instead of re-deriving it from a git cwd
+	 * (multi-repo sweep targets have no git working tree).
+	 */
+	get kbRoot(): string {
+		return this.rootPath;
+	}
+
 	async readFile(path: string): Promise<string | null> {
 		const file = join(this.rootPath, ".jolli", path);
 		if (!existsSync(file)) return null;
 		try {
 			return readFileSync(file, "utf-8");
+		} catch {
+			return null;
+		}
+	}
+
+	async statFile(path: string): Promise<{ mtimeMs: number } | null> {
+		const file = join(this.rootPath, ".jolli", path);
+		try {
+			const st = statSync(file);
+			if (!st.isFile()) return null;
+			return { mtimeMs: st.mtimeMs };
 		} catch {
 			return null;
 		}
@@ -821,6 +849,7 @@ export class FolderStorage implements StorageProvider {
 			fileId: `plan:${slug}`,
 			type: "plan",
 			fingerprint,
+			updatedAt: new Date().toISOString(),
 			// Persist branch so the revert command can route the regenerate
 			// back to the correct branchFolder. Without this, Extension.ts
 			// falls back to "main" for any plan written from a feature branch
@@ -901,6 +930,7 @@ export class FolderStorage implements StorageProvider {
 			// See generatePlanMarkdown for the source-branch rationale.
 			source: branch ? { branch } : {},
 			title: this.extractTitle(content) ?? id,
+			updatedAt: new Date().toISOString(),
 		});
 
 		log.info("Note markdown generated: %s", relativePath);
@@ -983,6 +1013,125 @@ export class FolderStorage implements StorageProvider {
 				result.push(toForwardSlash(relative(baseDir, fullPath)));
 			}
 		}
+	}
+
+	/**
+	 * SP3 — render the visible wiki from topic-KB pages. Full rebuild (wipe + rewrite).
+	 *
+	 * Best-effort relative to the hidden JSON source of truth (`topics/*.json`):
+	 * the manifest+disk wipe happens before the rewrite, so a crash mid-render can
+	 * leave `_wiki/` empty. That is recoverable — the next ingest re-renders from
+	 * the canonical topic pages. The `_wiki/` layer is generated, never a source of truth.
+	 */
+	async renderTopicWiki(pages: ReadonlyArray<TopicPage>): Promise<void> {
+		const wikiDir = join(this.rootPath, "_wiki");
+		this.wipeWikiArtifacts(wikiDir);
+		const ctx = this.buildWikiRenderContext();
+		mkdirSync(wikiDir, { recursive: true });
+		const compiled: ReturnType<typeof topicPageToCompiledTopic>[] = [];
+		for (const page of pages) {
+			try {
+				const topic = topicPageToCompiledTopic(page);
+				compiled.push(topic);
+				const relPath = `_wiki/topic--${topic.stableSlug}.md`;
+				const md = renderTopicImpl(topic, page.relatedBranches, page.lastUpdatedAt, ctx);
+				this.atomicWrite(join(this.rootPath, relPath), md);
+				this.metadataManager.updateManifest({
+					path: relPath,
+					fileId: `wiki-topic-${topic.stableSlug}`,
+					type: "wiki",
+					fingerprint: MetadataManager.sha256(md),
+					source: { generatedAt: page.lastUpdatedAt },
+					title: topic.title,
+				});
+			} catch (e) {
+				log.warn("renderTopicWiki: failed to render topic %s: %s", page.stableSlug, errMsg(e));
+			}
+		}
+		try {
+			const indexMd = renderTopicKBIndex(compiled, ctx);
+			const indexRel = "_wiki/_index.md";
+			this.atomicWrite(join(this.rootPath, indexRel), indexMd);
+			this.metadataManager.updateManifest({
+				path: indexRel,
+				fileId: "wiki-index",
+				type: "wiki",
+				fingerprint: MetadataManager.sha256(indexMd),
+				source: { generatedAt: new Date().toISOString() },
+				title: `${ctx.repoName} Knowledge Wiki`,
+			});
+		} catch (e) {
+			log.warn("renderTopicWiki: failed to render index: %s", errMsg(e));
+		}
+		log.info("Topic-KB wiki regenerated: %d topics under %s", pages.length, wikiDir);
+	}
+
+	/**
+	 * `_wiki/_index.md` is written on every successful render, so its presence is
+	 * the cheap proxy for "the visible wiki exists". Lets the post-commit ingest
+	 * re-render a user-deleted `_wiki/` even when no new sources were ingested.
+	 */
+	isTopicWikiPresent(): boolean {
+		return existsSync(join(this.rootPath, "_wiki", "_index.md"));
+	}
+
+	/**
+	 * Wipes every `.md` under `<rootPath>/_wiki/` and unregisters all manifest
+	 * rows of `type: "wiki"`. Called as the first step of every wiki rebuild
+	 * (per spec 110 Decision 3: merge is source of truth, no stale residue).
+	 */
+	private wipeWikiArtifacts(wikiDir: string): void {
+		// Manifest unregister first — even if the disk wipe fails, the next
+		// scan will treat orphan `_wiki/*.md` as user files (recoverable),
+		// not as ghost generated entries.
+		this.metadataManager.unregisterFilesByType("wiki");
+
+		if (!existsSync(wikiDir)) return;
+		try {
+			for (const entry of readdirSync(wikiDir)) {
+				if (!entry.endsWith(".md")) continue;
+				try {
+					unlinkSync(join(wikiDir, entry));
+				} catch (e) {
+					log.warn("FolderStorage.wipeWikiArtifacts: failed to unlink %s: %s", entry, errMsg(e));
+				}
+			}
+		} catch (e) {
+			log.warn("FolderStorage.wipeWikiArtifacts: failed to list %s: %s", wikiDir, errMsg(e));
+		}
+	}
+
+	/**
+	 * Builds the {@link WikiRenderContext} used by {@link WikiMarkdownBuilder}.
+	 * Lookups go through {@link MetadataManager} so renames / dirty manifest
+	 * rows reflect the same source the visible layer was written from.
+	 */
+	private buildWikiRenderContext(): WikiRenderContext {
+		const repoConfig = this.metadataManager.readConfig();
+		const branchMappings = this.metadataManager.listBranchMappings();
+		const branchByName = new Map(branchMappings.map((m) => [m.branch, m.folder]));
+
+		// Pre-index manifest by short commit hash so per-topic lookups don't
+		// rescan the manifest array each call.
+		const manifest = this.metadataManager.readManifest();
+		const byShortHash = new Map<string, ManifestEntry>();
+		for (const entry of manifest.files) {
+			if (entry.type === "commit" && entry.source.commitHash) {
+				byShortHash.set(entry.source.commitHash.substring(0, 8), entry);
+			}
+		}
+
+		return {
+			repoName: repoConfig.repoName ?? "Memory Bank",
+			resolveCommitVisiblePath: (hash8) => {
+				const entry = byShortHash.get(hash8);
+				if (!entry) return null;
+				// entry.path is relative to kbRoot; wiki links are relative to <kbRoot>/_wiki/.
+				return `../${entry.path}`;
+			},
+			resolveBranchFolder: (branch) => branchByName.get(branch) ?? null,
+			resolveCommitMessage: (hash8) => byShortHash.get(hash8)?.title ?? null,
+		};
 	}
 
 	private atomicWrite(targetPath: string, content: string): void {

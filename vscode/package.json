@@ -228,6 +228,12 @@
 				"title": "Sync Memory Bank Now",
 				"icon": "$(sync)",
 				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.compileNow",
+				"title": "Build Knowledge Wiki",
+				"icon": "$(database)",
+				"category": "Jolli Memory"
 			}
 		],
 		"menus": {

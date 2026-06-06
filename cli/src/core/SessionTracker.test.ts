@@ -41,7 +41,7 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import type {
-	GitOperation,
+	CommitGitOperation,
 	PlansRegistry,
 	Reference,
 	ReferenceEntry,
@@ -1507,7 +1507,7 @@ describe("SessionTracker", () => {
 	// ── git operation queue ────────────────────────────────────────────────
 
 	describe("git operation queue", () => {
-		const makeOp = (hash: string, type: GitOperation["type"] = "commit"): GitOperation => ({
+		const makeOp = (hash: string, type: CommitGitOperation["type"] = "commit"): CommitGitOperation => ({
 			type,
 			commitHash: hash,
 			createdAt: new Date().toISOString(),
@@ -1521,8 +1521,8 @@ describe("SessionTracker", () => {
 
 			const entries = await dequeueAllGitOperations(tempDir);
 			expect(entries).toHaveLength(2);
-			expect(entries[0].op.commitHash).toBe("aaa111");
-			expect(entries[1].op.commitHash).toBe("bbb222");
+			expect(entries[0].op).toMatchObject({ commitHash: "aaa111" });
+			expect(entries[1].op).toMatchObject({ commitHash: "bbb222" });
 		});
 
 		it("should return empty array when queue directory does not exist", async () => {
@@ -1554,7 +1554,7 @@ describe("SessionTracker", () => {
 			const entries = await dequeueAllGitOperations(tempDir);
 			// Should only return the valid entry, skip the malformed one
 			expect(entries).toHaveLength(1);
-			expect(entries[0].op.commitHash).toBe("ddd444");
+			expect(entries[0].op).toMatchObject({ commitHash: "ddd444" });
 		});
 
 		it("should prune stale entries older than 7 days", async () => {
@@ -1563,7 +1563,7 @@ describe("SessionTracker", () => {
 			await mkdir(queueDir, { recursive: true });
 
 			// Create a stale entry with createdAt 8 days ago
-			const staleOp: GitOperation = {
+			const staleOp: CommitGitOperation = {
 				type: "commit",
 				commitHash: "stale1",
 				createdAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(),
@@ -1575,7 +1575,7 @@ describe("SessionTracker", () => {
 
 			const entries = await dequeueAllGitOperations(tempDir);
 			expect(entries).toHaveLength(1);
-			expect(entries[0].op.commitHash).toBe("fresh1");
+			expect(entries[0].op).toMatchObject({ commitHash: "fresh1" });
 		});
 
 		it("should return true on successful enqueue", async () => {

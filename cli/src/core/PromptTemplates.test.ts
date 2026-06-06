@@ -36,6 +36,8 @@ describe("PromptTemplates", () => {
 			"recap",
 			"plan-progress",
 			"translate",
+			"route",
+			"reconcile",
 		]);
 	});
 
@@ -453,5 +455,29 @@ describe("PromptTemplates", () => {
 			expect(bucketIdx).toBeGreaterThan(rule5Idx);
 			expect(rule8Idx).toBeGreaterThan(bucketIdx);
 		});
+	});
+});
+
+describe("route/reconcile templates", () => {
+	it("registers the route action with topicIndex + sources placeholders", () => {
+		const t = TEMPLATES.get("route");
+		expect(t).toBeDefined();
+		expect(findUnfilledPlaceholders(t?.template ?? "", { topicIndex: "x", sources: "y" })).toEqual([]);
+	});
+
+	it("registers the reconcile action with its placeholders", () => {
+		const t = TEMPLATES.get("reconcile");
+		expect(t).toBeDefined();
+		expect(
+			findUnfilledPlaceholders(t?.template ?? "", { topicTitle: "x", currentPage: "y", sources: "z" }),
+		).toEqual([]);
+	});
+
+	it("fills route params", () => {
+		const t = TEMPLATES.get("route");
+		expect(t).toBeDefined();
+		const filled = fillTemplate(t?.template ?? "", { topicIndex: "IDX", sources: "SRC" });
+		expect(filled).toContain("IDX");
+		expect(filled).toContain("SRC");
 	});
 });

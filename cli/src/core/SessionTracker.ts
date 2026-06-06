@@ -12,25 +12,27 @@
  * Lock primitives (`worker.lock` / `orphan-write.lock`) live in `Locks.ts`.
  */
 
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
-import type {
-	CursorsRegistry,
-	GitOperation,
-	JolliMemoryConfig,
-	NoteEntry,
-	PlanEntry,
-	PlansRegistry,
-	Reference,
-	ReferenceEntry,
-	SessionInfo,
-	SessionsRegistry,
-	SourceId,
-	SquashPendingState,
-	TranscriptCursor,
+import {
+	type CursorsRegistry,
+	type GitOperation,
+	isIngestOperation,
+	type JolliMemoryConfig,
+	type NoteEntry,
+	type PlanEntry,
+	type PlansRegistry,
+	type Reference,
+	type ReferenceEntry,
+	type SessionInfo,
+	type SessionsRegistry,
+	type SourceId,
+	type SquashPendingState,
+	type TranscriptCursor,
 } from "../Types.js";
+import { atomicWriteFile as atomicWrite } from "./AtomicWrite.js";
 import { writeReferenceMarkdown } from "./references/ReferenceStore.js";
 
 const log = createLogger("SessionTracker");
@@ -556,24 +558,37 @@ const GIT_OP_QUEUE_DIR = "git-op-queue";
 const GIT_OP_QUEUE_STALE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
+ * Process-local monotonic sequence so two enqueues within the same
+ * millisecond cannot collide on filename. Old on-disk entries without the
+ * sequence segment still sort correctly because they were written under
+ * lower wall-clock ms; this segment only disambiguates within a single ms.
+ */
+let enqueueSeq = 0;
+
+/**
  * Enqueues a git operation for Worker processing.
  * Each entry is written as a separate file to avoid concurrent-write conflicts.
- * Filename format: `{timestamp}-{hash8}.json` ensures correct processing order.
+ * Filename format: `{timestamp}-{seq}-{tag}.json` ensures correct processing
+ * order even when multiple enqueues land in the same millisecond.
+ *
+ * Tag is `hash8` for commit operations and `ingest` for ingest operations —
+ * both fit the existing chronological-sort drain logic.
  */
 export async function enqueueGitOperation(op: GitOperation, cwd?: string): Promise<boolean> {
-	const hash8 = op.commitHash.substring(0, 8);
+	const tag = isIngestOperation(op) ? "ingest" : op.commitHash.substring(0, 8);
 	try {
 		const dir = await ensureJolliMemoryDir(cwd);
 		const queueDir = join(dir, GIT_OP_QUEUE_DIR);
 		await mkdir(queueDir, { recursive: true });
 
 		const timestamp = Date.now();
-		const fileName = `${timestamp}-${hash8}.json`;
+		const seq = (++enqueueSeq).toString().padStart(8, "0");
+		const fileName = `${timestamp}-${seq}-${tag}.json`;
 		await atomicWrite(join(queueDir, fileName), JSON.stringify(op, null, "\t"));
-		log.info("Enqueued git operation: type=%s hash=%s file=%s", op.type, hash8, fileName);
+		log.info("Enqueued queue operation: type=%s tag=%s file=%s", op.type, tag, fileName);
 		return true;
 	} catch (error: unknown) {
-		log.error("Failed to enqueue git operation type=%s hash=%s: %s", op.type, hash8, (error as Error).message);
+		log.error("Failed to enqueue queue operation type=%s tag=%s: %s", op.type, tag, (error as Error).message);
 		return false;
 	}
 }
@@ -757,30 +772,6 @@ async function pruneOrphanedCursors(dir: string, stalePaths: ReadonlyArray<strin
 		}
 		if (pruned > 0) {
 			await writeCursorsRegistry({ version: 1, cursors }, dir, filename);
-		}
-	}
-}
-
-/**
- * Writes content to a file atomically via tmpfile + rename.
- *
- * On Windows, rename() can fail with EPERM when the target file is held open
- * by another process (antivirus, file watchers, etc.). In that case, falls
- * back to a direct overwrite and cleans up the tmp file.
- */
-async function atomicWrite(filePath: string, content: string): Promise<void> {
-	const tmpPath = `${filePath}.tmp`;
-	await writeFile(tmpPath, content, "utf-8");
-	try {
-		await rename(tmpPath, filePath);
-	} catch (error: unknown) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "EPERM" || code === "EACCES") {
-			// Fallback: write directly and clean up tmp file
-			await writeFile(filePath, content, "utf-8");
-			await rm(tmpPath, { force: true });
-		} else {
-			throw error;
 		}
 	}
 }
