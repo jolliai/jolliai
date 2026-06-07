@@ -161,12 +161,21 @@ export async function ensureKBInitAndMigrated(cwd: string, localFolder: string |
 		const engine = new MigrationEngine(orphan, folder, mm);
 		const result = await engine.runMigration();
 		log.info("KB auto-migration: %s (%d/%d entries)", result.status, result.migratedEntries, result.totalEntries);
-	} else if (!migrationState.staleChildCleanup?.completedAt) {
+	} else {
+		// Already migrated: run the stale-child reconcile every sync (not gated
+		// on staleChildCleanup.completedAt — that stamp only retires the one-shot
+		// 0.99.2 head-regen inside runStaleChildCleanup). Sweeps orphaned visible
+		// .md for children hoisted on dormant branches the QueueWorker tail
+		// cleanup never revisits.
 		const folder = new FolderStorage(kbRoot, mm);
 		await folder.ensure();
 		const engine = new MigrationEngine(orphan, folder, mm);
 		const result = await engine.runStaleChildCleanup();
-		log.info("KB v3 stale-child cleanup: completedAt=%s", result.staleChildCleanup?.completedAt ?? "n/a");
+		log.info(
+			"KB stale-child reconcile: swept=%d completedAt=%s",
+			result.swept,
+			result.staleChildCleanup?.completedAt ?? "n/a",
+		);
 	}
 }
 

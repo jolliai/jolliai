@@ -541,9 +541,9 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).toContain("Update on Jolli");
 		});
 
-		it("shows push label 'Push to Jolli' when jolliDocUrl is undefined", () => {
+		it("shows push label 'Share in Jolli' when jolliDocUrl is undefined", () => {
 			const html = buildHtml(makeSummary({ jolliDocUrl: undefined }));
-			expect(html).toContain("Push to Jolli");
+			expect(html).toContain("Share in Jolli");
 		});
 
 		it("shows commit message tooltip in Jolli Memory row", () => {

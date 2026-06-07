@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.99.1
+
+- **"Push to Jolli" is now "Share in Jolli"** — the summary viewer's cloud-publish button is relabeled **Share in Jolli**. Behavior is unchanged; only the label was updated.
+
 ## 0.99.0
 
 ### Memory Bank

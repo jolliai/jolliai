@@ -815,6 +815,64 @@ describe("MigrationEngine", () => {
 			expect(visibleMdExists(kbRoot, "main", "stalechild-bbb")).toBe(false);
 		});
 
+		// `swept` is the caller's "did the visible layer change this run" signal:
+		// the VS Code activate path busts the storage cache + refreshes the
+		// sidebar ONLY when swept > 0. It must therefore count regenerated heads,
+		// not just deleted stale children — the one-shot 0.99.2 repair can
+		// regenerate a head while deleting zero stale children. With the old
+		// `swept = result.deleted` the repaired head stayed invisible until the
+		// next window reload.
+		it("counts regenerated heads in swept even when no stale child is deleted (first-run repair)", async () => {
+			const fs2 = makeFolderStorage();
+			// Head-only seed (no stale child) so the phase-2 sweep deletes nothing.
+			await fs2.writeFiles(
+				[
+					{
+						path: "summaries/aaa.json",
+						content: JSON.stringify({
+							version: 3,
+							commitHash: "aaa",
+							commitMessage: "head",
+							commitAuthor: "x",
+							commitDate: "2026-05-12T00:00:00Z",
+							branch: "main",
+							generatedAt: "2026-05-12T00:00:00Z",
+							topics: [],
+						}),
+					},
+					{
+						path: "index.json",
+						content: JSON.stringify({
+							version: 3,
+							entries: [
+								{
+									commitHash: "aaa",
+									parentCommitHash: null,
+									commitMessage: "head",
+									commitDate: "2026-05-12T00:00:00Z",
+									branch: "main",
+									generatedAt: "2026-05-12T00:00:00Z",
+								},
+							],
+						}),
+					},
+				],
+				"seed",
+			);
+			// Simulate 0.99.2 damage: the head .md was wrongly deleted.
+			const { unlinkSync } = require("node:fs");
+			unlinkSync(join(kbRoot, "main", "head-aaa.md"));
+
+			const mm = makeMetadataManager(kbRoot);
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			const state = await engine.runStaleChildCleanup();
+
+			// Head regenerated → visible layer changed, so swept must be > 0 even
+			// though zero stale children were deleted.
+			expect(visibleMdExists(kbRoot, "main", "head-aaa")).toBe(true);
+			expect(state.swept).toBe(1);
+		});
+
 		it("regenerates missing head .md from hidden JSON before deleting stale children (recovery from 0.99.2's inverted pass)", async () => {
 			const fs2 = makeFolderStorage();
 			await seedHoistChain(fs2);
@@ -834,18 +892,57 @@ describe("MigrationEngine", () => {
 			expect(visibleMdExists(kbRoot, "main", "stalechild-bbb")).toBe(false);
 		});
 
-		it("is a no-op when staleChildCleanup.completedAt is already set", async () => {
+		// The stale-child sweep is an idempotent reconciliation, NOT a one-shot
+		// repair: it MUST run on every invocation even after the gate is set, so
+		// children hoisted on a now-inactive / merged branch (never revisited by
+		// the QueueWorker tail cleanup) don't accumulate orphaned .md. Only the
+		// 0.99.2 head-regen phase is gated. The existing stamp is preserved
+		// verbatim — a recurring sweep must not bump the timestamp every activate.
+		it("still sweeps stale children when staleChildCleanup.completedAt is already set, preserving the stamp", async () => {
 			const fs2 = makeFolderStorage();
+			await seedHoistChain(fs2);
 			const mm = makeMetadataManager(kbRoot);
 			mm.saveMigrationState({
 				status: "completed",
-				totalEntries: 0,
-				migratedEntries: 0,
+				totalEntries: 2,
+				migratedEntries: 2,
 				staleChildCleanup: { completedAt: "2026-05-01T00:00:00Z" },
 			});
 			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
 			const state = await engine.runStaleChildCleanup();
+
+			// Sweep ran despite the gate: head kept, stale child deleted.
+			expect(visibleMdExists(kbRoot, "main", "head-aaa")).toBe(true);
+			expect(visibleMdExists(kbRoot, "main", "stalechild-bbb")).toBe(false);
+			// Gate preserved verbatim (not re-stamped on every activate).
 			expect(state.staleChildCleanup?.completedAt).toBe("2026-05-01T00:00:00Z");
+		});
+
+		// Phase 1 (0.99.2 head-regen) stays one-shot: once the stamp is set it is
+		// NOT re-run. A head .md missing for some later, non-0.99.2 reason is the
+		// concern of FolderStorage.healMissingVisibleMarkdown, not this pass — so
+		// with the gate set we sweep the stale child but do NOT regenerate the
+		// missing head. Pins the regenAlreadyDone=true skip branch.
+		it("does not re-run head regen once the gate is set (head stays missing, child still swept)", async () => {
+			const fs2 = makeFolderStorage();
+			await seedHoistChain(fs2);
+			const { unlinkSync } = require("node:fs");
+			unlinkSync(join(kbRoot, "main", "head-aaa.md"));
+
+			const mm = makeMetadataManager(kbRoot);
+			mm.saveMigrationState({
+				status: "completed",
+				totalEntries: 2,
+				migratedEntries: 2,
+				staleChildCleanup: { completedAt: "2026-05-01T00:00:00Z" },
+			});
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			await engine.runStaleChildCleanup();
+
+			// Regen gated → missing head NOT regenerated.
+			expect(visibleMdExists(kbRoot, "main", "head-aaa")).toBe(false);
+			// Sweep still ran → stale child cleaned.
+			expect(visibleMdExists(kbRoot, "main", "stalechild-bbb")).toBe(false);
 		});
 
 		// Coverage: the `lastMigratedHash` field on existing state must be
@@ -965,6 +1062,40 @@ describe("MigrationEngine", () => {
 			const state2 = await engine.runStaleChildCleanup();
 			expect(state2.staleChildCleanup?.completedAt).toBeTruthy();
 			expect(visibleMdExists(kbRoot, "main", "head-aaa")).toBe(true);
+		});
+
+		// Phase-2 failure decoupled from the stamp: a stale-child .md that can't
+		// be unlinked (EACCES/EBUSY) must NOT block the phase-1 stamp (which gates
+		// only the one-shot head-regen) and must report swept=0. The undeletable
+		// file leaves a ghost child, so the run also emits an independent WARN —
+		// this test pins that the failure no longer silently bumps the stamp.
+		it("preserves the stamp and reports swept=0 when a stale-child delete fails", async () => {
+			const fs2 = makeFolderStorage();
+			await seedHoistChain(fs2);
+
+			// Prior stamp set → phase 1 (head-regen) is skipped, isolating phase 2.
+			const mm = makeMetadataManager(kbRoot);
+			mm.saveMigrationState({
+				status: "completed",
+				totalEntries: 2,
+				migratedEntries: 2,
+				staleChildCleanup: { completedAt: "2026-05-12T10:00:00Z" },
+			});
+
+			// Force the stale-child unlink to throw a non-ENOENT error.
+			const origDelete = fs2.deleteVisibleMarkdown?.bind(fs2);
+			if (!origDelete) throw new Error("FolderStorage missing deleteVisibleMarkdown");
+			(fs2 as { deleteVisibleMarkdown?: typeof origDelete }).deleteVisibleMarkdown = async () => {
+				throw Object.assign(new Error("synthetic EACCES"), { code: "EACCES" });
+			};
+
+			const engine = new MigrationEngine(makeOrphanStorage(), fs2, mm);
+			const state = await engine.runStaleChildCleanup();
+
+			// Stamp preserved verbatim — phase-2 failure does not gate it.
+			expect(state.staleChildCleanup?.completedAt).toBe("2026-05-12T10:00:00Z");
+			// Nothing was actually deleted or regenerated → no sidebar refresh.
+			expect(state.swept).toBe(0);
 		});
 
 		// C2: an unreadable / unparseable folder index.json is the exact

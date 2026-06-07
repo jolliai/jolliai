@@ -47,10 +47,10 @@ export class DualWriteStorage implements StorageProvider {
 		}
 	}
 
-	async deleteVisibleMarkdown(entry: SummaryIndexEntry): Promise<void> {
-		if (!this.shadow.deleteVisibleMarkdown) return;
+	async deleteVisibleMarkdown(entry: SummaryIndexEntry): Promise<boolean> {
+		if (!this.shadow.deleteVisibleMarkdown) return false;
 		try {
-			await this.shadow.deleteVisibleMarkdown(entry);
+			return await this.shadow.deleteVisibleMarkdown(entry);
 		} catch (err) {
 			const hash8 = entry.commitHash.substring(0, 8);
 			log.warn(
@@ -60,6 +60,7 @@ export class DualWriteStorage implements StorageProvider {
 				errMsg(err),
 			);
 			this.shadow.markDirty?.(`deleteVisibleMarkdown ${entry.branch}/${hash8}`);
+			return false;
 		}
 	}
 

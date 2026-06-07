@@ -82,12 +82,12 @@ Click on any commit to open a full memory panel. It shows:
 Action buttons:
 
 * **Copy Markdown**: copies the full summary to clipboard
-* **Push to Jolli**: publishes the summary (and associated plans and notes) to your Jolli Space
+* **Share in Jolli**: publishes the summary (and associated plans and notes) to your Jolli Space
 * **Create & Update PR**: manages a GitHub PR for this commit
 
-### Push to Jolli Space
+### Share in Jolli Space
 
-Click **Push to Jolli** to publish the summary to your team's Jolli Space knowledge base. Jolli Space allows you to recall individual or shared memory for multiple devices or for different coding agent setups. Space team members can recall specific commits within the team.
+Click **Share in Jolli** to publish the summary to your team's Jolli Space knowledge base. Jolli Space allows you to recall individual or shared memory for multiple devices or for different coding agent setups. Space team members can recall specific commits within the team.
 
 Plans and notes (both Markdown files and text snippets) are each uploaded as separate articles first, so their URLs appear in the summary. The summary itself is published last.
 

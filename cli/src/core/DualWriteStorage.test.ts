@@ -378,8 +378,8 @@ describe("DualWriteStorage", () => {
 	});
 
 	describe("deleteVisibleMarkdown delegation", () => {
-		it("delegates to the folder-side provider", async () => {
-			const folderDelete = vi.fn().mockResolvedValue(undefined);
+		it("delegates to the folder-side provider and propagates its boolean result", async () => {
+			const folderDelete = vi.fn().mockResolvedValue(true);
 			const orphan = {
 				readFile: vi.fn(),
 				writeFiles: vi.fn(),
@@ -404,7 +404,9 @@ describe("DualWriteStorage", () => {
 				branch: "main",
 				generatedAt: "2026-05-12T00:00:00Z",
 			};
-			await dual.deleteVisibleMarkdown(entry);
+			// The folder side reports an actual unlink; the dual wrapper must
+			// forward that signal so the stale-child reconcile counts real removals.
+			await expect(dual.deleteVisibleMarkdown(entry)).resolves.toBe(true);
 			expect(folderDelete).toHaveBeenCalledWith(entry);
 		});
 
@@ -433,7 +435,7 @@ describe("DualWriteStorage", () => {
 					branch: "main",
 					generatedAt: "2026-05-12T00:00:00Z",
 				}),
-			).resolves.toBeUndefined();
+			).resolves.toBe(false);
 		});
 
 		it("marks dirty when the folder side throws", async () => {

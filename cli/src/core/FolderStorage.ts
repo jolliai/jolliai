@@ -158,10 +158,10 @@ export class FolderStorage implements StorageProvider {
 	 *
 	 * See StorageProvider.deleteVisibleMarkdown for the contract.
 	 */
-	async deleteVisibleMarkdown(entry: SummaryIndexEntry): Promise<void> {
+	async deleteVisibleMarkdown(entry: SummaryIndexEntry): Promise<boolean> {
 		const slug = FolderStorage.slugify(entry.commitMessage);
 		const hash8 = entry.commitHash.substring(0, 8);
-		await this.deleteVisibleArtifact(entry.commitHash, entry.branch, `${slug}-${hash8}.md`);
+		return this.deleteVisibleArtifact(entry.commitHash, entry.branch, `${slug}-${hash8}.md`);
 	}
 
 	/**
@@ -240,7 +240,7 @@ export class FolderStorage implements StorageProvider {
 	 * already gone — keeping a manifest entry for a deleted file would let
 	 * future scans re-trip on a ghost path).
 	 */
-	private async deleteVisibleArtifact(fileId: string, branch: string, fallbackFileName: string): Promise<void> {
+	private async deleteVisibleArtifact(fileId: string, branch: string, fallbackFileName: string): Promise<boolean> {
 		const manifestEntry = this.metadataManager.findById(fileId);
 		const branchFolder = this.metadataManager.resolveFolderForBranch(branch);
 		const relativePath = manifestEntry?.path ?? `${branchFolder}/${fallbackFileName}`;
@@ -248,24 +248,25 @@ export class FolderStorage implements StorageProvider {
 
 		if (!existsSync(absPath)) {
 			if (manifestEntry) this.metadataManager.removeFromManifest(fileId);
-			return;
+			return false;
 		}
 
 		if (manifestEntry?.fingerprint && this.isUserEditedOnDisk(absPath, manifestEntry.fingerprint)) {
 			log.warn("Skipping cleanup of %s — file modified since manifest record (likely hand-edited)", relativePath);
-			return;
+			return false;
 		}
 
 		try {
 			unlinkSync(absPath);
 			if (manifestEntry) this.metadataManager.removeFromManifest(fileId);
 			log.info("Deleted visible MD: %s", relativePath);
+			return true;
 			/* v8 ignore start -- TOCTOU defense: a concurrent writer removes the file between existsSync and unlinkSync. Requires multi-process scheduling to reproduce; the ENOENT-vs-rethrow split is asserted at code-review level. */
 		} catch (err) {
 			const code = (err as NodeJS.ErrnoException).code;
 			if (code === "ENOENT") {
 				if (manifestEntry) this.metadataManager.removeFromManifest(fileId);
-				return;
+				return false;
 			}
 			throw err;
 		}

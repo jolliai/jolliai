@@ -138,7 +138,10 @@ beforeEach(() => {
 	mockRunMigration.mockReset();
 	mockRunMigration.mockResolvedValue({ status: "completed", migratedEntries: 0, totalEntries: 0 });
 	mockRunStaleChildCleanup.mockReset();
-	mockRunStaleChildCleanup.mockResolvedValue({ staleChildCleanup: { completedAt: "2026-05-22T00:00:00Z" } });
+	mockRunStaleChildCleanup.mockResolvedValue({
+		staleChildCleanup: { completedAt: "2026-05-22T00:00:00Z" },
+		swept: 0,
+	});
 	mockResolveKBPath.mockClear();
 });
 
@@ -301,7 +304,11 @@ describe("registerSyncCommand", () => {
 			expect(mockRunStaleChildCleanup).not.toHaveBeenCalled();
 		});
 
-		it("skips both passes when migration AND cleanup already done", async () => {
+		// The stale-child reconcile is recurring, not one-shot: an already-set
+		// completedAt stamp must NOT skip it. The stamp only retires the inner
+		// 0.99.2 head-regen — the sweep still runs so children hoisted on dormant
+		// branches get their orphaned visible .md cleaned on every sync.
+		it("still runs stale-child reconcile when completedAt is already set (does not migrate)", async () => {
 			mockLoadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x" });
 			mockOrphanExists.mockResolvedValue(true);
 			mockReadMigrationState.mockReturnValue({
@@ -312,7 +319,7 @@ describe("registerSyncCommand", () => {
 			mockBuildSyncEngine.mockResolvedValue({ runRound });
 			await runCommand([]);
 			expect(mockRunMigration).not.toHaveBeenCalled();
-			expect(mockRunStaleChildCleanup).not.toHaveBeenCalled();
+			expect(mockRunStaleChildCleanup).toHaveBeenCalled();
 		});
 
 		it("warns but continues when migration throws — the round still tries to sync", async () => {

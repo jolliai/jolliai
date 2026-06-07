@@ -37,6 +37,7 @@ function makeStorage(opts: { withPrune?: boolean; pruneThrows?: boolean } = {}):
 		ensure: vi.fn(),
 		deleteVisibleMarkdown: async (entry) => {
 			deletions.push(entry);
+			return true;
 		},
 		deletions,
 		pruneCalls,
@@ -175,6 +176,41 @@ describe("StaleChildMarkdownCleanup", () => {
 			} satisfies StorageProvider;
 			const result = await cleanupAllBranchesStaleChildMarkdown("/cwd", storage);
 			expect(result.deleted).toBe(0);
+		});
+
+		it("counts only entries whose .md was actually removed (returns true), not already-absent ones", async () => {
+			// Steady state under v4 Hoist: hoisted-child index entries persist in
+			// index.json forever, but their visible .md were already swept by a
+			// prior pass. `deleteVisibleMarkdown` returns false for an already-gone
+			// file. `deleted` must reflect real removals, not entries visited —
+			// otherwise the every-activate reconcile reports swept>0 on every
+			// window reload and collapses the user's expanded folder tree.
+			(getIndexEntryMap as ReturnType<typeof vi.fn>).mockResolvedValue(
+				new Map<string, SummaryIndexEntry>([
+					["a", e("a", "main", null)], // head — never deleted
+					["b", e("b", "main", "a")], // stale child, .md present → true
+					["c", e("c", "main", "b")], // stale child, .md already gone → false
+				]),
+			);
+			const present = new Set(["b"]);
+			const visited: string[] = [];
+			const storage: StorageProvider = {
+				readFile: vi.fn(),
+				writeFiles: vi.fn(),
+				listFiles: vi.fn(),
+				exists: vi.fn(),
+				ensure: vi.fn(),
+				deleteVisibleMarkdown: async (entry) => {
+					visited.push(entry.commitHash);
+					return present.has(entry.commitHash);
+				},
+			};
+			const result = await cleanupAllBranchesStaleChildMarkdown("/cwd", storage);
+			// Both stale children were visited...
+			expect(visited.sort()).toEqual(["b", "c"]);
+			// ...but only the one whose file actually existed counts as deleted.
+			expect(result.deleted).toBe(1);
+			expect(result.failed).toBe(0);
 		});
 	});
 
@@ -378,6 +414,7 @@ describe("StaleChildMarkdownCleanup", () => {
 						throw new Error("failed");
 					}
 					deletions.push(entry);
+					return true;
 				},
 				deletions,
 			};
@@ -411,6 +448,7 @@ describe("StaleChildMarkdownCleanup", () => {
 						throw new Error("disk error");
 					}
 					deletions.push(entry);
+					return true;
 				},
 				deletions,
 			};

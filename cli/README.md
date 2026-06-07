@@ -453,7 +453,7 @@ The generated summary is then dual-written locally — to the git orphan branch 
 
 ### Uploads to Jolli Space
 
-The CLI itself does not push summaries to Jolli Space — that action lives in the VS Code and IntelliJ extensions (**Push to Jolli** button). When triggered there, only the **generated summary** and its **associated plans and notes** are uploaded. **Raw transcripts are never sent to Jolli Space.**
+The CLI itself does not push summaries to Jolli Space — that action lives in the VS Code and IntelliJ extensions (**Share in Jolli** button). When triggered there, only the **generated summary** and its **associated plans and notes** are uploaded. **Raw transcripts are never sent to Jolli Space.**
 
 ### Session metadata
 

@@ -54,8 +54,10 @@ export async function cleanupBranchStaleChildMarkdown(
 	let failed = 0;
 	for (const entry of branchStaleChildren) {
 		try {
-			await storage.deleteVisibleMarkdown(entry);
-			deleted++;
+			// Count only entries whose file was actually unlinked — an already-gone
+			// .md returns false. The index entry persists regardless, so counting
+			// visits instead of removals would report a non-zero sweep forever.
+			if (await storage.deleteVisibleMarkdown(entry)) deleted++;
 		} catch (err) {
 			failed++;
 			log.warn(
@@ -102,8 +104,10 @@ export async function cleanupAllBranchesStaleChildMarkdown(
 	let failed = 0;
 	for (const entry of staleChildren) {
 		try {
-			await storage.deleteVisibleMarkdown(entry);
-			deleted++;
+			// Count only entries whose file was actually unlinked — an already-gone
+			// .md returns false. The index entry persists regardless, so counting
+			// visits instead of removals would report a non-zero sweep forever.
+			if (await storage.deleteVisibleMarkdown(entry)) deleted++;
 		} catch (err) {
 			failed++;
 			log.warn(
