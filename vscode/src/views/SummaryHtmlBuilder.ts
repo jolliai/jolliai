@@ -267,7 +267,7 @@ function buildHeader(
 ): string {
 	const changesHtml = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, <span class="stat-add">${totalInsertions} insertion${totalInsertions !== 1 ? "s" : ""}(+)</span>, <span class="stat-del">${totalDeletions} deletion${totalDeletions !== 1 ? "s" : ""}(-)</span>`;
 	const totalTurns = aggregateTurns(summary);
-	const pushLabel = summary.jolliDocUrl ? "Update on Jolli" : "Push to Jolli";
+	const pushLabel = summary.jolliDocUrl ? "Update on Jolli" : "Share in Jolli";
 
 	return `
 <h1 class="page-title">${escHtml(summary.commitMessage)}</h1>

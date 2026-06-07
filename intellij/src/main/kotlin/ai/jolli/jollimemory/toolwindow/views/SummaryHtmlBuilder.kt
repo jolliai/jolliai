@@ -335,7 +335,7 @@ ${buildTranscriptModal()}"""
         val changesHtml =
             """$totalFiles file$filesPlural changed, <span class="stat-add">$totalInsertions insertion$insPlural(+)</span>, <span class="stat-del">$totalDeletions deletion$delPlural(-)</span>"""
         val totalTurns = SummaryTree.aggregateTurns(summary)
-        val pushLabel = if (summary.jolliDocUrl != null) "Update on Jolli" else "Push to Jolli"
+        val pushLabel = if (summary.jolliDocUrl != null) "Update on Jolli" else "Share in Jolli"
 
         return """
 <h1 class="page-title">${escHtml(summary.commitMessage)}</h1>

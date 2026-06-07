@@ -14,6 +14,7 @@
 - **More reliable cloud sync** — Your Memory Bank stays in sync across devices more dependably: a sync interrupted by a reload or crash recovers on its own, your vault is tied to one account so a different sign-in can't overwrite it, and conflicts resolve automatically when it's safe. The status bar shows synced / syncing / conflicts / offline.
 - **Quick plan previews** — Hover a plan in **Plans & Notes** to see its title, source, last-updated time, and a snippet.
 - **Opt-in DCO sign-off on AI commits** — A new toggle in **Settings → Others** adds a `Signed-off-by` line to AI-generated commit messages so they pass projects that require it. Off by default.
+- **"Push to Jolli" is now "Share in Jolli"** — the summary panel's cloud-publish button is relabeled **Share in Jolli**. Behavior is unchanged; only the label was updated.
 - Bug fixes
 
 ## 0.99.1

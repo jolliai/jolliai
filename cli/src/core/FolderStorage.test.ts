@@ -429,7 +429,7 @@ describe("FolderStorage", () => {
 			expect(existsSync(hiddenPath)).toBe(true);
 		});
 
-		it("is idempotent on a missing file (no throw)", async () => {
+		it("is idempotent on a missing file (no throw), returning false (nothing removed)", async () => {
 			await expect(
 				storage.deleteVisibleMarkdown({
 					commitHash: "ffffffffffffffff",
@@ -439,7 +439,7 @@ describe("FolderStorage", () => {
 					generatedAt: "2026-01-15T10:00:00Z",
 					parentCommitHash: null,
 				}),
-			).resolves.toBeUndefined();
+			).resolves.toBe(false);
 		});
 
 		it("preserves a hand-edited md (fingerprint mismatch — same protection cleanupSupersededDescendants gives at write time)", async () => {

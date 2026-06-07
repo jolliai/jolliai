@@ -177,55 +177,79 @@ export class MigrationEngine {
 	}
 
 	/**
-	 * v3 step (replaces the inverted v2 `runLeafCleanup` from 0.99.2): one-shot
-	 * reconciliation of the visible .md layer with the v4 Hoist storage model:
+	 * v3 step (replaces the inverted v2 `runLeafCleanup` from 0.99.2): reconciles
+	 * the visible .md layer with the v4 Hoist storage model in two phases that
+	 * have DIFFERENT lifecycles:
 	 *
-	 *   1. Regenerate any head .md (`parentCommitHash == null` entry) whose
-	 *      visible file is missing — undoes the damage of 0.99.2's leaf-only
-	 *      pass which inverted the semantics and deleted heads while keeping
-	 *      hoisted older children.
-	 *   2. Delete every stale-child .md (`parentCommitHash != null`) — these
-	 *      are older versions hoisted into a head's `children[]` and should
-	 *      not surface as standalone Memories.
+	 *   1. (ONE-SHOT) Regenerate any head .md (`parentCommitHash == null` entry)
+	 *      whose visible file is missing — undoes the damage of 0.99.2's
+	 *      leaf-only pass which inverted the semantics and deleted heads while
+	 *      keeping hoisted older children. This is a historical repair, gated on
+	 *      `state.staleChildCleanup.completedAt`: once it runs cleanly it never
+	 *      runs again.
+	 *   2. (EVERY INVOCATION) Delete every stale-child .md
+	 *      (`parentCommitHash != null`) — older versions hoisted into a head's
+	 *      `children[]` that must not surface as standalone Memories. This is an
+	 *      idempotent reconciliation, NOT a one-shot repair: it runs on every
+	 *      activate so the "visible folder shows only heads" invariant is
+	 *      self-healing. The QueueWorker tail cleanup only sweeps the branch of a
+	 *      live git op, so children hoisted on a now-inactive / merged branch are
+	 *      otherwise never revisited and their orphaned .md accumulate forever.
 	 *
-	 * Idempotent via `state.staleChildCleanup.completedAt`. The legacy
-	 * `state.leafCleanup` field from 0.99.2 is intentionally NOT consulted —
-	 * users who ran 0.99.2 must run this pass exactly once to repair the
-	 * inverted state, regardless of what `leafCleanup.completedAt` says.
+	 * The `state.staleChildCleanup.completedAt` stamp gates ONLY phase 1; an
+	 * existing stamp is preserved verbatim rather than re-stamped each run. The
+	 * legacy `state.leafCleanup` field from 0.99.2 is intentionally NOT consulted
+	 * — users who ran 0.99.2 must run phase 1 exactly once to repair the inverted
+	 * state, regardless of what `leafCleanup.completedAt` says.
 	 *
-	 * Called from `runMigration` after v1 completes; also invoked directly
-	 * from VS Code/IDE activate paths for already-migrated users who need
-	 * the one-shot repair.
+	 * Called from `runMigration` after v1 completes; also invoked directly from
+	 * VS Code/IDE activate paths on every startup.
 	 */
-	async runStaleChildCleanup(): Promise<MigrationState> {
+	async runStaleChildCleanup(): Promise<MigrationState & { readonly swept: number }> {
 		const existing = this.metadataManager.readMigrationState();
-		if (existing?.staleChildCleanup?.completedAt) {
-			log.info("stale-child cleanup already completed at %s — skipping", existing.staleChildCleanup.completedAt);
-			return existing;
+		const priorStamp = existing?.staleChildCleanup?.completedAt;
+
+		// Phase 1 (ONE-SHOT, gated): regenerate head .md that 0.99.2's inverted
+		// pass deleted. Once the stamp is set this historical repair never runs
+		// again — a head missing for some later reason is healMissingVisibleMarkdown's
+		// job, not this pass's.
+		const regenAlreadyDone = Boolean(priorStamp);
+		let regen = { regenerated: 0, skipped: 0, failed: 0 };
+		if (regenAlreadyDone) {
+			log.info("0.99.2 head-regen already completed at %s — skipping phase 1", priorStamp);
+		} else {
+			log.info("=== 0.99.2 head-regen (one-shot) started ===");
+			regen = await this.regenerateMissingHeadMarkdown();
+			log.info(
+				"Head regenerate: regenerated=%d skipped=%d failed=%d",
+				regen.regenerated,
+				regen.skipped,
+				regen.failed,
+			);
 		}
 
-		log.info("=== stale-child cleanup started ===");
-
-		// Phase 1: regenerate head .md that 0.99.2's inverted pass deleted.
-		const regen = await this.regenerateMissingHeadMarkdown();
-		log.info(
-			"Head regenerate: regenerated=%d skipped=%d failed=%d",
-			regen.regenerated,
-			regen.skipped,
-			regen.failed,
-		);
-
-		// Phase 2: delete every stale-child visible .md.
+		// Phase 2 (EVERY INVOCATION): delete every stale-child visible .md. This
+		// is an idempotent reconciliation that runs on every activate so the
+		// "visible folder shows only heads" invariant self-heals — children
+		// hoisted on a now-inactive / merged branch are never revisited by the
+		// QueueWorker tail cleanup and would otherwise accumulate forever.
 		const result = await cleanupAllBranchesStaleChildMarkdown(undefined, this.folderStorage);
-		log.info("Stale-child cleanup: deleted=%d failed=%d", result.deleted, result.failed);
+		log.info("Stale-child sweep: deleted=%d failed=%d", result.deleted, result.failed);
+		// Phase 2 failures no longer gate the stamp (it gates phase 1 only), but a
+		// persistently undeletable .md — EACCES/EBUSY — leaves a ghost child in the
+		// visible folder that no later run surfaces. Warn independently so the
+		// failure isn't swallowed at info level (silent under _silentConsole).
+		if (result.failed > 0) {
+			log.warn("Stale-child sweep left %d visible .md undeleted — ghost entries may persist", result.failed);
+		}
 
-		// Only stamp `staleChildCleanup.completedAt` when both phases ran clean.
-		// The stamp is a permanent skip-gate read at the top of this method; if
-		// we wrote it on partial failure, the 0.99.2 recovery we couldn't
-		// finish would never be retried on the next VS Code activate and the
-		// missing head .md files would be silently lost. Returning state
-		// without the stamp lets the next invocation re-attempt.
-		const cleanRun = regen.failed === 0 && result.failed === 0;
+		// The stamp gates ONLY phase 1, so it depends solely on a clean regen
+		// run; a failed regen withholds it so the next activate retries the
+		// one-shot repair (a premature stamp would silently lose the head .md we
+		// claimed to regenerate). An existing stamp is preserved verbatim — phase
+		// 2's recurring sweep must not bump the timestamp on every startup.
+		const regenClean = regenAlreadyDone || regen.failed === 0;
+		const completedAt = priorStamp ?? (regenClean ? new Date().toISOString() : undefined);
 		const merged: MigrationState = {
 			status: existing?.status ?? "completed",
 			totalEntries: existing?.totalEntries ?? 0,
@@ -235,17 +259,26 @@ export class MigrationEngine {
 			// Preserve the legacy 0.99.2 field if present so we don't accidentally
 			// invalidate it for any host code that still reads it during transition.
 			...(existing?.leafCleanup ? { leafCleanup: existing.leafCleanup } : {}),
-			...(cleanRun ? { staleChildCleanup: { completedAt: new Date().toISOString() } } : {}),
+			...(completedAt ? { staleChildCleanup: { completedAt } } : {}),
 		};
-		if (!cleanRun) {
+		if (!regenClean) {
 			log.warn(
-				"stale-child cleanup did not finish cleanly (regen.failed=%d, child.failed=%d) — will retry on next invocation",
+				"0.99.2 head-regen did not finish cleanly (regen.failed=%d) — will retry phase 1 on next invocation",
 				regen.failed,
-				result.failed,
 			);
 		}
 		this.metadataManager.saveMigrationState(merged);
-		return merged;
+		// `swept` is a transient signal for the caller (how many visible .md the
+		// run actually changed) — NOT persisted: `saveMigrationState` only writes
+		// the clean `merged` MigrationState above. It sums BOTH phases' real
+		// mutations: stale-child .md deleted (phase 2) AND head .md regenerated
+		// (phase 1) — the one-shot repair can regenerate a head while deleting no
+		// stale child, and that head must still appear immediately. The VS Code
+		// activate path uses swept>0 to refresh the sidebar ONLY when the visible
+		// layer actually changed, so a no-op reconcile doesn't reset the folder
+		// tree. `result.deleted` now counts real unlinks (already-gone .md return
+		// false), so a steady-state reconcile reports swept=0.
+		return { ...merged, swept: result.deleted + regen.regenerated };
 	}
 
 	/**

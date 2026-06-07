@@ -303,7 +303,7 @@ export async function refreshUpdateCache(
 export function computeCliUpdateNotice(args: { currentVersion: string; registryLatest?: string }): string | null {
 	const latest = args.registryLatest;
 	if (!latest || compareSemver(latest, args.currentVersion) <= 0) return null;
-	return `A newer version of ${CLI_PACKAGE_NAME} is available (${latest} → you have ${args.currentVersion}). Upgrade: npm update -g ${CLI_PACKAGE_NAME}`;
+	return `A newer version of ${CLI_PACKAGE_NAME} is available (you have ${args.currentVersion} → ${latest}). Upgrade: npm update -g ${CLI_PACKAGE_NAME}`;
 }
 
 /**
@@ -323,7 +323,7 @@ export function computePluginUpdateNotices(
 		if (!latest || !p.installedVersion) continue;
 		if (compareSemver(latest, p.installedVersion) > 0) {
 			notices.push(
-				`A newer version of ${p.packageName} is available (${latest} → you have ${p.installedVersion}). Upgrade: ${p.installHint}`,
+				`A newer version of ${p.packageName} is available (you have ${p.installedVersion} → ${latest}). Upgrade: ${p.installHint}`,
 			);
 		}
 	}

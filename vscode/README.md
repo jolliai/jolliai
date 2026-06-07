@@ -117,15 +117,15 @@ Click the eye icon (`$(eye)`) on any commit to open a full memory panel. It show
 Action buttons:
 
 * **Copy Markdown**: copies the full summary to clipboard
-* **Push to Jolli**: publishes the summary (and associated plans and notes) to your Jolli Space. The Memory Bank folder on disk already holds a Markdown copy of every memory automatically — Push to Jolli is purely about cloud publishing.
+* **Share in Jolli**: publishes the summary (and associated plans and notes) to your Jolli Space. The Memory Bank folder on disk already holds a Markdown copy of every memory automatically — Share in Jolli is purely about cloud publishing.
 * **Regenerate**: re-runs the LLM against the current commit's transcripts + diff, normalizes the result to the v4 tree, and replaces the previous summary in place. While the call is in flight, the panel enters a **regenerating-read-only** state (topics + recap dim, write actions disable, an inline banner explains the wait) and a final stale-write guard re-checks the commit hash inside the race window — so an amend / squash that lands mid-regenerate cannot clobber the new history.
 * **Create & Update PR**: manages a GitHub PR for this commit
 
 **Stale-commit read-only mode** — if the commit shown in the webview is rewritten by an amend / squash / rebase / branch switch while the panel is open, the panel stays open in a persistent **stale read-only** mode with an inline warning banner instead of silently disappearing mid-edit. All write paths (push, edit, regenerate, plan / note add-remove, …) re-check the commit hash inside the race window and bail out cleanly if the hash has moved on disk.
 
-### Push to Jolli Space
+### Share in Jolli Space
 
-Click **Push to Jolli** to publish the summary to your team's Jolli Space knowledge base. Jolli Space allows you to recall individual or shared memory for multiple devices or for different coding agent setups. Space team members can recall specific commits within the team.
+Click **Share in Jolli** to publish the summary to your team's Jolli Space knowledge base. Jolli Space allows you to recall individual or shared memory for multiple devices or for different coding agent setups. Space team members can recall specific commits within the team.
 
 Plans and notes (both Markdown files and text snippets) are each uploaded as separate articles first, so their URLs appear in the summary. The summary itself is published last. 
 
@@ -348,7 +348,7 @@ To produce a summary, Jolli Memory reads your active AI session transcripts and 
 
 The generated summary is then dual-written locally — to the git orphan branch (the source of truth) and to the Memory Bank folder on disk (canonical JSON at `<localFolder>/<repo>/.jolli/summaries/<commitHash>.json` plus human-readable Markdown at `<localFolder>/<repo>/<branch>/<slug>-<hash8>.md`), where `<localFolder>` is your configured Memory Bank root (one root can hold multiple repos, each in its own `<repo>/` subfolder). Raw transcripts are dual-written the same way: to `transcripts/<commitHash>.json` on the orphan branch and to `<localFolder>/<repo>/.jolli/transcripts/<commitHash>.json` in the Memory Bank folder. The Summary Webview's **All Conversations** section reads from the orphan-branch copy.
 
-### At Push to Jolli time (only when you click Push)
+### At Share in Jolli time (only when you click Share)
 
 Only the **generated summary** (Markdown + properties) and any **associated plans and notes** are uploaded to your Jolli Space. **Raw transcripts are never sent to Jolli Space** — they stay local.
 

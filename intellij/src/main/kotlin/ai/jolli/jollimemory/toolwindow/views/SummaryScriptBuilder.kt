@@ -149,7 +149,7 @@ ${buildPrSectionScript()}
       } else if (msg.command === 'pushFailed') {
         pushBtn.textContent = 'Push Failed';
         pushBtn.disabled = false;
-        setTimeout(function() { pushBtn.textContent = 'Push to Jolli'; }, 2000);
+        setTimeout(function() { pushBtn.textContent = 'Share in Jolli'; }, 2000);
       }
     }
 

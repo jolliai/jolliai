@@ -138,7 +138,7 @@ src/main/kotlin/ai/jolli/jollimemory/
 │   ├── JolliMemoryService.kt        # Central service: install/uninstall, status, branch ops
 │   ├── JolliMemoryStartupActivity.kt# Auto-detect and install hooks on project open
 │   ├── JolliAuthService.kt          # OAuth flow: opens browser, runs a local callback listener, stores credentials
-│   ├── JolliApiClient.kt            # HTTP client for Jolli Space API (Push to Jolli)
+│   ├── JolliApiClient.kt            # HTTP client for Jolli Space API (Share in Jolli)
 │   ├── PlanService.kt               # Plan detection and registry management
 │   └── PrService.kt                 # GitHub PR creation/update via gh CLI
 ├── settings/

@@ -64,10 +64,17 @@ export interface StorageProvider {
 	 * Does NOT touch .jolli/summaries/<hash>.json, .jolli/index.json, or any
 	 * orphan-branch state. Idempotent: a missing file is not an error.
 	 *
+	 * Returns true when a file was actually unlinked, false when nothing was
+	 * removed (the .md was already absent, or skipped as a hand-edit). Callers
+	 * that count real mutations — e.g. the every-activate stale-child reconcile
+	 * deciding whether the visible layer changed — must rely on this rather than
+	 * on "entry was visited", because hoisted-child index entries persist in
+	 * index.json indefinitely and would otherwise be counted on every pass.
+	 *
 	 * Optional: implemented by FolderStorage and delegated by DualWriteStorage.
 	 * OrphanBranchStorage does not implement it (no visible layer).
 	 */
-	deleteVisibleMarkdown?(entry: SummaryIndexEntry): Promise<void>;
+	deleteVisibleMarkdown?(entry: SummaryIndexEntry): Promise<boolean>;
 
 	/**
 	 * Re-emit the user-visible Markdown copy for a single summary entry from

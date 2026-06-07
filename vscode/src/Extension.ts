@@ -1220,20 +1220,31 @@ export function activate(context: vscode.ExtensionContext): void {
 					// post-wipe reload. Push a reset so the client re-fetches once
 					// migration's writes are on disk.
 					sidebarProvider.refreshKnowledgeBaseFolders();
-				} else if (!migrationState.staleChildCleanup?.completedAt) {
+				} else {
+					// Already migrated: run the stale-child reconcile on EVERY
+					// activate (not gated on staleChildCleanup.completedAt — that
+					// stamp now only retires the one-shot 0.99.2 head-regen inside
+					// runStaleChildCleanup). The sweep deletes visible .md for
+					// children hoisted on now-inactive / merged branches, which the
+					// QueueWorker tail cleanup never revisits, so this is the only
+					// place the "visible folder shows only heads" invariant
+					// self-heals for dormant branches.
 					const folder = new FolderStorage(kbRoot, mm);
 					await folder.ensure();
 					const engine = new MigrationEngine(orphan, folder, mm);
 					const result = await engine.runStaleChildCleanup();
 					log.info(
 						"activate",
-						`KB v3 stale-child cleanup: completedAt=${result.staleChildCleanup?.completedAt ?? "n/a"}`,
+						`KB stale-child reconcile: swept=${result.swept} completedAt=${result.staleChildCleanup?.completedAt ?? "n/a"}`,
 					);
-					// Same rationale as above — staleChildCleanup mutates the
-					// folder's index.json, and a bridge cache that snapshotted
-					// pre-cleanup state would keep returning stale rows.
-					bridge.reloadStorage();
-					sidebarProvider.refreshKnowledgeBaseFolders();
+					// Refresh ONLY when the sweep actually deleted files. A no-op
+					// reconcile (the steady state after the first heal) must not
+					// bust the storage cache or reset the sidebar tree — that would
+					// collapse the user's expanded folders on every window reload.
+					if (result.swept > 0) {
+						bridge.reloadStorage();
+						sidebarProvider.refreshKnowledgeBaseFolders();
+					}
 				}
 			}
 		} catch (err) {

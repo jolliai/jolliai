@@ -1541,6 +1541,9 @@ describe("Extension", () => {
 				migratedEntries: 0,
 				totalEntries: 0,
 				staleChildCleanup: { completedAt: "2026-05-12T00:00:00Z" },
+				// swept > 0 → the activate path busts the storage cache + refreshes
+				// the sidebar (the steady-state swept=0 case is pinned separately).
+				swept: 2,
 			});
 			mockMetadataManagerInstance.readMigrationState.mockReset();
 		});
@@ -1563,7 +1566,12 @@ describe("Extension", () => {
 			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
 		});
 
-		it("skips runStaleChildCleanup when staleChildCleanup.completedAt is already set", async () => {
+		// The stale-child reconcile is recurring, NOT one-shot: an already-set
+		// staleChildCleanup.completedAt must not skip it. That stamp only retires
+		// the inner 0.99.2 head-regen; the sweep still runs on every activate so
+		// children hoisted on dormant / merged branches get their orphaned visible
+		// .md cleaned even after the branch goes inactive.
+		it("still runs runStaleChildCleanup when staleChildCleanup.completedAt is already set", async () => {
 			mockOrphanInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
 				status: "completed",
@@ -1574,13 +1582,11 @@ describe("Extension", () => {
 
 			activate(makeContext());
 
-			// Give activate's fire-and-forget initializeKB() a chance to settle.
 			await vi.waitFor(() => {
-				expect(mockOrphanInstance.exists).toHaveBeenCalled();
+				expect(
+					mockMigrationEngineInstance.runStaleChildCleanup,
+				).toHaveBeenCalledTimes(1);
 			});
-			expect(
-				mockMigrationEngineInstance.runStaleChildCleanup,
-			).not.toHaveBeenCalled();
 			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
 		});
 
@@ -1602,6 +1608,7 @@ describe("Extension", () => {
 				status: "completed",
 				totalEntries: 5,
 				migratedEntries: 5,
+				swept: 0,
 				// no staleChildCleanup field
 			});
 
@@ -1610,7 +1617,7 @@ describe("Extension", () => {
 			await vi.waitFor(() => {
 				expect(info).toHaveBeenCalledWith(
 					"activate",
-					"KB v3 stale-child cleanup: completedAt=n/a",
+					"KB stale-child reconcile: swept=0 completedAt=n/a",
 				);
 			});
 		});
@@ -1711,10 +1718,11 @@ describe("Extension", () => {
 			expect(mockBridge.reloadStorage).toHaveBeenCalled();
 		});
 
-		it("busts bridge read-storage cache after runStaleChildCleanup completes", async () => {
-			// Symmetric pin for the staleChildCleanup branch. Cleanup
-			// mutates the folder's index.json; any bridge cache that
-			// snapshotted pre-cleanup state would keep serving stale rows.
+		it("busts bridge read-storage cache after runStaleChildCleanup deletes files (swept > 0)", async () => {
+			// Symmetric pin for the staleChildCleanup branch. When the sweep
+			// actually deletes visible .md it mutates the folder's index.json;
+			// any bridge cache that snapshotted pre-cleanup state would keep
+			// serving stale rows. Default mock returns swept=2.
 			mockOrphanInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
 				status: "completed",
@@ -1730,6 +1738,39 @@ describe("Extension", () => {
 				).toHaveBeenCalledTimes(1);
 			});
 			expect(mockBridge.reloadStorage).toHaveBeenCalled();
+			expect(mockRefreshKnowledgeBaseFolders).toHaveBeenCalled();
+		});
+
+		// Steady state: the recurring reconcile runs on every activate but the
+		// sweep usually deletes nothing (swept=0). It must NOT bust the storage
+		// cache or refresh the sidebar in that case — doing so on every window
+		// reload would collapse the user's expanded folder tree.
+		it("does NOT bust cache or refresh the sidebar when the sweep deletes nothing (swept = 0)", async () => {
+			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
+				status: "completed",
+				totalEntries: 5,
+				migratedEntries: 5,
+				staleChildCleanup: { completedAt: "2026-05-01T00:00:00Z" },
+			});
+			mockMigrationEngineInstance.runStaleChildCleanup.mockReset();
+			mockMigrationEngineInstance.runStaleChildCleanup.mockResolvedValue({
+				status: "completed",
+				totalEntries: 5,
+				migratedEntries: 5,
+				staleChildCleanup: { completedAt: "2026-05-01T00:00:00Z" },
+				swept: 0,
+			});
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(
+					mockMigrationEngineInstance.runStaleChildCleanup,
+				).toHaveBeenCalledTimes(1);
+			});
+			expect(mockBridge.reloadStorage).not.toHaveBeenCalled();
+			expect(mockRefreshKnowledgeBaseFolders).not.toHaveBeenCalled();
 		});
 	});
 
