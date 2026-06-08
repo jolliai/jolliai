@@ -107,6 +107,7 @@ vi.mock("../core/Locks.js", () => ({
 	releaseWorkerLock: vi.fn(),
 	refreshWorkerLockMtime: vi.fn(),
 	isWorkerLockHeld: vi.fn(),
+	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
 }));
 
 // Sqlite-backed and patch-doc readers — each loadSessionTranscripts call

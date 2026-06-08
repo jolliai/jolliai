@@ -67,6 +67,12 @@ vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	},
 }));
 
+// plans.lock passthrough — run the RMW body inline (no real lock file I/O on the
+// synthetic CWD). The lock contract is covered in cli/src/core/Locks.test.ts.
+vi.mock("../../../cli/src/core/Locks.js", () => ({
+	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+}));
+
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	storeNotes: mockStoreNotes,
 }));
@@ -260,14 +266,41 @@ describe("NoteService", () => {
 		});
 
 		it("persists the normalised registry once when migration purged legacy rows/fields (changed=true)", async () => {
-			mockLoadPlansRegistryWithStatus.mockResolvedValueOnce({
-				registry: { version: 1, plans: {}, notes: {} },
-				changed: true,
-			});
+			// Two primed responses: the read-side load, then the fresh re-read done
+			// inside plans.lock before the writeback (nothing has persisted yet, so
+			// both still report changed=true).
+			mockLoadPlansRegistryWithStatus
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: {}, notes: {} },
+					changed: true,
+				})
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: {}, notes: {} },
+					changed: true,
+				});
 
 			await detectNotes(CWD);
 
 			expect(mockSavePlansRegistry).toHaveBeenCalledTimes(1);
+		});
+
+		it("skips the writeback when a concurrent process already normalised it (in-lock fresh.changed=false)", async () => {
+			// Outer read reports changed=true, but the in-lock fresh re-read reports
+			// changed=false (a peer persisted the normalization first) — the
+			// idempotency guard must skip the redundant save.
+			mockLoadPlansRegistryWithStatus
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: {}, notes: {} },
+					changed: true,
+				})
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: {}, notes: {} },
+					changed: false,
+				});
+
+			await detectNotes(CWD);
+
+			expect(mockSavePlansRegistry).not.toHaveBeenCalled();
 		});
 
 		it("does not persist when nothing changed (changed=false)", async () => {

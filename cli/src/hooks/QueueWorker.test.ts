@@ -62,6 +62,9 @@ vi.mock("../core/Locks.js", () => ({
 	releaseWorkerLock: vi.fn(),
 	refreshWorkerLockMtime: vi.fn(),
 	isWorkerLockHeld: vi.fn(),
+	// Passthrough: run the RMW body without touching the real lock file. The
+	// per-worktree lock contract itself is covered in Locks.test.ts.
+	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
 }));
 
 // `vault-write.lock` integration: the Standalone Hotfix now wraps the worker

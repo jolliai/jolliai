@@ -22,6 +22,7 @@ import {
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { withPlansLock } from "../../../cli/src/core/Locks.js";
 import { isPathInside } from "../../../cli/src/core/PathUtils.js";
 import {
 	loadAllSessions,
@@ -78,7 +79,22 @@ export async function detectPlans(cwd: string): Promise<Array<PlanInfo>> {
 		}
 	}
 	if (cleaned || changed) {
-		await savePlansRegistry({ ...registry, plans: registryPlans }, cwd);
+		// Re-run the convergence cleanup on a fresh in-lock snapshot so it can't
+		// clobber a concurrent write (the Codex-discovery tick in this host, or a
+		// cross-process StopHook/QueueWorker). The display list uses the pre-lock
+		// snapshot, which is fine for a read-side refresh.
+		await withPlansLock(cwd, async () => {
+			const fresh = await loadPlansRegistryWithStatus(cwd);
+			const freshPlans = { ...fresh.registry.plans };
+			let mutate = fresh.changed;
+			for (const [slug, entry] of Object.entries(freshPlans)) {
+				if (entry.commitHash === null && !entry.contentHashAtCommit && !existsSync(entry.sourcePath)) {
+					delete freshPlans[slug];
+					mutate = true;
+				}
+			}
+			if (mutate) await savePlansRegistry({ ...fresh.registry, plans: freshPlans }, cwd);
+		});
 	}
 
 	const plans = buildPlanInfoList(registryPlans);
@@ -179,34 +195,50 @@ function toPlanInfo(entry: PlanEntry): PlanInfo | null {
  * exact key unconditionally — that's the user explicitly removing the live plan.
  */
 export async function removePlan(slug: string, cwd: string, expectedCommitHash?: string): Promise<void> {
-	const registry = await loadPlansRegistry(cwd);
-	// Resolve the registry key to delete.
-	let key: string | undefined;
-	if (expectedCommitHash === undefined) {
-		// Sidebar / cleanup path: exact key only, delete whatever lives there.
-		key = registry.plans[slug] !== undefined ? slug : undefined;
-	} else {
-		// Commit-dissociate path: only delete a row still owned by THIS commit.
-		// Exact key first; then the archive base (`<base>-<8hex>` → `<base>`),
-		// which handles squash/rebase where the summary slug keeps the old hash.
-		if (registry.plans[slug]?.commitHash === expectedCommitHash) {
-			key = slug;
+	// Resolve, gate, and delete all on ONE fresh read inside plans.lock so the
+	// commit gate is checked against the same snapshot we delete from (and a
+	// concurrent write to another row survives). Returns the deleted entry so the
+	// backing-file cleanup can run AFTER the lock; returns null on a no-op.
+	const removed = await withPlansLock(cwd, async () => {
+		const registry = await loadPlansRegistry(cwd);
+		// Resolve the registry key to delete.
+		let key: string | undefined;
+		if (expectedCommitHash === undefined) {
+			// Sidebar / cleanup path: exact key only, delete whatever lives there.
+			key = registry.plans[slug] !== undefined ? slug : undefined;
 		} else {
-			const split = splitArchivedKey(slug);
-			if (split && registry.plans[split.baseKey]?.commitHash === expectedCommitHash) {
-				key = split.baseKey;
+			// Commit-dissociate path: only delete a row still owned by THIS commit.
+			// Exact key first; then the archive base (`<base>-<8hex>` → `<base>`),
+			// which handles squash/rebase where the summary slug keeps the old hash.
+			if (registry.plans[slug]?.commitHash === expectedCommitHash) {
+				key = slug;
+			} else {
+				const split = splitArchivedKey(slug);
+				if (split && registry.plans[split.baseKey]?.commitHash === expectedCommitHash) {
+					key = split.baseKey;
+				}
 			}
 		}
-	}
-	if (key === undefined) {
-		return;
-	}
-	const entry = registry.plans[key];
-	if (!entry) {
+		if (key === undefined) {
+			return null;
+		}
+		const entry = registry.plans[key];
+		if (!entry) {
+			return null;
+		}
+		const plans = { ...registry.plans };
+		delete plans[key];
+		await savePlansRegistry({ ...registry, plans }, cwd);
+		return { entry };
+	});
+	if (removed === null) {
 		return;
 	}
 	// Delete the backing file only when it is inside .jolli/jollimemory/ —
 	// external plan files (the common case) are the user's own, never deleted.
+	// Done after the lock: the registry row is already gone, so a failed unlink
+	// can't strand state.
+	const { entry } = removed;
 	if (
 		isPathInside(entry.sourcePath, getJolliMemoryDir(cwd)) &&
 		existsSync(entry.sourcePath)
@@ -214,12 +246,9 @@ export async function removePlan(slug: string, cwd: string, expectedCommitHash?:
 		try {
 			unlinkSync(entry.sourcePath);
 		} catch {
-			/* best-effort — the registry row is still removed below */
+			/* best-effort — the registry row is already removed */
 		}
 	}
-	const plans = { ...registry.plans };
-	delete plans[key];
-	await savePlansRegistry({ ...registry, plans }, cwd);
 }
 
 /**
@@ -250,13 +279,12 @@ export async function addPlanToRegistry(
 		commitHash: null,
 	};
 
-	await savePlansRegistry(
-		{
-			...registry,
-			plans: { ...registry.plans, [slug]: entry },
-		},
-		cwd,
-	);
+	// plans.lock + fresh re-read so this single-plan upsert merges onto the latest
+	// state instead of clobbering a concurrent write.
+	await withPlansLock(cwd, async () => {
+		const fresh = await loadPlansRegistry(cwd);
+		await savePlansRegistry({ ...fresh, plans: { ...fresh.plans, [slug]: entry } }, cwd);
+	});
 }
 
 /**
@@ -404,21 +432,17 @@ export async function archivePlanForCommit(
 	// Update plans.json: the original slug becomes the guard. No
 	// `<slug>-<shortHash>` archive row — the orphan-branch snapshot (stored under
 	// newSlug below) + the CommitSummary PlanReference are the system of record.
-	await savePlansRegistry(
-		{
-			...registry,
-			plans: {
-				...registry.plans,
-				[slug]: {
-					...entry,
-					commitHash,
-					updatedAt: now,
-					contentHashAtCommit,
-				},
-			},
-		},
-		cwd,
-	);
+	const guardEntry: PlanEntry = {
+		...entry,
+		commitHash,
+		updatedAt: now,
+		contentHashAtCommit,
+	};
+	// plans.lock + fresh re-read so the guard upsert merges onto the latest state.
+	await withPlansLock(cwd, async () => {
+		const fresh = await loadPlansRegistry(cwd);
+		await savePlansRegistry({ ...fresh, plans: { ...fresh.plans, [slug]: guardEntry } }, cwd);
+	});
 
 	// Store plan file in orphan branch under new slug.
 	//

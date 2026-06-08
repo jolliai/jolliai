@@ -100,6 +100,7 @@ vi.mock("../core/Locks.js", () => ({
 	releaseWorkerLock: vi.fn().mockResolvedValue(undefined),
 	refreshWorkerLockMtime: vi.fn(),
 	isWorkerLockHeld: vi.fn(),
+	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
 }));
 
 vi.mock("../core/TranscriptReader.js", () => ({

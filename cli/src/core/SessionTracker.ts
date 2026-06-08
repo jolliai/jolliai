@@ -33,6 +33,7 @@ import {
 	type TranscriptCursor,
 } from "../Types.js";
 import { atomicWriteFile as atomicWrite } from "./AtomicWrite.js";
+import { withPlansLock } from "./Locks.js";
 import { writeReferenceMarkdown } from "./references/ReferenceStore.js";
 
 const log = createLogger("SessionTracker");
@@ -956,19 +957,21 @@ export async function associatePlanWithCommit(archivedSlug: string, commitHash: 
 		log.debug("associatePlanWithCommit: %s is not an archived slug, skipping", archivedSlug);
 		return;
 	}
-	const registry = await loadPlansRegistry(cwd);
-	const guard = registry.plans[split.baseKey];
-	if (!guard?.contentHashAtCommit || !guard.commitHash?.startsWith(split.oldShortHash)) {
-		log.debug("associatePlanWithCommit: no matching guard for %s, skipping", archivedSlug);
-		return;
-	}
-	const now = new Date().toISOString();
-	const updated: PlansRegistry = {
-		...registry,
-		plans: { ...registry.plans, [split.baseKey]: { ...guard, commitHash, updatedAt: now } },
-	};
-	await savePlansRegistry(updated, cwd);
-	log.info("associatePlanWithCommit: migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
+	await withPlansLock(cwd, async () => {
+		const registry = await loadPlansRegistry(cwd);
+		const guard = registry.plans[split.baseKey];
+		if (!guard?.contentHashAtCommit || !guard.commitHash?.startsWith(split.oldShortHash)) {
+			log.debug("associatePlanWithCommit: no matching guard for %s, skipping", archivedSlug);
+			return;
+		}
+		const now = new Date().toISOString();
+		const updated: PlansRegistry = {
+			...registry,
+			plans: { ...registry.plans, [split.baseKey]: { ...guard, commitHash, updatedAt: now } },
+		};
+		await savePlansRegistry(updated, cwd);
+		log.info("associatePlanWithCommit: migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
+	});
 }
 
 /**
@@ -985,23 +988,25 @@ export async function associateNoteWithCommit(noteId: string, commitHash: string
 		log.debug("associateNoteWithCommit: %s is not an archived id, skipping", noteId);
 		return;
 	}
-	const registry = await loadPlansRegistry(cwd);
-	const notes = registry.notes;
-	const guard = notes?.[split.baseKey];
-	if (!guard?.contentHashAtCommit || !guard.commitHash?.startsWith(split.oldShortHash)) {
-		log.debug("associateNoteWithCommit: no matching guard for %s, skipping", noteId);
-		return;
-	}
-	const now = new Date().toISOString();
-	const updated: PlansRegistry = {
-		...registry,
-		notes: {
-			...(notes as NonNullable<PlansRegistry["notes"]>),
-			[split.baseKey]: { ...guard, commitHash, updatedAt: now },
-		},
-	};
-	await savePlansRegistry(updated, cwd);
-	log.info("associateNoteWithCommit: migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
+	await withPlansLock(cwd, async () => {
+		const registry = await loadPlansRegistry(cwd);
+		const notes = registry.notes;
+		const guard = notes?.[split.baseKey];
+		if (!guard?.contentHashAtCommit || !guard.commitHash?.startsWith(split.oldShortHash)) {
+			log.debug("associateNoteWithCommit: no matching guard for %s, skipping", noteId);
+			return;
+		}
+		const now = new Date().toISOString();
+		const updated: PlansRegistry = {
+			...registry,
+			notes: {
+				...(notes as NonNullable<PlansRegistry["notes"]>),
+				[split.baseKey]: { ...guard, commitHash, updatedAt: now },
+			},
+		};
+		await savePlansRegistry(updated, cwd);
+		log.info("associateNoteWithCommit: migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
+	});
 }
 
 /**
@@ -1074,44 +1079,50 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string, _branch:
 	const mapKey = `${ref.source}:${ref.nativeId}`;
 	const now = new Date().toISOString();
 
-	const beforeRegistry = await loadPlansRegistry(cwd);
-	const beforeReferences = referencesOf(beforeRegistry);
-	const existing = beforeReferences[mapKey];
+	// Whole load→save under plans.lock so a concurrent StopHook / QueueWorker /
+	// Codex-discovery write to plans.json can't clobber this reference (and vice
+	// versa). The near-write reread + per-key merge below is retained as residual
+	// mitigation for the best-effort path where the lock couldn't be acquired.
+	await withPlansLock(cwd, async () => {
+		const beforeRegistry = await loadPlansRegistry(cwd);
+		const beforeReferences = referencesOf(beforeRegistry);
+		const existing = beforeReferences[mapKey];
 
-	const next: ReferenceEntry =
-		existing !== undefined
-			? {
-					...existing,
-					title: ref.title,
-					url: ref.url,
-					sourcePath,
-					sourceToolName: ref.toolName,
-					updatedAt: now,
-				}
-			: {
-					source: ref.source,
-					nativeId: ref.nativeId,
-					title: ref.title,
-					url: ref.url,
-					sourcePath,
-					addedAt: now,
-					updatedAt: now,
-					sourceToolName: ref.toolName,
-				};
+		const next: ReferenceEntry =
+			existing !== undefined
+				? {
+						...existing,
+						title: ref.title,
+						url: ref.url,
+						sourcePath,
+						sourceToolName: ref.toolName,
+						updatedAt: now,
+					}
+				: {
+						source: ref.source,
+						nativeId: ref.nativeId,
+						title: ref.title,
+						url: ref.url,
+						sourcePath,
+						addedAt: now,
+						updatedAt: now,
+						sourceToolName: ref.toolName,
+					};
 
-	// Near-write reread — only overwrites our own mapKey, so a concurrent writer
-	// touching other mapKeys between our two loadPlansRegistry calls is preserved.
-	const freshRegistry = await loadPlansRegistry(cwd);
-	const freshReferences = referencesOf(freshRegistry);
-	const references = { ...freshReferences, [mapKey]: next };
-	const out: PlansRegistry = {
-		version: 1,
-		plans: freshRegistry.plans,
-		...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
-		references,
-	};
-	await savePlansRegistry(out, cwd);
-	log.info("upsertReferenceEntry: %s (%s)", mapKey, existing === undefined ? "new" : "updated");
+		// Near-write reread — only overwrites our own mapKey, so a concurrent writer
+		// touching other mapKeys between our two loadPlansRegistry calls is preserved.
+		const freshRegistry = await loadPlansRegistry(cwd);
+		const freshReferences = referencesOf(freshRegistry);
+		const references = { ...freshReferences, [mapKey]: next };
+		const out: PlansRegistry = {
+			version: 1,
+			plans: freshRegistry.plans,
+			...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
+			references,
+		};
+		await savePlansRegistry(out, cwd);
+		log.info("upsertReferenceEntry: %s (%s)", mapKey, existing === undefined ? "new" : "updated");
+	});
 }
 
 // ─── Active-entry queries for prompt assembly ───────────────────────────────

@@ -90,12 +90,23 @@ function gitRevParseCommonDir(cwd: string): Promise<{ stdout: string; stderr: st
 export const WORKER_LOCK_FILE = "worker.lock";
 export const ORPHAN_WRITE_LOCK_FILE = "orphan-write.lock";
 export const SYNC_LOCK_FILE = "sync.lock";
+export const PLANS_LOCK_FILE = "plans.lock";
 
 /** Default wait budget for `acquireOrphanWriteLock` (background callers). */
 export const DEFAULT_ORPHAN_WRITE_TIMEOUT_MS = 1000;
 
 /** Default poll interval while waiting for `orphan-write.lock`. */
 export const DEFAULT_ORPHAN_WRITE_POLL_MS = 50;
+
+/**
+ * Default wait budget for `withPlansLock`. The protected critical section is a
+ * sub-millisecond read-modify-write of `plans.json`, so a peer holder clears
+ * almost instantly; 5 s is generous headroom before we fall back to best-effort.
+ */
+export const DEFAULT_PLANS_LOCK_TIMEOUT_MS = 5000;
+
+/** Default poll interval while waiting for `plans.lock`. */
+export const DEFAULT_PLANS_LOCK_POLL_MS = 25;
 
 /** Optional knobs for `acquireOrphanWriteLock`. */
 export interface OrphanWriteLockOpts {
@@ -268,4 +279,65 @@ export async function acquireOrphanWriteLock(cwd?: string, opts: OrphanWriteLock
 export async function releaseOrphanWriteLock(cwd?: string): Promise<void> {
 	const dir = await resolveSharedLockDir(cwd);
 	await releaseIfOwned(join(dir, ORPHAN_WRITE_LOCK_FILE), "orphan-write.lock");
+}
+
+/**
+ * Runs `fn` while holding `plans.lock`, serialising the read-modify-write of
+ * `plans.json` (plans, notes, and references) across processes.
+ *
+ * **Why it's needed.** `plans.json` has several concurrent writers, both in
+ * separate OS processes and inside one process:
+ *   - Claude StopHook (spawned at agent stop) — plans + references.
+ *   - QueueWorker (spawned post-commit) — plan/note archival, reference finalize.
+ *   - Codex reference-discovery tick (IDE extension host) — references.
+ *   - The IDE extension-host services — `ReferenceService`, `PlanService`,
+ *     `NoteService`, and the summary webview's plan-title sync — on user actions.
+ * Each does a load → mutate → `savePlansRegistry` (whole-file write). The
+ * in-function "near-write reread + per-key merge" only narrows the SAME-flow
+ * window; two loaders that each miss the other's row let the later
+ * `savePlansRegistry` clobber it. A shared lock around the RMW closes that
+ * window. It only works if EVERY writer takes it — partial coverage serialises
+ * nothing; all the writers above call through here.
+ *
+ * **Cross-process AND intra-process.** This is a PID-tagged file lock, but it
+ * serialises both ways: across processes via the PID/mtime staleness protocol,
+ * and between two SEPARATE async flows in one process (e.g. the discovery tick
+ * vs. a sidebar edit, both in the extension host) because the second contender
+ * poll-waits until the first releases. The ONE thing it cannot do is re-entrancy
+ * (a single flow that already holds it calling `withPlansLock` again) — that
+ * polls to timeout then runs best-effort. Hence the "MUST NOT be nested" rule.
+ *
+ * **Per-worktree.** The lock lives in `<cwd>/.jolli/jollimemory/` next to the
+ * `plans.json` it guards, so two git worktrees (each with their own
+ * `plans.json`) never contend with each other.
+ *
+ * **Best-effort fallback.** If the lock can't be acquired within `timeoutMs`
+ * (a peer holding it pathologically long — a fast RMW never does, and a crashed
+ * holder is reclaimed automatically once stale), `fn` still runs so writes that
+ * MUST land (StopHook / QueueWorker archival) are never silently dropped; the
+ * pre-existing per-key merge remains as residual mitigation. MUST NOT be nested:
+ * wrap leaf RMW functions only, never a caller that already holds it.
+ */
+export async function withPlansLock<T>(
+	cwd: string | undefined,
+	fn: () => Promise<T>,
+	opts: OrphanWriteLockOpts = {},
+): Promise<T> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_PLANS_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PLANS_LOCK_POLL_MS;
+	const dir = await ensureWorktreeLockDir(cwd);
+	const lockPath = join(dir, PLANS_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) {
+		log.warn(
+			"withPlansLock: could not acquire %s within %d ms — proceeding best-effort (per-key merge still mitigates)",
+			PLANS_LOCK_FILE,
+			timeoutMs,
+		);
+	}
+	try {
+		return await fn();
+	} finally {
+		if (acquired) await releaseIfOwned(lockPath, PLANS_LOCK_FILE);
+	}
 }

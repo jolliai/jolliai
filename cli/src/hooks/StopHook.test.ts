@@ -19,6 +19,13 @@ vi.mock("../core/references/ReferenceExtractor.js", () => ({
 	extractReferencesFromTranscript: vi.fn().mockResolvedValue({ references: [], lastLineNumberScanned: 0 }),
 }));
 
+// Mock Locks — these unit tests run with synthetic cwds (e.g. "/project"), so
+// the real per-worktree lock would create junk dirs off the drive root. Run the
+// plans.json RMW body inline; the lock contract is covered in Locks.test.ts.
+vi.mock("../core/Locks.js", () => ({
+	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+}));
+
 // Mock node:fs so we can control existsSync / readFileSync / createReadStream
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();

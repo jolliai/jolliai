@@ -63,6 +63,12 @@ const { mockExecFileSync } = vi.hoisted(() => ({
 
 // ─── vi.mock declarations ────────────────────────────────────────────────────
 
+// plans.lock passthrough — run the RMW body inline (no real lock file I/O on the
+// synthetic CWD). The lock contract is covered in cli/src/core/Locks.test.ts.
+vi.mock("../../../cli/src/core/Locks.js", () => ({
+	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+}));
+
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadAllSessions,
 	loadPlansRegistry,
@@ -746,11 +752,18 @@ describe("PlanService", () => {
 			const entry = makeEntry();
 			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "test-plan": entry } });
 			// Simulate loadPlansRegistry having stripped a legacy field/row: changed=true
-			// even though there are no orphaned entries to clean.
-			loadPlansRegistryWithStatus.mockResolvedValueOnce({
-				registry: { version: 1, plans: { "test-plan": entry } },
-				changed: true,
-			});
+			// even though there are no orphaned entries to clean. Two primed responses:
+			// the read-side load, then the fresh re-read done inside plans.lock before
+			// the writeback (nothing persisted yet, so both report changed=true).
+			loadPlansRegistryWithStatus
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: { "test-plan": entry } },
+					changed: true,
+				})
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: { "test-plan": entry } },
+					changed: true,
+				});
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Test Plan");
 			mockStatSync.mockReturnValue({ mtime: new Date("2025-06-01T00:00:00.000Z") });

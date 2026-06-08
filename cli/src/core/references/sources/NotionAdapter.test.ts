@@ -105,6 +105,16 @@ describe("NotionAdapter.extractRef", () => {
 		expect(NotionAdapter.extractRef(payload, fetchTool, ts)?.nativeId).toBe("36c4fc101d34805ab1fdfb3e69144580");
 	});
 
+	it("accepts the app.notion.com host with the /p/<32hex> form (Codex notion-fetch shape)", () => {
+		// Real Codex `notion-fetch` rollouts return this host/form; the adapter is
+		// shared with the Claude path, so this host is accepted on both.
+		const payload = {
+			...REAL_FETCH_PAYLOAD,
+			url: "https://app.notion.com/p/36c4fc101d34805ab1fdfb3e69144580",
+		};
+		expect(NotionAdapter.extractRef(payload, fetchTool, ts)?.nativeId).toBe("36c4fc101d34805ab1fdfb3e69144580");
+	});
+
 	it("normalizes the page id to lowercase", () => {
 		const payload = {
 			...REAL_FETCH_PAYLOAD,

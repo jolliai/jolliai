@@ -421,6 +421,29 @@ describe("CodexEnvelopeParser.parse — beforeTimestamp cutoff (P2)", () => {
 		expect(results).toHaveLength(1);
 		expect((results[0].payload as { id?: string }).id).toBe("AAA-1");
 	});
+
+	it("advances the cursor past a request whose ONLY result was cutoff-dropped (no deadlock)", () => {
+		// Regression: the request's output exists but is past the cutoff, so it is
+		// dropped. The cursor must still advance past the request — otherwise it is
+		// pinned to this line every poll, the same output is re-dropped forever, and
+		// all later lines become permanently unreachable.
+		const lines = [
+			row("2026-06-05T11:00:00.000Z", {
+				type: "function_call",
+				name: "_fetch",
+				namespace: "mcp__codex_apps__linear",
+				call_id: "late1",
+			}),
+			row("2026-06-05T11:00:01.000Z", { type: "function_call_output", call_id: "late1", output: arr(late) }),
+		];
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(
+			lines,
+			{ beforeTimestamp: "2026-06-05T10:30:00.000Z" },
+			ALL_ADAPTERS,
+		);
+		expect(results).toHaveLength(0); // cutoff-dropped, nothing emitted
+		expect(lastLineNumberScanned).toBe(2); // EOF, NOT pinned back to the request line (0)
+	});
 });
 
 describe("CodexEnvelopeParser end-to-end via extractReferencesFromTranscript (source=codex, real adapters)", () => {
