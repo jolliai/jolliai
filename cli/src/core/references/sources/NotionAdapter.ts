@@ -71,17 +71,13 @@ function isAllowedHost(url: string): boolean {
 
 export const NotionAdapter: SourceAdapter = {
 	id: "notion",
-	mcpPrefix: "mcp__claude_ai_Notion__",
 	wrapperKeys: ["results", "items", "pages"],
 	maxCharsPerReference: MAX_CHARS,
 
 	extractRef(payload, toolName, referencedAt) {
-		// Scope: only notion-fetch. Other notion-* tools (search /
-		// update-page / etc.) silently return null even when their MCP prefix
-		// matches. notion-search is deferred pending payload-shape
-		// investigation.
-		if (!toolName.endsWith("notion-fetch")) return null;
-
+		// Tool-level business scope (only `notion-fetch`, excluding search/update/
+		// write) lives in the producer bindings now — by the time we run, the tool
+		// is already in scope. This is a pure shape check.
 		if (!isObject(payload)) return null;
 		const obj = payload as Record<string, unknown>;
 		const metadata = obj.metadata;

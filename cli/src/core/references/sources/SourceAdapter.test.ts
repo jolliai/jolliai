@@ -3,17 +3,15 @@ import type { Reference, SourceId } from "../../../Types.js";
 import type { SourceAdapter } from "./SourceAdapter.js";
 
 describe("SourceAdapter type contract", () => {
-	it("requires id, mcpPrefix, wrapperKeys, maxCharsPerReference, extractRef, renderPromptBlock", () => {
+	it("requires id, wrapperKeys, maxCharsPerReference, extractRef, renderPromptBlock", () => {
 		const dummy: SourceAdapter = {
 			id: "linear" satisfies SourceId,
-			mcpPrefix: "mcp__test__",
 			wrapperKeys: [],
 			maxCharsPerReference: 100,
 			extractRef: () => null,
 			renderPromptBlock: () => "",
 		};
 		expect(dummy.id).toBe("linear");
-		expect(dummy.mcpPrefix).toBe("mcp__test__");
 		expect(dummy.wrapperKeys).toEqual([]);
 		expect(dummy.maxCharsPerReference).toBe(100);
 		expect(dummy.extractRef({}, "tool", "2026-05-26T00:00:00Z")).toBeNull();

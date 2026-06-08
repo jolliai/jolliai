@@ -3315,7 +3315,7 @@ describe("SidebarWebviewProvider", () => {
 	// runs on the 60s tick. Locks the wiring so a future handleRefresh refactor
 	// can't silently drop it. (scope "kb"/"status" don't refresh conversations, so
 	// they deliberately don't trigger it.)
-	describe("manual refresh triggers Codex reference discovery", () => {
+	describe("manual refresh triggers Codex discovery", () => {
 		function makeProviderWithCodex(discover: ReturnType<typeof vi.fn>): {
 			provider: SidebarWebviewProvider;
 			view: MockWebviewView;
@@ -3334,7 +3334,7 @@ describe("SidebarWebviewProvider", () => {
 				activeSessionsProvider: {
 					listWithDiagnostics: vi.fn().mockResolvedValue({ items: [], failedSources: [] }),
 				} as unknown as never,
-				codexReferenceDiscovery: { discover },
+				codexDiscovery: { discover },
 			});
 			const view = makeMockView();
 			provider.resolveWebviewView(view as unknown as never);

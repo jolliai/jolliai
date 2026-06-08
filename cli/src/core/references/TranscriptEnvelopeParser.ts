@@ -46,17 +46,19 @@ export interface ExtractOptions {
  */
 export interface NormalizedToolResult {
 	/**
-	 * The adapter that matched this tool call — carried as a reference, NOT
-	 * re-derived from a SourceId. Claude's `mcp__claude_ai_Atlassian__`→jira /
-	 * `mcp__claude_ai_Notion__`→notion are prefix≠SourceId, so a mechanical
-	 * derivation would be wrong; the parser already knows which adapter matched.
+	 * The adapter that matched this tool call. The producer binding resolves the
+	 * tool identity to a `SourceId` (e.g. Claude's `mcp__claude_ai_Atlassian__`→jira,
+	 * `mcp__claude_ai_Notion__`→notion — prefix≠SourceId) and the parser maps that
+	 * to the adapter via `adapters.find(a => a.id === id)`, carrying it here so the
+	 * driver never has to re-derive it.
 	 */
 	readonly adapter: SourceAdapter;
 	/**
-	 * The tool name passed to `adapter.extractRef` for its business guard.
-	 * Claude: the raw `block.name` (e.g. `mcp__github__issue_read`) — passed
-	 * through verbatim. Codex: a canonical name the adapter's guard accepts
-	 * (the CodexEnvelopeParser maps the connector tool name to it).
+	 * The tool name carried through to `Reference.toolName` (persisted as
+	 * `sourceToolName`). Claude: the raw `block.name` (e.g.
+	 * `mcp__github__issue_read`), verbatim. Codex: the binding's canonical name
+	 * (the connector's real tool name is mapped to a stable synthetic one). The
+	 * purified adapter no longer inspects this — recognition lives in the binding.
 	 */
 	readonly toolName: string;
 	/** Already-`JSON.parse`d, envelope-stripped payload object. */

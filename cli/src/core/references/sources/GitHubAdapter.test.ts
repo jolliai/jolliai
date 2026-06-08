@@ -158,9 +158,8 @@ describe("GitHubAdapter.extractRef", () => {
 		expect(GitHubAdapter.extractRef(42, toolName, ts)).toBeNull();
 	});
 
-	it("rejects payloads delivered under a non-GitHub tool name (defense-in-depth)", () => {
-		expect(GitHubAdapter.extractRef(ISSUE_959_PAYLOAD, "mcp__linear__get_issue", ts)).toBeNull();
-	});
+	// Note: source recognition (rejecting non-GitHub tool names) moved to the
+	// producer bindings; the purified adapter is a pure shape check.
 
 	it("accepts milestone as a bare string", () => {
 		const payload = {
@@ -337,9 +336,8 @@ describe("GitHubAdapter.renderPromptBlock", () => {
 });
 
 describe("GitHubAdapter metadata", () => {
-	it("exposes id, mcpPrefix, wrapperKeys, maxCharsPerReference", () => {
+	it("exposes id, wrapperKeys, maxCharsPerReference", () => {
 		expect(GitHubAdapter.id).toBe("github");
-		expect(GitHubAdapter.mcpPrefix).toBe("mcp__github__");
 		expect(GitHubAdapter.wrapperKeys).toEqual(["items", "issues", "nodes", "results"]);
 		expect(GitHubAdapter.maxCharsPerReference).toBe(4000);
 	});

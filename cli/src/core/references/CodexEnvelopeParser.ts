@@ -14,13 +14,13 @@
  * `api.atlassian.com` gateway). The event is used only as a fallback for
  * call_ids that produced no `function_call_output`.
  *
- * Normalisation (§3.4) makes each payload digestible by the UNCHANGED adapters:
- *   - toolName → a canonical name the adapter's guard accepts (CodexToolMap).
- *   - GitHub   → unwrap `issue.*`, `issue_number`→`number`, `url`→`html_url`,
- *                flatten object-array `labels`/`assignees` to string arrays.
- *   - Linear/Notion/Jira → pass through (Linear ticket id is already in `id`;
- *     Jira `issues.nodes[]` carries `webUrl` and the adapter's wrapperKeys
- *     descend into it; Notion shape already matches).
+ * Tool identity and per-source normalisation are NOT in this file — they live in
+ * the `./bindings/codex` producer registry ({@link CodexBinding}). Each binding
+ * declares the tool names it is reached through (fetch AND search), the canonical
+ * tool name persisted as `sourceToolName`, and how to normalize its payload
+ * (single entity or search/list collection) for the UNCHANGED adapters. This
+ * parser only correlates lines and delegates identity + normalisation to that
+ * registry.
  *
  * Robustness: the `Wall time:` prefix is stripped only when present; every parse
  * is wrapped and a non-JSON output (e.g. `execution error: Io(...)`) is skipped.
@@ -28,7 +28,7 @@
 
 import { createLogger } from "../../Logger.js";
 import type { SourceId } from "../../Types.js";
-import { canonicalToolName, sourceFromFunctionCall, sourceFromInvocationTool } from "./CodexToolMap.js";
+import { codexBindingFromFunctionCall, codexBindingFromInvocationTool } from "./bindings/codex/index.js";
 import type { SourceAdapter } from "./sources/SourceAdapter.js";
 import type {
 	EnvelopeParseResult,
@@ -148,17 +148,17 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		for (const [callId, out] of outputs) {
 			const call = calls.get(callId);
 			if (call === undefined) continue;
-			const source = sourceFromFunctionCall(call.namespace, call.name);
-			if (source === null) continue;
+			const binding = codexBindingFromFunctionCall(call.namespace, call.name);
+			if (binding === null) continue;
 			const business = parseFunctionCallOutput(out.output);
 			if (business === null) continue;
-			const adapter = adapterFor(source);
+			const adapter = adapterFor(binding.id);
 			/* v8 ignore next -- adapters always include all four sources; guarded for totality. */
 			if (adapter === undefined) continue;
 			results.push({
 				adapter,
-				toolName: canonicalToolName(source),
-				payload: normalizeForSource(source, business),
+				toolName: binding.canonicalToolName,
+				payload: binding.normalize(business),
 				lineNumber: out.lineNumber,
 				referencedAt: out.referencedAt,
 			});
@@ -168,17 +168,30 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		// FALLBACK: mcp_tool_call_end events for call_ids without a paired output.
 		for (const ev of events) {
 			if (ev.callId !== undefined && emitted.has(ev.callId)) continue;
-			const source = sourceFromInvocationTool(ev.tool);
-			if (source === null) continue;
-			const business = tryParse(ev.text);
+			const binding = codexBindingFromInvocationTool(ev.tool);
+			if (binding === null) continue;
+			let business = tryParse(ev.text);
 			if (business === null) continue;
-			const adapter = adapterFor(source);
+			// Recovery (NOT the main path): reaching the fallback for a call_id that
+			// ALSO has a function_call output means that output failed to parse (a
+			// successful parse would have emitted + marked it in PRIMARY). Some fields
+			// live ONLY on that malformed output (e.g. Jira's tenant webUrl), so let
+			// the binding stitch them onto this valid event payload. Bindings without
+			// this brittle edge leave `recover` unset.
+			if (binding.recover !== undefined && ev.callId !== undefined) {
+				const rawOutput = outputs.get(ev.callId)?.output;
+				if (rawOutput !== undefined) {
+					const stitched = binding.recover(business, rawOutput);
+					if (stitched !== null) business = stitched;
+				}
+			}
+			const adapter = adapterFor(binding.id);
 			/* v8 ignore next -- adapters always include all four sources; guarded for totality. */
 			if (adapter === undefined) continue;
 			results.push({
 				adapter,
-				toolName: canonicalToolName(source),
-				payload: normalizeForSource(source, business),
+				toolName: binding.canonicalToolName,
+				payload: binding.normalize(business),
 				lineNumber: ev.lineNumber,
 				referencedAt: ev.referencedAt,
 			});
@@ -203,7 +216,7 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		let safeCursor = lastConsumed;
 		for (const [callId, call] of calls) {
 			if (satisfied.has(callId)) continue;
-			if (sourceFromFunctionCall(call.namespace, call.name) === null) continue;
+			if (codexBindingFromFunctionCall(call.namespace, call.name) === null) continue;
 			if (call.lineIndex < safeCursor) safeCursor = call.lineIndex;
 		}
 		return { results, lastLineNumberScanned: safeCursor };
@@ -257,63 +270,6 @@ function unwrapTextArray(value: unknown): unknown {
 		return inner === null ? value : inner;
 	}
 	return value;
-}
-
-// ─── per-source normalisation (§3.4) ─────────────────────────────────────────
-
-function normalizeForSource(source: SourceId, business: unknown): unknown {
-	if (source === "github") return reshapeGitHub(business);
-	// linear / notion / jira pass through unchanged.
-	return business;
-}
-
-/**
- * Reshape the Codex GitHub payload into the shape `GitHubAdapter.extractRef`
- * reads: unwrap `issue.*` to top level, rename `issue_number`→`number` and
- * `url`→`html_url`, and flatten the object-array `labels`/`assignees` into the
- * string arrays the adapter's `readStringList` expects. Non-object input is
- * returned as-is (the adapter will reject it).
- */
-function reshapeGitHub(business: unknown): unknown {
-	if (!isObject(business)) return business;
-	const issue = isObject(business.issue) ? business.issue : business;
-	const out: Record<string, unknown> = {};
-
-	const num = issue.issue_number ?? issue.number;
-	if (typeof num === "number") out.number = num;
-	if (typeof issue.title === "string") out.title = issue.title;
-	const url = issue.url ?? issue.html_url;
-	if (typeof url === "string") out.html_url = url;
-	if (typeof issue.body === "string") out.body = issue.body;
-	if (typeof issue.state === "string") out.state = issue.state;
-
-	const labels = flattenNamed(issue.labels, "name");
-	if (labels !== undefined) out.labels = labels;
-	const assignees = flattenNamed(issue.assignees, "login");
-	if (assignees !== undefined) out.assignees = assignees;
-
-	const fullName = issue.repository_full_name ?? business.repository_full_name;
-	if (typeof fullName === "string") out.repository = { full_name: fullName };
-
-	return out;
-}
-
-/**
- * Flatten an array of `{[key]: string}` objects (or bare strings) into a string
- * array. Returns undefined when the input is not a non-empty usable array.
- */
-function flattenNamed(value: unknown, key: "name" | "login"): string[] | undefined {
-	if (!Array.isArray(value)) return undefined;
-	const out: string[] = [];
-	for (const item of value) {
-		if (typeof item === "string" && item.length > 0) {
-			out.push(item);
-		} else if (isObject(item)) {
-			const v = item[key];
-			if (typeof v === "string" && v.length > 0) out.push(v);
-		}
-	}
-	return out.length > 0 ? out : undefined;
 }
 
 // ─── field readers ───────────────────────────────────────────────────────────

@@ -106,16 +106,13 @@ function buildFields(
 
 export const JiraAdapter: SourceAdapter = {
 	id: "jira",
-	mcpPrefix: "mcp__claude_ai_Atlassian__",
 	wrapperKeys: ["nodes", "issues", "items", "results"],
 	maxCharsPerReference: DEFAULT_MAX_CHARS,
 
 	extractRef(payload, toolName, referencedAt) {
-		// Defense-in-depth: reject payloads delivered under non-Atlassian tool
-		// names even if walkPayload routed us here. The pending-map dispatch in
-		// ReferenceExtractor already filters by mcpPrefix, but a future caller
-		// could invoke us directly.
-		if (!toolName.includes("mcp__claude_ai_Atlassian__")) return null;
+		// Source recognition is the binding's job; this is a pure shape check. The
+		// Jira `key` + `fields.summary` requirements are what scope the payload to a
+		// Jira issue (e.g. a Confluence page lacks both).
 		if (!isObject(payload)) return null;
 		const obj = payload as Record<string, unknown>;
 		const key = obj.key;

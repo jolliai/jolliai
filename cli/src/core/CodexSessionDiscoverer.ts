@@ -7,7 +7,7 @@
  * filesystem. This runs both at post-commit time (for summaries) and on the
  * VS Code sidebar's 60s Active Conversations tick — the latter also drives
  * Codex reference extraction (Linear/Jira/GitHub/Notion) via
- * `CodexReferenceDiscovery.discoverCodexReferences`, which reuses the shared
+ * `CodexDiscovery.discoverCodexConversations`, which reuses the shared
  * `discovery-cursors.json` incremental cursor.
  *
  * Algorithm:

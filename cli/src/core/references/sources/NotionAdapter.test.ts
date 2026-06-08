@@ -39,15 +39,8 @@ describe("NotionAdapter.extractRef", () => {
 		expect(ref?.description).toContain("Notion Adapter");
 	});
 
-	it("returns null for notion-search (search-tool gate)", () => {
-		const ref = NotionAdapter.extractRef(REAL_FETCH_PAYLOAD, "mcp__claude_ai_Notion__notion-search", ts);
-		expect(ref).toBeNull();
-	});
-
-	it("returns null for notion-update-page (write-tool gate)", () => {
-		const ref = NotionAdapter.extractRef(REAL_FETCH_PAYLOAD, "mcp__claude_ai_Notion__notion-update-page", ts);
-		expect(ref).toBeNull();
-	});
+	// Note: the notion-fetch-only tool gate (rejecting notion-search/update/write)
+	// moved to the Claude binding (bindings/claude); see its test for that scope.
 
 	it("extracts the page id from a slug-32hex URL (Page-Title-<32hex>)", () => {
 		const payload = {
@@ -312,9 +305,8 @@ describe("NotionAdapter.renderPromptBlock", () => {
 });
 
 describe("NotionAdapter metadata", () => {
-	it("exposes id, mcpPrefix, wrapperKeys, maxCharsPerReference", () => {
+	it("exposes id, wrapperKeys, maxCharsPerReference", () => {
 		expect(NotionAdapter.id).toBe("notion");
-		expect(NotionAdapter.mcpPrefix).toBe("mcp__claude_ai_Notion__");
 		expect(NotionAdapter.wrapperKeys).toEqual(["results", "items", "pages"]);
 		expect(NotionAdapter.maxCharsPerReference).toBe(30000);
 	});

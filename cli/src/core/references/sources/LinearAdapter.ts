@@ -61,7 +61,6 @@ function buildFields(
 
 export const LinearAdapter: SourceAdapter = {
 	id: "linear",
-	mcpPrefix: "mcp__linear__",
 	wrapperKeys: ["items", "issues", "nodes", "results"],
 	maxCharsPerReference: DEFAULT_MAX_CHARS,
 

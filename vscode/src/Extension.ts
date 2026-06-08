@@ -13,7 +13,7 @@ import {
 	conversationKey,
 	setExcluded,
 } from "../../cli/src/core/CommitSelectionStore.js";
-import { discoverCodexReferences } from "../../cli/src/core/CodexReferenceDiscovery.js";
+import { discoverCodexConversations } from "../../cli/src/core/CodexDiscovery.js";
 import type { FolderStorage, ForceRegenerateResult } from "../../cli/src/core/FolderStorage.js";
 import {
 	extractRepoName,
@@ -939,14 +939,14 @@ export function activate(context: vscode.ExtensionContext): void {
 		// Active Conversations source for the Branch tab (hoisted above so
 		// selectAllConversationsCommand can reference it directly).
 		activeSessionsProvider: activeSessionsProvider,
-		// Polling-path Codex reference extraction, ridden on the 60s Active
-		// Conversations tick. Resolves cwd here; discoverCodexReferences never
+		// Polling-path Codex artifact discovery, ridden on the 60s Active
+		// Conversations tick. Resolves cwd here; discoverCodexConversations never
 		// rejects (per-cwd single-flight + internal error swallowing), so this is
 		// a safe fire-and-forget.
-		codexReferenceDiscovery: {
+		codexDiscovery: {
 			discover: () => {
 				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-				if (cwd) void discoverCodexReferences(cwd);
+				if (cwd) void discoverCodexConversations(cwd);
 			},
 		},
 		initialStateReady,
