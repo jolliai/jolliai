@@ -18,6 +18,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import { withPlansLock } from "../../../cli/src/core/Locks.js";
 import { isPathInside } from "../../../cli/src/core/PathUtils.js";
 import {
 	loadPlansRegistry,
@@ -48,7 +49,13 @@ export async function detectNotes(cwd: string): Promise<Array<NoteInfo>> {
 	// panel refresh after upgrade (deterministic-writeback migration).
 	const { registry, changed } = await loadPlansRegistryWithStatus(cwd);
 	if (changed) {
-		await savePlansRegistry(registry, cwd);
+		// Migration writeback (rare). Take plans.lock and re-read fresh inside it
+		// so this cleanup can't clobber a concurrent write. The list below is built
+		// from the pre-lock snapshot, which is fine for a read-side refresh.
+		await withPlansLock(cwd, async () => {
+			const fresh = await loadPlansRegistryWithStatus(cwd);
+			if (fresh.changed) await savePlansRegistry(fresh.registry, cwd);
+		});
 	}
 	const notes = registry.notes ?? {};
 
@@ -126,8 +133,15 @@ export async function saveNote(
 		commitHash: existingNotes[noteId]?.commitHash ?? null,
 	};
 
-	existingNotes[noteId] = entry;
-	await savePlansRegistry({ ...registry, notes: existingNotes }, cwd);
+	// plans.lock + fresh re-read so this single-note upsert can't clobber a
+	// concurrent write to another note/plan/reference (or be clobbered by it).
+	// Preserve `addedAt` from the FRESH row if one appeared since the pre-lock read
+	// (e.g. a concurrent archival created it) rather than the pre-lock snapshot.
+	await withPlansLock(cwd, async () => {
+		const fresh = await loadPlansRegistry(cwd);
+		const merged: NoteEntry = { ...entry, addedAt: fresh.notes?.[noteId]?.addedAt ?? entry.addedAt };
+		await savePlansRegistry({ ...fresh, notes: { ...(fresh.notes ?? {}), [noteId]: merged } }, cwd);
+	});
 	log.info(
 		"notes",
 		`saveNote: ${id ? "updated" : "created"} ${noteId} (${format})`,
@@ -147,37 +161,51 @@ export async function saveNote(
  * already cleaned up by `archiveNoteForCommit` simply skip the file delete.
  */
 export async function removeNote(id: string, cwd: string, expectedCommitHash?: string): Promise<void> {
-	const registry = await loadPlansRegistry(cwd);
-	const notes = { ...(registry.notes ?? {}) };
-	// Resolve the key to delete. When `expectedCommitHash` is set (commit-summary
-	// dissociate flow), EVERY delete — exact id and archive base alike — is gated
-	// on the row still belonging to that commit (`row.commitHash === expectedCommitHash`).
-	// A registry row is a single time-evolving slot: an archived id like
-	// `note-x-abcdef12` from an old summary can later become a LIVE note under that
-	// exact id, or the base can be revived/re-committed. The gate stops a dissociation
-	// from an OLD commit from wiping a row that has moved on. Sidebar removal (no
-	// `expectedCommitHash`) deletes the exact id unconditionally.
-	let key: string | undefined;
-	if (expectedCommitHash === undefined) {
-		key = notes[id] !== undefined ? id : undefined;
-	} else if (notes[id]?.commitHash === expectedCommitHash) {
-		key = id;
-	} else {
-		const split = splitArchivedKey(id);
-		if (split && notes[split.baseKey]?.commitHash === expectedCommitHash) {
-			key = split.baseKey;
+	// Resolve, gate, and delete all on ONE fresh read inside plans.lock so the
+	// commit gate is checked against the same snapshot we delete from (and a
+	// concurrent write to another row survives). Returns the deleted entry so the
+	// backing-file cleanup can run AFTER the lock; returns null on a no-op.
+	const removed = await withPlansLock(cwd, async () => {
+		const registry = await loadPlansRegistry(cwd);
+		const notes = { ...(registry.notes ?? {}) };
+		// Resolve the key to delete. When `expectedCommitHash` is set (commit-summary
+		// dissociate flow), EVERY delete — exact id and archive base alike — is gated
+		// on the row still belonging to that commit (`row.commitHash === expectedCommitHash`).
+		// A registry row is a single time-evolving slot: an archived id like
+		// `note-x-abcdef12` from an old summary can later become a LIVE note under that
+		// exact id, or the base can be revived/re-committed. The gate stops a dissociation
+		// from an OLD commit from wiping a row that has moved on. Sidebar removal (no
+		// `expectedCommitHash`) deletes the exact id unconditionally.
+		let key: string | undefined;
+		if (expectedCommitHash === undefined) {
+			key = notes[id] !== undefined ? id : undefined;
+		} else if (notes[id]?.commitHash === expectedCommitHash) {
+			key = id;
+		} else {
+			const split = splitArchivedKey(id);
+			if (split && notes[split.baseKey]?.commitHash === expectedCommitHash) {
+				key = split.baseKey;
+			}
 		}
-	}
-	if (key === undefined) {
-		return;
-	}
-	const entry = notes[key];
-	if (!entry) {
+		if (key === undefined) {
+			return null;
+		}
+		const entry = notes[key];
+		if (!entry) {
+			return null;
+		}
+		delete notes[key];
+		await savePlansRegistry({ ...registry, notes }, cwd);
+		return { key, entry };
+	});
+	if (removed === null) {
 		return;
 	}
 
 	// Delete the backing file only when it is inside .jolli/jollimemory/ — the
-	// user's external markdown sources are never deleted.
+	// user's external markdown sources are never deleted. Done after the lock:
+	// the registry row is already gone, so a failed unlink can't strand state.
+	const { key, entry } = removed;
 	if (
 		entry.sourcePath &&
 		isPathInside(entry.sourcePath, getJolliMemoryDir(cwd)) &&
@@ -191,8 +219,6 @@ export async function removeNote(id: string, cwd: string, expectedCommitHash?: s
 		}
 	}
 
-	delete notes[key];
-	await savePlansRegistry({ ...registry, notes }, cwd);
 	log.info("notes", `Removed note ${key} from registry`);
 }
 
@@ -235,13 +261,18 @@ export async function archiveNoteForCommit(
 	// Update registry: the original id becomes the guard. No
 	// `<id>-<shortHash>` archive row — the orphan-branch snapshot (stored under
 	// newId below) + the CommitSummary NoteReference are the system of record.
-	notes[id] = {
+	const guardEntry: NoteEntry = {
 		...entry,
 		commitHash,
 		updatedAt: now,
 		contentHashAtCommit,
 	};
-	await savePlansRegistry({ ...registry, notes }, cwd);
+	// plans.lock + fresh re-read so the guard upsert merges onto the latest state
+	// instead of clobbering concurrent writes to other rows.
+	await withPlansLock(cwd, async () => {
+		const fresh = await loadPlansRegistry(cwd);
+		await savePlansRegistry({ ...fresh, notes: { ...(fresh.notes ?? {}), [id]: guardEntry } }, cwd);
+	});
 
 	// Store note in orphan branch. branch left undefined — see archivePlan-
 	// ForCommit for the rationale (FolderStorage resolves the commit's branch

@@ -32,10 +32,12 @@ import {
 	isWorkerLockStale,
 	LOCK_TIMEOUT_MS,
 	ORPHAN_WRITE_LOCK_FILE,
+	PLANS_LOCK_FILE,
 	refreshWorkerLockMtime,
 	releaseOrphanWriteLock,
 	releaseWorkerLock,
 	WORKER_LOCK_FILE,
+	withPlansLock,
 } from "./Locks.js";
 
 /**
@@ -53,6 +55,11 @@ function workerLockPath(tempDir: string): string {
  */
 function orphanWriteLockPath(tempDir: string): string {
 	return join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE);
+}
+
+/** plans.lock dir = per-worktree (`<cwd>/.jolli/jollimemory/`), like worker.lock. */
+function plansLockPath(tempDir: string): string {
+	return join(tempDir, ".jolli", "jollimemory", PLANS_LOCK_FILE);
 }
 
 describe("Locks", () => {
@@ -79,6 +86,7 @@ describe("Locks", () => {
 		// usual "file does not exist" case.
 		await rm(join(tempDir, ".jolli", "jollimemory", WORKER_LOCK_FILE), { force: true });
 		await rm(join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE), { force: true });
+		await rm(plansLockPath(tempDir), { force: true });
 	});
 
 	afterEach(async () => {
@@ -493,6 +501,82 @@ describe("Locks", () => {
 			await releaseWorkerLock(tempDir);
 
 			await expect(stat(lockPath)).rejects.toThrow();
+		});
+	});
+
+	describe("withPlansLock — per-worktree plans.json RMW serialisation", () => {
+		it("acquires, runs the body, returns its value, then releases the lock", async () => {
+			let lockHeldDuringBody = false;
+			const result = await withPlansLock(tempDir, async () => {
+				// The lock file exists (and is ours) for the duration of the body.
+				lockHeldDuringBody = await stat(plansLockPath(tempDir)).then(
+					() => true,
+					() => false,
+				);
+				return 42;
+			});
+			expect(result).toBe(42);
+			expect(lockHeldDuringBody).toBe(true);
+			// Released afterwards.
+			await expect(stat(plansLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("releases the lock even when the body throws", async () => {
+			await expect(
+				withPlansLock(tempDir, async () => {
+					throw new Error("boom");
+				}),
+			).rejects.toThrow("boom");
+			await expect(stat(plansLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("serialises two overlapping holders: the second waits for the first to release", async () => {
+			const order: string[] = [];
+			let releaseFirst: () => void = () => {};
+			const firstBodyEntered = new Promise<void>((resolve) => {
+				void withPlansLock(tempDir, async () => {
+					order.push("first-enter");
+					resolve();
+					await new Promise<void>((r) => {
+						releaseFirst = r;
+					});
+					order.push("first-exit");
+				});
+			});
+			await firstBodyEntered;
+			// Second contends while the first still holds the lock.
+			const second = withPlansLock(tempDir, async () => {
+				order.push("second-enter");
+			});
+			// Let the second poll a couple of times — it must NOT have entered yet.
+			await new Promise((r) => setTimeout(r, 60));
+			expect(order).toEqual(["first-enter"]);
+			releaseFirst();
+			await second;
+			expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
+		});
+
+		it("falls back to best-effort (still runs the body) when the lock can't be acquired in time", async () => {
+			// Pre-create a fresh lock owned by THIS process (a live PID) so the
+			// acquire poll can never reclaim it. The body must still run, and the
+			// pre-existing lock must survive (we never owned it, so we don't release).
+			const { mkdir } = await import("node:fs/promises");
+			await mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
+			await writeFile(plansLockPath(tempDir), String(process.pid), "utf-8");
+
+			let ran = false;
+			const result = await withPlansLock(
+				tempDir,
+				async () => {
+					ran = true;
+					return "best-effort";
+				},
+				{ timeoutMs: 80, pollMs: 20 },
+			);
+			expect(ran).toBe(true);
+			expect(result).toBe("best-effort");
+			// The foreign-owned lock is untouched.
+			await expect(stat(plansLockPath(tempDir))).resolves.toBeDefined();
 		});
 	});
 });

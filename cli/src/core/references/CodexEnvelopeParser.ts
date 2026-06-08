@@ -69,6 +69,13 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		const calls = new Map<string, FunctionCallRow>();
 		const outputs = new Map<string, FunctionOutputRow>();
 		const events: ToolCallEndRow[] = [];
+		// call_ids whose result row (a function_call_output OR an mcp_tool_call_end)
+		// physically appeared in this scan window — recorded BEFORE the cutoff filter
+		// and regardless of parse success. This drives cursor-hold (see below). It is
+		// deliberately decoupled from `outputs`/`events` (which are cutoff-filtered
+		// and parse-gated): a request whose result was dropped by `beforeTimestamp`
+		// or failed to parse has still been answered, so it must not pin the cursor.
+		const resultSeen = new Set<string>();
 		let lastConsumed = fromLine;
 
 		for (let i = fromLine; i < lines.length; i++) {
@@ -119,6 +126,10 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 				}
 				case "function_call_output": {
 					const output = readString(payload.output);
+					// Mark the request answered for cursor-hold purposes BEFORE any
+					// cutoff/parse gate — otherwise a cutoff-dropped result would leave
+					// its request looking in-flight and pin the cursor on it forever.
+					if (callId !== undefined) resultSeen.add(callId);
 					// Honour the parser-interface beforeTimestamp contract: drop results
 					// whose timestamp is past the cutoff (same semantics as the Claude parser).
 					if (afterCutoff(referencedAt, opts.beforeTimestamp)) break;
@@ -128,6 +139,7 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 					break;
 				}
 				case "mcp_tool_call_end": {
+					if (callId !== undefined) resultSeen.add(callId);
 					if (afterCutoff(referencedAt, opts.beforeTimestamp)) break;
 					const tool = readInvocationTool(payload.invocation);
 					const text = readToolCallEndText(payload.result);
@@ -205,14 +217,24 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		// between a request and its `function_call_output`; advancing to EOF here
 		// would strand that output next poll (the output row has no namespace/name,
 		// so it can't be sourced without re-reading its request — Jira's tenant
-		// webUrl lives only on that paired output). A request is "satisfied" if its
-		// call_id has an output OR an event in this window; otherwise we resume from
-		// its line so the next poll re-correlates it (re-scan is idempotent via
+		// webUrl lives only on that paired output). A request is "satisfied" once a
+		// result row (output OR event) for its call_id has appeared, tracked in
+		// `resultSeen` — note this is recorded pre-cutoff and pre-parse, so a result
+		// that was cutoff-dropped or failed to parse still counts. (Using
+		// `outputs`/`events` here instead would deadlock: a cutoff-dropped result
+		// never lands in `outputs`, so the cursor would be pulled back to the same
+		// request every poll and never reach EOF.) Unsatisfied requests resume from
+		// their line so the next poll re-correlates them (re-scan is idempotent via
 		// dedupe + upsert-by-mapKey). Non-fetch calls never hold the cursor.
-		const satisfied = new Set<string>(outputs.keys());
-		for (const ev of events) {
-			if (ev.callId !== undefined) satisfied.add(ev.callId);
-		}
+		//
+		// Invariant this relies on: advancing the cursor past a cutoff-dropped
+		// result is safe ONLY while `beforeTimestamp` is monotonic non-decreasing
+		// across polls (true today — no caller passes a time-varying cutoff; both
+		// production callers pass none at all). If a later poll RELAXED the cutoff,
+		// the now-emittable output would already be behind the cursor and, having
+		// no namespace/name of its own, could not be re-sourced. Revisit this if a
+		// shrinking/moving cutoff is ever introduced.
+		const satisfied = resultSeen;
 		let safeCursor = lastConsumed;
 		for (const [callId, call] of calls) {
 			if (satisfied.has(callId)) continue;

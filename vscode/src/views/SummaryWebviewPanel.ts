@@ -16,6 +16,7 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { execFileSyncHidden } from "../../../cli/src/util/Subprocess.js";
+import { withPlansLock } from "../../../cli/src/core/Locks.js";
 import {
 	loadPlansRegistry,
 	savePlansRegistry,
@@ -2587,9 +2588,13 @@ export class SummaryWebviewPanel {
 			this.refreshPlansAndNotes(updatedSummary);
 		}
 
-		const registry = await loadPlansRegistry(this.workspaceRoot);
-		const entry = registry.plans[slug];
-		if (entry) {
+		// plans.lock + fresh re-read so this title sync merges onto the latest state
+		// instead of clobbering a concurrent write (the Codex-discovery tick in this
+		// host, or a cross-process StopHook/QueueWorker).
+		await withPlansLock(this.workspaceRoot, async () => {
+			const registry = await loadPlansRegistry(this.workspaceRoot);
+			const entry = registry.plans[slug];
+			if (!entry) return;
 			await savePlansRegistry(
 				{
 					...registry,
@@ -2597,7 +2602,7 @@ export class SummaryWebviewPanel {
 				},
 				this.workspaceRoot,
 			);
-		}
+		});
 	}
 
 	private async handleRemovePlan(slug: string, title: string): Promise<void> {

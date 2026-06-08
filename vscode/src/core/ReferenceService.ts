@@ -23,6 +23,7 @@
 
 import { readFileSync } from "node:fs";
 import * as vscode from "vscode";
+import { withPlansLock } from "../../../cli/src/core/Locks.js";
 import {
 	loadPlansRegistry,
 	loadPlansRegistryWithStatus,
@@ -55,7 +56,14 @@ export async function detectReferences(
 	// panel refresh after upgrade (deterministic-writeback migration).
 	const { registry, changed } = await loadPlansRegistryWithStatus(cwd);
 	if (changed) {
-		await savePlansRegistry(registry, cwd);
+		// Migration writeback (rare — only after a legacy-purge on upgrade). Take
+		// plans.lock and re-read fresh inside it so this cleanup can't clobber a
+		// concurrent reference/plan/note write. The display list below is built
+		// from the pre-lock snapshot, which is fine for a read-side refresh.
+		await withPlansLock(cwd, async () => {
+			const fresh = await loadPlansRegistryWithStatus(cwd);
+			if (fresh.changed) await savePlansRegistry(fresh.registry, cwd);
+		});
 	}
 	const references = { ...(registry.references ?? {}) };
 	const result: ReferenceInfo[] = [];
@@ -92,26 +100,36 @@ export async function detectReferences(
  * section is preserved verbatim.
  */
 export async function removeReference(cwd: string, mapKey: string): Promise<void> {
-	const registry = await loadPlansRegistry(cwd);
-	const existing = { ...(registry.references ?? {}) };
-	const entry = existing[mapKey];
-	if (!entry) return;
+	// Registry RMW under plans.lock so a concurrent writer (the Codex-discovery
+	// tick in this same host, or a cross-process StopHook/QueueWorker) can't clobber
+	// the removal (or be clobbered by it). The closure returns the removed entry's
+	// sourcePath; the markdown delete happens AFTER the lock — persisting the row
+	// removal first, then a best-effort file cleanup, is strictly safer than the
+	// reverse (a failed save would otherwise leave a row with no backing file).
+	const removedSourcePath = await withPlansLock(cwd, async () => {
+		const registry = await loadPlansRegistry(cwd);
+		const existing = { ...(registry.references ?? {}) };
+		const entry = existing[mapKey];
+		if (!entry) return null;
+		delete existing[mapKey];
+		const out: PlansRegistry = {
+			version: 1,
+			plans: registry.plans,
+			...(registry.notes !== undefined ? { notes: registry.notes } : {}),
+			references: existing,
+		};
+		await savePlansRegistry(out, cwd);
+		return entry.sourcePath;
+	});
+	if (removedSourcePath === null) return;
 	// Best-effort file delete — a permission/lock error (Windows EPERM/EBUSY)
-	// must not strand the registry row; mirrors PlanService.removePlan /
-	// NoteService.removeNote. deleteReferenceMarkdown already tolerates ENOENT.
+	// must not strand anything; mirrors PlanService.removePlan / NoteService.removeNote.
+	// deleteReferenceMarkdown already tolerates ENOENT.
 	try {
-		await deleteReferenceMarkdown(entry.sourcePath);
+		await deleteReferenceMarkdown(removedSourcePath);
 	} catch {
-		/* registry row is still removed below */
+		/* registry row is already removed */
 	}
-	delete existing[mapKey];
-	const out: PlansRegistry = {
-		version: 1,
-		plans: registry.plans,
-		...(registry.notes !== undefined ? { notes: registry.notes } : {}),
-		references: existing,
-	};
-	await savePlansRegistry(out, cwd);
 }
 
 /**

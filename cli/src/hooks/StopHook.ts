@@ -31,6 +31,7 @@ import { homedir } from "node:os";
 import { join, resolve as pathResolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { withPlansLock } from "../core/Locks.js";
 import { normalizePathForCompare } from "../core/PathUtils.js";
 import { scanReferencesFrom } from "../core/references/TranscriptReferenceDiscovery.js";
 import {
@@ -408,34 +409,40 @@ async function scanPlansFrom(transcriptPath: string, fromLine: number, cwd: stri
 		// touched on top. For each touched slug, also pull through any
 		// concurrent commitHash update (the PostCommitHook race already
 		// covered by the prior implementation).
-		const freshRegistry = await loadPlansRegistry(cwd);
-		const merged: Record<string, PlanEntry> = { ...freshRegistry.plans };
-		for (const slug of touchedSlugs) {
-			const ours = plans[slug];
-			if (!ours) continue;
-			const fresh = freshRegistry.plans[slug];
-			const freshCommitHash = fresh?.commitHash;
-			const originalCommitHash = registry.plans[slug]?.commitHash ?? null;
-			if (fresh && freshCommitHash && freshCommitHash !== originalCommitHash) {
-				// A sibling writer (typically QueueWorker) transitioned this slug
-				// from uncommitted to archived between our load and save: it set
-				// both `commitHash` AND `contentHashAtCommit` (the archive-guard
-				// pair). Use the fresh entry wholesale rather than overlaying one
-				// field on ours — otherwise `contentHashAtCommit` is dropped, the
-				// entry trips the snapshot-copy filter in PlanService.toPlanInfo
-				// (vanishes from the panel), and the upsertEntry archive-guard
-				// revive branch can never fire again (because it gates on
-				// `existing.contentHashAtCommit`).
-				merged[slug] = fresh;
-			} else {
-				merged[slug] = ours;
+		// plans.lock serialises this reload→save against other plans.json writers
+		// (QueueWorker archival, the Codex-discovery tick, a parallel StopHook).
+		// The fresh reread happens INSIDE the lock, so the per-slug merge layers
+		// our touched slugs onto a baseline no one can clobber before we save.
+		await withPlansLock(cwd, async () => {
+			const freshRegistry = await loadPlansRegistry(cwd);
+			const merged: Record<string, PlanEntry> = { ...freshRegistry.plans };
+			for (const slug of touchedSlugs) {
+				const ours = plans[slug];
+				if (!ours) continue;
+				const fresh = freshRegistry.plans[slug];
+				const freshCommitHash = fresh?.commitHash;
+				const originalCommitHash = registry.plans[slug]?.commitHash ?? null;
+				if (fresh && freshCommitHash && freshCommitHash !== originalCommitHash) {
+					// A sibling writer (typically QueueWorker) transitioned this slug
+					// from uncommitted to archived between our load and save: it set
+					// both `commitHash` AND `contentHashAtCommit` (the archive-guard
+					// pair). Use the fresh entry wholesale rather than overlaying one
+					// field on ours — otherwise `contentHashAtCommit` is dropped, the
+					// entry trips the snapshot-copy filter in PlanService.toPlanInfo
+					// (vanishes from the panel), and the upsertEntry archive-guard
+					// revive branch can never fire again (because it gates on
+					// `existing.contentHashAtCommit`).
+					merged[slug] = fresh;
+				} else {
+					merged[slug] = ours;
+				}
 			}
-		}
-		// Spread freshRegistry first to preserve notes / references — otherwise
-		// any sibling pipeline that wrote them between our load and save (e.g.
-		// the note service from the extension, the Linear discovery loop below)
-		// loses its work.
-		await savePlansRegistry({ ...freshRegistry, version: 1, plans: merged }, cwd);
+			// Spread freshRegistry first to preserve notes / references — otherwise
+			// any sibling pipeline that wrote them between our load and save (e.g.
+			// the note service from the extension, the Linear discovery loop below)
+			// loses its work.
+			await savePlansRegistry({ ...freshRegistry, version: 1, plans: merged }, cwd);
+		});
 		log.info(
 			"Plan discovery: upserted %d slug(s) + %d external path(s) into plans.json",
 			slugs.size,

@@ -35,7 +35,7 @@ import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
-import { acquireWorkerLock, refreshWorkerLockMtime, releaseWorkerLock } from "../core/Locks.js";
+import { acquireWorkerLock, refreshWorkerLockMtime, releaseWorkerLock, withPlansLock } from "../core/Locks.js";
 import { formatNotesBlock } from "../core/NotePromptFormatter.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
@@ -746,23 +746,28 @@ async function associatePlansWithCommit(
 		// orphan-branch snapshot (stored under newSlug below) + the CommitSummary
 		// PlanReference are the system of record; the archive row was a redundant
 		// plans.json copy the sidebar never showed.
-		const updatedRegistry = await loadPlansRegistry(cwd);
-		const guardEntry = {
-			...entry,
-			commitHash: commitHash,
-			contentHashAtCommit: contentHash,
-			updatedAt: nowStr,
-		};
-		await savePlansRegistry(
-			{
-				...updatedRegistry,
-				plans: {
-					...updatedRegistry.plans,
-					[slug]: guardEntry,
+		// plans.lock serialises this fresh-read→single-key-merge→save against
+		// other plans.json writers (StopHook, Codex-discovery tick, parallel
+		// worker). Per-iteration acquire/release keeps each archive atomic.
+		await withPlansLock(cwd, async () => {
+			const updatedRegistry = await loadPlansRegistry(cwd);
+			const guardEntry = {
+				...entry,
+				commitHash: commitHash,
+				contentHashAtCommit: contentHash,
+				updatedAt: nowStr,
+			};
+			await savePlansRegistry(
+				{
+					...updatedRegistry,
+					plans: {
+						...updatedRegistry.plans,
+						[slug]: guardEntry,
+					},
 				},
-			},
-			cwd,
-		);
+				cwd,
+			);
+		});
 		log.info("Plan archived: %s → %s (hash=%s)", slug, newSlug, contentHash.substring(0, 12));
 	}
 
@@ -874,10 +879,17 @@ async function associateNotesWithCommit(
 		log.info("Note archived: %s → %s (hash=%s)", id, newId, contentHash.substring(0, 12));
 	}
 
-	// Write accumulated changes in a single registry save
+	// Write accumulated changes in a single registry save. plans.lock serialises
+	// the reload→save so this whole-registry write can't clobber a concurrent
+	// reference/plan write (StopHook, Codex-discovery tick) that landed after our
+	// initial read. `updatedNotes` is still built from the pre-loop snapshot, so a
+	// concurrent NOTE write to a different id remains a pre-existing, out-of-scope
+	// race (NoteService is not lock-aware).
 	if (noteRefs.length > 0) {
-		registry = await loadPlansRegistry(cwd);
-		await savePlansRegistry({ ...registry, notes: updatedNotes }, cwd);
+		await withPlansLock(cwd, async () => {
+			registry = await loadPlansRegistry(cwd);
+			await savePlansRegistry({ ...registry, notes: updatedNotes }, cwd);
+		});
 	}
 
 	// Store note files in orphan branch
@@ -1064,36 +1076,43 @@ async function finalizeReferenceArchive(
 ): Promise<void> {
 	if (committed.length === 0) return;
 
-	const freshRegistry = await loadPlansRegistry(cwd);
-	const mergedReferences = { ...(freshRegistry.references ?? {}) };
-	const toDeleteMarkdown: Array<{ mapKey: string; sourcePath: string }> = [];
-	for (const { mapKey, sourcePath, updatedAt } of committed) {
-		const fresh = mergedReferences[mapKey];
-		// `updatedAt` is a sufficient fingerprint here: the captured value was
-		// written by a PRIOR upsert (at discovery / an earlier commit), while a
-		// racing re-upsert stamps `new Date()` during this post-commit window — so
-		// a mismatch reliably means "re-upserted since capture". A same-millisecond
-		// collision is unreachable (the two writes are separated by ≥ the time
-		// since discovery), so no revision/nonce is needed.
-		if (fresh !== undefined && fresh.updatedAt !== updatedAt) {
-			log.info("Reference finalize: %s re-upserted since capture — keeping active row", mapKey);
-			continue;
+	// plans.lock serialises the fresh-read→per-key-delete→save so this write can't
+	// clobber a concurrent reference/plan write that landed after our read. The
+	// closure returns the rows whose registry entry was actually removed; markdown
+	// deletion happens AFTER the lock is released (it touches only the local file).
+	const toDeleteMarkdown = await withPlansLock(cwd, async () => {
+		const freshRegistry = await loadPlansRegistry(cwd);
+		const mergedReferences = { ...(freshRegistry.references ?? {}) };
+		const toDelete: Array<{ mapKey: string; sourcePath: string }> = [];
+		for (const { mapKey, sourcePath, updatedAt } of committed) {
+			const fresh = mergedReferences[mapKey];
+			// `updatedAt` is a sufficient fingerprint here: the captured value was
+			// written by a PRIOR upsert (at discovery / an earlier commit), while a
+			// racing re-upsert stamps `new Date()` during this post-commit window — so
+			// a mismatch reliably means "re-upserted since capture". A same-millisecond
+			// collision is unreachable (the two writes are separated by ≥ the time
+			// since discovery), so no revision/nonce is needed.
+			if (fresh !== undefined && fresh.updatedAt !== updatedAt) {
+				log.info("Reference finalize: %s re-upserted since capture — keeping active row", mapKey);
+				continue;
+			}
+			delete mergedReferences[mapKey];
+			toDelete.push({ mapKey, sourcePath });
 		}
-		delete mergedReferences[mapKey];
-		toDeleteMarkdown.push({ mapKey, sourcePath });
-	}
-	// Nothing actually deleted (every key was re-upserted) → skip the write
-	// entirely. Re-saving an unchanged registry would only widen the lost-update
-	// window against a concurrent StopHook for zero benefit.
-	if (toDeleteMarkdown.length === 0) return;
+		// Nothing actually deleted (every key was re-upserted) → skip the write
+		// entirely. Re-saving an unchanged registry would only widen the lost-update
+		// window against a concurrent StopHook for zero benefit.
+		if (toDelete.length === 0) return toDelete;
 
-	const out: PlansRegistry = {
-		version: 1,
-		plans: freshRegistry.plans,
-		...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
-		references: mergedReferences,
-	};
-	await savePlansRegistry(out, cwd);
+		const out: PlansRegistry = {
+			version: 1,
+			plans: freshRegistry.plans,
+			...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
+			references: mergedReferences,
+		};
+		await savePlansRegistry(out, cwd);
+		return toDelete;
+	});
 
 	for (const { mapKey, sourcePath } of toDeleteMarkdown) {
 		try {

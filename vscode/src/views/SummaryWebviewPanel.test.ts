@@ -139,6 +139,12 @@ const {
 	mockSaveConfig: vi.fn().mockResolvedValue(undefined),
 }));
 
+// plans.lock passthrough — run the RMW body inline (no real lock file I/O on the
+// synthetic CWD). The lock contract is covered in cli/src/core/Locks.test.ts.
+vi.mock("../../../cli/src/core/Locks.js", () => ({
+	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+}));
+
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadPlansRegistry: mockLoadPlansRegistry,
 	savePlansRegistry: mockSavePlansRegistry,

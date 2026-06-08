@@ -12,7 +12,16 @@
  *
  * URL validation:
  *   - HTTPS only.
- *   - Allowed hosts: `www.notion.so`, `notion.so`, `*.notion.site`.
+ *   - Allowed hosts: `www.notion.so`, `notion.so`, `app.notion.com`,
+ *     `*.notion.site`. `app.notion.com` is the host the Codex `notion-fetch`
+ *     connector returns (e.g. `https://app.notion.com/p/<32hex>`, captured in a
+ *     real rollout). Because this adapter is shared by the Claude and Codex
+ *     paths, accepting it is a deliberate, additive widening: a Claude
+ *     `notion-fetch` returning an `app.notion.com` URL now yields a Reference
+ *     where it previously did not. That is an improvement (a valid Notion page
+ *     URL is the same page regardless of which agent fetched it), not a
+ *     regression — so the extraction side is NOT byte-identical to pre-Codex
+ *     `main` for this one host.
  *   - 32-hex page id must appear in the URL path. Two forms are accepted:
  *       1. Plain  — `https://www.notion.so/<32hex>`
  *       2. Slug   — `https://www.notion.so/Page-Title-<32hex>`
