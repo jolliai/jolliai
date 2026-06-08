@@ -23,14 +23,15 @@ export interface RenderOptions {
 export interface SourceAdapter {
 	/** Stable id matching the `Reference.source` field. */
 	readonly id: SourceId;
-	/** MCP tool name prefix used to short-circuit non-matching tool_use lines. */
-	readonly mcpPrefix: string;
 	/** Default cap on description size when rendering one reference. Adapter-specific. */
 	readonly maxCharsPerReference: number;
 	/**
-	 * Parse one MCP tool_result payload. Return `null` if the payload is not
-	 * recognised (wrong shape, wrong tool, validation failed). Caller filters
-	 * `null`s — adapters never throw on bad input.
+	 * Parse one MCP tool_result payload into a `Reference`, or `null` if the
+	 * payload shape isn't a valid reference. The adapter is agent-agnostic and
+	 * does NOT recognise tool names — source recognition and tool-level business
+	 * scope live in the producer bindings; by the time `extractRef` runs the
+	 * source is already known, so this is a pure shape check. `toolName` is still
+	 * passed through to `Reference.toolName`. Adapters never throw on bad input.
 	 */
 	extractRef(payload: unknown, toolName: string, referencedAt: string): Reference | null;
 	/**

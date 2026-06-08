@@ -7,10 +7,11 @@
  *
  * `getAdaptersForSource(source)` returns the adapter set applicable to a
  * transcript source. It deliberately carries NO matcher: which adapter matches a
- * given tool call is decided inside the per-source envelope parser
- * (ClaudeEnvelopeParser via `adapter.mcpPrefix`, CodexEnvelopeParser via
- * CodexToolMap → SourceId → `adapters.find(a => a.id === id)`). Adapters are
- * source-agnostic, so today both "claude" and "codex" get the same instances.
+ * given tool call is decided in the producer bindings (`bindings/claude` via the
+ * tool-name prefix, `bindings/codex` via namespace+name), which resolve a
+ * `SourceId` the envelope parser maps to an adapter via `adapters.find(a => a.id
+ * === id)`. Adapters are source-agnostic, so today both "claude" and "codex" get
+ * the same instances.
  */
 
 import type { TranscriptSource } from "../../../Types.js";

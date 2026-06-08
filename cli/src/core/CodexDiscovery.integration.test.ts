@@ -21,7 +21,7 @@ vi.mock("./SessionTracker.js", async (importOriginal) => {
 	};
 });
 
-import { discoverCodexReferences } from "./CodexReferenceDiscovery.js";
+import { discoverCodexConversations } from "./CodexDiscovery.js";
 import { discoverCodexSessions } from "./CodexSessionDiscoverer.js";
 import { loadDiscoveryCursor, upsertReferenceEntry } from "./SessionTracker.js";
 
@@ -90,7 +90,7 @@ const upsertedKeys = () =>
 		.mock.calls.map((c) => `${c[0].source}:${c[0].nativeId}`)
 		.sort();
 
-describe("discoverCodexReferences — integration (real parser + scan + cursor)", () => {
+describe("discoverCodexConversations — integration (real parser + scan + cursor)", () => {
 	it("extracts all four sources from a complete rollout and advances the cursor to EOF", async () => {
 		const lines = [
 			fnCall("mcp__codex_apps__linear", "_fetch", "c1"),
@@ -104,7 +104,7 @@ describe("discoverCodexReferences — integration (real parser + scan + cursor)"
 		];
 		writeFileSync(rollout, `${lines.join("\n")}\n`, "utf-8");
 
-		await discoverCodexReferences(dir);
+		await discoverCodexConversations(dir);
 
 		expect(upsertedKeys()).toEqual([
 			"github:jolliai/jolli#959",
@@ -119,14 +119,14 @@ describe("discoverCodexReferences — integration (real parser + scan + cursor)"
 	it("recovers a straddling fetch across two polls without losing the ref (P1)", async () => {
 		// Poll 1: only the Jira request is on disk (output not yet written).
 		writeFileSync(rollout, `${fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "j1")}\n`, "utf-8");
-		await discoverCodexReferences(dir);
+		await discoverCodexConversations(dir);
 		expect(upsertReferenceEntry).not.toHaveBeenCalled();
 		// Cursor was NOT advanced past the in-flight request.
 		expect(await loadDiscoveryCursor(rollout, dir)).toBeNull();
 
 		// Poll 2: the output arrives; the re-scan recovers the Jira ref (tenant webUrl).
 		appendFileSync(rollout, `${fnOutput("j1", JIRA, "bare")}\n`, "utf-8");
-		await discoverCodexReferences(dir);
+		await discoverCodexConversations(dir);
 		expect(upsertedKeys()).toEqual(["jira:KAN-4"]);
 		expect(vi.mocked(upsertReferenceEntry).mock.calls[0][0].url).toBe(
 			"https://jolli-team-kr0v9z0x.atlassian.net/browse/KAN-4",

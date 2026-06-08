@@ -202,10 +202,9 @@ describe("JiraAdapter.extractRef", () => {
 		expect(ref).toBeNull();
 	});
 
-	it("rejects payloads delivered under a non-Atlassian tool name (defense-in-depth)", () => {
-		const ref = JiraAdapter.extractRef(KAN_4_PAYLOAD, "mcp__linear__get_issue", ts);
-		expect(ref).toBeNull();
-	});
+	// Note: source recognition (rejecting non-Atlassian tool names) moved to the
+	// producer bindings; the purified adapter scopes via the Jira shape (key +
+	// fields.summary), which a non-Jira payload lacks.
 
 	it("omits status/priority/description when missing or invalid types", () => {
 		const ref = JiraAdapter.extractRef(
@@ -413,9 +412,8 @@ describe("JiraAdapter.renderPromptBlock", () => {
 // ─── Adapter metadata ────────────────────────────────────────────────────────
 
 describe("JiraAdapter metadata", () => {
-	it("exposes id, mcpPrefix, wrapperKeys, maxCharsPerReference", () => {
+	it("exposes id, wrapperKeys, maxCharsPerReference", () => {
 		expect(JiraAdapter.id).toBe("jira");
-		expect(JiraAdapter.mcpPrefix).toBe("mcp__claude_ai_Atlassian__");
 		expect(JiraAdapter.wrapperKeys).toEqual(["nodes", "issues", "items", "results"]);
 		expect(JiraAdapter.maxCharsPerReference).toBe(4000);
 	});

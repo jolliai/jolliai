@@ -1,13 +1,16 @@
 /**
- * CodexReferenceDiscovery — polling-path reference extraction for Codex.
+ * CodexDiscovery — polling-path artifact discovery for Codex.
  *
  * Codex has no lifecycle hook we can use (the Stop hook needs per-user manual
  * trust and is broken under git worktrees — see the spike). So instead of a
- * hook, references are extracted on the existing 60s polling path: the VS Code
+ * hook, artifacts are discovered on the existing 60s polling path: the VS Code
  * sidebar's Active Conversations tick already discovers Codex sessions every
- * minute; this module rides that tick to scan each session's transcript for
- * Linear / Jira / GitHub / Notion references and persist them — reusing the
- * SAME `discovery-cursors.json` mechanism as the Claude Stop path.
+ * minute; this module rides that tick to scan each session's transcript and
+ * persist what it finds — reusing the SAME `discovery-cursors.json` mechanism as
+ * the Claude Stop path. Today it extracts Linear / Jira / GitHub / Notion
+ * references; the module is named generically (not `CodexReferenceDiscovery`) so
+ * a future plan-discovery pass can join the same per-session cursor without
+ * another rename.
  *
  * Concurrency: a per-cwd single-flight collapses overlapping calls (the tick,
  * panel re-open, manual refresh, detail-panel save all call this). A re-entrant
@@ -17,7 +20,7 @@
  * a full minute. Sessions are processed serially so multiple per-session cursor
  * writes never race each other within a batch.
  *
- * Contract: `discoverCodexReferences` NEVER rejects — all errors are swallowed
+ * Contract: `discoverCodexConversations` NEVER rejects — all errors are swallowed
  * and logged, so callers can `void`-call it without an unhandled rejection.
  */
 
@@ -26,7 +29,7 @@ import { discoverCodexSessions, isCodexInstalled } from "./CodexSessionDiscovere
 import { scanReferencesFrom } from "./references/TranscriptReferenceDiscovery.js";
 import { loadConfig, loadDiscoveryCursor, migrateDiscoveryCursors, saveDiscoveryCursor } from "./SessionTracker.js";
 
-const log = createLogger("CodexReferenceDiscovery");
+const log = createLogger("CodexDiscovery");
 
 interface InFlight {
 	promise: Promise<void>;
@@ -38,9 +41,9 @@ const inFlight = new Map<string, InFlight>();
 
 /**
  * Scan all recent Codex sessions for this cwd and persist any discovered
- * references. Single-flight + dirty-rerun per cwd. Never rejects.
+ * artifacts (references today). Single-flight + dirty-rerun per cwd. Never rejects.
  */
-export function discoverCodexReferences(cwd: string): Promise<void> {
+export function discoverCodexConversations(cwd: string): Promise<void> {
 	const existing = inFlight.get(cwd);
 	if (existing !== undefined) {
 		// A run is in progress — request one more pass after it, share its promise.

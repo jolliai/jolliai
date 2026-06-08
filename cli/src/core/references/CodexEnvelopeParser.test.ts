@@ -108,6 +108,19 @@ const JIRA_BARE_NO_URL = {
 	self: "https://api.atlassian.com/ex/jira/29e34fb0/rest/api/3/issue/10099",
 	fields: { summary: "No-url issue" },
 };
+// Real `_search_issues` shape (2026-06-08): a `{issues:[…]}` wrapper whose hit
+// carries the URL but leaves `number`/`state` null — the connector's fallback
+// path for resolving an issue URL. The number must be derived from the URL.
+const GITHUB_SEARCH = {
+	issues: [
+		{
+			url: "https://github.com/jolliai/jolli/issues/959",
+			number: null,
+			state: null,
+			title: "Support multi-source external entity auto-discovery",
+		},
+	],
+};
 
 describe("CodexEnvelopeParser.parse", () => {
 	it("emits one NormalizedToolResult per source via the PRIMARY function_call pair, with canonical toolName + matched adapter", () => {
@@ -309,6 +322,29 @@ describe("CodexEnvelopeParser.parse — defensive branches", () => {
 		expect(gh?.labels).toEqual(["bug", "feat"]);
 		expect(gh?.repository?.full_name).toBe("o/r");
 	});
+
+	it("reshapes a _search_issues array and leaves number undefined when it can't be derived", () => {
+		const search = {
+			issues: [
+				// url present but NOT an issue/PR url → number can't be derived from it
+				{ url: "https://github.com/o/r/blob/main/x.ts", title: "blob, not an issue" },
+				// no url at all → number stays undefined
+				{ title: "no url here" },
+			],
+		};
+		const lines = [
+			fnCall("mcp__codex_apps__github", "_search_issues", "s1"),
+			raw({ type: "function_call_output", call_id: "s1", output: JSON.stringify(search) }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(1);
+		const payload = results[0].payload as { issues: Array<{ number?: unknown; html_url?: unknown }> };
+		// First hit kept its (non-issue) url but no number; second has neither.
+		expect(payload.issues[0].number).toBeUndefined();
+		expect(payload.issues[0].html_url).toBe("https://github.com/o/r/blob/main/x.ts");
+		expect(payload.issues[1].number).toBeUndefined();
+		expect(payload.issues[1].html_url).toBeUndefined();
+	});
 });
 
 describe("CodexEnvelopeParser.parse — cross-poll cursor safety (P1)", () => {
@@ -428,5 +464,64 @@ describe("CodexEnvelopeParser end-to-end via extractReferencesFromTranscript (so
 
 		// The webUrl-less jira event produced no ref.
 		expect(byKey.has("jira:KAN-9")).toBe(false);
+	});
+});
+
+describe("CodexEnvelopeParser end-to-end — GitHub _search_issues URL-resolution path", () => {
+	let dir: string;
+	let file: string;
+	beforeAll(() => {
+		dir = mkdtempSync(join(tmpdir(), "codex-ghsearch-"));
+		file = join(dir, "rollout.jsonl");
+		// Reproduces the 2026-06-08 case: the connector resolved an issue URL via
+		// _search_issues (not _fetch_issue), returning {issues:[{url, number:null}]}.
+		const lines = [
+			fnCall("mcp__codex_apps__github", "_search_issues", "c_search"),
+			fnOutput("c_search", GITHUB_SEARCH, { wrap: "bare", prefix: true }),
+		];
+		writeFileSync(file, `${lines.join("\n")}\n`, "utf-8");
+	});
+	afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+	it("extracts the github issue with the number derived from the URL", async () => {
+		const { references } = await extractReferencesFromTranscript(file, ALL_ADAPTERS, { source: "codex" });
+		const gh = references.find((r) => r.mapKey === "github:jolliai/jolli#959");
+		expect(gh).toBeDefined();
+		expect(gh?.url).toBe("https://github.com/jolliai/jolli/issues/959");
+		expect(gh?.title).toBe("Support multi-source external entity auto-discovery");
+	});
+});
+
+describe("CodexEnvelopeParser end-to-end — Jira malformed-output recovery", () => {
+	let dir: string;
+	let file: string;
+	beforeAll(() => {
+		dir = mkdtempSync(join(tmpdir(), "codex-jira-recover-"));
+		file = join(dir, "rollout.jsonl");
+		// The function_call output is the only copy with webUrl but is INVALID JSON
+		// (the bare word `broken`); the valid mcp_tool_call_end event carries key +
+		// summary (under versionedRepresentations, no `fields`) but no webUrl. The
+		// recovery stitches them into one jira ref.
+		const malformedOutput =
+			'Wall time: 7s\nOutput:\n{"issues":{"nodes":[{"key":"KAN-7", broken "webUrl":"https://acme.atlassian.net/browse/KAN-7"}]}}';
+		const lines = [
+			fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "j1"),
+			fnOutputRaw("j1", malformedOutput),
+			toolCallEnd("atlassian rovo_getjiraissue", "j1", {
+				key: "KAN-7",
+				self: "https://api.atlassian.com/ex/jira/x/rest/api/3/issue/10099",
+				versionedRepresentations: { summary: { "1": "Recovered jira summary" } },
+			}),
+		];
+		writeFileSync(file, `${lines.join("\n")}\n`, "utf-8");
+	});
+	afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+	it("recovers a jira ref by stitching the valid event with webUrl salvaged from the malformed output", async () => {
+		const { references } = await extractReferencesFromTranscript(file, ALL_ADAPTERS, { source: "codex" });
+		const jira = references.find((r) => r.mapKey === "jira:KAN-7");
+		expect(jira).toBeDefined();
+		expect(jira?.title).toBe("Recovered jira summary");
+		expect(jira?.url).toBe("https://acme.atlassian.net/browse/KAN-7");
 	});
 });

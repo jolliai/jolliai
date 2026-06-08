@@ -138,9 +138,8 @@ describe("LinearAdapter", () => {
 		expect(out).toContain('Title with "quote" &amp; &lt;tag&gt;');
 	});
 
-	it("exposes id, mcpPrefix, wrapperKeys, maxCharsPerReference", () => {
+	it("exposes id, wrapperKeys, maxCharsPerReference", () => {
 		expect(LinearAdapter.id).toBe("linear");
-		expect(LinearAdapter.mcpPrefix).toBe("mcp__linear__");
 		expect(LinearAdapter.wrapperKeys).toEqual(["items", "issues", "nodes", "results"]);
 		expect(LinearAdapter.maxCharsPerReference).toBe(4000);
 	});

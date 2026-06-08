@@ -126,12 +126,10 @@ function buildFields(args: {
 
 export const GitHubAdapter: SourceAdapter = {
 	id: "github",
-	mcpPrefix: "mcp__github__",
 	wrapperKeys: ["items", "issues", "nodes", "results"],
 	maxCharsPerReference: DEFAULT_MAX_CHARS,
 
 	extractRef(payload, toolName, referencedAt) {
-		if (!toolName.includes("mcp__github__")) return null;
 		if (!isObject(payload)) return null;
 		const obj = payload as Record<string, unknown>;
 

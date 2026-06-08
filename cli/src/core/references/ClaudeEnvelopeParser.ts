@@ -17,6 +17,7 @@
  */
 
 import { createLogger } from "../../Logger.js";
+import { CLAUDE_TOOL_PREFIXES, claudeBindingForToolName } from "./bindings/claude/index.js";
 import type { SourceAdapter } from "./sources/SourceAdapter.js";
 import type {
 	EnvelopeParseResult,
@@ -33,13 +34,16 @@ interface PendingEntry {
 	readonly toolName: string;
 	readonly timestamp?: string;
 	readonly adapter: SourceAdapter;
+	readonly normalize: (business: unknown) => unknown;
 }
 
 class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 	parse(lines: string[], opts: ExtractOptions, adapters: readonly SourceAdapter[]): EnvelopeParseResult {
 		// Pre-compute the per-line substring needles so we don't rebuild them per line.
-		const nameNeedles = adapters.map((a) => ({ needle: `"name":"${a.mcpPrefix}`, adapter: a }));
-		const prefixes = adapters.map((a) => a.mcpPrefix);
+		// Recognition (which tool → which source) lives in the Claude binding now,
+		// not on the adapter; the needles use the binding's tool-name prefixes.
+		const nameNeedles = CLAUDE_TOOL_PREFIXES.map((p) => `"name":"${p}`);
+		const adapterFor = (id: SourceAdapter["id"]): SourceAdapter | undefined => adapters.find((a) => a.id === id);
 
 		const fromLine = opts.fromLineNumber ?? 0;
 		const pending = new Map<string, PendingEntry>();
@@ -53,7 +57,7 @@ class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 			if (line.trim().length === 0) continue;
 			/* v8 ignore stop */
 
-			const hasAdapterNeedle = nameNeedles.some(({ needle }) => line.includes(needle));
+			const hasAdapterNeedle = nameNeedles.some((needle) => line.includes(needle));
 			const couldBeToolResult = pending.size > 0 && line.includes(TOOL_USE_ID_SUBSTR);
 			if (!hasAdapterNeedle && !couldBeToolResult) continue;
 
@@ -76,7 +80,7 @@ class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 			if (role === undefined || blocks === undefined) continue;
 
 			if (role === "assistant") {
-				collectToolUses(blocks, timestamp, opts.beforeTimestamp, pending, prefixes, adapters);
+				collectToolUses(blocks, timestamp, opts.beforeTimestamp, pending, adapterFor);
 				/* v8 ignore start -- readRole returns only "assistant" | "user" | undefined; undefined is filtered above, so the else-if's false branch is unreachable. */
 			} else if (role === "user") {
 				/* v8 ignore stop */
@@ -119,8 +123,7 @@ function collectToolUses(
 	timestamp: string | undefined,
 	beforeTimestamp: string | undefined,
 	pending: Map<string, PendingEntry>,
-	prefixes: ReadonlyArray<string>,
-	adapters: ReadonlyArray<SourceAdapter>,
+	adapterFor: (id: SourceAdapter["id"]) => SourceAdapter | undefined,
 ): void {
 	if (beforeTimestamp !== undefined && timestamp !== undefined && timestamp > beforeTimestamp) return;
 	for (const block of blocks) {
@@ -131,11 +134,15 @@ function collectToolUses(
 		if (typeof b.id !== "string" || typeof b.name !== "string") continue;
 		/* v8 ignore stop */
 		const name = b.name;
-		const prefixIdx = prefixes.findIndex((p) => name.startsWith(p));
-		/* v8 ignore start -- substring pre-filter requires the line to already contain `"name":"<adapter.mcpPrefix>` for at least one adapter, so a tool_use block in the same line whose name doesn't match any prefix is unreachable on real Claude Code JSONL. Pinned for total-function semantics. */
-		if (prefixIdx === -1) continue;
+		// Recognition + tool-level business scope (e.g. Notion only `notion-fetch`)
+		// live in the Claude binding; a non-matching tool is dropped here.
+		const binding = claudeBindingForToolName(name);
+		if (binding === null) continue;
+		const adapter = adapterFor(binding.sourceId);
+		/* v8 ignore start -- adapters always include all four sources; guarded for totality. */
+		if (adapter === undefined) continue;
 		/* v8 ignore stop */
-		pending.set(b.id, { toolName: name, timestamp, adapter: adapters[prefixIdx] });
+		pending.set(b.id, { toolName: name, timestamp, adapter, normalize: binding.normalize });
 	}
 }
 
@@ -180,7 +187,7 @@ function collectToolResults(
 		results.push({
 			adapter: pendingEntry.adapter,
 			toolName: pendingEntry.toolName,
-			payload: parsedPayload,
+			payload: pendingEntry.normalize(parsedPayload),
 			lineNumber,
 			referencedAt: timestamp ?? "",
 		});
