@@ -38,8 +38,8 @@
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, parse as parsePath, relative, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { satisfies } from "semver";
 import type { PluginContext, PluginRegister } from "./Api.js";
@@ -87,6 +87,14 @@ export interface LoadPluginsOptions {
 	scopesOverride?: ReadonlyArray<string>;
 	/** Custom resolver for the global npm root. Returning `null` means "not available". */
 	getGlobalRoot?: () => Promise<string | null>;
+	/**
+	 * Custom resolver for the `node_modules` root the running CLI is installed
+	 * under (the sibling-of-`@jolli.ai/cli` discovery root). Returning `null`
+	 * means "could not self-locate" (tsx dev run / bundled host). Test-only
+	 * injection point — production callers leave this unset and the loader uses
+	 * {@link defaultSelfInstallRoot}.
+	 */
+	getSelfInstallRoot?: () => string | null;
 	/**
 	 * Override for the user's home directory, used as the fallback upper bound
 	 * of the upward `node_modules` walk when no `.git` ancestor is found.
@@ -428,6 +436,23 @@ async function resolveRoots(opts?: LoadPluginsOptions): Promise<ReadonlyArray<st
 		dir = parent;
 	}
 
+	// Self-install root: the `node_modules` the running CLI itself lives under.
+	// A globally-installed `jolli` runs from `…/node_modules/@jolli.ai/cli/…`, so
+	// a co-installed plugin like `@jolli.ai/space-cli` is necessarily its sibling
+	// under the same `node_modules`. Adding this root makes global-plugin
+	// discovery independent of `npm root -g` — which on Windows routinely fails
+	// (5s subprocess timeout on cold `cmd.exe → npm.cmd → node`, a PATH stripped
+	// by the launching GUI/IDE, or a version-manager pointing the cache at a
+	// different Node's global root). The cwd walk above can never reach the
+	// global dir, so before this the global plugin was only reachable via that
+	// fragile subprocess. Cheap and deterministic; ordered before the global
+	// root so the sibling layout wins when both resolve to a directory.
+	const selfRootResolver = opts?.getSelfInstallRoot ?? defaultSelfInstallRoot;
+	const selfRoot = selfRootResolver();
+	if (selfRoot && existsSync(selfRoot) && !result.includes(selfRoot)) {
+		result.push(selfRoot);
+	}
+
 	const globalRootResolver = opts?.getGlobalRoot ?? (() => getNpmRootGlobal());
 	const globalRoot = await globalRootResolver();
 	if (globalRoot && existsSync(globalRoot) && !result.includes(globalRoot)) {
@@ -436,6 +461,53 @@ async function resolveRoots(opts?: LoadPluginsOptions): Promise<ReadonlyArray<st
 
 	return result;
 }
+
+/**
+ * Walk up from `startDir` to the nearest ancestor directory named
+ * `node_modules`, returning its absolute path, or `null` when none is found
+ * before reaching the filesystem root.
+ *
+ * Pure and synchronous so the walk logic is unit-testable with both POSIX and
+ * Windows-style inputs without spawning anything or mocking `import.meta.url`.
+ * Uses the platform `node:path` semantics (`basename` / `dirname` / `parse`),
+ * so on a real Windows runtime it walks `\`-separated paths correctly; the
+ * production self-locator ({@link defaultSelfInstallRoot}) feeds it the running
+ * module's own directory.
+ */
+export function findNodeModulesRoot(startDir: string): string | null {
+	const fsRoot = parsePath(startDir).root;
+	let dir = startDir;
+	while (dir !== fsRoot) {
+		if (basename(dir) === "node_modules") return dir;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return null;
+}
+
+/**
+ * Production resolver for the self-install `node_modules` root: walk up from
+ * this module's own on-disk location to the enclosing `node_modules`.
+ *
+ * Coverage-ignored: the result depends on where this module physically resides
+ * (`import.meta.url`), which can't be exercised deterministically in unit tests
+ * — the same rationale as {@link runNpmRootGlobal}. The walk itself is fully
+ * tested via {@link findNodeModulesRoot}; the loader's use of the resolved root
+ * is tested via the `getSelfInstallRoot` injection point. `fileURLToPath` is
+ * the same self-location pattern used in `Installer.ts` / `DistPathWriter.ts`,
+ * and esbuild rewrites `import.meta.url` to a real path in the VS Code bundle
+ * (where the walk simply finds no `@jolli.ai` scope and the root is skipped).
+ */
+/* v8 ignore start */
+function defaultSelfInstallRoot(): string | null {
+	try {
+		return findNodeModulesRoot(dirname(fileURLToPath(import.meta.url)));
+	} catch {
+		return null;
+	}
+}
+/* v8 ignore stop */
 
 /**
  * Walk the given roots, scan each known scope directory, and return the first

@@ -19,7 +19,7 @@ import { getHelpGroup } from "./commands/HelpGroups.js";
 import type { KnownPlugin } from "./KnownPlugins.js";
 import { KNOWN_PLUGINS } from "./KnownPlugins.js";
 import { setSilentConsole } from "./Logger.js";
-import { getNpmRootGlobal, inspectPlugins, loadPlugins } from "./PluginLoader.js";
+import { findNodeModulesRoot, getNpmRootGlobal, inspectPlugins, loadPlugins } from "./PluginLoader.js";
 
 const FIXTURE_NAME = "@test-fixtures/example-plugin";
 const FIXTURE_SCOPE = "@test-fixtures";
@@ -780,6 +780,79 @@ describe("loadPlugins", () => {
 				getGlobalRoot: async () => null,
 			});
 			expect(program.commands).toHaveLength(0);
+		} finally {
+			process.chdir(origCwd);
+			await rm(cleanCwd, { recursive: true, force: true });
+		}
+	});
+
+	it("discovers a plugin via the self-install root when getGlobalRoot returns null", async () => {
+		// The Windows-regression case (JOLLI-1694): `npm root -g` is unavailable
+		// (subprocess timeout / stripped PATH), so the global resolver yields
+		// null. The running CLI's own node_modules — the sibling-of-the-host
+		// layout a global `npm install -g` produces — must still surface the
+		// plugin. Here `getSelfInstallRoot` stands in for the import.meta.url
+		// walk and points at the fixture's node_modules root.
+		const root = await writeFixture(tempDir, {
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-via-self').action(() => {}); };",
+		});
+		const cleanCwd = await mkdtemp(join(tmpdir(), "clean-cwd-"));
+		const origCwd = process.cwd();
+		process.chdir(cleanCwd);
+		try {
+			const program = new Command();
+			await loadPlugins(program, "0.100.0", {
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+				getGlobalRoot: async () => null,
+				getSelfInstallRoot: () => root,
+			});
+			expect(program.commands.find((c) => c.name() === "plugin-via-self")).toBeDefined();
+		} finally {
+			process.chdir(origCwd);
+			await rm(cleanCwd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not crash when getSelfInstallRoot returns null", async () => {
+		const cleanCwd = await mkdtemp(join(tmpdir(), "clean-cwd-"));
+		const origCwd = process.cwd();
+		process.chdir(cleanCwd);
+		try {
+			const program = new Command();
+			await loadPlugins(program, "0.100.0", {
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+				getGlobalRoot: async () => null,
+				getSelfInstallRoot: () => null,
+			});
+			expect(program.commands).toHaveLength(0);
+		} finally {
+			process.chdir(origCwd);
+			await rm(cleanCwd, { recursive: true, force: true });
+		}
+	});
+
+	it("deduplicates when the self-install root and global root point at the same location", async () => {
+		// A standard global install: both resolvers return the same node_modules.
+		// The plugin must register exactly once, not twice.
+		const root = await writeFixture(tempDir, {
+			pluginSource:
+				"export const register = (ctx) => { ctx.program.command('plugin-self-dedup').action(() => {}); };",
+		});
+		const cleanCwd = await mkdtemp(join(tmpdir(), "clean-cwd-"));
+		const origCwd = process.cwd();
+		process.chdir(cleanCwd);
+		try {
+			const program = new Command();
+			await loadPlugins(program, "0.100.0", {
+				allowlistOverride: [FIXTURE_ID],
+				scopesOverride: [FIXTURE_SCOPE],
+				getSelfInstallRoot: () => root,
+				getGlobalRoot: async () => root,
+			});
+			expect(program.commands.filter((c) => c.name() === "plugin-self-dedup")).toHaveLength(1);
 		} finally {
 			process.chdir(origCwd);
 			await rm(cleanCwd, { recursive: true, force: true });
@@ -1570,5 +1643,36 @@ describe("loadPlugins diagnostics", () => {
 		expect(loaded.size).toBe(0);
 		expect(diagnostics).toHaveLength(KNOWN_PLUGINS.length);
 		expect(diagnostics.every((d) => d.state === "absent")).toBe(true);
+	});
+});
+
+describe("findNodeModulesRoot", () => {
+	// Pure walk used by the self-install discovery root (JOLLI-1694). Inputs use
+	// forward slashes, which both `path.posix` (CI runners) and `path.win32`
+	// (Windows) accept as separators, so the assertions hold on either host.
+
+	it("returns the directory itself when it is named node_modules", () => {
+		expect(findNodeModulesRoot("/usr/lib/node_modules")).toBe("/usr/lib/node_modules");
+	});
+
+	it("returns the nearest node_modules ancestor of a globally-installed CLI path", () => {
+		// The shape a global `npm install -g @jolli.ai/cli` produces.
+		expect(findNodeModulesRoot("/usr/local/lib/node_modules/@jolli.ai/cli/dist")).toBe(
+			"/usr/local/lib/node_modules",
+		);
+	});
+
+	it("returns the closest node_modules when several are nested", () => {
+		expect(findNodeModulesRoot("/a/node_modules/x/node_modules/@jolli.ai/cli/dist")).toBe(
+			"/a/node_modules/x/node_modules",
+		);
+	});
+
+	it("returns null when no node_modules ancestor exists (tsx dev run)", () => {
+		expect(findNodeModulesRoot("/Users/dev/workspace/jolliai/cli/src")).toBeNull();
+	});
+
+	it("returns null at the filesystem root", () => {
+		expect(findNodeModulesRoot("/")).toBeNull();
 	});
 });
