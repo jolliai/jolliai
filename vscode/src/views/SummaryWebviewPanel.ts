@@ -4,7 +4,12 @@
  * Opens a webview beside the editor showing the full JolliMemory "Commit Memory" for a commit.
  *
  * Features:
- * - Opens in ViewColumn.Beside (doesn't replace the active editor)
+ * - Opens in ViewColumn.One so every memory/summary panel — regardless of
+ *   source (memory / commit / kb) — lands in the main editor group and stacks
+ *   as tabs there, instead of cascading into a new column per click. One is
+ *   also the group VS Code's built-in markdown preview opens into for the
+ *   plain-markdown memory files (wiki / plan / note), so the rich summary
+ *   panels and those previews end up tabbed together in one group.
  * - Notion-like Clean design: generous whitespace, callout blocks, toggle sections
  * - Automatic light/dark theme support via VSCode CSS variables + custom callout palette
  * - Collapsible memory toggles with smooth CSS transitions
@@ -468,7 +473,16 @@ export class SummaryWebviewPanel {
 		this.panel = vscode.window.createWebviewPanel(
 			viewType,
 			"Commit Memory",
-			source === "kb" ? vscode.ViewColumn.One : vscode.ViewColumn.Beside,
+			// Every source opens in the same fixed column (One — the main editor
+			// group) so the panels stack as tabs in one group rather than
+			// cascading into a fresh column on each click (which is what
+			// ViewColumn.Beside did — it recomputes "beside the active group"
+			// every time, so panel N+1 lands beside panel N). One is also the
+			// group VS Code's built-in markdown preview opens into for the
+			// plain-markdown memory files (wiki / plan / note), so the rich
+			// summary panels and those previews tab together. kb was already
+			// special-cased to One; commit/memory now join it instead of Beside.
+			vscode.ViewColumn.One,
 			{
 				enableScripts: true,
 				localResourceRoots: [extensionUri],
@@ -1105,10 +1119,14 @@ export class SummaryWebviewPanel {
 					existing.update(summary);
 				}
 				// reveal() with no args keeps the panel in its current view column.
-				// Passing ViewColumn.Beside can trigger a column-move (VSCode
-				// recomputes "beside" against the active editor at call time),
-				// which destroys and recreates the iframe and leaves it blank.
-				// KB source: switch focus to the tab. Commit source: keep focus on sidebar.
+				// Passing an explicit column here can trigger a column-move (the
+				// panel may have been dragged to another group since creation),
+				// which destroys and recreates the iframe and leaves it blank —
+				// so we always pass undefined and let it stay put.
+				// KB source: switch focus to the tab (folder-tree "open file"
+				// intent). Commit source: keep focus on the sidebar so the user
+				// can keep arrow-keying down the list. This focus distinction is
+				// independent of the (now unified) column.
 				existing.panel.reveal(undefined, source !== "kb");
 				return;
 			}

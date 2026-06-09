@@ -82,7 +82,7 @@ vi.mock("vscode", () => ({
 			toString: () => String(args.join("/")),
 		})),
 	},
-	ViewColumn: { Beside: 2 },
+	ViewColumn: { One: 1 },
 	workspace: { getConfiguration, fs: { writeFile: fsWriteFile } },
 	commands: { executeCommand },
 }));
