@@ -271,6 +271,50 @@ describe("SummaryHtmlBuilder", () => {
 			expect(buildScript).toHaveBeenCalled();
 		});
 
+		// Guards the redesign's load-bearing invariant: the presentation re-skin
+		// must preserve every element id the client script + replaceSection
+		// refresh handlers bind to. A future refactor that drops or renames one
+		// of these would silently break push / regenerate / section refreshes.
+		it("preserves the structural ids the refresh handlers + redesign depend on", () => {
+			buildPrSectionHtml.mockReturnValue(
+				'<div id="prSection"></div><hr class="separator" />',
+			);
+			const html = buildHtml(makeSummary({ recap: "A recap." }), {
+				transcriptHashSet: new Set(["t1"]),
+			});
+			// New presentation wrappers
+			for (const id of [
+				"prCard",
+				"jolliCard",
+				"propTable",
+				"detailsToggle",
+				"memoryPanel",
+				"e2ePanel",
+				"attachmentsPanel",
+				"plansCard",
+				"privateDrawer",
+			]) {
+				expect(html).toContain(`id="${id}"`);
+			}
+			expect(html).toContain('class="ship-bar"');
+			expect(html).toContain('class="meta-strip"');
+			// Refresh-target sections must keep their ids (replaceSection contract)
+			for (const id of [
+				"recapSection",
+				"topicsSection",
+				"e2eTestSection",
+				"allConversationsSection",
+			]) {
+				expect(html).toContain(`id="${id}"`);
+			}
+			// Relocated controls keep their ids (handlers bind by id, not position)
+			expect(html).toContain('id="pushJolliBtn"');
+			expect(html).toContain('id="regenerateSummaryBtn"');
+			// Sections still emit the trailing <hr class="separator"> that
+			// replaceSection relies on as nextElementSibling.
+			expect(html).toContain('<hr class="separator"');
+		});
+
 		it("includes CSP meta tag when nonce is provided", () => {
 			const html = buildHtml(makeSummary(), { nonce: "abc123" });
 			expect(html).toContain('http-equiv="Content-Security-Policy"');
@@ -1183,14 +1227,17 @@ describe("SummaryHtmlBuilder", () => {
 	// ─── buildHtml recap ordering ────────────────────────────────────────────
 
 	describe("buildHtml recap ordering", () => {
-		it("renders Quick recap above the Pull Request section", () => {
+		// Redesign v2: the Ship bar (Create PR is the hero outbound action) sits
+		// at the top of the page; the Quick recap now lives inside the Memory
+		// panel below it. Order is intentionally PR-then-recap.
+		it("renders the Pull Request ship card above the Quick recap", () => {
 			buildPrSectionHtml.mockReturnValue('<div class="pr-marker">PR</div>');
 			const html = buildHtml(makeSummary({ recap: "A short recap." }));
-			const recapIdx = html.indexOf("recapSection");
 			const prIdx = html.indexOf("pr-marker");
-			expect(recapIdx).toBeGreaterThan(0);
+			const recapIdx = html.indexOf("recapSection");
 			expect(prIdx).toBeGreaterThan(0);
-			expect(recapIdx).toBeLessThan(prIdx);
+			expect(recapIdx).toBeGreaterThan(0);
+			expect(prIdx).toBeLessThan(recapIdx);
 		});
 
 		it("renders the State 1 placeholder when summary has no recap (so Generate button is reachable)", () => {

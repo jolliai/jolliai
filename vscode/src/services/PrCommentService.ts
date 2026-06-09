@@ -778,6 +778,7 @@ export function buildPrSectionHtml(): string {
 <div class="section" id="prSection">
   <div class="section-header">
     <div class="section-title">${PR_ICON} Pull Request</div>
+    <span class="ship-status is-loading" id="prStatusChip"><span class="led"></span>Checking…</span>
   </div>
   <p class="pr-status-text" id="prStatusText">Checking PR status...</p>
   <div class="pr-link-row pr-hidden" id="prLinkRow"></div>
@@ -829,6 +830,9 @@ export function buildPrSectionCss(): string {
   }
   .pr-actions {
     margin: 8px 0 4px;
+    display: flex;
+    gap: 7px;
+    flex-wrap: wrap;
   }
   /* ── PR History (Previously: …) ── */
   /*
@@ -930,6 +934,20 @@ export function buildPrSectionScript(): string {
   function prShow(el) { if (el) el.classList.remove('pr-hidden'); }
   function prHide(el) { if (el) el.classList.add('pr-hidden'); }
 
+  // Status chip in the PR card header (mirrors the Jolli card chip). Built via
+  // DOM (no innerHTML) so it stays CSP-safe; reuses the shared .ship-status
+  // styles from SummaryCssBuilder. cls is one of is-ok / is-warn / is-loading.
+  var prStatusChip = document.getElementById('prStatusChip');
+  function setPrChip(cls, label) {
+    if (!prStatusChip) return;
+    prStatusChip.className = 'ship-status ' + cls;
+    prStatusChip.textContent = '';
+    var led = document.createElement('span');
+    led.className = 'led';
+    prStatusChip.appendChild(led);
+    prStatusChip.appendChild(document.createTextNode(label));
+  }
+
   /**
    * Renders the "Previously: #N (merged) · #M (closed) · ..." strip.
    * Hides the row when history is empty. Each entry links to the PR URL;
@@ -1023,12 +1041,14 @@ export function buildPrMessageScript(): string {
       prHide(prForm);
 
       if (s === 'notInstalled') {
+        setPrChip('is-warn', 'Unavailable');
         prStatusText.textContent = 'GitHub CLI (gh) is not installed. Install it from https://cli.github.com/ and reload the window.';
         prShow(prStatusText);
         prHide(prLinkRow);
         prHide(prActions);
         prHide(prHistory);
       } else if (s === 'notAuthenticated') {
+        setPrChip('is-warn', 'Auth needed');
         prStatusText.textContent = 'GitHub CLI (gh) is not authenticated. Run "gh auth login" in a terminal, then retry.';
         prShow(prStatusText);
         prHide(prLinkRow);
@@ -1037,6 +1057,7 @@ export function buildPrMessageScript(): string {
         retryAuthBtn.className = 'action-btn';
         retryAuthBtn.textContent = 'Retry';
         retryAuthBtn.addEventListener('click', function() {
+          setPrChip('is-loading', 'Checking…');
           prStatusText.textContent = 'Checking PR status...';
           vscode.postMessage({ command: 'checkPrStatus' });
         });
@@ -1044,6 +1065,7 @@ export function buildPrMessageScript(): string {
         prShow(prActions);
         prHide(prHistory);
       } else if (s === 'unavailable') {
+        setPrChip('is-warn', 'Unavailable');
         prStatusText.textContent = msg.reason
           ? ('Could not load PR status — ' + msg.reason + '. Retry, or check the extension log.')
           : 'Could not reach GitHub CLI (gh). This is often transient — retry, or check the extension log.';
@@ -1054,6 +1076,7 @@ export function buildPrMessageScript(): string {
         retryBtn.className = 'action-btn';
         retryBtn.textContent = 'Retry';
         retryBtn.addEventListener('click', function() {
+          setPrChip('is-loading', 'Checking…');
           prStatusText.textContent = 'Checking PR status...';
           vscode.postMessage({ command: 'checkPrStatus' });
         });
@@ -1061,6 +1084,7 @@ export function buildPrMessageScript(): string {
         prShow(prActions);
         prHide(prHistory);
       } else if (s === 'noPr') {
+        setPrChip('is-warn', 'No PR');
         prHide(prLinkRow);
         prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '.';
         prShow(prStatusText);
@@ -1078,9 +1102,31 @@ export function buildPrMessageScript(): string {
           btn.textContent = 'Loading...';
           vscode.postMessage({ command: 'prepareCreatePr' });
         });
+        // When no E2E tests exist yet, offer a one-click "generate E2E first,
+        // then create the PR" path so the PR body includes a fresh guide. The
+        // empty-state #generateE2eBtn presence is the "no E2E" signal; when E2E
+        // already exists this button is not rendered (and is removed on
+        // e2eTestUpdated). The shared window.prChainE2eThenCreate flag lets the
+        // e2eTestUpdated handler continue to prepareCreatePr once generation
+        // succeeds.
+        if (document.getElementById('generateE2eBtn')) {
+          var e2eThenPrBtn = document.createElement('button');
+          e2eThenPrBtn.className = 'action-btn';
+          e2eThenPrBtn.id = 'createPrWithE2eBtn';
+          e2eThenPrBtn.textContent = 'Generate E2E + Create PR';
+          prActions.appendChild(e2eThenPrBtn);
+          e2eThenPrBtn.addEventListener('click', function() {
+            e2eThenPrBtn.disabled = true;
+            e2eThenPrBtn.textContent = 'Generating E2E…';
+            btn.disabled = true;
+            window.prChainE2eThenCreate = true;
+            vscode.postMessage({ command: 'generateE2eTest' });
+          });
+        }
         renderPrHistory(msg.history);
       } else if (s === 'ready') {
         var pr = msg.pr;
+        setPrChip('is-ok', '#' + pr.number + ' open');
         prHide(prStatusText);
         // Build PR link via DOM
         prLinkRow.textContent = '';
@@ -1161,6 +1207,11 @@ export function buildPrMessageScript(): string {
     if (msg.command === 'prCreateBlockedCrossBranch') {
       var blockedBtn = document.getElementById('createPrBtn');
       if (blockedBtn) { blockedBtn.textContent = 'Create PR'; blockedBtn.disabled = false; }
+      // Also revert the "Generate E2E + Create PR" chain button + flag so a
+      // blocked attempt leaves a clickable state rather than a stuck spinner.
+      window.prChainE2eThenCreate = false;
+      var blockedE2eBtn = document.getElementById('createPrWithE2eBtn');
+      if (blockedE2eBtn) { blockedE2eBtn.textContent = 'Generate E2E + Create PR'; blockedE2eBtn.disabled = false; }
       if (prFormSubmit) {
         prFormSubmit.textContent = 'Submit PR';
         prFormSubmit.disabled = false;

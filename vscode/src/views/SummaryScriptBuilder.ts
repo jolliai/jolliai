@@ -34,6 +34,38 @@ export function buildScript(): string {
   }
   document.querySelectorAll('.toggle-header').forEach(attachToggleHeader);
 
+  // ── Redesign v2: Details disclosure + panel/card/drawer collapse ──
+  // Net-new presentational toggles. The collapse wrappers (.attach-card,
+  // .private-drawer) live OUTSIDE the sections that replaceSection rebuilds, so
+  // their collapsed state survives plansAndNotesUpdated / refreshConversations
+  // refreshes with no state persistence needed. Bound once at load; the heads
+  // are never replaced. Default state is expanded for every collapsible region
+  // except the Details property table (which ships with .collapsed).
+  var detailsToggle = document.getElementById('detailsToggle');
+  if (detailsToggle) {
+    detailsToggle.addEventListener('click', function() {
+      var t = document.getElementById('propTable');
+      if (!t) { return; }
+      var open = t.classList.toggle('collapsed') === false;
+      detailsToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      detailsToggle.textContent = open ? 'Details \\u25B4' : 'Details \\u25BE';
+    });
+  }
+  // A head element carrying data-collapse="<targetId>" toggles .collapsed on
+  // that container (attachment cards, private drawer). Keyboard-operable.
+  document.querySelectorAll('[data-collapse]').forEach(function(head) {
+    function toggleCollapse() {
+      var target = document.getElementById(head.getAttribute('data-collapse'));
+      if (!target) { return; }
+      var collapsed = target.classList.toggle('collapsed');
+      head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    }
+    head.addEventListener('click', toggleCollapse);
+    head.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCollapse(); }
+    });
+  });
+
   // Hash copy button: copy full commit hash to clipboard inline
   document.querySelectorAll('.hash-copy').forEach(function(btn) {
     btn.addEventListener('click', function() {
@@ -700,7 +732,7 @@ ${buildPrMessageScript()}
 
   // ── Regenerate-summary shared request + delegated click handlers ────────
   // Drives the end-to-end re-run from either entry point:
-  //   - The Conversations card's #regenerateSummaryBtn (in the initial DOM)
+  //   - The page header's #regenerateSummaryBtn (in the initial DOM)
   //   - The top-of-page #summaryErrorRegenerateBtn (banner; may be inserted
   //     dynamically by the summaryRegenerated handler — event delegation
   //     means we don't need to re-bind after DOM replacement)
@@ -989,6 +1021,16 @@ ${buildPrMessageScript()}
           attachE2eHandlers(newSection);
         }
       }
+      // "Generate E2E + Create PR" chain: E2E now exists, so the second PR
+      // button no longer applies — retire it — and if the user launched the
+      // chain, continue to the PR create form (prepareCreatePr now picks up the
+      // freshly generated E2E in the body).
+      var chainE2eBtn = document.getElementById('createPrWithE2eBtn');
+      if (chainE2eBtn) { chainE2eBtn.remove(); }
+      if (window.prChainE2eThenCreate) {
+        window.prChainE2eThenCreate = false;
+        vscode.postMessage({ command: 'prepareCreatePr' });
+      }
     } else if (msg.command === 'e2eScenarioUpdated' && typeof msg.scenarioIndex === 'number' && msg.html) {
       // Surgical per-scenario replacement preserves collapsed state of other scenarios.
       var oldToggle = document.getElementById('e2e-scenario-' + msg.scenarioIndex);
@@ -1025,6 +1067,15 @@ ${buildPrMessageScript()}
           btn.textContent = '\\u2728 Generate';
         }
         btn.disabled = false;
+      }
+      // Abort the "Generate E2E + Create PR" chain and restore its buttons so
+      // the user can retry or fall back to a plain Create PR.
+      if (window.prChainE2eThenCreate) {
+        window.prChainE2eThenCreate = false;
+        var chainErrBtn = document.getElementById('createPrWithE2eBtn');
+        if (chainErrBtn) { chainErrBtn.disabled = false; chainErrBtn.textContent = 'Generate E2E + Create PR'; }
+        var createErrBtn = document.getElementById('createPrBtn');
+        if (createErrBtn) { createErrBtn.disabled = false; }
       }
     }
 

@@ -151,15 +151,12 @@ ${csp}
 <div class="${pageClass}">
 ${buildSummaryErrorBanner(summary, { readOnly })}
 ${staleBannerHtml}
-${buildAllConversationsSection(transcriptHashSet, !!opts.foreignRepoName)}
-${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
-<hr class="separator" />
-${buildRecapSection(summary.recap)}
-${buildPrSectionHtml()}
-${buildPlansAndNotesSection(summary.plans, summary.notes, summary.references ?? [], planTranslateSet, noteTranslateSet, referenceTranslateSet)}
-${buildE2eTestSection(summary)}
-${buildSourceCommits(sourceNodes)}
-${buildTopicsSection(summary, { readOnly })}
+${buildHeader(summary, totalFiles, totalInsertions, totalDeletions, !!opts.foreignRepoName)}
+${buildShipBar(summary)}
+${buildMemoryPanel(summary, { readOnly })}
+${buildE2ePanel(summary)}
+${buildAttachmentsPanel(summary, sourceNodes, planTranslateSet, noteTranslateSet, referenceTranslateSet)}
+${buildPrivateDrawer(transcriptHashSet, !!opts.foreignRepoName)}
 ${buildFooter(summary)}
 </div>
 <script${nonceAttr}>${buildScript()}</script>
@@ -246,46 +243,69 @@ export function buildJolliRow(
 		allItems.length > 0
 			? `<div class="jolli-plans-block"><span class="jolli-plans-label">Plans &amp; Notes</span>${allItems.join("")}</div>`
 			: "";
+	// Standalone block (not a `.prop-row`): lives inside the Jolli ship card.
+	// `jolliRowUpdated` (SummaryScriptBuilder) replaces this element wholesale
+	// by id, so the refresh stays consistent with this shape. Returns "" when
+	// the memory has not been shared yet (no url).
 	return `
-  <div class="prop-row" id="jolliRow">
-    <div class="prop-label">Jolli Memory</div>
-    <div class="prop-value">
-      <a class="jolli-link" href="${escHtml(url)}" title="${memoryTooltip}">${escHtml(url)}</a>
-      ${plansAndNotesHtml}
-    </div>
+  <div id="jolliRow" class="jolli-status">
+    <a class="jolli-link" href="${escHtml(url)}" title="${memoryTooltip}">${escHtml(url)}</a>
+    ${plansAndNotesHtml}
   </div>`;
 }
 
 // ─── Header ───────────────────────────────────────────────────────────────────
 
-/** Builds the page header: title + Notion-style properties table. */
+/**
+ * Builds the page header: title, a compact meta strip, the collapsible
+ * Details property table, and a secondary-action row (Copy Markdown +
+ * Regenerate). The Jolli "Share/Update" button and the `#jolliRow` link move
+ * to the ship bar (see buildShipBar); Regenerate (`#regenerateSummaryBtn`)
+ * moves here from the All Conversations section so the top-level action lives
+ * near the export controls.
+ *
+ * In `isForeign` (cross-repo Memory Bank) mode the Regenerate button is
+ * OMITTED from the DOM entirely — regenerating would write the orphan branch
+ * of the wrong repo, so we drop the affordance rather than rely on CSS to hide
+ * it (matching the old All-Conversations behavior). In stale / regenerating
+ * modes it stays in the DOM and is hidden by the readonly CSS rule (it is
+ * intentionally not `data-foreign-safe`).
+ */
 function buildHeader(
 	summary: CommitSummary,
 	totalFiles: number,
 	totalInsertions: number,
 	totalDeletions: number,
+	isForeign: boolean = false,
 ): string {
 	const changesHtml = `${totalFiles} file${totalFiles !== 1 ? "s" : ""} changed, <span class="stat-add">${totalInsertions} insertion${totalInsertions !== 1 ? "s" : ""}(+)</span>, <span class="stat-del">${totalDeletions} deletion${totalDeletions !== 1 ? "s" : ""}(-)</span>`;
 	const totalTurns = aggregateTurns(summary);
-	const pushLabel = summary.jolliDocUrl ? "Update on Jolli" : "Share in Jolli";
+	const shortHash = escHtml(summary.commitHash.substring(0, 8));
+	const turnsMeta =
+		totalTurns > 0
+			? `<span class="meta-sep">&middot;</span><span class="stat-turns">\uD83D\uDCAC ${totalTurns}</span>`
+			: "";
 
 	return `
 <h1 class="page-title">${escHtml(summary.commitMessage)}</h1>
-<div class="header-actions">
-  <div class="split-btn-group">
-    <button class="action-btn" id="copyMdBtn" data-foreign-safe>Copy Markdown</button>
-    <button class="action-btn split-toggle" id="copyMdDropdown" title="More export options" data-foreign-safe>&#x25BE;</button>
-    <div class="split-menu" id="copyMdMenu">
-      <button class="split-menu-item" id="downloadMdBtn" data-foreign-safe>Save as Markdown File</button>
-    </div>
-  </div>
-  <button class="action-btn primary" id="pushJolliBtn">${pushLabel}</button>
+<div class="meta-strip">
+  <span class="meta-hash">${shortHash}</span>
+  <span class="meta-sep">&middot;</span>
+  <span class="meta-branch" title="${escAttr(summary.branch)}">${escHtml(summary.branch)}</span>
+  <span class="meta-sep">&middot;</span>
+  <span class="meta-author">${escHtml(summary.commitAuthor)}</span>
+  <span class="meta-sep">&middot;</span>
+  <span class="meta-date">${timeAgo(getDisplayDate(summary))}</span>
+  <span class="meta-sep">&middot;</span>
+  <span class="meta-changes"><span class="stat-add">+${totalInsertions}</span>/<span class="stat-del">\u2212${totalDeletions}</span></span>
+  ${turnsMeta}
+  <button class="details-toggle" id="detailsToggle" data-foreign-safe aria-expanded="false">Details &#x25BE;</button>
 </div>
-<div class="properties">
+<div class="properties collapsed" id="propTable">
   <div class="prop-row">
     <div class="prop-label">Commit</div>
     <div class="prop-value">
-      <span class="hash">${escHtml(summary.commitHash.substring(0, 8))}</span>
+      <span class="hash">${shortHash}</span>
       <button class="hash-copy" data-hash="${escHtml(summary.commitHash)}" title="Copy full hash" data-foreign-safe>\u29C9</button>
     </div>
   </div>
@@ -310,7 +330,160 @@ function buildHeader(
     <div class="prop-value">${changesHtml}</div>
   </div>
   ${buildConversationsRow(totalTurns)}
-  ${buildJolliRow(summary.jolliDocUrl, summary.commitMessage, summary.plans, summary.notes)}
+</div>
+<div class="header-actions">
+  <div class="split-btn-group">
+    <button class="action-btn" id="copyMdBtn" data-foreign-safe>Copy Markdown</button>
+    <button class="action-btn split-toggle" id="copyMdDropdown" title="More export options" data-foreign-safe>&#x25BE;</button>
+    <div class="split-menu" id="copyMdMenu">
+      <button class="split-menu-item" id="downloadMdBtn" data-foreign-safe>Save as Markdown File</button>
+    </div>
+  </div>
+  ${isForeign ? "" : `<button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>`}
+</div>`;
+}
+
+// \u2500\u2500\u2500 Ship bar + content panels (presentation wrappers) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+/**
+ * Builds the hero "ship bar": the PR card (wraps the existing #prSection) and
+ * the Jolli card (the relocated #pushJolliBtn + reshaped #jolliRow + a
+ * server-derived synced/not-shared status chip). Both outbound actions sit
+ * side-by-side (responsive: stacks to one column on narrow widths via CSS
+ * auto-fit). No behavior change \u2014 #prSection and #pushJolliBtn keep their ids
+ * and handlers; only their placement and framing change.
+ */
+function buildShipBar(summary: CommitSummary): string {
+	const synced = !!summary.jolliDocUrl;
+	const pushLabel = synced ? "Update on Jolli" : "Share in Jolli";
+	const jolliChip = synced
+		? `<span class="ship-status is-ok"><span class="led"></span>Synced</span>`
+		: `<span class="ship-status is-warn"><span class="led"></span>Not shared</span>`;
+	const jolliSub = synced
+		? ""
+		: `<div class="ship-sub">Lives only on your machine. Share to publish this memory to your team's Jolli space.</div>`;
+	return `
+<div class="ship-bar">
+  <div class="ship-card" id="prCard">
+    ${buildPrSectionHtml()}
+  </div>
+  <div class="ship-card" id="jolliCard">
+    <div class="ship-head">
+      <span class="ship-icon">&#x25C6;</span>
+      <span class="ship-name">Jolli Memory</span>
+      ${jolliChip}
+    </div>
+    ${jolliSub}
+    ${buildJolliRow(summary.jolliDocUrl, summary.commitMessage, summary.plans, summary.notes)}
+    <div class="ship-actions">
+      <button class="action-btn primary" id="pushJolliBtn">${pushLabel}</button>
+    </div>
+  </div>
+</div>`;
+}
+
+/**
+ * Wraps the recap + topics sections in a single bounded "Memory" panel so the
+ * primary content reads as one grouped surface. Both inner sections keep their
+ * ids (#recapSection, #topicsSection) and trailing <hr> (hidden by CSS inside
+ * the panel) so replaceSection refreshes are unaffected.
+ */
+function buildMemoryPanel(
+	summary: CommitSummary,
+	options: BuildTopicsSectionOptions = {},
+): string {
+	return `
+<div class="panel" id="memoryPanel">
+  <div class="panel-header"><span class="panel-title">The memory</span></div>
+  ${buildRecapSection(summary.recap)}
+  ${buildTopicsSection(summary, options)}
+</div>`;
+}
+
+/**
+ * Wraps the E2E section in its own panel (above attachments). The inner
+ * #e2eTestSection keeps its section-header (title + Generate/Regenerate/Delete
+ * actions) and id, so generate/regenerate/delete behavior is unchanged.
+ */
+function buildE2ePanel(summary: CommitSummary): string {
+	return `
+<div class="panel" id="e2ePanel">
+  ${buildE2eTestSection(summary)}
+</div>`;
+}
+
+/**
+ * Builds the "Attachments & context" panel containing collapsible cards.
+ *
+ * Each card wrapper (head + chevron) lives OUTSIDE the refreshed section so
+ * collapse state survives `plansAndNotesUpdated` rebuilds for free \u2014 the
+ * refresh only replaces the inner #plansAndNotesSection, never the card
+ * wrapper. As a consequence card boundaries match refresh boundaries:
+ * references render inside the "Plans & Notes" card (they share
+ * #plansAndNotesSection), and source commits get their own card. Inner
+ * section titles are hidden by CSS in favor of the card head.
+ */
+function buildAttachmentsPanel(
+	summary: CommitSummary,
+	sourceNodes: ReadonlyArray<CommitSummary>,
+	planTranslateSet?: ReadonlySet<string>,
+	noteTranslateSet?: ReadonlySet<string>,
+	referenceTranslateSet?: ReadonlySet<string>,
+): string {
+	const plansBody = buildPlansAndNotesSection(
+		summary.plans,
+		summary.notes,
+		summary.references ?? [],
+		planTranslateSet,
+		noteTranslateSet,
+		referenceTranslateSet,
+	);
+	const sourceBody = buildSourceCommits(sourceNodes);
+	const sourceCard = sourceBody
+		? `
+  <div class="attach-card" id="sourceCard">
+    <div class="attach-card-head" data-collapse="sourceCard" role="button" tabindex="0" aria-expanded="true" data-foreign-safe>&#x1F4E6; Source Commits <span class="attach-arrow">&#x25BC;</span></div>
+    <div class="attach-card-body">${sourceBody}</div>
+  </div>`
+		: "";
+	return `
+<div class="panel" id="attachmentsPanel">
+  <div class="panel-header"><span class="panel-title">Attachments &amp; context</span></div>
+  <div class="attach-card" id="plansCard">
+    <div class="attach-card-head" data-collapse="plansCard" role="button" tabindex="0" aria-expanded="true" data-foreign-safe>&#x1F4CB; Plans &amp; Notes <span class="attach-arrow">&#x25BC;</span></div>
+    <div class="attach-card-body">${plansBody}</div>
+  </div>
+  ${sourceCard}
+</div>`;
+}
+
+/**
+ * Demotes the All Conversations (private transcripts) zone to a collapsible
+ * drawer at the bottom of the page. The collapse toggle lives on the drawer
+ * head (outside #allConversationsSection) so refreshConversations rebuilds of
+ * the inner section never reset the drawer's collapse state. The inner
+ * section's own title is hidden by CSS in favor of the drawer head; its
+ * Manage/View transcript button is preserved.
+ */
+function buildPrivateDrawer(
+	transcriptHashSet?: ReadonlySet<string>,
+	isForeign: boolean = false,
+): string {
+	const count = transcriptHashSet?.size ?? 0;
+	const countLabel =
+		count > 0
+			? `<span class="private-count">${count} session${count !== 1 ? "s" : ""}</span>`
+			: "";
+	return `
+<div class="private-drawer" id="privateDrawer">
+  <div class="private-head" data-collapse="privateDrawer" role="button" tabindex="0" aria-expanded="true" data-foreign-safe>
+    <span class="private-lock">&#x1F512;</span>
+    <span class="private-title">All Conversations</span>
+    <span class="private-badge">PRIVATE</span>
+    ${countLabel}
+    <span class="attach-arrow">&#x25BC;</span>
+  </div>
+  <div class="private-body">${buildAllConversationsSection(transcriptHashSet, isForeign)}</div>
 </div>`;
 }
 
@@ -793,9 +966,9 @@ export function buildAllConversationsSection(
 	const count = transcriptHashSet?.size ?? 0;
 	let inner: string;
 	if (count === 0) {
-		const emptyActions = isForeign
-			? ""
-			: `      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>`;
+		// Regenerate moved to the page header (buildHeader); the conversations
+		// zone no longer renders its own button to avoid a duplicate id.
+		const emptyActions = "";
 		inner = `
 <div class="private-zone">
   <div class="private-zone-watermark">PRIVATE</div>
@@ -810,8 +983,7 @@ ${emptyActions}
 	} else {
 		const headerActions = isForeign
 			? `      <button class="action-btn" id="openTranscriptsBtn" data-foreign-safe title="Browse transcripts (read-only)">View</button>`
-			: `      <button class="action-btn" id="regenerateSummaryBtn" title="Re-run the LLM end-to-end">&#x21BB; Regenerate</button>
-      <button class="action-btn" id="openTranscriptsBtn">Manage</button>`;
+			: `      <button class="action-btn" id="openTranscriptsBtn">Manage</button>`;
 
 		inner = `
 <div class="private-zone">
