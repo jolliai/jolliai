@@ -629,9 +629,13 @@ export function buildCss(): string {
   }
 
   /* ── Toggle content with smooth expand/collapse ── */
+  /* max-height is the expand/collapse animation cap, NOT a content limit. It
+     must stay well above the tallest realistic topic (trigger + decisions +
+     all inner callouts expanded) or long topics clip — the narrower reading
+     column makes topics taller, so 800px was no longer enough. */
   .toggle-content {
     overflow: hidden;
-    max-height: 800px;
+    max-height: 6000px;
     opacity: 1;
     transition: max-height 0.25s ease, opacity 0.2s ease, padding 0.25s ease;
     padding: 4px 10px 12px 30px;
@@ -1408,6 +1412,151 @@ export function buildCss(): string {
   .foreign-readonly .summary-error-banner-action,
   .stale-readonly .summary-error-banner-action {
     display: none;
+  }
+
+  /* ── Redesign v2: ship bar, panels, meta strip, attachment cards, private
+     drawer, reading column, responsive. Appended last so these rules win over
+     the legacy header / properties rules above (equal specificity → later
+     wins). Presentation only; every id + handler is unchanged. ── */
+
+  /* themed tokens (merge into the existing theme blocks via the cascade) */
+  body.vscode-light {
+    --panel-bg: rgba(0, 0, 0, 0.015);
+    --panel-inner: rgba(0, 0, 0, 0.035);
+    --ship-ok: #1b8a4f;
+    --ship-warn: #96680e;
+  }
+  body.vscode-dark, body.vscode-high-contrast {
+    --panel-bg: rgba(255, 255, 255, 0.018);
+    --panel-inner: rgba(255, 255, 255, 0.045);
+    --ship-ok: #4ece8d;
+    --ship-warn: #e0ac2b;
+  }
+
+  /* reading column: cap width for readability, tighten padding for narrow tabs */
+  .page { max-width: 820px; padding: 22px 18px 48px; }
+
+  /* ── Meta strip ── */
+  .meta-strip {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 5px 9px;
+    font-size: 0.86em; color: var(--text-secondary); margin-bottom: 6px;
+  }
+  .meta-strip .meta-sep { color: var(--text-tertiary); opacity: 0.55; }
+  .meta-strip .meta-hash { font-family: var(--vscode-editor-font-family); color: var(--vscode-textLink-foreground); }
+  .meta-branch {
+    display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; vertical-align: bottom;
+    padding: 1px 8px; border-radius: 5px; background: var(--pill-bg); color: var(--pill-text); font-size: 0.92em;
+  }
+  .details-toggle {
+    background: none; border: none; cursor: pointer; font-family: var(--vscode-font-family);
+    font-size: 0.96em; color: var(--text-tertiary); padding: 1px 4px; border-radius: 4px;
+    text-decoration: underline; text-underline-offset: 2px; text-decoration-style: dotted;
+  }
+  .details-toggle:hover { color: var(--vscode-textLink-foreground); }
+  .details-toggle:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 1px; }
+
+  /* properties → collapsible Details disclosure */
+  .properties.collapsed { display: none; }
+  .properties { margin: 8px 0 4px; border: 1px solid var(--border-light); border-radius: 8px; overflow: hidden; }
+  /* Balanced horizontal padding so the value text isn't flush against the
+     tinted label column (the gap was the reported issue). */
+  .properties .prop-label { padding: 6px 16px; background: var(--panel-inner); }
+  .properties .prop-value { padding: 6px 16px; }
+  .header-actions { margin: 14px 0 20px; }
+
+  /* ── Ship bar (hero) ── */
+  .ship-bar {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 12px; margin: 0 0 20px;
+  }
+  .ship-card {
+    border: 1px solid var(--border-light); border-radius: 11px; padding: 13px 15px;
+    background: var(--panel-bg); display: flex; flex-direction: column; gap: 9px;
+  }
+  .ship-card hr.separator { display: none; }
+  .ship-head { display: flex; align-items: center; gap: 8px; }
+  .ship-icon { opacity: 0.9; }
+  .ship-name { font-weight: 650; font-size: 0.92em; }
+  .ship-sub { font-size: 0.86em; color: var(--text-secondary); line-height: 1.45; }
+  .ship-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+  .jolli-status { font-size: 0.9em; }
+  /* PR section reframed as a ship card: drop its standalone section spacing */
+  #prCard #prSection { margin: 0; }
+  #prCard .section-header { margin-bottom: 6px; }
+  #prCard .pr-status-text { margin-top: 0; }
+
+  /* ── Status chip (shared: Jolli synced/not-shared + PR open / loading) ── */
+  .ship-status {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
+    font-size: 0.72em; font-weight: 650; letter-spacing: 0.02em; padding: 2px 9px;
+    border-radius: 11px; background: var(--surface-hover); color: var(--text-secondary);
+  }
+  .ship-status .led { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); flex-shrink: 0; }
+  .ship-status.is-ok { color: var(--ship-ok); } .ship-status.is-ok .led { background: var(--ship-ok); }
+  .ship-status.is-warn { color: var(--ship-warn); } .ship-status.is-warn .led { background: var(--ship-warn); }
+  .ship-status.is-loading .led { animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+
+  /* ── Panels (grouping primitive: border = boundary, fills inside) ── */
+  .panel {
+    border: 1px solid var(--border-light); border-radius: 12px;
+    background: var(--panel-bg); padding: 16px; margin-bottom: 20px;
+  }
+  .panel hr.separator { display: none; }
+  .panel-header {
+    display: flex; align-items: center; gap: 8px;
+    padding-bottom: 8px; margin-bottom: 12px; border-bottom: 1px solid var(--border-light);
+  }
+  .panel-title { font-size: 0.78em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.09em; color: var(--text-secondary); }
+  /* recap inside the memory panel: borderless accent block (no box-in-box) */
+  #memoryPanel #recapSection {
+    background: var(--panel-inner); border-left: 3px solid var(--vscode-textLink-foreground);
+    border-radius: 0 6px 6px 0; padding: 10px 13px; margin-bottom: 14px;
+  }
+
+  /* ── Attachment cards (collapse wrapper OUTSIDE the refreshed section so
+     collapse state survives plansAndNotesUpdated rebuilds for free) ── */
+  /* No overflow:hidden — the "+ Add" dropdown opens upward (bottom:100%) and
+     must escape the card bounds; clipping it cut off the first menu item.
+     Collapse uses display:none, so no overflow is needed for it. */
+  .attach-card { border-radius: 8px; background: var(--panel-inner); margin-bottom: 10px; }
+  .attach-card:last-child { margin-bottom: 0; }
+  .attach-card-head {
+    display: flex; align-items: center; gap: 8px; padding: 9px 12px;
+    cursor: pointer; user-select: none; font-size: 0.84em; font-weight: 600;
+  }
+  .attach-card-head:hover { background: var(--surface-hover); }
+  .attach-card-head:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -2px; }
+  .attach-arrow { margin-left: auto; font-size: 0.7em; color: var(--text-secondary); transition: transform 0.18s ease; }
+  .attach-card.collapsed .attach-arrow { transform: rotate(-90deg); }
+  .attach-card.collapsed .attach-card-body { display: none; }
+  .attach-card-body { padding: 4px 12px 12px; }
+  /* inner section titles replaced by the card head */
+  .attach-card-body .section-header { display: none; }
+  .attach-card-body .section-title { display: none; }
+
+  /* ── Private drawer (demoted to bottom, collapsible) ── */
+  .private-drawer {
+    border: 1px dashed var(--private-zone-border); border-radius: 10px;
+    background: var(--private-zone-bg); margin-top: 8px; overflow: hidden;
+  }
+  .private-head { display: flex; align-items: center; gap: 9px; padding: 11px 14px; cursor: pointer; user-select: none; }
+  .private-head:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -2px; }
+  .private-lock { font-size: 0.92em; }
+  .private-title { font-weight: 650; font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; }
+  .private-badge { font-size: 0.62em; font-weight: 700; letter-spacing: 0.1em; padding: 1px 6px; border-radius: 4px; background: var(--private-zone-border); color: var(--vscode-editor-background); }
+  .private-count { color: var(--text-secondary); font-size: 0.82em; }
+  .private-head .attach-arrow { color: var(--text-secondary); }
+  .private-drawer.collapsed .attach-arrow { transform: rotate(-90deg); }
+  .private-drawer.collapsed .private-body { display: none; }
+  /* the drawer head replaces the inner private-zone chrome; keep Manage/View */
+  .private-body .private-zone { border: none; background: none; padding: 0 14px 12px; margin: 0; }
+  .private-body .private-zone .section-title { display: none; }
+  .private-body .private-zone-watermark { display: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .attach-arrow, .ship-status.is-loading .led { transition: none; animation: none; }
   }
 
 ${buildPrSectionCss()}
