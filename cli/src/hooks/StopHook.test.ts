@@ -1137,6 +1137,65 @@ describe("StopHook — plan discovery", () => {
 		expect(saved?.plans["plan-b"]?.title).toBe("Plan B (from sibling)");
 	});
 
+	it("should respect a concurrent hard delete of a touched slug (no revival)", async () => {
+		// Race scenario: a tick (or Stop) re-touches an already-registered
+		// uncommitted plan `foo` (e.g. the AI edited docs/foo.md again). Between our
+		// outside-lock load and the in-lock re-read, the user clicks "Remove" in the
+		// sidebar → removePlan deletes `foo` under the lock. Our writeback must NOT
+		// resurrect it — the explicit delete wins over the racing auto-registration.
+		vi.mocked(existsSync).mockReturnValue(true);
+
+		vi.mocked(loadPlansRegistry)
+			// Outside-lock load: `foo` is present (uncommitted).
+			.mockResolvedValueOnce({
+				version: 1,
+				plans: {
+					foo: {
+						slug: "foo",
+						title: "Foo",
+						sourcePath: "/repo/docs/foo.md",
+						addedAt: "2026-01-01T00:00:00Z",
+						updatedAt: "2026-01-01T00:00:00Z",
+						commitHash: null,
+					},
+				},
+			})
+			// In-lock re-read: a sibling (sidebar Remove) deleted `foo`.
+			.mockResolvedValueOnce({ version: 1, plans: {} });
+
+		// Our run re-touches `foo` (AI edited docs/foo.md again).
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/docs/foo.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		// `foo` must stay deleted — not revived from our local snapshot.
+		expect(saved?.plans["foo"]).toBeUndefined();
+		expect(Object.keys(saved?.plans ?? {})).toHaveLength(0);
+	});
+
+	it("should still write a slug newly created this run when fresh lacks it (not mistaken for a delete)", async () => {
+		// Control for the hard-delete guard: a brand-new plan this run is absent
+		// from the fresh re-read simply because no sibling has it yet — NOT because
+		// it was deleted (the deleter never saw it). It must still be written.
+		vi.mocked(existsSync).mockReturnValue(true);
+
+		vi.mocked(loadPlansRegistry)
+			.mockResolvedValueOnce({ version: 1, plans: {} }) // outside-lock: empty
+			.mockResolvedValueOnce({ version: 1, plans: {} }); // in-lock: still empty
+
+		// Our run creates a brand-new external plan.
+		mockTranscriptWithLines(['{"type":"tool_use","name":"Write","input":{"file_path":"/repo/docs/brand-new.md"}}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
+		expect(saved?.plans["brand-new"]).toBeDefined();
+		expect(saved?.plans["brand-new"]?.sourcePath).toBe("/repo/docs/brand-new.md");
+	});
+
 	it("should resolve gracefully when readline emits an error during transcript scan", async () => {
 		vi.mocked(existsSync).mockReturnValue(true);
 		mockTranscriptWithError();

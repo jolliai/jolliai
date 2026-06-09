@@ -7,10 +7,9 @@
  * sidebar's Active Conversations tick already discovers Codex sessions every
  * minute; this module rides that tick to scan each session's transcript and
  * persist what it finds — reusing the SAME `discovery-cursors.json` mechanism as
- * the Claude Stop path. Today it extracts Linear / Jira / GitHub / Notion
- * references; the module is named generically (not `CodexReferenceDiscovery`) so
- * a future plan-discovery pass can join the same per-session cursor without
- * another rename.
+ * the Claude Stop path. It extracts Linear / Jira / GitHub / Notion references
+ * AND markdown plans (apply_patch writes); both share the one per-session cursor
+ * (the module was named generically so plans could join without another rename).
  *
  * Concurrency: a per-cwd single-flight collapses overlapping calls (the tick,
  * panel re-open, manual refresh, detail-panel save all call this). A re-entrant
@@ -26,6 +25,7 @@
 
 import { createLogger } from "../Logger.js";
 import { discoverCodexSessions, isCodexInstalled } from "./CodexSessionDiscoverer.js";
+import { scanPlansFrom } from "./plans/TranscriptPlanDiscovery.js";
 import { scanReferencesFrom } from "./references/TranscriptReferenceDiscovery.js";
 import { loadConfig, loadDiscoveryCursor, migrateDiscoveryCursors, saveDiscoveryCursor } from "./SessionTracker.js";
 
@@ -41,7 +41,7 @@ const inFlight = new Map<string, InFlight>();
 
 /**
  * Scan all recent Codex sessions for this cwd and persist any discovered
- * artifacts (references today). Single-flight + dirty-rerun per cwd. Never rejects.
+ * artifacts (references + plans). Single-flight + dirty-rerun per cwd. Never rejects.
  */
 export function discoverCodexConversations(cwd: string): Promise<void> {
 	const existing = inFlight.get(cwd);
@@ -78,24 +78,51 @@ async function runOnce(cwd: string): Promise<void> {
 			// must not abort the rest of the batch or block cursor advances.
 			try {
 				const fromLine = (await loadDiscoveryCursor(session.transcriptPath, cwd))?.lineNumber ?? 0;
-				const lastLine = await scanReferencesFrom(session.transcriptPath, fromLine, cwd, "codex");
-				if (lastLine > fromLine) {
+
+				// Reference scans FIRST: its safe cursor (refLine) decides how far this
+				// pass advances the shared cursor, AND it caps plan scanning. A plan
+				// must never be processed past refLine — those lines get re-read next
+				// pass, which would re-upsert and churn plans.json.
+				let refLine = fromLine;
+				let refDone = false;
+				try {
+					refLine = await scanReferencesFrom(session.transcriptPath, fromLine, cwd, "codex");
+					refDone = true;
+				} catch (err) {
+					log.warn("Codex reference discovery failed for %s: %s", session.sessionId, (err as Error).message);
+				}
+
+				// Plan scans only (fromLine, refLine] — aligned with the cursor we will
+				// save, never overlapping. If ref threw, refLine === fromLine → plan
+				// scans 0 lines and retries next pass alongside the held cursor.
+				let planDone = false;
+				try {
+					await scanPlansFrom(session.transcriptPath, fromLine, cwd, "codex", refLine);
+					planDone = true;
+				} catch (err) {
+					log.warn("Codex plan discovery failed for %s: %s", session.sessionId, (err as Error).message);
+				}
+
+				// Advance only when BOTH completed and the safe cursor moved — any
+				// throw holds this window so the next pass re-scans it (re-scan is
+				// idempotent via dedupe + upsert-by-key).
+				if (refDone && planDone && refLine > fromLine) {
 					await saveDiscoveryCursor(
 						{
 							transcriptPath: session.transcriptPath,
-							lineNumber: lastLine,
+							lineNumber: refLine,
 							updatedAt: new Date().toISOString(),
 						},
 						cwd,
 					);
 				}
 			} catch (err) {
-				log.warn("Codex reference discovery failed for %s: %s", session.sessionId, (err as Error).message);
+				log.warn("Codex discovery failed for %s: %s", session.sessionId, (err as Error).message);
 			}
 		}
 	} catch (err) {
 		// Top-level guard: loadConfig / discoverCodexSessions / migrate can throw.
 		// Swallow so the public contract ("never rejects") holds.
-		log.warn("Codex reference discovery pass failed: %s", (err as Error).message);
+		log.warn("Codex discovery pass failed: %s", (err as Error).message);
 	}
 }
