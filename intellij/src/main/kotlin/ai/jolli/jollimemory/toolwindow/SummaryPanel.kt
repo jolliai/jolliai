@@ -68,6 +68,7 @@ class SummaryPanel(
     var currentSummary: CommitSummary = summary
         private set
 
+
     private var browser: JBCefBrowser? = null
     private var jsQuery: JBCefJSQuery? = null
     private var bridgeScript: String = ""
@@ -215,7 +216,7 @@ class SummaryPanel(
     private val writeCommands = setOf(
         "pushToJolli", "editTopic", "deleteTopic", "generateE2eTest", "editE2eTest",
         "deleteE2eTest", "savePlan", "removePlan", "translatePlan", "associatePlan",
-        "createPr", "updatePr", "saveAllTranscripts", "deleteAllTranscripts",
+        "createPrDirect", "createPrWithE2e", "createPr", "updatePr", "saveAllTranscripts", "deleteAllTranscripts",
         "generateRecap", "editRecap",
     )
 
@@ -240,6 +241,8 @@ class SummaryPanel(
                 "translatePlan" -> handleTranslatePlan(json.get("slug").asString)
                 "associatePlan" -> handleAssociatePlan()
                 "checkPrStatus" -> handleCheckPrStatus()
+                "createPrDirect" -> showCreatePrForm()
+                "createPrWithE2e" -> handleCreatePrWithE2e()
                 "createPr" -> handleCreatePr(json.get("title").asString, json.get("body").asString)
                 "prepareUpdatePr" -> handlePrepareUpdatePr()
                 "updatePr" -> handleUpdatePr(json.get("title").asString, json.get("body").asString)
@@ -487,22 +490,8 @@ class SummaryPanel(
         postToWebview("e2eTestGenerating")
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val summary = currentSummary
-                val config = SessionTracker.loadConfig(cwd)
-                val (topics) = SummaryUtils.collectSortedTopics(summary)
-                val diff = getDiffForCommit(summary.commitHash)
-
-                val scenarios = Summarizer.generateE2eTest(Summarizer.E2eTestParams(
-                    topics = topics.map { it.topic.topic },
-                    commitMessage = summary.commitMessage, diff = diff,
-                    apiKey = config.apiKey, model = config.model, jolliApiKey = config.jolliApiKey,
-                    aiProvider = config.aiProvider,
-                ))
-
-                val updatedSummary = summary.copy(e2eTestGuide = scenarios)
-                store.storeSummary(updatedSummary, force = true)
-                currentSummary = updatedSummary
-                val html = SummaryHtmlBuilder.buildE2eTestSection(updatedSummary)
+                generateAndStoreE2eTest()
+                val html = SummaryHtmlBuilder.buildE2eTestSection(currentSummary)
                 ApplicationManager.getApplication().invokeLater { postToWebview("e2eTestUpdated", mapOf("html" to html)) }
             } catch (e: Exception) {
                 ApplicationManager.getApplication().invokeLater {
@@ -511,6 +500,36 @@ class SummaryPanel(
                 }
             }
         }
+    }
+
+    /**
+     * Generates an E2E test guide for [currentSummary] via the LLM, persists it,
+     * and swaps [currentSummary] to the updated copy. Runs synchronously — call
+     * from a pooled thread. Shared by [handleGenerateE2eTest] and the Create PR flow.
+     */
+    private fun generateAndStoreE2eTest(): List<E2eTestScenario> {
+        val summary = currentSummary
+        val config = SessionTracker.loadConfig(cwd)
+        val (topics) = SummaryUtils.collectSortedTopics(summary)
+        val diff = getDiffForCommit(summary.commitHash)
+        jmLog.info(
+            "generateAndStoreE2eTest: topics=%d, diff len=%d, provider=%s, model=%s, hasApiKey=%s, hasJolliKey=%s",
+            topics.size, diff.length, config.aiProvider ?: "<null>", config.model ?: "<null>",
+            (!config.apiKey.isNullOrBlank()).toString(), (!config.jolliApiKey.isNullOrBlank()).toString(),
+        )
+
+        val scenarios = Summarizer.generateE2eTest(Summarizer.E2eTestParams(
+            topics = topics.map { it.topic.topic },
+            commitMessage = summary.commitMessage, diff = diff,
+            apiKey = config.apiKey, model = config.model, jolliApiKey = config.jolliApiKey,
+            aiProvider = config.aiProvider,
+        ))
+        jmLog.info("generateAndStoreE2eTest: LLM returned %d scenario(s); persisting", scenarios.size)
+
+        val updatedSummary = summary.copy(e2eTestGuide = scenarios)
+        store.storeSummary(updatedSummary, force = true)
+        currentSummary = updatedSummary
+        return scenarios
     }
 
     private fun handleEditE2eTest(scenariosJson: JsonArray) {
@@ -704,10 +723,13 @@ class SummaryPanel(
     }
 
     private fun handleCheckPrStatus() {
+        jmLog.info("handleCheckPrStatus: start (cwd='%s')", cwd)
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val commitCount = PrService.getCommitCount(cwd)
+                jmLog.info("handleCheckPrStatus: commitCount=%d", commitCount)
                 if (commitCount > 1) {
+                    jmLog.info("handleCheckPrStatus: status=multipleCommits (count=%d)", commitCount)
                     ApplicationManager.getApplication().invokeLater {
                         postToWebview("prStatus", mapOf("status" to "multipleCommits", "count" to commitCount))
                     }
@@ -715,14 +737,18 @@ class SummaryPanel(
                 }
 
                 val ghAvailable = PrService.isGhAvailable(cwd)
+                jmLog.info("handleCheckPrStatus: isGhAvailable=%s", ghAvailable)
                 if (!ghAvailable) {
+                    jmLog.warn("handleCheckPrStatus: status=unavailable (gh --version failed — not installed or not on resolved PATH)")
                     ApplicationManager.getApplication().invokeLater {
                         postToWebview("prStatus", mapOf("status" to "unavailable"))
                     }
                     return@executeOnPooledThread
                 }
                 val ghAuth = PrService.isGhAuthenticated(cwd)
+                jmLog.info("handleCheckPrStatus: isGhAuthenticated=%s", ghAuth)
                 if (!ghAuth) {
+                    jmLog.warn("handleCheckPrStatus: status=unavailable (gh auth status failed — not logged in)")
                     ApplicationManager.getApplication().invokeLater {
                         postToWebview("prStatus", mapOf("status" to "unavailable"))
                     }
@@ -731,12 +757,15 @@ class SummaryPanel(
 
                 val branch = PrService.getCurrentBranch(cwd) ?: "unknown"
                 val pr = PrService.findPrForBranch(cwd)
+                jmLog.info("handleCheckPrStatus: branch='%s', pr=%s", branch, pr?.number?.toString() ?: "none")
 
                 if (pr == null) {
+                    jmLog.info("handleCheckPrStatus: status=noPr (branch='%s')", branch)
                     ApplicationManager.getApplication().invokeLater {
                         postToWebview("prStatus", mapOf("status" to "noPr", "branch" to branch))
                     }
                 } else {
+                    jmLog.info("handleCheckPrStatus: status=ready (pr #%d)", pr.number)
                     ApplicationManager.getApplication().invokeLater {
                         postToWebview("prStatus", mapOf(
                             "status" to "ready",
@@ -745,12 +774,50 @@ class SummaryPanel(
                     }
                 }
             } catch (e: Exception) {
+                jmLog.error("handleCheckPrStatus: status=unavailable (exception: %s)", e.message ?: e.toString())
                 LOG.warn("Check PR status failed: ${e.message}")
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("prStatus", mapOf("status" to "unavailable"))
                 }
             }
         }
+    }
+
+
+    /**
+     * Generates an E2E test summary first, then reveals the prefilled PR form.
+     * Called when the user clicks "Create PR with E2E" in the webview.
+     */
+    private fun handleCreatePrWithE2e() {
+        jmLog.info("handleCreatePrWithE2e: starting E2E generation")
+        postToWebview("prGeneratingE2e")
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                jmLog.info("handleCreatePrWithE2e: generateAndStoreE2eTest() start")
+                val scenarios = generateAndStoreE2eTest()
+                jmLog.info("handleCreatePrWithE2e: generateAndStoreE2eTest() done — %d scenario(s)", scenarios.size)
+                val e2eHtml = SummaryHtmlBuilder.buildE2eTestSection(currentSummary)
+                ApplicationManager.getApplication().invokeLater {
+                    postToWebview("e2eTestUpdated", mapOf("html" to e2eHtml))
+                    showCreatePrForm()
+                }
+            } catch (e: Exception) {
+                jmLog.error("handleCreatePrWithE2e: E2E generation failed: %s", e.message ?: e.toString())
+                ApplicationManager.getApplication().invokeLater {
+                    postToWebview("e2eTestError", mapOf("message" to (e.message ?: "Generation failed")))
+                    Messages.showErrorDialog(project, "E2E test generation failed: ${e.message}", "Error")
+                    handleCheckPrStatus()
+                }
+            }
+        }
+    }
+
+    /** Builds the PR title/body from [currentSummary] and reveals the prefilled create form. */
+    private fun showCreatePrForm() {
+        val title = currentSummary.commitMessage
+        val body = PrService.wrapWithMarkers(SummaryPrMarkdownBuilder.buildPrMarkdown(currentSummary))
+        jmLog.info("showCreatePrForm: posting prShowCreateForm (title len=%d, body len=%d)", title.length, body.length)
+        postToWebview("prShowCreateForm", mapOf("title" to title, "body" to body))
     }
 
     private fun handleCreatePr(title: String, body: String) {
@@ -997,6 +1064,9 @@ class SummaryPanel(
 
     companion object {
         private val LOG = Logger.getInstance(SummaryPanel::class.java)
+
+        /** Writes to <projectDir>/.jolli/jollimemory/debug.log (same sink as PrService). */
+        private val jmLog = ai.jolli.jollimemory.core.JmLogger.create("SummaryPanel")
 
         fun collectTreeHashes(summary: CommitSummary): Set<String> {
             val hashes = mutableSetOf(summary.commitHash)

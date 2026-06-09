@@ -94,8 +94,37 @@ $rootVars
   }
   .header-actions {
     display: flex;
+    align-items: center;
     gap: 6px;
-    margin-bottom: 16px;
+    margin-bottom: 8px;
+  }
+  .header-actions-spacer {
+    flex: 1;
+  }
+  .details-disclosure {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.78em;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+    opacity: 0.7;
+    transition: opacity 0.1s ease;
+  }
+  .details-disclosure:hover {
+    opacity: 1;
+  }
+  .details-arrow {
+    width: 0;
+    height: 0;
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    border-left: 6px solid currentColor;
+    transition: transform 0.15s ease;
+  }
+  .details-disclosure[aria-expanded="true"] .details-arrow {
+    transform: rotate(90deg);
   }
   .action-btn {
     font-family: $FONT_FAMILY;
@@ -293,6 +322,10 @@ $rootVars
     gap: 0;
     font-size: 0.93em;
     margin-bottom: 4px;
+  }
+  /* Two-class selector beats the single-class .properties grid rule, so this wins. */
+  .properties.collapsed {
+    display: none;
   }
   .prop-row {
     display: contents;
@@ -1125,7 +1158,28 @@ $rootVars
     text-decoration: underline;
   }
   .pr-actions {
+    display: flex;
+    gap: 6px;
     margin: 8px 0 4px;
+  }
+  /* ── PR Content Status ── */
+  .pr-content-status {
+    margin-top: 10px;
+  }
+  .pr-content-label {
+    font-size: 0.85em;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+  }
+  .pr-content-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 6px 0;
+    font-size: 0.85em;
+  }
+  .pr-content-list li {
+    padding: 2px 0;
   }
   /* ── PR Create Form ── */
   .pr-form {

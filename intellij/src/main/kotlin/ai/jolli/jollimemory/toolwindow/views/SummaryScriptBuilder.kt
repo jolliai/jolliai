@@ -66,6 +66,16 @@ object SummaryScriptBuilder {
     });
   });
 
+  // Details disclosure toggle — show/hide the commit properties block.
+  var detailsToggleBtn = document.getElementById('detailsToggleBtn');
+  var propertiesSection = document.getElementById('propertiesSection');
+  if (detailsToggleBtn && propertiesSection) {
+    detailsToggleBtn.addEventListener('click', function() {
+      var collapsed = propertiesSection.classList.toggle('collapsed');
+      detailsToggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    });
+  }
+
   // Copy Markdown button with brief visual feedback
   var copyBtn = document.getElementById('copyMdBtn');
   if (copyBtn) {
@@ -1404,18 +1414,16 @@ ${buildPrMessageScript()}
   if (prFormCancel) {
     prFormCancel.addEventListener('click', function() {
       prHide(prForm);
-      prShow(prActions);
-      // Restore Edit PR button state
-      var editBtn = document.getElementById('editPrBtn');
-      if (editBtn) { editBtn.textContent = 'Edit PR'; editBtn.disabled = false; }
-      // Restore correct visibility based on current state
-      if (prCurrentState === 'ready') {
-        prHide(prStatusText);
-        prShow(prLinkRow);
-      } else {
-        prShow(prStatusText);
-        prHide(prLinkRow);
-      }
+      prHide(prLinkRow);
+      prHide(prActions);
+      // Re-check PR status rather than restoring whatever was last shown. This reflects
+      // reality for both the no-PR and existing-PR (Edit) cases, and avoids re-revealing
+      // stale prStatusText — e.g. the leftover E2E "Generating…" spinner, which was hidden
+      // (not cleared) when the form opened. The auto-create flag was already consumed by
+      // the initial status check, so this will not re-open the create flow.
+      prStatusText.textContent = 'Checking PR status…';
+      prShow(prStatusText);
+      jmSend({ command: 'checkPrStatus' });
     });
   }
   if (prFormSubmit) {
@@ -1458,24 +1466,33 @@ ${buildPrMessageScript()}
         prHide(prLinkRow);
         prActions.textContent = '';
         var btn = document.createElement('button');
-        btn.className = 'action-btn';
+        btn.className = 'action-btn primary';
         btn.id = 'createPrBtn';
         btn.textContent = 'Create PR';
         prActions.appendChild(btn);
+        var hasE2e = document.querySelectorAll('.e2e-scenario').length > 0;
+        if (!hasE2e) {
+          var e2eBtn = document.createElement('button');
+          e2eBtn.className = 'action-btn';
+          e2eBtn.id = 'createPrWithE2eBtn';
+          e2eBtn.textContent = 'Create PR with E2E';
+          prActions.appendChild(e2eBtn);
+        }
         prShow(prActions);
-        // Bind Create PR button
         btn.addEventListener('click', function() {
-          prHide(prStatusText);
-          prHide(prLinkRow);
-          prHide(prActions);
-          prShow(prForm);
-          prForm.dataset.mode = 'create';
-          prFormSubmit.textContent = 'Submit PR';
-          // Pre-fill form — values set via data attributes on prForm
-          prTitleInput.value = prForm.dataset.title || '';
-          prBodyInput.value = prForm.dataset.body || '';
-          prTitleInput.focus();
+          btn.textContent = 'Loading...';
+          btn.disabled = true;
+          if (!hasE2e) e2eBtn.disabled = true;
+          jmSend({ command: 'createPrDirect' });
         });
+        if (!hasE2e) {
+          e2eBtn.addEventListener('click', function() {
+            e2eBtn.textContent = 'Generating E2E...';
+            e2eBtn.disabled = true;
+            btn.disabled = true;
+            jmSend({ command: 'createPrWithE2e' });
+          });
+        }
       } else if (s === 'ready') {
         var pr = msg.pr;
         prHide(prStatusText);
@@ -1502,6 +1519,31 @@ ${buildPrMessageScript()}
           jmSend({ command: 'prepareUpdatePr' });
         });
       }
+    }
+
+    // ── PR generating E2E ── (shown while the AI generates the E2E test for the PR)
+    if (msg.command === 'prGeneratingE2e') {
+      prHide(prLinkRow);
+      prHide(prActions);
+      prHide(prForm);
+      prStatusText.textContent = '⏳ Generating end-to-end tests… this can take up to a minute.';
+      prShow(prStatusText);
+    }
+
+    // ── PR show create form ──
+    if (msg.command === 'prShowCreateForm') {
+      prHide(prStatusText);
+      prHide(prLinkRow);
+      prActions.textContent = '';
+      prHide(prActions);
+      prShow(prForm);
+      prForm.dataset.mode = 'create';
+      prFormSubmit.textContent = 'Submit PR';
+      prFormSubmit.disabled = false;
+      prFormCancel.disabled = false;
+      prTitleInput.value = msg.title || '';
+      prBodyInput.value = msg.body || '';
+      prTitleInput.focus();
     }
 
     // ── PR show update form ──

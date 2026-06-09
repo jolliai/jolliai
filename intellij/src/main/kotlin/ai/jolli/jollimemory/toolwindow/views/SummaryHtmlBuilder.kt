@@ -54,15 +54,15 @@ object SummaryHtmlBuilder {
 
         val topicsHtml = when {
             allTopics.isEmpty() ->
-                """<p class="empty">No summaries available for this commit.</p>"""
+                """<p class="empty">No topics available for this commit.</p>"""
             showRecordDates ->
                 renderTimeline(groupTopicsByDate(allTopics))
             else ->
                 allTopics.mapIndexed { i, t -> renderTopic(t, i) }.joinToString("\n")
         }
 
-        val topicsLabel = "${allTopics.size} summar${if (allTopics.size != 1) "ies" else "y"} extracted from this commit"
-        val summariesTitle = if (allTopics.size == 1) "Summary" else "Summaries"
+        val topicsLabel = "${allTopics.size} topic${if (allTopics.size != 1) "s" else ""} extracted from this commit"
+        val topicsTitle = if (allTopics.size == 1) "Topic" else "Topics"
 
         return """<!DOCTYPE html>
 <html lang="en">
@@ -81,21 +81,21 @@ object SummaryHtmlBuilder {
 </head>
 <body>
 <div class="page">
-${buildAllConversationsSection(transcriptHashSet)}
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
 <hr class="separator" />
 ${buildPrSection(summary)}
-${buildPlansSection(summary.plans, planTranslateSet)}
 ${buildRecapSection(summary)}
-${buildE2eTestSection(summary)}
-${buildSourceCommits(sourceNodes)}
 <div class="section">
   <div class="section-header">
-    <div class="section-title" title="${escAttr(topicsLabel)}">&#x1F4DD; $summariesTitle <span class="section-count">${allTopics.size}</span></div>
-    <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all summaries">Collapse All</button>
+    <div class="section-title" title="${escAttr(topicsLabel)}">&#x1F4DD; $topicsTitle <span class="section-count">${allTopics.size}</span></div>
+    <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all topics">Collapse All</button>
   </div>
   $topicsHtml
 </div>
+${buildE2eTestSection(summary)}
+${buildPlansSection(summary.plans, planTranslateSet)}
+${buildSourceCommits(sourceNodes)}
+${buildAllConversationsSection(transcriptHashSet)}
 ${buildFooter(summary)}
 </div>
 ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
@@ -116,10 +116,10 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
 <div class="section" id="e2eTestSection">
   <div class="section-header">
     <div class="section-title">&#x1F9EA; E2E Test</div>
+    <button class="action-btn" id="generateE2eBtn">&#x2728; Generate</button>
   </div>
   <p class="e2e-placeholder">Generate step-by-step testing instructions for PR reviewers.<br>
   The guide describes how to manually verify each change from a user's perspective.</p>
-  <button class="action-btn" id="generateE2eBtn">&#x2728; Generate</button>
 </div>
 <hr class="separator" />"""
         }
@@ -153,9 +153,9 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
 <div class="section recap-section" id="recapSection">
   <div class="section-header">
     <div class="section-title">&#x1F4D6; Quick recap</div>
+    <button class="action-btn" id="generateRecapBtn">&#x2728; Generate</button>
   </div>
   <p class="recap-placeholder">Generate a recap that highlights the major work in this commit.</p>
-  <button class="action-btn" id="generateRecapBtn">&#x2728; Generate</button>
 </div>
 <hr class="separator" />"""
         }
@@ -278,7 +278,7 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
         }
 
         return """
-<div class="private-zone">
+<div class="private-zone" id="conversationsSection">
   <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
     <div class="section-title">&#x1F4AC; All Conversations</div>
@@ -336,14 +336,17 @@ ${buildTranscriptModal()}"""
             """$totalFiles file$filesPlural changed, <span class="stat-add">$totalInsertions insertion$insPlural(+)</span>, <span class="stat-del">$totalDeletions deletion$delPlural(-)</span>"""
         val totalTurns = SummaryTree.aggregateTurns(summary)
         val pushLabel = if (summary.jolliDocUrl != null) "Update on Jolli" else "Share in Jolli"
-
         return """
 <h1 class="page-title">${escHtml(summary.commitMessage)}</h1>
 <div class="header-actions">
-  <button class="action-btn" id="copyMdBtn">Copy Markdown</button>
+  <div class="details-disclosure" id="detailsToggleBtn" role="button" aria-expanded="false">
+    <span class="details-arrow"></span>Details
+  </div>
+  <div class="header-actions-spacer"></div>
   <button class="action-btn primary" id="pushJolliBtn">$pushLabel</button>
+  <button class="action-btn" id="copyMdBtn">Copy Markdown</button>
 </div>
-<div class="properties">
+<div class="properties collapsed" id="propertiesSection">
   <div class="prop-row">
     <div class="prop-label">Commit</div>
     <div class="prop-value">
@@ -442,14 +445,51 @@ ${buildTranscriptModal()}"""
         val escapedTitle = escAttr(summary.commitMessage)
         val escapedBody = escAttr(ai.jolli.jollimemory.services.PrService.wrapWithMarkers(prMarkdown))
 
+        val hasRecap = !summary.recap.isNullOrBlank()
+        val hasE2e = !summary.e2eTestGuide.isNullOrEmpty()
+
+        data class PrContentItem(val icon: String, val label: String, val included: Boolean)
+        val items = listOf(
+            PrContentItem("&#x1F4D6;", "Quick Recap", hasRecap),
+            PrContentItem("&#x1F9EA;", "E2E Test", hasE2e),
+        )
+        val included = items.filter { it.included }
+        val notIncluded = items.filter { !it.included }
+
+        val includedHtml = if (included.isNotEmpty()) {
+            val listItems = included.joinToString("\n") {
+                """    <li>&#x1F7E2; ${it.icon} ${it.label}</li>"""
+            }
+            """
+  <div class="pr-content-status">
+    <div class="pr-content-label">Will be included in PR:</div>
+    <ul class="pr-content-list">
+$listItems
+    </ul>
+  </div>"""
+        } else ""
+
+        val notIncludedHtml = if (notIncluded.isNotEmpty()) {
+            val listItems = notIncluded.joinToString("\n") {
+                """    <li>&#x274C; ${it.icon} ${it.label}</li>"""
+            }
+            """
+  <div class="pr-content-status">
+    <div class="pr-content-label">Will not be included (add below):</div>
+    <ul class="pr-content-list">
+$listItems
+    </ul>
+  </div>"""
+        } else ""
+
         return """
 <div class="section" id="prSection">
   <div class="section-header">
     <div class="section-title">$PR_ICON Pull Request</div>
+    <div class="pr-actions pr-hidden" id="prActions"></div>
   </div>
   <p class="pr-status-text" id="prStatusText">Checking PR status...</p>
-  <div class="pr-link-row pr-hidden" id="prLinkRow"></div>
-  <div class="pr-actions pr-hidden" id="prActions"></div>
+  <div class="pr-link-row pr-hidden" id="prLinkRow"></div>$includedHtml$notIncludedHtml
   <div class="pr-form pr-hidden" id="prForm" data-title="$escapedTitle" data-body="$escapedBody">
     <label class="pr-form-label">Title</label>
     <input type="text" class="pr-form-input" id="prTitleInput" />
@@ -509,9 +549,9 @@ ${buildTranscriptModal()}"""
 <div class="section" id="plansSection">
   <div class="section-header">
     <div class="section-title">&#x1F4CB; Plans$sectionCount</div>
+    <button class="action-btn associate-plan-btn" data-action="associatePlan">+ Associate Plan</button>
   </div>
   $body
-  <button class="action-btn associate-plan-btn" data-action="associatePlan">+ Associate Plan</button>
 </div>
 <hr class="separator" />
 """
@@ -537,7 +577,7 @@ ${buildTranscriptModal()}"""
         val expectedHtml = s.expectedResults.joinToString("\n        ") { r -> "<li>${escHtml(r)}</li>" }
 
         return """
-<div class="toggle e2e-scenario" id="e2e-scenario-$index">
+<div class="toggle e2e-scenario collapsed" id="e2e-scenario-$index">
   <div class="toggle-header">
     <span class="arrow">&#x25BC;</span>
     <span class="toggle-num">${padIndex(index)}</span>
