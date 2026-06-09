@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -21,9 +21,10 @@ vi.mock("./SessionTracker.js", async (importOriginal) => {
 	};
 });
 
+import { existsSync } from "node:fs";
 import { discoverCodexConversations } from "./CodexDiscovery.js";
 import { discoverCodexSessions } from "./CodexSessionDiscoverer.js";
-import { loadDiscoveryCursor, upsertReferenceEntry } from "./SessionTracker.js";
+import { loadDiscoveryCursor, loadPlansRegistry, savePlansRegistry, upsertReferenceEntry } from "./SessionTracker.js";
 
 const TS = "2026-06-05T10:24:53.000Z";
 const jsonl = (o: unknown) => JSON.stringify(o);
@@ -32,6 +33,12 @@ const fnCall = (namespace: string, name: string, callId: string) =>
 		type: "response_item",
 		timestamp: TS,
 		payload: { type: "function_call", name, namespace, arguments: "{}", call_id: callId },
+	});
+const applyPatch = (input: string) =>
+	jsonl({
+		type: "response_item",
+		timestamp: TS,
+		payload: { type: "custom_tool_call", name: "apply_patch", call_id: "p1", input },
 	});
 const fnOutput = (callId: string, inner: unknown, wrap: "array" | "bare") =>
 	jsonl({
@@ -131,5 +138,148 @@ describe("discoverCodexConversations — integration (real parser + scan + curso
 		expect(vi.mocked(upsertReferenceEntry).mock.calls[0][0].url).toBe(
 			"https://jolli-team-kr0v9z0x.atlassian.net/browse/KAN-4",
 		);
+	});
+
+	it("ingests a markdown plan written by apply_patch into plans.json (title from first #)", async () => {
+		// The plan file must exist on disk: the driver's existsSync guard reads it.
+		mkdirSync(join(dir, "docs"), { recursive: true });
+		writeFileSync(join(dir, "docs", "foo-plan.md"), "# Foo Plan Title\n\nbody\n", "utf-8");
+		writeFileSync(
+			rollout,
+			`${applyPatch(["*** Begin Patch", "*** Add File: docs/foo-plan.md", "+# Foo Plan Title", "*** End Patch"].join("\n"))}\n`,
+			"utf-8",
+		);
+
+		await discoverCodexConversations(dir);
+
+		const registry = await loadPlansRegistry(dir);
+		const entries = Object.values(registry.plans);
+		expect(entries).toHaveLength(1);
+		expect(entries[0]?.title).toBe("Foo Plan Title");
+		expect(entries[0]?.sourcePath).toBe(join(dir, "docs", "foo-plan.md"));
+		// Plan + reference share one cursor; with no refs here it advances to EOF (1 line).
+		expect((await loadDiscoveryCursor(rollout, dir))?.lineNumber).toBe(1);
+	});
+
+	it("does not churn plans.json while a straddling fetch caps the plan window, then ingests on the next poll (High)", async () => {
+		mkdirSync(join(dir, "docs"), { recursive: true });
+		writeFileSync(join(dir, "docs", "later-plan.md"), "# Later Plan\n", "utf-8");
+		// Poll 1: an in-flight Jira fetch (request, no output) comes BEFORE the plan
+		// write, so the reference safe cursor stops at the request line → the plan is
+		// beyond refLine and must NOT be ingested this pass.
+		writeFileSync(
+			rollout,
+			`${fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "j1")}\n${applyPatch(
+				["*** Begin Patch", "*** Add File: docs/later-plan.md", "+# Later Plan", "*** End Patch"].join("\n"),
+			)}\n`,
+			"utf-8",
+		);
+
+		// Repeated polls (simulating multiple 60s ticks) must not write the plan or
+		// advance the cursor while the fetch is in-flight.
+		await discoverCodexConversations(dir);
+		await discoverCodexConversations(dir);
+		expect(Object.keys((await loadPlansRegistry(dir)).plans)).toHaveLength(0);
+		expect(await loadDiscoveryCursor(rollout, dir)).toBeNull();
+		expect(existsSync(join(dir, ".jolli", "jollimemory", "plans.json"))).toBe(false); // never written
+
+		// Poll N: the fetch output lands → safe cursor advances past the plan line →
+		// the plan is finally ingested.
+		appendFileSync(rollout, `${fnOutput("j1", JIRA, "bare")}\n`, "utf-8");
+		await discoverCodexConversations(dir);
+		const entries = Object.values((await loadPlansRegistry(dir)).plans);
+		expect(entries).toHaveLength(1);
+		expect(entries[0]?.title).toBe("Later Plan");
+		expect((await loadDiscoveryCursor(rollout, dir))?.lineNumber).toBe(3);
+	});
+
+	it("ingests every .md file of a multi-file apply_patch into its own plans.json entry", async () => {
+		mkdirSync(join(dir, "docs"), { recursive: true });
+		writeFileSync(join(dir, "docs", "alpha.md"), "# Alpha\n", "utf-8");
+		writeFileSync(join(dir, "docs", "beta.md"), "# Beta\n", "utf-8");
+		writeFileSync(
+			rollout,
+			`${applyPatch(
+				[
+					"*** Begin Patch",
+					"*** Add File: docs/alpha.md",
+					"+# Alpha",
+					"*** Update File: src/code.ts",
+					"+code",
+					"*** Add File: docs/beta.md",
+					"+# Beta",
+					"*** End Patch",
+				].join("\n"),
+			)}\n`,
+			"utf-8",
+		);
+
+		await discoverCodexConversations(dir);
+
+		const titles = Object.values((await loadPlansRegistry(dir)).plans)
+			.map((p) => p.title)
+			.sort();
+		expect(titles).toEqual(["Alpha", "Beta"]); // both .md ingested, the .ts ignored
+	});
+
+	it("drops a stale Move-to source (no longer on disk) while keeping the move target", async () => {
+		mkdirSync(join(dir, "docs"), { recursive: true });
+		// Only the move TARGET exists on disk; the source was renamed away.
+		writeFileSync(join(dir, "docs", "renamed.md"), "# Renamed\n", "utf-8");
+		writeFileSync(
+			rollout,
+			`${applyPatch(
+				[
+					"*** Begin Patch",
+					"*** Update File: docs/original.md",
+					"*** Move to: docs/renamed.md",
+					"*** End Patch",
+				].join("\n"),
+			)}\n`,
+			"utf-8",
+		);
+
+		await discoverCodexConversations(dir);
+
+		const entries = Object.values((await loadPlansRegistry(dir)).plans);
+		expect(entries).toHaveLength(1); // stale source dropped by existsSync guard
+		expect(entries[0]?.sourcePath).toBe(join(dir, "docs", "renamed.md"));
+	});
+
+	it("does NOT register a Codex apply_patch .md that is already a markdown note", async () => {
+		mkdirSync(join(dir, "docs"), { recursive: true });
+		const noteFile = join(dir, "docs", "noted.md");
+		writeFileSync(noteFile, "# Noted\n", "utf-8");
+		// Pre-seed plans.json with a note pointing at the same file.
+		await savePlansRegistry(
+			{
+				version: 1,
+				plans: {},
+				notes: {
+					n1: {
+						id: "n1",
+						title: "Noted",
+						format: "markdown",
+						addedAt: TS,
+						updatedAt: TS,
+						commitHash: null,
+						sourcePath: noteFile,
+					},
+				},
+			},
+			dir,
+		);
+		writeFileSync(
+			rollout,
+			`${applyPatch(["*** Begin Patch", "*** Add File: docs/noted.md", "+# Noted", "*** End Patch"].join("\n"))}\n`,
+			"utf-8",
+		);
+
+		await discoverCodexConversations(dir);
+
+		// The note suppresses plan auto-registration — plans stays empty, note intact.
+		const registry = await loadPlansRegistry(dir);
+		expect(Object.keys(registry.plans)).toHaveLength(0);
+		expect(Object.keys(registry.notes ?? {})).toEqual(["n1"]);
 	});
 });
