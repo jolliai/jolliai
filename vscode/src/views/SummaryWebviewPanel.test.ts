@@ -113,7 +113,7 @@ vi.mock("vscode", () => ({
 			toString: () => String(args.join("/")),
 		})),
 	},
-	ViewColumn: { One: 1, Beside: 2 },
+	ViewColumn: { One: 1 },
 	workspace: {
 		getConfiguration,
 		fs: { writeFile: fsWriteFile },
@@ -735,7 +735,7 @@ describe("SummaryWebviewPanel", () => {
 			expect(createWebviewPanel).toHaveBeenCalledWith(
 				"jollimemory.summary.commit",
 				"Commit Memory",
-				2,
+				1,
 				expect.objectContaining({
 					enableScripts: true,
 					retainContextWhenHidden: true,
@@ -757,7 +757,7 @@ describe("SummaryWebviewPanel", () => {
 			expect(createWebviewPanel).toHaveBeenCalledWith(
 				"jollimemory.summary.memory",
 				"Commit Memory",
-				2,
+				1,
 				expect.objectContaining({
 					enableScripts: true,
 					retainContextWhenHidden: true,
@@ -765,12 +765,12 @@ describe("SummaryWebviewPanel", () => {
 			);
 		});
 
-		// The KB-folder browser opens a summary tab against an explicit ViewColumn
-		// instead of "Beside" so it lands in column One (the main editor area)
-		// rather than floating next to whatever happens to be focused. The
-		// commit-source default uses Beside; switching source to "kb" must flip
-		// the column the panel is created in.
-		it("opens the KB source in ViewColumn.One instead of Beside", async () => {
+		// All sources — memory / commit / kb — open on ViewColumn.One so every
+		// memory/summary panel stacks as tabs in the main editor group (the same
+		// group VS Code's built-in markdown preview uses for the plain-markdown
+		// memory files: wiki / plan / note). kb was already on One; this guards
+		// against any source regressing to a different column.
+		it("opens the KB source in ViewColumn.One, unified with the other sources", async () => {
 			const summary = makeSummary();
 			await SummaryWebviewPanel.show(
 				summary,
@@ -781,7 +781,7 @@ describe("SummaryWebviewPanel", () => {
 				"kb",
 			);
 
-			// Third positional arg is the ViewColumn — 1 for One, 2 for Beside.
+			// Third positional arg is the ViewColumn — 1 for One.
 			expect(createWebviewPanel).toHaveBeenCalledWith(
 				"jollimemory.summary.commit",
 				"Commit Memory",
@@ -1088,7 +1088,8 @@ describe("SummaryWebviewPanel", () => {
 
 			expect(createWebviewPanel).toHaveBeenCalledTimes(1);
 			// reveal() with undefined viewColumn keeps the panel in its current column
-			// (passing ViewColumn.Beside would risk a column-move that blanks the iframe).
+			// (passing an explicit column would risk a column-move that blanks the iframe).
+			// Second arg is preserveFocus: true for commit source (keep focus on the sidebar).
 			expect(reveal).toHaveBeenCalledWith(undefined, true);
 		});
 
