@@ -21,6 +21,7 @@ import java.time.Instant
  *   7. Call Anthropic API for structured summary
  *   8. Store summary in orphan branch
  */
+// test comment for commit 2
 object PostCommitHook {
 
     private val log = JmLogger.create("PostCommitHook")

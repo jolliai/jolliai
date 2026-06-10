@@ -6,8 +6,8 @@
 
 When you work with AI agents like Claude Code, Codex, or Gemini CLI, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
----
-
+--- asdfljjl; asdfasdf
+ asdfasdf asdfasdf asdfasdf
 ## What it does
 
 After each commit, Jolli Memory reads your selected AI session transcripts and the code diff, calls the LLM to produce a structured summary, and stores it alongside the commit silently in the background. The IntelliJ plugin surfaces everything in a tool window so you can manage plans, stage files, write AI-assisted commit messages, review summaries, and share them, without leaving your IDE.
