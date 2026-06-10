@@ -74,7 +74,7 @@ class SummaryHtmlBuilderTest {
 
         @Test
         fun `shows empty message for no topics`() {
-            SummaryHtmlBuilder.buildHtml(makeSummary(topics = emptyList())) shouldContain "No summaries available"
+            SummaryHtmlBuilder.buildHtml(makeSummary(topics = emptyList())) shouldContain "No topics available for this commit."
         }
 
         @Test
