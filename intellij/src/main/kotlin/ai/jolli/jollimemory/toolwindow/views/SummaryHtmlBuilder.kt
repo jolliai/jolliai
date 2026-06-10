@@ -54,15 +54,15 @@ object SummaryHtmlBuilder {
 
         val topicsHtml = when {
             allTopics.isEmpty() ->
-                """<p class="empty">No summaries available for this commit.</p>"""
+                """<p class="empty">No topics available for this commit.</p>"""
             showRecordDates ->
                 renderTimeline(groupTopicsByDate(allTopics))
             else ->
                 allTopics.mapIndexed { i, t -> renderTopic(t, i) }.joinToString("\n")
         }
 
-        val topicsLabel = "${allTopics.size} summar${if (allTopics.size != 1) "ies" else "y"} extracted from this commit"
-        val summariesTitle = if (allTopics.size == 1) "Summary" else "Summaries"
+        val topicsLabel = "${allTopics.size} topic${if (allTopics.size != 1) "s" else ""} extracted from this commit"
+        val topicsTitle = if (allTopics.size == 1) "Topic" else "Topics"
 
         return """<!DOCTYPE html>
 <html lang="en">
@@ -81,21 +81,12 @@ object SummaryHtmlBuilder {
 </head>
 <body>
 <div class="page">
-${buildAllConversationsSection(transcriptHashSet)}
 ${buildHeader(summary, totalFiles, totalInsertions, totalDeletions)}
-<hr class="separator" />
-${buildPrSection(summary)}
-${buildPlansSection(summary.plans, planTranslateSet)}
-${buildRecapSection(summary)}
-${buildE2eTestSection(summary)}
-${buildSourceCommits(sourceNodes)}
-<div class="section">
-  <div class="section-header">
-    <div class="section-title" title="${escAttr(topicsLabel)}">&#x1F4DD; $summariesTitle <span class="section-count">${allTopics.size}</span></div>
-    <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all summaries">Collapse All</button>
-  </div>
-  $topicsHtml
-</div>
+${buildShipBar(summary)}
+${buildMemoryPanel(summary, allTopics, topicsHtml, topicsTitle, topicsLabel)}
+${buildE2ePanel(summary)}
+${buildAttachmentsPanel(summary.plans, planTranslateSet, sourceNodes)}
+${buildPrivateDrawer(transcriptHashSet)}
 ${buildFooter(summary)}
 </div>
 ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
@@ -116,12 +107,11 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
 <div class="section" id="e2eTestSection">
   <div class="section-header">
     <div class="section-title">&#x1F9EA; E2E Test</div>
+    <button class="action-btn" id="generateE2eBtn">&#x2728; Generate</button>
   </div>
   <p class="e2e-placeholder">Generate step-by-step testing instructions for PR reviewers.<br>
   The guide describes how to manually verify each change from a user's perspective.</p>
-  <button class="action-btn" id="generateE2eBtn">&#x2728; Generate</button>
-</div>
-<hr class="separator" />"""
+</div>"""
         }
 
         // Scenarios exist — render each as a toggle
@@ -138,8 +128,7 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
     </span>
   </div>
   $scenariosHtml
-</div>
-<hr class="separator" />"""
+</div>"""
     }
 
     // ── Quick Recap Section (public for in-place update) ───────────────────
@@ -153,11 +142,10 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
 <div class="section recap-section" id="recapSection">
   <div class="section-header">
     <div class="section-title">&#x1F4D6; Quick recap</div>
+    <button class="action-btn" id="generateRecapBtn">&#x2728; Generate</button>
   </div>
   <p class="recap-placeholder">Generate a recap that highlights the major work in this commit.</p>
-  <button class="action-btn" id="generateRecapBtn">&#x2728; Generate</button>
-</div>
-<hr class="separator" />"""
+</div>"""
         }
 
         val bodyHtml = trimmed.split(Regex("\n\n+"))
@@ -173,8 +161,7 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
     </span>
   </div>
   <div class="recap-body">$bodyHtml</div>
-</div>
-<hr class="separator" />"""
+</div>"""
     }
 
     // ── Single Topic (public for in-place update after edit) ──────────────
@@ -278,7 +265,7 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
         }
 
         return """
-<div class="private-zone">
+<div class="private-zone" id="conversationsSection">
   <div class="private-zone-watermark">PRIVATE</div>
   <div class="section-header">
     <div class="section-title">&#x1F4AC; All Conversations</div>
@@ -322,7 +309,11 @@ ${buildTranscriptModal()}"""
 
     // ── Header ────────────────────────────────────────────────────────────
 
-    /** Builds the page header: title + Notion-style properties table. */
+    /**
+     * Builds the page header: title, compact meta strip, collapsible Details
+     * property table, and a secondary-action row (Copy Markdown).
+     * The Jolli "Share/Update" button moves to the ship bar (buildShipBar).
+     */
     private fun buildHeader(
         summary: CommitSummary,
         totalFiles: Int,
@@ -335,19 +326,31 @@ ${buildTranscriptModal()}"""
         val changesHtml =
             """$totalFiles file$filesPlural changed, <span class="stat-add">$totalInsertions insertion$insPlural(+)</span>, <span class="stat-del">$totalDeletions deletion$delPlural(-)</span>"""
         val totalTurns = SummaryTree.aggregateTurns(summary)
-        val pushLabel = if (summary.jolliDocUrl != null) "Update on Jolli" else "Share in Jolli"
+        val shortHash = escHtml(summary.commitHash.take(8))
+        val turnsMeta = if (totalTurns > 0)
+            """<span class="meta-sep">&middot;</span><span class="stat-turns">&#x1F4AC; $totalTurns</span>"""
+        else ""
 
         return """
 <h1 class="page-title">${escHtml(summary.commitMessage)}</h1>
-<div class="header-actions">
-  <button class="action-btn" id="copyMdBtn">Copy Markdown</button>
-  <button class="action-btn primary" id="pushJolliBtn">$pushLabel</button>
+<div class="meta-strip">
+  <span class="meta-hash">$shortHash</span>
+  <span class="meta-sep">&middot;</span>
+  <span class="meta-branch" title="${escAttr(summary.branch)}">${escHtml(summary.branch)}</span>
+  <span class="meta-sep">&middot;</span>
+  <span class="meta-author">${escHtml(summary.commitAuthor)}</span>
+  <span class="meta-sep">&middot;</span>
+  <span class="meta-date">${timeAgo(summary.commitDate)}</span>
+  <span class="meta-sep">&middot;</span>
+  <span class="meta-changes"><span class="stat-add">+$totalInsertions</span>/<span class="stat-del">&#x2212;$totalDeletions</span></span>
+  $turnsMeta
+  <button class="details-toggle" id="detailsToggle" aria-expanded="false">Details &#x25BE;</button>
 </div>
-<div class="properties">
+<div class="properties collapsed" id="propertiesSection">
   <div class="prop-row">
     <div class="prop-label">Commit</div>
     <div class="prop-value">
-      <span class="hash">${escHtml(summary.commitHash.take(8))}</span>
+      <span class="hash">$shortHash</span>
       <button class="hash-copy" data-hash="${escHtml(summary.commitHash)}" title="Copy full hash">&#x29C9;</button>
     </div>
   </div>
@@ -372,7 +375,9 @@ ${buildTranscriptModal()}"""
     <div class="prop-value">$changesHtml</div>
   </div>
   ${buildConversationsRow(totalTurns)}
-  ${buildJolliRow(summary.jolliDocUrl, summary.commitMessage, summary.plans)}
+</div>
+<div class="header-actions">
+  <button class="action-btn" id="copyMdBtn">Copy Markdown</button>
 </div>"""
     }
 
@@ -396,7 +401,10 @@ ${buildTranscriptModal()}"""
   </div>"""
     }
 
-    /** Builds the optional "Jolli Memory" property row with a clickable article link. */
+    /**
+     * Builds the Jolli Memory link block. Now lives inside the Jolli ship card
+     * (not in the properties table). Returns empty string when not shared.
+     */
     private fun buildJolliRow(
         url: String?,
         commitMessage: String?,
@@ -415,12 +423,9 @@ ${buildTranscriptModal()}"""
             ""
         }
         return """
-  <div class="prop-row" id="jolliRow">
-    <div class="prop-label">Jolli Memory</div>
-    <div class="prop-value">
-      <a class="jolli-link" href="${escHtml(url)}" title="$memoryTooltip">${escHtml(url)}</a>
-      $plansHtml
-    </div>
+  <div id="jolliRow" class="jolli-status">
+    <a class="jolli-link" href="${escHtml(url)}" title="$memoryTooltip">${escHtml(url)}</a>
+    $plansHtml
   </div>"""
     }
 
@@ -442,13 +447,36 @@ ${buildTranscriptModal()}"""
         val escapedTitle = escAttr(summary.commitMessage)
         val escapedBody = escAttr(ai.jolli.jollimemory.services.PrService.wrapWithMarkers(prMarkdown))
 
+        val hasRecap = !summary.recap.isNullOrBlank()
+        val hasE2e = !summary.e2eTestGuide.isNullOrEmpty()
+
+        data class PrContentItem(val icon: String, val label: String, val included: Boolean)
+        val notIncluded = listOf(
+            PrContentItem("&#x1F4D6;", "Quick Recap", hasRecap),
+            PrContentItem("&#x1F9EA;", "E2E Test", hasE2e),
+        ).filter { !it.included }
+
+        val notIncludedHtml = if (notIncluded.isNotEmpty()) {
+            val listItems = notIncluded.joinToString("\n") {
+                """    <li>&#x274C; ${it.icon} ${it.label}</li>"""
+            }
+            """
+  <div class="pr-content-status">
+    <div class="pr-content-label">Will not be included (add below):</div>
+    <ul class="pr-content-list">
+$listItems
+    </ul>
+  </div>"""
+        } else ""
+
         return """
 <div class="section" id="prSection">
   <div class="section-header">
     <div class="section-title">$PR_ICON Pull Request</div>
+    <span class="ship-status is-loading" id="prStatusChip"><span class="led"></span>Checking&hellip;</span>
   </div>
   <p class="pr-status-text" id="prStatusText">Checking PR status...</p>
-  <div class="pr-link-row pr-hidden" id="prLinkRow"></div>
+  <div class="pr-link-row pr-hidden" id="prLinkRow"></div>$notIncludedHtml
   <div class="pr-actions pr-hidden" id="prActions"></div>
   <div class="pr-form pr-hidden" id="prForm" data-title="$escapedTitle" data-body="$escapedBody">
     <label class="pr-form-label">Title</label>
@@ -460,8 +488,118 @@ ${buildTranscriptModal()}"""
       <button class="action-btn primary" id="prFormSubmit">Submit PR</button>
     </div>
   </div>
-</div>
-<hr class="separator" />"""
+</div>"""
+    }
+
+    // ── Ship bar + content panels (presentation wrappers) ─────────────────
+
+    /**
+     * Builds the hero "ship bar": the PR card (wraps #prSection) and the Jolli
+     * card (relocated #pushJolliBtn + synced/not-shared status chip).
+     */
+    private fun buildShipBar(summary: CommitSummary): String {
+        val synced = summary.jolliDocUrl != null
+        val pushLabel = if (synced) "Update on Jolli" else "Share in Jolli"
+        val jolliChip = if (synced)
+            """<span class="ship-status is-ok"><span class="led"></span>Synced</span>"""
+        else
+            """<span class="ship-status is-warn"><span class="led"></span>Not shared</span>"""
+        val jolliSub = if (!synced)
+            """<div class="ship-sub">Lives only on your machine. Share to publish this memory to your team's Jolli space.</div>"""
+        else ""
+        return """
+<div class="ship-bar">
+  <div class="ship-card" id="prCard">
+    ${buildPrSection(summary)}
+  </div>
+  <div class="ship-card" id="jolliCard">
+    <div class="ship-head">
+      <span class="ship-icon">&#x25C6;</span>
+      <span class="ship-name">Jolli Memory</span>
+      $jolliChip
+    </div>
+    $jolliSub
+    ${buildJolliRow(summary.jolliDocUrl, summary.commitMessage, summary.plans)}
+    <div class="ship-actions">
+      <button class="action-btn primary" id="pushJolliBtn">$pushLabel</button>
+    </div>
+  </div>
+</div>"""
+    }
+
+    /** Wraps recap + topics in a single "The Memory" panel. */
+    private fun buildMemoryPanel(
+        summary: CommitSummary,
+        allTopics: List<ViewTopicWithDate>,
+        topicsHtml: String,
+        topicsTitle: String,
+        topicsLabel: String,
+    ): String {
+        return """
+<div class="panel" id="memoryPanel">
+  <div class="panel-header"><span class="panel-title">The memory</span></div>
+  ${buildRecapSection(summary)}
+  <div class="section" id="topicsSection">
+    <div class="section-header">
+      <div class="section-title" title="${escAttr(topicsLabel)}">&#x1F4DD; $topicsTitle <span class="section-count">${allTopics.size}</span></div>
+      <button class="toggle-all-btn" id="toggleAllBtn" title="Expand / Collapse all topics">Collapse All</button>
+    </div>
+    $topicsHtml
+  </div>
+</div>"""
+    }
+
+    /** Wraps the E2E section in its own panel. */
+    private fun buildE2ePanel(summary: CommitSummary): String {
+        return """
+<div class="panel" id="e2ePanel">
+  ${buildE2eTestSection(summary)}
+</div>"""
+    }
+
+    /** Builds the "Attachments & context" panel with collapsible cards. */
+    private fun buildAttachmentsPanel(
+        plans: List<PlanReference>?,
+        planTranslateSet: Set<String>,
+        sourceNodes: List<CommitSummary>,
+    ): String {
+        val plansBody = buildPlansSection(plans, planTranslateSet)
+        val sourceBody = buildSourceCommits(sourceNodes)
+        val sourceCard = if (sourceBody.isNotEmpty()) """
+  <div class="attach-card" id="sourceCard">
+    <div class="attach-card-head" data-collapse="sourceCard" role="button" tabindex="0" aria-expanded="true">&#x1F4E6; Source Commits <span class="attach-arrow">&#x25BC;</span></div>
+    <div class="attach-card-body">$sourceBody</div>
+  </div>"""
+        else ""
+
+        return """
+<div class="panel" id="attachmentsPanel">
+  <div class="panel-header"><span class="panel-title">Attachments &amp; context</span></div>
+  <div class="attach-card" id="plansCard">
+    <div class="attach-card-head" data-collapse="plansCard" role="button" tabindex="0" aria-expanded="true">&#x1F4CB; Plans &amp; Notes <span class="attach-arrow">&#x25BC;</span></div>
+    <div class="attach-card-body">$plansBody</div>
+  </div>
+  $sourceCard
+</div>"""
+    }
+
+    /** Demotes conversations to a collapsible private drawer at the bottom. */
+    private fun buildPrivateDrawer(transcriptHashSet: Set<String>): String {
+        val count = transcriptHashSet.size
+        val countLabel = if (count > 0)
+            """<span class="private-count">$count session${if (count != 1) "s" else ""}</span>"""
+        else ""
+        return """
+<div class="private-drawer" id="privateDrawer">
+  <div class="private-head" data-collapse="privateDrawer" role="button" tabindex="0" aria-expanded="true">
+    <span class="private-lock">&#x1F512;</span>
+    <span class="private-title">All Conversations</span>
+    <span class="private-badge">PRIVATE</span>
+    $countLabel
+    <span class="attach-arrow">&#x25BC;</span>
+  </div>
+  <div class="private-body">${buildAllConversationsSection(transcriptHashSet)}</div>
+</div>"""
     }
 
     // ── Plans Section ─────────────────────────────────────────────────────
@@ -509,11 +647,10 @@ ${buildTranscriptModal()}"""
 <div class="section" id="plansSection">
   <div class="section-header">
     <div class="section-title">&#x1F4CB; Plans$sectionCount</div>
+    <button class="action-btn associate-plan-btn" data-action="associatePlan">+ Associate Plan</button>
   </div>
   $body
-  <button class="action-btn associate-plan-btn" data-action="associatePlan">+ Associate Plan</button>
 </div>
-<hr class="separator" />
 """
     }
 
@@ -537,7 +674,7 @@ ${buildTranscriptModal()}"""
         val expectedHtml = s.expectedResults.joinToString("\n        ") { r -> "<li>${escHtml(r)}</li>" }
 
         return """
-<div class="toggle e2e-scenario" id="e2e-scenario-$index">
+<div class="toggle e2e-scenario collapsed" id="e2e-scenario-$index">
   <div class="toggle-header">
     <span class="arrow">&#x25BC;</span>
     <span class="toggle-num">${padIndex(index)}</span>
@@ -575,8 +712,7 @@ ${buildTranscriptModal()}"""
   <div class="commit-list">
     $rows
   </div>
-</div>
-<hr class="separator" />"""
+</div>"""
     }
 
     /** Renders a single source commit as a compact row. */
