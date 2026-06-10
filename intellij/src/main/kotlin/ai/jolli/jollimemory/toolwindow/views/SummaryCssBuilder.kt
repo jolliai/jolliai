@@ -1156,6 +1156,32 @@ $rootVars
     gap: 6px;
     margin: 8px 0 4px;
   }
+  /* ── PR History strip ── */
+  .pr-history {
+    margin: 6px 0 4px;
+    font-size: 0.88em;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+  .pr-history-label {
+    margin-right: 4px;
+  }
+  .pr-history a {
+    text-decoration: none;
+  }
+  .pr-history a:hover {
+    text-decoration: underline;
+  }
+  .pr-history-merged {
+    color: #8957e5;
+  }
+  .pr-history-closed {
+    color: #cf222e;
+  }
+  .pr-history-sep {
+    margin: 0 6px;
+    color: var(--text-secondary);
+  }
   /* ── PR Content Status ── */
   .pr-content-status {
     margin-top: 10px;
