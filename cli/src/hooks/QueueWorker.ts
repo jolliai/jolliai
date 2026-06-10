@@ -213,6 +213,22 @@ export function launchWorker(cwd: string): void {
 	const dir = dirname(fileURLToPath(import.meta.url));
 	const scriptPath = join(dir, "QueueWorker.js");
 
+	// Locating the worker by file name makes "dist contains QueueWorker.js"
+	// a build contract — kept by the QueueWorker entry in cli/vite.config.ts
+	// and vscode/esbuild.config.mjs. Without an explicit entry the file's
+	// existence depends on rollup's chunk naming, and 0.99.2 shipped without
+	// it: the detached child died on MODULE_NOT_FOUND with stdio ignored and
+	// no summaries were generated. This guard is the only place that can
+	// leave a trace of that failure mode.
+	if (!existsSync(scriptPath)) {
+		log.error(
+			"Worker script not found: %s — skipping spawn; summaries will NOT be generated. " +
+				"This dist was built without a QueueWorker entry.",
+			scriptPath,
+		);
+		return;
+	}
+
 	// NO Node flags before scriptPath. The git hook is launched as a bare
 	// `exec node <Hook>.js` (no flags), so `process.execPath` here may be a
 	// Node older than the CLI's `engines` floor. A flag the running Node

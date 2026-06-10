@@ -1171,7 +1171,7 @@ describe("StopHook — plan discovery", () => {
 
 		const saved = vi.mocked(savePlansRegistry).mock.calls[0]?.[0];
 		// `foo` must stay deleted — not revived from our local snapshot.
-		expect(saved?.plans["foo"]).toBeUndefined();
+		expect(saved?.plans.foo).toBeUndefined();
 		expect(Object.keys(saved?.plans ?? {})).toHaveLength(0);
 	});
 

@@ -2196,6 +2196,10 @@ describe("queue-driven Worker", () => {
 				date: "2026-02-19",
 			});
 			vi.mocked(generateSummary).mockResolvedValue(createMockResult());
+			// launchWorker refuses to spawn when the worker bundle is missing;
+			// satisfy its existence probe (and only that one) so the chain
+			// spawn goes through.
+			vi.mocked(existsSync).mockImplementation((path) => String(path).endsWith("QueueWorker.js"));
 
 			await runWorker("/test/project");
 

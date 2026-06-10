@@ -508,6 +508,10 @@ describe("QueueWorker", () => {
 			// `launchWorker` invoked.
 			vi.mocked(consumePendingWorkers).mockResolvedValueOnce(["/test/cwd", "/other/cwd"]);
 			vi.mocked(dequeueAllGitOperations).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+			// launchWorker refuses to spawn when the worker bundle is missing;
+			// satisfy its existence probe (and only that one) so the wake-up
+			// spawn for /other/cwd goes through.
+			vi.mocked(existsSync).mockImplementation((path) => String(path).endsWith("QueueWorker.js"));
 
 			await runWorker("/test/cwd");
 
@@ -2106,6 +2110,7 @@ describe("QueueWorker", () => {
 	describe("launchWorker — argv hygiene (regression for old-Node startup crash)", () => {
 		it("spawns node with NO flags before scriptPath (no --disable-warning*)", () => {
 			vi.mocked(spawn).mockClear();
+			vi.mocked(existsSync).mockReturnValue(true);
 
 			launchWorker("/test/cwd");
 
@@ -2124,6 +2129,34 @@ describe("QueueWorker", () => {
 
 			// The legitimate script args are still present and ordered.
 			expect(args.slice(scriptIdx + 1)).toEqual(["--worker", "--cwd", "/test/cwd"]);
+		});
+	});
+
+	describe("launchWorker — missing worker script guard (regression for 0.99.2 silent spawn crash)", () => {
+		// 0.99.2 shipped a CLI dist without QueueWorker.js (rollup folded it
+		// into the SyncBootstrap chunk after a circular import appeared), and
+		// the detached child died on MODULE_NOT_FOUND with stdio ignored —
+		// zero log lines, summaries silently never generated. The guard must
+		// refuse to spawn and leave an ERROR trace instead.
+		it("does not spawn when QueueWorker.js is absent next to the running bundle", () => {
+			vi.mocked(spawn).mockClear();
+			vi.mocked(existsSync).mockReturnValue(false);
+
+			launchWorker("/test/cwd");
+
+			expect(spawn).not.toHaveBeenCalled();
+			// The guard must have probed for the worker script by its contract name.
+			const probed = vi.mocked(existsSync).mock.calls.map((c) => String(c[0]));
+			expect(probed.some((p) => p.endsWith("QueueWorker.js"))).toBe(true);
+		});
+
+		it("spawns normally when QueueWorker.js exists", () => {
+			vi.mocked(spawn).mockClear();
+			vi.mocked(existsSync).mockReturnValue(true);
+
+			launchWorker("/test/cwd");
+
+			expect(spawn).toHaveBeenCalledTimes(1);
 		});
 	});
 
