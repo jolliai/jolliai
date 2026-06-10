@@ -14,10 +14,28 @@
  */
 
 import type { SourceId } from "../../../../Types.js";
+import { matchCliCommand } from "../cli/index.js";
 
 export interface ClaudeBinding {
 	readonly sourceId: SourceId;
 	normalize(business: unknown): unknown;
+}
+
+/**
+ * Tool whose `input.command` carries a shell command line. Claude runs CLI
+ * fallbacks (e.g. `gh issue view … --json`) through `Bash`; its stdout is fed to
+ * the agent-neutral CLI registry. `BashOutput` (the background-shell poller) is
+ * deliberately NOT here — it has no `command` input.
+ */
+export const CLAUDE_SHELL_TOOL_NAMES: ReadonlySet<string> = new Set(["Bash"]);
+
+export interface ClaudeResolved {
+	readonly sourceId: SourceId;
+	/** "cli" results require command success (the is_error gate); "mcp" keeps prior behaviour. */
+	readonly kind: "mcp" | "cli";
+	/** Persisted as `sourceToolName`: the real MCP tool name, or the CLI canonical name. */
+	readonly toolName: string;
+	readonly normalize: (business: unknown) => unknown;
 }
 
 interface Rule {
@@ -53,6 +71,33 @@ export function claudeBindingForToolName(name: string): ClaudeBinding | null {
 		// continuing) is safe. If an overlapping prefix is ever added, revisit this.
 		if (rule.accept !== undefined && !rule.accept(name)) return null;
 		return { sourceId: rule.sourceId, normalize: identity };
+	}
+	return null;
+}
+
+function readCommand(input: unknown): string | undefined {
+	if (typeof input !== "object" || input === null) return undefined;
+	const cmd = (input as { command?: unknown }).command;
+	return typeof cmd === "string" ? cmd : undefined;
+}
+
+/**
+ * Resolve a Claude tool_use to its reference source: an MCP tool by name prefix,
+ * OR a shell CLI by the command in its `input` (e.g. `Bash` running `gh issue
+ * view … --json`). Returns null if neither matches. The MCP branch is unchanged
+ * (`toolName` = the real name, `kind: "mcp"`), preserving byte-identical output.
+ */
+export function resolveClaudeTool(name: string, input: unknown): ClaudeResolved | null {
+	const mcp = claudeBindingForToolName(name);
+	if (mcp !== null) return { sourceId: mcp.sourceId, kind: "mcp", toolName: name, normalize: mcp.normalize };
+	if (CLAUDE_SHELL_TOOL_NAMES.has(name)) {
+		const command = readCommand(input);
+		if (command !== undefined) {
+			const cli = matchCliCommand(command);
+			if (cli !== null) {
+				return { sourceId: cli.id, kind: "cli", toolName: cli.canonicalToolName, normalize: cli.normalize };
+			}
+		}
 	}
 	return null;
 }

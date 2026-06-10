@@ -11,6 +11,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 import type { Reference } from "../../Types.js";
 import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
+import { GitHubAdapter } from "./sources/GitHubAdapter.js";
 import { LinearAdapter } from "./sources/LinearAdapter.js";
 import type { SourceAdapter } from "./sources/SourceAdapter.js";
 
@@ -1112,5 +1113,140 @@ describe("formatReferencesBlock", () => {
 		expect(out).not.toContain("priority=");
 		expect(out).not.toContain("labels=");
 		expect(out).not.toContain("<description>");
+	});
+});
+
+// ─── Claude `Bash` gh issue view CLI fallback ────────────────────────────────
+
+/** Claude tool_use for the `Bash` tool: the command lives in `input.command`. */
+function bashUseLine(opts: { toolUseId: string; command: string; timestamp: string }): string {
+	return JSON.stringify({
+		message: {
+			role: "assistant",
+			content: [
+				{
+					type: "tool_use",
+					id: opts.toolUseId,
+					name: "Bash",
+					input: { command: opts.command, description: "x" },
+				},
+			],
+		},
+		timestamp: opts.timestamp,
+	});
+}
+
+/** Claude Bash tool_result: stdout is a PLAIN STRING (not a text-block array), with `is_error`. */
+function bashResultLine(opts: { toolUseId: string; stdout: string; timestamp: string; isError?: boolean }): string {
+	return JSON.stringify({
+		type: "user",
+		message: {
+			role: "user",
+			content: [
+				{
+					tool_use_id: opts.toolUseId,
+					type: "tool_result",
+					content: opts.stdout,
+					is_error: opts.isError ?? false,
+				},
+			],
+		},
+		timestamp: opts.timestamp,
+	});
+}
+
+const GH_CLI_STDOUT = JSON.stringify({
+	number: 959,
+	title: "Support multi-source external entity auto-discovery",
+	state: "CLOSED",
+	url: "https://github.com/jolliai/jolli/issues/959",
+	body: "Body text",
+	labels: [{ name: "enhancement" }],
+	assignees: [{ login: "sanshizhang-jolli" }],
+});
+const GH_VIEW_CMD = "gh issue view 959 --repo jolliai/jolli --json number,title,state,labels,assignees,body,url";
+
+describe("extractReferencesFromTranscript — Claude Bash gh issue view CLI fallback", () => {
+	it("extracts a github ref from a Bash `gh issue view --json` call (canonical toolName, lowercased state)", async () => {
+		const jsonl = makeJsonl(
+			bashUseLine({ toolUseId: "tu_gh", command: GH_VIEW_CMD, timestamp: "2026-06-09T10:00:00.000Z" }),
+			bashResultLine({ toolUseId: "tu_gh", stdout: GH_CLI_STDOUT, timestamp: "2026-06-09T10:00:01.000Z" }),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [GitHubAdapter]);
+		expect(references).toHaveLength(1);
+		expect(references[0]).toMatchObject({
+			mapKey: "github:jolliai/jolli#959",
+			url: "https://github.com/jolliai/jolli/issues/959",
+			toolName: "mcp__github__issue_read",
+		});
+		expect(fieldVal(references[0], "status")).toBe("closed");
+	});
+
+	it("drops a failed Bash gh command (is_error true) even when stdout is valid issue JSON", async () => {
+		const jsonl = makeJsonl(
+			bashUseLine({ toolUseId: "tu_err", command: GH_VIEW_CMD, timestamp: "2026-06-09T10:00:00.000Z" }),
+			bashResultLine({
+				toolUseId: "tu_err",
+				stdout: GH_CLI_STDOUT,
+				timestamp: "2026-06-09T10:00:01.000Z",
+				isError: true,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [GitHubAdapter]);
+		expect(references).toHaveLength(0);
+	});
+
+	it("does not extract from a Bash command that is not gh issue view", async () => {
+		const jsonl = makeJsonl(
+			bashUseLine({ toolUseId: "tu_x", command: "npm test", timestamp: "2026-06-09T10:00:00.000Z" }),
+			bashResultLine({ toolUseId: "tu_x", stdout: GH_CLI_STDOUT, timestamp: "2026-06-09T10:00:01.000Z" }),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [GitHubAdapter]);
+		expect(references).toHaveLength(0);
+	});
+
+	it("byte-equivalence: an MCP github result with is_error true is STILL extracted (gate is CLI-only)", async () => {
+		// The is_error gate must NOT fire for MCP entries — an errored-but-valid MCP
+		// tool_result was ingested before this change and must still be. MCP github
+		// payloads are already in adapter shape (html_url, not the gh `url`).
+		const mcpPayload = JSON.stringify({
+			number: 959,
+			title: "Support multi-source external entity auto-discovery",
+			html_url: "https://github.com/jolliai/jolli/issues/959",
+		});
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "tu_mcp",
+				toolName: "mcp__github__issue_read",
+				timestamp: "2026-06-09T10:00:00.000Z",
+				inputJson: '{"owner":"o","repo":"r","issue_number":959}',
+			}),
+			JSON.stringify({
+				type: "user",
+				message: {
+					role: "user",
+					content: [
+						{
+							tool_use_id: "tu_mcp",
+							type: "tool_result",
+							content: [{ type: "text", text: mcpPayload }],
+							is_error: true,
+						},
+					],
+				},
+				timestamp: "2026-06-09T10:00:01.000Z",
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl", [GitHubAdapter]);
+		expect(references).toHaveLength(1);
+		expect(references[0].mapKey).toBe("github:jolliai/jolli#959");
 	});
 });
