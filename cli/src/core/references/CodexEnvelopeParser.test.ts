@@ -548,3 +548,155 @@ describe("CodexEnvelopeParser end-to-end — Jira malformed-output recovery", ()
 		expect(jira?.url).toBe("https://acme.atlassian.net/browse/KAN-7");
 	});
 });
+
+// ─── shell CLI (`gh issue view … --json`) ────────────────────────────────────
+
+/** shell_command request row: NO namespace; the command is inside the JSON-string `arguments`. */
+function shellCall(command: string, callId: string): string {
+	return jsonl({
+		type: "response_item",
+		timestamp: TS,
+		payload: {
+			type: "function_call",
+			name: "shell_command",
+			arguments: JSON.stringify({ command, workdir: "e:\\jollimemory-3", timeout_ms: 20000 }),
+			call_id: callId,
+		},
+	});
+}
+
+/** shell function_call_output: real prefix `Exit code: N\nWall time: …\nOutput:\n<json>`. */
+function shellOutput(callId: string, inner: unknown, exitCode = 0): string {
+	const output = `Exit code: ${exitCode}\nWall time: 2.1 seconds\nOutput:\n${JSON.stringify(inner)}`;
+	return jsonl({
+		type: "response_item",
+		timestamp: TS,
+		payload: { type: "function_call_output", call_id: callId, output },
+	});
+}
+
+/** Real `gh issue view 959 --json …` payload (single issue, uppercase state). */
+const GH_CLI = {
+	number: 959,
+	title: "Support multi-source external entity auto-discovery",
+	state: "CLOSED",
+	url: "https://github.com/jolliai/jolli/issues/959",
+	body: "Body text",
+	labels: [{ name: "enhancement" }],
+	assignees: [{ login: "sanshizhang-jolli" }],
+};
+const GH_VIEW_CMD = "gh issue view 959 --repo jolliai/jolli --json number,title,state,labels,assignees,body,url";
+
+describe("CodexEnvelopeParser.parse — shell CLI (gh issue view)", () => {
+	it("emits a github ref from a shell gh issue view pair (canonical toolName, exit 0)", () => {
+		const lines = [shellCall(GH_VIEW_CMD, "c_sh"), shellOutput("c_sh", GH_CLI, 0)];
+		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(1);
+		expect(results[0].adapter.id).toBe("github");
+		expect(results[0].toolName).toBe("mcp__github__issue_read");
+	});
+
+	it("drops a failed command (non-zero exit) even when stdout is valid issue JSON", () => {
+		const lines = [shellCall(GH_VIEW_CMD, "c_fail"), shellOutput("c_fail", GH_CLI, 1)];
+		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(0);
+	});
+
+	it("ignores a non-gh shell command", () => {
+		const lines = [shellCall("npm test", "c_npm"), shellOutput("c_npm", GH_CLI, 0)];
+		const { results } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(0);
+	});
+
+	it("ignores a shell call whose `arguments` are not parseable JSON (no command extracted)", () => {
+		const badCall = jsonl({
+			type: "response_item",
+			timestamp: TS,
+			payload: { type: "function_call", name: "shell_command", arguments: "{not json", call_id: "c_bad" },
+		});
+		const { results } = codexEnvelopeParser.parse([badCall, shellOutput("c_bad", GH_CLI, 0)], {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(0);
+	});
+
+	it("drops a gh shell pair whose exit-0 stdout is not JSON", () => {
+		const out = jsonl({
+			type: "response_item",
+			timestamp: TS,
+			payload: {
+				type: "function_call_output",
+				call_id: "c_txt",
+				output: "Exit code: 0\nWall time: 1s\nOutput:\nnot json",
+			},
+		});
+		const { results } = codexEnvelopeParser.parse([shellCall(GH_VIEW_CMD, "c_txt"), out], {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(0);
+	});
+
+	it("drops a gh shell pair whose output lacks the `Exit code:` prefix (treated as not-success)", () => {
+		const out = jsonl({
+			type: "response_item",
+			timestamp: TS,
+			payload: { type: "function_call_output", call_id: "c_nopfx", output: JSON.stringify(GH_CLI) },
+		});
+		const { results } = codexEnvelopeParser.parse([shellCall(GH_VIEW_CMD, "c_nopfx"), out], {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(0);
+	});
+
+	it("holds the cursor before an in-flight shell gh request (output not yet written)", () => {
+		const lines = ["{}", shellCall(GH_VIEW_CMD, "c_inflight")];
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(0);
+		// safeCursor pinned to the request's 0-based line index (1), not EOF (2).
+		expect(lastLineNumberScanned).toBe(1);
+	});
+
+	it("advances the cursor once the in-flight shell output lands on the next poll", () => {
+		const lines = ["{}", shellCall(GH_VIEW_CMD, "c_inflight"), shellOutput("c_inflight", GH_CLI, 0)];
+		const { results, lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(1);
+		expect(lastLineNumberScanned).toBe(3);
+	});
+
+	it("holds the cursor at the EARLIEST of multiple in-flight shell requests", () => {
+		const lines = ["{}", shellCall(GH_VIEW_CMD, "c1"), shellCall(GH_VIEW_CMD, "c2")];
+		const { lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {}, ALL_ADAPTERS);
+		expect(lastLineNumberScanned).toBe(1); // pinned to c1's line, not lowered again by c2
+	});
+
+	it("ignores a shell call whose `arguments` is not a string", () => {
+		const badCall = jsonl({
+			type: "response_item",
+			timestamp: TS,
+			payload: { type: "function_call", name: "shell_command", arguments: 42, call_id: "c_numargs" },
+		});
+		const { results } = codexEnvelopeParser.parse([badCall, shellOutput("c_numargs", GH_CLI, 0)], {}, ALL_ADAPTERS);
+		expect(results).toHaveLength(0);
+	});
+});
+
+describe("CodexEnvelopeParser end-to-end — shell gh issue view (state lowercased, dedupe with MCP search)", () => {
+	let dir: string;
+	let file: string;
+	beforeAll(() => {
+		dir = mkdtempSync(join(tmpdir(), "codex-ghcli-"));
+		file = join(dir, "rollout.jsonl");
+		// The connector searched first (sparse hit), then ran gh to backfill — gh
+		// appears LATER, so it wins the same-mapKey dedupe in the realistic flow.
+		const lines = [
+			fnCall("mcp__codex_apps__github", "_search_issues", "c_search"),
+			fnOutput("c_search", GITHUB_SEARCH, { wrap: "bare", prefix: true }),
+			shellCall(GH_VIEW_CMD, "c_sh"),
+			shellOutput("c_sh", GH_CLI, 0),
+		];
+		writeFileSync(file, `${lines.join("\n")}\n`, "utf-8");
+	});
+	afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+	it("dedupes gh + MCP search to one rich ref with lowercased state", async () => {
+		const { references } = await extractReferencesFromTranscript(file, ALL_ADAPTERS, { source: "codex" });
+		const gh = references.filter((r) => r.mapKey === "github:jolliai/jolli#959");
+		expect(gh).toHaveLength(1);
+		expect(gh[0].fields?.find((f) => f.key === "status")?.value).toBe("closed");
+		expect(gh[0].fields?.some((f) => f.key === "labels")).toBe(true);
+	});
+});

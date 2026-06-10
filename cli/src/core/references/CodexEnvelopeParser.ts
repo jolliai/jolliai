@@ -22,12 +22,22 @@
  * parser only correlates lines and delegates identity + normalisation to that
  * registry.
  *
- * Robustness: the `Wall time:` prefix is stripped only when present; every parse
- * is wrapped and a non-JSON output (e.g. `execution error: Io(...)`) is skipped.
+ * Shell CLI fallback: Codex also resolves entities via plain shell, e.g.
+ * `gh issue view <n> --json …` (a `function_call` named `shell_command`, no
+ * namespace, paired with a `function_call_output` whose body is prefixed
+ * `Exit code: N\nWall time: …\nOutput:\n`). The command string is matched against
+ * the agent-neutral `./bindings/cli` registry; a recognised, exit-0 result is
+ * normalised and emitted just like an MCP pair. Recognition + normalisation live
+ * in that registry, not here.
+ *
+ * Robustness: the `Wall time:`/`Exit code:` prefix is stripped only when present;
+ * every parse is wrapped and a non-JSON output (e.g. `execution error: Io(...)`)
+ * is skipped.
  */
 
 import { createLogger } from "../../Logger.js";
 import type { SourceId } from "../../Types.js";
+import { type CliBinding, matchCliCommand } from "./bindings/cli/index.js";
 import { codexBindingFromFunctionCall, codexBindingFromInvocationTool } from "./bindings/codex/index.js";
 import type { SourceAdapter } from "./sources/SourceAdapter.js";
 import type {
@@ -60,6 +70,12 @@ interface ToolCallEndRow {
 	readonly lineNumber: number;
 	readonly referencedAt: string;
 }
+interface ShellCallRow {
+	readonly binding: CliBinding;
+	/** 0-based line index of the request — holds the cursor before an in-flight
+	 *  (output-not-yet-written) shell call, exactly like an MCP fetch. */
+	readonly lineIndex: number;
+}
 
 class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 	parse(lines: string[], opts: ExtractOptions, adapters: readonly SourceAdapter[]): EnvelopeParseResult {
@@ -67,6 +83,7 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 		const adapterFor = (id: SourceId): SourceAdapter | undefined => adapters.find((a) => a.id === id);
 
 		const calls = new Map<string, FunctionCallRow>();
+		const shellCalls = new Map<string, ShellCallRow>();
 		const outputs = new Map<string, FunctionOutputRow>();
 		const events: ToolCallEndRow[] = [];
 		// call_ids whose result row (a function_call_output OR an mcp_tool_call_end)
@@ -92,7 +109,12 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			if (
 				!line.includes("mcp__codex_apps__") &&
 				!line.includes("mcp_tool_call_end") &&
-				!line.includes("function_call_output")
+				!line.includes("function_call_output") &&
+				// A `gh` shell request is a `function_call` with name `shell_command`
+				// and NO `mcp__codex_apps__` namespace — it would be dropped by the
+				// three needles above, losing the command string. Its paired output is
+				// a `function_call_output` (already covered).
+				!line.includes("shell_command")
 			) {
 				continue;
 			}
@@ -119,6 +141,18 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 				case "function_call": {
 					const namespace = readString(payload.namespace);
 					const name = readString(payload.name);
+					// Shell CLI fallback (e.g. `gh issue view … --json`): a shell request
+					// is a `function_call` named `shell_command` with NO namespace. The
+					// command lives in the JSON-string `arguments`. Recognised commands
+					// go to a SEPARATE map (the namespace-keyed `calls` map can't hold them).
+					if (callId !== undefined && name === "shell_command") {
+						const command = readShellCommand(payload.arguments);
+						if (command !== undefined) {
+							const binding = matchCliCommand(command);
+							if (binding !== null) shellCalls.set(callId, { binding, lineIndex: i });
+						}
+						break;
+					}
 					if (callId !== undefined && namespace !== undefined && name !== undefined) {
 						calls.set(callId, { namespace, name, lineIndex: i });
 					}
@@ -175,6 +209,28 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 				referencedAt: out.referencedAt,
 			});
 			emitted.add(callId);
+		}
+
+		// PRIMARY (CLI): shell_command + function_call_output pairs. Gated on
+		// `Exit code: 0` — a failed command whose stdout happens to be valid issue
+		// JSON must NOT be ingested. shell call_ids never overlap MCP ones and there
+		// is no mcp_tool_call_end fallback for shell, so no `emitted` tracking.
+		for (const [callId, shell] of shellCalls) {
+			const out = outputs.get(callId);
+			if (out === undefined) continue;
+			if (readExitCode(out.output) !== 0) continue;
+			const business = parseFunctionCallOutput(out.output);
+			if (business === null) continue;
+			const adapter = adapterFor(shell.binding.id);
+			/* v8 ignore next -- adapters always include all four sources; guarded for totality. */
+			if (adapter === undefined) continue;
+			results.push({
+				adapter,
+				toolName: shell.binding.canonicalToolName,
+				payload: shell.binding.normalize(business),
+				lineNumber: out.lineNumber,
+				referencedAt: out.referencedAt,
+			});
 		}
 
 		// FALLBACK: mcp_tool_call_end events for call_ids without a paired output.
@@ -241,6 +297,13 @@ class CodexEnvelopeParser implements TranscriptEnvelopeParser {
 			if (codexBindingFromFunctionCall(call.namespace, call.name) === null) continue;
 			if (call.lineIndex < safeCursor) safeCursor = call.lineIndex;
 		}
+		// Same hold for an in-flight shell CLI request (already a CLI match by
+		// construction): its function_call_output marks `resultSeen` when it lands,
+		// so an unanswered one pins the cursor on its request line.
+		for (const [callId, shell] of shellCalls) {
+			if (satisfied.has(callId)) continue;
+			if (shell.lineIndex < safeCursor) safeCursor = shell.lineIndex;
+		}
 		return { results, lastLineNumberScanned: safeCursor };
 	}
 }
@@ -262,13 +325,33 @@ export const codexEnvelopeParser: TranscriptEnvelopeParser = new CodexEnvelopePa
  */
 function parseFunctionCallOutput(output: string): unknown {
 	let text = output;
-	if (text.startsWith("Wall time:")) {
+	// MCP outputs are prefixed `Wall time: …\nOutput:\n`; shell outputs add a
+	// leading `Exit code: …\n` before it. Strip from either marker.
+	if (text.startsWith("Wall time:") || text.startsWith("Exit code:")) {
 		const idx = text.indexOf(OUTPUT_MARKER);
 		if (idx >= 0) text = text.slice(idx + OUTPUT_MARKER.length);
 	}
 	const parsed = tryParse(text);
 	if (parsed === null) return null;
 	return unwrapTextArray(parsed);
+}
+
+/** Parse the `command` field from a shell `function_call`'s JSON-string `arguments`. */
+function readShellCommand(args: unknown): string | undefined {
+	if (typeof args !== "string") return undefined;
+	const parsed = tryParse(args);
+	if (!isObject(parsed)) return undefined;
+	return readString(parsed.command);
+}
+
+/**
+ * Exit code from a shell `function_call_output`'s `Exit code: N\n…` prefix.
+ * Returns undefined when absent (format drift) — the caller treats that as
+ * "not 0" and skips, the conservative choice for a false-positive guard.
+ */
+function readExitCode(output: string): number | undefined {
+	const m = /^Exit code:\s*(-?\d+)/.exec(output);
+	return m ? Number(m[1]) : undefined;
 }
 
 /** Try JSON.parse; return null (not throw) on failure. */

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CLAUDE_TOOL_PREFIXES, claudeBindingForToolName } from "./index.js";
+import { CLAUDE_SHELL_TOOL_NAMES, CLAUDE_TOOL_PREFIXES, claudeBindingForToolName, resolveClaudeTool } from "./index.js";
 
 describe("Claude producer binding", () => {
 	describe("claudeBindingForToolName — source recognition", () => {
@@ -54,6 +54,52 @@ describe("Claude producer binding", () => {
 				"mcp__linear__",
 				"mcp__claude_ai_Notion__",
 			]);
+		});
+	});
+
+	describe("resolveClaudeTool", () => {
+		it("resolves an MCP tool by name (kind mcp, toolName = real name, identity normalize)", () => {
+			const r = resolveClaudeTool("mcp__github__issue_read", undefined);
+			expect(r).toEqual({
+				sourceId: "github",
+				kind: "mcp",
+				toolName: "mcp__github__issue_read",
+				normalize: expect.any(Function),
+			});
+			const payload = { number: 1 };
+			expect(r?.normalize(payload)).toBe(payload); // identity for MCP
+		});
+
+		it("resolves a Bash `gh issue view --json` command to the github CLI binding (kind cli, canonical toolName)", () => {
+			const r = resolveClaudeTool("Bash", { command: "gh issue view 959 --repo o/r --json number,title" });
+			expect(r?.sourceId).toBe("github");
+			expect(r?.kind).toBe("cli");
+			expect(r?.toolName).toBe("mcp__github__issue_read");
+		});
+
+		it("returns null for Bash running a non-gh command", () => {
+			expect(resolveClaudeTool("Bash", { command: "npm test" })).toBeNull();
+		});
+
+		it("returns null for Bash with no command input", () => {
+			expect(resolveClaudeTool("Bash", {})).toBeNull();
+			expect(resolveClaudeTool("Bash", undefined)).toBeNull();
+			expect(resolveClaudeTool("Bash", { command: 42 })).toBeNull();
+		});
+
+		it("returns null for BashOutput (not a shell tool, no command)", () => {
+			expect(resolveClaudeTool("BashOutput", { bash_id: "x" })).toBeNull();
+		});
+
+		it("returns null for an unrecognised non-shell tool", () => {
+			expect(resolveClaudeTool("Read", { file_path: "/x" })).toBeNull();
+		});
+	});
+
+	describe("CLAUDE_SHELL_TOOL_NAMES", () => {
+		it("contains Bash and not BashOutput", () => {
+			expect(CLAUDE_SHELL_TOOL_NAMES.has("Bash")).toBe(true);
+			expect(CLAUDE_SHELL_TOOL_NAMES.has("BashOutput")).toBe(false);
 		});
 	});
 });

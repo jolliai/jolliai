@@ -17,7 +17,7 @@
  */
 
 import { createLogger } from "../../Logger.js";
-import { CLAUDE_TOOL_PREFIXES, claudeBindingForToolName } from "./bindings/claude/index.js";
+import { CLAUDE_SHELL_TOOL_NAMES, CLAUDE_TOOL_PREFIXES, resolveClaudeTool } from "./bindings/claude/index.js";
 import type { SourceAdapter } from "./sources/SourceAdapter.js";
 import type {
 	EnvelopeParseResult,
@@ -35,14 +35,21 @@ interface PendingEntry {
 	readonly timestamp?: string;
 	readonly adapter: SourceAdapter;
 	readonly normalize: (business: unknown) => unknown;
+	/** CLI (shell) entries require a successful command — drop the result if
+	 *  `is_error: true`. MCP entries set this false to keep prior behaviour. */
+	readonly requireSuccess: boolean;
 }
 
 class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 	parse(lines: string[], opts: ExtractOptions, adapters: readonly SourceAdapter[]): EnvelopeParseResult {
 		// Pre-compute the per-line substring needles so we don't rebuild them per line.
 		// Recognition (which tool → which source) lives in the Claude binding now,
-		// not on the adapter; the needles use the binding's tool-name prefixes.
-		const nameNeedles = CLAUDE_TOOL_PREFIXES.map((p) => `"name":"${p}`);
+		// not on the adapter; the needles use the binding's tool-name prefixes plus
+		// the shell tool names (exact-quoted to avoid matching e.g. `BashOutput`).
+		const nameNeedles = [
+			...CLAUDE_TOOL_PREFIXES.map((p) => `"name":"${p}`),
+			...[...CLAUDE_SHELL_TOOL_NAMES].map((n) => `"name":"${n}"`),
+		];
 		const adapterFor = (id: SourceAdapter["id"]): SourceAdapter | undefined => adapters.find((a) => a.id === id);
 
 		const fromLine = opts.fromLineNumber ?? 0;
@@ -129,20 +136,27 @@ function collectToolUses(
 	for (const block of blocks) {
 		/* v8 ignore start -- defensive guards (non-object block, wrong type, missing id/name) are unreachable in valid Claude Code JSONL once the substring pre-filter passed; pinned for total-function semantics. */
 		if (!isObject(block)) continue;
-		const b = block as { type?: unknown; id?: unknown; name?: unknown };
+		const b = block as { type?: unknown; id?: unknown; name?: unknown; input?: unknown };
 		if (b.type !== "tool_use") continue;
 		if (typeof b.id !== "string" || typeof b.name !== "string") continue;
 		/* v8 ignore stop */
 		const name = b.name;
-		// Recognition + tool-level business scope (e.g. Notion only `notion-fetch`)
-		// live in the Claude binding; a non-matching tool is dropped here.
-		const binding = claudeBindingForToolName(name);
-		if (binding === null) continue;
-		const adapter = adapterFor(binding.sourceId);
+		// Recognition + tool-level business scope (e.g. Notion only `notion-fetch`,
+		// or a `Bash` shell command matching the CLI registry) live in the Claude
+		// binding; a non-matching tool is dropped here.
+		const resolved = resolveClaudeTool(name, b.input);
+		if (resolved === null) continue;
+		const adapter = adapterFor(resolved.sourceId);
 		/* v8 ignore start -- adapters always include all four sources; guarded for totality. */
 		if (adapter === undefined) continue;
 		/* v8 ignore stop */
-		pending.set(b.id, { toolName: name, timestamp, adapter, normalize: binding.normalize });
+		pending.set(b.id, {
+			toolName: resolved.toolName,
+			timestamp,
+			adapter,
+			normalize: resolved.normalize,
+			requireSuccess: resolved.kind === "cli",
+		});
 	}
 }
 
@@ -158,11 +172,19 @@ function collectToolResults(
 	for (const block of blocks) {
 		/* v8 ignore start -- defensive guards: non-object block / non-tool_result type / non-string tool_use_id all unreachable in valid Claude Code JSONL once the substring pre-filter ran. */
 		if (!isObject(block)) continue;
-		const b = block as { type?: unknown; tool_use_id?: unknown; content?: unknown };
+		const b = block as { type?: unknown; tool_use_id?: unknown; content?: unknown; is_error?: unknown };
 		if (b.type !== "tool_result" || typeof b.tool_use_id !== "string") continue;
 		/* v8 ignore stop */
 		const pendingEntry = pending.get(b.tool_use_id);
 		if (!pendingEntry) continue;
+		// CLI (shell) results require success: a failed command whose stdout is
+		// valid issue JSON must not be ingested. Scoped to CLI entries via
+		// `requireSuccess` so MCP results stay byte-identical (an errored MCP
+		// result is still parsed exactly as before).
+		if (pendingEntry.requireSuccess && b.is_error === true) {
+			pending.delete(b.tool_use_id);
+			continue;
+		}
 		const payloadText = extractResultPayloadText(b.content);
 		/* v8 ignore start -- defensive against malformed payload (no text content); live transcripts always include payload text. */
 		if (payloadText === undefined) {
