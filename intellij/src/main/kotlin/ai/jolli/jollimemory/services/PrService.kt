@@ -20,13 +20,27 @@ object PrService {
 
     private val log = JmLogger.create("PrService")
 
-    /** PR metadata returned by `findPrForBranch`. */
+    /** PR metadata for an open PR. */
     data class PrInfo(
         val number: Int,
         val url: String,
         val title: String,
         val body: String,
     )
+
+    /** A closed or merged PR shown in the history strip. */
+    data class PrHistoryEntry(
+        val number: Int,
+        val url: String,
+        val state: String, // "MERGED" | "CLOSED"
+    )
+
+    /** Discriminated result of [findPrForBranch]. */
+    sealed class PrLookup {
+        data class Found(val pr: PrInfo, val history: List<PrHistoryEntry>) : PrLookup()
+        data class NoPr(val history: List<PrHistoryEntry>) : PrLookup()
+        data class LookupError(val reason: String) : PrLookup()
+    }
 
     private const val MARKER_START = "<!-- jollimemory-summary-start -->"
     private const val MARKER_END = "<!-- jollimemory-summary-end -->"
@@ -215,26 +229,70 @@ object PrService {
     }
 
     /**
-     * Returns PR info for the current branch, or null if none exists.
-     * Uses `gh pr view` to fetch the PR associated with the current branch.
+     * Returns PR info for the given branch.
+     *
+     * Uses `gh pr list --state all --head <branch>` so we get the active PR (if
+     * any) AND closed history in a single round-trip. The webview shows the active
+     * one front-and-center, history as a "Previously: #N (merged) · ..." strip.
+     *
+     * Why list instead of view: `gh pr view <branch>` only returns the most-recent
+     * PR regardless of state, so a force-pushed branch with PR1 merged + PR2 open
+     * showed only PR2; PR1 disappeared from the UI even though the user could
+     * still navigate to it on GitHub. List + state filtering is the right shape.
      */
-    fun findPrForBranch(cwd: String): PrInfo? {
-        val raw = execGh(listOf("pr", "view", "--json", "number,url,title,body"), cwd) ?: return null
+    fun findPrForBranch(cwd: String, branch: String): PrLookup {
+        val raw = execGh(
+            listOf("pr", "list", "--state", "all", "--head", branch, "--json", "number,url,title,body,state,isCrossRepository"),
+            cwd,
+        )
+        if (raw == null) {
+            return PrLookup.LookupError("gh pr list failed")
+        }
 
         return try {
-            @Suppress("UNCHECKED_CAST")
-            val json = com.google.gson.Gson().fromJson(raw, Map::class.java) as Map<String, Any?>
-            val number = (json["number"] as? Double)?.toInt() ?: return null
-            if (number == 0) return null
+            val gson = com.google.gson.Gson()
+            val listType = object : com.google.gson.reflect.TypeToken<List<Map<String, Any?>>>() {}.type
+            val parsed: List<Map<String, Any?>> = gson.fromJson(raw, listType)
 
-            PrInfo(
-                number = number,
-                url = json["url"] as? String ?: "",
-                title = json["title"] as? String ?: "",
-                body = json["body"] as? String ?: "",
-            )
-        } catch (_: Exception) {
-            null
+            // Filter out malformed entries and cross-repository (fork) PRs
+            val valid = parsed.filter { row ->
+                val number = (row["number"] as? Double)?.toInt() ?: 0
+                val state = row["state"] as? String
+                val isCross = row["isCrossRepository"] as? Boolean ?: false
+                number > 0 && state != null && !isCross
+            }
+
+            val openPrs = valid
+                .filter { (it["state"] as? String) == "OPEN" }
+                .sortedByDescending { (it["number"] as? Double)?.toInt() ?: 0 }
+
+            val closedPrs = valid
+                .filter { (it["state"] as? String).let { s -> s == "MERGED" || s == "CLOSED" } }
+                .sortedByDescending { (it["number"] as? Double)?.toInt() ?: 0 }
+
+            val history = closedPrs.map { row ->
+                PrHistoryEntry(
+                    number = (row["number"] as? Double)?.toInt() ?: 0,
+                    url = row["url"] as? String ?: "",
+                    state = row["state"] as? String ?: "CLOSED",
+                )
+            }
+
+            if (openPrs.isEmpty()) {
+                PrLookup.NoPr(history)
+            } else {
+                val open = openPrs[0]
+                val pr = PrInfo(
+                    number = (open["number"] as? Double)?.toInt() ?: 0,
+                    url = open["url"] as? String ?: "",
+                    title = open["title"] as? String ?: "",
+                    body = open["body"] as? String ?: "",
+                )
+                PrLookup.Found(pr, history)
+            }
+        } catch (e: Exception) {
+            log.warn("findPrForBranch: parse error: %s", e.message ?: e.toString())
+            PrLookup.LookupError("Unparseable response from gh: ${e.message}")
         }
     }
 

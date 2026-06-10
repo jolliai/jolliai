@@ -1517,7 +1517,9 @@ ${buildPrMessageScript()}
   var prFormCancel = document.getElementById('prFormCancel');
   var prFormSubmit = document.getElementById('prFormSubmit');
 
+  var prHistory = document.getElementById('prHistory');
   var prCurrentState = 'loading';
+  var prLastHistory = [];
 
   /** Toggle visibility via the pr-hidden CSS class (CSP blocks inline style attributes). */
   function prShow(el) { if (el) el.classList.remove('pr-hidden'); }
@@ -1533,6 +1535,38 @@ ${buildPrMessageScript()}
     led.className = 'led';
     prStatusChip.appendChild(led);
     prStatusChip.appendChild(document.createTextNode(label));
+  }
+
+  function renderPrHistory(history) {
+    prLastHistory = Array.isArray(history) ? history : [];
+    if (prLastHistory.length === 0) {
+      prHide(prHistory);
+      return;
+    }
+    prHistory.textContent = '';
+    var label = document.createElement('span');
+    label.className = 'pr-history-label';
+    label.textContent = 'Previously:';
+    prHistory.appendChild(label);
+    var renderedCount = 0;
+    for (var i = 0; i < prLastHistory.length; i++) {
+      var h = prLastHistory[i];
+      if (typeof h.url !== 'string' || h.url.indexOf('https://') !== 0) continue;
+      if (renderedCount > 0) {
+        var sep = document.createElement('span');
+        sep.className = 'pr-history-sep';
+        sep.textContent = '\u00b7';
+        prHistory.appendChild(sep);
+      }
+      var link = document.createElement('a');
+      link.href = h.url;
+      link.title = 'Open PR in browser';
+      link.className = h.state === 'MERGED' ? 'pr-history-merged' : 'pr-history-closed';
+      link.textContent = '#' + h.number + ' (' + (h.state === 'MERGED' ? 'merged' : 'closed') + ')';
+      prHistory.appendChild(link);
+      renderedCount++;
+    }
+    prShow(prHistory);
   }
 
   // Auto-check PR status on load
@@ -1579,12 +1613,22 @@ ${buildPrMessageScript()}
       prCurrentState = s;
       prHide(prForm);
 
-      if (s === 'unavailable') {
-        setPrChip('is-warn', 'Unavailable');
-        prStatusText.textContent = 'GitHub CLI (gh) is not installed or not authenticated.';
+      if (s === 'multipleCommits') {
+        setPrChip('is-warn', 'Multiple commits');
+        prStatusText.textContent = 'Branch has ' + msg.count + ' commits. Please squash into a single commit before creating or updating a PR.';
         prShow(prStatusText);
         prHide(prLinkRow);
         prHide(prActions);
+        prHide(prHistory);
+      } else if (s === 'unavailable') {
+        setPrChip('is-warn', 'Unavailable');
+        prStatusText.textContent = msg.reason
+          ? ('Could not load PR status \u2014 ' + msg.reason + '. Retry, or check the IDE log.')
+          : 'GitHub CLI (gh) is not installed or not authenticated.';
+        prShow(prStatusText);
+        prHide(prLinkRow);
+        prHide(prActions);
+        prHide(prHistory);
       } else if (s === 'noPr') {
         setPrChip('is-warn', 'No PR');
         prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '.';
@@ -1621,6 +1665,7 @@ ${buildPrMessageScript()}
           if (chainBtn) chainBtn.disabled = true;
           jmSend({ command: 'createPrDirect' });
         });
+        renderPrHistory(msg.history);
       } else if (s === 'ready') {
         var pr = msg.pr;
         setPrChip('is-ok', '#' + pr.number + ' open');
@@ -1647,6 +1692,7 @@ ${buildPrMessageScript()}
           editBtn.disabled = true;
           jmSend({ command: 'prepareUpdatePr' });
         });
+        renderPrHistory(msg.history);
       }
     }
 
@@ -1665,6 +1711,7 @@ ${buildPrMessageScript()}
       prHide(prLinkRow);
       prActions.textContent = '';
       prHide(prActions);
+      prHide(prHistory);
       prShow(prForm);
       prForm.dataset.mode = 'create';
       prFormSubmit.textContent = 'Submit PR';
@@ -1680,6 +1727,7 @@ ${buildPrMessageScript()}
       prHide(prStatusText);
       prHide(prLinkRow);
       prHide(prActions);
+      prHide(prHistory);
       prShow(prForm);
       prForm.dataset.mode = 'update';
       prFormSubmit.textContent = 'Update PR';
