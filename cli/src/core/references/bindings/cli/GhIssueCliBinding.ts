@@ -1,12 +1,14 @@
 /**
  * GhIssueCliBinding — `gh issue view … --json` → GitHub issue reference.
  *
- * Recognition is a minimal tokenization (split on whitespace — good enough for
- * gh invocations; perfect shell quote/escape handling is out of scope, the
- * envelope's exit-code/is_error gate is the second line of defense). It requires
- * a `gh`/`gh.exe` executable at a COMMAND POSITION (so `echo "gh issue view
- * --json"`, a `#` comment, or a quoted mention don't match), the exact
- * `issue view` subcommand, and a standalone `--json` flag (rejects `--jsonfoo`).
+ * Recognition is a minimal tokenization (pad shell metacharacters, then split on
+ * whitespace — good enough for gh invocations; perfect shell quote/escape handling
+ * is out of scope, the envelope's exit-code/is_error gate is the second line of
+ * defense). It requires a `gh`/`gh.exe` executable at a COMMAND POSITION (so
+ * `echo "gh issue view --json"`, a `#` comment, or a quoted mention don't match),
+ * the `issue view` subcommand as a consecutive token pair (tolerating global
+ * flags like `--repo o/r` before it), and a standalone `--json` / `--json=<fields>`
+ * flag (rejects `--jsonfoo`).
  *
  * Normalization reuses the shared `reshapeGitHubIssue` (gh's `--json` output maps
  * onto it verbatim) plus a gh-only `state` lowercasing — gh emits `"CLOSED"`
@@ -34,8 +36,19 @@ function atCommandPosition(tokens: readonly string[], i: number): boolean {
 	return j < 0 || COMMAND_BOUNDARIES.has(tokens[j]);
 }
 
+/** A standalone `--json` flag (`--json` or `--json=<fields>`); rejects `--jsonfoo`. */
+function isJsonFlag(token: string): boolean {
+	return token === "--json" || token.startsWith("--json=");
+}
+
 function lineHasGhIssueView(line: string): boolean {
-	const all = line.split(/\s+/).filter((t) => t.length > 0);
+	// Pad shell metacharacters so operators glued to a neighbour become their own
+	// tokens (e.g. `cd /repo; gh …` → `… /repo ; gh …`, `x&&gh` → `x & & gh`).
+	// Without this, atCommandPosition can't see the boundary before `gh`.
+	const all = line
+		.replace(/([;|&(){}])/g, " $1 ")
+		.split(/\s+/)
+		.filter((t) => t.length > 0);
 	// Drop a trailing `#` comment up front so neither the executable scan nor the
 	// `issue view` pair search reaches into commented-out text (e.g. the second
 	// `gh …` in `gh foo # gh issue view 1 --json`).
@@ -47,13 +60,13 @@ function lineHasGhIssueView(line: string): boolean {
 		// gh accepts global flags (e.g. `--repo o/r`, `-R o/r`) BEFORE the subcommand
 		// — verified on gh 2.85.0 — so require `issue view` as a CONSECUTIVE token
 		// pair anywhere in the args, not merely adjacent to `gh`. A standalone
-		// `--json` flag is still required.
+		// `--json` flag (`--json` or `--json=<fields>`) is still required.
 		//   - `gh issue --json view` is correctly missed (pair not consecutive).
 		//   - `gh --json issue view` matches here, but gh rejects it with a non-zero
 		//     exit (`unknown command "view"`), so the exit-code/is_error gate drops it.
 		const hasIssueViewPair = rest.some((t, k) => t === "issue" && rest[k + 1] === "view");
 		if (!hasIssueViewPair) continue;
-		if (rest.some((t) => t === "--json")) return true;
+		if (rest.some(isJsonFlag)) return true;
 	}
 	return false;
 }

@@ -14,6 +14,7 @@ import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
+import { SOURCE_PREFERENCE_ORDER } from "./DistPathResolver.js";
 
 const log = createLogger("DispatchScripts");
 
@@ -46,8 +47,11 @@ const log = createLogger("DispatchScripts");
  */
 const RESOLVE_DIST_PATH_CONTENT = `#!/bin/bash
 # JolliMemory dist-path resolver.
-# Outputs the absolute path to the current winning dist directory (highest
-# version across all registered sources whose path exists).
+# Outputs the absolute path to the current winning dist directory: the highest
+# core version across all registered sources whose path exists. Ties (same core
+# version) are broken by a preference list (cli > vscode > cursor > …) because
+# the bundled @jolli.ai/cli core is identical at equal versions — the tie-break
+# only makes the winner deterministic and favours the canonical CLI build.
 #
 # Stable public API: run-hook, run-cli, legacy hooks still on disk, and
 # third-party tools all rely on this script's "output a path, exit 0/1"
@@ -57,13 +61,12 @@ DIR="$HOME/.jolli/jollimemory"
 BEST_PATH=""
 BEST_VER="0.0.0"
 
-# Version selection uses 'sort -V'. It agrees with the in-process compareSemver
-# (cli/src/install/DistPathResolver.ts) on every non-prerelease comparison.
-# Known divergence: sort -V ranks a prerelease (e.g. 1.0.0-rc.1) ABOVE its
-# release (1.0.0), whereas compareSemver follows semver and ranks it below.
-# Matching semver here would mean hand-rolling prerelease rules in POSIX sh;
-# the case (a release and its own prerelease both registered) is too rare to
-# justify the risk. compareSemver is the authority for in-process selection.
+# Pass 1 — highest core version wins. Selection uses 'sort -V', which agrees with
+# the in-process compareSemver (cli/src/install/DistPathResolver.ts) on every
+# non-prerelease comparison. The comparison is STRICT greater-than: an equal
+# version does NOT overwrite, so enumeration (alphabetical) order never decides a
+# tie. (Known sort -V divergence: it ranks 1.0.0-rc.1 ABOVE 1.0.0; compareSemver
+# follows semver and ranks it below. Too rare to hand-roll in POSIX sh.)
 if [ -d "$DIR/dist-paths" ]; then
   for f in "$DIR/dist-paths"/*; do
     [ -f "$f" ] || continue
@@ -75,10 +78,32 @@ if [ -d "$DIR/dist-paths" ]; then
       dev|unknown) VER_CMP="0.0.0" ;;
       *)           VER_CMP="$VER" ;;
     esac
-    if [ -z "$BEST_PATH" ] || \\
-       printf '%s\\n%s' "$BEST_VER" "$VER_CMP" | sort -V | tail -1 | grep -qx "$VER_CMP"; then
+    if [ -z "$BEST_PATH" ]; then
       BEST_PATH="$CANDIDATE"
       BEST_VER="$VER_CMP"
+    elif [ "$VER_CMP" != "$BEST_VER" ] && \\
+         printf '%s\\n%s' "$BEST_VER" "$VER_CMP" | sort -V | tail -1 | grep -qx "$VER_CMP"; then
+      BEST_PATH="$CANDIDATE"
+      BEST_VER="$VER_CMP"
+    fi
+  done
+fi
+
+# Pass 2 — among sources tied at BEST_VER, prefer the order below (kept in lockstep
+# with SOURCE_PREFERENCE_ORDER in DistPathResolver.ts). Only overrides when the
+# preferred source carries the same top version, so a strictly-higher non-preferred
+# source still wins.
+if [ -n "$BEST_PATH" ]; then
+  for pref in ${SOURCE_PREFERENCE_ORDER.join(" ")}; do
+    pf="$DIR/dist-paths/$pref"
+    [ -f "$pf" ] || continue
+    PVER=$(sed -n '1p' "$pf")
+    PPATH=$(sed -n '2p' "$pf")
+    [ -d "$PPATH" ] || continue
+    case "$PVER" in dev|unknown) PVER="0.0.0" ;; esac
+    if [ "$PVER" = "$BEST_VER" ]; then
+      BEST_PATH="$PPATH"
+      break
     fi
   done
 fi

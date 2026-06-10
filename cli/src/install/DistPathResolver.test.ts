@@ -319,6 +319,38 @@ describe("DistPathResolver", () => {
 			]);
 			expect(best?.source).toBe("cli");
 		});
+
+		it("prefers cli on a version tie (even when iterated after another source)", () => {
+			const best = pickBestDistPath([
+				{ source: "vscode", version: "0.99.3", distDir: "/v", available: true },
+				{ source: "cli", version: "0.99.3", distDir: "/c", available: true },
+			]);
+			expect(best?.source).toBe("cli");
+		});
+
+		it("prefers vscode over cursor on a tie when cli is absent", () => {
+			const best = pickBestDistPath([
+				{ source: "cursor", version: "0.99.3", distDir: "/cur", available: true },
+				{ source: "vscode", version: "0.99.3", distDir: "/v", available: true },
+			]);
+			expect(best?.source).toBe("vscode");
+		});
+
+		it("does NOT let the tie-break override a strictly-higher non-preferred source", () => {
+			const best = pickBestDistPath([
+				{ source: "cli", version: "0.99.3", distDir: "/c", available: true },
+				{ source: "windsurf", version: "0.99.4", distDir: "/w", available: true },
+			]);
+			expect(best?.source).toBe("windsurf");
+		});
+
+		it("falls back to the first-seen highest when no preferred source is in the tie", () => {
+			const best = pickBestDistPath([
+				{ source: "windsurf", version: "0.99.3", distDir: "/w", available: true },
+				{ source: "antigravity", version: "0.99.3", distDir: "/a", available: true },
+			]);
+			expect(best?.source).toBe("windsurf"); // first-seen highest; order among non-preferred is undefined
+		});
 	});
 
 	// ── resolveDistPath (simplified shim) ────────────────────────────────

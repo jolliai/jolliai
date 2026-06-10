@@ -34,6 +34,8 @@ describe("installHookScripts", () => {
 		const resolveDistPath = await readFile(join(globalDir, "resolve-dist-path"), "utf-8");
 		expect(resolveDistPath).toContain("#!/bin/bash");
 		expect(resolveDistPath).toContain("dist-paths");
+		// Tie-break pass: strict-greater selection + preference order baked in.
+		expect(resolveDistPath).toContain("for pref in cli vscode cursor");
 
 		const runHook = await readFile(join(globalDir, "run-hook"), "utf-8");
 		expect(runHook).toContain("HOOK_TYPE");

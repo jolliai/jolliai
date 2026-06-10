@@ -221,7 +221,23 @@ export function compareSemver(a: string, b: string): number {
 }
 
 /**
- * Picks the best (highest version, available) entry from a dist-paths list.
+ * Tie-break preference when multiple sources carry the SAME highest core version.
+ * The bundled `@jolli.ai/cli` core is byte-for-byte the same logic at equal
+ * versions, so this list only makes the winner DETERMINISTIC and favours the
+ * canonical CLI build over an IDE-embedded copy. Sources not listed have no
+ * defined order among themselves (the first-seen highest is kept).
+ *
+ * MUST stay in lockstep with the `for pref in …` list baked into the
+ * `resolve-dist-path` shell script — DispatchScripts.ts imports this constant so
+ * there is a single source of truth.
+ */
+export const SOURCE_PREFERENCE_ORDER: ReadonlyArray<string> = ["cli", "vscode", "cursor"];
+
+/**
+ * Picks the best entry from a dist-paths list:
+ *   1. highest core version, **strict** greater-than (a tie never overwrites, so
+ *      enumeration order can't decide a tie), then
+ *   2. among sources tied at that version, the first in {@link SOURCE_PREFERENCE_ORDER}.
  * Returns undefined if the list is empty or no entries are available.
  */
 export function pickBestDistPath(entries: ReadonlyArray<DistPathInfo>): DistPathInfo | undefined {
@@ -232,6 +248,13 @@ export function pickBestDistPath(entries: ReadonlyArray<DistPathInfo>): DistPath
 		if (compareSemver(available[i].version, best.version) > 0) {
 			best = available[i];
 		}
+	}
+	// Tie-break: among the sources sharing the highest version, prefer cli > vscode
+	// > cursor. Falls through to the first-seen highest when none are preferred.
+	const tied = available.filter((e) => compareSemver(e.version, best.version) === 0);
+	for (const pref of SOURCE_PREFERENCE_ORDER) {
+		const match = tied.find((e) => e.source === pref);
+		if (match) return match;
 	}
 	return best;
 }
