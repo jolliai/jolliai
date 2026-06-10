@@ -26,6 +26,10 @@ describe("ghIssueCliBinding", () => {
 			"# fetch the issue\ngh issue view 1 --json f", // comment line above the command
 			"gh --repo cli/cli issue view 1 --json title", // global --repo BEFORE subcommand (valid on gh 2.85.0)
 			"gh -R cli/cli issue view 1 --json title", // global -R BEFORE subcommand (valid on gh 2.85.0)
+			"gh issue view 1 --repo cli/cli --json=number,title", // --json=fields equals form (valid on gh 2.85.0)
+			"cd /repo; gh issue view 1 --json number", // `;` glued to the previous token
+			"cd /x&&gh issue view 1 --json f", // `&&` glued with no surrounding spaces
+			"cd C:\\repo; gh issue view 1 --json number", // PowerShell-style `;` separator
 		])("matches %j", (cmd) => {
 			expect(matches(cmd)).toBe(true);
 		});
