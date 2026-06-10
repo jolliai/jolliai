@@ -44,9 +44,9 @@ $rootVars
 
   /* ── Page container ── */
   .page {
-    max-width: 900px;
+    max-width: 820px;
     margin: 0 auto;
-    padding: 36px 28px 48px;
+    padding: 22px 18px 48px;
   }
 
   /* ── Private Zone (All Conversations) ── */
@@ -94,9 +94,28 @@ $rootVars
   }
   .header-actions {
     display: flex;
+    align-items: center;
     gap: 6px;
-    margin-bottom: 16px;
+    margin: 14px 0 20px;
   }
+  /* ── Meta strip ── */
+  .meta-strip {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 5px 9px;
+    font-size: 0.86em; color: var(--text-secondary); margin-bottom: 6px;
+  }
+  .meta-strip .meta-sep { color: var(--text-tertiary); opacity: 0.55; }
+  .meta-strip .meta-hash { font-family: $MONO_FONT_FAMILY; color: var(--link-fg); }
+  .meta-branch {
+    display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; vertical-align: bottom;
+    padding: 1px 8px; border-radius: 5px; background: var(--pill-bg); color: var(--pill-text); font-size: 0.92em;
+  }
+  .details-toggle {
+    background: none; border: none; cursor: pointer; font-family: $FONT_FAMILY;
+    font-size: 0.96em; color: var(--text-tertiary); padding: 1px 4px; border-radius: 4px;
+    text-decoration: underline; text-underline-offset: 2px; text-decoration-style: dotted;
+  }
+  .details-toggle:hover { color: var(--link-fg); }
   .action-btn {
     font-family: $FONT_FAMILY;
     font-size: 0.8em;
@@ -292,20 +311,28 @@ $rootVars
     grid-template-columns: auto 1fr;
     gap: 0;
     font-size: 0.93em;
-    margin-bottom: 4px;
+    margin: 8px 0 4px;
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  /* Two-class selector beats the single-class .properties grid rule, so this wins. */
+  .properties.collapsed {
+    display: none;
   }
   .prop-row {
     display: contents;
   }
   .prop-label {
-    padding: 5px 16px 5px 0;
+    padding: 6px 16px;
     color: var(--prop-label);
     font-weight: 400;
     white-space: nowrap;
     border-bottom: 1px solid var(--border-light);
+    background: var(--panel-inner);
   }
   .prop-value {
-    padding: 5px 0;
+    padding: 6px 16px;
     color: var(--text-primary);
     border-bottom: 1px solid var(--border-light);
     word-break: break-word;
@@ -460,7 +487,7 @@ $rootVars
   /* ── Toggle content with smooth expand/collapse ── */
   .toggle-content {
     overflow: hidden;
-    max-height: 800px;
+    max-height: 6000px;
     opacity: 1;
     transition: max-height 0.25s ease, opacity 0.2s ease, padding 0.25s ease;
     padding: 4px 10px 12px 30px;
@@ -1125,7 +1152,28 @@ $rootVars
     text-decoration: underline;
   }
   .pr-actions {
+    display: flex;
+    gap: 6px;
     margin: 8px 0 4px;
+  }
+  /* ── PR Content Status ── */
+  .pr-content-status {
+    margin-top: 10px;
+  }
+  .pr-content-label {
+    font-size: 0.85em;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+  }
+  .pr-content-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 6px 0;
+    font-size: 0.85em;
+  }
+  .pr-content-list li {
+    padding: 2px 0;
   }
   /* ── PR Create Form ── */
   .pr-form {
@@ -1167,6 +1215,231 @@ $rootVars
     gap: 8px;
     margin-top: 8px;
     justify-content: flex-end;
+  }
+
+  /* ── Ship bar (two-card grid) ── */
+  .ship-bar {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .ship-card {
+    border: 1px solid var(--border-light);
+    border-radius: 10px;
+    padding: 14px 16px;
+    background: var(--panel-bg);
+  }
+  .ship-card hr.separator { display: none; }
+  .ship-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .ship-icon { font-size: 1.15em; }
+  .ship-name {
+    font-weight: 600;
+    font-size: 0.92em;
+    color: var(--text-primary);
+  }
+  .ship-sub {
+    font-size: 0.85em;
+    color: var(--description-fg);
+    margin-bottom: 8px;
+  }
+  .ship-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  /* ── Status chips ── */
+  .ship-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.78em;
+    font-weight: 500;
+    padding: 2px 10px;
+    border-radius: 10px;
+    margin-left: auto;
+  }
+  .ship-status .led {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+  .ship-status.is-ok {
+    background: rgba(78, 206, 141, 0.12);
+    color: var(--ship-ok);
+  }
+  .ship-status.is-ok .led { background: var(--ship-ok); }
+  .ship-status.is-warn {
+    background: rgba(224, 172, 43, 0.12);
+    color: var(--ship-warn);
+  }
+  .ship-status.is-warn .led { background: var(--ship-warn); }
+  .ship-status.is-loading {
+    background: var(--pill-bg);
+    color: var(--text-secondary);
+  }
+  .ship-status.is-loading .led {
+    background: var(--text-secondary);
+    animation: ledPulse 1.4s ease-in-out infinite;
+  }
+  @keyframes ledPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  /* ── Jolli status (standalone, inside ship card) ── */
+  .jolli-status {
+    font-size: 0.92em;
+    color: var(--description-fg);
+    margin: 4px 0;
+  }
+  .jolli-status a {
+    color: var(--link-fg);
+    text-decoration: none;
+  }
+  .jolli-status a:hover { text-decoration: underline; }
+
+  /* ── PR card overrides ── */
+  #prCard #prSection { margin: 0; }
+  #prCard .section-header { margin-bottom: 6px; }
+  #prCard .pr-status-text { margin-top: 0; }
+
+  /* ── Panels ── */
+  .panel {
+    border: 1px solid var(--border-light);
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 16px;
+    background: var(--panel-bg);
+  }
+  .panel-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .panel-title {
+    font-size: 0.82em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary);
+  }
+  .panel hr.separator { display: none; }
+  #memoryPanel .recap-section {
+    border-left: 3px solid var(--callout-trigger-label);
+    padding-left: 14px;
+    margin-bottom: 12px;
+  }
+
+  /* ── Attachment cards (collapsible) ── */
+  .attach-card {
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    margin-bottom: 10px;
+    overflow: hidden;
+  }
+  .attach-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 0.88em;
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--panel-inner);
+    transition: background 0.1s ease;
+  }
+  .attach-card-head:hover { background: var(--surface-hover); }
+  .attach-arrow {
+    font-size: 0.7em;
+    color: var(--text-secondary);
+    transition: transform 0.2s ease;
+    display: inline-block;
+    margin-left: auto;
+  }
+  .attach-card.collapsed .attach-arrow { transform: rotate(-90deg); }
+  .attach-card-body {
+    padding: 10px 14px;
+    overflow: hidden;
+    max-height: 4000px;
+    opacity: 1;
+    transition: max-height 0.3s ease, opacity 0.2s ease, padding 0.3s ease;
+  }
+  .attach-card.collapsed .attach-card-body {
+    max-height: 0;
+    opacity: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+  .attach-card-body .section-header { display: none; }
+
+  /* ── Private drawer (collapsed by default) ── */
+  .private-drawer {
+    border: 1px dashed var(--private-zone-border);
+    border-radius: 10px;
+    margin-bottom: 16px;
+    overflow: hidden;
+    background: var(--private-zone-bg);
+  }
+  .private-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 16px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.1s ease;
+  }
+  .private-head:hover { background: var(--surface-hover); }
+  .private-lock { font-size: 1em; flex-shrink: 0; }
+  .private-title {
+    font-size: 0.88em;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .private-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.75em;
+    padding: 1px 8px;
+    border-radius: 10px;
+    background: var(--pill-bg);
+    color: var(--pill-text);
+    margin-left: auto;
+  }
+  .private-count { font-weight: 600; }
+  .private-drawer .private-body {
+    padding: 0 16px 16px;
+    overflow: hidden;
+    max-height: 6000px;
+    opacity: 1;
+    transition: max-height 0.3s ease, opacity 0.2s ease, padding 0.3s ease;
+  }
+  .private-drawer.collapsed .private-body {
+    max-height: 0;
+    opacity: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+
+  /* ── Reduced motion ── */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
   }
 """
     }
@@ -1251,7 +1524,13 @@ $rootVars
     --cat-infra-bg: rgba(255, 255, 255, 0.06);
     --cat-infra-text: rgba(255, 255, 255, 0.50);
     --cat-docs-bg: rgba(76, 206, 141, 0.10);
-    --cat-docs-text: #4ece8d;"""
+    --cat-docs-text: #4ece8d;
+
+    /* ── Redesign v2 tokens ── */
+    --panel-bg: rgba(255, 255, 255, 0.018);
+    --panel-inner: rgba(255, 255, 255, 0.045);
+    --ship-ok: #4ece8d;
+    --ship-warn: #e0ac2b;"""
 
     /** Light theme variable block (matches `body.vscode-light` values). */
     private fun buildLightVars(): String = """
@@ -1322,5 +1601,11 @@ $rootVars
     --cat-infra-bg: rgba(0, 0, 0, 0.05);
     --cat-infra-text: rgba(0, 0, 0, 0.50);
     --cat-docs-bg: rgba(68, 176, 124, 0.10);
-    --cat-docs-text: #1b6340;"""
+    --cat-docs-text: #1b6340;
+
+    /* ── Redesign v2 tokens ── */
+    --panel-bg: rgba(0, 0, 0, 0.015);
+    --panel-inner: rgba(0, 0, 0, 0.035);
+    --ship-ok: #1b8a4f;
+    --ship-warn: #96680e;"""
 }

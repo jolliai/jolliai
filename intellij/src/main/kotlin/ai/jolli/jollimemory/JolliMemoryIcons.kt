@@ -39,6 +39,9 @@ object JolliMemoryIcons {
     /** Eye — matches VSCode codicon "eye" for view summary. */
     val Eye: Icon = IconLoader.getIcon("/icons/eye.svg", JolliMemoryIcons::class.java)
 
+    /** Vertical three dots (⋮) — per-row "more actions" affordance. */
+    val MoreVertical: Icon = IconLoader.getIcon("/icons/more-vertical.svg", JolliMemoryIcons::class.java)
+
     /** Select/deselect all — uses IntelliJ platform icon for crisp rendering. */
     val CheckAll: Icon = AllIcons.Actions.Selectall
 

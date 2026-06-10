@@ -383,10 +383,25 @@ class CommitsPanel(
             })
         }
 
-        // Right side: eye icon
+        // Three-dots "more actions" button (only for commits with a summary).
+        // Replaces the old right-click context menu as the sole menu trigger.
+        val moreLabel = JLabel(JolliMemoryIcons.MoreVertical).apply {
+            isVisible = commit.hasSummary
+            toolTipText = "More actions"
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            border = JBUI.Borders.emptyLeft(4)
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) {
+                    if (SwingUtilities.isLeftMouseButton(e)) showCommitRowMenu(commit, e.component, e.x, e.y)
+                }
+            })
+        }
+
+        // Right side: eye icon + three-dots menu
         val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
             isOpaque = false
             add(eyeLabel)
+            add(moreLabel)
         }
 
         val row = JPanel(BorderLayout(2, 0)).apply {
@@ -438,36 +453,28 @@ class CommitsPanel(
             child.addMouseListener(expandClickListener)
         }
 
-        // Right-click context menu — only for commits with a summary,
-        // matching VS Code's MemoryItem menu (Copy Recall Prompt + View Memory).
-        // Built via IntelliJ's ActionPopupMenu so it picks up IDE theming
-        // (hover highlight, keyboard nav, Darcula colors).
-        if (commit.hasSummary) {
-            val popupListener = object : MouseAdapter() {
-                override fun mousePressed(e: MouseEvent) = maybeShow(e)
-                override fun mouseReleased(e: MouseEvent) = maybeShow(e)
-                private fun maybeShow(e: MouseEvent) {
-                    if (!e.isPopupTrigger) return
-                    val group = DefaultActionGroup().apply {
-                        add(object : AnAction("Copy Recall Prompt") {
-                            override fun actionPerformed(ev: AnActionEvent) = copyRecallPrompt(commit.hash)
-                        })
-                        add(object : AnAction("View Commit Memory") {
-                            override fun actionPerformed(ev: AnActionEvent) = viewSummary(commit.hash)
-                        })
-                    }
-                    val menu = ActionManager.getInstance()
-                        .createActionPopupMenu("JolliMemory.CommitRowMenu", group)
-                    menu.component.show(e.component, e.x, e.y)
-                }
-            }
-            for (child in listOf(arrowLabel, messageLabel, leftPanel, eyeLabel, rightPanel, row)) {
-                child.addMouseListener(popupListener)
-            }
-        }
-
         row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
         return state
+    }
+
+    /**
+     * Shows the per-row "more actions" menu, triggered by the three-dots button.
+     * Built via IntelliJ's ActionPopupMenu so it picks up IDE theming (hover
+     * highlight, keyboard nav, Darcula colors). Mirrors VS Code's MemoryItem menu
+     * plus a "Create PR" entry that deep-links into the summary's Create PR flow.
+     */
+    private fun showCommitRowMenu(commit: CommitSummaryBrief, component: java.awt.Component, x: Int, y: Int) {
+        val group = DefaultActionGroup().apply {
+            add(object : AnAction("Create PR") {
+                override fun actionPerformed(ev: AnActionEvent) = viewSummary(commit.hash)
+            })
+            add(object : AnAction("Copy Recall Prompt") {
+                override fun actionPerformed(ev: AnActionEvent) = copyRecallPrompt(commit.hash)
+            })
+
+        }
+        val menu = ActionManager.getInstance().createActionPopupMenu("JolliMemory.CommitRowMenu", group)
+        menu.component.show(component, x, y)
     }
 
     /** Toggles the expand/collapse state of a commit's file list. */
@@ -678,6 +685,8 @@ class CommitsPanel(
             }
         }
     }
+
+
 
     // ─── Foreign mode ──────────────────────────────────────────────────────
 

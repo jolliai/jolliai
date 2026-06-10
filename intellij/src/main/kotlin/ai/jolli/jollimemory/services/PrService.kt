@@ -93,11 +93,37 @@ object PrService {
     }
 
     /**
+     * Resolves a bare command name (e.g. `gh`, `git`) to an absolute path using
+     * [resolvedPath]. Returns the input unchanged if it already looks like a path
+     * or can't be located.
+     *
+     * Required because [ProcessBuilder] resolves a bare command name against the
+     * JVM's *inherited* PATH — which is minimal when the IDE is GUI-launched
+     * (e.g. `/usr/bin:/bin:/usr/sbin:/sbin`) — and ignores the PATH we set via
+     * `pb.environment()`. Tools installed outside the system PATH (Homebrew's
+     * `gh` in `/opt/homebrew/bin`) are otherwise unfindable, while `git` in
+     * `/usr/bin` happens to work. Doing the lookup ourselves against
+     * [resolvedPath] fixes both `gh` and `git` callers in one place.
+     */
+    private fun resolveExecutable(command: String): String {
+        if (command.contains('/') || command.contains('\\')) return command // already a path
+        val candidates = if (isWindows) listOf("$command.exe", "$command.cmd", "$command.bat", command) else listOf(command)
+        for (dir in resolvedPath.split(File.pathSeparator)) {
+            if (dir.isBlank()) continue
+            for (name in candidates) {
+                val f = File(dir, name)
+                if (f.canExecute()) return f.absolutePath
+            }
+        }
+        return command
+    }
+
+    /**
      * Runs a CLI command directly via ProcessBuilder and returns stdout,
-     * or null on failure. Uses [resolvedPath] so that tools like `gh` and
-     * `git` installed via Homebrew (macOS/Linux) or user-scoped installers
-     * (Windows) are found. No shell wrapper or quoting needed — each argument
-     * is passed directly to the OS process.
+     * or null on failure. Resolves the command to an absolute path via
+     * [resolveExecutable] (see why there) and also exports [resolvedPath] to the
+     * child so any sub-processes it spawns inherit the full PATH. No shell
+     * wrapper or quoting needed — each argument is passed directly to the OS process.
      */
     private fun execCommand(
         command: String,
@@ -106,7 +132,7 @@ object PrService {
         timeoutSeconds: Long = 30,
     ): String? {
         return try {
-            val pb = ProcessBuilder(listOf(command) + args)
+            val pb = ProcessBuilder(listOf(resolveExecutable(command)) + args)
                 .directory(File(cwd))
                 .redirectErrorStream(false)
             pb.environment()["PATH"] = resolvedPath
@@ -161,7 +187,11 @@ object PrService {
 
     /** Checks whether the `gh` CLI is installed and reachable. */
     fun isGhAvailable(cwd: String): Boolean {
-        return execGh(listOf("--version"), cwd) != null
+        val available = execGh(listOf("--version"), cwd) != null
+        if (!available) {
+            log.warn("isGhAvailable: 'gh --version' failed — gh not found on resolvedPath or not runnable. resolvedPath='%s'", resolvedPath)
+        }
+        return available
     }
 
     /** Checks whether `gh` is authenticated (logged in). */

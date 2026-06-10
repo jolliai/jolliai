@@ -66,6 +66,34 @@ object SummaryScriptBuilder {
     });
   });
 
+  // ── Redesign v2: Details disclosure + panel/card/drawer collapse ──
+  var detailsToggle = document.getElementById('detailsToggle');
+  if (detailsToggle) {
+    detailsToggle.addEventListener('click', function() {
+      var t = document.getElementById('propertiesSection');
+      if (!t) { return; }
+      var open = t.classList.toggle('collapsed') === false;
+      detailsToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      detailsToggle.textContent = open ? 'Details \u25B4' : 'Details \u25BE';
+    });
+  }
+  // Generic data-collapse handler for attach cards + private drawer.
+  document.querySelectorAll('[data-collapse]').forEach(function(head) {
+    function toggleCollapse() {
+      var target = document.getElementById(head.getAttribute('data-collapse'));
+      if (!target) { return; }
+      var collapsed = target.classList.toggle('collapsed');
+      head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    }
+    head.addEventListener('click', function(e) {
+      if (e.target.closest('.action-btn')) return;
+      toggleCollapse();
+    });
+    head.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCollapse(); }
+    });
+  });
+
   // Copy Markdown button with brief visual feedback
   var copyBtn = document.getElementById('copyMdBtn');
   if (copyBtn) {
@@ -100,23 +128,21 @@ ${buildPrSectionScript()}
         pushBtn.textContent = 'Pushed \u2713';
         pushBtn.disabled = false;
         setTimeout(function() { pushBtn.textContent = 'Update on Jolli'; }, 2000);
-        // Dynamically add/update the Jolli Memory row in the properties table
+        // Dynamically add/update the Jolli Memory link in the Jolli ship card
         if (msg.url) {
-          var props = document.querySelector('.properties');
+          var jolliCard = document.getElementById('jolliCard');
           var existingRow = document.getElementById('jolliRow');
           if (existingRow) existingRow.remove();
-          if (props) {
-            var label = document.createElement('div');
-            label.className = 'prop-label';
-            label.textContent = 'Jolli Memory';
-            var value = document.createElement('div');
-            value.className = 'prop-value';
+          if (jolliCard) {
+            var row = document.createElement('div');
+            row.id = 'jolliRow';
+            row.className = 'jolli-status';
             var link = document.createElement('a');
             link.className = 'jolli-link';
             link.href = msg.url;
             link.title = msg.commitMessage || 'View on Jolli';
             link.textContent = msg.url;
-            value.appendChild(link);
+            row.appendChild(link);
             // Add plan URLs as sub-block if any
             if (msg.planUrls && msg.planUrls.length > 0) {
               var plansBlock = document.createElement('div');
@@ -136,14 +162,28 @@ ${buildPrSectionScript()}
                 item.appendChild(a);
                 plansBlock.appendChild(item);
               });
-              value.appendChild(plansBlock);
+              row.appendChild(plansBlock);
             }
-            var row = document.createElement('div');
-            row.className = 'prop-row';
-            row.id = 'jolliRow';
-            row.appendChild(label);
-            row.appendChild(value);
-            props.appendChild(row);
+            // Insert before ship-actions div
+            var shipActions = jolliCard.querySelector('.ship-actions');
+            if (shipActions) {
+              jolliCard.insertBefore(row, shipActions);
+            } else {
+              jolliCard.appendChild(row);
+            }
+            // Update Jolli chip to synced
+            var jolliChip = jolliCard.querySelector('.ship-status');
+            if (jolliChip) {
+              jolliChip.className = 'ship-status is-ok';
+              jolliChip.textContent = '';
+              var led = document.createElement('span');
+              led.className = 'led';
+              jolliChip.appendChild(led);
+              jolliChip.appendChild(document.createTextNode('Synced'));
+            }
+            // Remove the "not shared" subtitle
+            var sub = jolliCard.querySelector('.ship-sub');
+            if (sub) sub.remove();
           }
         }
       } else if (msg.command === 'pushFailed') {
@@ -679,11 +719,28 @@ ${buildPrMessageScript()}
           reattachE2eHandlers();
         }
       }
+      // "Generate E2E + Create PR" chain: E2E now exists, so the second PR
+      // button no longer applies — retire it — and if the user launched the
+      // chain, continue to the PR create form.
+      var chainE2eBtn = document.getElementById('createPrWithE2eBtn');
+      if (chainE2eBtn) { chainE2eBtn.remove(); }
+      if (window.prChainE2eThenCreate) {
+        window.prChainE2eThenCreate = false;
+        jmSend({ command: 'createPrDirect' });
+      }
     } else if (msg.command === 'e2eTestError') {
       var btn = document.getElementById('generateE2eBtn') || document.getElementById('regenE2eBtn');
       if (btn) {
         btn.textContent = btn.id === 'generateE2eBtn' ? 'Generate' : '\uD83D\uDD04';
         btn.disabled = false;
+      }
+      // Abort the chain and restore buttons
+      if (window.prChainE2eThenCreate) {
+        window.prChainE2eThenCreate = false;
+        var chainErrBtn = document.getElementById('createPrWithE2eBtn');
+        if (chainErrBtn) { chainErrBtn.disabled = false; chainErrBtn.textContent = 'Generate E2E + Create PR'; }
+        var createErrBtn = document.getElementById('createPrBtn');
+        if (createErrBtn) { createErrBtn.disabled = false; }
       }
       // If in edit mode, re-enable buttons
       var section = document.getElementById('e2eTestSection');
@@ -1397,6 +1454,18 @@ ${buildPrMessageScript()}
   function prShow(el) { if (el) el.classList.remove('pr-hidden'); }
   function prHide(el) { if (el) el.classList.add('pr-hidden'); }
 
+  // Status chip in the PR card header (mirrors the Jolli card chip).
+  var prStatusChip = document.getElementById('prStatusChip');
+  function setPrChip(cls, label) {
+    if (!prStatusChip) return;
+    prStatusChip.className = 'ship-status ' + cls;
+    prStatusChip.textContent = '';
+    var led = document.createElement('span');
+    led.className = 'led';
+    prStatusChip.appendChild(led);
+    prStatusChip.appendChild(document.createTextNode(label));
+  }
+
   // Auto-check PR status on load
   jmSend({ command: 'checkPrStatus' });
 
@@ -1404,18 +1473,17 @@ ${buildPrMessageScript()}
   if (prFormCancel) {
     prFormCancel.addEventListener('click', function() {
       prHide(prForm);
-      prShow(prActions);
-      // Restore Edit PR button state
-      var editBtn = document.getElementById('editPrBtn');
-      if (editBtn) { editBtn.textContent = 'Edit PR'; editBtn.disabled = false; }
-      // Restore correct visibility based on current state
-      if (prCurrentState === 'ready') {
-        prHide(prStatusText);
-        prShow(prLinkRow);
-      } else {
-        prShow(prStatusText);
-        prHide(prLinkRow);
-      }
+      prHide(prLinkRow);
+      prHide(prActions);
+      // Re-check PR status rather than restoring whatever was last shown. This reflects
+      // reality for both the no-PR and existing-PR (Edit) cases, and avoids re-revealing
+      // stale prStatusText — e.g. the leftover E2E "Generating…" spinner, which was hidden
+      // (not cleared) when the form opened. The auto-create flag was already consumed by
+      // the initial status check, so this will not re-open the create flow.
+      setPrChip('is-loading', 'Checking\u2026');
+      prStatusText.textContent = 'Checking PR status\u2026';
+      prShow(prStatusText);
+      jmSend({ command: 'checkPrStatus' });
     });
   }
   if (prFormSubmit) {
@@ -1443,41 +1511,56 @@ ${buildPrMessageScript()}
       prHide(prForm);
 
       if (s === 'multipleCommits') {
+        setPrChip('is-warn', 'Multiple commits');
         prStatusText.textContent = 'Branch has ' + msg.count + ' commits. Please squash into a single commit before creating or updating a PR.';
         prShow(prStatusText);
         prHide(prLinkRow);
         prHide(prActions);
       } else if (s === 'unavailable') {
+        setPrChip('is-warn', 'Unavailable');
         prStatusText.textContent = 'GitHub CLI (gh) is not installed or not authenticated.';
         prShow(prStatusText);
         prHide(prLinkRow);
         prHide(prActions);
       } else if (s === 'noPr') {
+        setPrChip('is-warn', 'No PR');
         prStatusText.textContent = 'No pull request found for branch ' + msg.branch + '.';
         prShow(prStatusText);
         prHide(prLinkRow);
         prActions.textContent = '';
         var btn = document.createElement('button');
-        btn.className = 'action-btn';
+        btn.className = 'action-btn primary';
         btn.id = 'createPrBtn';
         btn.textContent = 'Create PR';
         prActions.appendChild(btn);
+        // When no E2E exists yet, offer a "Generate E2E + Create PR" chain button
+        // so the PR body includes a fresh guide. The chain flag lets the
+        // e2eTestUpdated handler continue to createPrDirect once generation succeeds.
+        if (document.getElementById('generateE2eBtn')) {
+          var e2eBtn = document.createElement('button');
+          e2eBtn.className = 'action-btn';
+          e2eBtn.id = 'createPrWithE2eBtn';
+          e2eBtn.textContent = 'Generate E2E + Create PR';
+          prActions.appendChild(e2eBtn);
+          e2eBtn.addEventListener('click', function() {
+            e2eBtn.disabled = true;
+            e2eBtn.textContent = 'Generating E2E\u2026';
+            btn.disabled = true;
+            window.prChainE2eThenCreate = true;
+            jmSend({ command: 'generateE2eTest' });
+          });
+        }
         prShow(prActions);
-        // Bind Create PR button
         btn.addEventListener('click', function() {
-          prHide(prStatusText);
-          prHide(prLinkRow);
-          prHide(prActions);
-          prShow(prForm);
-          prForm.dataset.mode = 'create';
-          prFormSubmit.textContent = 'Submit PR';
-          // Pre-fill form — values set via data attributes on prForm
-          prTitleInput.value = prForm.dataset.title || '';
-          prBodyInput.value = prForm.dataset.body || '';
-          prTitleInput.focus();
+          btn.textContent = 'Loading...';
+          btn.disabled = true;
+          var chainBtn = document.getElementById('createPrWithE2eBtn');
+          if (chainBtn) chainBtn.disabled = true;
+          jmSend({ command: 'createPrDirect' });
         });
       } else if (s === 'ready') {
         var pr = msg.pr;
+        setPrChip('is-ok', '#' + pr.number + ' open');
         prHide(prStatusText);
         // Build PR link via DOM
         prLinkRow.textContent = '';
@@ -1502,6 +1585,31 @@ ${buildPrMessageScript()}
           jmSend({ command: 'prepareUpdatePr' });
         });
       }
+    }
+
+    // ── PR generating E2E ── (shown while the AI generates the E2E test for the PR)
+    if (msg.command === 'prGeneratingE2e') {
+      prHide(prLinkRow);
+      prHide(prActions);
+      prHide(prForm);
+      prStatusText.textContent = '⏳ Generating end-to-end tests… this can take up to a minute.';
+      prShow(prStatusText);
+    }
+
+    // ── PR show create form ──
+    if (msg.command === 'prShowCreateForm') {
+      prHide(prStatusText);
+      prHide(prLinkRow);
+      prActions.textContent = '';
+      prHide(prActions);
+      prShow(prForm);
+      prForm.dataset.mode = 'create';
+      prFormSubmit.textContent = 'Submit PR';
+      prFormSubmit.disabled = false;
+      prFormCancel.disabled = false;
+      prTitleInput.value = msg.title || '';
+      prBodyInput.value = msg.body || '';
+      prTitleInput.focus();
     }
 
     // ── PR show update form ──
