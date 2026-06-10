@@ -480,6 +480,7 @@ $listItems
   <p class="pr-status-text" id="prStatusText">Checking PR status...</p>
   <div class="pr-link-row pr-hidden" id="prLinkRow"></div>$notIncludedHtml
   <div class="pr-actions pr-hidden" id="prActions"></div>
+  <div class="pr-history pr-hidden" id="prHistory"></div>
   <div class="pr-form pr-hidden" id="prForm" data-title="$escapedTitle" data-body="$escapedBody">
     <label class="pr-form-label">Title</label>
     <input type="text" class="pr-form-input" id="prTitleInput" />
