@@ -39,8 +39,7 @@
 	],
 	"activationEvents": [
 		"workspaceContains:.git",
-		"onUri",
-		"onView:jollimemory.mainView"
+		"onUri"
 	],
 	"main": "./dist/Extension.js",
 	"contributes": {
@@ -65,7 +64,8 @@
 				{
 					"id": "jollimemory.mainView",
 					"name": "Jolli Memory",
-					"type": "webview"
+					"type": "webview",
+					"icon": "assets/icon.svg"
 				}
 			]
 		},
