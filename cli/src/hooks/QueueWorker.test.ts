@@ -65,6 +65,7 @@ vi.mock("../core/Locks.js", () => ({
 	// Passthrough: run the RMW body without touching the real lock file. The
 	// per-worktree lock contract itself is covered in Locks.test.ts.
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+	WORKER_PHASE_FILE: "worker-phase",
 }));
 
 // `vault-write.lock` integration: the Standalone Hotfix now wraps the worker
@@ -335,7 +336,9 @@ vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
 import { isCopilotChatInstalled } from "../core/CopilotChatDetector.js";
 import { discoverCopilotChatSessions } from "../core/CopilotChatSessionDiscoverer.js";
@@ -2160,6 +2163,40 @@ describe("QueueWorker", () => {
 		});
 	});
 
+	describe("runWorker — stale phase cleanup on lock acquisition", () => {
+		it("removes a worker-phase file left by a crashed worker when it acquires the lock", async () => {
+			const tmp = mkdtempSync(join(tmpdir(), "jolli-stalephase-"));
+			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
+			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
+			// Simulate crash residue: a previous worker was SIGKILL'd mid-ingest, so
+			// its `finally` cleanup never ran and the 'ingest' marker persists.
+			writeFileSync(phaseFile, "ingest");
+
+			const { existsSync: realExistsSync } = await vi.importActual<typeof import("node:fs")>("node:fs");
+			expect(realExistsSync(phaseFile)).toBe(true);
+
+			// Minimal storage so setActiveStorage() has something to hold; empty
+			// queue so the worker just acquires the lock and drains nothing.
+			vi.mocked(createStorage).mockResolvedValue({
+				readFile: vi.fn().mockResolvedValue(null),
+				writeFiles: vi.fn().mockResolvedValue(undefined),
+				listFiles: vi.fn().mockResolvedValue([]),
+				exists: vi.fn().mockResolvedValue(true),
+				ensure: vi.fn().mockResolvedValue(undefined),
+			} as never);
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([]);
+
+			await runWorker(tmp);
+
+			// The fresh worker holds the lock, proving the previous one is gone, so
+			// the stale marker is cleared at the source — not left to mislabel the
+			// next genuine summary run as "Updating Memory Bank…".
+			expect(realExistsSync(phaseFile)).toBe(false);
+
+			rmSync(tmp, { recursive: true, force: true });
+		});
+	});
+
 	describe("runWorker — ingest dispatch", () => {
 		function makeIngestOp(triggeredBy: IngestOperation["triggeredBy"] = "post-merge"): IngestOperation {
 			return { type: "ingest", triggeredBy, createdAt: new Date().toISOString() };
@@ -2181,6 +2218,53 @@ describe("QueueWorker", () => {
 		// case. Per-test overrides drive the wiki-missing recovery path.
 		beforeEach(() => {
 			vi.mocked(createStorage).mockResolvedValue(storageWithWiki(true));
+		});
+
+		it("writes worker-phase=ingest during ingest and removes it after", async () => {
+			const tmp = mkdtempSync(join(tmpdir(), "jolli-phase-"));
+			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
+			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
+
+			// Use the actual fs functions so we can observe real disk writes from
+			// production code (writeFileSync / rmSync are actual in the mock spread).
+			const { existsSync: realExistsSync, readFileSync: realReadFileSync } =
+				await vi.importActual<typeof import("node:fs")>("node:fs");
+			vi.mocked(existsSync).mockImplementation(realExistsSync);
+			vi.mocked(readFileSync).mockImplementation(realReadFileSync as typeof readFileSync);
+
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			let phaseSeenDuringIngest: string | null = null;
+			vi.mocked(drainIngest).mockImplementation(async () => {
+				phaseSeenDuringIngest = existsSync(phaseFile) ? readFileSync(phaseFile, "utf-8") : null;
+				return { batches: 1, ingested: 2, outcome: "OK", topicFailures: [] };
+			});
+
+			await __test__.processQueueEntry(makeIngestOp("post-merge"), tmp, storageWithWiki(true), false);
+
+			expect(phaseSeenDuringIngest).toBe("ingest");
+			expect(existsSync(phaseFile)).toBe(false);
+
+			rmSync(tmp, { recursive: true, force: true });
+		});
+
+		it("removes worker-phase even when ingest throws", async () => {
+			const tmp = mkdtempSync(join(tmpdir(), "jolli-phase-"));
+			mkdirSync(join(tmp, ".jolli", "jollimemory"), { recursive: true });
+			const phaseFile = join(tmp, ".jolli", "jollimemory", "worker-phase");
+
+			const { existsSync: realExistsSync } = await vi.importActual<typeof import("node:fs")>("node:fs");
+			vi.mocked(existsSync).mockImplementation(realExistsSync);
+
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			vi.mocked(drainIngest).mockRejectedValue(new Error("boom"));
+
+			await expect(
+				__test__.processQueueEntry(makeIngestOp("post-merge"), tmp, storageWithWiki(true), false),
+			).rejects.toThrow("boom");
+
+			expect(existsSync(phaseFile)).toBe(false);
+
+			rmSync(tmp, { recursive: true, force: true });
 		});
 
 		it("routes an ingest op to drainIngest and renderTopicKBWiki when API key is configured", async () => {

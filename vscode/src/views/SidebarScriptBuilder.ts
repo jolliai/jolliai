@@ -104,6 +104,10 @@ export function buildSidebarScript(): string {
     // toolbar. Not persisted — start from false on every load and let the next
     // worker:busy or status push correct it.
     workerBusy: false,
+    // Live phase of the running worker (currently only 'ingest'), pushed on the
+    // worker:phase channel. Selects "Updating Memory Bank..." over the default
+    // summary label. Not persisted -- host re-pushes on reload.
+    workerPhase: null,
     // Live sync-phase indicator pushed by the host as the sync engine
     // advances through phases (downloading / merging / uploading) or ends
     // in a sticky terminal failure. Shape: { label, severity } | null. Not
@@ -113,6 +117,7 @@ export function buildSidebarScript(): string {
   // workerBusy is intentionally reset on load (above), even if persisted state
   // had it set — the lock is process-bound and cannot survive a reload.
   state.workerBusy = false;
+  state.workerPhase = null;
   state.syncPhase = null;
   function persist() { vscode.setState(state); }
 
@@ -422,7 +427,9 @@ export function buildSidebarScript(): string {
       // about the working-tree branch.
       const items = [];
       const indicator = state.workerBusy
-        ? { label: 'AI summary in progress…', severity: 'info' }
+        ? (state.workerPhase === 'ingest'
+            ? { label: 'Updating Memory Bank…', severity: 'info' }
+            : { label: 'AI summary in progress…', severity: 'info' })
         : null;
       items.push(buildToolbarIndicator(indicator));
       items.push(iconButton('refresh', 'Refresh', 'refresh'));
@@ -694,6 +701,16 @@ export function buildSidebarScript(): string {
         if (state.activeTab === 'branch') {
           renderToolbar();
           renderBranch();
+        }
+        break;
+      }
+      case 'worker:phase': {
+        // Per-phase label for the post-commit Worker. Independent of
+        // worker:busy; only 'ingest' is surfaced today, anything else clears to
+        // the default summary label. Only the Branch tab reacts.
+        state.workerPhase = (msg.phase === 'ingest') ? 'ingest' : null;
+        if (state.activeTab === 'branch') {
+          renderToolbar();
         }
         break;
       }

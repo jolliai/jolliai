@@ -1530,6 +1530,16 @@ describe("SessionTracker", () => {
 			expect(entries).toEqual([]);
 		});
 
+		it("names queue files with a process-unique nonce segment (guards cross-process same-ms collisions)", async () => {
+			const { readdir } = await import("node:fs/promises");
+			await enqueueGitOperation(makeOp("aaa111ff"), tempDir);
+			const queueDir = join(tempDir, ".jolli", "jollimemory", "git-op-queue");
+			const [name] = await readdir(queueDir);
+			// {timestamp}-{8-digit seq}-{8-hex nonce}-{tag}.json — the nonce is what
+			// makes two processes enqueuing in the same ms with the same tag unique.
+			expect(name).toMatch(/^\d+-\d{8}-[0-9a-f]{8}-aaa111ff\.json$/);
+		});
+
 		it("should delete a queue entry by file path", async () => {
 			await enqueueGitOperation(makeOp("ccc333"), tempDir);
 			const entries = await dequeueAllGitOperations(tempDir);

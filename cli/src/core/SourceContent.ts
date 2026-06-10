@@ -6,7 +6,6 @@
  * which is passed the same read-side `storage` so it reads the folder view too.
  */
 
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createLogger } from "../Logger.js";
@@ -14,6 +13,7 @@ import { loadFolderPlanNoteContent, loadFolderPlanNoteHeadline } from "./FolderP
 import { FolderStorage } from "./FolderStorage.js";
 import { formatSummaryForCompile } from "./KnowledgeCompiler.js";
 import { listAllUserKnowledge } from "./MemoryBankScanner.js";
+import { MetadataManager } from "./MetadataManager.js";
 import { loadPlansRegistry } from "./SessionTracker.js";
 import { formatSourceHeadline } from "./SourceHeadline.js";
 import type { StorageProvider } from "./StorageProvider.js";
@@ -69,8 +69,17 @@ export async function loadSourceContent(
 				// fingerprint check → null → it resurfaces as a fresh pending source.
 				const content = await readTextOrNull(join(dirname(kbRoot), path));
 				if (content === null) return null;
-				const fp = createHash("sha256").update(content, "utf-8").digest("hex");
-				return fp === fingerprint ? content : null;
+				// Shared helper (NOT an inline createHash) so this verify hash can't
+				// drift from the one MemoryBankScanner stamped into the ref id.
+				const fp = MetadataManager.sha256(content);
+				if (fp !== fingerprint) {
+					// Not silent: surface the changed-since-scan case so a file that
+					// keeps re-ingesting is diagnosable. It resurfaces as a fresh
+					// pending source next batch under its new fingerprint.
+					log.warn("Userfile %s changed since scan (fingerprint mismatch) — skipped this batch", path);
+					return null;
+				}
+				return content;
 			}
 			// Orphan-only fallback: no kbRoot, so resolve via the cwd-based scan.
 			const files = await listAllUserKnowledge(cwd);

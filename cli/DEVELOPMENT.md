@@ -428,6 +428,31 @@ Api.registerCli(program, version)
 
 The `exports` field in `cli/package.json` is what enforces this: `@jolli.ai/cli` and `@jolli.ai/cli/api` are the only resolvable specifiers. Deep imports like `@jolli.ai/cli/dist/core/Foo.js` no longer resolve — plugins that relied on them must move to the public API.
 
+## Search Index & MCP Server
+
+Starting in JOLLI-1226, the CLI ships a local full-text search index plus an stdio MCP server that exposes JolliMemory's history to AI agents.
+
+### Local search index
+
+The index lives at `.jolli/jollimemory/search-index.json` (with a sidecar `search-index.manifest.json`) under the per-project `.jolli/jollimemory/` dir. It is a **disposable cache** — never written to the orphan branch — rebuilt from source (the topic KB + commit catalog) via [SearchIndex.ts](src/core/SearchIndex.ts) on top of an Orama BM25 index. The manifest records a schema version and a **staleness signature** (`computeSourceSignature` in [SearchIndexSource.ts](src/core/SearchIndexSource.ts)); `SearchIndex.open()` restores from disk only when both match the current source, otherwise it rebuilds and re-persists. Because source data (orphan branch / folder) is always authoritative, the index can be deleted at any time and is regenerated on next open.
+
+The index is also refreshed **incrementally at the end of `jolli compile`** (per-repo), so agents querying right after a compile see fresh results without a manual reindex.
+
+### `jolli mcp`
+
+`jolli mcp` ([McpCommand.ts](src/commands/McpCommand.ts)) starts an stdio MCP server ([McpServer.ts](src/mcp/McpServer.ts)) that AI agents connect to. `jolli mcp --reindex` forces a full rebuild of the local search index from source and exits (no server).
+
+The server exposes four tools, all pure handlers in [McpTools.ts](src/mcp/McpTools.ts):
+
+| Tool | Purpose |
+|------|---------|
+| `search` | Full-text search over the repo's historical decisions and implementations (topics + commits). |
+| `recall` | Recall a branch's development context from **RAW commit summaries** — the same data path as the `jolli-recall` skill, NOT the topic KB. Defaults to the current branch. |
+| `get_decision_timeline` | Chronological evolution of a topic — its source events ordered oldest-first. |
+| `list_branches` | All branches with JolliMemory records and their topic titles. |
+
+`McpServer.ts` is pure glue: tool schemas (`TOOL_DEFINITIONS`) plus a `dispatchTool` table over the `McpTools` handlers, adapted into SDK request handlers (`ListTools` / `CallTool`). Errors from a handler are returned as an `isError` tool response rather than crashing the server.
+
 ## Memory Bank Cloud Sync
 
 `cli/src/sync/` holds the engine that keeps the user's Memory Bank folder mirrored to a private Jolli vault. The engine is shipped in `dist/Cli.js` and inlined into the VS Code extension, but `@jolli.ai/cli` itself does **not** auto-trigger sync rounds today — the long-lived plugin process (currently VS Code only) is what drives the cadence. The CLI side exposes config (`syncEnabled`, `syncTranscripts`, `syncPollIntervalSec`) and the `configure --sync-enable / --sync-disable` shortcuts.

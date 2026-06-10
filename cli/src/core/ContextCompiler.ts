@@ -110,6 +110,20 @@ export interface RecallPayloadNote {
 }
 
 /**
+ * User-written Memory Bank file shipped in {@link RecallPayload}.
+ *
+ * `content` may be omitted when budget enforcement strips bodies (same
+ * discipline as plans/notes); `title` + `source` remain as a citation anchor.
+ */
+export interface RecallPayloadUserKnowledge {
+	readonly title: string;
+	/** Path relative to the Memory Bank parent (`localFolder`). */
+	readonly source: string;
+	readonly scope: "global" | "repo" | "branch";
+	readonly content?: string;
+}
+
+/**
  * Structured output of `jolli recall --format json`.
  *
  * Replaces the prior `ContextOutput` (which shipped a single pre-rendered
@@ -131,6 +145,13 @@ export interface RecallPayload {
 	readonly plans: ReadonlyArray<RecallPayloadPlan>;
 	/** Branch-scoped, deduplicated note bodies. Id is the canonical key. */
 	readonly notes: ReadonlyArray<RecallPayloadNote>;
+	/**
+	 * User-written Memory Bank files surfaced for this branch (spec 108
+	 * Correction 1). Present in the structured payload so the MCP `recall`
+	 * tool / `--format json` consumer sees the same knowledge the `--full`
+	 * markdown renderer shows. Omitted when there is no user knowledge.
+	 */
+	readonly userKnowledge?: ReadonlyArray<RecallPayloadUserKnowledge>;
 	readonly stats: ContextStats;
 	readonly estimatedTokens: number;
 	/** Set when budget enforcement removed at least one field (or commit). */
@@ -613,7 +634,8 @@ function deriveUserKnowledgeTitle(path: string, content: string): string {
  *   2. drop `topic.trigger`
  *   3. drop `plans[].content` (keep slug + title as a citation anchor)
  *   4. drop `notes[].content`
- *   5. drop the entire oldest commit from `commits[]` (with its decisions)
+ *   5. drop `userKnowledge[].content` (keep title + source as an anchor)
+ *   6. drop the entire oldest commit from `commits[]` (with its decisions)
  *
  * Type contract: every {@link SearchHit} that survives in `commits[]` carries
  * `decisions` on every topic and full identity fields. When the budget is so
@@ -626,6 +648,12 @@ export function buildRecallPayload(ctx: CompiledContext, tokenBudget?: number): 
 
 	let plans: RecallPayloadPlan[] = ctx.plans.map((p) => ({ slug: p.slug, title: p.title, content: p.content }));
 	let notes: RecallPayloadNote[] = ctx.notes.map((n) => ({ id: n.id, title: n.title, content: n.content }));
+	let userKnowledge: RecallPayloadUserKnowledge[] = (ctx.userKnowledgeTopics ?? []).map((u) => ({
+		title: u.title,
+		source: u.source,
+		scope: u.scope,
+		content: u.content,
+	}));
 
 	// Resolved-key sets — a stub on a commit is considered "live" only if its
 	// slug/id has a matching entry at the payload top level. This guards the
@@ -709,7 +737,7 @@ export function buildRecallPayload(ctx: CompiledContext, tokenBudget?: number): 
 		stats: ctx.stats,
 	};
 
-	const measure = (): number => estimateTokens(JSON.stringify({ ...envelope, commits, plans, notes }));
+	const measure = (): number => estimateTokens(JSON.stringify({ ...envelope, commits, plans, notes, userKnowledge }));
 
 	// Step 1: drop topic.response from oldest commits.
 	// Skip when pre-pass 2 already stripped response from every commit —
@@ -755,7 +783,19 @@ export function buildRecallPayload(ctx: CompiledContext, tokenBudget?: number): 
 		});
 	}
 
-	// Step 5: drop the oldest commit wholesale (with its decisions) until we fit.
+	// Step 5: drop userKnowledge[].content (title + source remain as citation
+	// anchors). User knowledge competes with summaries for budget but its body
+	// is dropped before whole commits, so a large user-written file can never
+	// evict commit decisions — the regression this guards against.
+	if (measure() > budget && userKnowledge.some((u) => u.content !== undefined)) {
+		userKnowledge = userKnowledge.map((u) => {
+			if (u.content === undefined) return u;
+			truncated = true;
+			return { title: u.title, source: u.source, scope: u.scope };
+		});
+	}
+
+	// Step 6: drop the oldest commit wholesale (with its decisions) until we fit.
 	// Always keep at least one commit — otherwise `commits=[]` would
 	// ambiguously mean "no records found" OR "budget evicted everything",
 	// forcing the skill template to teach the LLM a 3-way state machine
@@ -780,6 +820,7 @@ export function buildRecallPayload(ctx: CompiledContext, tokenBudget?: number): 
 		commits,
 		plans,
 		notes,
+		...(userKnowledge.length > 0 && { userKnowledge }),
 		stats: ctx.stats,
 		estimatedTokens,
 		...(truncated && { truncated: true }),
@@ -817,9 +858,10 @@ function filterStubs(hit: SearchHit, resolvedPlanSlugs: Set<string>, resolvedNot
 /**
  * Renders a compiled context into Markdown, applying token budget truncation.
  *
- * Priority (high to low): decisions → plans → summaries → transcripts.
- * When over budget: drop transcripts → fold older topics → truncate plans.
- * Decisions are never truncated.
+ * Only `decisions` are never truncated. Everything else — user knowledge,
+ * plans, notes, summaries — shares the remaining budget and is truncated to
+ * fit, so no single oversized section (e.g. a large user-written Memory Bank
+ * file) can evict the others.
  */
 export function renderContextMarkdown(ctx: CompiledContext, tokenBudget?: number): string {
 	const budget = tokenBudget ?? DEFAULT_TOKEN_BUDGET;
@@ -850,18 +892,22 @@ export function renderContextMarkdown(ctx: CompiledContext, tokenBudget?: number
 		lines.push("");
 	}
 
-	// User Memory Bank knowledge (spec 108 Correction 1)
+	// User Memory Bank knowledge (spec 108 Correction 1).
+	// Rendered into its own section (NOT the never-truncated decisions bucket)
+	// so a large user-written file is bounded by its own budget share below and
+	// can't evict plans/notes/summaries — the regression this guards against.
+	const userKnowledgeSection: string[] = [];
 	if (ctx.userKnowledgeTopics && ctx.userKnowledgeTopics.length > 0) {
-		lines.push("## Memory Bank Knowledge");
-		lines.push("");
+		userKnowledgeSection.push("## Memory Bank Knowledge");
+		userKnowledgeSection.push("");
 		for (const it of ctx.userKnowledgeTopics) {
-			lines.push(`### ${it.title} [${it.scope}: ${it.source}]`);
-			lines.push("");
-			lines.push(it.content);
-			lines.push("");
+			userKnowledgeSection.push(`### ${it.title} [${it.scope}: ${it.source}]`);
+			userKnowledgeSection.push("");
+			userKnowledgeSection.push(it.content);
+			userKnowledgeSection.push("");
 		}
-		lines.push("---");
-		lines.push("");
+		userKnowledgeSection.push("---");
+		userKnowledgeSection.push("");
 	}
 
 	// Plans section
@@ -905,8 +951,9 @@ export function renderContextMarkdown(ctx: CompiledContext, tokenBudget?: number
 		summarySection.push("");
 	}
 
-	// Apply budget: decisions + plans + notes + summaries
+	// Apply budget: decisions (never truncated) + userKnowledge + plans + notes + summaries
 	const decisionsText = lines.join("\n");
+	const userKnowledgeText = userKnowledgeSection.join("\n");
 	const plansText = planSection.join("\n");
 	const notesText = noteSection.join("\n");
 	const summariesText = summarySection.join("\n");
@@ -914,16 +961,31 @@ export function renderContextMarkdown(ctx: CompiledContext, tokenBudget?: number
 	const currentTokens = estimateTokens(decisionsText);
 	const remaining = budget - currentTokens;
 
-	// When decisions alone exceed the budget, drop plans, notes, and summaries entirely
+	// When decisions alone exceed the budget, drop everything else entirely
 	if (remaining <= 0) {
 		const footer = `\n*Generated by Jolli Memory · ${ctx.commitCount} commits · ~${currentTokens} tokens (decisions exceeded budget)*`;
 		return decisionsText + footer;
 	}
 
-	// Budget allocation: plans+notes share 25%, summaries get the rest
+	// Budget allocation across the truncatable region (everything but decisions):
+	//   plans+notes share 25% of `remaining`; the rest ("body") is split between
+	//   user knowledge and commit summaries. User knowledge is CAPPED at half the
+	//   body so a large user-written file can't evict summaries — but it only ever
+	//   consumes what it actually needs, so a small file leaves the unused share to
+	//   summaries instead of stranding it. Empty/small buckets return their share.
 	const hasPlansOrNotes = ctx.plans.length > 0 || ctx.notes.length > 0;
 	const plansNotesBudget = hasPlansOrNotes ? Math.floor(remaining * 0.25) : 0;
-	const summaryBudget = remaining - plansNotesBudget;
+	const bodyBudget = remaining - plansNotesBudget;
+	const hasUserKnowledge = userKnowledgeText.length > 0;
+	const userKnowledgeCap = hasUserKnowledge ? Math.floor(bodyBudget * 0.5) : 0;
+	const userKnowledgeTokens = estimateTokens(userKnowledgeText);
+	const userKnowledgeBudget = Math.min(userKnowledgeTokens, userKnowledgeCap);
+	const summaryBudget = bodyBudget - userKnowledgeBudget;
+
+	let finalUserKnowledge = userKnowledgeText;
+	if (userKnowledgeTokens > userKnowledgeBudget) {
+		finalUserKnowledge = truncateToTokenBudget(userKnowledgeText, userKnowledgeBudget);
+	}
 
 	let finalPlans = plansText;
 	let finalNotes = notesText;
@@ -940,7 +1002,7 @@ export function renderContextMarkdown(ctx: CompiledContext, tokenBudget?: number
 		finalSummaries = truncateToTokenBudget(summariesText, summaryBudget);
 	}
 
-	const allContent = decisionsText + finalPlans + finalNotes + finalSummaries;
+	const allContent = decisionsText + finalUserKnowledge + finalPlans + finalNotes + finalSummaries;
 	const footer = `\n*Generated by Jolli Memory · ${ctx.commitCount} commits · ~${estimateTokens(allContent)} tokens*`;
 
 	return allContent + footer;

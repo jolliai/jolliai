@@ -23,7 +23,7 @@ vi.mock("./KBPathResolver.js", () => ({
 }));
 
 import { extractRepoName, getRemoteUrl, resolveKBPath } from "./KBPathResolver.js";
-import { listAllUserKnowledgeFromRoot, listUserKnowledge } from "./MemoryBankScanner.js";
+import { listAllUserKnowledge, listAllUserKnowledgeFromRoot, listUserKnowledge } from "./MemoryBankScanner.js";
 import { loadConfig } from "./SessionTracker.js";
 
 const mockLoadConfig = vi.mocked(loadConfig);
@@ -311,6 +311,23 @@ describe("MemoryBankScanner.listUserKnowledge", () => {
 
 	it("listAllUserKnowledgeFromRoot returns [] when kbRoot does not exist", async () => {
 		expect(await listAllUserKnowledgeFromRoot(join(localFolderRoot, "nope"))).toEqual([]);
+	});
+
+	it("listAllUserKnowledge resolves the kbRoot from cwd and scans every branch folder", async () => {
+		// cwd-resolving wrapper: the beforeEach mocks already point the resolver at
+		// kbRoot, so this exercises the resolve → scan handoff end to end.
+		await writeManifest([]);
+		await mkdir(join(kbRoot, "untracked-branch"));
+		await writeFile(join(kbRoot, "Repo.md"), "r", "utf-8");
+		await writeFile(join(kbRoot, "untracked-branch", "scratch.md"), "b", "utf-8");
+
+		const result = await listAllUserKnowledge(cwd);
+		expect(result.map((f) => f.path).sort()).toEqual(["jolliai/Repo.md", "jolliai/untracked-branch/scratch.md"]);
+	});
+
+	it("listAllUserKnowledge returns [] when the Memory Bank root cannot be resolved", async () => {
+		mockLoadConfig.mockRejectedValue(new Error("config gone"));
+		expect(await listAllUserKnowledge(cwd)).toEqual([]);
 	});
 
 	it("returns global + repo + branch in one pass without duplication", async () => {

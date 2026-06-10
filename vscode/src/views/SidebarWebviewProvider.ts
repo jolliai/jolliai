@@ -57,6 +57,13 @@ export interface SidebarWebviewDeps {
 			readonly label: string;
 			readonly severity: "info" | "error";
 		} | null;
+		/**
+		 * Returns the current post-commit worker phase from StatusStore. Pushed
+		 * to the webview as `worker:phase` so the Branch tab toolbar can show
+		 * "Updating Memory Bank…" during a topic-KB ingest. Optional so existing
+		 * tests that only stub `getWorkerBusy` keep compiling.
+		 */
+		getWorkerPhase?: () => "ingest" | null;
 	};
 	kbFolders?: {
 		listChildren(relPath: string): Promise<FolderNode>;
@@ -889,6 +896,15 @@ export class SidebarWebviewProvider
 			this.postMessage({
 				type: "sync:phase",
 				phase: getSyncPhase(),
+			});
+		}
+		// Worker-phase indicator (ingest). Same StatusStore change event as
+		// worker:busy; optional getter so existing stubs keep compiling.
+		const getWorkerPhase = this.deps.statusProvider.getWorkerPhase;
+		if (getWorkerPhase) {
+			this.postMessage({
+				type: "worker:phase",
+				phase: getWorkerPhase(),
 			});
 		}
 	}

@@ -8,6 +8,7 @@ import {
 	PROXY_FETCH_TIMEOUT_MS,
 	resolveLlmCredentialSource,
 	STREAM_IDLE_TIMEOUT_MS,
+	STREAM_MAX_WALL_CLOCK_MS,
 } from "./LlmClient.js";
 
 const { mockCreate, mockStream, mockLogInfo, mockLogWarn, mockLogError } = vi.hoisted(() => ({
@@ -359,6 +360,22 @@ describe("LlmClient", () => {
 			expect(mockStream).not.toHaveBeenCalled();
 		});
 
+		it("uses streaming when forceStreaming is set, even below the token threshold", async () => {
+			// The ingest route call sets forceStreaming explicitly instead of padding
+			// maxTokens above the threshold to coerce the streaming path.
+			await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				model: "claude-sonnet-4-6",
+				maxTokens: 8192,
+				forceStreaming: true,
+			});
+
+			expect(mockStream).toHaveBeenCalledTimes(1);
+			expect(mockCreate).not.toHaveBeenCalled();
+		});
+
 		it("aborts a streaming call when no stream events arrive within the idle window", async () => {
 			vi.useFakeTimers();
 			try {
@@ -390,6 +407,49 @@ describe("LlmClient", () => {
 				await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS + 10);
 
 				expect(abort).toHaveBeenCalledTimes(1);
+				const err = await settled;
+				expect(String(err)).toContain("aborted");
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("aborts a streaming call at the wall-clock cap even while stream events keep arriving", async () => {
+			vi.useFakeTimers();
+			try {
+				let rejectFinal: (err: Error) => void = () => {};
+				const finalMessage = vi.fn(
+					() =>
+						new Promise((_resolve, reject) => {
+							rejectFinal = reject;
+						}),
+				);
+				const abort = vi.fn(() => rejectFinal(new Error("Request was aborted.")));
+				let onStreamEvent: (() => void) | undefined;
+				const on = vi.fn((event: string, cb: () => void) => {
+					if (event === "streamEvent") onStreamEvent = cb;
+				});
+				mockStream.mockReturnValue({ finalMessage, on, abort });
+
+				const promise = callLlm({
+					action: "reconcile",
+					params: { topicTitle: "Auth", currentPage: "", sources: "src" },
+					apiKey: "sk-ant-test",
+					model: "claude-sonnet-4-6",
+					maxTokens: 64_000,
+				});
+				const settled = promise.catch((e: unknown) => e);
+
+				// A stream that pings forever keeps resetting the idle watchdog. Each
+				// step is below the idle window so the idle watchdog never fires; the
+				// independent wall-clock cap must still abort once it elapses.
+				const step = STREAM_IDLE_TIMEOUT_MS - 20_000;
+				for (let elapsed = 0; elapsed <= STREAM_MAX_WALL_CLOCK_MS; elapsed += step) {
+					await vi.advanceTimersByTimeAsync(step);
+					onStreamEvent?.();
+				}
+
+				expect(abort).toHaveBeenCalled();
 				const err = await settled;
 				expect(String(err)).toContain("aborted");
 			} finally {

@@ -94,7 +94,9 @@ export async function assertNoSymlinksInPath(vaultRoot: string, absTargetPath: s
 	let cur = vaultRoot;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const seg = segments[i];
+		/* v8 ignore start -- defensive: `relative()` normalises away empty/duplicate segments, so an empty `seg` is unreachable here; the guard stays in case a future caller bypasses normalisation */
 		if (seg === undefined || seg.length === 0) continue;
+		/* v8 ignore stop */
 		cur = `${cur}${sep}${seg}`;
 		let stat: Awaited<ReturnType<typeof lstat>>;
 		try {
@@ -153,7 +155,9 @@ export function assertNoSymlinksInPathSync(vaultRoot: string, absTargetPath: str
 	let cur = vaultRoot;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const seg = segments[i];
+		/* v8 ignore start -- defensive: `relative()` normalises away empty/duplicate segments, so an empty `seg` is unreachable here; the guard stays in case a future caller bypasses normalisation */
 		if (seg === undefined || seg.length === 0) continue;
+		/* v8 ignore stop */
 		cur = `${cur}${sep}${seg}`;
 		let stat: ReturnType<typeof lstatSync>;
 		try {

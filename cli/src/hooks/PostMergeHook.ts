@@ -8,8 +8,11 @@
  * under the same lock as commit summaries.
  *
  * SP3 — collapses N per-branch compile enqueues to ONE repo-wide ingest op.
- * A single `git pull` with N merge commits enqueues a single ingest operation;
- * IngestTrigger's cooldown dedupes rapid pull clusters to one drain.
+ * A single `git pull` with N merge commits enqueues a single ingest operation.
+ * The enqueue is `force`d past IngestTrigger's per-cwd cooldown: a merge brings
+ * in genuinely new content (commits authored elsewhere), so it must not be
+ * suppressed by a cooldown a local commit just set. The repo-wide ingest op is
+ * idempotent, so the occasional duplicate drain is benign.
  */
 
 import { execGit } from "../core/GitOps.js";
@@ -114,10 +117,12 @@ export async function handlePostMerge(cwd: string): Promise<void> {
 	}
 
 	// SP3: collapse N per-branch compile enqueues to ONE repo-wide ingest op.
-	// IngestTrigger's per-cwd cooldown dedupes rapid pull clusters to one drain.
-	const enqueued = await enqueueIngestOperation(cwd, "post-merge");
+	// `force` past the cooldown — a merge brings in new commits that a recent
+	// local-commit cooldown must not suppress (the merged content would stay
+	// un-ingested until the window expired and some later trigger fired).
+	const enqueued = await enqueueIngestOperation(cwd, "post-merge", { force: true });
 	if (!enqueued) {
-		log.info("Ingest enqueue refused (within cooldown or failed) — worker not started");
+		log.info("Ingest enqueue failed — worker not started");
 		return;
 	}
 

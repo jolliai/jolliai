@@ -33,6 +33,7 @@ export type StatusChangeReason =
 	| "refresh"
 	| "setStatus"
 	| "workerBusy"
+	| "workerPhase"
 	| "syncPhase"
 	| "extensionOutdated"
 	| "migrating";
@@ -59,6 +60,7 @@ export interface StatusSnapshot extends Snapshot<StatusChangeReason> {
 	readonly config: JolliMemoryConfig | null;
 	readonly derived: StatusDerived;
 	readonly workerBusy: boolean;
+	readonly workerPhase: "ingest" | null;
 	readonly syncPhase: SyncPhaseState | null;
 	readonly extensionOutdated: boolean;
 	readonly migrating: boolean;
@@ -76,6 +78,7 @@ const EMPTY: StatusSnapshot = {
 	config: null,
 	derived: INITIAL_DERIVED,
 	workerBusy: false,
+	workerPhase: null,
 	syncPhase: null,
 	extensionOutdated: false,
 	migrating: false,
@@ -87,6 +90,7 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 	private status: StatusInfo | null = null;
 	private config: JolliMemoryConfig | null = null;
 	private workerBusy = false;
+	private workerPhase: "ingest" | null = null;
 	private syncPhase: SyncPhaseState | null = null;
 	private extensionOutdated = false;
 	private migrating = false;
@@ -122,11 +126,35 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 	}
 
 	setWorkerBusy(busy: boolean): void {
-		if (this.workerBusy === busy) {
+		// Phase lifetime is bound to the lock: whenever the worker is not busy the
+		// phase marker is meaningless, so a (possibly stale, crash-left) phase must
+		// be cleared even when `workerBusy` is already false. Otherwise the equality
+		// early-return below would skip the clear, and a stale 'ingest' marker read
+		// at activation — before `isWorkerBusy()` resolves false — would survive into
+		// the next genuine summary run and mislabel it "Updating Memory Bank…".
+		const staleClear = !busy && this.workerPhase !== null;
+		if (this.workerBusy === busy && !staleClear) {
 			return;
 		}
 		this.workerBusy = busy;
+		if (!busy) {
+			this.workerPhase = null;
+		}
 		this.rebuildSnapshot("workerBusy");
+	}
+
+	/**
+	 * Push (or clear) the post-commit worker's phase. Only `"ingest"` is
+	 * surfaced today; any other phase is represented as `null` (default
+	 * "AI summary in progress…" label). Equality-checked so a redundant call
+	 * is a no-op.
+	 */
+	setWorkerPhase(phase: "ingest" | null): void {
+		if (this.workerPhase === phase) {
+			return;
+		}
+		this.workerPhase = phase;
+		this.rebuildSnapshot("workerPhase");
 	}
 
 	/**
@@ -164,6 +192,7 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 			config: this.config,
 			derived: StatusDataService.derive(this.status, this.config),
 			workerBusy: this.workerBusy,
+			workerPhase: this.workerPhase,
 			syncPhase: this.syncPhase,
 			extensionOutdated: this.extensionOutdated,
 			migrating: this.migrating,

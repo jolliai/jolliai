@@ -91,6 +91,22 @@ describe("canonicaliseLocalFolder", () => {
 		expect(out).not.toMatch(/[/\\]{2,}/);
 	});
 
+	it("expands a bare `~` to the home directory (step 1)", () => {
+		const { homedir } = require("node:os");
+		// `~` alone → exactly the home dir (after the realpath/case-fold steps,
+		// which are idempotent for an existing dir like $HOME).
+		const out = canonicaliseLocalFolder("~");
+		const expected = canonicaliseLocalFolder(homedir());
+		expect(out).toBe(expected);
+	});
+
+	it("expands a leading `~/` prefix to the home directory (step 1)", () => {
+		const { homedir } = require("node:os");
+		const out = canonicaliseLocalFolder("~/some-vault-dir");
+		const expected = canonicaliseLocalFolder(join(homedir(), "some-vault-dir"));
+		expect(out).toBe(expected);
+	});
+
 	it("__vaultLockCanonicalForTesting is a thin re-export of canonicaliseLocalFolder (test seam stability)", () => {
 		// If someone refactors and breaks the test-seam alias, dependent
 		// tests would silently start using stale logic. Pin the alias.

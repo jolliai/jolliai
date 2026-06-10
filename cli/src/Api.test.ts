@@ -167,6 +167,7 @@ vi.mock("./core/SummaryStore.js", () => ({
 	getIndex: vi.fn().mockResolvedValue(null),
 	// Used by compile command to register the configured storage
 	setActiveStorage: vi.fn(),
+	getActiveStorage: vi.fn(() => null),
 }));
 
 vi.mock("./core/SummaryMigration.js", () => ({

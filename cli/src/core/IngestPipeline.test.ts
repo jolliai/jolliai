@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("./LlmClient.js", () => ({ callLlm: vi.fn(), STREAMING_THRESHOLD_TOKENS: 16_384 }));
+vi.mock("./LlmClient.js", () => ({ callLlm: vi.fn() }));
 vi.mock("./SourceTimeline.js", async (orig) => ({
 	...(await orig<typeof import("./SourceTimeline.js")>()),
 	listPendingSources: vi.fn(),
@@ -23,7 +23,7 @@ vi.mock("./IngestRunStore.js", () => ({ appendIngestRun: vi.fn() }));
 
 import { drainIngest, ingestPendingBatch } from "./IngestPipeline.js";
 import { appendIngestRun } from "./IngestRunStore.js";
-import { callLlm, STREAMING_THRESHOLD_TOKENS } from "./LlmClient.js";
+import { callLlm } from "./LlmClient.js";
 import { emptyProcessedSet, readProcessedSet, saveProcessedSet } from "./ProcessedSourceStore.js";
 import { loadSourceContent } from "./SourceContent.js";
 import { listPendingSources } from "./SourceTimeline.js";
@@ -75,16 +75,16 @@ describe("ingestPendingBatch", () => {
 		expect(vi.mocked(callLlm)).not.toHaveBeenCalled();
 	});
 
-	it("issues the route call with maxTokens above the streaming threshold (forces the streaming path)", async () => {
-		// The route call must take LlmClient's streaming path; if its maxTokens
-		// ever drifted to <= the threshold it would silently fall onto the 180s
-		// direct-call timeout. This pins the invariant against either constant moving.
+	it("issues the route call with forceStreaming so it takes LlmClient's streaming path", async () => {
+		// The route call can run long; it must take the streaming path (no fixed
+		// 180s direct-call cap) via an explicit flag, not by padding maxTokens
+		// above a threshold that could later be retuned out from under it.
 		vi.mocked(listPendingSources).mockResolvedValue([s("c0", "2026-01-01T00:00:00Z")]);
 		vi.mocked(callLlm).mockResolvedValueOnce(llmText("route", JSON.stringify({ updates: [], newTopics: [] })));
 		await ingestPendingBatch("/tmp/x", cfg);
 		const routeCall = vi.mocked(callLlm).mock.calls[0]?.[0];
 		expect(routeCall?.action).toBe("route");
-		expect(routeCall?.maxTokens).toBeGreaterThan(STREAMING_THRESHOLD_TOKENS);
+		expect(routeCall?.forceStreaming).toBe(true);
 	});
 
 	it("feeds reconcile source bodies in chronological order (old -> new)", async () => {

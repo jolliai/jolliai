@@ -13,7 +13,13 @@ import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/p
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { GitClient, injectGithubAppUsername, isNetworkErrorMessage, isRepoMissingMessage } from "./GitClient.js";
+import {
+	GitClient,
+	injectGithubAppUsername,
+	isNetworkErrorMessage,
+	isRepoMissingMessage,
+	isServerRejectionMessage,
+} from "./GitClient.js";
 import type { GitCredentials } from "./SyncTypes.js";
 
 // Isolate every `git` subprocess in this file from the developer's ~/.gitconfig
@@ -122,6 +128,16 @@ describe("GitClient", () => {
 			});
 			const r = await c.checkGitInstalled();
 			expect(r.ok).toBe(false);
+		});
+
+		it("falls back to the default askpass / maxBuffer when only the required opts are given", async () => {
+			// Covers the constructor's `?? prepareAskpass` and `?? MAX_BUFFER`
+			// default sides. `git --version` runs directly via execFileImpl and
+			// never enters `run()`, so the real `prepareAskpass` default is wired
+			// up but never invoked — no askpass artifacts are written to disk.
+			const c = new GitClient({ memoryBankRoot: rootTempDir, credentials: FAKE_CREDS });
+			const r = await c.checkGitInstalled();
+			expect(r.ok).toBe(true);
 		});
 	});
 
@@ -1662,6 +1678,304 @@ describe("GitClient", () => {
 			expect(remoteMain).toBe(sideSha);
 		});
 	});
+
+	describe("removePath (Tier 2.7 propagate-delete)", () => {
+		it("stages a deletion of a tracked file via `git rm -f`", async () => {
+			// ConflictResolver calls this to propagate a delete rather than
+			// undelete by accepting the modified side. `-f` is required because
+			// the path may be in a conflicted (stage-:3 present) state.
+			const c = makeClient();
+			await c.clone(bareRepoUrl);
+			// README.md was seeded in beforeAll, so it is HEAD-tracked.
+			await c.removePath("README.md");
+			// `git rm` stages the deletion AND removes the working-tree copy.
+			const staged = gitSync(["status", "--porcelain"], memoryBankRoot);
+			expect(staged).toMatch(/^D\s+README\.md/m);
+			await expect(stat(join(memoryBankRoot, "README.md"))).rejects.toThrow();
+		});
+	});
+
+	describe("hasUncommittedChanges — includeIgnored widens the check (§0.13)", () => {
+		it("surfaces ignored working-tree files only when includeIgnored is set", async () => {
+			// The deny-all `.gitignore` template (`*` + `!.gitignore`) makes every
+			// FolderStorage-written file ignored by default. A plain `--porcelain`
+			// check cannot see them, but the auto-reconcile path needs them flagged
+			// before deciding whether a `git checkout` is safe.
+			const c = makeClient();
+			await c.clone(bareRepoUrl);
+			// Commit a deny-all .gitignore so the next file is ignored-by-default.
+			await writeFile(join(memoryBankRoot, ".gitignore"), "*\n!.gitignore\n");
+			await c.addPath(".gitignore");
+			await c.commit("[jolli-mb] add gitignore", { name: "T", email: "t@x" });
+			// This file matches `*` → ignored. The tree is otherwise clean.
+			await writeFile(join(memoryBankRoot, "owned-summary.md"), "summary\n");
+
+			// Plain check is blind to the ignored file.
+			expect(await c.hasUncommittedChanges()).toBe(false);
+			// Opt-in widens to `--ignored=matching` and surfaces it.
+			expect(await c.hasUncommittedChanges({ includeIgnored: true })).toBe(true);
+		});
+	});
+
+	describe("explicit-path staging methods + chunkByBudget batching", () => {
+		it("stageAddPaths force-adds an ignored path (overrides the deny-all template)", async () => {
+			// `-f` is required: the post-allowlist `.gitignore` denies everything
+			// by default, so without it `git add` reports "paths are ignored".
+			const c = makeClient();
+			await c.clone(bareRepoUrl);
+			await writeFile(join(memoryBankRoot, ".gitignore"), "*\n!.gitignore\n");
+			await c.addPath(".gitignore");
+			await c.commit("[jolli-mb] add gitignore", { name: "T", email: "t@x" });
+			await writeFile(join(memoryBankRoot, "a.md"), "a\n");
+			await writeFile(join(memoryBankRoot, "b.md"), "b\n");
+
+			await c.stageAddPaths(["a.md", "b.md"]);
+			const staged = gitSync(["diff", "--name-only", "--cached"], memoryBankRoot).split("\n");
+			expect(staged).toContain("a.md");
+			expect(staged).toContain("b.md");
+		});
+
+		it("stageAddPaths splits into multiple batches when the joined path length exceeds ARG_BUDGET_CHARS", async () => {
+			// chunkByBudget yields more than one batch once the running argv length
+			// crosses 16 KB. Capture the exec calls and assert the path list was
+			// flushed across >1 `git add` invocation rather than one oversized one.
+			const addCalls: ReadonlyArray<string>[] = [];
+			const fakeExec = async (_cmd: string, args: ReadonlyArray<string>) => {
+				if (args.includes("add")) addCalls.push(args);
+				return { stdout: "", stderr: "" };
+			};
+			const c = new GitClient({
+				memoryBankRoot,
+				credentials: FAKE_CREDS,
+				askpass: NOOP_ASKPASS,
+				execFileImpl: fakeExec as never,
+			});
+			// 200 paths of ~200 chars each ≈ 40 KB total → at least 3 batches at 16 KB.
+			const longPaths = Array.from({ length: 200 }, (_, i) => `dir/${"x".repeat(190)}/${i}.json`);
+			await c.stageAddPaths(longPaths);
+			expect(addCalls.length).toBeGreaterThan(1);
+			// Every input path landed in exactly one batch (none dropped).
+			const flushed = addCalls.flatMap((args) => args.slice(args.indexOf("--") + 1));
+			expect(flushed.length).toBe(longPaths.length);
+		});
+
+		it("chunkByBudget ships a single over-budget path as its own batch (no silent drop)", async () => {
+			// A lone path longer than the whole budget still gets emitted — the OS
+			// rejects it with a clearer error than us dropping the entry. Verify the
+			// path reaches a `git add` invocation.
+			const addCalls: ReadonlyArray<string>[] = [];
+			const fakeExec = async (_cmd: string, args: ReadonlyArray<string>) => {
+				if (args.includes("add")) addCalls.push(args);
+				return { stdout: "", stderr: "" };
+			};
+			const c = new GitClient({
+				memoryBankRoot,
+				credentials: FAKE_CREDS,
+				askpass: NOOP_ASKPASS,
+				execFileImpl: fakeExec as never,
+			});
+			const oversized = "z".repeat(20_000);
+			await c.stageAddPaths([oversized]);
+			expect(addCalls.length).toBe(1);
+			expect(addCalls[0]?.includes(oversized)).toBe(true);
+		});
+
+		it("stageAddPaths is a no-op on an empty list (chunkByBudget yields nothing)", async () => {
+			// Empty input must not spawn `git add` at all — the final
+			// `if (batch.length > 0)` guard in chunkByBudget skips the trailing yield.
+			const addCalls: ReadonlyArray<string>[] = [];
+			const fakeExec = async (_cmd: string, args: ReadonlyArray<string>) => {
+				if (args.includes("add")) addCalls.push(args);
+				return { stdout: "", stderr: "" };
+			};
+			const c = new GitClient({
+				memoryBankRoot,
+				credentials: FAKE_CREDS,
+				askpass: NOOP_ASKPASS,
+				execFileImpl: fakeExec as never,
+			});
+			await c.stageAddPaths([]);
+			expect(addCalls.length).toBe(0);
+		});
+
+		it("stageRemovePaths removes index entries tolerantly (`--ignore-unmatch`)", async () => {
+			// Tolerant rm: a path already gone from the index (race between status
+			// snapshot and the rm) must not error.
+			const c = makeClient();
+			await c.clone(bareRepoUrl);
+			await writeFile(join(memoryBankRoot, "doomed.md"), "x\n");
+			await c.addPath("doomed.md");
+			await c.commit("[jolli-mb] add doomed", { name: "T", email: "t@x" });
+
+			// Mix a tracked path with one that was never in the index — both tolerated.
+			await c.stageRemovePaths(["doomed.md", "never-existed.md"]);
+			const staged = gitSync(["status", "--porcelain"], memoryBankRoot);
+			expect(staged).toMatch(/^D\s+doomed\.md/m);
+		});
+
+		it("unstagePaths drops a staged-only add via `git rm --cached` (no HEAD blob → safe)", async () => {
+			// For a path with NO HEAD blob this simply drops the index entry; the
+			// working-tree file survives and no peer-visible deletion is staged.
+			const c = makeClient();
+			await c.clone(bareRepoUrl);
+			await writeFile(join(memoryBankRoot, "staged-only.md"), "draft\n");
+			await c.addPath("staged-only.md");
+			// Currently `A` (staged add). unstagePaths drops it from the index.
+			await c.unstagePaths(["staged-only.md"]);
+			const staged = gitSync(["status", "--porcelain"], memoryBankRoot);
+			// Back to untracked (`??`), not a staged deletion — and still on disk.
+			expect(staged).toMatch(/^\?\?\s+staged-only\.md/m);
+			expect((await readFile(join(memoryBankRoot, "staged-only.md"), "utf-8")).trim()).toBe("draft");
+		});
+
+		it("resetPathsToHead restores a HEAD-tracked path's index entry without staging a deletion", async () => {
+			// Unlike `git rm --cached`, `git reset HEAD --` is non-destructive:
+			// for a HEAD-tracked file it restores the original blob (no diff to
+			// commit) rather than staging a deletion that peers would pull.
+			const c = makeClient();
+			await c.clone(bareRepoUrl);
+			// README.md is HEAD-tracked. Stage a modification to it.
+			await writeFile(join(memoryBankRoot, "README.md"), "locally edited\n");
+			await c.addPath("README.md");
+			expect(gitSync(["diff", "--name-only", "--cached"], memoryBankRoot)).toContain("README.md");
+
+			await c.resetPathsToHead(["README.md"]);
+			// Index entry restored to HEAD blob → nothing staged. The working-tree
+			// edit survives (reset does not touch the working copy).
+			expect(gitSync(["diff", "--name-only", "--cached"], memoryBankRoot)).toBe("");
+			expect((await readFile(join(memoryBankRoot, "README.md"), "utf-8")).trim()).toBe("locally edited");
+		});
+	});
+
+	describe("listLocalBranches — non-zero exit returns []", () => {
+		it("returns [] when the for-each-ref invocation itself fails", async () => {
+			// A corrupted refs store makes `git for-each-ref` exit non-zero. The
+			// bootstrap-merge guard treats that as "no local branches" so a failed
+			// probe never falsely unlocks the destructive fresh-local path... but
+			// here the safe default is simply [].
+			const fakeExec = async () => {
+				const err = new Error("for-each-ref failed") as Error & {
+					stdout?: string;
+					stderr?: string;
+					code?: number;
+				};
+				err.stdout = "";
+				err.stderr = "fatal: refs store corrupt";
+				err.code = 128;
+				throw err;
+			};
+			const c = new GitClient({
+				memoryBankRoot,
+				credentials: FAKE_CREDS,
+				askpass: NOOP_ASKPASS,
+				execFileImpl: fakeExec as never,
+			});
+			expect(await c.listLocalBranches()).toEqual([]);
+		});
+	});
+
+	describe("defensive branch coverage (rare/impossible-with-real-git paths)", () => {
+		it("isRebaseInProgress ignores a non-directory `.git/rebase-merge` entry", async () => {
+			// The state dirs are normally directories; if a stray FILE sits at
+			// `.git/rebase-merge`, `s.isDirectory()` is false and we must NOT report
+			// a rebase in progress (fall through to the `return false`).
+			const c = makeClient();
+			await c.clone(bareRepoUrl);
+			// Plant a regular file where git would place the rebase-state dir.
+			await writeFile(join(memoryBankRoot, ".git", "rebase-merge"), "not a dir\n");
+			expect(await c.isRebaseInProgress()).toBe(false);
+		});
+
+		it("revParse returns null when rev-parse exits 0 but emits empty output", async () => {
+			// Defensive `oid.length === 0 ? null : oid` null side: a 0-exit with no
+			// OID on stdout must surface as `null`, not an empty string the caller
+			// would mistake for a real ref.
+			const fakeExec = async () => ({ stdout: "\n", stderr: "" });
+			const c = new GitClient({
+				memoryBankRoot,
+				credentials: FAKE_CREDS,
+				askpass: NOOP_ASKPASS,
+				execFileImpl: fakeExec as never,
+			});
+			expect(await c.revParse("HEAD")).toBeNull();
+		});
+
+		it("commit error message falls back to stdout when stderr is empty", async () => {
+			// `git commit failed: ${result.stderr || result.stdout}` — the `||`
+			// fallback side. A real failure that prints to stdout (not stderr) must
+			// still be surfaced in the thrown message.
+			const fakeExec = ((_cmd: string, args: ReadonlyArray<string>) => {
+				if (args.includes("commit")) {
+					// Empty message + empty stderr so `run()`'s `err.stderr || err.message`
+					// fallback yields "" — forcing `commit`'s `stderr || stdout` onto stdout.
+					const err = new Error("") as Error & { stdout?: string; stderr?: string; code?: number };
+					err.stdout = "error: pathspec exploded";
+					err.stderr = "";
+					err.code = 1;
+					return Promise.reject(err);
+				}
+				return Promise.resolve({ stdout: "", stderr: "" });
+			}) as unknown as typeof execFileSync;
+			const c = new GitClient({
+				memoryBankRoot: "/tmp/fake",
+				credentials: FAKE_CREDS,
+				askpass: NOOP_ASKPASS,
+				execFileImpl: fakeExec as never,
+			});
+			await expect(c.commit("[jolli-mb] x", { name: "X", email: "x@x" })).rejects.toThrow(
+				/git commit failed: error: pathspec exploded/,
+			);
+		});
+
+		it("untrackPathGlob throw omits the stderr suffix when stderr is empty", async () => {
+			// The `result.stderr ? \` stderr=...\` : ""` ternary's empty side: a
+			// non-zero exit with no stderr still throws, but without a dangling
+			// `stderr=` fragment in the message.
+			const fakeExec = async () => {
+				// Empty message so `run()` cannot backfill stderr from `err.message`;
+				// the resulting `result.stderr === ""` exercises the ternary's empty side.
+				const err = new Error("") as Error & { stdout?: string; stderr?: string; code?: number };
+				err.stdout = "";
+				err.stderr = "";
+				err.code = 1;
+				throw err;
+			};
+			const c = new GitClient({
+				memoryBankRoot,
+				credentials: FAKE_CREDS,
+				askpass: NOOP_ASKPASS,
+				execFileImpl: fakeExec as never,
+			});
+			await expect(c.untrackPathGlob("anything")).rejects.toThrow(/git rm --cached failed for anything: exit=1$/);
+		});
+	});
+
+	describe("pullRebase — committer identity injection (CI runners with no global git config)", () => {
+		it("passes `-c user.name/email` so rebased commits get the caller's author", async () => {
+			// Without identity args `git pull --rebase` derives the committer from
+			// the host config; on CI with none, replaying commits fails with
+			// `empty ident name`. Assert the `-c user.*` flags are threaded through.
+			const captured: ReadonlyArray<string>[] = [];
+			const fakeExec = async (_cmd: string, args: ReadonlyArray<string>) => {
+				captured.push(args);
+				// Exit 0, no "Fast-forward" marker → clean non-FF rebase, conflicted: [].
+				return { stdout: "", stderr: "" };
+			};
+			const c = new GitClient({
+				memoryBankRoot,
+				credentials: FAKE_CREDS,
+				askpass: NOOP_ASKPASS,
+				execFileImpl: fakeExec as never,
+			});
+			const result = await c.pullRebase({ name: "Author Name", email: "author@example.com" });
+			expect(result.conflicted).toEqual([]);
+			const pullCall = captured.find((args) => args.includes("pull"));
+			expect(pullCall).toBeDefined();
+			expect(pullCall).toEqual(
+				expect.arrayContaining(["-c", "user.name=Author Name", "-c", "user.email=author@example.com"]),
+			);
+		});
+	});
 });
 
 describe("injectGithubAppUsername", () => {
@@ -1683,6 +1997,29 @@ describe("injectGithubAppUsername", () => {
 	it("passes through non-https URLs unchanged (file://, ssh, http)", () => {
 		expect(injectGithubAppUsername("file:///tmp/repo.git")).toBe("file:///tmp/repo.git");
 		expect(injectGithubAppUsername("git@github.com:foo/bar.git")).toBe("git@github.com:foo/bar.git");
+	});
+});
+
+describe("isServerRejectionMessage (§0.11 — server decline must outrank network classification)", () => {
+	it.each([
+		// Pre-receive / post-receive hook declines — the canonical case the
+		// classifier exists to keep OUT of the transient `network` bucket.
+		["remote: error: GH006: Protected branch update failed", true],
+		["pre-receive hook declined", true],
+		["pre receive hook declined", true],
+		["post-receive hook declined", true],
+		["error: failed to push some refs: protected branch hook declined", true],
+		["! [remote rejected] main -> main (refusing to update checked out branch)", true],
+		["remote: error: File big.bin is 120 MB; this exceeds GitHub's file size limit of 100 MB", true],
+		["remote: Permission to foo/bar.git denied to deploy-key.", true],
+		// Pure network / unrelated messages must NOT match — they belong to the
+		// retryable `network` bucket or other classifiers.
+		["fatal: the remote end hung up unexpectedly", false],
+		["fatal: early EOF", false],
+		["fatal: Authentication failed", false],
+		["", false],
+	])("classifies %j -> %s", (input, expected) => {
+		expect(isServerRejectionMessage(input)).toBe(expected);
 	});
 });
 

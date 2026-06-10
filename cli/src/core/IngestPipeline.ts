@@ -10,7 +10,7 @@ import type { IngestOperation, LlmConfig } from "../Types.js";
 import { mapWithConcurrency } from "./Concurrency.js";
 import { INGEST_CODES, type IngestCode } from "./IngestErrors.js";
 import { appendIngestRun } from "./IngestRunStore.js";
-import { callLlm, STREAMING_THRESHOLD_TOKENS } from "./LlmClient.js";
+import { callLlm } from "./LlmClient.js";
 import { addProcessed, readProcessedSet, saveProcessedSet } from "./ProcessedSourceStore.js";
 import { createReadStorage } from "./ReadStorageResolver.js";
 import { parseReconciledPage } from "./ReconciledPage.js";
@@ -26,14 +26,12 @@ import { readTopicPage, saveTopicPage } from "./TopicPageStore.js";
 const log = createLogger("IngestPipeline");
 
 const DEFAULT_BATCH_SIZE = 50;
-// Sits just above the streaming threshold *on purpose* so the route call always
-// takes LlmClient's streaming path. That path has no per-call AbortSignal (it may
-// legitimately run long), so it relies on the SDK's own ~10-min ceiling rather
-// than the 180s direct-call timeout. Deriving it from the shared constant keeps
-// that intent intact: if the threshold ever rises past this, the route call would
-// silently fall back onto the 180s path and could clip a large response. The +116
-// is an arbitrary margin — any positive offset preserves the "always streams" rule.
-const ROUTE_MAX_TOKENS = STREAMING_THRESHOLD_TOKENS + 116;
+// The route call can run long, so it takes LlmClient's streaming path (no fixed
+// 180s direct-call cap, just the idle + wall-clock watchdogs). We request it
+// explicitly via `forceStreaming` rather than coercing it by padding maxTokens
+// above the streaming threshold — an explicit flag can't be silently undone by
+// retuning the threshold or this token count.
+const ROUTE_MAX_TOKENS = 16_384;
 const RECONCILE_MAX_TOKENS = 64_000;
 const RECONCILE_CONCURRENCY = 4; // fan out reconcile LLM calls; writes stay serial
 
@@ -90,6 +88,7 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 		params: { topicIndex: formatIndexForRoute(index), sources: sourcesBlock },
 		model: resolveModelId(config.model),
 		maxTokens: ROUTE_MAX_TOKENS,
+		forceStreaming: true,
 		apiKey: config.apiKey,
 		jolliApiKey: config.jolliApiKey,
 	});

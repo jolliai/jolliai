@@ -32,11 +32,13 @@ vi.mock("./MemoryBankRepoDiscovery.js", () => ({
 		return all.filter((t) => !exclude.includes(t.folder));
 	}),
 }));
+vi.mock("./SearchIndex.js", () => ({ SearchIndex: { rebuild: vi.fn() } }));
 
 import { withVaultWriteLock } from "../sync/VaultWriteLock.js";
 import { drainIngest } from "./IngestPipeline.js";
 import { discoverRepos } from "./MemoryBankRepoDiscovery.js";
 import { compileAllRepos } from "./MultiRepoCompile.js";
+import { SearchIndex } from "./SearchIndex.js";
 import { getActiveStorage, setActiveStorage } from "./SummaryStore.js";
 import { readTopicIndex } from "./TopicIndexStore.js";
 import { purgeTopicPagesExcept } from "./TopicPageStore.js";
@@ -109,5 +111,31 @@ describe("compileAllRepos", () => {
 		expect(res.failed).toBe(1);
 		expect(res.repos.find((r) => r.folder === "jolli")?.error).toBe("plain string failure");
 		expect(res.repos.find((r) => r.folder === "jolli")?.ingested).toBe(0);
+	});
+
+	it("reindexes each repo after wiki render", async () => {
+		vi.mocked(SearchIndex.rebuild).mockResolvedValue({ index: {} as never, docCount: 5 });
+		// Restrict to a single repo so the assertions are unambiguous.
+		const res = await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
+		expect(res.totalIngested).toBe(2);
+		expect(SearchIndex.rebuild).toHaveBeenCalledWith("/mb/jolli", { kbRoot: "/mb/jolli" });
+		expect(SearchIndex.rebuild).toHaveBeenCalledTimes(1);
+	});
+
+	it("swallows a reindex failure without failing the repo", async () => {
+		vi.mocked(SearchIndex.rebuild).mockRejectedValue(new Error("orama boom"));
+		const res = await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
+		expect(res.failed).toBe(0); // index failure is non-fatal
+		expect(res.totalIngested).toBe(2);
+	});
+
+	it("swallows a non-Error reindex rejection without failing the repo", async () => {
+		// The reindex catch stringifies a bare-value rejection via String(idxErr)
+		// rather than reading `.message`; it must stay non-fatal like the Error path.
+		// biome-ignore lint/suspicious/noExplicitAny: rejecting with a non-Error value is the point
+		vi.mocked(SearchIndex.rebuild).mockRejectedValue("orama string boom" as any);
+		const res = await compileAllRepos("/mb", { compileExcludeFolders: ["jolliai", "boom"] } as never);
+		expect(res.failed).toBe(0);
+		expect(res.totalIngested).toBe(2);
 	});
 });

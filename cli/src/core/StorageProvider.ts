@@ -61,18 +61,6 @@ export interface StorageProvider {
 	isDirty?(): boolean;
 
 	/**
-	 * Optional: return mtime for a stored file, for callers that need recency
-	 * ordering of stored artifacts.
-	 *
-	 * Only meaningful for backends with a real filesystem layer
-	 * (FolderStorage). OrphanBranchStorage does not implement this — its
-	 * callers fall back to JSON-embedded timestamps.
-	 *
-	 * Returns `null` when the file does not exist or stat fails.
-	 */
-	statFile?(path: string): Promise<{ readonly mtimeMs: number } | null>;
-
-	/**
 	 * Remove the user-visible Markdown copy for a single summary entry.
 	 * Does NOT touch .jolli/summaries/<hash>.json, .jolli/index.json, or any
 	 * orphan-branch state. Idempotent: a missing file is not an error.
@@ -180,6 +168,19 @@ export interface StorageProvider {
 	 * leaves it undefined (no visible layer to recover).
 	 */
 	isTopicWikiPresent?(): boolean;
+
+	/**
+	 * Absolute path to this provider's per-repo Memory Bank root (`<localFolder>/
+	 * <repo>`), when folder-backed. The disposable search index is keyed off this
+	 * so it lives ALONGSIDE the data it indexes: the `jolli compile` sweep (which
+	 * runs with folder storage rooted here) and the MCP server (which runs in the
+	 * git checkout but resolves the SAME folder root in dual-write/folder mode)
+	 * then agree on the index location, instead of the sweep warming an index the
+	 * MCP server can't find. Folder-backed providers implement it; DualWriteStorage
+	 * delegates to its folder backend; orphan-only leaves it undefined (the index
+	 * falls back to the checkout's `.jolli/jollimemory/`).
+	 */
+	readonly kbRoot?: string;
 }
 
 /** Options for a heal-missing-markdown pass. */
