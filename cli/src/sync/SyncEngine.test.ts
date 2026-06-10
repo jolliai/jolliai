@@ -688,6 +688,35 @@ describe("SyncEngine.runRound — conflicts surface", () => {
 		expect(result.newState).toBe("synced");
 		expect(client.push).toHaveBeenCalled();
 	});
+
+	it("passes a working resolveVaultPath into makeResolver (vault-relative → absolute)", async () => {
+		// `buildResolver` constructs `resolveVaultPath: (rel) =>
+		// `${memoryBankRoot}/${rel}`` and hands it to `makeResolver`. The
+		// existing resolver stubs ignore that arg, so the arrow was never
+		// invoked. Here the stub calls it to prove it joins the vault root
+		// to the relative path — covering the arrow function body.
+		let resolved: string | undefined;
+		const client = makeGitClient({
+			pullRebase: vi.fn(async () => ({ fastForwarded: false, conflicted: ["notes/foo.md"] })),
+		});
+		const { engine } = makeEngine({
+			client,
+			makeResolver: (_client, extra) => {
+				resolved = extra.resolveVaultPath?.("notes/foo.md");
+				return {
+					resolveAll: vi.fn(async () => ({
+						resolved: ["notes/foo.md"],
+						skipped: [],
+						aiMerged: [],
+						binaryPicked: [],
+						rebaseAdvanced: true,
+					})),
+				} as unknown as import("./ConflictResolver.js").ConflictResolver;
+			},
+		});
+		await engine.runRound(ROUND);
+		expect(resolved).toBe(`${join(tempDir, "vault")}/notes/foo.md`);
+	});
 });
 
 describe("SyncEngine.runRound — onRoundComplete (P2 #1 chain-spawn hook)", () => {
@@ -2283,7 +2312,7 @@ describe("SyncEngine.runRound — auto-reconcile dirty vault (§0.9)", () => {
 		]);
 		const listDirtyPaths = vi.fn(async () => [corruptRel, cleanRel] as ReadonlyArray<string>);
 		const stageAll = vi.fn(async () => undefined);
-		const commit = vi.fn(async () => "deadbeef");
+		const commit = vi.fn(async (_message?: string) => "deadbeef");
 		const pullRebase = vi.fn(async () => ({ fastForwarded: false, conflicted: [] }));
 		const client = makeGitClient({
 			statusPorcelainZ,
@@ -3354,5 +3383,737 @@ describe("SyncEngine.runRound — JOLLI-1577 release-lock matrix", () => {
 		// off. Pre-fix this assertion failed: finally released the
 		// recovery token, contradicting the user's defer choice.
 		expect(releaseLock).not.toHaveBeenCalled();
+	});
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Coverage top-up: small scattered error/edge branches that the main
+// suites above don't exercise. Each test pins a SPECIFIC uncovered line
+// region in SyncEngine.ts and documents why that branch matters.
+// ──────────────────────────────────────────────────────────────────────
+
+describe("SyncEngine.runRound — auto-reconcile failure is non-fatal (catch at the dirty-vault gate)", () => {
+	it("swallows a reconcile commit throw and lets pullRebase be the real gate", async () => {
+		// The §0.9 auto-reconcile block is wrapped in its own try/catch:
+		// staging/committing the dirty vault before pullRebase is
+		// best-effort, because pullRebase will hit the same dirty state and
+		// surface a clear error if it actually matters. The gate is
+		// `hasOwnedDirtyPaths` (porcelain + classifier), NOT
+		// `hasUncommittedChanges` — so to reach the catch we must drive an
+		// OWNED dirty path through porcelain and then make the reconcile
+		// commit throw. Without this test the catch (and its warn log) was
+		// never hit because every existing dirty-vault test used a commit
+		// stub that resolves.
+		const summaryPath = `myrepo/.jolli/summaries/${"e".repeat(40)}.json`;
+		const statusPorcelainZ = vi.fn(async () => [
+			{ path: summaryPath, indexStatus: "!", worktreeStatus: "!", oldPath: undefined },
+		]);
+		let commitCalls = 0;
+		const commit = vi.fn(async (_msg: string) => {
+			commitCalls++;
+			// First call is the reconcile commit — make it throw so the
+			// §0.9 catch fires. Later calls (steady-state commit) succeed.
+			if (commitCalls === 1) throw new Error("reconcile commit failed: index lock");
+			return "deadbeef";
+		});
+		const pullRebase = vi.fn(async () => ({ fastForwarded: false, conflicted: [] }));
+		const client = makeGitClient({ statusPorcelainZ, commit, pullRebase });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		// pullRebase succeeded, so despite the reconcile commit throwing,
+		// the round still ends synced — proving the failure was non-fatal.
+		expect(result.newState).toBe("synced");
+		expect(pullRebase).toHaveBeenCalled();
+	});
+});
+
+describe("SyncEngine.runRound — hasOwnedDirtyPaths classifier branches", () => {
+	it("treats an owned transcript path as NOT dirty when syncTranscripts is off", async () => {
+		// `hasOwnedDirtyPaths` mirrors `stageVault`: a transcript path is
+		// owned, but with `syncTranscripts: false` it must NOT trip the
+		// reconcile gate (the transcript is gated out of the commit).
+		// Exercising this with `transcripts: false` covers the
+		// `kind === "transcript" && !syncTranscripts → return false` arm.
+		const transcriptPath = `myrepo/.jolli/transcripts/${"f".repeat(40)}.json`;
+		const statusPorcelainZ = vi.fn(async () => [
+			{ path: transcriptPath, indexStatus: "!", worktreeStatus: "!", oldPath: undefined },
+		]);
+		const commit = vi.fn(async (_message?: string) => "deadbeef");
+		const client = makeGitClient({ statusPorcelainZ, commit });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound({ ...ROUND, transcripts: false });
+		expect(result.newState).toBe("synced");
+		// Only the steady-state commit runs — the transcript-only dirtiness
+		// did NOT trigger a reconcile pre-commit.
+		expect(commit).toHaveBeenCalledTimes(1);
+		const firstMsg = commit.mock.calls[0]?.[0];
+		expect(typeof firstMsg === "string" && firstMsg).not.toMatch(/reconcile/);
+	});
+
+	it("treats a rename whose OLD side is owned as dirty (both sides classified)", async () => {
+		// A rename entry carries `path = newSide`, `oldPath = oldSide`.
+		// `stageVault.decomposeOps` classifies both halves, so a rename
+		// FROM an owned path TO an unowned path must still count as dirty
+		// — otherwise the `git rm --cached` for the owned old side never
+		// reaches a commit. This pins the `oldPath !== undefined &&
+		// isOwnedDirty(oldPath)` arm: the NEW side classifies to null
+		// (root-level non-owned) while the OLD side is owned.
+		const ownedOld = `myrepo/.jolli/summaries/${"a".repeat(40)}.json`;
+		const statusPorcelainZ = vi.fn(async () => [
+			// New side `.DS_Store` classifies null, so `isOwnedDirty(path)` is
+			// false and the gate MUST fall through to the oldPath check; old
+			// side is owned, which is what trips the round dirty.
+			{ path: ".DS_Store", indexStatus: "R", worktreeStatus: " ", oldPath: ownedOld },
+		]);
+		const commit = vi.fn(async (_message?: string) => "deadbeef");
+		const client = makeGitClient({ statusPorcelainZ, commit });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		// Reconcile commit fired because the owned OLD side made the round dirty.
+		expect(commit.mock.calls[0]?.[0]).toMatch(/reconcile/);
+	});
+
+	it("treats a staged deletion of a per-device JSON path as dirty (engine cleanup target)", async () => {
+		// P2#2: `ensureBootstrap` runs `git rm --cached` against
+		// per-device JSON (e.g. `**/.jolli/shadow-status.json`) so legacy
+		// committed copies get untracked, producing a staged `D`. The
+		// classifier returns null for that path, so without the explicit
+		// `indexStatus === "D" && isPerDeviceJsonPath` arm the round would
+		// idle-skip and the deletion would re-stage forever.
+		const statusPorcelainZ = vi.fn(async () => [
+			{ path: "myrepo/.jolli/shadow-status.json", indexStatus: "D", worktreeStatus: " ", oldPath: undefined },
+		]);
+		const commit = vi.fn(async (_message?: string) => "deadbeef");
+		const client = makeGitClient({ statusPorcelainZ, commit });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(commit.mock.calls[0]?.[0]).toMatch(/reconcile/);
+	});
+
+	it("treats an unmerged (U) porcelain entry as dirty", async () => {
+		// An `U` (unmerged) index/worktree status short-circuits to dirty
+		// regardless of classification — the conflict resolver should have
+		// handled it earlier, but if one slipped through we must not
+		// idle-skip. Covers the `e.indexStatus === "U" || e.worktreeStatus
+		// === "U"` arm.
+		const statusPorcelainZ = vi.fn(async () => [
+			{ path: "anything.txt", indexStatus: "U", worktreeStatus: "U", oldPath: undefined },
+		]);
+		const commit = vi.fn(async (_message?: string) => "deadbeef");
+		const client = makeGitClient({ statusPorcelainZ, commit });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(commit.mock.calls[0]?.[0]).toMatch(/reconcile/);
+	});
+});
+
+describe("SyncEngine.runRound — stageVault canary unowned bucket", () => {
+	it("folds unowned paths reported by stageVault into the round canary", async () => {
+		// `stageVaultTracked` accumulates `report.unowned` into
+		// `this.canary.unowned` (capped). The only direct test of stageVault
+		// drives the `symlinked` bucket; this pins the `unowned` arm. We
+		// plant an unclassified file in the working tree and report it as a
+		// brand-new (`?`) untracked entry via porcelain so `stageVault`
+		// classifies it as unowned and routes it to the canary.
+		const vault = join(tempDir, "vault");
+		// `.DS_Store` classifies as null (unowned) — OS junk in the vault.
+		await writeFile(join(vault, ".DS_Store"), "junk");
+		const statusPorcelainZ = vi.fn(async () => [
+			{ path: ".DS_Store", indexStatus: "?", worktreeStatus: "?", oldPath: undefined },
+		]);
+		const client = makeGitClient({ statusPorcelainZ });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		// The unowned stray file surfaces on the canary so the status bar
+		// can warn the user that something foreign lives in their vault.
+		expect(result.canary?.unowned).toContain(".DS_Store");
+	});
+
+	it("caps the canary unowned bucket at CANARY_PATH_CAP across multiple stage calls", async () => {
+		// `stageVaultTracked` runs TWICE in a reconcile round (once at the
+		// §0.9 pre-pull reconcile, once at step 7). The unowned accumulator
+		// persists across both. With >CANARY_PATH_CAP (10) unowned paths,
+		// the FIRST call fills the bucket to 10 and the SECOND finds
+		// `room <= 0` — exercising the `if (room > 0)` false arm (the cap
+		// guard) that a single-call test can't reach.
+		const vault = join(tempDir, "vault");
+		// 12 OS-junk files (classify null → unowned) + one owned summary so
+		// the reconcile gate fires and stageVaultTracked runs at step 4 too.
+		const junk = Array.from({ length: 12 }, (_, i) => `.DS_Store_${i}`);
+		for (const j of junk) await writeFile(join(vault, j), "junk");
+		const ownedPath = `myrepo/.jolli/summaries/${"c".repeat(40)}.json`;
+		await mkdir(join(vault, "myrepo", ".jolli", "summaries"), { recursive: true });
+		await writeFile(join(vault, ownedPath), JSON.stringify({ ok: true }));
+		const statusPorcelainZ = vi.fn(async () => [
+			...junk.map((p) => ({ path: p, indexStatus: "?", worktreeStatus: "?", oldPath: undefined })),
+			{ path: ownedPath, indexStatus: "!", worktreeStatus: "!", oldPath: undefined },
+		]);
+		const client = makeGitClient({ statusPorcelainZ });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		// Bucket is capped at 10 even though 12 unowned paths were reported
+		// across the two stage passes.
+		expect(result.canary?.unowned).toHaveLength(10);
+	});
+
+	it("caps the canary symlinked bucket at CANARY_PATH_CAP across multiple stage calls", async () => {
+		// Mirror of the unowned-cap test for the SYMLINKED bucket: real
+		// symlinks at classifier-OWNED locations are refused by stageVault's
+		// symlink guard and routed to `this.canary.symlinked`. With >10 such
+		// paths reported across the reconcile + step-7 stage passes, the
+		// second pass hits `room <= 0` — the `if (room > 0)` false arm for
+		// the symlinked bucket. Plus one plain owned file so the reconcile
+		// gate fires (a symlink alone wouldn't, since the guard short-circuits
+		// before classification influences the dirty gate).
+		const { symlink } = await import("node:fs/promises");
+		const vault = join(tempDir, "vault");
+		await mkdir(join(vault, "myrepo", ".jolli", "summaries"), { recursive: true });
+		const symPaths: string[] = [];
+		for (let i = 0; i < 12; i++) {
+			const rel = `myrepo/.jolli/summaries/${String(i).padStart(2, "0")}${"d".repeat(38)}.json`;
+			// Symlink the owned-location leaf at a foreign target — hostile
+			// placement the guard must refuse.
+			await symlink("/etc/hostname", join(vault, rel));
+			symPaths.push(rel);
+		}
+		// A plain owned file to trip the reconcile gate (statusPorcelainZ
+		// entry that classifies owned + is non-symlink).
+		const plainOwned = `myrepo/.jolli/summaries/${"e".repeat(40)}.json`;
+		await writeFile(join(vault, plainOwned), JSON.stringify({ ok: true }));
+		const statusPorcelainZ = vi.fn(async () => [
+			{ path: plainOwned, indexStatus: "!", worktreeStatus: "!", oldPath: undefined },
+			...symPaths.map((p) => ({ path: p, indexStatus: "!", worktreeStatus: "!", oldPath: undefined })),
+		]);
+		const client = makeGitClient({ statusPorcelainZ });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		// Symlinked bucket capped at 10 despite 12 hostile symlinks reported
+		// across both stage passes.
+		expect(result.canary?.symlinked).toHaveLength(10);
+	});
+});
+
+describe("SyncEngine.runRound — vault marker rewrite (needsRewrite branch)", () => {
+	it("rewrites a legacy-form marker in canonical form and still syncs", async () => {
+		// `verifyVaultMarker` returns `{ ok: true, needsRewrite: true }`
+		// when the stored marker URL matches creds only after
+		// re-normalization (e.g. a pre-541d00e marker that kept the
+		// trailing `.git`). The engine must rewrite the marker once so
+		// subsequent rounds take the byte-equality fast path. We seed a raw
+		// marker with the non-canonical `.git` suffix to trip this arm.
+		const markerPath = join(tempDir, "vault", ".git", "jolli-vault-identity.json");
+		await writeFile(
+			markerPath,
+			`${JSON.stringify({
+				kind: "jolli-memory-bank",
+				version: 1,
+				createdAt: "2025-01-01T00:00:00Z",
+				// Non-canonical: trailing `.git` survives in the raw bytes but
+				// normalizes to the same URL the creds carry.
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+			})}\n`,
+			"utf-8",
+		);
+		const { engine } = makeEngine();
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		// After the round the marker is rewritten in canonical (no `.git`) form.
+		const rewritten = JSON.parse(await (await import("node:fs/promises")).readFile(markerPath, "utf-8")) as {
+			gitUrl: string;
+		};
+		expect(rewritten.gitUrl).toBe("https://github.com/jolli-vaults/test");
+	});
+});
+
+describe("SyncEngine.runRound — repos.json folder collision surfacing (P2#3)", () => {
+	it("invokes onRepoMappingConflict when two identities claim the same folder", async () => {
+		// After pullRebase integrates a peer's mapping, the engine scans for
+		// cross-device folder collisions and surfaces them so the user can
+		// rename one side. We seed a `repos.json` with two identities
+		// pointing at the same folder to make `findRepoMappingConflicts`
+		// return a non-empty list, exercising the warn-loop + callback.
+		const vault = join(tempDir, "vault");
+		await mkdir(join(vault, ".jolli"), { recursive: true });
+		await writeFile(
+			join(vault, ".jolli", "repos.json"),
+			`${JSON.stringify({
+				version: 1,
+				mappings: [
+					{ repoIdentity: "https://github.com/a/a", folder: "shared" },
+					{ repoIdentity: "https://github.com/b/b", folder: "shared" },
+				],
+			})}\n`,
+			"utf-8",
+		);
+		const onRepoMappingConflict = vi.fn();
+		const { engine } = makeEngine();
+		(
+			engine as unknown as { opts: { onRepoMappingConflict: typeof onRepoMappingConflict } }
+		).opts.onRepoMappingConflict = onRepoMappingConflict;
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(onRepoMappingConflict).toHaveBeenCalledTimes(1);
+		const conflicts = onRepoMappingConflict.mock.calls[0]?.[0] as ReadonlyArray<{ folder: string }>;
+		expect(conflicts[0]?.folder).toBe("shared");
+	});
+
+	it("swallows a throwing onRepoMappingConflict callback without down-stating the round", async () => {
+		// The collision callback is wired to UI; a buggy handler must not
+		// poison the round. Covers the callback's own try/catch swallow.
+		const vault = join(tempDir, "vault");
+		await mkdir(join(vault, ".jolli"), { recursive: true });
+		await writeFile(
+			join(vault, ".jolli", "repos.json"),
+			`${JSON.stringify({
+				version: 1,
+				mappings: [
+					{ repoIdentity: "https://github.com/a/a", folder: "shared" },
+					{ repoIdentity: "https://github.com/b/b", folder: "shared" },
+				],
+			})}\n`,
+			"utf-8",
+		);
+		const { engine } = makeEngine();
+		(engine as unknown as { opts: { onRepoMappingConflict: () => void } }).opts.onRepoMappingConflict = () => {
+			throw new Error("notification UI exploded");
+		};
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+	});
+});
+
+describe("SyncEngine.runRound — push hard-failure classification", () => {
+	it("classifies a server-rejection push message as push_rejected (terminal)", async () => {
+		// A non-FF / non-auth / non-repoMissing push failure whose message
+		// matches a server-rejection pattern (pre-receive hook declined,
+		// protected branch, …) must route to `push_rejected` BEFORE the
+		// network classifier — otherwise a pre-receive decline that presents
+		// as "remote end hung up" gets misrouted to silent transient retry.
+		const client = makeGitClient({
+			push: vi.fn(async () => ({
+				ok: false as const,
+				nonFastForward: false,
+				unauthorized: false,
+				repoMissing: false,
+				message: "remote: pre-receive hook declined",
+			})),
+		});
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(result.lastError?.code).toBe("push_rejected");
+	});
+});
+
+describe("SyncEngine.runRound — 503 pending_flush_failed exhaustion", () => {
+	it("gives up with code=network when every 503 retry is consumed", async () => {
+		// The 503 path retries within the same mint budget but, unlike 423,
+		// it does NOT honor `vaultLockedRetrySchedule` for the wait — it
+		// uses `Math.max(1000, retryAfterSeconds*1000)`. With a single-entry
+		// schedule (totalAttempts = 2) we burn one ~1s sleep then hit the
+		// final-attempt give-up arm: code=network. Pins the
+		// "final attempt → return network" branch.
+		const { WebFlushPendingError } = await import("./BackendClient.js");
+		const mintFn = vi.fn(async () => {
+			throw new WebFlushPendingError('{"error":"pending_flush_failed"}', 0);
+		});
+		const backend = makeBackend({ mintGitCredentials: mintFn });
+		// One retry entry → 2 total attempts → 1 wait then terminal.
+		const { engine } = makeEngine({ backend, vaultLockedRetrySchedule: [0] });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(result.lastError?.code).toBe("network");
+		expect(mintFn).toHaveBeenCalledTimes(2);
+	});
+
+	it("swallows a throwing onLockedWait during a 503 retry (does not abort the loop)", async () => {
+		// The 503 retry fires `onLockedWait` right before its sleep, wrapped
+		// in its own try/catch. A buggy UI handler must not abort the
+		// cooperative back-off. Pins the 503-path onLockedWait swallow
+		// (distinct from the 423-path swallow already covered).
+		const { WebFlushPendingError } = await import("./BackendClient.js");
+		const mintFn = vi
+			.fn()
+			.mockRejectedValueOnce(new WebFlushPendingError('{"error":"pending_flush_failed"}', 0))
+			.mockResolvedValueOnce({
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				token: "ghs_test",
+				expiresAt: Date.now() + 3600_000,
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+				githubRepoCreated: false,
+				alreadyVaultBound: true as const,
+				lockOwnerToken: "test-lock-owner-token" as const,
+			});
+		const backend = makeBackend({ mintGitCredentials: mintFn });
+		const { engine } = makeEngine({
+			backend,
+			vaultLockedRetrySchedule: [0],
+			onLockedWait: () => {
+				throw new Error("503 UI handler exploded");
+			},
+		});
+		const result = await engine.runRound(ROUND);
+		// First attempt 503 → onLockedWait throws (swallowed) → sleep →
+		// second attempt succeeds.
+		expect(result.newState).toBe("synced");
+		expect(mintFn).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("SyncEngine.runRound — persistMintedLock with no api key", () => {
+	it("skips persisting the lock token when getJolliApiKey returns undefined (signed-out)", async () => {
+		// `persistMintedLock` early-returns when there is no api key — a
+		// signed-out / key-less install can still mint (the backend may
+		// allow it) but has nowhere to scope the pending-lock entry. Covers
+		// the `if (!apiKey) return;` guard. We assert the round still
+		// completes and no pending-lock file was written for any key.
+		const backend = makeBackend({ getJolliApiKey: vi.fn(async () => undefined) });
+		const { engine } = makeEngine({ backend });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		// readSelfLockState also early-returns on no key, so nothing is
+		// persisted; reading back any key yields null.
+		const { readPendingLock } = await import("./PendingLockStore.js");
+		expect(await readPendingLock("sk-jol-test-fixture")).toBeNull();
+	});
+});
+
+describe("SyncEngine — emitPhase / report robustness (direct unit hits)", () => {
+	it("emitPhase swallows a throwing onPhase callback", async () => {
+		// `emitPhase` is best-effort UI signalling; a throwing handler must
+		// not propagate. We invoke the private method directly so we hit the
+		// catch deterministically without depending on which phases a round
+		// happens to emit.
+		const { engine } = makeEngine();
+		(engine as unknown as { opts: { onPhase: () => void } }).opts.onPhase = () => {
+			throw new Error("onPhase exploded");
+		};
+		expect(() => (engine as unknown as { emitPhase: (p: string) => void }).emitPhase("merging")).not.toThrow();
+	});
+
+	it("report honors a caller-supplied canary in the partial (the rare hand-built path)", async () => {
+		// `report` prefers an explicit `canary` in the partial over the
+		// per-round accumulator. No production caller passes one today, so
+		// this defensive branch is only reachable by calling `report`
+		// directly — which we do here to lock the contract: a hand-built
+		// partial's canary wins and is NOT overwritten by `takeCanary()`.
+		const { engine } = makeEngine();
+		const explicit = { symlinked: ["x"], unowned: [] as string[] };
+		const result = (
+			engine as unknown as {
+				report: (
+					state: string,
+					partial: {
+						fetched: boolean;
+						pulled: boolean;
+						pushed: boolean;
+						conflicts: never[];
+						canary: typeof explicit;
+					},
+				) => { canary?: typeof explicit };
+			}
+		).report("synced", { fetched: false, pulled: false, pushed: false, conflicts: [], canary: explicit });
+		expect(result.canary).toBe(explicit);
+	});
+});
+
+describe("SyncEngine — safeRebaseAbort swallows abort failure", () => {
+	it("logs and continues when rebaseAbort throws during recovery", async () => {
+		// `safeRebaseAbort` must never let an abort failure shadow the
+		// upstream error that triggered the cleanup. We drive a non-FF push
+		// retry whose pullRebase throws (forcing `safeRebaseAbort`) AND make
+		// `rebaseAbort` itself throw — the round still reports a classified
+		// terminal failure rather than crashing.
+		let pushes = 0;
+		const client = makeGitClient({
+			push: vi.fn(async () => {
+				pushes++;
+				// Always non-FF so the retry path runs and calls pullRebaseLocked.
+				return { ok: false as const, nonFastForward: true, unauthorized: false, message: "non-fast-forward" };
+			}),
+			// pullRebase throws (no unmerged paths) → safeRebaseAbort fires.
+			pullRebase: vi.fn(async () => {
+				if (pushes >= 1) throw new Error("pull --rebase exploded after non-FF");
+				return { fastForwarded: false, conflicted: [] };
+			}),
+			rebaseAbort: vi.fn(async () => {
+				throw new Error("rebase --abort also failed");
+			}),
+		});
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		// Despite both pullRebase and rebaseAbort throwing, the round
+		// resolves to a classified offline outcome (no unhandled crash).
+		expect(result.newState).toBe("offline");
+	});
+});
+
+describe("logFirstBindAudit — non-file entries are skipped", () => {
+	it("first-bind init counts only top-level files, skipping subdirectories", async () => {
+		// The forensic audit run on the first-bind branch (`memoryBankExists
+		// && !hasGit`) iterates top-level entries and `continue`s on any
+		// non-file (directory / symlink). We trigger first-bind by removing
+		// `.git`, leave a real directory next to a real file, and assert the
+		// round still inits + syncs — the `if (!entry.isFile()) continue`
+		// arm runs for the directory.
+		const vault = join(tempDir, "vault");
+		await rm(join(vault, ".git"), { recursive: true, force: true });
+		// `vault` itself exists (memoryBankExists) but has no `.git` → init.
+		await mkdir(join(vault, "a-subdir"), { recursive: true });
+		await writeFile(join(vault, "a-file.txt"), "data");
+		const initRemote = vi.fn(async () => {
+			// Emulate `git init` creating `.git` so the marker write lands.
+			await mkdir(join(vault, ".git"), { recursive: true });
+		});
+		const client = makeGitClient({ initRemote });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		expect(initRemote).toHaveBeenCalled();
+	});
+});
+
+describe("SyncEngine.runRound — migration completion failure surfaces (docs>0 path)", () => {
+	it("returns the migration_failed result when completeMigration throws after a pushed HEAD", async () => {
+		// db→git migration with docs>0 + filesWritten>0 pushes the migration
+		// commit, then calls `tryCompleteMigration`. With `isAncestor: true`
+		// HEAD is on the remote so completion is NOT deferred — it calls the
+		// backend `completeMigration`, which throws here. That makes
+		// `tryCompleteMigration` return `{ ok: false, code: "migration_failed" }`
+		// and `runFirstBindMigration` bubbles it up via the
+		// `if (!completion.ok) return completion` guard in the docs>0 branch.
+		const mintFn = vi.fn(async () => ({
+			gitUrl: "https://github.com/jolli-vaults/test.git",
+			token: "ghs_test",
+			expiresAt: Date.now() + 3600_000,
+			repoFullName: "jolli-vaults/test",
+			defaultBranch: "main",
+			githubRepoCreated: true,
+			alreadyVaultBound: false as const, // drives the migration branch
+			lockOwnerToken: "test-lock-owner-token" as const,
+		}));
+		const completeMigration = vi.fn(async () => {
+			throw new Error("backend 500 during complete-migration");
+		});
+		const backend = makeBackend({
+			mintGitCredentials: mintFn,
+			completeMigration,
+			getLegacyContent: vi.fn(async () => ({
+				spaceId: 1,
+				spaceSlug: "personal",
+				alreadyMigrated: false,
+				docs: [
+					{
+						id: 1,
+						jrn: "doc:1",
+						slug: "x",
+						path: "/",
+						docType: "document",
+						parentId: null,
+						content: "y",
+						contentType: "text/markdown",
+						sortOrder: 0,
+						createdAt: "2026-05-01T00:00:00Z",
+						updatedAt: "2026-05-01T00:00:00Z",
+					},
+				],
+			})),
+		});
+		// `isAncestor: true` → HEAD already on origin/<default>, so completion
+		// proceeds to the backend call (not the defer branch).
+		const client = makeGitClient({ isAncestor: vi.fn(async () => true) });
+		const applyLegacy = vi.fn(async () => ({ filesWritten: 3 }));
+		const { engine } = makeEngine({
+			backend,
+			client,
+			makeLegacyMigration: () =>
+				({ apply: applyLegacy }) as unknown as ReturnType<
+					NonNullable<import("./SyncEngine.js").SyncEngineOpts["makeLegacyMigration"]>
+				>,
+		});
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(result.lastError?.code).toBe("migration_failed");
+		expect(result.lastError?.message).toContain("completeMigration");
+	});
+});
+
+describe("SyncEngine.runRound — migration push idempotent (transmitted=false)", () => {
+	it("skips the migration notify-push when the migration push transmitted nothing", async () => {
+		// When the migration `pushWithRetry` reports `transmitted: false`
+		// (the push was idempotent — "Everything up-to-date"), the migration
+		// notify-push is skipped. Covers the `if (pushed.transmitted)` false
+		// arm in `runFirstBindMigration`. The round still completes synced.
+		const mintFn = vi.fn(async () => ({
+			gitUrl: "https://github.com/jolli-vaults/test.git",
+			token: "ghs_test",
+			expiresAt: Date.now() + 3600_000,
+			repoFullName: "jolli-vaults/test",
+			defaultBranch: "main",
+			githubRepoCreated: true,
+			alreadyVaultBound: false as const,
+			lockOwnerToken: "test-lock-owner-token" as const,
+		}));
+		const notifyPush = vi.fn(async () => undefined);
+		const backend = makeBackend({
+			mintGitCredentials: mintFn,
+			notifyPush,
+			completeMigration: vi.fn(async () => ({ alreadyMigrated: false })),
+			getLegacyContent: vi.fn(async () => ({
+				spaceId: 1,
+				spaceSlug: "personal",
+				alreadyMigrated: false,
+				docs: [
+					{
+						id: 1,
+						jrn: "doc:1",
+						slug: "x",
+						path: "/",
+						docType: "document",
+						parentId: null,
+						content: "y",
+						contentType: "text/markdown",
+						sortOrder: 0,
+						createdAt: "2026-05-01T00:00:00Z",
+						updatedAt: "2026-05-01T00:00:00Z",
+					},
+				],
+			})),
+		});
+		// Push is always idempotent (transmitted: false) — both the migration
+		// push and the steady-state push report nothing transmitted.
+		const push = vi.fn(async () => ({ ok: true as const, transmitted: false }));
+		const client = makeGitClient({ push, isAncestor: vi.fn(async () => true) });
+		const applyLegacy = vi.fn(async () => ({ filesWritten: 2 }));
+		const { engine } = makeEngine({
+			backend,
+			client,
+			makeLegacyMigration: () =>
+				({ apply: applyLegacy }) as unknown as ReturnType<
+					NonNullable<import("./SyncEngine.js").SyncEngineOpts["makeLegacyMigration"]>
+				>,
+		});
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("synced");
+		// Neither the migration notify (transmitted=false) nor the
+		// steady-state notify (transmitted=false) fired.
+		expect(notifyPush).not.toHaveBeenCalled();
+	});
+});
+
+describe("SyncEngine.runRound — tryRemint propagates a failing re-mint", () => {
+	it("returns the re-mint failure code when the recovery mint itself fails", async () => {
+		// A push 401 triggers `tryRemint`, whose `mintFresh` call fails
+		// (network). `tryRemint` must propagate that classified failure
+		// wrapped with the cause prefix — covering the `if (!fresh.ok)
+		// return …` arm. The first mint succeeds (so the round gets going);
+		// the SECOND mint (the recovery) throws a network error.
+		let mintCalls = 0;
+		const mintFn = vi.fn(async () => {
+			mintCalls++;
+			if (mintCalls >= 2) throw new SyncBackendNetworkError(new Error("ECONNRESET on re-mint"));
+			return {
+				gitUrl: "https://github.com/jolli-vaults/test.git",
+				token: "ghs_test",
+				expiresAt: Date.now() + 3600_000,
+				repoFullName: "jolli-vaults/test",
+				defaultBranch: "main",
+				githubRepoCreated: false,
+				alreadyVaultBound: true as const,
+				lockOwnerToken: "test-lock-owner-token" as const,
+			};
+		});
+		const backend = makeBackend({ mintGitCredentials: mintFn });
+		// Push returns unauthorized once → triggers the recovery re-mint.
+		const push = vi.fn(async () => ({
+			ok: false as const,
+			nonFastForward: false,
+			unauthorized: true,
+			repoMissing: false,
+			message: "fatal: authentication failed",
+		}));
+		const client = makeGitClient({ push });
+		const { engine } = makeEngine({ backend, client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		// The re-mint network failure propagates with the cause-prefixed
+		// message ("re-mint after unauthorized: …").
+		expect(result.lastError?.code).toBe("network");
+		expect(result.lastError?.message).toContain("re-mint after unauthorized");
+		expect(mintCalls).toBe(2);
+	});
+});
+
+describe("SyncEngine.runRound — non-FF retry pullRebase throw classification", () => {
+	it("classifies a network-flavored pullRebase throw during non-FF retry as network", async () => {
+		// In `pushWithRetry`, a non-FF push pulls --rebase to integrate. If
+		// that pullRebase THROWS (not VaultLockBusyError) the catch
+		// classifies the message: a network-flavored message routes to
+		// `network`. Pins the `isNetworkErrorMessage(msg) ? "network"` arm.
+		const push = vi.fn(async () => ({
+			ok: false as const,
+			nonFastForward: true,
+			unauthorized: false,
+			message: "non-fast-forward",
+		}));
+		const pullRebase = vi
+			.fn<() => Promise<{ fastForwarded: boolean; conflicted: string[] }>>()
+			// First (main step-4) pull succeeds; the non-FF retry's pull throws.
+			.mockResolvedValueOnce({ fastForwarded: false, conflicted: [] })
+			.mockRejectedValue(new Error("fatal: unable to access — Could not resolve host: github.com"));
+		const client = makeGitClient({ push, pullRebase });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(result.lastError?.code).toBe("network");
+	});
+
+	it("classifies a server-rejection pullRebase throw during non-FF retry as push_rejected", async () => {
+		// Same path, but the rethrown message matches a server-rejection
+		// pattern → `push_rejected` (checked BEFORE the network classifier).
+		const push = vi.fn(async () => ({
+			ok: false as const,
+			nonFastForward: true,
+			unauthorized: false,
+			message: "non-fast-forward",
+		}));
+		const pullRebase = vi
+			.fn<() => Promise<{ fastForwarded: boolean; conflicted: string[] }>>()
+			.mockResolvedValueOnce({ fastForwarded: false, conflicted: [] })
+			.mockRejectedValue(new Error("remote: error: GH006: Protected branch update failed"));
+		const client = makeGitClient({ push, pullRebase });
+		const { engine } = makeEngine({ client });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(result.lastError?.code).toBe("push_rejected");
+	});
+});
+
+describe("SyncEngine.runRound — mint throws a non-Error value (generic fallback)", () => {
+	it("falls back to String(e) / '(none)' when the thrown value has no message/body", async () => {
+		// The generic mint catch reads `errAny.message ?? String(e)` and
+		// `errAny.body ?? "(none)"`. Throwing a bare object (no `message`,
+		// no `body`, not one of the typed backend errors) exercises BOTH
+		// nullish-fallback arms and the terminal `mint_failed` return.
+		const backend = makeBackend({
+			mintGitCredentials: vi.fn(async () => {
+				// Deliberately throw a non-Error, message-less, body-less value
+				// to drive both `?? String(e)` and `?? "(none)"` fallbacks.
+				throw {} as unknown;
+			}),
+		});
+		const { engine } = makeEngine({ backend });
+		const result = await engine.runRound(ROUND);
+		expect(result.newState).toBe("offline");
+		expect(result.lastError?.code).toBe("mint_failed");
 	});
 });

@@ -85,4 +85,14 @@ describe("appendLocalExclude", () => {
 		const content = await readFile(join(vault, ".git", "info", "exclude"), "utf-8");
 		expect(content).toBe(".jolli-quarantine-corrupt/\n");
 	});
+
+	it("returns false (non-fatal) when the read fails for a non-ENOENT reason", async () => {
+		// Plant a DIRECTORY where `exclude` should be a file: readFile throws
+		// EISDIR (not ENOENT), exercising the non-ENOENT warn branch, and the
+		// subsequent writeFile also fails — the helper degrades to false rather
+		// than throwing (its contract is "best-effort, never propagate").
+		await mkdir(join(vault, ".git", "info", "exclude"), { recursive: true });
+		const ok = await appendLocalExclude(vault, ".jolli-quarantine-corrupt/");
+		expect(ok).toBe(false);
+	});
 });

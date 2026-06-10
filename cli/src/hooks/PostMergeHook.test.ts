@@ -112,7 +112,7 @@ describe("handlePostMerge", () => {
 
 		// SP3: one ingest op total, not one compile op per branch
 		expect(mockEnqueueIngest).toHaveBeenCalledOnce();
-		expect(mockEnqueueIngest).toHaveBeenCalledWith("/test", "post-merge");
+		expect(mockEnqueueIngest).toHaveBeenCalledWith("/test", "post-merge", { force: true });
 		// Worker is launched once for the entire pull range
 		expect(mockLaunchWorker).toHaveBeenCalledOnce();
 	});
@@ -146,7 +146,7 @@ describe("handlePostMerge", () => {
 		await handlePostMerge("/test");
 
 		expect(mockEnqueueIngest).toHaveBeenCalledOnce();
-		expect(mockEnqueueIngest).toHaveBeenCalledWith("/test", "post-merge");
+		expect(mockEnqueueIngest).toHaveBeenCalledWith("/test", "post-merge", { force: true });
 		expect(mockLaunchWorker).toHaveBeenCalledOnce();
 	});
 
@@ -170,7 +170,7 @@ describe("handlePostMerge", () => {
 		await handlePostMerge("/test");
 
 		expect(mockEnqueueIngest).toHaveBeenCalledOnce();
-		expect(mockEnqueueIngest).toHaveBeenCalledWith("/test", "post-merge");
+		expect(mockEnqueueIngest).toHaveBeenCalledWith("/test", "post-merge", { force: true });
 		expect(mockLaunchWorker).toHaveBeenCalledOnce();
 	});
 
@@ -188,7 +188,26 @@ describe("handlePostMerge", () => {
 		expect(mockEnqueueIngest).not.toHaveBeenCalled();
 	});
 
-	it("does not launch the worker when the ingest enqueue is refused", async () => {
+	it("skips when the reflog is unavailable, HEAD is a merge, but the subject fetch fails", async () => {
+		// Fallback path: HEAD@{1} fatals, %P confirms a merge (≥2 parents), but the
+		// %s subject lookup itself errors. detectMergeAtHead returns "" rather than a
+		// bogus subject, so the hook treats it as "no merge" and skips cleanly.
+		mockExecGit.mockImplementation(async (args: readonly string[]) => {
+			const cmd = args.join(" ");
+			if (cmd.includes("HEAD@{1}..HEAD")) return { stdout: "", stderr: "fatal", exitCode: 128 };
+			if (cmd.includes("%P")) return { stdout: "parent1 parent2", stderr: "", exitCode: 0 };
+			if (cmd.includes("%s")) return { stdout: "", stderr: "fatal", exitCode: 1 };
+			return { stdout: "", stderr: "", exitCode: 0 };
+		});
+
+		await handlePostMerge("/test");
+
+		expect(mockLoadConfig).not.toHaveBeenCalled();
+		expect(mockEnqueueIngest).not.toHaveBeenCalled();
+		expect(mockLaunchWorker).not.toHaveBeenCalled();
+	});
+
+	it("does not launch the worker when the ingest enqueue fails", async () => {
 		mockExecGit.mockResolvedValue({
 			stdout: "Merge branch 'feature/x' into main",
 			stderr: "",

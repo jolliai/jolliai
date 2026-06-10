@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { assertNoSymlinksInPath } from "./VaultSymlinkGuard.js";
+import { assertNoSymlinksInPath, assertNoSymlinksInPathSync, safeAtomicWriteSync } from "./VaultSymlinkGuard.js";
 
 describe("assertNoSymlinksInPath", () => {
 	let vault: string;
@@ -95,5 +95,93 @@ describe("assertNoSymlinksInPath", () => {
 		await expect(assertNoSymlinksInPath("relative-vault", join(vault, "x.json"))).rejects.toThrow(
 			/must be absolute/,
 		);
+	});
+});
+
+// The sync twin shares the exact contract of the async function; these mirror
+// the async cases so FolderStorage's sync atomicWrite path is equally guarded.
+describe("assertNoSymlinksInPathSync", () => {
+	let vault: string;
+
+	beforeEach(() => {
+		vault = mkdtempSync(join(tmpdir(), "vault-symlink-sync-"));
+	});
+
+	afterEach(() => {
+		rmSync(vault, { recursive: true, force: true });
+	});
+
+	it("accepts a clean target and tolerates not-yet-existing segments", () => {
+		mkdirSync(join(vault, "myrepo", ".jolli"), { recursive: true });
+		expect(() =>
+			assertNoSymlinksInPathSync(vault, join(vault, "myrepo", ".jolli", "summaries", "abc.json")),
+		).not.toThrow();
+		// ENOENT tail (nothing under <vault>/cold/ exists) must not throw.
+		expect(() => assertNoSymlinksInPathSync(vault, join(vault, "cold", "x", "y.json"))).not.toThrow();
+	});
+
+	it("rejects a symlink in the path chain", () => {
+		mkdirSync(join(vault, "myrepo"), { recursive: true });
+		const escapeTarget = mkdtempSync(join(tmpdir(), "escape-"));
+		try {
+			symlinkSync(escapeTarget, join(vault, "myrepo", ".jolli"), "dir");
+			expect(() =>
+				assertNoSymlinksInPathSync(vault, join(vault, "myrepo", ".jolli", "summaries", "abc.json")),
+			).toThrow(/path segment is a symlink/);
+		} finally {
+			rmSync(escapeTarget, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a regular file where a directory is expected", () => {
+		writeFileSync(join(vault, "myrepo"), "not a dir");
+		expect(() => assertNoSymlinksInPathSync(vault, join(vault, "myrepo", ".jolli", "index.json"))).toThrow(
+			/not a directory/,
+		);
+	});
+
+	it("rejects a target outside the vault and non-absolute args", () => {
+		expect(() => assertNoSymlinksInPathSync(vault, "/etc/passwd")).toThrow(/not inside vault/);
+		expect(() => assertNoSymlinksInPathSync(vault, "myrepo/x.json")).toThrow(/must be absolute/);
+		expect(() => assertNoSymlinksInPathSync("rel-vault", join(vault, "x.json"))).toThrow(/must be absolute/);
+	});
+});
+
+describe("safeAtomicWriteSync", () => {
+	let vault: string;
+
+	beforeEach(() => {
+		vault = mkdtempSync(join(tmpdir(), "vault-safewrite-"));
+	});
+
+	afterEach(() => {
+		rmSync(vault, { recursive: true, force: true });
+	});
+
+	it("writes string content atomically, creating parent dirs, and leaves no .tmp behind", () => {
+		const target = join(vault, "myrepo", ".jolli", "index.json");
+		safeAtomicWriteSync(vault, target, '{"k":1}');
+		expect(readFileSync(target, "utf-8")).toBe('{"k":1}');
+		expect(() => lstatSync(`${target}.tmp`)).toThrow(); // tmp renamed away
+	});
+
+	it("writes Buffer content (the binary branch)", () => {
+		const target = join(vault, "myrepo", "blob.bin");
+		const buf = Buffer.from([0x00, 0x01, 0x02, 0xff]);
+		safeAtomicWriteSync(vault, target, buf);
+		expect(readFileSync(target).equals(buf)).toBe(true);
+	});
+
+	it("refuses to write through a symlinked path segment", () => {
+		mkdirSync(join(vault, "myrepo"), { recursive: true });
+		const escapeTarget = mkdtempSync(join(tmpdir(), "escape-"));
+		try {
+			symlinkSync(escapeTarget, join(vault, "myrepo", ".jolli"), "dir");
+			expect(() => safeAtomicWriteSync(vault, join(vault, "myrepo", ".jolli", "x.json"), "leak")).toThrow(
+				/symlink/,
+			);
+		} finally {
+			rmSync(escapeTarget, { recursive: true, force: true });
+		}
 	});
 });

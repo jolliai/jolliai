@@ -120,6 +120,20 @@ export const STREAMING_THRESHOLD_TOKENS = 16_384;
  */
 export const STREAM_IDLE_TIMEOUT_MS = 120_000;
 
+/**
+ * Absolute wall-clock cap for the streaming direct path, on TOP of the idle
+ * watchdog above. The idle watchdog alone cannot bound a stream that keeps
+ * emitting `ping` events but never completes (a server-side stall, a relay that
+ * trickles keep-alives, a pathological retry loop) — it would reset the idle
+ * timer forever and hold the QueueWorker / SyncEngine lock indefinitely. This
+ * hard cap fires regardless of activity. Sized well above the largest legitimate
+ * response (a 64K merge regenerate runs a few minutes) so it never clips valid
+ * work, while still failing in bounded time. The QueueWorker refreshes its lock
+ * every 60s, so a call running this long never loses the lock. Exported so a
+ * regression test can pin it.
+ */
+export const STREAM_MAX_WALL_CLOCK_MS = 15 * 60 * 1000;
+
 // `x-jolli-client` header value lives in `./ClientHeader.ts` so both this
 // module and `cli/src/sync/BackendClient.ts` share one source of truth.
 // Build-time `__JOLLI_CLIENT_KIND__` + `__PKG_VERSION__` resolution happens
@@ -196,6 +210,16 @@ export interface LlmCallOptions extends LlmCredentials {
 	readonly params: Record<string, string>;
 	/** Max output tokens (direct mode only, default 8192) */
 	readonly maxTokens?: number;
+	/**
+	 * Force the direct path onto `messages.stream` regardless of `maxTokens`.
+	 * Use when a call may run long enough to trip the SDK's non-streaming "10
+	 * minute" refusal even below {@link STREAMING_THRESHOLD_TOKENS} (e.g. the
+	 * ingest route call). Replaces the old trick of padding `maxTokens` just
+	 * above the threshold to coerce the streaming path — an explicit flag can't
+	 * be silently undone by retuning the threshold or the token count. No effect
+	 * in proxy mode.
+	 */
+	readonly forceStreaming?: boolean;
 	/** Optional prompt revision to pin (proxy mode only) */
 	readonly version?: number;
 }
@@ -319,7 +343,9 @@ async function callDirect(
 	// (the merge path raised this to 64k) keeps working without a per-call
 	// switch. `finalMessage()` resolves to the same `Anthropic.Message` shape
 	// `messages.create` returns, so the downstream code is unchanged.
-	const useStreaming = maxTokens > STREAMING_THRESHOLD_TOKENS;
+	// `forceStreaming` lets a caller pick streaming explicitly even below the
+	// token threshold (the ingest route call) instead of padding maxTokens.
+	const useStreaming = options.forceStreaming === true || maxTokens > STREAMING_THRESHOLD_TOKENS;
 
 	let response: Anthropic.Message;
 	try {
@@ -348,10 +374,15 @@ async function callDirect(
 			};
 			armIdleWatchdog();
 			stream.on("streamEvent", armIdleWatchdog);
+			// Absolute cap, NOT reset by stream events — bounds a stream that keeps
+			// pinging but never completes, which the idle watchdog alone can't catch.
+			const hardTimer = setTimeout(() => stream.abort(), STREAM_MAX_WALL_CLOCK_MS);
+			hardTimer.unref?.();
 			try {
 				response = await stream.finalMessage();
 			} finally {
 				clearTimeout(idleTimer);
+				clearTimeout(hardTimer);
 			}
 		} else {
 			// Hard cap on the in-flight HTTP request — see `DIRECT_FETCH_TIMEOUT_MS`.

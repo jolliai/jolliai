@@ -159,6 +159,36 @@ describe("MetadataManager", () => {
 			expect(manager.findById("a")?.path).toBe("main/a-renamed.md");
 			expect(manager.findById("b")?.path).toBe("main/b.md");
 		});
+
+		it("unregisterFilesByType removes only entries of the given type and returns the count", () => {
+			manager.updateManifest(makeEntry({ fileId: "c1", type: "commit" }));
+			manager.updateManifest(makeEntry({ fileId: "w1", type: "wiki" }));
+			manager.updateManifest(makeEntry({ fileId: "w2", type: "wiki" }));
+
+			expect(manager.unregisterFilesByType("wiki")).toBe(2);
+			const remaining = manager.readManifest().files;
+			expect(remaining).toHaveLength(1);
+			expect(remaining[0].fileId).toBe("c1");
+		});
+
+		it("unregisterFilesByType returns 0 and leaves the manifest untouched when no entry matches", () => {
+			manager.updateManifest(makeEntry({ fileId: "c1", type: "commit" }));
+			expect(manager.unregisterFilesByType("wiki")).toBe(0);
+			expect(manager.readManifest().files).toHaveLength(1);
+		});
+
+		it("replaceFiles swaps the entire files array in one write", () => {
+			manager.updateManifest(makeEntry({ fileId: "old" }));
+			const next = [makeEntry({ fileId: "x", path: "main/x.md" }), makeEntry({ fileId: "y", path: "main/y.md" })];
+
+			manager.replaceFiles(next);
+			expect(
+				manager
+					.readManifest()
+					.files.map((f) => f.fileId)
+					.sort(),
+			).toEqual(["x", "y"]);
+		});
 	});
 
 	describe("branch mapping", () => {
@@ -196,6 +226,20 @@ describe("MetadataManager", () => {
 			expect(removed).toBe(1);
 			expect(manager.readManifest().files).toHaveLength(1);
 			expect(manager.findById("b")).toBeDefined();
+		});
+
+		it("removeBranchMapping drops the mapping and returns true", () => {
+			manager.resolveFolderForBranch("feature/gone");
+			expect(manager.listBranchMappings()).toHaveLength(1);
+
+			expect(manager.removeBranchMapping("feature/gone")).toBe(true);
+			expect(manager.listBranchMappings()).toHaveLength(0);
+		});
+
+		it("removeBranchMapping is a no-op returning false when the branch is not mapped", () => {
+			manager.resolveFolderForBranch("feature/kept");
+			expect(manager.removeBranchMapping("feature/never-mapped")).toBe(false);
+			expect(manager.listBranchMappings().map((m) => m.branch)).toEqual(["feature/kept"]);
 		});
 
 		it("renameBranchFolder leaves unrelated manifest entries untouched and returns 0 when nothing matches", () => {

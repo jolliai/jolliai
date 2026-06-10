@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
@@ -35,7 +35,13 @@ import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
-import { acquireWorkerLock, refreshWorkerLockMtime, releaseWorkerLock, withPlansLock } from "../core/Locks.js";
+import {
+	acquireWorkerLock,
+	refreshWorkerLockMtime,
+	releaseWorkerLock,
+	WORKER_PHASE_FILE,
+	withPlansLock,
+} from "../core/Locks.js";
 import { formatNotesBlock } from "../core/NotePromptFormatter.js";
 import { discoverOpenCodeSessions, isOpenCodeInstalled } from "../core/OpenCodeSessionDiscoverer.js";
 import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
@@ -92,7 +98,7 @@ import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import { deriveSourceTag } from "../install/DistPathResolver.js";
-import { createLogger, errMsg, setLogDir, setLogLevel } from "../Logger.js";
+import { createLogger, errMsg, getJolliMemoryDir, setLogDir, setLogLevel } from "../Logger.js";
 import { consumePendingWorkers, recordPendingWorker } from "../sync/PendingWorkers.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
 import { acquireVaultWriteLock, DEFAULT_VAULT_WRITE_WAIT_MS } from "../sync/VaultWriteLock.js";
@@ -380,6 +386,20 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			return;
 		}
 
+		// Clear a stale `worker-phase` marker at the source. Holding worker.lock
+		// proves no other worker for this repo is alive, so any leftover phase file
+		// was orphaned by a crashed/SIGKILL'd predecessor whose `finally` cleanup
+		// (in processQueueEntry) never ran. Removing it here keeps the file's
+		// lifetime genuinely lock-bound — otherwise it survives indefinitely and
+		// mislabels the next plain summary run as "Updating Memory Bank…".
+		try {
+			rmSync(join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE), { force: true });
+		} catch (e) {
+			/* v8 ignore start -- best-effort cleanup; only an EPERM-class error reaches here and is non-fatal */
+			log.debug("stale worker-phase cleanup skipped (non-fatal): %s", errMsg(e));
+			/* v8 ignore stop */
+		}
+
 		// Periodically bump the worker.lock mtime — same rationale as
 		// vault-write.lock above.
 		/* v8 ignore start -- setInterval's lambda only fires on a real timer tick; unit tests finish in milliseconds and never observe the callback. */
@@ -499,7 +519,27 @@ async function processQueueEntry(
 	// No commit-hash or branch field; dispatch and return before commit-only code.
 	if (isIngestOperation(op)) {
 		log.info("Processing queue entry: type=ingest triggeredBy=%s", op.triggeredBy);
-		await runIngestFromQueue(op, cwd, storage);
+		// Cosmetic phase marker so the VS Code toolbar shows "Updating Memory
+		// Bank…" instead of "AI summary in progress…" during the (potentially
+		// ~80s) topic-KB ingest. Best-effort: a write/delete failure must never
+		// break ingest, so both ends are wrapped and logged at debug only.
+		const phaseFile = join(getJolliMemoryDir(cwd), WORKER_PHASE_FILE);
+		try {
+			writeFileSync(phaseFile, "ingest");
+		} catch (e) {
+			/* v8 ignore next -- best-effort cosmetic marker; write failure is non-fatal */
+			log.debug("worker-phase write skipped (non-fatal): %s", errMsg(e));
+		}
+		try {
+			await runIngestFromQueue(op, cwd, storage);
+		} finally {
+			try {
+				rmSync(phaseFile, { force: true });
+			} catch (e) {
+				/* v8 ignore next -- best-effort cosmetic marker; cleanup failure is non-fatal */
+				log.debug("worker-phase cleanup skipped (non-fatal): %s", errMsg(e));
+			}
+		}
 		return;
 	}
 

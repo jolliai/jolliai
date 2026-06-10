@@ -2357,29 +2357,6 @@ describe("FolderStorage", () => {
 		});
 	});
 
-	describe("statFile", () => {
-		beforeEach(async () => {
-			await storage.ensure();
-		});
-
-		it("returns mtimeMs for an existing hidden file", async () => {
-			await storage.writeFiles([{ path: "index.json", content: '{"version":3}' }], "seed");
-			const st = await storage.statFile("index.json");
-			expect(st).not.toBeNull();
-			expect(typeof st?.mtimeMs).toBe("number");
-			expect(st?.mtimeMs).toBeGreaterThan(0);
-		});
-
-		it("returns null for a nonexistent file", async () => {
-			expect(await storage.statFile("ghost.json")).toBeNull();
-		});
-
-		it("returns null when the path is a directory (not a file)", async () => {
-			mkdirSync(join(rootPath, ".jolli", "summaries"), { recursive: true });
-			expect(await storage.statFile("summaries")).toBeNull();
-		});
-	});
-
 	describe("markDirty suppressed-write path", () => {
 		beforeEach(async () => {
 			await storage.ensure();

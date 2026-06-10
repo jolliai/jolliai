@@ -2074,4 +2074,20 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).toContain("getAttribute('data-session')");
 		});
 	});
+
+	it("selects the Updating Memory Bank label for the ingest phase", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("Updating Memory Bank…");
+		expect(js).toContain("state.workerPhase === 'ingest'");
+	});
+
+	it("keeps the default AI summary label for non-ingest busy state", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("AI summary in progress…");
+	});
+
+	it("handles the worker:phase message channel", () => {
+		const js = buildSidebarScript();
+		expect(js).toContain("case 'worker:phase'");
+	});
 });

@@ -791,6 +791,7 @@ const {
 			setEnabled: vi.fn(),
 			setMigrating: vi.fn(),
 			setWorkerBusy: vi.fn(),
+			setWorkerPhase: vi.fn(),
 			setExtensionOutdated: vi.fn(),
 			setStatus: vi.fn(),
 			setMainBranch: vi.fn(),

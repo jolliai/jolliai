@@ -77,6 +77,22 @@ export async function compileAllRepos(
 						storage,
 					);
 					await renderTopicKBWiki(t.kbRoot, storage);
+					// Keep the local search index warm so query-time rebuilds are rare.
+					// Disposable cache: a failure here must never fail the compile.
+					// SearchIndex (→ @orama/*) is lazy-imported INSIDE this try so a
+					// load failure is contained the same way the node:sqlite readers
+					// are — a missing/incompatible orama degrades to "index not warmed",
+					// it never crashes module load or the whole sweep.
+					try {
+						const { SearchIndex } = await import("./SearchIndex.js");
+						await SearchIndex.rebuild(t.kbRoot, storage);
+					} catch (idxErr) {
+						log.warn(
+							"Search index update failed for %s (non-fatal): %s",
+							t.folder,
+							idxErr instanceof Error ? idxErr.message : String(idxErr),
+						);
+					}
 					totalIngested += ingested;
 					repos.push({ folder: t.folder, repoIdentity: t.repoIdentity, ingested, batches });
 					log.info("Compiled %s: %d source(s) in %d batch(es)", t.folder, ingested, batches);

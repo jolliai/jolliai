@@ -127,6 +127,17 @@ describe("registerCompileCommand", () => {
 		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("5 source(s) across 2 repo(s)"));
 	});
 
+	it("shows a skipped notice (not a 0-source success) when the sweep was lock-contended", async () => {
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", localFolder: "/mb" });
+		mockCompileAllRepos.mockResolvedValue({ repos: [], totalIngested: 0, failed: 0, skipped: true });
+		registerCompileCommand(makeOpts());
+
+		await registeredHandlers.get("jollimemory.compileNow")?.();
+
+		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("already running"));
+		expect(showInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("0 source(s)"));
+	});
+
 	it("surfaces failed count in the success toast", async () => {
 		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", localFolder: "/mb" });
 		mockCompileAllRepos.mockResolvedValue({

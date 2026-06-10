@@ -12,7 +12,7 @@
  * 4. Updates manifest to track the AI-generated file
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { rmdir } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { createLogger, errMsg } from "../Logger.js";
@@ -73,17 +73,6 @@ export class FolderStorage implements StorageProvider {
 		if (!existsSync(file)) return null;
 		try {
 			return readFileSync(file, "utf-8");
-		} catch {
-			return null;
-		}
-	}
-
-	async statFile(path: string): Promise<{ mtimeMs: number } | null> {
-		const file = join(this.rootPath, ".jolli", path);
-		try {
-			const st = statSync(file);
-			if (!st.isFile()) return null;
-			return { mtimeMs: st.mtimeMs };
 		} catch {
 			return null;
 		}

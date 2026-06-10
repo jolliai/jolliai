@@ -19,7 +19,6 @@
  *   - per-file read failure                       → skip + WARN
  */
 
-import { createHash } from "node:crypto";
 import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { createLogger } from "../Logger.js";
@@ -280,7 +279,9 @@ function collectMarkdown(args: CollectArgs): void {
 		}
 		/* v8 ignore stop */
 
-		const fingerprint = createHash("sha256").update(content, "utf-8").digest("hex");
+		// Shared helper (NOT an inline createHash) so this fingerprint stays in
+		// lockstep with the manifest fingerprint and SourceContent's verify hash.
+		const fingerprint = MetadataManager.sha256(content);
 		const localRelPath = toForwardSlash(relative(localFolderRoot, absolutePath));
 
 		out.push({

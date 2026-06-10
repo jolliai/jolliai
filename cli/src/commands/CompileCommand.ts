@@ -17,13 +17,15 @@ import { compileAllRepos } from "../core/MultiRepoCompile.js";
 import { emptyProcessedSet, saveProcessedSet } from "../core/ProcessedSourceStore.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
-import { setActiveStorage } from "../core/SummaryStore.js";
+import { getActiveStorage, setActiveStorage } from "../core/SummaryStore.js";
 import { emptyTopicIndex, readTopicIndex, saveTopicIndex } from "../core/TopicIndexStore.js";
 import { purgeTopicPagesExcept } from "../core/TopicPageStore.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
-import { setLogDir } from "../Logger.js";
+import { createLogger, setLogDir } from "../Logger.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
 import { DEFAULT_VAULT_WRITE_WAIT_MS, withVaultWriteLock } from "../sync/VaultWriteLock.js";
+
+const log = createLogger("CompileCommand");
 
 export type CompileOptions = { rebuild?: boolean; cwd?: string };
 
@@ -38,51 +40,73 @@ async function compileSingleRepo(cwd: string, rebuild: boolean): Promise<void> {
 		return;
 	}
 	const storage = await createStorage(cwd, cwd);
+	// Capture + restore the process-global override so a single-repo compile
+	// doesn't leak it into a long-lived host (mirrors compileAllRepos). Benign in
+	// the one-shot CLI, but executeCompile is an exported entry point.
+	const previousStorage = getActiveStorage();
 	setActiveStorage(storage);
+	try {
+		// Serialise on the same `vault-write.lock` the background QueueWorker holds for
+		// its ingest drain. Without it, a manual compile racing a post-commit worker
+		// lost-updates `topics/index.json` and the `drainIngest → readTopicIndex →
+		// purgeTopicPagesExcept` window can delete a topic page the worker just wrote.
+		// Wait mode (not fail-fast): the user explicitly asked to compile, so yield to
+		// a busy worker/sync rather than skip outright.
+		const vaultRoot = deriveMemoryBankRoot(config.localFolder);
+		const result = await withVaultWriteLock(vaultRoot, { wait: DEFAULT_VAULT_WRITE_WAIT_MS }, async () => {
+			if (rebuild) {
+				// Reset the watermark + index only. An empty index makes route treat every
+				// topic as new, so reconcile gets current=null (clean rebuild).
+				console.log("\n  Rebuilding knowledge base from scratch...");
+				await saveProcessedSet(emptyProcessedSet(), cwd);
+				await saveTopicIndex(emptyTopicIndex(), cwd);
+			} else {
+				console.log("\n  Ingesting pending sources into the knowledge base...");
+			}
 
-	// Serialise on the same `vault-write.lock` the background QueueWorker holds for
-	// its ingest drain. Without it, a manual compile racing a post-commit worker
-	// lost-updates `topics/index.json` and the `drainIngest → readTopicIndex →
-	// purgeTopicPagesExcept` window can delete a topic page the worker just wrote.
-	// Wait mode (not fail-fast): the user explicitly asked to compile, so yield to
-	// a busy worker/sync rather than skip outright.
-	const vaultRoot = deriveMemoryBankRoot(config.localFolder);
-	const result = await withVaultWriteLock(vaultRoot, { wait: DEFAULT_VAULT_WRITE_WAIT_MS }, async () => {
-		if (rebuild) {
-			// Reset the watermark + index only. An empty index makes route treat every
-			// topic as new, so reconcile gets current=null (clean rebuild).
-			console.log("\n  Rebuilding knowledge base from scratch...");
-			await saveProcessedSet(emptyProcessedSet(), cwd);
-			await saveTopicIndex(emptyTopicIndex(), cwd);
-		} else {
-			console.log("\n  Ingesting pending sources into the knowledge base...");
+			const drainResult = await drainIngest(cwd, config, { triggeredBy: "manual" });
+			// Converge the canonical layer to the index: drop topic pages no longer
+			// referenced (e.g. left behind when --rebuild replays into fewer topics).
+			const index = await readTopicIndex(cwd, storage);
+			await purgeTopicPagesExcept(
+				index.topics.map((t) => t.stableSlug),
+				cwd,
+				storage,
+			);
+			await renderTopicKBWiki(cwd, storage);
+			// Keep the local search index warm so the next query (MCP server / `jolli
+			// search`) rarely pays a lazy rebuild. Disposable cache: a failure here must
+			// never fail the compile. SearchIndex (→ @orama/*) is lazy-imported INSIDE
+			// this try so a load failure is contained (mirrors compileAllRepos).
+			try {
+				const { SearchIndex } = await import("../core/SearchIndex.js");
+				await SearchIndex.rebuild(cwd, storage);
+			} catch (idxErr) {
+				log.warn(
+					"Search index update failed (non-fatal): %s",
+					idxErr instanceof Error ? idxErr.message : String(idxErr),
+				);
+			}
+			return drainResult;
+		});
+
+		if (!result.ran) {
+			console.error(
+				"\n  Error: another vault writer (a background worker or sync) is busy — try again shortly.\n",
+			);
+			process.exitCode = 1;
+			return;
 		}
 
-		const drainResult = await drainIngest(cwd, config, { triggeredBy: "manual" });
-		// Converge the canonical layer to the index: drop topic pages no longer
-		// referenced (e.g. left behind when --rebuild replays into fewer topics).
-		const index = await readTopicIndex(cwd, storage);
-		await purgeTopicPagesExcept(
-			index.topics.map((t) => t.stableSlug),
-			cwd,
-			storage,
-		);
-		await renderTopicKBWiki(cwd, storage);
-		return drainResult;
-	});
-
-	if (!result.ran) {
-		console.error("\n  Error: another vault writer (a background worker or sync) is busy — try again shortly.\n");
-		process.exitCode = 1;
-		return;
+		const { batches, ingested, outcome, topicFailures } = result.value;
+		let summary = `\n  Done: ${ingested} source(s) folded in ${batches} batch(es). Wiki rebuilt. [${outcome}]`;
+		if (topicFailures.length > 0) {
+			summary += `\n  ${topicFailures.length} topic(s) held: ${topicFailures.map((f) => `${f.slug} (${f.code})`).join(", ")}`;
+		}
+		console.log(`${summary}\n`);
+	} finally {
+		setActiveStorage(previousStorage);
 	}
-
-	const { batches, ingested, outcome, topicFailures } = result.value;
-	let summary = `\n  Done: ${ingested} source(s) folded in ${batches} batch(es). Wiki rebuilt. [${outcome}]`;
-	if (topicFailures.length > 0) {
-		summary += `\n  ${topicFailures.length} topic(s) held: ${topicFailures.map((f) => `${f.slug} (${f.code})`).join(", ")}`;
-	}
-	console.log(`${summary}\n`);
 }
 
 /** Sweep every repo under the Memory Bank folder. */

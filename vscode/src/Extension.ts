@@ -833,6 +833,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				statusProvider.onDidChangeTreeData.bind(statusProvider),
 			getWorkerBusy: () => statusProvider.getWorkerBusy(),
 			getSyncPhase: () => statusStore.getSnapshot().syncPhase,
+			getWorkerPhase: () => statusStore.getSnapshot().workerPhase,
 		},
 		memoriesProvider: {
 			serialize: () => memoriesProvider.serialize(),
@@ -1461,6 +1462,41 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(lockWatcher);
 	// Check initial state — lock file might already exist on activation
 	void isWorkerBusy(workspaceRoot).then(setWorkerBusy);
+
+	// ── Worker phase file watcher ───────────────────────────────────────
+	// The worker writes `.jolli/jollimemory/worker-phase` (content "ingest")
+	// while running a topic-KB ingest, so the Branch toolbar can show
+	// "Updating Memory Bank…" instead of "AI summary in progress…". The phase
+	// is purely cosmetic; its busy-bound lifetime (StatusStore clears it on
+	// workerBusy=false) means a stale marker left by a crashed worker can't
+	// outlive the lock. Separate from the lock watcher because a phase-file
+	// write does not touch worker.lock, so onDidChange there would not fire.
+	const phaseWatcher = vscode.workspace.createFileSystemWatcher(
+		new vscode.RelativePattern(workspaceRoot, ".jolli/jollimemory/worker-phase"),
+	);
+	const readWorkerPhase = async (): Promise<void> => {
+		try {
+			const uri = vscode.Uri.joinPath(
+				vscode.Uri.file(workspaceRoot),
+				".jolli",
+				"jollimemory",
+				"worker-phase",
+			);
+			const bytes = await vscode.workspace.fs.readFile(uri);
+			const content = Buffer.from(bytes).toString("utf-8").trim();
+			statusStore.setWorkerPhase(content === "ingest" ? "ingest" : null);
+		} catch {
+			// File missing / unreadable → no special phase.
+			statusStore.setWorkerPhase(null);
+		}
+	};
+	phaseWatcher.onDidCreate(() => void readWorkerPhase());
+	phaseWatcher.onDidChange(() => void readWorkerPhase());
+	phaseWatcher.onDidDelete(() => statusStore.setWorkerPhase(null));
+	context.subscriptions.push(phaseWatcher);
+	// Check initial state — phase file might already exist on activation
+	// (extension started while a worker is mid-ingest).
+	void readWorkerPhase();
 
 	// COMMITS title updates are handled by the commitsStore.onChange subscription
 	// the sidebar webview wires up — no provider hook needed.

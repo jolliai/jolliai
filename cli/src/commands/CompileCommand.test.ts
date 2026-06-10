@@ -9,6 +9,7 @@ vi.mock("../core/StorageFactory.js", () => ({
 }));
 vi.mock("../core/SummaryStore.js", () => ({
 	setActiveStorage: vi.fn(),
+	getActiveStorage: vi.fn(() => null),
 }));
 vi.mock("../core/IngestPipeline.js", () => ({
 	drainIngest: vi.fn(async () => ({ batches: 1, ingested: 3, outcome: "OK", topicFailures: [] })),
@@ -62,7 +63,8 @@ import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
 import { compileAllRepos } from "../core/MultiRepoCompile.js";
 import { saveProcessedSet } from "../core/ProcessedSourceStore.js";
 import { loadConfig } from "../core/SessionTracker.js";
-import { saveTopicIndex } from "../core/TopicIndexStore.js";
+import { readTopicIndex, saveTopicIndex } from "../core/TopicIndexStore.js";
+import { purgeTopicPagesExcept } from "../core/TopicPageStore.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
 import { withVaultWriteLock } from "../sync/VaultWriteLock.js";
 import { registerCompileCommand } from "./CompileCommand.js";
@@ -239,6 +241,23 @@ describe("registerCompileCommand", () => {
 		expect(process.exitCode).toBe(1);
 		expect(mockDrainIngest).not.toHaveBeenCalled();
 		expect(vi.mocked(appendCredentialMissingRun)).toHaveBeenCalledWith("/repo", "manual");
+	});
+
+	it("--cwd: passes the index's stable slugs to the topic-page purge", async () => {
+		// The slug-mapping callback in the `purgeTopicPagesExcept(index.topics.map(...))`
+		// call only executes when the index is non-empty. The default mock returns an
+		// empty `topics` array, leaving that arrow uncovered; a populated index exercises
+		// it and pins the convergence contract (keep exactly the indexed slugs).
+		vi.mocked(readTopicIndex).mockResolvedValueOnce({
+			schemaVersion: 1,
+			topics: [{ stableSlug: "auth-flow" }, { stableSlug: "storage-layer" }],
+		} as never);
+		await runCompile(["--cwd", "/repo"]);
+		expect(vi.mocked(purgeTopicPagesExcept)).toHaveBeenCalledWith(
+			["auth-flow", "storage-layer"],
+			"/repo",
+			expect.anything(),
+		);
 	});
 
 	it("--cwd: prints the outcome code and held topics in the summary", async () => {

@@ -543,4 +543,17 @@ describe("version-line compatibility", () => {
 		// And it now carries the new metadata.version form.
 		expect(readRecall()).toMatch(/metadata:\n {2}version:/);
 	});
+
+	it("rewrites when the existing file has no recognizable version line at all", async () => {
+		// No `version:` / `jolli-skill-version:` / `jollimemory-version:` anywhere
+		// → the version-match regex returns null (the `if (versionMatch)` false
+		// branch) and the installer falls through to a fresh write.
+		const fs = await import("node:fs");
+		const planted = `---\nname: jolli-recall\n---\nbody with no version key`;
+		fs.mkdirSync(join(tempDir, ".claude/skills/jolli-recall"), { recursive: true });
+		fs.writeFileSync(join(tempDir, ".claude/skills/jolli-recall/SKILL.md"), planted, "utf-8");
+		await updateSkillsIfNeeded(tempDir);
+		expect(readRecall()).not.toBe(planted);
+		expect(readRecall()).toMatch(/metadata:\n {2}version:/);
+	});
 });

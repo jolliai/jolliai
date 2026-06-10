@@ -639,6 +639,107 @@ describe("renderContextMarkdown", () => {
 		expect(md).toContain("### Inbox [global: Inbox.md]");
 	});
 
+	it("a large user-knowledge file is truncated to its own budget, not allowed to evict the commit history", () => {
+		const ctx = {
+			branch: "feature/test",
+			period: { start: "2026-03-28T10:00:00.000Z", end: "2026-03-28T10:00:00.000Z" },
+			commitCount: 1,
+			totalFilesChanged: 1,
+			totalInsertions: 10,
+			totalDeletions: 0,
+			summaries: [makeSummary()],
+			plans: [],
+			notes: [],
+			keyDecisions: [],
+			userKnowledgeTopics: [
+				{ title: "Huge", content: "U ".repeat(6000), source: "huge.md", scope: "global" as const },
+			],
+			stats: {
+				topicCount: 1,
+				planCount: 0,
+				noteCount: 0,
+				decisionCount: 0,
+				topicTokens: 10,
+				planTokens: 0,
+				noteTokens: 0,
+				decisionTokens: 0,
+				transcriptTokens: 0,
+				totalTokens: 10,
+			},
+		};
+
+		// Before the fix the user file lived in the never-truncated decisions
+		// bucket, blew past the budget, and the function returned early WITHOUT
+		// the commit history. The commit history must survive.
+		const md = renderContextMarkdown(ctx, 500);
+		expect(md).toContain("## Commit History (chronological)");
+		expect(md).toContain("[... truncated due to token budget]");
+	});
+
+	it("a small user-knowledge file does not shrink the commit-summary budget (reclaims its unused share)", () => {
+		// Large commit body so summary truncation is observable, no plans/notes/
+		// decisions. The user-knowledge bucket is capped at 50% of the body, but a
+		// SMALL file must consume only what it needs — the unused remainder has to
+		// stay available to summaries, not be stranded (the old 50/50 split clipped
+		// summaries even when user knowledge barely used its half).
+		const big = "Implemented feature X with a new module. ".repeat(120);
+		const baseCtx = {
+			branch: "feature/test",
+			period: { start: "2026-03-28T10:00:00.000Z", end: "2026-03-28T10:00:00.000Z" },
+			commitCount: 1,
+			totalFilesChanged: 1,
+			totalInsertions: 10,
+			totalDeletions: 0,
+			summaries: [
+				makeSummary({
+					topics: [
+						{
+							title: "Feature X",
+							trigger: "Need feature X",
+							response: big,
+							decisions: "",
+							category: "feature",
+							importance: "major",
+							filesAffected: [],
+						},
+					],
+				}),
+			],
+			plans: [],
+			notes: [],
+			keyDecisions: [],
+			stats: {
+				topicCount: 1,
+				planCount: 0,
+				noteCount: 0,
+				decisionCount: 0,
+				topicTokens: 100,
+				planTokens: 0,
+				noteTokens: 0,
+				decisionTokens: 0,
+				transcriptTokens: 0,
+				totalTokens: 100,
+			},
+		};
+
+		// A budget that fits the whole context (no user knowledge) untruncated.
+		const budget = estimateTokens(renderContextMarkdown(baseCtx, 1_000_000));
+		expect(renderContextMarkdown(baseCtx, budget)).not.toContain("[... truncated due to token budget]");
+
+		// Add a tiny Memory Bank file and give the budget just its extra tokens.
+		const md = renderContextMarkdown(
+			{
+				...baseCtx,
+				userKnowledgeTopics: [
+					{ title: "Tip", content: "small note", source: "t.md", scope: "global" as const },
+				],
+			},
+			budget + 50,
+		);
+		expect(md).toContain("small note");
+		expect(md).not.toContain("[... truncated due to token budget]");
+	});
+
 	it("should omit decisions section when no decisions", () => {
 		const ctx = {
 			branch: "feature/test",
@@ -1327,6 +1428,42 @@ describe("buildRecallPayload", () => {
 		);
 		expect(payload.plans[0]).toEqual({ slug: "p1", title: "P1", content: "plan body" });
 		expect(payload.notes[0]).toEqual({ id: "n1", title: "N1", content: "note body" });
+	});
+
+	it("ships userKnowledge top-level so the JSON/MCP recall path sees Memory Bank files (was dropped)", () => {
+		const payload = buildRecallPayload(
+			makeCtx({
+				userKnowledgeTopics: [
+					{ title: "Auth", content: "Use PKCE", source: "auth.md", scope: "branch" as const },
+				],
+			}),
+			100_000,
+		);
+		expect(payload.userKnowledge).toEqual([
+			{ title: "Auth", source: "auth.md", scope: "branch", content: "Use PKCE" },
+		]);
+	});
+
+	it("omits userKnowledge when the context has none", () => {
+		expect(buildRecallPayload(makeCtx(), 100_000).userKnowledge).toBeUndefined();
+	});
+
+	it("drops userKnowledge content under budget pressure before evicting commits (keeps title+source)", () => {
+		const payload = buildRecallPayload(
+			makeCtx({
+				userKnowledgeTopics: [
+					{ title: "Big", content: "U".repeat(8000), source: "big.md", scope: "global" as const },
+				],
+			}),
+			1000,
+		);
+		expect(payload.truncated).toBe(true);
+		// A large user file must not evict the commit (with its decisions) ...
+		expect(payload.commits).toHaveLength(1);
+		expect(payload.commits[0].topics[0].decisions).toBeDefined();
+		// ... its body is dropped first, leaving title+source as a citation anchor.
+		expect(payload.userKnowledge).toBeDefined();
+		expect(payload.userKnowledge?.[0]).toEqual({ title: "Big", source: "big.md", scope: "global" });
 	});
 
 	it("under tight budget drops topic.response first (preserves trigger and decisions)", () => {

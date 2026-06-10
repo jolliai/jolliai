@@ -12,7 +12,7 @@ import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitClient } from "./GitClient.js";
-import { buildGitignore, MemoryBankBootstrap } from "./MemoryBankBootstrap.js";
+import { buildGitignore, isPerDeviceJsonPath, MemoryBankBootstrap } from "./MemoryBankBootstrap.js";
 
 let tempDir: string;
 let memoryBankRoot: string;
@@ -62,6 +62,27 @@ describe("buildGitignore (Phase 1 — minimal engine-managed template)", () => {
 
 	it("produces stable output across calls (idempotency)", () => {
 		expect(buildGitignore()).toBe(buildGitignore());
+	});
+});
+
+describe("isPerDeviceJsonPath", () => {
+	it("matches a per-repo shadow-status.json (the realistic <repo>/.jolli/ shape)", () => {
+		expect(isPerDeviceJsonPath("jolliai/.jolli/shadow-status.json")).toBe(true);
+		expect(isPerDeviceJsonPath("some/deep/repo/.jolli/shadow-status.json")).toBe(true);
+	});
+
+	it("does NOT match the bare suffix with nothing before it (length must exceed the suffix)", () => {
+		// The suffix carries a leading slash, so a root-level ".jolli/shadow-status.json"
+		// (no `<repo>/` prefix) is shorter-or-equal and must not match — the engine
+		// never writes per-device JSON at the vault root.
+		expect(isPerDeviceJsonPath(".jolli/shadow-status.json")).toBe(false);
+		expect(isPerDeviceJsonPath("/.jolli/shadow-status.json")).toBe(false);
+	});
+
+	it("does NOT match unrelated paths", () => {
+		expect(isPerDeviceJsonPath("jolliai/.jolli/index.json")).toBe(false);
+		expect(isPerDeviceJsonPath("jolliai/main/notes.md")).toBe(false);
+		expect(isPerDeviceJsonPath("")).toBe(false);
 	});
 });
 

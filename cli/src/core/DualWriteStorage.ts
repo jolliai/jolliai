@@ -19,6 +19,11 @@ export class DualWriteStorage implements StorageProvider {
 		private readonly shadow: StorageProvider,
 	) {}
 
+	/** Folder root for the disposable search index — the shadow (folder) backend's. */
+	get kbRoot(): string | undefined {
+		return this.shadow.kbRoot;
+	}
+
 	async readFile(path: string): Promise<string | null> {
 		return this.primary.readFile(path);
 	}
@@ -32,14 +37,6 @@ export class DualWriteStorage implements StorageProvider {
 		const result = new Map<string, string | null>();
 		for (const path of paths) result.set(path, await this.primary.readFile(path));
 		return result;
-	}
-
-	async statFile(path: string): Promise<{ mtimeMs: number } | null> {
-		// spec 110 — forward stat to primary (matches readFile routing).
-		// Optional method: undefined on primary → undefined drift here (e.g.
-		// orphan primary lacks real mtime).
-		if (!this.primary.statFile) return null;
-		return this.primary.statFile(path);
 	}
 
 	// Primary writes first because it's the source of truth (orphan branch).

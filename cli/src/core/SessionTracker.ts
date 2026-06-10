@@ -12,6 +12,7 @@
  * Lock primitives (`worker.lock` / `orphan-write.lock`) live in `Locks.ts`.
  */
 
+import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -559,18 +560,29 @@ const GIT_OP_QUEUE_DIR = "git-op-queue";
 const GIT_OP_QUEUE_STALE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
- * Process-local monotonic sequence so two enqueues within the same
- * millisecond cannot collide on filename. Old on-disk entries without the
- * sequence segment still sort correctly because they were written under
- * lower wall-clock ms; this segment only disambiguates within a single ms.
+ * Process-local monotonic sequence — disambiguates two enqueues within the same
+ * millisecond *in the same process*. It does NOT disambiguate across processes
+ * (each fresh node process starts at 0), which is why the filename also carries
+ * {@link PROCESS_NONCE}.
  */
 let enqueueSeq = 0;
 
 /**
+ * Per-process random nonce. The git hooks run as separate node processes
+ * (post-commit, post-merge, the QueueWorker re-enqueue) that can each enqueue
+ * in the same millisecond with the same tag — `{ms}-00000001-ingest` from two
+ * processes would collide and one atomicWrite would overwrite the other, losing
+ * a queue entry. Adding a process-unique segment makes the filename unique
+ * across processes without disturbing the timestamp-first sort order.
+ */
+const PROCESS_NONCE = randomBytes(4).toString("hex");
+
+/**
  * Enqueues a git operation for Worker processing.
  * Each entry is written as a separate file to avoid concurrent-write conflicts.
- * Filename format: `{timestamp}-{seq}-{tag}.json` ensures correct processing
- * order even when multiple enqueues land in the same millisecond.
+ * Filename format: `{timestamp}-{seq}-{nonce}-{tag}.json`. The `{timestamp}`
+ * prefix drives the chronological drain sort; `{seq}` + `{nonce}` only guarantee
+ * uniqueness (within and across processes) for same-millisecond enqueues.
  *
  * Tag is `hash8` for commit operations and `ingest` for ingest operations —
  * both fit the existing chronological-sort drain logic.
@@ -584,7 +596,7 @@ export async function enqueueGitOperation(op: GitOperation, cwd?: string): Promi
 
 		const timestamp = Date.now();
 		const seq = (++enqueueSeq).toString().padStart(8, "0");
-		const fileName = `${timestamp}-${seq}-${tag}.json`;
+		const fileName = `${timestamp}-${seq}-${PROCESS_NONCE}-${tag}.json`;
 		await atomicWrite(join(queueDir, fileName), JSON.stringify(op, null, "\t"));
 		log.info("Enqueued queue operation: type=%s tag=%s file=%s", op.type, tag, fileName);
 		return true;

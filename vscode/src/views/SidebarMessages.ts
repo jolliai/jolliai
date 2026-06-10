@@ -629,6 +629,18 @@ export type SidebarInboundMsg =
 	| { readonly type: "worker:busy"; readonly busy: boolean }
 	| {
 			/**
+			 * Worker-phase indicator for the Branch-tab toolbar. Selects a
+			 * distinct label for specific worker phases — currently only
+			 * `"ingest"` (topic-KB ingest), which renders "Updating Memory
+			 * Bank…" instead of the default "AI summary in progress…". `null`
+			 * falls back to the default label. Lifetime is bound to
+			 * `worker:busy` on the reader side.
+			 */
+			readonly type: "worker:phase";
+			readonly phase: "ingest" | null;
+	  }
+	| {
+			/**
 			 * Sync-phase indicator for the Branch-tab toolbar. `phase: null`
 			 * → idle (sidebar hides the indicator). Non-null → render the
 			 * label with a spinning loading icon (`severity: "info"`) or a

@@ -81,6 +81,7 @@ import {
 	removePrepareMsgHook,
 } from "./GitHookInstaller.js";
 import type { HookOpResult } from "./HookSettingsHelper.js";
+import { MCP_GIT_EXCLUDE_PATH, registerMcpInClaude, removeMcpFromClaude } from "./McpRegistration.js";
 import { SKILL_GIT_EXCLUDE_PATHS, updateSkillIfNeeded } from "./SkillInstaller.js";
 
 // ─── Re-exports for backward compatibility ──────────────────────────────────
@@ -205,10 +206,12 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			// We update SKILL.md before the Claude-hook gate below so disabling
 			// Claude doesn't strand the `.agents/` skills target unupdated.
 			await updateSkillIfNeeded(wt, { claudeEnabled: config.claudeEnabled });
-			// Keep the user's `git status` clean by adding Jolli-managed skill
-			// paths to `.git/info/exclude`. Worktree-aware: linked worktrees
-			// may have their own gitdir, so we resolve per-worktree.
-			await updateGitExclude(wt, SKILL_GIT_EXCLUDE_PATHS);
+			// Keep the user's `git status` clean by adding Jolli-managed paths to
+			// `.git/info/exclude`. Worktree-aware: linked worktrees may have their
+			// own gitdir, so we resolve per-worktree. `.mcp.json` is included
+			// because registerMcpInClaude (below) writes it with a machine-local
+			// absolute path that must never be committed.
+			await updateGitExclude(wt, [...SKILL_GIT_EXCLUDE_PATHS, MCP_GIT_EXCLUDE_PATH]);
 
 			if (config.claudeEnabled === false) continue;
 			const result = await installClaudeHook(wt);
@@ -223,6 +226,13 @@ export async function install(cwd?: string, options?: { source?: "vscode-extensi
 			}
 			// Install SessionStart hook for auto-briefing
 			await installSessionStartHook(wt);
+			// Register the MCP server for AI agents (Claude Code project config).
+			// Non-fatal: a failure here must not block hook installation.
+			try {
+				await registerMcpInClaude(wt);
+			} catch (mcpErr) {
+				log.warn("MCP registration failed in %s (non-fatal): %s", wt, (mcpErr as Error).message);
+			}
 		}
 
 		// Git hooks are shared across all worktrees — install once
@@ -498,6 +508,15 @@ export async function uninstall(cwd?: string): Promise<InstallResult> {
 			}
 			/* v8 ignore stop */
 			await removeGeminiHook(wt);
+			// Non-fatal, mirroring the install side: a failure here (e.g. EPERM on a
+			// read-only .mcp.json) must not abort the uninstall, or the shared git
+			// hooks below would leak and post-commit would keep firing after the
+			// user believes they've uninstalled.
+			try {
+				await removeMcpFromClaude(wt);
+			} catch (mcpErr) {
+				log.warn("MCP removal failed in %s (non-fatal): %s", wt, (mcpErr as Error).message);
+			}
 		}
 
 		// Git hooks are shared — remove once from the common hooks directory

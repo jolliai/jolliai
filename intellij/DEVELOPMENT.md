@@ -240,3 +240,15 @@ ideaVersion {
     untilBuild = "262.*"   // Up to IntelliJ 2026.2.x
 }
 ```
+
+---
+
+## MCP Server (manual setup)
+
+The CLI ships a `jolli mcp` stdio MCP server that exposes JolliMemory's search + recall tools to AI agents. The CLI and VS Code extension auto-register it; **the IntelliJ plugin does not register it yet**. IntelliJ users add it manually to their project's `.mcp.json`:
+
+```json
+{ "mcpServers": { "jollimemory": { "command": "jolli", "args": ["mcp"] } } }
+```
+
+This requires the `jolli` CLI to be on `PATH` (`npm install -g @jolli.ai/cli`).

@@ -43,6 +43,20 @@ vi.mock("../core/GeminiSessionDetector.js", () => ({
 	isGeminiInstalled: vi.fn().mockResolvedValue(false),
 }));
 
+// Partial mock of McpRegistration: keep the REAL register/remove implementations
+// (they operate on the temp dir's .mcp.json) but wrap them in vi.fn so a single
+// test can force `removeMcpFromClaude` to reject and assert uninstall still
+// proceeds. `clearMocks: true` only clears call history, so the real impl given
+// to vi.fn() survives across tests.
+vi.mock("./McpRegistration.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./McpRegistration.js")>();
+	return {
+		...actual,
+		registerMcpInClaude: vi.fn(actual.registerMcpInClaude),
+		removeMcpFromClaude: vi.fn(actual.removeMcpFromClaude),
+	};
+});
+
 // Mock OpenCodeSessionDiscoverer for status/install checks
 vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
 	isOpenCodeInstalled: vi.fn().mockResolvedValue(false),
@@ -882,6 +896,28 @@ describe("Installer", () => {
 			const content = await readFile(settingsPath, "utf-8");
 			const settings = JSON.parse(content);
 			expect(settings.hooks).toBeUndefined();
+		});
+
+		it("continues removing git hooks when removeMcpFromClaude throws (e.g. read-only .mcp.json)", async () => {
+			await install(tempDir);
+			const postRewritePath = join(tempDir, ".git", "hooks", "post-rewrite");
+			// Sanity: the hook is installed before uninstall.
+			expect(await readFile(postRewritePath, "utf-8")).toContain("JolliMemory");
+
+			// Force the MCP cleanup to fail for this worktree, as it would on an
+			// EPERM / read-only .mcp.json. The install side already treats this as
+			// non-fatal; uninstall must too, or the git hooks leak and post-commit
+			// keeps firing after the user thinks they've uninstalled.
+			const { removeMcpFromClaude } = await import("./McpRegistration.js");
+			vi.mocked(removeMcpFromClaude).mockRejectedValueOnce(new Error("EPERM: read-only .mcp.json"));
+
+			const result = await uninstall(tempDir);
+			expect(result.success).toBe(true);
+
+			// The post-rewrite git hook must still have been removed despite the
+			// MCP failure earlier in the same uninstall run.
+			const { stat } = await import("node:fs/promises");
+			await expect(stat(postRewritePath)).rejects.toThrow();
 		});
 
 		it("should use process.cwd() when uninstall is called without cwd", async () => {

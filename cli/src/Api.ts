@@ -18,6 +18,7 @@ import { registerDisableCommand, registerEnableCommand } from "./commands/Enable
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
+import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
@@ -157,6 +158,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"auth",
 	"heal-folder",
 	"sync-memory-bank",
+	"mcp",
 ]);
 
 const MEMORY_DESCRIPTION = `Auto-documents your AI-assisted development. Lightweight git and AI-agent
@@ -331,6 +333,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerExportCommand(program);
 	registerAuthCommands(program);
 	registerSyncCommand(program);
+	registerMcpCommand(program);
 
 	// Plugin-provided command surface. `loadPlugins` discovers and registers
 	// installed plugins (returning the set of IDs it loaded); whatever's left

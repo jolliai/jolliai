@@ -166,4 +166,48 @@ describe("StatusStore", () => {
 			expect(store.getSnapshot().syncPhase).not.toBeNull();
 		});
 	});
+
+	it("setWorkerPhase updates the snapshot and reason", () => {
+		const store = new StatusStore({ getStatus: vi.fn() } as never);
+		store.setWorkerBusy(true);
+		store.setWorkerPhase("ingest");
+		expect(store.getSnapshot().workerPhase).toBe("ingest");
+		expect(store.getSnapshot().changeReason).toBe("workerPhase");
+	});
+
+	it("setWorkerPhase is a no-op when unchanged", () => {
+		const store = new StatusStore({ getStatus: vi.fn() } as never);
+		let emits = 0;
+		store.onChange(() => {
+			emits++;
+		});
+		store.setWorkerPhase(null);
+		expect(emits).toBe(0);
+	});
+
+	it("setWorkerBusy(false) clears a set workerPhase (lock-bound lifetime)", () => {
+		const store = new StatusStore({ getStatus: vi.fn() } as never);
+		store.setWorkerBusy(true);
+		store.setWorkerPhase("ingest");
+		store.setWorkerBusy(false);
+		expect(store.getSnapshot().workerPhase).toBeNull();
+		expect(store.getSnapshot().workerBusy).toBe(false);
+	});
+
+	it("setWorkerBusy(false) clears a stale workerPhase even when already not busy (crash-residue activation path)", () => {
+		// Activation order is unspecified: readWorkerPhase() may read a stale
+		// 'ingest' marker (left by a SIGKILL'd worker) BEFORE
+		// isWorkerBusy().then(setWorkerBusy) resolves false. Because workerBusy
+		// starts false, setWorkerBusy(false) would hit the equality early-return
+		// and skip the phase clear — leaving a stale phase that mislabels the
+		// next genuine summary run as "Updating Memory Bank…". The busy-bound
+		// invariant must hold here too.
+		const store = new StatusStore({ getStatus: vi.fn() } as never);
+		store.setWorkerPhase("ingest"); // stale marker read while workerBusy is still false
+		const listener = vi.fn();
+		store.onChange(listener);
+		store.setWorkerBusy(false); // isWorkerBusy() resolved false — no busy transition
+		expect(store.getSnapshot().workerPhase).toBeNull();
+		expect(listener).toHaveBeenCalled(); // snapshot changed (phase cleared), so subscribers must re-render
+	});
 });
