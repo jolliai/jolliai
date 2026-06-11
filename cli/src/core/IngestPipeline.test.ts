@@ -20,6 +20,13 @@ vi.mock("./SourceContent.js", () => ({
 	loadSourceContent: vi.fn(async (r) => `content ${r.id}`),
 }));
 vi.mock("./IngestRunStore.js", () => ({ appendIngestRun: vi.fn() }));
+// Without this mock, every `ingestPendingBatch("/tmp/x", …)` call that omits
+// `opts.readStorage` runs the REAL createReadStorage → loadConfig reads the
+// developer's actual ~/.jolli config → resolveKBPath claims a stub `x/` folder
+// inside their real Memory Bank (`<localFolder>/x`). Same pattern as
+// SourceTimeline.test.ts. All storage consumers above are mocked, so the
+// dummy provider is never actually read.
+vi.mock("./ReadStorageResolver.js", () => ({ createReadStorage: vi.fn(async () => ({})) }));
 
 import { drainIngest, ingestPendingBatch } from "./IngestPipeline.js";
 import { appendIngestRun } from "./IngestRunStore.js";

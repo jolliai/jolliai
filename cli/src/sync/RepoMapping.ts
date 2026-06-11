@@ -28,8 +28,10 @@
  *      notification in VS Code) for manual disambiguation (P2#3).
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { canonicalizeRepoIdentity, repoIdentityFromConfig } from "./RepoIdentity.js";
 
 /** A single `repoIdentity → folder` mapping row. */
 export interface RepoMappingEntry {
@@ -89,6 +91,42 @@ export function parseRepoMapping(raw: string): RepoMappingFile | null {
 /** Serializes to the canonical 2-space-indented JSON + trailing newline. */
 export function serializeRepoMapping(mapping: RepoMappingFile): string {
 	return `${JSON.stringify(mapping, null, 2)}\n`;
+}
+
+/**
+ * Re-normalizes every row's `repoIdentity` through `canonicalizeRepoIdentity`
+ * and collapses rows that fold to the same identity. Heals files written
+ * before SSH→https transport folding: the same repo reached via
+ * `git@github.com:owner/repo` on one device and `https://github.com/owner/repo`
+ * on another got two rows, typically both claiming the same folder — which
+ * `findRepoMappingConflicts` then mis-reported as a cross-repo folder
+ * collision. When collapsing rows disagree on `folder`, the later row in
+ * file order wins — arbitrary but deterministic, and the affected repo's
+ * own sync round rewrites the row to the authoritative `KBPathResolver`
+ * pick on its next pass anyway (`resolveOrAssignFolder` case 3).
+ *
+ * Returns the original `mapping` object with `changed: false` when every
+ * row was already canonical, so callers can skip the persist (and the
+ * commit/push) on steady-state rounds.
+ */
+export function canonicalizeRepoMapping(mapping: RepoMappingFile): {
+	readonly merged: RepoMappingFile;
+	readonly changed: boolean;
+} {
+	const byIdentity = new Map<string, RepoMappingEntry>();
+	let changed = false;
+	for (const m of mapping.mappings) {
+		const identity = canonicalizeRepoIdentity(m.repoIdentity);
+		if (identity !== m.repoIdentity || byIdentity.has(identity)) changed = true;
+		byIdentity.set(identity, identity === m.repoIdentity ? m : { repoIdentity: identity, folder: m.folder });
+	}
+	if (!changed) return { merged: mapping, changed: false };
+	/* v8 ignore start -- comparator equal-branch (`: 0`) is unreachable: `byIdentity` keys are unique canonical identities */
+	const mappings = [...byIdentity.values()].sort((a, b) =>
+		a.repoIdentity < b.repoIdentity ? -1 : a.repoIdentity > b.repoIdentity ? 1 : 0,
+	);
+	/* v8 ignore stop */
+	return { merged: { version: 1, mappings }, changed: true };
 }
 
 /**
@@ -186,15 +224,22 @@ export interface RepoMappingConflict {
  * Cross-device first-bind races on the same `<slug>` (e.g. `alice/foo`
  * vs `bob/foo` on different hosts) are the typical trigger; rare in
  * practice and the warning + manual fix is acceptable.
+ *
+ * Rows from both sides are canonicalized (`canonicalizeRepoIdentity`) as
+ * they enter the union, so an SSH-style row pushed by an older client
+ * folds into this client's https-style row for the same repo instead of
+ * surviving the merge as a duplicate.
  */
 export function mergeRepoMapping(
 	local: RepoMappingFile,
 	remote: RepoMappingFile,
 ): { readonly merged: RepoMappingFile; readonly conflicts: ReadonlyArray<RepoMappingConflict> } {
-	// First pass: union by repoIdentity (last-write-wins; remote overrides).
+	// First pass: union by canonical repoIdentity (last-write-wins; remote overrides).
 	const byIdentity = new Map<string, RepoMappingEntry>();
-	for (const m of local.mappings) byIdentity.set(m.repoIdentity, m);
-	for (const m of remote.mappings) byIdentity.set(m.repoIdentity, m);
+	for (const m of [...local.mappings, ...remote.mappings]) {
+		const identity = canonicalizeRepoIdentity(m.repoIdentity);
+		byIdentity.set(identity, identity === m.repoIdentity ? m : { repoIdentity: identity, folder: m.folder });
+	}
 
 	// Second pass: detect folder collisions across different identities.
 	// Report each colliding folder once; entries themselves are left
@@ -258,4 +303,114 @@ export async function saveRepoMapping(memoryBankRoot: string, mapping: RepoMappi
 	const path = join(memoryBankRoot, REPO_MAPPING_PATH);
 	await mkdir(dirname(path), { recursive: true });
 	await writeFile(path, serializeRepoMapping(mapping));
+}
+
+/** One on-disk Memory Bank repo folder paired with the identity its config carries. */
+export interface ScannedFolderIdentity {
+	readonly identity: string;
+	readonly folder: string;
+}
+
+/**
+ * Scans `<memoryBankRoot>` for repo folders and derives each one's
+ * `repoIdentity` from its persisted `<folder>/.jolli/config.json`.
+ *
+ * Used by the reconcile pass (`reconcileMappingAdditive`) so `repos.json` can
+ * be brought in line with the folders that actually exist on disk — the live
+ * sync round only ever writes the row for the repo it is syncing, so a folder
+ * whose own first-bind round never reached the mapping-write step stays absent
+ * from `repos.json` indefinitely.
+ *
+ * Skips:
+ *   - non-directories
+ *   - dot-prefixed entries (`.jolli`, `.git`, `.jolli-bootstrap-stash`, …)
+ *   - folders with no readable / parseable `config.json`
+ *   - folders whose config carries no derivable identity (neither `remoteUrl`
+ *     nor `repoName` — e.g. an identity-stripped archive stub)
+ *
+ * Returns an empty list (never throws) when `memoryBankRoot` can't be read.
+ */
+export async function scanFolderIdentities(memoryBankRoot: string): Promise<ScannedFolderIdentity[]> {
+	let entries: Dirent[];
+	try {
+		entries = await readdir(memoryBankRoot, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const out: ScannedFolderIdentity[] = [];
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		if (entry.name.startsWith(".")) continue;
+		const configPath = join(memoryBankRoot, entry.name, ".jolli", "config.json");
+		let raw: string;
+		try {
+			raw = await readFile(configPath, "utf-8");
+		} catch {
+			continue;
+		}
+		let parsed: { remoteUrl?: unknown; repoName?: unknown };
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			continue;
+		}
+		const identity = repoIdentityFromConfig({
+			remoteUrl: typeof parsed.remoteUrl === "string" ? parsed.remoteUrl : undefined,
+			repoName: typeof parsed.repoName === "string" ? parsed.repoName : undefined,
+		});
+		if (identity === null) continue;
+		out.push({ identity, folder: entry.name });
+	}
+	return out;
+}
+
+/**
+ * Brings `mapping` in line with the on-disk folders reported by
+ * `scanFolderIdentities` — **additively**:
+ *
+ *   - Adds a row for every scanned identity that isn't already mapped.
+ *   - **Never removes** an existing row. `repos.json` is shared across devices
+ *     and clones via git, so a row pointing at a folder absent on THIS device
+ *     may belong to a peer — dropping it would corrupt the shared index.
+ *   - **Skips identities backed by more than one local folder.** The
+ *     migrate-to-fresh-folder flow leaves the old and new `<repo>` /
+ *     `<repo>-N` folders sharing one `remoteUrl` (hence one identity); guessing
+ *     a row here could point `repos.json` at the stale folder while
+ *     FolderStorage writes the new one — the exact mapping↔disk split that
+ *     `resolveOrAssignFolder` (with the authoritative `KBPathResolver` pick)
+ *     avoids. Those repos are left to their own round's authoritative path.
+ *
+ * Returns `{ merged, changed: false }` with the original mapping object when
+ * nothing was added, so callers can skip the write (and the commit/push) on the
+ * steady-state no-op rounds.
+ */
+export function reconcileMappingAdditive(
+	mapping: RepoMappingFile,
+	scanned: ReadonlyArray<ScannedFolderIdentity>,
+): { readonly merged: RepoMappingFile; readonly changed: boolean } {
+	const folderCountByIdentity = new Map<string, number>();
+	for (const s of scanned) {
+		folderCountByIdentity.set(s.identity, (folderCountByIdentity.get(s.identity) ?? 0) + 1);
+	}
+	const ambiguous = new Set<string>();
+	for (const [identity, count] of folderCountByIdentity) {
+		if (count > 1) ambiguous.add(identity);
+	}
+	const present = new Set(mapping.mappings.map((m) => m.repoIdentity));
+	const additions: RepoMappingEntry[] = [];
+	for (const s of scanned) {
+		if (present.has(s.identity)) continue;
+		if (ambiguous.has(s.identity)) continue;
+		additions.push({ repoIdentity: s.identity, folder: s.folder });
+		// Treat as present so a duplicate scan entry (same identity, ruled in
+		// above) can't add the row twice.
+		present.add(s.identity);
+	}
+	if (additions.length === 0) return { merged: mapping, changed: false };
+	/* v8 ignore start -- comparator equal-branch (`: 0`) is unreachable: rows are deduped by repoIdentity above */
+	const mappings = [...mapping.mappings, ...additions].sort((a, b) =>
+		a.repoIdentity < b.repoIdentity ? -1 : a.repoIdentity > b.repoIdentity ? 1 : 0,
+	);
+	/* v8 ignore stop */
+	return { merged: { version: 1, mappings }, changed: true };
 }

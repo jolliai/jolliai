@@ -260,10 +260,75 @@ function isSameRepo(config: KBConfig, remoteUrl: string | null, repoName: string
 }
 
 function normalizeRemoteUrl(url: string): string {
-	return url
+	return foldGitTransportToHttps(url)
 		.replace(/\/+$/, "")
 		.replace(/\.git$/, "")
 		.toLowerCase();
+}
+
+/**
+ * Folds the SSH transport forms of a git remote URL into the https form so
+ * all transports of the same repo compare equal:
+ *
+ *   - `ssh://[user@]host[:port]/path` (and `git+ssh://`) → `https://host[:port]/path`.
+ *     The scheme's DEFAULT port (22) is dropped — it carries no identity —
+ *     but a non-default port is preserved: two self-hosted forges on
+ *     `host:2222` and `host:2223` are distinct repos and must not collapse.
+ *     Same rule as `vscode/src/util/GitRemoteUtils.ts` (the server binding
+ *     key), so the two canonicalizers agree on self-hosted SSH remotes.
+ *   - `git://host[:port]/path` → `https://host[:port]/path` (default 9418
+ *     dropped, same rule).
+ *   - SCP form `user@host:path` → `https://host/path`. The `user@` part is
+ *     REQUIRED on purpose: a bare `host:path` was never folded by earlier
+ *     releases either, and requiring the `@` keeps non-URL strings that
+ *     happen to contain a `:` (a basename can legally contain one on Linux,
+ *     `C:/repos/foo` is a Windows drive path) from being mangled into fake
+ *     https URLs. Hosted-git SSH remotes universally use `git@`, so the
+ *     constraint costs nothing in practice. The absolute-vs-relative
+ *     distinction of the SCP path is preserved (`host:/srv/repo` →
+ *     `…host//srv/repo` vs `host:srv/repo` → `…host/srv/repo`).
+ *
+ * Anything else (https, file paths, bare names) passes through unchanged.
+ *
+ * Shared by the local folder-reuse predicate (`isSameRepo` above) and the
+ * vault identity normalizer (`sync/RepoIdentity.ts`) so "is this the same
+ * repo?" gets one answer on both sides — they diverged once and the same
+ * repo cloned via SSH on one device and https on another produced duplicate
+ * `repos.json` rows plus a split local folder (`<repo>` / `<repo>-2`).
+ *
+ * The IntelliJ plugin carries a Kotlin port (`KBPathResolver.kt
+ * foldGitTransportToHttps`) that must stay in lockstep — both IDEs resolve
+ * folders in the same Memory Bank, and divergent folding sends them to
+ * different folders for the same repo.
+ */
+/**
+ * Hosts whose owner/repo path is case-insensitive on the wire — clones typed
+ * with different casing all resolve to the same repo, so canonicalizers must
+ * lower-case the path for these hosts (and ONLY these: self-hosted forges may
+ * be case-sensitive). Single shared source of truth for every comparer:
+ * `sync/RepoIdentity.ts` (vault identity), `vscode/src/util/GitRemoteUtils.ts`
+ * (server binding key — imports this set), and the whole-string-lowercasing
+ * comparers (`normalizeRemoteUrl` above, `KBRepoDiscoverer`) which fold case
+ * unconditionally and need no per-host check. Add new entries only after
+ * confirming the host actually treats the path as case-insensitive (assuming
+ * wrong here merges distinct repos).
+ */
+export const CASE_INSENSITIVE_PATH_HOSTS: ReadonlySet<string> = new Set(["github.com", "gitlab.com", "bitbucket.org"]);
+
+export function foldGitTransportToHttps(url: string): string {
+	const ssh = url.match(/^(?:git\+)?ssh:\/\/(?:[^@/]+@)?([^/:]+)(?::(\d+))?\/(.+)$/i);
+	if (ssh) return `https://${ssh[1]}${nonDefaultPortSegment(ssh[2], "22")}/${ssh[3]}`;
+	const git = url.match(/^git:\/\/([^/:]+)(?::(\d+))?\/(.+)$/i);
+	if (git) return `https://${git[1]}${nonDefaultPortSegment(git[2], "9418")}/${git[3]}`;
+	const scp = url.match(/^[^@/:]+@([^/:]+):(.+)$/);
+	if (scp) return `https://${scp[1]}/${scp[2]}`;
+	return url;
+}
+
+/** `:<port>` when present and not the scheme's default, else empty. */
+function nonDefaultPortSegment(port: string | undefined, schemeDefault: string): string {
+	if (port === undefined || port === schemeDefault) return "";
+	return `:${port}`;
 }
 
 function findAvailablePathAndClaim(parent: string, repoName: string, remoteUrl: string | null): string {

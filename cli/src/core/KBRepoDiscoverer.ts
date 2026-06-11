@@ -17,7 +17,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
-import { resolveKbParent } from "./KBPathResolver.js";
+import { foldGitTransportToHttps, resolveKbParent } from "./KBPathResolver.js";
 import type { KBConfig } from "./KBTypes.js";
 
 const log = createLogger("KBRepoDiscoverer");
@@ -112,7 +112,13 @@ function isCurrentRepo(
 }
 
 function normalizeUrl(url: string): string {
-	return url
+	// Fold SSH transports first so a config stored from an SSH clone still
+	// matches the https remote of the same repo (and vice versa) — otherwise
+	// `isCurrentRepo` calls the current repo "foreign" while
+	// `KBPathResolver.isSameRepo` (which folds) happily reuses its folder,
+	// breaking current-repo highlighting and `createReadStorageForCurrentRepo`.
+	// The whole-string lowercase below already covers path-case differences.
+	return foldGitTransportToHttps(url)
 		.replace(/\/+$/, "")
 		.replace(/\.git$/, "")
 		.toLowerCase();

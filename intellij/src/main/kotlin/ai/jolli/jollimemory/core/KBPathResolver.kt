@@ -144,9 +144,54 @@ object KBPathResolver {
         return false
     }
 
-    /** Normalizes a git remote URL for comparison (strips .git suffix, trailing slash). */
+    /**
+     * Normalizes a git remote URL for comparison: folds SSH transports into
+     * the https form, then strips trailing slashes + `.git` and lowercases.
+     */
     private fun normalizeRemoteUrl(url: String): String {
-        return url.trimEnd('/').removeSuffix(".git").lowercase()
+        return foldGitTransportToHttps(url).trimEnd('/').removeSuffix(".git").lowercase()
+    }
+
+    private val SSH_URL_REGEX = Regex("^(?:git\\+)?ssh://(?:[^@/]+@)?([^/:]+)(?::(\\d+))?/(.+)$", RegexOption.IGNORE_CASE)
+    private val GIT_URL_REGEX = Regex("^git://([^/:]+)(?::(\\d+))?/(.+)$", RegexOption.IGNORE_CASE)
+    private val SCP_URL_REGEX = Regex("^[^@/:]+@([^/:]+):(.+)$")
+
+    /**
+     * Folds the SSH transport forms of a git remote URL into the https form so
+     * all transports of the same repo compare equal — `git@host:owner/repo`,
+     * `ssh://[user@]host[:port]/owner/repo`, `git://host/owner/repo` and
+     * `https://host/owner/repo` are the same repo, and treating them as
+     * different splits the Memory Bank into `<repo>` / `<repo>-2` folders when
+     * the user switches clone transport.
+     *
+     * The SCP form requires the `user@` prefix on purpose: a bare `host:path`
+     * was never folded by earlier releases either, and requiring the `@` keeps
+     * non-URL strings that merely contain a `:` (Windows drive paths like
+     * `C:/repos/foo`) from being mangled into fake https URLs.
+     *
+     * Port of the canonical TypeScript implementation in
+     * `cli/src/core/KBPathResolver.ts foldGitTransportToHttps` — the two MUST
+     * stay in lockstep, since both IDEs resolve folders in the same Memory
+     * Bank and divergent folding sends them to different folders.
+     */
+    internal fun foldGitTransportToHttps(url: String): String {
+        // The scheme's DEFAULT port (ssh 22 / git 9418) is dropped — it carries
+        // no identity — but a non-default port is preserved so two self-hosted
+        // forges on `host:2222` and `host:2223` stay distinct repos.
+        SSH_URL_REGEX.find(url)?.let {
+            return "https://${it.groupValues[1]}${nonDefaultPortSegment(it.groupValues[2], "22")}/${it.groupValues[3]}"
+        }
+        GIT_URL_REGEX.find(url)?.let {
+            return "https://${it.groupValues[1]}${nonDefaultPortSegment(it.groupValues[2], "9418")}/${it.groupValues[3]}"
+        }
+        SCP_URL_REGEX.find(url)?.let { return "https://${it.groupValues[1]}/${it.groupValues[2]}" }
+        return url
+    }
+
+    /** `:<port>` when present and not the scheme's default, else empty. */
+    private fun nonDefaultPortSegment(port: String, schemeDefault: String): String {
+        if (port.isEmpty() || port == schemeDefault) return ""
+        return ":$port"
     }
 
     private fun findAvailablePath(repoName: String, remoteUrl: String?): Path {

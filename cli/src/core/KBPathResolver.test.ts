@@ -7,6 +7,7 @@ import {
 	assertValidLocalFolder,
 	extractRepoName,
 	findFreshKBPath,
+	foldGitTransportToHttps,
 	getRemoteUrl,
 	InvalidLocalFolderError,
 	initializeKBFolder,
@@ -234,6 +235,49 @@ esac
 
 			const result = resolveKBPath("localrepo", null, tempDir);
 			expect(result).toBe(kbRoot);
+		});
+
+		it("reuses the folder across clone transports (stored SSH, live https — and vice versa)", () => {
+			// Same repo, different transport. Before folding, switching the
+			// remote from SSH to https split the Memory Bank into
+			// `myrepo` / `myrepo-2`.
+			const kbRoot = join(tempDir, "myrepo");
+			initializeKBFolder(kbRoot, "myrepo", "git@github.com:user/myrepo.git");
+			expect(resolveKBPath("myrepo", "https://github.com/user/myrepo.git", tempDir)).toBe(kbRoot);
+
+			const kbRoot2 = join(tempDir, "other");
+			initializeKBFolder(kbRoot2, "other", "https://github.com/user/other.git");
+			expect(resolveKBPath("other", "ssh://git@github.com:22/user/other.git", tempDir)).toBe(kbRoot2);
+		});
+	});
+
+	describe("foldGitTransportToHttps", () => {
+		it("folds SCP, ssh:// (with user/port), git+ssh:// and git:// into the https form", () => {
+			expect(foldGitTransportToHttps("git@github.com:user/repo.git")).toBe("https://github.com/user/repo.git");
+			expect(foldGitTransportToHttps("ssh://git@github.com:22/user/repo")).toBe("https://github.com/user/repo");
+			expect(foldGitTransportToHttps("git+ssh://git@github.com/user/repo")).toBe("https://github.com/user/repo");
+			expect(foldGitTransportToHttps("git://github.com:9418/user/repo")).toBe("https://github.com/user/repo");
+		});
+
+		it("preserves non-default ssh/git ports (distinct self-hosted forges must not collapse)", () => {
+			expect(foldGitTransportToHttps("ssh://git@host.example:2222/team/repo")).toBe(
+				"https://host.example:2222/team/repo",
+			);
+			expect(foldGitTransportToHttps("git://host.example:9419/team/repo")).toBe(
+				"https://host.example:9419/team/repo",
+			);
+		});
+
+		it("preserves the absolute-path distinction of SCP paths", () => {
+			expect(foldGitTransportToHttps("git@host.example:/srv/repo")).toBe("https://host.example//srv/repo");
+			expect(foldGitTransportToHttps("git@host.example:srv/repo")).toBe("https://host.example/srv/repo");
+		});
+
+		it("passes through https URLs, Windows drive paths, bare names and bare host:path", () => {
+			expect(foldGitTransportToHttps("https://github.com/user/repo")).toBe("https://github.com/user/repo");
+			expect(foldGitTransportToHttps("C:/repos/foo")).toBe("C:/repos/foo");
+			expect(foldGitTransportToHttps("my-notes")).toBe("my-notes");
+			expect(foldGitTransportToHttps("mygit.local:repos/foo")).toBe("mygit.local:repos/foo");
 		});
 	});
 
