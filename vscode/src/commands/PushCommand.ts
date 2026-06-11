@@ -11,6 +11,13 @@
  * 2. If the HEAD commit is already on remote, ask for force-push confirmation.
  * 3. Otherwise try normal push; on non-fast-forward rejection, offer force push.
  * 4. Refresh panels and status bar after success.
+ *
+ * Note: pushing is intentionally NOT gated on the post-commit Worker lock
+ * (`isWorkerBusy`). Push only runs `git push` on the current code branch; it
+ * shares no git ref or file with the QueueWorker, which writes summaries to the
+ * orphan branch + Memory Bank folder and never touches the remote. Commit and
+ * Squash stay gated because they race the worker (LLM provider / local history
+ * rewrite); push does not. Do not reintroduce a worker-busy guard here.
  */
 
 import * as vscode from "vscode";
@@ -19,7 +26,6 @@ import type { CommitsStore } from "../stores/CommitsStore.js";
 import type { FilesStore } from "../stores/FilesStore.js";
 import type { StatusStore } from "../stores/StatusStore.js";
 import type { BranchCommit } from "../Types.js";
-import { isWorkerBusy } from "../util/LockUtils.js";
 import { log } from "../util/Logger.js";
 import type { StatusBarManager } from "../util/StatusBarManager.js";
 
@@ -32,18 +38,9 @@ export class PushCommand {
 		private readonly filesStore: FilesStore,
 		private readonly statusStore: StatusStore,
 		private readonly statusBar: StatusBarManager,
-		private readonly workspaceRoot: string,
 	) {}
 
 	async execute(): Promise<void> {
-		// Guard: block while the post-commit Worker holds the lock
-		if (await isWorkerBusy(this.workspaceRoot)) {
-			vscode.window.showWarningMessage(
-				"Jolli Memory: AI summary is being generated. Please wait a moment.",
-			);
-			return;
-		}
-
 		const commits = this.commitsStore.getSnapshot().commits;
 		if (commits.length === 0) {
 			log.info(

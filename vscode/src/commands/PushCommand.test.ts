@@ -91,7 +91,15 @@ describe("PushCommand", () => {
 		error.mockClear();
 	});
 
-	it("blocks while the worker is busy", async () => {
+	it("pushes even while the worker is busy and never consults the worker lock", async () => {
+		// Regression guard: push must NOT be gated on the post-commit Worker
+		// lock — it shares no state with the QueueWorker. The mock is wired to
+		// report a busy worker (`true`); the hoisted vi.mock intercepts the
+		// module for any importer, so if someone reintroduces an `isWorkerBusy`
+		// guard in execute(), that guard would early-return and the assertions
+		// below (push happened, no busy warning) would fail. The
+		// `not.toHaveBeenCalled()` assertion is the direct invariant: push does
+		// not even look at the lock.
 		isWorkerBusy.mockResolvedValue(true);
 		const deps = makeDeps();
 		const command = new PushCommand(
@@ -100,15 +108,18 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 
 		await command.execute();
 
-		expect(showWarningMessage).toHaveBeenCalledWith(
+		expect(isWorkerBusy).not.toHaveBeenCalled();
+		expect(deps.bridge.pushCurrentBranch).toHaveBeenCalled();
+		expect(showInformationMessage).toHaveBeenCalledWith(
+			"Jolli Memory: Successfully pushed the current branch.",
+		);
+		expect(showWarningMessage).not.toHaveBeenCalledWith(
 			"Jolli Memory: AI summary is being generated. Please wait a moment.",
 		);
-		expect(deps.bridge.pushCurrentBranch).not.toHaveBeenCalled();
 	});
 
 	it("pushes successfully when branch has multiple commits (multi-commit support)", async () => {
@@ -121,7 +132,6 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 
 		await command.execute();
@@ -146,7 +156,6 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 
 		await command.execute();
@@ -170,7 +179,6 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 
 		await command.execute();
@@ -191,7 +199,6 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 
 		await command.execute();
@@ -214,7 +221,6 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 		showWarningMessage
 			.mockResolvedValueOnce(undefined)
@@ -242,7 +248,6 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 
 		await command.execute();
@@ -261,7 +266,6 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 
 		await command.execute();
@@ -284,7 +288,6 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 
 		await command.execute();
@@ -304,7 +307,6 @@ describe("PushCommand", () => {
 			deps.filesStore as never,
 			deps.statusStore as never,
 			deps.statusBar as never,
-			"/repo",
 		);
 
 		await command.execute();

@@ -1541,7 +1541,6 @@ export function activate(context: vscode.ExtensionContext): void {
 		filesStore,
 		statusStore,
 		statusBar,
-		workspaceRoot,
 	);
 
 	// Shared resolver for the multi-source reference webview commands. The webview
