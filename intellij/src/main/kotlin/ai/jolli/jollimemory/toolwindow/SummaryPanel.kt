@@ -723,19 +723,10 @@ class SummaryPanel(
     }
 
     private fun handleCheckPrStatus() {
-        jmLog.info("handleCheckPrStatus: start (cwd='%s')", cwd)
+        val targetBranch = currentSummary.branch
+        jmLog.info("handleCheckPrStatus: start (cwd='%s', branch='%s')", cwd, targetBranch)
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val commitCount = PrService.getCommitCount(cwd)
-                jmLog.info("handleCheckPrStatus: commitCount=%d", commitCount)
-                if (commitCount > 1) {
-                    jmLog.info("handleCheckPrStatus: status=multipleCommits (count=%d)", commitCount)
-                    ApplicationManager.getApplication().invokeLater {
-                        postToWebview("prStatus", mapOf("status" to "multipleCommits", "count" to commitCount))
-                    }
-                    return@executeOnPooledThread
-                }
-
                 val ghAvailable = PrService.isGhAvailable(cwd)
                 jmLog.info("handleCheckPrStatus: isGhAvailable=%s", ghAvailable)
                 if (!ghAvailable) {
@@ -755,22 +746,35 @@ class SummaryPanel(
                     return@executeOnPooledThread
                 }
 
-                val branch = PrService.getCurrentBranch(cwd) ?: "unknown"
-                val pr = PrService.findPrForBranch(cwd)
-                jmLog.info("handleCheckPrStatus: branch='%s', pr=%s", branch, pr?.number?.toString() ?: "none")
+                val lookup = PrService.findPrForBranch(cwd, targetBranch)
+                jmLog.info("handleCheckPrStatus: lookup=%s", lookup::class.simpleName)
 
-                if (pr == null) {
-                    jmLog.info("handleCheckPrStatus: status=noPr (branch='%s')", branch)
-                    ApplicationManager.getApplication().invokeLater {
-                        postToWebview("prStatus", mapOf("status" to "noPr", "branch" to branch))
+                when (lookup) {
+                    is PrService.PrLookup.LookupError -> {
+                        jmLog.warn("handleCheckPrStatus: status=unavailable (lookupError: %s)", lookup.reason)
+                        ApplicationManager.getApplication().invokeLater {
+                            postToWebview("prStatus", mapOf("status" to "unavailable", "reason" to lookup.reason))
+                        }
                     }
-                } else {
-                    jmLog.info("handleCheckPrStatus: status=ready (pr #%d)", pr.number)
-                    ApplicationManager.getApplication().invokeLater {
-                        postToWebview("prStatus", mapOf(
-                            "status" to "ready",
-                            "pr" to mapOf("number" to pr.number, "url" to pr.url, "title" to pr.title),
-                        ))
+                    is PrService.PrLookup.NoPr -> {
+                        jmLog.info("handleCheckPrStatus: status=noPr (branch='%s', history=%d)", targetBranch, lookup.history.size)
+                        ApplicationManager.getApplication().invokeLater {
+                            postToWebview("prStatus", mapOf(
+                                "status" to "noPr",
+                                "branch" to targetBranch,
+                                "history" to lookup.history.map { mapOf("number" to it.number, "url" to it.url, "state" to it.state) },
+                            ))
+                        }
+                    }
+                    is PrService.PrLookup.Found -> {
+                        jmLog.info("handleCheckPrStatus: status=ready (pr #%d, history=%d)", lookup.pr.number, lookup.history.size)
+                        ApplicationManager.getApplication().invokeLater {
+                            postToWebview("prStatus", mapOf(
+                                "status" to "ready",
+                                "pr" to mapOf("number" to lookup.pr.number, "url" to lookup.pr.url, "title" to lookup.pr.title),
+                                "history" to lookup.history.map { mapOf("number" to it.number, "url" to it.url, "state" to it.state) },
+                            ))
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -826,11 +830,11 @@ class SummaryPanel(
             try {
                 PrService.pushBranch(cwd)
                 // Check if PR already exists for this branch — update instead of create
-                val existingPr = PrService.findPrForBranch(cwd)
+                val lookup = PrService.findPrForBranch(cwd, currentSummary.branch)
                 val prUrl: String
-                if (existingPr != null) {
-                    PrService.updatePr(existingPr.number, title, body, cwd)
-                    prUrl = existingPr.url
+                if (lookup is PrService.PrLookup.Found) {
+                    PrService.updatePr(lookup.pr.number, title, body, cwd)
+                    prUrl = lookup.pr.url
                 } else {
                     prUrl = PrService.createPr(title, body, cwd)
                 }
@@ -850,11 +854,12 @@ class SummaryPanel(
     private fun handlePrepareUpdatePr() {
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val pr = PrService.findPrForBranch(cwd)
-                if (pr == null) {
+                val lookup = PrService.findPrForBranch(cwd, currentSummary.branch)
+                if (lookup !is PrService.PrLookup.Found) {
                     ApplicationManager.getApplication().invokeLater { postToWebview("prUpdateError", mapOf("message" to "No PR found")) }
                     return@executeOnPooledThread
                 }
+                val pr = lookup.pr
                 val newMarkdown = SummaryPrMarkdownBuilder.buildPrMarkdown(currentSummary)
                 val newBody = PrService.replaceSummaryInBody(pr.body, newMarkdown)
                 ApplicationManager.getApplication().invokeLater {
@@ -870,11 +875,12 @@ class SummaryPanel(
         postToWebview("prUpdating")
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val pr = PrService.findPrForBranch(cwd)
-                if (pr == null) {
+                val lookup = PrService.findPrForBranch(cwd, currentSummary.branch)
+                if (lookup !is PrService.PrLookup.Found) {
                     ApplicationManager.getApplication().invokeLater { postToWebview("prUpdateError", mapOf("message" to "No PR found")) }
                     return@executeOnPooledThread
                 }
+                val pr = lookup.pr
                 PrService.updatePr(pr.number, title, body, cwd)
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("prUpdated", mapOf("url" to pr.url))
